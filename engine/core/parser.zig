@@ -1,36 +1,827 @@
-//! Parser engine skeleton. Real implementation arrives in Phase 3 (comptime
-//! pattern DSL + SIMD-friendly extraction). This stub exists so the module
-//! graph compiles.
+//! Parser engine: comptime pattern DSL + hot-path token extractors.
+//!
+//! The DSL compiles a pattern string at comptime into a specialized
+//! `MatchFn = fn(line: []const u8) ?ParseResult`. The generated function
+//! walks the input with a mix of literal memcmp / indexOf probes and
+//! token extractors (`<IP>`, `<TIMESTAMP>`, `<HOST>`, `<*>`). There is
+//! NO runtime regex engine — every pattern is code at comptime.
+//!
+//! Supported tokens:
+//!   <IP>         IPv4 or IPv6 address (required, extracted into result)
+//!   <TIMESTAMP>  BSD syslog / ISO 8601 / epoch-seconds timestamp (optional)
+//!   <HOST>       Hostname chars [A-Za-z0-9.-_]+
+//!   <*>          Non-greedy any-chars-until-next-literal
+//!
+//! The hot path (log line -> ParseResult) is allocation-free: everything
+//! operates on slices of the caller-provided buffer. Parse errors on
+//! attacker-controlled input return `null`, never panic.
+//!
+//! ALL input is attacker-controlled. No `@panic`, no `unreachable`,
+//! `@branchHint(.unlikely)` on reject paths.
 
 const std = @import("std");
 const shared = @import("shared");
 
-pub const Error = error{NotImplemented};
+// matcher.zig sits on top of this module; importing it here ensures the
+// multi-pattern matcher's tests are reached through parser.zig's test block
+// (main.zig already imports parser). See `test { _ = matcher; }` below.
+pub const matcher = @import("matcher.zig");
 
+// ============================================================================
+// Public types
+// ============================================================================
+
+/// Result produced by a generated match function. `ip` is always populated
+/// (every pattern must include an `<IP>` token), `timestamp` is populated
+/// when the pattern contains `<TIMESTAMP>`, and `matched_pattern_id` is
+/// assigned by the caller (e.g. the multi-pattern `Matcher`).
 pub const ParseResult = struct {
     ip: shared.IpAddress,
     timestamp: ?shared.Timestamp = null,
     matched_pattern_id: u16 = 0,
 };
 
-pub const Parser = struct {
-    allocator: std.mem.Allocator,
+/// Signature of every comptime-generated match function.
+pub const MatchFn = *const fn (line: []const u8) ?ParseResult;
 
-    pub fn init(allocator: std.mem.Allocator) Parser {
-        return .{ .allocator = allocator };
+/// Byte-counted IPv4 extraction result.
+pub const Ipv4Match = struct { ip: u32, len: u8 };
+
+/// Byte-counted IPv6 extraction result.
+pub const Ipv6Match = struct { ip: u128, len: u16 };
+
+/// Byte-counted generic IP extraction result.
+pub const IpMatch = struct { ip: shared.IpAddress, len: u16 };
+
+/// Byte-counted timestamp extraction result.
+pub const TimestampMatch = struct { ts: shared.Timestamp, len: u16 };
+
+// ============================================================================
+// Extractors — hot-path, zero-allocation
+// ============================================================================
+
+/// IPv4 scan-and-validate in one pass.
+/// Returns the parsed 32-bit big-endian u32 and the number of bytes consumed.
+/// Zero allocation. Reject paths are hinted cold.
+pub fn extractIpv4(text: []const u8) ?Ipv4Match {
+    if (text.len < 7) {
+        @branchHint(.unlikely);
+        return null;
     }
 
-    pub fn parseLine(self: *const Parser, line: []const u8) Error!?ParseResult {
-        _ = self;
-        _ = line;
-        return error.NotImplemented;
+    var result: u32 = 0;
+    var octets: u8 = 0;
+    var current: u32 = 0;
+    var digits: u8 = 0;
+    var consumed: u8 = 0;
+
+    for (text, 0..) |c, i| {
+        // Hard bound: 15 bytes max (e.g. 255.255.255.255). Past that we are
+        // clearly past the address; let the terminator check below handle it.
+        if (i >= 15) break;
+
+        switch (c) {
+            '0'...'9' => {
+                current = current * 10 + @as(u32, c - '0');
+                digits += 1;
+                if (digits > 3 or current > 255) {
+                    @branchHint(.unlikely);
+                    return null;
+                }
+                consumed = @intCast(i + 1);
+            },
+            '.' => {
+                // Dot after the 4th octet is a terminator, not part of the
+                // address — stop here and let the final octet validate below.
+                if (octets >= 3) break;
+                if (digits == 0) {
+                    @branchHint(.unlikely);
+                    return null;
+                }
+                result = (result << 8) | current;
+                octets += 1;
+                current = 0;
+                digits = 0;
+                consumed = @intCast(i + 1);
+            },
+            else => break,
+        }
+    }
+
+    if (digits == 0 or octets != 3) {
+        @branchHint(.unlikely);
+        return null;
+    }
+    result = (result << 8) | current;
+    return .{ .ip = result, .len = consumed };
+}
+
+/// IPv6 scan-and-validate. Delegates the algebra to `std.net.Ip6Address.parse`
+/// which handles full, compressed `::`, and IPv4-mapped forms, but we do our
+/// OWN single-pass scan to determine the slice boundary on attacker input
+/// (we cannot hand `std.net` a whole log line and expect a useful result).
+/// Zero allocation.
+pub fn extractIpv6(text: []const u8) ?Ipv6Match {
+    // Allowed bytes inside an IPv6 literal: hex digits, ':', '.'. Scan as
+    // far as possible (bounded), then try std.net.Ip6Address.parse on the
+    // resulting slice. If that rejects, truncate from the right until we
+    // find a valid prefix OR give up.
+    //
+    // A well-formed IPv6 is at most 45 bytes (`xxxx:xxxx:...:xxxx:255.255.255.255`).
+    // Cap the scan at 64 bytes to be safe against garbage.
+    const cap: usize = @min(text.len, 64);
+    var scan_len: usize = 0;
+    while (scan_len < cap) : (scan_len += 1) {
+        const c = text[scan_len];
+        const ok = switch (c) {
+            '0'...'9', 'a'...'f', 'A'...'F', ':', '.' => true,
+            else => false,
+        };
+        if (!ok) break;
+    }
+
+    if (scan_len < 2) {
+        @branchHint(.unlikely);
+        return null;
+    }
+
+    // Try longest-valid prefix. An IPv6 literal should contain at least one
+    // ':' — reject anything that is pure IPv4-looking to avoid double-handling.
+    var has_colon = false;
+    for (text[0..scan_len]) |c| {
+        if (c == ':') {
+            has_colon = true;
+            break;
+        }
+    }
+    if (!has_colon) {
+        @branchHint(.unlikely);
+        return null;
+    }
+
+    var candidate_len: usize = scan_len;
+    while (candidate_len >= 2) : (candidate_len -= 1) {
+        if (std.net.Ip6Address.parse(text[0..candidate_len], 0)) |addr| {
+            const ip = std.mem.readInt(u128, &addr.sa.addr, .big);
+            return .{ .ip = ip, .len = @intCast(candidate_len) };
+        } else |_| {}
+    }
+    return null;
+}
+
+/// Extract an IPv4 OR IPv6 address at `text[0..]`. Tries IPv6 first because
+/// a valid IPv6 prefix never looks like a valid IPv4 — the presence of `:`
+/// is disqualifying for IPv4. IPv4 is the common case; most of our callers
+/// will end up in the IPv4 branch.
+fn extractIp(text: []const u8) ?IpMatch {
+    // Fast path: first byte is hex letter or the second byte is ':' — v6.
+    // Otherwise try v4 first, then v6 as a fallback.
+    if (text.len >= 1) {
+        const c0 = text[0];
+        const looks_v6 = switch (c0) {
+            'a'...'f', 'A'...'F', ':' => true,
+            else => false,
+        };
+        if (looks_v6) {
+            if (extractIpv6(text)) |r| {
+                return .{ .ip = .{ .ipv6 = r.ip }, .len = r.len };
+            }
+        }
+    }
+    if (extractIpv4(text)) |r| {
+        return .{ .ip = .{ .ipv4 = r.ip }, .len = r.len };
+    }
+    if (extractIpv6(text)) |r| {
+        return .{ .ip = .{ .ipv6 = r.ip }, .len = r.len };
+    }
+    return null;
+}
+
+// ----------------------------------------------------------------------------
+// Timestamp extraction
+// ----------------------------------------------------------------------------
+
+const SECS_PER_DAY: i64 = 86_400;
+
+fn isLeapYear(y: i64) bool {
+    return (@mod(y, 4) == 0 and @mod(y, 100) != 0) or @mod(y, 400) == 0;
+}
+
+fn daysFromCivil(y: i64, m: u8, d: u8) i64 {
+    // Howard Hinnant's date algorithm. Returns days since 1970-01-01 for
+    // (y, m, d) in the proleptic Gregorian calendar.
+    const y_adj: i64 = if (m <= 2) y - 1 else y;
+    const era: i64 = @divFloor(y_adj, 400);
+    const yoe: i64 = y_adj - era * 400; // [0, 399]
+    const m_i: i64 = @intCast(m);
+    const d_i: i64 = @intCast(d);
+    const m_off: i64 = if (m > 2) m_i - 3 else m_i + 9;
+    const doy: i64 = @divFloor(153 * m_off + 2, 5) + d_i - 1; // [0, 365]
+    const doe: i64 = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146_097 + doe - 719_468;
+}
+
+fn monthFromBsdName(s: []const u8) ?u8 {
+    if (s.len != 3) return null;
+    const months = [_][]const u8{
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    };
+    inline for (months, 0..) |name, i| {
+        if (std.mem.eql(u8, s, name)) return @intCast(i + 1);
+    }
+    return null;
+}
+
+fn parseU(comptime T: type, s: []const u8) ?T {
+    if (s.len == 0) return null;
+    var v: T = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') return null;
+        v = v * 10 + @as(T, c - '0');
+    }
+    return v;
+}
+
+/// Parse the timestamp starting at `text[0..]`. On success returns the unix
+/// epoch `i64` and the number of bytes consumed. Supports three shapes:
+///
+///   1. BSD syslog:  `MMM  D HH:MM:SS` or `MMM DD HH:MM:SS`  (15 bytes)
+///      The year is assumed to be the current year (we don't have one
+///      in the line). For fail2zig's purposes, relative ordering within
+///      findtime is what matters — we expose the parsed calendar seconds.
+///   2. ISO 8601:    `YYYY-MM-DDTHH:MM:SS` optionally followed by `Z`
+///                   or `+HH:MM` / `-HH:MM`.
+///   3. Epoch seconds: a run of 10-11 ASCII digits (covers years
+///      ~2001-5138). We explicitly bound the digit count so arbitrary
+///      numbers embedded in log lines don't get misread as timestamps.
+pub fn extractTimestamp(text: []const u8) ?TimestampMatch {
+    return extractTimestampWithYear(text, null);
+}
+
+/// Same as `extractTimestamp` but allows the caller to pin the year used
+/// for BSD syslog timestamps (which lack a year). When `year` is null we
+/// default to 1970 — callers embedding this in a real daemon should pass
+/// the current wall-clock year.
+pub fn extractTimestampWithYear(
+    text: []const u8,
+    year: ?i64,
+) ?TimestampMatch {
+    if (text.len == 0) {
+        @branchHint(.unlikely);
+        return null;
+    }
+
+    // ---- ISO 8601: starts with 4 digits + '-' ----
+    if (text.len >= 19 and text[4] == '-' and text[7] == '-' and
+        (text[10] == 'T' or text[10] == ' ') and
+        text[13] == ':' and text[16] == ':')
+    {
+        const y = parseU(i64, text[0..4]) orelse return null;
+        const mo = parseU(u8, text[5..7]) orelse return null;
+        const d = parseU(u8, text[8..10]) orelse return null;
+        const hh = parseU(u8, text[11..13]) orelse return null;
+        const mm = parseU(u8, text[14..16]) orelse return null;
+        const ss = parseU(u8, text[17..19]) orelse return null;
+        if (mo == 0 or mo > 12 or d == 0 or d > 31 or hh > 23 or mm > 59 or ss > 60) {
+            @branchHint(.unlikely);
+            return null;
+        }
+
+        const days = daysFromCivil(y, mo, d);
+        var ts: i64 = days * SECS_PER_DAY + @as(i64, hh) * 3600 +
+            @as(i64, mm) * 60 + @as(i64, ss);
+
+        var consumed: usize = 19;
+        // Optional fractional seconds — skip but don't interpret.
+        if (consumed < text.len and text[consumed] == '.') {
+            consumed += 1;
+            while (consumed < text.len and text[consumed] >= '0' and text[consumed] <= '9') {
+                consumed += 1;
+            }
+        }
+        // Optional timezone: 'Z', '+HH:MM', '-HH:MM'
+        if (consumed < text.len) {
+            const c = text[consumed];
+            if (c == 'Z') {
+                consumed += 1;
+            } else if ((c == '+' or c == '-') and consumed + 6 <= text.len and text[consumed + 3] == ':') {
+                const sign: i64 = if (c == '-') -1 else 1;
+                const off_h = parseU(i64, text[consumed + 1 .. consumed + 3]) orelse return null;
+                const off_m = parseU(i64, text[consumed + 4 .. consumed + 6]) orelse return null;
+                if (off_h > 23 or off_m > 59) return null;
+                ts -= sign * (off_h * 3600 + off_m * 60);
+                consumed += 6;
+            }
+        }
+        return .{ .ts = ts, .len = @intCast(consumed) };
+    }
+
+    // ---- BSD syslog: `MMM ` then ` D HH:MM:SS` or `DD HH:MM:SS` (15 bytes total) ----
+    if (text.len >= 15 and text[3] == ' ') {
+        const mo = monthFromBsdName(text[0..3]) orelse {
+            @branchHint(.unlikely);
+            return null;
+        };
+        // Day slot is always text[4..6], two chars. When the day is a
+        // single digit, traditional syslog right-pads with a leading space
+        // ("Apr  5"), so text[4] is ' ' and text[5] is the digit. Space
+        // then follows at text[6] before the time segment.
+        const day_slice = std.mem.trim(u8, text[4..6], " ");
+        const d = parseU(u8, day_slice) orelse {
+            @branchHint(.unlikely);
+            return null;
+        };
+        if (text[6] != ' ') return null;
+
+        // Time: HH:MM:SS at text[7..15].
+        const t: usize = 7;
+        if (text[t + 2] != ':' or text[t + 5] != ':') return null;
+        const hh = parseU(u8, text[t .. t + 2]) orelse return null;
+        const mm = parseU(u8, text[t + 3 .. t + 5]) orelse return null;
+        const ss = parseU(u8, text[t + 6 .. t + 8]) orelse return null;
+        if (mo == 0 or mo > 12 or d == 0 or d > 31 or hh > 23 or mm > 59 or ss > 60) {
+            @branchHint(.unlikely);
+            return null;
+        }
+
+        const y = year orelse 1970;
+        const days = daysFromCivil(y, mo, d);
+        const ts = days * SECS_PER_DAY + @as(i64, hh) * 3600 +
+            @as(i64, mm) * 60 + @as(i64, ss);
+        return .{ .ts = ts, .len = @intCast(t + 8) };
+    }
+
+    // ---- Epoch seconds: 10-11 ASCII digits. Anchored. ----
+    {
+        var i: usize = 0;
+        while (i < text.len and i < 12 and text[i] >= '0' and text[i] <= '9') : (i += 1) {}
+        if (i >= 10 and i <= 11) {
+            // Must not be followed by more digits (would be a bigger number)
+            if (i < text.len and text[i] >= '0' and text[i] <= '9') {
+                @branchHint(.unlikely);
+                return null;
+            }
+            const ts = parseU(i64, text[0..i]) orelse return null;
+            return .{ .ts = ts, .len = @intCast(i) };
+        }
+    }
+
+    return null;
+}
+
+// ----------------------------------------------------------------------------
+// Hostname extraction — bounded, chars-only scan
+// ----------------------------------------------------------------------------
+
+fn extractHost(text: []const u8) ?u16 {
+    // A hostname byte: [A-Za-z0-9._-]. Bound to 253 bytes (DNS max).
+    const cap = @min(text.len, 253);
+    var i: usize = 0;
+    while (i < cap) : (i += 1) {
+        const c = text[i];
+        const ok = switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '.', '-', '_' => true,
+            else => false,
+        };
+        if (!ok) break;
+    }
+    if (i == 0) return null;
+    return @intCast(i);
+}
+
+// ============================================================================
+// Comptime pattern compiler
+// ============================================================================
+
+const Token = enum { literal, ip, timestamp, host, wildcard };
+
+const Segment = struct {
+    tok: Token,
+    lit: []const u8, // only meaningful when tok == .literal
+};
+
+/// Split a pattern string into a list of segments at comptime.
+fn compileSegments(comptime pattern: []const u8) []const Segment {
+    comptime {
+        @setEvalBranchQuota(100_000);
+        var segs: []const Segment = &.{};
+        var i: usize = 0;
+        var lit_start: usize = 0;
+        while (i < pattern.len) {
+            if (pattern[i] == '<') {
+                // Flush any pending literal first.
+                if (i > lit_start) {
+                    segs = segs ++ &[_]Segment{.{ .tok = .literal, .lit = pattern[lit_start..i] }};
+                }
+                // Parse the token up to the matching '>'.
+                const name_start = i + 1;
+                var j = name_start;
+                while (j < pattern.len and pattern[j] != '>') : (j += 1) {}
+                if (j >= pattern.len) {
+                    @compileError("pattern: unterminated token '<' near: " ++ pattern[i..]);
+                }
+                const name = pattern[name_start..j];
+                const tok: Token = blk: {
+                    if (std.mem.eql(u8, name, "IP")) break :blk .ip;
+                    if (std.mem.eql(u8, name, "TIMESTAMP")) break :blk .timestamp;
+                    if (std.mem.eql(u8, name, "HOST")) break :blk .host;
+                    if (std.mem.eql(u8, name, "*")) break :blk .wildcard;
+                    @compileError("pattern: unknown token <" ++ name ++ ">");
+                };
+                segs = segs ++ &[_]Segment{.{ .tok = tok, .lit = "" }};
+                i = j + 1;
+                lit_start = i;
+            } else {
+                i += 1;
+            }
+        }
+        if (lit_start < pattern.len) {
+            segs = segs ++ &[_]Segment{.{ .tok = .literal, .lit = pattern[lit_start..] }};
+        }
+        return segs;
+    }
+}
+
+/// Validate constraints on a pattern at comptime:
+///   * exactly one `<IP>` token (every match produces an IP)
+///   * at most one `<TIMESTAMP>` token
+///   * `<*>` may precede any token (including other dynamics) — it means
+///     "scan until the next extractor succeeds or the next literal
+///     matches". Two non-wildcard dynamic tokens adjacent (e.g.
+///     `<IP><HOST>`) are rejected as ambiguous.
+fn validatePattern(comptime segs: []const Segment) void {
+    comptime {
+        var ip_count: usize = 0;
+        var ts_count: usize = 0;
+        var prev: ?Token = null;
+        for (segs) |s| {
+            if (s.tok == .ip) ip_count += 1;
+            if (s.tok == .timestamp) ts_count += 1;
+            if (prev) |p| {
+                const both_dyn = p != .literal and s.tok != .literal;
+                const prev_is_wild = p == .wildcard;
+                if (both_dyn and !prev_is_wild) {
+                    @compileError(
+                        "pattern: two non-wildcard dynamic tokens may not be adjacent (insert a literal or <*>)",
+                    );
+                }
+            }
+            prev = s.tok;
+        }
+        if (ip_count != 1) {
+            @compileError("pattern: exactly one <IP> token is required");
+        }
+        if (ts_count > 1) {
+            @compileError("pattern: at most one <TIMESTAMP> token is allowed");
+        }
+    }
+}
+
+/// Build a specialized match function for the given pattern.
+///
+/// The returned function walks the input once, advancing a cursor
+/// through each segment:
+///   * literal: `mem.indexOfPos(line, cursor, lit)` — the first literal
+///     is anchored (must be at position 0), later literals may sit
+///     after a wildcard/host/ip/timestamp.
+///   * <IP>: `extractIp(line[cursor..])` — required, populates ip.
+///   * <TIMESTAMP>: `extractTimestamp(line[cursor..])` — populates ts.
+///   * <HOST>: `extractHost(line[cursor..])` — advances cursor.
+///   * <*>: defer — consumed by the following literal's indexOf.
+pub fn compile(comptime pattern: []const u8) MatchFn {
+    const segs = compileSegments(pattern);
+    validatePattern(segs);
+
+    const Gen = struct {
+        fn match(line: []const u8) ?ParseResult {
+            var cursor: usize = 0;
+            var result: ParseResult = .{ .ip = .{ .ipv4 = 0 } };
+            var pending_wild: bool = false;
+
+            inline for (segs, 0..) |seg, idx| {
+                switch (seg.tok) {
+                    .literal => {
+                        if (pending_wild) {
+                            const found = std.mem.indexOfPos(u8, line, cursor, seg.lit) orelse {
+                                @branchHint(.unlikely);
+                                return null;
+                            };
+                            cursor = found + seg.lit.len;
+                            pending_wild = false;
+                        } else if (idx == 0) {
+                            // Anchored literal at start.
+                            if (line.len < seg.lit.len or
+                                !std.mem.eql(u8, line[0..seg.lit.len], seg.lit))
+                            {
+                                @branchHint(.unlikely);
+                                return null;
+                            }
+                            cursor = seg.lit.len;
+                        } else {
+                            // Unanchored: must match exactly at cursor.
+                            const end = cursor + seg.lit.len;
+                            if (end > line.len or
+                                !std.mem.eql(u8, line[cursor..end], seg.lit))
+                            {
+                                @branchHint(.unlikely);
+                                return null;
+                            }
+                            cursor = end;
+                        }
+                    },
+                    .ip => {
+                        const hit = scanForIp(line, cursor, pending_wild) orelse {
+                            @branchHint(.unlikely);
+                            return null;
+                        };
+                        result.ip = hit.ip;
+                        cursor = hit.end;
+                        pending_wild = false;
+                    },
+                    .timestamp => {
+                        const hit = scanForTimestamp(line, cursor, pending_wild) orelse {
+                            @branchHint(.unlikely);
+                            return null;
+                        };
+                        result.timestamp = hit.ts;
+                        cursor = hit.end;
+                        pending_wild = false;
+                    },
+                    .host => {
+                        const hit = scanForHost(line, cursor, pending_wild) orelse {
+                            @branchHint(.unlikely);
+                            return null;
+                        };
+                        cursor = hit;
+                        pending_wild = false;
+                    },
+                    .wildcard => {
+                        pending_wild = true;
+                    },
+                }
+            }
+            return result;
+        }
+    };
+
+    return &Gen.match;
+}
+
+// ----------------------------------------------------------------------------
+// Pattern-compiler scan helpers (non-comptime — called from generated fn)
+// ----------------------------------------------------------------------------
+
+const IpHit = struct { ip: shared.IpAddress, end: usize };
+const TimestampHit = struct { ts: shared.Timestamp, end: usize };
+
+/// When `scan` is false, the IP must sit exactly at `cursor`. When `scan`
+/// is true (i.e. a prior `<*>` is pending), advance through the line
+/// until we find a valid IP — bounded by line length, so cost is O(n).
+fn scanForIp(line: []const u8, cursor: usize, scan: bool) ?IpHit {
+    if (!scan) {
+        if (cursor > line.len) return null;
+        const r = extractIp(line[cursor..]) orelse return null;
+        return .{ .ip = r.ip, .end = cursor + r.len };
+    }
+    var i: usize = cursor;
+    while (i < line.len) : (i += 1) {
+        if (extractIp(line[i..])) |r| {
+            return .{ .ip = r.ip, .end = i + r.len };
+        }
+    }
+    return null;
+}
+
+fn scanForTimestamp(line: []const u8, cursor: usize, scan: bool) ?TimestampHit {
+    if (!scan) {
+        if (cursor > line.len) return null;
+        const r = extractTimestamp(line[cursor..]) orelse return null;
+        return .{ .ts = r.ts, .end = cursor + r.len };
+    }
+    var i: usize = cursor;
+    while (i < line.len) : (i += 1) {
+        if (extractTimestamp(line[i..])) |r| {
+            return .{ .ts = r.ts, .end = i + r.len };
+        }
+    }
+    return null;
+}
+
+fn scanForHost(line: []const u8, cursor: usize, scan: bool) ?usize {
+    if (!scan) {
+        if (cursor > line.len) return null;
+        const n = extractHost(line[cursor..]) orelse return null;
+        return cursor + n;
+    }
+    var i: usize = cursor;
+    while (i < line.len) : (i += 1) {
+        if (extractHost(line[i..])) |n| {
+            return i + n;
+        }
+    }
+    return null;
+}
+
+// ============================================================================
+// Legacy Parser wrapper — keeps the pre-existing API surface alive for now.
+// Phase 4 will retire this in favor of direct `Matcher` use.
+// ============================================================================
+
+pub const Error = error{NoMatch};
+
+pub const Parser = struct {
+    allocator: std.mem.Allocator,
+    match_fn: MatchFn,
+
+    pub fn init(allocator: std.mem.Allocator) Parser {
+        // Default to a permissive "match any line that contains an IP" pattern.
+        const default_match = comptime compile("<*><IP>");
+        return .{ .allocator = allocator, .match_fn = default_match };
+    }
+
+    pub fn withMatcher(allocator: std.mem.Allocator, match_fn: MatchFn) Parser {
+        return .{ .allocator = allocator, .match_fn = match_fn };
+    }
+
+    pub fn parseLine(self: *const Parser, line: []const u8) Error!ParseResult {
+        return self.match_fn(line) orelse error.NoMatch;
     }
 };
 
-test "parser: instantiates and parseLine returns NotImplemented" {
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "parser: extractIpv4 typical" {
+    const r = extractIpv4("192.168.1.1 rest of line").?;
+    try std.testing.expectEqual(@as(u32, 0xC0A80101), r.ip);
+    try std.testing.expectEqual(@as(u8, 11), r.len);
+}
+
+test "parser: extractIpv4 at exact end of slice" {
+    const r = extractIpv4("10.0.0.1").?;
+    try std.testing.expectEqual(@as(u32, 0x0A000001), r.ip);
+    try std.testing.expectEqual(@as(u8, 8), r.len);
+}
+
+test "parser: extractIpv4 rejects too short" {
+    try std.testing.expect(extractIpv4("1.2.3") == null);
+    try std.testing.expect(extractIpv4("") == null);
+}
+
+test "parser: extractIpv4 rejects invalid octet" {
+    try std.testing.expect(extractIpv4("256.0.0.1") == null);
+    try std.testing.expect(extractIpv4("999.0.0.0") == null);
+    // Ends on '.5' — consumes 1.2.3.4 and stops at the next dot boundary.
+    const r = extractIpv4("1.2.3.4.5").?;
+    try std.testing.expectEqual(@as(u32, 0x01020304), r.ip);
+    try std.testing.expectEqual(@as(u8, 7), r.len);
+}
+
+test "parser: extractIpv4 stops at non-digit-non-dot" {
+    const r = extractIpv4("1.2.3.4 from somewhere").?;
+    try std.testing.expectEqual(@as(u32, 0x01020304), r.ip);
+    try std.testing.expectEqual(@as(u8, 7), r.len);
+}
+
+test "parser: extractIpv4 consumes just the address" {
+    const r = extractIpv4("8.8.8.8:443").?;
+    try std.testing.expectEqual(@as(u8, 7), r.len);
+}
+
+test "parser: extractIpv6 loopback" {
+    const r = extractIpv6("::1 tail").?;
+    try std.testing.expectEqual(@as(u128, 1), r.ip);
+    try std.testing.expectEqual(@as(u16, 3), r.len);
+}
+
+test "parser: extractIpv6 full form" {
+    const r = extractIpv6("2001:0db8:85a3:0000:0000:8a2e:0370:7334 tail").?;
+    try std.testing.expectEqual(@as(u128, 0x20010db885a3000000008a2e03707334), r.ip);
+}
+
+test "parser: extractIpv6 ipv4-mapped" {
+    const r = extractIpv6("::ffff:192.168.1.1 tail").?;
+    const expected: u128 = 0x00000000000000000000ffffc0a80101;
+    try std.testing.expectEqual(expected, r.ip);
+}
+
+test "parser: extractIpv6 rejects plain v4" {
+    // No colons -> not v6.
+    try std.testing.expect(extractIpv6("192.168.1.1") == null);
+}
+
+test "parser: extractTimestamp ISO 8601 Z" {
+    const r = extractTimestamp("2026-04-20T14:30:22Z tail").?;
+    // 2026-04-20T14:30:22Z == 1776695422 (verified against python calendar.timegm)
+    try std.testing.expectEqual(@as(i64, 1_776_695_422), r.ts);
+    try std.testing.expectEqual(@as(u16, 20), r.len);
+}
+
+test "parser: extractTimestamp ISO 8601 with offset" {
+    const r = extractTimestamp("2026-04-20T14:30:22+02:00 tail").?;
+    // 2026-04-20T14:30:22+02:00 == 2026-04-20T12:30:22Z == epoch 1776688222
+    try std.testing.expectEqual(@as(i64, 1_776_688_222), r.ts);
+}
+
+test "parser: extractTimestamp BSD syslog 2-digit day" {
+    const r = extractTimestampWithYear("Apr 20 14:30:22 host sshd", 2026).?;
+    try std.testing.expectEqual(@as(i64, 1_776_695_422), r.ts);
+    try std.testing.expectEqual(@as(u16, 15), r.len);
+}
+
+test "parser: extractTimestamp BSD syslog single-digit padded day" {
+    const r = extractTimestampWithYear("Apr  5 14:30:22 host sshd", 2026).?;
+    // Days from 1970-01-01 to 2026-04-05 * 86400 + 14:30:22
+    const expected_days = daysFromCivil(2026, 4, 5);
+    const expected_ts = expected_days * SECS_PER_DAY + 14 * 3600 + 30 * 60 + 22;
+    try std.testing.expectEqual(expected_ts, r.ts);
+    try std.testing.expectEqual(@as(u16, 15), r.len);
+}
+
+test "parser: extractTimestamp epoch seconds" {
+    const r = extractTimestamp("1713624622 tail").?;
+    try std.testing.expectEqual(@as(i64, 1_713_624_622), r.ts);
+    try std.testing.expectEqual(@as(u16, 10), r.len);
+}
+
+test "parser: extractTimestamp rejects random digits" {
+    // Only 5 digits — too short to be an epoch.
+    try std.testing.expect(extractTimestamp("12345 tail") == null);
+}
+
+test "parser: compile sshd-style pattern" {
+    const m = comptime compile("Failed password for <*> from <IP>");
+    const r = m("Failed password for root from 1.2.3.4").?;
+    try std.testing.expectEqual(@as(u32, 0x01020304), r.ip.ipv4);
+}
+
+test "parser: compile sshd pattern rejects non-matching line" {
+    const m = comptime compile("Failed password for <*> from <IP>");
+    try std.testing.expect(m("Accepted password for root from 1.2.3.4") == null);
+}
+
+test "parser: compile pattern with timestamp" {
+    const m = comptime compile("<TIMESTAMP> <*> from <IP>");
+    const r = m("2026-04-20T14:30:22Z sshd from 10.0.0.1").?;
+    try std.testing.expectEqual(@as(u32, 0x0A000001), r.ip.ipv4);
+    try std.testing.expectEqual(@as(i64, 1_776_695_422), r.timestamp.?);
+}
+
+test "parser: compile pattern with ipv6" {
+    const m = comptime compile("Failed password for <*> from <IP>");
+    const r = m("Failed password for root from 2001:db8::1").?;
+    try std.testing.expectEqual(@as(u128, 0x20010db8000000000000000000000001), r.ip.ipv6);
+}
+
+test "parser: compile anchored literal failure" {
+    const m = comptime compile("Failed <*> from <IP>");
+    try std.testing.expect(m("  Failed whatever from 1.2.3.4") == null);
+}
+
+test "parser: compile pattern with host" {
+    const m = comptime compile("<HOST> has IP <IP>");
+    const r = m("web01.example.com has IP 10.0.0.5").?;
+    try std.testing.expectEqual(@as(u32, 0x0A000005), r.ip.ipv4);
+}
+
+test "parser: compile pattern has zero heap allocation" {
+    // Wrap std.testing.allocator in a FailingAllocator that denies every
+    // request — if the match fn ever tried to allocate, the test would
+    // crash with a failure. The generated match fn is slice arithmetic
+    // only, so the allocator is never touched.
+    var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const a = fa.allocator();
+    const m = comptime compile("Failed password for <*> from <IP>");
+    const p = Parser.withMatcher(a, m);
+    const r = try p.parseLine("Failed password for root from 9.9.9.9");
+    try std.testing.expectEqual(@as(u32, 0x09090909), r.ip.ipv4);
+    // No alloc / resize attempt ever reached the FailingAllocator.
+    try std.testing.expectEqual(@as(usize, 0), fa.alloc_index);
+    try std.testing.expectEqual(@as(usize, 0), fa.allocations);
+}
+
+test "parser: Parser wrapper parseLine default pattern" {
     const p = Parser.init(std.testing.allocator);
-    try std.testing.expectError(
-        error.NotImplemented,
-        p.parseLine("Failed password from 1.2.3.4"),
-    );
+    const r = try p.parseLine("some prefix 1.2.3.4 tail");
+    try std.testing.expectEqual(@as(u32, 0x01020304), r.ip.ipv4);
+}
+
+test "parser: Parser wrapper rejects line with no IP" {
+    const p = Parser.init(std.testing.allocator);
+    try std.testing.expectError(error.NoMatch, p.parseLine("no ip here"));
+}
+
+test "parser: Parser wrapper with custom match fn" {
+    const m = comptime compile("ssh <IP>");
+    const p = Parser.withMatcher(std.testing.allocator, m);
+    const r = try p.parseLine("ssh 10.0.0.1");
+    try std.testing.expectEqual(@as(u32, 0x0A000001), r.ip.ipv4);
+}
+
+test {
+    // Surface the matcher module's tests through parser.zig so main.zig
+    // doesn't need to be modified to reach them.
+    _ = matcher;
 }

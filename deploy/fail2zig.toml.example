@@ -1,0 +1,92 @@
+# fail2zig — example native configuration file
+#
+# Copy this file to /etc/fail2zig/fail2zig.toml and edit to taste.
+# All values shown here are the built-in defaults unless noted.
+#
+# Syntax is a strict subset of TOML:
+#   - [section]   and [section.subsection]
+#   - key = "string" | integer | true | false | ["array", "of", "strings"]
+#   - # comments to end of line
+#
+# fail2zig rejects unknown keys at load time — typos are not silently
+# ignored. Error messages include the line and column of the offending
+# token.
+
+# ----------------------------------------------------------------------
+# [global] — daemon-level settings
+# ----------------------------------------------------------------------
+[global]
+
+# Minimum log level emitted to stderr / journald.
+# One of: "debug", "info", "warn", "err"
+log_level = "info"
+
+# PID file location. Parent directory must be writable by root.
+pid_file = "/run/fail2zig.pid"
+
+# Unix domain socket for the fail2zig-client CLI.
+# Mode 0660, owned by root:fail2zig (see deploy/fail2zig.service).
+socket_path = "/run/fail2zig.sock"
+
+# Persistent state file — restored on restart, atomically rewritten
+# at shutdown and periodically. Parent dir must exist.
+state_file = "/var/lib/fail2zig/state.bin"
+
+# Hard memory ceiling for the daemon (MB). The state tracker and all
+# per-jail arenas respect this bound — once hit, the eviction policy
+# kicks in rather than growing. Minimum 16 MB.
+memory_ceiling_mb = 64
+
+# ----------------------------------------------------------------------
+# [defaults] — applied to every jail unless overridden under [jails.X]
+# ----------------------------------------------------------------------
+[defaults]
+
+# Seconds a banned IP stays banned.
+bantime = 600
+
+# Sliding window (seconds) over which `maxretry` failures trigger a ban.
+findtime = 600
+
+# Number of failures within `findtime` that triggers a ban.
+maxretry = 5
+
+# Firewall backend. fail2zig picks the best available at startup if
+# "nftables" is requested on a system without nf_tables; explicit values
+# here are honored exactly.
+# One of: "nftables", "iptables", "ipset", "log-only"
+banaction = "nftables"
+
+# List of CIDRs / IPs that are never banned. Applied before any jail
+# logic — matching lines are dropped early.
+ignoreip = ["127.0.0.1/8", "::1"]
+
+# ----------------------------------------------------------------------
+# [jails.<name>] — one table per jail
+# ----------------------------------------------------------------------
+
+# Protect SSH — the classic fail2ban baseline jail.
+[jails.sshd]
+enabled = true
+filter  = "sshd"
+logpath = ["/var/log/auth.log", "/var/log/secure"]
+maxretry = 3              # stricter than the default 5
+bantime  = 3600           # 1 hour first offence
+# ignoreip is inherited from [defaults] when unset.
+
+# Progressive bantime increase — each re-ban extends the window.
+# Formula: linear     -> next_bantime = bantime * multiplier * ban_count
+#          exponential-> next_bantime = bantime * multiplier ^ ban_count
+# Capped at `bantime_increment_max_bantime`.
+bantime_increment_enabled    = true
+bantime_increment_multiplier = 2
+bantime_increment_formula    = "exponential"
+bantime_increment_max_bantime = 604800   # 1 week ceiling
+
+# Protect nginx against credential-stuffing on basic-auth endpoints.
+[jails.nginx-http-auth]
+enabled = true
+filter  = "nginx-http-auth"
+logpath = ["/var/log/nginx/error.log"]
+# maxretry / findtime / bantime inherit from [defaults].
+ignoreip = ["192.168.0.0/16"]
