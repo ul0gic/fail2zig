@@ -42,6 +42,7 @@ const logger_mod = @import("core/logger.zig");
 const parser_mod = @import("core/parser.zig");
 pub const state_mod = @import("core/state.zig");
 const persist_mod = @import("core/persist.zig");
+const reconcile_mod = @import("core/reconcile.zig");
 pub const firewall = @import("firewall/backend.zig");
 pub const config_mod = @import("config/native.zig");
 pub const fail2ban_mod = @import("config/fail2ban.zig");
@@ -482,6 +483,30 @@ pub fn main() !void {
     try runDaemon(heap, &cfg);
 }
 
+/// Bridges `reconcile_mod.reconcileRestoredBans` to the live firewall
+/// backend. `ctx` is a `*firewall.Backend`. Treats `AlreadyBanned` as
+/// idempotent success; surfaces any other failure as a warn log +
+/// error return so reconcile counts it as a failed apply and moves on
+/// to the next entry.
+fn reconcileBanApply(
+    ctx: *anyopaque,
+    ip: shared.IpAddress,
+    jail: shared.JailId,
+    remaining: u64,
+) anyerror!void {
+    const be: *firewall.Backend = @ptrCast(@alignCast(ctx));
+    be.ban(ip, jail, remaining) catch |err| switch (err) {
+        error.AlreadyBanned => return,
+        else => {
+            std.log.warn(
+                "persist: backend re-ban failed for ip={}: {s}",
+                .{ ip, @errorName(err) },
+            );
+            return err;
+        },
+    };
+}
+
 fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     // Memory pool.
     const mem_cfg = deriveMemoryConfig(cfg);
@@ -537,6 +562,35 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         }
     } else |err| {
         std.log.warn("persist: load failed: {s}", .{@errorName(err)});
+    }
+
+    // Reconcile the firewall backend with restored state (SYS-007).
+    //
+    // The backend's scaffold was freshly installed by `backend.init` —
+    // its ban sets are empty regardless of what was active before the
+    // restart. The state tracker holds the restored bans. Without this
+    // step the kernel silently stops enforcing those bans until a fresh
+    // ban decision fires. Logic extracted into core/reconcile.zig so
+    // it's testable without spinning up the whole daemon.
+    {
+        const now = std.time.timestamp();
+        const reinstalled = reconcile_mod.reconcileRestoredBans(
+            heap,
+            &tracker,
+            &metrics,
+            now,
+            reconcileBanApply,
+            @ptrCast(&backend_val),
+        ) catch |err| blk: {
+            std.log.warn("persist: reconcile failed: {s}", .{@errorName(err)});
+            break :blk 0;
+        };
+        if (reinstalled > 0) {
+            std.log.info(
+                "persist: reconciled {d} active ban(s) with firewall backend",
+                .{reinstalled},
+            );
+        }
     }
 
     // Event loop.

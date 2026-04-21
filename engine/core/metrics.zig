@@ -149,6 +149,15 @@ pub const Metrics = struct {
         self.memory_bytes_used.store(bytes, counter_order);
     }
 
+    /// Directly set the `active_bans` gauge without bumping the
+    /// `bans_total` lifetime counter. Used when reconciling state from
+    /// disk at startup — those bans aren't new, they're just being
+    /// re-surfaced to the running process, so the gauge is the thing
+    /// that needs correcting and the counter stays honest (SYS-007).
+    pub fn setActiveBans(self: *Metrics, count: u32) void {
+        self.active_bans.store(count, counter_order);
+    }
+
     // ----- Per-jail operations -----
 
     /// Register a jail so future per-jail updates under this name can
@@ -206,6 +215,13 @@ pub const Metrics = struct {
         if (self.jailIndex(jail)) |i| {
             _ = self.jails[i].bans_total.fetchAdd(1, counter_order);
             _ = self.jails[i].active_bans.fetchAdd(1, counter_order);
+        }
+    }
+
+    /// Per-jail counterpart of `setActiveBans`.
+    pub fn jailSetActiveBans(self: *Metrics, jail: []const u8, count: u32) void {
+        if (self.jailIndex(jail)) |i| {
+            self.jails[i].active_bans.store(count, counter_order);
         }
     }
 
