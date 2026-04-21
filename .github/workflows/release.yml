@@ -32,6 +32,9 @@ permissions:
 
 env:
   ZIG_VERSION: "0.14.1"
+  # SHA256 of zig-x86_64-linux-${ZIG_VERSION}.tar.xz — keep in sync with
+  # ZIG_VERSION and with ci.yml. Supply-chain audit trail.
+  ZIG_SHA256: "24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c"
 
 jobs:
   build-release:
@@ -45,9 +48,14 @@ jobs:
           - aarch64-linux-musl
     steps:
       - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v1
-        with:
-          version: ${{ env.ZIG_VERSION }}
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: |
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
+          echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c -
+          sudo mkdir -p /opt/zig
+          sudo tar -xf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+          echo "/opt/zig" >> "$GITHUB_PATH"
+          /opt/zig/zig version
 
       - name: Extract version from tag
         id: version
