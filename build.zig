@@ -8,6 +8,11 @@ pub fn build(b: *std.Build) void {
         "sim",
         "Build the attack simulator (demo-only tool, not shipped).",
     ) orelse false;
+    const enable_bench = b.option(
+        bool,
+        "bench",
+        "Auto-set FAIL2ZIG_RUN_BENCH=1 on benchmark test runs so `zig build test` exercises them.",
+    ) orelse false;
     const test_filter = b.option(
         []const u8,
         "test-filter",
@@ -115,4 +120,103 @@ pub fn build(b: *std.Build) void {
     });
     const run_integration_tests = b.addRunArtifact(integration_tests);
     test_step.dependOn(&run_integration_tests.step);
+
+    // ----- Phase 7 test suite: integration harness, fuzz corpus, benchmarks -----
+
+    const IntegrationFile = struct {
+        name: []const u8,
+        path: []const u8,
+        needs_daemon_binary: bool,
+    };
+    const integration_files = [_]IntegrationFile{
+        .{ .name = "harness", .path = "tests/integration/harness.zig", .needs_daemon_binary = false },
+        .{ .name = "ban", .path = "tests/integration/ban_test.zig", .needs_daemon_binary = true },
+        .{ .name = "migration", .path = "tests/integration/migration_test.zig", .needs_daemon_binary = false },
+        .{ .name = "persistence", .path = "tests/integration/persistence_test.zig", .needs_daemon_binary = true },
+    };
+    for (integration_files) |f| {
+        const mod = b.createModule(.{
+            .root_source_file = b.path(f.path),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        mod.addImport("shared", shared_mod);
+        mod.addImport("engine", engine_mod);
+        const t = b.addTest(.{ .root_module = mod, .filters = test_filters });
+        const run = b.addRunArtifact(t);
+        if (f.needs_daemon_binary) run.step.dependOn(b.getInstallStep());
+        test_step.dependOn(&run.step);
+    }
+
+    // Fuzz corpus (tests/fuzz/). Each target has a minimal module graph —
+    // only the parse boundary it exercises — so the fuzz binaries stay small
+    // and fast to rebuild.
+
+    const parser_only_mod = b.createModule(.{
+        .root_source_file = b.path("engine/core/parser.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    parser_only_mod.addImport("shared", shared_mod);
+
+    const config_native_only_mod = b.createModule(.{
+        .root_source_file = b.path("engine/config/native.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    config_native_only_mod.addImport("shared", shared_mod);
+
+    const FuzzFile = struct {
+        path: []const u8,
+        extra_import_name: ?[]const u8,
+        extra_import_mod: ?*std.Build.Module,
+    };
+    const fuzz_files = [_]FuzzFile{
+        .{ .path = "tests/fuzz/fuzz_parser.zig", .extra_import_name = "parser", .extra_import_mod = parser_only_mod },
+        .{ .path = "tests/fuzz/fuzz_ip.zig", .extra_import_name = null, .extra_import_mod = null },
+        .{ .path = "tests/fuzz/fuzz_protocol.zig", .extra_import_name = null, .extra_import_mod = null },
+        .{ .path = "tests/fuzz/fuzz_config.zig", .extra_import_name = "config_native", .extra_import_mod = config_native_only_mod },
+    };
+    for (fuzz_files) |f| {
+        const mod = b.createModule(.{
+            .root_source_file = b.path(f.path),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("shared", shared_mod);
+        if (f.extra_import_name) |n| mod.addImport(n, f.extra_import_mod.?);
+        const t = b.addTest(.{ .root_module = mod, .filters = test_filters });
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
+
+    // Benchmarks (tests/benchmark/). Gated behind `FAIL2ZIG_RUN_BENCH=1` at
+    // runtime — benchmark tests skip unless the env var is set so the default
+    // `zig build test` cycle stays fast. `-Dbench=true` flips that auto.
+
+    const BenchFile = struct {
+        path: []const u8,
+        needs_daemon_binary: bool,
+    };
+    const bench_files = [_]BenchFile{
+        .{ .path = "tests/benchmark/parse_throughput.zig", .needs_daemon_binary = false },
+        .{ .path = "tests/benchmark/memory_ceiling.zig", .needs_daemon_binary = false },
+        .{ .path = "tests/benchmark/startup_time.zig", .needs_daemon_binary = true },
+        .{ .path = "tests/benchmark/ban_latency.zig", .needs_daemon_binary = false },
+    };
+    for (bench_files) |f| {
+        const mod = b.createModule(.{
+            .root_source_file = b.path(f.path),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        mod.addImport("shared", shared_mod);
+        mod.addImport("engine", engine_mod);
+        const t = b.addTest(.{ .root_module = mod, .filters = test_filters });
+        const run = b.addRunArtifact(t);
+        if (enable_bench) run.setEnvironmentVariable("FAIL2ZIG_RUN_BENCH", "1");
+        if (f.needs_daemon_binary) run.step.dependOn(b.getInstallStep());
+        test_step.dependOn(&run.step);
+    }
 }

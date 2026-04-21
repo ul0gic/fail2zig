@@ -234,7 +234,16 @@ fn lineCallback(
         m.jailIncrementParsed(ctx.jail.slice());
     }
 
-    const result = ctx.parser.parseLine(line) catch {
+    // QA-001: strip the syslog envelope before pattern anchoring. Built-in
+    // filter patterns match against the program-emitted message body
+    // (e.g. `Failed password for ...`), not against the rsyslog-framed
+    // line (`Apr 21 10:15:03 host sshd[1234]: Failed password ...`).
+    // `stripSyslogPrefix` returns the same slice unchanged when no
+    // syslog envelope is detected — zero-alloc, zero-cost on non-syslog
+    // inputs (e.g. journalctl-piped lines where the prefix is absent).
+    const body = parser_mod.stripSyslogPrefix(line);
+
+    const result = ctx.parser.parseLine(body) catch {
         if (ctx.metrics) |m| {
             m.incrementParseErrors();
             m.jailIncrementParseErrors(ctx.jail.slice());

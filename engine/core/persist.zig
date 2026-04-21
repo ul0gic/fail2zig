@@ -250,8 +250,16 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) Error![]StateEntry {
     const stored_crc = std.mem.readInt(u32, bytes[10..14], .little);
 
     const expected_bytes = header_size + @as(usize, count) * entry_size;
-    if (bytes.len < expected_bytes) {
-        std.log.warn("persist: state file truncated (have {d}, need {d}); starting fresh", .{ bytes.len, expected_bytes });
+    // SEC-006: fail closed on ANY size mismatch, not just truncation.
+    // Trailing bytes past the declared entry region can only appear via
+    // filesystem corruption or adversarial tampering (the save path
+    // writes exactly `expected_bytes` and nothing more). Silently
+    // accepting them would mask a real integrity problem.
+    if (bytes.len != expected_bytes) {
+        std.log.warn(
+            "persist: state file size mismatch (have {d}, expected {d}); starting fresh",
+            .{ bytes.len, expected_bytes },
+        );
         return allocator.alloc(StateEntry, 0) catch return error.OutOfMemory;
     }
 
@@ -468,6 +476,41 @@ test "persist: corrupted checksum triggers graceful recovery" {
         try f.seekTo(header_size + 5);
         var one: [1]u8 = .{0xFF};
         _ = try f.writeAll(&one);
+    }
+
+    const entries = try load(testing.allocator, path);
+    defer testing.allocator.free(entries);
+    try testing.expectEqual(@as(usize, 0), entries.len);
+}
+
+test "persist: trailing bytes past declared entries rejected (SEC-006)" {
+    // SEC-006: silently accepting extra bytes masks corruption / tamper.
+    // Write a valid state file, append one junk byte, confirm load
+    // returns 0 entries (fail-closed) rather than the original set.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &path_buf);
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&full, "{s}/state.bin", .{dir});
+
+    var tracker = try StateTracker.init(testing.allocator, .{
+        .maxretry = 2,
+        .findtime = 600,
+    });
+    defer tracker.deinit();
+    const jail = tJail("sshd");
+    _ = try tracker.recordAttempt(tIp("1.2.3.4"), jail, 1_000);
+    _ = try tracker.recordAttempt(tIp("1.2.3.4"), jail, 1_100);
+    try save(&tracker, path);
+
+    // Append one junk byte — valid file + trailing garbage.
+    {
+        const f = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+        defer f.close();
+        try f.seekFromEnd(0);
+        var junk: [1]u8 = .{0xFE};
+        _ = try f.writeAll(&junk);
     }
 
     const entries = try load(testing.allocator, path);

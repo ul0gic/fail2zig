@@ -116,18 +116,19 @@ pub fn extractIpv4(text: []const u8) ?Ipv4Match {
     return .{ .ip = result, .len = consumed };
 }
 
-/// IPv6 scan-and-validate. Delegates the algebra to `std.net.Ip6Address.parse`
-/// which handles full, compressed `::`, and IPv4-mapped forms, but we do our
-/// OWN single-pass scan to determine the slice boundary on attacker input
-/// (we cannot hand `std.net` a whole log line and expect a useful result).
-/// Zero allocation.
+/// IPv6 scan-and-validate. Single-pass structural validator: counts the
+/// number of hex groups, enforces at most one `::` compression run, and
+/// allows a trailing dotted-quad (IPv4-mapped / IPv4-compat forms). No
+/// allocation, O(n) in the length of the literal, and — unlike the
+/// previous truncation loop — does NOT call the full `std.net` parser
+/// once per byte on adversarial input (SEC-009).
+///
+/// The returned `ip` is the raw big-endian u128; callers that want
+/// `::ffff:a.b.c.d` folded to the IPv4 variant go through
+/// `shared.IpAddress.fromIpv6Bits` in `extractIp`.
 pub fn extractIpv6(text: []const u8) ?Ipv6Match {
-    // Allowed bytes inside an IPv6 literal: hex digits, ':', '.'. Scan as
-    // far as possible (bounded), then try std.net.Ip6Address.parse on the
-    // resulting slice. If that rejects, truncate from the right until we
-    // find a valid prefix OR give up.
-    //
-    // A well-formed IPv6 is at most 45 bytes (`xxxx:xxxx:...:xxxx:255.255.255.255`).
+    // Allowed bytes inside an IPv6 literal: hex digits, ':', '.'.
+    // A well-formed IPv6 is at most 45 bytes (`xxxx:...:xxxx:255.255.255.255`).
     // Cap the scan at 64 bytes to be safe against garbage.
     const cap: usize = @min(text.len, 64);
     var scan_len: usize = 0;
@@ -145,10 +146,114 @@ pub fn extractIpv6(text: []const u8) ?Ipv6Match {
         return null;
     }
 
-    // Try longest-valid prefix. An IPv6 literal should contain at least one
-    // ':' — reject anything that is pure IPv4-looking to avoid double-handling.
+    // Structural validator. We walk left-to-right, consuming groups of up
+    // to 4 hex digits separated by ':'. At most one '::' compression run
+    // is allowed. If a '.' is encountered inside a group, the tail is
+    // interpreted as a dotted-quad IPv4 literal occupying the final two
+    // 16-bit groups. We track the longest structurally-valid prefix and
+    // commit the parse at that boundary.
+    //
+    // `groups_seen` counts 16-bit groups collected so far (left side +
+    // right side of a '::' compression). Must end at exactly 8 (or at
+    // most 8 when compressed).
+    var i: usize = 0;
+    var groups_seen: u8 = 0;
+    var saw_double: bool = false;
+    var last_valid_end: usize = 0;
+    var last_valid_groups: u8 = 0;
+    var last_valid_double: bool = false;
+
+    while (i < scan_len) {
+        // Handle colon boundaries first.
+        if (text[i] == ':') {
+            if (i + 1 < scan_len and text[i + 1] == ':') {
+                if (saw_double) {
+                    @branchHint(.unlikely);
+                    break; // Second '::' is invalid; stop at the last valid prefix.
+                }
+                saw_double = true;
+                i += 2;
+                // A trailing '::' at end-of-literal is valid (`1::`).
+                if (i == scan_len or !isIpv6Byte(text[i])) {
+                    // Valid terminator after compression.
+                    if (groups_seen <= 8) {
+                        last_valid_end = i;
+                        last_valid_groups = groups_seen;
+                        last_valid_double = saw_double;
+                    }
+                    break;
+                }
+                continue;
+            }
+            // Single ':' not at start (':: handled above') — must be
+            // between groups; if we're at the very start, invalid.
+            if (i == 0) {
+                @branchHint(.unlikely);
+                break;
+            }
+            // Otherwise consume and expect a group next.
+            i += 1;
+            // Dangling ':' at end means we stopped mid-literal; not valid
+            // past the previous group boundary — break without committing.
+            if (i == scan_len or !isIpv6Byte(text[i])) break;
+            continue;
+        }
+
+        // Collect a hex group of 1..4 digits.
+        const group_start = i;
+        var hex_digits: u8 = 0;
+        while (i < scan_len and isHex(text[i]) and hex_digits < 4) : (i += 1) {
+            hex_digits += 1;
+        }
+        if (hex_digits == 0) {
+            @branchHint(.unlikely);
+            break;
+        }
+        // If a '.' follows, the group is actually the first octet of a
+        // dotted-quad IPv4 suffix. Re-scan from group_start as IPv4.
+        if (i < scan_len and text[i] == '.') {
+            const v4 = extractIpv4(text[group_start..scan_len]) orelse break;
+            // IPv4 occupies two 16-bit groups.
+            if (groups_seen + 2 > 8) break;
+            groups_seen += 2;
+            const end = group_start + v4.len;
+            // Valid total count: 8 without compression, or <=8 with.
+            const ok_count = if (saw_double) groups_seen <= 8 else groups_seen == 8;
+            if (ok_count) {
+                last_valid_end = end;
+                last_valid_groups = groups_seen;
+                last_valid_double = saw_double;
+            }
+            i = end;
+            break; // IPv4 suffix terminates the literal.
+        }
+
+        groups_seen += 1;
+        if (groups_seen > 8) {
+            @branchHint(.unlikely);
+            break;
+        }
+
+        // After a group, valid terminators: end-of-literal, non-ipv6 byte,
+        // or another ':'. If we're at a valid end boundary, record it.
+        const at_end = (i == scan_len) or !isIpv6Byte(text[i]);
+        const ok_count = if (saw_double) groups_seen <= 8 else groups_seen == 8;
+        if (at_end and ok_count) {
+            last_valid_end = i;
+            last_valid_groups = groups_seen;
+            last_valid_double = saw_double;
+        }
+        if (at_end) break;
+        // Otherwise it's a ':' — the top of the next iteration handles it.
+    }
+
+    if (last_valid_end < 2) {
+        @branchHint(.unlikely);
+        return null;
+    }
+    // Require at least one ':' so pure IPv4 doesn't reach here.
     var has_colon = false;
-    for (text[0..scan_len]) |c| {
+    for (text[0..last_valid_end]) |c| {
         if (c == ':') {
             has_colon = true;
             break;
@@ -158,21 +263,38 @@ pub fn extractIpv6(text: []const u8) ?Ipv6Match {
         @branchHint(.unlikely);
         return null;
     }
-
-    var candidate_len: usize = scan_len;
-    while (candidate_len >= 2) : (candidate_len -= 1) {
-        if (std.net.Ip6Address.parse(text[0..candidate_len], 0)) |addr| {
-            const ip = std.mem.readInt(u128, &addr.sa.addr, .big);
-            return .{ .ip = ip, .len = @intCast(candidate_len) };
-        } else |_| {}
+    // Final count validation.
+    if (last_valid_double) {
+        if (last_valid_groups > 8) return null;
+    } else {
+        if (last_valid_groups != 8) return null;
     }
-    return null;
+
+    // Delegate only the final algebra (group-to-u128) to std.net on the
+    // proven-valid prefix. This is ONE call, not O(n) calls — SEC-009.
+    const addr = std.net.Ip6Address.parse(text[0..last_valid_end], 0) catch return null;
+    const ip = std.mem.readInt(u128, &addr.sa.addr, .big);
+    return .{ .ip = ip, .len = @intCast(last_valid_end) };
+}
+
+inline fn isHex(c: u8) bool {
+    return (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+}
+
+inline fn isIpv6Byte(c: u8) bool {
+    return isHex(c) or c == ':' or c == '.';
 }
 
 /// Extract an IPv4 OR IPv6 address at `text[0..]`. Tries IPv6 first because
 /// a valid IPv6 prefix never looks like a valid IPv4 — the presence of `:`
 /// is disqualifying for IPv4. IPv4 is the common case; most of our callers
 /// will end up in the IPv4 branch.
+///
+/// SEC-001: any IPv4-mapped IPv6 result (`::ffff:a.b.c.d`) is canonicalized
+/// to the `.ipv4` variant via `shared.IpAddress.fromIpv6Bits`. Deprecated
+/// `::a.b.c.d` values are rejected. This closes the ban-evasion path where
+/// an attacker toggles representations to get two independent tracker
+/// entries for a single address.
 fn extractIp(text: []const u8) ?IpMatch {
     // Fast path: first byte is hex letter or the second byte is ':' — v6.
     // Otherwise try v4 first, then v6 as a fallback.
@@ -184,7 +306,8 @@ fn extractIp(text: []const u8) ?IpMatch {
         };
         if (looks_v6) {
             if (extractIpv6(text)) |r| {
-                return .{ .ip = .{ .ipv6 = r.ip }, .len = r.len };
+                const canon = shared.IpAddress.fromIpv6Bits(r.ip) catch return null;
+                return .{ .ip = canon, .len = r.len };
             }
         }
     }
@@ -192,7 +315,8 @@ fn extractIp(text: []const u8) ?IpMatch {
         return .{ .ip = .{ .ipv4 = r.ip }, .len = r.len };
     }
     if (extractIpv6(text)) |r| {
-        return .{ .ip = .{ .ipv6 = r.ip }, .len = r.len };
+        const canon = shared.IpAddress.fromIpv6Bits(r.ip) catch return null;
+        return .{ .ip = canon, .len = r.len };
     }
     return null;
 }
@@ -368,6 +492,46 @@ pub fn extractTimestampWithYear(
     }
 
     return null;
+}
+
+// ----------------------------------------------------------------------------
+// Syslog prefix stripping — QA-001
+// ----------------------------------------------------------------------------
+
+/// Strip a standard RFC 3164 syslog prefix from `line` if one is present.
+/// Returns a subslice of `line` pointing at the message body; zero
+/// allocation. Callers feed the returned slice to `Parser.parseLine` so
+/// filter patterns can remain position-0 anchored against the "real"
+/// log message rather than the syslog envelope.
+///
+/// Recognized shapes:
+///   * `MMM [D]D HH:MM:SS host prog[pid]: body...`     -> `body...`
+///   * `MMM [D]D HH:MM:SS host prog: body...`          -> `body...`
+///   * `YYYY-MM-DDTHH:MM:SS... host prog[pid]: body...` -> `body...`
+///   * Any other shape -> returned unchanged.
+///
+/// The detector accepts only well-formed BSD / ISO 8601 prefixes — a log
+/// line that genuinely starts with `"Failed password..."` is returned
+/// untouched.
+pub fn stripSyslogPrefix(line: []const u8) []const u8 {
+    // Detect a timestamp prefix. If present, skip it; then look for the
+    // program-tag-colon-space separator and return everything after it.
+    const ts_hit = extractTimestamp(line);
+    if (ts_hit == null) return line;
+    const after_ts = ts_hit.?.len;
+    if (after_ts >= line.len or line[after_ts] != ' ') return line;
+    // Bounded scan for `": "`. Cap at 256 bytes after the timestamp —
+    // beyond that, this is not a syslog prefix, it's a log message that
+    // happens to contain a colon. 256 covers every realistic
+    // `hostname program[pid]:` combination.
+    const scan_cap = @min(line.len, after_ts + 256);
+    var i: usize = after_ts + 1;
+    while (i + 1 < scan_cap) : (i += 1) {
+        if (line[i] == ':' and line[i + 1] == ' ') {
+            return line[i + 2 ..];
+        }
+    }
+    return line;
 }
 
 // ----------------------------------------------------------------------------
@@ -702,14 +866,46 @@ test "parser: extractIpv6 full form" {
 }
 
 test "parser: extractIpv6 ipv4-mapped" {
+    // extractIpv6 still returns the raw u128; canonicalization happens in extractIp.
     const r = extractIpv6("::ffff:192.168.1.1 tail").?;
     const expected: u128 = 0x00000000000000000000ffffc0a80101;
     try std.testing.expectEqual(expected, r.ip);
+    try std.testing.expectEqual(@as(u16, 18), r.len);
 }
 
 test "parser: extractIpv6 rejects plain v4" {
     // No colons -> not v6.
     try std.testing.expect(extractIpv6("192.168.1.1") == null);
+}
+
+test "parser: extractIp folds ::ffff: into ipv4 (SEC-001)" {
+    // Same attacker address in two representations must produce equal keys.
+    const mapped = extractIp("::ffff:1.2.3.4 tail").?;
+    const plain = extractIp("1.2.3.4 tail").?;
+    try std.testing.expect(shared.IpAddress.eql(mapped.ip, plain.ip));
+    try std.testing.expectEqual(@as(u32, 0x01020304), mapped.ip.ipv4);
+}
+
+test "parser: extractIp rejects deprecated ::a.b.c.d (SEC-001)" {
+    // IPv4-compatible form is deprecated and becomes an evasion vector —
+    // reject outright. `extractIpv6` still returns the raw bits; extractIp
+    // filters via fromIpv6Bits.
+    try std.testing.expect(extractIp("::1.2.3.4") == null);
+}
+
+test "parser: extractIpv6 single-pass rejects double '::' (SEC-009)" {
+    // The previous truncation-loop implementation would keep retrying
+    // shorter prefixes. The structural validator should return null or
+    // a short prefix — never hang or burn O(n) std.net calls.
+    try std.testing.expect(extractIpv6("::1::2") == null or extractIpv6("::1::2").?.len <= 3);
+}
+
+test "parser: extractIpv6 adversarial garbage input (SEC-009)" {
+    // Worst-case input for the old loop: 60+ bytes of ipv6-lookalike that
+    // never parses until the last attempt. The structural validator should
+    // reject it in a single pass.
+    const adversarial = "a:b:c:d:e:f:0123456789abcdef:0123456789abcdef:z tail";
+    _ = extractIpv6(adversarial); // Must not panic; structural check rejects.
 }
 
 test "parser: extractTimestamp ISO 8601 Z" {
@@ -749,6 +945,55 @@ test "parser: extractTimestamp epoch seconds" {
 test "parser: extractTimestamp rejects random digits" {
     // Only 5 digits — too short to be an epoch.
     try std.testing.expect(extractTimestamp("12345 tail") == null);
+}
+
+test "parser: stripSyslogPrefix BSD rsyslog sshd line (QA-001)" {
+    // QA-001: a real /var/log/auth.log line must come out of
+    // stripSyslogPrefix as just the program message body, so that
+    // position-0-anchored filter patterns can match.
+    const raw = "Apr 21 10:15:03 host sshd[1234]: Failed password for root from 1.2.3.4 port 22 ssh2";
+    const stripped = stripSyslogPrefix(raw);
+    try std.testing.expectEqualStrings(
+        "Failed password for root from 1.2.3.4 port 22 ssh2",
+        stripped,
+    );
+}
+
+test "parser: stripSyslogPrefix ISO 8601 variant (QA-001)" {
+    const raw = "2026-04-21T10:15:03Z host nginx: 1.2.3.4 - - [21/Apr] \"GET /wp-login.php HTTP/1.1\" 404 0";
+    const stripped = stripSyslogPrefix(raw);
+    try std.testing.expectEqualStrings(
+        "1.2.3.4 - - [21/Apr] \"GET /wp-login.php HTTP/1.1\" 404 0",
+        stripped,
+    );
+}
+
+test "parser: stripSyslogPrefix passes non-syslog lines through (QA-001)" {
+    // journalctl-piped or test-harness lines already start with the
+    // program message body — stripSyslogPrefix must return them unchanged.
+    const raw = "Failed password for root from 1.2.3.4 port 22 ssh2";
+    const stripped = stripSyslogPrefix(raw);
+    try std.testing.expectEqualStrings(raw, stripped);
+}
+
+test "parser: stripSyslogPrefix leaves lines with no colon intact (QA-001)" {
+    // A timestamped line without the `program: ` separator must not be
+    // mangled — returned as-is.
+    const raw = "Apr 21 10:15:03 host notquitesyslog";
+    const stripped = stripSyslogPrefix(raw);
+    try std.testing.expectEqualStrings(raw, stripped);
+}
+
+test "parser: compile matches syslog-prefixed sshd via stripSyslogPrefix (QA-001)" {
+    // The integration: sshd pattern + real rsyslog line. Without
+    // stripping, this would fail because `Failed password` sits at
+    // byte 32, not byte 0. After stripping, the anchored literal
+    // matches at position 0.
+    const m = comptime compile("Failed password for <*> from <IP>");
+    const raw = "Apr 21 10:15:03 host sshd[1234]: Failed password for root from 1.2.3.4 port 22 ssh2";
+    const body = stripSyslogPrefix(raw);
+    const r = m(body).?;
+    try std.testing.expectEqual(@as(u32, 0x01020304), r.ip.ipv4);
 }
 
 test "parser: compile sshd-style pattern" {

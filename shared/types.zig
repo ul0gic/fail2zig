@@ -17,8 +17,38 @@ pub const IpAddress = union(enum) {
 
     pub fn parse(s: []const u8) Error!IpAddress {
         if (parseIpv4(s)) |v| return .{ .ipv4 = v };
-        if (parseIpv6(s)) |v| return .{ .ipv6 = v };
+        if (parseIpv6(s)) |v| return fromIpv6Bits(v);
         return error.Invalid;
+    }
+
+    /// Canonicalize a u128 IPv6 address into its semantically-equivalent
+    /// form. IPv4-mapped IPv6 (`::ffff:a.b.c.d`, RFC 4291 §2.5.5.2) is
+    /// folded to a plain `.ipv4` variant so the state tracker can't be
+    /// tricked into treating `1.2.3.4` and `::ffff:1.2.3.4` as distinct
+    /// offenders. The deprecated IPv4-compatible range (`::a.b.c.d`, RFC
+    /// 4291 §2.5.5.1, formally deprecated in RFC 4291 and unrouted) is
+    /// rejected: no legitimate peer emits it and accepting it would be
+    /// a second evasion surface. `::` (all-zeros, unspecified) is left
+    /// intact — it's a distinct address with no IPv4 equivalent.
+    pub fn fromIpv6Bits(v: u128) Error!IpAddress {
+        // IPv4-mapped: bits 80..95 == 0xffff, bits 0..79 == 0.
+        const mapped_prefix: u128 = 0x0000_0000_0000_0000_0000_ffff_0000_0000;
+        const mapped_mask: u128 = 0xffff_ffff_ffff_ffff_ffff_ffff_0000_0000;
+        if ((v & mapped_mask) == mapped_prefix) {
+            return .{ .ipv4 = @truncate(v) };
+        }
+        // IPv4-compatible (deprecated): top 96 bits zero, low 32 bits non-zero,
+        // and NOT the special ::0, ::1 addresses. Reject to close the evasion
+        // window without breaking loopback / unspecified.
+        const compat_mask: u128 = 0xffff_ffff_ffff_ffff_ffff_ffff_0000_0000;
+        if ((v & compat_mask) == 0) {
+            const low32: u32 = @truncate(v);
+            // Preserve :: (0) and ::1 as legitimate IPv6 addresses.
+            if (low32 != 0 and low32 != 1) {
+                return error.Invalid;
+            }
+        }
+        return .{ .ipv6 = v };
     }
 
     pub fn eql(a: IpAddress, b: IpAddress) bool {
@@ -212,10 +242,38 @@ test "IpAddress: parse ipv6 compressed all-zeros" {
     try std.testing.expectEqual(@as(u128, 0), ip.ipv6);
 }
 
-test "IpAddress: parse ipv6 ipv4-mapped" {
-    const ip = try IpAddress.parse("::ffff:192.168.1.1");
-    const expected: u128 = 0x00000000000000000000ffffc0a80101;
-    try std.testing.expectEqual(expected, ip.ipv6);
+test "IpAddress: parse ipv6 ipv4-mapped folds to ipv4" {
+    // SEC-001: `::ffff:a.b.c.d` MUST canonicalize to the IPv4 variant so
+    // the state tracker treats it as the same offender as a plain `a.b.c.d`.
+    const mapped = try IpAddress.parse("::ffff:192.168.1.1");
+    const plain = try IpAddress.parse("192.168.1.1");
+    try std.testing.expect(IpAddress.eql(mapped, plain));
+    try std.testing.expectEqual(@as(u32, 0xC0A80101), mapped.ipv4);
+}
+
+test "IpAddress: deprecated ipv4-compatible ::a.b.c.d is rejected" {
+    // SEC-001: the deprecated `::a.b.c.d` range (RFC 4291 §2.5.5.1) is
+    // another potential evasion vector — reject so it can never reach
+    // the state tracker.
+    try std.testing.expectError(error.Invalid, IpAddress.parse("::1.2.3.4"));
+    try std.testing.expectError(error.Invalid, IpAddress.parse("::192.168.1.1"));
+    // But :: and ::1 must still parse (they have no IPv4 equivalent).
+    _ = try IpAddress.parse("::");
+    _ = try IpAddress.parse("::1");
+}
+
+test "IpAddress: fromIpv6Bits folds mapped low bits" {
+    // Direct test of the canonicalizer.
+    const raw: u128 = 0x00000000000000000000ffff01020304;
+    const ip = try IpAddress.fromIpv6Bits(raw);
+    try std.testing.expectEqual(@as(u32, 0x01020304), ip.ipv4);
+}
+
+test "IpAddress: fromIpv6Bits preserves unspecified and loopback" {
+    const unspec = try IpAddress.fromIpv6Bits(0);
+    try std.testing.expectEqual(@as(u128, 0), unspec.ipv6);
+    const loop = try IpAddress.fromIpv6Bits(1);
+    try std.testing.expectEqual(@as(u128, 1), loop.ipv6);
 }
 
 test "IpAddress: format ipv4 roundtrip" {

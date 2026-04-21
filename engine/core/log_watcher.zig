@@ -233,18 +233,65 @@ pub const LogWatcher = struct {
         // Seek to end: we only care about NEW lines, not the historical
         // file contents. Tailing-from-end is the standard fail2ban
         // behavior. On rotation we reset to 0.
+        //
+        // SEC-007: lseek errors (ESPIPE on a pipe-backed path, EBADF,
+        // EOVERFLOW) previously got silently swallowed, leaving us
+        // reading from an unknown cursor. Explicit error handling here:
+        // log the failure, detach the watch, and continue setup so the
+        // parent-directory watch can still pick up a regular file if it
+        // later appears at the same path.
         if (fw.file_fd >= 0) {
-            posix.lseek_END(fw.file_fd, 0) catch {};
-            fw.offset = posix.lseek_CUR_get(fw.file_fd) catch 0;
-            fw.prev_size = fw.offset;
-            // Seed the fingerprint from whatever head bytes exist
-            // already (if any). Useful when attaching to a long-running
-            // file that has existing content.
-            if (fw.offset >= fingerprint_len) {
-                posix.lseek_SET(fw.file_fd, 0) catch {};
-                const got = posix.read(fw.file_fd, fw.fingerprint[0..]) catch 0;
-                fw.fingerprint_len = @intCast(got);
-                posix.lseek_SET(fw.file_fd, fw.offset) catch {};
+            blk: {
+                posix.lseek_END(fw.file_fd, 0) catch |err| {
+                    std.log.warn(
+                        "log_watcher: lseek_END failed on {s}: {s}; detaching file watch",
+                        .{ fw.path(), @errorName(err) },
+                    );
+                    self.detachFileWatch(fw);
+                    break :blk;
+                };
+                fw.offset = posix.lseek_CUR_get(fw.file_fd) catch |err| {
+                    std.log.warn(
+                        "log_watcher: lseek_CUR failed on {s}: {s}; detaching file watch",
+                        .{ fw.path(), @errorName(err) },
+                    );
+                    self.detachFileWatch(fw);
+                    break :blk;
+                };
+                fw.prev_size = fw.offset;
+                // Seed the fingerprint from whatever head bytes exist
+                // already (if any). Useful when attaching to a long-running
+                // file that has existing content. Any lseek or read error
+                // here is a hard signal that the file isn't a regular
+                // file (or the fd is bad); detach and let the parent
+                // watch recover if something better shows up.
+                if (fw.offset >= fingerprint_len) {
+                    posix.lseek_SET(fw.file_fd, 0) catch |err| {
+                        std.log.warn(
+                            "log_watcher: lseek_SET(0) failed on {s}: {s}; detaching file watch",
+                            .{ fw.path(), @errorName(err) },
+                        );
+                        self.detachFileWatch(fw);
+                        break :blk;
+                    };
+                    const got = posix.read(fw.file_fd, fw.fingerprint[0..]) catch |err| {
+                        std.log.warn(
+                            "log_watcher: read(head) failed on {s}: {s}; detaching file watch",
+                            .{ fw.path(), @errorName(err) },
+                        );
+                        self.detachFileWatch(fw);
+                        break :blk;
+                    };
+                    fw.fingerprint_len = @intCast(got);
+                    posix.lseek_SET(fw.file_fd, fw.offset) catch |err| {
+                        std.log.warn(
+                            "log_watcher: lseek_SET(offset) failed on {s}: {s}; detaching file watch",
+                            .{ fw.path(), @errorName(err) },
+                        );
+                        self.detachFileWatch(fw);
+                        break :blk;
+                    };
+                }
             }
         }
 
@@ -436,13 +483,39 @@ pub const LogWatcher = struct {
         // are available, up to `fingerprint_len`. A populated
         // fingerprint (even a short one) is what enables truncate+refill
         // detection in the IN_MODIFY race.
+        //
+        // SEC-007: an lseek failure in this block points to a corrupt or
+        // non-regular-file fd. Log it so ops know why rotation detection
+        // degraded; we keep reading (the caller-owned offset is still
+        // correct, but truncate+refill races will go undetected until
+        // the next successful refresh).
         if (fw.offset > 0) {
             const sample_len = @min(@as(usize, fingerprint_len), fw.offset);
-            posix.lseek_SET(fw.file_fd, 0) catch return;
-            const got = posix.read(fw.file_fd, fw.fingerprint[0..sample_len]) catch return;
+            posix.lseek_SET(fw.file_fd, 0) catch |err| {
+                std.log.warn(
+                    "log_watcher: fingerprint lseek_SET(0) failed on {s}: {s}",
+                    .{ fw.path(), @errorName(err) },
+                );
+                return;
+            };
+            const got = posix.read(fw.file_fd, fw.fingerprint[0..sample_len]) catch |err| {
+                std.log.warn(
+                    "log_watcher: fingerprint read failed on {s}: {s}",
+                    .{ fw.path(), @errorName(err) },
+                );
+                return;
+            };
             fw.fingerprint_len = @intCast(got);
-            // Restore offset for the next read.
-            posix.lseek_SET(fw.file_fd, fw.offset) catch return;
+            // Restore offset for the next read. If this fails the next
+            // readNewData will re-seek at the top, so no correctness
+            // impact; still log to surface the underlying issue.
+            posix.lseek_SET(fw.file_fd, fw.offset) catch |err| {
+                std.log.warn(
+                    "log_watcher: fingerprint lseek_SET(offset) failed on {s}: {s}",
+                    .{ fw.path(), @errorName(err) },
+                );
+                return;
+            };
         }
     }
 
@@ -600,6 +673,57 @@ const LineSink = struct {
         return self.lines.items.len;
     }
 };
+
+test "log_watcher: fifo path lseek failure detaches cleanly (SEC-007)" {
+    // SEC-007: operator points logpath at a FIFO (pipe). lseek_END
+    // returns ESPIPE. The watcher must log and detach the file watch
+    // rather than silently proceed with a stale cursor or crash.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = tmp.dir.realpath(".", &path_buf) catch return error.SkipZigTest;
+    const fifo_name = "fifo.log";
+    var full_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const fifo_path = try std.fmt.bufPrint(&full_path_buf, "{s}/{s}", .{ dir_path, fifo_name });
+
+    // Create the FIFO. `mkfifoat` is the POSIX call.
+    var path_z: [std.fs.max_path_bytes]u8 = undefined;
+    @memcpy(path_z[0..fifo_path.len], fifo_path);
+    path_z[fifo_path.len] = 0;
+    // libc: int mkfifo(const char *pathname, mode_t mode)
+    const mkfifo = struct {
+        extern "c" fn mkfifo(path: [*:0]const u8, mode: u32) callconv(.C) c_int;
+    }.mkfifo;
+    if (mkfifo(@ptrCast(&path_z[0]), 0o600) != 0) return error.SkipZigTest;
+
+    var loop = try EventLoop.init(testing.allocator);
+    defer loop.deinit();
+
+    var watcher = try LogWatcher.init(testing.allocator, &loop);
+    try watcher.attach();
+    defer watcher.deinit();
+
+    var sink = LineSink.init(testing.allocator);
+    defer sink.deinit(testing.allocator);
+
+    const jail = try JailId.fromSlice("sshd");
+    // watchFile may succeed or fail depending on whether opening a FIFO
+    // for reading blocks. What MUST NOT happen: a panic or crash. On
+    // success the FileWatch should have been detached (file_fd=-1).
+    watcher.watchFile(fifo_path, jail, LineSink.onLine, &sink) catch {
+        // Accept errors; the point is no crash.
+        return;
+    };
+    // If watchFile returned successfully, the file watch must be detached
+    // (SEC-007): lseek_END on a FIFO returns ESPIPE, so the handler
+    // detaches.
+    for (watcher.files.items) |fw| {
+        try testing.expect(fw.file_fd == -1);
+    }
+}
 
 test "log_watcher: detects appended lines" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;

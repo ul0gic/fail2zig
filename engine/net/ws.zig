@@ -240,6 +240,21 @@ pub const WsServer = struct {
             };
             cursor += parse.consumed;
         }
+        // SEC-010: buffer-full but no frame consumed. The client either
+        // sent garbage or stalled mid-frame with enough bytes to fill
+        // the buffer. Either way, we cannot make progress and the next
+        // read would be into a zero-length slice — relying on the
+        // kernel's zero-length-read semantics is brittle. Close the
+        // client with an explicit policy-violation log.
+        if (cursor == 0 and cli.len == cli.buf.len) {
+            @branchHint(.unlikely);
+            std.log.warn(
+                "ws: client fd={d} filled buffer with unparseable bytes; closing (policy)",
+                .{cli.fd},
+            );
+            self.closeClient(cli);
+            return;
+        }
         // Compact leftover bytes to the front of the buffer.
         if (cursor > 0) {
             std.mem.copyForwards(u8, cli.buf[0 .. cli.len - cursor], cli.buf[cursor..cli.len]);
@@ -675,6 +690,64 @@ fn readExact(fd: posix.fd_t, buf: []u8) !void {
         if (n == 0) return error.EndOfStream;
         i += n;
     }
+}
+
+test "ws: buffer full with unparseable bytes closes client (SEC-010)" {
+    // SEC-010: a client that fills the read buffer with bytes that
+    // cannot form a complete frame (declared payload longer than the
+    // buffer can hold, no matter how many more bytes arrive) must be
+    // closed explicitly. Without the SEC-010 guard, the next read
+    // into cli.buf[cli.len..] is a zero-length slice and correctness
+    // depends on kernel semantics — brittle.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = testing.allocator;
+
+    var loop = try EventLoop.init(a);
+    defer loop.deinit();
+
+    var server = try WsServer.init(a, &loop);
+    defer server.deinit();
+
+    var fds: [2]i32 = undefined;
+    const stype_u32: u32 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
+    const rc = linux.socketpair(
+        @as(i32, linux.AF.UNIX),
+        @as(i32, @intCast(stype_u32)),
+        0,
+        &fds,
+    );
+    switch (posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    defer posix.close(fds[1]);
+
+    try server.admitUpgraded(fds[0], &.{});
+    const cli = server.clients[0].?;
+
+    // Forge a "first bytes of a valid masked frame whose declared payload
+    // is exactly max_inbound_payload (the biggest the parser accepts) but
+    // whose total frame size (14-byte header + payload) exceeds
+    // cli.buf.len". parseFrame accepts the length (at the cap), then
+    // requires `buf.len >= offset + payload_len` which is false, so
+    // returns Incomplete. cursor stays 0, cli.len == cli.buf.len → the
+    // SEC-010 guard closes the client.
+    //
+    // Wire shape (14-byte header): b0=0x81 (FIN + text), b1=0xFF
+    // (masked + 127-extended), u64 length = max_inbound_payload, u32 mask.
+    std.debug.assert(cli.buf.len >= 16);
+    cli.buf[0] = 0x81;
+    cli.buf[1] = 0xFF;
+    std.mem.writeInt(u64, cli.buf[2..10], @as(u64, max_inbound_payload), .big);
+    cli.buf[10] = 0;
+    cli.buf[11] = 0;
+    cli.buf[12] = 0;
+    cli.buf[13] = 0;
+    cli.len = cli.buf.len;
+
+    server.readFrames(cli);
+    // Slot cleared ⇒ client was closed.
+    try testing.expect(server.clients[0] == null);
 }
 
 test "ws: admitUpgraded takes ownership of fd and broadcasts reach it" {

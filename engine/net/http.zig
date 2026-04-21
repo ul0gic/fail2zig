@@ -40,6 +40,18 @@ pub const max_clients: usize = 16;
 pub const max_request_bytes: usize = 8 * 1024;
 pub const max_response_bytes: usize = 64 * 1024;
 
+/// SEC-008: per-client read deadline. If the client has not sent a
+/// complete request (\r\n\r\n) within this many ms of admission, the
+/// connection is closed. Defends against slowloris holding a slot
+/// indefinitely.
+pub const client_read_deadline_ms: i64 = 5_000;
+
+/// SEC-008: accept-side rate cap. At most this many new connections
+/// admitted per rolling 1-second bucket. Excess `accept()` results are
+/// closed immediately. Defends against local flood that would otherwise
+/// saturate all `max_clients` slots.
+pub const max_accepts_per_second: u32 = 100;
+
 // ============================================================================
 // Public error set
 // ============================================================================
@@ -113,6 +125,9 @@ const ClientReg = struct {
     fd: posix.fd_t,
     buf: [max_request_bytes]u8 = undefined,
     len: usize = 0,
+    /// SEC-008: wall-clock time (ms) when the client was admitted. Used
+    /// to enforce `client_read_deadline_ms` on slow / stalled clients.
+    admitted_ms: i64 = 0,
 };
 
 // ============================================================================
@@ -134,6 +149,9 @@ pub const HttpServer = struct {
     /// any Upgrade request gets 400.
     ws_server: ?*ws_mod.WsServer = null,
     clients: [max_clients]?*ClientReg = [_]?*ClientReg{null} ** max_clients,
+    /// SEC-008: rolling 1-second accept-rate bucket.
+    accept_bucket_epoch_s: i64 = 0,
+    accept_bucket_count: u32 = 0,
 
     /// Create a TCP listening socket. `bind_addr` is a dotted IPv4 —
     /// typically `"127.0.0.1"` (the default we recommend). `port == 0`
@@ -243,6 +261,10 @@ pub const HttpServer = struct {
     }
 
     fn acceptPending(self: *HttpServer, listen_fd: posix.fd_t) void {
+        // First: sweep any clients that blew past the read deadline.
+        // Cheap to run on every accept batch; keeps slots available.
+        self.sweepDeadlines();
+
         while (true) {
             const accept_flags: u32 = posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
             const cfd = posix.accept(listen_fd, null, null, accept_flags) catch |err| switch (err) {
@@ -252,11 +274,51 @@ pub const HttpServer = struct {
                     return;
                 },
             };
+            // SEC-008: accept-side rate limit. Rolling 1-second bucket.
+            if (!self.consumeAcceptToken()) {
+                @branchHint(.unlikely);
+                std.log.warn("http: accept rate cap reached; dropping fd={d}", .{cfd});
+                posix.close(cfd);
+                continue;
+            }
             self.admitClient(cfd) catch |err| {
                 std.log.warn("http: admit fd={d}: {s}", .{ cfd, @errorName(err) });
                 posix.close(cfd);
             };
         }
+    }
+
+    /// SEC-008: close any admitted client that has exceeded the read
+    /// deadline. Called opportunistically from the accept loop; bounded
+    /// by `max_clients` so it's a cheap constant-time scan.
+    fn sweepDeadlines(self: *HttpServer) void {
+        const now_ms = std.time.milliTimestamp();
+        for (&self.clients) |*slot| {
+            if (slot.*) |cli| {
+                if (now_ms - cli.admitted_ms > client_read_deadline_ms) {
+                    @branchHint(.unlikely);
+                    std.log.info(
+                        "http: client fd={d} exceeded {d}ms read deadline; closing",
+                        .{ cli.fd, client_read_deadline_ms },
+                    );
+                    self.closeClient(cli);
+                }
+            }
+        }
+    }
+
+    /// SEC-008: accept-rate bucket. Returns true iff a token is available
+    /// in the current 1-second window. Rolls the bucket when the wall
+    /// clock advances to a new second.
+    fn consumeAcceptToken(self: *HttpServer) bool {
+        const now_s: i64 = @divTrunc(std.time.milliTimestamp(), 1000);
+        if (now_s != self.accept_bucket_epoch_s) {
+            self.accept_bucket_epoch_s = now_s;
+            self.accept_bucket_count = 0;
+        }
+        if (self.accept_bucket_count >= max_accepts_per_second) return false;
+        self.accept_bucket_count += 1;
+        return true;
     }
 
     fn admitClient(self: *HttpServer, fd: posix.fd_t) !void {
@@ -271,7 +333,7 @@ pub const HttpServer = struct {
 
         const cli = try self.allocator.create(ClientReg);
         errdefer self.allocator.destroy(cli);
-        cli.* = .{ .server = self, .fd = fd };
+        cli.* = .{ .server = self, .fd = fd, .admitted_ms = std.time.milliTimestamp() };
 
         try self.loop.addFd(fd, linux.EPOLL.IN, onClientReadable, @ptrCast(cli));
         self.clients[idx.?] = cli;
@@ -289,6 +351,20 @@ pub const HttpServer = struct {
     }
 
     fn handleClient(self: *HttpServer, cli: *ClientReg) void {
+        // SEC-008: enforce the read deadline on every wake-up. A slow
+        // client that dribbles bytes to stay under EAGAIN still gets
+        // dropped once the total time since admission exceeds the cap.
+        const now_ms = std.time.milliTimestamp();
+        if (now_ms - cli.admitted_ms > client_read_deadline_ms) {
+            @branchHint(.unlikely);
+            std.log.info(
+                "http: client fd={d} exceeded {d}ms read deadline; closing",
+                .{ cli.fd, client_read_deadline_ms },
+            );
+            self.closeClient(cli);
+            return;
+        }
+
         // Read until we have the end of headers (\r\n\r\n) or the buffer
         // fills. Body is ignored — we only support GET.
         while (cli.len < cli.buf.len) {
@@ -499,6 +575,26 @@ fn parseRequestLine(line: []const u8) ?RequestLine {
     return .{ .method = line[0..sp1], .path = rest[0..sp2] };
 }
 
+/// SEC-005: security headers emitted on every response. Constants so
+/// they compile to a single static string and cost nothing at runtime.
+///
+/// Rationale:
+///   - `X-Content-Type-Options: nosniff` — stop browsers MIME-sniffing
+///     our text/plain metrics into executable content.
+///   - `X-Frame-Options: DENY` and CSP `frame-ancestors 'none'` — we
+///     never embed, never want to be framed.
+///   - `Referrer-Policy: no-referrer` — our endpoints never link out.
+///   - `Cache-Control: no-store` — metrics / status are live state; any
+///     intermediary cache would leak stale data.
+///   - `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`
+///     — we serve only text/plain and application/json bodies, never HTML.
+const security_headers =
+    "X-Content-Type-Options: nosniff\r\n" ++
+    "X-Frame-Options: DENY\r\n" ++
+    "Referrer-Policy: no-referrer\r\n" ++
+    "Cache-Control: no-store\r\n" ++
+    "Content-Security-Policy: default-src 'none'; frame-ancestors 'none'\r\n";
+
 fn writeResponse(
     fd: posix.fd_t,
     status: u16,
@@ -506,10 +602,12 @@ fn writeResponse(
     content_type: []const u8,
     body: []const u8,
 ) !void {
-    var hdr: [256]u8 = undefined;
+    var hdr: [512]u8 = undefined;
     const head = try std.fmt.bufPrint(
         &hdr,
-        "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n" ++
+            security_headers ++
+            "\r\n",
         .{ status, reason, content_type, body.len },
     );
     try writeAll(fd, head);
@@ -667,6 +765,159 @@ fn jsonStatus(
 ) anyerror!void {
     _ = ctx;
     try out.appendSlice(a, "{\"hello\":\"world\"}");
+}
+
+test "http: accept rate cap enforces 1-second bucket (SEC-008)" {
+    // SEC-008: consumeAcceptToken must allow exactly max_accepts_per_second
+    // admissions per rolling 1-second window. We exercise it directly on a
+    // minimal server — no listener, no event-loop interaction needed.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = testing.allocator;
+    var loop = try EventLoop.init(a);
+    defer loop.deinit();
+
+    var server: HttpServer = .{
+        .allocator = a,
+        .loop = &loop,
+        .port = 0,
+        .bind_addr = "127.0.0.1",
+        .listen_fd = -1,
+    };
+
+    // First max_accepts_per_second calls succeed within the same bucket.
+    for (0..max_accepts_per_second) |_| {
+        try testing.expect(server.consumeAcceptToken());
+    }
+    // The next one fails — bucket exhausted.
+    try testing.expect(!server.consumeAcceptToken());
+
+    // Force-roll the bucket by pretending time advanced to the next
+    // second. In production this happens naturally; here we poke the
+    // internal epoch so the test doesn't need a 1s sleep.
+    server.accept_bucket_epoch_s -= 1;
+    try testing.expect(server.consumeAcceptToken());
+}
+
+test "http: sweep closes clients past the read deadline (SEC-008)" {
+    // SEC-008: a client admitted long enough ago must be closed by
+    // sweepDeadlines even if it has never been readable. We admit a
+    // client via a socketpair, back-date its admitted_ms, then call
+    // sweepDeadlines and confirm the slot is freed.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = testing.allocator;
+    var loop = try EventLoop.init(a);
+    defer loop.deinit();
+
+    var server: HttpServer = .{
+        .allocator = a,
+        .loop = &loop,
+        .port = 0,
+        .bind_addr = "127.0.0.1",
+        .listen_fd = -1,
+    };
+    defer {
+        // Any leftover clients would leak; closeClient is idempotent
+        // at the slot-level so this is safe.
+        for (&server.clients) |*slot| {
+            if (slot.*) |cli| {
+                loop.removeFd(cli.fd) catch {};
+                posix.close(cli.fd);
+                a.destroy(cli);
+                slot.* = null;
+            }
+        }
+    }
+
+    var fds: [2]i32 = undefined;
+    const stype_u32: u32 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
+    const rc = linux.socketpair(
+        @as(i32, linux.AF.UNIX),
+        @as(i32, @intCast(stype_u32)),
+        0,
+        &fds,
+    );
+    switch (posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    defer posix.close(fds[1]);
+
+    try server.admitClient(fds[0]);
+    // Back-date the admission clock so the deadline is guaranteed to be exceeded.
+    if (server.clients[0]) |cli| {
+        cli.admitted_ms = std.time.milliTimestamp() - client_read_deadline_ms - 1000;
+    }
+    server.sweepDeadlines();
+    // The slot must be empty; the fd was closed by closeClient.
+    try testing.expect(server.clients[0] == null);
+}
+
+test "http: responses include security headers (SEC-005)" {
+    // SEC-005: every response must carry the full set of defense-in-depth
+    // headers regardless of status code or content type. Exercise both a
+    // 200 and a 404 to confirm the headers come from writeResponse, not
+    // from the success path.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = testing.allocator;
+
+    var loop = try EventLoop.init(a);
+    defer loop.deinit();
+
+    var server = HttpServer.init(a, &loop, 0, "127.0.0.1") catch return error.SkipZigTest;
+    defer server.deinit();
+    try server.start();
+
+    const port = try server.getBoundPort();
+    const Ctx = struct { port: u16, metrics: *ClientResult, notfound: *ClientResult };
+    var metrics: ClientResult = .{};
+    var notfound: ClientResult = .{};
+    var ctx = Ctx{ .port = port, .metrics = &metrics, .notfound = &notfound };
+
+    const Driver = struct {
+        fn run(c: *Ctx, l: *EventLoop) void {
+            std.time.sleep(20 * std.time.ns_per_ms);
+            // /metrics → 200
+            const fd1 = connectLocalhost(c.port) catch {
+                l.stop();
+                return;
+            };
+            defer posix.close(fd1);
+            writeAll(fd1, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n") catch {};
+            c.metrics.len = readAll(fd1, &c.metrics.buf) catch 0;
+            // /nope → 404
+            const fd2 = connectLocalhost(c.port) catch {
+                l.stop();
+                return;
+            };
+            defer posix.close(fd2);
+            writeAll(fd2, "GET /nope HTTP/1.1\r\nHost: x\r\n\r\n") catch {};
+            c.notfound.len = readAll(fd2, &c.notfound.buf) catch 0;
+            l.stop();
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Driver.run, .{ &ctx, &loop });
+    const Wd = struct {
+        fn run(l: *EventLoop) void {
+            std.time.sleep(2 * std.time.ns_per_s);
+            l.stop();
+        }
+    };
+    const wd = try std.Thread.spawn(.{}, Wd.run, .{&loop});
+    try loop.run();
+    th.join();
+    wd.join();
+
+    const required = [_][]const u8{
+        "X-Content-Type-Options: nosniff",
+        "X-Frame-Options: DENY",
+        "Referrer-Policy: no-referrer",
+        "Cache-Control: no-store",
+        "Content-Security-Policy: default-src 'none'",
+    };
+    for (required) |h| {
+        try testing.expect(std.mem.indexOf(u8, metrics.bytes(), h) != null);
+        try testing.expect(std.mem.indexOf(u8, notfound.bytes(), h) != null);
+    }
 }
 
 test "http: GET /metrics returns Prometheus body" {

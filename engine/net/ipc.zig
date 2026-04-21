@@ -128,6 +128,11 @@ const c_group = extern struct {
 
 extern "c" fn getgrnam(name: [*:0]const u8) callconv(.C) ?*c_group;
 
+/// libc umask(2). Used around bind() to force the socket's on-disk mode
+/// to 0660 directly — closes the TOCTOU window before the follow-up
+/// fchmodat. Returns the previous umask.
+extern "c" fn umask(mask: u32) callconv(.C) u32;
+
 // ============================================================================
 // IpcServer
 // ============================================================================
@@ -186,10 +191,19 @@ pub const IpcServer = struct {
         const sun_path_offset = @offsetOf(linux.sockaddr.un, "path");
         const addr_len: posix.socklen_t =
             @intCast(sun_path_offset + socket_path.len + 1);
-        posix.bind(fd, @ptrCast(&addr), addr_len) catch
-            return error.BindFailed;
 
-        // Mode 0660: root + fail2zig group can rw. Others denied.
+        // SEC-002: umask(0o117) forces the socket to be created mode 0660
+        // directly by bind(), closing the TOCTOU window between bind() and
+        // a follow-up fchmodat(). Restore the prior umask immediately after
+        // so we don't affect any files the daemon creates later in init.
+        const prev_umask: u32 = umask(0o117);
+        const bind_result = posix.bind(fd, @ptrCast(&addr), addr_len);
+        _ = umask(prev_umask);
+        bind_result catch return error.BindFailed;
+
+        // Belt-and-braces: still fchmod to 0660 in case the filesystem
+        // ignored the umask (some FUSE setups do). Safe because the socket
+        // was already created with the tight mode above.
         std.posix.fchmodat(std.posix.AT.FDCWD, socket_path, 0o660, 0) catch |err| {
             std.log.err("ipc: chmod '{s}' failed: {s}", .{ socket_path, @errorName(err) });
             return error.ChmodFailed;
@@ -616,6 +630,36 @@ test "ipc: init with stale socket file unlinks and rebinds" {
 
     var server = try IpcServer.init(a, &loop, path);
     defer server.deinit();
+}
+
+test "ipc: socket has mode 0660 immediately after init (SEC-002)" {
+    // SEC-002: closes the TOCTOU window between bind() and chmod() by
+    // forcing umask 0o117 around bind. A stat() immediately after init
+    // (no sleep, no delay) must observe mode 0660.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = testing.allocator;
+
+    var loop = try EventLoop.init(a);
+    defer loop.deinit();
+
+    const path = try makeTestPath(a);
+    defer a.free(path);
+
+    var server = try IpcServer.init(a, &loop, path);
+    defer server.deinit();
+
+    var path_z: [128]u8 = undefined;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    var stbuf: linux.Stat = undefined;
+    const rc = linux.stat(@ptrCast(&path_z[0]), &stbuf);
+    switch (posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    // Mask off the type bits; check the 9 permission bits exactly.
+    const perm = stbuf.mode & 0o777;
+    try testing.expectEqual(@as(u32, 0o660), perm);
 }
 
 test "ipc: init rejects path that is too long" {

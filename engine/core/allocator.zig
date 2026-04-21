@@ -28,6 +28,11 @@ pub const Stats = struct {
     allocation_count: u64,
     /// Configured byte ceiling (budget).
     capacity: usize,
+    /// Count of free/resize/remap operations that detected accounting
+    /// underflow (SEC-003). Always zero in correct callers; non-zero
+    /// indicates a double-free or a buffer from another allocator was
+    /// passed in. Exposed so tests and ops can detect misuse.
+    accounting_errors: u64,
 };
 
 /// Budget-enforcing allocator. Not thread-safe by design — each component
@@ -48,6 +53,8 @@ pub const BudgetAllocator = struct {
     backing_buffer: []u8,
     /// FixedBufferAllocator that serves physical memory from `backing_buffer`.
     fba: std.heap.FixedBufferAllocator,
+    /// Count of accounting-underflow events (SEC-003 defense-in-depth).
+    accounting_errors: u64,
 
     pub const Error = error{OutOfMemory};
 
@@ -64,6 +71,7 @@ pub const BudgetAllocator = struct {
             .allocation_count = 0,
             .backing_buffer = buf,
             .fba = std.heap.FixedBufferAllocator.init(buf),
+            .accounting_errors = 0,
         };
     }
 
@@ -94,6 +102,7 @@ pub const BudgetAllocator = struct {
             .peak_bytes = self.peak_bytes,
             .allocation_count = self.allocation_count,
             .capacity = self.capacity,
+            .accounting_errors = self.accounting_errors,
         };
     }
 
@@ -170,7 +179,18 @@ pub const BudgetAllocator = struct {
         const fba_alloc = self.fba.allocator();
         if (!fba_alloc.rawResize(buf, alignment, new_len, ret_addr)) return false;
         const delta = buf.len - new_len;
-        self.bytes_allocated -= delta;
+        // SEC-003: saturate to defend against a buffer whose original
+        // size wasn't tracked by us (double-account bug in caller).
+        if (delta <= self.bytes_allocated) {
+            self.bytes_allocated -= delta;
+        } else {
+            std.log.warn(
+                "budget: resize shrink underflow (delta={d} bytes_allocated={d})",
+                .{ delta, self.bytes_allocated },
+            );
+            self.bytes_allocated = 0;
+            self.accounting_errors += 1;
+        }
         return true;
     }
 
@@ -209,7 +229,17 @@ pub const BudgetAllocator = struct {
         const fba_alloc = self.fba.allocator();
         const ptr = fba_alloc.rawRemap(buf, alignment, new_len, ret_addr) orelse return null;
         const delta = buf.len - new_len;
-        self.bytes_allocated -= delta;
+        // SEC-003: saturate on shrink to defend against caller misuse.
+        if (delta <= self.bytes_allocated) {
+            self.bytes_allocated -= delta;
+        } else {
+            std.log.warn(
+                "budget: remap shrink underflow (delta={d} bytes_allocated={d})",
+                .{ delta, self.bytes_allocated },
+            );
+            self.bytes_allocated = 0;
+            self.accounting_errors += 1;
+        }
         return ptr;
     }
 
@@ -220,7 +250,20 @@ pub const BudgetAllocator = struct {
         // FixedBufferAllocator reclaims only the last allocation; we still
         // decrement the budget counter so caps are measured by logical
         // lifetime rather than physical reclamation.
-        self.bytes_allocated -= buf.len;
+        //
+        // SEC-003: saturate at zero. A bookkeeping-only layer must not
+        // panic (ReleaseSafe) or silently wrap (ReleaseFast) if a caller
+        // double-frees or frees a buffer that wasn't tracked by us.
+        if (buf.len <= self.bytes_allocated) {
+            self.bytes_allocated -= buf.len;
+        } else {
+            std.log.warn(
+                "budget: free underflow (buf.len={d} bytes_allocated={d})",
+                .{ buf.len, self.bytes_allocated },
+            );
+            self.bytes_allocated = 0;
+            self.accounting_errors += 1;
+        }
     }
 };
 
@@ -324,6 +367,32 @@ test "BudgetAllocator: rejects pathological huge request" {
     // A request that would overflow if naively added must be rejected
     // without crashing.
     try testing.expectError(error.OutOfMemory, a.alloc(u8, std.math.maxInt(usize)));
+}
+
+test "BudgetAllocator: free underflow saturates at 0 (SEC-003)" {
+    // Simulate a defense-in-depth scenario: a caller returns a buffer
+    // whose length is larger than the currently-tracked bytes (double-
+    // account bug, or a buffer from another allocator). The budget
+    // layer must NOT panic (.ReleaseSafe) or wrap (.ReleaseFast) — it
+    // must clamp to zero and bump an accounting-errors counter.
+    //
+    // We exercise the accounting path directly. Allocating a buffer
+    // through the budget and then corrupting the accounting counter to
+    // a value smaller than the buffer's length produces the same
+    // precondition `free` has to survive (buf.len > bytes_allocated).
+    var budget = try BudgetAllocator.init(4096);
+    defer budget.deinit();
+    const a = budget.allocator();
+
+    const buf = try a.alloc(u8, 100);
+    // Force the accounting counter below buf.len. In production this
+    // condition only happens when a caller frees a buffer not tracked
+    // by us; here we synthesize it so the test doesn't depend on FBA
+    // undefined behaviour.
+    budget.bytes_allocated = 10;
+    a.free(buf);
+    try testing.expectEqual(@as(usize, 0), budget.stats().bytes_allocated);
+    try testing.expectEqual(@as(u64, 1), budget.stats().accounting_errors);
 }
 
 test "BudgetAllocator: arena on top of budget stays bounded" {

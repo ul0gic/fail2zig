@@ -414,7 +414,12 @@ pub const StateTracker = struct {
         // Prune + push. Order matters: prune first so a new attempt
         // that lands long after the previous window collapses the ring
         // to just itself.
-        const cutoff: Timestamp = timestamp - @as(Timestamp, @intCast(self.config.findtime));
+        //
+        // SEC-004: clamp findtime to fit in a Timestamp before casting.
+        // A pathological config (`findtime` set to a Duration > i64 max)
+        // would panic in .ReleaseSafe on the @intCast below. Saturate.
+        const findtime_i64: Timestamp = @intCast(@min(self.config.findtime, std.math.maxInt(Timestamp)));
+        const cutoff: Timestamp = timestamp -| findtime_i64;
         st.pruneRing(cutoff);
         st.pushRing(timestamp);
 
@@ -428,7 +433,16 @@ pub const StateTracker = struct {
             );
             st.ban_state = .banned;
             st.ban_count = new_ban_count;
-            st.ban_expiry = timestamp + @as(Timestamp, @intCast(duration));
+            // SEC-004: saturate on overflow rather than panicking. A
+            // Duration > i64 max (operator-config typo) or a wall-clock
+            // timestamp close to i64 max would otherwise crash the daemon
+            // on the first ban. Clamp to Timestamp max so the ban stays
+            // effectively permanent until explicitly cleared.
+            const duration_i64: Timestamp = @intCast(@min(duration, std.math.maxInt(Timestamp)));
+            st.ban_expiry = std.math.add(Timestamp, timestamp, duration_i64) catch blk: {
+                std.log.warn("state: ban_expiry overflow, clamping to Timestamp max", .{});
+                break :blk std.math.maxInt(Timestamp);
+            };
             // Clear the ring so that another immediate attempt doesn't
             // re-fire a second ban within the same findtime window.
             st.ring_len = 0;
@@ -975,7 +989,11 @@ test "state: Cidr.parse rejects malformed specs" {
 test "state: ipv4 and ipv6 CIDRs do not cross-match" {
     const v4 = try Cidr.parse("10.0.0.0/8");
     const v6 = try Cidr.parse("::/0");
-    try testing.expect(!v4.contains(tIp("::ffff:10.0.0.1"))); // v6 value
+    // SEC-001: `::ffff:10.0.0.1` is canonicalized to the IPv4 variant at
+    // parse time, so it MUST be treated as 10.0.0.1 and match the v4 CIDR.
+    // That's the whole point of the fix — the state tracker can't be
+    // tricked into seeing two distinct keys for the same attacker.
+    try testing.expect(v4.contains(tIp("::ffff:10.0.0.1")));
     try testing.expect(v6.contains(tIp("::1")));
     try testing.expect(!v6.contains(tIp("1.2.3.4"))); // v4 value
 }
@@ -1034,4 +1052,69 @@ test "state: ring buffer caps at max_attempts_per_ip, evicting oldest" {
         if (v < min_v) min_v = v;
     }
     try testing.expect(min_v >= 10);
+}
+
+test "state: extreme bantime does not overflow ban_expiry (SEC-004)" {
+    // Operator config error: bantime = u64::MAX AND the bantime-increment
+    // cap is disabled (max_bantime = u64::MAX). In .ReleaseSafe the naive
+    // `timestamp + @intCast(duration)` path would panic; with the SEC-004
+    // clamp the daemon saturates at Timestamp max without crashing.
+    var tracker = try StateTracker.init(testing.allocator, .{
+        .maxretry = 2,
+        .findtime = 600,
+        .bantime = std.math.maxInt(u64),
+        .bantime_increment = .{
+            .enabled = false,
+            .max_bantime = std.math.maxInt(u64),
+        },
+    });
+    defer tracker.deinit();
+
+    const ip = tIp("1.2.3.4");
+    const jail = tJail("sshd");
+    try testing.expect((try tracker.recordAttempt(ip, jail, 1_000)) == null);
+    const dec = (try tracker.recordAttempt(ip, jail, 1_100)).?;
+    // Ban fired without panicking; expiry is clamped to Timestamp max.
+    try testing.expect(IpAddress.eql(dec.ip, ip));
+    const st = tracker.get(ip).?;
+    try testing.expectEqual(@as(?Timestamp, std.math.maxInt(Timestamp)), st.ban_expiry);
+}
+
+test "state: extreme findtime does not overflow cutoff (SEC-004)" {
+    // Operator config error: findtime = u64::MAX. The cutoff computation
+    // must saturate rather than panic.
+    var tracker = try StateTracker.init(testing.allocator, .{
+        .maxretry = 2,
+        .findtime = std.math.maxInt(u64),
+        .bantime = 600,
+    });
+    defer tracker.deinit();
+    const ip = tIp("1.2.3.4");
+    const jail = tJail("sshd");
+    _ = try tracker.recordAttempt(ip, jail, 1_000);
+}
+
+test "state: ipv4-mapped IPv6 does not create a second tracker entry (SEC-001)" {
+    // The ban-evasion path: attempts for `1.2.3.4` and `::ffff:1.2.3.4`
+    // must collapse into the same state entry so maxretry isn't doubled.
+    var tracker = try StateTracker.init(testing.allocator, .{
+        .maxretry = 3,
+        .findtime = 600,
+        .bantime = 600,
+    });
+    defer tracker.deinit();
+
+    const v4 = tIp("1.2.3.4");
+    const mapped = tIp("::ffff:1.2.3.4");
+    // After SEC-001, both parse to the same IpAddress value.
+    try testing.expect(IpAddress.eql(v4, mapped));
+
+    const jail = tJail("sshd");
+    // Two attempts under v4, one under mapped form — third trigger MUST ban.
+    try testing.expect((try tracker.recordAttempt(v4, jail, 1_000)) == null);
+    try testing.expect((try tracker.recordAttempt(v4, jail, 1_100)) == null);
+    const dec = (try tracker.recordAttempt(mapped, jail, 1_200)).?;
+    try testing.expect(IpAddress.eql(dec.ip, v4));
+    // Only one entry in the tracker.
+    try testing.expectEqual(@as(usize, 1), tracker.stats().entry_count);
 }
