@@ -1,0 +1,186 @@
+# fail2zig — release pipeline
+#
+# Triggered by pushing a `v*` tag (e.g. `v0.1.0`). Produces a GitHub Release
+# with stripped static musl binaries for each supported target, plus a
+# SHA256SUMS manifest and the systemd unit file so `scripts/install.sh` can
+# fetch everything from one URL tree.
+#
+# Release notes are read from `RELEASE_NOTES.md` at the repo root. That file
+# is not committed day-to-day — `.project/changelog.md` is the living document
+# but lives in the gitignored `.project/` tree. The Lead's release cut
+# procedure is:
+#
+#   1. Copy the [Unreleased] section from .project/changelog.md to
+#      RELEASE_NOTES.md at repo root, retitled with the tag version.
+#   2. `git add RELEASE_NOTES.md && git commit -m "chore: release notes for v0.1.0"`
+#   3. `git tag v0.1.0 && git push origin main v0.1.0`
+#
+# The workflow fails closed if RELEASE_NOTES.md is missing.
+#
+# Cross-compile matrix deliberately excludes arm-linux-musleabihf + mips-linux-musl
+# — both are broken on SYS-009. Re-enable them once SYS-009 ships its fix.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  ZIG_VERSION: "0.14.1"
+
+jobs:
+  build-release:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-linux-musl
+          - aarch64-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [ -z "${version}" ]; then
+            echo "::error::could not derive version from tag ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "Building release artifacts for v${version} (${{ matrix.target }})"
+
+      - name: Build ReleaseSafe static binaries
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
+
+      - name: Strip binaries
+        run: |
+          # Zig produces already-stripped ReleaseSafe binaries for most cases,
+          # but llvm-strip drops any residual debug sections and shrinks the
+          # artifacts a further ~5-10%. Use llvm-strip because it handles the
+          # aarch64 ELFs from a cross build without needing target-specific
+          # binutils installed on the x86_64 runner.
+          sudo apt-get update
+          sudo apt-get install -y llvm
+          llvm-strip --strip-all zig-out/bin/fail2zig
+          llvm-strip --strip-all zig-out/bin/fail2zig-client
+
+      - name: Verify binary is statically linked
+        run: |
+          file zig-out/bin/fail2zig
+          file zig-out/bin/fail2zig-client
+          if file zig-out/bin/fail2zig | grep -q "dynamically linked"; then
+            echo "::error::fail2zig is dynamically linked; expected static musl binary"
+            exit 1
+          fi
+
+      - name: Rename artifacts
+        run: |
+          mkdir -p dist
+          v="${{ steps.version.outputs.version }}"
+          t="${{ matrix.target }}"
+          cp zig-out/bin/fail2zig         "dist/fail2zig-v${v}-${t}"
+          cp zig-out/bin/fail2zig-client  "dist/fail2zig-client-v${v}-${t}"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fail2zig-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  create-release:
+    name: Create GitHub Release
+    needs: build-release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify release notes exist
+        run: |
+          if [ ! -f RELEASE_NOTES.md ]; then
+            echo "::error::RELEASE_NOTES.md is missing — commit it before tagging."
+            echo "Copy the relevant section from .project/changelog.md to RELEASE_NOTES.md"
+            echo "at repo root before cutting a release tag."
+            exit 1
+          fi
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Assemble release directory
+        run: |
+          mkdir -p release
+          # Flatten per-target artifact directories into one.
+          find artifacts -type f -name 'fail2zig*' -exec cp {} release/ \;
+          # Bundle the systemd unit + example config so scripts/install.sh can
+          # fetch them from the release page, not from a checkout.
+          cp deploy/fail2zig.service release/ 2>/dev/null || true
+          cp deploy/fail2zig.socket  release/ 2>/dev/null || true
+          cp deploy/fail2zig.toml.example release/ 2>/dev/null || true
+          ls -la release/
+
+      - name: Compute SHA256SUMS
+        working-directory: release
+        run: |
+          sha256sum -- * > SHA256SUMS
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: fail2zig ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
+          draft: false
+          prerelease: false
+          files: release/*
+          fail_on_unmatched_files: true
+
+  verify-release:
+    name: Verify published release
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download released assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p verify
+          cd verify
+          gh release download "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}"
+          ls -la
+
+      - name: Verify SHA256SUMS matches downloaded files
+        working-directory: verify
+        run: |
+          if [ ! -f SHA256SUMS ]; then
+            echo "::error::SHA256SUMS missing from published release"
+            exit 1
+          fi
+          sha256sum --check --strict SHA256SUMS
+          echo "All release artifacts verified against published SHA256SUMS."

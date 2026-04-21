@@ -1,0 +1,64 @@
+[Unit]
+Description=fail2zig — intrusion prevention system
+Documentation=https://github.com/ul0gic/fail2zig https://fail2zig.io/docs
+After=network-online.target rsyslog.service systemd-journald.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/fail2zig --config /etc/fail2zig/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+# Capability model — least privilege required for the product to function.
+# CAP_NET_ADMIN   — install/modify nftables + iptables rules, ipset entries.
+# CAP_DAC_READ_SEARCH — read /var/log/* files owned by root:adm even when the
+#                      daemon drops other privileges.
+AmbientCapabilities=CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+
+# Filesystem isolation. Everything writable is declared.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/fail2zig /run/fail2zig
+RuntimeDirectory=fail2zig
+RuntimeDirectoryMode=0710
+StateDirectory=fail2zig
+StateDirectoryMode=0750
+
+# Kernel hardening — block kernel-adjacent attack surface the daemon never
+# legitimately needs.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+
+# Namespace, realtime, and miscellaneous exploit-surface reduction.
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @cpu-emulation @debug @module @mount @obsolete @raw-io @reboot @swap
+
+# Remove keyring access entirely — we never touch it.
+KeyringMode=private
+PrivateMounts=yes
+
+# Tighter umask than the systemd default (0022). Files we create under
+# /run/fail2zig and /var/lib/fail2zig should never be world-readable.
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

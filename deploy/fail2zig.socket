@@ -1,0 +1,16 @@
+[Unit]
+Description=fail2zig IPC socket
+Documentation=https://github.com/ul0gic/fail2zig
+PartOf=fail2zig.service
+
+[Socket]
+# Authenticated via SO_PEERCRED inside the daemon. Group-restricted on disk
+# so only members of `fail2zig` can connect with fail2zig-client.
+ListenStream=/run/fail2zig/fail2zig.sock
+SocketMode=0660
+SocketUser=root
+SocketGroup=fail2zig
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

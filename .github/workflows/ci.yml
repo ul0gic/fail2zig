@@ -1,0 +1,159 @@
+# fail2zig — continuous integration
+#
+# Fast-feedback pipeline that runs on every push and pull request.
+# Failure in any job blocks merge.
+#
+# Job order (parallel where possible):
+#   fmt           — style gate, fastest to fail
+#   build-native  — `zig build` on ubuntu-latest
+#   test          — `zig build test` with std.testing.allocator leak detection
+#   cross-compile — x86_64 + aarch64 musl static release builds
+#   shellcheck    — lint every tracked shell script
+#   yamllint      — lint the workflow files themselves
+#
+# Cross-compile matrix deliberately excludes `arm-linux-musleabihf` and
+# `mips-linux-musl` — both are broken on real portability bugs tracked in
+# .project/issues/open/SYS-009-armv7-cross-compile-broken.md. They will be
+# re-enabled once SYS-009 ships its fix (switch u64 atomic counters to a
+# mutex-backed Counter, fix socklen_t cast in client/socket.zig).
+#
+# Zig version is pinned to the toolchain that ships the project — see
+# build.zig.zon `minimum_zig_version`. Keep this in sync with any bump.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZIG_VERSION: "0.14.1"
+
+jobs:
+  fmt:
+    name: zig fmt --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Check formatting
+        run: zig fmt --check engine/ client/ shared/ tests/ sim/
+
+  build-native:
+    name: Build (native Debug)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Cache zig-cache
+        uses: actions/cache@v4
+        with:
+          path: .zig-cache
+          key: zig-cache-build-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            zig-cache-build-${{ runner.os }}-${{ env.ZIG_VERSION }}-
+      - name: zig build
+        run: zig build
+
+  test:
+    name: Tests (std.testing.allocator leak detection)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Cache zig-cache
+        uses: actions/cache@v4
+        with:
+          path: .zig-cache
+          key: zig-cache-test-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            zig-cache-test-${{ runner.os }}-${{ env.ZIG_VERSION }}-
+      - name: zig build test
+        run: zig build test
+
+  cross-compile:
+    name: Cross-compile ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # arm-linux-musleabihf + mips-linux-musl excluded — SYS-009.
+        target:
+          - x86_64-linux-musl
+          - aarch64-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Cache zig-cache
+        uses: actions/cache@v4
+        with:
+          path: .zig-cache
+          key: zig-cache-cross-${{ matrix.target }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            zig-cache-cross-${{ matrix.target }}-${{ env.ZIG_VERSION }}-
+      - name: Build ReleaseSafe static binaries
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
+      - name: Verify binary is statically linked
+        run: |
+          file zig-out/bin/fail2zig
+          file zig-out/bin/fail2zig-client
+          # Musl static binaries should not have a dynamic interpreter.
+          if file zig-out/bin/fail2zig | grep -q "dynamically linked"; then
+            echo "::error::fail2zig is dynamically linked; expected static musl binary"
+            exit 1
+          fi
+          if file zig-out/bin/fail2zig-client | grep -q "dynamically linked"; then
+            echo "::error::fail2zig-client is dynamically linked; expected static musl binary"
+            exit 1
+          fi
+      - name: Upload cross-compile artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fail2zig-${{ matrix.target }}
+          path: |
+            zig-out/bin/fail2zig
+            zig-out/bin/fail2zig-client
+          if-no-files-found: error
+          retention-days: 14
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Lint scripts
+        run: |
+          # Fail on warnings (shellcheck default severity is style; we raise it).
+          shellcheck -S warning scripts/hammer/*.sh
+          if [ -f scripts/install.sh ]; then
+            shellcheck -S warning scripts/install.sh
+          fi
+
+  yamllint:
+    name: yamllint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install yamllint
+        run: sudo apt-get update && sudo apt-get install -y yamllint
+      - name: Lint CI YAML
+        run: yamllint -c .yamllint .github/workflows/
