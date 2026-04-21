@@ -32,13 +32,14 @@ const linux = std.os.linux;
 const shared = @import("shared");
 const protocol = shared.protocol;
 
-const event_loop = @import("../engine/core/event_loop.zig");
-const state = @import("../engine/core/state.zig");
-const firewall = @import("../engine/firewall/backend.zig");
-const nftables = @import("../engine/firewall/nftables.zig");
-const config_mod = @import("../engine/config/native.zig");
-const commands = @import("../engine/net/commands.zig");
-const ipc = @import("../engine/net/ipc.zig");
+const engine = @import("engine");
+const event_loop = engine.event_loop_mod;
+const state = engine.state_mod;
+const firewall = engine.firewall;
+const nftables = firewall.nftables;
+const config_mod = engine.config_mod;
+const commands = engine.commands_mod;
+const ipc = engine.ipc_mod;
 
 const testing = std.testing;
 

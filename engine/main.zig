@@ -31,21 +31,23 @@ const posix = std.posix;
 const shared = @import("shared");
 
 // Wire all engine modules into the build graph so their tests are discovered.
+// Modules reached by integration tests (via the named `engine` module) are
+// `pub const`; the rest stay private.
 const allocator_mod = @import("core/allocator.zig");
 const memory_mod = @import("core/memory.zig");
-const event_loop_mod = @import("core/event_loop.zig");
+pub const event_loop_mod = @import("core/event_loop.zig");
 const log_watcher_mod = @import("core/log_watcher.zig");
 const line_buffer_mod = @import("core/line_buffer.zig");
 const logger_mod = @import("core/logger.zig");
 const parser_mod = @import("core/parser.zig");
-const state_mod = @import("core/state.zig");
+pub const state_mod = @import("core/state.zig");
 const persist_mod = @import("core/persist.zig");
-const firewall = @import("firewall/backend.zig");
-const config_mod = @import("config/native.zig");
+pub const firewall = @import("firewall/backend.zig");
+pub const config_mod = @import("config/native.zig");
 const http = @import("net/http.zig");
 const ws = @import("net/ws.zig");
-const ipc_mod = @import("net/ipc.zig");
-const commands_mod = @import("net/commands.zig");
+pub const ipc_mod = @import("net/ipc.zig");
+pub const commands_mod = @import("net/commands.zig");
 const metrics_mod = @import("core/metrics.zig");
 
 pub const version = "0.1.0";

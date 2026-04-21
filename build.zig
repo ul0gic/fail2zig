@@ -23,7 +23,10 @@ pub fn build(b: *std.Build) void {
     });
 
     // ===== Engine (fail2zig daemon) =====
-    const engine_mod = b.createModule(.{
+    // Registered as a named module so integration tests can import the
+    // engine's public surface via `@import("engine")` instead of reaching
+    // in with relative paths.
+    const engine_mod = b.addModule("engine", .{
         .root_source_file = b.path("engine/main.zig"),
         .target = target,
         .optimize = optimize,
@@ -95,18 +98,16 @@ pub fn build(b: *std.Build) void {
     const run_shared_tests = b.addRunArtifact(shared_tests);
     test_step.dependOn(&run_shared_tests.step);
 
-    // Integration tests — driven from `tests/integration_ipc_roundtrip.zig`
-    // but with the module root pinned to the repository root via a
-    // single-line shim. That gives the test file freedom to reach into
-    // `engine/` with normal relative `@import` paths while keeping the
-    // test file under `tests/` where `.project/build-plan.md` requires.
+    // Integration tests live under `tests/` and import `engine` + `shared`
+    // as named modules. No repo-root shim needed.
     const integration_mod = b.createModule(.{
-        .root_source_file = b.path("integration_root.zig"),
+        .root_source_file = b.path("tests/integration_ipc_roundtrip.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
     integration_mod.addImport("shared", shared_mod);
+    integration_mod.addImport("engine", engine_mod);
 
     const integration_tests = b.addTest(.{
         .root_module = integration_mod,
