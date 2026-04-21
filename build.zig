@@ -8,6 +8,11 @@ pub fn build(b: *std.Build) void {
         "sim",
         "Build the attack simulator (demo-only tool, not shipped).",
     ) orelse false;
+    const test_filter = b.option(
+        []const u8,
+        "test-filter",
+        "Only compile tests matching this substring (e.g. -Dtest-filter=allocator)",
+    );
 
     // Shared types + IPC protocol. Imported by engine and client as
     // `@import("shared")` — frozen contract between the two binaries.
@@ -67,19 +72,26 @@ pub fn build(b: *std.Build) void {
 
     // ===== Tests =====
     const test_step = b.step("test", "Run all tests (engine, client, shared)");
+    const test_filters: []const []const u8 = if (test_filter) |f| &.{f} else &.{};
 
-    const engine_tests = b.addTest(.{ .root_module = engine_mod });
+    const engine_tests = b.addTest(.{
+        .root_module = engine_mod,
+        .filters = test_filters,
+    });
     const run_engine_tests = b.addRunArtifact(engine_tests);
-    if (b.args) |args| run_engine_tests.addArgs(args);
     test_step.dependOn(&run_engine_tests.step);
 
-    const client_tests = b.addTest(.{ .root_module = client_mod });
+    const client_tests = b.addTest(.{
+        .root_module = client_mod,
+        .filters = test_filters,
+    });
     const run_client_tests = b.addRunArtifact(client_tests);
-    if (b.args) |args| run_client_tests.addArgs(args);
     test_step.dependOn(&run_client_tests.step);
 
-    const shared_tests = b.addTest(.{ .root_module = shared_mod });
+    const shared_tests = b.addTest(.{
+        .root_module = shared_mod,
+        .filters = test_filters,
+    });
     const run_shared_tests = b.addRunArtifact(shared_tests);
-    if (b.args) |args| run_shared_tests.addArgs(args);
     test_step.dependOn(&run_shared_tests.step);
 }
