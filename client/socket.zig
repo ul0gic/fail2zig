@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Unix-domain-socket client for the fail2zig daemon IPC protocol.
 //!
 //! Wire format is defined in `shared/protocol.zig`:

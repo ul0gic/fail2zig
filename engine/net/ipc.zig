@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Unix-domain socket IPC server for the fail2zig daemon.
 //!
 //! The daemon exposes a single `AF_UNIX` stream socket. `fail2zig-client`

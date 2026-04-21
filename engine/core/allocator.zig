@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Budget-enforcing allocator for fail2zig components.
 //!
 //! `BudgetAllocator` wraps a backing allocator and enforces a hard byte

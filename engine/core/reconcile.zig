@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! State-tracker → firewall-backend reconciliation on daemon startup.
 //!
 //! The scaffold installer (`nftables.zig::sendScaffold`) always leaves

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Command handlers for the IPC server.
 //!
 //! The handlers here take a parsed `shared.Command`, walk the

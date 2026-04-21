@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Phase 5 gate integration test: IPC status roundtrip.
 //!
 //! The gate protocol requires proving that the CLI client can drive the

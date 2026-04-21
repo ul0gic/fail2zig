@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Operational logger for the fail2zig daemon.
 //!
 //! This is for fail2zig's OWN logs — startup messages, errors, metrics.

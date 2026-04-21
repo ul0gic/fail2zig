@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! fail2ban config compatibility parser.
 //!
 //! Parses fail2ban's INI-ish configuration format into an intermediate

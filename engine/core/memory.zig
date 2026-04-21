@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Per-component memory budgets for the fail2zig daemon.
 //!
 //! `MemoryConfig` carries the byte budget for each component. `MemoryPool`

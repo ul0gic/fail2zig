@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Config migration integration test.
 //!
 //! Exercises the full `fail2zig --import-config <dir>` path against a

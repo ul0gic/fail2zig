@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Multi-pattern matcher.
 //!
 //! Holds up to 256 comptime-compiled `MatchFn`s, each carrying its

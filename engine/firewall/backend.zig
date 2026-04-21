@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Firewall backend interface.
 //!
 //! The engine speaks to the kernel packet filter through this single,

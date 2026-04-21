@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! ipset backend — ipset sets + one iptables jump rule per jail.
 //!
 //! Why this exists: `iptables -s <ip> -j DROP` rules are O(n) per

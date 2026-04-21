@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Fuzz corpus for the IPC protocol deserializer.
 //!
 //! The daemon receives length-prefixed binary frames from any peer that

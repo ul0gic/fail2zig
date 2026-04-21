@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Minimal WebSocket (RFC 6455) server for the fail2zig dashboard.
 //!
 //! Scope:

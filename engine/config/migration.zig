@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! fail2ban → fail2zig migration tool.
 //!
 //! Reads a fail2ban config directory (jail.conf + jail.local + jail.d/

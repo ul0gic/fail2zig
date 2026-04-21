@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Built-in filter registry.
 //!
 //! Maps filter names (the canonical strings operators use in

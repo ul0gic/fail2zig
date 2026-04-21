@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Minimal HTTP/1.1 server — `/metrics` (Prometheus), `/api/status`,
 //! and `GET /events` WebSocket upgrade.
 //!

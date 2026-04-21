@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Epoll-based event loop for the fail2zig daemon.
 //!
 //! This is the universal fallback (Linux 2.6+). An io_uring backend will

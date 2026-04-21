@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Metrics collector — lock-free atomic counters for the fail2zig daemon.
 //!
 //! The daemon's hot paths (log parser, state tracker, firewall backend)

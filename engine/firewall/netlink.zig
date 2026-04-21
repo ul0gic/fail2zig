@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Safe Zig wrapper around Linux netlink sockets.
 //!
 //! Scope: the wrapper is deliberately narrow — just what the

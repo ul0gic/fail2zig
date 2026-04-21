@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Fuzz corpus for the native TOML config parser.
 //!
 //! `Config.parse` takes an arbitrary in-memory source and produces a

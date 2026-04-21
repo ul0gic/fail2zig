@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! End-to-end ban test for the fail2zig daemon.
 //!
 //! What this test proves (when it runs):

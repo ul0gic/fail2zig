@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Per-IP state tracker for the fail2zig ban lifecycle.
 //!
 //! `StateTracker` holds a pre-allocated `std.AutoHashMap` keyed by

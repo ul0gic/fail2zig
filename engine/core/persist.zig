@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Binary on-disk state for the fail2zig daemon.
 //!
 //! File layout (little-endian, packed):

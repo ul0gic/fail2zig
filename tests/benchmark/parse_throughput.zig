@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Parser throughput benchmark.
 //!
 //! Generates 1,000,000 synthetic auth.log lines (the shape OpenSSH

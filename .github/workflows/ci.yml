@@ -199,3 +199,25 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y yamllint
       - name: Lint CI YAML
         run: yamllint -c .yamllint .github/workflows/
+
+  spdx:
+    name: SPDX headers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify every .zig file carries the SPDX + copyright header
+        # Every first-party .zig source under engine/, client/, shared/,
+        # tests/, plus build.zig at the root, must start with:
+        #   // SPDX-License-Identifier: AGPL-3.0-or-later
+        #   // Copyright (c) <year> fail2zig maintainers
+        # This guards against header drift when new files are added.
+        run: |
+          missing=$(find engine client shared tests build.zig \
+            -type f -name '*.zig' \
+            -exec grep -L 'SPDX-License-Identifier' {} +)
+          if [ -n "$missing" ]; then
+            echo "::error::.zig files missing SPDX-License-Identifier header:"
+            echo "$missing"
+            exit 1
+          fi
+          echo "SPDX header present on every tracked .zig file."

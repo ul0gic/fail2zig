@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Remaining built-in filters:
 //!   * `named_refused` — BIND DNS queries denied.
 //!   * `recidive`      — fail2zig's own ban log (meta-jail for repeat offenders).

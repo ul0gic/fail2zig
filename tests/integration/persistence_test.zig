@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! State persistence integration test.
 //!
 //! Two scenarios, one covered in every environment and one gated on

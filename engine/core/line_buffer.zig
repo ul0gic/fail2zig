@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Zero-copy line buffer for log ingestion.
 //!
 //! `LineBuffer` accumulates bytes produced by the log watcher and hands

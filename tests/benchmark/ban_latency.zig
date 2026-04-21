@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Ban-latency benchmark.
 //!
 //! Measures the time from a log line being written to a "ban decision"

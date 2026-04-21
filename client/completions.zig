@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Shell-completion scripts for fail2zig-client.
 //!
 //! Three supported shells: bash, zsh, fish. Each `generate*()` returns a

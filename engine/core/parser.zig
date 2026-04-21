@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! Parser engine: comptime pattern DSL + hot-path token extractors.
 //!
 //! The DSL compiles a pattern string at comptime into a specialized

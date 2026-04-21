@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
 //! iptables backend — legacy fallback via CLI fork/exec.
 //!
 //! We shell out to `iptables` / `ip6tables` because most
