@@ -370,7 +370,10 @@ fn writeListTable(writer: anytype, entries: []const BanEntry, color: Color, now:
     }
 
     const ip_col: usize = 18;
-    const jail_col: usize = 12;
+    // Jail names can be hyphenated (e.g. `nginx-http-auth`, 15 chars).
+    // Width chosen to fit the longest built-in filter name with a
+    // single trailing space so it doesn't bleed into TIME LEFT.
+    const jail_col: usize = 18;
     const time_col: usize = 12;
     const count_col: usize = 10;
 
