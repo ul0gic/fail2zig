@@ -66,7 +66,7 @@ pub fn run(
             return .success;
         },
         .version => {
-            stdout.print("fail2zig-client v{s}\n", .{client_version}) catch {};
+            stdout.print("fail2zig-client {s}\n", .{client_version}) catch {};
             return .success;
         },
         .completions => |shell| {
@@ -297,7 +297,7 @@ test "client: --version exits 0 and prints client version" {
     defer testing.allocator.free(r.out);
     defer testing.allocator.free(r.err);
     try testing.expectEqual(ExitCode.success, r.code);
-    try testing.expect(std.mem.indexOf(u8, r.out, "fail2zig-client v0.1.0") != null);
+    try testing.expect(std.mem.indexOf(u8, r.out, "fail2zig-client 0.1.0") != null);
 }
 
 test "client: no args exits 2 with error about missing command" {

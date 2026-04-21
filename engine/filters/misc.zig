@@ -149,7 +149,7 @@ test "recidive: negative — unban line" {
 }
 
 test "recidive: negative — daemon startup line" {
-    try testing.expect(firstMatchIn(&recidive_patterns, "fail2zig v0.1.0 running; backend=nftables") == null);
+    try testing.expect(firstMatchIn(&recidive_patterns, "fail2zig 0.1.0 running; backend=nftables") == null);
 }
 
 // ---------- vsftpd ----------

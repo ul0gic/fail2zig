@@ -185,7 +185,7 @@ fn writeStatusTable(writer: anytype, s: StatusPayload, color: Color) !void {
     try writer.writeAll("| ");
     try color.on(writer, Color.bold);
     try writer.print("fail2zig", .{});
-    if (s.version) |v| try writer.print(" v{s}", .{v});
+    if (s.version) |v| try writer.print(" {s}", .{v});
     try color.off(writer);
     try color.on(writer, Color.green);
     try writer.writeAll(" — running");
@@ -206,7 +206,7 @@ fn writeStatusTable(writer: anytype, s: StatusPayload, color: Color) !void {
 }
 
 fn versionLen(v: ?[]const u8) usize {
-    if (v) |s| return s.len + 2; // " v" prefix
+    if (v) |s| return s.len + 1; // leading space
     return 0;
 }
 
@@ -582,7 +582,7 @@ pub fn formatVersion(
             }
         },
         .table => {
-            try writer.print("fail2zig-client v{s}\n", .{client_version});
+            try writer.print("fail2zig-client {s}\n", .{client_version});
             if (payload_json.len > 0) {
                 const parsed = std.json.parseFromSlice(
                     VersionPayload,
@@ -591,7 +591,7 @@ pub fn formatVersion(
                     .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
                 ) catch return;
                 defer parsed.deinit();
-                if (parsed.value.daemon_version) |v| try writer.print("fail2zig       v{s}\n", .{v});
+                if (parsed.value.daemon_version) |v| try writer.print("fail2zig       {s}\n", .{v});
                 if (parsed.value.git_commit) |c| try writer.print("  commit:      {s}\n", .{c});
                 if (parsed.value.build_date) |d| try writer.print("  built:       {s}\n", .{d});
             } else {
@@ -795,7 +795,7 @@ test "format: status table shows box lines and version" {
     const out = try runStatus(testing.allocator, payload, .table);
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "+---") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "fail2zig v0.1.0") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "fail2zig 0.1.0") != null);
     try testing.expect(std.mem.indexOf(u8, out, "1d 0h 1m 1s") != null);
     try testing.expect(std.mem.indexOf(u8, out, "nftables") != null);
     try testing.expect(std.mem.indexOf(u8, out, "142") != null);
@@ -987,15 +987,15 @@ test "format: version table shows client and daemon" {
     const payload = "{\"daemon_version\":\"0.1.0\",\"git_commit\":\"abc123\"}";
     const out = try runVersion(testing.allocator, payload, .table);
     defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "fail2zig-client v0.1.0") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "fail2zig       v0.1.0") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "fail2zig-client 0.1.0") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "fail2zig       0.1.0") != null);
     try testing.expect(std.mem.indexOf(u8, out, "abc123") != null);
 }
 
 test "format: version table with no daemon payload" {
     const out = try runVersion(testing.allocator, "", .table);
     defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "fail2zig-client v0.1.0") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "fail2zig-client 0.1.0") != null);
     try testing.expect(std.mem.indexOf(u8, out, "daemon unreachable") != null);
 }
 

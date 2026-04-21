@@ -51,7 +51,7 @@ Print the client version and exit. Does not contact the daemon.
 
 ```bash
 fail2zig-client --version
-# fail2zig-client v0.1.0
+# fail2zig-client 0.1.0
 ```
 
 ### `--help` / `-h`
@@ -70,7 +70,7 @@ sudo fail2zig-client status
 
 ```text
 +------------------------------------------+
-| fail2zig v0.1.0 — running               |
+| fail2zig 0.1.0 — running                |
 +------------------------------------------+
 | Uptime:      0d 0h 40m 54s               |
 | Memory:      0.0 MB                      |

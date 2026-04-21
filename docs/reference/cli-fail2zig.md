@@ -91,7 +91,7 @@ Print the version string and exit.
 
 ```bash
 fail2zig --version
-# fail2zig v0.1.0
+# fail2zig 0.1.0
 ```
 
 ### `--help` / `-h`

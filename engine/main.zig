@@ -151,7 +151,7 @@ pub fn parseArgs(args: []const []const u8) CliError!CliOptions {
 
 fn printHelp(w: anytype) !void {
     try w.print(
-        \\fail2zig v{s} — modern intrusion prevention
+        \\fail2zig {s} — modern intrusion prevention
         \\
         \\USAGE:
         \\  fail2zig [OPTIONS]
@@ -736,7 +736,7 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     _ = try loop.addTimer(1000, expirySweep, &expiry_ctx, false);
 
     std.log.info(
-        "fail2zig v{s} running; backend={s}; ipc={s}; http={s}:{d}",
+        "fail2zig {s} running; backend={s}; ipc={s}; http={s}:{d}",
         .{
             version,
             @tagName(backend_val.tag()),
