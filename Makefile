@@ -43,10 +43,10 @@ test: ## Run the full test suite (unit, integration, fuzz corpora)
 	zig build test
 
 fmt: ## Apply `zig fmt` to all tracked Zig source trees
-	zig fmt engine/ client/ shared/ tests/ sim/
+	zig fmt engine/ client/ shared/ tests/
 
 fmt-check: ## Verify `zig fmt` is a no-op (used by CI)
-	zig fmt --check engine/ client/ shared/ tests/ sim/
+	zig fmt --check engine/ client/ shared/ tests/
 
 release: ## Build ReleaseSafe static binaries for the native target
 	zig build -Doptimize=$(OPT)
