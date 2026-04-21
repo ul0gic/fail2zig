@@ -103,6 +103,13 @@ pub const JailDefaults = struct {
     maxretry: u32 = 5,
     banaction: BanAction = .nftables,
     ignoreip: []const []const u8 = &.{},
+    /// Recidive escalation policy (SYS-008). The state tracker is
+    /// currently global (single-tracker for all jails), so the
+    /// per-jail `bantime_increment` field on `JailConfig` is parsed
+    /// but not wired through. For v0.1.0 this defaults-level setting
+    /// is the one that takes effect. Per-jail overrides become
+    /// meaningful once the tracker goes per-jail in Phase 2.
+    bantime_increment: BanTimeIncrement = .{},
 };
 
 pub const JailConfig = struct {
@@ -626,6 +633,23 @@ const Parser = struct {
             self.defaults.banaction = try parseBanAction(s);
         } else if (std.mem.eql(u8, key, "ignoreip")) {
             self.defaults.ignoreip = try asStringArray(v);
+        } else if (std.mem.eql(u8, key, "bantime_increment_enabled")) {
+            self.defaults.bantime_increment.enabled = try asBool(v);
+        } else if (std.mem.eql(u8, key, "bantime_increment_multiplier")) {
+            self.defaults.bantime_increment.multiplier = @floatFromInt(try asInt(v));
+        } else if (std.mem.eql(u8, key, "bantime_increment_factor")) {
+            self.defaults.bantime_increment.factor = @floatFromInt(try asInt(v));
+        } else if (std.mem.eql(u8, key, "bantime_increment_formula")) {
+            const s = try asString(v);
+            if (std.mem.eql(u8, s, "linear")) {
+                self.defaults.bantime_increment.formula = .linear;
+            } else if (std.mem.eql(u8, s, "exponential")) {
+                self.defaults.bantime_increment.formula = .exponential;
+            } else return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "bantime_increment_max_bantime")) {
+            const n = try asInt(v);
+            if (n < 0) return error.InvalidValue;
+            self.defaults.bantime_increment.max_bantime = @intCast(n);
         } else return error.UnknownKey;
     }
 

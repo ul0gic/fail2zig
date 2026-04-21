@@ -374,14 +374,29 @@ fn onReload(siginfo: *const linux.signalfd_siginfo, userdata: ?*anyopaque) void 
 
 fn deriveTrackerConfig(cfg: *const config_mod.Config, max_entries: u32) state_mod.Config {
     const d = cfg.defaults;
+    // SYS-008: translate `config.native.BanTimeIncrement` into the
+    // state tracker's shape. The two structs carry the same fields but
+    // are defined independently (state has zero config-layer imports).
+    // Per-jail `bantime_increment` on JailConfig is parsed but
+    // currently inactive (single global tracker). When per-jail
+    // tracking lands in Phase 2, this will read from the active jail's
+    // resolved settings instead of defaults.
+    const incr: state_mod.BanTimeIncrement = .{
+        .enabled = d.bantime_increment.enabled,
+        .multiplier = d.bantime_increment.multiplier,
+        .factor = d.bantime_increment.factor,
+        .formula = switch (d.bantime_increment.formula) {
+            .linear => .linear,
+            .exponential => .exponential,
+        },
+        .max_bantime = d.bantime_increment.max_bantime,
+    };
     return .{
         .max_entries = max_entries,
         .findtime = d.findtime,
         .maxretry = d.maxretry,
         .bantime = d.bantime,
-        // Global ignore list / bantime_increment live per-jail in the
-        // current schema; the global tracker uses conservative defaults.
-        .bantime_increment = .{},
+        .bantime_increment = incr,
         .eviction_policy = .drop_oldest_unbanned,
     };
 }
