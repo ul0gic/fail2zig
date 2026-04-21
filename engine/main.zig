@@ -44,6 +44,15 @@ pub const state_mod = @import("core/state.zig");
 const persist_mod = @import("core/persist.zig");
 pub const firewall = @import("firewall/backend.zig");
 pub const config_mod = @import("config/native.zig");
+pub const fail2ban_mod = @import("config/fail2ban.zig");
+pub const migration_mod = @import("config/migration.zig");
+pub const filter_types_mod = @import("filters/types.zig");
+pub const filter_sshd_mod = @import("filters/sshd.zig");
+pub const filter_nginx_mod = @import("filters/nginx.zig");
+pub const filter_apache_mod = @import("filters/apache.zig");
+pub const filter_mail_mod = @import("filters/mail.zig");
+pub const filter_misc_mod = @import("filters/misc.zig");
+pub const filter_registry_mod = @import("filters/registry.zig");
 const http = @import("net/http.zig");
 const ws = @import("net/ws.zig");
 pub const ipc_mod = @import("net/ipc.zig");
@@ -67,6 +76,7 @@ pub const CliAction = enum {
     print_version,
     print_help,
     test_config,
+    validate_config,
     import_config,
 };
 
@@ -75,7 +85,13 @@ pub const CliAction = enum {
 pub const CliOptions = struct {
     action: CliAction = .run,
     config_path: []const u8 = "/etc/fail2zig/config.toml",
+    /// Source directory passed to `--import-config`. Defaults to
+    /// fail2ban's standard location.
     import_path: ?[]const u8 = null,
+    /// Destination path for `--import-config` output. Defaults to
+    /// fail2zig's standard config location so the workflow
+    /// `fail2zig --import-config` → `fail2zig` just works.
+    import_output: []const u8 = "/etc/fail2zig/config.toml",
     foreground: bool = true, // v0.1: foreground-only
 };
 
@@ -92,6 +108,10 @@ pub fn parseArgs(args: []const []const u8) CliError!CliOptions {
             out.action = .print_version;
         } else if (std.mem.eql(u8, a, "--test-config")) {
             out.action = .test_config;
+        } else if (std.mem.eql(u8, a, "--validate-config")) {
+            // Alias of --test-config with clearer naming — we still keep
+            // --test-config for backward compatibility with early release docs.
+            out.action = .validate_config;
         } else if (std.mem.eql(u8, a, "--foreground")) {
             out.foreground = true;
         } else if (std.mem.eql(u8, a, "--config")) {
@@ -101,13 +121,24 @@ pub fn parseArgs(args: []const []const u8) CliError!CliOptions {
         } else if (std.mem.startsWith(u8, a, "--config=")) {
             out.config_path = a["--config=".len..];
         } else if (std.mem.eql(u8, a, "--import-config")) {
-            i += 1;
-            if (i >= args.len) return error.MissingValue;
-            out.import_path = args[i];
+            // Optional argument: if the next token looks like a path (not
+            // a flag), consume it; otherwise default to /etc/fail2ban.
+            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "--")) {
+                i += 1;
+                out.import_path = args[i];
+            } else {
+                out.import_path = "/etc/fail2ban";
+            }
             out.action = .import_config;
         } else if (std.mem.startsWith(u8, a, "--import-config=")) {
             out.import_path = a["--import-config=".len..];
             out.action = .import_config;
+        } else if (std.mem.eql(u8, a, "--import-output")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            out.import_output = args[i];
+        } else if (std.mem.startsWith(u8, a, "--import-output=")) {
+            out.import_output = a["--import-output=".len..];
         } else {
             return error.UnknownFlag;
         }
@@ -123,14 +154,44 @@ fn printHelp(w: anytype) !void {
         \\  fail2zig [OPTIONS]
         \\
         \\OPTIONS:
-        \\  --config <path>        Config file (default: /etc/fail2zig/config.toml)
-        \\  --foreground           Run in foreground (v0.1: only mode)
-        \\  --test-config          Validate config and exit
-        \\  --import-config <path> Import fail2ban config (not yet implemented)
-        \\  --version, -V          Print version and exit
-        \\  --help, -h             Print this help and exit
+        \\  --config <path>           Config file (default: /etc/fail2zig/config.toml)
+        \\  --foreground              Run in foreground (v0.1: only mode)
+        \\  --test-config             Alias for --validate-config
+        \\  --validate-config         Load + validate config, print result, exit
+        \\  --import-config [<dir>]   Import fail2ban config (default: /etc/fail2ban)
+        \\  --import-output <path>    Where to write imported config (default: /etc/fail2zig/config.toml)
+        \\  --version, -V             Print version and exit
+        \\  --help, -h                Print this help and exit
+        \\
+        \\EXIT CODES:
+        \\  0   success
+        \\  1   config load / validation failure, or zero jails imported
+        \\  2   hard parse error on import
         \\
     , .{version});
+}
+
+// ============================================================================
+// Migration driver — small wrapper so tests can drive it without spawning
+// the whole daemon. Returns the same exit code the CLI surfaces.
+// ============================================================================
+
+pub fn runImport(
+    heap: std.mem.Allocator,
+    source: []const u8,
+    output: []const u8,
+    stderr: anytype,
+) u8 {
+    var arena = std.heap.ArenaAllocator.init(heap);
+    defer arena.deinit();
+
+    const report = migration_mod.importConfig(arena.allocator(), source, output) catch |err| {
+        stderr.print("import: failed: {s}\n", .{@errorName(err)}) catch {};
+        return 2;
+    };
+    migration_mod.printReport(report, stderr) catch {};
+    if (report.jails_imported == 0) return 1;
+    return 0;
 }
 
 // ============================================================================
@@ -367,10 +428,12 @@ pub fn main() !void {
             return;
         },
         .import_config => {
-            try stdout.print("fail2zig: --import-config not yet implemented\n", .{});
-            return;
+            const stderr = std.io.getStdErr().writer();
+            const source = opts.import_path orelse "/etc/fail2ban";
+            const rc = runImport(heap, source, opts.import_output, stderr);
+            std.process.exit(rc);
         },
-        .test_config, .run => {},
+        .test_config, .validate_config, .run => {},
     }
 
     // Load config.
@@ -383,10 +446,12 @@ pub fn main() !void {
     };
 
     // Ensure the socket directory exists before `validate()` checks it.
-    // On --test-config we skip the mkdir (the validator treats a missing
-    // dir as a hard error, which is the behavior operators want when
-    // they're troubleshooting a config from a laptop without root).
-    if (opts.action != .test_config) {
+    // On `--test-config` / `--validate-config` we skip the mkdir — the
+    // validator treats a missing dir as a hard error, which is what
+    // operators want when they're troubleshooting from a laptop without
+    // root.
+    const is_validate_only = opts.action == .test_config or opts.action == .validate_config;
+    if (!is_validate_only) {
         ensureSocketDir(cfg.global.socket_path) catch |err| {
             const stderr = std.io.getStdErr().writer();
             try stderr.print("config: cannot prepare socket directory: {s}\n", .{@errorName(err)});
@@ -399,7 +464,7 @@ pub fn main() !void {
         try stderr.print("config: validation failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
-    if (opts.action == .test_config) {
+    if (is_validate_only) {
         try stdout.print("config: OK ({d} jail(s) configured)\n", .{cfg.jails.len});
         return;
     }
@@ -801,11 +866,39 @@ test "cli: --test-config" {
     try std.testing.expectEqual(CliAction.test_config, opts.action);
 }
 
-test "cli: --import-config" {
-    const args = [_][]const u8{ "fail2zig", "--import-config", "/etc/fail2ban/jail.conf" };
+test "cli: --import-config with explicit path" {
+    const args = [_][]const u8{ "fail2zig", "--import-config", "/etc/fail2ban" };
     const opts = try parseArgs(&args);
     try std.testing.expectEqual(CliAction.import_config, opts.action);
-    try std.testing.expectEqualStrings("/etc/fail2ban/jail.conf", opts.import_path.?);
+    try std.testing.expectEqualStrings("/etc/fail2ban", opts.import_path.?);
+    try std.testing.expectEqualStrings("/etc/fail2zig/config.toml", opts.import_output);
+}
+
+test "cli: --import-config with no arg uses default source" {
+    const args = [_][]const u8{"fail2zig"} ++ [_][]const u8{"--import-config"};
+    const opts = try parseArgs(&args);
+    try std.testing.expectEqual(CliAction.import_config, opts.action);
+    try std.testing.expectEqualStrings("/etc/fail2ban", opts.import_path.?);
+}
+
+test "cli: --import-config with --import-output override" {
+    const args = [_][]const u8{ "fail2zig", "--import-config", "/etc/fail2ban", "--import-output", "/tmp/out.toml" };
+    const opts = try parseArgs(&args);
+    try std.testing.expectEqual(CliAction.import_config, opts.action);
+    try std.testing.expectEqualStrings("/tmp/out.toml", opts.import_output);
+}
+
+test "cli: --import-config= inline" {
+    const args = [_][]const u8{ "fail2zig", "--import-config=/etc/fail2ban" };
+    const opts = try parseArgs(&args);
+    try std.testing.expectEqual(CliAction.import_config, opts.action);
+    try std.testing.expectEqualStrings("/etc/fail2ban", opts.import_path.?);
+}
+
+test "cli: --validate-config" {
+    const args = [_][]const u8{ "fail2zig", "--validate-config" };
+    const opts = try parseArgs(&args);
+    try std.testing.expectEqual(CliAction.validate_config, opts.action);
 }
 
 test "cli: --foreground" {
@@ -826,13 +919,102 @@ test "cli: missing value errors" {
 }
 
 test "cli: printHelp writes usage" {
-    var buf: [1024]u8 = undefined;
+    var buf: [2048]u8 = undefined;
     var stream = std.io.fixedBufferStream(&buf);
     try printHelp(stream.writer());
     const written = stream.getWritten();
     try std.testing.expect(std.mem.indexOf(u8, written, "fail2zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "--config") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "--version") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "--import-config") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "--import-output") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "--validate-config") != null);
+}
+
+test "cli: runImport succeeds and returns 0 for a viable config tree" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "jail.conf",
+        .data =
+        \\[sshd]
+        \\enabled = true
+        \\filter = sshd
+        \\logpath = /var/log/auth.log
+        ,
+    });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source = try tmp.dir.realpathAlloc(arena.allocator(), ".");
+    const out = try std.fs.path.join(arena.allocator(), &.{ source, "out.toml" });
+
+    var stderr_buf = std.ArrayList(u8).init(std.testing.allocator);
+    defer stderr_buf.deinit();
+
+    const rc = runImport(std.testing.allocator, source, out, stderr_buf.writer());
+    try std.testing.expectEqual(@as(u8, 0), rc);
+}
+
+test "cli: runImport returns 1 when zero jails are imported" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Only a DEFAULT section — no user jails = zero imported.
+    try tmp.dir.writeFile(.{
+        .sub_path = "jail.conf",
+        .data =
+        \\[DEFAULT]
+        \\bantime = 600
+        ,
+    });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source = try tmp.dir.realpathAlloc(arena.allocator(), ".");
+    const out = try std.fs.path.join(arena.allocator(), &.{ source, "out.toml" });
+
+    var stderr_buf = std.ArrayList(u8).init(std.testing.allocator);
+    defer stderr_buf.deinit();
+
+    const rc = runImport(std.testing.allocator, source, out, stderr_buf.writer());
+    try std.testing.expectEqual(@as(u8, 1), rc);
+}
+
+test "cli: runImport returns 2 on unreadable source dir" {
+    var stderr_buf = std.ArrayList(u8).init(std.testing.allocator);
+    defer stderr_buf.deinit();
+
+    // A source with an oversized jail.conf would exceed our bound and fail
+    // parsing. Here we just point at a non-existent path: loadJailConfig
+    // handles that gracefully (returns empty ini) so the next non-success
+    // code path to exercise is filesystem-level. We simulate by asking
+    // for an output path inside a nonexistent directory — writeTomlAtomic
+    // will attempt to create it, but we'll also feed an unwritable output
+    // to force WriteFailed.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "jail.conf",
+        .data =
+        \\[sshd]
+        \\enabled = true
+        \\filter = sshd
+        ,
+    });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source = try tmp.dir.realpathAlloc(arena.allocator(), ".");
+
+    // Writing under a file-as-directory path fails.
+    try tmp.dir.writeFile(.{ .sub_path = "blocker", .data = "x" });
+    const bad_out = try std.fs.path.join(arena.allocator(), &.{ source, "blocker", "out.toml" });
+
+    const rc = runImport(std.testing.allocator, source, bad_out, stderr_buf.writer());
+    try std.testing.expectEqual(@as(u8, 2), rc);
 }
 
 test "main: deriveMemoryConfig splits ceiling sensibly" {
@@ -884,6 +1066,15 @@ test {
     _ = persist_mod;
     _ = firewall;
     _ = config_mod;
+    _ = fail2ban_mod;
+    _ = migration_mod;
+    _ = filter_types_mod;
+    _ = filter_sshd_mod;
+    _ = filter_nginx_mod;
+    _ = filter_apache_mod;
+    _ = filter_mail_mod;
+    _ = filter_misc_mod;
+    _ = filter_registry_mod;
     _ = http;
     _ = ws;
     _ = ipc_mod;
