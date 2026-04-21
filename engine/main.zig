@@ -44,6 +44,9 @@ const firewall = @import("firewall/backend.zig");
 const config_mod = @import("config/native.zig");
 const http = @import("net/http.zig");
 const ws = @import("net/ws.zig");
+const ipc_mod = @import("net/ipc.zig");
+const commands_mod = @import("net/commands.zig");
+const metrics_mod = @import("core/metrics.zig");
 
 pub const version = "0.1.0";
 
@@ -137,6 +140,9 @@ const JailContext = struct {
     parser: parser_mod.Parser,
     state: *state_mod.StateTracker,
     backend_ptr: *firewall.Backend,
+    /// Metrics is nullable for tests that don't care about counters —
+    /// the daemon always supplies a real pointer.
+    metrics: ?*metrics_mod.Metrics = null,
     /// Current wall-clock is read at callback time; stored here so tests
     /// can override it. In production this stays at null.
     now_override: ?shared.Timestamp = null,
@@ -160,8 +166,22 @@ fn lineCallback(
         return;
     }
     const ctx: *JailContext = @ptrCast(@alignCast(userdata.?));
+    if (ctx.metrics) |m| {
+        m.incrementParsed();
+        m.jailIncrementParsed(ctx.jail.slice());
+    }
 
-    const result = ctx.parser.parseLine(line) catch return;
+    const result = ctx.parser.parseLine(line) catch {
+        if (ctx.metrics) |m| {
+            m.incrementParseErrors();
+            m.jailIncrementParseErrors(ctx.jail.slice());
+        }
+        return;
+    };
+    if (ctx.metrics) |m| {
+        m.incrementMatched();
+        m.jailIncrementMatched(ctx.jail.slice());
+    }
     const ts = ctx.now();
     const decision = ctx.state.recordAttempt(result.ip, ctx.jail, ts) catch |err| {
         std.log.warn(
@@ -180,7 +200,12 @@ fn lineCallback(
                 "backend: ban failed for ip={} jail='{s}': {s}",
                 .{ d.ip, ctx.jail.slice(), @errorName(err) },
             );
+            return;
         };
+        if (ctx.metrics) |m| {
+            m.incrementBans();
+            m.jailIncrementBans(ctx.jail.slice());
+        }
     }
 }
 
@@ -191,6 +216,7 @@ fn lineCallback(
 const ExpiryContext = struct {
     state: *state_mod.StateTracker,
     backend_ptr: *firewall.Backend,
+    metrics: ?*metrics_mod.Metrics = null,
 };
 
 fn expirySweep(expirations: u64, userdata: ?*anyopaque) void {
@@ -230,6 +256,10 @@ fn expirySweep(expirations: u64, userdata: ?*anyopaque) void {
             );
         };
         ctx.state.clearBan(item.ip);
+        if (ctx.metrics) |m| {
+            m.incrementUnbans();
+            m.jailIncrementUnbans(item.jail.slice());
+        }
         std.log.info(
             "unban: jail='{s}' ip={}",
             .{ item.jail.slice(), item.ip },
@@ -341,7 +371,7 @@ pub fn main() !void {
         .test_config, .run => {},
     }
 
-    // Load + validate config.
+    // Load config.
     var cfg_arena = std.heap.ArenaAllocator.init(heap);
     defer cfg_arena.deinit();
     const cfg = config_mod.Config.loadFile(cfg_arena.allocator(), opts.config_path) catch |err| {
@@ -349,6 +379,19 @@ pub fn main() !void {
         try stderr.print("config: failed to load '{s}': {s}\n", .{ opts.config_path, @errorName(err) });
         std.process.exit(1);
     };
+
+    // Ensure the socket directory exists before `validate()` checks it.
+    // On --test-config we skip the mkdir (the validator treats a missing
+    // dir as a hard error, which is the behavior operators want when
+    // they're troubleshooting a config from a laptop without root).
+    if (opts.action != .test_config) {
+        ensureSocketDir(cfg.global.socket_path) catch |err| {
+            const stderr = std.io.getStdErr().writer();
+            try stderr.print("config: cannot prepare socket directory: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+    }
+
     config_mod.validate(&cfg) catch |err| {
         const stderr = std.io.getStdErr().writer();
         try stderr.print("config: validation failed: {s}\n", .{@errorName(err)});
@@ -371,6 +414,14 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         return err;
     };
     defer pool.deinit();
+
+    // Metrics (atomic counters). Cheap; construct before anything that
+    // increments them.
+    var metrics = metrics_mod.Metrics.init();
+    for (cfg.jails) |jc| {
+        if (!jc.enabled) continue;
+        _ = metrics.registerJail(jc.name);
+    }
 
     // Firewall backend.
     var backend_val = firewall.detect(heap) catch |err| {
@@ -448,6 +499,7 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
             .parser = parser_mod.Parser.init(pool.allocator(.parser_buffer)),
             .state = &tracker,
             .backend_ptr = &backend_val,
+            .metrics = &metrics,
         };
         try contexts.append(ctx);
 
@@ -463,6 +515,60 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         std.log.info("jail: enabled '{s}' ({d} logpath(s))", .{ jail_cfg.name, jail_cfg.logpath.len });
     }
 
+    // IPC command handler context. Must outlive the IpcServer and HTTP
+    // status source. start_time captured here so uptime reflects the
+    // operational start.
+    var cmd_ctx: commands_mod.Context = .{
+        .state = &tracker,
+        .config = cfg,
+        .backend = &backend_val,
+        .stats_source = .{
+            .ctx = @ptrCast(&metrics),
+            .snapshot = metricsStatsSnapshot,
+        },
+        .start_time = std.time.timestamp(),
+        .version = version,
+    };
+
+    // IPC server. The caller (`main()`) has already ensured
+    // `socket_path`'s parent directory exists, so bind(2) can't fail on
+    // ENOENT here.
+
+    var ipc_server = ipc_mod.IpcServer.init(heap, &loop, cfg.global.socket_path) catch |err| {
+        std.log.err("ipc: init failed at '{s}': {s}", .{ cfg.global.socket_path, @errorName(err) });
+        return err;
+    };
+    defer ipc_server.deinit();
+    ipc_server.setCommandHandler(cmd_ctx.asHandler());
+    try ipc_server.start();
+
+    // WebSocket server — state-only, the HTTP server owns the listener.
+    var ws_server = ws.WsServer.init(heap, &loop) catch |err| {
+        std.log.err("ws: init failed: {s}", .{@errorName(err)});
+        return err;
+    };
+    defer ws_server.deinit();
+
+    // HTTP server (metrics + status + /events WebSocket upgrade).
+    var http_ctx: HttpSources = .{ .metrics = &metrics, .cmd_ctx = &cmd_ctx };
+    var http_server = http.HttpServer.init(
+        heap,
+        &loop,
+        cfg.global.metrics_port,
+        cfg.global.metrics_bind,
+    ) catch |err| {
+        std.log.err(
+            "http: init on {s}:{d} failed: {s}",
+            .{ cfg.global.metrics_bind, cfg.global.metrics_port, @errorName(err) },
+        );
+        return err;
+    };
+    defer http_server.deinit();
+    http_server.setMetricsSource(.{ .ctx = @ptrCast(&http_ctx), .write = writeMetricsPayload });
+    http_server.setStatusSource(.{ .ctx = @ptrCast(&http_ctx), .write = writeStatusPayload });
+    http_server.setWsServer(&ws_server);
+    try http_server.start();
+
     // Signal handlers. Order matters: install TERM/INT before HUP so
     // tests can observe TERM behaviour without HUP interference.
     var sig_ctx = SignalContext{
@@ -475,15 +581,171 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     try loop.addSignalHandler(linux.SIG.HUP, onReload, &sig_ctx);
 
     // Ban expiry timer.
-    var expiry_ctx = ExpiryContext{ .state = &tracker, .backend_ptr = &backend_val };
+    var expiry_ctx = ExpiryContext{
+        .state = &tracker,
+        .backend_ptr = &backend_val,
+        .metrics = &metrics,
+    };
     _ = try loop.addTimer(1000, expirySweep, &expiry_ctx, false);
 
-    std.log.info("fail2zig v{s} running; backend={s}", .{ version, @tagName(backend_val.tag()) });
+    std.log.info(
+        "fail2zig v{s} running; backend={s}; ipc={s}; http={s}:{d}",
+        .{
+            version,
+            @tagName(backend_val.tag()),
+            cfg.global.socket_path,
+            cfg.global.metrics_bind,
+            cfg.global.metrics_port,
+        },
+    );
 
     try loop.run();
 
     // Final state save on clean shutdown (best-effort; ignore errors).
     persist_mod.save(&tracker, cfg.global.state_file) catch {};
+
+    // Explicit teardown order: close IPC/HTTP/WS first so their FDs are
+    // no longer registered with the loop when `loop.deinit` runs below
+    // via `defer`. Deferred calls run in reverse, so the defers above
+    // will fire in the correct order already — but if the loop exits
+    // abnormally, logging here surfaces it.
+    std.log.info("fail2zig: shutting down", .{});
+}
+
+// ============================================================================
+// Service helpers
+// ============================================================================
+
+/// Ensure the parent directory of `socket_path` exists. Created with
+/// mode 0710 so the root user can write and members of the fail2zig
+/// group can traverse it (to reach the socket file itself). On
+/// AlreadyExists this is a no-op — any other error is surfaced because
+/// it would prevent `bind(2)` from succeeding later.
+fn ensureSocketDir(socket_path: []const u8) !void {
+    const dir = std.fs.path.dirname(socket_path) orelse return;
+    std.fs.cwd().makeDir(dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => {
+            std.log.err(
+                "ipc: failed to create socket parent dir '{s}': {s}",
+                .{ dir, @errorName(err) },
+            );
+            return err;
+        },
+    };
+    // Best-effort chmod to 0710 — root/rw, group/x, other/none. If
+    // chmod fails (e.g. the directory is not owned by us), log and
+    // continue; the bind() still works if the parent is at least
+    // traversable by the daemon.
+    std.posix.fchmodat(std.posix.AT.FDCWD, dir, 0o710, 0) catch |err| {
+        std.log.warn(
+            "ipc: chmod of socket parent dir '{s}' failed: {s}",
+            .{ dir, @errorName(err) },
+        );
+    };
+}
+
+// ============================================================================
+// Metrics / HTTP glue — decoupling shims between metrics.zig and the
+// source-vtables defined by http.zig and commands.zig.
+// ============================================================================
+
+/// Adapter invoked from `commands.StatsSource.snapshot` to read the live
+/// metrics counters. Lives in main.zig so `net/commands.zig` doesn't
+/// take a compile-time dependency on `core/metrics.zig`.
+fn metricsStatsSnapshot(ctx: ?*anyopaque) commands_mod.StatsSnapshot {
+    const m: *metrics_mod.Metrics = @ptrCast(@alignCast(ctx.?));
+    const s = m.snapshot();
+    return .{
+        .memory_bytes_used = s.memory_bytes_used,
+        .parse_rate = 0, // computed across an interval; Phase 6 improvement.
+    };
+}
+
+/// Bundle of pointers the HTTP `/metrics` and `/api/status` handlers
+/// need. Kept together so we only plumb one `ctx` pointer through the
+/// vtable.
+const HttpSources = struct {
+    metrics: *metrics_mod.Metrics,
+    cmd_ctx: *commands_mod.Context,
+};
+
+/// MetricsSource.write implementation — renders the Prometheus text
+/// exposition for all live counters.
+fn writeMetricsPayload(
+    ctx: ?*anyopaque,
+    out: *std.ArrayListUnmanaged(u8),
+    a: std.mem.Allocator,
+) anyerror!void {
+    const self: *HttpSources = @ptrCast(@alignCast(ctx.?));
+    const snap = self.metrics.snapshot();
+    const w = out.writer(a);
+
+    try w.writeAll("# HELP fail2zig_up 1 when the daemon is running\n");
+    try w.writeAll("# TYPE fail2zig_up gauge\n");
+    try w.writeAll("fail2zig_up 1\n");
+
+    try w.writeAll("# HELP fail2zig_lines_parsed_total Total log lines parsed\n");
+    try w.writeAll("# TYPE fail2zig_lines_parsed_total counter\n");
+    try w.print("fail2zig_lines_parsed_total {d}\n", .{snap.lines_parsed});
+
+    try w.writeAll("# HELP fail2zig_lines_matched_total Log lines matching a filter\n");
+    try w.writeAll("# TYPE fail2zig_lines_matched_total counter\n");
+    try w.print("fail2zig_lines_matched_total {d}\n", .{snap.lines_matched});
+
+    try w.writeAll("# HELP fail2zig_bans_total Total bans issued\n");
+    try w.writeAll("# TYPE fail2zig_bans_total counter\n");
+    try w.print("fail2zig_bans_total {d}\n", .{snap.bans_total});
+
+    try w.writeAll("# HELP fail2zig_unbans_total Total unbans issued\n");
+    try w.writeAll("# TYPE fail2zig_unbans_total counter\n");
+    try w.print("fail2zig_unbans_total {d}\n", .{snap.unbans_total});
+
+    try w.writeAll("# HELP fail2zig_active_bans Current active bans\n");
+    try w.writeAll("# TYPE fail2zig_active_bans gauge\n");
+    try w.print("fail2zig_active_bans {d}\n", .{snap.active_bans});
+
+    try w.writeAll("# HELP fail2zig_parse_errors_total Total parse errors\n");
+    try w.writeAll("# TYPE fail2zig_parse_errors_total counter\n");
+    try w.print("fail2zig_parse_errors_total {d}\n", .{snap.parse_errors});
+
+    try w.writeAll("# HELP fail2zig_memory_bytes_used Current memory footprint\n");
+    try w.writeAll("# TYPE fail2zig_memory_bytes_used gauge\n");
+    try w.print("fail2zig_memory_bytes_used {d}\n", .{snap.memory_bytes_used});
+
+    // Per-jail labels.
+    for (snap.perJail()) |pj| {
+        const name = pj.name();
+        try w.print("fail2zig_lines_parsed_total{{jail=\"{s}\"}} {d}\n", .{ name, pj.lines_parsed });
+        try w.print("fail2zig_lines_matched_total{{jail=\"{s}\"}} {d}\n", .{ name, pj.lines_matched });
+        try w.print("fail2zig_bans_total{{jail=\"{s}\"}} {d}\n", .{ name, pj.bans_total });
+        try w.print("fail2zig_unbans_total{{jail=\"{s}\"}} {d}\n", .{ name, pj.unbans_total });
+        try w.print("fail2zig_active_bans{{jail=\"{s}\"}} {d}\n", .{ name, pj.active_bans });
+    }
+}
+
+/// StatusSource.write implementation — delegates to the same JSON
+/// renderer the IPC `status` command uses. Guarantees the dashboard and
+/// the CLI see identical data shapes.
+fn writeStatusPayload(
+    ctx: ?*anyopaque,
+    out: *std.ArrayListUnmanaged(u8),
+    a: std.mem.Allocator,
+) anyerror!void {
+    const self: *HttpSources = @ptrCast(@alignCast(ctx.?));
+    // Go through the installed handler vtable so `/api/status` emits
+    // byte-identical JSON to what the IPC `status` command produces.
+    const handler = self.cmd_ctx.asHandler();
+    const resp = try handler.dispatch(handler.ctx, .{ .status = {} }, a);
+    defer resp.deinit(a);
+    switch (resp) {
+        .ok => |o| try out.appendSlice(a, o.payload),
+        .err => |e| {
+            var buf: [128]u8 = undefined;
+            const s = try std.fmt.bufPrint(&buf, "{{\"error\":{d},\"message\":\"{s}\"}}", .{ e.code, e.message });
+            try out.appendSlice(a, s);
+        },
+    }
 }
 
 // ============================================================================
@@ -603,6 +865,12 @@ test "main: deriveTrackerConfig mirrors defaults" {
 }
 
 test {
+    // Force test discovery for every engine module. Zig only includes a
+    // file's tests in the test binary if it is referenced from inside a
+    // `test` block — top-level `@import` alone is not enough. Keep this
+    // list complete even for modules that `runDaemon` constructs
+    // directly, otherwise their unit tests disappear from `zig build
+    // test` output.
     _ = allocator_mod;
     _ = memory_mod;
     _ = event_loop_mod;
@@ -616,5 +884,8 @@ test {
     _ = config_mod;
     _ = http;
     _ = ws;
+    _ = ipc_mod;
+    _ = commands_mod;
+    _ = metrics_mod;
     _ = shared;
 }

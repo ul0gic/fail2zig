@@ -80,10 +80,21 @@ pub const BanTimeIncrement = struct {
 
 pub const GlobalConfig = struct {
     log_level: LogLevel = .info,
-    pid_file: []const u8 = "/run/fail2zig.pid",
-    socket_path: []const u8 = "/run/fail2zig.sock",
+    pid_file: []const u8 = "/run/fail2zig/fail2zig.pid",
+    /// Unix domain socket for fail2zig-client. The daemon creates the
+    /// parent directory (mode 0710) on startup if missing. Matches the
+    /// client's `--socket` default and fail2ban convention of placing
+    /// runtime files under a dedicated `/run/<pkg>/` directory.
+    socket_path: []const u8 = "/run/fail2zig/fail2zig.sock",
     state_file: []const u8 = "/var/lib/fail2zig/state.bin",
     memory_ceiling_mb: u32 = 64,
+    /// HTTP metrics endpoint (Prometheus + /api/status). Localhost-only
+    /// by default — exposing this publicly leaks operational telemetry.
+    metrics_bind: []const u8 = "127.0.0.1",
+    /// Prometheus node_exporter convention is port 9100. Operators who
+    /// run both fail2zig and node_exporter on the same host should
+    /// override one of them.
+    metrics_port: u16 = 9100,
 };
 
 pub const JailDefaults = struct {
@@ -587,6 +598,12 @@ const Parser = struct {
             const n = try asInt(v);
             if (n < 0) return error.InvalidValue;
             self.global.memory_ceiling_mb = @intCast(n);
+        } else if (std.mem.eql(u8, key, "metrics_bind")) {
+            self.global.metrics_bind = try asString(v);
+        } else if (std.mem.eql(u8, key, "metrics_port")) {
+            const n = try asInt(v);
+            if (n < 0 or n > 65535) return error.InvalidValue;
+            self.global.metrics_port = @intCast(n);
         } else return error.UnknownKey;
     }
 
@@ -931,6 +948,7 @@ test "native: validate rejects duplicate jail names" {
     const src =
         \\[global]
         \\memory_ceiling_mb = 32
+        \\socket_path = "/tmp/fail2zig-test-validate.sock"
         \\[defaults]
         \\bantime = 600
         \\findtime = 600

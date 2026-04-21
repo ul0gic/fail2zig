@@ -71,7 +71,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // ===== Tests =====
-    const test_step = b.step("test", "Run all tests (engine, client, shared)");
+    const test_step = b.step("test", "Run all tests (engine, client, shared, integration)");
     const test_filters: []const []const u8 = if (test_filter) |f| &.{f} else &.{};
 
     const engine_tests = b.addTest(.{
@@ -94,4 +94,24 @@ pub fn build(b: *std.Build) void {
     });
     const run_shared_tests = b.addRunArtifact(shared_tests);
     test_step.dependOn(&run_shared_tests.step);
+
+    // Integration tests — driven from `tests/integration_ipc_roundtrip.zig`
+    // but with the module root pinned to the repository root via a
+    // single-line shim. That gives the test file freedom to reach into
+    // `engine/` with normal relative `@import` paths while keeping the
+    // test file under `tests/` where `.project/build-plan.md` requires.
+    const integration_mod = b.createModule(.{
+        .root_source_file = b.path("integration_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    integration_mod.addImport("shared", shared_mod);
+
+    const integration_tests = b.addTest(.{
+        .root_module = integration_mod,
+        .filters = test_filters,
+    });
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+    test_step.dependOn(&run_integration_tests.step);
 }

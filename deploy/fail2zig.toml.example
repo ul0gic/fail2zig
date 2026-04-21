@@ -21,12 +21,14 @@
 # One of: "debug", "info", "warn", "err"
 log_level = "info"
 
-# PID file location. Parent directory must be writable by root.
-pid_file = "/run/fail2zig.pid"
+# PID file location. Parent directory is created at startup if absent.
+pid_file = "/run/fail2zig/fail2zig.pid"
 
 # Unix domain socket for the fail2zig-client CLI.
 # Mode 0660, owned by root:fail2zig (see deploy/fail2zig.service).
-socket_path = "/run/fail2zig.sock"
+# The daemon creates the parent directory (mode 0710) on startup if it
+# does not exist — matches the client's default `--socket` path.
+socket_path = "/run/fail2zig/fail2zig.sock"
 
 # Persistent state file — restored on restart, atomically rewritten
 # at shutdown and periodically. Parent dir must exist.
@@ -36,6 +38,13 @@ state_file = "/var/lib/fail2zig/state.bin"
 # per-jail arenas respect this bound — once hit, the eviction policy
 # kicks in rather than growing. Minimum 16 MB.
 memory_ceiling_mb = 64
+
+# HTTP endpoint that exposes Prometheus `/metrics` and JSON `/api/status`.
+# The same port also upgrades WebSocket connections on `/events` for the
+# real-time dashboard. Bound to localhost by default — exposing this
+# publicly leaks operational telemetry.
+metrics_bind = "127.0.0.1"
+metrics_port = 9100
 
 # ----------------------------------------------------------------------
 # [defaults] — applied to every jail unless overridden under [jails.X]
