@@ -34,7 +34,10 @@ zig build -Doptimize=.ReleaseSafe
 - **Single static binary.** Copy it to any Linux server. No Python, no packages,
   no package manager. Works on distroless containers, minimal VMs, OpenWrt.
 - **Zero runtime dependencies.** The binary is the complete trusted computing
-  base. C interop is limited to stable kernel ABIs (inotify, netfilter).
+  base. No shell-out to `nft`, `iptables`, or any other CLI. fail2zig speaks
+  netlink directly to the kernel for every firewall operation — see
+  [docs/architecture/zero-dependencies.md](docs/architecture/zero-dependencies.md)
+  for why this matters for a security tool, and how we verify it.
 - **Hard memory ceiling.** Pre-allocated arenas with a configurable cap (default
   64 MB). Memory usage does not grow under sustained brute-force or DDoS
   conditions. Behavior at the ceiling is operator-defined via eviction policy.

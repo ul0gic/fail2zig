@@ -167,7 +167,13 @@ pub const IpcServer = struct {
         // sun_path is 108 bytes including the terminator — leave room for it.
         if (socket_path.len >= 108) return error.PathTooLong;
 
-        const stype: u32 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
+        // SOCK.NONBLOCK on the listener is mandatory: `acceptPending()` drains
+        // the listen queue in a loop and relies on `error.WouldBlock` from
+        // accept4 to exit. That error is only raised when the *listener* is
+        // non-blocking — the SOCK.NONBLOCK flag on accept4's accepted-fd side
+        // doesn't help. Without it the event loop blocks inside accept4
+        // forever after the first client connects (SYS-001).
+        const stype: u32 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
         const fd = posix.socket(posix.AF.UNIX, stype, 0) catch
             return error.SocketCreateFailed;
         errdefer posix.close(fd);
@@ -660,6 +666,28 @@ test "ipc: socket has mode 0660 immediately after init (SEC-002)" {
     // Mask off the type bits; check the 9 permission bits exactly.
     const perm = stbuf.mode & 0o777;
     try testing.expectEqual(@as(u32, 0o660), perm);
+}
+
+test "ipc: listener socket is non-blocking (SYS-001)" {
+    // SYS-001 regression: the listener must have O_NONBLOCK set. The accept
+    // loop in `acceptPending()` drains the backlog until accept4 returns
+    // WouldBlock, which only happens on a non-blocking listener. A blocking
+    // listener freezes the entire event loop inside the kernel's unix_accept
+    // after the first client connects, making the daemon unusable.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = testing.allocator;
+
+    var loop = try EventLoop.init(a);
+    defer loop.deinit();
+
+    const path = try makeTestPath(a);
+    defer a.free(path);
+
+    var server = try IpcServer.init(a, &loop, path);
+    defer server.deinit();
+
+    const flags = try posix.fcntl(server.listen_fd, posix.F.GETFL, 0);
+    try testing.expect((flags & @as(usize, linux.SOCK.NONBLOCK)) != 0);
 }
 
 test "ipc: init rejects path that is too long" {

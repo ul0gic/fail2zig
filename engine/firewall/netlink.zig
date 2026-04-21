@@ -45,6 +45,22 @@ pub const Error = error{
     RecvFailed,
     /// Peer returned an `NLMSG_ERROR` with a non-zero errno.
     NetlinkError,
+    /// The kernel said the named object (table/set/chain/rule/element)
+    /// does not exist. Specific-enough to inform install / idempotency
+    /// decisions — e.g. "DELTABLE failed with NotFound" is expected on
+    /// first-time install.
+    NotFound,
+    /// The kernel said the object already exists. Used for idempotent
+    /// install checks.
+    AlreadyExists,
+    /// The kernel denied the operation — missing CAP_NET_ADMIN or
+    /// some other permissions failure.
+    PermissionDenied,
+    /// The kernel rejected our message as malformed. This is almost
+    /// always a bug in our payload builders; log loudly.
+    InvalidArgument,
+    /// Drain timed out before all expected ACKs arrived.
+    Timeout,
     /// Response was shorter than expected / malformed.
     TruncatedMessage,
     /// Caller's buffer was too small for the response.
@@ -52,6 +68,26 @@ pub const Error = error{
     /// Batch state machine used out of order.
     InvalidBatchState,
 };
+
+/// Map a kernel-returned errno (as delivered in an `NLMSG_ERROR`
+/// payload, already sign-flipped so it's a positive errno value) to
+/// one of our specific `Error` variants. Unknown errnos collapse to
+/// `NetlinkError` so callers can still handle the message fault.
+pub fn errnoToError(errno: i32) Error {
+    // `parseNlmsgerr` returns the signed kernel value (typically
+    // negative). We care about the positive errno magnitude.
+    const v: i32 = if (errno < 0) -errno else errno;
+    // errno values from `include/uapi/asm-generic/errno-base.h` and
+    // `errno.h`. Only the ones relevant to nftables operations.
+    return switch (v) {
+        2 => error.NotFound, // ENOENT
+        13 => error.PermissionDenied, // EACCES
+        1 => error.PermissionDenied, // EPERM
+        17 => error.AlreadyExists, // EEXIST
+        22 => error.InvalidArgument, // EINVAL
+        else => error.NetlinkError,
+    };
+}
 
 /// Owning handle for a netlink socket.
 pub const NetlinkSocket = struct {
@@ -125,11 +161,106 @@ pub const NetlinkSocket = struct {
     /// for walking multiple `nlmsghdr` frames within that slice
     /// via `MessageIterator`.
     pub fn recv(self: *NetlinkSocket, buf: []u8) Error![]u8 {
-        const n = posix.recv(self.fd, buf, 0) catch {
-            return error.RecvFailed;
+        const n = posix.recv(self.fd, buf, 0) catch |err| switch (err) {
+            error.WouldBlock => return error.Timeout,
+            else => return error.RecvFailed,
         };
         if (n == 0) return error.TruncatedMessage;
         return buf[0..n];
+    }
+
+    /// Set the socket's receive timeout. `drainAck` uses this to
+    /// bound the worst-case wait for netlink responses. Passing 0
+    /// disables the timeout (blocking recv forever).
+    pub fn setRecvTimeout(self: *NetlinkSocket, ms: u64) Error!void {
+        const secs: i64 = @intCast(ms / 1000);
+        const usecs: i64 = @intCast((ms % 1000) * 1000);
+        const tv: posix.timeval = .{ .sec = secs, .usec = usecs };
+        posix.setsockopt(
+            self.fd,
+            posix.SOL.SOCKET,
+            posix.SO.RCVTIMEO,
+            mem.asBytes(&tv),
+        ) catch return error.SocketFailed;
+    }
+
+    /// Drain netlink responses until every sequence number in
+    /// `expected_seqs` has been ACK'd or any returns an errno.
+    ///
+    /// Nftables ACK semantics (from `linux/net/netfilter/nfnetlink.c`):
+    /// every message sent with `NLM_F_ACK` produces exactly one
+    /// `NLMSG_ERROR` reply carrying either errno=0 (success) or a
+    /// negative errno. Unmatched message types are skipped.
+    ///
+    /// `scratch` is a caller-owned receive buffer — typically 8 KiB
+    /// suffices for a single batch ACK, but callers sending many
+    /// messages per batch may want more.
+    ///
+    /// On any non-zero errno this returns the specific `Error`
+    /// variant mapped by `errnoToError`. The caller decides whether
+    /// that particular failure is fatal or expected (e.g. DELTABLE
+    /// on first-time install legitimately returns `NotFound`).
+    pub fn drainAck(
+        self: *NetlinkSocket,
+        expected_seqs: []const u32,
+        scratch: []u8,
+    ) Error!void {
+        if (expected_seqs.len == 0) return;
+
+        // Track which seqs are still outstanding. For small N (<=64
+        // which covers every batch we realistically build) a bitset
+        // over a `u64` is enough; we degrade to an O(N) linear scan
+        // above that.
+        var bits: u64 = 0;
+        const use_bitset = expected_seqs.len <= 64;
+        if (use_bitset) {
+            bits = if (expected_seqs.len == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(expected_seqs.len)) - 1;
+        }
+        // O(N) fallback for larger batches — avoided in practice but
+        // keeps the surface robust.
+        var done_flags = [_]bool{false} ** 256;
+
+        while (true) {
+            const anyPending = if (use_bitset) bits != 0 else blk: {
+                var pending = false;
+                for (done_flags[0..expected_seqs.len]) |d| if (!d) {
+                    pending = true;
+                    break;
+                };
+                break :blk pending;
+            };
+            if (!anyPending) return;
+
+            const data = try self.recv(scratch);
+            var it = MessageIterator.init(data);
+            while (it.next()) |msg| {
+                // NLMSG_ERROR is type 2 in the standard netlink type
+                // space. Hard-coded here rather than via
+                // `linux.NetlinkMessageType.ERROR` because the enum
+                // name varies across Zig 0.14 / 0.15.
+                if (@intFromEnum(msg.hdr.type) != @as(u16, 2)) continue;
+                const errno = try parseNlmsgerr(msg.payload);
+                // Correlate by the *inner* seq (which is msg.hdr.seq
+                // echoed back). `parseNlmsgerr` skips past the errno
+                // field; the header inside the payload is the one
+                // we originally sent, but its seq equals msg.hdr.seq.
+                const seq = msg.hdr.seq;
+                var matched_idx: ?usize = null;
+                for (expected_seqs, 0..) |s, idx| {
+                    if (s == seq) {
+                        matched_idx = idx;
+                        break;
+                    }
+                }
+                if (matched_idx == null) continue; // stray ACK, ignore
+                if (errno != 0) return errnoToError(errno);
+                if (use_bitset) {
+                    bits &= ~(@as(u64, 1) << @intCast(matched_idx.?));
+                } else {
+                    done_flags[matched_idx.?] = true;
+                }
+            }
+        }
     }
 };
 

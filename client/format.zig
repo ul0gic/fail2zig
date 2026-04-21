@@ -76,29 +76,28 @@ pub const StatusPayload = struct {
     jails_active: ?u32 = null,
 };
 
+/// Matches the JSON emitted by `engine/net/commands.zig::writeListEntry`.
+/// `ban_expiry` is an absolute unix timestamp in seconds; the "time left"
+/// column is computed locally from `ban_expiry - now`.
 pub const BanEntry = struct {
     ip: ?[]const u8 = null,
     jail: ?[]const u8 = null,
-    remaining_seconds: ?i64 = null,
+    attempt_count: ?u32 = null,
+    last_attempt: ?i64 = null,
     ban_count: ?u32 = null,
-    country: ?[]const u8 = null,
+    ban_expiry: ?i64 = null,
 };
 
-pub const ListPayload = struct {
-    jail: ?[]const u8 = null,
-    entries: []BanEntry = &.{},
-};
-
+/// Matches the JSON emitted by `engine/net/commands.zig::handleListJails`.
+/// Shows the effective `maxretry / findtime / bantime` the daemon resolved
+/// for each jail from its config + inherited defaults.
 pub const JailEntry = struct {
     name: ?[]const u8 = null,
     enabled: ?bool = null,
     active_bans: ?u32 = null,
-    total_bans: ?u64 = null,
-    backend: ?[]const u8 = null,
-};
-
-pub const JailsPayload = struct {
-    jails: []JailEntry = &.{},
+    maxretry: ?u32 = null,
+    findtime: ?u32 = null,
+    bantime: ?u32 = null,
 };
 
 pub const VersionPayload = struct {
@@ -328,7 +327,7 @@ pub fn formatList(
         },
         .plain, .table => {
             const parsed = std.json.parseFromSlice(
-                ListPayload,
+                []BanEntry,
                 allocator,
                 payload_json,
                 .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
@@ -338,74 +337,66 @@ pub fn formatList(
             };
             defer parsed.deinit();
 
+            const now = std.time.timestamp();
             if (fmt == .plain) {
-                try writeListPlain(writer, parsed.value);
+                try writeListPlain(writer, parsed.value, now);
             } else {
-                try writeListTable(writer, parsed.value, color);
+                try writeListTable(writer, parsed.value, color, now);
             }
         },
     }
 }
 
-fn writeListPlain(writer: anytype, p: ListPayload) !void {
-    for (p.entries) |e| {
-        try writer.print("{s}\t{s}\t{d}\t{d}\t{s}\n", .{
+fn remainingFromExpiry(ban_expiry: ?i64, now: i64) ?i64 {
+    const exp = ban_expiry orelse return null;
+    return exp - now;
+}
+
+fn writeListPlain(writer: anytype, entries: []const BanEntry, now: i64) !void {
+    for (entries) |e| {
+        try writer.print("{s}\t{s}\t{d}\t{d}\n", .{
             e.ip orelse "-",
             e.jail orelse "-",
-            e.remaining_seconds orelse 0,
+            remainingFromExpiry(e.ban_expiry, now) orelse 0,
             e.ban_count orelse 0,
-            e.country orelse "-",
         });
     }
 }
 
-fn writeListTable(writer: anytype, p: ListPayload, color: Color) !void {
-    if (p.entries.len == 0) {
-        if (p.jail) |j| {
-            try writer.print("No active bans in jail '{s}'.\n", .{j});
-        } else {
-            try writer.writeAll("No active bans.\n");
-        }
+fn writeListTable(writer: anytype, entries: []const BanEntry, color: Color, now: i64) !void {
+    if (entries.len == 0) {
+        try writer.writeAll("No active bans.\n");
         return;
     }
 
-    // Column widths.
     const ip_col: usize = 18;
-    const jail_col: usize = 10;
-    const time_col: usize = 10;
+    const jail_col: usize = 12;
+    const time_col: usize = 12;
     const count_col: usize = 10;
-    const cc_col: usize = 8;
 
-    // Header
     try color.on(writer, Color.bold);
     try padRightPrint(writer, "IP ADDRESS", ip_col);
     try padRightPrint(writer, "JAIL", jail_col);
     try padRightPrint(writer, "TIME LEFT", time_col);
     try padRightPrint(writer, "BAN COUNT", count_col);
-    try padRightPrint(writer, "COUNTRY", cc_col);
     try color.off(writer);
     try writer.writeAll("\n");
 
-    const total_w = ip_col + jail_col + time_col + count_col + cc_col;
+    const total_w = ip_col + jail_col + time_col + count_col;
     try repeatChar(writer, '-', total_w);
     try writer.writeAll("\n");
 
-    for (p.entries) |e| {
+    for (entries) |e| {
         try color.on(writer, Color.cyan);
         try padRightPrint(writer, e.ip orelse "-", ip_col);
         try color.off(writer);
         try padRightPrint(writer, e.jail orelse "-", jail_col);
-        try padRightPrint(writer, formatRemaining(e.remaining_seconds), time_col);
+        try padRightPrint(writer, formatRemaining(remainingFromExpiry(e.ban_expiry, now)), time_col);
         try padRightPrint(writer, formatOptU32Local(e.ban_count), count_col);
-        try padRightPrint(writer, e.country orelse "-", cc_col);
         try writer.writeAll("\n");
     }
 
-    if (p.jail) |j| {
-        try writer.print("Total: {d} active bans in jail '{s}'\n", .{ p.entries.len, j });
-    } else {
-        try writer.print("Total: {d} active bans\n", .{p.entries.len});
-    }
+    try writer.print("Total: {d} active bans\n", .{entries.len});
 }
 
 fn padRightPrint(writer: anytype, s: []const u8, width: usize) !void {
@@ -448,7 +439,7 @@ pub fn formatJails(
         },
         .plain, .table => {
             const parsed = std.json.parseFromSlice(
-                JailsPayload,
+                []JailEntry,
                 allocator,
                 payload_json,
                 .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
@@ -467,43 +458,46 @@ pub fn formatJails(
     }
 }
 
-fn writeJailsPlain(writer: anytype, p: JailsPayload) !void {
-    for (p.jails) |j| {
-        try writer.print("{s}\t{s}\t{d}\t{d}\t{s}\n", .{
+fn writeJailsPlain(writer: anytype, jails: []const JailEntry) !void {
+    for (jails) |j| {
+        try writer.print("{s}\t{s}\t{d}\t{d}\t{d}\t{d}\n", .{
             j.name orelse "-",
             if (j.enabled orelse false) "enabled" else "disabled",
             j.active_bans orelse 0,
-            j.total_bans orelse 0,
-            j.backend orelse "-",
+            j.maxretry orelse 0,
+            j.findtime orelse 0,
+            j.bantime orelse 0,
         });
     }
 }
 
-fn writeJailsTable(writer: anytype, p: JailsPayload, color: Color) !void {
-    if (p.jails.len == 0) {
+fn writeJailsTable(writer: anytype, jails: []const JailEntry, color: Color) !void {
+    if (jails.len == 0) {
         try writer.writeAll("No jails configured.\n");
         return;
     }
 
     const name_col: usize = 20;
     const state_col: usize = 10;
-    const active_col: usize = 12;
-    const total_col: usize = 12;
-    const backend_col: usize = 12;
+    const active_col: usize = 10;
+    const max_col: usize = 10;
+    const find_col: usize = 12;
+    const ban_col: usize = 12;
 
     try color.on(writer, Color.bold);
     try padRightPrint(writer, "JAIL", name_col);
     try padRightPrint(writer, "STATE", state_col);
     try padRightPrint(writer, "ACTIVE", active_col);
-    try padRightPrint(writer, "TOTAL", total_col);
-    try padRightPrint(writer, "BACKEND", backend_col);
+    try padRightPrint(writer, "MAX RETRY", max_col);
+    try padRightPrint(writer, "FIND TIME", find_col);
+    try padRightPrint(writer, "BAN TIME", ban_col);
     try color.off(writer);
     try writer.writeAll("\n");
 
-    try repeatChar(writer, '-', name_col + state_col + active_col + total_col + backend_col);
+    try repeatChar(writer, '-', name_col + state_col + active_col + max_col + find_col + ban_col);
     try writer.writeAll("\n");
 
-    for (p.jails) |j| {
+    for (jails) |j| {
         try padRightPrint(writer, j.name orelse "-", name_col);
         const state_str: []const u8 = if (j.enabled orelse false) "enabled" else "disabled";
         if (j.enabled orelse false) {
@@ -514,17 +508,30 @@ fn writeJailsTable(writer: anytype, p: JailsPayload, color: Color) !void {
         try padRightPrint(writer, state_str, state_col);
         try color.off(writer);
         try padRightPrint(writer, formatOptU32Local(j.active_bans), active_col);
-        try padRightPrint(writer, formatOptU64Local(j.total_bans), total_col);
-        try padRightPrint(writer, j.backend orelse "-", backend_col);
+        try padRightPrint(writer, formatOptU32Local(j.maxretry), max_col);
+        try padRightPrint(writer, formatDurationSecs(j.findtime), find_col);
+        try padRightPrint(writer, formatDurationSecs(j.bantime), ban_col);
         try writer.writeAll("\n");
     }
 
-    try writer.print("Total: {d} jails\n", .{p.jails.len});
+    try writer.print("Total: {d} jails\n", .{jails.len});
 }
 
-fn formatOptU64Local(opt: ?u64) []const u8 {
-    const v = opt orelse return "-";
-    const out = std.fmt.bufPrint(&scratch, "{d}", .{v}) catch return "-";
+fn formatDurationSecs(opt: ?u32) []const u8 {
+    const secs = opt orelse return "-";
+    if (secs >= 86400) {
+        const out = std.fmt.bufPrint(&scratch, "{d}d", .{secs / 86400}) catch return "-";
+        return out;
+    }
+    if (secs >= 3600) {
+        const out = std.fmt.bufPrint(&scratch, "{d}h", .{secs / 3600}) catch return "-";
+        return out;
+    }
+    if (secs >= 60) {
+        const out = std.fmt.bufPrint(&scratch, "{d}m", .{secs / 60}) catch return "-";
+        return out;
+    }
+    const out = std.fmt.bufPrint(&scratch, "{d}s", .{secs}) catch return "-";
     return out;
 }
 
@@ -834,43 +841,73 @@ fn runList(alloc: std.mem.Allocator, payload: []const u8, fmt: OutputFormat) ![]
     return list.toOwnedSlice();
 }
 
-test "format: list table with entries" {
+test "format: list table with entries (daemon-shape JSON, SYS-002)" {
+    // Matches engine/net/commands.zig::writeListEntry output exactly.
+    // ban_expiry is an absolute unix timestamp; table must compute "time left"
+    // from it using std.time.timestamp(). We can't pin the result without
+    // mocking the clock, but we can assert on the IPs, column headers and
+    // total count -- same shape real daemons produce.
     const payload =
-        \\{"jail":"sshd","entries":[
-        \\  {"ip":"45.227.253.98","jail":"sshd","remaining_seconds":252,"ban_count":3,"country":"BR"},
-        \\  {"ip":"103.144.82.210","jail":"sshd","remaining_seconds":525,"ban_count":1,"country":"IN"}
-        \\]}
+        \\[
+        \\  {"ip":"45.227.253.98","jail":"sshd","attempt_count":5,"last_attempt":0,"ban_count":3,"ban_expiry":9999999999},
+        \\  {"ip":"103.144.82.210","jail":"sshd","attempt_count":4,"last_attempt":0,"ban_count":1,"ban_expiry":9999999999}
+        \\]
     ;
     const out = try runList(testing.allocator, payload, .table);
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "IP ADDRESS") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "JAIL") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "TIME LEFT") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "BAN COUNT") != null);
     try testing.expect(std.mem.indexOf(u8, out, "45.227.253.98") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "BR") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "Total: 2") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "103.144.82.210") != null);
     try testing.expect(std.mem.indexOf(u8, out, "sshd") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Total: 2 active bans") != null);
+    // Country column has been removed (GeoIP is a Phase 2 feature).
+    try testing.expect(std.mem.indexOf(u8, out, "COUNTRY") == null);
 }
 
-test "format: list table empty" {
-    const payload = "{\"entries\":[]}";
+test "format: list table empty (SYS-002)" {
+    const payload = "[]";
     const out = try runList(testing.allocator, payload, .table);
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "No active bans") != null);
 }
 
-test "format: list plain tab-separated" {
-    const payload =
-        \\{"entries":[{"ip":"1.2.3.4","jail":"sshd","remaining_seconds":10,"ban_count":2,"country":"US"}]}
-    ;
+test "format: list plain tab-separated (SYS-002)" {
+    const payload = "[{\"ip\":\"1.2.3.4\",\"jail\":\"sshd\",\"attempt_count\":3,\"last_attempt\":0,\"ban_count\":2,\"ban_expiry\":9999999999}]";
     const out = try runList(testing.allocator, payload, .plain);
     defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "1.2.3.4\tsshd\t10\t2\tUS") != null);
+    // Four tab-separated columns: ip, jail, remaining_seconds, ban_count.
+    // remaining is clock-dependent so we assert only on the stable prefix.
+    try testing.expect(std.mem.startsWith(u8, out, "1.2.3.4\tsshd\t"));
+    try testing.expect(std.mem.endsWith(u8, out, "\t2\n"));
 }
 
-test "format: list json passes through" {
-    const payload = "{\"entries\":[]}";
+test "format: list expired entry shows 'expired' (SYS-002)" {
+    // ban_expiry in the past (year 2001) must render as "expired" rather than
+    // a negative number or garbage.
+    const payload = "[{\"ip\":\"5.5.5.5\",\"jail\":\"sshd\",\"attempt_count\":3,\"last_attempt\":0,\"ban_count\":1,\"ban_expiry\":1000000000}]";
+    const out = try runList(testing.allocator, payload, .table);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "expired") != null);
+}
+
+test "format: list json passes through (SYS-002)" {
+    const payload = "[]";
     const out = try runList(testing.allocator, payload, .json);
     defer testing.allocator.free(out);
-    try testing.expect(std.mem.startsWith(u8, out, "{"));
+    try testing.expect(std.mem.startsWith(u8, out, "["));
+}
+
+test "format: list rejects object-shape payload (SYS-002 regression)" {
+    // The old wrapper shape would have succeeded before SYS-002 was filed;
+    // the new parser must reject it so a future regression can't silently
+    // drift the wire format again.
+    const payload = "{\"entries\":[]}";
+    const out = try runList(testing.allocator, payload, .table);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "error: could not parse list payload") != null);
 }
 
 fn runJails(alloc: std.mem.Allocator, payload: []const u8, fmt: OutputFormat) ![]u8 {
@@ -880,35 +917,58 @@ fn runJails(alloc: std.mem.Allocator, payload: []const u8, fmt: OutputFormat) ![
     return list.toOwnedSlice();
 }
 
-test "format: jails table" {
+test "format: jails table (daemon-shape JSON, SYS-002)" {
+    // Matches engine/net/commands.zig::handleListJails output exactly.
     const payload =
-        \\{"jails":[
-        \\  {"name":"sshd","enabled":true,"active_bans":5,"total_bans":40,"backend":"nftables"},
-        \\  {"name":"nginx","enabled":false,"active_bans":0,"total_bans":3,"backend":"nftables"}
-        \\]}
+        \\[
+        \\  {"name":"sshd","enabled":true,"active_bans":5,"maxretry":3,"findtime":600,"bantime":3600},
+        \\  {"name":"nginx","enabled":false,"active_bans":0,"maxretry":5,"findtime":600,"bantime":600}
+        \\]
     ;
     const out = try runJails(testing.allocator, payload, .table);
     defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "JAIL") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "MAX RETRY") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "FIND TIME") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "BAN TIME") != null);
     try testing.expect(std.mem.indexOf(u8, out, "sshd") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "nginx") != null);
     try testing.expect(std.mem.indexOf(u8, out, "enabled") != null);
     try testing.expect(std.mem.indexOf(u8, out, "disabled") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "nftables") != null);
     try testing.expect(std.mem.indexOf(u8, out, "Total: 2 jails") != null);
+    // TOTAL and BACKEND columns removed (not per-jail data in v0.1.0).
+    try testing.expect(std.mem.indexOf(u8, out, "TOTAL") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "BACKEND") == null);
 }
 
-test "format: jails plain" {
-    const payload =
-        \\{"jails":[{"name":"sshd","enabled":true,"active_bans":1,"total_bans":2,"backend":"nftables"}]}
-    ;
+test "format: jails plain (SYS-002)" {
+    const payload = "[{\"name\":\"sshd\",\"enabled\":true,\"active_bans\":1,\"maxretry\":3,\"findtime\":600,\"bantime\":300}]";
     const out = try runJails(testing.allocator, payload, .plain);
     defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "sshd\tenabled\t1\t2\tnftables") != null);
+    // Six tab-separated columns: name, state, active, maxretry, findtime, bantime.
+    try testing.expect(std.mem.indexOf(u8, out, "sshd\tenabled\t1\t3\t600\t300") != null);
 }
 
-test "format: jails empty table" {
-    const out = try runJails(testing.allocator, "{\"jails\":[]}", .table);
+test "format: jails empty table (SYS-002)" {
+    const out = try runJails(testing.allocator, "[]", .table);
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "No jails") != null);
+}
+
+test "format: jails human duration formatting (SYS-002)" {
+    // findtime=600 -> "10m", bantime=86400 -> "1d".
+    const payload = "[{\"name\":\"sshd\",\"enabled\":true,\"active_bans\":0,\"maxretry\":3,\"findtime\":600,\"bantime\":86400}]";
+    const out = try runJails(testing.allocator, payload, .table);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "10m") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "1d") != null);
+}
+
+test "format: jails rejects object-shape payload (SYS-002 regression)" {
+    const payload = "{\"jails\":[]}";
+    const out = try runJails(testing.allocator, payload, .table);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "error: could not parse jails payload") != null);
 }
 
 fn runVersion(alloc: std.mem.Allocator, payload: []const u8, fmt: OutputFormat) ![]u8 {
@@ -996,7 +1056,7 @@ test "format: error all modes" {
 test "format: color escapes emitted only when enabled" {
     var list = std.ArrayList(u8).init(testing.allocator);
     defer list.deinit();
-    const payload = "{\"entries\":[{\"ip\":\"1.2.3.4\",\"jail\":\"sshd\",\"remaining_seconds\":10,\"ban_count\":1,\"country\":\"US\"}]}";
+    const payload = "[{\"ip\":\"1.2.3.4\",\"jail\":\"sshd\",\"attempt_count\":3,\"last_attempt\":0,\"ban_count\":1,\"ban_expiry\":9999999999}]";
 
     try formatList(testing.allocator, list.writer(), payload, .table, .{ .enabled = true });
     try testing.expect(std.mem.indexOf(u8, list.items, "\x1b[") != null);
