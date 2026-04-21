@@ -62,7 +62,8 @@ jobs:
           echo "/opt/zig" >> "$GITHUB_PATH"
           /opt/zig/zig version
       - name: Check formatting
-        run: zig fmt --check engine/ client/ shared/ tests/ sim/
+        # sim/ is added back when Phase 9 ships the attack simulator.
+        run: zig fmt --check engine/ client/ shared/ tests/
 
   build-native:
     name: Build (native Debug)
