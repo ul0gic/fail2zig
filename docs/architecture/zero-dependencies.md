@@ -1,3 +1,12 @@
+---
+title: Zero runtime dependencies
+description: fail2zig is a single static binary that speaks netlink directly to the Linux kernel for every firewall operation — no CLI shell-out, no dynamic libraries, no plugin surface. The architectural reasoning and the design trade-offs.
+sidebar_position: 1
+category: Architecture
+audience: operator
+last_verified: 2026-04-21
+---
+
 # Zero Runtime Dependencies
 
 > A security tool should not be the source of risk it's protecting against.
@@ -22,41 +31,84 @@ This is a deliberately aggressive posture. The rest of this document explains
 why it's the only posture that makes sense for a root-privileged security
 daemon parsing attacker-controlled input, and how we uphold it in practice.
 
-## The anti-pattern
+## What fail2zig builds on
 
-The tool we're replacing, fail2ban, reacts to log matches by forking a shell
-and running `iptables`, `ipset`, `nft`, or a custom operator script. The
-command template is expanded from an `.conf` file that embeds `<ip>` and
-`<host>` placeholders filled in from the matched log line.
+fail2ban pioneered this entire category in the early 2000s and has defended
+Linux services on millions of machines for twenty years. Its architecture —
+Python orchestration around shell-action templates that invoke `iptables`,
+`ipset`, `nft`, or whatever firewall tool an operator already runs — was a
+careful, considered choice for the toolchain and threat model of its era.
+Python was the right language for extensible filter logic in 2004;
+shell-action templates made integration with any existing firewall stack
+painless; CLI invocations were the pragmatic lingua franca for netfilter
+manipulation before the kernel's netlink ABIs were stable enough to depend
+on directly.
 
-That means fail2ban's effective trust-computing-base for the ban action is:
+That legacy is what fail2zig inherits. The mental model — jails, filters,
+`maxretry`, `findtime`, `bantime`, `ignoreip` — is fail2ban's contribution
+to the operational vocabulary of Linux security, and we keep it intact for
+good reasons: operators shouldn't have to relearn the category to adopt a
+new implementation of it.
 
-- fail2ban itself (Python process running as root)
-- The Python interpreter
-- The entire Python standard library
-- The shell (`/bin/sh`, usually bash)
+What's changed in twenty years is the surface area around that model.
+Language tooling has improved: Zig compiles to static musl binaries the
+same way Rust or Go would, with memory safety at the low level where shell
+scripts historically filled in. Kernel ABIs for netfilter manipulation —
+nftables over netlink, eBPF programs, direct packet hooks — are now mature
+enough to depend on as library surfaces. And the expectations for what a
+root-privileged security daemon should and shouldn't do have tightened.
+
+## Where a shell-action architecture gets expensive
+
+Any daemon that reacts to matched log lines by forking a shell template
+inherits a specific class of attack surface. The template is expanded from
+config, with placeholders like `<ip>` and `<host>` filled in from the
+log line's contents; the resulting command string is handed to `/bin/sh`
+or `execve` for evaluation.
+
+The resulting effective trust-computing-base, for each ban fire, is
+roughly:
+
+- The orchestration daemon itself
+- The language interpreter it runs in
+- The shell binary (`/bin/sh`, commonly `dash` or `bash`)
 - Every CLI the action template invokes (`iptables`, `ip6tables`, `ipset`,
-  `nftables`, ...) and each of their transitive library dependencies
+  `nft`, ...) and each of their transitive library dependencies
 - The `PATH` environment variable, and whatever binaries resolve against it
-- The `.conf` action templates — essentially small programs — shipped by
-  the distribution maintainer
+- The action-template configuration files — essentially small programs —
+  shipped by the distribution maintainer
 
-Compromising any link in that chain compromises the whole system. Swap
-`/usr/sbin/nft` with a hostile binary and fail2ban obediently executes it as
-root every time a ban fires. Trick a `.conf` template into including
-attacker-influenced bytes in a shell command and you have remote code
-execution on a server you were installing defensive software onto.
+Compromising any link in that chain compromises ban enforcement. Replace
+`/usr/sbin/nft` with a hostile binary and the shell-action template will
+execute it as root every time a ban fires. Coerce an action template into
+composing attacker-influenced bytes into a shell command and you have a
+remote-code-execution path on a server that was running defensive
+software.
 
-This is not theoretical. fail2ban has had multiple CVEs along exactly these
-lines: [CVE-2013-2178](https://www.cve.org/CVERecord?id=CVE-2013-2178) (shell
-injection via crafted log content), [CVE-2021-32749](https://www.cve.org/CVERecord?id=CVE-2021-32749)
-(mail action template passing attacker-controlled data to the sendmail CLI).
-The common thread is the same: **the ban action path is a shell program, and
-a shell program that processes attacker-derived inputs is an attack surface**.
+This is not a theoretical concern. Shell-action architectures in the
+broader intrusion-prevention space have had CVEs along these lines:
+[CVE-2013-2178](https://www.cve.org/CVERecord?id=CVE-2013-2178) (shell
+injection via crafted log content in a widely-deployed IPS daemon),
+[CVE-2021-32749](https://www.cve.org/CVERecord?id=CVE-2021-32749) (an
+action template passing attacker-controlled data to a CLI). The common
+thread is structural: **the ban-action path is a shell program, and a
+shell program that processes attacker-derived inputs is an attack
+surface**. Hardening a shell-action template is hard because the
+attack-surface isn't one bug — it's the shape of the architecture.
 
-fail2zig rejects this model entirely. We never exec. We never shell. The
-ban action is a handful of pure Zig functions that speak netlink directly
-to the kernel.
+## Why fail2zig took a different approach
+
+fail2zig is a clean-slate implementation in a different era. The ecosystem
+has given us direct-netlink libraries that are stable, memory-safe languages
+with static compilation, and kernel APIs mature enough to depend on as
+ground truth. With those ingredients, the ban-action path doesn't need to
+be a shell program at all.
+
+fail2zig's ban action is a handful of pure Zig functions that speak
+netlink directly to the kernel. No exec, no shell, no CLI tools in the
+critical path. The resulting binary is its own trust-computing-base plus
+the Linux kernel — the same TCB any program on the system already depends
+on.
 
 ## Why "pure netlink" is the answer, not "exec nft safely"
 

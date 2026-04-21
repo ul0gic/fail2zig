@@ -1,0 +1,251 @@
+.TH FAIL2ZIG-CLIENT 1 "2026-04-21" "fail2zig 0.1.0" "User Commands"
+.
+.SH NAME
+fail2zig\-client \- query and control the fail2zig intrusion prevention daemon
+.
+.SH SYNOPSIS
+.B fail2zig\-client
+[\fIglobal\-flags\fR]
+.I command
+[\fIcommand\-args\fR]
+.
+.SH DESCRIPTION
+.B fail2zig\-client
+is the command-line interface to the
+.BR fail2zig (1)
+daemon. It communicates over the daemon's Unix domain socket using a
+length-prefixed binary protocol.
+.PP
+The client requires either root privileges (uid=0) or membership in the
+.B fail2zig
+group to connect. If the daemon is not running, all commands exit with code 3
+and print a diagnostic message indicating the reason (connection refused,
+permission denied, or timeout).
+.PP
+Output format is configurable: tabular (the default, with ANSI color on a
+terminal), JSON, or plain tab-separated. Use
+.B \-\-output json
+for scripting.
+.
+.SH GLOBAL FLAGS
+Global flags may appear before or after the command name.
+.TP
+.BI \-\-socket " path"
+Unix socket path. Default:
+.IR /run/fail2zig/fail2zig.sock .
+Override when the daemon is configured with a non-default
+.B global.socket_path
+or when testing against a non-production daemon instance.
+.TP
+.BI \-\-output " format"
+Output format:
+.BR table " (default), " json ", or " plain .
+.B table
+renders box-drawing borders with ANSI color on a terminal and without on
+non-terminals.
+.B plain
+emits tab-separated values with no borders or color, suitable for
+.BR awk (1)
+or
+.BR cut (1)
+processing.
+.B json
+emits compact JSON.
+.TP
+.B \-\-no\-color
+Disable ANSI color output unconditionally. Equivalent to setting a non-tty output.
+.TP
+.BI \-\-timeout " ms"
+Command timeout in milliseconds. Default: 5000 (5 seconds). If the daemon does
+not respond within this window, the client exits with code 3.
+.TP
+.BR \-\-version ", " \-V
+Print the client version and exit. Does not contact the daemon.
+.TP
+.BR \-\-help ", " \-h
+Print usage information and exit.
+.
+.SH COMMANDS
+.SS status
+Show a summary of daemon health: uptime, memory usage, parse rate, active bans,
+total bans, firewall backend, and jail count.
+.PP
+.nf
+.B "$ sudo fail2zig-client status"
++------------------------------------------+
+| fail2zig v0.1.0 — running               |
++------------------------------------------+
+| Uptime:      0d 0h 40m 54s               |
+| Memory:      0.0 MB                      |
+| Parse rate:  0 lines/sec                 |
+| Active bans: 0                           |
+| Total bans:  -                           |
+| Backend:     nftables                    |
+| Jails:       -                           |
++------------------------------------------+
+.fi
+.PP
+.SS ban \fIip\fR [\fB\-\-jail\fR \fIname\fR] [\fB\-\-duration\fR \fIseconds\fR]
+Manually ban an IP address. The
+.B \-\-jail
+flag names which jail the ban is attributed to (used for per-jail accounting and
+for targeting the unban command). If omitted, the ban is attributed to an internal
+"manual" category. The optional
+.B \-\-duration
+flag sets the ban duration in seconds; if omitted, the jail's configured
+.B bantime
+is used.
+.PP
+.nf
+.B "$ sudo fail2zig-client ban 45.227.253.98 --jail sshd"
+banned: 45.227.253.98 (jail=sshd, duration=3600s)
+.fi
+.PP
+.SS unban \fIip\fR [\fB\-\-jail\fR \fIname\fR]
+Remove a ban. If
+.B \-\-jail
+is specified, only the ban in that jail is removed. If omitted, the ban is
+removed from all jails.
+.PP
+.nf
+.B "$ sudo fail2zig-client unban 45.227.253.98 --jail sshd"
+unbanned: 45.227.253.98
+.fi
+.PP
+.SS list [\fB\-\-jail\fR \fIname\fR]
+List active bans. With
+.B \-\-jail
+, filter to a specific jail. Each row shows the IP, the jail it was banned by,
+the time of the ban, and the time remaining.
+.PP
+.nf
+.B "$ sudo fail2zig-client list"
+IP                 JAIL    BANNED AT             TIME LEFT
+------------------------------------------------------------
+45.227.253.98      sshd    2026-04-21 12:03:10   57m 43s
+.fi
+.PP
+.SS jails
+List all configured jails with their current state, active ban count, and
+configured thresholds.
+.PP
+.nf
+.B "$ sudo fail2zig-client jails"
+JAIL                STATE     ACTIVE    MAX RETRY FIND TIME   BAN TIME
+-----------------------------------------------------------------------
+sshd                enabled   0         3         10m         5m
+nginx-http-auth     enabled   0         3         10m         5m
+nginx-botsearch     enabled   0         3         10m         5m
+postfix             enabled   0         3         10m         5m
+apache-auth         enabled   0         3         10m         5m
+dovecot             enabled   0         3         10m         5m
+Total: 6 jails
+.fi
+.PP
+.SS reload
+Signal the daemon to reload its configuration. In v0.1.0 this command is
+implemented at the IPC level but the daemon-side handler is a stub; the daemon
+logs the request and acknowledges it, but does not reload the config. A service
+restart is required to pick up configuration changes.
+.PP
+.SS version
+Print the daemon version (requires a daemon connection, unlike
+.BR \-\-version ).
+.PP
+.nf
+.B "$ sudo fail2zig-client version"
+fail2zig-client v0.1.0
+.fi
+.PP
+.SS completions \fIshell\fR
+Print a shell completion script for the specified shell to stdout.
+Supported shells:
+.BR bash ,
+.BR zsh ,
+.BR fish .
+.PP
+.nf
+.B "$ fail2zig-client completions bash > /etc/bash_completion.d/fail2zig-client"
+.B "$ fail2zig-client completions zsh  > ~/.zsh/completions/_fail2zig-client"
+.B "$ fail2zig-client completions fish > ~/.config/fish/completions/fail2zig-client.fish"
+.fi
+.PP
+.SS help [\fIcommand\fR]
+Print general help or help for a specific command.
+.
+.SH FILES
+.TP
+.I /run/fail2zig/fail2zig.sock
+Default Unix socket path. The socket is created by
+.BR fail2zig (1)
+at startup with mode 0660. Override with
+.BR \-\-socket .
+.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+The daemon returned an error response (e.g., unknown jail name, IP not found).
+.TP
+.B 2
+Bad arguments or invalid input (unknown command, missing required argument,
+unrecognized IP address format).
+.TP
+.B 3
+Connection failed: daemon is not running, permission denied, or command timed out.
+.
+.SH ENVIRONMENT
+No environment variables are read by the client.
+.
+.SH EXAMPLES
+.SS Check daemon health
+.nf
+sudo fail2zig-client status
+.fi
+.SS Ban an IP manually for 24 hours
+.nf
+sudo fail2zig-client ban 192.0.2.10 --jail sshd --duration 86400
+.fi
+.SS List active bans as JSON for scripting
+.nf
+sudo fail2zig-client list --output json | jq '.[].ip'
+.fi
+.SS Watch for bans in a loop
+.nf
+watch -n 5 'sudo fail2zig-client list --output plain'
+.fi
+.SS Install bash completions system-wide
+.nf
+sudo fail2zig-client completions bash > /etc/bash_completion.d/fail2zig-client
+.fi
+.
+.SH SEE ALSO
+.BR fail2zig (1),
+.BR fail2zig.toml (5)
+.
+.SH AUTHORS
+Written by the fail2zig contributors.
+.
+.SH BUGS
+Report bugs at
+.UR https://github.com/ul0gic/fail2zig/issues
+.UE .
+.PP
+Known limitations in v0.1.0:
+.IP \(bu 2
+The
+.B reload
+command is a stub; restart the daemon to apply config changes.
+.IP \(bu 2
+The
+.B \-\-duration
+flag on the
+.B ban
+command is accepted but the daemon currently uses the jail's configured
+.B bantime
+in all cases. This will be honored in v0.2.0.
+.
+.SH HISTORY
+fail2zig-client 0.1.0 was the first public release, April 2026.

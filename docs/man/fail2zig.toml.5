@@ -1,0 +1,239 @@
+.TH FAIL2ZIG.TOML 5 "2026-04-21" "fail2zig 0.1.0" "File Formats"
+.
+.SH NAME
+fail2zig.toml \- fail2zig daemon configuration file
+.
+.SH SYNOPSIS
+.I /etc/fail2zig/config.toml
+.
+.SH DESCRIPTION
+.B fail2zig.toml
+is the configuration file for the
+.BR fail2zig (1)
+intrusion prevention daemon. The file uses a strict subset of the TOML format.
+.PP
+Unknown keys are rejected with line and column context. Unknown sections are
+rejected. All values are strictly typed; a string where an integer is expected
+is an error.
+.PP
+The file is divided into three section types:
+.IP \(bu 2
+.B [global]
+\(em daemon-wide settings (log level, socket path, memory ceiling, metrics binding).
+.IP \(bu 2
+.B [defaults]
+\(em default values applied to every jail unless overridden.
+.IP \(bu 2
+.BR [jails. \fIname\fR ]
+\(em one section per jail, overriding any defaults as needed.
+.PP
+Validate the configuration without starting the daemon:
+.PP
+.nf
+sudo fail2zig --validate-config --config /etc/fail2zig/config.toml
+.fi
+.
+.SH GLOBAL SECTION
+.TP
+.B log_level
+String. One of
+.BR debug ,
+.BR info ,
+.BR warn ,
+.BR err .
+Default:
+.IR info .
+.TP
+.B pid_file
+String (absolute path). PID file written on startup. Default:
+.IR /run/fail2zig/fail2zig.pid .
+.TP
+.B socket_path
+String (absolute path). Unix domain socket for
+.BR fail2zig\-client (1).
+Default:
+.IR /run/fail2zig/fail2zig.sock .
+Mode 0660; group
+.B fail2zig
+if that group exists.
+.TP
+.B state_file
+String (absolute path). Ban-state file, written on clean shutdown and read at
+startup. CRC32-validated; discarded on mismatch. Mode 0600. Default:
+.IR /var/lib/fail2zig/state.bin .
+.TP
+.B memory_ceiling_mb
+Integer. Hard memory ceiling enforced at the allocator level. Minimum: 16.
+Default: 64.
+.TP
+.B metrics_bind
+String (IP address). Address the HTTP metrics server binds to. Default:
+.IR 127.0.0.1 .
+Do not expose publicly without additional access controls.
+.TP
+.B metrics_port
+Integer (1\(en65535). Port for the HTTP server. Default:
+.IR 9100 .
+The server exposes
+.IR /metrics ,
+.IR /api/status ,
+and
+.IR /events
+(WebSocket).
+.
+.SH DEFAULTS SECTION
+All keys in this section apply to every jail unless overridden in the
+.BI [jails. name ]
+section.
+.TP
+.B bantime
+Integer (seconds). Ban duration for a first offense. Minimum: 1. Default: 600.
+.TP
+.B findtime
+Integer (seconds). Sliding window for counting failures. Minimum: 1. Default: 600.
+.TP
+.B maxretry
+Integer. Number of failures within
+.B findtime
+required to trigger a ban. Minimum: 1. Default: 5.
+.TP
+.B banaction
+String. Firewall backend:
+.BR nftables ,
+.BR iptables ,
+.BR ipset ,
+or
+.BR log-only .
+Default:
+.IR nftables .
+.TP
+.B ignoreip
+String array. CIDR ranges and exact IPs that are never banned. Example:
+.IR ["127.0.0.1/8", "::1", "10.0.0.0/8"] .
+Default: empty.
+.TP
+.B bantime_increment_enabled
+Boolean. Enable escalating ban durations for repeat offenders. Default:
+.IR false .
+.TP
+.B bantime_increment_multiplier
+Integer. Base multiplier in the escalation formula. Default: 1.
+.TP
+.B bantime_increment_factor
+Integer. Growth rate in the escalation formula. Default: 1.
+.TP
+.B bantime_increment_formula
+String.
+.B linear
+or
+.BR exponential .
+.I linear:
+.IR "bantime × multiplier × (1 + factor × n)" .
+.I exponential:
+.IR "bantime × multiplier × factor^n" .
+Default:
+.IR linear .
+.TP
+.B bantime_increment_max_bantime
+Integer (seconds). Cap on escalated ban durations. Default: 604800 (7 days).
+.
+.SH JAIL SECTIONS
+Each
+.BI [jails. name ]
+section defines one jail. The name must be ASCII alphanumeric, hyphens, or
+underscores.
+.TP
+.B enabled
+Boolean. When false, the jail is parsed but not started. Default:
+.IR true .
+.TP
+.B filter
+String. Built-in filter name or a name resolvable via the filter registry.
+Accepts hyphenated and underscore forms interchangeably. Default: empty (no
+matching; a warning is logged at startup).
+.TP
+.B logpath
+String array. Absolute paths to log files. Missing files are warned about but
+are not fatal — they may appear after the daemon starts.
+.TP
+.B maxretry
+Optional integer. Overrides
+.B defaults.maxretry
+for this jail.
+.TP
+.B findtime
+Optional integer (seconds). Overrides
+.B defaults.findtime
+for this jail.
+.TP
+.B bantime
+Optional integer (seconds). Overrides
+.B defaults.bantime
+for this jail.
+.TP
+.B banaction
+Optional string. Overrides
+.B defaults.banaction
+for this jail.
+.TP
+.B ignoreip
+Optional string array. Replaces (does not merge with)
+.B defaults.ignoreip
+for this jail.
+.TP
+.B bantime_increment_enabled , bantime_increment_multiplier , bantime_increment_factor , bantime_increment_formula , bantime_increment_max_bantime
+Parsed and stored; in v0.1.0 only the
+.B [defaults]
+values take effect. Per-jail escalation is planned for v0.2.0.
+.
+.SH EXAMPLES
+.SS Minimal configuration
+.nf
+[global]
+memory_ceiling_mb = 64
+
+[defaults]
+bantime   = 600
+findtime  = 600
+maxretry  = 5
+banaction = "nftables"
+ignoreip  = ["127.0.0.1/8", "::1"]
+
+[jails.sshd]
+enabled = true
+filter  = "sshd"
+logpath = ["/var/log/auth.log"]
+.fi
+.PP
+.SS SSH with exponential escalation
+.nf
+[defaults]
+bantime                       = 600
+findtime                      = 600
+maxretry                      = 5
+banaction                     = "nftables"
+ignoreip                      = ["127.0.0.1/8", "::1"]
+bantime_increment_enabled     = true
+bantime_increment_formula     = "exponential"
+bantime_increment_multiplier  = 1
+bantime_increment_factor      = 2
+bantime_increment_max_bantime = 1209600
+
+[jails.sshd]
+enabled  = true
+filter   = "sshd"
+logpath  = ["/var/log/auth.log", "/var/log/secure"]
+maxretry = 3
+bantime  = 3600
+.fi
+.
+.SH SEE ALSO
+.BR fail2zig (1),
+.BR fail2zig\-client (1)
+.PP
+Full reference:
+.UR https://fail2zig.dev/docs/reference/config
+.UE
+.
+.SH HISTORY
+The fail2zig.toml format was introduced in fail2zig 0.1.0.
