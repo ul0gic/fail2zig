@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/hammer/observe.sh — sample daemon state into JSONL for post-run analysis.
+# tests/harness/observe.sh — sample daemon state into JSONL for post-run analysis.
 #
 # Continuously polls four sources, emits one JSONL line per sample to
 # stdout (or to --output <path>):

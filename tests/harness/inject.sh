@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/hammer/inject.sh — synthesize realistic log lines for a given jail.
+# tests/harness/inject.sh — synthesize realistic log lines for a given jail.
 #
 # Runs on the *target* box. Writes lines matching the named filter's
 # patterns into the log file that jail is configured to watch, so

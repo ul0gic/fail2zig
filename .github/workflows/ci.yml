@@ -185,7 +185,7 @@ jobs:
       - name: Lint scripts
         run: |
           # Fail on warnings (shellcheck default severity is style; we raise it).
-          shellcheck -S warning scripts/hammer/*.sh
+          shellcheck -S warning tests/harness/*.sh
           if [ -f scripts/install.sh ]; then
             shellcheck -S warning scripts/install.sh
           fi

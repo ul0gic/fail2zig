@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# scripts/hammer/ssh_brute.sh — real SSH bruteforce from an attacker host.
+# tests/harness/ssh_brute.sh — real SSH bruteforce from an attacker host.
 #
-# Runs *on an attacker VM* (e.g. p33ker in the Phase 7.5 lab), pointed at
-# the fail2zig-protected target. Generates real SSH connection attempts
-# so the full network-level detection path exercises end-to-end —
+# Runs *on the attacker VM*, pointed at the fail2zig-protected target.
+# Generates real SSH connection attempts so the full network-level
+# detection path exercises end-to-end —
 # inotify → parser → state → nftables → kernel DROP.
 #
 # Usage: ssh_brute.sh <target-ip> [attempts=5]

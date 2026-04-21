@@ -29,7 +29,7 @@ INSTALL ?= install
 .DEFAULT_GOAL := help
 
 .PHONY: help build test fmt fmt-check release cross install clean bench fuzz \
-        hammer-smoke lint docs-check
+        harness-smoke lint docs-check
 
 help: ## Show this help message
 	@awk 'BEGIN { FS = ":.*?## " } \
@@ -75,12 +75,12 @@ bench: ## Run Phase 7 performance benchmarks (sets FAIL2ZIG_RUN_BENCH=1)
 fuzz: ## Run the fuzz corpus targets
 	zig build test --test-filter fuzz
 
-hammer-smoke: ## Run the lab-box attack smoke test (ssh_brute). Only useful on the lab host.
-	scripts/hammer/reset.sh
-	scripts/hammer/ssh_brute.sh
+harness-smoke: ## Run the lab-box attack smoke test (ssh_brute). Only useful on the lab host.
+	tests/harness/reset.sh
+	tests/harness/ssh_brute.sh
 
 lint: fmt-check ## Static analysis: zig fmt --check, shellcheck, yamllint
-	shellcheck -S warning scripts/hammer/*.sh scripts/install.sh
+	shellcheck -S warning tests/harness/*.sh scripts/install.sh
 	yamllint -c .yamllint .github/workflows/
 
 docs-check: ## Run the documentation quality gate (owned by DOC team; 8.1.6)

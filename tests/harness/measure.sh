@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/hammer/measure.sh — one-shot performance probes.
+# tests/harness/measure.sh — one-shot performance probes.
 #
 # Each subcommand runs a controlled experiment and emits a single
 # summary JSON line to stdout. Designed to be composable — the

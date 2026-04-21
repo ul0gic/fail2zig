@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/hammer/reset.sh — return the lab box to a clean testable state.
+# tests/harness/reset.sh — return the lab box to a clean testable state.
 #
 # Stops the daemon, wipes persistent state, flushes the nftables table,
 # truncates the watched log files, and starts the daemon again. Used
