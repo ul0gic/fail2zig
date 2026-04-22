@@ -72,7 +72,7 @@ is tagged.
 - **Zero runtime dependencies.** No shell-out to `nft`, `iptables`, or any
   other CLI. fail2zig speaks netlink directly to the kernel for every
   firewall operation. See
-  [docs/architecture/zero-dependencies.md](docs/architecture/zero-dependencies.md)
+  [architecture/zero-dependencies](https://fail2zig.com/docs/architecture/zero-dependencies/)
   for why this matters and how we verify it.
 - **Hard memory ceiling.** Fixed allocators with a configurable cap (default
   64 MB). Memory does not grow under sustained brute-force or DDoS
@@ -132,7 +132,7 @@ flowchart LR
     DASH["Dashboard / WS"] --> HTTP
 ```
 
-Deep-dive: [docs/architecture/zero-dependencies.md](docs/architecture/zero-dependencies.md).
+Deep-dive: [architecture/zero-dependencies](https://fail2zig.com/docs/architecture/zero-dependencies/).
 
 ---
 
@@ -225,7 +225,7 @@ bantime_increment_multiplier  = 2
 bantime_increment_max_bantime = 604800
 ```
 
-Full schema and every option: [docs/reference/config.md](docs/reference/config.md).
+Full schema and every option: [reference/config](https://fail2zig.com/docs/reference/config/).
 
 ### Migrate from fail2ban
 
@@ -238,7 +238,7 @@ The importer merges `jail.conf` → `jail.local` → `jail.d/*`, translates
 Python regex patterns to the fail2zig DSL where possible, maps action names
 to native backends, and prints a migration report.
 
-Step-by-step guide: [docs/guides/migration-from-fail2ban.md](docs/guides/migration-from-fail2ban.md).
+Step-by-step guide: [guides/migration-from-fail2ban](https://fail2zig.com/docs/guides/migration-from-fail2ban/).
 
 ---
 
@@ -259,7 +259,7 @@ OPTIONS:
   --help, -h                Print help and exit
 ```
 
-Full reference: [docs/reference/cli-fail2zig.md](docs/reference/cli-fail2zig.md) ·
+Full reference: [reference/cli-fail2zig](https://fail2zig.com/docs/reference/cli-fail2zig/) ·
 man page: [docs/man/fail2zig.1](docs/man/fail2zig.1).
 
 ### Client — `fail2zig-client(1)`
@@ -278,7 +278,7 @@ man page: [docs/man/fail2zig.1](docs/man/fail2zig.1).
 Global flags: `--socket <path>`, `--output table|json|plain`, `--no-color`,
 `--timeout <ms>`.
 
-Full reference: [docs/reference/cli-fail2zig-client.md](docs/reference/cli-fail2zig-client.md) ·
+Full reference: [reference/cli-fail2zig-client](https://fail2zig.com/docs/reference/cli-fail2zig-client/) ·
 man page: [docs/man/fail2zig-client.1](docs/man/fail2zig-client.1).
 
 ---
@@ -337,7 +337,7 @@ eBPF/XDP (NIC-level drop) is architected; ships in a future release.
 | Database | `mysqld-auth` |
 | Meta | `recidive` (escalates repeat offenders) |
 
-Full reference: [docs/reference/filters.md](docs/reference/filters.md).
+Full reference: [reference/filters](https://fail2zig.com/docs/reference/filters/).
 Filter names accept hyphenated or underscore forms
 (`nginx-http-auth` ≡ `nginx_http_auth`).
 
@@ -400,11 +400,8 @@ fail2zig/
 │   ├── benchmark/       # Zig microbenchmarks (-Dbench=true)
 │   ├── fuzz/            # Zig fuzz corpora (parsers, protocol, config)
 │   └── harness/         # Shell-based system harness (lab-box tests)
-├── docs/                # Divio-structured documentation
-│   ├── architecture/    # Design deep-dives
-│   ├── guides/          # Task-oriented how-tos
-│   ├── reference/       # Schema, CLI, filter reference
-│   └── man/             # troff man pages
+├── docs/                # Installable man pages
+│   └── man/             # troff: fail2zig(1), fail2zig-client(1), fail2zig.toml(5)
 ├── deploy/              # systemd unit, socket, example config
 ├── scripts/             # Public installer (scripts/install.sh)
 ├── .github/workflows/   # CI (ci.yml) + release pipeline (release.yml)
@@ -418,9 +415,9 @@ fail2zig/
 
 | Kind | Where | What |
 |------|-------|------|
-| Architecture | [docs/architecture/](docs/architecture/) | Why decisions were made (zero-dependencies deep-dive) |
-| Guides | [docs/guides/](docs/guides/) | Task-oriented walkthroughs (migration from fail2ban) |
-| Reference | [docs/reference/](docs/reference/) | Config schema, CLI flags, filter catalogue |
+| Architecture | [fail2zig.com/docs](https://fail2zig.com/docs/) | Why decisions were made (zero-dependencies deep-dive) |
+| Guides | [fail2zig.com/docs](https://fail2zig.com/docs/) | Task-oriented walkthroughs (migration from fail2ban) |
+| Reference | [fail2zig.com/docs](https://fail2zig.com/docs/) | Config schema, CLI flags, filter catalogue |
 | Man pages | [docs/man/](docs/man/) | `fail2zig(1)`, `fail2zig-client(1)`, `fail2zig.toml(5)` |
 | Tests | [tests/README.md](tests/README.md) | Unit / integration / benchmark / fuzz / harness layout |
 

@@ -44,7 +44,7 @@ const breadcrumbHtml = `<span>docs</span> / ${category} / ${entry.data.title}`;
   <Fragment slot="actions">
     <button class="copy-page-btn btn ghost" data-slug={currentSlug}>Copy page as markdown</button>
     <a
-      href={`https://github.com/ul0gic/fail2zig/edit/main/docs/${currentSlug}.md`}
+      href={`https://github.com/ul0gic/fail2zig/edit/main/web/src/content/docs/${currentSlug.replaceAll('/', '--')}.md`}
       class="btn ghost"
       rel="noopener noreferrer">Edit on GitHub &rarr;</a
     >
