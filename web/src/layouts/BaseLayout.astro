@@ -30,7 +30,7 @@ const canonical = new URL(Astro.url.pathname, Astro.site ?? Astro.url).toString(
 ---
 
 <!doctype html>
-<html lang="en" data-theme="light">
+<html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
@@ -44,42 +44,7 @@ const canonical = new URL(Astro.url.pathname, Astro.site ?? Astro.url).toString(
     <meta property="og:description" content={description} />
     <meta property="og:url" content={canonical} />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="color-scheme" content="dark light" />
-    <script is:inline>
-      // Theme toggle — ported from .project/design/assets/shared.js.
-      // Inline + pre-hydration to avoid a flash of wrong theme.
-      (function () {
-        const root = document.documentElement;
-        const stored = localStorage.getItem('f2z-theme') || 'light';
-        root.setAttribute('data-theme', stored);
-        const render = () => {
-          const btn = document.getElementById('theme-toggle');
-          if (!btn) return;
-          const t = root.getAttribute('data-theme');
-          btn.textContent = t === 'dark' ? '◐' : '◑';
-          btn.setAttribute(
-            'aria-label',
-            t === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'
-          );
-        };
-        const bind = () => {
-          const btn = document.getElementById('theme-toggle');
-          if (!btn) return;
-          render();
-          btn.addEventListener('click', () => {
-            const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
-            root.setAttribute('data-theme', next);
-            localStorage.setItem('f2z-theme', next);
-            render();
-          });
-        };
-        if (document.readyState === 'loading') {
-          document.addEventListener('DOMContentLoaded', bind);
-        } else {
-          bind();
-        }
-      })();
-    </script>
+    <meta name="color-scheme" content="dark" />
   </head>
   <body>
     <SiteNav active={activeNav} />

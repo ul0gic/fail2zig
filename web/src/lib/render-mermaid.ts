@@ -17,10 +17,9 @@ let modalInstalled = false;
 async function loadMermaid(): Promise<typeof Mermaid> {
   if (!mermaidPromise) {
     mermaidPromise = import('mermaid').then((m) => {
-      const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
       m.default.initialize({
         startOnLoad: false,
-        theme: isDark ? 'dark' : 'neutral',
+        theme: 'dark',
         securityLevel: 'strict',
         fontFamily: 'JetBrains Mono, ui-monospace, SFMono-Regular, monospace',
         flowchart: { curve: 'basis', htmlLabels: true },

@@ -1,44 +1,57 @@
-/* fail2zig theme tokens — "Warm Paper + Black Nav" palette.
- * Calibrated for editorial contrast: 4-tier ink scale, 3 rule strengths,
- * selective section banding. No white surfaces on the body. No shadows.
+/* fail2zig theme tokens — single canonical palette: dark body, dark
+ * chrome, warm amber accent.
+ *
+ * Body surfaces are near-black with a subtle warm tint so the product
+ * doesn't feel sterile. Nav + footer are pure black (slightly darker
+ * than the body) so the chrome sits below the content by half a tonal
+ * step. There is no alternate palette and no toggle.
+ *
+ * Editorial contrast: 5-tier ink scale, 3 rule strengths, section
+ * banding via --bg-band, no shadows.
  */
 :root {
-  /* Paper surface */
-  --bg: #F3EFE6;
-  --bg-elev: #EEE8DD;
-  --bg-soft: #EEE8DD;
-  --bg-band: #ECE7DC;
+  /* Body surface */
+  --bg: rgb(31, 31, 30);
+  --bg-elev: rgb(40, 40, 38);
+  --bg-soft: rgb(37, 37, 35);
+  --bg-band: rgb(24, 24, 23);
 
   /* Rules — three strengths for editorial hierarchy */
-  --line-hairline: #DDD5C5;
-  --line: #CEC5B5;
-  --line-strong: #B0A692;
-  /* Back-compat alias for mockup-ported code that still references --line-soft */
+  --line-hairline: oklch(0.28 0.008 80);
+  --line: oklch(0.35 0.008 80);
+  --line-strong: oklch(0.48 0.01 80);
+  /* --line-soft tracks the hairline weight; alias kept so mockup-era
+     selectors referencing it continue to resolve correctly. */
   --line-soft: var(--line-hairline);
 
   /* Ink — five-tier scale: heading → strong → body → dim → faint.
    * fg-strong sits between headings and body. Use for:
    * table row leaders, command text, key metric values, terminal strong lines. */
-  --fg: #171717;
-  --fg-strong: #2B2926;
-  --fg-body: #4E4942;
-  --fg-dim: #6E675E;
-  --fg-faint: #8C8478;
-  /* Back-compat alias for mockup-ported code that still references --fg-mute */
+  --fg: oklch(0.96 0.005 80);
+  --fg-strong: oklch(0.88 0.005 80);
+  --fg-body: oklch(0.78 0.005 80);
+  --fg-dim: oklch(0.62 0.008 80);
+  --fg-faint: oklch(0.48 0.008 80);
+  /* --fg-mute is the meta/microcopy tier — alias kept so microtext
+     selectors written against --fg-mute keep working. */
   --fg-mute: var(--fg-faint);
 
-  /* Accent — dry amber, editorial-mark, never neon */
-  --accent: #C69418;
-  --accent-dim: #A97D12;
-  --accent-ghost: #EFE3C7;
+  /* Accent — dry amber, editorial-mark, never neon. Brightened for
+     dark-body legibility. */
+  --accent: oklch(0.74 0.17 60);
+  --accent-dim: oklch(0.60 0.14 60);
+  --accent-ghost: oklch(0.32 0.08 60);
 
-  /* Dark code surface */
-  --surface-ink: #2A2927;
+  /* Near-black code surface used by terminal pills + fenced blocks */
+  --surface-ink: oklch(0.09 0.005 80);
 
-  /* Diagram node fill — defaults to page bg so nodes blend; overridden in dark */
-  --diagram-surface: var(--bg);
+  /* Diagram fill — lifts a step above the body so mermaid nodes read
+     as elevated rather than sunk into the page. */
+  --diagram-surface: rgb(44, 44, 43);
 
-  /* Inverted nav/footer */
+  /* Chrome — nav + footer.
+     Pure black, one step darker than --bg, so the chrome recedes
+     behind the content without introducing a hard colour change. */
   --nav-bg: #0A0A0A;
   --nav-bg-soft: #1A1A18;
   --nav-line: #2A2926;
@@ -47,9 +60,9 @@
   --nav-fg-mute: #7A746C;
 
   /* Status */
-  --safe: #2D7D46;
-  --safe-dim: #1F5A32;
-  --danger: #B91C1C;
+  --safe: oklch(0.70 0.14 155);
+  --safe-dim: oklch(0.55 0.10 155);
+  --danger: oklch(0.68 0.22 25);
 
   /* Fonts */
   --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -59,57 +72,6 @@
   --radius: 2px;
   --radius-lg: 2px;
   --step: 8px;
-}
-
-:root[data-theme="light"] {
-  --bg: oklch(0.985 0.005 80);
-  --bg-elev: oklch(0.96 0.005 80);
-  --bg-soft: oklch(0.94 0.005 80);
-  --line: oklch(0.86 0.01 80);
-  --line-soft: oklch(0.90 0.01 80);
-  --fg: oklch(0.20 0.01 80);
-  --fg-dim: oklch(0.40 0.01 80);
-  --fg-mute: oklch(0.55 0.01 80);
-  --accent: oklch(0.62 0.16 60);
-  --accent-dim: oklch(0.70 0.12 60);
-  --accent-ghost: oklch(0.92 0.05 60);
-  --safe: oklch(0.48 0.14 155);
-  --safe-dim: oklch(0.70 0.10 155);
-  --danger: oklch(0.55 0.20 25);
-}
-
-:root[data-theme="dark"] {
-  /* Near-black surfaces with a subtle warm tint so it doesn't feel sterile */
-  --bg: rgb(31, 31, 30);
-  --bg-elev: rgb(40, 40, 38);
-  --bg-soft: rgb(37, 37, 35);
-  --bg-band: rgb(24, 24, 23);
-
-  /* Rules — three strengths, lifted for visibility on dark bg */
-  --line-hairline: oklch(0.28 0.008 80);
-  --line: oklch(0.35 0.008 80);
-  --line-strong: oklch(0.48 0.01 80);
-
-  /* Ink scale — inverted. Heading → strong → body → dim → faint. */
-  --fg: oklch(0.96 0.005 80);
-  --fg-strong: oklch(0.88 0.005 80);
-  --fg-body: oklch(0.78 0.005 80);
-  --fg-dim: oklch(0.62 0.008 80);
-  --fg-faint: oklch(0.48 0.008 80);
-
-  /* Same orange as light mode, brightened slightly for dark-bg legibility */
-  --accent: oklch(0.74 0.17 60);
-  --accent-dim: oklch(0.60 0.14 60);
-  --accent-ghost: oklch(0.32 0.08 60);
-
-  --surface-ink: oklch(0.09 0.005 80);
-
-  /* Lift diagram nodes above the dark body for visual depth */
-  --diagram-surface: rgb(44, 44, 43);
-
-  --safe: oklch(0.70 0.14 155);
-  --safe-dim: oklch(0.55 0.10 155);
-  --danger: oklch(0.68 0.22 25);
 }
 
 * { box-sizing: border-box; }
@@ -208,22 +170,6 @@ pre { margin: 0; }
   color: var(--fg) !important;
 }
 .nav-cta:hover { border-color: var(--accent); color: var(--accent) !important; }
-
-.theme-toggle {
-  background: transparent;
-  border: 1px solid var(--line);
-  color: var(--fg-dim);
-  width: 28px;
-  height: 28px;
-  padding: 0;
-  cursor: pointer;
-  font-family: var(--mono);
-  font-size: 12px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-.theme-toggle:hover { color: var(--fg); border-color: var(--accent); }
 
 /* ---- buttons ---- */
 .btn {
