@@ -15,18 +15,16 @@ let mermaidPromise: Promise<typeof Mermaid> | null = null;
 let modalInstalled = false;
 
 async function loadMermaid(): Promise<typeof Mermaid> {
-  if (!mermaidPromise) {
-    mermaidPromise = import('mermaid').then((m) => {
-      m.default.initialize({
-        startOnLoad: false,
-        theme: 'dark',
-        securityLevel: 'strict',
-        fontFamily: 'JetBrains Mono, ui-monospace, SFMono-Regular, monospace',
-        flowchart: { curve: 'basis', htmlLabels: true },
-      });
-      return m.default;
+  mermaidPromise ??= import('mermaid').then((m) => {
+    m.default.initialize({
+      startOnLoad: false,
+      theme: 'dark',
+      securityLevel: 'strict',
+      fontFamily: 'JetBrains Mono, ui-monospace, SFMono-Regular, monospace',
+      flowchart: { curve: 'basis', htmlLabels: true },
     });
-  }
+    return m.default;
+  });
   return mermaidPromise;
 }
 
@@ -35,7 +33,7 @@ export async function renderMermaidTargets(targets: MermaidTarget[]): Promise<vo
   const mermaid = await loadMermaid();
   let n = 0;
   for (const t of targets) {
-    const source = (t.source.textContent ?? '').trim();
+    const source = t.source.textContent.trim();
     try {
       const { svg } = await mermaid.render(`mmd-${Date.now().toString()}-${(n++).toString()}`, source);
       const container = document.createElement('div');

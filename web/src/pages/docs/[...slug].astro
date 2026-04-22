@@ -1,14 +1,25 @@
 ---
-/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-call, @typescript-eslint/restrict-template-expressions */
+import type { CollectionEntry } from 'astro:content';
 import { getCollection, render } from 'astro:content';
 import DocLayout from '@/layouts/DocLayout.astro';
 
-export async function getStaticPaths() {
+type DocEntry = CollectionEntry<'docs'>;
+
+interface StaticPath {
+  params: { slug: string };
+  props: { entry: DocEntry };
+}
+
+export async function getStaticPaths(): Promise<StaticPath[]> {
   const docs = await getCollection('docs');
   return docs.map((entry) => ({
     params: { slug: entry.id.replace(/--/g, '/') },
     props: { entry },
   }));
+}
+
+interface Props {
+  entry: DocEntry;
 }
 
 const { entry } = Astro.props;
