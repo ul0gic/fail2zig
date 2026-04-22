@@ -1,0 +1,65 @@
+# Dependabot — keeps dependency versions safe without nagging.
+#
+# Scope:
+#   - web/ pnpm dependency graph: flag CVEs + PR security-patch updates
+#   - .github/workflows/* GitHub Action pins: flag outdated SHA refs
+#
+# The Zig daemon has zero runtime dependencies by design (see
+# docs/architecture/zero-dependencies), so there is no Zig ecosystem
+# to scan here. build.zig.zon carries no third-party packages; if that
+# ever changes, a zig ecosystem block will need adding.
+#
+# Grouping reduces PR noise: one PR per weekly batch per ecosystem
+# instead of one per dependency.
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/web"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Chicago"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "web"
+    commit-message:
+      prefix: "chore(web)"
+      include: "scope"
+    groups:
+      astro-and-friends:
+        patterns:
+          - "astro"
+          - "@astrojs/*"
+          - "@tailwindcss/*"
+          - "tailwindcss"
+      lint-and-format:
+        patterns:
+          - "eslint"
+          - "eslint-*"
+          - "@eslint/*"
+          - "typescript-eslint"
+          - "prettier"
+          - "prettier-*"
+      mdx-rehype:
+        patterns:
+          - "rehype-*"
+          - "mermaid"
+          - "shiki"
+          - "unist-*"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Chicago"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "chore(ci)"
+      include: "scope"

@@ -1,0 +1,77 @@
+# fail2zig — CodeQL code scanning.
+#
+# Scope: JavaScript + TypeScript only. Covers the ~470 lines of TS
+# and the inline scripts in .astro pages under web/. CodeQL does not
+# currently support Zig, so the engine side (Zig daemon, firewall
+# backends, parser) is covered by the existing fuzz + integration
+# + std.testing.allocator leak-detection suite run by ci.yml.
+#
+# Runs on:
+#   - push to main (catches anything landed directly)
+#   - pull_request to main (catches PR-introduced issues before merge)
+#   - weekly schedule (catches new CodeQL queries against an unchanged
+#     codebase)
+#
+# Results land in the Security tab: Code scanning alerts. A finding
+# blocks nothing by default; branch protection could be extended to
+# require this workflow green once the baseline is clean.
+
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - ".github/workflows/codeql.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "web/**"
+      - ".github/workflows/codeql.yml"
+  schedule:
+    # Monday 10:17 UTC — off-peak; minimises contention with Dependabot
+    - cron: "17 10 * * 1"
+
+permissions:
+  # Required for CodeQL to read source and write SARIF results
+  contents: read
+  security-events: write
+  actions: read
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language:
+          - javascript-typescript
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          # security-extended adds queries beyond the default set; it
+          # raises signal at a small runtime cost. Worth it for a
+          # security tool.
+          queries: security-extended
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
