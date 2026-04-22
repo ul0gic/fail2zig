@@ -48,7 +48,7 @@ jobs:
     name: zig fmt --check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install Zig ${{ env.ZIG_VERSION }}
         # Direct fetch instead of mlugg/setup-zig@v1 — that action's
         # mirror layout doesn't handle the 0.14.1 archive rename
@@ -69,7 +69,7 @@ jobs:
     name: Build (native Debug)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install Zig ${{ env.ZIG_VERSION }}
         # Direct fetch instead of mlugg/setup-zig@v1 — that action's
         # mirror layout doesn't handle the 0.14.1 archive rename
@@ -96,7 +96,7 @@ jobs:
     name: Tests (std.testing.allocator leak detection)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install Zig ${{ env.ZIG_VERSION }}
         # Direct fetch instead of mlugg/setup-zig@v1 — that action's
         # mirror layout doesn't handle the 0.14.1 archive rename
@@ -130,7 +130,7 @@ jobs:
           - x86_64-linux-musl
           - aarch64-linux-musl
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install Zig ${{ env.ZIG_VERSION }}
         # Direct fetch instead of mlugg/setup-zig@v1 — that action's
         # mirror layout doesn't handle the 0.14.1 archive rename
@@ -179,7 +179,7 @@ jobs:
     name: shellcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Lint scripts
@@ -194,7 +194,7 @@ jobs:
     name: yamllint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install yamllint
         run: sudo apt-get update && sudo apt-get install -y yamllint
       - name: Lint CI YAML
@@ -204,7 +204,7 @@ jobs:
     name: SPDX headers
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Verify every .zig file carries the SPDX + copyright header
         # Every first-party .zig source under engine/, client/, shared/,
         # tests/, plus build.zig at the root, must start with:
