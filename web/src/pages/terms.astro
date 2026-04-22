@@ -3,71 +3,488 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
 ---
 
 <BaseLayout
-  title="fail2zig · terms"
-  description="Terms of use for fail2zig."
+  title="Terms · fail2zig"
+  description="Terms of use for fail2zig — AGPL-3.0-or-later code license, trademark policy for the name and mark, no-warranty disclaimer, governing law."
   activeNav="/terms"
 >
-  <article class="legal-stub">
+  <header class="lg-hero">
     <div class="wrap">
-      <div class="eyebrow"><span class="dot"></span>Terms</div>
-      <h1>Terms of use</h1>
-      <p class="lede">
-        Full terms coming soon. Short version below.
+      <div class="lg-meta">
+        <span><strong>Version</strong> &middot; 1.0</span>
+        <span><strong>Effective</strong> &middot; 2026-04-22</span>
+        <span><strong>Operator</strong> &middot; Corelift</span>
+        <span><strong>Jurisdiction</strong> &middot; California, USA</span>
+      </div>
+      <h1>Terms of use.</h1>
+      <p class="lg-lede">
+        The rules that govern your use of the fail2zig source code, the
+        fail2zig name and mark, and this website. Plain language. If a
+        section ever contradicts the AGPL-3.0-or-later licence text
+        itself, the licence wins.
       </p>
-      <h2>Code</h2>
-      <p>
-        The fail2zig source code is licensed under AGPL-3.0-or-later. The full LICENSE text
-        lives in the repository and governs your rights to use, modify, and redistribute the
-        code. Nothing on this site grants rights that the license itself does not.
-      </p>
-      <h2>Name and mark</h2>
-      <p>
-        The &ldquo;fail2zig&rdquo; name, logo, and brand mark are trademarks of the maintainer.
-        Forks and downstream distributions must use their own name and branding. See the brand
-        page for details.
-      </p>
-      <h2>No warranty</h2>
-      <p>
-        The software is provided as-is, without warranty of any kind, per the AGPL. Running
-        a security daemon on your infrastructure is your responsibility.
-      </p>
-      <p class="stub-note">Last updated: draft, expanded version pending.</p>
     </div>
-  </article>
+  </header>
+
+  <section class="section">
+    <div class="wrap">
+      <div class="section-head">
+        <div class="eyebrow"><span class="dot"></span>01 &middot; The code</div>
+        <div>
+          <h2>AGPL-3.0-or-later. The licence governs.</h2>
+        </div>
+      </div>
+
+      <div class="prose">
+        <p>
+          The fail2zig source code is licensed under the
+          <strong>GNU Affero General Public License, version 3 or
+          later (AGPL-3.0-or-later)</strong>. The canonical licence
+          text lives in the repository at
+          <a href="https://github.com/ul0gic/fail2zig/blob/main/LICENSE" rel="noopener noreferrer"><code>LICENSE</code></a>
+          and is incorporated here by reference.
+        </p>
+        <p>
+          The licence governs your right to use, study, modify, and
+          redistribute the code. Nothing on this site grants rights
+          the licence itself does not. Nothing on this site removes
+          obligations the licence places on you.
+        </p>
+        <p>
+          <strong>Affero provision:</strong> if you run a modified
+          version of fail2zig as a network service, you must offer the
+          corresponding source of your modifications to the users of
+          that service. This is not an afterthought; it is a deliberate
+          choice for a security tool that handles attacker-controlled
+          input. A fork the public cannot audit is one the public
+          should not be relying on.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section--band">
+    <div class="wrap">
+      <div class="section-head">
+        <div class="eyebrow"><span class="dot"></span>02 &middot; The name and mark</div>
+        <div>
+          <h2>Trademark on the word and the logo.</h2>
+          <p class="lg-sublede">
+            The code is free. The identity is not. Forks are welcome;
+            forks that ship as "fail2zig" are not.
+          </p>
+        </div>
+      </div>
+
+      <div class="rows">
+        <div class="row">
+          <div class="row-k">Trademarked</div>
+          <div class="row-v">
+            <p>
+              The word <strong>fail2zig</strong> and the accompanying
+              logo / brand mark are trademarks of the operator. Use of
+              the mark in a way that suggests official endorsement,
+              affiliation, or equivalence is not permitted without
+              written permission.
+            </p>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-k">You may</div>
+          <div class="row-v">
+            <p>
+              Reference fail2zig by name factually (&ldquo;compatible
+              with fail2zig&rdquo;, &ldquo;migrated from
+              fail2zig&rdquo;, &ldquo;a fork of fail2zig&rdquo;). Link
+              to this site. Distribute unmodified release binaries
+              under their original name.
+            </p>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-k">You may not</div>
+          <div class="row-v">
+            <p>
+              Ship a modified fork under the <code>fail2zig</code> name
+              or the <code>fail2zig</code> logo. Register confusingly
+              similar names or domains. Imply the operator endorses
+              your downstream distribution. Use the name as a
+              company, product, or service identifier without written
+              permission.
+            </p>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-k">Forks, rename</div>
+          <div class="row-v">
+            <p>
+              Fork freely under the AGPL, but ship your fork under a
+              different name and without the fail2zig logo. A
+              different name does not imply the fork is lesser — it
+              means the public can reason about which project they are
+              running.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <div class="section-head">
+        <div class="eyebrow"><span class="dot"></span>03 &middot; No warranty</div>
+        <div>
+          <h2>As-is. Use at your own risk.</h2>
+        </div>
+      </div>
+
+      <div class="prose">
+        <p>
+          fail2zig is provided <strong>AS IS, WITHOUT WARRANTY OF ANY
+          KIND</strong>, express or implied, including but not limited
+          to the warranties of merchantability, fitness for a particular
+          purpose, and non-infringement. This mirrors the AGPL-3.0
+          disclaimer and applies here in full.
+        </p>
+        <p>
+          You run a root-privileged security daemon on your own
+          infrastructure. The operational consequences of that decision
+          — correctly or incorrectly banning an IP, interacting with
+          your firewall, integrating with your log pipeline — are
+          yours to verify. The project documents its behaviour in the
+          <a href="/docs">docs</a> and its security posture in the
+          <a href="/threat-model">threat model</a>, but documentation
+          is not a warranty.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section--band">
+    <div class="wrap">
+      <div class="section-head">
+        <div class="eyebrow"><span class="dot"></span>04 &middot; Limitation of liability</div>
+        <div>
+          <h2>What happens on your servers is yours.</h2>
+        </div>
+      </div>
+
+      <div class="prose">
+        <p>
+          To the maximum extent permitted by applicable law, the
+          operator and contributors are not liable for any direct,
+          indirect, incidental, special, consequential, or exemplary
+          damages arising from the use or inability to use fail2zig.
+          This includes damages for lost profits, lost data, business
+          interruption, or missed bans, even if advised of the
+          possibility.
+        </p>
+        <p>
+          <strong>Using fail2zig against third-party infrastructure you
+          do not own or operate is your responsibility.</strong>
+          fail2zig is a defensive tool for protecting hosts you
+          control. It is not a weapon, and running it in offensive
+          contexts is not a use the project endorses or supports.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <div class="section-head">
+        <div class="eyebrow"><span class="dot"></span>05 &middot; Responsible disclosure</div>
+        <div>
+          <h2>If you find a vulnerability, tell us privately.</h2>
+        </div>
+      </div>
+
+      <div class="prose">
+        <p>
+          Security vulnerabilities in fail2zig are reported via
+          GitHub's private security advisory form:
+          <a href="https://github.com/ul0gic/fail2zig/security/advisories/new" rel="noopener noreferrer">github.com/ul0gic/fail2zig/security/advisories/new</a>.
+          Do not open a public issue for a security vulnerability.
+          Full policy lives in the repository
+          <a href="https://github.com/ul0gic/fail2zig/blob/main/SECURITY.md" rel="noopener noreferrer"><code>SECURITY.md</code></a>.
+        </p>
+        <p>
+          Researchers reporting in good faith within the stated scope
+          will not be pursued legally. We commit to a 48-hour
+          acknowledgement and a best-effort initial assessment within
+          14 days.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section--band">
+    <div class="wrap">
+      <div class="section-head">
+        <div class="eyebrow"><span class="dot"></span>06 &middot; Governing law</div>
+        <div>
+          <h2>California, USA.</h2>
+        </div>
+      </div>
+
+      <div class="rows">
+        <div class="row">
+          <div class="row-k">Choice of law</div>
+          <div class="row-v">
+            <p>
+              These terms are governed by the laws of the State of
+              California, United States, without regard to its
+              conflict-of-law provisions.
+            </p>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-k">Venue</div>
+          <div class="row-v">
+            <p>
+              Any dispute not settled informally is subject to the
+              exclusive jurisdiction of the state and federal courts
+              located in California.
+            </p>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-k">Severability</div>
+          <div class="row-v">
+            <p>
+              If any provision of these terms is held unenforceable,
+              the remainder stays in effect.
+            </p>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-k">Changes</div>
+          <div class="row-v">
+            <p>
+              Material changes are flagged in the
+              <a href="/changelog">site changelog</a>. The current
+              version and effective date appear at the top of this
+              page.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap lg-close">
+      <div>
+        <div class="eyebrow"><span class="dot"></span>Contact</div>
+        <h2>How to reach us.</h2>
+        <p>
+          Use the channel that matches the topic. Privacy questions go
+          elsewhere — see the <a href="/privacy">privacy policy</a>.
+        </p>
+      </div>
+      <div class="contact-grid">
+        <div class="contact-row">
+          <span class="row-k">Licensing / trademark</span>
+          <a href="mailto:devteam@corelift.io"><code>devteam@corelift.io</code></a>
+        </div>
+        <div class="contact-row">
+          <span class="row-k">General bugs / features</span>
+          <a href="https://github.com/ul0gic/fail2zig/issues" rel="noopener noreferrer">github.com/ul0gic/fail2zig/issues</a>
+        </div>
+        <div class="contact-row">
+          <span class="row-k">Security vulnerabilities</span>
+          <a href="https://github.com/ul0gic/fail2zig/security/advisories/new" rel="noopener noreferrer">private advisory form</a>
+        </div>
+        <div class="contact-row">
+          <span class="row-k">Operator</span>
+          <span>Corelift &middot; California, USA</span>
+        </div>
+      </div>
+    </div>
+  </section>
 </BaseLayout>
 
 <style>
-  .legal-stub {
-    padding: 96px 0 128px;
+  /* Hero — same shape as /privacy, /why, /threat-model */
+  .lg-hero {
+    padding: 96px 0 56px;
+    border-bottom: 1px solid var(--line);
   }
-  .legal-stub h1 {
-    font-size: clamp(32px, 3.4vw, 44px);
-    line-height: 1.08;
-    letter-spacing: -0.02em;
-    margin: 20px 0 16px;
+  .lg-hero h1 {
+    font-size: clamp(40px, 5vw, 64px);
+    margin: 24px 0;
+    letter-spacing: -0.025em;
   }
-  .legal-stub .lede {
-    margin-bottom: 40px;
-  }
-  .legal-stub h2 {
-    font-family: var(--mono);
-    font-size: 15px;
-    font-weight: 500;
-    color: var(--fg);
-    margin: 32px 0 12px;
-  }
-  .legal-stub p {
+  .lg-lede {
+    font-size: 19px;
+    line-height: 1.6;
     color: var(--fg-body);
-    line-height: 1.65;
     max-width: 68ch;
-    margin: 0 0 14px;
+    margin: 0;
+    text-wrap: pretty;
   }
-  .stub-note {
-    margin-top: 48px;
-    padding-top: 20px;
-    border-top: 1px dashed var(--line);
-    color: var(--fg-dim);
+  .lg-meta {
+    display: flex;
+    gap: 24px;
+    flex-wrap: wrap;
     font-family: var(--mono);
     font-size: 12px;
+    color: var(--fg-strong);
+  }
+  .lg-meta strong {
+    color: var(--fg-dim);
+    font-weight: 500;
+  }
+
+  /* Section head */
+  .section-head {
+    display: grid;
+    grid-template-columns: 220px 1fr;
+    gap: 48px;
+    margin-bottom: 40px;
+    align-items: baseline;
+  }
+  .section-head .eyebrow {
+    padding-top: 6px;
+  }
+  .section-head h2 {
+    font-size: clamp(24px, 2.4vw, 32px);
+    letter-spacing: -0.02em;
+    margin: 0;
+    max-width: 36ch;
+    text-wrap: balance;
+  }
+  .lg-sublede {
+    font-size: 15px;
+    color: var(--fg-body);
+    max-width: 64ch;
+    margin: 12px 0 0;
+    line-height: 1.6;
+  }
+  .lg-sublede strong {
+    color: var(--fg);
+    font-weight: 600;
+  }
+
+  /* Row tables */
+  .rows {
+    border-top: 1px solid var(--line);
+  }
+  .row {
+    display: grid;
+    grid-template-columns: 260px 1fr;
+    gap: 48px;
+    padding: 22px 0;
+    border-bottom: 1px solid var(--line);
+    align-items: start;
+  }
+  .row-k {
+    font-family: var(--mono);
+    font-size: 14px;
+    color: var(--fg);
+    font-weight: 500;
+    padding-top: 2px;
+  }
+  .row-v p {
+    font-size: 15px;
+    line-height: 1.65;
+    color: var(--fg-body);
+    margin: 0;
+    max-width: 68ch;
+  }
+  .row-v a {
+    color: var(--accent);
+  }
+  .row-v a:hover {
+    text-decoration: underline;
+  }
+  .row-v strong {
+    color: var(--fg);
+    font-weight: 600;
+  }
+
+  /* Prose */
+  .prose {
+    max-width: 68ch;
+  }
+  .prose p {
+    font-size: 15px;
+    line-height: 1.7;
+    color: var(--fg-body);
+    margin: 0 0 16px;
+  }
+  .prose p:last-child {
+    margin-bottom: 0;
+  }
+  .prose p strong {
+    color: var(--fg);
+    font-weight: 600;
+  }
+  .prose a {
+    color: var(--accent);
+  }
+
+  /* Code chips */
+  .row-v code,
+  .prose code,
+  .contact-row code {
+    font-family: var(--mono);
+    font-size: 0.9em;
+    color: var(--nav-fg);
+    background: var(--nav-bg);
+    border: 1px solid var(--nav-line);
+    padding: 1px 6px;
+  }
+
+  /* Close / contact */
+  .lg-close {
+    display: grid;
+    grid-template-columns: 1.2fr 1fr;
+    gap: 64px;
+    align-items: start;
+  }
+  .lg-close h2 {
+    font-size: clamp(24px, 2.4vw, 32px);
+    margin: 16px 0 16px;
+    max-width: 22ch;
+  }
+  .lg-close p {
+    font-size: 16px;
+    color: var(--fg-body);
+    max-width: 56ch;
+    margin: 0 0 24px;
+    line-height: 1.6;
+  }
+  .lg-close p a {
+    color: var(--accent);
+  }
+  .contact-grid {
+    border-top: 1px solid var(--line-hairline);
+  }
+  .contact-row {
+    display: grid;
+    grid-template-columns: 200px 1fr;
+    gap: 24px;
+    padding: 14px 0;
+    border-bottom: 1px solid var(--line-hairline);
+    font-size: 14px;
+    color: var(--fg-body);
+    align-items: center;
+  }
+  .contact-row a {
+    color: var(--accent);
+  }
+  .contact-row a:hover {
+    text-decoration: underline;
+  }
+
+  @media (max-width: 960px) {
+    .section-head,
+    .row,
+    .contact-row,
+    .lg-close {
+      grid-template-columns: 1fr;
+      gap: 12px;
+    }
   }
 </style>

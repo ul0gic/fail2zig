@@ -3,65 +3,632 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
 ---
 
 <BaseLayout
-  title="fail2zig · privacy"
-  description="Privacy policy for fail2zig."
+  title="Privacy · fail2zig"
+  description="Privacy policy for fail2zig.com. The site collects no personal data, uses no cookies, runs no third-party trackers, sends nothing to data brokers."
   activeNav="/privacy"
 >
-  <article class="legal-stub">
+  <header class="lg-hero">
     <div class="wrap">
-      <div class="eyebrow"><span class="dot"></span>Privacy</div>
-      <h1>Privacy policy</h1>
-      <p class="lede">
-        Full policy coming soon. Short version below.
+      <div class="lg-meta">
+        <span><strong>Version</strong> &middot; 1.0</span>
+        <span><strong>Effective</strong> &middot; 2026-04-22</span>
+        <span><strong>Operator</strong> &middot; Corelift</span>
+        <span><strong>Jurisdiction</strong> &middot; California, USA</span>
+      </div>
+      <h1>Privacy.</h1>
+      <p class="lg-lede">
+        What this site sees about you, who else touches it, and what
+        you can ask us to do about it. Plain language, no dark
+        patterns, no dual-purpose data flows. If you can't read your
+        own privacy policy, it isn't one.
       </p>
-      <h2>What we collect</h2>
-      <p>
-        This site uses Cloudflare Web Analytics. It is cookieless and does not fingerprint
-        visitors. Pageview counts, referrer domains, and coarse device class are aggregated
-        at the edge. No personal data is collected or stored.
-      </p>
-      <h2>What the fail2zig daemon does</h2>
-      <p>
-        The daemon runs on your own servers. It reads your log files, maintains ban state on
-        disk, and writes firewall rules. It does not send telemetry or call home.
-      </p>
-      <p class="stub-note">Last updated: draft, expanded version pending.</p>
     </div>
-  </article>
+  </header>
+
+  <section class="section">
+    <div class="wrap">
+      <div class="data-broker-notice">
+        <div class="dbn-label">Notice to data brokers</div>
+        <div class="dbn-body">
+          <p>
+            <strong>Do not contact.</strong> fail2zig and its operator
+            (Corelift) do not sell, rent, share, license, barter,
+            syndicate, pool, hash-exchange, cohort-build, or otherwise
+            transfer personal data to any data broker, advertising
+            network, data aggregator, marketing platform, identity
+            graph, or analogous intermediary. We will not accept
+            solicitations to do so. Unsolicited outreach from such
+            parties will be ignored, routed to the bit bucket, and may
+            be forwarded to the relevant regulator.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <div class="section-head">
+        <div class="eyebrow"><span class="dot"></span>01 &middot; What this site collects</div>
+        <div>
+          <h2>Three data surfaces, all minimal.</h2>
+        </div>
+      </div>
+
+      <div class="rows">
+        <div class="row">
+          <div class="row-k">Cloudflare Web Analytics</div>
+          <div class="row-v">
+            <p>
+              Pageview counts, referrer domain, country, coarse device
+              class. Aggregated at Cloudflare's edge. Cookieless. No
+              fingerprinting. Not linked to any identifier on our side.
+            </p>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-k">Cloudflare edge logs</div>
+          <div class="row-v">
+            <p>
+              Standard request logs (IP address, timestamp, URL,
+              user-agent) retained by Cloudflare per their logging
+              policy. We do not export these to ourselves. We read
+              them only when investigating an incident affecting this
+              site.
+            </p>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-k">Visitor IP during the live demo</div>
+          <div class="row-v">
+            <p>
+              When the "attack yourself" demo is live, it reads your IP
+              from Cloudflare's <code>cf-connecting-ip</code> header,
+              synthesizes a short sequence of log lines, and feeds them
+              to a fail2zig instance on a disposable origin server.
+              The resulting ban lasts 60 seconds and is never persisted
+              to disk or to any external system. No field other than
+              the IP is used.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section--band">
+    <div class="wrap">
+      <div class="section-head">
+        <div class="eyebrow"><span class="dot"></span>02 &middot; What this site never collects</div>
+        <div>
+          <h2>A clean no-list.</h2>
+        </div>
+      </div>
+
+      <ul class="never-list">
+        <li><strong>No cookies.</strong> The site renders without any.</li>
+        <li><strong>No third-party trackers.</strong> No Google Analytics, no Facebook Pixel, no Hotjar, no Segment, no ad networks, no tag managers.</li>
+        <li><strong>No fingerprinting.</strong> We do not combine signals to identify returning visitors.</li>
+        <li><strong>No cross-site tracking.</strong> The site loads no script or pixel that phones home to another origin.</li>
+        <li><strong>No accounts.</strong> There is no sign-up, no login, no email or phone on file.</li>
+        <li><strong>No advertising identifiers.</strong> We do not pass IDFA, GAID, LiveRamp, UID 2.0, or equivalents.</li>
+        <li><strong>No data sold or shared.</strong> See the data broker notice above.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <div class="section-head">
+        <div class="eyebrow"><span class="dot"></span>03 &middot; Who processes the data</div>
+        <div>
+          <h2>Three parties touch anything. Nobody else.</h2>
+        </div>
+      </div>
+
+      <div class="rows">
+        <div class="row">
+          <div class="row-k">Cloudflare, Inc.</div>
+          <div class="row-v">
+            <p>
+              CDN, DNS, Web Analytics, edge logs. Acts as a data
+              processor for request metadata. Governed by their
+              privacy policy at
+              <a href="https://www.cloudflare.com/privacypolicy/" rel="noopener noreferrer">cloudflare.com/privacypolicy</a>.
+            </p>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-k">AWS (Lightsail, us-east-2)</div>
+          <div class="row-v">
+            <p>
+              Hosts the demo origin when the live demo is running.
+              Only Cloudflare IP ranges can reach it; your browser
+              never talks to Lightsail directly. AWS's privacy posture
+              is governed by
+              <a href="https://aws.amazon.com/privacy/" rel="noopener noreferrer">aws.amazon.com/privacy</a>.
+            </p>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-k">GitHub, Inc.</div>
+          <div class="row-v">
+            <p>
+              Hosts the source code, issue tracker, and private security
+              advisories. When you click a GitHub link you leave this
+              site and GitHub's own privacy policy applies.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section--band">
+    <div class="wrap">
+      <div class="section-head">
+        <div class="eyebrow"><span class="dot"></span>04 &middot; The daemon on your servers</div>
+        <div>
+          <h2>Nothing leaves your host.</h2>
+          <p class="lg-sublede">
+            This privacy policy governs <strong>fail2zig.com</strong>.
+            The software you install on your infrastructure is a
+            separate matter — but the answer is the same: nothing goes
+            anywhere.
+          </p>
+        </div>
+      </div>
+
+      <div class="prose">
+        <p>
+          The <code>fail2zig</code> daemon and the <code>fail2zig-client</code>
+          CLI do not phone home. They do not contact <code>fail2zig.com</code>.
+          They do not include analytics, telemetry, or remote logging.
+          There is no update check, no crash-report uploader, no opt-in
+          diagnostics. The binary is the same whether the machine is
+          air-gapped or on the open internet.
+        </p>
+        <p>
+          What the daemon does:
+        </p>
+        <ul class="prose-list">
+          <li>Reads log files you configure (e.g. <code>/var/log/auth.log</code>).</li>
+          <li>Writes ban state to a local file.</li>
+          <li>Installs firewall rules via direct netlink to the Linux kernel.</li>
+          <li>Serves IPC over a local Unix socket restricted to root + the <code>fail2zig</code> group.</li>
+          <li>Exposes optional Prometheus metrics on localhost only, by default.</li>
+        </ul>
+        <p>
+          The zero-dependency posture is empirically verifiable. See
+          <a href="/docs/guides/verifying-zero-dependencies">verifying zero dependencies</a>
+          for the operator recipe.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <div class="section-head">
+        <div class="eyebrow"><span class="dot"></span>05 &middot; Your rights</div>
+        <div>
+          <h2>GDPR, CCPA, PIPEDA — in plain language.</h2>
+        </div>
+      </div>
+
+      <div class="rows">
+        <div class="row">
+          <div class="row-k">Access</div>
+          <div class="row-v">
+            <p>
+              Ask us what we hold about you. The honest answer is:
+              whatever Cloudflare's edge logs contain for IPs matching
+              yours, during their retention window. We have nothing
+              additional stored on our side.
+            </p>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-k">Erasure</div>
+          <div class="row-v">
+            <p>
+              Cloudflare expires edge logs on its own schedule; we
+              cannot shorten it for individual records. We hold no
+              copies, so there is nothing on our side to erase.
+            </p>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-k">Rectification</div>
+          <div class="row-v">
+            <p>
+              The data is transient request metadata. Nothing to
+              correct.
+            </p>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-k">Objection / opt-out</div>
+          <div class="row-v">
+            <p>
+              Stop visiting the site, or block Cloudflare's analytics
+              endpoint at the browser level. Neither affects your
+              ability to read the content.
+            </p>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-k">Portability</div>
+          <div class="row-v">
+            <p>
+              There is no persistent record on our side to export.
+            </p>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-k">No sale, no sharing</div>
+          <div class="row-v">
+            <p>
+              We do not sell or share personal data. The opt-out signals
+              (Global Privacy Control, Do Not Track) are therefore
+              honored by construction.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <p class="rights-footer">
+        To exercise any of the above, email
+        <a href="mailto:devteam@corelift.io"><code>devteam@corelift.io</code></a>.
+        Best-effort response within 14 days.
+      </p>
+    </div>
+  </section>
+
+  <section class="section section--band">
+    <div class="wrap">
+      <div class="section-head">
+        <div class="eyebrow"><span class="dot"></span>06 &middot; Retention and changes</div>
+        <div>
+          <h2>How long things last, how changes are announced.</h2>
+        </div>
+      </div>
+
+      <div class="rows">
+        <div class="row">
+          <div class="row-k">Cloudflare Web Analytics</div>
+          <div class="row-v">
+            <p>Per Cloudflare's retention (aggregated, no user identification).</p>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-k">Cloudflare edge logs</div>
+          <div class="row-v">
+            <p>Per Cloudflare's logging retention for the plan this site runs on.</p>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-k">Demo ban state</div>
+          <div class="row-v">
+            <p>60-second kernel timeout. Zero-second persistence.</p>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-k">This policy</div>
+          <div class="row-v">
+            <p>
+              Versioned. Material changes are flagged in the
+              <a href="/changelog">site changelog</a>. The current
+              version and effective date appear at the top of this
+              page.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap lg-close">
+      <div>
+        <div class="eyebrow"><span class="dot"></span>Contact</div>
+        <h2>How to reach us.</h2>
+        <p>
+          Plain email works. Use the channel that matches the topic —
+          privacy and data rights on one, bugs on another, security
+          vulnerabilities on the third.
+        </p>
+      </div>
+      <div class="contact-grid">
+        <div class="contact-row">
+          <span class="row-k">Data rights</span>
+          <a href="mailto:devteam@corelift.io"><code>devteam@corelift.io</code></a>
+        </div>
+        <div class="contact-row">
+          <span class="row-k">General bugs / features</span>
+          <a href="https://github.com/ul0gic/fail2zig/issues" rel="noopener noreferrer">github.com/ul0gic/fail2zig/issues</a>
+        </div>
+        <div class="contact-row">
+          <span class="row-k">Security vulnerabilities</span>
+          <a href="https://github.com/ul0gic/fail2zig/security/advisories/new" rel="noopener noreferrer">private advisory form</a>
+        </div>
+        <div class="contact-row">
+          <span class="row-k">Operator</span>
+          <span>Corelift &middot; California, USA</span>
+        </div>
+      </div>
+    </div>
+  </section>
 </BaseLayout>
 
 <style>
-  .legal-stub {
-    padding: 96px 0 128px;
+  /* Hero — shared shape with /why + /threat-model */
+  .lg-hero {
+    padding: 96px 0 56px;
+    border-bottom: 1px solid var(--line);
   }
-  .legal-stub h1 {
-    font-size: clamp(32px, 3.4vw, 44px);
-    line-height: 1.08;
-    letter-spacing: -0.02em;
-    margin: 20px 0 16px;
+  .lg-hero h1 {
+    font-size: clamp(40px, 5vw, 64px);
+    margin: 24px 0;
+    letter-spacing: -0.025em;
   }
-  .legal-stub .lede {
-    margin-bottom: 40px;
-  }
-  .legal-stub h2 {
-    font-family: var(--mono);
-    font-size: 15px;
-    font-weight: 500;
-    color: var(--fg);
-    margin: 32px 0 12px;
-  }
-  .legal-stub p {
+  .lg-lede {
+    font-size: 19px;
+    line-height: 1.6;
     color: var(--fg-body);
-    line-height: 1.65;
     max-width: 68ch;
-    margin: 0 0 14px;
+    margin: 0;
+    text-wrap: pretty;
   }
-  .stub-note {
-    margin-top: 48px;
-    padding-top: 20px;
-    border-top: 1px dashed var(--line);
-    color: var(--fg-dim);
+  .lg-meta {
+    display: flex;
+    gap: 24px;
+    flex-wrap: wrap;
     font-family: var(--mono);
     font-size: 12px;
+    color: var(--fg-strong);
+  }
+  .lg-meta strong {
+    color: var(--fg-dim);
+    font-weight: 500;
+  }
+
+  /* Data-broker notice — prominent, gold top bar, row-style layout */
+  .data-broker-notice {
+    position: relative;
+    display: grid;
+    grid-template-columns: 220px 1fr;
+    gap: 48px;
+    border: 1px solid var(--line);
+    padding: 28px 32px;
+    align-items: start;
+  }
+  .data-broker-notice::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 2px;
+    background: var(--accent);
+  }
+  .dbn-label {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    padding-top: 2px;
+  }
+  .dbn-body p {
+    font-size: 15px;
+    line-height: 1.65;
+    color: var(--fg-body);
+    margin: 0;
+    max-width: 68ch;
+  }
+  .dbn-body strong {
+    color: var(--fg);
+    font-weight: 600;
+  }
+
+  /* Section head */
+  .section-head {
+    display: grid;
+    grid-template-columns: 220px 1fr;
+    gap: 48px;
+    margin-bottom: 40px;
+    align-items: baseline;
+  }
+  .section-head .eyebrow {
+    padding-top: 6px;
+  }
+  .section-head h2 {
+    font-size: clamp(24px, 2.4vw, 32px);
+    letter-spacing: -0.02em;
+    margin: 0;
+    max-width: 36ch;
+    text-wrap: balance;
+  }
+  .lg-sublede {
+    font-size: 15px;
+    color: var(--fg-body);
+    max-width: 64ch;
+    margin: 12px 0 0;
+    line-height: 1.6;
+  }
+  .lg-sublede strong {
+    color: var(--fg);
+    font-weight: 600;
+  }
+
+  /* Row table — same vocabulary as /why / .choice + /threat-model */
+  .rows {
+    border-top: 1px solid var(--line);
+  }
+  .row {
+    display: grid;
+    grid-template-columns: 260px 1fr;
+    gap: 48px;
+    padding: 22px 0;
+    border-bottom: 1px solid var(--line);
+    align-items: start;
+  }
+  .row-k {
+    font-family: var(--mono);
+    font-size: 14px;
+    color: var(--fg);
+    font-weight: 500;
+    padding-top: 2px;
+  }
+  .row-v p {
+    font-size: 15px;
+    line-height: 1.65;
+    color: var(--fg-body);
+    margin: 0;
+    max-width: 68ch;
+  }
+  .row-v a {
+    color: var(--accent);
+  }
+  .row-v a:hover {
+    text-decoration: underline;
+  }
+
+  /* "Never collected" list */
+  .never-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    border-top: 1px solid var(--line);
+  }
+  .never-list li {
+    padding: 14px 0;
+    border-bottom: 1px solid var(--line-hairline);
+    color: var(--fg-body);
+    font-size: 15px;
+    line-height: 1.6;
+    max-width: 78ch;
+  }
+  .never-list strong {
+    color: var(--fg);
+    font-weight: 600;
+  }
+
+  /* Prose + prose-list for section 04 */
+  .prose {
+    max-width: 68ch;
+  }
+  .prose p {
+    font-size: 15px;
+    line-height: 1.7;
+    color: var(--fg-body);
+    margin: 0 0 16px;
+  }
+  .prose p:last-child {
+    margin-bottom: 0;
+  }
+  .prose a {
+    color: var(--accent);
+  }
+  .prose-list {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 16px;
+  }
+  .prose-list li {
+    padding: 8px 0 8px 16px;
+    position: relative;
+    font-size: 15px;
+    line-height: 1.6;
+    color: var(--fg-body);
+  }
+  .prose-list li::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 16px;
+    width: 6px;
+    height: 2px;
+    background: var(--accent);
+  }
+
+  /* Code chips — consistent with /why + /threat-model */
+  .dbn-body code,
+  .row-v code,
+  .prose code,
+  .prose-list code,
+  .contact-row code {
+    font-family: var(--mono);
+    font-size: 0.9em;
+    color: var(--nav-fg);
+    background: var(--nav-bg);
+    border: 1px solid var(--nav-line);
+    padding: 1px 6px;
+  }
+
+  /* Rights footer */
+  .rights-footer {
+    font-size: 14px;
+    color: var(--fg-dim);
+    margin: 24px 0 0;
+    max-width: 68ch;
+    line-height: 1.6;
+  }
+  .rights-footer a {
+    color: var(--accent);
+  }
+
+  /* Close / contact */
+  .lg-close {
+    display: grid;
+    grid-template-columns: 1.2fr 1fr;
+    gap: 64px;
+    align-items: start;
+  }
+  .lg-close h2 {
+    font-size: clamp(24px, 2.4vw, 32px);
+    margin: 16px 0 16px;
+    max-width: 22ch;
+  }
+  .lg-close p {
+    font-size: 16px;
+    color: var(--fg-body);
+    max-width: 56ch;
+    margin: 0 0 24px;
+    line-height: 1.6;
+  }
+  .contact-grid {
+    border-top: 1px solid var(--line-hairline);
+  }
+  .contact-row {
+    display: grid;
+    grid-template-columns: 200px 1fr;
+    gap: 24px;
+    padding: 14px 0;
+    border-bottom: 1px solid var(--line-hairline);
+    font-size: 14px;
+    color: var(--fg-body);
+    align-items: center;
+  }
+  .contact-row a {
+    color: var(--accent);
+  }
+  .contact-row a:hover {
+    text-decoration: underline;
+  }
+
+  @media (max-width: 960px) {
+    .section-head,
+    .data-broker-notice,
+    .row,
+    .contact-row,
+    .lg-close {
+      grid-template-columns: 1fr;
+      gap: 12px;
+    }
+    .data-broker-notice {
+      padding: 24px 20px;
+    }
   }
 </style>
