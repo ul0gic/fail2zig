@@ -807,45 +807,14 @@ flowchart LR
 </BaseLayout>
 
 <script>
-  // Render any mermaid blocks on this page. Lazy import so the
-  // 500 KB mermaid bundle only loads on pages that actually have a
-  // diagram.
-  async function renderThreatModelMermaid() {
-    const blocks = Array.from(
-      document.querySelectorAll<HTMLElement>('pre.mermaid'),
-    );
-    if (blocks.length === 0) return;
-    const mermaid = (await import('mermaid')).default;
-    const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
-    mermaid.initialize({
-      startOnLoad: false,
-      theme: isDark ? 'dark' : 'neutral',
-      securityLevel: 'strict',
-      fontFamily: 'JetBrains Mono, ui-monospace, SFMono-Regular, monospace',
-      flowchart: { curve: 'basis', htmlLabels: true },
-    });
+  import {
+    findRawPreBlocks,
+    installMermaidModal,
+    renderMermaidTargets,
+  } from '@/lib/render-mermaid';
 
-    let n = 0;
-    for (const pre of blocks) {
-      const source = (pre.textContent || '').trim();
-      try {
-        const { svg } = await mermaid.render(`tm-mmd-${Date.now()}-${n++}`, source);
-        const container = document.createElement('div');
-        container.className = 'mermaid-rendered';
-        container.innerHTML = svg;
-        pre.replaceWith(container);
-      } catch (err) {
-        // Surface parse errors on-page so they are visible in the
-        // network tab and in view-source without a console open.
-        const errEl = document.createElement('pre');
-        errEl.className = 'mermaid-error';
-        errEl.textContent = 'mermaid render failed: ' + (err as Error).message;
-        pre.replaceWith(errEl);
-      }
-    }
-  }
-
-  void renderThreatModelMermaid();
+  installMermaidModal();
+  void renderMermaidTargets(findRawPreBlocks());
 </script>
 
 <style>

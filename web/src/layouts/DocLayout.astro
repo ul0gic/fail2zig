@@ -105,12 +105,6 @@ const showToc = (tocHeadings && tocHeadings.length > 0) || hasCustomToc;
     }
   </div>
 
-  <div class="mermaid-modal" id="mermaid-modal" role="dialog" aria-modal="true" aria-label="Enlarged diagram">
-    <div class="mermaid-modal-inner">
-      <button type="button" class="mermaid-modal-close" aria-label="Close">close</button>
-      <div class="mermaid-modal-content"></div>
-    </div>
-  </div>
 </BaseLayout>
 
 <style>
@@ -563,97 +557,12 @@ const showToc = (tocHeadings && tocHeadings.length > 0) || hasCustomToc;
 </script>
 
 <script>
-  // Mermaid rendering + click-to-enlarge modal.
-  // Lazy-loaded: only pulls mermaid when the page actually contains a diagram.
-  async function renderMermaid() {
-    const blocks = Array.from(
-      document.querySelectorAll<HTMLElement>('.doc-content code[data-language="mermaid"]'),
-    );
-    if (blocks.length === 0) return;
+  import {
+    findDocBlocks,
+    installMermaidModal,
+    renderMermaidTargets,
+  } from '@/lib/render-mermaid';
 
-    const mermaid = (await import('mermaid')).default;
-    const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
-    mermaid.initialize({
-      startOnLoad: false,
-      theme: isDark ? 'dark' : 'neutral',
-      securityLevel: 'strict',
-      fontFamily: 'JetBrains Mono, ui-monospace, SFMono-Regular, monospace',
-      flowchart: { curve: 'basis', htmlLabels: true },
-    });
-
-    let n = 0;
-    for (const code of blocks) {
-      const source = (code.textContent || '').trim();
-      const wrapper =
-        code.closest('figure[data-rehype-pretty-code-figure]') ?? code.closest('pre');
-      if (!wrapper) continue;
-
-      const placeholder = document.createElement('div');
-      placeholder.className = 'mermaid-loading';
-      placeholder.textContent = 'rendering diagram…';
-      wrapper.replaceWith(placeholder);
-
-      try {
-        const { svg } = await mermaid.render(`mmd-${Date.now()}-${n++}`, source);
-        const container = document.createElement('div');
-        container.className = 'mermaid-rendered';
-        container.setAttribute('role', 'button');
-        container.setAttribute('tabindex', '0');
-        container.setAttribute('aria-label', 'Click to enlarge diagram');
-        container.innerHTML = svg;
-        placeholder.replaceWith(container);
-      } catch (err) {
-        const errEl = document.createElement('pre');
-        errEl.className = 'mermaid-error';
-        errEl.textContent = 'mermaid render failed: ' + (err as Error).message;
-        placeholder.replaceWith(errEl);
-      }
-    }
-  }
-
-  function initMermaidModal() {
-    const modal = document.getElementById('mermaid-modal');
-    if (!modal) return;
-    const content = modal.querySelector<HTMLElement>('.mermaid-modal-content');
-    const closeBtn = modal.querySelector<HTMLButtonElement>('.mermaid-modal-close');
-    const inner = modal.querySelector<HTMLElement>('.mermaid-modal-inner');
-    if (!content || !closeBtn || !inner) return;
-
-    function open(svgSource: string) {
-      content!.innerHTML = svgSource;
-      modal!.classList.add('open');
-      document.body.style.overflow = 'hidden';
-    }
-    function close() {
-      modal!.classList.remove('open');
-      content!.innerHTML = '';
-      document.body.style.overflow = '';
-    }
-
-    document.addEventListener('click', (e) => {
-      const diagram = (e.target as HTMLElement).closest<HTMLElement>('.mermaid-rendered');
-      if (!diagram) return;
-      const svg = diagram.querySelector('svg');
-      if (!svg) return;
-      open(svg.outerHTML);
-    });
-    document.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.key === ' ') {
-        const active = document.activeElement as HTMLElement | null;
-        if (active && active.classList.contains('mermaid-rendered')) {
-          e.preventDefault();
-          const svg = active.querySelector('svg');
-          if (svg) open(svg.outerHTML);
-        }
-      }
-      if (e.key === 'Escape' && modal!.classList.contains('open')) close();
-    });
-    closeBtn.addEventListener('click', close);
-    modal.addEventListener('click', (e) => {
-      if (e.target === modal) close();
-    });
-  }
-
-  initMermaidModal();
-  void renderMermaid();
+  installMermaidModal();
+  void renderMermaidTargets(findDocBlocks());
 </script>

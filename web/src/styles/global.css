@@ -1,41 +1,11 @@
 @import 'tailwindcss';
-@import 'tw-animate-css';
 @import './theme.css';
 
 /*
- * shadcn/ui token aliases mapped to our OKLCH palette.
- * shadcn components reference these names via bg-background, text-foreground,
- * border-border, etc. Keeping the aliases here means components work out of the
- * box without re-theming each one.
- */
-:root {
-  --background: var(--bg);
-  --foreground: var(--fg);
-  --card: var(--bg);
-  --card-foreground: var(--fg);
-  --popover: var(--bg-soft);
-  --popover-foreground: var(--fg);
-  --primary: var(--fg);
-  --primary-foreground: var(--bg);
-  --secondary: var(--bg-soft);
-  --secondary-foreground: var(--fg);
-  --muted: var(--bg-soft);
-  --muted-foreground: var(--fg-mute);
-  --accent-ui: var(--accent-ghost);
-  --accent-foreground: var(--fg);
-  --destructive: var(--danger);
-  --destructive-foreground: var(--bg);
-  --border: var(--line-strong);
-  --input: var(--line-strong);
-  --ring: var(--accent);
-  --radius: 2px;
-}
-
-/*
- * Tailwind 4 CSS-first config: expose the OKLCH theme tokens as
- * Tailwind utility classes (bg-bg, text-fg, border-line, etc.) while
- * keeping the raw CSS custom properties from theme.css intact for
- * direct use in component styles ported from the mockups.
+ * Tailwind 4 CSS-first config: expose the theme tokens from theme.css
+ * as Tailwind utility classes (bg-bg, text-fg, border-line, etc.)
+ * while keeping the raw CSS custom properties intact for direct use
+ * in component styles.
  */
 @theme inline {
   --color-bg: var(--bg);
@@ -56,25 +26,4 @@
   --font-sans: var(--sans);
   --font-serif: var(--serif);
   --radius-lg: var(--radius-lg);
-
-  /* shadcn/ui token bridge */
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --color-card: var(--card);
-  --color-card-foreground: var(--card-foreground);
-  --color-popover: var(--popover);
-  --color-popover-foreground: var(--popover-foreground);
-  --color-primary: var(--primary);
-  --color-primary-foreground: var(--primary-foreground);
-  --color-secondary: var(--secondary);
-  --color-secondary-foreground: var(--secondary-foreground);
-  --color-muted: var(--muted);
-  --color-muted-foreground: var(--muted-foreground);
-  --color-accent-ui: var(--accent-ui);
-  --color-accent-foreground: var(--accent-foreground);
-  --color-destructive: var(--destructive);
-  --color-destructive-foreground: var(--destructive-foreground);
-  --color-border: var(--border);
-  --color-input: var(--input);
-  --color-ring: var(--ring);
 }

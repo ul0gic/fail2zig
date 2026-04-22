@@ -1,21 +1,18 @@
 import { defineConfig } from 'astro/config';
-import cloudflare from '@astrojs/cloudflare';
-import react from '@astrojs/react';
-import mdx from '@astrojs/mdx';
 import tailwindcss from '@tailwindcss/vite';
 import rehypePrettyCode from 'rehype-pretty-code';
 import rehypeSlug from 'rehype-slug';
 import rehypeAutolinkHeadings from 'rehype-autolink-headings';
 
+// Pure static build — Astro's default output drops straight into
+// Cloudflare Pages without any adapter. No SSR, no image-service
+// compile step, no wrangler dependency.
+//
 // https://astro.build/config
 export default defineConfig({
   site: 'https://fail2zig.com',
   output: 'static',
   server: { host: true },
-  adapter: cloudflare({
-    imageService: 'compile',
-  }),
-  integrations: [react(), mdx()],
   markdown: {
     syntaxHighlight: false,
     rehypePlugins: [

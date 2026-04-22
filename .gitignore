@@ -19,3 +19,15 @@ node_modules/
 
 # Secrets
 .env
+
+# Accidental artifacts at repo root — this is a Zig project, any
+# package.json or lockfile here is from pnpm being run at the wrong
+# cwd. Real Node manifests live under web/ only.
+/package.json
+/pnpm-lock.yaml
+
+# Debug / macOS screenshots. Narrow-no-break-space in macOS filenames,
+# so the literal 'Screenshot*.png' pattern is deliberate.
+Screenshot*.png
+Screenshot*.jpg
+Screenshot*.jpeg
