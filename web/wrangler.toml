@@ -9,10 +9,14 @@ workers_dev = false
 
 [assets]
 directory = "./dist"
-binding = "ASSETS"
 # Astro emits a real per-page dist/404.html. Serve it on miss instead
 # of treating this as an SPA that rewrites everything to index.html.
 not_found_handling = "404-page"
+# NOTE: the `binding = "ASSETS"` field is intentionally absent. That
+# binding is only legal when this Worker also has a `main` script to
+# serve dynamic routes. Phase 9B adds that script (for /api/whoami,
+# /trigger/*, and the WebSocket feed) and will restore the binding
+# so the Worker can fall through to static assets after its handlers.
 
 [[routes]]
 pattern = "fail2zig.com/*"
