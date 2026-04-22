@@ -10,6 +10,9 @@ workers_dev = false
 [assets]
 directory = "./dist"
 binding = "ASSETS"
+# Astro emits a real per-page dist/404.html. Serve it on miss instead
+# of treating this as an SPA that rewrites everything to index.html.
+not_found_handling = "404-page"
 
 [[routes]]
 pattern = "fail2zig.com/*"
