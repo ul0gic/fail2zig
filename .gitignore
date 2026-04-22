@@ -8,11 +8,27 @@ zig-cache/
 .zig-cache/
 node_modules/
 
+# web/ Astro subproject build artifacts
+web/dist/
+web/.astro/
+
+# Node debug logs (web/)
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+
 # Editor/OS cruft
 .DS_Store
 *.o
 *.d
 *.swp
+
+# Editors / IDEs
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
 
 # Playwright
 .playwright-mcp/
