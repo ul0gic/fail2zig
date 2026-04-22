@@ -139,13 +139,13 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
           </div>
         </div>
         <div class="row">
-          <div class="row-k">AWS (Lightsail, us-east-2)</div>
+          <div class="row-k">AWS</div>
           <div class="row-v">
             <p>
-              Hosts the demo origin when the live demo is running.
-              Only Cloudflare IP ranges can reach it; your browser
-              never talks to Lightsail directly. AWS's privacy posture
-              is governed by
+              Hosts the honeypot VM that powers the live demo. The VM
+              reaches Cloudflare outbound only — your browser never
+              talks to it directly. AWS's privacy posture is governed
+              by
               <a href="https://aws.amazon.com/privacy/" rel="noopener noreferrer">aws.amazon.com/privacy</a>.
             </p>
           </div>

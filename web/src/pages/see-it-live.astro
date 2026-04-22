@@ -8,17 +8,18 @@ import MetricsPane from '@/components/see-it-live/MetricsPane.astro';
 
 <BaseLayout
   title="See it Live — fail2zig"
-  description="A real Lightsail honeypot, tailed by fail2zig, defending itself against live attackers in real time. Live WebSocket feed of attack_detected, ip_banned, and ip_unbanned events."
+  description="A real internet-exposed honeypot, tailed by fail2zig, defending itself against live attackers in real time. Live WebSocket feed of attack_detected, ip_banned, and ip_unbanned events."
   activeNav="/see-it-live"
 >
   <div class="live-wrap">
     <header class="live-intro">
       <h1>See it live</h1>
       <p class="live-lede">
-        A single Lightsail VM in Ohio runs <code>sshd</code> and <code>nginx</code>
-        on the open internet. fail2zig tails their logs and installs real kernel-level
-        <code>nftables</code> DROP rules against real attackers. Everything below is live —
-        no synthesised events, no dashboards dressed up as daemons, no demo button.
+        A small Linux VM runs <code>sshd</code> and <code>nginx</code> on the open
+        internet — no valid credentials, no dynamic content, just attack bait.
+        fail2zig tails their logs and installs real kernel-level <code>nftables</code>
+        DROP rules against real attackers. Everything below is live — no synthesised
+        events, no dashboards dressed up as daemons, no demo button.
       </p>
     </header>
 
