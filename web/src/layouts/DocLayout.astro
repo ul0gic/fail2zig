@@ -1,0 +1,659 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from './BaseLayout.astro';
+
+interface TocHeading {
+  depth: number;
+  slug: string;
+  text: string;
+}
+
+interface Props {
+  title: string;
+  description?: string | undefined;
+  activeSlug?: string | undefined;
+  breadcrumb?: string | undefined;
+  tocHeadings?: TocHeading[] | undefined;
+  lastVerified?: string | undefined;
+}
+
+const { title, description, activeSlug, breadcrumb, tocHeadings, lastVerified } = Astro.props;
+
+// Sidebar is built identically on every docs page so nav stays stable.
+interface SidebarSection {
+  label: string;
+  items: { slug: string; title: string; position: number }[];
+}
+
+const allDocs = await getCollection('docs');
+const sectionMap = new Map<string, SidebarSection>();
+
+for (const doc of allDocs) {
+  const parts = doc.id.split('--');
+  const category = doc.data.category ?? (parts.length > 1 ? (parts[0] ?? 'General') : 'General');
+  const slug = doc.id.replace(/--/g, '/');
+
+  if (!sectionMap.has(category)) {
+    sectionMap.set(category, { label: category, items: [] });
+  }
+  sectionMap.get(category)?.items.push({
+    slug,
+    title: doc.data.title,
+    position: doc.data.sidebar_position ?? 99,
+  });
+}
+
+for (const section of sectionMap.values()) {
+  section.items.sort((a, b) => a.position - b.position);
+}
+
+const sections = Array.from(sectionMap.values());
+const hasCustomToc = Astro.slots.has('toc');
+const hasActions = Astro.slots.has('actions');
+const showToc = (tocHeadings && tocHeadings.length > 0) || hasCustomToc;
+---
+
+<BaseLayout title={title} description={description} activeNav="/docs">
+  <div class:list={['doc-layout', { 'no-toc': !showToc }]}>
+    <aside class="sidebar">
+      {
+        sections.map((section) => (
+          <>
+            <h5>{section.label}</h5>
+            {section.items.map((item) => (
+              <a href={`/docs/${item.slug}`} class={activeSlug === item.slug ? 'active' : ''}>
+                {item.title}
+              </a>
+            ))}
+          </>
+        ))
+      }
+    </aside>
+
+    <main class="doc-main">
+      {breadcrumb && <div class="breadcrumb" set:html={breadcrumb} />}
+      <div class="doc-content">
+        <slot />
+      </div>
+      {hasActions && <div class="doc-actions"><slot name="actions" /></div>}
+    </main>
+
+    {
+      showToc && (
+        <aside class="toc">
+          {tocHeadings && tocHeadings.length > 0 ? (
+            <>
+              <h5>On this page</h5>
+              {tocHeadings.map((h) => (
+                <a href={`#${h.slug}`} class={`depth-${String(h.depth)}`}>
+                  {h.text}
+                </a>
+              ))}
+            </>
+          ) : (
+            <slot name="toc" />
+          )}
+          {lastVerified && (
+            <div class="toc-meta">
+              last verified
+              <br />
+              <span>{lastVerified}</span>
+            </div>
+          )}
+        </aside>
+      )
+    }
+  </div>
+
+  <div class="mermaid-modal" id="mermaid-modal" role="dialog" aria-modal="true" aria-label="Enlarged diagram">
+    <div class="mermaid-modal-inner">
+      <button type="button" class="mermaid-modal-close" aria-label="Close">close</button>
+      <div class="mermaid-modal-content"></div>
+    </div>
+  </div>
+</BaseLayout>
+
+<style>
+  .doc-layout {
+    display: grid;
+    grid-template-columns: 260px minmax(0, 1fr) 220px;
+    gap: 48px;
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 32px;
+    min-height: calc(100vh - 60px);
+  }
+  .doc-layout.no-toc {
+    grid-template-columns: 260px minmax(0, 1fr);
+    max-width: 1080px;
+  }
+  aside.sidebar {
+    border-right: 1px solid var(--line-soft);
+    padding-right: 24px;
+    position: sticky;
+    top: 70px;
+    height: calc(100vh - 96px);
+    overflow-y: auto;
+    font-family: var(--mono);
+    font-size: 14px;
+  }
+  .sidebar h5 {
+    font-size: 12px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--fg-dim);
+    margin: 24px 0 8px;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .sidebar h5::before {
+    content: '';
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    background: var(--accent);
+    transform: translateY(-1px);
+  }
+  .sidebar h5:first-of-type {
+    margin-top: 0;
+  }
+  .sidebar a {
+    display: block;
+    padding: 6px 0;
+    color: var(--fg-body);
+    border-left: 2px solid transparent;
+    padding-left: 12px;
+    margin-left: -10px;
+    transition: color 0.12s, border-left-color 0.12s, background 0.12s;
+  }
+  .sidebar a:hover {
+    color: var(--fg);
+    background: linear-gradient(90deg, var(--bg-elev) 0%, transparent 80%);
+  }
+  .sidebar a.active {
+    color: var(--accent);
+    border-left-color: var(--accent);
+    font-weight: 500;
+  }
+
+  .doc-main {
+    min-width: 0;
+  }
+  .breadcrumb {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--fg-strong);
+    margin-bottom: 16px;
+  }
+  .breadcrumb :global(span) {
+    color: var(--accent);
+  }
+
+  .doc-content :global(h1) {
+    font-size: 40px;
+    margin-bottom: 24px;
+  }
+  .doc-content :global(h2) {
+    font-size: 24px;
+    margin: 48px 0 16px;
+    padding-top: 24px;
+    border-top: 1px solid var(--line-soft);
+  }
+  .doc-content :global(h3) {
+    font-size: 15px;
+    font-family: var(--sans);
+    font-weight: 600;
+    color: var(--fg);
+    margin: 36px 0 8px;
+    letter-spacing: -0.01em;
+  }
+  .doc-content :global(h3 + p),
+  .doc-content :global(h3 + ul),
+  .doc-content :global(h3 + ol) {
+    margin-top: 0;
+  }
+  .doc-content :global(p) {
+    color: var(--fg-body);
+    max-width: 68ch;
+    margin: 0 0 16px;
+  }
+  .doc-content :global(ul) {
+    color: var(--fg-body);
+    max-width: 68ch;
+    padding-left: 20px;
+  }
+  .doc-content :global(li) {
+    margin: 6px 0;
+  }
+  .doc-content :global(code:not(pre code)) {
+    background: var(--nav-bg);
+    border: 1px solid var(--nav-line);
+    padding: 1px 6px;
+    font-size: 0.9em;
+    color: var(--nav-fg);
+  }
+  .doc-content :global(figure[data-rehype-pretty-code-figure]) {
+    margin: 16px 0;
+    position: relative;
+  }
+  .doc-content :global(figure[data-rehype-pretty-code-figure] pre) {
+    margin: 0;
+  }
+  .doc-content :global(pre) {
+    background: var(--nav-bg);
+    border: 1px solid var(--nav-line);
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.6;
+    padding: 16px 20px;
+    color: var(--nav-fg);
+    overflow-x: auto;
+    margin: 16px 0;
+  }
+  .doc-content :global(pre code) {
+    background: transparent;
+    border: 0;
+    padding: 0;
+    color: inherit;
+  }
+  .doc-content :global(.mermaid-rendered) {
+    background: var(--bg);
+    border: 1px solid var(--line);
+    padding: 24px;
+    margin: 16px 0;
+    text-align: center;
+    overflow-x: auto;
+    cursor: zoom-in;
+    transition: border-color 0.12s;
+  }
+  .doc-content :global(.mermaid-rendered:hover) {
+    border-color: var(--accent);
+  }
+  .doc-content :global(.mermaid-rendered svg) {
+    max-width: 100%;
+    height: auto;
+  }
+  .doc-content :global(.mermaid-loading) {
+    background: var(--bg-elev);
+    border: 1px dashed var(--line);
+    padding: 24px;
+    margin: 16px 0;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--fg-mute);
+    text-align: center;
+  }
+  .doc-content :global(.mermaid-error) {
+    background: var(--bg-elev);
+    border: 1px solid var(--danger);
+    padding: 16px;
+    margin: 16px 0;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--danger);
+    white-space: pre-wrap;
+  }
+
+  :global(.mermaid-modal) {
+    position: fixed;
+    inset: 0;
+    background: rgba(10, 10, 10, 0.82);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+    padding: 32px;
+    cursor: zoom-out;
+  }
+  :global(.mermaid-modal.open) {
+    display: flex;
+  }
+  :global(.mermaid-modal-inner) {
+    background: var(--bg);
+    border: 1px solid var(--line);
+    padding: 48px;
+    width: min(95vw, 1400px);
+    height: min(92vh, 1000px);
+    overflow: auto;
+    cursor: default;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  :global(.mermaid-modal-content) {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  :global(.mermaid-modal-content svg) {
+    width: 100% !important;
+    height: 100% !important;
+    max-width: none !important;
+    max-height: none !important;
+    display: block;
+  }
+  :global(.mermaid-modal-close) {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    background: transparent;
+    border: 1px solid var(--line);
+    color: var(--fg-mute);
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 4px 10px;
+    cursor: pointer;
+  }
+  :global(.mermaid-modal-close:hover) {
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+  .doc-content :global(blockquote) {
+    border-left: 2px solid var(--accent);
+    background: color-mix(in oklab, var(--bg-elev) 55%, transparent);
+    padding: 12px 20px;
+    margin: 4px 0 32px;
+    font-size: 14px;
+    color: var(--fg-body);
+  }
+  .doc-content :global(blockquote strong) {
+    color: var(--fg);
+    font-family: var(--mono);
+    font-weight: 500;
+  }
+  .doc-content :global(table) {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+    margin: 16px 0;
+  }
+  .doc-content :global(th),
+  .doc-content :global(td) {
+    text-align: left;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--line-soft);
+    vertical-align: top;
+  }
+  .doc-content :global(th) {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--fg-dim);
+    font-weight: 500;
+    background: var(--bg-elev);
+  }
+  .doc-content :global(a) {
+    color: var(--accent);
+  }
+  .doc-content :global(.heading-anchor) {
+    color: var(--fg-strong);
+    margin-left: 8px;
+    text-decoration: none;
+    opacity: 0;
+    transition: opacity 0.15s, color 0.12s;
+  }
+  .doc-content :global(h2:hover .heading-anchor),
+  .doc-content :global(h3:hover .heading-anchor) {
+    opacity: 1;
+  }
+  .doc-content :global(.heading-anchor:hover) {
+    color: var(--fg);
+  }
+
+  .doc-actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 48px;
+    padding-top: 24px;
+    border-top: 1px solid var(--line-soft);
+  }
+
+  :global(.code-copy-btn) {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    background: transparent;
+    border: 1px solid var(--nav-line);
+    color: var(--nav-fg-mute);
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 2px 8px;
+    cursor: pointer;
+  }
+  :global(.code-copy-btn:hover) {
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+
+  .toc {
+    position: sticky;
+    top: 70px;
+    height: calc(100vh - 96px);
+    overflow-y: auto;
+    font-family: var(--mono);
+    font-size: 12px;
+    padding-left: 16px;
+    border-left: 1px solid var(--line-soft);
+  }
+  .toc h5 {
+    font-size: 12px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--fg-dim);
+    margin: 0 0 10px;
+    font-weight: 500;
+  }
+  .toc :global(a) {
+    display: block;
+    padding: 4px 0;
+    color: var(--fg-strong);
+    border-left: 2px solid transparent;
+    padding-left: 10px;
+    margin-left: -10px;
+    transition: color 0.15s, border-left-color 0.15s;
+  }
+  .toc :global(a:hover) {
+    color: var(--fg);
+  }
+  .toc :global(a.depth-3) {
+    padding-left: 22px;
+  }
+  .toc :global(a.active) {
+    color: var(--accent);
+    border-left-color: var(--accent);
+  }
+  .toc-meta {
+    margin-top: 32px;
+    padding-top: 16px;
+    border-top: 1px solid var(--line-soft);
+    color: var(--fg-faint);
+    font-size: 11px;
+  }
+  .toc-meta span {
+    color: var(--fg-faint);
+  }
+
+  @media (max-width: 1100px) {
+    .doc-layout {
+      grid-template-columns: 240px 1fr;
+    }
+    .toc {
+      display: none;
+    }
+  }
+  @media (max-width: 800px) {
+    .doc-layout {
+      grid-template-columns: 1fr;
+      padding: 16px;
+    }
+    aside.sidebar {
+      position: static;
+      height: auto;
+      border-right: none;
+      border-bottom: 1px solid var(--line-soft);
+      padding-bottom: 24px;
+    }
+  }
+</style>
+
+<script is:inline>
+  // Scroll-spy for the right-hand TOC: highlight the section the reader is viewing.
+  (function () {
+    var toc = document.querySelector('.toc');
+    if (!toc) return;
+    var links = Array.from(toc.querySelectorAll('a[href^="#"]'));
+    if (links.length === 0) return;
+
+    var targets = links
+      .map(function (link) {
+        var href = link.getAttribute('href') || '';
+        var id = href.slice(1);
+        var el = id ? document.getElementById(id) : null;
+        return el ? { link: link, el: el } : null;
+      })
+      .filter(Boolean);
+
+    if (targets.length === 0) return;
+
+    var setActive = function (link) {
+      links.forEach(function (l) {
+        l.classList.remove('active');
+      });
+      link.classList.add('active');
+    };
+
+    // Initial: if hash in URL, sync to it; otherwise mark first link.
+    var initial = targets.find(function (t) {
+      return window.location.hash && t.link.getAttribute('href') === window.location.hash;
+    });
+    setActive(initial ? initial.link : targets[0].link);
+
+    var observer = new IntersectionObserver(
+      function (entries) {
+        // Pick the topmost visible section among those currently intersecting.
+        var visible = entries
+          .filter(function (e) {
+            return e.isIntersecting;
+          })
+          .sort(function (a, b) {
+            return a.boundingClientRect.top - b.boundingClientRect.top;
+          });
+        if (visible.length === 0) return;
+        var target = targets.find(function (t) {
+          return t.el === visible[0].target;
+        });
+        if (target) setActive(target.link);
+      },
+      {
+        rootMargin: '-80px 0px -60% 0px',
+        threshold: [0, 0.1],
+      }
+    );
+
+    targets.forEach(function (t) {
+      observer.observe(t.el);
+    });
+  })();
+</script>
+
+<script>
+  // Mermaid rendering + click-to-enlarge modal.
+  // Lazy-loaded: only pulls mermaid when the page actually contains a diagram.
+  async function renderMermaid() {
+    const blocks = Array.from(
+      document.querySelectorAll<HTMLElement>('.doc-content code[data-language="mermaid"]'),
+    );
+    if (blocks.length === 0) return;
+
+    const mermaid = (await import('mermaid')).default;
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: isDark ? 'dark' : 'neutral',
+      securityLevel: 'strict',
+      fontFamily: 'JetBrains Mono, ui-monospace, SFMono-Regular, monospace',
+      flowchart: { curve: 'basis', htmlLabels: true },
+    });
+
+    let n = 0;
+    for (const code of blocks) {
+      const source = (code.textContent || '').trim();
+      const wrapper =
+        code.closest('figure[data-rehype-pretty-code-figure]') ?? code.closest('pre');
+      if (!wrapper) continue;
+
+      const placeholder = document.createElement('div');
+      placeholder.className = 'mermaid-loading';
+      placeholder.textContent = 'rendering diagram…';
+      wrapper.replaceWith(placeholder);
+
+      try {
+        const { svg } = await mermaid.render(`mmd-${Date.now()}-${n++}`, source);
+        const container = document.createElement('div');
+        container.className = 'mermaid-rendered';
+        container.setAttribute('role', 'button');
+        container.setAttribute('tabindex', '0');
+        container.setAttribute('aria-label', 'Click to enlarge diagram');
+        container.innerHTML = svg;
+        placeholder.replaceWith(container);
+      } catch (err) {
+        const errEl = document.createElement('pre');
+        errEl.className = 'mermaid-error';
+        errEl.textContent = 'mermaid render failed: ' + (err as Error).message;
+        placeholder.replaceWith(errEl);
+      }
+    }
+  }
+
+  function initMermaidModal() {
+    const modal = document.getElementById('mermaid-modal');
+    if (!modal) return;
+    const content = modal.querySelector<HTMLElement>('.mermaid-modal-content');
+    const closeBtn = modal.querySelector<HTMLButtonElement>('.mermaid-modal-close');
+    const inner = modal.querySelector<HTMLElement>('.mermaid-modal-inner');
+    if (!content || !closeBtn || !inner) return;
+
+    function open(svgSource: string) {
+      content!.innerHTML = svgSource;
+      modal!.classList.add('open');
+      document.body.style.overflow = 'hidden';
+    }
+    function close() {
+      modal!.classList.remove('open');
+      content!.innerHTML = '';
+      document.body.style.overflow = '';
+    }
+
+    document.addEventListener('click', (e) => {
+      const diagram = (e.target as HTMLElement).closest<HTMLElement>('.mermaid-rendered');
+      if (!diagram) return;
+      const svg = diagram.querySelector('svg');
+      if (!svg) return;
+      open(svg.outerHTML);
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        const active = document.activeElement as HTMLElement | null;
+        if (active && active.classList.contains('mermaid-rendered')) {
+          e.preventDefault();
+          const svg = active.querySelector('svg');
+          if (svg) open(svg.outerHTML);
+        }
+      }
+      if (e.key === 'Escape' && modal!.classList.contains('open')) close();
+    });
+    closeBtn.addEventListener('click', close);
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) close();
+    });
+  }
+
+  initMermaidModal();
+  void renderMermaid();
+</script>

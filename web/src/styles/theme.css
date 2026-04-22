@@ -1,23 +1,63 @@
-/* fail2zig theme tokens */
+/* fail2zig theme tokens — "Warm Paper + Black Nav" palette.
+ * Calibrated for editorial contrast: 4-tier ink scale, 3 rule strengths,
+ * selective section banding. No white surfaces on the body. No shadows.
+ */
 :root {
-  --bg: oklch(0.16 0.008 80);
-  --bg-elev: oklch(0.20 0.008 80);
-  --bg-soft: oklch(0.22 0.008 80);
-  --line: oklch(0.28 0.01 80);
-  --line-soft: oklch(0.24 0.01 80);
-  --fg: oklch(0.94 0.01 80);
-  --fg-dim: oklch(0.72 0.01 80);
-  --fg-mute: oklch(0.55 0.01 80);
-  --accent: oklch(0.80 0.14 75);
-  --accent-dim: oklch(0.60 0.14 75);
-  --accent-ghost: oklch(0.30 0.08 75);
-  --safe: oklch(0.78 0.14 155);
-  --safe-dim: oklch(0.50 0.10 155);
-  --danger: oklch(0.70 0.18 25);
+  /* Paper surface */
+  --bg: #F3EFE6;
+  --bg-elev: #EEE8DD;
+  --bg-soft: #EEE8DD;
+  --bg-band: #ECE7DC;
+
+  /* Rules — three strengths for editorial hierarchy */
+  --line-hairline: #DDD5C5;
+  --line: #CEC5B5;
+  --line-strong: #B0A692;
+  /* Back-compat alias for mockup-ported code that still references --line-soft */
+  --line-soft: var(--line-hairline);
+
+  /* Ink — five-tier scale: heading → strong → body → dim → faint.
+   * fg-strong sits between headings and body. Use for:
+   * table row leaders, command text, key metric values, terminal strong lines. */
+  --fg: #171717;
+  --fg-strong: #2B2926;
+  --fg-body: #4E4942;
+  --fg-dim: #6E675E;
+  --fg-faint: #8C8478;
+  /* Back-compat alias for mockup-ported code that still references --fg-mute */
+  --fg-mute: var(--fg-faint);
+
+  /* Accent — dry amber, editorial-mark, never neon */
+  --accent: #C69418;
+  --accent-dim: #A97D12;
+  --accent-ghost: #EFE3C7;
+
+  /* Dark code surface */
+  --surface-ink: #2A2927;
+
+  /* Diagram node fill — defaults to page bg so nodes blend; overridden in dark */
+  --diagram-surface: var(--bg);
+
+  /* Inverted nav/footer */
+  --nav-bg: #0A0A0A;
+  --nav-bg-soft: #1A1A18;
+  --nav-line: #2A2926;
+  --nav-fg: #ECE7DE;
+  --nav-fg-dim: #B5B0A6;
+  --nav-fg-mute: #7A746C;
+
+  /* Status */
+  --safe: #2D7D46;
+  --safe-dim: #1F5A32;
+  --danger: #B91C1C;
+
+  /* Fonts */
   --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-  --sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --sans: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --serif: "IBM Plex Serif", Georgia, "Times New Roman", serif;
+
   --radius: 2px;
-  --radius-lg: 4px;
+  --radius-lg: 2px;
   --step: 8px;
 }
 
@@ -36,6 +76,40 @@
   --safe: oklch(0.48 0.14 155);
   --safe-dim: oklch(0.70 0.10 155);
   --danger: oklch(0.55 0.20 25);
+}
+
+:root[data-theme="dark"] {
+  /* Near-black surfaces with a subtle warm tint so it doesn't feel sterile */
+  --bg: rgb(31, 31, 30);
+  --bg-elev: rgb(40, 40, 38);
+  --bg-soft: rgb(37, 37, 35);
+  --bg-band: rgb(24, 24, 23);
+
+  /* Rules — three strengths, lifted for visibility on dark bg */
+  --line-hairline: oklch(0.28 0.008 80);
+  --line: oklch(0.35 0.008 80);
+  --line-strong: oklch(0.48 0.01 80);
+
+  /* Ink scale — inverted. Heading → strong → body → dim → faint. */
+  --fg: oklch(0.96 0.005 80);
+  --fg-strong: oklch(0.88 0.005 80);
+  --fg-body: oklch(0.78 0.005 80);
+  --fg-dim: oklch(0.62 0.008 80);
+  --fg-faint: oklch(0.48 0.008 80);
+
+  /* Same orange as light mode, brightened slightly for dark-bg legibility */
+  --accent: oklch(0.74 0.17 60);
+  --accent-dim: oklch(0.60 0.14 60);
+  --accent-ghost: oklch(0.32 0.08 60);
+
+  --surface-ink: oklch(0.09 0.005 80);
+
+  /* Lift diagram nodes above the dark body for visual depth */
+  --diagram-surface: rgb(44, 44, 43);
+
+  --safe: oklch(0.70 0.14 155);
+  --safe-dim: oklch(0.55 0.10 155);
+  --danger: oklch(0.68 0.22 25);
 }
 
 * { box-sizing: border-box; }
@@ -63,17 +137,26 @@ pre { margin: 0; }
   position: sticky;
   top: 0;
   z-index: 20;
-  background: color-mix(in oklab, var(--bg) 85%, transparent);
-  backdrop-filter: blur(10px);
-  border-bottom: 1px solid var(--line-soft);
+  /* Nav runs its own ink palette so children inherit dark-appropriate tones. */
+  --bg: var(--nav-bg);
+  --bg-elev: var(--nav-bg-soft);
+  --bg-soft: var(--nav-bg-soft);
+  --line: var(--nav-line);
+  --line-soft: var(--nav-line);
+  --fg: var(--nav-fg);
+  --fg-dim: var(--nav-fg-dim);
+  --fg-mute: var(--nav-fg-mute);
+  background: var(--nav-bg);
+  color: var(--nav-fg);
+  border-bottom: 1px solid var(--nav-line);
 }
 .nav-inner {
-  max-width: 1280px;
+  max-width: 1440px;
   margin: 0 auto;
-  padding: 14px 32px;
+  padding: 8px 32px;
   display: flex;
   align-items: center;
-  gap: 32px;
+  gap: 24px;
 }
 .brand {
   font-family: var(--mono);
@@ -97,20 +180,22 @@ pre { margin: 0; }
 .brand-slash { color: var(--fg-mute); font-weight: 400; }
 .nav-links {
   display: flex;
-  gap: 4px;
+  flex: 1;
+  justify-content: center;
+  gap: 2px;
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: 14px;
   color: var(--fg-dim);
-  margin-left: 24px;
+  white-space: nowrap;
 }
 .nav-links a {
-  padding: 6px 10px;
+  padding: 6px 8px;
   border-radius: var(--radius);
   transition: color .15s, background .15s;
 }
 .nav-links a:hover { color: var(--fg); background: var(--bg-elev); }
 .nav-links a.active { color: var(--accent); }
-.nav-right { margin-left: auto; display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 13px; }
+.nav-right { margin-left: auto; display: flex; align-items: center; gap: 4px; font-family: var(--mono); font-size: 14px; white-space: nowrap; }
 .nav-right a { color: var(--fg-dim); padding: 6px 10px; }
 .nav-right a:hover { color: var(--fg); }
 .nav-cta {
@@ -144,24 +229,42 @@ pre { margin: 0; }
   display: inline-flex;
   align-items: center;
   gap: 10px;
-  padding: 12px 18px;
+  padding: 12px 20px;
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 500;
-  border: 1px solid var(--line);
-  background: var(--bg-elev);
+  letter-spacing: 0;
+  border-radius: var(--radius);
+  border: 1px solid var(--line-strong);
+  background: transparent;
   color: var(--fg);
   cursor: pointer;
-  transition: border-color .15s, background .15s, color .15s;
+  transition: background .15s ease, color .15s ease, border-color .15s ease;
 }
-.btn:hover { border-color: var(--accent); color: var(--accent); }
-.btn.primary {
-  background: var(--accent);
+.btn:hover {
+  background: var(--fg);
   color: var(--bg);
-  border-color: var(--accent);
+  border-color: var(--fg);
 }
-.btn.primary:hover { background: var(--fg); border-color: var(--fg); color: var(--bg); }
-.btn.ghost { background: transparent; }
+.btn.primary {
+  background: #0A0A0A;
+  color: #ECE7DE;
+  border-color: #0A0A0A;
+}
+.btn.primary:hover {
+  background: transparent;
+  color: var(--fg);
+  border-color: var(--fg);
+}
+.btn.ghost {
+  border-color: var(--line-strong);
+  color: var(--fg);
+}
+.btn.ghost:hover {
+  background: transparent;
+  color: var(--fg);
+  border-color: var(--fg);
+}
 
 /* ---- typography scale ---- */
 .eyebrow {
@@ -169,7 +272,7 @@ pre { margin: 0; }
   font-size: 11px;
   letter-spacing: 0.12em;
   text-transform: uppercase;
-  color: var(--fg-mute);
+  color: var(--fg-dim);
 }
 .eyebrow .dot {
   display: inline-block;
@@ -184,12 +287,16 @@ h1 { font-size: clamp(40px, 5.5vw, 72px); line-height: 1.02; }
 h2 { font-size: clamp(28px, 3.2vw, 40px); line-height: 1.1; }
 h3 { font-size: 20px; line-height: 1.2; }
 
-.lede { font-size: 18px; line-height: 1.5; color: var(--fg-dim); max-width: 62ch; text-wrap: pretty; }
+.lede { font-size: 18px; line-height: 1.55; color: var(--fg-body); max-width: 62ch; text-wrap: pretty; }
 
 /* ---- layout ---- */
 .wrap { max-width: 1280px; margin: 0 auto; padding: 0 32px; }
-.section { padding: 96px 0; border-top: 1px solid var(--line-soft); }
+.section { padding: 96px 0; border-top: 1px solid var(--line); }
 .section:first-of-type { border-top: none; }
+/* Section rhythm: band a few sections with a slightly darker paper tone
+ * to break long uninterrupted scroll. Strong top rule asserts authority.
+ * Apply via class="section section--band" selectively, not every section. */
+.section--band { background: var(--bg-band); border-top: 1px solid var(--line-strong); }
 .section-head { display: grid; grid-template-columns: 180px 1fr; gap: 48px; margin-bottom: 48px; align-items: baseline; }
 .section-head .eyebrow { padding-top: 6px; }
 
@@ -212,16 +319,26 @@ h3 { font-size: 20px; line-height: 1.2; }
 
 /* ---- footer ---- */
 .site-footer {
-  border-top: 1px solid var(--line-soft);
+  /* Footer runs the same ink palette as the nav. */
+  --bg: var(--nav-bg);
+  --bg-elev: var(--nav-bg-soft);
+  --bg-soft: var(--nav-bg-soft);
+  --line: var(--nav-line);
+  --line-soft: var(--nav-line);
+  --fg: var(--nav-fg);
+  --fg-dim: var(--nav-fg-dim);
+  --fg-mute: var(--nav-fg-mute);
+  background: var(--nav-bg);
+  color: var(--nav-fg-mute);
+  border-top: 1px solid var(--nav-line);
   padding: 48px 0 64px;
   font-family: var(--mono);
   font-size: 12px;
-  color: var(--fg-mute);
 }
 .site-footer .wrap { display: grid; grid-template-columns: 1fr 2fr; gap: 48px; }
 .foot-cols { display: grid; grid-template-columns: repeat(4, 1fr); gap: 32px; }
 .foot-cols h5 { font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--fg-dim); margin: 0 0 12px; font-weight: 500; }
-.foot-cols a { display: block; padding: 3px 0; color: var(--fg-mute); }
+.foot-cols a { display: block; padding: 3px 0; color: var(--fg-dim); }
 .foot-cols a:hover { color: var(--fg); }
 
 /* ---- small utilities ---- */

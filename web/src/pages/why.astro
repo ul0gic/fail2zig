@@ -1,0 +1,589 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+---
+
+<BaseLayout
+  title="Why fail2zig"
+  description="fail2ban built the category. It also predates most of the techniques we now take for granted — static compilation, direct netlink, memory-safe systems languages, containerised minimal images. Why a new implementation matters in 2026."
+  activeNav="/why"
+>
+  <header class="why-hero">
+    <div class="wrap">
+      <div class="why-meta">
+        <span><strong>Position</strong> &middot; v1.0</span>
+        <span><strong>Audience</strong> &middot; operators, reviewers</span>
+        <span><strong>Revised</strong> &middot; 2026-04-22</span>
+      </div>
+      <h1>Why a new implementation.</h1>
+      <p class="why-lede">
+        fail2ban has defended Linux services for twenty years. It built the
+        category, shaped the vocabulary, and still works for most of the
+        hosts it runs on. This page is not an argument that it was wrong.
+        It is an argument that the architecture it chose in 2004 has
+        reached the limits of what it can do — and that the tools needed
+        to do better are now mature.
+      </p>
+    </div>
+  </header>
+
+  <section class="section">
+    <div class="wrap">
+      <div class="section-head">
+        <div class="eyebrow"><span class="dot"></span>01 &middot; What fail2ban did right</div>
+        <div>
+          <h2>The category exists because fail2ban proved it could.</h2>
+        </div>
+      </div>
+
+      <div class="prose">
+        <p>
+          When fail2ban shipped in 2004, the idea that a host should
+          autonomously correlate log failures and install firewall rules
+          was not obvious. The ingredients for a clean implementation
+          were not there either — no stable netfilter netlink ABI, no
+          systemd-journal, no static-linking toolchain for memory-safe
+          systems languages, no containerised minimal images to deploy
+          into. Python orchestration around shell-action templates was
+          a careful, considered choice for the toolchain of its era. It
+          worked, and it still works on most of the hosts running it
+          today.
+        </p>
+        <p>
+          The operational vocabulary that fail2ban introduced —
+          <strong>jail</strong>, <strong>filter</strong>,
+          <code>maxretry</code>, <code>findtime</code>,
+          <code>bantime</code>, <code>ignoreip</code> — is now the way
+          the category thinks. fail2zig keeps every one of those words
+          with the same meaning, because operators should not have to
+          relearn a category to change an implementation.
+        </p>
+        <p>
+          Any honest story about why another tool exists in this space
+          has to start here. The cost of being early is that the choices
+          that were right for the era do not always stay right forever.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section--band">
+    <div class="wrap">
+      <div class="section-head">
+        <div class="eyebrow"><span class="dot"></span>02 &middot; What the model costs in 2026</div>
+        <div>
+          <h2>Four concrete problems the shell-action model cannot resolve.</h2>
+        </div>
+      </div>
+
+      <div class="grid grid-4">
+        <div class="card">
+          <div class="idx">PR.01</div>
+          <h3>An interpreter in the TCB</h3>
+          <p>
+            CPython, the Python standard library, <code>python3-systemd</code>,
+            and a chain of C extension modules all execute in the daemon's
+            address space with root. The interpreter can load any bytecode
+            and parse any input. Whatever else a root daemon should be, a
+            shape that accepts "any bytecode" as legitimate input is a
+            larger trust contract than a single static binary.
+          </p>
+        </div>
+        <div class="card">
+          <div class="idx">PR.02</div>
+          <h3>Process-per-action overhead</h3>
+          <p>
+            Every ban forks <code>/bin/sh</code> and execs
+            <code>iptables</code> / <code>nft</code> / <code>ipset</code>.
+            On a host being scanned at a few hundred attempts per second —
+            a modest VPS workload in 2026 — the fork-exec cost becomes
+            the binding constraint on how fast bans can actually land.
+            A shell-action can be written efficiently; it cannot be
+            written faster than <code>execve</code>.
+          </p>
+        </div>
+        <div class="card">
+          <div class="idx">PR.03</div>
+          <h3>Unbounded memory growth</h3>
+          <p>
+            Attackers shaping log traffic to pressurise the state tracker
+            is a real scenario. A dictionary-backed data model grows under
+            that pressure — and resizes during growth, which pauses the
+            event loop. Under sustained attack, those pauses stack and
+            the daemon falls behind its own log stream.
+          </p>
+        </div>
+        <div class="card">
+          <div class="idx">PR.04</div>
+          <h3>No runtime in minimal images</h3>
+          <p>
+            Distroless images, scratch containers, OpenWrt routers,
+            hardened minimal servers, FreeBSD jails. The platforms
+            where a host IPS matters most are precisely the platforms
+            that do not tolerate a 30 MB Python runtime. Operators
+            running those today run no host IPS at all, which is the
+            wrong answer.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <div class="section-head">
+        <div class="eyebrow"><span class="dot"></span>03 &middot; Why this is architectural</div>
+        <div>
+          <h2>These are structural, not patchable.</h2>
+        </div>
+      </div>
+
+      <div class="prose">
+        <p>
+          All four of the problems in the previous section are
+          consequences of the same choice: <strong>orchestrate in
+          Python, act through shell.</strong> That combination made
+          sense when it was the only way to integrate with whatever
+          firewall tool the operator already ran. It is the shape of
+          the architecture, not the quality of its implementation.
+        </p>
+        <p>
+          Tuning a shell-action template cannot remove
+          <code>execve</code> from the ban path. Rewriting a Python
+          filter cannot remove the CPython interpreter from the
+          daemon's address space. Caching cannot remove the dictionary
+          resize from the state tracker. These are not bugs to be
+          fixed; they are the ceiling of what the architecture can
+          offer.
+        </p>
+        <p>
+          A better ceiling requires a different shape: a
+          statically-compiled binary, memory bounded explicitly rather
+          than by convention, firewall state written to the kernel
+          directly rather than through a shell program, a data model
+          designed for attacker-shaped input rather than resized
+          beneath it.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section--band">
+    <div class="wrap">
+      <div class="section-head">
+        <div class="eyebrow"><span class="dot"></span>04 &middot; What fail2zig chose</div>
+        <div>
+          <h2>Different ingredients, same problem.</h2>
+          <p class="why-sublede">
+            The work the category has always done, rebuilt with the
+            tools that were not available when it was first invented.
+          </p>
+        </div>
+      </div>
+
+      <div class="choices">
+        <div class="choice">
+          <div class="choice-k">The binary is the TCB</div>
+          <div class="choice-v">
+            <p>
+              A single statically-linked musl binary. No interpreter,
+              no VM, no dynamic loading, no third-party Zig packages
+              in the critical path. What you audit is what runs. The
+              <a href="/docs/architecture/trusted-computing-base">trusted computing base</a> is
+              ~12,000 lines of Zig you can read in an afternoon.
+            </p>
+          </div>
+        </div>
+        <div class="choice">
+          <div class="choice-k">Direct netlink, no shell</div>
+          <div class="choice-v">
+            <p>
+              Bans are written to the kernel through
+              <code>AF_NETLINK</code> directly — no <code>nft</code>,
+              <code>iptables</code>, or <code>ipset</code> binaries
+              are ever spawned. Ban latency drops from milliseconds to
+              tens of microseconds, and the supply chain for the ban
+              path contains exactly one program. See
+              <a href="/docs/architecture/netlink-interop">netlink interop</a>.
+            </p>
+          </div>
+        </div>
+        <div class="choice">
+          <div class="choice-k">A hard memory ceiling</div>
+          <div class="choice-v">
+            <p>
+              A fixed-size arena, configured at startup, enforced at
+              the allocator level. The daemon cannot exceed it
+              regardless of attack volume. When the state tracker
+              reaches capacity, eviction policy fires — the daemon
+              does not resize, does not pause the event loop, does
+              not get killed by the OOM reaper.
+            </p>
+          </div>
+        </div>
+        <div class="choice">
+          <div class="choice-k">A filter engine compiled at build time</div>
+          <div class="choice-v">
+            <p>
+              Filters are specialised at compile time via Zig's
+              <code>comptime</code>. No runtime regex engine, no
+              pattern interpreter — attackers cannot influence how
+              their input is parsed because the parser was fixed
+              before the binary shipped.
+            </p>
+          </div>
+        </div>
+        <div class="choice">
+          <div class="choice-k">Zero runtime dependencies</div>
+          <div class="choice-v">
+            <p>
+              No Python, no Perl, no Ruby, no Node. No D-Bus. No
+              <code>/bin/sh</code>. No plugins. The binary plus the
+              Linux kernel is the complete dependency graph. See
+              <a href="/docs/architecture/zero-dependencies">zero runtime dependencies</a>
+              for which kernel ABIs the binary does depend on and why
+              those are the acceptable boundary.
+            </p>
+          </div>
+        </div>
+        <div class="choice">
+          <div class="choice-k">fail2ban is the adoption path</div>
+          <div class="choice-v">
+            <p>
+              Your jails, filters, thresholds, and ignore lists port
+              over with one command:
+              <code>fail2zig --import-config /etc/fail2ban</code>. The
+              mental model is identical. The operational vocabulary is
+              identical. The only thing that changes is what runs as
+              root on your machine.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <div class="section-head">
+        <div class="eyebrow"><span class="dot"></span>05 &middot; What fail2zig is not</div>
+        <div>
+          <h2>Scoping is a feature.</h2>
+        </div>
+      </div>
+
+      <div class="not-grid">
+        <div class="not-row">
+          <span class="not-k">Not a WAF.</span>
+          <span class="not-v">
+            fail2zig does not inspect request bodies, enforce rules on
+            HTTP payloads, or sit in the request path. WAFs belong at
+            the edge. fail2zig lives on the host.
+          </span>
+        </div>
+        <div class="not-row">
+          <span class="not-k">Not a SIEM.</span>
+          <span class="not-v">
+            fail2zig does not aggregate, store, index, or correlate
+            logs across hosts. It reads one host's logs, decides who is
+            attacking it, and tells the kernel to drop their packets.
+          </span>
+        </div>
+        <div class="not-row">
+          <span class="not-k">Not an IDS.</span>
+          <span class="not-v">
+            Intrusion detection is a deeper problem space — protocol
+            decoding, packet inspection, behavioural anomaly detection.
+            Projects like Suricata and Zeek do that work. fail2zig
+            consumes the signals an IDS (or the services themselves)
+            produce and enforces the blunt response.
+          </span>
+        </div>
+        <div class="not-row">
+          <span class="not-k">Not a network firewall.</span>
+          <span class="not-v">
+            nftables is the firewall. fail2zig writes to it. A network
+            firewall, a cloud security group, and a host IPS are three
+            different layers; running fail2zig does not replace the
+            first two.
+          </span>
+        </div>
+        <div class="not-row">
+          <span class="not-k">Not a replacement for hardening.</span>
+          <span class="not-v">
+            fail2zig bans attackers after they have already probed.
+            Disabling password auth for SSH, keeping services patched,
+            and minimising exposed surface are what prevent the
+            probe-to-compromise path in the first place. fail2zig
+            raises the cost of probing; it does not replace the
+            reasons probing is ineffective against a well-run host.
+          </span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section--band">
+    <div class="wrap why-close">
+      <h2>Where to go from here.</h2>
+      <p>
+        If you run fail2ban today and the values above speak to the
+        problems you have actually hit, the import path is the
+        shortest route.
+      </p>
+      <div class="why-actions">
+        <a href="/install" class="btn primary">$ install</a>
+        <a href="/docs/guides/migration-from-fail2ban" class="btn">Migration guide &rarr;</a>
+        <a href="/threat-model" class="btn ghost">Read the threat model</a>
+      </div>
+    </div>
+  </section>
+</BaseLayout>
+
+<style>
+  /* Hero */
+  .why-hero {
+    padding: 96px 0 64px;
+    border-bottom: 1px solid var(--line);
+  }
+  .why-hero h1 {
+    font-size: clamp(40px, 5vw, 64px);
+    margin: 24px 0 24px;
+    letter-spacing: -0.025em;
+    max-width: 20ch;
+  }
+  .why-lede {
+    font-size: 19px;
+    line-height: 1.6;
+    color: var(--fg-body);
+    max-width: 68ch;
+    margin: 0;
+    text-wrap: pretty;
+  }
+  .why-meta {
+    display: flex;
+    gap: 24px;
+    flex-wrap: wrap;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--fg-strong);
+    padding-bottom: 8px;
+  }
+  .why-meta strong {
+    color: var(--fg-dim);
+    font-weight: 500;
+  }
+
+  /* Section head (reusing the same rhythm as /security used to have,
+   * calibrated to the final font / ink tier system). */
+  .section-head {
+    display: grid;
+    grid-template-columns: 220px 1fr;
+    gap: 48px;
+    margin-bottom: 40px;
+    align-items: baseline;
+  }
+  .section-head .eyebrow {
+    padding-top: 6px;
+  }
+  .section-head h2 {
+    font-size: clamp(24px, 2.4vw, 32px);
+    letter-spacing: -0.02em;
+    margin: 0 0 8px;
+    max-width: 28ch;
+    text-wrap: balance;
+  }
+  .why-sublede {
+    font-size: 15px;
+    color: var(--fg-body);
+    max-width: 58ch;
+    margin: 12px 0 0;
+    line-height: 1.55;
+  }
+
+  /* Prose blocks */
+  .prose {
+    max-width: 68ch;
+  }
+  .prose p {
+    font-size: 15px;
+    line-height: 1.7;
+    color: var(--fg-body);
+    margin: 0 0 16px;
+  }
+  .prose p:last-child {
+    margin-bottom: 0;
+  }
+  .prose p strong {
+    color: var(--fg);
+    font-weight: 600;
+  }
+  .prose code,
+  .choice code,
+  .not-row code {
+    font-family: var(--mono);
+    font-size: 0.9em;
+    color: var(--nav-fg);
+    background: var(--nav-bg);
+    border: 1px solid var(--nav-line);
+    padding: 1px 6px;
+  }
+
+  /* Card grid for "what the model costs" */
+  .grid {
+    display: grid;
+    gap: 0;
+    border: 1px solid var(--line);
+    background: var(--bg);
+  }
+  .grid-4 {
+    grid-template-columns: repeat(4, 1fr);
+  }
+  .card {
+    padding: 28px 28px 32px;
+    border-right: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+  }
+  .card:nth-child(4n) {
+    border-right: none;
+  }
+  .card:nth-last-child(-n + 4) {
+    border-bottom: none;
+  }
+  .card .idx {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--accent);
+    letter-spacing: 0.1em;
+    margin-bottom: 12px;
+  }
+  .card h3 {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--fg);
+    margin: 0 0 10px;
+    letter-spacing: -0.01em;
+  }
+  .card p {
+    font-size: 14px;
+    line-height: 1.6;
+    color: var(--fg-body);
+    margin: 0;
+    max-width: 42ch;
+  }
+
+  /* Choices — two-column rows */
+  .choices {
+    border-top: 1px solid var(--line);
+  }
+  .choice {
+    display: grid;
+    grid-template-columns: 260px 1fr;
+    gap: 48px;
+    padding: 28px 0;
+    border-bottom: 1px solid var(--line);
+    align-items: start;
+  }
+  .choice-k {
+    font-family: var(--mono);
+    font-size: 14px;
+    color: var(--fg);
+    font-weight: 500;
+    letter-spacing: -0.005em;
+    padding-top: 2px;
+  }
+  .choice-v p {
+    font-size: 15px;
+    line-height: 1.65;
+    color: var(--fg-body);
+    margin: 0;
+    max-width: 62ch;
+  }
+  .choice-v a {
+    color: var(--accent);
+  }
+  .choice-v a:hover {
+    text-decoration: underline;
+  }
+
+  /* "Not" grid */
+  .not-grid {
+    border-top: 1px solid var(--line);
+  }
+  .not-row {
+    display: grid;
+    grid-template-columns: 260px 1fr;
+    gap: 48px;
+    padding: 20px 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .not-k {
+    font-family: var(--mono);
+    font-size: 14px;
+    color: var(--fg);
+    font-weight: 500;
+  }
+  .not-v {
+    font-size: 15px;
+    color: var(--fg-body);
+    line-height: 1.65;
+    max-width: 62ch;
+  }
+
+  /* Close */
+  .why-close h2 {
+    font-size: clamp(24px, 2.4vw, 32px);
+    margin: 0 0 16px;
+  }
+  .why-close p {
+    font-size: 17px;
+    color: var(--fg-body);
+    max-width: 60ch;
+    margin: 0 0 28px;
+    line-height: 1.55;
+  }
+  .why-actions {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  @media (max-width: 960px) {
+    .grid-4 {
+      grid-template-columns: repeat(2, 1fr);
+    }
+    .card {
+      border-right: 1px solid var(--line);
+    }
+    .card:nth-child(2n) {
+      border-right: none;
+    }
+    .card:nth-last-child(-n + 2) {
+      border-bottom: none;
+    }
+    .card:nth-last-child(4),
+    .card:nth-last-child(3) {
+      border-bottom: 1px solid var(--line);
+    }
+    .section-head {
+      grid-template-columns: 1fr;
+      gap: 16px;
+    }
+    .choice,
+    .not-row {
+      grid-template-columns: 1fr;
+      gap: 8px;
+    }
+  }
+  @media (max-width: 600px) {
+    .grid-4 {
+      grid-template-columns: 1fr;
+    }
+    .card {
+      border-right: none;
+      border-bottom: 1px solid var(--line);
+    }
+    .card:last-child {
+      border-bottom: none;
+    }
+  }
+</style>

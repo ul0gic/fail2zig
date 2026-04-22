@@ -1,0 +1,178 @@
+---
+// PipelineDiagram — horizontal 4-stage pipeline schematic with a live event indicator.
+// viewBox 1100x360, container aspect 1100/500 (taller than content so SVG has breathing room).
+---
+
+<div class="diagram" aria-hidden="true">
+  <div class="diagram-header">
+    <div class="dots"><span></span><span></span><span></span></div>
+    <div>pipeline.trace&nbsp;&middot;&nbsp;live</div>
+    <div class="diagram-counter" data-counter>982,684 events</div>
+  </div>
+  <svg class="diagram-svg" viewBox="0 0 1100 360" preserveAspectRatio="xMidYMid meet">
+    <defs>
+      <marker
+        id="pd-arrowhead"
+        markerWidth="10"
+        markerHeight="10"
+        refX="9"
+        refY="5"
+        orient="auto"
+      >
+        <path d="M0,0 L10,5 L0,10 z" fill="var(--fg-mute)"></path>
+      </marker>
+      <linearGradient id="pd-pulseGrad" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0%" stop-color="var(--accent)" stop-opacity="0"></stop>
+        <stop offset="50%" stop-color="var(--accent)" stop-opacity="1"></stop>
+        <stop offset="100%" stop-color="var(--accent)" stop-opacity="0"></stop>
+      </linearGradient>
+    </defs>
+
+    <!-- Stage 01: SOURCE -->
+    <text x="30" y="48" fill="var(--fg-mute)" font-family="var(--mono)" font-size="12" letter-spacing="1">01 &middot; SOURCE</text>
+    <g class="node">
+      <rect x="20" y="60" width="240" height="110" fill="var(--diagram-surface)" stroke="var(--line-strong)"></rect>
+      <text x="34" y="86" fill="var(--fg)" font-family="var(--mono)" font-size="14" font-weight="500">log sources</text>
+      <text x="34" y="108" fill="var(--fg-dim)" font-family="var(--mono)" font-size="13">/var/log/auth.log</text>
+      <text x="34" y="126" fill="var(--fg-dim)" font-family="var(--mono)" font-size="13">journald &middot; sshd &middot; nginx</text>
+      <text x="34" y="150" fill="var(--fg-mute)" font-family="var(--mono)" font-size="12">inotify &middot; io_uring &middot; kqueue</text>
+    </g>
+
+    <!-- Arrow source -> parse -->
+    <line x1="262" y1="115" x2="290" y2="115" stroke="var(--line-strong)" stroke-width="1" marker-end="url(#pd-arrowhead)"></line>
+    <line x1="262" y1="115" x2="290" y2="115" stroke="url(#pd-pulseGrad)" stroke-width="2" stroke-dasharray="28 600"></line>
+
+    <!-- Stage 02: PARSE -->
+    <text x="300" y="48" fill="var(--fg-mute)" font-family="var(--mono)" font-size="12" letter-spacing="1">02 &middot; PARSE</text>
+    <g class="node">
+      <rect x="290" y="60" width="240" height="110" fill="var(--diagram-surface)" stroke="var(--line-strong)"></rect>
+      <text x="304" y="86" fill="var(--fg)" font-family="var(--mono)" font-size="14" font-weight="500">parser engine</text>
+      <text x="304" y="108" fill="var(--fg-dim)" font-family="var(--mono)" font-size="13">comptime filters &middot; SIMD</text>
+      <text x="304" y="126" fill="var(--fg-dim)" font-family="var(--mono)" font-size="13">zero-copy &middot; bounds-checked</text>
+      <text x="304" y="150" fill="var(--fg-mute)" font-family="var(--mono)" font-size="12">no regex engine in-process</text>
+    </g>
+
+    <!-- Arrow parse -> state -->
+    <line x1="532" y1="115" x2="560" y2="115" stroke="var(--line-strong)" stroke-width="1" marker-end="url(#pd-arrowhead)"></line>
+    <line x1="532" y1="115" x2="560" y2="115" stroke="url(#pd-pulseGrad)" stroke-width="2" stroke-dasharray="28 600"></line>
+
+    <!-- Stage 03: STATE -->
+    <text x="570" y="48" fill="var(--fg-mute)" font-family="var(--mono)" font-size="12" letter-spacing="1">03 &middot; STATE</text>
+    <g class="node">
+      <rect x="560" y="60" width="240" height="110" fill="var(--diagram-surface)" stroke="var(--line-strong)"></rect>
+      <text x="574" y="86" fill="var(--fg)" font-family="var(--mono)" font-size="14" font-weight="500">state tracker</text>
+      <text x="574" y="108" fill="var(--fg-dim)" font-family="var(--mono)" font-size="13">fixed-arena hash table</text>
+      <text x="574" y="126" fill="var(--fg-dim)" font-family="var(--mono)" font-size="13">pre-allocated &middot; evict-oldest</text>
+      <text x="574" y="150" fill="var(--fg-mute)" font-family="var(--mono)" font-size="12">hard 64MB ceiling</text>
+    </g>
+
+    <!-- Arrow state -> ban -->
+    <line x1="802" y1="115" x2="830" y2="115" stroke="var(--line-strong)" stroke-width="1" marker-end="url(#pd-arrowhead)"></line>
+    <line x1="802" y1="115" x2="830" y2="115" stroke="url(#pd-pulseGrad)" stroke-width="2" stroke-dasharray="28 600"></line>
+
+    <!-- Stage 04: BAN -->
+    <text x="840" y="48" fill="var(--fg-mute)" font-family="var(--mono)" font-size="12" letter-spacing="1">04 &middot; BAN</text>
+    <g class="node">
+      <rect x="830" y="60" width="240" height="110" fill="var(--diagram-surface)" stroke="var(--line-strong)"></rect>
+      <text x="844" y="86" fill="var(--fg)" font-family="var(--mono)" font-size="14" font-weight="500">ban executor</text>
+      <text x="844" y="108" fill="var(--fg-dim)" font-family="var(--mono)" font-size="13">nftables &middot; ipset &middot; iptables</text>
+      <text x="844" y="126" fill="var(--fg-dim)" font-family="var(--mono)" font-size="13">eBPF/XDP (phase 2)</text>
+      <text x="844" y="150" fill="var(--accent)" font-family="var(--mono)" font-size="12">DROP &middot; at NIC driver</text>
+    </g>
+
+    <!-- Observability tap: state -> metrics (dashed vertical) -->
+    <line x1="680" y1="170" x2="680" y2="232" stroke="var(--line-soft)" stroke-width="1" stroke-dasharray="3 3"></line>
+
+    <!-- Metrics / audit (secondary bar) -->
+    <text x="30" y="232" fill="var(--fg-mute)" font-family="var(--mono)" font-size="12" letter-spacing="1">05 &middot; OBSERVE</text>
+    <g>
+      <rect x="20" y="244" width="1050" height="100" fill="var(--diagram-surface)" stroke="var(--line-soft)" stroke-dasharray="4 4"></rect>
+      <text x="34" y="270" fill="var(--fg-dim)" font-family="var(--mono)" font-size="14" font-weight="500">metrics &middot; audit</text>
+      <text x="34" y="294" fill="var(--fg-mute)" font-family="var(--mono)" font-size="13">prometheus /metrics &middot; read-only endpoint</text>
+      <text x="34" y="316" fill="var(--fg-mute)" font-family="var(--mono)" font-size="13">signed audit trail &middot; structured JSON logs</text>
+    </g>
+
+    <circle class="diagram-event" r="5" fill="var(--accent)" opacity="1" cx="140" cy="115" data-event>
+      <animate attributeName="opacity" values="0;1;1;0" dur="3.2s" repeatCount="indefinite"></animate>
+    </circle>
+  </svg>
+</div>
+
+<style>
+  .diagram {
+    position: relative;
+    background:
+      linear-gradient(var(--line) 1px, transparent 1px) 0 0 / 40px 40px,
+      linear-gradient(90deg, var(--line) 1px, transparent 1px) 0 0 / 40px 40px,
+      var(--bg-soft);
+    border: 1px solid var(--fg-faint);
+    aspect-ratio: 1100 / 500;
+    width: 100%;
+    max-width: 1100px;
+    margin-left: auto;
+    overflow: hidden;
+  }
+  .diagram-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--line-strong);
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--fg-dim);
+    background: var(--bg-band);
+  }
+  .diagram-header .dots {
+    display: flex;
+    gap: 6px;
+  }
+  .diagram-header .dots span {
+    width: 7px;
+    height: 7px;
+    background: var(--line);
+  }
+  .diagram-header .dots span:nth-child(1) {
+    background: var(--accent-dim);
+  }
+  .diagram-svg {
+    width: 100%;
+    height: calc(100% - 40px);
+  }
+</style>
+
+<script is:inline>
+  (function () {
+    var diagram = document.querySelector('.diagram');
+    if (!diagram) return;
+    var ev = diagram.querySelector('[data-event]');
+    var counter = diagram.querySelector('[data-counter]');
+    if (!ev) return;
+
+    var path = [
+      [140, 115],
+      [262, 115],
+      [290, 115],
+      [410, 115],
+      [532, 115],
+      [560, 115],
+      [680, 115],
+      [802, 115],
+      [830, 115],
+      [950, 115],
+    ];
+    var t = 0;
+    var counterVal = 0;
+    setInterval(function () {
+      t = (t + 1) % path.length;
+      var p = path[t];
+      ev.setAttribute('cx', String(p[0]));
+      ev.setAttribute('cy', String(p[1]));
+      ev.setAttribute('opacity', '1');
+      if (t === 0 && counter) {
+        counterVal += Math.floor(18000 + Math.random() * 6000);
+        counter.textContent = counterVal.toLocaleString() + ' events';
+      }
+    }, 280);
+  })();
+</script>

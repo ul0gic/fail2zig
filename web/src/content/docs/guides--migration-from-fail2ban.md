@@ -247,6 +247,37 @@ for the full list and per-filter log path guidance.
 
 ---
 
+## Cross-reference: fail2ban → fail2zig
+
+A direct map between fail2ban's `jail.conf` keys and fail2zig's TOML
+equivalents. Most values carry over one-to-one; the most common
+footgun is `ignoreip` (whitespace-separated in fail2ban, string array
+in fail2zig) and time values (fail2ban accepts `10m` / `1h` suffixes,
+fail2zig uses integer seconds).
+
+| fail2ban key | fail2zig equivalent | Notes |
+|---|---|---|
+| `[DEFAULT]` section | `[defaults]` section | Direct equivalent. |
+| `bantime` | `bantime` | Same semantics. fail2ban accepts `10m`, `1h` suffixes; fail2zig uses integer seconds only. |
+| `findtime` | `findtime` | Same semantics. Integer seconds only. |
+| `maxretry` | `maxretry` | Same semantics. |
+| `ignoreip` | `ignoreip` | TOML string array instead of whitespace-separated string. |
+| `banaction` | `banaction` | Mapped to one of: `nftables`, `iptables`, `ipset`, `log-only`. |
+| `bantime.increment` | `bantime_increment_enabled` | |
+| `bantime.factor` | `bantime_increment_factor` | |
+| `bantime.multiplier` | `bantime_increment_multiplier` | |
+| `bantime.maxtime` | `bantime_increment_max_bantime` | |
+| `bantime.formula` | `bantime_increment_formula` | Values: `linear`, `exponential`. |
+| `logpath` | `logpath` | TOML string array. |
+| `filter` | `filter` | Same filter name convention. |
+| `enabled` | `enabled` | |
+| `backend` | Not applicable | fail2zig uses inotify + systemd journal natively; no `backend = auto` selection needed. |
+
+For full type / default / constraint detail on the fail2zig side, see
+the [Configuration reference](../reference/config).
+
+---
+
 ## Running side-by-side during verification
 
 The safest migration runs fail2ban and fail2zig simultaneously for a short

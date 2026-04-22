@@ -1,0 +1,73 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+---
+
+<BaseLayout
+  title="fail2zig · terms"
+  description="Terms of use for fail2zig."
+  activeNav="/terms"
+>
+  <article class="legal-stub">
+    <div class="wrap">
+      <div class="eyebrow"><span class="dot"></span>Terms</div>
+      <h1>Terms of use</h1>
+      <p class="lede">
+        Full terms coming soon. Short version below.
+      </p>
+      <h2>Code</h2>
+      <p>
+        The fail2zig source code is licensed under AGPL-3.0-or-later. The full LICENSE text
+        lives in the repository and governs your rights to use, modify, and redistribute the
+        code. Nothing on this site grants rights that the license itself does not.
+      </p>
+      <h2>Name and mark</h2>
+      <p>
+        The &ldquo;fail2zig&rdquo; name, logo, and brand mark are trademarks of the maintainer.
+        Forks and downstream distributions must use their own name and branding. See the brand
+        page for details.
+      </p>
+      <h2>No warranty</h2>
+      <p>
+        The software is provided as-is, without warranty of any kind, per the AGPL. Running
+        a security daemon on your infrastructure is your responsibility.
+      </p>
+      <p class="stub-note">Last updated: draft, expanded version pending.</p>
+    </div>
+  </article>
+</BaseLayout>
+
+<style>
+  .legal-stub {
+    padding: 96px 0 128px;
+  }
+  .legal-stub h1 {
+    font-size: clamp(32px, 3.4vw, 44px);
+    line-height: 1.08;
+    letter-spacing: -0.02em;
+    margin: 20px 0 16px;
+  }
+  .legal-stub .lede {
+    margin-bottom: 40px;
+  }
+  .legal-stub h2 {
+    font-family: var(--mono);
+    font-size: 15px;
+    font-weight: 500;
+    color: var(--fg);
+    margin: 32px 0 12px;
+  }
+  .legal-stub p {
+    color: var(--fg-body);
+    line-height: 1.65;
+    max-width: 68ch;
+    margin: 0 0 14px;
+  }
+  .stub-note {
+    margin-top: 48px;
+    padding-top: 20px;
+    border-top: 1px dashed var(--line);
+    color: var(--fg-dim);
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+</style>

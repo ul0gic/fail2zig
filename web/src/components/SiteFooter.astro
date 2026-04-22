@@ -9,18 +9,19 @@ const year = new Date().getFullYear();
   <div class="wrap">
     <div>
       <div class="brand footer-brand">
-        <span class="brand-mark" aria-hidden="true"></span>
-        fail2zig
+        <span class="brand-name">fail<span class="brand-2">2</span>zig</span>
       </div>
       <div class="footer-tagline">
         A modern intrusion prevention system. Single binary. Zero dependencies.
       </div>
       <div class="footer-copy">
-        © {year} Corelift &nbsp;·&nbsp; Code licensed under{' '}
-        <a href="/LICENSE" class="footer-link">AGPL-3.0-or-later</a>
+        © {year} Corelift<br />
+        Code licensed under <a href="/LICENSE" class="footer-link">AGPL-3.0-or-later</a>
       </div>
       <div class="footer-privacy">
-        No tracking. No cookies at launch. See <a href="/privacy" class="footer-link">privacy</a>.
+        Cookieless analytics via Cloudflare.
+        <a href="/privacy" class="footer-link">Privacy</a> &middot;
+        <a href="/terms" class="footer-link">Terms</a>
       </div>
     </div>
     <div class="foot-cols">
@@ -28,7 +29,6 @@ const year = new Date().getFullYear();
         <h5>Product</h5>
         <a href="/">Overview</a>
         <a href="/install">Install</a>
-        <a href="/roadmap">Roadmap</a>
         <a href="/see-it-live">See it Live</a>
       </div>
       <div>
@@ -40,14 +40,14 @@ const year = new Date().getFullYear();
       </div>
       <div>
         <h5>Security</h5>
-        <a href="/security">Threat model</a>
-        <a href="/security">Reporting</a>
-        <a href="/security">Reproducible builds</a>
+        <a href="/threat-model">Threat model</a>
+        <a href="https://github.com/ul0gic/fail2zig/blob/main/SECURITY.md" rel="noopener noreferrer">Report a vulnerability</a>
+        <a href="/docs/guides/verifying-zero-dependencies">Verify a build</a>
         <a href="/changelog">Changelog</a>
       </div>
       <div>
         <h5>Project</h5>
-        <a href="/manifesto">Manifesto</a>
+        <a href="/why">Why fail2zig</a>
         <a href="/about">About</a>
         <a href="/brand">Brand / trademark</a>
         <a href="https://github.com/ul0gic/fail2zig" rel="noopener noreferrer">GitHub ↗</a>
@@ -57,6 +57,9 @@ const year = new Date().getFullYear();
 </footer>
 
 <style>
+  .brand-2 {
+    color: var(--accent);
+  }
   .footer-brand {
     margin-bottom: 12px;
   }

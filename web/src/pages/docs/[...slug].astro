@@ -1,7 +1,7 @@
 ---
 /* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-call, @typescript-eslint/restrict-template-expressions */
 import { getCollection, render } from 'astro:content';
-import BaseLayout from '@/layouts/BaseLayout.astro';
+import DocLayout from '@/layouts/DocLayout.astro';
 
 export async function getStaticPaths() {
   const docs = await getCollection('docs');
@@ -14,379 +14,118 @@ export async function getStaticPaths() {
 const { entry } = Astro.props;
 const { Content, headings } = await render(entry);
 
-const allDocs = await getCollection('docs');
-
-interface SidebarSection {
-  label: string;
-  items: { slug: string; title: string; position: number }[];
-}
-
-const sectionMap = new Map<string, SidebarSection>();
-
-for (const doc of allDocs) {
-  const parts = doc.id.split('--');
-  const category = doc.data.category ?? (parts.length > 1 ? (parts[0] ?? 'General') : 'General');
-  const slug = doc.id.replace(/--/g, '/');
-
-  if (!sectionMap.has(category)) {
-    sectionMap.set(category, { label: category, items: [] });
-  }
-  sectionMap.get(category)?.items.push({
-    slug,
-    title: doc.data.title,
-    position: doc.data.sidebar_position ?? 99,
-  });
-}
-
-for (const section of sectionMap.values()) {
-  section.items.sort((a, b) => a.position - b.position);
-}
-
-const sections = Array.from(sectionMap.values());
 const currentSlug = entry.id.replace(/--/g, '/');
 const tocHeadings = headings.filter((h) => h.depth <= 3);
+const category = entry.data.category ?? 'General';
+const breadcrumbHtml = `<span>docs</span> / ${category} / ${entry.data.title}`;
 ---
 
-<BaseLayout
+<DocLayout
   title={`${entry.data.title} · fail2zig docs`}
   description={entry.data.description}
-  activeNav="/docs"
+  activeSlug={currentSlug}
+  breadcrumb={breadcrumbHtml}
+  tocHeadings={tocHeadings}
+  lastVerified={entry.data.last_verified}
 >
-  <div class="doc-layout">
-    <aside class="sidebar">
-      {
-        sections.map((section) => (
-          <>
-            <h5>{section.label}</h5>
-            {section.items.map((item) => (
-              <a href={`/docs/${item.slug}`} class={currentSlug === item.slug ? 'active' : ''}>
-                {item.title}
-              </a>
-            ))}
-          </>
-        ))
-      }
-    </aside>
+  <Content />
 
-    <main class="doc-main">
-      <div class="breadcrumb">
-        <span>docs</span> / {entry.data.category ?? 'General'} / {entry.data.title}
-      </div>
-      <div class="doc-content">
-        <Content />
-      </div>
-      <div class="doc-actions">
-        <button class="copy-page-btn btn ghost" data-slug={currentSlug}
-          >Copy page as markdown</button
-        >
-        <a
-          href={`https://github.com/ul0gic/fail2zig/edit/main/docs/${currentSlug}.md`}
-          class="btn ghost"
-          rel="noopener noreferrer">Edit on GitHub &rarr;</a
-        >
-      </div>
-    </main>
-
-    <aside class="toc">
-      <h5>On this page</h5>
-      {
-        tocHeadings.map((h) => (
-          <a href={`#${h.slug}`} class={`depth-${String(h.depth)}`}>
-            {h.text}
-          </a>
-        ))
-      }
-      {
-        entry.data.last_verified && (
-          <div class="toc-meta">
-            last verified
-            <br />
-            <span>{entry.data.last_verified}</span>
-          </div>
-        )
-      }
-    </aside>
-  </div>
-</BaseLayout>
+  <Fragment slot="actions">
+    <button class="copy-page-btn btn ghost" data-slug={currentSlug}>Copy page as markdown</button>
+    <a
+      href={`https://github.com/ul0gic/fail2zig/edit/main/docs/${currentSlug}.md`}
+      class="btn ghost"
+      rel="noopener noreferrer">Edit on GitHub &rarr;</a
+    >
+  </Fragment>
+</DocLayout>
 
 <script is:inline>
-  document.addEventListener('DOMContentLoaded', function () {
-    // Copy page as markdown
-    document.querySelectorAll('.copy-page-btn').forEach(function (btn) {
-      btn.addEventListener('click', function () {
+  (function () {
+    function copyText(text) {
+      if (navigator.clipboard && window.isSecureContext) {
+        return navigator.clipboard.writeText(text);
+      }
+      // Fallback for non-secure contexts.
+      return new Promise(function (resolve, reject) {
+        try {
+          var ta = document.createElement('textarea');
+          ta.value = text;
+          ta.style.position = 'fixed';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand('copy');
+          document.body.removeChild(ta);
+          resolve();
+        } catch (e) {
+          reject(e);
+        }
+      });
+    }
+
+    function flash(btn, label) {
+      var orig = btn.textContent;
+      btn.textContent = label;
+      setTimeout(function () {
+        btn.textContent = orig;
+      }, 1200);
+    }
+
+    function installCodeCopyButtons() {
+      // rehype-pretty-code wraps pre in a <figure data-rehype-pretty-code-figure>.
+      // Anchor the button on the wrapper when present so it doesn't scroll
+      // with long lines; fall back to the bare <pre> otherwise.
+      var blocks = document.querySelectorAll('.doc-content pre');
+      blocks.forEach(function (pre) {
+        if (pre.classList.contains('mermaid')) return;
+        if (pre.querySelector('code[data-language="mermaid"]')) return;
+        var anchor = pre.closest('figure[data-rehype-pretty-code-figure]') || pre;
+        if (anchor.dataset.copyInstalled === '1') return;
+        anchor.dataset.copyInstalled = '1';
+        anchor.style.position = 'relative';
+
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'code-copy-btn';
+        btn.textContent = 'copy';
+        btn.setAttribute('aria-label', 'Copy code');
+        anchor.appendChild(btn);
+      });
+    }
+
+    function onCopyClick(e) {
+      var btn = e.target.closest('.code-copy-btn, .copy-page-btn');
+      if (!btn) return;
+      e.preventDefault();
+
+      if (btn.classList.contains('copy-page-btn')) {
         var content = document.querySelector('.doc-content');
         if (!content) return;
-        // Get the rendered text content as a reasonable markdown approximation
-        var text = content.innerText;
-        navigator.clipboard.writeText(text).then(function () {
-          var orig = btn.textContent;
-          btn.textContent = 'Copied!';
-          setTimeout(function () {
-            btn.textContent = orig;
-          }, 1200);
+        copyText(content.innerText).then(function () {
+          flash(btn, 'Copied!');
         });
-      });
-    });
+        return;
+      }
 
-    // Copy button for code blocks
-    document.querySelectorAll('.doc-content pre').forEach(function (pre) {
-      var copyBtn = document.createElement('button');
-      copyBtn.className = 'code-copy-btn';
-      copyBtn.textContent = 'copy';
-      copyBtn.addEventListener('click', function () {
-        var code = pre.querySelector('code');
-        if (!code) return;
-        navigator.clipboard.writeText(code.textContent || '').then(function () {
-          copyBtn.textContent = 'copied';
-          setTimeout(function () {
-            copyBtn.textContent = 'copy';
-          }, 1200);
-        });
+      var anchor = btn.parentElement;
+      if (!anchor) return;
+      var code = anchor.querySelector('pre code') || anchor.querySelector('code');
+      if (!code) return;
+      copyText(code.textContent || '').then(function () {
+        flash(btn, 'copied');
       });
-      pre.style.position = 'relative';
-      pre.appendChild(copyBtn);
-    });
-  });
+    }
+
+    function init() {
+      installCodeCopyButtons();
+      document.addEventListener('click', onCopyClick);
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', init);
+    } else {
+      init();
+    }
+  })();
 </script>
-
-<style>
-  .doc-layout {
-    display: grid;
-    grid-template-columns: 260px minmax(0, 1fr) 220px;
-    gap: 48px;
-    max-width: 1280px;
-    margin: 0 auto;
-    padding: 32px;
-    min-height: calc(100vh - 60px);
-  }
-  aside.sidebar {
-    border-right: 1px solid var(--line-soft);
-    padding-right: 24px;
-    position: sticky;
-    top: 70px;
-    height: calc(100vh - 96px);
-    overflow-y: auto;
-    font-family: var(--mono);
-    font-size: 13px;
-  }
-  .sidebar h5 {
-    font-size: 11px;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: var(--fg-mute);
-    margin: 24px 0 8px;
-    font-weight: 500;
-  }
-  .sidebar a {
-    display: block;
-    padding: 5px 0;
-    color: var(--fg-dim);
-    border-left: 2px solid transparent;
-    padding-left: 10px;
-    margin-left: -10px;
-  }
-  .sidebar a:hover {
-    color: var(--fg);
-  }
-  .sidebar a.active {
-    color: var(--accent);
-    border-left-color: var(--accent);
-  }
-
-  .doc-main {
-    min-width: 0;
-  }
-  .breadcrumb {
-    font-family: var(--mono);
-    font-size: 12px;
-    color: var(--fg-mute);
-    margin-bottom: 16px;
-  }
-  .breadcrumb span {
-    color: var(--accent);
-  }
-
-  .doc-content :global(h1) {
-    font-size: 40px;
-    margin-bottom: 12px;
-  }
-  .doc-content :global(h2) {
-    font-size: 24px;
-    margin: 48px 0 16px;
-    padding-top: 24px;
-    border-top: 1px solid var(--line-soft);
-  }
-  .doc-content :global(h3) {
-    font-size: 16px;
-    font-family: var(--mono);
-    font-weight: 500;
-    margin: 28px 0 12px;
-  }
-  .doc-content :global(p) {
-    color: var(--fg-dim);
-    max-width: 68ch;
-    margin: 0 0 16px;
-  }
-  .doc-content :global(ul) {
-    color: var(--fg-dim);
-    max-width: 68ch;
-    padding-left: 20px;
-  }
-  .doc-content :global(li) {
-    margin: 6px 0;
-  }
-  .doc-content :global(code:not(pre code)) {
-    background: var(--bg-elev);
-    border: 1px solid var(--line-soft);
-    padding: 1px 6px;
-    font-size: 0.9em;
-    color: var(--accent);
-  }
-  .doc-content :global(pre) {
-    background: var(--bg-elev);
-    border: 1px solid var(--line-soft);
-    font-family: var(--mono);
-    font-size: 13px;
-    line-height: 1.6;
-    padding: 16px 20px;
-    color: var(--fg);
-    overflow-x: auto;
-    margin: 16px 0;
-  }
-  .doc-content :global(blockquote) {
-    border-left: 2px solid var(--accent);
-    background: var(--bg-elev);
-    padding: 16px 20px;
-    margin: 20px 0;
-    font-size: 14px;
-    color: var(--fg-dim);
-  }
-  .doc-content :global(blockquote strong) {
-    color: var(--fg);
-    font-family: var(--mono);
-    font-weight: 500;
-  }
-  .doc-content :global(table) {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 14px;
-    margin: 16px 0;
-  }
-  .doc-content :global(th),
-  .doc-content :global(td) {
-    text-align: left;
-    padding: 10px 12px;
-    border-bottom: 1px solid var(--line-soft);
-    vertical-align: top;
-  }
-  .doc-content :global(th) {
-    font-family: var(--mono);
-    font-size: 11px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--fg-mute);
-    font-weight: 500;
-    background: var(--bg-elev);
-  }
-  .doc-content :global(a) {
-    color: var(--accent);
-  }
-  .doc-content :global(.heading-anchor) {
-    color: var(--fg-mute);
-    margin-left: 8px;
-    text-decoration: none;
-    opacity: 0;
-    transition: opacity 0.15s;
-  }
-  .doc-content :global(h2:hover .heading-anchor),
-  .doc-content :global(h3:hover .heading-anchor) {
-    opacity: 1;
-  }
-
-  .doc-actions {
-    display: flex;
-    gap: 10px;
-    margin-top: 48px;
-    padding-top: 24px;
-    border-top: 1px solid var(--line-soft);
-  }
-
-  :global(.code-copy-btn) {
-    position: absolute;
-    top: 8px;
-    right: 8px;
-    background: transparent;
-    border: 1px solid var(--line);
-    color: var(--fg-mute);
-    font-family: var(--mono);
-    font-size: 10px;
-    padding: 2px 8px;
-    cursor: pointer;
-  }
-  :global(.code-copy-btn:hover) {
-    color: var(--accent);
-    border-color: var(--accent);
-  }
-
-  .toc {
-    position: sticky;
-    top: 70px;
-    height: calc(100vh - 96px);
-    overflow-y: auto;
-    font-family: var(--mono);
-    font-size: 12px;
-    padding-left: 16px;
-    border-left: 1px solid var(--line-soft);
-  }
-  .toc h5 {
-    font-size: 11px;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: var(--fg-mute);
-    margin: 0 0 10px;
-    font-weight: 500;
-  }
-  .toc a {
-    display: block;
-    padding: 4px 0;
-    color: var(--fg-mute);
-  }
-  .toc a:hover {
-    color: var(--fg);
-  }
-  .toc a.depth-3 {
-    padding-left: 12px;
-  }
-  .toc-meta {
-    margin-top: 32px;
-    padding-top: 16px;
-    border-top: 1px solid var(--line-soft);
-    color: var(--fg-mute);
-    font-size: 11px;
-  }
-  .toc-meta span {
-    color: var(--fg-dim);
-  }
-
-  @media (max-width: 1100px) {
-    .doc-layout {
-      grid-template-columns: 240px 1fr;
-    }
-    .toc {
-      display: none;
-    }
-  }
-  @media (max-width: 800px) {
-    .doc-layout {
-      grid-template-columns: 1fr;
-      padding: 16px;
-    }
-    aside.sidebar {
-      position: static;
-      height: auto;
-      border-right: none;
-      border-bottom: 1px solid var(--line-soft);
-      padding-bottom: 24px;
-    }
-  }
-</style>

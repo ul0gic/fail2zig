@@ -12,8 +12,8 @@ const { active } = Astro.props;
 const links: readonly { href: string; label: string }[] = [
   { href: '/', label: 'Home' },
   { href: '/docs', label: 'Docs' },
-  { href: '/security', label: 'Security' },
-  { href: '/manifesto', label: 'Manifesto' },
+  { href: '/threat-model', label: 'Threat Model' },
+  { href: '/why', label: 'Why' },
   { href: '/changelog', label: 'Changelog' },
   { href: '/install', label: 'Install' },
   { href: '/see-it-live', label: 'See it Live' },
@@ -30,8 +30,7 @@ const isActive = (href: string): boolean => {
 <nav class="site-nav">
   <div class="nav-inner">
     <a href="/" class="brand">
-      <span class="brand-mark" aria-hidden="true"></span>
-      fail2zig<span class="brand-slash">/</span><span class="brand-version">0.1.0-preview</span>
+      <span class="brand-name">fail<span class="brand-2">2</span>zig</span><span class="brand-slash">/</span><span class="brand-version">0.1.0-preview</span>
     </a>
     <div class="nav-links">
       {
@@ -55,8 +54,17 @@ const isActive = (href: string): boolean => {
 </nav>
 
 <style>
+  .brand-name,
+  .brand-slash,
+  .brand-version {
+    font-size: 20px;
+  }
+  .brand-2 {
+    color: var(--accent);
+  }
   .brand-version {
     color: var(--fg-dim);
     font-weight: 400;
+    font-style: italic;
   }
 </style>

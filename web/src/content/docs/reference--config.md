@@ -1,6 +1,6 @@
 ---
 title: Configuration reference
-description: Complete reference for fail2zig.toml — every key in [global], [defaults], and [jails.<name>], with types, defaults, constraints, and a full worked example.
+description: Complete reference for fail2zig.toml — every key in [global], [defaults], and [jails.<name>], with types, defaults, constraints, and validation rules.
 sidebar_position: 1
 category: Reference
 audience: operator
@@ -377,89 +377,19 @@ by the lack of per-jail escalation behavior.
 
 ---
 
-## Cross-reference: fail2ban → fail2zig
+## A complete worked example
 
-| fail2ban key         | fail2zig equivalent             | Notes                                                                                      |
-| -------------------- | ------------------------------- | ------------------------------------------------------------------------------------------ |
-| `[DEFAULT]` section  | `[defaults]` section            | Direct equivalent.                                                                         |
-| `bantime`            | `bantime`                       | Same semantics. fail2ban accepts `10m`, `1h` suffixes; fail2zig uses integer seconds only. |
-| `findtime`           | `findtime`                      | Same semantics. Integer seconds only.                                                      |
-| `maxretry`           | `maxretry`                      | Same semantics.                                                                            |
-| `ignoreip`           | `ignoreip`                      | TOML string array instead of whitespace-separated string.                                  |
-| `banaction`          | `banaction`                     | Mapped to one of: `nftables`, `iptables`, `ipset`, `log-only`.                             |
-| `bantime.increment`  | `bantime_increment_enabled`     |                                                                                            |
-| `bantime.factor`     | `bantime_increment_factor`      |                                                                                            |
-| `bantime.multiplier` | `bantime_increment_multiplier`  |                                                                                            |
-| `bantime.maxtime`    | `bantime_increment_max_bantime` |                                                                                            |
-| `bantime.formula`    | `bantime_increment_formula`     | Values: `linear`, `exponential`.                                                           |
-| `logpath`            | `logpath`                       | TOML string array.                                                                         |
-| `filter`             | `filter`                        | Same filter name convention.                                                               |
-| `enabled`            | `enabled`                       |                                                                                            |
-| `backend`            | Not applicable                  | fail2zig uses inotify + systemd journal natively; no `backend = auto` selection needed.    |
+A production-shape `fail2zig.toml` protecting SSH, nginx basic auth,
+and postfix — with commentary on each block — lives on its own page:
+[Example jail configuration](../guides/example-jail-config).
 
----
+Use that as a starting template and adapt the four or five values
+that matter for your environment (`ignoreip`, `memory_ceiling_mb`,
+per-jail `maxretry` / `bantime`).
 
-## Full worked example
-
-The following config protects SSH, nginx basic auth, and postfix. It uses
-exponential bantime escalation, a two-week maximum ban, and a shared ignore
-list for the local subnet and Ansible control host.
-
-```toml
-[global]
-log_level         = "info"
-pid_file          = "/run/fail2zig/fail2zig.pid"
-socket_path       = "/run/fail2zig/fail2zig.sock"
-state_file        = "/var/lib/fail2zig/state.bin"
-memory_ceiling_mb = 64
-metrics_bind      = "127.0.0.1"
-metrics_port      = 9100
-
-[defaults]
-bantime   = 600          # 10 minutes for a first offense
-findtime  = 600          # sliding window: 5 failures in 10 minutes
-maxretry  = 5
-banaction = "nftables"
-ignoreip  = [
-    "127.0.0.1/8",      # loopback
-    "::1",              # loopback IPv6
-    "10.0.0.0/8",       # internal network
-    "192.168.1.50/32",  # Ansible control host — exact IP
-]
-
-# Repeat offenders get exponentially longer bans, capped at 2 weeks.
-bantime_increment_enabled     = true
-bantime_increment_formula     = "exponential"
-bantime_increment_multiplier  = 1
-bantime_increment_factor      = 2
-bantime_increment_max_bantime = 1209600   # 14 days in seconds
-
-[jails.sshd]
-enabled  = true
-filter   = "sshd"
-logpath  = [
-    "/var/log/auth.log",  # Debian/Ubuntu
-    "/var/log/secure",    # RHEL/Fedora/CentOS
-]
-maxretry = 3              # stricter than the default — SSH is high-value
-bantime  = 3600           # first offense: 1 hour
-
-[jails.nginx-http-auth]
-enabled  = true
-filter   = "nginx-http-auth"
-logpath  = ["/var/log/nginx/error.log"]
-# Inherits maxretry=5, findtime=600, bantime=600 from [defaults].
-
-[jails.postfix]
-enabled  = true
-filter   = "postfix"
-logpath  = [
-    "/var/log/mail.log",    # Debian/Ubuntu
-    "/var/log/maillog",     # RHEL/Fedora
-]
-maxretry = 5
-bantime  = 1800           # first offense: 30 minutes
-```
+If you are migrating from an existing fail2ban install, the
+field-by-field mapping between `jail.conf` and `fail2zig.toml`
+lives on the [migration guide](../guides/migration-from-fail2ban).
 
 ---
 

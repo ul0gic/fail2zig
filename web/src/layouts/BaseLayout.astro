@@ -1,7 +1,11 @@
 ---
-import '@fontsource/inter/400.css';
-import '@fontsource/inter/500.css';
-import '@fontsource/inter/600.css';
+import '@fontsource/ibm-plex-sans/400.css';
+import '@fontsource/ibm-plex-sans/500.css';
+import '@fontsource/ibm-plex-sans/600.css';
+import '@fontsource/ibm-plex-serif/400.css';
+import '@fontsource/ibm-plex-serif/500.css';
+import '@fontsource/ibm-plex-serif/600.css';
+import '@fontsource/ibm-plex-serif/400-italic.css';
 import '@fontsource/jetbrains-mono/400.css';
 import '@fontsource/jetbrains-mono/500.css';
 import '@fontsource/jetbrains-mono/600.css';
@@ -26,7 +30,7 @@ const canonical = new URL(Astro.url.pathname, Astro.site ?? Astro.url).toString(
 ---
 
 <!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="en" data-theme="light">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
@@ -46,7 +50,7 @@ const canonical = new URL(Astro.url.pathname, Astro.site ?? Astro.url).toString(
       // Inline + pre-hydration to avoid a flash of wrong theme.
       (function () {
         const root = document.documentElement;
-        const stored = localStorage.getItem('f2z-theme') || 'dark';
+        const stored = localStorage.getItem('f2z-theme') || 'light';
         root.setAttribute('data-theme', stored);
         const render = () => {
           const btn = document.getElementById('theme-toggle');
