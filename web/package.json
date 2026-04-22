@@ -53,6 +53,9 @@
     "onlyBuiltDependencies": [
       "esbuild",
       "sharp"
-    ]
+    ],
+    "overrides": {
+      "yaml-language-server": "^1.22.0"
+    }
   }
 }
