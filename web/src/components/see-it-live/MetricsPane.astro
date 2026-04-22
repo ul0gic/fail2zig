@@ -1,0 +1,208 @@
+---
+/**
+ * MetricsPane — 1 Hz poll of `/metrics`, rendered as a flat grid of
+ * six counters plus a rolling parse-rate bar.
+ *
+ * Counters exposed:
+ *   lines_parsed        (with rolling lines/sec bar, computed from
+ *                        successive samples)
+ *   lines_matched
+ *   bans_total
+ *   active_bans
+ *   process_resident_memory_bytes (displayed as MB)
+ *   uptime              (derived: now - process_start_time_seconds)
+ *
+ * The rolling rate keeps the last 15 samples (~15 s window) and
+ * shows an EMA-smoothed lines/sec.  The bar width is normalised
+ * against 10M l/s (engine peak) so a busy demo VM sits around 1-5%
+ * — the point is the *live* movement, not an absolute scale.
+ */
+---
+
+<section class="pane metrics-pane" aria-label="fail2zig metrics">
+  <header class="pane-header">
+    <span class="pane-title">Metrics</span>
+    <span class="pane-sub"><code>demo.fail2zig.com/metrics</code> · 1 Hz poll</span>
+  </header>
+  <div class="metrics-body">
+    <div class="metric">
+      <div class="metric-label">lines parsed</div>
+      <div class="metric-value" id="m-lines-parsed">—</div>
+      <div class="metric-bar">
+        <div class="metric-bar-fill" id="m-rate-fill" style="width: 0%"></div>
+      </div>
+      <div class="metric-sub" id="m-rate-sub">0 lines/sec (EMA)</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">lines matched</div>
+      <div class="metric-value" id="m-lines-matched">—</div>
+      <div class="metric-sub">attack-pattern hits</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">bans (total)</div>
+      <div class="metric-value" id="m-bans-total">—</div>
+      <div class="metric-sub">lifetime</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">active bans</div>
+      <div class="metric-value" id="m-active-bans">—</div>
+      <div class="metric-sub">currently in nft set</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">resident memory</div>
+      <div class="metric-value" id="m-memory">—</div>
+      <div class="metric-sub">RSS</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">uptime</div>
+      <div class="metric-value" id="m-uptime">—</div>
+      <div class="metric-sub">since daemon start</div>
+    </div>
+  </div>
+</section>
+
+<style>
+  .metrics-pane {
+    grid-area: metrics;
+    min-height: 0;
+  }
+  .metrics-body {
+    flex: 1 1 auto;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+  }
+  .metric {
+    background: var(--surface-ink);
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+  }
+  .metric-label {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--fg-faint);
+  }
+  .metric-value {
+    font-family: var(--mono);
+    font-size: 22px;
+    font-weight: 500;
+    color: var(--fg);
+    font-variant-numeric: tabular-nums;
+  }
+  .metric-sub {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--fg-dim);
+  }
+  .metric-bar {
+    height: 3px;
+    background: var(--bg-band);
+    overflow: hidden;
+    margin-top: 2px;
+  }
+  .metric-bar-fill {
+    height: 100%;
+    background: var(--accent);
+    transition: width 0.6s ease-out;
+  }
+</style>
+
+<script>
+  import { parsePrometheus, metricValue } from '@/lib/prometheus';
+
+  const POLL_MS = 1_000;
+  const METRICS_URL = 'https://demo.fail2zig.com/metrics';
+  const RATE_WINDOW = 15;
+  const RATE_MAX_LINES_PER_SEC = 10_000_000;
+
+  const fmtNumber = (n: number): string => n.toLocaleString('en-US');
+  const fmtMB = (bytes: number): string => `${(bytes / 1_048_576).toFixed(1)} MB`;
+  const fmtUptime = (seconds: number): string => {
+    const s = Math.max(0, Math.floor(seconds));
+    const days = Math.floor(s / 86_400);
+    const hours = Math.floor((s % 86_400) / 3_600);
+    const mins = Math.floor((s % 3_600) / 60);
+    if (days > 0) return `${String(days)}d ${String(hours)}h ${String(mins)}m`;
+    if (hours > 0) return `${String(hours)}h ${String(mins)}m`;
+    return `${String(mins)}m ${String(s % 60)}s`;
+  };
+
+  const writeText = (id: string, value: string): void => {
+    const el = document.getElementById(id);
+    if (el !== null) el.textContent = value;
+  };
+
+  interface Sample {
+    t: number;
+    linesParsed: number;
+  }
+  const samples: Sample[] = [];
+
+  let lastRateEma = 0;
+
+  const updateRate = (linesParsed: number): void => {
+    const now = Date.now();
+    samples.push({ t: now, linesParsed });
+    while (samples.length > RATE_WINDOW) samples.shift();
+    if (samples.length < 2) return;
+    const first = samples[0];
+    const last = samples[samples.length - 1];
+    if (first === undefined || last === undefined) return;
+    const dt = (last.t - first.t) / 1_000;
+    if (dt <= 0) return;
+    const lps = Math.max(0, (last.linesParsed - first.linesParsed) / dt);
+    // EMA with alpha 0.35 — smooth without excessive lag.
+    lastRateEma = lastRateEma === 0 ? lps : lastRateEma * 0.65 + lps * 0.35;
+    writeText('m-rate-sub', `${fmtNumber(Math.round(lastRateEma))} lines/sec (EMA)`);
+    const pct = Math.min(100, (lastRateEma / RATE_MAX_LINES_PER_SEC) * 100);
+    const fill = document.getElementById('m-rate-fill');
+    if (fill !== null) fill.style.width = `${pct.toFixed(2)}%`;
+  };
+
+  const tick = async (): Promise<void> => {
+    try {
+      const res = await fetch(METRICS_URL, { cache: 'no-store' });
+      if (!res.ok) throw new Error(String(res.status));
+      const text = await res.text();
+      const sample = parsePrometheus(text);
+
+      const linesParsed = metricValue(sample, 'fail2zig_lines_parsed');
+      const linesMatched = metricValue(sample, 'fail2zig_lines_matched');
+      const bansTotal = metricValue(sample, 'fail2zig_bans_total');
+      const activeBans = metricValue(sample, 'fail2zig_active_bans');
+      const memBytes = metricValue(sample, 'process_resident_memory_bytes');
+      const startTime = metricValue(sample, 'process_start_time_seconds');
+
+      if (linesParsed !== null) {
+        writeText('m-lines-parsed', fmtNumber(Math.round(linesParsed)));
+        updateRate(linesParsed);
+      }
+      if (linesMatched !== null) writeText('m-lines-matched', fmtNumber(Math.round(linesMatched)));
+      if (bansTotal !== null) writeText('m-bans-total', fmtNumber(Math.round(bansTotal)));
+      if (activeBans !== null) writeText('m-active-bans', fmtNumber(Math.round(activeBans)));
+      if (memBytes !== null) writeText('m-memory', fmtMB(memBytes));
+      if (startTime !== null) {
+        const up = Date.now() / 1_000 - startTime;
+        writeText('m-uptime', fmtUptime(up));
+      }
+    } catch {
+      // Silent skip — the status banner already tells the user the
+      // feed is degraded.  Previous values stay on screen.
+    }
+  };
+
+  void tick();
+  const interval = window.setInterval(() => {
+    void tick();
+  }, POLL_MS);
+  window.addEventListener('beforeunload', () => {
+    window.clearInterval(interval);
+  });
+</script>

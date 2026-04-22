@@ -97,7 +97,20 @@ pub const GlobalConfig = struct {
     /// run both fail2zig and node_exporter on the same host should
     /// override one of them.
     metrics_port: u16 = 9100,
+    /// Maximum simultaneous WebSocket clients on `/events`. Default is
+    /// operator-friendly (small trusted set of dashboards / curl users).
+    /// The honeypot demo config sets this to 128. Hard-capped at 1024 by
+    /// the validator; zero is rejected. Surface-level knob — each client
+    /// holds a small per-connection buffer, so growing this affects heap
+    /// footprint but not the hot parse path.
+    websocket_max_clients: u32 = 16,
 };
+
+/// Absolute upper bound on `websocket_max_clients`. Kept in sync with
+/// `engine/net/ws.zig::hard_max_clients`; defined here so the config
+/// layer can enforce the bound without importing the ws module (and
+/// thus avoiding a circular dependency through main.zig).
+pub const websocket_hard_max_clients: u32 = 1024;
 
 pub const JailDefaults = struct {
     bantime: shared.Duration = 600,
@@ -613,6 +626,14 @@ const Parser = struct {
             const n = try asInt(v);
             if (n < 0 or n > 65535) return error.InvalidValue;
             self.global.metrics_port = @intCast(n);
+        } else if (std.mem.eql(u8, key, "websocket_max_clients")) {
+            // 9B.1.2: reject zero and anything past the hard cap at parse
+            // time. Zero would produce a WsServer that accepts no clients
+            // at all (silent breakage), and values past `hard_max_clients`
+            // open a heap-pressure vector via an allocatable slot table.
+            const n = try asInt(v);
+            if (n <= 0 or n > websocket_hard_max_clients) return error.InvalidValue;
+            self.global.websocket_max_clients = @intCast(n);
         } else return error.UnknownKey;
     }
 
@@ -1100,4 +1121,62 @@ test "native: parse a full example with all options" {
     try std.testing.expect(cfg.jails[0].bantime_increment.enabled);
     try std.testing.expectEqualStrings("nginx-http-auth", cfg.jails[1].name);
     try std.testing.expectEqual(@as(usize, 1), cfg.jails[1].ignoreip.?.len);
+}
+
+test "native: websocket_max_clients default is 16" {
+    // 9B.1.2: unset key -> default preserved, so existing deployments
+    // that don't mention the key keep their old behaviour.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[global]
+        \\memory_ceiling_mb = 32
+    ;
+    const cfg = try Config.parse(arena.allocator(), src);
+    try std.testing.expectEqual(@as(u32, 16), cfg.global.websocket_max_clients);
+}
+
+test "native: websocket_max_clients accepts 16, 128, and hard cap" {
+    // 9B.1.2: representative valid values — the stock default, the
+    // honeypot demo setting, and the hard cap exactly at the boundary.
+    const cases = [_]u32{ 16, 128, websocket_hard_max_clients };
+    for (cases) |v| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+
+        var buf: [128]u8 = undefined;
+        const src = try std.fmt.bufPrint(
+            &buf,
+            "[global]\nwebsocket_max_clients = {d}\n",
+            .{v},
+        );
+        const cfg = try Config.parse(arena.allocator(), src);
+        try std.testing.expectEqual(v, cfg.global.websocket_max_clients);
+    }
+}
+
+test "native: websocket_max_clients rejects 0" {
+    // 9B.1.2: a zero-cap WsServer is a silent-breakage config — no
+    // dashboard can ever connect. Fail closed at parse time.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[global]
+        \\websocket_max_clients = 0
+    ;
+    try std.testing.expectError(error.InvalidValue, Config.parse(arena.allocator(), src));
+}
+
+test "native: websocket_max_clients rejects values above hard cap" {
+    // 9B.1.2: reject anything past `websocket_hard_max_clients` (1024) so
+    // the allocator can't be asked for a gigantic slot table via config.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    const src = try std.fmt.bufPrint(
+        &buf,
+        "[global]\nwebsocket_max_clients = {d}\n",
+        .{websocket_hard_max_clients + 1},
+    );
+    try std.testing.expectError(error.InvalidValue, Config.parse(arena.allocator(), src));
 }

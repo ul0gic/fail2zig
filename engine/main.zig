@@ -690,14 +690,27 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     try ipc_server.start();
 
     // WebSocket server — state-only, the HTTP server owns the listener.
-    var ws_server = ws.WsServer.init(heap, &loop) catch |err| {
-        std.log.err("ws: init failed: {s}", .{@errorName(err)});
+    // Client cap comes from `[global] websocket_max_clients` (default 16,
+    // capped at `ws.hard_max_clients` by the config validator).
+    var ws_server = ws.WsServer.init(
+        heap,
+        &loop,
+        cfg.global.websocket_max_clients,
+    ) catch |err| {
+        std.log.err(
+            "ws: init failed (max_clients={d}): {s}",
+            .{ cfg.global.websocket_max_clients, @errorName(err) },
+        );
         return err;
     };
     defer ws_server.deinit();
 
     // HTTP server (metrics + status + /events WebSocket upgrade).
-    var http_ctx: HttpSources = .{ .metrics = &metrics, .cmd_ctx = &cmd_ctx };
+    var http_ctx: HttpSources = .{
+        .metrics = &metrics,
+        .cmd_ctx = &cmd_ctx,
+        .state = &tracker,
+    };
     var http_server = http.HttpServer.init(
         heap,
         &loop,
@@ -713,6 +726,7 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     defer http_server.deinit();
     http_server.setMetricsSource(.{ .ctx = @ptrCast(&http_ctx), .write = writeMetricsPayload });
     http_server.setStatusSource(.{ .ctx = @ptrCast(&http_ctx), .write = writeStatusPayload });
+    http_server.setBansSource(.{ .ctx = @ptrCast(&http_ctx), .write = writeBansPayload });
     http_server.setWsServer(&ws_server);
     try http_server.start();
 
@@ -809,12 +823,13 @@ fn metricsStatsSnapshot(ctx: ?*anyopaque) commands_mod.StatsSnapshot {
     };
 }
 
-/// Bundle of pointers the HTTP `/metrics` and `/api/status` handlers
-/// need. Kept together so we only plumb one `ctx` pointer through the
-/// vtable.
+/// Bundle of pointers the HTTP `/metrics`, `/api/status`, and
+/// `/api/bans` handlers need. Kept together so we only plumb one `ctx`
+/// pointer through each source vtable.
 const HttpSources = struct {
     metrics: *metrics_mod.Metrics,
     cmd_ctx: *commands_mod.Context,
+    state: *state_mod.StateTracker,
 };
 
 /// MetricsSource.write implementation — renders the Prometheus text
@@ -893,6 +908,97 @@ fn writeStatusPayload(
             try out.appendSlice(a, s);
         },
     }
+}
+
+/// BansSource.write implementation — walks the state tracker and emits
+/// the active-ban snapshot consumed by `NftSetPane` on the see-it-live
+/// dashboard. Schema:
+///
+/// ```
+/// {
+///   "set_name":"fail2zig_bans",
+///   "family":"inet",
+///   "table":"fail2zig",
+///   "count":N,
+///   "elements":[{"ip":"...","jail":"...","remaining_s":N,"banned_at":<epoch>}]
+/// }
+/// ```
+///
+/// `count` reflects the full number of active bans; `elements` is
+/// truncated at `http.max_bans_in_snapshot` (200) so the response size
+/// stays bounded. `remaining_s` is `max(0, ban_expiry - now)` — negative
+/// remainders (already-expired but not-yet-swept) are reported as zero.
+/// `banned_at` is inferred as `ban_expiry - duration` where `duration`
+/// is derived from the tracker's configured bantime and the recorded
+/// ban_count — good enough for a demo panel; for forensic use we will
+/// persist the true ban timestamp in Phase 10.
+fn writeBansPayload(
+    ctx: ?*anyopaque,
+    out: *std.ArrayListUnmanaged(u8),
+    a: std.mem.Allocator,
+) anyerror!void {
+    const self: *HttpSources = @ptrCast(@alignCast(ctx.?));
+    const w = out.writer(a);
+
+    // First pass: count active bans (so `count` is accurate even when
+    // we truncate `elements`).
+    var total: u32 = 0;
+    {
+        var it = self.state.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.ban_state == .banned) total += 1;
+        }
+    }
+
+    try w.writeAll(
+        "{\"set_name\":\"fail2zig_bans\",\"family\":\"inet\",\"table\":\"fail2zig\",\"count\":",
+    );
+    try w.print("{d}", .{total});
+    try w.writeAll(",\"elements\":[");
+
+    const now_s: i64 = std.time.timestamp();
+    const cfg = self.state.config;
+
+    var written: usize = 0;
+    var it = self.state.iterator();
+    while (it.next()) |kv| {
+        if (kv.value_ptr.ban_state != .banned) continue;
+        if (written >= http.max_bans_in_snapshot) break;
+        if (written > 0) try w.writeAll(",");
+        written += 1;
+
+        const ip = kv.key_ptr.*;
+        const st = kv.value_ptr;
+
+        // remaining_s: clamp to 0 if the ban has already lapsed but the
+        // expiry sweep hasn't fired yet.
+        const remaining_s: i64 = if (st.ban_expiry) |exp|
+            @max(0, exp - now_s)
+        else
+            0;
+
+        // banned_at: best-effort reconstruction. The tracker doesn't
+        // persist the ban start timestamp directly — we derive it by
+        // subtracting the computed bantime for this recidive count from
+        // the expiry. See the docstring above for the caveat.
+        const duration = state_mod.computeBantime(
+            cfg.bantime,
+            cfg.bantime_increment,
+            if (st.ban_count == 0) 0 else st.ban_count - 1,
+        );
+        const dur_i64: i64 = @intCast(@min(duration, std.math.maxInt(i64)));
+        const banned_at: i64 = if (st.ban_expiry) |exp|
+            std.math.sub(i64, exp, dur_i64) catch now_s
+        else
+            now_s;
+
+        try w.print(
+            "{{\"ip\":\"{}\",\"jail\":\"{s}\",\"remaining_s\":{d},\"banned_at\":{d}}}",
+            .{ ip, st.jail.slice(), remaining_s, banned_at },
+        );
+    }
+
+    try w.writeAll("]}");
 }
 
 // ============================================================================
@@ -1161,4 +1267,140 @@ test {
     _ = commands_mod;
     _ = metrics_mod;
     _ = shared;
+}
+
+// ---------- 9B.1.1: /api/bans payload tests ----------
+//
+// These exercise `writeBansPayload` directly with a state tracker we
+// control. We bypass `recordAttempt` and inject banned entries via the
+// map — mirrors the pattern used by `net/commands.zig` tests.
+
+const testing = std.testing;
+
+/// Helper: build a minimal HttpSources wired up only for the bans path.
+/// `metrics` and `cmd_ctx` fields get unused stub pointers — the bans
+/// writer reads only `state`.
+fn injectBan(
+    tracker: *state_mod.StateTracker,
+    ip_str: []const u8,
+    jail_name: []const u8,
+    banned_at: shared.Timestamp,
+    duration: shared.Duration,
+) !void {
+    const ip = try shared.IpAddress.parse(ip_str);
+    const jail = try shared.JailId.fromSlice(jail_name);
+    const gop = try tracker.map.getOrPut(ip);
+    gop.value_ptr.* = .{
+        .jail = jail,
+        .attempt_count = 1,
+        .ban_count = 1,
+        .first_attempt = banned_at,
+        .last_attempt = banned_at,
+        .ban_state = .banned,
+        .ban_expiry = banned_at + @as(shared.Timestamp, @intCast(duration)),
+        .ring = undefined,
+        .ring_len = 0,
+    };
+}
+
+test "http: /api/bans empty snapshot -> count 0, elements []" {
+    const a = testing.allocator;
+    var tracker = try state_mod.StateTracker.init(a, .{
+        .max_entries = 16,
+        .findtime = 600,
+        .maxretry = 5,
+        .bantime = 600,
+    });
+    defer tracker.deinit();
+
+    var ctx: HttpSources = .{
+        .metrics = undefined,
+        .cmd_ctx = undefined,
+        .state = &tracker,
+    };
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    defer out.deinit(a);
+    try writeBansPayload(@ptrCast(&ctx), &out, a);
+
+    const body = out.items;
+    try testing.expect(std.mem.indexOf(u8, body, "\"set_name\":\"fail2zig_bans\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"family\":\"inet\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"table\":\"fail2zig\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"count\":0") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"elements\":[]") != null);
+}
+
+test "http: /api/bans single ban populates element fields" {
+    const a = testing.allocator;
+    var tracker = try state_mod.StateTracker.init(a, .{
+        .max_entries = 16,
+        .findtime = 600,
+        .maxretry = 5,
+        .bantime = 600,
+    });
+    defer tracker.deinit();
+
+    // Use a banned_at comfortably in the past so `banned_at` field in
+    // the response is deterministic relative to the fixed bantime.
+    try injectBan(&tracker, "185.220.101.5", "sshd", 1_714_000_000, 600);
+
+    var ctx: HttpSources = .{
+        .metrics = undefined,
+        .cmd_ctx = undefined,
+        .state = &tracker,
+    };
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    defer out.deinit(a);
+    try writeBansPayload(@ptrCast(&ctx), &out, a);
+
+    const body = out.items;
+    try testing.expect(std.mem.indexOf(u8, body, "\"count\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"ip\":\"185.220.101.5\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"jail\":\"sshd\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"banned_at\":1714000000") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"remaining_s\":") != null);
+}
+
+test "http: /api/bans truncates elements at 200 but count reflects total" {
+    const a = testing.allocator;
+    // Capacity large enough to hold all 250 entries; the cap we enforce
+    // at the response layer is `http.max_bans_in_snapshot`, not the
+    // tracker's.
+    var tracker = try state_mod.StateTracker.init(a, .{
+        .max_entries = 512,
+        .findtime = 600,
+        .maxretry = 5,
+        .bantime = 600,
+    });
+    defer tracker.deinit();
+
+    // 250 unique IPs in 10.x.y.z range — all banned.
+    var i: u32 = 0;
+    while (i < 250) : (i += 1) {
+        var buf: [16]u8 = undefined;
+        const s = try std.fmt.bufPrint(&buf, "10.0.{d}.{d}", .{ i / 256, i % 256 });
+        try injectBan(&tracker, s, "sshd", 1_714_000_000, 600);
+    }
+
+    var ctx: HttpSources = .{
+        .metrics = undefined,
+        .cmd_ctx = undefined,
+        .state = &tracker,
+    };
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    defer out.deinit(a);
+    try writeBansPayload(@ptrCast(&ctx), &out, a);
+
+    const body = out.items;
+    try testing.expect(std.mem.indexOf(u8, body, "\"count\":250") != null);
+
+    // Count the elements by counting `"ip":` occurrences — robust to
+    // element ordering since HashMap iteration isn't sorted.
+    var element_count: usize = 0;
+    var cursor: usize = 0;
+    while (std.mem.indexOf(u8, body[cursor..], "\"ip\":")) |rel| {
+        element_count += 1;
+        cursor += rel + 1;
+    }
+    try testing.expectEqual(http.max_bans_in_snapshot, element_count);
 }

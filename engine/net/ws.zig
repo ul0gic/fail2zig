@@ -18,8 +18,10 @@
 //! event loop under WsServer's frame-reading callback.
 //!
 //! Security notes:
-//!   - Max 16 clients hard-capped. Excess connections rejected at the
-//!     HTTP layer with 503 before the upgrade completes.
+//!   - Per-instance client cap (`max_clients` on `WsServer`, supplied by
+//!     the daemon from `[global] websocket_max_clients`, default 16).
+//!     Excess connections rejected at the HTTP layer before the upgrade
+//!     completes.
 //!   - Payloads from clients capped at 64 KB (dashboard only ever
 //!     sends pings/pongs, so this is generous).
 //!   - Masking enforced on every frame we receive per RFC. Server
@@ -37,7 +39,16 @@ const EventLoop = event_loop_mod.EventLoop;
 // Constants
 // ============================================================================
 
-pub const max_clients: usize = 16;
+/// Default client cap when the daemon does not supply one (tests,
+/// unconfigured embeds). Production callers pass the configured value
+/// via `WsServer.init`'s `max_clients` parameter which originates from
+/// `[global] websocket_max_clients` in `config.toml`.
+pub const default_max_clients: usize = 16;
+
+/// Absolute upper bound on `max_clients`. The config parser rejects any
+/// `websocket_max_clients` value that exceeds this. Keeps a malformed
+/// config from asking us to allocate a gigantic slot table.
+pub const hard_max_clients: usize = 1024;
 pub const max_handshake_bytes: usize = 8 * 1024;
 pub const max_inbound_payload: usize = 64 * 1024;
 
@@ -71,6 +82,7 @@ pub const Error = error{
     TooManyClients,
     OutOfMemory,
     NotLinux,
+    InvalidMaxClients,
 };
 
 // ============================================================================
@@ -102,23 +114,39 @@ const ClientReg = struct {
 pub const WsServer = struct {
     allocator: std.mem.Allocator,
     loop: *EventLoop,
-    clients: [max_clients]?*ClientReg = [_]?*ClientReg{null} ** max_clients,
+    /// Heap-allocated slot table sized at `init` time. One `?*ClientReg`
+    /// per admissible client; `null` means the slot is free. Fixed-size
+    /// after construction — we never grow under load.
+    clients: []?*ClientReg,
 
     /// Construct a WsServer with no listening socket. The HttpServer
     /// is expected to feed upgraded client FDs in via `admitUpgraded`.
+    ///
+    /// `max_clients` is the runtime cap (from `[global] websocket_max_clients`).
+    /// Must be in `1..=hard_max_clients` — zero or out-of-range values
+    /// return `error.InvalidMaxClients` rather than silently falling back,
+    /// so a misconfigured daemon fails closed at startup.
     pub fn init(
         allocator: std.mem.Allocator,
         loop: *EventLoop,
+        max_clients: usize,
     ) Error!WsServer {
         if (builtin.os.tag != .linux) return error.NotLinux;
+        if (max_clients == 0 or max_clients > hard_max_clients) {
+            return error.InvalidMaxClients;
+        }
+        const slots = allocator.alloc(?*ClientReg, max_clients) catch
+            return error.OutOfMemory;
+        @memset(slots, null);
         return .{
             .allocator = allocator,
             .loop = loop,
+            .clients = slots,
         };
     }
 
     pub fn deinit(self: *WsServer) void {
-        for (&self.clients) |*slot| {
+        for (self.clients) |*slot| {
             if (slot.*) |cli| {
                 self.loop.removeFd(cli.fd) catch {};
                 posix.close(cli.fd);
@@ -127,6 +155,7 @@ pub const WsServer = struct {
                 slot.* = null;
             }
         }
+        self.allocator.free(self.clients);
         self.* = undefined;
     }
 
@@ -297,7 +326,7 @@ pub const WsServer = struct {
     /// Send a text message to every connected (post-upgrade) client.
     /// Slow clients whose write would block are dropped.
     pub fn broadcast(self: *WsServer, text: []const u8) !void {
-        for (&self.clients) |*slot| {
+        for (self.clients) |*slot| {
             if (slot.*) |cli| {
                 if (!cli.upgraded) continue;
                 writeTextFrame(cli.fd, text) catch {
@@ -376,7 +405,7 @@ pub const WsServer = struct {
     /// `last_pong` is older than `ping_interval_ms + pong_timeout_ms`.
     pub fn tickHeartbeat(self: *WsServer) void {
         const now = std.time.milliTimestamp();
-        for (&self.clients) |*slot| {
+        for (self.clients) |*slot| {
             if (slot.*) |cli| {
                 if (!cli.upgraded) continue;
                 if (cli.last_pong_ms != 0 and
@@ -399,7 +428,7 @@ pub const WsServer = struct {
     }
 
     fn closeClient(self: *WsServer, cli: *ClientReg) void {
-        for (&self.clients) |*slot| {
+        for (self.clients) |*slot| {
             if (slot.*) |existing| {
                 if (existing == cli) {
                     slot.* = null;
@@ -707,7 +736,7 @@ test "ws: buffer full with unparseable bytes closes client (SEC-010)" {
     var loop = try EventLoop.init(a);
     defer loop.deinit();
 
-    var server = try WsServer.init(a, &loop);
+    var server = try WsServer.init(a, &loop, default_max_clients);
     defer server.deinit();
 
     var fds: [2]i32 = undefined;
@@ -759,7 +788,7 @@ test "ws: admitUpgraded takes ownership of fd and broadcasts reach it" {
     var loop = try EventLoop.init(a);
     defer loop.deinit();
 
-    var server = try WsServer.init(a, &loop);
+    var server = try WsServer.init(a, &loop, default_max_clients);
     defer server.deinit();
 
     var fds: [2]i32 = undefined;
@@ -796,12 +825,12 @@ test "ws: admitUpgraded rejects past max_clients and closes the fd" {
     var loop = try EventLoop.init(a);
     defer loop.deinit();
 
-    var server = try WsServer.init(a, &loop);
+    var server = try WsServer.init(a, &loop, default_max_clients);
     defer server.deinit();
 
     // Fill all slots.
-    var peer_fds: [max_clients]i32 = undefined;
-    for (0..max_clients) |i| {
+    var peer_fds: [default_max_clients]i32 = undefined;
+    for (0..default_max_clients) |i| {
         var fds: [2]i32 = undefined;
         const stype_u32: u32 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
         const rc = linux.socketpair(
@@ -847,7 +876,7 @@ test "ws: broadcast to 3 in-memory clients all receive the same frame" {
     // We don't need a listener for this test — construct a WsServer
     // and inject three "upgraded" clients backed by socketpair fds. The
     // test reads from the peer side of each pair to verify the frame.
-    var server = try WsServer.init(a, &loop);
+    var server = try WsServer.init(a, &loop, default_max_clients);
 
     var peer_fds: [3]i32 = undefined;
     defer for (&peer_fds) |f| posix.close(f);
@@ -894,8 +923,11 @@ test "ws: broadcast to 3 in-memory clients all receive the same frame" {
         try testing.expectEqualStrings("hello world", buf[2..13]);
     }
 
-    // Manual cleanup since we skipped the loop.
-    for (&server.clients) |*slot| {
+    // Manual cleanup since we skipped the loop. We close each injected
+    // client by hand (the FDs were never registered with the loop), then
+    // free the slot table — mirror of what `deinit` would do without the
+    // `loop.removeFd` calls.
+    for (server.clients) |*slot| {
         if (slot.*) |cli| {
             posix.close(cli.fd);
             a.free(cli.buf);
@@ -903,4 +935,48 @@ test "ws: broadcast to 3 in-memory clients all receive the same frame" {
             slot.* = null;
         }
     }
+    a.free(server.clients);
+}
+
+test "ws: init rejects max_clients == 0" {
+    // 9B.1.2: guard against a misconfigured `websocket_max_clients = 0`
+    // that slipped past the config parser — fail closed rather than
+    // silently fall back to a default.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = testing.allocator;
+    var loop = try EventLoop.init(a);
+    defer loop.deinit();
+    try testing.expectError(error.InvalidMaxClients, WsServer.init(a, &loop, 0));
+}
+
+test "ws: init rejects max_clients above hard_max_clients" {
+    // 9B.1.2: operator cannot ask us to allocate an unbounded slot table
+    // via a huge `websocket_max_clients`. Hard cap at `hard_max_clients`.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = testing.allocator;
+    var loop = try EventLoop.init(a);
+    defer loop.deinit();
+    try testing.expectError(
+        error.InvalidMaxClients,
+        WsServer.init(a, &loop, hard_max_clients + 1),
+    );
+}
+
+test "ws: init with custom max_clients sizes slot table" {
+    // 9B.1.2: the slot table length must equal the configured cap, so
+    // admission-testing by counting successful `admitUpgraded` calls is
+    // meaningful.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = testing.allocator;
+    var loop = try EventLoop.init(a);
+    defer loop.deinit();
+
+    var server = try WsServer.init(a, &loop, 3);
+    defer server.deinit();
+    try testing.expectEqual(@as(usize, 3), server.clients.len);
+
+    // Also honours the boundary at `hard_max_clients` exactly.
+    var big = try WsServer.init(a, &loop, hard_max_clients);
+    defer big.deinit();
+    try testing.expectEqual(hard_max_clients, big.clients.len);
 }

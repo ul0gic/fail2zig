@@ -1,0 +1,155 @@
+---
+/**
+ * StatusBanner — top strip reporting the live/replay state.
+ *
+ * Subscribes to the shared EventStream instance published by
+ * TerminalPane via `window.fail2zigStream`.  Renders one of four
+ * states:
+ *
+ *   [ connected · N active bans · last event Xs ago ]
+ *   [ connecting to demo.fail2zig.com… ]
+ *   [ reconnecting (attempt N) ]
+ *   [ REPLAY MODE — live feed unavailable ]
+ *
+ * Connection state is the source of truth; the "N active bans" and
+ * "last event Xs ago" details come from tracking ip_banned and
+ * ip_unbanned frames as they pass.
+ */
+---
+
+<div id="status-banner" class="status-banner" role="status" aria-live="polite">
+  <span id="status-dot" class="status-dot status-dot-connecting" aria-hidden="true"></span>
+  <span id="status-text">connecting to demo.fail2zig.com…</span>
+</div>
+
+<style>
+  .status-banner {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 16px;
+    background: var(--bg-band);
+    border: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+    font-family: var(--mono);
+    font-size: 12.5px;
+    color: var(--fg-body);
+  }
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+    flex-shrink: 0;
+  }
+  .status-dot-connecting {
+    background: var(--fg-faint);
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+  .status-dot-connected {
+    background: var(--safe);
+  }
+  .status-dot-disconnected {
+    background: var(--danger);
+  }
+  .status-dot-replay {
+    background: var(--accent);
+  }
+  @keyframes pulse {
+    0%,
+    100% {
+      opacity: 0.4;
+    }
+    50% {
+      opacity: 1;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .status-dot-connecting {
+      animation: none;
+    }
+  }
+  .status-banner .status-emphasis {
+    color: var(--fg);
+    font-weight: 500;
+  }
+</style>
+
+<script>
+  import type { EventStream, StreamState } from '@/lib/event-stream';
+  import type { DemoEvent } from '@/lib/events';
+
+  interface StreamWindow extends Window {
+    fail2zigStream?: EventStream;
+  }
+
+  const dot = document.getElementById('status-dot');
+  const text = document.getElementById('status-text');
+
+  let activeBans = 0;
+  let lastEventAt: number | null = null;
+
+  const render = (state: Readonly<StreamState>): void => {
+    if (dot === null || text === null) return;
+    dot.classList.remove(
+      'status-dot-connecting',
+      'status-dot-connected',
+      'status-dot-disconnected',
+      'status-dot-replay',
+    );
+    switch (state.status) {
+      case 'connecting':
+        dot.classList.add('status-dot-connecting');
+        text.textContent = 'connecting to demo.fail2zig.com…';
+        break;
+      case 'connected': {
+        dot.classList.add('status-dot-connected');
+        const parts: string[] = ['connected'];
+        parts.push(`${String(activeBans)} active bans seen this session`);
+        if (lastEventAt !== null) {
+          const age = Math.max(0, Math.round((Date.now() - lastEventAt) / 1_000));
+          parts.push(`last event ${String(age)}s ago`);
+        } else {
+          parts.push('awaiting first event');
+        }
+        text.textContent = `[ ${parts.join(' · ')} ]`;
+        break;
+      }
+      case 'disconnected':
+        dot.classList.add('status-dot-disconnected');
+        text.textContent = `[ reconnecting (attempt ${String(state.attemptCount)}) ]`;
+        break;
+      case 'replay':
+        dot.classList.add('status-dot-replay');
+        text.textContent = '[ REPLAY MODE — live feed unavailable, showing a recent blessed snapshot ]';
+        break;
+    }
+  };
+
+  const wire = (stream: EventStream): void => {
+    stream.onState(render);
+    stream.onEvent((event: DemoEvent) => {
+      lastEventAt = Date.now();
+      if (event.type === 'ip_banned') activeBans += 1;
+      if (event.type === 'ip_unbanned' && activeBans > 0) activeBans -= 1;
+    });
+    // Re-render every second so the "last event Xs ago" ticks forward.
+    window.setInterval(() => {
+      render(stream.getState());
+    }, 1_000);
+  };
+
+  const streamWindow = window as StreamWindow;
+  if (streamWindow.fail2zigStream !== undefined) {
+    wire(streamWindow.fail2zigStream);
+  } else {
+    window.addEventListener(
+      'fail2zig:stream-ready',
+      () => {
+        const s = (window as StreamWindow).fail2zigStream;
+        if (s !== undefined) wire(s);
+      },
+      { once: true },
+    );
+  }
+</script>

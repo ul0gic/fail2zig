@@ -8,9 +8,13 @@
 # and can conflict on deploy.
 #
 # Phase 9A: pure static-assets Worker.
-# Phase 9B: will add a `main` script (worker/index.ts) + restore the
-# ASSETS binding so dynamic handlers (/api/whoami, /trigger/*, the
-# WebSocket feed) can fall through to static assets.
+# Phase 9B: still pure static-assets. The see-it-live dashboard talks
+# directly to the demo origin through a Cloudflare Tunnel hostname
+# (`demo.fail2zig.com/events`, `/metrics`, `/api/bans`) — there is no
+# Worker in the path, no `/api/whoami`, no `/trigger/*`. Keeping this
+# deployment assets-only means no dynamic surface to harden, no Worker
+# bundle to size-budget, and no routes block to conflict with the
+# dashboard-managed custom domain.
 
 name = "fail2zig"
 compatibility_date = "2026-04-22"

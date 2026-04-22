@@ -1,0 +1,194 @@
+---
+/**
+ * TerminalPane — xterm.js live feed for attack_detected / ip_banned /
+ * ip_unbanned events.
+ *
+ * Scoped via `id="terminal-pane"` so the inline script can bootstrap
+ * without a bundler-level import cycle.  The module script imports
+ * xterm + addon-fit directly (Astro/Vite resolves, bundles, hashes).
+ *
+ * Behaviours:
+ *   - 200-line ring buffer (`scrollback: 200`)
+ *   - ANSI colour per jail (sshd=cyan, nginx-botsearch=magenta,
+ *     nginx-http-auth=yellow, nginx-limit-req=green, postfix=red,
+ *     fallback=white).
+ *   - Quiet-window copy: after 30 s of no events, dim
+ *     "waiting for next attack…"; after 60 s total, adds the
+ *     "organic-traffic windows vary" line.  Never synthesises fake
+ *     events.
+ *   - Responds to window resize via FitAddon.
+ */
+---
+
+<section class="pane terminal-pane" aria-label="Live attack feed">
+  <header class="pane-header">
+    <span class="pane-title">Live feed</span>
+    <span class="pane-sub">WebSocket · <code>demo.fail2zig.com/events</code></span>
+  </header>
+  <div id="terminal-host" class="terminal-host" aria-live="polite" aria-label="Terminal log of attack and ban events"></div>
+</section>
+
+<style>
+  .terminal-pane {
+    grid-area: terminal;
+    min-height: 0;
+  }
+  .terminal-host {
+    flex: 1 1 auto;
+    min-height: 360px;
+    height: 100%;
+    background: var(--surface-ink);
+    border: 1px solid var(--line);
+    padding: 10px 12px;
+    overflow: hidden;
+  }
+  .terminal-host :global(.xterm) {
+    height: 100% !important;
+  }
+  .terminal-host :global(.xterm-viewport) {
+    background: transparent !important;
+  }
+</style>
+
+<script>
+  import { Terminal } from '@xterm/xterm';
+  import { FitAddon } from '@xterm/addon-fit';
+  import '@xterm/xterm/css/xterm.css';
+  import { EventStream } from '@/lib/event-stream';
+  import type { DemoEvent } from '@/lib/events';
+
+  const QUIET_FIRST_MS = 30_000;
+  const QUIET_SECOND_MS = 60_000;
+
+  const host = document.getElementById('terminal-host');
+  if (host !== null) {
+    const term = new Terminal({
+      fontFamily:
+        '"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace',
+      fontSize: 13,
+      lineHeight: 1.3,
+      scrollback: 200,
+      convertEol: true,
+      cursorBlink: false,
+      cursorStyle: 'bar',
+      theme: {
+        background: '#0a0a0a',
+        foreground: '#e8e2d3',
+        cursor: '#e8a13a',
+        selectionBackground: '#3a3a35',
+      },
+      disableStdin: true,
+    });
+    const fit = new FitAddon();
+    term.loadAddon(fit);
+    term.open(host);
+    fit.fit();
+    window.addEventListener('resize', () => {
+      fit.fit();
+    });
+
+    // Intro banner.  Not a fake event, just framing copy.
+    term.writeln('\x1b[2m# fail2zig live attack feed — connected streams are real, no synthesised events\x1b[0m');
+    term.writeln('\x1b[2m# format: HH:MM:SS [event] ip jail/pattern\x1b[0m');
+    term.writeln('');
+
+    const jailColor = (jail: string): string => {
+      switch (jail) {
+        case 'sshd':
+          return '\x1b[36m'; // cyan
+        case 'nginx-botsearch':
+          return '\x1b[35m'; // magenta
+        case 'nginx-http-auth':
+          return '\x1b[33m'; // yellow
+        case 'nginx-limit-req':
+          return '\x1b[32m'; // green
+        case 'postfix':
+          return '\x1b[31m'; // red
+        default:
+          return '\x1b[37m'; // white
+      }
+    };
+    const eventTag = (type: DemoEvent['type']): string => {
+      switch (type) {
+        case 'attack_detected':
+          return '\x1b[2;37m[detect]\x1b[0m';
+        case 'ip_banned':
+          return '\x1b[1;31m[ BAN ]\x1b[0m';
+        case 'ip_unbanned':
+          return '\x1b[2;32m[unban]\x1b[0m';
+        case 'metrics':
+          return '\x1b[2;34m[metrx]\x1b[0m';
+      }
+    };
+    const hhmmss = (iso: string): string => {
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return '--:--:--';
+      const h = String(d.getUTCHours()).padStart(2, '0');
+      const m = String(d.getUTCMinutes()).padStart(2, '0');
+      const s = String(d.getUTCSeconds()).padStart(2, '0');
+      return `${h}:${m}:${s}`;
+    };
+
+    const writeEvent = (event: DemoEvent): void => {
+      if (event.type === 'metrics') return; // terminal doesn't render metrics frames
+      const c = jailColor(event.payload.jail);
+      const tag = eventTag(event.type);
+      const ts = hhmmss(event.ts);
+      const ip = event.payload.ip;
+      const jail = event.payload.jail;
+      let suffix = '';
+      if (event.type === 'attack_detected') {
+        suffix = `/${event.payload.pattern_name}`;
+      } else if (event.type === 'ip_banned') {
+        suffix = ` ban=${String(event.payload.bantime_s)}s`;
+      }
+      term.writeln(`\x1b[2m${ts}\x1b[0m ${tag} ${c}${ip}\x1b[0m ${c}${jail}\x1b[0m${suffix}`);
+    };
+
+    // Quiet-window heuristics.  Two-stage: first dim "waiting" line,
+    // then a second reassurance line if the silence stretches.  We
+    // only emit these once per quiet window — when a real event
+    // lands, the stage resets.
+    let quietStage: 0 | 1 | 2 = 0;
+    let quietTimer: ReturnType<typeof setTimeout> | null = null;
+    const armQuiet = (stage: 1 | 2): void => {
+      if (quietTimer !== null) clearTimeout(quietTimer);
+      quietTimer = setTimeout(
+        () => {
+          if (stage === 1 && quietStage < 1) {
+            quietStage = 1;
+            term.writeln('\x1b[2;37m-- waiting for next attack… --\x1b[0m');
+            armQuiet(2);
+          } else if (stage === 2 && quietStage < 2) {
+            quietStage = 2;
+            term.writeln(
+              '\x1b[2;37m-- organic-traffic windows vary — the internet is never quiet for long --\x1b[0m',
+            );
+          }
+        },
+        stage === 1 ? QUIET_FIRST_MS : QUIET_SECOND_MS - QUIET_FIRST_MS,
+      );
+    };
+    armQuiet(1);
+
+    const url =
+      typeof window !== 'undefined' && window.location.hostname === 'localhost'
+        ? 'wss://demo.fail2zig.com/events'
+        : 'wss://demo.fail2zig.com/events';
+    const stream = new EventStream({
+      url,
+      replayUrl: '/replay/recent-attacks.json',
+    });
+    stream.onEvent((event) => {
+      quietStage = 0;
+      armQuiet(1);
+      writeEvent(event);
+    });
+    stream.start();
+
+    // Publish the stream to the page so other panes can subscribe to
+    // the shared connection state for the top banner.
+    (window as unknown as { fail2zigStream?: EventStream }).fail2zigStream = stream;
+    window.dispatchEvent(new CustomEvent('fail2zig:stream-ready'));
+  }
+</script>

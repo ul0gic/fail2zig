@@ -98,6 +98,31 @@ pub const StatusSource = struct {
     ) anyerror!void = defaultWriteStatus,
 };
 
+/// Vtable for `GET /api/bans`. Produces a JSON snapshot of the current
+/// active-ban set — the shape is what the see-it-live dashboard's
+/// `NftSetPane` consumes at 1 Hz.
+///
+/// Decoupling rationale: the HTTP module intentionally has no compile-time
+/// dependency on `core/state.zig`. The daemon installs a small adapter
+/// (see main.zig) that walks the tracker's iterator and writes JSON.
+///
+/// The producer MUST cap `elements` at `max_bans_in_snapshot` — keeps
+/// the response bounded and bandwidth-cheap under heavy bans.
+pub const BansSource = struct {
+    ctx: ?*anyopaque = null,
+    write: *const fn (
+        ctx: ?*anyopaque,
+        out: *std.ArrayListUnmanaged(u8),
+        a: std.mem.Allocator,
+    ) anyerror!void = defaultWriteBans,
+};
+
+/// Hard cap on the number of elements emitted by `/api/bans`. Matches
+/// the see-it-live dashboard's 200-entry visible list. Producers MUST
+/// truncate past this; the total `count` field still reflects the full
+/// active-ban count so the dashboard can show "N more ...".
+pub const max_bans_in_snapshot: usize = 200;
+
 fn defaultWriteMetrics(
     ctx: ?*anyopaque,
     out: *std.ArrayListUnmanaged(u8),
@@ -116,6 +141,21 @@ fn defaultWriteStatus(
 ) anyerror!void {
     _ = ctx;
     try out.appendSlice(a, "{\"status\":\"ok\"}");
+}
+
+/// Stub bans producer used until the daemon installs a real one. Emits
+/// a schema-conformant empty snapshot so the route returns valid JSON
+/// during early startup (before the tracker is wired in).
+fn defaultWriteBans(
+    ctx: ?*anyopaque,
+    out: *std.ArrayListUnmanaged(u8),
+    a: std.mem.Allocator,
+) anyerror!void {
+    _ = ctx;
+    try out.appendSlice(
+        a,
+        "{\"set_name\":\"fail2zig_bans\",\"family\":\"inet\",\"table\":\"fail2zig\",\"count\":0,\"elements\":[]}",
+    );
 }
 
 // ============================================================================
@@ -145,6 +185,7 @@ pub const HttpServer = struct {
     started: bool = false,
     metrics_source: MetricsSource = .{},
     status_source: StatusSource = .{},
+    bans_source: BansSource = .{},
     /// Optional sibling WebSocket server. When non-null, `GET /events`
     /// requests that carry a valid `Upgrade: websocket` header get the
     /// 101 handshake completed here and the FD is handed off. When null,
@@ -233,6 +274,10 @@ pub const HttpServer = struct {
 
     pub fn setStatusSource(self: *HttpServer, s: StatusSource) void {
         self.status_source = s;
+    }
+
+    pub fn setBansSource(self: *HttpServer, s: BansSource) void {
+        self.bans_source = s;
     }
 
     /// Install the sibling WebSocket server that receives upgraded
@@ -430,6 +475,9 @@ pub const HttpServer = struct {
         } else if (std.mem.eql(u8, path, "/api/status")) {
             try self.respondStatus(cli.fd);
             return .close;
+        } else if (std.mem.eql(u8, path, "/api/bans")) {
+            try self.respondBans(cli.fd);
+            return .close;
         } else if (std.mem.eql(u8, path, "/events")) {
             return self.tryWsUpgrade(cli, hdr_end_idx);
         } else {
@@ -523,6 +571,17 @@ pub const HttpServer = struct {
         try self.status_source.write(self.status_source.ctx, &body, self.allocator);
         if (body.items.len > max_response_bytes) {
             try writeSimpleResponse(fd, 500, "Internal Server Error", "text/plain", "status body too large\n");
+            return;
+        }
+        try writeResponse(fd, 200, "OK", "application/json", body.items);
+    }
+
+    fn respondBans(self: *HttpServer, fd: posix.fd_t) !void {
+        var body: std.ArrayListUnmanaged(u8) = .{};
+        defer body.deinit(self.allocator);
+        try self.bans_source.write(self.bans_source.ctx, &body, self.allocator);
+        if (body.items.len > max_response_bytes) {
+            try writeSimpleResponse(fd, 500, "Internal Server Error", "text/plain", "bans body too large\n");
             return;
         }
         try writeResponse(fd, 200, "OK", "application/json", body.items);

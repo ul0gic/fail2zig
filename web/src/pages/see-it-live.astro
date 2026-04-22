@@ -1,0 +1,172 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import StatusBanner from '@/components/see-it-live/StatusBanner.astro';
+import TerminalPane from '@/components/see-it-live/TerminalPane.astro';
+import NftSetPane from '@/components/see-it-live/NftSetPane.astro';
+import MetricsPane from '@/components/see-it-live/MetricsPane.astro';
+---
+
+<BaseLayout
+  title="See it Live — fail2zig"
+  description="A real Lightsail honeypot, tailed by fail2zig, defending itself against live attackers in real time. Live WebSocket feed of attack_detected, ip_banned, and ip_unbanned events."
+  activeNav="/see-it-live"
+>
+  <div class="live-wrap">
+    <header class="live-intro">
+      <h1>See it live</h1>
+      <p class="live-lede">
+        A single Lightsail VM in Ohio runs <code>sshd</code> and <code>nginx</code>
+        on the open internet. fail2zig tails their logs and installs real kernel-level
+        <code>nftables</code> DROP rules against real attackers. Everything below is live —
+        no synthesised events, no dashboards dressed up as daemons, no demo button.
+      </p>
+    </header>
+
+    <StatusBanner />
+
+    <section class="live-grid" aria-label="Live fail2zig dashboard">
+      <TerminalPane />
+      <NftSetPane />
+      <MetricsPane />
+    </section>
+
+    <footer class="live-footer">
+      <h2 id="about-the-ips">About the IPs</h2>
+      <p>
+        Every IP on this page is an IP address that attacked this server.
+        When the status banner reads <em>connected</em>, the feed is live —
+        events arrive the moment fail2zig parses and bans them. If the banner
+        reads <em>replay mode</em> or <em>live feed unavailable</em>, the
+        tunnel is temporarily unreachable and events may be stale or absent.
+        Nothing on this page is simulated traffic.
+      </p>
+      <p>
+        The IPs are published as threat intelligence — the same class of data
+        AbuseIPDB, Shodan, GreyNoise, and the broader IoC community share
+        openly. No visitor data is ever collected or displayed on this page.
+        The server defending itself here is a disposable honeypot, not shared
+        infrastructure; compromise attempts don't affect any other fail2zig
+        user.
+      </p>
+    </footer>
+  </div>
+</BaseLayout>
+
+<style>
+  .live-wrap {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 32px 24px 64px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+  .live-intro h1 {
+    font-family: var(--serif);
+    font-size: 38px;
+    line-height: 1.12;
+    margin: 0 0 12px;
+    color: var(--fg);
+  }
+  .live-lede {
+    font-size: 15px;
+    line-height: 1.55;
+    color: var(--fg-body);
+    max-width: 720px;
+    margin: 0;
+  }
+  .live-lede code {
+    font-family: var(--mono);
+    font-size: 13px;
+    padding: 1px 5px;
+    background: var(--bg-band);
+    border: 1px solid var(--line);
+  }
+
+  .live-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 2fr) minmax(0, 1.2fr);
+    grid-template-rows: 420px auto;
+    grid-template-areas:
+      'terminal nftset'
+      'metrics  nftset';
+    gap: 16px;
+    min-height: 0;
+  }
+  .live-grid :global(.pane) {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+  }
+  .live-grid :global(.pane-header) {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    padding-bottom: 2px;
+    border-bottom: 1px solid var(--line);
+  }
+  .live-grid :global(.pane-title) {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--fg-strong);
+  }
+  .live-grid :global(.pane-sub) {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--fg-faint);
+  }
+  .live-grid :global(.pane-sub code) {
+    color: var(--fg-dim);
+  }
+
+  @media (max-width: 960px) {
+    .live-grid {
+      grid-template-columns: 1fr;
+      grid-template-rows: auto;
+      grid-template-areas:
+        'terminal'
+        'nftset'
+        'metrics';
+    }
+    .live-grid :global(.terminal-pane) {
+      min-height: 360px;
+    }
+    .live-grid :global(.nft-body) {
+      max-height: 420px;
+    }
+  }
+
+  .live-footer {
+    border-top: 1px solid var(--line);
+    padding-top: 20px;
+    margin-top: 8px;
+    max-width: 760px;
+    color: var(--fg-body);
+  }
+  .live-footer h2 {
+    font-family: var(--serif);
+    font-size: 20px;
+    margin: 0 0 10px;
+    color: var(--fg);
+  }
+  .live-footer p {
+    font-size: 14px;
+    line-height: 1.55;
+    margin: 0 0 10px;
+  }
+  .live-footer-meta {
+    color: var(--fg-faint);
+    font-size: 12.5px;
+  }
+  .live-footer code {
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 1px 4px;
+    background: var(--bg-band);
+    border: 1px solid var(--line);
+  }
+</style>

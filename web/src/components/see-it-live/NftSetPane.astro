@@ -1,0 +1,162 @@
+---
+/**
+ * NftSetPane — plain `<pre>` render of `/api/bans` at 1 Hz.
+ *
+ * Format mimics the leading block of `nft list set inet fail2zig
+ * banned_v4`, not because we're parsing it but because that's the
+ * single source of truth in an operator's shell — the point of the
+ * pane is "the kernel, not a dashboard."
+ *
+ * Each IP is wrapped in an <a> pointing to AbuseIPDB so the visitor
+ * can confirm in one click that the ban is against a known bad
+ * actor.  Render is capped at 200 rows defensively; the API caps
+ * server-side too (design-doc §"What fail2zig broadcasts publicly").
+ */
+---
+
+<section class="pane nft-pane" aria-label="Active nftables bans">
+  <header class="pane-header">
+    <span class="pane-title">nft banned set</span>
+    <span class="pane-sub"><code>fail2zig/banned_v4</code> · 1 Hz poll</span>
+  </header>
+  <div class="nft-body">
+    <pre id="nft-output" class="nft-output" aria-live="polite"><span class="nft-empty">loading banned set…</span></pre>
+  </div>
+</section>
+
+<style>
+  .nft-pane {
+    grid-area: nftset;
+    min-height: 0;
+  }
+  .nft-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+    background: var(--surface-ink);
+    border: 1px solid var(--line);
+  }
+  .nft-output {
+    margin: 0;
+    padding: 12px;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.45;
+    color: var(--fg-body);
+    white-space: pre;
+    min-width: max-content;
+  }
+  .nft-output :global(a) {
+    color: var(--fg);
+    text-decoration: underline;
+    text-decoration-color: var(--accent-ghost);
+    text-underline-offset: 2px;
+  }
+  .nft-output :global(a:hover) {
+    text-decoration-color: var(--accent);
+    color: var(--accent);
+  }
+  .nft-output :global(.nft-comment) {
+    color: var(--fg-faint);
+  }
+  .nft-empty {
+    color: var(--fg-faint);
+  }
+</style>
+
+<script>
+  import { parseBansSnapshot, type BanRow } from '@/lib/events';
+
+  const POLL_MS = 1_000;
+  const MAX_ROWS = 200;
+  const API_URL = 'https://demo.fail2zig.com/api/bans';
+
+  const escape = (s: string): string =>
+    s.replace(/[&<>"']/g, (ch) => {
+      switch (ch) {
+        case '&':
+          return '&amp;';
+        case '<':
+          return '&lt;';
+        case '>':
+          return '&gt;';
+        case '"':
+          return '&quot;';
+        case "'":
+          return '&#39;';
+        default:
+          return ch;
+      }
+    });
+
+  const formatTimeout = (seconds: number): string => {
+    const s = Math.max(0, Math.floor(seconds));
+    if (s < 60) return `${String(s)}s`;
+    if (s < 3600) return `${String(Math.floor(s / 60))}m${String(s % 60).padStart(2, '0')}s`;
+    return `${String(Math.floor(s / 3600))}h${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}m`;
+  };
+
+  const renderRows = (rows: readonly BanRow[], total: number): string => {
+    const header = `table inet fail2zig {\n    set banned_v4 {\n        type ipv4_addr\n        flags timeout\n        size 65536\n`;
+    const capped = rows.slice(0, MAX_ROWS);
+    const hiddenNote =
+      total > MAX_ROWS
+        ? `        <span class="nft-comment"># … ${String(total - MAX_ROWS)} more entries omitted from this view</span>\n`
+        : '';
+
+    if (capped.length === 0) {
+      return (
+        header +
+        '        elements = {\n' +
+        `            <span class="nft-empty">(empty — no active bans)</span>\n` +
+        '        }\n    }\n}'
+      );
+    }
+
+    const lines = capped.map((row, idx) => {
+      const ipSafe = escape(row.ip);
+      const jailSafe = escape(row.jail);
+      const link = `<a href="https://www.abuseipdb.com/check/${ipSafe}" target="_blank" rel="noopener" title="Lookup on AbuseIPDB">${ipSafe}</a>`;
+      const expires = formatTimeout(row.seconds_remaining);
+      const trailing = idx < capped.length - 1 ? ',' : '';
+      return `            ${link} timeout ${expires}${trailing}  <span class="nft-comment"># ${jailSafe}</span>`;
+    });
+    return (
+      header +
+      `        elements = {\n${lines.join('\n')}\n        }\n` +
+      hiddenNote +
+      '    }\n}'
+    );
+  };
+
+  const host = document.getElementById('nft-output');
+  if (host !== null) {
+    let stopped = false;
+    const tick = async (): Promise<void> => {
+      try {
+        const res = await fetch(API_URL, { cache: 'no-store' });
+        if (!res.ok) throw new Error(String(res.status));
+        const raw: unknown = await res.json();
+        const snapshot = parseBansSnapshot(raw);
+        if (snapshot !== null) {
+          host.innerHTML = renderRows(snapshot.entries, snapshot.total);
+        }
+      } catch {
+        // Network / parse failure — leave the previous render in
+        // place.  The status banner in the page header surfaces the
+        // degraded state; the pane shouldn't flash empty on every
+        // transient timeout.
+      }
+    };
+
+    void tick();
+    const interval = window.setInterval(() => {
+      if (stopped) return;
+      void tick();
+    }, POLL_MS);
+    window.addEventListener('beforeunload', () => {
+      stopped = true;
+      window.clearInterval(interval);
+    });
+  }
+</script>

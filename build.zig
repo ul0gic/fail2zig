@@ -5,11 +5,6 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const enable_sim = b.option(
-        bool,
-        "sim",
-        "Build the attack simulator (demo-only tool, not shipped).",
-    ) orelse false;
     const enable_bench = b.option(
         bool,
         "bench",
@@ -65,20 +60,6 @@ pub fn build(b: *std.Build) void {
         .root_module = client_mod,
     });
     b.installArtifact(client_exe);
-
-    // ===== Simulator (opt-in via -Dsim=true) =====
-    if (enable_sim) {
-        const sim_mod = b.createModule(.{
-            .root_source_file = b.path("sim/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        const sim_exe = b.addExecutable(.{
-            .name = "fail2zig-sim",
-            .root_module = sim_mod,
-        });
-        b.installArtifact(sim_exe);
-    }
 
     // ===== Tests =====
     const test_step = b.step("test", "Run all tests (engine, client, shared, integration)");

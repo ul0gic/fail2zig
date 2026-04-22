@@ -79,16 +79,16 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
           </div>
         </div>
         <div class="row">
-          <div class="row-k">Visitor IP during the live demo</div>
+          <div class="row-k">The live honeypot feed</div>
           <div class="row-v">
             <p>
-              When the "attack yourself" demo is live, it reads your IP
-              from Cloudflare's <code>cf-connecting-ip</code> header,
-              synthesizes a short sequence of log lines, and feeds them
-              to a fail2zig instance on a disposable origin server.
-              The resulting ban lasts 60 seconds and is never persisted
-              to disk or to any external system. No field other than
-              the IP is used.
+              The <a href="/see-it-live">See It Live</a> page streams
+              real attack and ban events from a dedicated fail2zig
+              honeypot VM. The IP addresses shown are IPs that attacked
+              our public honeypot &mdash; threat intelligence, the same
+              class of data AbuseIPDB, Shodan, and GreyNoise publish
+              openly. Visitor IPs are never read, logged, or shown on
+              that page.
             </p>
           </div>
         </div>
