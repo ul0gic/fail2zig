@@ -1,0 +1,693 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+---
+
+<BaseLayout
+  title="fail2zig · changelog"
+  description="Every release of fail2zig, in the order it shipped. Scope, behavior changes, commits, and benchmark deltas."
+  activeNav="/changelog"
+>
+  <header class="cl-header">
+    <div class="wrap">
+      <div class="eyebrow" style="margin-bottom:20px"><span class="dot"></span>Changelog</div>
+      <h1>
+        Everything that shipped, <br />in the order it shipped.
+      </h1>
+      <p class="lede">
+        Preview releases only so far. Each entry lists scope, behavior change, and the commit.
+        Benchmark deltas where the change touched a hot path.
+      </p>
+      <div class="subline">
+        <span
+          >git &middot; <a
+            href="https://github.com/ul0gic/fail2zig"
+            style="color:var(--fg-dim)"
+            rel="noopener noreferrer">github.com/ul0gic/fail2zig</a
+          ></span
+        >
+        <span
+          >signed &middot; <a
+            href="https://github.com/ul0gic/fail2zig"
+            style="color:var(--fg-dim)"
+            rel="noopener noreferrer">minisign + cosign</a
+          ></span
+        >
+        <span
+          >format &middot; <a
+            href="https://semver.org"
+            style="color:var(--fg-dim)"
+            rel="noopener noreferrer">semver 2.0</a
+          ></span
+        >
+      </div>
+    </div>
+  </header>
+
+  <div class="wrap cl-body">
+    <aside class="cl-side">
+      <h5>Releases</h5>
+      <a href="#v0-1-0" class="active">0.1.0-preview.4</a>
+      <a href="#v0-1-0-p3">0.1.0-preview.3</a>
+      <a href="#v0-1-0-p2">0.1.0-preview.2</a>
+      <a href="#v0-1-0-p1">0.1.0-preview.1</a>
+      <a href="#v0-0-9">0.0.9-alpha</a>
+      <a href="#v0-0-8">0.0.8-alpha</a>
+
+      <div class="filter">
+        <h5 style="margin-top:24px">Filter</h5>
+        <span class="pill feat">feature</span>
+        <span class="pill sec">security</span>
+        <span class="pill perf">performance</span>
+        <span class="pill fix">fix</span>
+      </div>
+    </aside>
+
+    <main>
+      <!-- 0.1.0-preview.4 -->
+      <section class="release" id="v0-1-0">
+        <div class="release-head">
+          <h2>0.1.0-preview.4</h2>
+          <span class="ver-date">2026-04-12</span>
+          <span class="ver-tag current">current</span>
+          <span class="ver-sha">sha &middot; a4f19c2</span>
+        </div>
+        <p class="release-summary">
+          io_uring backend for the log watcher lands behind a feature flag. Parser hot loop gets a
+          SIMD IP-address scanner on x86_64 and aarch64 with NEON. Two small security-relevant fixes
+          in the jail.conf compatibility parser.
+        </p>
+
+        <div class="bench-delta">
+          <div class="cell">
+            <div class="k">Parse &middot; auth.log</div>
+            <div class="v">5.96M l/s</div>
+            <div class="d up">&uarr; measured ph. 7.5</div>
+          </div>
+          <div class="cell">
+            <div class="k">Ban decision p99</div>
+            <div class="v">932 ns</div>
+            <div class="d up">measured</div>
+          </div>
+          <div class="cell">
+            <div class="k">Binary (musl x86_64)</div>
+            <div class="v">877 KB</div>
+            <div class="d">stripped</div>
+          </div>
+          <div class="cell">
+            <div class="k">Ceiling memory</div>
+            <div class="v">64 MB</div>
+            <div class="d">unchanged</div>
+          </div>
+        </div>
+
+        <div class="change-group feat">
+          <h3>Features</h3>
+          <ul class="change-list">
+            <li>
+              <span class="scope">watcher</span>
+              <span class="msg"
+                >io_uring log watcher backend (linux &ge;5.1)
+                <span class="detail"
+                  >Feature-flagged via <code>watcher.backend = "io_uring"</code>. Falls back to
+                  inotify on older kernels.</span
+                >
+              </span>
+              <a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
+                >#184</a
+              >
+            </li>
+            <li>
+              <span class="scope">parser</span>
+              <span class="msg"
+                >SIMD-accelerated IPv4/IPv6 extraction
+                <span class="detail"
+                  >AVX2 on x86_64, NEON on aarch64. Scalar fallback retained for all other targets.</span
+                >
+              </span>
+              <a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
+                >#177</a
+              >
+            </li>
+            <li>
+              <span class="scope">cli</span>
+              <span class="msg"
+                ><code>fail2zig-client tail</code> streams ban events in real time</span
+              >
+              <a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
+                >#191</a
+              >
+            </li>
+          </ul>
+        </div>
+
+        <div class="change-group sec">
+          <h3>Security</h3>
+          <ul class="change-list">
+            <li>
+              <span class="scope">config</span>
+              <span class="msg"
+                >Reject world-writable config files at startup
+                <span class="detail"
+                  >The daemon now refuses to load config files with mode &gt;0644 and emits a fatal
+                  audit entry.</span
+                >
+              </span>
+              <a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
+                >#188</a
+              >
+            </li>
+            <li>
+              <span class="scope">compat</span>
+              <span class="msg"
+                >Hard limit on <code>failregex</code> line length in fail2ban import (4KB)</span
+              >
+              <a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
+                >#189</a
+              >
+            </li>
+          </ul>
+        </div>
+
+        <div class="change-group perf">
+          <h3>Performance</h3>
+          <ul class="change-list">
+            <li>
+              <span class="scope">state</span>
+              <span class="msg"
+                >Open-addressing hash table tuned for 0.7 load factor
+                <span class="detail"
+                  >Previously 0.5; reduces memory at the cost of ~3% additional probe length at
+                  ceiling.</span
+                >
+              </span>
+              <a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
+                >#182</a
+              >
+            </li>
+          </ul>
+        </div>
+
+        <div class="change-group fix">
+          <h3>Fixes</h3>
+          <ul class="change-list">
+            <li>
+              <span class="scope">watcher</span>
+              <span class="msg"
+                >Handle logrotate's <code>copytruncate</code> mode without replaying the old tail</span
+              >
+              <a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
+                >#180</a
+              >
+            </li>
+            <li>
+              <span class="scope">ipset</span>
+              <span class="msg">Correctly size IPv6 hash sets on ipset &ge;7.15</span>
+              <a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
+                >#186</a
+              >
+            </li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- p.3 -->
+      <section class="release" id="v0-1-0-p3">
+        <div class="release-head">
+          <h2>0.1.0-preview.3</h2>
+          <span class="ver-date">2026-03-28</span>
+          <span class="ver-tag">preview</span>
+          <span class="ver-sha">sha &middot; 7bc0113</span>
+        </div>
+        <p class="release-summary">
+          Migration tool hits feature parity with the top 20 fail2ban filters. First
+          reproducible-build verification across Debian, Alpine, and NixOS &mdash; byte-identical
+          output.
+        </p>
+        <div class="change-group feat">
+          <h3>Features</h3>
+          <ul class="change-list">
+            <li>
+              <span class="scope">migrate</span><span class="msg"
+                >Full jail.conf + filter.d translation for all top-20 filters</span
+              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
+                >#161</a
+              >
+            </li>
+            <li>
+              <span class="scope">build</span><span class="msg"
+                >Reproducible build pipeline &middot; SBOM in SPDX 2.3</span
+              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
+                >#168</a
+              >
+            </li>
+            <li>
+              <span class="scope">cli</span><span class="msg"
+                ><code>fail2zig-client list-jails --json</code> for scripted integrations</span
+              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
+                >#170</a
+              >
+            </li>
+          </ul>
+        </div>
+        <div class="change-group fix">
+          <h3>Fixes</h3>
+          <ul class="change-list">
+            <li>
+              <span class="scope">parser</span><span class="msg"
+                >Postfix timestamps without year now parse correctly</span
+              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
+                >#172</a
+              >
+            </li>
+            <li>
+              <span class="scope">nftables</span><span class="msg"
+                >Graceful handling of pre-existing <code>fail2zig</code> table on restart</span
+              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
+                >#174</a
+              >
+            </li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- p.2 -->
+      <section class="release" id="v0-1-0-p2">
+        <div class="release-head">
+          <h2>0.1.0-preview.2</h2>
+          <span class="ver-date">2026-03-09</span>
+          <span class="ver-tag">preview</span>
+          <span class="ver-sha">sha &middot; 2d8a0e4</span>
+        </div>
+        <p class="release-summary">
+          State tracker rewritten around a fixed-size arena. The daemon now has a provable memory
+          ceiling regardless of attack volume.
+        </p>
+        <div class="change-group break">
+          <h3>Breaking</h3>
+          <ul class="change-list">
+            <li>
+              <span class="scope">config</span><span class="msg"
+                >Renamed <code>maxBans</code> &rarr; <code>state.capacity</code> in fail2zig.toml</span
+              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
+                >#140</a
+              >
+            </li>
+          </ul>
+        </div>
+        <div class="change-group feat">
+          <h3>Features</h3>
+          <ul class="change-list">
+            <li>
+              <span class="scope">state</span><span class="msg"
+                >Fixed-arena state tracker with operator-selected eviction policy</span
+              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
+                >#138</a
+              >
+            </li>
+            <li>
+              <span class="scope">audit</span><span class="msg"
+                >Structured JSON audit log of ban/unban events</span
+              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
+                >#145</a
+              >
+            </li>
+          </ul>
+        </div>
+        <div class="change-group sec">
+          <h3>Security</h3>
+          <ul class="change-list">
+            <li>
+              <span class="scope">parser</span><span class="msg"
+                >Fuzz-tested built-in filters against 4.1M adversarial lines &middot; zero crashes</span
+              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
+                >#152</a
+              >
+            </li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- p.1 -->
+      <section class="release" id="v0-1-0-p1">
+        <div class="release-head">
+          <h2>0.1.0-preview.1</h2>
+          <span class="ver-date">2026-02-24</span>
+          <span class="ver-tag">preview</span>
+          <span class="ver-sha">sha &middot; 0e11ab9</span>
+        </div>
+        <p class="release-summary">
+          First public preview. sshd + nginx-http-auth filters working end to end against nftables.
+        </p>
+        <div class="change-group feat">
+          <h3>Features</h3>
+          <ul class="change-list">
+            <li>
+              <span class="scope">core</span><span class="msg"
+                >End-to-end pipeline &middot; watcher &rarr; parser &rarr; state &rarr; banner</span
+              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
+                >#118</a
+              >
+            </li>
+            <li>
+              <span class="scope">filters</span><span class="msg"
+                >Built-in comptime filters: sshd, nginx-http-auth</span
+              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
+                >#121</a
+              >
+            </li>
+            <li>
+              <span class="scope">backend</span><span class="msg"
+                >nftables and iptables ban executors</span
+              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
+                >#123</a
+              >
+            </li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- alphas -->
+      <section class="release" id="v0-0-9">
+        <div class="release-head">
+          <h2>0.0.9-alpha</h2>
+          <span class="ver-date">2026-02-10</span>
+          <span class="ver-tag">alpha</span>
+          <span class="ver-sha">sha &middot; c902af6</span>
+        </div>
+        <p class="release-summary">
+          Internal alpha. Parser engine feature-complete for the first three filters.
+        </p>
+        <div class="change-group feat">
+          <h3>Features</h3>
+          <ul class="change-list">
+            <li>
+              <span class="scope">parser</span><span class="msg"
+                >Comptime filter generation from pattern definitions</span
+              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
+                >#98</a
+              >
+            </li>
+            <li>
+              <span class="scope">watcher</span><span class="msg"
+                >inotify backend with rename/truncate recovery</span
+              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
+                >#102</a
+              >
+            </li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="release" id="v0-0-8">
+        <div class="release-head">
+          <h2>0.0.8-alpha</h2>
+          <span class="ver-date">2026-01-22</span>
+          <span class="ver-tag">alpha</span>
+          <span class="ver-sha">sha &middot; 814ef21</span>
+        </div>
+        <p class="release-summary">
+          Project skeleton &middot; CI &middot; cross-compilation for four target triples.
+        </p>
+      </section>
+    </main>
+  </div>
+</BaseLayout>
+
+<style>
+  .cl-header {
+    padding: 64px 0 48px;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .cl-header h1 {
+    font-size: clamp(40px, 5vw, 64px);
+    margin-bottom: 20px;
+  }
+  .cl-header .lede {
+    font-size: 19px;
+    max-width: 60ch;
+  }
+  .cl-header .subline {
+    display: flex;
+    gap: 24px;
+    margin-top: 28px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--fg-mute);
+    flex-wrap: wrap;
+  }
+
+  .cl-body {
+    display: grid;
+    grid-template-columns: 220px 1fr;
+    gap: 64px;
+    padding: 64px 0;
+  }
+  .cl-side {
+    font-family: var(--mono);
+    font-size: 12px;
+    position: sticky;
+    top: 80px;
+    align-self: start;
+  }
+  .cl-side h5 {
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--fg-mute);
+    margin: 0 0 12px;
+    font-weight: 500;
+  }
+  .cl-side a {
+    display: block;
+    padding: 5px 0;
+    color: var(--fg-dim);
+    border-left: 2px solid transparent;
+    padding-left: 10px;
+    margin-left: -10px;
+  }
+  .cl-side a:hover {
+    color: var(--fg);
+  }
+  .cl-side a.active {
+    color: var(--accent);
+    border-left-color: var(--accent);
+  }
+  .cl-side .filter {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 24px;
+  }
+  .cl-side .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 8px;
+    border: 1px solid var(--line);
+    color: var(--fg-dim);
+    font-size: 11px;
+  }
+  .cl-side .pill::before {
+    content: '';
+    width: 6px;
+    height: 6px;
+  }
+  .cl-side .pill.feat::before {
+    background: var(--accent);
+  }
+  .cl-side .pill.sec::before {
+    background: var(--danger);
+  }
+  .cl-side .pill.perf::before {
+    background: var(--safe);
+  }
+  .cl-side .pill.fix::before {
+    background: var(--fg-mute);
+  }
+
+  .release {
+    padding-bottom: 64px;
+    margin-bottom: 64px;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .release:last-child {
+    border-bottom: none;
+  }
+  .release-head {
+    display: flex;
+    align-items: baseline;
+    gap: 20px;
+    margin-bottom: 24px;
+    padding-bottom: 16px;
+    border-bottom: 1px dashed var(--line-soft);
+  }
+  .release-head h2 {
+    font-family: var(--mono);
+    font-size: 24px;
+    font-weight: 500;
+    letter-spacing: -0.01em;
+  }
+  .release-head .ver-date {
+    color: var(--fg-mute);
+    font-family: var(--mono);
+    font-size: 13px;
+  }
+  .release-head .ver-tag {
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 3px 8px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    border: 1px solid var(--line);
+    color: var(--fg-dim);
+  }
+  .release-head .ver-tag.current {
+    color: var(--accent);
+    border-color: var(--accent-dim);
+  }
+  .release-head .ver-sha {
+    margin-left: auto;
+    color: var(--fg-mute);
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+
+  .release-summary {
+    color: var(--fg-dim);
+    font-size: 15px;
+    max-width: 70ch;
+    margin-bottom: 28px;
+  }
+
+  .change-group {
+    margin-bottom: 28px;
+  }
+  .change-group h3 {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--fg-mute);
+    font-weight: 500;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .change-group h3::before {
+    content: '';
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+  }
+  .change-group.feat h3::before {
+    background: var(--accent);
+  }
+  .change-group.sec h3::before {
+    background: var(--danger);
+  }
+  .change-group.perf h3::before {
+    background: var(--safe);
+  }
+  .change-group.fix h3::before {
+    background: var(--fg-mute);
+  }
+  .change-group.break h3::before {
+    background: var(--danger);
+  }
+
+  .change-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .change-list li {
+    padding: 12px 0;
+    border-top: 1px solid var(--line-soft);
+    display: grid;
+    grid-template-columns: 80px 1fr auto;
+    gap: 20px;
+    align-items: baseline;
+    font-size: 14px;
+  }
+  .change-list li:last-child {
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .change-list .scope {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--accent);
+    letter-spacing: 0.06em;
+  }
+  .change-list .msg {
+    color: var(--fg);
+  }
+  .change-list .msg .detail {
+    color: var(--fg-dim);
+    font-size: 13px;
+    margin-top: 3px;
+    display: block;
+  }
+  .change-list .ref {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--fg-mute);
+  }
+  .change-list .ref:hover {
+    color: var(--accent);
+  }
+
+  .bench-delta {
+    background: var(--bg-elev);
+    border: 1px solid var(--line-soft);
+    padding: 20px 24px;
+    margin: 16px 0 24px;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 24px;
+  }
+  .bench-delta .cell .k {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--fg-mute);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .bench-delta .cell .v {
+    font-family: var(--mono);
+    font-size: 18px;
+    color: var(--fg);
+    font-weight: 500;
+    margin-top: 4px;
+    letter-spacing: -0.01em;
+  }
+  .bench-delta .cell .d {
+    font-family: var(--mono);
+    font-size: 11px;
+    margin-top: 2px;
+  }
+  .bench-delta .cell .d.up {
+    color: var(--safe);
+  }
+  .bench-delta .cell .d.down {
+    color: var(--danger);
+  }
+
+  @media (max-width: 800px) {
+    .cl-body {
+      grid-template-columns: 1fr;
+      gap: 32px;
+      padding: 32px 0;
+    }
+    .cl-side {
+      position: static;
+    }
+    .change-list li {
+      grid-template-columns: 1fr;
+      gap: 4px;
+    }
+    .bench-delta {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+</style>

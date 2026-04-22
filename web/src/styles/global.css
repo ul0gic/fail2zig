@@ -1,0 +1,29 @@
+@import 'tailwindcss';
+@import './theme.css';
+
+/*
+ * Tailwind 4 CSS-first config: expose the OKLCH theme tokens as
+ * Tailwind utility classes (bg-bg, text-fg, border-line, etc.) while
+ * keeping the raw CSS custom properties from theme.css intact for
+ * direct use in component styles ported from the mockups.
+ */
+@theme inline {
+  --color-bg: var(--bg);
+  --color-bg-elev: var(--bg-elev);
+  --color-bg-soft: var(--bg-soft);
+  --color-line: var(--line);
+  --color-line-soft: var(--line-soft);
+  --color-fg: var(--fg);
+  --color-fg-dim: var(--fg-dim);
+  --color-fg-mute: var(--fg-mute);
+  --color-accent: var(--accent);
+  --color-accent-dim: var(--accent-dim);
+  --color-accent-ghost: var(--accent-ghost);
+  --color-safe: var(--safe);
+  --color-safe-dim: var(--safe-dim);
+  --color-danger: var(--danger);
+  --font-mono: var(--mono);
+  --font-sans: var(--sans);
+  --radius: var(--radius);
+  --radius-lg: var(--radius-lg);
+}

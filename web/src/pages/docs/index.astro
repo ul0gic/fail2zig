@@ -1,0 +1,136 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from '@/layouts/BaseLayout.astro';
+
+const allDocs = await getCollection('docs');
+
+interface SidebarSection {
+  label: string;
+  items: { slug: string; title: string; description?: string | undefined; position: number }[];
+}
+
+const sectionMap = new Map<string, SidebarSection>();
+
+for (const doc of allDocs) {
+  const parts = doc.id.split('--');
+  const category = doc.data.category ?? (parts.length > 1 ? (parts[0] ?? 'General') : 'General');
+  const slug = doc.id.replace(/--/g, '/');
+
+  if (!sectionMap.has(category)) {
+    sectionMap.set(category, { label: category, items: [] });
+  }
+  sectionMap.get(category)?.items.push({
+    slug,
+    title: doc.data.title,
+    description: doc.data.description,
+    position: doc.data.sidebar_position ?? 99,
+  });
+}
+
+for (const section of sectionMap.values()) {
+  section.items.sort((a, b) => a.position - b.position);
+}
+
+const sections = Array.from(sectionMap.values());
+---
+
+<BaseLayout
+  title="fail2zig · docs"
+  description="Documentation for fail2zig — configuration, migration, CLI reference, and architecture."
+  activeNav="/docs"
+>
+  <div class="docs-index">
+    <div class="wrap">
+      <div class="eyebrow" style="margin-bottom:20px"><span class="dot"></span>Documentation</div>
+      <h1>fail2zig docs</h1>
+      <p class="lede">
+        Configuration reference, migration guide, CLI docs, and architecture decisions. Everything
+        you need to install, configure, and operate fail2zig.
+      </p>
+
+      <div class="docs-grid">
+        {
+          sections.map((section) => (
+            <div class="docs-section">
+              <h2>{section.label}</h2>
+              <ul>
+                {section.items.map((item) => (
+                  <li>
+                    <a href={`/docs/${item.slug}`}>
+                      <span class="doc-title">{item.title}</span>
+                      {item.description && <span class="doc-desc">{item.description}</span>}
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))
+        }
+      </div>
+    </div>
+  </div>
+</BaseLayout>
+
+<style>
+  .docs-index {
+    padding: 64px 0 96px;
+  }
+  .docs-index h1 {
+    font-size: clamp(40px, 5vw, 64px);
+    margin-bottom: 20px;
+  }
+  .docs-index .lede {
+    margin-bottom: 48px;
+  }
+
+  .docs-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 32px;
+  }
+  .docs-section h2 {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--fg-mute);
+    margin-bottom: 12px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .docs-section ul {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .docs-section li {
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .docs-section a {
+    display: block;
+    padding: 12px 0;
+    transition: color 0.15s;
+  }
+  .docs-section a:hover {
+    color: var(--accent);
+  }
+  .doc-title {
+    display: block;
+    font-family: var(--mono);
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--fg);
+  }
+  .doc-desc {
+    display: block;
+    font-size: 13px;
+    color: var(--fg-dim);
+    margin-top: 4px;
+    line-height: 1.4;
+    max-width: 50ch;
+  }
+  .docs-section a:hover .doc-title {
+    color: var(--accent);
+  }
+</style>

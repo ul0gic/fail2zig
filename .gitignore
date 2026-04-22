@@ -14,5 +14,8 @@ node_modules/
 *.d
 *.swp
 
+# Playwright
+.playwright-mcp/
+
 # Secrets
 .env

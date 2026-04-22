@@ -1,0 +1,9 @@
+dist/
+.astro/
+.wrangler/
+node_modules/
+pnpm-lock.yaml
+
+# theme.css is ported verbatim from .project/design/assets/theme.css —
+# do not reformat it so it stays 1:1 with the design source.
+src/styles/theme.css

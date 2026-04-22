@@ -1,0 +1,16 @@
+#:schema node_modules/wrangler/config-schema.json
+# fail2zig.com — Workers Static Assets (not Cloudflare Pages).
+# Phase 9A: pure static-assets Worker. Phase 9B will add /api/whoami and
+# /trigger/* dynamic handlers via a Worker entrypoint under ./worker/.
+
+name = "fail2zig"
+compatibility_date = "2026-04-22"
+workers_dev = false
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+
+[[routes]]
+pattern = "fail2zig.com/*"
+zone_name = "fail2zig.com"

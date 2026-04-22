@@ -1,0 +1,62 @@
+---
+// Site navigation — extracted verbatim (class names preserved) from
+// .project/design/assets/shared.js `renderNav()` and .project/design/index.html.
+// Styling lives in src/styles/theme.css under the .site-nav / .nav-inner rules.
+
+interface Props {
+  active?: string | undefined;
+}
+
+const { active } = Astro.props;
+
+const links: readonly { href: string; label: string }[] = [
+  { href: '/', label: 'Home' },
+  { href: '/docs', label: 'Docs' },
+  { href: '/security', label: 'Security' },
+  { href: '/manifesto', label: 'Manifesto' },
+  { href: '/changelog', label: 'Changelog' },
+  { href: '/install', label: 'Install' },
+  { href: '/see-it-live', label: 'See it Live' },
+];
+
+const isActive = (href: string): boolean => {
+  if (active) return active === href;
+  const path = Astro.url.pathname.replace(/\/$/, '') || '/';
+  const target = href.replace(/\/$/, '') || '/';
+  return path === target;
+};
+---
+
+<nav class="site-nav">
+  <div class="nav-inner">
+    <a href="/" class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      fail2zig<span class="brand-slash">/</span><span class="brand-version">0.1.0-preview</span>
+    </a>
+    <div class="nav-links">
+      {
+        links.map((link) => (
+          <a href={link.href} class={isActive(link.href) ? 'active' : ''}>
+            {link.label}
+          </a>
+        ))
+      }
+    </div>
+    <div class="nav-right">
+      <a href="https://github.com/ul0gic/fail2zig" title="GitHub" rel="noopener noreferrer">
+        github ↗
+      </a>
+      <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle theme">
+        ◐
+      </button>
+      <a href="/install" class="nav-cta">$ install</a>
+    </div>
+  </div>
+</nav>
+
+<style>
+  .brand-version {
+    color: var(--fg-dim);
+    font-weight: 400;
+  }
+</style>

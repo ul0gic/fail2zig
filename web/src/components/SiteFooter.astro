@@ -1,0 +1,82 @@
+---
+// Site footer — extracted from .project/design/assets/shared.js `renderFooter()`.
+// Class names preserved so the existing theme.css .site-footer / .foot-cols
+// rules apply without modification.
+const year = new Date().getFullYear();
+---
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div>
+      <div class="brand footer-brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        fail2zig
+      </div>
+      <div class="footer-tagline">
+        A modern intrusion prevention system. Single binary. Zero dependencies.
+      </div>
+      <div class="footer-copy">
+        © {year} Corelift &nbsp;·&nbsp; Code licensed under{' '}
+        <a href="/LICENSE" class="footer-link">AGPL-3.0-or-later</a>
+      </div>
+      <div class="footer-privacy">
+        No tracking. No cookies at launch. See <a href="/privacy" class="footer-link">privacy</a>.
+      </div>
+    </div>
+    <div class="foot-cols">
+      <div>
+        <h5>Product</h5>
+        <a href="/">Overview</a>
+        <a href="/install">Install</a>
+        <a href="/roadmap">Roadmap</a>
+        <a href="/see-it-live">See it Live</a>
+      </div>
+      <div>
+        <h5>Docs</h5>
+        <a href="/docs">Getting started</a>
+        <a href="/docs">Migration guide</a>
+        <a href="/docs">Configuration</a>
+        <a href="/docs">CLI reference</a>
+      </div>
+      <div>
+        <h5>Security</h5>
+        <a href="/security">Threat model</a>
+        <a href="/security">Reporting</a>
+        <a href="/security">Reproducible builds</a>
+        <a href="/changelog">Changelog</a>
+      </div>
+      <div>
+        <h5>Project</h5>
+        <a href="/manifesto">Manifesto</a>
+        <a href="/about">About</a>
+        <a href="/brand">Brand / trademark</a>
+        <a href="https://github.com/ul0gic/fail2zig" rel="noopener noreferrer">GitHub ↗</a>
+      </div>
+    </div>
+  </div>
+</footer>
+
+<style>
+  .footer-brand {
+    margin-bottom: 12px;
+  }
+  .footer-tagline {
+    color: var(--fg-mute);
+    max-width: 32ch;
+    line-height: 1.6;
+  }
+  .footer-copy {
+    margin-top: 20px;
+    color: var(--fg-mute);
+  }
+  .footer-privacy {
+    margin-top: 8px;
+    color: var(--fg-mute);
+  }
+  .footer-link {
+    color: var(--fg-dim);
+  }
+  .footer-link:hover {
+    color: var(--accent);
+  }
+</style>

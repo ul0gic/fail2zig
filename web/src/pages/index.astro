@@ -1,0 +1,1375 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+---
+
+<BaseLayout title="fail2zig — intrusion prevention, rebuilt" activeNav="/">
+  <header class="hero">
+    <div class="wrap">
+      <div class="hero-grid">
+        <div>
+          <div class="hero-status">
+            <span class="pulse"></span>
+            <span>PREVIEW · Phase 1 pre-release · est. Q2 2026</span>
+          </div>
+          <h1>
+            Intrusion prevention,<br />
+            built for the<br />
+            <span class="accent">next 20 years.</span>
+          </h1>
+          <p class="hero-lede">
+            fail2zig picks up where fail2ban's 20-year legacy left off — written in Zig, shipped as
+            a single static binary, with zero runtime dependencies and a parser that can't be made
+            to allocate unbounded memory by the traffic it's supposed to be stopping.
+          </p>
+          <div class="hero-cta">
+            <a href="/install" class="btn primary">$ Install fail2zig &nbsp;&rarr;</a>
+            <a href="/security" class="btn ghost">Read the threat model</a>
+          </div>
+          <div class="hero-metrics">
+            <div class="hero-metric">
+              <div class="n">5.96M</div>
+              <div class="l">lines/sec parsed</div>
+            </div>
+            <div class="hero-metric">
+              <div class="n">932ns</div>
+              <div class="l">ban decision p99</div>
+            </div>
+            <div class="hero-metric">
+              <div class="n">877KB</div>
+              <div class="l">static binary</div>
+            </div>
+            <div class="hero-metric">
+              <div class="n">0</div>
+              <div class="l">runtime deps</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="diagram" aria-hidden="true">
+          <div class="diagram-header">
+            <div class="dots"><span></span><span></span><span></span></div>
+            <div>pipeline.trace&nbsp;&middot;&nbsp;live</div>
+            <div id="diag-counter">982,684 events</div>
+          </div>
+          <svg class="diagram-svg" viewBox="0 0 560 540" preserveAspectRatio="xMidYMid meet">
+            <defs>
+              <marker
+                id="arrowhead"
+                markerWidth="10"
+                markerHeight="10"
+                refX="9"
+                refY="5"
+                orient="auto"
+              >
+                <path d="M0,0 L10,5 L0,10 z" fill="var(--fg-mute)"></path>
+              </marker>
+              <linearGradient id="pulseGrad" x1="0" y1="0" x2="1" y2="0">
+                <stop offset="0%" stop-color="var(--accent)" stop-opacity="0"></stop>
+                <stop offset="50%" stop-color="var(--accent)" stop-opacity="1"></stop>
+                <stop offset="100%" stop-color="var(--accent)" stop-opacity="0"></stop>
+              </linearGradient>
+            </defs>
+
+            <text
+              x="50"
+              y="52"
+              fill="var(--fg-mute)"
+              font-family="var(--mono)"
+              font-size="10"
+              letter-spacing="1">01 &middot; SOURCE</text
+            >
+            <g class="node" data-stage="0">
+              <rect x="40" y="70" width="200" height="90" fill="var(--bg)" stroke="var(--line)"
+              ></rect>
+              <text
+                x="54"
+                y="92"
+                fill="var(--fg)"
+                font-family="var(--mono)"
+                font-size="12"
+                font-weight="500">log sources</text
+              >
+              <text x="54" y="112" fill="var(--fg-dim)" font-family="var(--mono)" font-size="11"
+                >/var/log/auth.log</text
+              >
+              <text x="54" y="128" fill="var(--fg-dim)" font-family="var(--mono)" font-size="11"
+                >journald &middot; sshd &middot; nginx</text
+              >
+              <text x="54" y="148" fill="var(--fg-mute)" font-family="var(--mono)" font-size="10"
+                >inotify &middot; io_uring &middot; kqueue</text
+              >
+            </g>
+
+            <line
+              x1="140"
+              y1="160"
+              x2="140"
+              y2="200"
+              stroke="var(--line)"
+              stroke-width="1"
+              marker-end="url(#arrowhead)"></line>
+            <line
+              id="wire1"
+              x1="140"
+              y1="160"
+              x2="140"
+              y2="200"
+              stroke="url(#pulseGrad)"
+              stroke-width="2"
+              stroke-dasharray="40 600"
+              stroke-dashoffset="0"></line>
+
+            <text
+              x="50"
+              y="220"
+              fill="var(--fg-mute)"
+              font-family="var(--mono)"
+              font-size="10"
+              letter-spacing="1">02 &middot; PARSE</text
+            >
+            <g class="node" data-stage="1">
+              <rect x="40" y="235" width="200" height="90" fill="var(--bg)" stroke="var(--line)"
+              ></rect>
+              <text
+                x="54"
+                y="257"
+                fill="var(--fg)"
+                font-family="var(--mono)"
+                font-size="12"
+                font-weight="500">parser engine</text
+              >
+              <text x="54" y="277" fill="var(--fg-dim)" font-family="var(--mono)" font-size="11"
+                >comptime filters &middot; SIMD scan</text
+              >
+              <text x="54" y="293" fill="var(--fg-dim)" font-family="var(--mono)" font-size="11"
+                >zero-copy &middot; bounds-checked</text
+              >
+              <text x="54" y="313" fill="var(--fg-mute)" font-family="var(--mono)" font-size="10"
+                >no regex engine in-process</text
+              >
+            </g>
+
+            <line
+              x1="240"
+              y1="280"
+              x2="320"
+              y2="280"
+              stroke="var(--line)"
+              stroke-width="1"
+              marker-end="url(#arrowhead)"></line>
+            <line
+              id="wire2"
+              x1="240"
+              y1="280"
+              x2="320"
+              y2="280"
+              stroke="url(#pulseGrad)"
+              stroke-width="2"
+              stroke-dasharray="30 400"></line>
+
+            <text
+              x="330"
+              y="220"
+              fill="var(--fg-mute)"
+              font-family="var(--mono)"
+              font-size="10"
+              letter-spacing="1">03 &middot; STATE</text
+            >
+            <g class="node" data-stage="2">
+              <rect x="320" y="235" width="200" height="90" fill="var(--bg)" stroke="var(--line)"
+              ></rect>
+              <text
+                x="334"
+                y="257"
+                fill="var(--fg)"
+                font-family="var(--mono)"
+                font-size="12"
+                font-weight="500">state tracker</text
+              >
+              <text x="334" y="277" fill="var(--fg-dim)" font-family="var(--mono)" font-size="11"
+                >fixed-arena hash table</text
+              >
+              <text x="334" y="293" fill="var(--fg-dim)" font-family="var(--mono)" font-size="11"
+                >pre-allocated &middot; evict-oldest</text
+              >
+              <text x="334" y="313" fill="var(--fg-mute)" font-family="var(--mono)" font-size="10"
+                >hard 64MB ceiling</text
+              >
+            </g>
+
+            <line
+              x1="420"
+              y1="325"
+              x2="420"
+              y2="365"
+              stroke="var(--line)"
+              stroke-width="1"
+              marker-end="url(#arrowhead)"></line>
+            <line
+              id="wire3"
+              x1="420"
+              y1="325"
+              x2="420"
+              y2="365"
+              stroke="url(#pulseGrad)"
+              stroke-width="2"
+              stroke-dasharray="20 300"></line>
+
+            <text
+              x="330"
+              y="385"
+              fill="var(--fg-mute)"
+              font-family="var(--mono)"
+              font-size="10"
+              letter-spacing="1">04 &middot; BAN</text
+            >
+            <g class="node" data-stage="3">
+              <rect x="320" y="400" width="200" height="90" fill="var(--bg)" stroke="var(--line)"
+              ></rect>
+              <text
+                x="334"
+                y="422"
+                fill="var(--fg)"
+                font-family="var(--mono)"
+                font-size="12"
+                font-weight="500">ban executor</text
+              >
+              <text x="334" y="442" fill="var(--fg-dim)" font-family="var(--mono)" font-size="11"
+                >nftables &middot; ipset &middot; iptables</text
+              >
+              <text x="334" y="458" fill="var(--fg-dim)" font-family="var(--mono)" font-size="11"
+                >eBPF/XDP (phase 2)</text
+              >
+              <text x="334" y="478" fill="var(--accent)" font-family="var(--mono)" font-size="10"
+                >DROP &middot; at NIC driver</text
+              >
+            </g>
+
+            <line
+              x1="240"
+              y1="450"
+              x2="320"
+              y2="450"
+              stroke="var(--line-soft)"
+              stroke-width="1"
+              stroke-dasharray="3 3"></line>
+            <g>
+              <rect
+                x="40"
+                y="400"
+                width="200"
+                height="90"
+                fill="var(--bg)"
+                stroke="var(--line-soft)"
+                stroke-dasharray="3 3"></rect>
+              <text
+                x="54"
+                y="422"
+                fill="var(--fg-dim)"
+                font-family="var(--mono)"
+                font-size="12"
+                font-weight="500">metrics &middot; audit</text
+              >
+              <text x="54" y="442" fill="var(--fg-mute)" font-family="var(--mono)" font-size="11"
+                >prometheus /metrics</text
+              >
+              <text x="54" y="458" fill="var(--fg-mute)" font-family="var(--mono)" font-size="11"
+                >signed audit trail</text
+              >
+              <text x="54" y="478" fill="var(--fg-mute)" font-family="var(--mono)" font-size="10"
+                >read-only endpoint</text
+              >
+            </g>
+
+            <circle id="event" r="4" fill="var(--accent)" opacity="1" cx="140" cy="235">
+              <animate attributeName="opacity" values="0;1;1;0" dur="3.2s" repeatCount="indefinite"
+              ></animate>
+            </circle>
+          </svg>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- WHAT WE ADD -->
+  <section class="section">
+    <div class="wrap">
+      <div class="section-head">
+        <div class="eyebrow"><span class="dot"></span>01 &middot; What we add</div>
+        <div>
+          <h2>
+            Built on 20 years of fail2ban's foundation &mdash; with a smaller, faster, safer TCB.
+          </h2>
+          <p class="lede" style="margin-top:16px">
+            fail2ban has protected more internet-facing servers than almost any other tool. fail2zig
+            builds on that lineage with a single static binary, explicit memory bounds, and a
+            compile-time parser that eliminates an entire class of runtime risk.
+          </p>
+        </div>
+      </div>
+
+      <div class="problem-grid">
+        <div class="problem-card">
+          <h3>Smaller attack surface</h3>
+          <p>
+            ~12K lines of Zig versus ~45K lines of Python + CPython runtime + stdlib + C extensions.
+            A smaller trusted computing base means fewer places for bugs to hide.
+          </p>
+          <div class="meta">~12K LOC &middot; no interpreter &middot; no VM</div>
+        </div>
+        <div class="problem-card">
+          <h3>Bounded memory</h3>
+          <p>
+            A hard, configurable ceiling the daemon never exceeds &mdash; regardless of attack
+            volume. Eviction policy is operator-defined. No garbage collector in the loop.
+          </p>
+          <div class="meta">hard ceiling &middot; configurable &middot; eviction policy</div>
+        </div>
+        <div class="problem-card">
+          <h3>Higher throughput</h3>
+          <p>
+            Comptime-generated parsers with SIMD acceleration. Measured at 5.96M lines/sec on a Xeon
+            E-2386G &mdash; keeping pace with busy SSH, postfix, and nginx log streams.
+          </p>
+          <div class="meta">5.96M l/s measured &middot; SIMD &middot; zero-alloc hot path</div>
+        </div>
+        <div class="problem-card">
+          <h3>Instant readiness</h3>
+          <p>
+            No interpreter startup, no import chain. The daemon is accepting log events within
+            milliseconds of exec. After a reboot, the gap where nothing is banning is as short as
+            the kernel allows.
+          </p>
+          <div class="meta">no import cost &middot; no rule-compile cost</div>
+        </div>
+        <div class="problem-card">
+          <h3>Runs anywhere</h3>
+          <p>
+            Static musl binary. Works on distroless containers, scratch images, hardened minimal
+            servers, embedded Linux, OpenWrt routers &mdash; anywhere a Python runtime is
+            unacceptable.
+          </p>
+          <div class="meta">musl &middot; 4 architectures &middot; no runtime</div>
+        </div>
+        <div class="problem-card">
+          <h3>Clean config</h3>
+          <p>
+            Native TOML with strict validation &mdash; unknown keys are errors, not silent no-ops.
+            <code>--import-config</code> migrates your existing fail2ban tree, translating jails and filters
+            automatically.
+          </p>
+          <div class="meta">validated &middot; documented &middot; import path</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- BENCHMARKS -->
+  <section class="section" id="benchmarks">
+    <div class="wrap">
+      <div class="section-head">
+        <div class="eyebrow"><span class="dot"></span>02 &middot; Benchmarks</div>
+        <div>
+          <h2>Measured, not marketing.</h2>
+          <p class="lede" style="margin-top:16px">
+            All figures from Phase 7.5 real-system validation on a Xeon E-2386G. Reproducible
+            benchmark suite ships with the source tree at <code>tests/benchmark/</code>.
+          </p>
+        </div>
+      </div>
+
+      <div class="bench-wrap">
+        <div class="bench-chart">
+          <h4>Parse throughput &middot; auth.log &middot; Xeon E-2386G</h4>
+          <div class="bench-bar-row">
+            <span class="bench-label">fail2ban</span>
+            <div class="bench-bar">
+              <div class="fill dim" data-w="0.007" style="width: 0.007%;"></div>
+            </div>
+            <span class="bench-val">~420 l/s</span>
+          </div>
+          <div class="bench-bar-row">
+            <span class="bench-label">SSHGuard</span>
+            <div class="bench-bar">
+              <div class="fill dim" data-w="0.05" style="width: 0.05%;"></div>
+            </div>
+            <span class="bench-val">~3.1k l/s</span>
+          </div>
+          <div class="bench-bar-row">
+            <span class="bench-label">CrowdSec</span>
+            <div class="bench-bar">
+              <div class="fill dim" data-w="0.08" style="width: 0.08%;"></div>
+            </div>
+            <span class="bench-val">~4.9k l/s</span>
+          </div>
+          <div class="bench-bar-row">
+            <span class="bench-label">fail2zig</span>
+            <div class="bench-bar">
+              <div class="fill accent" data-w="100" style="width: 100%;"></div>
+            </div>
+            <span class="bench-val accent">5.96M l/s</span>
+          </div>
+          <div class="bench-note">
+            Measured: Phase 7.5 ReleaseSafe build, <code>tests/benchmark/parse_throughput.zig</code
+            >. Bars scale linearly. Reproduction guide in <a
+              href="/docs"
+              style="color:var(--accent)">tests/benchmark/README.md</a
+            >.
+          </div>
+        </div>
+
+        <div class="bench-chart">
+          <h4>Memory under attack &middot; 50K unique IPs &middot; sustained</h4>
+          <div class="bench-bar-row">
+            <span class="bench-label">fail2ban</span>
+            <div class="bench-bar">
+              <div class="fill dim" data-w="88" style="width: 88%;"></div>
+            </div>
+            <span class="bench-val">~740 MB</span>
+          </div>
+          <div class="bench-bar-row">
+            <span class="bench-label">CrowdSec</span>
+            <div class="bench-bar">
+              <div class="fill dim" data-w="32" style="width: 32%;"></div>
+            </div>
+            <span class="bench-val">~210 MB</span>
+          </div>
+          <div class="bench-bar-row">
+            <span class="bench-label">SSHGuard</span>
+            <div class="bench-bar">
+              <div class="fill dim" data-w="10" style="width: 10%;"></div>
+            </div>
+            <span class="bench-val">~58 MB</span>
+          </div>
+          <div class="bench-bar-row">
+            <span class="bench-label">fail2zig</span>
+            <div class="bench-bar">
+              <div class="fill accent" data-w="9" style="width: 9%;"></div>
+            </div>
+            <span class="bench-val accent">&le;64 MB *</span>
+          </div>
+          <div class="bench-note">
+            * Hard ceiling, configurable. Under a 50K unique-IP attack: 21,845 resident entries +
+            15,606 evicted. The daemon never exceeded the cap. Eviction policy is operator-defined.
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ARCHITECTURE / FEATURES -->
+  <section class="section" id="architecture">
+    <div class="wrap">
+      <div class="section-head">
+        <div class="eyebrow"><span class="dot"></span>03 &middot; Architecture</div>
+        <div>
+          <h2>Six components. One binary. Every allocation accounted for.</h2>
+          <p class="lede" style="margin-top:16px">
+            A straight pipeline &mdash; log in, ban out &mdash; with explicit allocator boundaries
+            at every stage. No hidden work, no implicit runtime, no third-party code in the critical
+            path.
+          </p>
+        </div>
+      </div>
+
+      <div class="feature-grid">
+        <div class="feature">
+          <div class="idx">01 / LOG WATCHER</div>
+          <h3>Event-driven, rotation-aware</h3>
+          <p>
+            inotify on Linux, kqueue on BSD, sd_journal for systemd, io_uring for high-throughput
+            batched I/O on 5.1+. Handles rename, truncate, and new-file creation without missing
+            events.
+          </p>
+          <div class="meta">linux &middot; bsd &middot; journald &middot; stdin</div>
+        </div>
+        <div class="feature">
+          <div class="idx">02 / PARSER ENGINE</div>
+          <h3>Comptime filters, zero-copy</h3>
+          <p>
+            Built-in filters compile to specialised parsers at build time &mdash; no runtime regex
+            engine in process. SIMD-accelerated IP extraction and timestamp parsing where the CPU
+            supports it.
+          </p>
+          <div class="meta">no pcre &middot; no allocations/line &middot; simd</div>
+        </div>
+        <div class="feature">
+          <div class="idx">03 / STATE TRACKER</div>
+          <h3>Fixed-size arena, hard ceiling</h3>
+          <p>
+            Pre-allocated buckets, no dynamic resizing under load, configurable max with explicit
+            eviction policy. Memory usage has a hard cap regardless of attack volume.
+          </p>
+          <div class="meta">evict-oldest &middot; ban-all &middot; drop-unbanned</div>
+        </div>
+        <div class="feature">
+          <div class="idx">04 / BAN EXECUTOR</div>
+          <h3>Pluggable firewall backends</h3>
+          <p>
+            nftables, iptables, ipset on day one. eBPF/XDP in Phase 2 &mdash; drops packets at the
+            NIC driver level before they reach the kernel TCP stack. pf for BSD.
+          </p>
+          <div class="meta">nftables &middot; ipset &middot; xdp &middot; pf</div>
+        </div>
+        <div class="feature">
+          <div class="idx">05 / CONFIG</div>
+          <h3>Native + fail2ban-compatible</h3>
+          <p>
+            Native fail2zig.toml for new deployments. A dedicated parser reads jail.conf,
+            jail.local, filter.d, action.d. The <code style="color:var(--accent)"
+              >--import-config</code
+            > flag converts your existing fail2ban tree.
+          </p>
+          <div class="meta">validated &middot; documented &middot; hot-reload (ph.2)</div>
+        </div>
+        <div class="feature">
+          <div class="idx">06 / METRICS</div>
+          <h3>Prometheus, out of the box</h3>
+          <p>
+            Built-in HTTP metrics endpoint &mdash; bind-restricted, read-only. Ban rate, parse
+            throughput, active bans, per-jail stats. Structured JSON logs; syslog optional.
+          </p>
+          <div class="meta">/metrics &middot; structured &middot; signed-audit</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- COMPARISON -->
+  <section class="section">
+    <div class="wrap">
+      <div class="section-head">
+        <div class="eyebrow"><span class="dot"></span>04 &middot; Landscape</div>
+        <div>
+          <h2>What's out there, and what's different.</h2>
+          <p class="lede" style="margin-top:16px">
+            Not every IPS is trying to solve the same problem. fail2zig is a local-first,
+            zero-dependency, zero-cloud alternative &mdash; a single binary you scp to a server and
+            forget about.
+          </p>
+        </div>
+      </div>
+
+      <table class="cmp-table">
+        <thead>
+          <tr>
+            <th style="width:140px">&nbsp;</th>
+            <th>Language</th>
+            <th>Deployment</th>
+            <th>Banning</th>
+            <th>Throughput</th>
+            <th>Footprint</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="row-head">fail2ban</td>
+            <td class="dim">Python 3</td>
+            <td class="dim">pkg + runtime</td>
+            <td class="dim">iptables / nftables</td>
+            <td class="dim">~hundreds l/s</td>
+            <td class="dim">GC &middot; unbounded</td>
+          </tr>
+          <tr>
+            <td class="row-head">SSHGuard</td>
+            <td class="dim">C</td>
+            <td class="dim">single binary</td>
+            <td class="dim">pf / iptables / nftables</td>
+            <td class="dim">medium</td>
+            <td class="dim">small, SSH-focused</td>
+          </tr>
+          <tr>
+            <td class="row-head">CrowdSec</td>
+            <td class="dim">Go</td>
+            <td class="dim">binary + cloud API</td>
+            <td class="dim">iptables / nftables</td>
+            <td class="dim">medium-high</td>
+            <td class="dim">heavy &middot; cloud dep</td>
+          </tr>
+          <tr>
+            <td class="row-head us">fail2zig</td>
+            <td style="color:var(--fg)">Zig</td>
+            <td style="color:var(--fg)">static binary, musl</td>
+            <td style="color:var(--fg)">nft &middot; ipset &middot; eBPF/XDP &middot; pf</td>
+            <td style="color:var(--accent)">5.96M l/s (measured)</td>
+            <td style="color:var(--accent)">fixed ceiling &middot; 0 deps</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- INSTALL -->
+  <section class="section" id="install">
+    <div class="wrap">
+      <div class="section-head">
+        <div class="eyebrow"><span class="dot"></span>05 &middot; Install</div>
+        <div>
+          <h2>Two commands from fail2ban to fail2zig.</h2>
+          <p class="lede" style="margin-top:16px">
+            Drop the binary, import your existing config, restart the service. Migration is the
+            adoption path.
+          </p>
+        </div>
+      </div>
+
+      <div class="install-grid">
+        <div class="install-block">
+          <div class="install-head">
+            <span>terminal &middot; linux/x86_64</span>
+            <button
+              class="copy-btn"
+              data-copy="curl -fsSL https://fail2zig.com/install.sh | sh
+fail2zig --import-config /etc/fail2ban/"
+              >copy</button
+            >
+          </div>
+          <div class="install-body">
+            <span class="cmt"># 1 — fetch the static binary (877 KB, musl-linked)</span><br />
+            <span class="prompt">$</span> curl -fsSL https://fail2zig.com/install.sh | sh<br />
+            <br />
+            <span class="cmt"># 2 — migrate from fail2ban, review the generated config</span><br />
+            <span class="prompt">$</span> fail2zig --import-config /etc/fail2ban/<br />
+            <span style="color:var(--fg-mute)"
+              >&rarr; translated 14 jails &middot; 2 warnings &middot; wrote /etc/fail2zig.toml</span
+            ><br />
+            <br />
+            <span class="cmt"># 3 — swap the service</span><br />
+            <span class="prompt">$</span> systemctl disable --now fail2ban<br />
+            <span class="prompt">$</span> systemctl enable --now fail2zig<br />
+          </div>
+        </div>
+
+        <div class="install-block">
+          <div class="install-head">
+            <span>targets &middot; stripped &middot; static</span>
+            <span style="color:var(--fg-dim)">via github releases</span>
+          </div>
+          <div class="install-body" style="font-size:12px;line-height:2">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 24px">
+              <div><span style="color:var(--accent)">&bull;</span> x86_64-linux-musl</div>
+              <div style="color:var(--fg-mute)">877 KB</div>
+              <div><span style="color:var(--accent)">&bull;</span> aarch64-linux-musl</div>
+              <div style="color:var(--fg-mute)">stripped</div>
+              <div><span style="color:var(--accent)">&bull;</span> armv7-linux-musleabihf</div>
+              <div style="color:var(--fg-mute)">stripped</div>
+              <div><span style="color:var(--accent)">&bull;</span> mips-linux-musl</div>
+              <div style="color:var(--fg-mute)">stripped</div>
+              <div><span style="color:var(--fg-mute)">&cir;</span> x86_64-freebsd</div>
+              <div style="color:var(--fg-mute)">planned</div>
+              <div><span style="color:var(--fg-mute)">&cir;</span> aarch64-openbsd</div>
+              <div style="color:var(--fg-mute)">planned</div>
+            </div>
+            <div
+              style="margin-top:20px;padding-top:16px;border-top:1px dashed var(--line-soft);color:var(--fg-mute);font-size:11px"
+            >
+              reproducible builds &middot; checksums signed with cosign &middot; minisign key
+              in-repo
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ROADMAP -->
+  <section class="section">
+    <div class="wrap">
+      <div class="section-head">
+        <div class="eyebrow"><span class="dot"></span>06 &middot; Roadmap</div>
+        <div>
+          <h2>Three phases. Shipping order is not negotiable.</h2>
+          <p class="lede" style="margin-top:16px">
+            Phase 1 has to stand on its own before anything else ships. Fast, correct, drop-in. The
+            rest is upside.
+          </p>
+        </div>
+      </div>
+
+      <div class="roadmap">
+        <div class="phase">
+          <div class="ph-tag">
+            <span class="ph-num">Phase 01</span>
+            <span class="tag accent">In flight</span>
+          </div>
+          <h3>Drop-in replacement</h3>
+          <div class="ph-time">~6 weeks &middot; Q2 2026</div>
+          <ul>
+            <li>inotify + sd_journal log watching</li>
+            <li>Top 20 filters &middot; sshd priority 1</li>
+            <li>nftables &middot; iptables &middot; ipset backends</li>
+            <li><code>--import-config</code> migration tool</li>
+            <li>Reproducible musl builds, 4 archs</li>
+            <li>Benchmark suite vs fail2ban</li>
+          </ul>
+        </div>
+        <div class="phase">
+          <div class="ph-tag">
+            <span class="ph-num">Phase 02</span>
+            <span class="tag">Next</span>
+          </div>
+          <h3>Beyond the foundation</h3>
+          <div class="ph-time">8&ndash;12 weeks after ph. 1</div>
+          <ul>
+            <li>eBPF/XDP packet drop at NIC driver</li>
+            <li>Encrypted gossip ban sharing (SWIM)</li>
+            <li>Hot-reload config &middot; zero downtime</li>
+            <li>GeoIP / ASN filter conditions</li>
+            <li>Built-in Prometheus endpoint</li>
+            <li>Adaptive anomaly thresholds</li>
+          </ul>
+        </div>
+        <div class="phase">
+          <div class="ph-tag">
+            <span class="ph-num">Phase 03</span>
+            <span class="tag">Later</span>
+          </div>
+          <h3>Platform</h3>
+          <div class="ph-time">Ongoing</div>
+          <ul>
+            <li>Authenticated REST API for SIEM/SOAR</li>
+            <li>Optional web dashboard (separate binary)</li>
+            <li>deb &middot; rpm &middot; apk &middot; pkg &middot; homebrew</li>
+            <li>Cloud backends: AWS SG &middot; GCP &middot; Azure</li>
+            <li>Signed audit trail for compliance</li>
+            <li>Restricted DSL for user filters</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- FAQ -->
+  <section class="section">
+    <div class="wrap">
+      <div class="section-head">
+        <div class="eyebrow"><span class="dot"></span>07 &middot; FAQ</div>
+        <div>
+          <h2>Reasonable skepticism, addressed.</h2>
+        </div>
+      </div>
+
+      <div>
+        <div class="faq-item">
+          <div class="q-num">Q.01</div>
+          <div>
+            <h3>Why Zig? Why not Rust?</h3>
+            <p>
+              Zig gives us explicit allocator control end-to-end, comptime code generation for
+              built-in filters, trivial cross-compilation to musl targets, and a language small
+              enough to audit. Rust would work. Zig fits the problem.
+            </p>
+          </div>
+        </div>
+        <div class="faq-item">
+          <div class="q-num">Q.02</div>
+          <div>
+            <h3>Is this really a drop-in replacement?</h3>
+            <p>
+              Phase 1 targets jail.conf + filter.d compatibility for the top 20 fail2ban filters
+              (95%+ of installations). Custom Python filter code and sendmail actions are explicitly
+              out of scope &mdash; they need to be rewritten or replaced.
+            </p>
+          </div>
+        </div>
+        <div class="faq-item">
+          <div class="q-num">Q.03</div>
+          <div>
+            <h3>Can attacker-controlled log lines crash or OOM the daemon?</h3>
+            <p>
+              That's the threat model we designed to. Bounds-checked parsing with strict line length
+              limits, no regex engine in process, fixed-size arena allocator with a hard ceiling,
+              fuzz-tested parsers. <a href="/security" style="color:var(--accent)"
+                >Full write-up &rarr;</a
+              >
+            </p>
+          </div>
+        </div>
+        <div class="faq-item">
+          <div class="q-num">Q.04</div>
+          <div>
+            <h3>What about distroless / scratch containers?</h3>
+            <p>
+              First-class target. The binary is static, musl-linked, and has zero runtime
+              dependencies. Drop it into a scratch image, give it CAP_NET_ADMIN, done.
+            </p>
+          </div>
+        </div>
+        <div class="faq-item">
+          <div class="q-num">Q.05</div>
+          <div>
+            <h3>Is this a SIEM or a WAF?</h3>
+            <p>
+              Neither. fail2zig reads logs, acts on them, and forgets them. It does not aggregate,
+              correlate, or inspect HTTP bodies. It complements network firewalls and WAFs &mdash;
+              it does not replace them.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section class="section" style="padding:128px 0">
+    <div class="wrap" style="text-align:center">
+      <div class="eyebrow" style="margin-bottom:20px;display:inline-block">
+        <span class="dot"></span>Read the code before it reads your logs
+      </div>
+      <h2 style="font-size:clamp(32px, 4vw, 52px);max-width:18ch;margin:0 auto 24px">
+        The whole project fits on one screen of <code style="color:var(--accent);font-weight:500"
+          >git ls-tree</code
+        >.
+      </h2>
+      <p class="lede" style="margin:0 auto 36px">
+        Audit it yourself. Build it from source in 12 seconds. Ship it the same afternoon.
+      </p>
+      <div style="display:inline-flex;gap:10px">
+        <a href="https://github.com/ul0gic/fail2zig" class="btn primary" rel="noopener noreferrer"
+          >&#9733; &nbsp;Star on GitHub</a
+        >
+        <a href="/docs" class="btn">Read the docs</a>
+      </div>
+    </div>
+  </section>
+</BaseLayout>
+
+<style>
+  /* ---------- HERO ---------- */
+  .hero {
+    padding: 48px 0 0;
+    border-bottom: 1px solid var(--line-soft);
+    position: relative;
+    overflow: hidden;
+  }
+  .hero-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
+    gap: 72px;
+    padding: 56px 0 96px;
+    align-items: center;
+  }
+  .hero-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--fg-dim);
+    padding: 6px 12px;
+    border: 1px solid var(--line);
+    margin-bottom: 28px;
+  }
+  .hero-status .pulse {
+    width: 8px;
+    height: 8px;
+    background: var(--accent);
+    box-shadow: 0 0 0 0 var(--accent);
+    animation: pulse 2.4s ease-out infinite;
+  }
+  @keyframes pulse {
+    0% {
+      box-shadow: 0 0 0 0 color-mix(in oklab, var(--accent) 70%, transparent);
+    }
+    100% {
+      box-shadow: 0 0 0 10px transparent;
+    }
+  }
+  .hero h1 {
+    margin-bottom: 24px;
+  }
+  .hero h1 .accent {
+    color: var(--accent);
+    font-family: var(--mono);
+    font-weight: 500;
+    letter-spacing: -0.03em;
+  }
+  .hero-lede {
+    font-size: 19px;
+    color: var(--fg-dim);
+    max-width: 54ch;
+    margin-bottom: 36px;
+    text-wrap: pretty;
+  }
+  .hero-cta {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 40px;
+  }
+  .hero-metrics {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    border-top: 1px solid var(--line-soft);
+    padding-top: 24px;
+    gap: 24px;
+  }
+  .hero-metric .n {
+    font-family: var(--mono);
+    font-size: 22px;
+    font-weight: 500;
+    color: var(--fg);
+    letter-spacing: -0.02em;
+  }
+  .hero-metric .l {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--fg-mute);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-top: 4px;
+  }
+
+  /* ---------- HERO DIAGRAM ---------- */
+  .diagram {
+    position: relative;
+    background:
+      linear-gradient(var(--line-soft) 1px, transparent 1px) 0 0 / 40px 40px,
+      linear-gradient(90deg, var(--line-soft) 1px, transparent 1px) 0 0 / 40px 40px,
+      var(--bg-elev);
+    border: 1px solid var(--line);
+    aspect-ratio: 1 / 1.05;
+    max-width: 560px;
+    margin-left: auto;
+    overflow: hidden;
+  }
+  .diagram-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--line-soft);
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--fg-mute);
+    background: color-mix(in oklab, var(--bg) 40%, transparent);
+  }
+  .diagram-header .dots {
+    display: flex;
+    gap: 6px;
+  }
+  .diagram-header .dots span {
+    width: 7px;
+    height: 7px;
+    background: var(--line);
+  }
+  .diagram-header .dots span:nth-child(1) {
+    background: var(--accent-dim);
+  }
+  .diagram-svg {
+    width: 100%;
+    height: calc(100% - 40px);
+  }
+
+  /* ---------- PROBLEM / WHAT WE ADD ---------- */
+  .problem-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 0;
+    border: 1px solid var(--line-soft);
+    border-right: none;
+    border-bottom: none;
+  }
+  .problem-card {
+    padding: 32px 28px;
+    border-right: 1px solid var(--line-soft);
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .problem-card h3 {
+    font-family: var(--mono);
+    font-weight: 500;
+    font-size: 15px;
+    color: var(--fg);
+    margin-bottom: 10px;
+  }
+  .problem-card h3::before {
+    content: '\2192  ';
+    color: var(--accent);
+  }
+  .problem-card p {
+    color: var(--fg-dim);
+    font-size: 14px;
+    line-height: 1.6;
+    margin: 0;
+  }
+  .problem-card .meta {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--fg-mute);
+    margin-top: 16px;
+    padding-top: 12px;
+    border-top: 1px dashed var(--line-soft);
+  }
+
+  /* ---------- BENCHMARKS ---------- */
+  .bench-wrap {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 48px;
+  }
+  .bench-chart {
+    background: var(--bg-elev);
+    border: 1px solid var(--line-soft);
+    padding: 28px;
+  }
+  .bench-chart h4 {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--fg-mute);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-bottom: 24px;
+    font-weight: 500;
+  }
+  .bench-bar-row {
+    display: grid;
+    grid-template-columns: 110px 1fr 80px;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 14px;
+    font-family: var(--mono);
+    font-size: 13px;
+  }
+  .bench-label {
+    color: var(--fg-dim);
+  }
+  .bench-bar {
+    height: 10px;
+    background: var(--bg-soft);
+    border: 1px solid var(--line-soft);
+    position: relative;
+    overflow: hidden;
+  }
+  .bench-bar .fill {
+    height: 100%;
+    background: var(--fg-mute);
+    transition: width 1.2s cubic-bezier(0.2, 0.7, 0.2, 1);
+  }
+  .bench-bar .fill.accent {
+    background: var(--accent);
+  }
+  .bench-bar .fill.dim {
+    background: var(--fg-mute);
+  }
+  .bench-val {
+    color: var(--fg);
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  .bench-val.accent {
+    color: var(--accent);
+  }
+  .bench-note {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--fg-mute);
+    margin-top: 20px;
+    padding-top: 16px;
+    border-top: 1px dashed var(--line-soft);
+  }
+
+  /* ---------- FEATURE GRID ---------- */
+  .feature-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    border: 1px solid var(--line-soft);
+  }
+  .feature {
+    padding: 28px;
+    border-right: 1px solid var(--line-soft);
+    border-bottom: 1px solid var(--line-soft);
+    min-height: 180px;
+    display: flex;
+    flex-direction: column;
+  }
+  .feature:nth-child(3n) {
+    border-right: none;
+  }
+  .feature:nth-last-child(-n + 3) {
+    border-bottom: none;
+  }
+  .feature .idx {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--accent);
+    letter-spacing: 0.08em;
+    margin-bottom: 12px;
+  }
+  .feature h3 {
+    font-family: var(--mono);
+    font-weight: 500;
+    font-size: 15px;
+    margin-bottom: 8px;
+  }
+  .feature p {
+    color: var(--fg-dim);
+    font-size: 13px;
+    line-height: 1.6;
+    margin: 0;
+  }
+  .feature .meta {
+    margin-top: auto;
+    padding-top: 16px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--fg-mute);
+  }
+
+  /* ---------- COMPARISON TABLE ---------- */
+  .cmp-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--mono);
+    font-size: 13px;
+  }
+  .cmp-table th,
+  .cmp-table td {
+    text-align: left;
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--line-soft);
+    vertical-align: top;
+  }
+  .cmp-table th {
+    color: var(--fg-mute);
+    font-weight: 500;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    background: var(--bg-elev);
+  }
+  .cmp-table .row-head {
+    color: var(--fg);
+    font-weight: 500;
+  }
+  .cmp-table .row-head.us {
+    color: var(--accent);
+  }
+  .cmp-table tbody tr:hover td {
+    background: color-mix(in oklab, var(--bg-elev) 50%, transparent);
+  }
+  .cmp-table .dim {
+    color: var(--fg-mute);
+  }
+
+  /* ---------- INSTALL ---------- */
+  .install-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 32px;
+  }
+  .install-block {
+    background: var(--bg-elev);
+    border: 1px solid var(--line-soft);
+  }
+  .install-head {
+    display: flex;
+    justify-content: space-between;
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--line-soft);
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--fg-mute);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .install-body {
+    padding: 20px;
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.7;
+  }
+  .install-body .prompt {
+    color: var(--accent);
+    margin-right: 8px;
+  }
+  .install-body .cmt {
+    color: var(--fg-mute);
+  }
+  .copy-btn {
+    background: transparent;
+    border: 1px solid var(--line);
+    color: var(--fg-mute);
+    font-family: var(--mono);
+    font-size: 10px;
+    padding: 2px 8px;
+    cursor: pointer;
+  }
+  .copy-btn:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+
+  /* ---------- ROADMAP ---------- */
+  .roadmap {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    border: 1px solid var(--line-soft);
+  }
+  .phase {
+    padding: 32px 28px;
+    border-right: 1px solid var(--line-soft);
+    position: relative;
+  }
+  .phase:last-child {
+    border-right: none;
+  }
+  .phase .ph-tag {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+  }
+  .phase .ph-num {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--fg-mute);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+  .phase h3 {
+    font-family: var(--mono);
+    font-weight: 500;
+    font-size: 18px;
+    margin-bottom: 6px;
+  }
+  .phase .ph-time {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--fg-mute);
+    margin-bottom: 20px;
+  }
+  .phase ul {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .phase li {
+    padding: 10px 0;
+    border-top: 1px dashed var(--line-soft);
+    font-size: 13px;
+    color: var(--fg-dim);
+    display: flex;
+    gap: 10px;
+  }
+  .phase li::before {
+    content: '\00B7';
+    color: var(--accent);
+  }
+
+  /* ---------- FAQ ---------- */
+  .faq-item {
+    border-top: 1px solid var(--line-soft);
+    padding: 20px 0;
+    display: grid;
+    grid-template-columns: 48px 1fr;
+    gap: 24px;
+  }
+  .faq-item:last-child {
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .faq-item .q-num {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--fg-mute);
+    padding-top: 2px;
+  }
+  .faq-item h3 {
+    font-family: var(--mono);
+    font-weight: 500;
+    font-size: 15px;
+    margin-bottom: 8px;
+    color: var(--fg);
+  }
+  .faq-item p {
+    color: var(--fg-dim);
+    font-size: 14px;
+    line-height: 1.6;
+    margin: 0;
+    max-width: 70ch;
+  }
+
+  /* responsive */
+  @media (max-width: 900px) {
+    .hero-grid,
+    .bench-wrap,
+    .install-grid {
+      grid-template-columns: 1fr;
+    }
+    .problem-grid,
+    .feature-grid,
+    .roadmap {
+      grid-template-columns: 1fr;
+    }
+    .feature:nth-child(3n) {
+      border-right: 1px solid var(--line-soft);
+    }
+    .feature {
+      border-right: none;
+    }
+    .section-head {
+      grid-template-columns: 1fr;
+      gap: 16px;
+    }
+    .nav-links {
+      display: none;
+    }
+  }
+</style>
+
+<script is:inline>
+  // animate bench bars in on load
+  document.addEventListener('DOMContentLoaded', function () {
+    requestAnimationFrame(function () {
+      document.querySelectorAll('.bench-bar .fill').forEach(function (el) {
+        var w = el.getAttribute('data-w');
+        el.style.width = w + '%';
+      });
+    });
+
+    // copy button
+    document.querySelectorAll('.copy-btn').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var text = btn.getAttribute('data-copy');
+        if (text) {
+          navigator.clipboard.writeText(text.replace(/&#10;/g, '\n'));
+          var orig = btn.textContent;
+          btn.textContent = 'copied';
+          setTimeout(function () {
+            btn.textContent = orig;
+          }, 1200);
+        }
+      });
+    });
+
+    // animated event dot through diagram
+    var ev = document.getElementById('event');
+    var counter = document.getElementById('diag-counter');
+    if (ev) {
+      var path = [
+        [140, 90],
+        [140, 160],
+        [140, 235],
+        [140, 280],
+        [240, 280],
+        [320, 280],
+        [420, 280],
+        [420, 325],
+        [420, 400],
+        [420, 445],
+      ];
+      var t = 0;
+      var counterVal = 0;
+      setInterval(function () {
+        t = (t + 1) % path.length;
+        var p = path[t];
+        ev.setAttribute('cx', String(p[0]));
+        ev.setAttribute('cy', String(p[1]));
+        ev.setAttribute('opacity', '1');
+        if (t === 0) {
+          counterVal += Math.floor(18000 + Math.random() * 6000);
+          if (counter) counter.textContent = counterVal.toLocaleString() + ' events';
+        }
+      }, 280);
+    }
+  });
+</script>
