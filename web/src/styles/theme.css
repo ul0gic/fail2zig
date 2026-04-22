@@ -182,7 +182,7 @@ pre { margin: 0; }
   display: flex;
   flex: 1;
   justify-content: center;
-  gap: 2px;
+  gap: 12px;
   font-family: var(--mono);
   font-size: 14px;
   color: var(--fg-dim);
@@ -198,6 +198,7 @@ pre { margin: 0; }
 .nav-right { margin-left: auto; display: flex; align-items: center; gap: 4px; font-family: var(--mono); font-size: 14px; white-space: nowrap; }
 .nav-right a { color: var(--fg-dim); padding: 6px 10px; }
 .nav-right a:hover { color: var(--fg); }
+.nav-right a.active { color: var(--accent); }
 .nav-cta {
   border: 1px solid var(--line);
   padding: 6px 12px !important;

@@ -16,12 +16,10 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
       </div>
       <h1>Why a new implementation.</h1>
       <p class="why-lede">
-        fail2ban has defended Linux services for twenty years. It built the
-        category, shaped the vocabulary, and still works for most of the
-        hosts it runs on. This page is not an argument that it was wrong.
-        It is an argument that the architecture it chose in 2004 has
-        reached the limits of what it can do — and that the tools needed
-        to do better are now mature.
+        fail2ban built the category and still works for most of the hosts
+        running it. This page is not an argument that it was wrong. It is
+        an argument that the architecture it chose in 2004 has reached its
+        ceiling, and the tools to go further are now mature.
       </p>
     </div>
   </header>
@@ -37,30 +35,25 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
 
       <div class="prose">
         <p>
-          When fail2ban shipped in 2004, the idea that a host should
-          autonomously correlate log failures and install firewall rules
-          was not obvious. The ingredients for a clean implementation
-          were not there either — no stable netfilter netlink ABI, no
-          systemd-journal, no static-linking toolchain for memory-safe
-          systems languages, no containerised minimal images to deploy
-          into. Python orchestration around shell-action templates was
-          a careful, considered choice for the toolchain of its era. It
-          worked, and it still works on most of the hosts running it
-          today.
+          In 2004, automatically correlating log failures and writing
+          firewall bans on the host was not an established pattern.
+          fail2ban made it one.
         </p>
+
+        <div class="term-label">What it introduced</div>
+        <div class="term-strip">
+          <code>jail</code>
+          <code>filter</code>
+          <code>maxretry</code>
+          <code>findtime</code>
+          <code>bantime</code>
+          <code>ignoreip</code>
+        </div>
+
         <p>
-          The operational vocabulary that fail2ban introduced —
-          <strong>jail</strong>, <strong>filter</strong>,
-          <code>maxretry</code>, <code>findtime</code>,
-          <code>bantime</code>, <code>ignoreip</code> — is now the way
-          the category thinks. fail2zig keeps every one of those words
-          with the same meaning, because operators should not have to
-          relearn a category to change an implementation.
-        </p>
-        <p>
-          Any honest story about why another tool exists in this space
-          has to start here. The cost of being early is that the choices
-          that were right for the era do not always stay right forever.
+          Those concepts survived because they were operationally
+          correct. fail2zig keeps the model. What changes is the
+          implementation ceiling — not the category definition.
         </p>
       </div>
     </div>
@@ -139,29 +132,45 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
 
       <div class="prose">
         <p>
-          All four of the problems in the previous section are
-          consequences of the same choice: <strong>orchestrate in
-          Python, act through shell.</strong> That combination made
-          sense when it was the only way to integrate with whatever
-          firewall tool the operator already ran. It is the shape of
-          the architecture, not the quality of its implementation.
+          All four problems in the previous section come from the same
+          choice: <strong>orchestrate in Python, act through shell.</strong>
+          That is the shape of the architecture, not the quality of any
+          single piece of it.
         </p>
+
+        <div class="term-label">What can't be patched</div>
+      </div>
+
+      <div class="reasons">
+        <div class="reason">
+          <div class="reason-k">Tune the shell template</div>
+          <div class="reason-v">
+            <code>execve</code> is still on every ban. The process spawn
+            is the operation, not an implementation detail.
+          </div>
+        </div>
+        <div class="reason">
+          <div class="reason-k">Rewrite the filter</div>
+          <div class="reason-v">
+            CPython is still in the daemon's address space. The
+            interpreter is the trust contract, not the code it loads.
+          </div>
+        </div>
+        <div class="reason">
+          <div class="reason-k">Cache the state tracker</div>
+          <div class="reason-v">
+            The dictionary still resizes. Growth under attacker pressure
+            is the data model, not a bug in the lookup path.
+          </div>
+        </div>
+      </div>
+
+      <div class="prose">
         <p>
-          Tuning a shell-action template cannot remove
-          <code>execve</code> from the ban path. Rewriting a Python
-          filter cannot remove the CPython interpreter from the
-          daemon's address space. Caching cannot remove the dictionary
-          resize from the state tracker. These are not bugs to be
-          fixed; they are the ceiling of what the architecture can
-          offer.
-        </p>
-        <p>
-          A better ceiling requires a different shape: a
-          statically-compiled binary, memory bounded explicitly rather
-          than by convention, firewall state written to the kernel
-          directly rather than through a shell program, a data model
-          designed for attacker-shaped input rather than resized
-          beneath it.
+          A better ceiling requires a different shape — a
+          statically-compiled binary, memory bounded explicitly,
+          firewall state written to the kernel directly, a data model
+          designed for attacker-shaped input.
         </p>
       </div>
     </div>
@@ -331,7 +340,7 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
         shortest route.
       </p>
       <div class="why-actions">
-        <a href="/install" class="btn primary">$ install</a>
+        <a href="https://github.com/ul0gic/fail2zig" class="btn primary" rel="noopener noreferrer">$ install</a>
         <a href="/docs/guides/migration-from-fail2ban" class="btn">Migration guide &rarr;</a>
         <a href="/threat-model" class="btn ghost">Read the threat model</a>
       </div>
@@ -419,7 +428,9 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
   }
   .prose code,
   .choice code,
-  .not-row code {
+  .not-row code,
+  .reason-v code,
+  .term-strip code {
     font-family: var(--mono);
     font-size: 0.9em;
     color: var(--nav-fg);
@@ -428,12 +439,86 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
     padding: 1px 6px;
   }
 
+  /* Section 03 "what can't be patched" — same row vocabulary as .choices
+     / .not-grid, hairline rules only (no gold top/bottom — we spend
+     those on sections 02/04/05 to mark section starts and ends). */
+  .reasons {
+    border-top: 1px solid var(--line);
+    margin: 0 0 24px;
+  }
+  .reason {
+    display: grid;
+    grid-template-columns: 260px 1fr;
+    gap: 48px;
+    padding: 20px 0;
+    border-bottom: 1px solid var(--line);
+    align-items: start;
+  }
+  .reason-k {
+    font-family: var(--mono);
+    font-size: 14px;
+    color: var(--fg);
+    font-weight: 500;
+  }
+  .reason-v {
+    font-size: 15px;
+    color: var(--fg-body);
+    line-height: 1.65;
+    max-width: 62ch;
+  }
+
+  /* Section 01 terminology block — matches the label / row vocabulary
+     used elsewhere on this page rather than running as prose. */
+  .term-label {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--fg-dim);
+    margin: 24px 0 12px;
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .term-label::before {
+    content: '';
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    background: var(--accent);
+    transform: translateY(-1px);
+  }
+  .term-strip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 0 0 24px;
+    font-size: 14px;
+  }
+  .term-strip code {
+    font-size: 13px;
+  }
+
   /* Card grid for "what the model costs" */
   .grid {
+    position: relative;
     display: grid;
     gap: 0;
     border: 1px solid var(--line);
     background: var(--bg);
+  }
+  /* Top gold bar — signals the start of the grid, same vocabulary as
+     the ADDS section on /. Sits above the whole grid regardless of
+     breakpoint, so the accent stays at the top rather than on every
+     wrapped row. */
+  .grid::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 2px;
+    background: var(--accent);
   }
   .grid-4 {
     grid-template-columns: repeat(4, 1fr);
@@ -473,7 +558,7 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
 
   /* Choices — two-column rows */
   .choices {
-    border-top: 1px solid var(--line);
+    border-top: 2px solid var(--accent);
   }
   .choice {
     display: grid;
@@ -505,7 +590,8 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
     text-decoration: underline;
   }
 
-  /* "Not" grid */
+  /* "Not" grid — bottom-edge gold bookends the scoping section,
+     same vocabulary as the feature grid on /. */
   .not-grid {
     border-top: 1px solid var(--line);
   }
@@ -515,6 +601,9 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
     gap: 48px;
     padding: 20px 0;
     border-bottom: 1px solid var(--line);
+  }
+  .not-row:last-child {
+    border-bottom: 2px solid var(--accent);
   }
   .not-k {
     font-family: var(--mono);
@@ -569,7 +658,8 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
       gap: 16px;
     }
     .choice,
-    .not-row {
+    .not-row,
+    .reason {
       grid-template-columns: 1fr;
       gap: 8px;
     }

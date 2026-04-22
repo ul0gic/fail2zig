@@ -25,7 +25,7 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
         residual risk, and explicit out-of-scope items.
       </p>
       <div class="tm-actions">
-        <a href="#data-flow" class="btn ghost">Jump to architecture &darr;</a>
+        <a href="#data-flow" class="btn primary">Jump to architecture &darr;</a>
         <a
           href="https://github.com/ul0gic/fail2zig/security/advisories/new"
           class="btn"
@@ -751,7 +751,7 @@ flowchart LR
               model, firewall backends, IPC authorization.
             </p>
           </div>
-          <div class="astatus pending">Scheduled</div>
+          <div class="astatus pending">Planned</div>
         </div>
         <div class="arow">
           <div class="adate">&mdash;</div>
@@ -796,7 +796,7 @@ flowchart LR
         <h3>What to expect</h3>
         <ul>
           <li><strong>Acknowledgement</strong> within 48 hours.</li>
-          <li><strong>Initial assessment</strong> (severity, affected versions, fix path) within 7 days.</li>
+          <li><strong>Initial assessment</strong> (severity, affected versions, fix path) — best-effort within 14 days.</li>
           <li><strong>Fix before disclosure</strong> for high-severity issues, or a coordinated 90-day disclosure window.</li>
           <li><strong>Credit</strong> in the advisory and release notes, unless you request otherwise.</li>
           <li><strong>No bug bounty.</strong> No legal action against good-faith reporters within scope.</li>
@@ -892,6 +892,7 @@ flowchart LR
     border: 1px solid var(--line);
   }
   .assumption {
+    position: relative;
     display: grid;
     grid-template-columns: 80px 1fr;
     gap: 16px;
@@ -905,6 +906,16 @@ flowchart LR
   }
   .assumption:nth-last-child(-n + 2) {
     border-bottom: none;
+  }
+  /* Top gold bar on the first row — signals page entry, restrained. */
+  .assumption:nth-child(-n + 2)::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 2px;
+    background: var(--accent);
   }
   .aidx {
     font-family: var(--mono);
@@ -927,31 +938,33 @@ flowchart LR
     max-width: 48ch;
   }
 
-  /* Diagram */
+  /* Diagram — corner tick matches the install-block treatment on /. */
   .diagram {
+    position: relative;
     border: 1px solid var(--line);
     background: var(--bg);
     padding: 32px;
     margin-bottom: 40px;
     overflow-x: auto;
   }
-  :global(.mermaid-rendered) {
-    text-align: center;
+  .diagram::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 18px;
+    height: 2px;
+    background: var(--accent);
   }
-  :global(.mermaid-rendered svg) {
-    max-width: 100%;
-    height: auto;
+  .diagram::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 2px;
+    height: 18px;
+    background: var(--accent);
   }
-  :global(.mermaid-error) {
-    background: var(--bg-elev);
-    border: 1px solid var(--danger);
-    padding: 16px;
-    font-family: var(--mono);
-    font-size: 12px;
-    color: var(--danger);
-    white-space: pre-wrap;
-  }
-
   /* Boundaries table */
   .boundaries {
     margin-top: 16px;
@@ -993,6 +1006,7 @@ flowchart LR
     font-family: var(--mono);
     color: var(--accent);
     width: 64px;
+    white-space: nowrap;
   }
   .tb {
     font-family: var(--mono);
@@ -1021,6 +1035,7 @@ flowchart LR
     border: 1px solid var(--line);
   }
   .adv {
+    position: relative;
     display: grid;
     grid-template-columns: 60px 1fr;
     gap: 16px;
@@ -1033,6 +1048,16 @@ flowchart LR
   }
   .adv:nth-last-child(-n + 2) {
     border-bottom: none;
+  }
+  /* Top gold bar on the first row — visually parallels the assumptions grid. */
+  .adv:nth-child(-n + 2)::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 2px;
+    background: var(--accent);
   }
   .aid {
     font-family: var(--mono);
@@ -1110,6 +1135,7 @@ flowchart LR
     border: 1px solid var(--line);
   }
   .fc {
+    position: relative;
     padding: 24px 28px;
     border-right: 1px solid var(--line);
     border-bottom: 1px solid var(--line);
@@ -1119,6 +1145,16 @@ flowchart LR
   }
   .fc:nth-last-child(-n + 3) {
     border-bottom: none;
+  }
+  /* Bottom gold bar on the last row — bookends the content like the home feature grid. */
+  .fc:nth-last-child(-n + 3)::after {
+    content: '';
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 2px;
+    background: var(--accent);
   }
   .fc h3 {
     font-size: 14px;

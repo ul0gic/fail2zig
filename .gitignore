@@ -32,6 +32,10 @@ yarn-debug.log*
 
 # Playwright
 .playwright-mcp/
+# MCP screenshots land at repo root without the Screenshot* prefix, so
+# catch the usual names we generate while debugging UI changes.
+/*.png
+!/public/*.png
 
 # Secrets
 .env

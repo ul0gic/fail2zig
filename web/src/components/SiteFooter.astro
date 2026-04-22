@@ -15,6 +15,7 @@ const year = new Date().getFullYear();
         A modern intrusion prevention system. Single binary. Zero dependencies.
       </div>
       <div class="footer-copy">
+        <span class="footer-ver">v0.1.0-preview</span><br />
         © {year} Corelift<br />
         Code licensed under <a href="/LICENSE" class="footer-link">AGPL-3.0-or-later</a>
       </div>
@@ -28,7 +29,6 @@ const year = new Date().getFullYear();
       <div>
         <h5>Product</h5>
         <a href="/">Overview</a>
-        <a href="/install">Install</a>
         <a href="/see-it-live">See it Live</a>
       </div>
       <div>
@@ -71,6 +71,10 @@ const year = new Date().getFullYear();
   .footer-copy {
     margin-top: 20px;
     color: var(--fg-mute);
+  }
+  .footer-ver {
+    color: var(--fg-dim);
+    letter-spacing: 0.02em;
   }
   .footer-privacy {
     margin-top: 8px;

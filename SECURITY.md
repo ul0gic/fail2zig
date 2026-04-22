@@ -32,8 +32,8 @@ maintainer via the address listed on the GitHub profile.
 ## What we commit to
 
 - **Acknowledgement within 48 hours** of a valid report.
-- **An initial assessment within 7 days** — severity, affected versions,
-  whether a fix path is clear.
+- **An initial assessment, best-effort within 14 days** — severity,
+  affected versions, whether a fix path is clear.
 - **A fix before public disclosure** for high-severity issues, or a
   coordinated 90-day disclosure timeline agreed with the reporter.
 - **Credit** in the advisory and the release notes, unless you request
