@@ -269,10 +269,22 @@ fn lineCallback(
     }
     const ts = ctx.now();
 
-    // Broadcast `attack_detected` on every match. Live dashboards
-    // render these as they stream in; `ip_banned` alone would leave
-    // the terminal pane empty in findtime windows where hits don't
-    // cross the retry threshold. Failure to broadcast is non-fatal.
+    // CRITICAL PRIVACY CHECK: if the IP is in `ignoreip`, do NOT
+    // broadcast anything to the public WS feed. `ignoreip` exists
+    // specifically to exempt operator + trusted infrastructure IPs
+    // from ban decisions; before this guard, we were matching the
+    // filter and emitting `attack_detected` for every operator SSH
+    // session, leaking the operator's real IP to anyone watching
+    // see-it-live. `recordAttempt` short-circuits for ignored IPs
+    // internally (no ban decision), so we also skip it here — both
+    // to save a hash lookup and to keep the control flow obvious.
+    const ignored = ctx.state.isIgnored(result.ip);
+
+    // Broadcast `attack_detected` on every non-ignored match. Live
+    // dashboards render these as they stream in; `ip_banned` alone
+    // would leave the terminal pane empty in findtime windows where
+    // hits don't cross the retry threshold. Failure to broadcast is
+    // non-fatal.
     //
     // `pattern_name` would ideally be the specific filter pattern
     // (e.g. "failed-password"), but the parser exposes only
@@ -280,16 +292,23 @@ fn lineCallback(
     // per-jail lookup table. For now we pass the jail name so the
     // frontend has something non-empty; plumbing actual pattern names
     // through is Phase 10 polish (see SYS-012 TODO).
-    if (ctx.ws) |ws_server| {
-        if (ctx.ws_alloc) |a| {
-            var ip_buf: [64]u8 = undefined;
-            if (std.fmt.bufPrint(&ip_buf, "{}", .{result.ip})) |ip_str| {
-                ws_server.broadcastAttackDetected(a, ip_str, ctx.jail.slice(), ctx.jail.slice()) catch |err| {
-                    std.log.warn("ws: broadcastAttackDetected failed: {s}", .{@errorName(err)});
-                };
-            } else |_| {}
+    if (!ignored) {
+        if (ctx.ws) |ws_server| {
+            if (ctx.ws_alloc) |a| {
+                var ip_buf: [64]u8 = undefined;
+                if (std.fmt.bufPrint(&ip_buf, "{}", .{result.ip})) |ip_str| {
+                    ws_server.broadcastAttackDetected(a, ip_str, ctx.jail.slice(), ctx.jail.slice()) catch |err| {
+                        std.log.warn("ws: broadcastAttackDetected failed: {s}", .{@errorName(err)});
+                    };
+                } else |_| {}
+            }
         }
     }
+
+    // Ignored IPs never yield a ban decision, so we skip the state
+    // tracker call entirely. Anything downstream (ban broadcasts,
+    // nftables install) is therefore unreachable for ignored IPs.
+    if (ignored) return;
 
     const decision = ctx.state.recordAttempt(result.ip, ctx.jail, ts) catch |err| {
         std.log.warn(
