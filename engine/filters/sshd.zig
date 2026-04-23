@@ -48,8 +48,15 @@ pub const patterns = [_]PatternDef{
         .match = parser.compile("error: PAM: Authentication failure for <*> from <IP>"),
     },
     .{
-        .name = "received-disconnect",
-        .match = parser.compile("Received disconnect from <IP>"),
+        // CRITICAL: require the `[preauth]` suffix. OpenSSH writes
+        // `Received disconnect from <IP> port ...` on EVERY SSH
+        // disconnect, including normal operator logouts. Matching the
+        // bare form false-positives on legitimate sessions and bans
+        // the operator's own IP. fail2ban upstream only enables this
+        // pattern in `aggressive` mode for exactly this reason.
+        // Regression: SYS-011, operator self-ban 2026-04-22.
+        .name = "received-disconnect-preauth",
+        .match = parser.compile("Received disconnect from <IP> <*>[preauth]"),
     },
     .{
         .name = "bad-protocol",
@@ -138,6 +145,20 @@ test "sshd: negative — session opened must NOT match" {
 
 test "sshd: negative — no IP present must NOT match" {
     try testing.expect(firstMatch("Failed password for root from (no address)") == null);
+}
+
+test "sshd: received-disconnect requires [preauth] (SYS-011 regression)" {
+    // Positive: attacker pre-auth disconnect — the [preauth] suffix is
+    // the signal that this IP never authenticated. These MUST match.
+    try testing.expect(firstMatch("Received disconnect from 1.2.3.4 port 22:11: Bye Bye [preauth]") != null);
+    try testing.expect(firstMatch("Received disconnect from 203.0.113.5 port 5555:11: disconnected by user [preauth]") != null);
+    try testing.expect(firstMatch("Received disconnect from 2001:db8::1 port 22:11: Bye Bye [preauth]") != null);
+
+    // Negative: normal successful-session disconnects. OpenSSH writes
+    // this exact line on every clean logout; catching it self-bans the
+    // operator's own IP under even modest maxretry.
+    try testing.expect(firstMatch("Received disconnect from 1.2.3.4 port 22:11: disconnected by user") == null);
+    try testing.expect(firstMatch("Received disconnect from 192.168.1.1 port 2222: disconnected by server request") == null);
 }
 
 test "sshd: negative — completely unrelated log line" {

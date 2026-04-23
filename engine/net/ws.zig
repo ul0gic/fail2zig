@@ -294,12 +294,20 @@ pub const WsServer = struct {
     }
 
     fn dispatchFrame(self: *WsServer, cli: *ClientReg, frame: ParsedFrame) !void {
+        // CRITICAL: never call `self.closeClient(cli)` inside this function.
+        // The caller (`readFrames`) continues iterating `cli.len` after we
+        // return and would read-after-free. Signal "close me" by returning
+        // an error instead — the caller's existing `catch` branch invokes
+        // closeClient exactly once. (Regression history: SEGV observed on
+        // VM 2026-04-22 when a scanner sent a close/binary frame.)
+        _ = self;
         switch (frame.opcode) {
             .close => {
-                // Echo close frame, then drop.
+                // Best-effort echo of the peer's CLOSE, then bubble up so
+                // the caller frees.
                 const close_frame = [_]u8{ 0x88, 0x00 }; // FIN|CLOSE, len=0
                 _ = posix.write(cli.fd, &close_frame) catch {};
-                self.closeClient(cli);
+                return error.ClientClosing;
             },
             .ping => {
                 // Build a pong frame with the same payload.
@@ -312,14 +320,12 @@ pub const WsServer = struct {
                 // Dashboard doesn't send messages; we accept + ignore.
             },
             .binary => {
-                // Unsupported: close 1003.
+                // Unsupported: send close 1003, then let the caller free.
                 const close_frame = [_]u8{ 0x88, 0x02, 0x03, 0xEB }; // 1003
                 _ = posix.write(cli.fd, &close_frame) catch {};
-                self.closeClient(cli);
+                return error.UnsupportedOpcode;
             },
-            else => {
-                self.closeClient(cli);
-            },
+            else => return error.UnsupportedOpcode,
         }
     }
 
@@ -979,4 +985,77 @@ test "ws: init with custom max_clients sizes slot table" {
     var big = try WsServer.init(a, &loop, hard_max_clients);
     defer big.deinit();
     try testing.expectEqual(hard_max_clients, big.clients.len);
+}
+
+test "ws: dispatchFrame returns error on close/binary/unknown (no self-close UAF)" {
+    // Regression for a SEGV observed on the demo VM 2026-04-22: scanner
+    // sent a CLOSE frame, dispatchFrame called closeClient() and freed
+    // the ClientReg, then returned success, and readFrames' subsequent
+    // `cursor += parse.consumed; while (cursor < cli.len)` dereferenced
+    // freed memory.
+    //
+    // The contract is: dispatchFrame MUST return an error on any opcode
+    // that warrants closing the client. The caller's catch branch then
+    // closes exactly once; there is never a UAF.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = testing.allocator;
+    var loop = try EventLoop.init(a);
+    defer loop.deinit();
+    var server = try WsServer.init(a, &loop, default_max_clients);
+    defer server.deinit();
+
+    // Socketpair so dispatchFrame's `posix.write(cli.fd, close_frame)`
+    // doesn't fail on a closed fd.
+    var fds: [2]i32 = undefined;
+    const stype_u32: u32 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
+    switch (posix.errno(linux.socketpair(
+        @as(i32, linux.AF.UNIX),
+        @as(i32, @intCast(stype_u32)),
+        0,
+        &fds,
+    ))) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    defer posix.close(fds[1]);
+    try server.admitUpgraded(fds[0], &.{});
+
+    // Grab the ClientReg the server just registered.
+    var cli: *ClientReg = undefined;
+    for (server.clients) |slot| {
+        if (slot) |c| {
+            cli = c;
+            break;
+        }
+    } else return error.Unexpected;
+
+    // .close -> ClientClosing (not success, not a self-close).
+    try testing.expectError(
+        error.ClientClosing,
+        server.dispatchFrame(cli, .{ .opcode = .close, .fin = true, .payload = &.{}, .consumed = 2 }),
+    );
+    // .binary -> UnsupportedOpcode.
+    try testing.expectError(
+        error.UnsupportedOpcode,
+        server.dispatchFrame(cli, .{ .opcode = .binary, .fin = true, .payload = &.{}, .consumed = 2 }),
+    );
+    // Reserved opcode (continuation bit, say 0x3) -> UnsupportedOpcode.
+    try testing.expectError(
+        error.UnsupportedOpcode,
+        server.dispatchFrame(cli, .{ .opcode = @enumFromInt(@as(u4, 3)), .fin = true, .payload = &.{}, .consumed = 2 }),
+    );
+
+    // After all three error returns, the slot MUST still point at our
+    // ClientReg — dispatchFrame did not call closeClient itself. The
+    // caller (readFrames) would close on catch; we skip that here.
+    var still_alive = false;
+    for (server.clients) |slot| {
+        if (slot) |c| {
+            if (c == cli) {
+                still_alive = true;
+                break;
+            }
+        }
+    }
+    try testing.expect(still_alive);
 }
