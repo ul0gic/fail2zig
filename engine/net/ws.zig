@@ -342,18 +342,29 @@ pub const WsServer = struct {
         }
     }
 
+    // Event wire contract, documented in `.project/design/demo-concept.md`:
+    //   { "type": <str>, "ts": <ISO8601 UTC>, "payload": { ... } }
+    //
+    // `ts` is the wall-clock time at broadcast in ISO-8601 UTC
+    // ("2026-04-23T00:07:42.123Z"). Epoch ints would be lighter on the
+    // wire but the doc specifies ISO for client-side readability and
+    // the cost here is trivial (~100 ns per event, far below parse
+    // overhead). `payload` shape is per-event.
+
     pub fn broadcastAttackDetected(
         self: *WsServer,
         a: std.mem.Allocator,
         ip: []const u8,
         jail: []const u8,
-        timestamp: i64,
+        pattern_name: []const u8,
     ) !void {
         var buf: std.ArrayListUnmanaged(u8) = .{};
         defer buf.deinit(a);
+        var ts_buf: [32]u8 = undefined;
+        const ts = try formatIso8601Utc(&ts_buf, std.time.milliTimestamp());
         try buf.writer(a).print(
-            "{{\"type\":\"attack_detected\",\"ip\":\"{s}\",\"jail\":\"{s}\",\"timestamp\":{d}}}",
-            .{ ip, jail, timestamp },
+            "{{\"type\":\"attack_detected\",\"ts\":\"{s}\",\"payload\":{{\"ip\":\"{s}\",\"jail\":\"{s}\",\"pattern_name\":\"{s}\"}}}}",
+            .{ ts, ip, jail, pattern_name },
         );
         try self.broadcast(buf.items);
     }
@@ -363,13 +374,15 @@ pub const WsServer = struct {
         a: std.mem.Allocator,
         ip: []const u8,
         jail: []const u8,
-        timestamp: i64,
+        bantime_s: u64,
     ) !void {
         var buf: std.ArrayListUnmanaged(u8) = .{};
         defer buf.deinit(a);
+        var ts_buf: [32]u8 = undefined;
+        const ts = try formatIso8601Utc(&ts_buf, std.time.milliTimestamp());
         try buf.writer(a).print(
-            "{{\"type\":\"ip_banned\",\"ip\":\"{s}\",\"jail\":\"{s}\",\"timestamp\":{d}}}",
-            .{ ip, jail, timestamp },
+            "{{\"type\":\"ip_banned\",\"ts\":\"{s}\",\"payload\":{{\"ip\":\"{s}\",\"jail\":\"{s}\",\"bantime_s\":{d}}}}}",
+            .{ ts, ip, jail, bantime_s },
         );
         try self.broadcast(buf.items);
     }
@@ -379,28 +392,39 @@ pub const WsServer = struct {
         a: std.mem.Allocator,
         ip: []const u8,
         jail: []const u8,
-        timestamp: i64,
     ) !void {
         var buf: std.ArrayListUnmanaged(u8) = .{};
         defer buf.deinit(a);
+        var ts_buf: [32]u8 = undefined;
+        const ts = try formatIso8601Utc(&ts_buf, std.time.milliTimestamp());
         try buf.writer(a).print(
-            "{{\"type\":\"ip_unbanned\",\"ip\":\"{s}\",\"jail\":\"{s}\",\"timestamp\":{d}}}",
-            .{ ip, jail, timestamp },
+            "{{\"type\":\"ip_unbanned\",\"ts\":\"{s}\",\"payload\":{{\"ip\":\"{s}\",\"jail\":\"{s}\"}}}}",
+            .{ ts, ip, jail },
         );
         try self.broadcast(buf.items);
     }
 
+    pub const MetricsPayload = struct {
+        lines_parsed: u64,
+        lines_matched: u64,
+        bans_total: u64,
+        active_bans: u32,
+        memory_bytes_used: u64,
+        uptime_s: u64,
+    };
+
     pub fn broadcastMetrics(
         self: *WsServer,
         a: std.mem.Allocator,
-        parse_rate: u64,
-        active_bans: u32,
+        m: MetricsPayload,
     ) !void {
         var buf: std.ArrayListUnmanaged(u8) = .{};
         defer buf.deinit(a);
+        var ts_buf: [32]u8 = undefined;
+        const ts = try formatIso8601Utc(&ts_buf, std.time.milliTimestamp());
         try buf.writer(a).print(
-            "{{\"type\":\"metrics\",\"parse_rate\":{d},\"active_bans\":{d}}}",
-            .{ parse_rate, active_bans },
+            "{{\"type\":\"metrics\",\"ts\":\"{s}\",\"payload\":{{\"lines_parsed\":{d},\"lines_matched\":{d},\"bans_total\":{d},\"active_bans\":{d},\"memory_bytes_used\":{d},\"uptime_s\":{d}}}}}",
+            .{ ts, m.lines_parsed, m.lines_matched, m.bans_total, m.active_bans, m.memory_bytes_used, m.uptime_s },
         );
         try self.broadcast(buf.items);
     }
@@ -455,6 +479,35 @@ pub const WsServer = struct {
 
 /// Compute `Sec-WebSocket-Accept` = base64(SHA1(key ++ ws_magic)).
 /// `out` must be at least 32 bytes (SHA-1 is 20 bytes -> base64 28 chars).
+/// Format a Unix millisecond timestamp into ISO-8601 UTC with
+/// millisecond precision ("2026-04-23T00:07:42.123Z"). `buf` must be
+/// at least 24 bytes; 32 is the recommended size with headroom.
+/// Returns a slice of `buf` holding the rendered string.
+pub fn formatIso8601Utc(buf: []u8, ms_since_epoch: i64) ![]const u8 {
+    // epoch_ms -> y/m/d h:m:s.fff via std.time.epoch.
+    const ms_u: u64 = if (ms_since_epoch < 0) 0 else @intCast(ms_since_epoch);
+    const seconds_total: u64 = ms_u / 1000;
+    const ms_part: u16 = @intCast(ms_u % 1000);
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = seconds_total };
+    const day_seconds = epoch_seconds.getDaySeconds();
+    const epoch_day = epoch_seconds.getEpochDay();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    return std.fmt.bufPrint(
+        buf,
+        "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z",
+        .{
+            year_day.year,
+            @intFromEnum(month_day.month),
+            @as(u16, month_day.day_index) + 1,
+            day_seconds.getHoursIntoDay(),
+            day_seconds.getMinutesIntoHour(),
+            day_seconds.getSecondsIntoMinute(),
+            ms_part,
+        },
+    );
+}
+
 pub fn computeAccept(key: []const u8, out: []u8) ![]const u8 {
     var sha = std.crypto.hash.Sha1.init(.{});
     sha.update(key);

@@ -209,6 +209,16 @@ const JailContext = struct {
     /// Metrics is nullable for tests that don't care about counters —
     /// the daemon always supplies a real pointer.
     metrics: ?*metrics_mod.Metrics = null,
+    /// Dashboard WS server. Nullable for tests; the daemon always
+    /// supplies a real pointer. When present, every parsed match
+    /// broadcasts `attack_detected` and every ban broadcasts
+    /// `ip_banned` so live dashboards can render in real time.
+    ws: ?*ws.WsServer = null,
+    /// Allocator used to render event payload strings before handing
+    /// them to WS broadcast. A small FBA would be nicer, but the
+    /// broadcasts are rare (per-match, per-ban), payloads are tiny
+    /// (<200 B), and the daemon's heap allocator tolerates this fine.
+    ws_alloc: ?std.mem.Allocator = null,
     /// Current wall-clock is read at callback time; stored here so tests
     /// can override it. In production this stays at null.
     now_override: ?shared.Timestamp = null,
@@ -258,6 +268,29 @@ fn lineCallback(
         m.jailIncrementMatched(ctx.jail.slice());
     }
     const ts = ctx.now();
+
+    // Broadcast `attack_detected` on every match. Live dashboards
+    // render these as they stream in; `ip_banned` alone would leave
+    // the terminal pane empty in findtime windows where hits don't
+    // cross the retry threshold. Failure to broadcast is non-fatal.
+    //
+    // `pattern_name` would ideally be the specific filter pattern
+    // (e.g. "failed-password"), but the parser exposes only
+    // `matched_pattern_id: u16` today — resolving id→name needs a
+    // per-jail lookup table. For now we pass the jail name so the
+    // frontend has something non-empty; plumbing actual pattern names
+    // through is Phase 10 polish (see SYS-012 TODO).
+    if (ctx.ws) |ws_server| {
+        if (ctx.ws_alloc) |a| {
+            var ip_buf: [64]u8 = undefined;
+            if (std.fmt.bufPrint(&ip_buf, "{}", .{result.ip})) |ip_str| {
+                ws_server.broadcastAttackDetected(a, ip_str, ctx.jail.slice(), ctx.jail.slice()) catch |err| {
+                    std.log.warn("ws: broadcastAttackDetected failed: {s}", .{@errorName(err)});
+                };
+            } else |_| {}
+        }
+    }
+
     const decision = ctx.state.recordAttempt(result.ip, ctx.jail, ts) catch |err| {
         std.log.warn(
             "state: recordAttempt failed for jail '{s}': {s}",
@@ -281,6 +314,17 @@ fn lineCallback(
             m.incrementBans();
             m.jailIncrementBans(ctx.jail.slice());
         }
+        // Broadcast `ip_banned` after the kernel ban is confirmed.
+        if (ctx.ws) |ws_server| {
+            if (ctx.ws_alloc) |a| {
+                var ip_buf: [64]u8 = undefined;
+                if (std.fmt.bufPrint(&ip_buf, "{}", .{d.ip})) |ip_str| {
+                    ws_server.broadcastBanned(a, ip_str, ctx.jail.slice(), d.duration) catch |err| {
+                        std.log.warn("ws: broadcastBanned failed: {s}", .{@errorName(err)});
+                    };
+                } else |_| {}
+            }
+        }
     }
 }
 
@@ -292,6 +336,8 @@ const ExpiryContext = struct {
     state: *state_mod.StateTracker,
     backend_ptr: *firewall.Backend,
     metrics: ?*metrics_mod.Metrics = null,
+    ws: ?*ws.WsServer = null,
+    ws_alloc: ?std.mem.Allocator = null,
 };
 
 fn expirySweep(expirations: u64, userdata: ?*anyopaque) void {
@@ -339,7 +385,60 @@ fn expirySweep(expirations: u64, userdata: ?*anyopaque) void {
             "unban: jail='{s}' ip={}",
             .{ item.jail.slice(), item.ip },
         );
+        // Broadcast `ip_unbanned` so dashboards can visually retire the
+        // entry as soon as nftables has dropped it. Non-fatal on error.
+        if (ctx.ws) |ws_server| {
+            if (ctx.ws_alloc) |a| {
+                var ip_buf: [64]u8 = undefined;
+                if (std.fmt.bufPrint(&ip_buf, "{}", .{item.ip})) |ip_str| {
+                    ws_server.broadcastUnbanned(a, ip_str, item.jail.slice()) catch |err| {
+                        std.log.warn("ws: broadcastUnbanned failed: {s}", .{@errorName(err)});
+                    };
+                } else |_| {}
+            }
+        }
     }
+}
+
+// ============================================================================
+// WS tick — heartbeat + periodic metrics push (1 Hz)
+// ============================================================================
+//
+// Without this, the /events stream is silent between filter matches.
+// Live dashboards need to show forward motion even during attack lulls;
+// they also need ping/pong so CF and clients keep the WS alive.
+const WsTickContext = struct {
+    ws: *ws.WsServer,
+    metrics: *metrics_mod.Metrics,
+    ws_alloc: std.mem.Allocator,
+    start_time: i64,
+};
+
+fn wsTick(expirations: u64, userdata: ?*anyopaque) void {
+    _ = expirations;
+    const ctx: *WsTickContext = @ptrCast(@alignCast(userdata.?));
+
+    // Heartbeat: send pings to silent clients, drop any that haven't
+    // pong'd in time. Cheap; no-op if there are no clients.
+    ctx.ws.tickHeartbeat();
+
+    const snap = ctx.metrics.snapshot();
+    const uptime_s: u64 = blk: {
+        const now = std.time.timestamp();
+        if (now <= ctx.start_time) break :blk 0;
+        break :blk @intCast(now - ctx.start_time);
+    };
+
+    ctx.ws.broadcastMetrics(ctx.ws_alloc, .{
+        .lines_parsed = snap.lines_parsed,
+        .lines_matched = snap.lines_matched,
+        .bans_total = snap.bans_total,
+        .active_bans = snap.active_bans,
+        .memory_bytes_used = snap.memory_bytes_used,
+        .uptime_s = uptime_s,
+    }) catch |err| {
+        std.log.warn("ws: broadcastMetrics failed: {s}", .{@errorName(err)});
+    };
 }
 
 // ============================================================================
@@ -730,6 +829,16 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     http_server.setWsServer(&ws_server);
     try http_server.start();
 
+    // Now that the WS server exists, wire it into every per-jail
+    // context so lineCallback can broadcast `attack_detected` +
+    // `ip_banned` events. Without this, dashboards subscribe to a
+    // silent channel — every parse + every ban happens, but nothing
+    // streams to the see-it-live page.
+    for (contexts.items) |jctx| {
+        jctx.ws = &ws_server;
+        jctx.ws_alloc = heap;
+    }
+
     // Signal handlers. Order matters: install TERM/INT before HUP so
     // tests can observe TERM behaviour without HUP interference.
     var sig_ctx = SignalContext{
@@ -746,8 +855,21 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         .state = &tracker,
         .backend_ptr = &backend_val,
         .metrics = &metrics,
+        .ws = &ws_server,
+        .ws_alloc = heap,
     };
     _ = try loop.addTimer(1000, expirySweep, &expiry_ctx, false);
+
+    // WS heartbeat + 1 Hz metrics push. Keeps the dashboard's terminal
+    // pane alive between attack matches and keeps the WS pings flowing
+    // so CF doesn't idle-close the stream.
+    var ws_tick_ctx = WsTickContext{
+        .ws = &ws_server,
+        .metrics = &metrics,
+        .ws_alloc = heap,
+        .start_time = cmd_ctx.start_time,
+    };
+    _ = try loop.addTimer(1000, wsTick, &ws_tick_ctx, false);
 
     std.log.info(
         "fail2zig {s} running; backend={s}; ipc={s}; http={s}:{d}",
@@ -912,26 +1034,24 @@ fn writeStatusPayload(
 
 /// BansSource.write implementation — walks the state tracker and emits
 /// the active-ban snapshot consumed by `NftSetPane` on the see-it-live
-/// dashboard. Schema:
+/// dashboard. Wire contract documented in
+/// `.project/design/demo-concept.md`:
 ///
 /// ```
 /// {
-///   "set_name":"fail2zig_bans",
-///   "family":"inet",
-///   "table":"fail2zig",
-///   "count":N,
-///   "elements":[{"ip":"...","jail":"...","remaining_s":N,"banned_at":<epoch>}]
+///   "total": N,
+///   "entries": [
+///     {"ip":"...","jail":"...","banned_at":"<ISO-8601 UTC>","seconds_remaining":N}
+///   ]
 /// }
 /// ```
 ///
-/// `count` reflects the full number of active bans; `elements` is
-/// truncated at `http.max_bans_in_snapshot` (200) so the response size
-/// stays bounded. `remaining_s` is `max(0, ban_expiry - now)` — negative
-/// remainders (already-expired but not-yet-swept) are reported as zero.
-/// `banned_at` is inferred as `ban_expiry - duration` where `duration`
-/// is derived from the tracker's configured bantime and the recorded
-/// ban_count — good enough for a demo panel; for forensic use we will
-/// persist the true ban timestamp in Phase 10.
+/// `total` reflects the full number of active bans; `entries` is
+/// truncated at `http.max_bans_in_snapshot` (200) so the response
+/// stays bounded. `seconds_remaining` is `max(0, ban_expiry - now)`.
+/// `banned_at` is an ISO-8601 UTC string reconstructed from
+/// `ban_expiry - duration`; see Phase 10 for persisting a real ban
+/// start time.
 fn writeBansPayload(
     ctx: ?*anyopaque,
     out: *std.ArrayListUnmanaged(u8),
@@ -940,8 +1060,8 @@ fn writeBansPayload(
     const self: *HttpSources = @ptrCast(@alignCast(ctx.?));
     const w = out.writer(a);
 
-    // First pass: count active bans (so `count` is accurate even when
-    // we truncate `elements`).
+    // First pass: count active bans (so `total` is accurate even when
+    // we truncate `entries`).
     var total: u32 = 0;
     {
         var it = self.state.iterator();
@@ -950,11 +1070,9 @@ fn writeBansPayload(
         }
     }
 
-    try w.writeAll(
-        "{\"set_name\":\"fail2zig_bans\",\"family\":\"inet\",\"table\":\"fail2zig\",\"count\":",
-    );
+    try w.writeAll("{\"total\":");
     try w.print("{d}", .{total});
-    try w.writeAll(",\"elements\":[");
+    try w.writeAll(",\"entries\":[");
 
     const now_s: i64 = std.time.timestamp();
     const cfg = self.state.config;
@@ -970,31 +1088,28 @@ fn writeBansPayload(
         const ip = kv.key_ptr.*;
         const st = kv.value_ptr;
 
-        // remaining_s: clamp to 0 if the ban has already lapsed but the
-        // expiry sweep hasn't fired yet.
-        const remaining_s: i64 = if (st.ban_expiry) |exp|
+        const seconds_remaining: i64 = if (st.ban_expiry) |exp|
             @max(0, exp - now_s)
         else
             0;
 
-        // banned_at: best-effort reconstruction. The tracker doesn't
-        // persist the ban start timestamp directly — we derive it by
-        // subtracting the computed bantime for this recidive count from
-        // the expiry. See the docstring above for the caveat.
         const duration = state_mod.computeBantime(
             cfg.bantime,
             cfg.bantime_increment,
             if (st.ban_count == 0) 0 else st.ban_count - 1,
         );
         const dur_i64: i64 = @intCast(@min(duration, std.math.maxInt(i64)));
-        const banned_at: i64 = if (st.ban_expiry) |exp|
+        const banned_at_epoch_s: i64 = if (st.ban_expiry) |exp|
             std.math.sub(i64, exp, dur_i64) catch now_s
         else
             now_s;
 
+        var ts_buf: [32]u8 = undefined;
+        const banned_at_iso = try ws.formatIso8601Utc(&ts_buf, banned_at_epoch_s * 1000);
+
         try w.print(
-            "{{\"ip\":\"{}\",\"jail\":\"{s}\",\"remaining_s\":{d},\"banned_at\":{d}}}",
-            .{ ip, st.jail.slice(), remaining_s, banned_at },
+            "{{\"ip\":\"{}\",\"jail\":\"{s}\",\"banned_at\":\"{s}\",\"seconds_remaining\":{d}}}",
+            .{ ip, st.jail.slice(), banned_at_iso, seconds_remaining },
         );
     }
 
@@ -1323,11 +1438,8 @@ test "http: /api/bans empty snapshot -> count 0, elements []" {
     try writeBansPayload(@ptrCast(&ctx), &out, a);
 
     const body = out.items;
-    try testing.expect(std.mem.indexOf(u8, body, "\"set_name\":\"fail2zig_bans\"") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"family\":\"inet\"") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"table\":\"fail2zig\"") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"count\":0") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"elements\":[]") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"total\":0") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"entries\":[]") != null);
 }
 
 test "http: /api/bans single ban populates element fields" {
@@ -1354,11 +1466,14 @@ test "http: /api/bans single ban populates element fields" {
     try writeBansPayload(@ptrCast(&ctx), &out, a);
 
     const body = out.items;
-    try testing.expect(std.mem.indexOf(u8, body, "\"count\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"total\":1") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"ip\":\"185.220.101.5\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"jail\":\"sshd\"") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"banned_at\":1714000000") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"remaining_s\":") != null);
+    // ISO-8601 UTC renders 1_714_000_000 (2024-04-24T23:06:40Z).
+    // Check the stable parts — full date + minute-precision time —
+    // rather than exact seconds to decouple from format helper.
+    try testing.expect(std.mem.indexOf(u8, body, "\"banned_at\":\"2024-04-24T23:06:") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"seconds_remaining\":") != null);
 }
 
 test "http: /api/bans truncates elements at 200 but count reflects total" {
@@ -1392,7 +1507,7 @@ test "http: /api/bans truncates elements at 200 but count reflects total" {
     try writeBansPayload(@ptrCast(&ctx), &out, a);
 
     const body = out.items;
-    try testing.expect(std.mem.indexOf(u8, body, "\"count\":250") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"total\":250") != null);
 
     // Count the elements by counting `"ip":` occurrences — robust to
     // element ordering since HashMap iteration isn't sorted.
