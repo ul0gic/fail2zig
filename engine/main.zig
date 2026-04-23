@@ -433,6 +433,31 @@ const WsTickContext = struct {
     start_time: i64,
 };
 
+/// Read `VmRSS` from `/proc/self/status` and return bytes. Linux-only.
+/// On any I/O or parse failure returns an error — callers should
+/// treat that as "gauge unavailable this tick" and skip the update.
+fn readSelfRssBytes() !u64 {
+    var file = std.fs.openFileAbsolute("/proc/self/status", .{}) catch |err| return err;
+    defer file.close();
+    var buf: [8192]u8 = undefined;
+    const n = file.readAll(&buf) catch |err| return err;
+    const contents = buf[0..n];
+    // Line shape: "VmRSS:\t   12345 kB"
+    const needle = "VmRSS:";
+    const idx = std.mem.indexOf(u8, contents, needle) orelse return error.NotFound;
+    const tail = contents[idx + needle.len ..];
+    const nl = std.mem.indexOfScalar(u8, tail, '\n') orelse tail.len;
+    const line = tail[0..nl];
+    // Extract the first run of decimal digits.
+    var i: usize = 0;
+    while (i < line.len and (line[i] < '0' or line[i] > '9')) : (i += 1) {}
+    const start = i;
+    while (i < line.len and line[i] >= '0' and line[i] <= '9') : (i += 1) {}
+    if (i == start) return error.ParseFailed;
+    const kb = try std.fmt.parseInt(u64, line[start..i], 10);
+    return kb * 1024;
+}
+
 fn wsTick(expirations: u64, userdata: ?*anyopaque) void {
     _ = expirations;
     const ctx: *WsTickContext = @ptrCast(@alignCast(userdata.?));
@@ -440,6 +465,14 @@ fn wsTick(expirations: u64, userdata: ?*anyopaque) void {
     // Heartbeat: send pings to silent clients, drop any that haven't
     // pong'd in time. Cheap; no-op if there are no clients.
     ctx.ws.tickHeartbeat();
+
+    // Refresh the RSS gauge before snapshotting. /proc/self/status is
+    // kernel-maintained; the VmRSS line is ~40 bytes in a ~8 KiB text
+    // file — a single read + strtoul per second is vanishing overhead.
+    // Falls back silently on non-Linux or an open-failure.
+    if (readSelfRssBytes()) |rss_bytes| {
+        ctx.metrics.setMemoryBytes(rss_bytes);
+    } else |_| {}
 
     const snap = ctx.metrics.snapshot();
     const uptime_s: u64 = blk: {

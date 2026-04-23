@@ -27,12 +27,6 @@ export interface PrometheusSample {
 
 type MetricType = 'counter' | 'gauge';
 
-/** Strips labels.  `foo{a="b",c="d"}` → `foo`. */
-function stripLabels(nameWithLabels: string): string {
-  const brace = nameWithLabels.indexOf('{');
-  return brace === -1 ? nameWithLabels : nameWithLabels.slice(0, brace);
-}
-
 export function parsePrometheus(text: string): PrometheusSample {
   const typeMap = new Map<string, MetricType>();
   const counters = new Map<string, number>();
@@ -57,12 +51,22 @@ export function parsePrometheus(text: string): PrometheusSample {
     const spaceIdx = line.indexOf(' ');
     if (spaceIdx === -1) continue;
     const nameWithLabels = line.slice(0, spaceIdx);
+
+    // Skip labeled variants entirely.  fail2zig emits both a bare-name
+    // aggregate (`fail2zig_lines_parsed_total 179`) AND per-jail
+    // labeled entries (`fail2zig_lines_parsed_total{jail="sshd"} 165`).
+    // If we naively stripped labels and `set()` on the same key, the
+    // last labeled row (recidive with value 0) would clobber the real
+    // aggregate.  The MetricsPane only wants the aggregates, so we
+    // just skip anything with labels.
+    if (nameWithLabels.includes('{')) continue;
+
     const valueStr = line.slice(spaceIdx + 1).trim().split(/\s+/)[0];
     if (valueStr === undefined) continue;
     const value = Number(valueStr);
     if (!Number.isFinite(value)) continue;
 
-    const name = stripLabels(nameWithLabels);
+    const name = nameWithLabels;
     const kind = typeMap.get(name) ?? 'counter';
     if (kind === 'gauge') {
       gauges.set(name, value);
