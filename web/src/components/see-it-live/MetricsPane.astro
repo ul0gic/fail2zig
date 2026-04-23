@@ -87,7 +87,7 @@
     font-size: 10.5px;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: var(--fg-faint);
+    color: var(--fg-dim);
   }
   .metric-value {
     font-family: var(--mono);
@@ -173,12 +173,16 @@
       const text = await res.text();
       const sample = parsePrometheus(text);
 
-      const linesParsed = metricValue(sample, 'fail2zig_lines_parsed');
-      const linesMatched = metricValue(sample, 'fail2zig_lines_matched');
+      // Engine uses Prometheus `_total` suffix on counters and our own
+      // `fail2zig_memory_bytes_used` / `fail2zig_uptime_seconds` gauges
+      // rather than the generic process_* convention — it's a
+      // self-reported daemon, not a child-of-exporter.
+      const linesParsed = metricValue(sample, 'fail2zig_lines_parsed_total');
+      const linesMatched = metricValue(sample, 'fail2zig_lines_matched_total');
       const bansTotal = metricValue(sample, 'fail2zig_bans_total');
       const activeBans = metricValue(sample, 'fail2zig_active_bans');
-      const memBytes = metricValue(sample, 'process_resident_memory_bytes');
-      const startTime = metricValue(sample, 'process_start_time_seconds');
+      const memBytes = metricValue(sample, 'fail2zig_memory_bytes_used');
+      const uptimeSec = metricValue(sample, 'fail2zig_uptime_seconds');
 
       if (linesParsed !== null) {
         writeText('m-lines-parsed', fmtNumber(Math.round(linesParsed)));
@@ -188,10 +192,7 @@
       if (bansTotal !== null) writeText('m-bans-total', fmtNumber(Math.round(bansTotal)));
       if (activeBans !== null) writeText('m-active-bans', fmtNumber(Math.round(activeBans)));
       if (memBytes !== null) writeText('m-memory', fmtMB(memBytes));
-      if (startTime !== null) {
-        const up = Date.now() / 1_000 - startTime;
-        writeText('m-uptime', fmtUptime(up));
-      }
+      if (uptimeSec !== null) writeText('m-uptime', fmtUptime(uptimeSec));
     } catch {
       // Silent skip — the status banner already tells the user the
       // feed is degraded.  Previous values stay on screen.

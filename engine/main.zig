@@ -997,6 +997,19 @@ fn writeMetricsPayload(
     try w.writeAll("# TYPE fail2zig_memory_bytes_used gauge\n");
     try w.print("fail2zig_memory_bytes_used {d}\n", .{snap.memory_bytes_used});
 
+    // Uptime exposed directly (vs relying on Prometheus' derive-
+    // from-process_start_time convention). Operators scraping this
+    // get a simple counter they can render without client-side
+    // arithmetic; the dashboard's MetricsPane reads this verbatim.
+    const uptime_s: u64 = blk: {
+        const now = std.time.timestamp();
+        if (now <= self.cmd_ctx.start_time) break :blk 0;
+        break :blk @intCast(now - self.cmd_ctx.start_time);
+    };
+    try w.writeAll("# HELP fail2zig_uptime_seconds Seconds since daemon start\n");
+    try w.writeAll("# TYPE fail2zig_uptime_seconds gauge\n");
+    try w.print("fail2zig_uptime_seconds {d}\n", .{uptime_s});
+
     // Per-jail labels.
     for (snap.perJail()) |pj| {
         const name = pj.name();
