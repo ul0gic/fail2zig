@@ -8,7 +8,7 @@
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 [![Zig](https://img.shields.io/badge/zig-0.14.1-F7A41D?logo=zig&logoColor=white)](https://ziglang.org/download/)
 [![Platform](https://img.shields.io/badge/platform-linux--x86__64%20%7C%20linux--aarch64-lightgrey)](#installation)
-[![Status](https://img.shields.io/badge/status-pre--release-orange.svg)](#project-status)
+[![Version](https://img.shields.io/github/v/release/ul0gic/fail2zig?label=version&color=orange)](https://github.com/ul0gic/fail2zig/releases/latest)
 
 </div>
 
@@ -37,7 +37,6 @@ a shared host.
 - [Comparison](#comparison)
 - [Project structure](#project-structure)
 - [Documentation](#documentation)
-- [Project status](#project-status)
 - [Contributing](#contributing)
 - [License & trademark](#license)
 
@@ -46,21 +45,31 @@ a shared host.
 ## Quick start
 
 ```bash
-# 1. Build (ReleaseSafe keeps bounds checking on the attacker-facing path)
-zig build -Doptimize=.ReleaseSafe
+# 1. Install (downloads the static musl binary, SHA256-verifies, installs
+#    systemd unit + example config)
+curl -fsSL https://github.com/ul0gic/fail2zig/raw/main/scripts/install.sh | sudo bash
 
-# 2. Import your existing fail2ban config (optional)
-./zig-out/bin/fail2zig --import-config /etc/fail2ban \
-                      --import-output /etc/fail2zig/config.toml
+# 2. (Optional) Migrate from fail2ban
+sudo fail2zig --import-config /etc/fail2ban \
+              --import-output /etc/fail2zig/config.toml
 
-# 3. Validate, then run
-./zig-out/bin/fail2zig --validate-config --config /etc/fail2zig/config.toml
-sudo ./zig-out/bin/fail2zig --foreground --config /etc/fail2zig/config.toml
+# 3. Validate config, then enable the service
+sudo fail2zig --validate-config --config /etc/fail2zig/config.toml
+sudo systemctl enable --now fail2zig
+
+# 4. Check the daemon
+fail2zig-client status
 ```
 
-Prebuilt static musl binaries will be published on the
-[GitHub Releases](https://github.com/ul0gic/fail2zig/releases) page once v0.1.0
-is tagged.
+That's it. No package manager, no Python runtime, no regex engine to
+CVE-surf around. One binary, one config file, one systemd unit.
+
+The installer pulls from the
+[latest GitHub Release](https://github.com/ul0gic/fail2zig/releases/latest)
+and verifies every asset against the published `SHA256SUMS` before placing
+anything on disk. Pin a specific version with
+`FAIL2ZIG_VERSION=v0.1.0` or inspect the script first with
+`curl -fsSL … | less`.
 
 ---
 
@@ -130,6 +139,10 @@ flowchart LR
     CLI["fail2zig-client"] --> IPC
     PROM["Prometheus"] --> HTTP
     DASH["Dashboard / WS"] --> HTTP
+
+    style Daemon stroke:#E1A050,stroke-width:2px
+    style PE stroke:#E1A050
+    style ST stroke:#E1A050
 ```
 
 Deep-dive: [architecture/zero-dependencies](https://fail2zig.com/docs/architecture/zero-dependencies/).
@@ -138,12 +151,65 @@ Deep-dive: [architecture/zero-dependencies](https://fail2zig.com/docs/architectu
 
 ## Installation
 
-### Prebuilt binary (post-v0.1.0)
+### Prebuilt binary (recommended)
 
-Static musl binaries and a `SHA256SUMS` manifest will be published on the
-[Releases](https://github.com/ul0gic/fail2zig/releases) page. `scripts/install.sh`
-fetches the latest release, verifies checksums, installs the binaries and the
-systemd unit, and creates the `fail2zig` system group.
+```bash
+curl -fsSL https://github.com/ul0gic/fail2zig/raw/main/scripts/install.sh | sudo bash
+```
+
+[`scripts/install.sh`](scripts/install.sh) detects your architecture, resolves
+the latest release (or `FAIL2ZIG_VERSION` if set), downloads `fail2zig` +
+`fail2zig-client` + `SHA256SUMS` from the
+[release](https://github.com/ul0gic/fail2zig/releases/latest) asset tree,
+verifies each binary against the signed manifest, creates the `fail2zig`
+system group, installs binaries to `/usr/local/bin`, drops the example
+config at `/etc/fail2zig/config.toml` (never clobbers an existing one), and
+installs the hardened `fail2zig.service` unit under
+`/etc/systemd/system/`. It does **not** auto-start the daemon — audit the
+config, then `systemctl enable --now fail2zig` when ready.
+
+**Supported targets (v0.1.0):**
+- `x86_64-linux-musl` (879 KB stripped)
+- `aarch64-linux-musl` (801 KB stripped)
+
+`armv7-linux-musleabihf` and `mips-linux-musl` are tracked in SYS-009 and
+ship in a future release.
+
+### Dry-run / inspect the installer
+
+```bash
+# Inspect before piping to root
+curl -fsSL https://github.com/ul0gic/fail2zig/raw/main/scripts/install.sh | less
+
+# See what would happen without writing anything
+curl -fsSL https://github.com/ul0gic/fail2zig/raw/main/scripts/install.sh | sudo bash -s -- --dry-run
+
+# Install from a local checkout instead of downloading
+sudo scripts/install.sh --local-bin zig-out/bin
+```
+
+### Manual install
+
+If you'd rather skip the script:
+
+```bash
+# 1. Download the binary + manifest for your arch
+VERSION=v0.1.0
+ARCH=x86_64-linux-musl   # or aarch64-linux-musl
+curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/fail2zig-${VERSION}-${ARCH}"
+curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/fail2zig-client-${VERSION}-${ARCH}"
+curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/SHA256SUMS"
+
+# 2. Verify (bail if any line fails)
+sha256sum --check --ignore-missing SHA256SUMS
+
+# 3. Install
+sudo install -m 0755 "fail2zig-${VERSION}-${ARCH}"        /usr/local/bin/fail2zig
+sudo install -m 0755 "fail2zig-client-${VERSION}-${ARCH}" /usr/local/bin/fail2zig-client
+sudo groupadd --system fail2zig 2>/dev/null || true
+```
+
+Then follow the [systemd setup](#systemd-setup) block below.
 
 ### Build from source
 
@@ -178,16 +244,39 @@ cast) tracked for a future release.
 
 ### systemd setup
 
+If you used `scripts/install.sh`, the unit file is already in place — skip to
+[Configuration](#configuration).
+
+From a repo checkout:
+
 ```bash
 sudo install -m 0644 deploy/fail2zig.service /etc/systemd/system/
 sudo install -m 0644 deploy/fail2zig.socket  /etc/systemd/system/
+sudo install -d -m 0750 /etc/fail2zig
 sudo install -m 0644 deploy/fail2zig.toml.example /etc/fail2zig/config.toml
 sudo systemctl daemon-reload
 sudo systemctl enable --now fail2zig
 ```
 
+From a downloaded release (the same three files are published alongside
+the binaries):
+
+```bash
+VERSION=v0.1.0
+for f in fail2zig.service fail2zig.socket fail2zig.toml.example; do
+  curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/${f}"
+done
+sudo install -m 0644 fail2zig.service /etc/systemd/system/
+sudo install -m 0644 fail2zig.socket  /etc/systemd/system/
+sudo install -d -m 0750 /etc/fail2zig
+sudo install -m 0644 fail2zig.toml.example /etc/fail2zig/config.toml
+sudo systemctl daemon-reload
+sudo systemctl enable --now fail2zig
+```
+
 The shipped unit is hardened: `ProtectSystem=strict`, `NoNewPrivileges=yes`,
-`CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH`, no home
+`CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH`,
+`RuntimeDirectory=fail2zig` (auto-created on every start), no home
 directories, no device nodes, no kernel tunables. `systemd-analyze security
 fail2zig` scores 2.4 (OK).
 
@@ -195,8 +284,11 @@ fail2zig` scores 2.4 (OK).
 
 ## Configuration
 
-Copy `deploy/fail2zig.toml.example` to `/etc/fail2zig/config.toml` and edit.
-Minimal config:
+`fail2zig` reads one TOML file — `/etc/fail2zig/config.toml` by default.
+The installer and the systemd setup both drop a fully-commented example
+there. Edit it, validate, restart.
+
+A minimal working config:
 
 ```toml
 [global]
@@ -208,22 +300,46 @@ metrics_port       = 9100
 
 [defaults]
 bantime    = 600      # seconds
-findtime   = 600      # sliding window
-maxretry   = 5
+findtime   = 600      # sliding window for counting attempts
+maxretry   = 5        # attempts inside findtime before a ban
 banaction  = "nftables"
 ignoreip   = ["127.0.0.1/8", "::1"]
 
-[jails.sshd]
-enabled  = true
-filter   = "sshd"
-logpath  = ["/var/log/auth.log", "/var/log/secure"]
-maxretry = 3
-bantime  = 3600
+# bantime_increment controls how repeat offenders get longer bans.
 bantime_increment_enabled     = true
 bantime_increment_formula     = "exponential"
 bantime_increment_multiplier  = 2
-bantime_increment_max_bantime = 604800
+bantime_increment_max_bantime = 604800   # cap at 7 days
+
+[jails.sshd]
+enabled = true
+filter  = "sshd"
+logpath = ["/var/log/auth.log", "/var/log/secure"]
+
+[jails.nginx-botsearch]
+enabled = true
+filter  = "nginx-botsearch"
+logpath = ["/var/log/nginx/access.log"]
 ```
+
+After editing:
+
+```bash
+sudo fail2zig --validate-config --config /etc/fail2zig/config.toml
+sudo systemctl restart fail2zig
+fail2zig-client status
+```
+
+### Threshold knobs in v0.1.0
+
+In **v0.1.0**, the `bantime`, `findtime`, `maxretry`, and
+`bantime_increment_*` values are honored from `[defaults]` only — a single
+shared state tracker applies the same thresholds across every jail. Per-jail
+overrides (`[jails.<name>].maxretry = …` etc.) are parsed and accepted by
+the validator, but have no runtime effect. Per-jail threshold tracking is
+the first item in the v0.2 scope (tracked as ISSUE-007). Set the values
+you want globally in `[defaults]` until then; per-jail `enabled`,
+`filter`, and `logpath` work as expected.
 
 Full schema and every option: [reference/config](https://fail2zig.com/docs/reference/config/).
 
@@ -345,8 +461,8 @@ Filter names accept hyphenated or underscore forms
 
 ## Benchmarks
 
-Measured on the Phase 7.5 lab box (x86_64, ReleaseSafe, stripped). Reproducible
-via `make bench` and the `tests/harness/measure.sh` probes.
+Measured on the reference lab box (x86_64, ReleaseSafe, stripped).
+Reproducible via `make bench` and the `tests/harness/measure.sh` probes.
 
 | Metric | Target | Measured |
 |--------|--------|----------|
@@ -420,32 +536,6 @@ fail2zig/
 | Reference | [fail2zig.com/docs](https://fail2zig.com/docs/) | Config schema, CLI flags, filter catalogue |
 | Man pages | [docs/man/](docs/man/) | `fail2zig(1)`, `fail2zig-client(1)`, `fail2zig.toml(5)` |
 | Tests | [tests/README.md](tests/README.md) | Unit / integration / benchmark / fuzz / harness layout |
-
----
-
-## Project status
-
-Pre-release. v0.1.0 candidate.
-
-| Phase | Status |
-|-------|--------|
-| 1. Foundation | ✅ Complete |
-| 2. Core engine (event loop, log watcher) | ✅ Complete |
-| 3. Parser + config + firewall backends | ✅ Complete |
-| 4. Ban lifecycle + persistence | ✅ Complete |
-| 5. IPC + client + metrics + WebSocket | ✅ Complete |
-| 6. fail2ban compat + filter library | ✅ Complete |
-| 7. Hardening + testing | ✅ Complete |
-| 7.5. Real-system validation (netns, bare-metal) | 🔄 90% — 12h soak remaining |
-| 8. Docs + DevOps (CI, release, systemd) | ✅ Complete |
-| 9. Attack simulator + marketing site | ⬜ Not started |
-| 10. Final polish (v0.1.0 tag) | ⬜ Not started |
-
-**Test suite:** 588 passing, 7 skipped (unprivileged-host gates), 0 failed,
-0 leaks reported by `std.testing.allocator`.
-
-fail2zig has not been through an external security audit. Run it in
-environments where that limitation is acceptable.
 
 ---
 
