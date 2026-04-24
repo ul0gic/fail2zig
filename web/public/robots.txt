@@ -1,5 +1,4 @@
 User-agent: *
 Allow: /
-Disallow: /see-it-live
 
 Sitemap: https://fail2zig.com/sitemap-index.xml

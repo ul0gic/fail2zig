@@ -124,11 +124,11 @@ fine.
 represents the rule `ip saddr @banned_ipv4 drop` as three expressions
 chained together:
 
-| Step | Expression | What the kernel does |
-|---|---|---|
-| 1 | `payload` load | Load the IPv4 source-address field (4 bytes at offset 12 in the network header) into register 1. |
-| 2 | `lookup` | Look up register 1 in the `banned_ipv4` set. If present, continue; otherwise fall through. |
-| 3 | `immediate` verdict `drop` | Write verdict `NF_DROP` into register 0 — the packet is dropped. |
+| Step | Expression                 | What the kernel does                                                                             |
+| ---- | -------------------------- | ------------------------------------------------------------------------------------------------ |
+| 1    | `payload` load             | Load the IPv4 source-address field (4 bytes at offset 12 in the network header) into register 1. |
+| 2    | `lookup`                   | Look up register 1 in the `banned_ipv4` set. If present, continue; otherwise fall through.       |
+| 3    | `immediate` verdict `drop` | Write verdict `NF_DROP` into register 0 — the packet is dropped.                                 |
 
 Each of the three expression nodes is an `NFTA_LIST_ELEM` TLV
 containing:

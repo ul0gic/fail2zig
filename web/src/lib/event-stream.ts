@@ -239,7 +239,8 @@ export class EventStream {
     const current = events.at(idx);
     if (current === undefined) return;
     const nowInReplay = Date.parse(current.ts);
-    const delta = Number.isFinite(nowInReplay) && Number.isFinite(anchor) ? nowInReplay - anchor : 0;
+    const delta =
+      Number.isFinite(nowInReplay) && Number.isFinite(anchor) ? nowInReplay - anchor : 0;
     const clamped = Math.max(0, Math.min(delta, 30_000));
 
     this.replayTimer = setTimeout(() => {

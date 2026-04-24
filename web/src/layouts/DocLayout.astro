@@ -75,7 +75,13 @@ const showToc = Boolean(tocHeadings?.length) || hasCustomToc;
       <div class="doc-content">
         <slot />
       </div>
-      {hasActions && <div class="doc-actions"><slot name="actions" /></div>}
+      {
+        hasActions && (
+          <div class="doc-actions">
+            <slot name="actions" />
+          </div>
+        )
+      }
     </main>
 
     {
@@ -104,7 +110,6 @@ const showToc = Boolean(tocHeadings?.length) || hasCustomToc;
       )
     }
   </div>
-
 </BaseLayout>
 
 <style>
@@ -160,7 +165,10 @@ const showToc = Boolean(tocHeadings?.length) || hasCustomToc;
     border-left: 2px solid transparent;
     padding-left: 12px;
     margin-left: -10px;
-    transition: color 0.12s, border-left-color 0.12s, background 0.12s;
+    transition:
+      color 0.12s,
+      border-left-color 0.12s,
+      background 0.12s;
   }
   .sidebar a:hover {
     color: var(--fg);
@@ -295,7 +303,9 @@ const showToc = Boolean(tocHeadings?.length) || hasCustomToc;
     margin-left: 8px;
     text-decoration: none;
     opacity: 0;
-    transition: opacity 0.15s, color 0.12s;
+    transition:
+      opacity 0.15s,
+      color 0.12s;
   }
   .doc-content :global(h2:hover .heading-anchor),
   .doc-content :global(h3:hover .heading-anchor) {
@@ -355,7 +365,9 @@ const showToc = Boolean(tocHeadings?.length) || hasCustomToc;
     border-left: 2px solid transparent;
     padding-left: 10px;
     margin-left: -10px;
-    transition: color 0.15s, border-left-color 0.15s;
+    transition:
+      color 0.15s,
+      border-left-color 0.15s;
   }
   .toc :global(a:hover) {
     color: var(--fg);
@@ -462,11 +474,7 @@ const showToc = Boolean(tocHeadings?.length) || hasCustomToc;
 </script>
 
 <script>
-  import {
-    findDocBlocks,
-    installMermaidModal,
-    renderMermaidTargets,
-  } from '@/lib/render-mermaid';
+  import { findDocBlocks, installMermaidModal, renderMermaidTargets } from '@/lib/render-mermaid';
 
   installMermaidModal();
   void renderMermaidTargets(findDocBlocks());

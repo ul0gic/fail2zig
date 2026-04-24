@@ -183,14 +183,14 @@ validated cleanly.
 
 The values you are most likely to change:
 
-| Key | Why you might change it |
-|---|---|
-| `ignoreip` | Add your office egress, monitoring probes, load balancer health-check source IPs. |
-| `memory_ceiling_mb` | Decrease on small VPSes or containers; increase only with many jails + long `findtime`. |
-| `[jails.sshd].maxretry` | Drop to 2 for a paranoid SSH-only bastion; keep at 3 for mixed-use servers. |
-| `[jails.nginx-http-auth].filter` | If you use `nginx-limit-req` or `nginx-botsearch` instead, swap it in. |
-| `bantime_increment_factor` | Lower to 1.5 for a gentler curve, raise to 3 for aggressive escalation. |
-| `bantime_increment_max_bantime` | Shorten to 86400 (1 day) if you accept the risk of mislabelled real users getting back in faster. |
+| Key                              | Why you might change it                                                                           |
+| -------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `ignoreip`                       | Add your office egress, monitoring probes, load balancer health-check source IPs.                 |
+| `memory_ceiling_mb`              | Decrease on small VPSes or containers; increase only with many jails + long `findtime`.           |
+| `[jails.sshd].maxretry`          | Drop to 2 for a paranoid SSH-only bastion; keep at 3 for mixed-use servers.                       |
+| `[jails.nginx-http-auth].filter` | If you use `nginx-limit-req` or `nginx-botsearch` instead, swap it in.                            |
+| `bantime_increment_factor`       | Lower to 1.5 for a gentler curve, raise to 3 for aggressive escalation.                           |
+| `bantime_increment_max_bantime`  | Shorten to 86400 (1 day) if you accept the risk of mislabelled real users getting back in faster. |
 
 If you add a new jail, the three keys that matter are `filter`,
 `logpath`, and (usually) `maxretry`. Everything else is inherited

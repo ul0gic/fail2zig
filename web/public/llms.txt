@@ -1,0 +1,97 @@
+# fail2zig
+
+> fail2zig is a modern intrusion prevention system for Linux — a single static musl binary with zero runtime dependencies that replaces fail2ban. Drop-in compatibility with fail2ban `jail.conf` + `filter.d` config. Kernel-native ban enforcement via direct netlink (nftables preferred; ipset and iptables as fallbacks). Written in Zig, AGPL-3.0-or-later.
+
+## Identity
+
+- Name: fail2zig
+- Category: intrusion prevention / log-based ban manager
+- Language: Zig 0.14.1
+- License: AGPL-3.0-or-later
+- Repository: https://github.com/ul0gic/fail2zig
+- Website: https://fail2zig.com
+- Current release: v0.1.0 (2026-04-24)
+- Author: ul0gic (https://github.com/ul0gic)
+
+## One-liner install
+
+```
+curl -fsSL https://github.com/ul0gic/fail2zig/raw/main/scripts/install.sh | sudo bash
+```
+
+## Core capabilities
+
+- Static musl binary, 877 KB stripped (x86_64-linux-musl); 801 KB (aarch64)
+- Zero runtime dependencies (no Python, no libc dynamic linkage, no shell-out)
+- Comptime-specialized parser — no runtime regex engine in the process
+- Pure netlink for nftables bans (no libnftnl, no shell-out to `nft`)
+- Argv-based fallback backends: iptables, ipset
+- Bounded memory with hard ceiling (default 64 MB)
+- Per-IP 128-slot ring buffer for sliding-window attempt tracking
+- Atomic CRC-checked state persistence across restarts
+- Built-in HTTP: `/metrics` (Prometheus), `/api/bans` (JSON), `/events` (WebSocket RFC 6455)
+- Unix-domain-socket IPC with `SO_PEERCRED` auth for the `fail2zig-client` CLI
+- Hardened systemd unit: `CAP_NET_ADMIN` + `CAP_DAC_READ_SEARCH` only
+
+## Filters shipped (15 built-in)
+
+- sshd (9 OpenSSH patterns, 7.x / 8.x / 9.x)
+- nginx-http-auth, nginx-limit-req, nginx-botsearch
+- apache-auth, apache-badbots, apache-overflows
+- postfix, dovecot, courier
+- named (BIND)
+- vsftpd, proftpd, mysqld
+- recidive (meta-filter for repeat offenders)
+
+## Relationship to fail2ban
+
+fail2zig is a drop-in replacement. It reads fail2ban's config format natively via `fail2zig --import-config /etc/fail2ban`, which:
+
+- Parses `jail.conf` + `jail.local` + `jail.d/*.conf` with correct override semantics
+- Translates Python regex patterns in `filter.d/` to fail2zig's comptime DSL
+- Maps action names in `action.d/` to native backends (`iptables-*` → iptables, `nftables-*` → nftables, `ipset-*` → ipset)
+- Emits a validated native TOML config
+
+An existing fail2ban deployment migrates with one command, zero rewrites.
+
+Differences from fail2ban (architectural, not competitive):
+
+- Single static binary vs Python runtime + libraries
+- Comptime-specialized parsers vs general-purpose regex engine
+- Direct netlink to kernel vs shelling out to `iptables` / `nft` CLI
+- Hard memory ceiling vs unbounded GC growth
+- Zig vs Python
+
+## Measured performance (v0.1.0, ReleaseSafe, stripped)
+
+- Parse throughput: 5.96M lines/sec
+- Ban latency: p50 365 ns, p99 932 ns
+- Memory under attack (50K unique IPs): 21,845 entries resident, 15,606 evictions, ceiling never exceeded
+- Resident memory under load: 22 MB
+- Test suite: 595 passing, 0 leaks, 0 warnings
+
+## Primary docs
+
+- [Home](https://fail2zig.com/): install, quick start, feature overview
+- [Why fail2zig](https://fail2zig.com/why): operator-honest argument for replacing fail2ban
+- [Threat model](https://fail2zig.com/threat-model): STRIDE analysis, trust boundaries, fail-closed matrix
+- [Docs](https://fail2zig.com/docs): reference, guides, architecture deep-dives
+- [Changelog](https://fail2zig.com/changelog): release history with commit refs
+- [Demo](https://fail2zig.com/demo): live honeypot streaming real attacker bans
+- [Privacy](https://fail2zig.com/privacy): data handling (no cookies, no tracking, no telemetry)
+- [Terms](https://fail2zig.com/terms): use of the site
+
+## Supported platforms (v0.1.0)
+
+- Linux x86_64 (musl-static)
+- Linux aarch64 (musl-static)
+
+Not yet shipped: armv7, mips (tracked as SYS-009), Windows, macOS.
+
+## Security reporting
+
+Vulnerabilities should be reported via GitHub Private Security Advisories, not public issues. 48-hour acknowledgement, coordinated disclosure. See https://github.com/ul0gic/fail2zig/security/advisories/new and the `SECURITY.md` at the repository root.
+
+## Contributing
+
+Contributions welcome. The highest-leverage area is new filter patterns for modern services — fail2ban's filter library stopped expanding around 2015. Candidates: Docker, Kubernetes, Traefik, Caddy, Vaultwarden, Authelia, Keycloak, Gitea, Jellyfin, Immich, LLM endpoints (Ollama, OpenWebUI, LocalAI), PostgreSQL, Redis, MongoDB, Grafana, Prometheus. See the repository `README.md` "Contributing" section.

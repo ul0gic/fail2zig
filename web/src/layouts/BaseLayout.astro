@@ -18,15 +18,45 @@ interface Props {
   title: string;
   description?: string | undefined;
   activeNav?: string | undefined;
+  /** Optional page-specific JSON-LD schemas (e.g. SoftwareApplication on the home page). */
+  jsonLd?: readonly Record<string, unknown>[];
 }
 
 const {
   title,
-  description = 'fail2zig — modern intrusion prevention. Single static binary, zero dependencies, built on 20 years of fail2ban lineage.',
+  description = 'A static musl binary that replaces fail2ban. Zero runtime dependencies, kernel-native bans via netlink, drop-in jail.conf compatibility.',
   activeNav,
+  jsonLd = [],
 } = Astro.props;
 
 const canonical = new URL(Astro.url.pathname, Astro.site ?? Astro.url).toString();
+const ogImage = new URL('/og.png', Astro.site ?? Astro.url).toString();
+const siteUrl = (Astro.site ?? Astro.url).toString().replace(/\/$/, '');
+
+// Site-wide structured data. Present on every page so search engines +
+// LLM crawlers always get canonical identity + site context.
+const organization = {
+  '@context': 'https://schema.org',
+  '@type': 'Organization',
+  name: 'fail2zig',
+  url: `${siteUrl}/`,
+  logo: `${siteUrl}/og.png`,
+  sameAs: ['https://github.com/ul0gic/fail2zig'],
+};
+
+const website = {
+  '@context': 'https://schema.org',
+  '@type': 'WebSite',
+  name: 'fail2zig',
+  url: `${siteUrl}/`,
+  description:
+    'A static musl binary that replaces fail2ban. Zero runtime dependencies, kernel-native bans, drop-in jail.conf compatibility.',
+  inLanguage: 'en',
+  publisher: { '@id': `${siteUrl}/#org` },
+};
+
+const alwaysJsonLd: readonly Record<string, unknown>[] = [organization, website];
+const allJsonLd: readonly Record<string, unknown>[] = [...alwaysJsonLd, ...jsonLd];
 ---
 
 <!doctype html>
@@ -40,11 +70,28 @@ const canonical = new URL(Astro.url.pathname, Astro.site ?? Astro.url).toString(
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="canonical" href={canonical} />
     <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="fail2zig" />
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
     <meta property="og:url" content={canonical} />
+    <meta property="og:image" content={ogImage} />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta
+      property="og:image:alt"
+      content="fail2zig — intrusion prevention, rebuilt. A static musl binary replacing fail2ban."
+    />
     <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={ogImage} />
     <meta name="color-scheme" content="dark" />
+    {
+      allJsonLd.map((schema) => (
+        <script type="application/ld+json" set:html={JSON.stringify(schema)} />
+      ))
+    }
   </head>
   <body>
     <SiteNav active={activeNav} />

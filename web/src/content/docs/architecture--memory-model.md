@@ -44,11 +44,11 @@ by silent death — is not on the menu.
 fail2zig's memory budget at steady state is dominated by three
 components:
 
-| Component | What it holds | Typical budget |
-| --- | --- | --- |
-| State tracker | Per-IP attempt counts, first/last-seen timestamps, ban expiry | ~80% |
-| Parser buffers | Per-filter line buffers, match-context state | ~10% |
-| Executor + IPC | Pending ban batches, client socket buffers | ~10% |
+| Component      | What it holds                                                 | Typical budget |
+| -------------- | ------------------------------------------------------------- | -------------- |
+| State tracker  | Per-IP attempt counts, first/last-seen timestamps, ban expiry | ~80%           |
+| Parser buffers | Per-filter line buffers, match-context state                  | ~10%           |
+| Executor + IPC | Pending ban batches, client socket buffers                    | ~10%           |
 
 The state tracker is where attacker-driven growth lives. Every observed
 source IP consumes a slot. The other components are bounded by design
@@ -84,7 +84,7 @@ The advantages are architectural, not micro-optimisations:
   arithmetic inside our own region. There is no `malloc` call, no
   allocator lock, no fragmentation concerns.
 - **Predictable worst case.** We can state the upper bound of memory use
-  because the arena size *is* the upper bound. There is no Python-style
+  because the arena size _is_ the upper bound. There is no Python-style
   "garbage collector should free soon."
 - **Deterministic behaviour at the ceiling.** When the arena is full, we
   know it, and we reach for the eviction policy — we don't silently drop
@@ -115,11 +115,11 @@ When the arena is full, fail2zig has to choose who gets removed to make
 room for new observations. That choice is a policy, not a mechanism, and
 it is yours to set.
 
-| Policy | Behaviour | When to use |
-| --- | --- | --- |
-| `evict_oldest` (default) | Drop the least-recently-observed entry. Recent attackers stay tracked; old decisions are forgotten first. | General case. This is the fail-quiet default. |
-| `ban_all` | Before evicting, ban every IP still in the table, then reset. An aggressive "full table = something big is happening" posture. | Hardened servers where false negatives are worse than false positives. |
-| `drop_unbanned` | Drop entries that have not yet crossed the ban threshold. Protect active ban decisions first. | High-churn environments where many IPs briefly probe but don't escalate. |
+| Policy                   | Behaviour                                                                                                                      | When to use                                                              |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------ |
+| `evict_oldest` (default) | Drop the least-recently-observed entry. Recent attackers stay tracked; old decisions are forgotten first.                      | General case. This is the fail-quiet default.                            |
+| `ban_all`                | Before evicting, ban every IP still in the table, then reset. An aggressive "full table = something big is happening" posture. | Hardened servers where false negatives are worse than false positives.   |
+| `drop_unbanned`          | Drop entries that have not yet crossed the ban threshold. Protect active ban decisions first.                                  | High-churn environments where many IPs briefly probe but don't escalate. |
 
 The policy is set per-daemon via `memory.eviction_policy`. Switching it
 requires a daemon restart — this is a conscious choice, not a hot-swap,

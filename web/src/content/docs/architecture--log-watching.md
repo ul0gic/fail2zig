@@ -65,20 +65,21 @@ Rotation is the source of most bugs in log-following code, and every
 production log watcher has a rotation test suite in its history. The
 cases we handle:
 
-| Event | What happened | What the watcher does |
-| --- | --- | --- |
-| `IN_MOVE_SELF` | `mv auth.log auth.log.1` | Drain remaining bytes from the old fd, close it, watch for `IN_CREATE` on the parent directory. |
-| `IN_DELETE_SELF` | `rm auth.log` | Same as move — drain + close + re-watch. |
-| `IN_CREATE` on parent dir for a watched filename | A new file was created where we expect | Open the new file, start watching its fd, rewind to offset 0 (new inode). |
-| File truncated in place | `> auth.log` inside the open fd | Detect via `fstat` — new size < last known offset — reset offset to 0 and resume. |
-| Log-rotate with copy-truncate | The file gets copied aside and then truncated in place | Handled by the truncation case above. |
-| Log-rotate with create | Standard case. The old file gets renamed and a new one appears. | Handled by the move + create sequence. |
+| Event                                            | What happened                                                   | What the watcher does                                                                           |
+| ------------------------------------------------ | --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `IN_MOVE_SELF`                                   | `mv auth.log auth.log.1`                                        | Drain remaining bytes from the old fd, close it, watch for `IN_CREATE` on the parent directory. |
+| `IN_DELETE_SELF`                                 | `rm auth.log`                                                   | Same as move — drain + close + re-watch.                                                        |
+| `IN_CREATE` on parent dir for a watched filename | A new file was created where we expect                          | Open the new file, start watching its fd, rewind to offset 0 (new inode).                       |
+| File truncated in place                          | `> auth.log` inside the open fd                                 | Detect via `fstat` — new size < last known offset — reset offset to 0 and resume.               |
+| Log-rotate with copy-truncate                    | The file gets copied aside and then truncated in place          | Handled by the truncation case above.                                                           |
+| Log-rotate with create                           | Standard case. The old file gets renamed and a new one appears. | Handled by the move + create sequence.                                                          |
 
 The watcher's rotation tests are in `tests/integration/log_rotation.zig`.
 They are parameterised over the five real-world rotation modes operators
 actually deploy (logrotate with `copytruncate`, logrotate with `create`,
 syslog-ng's internal rotation, the journal's binary rotation, and `mv`
-+ SIGHUP).
+
+- SIGHUP).
 
 ### Why not tail-follow the whole file
 
@@ -129,10 +130,10 @@ The journal is the authoritative source of structured events on
 systemd-managed hosts. It knows the unit name, the PID, the UID, and
 the message without us having to parse a timestamp or a syslog
 prefix. For services like sshd that log via systemd, reading the
-journal is more accurate *and* faster than tailing `/var/log/auth.log`.
+journal is more accurate _and_ faster than tailing `/var/log/auth.log`.
 
-The C interop is a trade-off we accept because sd_journal's wire format
-— the on-disk journal file layout — is explicitly *not* a stable ABI.
+The C interop is a trade-off we accept because sd*journal's wire format
+— the on-disk journal file layout — is explicitly \_not* a stable ABI.
 The C library is the stable interface. Writing our own journal reader
 would mean chasing every format change libsystemd makes.
 
@@ -191,7 +192,7 @@ them.
 The event loop reads from all watchers in a single pass per iteration.
 If the parser is slower than the log sources, the watcher's read
 buffer fills up. inotify will coalesce `IN_MODIFY` events while the
-file grows, so we don't lose the *signal* that new data exists — when
+file grows, so we don't lose the _signal_ that new data exists — when
 the parser catches up, the watcher reads everything in one go.
 
 For io_uring, completions queue up in the completion ring. The ring

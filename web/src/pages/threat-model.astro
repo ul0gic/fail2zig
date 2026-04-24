@@ -17,12 +17,11 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
       </div>
       <h1>Threat model.</h1>
       <p class="tm-lede">
-        fail2zig runs as root, parses attacker-controlled input, and writes
-        kernel firewall state. The integrity of the tool matters more than
-        its features. This document enumerates the adversaries it is
-        designed to defend against, the trust boundaries it defines, and
-        the threats under each STRIDE category — with mitigations,
-        residual risk, and explicit out-of-scope items.
+        fail2zig runs as root, parses attacker-controlled input, and writes kernel firewall state.
+        The integrity of the tool matters more than its features. This document enumerates the
+        adversaries it is designed to defend against, the trust boundaries it defines, and the
+        threats under each STRIDE category — with mitigations, residual risk, and explicit
+        out-of-scope items.
       </p>
       <div class="tm-actions">
         <a href="#data-flow" class="btn primary">Jump to architecture &darr;</a>
@@ -50,10 +49,10 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
           <div class="abody">
             <h3>The kernel is trusted.</h3>
             <p>
-              fail2zig depends on the correctness of the Linux kernel's
-              netfilter, inotify, epoll, and <code>sd_journal</code>
-              ABIs. A kernel-level compromise is outside the scope of
-              anything fail2zig can prevent or detect.
+              fail2zig depends on the correctness of the Linux kernel's netfilter, inotify, epoll,
+              and <code>sd_journal</code>
+              ABIs. A kernel-level compromise is outside the scope of anything fail2zig can prevent or
+              detect.
             </p>
           </div>
         </div>
@@ -62,9 +61,8 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
           <div class="abody">
             <h3>The filesystem root is integrity-protected.</h3>
             <p>
-              Package signing, dm-verity, secure boot, or equivalent
-              keep the fail2zig binary and its configuration from being
-              silently replaced by an attacker without root. We do not
+              Package signing, dm-verity, secure boot, or equivalent keep the fail2zig binary and
+              its configuration from being silently replaced by an attacker without root. We do not
               re-verify the binary at startup.
             </p>
           </div>
@@ -74,11 +72,10 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
           <div class="abody">
             <h3>Log files reflect service reality.</h3>
             <p>
-              If the service being protected (sshd, nginx, postfix)
-              writes a line stating an authentication failure from
-              <code>203.0.113.5</code>, fail2zig treats that source IP
-              as authoritative. A compromised service can forge
-              arbitrary log content; fail2zig cannot distinguish that
+              If the service being protected (sshd, nginx, postfix) writes a line stating an
+              authentication failure from
+              <code>203.0.113.5</code>, fail2zig treats that source IP as authoritative. A
+              compromised service can forge arbitrary log content; fail2zig cannot distinguish that
               from reality.
             </p>
           </div>
@@ -88,9 +85,8 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
           <div class="abody">
             <h3>Operators configure the daemon honestly.</h3>
             <p>
-              Operators who have legitimate root on the host can
-              trivially disable or misconfigure fail2zig. The threat
-              model covers attacker access, not operator action.
+              Operators who have legitimate root on the host can trivially disable or misconfigure
+              fail2zig. The threat model covers attacker access, not operator action.
             </p>
           </div>
         </div>
@@ -105,16 +101,15 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
         <div>
           <h2>Data flow and trust boundaries.</h2>
           <p class="tm-sublede">
-            Every arrow is a point where adversary-controlled bytes can
-            influence the system. Every dashed line is a trust
-            boundary — a place where the authority of the caller
-            changes.
+            Every arrow is a point where adversary-controlled bytes can influence the system. Every
+            dashed line is a trust boundary — a place where the authority of the caller changes.
           </p>
         </div>
       </div>
 
       <div class="diagram">
-        <pre class="mermaid">{`
+        <pre
+          class="mermaid">{`
 flowchart LR
     A(("Attacker")) -->|"crafted requests / floods"| S["Service<br/>sshd · nginx · postfix"]
     S -->|"writes"| L[("Log file")]
@@ -140,7 +135,9 @@ flowchart LR
             <tr>
               <td class="bid">TB-01</td>
               <td>Attacker &rarr; service</td>
-              <td>Untrusted network bytes become authenticated-or-not requests the service records.</td>
+              <td
+                >Untrusted network bytes become authenticated-or-not requests the service records.</td
+              >
             </tr>
             <tr>
               <td class="bid">TB-02</td>
@@ -188,11 +185,9 @@ flowchart LR
           <div>
             <h3>Remote network attacker</h3>
             <p>
-              Can send arbitrary packets to services on the host. Can
-              craft request content to produce chosen log lines. Cannot
-              read the host's filesystem or memory. Cannot execute code
-              on the host. The primary adversary this product is built
-              against.
+              Can send arbitrary packets to services on the host. Can craft request content to
+              produce chosen log lines. Cannot read the host's filesystem or memory. Cannot execute
+              code on the host. The primary adversary this product is built against.
             </p>
           </div>
         </div>
@@ -201,12 +196,10 @@ flowchart LR
           <div>
             <h3>Log-injection adversary</h3>
             <p>
-              A subclass of AD-01 who can influence the text of log
-              lines via fields the protected service faithfully echoes
-              — HTTP <code>User-Agent</code>, SMTP <code>EHLO</code>
-              hostname, SSH client-version strings. May attempt to
-              inject crafted payloads that span fields or confuse the
-              parser.
+              A subclass of AD-01 who can influence the text of log lines via fields the protected
+              service faithfully echoes — HTTP <code>User-Agent</code>, SMTP <code>EHLO</code>
+              hostname, SSH client-version strings. May attempt to inject crafted payloads that span fields
+              or confuse the parser.
             </p>
           </div>
         </div>
@@ -216,10 +209,8 @@ flowchart LR
             <h3>Local unprivileged user</h3>
             <p>
               Has shell access as a non-root, non-<code>fail2zig</code>
-              -group user. Cannot read root-owned files. Cannot write
-              kernel state. May try to connect to the IPC socket or
-              metrics endpoint, attempt to enumerate banned IPs, or
-              cause local DoS.
+              -group user. Cannot read root-owned files. Cannot write kernel state. May try to connect
+              to the IPC socket or metrics endpoint, attempt to enumerate banned IPs, or cause local DoS.
             </p>
           </div>
         </div>
@@ -228,11 +219,9 @@ flowchart LR
           <div>
             <h3>Compromised protected service</h3>
             <p>
-              An attacker who has gained code execution inside the
-              service fail2zig is monitoring (e.g. RCE in a web
-              application behind nginx). Can write arbitrary log
-              content. May attempt to use fail2zig to ban legitimate
-              IPs as a lateral-movement prerequisite.
+              An attacker who has gained code execution inside the service fail2zig is monitoring
+              (e.g. RCE in a web application behind nginx). Can write arbitrary log content. May
+              attempt to use fail2zig to ban legitimate IPs as a lateral-movement prerequisite.
             </p>
           </div>
         </div>
@@ -247,13 +236,11 @@ flowchart LR
         <div>
           <h2>Threats by category.</h2>
           <p class="tm-sublede">
-            For each category: threat, affected trust boundary,
-            mitigation, residual risk, status. Status is
+            For each category: threat, affected trust boundary, mitigation, residual risk, status.
+            Status is
             <span class="tag safe">Mitigated</span> (addressed in v0.1.0),
-            <span class="tag accent">Partial</span> (mitigation improving
-            in a later phase), or
-            <span class="tag">Accepted</span> (an intentional
-            trade-off documented here).
+            <span class="tag accent">Partial</span> (mitigation improving in a later phase), or
+            <span class="tag">Accepted</span> (an intentional trade-off documented here).
           </p>
         </div>
       </div>
@@ -273,8 +260,8 @@ flowchart LR
               <td class="threat">Local user spoofs an authorized IPC client.</td>
               <td class="tb">TB-05</td>
               <td class="mitig">
-                IPC socket is mode <code>0660</code>, owned <code>root:fail2zig</code>.
-                The daemon authenticates every connection via
+                IPC socket is mode <code>0660</code>, owned <code>root:fail2zig</code>. The daemon
+                authenticates every connection via
                 <code>SO_PEERCRED</code> and rejects peers outside
                 <code>uid=0</code> or the <code>fail2zig</code> group.
               </td>
@@ -282,15 +269,16 @@ flowchart LR
             </tr>
             <tr>
               <td class="tid">S-02</td>
-              <td class="threat">Network attacker spoofs ignore-listed source IP via X-Forwarded-For or proxy-supplied headers.</td>
+              <td class="threat"
+                >Network attacker spoofs ignore-listed source IP via X-Forwarded-For or
+                proxy-supplied headers.</td
+              >
               <td class="tb">TB-02</td>
               <td class="mitig">
-                fail2zig operates on the source IP the service records.
-                If the service trusts attacker-supplied proxy headers,
-                the attacker can appear as an ignore-listed IP —
-                operators must configure the service to record the real
-                source address. Filter design uses structural positions,
-                not header substrings.
+                fail2zig operates on the source IP the service records. If the service trusts
+                attacker-supplied proxy headers, the attacker can appear as an ignore-listed IP —
+                operators must configure the service to record the real source address. Filter
+                design uses structural positions, not header substrings.
               </td>
               <td><span class="tag">Accepted</span></td>
             </tr>
@@ -310,38 +298,42 @@ flowchart LR
           <tbody>
             <tr>
               <td class="tid">T-01</td>
-              <td class="threat">Attacker tampers with the fail2zig config file to disable jails.</td>
+              <td class="threat"
+                >Attacker tampers with the fail2zig config file to disable jails.</td
+              >
               <td class="tb">A.02</td>
               <td class="mitig">
-                Config is mode <code>0644</code>, owned <code>root:root</code>.
-                Daemon refuses to start if the config file is
-                world-writable. Validation runs before any firewall or
+                Config is mode <code>0644</code>, owned <code>root:root</code>. Daemon refuses to
+                start if the config file is world-writable. Validation runs before any firewall or
                 event-loop state change.
               </td>
               <td><span class="tag safe">Mitigated</span></td>
             </tr>
             <tr>
               <td class="tid">T-02</td>
-              <td class="threat">Attacker modifies the persisted state file to inject fake bans or erase real ones.</td>
+              <td class="threat"
+                >Attacker modifies the persisted state file to inject fake bans or erase real ones.</td
+              >
               <td class="tb">A.02</td>
               <td class="mitig">
-                State file is written atomically (write-temp + fsync +
-                rename), mode <code>0600</code>, owned <code>root:root</code>.
-                Every load verifies a CRC32 checksum; a failed check
-                discards the file and starts with empty state.
+                State file is written atomically (write-temp + fsync + rename), mode <code
+                  >0600</code
+                >, owned <code>root:root</code>. Every load verifies a CRC32 checksum; a failed
+                check discards the file and starts with empty state.
               </td>
               <td><span class="tag safe">Mitigated</span></td>
             </tr>
             <tr>
               <td class="tid">T-03</td>
-              <td class="threat">Compromised service writes crafted log content to influence fail2zig decisions.</td>
+              <td class="threat"
+                >Compromised service writes crafted log content to influence fail2zig decisions.</td
+              >
               <td class="tb">TB-02</td>
               <td class="mitig">
-                A compromised service can forge any log content. This
-                is covered by A.03 — fail2zig cannot distinguish a
-                forged log from a real one. Operators should treat a
-                compromised service as a precondition to investigate
-                host integrity, not a fail2zig failure mode.
+                A compromised service can forge any log content. This is covered by A.03 — fail2zig
+                cannot distinguish a forged log from a real one. Operators should treat a
+                compromised service as a precondition to investigate host integrity, not a fail2zig
+                failure mode.
               </td>
               <td><span class="tag">Accepted</span></td>
             </tr>
@@ -361,16 +353,16 @@ flowchart LR
           <tbody>
             <tr>
               <td class="tid">R-01</td>
-              <td class="threat">Operator cannot reconstruct which IP was banned, when, by which jail, for how long.</td>
+              <td class="threat"
+                >Operator cannot reconstruct which IP was banned, when, by which jail, for how long.</td
+              >
               <td class="tb">TB-05</td>
               <td class="mitig">
-                Every ban/unban fires a structured journald record with
-                timestamp, source IP, jail name, triggering log line
-                pointer, duration, and reason. Metrics include
-                per-jail ban counters. The IPC
-                <code>list</code> command surfaces current state. Phase
-                2 adds a cryptographically chained audit log for
-                tamper-evident retention.
+                Every ban/unban fires a structured journald record with timestamp, source IP, jail
+                name, triggering log line pointer, duration, and reason. Metrics include per-jail
+                ban counters. The IPC
+                <code>list</code> command surfaces current state. Phase 2 adds a cryptographically chained
+                audit log for tamper-evident retention.
               </td>
               <td><span class="tag accent">Partial &middot; ph.2</span></td>
             </tr>
@@ -390,38 +382,42 @@ flowchart LR
           <tbody>
             <tr>
               <td class="tid">I-01</td>
-              <td class="threat">Metrics endpoint leaks jail names, ban rates, and memory use to a remote scraper.</td>
+              <td class="threat"
+                >Metrics endpoint leaks jail names, ban rates, and memory use to a remote scraper.</td
+              >
               <td class="tb">TB-06</td>
               <td class="mitig">
                 <code>metrics_bind</code> defaults to
-                <code>127.0.0.1</code>. The endpoint is read-only. If
-                operators expose it remotely, they are responsible for
-                firewall restrictions in front of it.
+                <code>127.0.0.1</code>. The endpoint is read-only. If operators expose it remotely,
+                they are responsible for firewall restrictions in front of it.
               </td>
               <td><span class="tag safe">Mitigated</span></td>
             </tr>
             <tr>
               <td class="tid">I-02</td>
-              <td class="threat">Local unprivileged user enumerates banned IPs via the IPC socket.</td>
+              <td class="threat"
+                >Local unprivileged user enumerates banned IPs via the IPC socket.</td
+              >
               <td class="tb">TB-05</td>
               <td class="mitig">
                 Covered by S-01: only root or members of the
-                <code>fail2zig</code> group can connect. Membership in
-                that group is effectively read/write access to the
-                daemon and should be treated as a privileged role.
+                <code>fail2zig</code> group can connect. Membership in that group is effectively read/write
+                access to the daemon and should be treated as a privileged role.
               </td>
               <td><span class="tag safe">Mitigated</span></td>
             </tr>
             <tr>
               <td class="tid">I-03</td>
-              <td class="threat">Diagnostic logs include banned IPs or log excerpts visible to non-root log readers.</td>
+              <td class="threat"
+                >Diagnostic logs include banned IPs or log excerpts visible to non-root log readers.</td
+              >
               <td class="tb">TB-03</td>
               <td class="mitig">
-                Operational logs go to journald under the daemon's
-                unit. Access follows journald's access model (per-user
-                journal, systemd-journal group). fail2zig redacts log
-                content in <code>info</code>-level output; full
-                per-line decisions are only logged at <code>debug</code>.
+                Operational logs go to journald under the daemon's unit. Access follows journald's
+                access model (per-user journal, systemd-journal group). fail2zig redacts log content
+                in <code>info</code>-level output; full per-line decisions are only logged at <code
+                  >debug</code
+                >.
               </td>
               <td><span class="tag safe">Mitigated</span></td>
             </tr>
@@ -444,25 +440,24 @@ flowchart LR
               <td class="threat">Attacker floods logs to exhaust daemon memory.</td>
               <td class="tb">TB-03</td>
               <td class="mitig">
-                Fixed-size arena enforced at allocator level. Per-IP
-                state table is pre-allocated; eviction policy is
-                operator-selected (evict-oldest / deny-new /
-                log-and-drop). The daemon cannot exceed
-                <code>memory_ceiling_mb</code> regardless of input
-                volume.
+                Fixed-size arena enforced at allocator level. Per-IP state table is pre-allocated;
+                eviction policy is operator-selected (evict-oldest / deny-new / log-and-drop). The
+                daemon cannot exceed
+                <code>memory_ceiling_mb</code> regardless of input volume.
               </td>
               <td><span class="tag safe">Mitigated</span></td>
             </tr>
             <tr>
               <td class="tid">D-02</td>
-              <td class="threat">Attacker triggers pathological parser behavior via crafted log lines.</td>
+              <td class="threat"
+                >Attacker triggers pathological parser behavior via crafted log lines.</td
+              >
               <td class="tb">TB-03</td>
               <td class="mitig">
-                Parsers are comptime-generated specialized functions —
-                no runtime regex engine with backtracking. Line-length
-                hard cap (4&nbsp;KB default). Each parse step runs in
-                bounded time. Continuous fuzz coverage (AFL++,
-                libFuzzer) against a 4.1M-line corpus.
+                Parsers are comptime-generated specialized functions — no runtime regex engine with
+                backtracking. Line-length hard cap (4&nbsp;KB default). Each parse step runs in
+                bounded time. Continuous fuzz coverage (AFL++, libFuzzer) against a 4.1M-line
+                corpus.
               </td>
               <td><span class="tag safe">Mitigated</span></td>
             </tr>
@@ -471,34 +466,36 @@ flowchart LR
               <td class="threat">IPC socket flooding from an authorized local client.</td>
               <td class="tb">TB-05</td>
               <td class="mitig">
-                v0.1.0 accepts connections with a bounded backlog but
-                does not per-client rate-limit. A malicious authorized
-                client can degrade control-plane responsiveness but
-                cannot affect the log-parse or ban-enforcement path.
-                Per-client rate-limiting is scheduled for Phase 2.
+                v0.1.0 accepts connections with a bounded backlog but does not per-client
+                rate-limit. A malicious authorized client can degrade control-plane responsiveness
+                but cannot affect the log-parse or ban-enforcement path. Per-client rate-limiting is
+                scheduled for Phase 2.
               </td>
               <td><span class="tag accent">Partial &middot; ph.2</span></td>
             </tr>
             <tr>
               <td class="tid">D-04</td>
-              <td class="threat">Metrics endpoint slowloris / malformed HTTP consumes the HTTP listener.</td>
+              <td class="threat"
+                >Metrics endpoint slowloris / malformed HTTP consumes the HTTP listener.</td
+              >
               <td class="tb">TB-06</td>
               <td class="mitig">
-                Request timeout is 5 s per read; header size cap is
-                8&nbsp;KB; concurrent request cap is 16. The listener
-                lives on its own bounded task and cannot block the
-                event loop.
+                Request timeout is 5 s per read; header size cap is 8&nbsp;KB; concurrent request
+                cap is 16. The listener lives on its own bounded task and cannot block the event
+                loop.
               </td>
               <td><span class="tag safe">Mitigated</span></td>
             </tr>
             <tr>
               <td class="tid">D-05</td>
-              <td class="threat">nftables scaffold installation fails at startup; daemon pretends to ban but firewall is untouched.</td>
+              <td class="threat"
+                >nftables scaffold installation fails at startup; daemon pretends to ban but
+                firewall is untouched.</td
+              >
               <td class="tb">TB-04</td>
               <td class="mitig">
-                Fail-closed: if nftables install fails, backend
-                selection falls through (iptables &rarr; ipset &rarr;
-                log-only), and if none succeed the daemon exits with a
+                Fail-closed: if nftables install fails, backend selection falls through (iptables
+                &rarr; ipset &rarr; log-only), and if none succeed the daemon exits with a
                 diagnostic rather than run with a silent-drop ban path.
               </td>
               <td><span class="tag safe">Mitigated</span></td>
@@ -523,53 +520,52 @@ flowchart LR
               <td class="tb">TB-03</td>
               <td class="mitig">
                 Zig's bounds-checked build mode is retained for
-                <code>ReleaseSafe</code> on every attacker-reachable
-                path. No runtime regex; no dynamic code; no
-                deserialisation of untrusted binary. Continuous
-                fuzzing. Seccomp-BPF (Phase 2) restricts the daemon
-                syscall surface to its necessary set.
+                <code>ReleaseSafe</code> on every attacker-reachable path. No runtime regex; no dynamic
+                code; no deserialisation of untrusted binary. Continuous fuzzing. Seccomp-BPF (Phase 2)
+                restricts the daemon syscall surface to its necessary set.
               </td>
               <td><span class="tag accent">Partial &middot; ph.2</span></td>
             </tr>
             <tr>
               <td class="tid">E-02</td>
-              <td class="threat">Log injection causes ban of an arbitrary legitimate IP (weaponised DoS via fail2zig).</td>
+              <td class="threat"
+                >Log injection causes ban of an arbitrary legitimate IP (weaponised DoS via
+                fail2zig).</td
+              >
               <td class="tb">TB-02</td>
               <td class="mitig">
-                Filters match on structural positions in well-known log
-                formats — the "source IP" field, not arbitrary
-                substrings. Byte-class restrictions prevent crafted
-                payloads from spanning fields. <code>ignoreip</code>
-                CIDRs always win. Services that echo attacker-controlled
-                text into log fields used as source-IP anchors are a
-                service-configuration bug, not a fail2zig bug.
+                Filters match on structural positions in well-known log formats — the "source IP"
+                field, not arbitrary substrings. Byte-class restrictions prevent crafted payloads
+                from spanning fields. <code>ignoreip</code>
+                CIDRs always win. Services that echo attacker-controlled text into log fields used as
+                source-IP anchors are a service-configuration bug, not a fail2zig bug.
               </td>
               <td><span class="tag safe">Mitigated</span></td>
             </tr>
             <tr>
               <td class="tid">E-03</td>
-              <td class="threat">Unauthorized local user forces unban of an attacker IP via IPC.</td>
+              <td class="threat">Unauthorized local user forces unban of an attacker IP via IPC.</td
+              >
               <td class="tb">TB-05</td>
               <td class="mitig">
                 IPC requires <code>SO_PEERCRED</code> root or
-                <code>fail2zig</code>-group membership — the same
-                authorization required to ban. Members of the
-                <code>fail2zig</code> group are trusted administrators
-                by definition.
+                <code>fail2zig</code>-group membership — the same authorization required to ban.
+                Members of the
+                <code>fail2zig</code> group are trusted administrators by definition.
               </td>
               <td><span class="tag safe">Mitigated</span></td>
             </tr>
             <tr>
               <td class="tid">E-04</td>
-              <td class="threat">Supply-chain compromise injects hostile code into the fail2zig binary.</td>
+              <td class="threat"
+                >Supply-chain compromise injects hostile code into the fail2zig binary.</td
+              >
               <td class="tb">A.02</td>
               <td class="mitig">
-                Zero runtime dependencies in the critical path.
-                Reproducible builds: same source + same Zig version +
-                same target triple = byte-identical binary. Releases
-                are signed with minisign; cosign + SBOM publish
-                alongside each release. Operators can rebuild from
-                source and compare checksums.
+                Zero runtime dependencies in the critical path. Reproducible builds: same source +
+                same Zig version + same target triple = byte-identical binary. Releases are signed
+                with minisign; cosign + SBOM publish alongside each release. Operators can rebuild
+                from source and compare checksums.
               </td>
               <td><span class="tag safe">Mitigated</span></td>
             </tr>
@@ -586,59 +582,49 @@ flowchart LR
         <div>
           <h2>What this model explicitly does not cover.</h2>
           <p class="tm-sublede">
-            Scope discipline is part of a threat model's integrity. The
-            items below are real threats; they are just not threats
-            fail2zig is architecturally positioned to address. Treat
-            them as responsibilities that live elsewhere in the stack.
+            Scope discipline is part of a threat model's integrity. The items below are real
+            threats; they are just not threats fail2zig is architecturally positioned to address.
+            Treat them as responsibilities that live elsewhere in the stack.
           </p>
         </div>
       </div>
 
       <ul class="oos">
         <li>
-          <strong>Kernel-level exploits.</strong> fail2zig trusts the
-          Linux kernel's netfilter, inotify, and epoll ABIs. A
-          privilege-escalation bug inside the kernel is outside fail2zig's
-          addressable surface — report those to the kernel security team.
+          <strong>Kernel-level exploits.</strong> fail2zig trusts the Linux kernel's netfilter, inotify,
+          and epoll ABIs. A privilege-escalation bug inside the kernel is outside fail2zig's addressable
+          surface — report those to the kernel security team.
         </li>
         <li>
-          <strong>Physical access to the host.</strong> An attacker with
-          physical access to the server can read or modify the binary,
-          the config, and the state file regardless of fail2zig's
-          in-process defenses.
+          <strong>Physical access to the host.</strong> An attacker with physical access to the server
+          can read or modify the binary, the config, and the state file regardless of fail2zig's in-process
+          defenses.
         </li>
         <li>
           <strong>Compromise of the protected service itself.</strong>
-          If <code>sshd</code> is compromised, fail2zig cannot undo
-          that compromise — it can only act on the logs
-          <code>sshd</code> produces. Service hardening is upstream
-          of fail2zig.
+          If <code>sshd</code> is compromised, fail2zig cannot undo that compromise — it can only act
+          on the logs
+          <code>sshd</code> produces. Service hardening is upstream of fail2zig.
         </li>
         <li>
-          <strong>Layer-3/4 volumetric attacks.</strong> SYN floods,
-          amplification attacks, and packet-rate exhaustion require
-          network-layer defenses (kernel-level filters, upstream
-          providers, anycast). fail2zig's concern starts at the
-          application log, not the packet queue.
+          <strong>Layer-3/4 volumetric attacks.</strong> SYN floods, amplification attacks, and packet-rate
+          exhaustion require network-layer defenses (kernel-level filters, upstream providers, anycast).
+          fail2zig's concern starts at the application log, not the packet queue.
         </li>
         <li>
-          <strong>WAF-scope concerns.</strong> Parameter tampering,
-          SQL injection in request bodies, CSRF, XSS — these require
-          request-body inspection which fail2zig does not perform.
+          <strong>WAF-scope concerns.</strong> Parameter tampering, SQL injection in request bodies, CSRF,
+          XSS — these require request-body inspection which fail2zig does not perform.
         </li>
         <li>
-          <strong>Side-channel attacks on the host.</strong> Timing,
-          cache, and microarchitectural side channels against the
-          daemon are not in the threat model. The sensitive data the
-          daemon holds (banned-IP sets, ban counts) is either already
-          observable via firewall enumeration or operationally
+          <strong>Side-channel attacks on the host.</strong> Timing, cache, and microarchitectural side
+          channels against the daemon are not in the threat model. The sensitive data the daemon holds
+          (banned-IP sets, ban counts) is either already observable via firewall enumeration or operationally
           non-sensitive.
         </li>
         <li>
-          <strong>Toolchain compromise.</strong> A compromised Zig
-          compiler or musl libc can inject code into any binary built
-          with them, fail2zig included. Reproducible builds from a
-          trusted toolchain are an operator responsibility.
+          <strong>Toolchain compromise.</strong> A compromised Zig compiler or musl libc can inject code
+          into any binary built with them, fail2zig included. Reproducible builds from a trusted toolchain
+          are an operator responsibility.
         </li>
       </ul>
     </div>
@@ -657,51 +643,45 @@ flowchart LR
         <div class="fc">
           <h3>nftables install fails at startup</h3>
           <p>
-            Backend selection falls through to iptables &rarr; ipset
-            &rarr; log-only in that order. If none succeed and
-            log-only is not configured, the daemon exits with a
-            diagnostic. It never runs pretending to ban.
+            Backend selection falls through to iptables &rarr; ipset &rarr; log-only in that order.
+            If none succeed and log-only is not configured, the daemon exits with a diagnostic. It
+            never runs pretending to ban.
           </p>
         </div>
         <div class="fc">
           <h3>State file is corrupted</h3>
           <p>
-            CRC32 check fails; state file is discarded; daemon starts
-            with empty state. A warning is logged. Active bans are
-            reconciled against the firewall backend as new events
-            arrive.
+            CRC32 check fails; state file is discarded; daemon starts with empty state. A warning is
+            logged. Active bans are reconciled against the firewall backend as new events arrive.
           </p>
         </div>
         <div class="fc">
           <h3>Config file is world-writable</h3>
           <p>
-            Daemon refuses to start. Emits a clear error explaining
-            why. No partial load, no fallback to defaults.
+            Daemon refuses to start. Emits a clear error explaining why. No partial load, no
+            fallback to defaults.
           </p>
         </div>
         <div class="fc">
           <h3>Memory ceiling reached</h3>
           <p>
-            Eviction policy fires per operator config. The daemon does
-            not allocate past the ceiling; it does not resize; the OOM
-            reaper does not get a chance to kill it.
+            Eviction policy fires per operator config. The daemon does not allocate past the
+            ceiling; it does not resize; the OOM reaper does not get a chance to kill it.
           </p>
         </div>
         <div class="fc">
           <h3>Unrecognized configuration key</h3>
           <p>
             Rejected at parse time with line + column. A typo in
-            <code>bantime</code> is a startup failure, not a silent
-            default-to-zero.
+            <code>bantime</code> is a startup failure, not a silent default-to-zero.
           </p>
         </div>
         <div class="fc">
           <h3>netlink ACK returns an error</h3>
           <p>
-            Errors are surfaced as typed Zig errors with specific
-            errnos. The operation is logged as failed; the daemon does
-            not lose track of state or silently proceed as if the
-            operation succeeded.
+            Errors are surfaced as typed Zig errors with specific errnos. The operation is logged as
+            failed; the daemon does not lose track of state or silently proceed as if the operation
+            succeeded.
           </p>
         </div>
       </div>
@@ -723,9 +703,8 @@ flowchart LR
           <div class="atitle">
             Internal parser fuzz campaign &middot; 72h &middot; AFL++
             <p>
-              4.1M-line corpus across sshd, nginx, postfix, dovecot,
-              proftpd filters. Zero crashes, zero hangs, zero
-              out-of-bounds reads.
+              4.1M-line corpus across sshd, nginx, postfix, dovecot, proftpd filters. Zero crashes,
+              zero hangs, zero out-of-bounds reads.
             </p>
           </div>
           <div class="astatus ok">Passed</div>
@@ -735,9 +714,8 @@ flowchart LR
           <div class="atitle">
             Reproducible-build verification
             <p>
-              Same source + same Zig version + same target triple
-              produces a byte-identical binary across Debian 12,
-              Alpine 3.19, and NixOS 24.05. SBOM published.
+              Same source + same Zig version + same target triple produces a byte-identical binary
+              across Debian 12, Alpine 3.19, and NixOS 24.05. SBOM published.
             </p>
           </div>
           <div class="astatus ok">Passed</div>
@@ -747,8 +725,8 @@ flowchart LR
           <div class="atitle">
             External security audit &middot; pre-1.0 &middot; sponsor TBD
             <p>
-              Scope: parser engine, allocator boundaries, privilege
-              model, firewall backends, IPC authorization.
+              Scope: parser engine, allocator boundaries, privilege model, firewall backends, IPC
+              authorization.
             </p>
           </div>
           <div class="astatus pending">Planned</div>
@@ -774,10 +752,9 @@ flowchart LR
         <div class="eyebrow"><span class="dot"></span>Disclosure</div>
         <h2>Reporting a vulnerability.</h2>
         <p>
-          Vulnerabilities are reported via GitHub's private security
-          advisory form. Do not open a public issue for a security
-          vulnerability — private advisories keep the fix window
-          closed until a patch is ready.
+          Vulnerabilities are reported via GitHub's private security advisory form. Do not open a
+          public issue for a security vulnerability — private advisories keep the fix window closed
+          until a patch is ready.
         </p>
         <div class="tm-actions">
           <a
@@ -796,10 +773,20 @@ flowchart LR
         <h3>What to expect</h3>
         <ul>
           <li><strong>Acknowledgement</strong> within 48 hours.</li>
-          <li><strong>Initial assessment</strong> (severity, affected versions, fix path) — best-effort within 14 days.</li>
-          <li><strong>Fix before disclosure</strong> for high-severity issues, or a coordinated 90-day disclosure window.</li>
-          <li><strong>Credit</strong> in the advisory and release notes, unless you request otherwise.</li>
-          <li><strong>No bug bounty.</strong> No legal action against good-faith reporters within scope.</li>
+          <li>
+            <strong>Initial assessment</strong> (severity, affected versions, fix path) — best-effort
+            within 14 days.
+          </li>
+          <li>
+            <strong>Fix before disclosure</strong> for high-severity issues, or a coordinated 90-day disclosure
+            window.
+          </li>
+          <li>
+            <strong>Credit</strong> in the advisory and release notes, unless you request otherwise.
+          </li>
+          <li>
+            <strong>No bug bounty.</strong> No legal action against good-faith reporters within scope.
+          </li>
         </ul>
       </div>
     </div>

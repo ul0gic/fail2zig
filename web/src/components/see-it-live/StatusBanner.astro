@@ -95,7 +95,7 @@
       'status-dot-connecting',
       'status-dot-connected',
       'status-dot-disconnected',
-      'status-dot-replay',
+      'status-dot-replay'
     );
     switch (state.status) {
       case 'connecting':
@@ -121,7 +121,8 @@
         break;
       case 'replay':
         dot.classList.add('status-dot-replay');
-        text.textContent = '[ REPLAY MODE — live feed unavailable, showing a recent blessed snapshot ]';
+        text.textContent =
+          '[ REPLAY MODE — live feed unavailable, showing a recent blessed snapshot ]';
         break;
     }
   };
@@ -149,7 +150,7 @@
         const s = (window as StreamWindow).fail2zigStream;
         if (s !== undefined) wire(s);
       },
-      { once: true },
+      { once: true }
     );
   }
 </script>

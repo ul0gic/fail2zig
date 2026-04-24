@@ -2,6 +2,34 @@
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import PipelineDiagram from '@/components/PipelineDiagram.astro';
 
+// Home-page-only structured data: tells Google + LLM crawlers fail2zig
+// is a free, open-source SecurityApplication for Linux. Drives rich
+// snippets (license, category, OS, download) in Google SERPs and gives
+// LLMs a machine-readable profile of the product.
+const softwareApplication = {
+  '@context': 'https://schema.org',
+  '@type': 'SoftwareApplication',
+  name: 'fail2zig',
+  description:
+    'A static musl binary that replaces fail2ban. Zero runtime dependencies, kernel-native bans via netlink, drop-in jail.conf compatibility.',
+  url: 'https://fail2zig.com/',
+  applicationCategory: 'SecurityApplication',
+  applicationSubCategory: 'Intrusion Prevention System',
+  operatingSystem: 'Linux',
+  softwareVersion: '0.1.0',
+  releaseNotes: 'https://github.com/ul0gic/fail2zig/releases/tag/v0.1.0',
+  downloadUrl: 'https://github.com/ul0gic/fail2zig/releases/latest',
+  codeRepository: 'https://github.com/ul0gic/fail2zig',
+  programmingLanguage: 'Zig',
+  license: 'https://www.gnu.org/licenses/agpl-3.0.html',
+  offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
+  author: {
+    '@type': 'Person',
+    name: 'ul0gic',
+    url: 'https://github.com/ul0gic',
+  },
+};
+
 const adds: readonly { title: string; body: string; meta: string }[] = [
   {
     title: 'Smaller attack surface',
@@ -36,7 +64,11 @@ const adds: readonly { title: string; body: string; meta: string }[] = [
 ];
 ---
 
-<BaseLayout title="fail2zig — intrusion prevention, rebuilt" activeNav="/">
+<BaseLayout
+  title="fail2zig — intrusion prevention, rebuilt"
+  activeNav="/"
+  jsonLd={[softwareApplication]}
+>
   <header class="hero">
     <div class="wrap">
       <div class="hero-grid">
@@ -46,11 +78,13 @@ const adds: readonly { title: string; body: string; meta: string }[] = [
             <span class="accent">Zero dependencies.</span><br />
             Real intrusion prevention.
           </h1>
-          <p class="hero-lede">
-            Predictable behavior under hostile input.
-          </p>
+          <p class="hero-lede">Predictable behavior under hostile input.</p>
           <div class="hero-cta">
-            <a href="https://github.com/ul0gic/fail2zig" class="btn primary" rel="noopener noreferrer">$ Install fail2zig &nbsp;&rarr;</a>
+            <a
+              href="https://github.com/ul0gic/fail2zig"
+              class="btn primary"
+              rel="noopener noreferrer">$ Install fail2zig &nbsp;&rarr;</a
+            >
             <a href="/threat-model" class="btn ghost">Read the threat model</a>
           </div>
           <div class="hero-metrics">
@@ -96,10 +130,12 @@ const adds: readonly { title: string; body: string; meta: string }[] = [
         {
           adds.map((item, i) => (
             <div class="adds-cell">
-              <div class="adds-index"><span class="mark">§</span> {String(i + 1).padStart(2, '0')}</div>
+              <div class="adds-index">
+                <span class="mark">§</span> {String(i + 1).padStart(2, '0')}
+              </div>
               <h3 class="adds-title">{item.title}</h3>
               <p class="adds-body">{item.body}</p>
-              <div class="adds-meta" set:html={item.meta}></div>
+              <div class="adds-meta" set:html={item.meta} />
             </div>
           ))
         }
@@ -115,8 +151,8 @@ const adds: readonly { title: string; body: string; meta: string }[] = [
         <div>
           <h2>Measured, not marketing.</h2>
           <p class="lede" style="margin-top:16px">
-            Every figure measured on real hardware under real load. Not synthetic, not modeled.
-            The benchmark suite ships with the source and is fully reproducible.
+            Every figure measured on real hardware under real load. Not synthetic, not modeled. The
+            benchmark suite ships with the source and is fully reproducible.
           </p>
         </div>
       </div>
@@ -474,8 +510,8 @@ fail2zig --import-config /etc/fail2ban/"
           <div>
             <h3>Is this a SIEM or a WAF?</h3>
             <p>
-              Neither. It reads logs, acts on them, and gets out of the way. It does not
-              aggregate, correlate, or inspect HTTP bodies.
+              Neither. It reads logs, acts on them, and gets out of the way. It does not aggregate,
+              correlate, or inspect HTTP bodies.
             </p>
           </div>
         </div>
@@ -574,10 +610,14 @@ fail2zig --import-config /etc/fail2ban/"
     border: 1px solid var(--line-strong);
   }
   @media (max-width: 960px) {
-    .adds-matrix { grid-template-columns: repeat(2, 1fr); }
+    .adds-matrix {
+      grid-template-columns: repeat(2, 1fr);
+    }
   }
   @media (max-width: 640px) {
-    .adds-matrix { grid-template-columns: 1fr; }
+    .adds-matrix {
+      grid-template-columns: 1fr;
+    }
   }
   .adds-cell {
     background: var(--bg);
@@ -818,7 +858,7 @@ fail2zig --import-config /etc/fail2ban/"
     position: relative;
   }
   .cmp-table .cmp-row-us .cmp-leader::before {
-    content: "";
+    content: '';
     position: absolute;
     left: 0;
     top: 0;
@@ -900,7 +940,9 @@ fail2zig --import-config /etc/fail2ban/"
     font-size: 10px;
     padding: 2px 8px;
     cursor: pointer;
-    transition: color .15s, border-color .15s;
+    transition:
+      color 0.15s,
+      border-color 0.15s;
   }
   .copy-btn:hover {
     color: var(--accent);
@@ -990,6 +1032,5 @@ fail2zig --import-config /etc/fail2ban/"
         }
       });
     });
-
   });
 </script>

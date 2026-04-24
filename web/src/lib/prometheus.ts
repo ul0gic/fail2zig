@@ -61,7 +61,10 @@ export function parsePrometheus(text: string): PrometheusSample {
     // just skip anything with labels.
     if (nameWithLabels.includes('{')) continue;
 
-    const valueStr = line.slice(spaceIdx + 1).trim().split(/\s+/)[0];
+    const valueStr = line
+      .slice(spaceIdx + 1)
+      .trim()
+      .split(/\s+/)[0];
     if (valueStr === undefined) continue;
     const value = Number(valueStr);
     if (!Number.isFinite(value)) continue;

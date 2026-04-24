@@ -15,11 +15,11 @@ import MetricsPane from '@/components/see-it-live/MetricsPane.astro';
     <header class="live-intro">
       <h1>Demo</h1>
       <p class="live-lede">
-        A small Linux VM runs <code>sshd</code> and <code>nginx</code> on the open
-        internet — no valid credentials, no dynamic content, just attack bait.
-        fail2zig tails their logs and installs real kernel-level <code>nftables</code>
-        DROP rules against real attackers. Everything below is live — no synthesised
-        events, no dashboards dressed up as daemons, no demo button.
+        A small Linux VM runs <code>sshd</code> and <code>nginx</code> on the open internet — no valid
+        credentials, no dynamic content, just attack bait. fail2zig tails their logs and installs real
+        kernel-level <code>nftables</code>
+        DROP rules against real attackers. Everything below is live — no synthesised events, no dashboards
+        dressed up as daemons, no demo button.
       </p>
     </header>
 
@@ -34,20 +34,17 @@ import MetricsPane from '@/components/see-it-live/MetricsPane.astro';
     <footer class="live-footer">
       <h2 id="about-the-ips">About the IPs</h2>
       <p>
-        Every IP on this page is an IP address that attacked this server.
-        When the status banner reads <em>connected</em>, the feed is live —
-        events arrive the moment fail2zig parses and bans them. If the banner
-        reads <em>replay mode</em> or <em>live feed unavailable</em>, the
-        tunnel is temporarily unreachable and events may be stale or absent.
-        Nothing on this page is simulated traffic.
+        Every IP on this page is an IP address that attacked this server. When the status banner
+        reads <em>connected</em>, the feed is live — events arrive the moment fail2zig parses and
+        bans them. If the banner reads <em>replay mode</em> or <em>live feed unavailable</em>, the
+        tunnel is temporarily unreachable and events may be stale or absent. Nothing on this page is
+        simulated traffic.
       </p>
       <p>
-        The IPs are published as threat intelligence — the same class of data
-        AbuseIPDB, Shodan, GreyNoise, and the broader IoC community share
-        openly. No visitor data is ever collected or displayed on this page.
-        The server defending itself here is a disposable honeypot, not shared
-        infrastructure; compromise attempts don't affect any other fail2zig
-        user.
+        The IPs are published as threat intelligence — the same class of data AbuseIPDB, Shodan,
+        GreyNoise, and the broader IoC community share openly. No visitor data is ever collected or
+        displayed on this page. The server defending itself here is a disposable honeypot, not
+        shared infrastructure; compromise attempts don't affect any other fail2zig user.
       </p>
     </footer>
   </div>

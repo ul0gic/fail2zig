@@ -11,14 +11,7 @@
   </div>
   <svg class="diagram-svg" viewBox="0 0 1100 360" preserveAspectRatio="xMidYMid meet">
     <defs>
-      <marker
-        id="pd-arrowhead"
-        markerWidth="10"
-        markerHeight="10"
-        refX="9"
-        refY="5"
-        orient="auto"
-      >
+      <marker id="pd-arrowhead" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto">
         <path d="M0,0 L10,5 L0,10 z" fill="var(--fg-mute)"></path>
       </marker>
       <linearGradient id="pd-pulseGrad" x1="0" y1="0" x2="1" y2="0">
@@ -29,71 +22,258 @@
     </defs>
 
     <!-- Stage 01: SOURCE -->
-    <text x="30" y="48" fill="var(--fg-mute)" font-family="var(--mono)" font-size="12" letter-spacing="1">01 &middot; SOURCE</text>
+    <text
+      x="30"
+      y="48"
+      fill="var(--fg-mute)"
+      font-family="var(--mono)"
+      font-size="12"
+      letter-spacing="1">01 &middot; SOURCE</text
+    >
     <g class="node">
-      <rect x="20" y="60" width="240" height="110" fill="var(--diagram-surface)" stroke="var(--line-strong)"></rect>
-      <text x="34" y="86" fill="var(--fg)" font-family="var(--mono)" font-size="14" font-weight="500">log sources</text>
-      <text x="34" y="108" fill="var(--fg-dim)" font-family="var(--mono)" font-size="13">/var/log/auth.log</text>
-      <text x="34" y="126" fill="var(--fg-dim)" font-family="var(--mono)" font-size="13">journald &middot; sshd &middot; nginx</text>
-      <text x="34" y="150" fill="var(--fg-mute)" font-family="var(--mono)" font-size="12">inotify &middot; io_uring &middot; kqueue</text>
+      <rect
+        x="20"
+        y="60"
+        width="240"
+        height="110"
+        fill="var(--diagram-surface)"
+        stroke="var(--line-strong)"></rect>
+      <text
+        x="34"
+        y="86"
+        fill="var(--fg)"
+        font-family="var(--mono)"
+        font-size="14"
+        font-weight="500">log sources</text
+      >
+      <text x="34" y="108" fill="var(--fg-dim)" font-family="var(--mono)" font-size="13"
+        >/var/log/auth.log</text
+      >
+      <text x="34" y="126" fill="var(--fg-dim)" font-family="var(--mono)" font-size="13"
+        >journald &middot; sshd &middot; nginx</text
+      >
+      <text x="34" y="150" fill="var(--fg-mute)" font-family="var(--mono)" font-size="12"
+        >inotify &middot; io_uring &middot; kqueue</text
+      >
     </g>
 
     <!-- Arrow source -> parse -->
-    <line x1="262" y1="115" x2="290" y2="115" stroke="var(--line-strong)" stroke-width="1" marker-end="url(#pd-arrowhead)"></line>
-    <line x1="262" y1="115" x2="290" y2="115" stroke="url(#pd-pulseGrad)" stroke-width="2" stroke-dasharray="28 600"></line>
+    <line
+      x1="262"
+      y1="115"
+      x2="290"
+      y2="115"
+      stroke="var(--line-strong)"
+      stroke-width="1"
+      marker-end="url(#pd-arrowhead)"></line>
+    <line
+      x1="262"
+      y1="115"
+      x2="290"
+      y2="115"
+      stroke="url(#pd-pulseGrad)"
+      stroke-width="2"
+      stroke-dasharray="28 600"></line>
 
     <!-- Stage 02: PARSE -->
-    <text x="300" y="48" fill="var(--fg-mute)" font-family="var(--mono)" font-size="12" letter-spacing="1">02 &middot; PARSE</text>
+    <text
+      x="300"
+      y="48"
+      fill="var(--fg-mute)"
+      font-family="var(--mono)"
+      font-size="12"
+      letter-spacing="1">02 &middot; PARSE</text
+    >
     <g class="node">
-      <rect x="290" y="60" width="240" height="110" fill="var(--diagram-surface)" stroke="var(--line-strong)"></rect>
-      <text x="304" y="86" fill="var(--fg)" font-family="var(--mono)" font-size="14" font-weight="500">parser engine</text>
-      <text x="304" y="108" fill="var(--fg-dim)" font-family="var(--mono)" font-size="13">comptime filters &middot; SIMD</text>
-      <text x="304" y="126" fill="var(--fg-dim)" font-family="var(--mono)" font-size="13">zero-copy &middot; bounds-checked</text>
-      <text x="304" y="150" fill="var(--fg-mute)" font-family="var(--mono)" font-size="12">no regex engine in-process</text>
+      <rect
+        x="290"
+        y="60"
+        width="240"
+        height="110"
+        fill="var(--diagram-surface)"
+        stroke="var(--line-strong)"></rect>
+      <text
+        x="304"
+        y="86"
+        fill="var(--fg)"
+        font-family="var(--mono)"
+        font-size="14"
+        font-weight="500">parser engine</text
+      >
+      <text x="304" y="108" fill="var(--fg-dim)" font-family="var(--mono)" font-size="13"
+        >comptime filters &middot; SIMD</text
+      >
+      <text x="304" y="126" fill="var(--fg-dim)" font-family="var(--mono)" font-size="13"
+        >zero-copy &middot; bounds-checked</text
+      >
+      <text x="304" y="150" fill="var(--fg-mute)" font-family="var(--mono)" font-size="12"
+        >no regex engine in-process</text
+      >
     </g>
 
     <!-- Arrow parse -> state -->
-    <line x1="532" y1="115" x2="560" y2="115" stroke="var(--line-strong)" stroke-width="1" marker-end="url(#pd-arrowhead)"></line>
-    <line x1="532" y1="115" x2="560" y2="115" stroke="url(#pd-pulseGrad)" stroke-width="2" stroke-dasharray="28 600"></line>
+    <line
+      x1="532"
+      y1="115"
+      x2="560"
+      y2="115"
+      stroke="var(--line-strong)"
+      stroke-width="1"
+      marker-end="url(#pd-arrowhead)"></line>
+    <line
+      x1="532"
+      y1="115"
+      x2="560"
+      y2="115"
+      stroke="url(#pd-pulseGrad)"
+      stroke-width="2"
+      stroke-dasharray="28 600"></line>
 
     <!-- Stage 03: STATE -->
-    <text x="570" y="48" fill="var(--fg-mute)" font-family="var(--mono)" font-size="12" letter-spacing="1">03 &middot; STATE</text>
+    <text
+      x="570"
+      y="48"
+      fill="var(--fg-mute)"
+      font-family="var(--mono)"
+      font-size="12"
+      letter-spacing="1">03 &middot; STATE</text
+    >
     <g class="node">
-      <rect x="560" y="60" width="240" height="110" fill="var(--diagram-surface)" stroke="var(--line-strong)"></rect>
-      <text x="574" y="86" fill="var(--fg)" font-family="var(--mono)" font-size="14" font-weight="500">state tracker</text>
-      <text x="574" y="108" fill="var(--fg-dim)" font-family="var(--mono)" font-size="13">fixed-arena hash table</text>
-      <text x="574" y="126" fill="var(--fg-dim)" font-family="var(--mono)" font-size="13">pre-allocated &middot; evict-oldest</text>
-      <text x="574" y="150" fill="var(--fg-mute)" font-family="var(--mono)" font-size="12">hard 64MB ceiling</text>
+      <rect
+        x="560"
+        y="60"
+        width="240"
+        height="110"
+        fill="var(--diagram-surface)"
+        stroke="var(--line-strong)"></rect>
+      <text
+        x="574"
+        y="86"
+        fill="var(--fg)"
+        font-family="var(--mono)"
+        font-size="14"
+        font-weight="500">state tracker</text
+      >
+      <text x="574" y="108" fill="var(--fg-dim)" font-family="var(--mono)" font-size="13"
+        >fixed-arena hash table</text
+      >
+      <text x="574" y="126" fill="var(--fg-dim)" font-family="var(--mono)" font-size="13"
+        >pre-allocated &middot; evict-oldest</text
+      >
+      <text x="574" y="150" fill="var(--fg-mute)" font-family="var(--mono)" font-size="12"
+        >hard 64MB ceiling</text
+      >
     </g>
 
     <!-- Arrow state -> ban -->
-    <line x1="802" y1="115" x2="830" y2="115" stroke="var(--line-strong)" stroke-width="1" marker-end="url(#pd-arrowhead)"></line>
-    <line x1="802" y1="115" x2="830" y2="115" stroke="url(#pd-pulseGrad)" stroke-width="2" stroke-dasharray="28 600"></line>
+    <line
+      x1="802"
+      y1="115"
+      x2="830"
+      y2="115"
+      stroke="var(--line-strong)"
+      stroke-width="1"
+      marker-end="url(#pd-arrowhead)"></line>
+    <line
+      x1="802"
+      y1="115"
+      x2="830"
+      y2="115"
+      stroke="url(#pd-pulseGrad)"
+      stroke-width="2"
+      stroke-dasharray="28 600"></line>
 
     <!-- Stage 04: BAN -->
-    <text x="840" y="48" fill="var(--fg-mute)" font-family="var(--mono)" font-size="12" letter-spacing="1">04 &middot; BAN</text>
+    <text
+      x="840"
+      y="48"
+      fill="var(--fg-mute)"
+      font-family="var(--mono)"
+      font-size="12"
+      letter-spacing="1">04 &middot; BAN</text
+    >
     <g class="node">
-      <rect x="830" y="60" width="240" height="110" fill="var(--diagram-surface)" stroke="var(--line-strong)"></rect>
-      <text x="844" y="86" fill="var(--fg)" font-family="var(--mono)" font-size="14" font-weight="500">ban executor</text>
-      <text x="844" y="108" fill="var(--fg-dim)" font-family="var(--mono)" font-size="13">nftables &middot; ipset &middot; iptables</text>
-      <text x="844" y="126" fill="var(--fg-dim)" font-family="var(--mono)" font-size="13">eBPF/XDP (phase 2)</text>
-      <text x="844" y="150" fill="var(--accent)" font-family="var(--mono)" font-size="12">DROP &middot; at NIC driver</text>
+      <rect
+        x="830"
+        y="60"
+        width="240"
+        height="110"
+        fill="var(--diagram-surface)"
+        stroke="var(--line-strong)"></rect>
+      <text
+        x="844"
+        y="86"
+        fill="var(--fg)"
+        font-family="var(--mono)"
+        font-size="14"
+        font-weight="500">ban executor</text
+      >
+      <text x="844" y="108" fill="var(--fg-dim)" font-family="var(--mono)" font-size="13"
+        >nftables &middot; ipset &middot; iptables</text
+      >
+      <text x="844" y="126" fill="var(--fg-dim)" font-family="var(--mono)" font-size="13"
+        >eBPF/XDP (phase 2)</text
+      >
+      <text x="844" y="150" fill="var(--accent)" font-family="var(--mono)" font-size="12"
+        >DROP &middot; at NIC driver</text
+      >
     </g>
 
     <!-- Observability tap: state -> metrics (dashed vertical) -->
-    <line x1="680" y1="170" x2="680" y2="232" stroke="var(--line-soft)" stroke-width="1" stroke-dasharray="3 3"></line>
+    <line
+      x1="680"
+      y1="170"
+      x2="680"
+      y2="232"
+      stroke="var(--line-soft)"
+      stroke-width="1"
+      stroke-dasharray="3 3"></line>
 
     <!-- Metrics / audit (secondary bar) -->
-    <text x="30" y="232" fill="var(--fg-mute)" font-family="var(--mono)" font-size="12" letter-spacing="1">05 &middot; OBSERVE</text>
+    <text
+      x="30"
+      y="232"
+      fill="var(--fg-mute)"
+      font-family="var(--mono)"
+      font-size="12"
+      letter-spacing="1">05 &middot; OBSERVE</text
+    >
     <g>
-      <rect x="20" y="244" width="1050" height="100" fill="var(--diagram-surface)" stroke="var(--line-soft)" stroke-dasharray="4 4"></rect>
-      <text x="34" y="270" fill="var(--fg-dim)" font-family="var(--mono)" font-size="14" font-weight="500">metrics &middot; audit</text>
-      <text x="34" y="294" fill="var(--fg-mute)" font-family="var(--mono)" font-size="13">prometheus /metrics &middot; read-only endpoint</text>
-      <text x="34" y="316" fill="var(--fg-mute)" font-family="var(--mono)" font-size="13">signed audit trail &middot; structured JSON logs</text>
+      <rect
+        x="20"
+        y="244"
+        width="1050"
+        height="100"
+        fill="var(--diagram-surface)"
+        stroke="var(--line-soft)"
+        stroke-dasharray="4 4"></rect>
+      <text
+        x="34"
+        y="270"
+        fill="var(--fg-dim)"
+        font-family="var(--mono)"
+        font-size="14"
+        font-weight="500">metrics &middot; audit</text
+      >
+      <text x="34" y="294" fill="var(--fg-mute)" font-family="var(--mono)" font-size="13"
+        >prometheus /metrics &middot; read-only endpoint</text
+      >
+      <text x="34" y="316" fill="var(--fg-mute)" font-family="var(--mono)" font-size="13"
+        >signed audit trail &middot; structured JSON logs</text
+      >
     </g>
 
-    <circle class="diagram-event" r="5" fill="var(--accent)" opacity="1" cx="140" cy="115" data-event>
-      <animate attributeName="opacity" values="0;1;1;0" dur="3.2s" repeatCount="indefinite"></animate>
+    <circle
+      class="diagram-event"
+      r="5"
+      fill="var(--accent)"
+      opacity="1"
+      cx="140"
+      cy="115"
+      data-event
+    >
+      <animate attributeName="opacity" values="0;1;1;0" dur="3.2s" repeatCount="indefinite"
+      ></animate>
     </circle>
   </svg>
 </div>

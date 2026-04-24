@@ -19,10 +19,20 @@ const isActive = (href: string): boolean => {
   const target = href.replace(/\/$/, '') || '/';
   return path === target;
 };
+
+const onVibeJam = Astro.url.pathname.replace(/\/$/, '') === '/vibejam';
 ---
 
 <nav class="site-nav">
   <div class="nav-inner">
+    {
+      !onVibeJam && (
+        <a href="/vibejam" class="submission-button" title="VibeJam Spring '26 submission">
+          <span>vibejam</span>
+          <span>submission</span>
+        </a>
+      )
+    }
     <a href="/" class="brand">
       <span class="brand-name">fail<span class="brand-2">2</span>zig</span>
       <span class="nav-tag" title="fail2zig v0.1.0 — first public release">v0.1.0</span>
@@ -37,10 +47,7 @@ const isActive = (href: string): boolean => {
       }
     </div>
     <div class="nav-right">
-      <a
-        href="/changelog"
-        class:list={['nav-cta', { active: isActive('/changelog') }]}
-      >
+      <a href="/changelog" class:list={['nav-cta', { active: isActive('/changelog') }]}>
         Changelog
       </a>
       <a
@@ -70,5 +77,50 @@ const isActive = (href: string): boolean => {
     line-height: 1;
     align-self: flex-end;
     margin-bottom: 5px;
+  }
+
+  /* Submission back-button — pinned to the far-left edge of the nav,
+   * sits in reserved padding so it never overlaps the brand.
+   * Styled to match the github + changelog buttons (.nav-cta pattern).
+   * Hidden on /vibejam itself. */
+  :global(.site-nav) {
+    position: sticky; /* already set globally; restated so the context is clear */
+  }
+  :global(.site-nav):has(.submission-button) :global(.nav-inner) {
+    padding-left: 140px;
+  }
+  .submission-button {
+    position: absolute;
+    top: 8px;
+    left: 16px;
+    z-index: 2;
+    display: inline-flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0;
+    padding: 4px 10px;
+    border: 1px solid var(--line);
+    color: var(--fg);
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    line-height: 1.3;
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .submission-button:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  @media (max-width: 720px) {
+    :global(.site-nav):has(.submission-button) :global(.nav-inner) {
+      padding-left: 32px;
+    }
+    .submission-button {
+      position: static;
+      font-size: 8px;
+      padding: 3px 8px;
+    }
   }
 </style>

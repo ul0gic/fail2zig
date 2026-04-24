@@ -20,7 +20,10 @@
     <span class="pane-sub"><code>fail2zig/banned_v4</code> · 1 Hz poll</span>
   </header>
   <div class="nft-body">
-    <pre id="nft-output" class="nft-output" aria-live="polite"><span class="nft-empty">loading banned set…</span></pre>
+    <pre
+      id="nft-output"
+      class="nft-output"
+      aria-live="polite"><span class="nft-empty">loading banned set…</span></pre>
   </div>
 </section>
 
@@ -121,10 +124,7 @@
       return `            ${link} timeout ${expires}${trailing}  <span class="nft-comment"># ${jailSafe}</span>`;
     });
     return (
-      header +
-      `        elements = {\n${lines.join('\n')}\n        }\n` +
-      hiddenNote +
-      '    }\n}'
+      header + `        elements = {\n${lines.join('\n')}\n        }\n` + hiddenNote + '    }\n}'
     );
   };
 

@@ -79,15 +79,15 @@ sudo strace -c -p $(pgrep fail2zig) -- sleep 30
 The `-c` summary (after 30 seconds of sampling) will list the
 syscalls the daemon actually uses. Expected entries include:
 
-| Syscall | Why fail2zig uses it |
-|---|---|
-| `epoll_wait` | Event loop waiting for watcher / socket activity. |
-| `read` | Reading new bytes from log files. |
-| `inotify_add_watch`, `inotify_read` | Watching log files for changes. |
-| `recvmsg`, `sendmsg` | Netlink traffic to the kernel firewall. |
-| `accept4` | Accepting `fail2zig-client` IPC connections. |
-| `timerfd_settime` | Driving ban expiry timers. |
-| `write` | Writing operational logs to stderr / journal. |
+| Syscall                             | Why fail2zig uses it                              |
+| ----------------------------------- | ------------------------------------------------- |
+| `epoll_wait`                        | Event loop waiting for watcher / socket activity. |
+| `read`                              | Reading new bytes from log files.                 |
+| `inotify_add_watch`, `inotify_read` | Watching log files for changes.                   |
+| `recvmsg`, `sendmsg`                | Netlink traffic to the kernel firewall.           |
+| `accept4`                           | Accepting `fail2zig-client` IPC connections.      |
+| `timerfd_settime`                   | Driving ban expiry timers.                        |
+| `write`                             | Writing operational logs to stderr / journal.     |
 
 Entries that would be red flags: `execve`, `fork`, `clone` of a new
 process (thread creation is fine), `openat` against `/usr/sbin/*` or

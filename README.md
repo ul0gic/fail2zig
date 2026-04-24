@@ -541,36 +541,152 @@ fail2zig/
 
 ## Contributing
 
-Standards:
+fail2zig wants to be the modern replacement for fail2ban — the drop-in
+tool that understands the services people actually run in 2026.
+Contributors are how it gets there. The codebase is small (~18K lines of
+Zig), the conventions are boring on purpose, and the contribution surface
+is wide open.
 
-- `zig fmt engine/ client/ shared/ tests/` is law — run before every commit
-  (enforced by CI)
-- `zig build` and `zig build test` must pass with zero failures and zero
-  leaks
-- Zero compiler warnings; `zig build -Doptimize=.ReleaseSafe` must be clean
+### The biggest ask: modern filters
+
+fail2ban's built-in filter library largely stopped expanding around 2015.
+The internet moved on. The highest-leverage contribution right now is
+**a pattern file for a service you actually run**. Candidates we'd love
+to ship:
+
+- **Container + orchestration** — Docker daemon events, Kubernetes API auth, Nomad, container runtime audit logs
+- **Reverse proxies** — Traefik, Caddy, Envoy, HAProxy
+- **Self-hosted services** — Vaultwarden, Authelia, Keycloak, Gitea, Forgejo, Jellyfin, Immich, Nextcloud, Jenkins
+- **LLM endpoints** — Ollama, OpenWebUI, LocalAI — a whole category that post-dates fail2ban
+- **Databases** — PostgreSQL, Redis, MongoDB auth failures
+- **Observability** — Grafana, Prometheus unauthorized access
+
+Each filter is a handful of log-line patterns plus a few test cases.
+`engine/filters/sshd.zig` is the cleanest reference for the shape. Bring
+real log lines from a real deployment if you can — that's the gold
+standard.
+
+Not a Zig developer? Good filter proposals are welcome as issues too — a
+few representative log lines + the name of the service is enough to open
+the door.
+
+### Good first contributions
+
+- **Add a filter** for any service listed above (or one that isn't).
+- **Improve fail2ban migration output** — if `--import-config` skipped or mistranslated a jail you use, open an issue with the original `jail.conf` stanza.
+- **Fix a doc rough edge** — typos, unclear wording, missing context in a `.md` file.
+- **Add a test case** to an existing filter that covers an edge case.
+- **Benchmark fail2zig on a platform** we don't test and share numbers.
+- **Bug report from real deployment** — what broke, what you'd expect.
+
+### Pick your path
+
+| You want to... | Path |
+|---|---|
+| **Report a security vulnerability** | [GitHub Private Security Advisories](https://github.com/ul0gic/fail2zig/security/advisories/new) — not a public issue. Ack in 48 h, coordinated disclosure. See [SECURITY.md](SECURITY.md). |
+| **Report a bug** | [Open an issue](https://github.com/ul0gic/fail2zig/issues/new). Include Zig version (`zig version`), OS (`uname -a`), and a minimal config that reproduces it. |
+| **Add a filter for a modern service** | PR directly. Include positive + negative test cases and real log lines if you have them. |
+| **Fix a typo, doc, or small bug** | PR directly. No issue needed. |
+| **Propose a feature** | Open an issue to sketch the shape — saves you building something that won't fit. |
+| **Contribute a larger change** | Issue first so we can align, then PR. Keep PRs single-purpose. |
+
+### Licensing
+
+By opening a pull request, you agree your contribution is licensed
+**AGPL-3.0-or-later** — the same license as the rest of the project. No
+CLA, no sign-off ceremony. `git blame` is the authorship record.
+
+Trademark on the "fail2zig" name and logo is separate and not granted by
+contributing — see [Trademark](#trademark) below.
+
+### Development setup
+
+```bash
+# Engine + client
+git clone https://github.com/ul0gic/fail2zig
+cd fail2zig
+zig build test          # ~2s · green, zero leaks
+
+# Web (marketing site + demo dashboard)
+cd web
+pnpm install
+pnpm dev                # local preview on :4321
+```
+
+**Requires:**
+- [Zig 0.14.1](https://ziglang.org/download/) exactly. Newer versions may break the build.
+- For web work: Node via [nvm](https://github.com/nvm-sh/nvm) (never apt / NodeSource), pnpm 9+.
+
+### Standards
+
+CI enforces these — not because we're precious, because they catch real
+bugs early and keep the binary small.
+
+**Zig:**
+- `zig fmt engine/ client/ shared/ tests/` before every commit — CI-enforced
+- `zig build` and `zig build test` pass, zero failures, zero leaks
+- Zero compiler warnings; `zig build -Doptimize=.ReleaseSafe` clean
 - No `@panic` in production code — propagate errors explicitly
-- No `@setRuntimeSafety(false)` without a comment proving the safety
-  invariant
+- No `@setRuntimeSafety(false)` without a comment proving the safety invariant
 - All tests use `std.testing.allocator` for leak detection
+- SPDX header on every `.zig` file (CI-enforced)
 
-Useful targets in the [`Makefile`](Makefile):
+**Web (`web/`):**
+- `pnpm format:check`, `pnpm lint`, `pnpm typecheck` all green
+- No added runtime framework dependencies — Astro + HTML + CSS is the stack
+- Theme tokens via `src/styles/theme.css`, no inline styles in production
+
+### A good PR
+
+- **One purpose per PR.** A bug fix is not a refactor + rename + unrelated cleanup. If the description wants to say "also," split it.
+- **Commit messages follow existing style:** `feat(scope): …`, `fix(scope): …`, `docs(scope): …`, `chore(scope): …`. Scope is the directory or module.
+- **Description explains *why*.** The diff already shows *what*. If it fixes a bug, link the issue.
+- **Tests.** A bug fix includes a regression test that would have failed before the fix. A feature covers the happy path plus at least one error case. Filter contributions include positive + negative log lines.
+- **CI green.** If CI is broken on `main`, that's its own PR first.
+
+A PR that hits those marks gets reviewed. Feedback is aimed at landing
+the change, not gatekeeping — if something needs adjusting, we'll say
+what and why.
+
+### Things we're intentionally not building
+
+Open an issue if you want to argue for any of these — the list is not
+immutable, just what we've decided against so far:
+
+- **Windows or macOS support** — Linux-only until v1.0.
+- **GUI dashboards inside the daemon** — the `/events` WebSocket is the extension point. Dashboards live outside the daemon.
+- **Plugin systems or embedded scripting in the core** — see [architecture/zero-dependencies](https://fail2zig.com/docs/architecture/zero-dependencies/) for the reasoning.
+- **SIEM-specific adapters** — fail2zig emits Prometheus metrics + structured JSON; SIEM vendors handle ingestion on their side.
+- **Shell-out ban actions** — fail2ban's CVE history speaks for itself. Firewall access is via direct netlink in fail2zig, not subprocess chains.
+
+### Useful Makefile targets
 
 ```bash
 make build          # Debug build
 make test           # zig build test
-make bench          # microbenchmarks
-make fuzz           # fuzz corpus run
-make release        # ReleaseSafe native
+make bench          # Microbenchmarks
+make fuzz           # Fuzz corpus run
+make release        # ReleaseSafe native build
 make cross          # ReleaseSafe x86_64 + aarch64 musl
 make lint           # zig fmt --check, shellcheck, yamllint
-make harness-smoke  # lab-box attack smoke test (requires a Linux host)
+make harness-smoke  # Lab-box attack smoke test (requires a Linux host)
 ```
 
-Test filter:
+Run a single test or filter by substring:
 
 ```bash
 zig build test -Dtest-filter=parser
 ```
+
+### Review + communication
+
+Everything lives on the repo — issues, PRs, and security advisories.
+Keeping it there means the project history is public and searchable; new
+contributors can read what was decided and why without joining a chat.
+
+Review timing is best-effort. Small PRs usually get a first look within a
+few days; larger ones longer. Security advisories are acknowledged within
+48 hours. A gentle ping on a PR untouched for two weeks is welcome.
 
 ---
 

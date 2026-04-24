@@ -141,12 +141,12 @@ not less safe.
 Measured throughput on the Phase 7.5 benchmark suite, `auth.log`
 workload:
 
-| Parser | Lines per second |
-| --- | --- |
-| fail2ban (Python + `re`) | ~420 |
-| SSHGuard (C scanner) | ~3,100 |
-| CrowdSec (Go) | ~4,900 |
-| fail2zig (comptime + SIMD) | 5,960,000 |
+| Parser                     | Lines per second |
+| -------------------------- | ---------------- |
+| fail2ban (Python + `re`)   | ~420             |
+| SSHGuard (C scanner)       | ~3,100           |
+| CrowdSec (Go)              | ~4,900           |
+| fail2zig (comptime + SIMD) | 5,960,000        |
 
 The ~5.96M l/s figure is not a synthetic micro-benchmark. It is the
 end-to-end log-line-to-parsed-event rate measured on a single core

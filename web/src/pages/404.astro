@@ -2,23 +2,23 @@
 import BaseLayout from '@/layouts/BaseLayout.astro';
 ---
 
-<BaseLayout
-  title="404 — fail2zig"
-  description="Page not found."
->
+<BaseLayout title="404 — fail2zig" description="Page not found.">
   <div class="notfound">
     <p class="code">404</p>
     <h1>no match in the filter set</h1>
     <p class="lede">
-      Whatever you were looking for isn't at this path. It may have moved,
-      or the link may be stale. Try one of the routes below.
+      Whatever you were looking for isn't at this path. It may have moved, or the link may be stale.
+      Try one of the routes below.
     </p>
     <ul class="routes">
       <li><a href="/">Home</a> <span class="hint">— overview</span></li>
       <li><a href="/demo">Demo</a> <span class="hint">— live honeypot feed</span></li>
       <li><a href="/docs">Docs</a> <span class="hint">— reference + guides</span></li>
       <li><a href="/why">Why</a> <span class="hint">— the argument</span></li>
-      <li><a href="/threat-model">Threat Model</a> <span class="hint">— STRIDE + data-flow</span></li>
+      <li>
+        <a href="/threat-model">Threat Model</a>
+        <span class="hint">— STRIDE + data-flow</span>
+      </li>
       <li><a href="/changelog">Changelog</a> <span class="hint">— release history</span></li>
     </ul>
   </div>

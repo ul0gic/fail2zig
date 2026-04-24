@@ -14,8 +14,8 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
         Everything that shipped, <br />in the order it shipped.
       </h1>
       <p class="lede">
-        Preview releases only so far. Each entry lists scope, behavior change, and the commit.
-        Benchmark deltas where the change touched a hot path.
+        First public release is v0.1.0 (2026-04-24). Each entry lists scope, behavior change, and
+        the commit. Benchmark deltas where the change touched a hot path.
       </p>
       <div class="subline">
         <span
@@ -26,17 +26,17 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
           ></span
         >
         <span
-          >signed &middot; <a
-            href="https://github.com/ul0gic/fail2zig"
+          >release &middot; <a
+            href="https://github.com/ul0gic/fail2zig/releases/tag/v0.1.0"
             style="color:var(--fg-dim)"
-            rel="noopener noreferrer">minisign + cosign</a
+            rel="noopener noreferrer">v0.1.0 on GitHub</a
           ></span
         >
         <span
           >format &middot; <a
-            href="https://semver.org"
+            href="https://keepachangelog.com"
             style="color:var(--fg-dim)"
-            rel="noopener noreferrer">semver 2.0</a
+            rel="noopener noreferrer">keep a changelog</a
           ></span
         >
       </div>
@@ -46,15 +46,10 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
   <div class="wrap cl-body">
     <aside class="cl-side">
       <h5>Releases</h5>
-      <a href="#v0-1-0" class="active">0.1.0-preview.4</a>
-      <a href="#v0-1-0-p3">0.1.0-preview.3</a>
-      <a href="#v0-1-0-p2">0.1.0-preview.2</a>
-      <a href="#v0-1-0-p1">0.1.0-preview.1</a>
-      <a href="#v0-0-9">0.0.9-alpha</a>
-      <a href="#v0-0-8">0.0.8-alpha</a>
+      <a href="#v0-1-0" class="active">0.1.0</a>
 
       <div class="filter">
-        <h5 style="margin-top:24px">Filter</h5>
+        <h5 style="margin-top:24px">Categories</h5>
         <span class="pill feat">feature</span>
         <span class="pill sec">security</span>
         <span class="pill perf">performance</span>
@@ -63,30 +58,30 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
     </aside>
 
     <main>
-      <!-- 0.1.0-preview.4 -->
+      <!-- v0.1.0 -->
       <section class="release" id="v0-1-0">
         <div class="release-head">
-          <h2>0.1.0-preview.4</h2>
-          <span class="ver-date">2026-04-12</span>
-          <span class="ver-tag current">current</span>
-          <span class="ver-sha">sha &middot; a4f19c2</span>
+          <h2>0.1.0</h2>
+          <span class="ver-date">2026-04-24</span>
+          <span class="ver-tag current">stable</span>
+          <span class="ver-sha">sha &middot; 1340cae</span>
         </div>
         <p class="release-summary">
-          io_uring backend for the log watcher lands behind a feature flag. Parser hot loop gets a
-          SIMD IP-address scanner on x86_64 and aarch64 with NEON. Two small security-relevant fixes
-          in the jail.conf compatibility parser.
+          First public release. A single static musl binary replaces fail2ban's Python runtime,
+          regex engine, and shell-out action chain. Hardened across eleven Phase-7 security issues
+          and eight real-system SYS bugs before tagging. AGPL-3.0-or-later.
         </p>
 
         <div class="bench-delta">
           <div class="cell">
-            <div class="k">Parse &middot; auth.log</div>
+            <div class="k">Parse throughput</div>
             <div class="v">5.96M l/s</div>
-            <div class="d up">&uarr; measured ph. 7.5</div>
+            <div class="d up">271&times; target</div>
           </div>
           <div class="cell">
-            <div class="k">Ban decision p99</div>
+            <div class="k">Ban latency p99</div>
             <div class="v">932 ns</div>
-            <div class="d up">measured</div>
+            <div class="d up">p50 365 ns</div>
           </div>
           <div class="cell">
             <div class="k">Binary (musl x86_64)</div>
@@ -94,9 +89,9 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
             <div class="d">stripped</div>
           </div>
           <div class="cell">
-            <div class="k">Ceiling memory</div>
-            <div class="v">64 MB</div>
-            <div class="d">unchanged</div>
+            <div class="k">Resident memory</div>
+            <div class="v">22 MB</div>
+            <div class="d">64 MB ceiling</div>
           </div>
         </div>
 
@@ -104,37 +99,136 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
           <h3>Features</h3>
           <ul class="change-list">
             <li>
-              <span class="scope">watcher</span>
+              <span class="scope">engine</span>
               <span class="msg"
-                >io_uring log watcher backend (linux &ge;5.1)
-                <span class="detail"
-                  >Feature-flagged via <code>watcher.backend = "io_uring"</code>. Falls back to
-                  inotify on older kernels.</span
-                >
-              </span>
-              <a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
-                >#184</a
+                >Single static musl binary &middot; zero runtime dependencies &middot; 877 KB
+                stripped</span
+              >
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/5a85cc2"
+                class="ref"
+                rel="noopener noreferrer">5a85cc2</a
+              >
+            </li>
+            <li>
+              <span class="scope">core</span>
+              <span class="msg"
+                >epoll / timerfd / signalfd event loop &middot; inotify log watcher with rotation +
+                copytruncate handling</span
+              >
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/98cd331"
+                class="ref"
+                rel="noopener noreferrer">98cd331</a
               >
             </li>
             <li>
               <span class="scope">parser</span>
               <span class="msg"
-                >SIMD-accelerated IPv4/IPv6 extraction
-                <span class="detail"
-                  >AVX2 on x86_64, NEON on aarch64. Scalar fallback retained for all other targets.</span
-                >
-              </span>
-              <a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
-                >#177</a
+                >Comptime-specialized parsers &middot; no regex engine in the process &middot;
+                zero-allocation hot path verified with <code>FailingAllocator</code></span
+              >
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/ec31dee"
+                class="ref"
+                rel="noopener noreferrer">ec31dee</a
+              >
+            </li>
+            <li>
+              <span class="scope">firewall</span>
+              <span class="msg"
+                >Pure netlink for nftables (no libnftnl, no shell-out) &middot; argv for iptables +
+                ipset</span
+              >
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/ec31dee"
+                class="ref"
+                rel="noopener noreferrer">ec31dee</a
+              >
+            </li>
+            <li>
+              <span class="scope">state</span>
+              <span class="msg"
+                >Fixed-arena state tracker with three eviction policies &middot; atomic CRC-checked
+                persistence &middot; per-IP 128-slot ring buffer</span
+              >
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/a9e77dc"
+                class="ref"
+                rel="noopener noreferrer">a9e77dc</a
+              >
+            </li>
+            <li>
+              <span class="scope">config</span>
+              <span class="msg"
+                >Native TOML parser + full <code>--import-config /etc/fail2ban</code> pipeline &middot;
+                translates filter.d regexes &middot; maps action.d backends &middot; emits validated TOML</span
+              >
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/3af15fd"
+                class="ref"
+                rel="noopener noreferrer">3af15fd</a
+              >
+            </li>
+            <li>
+              <span class="scope">filters</span>
+              <span class="msg"
+                >15 built-in comptime filters: sshd, nginx-*, apache-*, postfix / dovecot / courier,
+                named, vsftpd, proftpd, mysqld, recidive</span
+              >
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/3af15fd"
+                class="ref"
+                rel="noopener noreferrer">3af15fd</a
               >
             </li>
             <li>
               <span class="scope">cli</span>
               <span class="msg"
-                ><code>fail2zig-client tail</code> streams ban events in real time</span
+                ><code>fail2zig-client</code> &mdash; status / ban / unban / list / jails / reload &middot;
+                table, JSON, plain output &middot; bash / zsh / fish completions</span
               >
-              <a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
-                >#191</a
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/2130f37"
+                class="ref"
+                rel="noopener noreferrer">2130f37</a
+              >
+            </li>
+            <li>
+              <span class="scope">metrics</span>
+              <span class="msg"
+                >Built-in HTTP/1.1 server &middot; <code>/metrics</code> (Prometheus), <code
+                  >/api/bans</code
+                > (JSON), <code>/events</code> (WebSocket, RFC 6455)</span
+              >
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/2130f37"
+                class="ref"
+                rel="noopener noreferrer">2130f37</a
+              >
+            </li>
+            <li>
+              <span class="scope">demo</span>
+              <span class="msg"
+                >Live internet-exposed honeypot at <a href="/demo">fail2zig.com/demo</a> &middot; real
+                sshd + nginx attack surface &middot; three-pane dashboard</span
+              >
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/1803321"
+                class="ref"
+                rel="noopener noreferrer">1803321</a
+              >
+            </li>
+            <li>
+              <span class="scope">release</span>
+              <span class="msg"
+                >Static musl binaries for x86_64 + aarch64 &middot; SHA256SUMS &middot; hardened
+                systemd unit &middot; <code>scripts/install.sh</code> one-shot installer</span
+              >
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/1340cae"
+                class="ref"
+                rel="noopener noreferrer">1340cae</a
               >
             </li>
           </ul>
@@ -144,25 +238,79 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
           <h3>Security</h3>
           <ul class="change-list">
             <li>
-              <span class="scope">config</span>
+              <span class="scope">parser</span>
               <span class="msg"
-                >Reject world-writable config files at startup
-                <span class="detail"
-                  >The daemon now refuses to load config files with mode &gt;0644 and emits a fatal
-                  audit entry.</span
-                >
-              </span>
-              <a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
-                >#188</a
+                >SEC-001 (HIGH) &mdash; IPv4-mapped IPv6 canonicalization closes ban-evasion by
+                peer-format flipping</span
+              >
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/8bfc74f"
+                class="ref"
+                rel="noopener noreferrer">8bfc74f</a
               >
             </li>
             <li>
-              <span class="scope">compat</span>
+              <span class="scope">ipc</span>
               <span class="msg"
-                >Hard limit on <code>failregex</code> line length in fail2ban import (4KB)</span
+                >SEC-002 (MEDIUM) &mdash; <code>umask(0o117)</code> around <code>bind()</code> closes
+                the socket-permissions race window</span
               >
-              <a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
-                >#189</a
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/8bfc74f"
+                class="ref"
+                rel="noopener noreferrer">8bfc74f</a
+              >
+            </li>
+            <li>
+              <span class="scope">http</span>
+              <span class="msg"
+                >SEC-005 / SEC-008 &mdash; security headers on every response &middot; 5s per-client
+                read deadline &middot; 100/sec accept rate cap</span
+              >
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/8bfc74f"
+                class="ref"
+                rel="noopener noreferrer">8bfc74f</a
+              >
+            </li>
+            <li>
+              <span class="scope">fuzz</span>
+              <span class="msg"
+                >Fuzz corpora for parser &middot; IP parser &middot; IPC protocol &middot; TOML
+                config &mdash; all with <code>FailingAllocator</code> to surface unbounded allocation
+                as <code>OutOfMemory</code></span
+              >
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/8bfc74f"
+                class="ref"
+                rel="noopener noreferrer">8bfc74f</a
+              >
+            </li>
+            <li>
+              <span class="scope">systemd</span>
+              <span class="msg"
+                >Hardened unit: <code>CAP_NET_ADMIN + CAP_DAC_READ_SEARCH</code> only &middot; <code
+                  >ProtectSystem=strict</code
+                > &middot; <code>NoNewPrivileges</code> &middot; seccomp filter &middot; <code
+                  >systemd-analyze security</code
+                > 2.4</span
+              >
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/7df630f"
+                class="ref"
+                rel="noopener noreferrer">7df630f</a
+              >
+            </li>
+            <li>
+              <span class="scope">license</span>
+              <span class="msg"
+                >AGPL-3.0-or-later &middot; trademark asserted on "fail2zig" name + logo &middot;
+                vulnerabilities reported via GitHub Private Security Advisories</span
+              >
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/ef16d7c"
+                class="ref"
+                rel="noopener noreferrer">ef16d7c</a
               >
             </li>
           </ul>
@@ -172,242 +320,136 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
           <h3>Performance</h3>
           <ul class="change-list">
             <li>
+              <span class="scope">bench</span>
+              <span class="msg"
+                >Parse throughput <strong>5.96M lines/sec</strong> (271&times; the 22K target) &middot;
+                ban latency p50 365 ns / p99 932 ns (1000&times; under the 1ms target)</span
+              >
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/8bfc74f"
+                class="ref"
+                rel="noopener noreferrer">8bfc74f</a
+              >
+            </li>
+            <li>
+              <span class="scope">memory</span>
+              <span class="msg"
+                >Hard memory ceiling held across 50K unique IPs: 21,845 entries resident, 15,606
+                evictions &mdash; ceiling never exceeded</span
+              >
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/8bfc74f"
+                class="ref"
+                rel="noopener noreferrer">8bfc74f</a
+              >
+            </li>
+            <li>
+              <span class="scope">binary</span>
+              <span class="msg"
+                >Static musl binary <strong>877 KB</strong> (x86_64) / <strong>801 KB</strong> (aarch64)
+                &mdash; well under the 5 MB ceiling</span
+              >
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/1340cae"
+                class="ref"
+                rel="noopener noreferrer">1340cae</a
+              >
+            </li>
+          </ul>
+        </div>
+
+        <div class="change-group fix">
+          <h3>Fixes</h3>
+          <ul class="change-list">
+            <li>
+              <span class="scope">ws</span>
+              <span class="msg"
+                >SYS-010 (CRITICAL) &mdash; use-after-free in <code>ws.dispatchFrame</code> on close /
+                binary frames</span
+              >
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/b101619"
+                class="ref"
+                rel="noopener noreferrer">b101619</a
+              >
+            </li>
+            <li>
+              <span class="scope">filter</span>
+              <span class="msg"
+                >SYS-011 (HIGH) &mdash; sshd filter matched clean disconnects, causing operator
+                self-ban during honeypot bring-up</span
+              >
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/b101619"
+                class="ref"
+                rel="noopener noreferrer">b101619</a
+              >
+            </li>
+            <li>
               <span class="scope">state</span>
               <span class="msg"
-                >Open-addressing hash table tuned for 0.7 load factor
-                <span class="detail"
-                  >Previously 0.5; reduces memory at the cost of ~3% additional probe length at
-                  ceiling.</span
-                >
-              </span>
-              <a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
-                >#182</a
+                >SYS-007 (HIGH) &mdash; restored bans on restart now re-installed into the firewall;
+                previously the state tracker held them but the kernel didn't enforce</span
+              >
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/dc916a9"
+                class="ref"
+                rel="noopener noreferrer">dc916a9</a
               >
             </li>
-          </ul>
-        </div>
-
-        <div class="change-group fix">
-          <h3>Fixes</h3>
-          <ul class="change-list">
             <li>
-              <span class="scope">watcher</span>
+              <span class="scope">state</span>
               <span class="msg"
-                >Handle logrotate's <code>copytruncate</code> mode without replaying the old tail</span
+                >SYS-008 (HIGH) &mdash; <code>bantime_increment</code> now wired from <code
+                  >[defaults]</code
+                > to the state tracker (was silently ignored)</span
               >
-              <a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
-                >#180</a
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/3d866c7"
+                class="ref"
+                rel="noopener noreferrer">3d866c7</a
               >
             </li>
             <li>
-              <span class="scope">ipset</span>
-              <span class="msg">Correctly size IPv6 hash sets on ipset &ge;7.15</span>
-              <a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
-                >#186</a
+              <span class="scope">ws</span>
+              <span class="msg"
+                >Broadcast wiring + event schema aligned to the documented <code
+                  >type / ts / payload</code
+                > envelope; dashboard counters now tick in real time</span
+              >
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/4d75186"
+                class="ref"
+                rel="noopener noreferrer">4d75186</a
+              >
+            </li>
+            <li>
+              <span class="scope">ipc</span>
+              <span class="msg"
+                >ISSUE-003 &mdash; daemon and client socket-path defaults unified on <code
+                  >/run/fail2zig/fail2zig.sock</code
+                ></span
+              >
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/2130f37"
+                class="ref"
+                rel="noopener noreferrer">2130f37</a
+              >
+            </li>
+            <li>
+              <span class="scope">build</span>
+              <span class="msg"
+                >ISSUE-004 &mdash; <code>@bitCast</code> size mismatch (i128 &rarr; u64) resolved via
+                <code>@truncate</code></span
+              >
+              <a
+                href="https://github.com/ul0gic/fail2zig/commit/2130f37"
+                class="ref"
+                rel="noopener noreferrer">2130f37</a
               >
             </li>
           </ul>
         </div>
-      </section>
-
-      <!-- p.3 -->
-      <section class="release" id="v0-1-0-p3">
-        <div class="release-head">
-          <h2>0.1.0-preview.3</h2>
-          <span class="ver-date">2026-03-28</span>
-          <span class="ver-tag">preview</span>
-          <span class="ver-sha">sha &middot; 7bc0113</span>
-        </div>
-        <p class="release-summary">
-          Migration tool hits feature parity with the top 20 fail2ban filters. First
-          reproducible-build verification across Debian, Alpine, and NixOS &mdash; byte-identical
-          output.
-        </p>
-        <div class="change-group feat">
-          <h3>Features</h3>
-          <ul class="change-list">
-            <li>
-              <span class="scope">migrate</span><span class="msg"
-                >Full jail.conf + filter.d translation for all top-20 filters</span
-              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
-                >#161</a
-              >
-            </li>
-            <li>
-              <span class="scope">build</span><span class="msg"
-                >Reproducible build pipeline &middot; SBOM in SPDX 2.3</span
-              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
-                >#168</a
-              >
-            </li>
-            <li>
-              <span class="scope">cli</span><span class="msg"
-                ><code>fail2zig-client list-jails --json</code> for scripted integrations</span
-              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
-                >#170</a
-              >
-            </li>
-          </ul>
-        </div>
-        <div class="change-group fix">
-          <h3>Fixes</h3>
-          <ul class="change-list">
-            <li>
-              <span class="scope">parser</span><span class="msg"
-                >Postfix timestamps without year now parse correctly</span
-              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
-                >#172</a
-              >
-            </li>
-            <li>
-              <span class="scope">nftables</span><span class="msg"
-                >Graceful handling of pre-existing <code>fail2zig</code> table on restart</span
-              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
-                >#174</a
-              >
-            </li>
-          </ul>
-        </div>
-      </section>
-
-      <!-- p.2 -->
-      <section class="release" id="v0-1-0-p2">
-        <div class="release-head">
-          <h2>0.1.0-preview.2</h2>
-          <span class="ver-date">2026-03-09</span>
-          <span class="ver-tag">preview</span>
-          <span class="ver-sha">sha &middot; 2d8a0e4</span>
-        </div>
-        <p class="release-summary">
-          State tracker rewritten around a fixed-size arena. The daemon now has a provable memory
-          ceiling regardless of attack volume.
-        </p>
-        <div class="change-group break">
-          <h3>Breaking</h3>
-          <ul class="change-list">
-            <li>
-              <span class="scope">config</span><span class="msg"
-                >Renamed <code>maxBans</code> &rarr; <code>state.capacity</code> in fail2zig.toml</span
-              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
-                >#140</a
-              >
-            </li>
-          </ul>
-        </div>
-        <div class="change-group feat">
-          <h3>Features</h3>
-          <ul class="change-list">
-            <li>
-              <span class="scope">state</span><span class="msg"
-                >Fixed-arena state tracker with operator-selected eviction policy</span
-              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
-                >#138</a
-              >
-            </li>
-            <li>
-              <span class="scope">audit</span><span class="msg"
-                >Structured JSON audit log of ban/unban events</span
-              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
-                >#145</a
-              >
-            </li>
-          </ul>
-        </div>
-        <div class="change-group sec">
-          <h3>Security</h3>
-          <ul class="change-list">
-            <li>
-              <span class="scope">parser</span><span class="msg"
-                >Fuzz-tested built-in filters against 4.1M adversarial lines &middot; zero crashes</span
-              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
-                >#152</a
-              >
-            </li>
-          </ul>
-        </div>
-      </section>
-
-      <!-- p.1 -->
-      <section class="release" id="v0-1-0-p1">
-        <div class="release-head">
-          <h2>0.1.0-preview.1</h2>
-          <span class="ver-date">2026-02-24</span>
-          <span class="ver-tag">preview</span>
-          <span class="ver-sha">sha &middot; 0e11ab9</span>
-        </div>
-        <p class="release-summary">
-          First public preview. sshd + nginx-http-auth filters working end to end against nftables.
-        </p>
-        <div class="change-group feat">
-          <h3>Features</h3>
-          <ul class="change-list">
-            <li>
-              <span class="scope">core</span><span class="msg"
-                >End-to-end pipeline &middot; watcher &rarr; parser &rarr; state &rarr; banner</span
-              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
-                >#118</a
-              >
-            </li>
-            <li>
-              <span class="scope">filters</span><span class="msg"
-                >Built-in comptime filters: sshd, nginx-http-auth</span
-              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
-                >#121</a
-              >
-            </li>
-            <li>
-              <span class="scope">backend</span><span class="msg"
-                >nftables and iptables ban executors</span
-              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
-                >#123</a
-              >
-            </li>
-          </ul>
-        </div>
-      </section>
-
-      <!-- alphas -->
-      <section class="release" id="v0-0-9">
-        <div class="release-head">
-          <h2>0.0.9-alpha</h2>
-          <span class="ver-date">2026-02-10</span>
-          <span class="ver-tag">alpha</span>
-          <span class="ver-sha">sha &middot; c902af6</span>
-        </div>
-        <p class="release-summary">
-          Internal alpha. Parser engine feature-complete for the first three filters.
-        </p>
-        <div class="change-group feat">
-          <h3>Features</h3>
-          <ul class="change-list">
-            <li>
-              <span class="scope">parser</span><span class="msg"
-                >Comptime filter generation from pattern definitions</span
-              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
-                >#98</a
-              >
-            </li>
-            <li>
-              <span class="scope">watcher</span><span class="msg"
-                >inotify backend with rename/truncate recovery</span
-              ><a href="https://github.com/ul0gic/fail2zig" class="ref" rel="noopener noreferrer"
-                >#102</a
-              >
-            </li>
-          </ul>
-        </div>
-      </section>
-
-      <section class="release" id="v0-0-8">
-        <div class="release-head">
-          <h2>0.0.8-alpha</h2>
-          <span class="ver-date">2026-01-22</span>
-          <span class="ver-tag">alpha</span>
-          <span class="ver-sha">sha &middot; 814ef21</span>
-        </div>
-        <p class="release-summary">
-          Project skeleton &middot; CI &middot; cross-compilation for four target triples.
-        </p>
       </section>
     </main>
   </div>

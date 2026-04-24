@@ -70,16 +70,16 @@ Every box in the top group is code fail2zig ships. Everything it reaches
 for lives in the kernel — the trust base any Linux program already
 depends on.
 
-| Component | Lines of Zig (approx.) | Runs as root |
-|---|---|---|
-| Event loop + watcher | 1,400 | yes |
-| Parser engine + filters | 3,200 | yes |
-| State tracker | 1,100 | yes |
-| Firewall backends (nftables / iptables / ipset) | 3,800 | yes |
-| IPC server + client protocol | 900 | yes |
-| Config parser (TOML + fail2ban import) | 1,500 | yes, startup only |
-| C shims to kernel ABIs | 150 | yes |
-| **Total** | **~12,000** | |
+| Component                                       | Lines of Zig (approx.) | Runs as root      |
+| ----------------------------------------------- | ---------------------- | ----------------- |
+| Event loop + watcher                            | 1,400                  | yes               |
+| Parser engine + filters                         | 3,200                  | yes               |
+| State tracker                                   | 1,100                  | yes               |
+| Firewall backends (nftables / iptables / ipset) | 3,800                  | yes               |
+| IPC server + client protocol                    | 900                    | yes               |
+| Config parser (TOML + fail2ban import)          | 1,500                  | yes, startup only |
+| C shims to kernel ABIs                          | 150                    | yes               |
+| **Total**                                       | **~12,000**            |                   |
 
 That is the entire TCB. No third-party Zig packages are pulled in. No
 `libc` helpers are invoked in the parse or ban path — the binary links
@@ -90,16 +90,16 @@ contract with the kernel is legible at a glance.
 
 ## What is deliberately not in the TCB
 
-| Excluded | Because |
-|---|---|
-| Python / Perl / Ruby / Node / Java runtime | No interpreter, no VM. The binary is the only thing that executes. |
+| Excluded                                                      | Because                                                                         |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| Python / Perl / Ruby / Node / Java runtime                    | No interpreter, no VM. The binary is the only thing that executes.              |
 | Third-party netlink helpers (`libmnl`, `libnftnl`, `libnl-3`) | Hand-written TLV frame builders, audited against `linux/netfilter/nf_tables.h`. |
-| `libcap` / `libcap-ng` | `/proc/self/status` + `prctl` syscall read directly. |
-| `libsystemd` | The sd_notify protocol subset we use is in-tree (~80 lines). |
-| `libpcre` / regex engines | Filters are compiled at build time by `comptime`; no runtime regex interpreter. |
-| `/bin/sh` | Ban actions are pure function calls. The daemon never execs. |
-| `nft`, `iptables`, `ipset` binaries | Firewall state is written via netlink directly, never via subprocess. |
-| External config preprocessors | TOML parsing is in-tree. No Jinja, no M4, no shell substitution. |
+| `libcap` / `libcap-ng`                                        | `/proc/self/status` + `prctl` syscall read directly.                            |
+| `libsystemd`                                                  | The sd_notify protocol subset we use is in-tree (~80 lines).                    |
+| `libpcre` / regex engines                                     | Filters are compiled at build time by `comptime`; no runtime regex interpreter. |
+| `/bin/sh`                                                     | Ban actions are pure function calls. The daemon never execs.                    |
+| `nft`, `iptables`, `ipset` binaries                           | Firewall state is written via netlink directly, never via subprocess.           |
+| External config preprocessors                                 | TOML parsing is in-tree. No Jinja, no M4, no shell substitution.                |
 
 Each exclusion is a CVE-class removed from the attack surface. Shell
 injection requires a shell. Python sandbox escape requires Python. A

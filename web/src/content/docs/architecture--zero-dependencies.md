@@ -132,14 +132,14 @@ binary. It does not mean fail2zig implements its own TCP stack. The
 boundary is: **fail2zig depends only on stable kernel ABIs that are
 part of Linux's backward-compatibility promise.**
 
-| ABI | Used for | Stable since |
-|---|---|---|
-| netlink (`AF_NETLINK`) | nftables / netfilter subsystem | Linux 2.2 (1999) |
-| inotify | Watching log files for new content | Linux 2.6.13 (2005) |
-| epoll | Event loop | Linux 2.6 (2004) |
+| ABI                              | Used for                                       | Stable since          |
+| -------------------------------- | ---------------------------------------------- | --------------------- |
+| netlink (`AF_NETLINK`)           | nftables / netfilter subsystem                 | Linux 2.2 (1999)      |
+| inotify                          | Watching log files for new content             | Linux 2.6.13 (2005)   |
+| epoll                            | Event loop                                     | Linux 2.6 (2004)      |
 | `signalfd`, `timerfd`, `eventfd` | Signal + timer integration with the event loop | Linux 2.6.22 / 2.6.25 |
-| `procfs` / `sysfs` (read-only) | Capability checks, `/proc/self/status` | Stable |
-| `AF_UNIX` | IPC socket between daemon and client | POSIX |
+| `procfs` / `sysfs` (read-only)   | Capability checks, `/proc/self/status`         | Stable                |
+| `AF_UNIX`                        | IPC socket between daemon and client           | POSIX                 |
 
 These are kernel ABIs, not userspace libraries. They are the
 lowest-level primitives available to any Linux program. Depending on

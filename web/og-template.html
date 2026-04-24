@@ -1,0 +1,147 @@
+<!doctype html>
+<!--
+  Source for public/og.png (the OpenGraph share card).
+  1200 × 630, matches site design tokens.
+
+  Regenerate after editing:
+    cd web
+    google-chrome --headless=new --disable-gpu --no-sandbox \
+      --hide-scrollbars --window-size=1200,630 \
+      --screenshot=public/og.png --virtual-time-budget=4000 \
+      "file://$(pwd)/og-template.html"
+
+  This file is not served — Astro only ships from public/ and pages/.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>og</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        width: 1200px;
+        height: 630px;
+        margin: 0;
+        background: #0a0a0a;
+        color: #ece7de;
+        font-family: 'JetBrains Mono', ui-monospace, monospace;
+        position: relative;
+        overflow: hidden;
+        padding: 88px 96px;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+      }
+      /* corner tick — matches the site pattern */
+      .tick-h,
+      .tick-v {
+        position: absolute;
+        top: 48px;
+        left: 48px;
+        background: #e5a048;
+      }
+      .tick-h {
+        width: 32px;
+        height: 3px;
+      }
+      .tick-v {
+        width: 3px;
+        height: 32px;
+      }
+      /* version pill — matches nav-tag treatment */
+      .version {
+        position: absolute;
+        top: 48px;
+        right: 48px;
+        font-size: 14px;
+        letter-spacing: 0.08em;
+        color: #85c59f;
+        border: 1px solid #4f8b62;
+        padding: 4px 10px;
+        line-height: 1;
+        font-weight: 500;
+      }
+      .brand {
+        font-size: 156px;
+        font-weight: 600;
+        letter-spacing: -0.035em;
+        line-height: 1;
+        margin: 0;
+      }
+      .brand .two {
+        color: #e5a048;
+      }
+      .tagline {
+        font-family: 'IBM Plex Sans', system-ui, sans-serif;
+        font-size: 42px;
+        font-weight: 500;
+        font-style: italic;
+        color: #e5a048;
+        margin: 20px 0 0;
+        letter-spacing: -0.012em;
+      }
+      .rule {
+        width: 96px;
+        height: 2px;
+        background: #e5a048;
+        margin: 40px 0 24px;
+      }
+      .stats {
+        font-size: 22px;
+        color: #b5b0a6;
+        margin: 0;
+        letter-spacing: 0.02em;
+        line-height: 1.5;
+      }
+      .stats strong {
+        color: #ece7de;
+        font-weight: 500;
+      }
+      .stats .sep {
+        color: #6b6557;
+        margin: 0 10px;
+      }
+      .footer {
+        position: absolute;
+        bottom: 48px;
+        left: 96px;
+        right: 96px;
+        display: flex;
+        justify-content: space-between;
+        font-size: 16px;
+        color: #7a746c;
+        letter-spacing: 0.04em;
+      }
+    </style>
+  </head>
+  <body>
+    <span class="tick-h"></span>
+    <span class="tick-v"></span>
+    <span class="version">v0.1.0</span>
+
+    <h1 class="brand">fail<span class="two">2</span>zig</h1>
+    <p class="tagline">intrusion prevention, rebuilt.</p>
+
+    <div class="rule"></div>
+    <p class="stats">
+      <strong>877 KB</strong> static musl binary
+      <span class="sep">·</span>
+      <strong>0</strong> runtime dependencies
+      <span class="sep">·</span>
+      drop-in <strong>fail2ban</strong>
+    </p>
+
+    <div class="footer">
+      <span>fail2zig.com</span>
+      <span>AGPL-3.0-or-later</span>
+    </div>
+  </body>
+</html>

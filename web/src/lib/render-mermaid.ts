@@ -35,7 +35,10 @@ export async function renderMermaidTargets(targets: MermaidTarget[]): Promise<vo
   for (const t of targets) {
     const source = t.source.textContent.trim();
     try {
-      const { svg } = await mermaid.render(`mmd-${Date.now().toString()}-${(n++).toString()}`, source);
+      const { svg } = await mermaid.render(
+        `mmd-${Date.now().toString()}-${(n++).toString()}`,
+        source
+      );
       const container = document.createElement('div');
       container.className = 'mermaid-rendered';
       container.setAttribute('role', 'button');
@@ -59,13 +62,10 @@ export async function renderMermaidTargets(targets: MermaidTarget[]): Promise<vo
  */
 export function findDocBlocks(root: ParentNode = document): MermaidTarget[] {
   return Array.from(
-    root.querySelectorAll<HTMLElement>('.doc-content code[data-language="mermaid"]'),
+    root.querySelectorAll<HTMLElement>('.doc-content code[data-language="mermaid"]')
   ).map((code) => ({
     source: code,
-    wrapper:
-      code.closest('figure[data-rehype-pretty-code-figure]') ??
-      code.closest('pre') ??
-      code,
+    wrapper: code.closest('figure[data-rehype-pretty-code-figure]') ?? code.closest('pre') ?? code,
   }));
 }
 
