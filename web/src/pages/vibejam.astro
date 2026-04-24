@@ -1,0 +1,713 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+---
+
+<BaseLayout
+  title="fail2zig — VibeJam Spring '26 submission"
+  description="A modern intrusion prevention system built in five days for VibeJam Spring '26. Single static binary, zero runtime dependencies, a real internet-exposed honeypot defending itself in real time."
+>
+  <div class="vibejam-wrap">
+
+    <!-- submission slip ────────────────────────────────────────────── -->
+    <section class="slip" aria-label="submission metadata">
+      <div class="slip-head">
+        <span class="slip-event">[ VIBEJAM SPRING '26 ]</span>
+        <span class="slip-id">SUBMISSION · ID VJ-2026-F2Z</span>
+      </div>
+      <div class="slip-grid">
+        <dl>
+          <dt>builder</dt>
+          <dd>solo · <a href="https://github.com/ul0gic" rel="noopener">@ul0gic</a></dd>
+        </dl>
+        <dl>
+          <dt>category</dt>
+          <dd>serious software</dd>
+        </dl>
+        <dl>
+          <dt>window</dt>
+          <dd>2026-04-20 noon PST → 2026-04-24 midnight PST</dd>
+        </dl>
+        <dl>
+          <dt>duration</dt>
+          <dd>120 hours · continuous</dd>
+        </dl>
+        <dl>
+          <dt>status</dt>
+          <dd>shipped · v0.1.0 tagged · demo live</dd>
+        </dl>
+        <dl>
+          <dt>artifact</dt>
+          <dd><a href="https://github.com/ul0gic/fail2zig/releases/tag/v0.1.0" rel="noopener">github.com/ul0gic/fail2zig</a></dd>
+        </dl>
+      </div>
+    </section>
+
+    <!-- hero ────────────────────────────────────────────── -->
+    <header class="hero">
+      <h1>fail2zig</h1>
+      <p class="tagline">Serious software. Shipped in five days.</p>
+      <p class="lede">
+        A modern intrusion prevention system: single static binary, zero
+        runtime dependencies, a comptime-specialized parser with no regex
+        engine in the process, pure netlink to the kernel for every
+        firewall operation. Written from scratch in Zig over VibeJam week.
+        Currently defending a real internet-exposed honeypot against real
+        attackers, with a three-pane dashboard you can watch live.
+      </p>
+      <div class="cta-row">
+        <a class="cta-primary" href="/demo">watch it defend →</a>
+        <a class="cta-secondary" href="https://github.com/ul0gic/fail2zig/releases/tag/v0.1.0" rel="noopener">v0.1.0 release ↗</a>
+        <a class="cta-secondary" href="https://github.com/ul0gic/fail2zig" rel="noopener">source ↗</a>
+      </div>
+    </header>
+
+    <!-- theme ────────────────────────────────────────────── -->
+    <section class="section">
+      <h2>The theme</h2>
+      <p class="section-lede">for the development of serious software — r/vibecoding, spring '26</p>
+
+      <p>
+        The security world lives inside a permanent underclass of
+        accepted risk. fail2ban has protected the open internet for twenty
+        years on a Python runtime that leaks memory under sustained
+        attack, a regex engine that has been CVE'd into the ground, and a
+        shell-out action model that wedges every time the firewall CLI is
+        busy. The community accepted all of this — for two decades — as
+        <em>just how infrastructure works</em>, because no one was serious
+        enough to replace it.
+      </p>
+
+      <p>
+        fail2zig is the answer to <em>no one is serious enough</em>.
+      </p>
+
+      <p>
+        The hard parts of the problem — the filter DSL, the log patterns,
+        the jail semantics, the migration story — fail2ban solved two
+        decades ago, and fail2zig inherits every bit of it through a
+        drop-in <code>jail.conf</code> compatibility layer. What fail2zig
+        contributes is the runtime: one 877 KB static binary, a
+        comptime-specialized parser with zero runtime regex, pure netlink
+        to the kernel, bounded memory under attack, and a WebSocket feed
+        so you can watch it work.
+      </p>
+
+      <p class="pull">
+        Five days. One person. Escape from the underclass.
+      </p>
+    </section>
+
+    <!-- what shipped ────────────────────────────────────────────── -->
+    <section class="section">
+      <h2>What shipped</h2>
+      <p class="section-lede">every number below is verifiable in two clicks.</p>
+
+      <div class="stat-grid">
+        <div class="stat-col">
+          <h3>Engine</h3>
+          <table>
+            <tr><td>Lines of Zig</td><td class="num">18,449</td></tr>
+            <tr><td>Source files</td><td class="num">54</td></tr>
+            <tr><td>Tests passing</td><td class="num">595</td></tr>
+            <tr><td>Leaks / warnings</td><td class="num">0 / 0</td></tr>
+            <tr><td>Binary (x86_64, stripped)</td><td class="num">877 KB</td></tr>
+            <tr><td>Binary (aarch64, stripped)</td><td class="num">801 KB</td></tr>
+            <tr><td>Parse throughput</td><td class="num">5.96M lines/sec</td></tr>
+            <tr><td>Ban latency (p50 / p99)</td><td class="num">365 ns / 932 ns</td></tr>
+            <tr><td>Resident memory under load</td><td class="num">22 MB</td></tr>
+            <tr><td>Runtime dependencies</td><td class="num">0</td></tr>
+          </table>
+        </div>
+        <div class="stat-col">
+          <h3>Web + Infra</h3>
+          <table>
+            <tr><td>Lines TypeScript / Astro</td><td class="num">14,893</td></tr>
+            <tr><td>Pages + components</td><td class="num">49</td></tr>
+            <tr><td>Doc pages</td><td class="num">13</td></tr>
+            <tr><td>Honeypot VM</td><td class="num">Lightsail · $7/mo</td></tr>
+            <tr><td>Public edge</td><td class="num">Cloudflare Tunnel</td></tr>
+            <tr><td>Real-traffic soak</td><td class="num">2+ days</td></tr>
+            <tr><td>Release assets</td><td class="num">8 files, SHA-verified</td></tr>
+            <tr><td>Cloud cost (total)</td><td class="num">&lt; $15</td></tr>
+            <tr><td>Commits</td><td class="num">100+</td></tr>
+            <tr><td>GitHub Release</td><td class="num">v0.1.0 · public</td></tr>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- proof ────────────────────────────────────────────── -->
+    <section class="section">
+      <h2>Proof it works</h2>
+      <p>
+        Nothing on this page is hand-waved. Every claim maps to a live,
+        inspectable artifact. Click any of these and verify on the spot.
+      </p>
+
+      <div class="proof-grid">
+        <a class="proof-card" href="/demo">
+          <span class="proof-kind">[ live ]</span>
+          <span class="proof-title">fail2zig.com/demo</span>
+          <span class="proof-desc">
+            three-pane dashboard streaming real attack detections, kernel-level
+            ban events, and <code>/metrics</code> counters from an internet-exposed
+            honeypot.
+          </span>
+        </a>
+        <a class="proof-card" href="https://github.com/ul0gic/fail2zig/releases/tag/v0.1.0" rel="noopener">
+          <span class="proof-kind">[ release ]</span>
+          <span class="proof-title">v0.1.0 on GitHub</span>
+          <span class="proof-desc">
+            static musl binaries for x86_64 + aarch64, systemd unit + socket,
+            example config, <code>SHA256SUMS</code>, self-verifying release job.
+            AGPL-3.0-or-later.
+          </span>
+        </a>
+        <a class="proof-card" href="https://github.com/ul0gic/fail2zig" rel="noopener">
+          <span class="proof-kind">[ source ]</span>
+          <span class="proof-title">github.com/ul0gic/fail2zig</span>
+          <span class="proof-desc">
+            18K lines of Zig, pure netlink, 595 tests, CI green on every push,
+            issue tracker, threat model, man pages. Read it. Fork it. Audit it.
+          </span>
+        </a>
+      </div>
+    </section>
+
+    <!-- tech stack ────────────────────────────────────────────── -->
+    <section class="section">
+      <h2>Tech stack</h2>
+      <p>
+        Every piece chosen for a reason I can defend in one sentence.
+        No framework tourism. No layers of abstraction for their own sake.
+      </p>
+
+      <div class="stack">
+        <h3>Engine</h3>
+        <table class="stack-table">
+          <tr><th>Language</th><td>Zig 0.14.1 — explicit allocators, comptime execution, error sets, no hidden control flow</td></tr>
+          <tr><th>Targets</th><td>x86_64-linux-musl, aarch64-linux-musl · all statically linked, no libc dependency at runtime</td></tr>
+          <tr><th>Event loop</th><td>epoll + timerfd + signalfd · single-threaded hot path · <code>io_uring</code> architecture ready, not yet default</td></tr>
+          <tr><th>Log ingest</th><td>inotify with rename / copytruncate / delete-create rotation detection · 64-byte fingerprint to catch copytruncate races</td></tr>
+          <tr><th>Parser</th><td>comptime DSL compiles to a specialized <code>MatchFn</code> per pattern · no regex engine in the process · zero-alloc hot path verified with <code>FailingAllocator</code></td></tr>
+          <tr><th>State tracker</th><td>fixed-buffer allocators · per-IP 128-slot attempt ring buffer · hard memory ceiling · CRC-checked atomic state persistence</td></tr>
+          <tr><th>Firewall</th><td>pure netlink for nftables (no libnftnl, no shelling to <code>nft</code>) · argv subprocess for iptables and ipset as legacy fallbacks</td></tr>
+          <tr><th>IPC</th><td>Unix domain socket · <code>SO_PEERCRED</code> peer authentication · length-prefixed binary protocol · 8 concurrent clients</td></tr>
+          <tr><th>Metrics</th><td>built-in HTTP/1.1 server · Prometheus text exposition · per-jail labels · bind-restricted, read-only</td></tr>
+          <tr><th>Events</th><td>WebSocket (RFC 6455) · <code>attack_detected</code>, <code>ip_banned</code>, <code>ip_unbanned</code>, <code>metrics_update</code> · 128-client cap</td></tr>
+          <tr><th>Config</th><td>native TOML parser (hand-written, zero-copy slices) · <code>fail2ban</code> <code>jail.conf</code> + <code>filter.d</code> + <code>action.d</code> importer</td></tr>
+          <tr><th>Testing</th><td><code>std.testing.allocator</code> (leak detection) · <code>FailingAllocator</code> (OOM paths) · fuzz corpora for parser, IP parser, IPC protocol, TOML config · integration harness with subprocess daemon</td></tr>
+        </table>
+
+        <h3>Web + dashboard</h3>
+        <table class="stack-table">
+          <tr><th>Framework</th><td>Astro 4 · TypeScript strict · zero React, zero xterm.js, zero bundled regex parsers</td></tr>
+          <tr><th>Dashboard</th><td>three pure-Astro panes · custom ~50-LOC Prometheus text-exposition parser · exponential backoff WS with replay-mode fallback</td></tr>
+          <tr><th>Deploy</th><td>Cloudflare Pages (static assets only, no Workers runtime for the marketing site)</td></tr>
+          <tr><th>Diagrams</th><td>mermaid · client-side render · click-to-enlarge modal for architecture + threat-model data flows</td></tr>
+        </table>
+
+        <h3>Infrastructure</h3>
+        <table class="stack-table">
+          <tr><th>Honeypot</th><td>AWS Lightsail <code>micro_3_0</code> · Debian 13 · us-east-2 · $7/mo</td></tr>
+          <tr><th>Public edge</th><td>Cloudflare Tunnel (named, outbound-only) · no public reverse proxy, no open origin, no fixed inbound port exposed for the control plane</td></tr>
+          <tr><th>DNS + CDN</th><td>Cloudflare</td></tr>
+          <tr><th>Honeypot services</th><td>real <code>sshd</code> on :22 · real nginx on :80 with <code>wp-login</code> / <code>xmlrpc</code> / <code>admin</code> / <code>.env</code> decoys · real <code>auditd</code> · real AppArmor · attackers see no simulation</td></tr>
+          <tr><th>Daemon privilege</th><td><code>CAP_NET_ADMIN</code> + <code>CAP_DAC_READ_SEARCH</code> only · <code>NoNewPrivileges=yes</code> · <code>ProtectSystem=strict</code> · <code>RuntimeDirectory=fail2zig</code> · seccomp syscall filter · <code>systemd-analyze security</code> score 2.4 (OK)</td></tr>
+        </table>
+
+        <h3>Developer tooling</h3>
+        <table class="stack-table">
+          <tr><th>Build</th><td><code>zig build</code> (native + cross-compile matrix) · pnpm for web · Makefile targets for bench/fuzz/lint/release</td></tr>
+          <tr><th>Formatting</th><td><code>zig fmt</code> CI-enforced · zero style-debate policy · all 54 <code>.zig</code> files carry SPDX + copyright headers (CI-checked)</td></tr>
+          <tr><th>CI</th><td>GitHub Actions · <code>ci.yml</code>: fmt + build + test + cross-compile smoke + shellcheck + yamllint + SPDX · <code>codeql.yml</code> · <code>dependency-review.yml</code></td></tr>
+          <tr><th>Release</th><td>GitHub Actions · <code>release.yml</code>: SHA-pinned Zig download · cross-compile + static-link verification · <code>llvm-strip</code> · <code>SHA256SUMS</code> manifest · post-release self-verify job that re-downloads published assets</td></tr>
+          <tr><th>Assistant</th><td>Claude Code — architecture discussion, scaffolding, test harnesses, honeypot provisioning, design iteration. Every commit reviewed by hand.</td></tr>
+        </table>
+      </div>
+    </section>
+
+    <!-- install ────────────────────────────────────────────── -->
+    <section class="section">
+      <h2>Try it</h2>
+      <p>
+        The biggest operator complaint about fail2ban has always been
+        setup pain. fail2zig's answer is three commands. The installer
+        pulls from the signed GitHub release, SHA-verifies every asset,
+        and drops a hardened systemd unit.
+      </p>
+
+      <pre class="code"><code># one-shot install · downloads, verifies, places files on disk
+curl -fsSL https://github.com/ul0gic/fail2zig/raw/main/scripts/install.sh | sudo bash
+
+# enable the hardened service
+sudo systemctl enable --now fail2zig
+
+# check the daemon
+fail2zig-client status</code></pre>
+
+      <p class="small">
+        Full install options (including manual curl + sha256sum, build-from-source,
+        dry-run) plus the fail2ban migration guide live at
+        <a href="/">fail2zig.com</a>.
+      </p>
+    </section>
+
+    <!-- thanks ────────────────────────────────────────────── -->
+    <section class="section thanks">
+      <h2>Thanks</h2>
+
+      <article>
+        <h3>Vibe Rubin and the VibeJam judges</h3>
+        <p>
+          For hosting this edition of VibeJam and — specifically — for the
+          <em>serious software</em> framing. That theme filter mattered. It
+          pushed me toward shipping a real tool instead of yet another
+          demo, and it's the reason this submission exists in its current
+          shape. r/vibecoding is a community that keeps raising its own
+          bar. Grateful to be part of it.
+        </p>
+      </article>
+
+      <article>
+        <h3>Alan</h3>
+        <p>
+          For six months, every time I showed up with another iPhone app
+          or side-quest or random weekend build, Alan said the same
+          three words.
+        </p>
+        <blockquote>Stay in your lane.</blockquote>
+        <p>
+          The lane being that I'm a security architect, and the hard
+          problems were already right under my nose. I kept not
+          listening. This submission is me finally listening. Thanks,
+          brother — for the signal in the noise.
+        </p>
+      </article>
+
+      <article>
+        <h3>fail2ban</h3>
+        <p>
+          Twenty years of service protecting the open internet from its own
+          worst traffic. fail2zig stands entirely on the shoulders of that
+          work: the <code>jail.conf</code> format, the filter regexes, the
+          operator vocabulary — every concept that makes fail2zig familiar
+          on day one came from fail2ban. This submission is a modern
+          implementation of an idea fail2ban already proved. Credit where
+          credit is due.
+        </p>
+      </article>
+    </section>
+
+    <!-- closing ────────────────────────────────────────────── -->
+    <section class="closing">
+      <p>
+        fail2zig — <a href="https://github.com/ul0gic/fail2zig" rel="noopener">github.com/ul0gic/fail2zig</a>
+      </p>
+      <p class="tiny">
+        AGPL-3.0-or-later · "fail2zig" ™ 2026 · built for VibeJam Spring '26 ·
+        <a href="/terms">terms</a> · <a href="/privacy">privacy</a>
+      </p>
+    </section>
+
+  </div>
+</BaseLayout>
+
+<style>
+  .vibejam-wrap {
+    max-width: 1040px;
+    margin: 40px auto 120px;
+    padding: 0 32px;
+  }
+
+  /* ── submission slip ─────────────────────────────────── */
+
+  .slip {
+    border: 1px solid var(--line);
+    padding: 20px 24px;
+    margin-bottom: 64px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--fg-body);
+    background: var(--bg-elev);
+  }
+  .slip-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--line-soft);
+    margin-bottom: 16px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  .slip-event {
+    color: var(--accent);
+    font-weight: 600;
+    font-size: 12px;
+  }
+  .slip-id {
+    color: var(--fg-faint);
+    font-size: 10.5px;
+  }
+  .slip-grid {
+    display: grid;
+    gap: 4px 32px;
+    grid-template-columns: 1fr 1fr;
+  }
+  .slip-grid dl {
+    margin: 0;
+    display: grid;
+    grid-template-columns: 100px 1fr;
+    gap: 16px;
+    line-height: 1.7;
+  }
+  .slip-grid dt {
+    color: var(--fg-faint);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    font-size: 10.5px;
+  }
+  .slip-grid dd {
+    margin: 0;
+    color: var(--fg);
+  }
+  .slip-grid dd a {
+    color: var(--accent);
+    text-decoration: none;
+  }
+  .slip-grid dd a:hover {
+    text-decoration: underline;
+  }
+  @media (max-width: 720px) {
+    .slip-grid { grid-template-columns: 1fr; }
+    .slip-grid dl { grid-template-columns: 90px 1fr; }
+  }
+
+  /* ── hero ─────────────────────────────────── */
+
+  .hero {
+    margin-bottom: 72px;
+  }
+  .hero h1 {
+    font-family: var(--mono);
+    font-size: 84px;
+    font-weight: 600;
+    letter-spacing: -0.03em;
+    margin: 0 0 6px;
+    color: var(--fg);
+    line-height: 0.95;
+  }
+  .hero .tagline {
+    font-size: 24px;
+    font-weight: 500;
+    color: var(--accent);
+    margin: 0 0 28px;
+    letter-spacing: -0.01em;
+    font-family: var(--sans);
+  }
+  .hero .lede {
+    font-size: 17px;
+    line-height: 1.65;
+    color: var(--fg-body);
+    max-width: 62ch;
+    margin: 0 0 36px;
+  }
+  .cta-row {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    font-family: var(--mono);
+    font-size: 13px;
+  }
+  .cta-primary,
+  .cta-secondary {
+    padding: 10px 18px;
+    border: 1px solid var(--line);
+    color: var(--fg);
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    text-decoration: none;
+  }
+  .cta-primary {
+    background: var(--accent-ghost);
+    border-color: var(--accent-dim);
+    color: var(--fg);
+  }
+  .cta-primary:hover,
+  .cta-secondary:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  @media (max-width: 720px) {
+    .hero h1 { font-size: 56px; }
+    .hero .tagline { font-size: 20px; }
+  }
+
+  /* ── sections ─────────────────────────────────── */
+
+  .section {
+    margin: 80px 0;
+  }
+  .section h2 {
+    font-size: 28px;
+    font-weight: 500;
+    letter-spacing: -0.01em;
+    margin: 0 0 8px;
+    color: var(--fg);
+  }
+  .section h3 {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--fg-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    margin: 36px 0 14px;
+  }
+  .section p {
+    font-size: 15px;
+    line-height: 1.7;
+    color: var(--fg-body);
+    max-width: 64ch;
+    margin: 0 0 18px;
+  }
+  .section em {
+    font-style: italic;
+    color: var(--fg);
+  }
+  .section code {
+    font-family: var(--mono);
+    font-size: 0.9em;
+    background: var(--bg-elev);
+    padding: 1px 6px;
+    border: 1px solid var(--line-soft);
+  }
+  .section-lede {
+    font-family: var(--mono) !important;
+    font-size: 12.5px !important;
+    color: var(--fg-faint) !important;
+    letter-spacing: 0.04em !important;
+    text-transform: uppercase !important;
+    margin: 0 0 24px !important;
+  }
+
+  .pull {
+    font-size: 20px !important;
+    color: var(--accent) !important;
+    font-weight: 500 !important;
+    margin: 28px 0 !important;
+    border-left: 2px solid var(--accent);
+    padding-left: 20px;
+    line-height: 1.4 !important;
+    max-width: 40ch !important;
+  }
+
+  /* ── stat grid ─────────────────────────────────── */
+
+  .stat-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 40px;
+    margin-top: 24px;
+  }
+  .stat-col table {
+    border-collapse: collapse;
+    width: 100%;
+    font-family: var(--mono);
+    font-size: 12.5px;
+  }
+  .stat-col td {
+    padding: 7px 10px;
+    border-bottom: 1px dashed var(--line-soft);
+    color: var(--fg-body);
+    vertical-align: top;
+  }
+  .stat-col td.num {
+    text-align: right;
+    color: var(--fg);
+    white-space: nowrap;
+  }
+  @media (max-width: 820px) {
+    .stat-grid { grid-template-columns: 1fr; gap: 24px; }
+  }
+
+  /* ── proof grid ─────────────────────────────────── */
+
+  .proof-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+    margin-top: 24px;
+  }
+  .proof-card {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 22px;
+    border: 1px solid var(--line);
+    color: var(--fg);
+    background: var(--bg-elev);
+    text-decoration: none;
+    transition: border-color 0.1s ease;
+  }
+  .proof-card:hover {
+    border-color: var(--accent);
+  }
+  .proof-kind {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.1em;
+    color: var(--accent);
+    text-transform: uppercase;
+  }
+  .proof-title {
+    font-family: var(--mono);
+    font-size: 14px;
+    color: var(--fg);
+  }
+  .proof-desc {
+    font-size: 12.5px;
+    line-height: 1.6;
+    color: var(--fg-faint);
+  }
+  .proof-desc code {
+    font-size: 0.9em;
+    background: transparent;
+    border: 0;
+    padding: 0;
+    color: var(--fg-body);
+  }
+  @media (max-width: 820px) {
+    .proof-grid { grid-template-columns: 1fr; }
+  }
+
+  /* ── tech stack tables ─────────────────────────────────── */
+
+  .stack-table {
+    border-collapse: collapse;
+    width: 100%;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    margin-bottom: 16px;
+  }
+  .stack-table th,
+  .stack-table td {
+    padding: 9px 12px;
+    vertical-align: top;
+    text-align: left;
+    border-bottom: 1px dashed var(--line-soft);
+    line-height: 1.6;
+  }
+  .stack-table th {
+    color: var(--fg-dim);
+    width: 140px;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    font-size: 10.5px;
+  }
+  .stack-table td {
+    color: var(--fg-body);
+  }
+  .stack-table code {
+    font-size: 0.92em;
+    background: var(--bg);
+    padding: 1px 4px;
+    border: 1px solid var(--line-soft);
+  }
+
+  /* ── install code block ─────────────────────────────────── */
+
+  .code {
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.7;
+    background: var(--nav-bg, #0A0A0A);
+    color: var(--nav-fg, #ECE7DE);
+    padding: 18px 22px;
+    border: 1px solid var(--line);
+    overflow-x: auto;
+    margin: 16px 0;
+  }
+  .code code {
+    color: inherit;
+    font-family: inherit;
+    background: transparent;
+    padding: 0;
+    border: 0;
+  }
+  .small {
+    font-size: 13px !important;
+    color: var(--fg-faint) !important;
+  }
+
+  /* ── thanks ─────────────────────────────────── */
+
+  .thanks article {
+    margin-bottom: 36px;
+    max-width: 64ch;
+  }
+  .thanks article:last-child {
+    margin-bottom: 0;
+  }
+  .thanks h3 {
+    font-family: var(--sans) !important;
+    font-size: 16px !important;
+    font-weight: 600 !important;
+    color: var(--fg) !important;
+    text-transform: none !important;
+    letter-spacing: -0.01em !important;
+    margin: 0 0 12px !important;
+  }
+  .thanks blockquote {
+    font-family: var(--mono);
+    font-size: 17px;
+    color: var(--fg);
+    background: var(--bg-elev);
+    border-left: 2px solid var(--accent-dim);
+    padding: 14px 22px;
+    margin: 16px 0;
+    max-width: 36ch;
+    letter-spacing: -0.005em;
+    font-style: normal;
+  }
+  .thanks code {
+    font-family: var(--mono);
+    font-size: 0.92em;
+    background: var(--bg-elev);
+    padding: 1px 6px;
+    border: 1px solid var(--line-soft);
+  }
+
+  /* ── closing ─────────────────────────────────── */
+
+  .closing {
+    margin-top: 96px;
+    padding-top: 28px;
+    border-top: 1px solid var(--line-soft);
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--fg-body);
+  }
+  .closing p {
+    margin: 0 0 6px;
+  }
+  .closing a {
+    color: var(--fg);
+    border-bottom: 1px solid var(--accent-ghost);
+    text-decoration: none;
+  }
+  .closing a:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+  .closing .tiny {
+    font-size: 11px;
+    color: var(--fg-faint);
+    letter-spacing: 0.02em;
+  }
+</style>
