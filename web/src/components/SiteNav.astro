@@ -10,7 +10,7 @@ const links: readonly { href: string; label: string }[] = [
   { href: '/docs', label: 'Docs' },
   { href: '/threat-model', label: 'Threat Model' },
   { href: '/why', label: 'Why' },
-  { href: '/see-it-live', label: 'See it Live' },
+  { href: '/demo', label: 'Demo' },
 ];
 
 const isActive = (href: string): boolean => {
@@ -25,6 +25,7 @@ const isActive = (href: string): boolean => {
   <div class="nav-inner">
     <a href="/" class="brand">
       <span class="brand-name">fail<span class="brand-2">2</span>zig</span>
+      <span class="nav-tag" title="fail2zig v0.1.0 — first public release">v0.1.0</span>
     </a>
     <div class="nav-links">
       {
@@ -38,11 +39,10 @@ const isActive = (href: string): boolean => {
     <div class="nav-right">
       <a
         href="/changelog"
-        class:list={['nav-changelog', { active: isActive('/changelog') }]}
+        class:list={['nav-cta', { active: isActive('/changelog') }]}
       >
         Changelog
       </a>
-      <span class="nav-tag" title="Pre-1.0 preview release">preview</span>
       <a
         href="https://github.com/ul0gic/fail2zig"
         class="nav-cta"
@@ -60,18 +60,15 @@ const isActive = (href: string): boolean => {
   .brand-2 {
     color: var(--accent);
   }
-  .nav-changelog {
-    font-size: 13px;
-  }
   .nav-tag {
     font-family: var(--mono);
     font-size: 10px;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: var(--fg-mute);
-    border: 1px solid var(--line);
-    padding: 2px 7px;
-    margin: 0 2px;
-    line-height: 1.4;
+    letter-spacing: 0.04em;
+    color: oklch(0.78 0.12 150);
+    border: 1px solid oklch(0.56 0.12 150);
+    padding: 1px 5px;
+    line-height: 1;
+    align-self: flex-end;
+    margin-bottom: 5px;
   }
 </style>
