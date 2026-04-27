@@ -101,7 +101,7 @@ jobs:
           cp zig-out/bin/fail2zig-client  "dist/fail2zig-client-v${v}-${t}"
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fail2zig-${{ matrix.target }}
           path: dist/
