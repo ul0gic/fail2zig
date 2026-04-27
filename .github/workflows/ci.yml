@@ -166,7 +166,7 @@ jobs:
             exit 1
           fi
       - name: Upload cross-compile artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fail2zig-${{ matrix.target }}
           path: |
