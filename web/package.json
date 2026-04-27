@@ -42,7 +42,7 @@
     "globals": "^17.5.0",
     "prettier": "^3.8.3",
     "prettier-plugin-astro": "^0.14.1",
-    "typescript-eslint": "^8.59.0",
+    "typescript-eslint": "^8.59.1",
     "unist-util-visit": "^5.1.0"
   },
   "packageManager": "pnpm@10.33.0",
