@@ -602,20 +602,16 @@ contributing — see [Trademark](#trademark) below.
 ### Development setup
 
 ```bash
-# Engine + client
 git clone https://github.com/ul0gic/fail2zig
 cd fail2zig
 zig build test          # ~2s · green, zero leaks
-
-# Web (marketing site + demo dashboard)
-cd web
-pnpm install
-pnpm dev                # local preview on :4321
 ```
 
 **Requires:**
 - [Zig 0.14.1](https://ziglang.org/download/) exactly. Newer versions may break the build.
-- For web work: Node via [nvm](https://github.com/nvm-sh/nvm) (never apt / NodeSource), pnpm 9+.
+
+The marketing site (fail2zig.com) lives in a separate repo and is not
+covered here.
 
 ### Standards
 
@@ -630,11 +626,6 @@ bugs early and keep the binary small.
 - No `@setRuntimeSafety(false)` without a comment proving the safety invariant
 - All tests use `std.testing.allocator` for leak detection
 - SPDX header on every `.zig` file (CI-enforced)
-
-**Web (`web/`):**
-- `pnpm format:check`, `pnpm lint`, `pnpm typecheck` all green
-- No added runtime framework dependencies — Astro + HTML + CSS is the stack
-- Theme tokens via `src/styles/theme.css`, no inline styles in production
 
 ### A good PR
 

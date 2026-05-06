@@ -6,19 +6,11 @@
 zig-out/
 zig-cache/
 .zig-cache/
-node_modules/
 
-# web/ Astro subproject build artifacts
-web/dist/
-web/.astro/
-
-# Node debug logs (web/)
+# Logs
 *.log
-npm-debug.log*
-pnpm-debug.log*
-yarn-debug.log*
 
-# Editor/OS cruft
+# Editor / OS cruft
 .DS_Store
 *.o
 *.d
@@ -30,24 +22,12 @@ yarn-debug.log*
 !.vscode/extensions.json
 .idea/
 
-# Playwright
+# Agent / MCP debug artifacts dropped at repo root
 .playwright-mcp/
-# MCP screenshots land at repo root without the Screenshot* prefix, so
-# catch the usual names we generate while debugging UI changes.
 /*.png
-!/public/*.png
-
-# Secrets
-.env
-
-# Accidental artifacts at repo root — this is a Zig project, any
-# package.json or lockfile here is from pnpm being run at the wrong
-# cwd. Real Node manifests live under web/ only.
-/package.json
-/pnpm-lock.yaml
-
-# Debug / macOS screenshots. Narrow-no-break-space in macOS filenames,
-# so the literal 'Screenshot*.png' pattern is deliberate.
 Screenshot*.png
 Screenshot*.jpg
 Screenshot*.jpeg
+
+# Secrets
+.env

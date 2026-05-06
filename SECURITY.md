@@ -50,8 +50,7 @@ In scope:
 - The fail2zig daemon and the `fail2zig-client` CLI.
 - The filter definitions shipped in the repository.
 - The release binaries published on the releases page.
-- The Astro-built marketing and documentation site served from
-  `fail2zig.com`.
+- The fail2zig.com marketing and documentation site.
 
 Out of scope:
 
