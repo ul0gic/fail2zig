@@ -1,0 +1,11 @@
+# Disable blank issues — force people through one of the templates.
+# Keeps the issue tracker scannable and consistent.
+blank_issues_enabled: false
+
+contact_links:
+  - name: Security vulnerability (private disclosure)
+    url: https://github.com/ul0gic/fail2zig/security/advisories/new
+    about: Do NOT open a public issue for vulnerabilities. Use GitHub's private advisory channel.
+  - name: Question / discussion
+    url: https://github.com/ul0gic/fail2zig/discussions
+    about: For open-ended questions, design discussions, or "how do I…" topics. Issues are for actionable work.

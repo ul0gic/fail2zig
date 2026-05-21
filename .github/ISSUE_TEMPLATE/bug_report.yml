@@ -1,0 +1,91 @@
+name: Bug report
+description: Something doesn't work the way it's supposed to.
+title: "[bug] "
+labels: ["type:bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Please give us enough detail to reproduce it on our end — the more concrete, the faster the fix.
+
+        **For security vulnerabilities:** Do NOT use this template. Open a [private security advisory](https://github.com/ul0gic/fail2zig/security/advisories/new) instead.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: A clear, concise description of the bug. What did you observe?
+      placeholder: "fail2zig stopped banning IPs after ~6 hours of uptime, even though `lines_matched_total` kept incrementing."
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: What should have happened instead?
+      placeholder: "Bans should continue to fire whenever the match threshold is crossed, regardless of uptime."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands, config snippets, log lines — whatever makes this reproducible.
+      placeholder: |
+        1. fail2zig.toml: `[defaults] maxretry=3, findtime=60, bantime=300`
+        2. Run: `sudo systemctl start fail2zig`
+        3. Trigger 3 ssh auth failures from a test IP within 60 s
+        4. `nft list set inet fail2zig fail2zig_bans` shows empty set
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: fail2zig version
+      description: Output of `fail2zig --version`
+      placeholder: "fail2zig 0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS + kernel
+      description: Output of `uname -a` plus distro
+      placeholder: "Debian 13, Linux 6.12.74 x86_64"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Firewall backend
+      options:
+        - nftables
+        - iptables
+        - ipset
+        - not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Output of `journalctl -u fail2zig --since "1 hour ago"`, or whatever's relevant. Strip anything sensitive.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Config (redacted)
+      description: Your fail2zig.toml (or jail.conf) — strip IPs, hostnames, anything sensitive.
+      render: toml
+    validations:
+      required: false

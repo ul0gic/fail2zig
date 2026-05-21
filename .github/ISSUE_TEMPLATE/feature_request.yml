@@ -1,0 +1,75 @@
+name: Feature request / enhancement
+description: Propose a new feature, behavioral change, or improvement.
+title: "[feat] "
+labels: ["type:enh"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for proposing something. fail2zig deliberately avoids feature bloat — the bar for "yes" is "this solves a concrete problem an operator hits, and the cost (binary size, attack surface, maintenance) is justified."
+
+        **Filter contribution?** Use the [Filter contribution](https://github.com/ul0gic/fail2zig/issues/new?template=filter_contribution.yml) template instead.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What's painful right now? What's the operator's day-to-day frustration?
+      placeholder: |
+        "When fail2zig restarts, all active bans are reapplied to nftables, but the kernel-level
+         packet counters reset. I lose visibility into how much traffic each ban has actually dropped."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you change? Be as specific as you can — config knobs, CLI flags, data shapes, etc.
+      placeholder: |
+        Add `fail2zig_kernel_drops_total{ip,jail}` to the metrics endpoint, sourced from
+        `nft list set inet fail2zig fail2zig_bans` packet counters. Sampled at the existing
+        1 Hz tick.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What else did you think about? Why did you reject it?
+      placeholder: |
+        Could parse `dmesg` for kernel drops, but that's noisy and not jail-attributable.
+        Could log every drop, but that's the volume problem we're trying to NOT cause.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Where does this live?
+      description: Pick the closest area. If it touches multiple, pick the primary one.
+      options:
+        - "engine — core daemon"
+        - "filters — pattern library"
+        - "firewall — backends"
+        - "client — fail2zig-client CLI"
+        - "config — TOML / fail2ban compat"
+        - "metrics / observability"
+        - "docs"
+        - "build / packaging / CI"
+        - "not sure"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: willing-to-pr
+    attributes:
+      label: Would you be willing to submit a PR?
+      description: No pressure — proposing is valuable on its own. But it helps us prioritize.
+      options:
+        - "Yes, I'd like to implement this"
+        - "Yes, with some guidance"
+        - "No, just proposing the idea"
+    validations:
+      required: true

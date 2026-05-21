@@ -1,0 +1,123 @@
+name: Filter contribution
+description: Propose a new filter for fail2zig's pattern library (Caddy, Vaultwarden, Authelia, etc.).
+title: "[filter] add filter for "
+labels: ["type:enh", "area:filters", "good first issue"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ### Filter contributions are the easiest way to help fail2zig.
+
+        fail2zig deliberately ships with comptime-baked filters — there's no runtime regex engine,
+        no plugin system, no dynamic code loading. Filters land via PR, get reviewed for security
+        and pattern correctness, and ship in the next release. Each filter is a few dozen lines of
+        Zig.
+
+        **Before filing:** check that this service isn't already covered in [`engine/filters/`](https://github.com/ul0gic/fail2zig/tree/main/engine/filters)
+        and that there isn't [an open filter issue](https://github.com/ul0gic/fail2zig/issues?q=is%3Aissue+label%3A%22area%3Afilters%22) for it.
+
+        Worked example to model your filter on: `engine/filters/sshd.zig`.
+
+  - type: input
+    id: service
+    attributes:
+      label: Service name
+      description: The exact upstream name (canonical casing, no abbreviation).
+      placeholder: "Vaultwarden"
+    validations:
+      required: true
+
+  - type: input
+    id: service-url
+    attributes:
+      label: Project URL
+      description: Upstream homepage or GitHub link.
+      placeholder: "https://github.com/dani-garcia/vaultwarden"
+    validations:
+      required: true
+
+  - type: textarea
+    id: why-relevant
+    attributes:
+      label: Why this matters
+      description: What attack pattern are operators seeing? Why does this belong in fail2zig?
+      placeholder: |
+        Vaultwarden is a self-hosted Bitwarden server running on homelabs and small business
+        installations. The default UI is public-facing, and credential stuffing / dictionary
+        attacks against `/identity/connect/token` are constant. Operators currently have no
+        good way to ban the offending IPs without writing a custom fail2ban filter.
+    validations:
+      required: true
+
+  - type: textarea
+    id: attack-pattern
+    attributes:
+      label: What does an attack look like in logs?
+      description: |
+        Paste 3–5 real (or realistic) log lines that should trigger a ban. Then list any common
+        false-positive shapes — auth failures from legitimate users, retries on flaky networks, etc.
+        The filter should match the attack lines and NOT match the false-positive shapes.
+      placeholder: |
+        # Should match — failed login (3 attempts close together = ban):
+        2026-05-20 14:23:11 [ERROR] Username or password is incorrect. Try again. IP: 198.51.100.42
+        2026-05-20 14:23:14 [ERROR] Username or password is incorrect. Try again. IP: 198.51.100.42
+        2026-05-20 14:23:18 [ERROR] Username or password is incorrect. Try again. IP: 198.51.100.42
+
+        # Should NOT match — successful login:
+        2026-05-20 14:25:00 [INFO]  User alice@example.com logged in successfully from 203.0.113.5
+
+        # Should NOT match — admin login from CLI (no IP):
+        2026-05-20 14:30:00 [INFO]  Admin command issued via CLI
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: log-path
+    attributes:
+      label: Default log location
+      description: Where do these lines land on a default install?
+      placeholder: "/var/log/vaultwarden/vaultwarden.log (or stdout under systemd-journald)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: log-format
+    attributes:
+      label: Log format
+      options:
+        - "Plain text (one line per event)"
+        - "JSON (one object per line)"
+        - "Multiline (events span multiple lines)"
+        - "Mixed / depends on config"
+    validations:
+      required: true
+
+  - type: input
+    id: ip-location
+    attributes:
+      label: Where does the source IP appear in the log line?
+      description: Position, key name, prefix — whatever helps a pattern author.
+      placeholder: "After 'IP: ' literal, at end of line. Sometimes prefixed with 'X-Forwarded-For:' when behind a reverse proxy."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: willing-to-pr
+    attributes:
+      label: Will you submit the PR?
+      options:
+        - "Yes, I'll implement and test it"
+        - "Yes, with guidance from a maintainer"
+        - "No, I'm proposing it for someone else to pick up"
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Edge cases, version-specific quirks, related services, etc.
+      placeholder: "Vaultwarden 1.30+ changed the log line format; older versions used a different template."
+    validations:
+      required: false
