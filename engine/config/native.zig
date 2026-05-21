@@ -44,6 +44,7 @@ pub const Error = error{
     UnterminatedString,
     InvalidEscape,
     InvalidInteger,
+    InvalidFloat,
     InvalidBool,
     InvalidArray,
     DuplicateKey,
@@ -500,6 +501,7 @@ const Parser = struct {
     const Value = union(enum) {
         string: []const u8,
         int: i64,
+        float: f64,
         boolean: bool,
         str_array: []const []const u8,
     };
@@ -511,7 +513,7 @@ const Parser = struct {
             '"' => return .{ .string = try self.parseString() },
             '[' => return .{ .str_array = try self.parseStringArray() },
             't', 'f' => return .{ .boolean = try self.parseBool() },
-            '-', '0'...'9' => return .{ .int = try self.parseInt() },
+            '-', '0'...'9' => return self.parseNumber(),
             else => return error.UnexpectedToken,
         }
     }
@@ -593,6 +595,41 @@ const Parser = struct {
         if (self.pos == digit_start) return error.InvalidInteger;
         const slice = self.src[start..self.pos];
         return std.fmt.parseInt(i64, slice, 10) catch return error.InvalidInteger;
+    }
+
+    /// Parse a numeric literal. Returns `.int` for integer literals (no
+    /// decimal point) and `.float` for literals containing a `.`. Used
+    /// for fields like `bantime_increment_factor` whose target type is
+    /// `f64` — operators expect to be able to write `factor = 1.5`.
+    /// The choice between int and float is made by the caller via
+    /// `asInt` / `asFloat` so int-only fields still reject `1.5`.
+    fn parseNumber(self: *Parser) Error!Value {
+        const start = self.pos;
+        if (self.peek() == '-') self.advance();
+        const digit_start = self.pos;
+        while (!self.eof()) {
+            const c = self.peek();
+            if (c < '0' or c > '9') break;
+            self.advance();
+        }
+        if (self.pos == digit_start) return error.InvalidInteger;
+        if (self.eof() or self.peek() != '.') {
+            const slice = self.src[start..self.pos];
+            const n = std.fmt.parseInt(i64, slice, 10) catch return error.InvalidInteger;
+            return .{ .int = n };
+        }
+        // Float path: consume '.' and at least one fractional digit.
+        self.advance();
+        const frac_start = self.pos;
+        while (!self.eof()) {
+            const c = self.peek();
+            if (c < '0' or c > '9') break;
+            self.advance();
+        }
+        if (self.pos == frac_start) return error.InvalidFloat;
+        const slice = self.src[start..self.pos];
+        const f = std.fmt.parseFloat(f64, slice) catch return error.InvalidFloat;
+        return .{ .float = f };
     }
 
     fn parseStringArray(self: *Parser) Error![]const []const u8 {
@@ -713,9 +750,9 @@ const Parser = struct {
         } else if (std.mem.eql(u8, key, "bantime_increment_enabled")) {
             self.defaults.bantime_increment.enabled = try asBool(v);
         } else if (std.mem.eql(u8, key, "bantime_increment_multiplier")) {
-            self.defaults.bantime_increment.multiplier = @floatFromInt(try asInt(v));
+            self.defaults.bantime_increment.multiplier = try asFloat(v);
         } else if (std.mem.eql(u8, key, "bantime_increment_factor")) {
-            self.defaults.bantime_increment.factor = @floatFromInt(try asInt(v));
+            self.defaults.bantime_increment.factor = try asFloat(v);
         } else if (std.mem.eql(u8, key, "bantime_increment_formula")) {
             const s = try asString(v);
             if (std.mem.eql(u8, s, "linear")) {
@@ -761,10 +798,10 @@ const Parser = struct {
             j.bantime_increment.enabled = try asBool(v);
             j.bantime_increment_explicit = true;
         } else if (std.mem.eql(u8, key, "bantime_increment_multiplier")) {
-            j.bantime_increment.multiplier = @floatFromInt(try asInt(v));
+            j.bantime_increment.multiplier = try asFloat(v);
             j.bantime_increment_explicit = true;
         } else if (std.mem.eql(u8, key, "bantime_increment_factor")) {
-            j.bantime_increment.factor = @floatFromInt(try asInt(v));
+            j.bantime_increment.factor = try asFloat(v);
             j.bantime_increment_explicit = true;
         } else if (std.mem.eql(u8, key, "bantime_increment_formula")) {
             const s = try asString(v);
@@ -806,6 +843,17 @@ fn asString(v: Parser.Value) Error![]const u8 {
 fn asInt(v: Parser.Value) Error!i64 {
     return switch (v) {
         .int => |n| n,
+        else => error.InvalidValue,
+    };
+}
+
+/// Accept either a TOML integer or float literal and return f64. Used
+/// for fields whose schema type is `f64` (e.g. bantime increment
+/// growth rates) — `factor = 2` and `factor = 1.5` are both valid.
+fn asFloat(v: Parser.Value) Error!f64 {
+    return switch (v) {
+        .int => |n| @floatFromInt(n),
+        .float => |f| f,
         else => error.InvalidValue,
     };
 }
@@ -945,6 +993,77 @@ test "native: parse bantime_increment config" {
     try std.testing.expectEqual(@as(f64, 2.0), bi.multiplier);
     try std.testing.expectEqual(BantimeFormula.exponential, bi.formula);
     try std.testing.expectEqual(@as(shared.Duration, 604800), bi.max_bantime);
+}
+
+test "native: bantime_increment accepts fractional factor in defaults" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[defaults]
+        \\bantime = 600
+        \\findtime = 600
+        \\maxretry = 5
+        \\bantime_increment_enabled = true
+        \\bantime_increment_factor = 1.5
+    ;
+    const cfg = try Config.parse(arena.allocator(), src);
+    try std.testing.expect(cfg.defaults.bantime_increment.enabled);
+    try std.testing.expectEqual(@as(f64, 1.5), cfg.defaults.bantime_increment.factor);
+}
+
+test "native: bantime_increment accepts fractional multiplier in defaults" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[defaults]
+        \\bantime = 600
+        \\findtime = 600
+        \\maxretry = 5
+        \\bantime_increment_enabled = true
+        \\bantime_increment_multiplier = 2.5
+    ;
+    const cfg = try Config.parse(arena.allocator(), src);
+    try std.testing.expectEqual(@as(f64, 2.5), cfg.defaults.bantime_increment.multiplier);
+}
+
+test "native: bantime_increment accepts fractional factor in per-jail block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[jails.sshd]
+        \\filter = "sshd"
+        \\bantime_increment_enabled = true
+        \\bantime_increment_factor = 1.75
+    ;
+    const cfg = try Config.parse(arena.allocator(), src);
+    try std.testing.expectEqual(@as(usize, 1), cfg.jails.len);
+    try std.testing.expectEqual(@as(f64, 1.75), cfg.jails[0].bantime_increment.factor);
+}
+
+test "native: bantime_increment still accepts integer factor/multiplier (regression)" {
+    // Operators using the canonical "doubling per ban" recipe (factor = 2)
+    // must continue to work after fractional support landed. Integers
+    // coerce to f64 — verify both the defaults and per-jail paths.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[defaults]
+        \\bantime = 600
+        \\findtime = 600
+        \\maxretry = 5
+        \\bantime_increment_enabled = true
+        \\bantime_increment_factor = 2
+        \\bantime_increment_multiplier = 3
+        \\[jails.sshd]
+        \\filter = "sshd"
+        \\bantime_increment_enabled = true
+        \\bantime_increment_factor = 4
+    ;
+    const cfg = try Config.parse(arena.allocator(), src);
+    try std.testing.expectEqual(@as(f64, 2.0), cfg.defaults.bantime_increment.factor);
+    try std.testing.expectEqual(@as(f64, 3.0), cfg.defaults.bantime_increment.multiplier);
+    try std.testing.expectEqual(@as(usize, 1), cfg.jails.len);
+    try std.testing.expectEqual(@as(f64, 4.0), cfg.jails[0].bantime_increment.factor);
 }
 
 test "native: parse rejects unclosed string" {
