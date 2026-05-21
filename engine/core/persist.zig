@@ -6,11 +6,11 @@
 //!
 //!     Header (14 bytes):
 //!       magic       [4]u8  = 'F','2','Z','S'
-//!       version     u16    = 1
+//!       version     u16    = 2  (legacy v1 still loadable)
 //!       entry_count u32
 //!       checksum    u32    = CRC32 over the `entry_count` packed entries
 //!
-//!     Entry (117 bytes each):
+//!     Entry (113 bytes each):
 //!       ip_type      u8     (4 or 6)
 //!       ip_bytes     [16]u8 (IPv4 stored in first 4 bytes, rest zero)
 //!       jail         [64]u8 (null-padded to 64)
@@ -20,12 +20,19 @@
 //!       last_attempt  i64
 //!       ban_expiry    i64   (0 = not banned)
 //!
+//! Wire format is identical between v1 and v2. The version bump (ISSUE-007)
+//! signals that the daemon now routes entries to per-jail trackers on
+//! load: any entry whose `jail` field doesn't match a currently-configured
+//! jail goes into the synthetic `__legacy__` tracker. v1 files are still
+//! accepted — the load path treats them the same as v2, and the next
+//! checkpoint rewrites the header at v2.
+//!
 //! Save semantics: write to `<path>.tmp`, fsync, fchmod 0600, rename onto
 //! `path`. Either the previous state remains intact OR the new state is
 //! durable — no torn write.
 //!
-//! Load semantics: validate magic + version; recompute CRC32. On any
-//! integrity failure log a warning and return an empty slice so the
+//! Load semantics: validate magic + version (1 or 2); recompute CRC32. On
+//! any integrity failure log a warning and return an empty slice so the
 //! daemon starts fresh — the priority is staying up, not preserving a
 //! corrupt history.
 //!
@@ -38,6 +45,7 @@ const posix = std.posix;
 const shared = @import("shared");
 
 const state_mod = @import("state.zig");
+const tracker_map_mod = @import("tracker_map.zig");
 
 const IpAddress = shared.IpAddress;
 const JailId = shared.JailId;
@@ -45,13 +53,18 @@ const Timestamp = shared.Timestamp;
 const BanState = shared.BanState;
 const StateTracker = state_mod.StateTracker;
 const IpState = state_mod.IpState;
+const TrackerMap = tracker_map_mod.TrackerMap;
 
 // ============================================================================
 // On-disk constants
 // ============================================================================
 
 pub const magic: [4]u8 = .{ 'F', '2', 'Z', 'S' };
-pub const version: u16 = 1;
+/// Current on-disk version. Saves always write this value.
+pub const version: u16 = 2;
+/// Last version we know how to ingest. Anything outside `[1, version]`
+/// is treated as unknown and the daemon starts fresh.
+pub const min_supported_version: u16 = 1;
 pub const header_size: usize = 4 + 2 + 4 + 4; // 14 bytes
 pub const entry_size: usize = 1 + 16 + 64 + 4 + 4 + 8 + 8 + 8; // 113 bytes
 
@@ -244,9 +257,19 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) Error![]StateEntry {
         return allocator.alloc(StateEntry, 0) catch return error.OutOfMemory;
     }
     const ver = std.mem.readInt(u16, bytes[4..6], .little);
-    if (ver != version) {
-        std.log.warn("persist: state file version {d} (expected {d}); starting fresh", .{ ver, version });
+    if (ver < min_supported_version or ver > version) {
+        std.log.warn("persist: state file version {d} (supported: {d}..{d}); starting fresh", .{ ver, min_supported_version, version });
         return allocator.alloc(StateEntry, 0) catch return error.OutOfMemory;
+    }
+    if (ver < version) {
+        // ISSUE-007 migration shim. v1 files predate per-jail trackers;
+        // their entries already carry the `jail` field so routing on
+        // load is purely a daemon-side decision. The next checkpoint
+        // rewrites the header at the current version.
+        std.log.info(
+            "persist: migrating state file v{d} -> v{d} (per-jail routing); next save will rewrite header",
+            .{ ver, version },
+        );
     }
     const count = std.mem.readInt(u32, bytes[6..10], .little);
     const stored_crc = std.mem.readInt(u32, bytes[10..14], .little);
@@ -359,6 +382,116 @@ pub fn seed(tracker: *StateTracker, entries: []const StateEntry) Error!void {
         };
         _ = &st;
         tracker.map.put(e.ip, st) catch return error.OutOfMemory;
+    }
+}
+
+// ============================================================================
+// Multi-tracker save / seed (ISSUE-007)
+// ============================================================================
+
+/// Persist every tracker in `map` to a single file. Entries from all
+/// trackers are concatenated into the existing flat layout — the
+/// `jail` field on each entry preserves the routing information
+/// needed at load time.
+pub fn saveAll(map: *const TrackerMap, path: []const u8) Error!void {
+    const max_path: usize = 4096;
+    if (path.len == 0 or path.len + 4 > max_path) return error.PathTooLong;
+    var tmp_buf: [max_path]u8 = undefined;
+    @memcpy(tmp_buf[0..path.len], path);
+    const tmp_suffix = ".tmp";
+    @memcpy(tmp_buf[path.len .. path.len + tmp_suffix.len], tmp_suffix);
+    const tmp_path = tmp_buf[0 .. path.len + tmp_suffix.len];
+
+    var file = std.fs.cwd().createFile(tmp_path, .{
+        .mode = 0o600,
+        .truncate = true,
+    }) catch return error.OpenFailed;
+    var close_handled = false;
+    defer if (!close_handled) file.close();
+
+    const writer = file.writer();
+
+    // Count total entries upfront so the header is accurate.
+    var entry_count: u32 = 0;
+    {
+        var it = map.iterator();
+        while (it.next()) |kv| {
+            entry_count += countPersistable(kv.value_ptr.*);
+        }
+    }
+
+    writer.writeAll(&magic) catch return error.WriteFailed;
+    writer.writeInt(u16, version, .little) catch return error.WriteFailed;
+    writer.writeInt(u32, entry_count, .little) catch return error.WriteFailed;
+    writer.writeInt(u32, 0, .little) catch return error.WriteFailed;
+
+    var crc = std.hash.Crc32.init();
+    var entry_buf: [entry_size]u8 = undefined;
+    var written: u32 = 0;
+    {
+        var it = map.iterator();
+        while (it.next()) |kv| {
+            var inner = kv.value_ptr.*.iterator();
+            while (inner.next()) |kv2| {
+                const ip = kv2.key_ptr.*;
+                const st = kv2.value_ptr;
+                encodeEntry(&entry_buf, ip, st);
+                writer.writeAll(&entry_buf) catch return error.WriteFailed;
+                crc.update(&entry_buf);
+                written += 1;
+            }
+        }
+    }
+    if (written != entry_count) return error.WriteFailed;
+
+    const final_crc = crc.final();
+    file.seekTo(header_size - 4) catch return error.WriteFailed;
+    writer.writeInt(u32, final_crc, .little) catch return error.WriteFailed;
+
+    posix.fsync(file.handle) catch return error.FsyncFailed;
+    posix.fchmod(file.handle, 0o600) catch return error.ChmodFailed;
+
+    file.close();
+    close_handled = true;
+
+    std.fs.cwd().rename(tmp_path, path) catch return error.RenameFailed;
+}
+
+/// Route loaded `entries` into the matching per-jail tracker. Entries
+/// whose `jail` field doesn't match any known tracker land in the
+/// synthetic legacy tracker — the caller must have populated it via
+/// `TrackerMap.ensureLegacy` before invoking this helper.
+///
+/// Counters returned by reference: `routed` increments per successful
+/// placement, `legacy` increments for orphan entries that fell back to
+/// the legacy bucket. Either may be null if the caller doesn't care.
+pub fn seedMap(
+    map: *TrackerMap,
+    entries: []const StateEntry,
+    routed: ?*u32,
+    legacy: ?*u32,
+) Error!void {
+    for (entries) |e| {
+        const jail_name = e.jail.slice();
+        const target = map.get(jail_name) orelse blk: {
+            if (legacy) |c| c.* += 1;
+            break :blk map.get(tracker_map_mod.legacy_jail_name) orelse
+                return error.OutOfMemory;
+        };
+
+        const st: IpState = .{
+            .jail = e.jail,
+            .attempt_count = e.attempt_count,
+            .ban_count = e.ban_count,
+            .first_attempt = e.first_attempt,
+            .last_attempt = e.last_attempt,
+            .ban_state = if (e.ban_expiry != null) .banned else .monitoring,
+            .ban_expiry = e.ban_expiry,
+            .ring = [_]Timestamp{0} ** state_mod.max_attempts_per_ip,
+            .ring_len = 0,
+        };
+        target.map.put(e.ip, st) catch return error.OutOfMemory;
+        if (routed) |c| c.* += 1;
     }
 }
 
@@ -573,6 +706,198 @@ test "persist: seed re-populates a tracker from loaded entries" {
     try testing.expectEqual(BanState.banned, restored.ban_state);
     try testing.expectEqual(@as(u32, 1), restored.ban_count);
     try testing.expectEqualStrings("sshd", restored.jail.slice());
+}
+
+// ---------- ISSUE-007: multi-tracker save / seed / migration ----------
+
+test "persist: saveAll roundtrips multiple per-jail trackers via seedMap" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &path_buf);
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&full, "{s}/state.bin", .{dir});
+
+    // Populate two trackers with distinct jail names + entries.
+    {
+        var tm = TrackerMap.init(testing.allocator);
+        defer tm.deinit();
+
+        const sshd = try tm.addTracker("sshd", .{
+            .max_entries = 16,
+            .maxretry = 2,
+            .findtime = 600,
+            .bantime = 300,
+        });
+        const nginx = try tm.addTracker("nginx", .{
+            .max_entries = 16,
+            .maxretry = 5,
+            .findtime = 600,
+            .bantime = 300,
+        });
+
+        const j_sshd = try JailId.fromSlice("sshd");
+        const j_nginx = try JailId.fromSlice("nginx");
+
+        // Ban in sshd.
+        _ = try sshd.recordAttempt(tIp("1.2.3.4"), j_sshd, 1_000);
+        _ = try sshd.recordAttempt(tIp("1.2.3.4"), j_sshd, 1_100);
+        // Monitoring in nginx.
+        _ = try nginx.recordAttempt(tIp("5.6.7.8"), j_nginx, 2_000);
+
+        try saveAll(&tm, path);
+    }
+
+    // Load back via flat `load`, route via `seedMap` into a fresh map.
+    const entries = try load(testing.allocator, path);
+    defer testing.allocator.free(entries);
+    try testing.expectEqual(@as(usize, 2), entries.len);
+
+    var tm2 = TrackerMap.init(testing.allocator);
+    defer tm2.deinit();
+    _ = try tm2.addTracker("sshd", .{ .max_entries = 16 });
+    _ = try tm2.addTracker("nginx", .{ .max_entries = 16 });
+    _ = try tm2.ensureLegacy(.{ .max_entries = 16 });
+
+    var routed: u32 = 0;
+    var legacy: u32 = 0;
+    try seedMap(&tm2, entries, &routed, &legacy);
+    try testing.expectEqual(@as(u32, 2), routed);
+    try testing.expectEqual(@as(u32, 0), legacy);
+
+    // Routed correctly: sshd has the banned IP, nginx the monitoring one.
+    const sshd2 = tm2.get("sshd").?;
+    const nginx2 = tm2.get("nginx").?;
+    const sshd_entry = sshd2.get(tIp("1.2.3.4")).?;
+    try testing.expectEqual(BanState.banned, sshd_entry.ban_state);
+    const nginx_entry = nginx2.get(tIp("5.6.7.8")).?;
+    try testing.expectEqual(BanState.monitoring, nginx_entry.ban_state);
+    // Legacy tracker stayed empty.
+    try testing.expectEqual(@as(usize, 0), tm2.get(tracker_map_mod.legacy_jail_name).?.stats().entry_count);
+}
+
+test "persist: seedMap routes unknown-jail entries into __legacy__ tracker" {
+    var tm = TrackerMap.init(testing.allocator);
+    defer tm.deinit();
+    _ = try tm.addTracker("sshd", .{ .max_entries = 16 });
+    _ = try tm.ensureLegacy(.{ .max_entries = 16 });
+
+    // Synthetic entry pretending to come from a jail that's no longer
+    // in the config — must funnel to legacy without dropping.
+    const entries = [_]StateEntry{
+        .{
+            .ip = tIp("9.9.9.9"),
+            .jail = try JailId.fromSlice("retired-jail"),
+            .attempt_count = 2,
+            .ban_count = 1,
+            .first_attempt = 100,
+            .last_attempt = 200,
+            .ban_expiry = 999_999,
+        },
+    };
+    var routed: u32 = 0;
+    var legacy: u32 = 0;
+    try seedMap(&tm, &entries, &routed, &legacy);
+    try testing.expectEqual(@as(u32, 1), routed);
+    try testing.expectEqual(@as(u32, 1), legacy);
+
+    const leg = tm.get(tracker_map_mod.legacy_jail_name).?;
+    const recovered = leg.get(tIp("9.9.9.9")).?;
+    try testing.expectEqual(BanState.banned, recovered.ban_state);
+    try testing.expectEqual(@as(u32, 1), recovered.ban_count);
+}
+
+test "persist: v1 state file is accepted by the migration shim" {
+    // ISSUE-007: hand-craft a v1 file (same wire format as v2) and
+    // confirm the loader accepts it. Subsequent saveAll writes v2.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &path_buf);
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&full, "{s}/state.bin", .{dir});
+
+    // Build header for one entry, version=1.
+    var entry_buf: [entry_size]u8 = undefined;
+    {
+        const jail = try JailId.fromSlice("sshd");
+        const sample: IpState = .{
+            .jail = jail,
+            .attempt_count = 4,
+            .ban_count = 1,
+            .first_attempt = 100,
+            .last_attempt = 200,
+            .ban_state = .banned,
+            .ban_expiry = 500_000,
+            .ring = [_]Timestamp{0} ** state_mod.max_attempts_per_ip,
+            .ring_len = 0,
+        };
+        encodeEntry(&entry_buf, tIp("203.0.113.7"), &sample);
+    }
+    const crc_val = std.hash.Crc32.hash(&entry_buf);
+
+    {
+        const f = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(&magic);
+        var v: [2]u8 = undefined;
+        std.mem.writeInt(u16, &v, 1, .little);
+        try f.writeAll(&v);
+        var c: [4]u8 = undefined;
+        std.mem.writeInt(u32, &c, 1, .little);
+        try f.writeAll(&c);
+        var crc_bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &crc_bytes, crc_val, .little);
+        try f.writeAll(&crc_bytes);
+        try f.writeAll(&entry_buf);
+    }
+
+    // Load -> single entry survives migration intact.
+    const entries = try load(testing.allocator, path);
+    defer testing.allocator.free(entries);
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    try testing.expectEqual(@as(u32, 1), entries[0].ban_count);
+    try testing.expectEqualStrings("sshd", entries[0].jail.slice());
+    try testing.expect(entries[0].isBanned());
+
+    // Subsequent saveAll writes the current version header.
+    var tm = TrackerMap.init(testing.allocator);
+    defer tm.deinit();
+    _ = try tm.addTracker("sshd", .{ .max_entries = 16 });
+    _ = try tm.ensureLegacy(.{ .max_entries = 16 });
+    try seedMap(&tm, entries, null, null);
+    try saveAll(&tm, path);
+
+    // Header should now say version=2 (current `version` constant).
+    const f = try std.fs.cwd().openFile(path, .{});
+    defer f.close();
+    var header_buf: [header_size]u8 = undefined;
+    _ = try f.readAll(&header_buf);
+    const ver = std.mem.readInt(u16, header_buf[4..6], .little);
+    try testing.expectEqual(version, ver);
+}
+
+test "persist: future-version file is rejected without corrupting daemon start" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &path_buf);
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&full, "{s}/state.bin", .{dir});
+
+    {
+        const f = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(&magic);
+        var v: [2]u8 = undefined;
+        std.mem.writeInt(u16, &v, version + 1, .little);
+        try f.writeAll(&v);
+        try f.writeAll(&[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }); // count + crc
+    }
+
+    const entries = try load(testing.allocator, path);
+    defer testing.allocator.free(entries);
+    try testing.expectEqual(@as(usize, 0), entries.len);
 }
 
 test "persist: file permissions are 0600 after save" {

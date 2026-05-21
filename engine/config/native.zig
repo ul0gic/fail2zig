@@ -137,7 +137,16 @@ pub const JailConfig = struct {
     bantime: ?shared.Duration = null,
     banaction: ?BanAction = null,
     ignoreip: ?[]const []const u8 = null,
+    /// Per-jail bantime-increment overrides. ISSUE-007 wired this into
+    /// the per-jail tracker — `ResolvedJailConfig.bantime_increment`
+    /// falls back to the defaults block only when this struct is
+    /// equal-by-value to its own default (i.e. operator never touched it).
     bantime_increment: BanTimeIncrement = .{},
+    /// Sentinel: true when the parser set `bantime_increment` (any
+    /// `bantime_increment_*` key seen under this jail). Lets us
+    /// distinguish "operator left it alone -> inherit defaults" from
+    /// "operator explicitly set it to the default-shaped values".
+    bantime_increment_explicit: bool = false,
 
     /// Resolved values after `applyDefaults` merges with `JailDefaults`.
     pub fn effectiveBantime(self: *const JailConfig, def: JailDefaults) shared.Duration {
@@ -153,6 +162,51 @@ pub const JailConfig = struct {
         return self.banaction orelse def.banaction;
     }
 };
+
+/// Fully-resolved per-jail thresholds. Built by `resolveJail` — the
+/// single place where the "jail value if set, else default" rule lives.
+/// Downstream code (state tracker construction, IPC `list-jails`) reads
+/// from here so the rule isn't reimplemented at every call site.
+pub const ResolvedJailConfig = struct {
+    name: []const u8,
+    enabled: bool,
+    maxretry: u32,
+    findtime: shared.Duration,
+    bantime: shared.Duration,
+    banaction: BanAction,
+    bantime_increment: BanTimeIncrement,
+};
+
+/// Resolve a jail's effective configuration. Per-jail overrides win;
+/// unset fields fall back to `cfg.defaults`. The `bantime_increment`
+/// block is treated atomically — if the operator set any of its keys
+/// under the jail, the entire block is used; otherwise the defaults
+/// block applies.
+pub fn resolveJail(cfg: *const Config, jail_name: []const u8) ?ResolvedJailConfig {
+    for (cfg.jails) |*j| {
+        if (std.mem.eql(u8, j.name, jail_name)) {
+            return resolveJailFromConfig(j, cfg.defaults);
+        }
+    }
+    return null;
+}
+
+/// Same as `resolveJail` but takes a `*const JailConfig` directly. Useful
+/// when the caller is already iterating the jails slice.
+pub fn resolveJailFromConfig(j: *const JailConfig, defaults: JailDefaults) ResolvedJailConfig {
+    return .{
+        .name = j.name,
+        .enabled = j.enabled,
+        .maxretry = j.effectiveMaxretry(defaults),
+        .findtime = j.effectiveFindtime(defaults),
+        .bantime = j.effectiveBantime(defaults),
+        .banaction = j.effectiveBanaction(defaults),
+        .bantime_increment = if (j.bantime_increment_explicit)
+            j.bantime_increment
+        else
+            defaults.bantime_increment,
+    };
+}
 
 pub const Config = struct {
     global: GlobalConfig = .{},
@@ -705,10 +759,13 @@ const Parser = struct {
             j.ignoreip = try asStringArray(v);
         } else if (std.mem.eql(u8, key, "bantime_increment_enabled")) {
             j.bantime_increment.enabled = try asBool(v);
+            j.bantime_increment_explicit = true;
         } else if (std.mem.eql(u8, key, "bantime_increment_multiplier")) {
             j.bantime_increment.multiplier = @floatFromInt(try asInt(v));
+            j.bantime_increment_explicit = true;
         } else if (std.mem.eql(u8, key, "bantime_increment_factor")) {
             j.bantime_increment.factor = @floatFromInt(try asInt(v));
+            j.bantime_increment_explicit = true;
         } else if (std.mem.eql(u8, key, "bantime_increment_formula")) {
             const s = try asString(v);
             if (std.mem.eql(u8, s, "linear")) {
@@ -716,10 +773,12 @@ const Parser = struct {
             } else if (std.mem.eql(u8, s, "exponential")) {
                 j.bantime_increment.formula = .exponential;
             } else return error.InvalidValue;
+            j.bantime_increment_explicit = true;
         } else if (std.mem.eql(u8, key, "bantime_increment_max_bantime")) {
             const n = try asInt(v);
             if (n < 0) return error.InvalidValue;
             j.bantime_increment.max_bantime = @intCast(n);
+            j.bantime_increment_explicit = true;
         } else return error.UnknownKey;
     }
 
@@ -1165,6 +1224,108 @@ test "native: websocket_max_clients rejects 0" {
         \\websocket_max_clients = 0
     ;
     try std.testing.expectError(error.InvalidValue, Config.parse(arena.allocator(), src));
+}
+
+// ---------- ISSUE-007: per-jail resolver tests ----------
+
+test "native: resolveJail returns null for unknown jail" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[defaults]
+        \\bantime = 600
+        \\findtime = 600
+        \\maxretry = 5
+        \\[jails.sshd]
+        \\filter = "sshd"
+    ;
+    const cfg = try Config.parse(arena.allocator(), src);
+    try std.testing.expect(resolveJail(&cfg, "nope") == null);
+}
+
+test "native: resolveJail uses per-jail values when set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[defaults]
+        \\bantime = 600
+        \\findtime = 600
+        \\maxretry = 5
+        \\[jails.aggressive]
+        \\filter = "sshd"
+        \\maxretry = 1
+        \\findtime = 10
+        \\bantime = 30
+    ;
+    const cfg = try Config.parse(arena.allocator(), src);
+    const r = resolveJail(&cfg, "aggressive").?;
+    try std.testing.expectEqual(@as(u32, 1), r.maxretry);
+    try std.testing.expectEqual(@as(shared.Duration, 10), r.findtime);
+    try std.testing.expectEqual(@as(shared.Duration, 30), r.bantime);
+}
+
+test "native: resolveJail falls back to defaults for unset fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[defaults]
+        \\bantime = 1800
+        \\findtime = 900
+        \\maxretry = 7
+        \\[jails.sshd]
+        \\filter = "sshd"
+        \\maxretry = 2
+    ;
+    const cfg = try Config.parse(arena.allocator(), src);
+    const r = resolveJail(&cfg, "sshd").?;
+    try std.testing.expectEqual(@as(u32, 2), r.maxretry);
+    // findtime and bantime not set on the jail -> inherit defaults.
+    try std.testing.expectEqual(@as(shared.Duration, 900), r.findtime);
+    try std.testing.expectEqual(@as(shared.Duration, 1800), r.bantime);
+}
+
+test "native: resolveJail inherits defaults bantime_increment when jail is silent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[defaults]
+        \\bantime = 600
+        \\findtime = 600
+        \\maxretry = 5
+        \\bantime_increment_enabled = true
+        \\bantime_increment_factor = 3
+        \\bantime_increment_formula = "exponential"
+        \\bantime_increment_max_bantime = 86400
+        \\[jails.sshd]
+        \\filter = "sshd"
+    ;
+    const cfg = try Config.parse(arena.allocator(), src);
+    const r = resolveJail(&cfg, "sshd").?;
+    try std.testing.expect(r.bantime_increment.enabled);
+    try std.testing.expectEqual(@as(f64, 3.0), r.bantime_increment.factor);
+    try std.testing.expectEqual(BantimeFormula.exponential, r.bantime_increment.formula);
+}
+
+test "native: resolveJail takes per-jail bantime_increment when present" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[defaults]
+        \\bantime = 600
+        \\findtime = 600
+        \\maxretry = 5
+        \\bantime_increment_enabled = true
+        \\bantime_increment_factor = 2
+        \\[jails.sshd]
+        \\filter = "sshd"
+        \\bantime_increment_enabled = true
+        \\bantime_increment_factor = 5
+    ;
+    const cfg = try Config.parse(arena.allocator(), src);
+    const r = resolveJail(&cfg, "sshd").?;
+    try std.testing.expect(r.bantime_increment.enabled);
+    // Jail's per-jail value wins over the defaults' factor=2.
+    try std.testing.expectEqual(@as(f64, 5.0), r.bantime_increment.factor);
 }
 
 test "native: websocket_max_clients rejects values above hard cap" {

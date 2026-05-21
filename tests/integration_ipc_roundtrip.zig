@@ -36,7 +36,7 @@ const protocol = shared.protocol;
 
 const engine = @import("engine");
 const event_loop = engine.event_loop_mod;
-const state = engine.state_mod;
+const tracker_map = engine.tracker_map_mod;
 const firewall = engine.firewall;
 const nftables = firewall.nftables;
 const config_mod = engine.config_mod;
@@ -95,16 +95,17 @@ test "integration: status command round-trips from client wire bytes to daemon J
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const a = testing.allocator;
 
-    // ----- Build the daemon-side state: state tracker, backend stub,
+    // ----- Build the daemon-side state: per-jail trackers, backend stub,
     // command context. -----
-    var tracker = try state.StateTracker.init(a, .{});
-    defer tracker.deinit();
+    var trackers = tracker_map.TrackerMap.init(a);
+    defer trackers.deinit();
+    const sshd_tracker = try trackers.addTracker("sshd", .{});
 
     // Seed a banned IP so the status response reports active_bans=1.
     const ip = try shared.IpAddress.parse("198.51.100.17");
     const jail = try shared.JailId.fromSlice("sshd");
-    _ = try tracker.recordAttempt(ip, jail, 1);
-    if (tracker.map.getPtr(ip)) |s| s.ban_state = .banned;
+    _ = try sshd_tracker.recordAttempt(ip, jail, 1);
+    if (sshd_tracker.map.getPtr(ip)) |s| s.ban_state = .banned;
 
     var jails = [_]config_mod.JailConfig{
         .{ .name = "sshd", .enabled = true },
@@ -124,7 +125,7 @@ test "integration: status command round-trips from client wire bytes to daemon J
     defer be.deinit();
 
     var cmd_ctx = commands.Context{
-        .state = &tracker,
+        .trackers = &trackers,
         .config = &cfg,
         .backend = &be,
         .start_time = std.time.timestamp() - 17, // make uptime observable
@@ -204,8 +205,8 @@ test "integration: version command round-trips and echoes supplied version" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const a = testing.allocator;
 
-    var tracker = try state.StateTracker.init(a, .{});
-    defer tracker.deinit();
+    var trackers = tracker_map.TrackerMap.init(a);
+    defer trackers.deinit();
     var cfg = config_mod.Config{
         .global = .{},
         .defaults = .{},
@@ -216,7 +217,7 @@ test "integration: version command round-trips and echoes supplied version" {
     defer be.deinit();
 
     var cmd_ctx = commands.Context{
-        .state = &tracker,
+        .trackers = &trackers,
         .config = &cfg,
         .backend = &be,
         .version = "ipc-roundtrip-version",
