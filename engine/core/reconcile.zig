@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const state_mod = @import("state.zig");
+const tracker_map_mod = @import("tracker_map.zig");
 const metrics_mod = @import("metrics.zig");
 const shared = @import("shared");
 
@@ -71,6 +72,52 @@ pub fn reconcileRestoredBans(
         const gop = try per_jail.getOrPut(jail_name);
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* += 1;
+    }
+
+    if (metrics) |m| {
+        m.setActiveBans(reinstalled);
+        var jit = per_jail.iterator();
+        while (jit.next()) |entry| {
+            m.jailSetActiveBans(entry.key_ptr.*, entry.value_ptr.*);
+        }
+    }
+
+    return reinstalled;
+}
+
+/// Multi-tracker variant of `reconcileRestoredBans` (ISSUE-007). Walks
+/// every tracker in `map` and reinstalls active bans against the
+/// firewall backend via `applyFn`. Returns the total number reinstalled
+/// across all jails. Metrics gauges are set to the aggregated counts.
+pub fn reconcileAllRestoredBans(
+    allocator: std.mem.Allocator,
+    map: *const tracker_map_mod.TrackerMap,
+    metrics: ?*metrics_mod.Metrics,
+    now: shared.Timestamp,
+    applyFn: BanApplyFn,
+    ctx: *anyopaque,
+) !u32 {
+    var per_jail = std.StringHashMap(u32).init(allocator);
+    defer per_jail.deinit();
+
+    var reinstalled: u32 = 0;
+    var it = map.iterator();
+    while (it.next()) |kv| {
+        const tracker = kv.value_ptr.*;
+        var tit = tracker.iterator();
+        while (tit.next()) |entry| {
+            if (entry.value_ptr.ban_state != .banned) continue;
+            const expiry = entry.value_ptr.ban_expiry orelse continue;
+            if (expiry <= now) continue;
+            const remaining: u64 = @intCast(expiry - now);
+            applyFn(ctx, entry.key_ptr.*, entry.value_ptr.jail, remaining) catch continue;
+            reinstalled += 1;
+
+            const jail_name = entry.value_ptr.jail.slice();
+            const gop = try per_jail.getOrPut(jail_name);
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* += 1;
+        }
     }
 
     if (metrics) |m| {
@@ -242,6 +289,49 @@ const FailFirst = struct {
         self.count += 1;
     }
 };
+
+test "reconcile: reconcileAllRestoredBans walks every tracker (ISSUE-007)" {
+    const alloc = testing.allocator;
+
+    var map = tracker_map_mod.TrackerMap.init(alloc);
+    defer map.deinit();
+
+    const tracker_a = try map.addTracker("a", .{ .max_entries = 16 });
+    const tracker_b = try map.addTracker("b", .{ .max_entries = 16 });
+    const j_a = try shared.JailId.fromSlice("a");
+    const j_b = try shared.JailId.fromSlice("b");
+    const now: shared.Timestamp = 1_000_000;
+
+    // Two active bans in `a`, one in `b`. One expired in `a` (skipped),
+    // one monitoring in `b` (skipped).
+    try persist_mod.seed(tracker_a, &[_]persist_mod.StateEntry{
+        .{ .ip = makeIpV4(203, 0, 113, 1), .jail = j_a, .attempt_count = 3, .ban_count = 1, .first_attempt = 0, .last_attempt = 0, .ban_expiry = now + 60 },
+        .{ .ip = makeIpV4(203, 0, 113, 2), .jail = j_a, .attempt_count = 3, .ban_count = 1, .first_attempt = 0, .last_attempt = 0, .ban_expiry = now + 90 },
+        .{ .ip = makeIpV4(203, 0, 113, 3), .jail = j_a, .attempt_count = 3, .ban_count = 1, .first_attempt = 0, .last_attempt = 0, .ban_expiry = now - 1 },
+    });
+    try persist_mod.seed(tracker_b, &[_]persist_mod.StateEntry{
+        .{ .ip = makeIpV4(198, 51, 100, 1), .jail = j_b, .attempt_count = 3, .ban_count = 1, .first_attempt = 0, .last_attempt = 0, .ban_expiry = now + 30 },
+        .{ .ip = makeIpV4(198, 51, 100, 2), .jail = j_b, .attempt_count = 1, .ban_count = 0, .first_attempt = 0, .last_attempt = 0, .ban_expiry = null },
+    });
+
+    var rec = Recorder.init(alloc);
+    defer rec.deinit();
+    var metrics = metrics_mod.Metrics.init();
+    _ = metrics.registerJail("a");
+    _ = metrics.registerJail("b");
+
+    const count = try reconcileAllRestoredBans(
+        alloc,
+        &map,
+        &metrics,
+        now,
+        recordApply,
+        @ptrCast(&rec),
+    );
+    try testing.expectEqual(@as(u32, 3), count);
+    try testing.expectEqual(@as(usize, 3), rec.calls.items.len);
+    try testing.expectEqual(@as(u32, 3), metrics.snapshot().active_bans);
+}
 
 test "reconcile: callback errors are non-fatal, loop continues (SYS-007)" {
     // If applyFn errors on one entry (e.g. backend returns AlreadyBanned,

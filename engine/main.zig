@@ -43,6 +43,7 @@ const line_buffer_mod = @import("core/line_buffer.zig");
 const logger_mod = @import("core/logger.zig");
 const parser_mod = @import("core/parser.zig");
 pub const state_mod = @import("core/state.zig");
+pub const tracker_map_mod = @import("core/tracker_map.zig");
 const persist_mod = @import("core/persist.zig");
 const reconcile_mod = @import("core/reconcile.zig");
 pub const firewall = @import("firewall/backend.zig");
@@ -204,6 +205,9 @@ pub fn runImport(
 const JailContext = struct {
     jail: shared.JailId,
     parser: parser_mod.Parser,
+    /// Per-jail state tracker (ISSUE-007). Each jail's tracker carries
+    /// its own resolved `maxretry`/`findtime`/`bantime` so per-jail
+    /// overrides actually take effect.
     state: *state_mod.StateTracker,
     backend_ptr: *firewall.Backend,
     /// Metrics is nullable for tests that don't care about counters —
@@ -352,7 +356,9 @@ fn lineCallback(
 // ============================================================================
 
 const ExpiryContext = struct {
-    state: *state_mod.StateTracker,
+    /// Walks every tracker each tick. With per-jail trackers
+    /// (ISSUE-007), expiry must visit every jail's ring buffer.
+    trackers: *tracker_map_mod.TrackerMap,
     backend_ptr: *firewall.Backend,
     metrics: ?*metrics_mod.Metrics = null,
     ws: ?*ws.WsServer = null,
@@ -371,18 +377,23 @@ fn expirySweep(expirations: u64, userdata: ?*anyopaque) void {
     var to_unban: [max_per_tick]struct {
         ip: shared.IpAddress,
         jail: shared.JailId,
+        tracker: *state_mod.StateTracker,
     } = undefined;
     var n: usize = 0;
 
-    var it = ctx.state.iterator();
-    while (it.next()) |kv| {
-        if (n >= max_per_tick) break;
-        const st = kv.value_ptr;
-        if (st.ban_state != .banned) continue;
-        const exp = st.ban_expiry orelse continue;
-        if (exp <= now) {
-            to_unban[n] = .{ .ip = kv.key_ptr.*, .jail = st.jail };
-            n += 1;
+    var tit = ctx.trackers.iterator();
+    outer: while (tit.next()) |tkv| {
+        const tracker = tkv.value_ptr.*;
+        var it = tracker.iterator();
+        while (it.next()) |kv| {
+            if (n >= max_per_tick) break :outer;
+            const st = kv.value_ptr;
+            if (st.ban_state != .banned) continue;
+            const exp = st.ban_expiry orelse continue;
+            if (exp <= now) {
+                to_unban[n] = .{ .ip = kv.key_ptr.*, .jail = st.jail, .tracker = tracker };
+                n += 1;
+            }
         }
     }
 
@@ -395,7 +406,7 @@ fn expirySweep(expirations: u64, userdata: ?*anyopaque) void {
                 .{ item.ip, item.jail.slice(), @errorName(err) },
             );
         };
-        ctx.state.clearBan(item.ip);
+        item.tracker.clearBan(item.ip);
         if (ctx.metrics) |m| {
             m.incrementUnbans();
             m.jailIncrementUnbans(item.jail.slice());
@@ -499,7 +510,10 @@ fn wsTick(expirations: u64, userdata: ?*anyopaque) void {
 
 const SignalContext = struct {
     loop: *event_loop_mod.EventLoop,
-    state: *state_mod.StateTracker,
+    /// Snapshots every per-jail tracker on shutdown (ISSUE-007). The
+    /// flat on-disk format already carries per-entry jail names, so
+    /// load+route on next start rehydrates the right tracker.
+    trackers: *tracker_map_mod.TrackerMap,
     state_path: []const u8,
     save_requested: bool = false,
 };
@@ -509,7 +523,7 @@ fn onTerminate(siginfo: *const linux.signalfd_siginfo, userdata: ?*anyopaque) vo
     const ctx: *SignalContext = @ptrCast(@alignCast(userdata.?));
     ctx.save_requested = true;
     std.log.info("signal: termination requested, saving state and shutting down", .{});
-    persist_mod.save(ctx.state, ctx.state_path) catch |err| {
+    persist_mod.saveAll(ctx.trackers, ctx.state_path) catch |err| {
         std.log.warn("persist: save failed on shutdown: {s}", .{@errorName(err)});
     };
     ctx.loop.stop();
@@ -525,31 +539,52 @@ fn onReload(siginfo: *const linux.signalfd_siginfo, userdata: ?*anyopaque) void 
 // Tracker config derivation from parsed config
 // ============================================================================
 
-fn deriveTrackerConfig(cfg: *const config_mod.Config, max_entries: u32) state_mod.Config {
-    const d = cfg.defaults;
-    // SYS-008: translate `config.native.BanTimeIncrement` into the
-    // state tracker's shape. The two structs carry the same fields but
-    // are defined independently (state has zero config-layer imports).
-    // Per-jail `bantime_increment` on JailConfig is parsed but
-    // currently inactive (single global tracker). When per-jail
-    // tracking lands in Phase 2, this will read from the active jail's
-    // resolved settings instead of defaults.
-    const incr: state_mod.BanTimeIncrement = .{
-        .enabled = d.bantime_increment.enabled,
-        .multiplier = d.bantime_increment.multiplier,
-        .factor = d.bantime_increment.factor,
-        .formula = switch (d.bantime_increment.formula) {
+/// Translate a config-layer `BanTimeIncrement` into the state tracker's
+/// shape. The two structs carry the same fields but are defined
+/// independently so the state module has zero config-layer imports.
+fn translateBanTimeIncrement(incr: config_mod.BanTimeIncrement) state_mod.BanTimeIncrement {
+    return .{
+        .enabled = incr.enabled,
+        .multiplier = incr.multiplier,
+        .factor = incr.factor,
+        .formula = switch (incr.formula) {
             .linear => .linear,
             .exponential => .exponential,
         },
-        .max_bantime = d.bantime_increment.max_bantime,
+        .max_bantime = incr.max_bantime,
     };
+}
+
+/// Build the state-tracker config for a single jail from the resolved
+/// per-jail values (ISSUE-007). Each jail gets its own tracker with its
+/// own thresholds.
+fn deriveJailTrackerConfig(
+    resolved: config_mod.ResolvedJailConfig,
+    max_entries: u32,
+) state_mod.Config {
+    return .{
+        .max_entries = max_entries,
+        .findtime = resolved.findtime,
+        .maxretry = resolved.maxretry,
+        .bantime = resolved.bantime,
+        .bantime_increment = translateBanTimeIncrement(resolved.bantime_increment),
+        .eviction_policy = .drop_oldest_unbanned,
+    };
+}
+
+/// Synthesize a state-tracker config for the synthetic `__legacy__`
+/// tracker. Uses the defaults block since legacy entries have no
+/// surviving jail config to consult. Tuned for a small ceiling — the
+/// legacy bucket exists only to keep restored bans active until the
+/// operator either deletes the state file or re-adds the jail.
+fn deriveLegacyTrackerConfig(cfg: *const config_mod.Config, max_entries: u32) state_mod.Config {
+    const d = cfg.defaults;
     return .{
         .max_entries = max_entries,
         .findtime = d.findtime,
         .maxretry = d.maxretry,
         .bantime = d.bantime,
-        .bantime_increment = incr,
+        .bantime_increment = translateBanTimeIncrement(d.bantime_increment),
         .eviction_policy = .drop_oldest_unbanned,
     };
 }
@@ -703,48 +738,90 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     };
     defer backend_val.deinit();
 
-    // State tracker.
-    const tracker_capacity = state_mod.capacityFromBudget(mem_cfg.state_tracker_bytes);
-    const tracker_cfg = deriveTrackerConfig(cfg, tracker_capacity);
-    var tracker = state_mod.StateTracker.init(heap, tracker_cfg) catch |err| {
-        std.log.err("state: tracker init failed: {s}", .{@errorName(err)});
-        return err;
-    };
-    defer tracker.deinit();
+    // Per-jail state trackers (ISSUE-007). The state-tracker memory
+    // budget is split evenly across the configured jails plus one
+    // legacy bucket for restored entries whose jail no longer matches
+    // the live config. Each tracker gets its own resolved thresholds,
+    // so per-jail `maxretry` / `findtime` / `bantime` / `bantime_increment`
+    // actually take effect.
+    var trackers = tracker_map_mod.TrackerMap.init(heap);
+    defer trackers.deinit();
 
-    // Global ignore CIDRs.
-    for (cfg.defaults.ignoreip) |spec| {
-        tracker.addIgnoreCidr(spec) catch |err| {
-            std.log.warn("state: ignoreip '{s}' rejected: {s}", .{ spec, @errorName(err) });
+    // Determine per-tracker capacity. Count enabled jails + 1 (legacy);
+    // never fall below 1 to keep the division safe even with zero
+    // enabled jails (legacy still gets the whole budget).
+    var enabled_count: u32 = 0;
+    for (cfg.jails) |jc| {
+        if (jc.enabled) enabled_count += 1;
+    }
+    const tracker_count: u32 = @max(1, enabled_count + 1);
+    const per_tracker_bytes: usize = mem_cfg.state_tracker_bytes / tracker_count;
+    const per_tracker_capacity = state_mod.capacityFromBudget(per_tracker_bytes);
+
+    // Install one tracker per enabled jail. Per-jail ignoreip resolves
+    // to defaults.ignoreip when the jail leaves the field unset.
+    for (cfg.jails) |*jc| {
+        if (!jc.enabled) continue;
+        const resolved = config_mod.resolveJailFromConfig(jc, cfg.defaults);
+        const tcfg = deriveJailTrackerConfig(resolved, per_tracker_capacity);
+        const tracker = trackers.addTracker(jc.name, tcfg) catch |err| {
+            std.log.err("state: tracker init for jail '{s}' failed: {s}", .{ jc.name, @errorName(err) });
+            return err;
         };
+        // ignoreip: per-jail override wins; otherwise inherit defaults.
+        const ignore_list: []const []const u8 = jc.ignoreip orelse cfg.defaults.ignoreip;
+        for (ignore_list) |spec| {
+            tracker.addIgnoreCidr(spec) catch |err| {
+                std.log.warn(
+                    "state: ignoreip '{s}' (jail '{s}') rejected: {s}",
+                    .{ spec, jc.name, @errorName(err) },
+                );
+            };
+        }
     }
 
-    // Seed state from disk.
+    // Ensure the legacy tracker exists. Receives restored entries whose
+    // jail name no longer matches a live jail; uses the defaults block
+    // for thresholds since the original jail is gone.
+    {
+        const legacy_cfg = deriveLegacyTrackerConfig(cfg, per_tracker_capacity);
+        const legacy_tracker = trackers.ensureLegacy(legacy_cfg) catch |err| {
+            std.log.err("state: legacy tracker init failed: {s}", .{@errorName(err)});
+            return err;
+        };
+        for (cfg.defaults.ignoreip) |spec| {
+            legacy_tracker.addIgnoreCidr(spec) catch |err| {
+                std.log.warn("state: legacy ignoreip '{s}' rejected: {s}", .{ spec, @errorName(err) });
+            };
+        }
+    }
+
+    // Seed state from disk. Entries are routed by `jail` field on each
+    // record; orphans land in the legacy tracker.
     if (persist_mod.load(heap, cfg.global.state_file)) |entries| {
         defer heap.free(entries);
         if (entries.len > 0) {
-            persist_mod.seed(&tracker, entries) catch |err| {
+            var routed: u32 = 0;
+            var legacy_routed: u32 = 0;
+            persist_mod.seedMap(&trackers, entries, &routed, &legacy_routed) catch |err| {
                 std.log.warn("persist: seed failed: {s}", .{@errorName(err)});
             };
-            std.log.info("persist: restored {d} state entries", .{entries.len});
+            std.log.info(
+                "persist: restored {d} entries ({d} routed, {d} -> legacy bucket)",
+                .{ entries.len, routed, legacy_routed },
+            );
         }
     } else |err| {
         std.log.warn("persist: load failed: {s}", .{@errorName(err)});
     }
 
     // Reconcile the firewall backend with restored state (SYS-007).
-    //
-    // The backend's scaffold was freshly installed by `backend.init` —
-    // its ban sets are empty regardless of what was active before the
-    // restart. The state tracker holds the restored bans. Without this
-    // step the kernel silently stops enforcing those bans until a fresh
-    // ban decision fires. Logic extracted into core/reconcile.zig so
-    // it's testable without spinning up the whole daemon.
+    // Walks every per-jail tracker so all restored bans are reinstalled.
     {
         const now = std.time.timestamp();
-        const reinstalled = reconcile_mod.reconcileRestoredBans(
+        const reinstalled = reconcile_mod.reconcileAllRestoredBans(
             heap,
-            &tracker,
+            &trackers,
             &metrics,
             now,
             reconcileBanApply,
@@ -791,11 +868,21 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
             std.log.warn("jail '{s}' rejected: {s}", .{ jail_cfg.name, @errorName(err) });
             continue;
         };
+        // Each JailContext points at its own tracker. The tracker map
+        // is keyed by jail name and was populated above; lookup here is
+        // infallible because we just inserted it.
+        const tracker_ptr = trackers.get(jail_cfg.name) orelse {
+            std.log.warn(
+                "jail '{s}' has no tracker — wiring bug, skipping",
+                .{jail_cfg.name},
+            );
+            continue;
+        };
         const ctx = try heap.create(JailContext);
         ctx.* = .{
             .jail = jail,
             .parser = parser_mod.Parser.init(pool.allocator(.parser_buffer)),
-            .state = &tracker,
+            .state = tracker_ptr,
             .backend_ptr = &backend_val,
             .metrics = &metrics,
         };
@@ -817,7 +904,7 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     // status source. start_time captured here so uptime reflects the
     // operational start.
     var cmd_ctx: commands_mod.Context = .{
-        .state = &tracker,
+        .trackers = &trackers,
         .config = cfg,
         .backend = &backend_val,
         .stats_source = .{
@@ -860,7 +947,7 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     var http_ctx: HttpSources = .{
         .metrics = &metrics,
         .cmd_ctx = &cmd_ctx,
-        .state = &tracker,
+        .trackers = &trackers,
     };
     var http_server = http.HttpServer.init(
         heap,
@@ -895,7 +982,7 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     // tests can observe TERM behaviour without HUP interference.
     var sig_ctx = SignalContext{
         .loop = &loop,
-        .state = &tracker,
+        .trackers = &trackers,
         .state_path = cfg.global.state_file,
     };
     try loop.addSignalHandler(linux.SIG.TERM, onTerminate, &sig_ctx);
@@ -904,7 +991,7 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
 
     // Ban expiry timer.
     var expiry_ctx = ExpiryContext{
-        .state = &tracker,
+        .trackers = &trackers,
         .backend_ptr = &backend_val,
         .metrics = &metrics,
         .ws = &ws_server,
@@ -937,7 +1024,7 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     try loop.run();
 
     // Final state save on clean shutdown (best-effort; ignore errors).
-    persist_mod.save(&tracker, cfg.global.state_file) catch {};
+    persist_mod.saveAll(&trackers, cfg.global.state_file) catch {};
 
     // Explicit teardown order: close IPC/HTTP/WS first so their FDs are
     // no longer registered with the loop when `loop.deinit` runs below
@@ -1003,7 +1090,9 @@ fn metricsStatsSnapshot(ctx: ?*anyopaque) commands_mod.StatsSnapshot {
 const HttpSources = struct {
     metrics: *metrics_mod.Metrics,
     cmd_ctx: *commands_mod.Context,
-    state: *state_mod.StateTracker,
+    /// Tracker map for `/api/bans` aggregation. Walks every per-jail
+    /// tracker to assemble the active-ban snapshot.
+    trackers: *tracker_map_mod.TrackerMap,
 };
 
 /// MetricsSource.write implementation — renders the Prometheus text
@@ -1125,57 +1214,55 @@ fn writeBansPayload(
     const self: *HttpSources = @ptrCast(@alignCast(ctx.?));
     const w = out.writer(a);
 
-    // First pass: count active bans (so `total` is accurate even when
-    // we truncate `entries`).
-    var total: u32 = 0;
-    {
-        var it = self.state.iterator();
-        while (it.next()) |kv| {
-            if (kv.value_ptr.ban_state == .banned) total += 1;
-        }
-    }
+    // First pass: count active bans across every tracker so `total`
+    // remains accurate even when we truncate `entries`.
+    const total: u32 = self.trackers.totalActiveBans();
 
     try w.writeAll("{\"total\":");
     try w.print("{d}", .{total});
     try w.writeAll(",\"entries\":[");
 
     const now_s: i64 = std.time.timestamp();
-    const cfg = self.state.config;
 
     var written: usize = 0;
-    var it = self.state.iterator();
-    while (it.next()) |kv| {
-        if (kv.value_ptr.ban_state != .banned) continue;
-        if (written >= http.max_bans_in_snapshot) break;
-        if (written > 0) try w.writeAll(",");
-        written += 1;
+    var tit = self.trackers.iterator();
+    outer: while (tit.next()) |tkv| {
+        const tracker = tkv.value_ptr.*;
+        const cfg = tracker.config;
+        var it = tracker.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.ban_state != .banned) continue;
+            if (written >= http.max_bans_in_snapshot) break :outer;
+            if (written > 0) try w.writeAll(",");
+            written += 1;
 
-        const ip = kv.key_ptr.*;
-        const st = kv.value_ptr;
+            const ip = kv.key_ptr.*;
+            const st = kv.value_ptr;
 
-        const seconds_remaining: i64 = if (st.ban_expiry) |exp|
-            @max(0, exp - now_s)
-        else
-            0;
+            const seconds_remaining: i64 = if (st.ban_expiry) |exp|
+                @max(0, exp - now_s)
+            else
+                0;
 
-        const duration = state_mod.computeBantime(
-            cfg.bantime,
-            cfg.bantime_increment,
-            if (st.ban_count == 0) 0 else st.ban_count - 1,
-        );
-        const dur_i64: i64 = @intCast(@min(duration, std.math.maxInt(i64)));
-        const banned_at_epoch_s: i64 = if (st.ban_expiry) |exp|
-            std.math.sub(i64, exp, dur_i64) catch now_s
-        else
-            now_s;
+            const duration = state_mod.computeBantime(
+                cfg.bantime,
+                cfg.bantime_increment,
+                if (st.ban_count == 0) 0 else st.ban_count - 1,
+            );
+            const dur_i64: i64 = @intCast(@min(duration, std.math.maxInt(i64)));
+            const banned_at_epoch_s: i64 = if (st.ban_expiry) |exp|
+                std.math.sub(i64, exp, dur_i64) catch now_s
+            else
+                now_s;
 
-        var ts_buf: [32]u8 = undefined;
-        const banned_at_iso = try ws.formatIso8601Utc(&ts_buf, banned_at_epoch_s * 1000);
+            var ts_buf: [32]u8 = undefined;
+            const banned_at_iso = try ws.formatIso8601Utc(&ts_buf, banned_at_epoch_s * 1000);
 
-        try w.print(
-            "{{\"ip\":\"{}\",\"jail\":\"{s}\",\"banned_at\":\"{s}\",\"seconds_remaining\":{d}}}",
-            .{ ip, st.jail.slice(), banned_at_iso, seconds_remaining },
-        );
+            try w.print(
+                "{{\"ip\":\"{}\",\"jail\":\"{s}\",\"banned_at\":\"{s}\",\"seconds_remaining\":{d}}}",
+                .{ ip, st.jail.slice(), banned_at_iso, seconds_remaining },
+            );
+        }
     }
 
     try w.writeAll("]}");
@@ -1396,7 +1483,33 @@ test "main: deriveMemoryConfig splits ceiling sensibly" {
     try m.validate();
 }
 
-test "main: deriveTrackerConfig mirrors defaults" {
+test "main: deriveJailTrackerConfig uses resolved per-jail values" {
+    // ISSUE-007: the tracker config for a jail now reflects its
+    // resolved thresholds (jail value if set, else defaults).
+    var jails = [_]config_mod.JailConfig{
+        .{
+            .name = "aggressive",
+            .enabled = true,
+            .maxretry = 1,
+            .findtime = 10,
+            .bantime = 30,
+        },
+    };
+    const cfg: config_mod.Config = .{
+        .global = .{ .memory_ceiling_mb = 64 },
+        .defaults = .{ .bantime = 600, .findtime = 600, .maxretry = 5 },
+        .jails = &jails,
+        .diag = .{},
+    };
+    const resolved = config_mod.resolveJail(&cfg, "aggressive").?;
+    const t = deriveJailTrackerConfig(resolved, 2048);
+    try std.testing.expectEqual(@as(u32, 2048), t.max_entries);
+    try std.testing.expectEqual(@as(shared.Duration, 30), t.bantime);
+    try std.testing.expectEqual(@as(shared.Duration, 10), t.findtime);
+    try std.testing.expectEqual(@as(u32, 1), t.maxretry);
+}
+
+test "main: deriveLegacyTrackerConfig mirrors defaults" {
     const cfg: config_mod.Config = .{
         .global = .{ .memory_ceiling_mb = 64 },
         .defaults = .{
@@ -1407,7 +1520,7 @@ test "main: deriveTrackerConfig mirrors defaults" {
         .jails = &.{},
         .diag = .{},
     };
-    const t = deriveTrackerConfig(&cfg, 2048);
+    const t = deriveLegacyTrackerConfig(&cfg, 2048);
     try std.testing.expectEqual(@as(u32, 2048), t.max_entries);
     try std.testing.expectEqual(@as(shared.Duration, 900), t.bantime);
     try std.testing.expectEqual(@as(shared.Duration, 450), t.findtime);
@@ -1429,6 +1542,7 @@ test {
     _ = logger_mod;
     _ = parser_mod;
     _ = state_mod;
+    _ = tracker_map_mod;
     _ = persist_mod;
     _ = firewall;
     _ = config_mod;
@@ -1459,7 +1573,7 @@ const testing = std.testing;
 
 /// Helper: build a minimal HttpSources wired up only for the bans path.
 /// `metrics` and `cmd_ctx` fields get unused stub pointers — the bans
-/// writer reads only `state`.
+/// writer reads only `trackers`.
 fn injectBan(
     tracker: *state_mod.StateTracker,
     ip_str: []const u8,
@@ -1485,18 +1599,19 @@ fn injectBan(
 
 test "http: /api/bans empty snapshot -> count 0, elements []" {
     const a = testing.allocator;
-    var tracker = try state_mod.StateTracker.init(a, .{
+    var trackers = tracker_map_mod.TrackerMap.init(a);
+    defer trackers.deinit();
+    _ = try trackers.addTracker("sshd", .{
         .max_entries = 16,
         .findtime = 600,
         .maxretry = 5,
         .bantime = 600,
     });
-    defer tracker.deinit();
 
     var ctx: HttpSources = .{
         .metrics = undefined,
         .cmd_ctx = undefined,
-        .state = &tracker,
+        .trackers = &trackers,
     };
     var out: std.ArrayListUnmanaged(u8) = .{};
     defer out.deinit(a);
@@ -1509,22 +1624,23 @@ test "http: /api/bans empty snapshot -> count 0, elements []" {
 
 test "http: /api/bans single ban populates element fields" {
     const a = testing.allocator;
-    var tracker = try state_mod.StateTracker.init(a, .{
+    var trackers = tracker_map_mod.TrackerMap.init(a);
+    defer trackers.deinit();
+    const sshd_tracker = try trackers.addTracker("sshd", .{
         .max_entries = 16,
         .findtime = 600,
         .maxretry = 5,
         .bantime = 600,
     });
-    defer tracker.deinit();
 
     // Use a banned_at comfortably in the past so `banned_at` field in
     // the response is deterministic relative to the fixed bantime.
-    try injectBan(&tracker, "185.220.101.5", "sshd", 1_714_000_000, 600);
+    try injectBan(sshd_tracker, "185.220.101.5", "sshd", 1_714_000_000, 600);
 
     var ctx: HttpSources = .{
         .metrics = undefined,
         .cmd_ctx = undefined,
-        .state = &tracker,
+        .trackers = &trackers,
     };
     var out: std.ArrayListUnmanaged(u8) = .{};
     defer out.deinit(a);
@@ -1543,29 +1659,30 @@ test "http: /api/bans single ban populates element fields" {
 
 test "http: /api/bans truncates elements at 200 but count reflects total" {
     const a = testing.allocator;
+    var trackers = tracker_map_mod.TrackerMap.init(a);
+    defer trackers.deinit();
     // Capacity large enough to hold all 250 entries; the cap we enforce
     // at the response layer is `http.max_bans_in_snapshot`, not the
     // tracker's.
-    var tracker = try state_mod.StateTracker.init(a, .{
+    const sshd_tracker = try trackers.addTracker("sshd", .{
         .max_entries = 512,
         .findtime = 600,
         .maxretry = 5,
         .bantime = 600,
     });
-    defer tracker.deinit();
 
     // 250 unique IPs in 10.x.y.z range — all banned.
     var i: u32 = 0;
     while (i < 250) : (i += 1) {
         var buf: [16]u8 = undefined;
         const s = try std.fmt.bufPrint(&buf, "10.0.{d}.{d}", .{ i / 256, i % 256 });
-        try injectBan(&tracker, s, "sshd", 1_714_000_000, 600);
+        try injectBan(sshd_tracker, s, "sshd", 1_714_000_000, 600);
     }
 
     var ctx: HttpSources = .{
         .metrics = undefined,
         .cmd_ctx = undefined,
-        .state = &tracker,
+        .trackers = &trackers,
     };
     var out: std.ArrayListUnmanaged(u8) = .{};
     defer out.deinit(a);
@@ -1583,4 +1700,30 @@ test "http: /api/bans truncates elements at 200 but count reflects total" {
         cursor += rel + 1;
     }
     try testing.expectEqual(http.max_bans_in_snapshot, element_count);
+}
+
+test "http: /api/bans aggregates across per-jail trackers (ISSUE-007)" {
+    const a = testing.allocator;
+    var trackers = tracker_map_mod.TrackerMap.init(a);
+    defer trackers.deinit();
+    const sshd_tracker = try trackers.addTracker("sshd", .{ .max_entries = 16, .findtime = 600, .maxretry = 5, .bantime = 600 });
+    const nginx_tracker = try trackers.addTracker("nginx", .{ .max_entries = 16, .findtime = 600, .maxretry = 5, .bantime = 600 });
+
+    try injectBan(sshd_tracker, "1.1.1.1", "sshd", 1_714_000_000, 600);
+    try injectBan(nginx_tracker, "2.2.2.2", "nginx", 1_714_000_000, 600);
+
+    var ctx: HttpSources = .{
+        .metrics = undefined,
+        .cmd_ctx = undefined,
+        .trackers = &trackers,
+    };
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    defer out.deinit(a);
+    try writeBansPayload(@ptrCast(&ctx), &out, a);
+    const body = out.items;
+    try testing.expect(std.mem.indexOf(u8, body, "\"total\":2") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "1.1.1.1") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "2.2.2.2") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"jail\":\"sshd\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"jail\":\"nginx\"") != null);
 }
