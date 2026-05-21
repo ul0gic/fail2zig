@@ -1,4 +1,4 @@
-.TH FAIL2ZIG.TOML 5 "2026-04-21" "fail2zig 0.1.0" "File Formats"
+.TH FAIL2ZIG.TOML 5 "2026-05-21" "fail2zig 0.1.1" "File Formats"
 .
 .SH NAME
 fail2zig.toml \- fail2zig daemon configuration file
@@ -182,9 +182,15 @@ Optional string array. Replaces (does not merge with)
 for this jail.
 .TP
 .B bantime_increment_enabled , bantime_increment_multiplier , bantime_increment_factor , bantime_increment_formula , bantime_increment_max_bantime
-Parsed and stored; in v0.1.0 only the
+Per-jail values take precedence over
 .B [defaults]
-values take effect. Per-jail escalation is planned for v0.2.0.
+values; jails without an explicit setting inherit from defaults.
+.B bantime_increment_multiplier
+and
+.B bantime_increment_factor
+accept either integer or fractional values (e.g.
+.B factor = 1.5
+for a softer escalation curve).
 .
 .SH EXAMPLES
 .SS Minimal configuration

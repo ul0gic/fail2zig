@@ -19,7 +19,7 @@ pub const socket = @import("socket.zig");
 pub const format = @import("format.zig");
 pub const completions = @import("completions.zig");
 
-pub const client_version = "0.1.0";
+pub const client_version = "0.1.1";
 
 pub const ExitCode = enum(u8) {
     success = 0,
@@ -297,7 +297,7 @@ test "client: --version exits 0 and prints client version" {
     defer testing.allocator.free(r.out);
     defer testing.allocator.free(r.err);
     try testing.expectEqual(ExitCode.success, r.code);
-    try testing.expect(std.mem.indexOf(u8, r.out, "fail2zig-client 0.1.0") != null);
+    try testing.expect(std.mem.indexOf(u8, r.out, "fail2zig-client 0.1.1") != null);
 }
 
 test "client: no args exits 2 with error about missing command" {

@@ -68,7 +68,7 @@ The installer pulls from the
 [latest GitHub Release](https://github.com/ul0gic/fail2zig/releases/latest)
 and verifies every asset against the published `SHA256SUMS` before placing
 anything on disk. Pin a specific version with
-`FAIL2ZIG_VERSION=v0.1.0` or inspect the script first with
+`FAIL2ZIG_VERSION=v0.1.1` or inspect the script first with
 `curl -fsSL … | less`.
 
 ---
@@ -168,7 +168,7 @@ installs the hardened `fail2zig.service` unit under
 `/etc/systemd/system/`. It does **not** auto-start the daemon — audit the
 config, then `systemctl enable --now fail2zig` when ready.
 
-**Supported targets (v0.1.0):**
+**Supported targets (v0.1.1):**
 - `x86_64-linux-musl` (879 KB stripped)
 - `aarch64-linux-musl` (801 KB stripped)
 
@@ -194,7 +194,7 @@ If you'd rather skip the script:
 
 ```bash
 # 1. Download the binary + manifest for your arch
-VERSION=v0.1.0
+VERSION=v0.1.1
 ARCH=x86_64-linux-musl   # or aarch64-linux-musl
 curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/fail2zig-${VERSION}-${ARCH}"
 curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/fail2zig-client-${VERSION}-${ARCH}"
@@ -262,7 +262,7 @@ From a downloaded release (the same three files are published alongside
 the binaries):
 
 ```bash
-VERSION=v0.1.0
+VERSION=v0.1.1
 for f in fail2zig.service fail2zig.socket fail2zig.toml.example; do
   curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/${f}"
 done
@@ -329,17 +329,6 @@ sudo fail2zig --validate-config --config /etc/fail2zig/config.toml
 sudo systemctl restart fail2zig
 fail2zig-client status
 ```
-
-### Threshold knobs in v0.1.0
-
-In **v0.1.0**, the `bantime`, `findtime`, `maxretry`, and
-`bantime_increment_*` values are honored from `[defaults]` only — a single
-shared state tracker applies the same thresholds across every jail. Per-jail
-overrides (`[jails.<name>].maxretry = …` etc.) are parsed and accepted by
-the validator, but have no runtime effect. Per-jail threshold tracking is
-the first item in the v0.2 scope (tracked as ISSUE-007). Set the values
-you want globally in `[defaults]` until then; per-jail `enabled`,
-`filter`, and `logpath` work as expected.
 
 Full schema and every option: [reference/config](https://fail2zig.com/docs/reference/config/).
 
