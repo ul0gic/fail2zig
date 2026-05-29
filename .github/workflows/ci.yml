@@ -48,7 +48,9 @@ jobs:
     name: zig fmt --check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Install Zig ${{ env.ZIG_VERSION }}
         # Direct fetch instead of mlugg/setup-zig@v1 — that action's
         # mirror layout doesn't handle the 0.14.1 archive rename
@@ -69,7 +71,9 @@ jobs:
     name: Build (native Debug)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Install Zig ${{ env.ZIG_VERSION }}
         # Direct fetch instead of mlugg/setup-zig@v1 — that action's
         # mirror layout doesn't handle the 0.14.1 archive rename
@@ -83,7 +87,7 @@ jobs:
           echo "/opt/zig" >> "$GITHUB_PATH"
           /opt/zig/zig version
       - name: Cache zig-cache
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: .zig-cache
           key: zig-cache-build-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
@@ -96,7 +100,9 @@ jobs:
     name: Tests (std.testing.allocator leak detection)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Install Zig ${{ env.ZIG_VERSION }}
         # Direct fetch instead of mlugg/setup-zig@v1 — that action's
         # mirror layout doesn't handle the 0.14.1 archive rename
@@ -110,7 +116,7 @@ jobs:
           echo "/opt/zig" >> "$GITHUB_PATH"
           /opt/zig/zig version
       - name: Cache zig-cache
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: .zig-cache
           key: zig-cache-test-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
@@ -130,7 +136,9 @@ jobs:
           - x86_64-linux-musl
           - aarch64-linux-musl
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Install Zig ${{ env.ZIG_VERSION }}
         # Direct fetch instead of mlugg/setup-zig@v1 — that action's
         # mirror layout doesn't handle the 0.14.1 archive rename
@@ -144,7 +152,7 @@ jobs:
           echo "/opt/zig" >> "$GITHUB_PATH"
           /opt/zig/zig version
       - name: Cache zig-cache
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: .zig-cache
           key: zig-cache-cross-${{ matrix.target }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
@@ -166,7 +174,7 @@ jobs:
             exit 1
           fi
       - name: Upload cross-compile artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fail2zig-${{ matrix.target }}
           path: |
@@ -179,7 +187,9 @@ jobs:
     name: shellcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Lint scripts
@@ -194,7 +204,9 @@ jobs:
     name: yamllint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Install yamllint
         run: sudo apt-get update && sudo apt-get install -y yamllint
       - name: Lint CI YAML
@@ -204,7 +216,9 @@ jobs:
     name: SPDX headers
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Verify every .zig file carries the SPDX + copyright header
         # Every first-party .zig source under engine/, client/, shared/,
         # tests/, plus build.zig at the root, must start with:
