@@ -11,11 +11,14 @@
 #   shellcheck    — lint every tracked shell script
 #   yamllint      — lint the workflow files themselves
 #
-# Cross-compile matrix deliberately excludes `arm-linux-musleabihf` and
-# `mips-linux-musl` — both are broken on real portability bugs tracked in
-# .project/issues/open/SYS-009-armv7-cross-compile-broken.md. They will be
-# re-enabled once SYS-009 ships its fix (switch u64 atomic counters to a
-# mutex-backed Counter, fix socklen_t cast in client/socket.zig).
+# Cross-compile matrix covers x86_64, aarch64, and armv7 (arm-linux-musleabihf).
+# SYS-009's portability bugs are fixed (u64 atomic counters now use a conditional
+# Counter that is mutex-backed on 32-bit arches; timeval casts narrow into the
+# target field types in client/socket.zig + engine/firewall/netlink.zig).
+# `mips-linux-musl` remains excluded: Zig 0.14.1 cannot provide musl libc for it
+# ("unable to find or provide libc for target 'mips-linux...-musl'") — a
+# toolchain limitation, not our code. See
+# .project/issues/open/SYS-009-armv7-cross-compile-broken.md.
 #
 # Zig version is pinned to the toolchain that ships the project — see
 # build.zig.zon `minimum_zig_version`. Keep this in sync with any bump.
@@ -131,10 +134,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # arm-linux-musleabihf + mips-linux-musl excluded — SYS-009.
+        # mips-linux-musl excluded — Zig 0.14.1 lacks musl libc for it (SYS-009).
         target:
           - x86_64-linux-musl
           - aarch64-linux-musl
+          - arm-linux-musleabihf
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:

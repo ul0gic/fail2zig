@@ -17,8 +17,11 @@
 # the auto-generated commit list below. The file is transient: commit it
 # along with the tag, delete it after the release is published.
 #
-# Cross-compile matrix deliberately excludes arm-linux-musleabihf + mips-linux-musl
-# — both are broken on SYS-009. Re-enable them once SYS-009 ships its fix.
+# Cross-compile matrix covers x86_64, aarch64, and armv7 (arm-linux-musleabihf).
+# mips-linux-musl is still excluded: SYS-009's code bugs (u64 atomics + timeval
+# casts) are fixed, but Zig 0.14.1 cannot provide musl libc for the
+# `mips-linux-musl` target ("unable to find or provide libc for target
+# 'mips-linux...-musl'"). That's a toolchain limitation, not our code.
 
 name: Release
 
@@ -45,9 +48,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # mips-linux-musl excluded — Zig 0.14.1 lacks musl libc for it (SYS-009).
         target:
           - x86_64-linux-musl
           - aarch64-linux-musl
+          - arm-linux-musleabihf
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:

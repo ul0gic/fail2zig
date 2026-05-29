@@ -175,8 +175,13 @@ pub const NetlinkSocket = struct {
     /// bound the worst-case wait for netlink responses. Passing 0
     /// disables the timeout (blocking recv forever).
     pub fn setRecvTimeout(self: *NetlinkSocket, ms: u64) Error!void {
-        const secs: i64 = @intCast(ms / 1000);
-        const usecs: i64 = @intCast((ms % 1000) * 1000);
+        // `timeval.sec`/`.usec` are target-width-dependent (i32 on 32-bit
+        // arm, isize elsewhere). Cast into the actual field types so this
+        // narrows on 32-bit and stays wide on 64-bit — a hardcoded i64
+        // fails to compile on arm-linux-musleabihf. (Same fix as
+        // client/socket.zig's timeoutToTimeval; SYS-009.)
+        const secs: @FieldType(posix.timeval, "sec") = @intCast(ms / 1000);
+        const usecs: @FieldType(posix.timeval, "usec") = @intCast((ms % 1000) * 1000);
         const tv: posix.timeval = .{ .sec = secs, .usec = usecs };
         posix.setsockopt(
             self.fd,

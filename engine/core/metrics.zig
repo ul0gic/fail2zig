@@ -20,6 +20,99 @@
 //! resize.
 
 const std = @import("std");
+const builtin = @import("builtin");
+
+// ============================================================================
+// Counter — portable 64-bit monotonic counter
+// ============================================================================
+//
+// Our counters are u64 so a long-running daemon never wraps a lifetime total
+// (bans_total, lines_parsed_total) on a busy server. The problem: 32-bit
+// targets without native 64-bit CAS (arm-linux-musleabihf pre-LSE, mips) have
+// NO hardware instruction to atomically read-modify-write a u64, so
+// `std.atomic.Value(u64)` is REJECTED at compile time on those arches. x86_64
+// (cmpxchg16b) and aarch64 (LSE) compile fine, which is why this only shows up
+// when cross-compiling to embedded targets.
+//
+// Fix: `Counter` is a conditional type with one public API across all arches:
+//   - 64-bit targets  -> `AtomicCounter`: lock-free `std.atomic.Value(u64)`,
+//                        `.monotonic` ordering baked in (independent counters,
+//                        no cross-counter invariants — see module doc).
+//   - 32-bit targets  -> `MutexCounter`: a plain u64 guarded by a
+//                        `std.Thread.Mutex`. An uncontended mutex is ~tens of
+//                        ns; these are per-event increments + periodic snapshot
+//                        reads, so the cost is negligible and correctness holds
+//                        on every arch.
+//
+// Both expose identical methods (`init`/`inc`/`load`/`store`) so call sites
+// never branch on architecture. `MutexCounter` holds a mutex by value, which is
+// only sound because `Metrics`/`PerJail` are constructed once and thereafter
+// accessed exclusively through `*Metrics` — they are never copied by value
+// (snapshot() reads each counter through `load()` into a plain-u64 `Snapshot`,
+// never memcpy of the Counter itself).
+
+/// Lock-free counter for arches with native 64-bit atomics. `.monotonic`
+/// ordering is baked in: we only need per-counter atomicity, not cross-counter
+/// consistency (readers may observe the middle of a batch update by design).
+const AtomicCounter = struct {
+    value: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    fn init(v: u64) AtomicCounter {
+        return .{ .value = std.atomic.Value(u64).init(v) };
+    }
+
+    /// Atomically add 1. Hot path.
+    fn inc(self: *AtomicCounter) void {
+        _ = self.value.fetchAdd(1, .monotonic);
+    }
+
+    // `self` is non-const to mirror MutexCounter.load (which must lock).
+    // Keeping the signatures identical lets call sites stay arch-agnostic.
+    fn load(self: *AtomicCounter) u64 {
+        return self.value.load(.monotonic);
+    }
+
+    fn store(self: *AtomicCounter, v: u64) void {
+        self.value.store(v, .monotonic);
+    }
+};
+
+/// Mutex-guarded counter for 32-bit arches that lack a native 64-bit atomic.
+/// The mutex provides ordering, so no atomic ordering parameter is needed. Held
+/// by value — safe because Metrics/PerJail are never copied (see note above).
+const MutexCounter = struct {
+    mutex: std.Thread.Mutex = .{},
+    value: u64 = 0,
+
+    fn init(v: u64) MutexCounter {
+        return .{ .value = v };
+    }
+
+    /// Add 1 under the lock. Critical section is a single u64 increment.
+    fn inc(self: *MutexCounter) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.value += 1;
+    }
+
+    fn load(self: *MutexCounter) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.value;
+    }
+
+    fn store(self: *MutexCounter, v: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.value = v;
+    }
+};
+
+/// Portable 64-bit monotonic counter. Lock-free on 64-bit targets,
+/// mutex-guarded on 32-bit targets (which lack native 64-bit atomics). Same API
+/// on both — call sites never branch on architecture. See the block comment
+/// above for the full rationale.
+const Counter = if (@bitSizeOf(usize) >= 64) AtomicCounter else MutexCounter;
 
 /// Hard upper bound on per-jail slots. Matches the configuration cap
 /// in `config.native` (no jail configuration beyond this ceiling is
@@ -45,12 +138,14 @@ const counter_order: std.builtin.AtomicOrder = .monotonic;
 pub const PerJail = struct {
     name_buf: [max_jail_name_len]u8 = [_]u8{0} ** max_jail_name_len,
     name_len: u8 = 0,
-    lines_parsed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    lines_matched: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    bans_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    unbans_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    lines_parsed: Counter = .{},
+    lines_matched: Counter = .{},
+    bans_total: Counter = .{},
+    unbans_total: Counter = .{},
+    // active_bans is u32 — 32-bit atomics are native on every target, so
+    // it stays a plain atomic (incl. its saturating fetchSub logic).
     active_bans: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    parse_errors: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    parse_errors: Counter = .{},
 
     pub fn name(self: *const PerJail) []const u8 {
         return self.name_buf[0..self.name_len];
@@ -98,14 +193,18 @@ pub const Snapshot = struct {
 
 pub const Metrics = struct {
     // Global counters. Field order is intentional: hottest counters
-    // first so they land on the same cache line on typical 64B CPUs.
-    lines_parsed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    lines_matched: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    bans_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    unbans_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    // first so they land on the same cache line on typical 64B CPUs
+    // (true on the 64-bit lock-free path; the 32-bit mutex path trades
+    // a little layout density for portability, which is the right call
+    // on the embedded targets that need it).
+    lines_parsed: Counter = .{},
+    lines_matched: Counter = .{},
+    bans_total: Counter = .{},
+    unbans_total: Counter = .{},
+    // active_bans is u32 — native 32-bit atomic on every target.
     active_bans: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    parse_errors: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    memory_bytes_used: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    parse_errors: Counter = .{},
+    memory_bytes_used: Counter = .{},
 
     // Per-jail entries + number of currently-populated slots. The
     // `jails_len` field is written only when a new jail is registered;
@@ -122,20 +221,20 @@ pub const Metrics = struct {
     // ----- Global increments -----
 
     pub fn incrementParsed(self: *Metrics) void {
-        _ = self.lines_parsed.fetchAdd(1, counter_order);
+        self.lines_parsed.inc();
     }
 
     pub fn incrementMatched(self: *Metrics) void {
-        _ = self.lines_matched.fetchAdd(1, counter_order);
+        self.lines_matched.inc();
     }
 
     pub fn incrementBans(self: *Metrics) void {
-        _ = self.bans_total.fetchAdd(1, counter_order);
+        self.bans_total.inc();
         _ = self.active_bans.fetchAdd(1, counter_order);
     }
 
     pub fn incrementUnbans(self: *Metrics) void {
-        _ = self.unbans_total.fetchAdd(1, counter_order);
+        self.unbans_total.inc();
         // Active bans is a gauge; saturate at zero rather than underflow.
         const prev = self.active_bans.load(counter_order);
         if (prev > 0) {
@@ -144,11 +243,11 @@ pub const Metrics = struct {
     }
 
     pub fn incrementParseErrors(self: *Metrics) void {
-        _ = self.parse_errors.fetchAdd(1, counter_order);
+        self.parse_errors.inc();
     }
 
     pub fn setMemoryBytes(self: *Metrics, bytes: u64) void {
-        self.memory_bytes_used.store(bytes, counter_order);
+        self.memory_bytes_used.store(bytes);
     }
 
     /// Directly set the `active_bans` gauge without bumping the
@@ -203,19 +302,19 @@ pub const Metrics = struct {
 
     pub fn jailIncrementParsed(self: *Metrics, jail: []const u8) void {
         if (self.jailIndex(jail)) |i| {
-            _ = self.jails[i].lines_parsed.fetchAdd(1, counter_order);
+            self.jails[i].lines_parsed.inc();
         }
     }
 
     pub fn jailIncrementMatched(self: *Metrics, jail: []const u8) void {
         if (self.jailIndex(jail)) |i| {
-            _ = self.jails[i].lines_matched.fetchAdd(1, counter_order);
+            self.jails[i].lines_matched.inc();
         }
     }
 
     pub fn jailIncrementBans(self: *Metrics, jail: []const u8) void {
         if (self.jailIndex(jail)) |i| {
-            _ = self.jails[i].bans_total.fetchAdd(1, counter_order);
+            self.jails[i].bans_total.inc();
             _ = self.jails[i].active_bans.fetchAdd(1, counter_order);
         }
     }
@@ -229,7 +328,7 @@ pub const Metrics = struct {
 
     pub fn jailIncrementUnbans(self: *Metrics, jail: []const u8) void {
         if (self.jailIndex(jail)) |i| {
-            _ = self.jails[i].unbans_total.fetchAdd(1, counter_order);
+            self.jails[i].unbans_total.inc();
             const prev = self.jails[i].active_bans.load(counter_order);
             if (prev > 0) {
                 _ = self.jails[i].active_bans.fetchSub(1, counter_order);
@@ -239,23 +338,26 @@ pub const Metrics = struct {
 
     pub fn jailIncrementParseErrors(self: *Metrics, jail: []const u8) void {
         if (self.jailIndex(jail)) |i| {
-            _ = self.jails[i].parse_errors.fetchAdd(1, counter_order);
+            self.jails[i].parse_errors.inc();
         }
     }
 
     // ----- Snapshot -----
 
     /// Take a consistent-per-counter snapshot of all global and
-    /// per-jail values. Returned by value (no allocation).
-    pub fn snapshot(self: *const Metrics) Snapshot {
+    /// per-jail values into a plain-u64 `Snapshot` (no allocation, no
+    /// memcpy of any `Counter`). `self` is `*Metrics` (not `*const`)
+    /// because `Counter.load` may take a mutex on 32-bit targets; reads
+    /// never mutate logical counter values.
+    pub fn snapshot(self: *Metrics) Snapshot {
         var s = Snapshot{};
-        s.lines_parsed = self.lines_parsed.load(counter_order);
-        s.lines_matched = self.lines_matched.load(counter_order);
-        s.bans_total = self.bans_total.load(counter_order);
-        s.unbans_total = self.unbans_total.load(counter_order);
+        s.lines_parsed = self.lines_parsed.load();
+        s.lines_matched = self.lines_matched.load();
+        s.bans_total = self.bans_total.load();
+        s.unbans_total = self.unbans_total.load();
         s.active_bans = self.active_bans.load(counter_order);
-        s.parse_errors = self.parse_errors.load(counter_order);
-        s.memory_bytes_used = self.memory_bytes_used.load(counter_order);
+        s.parse_errors = self.parse_errors.load();
+        s.memory_bytes_used = self.memory_bytes_used.load();
 
         const live = self.jails_len.load(.acquire);
         s.jails_len = live;
@@ -263,12 +365,12 @@ pub const Metrics = struct {
             s.jails[i] = .{
                 .name_buf = slot.name_buf,
                 .name_len = slot.name_len,
-                .lines_parsed = slot.lines_parsed.load(counter_order),
-                .lines_matched = slot.lines_matched.load(counter_order),
-                .bans_total = slot.bans_total.load(counter_order),
-                .unbans_total = slot.unbans_total.load(counter_order),
+                .lines_parsed = slot.lines_parsed.load(),
+                .lines_matched = slot.lines_matched.load(),
+                .bans_total = slot.bans_total.load(),
+                .unbans_total = slot.unbans_total.load(),
                 .active_bans = slot.active_bans.load(counter_order),
-                .parse_errors = slot.parse_errors.load(counter_order),
+                .parse_errors = slot.parse_errors.load(),
             };
         }
         return s;
@@ -444,4 +546,90 @@ test "metrics: concurrent mixed operations preserve totals" {
     try testing.expectEqual(@as(u64, 2000), s.perJail()[0].lines_parsed);
     // active_bans increments by ban, decrements by unban -> net 0.
     try testing.expectEqual(@as(u32, 0), s.active_bans);
+}
+
+// ----------------------------------------------------------------------------
+// Direct Counter-impl coverage
+//
+// On the x86_64 CI host, `Counter` resolves to `AtomicCounter` at comptime, so
+// the production tests above NEVER exercise `MutexCounter` at runtime — the
+// 32-bit mutex path would otherwise be "verified" only by cross-compilation.
+// These tests instantiate BOTH impls explicitly (regardless of host arch) so
+// the mutex logic gets real runtime coverage here, and so AtomicCounter has a
+// symmetric direct test documenting the intended single-threaded contract.
+// File-private `MutexCounter`/`AtomicCounter` are reachable from inline test
+// blocks in the same file, so neither is made `pub` just for testing.
+// ----------------------------------------------------------------------------
+
+test "MutexCounter: single-threaded init/inc/load/store" {
+    var c = MutexCounter.init(0);
+    try testing.expectEqual(@as(u64, 0), c.load());
+
+    var i: u64 = 0;
+    while (i < 7) : (i += 1) c.inc();
+    try testing.expectEqual(@as(u64, 7), c.load());
+
+    c.store(123456789);
+    try testing.expectEqual(@as(u64, 123456789), c.load());
+
+    // init(v) seeds a non-zero starting value.
+    var seeded = MutexCounter.init(42);
+    try testing.expectEqual(@as(u64, 42), seeded.load());
+}
+
+// Mirrors the Metrics-level 4x1000 stress test, but drives MutexCounter
+// directly. On x86_64 this is the ONLY runtime proof that the mutex actually
+// serializes concurrent inc() — any lost update would leave load() < 4000.
+test "MutexCounter: 4 threads x 1000 inc serialize to exactly 4000" {
+    var c = MutexCounter.init(0);
+    const Worker = struct {
+        fn run(counter: *MutexCounter) void {
+            var i: u32 = 0;
+            while (i < 1000) : (i += 1) counter.inc();
+        }
+    };
+
+    var ths: [4]std.Thread = undefined;
+    for (&ths) |*t| {
+        t.* = try std.Thread.spawn(.{}, Worker.run, .{&c});
+    }
+    for (ths) |t| t.join();
+
+    try testing.expectEqual(@as(u64, 4000), c.load());
+}
+
+test "AtomicCounter: single-threaded init/inc/load/store" {
+    var c = AtomicCounter.init(0);
+    try testing.expectEqual(@as(u64, 0), c.load());
+
+    var i: u64 = 0;
+    while (i < 7) : (i += 1) c.inc();
+    try testing.expectEqual(@as(u64, 7), c.load());
+
+    c.store(123456789);
+    try testing.expectEqual(@as(u64, 123456789), c.load());
+
+    var seeded = AtomicCounter.init(42);
+    try testing.expectEqual(@as(u64, 42), seeded.load());
+}
+
+// Symmetric to the MutexCounter stress test so both impls have explicit,
+// parallel coverage of concurrent inc(). The production Metrics tests already
+// exercise this path on 64-bit hosts; this one documents intent directly.
+test "AtomicCounter: 4 threads x 1000 inc sum to exactly 4000" {
+    var c = AtomicCounter.init(0);
+    const Worker = struct {
+        fn run(counter: *AtomicCounter) void {
+            var i: u32 = 0;
+            while (i < 1000) : (i += 1) counter.inc();
+        }
+    };
+
+    var ths: [4]std.Thread = undefined;
+    for (&ths) |*t| {
+        t.* = try std.Thread.spawn(.{}, Worker.run, .{&c});
+    }
+    for (ths) |t| t.join();
+
+    try testing.expectEqual(@as(u64, 4000), c.load());
 }

@@ -246,8 +246,12 @@ pub const DiagBuf = struct {
 };
 
 fn timeoutToTimeval(ms: u64) posix.timeval {
-    const secs: i64 = @intCast(ms / 1000);
-    const usecs: i64 = @intCast((ms % 1000) * 1000);
+    // `timeval.sec`/`.usec` are target-width-dependent (i32 on 32-bit arm,
+    // isize elsewhere). Let `@intCast` narrow into the actual field types
+    // instead of forcing i64 — a hardcoded i64 fails to compile on 32-bit
+    // targets where the field is i32.
+    const secs: @FieldType(posix.timeval, "sec") = @intCast(ms / 1000);
+    const usecs: @FieldType(posix.timeval, "usec") = @intCast((ms % 1000) * 1000);
     return .{ .sec = secs, .usec = usecs };
 }
 
