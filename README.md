@@ -251,21 +251,23 @@ From a repo checkout:
 
 ```bash
 sudo install -m 0644 deploy/fail2zig.service /etc/systemd/system/
+sudo install -m 0644 deploy/fail2zig.socket  /etc/systemd/system/
 sudo install -d -m 0750 /etc/fail2zig
 sudo install -m 0640 deploy/fail2zig.toml.example /etc/fail2zig/config.toml
 sudo systemctl daemon-reload
 sudo systemctl enable --now fail2zig
 ```
 
-From a downloaded release (the same three files are published alongside
+From a downloaded release (the same files are published alongside
 the binaries):
 
 ```bash
-VERSION=v0.1.2
-for f in fail2zig.service fail2zig.toml.example; do
+VERSION=v0.1.1
+for f in fail2zig.service fail2zig.socket fail2zig.toml.example; do
   curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/${f}"
 done
 sudo install -m 0644 fail2zig.service /etc/systemd/system/
+sudo install -m 0644 fail2zig.socket  /etc/systemd/system/
 sudo install -d -m 0750 /etc/fail2zig
 sudo install -m 0640 fail2zig.toml.example /etc/fail2zig/config.toml
 sudo systemctl daemon-reload
