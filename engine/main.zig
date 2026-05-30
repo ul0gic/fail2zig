@@ -210,6 +210,15 @@ const JailContext = struct {
     /// overrides actually take effect.
     state: *state_mod.StateTracker,
     backend_ptr: *firewall.Backend,
+    /// Resolved ban action for THIS jail (SYS-016). Drives ban dispatch:
+    /// `.@"log-only"` records the ban intent (would-ban log line + bans
+    /// metric) but skips the firewall mutation AND the `ip_banned` event;
+    /// every other value enforces through `backend_ptr` and emits the
+    /// event. Resolved once at context construction via
+    /// `config_mod.resolveJailFromConfig` so the per-jail-vs-defaults rule
+    /// isn't reimplemented here. Defaults to `.nftables` (the schema
+    /// default) so a context built without this field still enforces.
+    banaction: config_mod.BanAction = .nftables,
     /// Metrics is nullable for tests that don't care about counters —
     /// the daemon always supplies a real pointer.
     metrics: ?*metrics_mod.Metrics = null,
@@ -226,12 +235,102 @@ const JailContext = struct {
     /// Current wall-clock is read at callback time; stored here so tests
     /// can override it. In production this stays at null.
     now_override: ?shared.Timestamp = null,
+    /// Test seam (SYS-016). When non-null, the enforcing dispatch path
+    /// calls this instead of `backend_ptr.ban`, letting tests observe
+    /// whether enforcement was invoked without a real kernel/firewall.
+    /// In production this stays null and the real backend is called.
+    /// Mirrors the `now_override` test-seam idiom already used here.
+    ban_hook: ?*const fn (
+        userdata: ?*anyopaque,
+        ip: shared.IpAddress,
+        jail: shared.JailId,
+        duration: shared.Duration,
+    ) firewall.BackendError!void = null,
+    /// Opaque userdata handed to `ban_hook` (e.g. a call-count spy).
+    ban_hook_ctx: ?*anyopaque = null,
 
     fn now(self: *const JailContext) shared.Timestamp {
         if (self.now_override) |t| return t;
         return std.time.timestamp();
     }
+
+    /// Enforce a ban through the configured backend, honoring the test
+    /// seam when present. Returns the backend error unchanged so callers
+    /// keep their existing error handling.
+    fn enforceBan(
+        self: *JailContext,
+        ip: shared.IpAddress,
+        jail: shared.JailId,
+        duration: shared.Duration,
+    ) firewall.BackendError!void {
+        if (self.ban_hook) |hook| {
+            return hook(self.ban_hook_ctx, ip, jail, duration);
+        }
+        return self.backend_ptr.ban(ip, jail, duration);
+    }
 };
+
+/// Dispatch a ban decision (SYS-016). Honors the jail's resolved
+/// `banaction`:
+///
+///   * `.@"log-only"` — record the ban INTENT only: log a "would-ban"
+///     line and increment the bans counter so the operator can see the
+///     jail is doing its job, but DO NOT mutate the firewall and DO NOT
+///     emit the `ip_banned` WS event. That event asserts the IP was
+///     actually banned; emitting it for a log-only jail would be a lie —
+///     the same dishonesty (claiming an enforcement that didn't happen)
+///     this fix exists to remove. Honest audit/monitoring mode.
+///   * everything else — a real ban. Enforce through the backend first;
+///     on backend error, warn and return BEFORE incrementing metrics /
+///     broadcasting (preserving the original ordering) so a failed
+///     enforcement is not counted as a successful ban. Then broadcast the
+///     honest `ip_banned` event.
+///
+/// Extracted from `lineCallback` so the branch is unit-testable.
+fn dispatchBan(ctx: *JailContext, d: state_mod.BanDecision) void {
+    if (ctx.banaction == .@"log-only") {
+        // Audit mode: record intent, touch nothing.
+        std.log.info(
+            "would-ban: jail='{s}' ip={} duration={d}s ban_count={d} action=log-only",
+            .{ ctx.jail.slice(), d.ip, d.duration, d.ban_count },
+        );
+        if (ctx.metrics) |m| {
+            m.incrementBans();
+            m.jailIncrementBans(ctx.jail.slice());
+        }
+        // Deliberately NO broadcastBanned() here: no firewall mutation
+        // occurred, so an `ip_banned` event would misrepresent reality.
+        return;
+    }
+
+    // Enforcing path — a real ban.
+    std.log.info(
+        "ban: jail='{s}' ip={} duration={d}s ban_count={d} action={s}",
+        .{ ctx.jail.slice(), d.ip, d.duration, d.ban_count, @tagName(ctx.banaction) },
+    );
+    ctx.enforceBan(d.ip, d.jail, d.duration) catch |err| {
+        std.log.warn(
+            "backend: ban failed for ip={} jail='{s}': {s}",
+            .{ d.ip, ctx.jail.slice(), @errorName(err) },
+        );
+        return;
+    };
+    if (ctx.metrics) |m| {
+        m.incrementBans();
+        m.jailIncrementBans(ctx.jail.slice());
+    }
+    // Broadcast `ip_banned` after the kernel ban is confirmed.
+    if (ctx.ws) |ws_server| {
+        if (ctx.ws_alloc) |a| {
+            var ip_buf: [64]u8 = undefined;
+            if (std.fmt.bufPrint(&ip_buf, "{}", .{d.ip})) |ip_str| {
+                ws_server.broadcastBanned(a, ip_str, ctx.jail.slice(), d.duration) catch |err| {
+                    std.log.warn("ws: broadcastBanned failed: {s}", .{@errorName(err)});
+                };
+            } else |_| {}
+        }
+    }
+}
 
 fn lineCallback(
     line: []const u8,
@@ -322,32 +421,7 @@ fn lineCallback(
         return;
     };
     if (decision) |d| {
-        std.log.info(
-            "ban: jail='{s}' ip={} duration={d}s ban_count={d}",
-            .{ ctx.jail.slice(), d.ip, d.duration, d.ban_count },
-        );
-        ctx.backend_ptr.ban(d.ip, d.jail, d.duration) catch |err| {
-            std.log.warn(
-                "backend: ban failed for ip={} jail='{s}': {s}",
-                .{ d.ip, ctx.jail.slice(), @errorName(err) },
-            );
-            return;
-        };
-        if (ctx.metrics) |m| {
-            m.incrementBans();
-            m.jailIncrementBans(ctx.jail.slice());
-        }
-        // Broadcast `ip_banned` after the kernel ban is confirmed.
-        if (ctx.ws) |ws_server| {
-            if (ctx.ws_alloc) |a| {
-                var ip_buf: [64]u8 = undefined;
-                if (std.fmt.bufPrint(&ip_buf, "{}", .{d.ip})) |ip_str| {
-                    ws_server.broadcastBanned(a, ip_str, ctx.jail.slice(), d.duration) catch |err| {
-                        std.log.warn("ws: broadcastBanned failed: {s}", .{@errorName(err)});
-                    };
-                } else |_| {}
-            }
-        }
+        dispatchBan(ctx, d);
     }
 }
 
@@ -878,12 +952,17 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
             );
             continue;
         };
+        // Resolve this jail's effective ban action (SYS-016). Same
+        // per-jail-vs-defaults rule used for the tracker config above;
+        // `resolveJailFromConfig` is the single source of that rule.
+        const resolved = config_mod.resolveJailFromConfig(&jail_cfg, cfg.defaults);
         const ctx = try heap.create(JailContext);
         ctx.* = .{
             .jail = jail,
             .parser = parser_mod.Parser.init(pool.allocator(.parser_buffer)),
             .state = tracker_ptr,
             .backend_ptr = &backend_val,
+            .banaction = resolved.banaction,
             .metrics = &metrics,
         };
         try contexts.append(ctx);
@@ -1507,6 +1586,198 @@ test "main: deriveJailTrackerConfig uses resolved per-jail values" {
     try std.testing.expectEqual(@as(shared.Duration, 30), t.bantime);
     try std.testing.expectEqual(@as(shared.Duration, 10), t.findtime);
     try std.testing.expectEqual(@as(u32, 1), t.maxretry);
+}
+
+// ---------- SYS-016: banaction honored at ban dispatch ----------
+//
+// These exercise `dispatchBan` directly with a real `BanDecision`
+// (produced by a real `StateTracker` crossing its threshold) and a spy
+// in place of the firewall backend. The spy lets us assert whether the
+// enforcing `ban` path was invoked WITHOUT a real kernel/firewall — the
+// core of the bug was that a `log-only` jail still mutated the firewall.
+
+/// Counts calls to the ban hook. The hook signature matches
+/// `JailContext.ban_hook`; the spy never touches the kernel.
+const BanSpy = struct {
+    calls: u32 = 0,
+    last_ip: ?shared.IpAddress = null,
+
+    fn ban(
+        userdata: ?*anyopaque,
+        ip: shared.IpAddress,
+        jail: shared.JailId,
+        duration: shared.Duration,
+    ) firewall.BackendError!void {
+        _ = jail;
+        _ = duration;
+        const self: *BanSpy = @ptrCast(@alignCast(userdata.?));
+        self.calls += 1;
+        self.last_ip = ip;
+    }
+};
+
+/// Build a JailContext wired to a spy + metrics for dispatch tests.
+/// `backend_ptr` is required by the struct but is never dereferenced
+/// because the spy hook short-circuits the enforcing call.
+fn makeDispatchTestCtx(
+    jail: shared.JailId,
+    tracker: *state_mod.StateTracker,
+    backend: *firewall.Backend,
+    metrics: *metrics_mod.Metrics,
+    spy: *BanSpy,
+    action: config_mod.BanAction,
+) JailContext {
+    return .{
+        .jail = jail,
+        .parser = undefined, // dispatchBan never reads the parser
+        .state = tracker,
+        .backend_ptr = backend,
+        .banaction = action,
+        .metrics = metrics,
+        .ban_hook = BanSpy.ban,
+        .ban_hook_ctx = spy,
+    };
+}
+
+/// Drive a tracker across its `maxretry` threshold and return the
+/// resulting decision. Asserts a decision actually fired.
+fn produceDecision(
+    tracker: *state_mod.StateTracker,
+    ip: shared.IpAddress,
+    jail: shared.JailId,
+) !state_mod.BanDecision {
+    try testing.expect((try tracker.recordAttempt(ip, jail, 1_000)) == null);
+    try testing.expect((try tracker.recordAttempt(ip, jail, 1_100)) == null);
+    return (try tracker.recordAttempt(ip, jail, 1_200)).?;
+}
+
+test "dispatch: log-only jail records ban intent but does NOT call backend" {
+    const a = testing.allocator;
+    var tracker = try state_mod.StateTracker.init(a, .{
+        .max_entries = 16,
+        .maxretry = 3,
+        .findtime = 600,
+        .bantime = 600,
+    });
+    defer tracker.deinit();
+
+    var metrics = metrics_mod.Metrics.init();
+    const jail_name = "sshd";
+    _ = metrics.registerJail(jail_name);
+    const jail = try shared.JailId.fromSlice(jail_name);
+    const ip = try shared.IpAddress.parse("203.0.113.66");
+
+    // A backend that must NOT be touched. If `dispatchBan` ever called
+    // through it instead of the spy, the iptables CLI path would run —
+    // but the spy hook intercepts first, so this stays inert.
+    var backend: firewall.Backend = .{ .iptables = firewall.iptables.IptablesBackend{} };
+    var spy: BanSpy = .{};
+
+    var ctx = makeDispatchTestCtx(jail, &tracker, &backend, &metrics, &spy, .@"log-only");
+
+    const decision = try produceDecision(&tracker, ip, jail);
+    dispatchBan(&ctx, decision);
+
+    // The firewall was NOT mutated: the enforcing path was never invoked.
+    try testing.expectEqual(@as(u32, 0), spy.calls);
+
+    // ...yet the ban intent WAS recorded: global + per-jail counters move.
+    const snap = metrics.snapshot();
+    try testing.expectEqual(@as(u64, 1), snap.bans_total);
+    var found = false;
+    for (snap.perJail()) |pj| {
+        if (std.mem.eql(u8, pj.name(), jail_name)) {
+            try testing.expectEqual(@as(u64, 1), pj.bans_total);
+            found = true;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "dispatch: enforcing jail (nftables) DOES call the backend ban path" {
+    const a = testing.allocator;
+    var tracker = try state_mod.StateTracker.init(a, .{
+        .max_entries = 16,
+        .maxretry = 3,
+        .findtime = 600,
+        .bantime = 600,
+    });
+    defer tracker.deinit();
+
+    var metrics = metrics_mod.Metrics.init();
+    const jail_name = "sshd";
+    _ = metrics.registerJail(jail_name);
+    const jail = try shared.JailId.fromSlice(jail_name);
+    const ip = try shared.IpAddress.parse("203.0.113.66");
+
+    var backend: firewall.Backend = .{ .iptables = firewall.iptables.IptablesBackend{} };
+    var spy: BanSpy = .{};
+
+    var ctx = makeDispatchTestCtx(jail, &tracker, &backend, &metrics, &spy, .nftables);
+
+    const decision = try produceDecision(&tracker, ip, jail);
+    dispatchBan(&ctx, decision);
+
+    // Enforcing path WAS invoked exactly once, with the offending IP.
+    try testing.expectEqual(@as(u32, 1), spy.calls);
+    try testing.expect(spy.last_ip != null);
+    try testing.expect(shared.IpAddress.eql(spy.last_ip.?, ip));
+
+    // And accounting still happened (the enforcing path increments after
+    // a successful backend call).
+    const snap = metrics.snapshot();
+    try testing.expectEqual(@as(u64, 1), snap.bans_total);
+}
+
+test "dispatch: backend error on enforcing path skips metrics (no false ban)" {
+    // The enforcing path must NOT count a ban when the backend fails —
+    // it warns and returns before incrementing. This guards the ordering
+    // the original inline block relied on.
+    const a = testing.allocator;
+    var tracker = try state_mod.StateTracker.init(a, .{
+        .max_entries = 16,
+        .maxretry = 3,
+        .findtime = 600,
+        .bantime = 600,
+    });
+    defer tracker.deinit();
+
+    var metrics = metrics_mod.Metrics.init();
+    const jail_name = "sshd";
+    _ = metrics.registerJail(jail_name);
+    const jail = try shared.JailId.fromSlice(jail_name);
+    const ip = try shared.IpAddress.parse("203.0.113.66");
+
+    var backend: firewall.Backend = .{ .iptables = firewall.iptables.IptablesBackend{} };
+
+    const FailingSpy = struct {
+        fn ban(
+            _: ?*anyopaque,
+            _: shared.IpAddress,
+            _: shared.JailId,
+            _: shared.Duration,
+        ) firewall.BackendError!void {
+            return error.SystemError;
+        }
+    };
+
+    var ctx: JailContext = .{
+        .jail = jail,
+        .parser = undefined,
+        .state = &tracker,
+        .backend_ptr = &backend,
+        .banaction = .nftables,
+        .metrics = &metrics,
+        .ban_hook = FailingSpy.ban,
+        .ban_hook_ctx = null,
+    };
+
+    const decision = try produceDecision(&tracker, ip, jail);
+    dispatchBan(&ctx, decision);
+
+    // Backend failed -> no ban counted.
+    const snap = metrics.snapshot();
+    try testing.expectEqual(@as(u64, 0), snap.bans_total);
 }
 
 test "main: deriveLegacyTrackerConfig mirrors defaults" {
