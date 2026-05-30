@@ -66,6 +66,42 @@ const metrics_mod = @import("core/metrics.zig");
 pub const version = "0.1.1";
 
 // ============================================================================
+// libc glue (SYS-018) — resolve the `fail2zig` group and chown by path.
+// `std.posix` exposes `fchown` (by fd) but not `fchownat` (by path) in
+// this Zig version, and the runtime dir is referenced by path, so we
+// declare the minimal libc entry points we need. The engine links libc.
+// ============================================================================
+
+const c_group = extern struct {
+    gr_name: [*:0]const u8,
+    gr_passwd: [*:0]const u8,
+    gr_gid: u32,
+    gr_mem: [*:null]?[*:0]const u8,
+};
+
+extern "c" fn getgrnam(name: [*:0]const u8) callconv(.C) ?*c_group;
+
+/// libc fchownat(2). owner `0` (root) / resolved gid; `flags` 0. Returns
+/// 0 on success, -1 with errno set otherwise (caller logs + continues).
+extern "c" fn fchownat(
+    dirfd: i32,
+    path: [*:0]const u8,
+    owner: u32,
+    group: u32,
+    flags: u32,
+) callconv(.C) i32;
+
+/// Resolve the gid of the `fail2zig` group, or `null` if it does not
+/// exist. Mirrors the lookup in `net/ipc.zig`; callers treat `null` as
+/// "group absent, skip chown" — never a fatal error.
+fn fail2zigGid() ?u32 {
+    const group_name = "fail2zig";
+    const c_name: [*:0]const u8 = @ptrCast(group_name.ptr);
+    if (getgrnam(c_name)) |grp| return grp.gr_gid;
+    return null;
+}
+
+// ============================================================================
 // CLI argument parsing
 // ============================================================================
 
@@ -1117,11 +1153,18 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
 // Service helpers
 // ============================================================================
 
-/// Ensure the parent directory of `socket_path` exists. Created with
-/// mode 0710 so the root user can write and members of the fail2zig
-/// group can traverse it (to reach the socket file itself). On
-/// AlreadyExists this is a no-op — any other error is surfaced because
-/// it would prevent `bind(2)` from succeeding later.
+/// Ensure the parent directory of `socket_path` exists. Created
+/// `root:fail2zig` mode 0750 so the root user has full access and
+/// members of the `fail2zig` group can traverse it (the `x` bit) and
+/// list it (the `r` bit) to reach the socket file — the documented
+/// least-privilege operator path (SYS-018). On AlreadyExists the dir is
+/// re-chowned/chmodded to the intended ownership so a pre-existing dir
+/// (e.g. systemd `RuntimeDirectory`, created root:root) is corrected.
+/// makeDir errors other than AlreadyExists are surfaced because they
+/// would prevent `bind(2)` from succeeding later. chmod/chown failures
+/// (e.g. not owned by us, or EPERM when unprivileged) and an absent
+/// `fail2zig` group are non-fatal: log and continue — bind() still
+/// works as long as the daemon (root) can traverse the dir.
 fn ensureSocketDir(socket_path: []const u8) !void {
     const dir = std.fs.path.dirname(socket_path) orelse return;
     std.fs.cwd().makeDir(dir) catch |err| switch (err) {
@@ -1134,11 +1177,29 @@ fn ensureSocketDir(socket_path: []const u8) !void {
             return err;
         },
     };
-    // Best-effort chmod to 0710 — root/rw, group/x, other/none. If
-    // chmod fails (e.g. the directory is not owned by us), log and
-    // continue; the bind() still works if the parent is at least
-    // traversable by the daemon.
-    std.posix.fchmodat(std.posix.AT.FDCWD, dir, 0o710, 0) catch |err| {
+
+    // SYS-018: set the dir GROUP to `fail2zig` (owner stays root) so the
+    // group model actually holds on a real box. Skip silently if the
+    // group is absent; warn-and-continue on chown failure. A path longer
+    // than PATH_MAX-1 is reported by the chmod below, so here we just
+    // skip the group chown rather than failing.
+    if (fail2zigGid()) |gid| {
+        if (std.posix.toPosixPath(dir)) |dir_z| {
+            if (fchownat(std.posix.AT.FDCWD, &dir_z, 0, gid, 0) != 0) {
+                std.log.warn(
+                    "ipc: chown of socket parent dir '{s}' group to gid={d} " ++
+                        "failed; group access may be unavailable",
+                    .{ dir, gid },
+                );
+            }
+        } else |_| {}
+    }
+
+    // Mode 0750 — owner rwx, group r-x, other none. Group members need
+    // `x` to traverse into the dir and `r` to resolve the socket path.
+    // Best-effort: if chmod fails (e.g. not owned by us), log and
+    // continue; bind() still works if the daemon can traverse.
+    std.posix.fchmodat(std.posix.AT.FDCWD, dir, 0o750, 0) catch |err| {
         std.log.warn(
             "ipc: chmod of socket parent dir '{s}' failed: {s}",
             .{ dir, @errorName(err) },

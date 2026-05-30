@@ -135,6 +135,20 @@ extern "c" fn getgrnam(name: [*:0]const u8) callconv(.C) ?*c_group;
 /// fchmodat. Returns the previous umask.
 extern "c" fn umask(mask: u32) callconv(.C) u32;
 
+/// libc fchownat(2). `std.posix` exposes `fchown` (by fd) but not
+/// `fchownat` (by path) in this Zig version. We chown the socket *by
+/// path* to stay consistent with the `fchmodat`-by-path call directly
+/// above. Pass `AT.FDCWD` for `dirfd`, a NUL-terminated path, owner `0`
+/// (root) and the resolved `fail2zig` gid; `flags` is 0. Returns 0 on
+/// success, -1 with errno set on failure (caller logs and continues).
+extern "c" fn fchownat(
+    dirfd: i32,
+    path: [*:0]const u8,
+    owner: u32,
+    group: u32,
+    flags: u32,
+) callconv(.C) i32;
+
 // ============================================================================
 // IpcServer
 // ============================================================================
@@ -229,6 +243,34 @@ pub const IpcServer = struct {
                 "ipc: group 'fail2zig' not found; only uid=0 may connect",
                 .{},
             );
+        }
+
+        // SYS-018: set the socket's GROUP to the `fail2zig` gid (owner
+        // stays root/uid 0) so members of that group can connect under
+        // mode 0660 — the documented least-privilege operator path. We
+        // reuse the gid resolved just above (no second getgrnam). The
+        // mode set by fchmodat is untouched; we only change ownership.
+        //
+        // Degraded behavior (never fails init):
+        //   - group absent (`allowed_gid == null`): skip the chown; the
+        //     socket stays root:root, i.e. uid=0-only — the correct
+        //     fallback already enforced by `peerAllowed`.
+        //   - chown fails (e.g. EPERM when not running as root, as in
+        //     the test suite): log a warning and continue, mirroring how
+        //     the fchmodat failure path is non-fatal in spirit. The
+        //     socket still works for root and for the test peer.
+        if (allowed_gid) |gid| {
+            // NUL-terminate the path for the libc call. `socket_path` was
+            // already length-checked (< 108) above; toPosixPath only
+            // fails on PATH_MAX overflow, which cannot happen here.
+            const path_z = posix.toPosixPath(socket_path) catch unreachable;
+            if (fchownat(posix.AT.FDCWD, &path_z, 0, gid, 0) != 0) {
+                std.log.warn(
+                    "ipc: chown '{s}' group to gid={d} failed; " ++
+                        "socket remains root-owned (root-only access)",
+                    .{ socket_path, gid },
+                );
+            }
         }
 
         return .{
@@ -668,6 +710,92 @@ test "ipc: socket has mode 0660 immediately after init (SEC-002)" {
     // Mask off the type bits; check the 9 permission bits exactly.
     const perm = stbuf.mode & 0o777;
     try testing.expectEqual(@as(u32, 0o660), perm);
+}
+
+/// stat() a path and return its permission bits (0o777 masked), or
+/// `error.SkipZigTest` if the stat fails. Mirrors the SEC-002 test's
+/// approach so SYS-018 assertions stay consistent with it.
+fn statPerm(path: []const u8) !u32 {
+    var path_z: [128]u8 = undefined;
+    if (path.len >= path_z.len) return error.SkipZigTest;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    var stbuf: linux.Stat = undefined;
+    const rc = linux.stat(@ptrCast(&path_z[0]), &stbuf);
+    switch (posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    return stbuf.mode & 0o777;
+}
+
+test "ipc: init succeeds and socket stays 0660 with no fail2zig group (SYS-018)" {
+    // SYS-018: init() now chowns the socket's group to the `fail2zig`
+    // gid when that group exists. When it does NOT exist (the common CI
+    // case, and the degraded-but-correct path), the chown is skipped and
+    // init must still succeed with the socket at mode 0660 — i.e. the
+    // group-ownership feature never weakens or breaks the existing
+    // root-only guarantee. This is the testable invariant under non-root.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = testing.allocator;
+
+    var loop = try EventLoop.init(a);
+    defer loop.deinit();
+
+    const path = try makeTestPath(a);
+    defer a.free(path);
+
+    // init() must not fail regardless of whether `fail2zig` exists or
+    // whether a chown would EPERM under a non-root test runner.
+    var server = try IpcServer.init(a, &loop, path);
+    defer server.deinit();
+
+    // Socket exists and is connectable-by-mode (0660 unchanged).
+    try std.fs.cwd().access(path, .{});
+    try testing.expectEqual(@as(u32, 0o660), try statPerm(path));
+
+    // The chown target gid is exactly the gid used for SO_PEERCRED
+    // authorization — one source of truth. When the group is absent both
+    // are null; when present both equal getgrnam("fail2zig").gr_gid.
+    const expected_gid: ?u32 = blk: {
+        if (getgrnam("fail2zig")) |grp| break :blk grp.gr_gid;
+        break :blk null;
+    };
+    try testing.expectEqual(expected_gid, server.allowed_gid);
+}
+
+test "ipc: a failed group chown leaves the socket intact (SYS-018)" {
+    // SYS-018: the daemon must tolerate a chown failure (EPERM when not
+    // running as root) — log + continue, never fail. We exercise the
+    // failure branch's effect directly: after init(), attempt to chown
+    // the socket's GROUP (owner left unchanged) to a gid the test
+    // process cannot grant, then assert the socket is still mode 0660
+    // and still accessible. The chown either fails (non-root: EPERM) or
+    // succeeds (root): in BOTH cases the socket must remain usable and
+    // its mode must be undisturbed.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = testing.allocator;
+
+    var loop = try EventLoop.init(a);
+    defer loop.deinit();
+
+    const path = try makeTestPath(a);
+    defer a.free(path);
+
+    var server = try IpcServer.init(a, &loop, path);
+    defer server.deinit();
+
+    // owner = (uid_t)-1 → "do not change owner"; group = 0 (root group),
+    // which a non-root, non-member process cannot set → EPERM. Under a
+    // root runner this succeeds; either way the assertions below hold.
+    const path_z = try posix.toPosixPath(path);
+    const keep_owner: u32 = ~@as(u32, 0);
+    _ = fchownat(posix.AT.FDCWD, &path_z, keep_owner, 0, 0);
+
+    // The mode must be untouched by the chown attempt, and the socket
+    // must remain present and accessible — the daemon's invariant.
+    try testing.expectEqual(@as(u32, 0o660), try statPerm(path));
+    try std.fs.cwd().access(path, .{});
 }
 
 test "ipc: listener socket is non-blocking (SYS-001)" {
