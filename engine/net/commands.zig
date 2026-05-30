@@ -113,6 +113,7 @@ pub const Context = struct {
         const stats = self.stats_source.snapshot(self.stats_source.ctx);
         const active_bans = self.trackers.totalActiveBans();
         const backend_name = @tagName(self.backend.tag());
+        const protection = self.computeProtection();
 
         var buf: std.ArrayListUnmanaged(u8) = .{};
         defer buf.deinit(a);
@@ -124,11 +125,37 @@ pub const Context = struct {
         try w.print("\"parse_rate\":{d},", .{stats.parse_rate});
         try w.print("\"active_bans\":{d},", .{active_bans});
         try w.print("\"jail_count\":{d},", .{self.config.jails.len});
+        try w.print("\"protection\":\"{s}\",", .{protection});
         try w.print("\"backend\":\"{s}\"", .{backend_name});
         try w.writeAll("}");
 
         const payload = try a.dupe(u8, buf.items);
         return .{ .ok = .{ .payload = payload } };
+    }
+
+    /// Resolve enforcement posture across enabled jails. Returns one of
+    /// `"active"` (all enabled jails enforce), `"log-only"` (all enabled
+    /// jails are non-enforcing), or `"mixed"` (some of each). With zero
+    /// enabled jails there is nothing to misreport, so `"active"`.
+    ///
+    /// The effective banaction per jail comes from the same resolver the
+    /// dispatch path uses (`resolveJailFromConfig`), so this string can
+    /// never disagree with what the daemon actually does on a ban.
+    fn computeProtection(self: *const Context) []const u8 {
+        var any_enforcing = false;
+        var any_log_only = false;
+        for (self.config.jails) |*jc| {
+            if (!jc.enabled) continue;
+            const resolved = config_mod.resolveJailFromConfig(jc, self.config.defaults);
+            if (resolved.banaction == .@"log-only") {
+                any_log_only = true;
+            } else {
+                any_enforcing = true;
+            }
+        }
+        if (any_enforcing and any_log_only) return "mixed";
+        if (any_log_only) return "log-only";
+        return "active";
     }
 
     fn handleBan(
@@ -230,7 +257,7 @@ pub const Context = struct {
         defer buf.deinit(a);
         const w = buf.writer(a);
         try w.writeAll("[");
-        for (self.config.jails, 0..) |jc, idx| {
+        for (self.config.jails, 0..) |*jc, idx| {
             if (idx > 0) try w.writeAll(",");
             var count: u32 = 0;
             if (self.trackers.get(jc.name)) |t| {
@@ -239,15 +266,18 @@ pub const Context = struct {
                     if (kv.value_ptr.ban_state == .banned) count += 1;
                 }
             }
+            const resolved = config_mod.resolveJailFromConfig(jc, self.config.defaults);
             try w.print(
-                "{{\"name\":\"{s}\",\"enabled\":{s},\"active_bans\":{d},\"maxretry\":{d},\"findtime\":{d},\"bantime\":{d}}}",
+                "{{\"name\":\"{s}\",\"enabled\":{s},\"active_bans\":{d},\"maxretry\":{d},\"findtime\":{d},\"bantime\":{d},\"action\":\"{s}\",\"enforcing\":{s}}}",
                 .{
                     jc.name,
                     if (jc.enabled) "true" else "false",
                     count,
-                    jc.effectiveMaxretry(self.config.defaults),
-                    jc.effectiveFindtime(self.config.defaults),
-                    jc.effectiveBantime(self.config.defaults),
+                    resolved.maxretry,
+                    resolved.findtime,
+                    resolved.bantime,
+                    @tagName(resolved.banaction),
+                    if (resolved.banaction != .@"log-only") "true" else "false",
                 },
             );
         }
@@ -472,6 +502,8 @@ test "commands: handleStatus produces expected JSON fields" {
     try testing.expect(std.mem.indexOf(u8, body, "\"active_bans\":1") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"jail_count\":0") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"backend\":\"nftables\"") != null);
+    // Zero enabled jails -> "active" (nothing to misreport).
+    try testing.expect(std.mem.indexOf(u8, body, "\"protection\":\"active\"") != null);
 }
 
 test "commands: handleListJails counts banned entries per-jail" {
@@ -540,6 +572,114 @@ test "commands: handleListJails reflects per-jail resolved thresholds (ISSUE-007
     // sshd's per-jail values surface; nginx inherits defaults.
     try testing.expect(std.mem.indexOf(u8, body, "\"name\":\"sshd\",\"enabled\":true,\"active_bans\":0,\"maxretry\":1,\"findtime\":10,\"bantime\":60") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"name\":\"nginx\",\"enabled\":true,\"active_bans\":0,\"maxretry\":5,\"findtime\":600,\"bantime\":600") != null);
+}
+
+test "commands: handleStatus protection is active when all enabled jails enforce" {
+    const a = testing.allocator;
+    var trackers = makeEmptyTrackerMap(a);
+    defer trackers.deinit();
+
+    var jails = [_]config_mod.JailConfig{
+        .{ .name = "sshd", .enabled = true, .banaction = .nftables },
+        .{ .name = "nginx", .enabled = true, .banaction = .iptables },
+    };
+    var cfg = config_mod.Config{
+        .global = .{},
+        .defaults = .{ .banaction = .nftables },
+        .jails = &jails,
+        .diag = .{},
+    };
+    var stub = StubBackend{};
+    var be = realBackendFromStub(&stub);
+    defer be.deinit();
+
+    var ctx = Context{ .trackers = &trackers, .config = &cfg, .backend = &be };
+    const resp = try ctx.handle(.{ .status = {} }, a);
+    defer resp.deinit(a);
+    try testing.expect(std.mem.indexOf(u8, resp.ok.payload, "\"protection\":\"active\"") != null);
+}
+
+test "commands: handleStatus protection is log-only when all enabled jails are log-only" {
+    const a = testing.allocator;
+    var trackers = makeEmptyTrackerMap(a);
+    defer trackers.deinit();
+
+    var jails = [_]config_mod.JailConfig{
+        .{ .name = "sshd", .enabled = true, .banaction = .@"log-only" },
+        // Disabled enforcing jail must NOT pull the verdict back to active.
+        .{ .name = "nginx", .enabled = false, .banaction = .nftables },
+    };
+    var cfg = config_mod.Config{
+        .global = .{},
+        .defaults = .{ .banaction = .@"log-only" },
+        .jails = &jails,
+        .diag = .{},
+    };
+    var stub = StubBackend{};
+    var be = realBackendFromStub(&stub);
+    defer be.deinit();
+
+    var ctx = Context{ .trackers = &trackers, .config = &cfg, .backend = &be };
+    const resp = try ctx.handle(.{ .status = {} }, a);
+    defer resp.deinit(a);
+    try testing.expect(std.mem.indexOf(u8, resp.ok.payload, "\"protection\":\"log-only\"") != null);
+}
+
+test "commands: handleStatus protection is mixed when enforcing and log-only coexist" {
+    const a = testing.allocator;
+    var trackers = makeEmptyTrackerMap(a);
+    defer trackers.deinit();
+
+    var jails = [_]config_mod.JailConfig{
+        .{ .name = "sshd", .enabled = true, .banaction = .nftables },
+        // Inherits a log-only default -> non-enforcing via the resolver.
+        .{ .name = "sshd-test", .enabled = true },
+    };
+    var cfg = config_mod.Config{
+        .global = .{},
+        .defaults = .{ .banaction = .@"log-only" },
+        .jails = &jails,
+        .diag = .{},
+    };
+    var stub = StubBackend{};
+    var be = realBackendFromStub(&stub);
+    defer be.deinit();
+
+    var ctx = Context{ .trackers = &trackers, .config = &cfg, .backend = &be };
+    const resp = try ctx.handle(.{ .status = {} }, a);
+    defer resp.deinit(a);
+    try testing.expect(std.mem.indexOf(u8, resp.ok.payload, "\"protection\":\"mixed\"") != null);
+}
+
+test "commands: handleListJails emits action and enforcing per jail" {
+    const a = testing.allocator;
+    var trackers = makeEmptyTrackerMap(a);
+    defer trackers.deinit();
+
+    var jails = [_]config_mod.JailConfig{
+        .{ .name = "sshd", .enabled = true, .banaction = .nftables },
+        .{ .name = "sshd-test", .enabled = true, .banaction = .@"log-only" },
+    };
+    var cfg = config_mod.Config{
+        .global = .{},
+        .defaults = .{ .banaction = .nftables },
+        .jails = &jails,
+        .diag = .{},
+    };
+    var stub = StubBackend{};
+    var be = realBackendFromStub(&stub);
+    defer be.deinit();
+
+    var ctx = Context{ .trackers = &trackers, .config = &cfg, .backend = &be };
+    const resp = try ctx.handle(.{ .list_jails = {} }, a);
+    defer resp.deinit(a);
+    const body = resp.ok.payload;
+    // Enforcing jail.
+    try testing.expect(std.mem.indexOf(u8, body, "\"name\":\"sshd\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"action\":\"nftables\",\"enforcing\":true") != null);
+    // Non-enforcing jail.
+    try testing.expect(std.mem.indexOf(u8, body, "\"name\":\"sshd-test\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"action\":\"log-only\",\"enforcing\":false") != null);
 }
 
 test "commands: handleList without jail returns only banned entries" {

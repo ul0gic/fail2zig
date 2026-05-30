@@ -74,6 +74,10 @@ pub const StatusPayload = struct {
     active_bans: ?u32 = null,
     total_bans_24h: ?u64 = null,
     parse_rate: ?f64 = null, // lines/sec
+    /// Enforcement posture resolved across enabled jails by the daemon:
+    /// "active" (all enforcing), "log-only" (all non-enforcing), or
+    /// "mixed". Optional so an older daemon that omits it renders "-".
+    protection: ?[]const u8 = null,
     backend: ?[]const u8 = null,
     jails_active: ?u32 = null,
 };
@@ -100,6 +104,13 @@ pub const JailEntry = struct {
     maxretry: ?u32 = null,
     findtime: ?u32 = null,
     bantime: ?u32 = null,
+    /// Effective banaction tag the daemon resolved for this jail
+    /// (`nftables`/`ipset`/`iptables`/`log-only`). Optional so an older
+    /// daemon that omits it renders "-".
+    action: ?[]const u8 = null,
+    /// Whether this jail actually touches the firewall. False for a
+    /// `log-only` jail (records intent, no enforcement).
+    enforcing: ?bool = null,
 };
 
 pub const VersionPayload = struct {
@@ -174,6 +185,7 @@ fn writeStatusPlain(writer: anytype, s: StatusPayload) !void {
     if (s.active_bans) |a| try writer.print("active_bans\t{d}\n", .{a});
     if (s.total_bans_24h) |a| try writer.print("total_bans_24h\t{d}\n", .{a});
     if (s.parse_rate) |p| try writer.print("parse_rate\t{d:.2}\n", .{p});
+    if (s.protection) |p| try writer.print("protection\t{s}\n", .{p});
     if (s.backend) |b| try writer.print("backend\t{s}\n", .{b});
     if (s.jails_active) |j| try writer.print("jails_active\t{d}\n", .{j});
 }
@@ -199,6 +211,7 @@ fn writeStatusTable(writer: anytype, s: StatusPayload, color: Color) !void {
     try rowLabel(writer, "Parse rate:", formatRate(s.parse_rate), width);
     try rowLabel(writer, "Active bans:", formatOptU32(s.active_bans), width);
     try rowLabel(writer, "Total bans:", formatOptU64Suffix(s.total_bans_24h, " (24h)"), width);
+    try rowLabel(writer, "Protection:", s.protection orelse "-", width);
     try rowLabel(writer, "Backend:", s.backend orelse "-", width);
     try rowLabel(writer, "Jails:", formatOptU32(s.jails_active), width);
 
@@ -465,13 +478,15 @@ pub fn formatJails(
 
 fn writeJailsPlain(writer: anytype, jails: []const JailEntry) !void {
     for (jails) |j| {
-        try writer.print("{s}\t{s}\t{d}\t{d}\t{d}\t{d}\n", .{
+        try writer.print("{s}\t{s}\t{d}\t{d}\t{d}\t{d}\t{s}\t{s}\n", .{
             j.name orelse "-",
             if (j.enabled orelse false) "enabled" else "disabled",
             j.active_bans orelse 0,
             j.maxretry orelse 0,
             j.findtime orelse 0,
             j.bantime orelse 0,
+            j.action orelse "-",
+            if (j.enforcing) |e| (if (e) "true" else "false") else "-",
         });
     }
 }
@@ -488,6 +503,8 @@ fn writeJailsTable(writer: anytype, jails: []const JailEntry, color: Color) !voi
     const max_col: usize = 10;
     const find_col: usize = 12;
     const ban_col: usize = 12;
+    const action_col: usize = 12;
+    const enforce_col: usize = 10;
 
     try color.on(writer, Color.bold);
     try padRightPrint(writer, "JAIL", name_col);
@@ -496,10 +513,12 @@ fn writeJailsTable(writer: anytype, jails: []const JailEntry, color: Color) !voi
     try padRightPrint(writer, "MAX RETRY", max_col);
     try padRightPrint(writer, "FIND TIME", find_col);
     try padRightPrint(writer, "BAN TIME", ban_col);
+    try padRightPrint(writer, "ACTION", action_col);
+    try padRightPrint(writer, "ENFORCING", enforce_col);
     try color.off(writer);
     try writer.writeAll("\n");
 
-    try repeatChar(writer, '-', name_col + state_col + active_col + max_col + find_col + ban_col);
+    try repeatChar(writer, '-', name_col + state_col + active_col + max_col + find_col + ban_col + action_col + enforce_col);
     try writer.writeAll("\n");
 
     for (jails) |j| {
@@ -516,6 +535,16 @@ fn writeJailsTable(writer: anytype, jails: []const JailEntry, color: Color) !voi
         try padRightPrint(writer, formatOptU32Local(j.maxretry), max_col);
         try padRightPrint(writer, formatDurationSecs(j.findtime), find_col);
         try padRightPrint(writer, formatDurationSecs(j.bantime), ban_col);
+        try padRightPrint(writer, j.action orelse "-", action_col);
+        // A non-enforcing jail is the surprising state — tint it yellow so
+        // an operator notices a jail that watches but never bans.
+        if (j.enforcing) |e| {
+            try color.on(writer, if (e) Color.green else Color.yellow);
+            try padRightPrint(writer, if (e) "true" else "false", enforce_col);
+            try color.off(writer);
+        } else {
+            try padRightPrint(writer, "-", enforce_col);
+        }
         try writer.writeAll("\n");
     }
 
@@ -839,6 +868,29 @@ test "format: status bad json surfaces error" {
     try testing.expect(std.mem.indexOf(u8, out, "error") != null);
 }
 
+test "format: status table renders Protection row when present" {
+    const payload = "{\"version\":\"0.2.0\",\"protection\":\"log-only\",\"backend\":\"nftables\"}";
+    const out = try runStatus(testing.allocator, payload, .table);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "Protection:") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "log-only") != null);
+}
+
+test "format: status plain renders protection when present" {
+    const payload = "{\"protection\":\"mixed\"}";
+    const out = try runStatus(testing.allocator, payload, .plain);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "protection\tmixed") != null);
+}
+
+test "format: status table tolerates missing protection (older daemon)" {
+    // No protection field -> the row still draws with "-".
+    const payload = "{\"backend\":\"nftables\"}";
+    const out = try runStatus(testing.allocator, payload, .table);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "Protection:") != null);
+}
+
 fn runList(alloc: std.mem.Allocator, payload: []const u8, fmt: OutputFormat) ![]u8 {
     var list = std.ArrayList(u8).init(alloc);
     errdefer list.deinit();
@@ -947,11 +999,14 @@ test "format: jails table (daemon-shape JSON, SYS-002)" {
 }
 
 test "format: jails plain (SYS-002)" {
+    // No action/enforcing in the payload (older daemon) -> those columns
+    // render "-" while the original six columns are unchanged.
     const payload = "[{\"name\":\"sshd\",\"enabled\":true,\"active_bans\":1,\"maxretry\":3,\"findtime\":600,\"bantime\":300}]";
     const out = try runJails(testing.allocator, payload, .plain);
     defer testing.allocator.free(out);
-    // Six tab-separated columns: name, state, active, maxretry, findtime, bantime.
-    try testing.expect(std.mem.indexOf(u8, out, "sshd\tenabled\t1\t3\t600\t300") != null);
+    // Eight tab-separated columns: name, state, active, maxretry, findtime,
+    // bantime, action, enforcing.
+    try testing.expect(std.mem.indexOf(u8, out, "sshd\tenabled\t1\t3\t600\t300\t-\t-\n") != null);
 }
 
 test "format: jails empty table (SYS-002)" {
@@ -974,6 +1029,30 @@ test "format: jails rejects object-shape payload (SYS-002 regression)" {
     const out = try runJails(testing.allocator, payload, .table);
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "error: could not parse jails payload") != null);
+}
+
+test "format: jails table renders action and enforcing (SYS-017)" {
+    const payload =
+        \\[
+        \\  {"name":"sshd","enabled":true,"active_bans":0,"maxretry":3,"findtime":600,"bantime":3600,"action":"nftables","enforcing":true},
+        \\  {"name":"sshd-test","enabled":true,"active_bans":0,"maxretry":3,"findtime":600,"bantime":600,"action":"log-only","enforcing":false}
+        \\]
+    ;
+    const out = try runJails(testing.allocator, payload, .table);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "ACTION") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "ENFORCING") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "nftables") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "log-only") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "true") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "false") != null);
+}
+
+test "format: jails plain renders action and enforcing (SYS-017)" {
+    const payload = "[{\"name\":\"sshd-test\",\"enabled\":true,\"active_bans\":0,\"maxretry\":3,\"findtime\":600,\"bantime\":600,\"action\":\"log-only\",\"enforcing\":false}]";
+    const out = try runJails(testing.allocator, payload, .plain);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "sshd-test\tenabled\t0\t3\t600\t600\tlog-only\tfalse\n") != null);
 }
 
 fn runVersion(alloc: std.mem.Allocator, payload: []const u8, fmt: OutputFormat) ![]u8 {
