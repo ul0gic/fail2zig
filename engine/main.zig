@@ -39,6 +39,7 @@ const allocator_mod = @import("core/allocator.zig");
 const memory_mod = @import("core/memory.zig");
 pub const event_loop_mod = @import("core/event_loop.zig");
 const log_watcher_mod = @import("core/log_watcher.zig");
+pub const journald_source_mod = @import("core/journald_source.zig");
 const line_buffer_mod = @import("core/line_buffer.zig");
 const logger_mod = @import("core/logger.zig");
 const parser_mod = @import("core/parser.zig");
@@ -589,17 +590,66 @@ const SignalContext = struct {
     /// load+route on next start rehydrates the right tracker.
     trackers: *tracker_map_mod.TrackerMap,
     state_path: []const u8,
+    /// journald source (SYS-015). Null when no jail reads the journal.
+    /// Its cursor sidecar is flushed AFTER engine state — see
+    /// `flushStateThenCursors`.
+    journald: ?*journald_source_mod.JournaldSource = null,
     save_requested: bool = false,
 };
+
+/// Persist engine state, THEN the journald cursor sidecar — ordering is
+/// load-bearing (SYS-015 Lead decision 2). State must hit disk before the
+/// cursor so a crash between the two writes leaves the cursor OLDER than
+/// the state: the next start replays ≤1 poll interval of already-counted
+/// entries (safe at-least-once) and NEVER skips entries. Reversing the
+/// order would risk advancing the cursor past entries whose ban-state
+/// updates were lost. Both writes are best-effort: a failure is logged,
+/// never fatal.
+fn flushStateThenCursors(
+    trackers: *tracker_map_mod.TrackerMap,
+    state_path: []const u8,
+    journald: ?*journald_source_mod.JournaldSource,
+) void {
+    persist_mod.saveAll(trackers, state_path) catch |err| {
+        std.log.warn("persist: state save failed: {s}", .{@errorName(err)});
+    };
+    if (journald) |jd| {
+        if (jd.hasJails()) {
+            var buf: [journald_source_mod.max_jails]journald_source_mod.CursorEntry = undefined;
+            const cursors = jd.collectCursors(&buf);
+            journald_source_mod.saveCursors(cursors, jd.cursor_path) catch |err| {
+                std.log.warn("journald: cursor sidecar save failed: {s}", .{@errorName(err)});
+            };
+        }
+    }
+}
+
+/// Context for the journald periodic-flush hook (SYS-015 Change 2).
+/// Lives on `runDaemon`'s stack across `loop.run()`. The hook is invoked
+/// by `JournaldSource.maybeFlush` after any poll tick that advanced a
+/// cursor, so state + cursors are durable within ≤1 poll interval of the
+/// entries they reflect (without a separate flush timer).
+const JournaldFlushContext = struct {
+    trackers: *tracker_map_mod.TrackerMap,
+    state_path: []const u8,
+    journald: *journald_source_mod.JournaldSource,
+};
+
+/// JournaldSource flush hook. Casts userdata → `*JournaldFlushContext` and
+/// delegates to `flushStateThenCursors`, which enforces the load-bearing
+/// state-first / cursor-second ordering. Single-threaded loop: this runs
+/// on the loop thread inside `pollTick` and never re-enters the poller.
+fn journaldFlushHook(userdata: ?*anyopaque) void {
+    const ctx: *JournaldFlushContext = @ptrCast(@alignCast(userdata.?));
+    flushStateThenCursors(ctx.trackers, ctx.state_path, ctx.journald);
+}
 
 fn onTerminate(siginfo: *const linux.signalfd_siginfo, userdata: ?*anyopaque) void {
     _ = siginfo;
     const ctx: *SignalContext = @ptrCast(@alignCast(userdata.?));
     ctx.save_requested = true;
     std.log.info("signal: termination requested, saving state and shutting down", .{});
-    persist_mod.saveAll(ctx.trackers, ctx.state_path) catch |err| {
-        std.log.warn("persist: save failed on shutdown: {s}", .{@errorName(err)});
-    };
+    flushStateThenCursors(ctx.trackers, ctx.state_path, ctx.journald);
     ctx.loop.stop();
 }
 
@@ -927,6 +977,26 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     defer watcher.deinit();
     try watcher.attach();
 
+    // journald log source (SYS-015). Sibling of the file watcher: a jail
+    // whose source resolves to `journald` reads the systemd journal via a
+    // polled `journalctl -o json` subprocess instead of an inotify file
+    // tail. The timer is armed only if at least one jail uses it.
+    var journald = journald_source_mod.JournaldSource.init(heap, &loop, cfg.global.state_file) catch |err| {
+        std.log.err("journald: init failed: {s}", .{@errorName(err)});
+        return err;
+    };
+    defer journald.deinit();
+
+    // Flush context for the journald periodic-flush hook. Declared at
+    // function scope so it outlives `loop.run()` — the hook captures its
+    // address and fires from inside `pollTick`. Wired into `journald` only
+    // when the source is actually in use (after the per-jail loop below).
+    var journald_flush_ctx = JournaldFlushContext{
+        .trackers = &trackers,
+        .state_path = cfg.global.state_file,
+        .journald = &journald,
+    };
+
     // Per-jail contexts. Heap-allocated so their pointers remain stable
     // across the event loop lifetime (the watcher's userdata field holds
     // these pointers).
@@ -967,16 +1037,100 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         };
         try contexts.append(ctx);
 
-        for (jail_cfg.logpath) |lp| {
-            watcher.watchFile(lp, jail, lineCallback, ctx) catch |err| {
-                std.log.warn(
-                    "log_watcher: watchFile '{s}' (jail '{s}') failed: {s}",
-                    .{ lp, jail_cfg.name, @errorName(err) },
+        // SYS-015: resolve this jail's effective log source. `.file` keeps
+        // the inotify tailer (and its late-appearance/rotation tolerance);
+        // `.journald` reads the journal via the polled subprocess; `.fail`
+        // means a jail asked for journald/auto on a box with no usable log
+        // source at all — fail closed (don't run a jail that protects
+        // nothing). The journalctl probe is read-only (access X_OK), no
+        // spawn.
+        const journalctl_present = config_mod.journalctlPresent();
+        const resolved_source = journald_source_mod.resolveSource(
+            jail_cfg.source,
+            jail_cfg.logpath,
+            journalctl_present,
+        );
+        switch (resolved_source) {
+            .file => {
+                for (jail_cfg.logpath) |lp| {
+                    watcher.watchFile(lp, jail, lineCallback, ctx) catch |err| {
+                        std.log.warn(
+                            "log_watcher: watchFile '{s}' (jail '{s}') failed: {s}",
+                            .{ lp, jail_cfg.name, @errorName(err) },
+                        );
+                        continue;
+                    };
+                }
+                std.log.info(
+                    "jail: enabled '{s}' source=file ({d} logpath(s))",
+                    .{ jail_cfg.name, jail_cfg.logpath.len },
                 );
-                continue;
-            };
+            },
+            .journald => {
+                journald.addJail(jail, jail_cfg.filter, lineCallback, ctx) catch |err| switch (err) {
+                    // v1 journald supports the `sshd` filter only. A jail
+                    // asking for journald with any other filter would get
+                    // sshd selectors silently mis-applied — fail closed
+                    // with a message that tells the operator exactly how to
+                    // fix it, and refuse to start.
+                    error.UnsupportedJournaldFilter => {
+                        std.log.err(
+                            "journald source supports only the \"sshd\" filter in v1; jail '{s}' uses filter '{s}' — refusing to start (use source=file with a text logpath, or remove the jail)",
+                            .{ jail_cfg.name, jail_cfg.filter },
+                        );
+                        return err;
+                    },
+                    else => {
+                        std.log.err(
+                            "journald: addJail '{s}' failed: {s}",
+                            .{ jail_cfg.name, @errorName(err) },
+                        );
+                        return err;
+                    },
+                };
+                std.log.info(
+                    "jail: enabled '{s}' source=journald (filter '{s}')",
+                    .{ jail_cfg.name, jail_cfg.filter },
+                );
+            },
+            .fail => {
+                std.log.err(
+                    "jail '{s}' has no usable log source (source={s}, logpath={d}, journalctl={}); refusing to run a jail that protects nothing",
+                    .{ jail_cfg.name, @tagName(jail_cfg.source), jail_cfg.logpath.len, journalctl_present },
+                );
+                return error.JailHasNoUsableSource;
+            },
         }
-        std.log.info("jail: enabled '{s}' ({d} logpath(s))", .{ jail_cfg.name, jail_cfg.logpath.len });
+    }
+
+    // Seed journald cursors from the sidecar and arm the poll timer, but
+    // only if at least one jail actually reads the journal. Cursor restore
+    // failure is non-fatal — a jail with no restored cursor baselines at
+    // "now" on its first tick (no history replay).
+    if (journald.hasJails()) {
+        if (journald_source_mod.loadCursors(heap, journald.cursor_path)) |cursors| {
+            defer {
+                for (cursors) |c| {
+                    heap.free(c.name);
+                    heap.free(c.cursor);
+                }
+                heap.free(cursors);
+            }
+            for (cursors) |c| journald.seedCursor(c.name, c.cursor);
+            if (cursors.len > 0) {
+                std.log.info("journald: restored {d} cursor(s) from sidecar", .{cursors.len});
+            }
+        } else |err| {
+            std.log.warn("journald: cursor restore failed: {s}; baselining at now", .{@errorName(err)});
+        }
+        // Install the periodic-flush hook BEFORE arming the timer, so the
+        // first dirty tick can persist state + cursors (SYS-015 Change 2).
+        journald.setFlushHook(journaldFlushHook, &journald_flush_ctx);
+        journald.attach() catch |err| {
+            std.log.err("journald: attach (poll timer) failed: {s}", .{@errorName(err)});
+            return err;
+        };
+        std.log.info("journald: polling {d} jail(s) every {d}ms", .{ journald.jailCount(), journald_source_mod.poll_interval_ms });
     }
 
     // IPC command handler context. Must outlive the IpcServer and HTTP
@@ -1063,6 +1217,7 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         .loop = &loop,
         .trackers = &trackers,
         .state_path = cfg.global.state_file,
+        .journald = &journald,
     };
     try loop.addSignalHandler(linux.SIG.TERM, onTerminate, &sig_ctx);
     try loop.addSignalHandler(linux.SIG.INT, onTerminate, &sig_ctx);
@@ -1102,8 +1257,10 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
 
     try loop.run();
 
-    // Final state save on clean shutdown (best-effort; ignore errors).
-    persist_mod.saveAll(&trackers, cfg.global.state_file) catch {};
+    // Final flush on clean shutdown (best-effort): engine state first,
+    // then the journald cursor sidecar (ordering is load-bearing — see
+    // `flushStateThenCursors`).
+    flushStateThenCursors(&trackers, cfg.global.state_file, &journald);
 
     // Explicit teardown order: close IPC/HTTP/WS first so their FDs are
     // no longer registered with the loop when `loop.deinit` runs below
@@ -1819,6 +1976,7 @@ test {
     _ = memory_mod;
     _ = event_loop_mod;
     _ = log_watcher_mod;
+    _ = journald_source_mod;
     _ = line_buffer_mod;
     _ = logger_mod;
     _ = parser_mod;

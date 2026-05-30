@@ -71,6 +71,19 @@ pub const LogLevel = enum { debug, info, warn, err };
 
 pub const BanAction = enum { nftables, iptables, ipset, @"log-only" };
 
+/// Where a jail reads its log lines from (SYS-015).
+///   * `auto`     — resolve at startup: a configured+usable `logpath`
+///                  wins (file tailer); otherwise, if `journalctl` is
+///                  present, read the systemd journal; otherwise the jail
+///                  fails closed at wiring time.
+///   * `file`     — always the inotify file tailer over `logpath`.
+///   * `journald` — always the journald subprocess poller. Requires
+///                  `journalctl`; fails closed if absent.
+/// Default `.auto` keeps every existing config working unchanged: a jail
+/// with a real `logpath` resolves to `file`, and a journald-only box
+/// (modern Debian/systemd, no /var/log/auth.log) resolves to `journald`.
+pub const LogSource = enum { auto, file, journald };
+
 pub const BantimeFormula = enum { linear, exponential };
 
 pub const BanTimeIncrement = struct {
@@ -132,6 +145,12 @@ pub const JailConfig = struct {
     name: []const u8,
     enabled: bool = true,
     logpath: []const []const u8 = &.{},
+    /// Log source backend for this jail (SYS-015). Defaults to `.auto`,
+    /// which resolves to the file tailer when a usable `logpath` is
+    /// configured and to the journald poller otherwise. See `LogSource`.
+    /// v1 has no per-jail `journalmatch` override — the journald selector
+    /// set is fixed per filter (see engine/core/journald_source.zig).
+    source: LogSource = .auto,
     filter: []const u8 = "",
     maxretry: ?u32 = null,
     findtime: ?shared.Duration = null,
@@ -324,6 +343,26 @@ pub fn validate(cfg: *const Config) ValidationError!void {
             std.fs.cwd().access(lp, .{}) catch {
                 std.log.warn("config: jail '{s}' logpath not found (may appear later): {s}", .{ j.name, lp });
             };
+        }
+
+        // SYS-015: warn (don't fail) when a jail would read the journal but
+        // `journalctl` is not installed. Like a missing logpath, this is a
+        // warning here — `--validate-config` runs on operator laptops that
+        // may lack journalctl, and the real fail-closed happens at jail
+        // wiring time (runDaemon). `auto` only triggers the warning when it
+        // would actually pick journald, i.e. no usable logpath is set.
+        if (j.enabled) {
+            const would_use_journald = switch (j.source) {
+                .journald => true,
+                .auto => !hasUsableLogpath(j.logpath),
+                .file => false,
+            };
+            if (would_use_journald and !journalctlPresent()) {
+                std.log.warn(
+                    "config: jail '{s}' source resolves to journald but journalctl not found at {s}",
+                    .{ j.name, journalctl_path },
+                );
+            }
         }
 
         // Filter name is informational in Phase 3 — Phase 5 will check that
@@ -781,6 +820,9 @@ const Parser = struct {
             j.filter = try asString(v);
         } else if (std.mem.eql(u8, key, "logpath")) {
             j.logpath = try asStringArray(v);
+        } else if (std.mem.eql(u8, key, "source")) {
+            const s = try asString(v);
+            j.source = try parseLogSource(s);
         } else if (std.mem.eql(u8, key, "maxretry")) {
             const n = try asInt(v);
             if (n < 0) return error.InvalidValue;
@@ -884,11 +926,42 @@ fn parseLogLevel(s: []const u8) Error!LogLevel {
     return error.InvalidValue;
 }
 
+/// Canonical journalctl path on the target distros (SYS-015). Probed by
+/// `journalctlPresent` and used by the runtime source resolver.
+pub const journalctl_path: []const u8 = "/usr/bin/journalctl";
+
+/// True when at least one configured logpath string is non-empty. The
+/// file watcher itself tolerates a path that doesn't exist yet (it arms a
+/// parent-directory inotify watch and picks the file up on creation), so
+/// "usable" here means "configured", not "currently present" — preserving
+/// the late-appearance/rotation semantics (SYS-015 Lead decision 1).
+pub fn hasUsableLogpath(logpath: []const []const u8) bool {
+    for (logpath) |lp| {
+        if (lp.len > 0) return true;
+    }
+    return false;
+}
+
+/// True when the journalctl binary is present and executable. Used both
+/// by `validate()` (warn-only) and by the runtime source resolver
+/// (fail-closed). A read-only `access(X_OK)` probe — no spawn.
+pub fn journalctlPresent() bool {
+    std.fs.cwd().access(journalctl_path, .{ .mode = .read_only }) catch return false;
+    return true;
+}
+
 fn parseBanAction(s: []const u8) Error!BanAction {
     if (std.mem.eql(u8, s, "nftables")) return .nftables;
     if (std.mem.eql(u8, s, "iptables")) return .iptables;
     if (std.mem.eql(u8, s, "ipset")) return .ipset;
     if (std.mem.eql(u8, s, "log-only")) return .@"log-only";
+    return error.InvalidValue;
+}
+
+fn parseLogSource(s: []const u8) Error!LogSource {
+    if (std.mem.eql(u8, s, "auto")) return .auto;
+    if (std.mem.eql(u8, s, "file")) return .file;
+    if (std.mem.eql(u8, s, "journald")) return .journald;
     return error.InvalidValue;
 }
 
@@ -976,6 +1049,98 @@ test "native: parse jails section with overrides" {
     try std.testing.expectEqual(@as(shared.Duration, 600), eff_find);
     const eff_mr = cfg.jails[0].effectiveMaxretry(cfg.defaults);
     try std.testing.expectEqual(@as(u32, 3), eff_mr);
+}
+
+// ---------- SYS-015: per-jail log source ----------
+
+test "native: jail source defaults to auto when unset" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[jails.sshd]
+        \\filter = "sshd"
+        \\logpath = ["/var/log/auth.log"]
+    ;
+    const cfg = try Config.parse(arena.allocator(), src);
+    try std.testing.expectEqual(@as(usize, 1), cfg.jails.len);
+    try std.testing.expectEqual(LogSource.auto, cfg.jails[0].source);
+}
+
+test "native: jail source parses file / journald / auto" {
+    const cases = [_]struct { tok: []const u8, want: LogSource }{
+        .{ .tok = "file", .want = .file },
+        .{ .tok = "journald", .want = .journald },
+        .{ .tok = "auto", .want = .auto },
+    };
+    for (cases) |c| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var buf: [128]u8 = undefined;
+        const src = try std.fmt.bufPrint(
+            &buf,
+            "[jails.sshd]\nfilter = \"sshd\"\nsource = \"{s}\"\n",
+            .{c.tok},
+        );
+        const cfg = try Config.parse(arena.allocator(), src);
+        try std.testing.expectEqual(c.want, cfg.jails[0].source);
+    }
+}
+
+test "native: jail source rejects an unknown token" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[jails.sshd]
+        \\filter = "sshd"
+        \\source = "syslog"
+    ;
+    try std.testing.expectError(error.InvalidValue, Config.parse(arena.allocator(), src));
+}
+
+test "native: unknown journalmatch key still trips UnknownKey (v1 has no override)" {
+    // The journald selector set is fixed in v1 — there is no per-jail
+    // `journalmatch` override. An operator who writes one must get a clear
+    // error, not a silently-ignored line. Regression guard for the
+    // deferred-to-v2 decision.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[jails.sshd]
+        \\filter = "sshd"
+        \\source = "journald"
+        \\journalmatch = "_SYSTEMD_UNIT=ssh.service"
+    ;
+    try std.testing.expectError(error.UnknownKey, Config.parse(arena.allocator(), src));
+}
+
+test "native: hasUsableLogpath is true only for a non-empty path list" {
+    try std.testing.expect(!hasUsableLogpath(&.{}));
+    try std.testing.expect(!hasUsableLogpath(&.{""}));
+    try std.testing.expect(hasUsableLogpath(&.{"/var/log/auth.log"}));
+    try std.testing.expect(hasUsableLogpath(&.{ "", "/var/log/secure" }));
+}
+
+test "native: validate does not fail when a jail resolves to journald" {
+    // SYS-015: a journald-source jail must not turn `--validate-config`
+    // into a hard failure even when journalctl is missing — the resolver
+    // fails closed at startup, not at validate time. Same warn-not-fail
+    // discipline as the missing-logpath and missing-socket-dir cases.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[global]
+        \\memory_ceiling_mb = 32
+        \\socket_path = "/tmp/fail2zig-sys015.sock"
+        \\[defaults]
+        \\bantime = 600
+        \\findtime = 600
+        \\maxretry = 5
+        \\[jails.sshd]
+        \\filter = "sshd"
+        \\source = "journald"
+    ;
+    const cfg = try Config.parse(arena.allocator(), src);
+    try validate(&cfg);
 }
 
 test "native: parse bantime_increment config" {
