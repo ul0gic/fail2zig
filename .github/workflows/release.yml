@@ -162,7 +162,6 @@ jobs:
           # Bundle the systemd unit + example config so scripts/install.sh can
           # fetch them from the release page, not from a checkout.
           cp deploy/fail2zig.service release/ 2>/dev/null || true
-          cp deploy/fail2zig.socket  release/ 2>/dev/null || true
           cp deploy/fail2zig.toml.example release/ 2>/dev/null || true
           ls -la release/
 

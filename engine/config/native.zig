@@ -255,7 +255,6 @@ pub const ValidationError = error{
     InvalidFindtime,
     InvalidMaxretry,
     MemoryCeilingTooLow,
-    SocketDirMissing,
     UnknownFilter,
     EmptyJailName,
     DuplicateJailName,
@@ -288,13 +287,18 @@ pub fn validate(cfg: *const Config) ValidationError!void {
         return error.InvalidMaxretry;
     }
 
-    // Socket dir must exist. /run is always present on Linux; the check is
-    // cheap and surfaces config typos early.
+    // Warn (don't fail) on a missing socket dir — like a logpath, the
+    // socket's parent directory (e.g. /run/fail2zig) legitimately appears
+    // at/after startup. systemd's RuntimeDirectory=fail2zig creates it, and
+    // the daemon itself creates it (mode 0710) via ensureSocketDir() before
+    // binding the socket. Standalone `--validate-config` runs before either
+    // of those, so a missing dir here is expected and must not be fatal.
+    // Startup still enforces reality: if the daemon cannot create or bind
+    // the socket dir, it fails at startup with a clear error.
     const sock_dir = std.fs.path.dirname(cfg.global.socket_path) orelse "/";
     if (sock_dir.len > 0) {
         std.fs.cwd().access(sock_dir, .{}) catch {
-            std.log.warn("config: socket_path parent directory does not exist: {s}", .{sock_dir});
-            return error.SocketDirMissing;
+            std.log.warn("config: socket_path parent directory not found (created at startup): {s}", .{sock_dir});
         };
     }
 
@@ -1192,7 +1196,13 @@ test "native: validate rejects duplicate jail names" {
     try std.testing.expectError(error.DuplicateJailName, validate(&cfg));
 }
 
-test "native: validate rejects missing socket dir" {
+test "native: validate warns on missing socket dir, does not fail" {
+    // A missing socket parent dir (e.g. /run/fail2zig before startup) is a
+    // warning, not a failure: the daemon creates it at startup via
+    // ensureSocketDir() and systemd's RuntimeDirectory. Standalone
+    // --validate-config runs before that, so it must still succeed. This is
+    // a regression guard for the fresh-install onboarding bug where
+    // validate() hard-failed with SocketDirMissing.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1206,7 +1216,7 @@ test "native: validate rejects missing socket dir" {
         \\maxretry = 5
     ;
     const cfg = try Config.parse(arena.allocator(), src);
-    try std.testing.expectError(error.SocketDirMissing, validate(&cfg));
+    try validate(&cfg);
 }
 
 test "native: validate accepts healthy config" {

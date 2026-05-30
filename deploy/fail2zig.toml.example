@@ -1,6 +1,8 @@
 # fail2zig — example native configuration file
 #
-# Copy this file to /etc/fail2zig/fail2zig.toml and edit to taste.
+# Copy this file to /etc/fail2zig/config.toml and edit to taste.
+# (scripts/install.sh seeds config.toml from this example automatically;
+#  the systemd unit runs `fail2zig --config /etc/fail2zig/config.toml`.)
 # All values shown here are the built-in defaults unless noted.
 #
 # Syntax is a strict subset of TOML:

@@ -1,6 +1,6 @@
 [Unit]
 Description=fail2zig — intrusion prevention system
-Documentation=https://github.com/ul0gic/fail2zig https://fail2zig.io/docs
+Documentation=https://github.com/ul0gic/fail2zig https://fail2zig.com/docs
 After=network-online.target rsyslog.service systemd-journald.service
 Wants=network-online.target
 
