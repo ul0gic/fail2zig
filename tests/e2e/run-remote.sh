@@ -50,14 +50,17 @@ echo "run-remote: building ReleaseSafe ${TGT_TRIPLE} on the dev box" >&2
 [ -x "${REPO_ROOT}/zig-out/bin/fail2zig" ] || { echo "run-remote: build produced no fail2zig binary" >&2; exit 1; }
 [ -x "${REPO_ROOT}/zig-out/bin/fail2zig-client" ] || { echo "run-remote: build produced no fail2zig-client binary" >&2; exit 1; }
 
-# 2. Sync the repo + freshly built binaries to the target. Exclude only the
-#    VCS dir and the build cache — zig-out IS shipped so the remote can
-#    install via --local-bin without a toolchain on the target.
-echo "run-remote: syncing repo + zig-out to ${TARGET}:${REMOTE_DIR}" >&2
-rsync -az --delete \
-  -e "ssh ${SSH_OPTS[*]}" \
-  --exclude '.git' --exclude '.zig-cache' --exclude 'zig-cache' \
-  "${REPO_ROOT}/" "${TARGET}:${REMOTE_DIR}/"
+# 2. Sync the repo + freshly built binaries to the target via tar-over-ssh.
+#    tar ships in base on every Debian/Ubuntu; rsync does NOT (a minimal
+#    target has no rsync), so tar keeps the harness fresh/minimal-box ready.
+#    Exclude only the VCS dir and the build cache — zig-out IS shipped so the
+#    remote installs via --local-bin without a toolchain. The remote rm -rf
+#    mirrors rsync --delete: a clean extract into a fresh REMOTE_DIR.
+echo "run-remote: syncing repo + zig-out to ${TARGET}:${REMOTE_DIR} (tar over ssh)" >&2
+tar -C "$REPO_ROOT" -czf - \
+  --exclude='./.git' --exclude='./.zig-cache' --exclude='./zig-cache' . \
+  | ssh "${SSH_OPTS[@]}" "$TARGET" \
+      "rm -rf ${REMOTE_DIR} && mkdir -p ${REMOTE_DIR} && tar -xzf - -C ${REMOTE_DIR}"
 
 # 3. Run the harness on the target against the pre-built binaries — NOT
 #    --build (the target has no zig). Any extra args (e.g. --purge, --force)
