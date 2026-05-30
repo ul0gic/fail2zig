@@ -295,22 +295,47 @@ pub fn decodeEntry(
     const message = try normalizeMessage(msg_val, msg_buf);
 
     // ---- __CURSOR (optional) ----
-    var cursor: ?[]const u8 = null;
-    if (obj.get("__CURSOR")) |cur_val| {
-        switch (cur_val) {
-            .string => |s| {
-                if (s.len > 0 and s.len <= cursor_buf.len) {
-                    @memcpy(cursor_buf[0..s.len], s);
-                    cursor = cursor_buf[0..s.len];
-                }
-                // An over-long or empty cursor is treated as "no cursor"
-                // for this entry — we process the line but do not advance.
-            },
-            else => {}, // wrong type → treat as absent
-        }
-    }
+    // An over-long/empty/wrong-type cursor is treated as "no cursor" for
+    // this entry — the line is still processed but the cursor does not
+    // advance.
+    const cursor = cursorFromObject(obj, cursor_buf);
 
     return .{ .message = message, .cursor = cursor };
+}
+
+/// Copy the `__CURSOR` string out of a parsed journal object into
+/// `cursor_buf`, returning a slice into it, or null when the field is
+/// absent, empty, the wrong type, or too long for the buffer. Shared by
+/// `decodeEntry` (steady-state) and `extractCursor` (first-run baseline).
+fn cursorFromObject(obj: std.json.ObjectMap, cursor_buf: []u8) ?[]const u8 {
+    const cur_val = obj.get("__CURSOR") orelse return null;
+    switch (cur_val) {
+        .string => |s| {
+            if (s.len == 0 or s.len > cursor_buf.len) return null;
+            @memcpy(cursor_buf[0..s.len], s);
+            return cursor_buf[0..s.len];
+        },
+        else => return null,
+    }
+}
+
+/// Extract ONLY the `__CURSOR` from one journalctl `-o json` line,
+/// independent of MESSAGE validity. Used for the first-run baseline, which
+/// needs the cursor but must NOT process (or even require) the entry's
+/// message — an entry with a missing or malformed MESSAGE but a valid
+/// `__CURSOR` must still seed the baseline. Returns a slice into
+/// `cursor_buf`, or null when the line is not a JSON object or carries no
+/// usable `__CURSOR`. `arena` backs the transient JSON DOM and is the
+/// caller's to reset/free (no hidden global heap).
+pub fn extractCursor(arena: Allocator, json_line: []const u8, cursor_buf: []u8) ?[]const u8 {
+    const parsed = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena,
+        json_line,
+        .{},
+    ) catch return null;
+    if (parsed != .object) return null;
+    return cursorFromObject(parsed.object, cursor_buf);
 }
 
 /// Normalize a MESSAGE JSON value into raw bytes in `out`. Returns a slice
@@ -767,19 +792,29 @@ pub const JournaldSource = struct {
         NonZeroExit,
     };
 
-    /// One reconcile for one jail: spawn journalctl, process the batch,
-    /// advance the in-memory cursor. The cursor sidecar is NOT written
-    /// here — the daemon flushes it AFTER engine state, so a crash replays
-    /// rather than skips (ordering is load-bearing).
+    /// One reconcile for one jail: spawn journalctl, then either SEED the
+    /// baseline cursor (first run) or PROCESS new entries (steady state).
+    /// The cursor sidecar is NOT written here — the daemon flushes it AFTER
+    /// engine state, so a crash replays rather than skips (ordering is
+    /// load-bearing).
+    ///
+    /// First run (`cursor_len == 0`): run the `-n 1` baseline query and
+    /// seed the cursor from the single returned entry WITHOUT feeding it to
+    /// the callback. Replaying a pre-existing journal entry on first start
+    /// would ban an offender for an event that predates the daemon —
+    /// exactly the history-replay the locked first-run policy forbids. We
+    /// take only the entry's `__CURSOR` and start AFTER it next tick.
     fn pollJail(self: *JournaldSource, jj: *JournalJail) PollError!void {
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
+        const first_run = jj.cursor_len == 0;
+
         // Build argv: baseline (-n 1) on first run, --after-cursor in
         // steady state.
         const argv = blk: {
-            if (jj.cursor_len == 0) {
+            if (first_run) {
                 break :blk buildBaselineArgv(arena, jj.selectors) catch
                     return error.OutOfMemory;
             }
@@ -819,7 +854,52 @@ pub const JournaldSource = struct {
             },
         }
 
+        if (first_run) {
+            // Seed only — NEVER feed the baseline entry to the callback.
+            self.seedBaseline(jj, result.stdout);
+            return;
+        }
+
         self.processBatch(jj, result.stdout);
+    }
+
+    /// Seed a jail's cursor from the first-run baseline stdout WITHOUT
+    /// processing any entry. Takes the first non-empty line of the `-n 1`
+    /// output, extracts its `__CURSOR` (independently of MESSAGE validity —
+    /// the baseline cares only about the cursor), and on success commits it
+    /// and marks the source dirty so the existing `maybeFlush` →
+    /// `flushStateThenCursors` persists it via the state-then-cursor path.
+    ///
+    /// No entry, or an entry without a `__CURSOR`: leave the cursor empty
+    /// so the next tick re-baselines. (An empty journal for these selectors
+    /// is the common case on a freshly-installed box with no SSH traffic
+    /// yet — we simply keep probing with `-n 1` until something appears.)
+    fn seedBaseline(self: *JournaldSource, jj: *JournalJail, stdout: []const u8) void {
+        var cursor_buf: [max_cursor_len]u8 = undefined;
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        var it = std.mem.splitScalar(u8, stdout, '\n');
+        while (it.next()) |raw_line| {
+            const line = std.mem.trim(u8, raw_line, " \t\r");
+            if (line.len == 0) continue;
+            // First non-empty line is the single baseline entry.
+            if (extractCursor(arena_state.allocator(), line, &cursor_buf)) |cur| {
+                jj.setCursor(cur);
+                self.dirty = true;
+                std.log.info(
+                    "journald: jail '{s}' baselined at journal tail (no history replay)",
+                    .{jj.jail.slice()},
+                );
+            } else {
+                std.log.warn(
+                    "journald: jail '{s}' baseline entry had no usable __CURSOR; re-baselining next tick",
+                    .{jj.jail.slice()},
+                );
+            }
+            return; // only the first entry matters for the baseline
+        }
+        // Empty output: no matching entries yet. Stay un-baselined; the
+        // next tick retries the `-n 1` probe.
     }
 
     /// Process a journalctl `-o json` stdout batch for one jail. Each
@@ -1295,4 +1375,131 @@ test "journald: processBatch marks dirty so maybeFlush will fire" {
     src.maybeFlush();
     try testing.expectEqual(@as(u32, 1), spy.calls);
     try testing.expect(!src.dirty);
+}
+
+// ----- First-run baseline: seed cursor WITHOUT replay -----
+
+test "journald: extractCursor returns the cursor even when MESSAGE is missing/malformed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var cur_buf: [max_cursor_len]u8 = undefined;
+
+    // No MESSAGE at all, but a valid __CURSOR → must still extract.
+    const no_msg =
+        \\{"__CURSOR":"s=base;i=42","PRIORITY":"6"}
+    ;
+    const c1 = extractCursor(arena.allocator(), no_msg, &cur_buf);
+    try testing.expect(c1 != null);
+    try testing.expectEqualStrings("s=base;i=42", c1.?);
+
+    // Malformed MESSAGE (out-of-range byte-array) but valid __CURSOR → the
+    // baseline only cares about the cursor, so it must still extract.
+    const bad_msg =
+        \\{"MESSAGE":[999],"__CURSOR":"s=base2"}
+    ;
+    const c2 = extractCursor(arena.allocator(), bad_msg, &cur_buf);
+    try testing.expect(c2 != null);
+    try testing.expectEqualStrings("s=base2", c2.?);
+
+    // No __CURSOR → null (cannot baseline from this entry).
+    const no_cursor =
+        \\{"MESSAGE":"Invalid user x from 1.2.3.4 port 22"}
+    ;
+    try testing.expect(extractCursor(arena.allocator(), no_cursor, &cur_buf) == null);
+
+    // Not even a JSON object → null.
+    try testing.expect(extractCursor(arena.allocator(), "{not json", &cur_buf) == null);
+}
+
+test "journald: seedBaseline sets cursor + dirty but does NOT invoke the callback" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var loop = try EventLoop.init(testing.allocator);
+    defer loop.deinit();
+    var src = try JournaldSource.init(testing.allocator, &loop, "/tmp/fail2zig-test/state.bin");
+    defer src.deinit();
+    var rec = CallRecorder.init(testing.allocator);
+    defer rec.deinit();
+    const jail = try JailId.fromSlice("sshd");
+    try src.addJail(jail, "sshd", CallRecorder.onLine, &rec);
+    const jj = &src.jails.items[0];
+
+    try testing.expect(jj.cursor_len == 0);
+    const baseline =
+        "{\"MESSAGE\":\"some recent journal line\",\"__CURSOR\":\"s=tail;i=7\"}\n";
+    src.seedBaseline(jj, baseline);
+
+    // Cursor seeded, source dirty (so maybeFlush persists it), and the
+    // callback was NEVER invoked — the baseline entry is not processed.
+    try testing.expectEqualStrings("s=tail;i=7", jj.cursorSlice());
+    try testing.expect(src.dirty);
+    try testing.expectEqual(@as(usize, 0), rec.lines.items.len);
+}
+
+test "journald: first-run baseline of a FAILURE entry does not ban (no callback)" {
+    // The exact SYS-015 acceptance: a pre-existing FAILURE in the journal
+    // must not be processed/banned on first start. With maxretry=1 the
+    // real lineCallback would ban this on a single match — proving the
+    // baseline entry never reaches the callback is proving it never bans.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var loop = try EventLoop.init(testing.allocator);
+    defer loop.deinit();
+    var src = try JournaldSource.init(testing.allocator, &loop, "/tmp/fail2zig-test/state.bin");
+    defer src.deinit();
+    var rec = CallRecorder.init(testing.allocator);
+    defer rec.deinit();
+    const jail = try JailId.fromSlice("sshd");
+    try src.addJail(jail, "sshd", CallRecorder.onLine, &rec);
+    const jj = &src.jails.items[0];
+
+    const baseline =
+        "{\"MESSAGE\":\"Invalid user attacker from 203.0.113.9 port 22\",\"__CURSOR\":\"s=preexisting\"}\n";
+    src.seedBaseline(jj, baseline);
+
+    try testing.expectEqual(@as(usize, 0), rec.lines.items.len); // not processed
+    try testing.expectEqualStrings("s=preexisting", jj.cursorSlice()); // but baselined
+}
+
+test "journald: seedBaseline with empty output leaves the jail un-baselined" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var loop = try EventLoop.init(testing.allocator);
+    defer loop.deinit();
+    var src = try JournaldSource.init(testing.allocator, &loop, "/tmp/fail2zig-test/state.bin");
+    defer src.deinit();
+    var rec = CallRecorder.init(testing.allocator);
+    defer rec.deinit();
+    const jail = try JailId.fromSlice("sshd");
+    try src.addJail(jail, "sshd", CallRecorder.onLine, &rec);
+    const jj = &src.jails.items[0];
+
+    // No matching journal entries yet (fresh box, no SSH traffic).
+    src.seedBaseline(jj, "");
+    try testing.expectEqual(@as(usize, 0), jj.cursor_len); // stays un-baselined
+    try testing.expect(!src.dirty);
+    try testing.expectEqual(@as(usize, 0), rec.lines.items.len);
+}
+
+test "journald: steady-state processBatch STILL invokes the callback (contrast with baseline)" {
+    // Guards the steady-state path: once a cursor exists, --after-cursor
+    // entries ARE processed (and advance the cursor). This is the
+    // deliberate counterpart to the no-replay baseline behaviour above.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var loop = try EventLoop.init(testing.allocator);
+    defer loop.deinit();
+    var src = try JournaldSource.init(testing.allocator, &loop, "/tmp/fail2zig-test/state.bin");
+    defer src.deinit();
+    var rec = CallRecorder.init(testing.allocator);
+    defer rec.deinit();
+    const jail = try JailId.fromSlice("sshd");
+    try src.addJail(jail, "sshd", CallRecorder.onLine, &rec);
+    const jj = &src.jails.items[0];
+
+    // Simulate "already baselined" by giving the jail a cursor.
+    jj.setCursor("s=already-baselined");
+    const batch =
+        "{\"MESSAGE\":\"Invalid user x from 5.5.5.5 port 1\",\"__CURSOR\":\"s=new1\"}\n";
+    src.processBatch(jj, batch);
+
+    try testing.expectEqual(@as(usize, 1), rec.lines.items.len); // processed
+    try testing.expectEqualStrings("Invalid user x from 5.5.5.5 port 1", rec.lines.items[0]);
+    try testing.expectEqualStrings("s=new1", jj.cursorSlice()); // advanced
 }
