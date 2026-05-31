@@ -6,24 +6,27 @@
 //!   1. Parse CLI args (--config, --version, --help, --test-config,
 //!      --foreground, --import-config).
 //!   2. Load + validate config.
-//!   3. Build the memory pool from the config ceiling.
-//!   4. Detect the firewall backend (or fail closed if none available).
-//!   5. Initialize the state tracker; seed it from the persisted state
+//!   3. Detect the firewall backend (or fail closed if none available).
+//!   4. Initialize the state tracker; seed it from the persisted state
 //!      file if present.
-//!   6. For each enabled jail, wire a `Parser` + `LogWatcher` per
+//!   5. For each enabled jail, resolve its configured filter to a
+//!      `FilterMatcher` and wire a `LogWatcher` (or journald source) per
 //!      `logpath`, with a static line callback that routes matches
 //!      through the state tracker and on ban decisions into the
 //!      firewall backend.
-//!   7. Install signal handlers (SIGTERM/SIGINT save state + exit,
+//!   6. Install signal handlers (SIGTERM/SIGINT save state + exit,
 //!      SIGHUP logs "reload not yet implemented").
-//!   8. Arm a 1s periodic timer that scans for expired bans and calls
+//!   7. Arm a 1s periodic timer that scans for expired bans and calls
 //!      `backend.unban` for each.
-//!   9. Enter the event loop until stopped.
+//!   8. Enter the event loop until stopped.
 //!
-//! Every allocating step is backed by either the memory pool (per
-//! component) or a process-lifetime arena (for config strings and
-//! per-jail contexts). The steady-state hot path — log line → parse →
-//! state update → (maybe) ban — is allocation-free on the happy path.
+//! The steady-state hot path — log line → match → state update →
+//! (maybe) ban — is allocation-free on the happy path: the matcher
+//! operates on slices of the caller's buffer and the per-jail state
+//! tracker is a fixed-capacity map sized at startup. Per-component
+//! memory-ceiling enforcement (the `MemoryPool` scaffolding in
+//! `core/memory.zig`) is not yet wired to a live consumer — tracked
+//! separately.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -205,7 +208,18 @@ pub fn runImport(
 
 const JailContext = struct {
     jail: shared.JailId,
-    parser: parser_mod.Parser,
+    /// Runtime matcher for THIS jail's configured filter (SYS-020). Built
+    /// once at construction from `jail.filter` via
+    /// `filter_registry_mod.matcherForFilter`, which resolves the filter
+    /// name to its comptime-compiled pattern set. This REPLACES the old
+    /// permissive `Parser.init` default (`<*><IP>` — "any line containing
+    /// an IP"), which matched benign IP-bearing lines (sshd's
+    /// `Server listening on 0.0.0.0 port 22`, successful logins) and caused
+    /// false bans. Both the file tailer and the journald source route
+    /// through `lineCallback`, so both resolve to the SAME configured
+    /// matcher for a given jail. A jail whose filter has no builtin matcher
+    /// fails closed at construction (never reaches here with a default).
+    matcher: filter_registry_mod.FilterMatcher,
     /// Per-jail state tracker (ISSUE-007). Each jail's tracker carries
     /// its own resolved `maxretry`/`findtime`/`bantime` so per-jail
     /// overrides actually take effect.
@@ -360,13 +374,35 @@ fn lineCallback(
     // inputs (e.g. journalctl-piped lines where the prefix is absent).
     const body = parser_mod.stripSyslogPrefix(line);
 
-    const result = ctx.parser.parseLine(body) catch {
+    // SYS-020: match against THIS jail's CONFIGURED filter patterns, not a
+    // permissive default. A non-matching line is the common case (most log
+    // lines are not auth failures) — no count, no ban. `incrementParseErrors`
+    // is misnamed for "no match" but is the existing counter for "a line we
+    // saw but did not act on"; keep using it so metrics stay continuous.
+    const result = ctx.matcher.match(body) orelse {
         if (ctx.metrics) |m| {
             m.incrementParseErrors();
             m.jailIncrementParseErrors(ctx.jail.slice());
         }
         return;
     };
+
+    // SYS-020 defense-in-depth: even a matched line may carry an
+    // unenforceable IP (the unspecified `0.0.0.0` / `::` a listener logs on
+    // start, or loopback). Banning these is noise at best, self-DoS at
+    // worst. Drop the match here — at the record boundary, so this rail
+    // protects EVERY matcher, not just sshd. We never coerce a missing IP
+    // to zero; extraction returns no match instead, so this only fires when
+    // a real-but-unenforceable token was parsed.
+    if (result.ip.isUnenforceable()) {
+        @branchHint(.unlikely);
+        std.log.debug(
+            "skip: jail='{s}' matched but ip={} is unenforceable (unspecified/loopback) — ignoring",
+            .{ ctx.jail.slice(), result.ip },
+        );
+        return;
+    }
+
     if (ctx.metrics) |m| {
         m.incrementMatched();
         m.jailIncrementMatched(ctx.jail.slice());
@@ -713,25 +749,6 @@ fn deriveLegacyTrackerConfig(cfg: *const config_mod.Config, max_entries: u32) st
     };
 }
 
-fn deriveMemoryConfig(cfg: *const config_mod.Config) memory_mod.MemoryConfig {
-    // Scale each component proportionally to the ceiling. The default
-    // schema (64MB) matches memory_mod's defaults exactly.
-    const ceiling_bytes: usize = @as(usize, cfg.global.memory_ceiling_mb) * memory_mod.one_mb;
-    // Shares: state 50%, parser 6%, event 2%, log 12%. Sum = 70%.
-    // Leftover 30% is headroom (future components, fragmentation safety).
-    const state_bytes = ceiling_bytes / 2;
-    const parser_bytes = @max(@as(usize, 1) * memory_mod.one_mb, ceiling_bytes / 16);
-    const event_bytes = @max(@as(usize, 512 * 1024), ceiling_bytes / 64);
-    const log_bytes = @max(@as(usize, 2) * memory_mod.one_mb, ceiling_bytes / 8);
-    return .{
-        .state_tracker_bytes = state_bytes,
-        .parser_buffer_bytes = parser_bytes,
-        .event_queue_bytes = event_bytes,
-        .log_buffer_bytes = log_bytes,
-        .total_ceiling_bytes = ceiling_bytes,
-    };
-}
-
 // ============================================================================
 // Entry point
 // ============================================================================
@@ -835,14 +852,6 @@ fn reconcileBanApply(
 }
 
 fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
-    // Memory pool.
-    const mem_cfg = deriveMemoryConfig(cfg);
-    var pool = memory_mod.MemoryPool.init(mem_cfg) catch |err| {
-        std.log.err("memory: pool init failed: {s}", .{@errorName(err)});
-        return err;
-    };
-    defer pool.deinit();
-
     // Metrics (atomic counters). Cheap; construct before anything that
     // increments them.
     var metrics = metrics_mod.Metrics.init();
@@ -879,7 +888,13 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         if (jc.enabled) enabled_count += 1;
     }
     const tracker_count: u32 = @max(1, enabled_count + 1);
-    const per_tracker_bytes: usize = mem_cfg.state_tracker_bytes / tracker_count;
+    // State-tracker share of the configured ceiling: half the ceiling, split
+    // evenly across trackers. This is the SAME value the (now-removed)
+    // MemoryPool config used for `state_tracker_bytes` — kept inline so
+    // tracker capacity sizing is byte-for-byte unchanged. It sizes the
+    // tracker HashMaps' entry counts only; it is not an allocator budget.
+    const state_tracker_bytes: usize = (@as(usize, cfg.global.memory_ceiling_mb) * memory_mod.one_mb) / 2;
+    const per_tracker_bytes: usize = state_tracker_bytes / tracker_count;
     const per_tracker_capacity = state_mod.capacityFromBudget(per_tracker_bytes);
 
     // Install one tracker per enabled jail. Per-jail ignoreip resolves
@@ -1022,6 +1037,20 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
             );
             continue;
         };
+        // SYS-020: resolve this jail's CONFIGURED filter to its runtime
+        // matcher BEFORE allocating anything. A filter with no builtin
+        // matcher must fail closed — refuse to start, NEVER fall back to a
+        // permissive default that bans benign IP-bearing lines. This is the
+        // file-path equivalent of the journald source's
+        // `error.UnsupportedJournaldFilter`; resolving here covers BOTH
+        // sources (file + journald share `lineCallback`/`JailContext`).
+        const jail_matcher = filter_registry_mod.matcherForFilter(jail_cfg.filter) orelse {
+            std.log.err(
+                "jail '{s}' uses filter '{s}', which has no builtin matcher — refusing to start (fail2zig will not run a jail with no patterns, as that would ban any line containing an IP). Use a supported builtin filter or remove the jail.",
+                .{ jail_cfg.name, jail_cfg.filter },
+            );
+            return error.UnsupportedFilter;
+        };
         // Resolve this jail's effective ban action (SYS-016). Same
         // per-jail-vs-defaults rule used for the tracker config above;
         // `resolveJailFromConfig` is the single source of that rule.
@@ -1029,7 +1058,7 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         const ctx = try heap.create(JailContext);
         ctx.* = .{
             .jail = jail,
-            .parser = parser_mod.Parser.init(pool.allocator(.parser_buffer)),
+            .matcher = jail_matcher,
             .state = tracker_ptr,
             .backend_ptr = &backend_val,
             .banaction = resolved.banaction,
@@ -1716,19 +1745,6 @@ test "cli: runImport returns 2 on unreadable source dir" {
     try std.testing.expectEqual(@as(u8, 2), rc);
 }
 
-test "main: deriveMemoryConfig splits ceiling sensibly" {
-    const cfg: config_mod.Config = .{
-        .global = .{ .memory_ceiling_mb = 64 },
-        .defaults = .{},
-        .jails = &.{},
-        .diag = .{},
-    };
-    const m = deriveMemoryConfig(&cfg);
-    try std.testing.expect(m.total_ceiling_bytes == 64 * memory_mod.one_mb);
-    try std.testing.expect(m.state_tracker_bytes >= m.parser_buffer_bytes);
-    try m.validate();
-}
-
 test "main: deriveJailTrackerConfig uses resolved per-jail values" {
     // ISSUE-007: the tracker config for a jail now reflects its
     // resolved thresholds (jail value if set, else defaults).
@@ -1796,7 +1812,7 @@ fn makeDispatchTestCtx(
 ) JailContext {
     return .{
         .jail = jail,
-        .parser = undefined, // dispatchBan never reads the parser
+        .matcher = undefined, // dispatchBan never reads the matcher
         .state = tracker,
         .backend_ptr = backend,
         .banaction = action,
@@ -1930,7 +1946,7 @@ test "dispatch: backend error on enforcing path skips metrics (no false ban)" {
 
     var ctx: JailContext = .{
         .jail = jail,
-        .parser = undefined,
+        .matcher = undefined,
         .state = &tracker,
         .backend_ptr = &backend,
         .banaction = .nftables,
@@ -1945,6 +1961,177 @@ test "dispatch: backend error on enforcing path skips metrics (no false ban)" {
     // Backend failed -> no ban counted.
     const snap = metrics.snapshot();
     try testing.expectEqual(@as(u64, 0), snap.bans_total);
+}
+
+// ----------------------------------------------------------------------------
+// SYS-020: runtime applies the jail's CONFIGURED filter, not a permissive
+// default; reserved/unenforceable IPs never ban. These drive the SHARED
+// `lineCallback` directly — both the file tailer and the journald source
+// route through it with the same `*JailContext`, so exercising it here
+// proves BOTH paths resolve to the same configured matcher.
+// ----------------------------------------------------------------------------
+
+/// Build a `lineCallback`-ready context wired to the sshd filter matcher,
+/// a real tracker, a ban spy, and metrics. `maxretry` is the caller's so a
+/// test can force a single hit to cross the threshold.
+fn makeLineCallbackCtx(
+    jail: shared.JailId,
+    tracker: *state_mod.StateTracker,
+    backend: *firewall.Backend,
+    metrics: *metrics_mod.Metrics,
+    spy: *BanSpy,
+) JailContext {
+    return .{
+        .jail = jail,
+        .matcher = filter_registry_mod.matcherForFilter("sshd").?,
+        .state = tracker,
+        .backend_ptr = backend,
+        .banaction = .nftables,
+        .metrics = metrics,
+        .now_override = 1_000, // deterministic clock
+        .ban_hook = BanSpy.ban,
+        .ban_hook_ctx = spy,
+    };
+}
+
+const LineCallbackFixture = struct {
+    tracker: state_mod.StateTracker,
+    metrics: metrics_mod.Metrics,
+    backend: firewall.Backend,
+    spy: BanSpy,
+    jail: shared.JailId,
+
+    fn deinit(self: *LineCallbackFixture) void {
+        self.tracker.deinit();
+    }
+};
+
+/// maxretry=1 so a single matching line that crosses the threshold bans
+/// immediately — makes "did this line ban?" a one-shot assertion.
+fn initLineCallbackFixture(self: *LineCallbackFixture) !void {
+    self.tracker = try state_mod.StateTracker.init(testing.allocator, .{
+        .max_entries = 16,
+        .maxretry = 1,
+        .findtime = 600,
+        .bantime = 600,
+    });
+    self.metrics = metrics_mod.Metrics.init();
+    _ = self.metrics.registerJail("sshd");
+    self.backend = .{ .iptables = firewall.iptables.IptablesBackend{} };
+    self.spy = .{};
+    self.jail = try shared.JailId.fromSlice("sshd");
+}
+
+test "lineCallback: sshd listener startup line does NOT match/count/ban (SYS-020)" {
+    var fx: LineCallbackFixture = undefined;
+    try initLineCallbackFixture(&fx);
+    defer fx.deinit();
+    var ctx = makeLineCallbackCtx(fx.jail, &fx.tracker, &fx.backend, &fx.metrics, &fx.spy);
+
+    // The exact lines sshd logs on (re)start. The old `<*><IP>` default
+    // matched these and banned 0.0.0.0 / ::; the configured sshd patterns
+    // do not match them at all.
+    lineCallback("Server listening on 0.0.0.0 port 22.", fx.jail, false, &ctx);
+    lineCallback("Server listening on :: port 22.", fx.jail, false, &ctx);
+
+    try testing.expectEqual(@as(u32, 0), fx.spy.calls);
+    const snap = fx.metrics.snapshot();
+    try testing.expectEqual(@as(u64, 0), snap.bans_total);
+    try testing.expectEqual(@as(u64, 0), snap.lines_matched);
+}
+
+test "lineCallback: successful auth (Accepted password/publickey) does NOT ban (SYS-020)" {
+    var fx: LineCallbackFixture = undefined;
+    try initLineCallbackFixture(&fx);
+    defer fx.deinit();
+    var ctx = makeLineCallbackCtx(fx.jail, &fx.tracker, &fx.backend, &fx.metrics, &fx.spy);
+
+    lineCallback("Accepted password for root from 198.51.100.7 port 22 ssh2", fx.jail, false, &ctx);
+    lineCallback("Accepted publickey for root from 198.51.100.7 port 22 ssh2: RSA SHA256:x", fx.jail, false, &ctx);
+
+    try testing.expectEqual(@as(u32, 0), fx.spy.calls);
+    try testing.expectEqual(@as(u64, 0), fx.metrics.snapshot().bans_total);
+}
+
+test "lineCallback: real sshd auth failures DO match and ban (no regression, SYS-020)" {
+    var fx: LineCallbackFixture = undefined;
+    try initLineCallbackFixture(&fx);
+    defer fx.deinit();
+    var ctx = makeLineCallbackCtx(fx.jail, &fx.tracker, &fx.backend, &fx.metrics, &fx.spy);
+
+    // maxretry=1 -> the first failure crosses the threshold and bans.
+    lineCallback("Failed password for root from 203.0.113.10 port 22 ssh2", fx.jail, false, &ctx);
+    try testing.expectEqual(@as(u32, 1), fx.spy.calls);
+    try testing.expect(fx.spy.last_ip != null);
+    try testing.expect(shared.IpAddress.eql(fx.spy.last_ip.?, try shared.IpAddress.parse("203.0.113.10")));
+
+    // A second distinct offender via the "Invalid user" pattern also bans.
+    lineCallback("Invalid user oracle from 203.0.113.20 port 22", fx.jail, false, &ctx);
+    try testing.expectEqual(@as(u32, 2), fx.spy.calls);
+}
+
+test "lineCallback: [preauth] self-ban guard takes effect at runtime (SYS-011 via SYS-020)" {
+    var fx: LineCallbackFixture = undefined;
+    try initLineCallbackFixture(&fx);
+    defer fx.deinit();
+    var ctx = makeLineCallbackCtx(fx.jail, &fx.tracker, &fx.backend, &fx.metrics, &fx.spy);
+
+    // Clean operator logout — OpenSSH writes this on every normal session
+    // close. The configured pattern requires the `[preauth]` suffix, so a
+    // clean disconnect MUST NOT ban. Before SYS-020 the `<*><IP>` default
+    // matched it and could self-ban the operator.
+    lineCallback("Received disconnect from 192.0.2.50 port 22:11: disconnected by user", fx.jail, false, &ctx);
+    try testing.expectEqual(@as(u32, 0), fx.spy.calls);
+
+    // Attacker pre-auth disconnect — the `[preauth]` suffix means the IP
+    // never authenticated; this MUST ban.
+    lineCallback("Received disconnect from 203.0.113.99 port 22:11: Bye Bye [preauth]", fx.jail, false, &ctx);
+    try testing.expectEqual(@as(u32, 1), fx.spy.calls);
+}
+
+test "lineCallback: matched line with unenforceable IP never bans (reserved-IP guard, SYS-020)" {
+    var fx: LineCallbackFixture = undefined;
+    try initLineCallbackFixture(&fx);
+    defer fx.deinit();
+    var ctx = makeLineCallbackCtx(fx.jail, &fx.tracker, &fx.backend, &fx.metrics, &fx.spy);
+
+    // These lines DO match the sshd "Invalid user" pattern, but the
+    // extracted token is unspecified/loopback — the record-boundary guard
+    // must drop them before any count or ban, even though a pattern matched.
+    lineCallback("Invalid user attacker from 0.0.0.0 port 22", fx.jail, false, &ctx);
+    lineCallback("Invalid user attacker from :: port 22", fx.jail, false, &ctx);
+    lineCallback("Failed password for root from 127.0.0.1 port 22 ssh2", fx.jail, false, &ctx);
+
+    try testing.expectEqual(@as(u32, 0), fx.spy.calls);
+    const snap = fx.metrics.snapshot();
+    try testing.expectEqual(@as(u64, 0), snap.bans_total);
+    // The guard fires AFTER the match but BEFORE the matched counter, so a
+    // dropped unenforceable hit is not counted as a match either.
+    try testing.expectEqual(@as(u64, 0), snap.lines_matched);
+}
+
+test "lineCallback: file and journald inputs resolve to the SAME configured matcher (SYS-020)" {
+    // The file tailer passes a syslog-framed line; the journald source
+    // passes the bare message body. Both reach this identical callback with
+    // the identical context. A benign-but-IP-bearing line must be rejected
+    // on BOTH shapes, proving neither path uses a permissive default.
+    var fx: LineCallbackFixture = undefined;
+    try initLineCallbackFixture(&fx);
+    defer fx.deinit();
+    var ctx = makeLineCallbackCtx(fx.jail, &fx.tracker, &fx.backend, &fx.metrics, &fx.spy);
+
+    // File-source shape: full rsyslog envelope (stripSyslogPrefix peels it).
+    lineCallback("Apr 21 10:15:03 host sshd[1234]: Accepted password for root from 198.51.100.8 port 22 ssh2", fx.jail, false, &ctx);
+    // journald shape: bare message body, no envelope.
+    lineCallback("Accepted password for root from 198.51.100.8 port 22 ssh2", fx.jail, false, &ctx);
+
+    // Neither shape banned — both ran the configured sshd matcher, which
+    // rejects successful auth.
+    try testing.expectEqual(@as(u32, 0), fx.spy.calls);
+
+    // And a real failure in BOTH shapes DOES ban (same matcher, same result).
+    lineCallback("Apr 21 10:15:04 host sshd[1234]: Failed password for root from 203.0.113.30 port 22 ssh2", fx.jail, false, &ctx);
+    try testing.expectEqual(@as(u32, 1), fx.spy.calls);
 }
 
 test "main: deriveLegacyTrackerConfig mirrors defaults" {
@@ -1973,6 +2160,9 @@ test {
     // directly, otherwise their unit tests disappear from `zig build
     // test` output.
     _ = allocator_mod;
+    // Test-only: surface memory.zig's tests. The MemoryPool is not yet
+    // wired to a live consumer (tracked separately); see the
+    // memory-ceiling-not-enforced issue.
     _ = memory_mod;
     _ = event_loop_mod;
     _ = log_watcher_mod;
