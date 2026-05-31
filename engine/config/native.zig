@@ -72,16 +72,20 @@ pub const LogLevel = enum { debug, info, warn, err };
 pub const BanAction = enum { nftables, iptables, ipset, @"log-only" };
 
 /// Where a jail reads its log lines from (SYS-015).
-///   * `auto`     — resolve at startup: a configured+usable `logpath`
-///                  wins (file tailer); otherwise, if `journalctl` is
-///                  present, read the systemd journal; otherwise the jail
-///                  fails closed at wiring time.
+///   * `auto`     — resolve at startup, EXISTENCE-based (SYS-015 reopened):
+///                  a configured `logpath` that exists on disk wins (file
+///                  tailer); otherwise, if the jail's filter is
+///                  journald-supported and `journalctl` is present, read the
+///                  systemd journal; otherwise fall back to the file tailer
+///                  (which tolerates a late-appearing path). `auto` NEVER
+///                  fails closed.
 ///   * `file`     — always the inotify file tailer over `logpath`.
 ///   * `journald` — always the journald subprocess poller. Requires
 ///                  `journalctl`; fails closed if absent.
-/// Default `.auto` keeps every existing config working unchanged: a jail
-/// with a real `logpath` resolves to `file`, and a journald-only box
-/// (modern Debian/systemd, no /var/log/auth.log) resolves to `journald`.
+/// Default `.auto` keeps every existing config working: a jail whose
+/// `logpath` exists resolves to `file`, and a journald-only box (modern
+/// Debian/systemd, no /var/log/auth.log) resolves its sshd jail to
+/// `journald` because the configured auth.log/secure paths are absent.
 pub const LogSource = enum { auto, file, journald };
 
 pub const BantimeFormula = enum { linear, exponential };
@@ -349,12 +353,16 @@ pub fn validate(cfg: *const Config) ValidationError!void {
         // `journalctl` is not installed. Like a missing logpath, this is a
         // warning here — `--validate-config` runs on operator laptops that
         // may lack journalctl, and the real fail-closed happens at jail
-        // wiring time (runDaemon). `auto` only triggers the warning when it
-        // would actually pick journald, i.e. no usable logpath is set.
+        // wiring time (runDaemon). The `auto` condition mirrors
+        // `journald_source.resolveSource` EXACTLY (SYS-015 reopened):
+        // existence-based, and gated on the filter actually being
+        // journald-supported, so an `auto` jail with an absent log but a
+        // non-journald filter (e.g. nginx) resolves to file and does NOT
+        // warn here.
         if (j.enabled) {
             const would_use_journald = switch (j.source) {
                 .journald => true,
-                .auto => !hasUsableLogpath(j.logpath),
+                .auto => !anyLogpathExists(j.logpath) and filterSupportsJournald(j.filter),
                 .file => false,
             };
             if (would_use_journald and !journalctlPresent()) {
@@ -930,16 +938,33 @@ fn parseLogLevel(s: []const u8) Error!LogLevel {
 /// `journalctlPresent` and used by the runtime source resolver.
 pub const journalctl_path: []const u8 = "/usr/bin/journalctl";
 
-/// True when at least one configured logpath string is non-empty. The
-/// file watcher itself tolerates a path that doesn't exist yet (it arms a
-/// parent-directory inotify watch and picks the file up on creation), so
-/// "usable" here means "configured", not "currently present" — preserving
-/// the late-appearance/rotation semantics (SYS-015 Lead decision 1).
-pub fn hasUsableLogpath(logpath: []const []const u8) bool {
+/// True when at least one configured logpath currently EXISTS on disk
+/// (SYS-015). This existence-based probe is what the `auto` resolver uses
+/// to decide file-vs-journald: on a journald-only box the shipped sshd
+/// jail's `/var/log/auth.log` / `/var/log/secure` are absent, so `auto`
+/// resolves to journald rather than tailing files that will never appear.
+/// Empty path strings are skipped. A read-only `access` probe, no open/read
+/// — cheap and non-mutating. (The file tailer still tolerates a configured
+/// path that doesn't exist yet once `.file` is chosen — it arms a
+/// parent-directory inotify watch and picks the file up on creation.)
+pub fn anyLogpathExists(logpath: []const []const u8) bool {
     for (logpath) |lp| {
-        if (lp.len > 0) return true;
+        if (lp.len == 0) continue;
+        std.fs.cwd().access(lp, .{ .mode = .read_only }) catch continue;
+        return true;
     }
     return false;
+}
+
+/// True when `filter` has a journald selector set (i.e. `auto` may route it
+/// to the journald source). v1 supports `sshd` ONLY. This MUST stay in sync
+/// with `journald_source.selectorsForFilter` — that function is the
+/// authority for the actual selectors; this boolean mirror exists only so
+/// the config layer can apply the same `auto` filter gate without importing
+/// the journald source (which would create a config<->journald import
+/// cycle). A sync test in `journald_source.zig` asserts the two agree.
+pub fn filterSupportsJournald(filter: []const u8) bool {
+    return std.mem.eql(u8, filter, "sshd");
 }
 
 /// True when the journalctl binary is present and executable. Used both
@@ -1113,11 +1138,34 @@ test "native: unknown journalmatch key still trips UnknownKey (v1 has no overrid
     try std.testing.expectError(error.UnknownKey, Config.parse(arena.allocator(), src));
 }
 
-test "native: hasUsableLogpath is true only for a non-empty path list" {
-    try std.testing.expect(!hasUsableLogpath(&.{}));
-    try std.testing.expect(!hasUsableLogpath(&.{""}));
-    try std.testing.expect(hasUsableLogpath(&.{"/var/log/auth.log"}));
-    try std.testing.expect(hasUsableLogpath(&.{ "", "/var/log/secure" }));
+test "native: anyLogpathExists is existence-based, not configured-based (SYS-015)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "present.log", .data = "x" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const present = try tmp.dir.realpathAlloc(arena.allocator(), "present.log");
+    const absent = try std.fmt.allocPrint(arena.allocator(), "{s}/nope.log", .{std.fs.path.dirname(present).?});
+
+    // Empty list / empty strings / absent paths => false (this is the
+    // journald-only-box case for the shipped sshd jail).
+    try std.testing.expect(!anyLogpathExists(&.{}));
+    try std.testing.expect(!anyLogpathExists(&.{""}));
+    try std.testing.expect(!anyLogpathExists(&.{absent}));
+    try std.testing.expect(!anyLogpathExists(&.{ "", absent }));
+
+    // An existing path => true, even mixed with empty / absent entries.
+    try std.testing.expect(anyLogpathExists(&.{present}));
+    try std.testing.expect(anyLogpathExists(&.{ "", absent, present }));
+}
+
+test "native: filterSupportsJournald is sshd-only in v1" {
+    try std.testing.expect(filterSupportsJournald("sshd"));
+    try std.testing.expect(!filterSupportsJournald("nginx-http-auth"));
+    try std.testing.expect(!filterSupportsJournald("apache-auth"));
+    try std.testing.expect(!filterSupportsJournald(""));
+    try std.testing.expect(!filterSupportsJournald("sshd-ddos"));
 }
 
 test "native: validate does not fail when a jail resolves to journald" {

@@ -100,30 +100,48 @@ pub const max_line_len: usize = 4096;
 
 pub const ResolvedSource = enum { file, journald, fail };
 
-/// Resolve a jail's effective log source from its configured `source`,
-/// its `logpath`, and a probe for journalctl presence. Pure function:
-/// the journalctl probe is injected so this is unit-testable with no
-/// filesystem (and no journald) — see tests below.
+/// Resolve a jail's effective log source. Pure function: all filesystem /
+/// environment probes are injected as booleans by the caller, so this is
+/// unit-testable with no filesystem and no journald — see tests below.
 ///
+/// Inputs:
+///   * `logpath_exists`            — at least one configured logpath EXISTS
+///                                   on disk (caller stats them, see
+///                                   `config_mod.anyLogpathExists`).
+///   * `journalctl_present`        — the journalctl binary is installed.
+///   * `filter_journald_supported` — the jail's filter has a journald
+///                                   selector set (`selectorsForFilter !=
+///                                   null`; sshd only in v1).
+///
+/// Resolution:
 ///   * `.file`     → `.file` always (the watcher tolerates a not-yet-
 ///                   present path; "fail-closed for file" only applies to
 ///                   an empty/invalid path the watcher cannot handle,
 ///                   which surfaces at `watchFile` time, not here).
 ///   * `.journald` → `.journald` iff journalctl present, else `.fail`.
-///   * `.auto`     → usable logpath → `.file`; else journalctl present →
-///                   `.journald`; else `.fail`.
+///   * `.auto`     → SYS-015 (reopened): EXISTENCE-based.
+///       1. A configured logpath that exists on disk → `.file`.
+///       2. Else, if the filter is journald-supported AND journalctl is
+///          present → `.journald`. The filter gate is mandatory: without it
+///          a non-sshd jail with an absent log (e.g. nginx-http-auth on a
+///          box with no nginx logs) would resolve to journald and then fail
+///          closed at wiring time with `error.UnsupportedJournaldFilter`.
+///       3. Else → `.file`. The file tailer already tolerates a late-
+///          appearing path, so `auto` NEVER fails closed — it degrades to a
+///          (possibly-empty) file tail rather than refusing to start.
 pub fn resolveSource(
     source: config_mod.LogSource,
-    logpath: []const []const u8,
+    logpath_exists: bool,
     journalctl_present: bool,
+    filter_journald_supported: bool,
 ) ResolvedSource {
     return switch (source) {
         .file => .file,
         .journald => if (journalctl_present) .journald else .fail,
         .auto => blk: {
-            if (config_mod.hasUsableLogpath(logpath)) break :blk .file;
-            if (journalctl_present) break :blk .journald;
-            break :blk .fail;
+            if (logpath_exists) break :blk .file;
+            if (filter_journald_supported and journalctl_present) break :blk .journald;
+            break :blk .file;
         },
     };
 }
@@ -974,26 +992,51 @@ pub const JournaldSource = struct {
 
 const testing = std.testing;
 
-test "journald: resolveSource file always picks file" {
-    try testing.expectEqual(ResolvedSource.file, resolveSource(.file, &.{}, true));
-    try testing.expectEqual(ResolvedSource.file, resolveSource(.file, &.{}, false));
-    try testing.expectEqual(ResolvedSource.file, resolveSource(.file, &.{"/var/log/auth.log"}, false));
+// resolveSource args: (source, logpath_exists, journalctl_present,
+// filter_journald_supported). All probes are injected booleans — pure,
+// fs-free.
+
+test "journald: resolveSource explicit .file always picks file" {
+    // .file ignores every other input.
+    try testing.expectEqual(ResolvedSource.file, resolveSource(.file, false, true, true));
+    try testing.expectEqual(ResolvedSource.file, resolveSource(.file, false, false, false));
+    try testing.expectEqual(ResolvedSource.file, resolveSource(.file, true, false, true));
 }
 
-test "journald: resolveSource journald needs journalctl, else fails closed" {
-    try testing.expectEqual(ResolvedSource.journald, resolveSource(.journald, &.{}, true));
-    try testing.expectEqual(ResolvedSource.fail, resolveSource(.journald, &.{}, false));
+test "journald: resolveSource explicit .journald needs journalctl, else fails closed" {
+    try testing.expectEqual(ResolvedSource.journald, resolveSource(.journald, false, true, true));
+    try testing.expectEqual(ResolvedSource.fail, resolveSource(.journald, false, false, true));
+    // .journald is unaffected by the filter-support flag — that gate is
+    // for `auto` only; an explicit journald jail with a bad filter fails
+    // closed later, at addJail (UnsupportedJournaldFilter).
+    try testing.expectEqual(ResolvedSource.journald, resolveSource(.journald, false, true, false));
 }
 
-test "journald: resolveSource auto prefers a usable logpath" {
-    try testing.expectEqual(ResolvedSource.file, resolveSource(.auto, &.{"/var/log/auth.log"}, true));
-    try testing.expectEqual(ResolvedSource.file, resolveSource(.auto, &.{"/var/log/auth.log"}, false));
+test "journald: resolveSource auto with an EXISTING logpath picks file (SYS-015)" {
+    // Existence wins regardless of journalctl / filter support.
+    try testing.expectEqual(ResolvedSource.file, resolveSource(.auto, true, true, true));
+    try testing.expectEqual(ResolvedSource.file, resolveSource(.auto, true, false, true));
+    try testing.expectEqual(ResolvedSource.file, resolveSource(.auto, true, true, false));
 }
 
-test "journald: resolveSource auto falls back to journald, then fails closed" {
-    try testing.expectEqual(ResolvedSource.journald, resolveSource(.auto, &.{}, true));
-    try testing.expectEqual(ResolvedSource.journald, resolveSource(.auto, &.{""}, true));
-    try testing.expectEqual(ResolvedSource.fail, resolveSource(.auto, &.{}, false));
+test "journald: resolveSource auto with ABSENT log + sshd + journalctl picks journald (SYS-015)" {
+    // The reopened-bug case: shipped sshd jail, /var/log/auth.log absent on
+    // a journald-only box -> journald, not an inert file tail.
+    try testing.expectEqual(ResolvedSource.journald, resolveSource(.auto, false, true, true));
+}
+
+test "journald: resolveSource auto with ABSENT log + NON-sshd filter stays file (no fail-closed)" {
+    // The filter gate: an absent-log nginx jail must NOT route to journald
+    // (which would fail closed at wiring with UnsupportedJournaldFilter).
+    // It degrades to a file tail so the daemon still starts.
+    try testing.expectEqual(ResolvedSource.file, resolveSource(.auto, false, true, false));
+}
+
+test "journald: resolveSource auto with ABSENT log + sshd but NO journalctl stays file" {
+    // No journald available -> fall through to file (auto never fails closed).
+    try testing.expectEqual(ResolvedSource.file, resolveSource(.auto, false, false, true));
+    // And with neither journalctl nor filter support, still file.
+    try testing.expectEqual(ResolvedSource.file, resolveSource(.auto, false, false, false));
 }
 
 test "journald: selectorsForFilter returns the set for sshd, null otherwise" {
@@ -1006,6 +1049,17 @@ test "journald: selectorsForFilter returns the set for sshd, null otherwise" {
     try testing.expect(selectorsForFilter("") == null);
     // Not a prefix/substring match — must be exact.
     try testing.expect(selectorsForFilter("sshd-ddos") == null);
+}
+
+test "journald: config_mod.filterSupportsJournald stays in sync with selectorsForFilter" {
+    // The config layer's boolean gate (used by validate's would-use-journald
+    // warning) MUST agree with the authoritative selector table here. If a
+    // v2 filter gains journald selectors, this test forces both to move
+    // together.
+    const candidates = [_][]const u8{ "sshd", "nginx-http-auth", "apache-auth", "postfix", "dovecot", "", "sshd-ddos" };
+    for (candidates) |f| {
+        try testing.expectEqual(selectorsForFilter(f) != null, config_mod.filterSupportsJournald(f));
+    }
 }
 
 test "journald: addJail fails closed on an unsupported filter and does not register" {

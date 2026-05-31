@@ -1069,15 +1069,25 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         // SYS-015: resolve this jail's effective log source. `.file` keeps
         // the inotify tailer (and its late-appearance/rotation tolerance);
         // `.journald` reads the journal via the polled subprocess; `.fail`
-        // means a jail asked for journald/auto on a box with no usable log
-        // source at all — fail closed (don't run a jail that protects
-        // nothing). The journalctl probe is read-only (access X_OK), no
-        // spawn.
+        // means an EXPLICIT `source = journald` jail on a box without
+        // journalctl — fail closed (don't run a jail that protects nothing).
+        // `auto` never yields `.fail`: it degrades to a file tail instead.
+        // SYS-015 (reopened): `auto` is EXISTENCE-based, so the resolver
+        // needs to know whether a configured logpath is actually present on
+        // disk (stat here, keeping the resolver pure/fs-free) and whether
+        // this jail's filter has a journald selector set (sshd only in v1).
+        // The filter gate stops a non-sshd jail with an absent log from
+        // resolving to journald and then failing closed at wiring time.
+        // The journalctl probe is read-only (access X_OK), no spawn.
         const journalctl_present = config_mod.journalctlPresent();
+        const logpath_exists = config_mod.anyLogpathExists(jail_cfg.logpath);
+        const filter_journald_supported =
+            journald_source_mod.selectorsForFilter(jail_cfg.filter) != null;
         const resolved_source = journald_source_mod.resolveSource(
             jail_cfg.source,
-            jail_cfg.logpath,
+            logpath_exists,
             journalctl_present,
+            filter_journald_supported,
         );
         switch (resolved_source) {
             .file => {
