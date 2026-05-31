@@ -83,10 +83,11 @@ anything on disk. Pin a specific version with
   firewall operation. See
   [architecture/zero-dependencies](https://fail2zig.com/docs/architecture/zero-dependencies/)
   for why this matters and how we verify it.
-- **Hard memory ceiling.** Fixed allocators with a configurable cap (default
-  64 MB). Memory does not grow under sustained brute-force or DDoS
-  conditions — behavior at the ceiling is operator-defined via eviction
-  policy.
+- **Bounded under attack.** The IP state tracker is a fixed-capacity,
+  pre-allocated map sized from a configurable ceiling (`memory_ceiling_mb`,
+  default 64 MB) with an operator-defined eviction policy — so tracked state
+  does not grow under sustained brute-force or DDoS. The ceiling bounds
+  tracker capacity, not a hard per-component byte budget across every allocator.
 - **Comptime-generated parsers.** Built-in filter patterns compile into
   specialized match functions at build time. There is no regex engine in the
   process. Attacker-controlled input never reaches a Turing-complete matcher.
@@ -113,7 +114,7 @@ flowchart LR
     subgraph Daemon["fail2zig (root, CAP_NET_ADMIN + CAP_DAC_READ_SEARCH)"]
         LW["Log Watcher<br/>inotify + epoll<br/>rotation-aware"]
         PE["Parser Engine<br/>comptime filters<br/>zero-copy slices"]
-        ST["State Tracker<br/>fixed arena, 64 MB ceiling<br/>findtime · bantime increment"]
+        ST["State Tracker<br/>fixed-capacity map · sized from ceiling<br/>findtime · bantime increment"]
         BE["Ban Executor"]
         IPC["IPC Server<br/>Unix socket 0660<br/>SO_PEERCRED auth"]
         HTTP["HTTP Server<br/>127.0.0.1:9100<br/>/metrics · /events (WS)"]
@@ -172,8 +173,9 @@ config, then `systemctl enable --now fail2zig` when ready.
 - `x86_64-linux-musl` (879 KB stripped)
 - `aarch64-linux-musl` (801 KB stripped)
 
-`armv7-linux-musleabihf` and `mips-linux-musl` are tracked in SYS-009 and
-ship in a future release.
+`armv7-linux-musleabihf` now builds and is in the CI + release matrices (ships
+with the next release). `mips-linux-musl` is deferred — the Zig 0.14.1 toolchain
+cannot yet provide musl libc for that triple (SYS-013).
 
 ### Dry-run / inspect the installer
 
@@ -314,6 +316,9 @@ bantime_increment_max_bantime = 604800   # cap at 7 days
 [jails.sshd]
 enabled = true
 filter  = "sshd"
+# source = "auto" (the default) reads the systemd journal on modern minimal
+# systemd boxes where /var/log/auth.log is absent, and tails the files below
+# when they exist. Force it with source = "journald" or source = "file".
 logpath = ["/var/log/auth.log", "/var/log/secure"]
 
 [jails.nginx-botsearch]
