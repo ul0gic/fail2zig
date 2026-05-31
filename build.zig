@@ -2,9 +2,27 @@
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
 
+// Single source of truth for the binary version. Both the daemon and the
+// client read this through the generated `build_options` module
+// (`@import("build_options").version`) — no per-binary literals to drift.
+//
+// Keep in sync with `build.zig.zon`'s `.version` field (the package manifest
+// copy). The release-stamp step bumps both together; the version regression
+// test asserts the two binaries agree, so engine/client drift is impossible.
+// `.zon` can't be the in-process source here: Zig 0.14.x `@import` of a `.zon`
+// file requires a full result-type mirror of the manifest schema, which would
+// couple build.zig to the manifest's shape on an unrelated axis.
+const fail2zig_version = "0.2.0";
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    // Version surfaced to both binaries as `@import("build_options").version`.
+    // Wired into `engine_mod` and `client_mod` below; the test artifacts reuse
+    // those modules, so `engine_tests`/`client_tests` see it too.
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", fail2zig_version);
     const enable_bench = b.option(
         bool,
         "bench",
@@ -35,6 +53,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     engine_mod.addImport("shared", shared_mod);
+    engine_mod.addImport("build_options", build_options.createModule());
 
     const engine_exe = b.addExecutable(.{
         .name = "fail2zig",
@@ -54,6 +73,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     client_mod.addImport("shared", shared_mod);
+    client_mod.addImport("build_options", build_options.createModule());
 
     const client_exe = b.addExecutable(.{
         .name = "fail2zig-client",

@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const shared = @import("shared");
+const build_options = @import("build_options");
 
 const state_mod = @import("../core/state.zig");
 const tracker_map_mod = @import("../core/tracker_map.zig");
@@ -67,8 +68,11 @@ pub const Context = struct {
     /// so the status handler can report uptime as a whole number of
     /// seconds.
     start_time: i64 = 0,
-    /// Build version string; mirrored into responses.
-    version: []const u8 = "0.1.0",
+    /// Build version string; mirrored into responses. Defaults to the
+    /// build-injected single source of truth (`build_options.version`) so the
+    /// IPC response can never report a stale literal even before main.zig
+    /// explicitly wires it.
+    version: []const u8 = build_options.version,
 
     /// Entry point used by the IPC server. Matches the
     /// `CommandHandler.dispatch` function pointer signature.

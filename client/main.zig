@@ -13,13 +13,17 @@
 
 const std = @import("std");
 const shared = @import("shared");
+const build_options = @import("build_options");
 
 pub const args = @import("args.zig");
 pub const socket = @import("socket.zig");
 pub const format = @import("format.zig");
 pub const completions = @import("completions.zig");
 
-pub const client_version = "0.1.1";
+/// Client version. Single source of truth lives in `build.zig`
+/// (`fail2zig_version`), injected via the generated `build_options` module so
+/// the client and the daemon always report the same string.
+pub const client_version = build_options.version;
 
 pub const ExitCode = enum(u8) {
     success = 0,
@@ -297,7 +301,20 @@ test "client: --version exits 0 and prints client version" {
     defer testing.allocator.free(r.out);
     defer testing.allocator.free(r.err);
     try testing.expectEqual(ExitCode.success, r.code);
-    try testing.expect(std.mem.indexOf(u8, r.out, "fail2zig-client 0.1.1") != null);
+
+    // Assert against the build-injected version rather than a literal so this
+    // can never drift behind a release bump (the bug ISSUE-010 fixes).
+    const expected = "fail2zig-client " ++ build_options.version;
+    try testing.expect(std.mem.indexOf(u8, r.out, expected) != null);
+}
+
+test "client: client_version is the build-injected single source of truth" {
+    // Regression guard for ISSUE-010: the client must report exactly the
+    // version baked into the build, never a hand-maintained literal that can
+    // fall behind a release stamp. The engine asserts the matching identity
+    // (`version == build_options.version`) on its side, so both binaries are
+    // pinned to the same `build.zig` source — drift cannot silently return.
+    try testing.expectEqualStrings(build_options.version, client_version);
 }
 
 test "client: no args exits 2 with error about missing command" {
