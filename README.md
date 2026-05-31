@@ -68,7 +68,7 @@ The installer pulls from the
 [latest GitHub Release](https://github.com/ul0gic/fail2zig/releases/latest)
 and verifies every asset against the published `SHA256SUMS` before placing
 anything on disk. Pin a specific version with
-`FAIL2ZIG_VERSION=v0.1.1` or inspect the script first with
+`FAIL2ZIG_VERSION=v0.2.0` or inspect the script first with
 `curl -fsSL … | less`.
 
 ---
@@ -169,13 +169,13 @@ installs the hardened `fail2zig.service` unit under
 `/etc/systemd/system/`. It does **not** auto-start the daemon — audit the
 config, then `systemctl enable --now fail2zig` when ready.
 
-**Supported targets (v0.1.1):**
+**Supported targets (v0.2.0):**
 - `x86_64-linux-musl` (879 KB stripped)
 - `aarch64-linux-musl` (801 KB stripped)
+- `armv7-linux-musleabihf`
 
-`armv7-linux-musleabihf` now builds and is in the CI + release matrices (ships
-with the next release). `mips-linux-musl` is deferred — the Zig 0.14.1 toolchain
-cannot yet provide musl libc for that triple (SYS-013).
+`mips-linux-musl` is deferred — the Zig 0.14.1 toolchain cannot yet provide musl
+libc for that triple (SYS-013).
 
 ### Dry-run / inspect the installer
 
@@ -196,8 +196,8 @@ If you'd rather skip the script:
 
 ```bash
 # 1. Download the binary + manifest for your arch
-VERSION=v0.1.1
-ARCH=x86_64-linux-musl   # or aarch64-linux-musl
+VERSION=v0.2.0
+ARCH=x86_64-linux-musl   # or aarch64-linux-musl, armv7-linux-musleabihf
 curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/fail2zig-${VERSION}-${ARCH}"
 curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/fail2zig-client-${VERSION}-${ARCH}"
 curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/SHA256SUMS"
@@ -264,7 +264,7 @@ From a downloaded release (the same files are published alongside
 the binaries):
 
 ```bash
-VERSION=v0.1.1
+VERSION=v0.2.0
 for f in fail2zig.service fail2zig.socket fail2zig.toml.example; do
   curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/${f}"
 done

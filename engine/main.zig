@@ -67,7 +67,7 @@ pub const ipc_mod = @import("net/ipc.zig");
 pub const commands_mod = @import("net/commands.zig");
 const metrics_mod = @import("core/metrics.zig");
 
-pub const version = "0.1.1";
+pub const version = "0.2.0";
 
 // ============================================================================
 // CLI argument parsing
@@ -1558,7 +1558,7 @@ fn writeBansPayload(
 // ============================================================================
 
 test "engine: version constant" {
-    try std.testing.expectEqualStrings("0.1.1", version);
+    try std.testing.expectEqualStrings("0.2.0", version);
 }
 
 test "cli: default action is run" {
