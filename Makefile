@@ -80,7 +80,7 @@ harness-smoke: ## Run the lab-box attack smoke test (ssh_brute). Only useful on 
 	tests/harness/ssh_brute.sh
 
 lint: fmt-check ## Static analysis: zig fmt --check, shellcheck, yamllint
-	shellcheck -S warning tests/harness/*.sh scripts/install.sh
+	shellcheck -S warning tests/harness/*.sh tests/e2e/*.sh scripts/install.sh
 	yamllint -c .yamllint .github/workflows/
 
 docs-check: ## Run the documentation quality gate (owned by DOC team; 8.1.6)

@@ -14,6 +14,7 @@
 //! `nginx_http_auth`) to smooth over TOML key conventions.
 
 const std = @import("std");
+const parser = @import("../core/parser.zig");
 const types = @import("types.zig");
 const sshd = @import("sshd.zig");
 const nginx = @import("nginx.zig");
@@ -59,6 +60,46 @@ pub fn get(name: []const u8) ?[]const PatternDef {
         if (namesEqual(e.name, name)) return e.patterns;
     }
     return null;
+}
+
+/// Runtime matcher for one jail's configured filter (SYS-020).
+///
+/// Wraps a filter's already-compiled `PatternDef` slice (each carrying a
+/// comptime-generated, zero-allocation `parser.MatchFn`) and tries each
+/// pattern in declaration order — first match wins, exactly as the
+/// per-filter unit tests assert. No recompilation, no raw pattern strings,
+/// no heap state: the slice points into `.rodata` and `match` is pure slice
+/// arithmetic on the caller's buffer.
+///
+/// This is the production replacement for the old `Parser.init` default
+/// `<*><IP>` ("any line containing an IP"). The hot path resolves the
+/// jail's filter name to one of these once at jail construction; every
+/// subsequent line is matched against the CONFIGURED patterns.
+pub const FilterMatcher = struct {
+    patterns: []const PatternDef,
+
+    /// Try each configured pattern in order. Returns the first match's
+    /// `ParseResult` (IP + optional timestamp), or `null` when no pattern
+    /// matches. Zero allocation.
+    pub fn match(self: FilterMatcher, line: []const u8) ?parser.ParseResult {
+        for (self.patterns) |p| {
+            if (p.match(line)) |r| return r;
+        }
+        return null;
+    }
+
+    pub fn patternCount(self: FilterMatcher) usize {
+        return self.patterns.len;
+    }
+};
+
+/// Resolve a filter name to its runtime matcher (SYS-020). Accepts the same
+/// hyphen/underscore-insensitive names as `get`. Returns `null` for an
+/// unknown filter — the caller MUST fail closed (refuse to start the jail),
+/// NEVER fall back to a permissive default.
+pub fn matcherForFilter(name: []const u8) ?FilterMatcher {
+    const patterns = get(name) orelse return null;
+    return .{ .patterns = patterns };
 }
 
 /// Case-sensitive equality that treats `-` and `_` as identical.
@@ -156,6 +197,45 @@ test "registry: unknown filter returns null" {
     try testing.expect(get("nonexistent") == null);
     try testing.expect(get("") == null);
     try testing.expect(get("sshdx") == null);
+}
+
+test "registry: matcherForFilter resolves sshd and applies its patterns (SYS-020)" {
+    const m = matcherForFilter("sshd").?;
+    try testing.expect(m.patternCount() == sshd.patterns.len);
+
+    // Real sshd auth failures MUST match.
+    try testing.expect(m.match("Failed password for root from 1.2.3.4 port 22 ssh2") != null);
+    try testing.expect(m.match("Invalid user oracle from 203.0.113.5 port 22") != null);
+
+    // The sshd listener startup line MUST NOT match — the configured
+    // patterns never matched it (only the old `<*><IP>` default did).
+    try testing.expect(m.match("Server listening on 0.0.0.0 port 22.") == null);
+    try testing.expect(m.match("Server listening on :: port 22.") == null);
+
+    // Successful auth MUST NOT match.
+    try testing.expect(m.match("Accepted password for root from 1.2.3.4 port 22 ssh2") == null);
+    try testing.expect(m.match("Accepted publickey for root from 1.2.3.4 port 22 ssh2: RSA SHA256:x") == null);
+}
+
+test "registry: matcherForFilter accepts hyphen/underscore forms" {
+    try testing.expect(matcherForFilter("nginx-http-auth") != null);
+    try testing.expect(matcherForFilter("nginx_http_auth") != null);
+}
+
+test "registry: matcherForFilter fails closed on unknown filter (SYS-020)" {
+    // An unknown filter MUST yield null so the daemon can refuse to start
+    // the jail — never a permissive fallback.
+    try testing.expect(matcherForFilter("nonexistent") == null);
+    try testing.expect(matcherForFilter("") == null);
+    try testing.expect(matcherForFilter("custom-app") == null);
+}
+
+test "registry: FilterMatcher returns first-match result in declaration order" {
+    const m = matcherForFilter("sshd").?;
+    // "Failed password for ..." is the first pattern; its result carries
+    // the extracted offender IP.
+    const r = m.match("Failed password for admin from 10.0.0.1 port 22 ssh2").?;
+    try testing.expectEqual(@as(u32, 0x0A000001), r.ip.ipv4);
 }
 
 test "registry: listFilters writes all names" {

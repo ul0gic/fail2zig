@@ -6,24 +6,27 @@
 //!   1. Parse CLI args (--config, --version, --help, --test-config,
 //!      --foreground, --import-config).
 //!   2. Load + validate config.
-//!   3. Build the memory pool from the config ceiling.
-//!   4. Detect the firewall backend (or fail closed if none available).
-//!   5. Initialize the state tracker; seed it from the persisted state
+//!   3. Detect the firewall backend (or fail closed if none available).
+//!   4. Initialize the state tracker; seed it from the persisted state
 //!      file if present.
-//!   6. For each enabled jail, wire a `Parser` + `LogWatcher` per
+//!   5. For each enabled jail, resolve its configured filter to a
+//!      `FilterMatcher` and wire a `LogWatcher` (or journald source) per
 //!      `logpath`, with a static line callback that routes matches
 //!      through the state tracker and on ban decisions into the
 //!      firewall backend.
-//!   7. Install signal handlers (SIGTERM/SIGINT save state + exit,
+//!   6. Install signal handlers (SIGTERM/SIGINT save state + exit,
 //!      SIGHUP logs "reload not yet implemented").
-//!   8. Arm a 1s periodic timer that scans for expired bans and calls
+//!   7. Arm a 1s periodic timer that scans for expired bans and calls
 //!      `backend.unban` for each.
-//!   9. Enter the event loop until stopped.
+//!   8. Enter the event loop until stopped.
 //!
-//! Every allocating step is backed by either the memory pool (per
-//! component) or a process-lifetime arena (for config strings and
-//! per-jail contexts). The steady-state hot path — log line → parse →
-//! state update → (maybe) ban — is allocation-free on the happy path.
+//! The steady-state hot path — log line → match → state update →
+//! (maybe) ban — is allocation-free on the happy path: the matcher
+//! operates on slices of the caller's buffer and the per-jail state
+//! tracker is a fixed-capacity map sized at startup. Per-component
+//! memory-ceiling enforcement (the `MemoryPool` scaffolding in
+//! `core/memory.zig`) is not yet wired to a live consumer — tracked
+//! separately.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -39,6 +42,7 @@ const allocator_mod = @import("core/allocator.zig");
 const memory_mod = @import("core/memory.zig");
 pub const event_loop_mod = @import("core/event_loop.zig");
 const log_watcher_mod = @import("core/log_watcher.zig");
+pub const journald_source_mod = @import("core/journald_source.zig");
 const line_buffer_mod = @import("core/line_buffer.zig");
 const logger_mod = @import("core/logger.zig");
 const parser_mod = @import("core/parser.zig");
@@ -63,7 +67,7 @@ pub const ipc_mod = @import("net/ipc.zig");
 pub const commands_mod = @import("net/commands.zig");
 const metrics_mod = @import("core/metrics.zig");
 
-pub const version = "0.1.1";
+pub const version = "0.2.0";
 
 // ============================================================================
 // CLI argument parsing
@@ -204,12 +208,32 @@ pub fn runImport(
 
 const JailContext = struct {
     jail: shared.JailId,
-    parser: parser_mod.Parser,
+    /// Runtime matcher for THIS jail's configured filter (SYS-020). Built
+    /// once at construction from `jail.filter` via
+    /// `filter_registry_mod.matcherForFilter`, which resolves the filter
+    /// name to its comptime-compiled pattern set. This REPLACES the old
+    /// permissive `Parser.init` default (`<*><IP>` — "any line containing
+    /// an IP"), which matched benign IP-bearing lines (sshd's
+    /// `Server listening on 0.0.0.0 port 22`, successful logins) and caused
+    /// false bans. Both the file tailer and the journald source route
+    /// through `lineCallback`, so both resolve to the SAME configured
+    /// matcher for a given jail. A jail whose filter has no builtin matcher
+    /// fails closed at construction (never reaches here with a default).
+    matcher: filter_registry_mod.FilterMatcher,
     /// Per-jail state tracker (ISSUE-007). Each jail's tracker carries
     /// its own resolved `maxretry`/`findtime`/`bantime` so per-jail
     /// overrides actually take effect.
     state: *state_mod.StateTracker,
     backend_ptr: *firewall.Backend,
+    /// Resolved ban action for THIS jail (SYS-016). Drives ban dispatch:
+    /// `.@"log-only"` records the ban intent (would-ban log line + bans
+    /// metric) but skips the firewall mutation AND the `ip_banned` event;
+    /// every other value enforces through `backend_ptr` and emits the
+    /// event. Resolved once at context construction via
+    /// `config_mod.resolveJailFromConfig` so the per-jail-vs-defaults rule
+    /// isn't reimplemented here. Defaults to `.nftables` (the schema
+    /// default) so a context built without this field still enforces.
+    banaction: config_mod.BanAction = .nftables,
     /// Metrics is nullable for tests that don't care about counters —
     /// the daemon always supplies a real pointer.
     metrics: ?*metrics_mod.Metrics = null,
@@ -226,12 +250,102 @@ const JailContext = struct {
     /// Current wall-clock is read at callback time; stored here so tests
     /// can override it. In production this stays at null.
     now_override: ?shared.Timestamp = null,
+    /// Test seam (SYS-016). When non-null, the enforcing dispatch path
+    /// calls this instead of `backend_ptr.ban`, letting tests observe
+    /// whether enforcement was invoked without a real kernel/firewall.
+    /// In production this stays null and the real backend is called.
+    /// Mirrors the `now_override` test-seam idiom already used here.
+    ban_hook: ?*const fn (
+        userdata: ?*anyopaque,
+        ip: shared.IpAddress,
+        jail: shared.JailId,
+        duration: shared.Duration,
+    ) firewall.BackendError!void = null,
+    /// Opaque userdata handed to `ban_hook` (e.g. a call-count spy).
+    ban_hook_ctx: ?*anyopaque = null,
 
     fn now(self: *const JailContext) shared.Timestamp {
         if (self.now_override) |t| return t;
         return std.time.timestamp();
     }
+
+    /// Enforce a ban through the configured backend, honoring the test
+    /// seam when present. Returns the backend error unchanged so callers
+    /// keep their existing error handling.
+    fn enforceBan(
+        self: *JailContext,
+        ip: shared.IpAddress,
+        jail: shared.JailId,
+        duration: shared.Duration,
+    ) firewall.BackendError!void {
+        if (self.ban_hook) |hook| {
+            return hook(self.ban_hook_ctx, ip, jail, duration);
+        }
+        return self.backend_ptr.ban(ip, jail, duration);
+    }
 };
+
+/// Dispatch a ban decision (SYS-016). Honors the jail's resolved
+/// `banaction`:
+///
+///   * `.@"log-only"` — record the ban INTENT only: log a "would-ban"
+///     line and increment the bans counter so the operator can see the
+///     jail is doing its job, but DO NOT mutate the firewall and DO NOT
+///     emit the `ip_banned` WS event. That event asserts the IP was
+///     actually banned; emitting it for a log-only jail would be a lie —
+///     the same dishonesty (claiming an enforcement that didn't happen)
+///     this fix exists to remove. Honest audit/monitoring mode.
+///   * everything else — a real ban. Enforce through the backend first;
+///     on backend error, warn and return BEFORE incrementing metrics /
+///     broadcasting (preserving the original ordering) so a failed
+///     enforcement is not counted as a successful ban. Then broadcast the
+///     honest `ip_banned` event.
+///
+/// Extracted from `lineCallback` so the branch is unit-testable.
+fn dispatchBan(ctx: *JailContext, d: state_mod.BanDecision) void {
+    if (ctx.banaction == .@"log-only") {
+        // Audit mode: record intent, touch nothing.
+        std.log.info(
+            "would-ban: jail='{s}' ip={} duration={d}s ban_count={d} action=log-only",
+            .{ ctx.jail.slice(), d.ip, d.duration, d.ban_count },
+        );
+        if (ctx.metrics) |m| {
+            m.incrementBans();
+            m.jailIncrementBans(ctx.jail.slice());
+        }
+        // Deliberately NO broadcastBanned() here: no firewall mutation
+        // occurred, so an `ip_banned` event would misrepresent reality.
+        return;
+    }
+
+    // Enforcing path — a real ban.
+    std.log.info(
+        "ban: jail='{s}' ip={} duration={d}s ban_count={d} action={s}",
+        .{ ctx.jail.slice(), d.ip, d.duration, d.ban_count, @tagName(ctx.banaction) },
+    );
+    ctx.enforceBan(d.ip, d.jail, d.duration) catch |err| {
+        std.log.warn(
+            "backend: ban failed for ip={} jail='{s}': {s}",
+            .{ d.ip, ctx.jail.slice(), @errorName(err) },
+        );
+        return;
+    };
+    if (ctx.metrics) |m| {
+        m.incrementBans();
+        m.jailIncrementBans(ctx.jail.slice());
+    }
+    // Broadcast `ip_banned` after the kernel ban is confirmed.
+    if (ctx.ws) |ws_server| {
+        if (ctx.ws_alloc) |a| {
+            var ip_buf: [64]u8 = undefined;
+            if (std.fmt.bufPrint(&ip_buf, "{}", .{d.ip})) |ip_str| {
+                ws_server.broadcastBanned(a, ip_str, ctx.jail.slice(), d.duration) catch |err| {
+                    std.log.warn("ws: broadcastBanned failed: {s}", .{@errorName(err)});
+                };
+            } else |_| {}
+        }
+    }
+}
 
 fn lineCallback(
     line: []const u8,
@@ -260,13 +374,35 @@ fn lineCallback(
     // inputs (e.g. journalctl-piped lines where the prefix is absent).
     const body = parser_mod.stripSyslogPrefix(line);
 
-    const result = ctx.parser.parseLine(body) catch {
+    // SYS-020: match against THIS jail's CONFIGURED filter patterns, not a
+    // permissive default. A non-matching line is the common case (most log
+    // lines are not auth failures) — no count, no ban. `incrementParseErrors`
+    // is misnamed for "no match" but is the existing counter for "a line we
+    // saw but did not act on"; keep using it so metrics stay continuous.
+    const result = ctx.matcher.match(body) orelse {
         if (ctx.metrics) |m| {
             m.incrementParseErrors();
             m.jailIncrementParseErrors(ctx.jail.slice());
         }
         return;
     };
+
+    // SYS-020 defense-in-depth: even a matched line may carry an
+    // unenforceable IP (the unspecified `0.0.0.0` / `::` a listener logs on
+    // start, or loopback). Banning these is noise at best, self-DoS at
+    // worst. Drop the match here — at the record boundary, so this rail
+    // protects EVERY matcher, not just sshd. We never coerce a missing IP
+    // to zero; extraction returns no match instead, so this only fires when
+    // a real-but-unenforceable token was parsed.
+    if (result.ip.isUnenforceable()) {
+        @branchHint(.unlikely);
+        std.log.debug(
+            "skip: jail='{s}' matched but ip={} is unenforceable (unspecified/loopback) — ignoring",
+            .{ ctx.jail.slice(), result.ip },
+        );
+        return;
+    }
+
     if (ctx.metrics) |m| {
         m.incrementMatched();
         m.jailIncrementMatched(ctx.jail.slice());
@@ -322,32 +458,7 @@ fn lineCallback(
         return;
     };
     if (decision) |d| {
-        std.log.info(
-            "ban: jail='{s}' ip={} duration={d}s ban_count={d}",
-            .{ ctx.jail.slice(), d.ip, d.duration, d.ban_count },
-        );
-        ctx.backend_ptr.ban(d.ip, d.jail, d.duration) catch |err| {
-            std.log.warn(
-                "backend: ban failed for ip={} jail='{s}': {s}",
-                .{ d.ip, ctx.jail.slice(), @errorName(err) },
-            );
-            return;
-        };
-        if (ctx.metrics) |m| {
-            m.incrementBans();
-            m.jailIncrementBans(ctx.jail.slice());
-        }
-        // Broadcast `ip_banned` after the kernel ban is confirmed.
-        if (ctx.ws) |ws_server| {
-            if (ctx.ws_alloc) |a| {
-                var ip_buf: [64]u8 = undefined;
-                if (std.fmt.bufPrint(&ip_buf, "{}", .{d.ip})) |ip_str| {
-                    ws_server.broadcastBanned(a, ip_str, ctx.jail.slice(), d.duration) catch |err| {
-                        std.log.warn("ws: broadcastBanned failed: {s}", .{@errorName(err)});
-                    };
-                } else |_| {}
-            }
-        }
+        dispatchBan(ctx, d);
     }
 }
 
@@ -515,17 +626,66 @@ const SignalContext = struct {
     /// load+route on next start rehydrates the right tracker.
     trackers: *tracker_map_mod.TrackerMap,
     state_path: []const u8,
+    /// journald source (SYS-015). Null when no jail reads the journal.
+    /// Its cursor sidecar is flushed AFTER engine state — see
+    /// `flushStateThenCursors`.
+    journald: ?*journald_source_mod.JournaldSource = null,
     save_requested: bool = false,
 };
+
+/// Persist engine state, THEN the journald cursor sidecar — ordering is
+/// load-bearing (SYS-015 Lead decision 2). State must hit disk before the
+/// cursor so a crash between the two writes leaves the cursor OLDER than
+/// the state: the next start replays ≤1 poll interval of already-counted
+/// entries (safe at-least-once) and NEVER skips entries. Reversing the
+/// order would risk advancing the cursor past entries whose ban-state
+/// updates were lost. Both writes are best-effort: a failure is logged,
+/// never fatal.
+fn flushStateThenCursors(
+    trackers: *tracker_map_mod.TrackerMap,
+    state_path: []const u8,
+    journald: ?*journald_source_mod.JournaldSource,
+) void {
+    persist_mod.saveAll(trackers, state_path) catch |err| {
+        std.log.warn("persist: state save failed: {s}", .{@errorName(err)});
+    };
+    if (journald) |jd| {
+        if (jd.hasJails()) {
+            var buf: [journald_source_mod.max_jails]journald_source_mod.CursorEntry = undefined;
+            const cursors = jd.collectCursors(&buf);
+            journald_source_mod.saveCursors(cursors, jd.cursor_path) catch |err| {
+                std.log.warn("journald: cursor sidecar save failed: {s}", .{@errorName(err)});
+            };
+        }
+    }
+}
+
+/// Context for the journald periodic-flush hook (SYS-015 Change 2).
+/// Lives on `runDaemon`'s stack across `loop.run()`. The hook is invoked
+/// by `JournaldSource.maybeFlush` after any poll tick that advanced a
+/// cursor, so state + cursors are durable within ≤1 poll interval of the
+/// entries they reflect (without a separate flush timer).
+const JournaldFlushContext = struct {
+    trackers: *tracker_map_mod.TrackerMap,
+    state_path: []const u8,
+    journald: *journald_source_mod.JournaldSource,
+};
+
+/// JournaldSource flush hook. Casts userdata → `*JournaldFlushContext` and
+/// delegates to `flushStateThenCursors`, which enforces the load-bearing
+/// state-first / cursor-second ordering. Single-threaded loop: this runs
+/// on the loop thread inside `pollTick` and never re-enters the poller.
+fn journaldFlushHook(userdata: ?*anyopaque) void {
+    const ctx: *JournaldFlushContext = @ptrCast(@alignCast(userdata.?));
+    flushStateThenCursors(ctx.trackers, ctx.state_path, ctx.journald);
+}
 
 fn onTerminate(siginfo: *const linux.signalfd_siginfo, userdata: ?*anyopaque) void {
     _ = siginfo;
     const ctx: *SignalContext = @ptrCast(@alignCast(userdata.?));
     ctx.save_requested = true;
     std.log.info("signal: termination requested, saving state and shutting down", .{});
-    persist_mod.saveAll(ctx.trackers, ctx.state_path) catch |err| {
-        std.log.warn("persist: save failed on shutdown: {s}", .{@errorName(err)});
-    };
+    flushStateThenCursors(ctx.trackers, ctx.state_path, ctx.journald);
     ctx.loop.stop();
 }
 
@@ -586,25 +746,6 @@ fn deriveLegacyTrackerConfig(cfg: *const config_mod.Config, max_entries: u32) st
         .bantime = d.bantime,
         .bantime_increment = translateBanTimeIncrement(d.bantime_increment),
         .eviction_policy = .drop_oldest_unbanned,
-    };
-}
-
-fn deriveMemoryConfig(cfg: *const config_mod.Config) memory_mod.MemoryConfig {
-    // Scale each component proportionally to the ceiling. The default
-    // schema (64MB) matches memory_mod's defaults exactly.
-    const ceiling_bytes: usize = @as(usize, cfg.global.memory_ceiling_mb) * memory_mod.one_mb;
-    // Shares: state 50%, parser 6%, event 2%, log 12%. Sum = 70%.
-    // Leftover 30% is headroom (future components, fragmentation safety).
-    const state_bytes = ceiling_bytes / 2;
-    const parser_bytes = @max(@as(usize, 1) * memory_mod.one_mb, ceiling_bytes / 16);
-    const event_bytes = @max(@as(usize, 512 * 1024), ceiling_bytes / 64);
-    const log_bytes = @max(@as(usize, 2) * memory_mod.one_mb, ceiling_bytes / 8);
-    return .{
-        .state_tracker_bytes = state_bytes,
-        .parser_buffer_bytes = parser_bytes,
-        .event_queue_bytes = event_bytes,
-        .log_buffer_bytes = log_bytes,
-        .total_ceiling_bytes = ceiling_bytes,
     };
 }
 
@@ -711,14 +852,6 @@ fn reconcileBanApply(
 }
 
 fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
-    // Memory pool.
-    const mem_cfg = deriveMemoryConfig(cfg);
-    var pool = memory_mod.MemoryPool.init(mem_cfg) catch |err| {
-        std.log.err("memory: pool init failed: {s}", .{@errorName(err)});
-        return err;
-    };
-    defer pool.deinit();
-
     // Metrics (atomic counters). Cheap; construct before anything that
     // increments them.
     var metrics = metrics_mod.Metrics.init();
@@ -755,7 +888,13 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         if (jc.enabled) enabled_count += 1;
     }
     const tracker_count: u32 = @max(1, enabled_count + 1);
-    const per_tracker_bytes: usize = mem_cfg.state_tracker_bytes / tracker_count;
+    // State-tracker share of the configured ceiling: half the ceiling, split
+    // evenly across trackers. This is the SAME value the (now-removed)
+    // MemoryPool config used for `state_tracker_bytes` — kept inline so
+    // tracker capacity sizing is byte-for-byte unchanged. It sizes the
+    // tracker HashMaps' entry counts only; it is not an allocator budget.
+    const state_tracker_bytes: usize = (@as(usize, cfg.global.memory_ceiling_mb) * memory_mod.one_mb) / 2;
+    const per_tracker_bytes: usize = state_tracker_bytes / tracker_count;
     const per_tracker_capacity = state_mod.capacityFromBudget(per_tracker_bytes);
 
     // Install one tracker per enabled jail. Per-jail ignoreip resolves
@@ -853,6 +992,26 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     defer watcher.deinit();
     try watcher.attach();
 
+    // journald log source (SYS-015). Sibling of the file watcher: a jail
+    // whose source resolves to `journald` reads the systemd journal via a
+    // polled `journalctl -o json` subprocess instead of an inotify file
+    // tail. The timer is armed only if at least one jail uses it.
+    var journald = journald_source_mod.JournaldSource.init(heap, &loop, cfg.global.state_file) catch |err| {
+        std.log.err("journald: init failed: {s}", .{@errorName(err)});
+        return err;
+    };
+    defer journald.deinit();
+
+    // Flush context for the journald periodic-flush hook. Declared at
+    // function scope so it outlives `loop.run()` — the hook captures its
+    // address and fires from inside `pollTick`. Wired into `journald` only
+    // when the source is actually in use (after the per-jail loop below).
+    var journald_flush_ctx = JournaldFlushContext{
+        .trackers = &trackers,
+        .state_path = cfg.global.state_file,
+        .journald = &journald,
+    };
+
     // Per-jail contexts. Heap-allocated so their pointers remain stable
     // across the event loop lifetime (the watcher's userdata field holds
     // these pointers).
@@ -878,26 +1037,139 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
             );
             continue;
         };
+        // SYS-020: resolve this jail's CONFIGURED filter to its runtime
+        // matcher BEFORE allocating anything. A filter with no builtin
+        // matcher must fail closed — refuse to start, NEVER fall back to a
+        // permissive default that bans benign IP-bearing lines. This is the
+        // file-path equivalent of the journald source's
+        // `error.UnsupportedJournaldFilter`; resolving here covers BOTH
+        // sources (file + journald share `lineCallback`/`JailContext`).
+        const jail_matcher = filter_registry_mod.matcherForFilter(jail_cfg.filter) orelse {
+            std.log.err(
+                "jail '{s}' uses filter '{s}', which has no builtin matcher — refusing to start (fail2zig will not run a jail with no patterns, as that would ban any line containing an IP). Use a supported builtin filter or remove the jail.",
+                .{ jail_cfg.name, jail_cfg.filter },
+            );
+            return error.UnsupportedFilter;
+        };
+        // Resolve this jail's effective ban action (SYS-016). Same
+        // per-jail-vs-defaults rule used for the tracker config above;
+        // `resolveJailFromConfig` is the single source of that rule.
+        const resolved = config_mod.resolveJailFromConfig(&jail_cfg, cfg.defaults);
         const ctx = try heap.create(JailContext);
         ctx.* = .{
             .jail = jail,
-            .parser = parser_mod.Parser.init(pool.allocator(.parser_buffer)),
+            .matcher = jail_matcher,
             .state = tracker_ptr,
             .backend_ptr = &backend_val,
+            .banaction = resolved.banaction,
             .metrics = &metrics,
         };
         try contexts.append(ctx);
 
-        for (jail_cfg.logpath) |lp| {
-            watcher.watchFile(lp, jail, lineCallback, ctx) catch |err| {
-                std.log.warn(
-                    "log_watcher: watchFile '{s}' (jail '{s}') failed: {s}",
-                    .{ lp, jail_cfg.name, @errorName(err) },
+        // SYS-015: resolve this jail's effective log source. `.file` keeps
+        // the inotify tailer (and its late-appearance/rotation tolerance);
+        // `.journald` reads the journal via the polled subprocess; `.fail`
+        // means an EXPLICIT `source = journald` jail on a box without
+        // journalctl — fail closed (don't run a jail that protects nothing).
+        // `auto` never yields `.fail`: it degrades to a file tail instead.
+        // SYS-015 (reopened): `auto` is EXISTENCE-based, so the resolver
+        // needs to know whether a configured logpath is actually present on
+        // disk (stat here, keeping the resolver pure/fs-free) and whether
+        // this jail's filter has a journald selector set (sshd only in v1).
+        // The filter gate stops a non-sshd jail with an absent log from
+        // resolving to journald and then failing closed at wiring time.
+        // The journalctl probe is read-only (access X_OK), no spawn.
+        const journalctl_present = config_mod.journalctlPresent();
+        const logpath_exists = config_mod.anyLogpathExists(jail_cfg.logpath);
+        const filter_journald_supported =
+            journald_source_mod.selectorsForFilter(jail_cfg.filter) != null;
+        const resolved_source = journald_source_mod.resolveSource(
+            jail_cfg.source,
+            logpath_exists,
+            journalctl_present,
+            filter_journald_supported,
+        );
+        switch (resolved_source) {
+            .file => {
+                for (jail_cfg.logpath) |lp| {
+                    watcher.watchFile(lp, jail, lineCallback, ctx) catch |err| {
+                        std.log.warn(
+                            "log_watcher: watchFile '{s}' (jail '{s}') failed: {s}",
+                            .{ lp, jail_cfg.name, @errorName(err) },
+                        );
+                        continue;
+                    };
+                }
+                std.log.info(
+                    "jail: enabled '{s}' source=file ({d} logpath(s))",
+                    .{ jail_cfg.name, jail_cfg.logpath.len },
                 );
-                continue;
-            };
+            },
+            .journald => {
+                journald.addJail(jail, jail_cfg.filter, lineCallback, ctx) catch |err| switch (err) {
+                    // v1 journald supports the `sshd` filter only. A jail
+                    // asking for journald with any other filter would get
+                    // sshd selectors silently mis-applied — fail closed
+                    // with a message that tells the operator exactly how to
+                    // fix it, and refuse to start.
+                    error.UnsupportedJournaldFilter => {
+                        std.log.err(
+                            "journald source supports only the \"sshd\" filter in v1; jail '{s}' uses filter '{s}' — refusing to start (use source=file with a text logpath, or remove the jail)",
+                            .{ jail_cfg.name, jail_cfg.filter },
+                        );
+                        return err;
+                    },
+                    else => {
+                        std.log.err(
+                            "journald: addJail '{s}' failed: {s}",
+                            .{ jail_cfg.name, @errorName(err) },
+                        );
+                        return err;
+                    },
+                };
+                std.log.info(
+                    "jail: enabled '{s}' source=journald (filter '{s}')",
+                    .{ jail_cfg.name, jail_cfg.filter },
+                );
+            },
+            .fail => {
+                std.log.err(
+                    "jail '{s}' has no usable log source (source={s}, logpath={d}, journalctl={}); refusing to run a jail that protects nothing",
+                    .{ jail_cfg.name, @tagName(jail_cfg.source), jail_cfg.logpath.len, journalctl_present },
+                );
+                return error.JailHasNoUsableSource;
+            },
         }
-        std.log.info("jail: enabled '{s}' ({d} logpath(s))", .{ jail_cfg.name, jail_cfg.logpath.len });
+    }
+
+    // Seed journald cursors from the sidecar and arm the poll timer, but
+    // only if at least one jail actually reads the journal. Cursor restore
+    // failure is non-fatal — a jail with no restored cursor baselines at
+    // "now" on its first tick (no history replay).
+    if (journald.hasJails()) {
+        if (journald_source_mod.loadCursors(heap, journald.cursor_path)) |cursors| {
+            defer {
+                for (cursors) |c| {
+                    heap.free(c.name);
+                    heap.free(c.cursor);
+                }
+                heap.free(cursors);
+            }
+            for (cursors) |c| journald.seedCursor(c.name, c.cursor);
+            if (cursors.len > 0) {
+                std.log.info("journald: restored {d} cursor(s) from sidecar", .{cursors.len});
+            }
+        } else |err| {
+            std.log.warn("journald: cursor restore failed: {s}; baselining at now", .{@errorName(err)});
+        }
+        // Install the periodic-flush hook BEFORE arming the timer, so the
+        // first dirty tick can persist state + cursors (SYS-015 Change 2).
+        journald.setFlushHook(journaldFlushHook, &journald_flush_ctx);
+        journald.attach() catch |err| {
+            std.log.err("journald: attach (poll timer) failed: {s}", .{@errorName(err)});
+            return err;
+        };
+        std.log.info("journald: polling {d} jail(s) every {d}ms", .{ journald.jailCount(), journald_source_mod.poll_interval_ms });
     }
 
     // IPC command handler context. Must outlive the IpcServer and HTTP
@@ -984,6 +1256,7 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         .loop = &loop,
         .trackers = &trackers,
         .state_path = cfg.global.state_file,
+        .journald = &journald,
     };
     try loop.addSignalHandler(linux.SIG.TERM, onTerminate, &sig_ctx);
     try loop.addSignalHandler(linux.SIG.INT, onTerminate, &sig_ctx);
@@ -1023,8 +1296,10 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
 
     try loop.run();
 
-    // Final state save on clean shutdown (best-effort; ignore errors).
-    persist_mod.saveAll(&trackers, cfg.global.state_file) catch {};
+    // Final flush on clean shutdown (best-effort): engine state first,
+    // then the journald cursor sidecar (ordering is load-bearing — see
+    // `flushStateThenCursors`).
+    flushStateThenCursors(&trackers, cfg.global.state_file, &journald);
 
     // Explicit teardown order: close IPC/HTTP/WS first so their FDs are
     // no longer registered with the loop when `loop.deinit` runs below
@@ -1038,11 +1313,20 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
 // Service helpers
 // ============================================================================
 
-/// Ensure the parent directory of `socket_path` exists. Created with
-/// mode 0710 so the root user can write and members of the fail2zig
-/// group can traverse it (to reach the socket file itself). On
-/// AlreadyExists this is a no-op — any other error is surfaced because
-/// it would prevent `bind(2)` from succeeding later.
+/// Ensure the parent directory of `socket_path` exists, mode 0750 (owner
+/// rwx, group r-x, other none). Group OWNERSHIP is deliberately NOT set
+/// here (SYS-019): under the shipped systemd unit, `RuntimeDirectory=
+/// fail2zig` + `Group=fail2zig` create `/run/fail2zig` as `root:fail2zig`
+/// and the socket inherits the `fail2zig` group from the daemon's egid —
+/// no chown needed. A daemon-side chown would be a `@privileged` syscall
+/// the hardened unit's seccomp filter (`~@privileged`) kills with SIGSYS,
+/// and CAP_CHOWN is not in the unit's bounding set, so it could not
+/// succeed even if permitted. For bare `--config` runs (no systemd) the
+/// dir/socket are `root:root` and only root may use the IPC socket — the
+/// correct least-privilege default. makeDir errors other than
+/// AlreadyExists are surfaced (they would block `bind(2)`); a chmod
+/// failure is non-fatal — bind() still works as long as the daemon (root)
+/// can traverse the dir.
 fn ensureSocketDir(socket_path: []const u8) !void {
     const dir = std.fs.path.dirname(socket_path) orelse return;
     std.fs.cwd().makeDir(dir) catch |err| switch (err) {
@@ -1055,11 +1339,12 @@ fn ensureSocketDir(socket_path: []const u8) !void {
             return err;
         },
     };
-    // Best-effort chmod to 0710 — root/rw, group/x, other/none. If
-    // chmod fails (e.g. the directory is not owned by us), log and
-    // continue; the bind() still works if the parent is at least
-    // traversable by the daemon.
-    std.posix.fchmodat(std.posix.AT.FDCWD, dir, 0o710, 0) catch |err| {
+
+    // Mode 0750 — owner rwx, group r-x, other none. Group members need
+    // `x` to traverse into the dir and `r` to resolve the socket path.
+    // Best-effort: if chmod fails (e.g. not owned by us), log and
+    // continue; bind() still works if the daemon can traverse.
+    std.posix.fchmodat(std.posix.AT.FDCWD, dir, 0o750, 0) catch |err| {
         std.log.warn(
             "ipc: chmod of socket parent dir '{s}' failed: {s}",
             .{ dir, @errorName(err) },
@@ -1273,7 +1558,7 @@ fn writeBansPayload(
 // ============================================================================
 
 test "engine: version constant" {
-    try std.testing.expectEqualStrings("0.1.1", version);
+    try std.testing.expectEqualStrings("0.2.0", version);
 }
 
 test "cli: default action is run" {
@@ -1470,19 +1755,6 @@ test "cli: runImport returns 2 on unreadable source dir" {
     try std.testing.expectEqual(@as(u8, 2), rc);
 }
 
-test "main: deriveMemoryConfig splits ceiling sensibly" {
-    const cfg: config_mod.Config = .{
-        .global = .{ .memory_ceiling_mb = 64 },
-        .defaults = .{},
-        .jails = &.{},
-        .diag = .{},
-    };
-    const m = deriveMemoryConfig(&cfg);
-    try std.testing.expect(m.total_ceiling_bytes == 64 * memory_mod.one_mb);
-    try std.testing.expect(m.state_tracker_bytes >= m.parser_buffer_bytes);
-    try m.validate();
-}
-
 test "main: deriveJailTrackerConfig uses resolved per-jail values" {
     // ISSUE-007: the tracker config for a jail now reflects its
     // resolved thresholds (jail value if set, else defaults).
@@ -1507,6 +1779,369 @@ test "main: deriveJailTrackerConfig uses resolved per-jail values" {
     try std.testing.expectEqual(@as(shared.Duration, 30), t.bantime);
     try std.testing.expectEqual(@as(shared.Duration, 10), t.findtime);
     try std.testing.expectEqual(@as(u32, 1), t.maxretry);
+}
+
+// ---------- SYS-016: banaction honored at ban dispatch ----------
+//
+// These exercise `dispatchBan` directly with a real `BanDecision`
+// (produced by a real `StateTracker` crossing its threshold) and a spy
+// in place of the firewall backend. The spy lets us assert whether the
+// enforcing `ban` path was invoked WITHOUT a real kernel/firewall — the
+// core of the bug was that a `log-only` jail still mutated the firewall.
+
+/// Counts calls to the ban hook. The hook signature matches
+/// `JailContext.ban_hook`; the spy never touches the kernel.
+const BanSpy = struct {
+    calls: u32 = 0,
+    last_ip: ?shared.IpAddress = null,
+
+    fn ban(
+        userdata: ?*anyopaque,
+        ip: shared.IpAddress,
+        jail: shared.JailId,
+        duration: shared.Duration,
+    ) firewall.BackendError!void {
+        _ = jail;
+        _ = duration;
+        const self: *BanSpy = @ptrCast(@alignCast(userdata.?));
+        self.calls += 1;
+        self.last_ip = ip;
+    }
+};
+
+/// Build a JailContext wired to a spy + metrics for dispatch tests.
+/// `backend_ptr` is required by the struct but is never dereferenced
+/// because the spy hook short-circuits the enforcing call.
+fn makeDispatchTestCtx(
+    jail: shared.JailId,
+    tracker: *state_mod.StateTracker,
+    backend: *firewall.Backend,
+    metrics: *metrics_mod.Metrics,
+    spy: *BanSpy,
+    action: config_mod.BanAction,
+) JailContext {
+    return .{
+        .jail = jail,
+        .matcher = undefined, // dispatchBan never reads the matcher
+        .state = tracker,
+        .backend_ptr = backend,
+        .banaction = action,
+        .metrics = metrics,
+        .ban_hook = BanSpy.ban,
+        .ban_hook_ctx = spy,
+    };
+}
+
+/// Drive a tracker across its `maxretry` threshold and return the
+/// resulting decision. Asserts a decision actually fired.
+fn produceDecision(
+    tracker: *state_mod.StateTracker,
+    ip: shared.IpAddress,
+    jail: shared.JailId,
+) !state_mod.BanDecision {
+    try testing.expect((try tracker.recordAttempt(ip, jail, 1_000)) == null);
+    try testing.expect((try tracker.recordAttempt(ip, jail, 1_100)) == null);
+    return (try tracker.recordAttempt(ip, jail, 1_200)).?;
+}
+
+test "dispatch: log-only jail records ban intent but does NOT call backend" {
+    const a = testing.allocator;
+    var tracker = try state_mod.StateTracker.init(a, .{
+        .max_entries = 16,
+        .maxretry = 3,
+        .findtime = 600,
+        .bantime = 600,
+    });
+    defer tracker.deinit();
+
+    var metrics = metrics_mod.Metrics.init();
+    const jail_name = "sshd";
+    _ = metrics.registerJail(jail_name);
+    const jail = try shared.JailId.fromSlice(jail_name);
+    const ip = try shared.IpAddress.parse("203.0.113.66");
+
+    // A backend that must NOT be touched. If `dispatchBan` ever called
+    // through it instead of the spy, the iptables CLI path would run —
+    // but the spy hook intercepts first, so this stays inert.
+    var backend: firewall.Backend = .{ .iptables = firewall.iptables.IptablesBackend{} };
+    var spy: BanSpy = .{};
+
+    var ctx = makeDispatchTestCtx(jail, &tracker, &backend, &metrics, &spy, .@"log-only");
+
+    const decision = try produceDecision(&tracker, ip, jail);
+    dispatchBan(&ctx, decision);
+
+    // The firewall was NOT mutated: the enforcing path was never invoked.
+    try testing.expectEqual(@as(u32, 0), spy.calls);
+
+    // ...yet the ban intent WAS recorded: global + per-jail counters move.
+    const snap = metrics.snapshot();
+    try testing.expectEqual(@as(u64, 1), snap.bans_total);
+    var found = false;
+    for (snap.perJail()) |pj| {
+        if (std.mem.eql(u8, pj.name(), jail_name)) {
+            try testing.expectEqual(@as(u64, 1), pj.bans_total);
+            found = true;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "dispatch: enforcing jail (nftables) DOES call the backend ban path" {
+    const a = testing.allocator;
+    var tracker = try state_mod.StateTracker.init(a, .{
+        .max_entries = 16,
+        .maxretry = 3,
+        .findtime = 600,
+        .bantime = 600,
+    });
+    defer tracker.deinit();
+
+    var metrics = metrics_mod.Metrics.init();
+    const jail_name = "sshd";
+    _ = metrics.registerJail(jail_name);
+    const jail = try shared.JailId.fromSlice(jail_name);
+    const ip = try shared.IpAddress.parse("203.0.113.66");
+
+    var backend: firewall.Backend = .{ .iptables = firewall.iptables.IptablesBackend{} };
+    var spy: BanSpy = .{};
+
+    var ctx = makeDispatchTestCtx(jail, &tracker, &backend, &metrics, &spy, .nftables);
+
+    const decision = try produceDecision(&tracker, ip, jail);
+    dispatchBan(&ctx, decision);
+
+    // Enforcing path WAS invoked exactly once, with the offending IP.
+    try testing.expectEqual(@as(u32, 1), spy.calls);
+    try testing.expect(spy.last_ip != null);
+    try testing.expect(shared.IpAddress.eql(spy.last_ip.?, ip));
+
+    // And accounting still happened (the enforcing path increments after
+    // a successful backend call).
+    const snap = metrics.snapshot();
+    try testing.expectEqual(@as(u64, 1), snap.bans_total);
+}
+
+test "dispatch: backend error on enforcing path skips metrics (no false ban)" {
+    // The enforcing path must NOT count a ban when the backend fails —
+    // it warns and returns before incrementing. This guards the ordering
+    // the original inline block relied on.
+    const a = testing.allocator;
+    var tracker = try state_mod.StateTracker.init(a, .{
+        .max_entries = 16,
+        .maxretry = 3,
+        .findtime = 600,
+        .bantime = 600,
+    });
+    defer tracker.deinit();
+
+    var metrics = metrics_mod.Metrics.init();
+    const jail_name = "sshd";
+    _ = metrics.registerJail(jail_name);
+    const jail = try shared.JailId.fromSlice(jail_name);
+    const ip = try shared.IpAddress.parse("203.0.113.66");
+
+    var backend: firewall.Backend = .{ .iptables = firewall.iptables.IptablesBackend{} };
+
+    const FailingSpy = struct {
+        fn ban(
+            _: ?*anyopaque,
+            _: shared.IpAddress,
+            _: shared.JailId,
+            _: shared.Duration,
+        ) firewall.BackendError!void {
+            return error.SystemError;
+        }
+    };
+
+    var ctx: JailContext = .{
+        .jail = jail,
+        .matcher = undefined,
+        .state = &tracker,
+        .backend_ptr = &backend,
+        .banaction = .nftables,
+        .metrics = &metrics,
+        .ban_hook = FailingSpy.ban,
+        .ban_hook_ctx = null,
+    };
+
+    const decision = try produceDecision(&tracker, ip, jail);
+    dispatchBan(&ctx, decision);
+
+    // Backend failed -> no ban counted.
+    const snap = metrics.snapshot();
+    try testing.expectEqual(@as(u64, 0), snap.bans_total);
+}
+
+// ----------------------------------------------------------------------------
+// SYS-020: runtime applies the jail's CONFIGURED filter, not a permissive
+// default; reserved/unenforceable IPs never ban. These drive the SHARED
+// `lineCallback` directly — both the file tailer and the journald source
+// route through it with the same `*JailContext`, so exercising it here
+// proves BOTH paths resolve to the same configured matcher.
+// ----------------------------------------------------------------------------
+
+/// Build a `lineCallback`-ready context wired to the sshd filter matcher,
+/// a real tracker, a ban spy, and metrics. `maxretry` is the caller's so a
+/// test can force a single hit to cross the threshold.
+fn makeLineCallbackCtx(
+    jail: shared.JailId,
+    tracker: *state_mod.StateTracker,
+    backend: *firewall.Backend,
+    metrics: *metrics_mod.Metrics,
+    spy: *BanSpy,
+) JailContext {
+    return .{
+        .jail = jail,
+        .matcher = filter_registry_mod.matcherForFilter("sshd").?,
+        .state = tracker,
+        .backend_ptr = backend,
+        .banaction = .nftables,
+        .metrics = metrics,
+        .now_override = 1_000, // deterministic clock
+        .ban_hook = BanSpy.ban,
+        .ban_hook_ctx = spy,
+    };
+}
+
+const LineCallbackFixture = struct {
+    tracker: state_mod.StateTracker,
+    metrics: metrics_mod.Metrics,
+    backend: firewall.Backend,
+    spy: BanSpy,
+    jail: shared.JailId,
+
+    fn deinit(self: *LineCallbackFixture) void {
+        self.tracker.deinit();
+    }
+};
+
+/// maxretry=1 so a single matching line that crosses the threshold bans
+/// immediately — makes "did this line ban?" a one-shot assertion.
+fn initLineCallbackFixture(self: *LineCallbackFixture) !void {
+    self.tracker = try state_mod.StateTracker.init(testing.allocator, .{
+        .max_entries = 16,
+        .maxretry = 1,
+        .findtime = 600,
+        .bantime = 600,
+    });
+    self.metrics = metrics_mod.Metrics.init();
+    _ = self.metrics.registerJail("sshd");
+    self.backend = .{ .iptables = firewall.iptables.IptablesBackend{} };
+    self.spy = .{};
+    self.jail = try shared.JailId.fromSlice("sshd");
+}
+
+test "lineCallback: sshd listener startup line does NOT match/count/ban (SYS-020)" {
+    var fx: LineCallbackFixture = undefined;
+    try initLineCallbackFixture(&fx);
+    defer fx.deinit();
+    var ctx = makeLineCallbackCtx(fx.jail, &fx.tracker, &fx.backend, &fx.metrics, &fx.spy);
+
+    // The exact lines sshd logs on (re)start. The old `<*><IP>` default
+    // matched these and banned 0.0.0.0 / ::; the configured sshd patterns
+    // do not match them at all.
+    lineCallback("Server listening on 0.0.0.0 port 22.", fx.jail, false, &ctx);
+    lineCallback("Server listening on :: port 22.", fx.jail, false, &ctx);
+
+    try testing.expectEqual(@as(u32, 0), fx.spy.calls);
+    const snap = fx.metrics.snapshot();
+    try testing.expectEqual(@as(u64, 0), snap.bans_total);
+    try testing.expectEqual(@as(u64, 0), snap.lines_matched);
+}
+
+test "lineCallback: successful auth (Accepted password/publickey) does NOT ban (SYS-020)" {
+    var fx: LineCallbackFixture = undefined;
+    try initLineCallbackFixture(&fx);
+    defer fx.deinit();
+    var ctx = makeLineCallbackCtx(fx.jail, &fx.tracker, &fx.backend, &fx.metrics, &fx.spy);
+
+    lineCallback("Accepted password for root from 198.51.100.7 port 22 ssh2", fx.jail, false, &ctx);
+    lineCallback("Accepted publickey for root from 198.51.100.7 port 22 ssh2: RSA SHA256:x", fx.jail, false, &ctx);
+
+    try testing.expectEqual(@as(u32, 0), fx.spy.calls);
+    try testing.expectEqual(@as(u64, 0), fx.metrics.snapshot().bans_total);
+}
+
+test "lineCallback: real sshd auth failures DO match and ban (no regression, SYS-020)" {
+    var fx: LineCallbackFixture = undefined;
+    try initLineCallbackFixture(&fx);
+    defer fx.deinit();
+    var ctx = makeLineCallbackCtx(fx.jail, &fx.tracker, &fx.backend, &fx.metrics, &fx.spy);
+
+    // maxretry=1 -> the first failure crosses the threshold and bans.
+    lineCallback("Failed password for root from 203.0.113.10 port 22 ssh2", fx.jail, false, &ctx);
+    try testing.expectEqual(@as(u32, 1), fx.spy.calls);
+    try testing.expect(fx.spy.last_ip != null);
+    try testing.expect(shared.IpAddress.eql(fx.spy.last_ip.?, try shared.IpAddress.parse("203.0.113.10")));
+
+    // A second distinct offender via the "Invalid user" pattern also bans.
+    lineCallback("Invalid user oracle from 203.0.113.20 port 22", fx.jail, false, &ctx);
+    try testing.expectEqual(@as(u32, 2), fx.spy.calls);
+}
+
+test "lineCallback: [preauth] self-ban guard takes effect at runtime (SYS-011 via SYS-020)" {
+    var fx: LineCallbackFixture = undefined;
+    try initLineCallbackFixture(&fx);
+    defer fx.deinit();
+    var ctx = makeLineCallbackCtx(fx.jail, &fx.tracker, &fx.backend, &fx.metrics, &fx.spy);
+
+    // Clean operator logout — OpenSSH writes this on every normal session
+    // close. The configured pattern requires the `[preauth]` suffix, so a
+    // clean disconnect MUST NOT ban. Before SYS-020 the `<*><IP>` default
+    // matched it and could self-ban the operator.
+    lineCallback("Received disconnect from 192.0.2.50 port 22:11: disconnected by user", fx.jail, false, &ctx);
+    try testing.expectEqual(@as(u32, 0), fx.spy.calls);
+
+    // Attacker pre-auth disconnect — the `[preauth]` suffix means the IP
+    // never authenticated; this MUST ban.
+    lineCallback("Received disconnect from 203.0.113.99 port 22:11: Bye Bye [preauth]", fx.jail, false, &ctx);
+    try testing.expectEqual(@as(u32, 1), fx.spy.calls);
+}
+
+test "lineCallback: matched line with unenforceable IP never bans (reserved-IP guard, SYS-020)" {
+    var fx: LineCallbackFixture = undefined;
+    try initLineCallbackFixture(&fx);
+    defer fx.deinit();
+    var ctx = makeLineCallbackCtx(fx.jail, &fx.tracker, &fx.backend, &fx.metrics, &fx.spy);
+
+    // These lines DO match the sshd "Invalid user" pattern, but the
+    // extracted token is unspecified/loopback — the record-boundary guard
+    // must drop them before any count or ban, even though a pattern matched.
+    lineCallback("Invalid user attacker from 0.0.0.0 port 22", fx.jail, false, &ctx);
+    lineCallback("Invalid user attacker from :: port 22", fx.jail, false, &ctx);
+    lineCallback("Failed password for root from 127.0.0.1 port 22 ssh2", fx.jail, false, &ctx);
+
+    try testing.expectEqual(@as(u32, 0), fx.spy.calls);
+    const snap = fx.metrics.snapshot();
+    try testing.expectEqual(@as(u64, 0), snap.bans_total);
+    // The guard fires AFTER the match but BEFORE the matched counter, so a
+    // dropped unenforceable hit is not counted as a match either.
+    try testing.expectEqual(@as(u64, 0), snap.lines_matched);
+}
+
+test "lineCallback: file and journald inputs resolve to the SAME configured matcher (SYS-020)" {
+    // The file tailer passes a syslog-framed line; the journald source
+    // passes the bare message body. Both reach this identical callback with
+    // the identical context. A benign-but-IP-bearing line must be rejected
+    // on BOTH shapes, proving neither path uses a permissive default.
+    var fx: LineCallbackFixture = undefined;
+    try initLineCallbackFixture(&fx);
+    defer fx.deinit();
+    var ctx = makeLineCallbackCtx(fx.jail, &fx.tracker, &fx.backend, &fx.metrics, &fx.spy);
+
+    // File-source shape: full rsyslog envelope (stripSyslogPrefix peels it).
+    lineCallback("Apr 21 10:15:03 host sshd[1234]: Accepted password for root from 198.51.100.8 port 22 ssh2", fx.jail, false, &ctx);
+    // journald shape: bare message body, no envelope.
+    lineCallback("Accepted password for root from 198.51.100.8 port 22 ssh2", fx.jail, false, &ctx);
+
+    // Neither shape banned — both ran the configured sshd matcher, which
+    // rejects successful auth.
+    try testing.expectEqual(@as(u32, 0), fx.spy.calls);
+
+    // And a real failure in BOTH shapes DOES ban (same matcher, same result).
+    lineCallback("Apr 21 10:15:04 host sshd[1234]: Failed password for root from 203.0.113.30 port 22 ssh2", fx.jail, false, &ctx);
+    try testing.expectEqual(@as(u32, 1), fx.spy.calls);
 }
 
 test "main: deriveLegacyTrackerConfig mirrors defaults" {
@@ -1535,9 +2170,13 @@ test {
     // directly, otherwise their unit tests disappear from `zig build
     // test` output.
     _ = allocator_mod;
+    // Test-only: surface memory.zig's tests. The MemoryPool is not yet
+    // wired to a live consumer (tracked separately); see the
+    // memory-ceiling-not-enforced issue.
     _ = memory_mod;
     _ = event_loop_mod;
     _ = log_watcher_mod;
+    _ = journald_source_mod;
     _ = line_buffer_mod;
     _ = logger_mod;
     _ = parser_mod;

@@ -68,7 +68,7 @@ The installer pulls from the
 [latest GitHub Release](https://github.com/ul0gic/fail2zig/releases/latest)
 and verifies every asset against the published `SHA256SUMS` before placing
 anything on disk. Pin a specific version with
-`FAIL2ZIG_VERSION=v0.1.1` or inspect the script first with
+`FAIL2ZIG_VERSION=v0.2.0` or inspect the script first with
 `curl -fsSL … | less`.
 
 ---
@@ -83,10 +83,11 @@ anything on disk. Pin a specific version with
   firewall operation. See
   [architecture/zero-dependencies](https://fail2zig.com/docs/architecture/zero-dependencies/)
   for why this matters and how we verify it.
-- **Hard memory ceiling.** Fixed allocators with a configurable cap (default
-  64 MB). Memory does not grow under sustained brute-force or DDoS
-  conditions — behavior at the ceiling is operator-defined via eviction
-  policy.
+- **Bounded under attack.** The IP state tracker is a fixed-capacity,
+  pre-allocated map sized from a configurable ceiling (`memory_ceiling_mb`,
+  default 64 MB) with an operator-defined eviction policy — so tracked state
+  does not grow under sustained brute-force or DDoS. The ceiling bounds
+  tracker capacity, not a hard per-component byte budget across every allocator.
 - **Comptime-generated parsers.** Built-in filter patterns compile into
   specialized match functions at build time. There is no regex engine in the
   process. Attacker-controlled input never reaches a Turing-complete matcher.
@@ -113,7 +114,7 @@ flowchart LR
     subgraph Daemon["fail2zig (root, CAP_NET_ADMIN + CAP_DAC_READ_SEARCH)"]
         LW["Log Watcher<br/>inotify + epoll<br/>rotation-aware"]
         PE["Parser Engine<br/>comptime filters<br/>zero-copy slices"]
-        ST["State Tracker<br/>fixed arena, 64 MB ceiling<br/>findtime · bantime increment"]
+        ST["State Tracker<br/>fixed-capacity map · sized from ceiling<br/>findtime · bantime increment"]
         BE["Ban Executor"]
         IPC["IPC Server<br/>Unix socket 0660<br/>SO_PEERCRED auth"]
         HTTP["HTTP Server<br/>127.0.0.1:9100<br/>/metrics · /events (WS)"]
@@ -168,12 +169,13 @@ installs the hardened `fail2zig.service` unit under
 `/etc/systemd/system/`. It does **not** auto-start the daemon — audit the
 config, then `systemctl enable --now fail2zig` when ready.
 
-**Supported targets (v0.1.1):**
+**Supported targets (v0.2.0):**
 - `x86_64-linux-musl` (879 KB stripped)
 - `aarch64-linux-musl` (801 KB stripped)
+- `armv7-linux-musleabihf`
 
-`armv7-linux-musleabihf` and `mips-linux-musl` are tracked in SYS-009 and
-ship in a future release.
+`mips-linux-musl` is deferred — the Zig 0.14.1 toolchain cannot yet provide musl
+libc for that triple (SYS-013).
 
 ### Dry-run / inspect the installer
 
@@ -194,8 +196,8 @@ If you'd rather skip the script:
 
 ```bash
 # 1. Download the binary + manifest for your arch
-VERSION=v0.1.1
-ARCH=x86_64-linux-musl   # or aarch64-linux-musl
+VERSION=v0.2.0
+ARCH=x86_64-linux-musl   # or aarch64-linux-musl, armv7-linux-musleabihf
 curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/fail2zig-${VERSION}-${ARCH}"
 curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/fail2zig-client-${VERSION}-${ARCH}"
 curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/SHA256SUMS"
@@ -253,23 +255,23 @@ From a repo checkout:
 sudo install -m 0644 deploy/fail2zig.service /etc/systemd/system/
 sudo install -m 0644 deploy/fail2zig.socket  /etc/systemd/system/
 sudo install -d -m 0750 /etc/fail2zig
-sudo install -m 0644 deploy/fail2zig.toml.example /etc/fail2zig/config.toml
+sudo install -m 0640 deploy/fail2zig.toml.example /etc/fail2zig/config.toml
 sudo systemctl daemon-reload
 sudo systemctl enable --now fail2zig
 ```
 
-From a downloaded release (the same three files are published alongside
+From a downloaded release (the same files are published alongside
 the binaries):
 
 ```bash
-VERSION=v0.1.1
+VERSION=v0.2.0
 for f in fail2zig.service fail2zig.socket fail2zig.toml.example; do
   curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/${f}"
 done
 sudo install -m 0644 fail2zig.service /etc/systemd/system/
 sudo install -m 0644 fail2zig.socket  /etc/systemd/system/
 sudo install -d -m 0750 /etc/fail2zig
-sudo install -m 0644 fail2zig.toml.example /etc/fail2zig/config.toml
+sudo install -m 0640 fail2zig.toml.example /etc/fail2zig/config.toml
 sudo systemctl daemon-reload
 sudo systemctl enable --now fail2zig
 ```
@@ -314,6 +316,9 @@ bantime_increment_max_bantime = 604800   # cap at 7 days
 [jails.sshd]
 enabled = true
 filter  = "sshd"
+# source = "auto" (the default) reads the systemd journal on modern minimal
+# systemd boxes where /var/log/auth.log is absent, and tails the files below
+# when they exist. Force it with source = "journald" or source = "file".
 logpath = ["/var/log/auth.log", "/var/log/secure"]
 
 [jails.nginx-botsearch]

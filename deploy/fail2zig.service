@@ -1,11 +1,20 @@
 [Unit]
 Description=fail2zig — intrusion prevention system
-Documentation=https://github.com/ul0gic/fail2zig https://fail2zig.io/docs
+Documentation=https://github.com/ul0gic/fail2zig https://fail2zig.com/docs
 After=network-online.target rsyslog.service systemd-journald.service
 Wants=network-online.target
 
 [Service]
 Type=simple
+
+# Run as root (no User=) but with `fail2zig` as the primary group. The
+# daemon's egid is then `fail2zig`, so `RuntimeDirectory` below and the IPC
+# socket the daemon binds both come out `root:fail2zig` with no daemon-side
+# chown. This keeps the chown family (`@privileged`) denied by the seccomp
+# filter and CAP_CHOWN out of the bounding set — a daemon chown would be
+# SIGSYS-killed and could not succeed anyway (SYS-019). Group members can
+# use fail2zig-client (mode 0660 socket, SO_PEERCRED-authenticated).
+Group=fail2zig
 ExecStart=/usr/local/bin/fail2zig --config /etc/fail2zig/config.toml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure

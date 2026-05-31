@@ -231,6 +231,17 @@ pub const IpcServer = struct {
             );
         }
 
+        // Group ownership of the socket is NOT set by a daemon chown
+        // (SYS-019). Under the shipped systemd unit, `Group=fail2zig`
+        // makes the daemon's egid `fail2zig`, so the socket bound above is
+        // created `root:fail2zig` automatically — and a chown(2) here would
+        // be a `@privileged` syscall the unit's seccomp filter kills with
+        // SIGSYS (and CAP_CHOWN is not in its bounding set anyway). The
+        // `allowed_gid` resolved above still drives SO_PEERCRED
+        // authorization — its one purpose. Bare `--config` runs (no
+        // systemd) get a `root:root` socket: correct root-only IPC by
+        // default.
+
         return .{
             .allocator = allocator,
             .loop = loop,
@@ -668,6 +679,124 @@ test "ipc: socket has mode 0660 immediately after init (SEC-002)" {
     // Mask off the type bits; check the 9 permission bits exactly.
     const perm = stbuf.mode & 0o777;
     try testing.expectEqual(@as(u32, 0o660), perm);
+}
+
+/// stat() a path and return its permission bits (0o777 masked), or
+/// `error.SkipZigTest` if the stat fails. Mirrors the SEC-002 test's
+/// approach so SYS-018 assertions stay consistent with it.
+fn statPerm(path: []const u8) !u32 {
+    var path_z: [128]u8 = undefined;
+    if (path.len >= path_z.len) return error.SkipZigTest;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    var stbuf: linux.Stat = undefined;
+    const rc = linux.stat(@ptrCast(&path_z[0]), &stbuf);
+    switch (posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    return stbuf.mode & 0o777;
+}
+
+/// stat() a path and return its owning group id, or `error.SkipZigTest`
+/// if the stat fails. Shares the `linux.Stat` mechanics of `statPerm` so
+/// the SYS-019 ownership-regression assertion stays consistent with the
+/// SEC-002 / SYS-018 mode assertions.
+fn statGid(path: []const u8) !u32 {
+    var path_z: [128]u8 = undefined;
+    if (path.len >= path_z.len) return error.SkipZigTest;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    var stbuf: linux.Stat = undefined;
+    const rc = linux.stat(@ptrCast(&path_z[0]), &stbuf);
+    switch (posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    return stbuf.gid;
+}
+
+/// stat() a path and return its full mode word (type + permission +
+/// special bits), or `error.SkipZigTest` if the stat fails. Used to
+/// inspect the setgid bit of the socket's parent directory.
+fn statRawMode(path: []const u8) !u32 {
+    var path_z: [128]u8 = undefined;
+    if (path.len >= path_z.len) return error.SkipZigTest;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    var stbuf: linux.Stat = undefined;
+    const rc = linux.stat(@ptrCast(&path_z[0]), &stbuf);
+    switch (posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    return stbuf.mode;
+}
+
+test "ipc: init succeeds and socket stays 0660 with no fail2zig group (SYS-018)" {
+    // SYS-018/SYS-019: init() resolves the `fail2zig` gid for SO_PEERCRED
+    // authorization but does NOT chown the socket — group ownership comes
+    // from the daemon's egid under systemd `Group=fail2zig`. Whether or not
+    // the group exists, init must succeed with the socket at mode 0660: the
+    // group path never weakens the existing root-only guarantee. This is
+    // the testable invariant under a non-root test runner.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = testing.allocator;
+
+    var loop = try EventLoop.init(a);
+    defer loop.deinit();
+
+    const path = try makeTestPath(a);
+    defer a.free(path);
+
+    // init() must not fail regardless of whether `fail2zig` exists or
+    // whether a chown would EPERM under a non-root test runner.
+    var server = try IpcServer.init(a, &loop, path);
+    defer server.deinit();
+
+    // Assertion 1 — gid resolution (single source of truth). The resolved
+    // gid is exactly the gid used for SO_PEERCRED authorization. When the
+    // `fail2zig` group is absent it is null; when present it equals
+    // getgrnam("fail2zig").gr_gid. No other test asserts this — keep it
+    // here so there is one canonical check.
+    const expected_gid: ?u32 = blk: {
+        if (getgrnam("fail2zig")) |grp| break :blk grp.gr_gid;
+        break :blk null;
+    };
+    try testing.expectEqual(expected_gid, server.allowed_gid);
+
+    // Assertion 2 — socket mode is 0660 after init. Socket exists and is
+    // connectable-by-mode (the umask+fchmodat path is undisturbed by the
+    // SYS-019 chown removal).
+    try std.fs.cwd().access(path, .{});
+    try testing.expectEqual(@as(u32, 0o660), try statPerm(path));
+
+    // Assertion 3 — SYS-019 ownership-regression guard. The earlier
+    // SYS-018 attempt set the socket's group with a daemon-side
+    // fchownat(); under the shipped hardened unit that `@privileged`
+    // syscall is killed with SIGSYS and crash-loops the daemon. The fix
+    // removed that chown entirely: the bound socket must simply INHERIT
+    // its group from the creating process's egid (which systemd sets to
+    // `fail2zig` via `Group=fail2zig`). We assert the observable form of
+    // "init performed no ownership change": the socket's group equals the
+    // test process's egid. If a chown were ever reintroduced into the
+    // socket-creation path, it would reassign the group to the resolved
+    // `fail2zig` gid (or fail) and this would no longer hold.
+    //
+    // One environmental caveat: if the socket's parent directory carries
+    // the setgid bit (S_ISGID), a newly created file inherits the
+    // DIRECTORY's group rather than the creator's egid — making the
+    // egid comparison invalid through no fault of `init`. /tmp normally
+    // has no setgid bit, but we detect and skip that case rather than
+    // assert something flaky. This holds identically under root and
+    // non-root runners: the socket group is the creator's egid either way.
+    const parent = std.fs.path.dirname(path) orelse return error.SkipZigTest;
+    const parent_mode = try statRawMode(parent);
+    const s_isgid: u32 = 0o2000;
+    if ((parent_mode & s_isgid) != 0) return error.SkipZigTest;
+
+    const socket_gid = try statGid(path);
+    try testing.expectEqual(@as(u32, linux.getegid()), socket_gid);
 }
 
 test "ipc: listener socket is non-blocking (SYS-001)" {

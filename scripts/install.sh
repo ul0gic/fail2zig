@@ -3,7 +3,7 @@
 # scripts/install.sh — fail2zig one-shot installer.
 #
 # Designed for:
-#   curl -fsSL https://fail2zig.io/install | sudo sh
+#   curl -fsSL https://github.com/ul0gic/fail2zig/raw/main/scripts/install.sh | sudo bash
 #
 # Also usable directly from a git checkout:
 #   sudo scripts/install.sh

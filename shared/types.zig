@@ -57,6 +57,44 @@ pub const IpAddress = union(enum) {
         return std.meta.eql(a, b);
     }
 
+    /// Defense-in-depth guard for the ban/dispatch boundary (SYS-020).
+    ///
+    /// A pattern can match a benign log line whose extracted `<IP>` token is
+    /// not a real, routable offender — most importantly the unspecified
+    /// address that sshd logs on (re)start (`Server listening on 0.0.0.0
+    /// port 22` / `:: port 22`). Banning these is at best noise and at worst
+    /// a self-DoS (a wildcard listener line, a loopback hit). This returns
+    /// `true` for any address fail2zig must NEVER enforce against, so callers
+    /// can drop the match (log + ignore) instead of banning. It is applied at
+    /// the record boundary so it protects EVERY matcher, not just sshd.
+    ///
+    /// Rejected:
+    ///   * IPv4 `0.0.0.0/8`     — "this host on this network" (RFC 1122),
+    ///                            covers the unspecified `0.0.0.0`.
+    ///   * IPv4 `127.0.0.0/8`   — loopback.
+    ///   * IPv6 `::`            — unspecified.
+    ///   * IPv6 `::1`           — loopback.
+    ///
+    /// Note: a missing/invalid IP never reaches here — extraction returns
+    /// `null` (no match) rather than coercing to zero, so there is no
+    /// "default to 0.0.0.0" path to defend against. This guard exists for
+    /// the case where a real token *was* extracted but is unenforceable.
+    pub fn isUnenforceable(self: IpAddress) bool {
+        switch (self) {
+            .ipv4 => |v| {
+                // 0.0.0.0/8 (includes the unspecified address).
+                if ((v & 0xff00_0000) == 0x0000_0000) return true;
+                // 127.0.0.0/8 loopback.
+                if ((v & 0xff00_0000) == 0x7f00_0000) return true;
+                return false;
+            },
+            .ipv6 => |v| {
+                // :: (unspecified) and ::1 (loopback).
+                return v == 0 or v == 1;
+            },
+        }
+    }
+
     pub fn format(
         self: IpAddress,
         comptime _: []const u8,
@@ -336,6 +374,27 @@ test "IpAddress: eql" {
     try std.testing.expect(IpAddress.eql(a, b));
     try std.testing.expect(!IpAddress.eql(a, c));
     try std.testing.expect(!IpAddress.eql(a, d));
+}
+
+test "IpAddress: isUnenforceable rejects unspecified and loopback" {
+    // The exact addresses sshd logs on (re)start.
+    try std.testing.expect((IpAddress{ .ipv4 = 0 }).isUnenforceable()); // 0.0.0.0
+    try std.testing.expect((try IpAddress.parse("::")).isUnenforceable());
+    // Loopback (never a real remote offender).
+    try std.testing.expect((try IpAddress.parse("127.0.0.1")).isUnenforceable());
+    try std.testing.expect((try IpAddress.parse("::1")).isUnenforceable());
+    // The whole 0.0.0.0/8 and 127.0.0.0/8 blocks are unenforceable.
+    try std.testing.expect((try IpAddress.parse("0.1.2.3")).isUnenforceable());
+    try std.testing.expect((try IpAddress.parse("127.255.255.254")).isUnenforceable());
+}
+
+test "IpAddress: isUnenforceable allows real routable offenders" {
+    try std.testing.expect(!(try IpAddress.parse("1.2.3.4")).isUnenforceable());
+    try std.testing.expect(!(try IpAddress.parse("203.0.113.5")).isUnenforceable());
+    try std.testing.expect(!(try IpAddress.parse("192.168.1.100")).isUnenforceable());
+    try std.testing.expect(!(try IpAddress.parse("2001:db8::1")).isUnenforceable());
+    // ::ffff:1.2.3.4 folds to the IPv4 1.2.3.4 — still enforceable.
+    try std.testing.expect(!(try IpAddress.parse("::ffff:1.2.3.4")).isUnenforceable());
 }
 
 test "JailId: fromSlice typical" {
