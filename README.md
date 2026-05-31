@@ -80,7 +80,8 @@ anything on disk. Pin a specific version with
   routers. Stripped release binary is ~900 KB.
 - **Zero runtime dependencies.** No shell-out to `nft`, `iptables`, or any
   other CLI. fail2zig speaks netlink directly to the kernel for every
-  firewall operation. See
+  firewall operation — the nftables userspace package (`nft`) does not need
+  to be installed. See
   [architecture/zero-dependencies](https://fail2zig.com/docs/architecture/zero-dependencies/)
   for why this matters and how we verify it.
 - **Bounded under attack.** The IP state tracker is a fixed-capacity,

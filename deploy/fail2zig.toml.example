@@ -36,9 +36,11 @@ socket_path = "/run/fail2zig/fail2zig.sock"
 # at shutdown and periodically. Parent dir must exist.
 state_file = "/var/lib/fail2zig/state.bin"
 
-# Hard memory ceiling for the daemon (MB). The state tracker and all
-# per-jail arenas respect this bound — once hit, the eviction policy
-# kicks in rather than growing. Minimum 16 MB.
+# Memory ceiling for the daemon (MB). The state tracker is sized from
+# this value: ceiling → entry capacity (≈ ceiling_MB×1024²/1536 entries).
+# When that cap is reached, oldest unbanned entries are evicted rather
+# than growing — so tracked-IP state cannot expand under attack.
+# This is not a per-component byte cap on every allocator. Minimum 16 MB.
 memory_ceiling_mb = 64
 
 # HTTP endpoint that exposes Prometheus `/metrics` and JSON `/api/status`.
