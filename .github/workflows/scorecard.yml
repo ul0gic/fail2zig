@@ -1,0 +1,84 @@
+# fail2zig — OpenSSF Scorecard
+#
+# Runs the OpenSSF Scorecard analysis against this repository and publishes
+# the results to the public Scorecard API (https://scorecard.dev), which
+# backs the README badge. Scorecard checks supply-chain posture: branch
+# protection, pinned dependencies, token permissions, code review, SAST,
+# and more.
+#
+# Why a separate file (not a job in ci.yml): Scorecard is a scheduled /
+# cadence-driven scan, not a per-PR validator. It needs elevated
+# `security-events: write` + `id-token: write` permissions that the rest of
+# CI must not carry, and it reacts to `branch_protection_rule` changes. We
+# split workflows by trigger/cadence, so it gets its own file.
+#
+# Publishing uses OIDC (`id-token: write`) — no stored secret. `publish_results`
+# is only honoured on the public upstream repo; forks get a no-op.
+#
+# Every action is pinned to a full commit SHA (SEC-011); Dependabot's
+# github-actions ecosystem keeps the pins + version comments current.
+#
+# Lead/maintainer follow-ups (one-time, outside this workflow):
+#   - Enable "Code scanning" in repo Settings → Security so the SARIF upload
+#     has a destination (the upload step is a no-op until then).
+#   - The Scorecard badge in README.md resolves once the first scheduled run
+#     publishes to api.securityscorecards.dev.
+
+name: Scorecard
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Weekly, Mondays 07:30 UTC — staggered off Dependabot's 09:00 CT run.
+    - cron: "30 7 * * 1"
+  branch_protection_rule:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scorecard-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    permissions:
+      # Needed to upload the SARIF results to the code-scanning dashboard.
+      security-events: write
+      # Needed to publish results to the public Scorecard API over OIDC —
+      # no secret required on a public repo.
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Run Scorecard analysis
+        uses: ossf/scorecard-action@4eaacf0543bb3f2c246792bd56e8cdeffafb205a # v2.4.3
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          # Publish to the public Scorecard API (backs the README badge).
+          # OIDC-authenticated; honoured only on the upstream public repo.
+          publish_results: true
+
+      - name: Upload SARIF to code scanning
+        # Surfaces Scorecard findings in the repo's Security → Code scanning
+        # tab. No-op until code scanning is enabled in repo settings.
+        uses: github/codeql-action/upload-sarif@2d92b76c45b91eb80fc44c74ce3fce0ee94e8f9d # v3.30.0
+        with:
+          sarif_file: results.sarif
+
+      - name: Upload SARIF artifact
+        # Retain the raw SARIF as a build artifact for offline inspection
+        # even if code scanning is not yet enabled.
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scorecard-results
+          path: results.sarif
+          if-no-files-found: error
+          retention-days: 14

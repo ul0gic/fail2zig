@@ -18,7 +18,7 @@
 # `mips-linux-musl` remains excluded: Zig 0.14.1 cannot provide musl libc for it
 # ("unable to find or provide libc for target 'mips-linux...-musl'") — a
 # toolchain limitation, not our code. See
-# .project/issues/open/SYS-009-armv7-cross-compile-broken.md.
+# .project/issue-management/open/SYS-009-armv7-cross-compile-broken.md.
 #
 # Zig version is pinned to the toolchain that ships the project — see
 # build.zig.zon `minimum_zig_version`. Keep this in sync with any bump.
@@ -215,6 +215,35 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y yamllint
       - name: Lint CI YAML
         run: yamllint -c .yamllint .github/workflows/
+
+  zizmor:
+    name: zizmor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Run zizmor (GitHub Actions SAST)
+        # zizmor statically analyses our workflow files for injection sinks,
+        # excessive token permissions, unpinned actions, credential
+        # persistence, and similar CI supply-chain footguns.
+        #
+        # Run as a pinned CLI via pipx (preinstalled on ubuntu-latest), not a
+        # marketplace action — keeps the third-party *action* surface minimal
+        # while still version-locking the tool. Bump the pin in lockstep with
+        # any zizmor finding-set changes.
+        #
+        # --min-severity medium: gate on medium+ findings (security-relevant
+        # posture) while not failing on low/informational pedantic lints we
+        # have consciously accepted. Run `pipx run zizmor==1.25.2
+        # .github/workflows/` locally to see the full (including low) set.
+        env:
+          # GH token lets zizmor's online audits (e.g. ref confusion) resolve
+          # action repos; read-only, scoped to this job by the top-level
+          # `permissions: contents: read`.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pipx run zizmor==1.25.2 --min-severity medium .github/workflows/
 
   spdx:
     name: SPDX headers
