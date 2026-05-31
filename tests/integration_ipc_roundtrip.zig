@@ -272,7 +272,9 @@ test "integration: version command round-trips and echoes supplied version" {
     defer resp.deinit(a);
 
     try testing.expect(resp == .ok);
+    // ISSUE-011: handleVersion emits the version under `daemon_version` to
+    // match the client's VersionPayload contract (not `version`).
     try testing.expect(
-        std.mem.indexOf(u8, resp.ok.payload, "\"version\":\"ipc-roundtrip-version\"") != null,
+        std.mem.indexOf(u8, resp.ok.payload, "\"daemon_version\":\"ipc-roundtrip-version\"") != null,
     );
 }
