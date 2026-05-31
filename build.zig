@@ -12,7 +12,7 @@ const std = @import("std");
 // `.zon` can't be the in-process source here: Zig 0.14.x `@import` of a `.zon`
 // file requires a full result-type mirror of the manifest schema, which would
 // couple build.zig to the manifest's shape on an unrelated axis.
-const fail2zig_version = "0.2.0";
+const fail2zig_version = "0.2.1";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
