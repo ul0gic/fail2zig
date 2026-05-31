@@ -34,6 +34,7 @@ const linux = std.os.linux;
 const posix = std.posix;
 
 const shared = @import("shared");
+const build_options = @import("build_options");
 
 // Wire all engine modules into the build graph so their tests are discovered.
 // Modules reached by integration tests (via the named `engine` module) are
@@ -67,7 +68,10 @@ pub const ipc_mod = @import("net/ipc.zig");
 pub const commands_mod = @import("net/commands.zig");
 const metrics_mod = @import("core/metrics.zig");
 
-pub const version = "0.2.0";
+/// Daemon version. Single source of truth lives in `build.zig`
+/// (`fail2zig_version`), injected via the generated `build_options` module so
+/// the daemon and the client can never report different strings.
+pub const version = build_options.version;
 
 // ============================================================================
 // CLI argument parsing
@@ -1557,8 +1561,28 @@ fn writeBansPayload(
 // Tests
 // ============================================================================
 
-test "engine: version constant" {
-    try std.testing.expectEqualStrings("0.2.0", version);
+test "engine: version constant tracks build_options" {
+    // The daemon's `version` is the build-injected single source of truth, not
+    // a hand-maintained literal. Asserting against `build_options.version`
+    // keeps this green across release bumps while still catching an accidental
+    // decoupling of the two.
+    try std.testing.expectEqualStrings(build_options.version, version);
+}
+
+test "engine: all version identities agree (ISSUE-010 drift guard)" {
+    // Every engine-side version source must collapse to the same build-injected
+    // string: the exported `version`, and the IPC `Context.version` default
+    // (which used to carry a stale `0.1.0` literal). The client mirrors this on
+    // its side (`client_version == build_options.version`), so the two binaries
+    // are pinned to a single `build.zig` source — the version can never silently
+    // drift between them again.
+    const ctx_default_version = (commands_mod.Context{
+        .trackers = undefined,
+        .config = undefined,
+        .backend = undefined,
+    }).version;
+    try std.testing.expectEqualStrings(build_options.version, version);
+    try std.testing.expectEqualStrings(build_options.version, ctx_default_version);
 }
 
 test "cli: default action is run" {

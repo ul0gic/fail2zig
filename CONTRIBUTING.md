@@ -89,7 +89,7 @@ what and why.
 **Architecture invariants — do not violate without a design conversation first:**
 - **No runtime plugins / dynamic code loading.** The trusted computing base IS the binary. Contributions land at compile time, not at runtime.
 - **No third-party Zig packages.** Zero runtime dependencies is the product promise. C interop is allowed for stable kernel ABIs only.
-- **Memory ceilings are absolute.** No component may allocate beyond its configured budget. Use `BudgetAllocator` for new components.
+- **State tracker is bounded by the ceiling.** `memory_ceiling_mb` derives an entry-count cap for the state tracker (the dominant memory consumer); eviction fires before the cap is exceeded. The parser hot path is zero-alloc. `BudgetAllocator` exists in `engine/core/memory.zig` for components that need a hard per-component byte budget, but is not currently wired to a live consumer — if you add a new component with significant allocation, reach out before choosing an allocator strategy.
 - **No runtime regex engine in the daemon.** Patterns are comptime-specialized. Runtime regex is an attack surface we don't carry.
 
 ## What we're intentionally NOT building

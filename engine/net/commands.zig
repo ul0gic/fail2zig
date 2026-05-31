@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const shared = @import("shared");
+const build_options = @import("build_options");
 
 const state_mod = @import("../core/state.zig");
 const tracker_map_mod = @import("../core/tracker_map.zig");
@@ -67,8 +68,11 @@ pub const Context = struct {
     /// so the status handler can report uptime as a whole number of
     /// seconds.
     start_time: i64 = 0,
-    /// Build version string; mirrored into responses.
-    version: []const u8 = "0.1.0",
+    /// Build version string; mirrored into responses. Defaults to the
+    /// build-injected single source of truth (`build_options.version`) so the
+    /// IPC response can never report a stale literal even before main.zig
+    /// explicitly wires it.
+    version: []const u8 = build_options.version,
 
     /// Entry point used by the IPC server. Matches the
     /// `CommandHandler.dispatch` function pointer signature.
@@ -296,7 +300,11 @@ pub const Context = struct {
     fn handleVersion(self: *Context, a: std.mem.Allocator) !shared.Response {
         var buf: std.ArrayListUnmanaged(u8) = .{};
         defer buf.deinit(a);
-        try buf.writer(a).print("{{\"version\":\"{s}\"}}", .{self.version});
+        // ISSUE-011: the field MUST be `daemon_version` to match the client's
+        // `VersionPayload` contract (client/format.zig). Emitting `version`
+        // here parses as null on the client and silently drops the daemon line.
+        // The `status` command pair uses `version` separately — do not unify.
+        try buf.writer(a).print("{{\"daemon_version\":\"{s}\"}}", .{self.version});
         const payload = try a.dupe(u8, buf.items);
         return .{ .ok = .{ .payload = payload } };
     }
@@ -464,6 +472,58 @@ test "commands: handleVersion returns version JSON" {
     defer resp.deinit(a);
     try testing.expect(resp == .ok);
     try testing.expect(std.mem.indexOf(u8, resp.ok.payload, "9.9.9") != null);
+    // ISSUE-011: the payload MUST carry the daemon version under the
+    // `daemon_version` key (not `version`) so the client's VersionPayload
+    // parser picks it up.
+    try testing.expect(std.mem.indexOf(u8, resp.ok.payload, "\"daemon_version\"") != null);
+}
+
+// ISSUE-011 contract guard: the daemon's `version`-command payload must parse
+// cleanly as the client's `VersionPayload` shape, with `daemon_version`
+// populated. This mirrors `client/format.zig`'s `VersionPayload` (all fields
+// optional; only `daemon_version` is set by the daemon). If someone renames
+// the emitted field back to `version`, `daemon_version` parses as null and
+// this test fails — pinning the daemon↔client field-name contract.
+test "commands: handleVersion payload parses as client VersionPayload (ISSUE-011)" {
+    const a = testing.allocator;
+
+    var trackers = makeEmptyTrackerMap(a);
+    defer trackers.deinit();
+    var cfg = makeConfig();
+    var stub = StubBackend{};
+    var be = realBackendFromStub(&stub);
+    defer be.deinit();
+
+    var ctx = Context{
+        .trackers = &trackers,
+        .config = &cfg,
+        .backend = &be,
+        .version = "1.2.3",
+    };
+    const resp = try ctx.handle(.{ .version = {} }, a);
+    defer resp.deinit(a);
+    try testing.expect(resp == .ok);
+
+    // Local mirror of client/format.zig's VersionPayload contract.
+    const VersionPayload = struct {
+        daemon_version: ?[]const u8 = null,
+        git_commit: ?[]const u8 = null,
+        build_date: ?[]const u8 = null,
+    };
+    const parsed = try std.json.parseFromSlice(
+        VersionPayload,
+        a,
+        resp.ok.payload,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+
+    try testing.expect(parsed.value.daemon_version != null);
+    try testing.expectEqualStrings("1.2.3", parsed.value.daemon_version.?);
+    // The daemon deliberately does NOT embed git/build state (reproducible
+    // builds) — these stay absent and the client handles their absence.
+    try testing.expect(parsed.value.git_commit == null);
+    try testing.expect(parsed.value.build_date == null);
 }
 
 test "commands: handleStatus produces expected JSON fields" {

@@ -63,8 +63,11 @@ startup. CRC32-validated; discarded on mismatch. Mode 0600. Default:
 .IR /var/lib/fail2zig/state.bin .
 .TP
 .B memory_ceiling_mb
-Integer. Hard memory ceiling enforced at the allocator level. Minimum: 16.
-Default: 64.
+Integer. Bounds the state tracker's entry capacity: the ceiling is divided by
+an approximate per-entry size (~1536\ B) to derive a maximum tracked-IP count.
+Once that cap is reached, the oldest unbanned entries are evicted rather than
+growing unbounded. This is not a per-component byte budget on every allocator.
+Minimum: 16. Default: 64.
 .TP
 .B metrics_bind
 String (IP address). Address the HTTP metrics server binds to. Default:
