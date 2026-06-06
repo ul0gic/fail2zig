@@ -63,11 +63,15 @@ fn defaultStatsSnapshot(ctx: ?*anyopaque) StatsSnapshot {
 /// in main.zig copies between them so this file keeps zero compile-time
 /// dependency on the source modules.
 ///
-/// `healthy == false` is a genuine negative probe — only a journald jail
-/// that has never read cleanly reports it (file health returns "unknown"
-/// rather than a hard false). That invariant is what lets
-/// `computeOverallState` use `healthy == false` as the DEGRADED trigger
-/// while staying journald-only in v1 (§4).
+/// `healthy == false` is a genuine negative probe. journald reports it when
+/// no clean `journalctl` poll has ever completed; the file source reports it
+/// (ENH-004) when a watch that was once attached has been detached past the
+/// debounce window (deleted / unmounted / perms revoked). Either way it is a
+/// real source break, which is what lets `computeOverallState` use
+/// `healthy == false` as the DEGRADED trigger for ANY enforcing jail
+/// (ENH-004 lifts the SYS-017 v1 journald-only restriction). A source that
+/// has never read returns "unknown" (null), never a hard false, so DEGRADED
+/// is never asserted from a placeholder.
 ///
 /// This carries HEALTH only (whether the source is reading). The SOURCE
 /// label is the *resolved-source descriptor* — `JailSourceSource`, always
@@ -237,11 +241,11 @@ pub const Context = struct {
     /// descriptors never disagree with what the daemon actually does.
     ///
     /// DEGRADED predicate (§4): an ENABLED, ENFORCING jail whose log source
-    /// is genuinely unhealthy (`health.healthy == false`). Only a journald
-    /// source ever reports `healthy == false` — the file source returns
-    /// "unknown" (null) instead of a hard false — so this is journald-only
-    /// in v1 without an explicit source check (the invariant lives in the
-    /// `JailHealthSource` adapter). A jail with unknown health (null) is
+    /// is genuinely unhealthy (`health.healthy == false`). Both source kinds
+    /// can report a hard false: journald when no clean poll has ever
+    /// completed, file (ENH-004) when a once-attached watch is detached past
+    /// the debounce window. So DEGRADED is source-agnostic — the predicate
+    /// needs no explicit source check. A jail with unknown health (null) is
     /// NEVER degraded: DEGRADED is asserted only from a real negative probe,
     /// never a placeholder. This reads health probes only — it never changes
     /// whether/how a ban is dispatched.
@@ -257,7 +261,7 @@ pub const Context = struct {
             } else {
                 any_enforcing = true;
                 // Enforcing jail: a genuine negative source-health probe
-                // (journald-only) flips the host to DEGRADED.
+                // (journald OR file, per ENH-004) flips the host to DEGRADED.
                 if (self.health_source.lookup(self.health_source.ctx, jc.name)) |h| {
                     if (!h.healthy) any_degraded = true;
                 }

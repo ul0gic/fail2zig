@@ -18,6 +18,7 @@
 //! FDs carry `SOCK_CLOEXEC`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const linux = std.os.linux;
 const mem = std.mem;
@@ -39,8 +40,14 @@ pub const NLMSG_HDRLEN: usize = nlmsgAlign(@sizeOf(linux.nlmsghdr));
 /// Errors raised by the wrapper. These map cleanly onto
 /// `BackendError.SystemError` at the backend boundary.
 pub const Error = error{
-    /// `socket(2)` or `bind(2)` failed.
+    /// `socket(2)` or `bind(2)` failed (transient / unexpected cause).
     SocketFailed,
+    /// `socket(2)` reported the netlink protocol or family is unavailable
+    /// (`EPROTONOSUPPORT` / `EAFNOSUPPORT` / `EINVAL`) — the kernel lacks
+    /// netfilter/nf_tables support (module not loaded, or not compiled in).
+    /// Distinct from `SocketFailed` so callers (SYS-014 #2) can tell
+    /// "no nf_tables in kernel" apart from a transient socket failure.
+    ProtocolUnsupported,
     /// `send(2)` / `sendto(2)` failed.
     SendFailed,
     /// `recv(2)` / `recvfrom(2)` failed.
@@ -107,8 +114,18 @@ pub const NetlinkSocket = struct {
         // Always pass SOCK_CLOEXEC per security.md — we don't want
         // the socket fd leaking into subprocess spawns.
         const flags = posix.SOCK.RAW | posix.SOCK.CLOEXEC;
-        const fd = posix.socket(posix.AF.NETLINK, flags, @intCast(protocol)) catch {
-            return error.SocketFailed;
+        // SYS-014 #2: preserve the cause. A missing netfilter/nf_tables
+        // subsystem surfaces here as PROTONOSUPPORT/AFNOSUPPORT/INVAL → map
+        // to `ProtocolUnsupported` so `detect()` can say "no nf_tables in
+        // kernel" rather than a generic socket failure. ACCES (rare on
+        // socket(2)) → `PermissionDenied`. Everything else stays transient.
+        const fd = posix.socket(posix.AF.NETLINK, flags, @intCast(protocol)) catch |err| switch (err) {
+            error.ProtocolNotSupported,
+            error.AddressFamilyNotSupported,
+            error.ProtocolFamilyNotAvailable,
+            => return error.ProtocolUnsupported,
+            error.PermissionDenied => return error.PermissionDenied,
+            else => return error.SocketFailed,
         };
         errdefer posix.close(fd);
 
@@ -247,10 +264,26 @@ pub const NetlinkSocket = struct {
                 // name varies across Zig 0.14 / 0.15.
                 if (@intFromEnum(msg.hdr.type) != @as(u16, 2)) continue;
                 const errno = try parseNlmsgerr(msg.payload);
-                // Correlate by the *inner* seq (which is msg.hdr.seq
-                // echoed back). `parseNlmsgerr` skips past the errno
-                // field; the header inside the payload is the one
-                // we originally sent, but its seq equals msg.hdr.seq.
+
+                // A non-zero errno is ALWAYS fatal and is surfaced
+                // regardless of whether its seq is in `expected_seqs`.
+                // The kernel may report a batch failure on a seq we did
+                // not list as a completion target — notably an `-EPERM`
+                // permission check at `NFNL_MSG_BATCH_BEGIN` (whose seq
+                // callers don't pass), but also at BATCH_END or an op,
+                // varying by kernel/operation. The scaffold socket is
+                // used synchronously for one batch at a time, so any error
+                // on it is ours; dropping it as a "stray ACK" (the prior
+                // bug) hid the real cause and stalled `drainAck` until
+                // `recv` timed out, mis-surfacing e.g. EPERM as a generic
+                // SystemError. Seq correlation applies ONLY to errno==0
+                // success acks below.
+                if (errno != 0) return errnoToError(errno);
+
+                // Correlate the success ack by the *inner* seq (which is
+                // msg.hdr.seq echoed back). `parseNlmsgerr` skips past the
+                // errno field; the header inside the payload is the one we
+                // originally sent, but its seq equals msg.hdr.seq.
                 const seq = msg.hdr.seq;
                 var matched_idx: ?usize = null;
                 for (expected_seqs, 0..) |s, idx| {
@@ -259,8 +292,7 @@ pub const NetlinkSocket = struct {
                         break;
                     }
                 }
-                if (matched_idx == null) continue; // stray ACK, ignore
-                if (errno != 0) return errnoToError(errno);
+                if (matched_idx == null) continue; // stray success ack, ignore
                 if (use_bitset) {
                     bits &= ~(@as(u64, 1) << @intCast(matched_idx.?));
                 } else {
@@ -679,4 +711,133 @@ test "netlink: open real socket or skip when not privileged" {
     try std.testing.expect(sock.port_id != 0);
     try std.testing.expectEqual(@as(u32, 1), sock.nextSeq());
     try std.testing.expectEqual(@as(u32, 2), sock.nextSeq());
+}
+
+test "netlink: init maps an unsupported netlink protocol to ProtocolUnsupported (SYS-014)" {
+    // An out-of-range netlink protocol number is rejected by socket(2) with
+    // EPROTONOSUPPORT — the same class of error a kernel without
+    // netfilter/nf_tables produces. We must surface that as the distinct
+    // `ProtocolUnsupported`, not a generic `SocketFailed`, so `detect` can
+    // tell the operator "no nf_tables in kernel". Skip if a sandbox blocks
+    // socket creation outright (then we can't exercise the mapping).
+    const bogus_protocol: u32 = 255; // beyond MAX_LINKS
+    const result = NetlinkSocket.init(bogus_protocol);
+    if (result) |sock| {
+        var s = sock;
+        s.close();
+        return error.SkipZigTest; // kernel accepted it — can't assert here
+    } else |err| switch (err) {
+        error.ProtocolUnsupported => {}, // expected mapping
+        else => return error.SkipZigTest, // sandbox-specific failure; don't assert
+    }
+}
+
+// --- drainAck: a non-zero errno is fatal regardless of seq match (SYS-014) ---
+//
+// These drive the REAL `drainAck` → `recv` → `MessageIterator` → `parseNlmsgerr`
+// path over a `socketpair` so no kernel/netlink privilege is needed. We write a
+// crafted `NLMSG_ERROR` frame to one end and call `drainAck` on the other.
+
+/// Create a connected `AF_UNIX/SOCK_DGRAM` socket pair for tests. Returns
+/// `{ reader, writer }` fds, or null if the host disallows it (skip then).
+/// Uses the raw linux syscall — `std.posix` has no `socketpair` wrapper here.
+fn testSocketpair() ?[2]i32 {
+    var fds: [2]i32 = undefined;
+    const rc = linux.socketpair(posix.AF.UNIX, posix.SOCK.DGRAM, 0, &fds);
+    if (linux.E.init(rc) != .SUCCESS) return null;
+    return fds;
+}
+
+/// Build an `NLMSG_ERROR` frame (type 2) with the given seq and errno into
+/// `buf`, returning the written slice. Payload is `struct nlmsgerr { __s32
+/// error; ... }` — `parseNlmsgerr` reads the leading i32.
+fn buildNlmsgErr(buf: []u8, seq: u32, errno: i32) []const u8 {
+    var b = MessageBuilder.init(buf);
+    var payload: [4]u8 = undefined;
+    mem.writeInt(i32, &payload, errno, .little);
+    b.append(@as(u16, 2), 0, seq, 0, &payload) catch unreachable;
+    return b.bytes();
+}
+
+test "netlink: drainAck surfaces a non-zero errno on an UNEXPECTED seq (SYS-014)" {
+    // The bug: a batch rejected at NFNL_MSG_BATCH_BEGIN returns NLMSG_ERROR on
+    // the BATCH_BEGIN seq, which callers do NOT list in `expected_seqs`. The
+    // old code did `if (matched_idx == null) continue;` BEFORE the errno
+    // check, dropping the -EPERM as a "stray ACK" → drainAck stalled until
+    // recv timed out → the real cause (PermissionDenied) was never surfaced.
+    // The fix returns any non-zero errno regardless of seq match.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const fds = testSocketpair() orelse return error.SkipZigTest;
+    var writer_open = true;
+    defer posix.close(fds[1]);
+    defer if (writer_open) posix.close(fds[0]);
+
+    // Kernel reports -EPERM at BATCH_BEGIN, seq = 1.
+    var frame_buf: [64]u8 = undefined;
+    const frame = buildNlmsgErr(&frame_buf, 1, -1); // -1 == -EPERM
+    _ = posix.send(fds[0], frame, 0) catch return error.SkipZigTest;
+    posix.close(fds[0]);
+    writer_open = false;
+
+    var sock = NetlinkSocket{ .fd = fds[1] };
+    // Bound the wait so a regression that drops the error (the old bug)
+    // FAILS fast (Timeout) instead of hanging CI.
+    sock.setRecvTimeout(500) catch return error.SkipZigTest;
+    // expected_seqs is the OP seq (e.g. del_seq=2), NOT the BATCH_BEGIN seq 1.
+    var scratch: [256]u8 = undefined;
+    const result = sock.drainAck(&[_]u32{2}, &scratch);
+    try std.testing.expectError(error.PermissionDenied, result);
+}
+
+test "netlink: drainAck maps each errno class on an unexpected seq (SYS-014)" {
+    // Same fatal-regardless-of-seq path for the other errno classes the
+    // scaffold relies on, so the mapping is exercised end-to-end through recv.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const Case = struct { errno: i32, want: anyerror };
+    const cases = [_]Case{
+        .{ .errno = -1, .want = error.PermissionDenied }, // EPERM
+        .{ .errno = -13, .want = error.PermissionDenied }, // EACCES
+        .{ .errno = -2, .want = error.NotFound }, // ENOENT
+        .{ .errno = -17, .want = error.AlreadyExists }, // EEXIST
+        .{ .errno = -22, .want = error.InvalidArgument }, // EINVAL
+    };
+    for (cases) |c| {
+        const fds = testSocketpair() orelse return error.SkipZigTest;
+        defer posix.close(fds[1]);
+        var frame_buf: [64]u8 = undefined;
+        const frame = buildNlmsgErr(&frame_buf, 1, c.errno); // seq 1, unexpected
+        _ = posix.send(fds[0], frame, 0) catch return error.SkipZigTest;
+        posix.close(fds[0]);
+        var sock = NetlinkSocket{ .fd = fds[1] };
+        sock.setRecvTimeout(500) catch return error.SkipZigTest; // fail fast on regression
+        var scratch: [256]u8 = undefined;
+        try std.testing.expectError(c.want, sock.drainAck(&[_]u32{2}, &scratch));
+    }
+}
+
+test "netlink: drainAck does NOT surface a SUCCESS ack on an unexpected seq (SYS-014)" {
+    // Guard against over-correction: an errno==0 ack on a seq we did not
+    // expect must still be IGNORED (success correlation stays seq-scoped), not
+    // treated as completion. With only a stray success ack and a recv timeout,
+    // drainAck must keep waiting and ultimately time out (the expected op-ack
+    // never arrives) — proving the success path was NOT prematurely satisfied.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const fds = testSocketpair() orelse return error.SkipZigTest;
+    defer posix.close(fds[1]);
+    var frame_buf: [64]u8 = undefined;
+    const frame = buildNlmsgErr(&frame_buf, 99, 0); // errno 0 == success, seq 99
+    _ = posix.send(fds[0], frame, 0) catch return error.SkipZigTest;
+    posix.close(fds[0]); // EOF after the one stray ack
+
+    var sock = NetlinkSocket{ .fd = fds[1] };
+    sock.setRecvTimeout(200) catch return error.SkipZigTest;
+    var scratch: [256]u8 = undefined;
+    // expected_seqs=[2] never arrives; the stray success ack on seq 99 is
+    // ignored; the socket EOFs → recv returns 0 → TruncatedMessage, or the
+    // timeout fires → Timeout. Either way it is NOT a spurious success.
+    const result = sock.drainAck(&[_]u32{2}, &scratch);
+    try std.testing.expect(result == error.Timeout or result == error.TruncatedMessage);
 }

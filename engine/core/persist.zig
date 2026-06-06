@@ -506,6 +506,11 @@ fn decodeEntry(buf: [entry_size]u8) ?StateEntry {
 /// the restored bans remain active and the ban expiry timer picks them
 /// up on the next tick.
 pub fn seed(tracker: *StateTracker, entries: []const StateEntry) Error!void {
+    if (entries.len == 0) return;
+    // QA-002: reserve before bulk-loading so the restored set lands in a
+    // single reserved bucket array (no per-put rehash), matching the
+    // steady-state never-rehash invariant.
+    tracker.ensureReserved() catch return error.OutOfMemory;
     for (entries) |e| {
         var st: IpState = .{
             .jail = e.jail,
@@ -648,6 +653,10 @@ pub fn seedMap(
             .ring = [_]Timestamp{0} ** state_mod.max_attempts_per_ip,
             .ring_len = 0,
         };
+        // QA-002: reserve the target's bucket array before its first put
+        // (idempotent after the first call). Keeps the never-rehash
+        // invariant for restored entries under lazy init.
+        target.ensureReserved() catch return error.OutOfMemory;
         target.map.put(e.ip, st) catch return error.OutOfMemory;
         if (routed) |c| c.* += 1;
     }

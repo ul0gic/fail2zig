@@ -63,10 +63,14 @@ pub const Error = error{
 /// shows its path, not "unknown". HEALTH being unknown (null here) is the
 /// orthogonal, expected signal for such a jail.
 ///
-/// `healthy == false` is a *genuine negative probe* (a journald jail that
-/// has never read cleanly); the file source never reports `false` (it
-/// returns `null` = unknown instead), so a `false` is always journald and
-/// can drive DEGRADED safely (§4).
+/// `healthy == false` is a *genuine negative probe*. journald reports it
+/// when no clean `journalctl` poll has ever completed; the file source
+/// reports it (ENH-004) when a watch that was once attached has been
+/// detached past the debounce window (deleted / unmounted / perms revoked).
+/// Both are real source breaks an enforcing jail must surface as DEGRADED.
+/// A source that has never attached/read returns `null` (unknown), never a
+/// hard `false`, so a late-appearing boot log never flashes a false
+/// negative.
 pub const JailHealth = struct {
     healthy: bool,
     lines_seen: u64,
@@ -91,6 +95,12 @@ const inotify_read_buf_len: usize = 4096;
 /// fingerprint. 64 bytes is plenty for syslog-style headers (date,
 /// hostname, program) and fits in a single cache line.
 const fingerprint_len: usize = 64;
+/// Debounce (seconds) before a was-attached-then-detached file watch
+/// reports unhealthy (ENH-004). Normal rename rotation is a detach
+/// immediately followed by a reopen; a couple of seconds of slack (≥ one
+/// ~1 s expiry-sweep tick) absorbs that flicker while still surfacing a
+/// genuine source break within a couple of seconds. Not operator-tunable.
+const detach_debounce_s: i64 = 2;
 
 /// Per-watched-file state. Heap-allocated so the inotify-wd-keyed map
 /// can point at it from both the file-watch entry and the parent-dir
@@ -132,6 +142,23 @@ const FileWatch = struct {
     /// Lines delivered to the callback, lifetime.
     lines_seen: u64,
 
+    /// Structural read-health (ENH-004). `true` once a file-level inotify
+    /// watch has ever successfully attached for this path (in `watchFile`
+    /// or `reopenAfterRotation`). This is what distinguishes a log that has
+    /// never appeared (boot / late log → never attached → unknown health)
+    /// from one that was attached then broke (deleted / unmounted / perms
+    /// revoked → was-attached-then-detached → genuinely unhealthy). Set
+    /// once, never cleared — a watch that has ever read is forever
+    /// "was once a real source".
+    was_ever_attached: bool,
+    /// Wall-clock secs of the most recent was-attached → detached
+    /// transition (set in `detachFileWatch` only when `was_ever_attached`).
+    /// `0` means "not currently in a detached-after-attach state". The
+    /// verdict only reports unhealthy once `now - detached_at_ts >=
+    /// detach_debounce_s`, so normal rename-rotation flicker (detach →
+    /// reopen within ~one tick) never flips DEGRADED. Cleared on reopen.
+    detached_at_ts: i64,
+
     line_buffer: LineBuffer,
     allocator: Allocator,
 
@@ -160,6 +187,19 @@ pub const LogWatcher = struct {
     /// Owns the `FileWatch` pointers; iterate for cleanup.
     files: std.ArrayList(*FileWatch),
 
+    /// BUG-007: count of trailing `IN_IGNORED` events we still expect for a
+    /// wd-NUMBER that *we* proactively `inotify_rm_watch`'d. The kernel
+    /// queues exactly one `IN_IGNORED` per removed watch and immediately
+    /// frees the wd number for reuse, so a stale `IN_IGNORED` can arrive
+    /// AFTER `reopenAfterRotation` has reused that same number for a new,
+    /// healthy watch. We must NOT let that trailing event detach the new
+    /// watch. Keyed by wd number; the value is a count (the same number can
+    /// be removed → reused → removed again before either `IN_IGNORED`
+    /// drains). A kernel-AUTO `IN_IGNORED` (file deleted while we held the
+    /// watch) has no pending entry → it is a genuine detach. Entries are
+    /// removed when the count returns to 0.
+    pending_ignored: std.AutoHashMap(i32, u32),
+
     pub fn init(allocator: Allocator, event_loop: *EventLoop) Error!LogWatcher {
         if (builtin.os.tag != .linux) return error.NotLinux;
 
@@ -172,6 +212,8 @@ pub const LogWatcher = struct {
         errdefer wd_to_file.deinit();
         var files = std.ArrayList(*FileWatch).init(allocator);
         errdefer files.deinit();
+        var pending_ignored = std.AutoHashMap(i32, u32).init(allocator);
+        errdefer pending_ignored.deinit();
 
         var watcher: LogWatcher = .{
             .allocator = allocator,
@@ -179,6 +221,7 @@ pub const LogWatcher = struct {
             .inotify_fd = ifd,
             .wd_to_file = wd_to_file,
             .files = files,
+            .pending_ignored = pending_ignored,
         };
 
         // Register the inotify FD with the event loop so read events are
@@ -202,40 +245,72 @@ pub const LogWatcher = struct {
         ) catch return error.EventLoopError;
     }
 
-    /// Per-jail read-HEALTH for the status surface (SYS-017). Pure
-    /// derivation over the live `FileWatch` fields — no I/O. A jail may map
-    /// to several logpaths (several `FileWatch` records); we aggregate.
-    /// Returns `null` when `name` matches no watch (the caller then tries
-    /// the journald source, or reports unknown HEALTH — the SOURCE label is
-    /// the daemon's resolved descriptor, not this).
+    /// Per-jail read-HEALTH for the status surface (ENH-004, supersedes the
+    /// SYS-017 v1 verdict). Pure structural derivation over the live
+    /// `FileWatch` fields — no I/O. A jail may map to several logpaths
+    /// (several `FileWatch` records); we aggregate. Returns `null` when
+    /// `name` matches no watch (the caller then tries the journald source,
+    /// or reports unknown HEALTH — the SOURCE label is the daemon's resolved
+    /// descriptor, not this).
     ///
-    /// File verdict (§2.2, best-effort/informational — NEVER drives
-    /// DEGRADED in v1): healthy iff any matching watch is attached
-    /// (`file_fd >= 0`) OR the jail has ever delivered a line
-    /// (`lines_seen > 0`). A jail whose every watch is detached and which
-    /// has never read returns `null` (unknown), never a hard `false` — the
-    /// lifetime counter is sticky and a late-appearing boot log must not
-    /// flash a false-unhealthy.
+    /// Like the parent-wd dispatch in `handleEvent`, this iterates
+    /// `self.files` and so relies on the FileWatch-immortality invariant
+    /// documented there (no runtime removal; revisit if dynamic jail reload
+    /// is ever added).
+    ///
+    /// File verdict (no staleness timer — a quiet healthy jail keeps its
+    /// inotify watch attached and stays healthy with zero traffic):
+    ///
+    ///   * healthy (`true`) iff ANY matching watch is currently attached
+    ///     (`file_fd >= 0`) — the source is reading, traffic or not.
+    ///   * else if NO matching watch was ever attached → `null` (unknown):
+    ///     a never-appeared / boot / late log must not flash unhealthy.
+    ///   * else (every matching watch is detached, ≥1 was once attached):
+    ///     unhealthy (`false`) iff the most recent detach is past the
+    ///     `detach_debounce_s` window — a was-attached-then-detached source
+    ///     (deleted / unmounted / perms revoked). Within the window → `null`
+    ///     (rename-rotation flicker; not yet a confirmed break).
+    ///
+    /// A `false` from this function is a genuine negative probe and DOES
+    /// drive DEGRADED for an enforcing jail (ENH-004 lifts the SYS-017 v1
+    /// "file never drives DEGRADED" restriction). `lines_seen`/
+    /// `last_read_ok_ts` are still reported for the per-jail display but no
+    /// longer source the verdict (the old sticky-healthy defect).
     pub fn healthForJail(self: *const LogWatcher, name: []const u8) ?JailHealth {
         var matched = false;
         var any_attached = false;
+        var any_ever_attached = false;
         var total_lines: u64 = 0;
-        var max_ts: i64 = 0;
+        var max_read_ts: i64 = 0;
+        // Most recent (latest) detach across this jail's was-attached watches.
+        var latest_detach_ts: i64 = 0;
         for (self.files.items) |fw| {
             if (!std.mem.eql(u8, fw.jail.slice(), name)) continue;
             matched = true;
             if (fw.file_fd >= 0) any_attached = true;
+            if (fw.was_ever_attached) any_ever_attached = true;
+            if (fw.detached_at_ts > latest_detach_ts) latest_detach_ts = fw.detached_at_ts;
             total_lines += fw.lines_seen;
-            if (fw.last_read_ok_ts > max_ts) max_ts = fw.last_read_ok_ts;
+            if (fw.last_read_ok_ts > max_read_ts) max_read_ts = fw.last_read_ok_ts;
         }
         if (!matched) return null;
-        const healthy = any_attached or total_lines > 0;
-        if (!healthy) return null; // unknown, never a hard `false` (§2.2)
-        return .{
-            .healthy = true,
-            .lines_seen = total_lines,
-            .last_read_ok_ts = max_ts,
-        };
+
+        // Any attached watch → the jail is reading → healthy.
+        if (any_attached) {
+            return .{ .healthy = true, .lines_seen = total_lines, .last_read_ok_ts = max_read_ts };
+        }
+        // Nothing ever attached → unknown (boot / late log), never false.
+        if (!any_ever_attached) return null;
+
+        // Detached after having been attached. Confirm the break only once
+        // the debounce has elapsed, so normal rotation flicker stays unknown.
+        if (latest_detach_ts != 0) {
+            const now = std.time.timestamp();
+            if (now - latest_detach_ts >= detach_debounce_s) {
+                return .{ .healthy = false, .lines_seen = total_lines, .last_read_ok_ts = max_read_ts };
+            }
+        }
+        return null; // within debounce → unknown, not yet a confirmed break
     }
 
     pub fn deinit(self: *LogWatcher) void {
@@ -248,6 +323,7 @@ pub const LogWatcher = struct {
         }
         self.files.deinit();
         self.wd_to_file.deinit();
+        self.pending_ignored.deinit();
         posix.close(self.inotify_fd);
         self.* = undefined;
     }
@@ -286,6 +362,8 @@ pub const LogWatcher = struct {
             .parent_wd = -1,
             .last_read_ok_ts = 0,
             .lines_seen = 0,
+            .was_ever_attached = false,
+            .detached_at_ts = 0,
             .line_buffer = undefined,
             .allocator = self.allocator,
         };
@@ -398,16 +476,26 @@ pub const LogWatcher = struct {
                 file_mask,
             ) catch return error.InotifyAddWatchFailed;
             fw.file_wd = file_wd;
+            // ENH-004: a real source attached at least once. Structural
+            // health keys off this — a path that never gets here stays
+            // "unknown" (boot / late log), never "unhealthy".
+            fw.was_ever_attached = true;
         }
         errdefer if (fw.file_wd >= 0) {
             _ = linux.inotify_rm_watch(self.inotify_fd, fw.file_wd);
         };
 
-        // Record the FileWatch under both watch descriptors.
+        // Record the FileWatch. The FILE wd is unique per file, so it keys
+        // the 1:1 `wd_to_file` map. The PARENT wd is NOT recorded here: when
+        // several jails' logs live in the same directory, inotify dedups the
+        // dir watch and hands back the SAME parent wd for all of them, so a
+        // 1:1 map would let the last jail registered overwrite the rest
+        // (BUG-007). Parent-dir events are instead dispatched by iterating
+        // `self.files` for every watch sharing that parent wd (see
+        // `handleEvent`).
         try self.files.append(fw);
         errdefer _ = self.files.pop();
         if (fw.file_wd >= 0) try self.wd_to_file.put(fw.file_wd, fw);
-        try self.wd_to_file.put(fw.parent_wd, fw);
     }
 
     // ------------------------------------------------------------------
@@ -458,11 +546,42 @@ pub const LogWatcher = struct {
         ev: linux.inotify_event,
         name: []const u8,
     ) !void {
-        const fw = self.wd_to_file.get(ev.wd) orelse return;
+        // BUG-007: a trailing `IN_IGNORED` for a wd WE proactively removed is
+        // a no-op. Check this BEFORE resolving the wd: by the time the stale
+        // event drains, `reopenAfterRotation` may have reused the wd NUMBER
+        // for a fresh, healthy watch — letting this event reach the detach
+        // branch would clobber the reopened watch (stop reading the
+        // rotated-in file) and falsely flip the jail to DEGRADED. A
+        // kernel-AUTO `IN_IGNORED` (no pending entry) falls through to the
+        // genuine-detach handling below.
+        if ((ev.mask & linux.IN.IGNORED) != 0 and self.consumePendingIgnored(ev.wd)) {
+            return;
+        }
 
-        // Event on the file itself.
-        if (ev.wd == fw.file_wd) {
-            if ((ev.mask & linux.IN.MODIFY) != 0) try self.readNewData(fw);
+        // FILE event: the file wd is unique per file, so the 1:1 map resolves
+        // it exactly. (Parent wds are deliberately NOT in this map — see the
+        // parent branch below and the note in `watchFile`.)
+        if (self.wd_to_file.get(ev.wd)) |fw| {
+            if ((ev.mask & linux.IN.MODIFY) != 0) {
+                // ENH-004: a hard read/stat failure on a still-open fd (EIO,
+                // ESTALE on an unmounted NFS export, EBADF, a revoked-perms
+                // remount) means the source is broken even though the fd is
+                // still nominally open. Transient cases never reach here:
+                // `posix.read` retries EINTR internally and EAGAIN is
+                // filtered as `WouldBlock` inside the read loop. So treat a
+                // returned error as a genuine break — detach (arming the
+                // regression debounce) instead of leaving a dead fd
+                // reporting healthy. The parent-dir watch stays alive so a
+                // replacement file still triggers `reopenAfterRotation`.
+                self.readNewData(fw) catch |err| {
+                    std.log.warn(
+                        "log_watcher: read failed on {s}: {s}; detaching file watch",
+                        .{ fw.path(), @errorName(err) },
+                    );
+                    self.detachFileWatch(fw);
+                    return;
+                };
+            }
             if ((ev.mask & (linux.IN.MOVE_SELF | linux.IN.DELETE_SELF | linux.IN.IGNORED)) != 0) {
                 // Watched file disappeared — close it but keep the
                 // parent watch alive so we'll pick up the replacement.
@@ -471,15 +590,38 @@ pub const LogWatcher = struct {
             return;
         }
 
-        // Event on the parent directory.
-        if (ev.wd == fw.parent_wd) {
+        // PARENT-DIR event: `ev.wd` is a directory watch, which inotify
+        // dedups per-inode — so it may be SHARED by several jails whose logs
+        // live in the same directory (BUG-007). We cannot rely on a single
+        // lookup; iterate every FileWatch on this parent wd and reopen each
+        // one whose basename matches the created/moved name. Without this, a
+        // shared parent wd resolves to only the last-registered jail and the
+        // others never reattach after rotation (missing post-rotation reads +
+        // false DEGRADED). O(files) only on a directory event (rare); files
+        // is bounded by the jail count.
+        if ((ev.mask & (linux.IN.CREATE | linux.IN.MOVED_TO)) == 0) return;
+        // INVARIANT: safe to iterate `self.files` here (and to rely on stable
+        // `*FileWatch` pointers) ONLY because FileWatches are never removed
+        // during the daemon lifetime — they live from startup config load
+        // until `deinit`. There is no runtime unwatch / per-jail removal path.
+        // If dynamic jail reload / runtime jail add-remove / SIGHUP config
+        // reload is ever added, this parent-wd dispatch (and any held
+        // `*FileWatch`) must be revisited.
+        for (self.files.items) |fw| {
+            if (fw.parent_wd != ev.wd) continue;
             const fw_basename = fw.basename();
             if (name.len == fw_basename.len and std.mem.eql(u8, name, fw_basename)) {
-                if ((ev.mask & (linux.IN.CREATE | linux.IN.MOVED_TO)) != 0) {
-                    try self.reopenAfterRotation(fw);
-                }
+                // Per-fw resilience: one jail's reopen failure (e.g. transient
+                // open error) must not skip the remaining matching jails on
+                // this shared parent wd. Log and continue — the parent watch
+                // stays live, so a later create on the same path retries.
+                self.reopenAfterRotation(fw) catch |err| {
+                    std.log.warn(
+                        "log_watcher: reopen after rotation failed on {s}: {s}",
+                        .{ fw.path(), @errorName(err) },
+                    );
+                };
             }
-            return;
         }
     }
 
@@ -600,8 +742,23 @@ pub const LogWatcher = struct {
     }
 
     fn detachFileWatch(self: *LogWatcher, fw: *FileWatch) void {
+        // ENH-004: arm the regression debounce only for a watch that was
+        // genuinely attached. A detach during a never-succeeded first
+        // attach must not arm it (that path stays "unknown", not
+        // "unhealthy"). Stamp once per detach transition — re-detaching an
+        // already-detached watch keeps the original (earliest) timestamp so
+        // the debounce measures from the real break, not a later sweep.
+        if (fw.was_ever_attached and fw.file_wd >= 0 and fw.detached_at_ts == 0) {
+            fw.detached_at_ts = std.time.timestamp();
+        }
         if (fw.file_wd >= 0) {
             _ = self.wd_to_file.remove(fw.file_wd);
+            // BUG-007: a proactive `inotify_rm_watch` makes the kernel queue
+            // exactly one trailing `IN_IGNORED` for this wd number and frees
+            // the number for reuse. Record that we owe ourselves one
+            // suppression so a stale `IN_IGNORED` arriving AFTER the wd is
+            // reused (by `reopenAfterRotation`) cannot detach the new watch.
+            self.markPendingIgnored(fw.file_wd);
             _ = linux.inotify_rm_watch(self.inotify_fd, fw.file_wd);
             fw.file_wd = -1;
         }
@@ -612,6 +769,39 @@ pub const LogWatcher = struct {
         fw.offset = 0;
         fw.prev_size = 0;
         fw.fingerprint_len = 0;
+    }
+
+    /// BUG-007: record that one trailing `IN_IGNORED` is expected (and must
+    /// be ignored) for `wd` because we proactively removed that watch.
+    /// Counting (rather than a set) handles the same wd NUMBER being removed,
+    /// reused, and removed again before either `IN_IGNORED` drains. Failure
+    /// to allocate the bookkeeping entry is non-fatal: the worst case is the
+    /// pre-fix behavior (a stale `IN_IGNORED` could clobber a reused watch),
+    /// so we log and continue rather than leak the rm_watch.
+    fn markPendingIgnored(self: *LogWatcher, wd: i32) void {
+        const gop = self.pending_ignored.getOrPut(wd) catch {
+            std.log.warn("log_watcher: pending-IGNORED bookkeeping alloc failed for wd={d}", .{wd});
+            return;
+        };
+        if (gop.found_existing) {
+            gop.value_ptr.* += 1;
+        } else {
+            gop.value_ptr.* = 1;
+        }
+    }
+
+    /// BUG-007: if a trailing `IN_IGNORED` was expected for `wd`, consume one
+    /// and return `true` (the caller must treat the event as a no-op). A
+    /// kernel-AUTO `IN_IGNORED` (file deleted while we held the watch) has no
+    /// pending entry → returns `false` → genuine detach.
+    fn consumePendingIgnored(self: *LogWatcher, wd: i32) bool {
+        const entry = self.pending_ignored.getPtr(wd) orelse return false;
+        if (entry.* <= 1) {
+            _ = self.pending_ignored.remove(wd);
+        } else {
+            entry.* -= 1;
+        }
+        return true;
     }
 
     fn reopenAfterRotation(self: *LogWatcher, fw: *FileWatch) !void {
@@ -637,6 +827,11 @@ pub const LogWatcher = struct {
         ) catch return error.InotifyAddWatchFailed;
         fw.file_wd = file_wd;
         try self.wd_to_file.put(file_wd, fw);
+        // ENH-004: re-attached after a rotation — the source is reading
+        // again. Clear the debounce so the verdict goes back to healthy
+        // before the window elapses (this is the flicker we debounce for).
+        fw.was_ever_attached = true;
+        fw.detached_at_ts = 0;
 
         // Read whatever is already present.
         try self.readNewData(fw);
@@ -1004,16 +1199,42 @@ test "log_watcher: detects rename rotation" {
     try testing.expectEqualStrings("after", sink.lines.items[1]);
 }
 
-// --- SYS-017 read-health verdict (file: best-effort, never a hard false) ---
-
-test "log_watcher: healthForJail healthy once a watch is attached (SYS-017)" {
+test "log_watcher: BUG-007 trailing IN_IGNORED after wd reuse does NOT clobber reopened watch" {
+    // BUG-007 regression — the DETERMINISTIC guard. Drives the exact
+    // pathological state on a REAL inotify instance:
+    //
+    //   1. watch a real file → capture its file_wd (old_wd).
+    //   2. detachFileWatch → real inotify_rm_watch(old_wd) (kernel queues the
+    //      trailing IN_IGNORED for old_wd and frees the number) → our fix
+    //      records pending[old_wd].
+    //   3. reopenAfterRotation → real inotify_add_watch → new healthy watch.
+    //   4. put the watcher in the real-box reused-wd state (see below) and
+    //      deliver the trailing IN_IGNORED for old_wd via the real
+    //      handleEvent path — the clobber trigger.
+    //
+    // WITHOUT the fix this re-detaches the freshly reopened watch
+    // (file_fd=-1, stuck unhealthy → false DEGRADED, and post-rotation reads
+    // stop). WITH the fix the trailing IN_IGNORED is suppressed (pending entry
+    // consumed) and the watch survives: still attached, healthy, still reading.
+    //
+    // Two facts forced explicitly because a fresh in-process inotify instance
+    // cannot reproduce them on its own (confirmed by probing kernel 6.12):
+    //   * WD REUSE — the kernel's inotify IDR does NOT recycle a wd number on
+    //     the immediate next add_watch; reuse only happens after the IDR wraps
+    //     on a long-running daemon (f2z-target). We re-point the live mapping
+    //     so the reopened watch lands on old_wd, the real-box condition.
+    //   * ORDERING — in-process the kernel queues MOVE_SELF+IGNORED together,
+    //     so the IGNORED drains BEFORE the later parent IN_CREATE drives
+    //     reopen (harmless). We deliver it AFTER reopen, the box ordering.
+    // `tests/e2e/degraded_file_source.sh` assertion (c) covers the full
+    // real-logrotate timing + real IDR reuse end-to-end on f2z-target.
     if (builtin.os.tag != .linux) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = tmp.dir.realpath(".", &path_buf) catch return error.SkipZigTest;
-    const log_name = "h.log";
+    const log_name = "br.log";
     var full_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const log_path = try std.fmt.bufPrint(&full_path_buf, "{s}/{s}", .{ dir_path, log_name });
     {
@@ -1029,37 +1250,436 @@ test "log_watcher: healthForJail healthy once a watch is attached (SYS-017)" {
     var sink = LineSink.init(testing.allocator);
     defer sink.deinit(testing.allocator);
 
-    try watcher.watchFile(log_path, try JailId.fromSlice("sshd"), LineSink.onLine, &sink);
+    const jail = try JailId.fromSlice("sshd");
+    try watcher.watchFile(log_path, jail, LineSink.onLine, &sink);
 
-    // Attached watch (file_fd >= 0) → healthy even with zero lines read.
+    // Locate the FileWatch and capture the OLD file wd (the one the kernel
+    // will queue a trailing IN_IGNORED for when we detach).
+    try testing.expectEqual(@as(usize, 1), watcher.files.items.len);
+    const fw = watcher.files.items[0];
+    try testing.expect(fw.file_fd >= 0);
+    const old_wd = fw.file_wd;
+    try testing.expect(old_wd >= 0);
+
+    // Step 2: detach (real rm_watch(old_wd) → kernel queues the trailing
+    // IN_IGNORED for old_wd; our fix records pending[old_wd]).
+    watcher.detachFileWatch(fw);
+    try testing.expect(fw.file_fd == -1);
+
+    // Step 3: reopen (real add_watch). We write fresh content first so the
+    // reopened watch has something to read.
+    {
+        const f = try tmp.dir.openFile(log_name, .{ .mode = .write_only });
+        defer f.close();
+        _ = try f.writeAll("after-reopen\n");
+    }
+    try watcher.reopenAfterRotation(fw);
+    try testing.expect(fw.file_fd >= 0); // reopened
+    try testing.expect(fw.file_wd >= 0);
+    // The reopen reads existing content synchronously.
+    try testing.expect(sink.count() >= 1);
+    try testing.expectEqualStrings("after-reopen", sink.lines.items[0]);
+
+    // Simulate the kernel REUSING old_wd for the reopened watch. On a
+    // long-running daemon the inotify IDR eventually recycles wd numbers, so
+    // the reopened watch can land on the very number a stale IN_IGNORED still
+    // references — the exact condition that triggers the clobber on
+    // f2z-target. A fresh in-process inotify instance won't recycle the
+    // number on its own, so we re-point the live mapping to old_wd to put the
+    // watcher in that real-box state deterministically. (Only the bookkeeping
+    // is adjusted; the underlying open fd is the real reopened one.)
+    if (fw.file_wd != old_wd) {
+        _ = watcher.wd_to_file.remove(fw.file_wd);
+        fw.file_wd = old_wd;
+        try watcher.wd_to_file.put(old_wd, fw);
+    }
+
+    // Step 4: deliver the STALE trailing IN_IGNORED for old_wd — the event
+    // the kernel queued in step 2, now resolving (via reuse) to the freshly
+    // reopened watch. This is the clobber path.
+    const stale_ignored: linux.inotify_event = .{
+        .wd = old_wd,
+        .mask = linux.IN.IGNORED,
+        .cookie = 0,
+        .len = 0,
+    };
+    try watcher.handleEvent(stale_ignored, &[_]u8{});
+
+    // The fix must keep the reopened watch alive: NOT clobbered.
+    try testing.expect(fw.file_fd >= 0);
+    try testing.expect(fw.file_wd == old_wd);
+    try testing.expectEqual(@as(i64, 0), fw.detached_at_ts); // not re-armed
+
+    // Health stays healthy (an attached watch is healthy regardless of the
+    // stale event), not the stuck `false` the bug produced.
     const h = watcher.healthForJail("sshd").?;
     try testing.expect(h.healthy);
-    try testing.expectEqual(@as(u64, 0), h.lines_seen);
 
-    // A detached watch that has never read returns unknown (null), never a
-    // hard `false`: the file verdict must not flash false-unhealthy.
-    // (HEALTH-only — the SOURCE label is the daemon's resolved descriptor.)
-    watcher.files.items[0].file_fd = -1;
-    watcher.files.items[0].lines_seen = 0;
-    try testing.expect(watcher.healthForJail("sshd") == null);
-
-    // …but a detached watch that DID read before stays sticky-healthy
-    // (the lifetime counter — exactly why file health never drives
-    // DEGRADED in v1).
-    watcher.files.items[0].lines_seen = 3;
-    watcher.files.items[0].last_read_ok_ts = 99;
-    const h2 = watcher.healthForJail("sshd").?;
-    try testing.expect(h2.healthy);
-    try testing.expectEqual(@as(u64, 3), h2.lines_seen);
-    try testing.expectEqual(@as(i64, 99), h2.last_read_ok_ts);
+    // ENFORCEMENT: the reopened fd still reads NEW content after the stale
+    // IGNORED — the daemon did not silently stop reading the rotated-in file.
+    // Drive `readNewData` directly on the still-open fd (the wd mapping was
+    // re-pointed above to simulate reuse, so an inotify-delivered IN_MODIFY
+    // would carry the kernel's real wd; reading the fd is the faithful check
+    // that the file source survived). The full inotify→read path under real
+    // rotation is covered by the companion test below and e2e assertion (c).
+    {
+        const f = try tmp.dir.openFile(log_name, .{ .mode = .write_only });
+        defer f.close();
+        _ = try f.seekFromEnd(0);
+        _ = try f.writeAll("still-reading\n");
+    }
+    try watcher.readNewData(fw);
+    try testing.expect(sink.count() >= 2);
+    try testing.expectEqualStrings("still-reading", sink.lines.items[1]);
 }
 
-test "log_watcher: healthForJail returns null for an unknown jail (SYS-017)" {
+test "log_watcher: BUG-007 real same-name rotation keeps reading (enforcement)" {
+    // Companion integration check: a REAL mv-away+recreate rotation under the
+    // natural event ordering. Confirms the rotation path reads across the
+    // rotation and stays healthy. (The deterministic test above is the guard
+    // for the post-reopen IN_IGNORED ordering this one cannot force.)
     if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = tmp.dir.realpath(".", &path_buf) catch return error.SkipZigTest;
+    const log_name = "br2.log";
+    var full_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const log_path = try std.fmt.bufPrint(&full_path_buf, "{s}/{s}", .{ dir_path, log_name });
+    {
+        const f = try tmp.dir.createFile(log_name, .{ .truncate = true });
+        f.close();
+    }
+
     var loop = try EventLoop.init(testing.allocator);
     defer loop.deinit();
     var watcher = try LogWatcher.init(testing.allocator, &loop);
     try watcher.attach();
     defer watcher.deinit();
-    try testing.expect(watcher.healthForJail("nope") == null);
+    var sink = LineSink.init(testing.allocator);
+    defer sink.deinit(testing.allocator);
+
+    const jail = try JailId.fromSlice("sshd");
+    try watcher.watchFile(log_path, jail, LineSink.onLine, &sink);
+
+    const Ctx = struct { tmp_dir: std.fs.Dir, loop: *EventLoop, sink: *LineSink };
+    var ctx = Ctx{ .tmp_dir = tmp.dir, .loop = &loop, .sink = &sink };
+
+    const th = try std.Thread.spawn(.{}, struct {
+        fn kick(c: *Ctx) void {
+            std.time.sleep(30 * std.time.ns_per_ms);
+            {
+                const f = c.tmp_dir.openFile("br2.log", .{ .mode = .write_only }) catch return;
+                defer f.close();
+                _ = f.writeAll("pre\n") catch {};
+            }
+            var tries: u32 = 0;
+            while (tries < 100 and c.sink.count() < 1) : (tries += 1) std.time.sleep(10 * std.time.ns_per_ms);
+            c.tmp_dir.rename("br2.log", "br2.log.1") catch return;
+            {
+                const f = c.tmp_dir.createFile("br2.log", .{ .truncate = true }) catch return;
+                defer f.close();
+                _ = f.writeAll("post1\n") catch {};
+            }
+            tries = 0;
+            while (tries < 200 and c.sink.count() < 2) : (tries += 1) std.time.sleep(10 * std.time.ns_per_ms);
+            // Second post-rotation append: confirms the watch keeps reading.
+            {
+                const f = c.tmp_dir.openFile("br2.log", .{ .mode = .write_only }) catch return;
+                defer f.close();
+                _ = f.seekFromEnd(0) catch {};
+                _ = f.writeAll("post2\n") catch {};
+            }
+            tries = 0;
+            while (tries < 200 and c.sink.count() < 3) : (tries += 1) std.time.sleep(10 * std.time.ns_per_ms);
+            c.loop.stop();
+        }
+    }.kick, .{&ctx});
+
+    try loop.run();
+    th.join();
+
+    try testing.expect(sink.count() >= 3);
+    try testing.expectEqualStrings("pre", sink.lines.items[0]);
+    try testing.expectEqualStrings("post1", sink.lines.items[1]);
+    try testing.expectEqualStrings("post2", sink.lines.items[2]);
+    const h = watcher.healthForJail("sshd").?;
+    try testing.expect(h.healthy);
+}
+
+test "log_watcher: BUG-007 same-dir multi-jail rotation reopens the rotated jail (shared parent wd)" {
+    // BUG-007 REAL root cause: multiple file jails whose logs live in the
+    // SAME directory share one parent-dir inotify wd (inotify dedups per
+    // inode). A 1:1 `wd_to_file` parent mapping let the last-registered jail
+    // overwrite the rest, so a parent IN_CREATE resolved to the wrong jail,
+    // its basename didn't match, and the ROTATED jail never reattached —
+    // missing post-rotation reads + false DEGRADED.
+    //
+    // Drives a REAL same-dir two-jail setup, rotates ONE log (mv-away +
+    // recreate), and asserts:
+    //   (a) the rotated jail reopens, reads new content, reports healthy;
+    //   (b) the OTHER same-dir jail is unaffected (keeps reading + healthy).
+    //
+    // FAILS before the fix (the rotated jail's parent event resolves to the
+    // other jail; basename mismatch → no reopen). PASSES after the fix
+    // (handleEvent iterates ALL FileWatches on the shared parent wd).
+    // The single-jail tests above cannot see this — they never collide.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = tmp.dir.realpath(".", &path_buf) catch return error.SkipZigTest;
+
+    var a_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var b_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const a_path = try std.fmt.bufPrint(&a_buf, "{s}/a.log", .{dir_path});
+    const b_path = try std.fmt.bufPrint(&b_buf, "{s}/b.log", .{dir_path});
+    {
+        const fa = try tmp.dir.createFile("a.log", .{ .truncate = true });
+        fa.close();
+        const fb = try tmp.dir.createFile("b.log", .{ .truncate = true });
+        fb.close();
+    }
+
+    var loop = try EventLoop.init(testing.allocator);
+    defer loop.deinit();
+    var watcher = try LogWatcher.init(testing.allocator, &loop);
+    try watcher.attach();
+    defer watcher.deinit();
+
+    // Each jail gets its OWN sink so lines are attributable per jail.
+    var sink_a = LineSink.init(testing.allocator);
+    defer sink_a.deinit(testing.allocator);
+    var sink_b = LineSink.init(testing.allocator);
+    defer sink_b.deinit(testing.allocator);
+
+    // Register "jail-a" FIRST, "jail-b" LAST — pre-fix, the shared parent wd
+    // would resolve to jail-b (last writer), so jail-a (the one we rotate)
+    // would never reopen. This ordering makes the bug bite.
+    try watcher.watchFile(a_path, try JailId.fromSlice("jail-a"), LineSink.onLine, &sink_a);
+    try watcher.watchFile(b_path, try JailId.fromSlice("jail-b"), LineSink.onLine, &sink_b);
+
+    // Sanity: both watches share ONE parent wd (the real-box precondition).
+    try testing.expectEqual(@as(usize, 2), watcher.files.items.len);
+    try testing.expect(watcher.files.items[0].parent_wd == watcher.files.items[1].parent_wd);
+
+    const Ctx = struct {
+        tmp_dir: std.fs.Dir,
+        loop: *EventLoop,
+        sink_a: *LineSink,
+        sink_b: *LineSink,
+    };
+    var ctx = Ctx{ .tmp_dir = tmp.dir, .loop = &loop, .sink_a = &sink_a, .sink_b = &sink_b };
+
+    const th = try std.Thread.spawn(.{}, struct {
+        fn kick(c: *Ctx) void {
+            std.time.sleep(30 * std.time.ns_per_ms);
+            // Pre-rotation: write to BOTH logs.
+            {
+                const fa = c.tmp_dir.openFile("a.log", .{ .mode = .write_only }) catch return;
+                defer fa.close();
+                _ = fa.writeAll("a-pre\n") catch {};
+            }
+            {
+                const fb = c.tmp_dir.openFile("b.log", .{ .mode = .write_only }) catch return;
+                defer fb.close();
+                _ = fb.writeAll("b-pre\n") catch {};
+            }
+            var tries: u32 = 0;
+            while (tries < 100 and (c.sink_a.count() < 1 or c.sink_b.count() < 1)) : (tries += 1)
+                std.time.sleep(10 * std.time.ns_per_ms);
+
+            // Rotate ONLY a.log (mv away + recreate same name).
+            c.tmp_dir.rename("a.log", "a.log.1") catch return;
+            {
+                const fa = c.tmp_dir.createFile("a.log", .{ .truncate = true }) catch return;
+                defer fa.close();
+                _ = fa.writeAll("a-post\n") catch {};
+            }
+            // jail-a must reopen and read a-post (the bug: it never does).
+            tries = 0;
+            while (tries < 300 and c.sink_a.count() < 2) : (tries += 1)
+                std.time.sleep(10 * std.time.ns_per_ms);
+
+            // jail-b (untouched) keeps reading — append a second b line.
+            {
+                const fb = c.tmp_dir.openFile("b.log", .{ .mode = .write_only }) catch return;
+                defer fb.close();
+                _ = fb.seekFromEnd(0) catch {};
+                _ = fb.writeAll("b-post\n") catch {};
+            }
+            tries = 0;
+            while (tries < 300 and c.sink_b.count() < 2) : (tries += 1)
+                std.time.sleep(10 * std.time.ns_per_ms);
+            c.loop.stop();
+        }
+    }.kick, .{&ctx});
+
+    try loop.run();
+    th.join();
+
+    // (a) The ROTATED jail reopened, read its post-rotation line, is healthy.
+    try testing.expect(sink_a.count() >= 2);
+    try testing.expectEqualStrings("a-pre", sink_a.lines.items[0]);
+    try testing.expectEqualStrings("a-post", sink_a.lines.items[1]);
+    try testing.expect(watcher.healthForJail("jail-a").?.healthy);
+
+    // (b) The OTHER same-dir jail is unaffected — kept reading, still healthy.
+    try testing.expect(sink_b.count() >= 2);
+    try testing.expectEqualStrings("b-pre", sink_b.lines.items[0]);
+    try testing.expectEqualStrings("b-post", sink_b.lines.items[1]);
+    try testing.expect(watcher.healthForJail("jail-b").?.healthy);
+}
+
+// --- ENH-004 structural file read-health verdict ---
+//
+// These exercise `healthForJail`'s pure structural derivation directly over
+// crafted `FileWatch` fields — no inotify, no spawn, no clock dependence
+// except the debounce comparison (driven with explicit past/now timestamps).
+// A minimal `LogWatcher` (only `files` populated) suffices; the verdict reads
+// nothing else.
+
+/// Build a `FileWatch` with only the verdict-relevant fields set. Allocated
+/// from `a`; the caller appends it to a watcher and frees via `freeTestWatch`
+/// (we deliberately do NOT init `line_buffer`, so do not call `deinit`).
+fn testNoopCallback(_: []const u8, _: JailId, _: bool, _: ?*anyopaque) void {}
+
+fn makeTestWatch(
+    a: Allocator,
+    jail_name: []const u8,
+    file_fd: posix.fd_t,
+    was_ever_attached: bool,
+    detached_at_ts: i64,
+    lines_seen: u64,
+    last_read_ok_ts: i64,
+) !*FileWatch {
+    const fw = try a.create(FileWatch);
+    // `healthForJail` reads only jail / file_fd / was_ever_attached /
+    // detached_at_ts / lines_seen / last_read_ok_ts. The remaining fields are
+    // set to inert valid values (line_buffer is never touched — the caller
+    // frees via `freeTestWatcher`, which only `destroy`s, never `deinit`s).
+    fw.* = .{
+        .path_buf = undefined,
+        .path_len = 0,
+        .basename_start = 0,
+        .jail = try JailId.fromSlice(jail_name),
+        .callback = testNoopCallback,
+        .userdata = null,
+        .file_fd = file_fd,
+        .offset = 0,
+        .inode = 0,
+        .prev_size = 0,
+        .fingerprint = [_]u8{0} ** fingerprint_len,
+        .fingerprint_len = 0,
+        .file_wd = -1,
+        .parent_wd = -1,
+        .last_read_ok_ts = last_read_ok_ts,
+        .lines_seen = lines_seen,
+        .was_ever_attached = was_ever_attached,
+        .detached_at_ts = detached_at_ts,
+        .line_buffer = undefined,
+        .allocator = a,
+    };
+    return fw;
+}
+
+/// A bare watcher whose only populated field is `files`. `healthForJail`
+/// touches nothing else.
+fn makeTestWatcher(a: Allocator) LogWatcher {
+    return .{
+        .allocator = a,
+        .event_loop = undefined,
+        .inotify_fd = -1,
+        .wd_to_file = std.AutoHashMap(i32, *FileWatch).init(a),
+        .files = std.ArrayList(*FileWatch).init(a),
+        .pending_ignored = std.AutoHashMap(i32, u32).init(a),
+    };
+}
+
+fn freeTestWatcher(w: *LogWatcher) void {
+    for (w.files.items) |fw| w.allocator.destroy(fw);
+    w.files.deinit();
+    w.wd_to_file.deinit();
+    w.pending_ignored.deinit();
+}
+
+test "log_watcher: healthForJail attached → healthy with zero traffic (ENH-004)" {
+    const a = testing.allocator;
+    var w = makeTestWatcher(a);
+    defer freeTestWatcher(&w);
+    // file_fd >= 0, never read: a quiet healthy jail must NOT be flagged.
+    try w.files.append(try makeTestWatch(a, "sshd", 7, true, 0, 0, 0));
+    const h = w.healthForJail("sshd").?;
+    try testing.expect(h.healthy);
+}
+
+test "log_watcher: healthForJail never-attached → unknown, no boot false-flash (ENH-004)" {
+    const a = testing.allocator;
+    var w = makeTestWatcher(a);
+    defer freeTestWatcher(&w);
+    // Late-appearing log: detached, never attached, never read → unknown.
+    try w.files.append(try makeTestWatch(a, "sshd", -1, false, 0, 0, 0));
+    try testing.expect(w.healthForJail("sshd") == null);
+}
+
+test "log_watcher: healthForJail detached within debounce → unknown (rotation flicker) (ENH-004)" {
+    const a = testing.allocator;
+    var w = makeTestWatcher(a);
+    defer freeTestWatcher(&w);
+    // Was attached, just detached (now): inside the debounce window → unknown,
+    // so a normal rename-rotation detach-then-reopen never flips DEGRADED.
+    const now = std.time.timestamp();
+    try w.files.append(try makeTestWatch(a, "sshd", -1, true, now, 5, now));
+    try testing.expect(w.healthForJail("sshd") == null);
+}
+
+test "log_watcher: healthForJail detached past debounce → unhealthy (ENH-004)" {
+    const a = testing.allocator;
+    var w = makeTestWatcher(a);
+    defer freeTestWatcher(&w);
+    // Was attached, detached well past the debounce window: a genuine break
+    // (deleted / unmounted / perms revoked) → hard false (drives DEGRADED).
+    const stale = std.time.timestamp() - detach_debounce_s - 5;
+    try w.files.append(try makeTestWatch(a, "sshd", -1, true, stale, 5, stale));
+    const h = w.healthForJail("sshd").?;
+    try testing.expect(!h.healthy);
+    try testing.expectEqual(@as(u64, 5), h.lines_seen);
+}
+
+test "log_watcher: healthForJail multi-logpath any-attached wins (ENH-004)" {
+    const a = testing.allocator;
+    var w = makeTestWatcher(a);
+    defer freeTestWatcher(&w);
+    const stale = std.time.timestamp() - detach_debounce_s - 5;
+    // One path broken (detached past debounce), one still reading. The jail
+    // is still healthy: it has a live source.
+    try w.files.append(try makeTestWatch(a, "sshd", -1, true, stale, 2, stale));
+    try w.files.append(try makeTestWatch(a, "sshd", 9, true, 0, 0, 0));
+    const h = w.healthForJail("sshd").?;
+    try testing.expect(h.healthy);
+}
+
+test "log_watcher: healthForJail reopen clears the break (ENH-004)" {
+    const a = testing.allocator;
+    var w = makeTestWatcher(a);
+    defer freeTestWatcher(&w);
+    const stale = std.time.timestamp() - detach_debounce_s - 5;
+    const fw = try makeTestWatch(a, "sshd", -1, true, stale, 2, stale);
+    try w.files.append(fw);
+    try testing.expect(!w.healthForJail("sshd").?.healthy); // broken
+
+    // Simulate reopenAfterRotation's effect: re-attached, debounce cleared.
+    fw.file_fd = 9;
+    fw.detached_at_ts = 0;
+    try testing.expect(w.healthForJail("sshd").?.healthy); // recovered
+}
+
+test "log_watcher: healthForJail returns null for an unknown jail (ENH-004)" {
+    const a = testing.allocator;
+    var w = makeTestWatcher(a);
+    defer freeTestWatcher(&w);
+    try w.files.append(try makeTestWatch(a, "sshd", 7, true, 0, 0, 0));
+    try testing.expect(w.healthForJail("nope") == null);
 }

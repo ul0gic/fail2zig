@@ -23,10 +23,10 @@
 //! The steady-state hot path — log line → match → state update →
 //! (maybe) ban — is allocation-free on the happy path: the matcher
 //! operates on slices of the caller's buffer and the per-jail state
-//! tracker is a fixed-capacity map sized at startup. Per-component
-//! memory-ceiling enforcement (the `MemoryPool` scaffolding in
-//! `core/memory.zig`) is not yet wired to a live consumer — tracked
-//! separately.
+//! tracker is a fixed-capacity map sized at startup. The memory ceiling
+//! (`memory_ceiling_mb`) is enforced as a ceiling-derived per-jail entry
+//! cap with eviction in the state tracker (ADR-005) — the single live
+//! mechanism (DBT-003 / DBT-004).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -39,8 +39,6 @@ const build_options = @import("build_options");
 // Wire all engine modules into the build graph so their tests are discovered.
 // Modules reached by integration tests (via the named `engine` module) are
 // `pub const`; the rest stay private.
-const allocator_mod = @import("core/allocator.zig");
-const memory_mod = @import("core/memory.zig");
 pub const event_loop_mod = @import("core/event_loop.zig");
 const log_watcher_mod = @import("core/log_watcher.zig");
 pub const journald_source_mod = @import("core/journald_source.zig");
@@ -871,7 +869,64 @@ fn reconcileBanApply(
     };
 }
 
+/// QA-002: opt-in startup-phase profiler. Zero cost unless the
+/// `FAIL2ZIG_STARTUP_TRACE` env var is set (then it prints one JSON line of
+/// per-phase deltas to stderr at the end of init, so the ~98ms cold-start
+/// cost can be attributed before/after the lazy-init change). Not wired to
+/// any production behavior — purely a diagnostic the operator/CI opts into.
+const StartupTrace = struct {
+    enabled: bool,
+    timer: ?std.time.Timer,
+    last_ns: u64 = 0,
+    /// One JSON line accumulated across `mark` calls.
+    buf: std.ArrayListUnmanaged(u8) = .{},
+    allocator: std.mem.Allocator,
+
+    fn init(allocator: std.mem.Allocator) StartupTrace {
+        const on = blk: {
+            const v = std.process.getEnvVarOwned(allocator, "FAIL2ZIG_STARTUP_TRACE") catch break :blk false;
+            defer allocator.free(v);
+            break :blk std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+        };
+        if (!on) return .{ .enabled = false, .timer = null, .allocator = allocator };
+        const t = std.time.Timer.start() catch return .{ .enabled = false, .timer = null, .allocator = allocator };
+        var self: StartupTrace = .{ .enabled = true, .timer = t, .allocator = allocator };
+        self.buf.appendSlice(allocator, "{\"trace\":\"startup\"") catch {};
+        return self;
+    }
+
+    /// Record the elapsed time since the previous `mark` (or start) under
+    /// `phase`. No-op when disabled.
+    fn mark(self: *StartupTrace, phase: []const u8) void {
+        if (!self.enabled) return;
+        const now = self.timer.?.read();
+        const delta_ms = @as(f64, @floatFromInt(now - self.last_ns)) / @as(f64, std.time.ns_per_ms);
+        self.last_ns = now;
+        const w = self.buf.writer(self.allocator);
+        w.print(",\"{s}_ms\":{d:.2}", .{ phase, delta_ms }) catch {};
+    }
+
+    /// Emit the accumulated line to stderr and release the buffer. Fully
+    /// idempotent — safe to call explicitly at the loop-ready point AND via
+    /// the `defer` on an early-return error path. The first call emits +
+    /// frees; later calls are no-ops (buffer is left empty, not undefined,
+    /// so a second free is harmless).
+    fn report(self: *StartupTrace) void {
+        if (self.enabled) {
+            self.enabled = false;
+            const total_ms = @as(f64, @floatFromInt(self.timer.?.read())) / @as(f64, std.time.ns_per_ms);
+            const w = self.buf.writer(self.allocator);
+            w.print(",\"total_ms\":{d:.2}}}\n", .{total_ms}) catch {};
+            std.io.getStdErr().writeAll(self.buf.items) catch {};
+        }
+        self.buf.clearAndFree(self.allocator);
+    }
+};
+
 fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
+    var trace = StartupTrace.init(heap);
+    defer trace.report();
+
     // Metrics (atomic counters). Cheap; construct before anything that
     // increments them.
     var metrics = metrics_mod.Metrics.init();
@@ -879,17 +934,28 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         if (!jc.enabled) continue;
         _ = metrics.registerJail(jc.name);
     }
+    trace.mark("metrics");
 
-    // Firewall backend.
+    // Firewall backend. No usable backend (or a backend that can't install
+    // its scaffold — e.g. missing CAP_NET_ADMIN) is a KNOWN fail-closed
+    // condition with a clear cause logged just above by detect()/init(). Exit
+    // cleanly with a non-zero status rather than `return err` — propagating
+    // the error to `main` would dump a ReleaseSafe error-return-trace that
+    // looks like a crash on top of the already-clear message. We still fail
+    // closed (exit 1, refuse to run unprotected). `std.process.exit` skips
+    // defers, which is fine here: no firewall rules are installed on this
+    // path and the only skipped defer is the opt-in startup trace.
     var backend_val = firewall.detect(heap) catch |err| {
         std.log.err("firewall: no backend available ({s}) — refusing to run unprotected", .{@errorName(err)});
-        return err;
+        std.process.exit(1);
     };
+    trace.mark("fw_detect");
     backend_val.init(.{}, heap) catch |err| {
-        std.log.err("firewall: backend init failed: {s}", .{@errorName(err)});
-        return err;
+        std.log.err("firewall: backend init failed: {s} — refusing to run unprotected", .{@errorName(err)});
+        std.process.exit(1);
     };
     defer backend_val.deinit();
+    trace.mark("fw_init");
 
     // Per-jail state trackers (ISSUE-007). The state-tracker memory
     // budget is split evenly across the configured jails plus one
@@ -908,12 +974,14 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         if (jc.enabled) enabled_count += 1;
     }
     const tracker_count: u32 = @max(1, enabled_count + 1);
-    // State-tracker share of the configured ceiling: half the ceiling, split
-    // evenly across trackers. This is the SAME value the (now-removed)
-    // MemoryPool config used for `state_tracker_bytes` — kept inline so
-    // tracker capacity sizing is byte-for-byte unchanged. It sizes the
-    // tracker HashMaps' entry counts only; it is not an allocator budget.
-    const state_tracker_bytes: usize = (@as(usize, cfg.global.memory_ceiling_mb) * memory_mod.one_mb) / 2;
+    // State-tracker share of the configured ceiling (ADR-005): half the
+    // ceiling, split evenly across trackers. This sizes the tracker
+    // HashMaps' entry counts only (via `capacityFromBudget`) — it is NOT an
+    // allocator byte budget. The state tracker is the single live
+    // memory-ceiling mechanism (DBT-004 removed the unused per-component
+    // budget scaffolding).
+    const bytes_per_mb: usize = 1024 * 1024;
+    const state_tracker_bytes: usize = (@as(usize, cfg.global.memory_ceiling_mb) * bytes_per_mb) / 2;
     const per_tracker_bytes: usize = state_tracker_bytes / tracker_count;
     const per_tracker_capacity = state_mod.capacityFromBudget(per_tracker_bytes);
 
@@ -954,6 +1022,8 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
             };
         }
     }
+
+    trace.mark("trackers");
 
     // Seed state from disk. Entries are routed by `jail` field on each
     // record; orphans land in the legacy tracker. Per-jail lifetime ban
@@ -1013,6 +1083,8 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
             );
         }
     }
+
+    trace.mark("state_load");
 
     // Event loop.
     var loop = event_loop_mod.EventLoop.init(heap) catch |err| {
@@ -1367,6 +1439,12 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         },
     );
 
+    // QA-002: everything up to here is the operator-visible cold-start cost
+    // (servers bound, loop ready to serve). Emit the trace now, before we
+    // block in `loop.run()`.
+    trace.mark("servers");
+    trace.report();
+
     try loop.run();
 
     // Final flush on clean shutdown (best-effort): engine state first,
@@ -1451,16 +1529,18 @@ const HealthSources = struct {
     journald: *journald_source_mod.JournaldSource,
 };
 
-/// Adapter for `commands.JailHealthSource.lookup` (SYS-017). Resolves a
-/// jail's read-HEALTH by scanning the journald source first (it is the only
-/// source that can report a hard `unhealthy`/false that drives DEGRADED),
-/// then the file watcher. Returns `null` (unknown HEALTH) when neither
-/// source knows the jail or the file source has never read. The SOURCE
-/// label is NOT here — it is the resolved descriptor (`jailSourceLookup`).
+/// Adapter for `commands.JailHealthSource.lookup` (SYS-017, extended by
+/// ENH-004). Resolves a jail's read-HEALTH by scanning the journald source
+/// first, then the file watcher. Both can now report a hard `false` that
+/// drives DEGRADED (journald: never read cleanly; file: once-attached watch
+/// detached past the debounce, ENH-004). Returns `null` (unknown HEALTH)
+/// when neither source knows the jail, or the matched source has never had a
+/// real source (boot / late log). The SOURCE label is NOT here — it is the
+/// resolved descriptor (`jailSourceLookup`).
 ///
-/// The journald-first order makes the journald-only-DEGRADED invariant (§4)
-/// hold even in the (config-invalid) case where a name appears in both: a
-/// journald verdict — the only one that can be `false` — wins.
+/// A jail name belongs to exactly one source kind in a valid config; the
+/// journald-first scan order only disambiguates the config-invalid case
+/// where a name appears in both (a journald verdict wins).
 fn jailHealthLookup(ctx: ?*anyopaque, jail_name: []const u8) ?commands_mod.JailHealth {
     const self: *HealthSources = @ptrCast(@alignCast(ctx.?));
     if (self.journald.healthForJail(jail_name)) |h| {
@@ -2455,11 +2535,6 @@ test {
     // list complete even for modules that `runDaemon` constructs
     // directly, otherwise their unit tests disappear from `zig build
     // test` output.
-    _ = allocator_mod;
-    // Test-only: surface memory.zig's tests. The MemoryPool is not yet
-    // wired to a live consumer (tracked separately); see the
-    // memory-ceiling-not-enforced issue.
-    _ = memory_mod;
     _ = event_loop_mod;
     _ = log_watcher_mod;
     _ = journald_source_mod;
@@ -2728,4 +2803,316 @@ test "JailSourceDescriptors: records KIND-truthful resolved descriptors (SYS-017
     // An unrecorded jail → null → the handler renders "unknown" only for a
     // jail the daemon never resolved (cannot happen for an enabled jail).
     try testing.expect(JailSourceDescriptors.lookup(@ptrCast(&d), "nope") == null);
+}
+
+// ---------------------------------------------------------------------------
+// ENH-004 end-to-end: a REAL file-source LogWatcher's read-health verdict
+// drives the REAL status + metrics surface.
+//
+// The inline `log_watcher.zig` tests prove `healthForJail`'s verdict over
+// crafted struct fields; the `commands.zig` / `writeMetricsPayload` tests
+// prove the DEGRADED + gauge consumption over a STUBBED health value. Nothing
+// connected the two: a real watcher attaching to a real file, the file being
+// moved away (a real `IN_MOVE_SELF` → `detachFileWatch` arming the structural
+// signal — see the test body for why rename-away, not unlink, is the
+// deterministic deletion-class signal while the daemon holds the fd open), and
+// that verdict flowing through the REAL `jailHealthLookup` adapter →
+// `computeOverallState` → `writeMetricsPayload`. A regression in the adapter,
+// the metric writer, or the watcher's detach bookkeeping would slip past every
+// existing test. This is that end-to-end seam.
+//
+// Local + CI-runnable: real inotify on a tmp file, no root, no journald, no
+// firewall. Linux-only (inotify); skips elsewhere.
+
+const enh004NoopLine = struct {
+    fn cb(_: []const u8, _: shared.JailId, _: bool, _: ?*anyopaque) void {}
+}.cb;
+
+test "ENH-004 e2e: real file move-away → real detach → DEGRADED + log_source_healthy 0" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = tmp.dir.realpath(".", &path_buf) catch return error.SkipZigTest;
+    const log_name = "enh004.log";
+    var full_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const log_path = try std.fmt.bufPrint(&full_path_buf, "{s}/{s}", .{ dir_path, log_name });
+
+    {
+        const f = try tmp.dir.createFile(log_name, .{ .truncate = true });
+        f.close();
+    }
+
+    // A mutex-guarded line counter: the kick thread (file mutation + loop
+    // control) and the loop thread (callback) are the only writers/readers
+    // while the loop runs. The watcher's own per-jail state is read ONLY on
+    // the main thread after loop.run() returns — single-threaded, matching the
+    // rotation tests' discipline (no cross-thread read of mutable watch fields).
+    const Sink = struct {
+        mutex: std.Thread.Mutex = .{},
+        lines: u32 = 0,
+        fn cb(_: []const u8, _: shared.JailId, _: bool, ud: ?*anyopaque) void {
+            const s: *@This() = @ptrCast(@alignCast(ud.?));
+            s.mutex.lock();
+            defer s.mutex.unlock();
+            s.lines += 1;
+        }
+        fn count(s: *@This()) u32 {
+            s.mutex.lock();
+            defer s.mutex.unlock();
+            return s.lines;
+        }
+    };
+    var sink = Sink{};
+
+    var loop = event_loop_mod.EventLoop.init(a) catch return error.SkipZigTest;
+    defer loop.deinit();
+    var watcher = log_watcher_mod.LogWatcher.init(a, &loop) catch return error.SkipZigTest;
+    try watcher.attach();
+    defer watcher.deinit();
+
+    const jail = try shared.JailId.fromSlice("sshd");
+    try watcher.watchFile(log_path, jail, Sink.cb, &sink);
+
+    // Kick thread: write a line (a real attach+read → was_ever_attached), wait
+    // until it's read, then RENAME the watched file out to a non-matching name
+    // (a real IN_MOVE_SELF the loop drains into detachFileWatch). Rename-away
+    // is the deterministic "source broke after reading" signal here: while the
+    // daemon holds the file fd open, an unlink (IN_DELETE_SELF) is NOT
+    // delivered until the last fd closes (verified) — the real-box analogue is
+    // a logrotate/`mv` that takes the active log away without a same-name
+    // replacement, so the parent-dir reopen never fires and the watch stays
+    // detached. A bounded drain window, then stop. No verdict read on this
+    // thread.
+    const Ctx = struct { tmp_dir: std.fs.Dir, loop: *event_loop_mod.EventLoop, sink: *Sink };
+    var ctx = Ctx{ .tmp_dir = tmp.dir, .loop = &loop, .sink = &sink };
+    const th = try std.Thread.spawn(.{}, struct {
+        fn kick(c: *Ctx) void {
+            std.time.sleep(30 * std.time.ns_per_ms);
+            {
+                const f = c.tmp_dir.openFile("enh004.log", .{ .mode = .write_only }) catch return;
+                defer f.close();
+                _ = f.seekFromEnd(0) catch {};
+                _ = f.writeAll("Failed password for root from 203.0.113.7 port 22 ssh2\n") catch {};
+            }
+            // Wait until a line is read (attach confirmed → was_ever_attached).
+            var tries: u32 = 0;
+            while (tries < 400 and c.sink.count() < 1) : (tries += 1) {
+                std.time.sleep(5 * std.time.ns_per_ms);
+            }
+            // Move the watched file away under a NON-matching basename so the
+            // parent-dir watch does NOT reopen it — a genuine, sticky break.
+            c.tmp_dir.rename("enh004.log", "enh004.log.gone") catch {};
+            std.time.sleep(120 * std.time.ns_per_ms);
+            c.loop.stop();
+        }
+    }.kick, .{&ctx});
+
+    try loop.run();
+    th.join();
+
+    // The loop thread is done — read watch state on the main thread only.
+    try testing.expect(sink.count() >= 1); // the line was actually read
+    // The real IN_MOVE_SELF drove a real structural detach: the watch was once
+    // attached and is now detached, with detached_at_ts armed.
+    try assertStructuralDetach(&watcher, "sshd");
+
+    // Backdate the detach past the 2s debounce on the real watch struct (the
+    // only time-dependent input; the structural detach itself is real) so the
+    // verdict becomes a genuine `false` without a wall-clock wait — case (a).
+    backdateDetach(&watcher, "sshd");
+    {
+        const h = watcher.healthForJail("sshd").?;
+        try testing.expect(!h.healthy); // a was-healthy-then-broken file source
+    }
+
+    // --- the end-to-end chain through the daemon's own wiring ---
+    var trackers = tracker_map_mod.TrackerMap.init(a);
+    defer trackers.deinit();
+    var metrics = metrics_mod.Metrics.init();
+    var jails = [_]config_mod.JailConfig{
+        .{ .name = "sshd", .enabled = true, .banaction = .nftables },
+    };
+    var cfg = config_mod.Config{ .global = .{}, .defaults = .{ .banaction = .nftables }, .jails = &jails, .diag = .{} };
+    var backend_val: firewall.Backend = .{ .nftables = firewall.nftables.NftablesBackend{} };
+    defer backend_val.deinit();
+
+    // The REAL adapter over the REAL watcher. The journald source is empty
+    // (no jails registered → healthForJail returns null for every name), so
+    // the verdict comes from the file watcher — exactly the daemon's
+    // journald-first scan order falling through to the file source.
+    var journald_src = journald_source_mod.JournaldSource.init(a, &loop, log_path) catch return error.SkipZigTest;
+    defer journald_src.deinit();
+    var health_sources = HealthSources{ .watcher = &watcher, .journald = &journald_src };
+
+    var cmd_ctx: commands_mod.Context = .{
+        .trackers = &trackers,
+        .config = &cfg,
+        .backend = &backend_val,
+        .stats_source = .{ .ctx = @ptrCast(&metrics), .snapshot = metricsStatsSnapshot },
+        .health_source = .{ .ctx = @ptrCast(&health_sources), .lookup = jailHealthLookup },
+    };
+
+    // (1) Overall state flips DEGRADED off the real file verdict (case a).
+    try testing.expectEqualStrings("degraded", cmd_ctx.computeOverallState());
+
+    // (2) The metric gauge reports 0 for the broken source (case a).
+    var http_ctx: HttpSources = .{ .metrics = &metrics, .cmd_ctx = &cmd_ctx, .trackers = &trackers };
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    defer out.deinit(a);
+    try writeMetricsPayload(@ptrCast(&http_ctx), &out, a);
+    try testing.expect(std.mem.indexOf(u8, out.items, "fail2zig_jail_log_source_healthy{jail=\"sshd\"} 0") != null);
+    // Overall protection gauge follows: DEGRADED → not actively protecting.
+    try testing.expect(std.mem.indexOf(u8, out.items, "fail2zig_protection_active 0") != null);
+}
+
+/// Reach into the real watcher and backdate the matching jail's detach
+/// timestamp past the debounce, simulating the elapse of the 2s window
+/// without a wall-clock wait. The detach itself (file_fd<0, was_ever_attached)
+/// must already be real — this only ages the timestamp the verdict compares.
+fn backdateDetach(watcher: *log_watcher_mod.LogWatcher, jail_name: []const u8) void {
+    const jail = shared.JailId.fromSlice(jail_name) catch return;
+    for (watcher.files.items) |fw| {
+        if (fw.jail.eql(jail) and fw.file_fd < 0 and fw.was_ever_attached) {
+            fw.detached_at_ts = std.time.timestamp() - 3600;
+        }
+    }
+}
+
+/// Assert a real detach happened: at least one of the jail's watches was once
+/// attached, is now detached (`file_fd < 0`), and has a non-zero
+/// `detached_at_ts`. This is the structural fact the IN_DELETE_SELF must have
+/// produced — the precondition for the verdict's hard `false`.
+fn assertStructuralDetach(watcher: *log_watcher_mod.LogWatcher, jail_name: []const u8) !void {
+    const jail = try shared.JailId.fromSlice(jail_name);
+    for (watcher.files.items) |fw| {
+        if (fw.jail.eql(jail) and fw.was_ever_attached and fw.file_fd < 0 and fw.detached_at_ts != 0) {
+            return; // a genuine was-attached-then-detached watch
+        }
+    }
+    return error.NoStructuralDetach;
+}
+
+test "ENH-004 e2e: a quiet healthy file jail stays ACTIVE, gauge 1 (no false flag)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = tmp.dir.realpath(".", &path_buf) catch return error.SkipZigTest;
+    const log_name = "quiet.log";
+    var full_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const log_path = try std.fmt.bufPrint(&full_path_buf, "{s}/{s}", .{ dir_path, log_name });
+    {
+        const f = try tmp.dir.createFile(log_name, .{ .truncate = true });
+        f.close();
+    }
+
+    var loop = event_loop_mod.EventLoop.init(a) catch return error.SkipZigTest;
+    defer loop.deinit();
+    var watcher = log_watcher_mod.LogWatcher.init(a, &loop) catch return error.SkipZigTest;
+    try watcher.attach();
+    defer watcher.deinit();
+
+    const jail = try shared.JailId.fromSlice("sshd");
+    // Attach to an existing, NEVER-written file: the watch attaches (file_fd>=0)
+    // but no line is ever read → quiet-but-healthy. No event loop run needed;
+    // watchFile attaches synchronously when the file already exists.
+    try watcher.watchFile(log_path, jail, enh004NoopLine, &watcher);
+
+    // Attached with zero traffic → healthy, NOT a false negative (case b).
+    const h = watcher.healthForJail("sshd").?;
+    try testing.expect(h.healthy);
+    try testing.expectEqual(@as(u64, 0), h.lines_seen);
+
+    // Through the real surface: a quiet healthy enforcing file jail is ACTIVE,
+    // not DEGRADED, and its gauge reads 1.
+    var trackers = tracker_map_mod.TrackerMap.init(a);
+    defer trackers.deinit();
+    var metrics = metrics_mod.Metrics.init();
+    var jails = [_]config_mod.JailConfig{
+        .{ .name = "sshd", .enabled = true, .banaction = .nftables },
+    };
+    var cfg = config_mod.Config{ .global = .{}, .defaults = .{ .banaction = .nftables }, .jails = &jails, .diag = .{} };
+    var backend_val: firewall.Backend = .{ .nftables = firewall.nftables.NftablesBackend{} };
+    defer backend_val.deinit();
+    var journald_src = journald_source_mod.JournaldSource.init(a, &loop, log_path) catch return error.SkipZigTest;
+    defer journald_src.deinit();
+    var health_sources = HealthSources{ .watcher = &watcher, .journald = &journald_src };
+    var cmd_ctx: commands_mod.Context = .{
+        .trackers = &trackers,
+        .config = &cfg,
+        .backend = &backend_val,
+        .stats_source = .{ .ctx = @ptrCast(&metrics), .snapshot = metricsStatsSnapshot },
+        .health_source = .{ .ctx = @ptrCast(&health_sources), .lookup = jailHealthLookup },
+    };
+    try testing.expectEqualStrings("active", cmd_ctx.computeOverallState());
+
+    var http_ctx: HttpSources = .{ .metrics = &metrics, .cmd_ctx = &cmd_ctx, .trackers = &trackers };
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    defer out.deinit(a);
+    try writeMetricsPayload(@ptrCast(&http_ctx), &out, a);
+    try testing.expect(std.mem.indexOf(u8, out.items, "fail2zig_jail_log_source_healthy{jail=\"sshd\"} 1") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "fail2zig_protection_active 1") != null);
+}
+
+test "ENH-004 e2e: a never-appeared (late) log is NOT degraded, gauge 0 (no false flash)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = tmp.dir.realpath(".", &path_buf) catch return error.SkipZigTest;
+    var full_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    // A path whose PARENT exists (the tmp dir) but whose file is absent at
+    // watch time → boot/late-log: was_ever_attached stays false (case d).
+    const log_path = try std.fmt.bufPrint(&full_path_buf, "{s}/never_appears.log", .{dir_path});
+
+    var loop = event_loop_mod.EventLoop.init(a) catch return error.SkipZigTest;
+    defer loop.deinit();
+    var watcher = log_watcher_mod.LogWatcher.init(a, &loop) catch return error.SkipZigTest;
+    try watcher.attach();
+    defer watcher.deinit();
+
+    const jail = try shared.JailId.fromSlice("sshd");
+    try watcher.watchFile(log_path, jail, enh004NoopLine, &watcher);
+
+    // Never attached → verdict is unknown (null), never a hard false (case d).
+    try testing.expect(watcher.healthForJail("sshd") == null);
+
+    var trackers = tracker_map_mod.TrackerMap.init(a);
+    defer trackers.deinit();
+    var metrics = metrics_mod.Metrics.init();
+    var jails = [_]config_mod.JailConfig{
+        .{ .name = "sshd", .enabled = true, .banaction = .nftables },
+    };
+    var cfg = config_mod.Config{ .global = .{}, .defaults = .{ .banaction = .nftables }, .jails = &jails, .diag = .{} };
+    var backend_val: firewall.Backend = .{ .nftables = firewall.nftables.NftablesBackend{} };
+    defer backend_val.deinit();
+    var journald_src = journald_source_mod.JournaldSource.init(a, &loop, log_path) catch return error.SkipZigTest;
+    defer journald_src.deinit();
+    var health_sources = HealthSources{ .watcher = &watcher, .journald = &journald_src };
+    var cmd_ctx: commands_mod.Context = .{
+        .trackers = &trackers,
+        .config = &cfg,
+        .backend = &backend_val,
+        .stats_source = .{ .ctx = @ptrCast(&metrics), .snapshot = metricsStatsSnapshot },
+        .health_source = .{ .ctx = @ptrCast(&health_sources), .lookup = jailHealthLookup },
+    };
+    // Unknown health → NOT degraded (no false DEGRADED flash at boot).
+    try testing.expectEqualStrings("active", cmd_ctx.computeOverallState());
+
+    var http_ctx: HttpSources = .{ .metrics = &metrics, .cmd_ctx = &cmd_ctx, .trackers = &trackers };
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    defer out.deinit(a);
+    try writeMetricsPayload(@ptrCast(&http_ctx), &out, a);
+    // The gauge reports 0 for an unknown source ("not confirmed reading"), but
+    // the OVERALL state is NOT degraded — the metric's tri-state collapse must
+    // never be mistaken for a DEGRADED trigger. This guards that distinction.
+    try testing.expect(std.mem.indexOf(u8, out.items, "fail2zig_jail_log_source_healthy{jail=\"sshd\"} 0") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "fail2zig_protection_active 1") != null);
 }

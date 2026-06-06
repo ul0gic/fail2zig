@@ -704,15 +704,44 @@ pub const vtable: backend.BackendVTable = .{
     .isAvailableFn = isAvailableImpl,
 };
 
-/// Availability probe for `backend.detect()`. Opens a netfilter
-/// netlink socket and closes it — if that works, `nf_tables` is at
-/// least loadable. The real backend also attempts a temporary table
-/// create at `init()` time to confirm kernel support; we keep this
-/// probe cheap.
-pub fn probeAvailable() bool {
-    var sock = netlink.NetlinkSocket.init(linux.NETLINK.NETFILTER) catch return false;
+/// Outcome of the cheap nftables availability probe (SYS-014 #2). The
+/// open+close netlink probe can cheaply distinguish "no nf_tables in the
+/// kernel" (the socket family/protocol is unsupported) from a transient
+/// socket failure. It deliberately does NOT exercise a privileged
+/// operation: opening an `AF_NETLINK` socket succeeds without
+/// CAP_NET_ADMIN (EPERM only surfaces at table-create), and ipset/iptables
+/// also require CAP_NET_ADMIN — so detecting "no permission" at detect-time
+/// to fall through gains nothing and costs a netlink round-trip. The
+/// permission case is reported at `init()`/scaffold time, where EPERM
+/// genuinely lands and the daemon already fails closed.
+pub const ProbeResult = enum {
+    /// Netlink socket opened — nf_tables is at least loadable. (Whether the
+    /// caller has CAP_NET_ADMIN is determined later, at scaffold install.)
+    available,
+    /// `socket(AF_NETLINK, NETLINK_NETFILTER)` reported the protocol/family
+    /// unavailable — netfilter/nf_tables is not in the kernel.
+    kernel_unsupported,
+    /// A transient / unexpected socket failure (fd exhaustion, OOM, …).
+    transient,
+};
+
+/// Cheap availability probe for `backend.detect()` (SYS-014 #2). Opens a
+/// netfilter netlink socket and closes it, mapping the open result to a
+/// `ProbeResult` so the detect site can log a cause-accurate message. No
+/// privileged operation is performed (see `ProbeResult`).
+pub fn probeReason() ProbeResult {
+    var sock = netlink.NetlinkSocket.init(linux.NETLINK.NETFILTER) catch |err| switch (err) {
+        error.ProtocolUnsupported => return .kernel_unsupported,
+        else => return .transient,
+    };
     sock.close();
-    return true;
+    return .available;
+}
+
+/// Boolean availability probe retained for `backend.detect()`'s existing
+/// vtable shape. `true` iff `probeReason()` is `.available`.
+pub fn probeAvailable() bool {
+    return probeReason() == .available;
 }
 
 fn castSelf(ctx: *anyopaque) *NftablesBackend {
@@ -778,7 +807,10 @@ fn sendScaffold(self: *NftablesBackend) backend.BackendError!void {
         var ack_buf: [2048]u8 = undefined;
         sock_ptr.drainAck(&[_]u32{del_seq}, &ack_buf) catch |e| switch (e) {
             error.NotFound => {}, // first-time install — expected.
-            error.PermissionDenied => return error.NotAvailable,
+            error.PermissionDenied => {
+                logPermissionDenied();
+                return error.NotAvailable;
+            },
             else => return mapNetlinkErr(e),
         };
     }
@@ -926,13 +958,33 @@ fn sendScaffold(self: *NftablesBackend) backend.BackendError!void {
     };
     for (labeled) |item| {
         sock_ptr.drainAck(&[_]u32{item.seq}, &install_ack) catch |e| {
-            std.log.warn(
-                "nftables: scaffold step '{s}' failed: {s}",
-                .{ item.step, @errorName(e) },
-            );
+            // SYS-014 #2: EPERM here is the genuine missing-CAP_NET_ADMIN
+            // case (the kernel HAS nf_tables — the socket opened and the
+            // batch was accepted up to the privileged commit). Give the
+            // operator the actionable cause, not a bare errno.
+            if (e == error.PermissionDenied) {
+                logPermissionDenied();
+            } else {
+                std.log.warn(
+                    "nftables: scaffold step '{s}' failed: {s}",
+                    .{ item.step, @errorName(e) },
+                );
+            }
             return mapNetlinkErr(e);
         };
     }
+}
+
+/// SYS-014 #2: the actionable operator message for the missing-capability
+/// case. nf_tables is present in the kernel (the socket opened and earlier
+/// scaffold steps were accepted) but the privileged commit was denied.
+fn logPermissionDenied() void {
+    std.log.err(
+        "nftables: permission denied installing the firewall scaffold — " ++
+            "missing CAP_NET_ADMIN. Run fail2zig as root or grant the " ++
+            "capability (e.g. setcap cap_net_admin+ep). Refusing to run unprotected.",
+        .{},
+    );
 }
 
 fn initImpl(
@@ -1160,6 +1212,8 @@ fn isAvailableImpl(ctx: *anyopaque) bool {
 fn mapNetlinkErr(err: netlink.Error) backend.BackendError {
     return switch (err) {
         error.PermissionDenied => backend.BackendError.NotAvailable,
+        // The kernel lacks nf_tables/netfilter — not available (fail closed).
+        error.ProtocolUnsupported => backend.BackendError.NotAvailable,
         error.AlreadyExists => backend.BackendError.AlreadyBanned,
         error.NotFound => backend.BackendError.NotBanned,
         error.BufferTooSmall,
@@ -1752,4 +1806,12 @@ test "nftables: isAvailable on zeroed struct reports probeAvailable result" {
     // doesn't crash and matches `probeAvailable()`.
     const got = isAvailableImpl(@ptrCast(&be));
     try std.testing.expectEqual(probeAvailable(), got);
+}
+
+test "nftables: probeAvailable agrees with probeReason (SYS-014)" {
+    // `probeAvailable()` is exactly `probeReason() == .available` — the bool
+    // shim must never disagree with the cause-carrying probe. Host-dependent
+    // result, but the invariant holds on any host.
+    const reason = probeReason();
+    try std.testing.expectEqual(reason == .available, probeAvailable());
 }
