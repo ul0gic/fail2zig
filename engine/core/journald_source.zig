@@ -45,6 +45,7 @@ const shared = @import("shared");
 const EventLoop = event_loop_mod.EventLoop;
 const TimerHandle = event_loop_mod.TimerHandle;
 const LineCallback = log_watcher_mod.LineCallback;
+const JailHealth = log_watcher_mod.JailHealth;
 const JailId = shared.JailId;
 
 pub const Error = error{
@@ -624,6 +625,21 @@ pub const JournalJail = struct {
     cursor: [max_cursor_len]u8 = [_]u8{0} ** max_cursor_len,
     cursor_len: usize = 0,
 
+    /// Read-health (SYS-017). Both written on the loop thread in
+    /// pollJail/processBatch and read on the cold status/metrics path —
+    /// same thread (the IPC/HTTP/WS servers are FD subscriptions on the
+    /// single event loop), so no atomics, mirroring the non-atomic
+    /// `cursor` discipline above.
+    ///
+    /// Wall-clock secs of the last `pollJail` that ran journalctl to a
+    /// clean `.Exited(0)` (entries or not — the empty-but-OK case counts).
+    /// `0` means "no clean poll has completed yet" → unhealthy per §2.2.
+    last_read_ok_ts: i64 = 0,
+    /// Decoded MESSAGEs fed to the callback, lifetime. Baseline-seed
+    /// entries are deliberately NOT counted (they are never fed to the
+    /// callback — the no-history-replay invariant).
+    lines_seen: u64 = 0,
+
     fn cursorSlice(self: *const JournalJail) []const u8 {
         return self.cursor[0..self.cursor_len];
     }
@@ -767,6 +783,30 @@ pub const JournaldSource = struct {
         return self.jails.items.len;
     }
 
+    /// Per-jail read-HEALTH for the status surface (SYS-017). Pure
+    /// derivation over the live struct fields — no spawn, no I/O. Returns
+    /// `null` when `name` is not a journald-backed jail (the caller then
+    /// tries the file watcher). The SOURCE label is the daemon's resolved
+    /// descriptor, not this — see `commands.JailSourceSource`.
+    ///
+    /// journald verdict (§2.2): healthy iff at least one clean `journalctl`
+    /// poll has completed (`last_read_ok_ts > 0`). A journald jail that has
+    /// never read cleanly reports `healthy = false` — the genuine negative
+    /// probe that drives DEGRADED for an enforcing jail (§4). (File health
+    /// never reports `false`, so a `false` here is unambiguously journald.)
+    pub fn healthForJail(self: *const JournaldSource, name: []const u8) ?JailHealth {
+        for (self.jails.items) |*jj| {
+            if (std.mem.eql(u8, jj.jail.slice(), name)) {
+                return .{
+                    .healthy = jj.last_read_ok_ts > 0,
+                    .lines_seen = jj.lines_seen,
+                    .last_read_ok_ts = jj.last_read_ok_ts,
+                };
+            }
+        }
+        return null;
+    }
+
     // ----- poll tick -----
 
     fn pollTick(expirations: u64, userdata: ?*anyopaque) void {
@@ -872,6 +912,12 @@ pub const JournaldSource = struct {
             },
         }
 
+        // Clean `.Exited(0)` reached (entries or not) — record the
+        // successful read for read-health (SYS-017). Covers both the
+        // baseline-seed first run and the steady-state batch, and the
+        // "no new entries" empty-but-OK case.
+        jj.last_read_ok_ts = std.time.timestamp();
+
         if (first_run) {
             // Seed only — NEVER feed the baseline entry to the callback.
             self.seedBaseline(jj, result.stdout);
@@ -974,6 +1020,7 @@ pub const JournaldSource = struct {
             // watcher uses. `truncated = false`: we never deliver partial
             // journal messages (a too-long MESSAGE is rejected in decode).
             jj.callback(entry.message, jj.jail, false, jj.userdata);
+            jj.lines_seen += 1; // read-health (SYS-017), lifetime
 
             // Advance the cursor ONLY after the callback has run, and ONLY
             // from an entry that carried a cursor.
@@ -1556,4 +1603,46 @@ test "journald: steady-state processBatch STILL invokes the callback (contrast w
     try testing.expectEqual(@as(usize, 1), rec.lines.items.len); // processed
     try testing.expectEqualStrings("Invalid user x from 5.5.5.5 port 1", rec.lines.items[0]);
     try testing.expectEqualStrings("s=new1", jj.cursorSlice()); // advanced
+    // SYS-017: a delivered MESSAGE increments lines_seen (baseline entries
+    // do not — see the seedBaseline tests above, which never touch it).
+    try testing.expectEqual(@as(u64, 1), jj.lines_seen);
+}
+
+// --- SYS-017 read-health verdict (pure: drive the struct fields directly) ---
+
+test "journald: healthForJail unhealthy until a clean poll completes (SYS-017)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var loop = try EventLoop.init(testing.allocator);
+    defer loop.deinit();
+    var src = try JournaldSource.init(testing.allocator, &loop, "/tmp/fail2zig-test/state.bin");
+    defer src.deinit();
+    var rec = CallRecorder.init(testing.allocator);
+    defer rec.deinit();
+    try src.addJail(try JailId.fromSlice("sshd"), "sshd", CallRecorder.onLine, &rec);
+    const jj = &src.jails.items[0];
+
+    // No clean poll yet → unhealthy (the genuine negative probe that can
+    // drive DEGRADED for an enforcing journald jail). HEALTH only — the
+    // SOURCE label is the daemon's resolved descriptor, not this.
+    const h0 = src.healthForJail("sshd").?;
+    try testing.expect(!h0.healthy);
+    try testing.expectEqual(@as(u64, 0), h0.lines_seen);
+
+    // After one clean poll the jail is healthy regardless of traffic
+    // (the conservative "ever read successfully?" threshold).
+    jj.last_read_ok_ts = 1234;
+    jj.lines_seen = 7;
+    const h1 = src.healthForJail("sshd").?;
+    try testing.expect(h1.healthy);
+    try testing.expectEqual(@as(u64, 7), h1.lines_seen);
+    try testing.expectEqual(@as(i64, 1234), h1.last_read_ok_ts);
+}
+
+test "journald: healthForJail returns null for an unknown jail (SYS-017)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var loop = try EventLoop.init(testing.allocator);
+    defer loop.deinit();
+    var src = try JournaldSource.init(testing.allocator, &loop, "/tmp/fail2zig-test/state.bin");
+    defer src.deinit();
+    try testing.expect(src.healthForJail("nope") == null);
 }

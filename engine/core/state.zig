@@ -306,6 +306,14 @@ pub const StateTracker = struct {
     map: Map,
     ignore: std.ArrayList(Cidr),
     stats_inner: Stats,
+    /// Monotonic LIFETIME ban count for this jail (BUG-006). Incremented
+    /// once per NEW ban issued (the dispatch path), persisted in the state
+    /// file, and seeded from disk on restart — never reset, never bumped on
+    /// restore. The status rollup's `Total bans` is the sum of these across
+    /// jails, so it is ≥ active bans by construction and survives restarts.
+    /// Single-threaded (event-loop owned) — no atomics, matching the rest
+    /// of the tracker's discipline.
+    lifetime_bans: u64 = 0,
 
     /// Initialize with an explicit capacity (in IP entries). Pre-allocates
     /// hash-map buckets so the steady-state path never needs a rehash.
@@ -324,7 +332,21 @@ pub const StateTracker = struct {
             .map = map,
             .ignore = ignore,
             .stats_inner = .{},
+            .lifetime_bans = 0,
         };
+    }
+
+    /// Record one NEW ban against this jail's lifetime counter (BUG-006).
+    /// Call exactly once per ban issued, from the dispatch path — NEVER on
+    /// restore (a restored ban was already counted when first issued).
+    pub fn recordLifetimeBan(self: *StateTracker) void {
+        self.lifetime_bans += 1;
+    }
+
+    /// Seed the lifetime ban counter from persisted state at startup
+    /// (BUG-006). Sets, never adds — the persisted value is the authority.
+    pub fn seedLifetimeBans(self: *StateTracker, count: u64) void {
+        self.lifetime_bans = count;
     }
 
     pub fn deinit(self: *StateTracker) void {

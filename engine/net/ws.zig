@@ -411,6 +411,12 @@ pub const WsServer = struct {
         active_bans: u32,
         memory_bytes_used: u64,
         uptime_s: u64,
+        /// SYS-017 (additive): overall protection state
+        /// ("active"/"mixed"/"log-only"/"degraded") and a degraded flag.
+        /// Defaulted so older callers / tests need not supply them; an
+        /// added JSON field is backward-safe for any consumer.
+        protection_state: []const u8 = "active",
+        degraded: bool = false,
     };
 
     pub fn broadcastMetrics(
@@ -423,8 +429,8 @@ pub const WsServer = struct {
         var ts_buf: [32]u8 = undefined;
         const ts = try formatIso8601Utc(&ts_buf, std.time.milliTimestamp());
         try buf.writer(a).print(
-            "{{\"type\":\"metrics\",\"ts\":\"{s}\",\"payload\":{{\"lines_parsed\":{d},\"lines_matched\":{d},\"bans_total\":{d},\"active_bans\":{d},\"memory_bytes_used\":{d},\"uptime_s\":{d}}}}}",
-            .{ ts, m.lines_parsed, m.lines_matched, m.bans_total, m.active_bans, m.memory_bytes_used, m.uptime_s },
+            "{{\"type\":\"metrics\",\"ts\":\"{s}\",\"payload\":{{\"lines_parsed\":{d},\"lines_matched\":{d},\"bans_total\":{d},\"active_bans\":{d},\"memory_bytes_used\":{d},\"uptime_s\":{d},\"protection_state\":\"{s}\",\"degraded\":{s}}}}}",
+            .{ ts, m.lines_parsed, m.lines_matched, m.bans_total, m.active_bans, m.memory_bytes_used, m.uptime_s, m.protection_state, if (m.degraded) "true" else "false" },
         );
         try self.broadcast(buf.items);
     }

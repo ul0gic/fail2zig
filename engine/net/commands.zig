@@ -39,6 +39,10 @@ const ipc = @import("ipc.zig");
 pub const StatsSnapshot = struct {
     memory_bytes_used: u64 = 0,
     parse_rate: u64 = 0,
+    /// Lifetime total bans issued (SYS-017). The daemon adapter fills this
+    /// from `metrics.snapshot().bans_total`; zero by default so this file
+    /// keeps no compile-time dependency on metrics.zig.
+    bans_total: u64 = 0,
 };
 
 /// Vtable the handler uses to read live stats. Kept separate from the
@@ -54,6 +58,67 @@ fn defaultStatsSnapshot(ctx: ?*anyopaque) StatsSnapshot {
     return .{};
 }
 
+/// Per-jail log-source read-HEALTH (SYS-017), looked up at status time.
+/// Mirrors `core/log_watcher.zig`'s `JailHealth` shape; the daemon adapter
+/// in main.zig copies between them so this file keeps zero compile-time
+/// dependency on the source modules.
+///
+/// `healthy == false` is a genuine negative probe — only a journald jail
+/// that has never read cleanly reports it (file health returns "unknown"
+/// rather than a hard false). That invariant is what lets
+/// `computeOverallState` use `healthy == false` as the DEGRADED trigger
+/// while staying journald-only in v1 (§4).
+///
+/// This carries HEALTH only (whether the source is reading). The SOURCE
+/// label is the *resolved-source descriptor* — `JailSourceSource`, always
+/// present for a configured jail even when no live source is attached — so
+/// a misconfigured (absent-path) file jail still shows its path, not
+/// "unknown". HEALTH and SOURCE stay KIND-consistent because both derive
+/// from the same runtime `resolveSource` result.
+pub const JailHealth = struct { healthy: bool, lines_seen: u64, last_read_ok_ts: i64 };
+
+/// Vtable the handler uses to read per-jail source health. Read-only,
+/// same decoupling idiom as `StatsSource`. Default returns `.unknown`
+/// (null) for every jail so the daemon can wire it incrementally and
+/// tests need not supply it.
+pub const JailHealthSource = struct {
+    ctx: ?*anyopaque = null,
+    /// Look up health for one jail by name. `null` => no source health
+    /// known for that jail (renders "unknown", never "unhealthy").
+    lookup: *const fn (ctx: ?*anyopaque, jail_name: []const u8) ?JailHealth = defaultNoHealth,
+};
+
+fn defaultNoHealth(ctx: ?*anyopaque, jail_name: []const u8) ?JailHealth {
+    _ = ctx;
+    _ = jail_name;
+    return null;
+}
+
+/// Vtable the handler uses to read a jail's RESOLVED SOURCE DESCRIPTOR —
+/// the authoritative SOURCE label, recorded at jail-resolution time in the
+/// daemon (where the runtime `file`/`journald` decision is made). Unlike
+/// live read-health, this is known for every enabled/configured jail
+/// regardless of whether a source is attached, so a configured jail NEVER
+/// renders `SOURCE: unknown` (the absent-logpath case shows the path, which
+/// is exactly the misconfiguration signal an operator needs).
+///
+/// The descriptor is KIND-truthful: journald → `journald (<filter>)`; file
+/// → the resolved logpath(s). It is NOT a config heuristic — the daemon
+/// records the descriptor only after `resolveSource` picks the kind. The
+/// returned slice points into long-lived daemon data (no allocation per
+/// call, no lifetime hazard). `null` => the daemon did not record one (e.g.
+/// the default vtable in tests) → the handler renders "unknown".
+pub const JailSourceSource = struct {
+    ctx: ?*anyopaque = null,
+    lookup: *const fn (ctx: ?*anyopaque, jail_name: []const u8) ?[]const u8 = defaultNoSource,
+};
+
+fn defaultNoSource(ctx: ?*anyopaque, jail_name: []const u8) ?[]const u8 {
+    _ = ctx;
+    _ = jail_name;
+    return null;
+}
+
 /// Aggregate context plumbed into the handler at construction time. The
 /// daemon owns the referenced objects and outlives the server.
 pub const Context = struct {
@@ -64,6 +129,13 @@ pub const Context = struct {
     config: *const config_mod.Config,
     backend: *firewall.Backend,
     stats_source: StatsSource = .{},
+    /// Per-jail log-source health (SYS-017). Default returns "unknown" for
+    /// every jail; the daemon installs an adapter over the live sources.
+    health_source: JailHealthSource = .{},
+    /// Per-jail RESOLVED SOURCE DESCRIPTOR (SYS-017) — the authoritative
+    /// SOURCE label, recorded at jail-resolution time. Default returns
+    /// "unknown"; the daemon installs an adapter over its resolution record.
+    source_descriptor: JailSourceSource = .{},
     /// Monotonic startup timestamp captured by the daemon at main()
     /// so the status handler can report uptime as a whole number of
     /// seconds.
@@ -117,7 +189,8 @@ pub const Context = struct {
         const stats = self.stats_source.snapshot(self.stats_source.ctx);
         const active_bans = self.trackers.totalActiveBans();
         const backend_name = @tagName(self.backend.tag());
-        const protection = self.computeProtection();
+        const protection = self.computeOverallState();
+        const jails_active = self.enabledJailCount();
 
         var buf: std.ArrayListUnmanaged(u8) = .{};
         defer buf.deinit(a);
@@ -128,7 +201,13 @@ pub const Context = struct {
         try w.print("\"memory_bytes_used\":{d},", .{stats.memory_bytes_used});
         try w.print("\"parse_rate\":{d},", .{stats.parse_rate});
         try w.print("\"active_bans\":{d},", .{active_bans});
+        // SYS-017: lifetime total bans (from the stats vtable) and the
+        // count of ENABLED jails. `jail_count` is kept (additive) — it
+        // counts ALL configured jails; `jails_active` is the enabled subset
+        // the client renders as "Jails:".
+        try w.print("\"total_bans\":{d},", .{stats.bans_total});
         try w.print("\"jail_count\":{d},", .{self.config.jails.len});
+        try w.print("\"jails_active\":{d},", .{jails_active});
         try w.print("\"protection\":\"{s}\",", .{protection});
         try w.print("\"backend\":\"{s}\"", .{backend_name});
         try w.writeAll("}");
@@ -137,17 +216,39 @@ pub const Context = struct {
         return .{ .ok = .{ .payload = payload } };
     }
 
-    /// Resolve enforcement posture across enabled jails. Returns one of
-    /// `"active"` (all enabled jails enforce), `"log-only"` (all enabled
-    /// jails are non-enforcing), or `"mixed"` (some of each). With zero
-    /// enabled jails there is nothing to misreport, so `"active"`.
+    /// Count of ENABLED jails (SYS-017). Reported as `jails_active`; the
+    /// client renders it as the "Jails:" rollup.
+    fn enabledJailCount(self: *const Context) u32 {
+        var n: u32 = 0;
+        for (self.config.jails) |*jc| {
+            if (jc.enabled) n += 1;
+        }
+        return n;
+    }
+
+    /// Resolve overall protection state across enabled jails (SYS-017,
+    /// replaces `computeProtection`). Returns one of `"degraded"`,
+    /// `"mixed"`, `"log-only"`, `"active"` with precedence:
+    ///
+    ///     degraded  >  mixed  >  log-only  >  active
     ///
     /// The effective banaction per jail comes from the same resolver the
-    /// dispatch path uses (`resolveJailFromConfig`), so this string can
-    /// never disagree with what the daemon actually does on a ban.
-    fn computeProtection(self: *const Context) []const u8 {
+    /// dispatch path uses (`resolveJailFromConfig`), so the enforcement
+    /// descriptors never disagree with what the daemon actually does.
+    ///
+    /// DEGRADED predicate (§4): an ENABLED, ENFORCING jail whose log source
+    /// is genuinely unhealthy (`health.healthy == false`). Only a journald
+    /// source ever reports `healthy == false` — the file source returns
+    /// "unknown" (null) instead of a hard false — so this is journald-only
+    /// in v1 without an explicit source check (the invariant lives in the
+    /// `JailHealthSource` adapter). A jail with unknown health (null) is
+    /// NEVER degraded: DEGRADED is asserted only from a real negative probe,
+    /// never a placeholder. This reads health probes only — it never changes
+    /// whether/how a ban is dispatched.
+    pub fn computeOverallState(self: *const Context) []const u8 {
         var any_enforcing = false;
         var any_log_only = false;
+        var any_degraded = false;
         for (self.config.jails) |*jc| {
             if (!jc.enabled) continue;
             const resolved = config_mod.resolveJailFromConfig(jc, self.config.defaults);
@@ -155,8 +256,14 @@ pub const Context = struct {
                 any_log_only = true;
             } else {
                 any_enforcing = true;
+                // Enforcing jail: a genuine negative source-health probe
+                // (journald-only) flips the host to DEGRADED.
+                if (self.health_source.lookup(self.health_source.ctx, jc.name)) |h| {
+                    if (!h.healthy) any_degraded = true;
+                }
             }
         }
+        if (any_degraded) return "degraded";
         if (any_enforcing and any_log_only) return "mixed";
         if (any_log_only) return "log-only";
         return "active";
@@ -271,8 +378,25 @@ pub const Context = struct {
                 }
             }
             const resolved = config_mod.resolveJailFromConfig(jc, self.config.defaults);
+            // SYS-017: per-jail SOURCE + HEALTH for the human/JSON list,
+            // BOTH derived from the same runtime `resolveSource` decision so
+            // they are KIND-consistent and never config-guessed.
+            //   * SOURCE (`log_source`) = the RESOLVED SOURCE DESCRIPTOR,
+            //     recorded at jail-resolution time — known for every enabled
+            //     jail even when no source is attached, so a configured jail
+            //     NEVER renders "unknown" (an absent-path file jail shows its
+            //     path, the misconfiguration signal). Falls back to "unknown"
+            //     only when the daemon recorded none (e.g. tests).
+            //   * HEALTH (`source_healthy`, `lines_seen`) = the LIVE source
+            //     read-health. Tri-state: `true`/`false` when the source
+            //     reports a verdict, OMITTED when "unknown" (no signal yet, or
+            //     a file source that has never read).
+            const health = self.health_source.lookup(self.health_source.ctx, jc.name);
+            const lines_seen: u64 = if (health) |h| h.lines_seen else 0;
+            const log_source: []const u8 =
+                self.source_descriptor.lookup(self.source_descriptor.ctx, jc.name) orelse "unknown";
             try w.print(
-                "{{\"name\":\"{s}\",\"enabled\":{s},\"active_bans\":{d},\"maxretry\":{d},\"findtime\":{d},\"bantime\":{d},\"action\":\"{s}\",\"enforcing\":{s}}}",
+                "{{\"name\":\"{s}\",\"enabled\":{s},\"active_bans\":{d},\"maxretry\":{d},\"findtime\":{d},\"bantime\":{d},\"action\":\"{s}\",\"enforcing\":{s},\"log_source\":\"{s}\",\"lines_seen\":{d}",
                 .{
                     jc.name,
                     if (jc.enabled) "true" else "false",
@@ -282,8 +406,16 @@ pub const Context = struct {
                     resolved.bantime,
                     @tagName(resolved.banaction),
                     if (resolved.banaction != .@"log-only") "true" else "false",
+                    log_source,
+                    lines_seen,
                 },
             );
+            if (health) |h| {
+                try w.print(",\"source_healthy\":{s}}}", .{if (h.healthy) "true" else "false"});
+            } else {
+                // Unknown: omit `source_healthy` entirely (tri-state).
+                try w.writeAll("}");
+            }
         }
         try w.writeAll("]");
         const payload = try a.dupe(u8, buf.items);
@@ -436,6 +568,48 @@ fn realBackendFromStub(s: *StubBackend) firewall.Backend {
     // stub in dedicated tests that skip the Backend layer entirely.
     return .{ .nftables = firewall.nftables.NftablesBackend{} };
 }
+
+/// Stub stats source returning a fixed `bans_total` so handleStatus's
+/// rollup can be asserted without metrics.zig.
+const StubStats = struct {
+    bans_total: u64,
+    fn snapshot(ctx: ?*anyopaque) StatsSnapshot {
+        const self: *StubStats = @ptrCast(@alignCast(ctx.?));
+        return .{ .bans_total = self.bans_total };
+    }
+};
+
+/// Stub jail-HEALTH source. Maps a fixed name to a verdict; everything else
+/// is "unknown" (null). Mirrors the daemon adapter contract: only a journald
+/// jail ever yields `healthy == false`. (SOURCE labels come from
+/// `StubSource`, not here — HEALTH and SOURCE are separate signals.)
+const StubHealth = struct {
+    name: []const u8,
+    healthy: bool,
+    lines_seen: u64,
+    last_read_ok_ts: i64,
+    fn lookup(ctx: ?*anyopaque, jail_name: []const u8) ?JailHealth {
+        const self: *StubHealth = @ptrCast(@alignCast(ctx.?));
+        if (!std.mem.eql(u8, jail_name, self.name)) return null;
+        return .{
+            .healthy = self.healthy,
+            .lines_seen = self.lines_seen,
+            .last_read_ok_ts = self.last_read_ok_ts,
+        };
+    }
+};
+
+/// Stub resolved-source descriptor source for `JailSourceSource`. Maps a
+/// fixed name to its descriptor; everything else returns null (→ "unknown").
+const StubSource = struct {
+    name: []const u8,
+    descriptor: []const u8,
+    fn lookup(ctx: ?*anyopaque, jail_name: []const u8) ?[]const u8 {
+        const self: *StubSource = @ptrCast(@alignCast(ctx.?));
+        if (std.mem.eql(u8, jail_name, self.name)) return self.descriptor;
+        return null;
+    }
+};
 
 fn makeConfig() config_mod.Config {
     return .{
@@ -824,6 +998,325 @@ test "commands: handleBan on uninitialized backend returns err response" {
     defer resp.deinit(a);
     try testing.expect(resp == .err);
     try testing.expectEqual(@as(u16, 500), resp.err.code);
+}
+
+// --- SYS-017: rollups, DEGRADED overall state, list-jails source/health ---
+
+test "commands: handleStatus emits total_bans + jails_active rollups (SYS-017)" {
+    const a = testing.allocator;
+    var trackers = makeEmptyTrackerMap(a);
+    defer trackers.deinit();
+
+    var jails = [_]config_mod.JailConfig{
+        .{ .name = "sshd", .enabled = true, .banaction = .nftables },
+        .{ .name = "nginx", .enabled = false, .banaction = .nftables },
+    };
+    var cfg = config_mod.Config{
+        .global = .{},
+        .defaults = .{ .banaction = .nftables },
+        .jails = &jails,
+        .diag = .{},
+    };
+    var stub = StubBackend{};
+    var be = realBackendFromStub(&stub);
+    defer be.deinit();
+    var stats = StubStats{ .bans_total = 42 };
+
+    var ctx = Context{
+        .trackers = &trackers,
+        .config = &cfg,
+        .backend = &be,
+        .stats_source = .{ .ctx = @ptrCast(&stats), .snapshot = StubStats.snapshot },
+    };
+    const resp = try ctx.handle(.{ .status = {} }, a);
+    defer resp.deinit(a);
+    const body = resp.ok.payload;
+    try testing.expect(std.mem.indexOf(u8, body, "\"total_bans\":42") != null);
+    // One enabled, one disabled → jails_active = 1, jail_count = 2 (kept).
+    try testing.expect(std.mem.indexOf(u8, body, "\"jails_active\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"jail_count\":2") != null);
+}
+
+test "commands: BUG-006 status Total bans >= Active bans after a restore" {
+    // The exact regression: after a restart that restored active bans, the
+    // persisted lifetime (seeded ≥ active) must keep Total >= Active. Here
+    // the stats source reports the persisted lifetime (2) and the tracker
+    // holds 2 restored active bans — Total (2) must not read below Active.
+    const a = testing.allocator;
+    var trackers = makeEmptyTrackerMap(a);
+    defer trackers.deinit();
+    const sshd = try trackers.addTracker("sshd", .{ .max_entries = 16 });
+    // Two restored, banned entries.
+    inline for (.{ "1.2.3.4", "5.6.7.8" }) |ip_s| {
+        _ = try sshd.recordAttempt(try shared.IpAddress.parse(ip_s), try shared.JailId.fromSlice("sshd"), 100);
+        sshd.map.getPtr(try shared.IpAddress.parse(ip_s)).?.ban_state = .banned;
+    }
+    var cfg = makeConfig();
+    var stub = StubBackend{};
+    var be = realBackendFromStub(&stub);
+    defer be.deinit();
+    // Persisted lifetime floored at active (2) — the BUG-006 seed.
+    var stats = StubStats{ .bans_total = 2 };
+
+    var ctx = Context{
+        .trackers = &trackers,
+        .config = &cfg,
+        .backend = &be,
+        .stats_source = .{ .ctx = @ptrCast(&stats), .snapshot = StubStats.snapshot },
+    };
+    const resp = try ctx.handle(.{ .status = {} }, a);
+    defer resp.deinit(a);
+    const body = resp.ok.payload;
+    try testing.expect(std.mem.indexOf(u8, body, "\"active_bans\":2") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"total_bans\":2") != null);
+    // Total (2) >= Active (2): the self-contradictory state is gone.
+}
+
+test "commands: overall state is degraded for an enforcing jail with unhealthy source (SYS-017)" {
+    const a = testing.allocator;
+    var trackers = makeEmptyTrackerMap(a);
+    defer trackers.deinit();
+    var jails = [_]config_mod.JailConfig{
+        .{ .name = "sshd", .enabled = true, .banaction = .nftables },
+    };
+    var cfg = config_mod.Config{ .global = .{}, .defaults = .{ .banaction = .nftables }, .jails = &jails, .diag = .{} };
+    var stub = StubBackend{};
+    var be = realBackendFromStub(&stub);
+    defer be.deinit();
+    var health = StubHealth{ .name = "sshd", .healthy = false, .lines_seen = 0, .last_read_ok_ts = 0 };
+
+    var ctx = Context{
+        .trackers = &trackers,
+        .config = &cfg,
+        .backend = &be,
+        .health_source = .{ .ctx = @ptrCast(&health), .lookup = StubHealth.lookup },
+    };
+    const resp = try ctx.handle(.{ .status = {} }, a);
+    defer resp.deinit(a);
+    try testing.expect(std.mem.indexOf(u8, resp.ok.payload, "\"protection\":\"degraded\"") != null);
+}
+
+test "commands: degraded outranks mixed (enforcing+unhealthy with a log-only jail) (SYS-017)" {
+    const a = testing.allocator;
+    var trackers = makeEmptyTrackerMap(a);
+    defer trackers.deinit();
+    var jails = [_]config_mod.JailConfig{
+        .{ .name = "sshd", .enabled = true, .banaction = .nftables },
+        .{ .name = "audit", .enabled = true, .banaction = .@"log-only" },
+    };
+    var cfg = config_mod.Config{ .global = .{}, .defaults = .{ .banaction = .nftables }, .jails = &jails, .diag = .{} };
+    var stub = StubBackend{};
+    var be = realBackendFromStub(&stub);
+    defer be.deinit();
+    var health = StubHealth{ .name = "sshd", .healthy = false, .lines_seen = 0, .last_read_ok_ts = 0 };
+
+    var ctx = Context{
+        .trackers = &trackers,
+        .config = &cfg,
+        .backend = &be,
+        .health_source = .{ .ctx = @ptrCast(&health), .lookup = StubHealth.lookup },
+    };
+    const resp = try ctx.handle(.{ .status = {} }, a);
+    defer resp.deinit(a);
+    try testing.expect(std.mem.indexOf(u8, resp.ok.payload, "\"protection\":\"degraded\"") != null);
+}
+
+test "commands: healthy enforcing + log-only is mixed, not degraded (SYS-017)" {
+    const a = testing.allocator;
+    var trackers = makeEmptyTrackerMap(a);
+    defer trackers.deinit();
+    var jails = [_]config_mod.JailConfig{
+        .{ .name = "sshd", .enabled = true, .banaction = .nftables },
+        .{ .name = "audit", .enabled = true, .banaction = .@"log-only" },
+    };
+    var cfg = config_mod.Config{ .global = .{}, .defaults = .{ .banaction = .nftables }, .jails = &jails, .diag = .{} };
+    var stub = StubBackend{};
+    var be = realBackendFromStub(&stub);
+    defer be.deinit();
+    var health = StubHealth{ .name = "sshd", .healthy = true, .lines_seen = 5, .last_read_ok_ts = 100 };
+
+    var ctx = Context{
+        .trackers = &trackers,
+        .config = &cfg,
+        .backend = &be,
+        .health_source = .{ .ctx = @ptrCast(&health), .lookup = StubHealth.lookup },
+    };
+    const resp = try ctx.handle(.{ .status = {} }, a);
+    defer resp.deinit(a);
+    try testing.expect(std.mem.indexOf(u8, resp.ok.payload, "\"protection\":\"mixed\"") != null);
+}
+
+test "commands: a log-only jail with a dead source does NOT degrade (SYS-017)" {
+    // A non-enforcing jail's source health never flips the host critical —
+    // its non-enforcement is already honestly reported by "log-only".
+    const a = testing.allocator;
+    var trackers = makeEmptyTrackerMap(a);
+    defer trackers.deinit();
+    var jails = [_]config_mod.JailConfig{
+        .{ .name = "sshd", .enabled = true, .banaction = .@"log-only" },
+    };
+    var cfg = config_mod.Config{ .global = .{}, .defaults = .{ .banaction = .@"log-only" }, .jails = &jails, .diag = .{} };
+    var stub = StubBackend{};
+    var be = realBackendFromStub(&stub);
+    defer be.deinit();
+    var health = StubHealth{ .name = "sshd", .healthy = false, .lines_seen = 0, .last_read_ok_ts = 0 };
+
+    var ctx = Context{
+        .trackers = &trackers,
+        .config = &cfg,
+        .backend = &be,
+        .health_source = .{ .ctx = @ptrCast(&health), .lookup = StubHealth.lookup },
+    };
+    const resp = try ctx.handle(.{ .status = {} }, a);
+    defer resp.deinit(a);
+    try testing.expect(std.mem.indexOf(u8, resp.ok.payload, "\"protection\":\"log-only\"") != null);
+}
+
+test "commands: enforcing jail with UNKNOWN health is not degraded (SYS-017)" {
+    // No source-health signal yet (lookup returns null) → never a synthetic
+    // DEGRADED. The default no-health vtable yields exactly this.
+    const a = testing.allocator;
+    var trackers = makeEmptyTrackerMap(a);
+    defer trackers.deinit();
+    var jails = [_]config_mod.JailConfig{
+        .{ .name = "sshd", .enabled = true, .banaction = .nftables },
+    };
+    var cfg = config_mod.Config{ .global = .{}, .defaults = .{ .banaction = .nftables }, .jails = &jails, .diag = .{} };
+    var stub = StubBackend{};
+    var be = realBackendFromStub(&stub);
+    defer be.deinit();
+
+    // No health_source installed → defaultNoHealth → unknown for every jail.
+    var ctx = Context{ .trackers = &trackers, .config = &cfg, .backend = &be };
+    const resp = try ctx.handle(.{ .status = {} }, a);
+    defer resp.deinit(a);
+    try testing.expect(std.mem.indexOf(u8, resp.ok.payload, "\"protection\":\"active\"") != null);
+}
+
+/// Multi-jail health stub: maps each jail name to a resolved-source label
+/// + verdict, writing the label into the caller's `source_buf` (exactly
+/// like the real per-source `healthForJail`). HEALTH only — SOURCE comes
+/// from `MultiSource`.
+const MultiHealth = struct {
+    const Entry = struct { name: []const u8, healthy: bool, lines_seen: u64 };
+    entries: []const Entry,
+    fn lookup(ctx: ?*anyopaque, jail_name: []const u8) ?JailHealth {
+        const self: *MultiHealth = @ptrCast(@alignCast(ctx.?));
+        for (self.entries) |e| {
+            if (!std.mem.eql(u8, jail_name, e.name)) continue;
+            return .{ .healthy = e.healthy, .lines_seen = e.lines_seen, .last_read_ok_ts = 0 };
+        }
+        return null;
+    }
+};
+
+/// Multi-jail RESOLVED-source descriptor stub. The descriptor is the
+/// runtime-resolved truth recorded by the daemon — INDEPENDENT of the
+/// jail's config and of whether a live source is attached — so a test can
+/// prove SOURCE follows runtime resolution, never the config logpath, and
+/// is present even for a jail with no live health.
+const MultiSource = struct {
+    const Entry = struct { name: []const u8, descriptor: []const u8 };
+    entries: []const Entry,
+    fn lookup(ctx: ?*anyopaque, jail_name: []const u8) ?[]const u8 {
+        const self: *MultiSource = @ptrCast(@alignCast(ctx.?));
+        for (self.entries) |e| {
+            if (std.mem.eql(u8, jail_name, e.name)) return e.descriptor;
+        }
+        return null;
+    }
+};
+
+test "commands: handleListJails emits log_source/source_healthy/lines_seen (SYS-017)" {
+    const a = testing.allocator;
+    var trackers = makeEmptyTrackerMap(a);
+    defer trackers.deinit();
+    var jails = [_]config_mod.JailConfig{
+        // sshd: config says source=auto with a FILE logpath (auth.log), but
+        // at runtime it RESOLVED to journald (the exact f2z-target bug:
+        // auth.log doesn't exist on a journald-only box). SOURCE must follow
+        // the resolved descriptor (journald), NOT the config logpath.
+        .{ .name = "sshd", .enabled = true, .banaction = .nftables, .source = .auto, .filter = "sshd", .logpath = &.{"/var/log/auth.log"} },
+        // nginx: a real, reading file jail.
+        .{ .name = "nginx", .enabled = true, .banaction = .nftables, .source = .file, .filter = "nginx", .logpath = &.{"/var/log/nginx/error.log"} },
+        // mail: file-resolved but its path is ABSENT — no live source is
+        // attached, so HEALTH is unknown. SOURCE must STILL show the
+        // resolved path (the misconfiguration signal), never "unknown".
+        .{ .name = "mail", .enabled = true, .banaction = .nftables, .source = .file, .filter = "mail", .logpath = &.{"/var/log/mail.log"} },
+    };
+    var cfg = config_mod.Config{ .global = .{}, .defaults = .{ .banaction = .nftables }, .jails = &jails, .diag = .{} };
+    var stub = StubBackend{};
+    var be = realBackendFromStub(&stub);
+    defer be.deinit();
+    // HEALTH: sshd + nginx report; mail has NO live source (unknown health).
+    var health = MultiHealth{ .entries = &.{
+        .{ .name = "sshd", .healthy = true, .lines_seen = 12 },
+        .{ .name = "nginx", .healthy = true, .lines_seen = 3 },
+    } };
+    // SOURCE descriptors: recorded for ALL enabled jails at resolution time,
+    // including mail (whose path is absent) — so SOURCE never renders unknown.
+    var source = MultiSource{ .entries = &.{
+        .{ .name = "sshd", .descriptor = "journald (sshd)" },
+        .{ .name = "nginx", .descriptor = "/var/log/nginx/error.log" },
+        .{ .name = "mail", .descriptor = "/var/log/mail.log" },
+    } };
+
+    var ctx = Context{
+        .trackers = &trackers,
+        .config = &cfg,
+        .backend = &be,
+        .health_source = .{ .ctx = @ptrCast(&health), .lookup = MultiHealth.lookup },
+        .source_descriptor = .{ .ctx = @ptrCast(&source), .lookup = MultiSource.lookup },
+    };
+    const resp = try ctx.handle(.{ .list_jails = {} }, a);
+    defer resp.deinit(a);
+    const body = resp.ok.payload;
+    // sshd: SOURCE follows the resolved descriptor (journald), NOT the
+    // config logpath — auth.log must NOT appear anywhere.
+    try testing.expect(std.mem.indexOf(u8, body, "\"log_source\":\"journald (sshd)\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "/var/log/auth.log") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"source_healthy\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"lines_seen\":12") != null);
+    // nginx: file jail shows its real path.
+    try testing.expect(std.mem.indexOf(u8, body, "\"log_source\":\"/var/log/nginx/error.log\"") != null);
+    // mail (THE FIX): absent path / no live health → SOURCE shows the
+    // resolved path, NOT "unknown"; health omitted (no source_healthy).
+    try testing.expect(std.mem.indexOf(u8, body, "\"log_source\":\"/var/log/mail.log\"") != null);
+    // And no configured jail renders log_source "unknown".
+    try testing.expect(std.mem.indexOf(u8, body, "\"log_source\":\"unknown\"") == null);
+}
+
+test "commands: an enabled jail with a recorded descriptor never renders SOURCE unknown (SYS-017)" {
+    // Direct guard on the fix: even with NO health source at all (health
+    // unknown for every jail), a jail whose resolved descriptor was recorded
+    // shows that descriptor — never "unknown".
+    const a = testing.allocator;
+    var trackers = makeEmptyTrackerMap(a);
+    defer trackers.deinit();
+    var jails = [_]config_mod.JailConfig{
+        .{ .name = "nginx", .enabled = true, .banaction = .nftables, .source = .file, .filter = "nginx", .logpath = &.{"/var/log/nginx/error.log"} },
+    };
+    var cfg = config_mod.Config{ .global = .{}, .defaults = .{ .banaction = .nftables }, .jails = &jails, .diag = .{} };
+    var stub = StubBackend{};
+    var be = realBackendFromStub(&stub);
+    defer be.deinit();
+    var source = MultiSource{ .entries = &.{
+        .{ .name = "nginx", .descriptor = "/var/log/nginx/error.log" },
+    } };
+    // No health_source installed → unknown HEALTH for every jail.
+    var ctx = Context{
+        .trackers = &trackers,
+        .config = &cfg,
+        .backend = &be,
+        .source_descriptor = .{ .ctx = @ptrCast(&source), .lookup = MultiSource.lookup },
+    };
+    const resp = try ctx.handle(.{ .list_jails = {} }, a);
+    defer resp.deinit(a);
+    const body = resp.ok.payload;
+    try testing.expect(std.mem.indexOf(u8, body, "\"log_source\":\"/var/log/nginx/error.log\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"log_source\":\"unknown\"") == null);
+    // HEALTH genuinely unknown → source_healthy omitted.
+    try testing.expect(std.mem.indexOf(u8, body, "\"source_healthy\"") == null);
 }
 
 test "commands: handleUnban without jail returns 404 when no jails configured" {
