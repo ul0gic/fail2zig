@@ -259,6 +259,15 @@ pub const Metrics = struct {
         self.active_bans.store(count, counter_order);
     }
 
+    /// Seed the GLOBAL lifetime `bans_total` counter from persisted state
+    /// at startup (BUG-006). Sets, never adds — the persisted lifetime sum
+    /// is the authority. A persisted monotonic counter that survives
+    /// restarts keeps the human `Total bans` and `/metrics`
+    /// `fail2zig_bans_total` in agreement and always ≥ active bans.
+    pub fn setBansTotal(self: *Metrics, count: u64) void {
+        self.bans_total.store(count);
+    }
+
     // ----- Per-jail operations -----
 
     /// Register a jail so future per-jail updates under this name can
@@ -323,6 +332,15 @@ pub const Metrics = struct {
     pub fn jailSetActiveBans(self: *Metrics, jail: []const u8, count: u32) void {
         if (self.jailIndex(jail)) |i| {
             self.jails[i].active_bans.store(count, counter_order);
+        }
+    }
+
+    /// Per-jail counterpart of `setBansTotal` — seed a jail's lifetime
+    /// `bans_total` from persisted state (BUG-006). No-op for an
+    /// unregistered jail.
+    pub fn jailSetBansTotal(self: *Metrics, jail: []const u8, count: u64) void {
+        if (self.jailIndex(jail)) |i| {
+            self.jails[i].bans_total.store(count);
         }
     }
 
@@ -491,6 +509,23 @@ test "metrics: setMemoryBytes updates the memory gauge" {
     try testing.expectEqual(@as(u64, 12345), m.snapshot().memory_bytes_used);
     m.setMemoryBytes(67890);
     try testing.expectEqual(@as(u64, 67890), m.snapshot().memory_bytes_used);
+}
+
+test "metrics: BUG-006 setBansTotal / jailSetBansTotal seed the lifetime counters" {
+    var m = Metrics.init();
+    _ = m.registerJail("sshd");
+    // Seed from persisted lifetime, then a new ban increments on top.
+    m.setBansTotal(100);
+    m.jailSetBansTotal("sshd", 60);
+    var s = m.snapshot();
+    try testing.expectEqual(@as(u64, 100), s.bans_total);
+    try testing.expectEqual(@as(u64, 60), s.perJail()[0].bans_total);
+
+    m.incrementBans();
+    m.jailIncrementBans("sshd");
+    s = m.snapshot();
+    try testing.expectEqual(@as(u64, 101), s.bans_total);
+    try testing.expectEqual(@as(u64, 61), s.perJail()[0].bans_total);
 }
 
 // Threading stress test: 4 threads x 1000 increments. Post-condition

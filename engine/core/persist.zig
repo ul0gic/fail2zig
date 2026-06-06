@@ -6,9 +6,10 @@
 //!
 //!     Header (14 bytes):
 //!       magic       [4]u8  = 'F','2','Z','S'
-//!       version     u16    = 2  (legacy v1 still loadable)
+//!       version     u16    = 3  (legacy v1/v2 still loadable)
 //!       entry_count u32
-//!       checksum    u32    = CRC32 over the `entry_count` packed entries
+//!       checksum    u32    = CRC32 over the entries region AND, in v3+,
+//!                            the trailing per-jail lifetime block
 //!
 //!     Entry (113 bytes each):
 //!       ip_type      u8     (4 or 6)
@@ -20,21 +21,27 @@
 //!       last_attempt  i64
 //!       ban_expiry    i64   (0 = not banned)
 //!
-//! Wire format is identical between v1 and v2. The version bump (ISSUE-007)
-//! signals that the daemon now routes entries to per-jail trackers on
-//! load: any entry whose `jail` field doesn't match a currently-configured
-//! jail goes into the synthetic `__legacy__` tracker. v1 files are still
-//! accepted — the load path treats them the same as v2, and the next
-//! checkpoint rewrites the header at v2.
+//!     Per-jail lifetime block (v3+ only, immediately after the entries):
+//!       jail_count   u32
+//!       JailLifetime (72 bytes each), jail_count of them:
+//!         jail          [64]u8 (null-padded)
+//!         lifetime_bans u64    (monotonic lifetime ban count, BUG-006)
+//!
+//! Wire format of the entries is identical across v1/v2/v3. v2 (ISSUE-007)
+//! signalled per-jail routing on load; v3 (BUG-006) appends the per-jail
+//! lifetime block so `Total bans` survives restarts. v1/v2 files are still
+//! accepted: they carry no lifetime block, so each jail's lifetime is
+//! SEEDED from its restored active-ban count (a floor keeping
+//! Total ≥ Active immediately), and the next checkpoint rewrites at v3.
 //!
 //! Save semantics: write to `<path>.tmp`, fsync, fchmod 0600, rename onto
 //! `path`. Either the previous state remains intact OR the new state is
 //! durable — no torn write.
 //!
-//! Load semantics: validate magic + version (1 or 2); recompute CRC32. On
-//! any integrity failure log a warning and return an empty slice so the
-//! daemon starts fresh — the priority is staying up, not preserving a
-//! corrupt history.
+//! Load semantics: validate magic + version (1..3); recompute CRC32 over
+//! the entries (+ v3 lifetime block). On any integrity failure log a
+//! warning and return empty so the daemon starts fresh — the priority is
+//! staying up, not preserving a corrupt history.
 //!
 //! Security: file mode 0600. CRC32 is NOT a cryptographic integrity check
 //! — the state file lives in a root-owned directory. The checksum guards
@@ -61,12 +68,18 @@ const TrackerMap = tracker_map_mod.TrackerMap;
 
 pub const magic: [4]u8 = .{ 'F', '2', 'Z', 'S' };
 /// Current on-disk version. Saves always write this value.
-pub const version: u16 = 2;
+pub const version: u16 = 3;
+/// First version carrying the per-jail lifetime block (BUG-006). Files
+/// below this have no block — lifetimes are seeded from active bans.
+pub const lifetime_block_version: u16 = 3;
 /// Last version we know how to ingest. Anything outside `[1, version]`
 /// is treated as unknown and the daemon starts fresh.
 pub const min_supported_version: u16 = 1;
 pub const header_size: usize = 4 + 2 + 4 + 4; // 14 bytes
 pub const entry_size: usize = 1 + 16 + 64 + 4 + 4 + 8 + 8 + 8; // 113 bytes
+pub const jail_name_field: usize = 64;
+/// One per-jail lifetime record: jail name (64) + lifetime_bans u64 (8).
+pub const lifetime_record_size: usize = jail_name_field + 8; // 72 bytes
 
 pub const Error = error{
     OutOfMemory,
@@ -95,6 +108,26 @@ pub const StateEntry = struct {
 
     pub fn isBanned(self: StateEntry) bool {
         return self.ban_expiry != null;
+    }
+};
+
+/// One persisted per-jail lifetime ban count (BUG-006, v3+).
+pub const JailLifetime = struct {
+    jail: JailId,
+    lifetime_bans: u64,
+};
+
+/// Full load result: restored IP entries + per-jail lifetime ban counts.
+/// `lifetimes` is empty for v1/v2 files (no block) — the caller then seeds
+/// each jail's lifetime from its restored active-ban count. Both slices are
+/// allocated with the caller's allocator; free both via `deinit`.
+pub const Loaded = struct {
+    entries: []StateEntry,
+    lifetimes: []JailLifetime,
+
+    pub fn deinit(self: Loaded, allocator: std.mem.Allocator) void {
+        allocator.free(self.entries);
+        allocator.free(self.lifetimes);
     }
 };
 
@@ -154,6 +187,21 @@ pub fn save(tracker: *const StateTracker, path: []const u8) Error!void {
         return error.WriteFailed;
     }
 
+    // v3 lifetime block (BUG-006). A single tracker represents one jail;
+    // key the record by the jail name on its first entry. With no entries
+    // there is no jail name to attach a lifetime to → empty block.
+    var lifetime_rec: [lifetime_record_size]u8 = undefined;
+    if (firstJailName(tracker)) |jail_name| {
+        writer.writeInt(u32, 1, .little) catch return error.WriteFailed;
+        encodeLifetime(&lifetime_rec, jail_name, tracker.lifetime_bans);
+        writer.writeAll(&lifetime_rec) catch return error.WriteFailed;
+        crc.update(std.mem.asBytes(&@as(u32, 1)));
+        crc.update(&lifetime_rec);
+    } else {
+        writer.writeInt(u32, 0, .little) catch return error.WriteFailed;
+        crc.update(std.mem.asBytes(&@as(u32, 0)));
+    }
+
     // Patch checksum into the header.
     const final_crc = crc.final();
     file.seekTo(header_size - 4) catch return error.WriteFailed;
@@ -171,6 +219,24 @@ pub fn save(tracker: *const StateTracker, path: []const u8) Error!void {
     close_handled = true;
 
     std.fs.cwd().rename(tmp_path, path) catch return error.RenameFailed;
+}
+
+/// The jail name on this tracker's first entry, or null when empty. A
+/// single `StateTracker` holds one jail's IPs, so the first entry's jail
+/// names the whole tracker (used to key its lifetime record in `save`).
+fn firstJailName(tracker: *const StateTracker) ?[]const u8 {
+    var it = tracker.iterator();
+    if (it.next()) |kv| return kv.value_ptr.jail.slice();
+    return null;
+}
+
+/// Encode one per-jail lifetime record: 64-byte null-padded jail name +
+/// u64 lifetime ban count (little-endian).
+fn encodeLifetime(buf: *[lifetime_record_size]u8, jail_name: []const u8, lifetime_bans: u64) void {
+    @memset(buf[0..jail_name_field], 0);
+    const n = @min(jail_name.len, jail_name_field);
+    @memcpy(buf[0..n], jail_name[0..n]);
+    std.mem.writeInt(u64, buf[jail_name_field .. jail_name_field + 8][0..8], lifetime_bans, .little);
 }
 
 fn countPersistable(tracker: *const StateTracker) u32 {
@@ -225,14 +291,23 @@ fn encodeEntry(buf: *[entry_size]u8, ip: IpAddress, st: *const IpState) void {
 // Load
 // ============================================================================
 
-/// Load persisted state. Caller owns the returned slice (allocated with
-/// `allocator`). Missing file returns an empty slice without warning.
-/// Corrupt / truncated / checksum-mismatched file logs a warning and
-/// returns an empty slice — daemon should continue without history.
+/// Load persisted IP entries. Thin wrapper over `loadFull` that discards
+/// the per-jail lifetime block — kept for call sites that only need
+/// entries (legacy seed paths, most tests). Caller owns the returned slice.
 pub fn load(allocator: std.mem.Allocator, path: []const u8) Error![]StateEntry {
+    const loaded = try loadFull(allocator, path);
+    allocator.free(loaded.lifetimes);
+    return loaded.entries;
+}
+
+/// Load persisted state: IP entries + per-jail lifetime ban counts
+/// (BUG-006). Missing file returns empty without warning. Corrupt /
+/// truncated / checksum-mismatched file logs a warning and returns empty —
+/// the daemon continues without history. For v1/v2 files (no lifetime
+/// block) `lifetimes` is empty and the caller seeds from active bans.
+pub fn loadFull(allocator: std.mem.Allocator, path: []const u8) Error!Loaded {
     var file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return allocator.alloc(StateEntry, 0) catch
-            return error.OutOfMemory,
+        error.FileNotFound => return emptyLoaded(allocator),
         error.AccessDenied => return error.OpenFailed,
         else => return error.OpenFailed,
     };
@@ -250,51 +325,74 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) Error![]StateEntry {
 
     if (bytes.len < header_size) {
         std.log.warn("persist: state file too short ({d} bytes); starting fresh", .{bytes.len});
-        return allocator.alloc(StateEntry, 0) catch return error.OutOfMemory;
+        return emptyLoaded(allocator);
     }
     if (!std.mem.eql(u8, bytes[0..4], &magic)) {
         std.log.warn("persist: state file magic mismatch; starting fresh", .{});
-        return allocator.alloc(StateEntry, 0) catch return error.OutOfMemory;
+        return emptyLoaded(allocator);
     }
     const ver = std.mem.readInt(u16, bytes[4..6], .little);
     if (ver < min_supported_version or ver > version) {
         std.log.warn("persist: state file version {d} (supported: {d}..{d}); starting fresh", .{ ver, min_supported_version, version });
-        return allocator.alloc(StateEntry, 0) catch return error.OutOfMemory;
+        return emptyLoaded(allocator);
     }
     if (ver < version) {
-        // ISSUE-007 migration shim. v1 files predate per-jail trackers;
-        // their entries already carry the `jail` field so routing on
-        // load is purely a daemon-side decision. The next checkpoint
-        // rewrites the header at the current version.
+        // v1/v2 migration shim. Entries carry the `jail` field so per-jail
+        // routing on load is a daemon-side decision; v1/v2 carry no
+        // lifetime block (seeded from active bans by the caller). The next
+        // checkpoint rewrites the header at the current version.
         std.log.info(
-            "persist: migrating state file v{d} -> v{d} (per-jail routing); next save will rewrite header",
+            "persist: migrating state file v{d} -> v{d}; next save will rewrite header",
             .{ ver, version },
         );
     }
     const count = std.mem.readInt(u32, bytes[6..10], .little);
     const stored_crc = std.mem.readInt(u32, bytes[10..14], .little);
 
-    const expected_bytes = header_size + @as(usize, count) * entry_size;
-    // SEC-006: fail closed on ANY size mismatch, not just truncation.
-    // Trailing bytes past the declared entry region can only appear via
-    // filesystem corruption or adversarial tampering (the save path
-    // writes exactly `expected_bytes` and nothing more). Silently
-    // accepting them would mask a real integrity problem.
-    if (bytes.len != expected_bytes) {
+    const entries_bytes_len = @as(usize, count) * entry_size;
+    const entries_end = header_size + entries_bytes_len;
+    if (bytes.len < entries_end) {
+        std.log.warn(
+            "persist: state file truncated in entries (have {d}, need >= {d}); starting fresh",
+            .{ bytes.len, entries_end },
+        );
+        return emptyLoaded(allocator);
+    }
+
+    // v3+ carries a trailing per-jail lifetime block; v1/v2 must end
+    // exactly at the entries (SEC-006 strict — trailing junk is rejected).
+    var lifetime_count: u32 = 0;
+    var crc_region_end = entries_end;
+    if (ver >= lifetime_block_version) {
+        if (bytes.len < entries_end + 4) {
+            std.log.warn("persist: state file missing lifetime block header; starting fresh", .{});
+            return emptyLoaded(allocator);
+        }
+        lifetime_count = std.mem.readInt(u32, bytes[entries_end .. entries_end + 4][0..4], .little);
+        crc_region_end = entries_end + 4 + @as(usize, lifetime_count) * lifetime_record_size;
+    }
+
+    // SEC-006: fail closed on ANY size mismatch — the save path writes
+    // exactly `crc_region_end` bytes and nothing more. Trailing bytes can
+    // only come from corruption / tampering; accepting them masks it.
+    if (bytes.len != crc_region_end) {
         std.log.warn(
             "persist: state file size mismatch (have {d}, expected {d}); starting fresh",
-            .{ bytes.len, expected_bytes },
+            .{ bytes.len, crc_region_end },
         );
-        return allocator.alloc(StateEntry, 0) catch return error.OutOfMemory;
+        return emptyLoaded(allocator);
     }
 
-    const entries_bytes = bytes[header_size..expected_bytes];
-    const actual_crc = std.hash.Crc32.hash(entries_bytes);
+    // CRC covers the entries AND (v3+) the lifetime block — one integrity
+    // check over everything after the header.
+    const crc_region = bytes[header_size..crc_region_end];
+    const actual_crc = std.hash.Crc32.hash(crc_region);
     if (actual_crc != stored_crc) {
         std.log.warn("persist: state file checksum mismatch (got {x}, want {x}); starting fresh", .{ actual_crc, stored_crc });
-        return allocator.alloc(StateEntry, 0) catch return error.OutOfMemory;
+        return emptyLoaded(allocator);
     }
 
+    const entries_bytes = bytes[header_size..entries_end];
     var out = allocator.alloc(StateEntry, count) catch return error.OutOfMemory;
     errdefer allocator.free(out);
 
@@ -306,10 +404,50 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) Error![]StateEntry {
             // partial load is riskier than starting fresh.
             std.log.warn("persist: invalid entry at index {d}; starting fresh", .{i});
             allocator.free(out);
-            return allocator.alloc(StateEntry, 0) catch return error.OutOfMemory;
+            return emptyLoaded(allocator);
         };
     }
-    return out;
+
+    // Decode the lifetime block (v3+ only; empty for v1/v2). The block
+    // bytes start at `entries_end + 4` (past the u32 count) and only exist
+    // when `lifetime_count > 0`, so guard the slice for the v1/v2 path.
+    var lifetimes = allocator.alloc(JailLifetime, lifetime_count) catch {
+        allocator.free(out);
+        return error.OutOfMemory;
+    };
+    errdefer allocator.free(lifetimes);
+    if (lifetime_count > 0) {
+        const block = bytes[entries_end + 4 .. crc_region_end];
+        var j: usize = 0;
+        while (j < lifetime_count) : (j += 1) {
+            const off = j * lifetime_record_size;
+            lifetimes[j] = decodeLifetime(block[off .. off + lifetime_record_size][0..lifetime_record_size].*) orelse {
+                std.log.warn("persist: invalid lifetime record at index {d}; starting fresh", .{j});
+                allocator.free(out);
+                allocator.free(lifetimes);
+                return emptyLoaded(allocator);
+            };
+        }
+    }
+
+    return .{ .entries = out, .lifetimes = lifetimes };
+}
+
+/// Allocate an empty `Loaded` (two zero-length slices) for the fresh-start
+/// / corruption-recovery paths.
+fn emptyLoaded(allocator: std.mem.Allocator) Error!Loaded {
+    const e = allocator.alloc(StateEntry, 0) catch return error.OutOfMemory;
+    errdefer allocator.free(e);
+    const l = allocator.alloc(JailLifetime, 0) catch return error.OutOfMemory;
+    return .{ .entries = e, .lifetimes = l };
+}
+
+fn decodeLifetime(buf: [lifetime_record_size]u8) ?JailLifetime {
+    var jail_len: usize = 0;
+    while (jail_len < jail_name_field and buf[jail_len] != 0) : (jail_len += 1) {}
+    const jail = JailId.fromSlice(buf[0..jail_len]) catch return null;
+    const lifetime_bans = std.mem.readInt(u64, buf[jail_name_field .. jail_name_field + 8][0..8], .little);
+    return .{ .jail = jail, .lifetime_bans = lifetime_bans };
 }
 
 fn decodeEntry(buf: [entry_size]u8) ?StateEntry {
@@ -444,6 +582,26 @@ pub fn saveAll(map: *const TrackerMap, path: []const u8) Error!void {
     }
     if (written != entry_count) return error.WriteFailed;
 
+    // v3 lifetime block (BUG-006): one record per tracker keyed by its map
+    // name, carrying the monotonic lifetime ban count. Persist EVERY jail
+    // (even `lifetime_bans == 0`) so the count survives across a window
+    // where all bans have expired — lifetime must not silently drop to 0.
+    {
+        var jail_count: u32 = 0;
+        var it = map.iterator();
+        while (it.next()) |_| jail_count += 1;
+        writer.writeInt(u32, jail_count, .little) catch return error.WriteFailed;
+        crc.update(std.mem.asBytes(&jail_count));
+
+        var lifetime_rec: [lifetime_record_size]u8 = undefined;
+        var it2 = map.iterator();
+        while (it2.next()) |kv| {
+            encodeLifetime(&lifetime_rec, kv.key_ptr.*, kv.value_ptr.*.lifetime_bans);
+            writer.writeAll(&lifetime_rec) catch return error.WriteFailed;
+            crc.update(&lifetime_rec);
+        }
+    }
+
     const final_crc = crc.final();
     file.seekTo(header_size - 4) catch return error.WriteFailed;
     writer.writeInt(u32, final_crc, .little) catch return error.WriteFailed;
@@ -492,6 +650,33 @@ pub fn seedMap(
         };
         target.map.put(e.ip, st) catch return error.OutOfMemory;
         if (routed) |c| c.* += 1;
+    }
+}
+
+/// Seed each tracker's monotonic lifetime ban counter from the loaded
+/// state (BUG-006). For a v3 file, `lifetimes` carries one record per jail;
+/// set each matching tracker's `lifetime_bans`. For a v1/v2 file
+/// (`lifetimes` empty), seed each tracker's lifetime from its CURRENT
+/// active-ban count — a sane floor so `Total bans ≥ Active bans` holds
+/// immediately after an upgrade, without inventing history. Call AFTER
+/// `seedMap` so the active-ban floor reflects restored bans.
+pub fn seedLifetimes(map: *TrackerMap, lifetimes: []const JailLifetime) void {
+    if (lifetimes.len > 0) {
+        for (lifetimes) |l| {
+            if (map.get(l.jail.slice())) |t| t.seedLifetimeBans(l.lifetime_bans);
+        }
+        return;
+    }
+    // v1/v2 back-compat: floor each tracker's lifetime at its active bans.
+    var it = map.iterator();
+    while (it.next()) |kv| {
+        const t = kv.value_ptr.*;
+        var active: u64 = 0;
+        var inner = t.iterator();
+        while (inner.next()) |e| {
+            if (e.value_ptr.ban_state == .banned) active += 1;
+        }
+        t.seedLifetimeBans(active);
     }
 }
 
@@ -868,7 +1053,7 @@ test "persist: v1 state file is accepted by the migration shim" {
     try seedMap(&tm, entries, null, null);
     try saveAll(&tm, path);
 
-    // Header should now say version=2 (current `version` constant).
+    // Header should now say the current `version` constant (v3, BUG-006).
     const f = try std.fs.cwd().openFile(path, .{});
     defer f.close();
     var header_buf: [header_size]u8 = undefined;
@@ -915,4 +1100,143 @@ test "persist: file permissions are 0600 after save" {
     const st = try std.fs.cwd().statFile(path);
     // Mask off high bits (Linux stat returns more than the perm bits).
     try testing.expectEqual(@as(std.fs.File.Mode, 0o600), st.mode & 0o777);
+}
+
+// ---------- BUG-006: persisted lifetime ban counter ----------
+
+test "persist: lifetime ban counts roundtrip across saveAll/loadFull" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &path_buf);
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&full, "{s}/state.bin", .{dir});
+
+    {
+        var tm = TrackerMap.init(testing.allocator);
+        defer tm.deinit();
+        const sshd = try tm.addTracker("sshd", .{ .max_entries = 16, .maxretry = 1, .findtime = 600, .bantime = 300 });
+        const nginx = try tm.addTracker("nginx", .{ .max_entries = 16, .maxretry = 1, .findtime = 600, .bantime = 300 });
+        // Simulate lifetimes that EXCEED active bans (the whole point —
+        // bans issued earlier, some since expired).
+        sshd.lifetime_bans = 7;
+        nginx.lifetime_bans = 3;
+        // One active ban in sshd, none in nginx — proves lifetime persists
+        // independent of (and above) the active set.
+        _ = try sshd.recordAttempt(tIp("1.2.3.4"), tJail("sshd"), 1_000);
+        try saveAll(&tm, path);
+    }
+
+    const loaded = try loadFull(testing.allocator, path);
+    defer loaded.deinit(testing.allocator);
+    // Two jails persisted (even nginx with zero active bans).
+    try testing.expectEqual(@as(usize, 2), loaded.lifetimes.len);
+
+    var tm2 = TrackerMap.init(testing.allocator);
+    defer tm2.deinit();
+    _ = try tm2.addTracker("sshd", .{ .max_entries = 16 });
+    _ = try tm2.addTracker("nginx", .{ .max_entries = 16 });
+    _ = try tm2.ensureLegacy(.{ .max_entries = 16 });
+    try seedMap(&tm2, loaded.entries, null, null);
+    seedLifetimes(&tm2, loaded.lifetimes);
+
+    try testing.expectEqual(@as(u64, 7), tm2.get("sshd").?.lifetime_bans);
+    try testing.expectEqual(@as(u64, 3), tm2.get("nginx").?.lifetime_bans);
+    // Lifetime (7) exceeds active (1) — the Total ≥ Active invariant.
+    try testing.expect(tm2.get("sshd").?.lifetime_bans > 1);
+}
+
+test "persist: v2 back-compat seeds lifetime from active bans (BUG-006)" {
+    // A v2 file (no lifetime block) must seed each jail's lifetime at its
+    // restored active-ban count — never 0 — so Total ≥ Active immediately.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &path_buf);
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&full, "{s}/state.bin", .{dir});
+
+    // Hand-craft a v2 file with two banned entries in jail "sshd".
+    var e1: [entry_size]u8 = undefined;
+    var e2: [entry_size]u8 = undefined;
+    {
+        const banned: IpState = .{
+            .jail = tJail("sshd"),
+            .attempt_count = 3,
+            .ban_count = 1,
+            .first_attempt = 100,
+            .last_attempt = 200,
+            .ban_state = .banned,
+            .ban_expiry = 9_999_999,
+            .ring = [_]Timestamp{0} ** state_mod.max_attempts_per_ip,
+            .ring_len = 0,
+        };
+        encodeEntry(&e1, tIp("1.2.3.4"), &banned);
+        encodeEntry(&e2, tIp("5.6.7.8"), &banned);
+    }
+    var crc = std.hash.Crc32.init();
+    crc.update(&e1);
+    crc.update(&e2);
+    const crc_val = crc.final();
+    {
+        const f = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(&magic);
+        var v: [2]u8 = undefined;
+        std.mem.writeInt(u16, &v, 2, .little); // v2: no lifetime block
+        try f.writeAll(&v);
+        var c: [4]u8 = undefined;
+        std.mem.writeInt(u32, &c, 2, .little); // entry_count = 2
+        try f.writeAll(&c);
+        var crc_bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &crc_bytes, crc_val, .little);
+        try f.writeAll(&crc_bytes);
+        try f.writeAll(&e1);
+        try f.writeAll(&e2);
+    }
+
+    const loaded = try loadFull(testing.allocator, path);
+    defer loaded.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), loaded.entries.len);
+    try testing.expectEqual(@as(usize, 0), loaded.lifetimes.len); // no block
+
+    var tm = TrackerMap.init(testing.allocator);
+    defer tm.deinit();
+    _ = try tm.addTracker("sshd", .{ .max_entries = 16 });
+    _ = try tm.ensureLegacy(.{ .max_entries = 16 });
+    try seedMap(&tm, loaded.entries, null, null);
+    seedLifetimes(&tm, loaded.lifetimes); // empty block → floor at active
+
+    // Two restored active bans → lifetime floored at 2 (≥ active), not 0.
+    try testing.expectEqual(@as(u64, 2), tm.get("sshd").?.lifetime_bans);
+}
+
+test "persist: v3 file is accepted (current version supported, BUG-006)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &path_buf);
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&full, "{s}/state.bin", .{dir});
+
+    var tm = TrackerMap.init(testing.allocator);
+    defer tm.deinit();
+    const sshd = try tm.addTracker("sshd", .{ .max_entries = 16, .maxretry = 1, .findtime = 600, .bantime = 300 });
+    sshd.lifetime_bans = 5;
+    try saveAll(&tm, path);
+
+    // Header must declare the current (v3) version.
+    {
+        const f = try std.fs.cwd().openFile(path, .{});
+        defer f.close();
+        var header_buf: [header_size]u8 = undefined;
+        _ = try f.readAll(&header_buf);
+        try testing.expectEqual(version, std.mem.readInt(u16, header_buf[4..6], .little));
+    }
+
+    // And it loads cleanly with the lifetime intact.
+    const loaded = try loadFull(testing.allocator, path);
+    defer loaded.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), loaded.lifetimes.len);
+    try testing.expectEqual(@as(u64, 5), loaded.lifetimes[0].lifetime_bans);
 }

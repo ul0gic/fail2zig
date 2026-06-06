@@ -313,6 +313,11 @@ fn dispatchBan(ctx: *JailContext, d: state_mod.BanDecision) void {
             "would-ban: jail='{s}' ip={} duration={d}s ban_count={d} action=log-only",
             .{ ctx.jail.slice(), d.ip, d.duration, d.ban_count },
         );
+        // BUG-006: count the NEW ban against the jail's persisted lifetime
+        // (log-only bans count too — the metric does, and a log-only jail's
+        // intent is still a ban event). Restores never reach here, so no
+        // double-count across restarts.
+        ctx.state.recordLifetimeBan();
         if (ctx.metrics) |m| {
             m.incrementBans();
             m.jailIncrementBans(ctx.jail.slice());
@@ -334,6 +339,9 @@ fn dispatchBan(ctx: *JailContext, d: state_mod.BanDecision) void {
         );
         return;
     };
+    // BUG-006: a confirmed new ban bumps the jail's persisted lifetime
+    // count (only after the kernel ban succeeded, matching the metric).
+    ctx.state.recordLifetimeBan();
     if (ctx.metrics) |m| {
         m.incrementBans();
         m.jailIncrementBans(ctx.jail.slice());
@@ -557,6 +565,10 @@ const WsTickContext = struct {
     metrics: *metrics_mod.Metrics,
     ws_alloc: std.mem.Allocator,
     start_time: i64,
+    /// SYS-017: the command context, so the 1 Hz metrics push can emit the
+    /// overall `protection_state` + `degraded` flag. Read-only at tick time
+    /// (same event-loop thread).
+    cmd_ctx: *commands_mod.Context,
 };
 
 /// Read `VmRSS` from `/proc/self/status` and return bytes. Linux-only.
@@ -607,6 +619,8 @@ fn wsTick(expirations: u64, userdata: ?*anyopaque) void {
         break :blk @intCast(now - ctx.start_time);
     };
 
+    // SYS-017: overall protection state on the WS frame (additive).
+    const protection_state = ctx.cmd_ctx.computeOverallState();
     ctx.ws.broadcastMetrics(ctx.ws_alloc, .{
         .lines_parsed = snap.lines_parsed,
         .lines_matched = snap.lines_matched,
@@ -614,6 +628,8 @@ fn wsTick(expirations: u64, userdata: ?*anyopaque) void {
         .active_bans = snap.active_bans,
         .memory_bytes_used = snap.memory_bytes_used,
         .uptime_s = uptime_s,
+        .protection_state = protection_state,
+        .degraded = std.mem.eql(u8, protection_state, "degraded"),
     }) catch |err| {
         std.log.warn("ws: broadcastMetrics failed: {s}", .{@errorName(err)});
     };
@@ -940,20 +956,37 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     }
 
     // Seed state from disk. Entries are routed by `jail` field on each
-    // record; orphans land in the legacy tracker.
-    if (persist_mod.load(heap, cfg.global.state_file)) |entries| {
-        defer heap.free(entries);
-        if (entries.len > 0) {
+    // record; orphans land in the legacy tracker. Per-jail lifetime ban
+    // counts (BUG-006) are seeded after routing — from the v3 block, or
+    // floored at active bans for an older v1/v2 file.
+    if (persist_mod.loadFull(heap, cfg.global.state_file)) |loaded| {
+        defer loaded.deinit(heap);
+        if (loaded.entries.len > 0) {
             var routed: u32 = 0;
             var legacy_routed: u32 = 0;
-            persist_mod.seedMap(&trackers, entries, &routed, &legacy_routed) catch |err| {
+            persist_mod.seedMap(&trackers, loaded.entries, &routed, &legacy_routed) catch |err| {
                 std.log.warn("persist: seed failed: {s}", .{@errorName(err)});
             };
             std.log.info(
                 "persist: restored {d} entries ({d} routed, {d} -> legacy bucket)",
-                .{ entries.len, routed, legacy_routed },
+                .{ loaded.entries.len, routed, legacy_routed },
             );
         }
+        // Lifetime seeding runs even with zero entries (a v3 file may carry
+        // lifetime counts for jails whose bans have all since expired).
+        persist_mod.seedLifetimes(&trackers, loaded.lifetimes);
+        // Mirror the persisted lifetime sum into the metrics ban counters
+        // so `/metrics` and the human `Total bans` agree and both survive
+        // restart (BUG-006). Per-jail counters are seeded individually; the
+        // global is the sum.
+        var lifetime_sum: u64 = 0;
+        var tit = trackers.iterator();
+        while (tit.next()) |kv| {
+            const t = kv.value_ptr.*;
+            lifetime_sum += t.lifetime_bans;
+            metrics.jailSetBansTotal(kv.key_ptr.*, t.lifetime_bans);
+        }
+        metrics.setBansTotal(lifetime_sum);
     } else |err| {
         std.log.warn("persist: load failed: {s}", .{@errorName(err)});
     }
@@ -1024,6 +1057,14 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         for (contexts.items) |ctx| heap.destroy(ctx);
         contexts.deinit();
     }
+
+    // SYS-017: resolved-source descriptor per enabled jail — the
+    // authoritative SOURCE label for the status surface. Recorded below as
+    // each jail's `file`/`journald` kind is decided, so a configured jail
+    // never renders `SOURCE: unknown` (an absent-path file jail shows its
+    // path). Outlives `cmd_ctx`; installed on `cmd_ctx.source_descriptor`.
+    var source_descriptors = JailSourceDescriptors.init(heap);
+    defer source_descriptors.deinit();
 
     for (cfg.jails) |jail_cfg| {
         if (!jail_cfg.enabled) continue;
@@ -1104,6 +1145,12 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
                         continue;
                     };
                 }
+                // SYS-017: record the resolved SOURCE descriptor (the
+                // resolved logpath(s)) — known even if no watch attached
+                // (absent path), so the status surface shows the path.
+                source_descriptors.putFile(jail_cfg.name, jail_cfg.logpath) catch |err| {
+                    std.log.warn("status: source descriptor record failed for '{s}': {s}", .{ jail_cfg.name, @errorName(err) });
+                };
                 std.log.info(
                     "jail: enabled '{s}' source=file ({d} logpath(s))",
                     .{ jail_cfg.name, jail_cfg.logpath.len },
@@ -1130,6 +1177,11 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
                         );
                         return err;
                     },
+                };
+                // SYS-017: record the resolved SOURCE descriptor
+                // `journald (<filter>)` — the KIND-truthful label.
+                source_descriptors.putJournald(jail_cfg.name, jail_cfg.filter) catch |err| {
+                    std.log.warn("status: source descriptor record failed for '{s}': {s}", .{ jail_cfg.name, @errorName(err) });
                 };
                 std.log.info(
                     "jail: enabled '{s}' source=journald (filter '{s}')",
@@ -1179,6 +1231,14 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     // IPC command handler context. Must outlive the IpcServer and HTTP
     // status source. start_time captured here so uptime reflects the
     // operational start.
+    // SYS-017: per-jail read-health source for the status surface. Bundle
+    // the two live log sources; the adapter reads them at status time.
+    // Declared at function scope so it outlives `cmd_ctx` and the servers.
+    var health_sources = HealthSources{
+        .watcher = &watcher,
+        .journald = &journald,
+    };
+
     var cmd_ctx: commands_mod.Context = .{
         .trackers = &trackers,
         .config = cfg,
@@ -1186,6 +1246,14 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         .stats_source = .{
             .ctx = @ptrCast(&metrics),
             .snapshot = metricsStatsSnapshot,
+        },
+        .health_source = .{
+            .ctx = @ptrCast(&health_sources),
+            .lookup = jailHealthLookup,
+        },
+        .source_descriptor = .{
+            .ctx = @ptrCast(&source_descriptors),
+            .lookup = JailSourceDescriptors.lookup,
         },
         .start_time = std.time.timestamp(),
         .version = version,
@@ -1284,6 +1352,7 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         .metrics = &metrics,
         .ws_alloc = heap,
         .start_time = cmd_ctx.start_time,
+        .cmd_ctx = &cmd_ctx,
     };
     _ = try loop.addTimer(1000, wsTick, &ws_tick_ctx, false);
 
@@ -1370,8 +1439,100 @@ fn metricsStatsSnapshot(ctx: ?*anyopaque) commands_mod.StatsSnapshot {
     return .{
         .memory_bytes_used = s.memory_bytes_used,
         .parse_rate = 0, // computed across an interval; Phase 6 improvement.
+        .bans_total = s.bans_total, // SYS-017: lifetime total bans rollup.
     };
 }
+
+/// Bundle of the two live log sources, installed on
+/// `commands.Context.health_source` (SYS-017). Both outlive `cmd_ctx` and
+/// the servers (they are `runDaemon` locals). Read-only at status time.
+const HealthSources = struct {
+    watcher: *log_watcher_mod.LogWatcher,
+    journald: *journald_source_mod.JournaldSource,
+};
+
+/// Adapter for `commands.JailHealthSource.lookup` (SYS-017). Resolves a
+/// jail's read-HEALTH by scanning the journald source first (it is the only
+/// source that can report a hard `unhealthy`/false that drives DEGRADED),
+/// then the file watcher. Returns `null` (unknown HEALTH) when neither
+/// source knows the jail or the file source has never read. The SOURCE
+/// label is NOT here — it is the resolved descriptor (`jailSourceLookup`).
+///
+/// The journald-first order makes the journald-only-DEGRADED invariant (§4)
+/// hold even in the (config-invalid) case where a name appears in both: a
+/// journald verdict — the only one that can be `false` — wins.
+fn jailHealthLookup(ctx: ?*anyopaque, jail_name: []const u8) ?commands_mod.JailHealth {
+    const self: *HealthSources = @ptrCast(@alignCast(ctx.?));
+    if (self.journald.healthForJail(jail_name)) |h| {
+        return .{ .healthy = h.healthy, .lines_seen = h.lines_seen, .last_read_ok_ts = h.last_read_ok_ts };
+    }
+    if (self.watcher.healthForJail(jail_name)) |h| {
+        return .{ .healthy = h.healthy, .lines_seen = h.lines_seen, .last_read_ok_ts = h.last_read_ok_ts };
+    }
+    return null;
+}
+
+/// Resolved-source descriptor store (SYS-017). Records, per enabled jail,
+/// the KIND-truthful SOURCE label decided at jail-resolution time —
+/// `journald (<filter>)` or the resolved logpath(s). This is the
+/// authoritative SOURCE: known for every configured jail even when no live
+/// source is attached, so a misconfigured (absent-path) file jail still
+/// shows its path, never "unknown".
+///
+/// Keys are config-owned jail-name slices (stable for the daemon lifetime).
+/// Descriptor strings are owned in `arena` (freed at daemon shutdown), so
+/// the returned slices are valid for as long as the status handler runs. No
+/// per-call allocation, no leak — `std.testing.allocator` is irrelevant
+/// here (production-only; the arena is freed on the daemon's normal teardown
+/// path). Read-only after the resolution loop populates it.
+const JailSourceDescriptors = struct {
+    map: std.StringHashMap([]const u8),
+    arena: std.heap.ArenaAllocator,
+
+    fn init(backing: std.mem.Allocator) JailSourceDescriptors {
+        return .{
+            .map = std.StringHashMap([]const u8).init(backing),
+            .arena = std.heap.ArenaAllocator.init(backing),
+        };
+    }
+
+    fn deinit(self: *JailSourceDescriptors) void {
+        self.map.deinit();
+        self.arena.deinit();
+    }
+
+    /// Record `jail_name`'s journald descriptor `journald (<filter>)`.
+    fn putJournald(self: *JailSourceDescriptors, jail_name: []const u8, filter: []const u8) !void {
+        const a = self.arena.allocator();
+        const desc = try std.fmt.allocPrint(a, "journald ({s})", .{filter});
+        try self.map.put(jail_name, desc);
+    }
+
+    /// Record `jail_name`'s file descriptor from its resolved logpath(s):
+    /// the single path, or a bounded comma-join for multiple. Empty logpath
+    /// (shouldn't happen for a file-resolved jail) records "file".
+    fn putFile(self: *JailSourceDescriptors, jail_name: []const u8, logpath: []const []const u8) !void {
+        const a = self.arena.allocator();
+        if (logpath.len == 0) {
+            try self.map.put(jail_name, "file");
+            return;
+        }
+        if (logpath.len == 1) {
+            // Config-owned slice is stable; still dup into the arena so the
+            // store owns a single uniform lifetime.
+            const desc = try a.dupe(u8, logpath[0]);
+            try self.map.put(jail_name, desc);
+            return;
+        }
+        const joined = try std.mem.join(a, ", ", logpath);
+        try self.map.put(jail_name, joined);
+    }
+
+    fn lookup(ctx: ?*anyopaque, jail_name: []const u8) ?[]const u8 {
+        const self: *JailSourceDescriptors = @ptrCast(@alignCast(ctx.?));
+        return self.map.get(jail_name);
+    }
+};
 
 /// Bundle of pointers the HTTP `/metrics`, `/api/status`, and
 /// `/api/bans` handlers need. Kept together so we only plumb one `ctx`
@@ -1439,6 +1600,42 @@ fn writeMetricsPayload(
     try w.writeAll("# HELP fail2zig_uptime_seconds Seconds since daemon start\n");
     try w.writeAll("# TYPE fail2zig_uptime_seconds gauge\n");
     try w.print("fail2zig_uptime_seconds {d}\n", .{uptime_s});
+
+    // SYS-017: overall protection state as a single alerting-useful gauge.
+    // `1` only when the host is ACTIVELY enforcing right now (overall state
+    // `active` or `mixed`); `0` when `degraded` or `log-only`. A log-only
+    // host is intentionally not enforcing → 0.
+    const overall = self.cmd_ctx.computeOverallState();
+    const actively_enforcing =
+        std.mem.eql(u8, overall, "active") or std.mem.eql(u8, overall, "mixed");
+    try w.writeAll("# HELP fail2zig_protection_active 1 when the host is actively enforcing (overall state active/mixed), else 0\n");
+    try w.writeAll("# TYPE fail2zig_protection_active gauge\n");
+    try w.print("fail2zig_protection_active {d}\n", .{@intFromBool(actively_enforcing)});
+
+    // SYS-017: per-jail source-health gauges. `jail` label only (bounded
+    // cardinality), iterating the configured ENABLED jails. log_source
+    // health is tri-state; an "unknown" verdict (no signal yet, or a file
+    // source that has never read) is reported as `0` for the healthy gauge
+    // — the gauge answers "is this source confirmed reading?", and unknown
+    // is not yet confirmed.
+    try w.writeAll("# HELP fail2zig_jail_log_source_healthy 1 when the jail's log source is confirmed reading, else 0\n");
+    try w.writeAll("# TYPE fail2zig_jail_log_source_healthy gauge\n");
+    try w.writeAll("# HELP fail2zig_jail_enforcing 1 when the jail's resolved action touches the firewall, else 0\n");
+    try w.writeAll("# TYPE fail2zig_jail_enforcing gauge\n");
+    try w.writeAll("# HELP fail2zig_jail_lines_seen_total Lines the jail's log source has delivered (read-health proxy)\n");
+    try w.writeAll("# TYPE fail2zig_jail_lines_seen_total counter\n");
+    for (self.cmd_ctx.config.jails) |*jc| {
+        if (!jc.enabled) continue;
+        const resolved = config_mod.resolveJailFromConfig(jc, self.cmd_ctx.config.defaults);
+        const enforcing = resolved.banaction != .@"log-only";
+        const hs = self.cmd_ctx.health_source;
+        const health = hs.lookup(hs.ctx, jc.name);
+        const healthy = if (health) |h| h.healthy else false;
+        const lines_seen: u64 = if (health) |h| h.lines_seen else 0;
+        try w.print("fail2zig_jail_log_source_healthy{{jail=\"{s}\"}} {d}\n", .{ jc.name, @intFromBool(healthy) });
+        try w.print("fail2zig_jail_enforcing{{jail=\"{s}\"}} {d}\n", .{ jc.name, @intFromBool(enforcing) });
+        try w.print("fail2zig_jail_lines_seen_total{{jail=\"{s}\"}} {d}\n", .{ jc.name, lines_seen });
+    }
 
     // Per-jail labels.
     for (snap.perJail()) |pj| {
@@ -1995,6 +2192,71 @@ test "dispatch: backend error on enforcing path skips metrics (no false ban)" {
     // Backend failed -> no ban counted.
     const snap = metrics.snapshot();
     try testing.expectEqual(@as(u64, 0), snap.bans_total);
+    // BUG-006: a failed ban also does NOT bump the persisted lifetime.
+    try testing.expectEqual(@as(u64, 0), tracker.lifetime_bans);
+}
+
+test "dispatch: BUG-006 a new ban increments the jail's persisted lifetime" {
+    const a = testing.allocator;
+    var tracker = try state_mod.StateTracker.init(a, .{ .max_entries = 16, .maxretry = 3, .findtime = 600, .bantime = 600 });
+    defer tracker.deinit();
+    var metrics = metrics_mod.Metrics.init();
+    _ = metrics.registerJail("sshd");
+    const jail = try shared.JailId.fromSlice("sshd");
+    var backend: firewall.Backend = .{ .iptables = firewall.iptables.IptablesBackend{} };
+    var spy: BanSpy = .{};
+
+    // Enforcing jail: one new ban → lifetime 1.
+    var ctx = makeDispatchTestCtx(jail, &tracker, &backend, &metrics, &spy, .nftables);
+    const d1 = try produceDecision(&tracker, try shared.IpAddress.parse("203.0.113.10"), jail);
+    dispatchBan(&ctx, d1);
+    try testing.expectEqual(@as(u64, 1), tracker.lifetime_bans);
+
+    // Log-only jail counts toward lifetime too (intent is still a ban).
+    tracker.clearBan(try shared.IpAddress.parse("203.0.113.10"));
+    var ctx2 = makeDispatchTestCtx(jail, &tracker, &backend, &metrics, &spy, .@"log-only");
+    const d2 = try produceDecision(&tracker, try shared.IpAddress.parse("203.0.113.11"), jail);
+    dispatchBan(&ctx2, d2);
+    try testing.expectEqual(@as(u64, 2), tracker.lifetime_bans);
+}
+
+test "dispatch: BUG-006 restored bans do NOT increment lifetime (no double-count)" {
+    // Restore goes through persist.seed/seedMap (NOT dispatchBan), and the
+    // lifetime is set by seedLifetimes — so re-surfacing a ban across a
+    // restart never re-counts it. Simulate: a v3 file with lifetime=4 and
+    // one active ban, loaded into a fresh tracker.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &path_buf);
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&full, "{s}/state.bin", .{dir});
+
+    {
+        var tm = tracker_map_mod.TrackerMap.init(a);
+        defer tm.deinit();
+        const sshd = try tm.addTracker("sshd", .{ .max_entries = 16, .maxretry = 1, .findtime = 600, .bantime = 600 });
+        sshd.lifetime_bans = 4;
+        // One active ban present at save time.
+        _ = try sshd.recordAttempt(try shared.IpAddress.parse("9.9.9.9"), try shared.JailId.fromSlice("sshd"), 1_000);
+        try persist_mod.saveAll(&tm, path);
+    }
+
+    // Restart: fresh map, load + seed. Lifetime is RESTORED to 4 (not
+    // re-incremented by the restored ban), and active is 1.
+    var tm2 = tracker_map_mod.TrackerMap.init(a);
+    defer tm2.deinit();
+    _ = try tm2.addTracker("sshd", .{ .max_entries = 16 });
+    _ = try tm2.ensureLegacy(.{ .max_entries = 16 });
+    const loaded = try persist_mod.loadFull(a, path);
+    defer loaded.deinit(a);
+    try persist_mod.seedMap(&tm2, loaded.entries, null, null);
+    persist_mod.seedLifetimes(&tm2, loaded.lifetimes);
+
+    try testing.expectEqual(@as(u64, 4), tm2.get("sshd").?.lifetime_bans);
+    // Total (4) ≥ Active (1) after restore — the BUG-006 invariant.
+    try testing.expect(tm2.get("sshd").?.lifetime_bans >= tm2.totalActiveBans());
 }
 
 // ----------------------------------------------------------------------------
@@ -2389,4 +2651,81 @@ test "http: /api/bans aggregates across per-jail trackers (ISSUE-007)" {
     try testing.expect(std.mem.indexOf(u8, body, "2.2.2.2") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"jail\":\"sshd\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"jail\":\"nginx\"") != null);
+}
+
+// ---------- SYS-017: /metrics protection + per-jail health gauges ----------
+
+/// Test-only health lookup: "sshd" is an unhealthy journald source
+/// (healthy=false) → drives DEGRADED for the enforcing sshd jail.
+fn testUnhealthySshdLookup(ctx: ?*anyopaque, jail_name: []const u8) ?commands_mod.JailHealth {
+    _ = ctx;
+    if (std.mem.eql(u8, jail_name, "sshd")) {
+        return .{ .healthy = false, .lines_seen = 0, .last_read_ok_ts = 0 };
+    }
+    return null;
+}
+
+test "metrics: SYS-017 protection_active + per-jail gauges render with jail label only" {
+    const a = testing.allocator;
+    var trackers = tracker_map_mod.TrackerMap.init(a);
+    defer trackers.deinit();
+
+    var metrics = metrics_mod.Metrics.init();
+    var jails = [_]config_mod.JailConfig{
+        .{ .name = "sshd", .enabled = true, .banaction = .nftables },
+    };
+    var cfg = config_mod.Config{
+        .global = .{},
+        .defaults = .{ .banaction = .nftables },
+        .jails = &jails,
+        .diag = .{},
+    };
+    var backend_val: firewall.Backend = .{ .nftables = firewall.nftables.NftablesBackend{} };
+    defer backend_val.deinit();
+
+    var cmd_ctx: commands_mod.Context = .{
+        .trackers = &trackers,
+        .config = &cfg,
+        .backend = &backend_val,
+        .stats_source = .{ .ctx = @ptrCast(&metrics), .snapshot = metricsStatsSnapshot },
+        .health_source = .{ .ctx = null, .lookup = testUnhealthySshdLookup },
+    };
+    var http_ctx: HttpSources = .{ .metrics = &metrics, .cmd_ctx = &cmd_ctx, .trackers = &trackers };
+
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    defer out.deinit(a);
+    try writeMetricsPayload(@ptrCast(&http_ctx), &out, a);
+    const body = out.items;
+
+    // Global gauge: enforcing jail with an unhealthy journald source →
+    // overall DEGRADED → protection_active 0.
+    try testing.expect(std.mem.indexOf(u8, body, "# TYPE fail2zig_protection_active gauge") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "fail2zig_protection_active 0") != null);
+
+    // Per-jail gauges with the `jail` label only, plus their TYPE lines.
+    try testing.expect(std.mem.indexOf(u8, body, "# TYPE fail2zig_jail_log_source_healthy gauge") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "fail2zig_jail_log_source_healthy{jail=\"sshd\"} 0") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "# TYPE fail2zig_jail_enforcing gauge") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "fail2zig_jail_enforcing{jail=\"sshd\"} 1") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "# TYPE fail2zig_jail_lines_seen_total counter") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "fail2zig_jail_lines_seen_total{jail=\"sshd\"} 0") != null);
+}
+
+test "JailSourceDescriptors: records KIND-truthful resolved descriptors (SYS-017)" {
+    const a = testing.allocator;
+    var d = JailSourceDescriptors.init(a);
+    defer d.deinit();
+
+    try d.putJournald("sshd", "sshd");
+    try d.putFile("nginx", &.{"/var/log/nginx/error.log"});
+    try d.putFile("multi", &.{ "/var/log/a.log", "/var/log/b.log" });
+    try d.putFile("weird", &.{}); // shouldn't happen, but must not crash
+
+    try testing.expectEqualStrings("journald (sshd)", JailSourceDescriptors.lookup(@ptrCast(&d), "sshd").?);
+    try testing.expectEqualStrings("/var/log/nginx/error.log", JailSourceDescriptors.lookup(@ptrCast(&d), "nginx").?);
+    try testing.expectEqualStrings("/var/log/a.log, /var/log/b.log", JailSourceDescriptors.lookup(@ptrCast(&d), "multi").?);
+    try testing.expectEqualStrings("file", JailSourceDescriptors.lookup(@ptrCast(&d), "weird").?);
+    // An unrecorded jail → null → the handler renders "unknown" only for a
+    // jail the daemon never resolved (cannot happen for an enabled jail).
+    try testing.expect(JailSourceDescriptors.lookup(@ptrCast(&d), "nope") == null);
 }

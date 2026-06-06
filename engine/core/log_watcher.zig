@@ -51,6 +51,28 @@ pub const Error = error{
     EventLoopError,
 };
 
+/// Per-jail read-HEALTH verdict (SYS-017), returned by each log source's
+/// `healthForJail`. A pure derivation over the source's live per-jail
+/// fields — no allocation, no I/O. The status handler's `commands.JailHealth`
+/// mirrors this shape; the main.zig adapter copies between them so
+/// `net/commands.zig` keeps no compile-time dependency on the source modules.
+///
+/// This is HEALTH only (is the source reading?). The SOURCE label is the
+/// daemon's resolved-source descriptor (`commands.JailSourceSource`), known
+/// for every configured jail — so a file jail with an absent path still
+/// shows its path, not "unknown". HEALTH being unknown (null here) is the
+/// orthogonal, expected signal for such a jail.
+///
+/// `healthy == false` is a *genuine negative probe* (a journald jail that
+/// has never read cleanly); the file source never reports `false` (it
+/// returns `null` = unknown instead), so a `false` is always journald and
+/// can drive DEGRADED safely (§4).
+pub const JailHealth = struct {
+    healthy: bool,
+    lines_seen: u64,
+    last_read_ok_ts: i64,
+};
+
 /// Line delivery callback. `line` is a zero-copy slice valid only for the
 /// duration of the call. `jail` is the JailId provided when the path was
 /// registered. `truncated` is `true` when the line exceeded the per-file
@@ -99,6 +121,16 @@ const FileWatch = struct {
 
     file_wd: i32,
     parent_wd: i32,
+
+    /// Read-health (SYS-017). Written in `readNewData` on the loop thread,
+    /// read on the cold status/metrics path — same thread, so no atomics
+    /// (mirrors the non-atomic `offset` discipline above).
+    ///
+    /// Wall-clock secs of the last `readNewData` that completed its read
+    /// loop without `error.ReadFailed`. `0` means "no clean read yet".
+    last_read_ok_ts: i64,
+    /// Lines delivered to the callback, lifetime.
+    lines_seen: u64,
 
     line_buffer: LineBuffer,
     allocator: Allocator,
@@ -170,6 +202,42 @@ pub const LogWatcher = struct {
         ) catch return error.EventLoopError;
     }
 
+    /// Per-jail read-HEALTH for the status surface (SYS-017). Pure
+    /// derivation over the live `FileWatch` fields — no I/O. A jail may map
+    /// to several logpaths (several `FileWatch` records); we aggregate.
+    /// Returns `null` when `name` matches no watch (the caller then tries
+    /// the journald source, or reports unknown HEALTH — the SOURCE label is
+    /// the daemon's resolved descriptor, not this).
+    ///
+    /// File verdict (§2.2, best-effort/informational — NEVER drives
+    /// DEGRADED in v1): healthy iff any matching watch is attached
+    /// (`file_fd >= 0`) OR the jail has ever delivered a line
+    /// (`lines_seen > 0`). A jail whose every watch is detached and which
+    /// has never read returns `null` (unknown), never a hard `false` — the
+    /// lifetime counter is sticky and a late-appearing boot log must not
+    /// flash a false-unhealthy.
+    pub fn healthForJail(self: *const LogWatcher, name: []const u8) ?JailHealth {
+        var matched = false;
+        var any_attached = false;
+        var total_lines: u64 = 0;
+        var max_ts: i64 = 0;
+        for (self.files.items) |fw| {
+            if (!std.mem.eql(u8, fw.jail.slice(), name)) continue;
+            matched = true;
+            if (fw.file_fd >= 0) any_attached = true;
+            total_lines += fw.lines_seen;
+            if (fw.last_read_ok_ts > max_ts) max_ts = fw.last_read_ok_ts;
+        }
+        if (!matched) return null;
+        const healthy = any_attached or total_lines > 0;
+        if (!healthy) return null; // unknown, never a hard `false` (§2.2)
+        return .{
+            .healthy = true,
+            .lines_seen = total_lines,
+            .last_read_ok_ts = max_ts,
+        };
+    }
+
     pub fn deinit(self: *LogWatcher) void {
         // Best-effort remove from event loop; deinit is terminal anyway.
         self.event_loop.removeFd(self.inotify_fd) catch {};
@@ -216,6 +284,8 @@ pub const LogWatcher = struct {
             .fingerprint_len = 0,
             .file_wd = -1,
             .parent_wd = -1,
+            .last_read_ok_ts = 0,
+            .lines_seen = 0,
             .line_buffer = undefined,
             .allocator = self.allocator,
         };
@@ -478,8 +548,16 @@ pub const LogWatcher = struct {
 
             while (fw.line_buffer.nextLine()) |line| {
                 fw.callback(line.bytes, fw.jail, line.truncated, fw.userdata);
+                fw.lines_seen += 1; // read-health (SYS-017), lifetime
             }
         }
+
+        // The read loop completed without `error.ReadFailed` (every early
+        // return above on a read/stat error skips this) — record the clean
+        // read for read-health (SYS-017). The best-effort fingerprint
+        // refresh below must NOT gate this: a fingerprint lseek hiccup does
+        // not mean we failed to read the appended lines.
+        fw.last_read_ok_ts = std.time.timestamp();
 
         // Refresh fingerprint for next call. Sample however many bytes
         // are available, up to `fingerprint_len`. A populated
@@ -924,4 +1002,64 @@ test "log_watcher: detects rename rotation" {
     try testing.expect(sink.count() >= 2);
     try testing.expectEqualStrings("before", sink.lines.items[0]);
     try testing.expectEqualStrings("after", sink.lines.items[1]);
+}
+
+// --- SYS-017 read-health verdict (file: best-effort, never a hard false) ---
+
+test "log_watcher: healthForJail healthy once a watch is attached (SYS-017)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = tmp.dir.realpath(".", &path_buf) catch return error.SkipZigTest;
+    const log_name = "h.log";
+    var full_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const log_path = try std.fmt.bufPrint(&full_path_buf, "{s}/{s}", .{ dir_path, log_name });
+    {
+        const f = try tmp.dir.createFile(log_name, .{ .truncate = true });
+        f.close();
+    }
+
+    var loop = try EventLoop.init(testing.allocator);
+    defer loop.deinit();
+    var watcher = try LogWatcher.init(testing.allocator, &loop);
+    try watcher.attach();
+    defer watcher.deinit();
+    var sink = LineSink.init(testing.allocator);
+    defer sink.deinit(testing.allocator);
+
+    try watcher.watchFile(log_path, try JailId.fromSlice("sshd"), LineSink.onLine, &sink);
+
+    // Attached watch (file_fd >= 0) → healthy even with zero lines read.
+    const h = watcher.healthForJail("sshd").?;
+    try testing.expect(h.healthy);
+    try testing.expectEqual(@as(u64, 0), h.lines_seen);
+
+    // A detached watch that has never read returns unknown (null), never a
+    // hard `false`: the file verdict must not flash false-unhealthy.
+    // (HEALTH-only — the SOURCE label is the daemon's resolved descriptor.)
+    watcher.files.items[0].file_fd = -1;
+    watcher.files.items[0].lines_seen = 0;
+    try testing.expect(watcher.healthForJail("sshd") == null);
+
+    // …but a detached watch that DID read before stays sticky-healthy
+    // (the lifetime counter — exactly why file health never drives
+    // DEGRADED in v1).
+    watcher.files.items[0].lines_seen = 3;
+    watcher.files.items[0].last_read_ok_ts = 99;
+    const h2 = watcher.healthForJail("sshd").?;
+    try testing.expect(h2.healthy);
+    try testing.expectEqual(@as(u64, 3), h2.lines_seen);
+    try testing.expectEqual(@as(i64, 99), h2.last_read_ok_ts);
+}
+
+test "log_watcher: healthForJail returns null for an unknown jail (SYS-017)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var loop = try EventLoop.init(testing.allocator);
+    defer loop.deinit();
+    var watcher = try LogWatcher.init(testing.allocator, &loop);
+    try watcher.attach();
+    defer watcher.deinit();
+    try testing.expect(watcher.healthForJail("nope") == null);
 }
