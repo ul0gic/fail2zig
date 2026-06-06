@@ -174,18 +174,20 @@ pub const Backend = union(BackendTag) {
 
 /// Availability probe hooks, separated so tests can inject mocks.
 /// The defaults call the real system.
+///
+/// SYS-014 #2: the nftables probe returns a `ProbeResult` (not a bare bool)
+/// so `detect` can log a cause-accurate message when nftables is skipped —
+/// "no nf_tables in kernel" vs a transient failure. The permission case is
+/// NOT distinguished here (opening the socket succeeds without CAP_NET_ADMIN;
+/// it is reported at init/scaffold time where EPERM genuinely lands).
 pub const AvailabilityProbes = struct {
-    nftablesAvailable: *const fn () bool = defaultNftablesAvailable,
+    nftablesReason: *const fn () nftables.ProbeResult = defaultNftablesReason,
     ipsetAvailable: *const fn () bool = defaultIpsetAvailable,
     iptablesAvailable: *const fn () bool = defaultIptablesAvailable,
 };
 
 /// Detect the best available backend. Priority: nftables → ipset →
 /// iptables. Returns `BackendError.NotAvailable` if nothing works.
-///
-/// Task 3.6.2 replaces this stub with a real probe. For now the
-/// probe delegates to each backend's `isAvailableFn` via module-level
-/// helpers so callers can unit-test the detection tree with mocks.
 pub fn detect(allocator: std.mem.Allocator) BackendError!Backend {
     return detectWithProbes(allocator, .{});
 }
@@ -198,11 +200,24 @@ pub fn detectWithProbes(
     probes: AvailabilityProbes,
 ) BackendError!Backend {
     _ = allocator;
-    if (probes.nftablesAvailable()) {
-        std.log.info("firewall backend: nftables selected", .{});
-        return .{ .nftables = nftables.NftablesBackend{} };
+    switch (probes.nftablesReason()) {
+        .available => {
+            std.log.info("firewall backend: nftables selected", .{});
+            return .{ .nftables = nftables.NftablesBackend{} };
+        },
+        // SYS-014 #2: cause-accurate message before falling through. These
+        // are warn-level (a lower backend may still succeed); the fatal
+        // refusal, if nothing works, is logged by the caller.
+        .kernel_unsupported => std.log.warn(
+            "firewall backend: nftables unavailable — nf_tables not in kernel " ++
+                "(module not loaded or not compiled in); trying ipset",
+            .{},
+        ),
+        .transient => std.log.warn(
+            "firewall backend: nftables probe failed transiently; trying ipset",
+            .{},
+        ),
     }
-    std.log.debug("firewall backend: nftables unavailable, trying ipset", .{});
 
     if (probes.ipsetAvailable()) {
         std.log.info("firewall backend: ipset selected", .{});
@@ -223,8 +238,8 @@ pub fn detectWithProbes(
     return error.NotAvailable;
 }
 
-fn defaultNftablesAvailable() bool {
-    return nftables.probeAvailable();
+fn defaultNftablesReason() nftables.ProbeResult {
+    return nftables.probeReason();
 }
 
 fn defaultIpsetAvailable() bool {
@@ -261,7 +276,7 @@ test "backend: tagged union dispatches to iptables vtable" {
 
 test "backend: detect prefers nftables when all available" {
     const probes: AvailabilityProbes = .{
-        .nftablesAvailable = testAlwaysTrue,
+        .nftablesReason = testNftReasonAvailable,
         .ipsetAvailable = testAlwaysTrue,
         .iptablesAvailable = testAlwaysTrue,
     };
@@ -270,9 +285,20 @@ test "backend: detect prefers nftables when all available" {
     try std.testing.expectEqual(BackendTag.nftables, be.tag());
 }
 
-test "backend: detect falls back to ipset when nftables unavailable" {
+test "backend: detect falls back to ipset when nf_tables not in kernel (SYS-014)" {
     const probes: AvailabilityProbes = .{
-        .nftablesAvailable = testAlwaysFalse,
+        .nftablesReason = testNftReasonKernelUnsupported,
+        .ipsetAvailable = testAlwaysTrue,
+        .iptablesAvailable = testAlwaysTrue,
+    };
+    var be = try detectWithProbes(std.testing.allocator, probes);
+    defer be.deinit();
+    try std.testing.expectEqual(BackendTag.ipset, be.tag());
+}
+
+test "backend: detect falls back past a transient nftables probe failure (SYS-014)" {
+    const probes: AvailabilityProbes = .{
+        .nftablesReason = testNftReasonTransient,
         .ipsetAvailable = testAlwaysTrue,
         .iptablesAvailable = testAlwaysTrue,
     };
@@ -283,7 +309,7 @@ test "backend: detect falls back to ipset when nftables unavailable" {
 
 test "backend: detect falls back to iptables when only it is available" {
     const probes: AvailabilityProbes = .{
-        .nftablesAvailable = testAlwaysFalse,
+        .nftablesReason = testNftReasonKernelUnsupported,
         .ipsetAvailable = testAlwaysFalse,
         .iptablesAvailable = testAlwaysTrue,
     };
@@ -292,9 +318,11 @@ test "backend: detect falls back to iptables when only it is available" {
     try std.testing.expectEqual(BackendTag.iptables, be.tag());
 }
 
-test "backend: detect returns NotAvailable when nothing available" {
+test "backend: detect fails closed (NotAvailable) when nothing available (SYS-014)" {
+    // The cause distinction must NOT weaken fail-closed: a kernel-unsupported
+    // nftables with no other backend still refuses to run unprotected.
     const probes: AvailabilityProbes = .{
-        .nftablesAvailable = testAlwaysFalse,
+        .nftablesReason = testNftReasonKernelUnsupported,
         .ipsetAvailable = testAlwaysFalse,
         .iptablesAvailable = testAlwaysFalse,
     };
@@ -310,6 +338,18 @@ fn testAlwaysTrue() bool {
 
 fn testAlwaysFalse() bool {
     return false;
+}
+
+fn testNftReasonAvailable() nftables.ProbeResult {
+    return .available;
+}
+
+fn testNftReasonKernelUnsupported() nftables.ProbeResult {
+    return .kernel_unsupported;
+}
+
+fn testNftReasonTransient() nftables.ProbeResult {
+    return .transient;
 }
 
 test "backend: detect with default probes runs without crashing" {

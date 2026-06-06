@@ -315,15 +315,23 @@ pub const StateTracker = struct {
     /// of the tracker's discipline.
     lifetime_bans: u64 = 0,
 
-    /// Initialize with an explicit capacity (in IP entries). Pre-allocates
-    /// hash-map buckets so the steady-state path never needs a rehash.
+    /// QA-002: whether the map's bucket array has been reserved to
+    /// `config.max_entries` yet. Reservation is deferred from `init` to the
+    /// first insert (`ensureReserved`) so daemon startup does not pay the
+    /// per-tracker bucket-array allocation (and its page zero-fault) up
+    /// front. The logical capacity / eviction behavior is identical — only
+    /// the *timing* of the physical reservation moves.
+    reserved: bool = false,
+
+    /// Initialize the tracker. The hash-map bucket array is NOT reserved
+    /// here (QA-002) — it is reserved lazily on the first insert via
+    /// `ensureReserved`, so the steady-state path still never rehashes but
+    /// startup avoids the up-front allocation. `config.max_entries` is still
+    /// validated and remains the eviction-enforced logical ceiling (ADR-005).
     pub fn init(allocator: std.mem.Allocator, config: Config) Error!StateTracker {
         if (config.max_entries == 0) return error.CapacityZero;
 
-        var map = Map.init(allocator);
-        errdefer map.deinit();
-        map.ensureTotalCapacity(config.max_entries) catch return error.OutOfMemory;
-
+        const map = Map.init(allocator);
         const ignore = std.ArrayList(Cidr).init(allocator);
 
         return .{
@@ -333,7 +341,22 @@ pub const StateTracker = struct {
             .ignore = ignore,
             .stats_inner = .{},
             .lifetime_bans = 0,
+            .reserved = false,
         };
+    }
+
+    /// Reserve the map's bucket array to `config.max_entries` exactly once
+    /// (QA-002). Called before the first insert so `getOrPut` for the
+    /// (max_entries+1)th key still lands in a reserved bucket and the
+    /// eviction path behaves identically to the old eager-reserve design.
+    /// Idempotent and cheap after the first call. `pub` so the persist
+    /// seed paths (which insert via `map.put` directly) can reserve before
+    /// bulk-loading restored entries — same invariant, off the startup path
+    /// for trackers that receive no restored state.
+    pub fn ensureReserved(self: *StateTracker) Error!void {
+        if (self.reserved) return;
+        self.map.ensureTotalCapacity(self.config.max_entries) catch return error.OutOfMemory;
+        self.reserved = true;
     }
 
     /// Record one NEW ban against this jail's lifetime counter (BUG-006).
@@ -397,6 +420,10 @@ pub const StateTracker = struct {
             return null;
         }
         self.stats_inner.attempts_observed += 1;
+
+        // QA-002: reserve the bucket array on first insert. Off the startup
+        // path; the steady-state path still never rehashes after this.
+        try self.ensureReserved();
 
         const gop = self.map.getOrPut(ip) catch return error.OutOfMemory;
         if (!gop.found_existing) {
@@ -635,6 +662,51 @@ test "state: init rejects zero capacity" {
         error.CapacityZero,
         StateTracker.init(testing.allocator, .{ .max_entries = 0 }),
     );
+}
+
+test "state: QA-002 init defers bucket reservation until first insert" {
+    var tracker = try StateTracker.init(testing.allocator, .{ .max_entries = 4096 });
+    defer tracker.deinit();
+    // Lazy: no buckets reserved at init — startup pays nothing for this map.
+    try testing.expect(!tracker.reserved);
+    try testing.expectEqual(@as(usize, 0), tracker.map.capacity());
+
+    // First insert reserves to the configured capacity (never rehashes after).
+    _ = try tracker.recordAttempt(tIp("1.2.3.4"), tJail("sshd"), 1_000);
+    try testing.expect(tracker.reserved);
+    try testing.expect(tracker.map.capacity() >= 4096);
+}
+
+test "state: QA-002 an ignored IP does not trigger reservation" {
+    var tracker = try StateTracker.init(testing.allocator, .{ .max_entries = 4096 });
+    defer tracker.deinit();
+    try tracker.addIgnoreCidr("1.2.3.4");
+    // Ignored attempts never insert, so the lazy reserve must NOT fire.
+    _ = try tracker.recordAttempt(tIp("1.2.3.4"), tJail("sshd"), 1_000);
+    try testing.expect(!tracker.reserved);
+    try testing.expectEqual(@as(usize, 0), tracker.map.capacity());
+}
+
+test "state: QA-002 lazy init preserves first-insert eviction correctness" {
+    // Drives the (max_entries+1)th insert through the lazy-reserved map: the
+    // logical cap must still be enforced via eviction, identical to the old
+    // eager-reserve design (ADR-005 cap unchanged).
+    var tracker = try StateTracker.init(testing.allocator, .{
+        .max_entries = 3,
+        .maxretry = 100,
+        .findtime = 10_000,
+        .eviction_policy = .evict_oldest,
+    });
+    defer tracker.deinit();
+    const jail = tJail("sshd");
+    _ = try tracker.recordAttempt(tIp("1.1.1.1"), jail, 1_000);
+    _ = try tracker.recordAttempt(tIp("2.2.2.2"), jail, 2_000);
+    _ = try tracker.recordAttempt(tIp("3.3.3.3"), jail, 3_000);
+    // 4th distinct IP exceeds max_entries=3 → oldest (1.1.1.1) is evicted.
+    _ = try tracker.recordAttempt(tIp("4.4.4.4"), jail, 4_000);
+    try testing.expectEqual(@as(u32, 3), tracker.stats().entry_count);
+    try testing.expect(!tracker.contains(tIp("1.1.1.1")));
+    try testing.expect(tracker.contains(tIp("4.4.4.4")));
 }
 
 test "state: record single attempt below threshold" {

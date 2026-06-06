@@ -8,11 +8,9 @@
 //! tokens, every opcode of unicode chaos we can think of, and regression
 //! seeds from prior security findings.
 //!
-//! Each input is parsed under a `BudgetAllocator` with a TIGHT ceiling
-//! (the parser is documented zero-allocation on the hot path, so any
-//! allocation inside the matcher under fuzz is an immediate FAIL). We
-//! also wrap the allocator in `std.testing.FailingAllocator` to double-
-//! enforce.
+//! Each input is parsed under `std.testing.FailingAllocator` (the parser is
+//! documented zero-allocation on the hot path, so any allocation inside the
+//! matcher under fuzz is an immediate FAIL).
 //!
 //! Wire-up: this file is NOT yet plugged into build.zig (it is a conflict
 //! zone during Phase 7). See `tests/fuzz/README.md` for the exact `zig
