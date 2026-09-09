@@ -43,6 +43,8 @@ pub const max_json_line_len: usize = 64 * 1024;
 
 pub const default_child_timeout_ms: u64 = 60_000;
 
+pub const default_baseline_timeout_ms: u64 = 5_000;
+
 const max_reads_per_callback: usize = 4;
 
 pub const ResolvedSource = enum { file, journald, internal, fail };
@@ -408,6 +410,7 @@ const InFlight = struct {
     stdout_fd: posix.fd_t,
     started_ms: i64,
     baseline: bool,
+    registered: bool,
     bytes: usize = 0,
     eof: bool = false,
 };
@@ -450,6 +453,7 @@ pub const JournalJail = struct {
 pub const Options = struct {
     journalctl_path: []const u8 = config_mod.journalctl_path,
     child_timeout_ms: u64 = default_child_timeout_ms,
+    baseline_timeout_ms: u64 = default_baseline_timeout_ms,
 };
 
 pub const JournaldSource = struct {
@@ -459,6 +463,7 @@ pub const JournaldSource = struct {
     cursor_path: []u8,
     journalctl_path: []const u8,
     child_timeout_ms: u64,
+    baseline_timeout_ms: u64,
     poll_handle: ?TimerHandle = null,
     dirty: bool = false,
     flush_fn: ?*const fn (?*anyopaque) void = null,
@@ -484,6 +489,7 @@ pub const JournaldSource = struct {
             .cursor_path = owned,
             .journalctl_path = options.journalctl_path,
             .child_timeout_ms = options.child_timeout_ms,
+            .baseline_timeout_ms = options.baseline_timeout_ms,
         };
     }
 
@@ -545,9 +551,46 @@ pub const JournaldSource = struct {
     }
 
     pub fn attach(self: *JournaldSource) Error!void {
+        for (self.jails.items) |*jj| {
+            if (jj.cursor_len != 0) continue;
+            self.baselineSync(jj) catch |err| {
+                std.log.warn(
+                    "journald: baseline for jail '{s}' failed: {s}; retrying on the poll timer",
+                    .{ jj.jail.slice(), @errorName(err) },
+                );
+            };
+        }
+        self.maybeFlush();
         const h = self.event_loop.addTimer(poll_interval_ms, pollTick, self, false) catch
             return error.EventLoopError;
         self.poll_handle = h;
+    }
+
+    fn baselineSync(self: *JournaldSource, jj: *JournalJail) PollError!void {
+        try self.spawnChild(jj, false);
+        const deadline = std.time.milliTimestamp() + @as(i64, @intCast(self.baseline_timeout_ms));
+
+        while (jj.child) |inf| {
+            const remaining = deadline - std.time.milliTimestamp();
+            if (remaining <= 0) break;
+            if (inf.eof) {
+                std.time.sleep(std.time.ns_per_ms);
+                self.finishChild(jj, .eof);
+                continue;
+            }
+            var pfd = [_]posix.pollfd{.{ .fd = inf.stdout_fd, .events = posix.POLL.IN, .revents = 0 }};
+            const ready = posix.poll(&pfd, @intCast(@min(remaining, std.math.maxInt(i32)))) catch 0;
+            if (ready == 0) continue;
+            self.drainStdout(jj);
+        }
+
+        if (jj.child != null) {
+            std.log.warn(
+                "journald: baseline for jail '{s}' exceeded {d}ms; killing and retrying on the poll timer",
+                .{ jj.jail.slice(), self.baseline_timeout_ms },
+            );
+            self.finishChild(jj, .kill);
+        }
     }
 
     pub fn collectCursors(self: *const JournaldSource, buf: []CursorEntry) []CursorEntry {
@@ -627,6 +670,10 @@ pub const JournaldSource = struct {
     };
 
     fn pollJail(self: *JournaldSource, jj: *JournalJail) PollError!void {
+        return self.spawnChild(jj, true);
+    }
+
+    fn spawnChild(self: *JournaldSource, jj: *JournalJail, register: bool) PollError!void {
         if (jj.child != null) return;
 
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
@@ -662,14 +709,17 @@ pub const JournaldSource = struct {
             posix.close(stdout_fd);
             _ = killAndReap(child.id);
         }
+        child.waitForSpawn() catch return error.SpawnFailed;
 
         const flags = posix.fcntl(stdout_fd, posix.F.GETFL, 0) catch return error.SpawnFailed;
         _ = posix.fcntl(stdout_fd, posix.F.SETFL, flags | @as(usize, linux.SOCK.NONBLOCK)) catch
             return error.SpawnFailed;
 
-        const ev_mask: u32 = linux.EPOLL.IN | linux.EPOLL.HUP | linux.EPOLL.ERR;
-        self.event_loop.addFd(stdout_fd, ev_mask, onStdoutReady, self) catch
-            return error.EventLoopError;
+        if (register) {
+            const ev_mask: u32 = linux.EPOLL.IN | linux.EPOLL.HUP | linux.EPOLL.ERR;
+            self.event_loop.addFd(stdout_fd, ev_mask, onStdoutReady, self) catch
+                return error.EventLoopError;
+        }
 
         jj.resetStream();
         jj.child = .{
@@ -677,6 +727,7 @@ pub const JournaldSource = struct {
             .stdout_fd = stdout_fd,
             .started_ms = std.time.milliTimestamp(),
             .baseline = baseline,
+            .registered = register,
         };
     }
 
@@ -838,7 +889,7 @@ pub const JournaldSource = struct {
         var inf = jj.child orelse return;
 
         if (inf.stdout_fd >= 0) {
-            self.event_loop.removeFd(inf.stdout_fd) catch {};
+            if (inf.registered) self.event_loop.removeFd(inf.stdout_fd) catch {};
             posix.close(inf.stdout_fd);
             inf.stdout_fd = -1;
         }
@@ -1560,12 +1611,56 @@ const FakeJournalctl = struct {
     fn cleanup(self: *FakeJournalctl) void {
         self.tmp.cleanup();
     }
+
+    fn createJournalBacked() !FakeJournalctl {
+        var self = FakeJournalctl{ .tmp = testing.tmpDir(.{}) };
+        errdefer self.tmp.cleanup();
+        var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir = try self.tmp.dir.realpath(".", &dir_buf);
+        var body_buf: [2048]u8 = undefined;
+        const body = try std.fmt.bufPrint(&body_buf,
+            \\#!/bin/sh
+            \\J="{s}/journal"
+            \\cur=""
+            \\for a in "$@"; do case "$a" in --after-cursor=*) cur="${{a#--after-cursor=}}";; esac; done
+            \\if [ -z "$cur" ]; then tail -n 1 "$J"; else awk -v c="$cur" 'f{{print}} index($0,"\"__CURSOR\":\"" c "\"")>0{{f=1}}' "$J"; fi
+            \\
+        , .{dir});
+        try self.tmp.dir.writeFile(.{ .sub_path = "journal", .data = "" });
+        try self.tmp.dir.writeFile(.{
+            .sub_path = "journalctl",
+            .data = body,
+            .flags = .{ .mode = 0o755 },
+        });
+        const p = try self.tmp.dir.realpath("journalctl", &self.path_buf);
+        self.path_len = p.len;
+        return self;
+    }
+
+    fn appendJournal(self: *FakeJournalctl, line: []const u8) !void {
+        const f = try self.tmp.dir.openFile("journal", .{ .mode = .write_only });
+        defer f.close();
+        try f.seekFromEnd(0);
+        try f.writeAll(line);
+    }
 };
+
+const poll_timer_fds: usize = 1;
+
+fn openFdCount() !usize {
+    var dir = try std.fs.openDirAbsolute("/proc/self/fd", .{ .iterate = true });
+    defer dir.close();
+    var n: usize = 0;
+    var it = dir.iterate();
+    while (try it.next()) |_| n += 1;
+    return n - 1;
+}
 
 const LoopDriver = struct {
     loop: *EventLoop,
     rec: *CallRecorder,
     jj: *JournalJail,
+    src: ?*JournaldSource = null,
     start_ms: i64,
     want_lines: usize,
     want_reaped: bool,
@@ -1577,6 +1672,11 @@ const LoopDriver = struct {
     fn onCheck(_: u64, ud: ?*anyopaque) void {
         const d: *LoopDriver = @ptrCast(@alignCast(ud.?));
         const now = std.time.milliTimestamp();
+        if (d.src) |src| {
+            if (d.jj.child) |c| {
+                if (c.eof) src.finishChild(d.jj, .eof);
+            }
+        }
         const lines_ok = d.rec.lines.items.len >= d.want_lines;
         const reaped_ok = !d.want_reaped or d.jj.child == null;
         if ((lines_ok and reaped_ok) or now - d.start_ms > deadline_ms) d.loop.stop();
@@ -1634,17 +1734,18 @@ test "journald: slow journalctl does not stall the loop — timer and fd service
         .want_reaped = false,
     };
 
-    try src.pollJail(jj);
-    const pid = jj.child.?.pid;
-    try src.attach();
-    _ = try loop.addTimer(200, LoopDriver.onProbeTimer, &drv, true);
-    _ = try loop.addTimer(25, LoopDriver.onCheck, &drv, false);
-
     const efd = try posix.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
     defer posix.close(efd);
     try loop.addFd(efd, linux.EPOLL.IN, LoopDriver.onProbeFd, &drv);
     const one: u64 = 1;
     _ = try posix.write(efd, std.mem.asBytes(&one));
+
+    _ = try loop.addTimer(200, LoopDriver.onProbeTimer, &drv, true);
+    _ = try loop.addTimer(25, LoopDriver.onCheck, &drv, false);
+    const fds_before = try openFdCount();
+    try src.pollJail(jj);
+    const pid = jj.child.?.pid;
+    try src.attach();
 
     try loop.run();
     try loop.removeFd(efd);
@@ -1659,7 +1760,9 @@ test "journald: slow journalctl does not stall the loop — timer and fd service
     try testing.expect(drv.fd_fired_ms < rec.first_line_ms);
 
     src.deinit();
+    const fds_after = try openFdCount();
     src = try JournaldSource.init(testing.allocator, &loop, "/tmp/fail2zig-test/state.bin", .{});
+    try testing.expectEqual(fds_before, fds_after);
     try testing.expectEqual(linux.E.CHILD, waitpidErrno(pid));
 }
 
@@ -1694,11 +1797,14 @@ test "journald: hung journalctl is killed at the timeout, reaped, cursor unchang
         .want_reaped = true,
     };
 
+    _ = try loop.addTimer(25, LoopDriver.onCheck, &drv, false);
+    try src.attach();
+    const fds_before = try openFdCount();
     try src.pollJail(jj);
     const pid = jj.child.?.pid;
-    try src.attach();
-    _ = try loop.addTimer(25, LoopDriver.onCheck, &drv, false);
     try loop.run();
+    try testing.expect(jj.child == null);
+    try testing.expectEqual(fds_before, try openFdCount());
 
     const elapsed = std.time.milliTimestamp() - drv.start_ms;
     try testing.expect(elapsed >= 1500);
@@ -1785,4 +1891,180 @@ test "journald: a tick while a child is in flight does not spawn a second one (P
     src = try JournaldSource.init(testing.allocator, &loop, "/tmp/fail2zig-test/state.bin", .{});
     try testing.expectEqual(linux.E.CHILD, waitpidErrno(pid));
     try testing.expectEqual(@as(usize, 1), loop.registrations.count());
+}
+
+test "journald: twenty EOF-path polls leave the open fd count flat (SYS-023)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var fake = try FakeJournalctl.create(
+        \\#!/bin/sh
+        \\printf '{"MESSAGE":"Invalid user a from 1.1.1.1 port 1","__CURSOR":"s=eof"}\n'
+        \\
+    );
+    defer fake.cleanup();
+
+    var loop = try EventLoop.init(testing.allocator);
+    defer loop.deinit();
+    var src = try JournaldSource.init(testing.allocator, &loop, "/tmp/fail2zig-test/state.bin", .{
+        .journalctl_path = fake.path(),
+    });
+    defer src.deinit();
+    var rec = CallRecorder.init(testing.allocator);
+    defer rec.deinit();
+    try src.addJail(try JailId.fromSlice("sshd"), "sshd", CallRecorder.onLine, &rec);
+    const jj = &src.jails.items[0];
+    jj.setCursor("s=seed");
+
+    var drv = LoopDriver{
+        .loop = &loop,
+        .rec = &rec,
+        .jj = jj,
+        .src = &src,
+        .start_ms = 0,
+        .want_lines = 0,
+        .want_reaped = true,
+    };
+    _ = try loop.addTimer(5, LoopDriver.onCheck, &drv, false);
+
+    const fds_before = try openFdCount();
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        drv.start_ms = std.time.milliTimestamp();
+        drv.want_lines = i + 1;
+        try src.pollJail(jj);
+        try loop.run();
+        try testing.expect(jj.child == null);
+        try testing.expectEqual(i + 1, rec.lines.items.len);
+    }
+    try testing.expectEqual(fds_before, try openFdCount());
+    try testing.expect(jj.last_read_ok_ts > 0);
+}
+
+test "journald: twenty kill-path polls leave the open fd count flat (SYS-023)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var fake = try FakeJournalctl.create(
+        \\#!/bin/sh
+        \\exec sleep 1000
+        \\
+    );
+    defer fake.cleanup();
+
+    var loop = try EventLoop.init(testing.allocator);
+    defer loop.deinit();
+    var src = try JournaldSource.init(testing.allocator, &loop, "/tmp/fail2zig-test/state.bin", .{
+        .journalctl_path = fake.path(),
+    });
+    defer src.deinit();
+    try src.addJail(try JailId.fromSlice("sshd"), "sshd", CallRecorder.onLine, null);
+    const jj = &src.jails.items[0];
+    jj.setCursor("s=seed");
+
+    const fds_before = try openFdCount();
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        try src.pollJail(jj);
+        const pid = jj.child.?.pid;
+        src.finishChild(jj, .kill);
+        try testing.expect(jj.child == null);
+        try testing.expectEqual(linux.E.CHILD, waitpidErrno(pid));
+    }
+    try testing.expectEqual(fds_before, try openFdCount());
+    try testing.expectEqual(@as(usize, 1), loop.registrations.count());
+}
+
+test "journald: attach baselines synchronously; entries logged before the first tick are delivered (SYS-024)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var fake = try FakeJournalctl.createJournalBacked();
+    defer fake.cleanup();
+    try fake.appendJournal("{\"MESSAGE\":\"Invalid user old from 9.9.9.9 port 9\",\"__CURSOR\":\"s=0\"}\n");
+
+    var loop = try EventLoop.init(testing.allocator);
+    defer loop.deinit();
+    var src = try JournaldSource.init(testing.allocator, &loop, "/tmp/fail2zig-test/state.bin", .{
+        .journalctl_path = fake.path(),
+    });
+    defer src.deinit();
+    var rec = CallRecorder.init(testing.allocator);
+    defer rec.deinit();
+    try src.addJail(try JailId.fromSlice("sshd"), "sshd", CallRecorder.onLine, &rec);
+    const jj = &src.jails.items[0];
+    try testing.expectEqual(@as(usize, 0), jj.cursor_len);
+
+    const fds_before = try openFdCount();
+    try src.attach();
+    try testing.expectEqualStrings("s=0", jj.cursorSlice());
+    try testing.expect(jj.child == null);
+    try testing.expect(jj.last_read_ok_ts > 0);
+    try testing.expectEqual(@as(usize, 0), rec.lines.items.len);
+    try testing.expectEqual(fds_before + poll_timer_fds, try openFdCount());
+
+    try fake.appendJournal("{\"MESSAGE\":\"Invalid user a from 1.1.1.1 port 1\",\"__CURSOR\":\"s=1\"}\n");
+    try fake.appendJournal("{\"MESSAGE\":\"Invalid user b from 2.2.2.2 port 2\",\"__CURSOR\":\"s=2\"}\n");
+
+    var drv = LoopDriver{
+        .loop = &loop,
+        .rec = &rec,
+        .jj = jj,
+        .start_ms = std.time.milliTimestamp(),
+        .want_lines = 2,
+        .want_reaped = false,
+    };
+    _ = try loop.addTimer(25, LoopDriver.onCheck, &drv, false);
+    try loop.run();
+
+    try testing.expectEqual(@as(usize, 2), rec.lines.items.len);
+    try testing.expectEqualStrings("Invalid user a from 1.1.1.1 port 1", rec.lines.items[0]);
+    try testing.expectEqualStrings("Invalid user b from 2.2.2.2 port 2", rec.lines.items[1]);
+    try testing.expectEqualStrings("s=2", jj.cursorSlice());
+}
+
+test "journald: attach skips the baseline for a jail with a sidecar cursor (SYS-024)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var fake = try FakeJournalctl.createJournalBacked();
+    defer fake.cleanup();
+    try fake.appendJournal("{\"MESSAGE\":\"Invalid user old from 9.9.9.9 port 9\",\"__CURSOR\":\"s=0\"}\n");
+
+    var loop = try EventLoop.init(testing.allocator);
+    defer loop.deinit();
+    var src = try JournaldSource.init(testing.allocator, &loop, "/tmp/fail2zig-test/state.bin", .{
+        .journalctl_path = fake.path(),
+    });
+    defer src.deinit();
+    try src.addJail(try JailId.fromSlice("sshd"), "sshd", CallRecorder.onLine, null);
+    const jj = &src.jails.items[0];
+    src.seedCursor("sshd", "s=restored");
+
+    try src.attach();
+    try testing.expectEqualStrings("s=restored", jj.cursorSlice());
+    try testing.expectEqual(@as(i64, 0), jj.last_read_ok_ts);
+}
+
+test "journald: a hung baseline is killed at the baseline timeout and attach still succeeds (SYS-024)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var fake = try FakeJournalctl.create(
+        \\#!/bin/sh
+        \\exec sleep 1000
+        \\
+    );
+    defer fake.cleanup();
+
+    var loop = try EventLoop.init(testing.allocator);
+    defer loop.deinit();
+    var src = try JournaldSource.init(testing.allocator, &loop, "/tmp/fail2zig-test/state.bin", .{
+        .journalctl_path = fake.path(),
+        .baseline_timeout_ms = 300,
+    });
+    defer src.deinit();
+    try src.addJail(try JailId.fromSlice("sshd"), "sshd", CallRecorder.onLine, null);
+    const jj = &src.jails.items[0];
+
+    const fds_before = try openFdCount();
+    const t0 = std.time.milliTimestamp();
+    try src.attach();
+    const elapsed = std.time.milliTimestamp() - t0;
+    try testing.expect(elapsed >= 300);
+    try testing.expect(elapsed < 3000);
+    try testing.expect(jj.child == null);
+    try testing.expectEqual(@as(usize, 0), jj.cursor_len);
+    try testing.expectEqual(fds_before + poll_timer_fds, try openFdCount());
+    try testing.expect(src.poll_handle != null);
 }
