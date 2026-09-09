@@ -45,7 +45,7 @@ pub const default_child_timeout_ms: u64 = 60_000;
 
 const max_reads_per_callback: usize = 4;
 
-pub const ResolvedSource = enum { file, journald, fail };
+pub const ResolvedSource = enum { file, journald, internal, fail };
 
 pub fn resolveSource(
     source: config_mod.LogSource,
@@ -55,6 +55,7 @@ pub fn resolveSource(
 ) ResolvedSource {
     return switch (source) {
         .file => .file,
+        .internal => .internal,
         .journald => if (journalctl_present) .journald else .fail,
         .auto => blk: {
             if (logpath_exists) break :blk .file;

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Header 14B (magic 'F2ZS', u16 version=3, u32 count, u32 crc32) + 113B entries + v3 per-jail lifetime block; v1/v2 loadable.
+//! Header 14B (magic 'F2ZS', u16 version=4, u32 count, u32 crc32) + 114B entries (113B v1-v3 layout + flags) + per-jail lifetime block (v3+); v1-v3 loadable.
 
 const std = @import("std");
 const posix = std.posix;
@@ -18,11 +18,14 @@ const IpState = state_mod.IpState;
 const TrackerMap = tracker_map_mod.TrackerMap;
 
 pub const magic: [4]u8 = .{ 'F', '2', 'Z', 'S' };
-pub const version: u16 = 3;
+pub const version: u16 = 4;
 pub const lifetime_block_version: u16 = 3;
+pub const flags_version: u16 = 4;
 pub const min_supported_version: u16 = 1;
 pub const header_size: usize = 4 + 2 + 4 + 4;
-pub const entry_size: usize = 1 + 16 + 64 + 4 + 4 + 8 + 8 + 8;
+pub const entry_size_legacy: usize = 1 + 16 + 64 + 4 + 4 + 8 + 8 + 8;
+pub const entry_size: usize = entry_size_legacy + 1;
+pub const flag_enforced: u8 = 0x01;
 pub const jail_name_field: usize = 64;
 pub const lifetime_record_size: usize = jail_name_field + 8;
 
@@ -45,9 +48,23 @@ pub const StateEntry = struct {
     first_attempt: Timestamp,
     last_attempt: Timestamp,
     ban_expiry: ?Timestamp,
+    /// null = pre-v4 file, which never recorded whether the ban reached the firewall; the seeder decides.
+    enforced: ?bool = null,
 
     pub fn isBanned(self: StateEntry) bool {
         return self.ban_expiry != null;
+    }
+};
+
+/// Decides `enforced` for entries loaded from a pre-v4 file, keyed by jail name.
+pub const LegacyEnforcedResolver = struct {
+    ctx: ?*anyopaque = null,
+    resolve: *const fn (ctx: ?*anyopaque, jail_name: []const u8) bool = assumeEnforced,
+
+    fn assumeEnforced(ctx: ?*anyopaque, jail_name: []const u8) bool {
+        _ = ctx;
+        _ = jail_name;
+        return true;
     }
 };
 
@@ -187,6 +204,8 @@ fn encodeEntry(buf: *[entry_size]u8, ip: IpAddress, st: *const IpState) void {
     const expiry: i64 = st.ban_expiry orelse 0;
     std.mem.writeInt(i64, buf[off .. off + 8][0..8], expiry, .little);
     off += 8;
+    buf[off] = if (st.enforced) flag_enforced else 0;
+    off += 1;
 
     std.debug.assert(off == entry_size);
 }
@@ -234,7 +253,8 @@ pub fn loadFull(allocator: std.mem.Allocator, path: []const u8) Error!Loaded {
     const count = std.mem.readInt(u32, bytes[6..10], .little);
     const stored_crc = std.mem.readInt(u32, bytes[10..14], .little);
 
-    const entries_bytes_len = @as(usize, count) * entry_size;
+    const esize: usize = if (ver >= flags_version) entry_size else entry_size_legacy;
+    const entries_bytes_len = @as(usize, count) * esize;
     const entries_end = header_size + entries_bytes_len;
     if (bytes.len < entries_end) {
         std.log.warn(
@@ -276,8 +296,8 @@ pub fn loadFull(allocator: std.mem.Allocator, path: []const u8) Error!Loaded {
 
     var i: usize = 0;
     while (i < count) : (i += 1) {
-        const off = i * entry_size;
-        out[i] = decodeEntry(entries_bytes[off .. off + entry_size][0..entry_size].*) orelse {
+        const off = i * esize;
+        out[i] = decodeEntry(entries_bytes[off .. off + esize]) orelse {
             std.log.warn("persist: invalid entry at index {d}; starting fresh", .{i});
             allocator.free(out);
             return emptyLoaded(allocator);
@@ -321,7 +341,8 @@ fn decodeLifetime(buf: [lifetime_record_size]u8) ?JailLifetime {
     return .{ .jail = jail, .lifetime_bans = lifetime_bans };
 }
 
-fn decodeEntry(buf: [entry_size]u8) ?StateEntry {
+fn decodeEntry(buf: []const u8) ?StateEntry {
+    if (buf.len != entry_size and buf.len != entry_size_legacy) return null;
     var off: usize = 0;
     const ip_type = buf[off];
     off += 1;
@@ -354,7 +375,8 @@ fn decodeEntry(buf: [entry_size]u8) ?StateEntry {
     off += 8;
     const expiry_raw = std.mem.readInt(i64, buf[off .. off + 8][0..8], .little);
     off += 8;
-    std.debug.assert(off == entry_size);
+    std.debug.assert(off == entry_size_legacy);
+    const enforced: ?bool = if (buf.len == entry_size) (buf[off] & flag_enforced) != 0 else null;
 
     return StateEntry{
         .ip = ip,
@@ -364,6 +386,7 @@ fn decodeEntry(buf: [entry_size]u8) ?StateEntry {
         .first_attempt = first_attempt,
         .last_attempt = last_attempt,
         .ban_expiry = if (expiry_raw == 0) null else expiry_raw,
+        .enforced = enforced,
     };
 }
 
@@ -379,6 +402,7 @@ pub fn seed(tracker: *StateTracker, entries: []const StateEntry) Error!void {
             .last_attempt = e.last_attempt,
             .ban_state = if (e.ban_expiry != null) .banned else .monitoring,
             .ban_expiry = e.ban_expiry,
+            .enforced = e.ban_expiry != null and (e.enforced orelse true),
             .ring = [_]Timestamp{0} ** state_mod.max_attempts_per_ip,
             .ring_len = 0,
         };
@@ -472,6 +496,16 @@ pub fn seedMap(
     routed: ?*u32,
     legacy: ?*u32,
 ) Error!void {
+    return seedMapWith(map, entries, routed, legacy, .{});
+}
+
+pub fn seedMapWith(
+    map: *TrackerMap,
+    entries: []const StateEntry,
+    routed: ?*u32,
+    legacy: ?*u32,
+    legacy_enforced: LegacyEnforcedResolver,
+) Error!void {
     for (entries) |e| {
         const jail_name = e.jail.slice();
         const target = map.get(jail_name) orelse blk: {
@@ -488,6 +522,8 @@ pub fn seedMap(
             .last_attempt = e.last_attempt,
             .ban_state = if (e.ban_expiry != null) .banned else .monitoring,
             .ban_expiry = e.ban_expiry,
+            .enforced = e.ban_expiry != null and
+                (e.enforced orelse legacy_enforced.resolve(legacy_enforced.ctx, jail_name)),
             .ring = [_]Timestamp{0} ** state_mod.max_attempts_per_ip,
             .ring_len = 0,
         };
@@ -527,7 +563,8 @@ fn tJail(comptime s: []const u8) JailId {
 
 test "persist: header constants" {
     try testing.expectEqual(@as(usize, 14), header_size);
-    try testing.expectEqual(@as(usize, 113), entry_size);
+    try testing.expectEqual(@as(usize, 113), entry_size_legacy);
+    try testing.expectEqual(@as(usize, 114), entry_size);
 }
 
 test "persist: save empty tracker, load returns empty slice" {
@@ -827,7 +864,8 @@ test "persist: v1 state file is accepted by the migration shim" {
         };
         encodeEntry(&entry_buf, tIp("203.0.113.7"), &sample);
     }
-    const crc_val = std.hash.Crc32.hash(&entry_buf);
+    const legacy_entry = entry_buf[0..entry_size_legacy];
+    const crc_val = std.hash.Crc32.hash(legacy_entry);
 
     {
         const f = try std.fs.cwd().createFile(path, .{ .truncate = true });
@@ -842,7 +880,7 @@ test "persist: v1 state file is accepted by the migration shim" {
         var crc_bytes: [4]u8 = undefined;
         std.mem.writeInt(u32, &crc_bytes, crc_val, .little);
         try f.writeAll(&crc_bytes);
-        try f.writeAll(&entry_buf);
+        try f.writeAll(legacy_entry);
     }
 
     const entries = try load(testing.allocator, path);
@@ -851,6 +889,7 @@ test "persist: v1 state file is accepted by the migration shim" {
     try testing.expectEqual(@as(u32, 1), entries[0].ban_count);
     try testing.expectEqualStrings("sshd", entries[0].jail.slice());
     try testing.expect(entries[0].isBanned());
+    try testing.expect(entries[0].enforced == null);
 
     var tm = TrackerMap.init(testing.allocator);
     defer tm.deinit();
@@ -968,8 +1007,8 @@ test "persist: v2 back-compat seeds lifetime from active bans (BUG-006)" {
         encodeEntry(&e2, tIp("5.6.7.8"), &banned);
     }
     var crc = std.hash.Crc32.init();
-    crc.update(&e1);
-    crc.update(&e2);
+    crc.update(e1[0..entry_size_legacy]);
+    crc.update(e2[0..entry_size_legacy]);
     const crc_val = crc.final();
     {
         const f = try std.fs.cwd().createFile(path, .{ .truncate = true });
@@ -984,8 +1023,8 @@ test "persist: v2 back-compat seeds lifetime from active bans (BUG-006)" {
         var crc_bytes: [4]u8 = undefined;
         std.mem.writeInt(u32, &crc_bytes, crc_val, .little);
         try f.writeAll(&crc_bytes);
-        try f.writeAll(&e1);
-        try f.writeAll(&e2);
+        try f.writeAll(e1[0..entry_size_legacy]);
+        try f.writeAll(e2[0..entry_size_legacy]);
     }
 
     const loaded = try loadFull(testing.allocator, path);
@@ -1029,4 +1068,140 @@ test "persist: v3 file is accepted (current version supported, BUG-006)" {
     defer loaded.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), loaded.lifetimes.len);
     try testing.expectEqual(@as(u64, 5), loaded.lifetimes[0].lifetime_bans);
+}
+
+fn tmpStatePath(tmp: *testing.TmpDir, buf: *[std.fs.max_path_bytes]u8) ![]const u8 {
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &dir_buf);
+    return std.fmt.bufPrint(buf, "{s}/state.bin", .{dir});
+}
+
+test "persist: v4 roundtrip preserves enforced vs would-ban per entry (BUG-012)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmpStatePath(&tmp, &full);
+
+    {
+        var tm = TrackerMap.init(testing.allocator);
+        defer tm.deinit();
+        const sshd = try tm.addTracker("sshd", .{ .max_entries = 16, .maxretry = 1, .findtime = 600, .bantime = 300 });
+        const audit = try tm.addTracker("audit", .{ .max_entries = 16, .maxretry = 1, .findtime = 600, .bantime = 300 });
+        _ = try sshd.recordAttempt(tIp("203.0.113.1"), tJail("sshd"), 1_000);
+        sshd.markEnforced(tIp("203.0.113.1"));
+        _ = try audit.recordAttempt(tIp("203.0.113.2"), tJail("audit"), 1_000);
+        try saveAll(&tm, path);
+    }
+
+    const loaded = try loadFull(testing.allocator, path);
+    defer loaded.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), loaded.entries.len);
+    for (loaded.entries) |e| {
+        try testing.expect(e.isBanned());
+        if (std.mem.eql(u8, e.jail.slice(), "sshd")) {
+            try testing.expectEqual(@as(?bool, true), e.enforced);
+        } else {
+            try testing.expectEqual(@as(?bool, false), e.enforced);
+        }
+    }
+
+    var tm2 = TrackerMap.init(testing.allocator);
+    defer tm2.deinit();
+    _ = try tm2.addTracker("sshd", .{ .max_entries = 16 });
+    _ = try tm2.addTracker("audit", .{ .max_entries = 16 });
+    _ = try tm2.ensureLegacy(.{ .max_entries = 16 });
+    try seedMap(&tm2, loaded.entries, null, null);
+    try testing.expect(tm2.get("sshd").?.get(tIp("203.0.113.1")).?.enforced);
+    try testing.expect(!tm2.get("audit").?.get(tIp("203.0.113.2")).?.enforced);
+}
+
+const LegacyByJail = struct {
+    enforcing_jail: []const u8,
+    fn resolve(ctx: ?*anyopaque, jail_name: []const u8) bool {
+        const self: *LegacyByJail = @ptrCast(@alignCast(ctx.?));
+        return std.mem.eql(u8, jail_name, self.enforcing_jail);
+    }
+};
+
+test "persist: pre-v4 entries take enforced from the resolver; v4 entries ignore it (BUG-012)" {
+    var tm = TrackerMap.init(testing.allocator);
+    defer tm.deinit();
+    _ = try tm.addTracker("sshd", .{ .max_entries = 16 });
+    _ = try tm.addTracker("audit", .{ .max_entries = 16 });
+    _ = try tm.ensureLegacy(.{ .max_entries = 16 });
+
+    const entries = [_]StateEntry{
+        .{ .ip = tIp("203.0.113.1"), .jail = tJail("sshd"), .attempt_count = 3, .ban_count = 1, .first_attempt = 0, .last_attempt = 0, .ban_expiry = 999_999 },
+        .{ .ip = tIp("203.0.113.2"), .jail = tJail("audit"), .attempt_count = 3, .ban_count = 1, .first_attempt = 0, .last_attempt = 0, .ban_expiry = 999_999 },
+        .{ .ip = tIp("203.0.113.3"), .jail = tJail("audit"), .attempt_count = 3, .ban_count = 1, .first_attempt = 0, .last_attempt = 0, .ban_expiry = 999_999, .enforced = true },
+        .{ .ip = tIp("203.0.113.4"), .jail = tJail("sshd"), .attempt_count = 1, .ban_count = 0, .first_attempt = 0, .last_attempt = 0, .ban_expiry = null },
+    };
+    var policy = LegacyByJail{ .enforcing_jail = "sshd" };
+    try seedMapWith(&tm, &entries, null, null, .{ .ctx = @ptrCast(&policy), .resolve = LegacyByJail.resolve });
+
+    try testing.expect(tm.get("sshd").?.get(tIp("203.0.113.1")).?.enforced);
+    try testing.expect(!tm.get("audit").?.get(tIp("203.0.113.2")).?.enforced);
+    try testing.expect(tm.get("audit").?.get(tIp("203.0.113.3")).?.enforced);
+    try testing.expect(!tm.get("sshd").?.get(tIp("203.0.113.4")).?.enforced);
+}
+
+test "persist: v3 file loads with enforced unknown and the default seeder assumes enforced (BUG-012)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmpStatePath(&tmp, &full);
+
+    var e1: [entry_size]u8 = undefined;
+    {
+        const banned: IpState = .{
+            .jail = tJail("sshd"),
+            .attempt_count = 3,
+            .ban_count = 1,
+            .first_attempt = 100,
+            .last_attempt = 200,
+            .ban_state = .banned,
+            .ban_expiry = 9_999_999,
+            .ring = [_]Timestamp{0} ** state_mod.max_attempts_per_ip,
+            .ring_len = 0,
+        };
+        encodeEntry(&e1, tIp("1.2.3.4"), &banned);
+    }
+    var crc = std.hash.Crc32.init();
+    crc.update(e1[0..entry_size_legacy]);
+    const jail_count: u32 = 0;
+    crc.update(std.mem.asBytes(&jail_count));
+    const crc_val = crc.final();
+    {
+        const f = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(&magic);
+        var v: [2]u8 = undefined;
+        std.mem.writeInt(u16, &v, 3, .little);
+        try f.writeAll(&v);
+        var c: [4]u8 = undefined;
+        std.mem.writeInt(u32, &c, 1, .little);
+        try f.writeAll(&c);
+        var crc_bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &crc_bytes, crc_val, .little);
+        try f.writeAll(&crc_bytes);
+        try f.writeAll(e1[0..entry_size_legacy]);
+        try f.writeAll(std.mem.asBytes(&jail_count));
+    }
+
+    const loaded = try loadFull(testing.allocator, path);
+    defer loaded.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), loaded.entries.len);
+    try testing.expect(loaded.entries[0].enforced == null);
+
+    var tm = TrackerMap.init(testing.allocator);
+    defer tm.deinit();
+    _ = try tm.addTracker("sshd", .{ .max_entries = 16 });
+    _ = try tm.ensureLegacy(.{ .max_entries = 16 });
+    try seedMap(&tm, loaded.entries, null, null);
+    try testing.expect(tm.get("sshd").?.get(tIp("1.2.3.4")).?.enforced);
+
+    try saveAll(&tm, path);
+    const again = try loadFull(testing.allocator, path);
+    defer again.deinit(testing.allocator);
+    try testing.expectEqual(@as(?bool, true), again.entries[0].enforced);
 }

@@ -58,9 +58,19 @@ pub const LogLevel = enum { debug, info, warn, err };
 
 pub const BanAction = enum { nftables, iptables, ipset, @"log-only" };
 
-pub const LogSource = enum { auto, file, journald };
+pub const LogSource = enum { auto, file, journald, internal };
+
+/// The only filter the in-process `internal` source feeds (ADR-013): confirmed bans from every other jail.
+pub const internal_filter: []const u8 = "recidive";
+
+pub fn filterSupportsInternal(filter: []const u8) bool {
+    return std.mem.eql(u8, filter, internal_filter);
+}
 
 pub const BantimeFormula = enum { linear, exponential };
+
+/// ADR-007: what the daemon does when an enforcing jail exists but no firewall backend is usable.
+pub const OnNoBackend = enum { @"fail-closed", @"log-only" };
 
 pub const BanTimeIncrement = struct {
     enabled: bool = false,
@@ -79,6 +89,7 @@ pub const GlobalConfig = struct {
     metrics_bind: []const u8 = "127.0.0.1",
     metrics_port: u16 = 9100,
     websocket_max_clients: u32 = 16,
+    on_no_backend: OnNoBackend = .@"fail-closed",
 };
 
 pub const websocket_hard_max_clients: u32 = 1024;
@@ -270,7 +281,7 @@ pub fn validate(cfg: *const Config) ValidationError!void {
             const would_use_journald = switch (j.source) {
                 .journald => true,
                 .auto => !anyLogpathExists(j.logpath) and filterSupportsJournald(j.filter),
-                .file => false,
+                .file, .internal => false,
             };
             if (would_use_journald and !journalctlPresent()) {
                 std.log.warn(
@@ -695,6 +706,9 @@ const Parser = struct {
             const n = try asInt(v);
             if (n <= 0 or n > websocket_hard_max_clients) return error.InvalidValue;
             self.global.websocket_max_clients = @intCast(n);
+        } else if (std.mem.eql(u8, key, "on_no_backend")) {
+            const s = try asString(v);
+            self.global.on_no_backend = try parseOnNoBackend(s);
         } else return error.UnknownKey;
     }
 
@@ -907,10 +921,17 @@ fn parseBanAction(s: []const u8) Error!BanAction {
     return error.InvalidValue;
 }
 
+fn parseOnNoBackend(s: []const u8) Error!OnNoBackend {
+    if (std.mem.eql(u8, s, "fail-closed")) return .@"fail-closed";
+    if (std.mem.eql(u8, s, "log-only")) return .@"log-only";
+    return error.InvalidValue;
+}
+
 fn parseLogSource(s: []const u8) Error!LogSource {
     if (std.mem.eql(u8, s, "auto")) return .auto;
     if (std.mem.eql(u8, s, "file")) return .file;
     if (std.mem.eql(u8, s, "journald")) return .journald;
+    if (std.mem.eql(u8, s, "internal")) return .internal;
     return error.InvalidValue;
 }
 
@@ -1601,6 +1622,40 @@ test "native: diag reports InvalidValue at the value position" {
     try std.testing.expectEqualStrings("global", diag.section());
 }
 
+test "native: on_no_backend defaults to fail-closed (SYS-014)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cfg = try Config.parse(arena.allocator(), "[global]\nmemory_ceiling_mb = 32\n");
+    try std.testing.expectEqual(OnNoBackend.@"fail-closed", cfg.global.on_no_backend);
+}
+
+test "native: on_no_backend parses both accepted values (SYS-014)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const lo = try Config.parse(arena.allocator(), "[global]\non_no_backend = \"log-only\"\n");
+    try std.testing.expectEqual(OnNoBackend.@"log-only", lo.global.on_no_backend);
+    const fc = try Config.parse(arena.allocator(), "[global]\non_no_backend = \"fail-closed\"\n");
+    try std.testing.expectEqual(OnNoBackend.@"fail-closed", fc.global.on_no_backend);
+}
+
+test "native: on_no_backend rejects any other value with a positioned diag (SYS-014)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[global]
+        \\on_no_backend = "degrade"
+    ;
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.InvalidValue, Config.parseDiag(arena.allocator(), src, &diag));
+    try std.testing.expectEqual(@as(u32, 2), diag.line);
+    try std.testing.expectEqualStrings("on_no_backend", diag.key());
+    try std.testing.expectEqualStrings("global", diag.section());
+
+    var diag_int: Diagnostic = .{};
+    try std.testing.expectError(error.InvalidValue, Config.parseDiag(arena.allocator(), "[global]\non_no_backend = 1\n", &diag_int));
+    try std.testing.expectEqualStrings("on_no_backend", diag_int.key());
+}
+
 test "native: diag reports UnknownSection at the header and UnterminatedString at the value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1822,4 +1877,14 @@ test "native: backend and source conflict in [defaults] and unknown backend is r
     try std.testing.expectError(error.InvalidValue, Config.parse(arena.allocator(), "[defaults]\nbackend = \"systemd[journalflags=1]\"\n"));
     const cfg = try Config.parse(arena.allocator(), "[defaults]\nsource = \"journald\"\n");
     try std.testing.expectEqual(LogSource.journald, cfg.defaults.source);
+}
+
+test "native: source = \"internal\" parses per jail and in defaults (ENH-005)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cfg = try Config.parse(arena.allocator(), "[defaults]\nsource = \"internal\"\n[jails.recidive]\nfilter = \"recidive\"\nsource = \"internal\"\n");
+    try std.testing.expectEqual(LogSource.internal, cfg.defaults.source);
+    try std.testing.expectEqual(LogSource.internal, cfg.jails[0].source);
+    try std.testing.expect(filterSupportsInternal("recidive"));
+    try std.testing.expect(!filterSupportsInternal("sshd"));
 }

@@ -15,6 +15,7 @@ real `zig-out/bin/fail2zig` binary and verify operator-visible flows.
 | `status_surface_test.zig` | No (in-process command dispatch) | No | non-Linux |
 | `startup_failclosed_test.zig` | Yes (expects each run to exit 1) | No — one assertion in scenario (b) is root-only (ENH-006) | non-Linux, daemon binary missing |
 | `config_diag_test.zig` | Yes (`--validate-config` only) | No | non-Linux, daemon binary missing |
+| `no_backend_test.zig` | Yes (2 runs expect exit 1; 2 keep the daemon up, SIGTERM it) | No — **skips when root** (needs a real `PermissionDenied` from detect/init) | non-Linux, root, daemon binary missing, socket path ≥ 108 bytes |
 
 Unprivileged developer machines see every root-gated subprocess case skip
 cleanly. A CI job with `sudo` (or a privileged container) exercises the full
@@ -59,8 +60,21 @@ const integration_files = [_]IntegrationFile{
 To add a file, append one row. `needs_daemon_binary = true` makes the run
 depend on `b.getInstallStep()`, so `zig-out/bin/fail2zig` is built before the
 test spawns it; set it for every file that starts the daemon as a subprocess
-(`ban`, `persistence`, `startup_failclosed`, `config_diag`). Only Lead edits
-`build.zig`, at the sub-phase close.
+(`ban`, `persistence`, `startup_failclosed`, `config_diag`, `no_backend`).
+Only Lead edits `build.zig`, at the sub-phase close.
+
+`no_backend_test.zig` (SYS-014 / ADR-007 / ENH-006) is the inverse of the
+root-gated files: it must run unprivileged so the firewall really is
+unusable. Scenarios (b) and (c) read the status JSON from
+`GET /api/status` on the metrics port (same payload as IPC `status`)
+because a non-root daemon rejects the test's IPC peer unless it is in the
+`fail2zig` group (QA-004); the `Protection:` row rendering is covered by
+the client's own tests. They assert on the stable strings
+(`no usable backend`, `refusing to run unprotected`,
+`running DEGRADED as log-only`, a non-empty `protection_cause`), not on
+the cause token, which is being corrected under SYS-022. Its
+`LiveDaemon` helper pumps the daemon's stderr on a thread so a test can
+wait for a log line (`would-ban:`) while the process is still running.
 
 ## Skip semantics
 

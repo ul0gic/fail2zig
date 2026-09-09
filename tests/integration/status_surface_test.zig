@@ -43,6 +43,7 @@ fn resolveDescriptor(
     );
     const desc = switch (resolved) {
         .journald => try std.fmt.allocPrint(arena, "journald ({s})", .{jail.filter}),
+        .internal => try arena.dupe(u8, "internal"),
         .file => if (jail.logpath.len == 0)
             try arena.dupe(u8, "file")
         else if (jail.logpath.len == 1)

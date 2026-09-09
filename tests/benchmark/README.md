@@ -13,6 +13,7 @@ default `zig build test` cycle.
 | `memory_ceiling.zig` | Entries under attack over budget | Never exceed | 21,845 entries, 15,606 evictions across 50K attempts |
 | `startup_time.zig` | Process spawn → accepting IPC | < 100ms | Skips on unprivileged hosts (daemon can't run) |
 | `ban_latency.zig` | Match → ban decision | < 1ms | p50 365ns, p99 932ns |
+| `loop_latency.zig` | IPC `status` round-trip p99 while a 1 s fake `journalctl` is polled every tick (PRF-001) | p99 < 50ms | v0.2.2 baseline (sync poll, real journald on f2z-target): p99 21ms. v0.3 (ADR-011, 2026-09-09, dev box): p50 3.2ms, p99 4.3ms, max 8.7ms over 500 round-trips; no-poll floor p50 3.2ms (PRF-002) |
 
 ## Running
 
@@ -56,6 +57,16 @@ current environment returns `error.SkipZigTest`. In particular,
 `startup_time.zig` skips when the daemon binary is missing or the daemon
 refuses to start (no firewall backend) — both are legitimate dev-machine
 conditions.
+
+`loop_latency.zig` needs no daemon binary or privileges: it runs
+`EventLoop` + `JournaldSource` + `IpcServer` + `commands.Context`
+in-process (the daemon has no config key for the `journalctl` path — the
+seam is `JournaldSource.Options.journalctl_path`), polls a fake
+`journalctl` that sleeps 1 s, and drives `status` from a client thread at
+10 ms pacing so the ~5 s run spans several poll cycles. It also asserts at
+least two poll batches were consumed, so a run that never overlapped a
+poll fails rather than reporting a flattering number. Wire it with
+`needs_daemon_binary = false`.
 
 The parse_throughput, memory_ceiling, and ban_latency benchmarks
 additionally require `FAIL2ZIG_RUN_BENCH=1` so a developer's default

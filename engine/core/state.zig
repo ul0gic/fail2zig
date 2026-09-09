@@ -54,6 +54,8 @@ pub const IpState = struct {
     last_attempt: Timestamp,
     ban_state: BanState,
     ban_expiry: ?Timestamp,
+    /// True only when the dispatcher handed this ban to the firewall; a log-only would-ban stays false so reconcile/expiry never touch the backend for it (BUG-012).
+    enforced: bool = false,
 
     ring: [max_attempts_per_ip]Timestamp,
     ring_len: u8,
@@ -291,6 +293,7 @@ pub const StateTracker = struct {
                 new_ban_count - 1,
             );
             st.ban_state = .banned;
+            st.enforced = false;
             st.ban_count = new_ban_count;
             // Saturate instead of overflow: a huge duration or near-max clock must not crash the daemon on first ban.
             const duration_i64: Timestamp = @intCast(@min(duration, std.math.maxInt(Timestamp)));
@@ -314,7 +317,14 @@ pub const StateTracker = struct {
         if (self.map.getPtr(ip)) |st| {
             st.ban_state = .expired;
             st.ban_expiry = null;
+            st.enforced = false;
             st.ring_len = 0;
+        }
+    }
+
+    pub fn markEnforced(self: *StateTracker, ip: IpAddress) void {
+        if (self.map.getPtr(ip)) |st| {
+            if (st.ban_state == .banned) st.enforced = true;
         }
     }
 
@@ -927,4 +937,23 @@ test "state: ipv4-mapped IPv6 does not create a second tracker entry (SEC-001)" 
     const dec = (try tracker.recordAttempt(mapped, jail, 1_200)).?;
     try testing.expect(IpAddress.eql(dec.ip, v4));
     try testing.expectEqual(@as(usize, 1), tracker.stats().entry_count);
+}
+
+test "state: a fresh ban is a would-ban until markEnforced; clearBan resets it (BUG-012)" {
+    var tracker = try StateTracker.init(testing.allocator, .{ .max_entries = 8, .maxretry = 1, .findtime = 600, .bantime = 300 });
+    defer tracker.deinit();
+    const ip = tIp("203.0.113.12");
+    const jail = tJail("sshd");
+    try testing.expect((try tracker.recordAttempt(ip, jail, 1_000)) != null);
+    try testing.expect(!tracker.get(ip).?.enforced);
+
+    tracker.markEnforced(ip);
+    try testing.expect(tracker.get(ip).?.enforced);
+
+    tracker.clearBan(ip);
+    try testing.expect(!tracker.get(ip).?.enforced);
+    try testing.expectEqual(BanState.expired, tracker.get(ip).?.ban_state);
+
+    tracker.markEnforced(ip);
+    try testing.expect(!tracker.get(ip).?.enforced);
 }

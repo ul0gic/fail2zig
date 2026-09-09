@@ -49,6 +49,7 @@ pub const StatusPayload = struct {
     total_bans: ?u64 = null,
     parse_rate: ?f64 = null,
     protection: ?[]const u8 = null,
+    protection_cause: ?[]const u8 = null,
     backend: ?[]const u8 = null,
     jails_active: ?u32 = null,
 };
@@ -145,6 +146,7 @@ fn writeStatusPlain(writer: anytype, s: StatusPayload) !void {
     if (s.total_bans) |a| try writer.print("total_bans\t{d}\n", .{a});
     if (s.parse_rate) |p| try writer.print("parse_rate\t{d:.2}\n", .{p});
     if (s.protection) |p| try writer.print("protection\t{s}\n", .{p});
+    if (s.protection_cause) |c| try writer.print("protection_cause\t{s}\n", .{c});
     if (s.backend) |b| try writer.print("backend\t{s}\n", .{b});
     if (s.jails_active) |j| try writer.print("jails_active\t{d}\n", .{j});
 }
@@ -169,7 +171,7 @@ fn writeStatusTable(writer: anytype, s: StatusPayload, color: Color) !void {
     try rowLabel(writer, "Parse rate:", formatRate(s.parse_rate), width);
     try rowLabel(writer, "Active bans:", formatOptU32(s.active_bans), width);
     try rowLabel(writer, "Total bans:", formatOptU64(s.total_bans), width);
-    try rowLabel(writer, "Protection:", s.protection orelse "-", width);
+    try rowLabel(writer, "Protection:", formatProtection(s), width);
     try rowLabel(writer, "Backend:", s.backend orelse "-", width);
     try rowLabel(writer, "Jails:", formatOptU32(s.jails_active), width);
 
@@ -183,7 +185,7 @@ fn statusWidth(s: StatusPayload) usize {
     used = @max(used, rowUsed(formatRate(s.parse_rate)));
     used = @max(used, rowUsed(formatOptU32(s.active_bans)));
     used = @max(used, rowUsed(formatOptU64(s.total_bans)));
-    used = @max(used, rowUsed(s.protection orelse "-"));
+    used = @max(used, rowUsed(formatProtection(s)));
     used = @max(used, rowUsed(s.backend orelse "-"));
     used = @max(used, rowUsed(formatOptU32(s.jails_active)));
     return @max(44, used + 2);
@@ -194,6 +196,13 @@ fn rowUsed(value: []const u8) usize {
 }
 
 const label_col: usize = 13;
+
+fn formatProtection(s: StatusPayload) []const u8 {
+    const p = s.protection orelse return "-";
+    if (!std.mem.eql(u8, p, "degraded")) return p;
+    const cause = s.protection_cause orelse return "DEGRADED";
+    return std.fmt.bufPrint(&scratch, "DEGRADED ({s})", .{cause}) catch "DEGRADED";
+}
 
 fn versionLen(v: ?[]const u8) usize {
     if (v) |s| return s.len + 1;
@@ -903,6 +912,44 @@ test "format: status table tolerates missing protection (older daemon)" {
     try testing.expect(std.mem.indexOf(u8, out, "Protection:") != null);
 }
 
+test "format: status degraded with protection_cause renders the cause" {
+    const payload = "{\"protection\":\"degraded\",\"protection_cause\":\"NftablesUnavailable\",\"backend\":\"none\"}";
+    const table = try runStatus(testing.allocator, payload, .table);
+    defer testing.allocator.free(table);
+    try testing.expect(std.mem.indexOf(u8, table, "Protection:  DEGRADED (NftablesUnavailable)") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "Backend:     none") != null);
+
+    const plain = try runStatus(testing.allocator, payload, .plain);
+    defer testing.allocator.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "protection\tdegraded\n") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "protection_cause\tNftablesUnavailable\n") != null);
+
+    const json = try runStatus(testing.allocator, payload, .json);
+    defer testing.allocator.free(json);
+    try testing.expect(std.mem.indexOf(u8, json, "\"protection_cause\":\"NftablesUnavailable\"") != null);
+}
+
+test "format: status degraded without protection_cause renders plain DEGRADED (older daemon)" {
+    const payload = "{\"protection\":\"degraded\",\"backend\":\"nftables\"}";
+    const table = try runStatus(testing.allocator, payload, .table);
+    defer testing.allocator.free(table);
+    try testing.expect(std.mem.indexOf(u8, table, "Protection:  DEGRADED ") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "DEGRADED (") == null);
+
+    const plain = try runStatus(testing.allocator, payload, .plain);
+    defer testing.allocator.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "protection_cause") == null);
+}
+
+test "format: status all-log-only renders Protection log-only and Backend none" {
+    const payload = "{\"protection\":\"log-only\",\"backend\":\"none\",\"jails_active\":2}";
+    const table = try runStatus(testing.allocator, payload, .table);
+    defer testing.allocator.free(table);
+    try testing.expect(std.mem.indexOf(u8, table, "Protection:  log-only ") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "Backend:     none ") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "DEGRADED") == null);
+}
+
 fn runList(alloc: std.mem.Allocator, payload: []const u8, fmt: OutputFormat) ![]u8 {
     var list = std.ArrayList(u8).init(alloc);
     errdefer list.deinit();
@@ -1051,7 +1098,7 @@ test "format: status renders protection degraded (SYS-017)" {
     const payload = "{\"protection\":\"degraded\",\"total_bans\":7,\"jails_active\":2}";
     const table = try runStatus(testing.allocator, payload, .table);
     defer testing.allocator.free(table);
-    try testing.expect(std.mem.indexOf(u8, table, "degraded") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "Protection:  DEGRADED ") != null);
     try testing.expect(std.mem.indexOf(u8, table, "Total bans:") != null);
     try testing.expect(std.mem.indexOf(u8, table, "7") != null);
 

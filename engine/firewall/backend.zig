@@ -12,6 +12,7 @@ pub const netlink = @import("netlink.zig");
 pub const BackendError = error{
     SystemError,
     NotAvailable,
+    PermissionDenied,
     RuleLimitReached,
     AlreadyBanned,
     NotBanned,
@@ -157,8 +158,12 @@ pub fn detectWithProbes(
             return .{ .nftables = nftables.NftablesBackend{} };
         },
         .kernel_unsupported => error.KernelUnsupported,
-        .permission_denied => error.PermissionDenied,
         .transient => error.Transient,
+        // ipset/iptables need the same capability, so falling through would only mask the cause.
+        .permission_denied => {
+            std.log.warn("firewall backend: no backend available — {s}", .{causeName(error.PermissionDenied)});
+            return error.PermissionDenied;
+        },
     };
     std.log.warn("firewall backend: nftables unavailable — {s}; trying ipset", .{causeName(cause)});
 
@@ -251,15 +256,16 @@ test "backend: detect falls back to iptables when only it is available" {
     try std.testing.expectEqual(BackendTag.iptables, be.tag());
 }
 
-test "backend: detect falls back past a permission-denied nftables probe (SYS-014)" {
+test "backend: detect reports PermissionDenied without falling through to ipset/iptables (SYS-022)" {
     const probes: AvailabilityProbes = .{
         .nftablesReason = testNftReasonPermissionDenied,
         .ipsetAvailable = testAlwaysTrue,
         .iptablesAvailable = testAlwaysTrue,
     };
-    var be = try detectWithProbes(std.testing.allocator, probes);
-    defer be.deinit();
-    try std.testing.expectEqual(BackendTag.ipset, be.tag());
+    try std.testing.expectError(
+        error.PermissionDenied,
+        detectWithProbes(std.testing.allocator, probes),
+    );
 }
 
 test "backend: detect reports KernelUnsupported when nf_tables absent and nothing else usable (SYS-014)" {

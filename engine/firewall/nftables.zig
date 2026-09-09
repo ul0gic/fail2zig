@@ -25,6 +25,8 @@ pub const NFT_MSG = struct {
     pub const NEWSETELEM: u16 = 12;
     pub const GETSETELEM: u16 = 13;
     pub const DELSETELEM: u16 = 14;
+    pub const NEWGEN: u16 = 15;
+    pub const GETGEN: u16 = 16;
 };
 
 pub const NFTA_TABLE = struct {
@@ -508,11 +510,32 @@ pub const ProbeResult = enum {
     transient,
 };
 
+const PROBE_RECV_TIMEOUT_MS: u64 = 2000;
+
 pub fn probeReason() ProbeResult {
     var sock = netlink.NetlinkSocket.init(linux.NETLINK.NETFILTER) catch |err| {
         return probeReasonFromInitError(err);
     };
-    sock.close();
+    defer sock.close();
+    sock.setRecvTimeout(PROBE_RECV_TIMEOUT_MS) catch return .transient;
+
+    // Opening the socket succeeds without CAP_NET_ADMIN; nfnetlink gates every message on it,
+    // so a read-only GETGEN round-trip is what actually proves the backend is usable.
+    var msg_buf: [64]u8 = undefined;
+    var builder = netlink.MessageBuilder.init(&msg_buf);
+    const seq = sock.nextSeq();
+    const ng: netlink.nfgenmsg = .{ .nfgen_family = netlink.NFPROTO.UNSPEC };
+    builder.append(
+        netlink.nfnlMsgType(netlink.NFNL.SUBSYS_NFTABLES, NFT_MSG.GETGEN),
+        linux.NLM_F_REQUEST | linux.NLM_F_ACK,
+        seq,
+        sock.port_id,
+        std.mem.asBytes(&ng),
+    ) catch return .transient;
+    sock.send(builder.bytes()) catch return .transient;
+
+    var ack_buf: [1024]u8 = undefined;
+    sock.drainAck(&[_]u32{seq}, &ack_buf) catch |err| return probeReasonFromAckError(err);
     return .available;
 }
 
@@ -520,6 +543,15 @@ pub fn probeReasonFromInitError(err: netlink.Error) ProbeResult {
     return switch (err) {
         error.ProtocolUnsupported => .kernel_unsupported,
         error.PermissionDenied => .permission_denied,
+        else => .transient,
+    };
+}
+
+/// EINVAL on GETGEN means nfnetlink is present but the nf_tables subsystem could not be loaded.
+pub fn probeReasonFromAckError(err: netlink.Error) ProbeResult {
+    return switch (err) {
+        error.PermissionDenied => .permission_denied,
+        error.InvalidArgument => .kernel_unsupported,
         else => .transient,
     };
 }
@@ -566,7 +598,7 @@ fn sendScaffold(self: *NftablesBackend) backend.BackendError!void {
             error.NotFound => {},
             error.PermissionDenied => {
                 logPermissionDenied();
-                return error.NotAvailable;
+                return error.PermissionDenied;
             },
             else => return mapNetlinkErr(e),
         };
@@ -741,8 +773,9 @@ fn initImpl(
     self.allocator = allocator;
     self.config = config;
 
-    var sock = netlink.NetlinkSocket.init(linux.NETLINK.NETFILTER) catch {
-        return error.NotAvailable;
+    var sock = netlink.NetlinkSocket.init(linux.NETLINK.NETFILTER) catch |err| switch (err) {
+        error.PermissionDenied => return error.PermissionDenied,
+        else => return error.NotAvailable,
     };
 
     sock.setRecvTimeout(5000) catch |e| {
@@ -915,7 +948,7 @@ fn isAvailableImpl(ctx: *anyopaque) bool {
 
 fn mapNetlinkErr(err: netlink.Error) backend.BackendError {
     return switch (err) {
-        error.PermissionDenied => backend.BackendError.NotAvailable,
+        error.PermissionDenied => backend.BackendError.PermissionDenied,
         error.ProtocolUnsupported => backend.BackendError.NotAvailable,
         error.AlreadyExists => backend.BackendError.AlreadyBanned,
         error.NotFound => backend.BackendError.NotBanned,
@@ -1453,4 +1486,40 @@ test "nftables: probe maps each netlink init failure to its cause (SYS-014)" {
     try std.testing.expectEqual(ProbeResult.permission_denied, probeReasonFromInitError(error.PermissionDenied));
     try std.testing.expectEqual(ProbeResult.transient, probeReasonFromInitError(error.SocketFailed));
     try std.testing.expectEqual(ProbeResult.transient, probeReasonFromInitError(error.Timeout));
+}
+
+test "nftables: probe maps each GETGEN ack failure to its cause (SYS-022)" {
+    try std.testing.expectEqual(ProbeResult.permission_denied, probeReasonFromAckError(error.PermissionDenied));
+    try std.testing.expectEqual(ProbeResult.kernel_unsupported, probeReasonFromAckError(error.InvalidArgument));
+    try std.testing.expectEqual(ProbeResult.transient, probeReasonFromAckError(error.Timeout));
+    try std.testing.expectEqual(ProbeResult.transient, probeReasonFromAckError(error.NetlinkError));
+}
+
+test "nftables: netlink EPERM maps to BackendError.PermissionDenied (SYS-022)" {
+    try std.testing.expectEqual(backend.BackendError.PermissionDenied, mapNetlinkErr(error.PermissionDenied));
+    try std.testing.expectEqual(backend.BackendError.NotAvailable, mapNetlinkErr(error.ProtocolUnsupported));
+}
+
+test "nftables: probe without CAP_NET_ADMIN reports permission_denied (SYS-022)" {
+    if (testHasCapNetAdmin()) return error.SkipZigTest;
+    try std.testing.expectEqual(ProbeResult.permission_denied, probeReason());
+}
+
+test "nftables: probe with CAP_NET_ADMIN never reports permission_denied (SYS-022)" {
+    if (!testHasCapNetAdmin()) return error.SkipZigTest;
+    try std.testing.expect(probeReason() != .permission_denied);
+}
+
+fn testHasCapNetAdmin() bool {
+    if (linux.geteuid() == 0) return true;
+    var buf: [4096]u8 = undefined;
+    const status = std.fs.cwd().readFile("/proc/self/status", &buf) catch return false;
+    var lines = std.mem.splitScalar(u8, status, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "CapEff:")) continue;
+        const hex = std.mem.trim(u8, line["CapEff:".len..], " \t");
+        const caps = std.fmt.parseInt(u64, hex, 16) catch return false;
+        return (caps >> linux.CAP.NET_ADMIN) & 1 == 1;
+    }
+    return false;
 }

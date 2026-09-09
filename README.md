@@ -461,7 +461,7 @@ eBPF/XDP (NIC-level drop) is architected; ships in a future release.
 | DNS | `named-refused` (BIND) |
 | FTP | `vsftpd`, `proftpd` |
 | Database | `mysqld-auth` |
-| Meta | `recidive` (escalates repeat offenders) |
+| Meta | `recidive` (escalates repeat offenders — fed in-process from confirmed bans in other jails, `source = "internal"`; no ban log to tail) |
 
 Full reference: [reference/filters](https://fail2zig.com/docs/reference/filters/).
 Filter names accept hyphenated or underscore forms

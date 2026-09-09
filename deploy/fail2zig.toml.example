@@ -96,6 +96,16 @@ bantime_increment_multiplier = 2
 bantime_increment_formula    = "exponential"
 bantime_increment_max_bantime = 604800   # 1 week ceiling
 
+# Escalate repeat offenders. Every confirmed ban in any other jail counts as one
+# attempt here — fed in-process (source resolves to "internal"), no log file
+# needed. Two bans within a day earn a week.
+[jails.recidive]
+enabled  = true
+filter   = "recidive"
+maxretry = 2
+findtime = 86400
+bantime  = 604800
+
 # Protect nginx against credential-stuffing on basic-auth endpoints.
 [jails.nginx-http-auth]
 enabled = true

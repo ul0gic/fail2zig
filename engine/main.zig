@@ -153,7 +153,7 @@ const JailContext = struct {
     jail: shared.JailId,
     matcher: filter_registry_mod.FilterMatcher,
     state: *state_mod.StateTracker,
-    backend_ptr: *firewall.Backend,
+    backend_ptr: ?*firewall.Backend = null,
     banaction: config_mod.BanAction = .nftables,
     metrics: ?*metrics_mod.Metrics = null,
     ws: ?*ws.WsServer = null,
@@ -166,6 +166,9 @@ const JailContext = struct {
         duration: shared.Duration,
     ) firewall.BackendError!void = null,
     ban_hook_ctx: ?*anyopaque = null,
+    feed: ?*InternalFeed = null,
+    is_internal: bool = false,
+    internal_events: u64 = 0,
 
     fn now(self: *const JailContext) shared.Timestamp {
         if (self.now_override) |t| return t;
@@ -181,9 +184,62 @@ const JailContext = struct {
         if (self.ban_hook) |hook| {
             return hook(self.ban_hook_ctx, ip, jail, duration);
         }
-        return self.backend_ptr.ban(ip, jail, duration);
+        const be = self.backend_ptr orelse return error.NotAvailable;
+        return be.ban(ip, jail, duration);
     }
 };
+
+/// ADR-013: confirmed enforced bans from ordinary jails become one attempt each against every `internal`-sourced jail.
+const InternalFeed = struct {
+    sinks: std.ArrayList(*JailContext),
+
+    fn init(a: std.mem.Allocator) InternalFeed {
+        return .{ .sinks = std.ArrayList(*JailContext).init(a) };
+    }
+
+    fn deinit(self: *InternalFeed) void {
+        self.sinks.deinit();
+    }
+
+    fn onConfirmedBan(self: *InternalFeed, ip: shared.IpAddress, from: *const JailContext) void {
+        if (from.is_internal) return;
+        for (self.sinks.items) |sink| {
+            sink.internal_events += 1;
+            if (sink.metrics) |m| {
+                m.incrementParsed();
+                m.jailIncrementParsed(sink.jail.slice());
+                m.incrementMatched();
+                m.jailIncrementMatched(sink.jail.slice());
+            }
+            if (sink.state.isIgnored(ip)) continue;
+            const decision = sink.state.recordAttempt(ip, sink.jail, sink.now()) catch |err| {
+                std.log.warn("state: recordAttempt failed for jail '{s}': {s}", .{ sink.jail.slice(), @errorName(err) });
+                continue;
+            };
+            if (decision) |d| dispatchBan(sink, d);
+        }
+    }
+
+    fn healthFor(self: *const InternalFeed, jail_name: []const u8) ?commands_mod.JailHealth {
+        for (self.sinks.items) |sink| {
+            if (!std.mem.eql(u8, sink.jail.slice(), jail_name)) continue;
+            return .{ .healthy = true, .lines_seen = sink.internal_events, .last_read_ok_ts = std.time.timestamp() };
+        }
+        return null;
+    }
+};
+
+fn resolveJailSource(
+    jail_cfg: *const config_mod.JailConfig,
+    logpath_exists: bool,
+    journalctl_present: bool,
+    filter_journald_supported: bool,
+) journald_source_mod.ResolvedSource {
+    if (jail_cfg.source == .auto and !logpath_exists and config_mod.filterSupportsInternal(jail_cfg.filter)) {
+        return .internal;
+    }
+    return journald_source_mod.resolveSource(jail_cfg.source, logpath_exists, journalctl_present, filter_journald_supported);
+}
 
 fn dispatchBan(ctx: *JailContext, d: state_mod.BanDecision) void {
     if (ctx.banaction == .@"log-only") {
@@ -204,6 +260,8 @@ fn dispatchBan(ctx: *JailContext, d: state_mod.BanDecision) void {
         "ban: jail='{s}' ip={} duration={d}s ban_count={d} action={s}",
         .{ ctx.jail.slice(), d.ip, d.duration, d.ban_count, @tagName(ctx.banaction) },
     );
+    // Marked before the backend call: a ban the firewall rejected is still owed to it, so reconcile retries it on restart.
+    ctx.state.markEnforced(d.ip);
     ctx.enforceBan(d.ip, d.jail, d.duration) catch |err| {
         std.log.warn(
             "backend: ban failed for ip={} jail='{s}': {s}",
@@ -226,6 +284,7 @@ fn dispatchBan(ctx: *JailContext, d: state_mod.BanDecision) void {
             } else |_| {}
         }
     }
+    if (ctx.feed) |feed| feed.onConfirmedBan(d.ip, ctx);
 }
 
 fn lineCallback(
@@ -300,10 +359,18 @@ fn lineCallback(
 
 const ExpiryContext = struct {
     trackers: *tracker_map_mod.TrackerMap,
-    backend_ptr: *firewall.Backend,
+    backend_ptr: ?*firewall.Backend,
     metrics: ?*metrics_mod.Metrics = null,
     ws: ?*ws.WsServer = null,
     ws_alloc: ?std.mem.Allocator = null,
+    unban_hook: ?*const fn (userdata: ?*anyopaque, ip: shared.IpAddress, jail: shared.JailId) firewall.BackendError!void = null,
+    unban_hook_ctx: ?*anyopaque = null,
+
+    fn releaseBan(self: *ExpiryContext, ip: shared.IpAddress, jail: shared.JailId) firewall.BackendError!void {
+        if (self.unban_hook) |hook| return hook(self.unban_hook_ctx, ip, jail);
+        const be = self.backend_ptr orelse return error.NotAvailable;
+        return be.unban(ip, jail);
+    }
 };
 
 fn expirySweep(expirations: u64, userdata: ?*anyopaque) void {
@@ -316,6 +383,7 @@ fn expirySweep(expirations: u64, userdata: ?*anyopaque) void {
         ip: shared.IpAddress,
         jail: shared.JailId,
         tracker: *state_mod.StateTracker,
+        enforced: bool,
     } = undefined;
     var n: usize = 0;
 
@@ -329,7 +397,7 @@ fn expirySweep(expirations: u64, userdata: ?*anyopaque) void {
             if (st.ban_state != .banned) continue;
             const exp = st.ban_expiry orelse continue;
             if (exp <= now) {
-                to_unban[n] = .{ .ip = kv.key_ptr.*, .jail = st.jail, .tracker = tracker };
+                to_unban[n] = .{ .ip = kv.key_ptr.*, .jail = st.jail, .tracker = tracker, .enforced = st.enforced };
                 n += 1;
             }
         }
@@ -338,17 +406,22 @@ fn expirySweep(expirations: u64, userdata: ?*anyopaque) void {
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const item = to_unban[i];
-        ctx.backend_ptr.unban(item.ip, item.jail) catch |err| {
-            std.log.warn(
-                "backend: unban failed for ip={} jail='{s}': {s}",
-                .{ item.ip, item.jail.slice(), @errorName(err) },
-            );
-        };
         item.tracker.clearBan(item.ip);
         if (ctx.metrics) |m| {
             m.incrementUnbans();
             m.jailIncrementUnbans(item.jail.slice());
         }
+        if (!item.enforced) {
+            // A would-ban never reached the firewall, so there is nothing to remove and no ip_unbanned event to emit.
+            std.log.info("would-ban expired: jail='{s}' ip={}", .{ item.jail.slice(), item.ip });
+            continue;
+        }
+        ctx.releaseBan(item.ip, item.jail) catch |err| {
+            std.log.warn(
+                "backend: unban failed for ip={} jail='{s}': {s}",
+                .{ item.ip, item.jail.slice(), @errorName(err) },
+            );
+        };
         std.log.info(
             "unban: jail='{s}' ip={}",
             .{ item.jail.slice(), item.ip },
@@ -637,6 +710,7 @@ fn printConfigLoadError(
 }
 
 fn printValidateSummary(w: anytype, cfg: *const config_mod.Config) !void {
+    try w.print("config: on_no_backend={s}\n", .{@tagName(cfg.global.on_no_backend)});
     for (cfg.jails) |*j| {
         const r = config_mod.resolveJailFromConfig(j, cfg.defaults);
         try w.print(
@@ -698,9 +772,45 @@ test "cli: validate summary names each jail's resolved source" {
     const cfg = try config_mod.Config.parse(arena.allocator(), "[jails.sshd]\nfilter = \"sshd\"\nbackend = \"systemd\"\n");
     try printValidateSummary(stream.writer(), &cfg);
     try std.testing.expectEqualStrings(
-        "config: jail 'sshd' enabled=true filter=sshd source=journald banaction=nftables\nconfig: OK (1 jail(s) configured)\n",
+        "config: on_no_backend=fail-closed\nconfig: jail 'sshd' enabled=true filter=sshd source=journald banaction=nftables\nconfig: OK (1 jail(s) configured)\n",
         stream.getWritten(),
     );
+}
+
+test "cli: validate summary shows an opted-in on_no_backend (SYS-014)" {
+    var buf: [512]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cfg = try config_mod.Config.parse(arena.allocator(), "[global]\non_no_backend = \"log-only\"\n");
+    try printValidateSummary(stream.writer(), &cfg);
+    try std.testing.expectEqualStrings(
+        "config: on_no_backend=log-only\nconfig: OK (0 jail(s) configured)\n",
+        stream.getWritten(),
+    );
+}
+
+// Pre-v4 state files never recorded whether a ban reached the firewall; a jail that enforces today is assumed to have enforced then.
+fn legacyEntryEnforced(ctx: ?*anyopaque, jail_name: []const u8) bool {
+    const cfg: *const config_mod.Config = @ptrCast(@alignCast(ctx.?));
+    for (cfg.jails) |*jc| {
+        if (!std.mem.eql(u8, jc.name, jail_name)) continue;
+        return config_mod.resolveJailFromConfig(jc, cfg.defaults).banaction != .@"log-only";
+    }
+    return true;
+}
+
+test "persist: legacyEntryEnforced follows the jail's resolved banaction; unknown jails assume enforced (BUG-012)" {
+    var jails = [_]config_mod.JailConfig{
+        .{ .name = "sshd", .enabled = true, .banaction = .nftables },
+        .{ .name = "audit", .enabled = true, .banaction = .@"log-only" },
+        .{ .name = "viadefault", .enabled = true },
+    };
+    var cfg = config_mod.Config{ .global = .{}, .defaults = .{ .banaction = .@"log-only" }, .jails = &jails, .diag = .{} };
+    try testing.expect(legacyEntryEnforced(@ptrCast(&cfg), "sshd"));
+    try testing.expect(!legacyEntryEnforced(@ptrCast(&cfg), "audit"));
+    try testing.expect(!legacyEntryEnforced(@ptrCast(&cfg), "viadefault"));
+    try testing.expect(legacyEntryEnforced(@ptrCast(&cfg), "retired"));
 }
 
 fn reconcileBanApply(
@@ -773,6 +883,21 @@ fn failClosed(err: anytype, comptime fmt: []const u8, args: anytype) @TypeOf(err
     }
 }
 
+fn noUsableBackend(cfg: *const config_mod.Config, cause: commands_mod.NoBackendCause) commands_mod.FirewallState {
+    var buf: [96]u8 = undefined;
+    const why = cause.describe(&buf);
+    switch (cfg.global.on_no_backend) {
+        .@"fail-closed" => {
+            std.log.err("firewall: no usable backend ({s}); refusing to run unprotected", .{why});
+            std.process.exit(1);
+        },
+        .@"log-only" => {
+            std.log.err("firewall: no usable backend ({s}); running DEGRADED as log-only per on_no_backend", .{why});
+            return .{ .unavailable = cause };
+        },
+    }
+}
+
 fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     var trace = StartupTrace.init(heap);
     defer trace.report();
@@ -784,16 +909,27 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     }
     trace.mark("metrics");
 
-    var backend_val = firewall.detect(heap) catch |err| {
-        std.log.err("firewall: no backend available ({s}) — refusing to run unprotected", .{@errorName(err)});
-        std.process.exit(1);
-    };
-    trace.mark("fw_detect");
-    backend_val.init(.{}, heap) catch |err| {
-        std.log.err("firewall: backend init failed: {s} — refusing to run unprotected", .{@errorName(err)});
-        std.process.exit(1);
-    };
-    defer backend_val.deinit();
+    var backend_storage: firewall.Backend = undefined;
+    var backend_opt: ?*firewall.Backend = null;
+    var fw_state: commands_mod.FirewallState = .not_needed;
+    if (commands_mod.firewallNeeded(cfg)) {
+        if (firewall.detect(heap)) |be| {
+            backend_storage = be;
+            trace.mark("fw_detect");
+            if (backend_storage.init(.{}, heap)) |_| {
+                backend_opt = &backend_storage;
+                fw_state = .ready;
+            } else |err| {
+                backend_storage.deinit();
+                fw_state = noUsableBackend(cfg, .{ .init = err });
+            }
+        } else |cause| {
+            fw_state = noUsableBackend(cfg, .{ .detect = cause });
+        }
+    } else {
+        std.log.info("firewall: every enabled jail is log-only; backend detection skipped (nothing to enforce)", .{});
+    }
+    defer if (backend_opt) |be| be.deinit();
     trace.mark("fw_init");
 
     var trackers = tracker_map_mod.TrackerMap.init(heap);
@@ -844,7 +980,10 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         if (loaded.entries.len > 0) {
             var routed: u32 = 0;
             var legacy_routed: u32 = 0;
-            persist_mod.seedMap(&trackers, loaded.entries, &routed, &legacy_routed) catch |err| {
+            persist_mod.seedMapWith(&trackers, loaded.entries, &routed, &legacy_routed, .{
+                .ctx = @ptrCast(@constCast(cfg)),
+                .resolve = legacyEntryEnforced,
+            }) catch |err| {
                 std.log.warn("persist: seed failed: {s}", .{@errorName(err)});
             };
             std.log.info(
@@ -865,7 +1004,7 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         std.log.warn("persist: load failed: {s}", .{@errorName(err)});
     }
 
-    {
+    if (backend_opt) |be| {
         const now = std.time.timestamp();
         const reinstalled = reconcile_mod.reconcileAllRestoredBans(
             heap,
@@ -873,7 +1012,7 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
             &metrics,
             now,
             reconcileBanApply,
-            @ptrCast(&backend_val),
+            @ptrCast(be),
         ) catch |err| blk: {
             std.log.warn("persist: reconcile failed: {s}", .{@errorName(err)});
             break :blk 0;
@@ -919,6 +1058,9 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     var source_descriptors = JailSourceDescriptors.init(heap);
     defer source_descriptors.deinit();
 
+    var internal_feed = InternalFeed.init(heap);
+    defer internal_feed.deinit();
+
     for (cfg.jails) |jail_cfg| {
         if (!jail_cfg.enabled) continue;
         const jail = shared.JailId.fromSlice(jail_cfg.name) catch |err| {
@@ -945,8 +1087,8 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
             .jail = jail,
             .matcher = jail_matcher,
             .state = tracker_ptr,
-            .backend_ptr = &backend_val,
-            .banaction = resolved.banaction,
+            .backend_ptr = backend_opt,
+            .banaction = fw_state.effectiveAction(resolved.banaction),
             .metrics = &metrics,
         };
         try contexts.append(ctx);
@@ -955,13 +1097,28 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         const logpath_exists = config_mod.anyLogpathExists(jail_cfg.logpath);
         const filter_journald_supported =
             journald_source_mod.selectorsForFilter(jail_cfg.filter) != null;
-        const resolved_source = journald_source_mod.resolveSource(
-            jail_cfg.source,
+        const resolved_source = resolveJailSource(
+            &jail_cfg,
             logpath_exists,
             journalctl_present,
             filter_journald_supported,
         );
         switch (resolved_source) {
+            .internal => {
+                if (!config_mod.filterSupportsInternal(jail_cfg.filter)) {
+                    return failClosed(
+                        error.JailHasNoUsableSource,
+                        "jail '{s}' uses source=internal, which only feeds filter '{s}' (confirmed bans from other jails); it uses filter '{s}'",
+                        .{ jail_cfg.name, config_mod.internal_filter, jail_cfg.filter },
+                    );
+                }
+                ctx.is_internal = true;
+                try internal_feed.sinks.append(ctx);
+                source_descriptors.putInternal(jail_cfg.name) catch |err| {
+                    std.log.warn("status: source descriptor record failed for '{s}': {s}", .{ jail_cfg.name, @errorName(err) });
+                };
+                std.log.info("jail: enabled '{s}' source=internal (fed by confirmed bans in other jails)", .{jail_cfg.name});
+            },
             .file => {
                 for (jail_cfg.logpath) |lp| {
                     watcher.watchFile(lp, jail, lineCallback, ctx) catch |err| {
@@ -1031,15 +1188,23 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         std.log.info("journald: polling {d} jail(s) every {d}ms", .{ journald.jailCount(), journald_source_mod.poll_interval_ms });
     }
 
+    if (internal_feed.sinks.items.len > 0) {
+        for (contexts.items) |jctx| {
+            if (!jctx.is_internal) jctx.feed = &internal_feed;
+        }
+    }
+
     var health_sources = HealthSources{
         .watcher = &watcher,
         .journald = &journald,
+        .internal = &internal_feed,
     };
 
     var cmd_ctx: commands_mod.Context = .{
         .trackers = &trackers,
         .config = cfg,
-        .backend = &backend_val,
+        .backend = backend_opt,
+        .firewall_state = fw_state,
         .stats_source = .{
             .ctx = @ptrCast(&metrics),
             .snapshot = metricsStatsSnapshot,
@@ -1107,7 +1272,7 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
 
     var expiry_ctx = ExpiryContext{
         .trackers = &trackers,
-        .backend_ptr = &backend_val,
+        .backend_ptr = backend_opt,
         .metrics = &metrics,
         .ws = &ws_server,
         .ws_alloc = heap,
@@ -1127,7 +1292,7 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         "fail2zig {s} running; backend={s}; ipc={s}; http={s}:{d}",
         .{
             version,
-            @tagName(backend_val.tag()),
+            if (backend_opt) |be| @tagName(be.tag()) else "none",
             cfg.global.socket_path,
             cfg.global.metrics_bind,
             cfg.global.metrics_port,
@@ -1219,10 +1384,14 @@ fn metricsStatsSnapshot(ctx: ?*anyopaque) commands_mod.StatsSnapshot {
 const HealthSources = struct {
     watcher: *log_watcher_mod.LogWatcher,
     journald: *journald_source_mod.JournaldSource,
+    internal: ?*const InternalFeed = null,
 };
 
 fn jailHealthLookup(ctx: ?*anyopaque, jail_name: []const u8) ?commands_mod.JailHealth {
     const self: *HealthSources = @ptrCast(@alignCast(ctx.?));
+    if (self.internal) |feed| {
+        if (feed.healthFor(jail_name)) |h| return h;
+    }
     if (self.journald.healthForJail(jail_name)) |h| {
         return .{ .healthy = h.healthy, .lines_seen = h.lines_seen, .last_read_ok_ts = h.last_read_ok_ts };
     }
@@ -1254,6 +1423,10 @@ const JailSourceDescriptors = struct {
         try self.map.put(jail_name, desc);
     }
 
+    fn putInternal(self: *JailSourceDescriptors, jail_name: []const u8) !void {
+        try self.map.put(jail_name, "internal");
+    }
+
     fn putFile(self: *JailSourceDescriptors, jail_name: []const u8, logpath: []const []const u8) !void {
         const a = self.arena.allocator();
         if (logpath.len == 0) {
@@ -1274,6 +1447,8 @@ const JailSourceDescriptors = struct {
         return self.map.get(jail_name);
     }
 };
+
+const protection_states = [_][]const u8{ "active", "mixed", "log-only", "degraded" };
 
 const HttpSources = struct {
     metrics: *metrics_mod.Metrics,
@@ -1338,6 +1513,12 @@ fn writeMetricsPayload(
     try w.writeAll("# TYPE fail2zig_protection_active gauge\n");
     try w.print("fail2zig_protection_active {d}\n", .{@intFromBool(actively_enforcing)});
 
+    try w.writeAll("# HELP fail2zig_protection_state 1 on the series matching the overall protection state (active/mixed/log-only/degraded)\n");
+    try w.writeAll("# TYPE fail2zig_protection_state gauge\n");
+    for (protection_states) |st| {
+        try w.print("fail2zig_protection_state{{state=\"{s}\"}} {d}\n", .{ st, @intFromBool(std.mem.eql(u8, overall, st)) });
+    }
+
     try w.writeAll("# HELP fail2zig_jail_log_source_healthy 1 when the jail's log source is confirmed reading, else 0\n");
     try w.writeAll("# TYPE fail2zig_jail_log_source_healthy gauge\n");
     try w.writeAll("# HELP fail2zig_jail_enforcing 1 when the jail's resolved action touches the firewall, else 0\n");
@@ -1346,8 +1527,7 @@ fn writeMetricsPayload(
     try w.writeAll("# TYPE fail2zig_jail_lines_seen_total counter\n");
     for (self.cmd_ctx.config.jails) |*jc| {
         if (!jc.enabled) continue;
-        const resolved = config_mod.resolveJailFromConfig(jc, self.cmd_ctx.config.defaults);
-        const enforcing = resolved.banaction != .@"log-only";
+        const enforcing = self.cmd_ctx.jailEnforcing(jc);
         const hs = self.cmd_ctx.health_source;
         const health = hs.lookup(hs.ctx, jc.name);
         const healthy = if (health) |h| h.healthy else false;
@@ -1753,6 +1933,196 @@ test "dispatch: log-only jail records ban intent but does NOT call backend" {
         }
     }
     try testing.expect(found);
+}
+
+test "dispatch: log-only leaves the tracker entry a would-ban; enforcing marks it enforced (BUG-012)" {
+    const a = testing.allocator;
+    var tracker = try state_mod.StateTracker.init(a, .{ .max_entries = 16, .maxretry = 3, .findtime = 600, .bantime = 600 });
+    defer tracker.deinit();
+    var metrics = metrics_mod.Metrics.init();
+    _ = metrics.registerJail("sshd");
+    const jail = try shared.JailId.fromSlice("sshd");
+    var backend: firewall.Backend = .{ .iptables = firewall.iptables.IptablesBackend{} };
+    var spy: BanSpy = .{};
+
+    const observed = try shared.IpAddress.parse("203.0.113.10");
+    var lo = makeDispatchTestCtx(jail, &tracker, &backend, &metrics, &spy, .@"log-only");
+    dispatchBan(&lo, try produceDecision(&tracker, observed, jail));
+    try testing.expect(tracker.get(observed).?.isBanned());
+    try testing.expect(!tracker.get(observed).?.enforced);
+
+    const enforced = try shared.IpAddress.parse("203.0.113.11");
+    var enf = makeDispatchTestCtx(jail, &tracker, &backend, &metrics, &spy, .nftables);
+    dispatchBan(&enf, try produceDecision(&tracker, enforced, jail));
+    try testing.expectEqual(@as(u32, 1), spy.calls);
+    try testing.expect(tracker.get(enforced).?.enforced);
+}
+
+test "recidive: resolveJailSource picks internal for filter=recidive with no logpath, file when one exists, explicit internal always (ENH-005)" {
+    const rec_auto = config_mod.JailConfig{ .name = "recidive", .filter = "recidive" };
+    try testing.expectEqual(journald_source_mod.ResolvedSource.internal, resolveJailSource(&rec_auto, false, true, false));
+    try testing.expectEqual(journald_source_mod.ResolvedSource.file, resolveJailSource(&rec_auto, true, true, false));
+    const rec_explicit = config_mod.JailConfig{ .name = "recidive", .filter = "recidive", .source = .internal };
+    try testing.expectEqual(journald_source_mod.ResolvedSource.internal, resolveJailSource(&rec_explicit, true, true, false));
+    const rec_file = config_mod.JailConfig{ .name = "recidive", .filter = "recidive", .source = .file };
+    try testing.expectEqual(journald_source_mod.ResolvedSource.file, resolveJailSource(&rec_file, false, true, false));
+    const sshd = config_mod.JailConfig{ .name = "sshd", .filter = "sshd" };
+    try testing.expectEqual(journald_source_mod.ResolvedSource.journald, resolveJailSource(&sshd, false, true, true));
+    try testing.expectEqual(journald_source_mod.ResolvedSource.file, resolveJailSource(&sshd, false, false, true));
+}
+
+const RecidiveRig = struct {
+    trackers: tracker_map_mod.TrackerMap,
+    metrics: metrics_mod.Metrics,
+    backend: firewall.Backend,
+    feed: InternalFeed,
+    spy: BanSpy = .{},
+    sshd: JailContext = undefined,
+    nginx: JailContext = undefined,
+    recidive: JailContext = undefined,
+
+    fn init(self: *RecidiveRig, a: std.mem.Allocator, sshd_action: config_mod.BanAction) !void {
+        self.trackers = tracker_map_mod.TrackerMap.init(a);
+        self.metrics = metrics_mod.Metrics.init();
+        self.backend = .{ .iptables = firewall.iptables.IptablesBackend{} };
+        self.feed = InternalFeed.init(a);
+        self.spy = .{};
+        const src_cfg: state_mod.Config = .{ .max_entries = 16, .maxretry = 1, .findtime = 600, .bantime = 600 };
+        const sshd_t = try self.trackers.addTracker("sshd", src_cfg);
+        const nginx_t = try self.trackers.addTracker("nginx", src_cfg);
+        const rec_t = try self.trackers.addTracker("recidive", .{ .max_entries = 16, .maxretry = 2, .findtime = 86_400, .bantime = 604_800 });
+        for ([_][]const u8{ "sshd", "nginx", "recidive" }) |n| _ = self.metrics.registerJail(n);
+        self.sshd = makeDispatchTestCtx(try shared.JailId.fromSlice("sshd"), sshd_t, &self.backend, &self.metrics, &self.spy, sshd_action);
+        self.nginx = makeDispatchTestCtx(try shared.JailId.fromSlice("nginx"), nginx_t, &self.backend, &self.metrics, &self.spy, .nftables);
+        self.recidive = makeDispatchTestCtx(try shared.JailId.fromSlice("recidive"), rec_t, &self.backend, &self.metrics, &self.spy, .nftables);
+        self.recidive.is_internal = true;
+        try self.feed.sinks.append(&self.recidive);
+        self.sshd.feed = &self.feed;
+        self.nginx.feed = &self.feed;
+    }
+
+    fn deinit(self: *RecidiveRig) void {
+        self.feed.deinit();
+        self.trackers.deinit();
+    }
+};
+
+fn banIn(ctx: *JailContext, ip: shared.IpAddress, ts: shared.Timestamp) !void {
+    const d = (try ctx.state.recordAttempt(ip, ctx.jail, ts)).?;
+    dispatchBan(ctx, d);
+}
+
+test "recidive: confirmed bans across jails within findtime escalate to a recidive ban with the longer bantime (ENH-005)" {
+    const a = testing.allocator;
+    var rig: RecidiveRig = undefined;
+    try rig.init(a, .nftables);
+    defer rig.deinit();
+    const ip = try shared.IpAddress.parse("203.0.113.30");
+
+    try banIn(&rig.sshd, ip, 1_000);
+    try testing.expectEqual(@as(u32, 1), rig.spy.calls);
+    try testing.expectEqual(@as(u64, 1), rig.recidive.internal_events);
+    try testing.expect(!rig.recidive.state.get(ip).?.isBanned());
+
+    try banIn(&rig.nginx, ip, 1_100);
+    try testing.expectEqual(@as(u32, 3), rig.spy.calls);
+    const rec = rig.recidive.state.get(ip).?;
+    try testing.expect(rec.isBanned());
+    try testing.expect(rec.enforced);
+    try testing.expectEqual(@as(?shared.Timestamp, rig.recidive.state.get(ip).?.last_attempt + 604_800), rec.ban_expiry);
+    try testing.expectEqual(@as(u64, 2), rig.recidive.internal_events);
+
+    const h = rig.feed.healthFor("recidive").?;
+    try testing.expect(h.healthy);
+    try testing.expectEqual(@as(u64, 2), h.lines_seen);
+    try testing.expect(rig.feed.healthFor("sshd") == null);
+}
+
+test "recidive: would-bans, failed bans and the recidive jail's own bans never feed the sink (ENH-005)" {
+    const a = testing.allocator;
+    const ip = try shared.IpAddress.parse("203.0.113.31");
+    {
+        var rig: RecidiveRig = undefined;
+        try rig.init(a, .@"log-only");
+        defer rig.deinit();
+        try banIn(&rig.sshd, ip, 1_000);
+        try testing.expectEqual(@as(u32, 0), rig.spy.calls);
+        try testing.expectEqual(@as(u64, 0), rig.recidive.internal_events);
+    }
+    {
+        var rig: RecidiveRig = undefined;
+        try rig.init(a, .nftables);
+        defer rig.deinit();
+        rig.sshd.ban_hook = FailingBan.ban;
+        try banIn(&rig.sshd, ip, 1_000);
+        try testing.expectEqual(@as(u64, 0), rig.recidive.internal_events);
+    }
+    {
+        var rig: RecidiveRig = undefined;
+        try rig.init(a, .nftables);
+        defer rig.deinit();
+        rig.recidive.feed = &rig.feed;
+        try banIn(&rig.sshd, ip, 1_000);
+        try banIn(&rig.nginx, ip, 1_100);
+        try testing.expectEqual(@as(u64, 2), rig.recidive.internal_events);
+        try testing.expect(rig.recidive.state.get(ip).?.isBanned());
+    }
+}
+
+const FailingBan = struct {
+    fn ban(userdata: ?*anyopaque, ip: shared.IpAddress, jail: shared.JailId, duration: shared.Duration) firewall.BackendError!void {
+        _ = userdata;
+        _ = ip;
+        _ = jail;
+        _ = duration;
+        return error.SystemError;
+    }
+};
+
+const UnbanSpy = struct {
+    calls: u32 = 0,
+    last_ip: ?shared.IpAddress = null,
+
+    fn unban(userdata: ?*anyopaque, ip: shared.IpAddress, jail: shared.JailId) firewall.BackendError!void {
+        _ = jail;
+        const self: *UnbanSpy = @ptrCast(@alignCast(userdata.?));
+        self.calls += 1;
+        self.last_ip = ip;
+    }
+};
+
+test "expiry: sweep unbans only enforced entries; an expired would-ban is cleared without touching the backend (BUG-012)" {
+    const a = testing.allocator;
+    var trackers = tracker_map_mod.TrackerMap.init(a);
+    defer trackers.deinit();
+    const sshd = try trackers.addTracker("sshd", .{ .max_entries = 16, .maxretry = 1, .findtime = 600, .bantime = 1 });
+    const audit = try trackers.addTracker("audit", .{ .max_entries = 16, .maxretry = 1, .findtime = 600, .bantime = 1 });
+
+    const long_ago: shared.Timestamp = std.time.timestamp() - 3600;
+    const real = try shared.IpAddress.parse("203.0.113.20");
+    const would = try shared.IpAddress.parse("203.0.113.21");
+    try testing.expect((try sshd.recordAttempt(real, try shared.JailId.fromSlice("sshd"), long_ago)) != null);
+    sshd.markEnforced(real);
+    try testing.expect((try audit.recordAttempt(would, try shared.JailId.fromSlice("audit"), long_ago)) != null);
+
+    var metrics = metrics_mod.Metrics.init();
+    _ = metrics.registerJail("sshd");
+    _ = metrics.registerJail("audit");
+    var spy: UnbanSpy = .{};
+    var ctx = ExpiryContext{
+        .trackers = &trackers,
+        .backend_ptr = null,
+        .metrics = &metrics,
+        .unban_hook = UnbanSpy.unban,
+        .unban_hook_ctx = @ptrCast(&spy),
+    };
+    expirySweep(1, @ptrCast(&ctx));
+
+    try testing.expectEqual(@as(u32, 1), spy.calls);
+    try testing.expectEqual(real.ipv4, spy.last_ip.?.ipv4);
+    try testing.expectEqual(shared.BanState.expired, sshd.get(real).?.ban_state);
+    try testing.expectEqual(shared.BanState.expired, audit.get(would).?.ban_state);
+    try testing.expectEqual(@as(u64, 2), metrics.snapshot().unbans_total);
 }
 
 test "dispatch: enforcing jail (nftables) DOES call the backend ban path" {
@@ -2264,6 +2634,119 @@ test "metrics: SYS-017 protection_active + per-jail gauges render with jail labe
     try testing.expect(std.mem.indexOf(u8, body, "fail2zig_jail_lines_seen_total{jail=\"sshd\"} 0") != null);
 }
 
+test "metrics: fail2zig_protection_state label is degraded and jail_enforcing 0 when no backend is usable (SYS-014)" {
+    const a = testing.allocator;
+    var trackers = tracker_map_mod.TrackerMap.init(a);
+    defer trackers.deinit();
+    var metrics = metrics_mod.Metrics.init();
+    var jails = [_]config_mod.JailConfig{
+        .{ .name = "sshd", .enabled = true, .banaction = .nftables },
+    };
+    var cfg = config_mod.Config{ .global = .{}, .defaults = .{ .banaction = .nftables }, .jails = &jails, .diag = .{} };
+    var cmd_ctx: commands_mod.Context = .{
+        .trackers = &trackers,
+        .config = &cfg,
+        .backend = null,
+        .firewall_state = .{ .unavailable = .{ .detect = error.PermissionDenied } },
+        .stats_source = .{ .ctx = @ptrCast(&metrics), .snapshot = metricsStatsSnapshot },
+    };
+    var http_ctx: HttpSources = .{ .metrics = &metrics, .cmd_ctx = &cmd_ctx, .trackers = &trackers };
+
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    defer out.deinit(a);
+    try writeMetricsPayload(@ptrCast(&http_ctx), &out, a);
+    const body = out.items;
+    try testing.expect(std.mem.indexOf(u8, body, "# TYPE fail2zig_protection_state gauge") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "fail2zig_protection_state{state=\"degraded\"} 1") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "fail2zig_protection_state{state=\"active\"} 0") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "fail2zig_protection_state{state=\"log-only\"} 0") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "fail2zig_protection_state{state=\"mixed\"} 0") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "fail2zig_protection_active 0") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "fail2zig_jail_enforcing{jail=\"sshd\"} 0") != null);
+
+    var status: std.ArrayListUnmanaged(u8) = .{};
+    defer status.deinit(a);
+    try writeStatusPayload(@ptrCast(&http_ctx), &status, a);
+    try testing.expect(std.mem.indexOf(u8, status.items, "\"protection\":\"degraded\"") != null);
+    try testing.expect(std.mem.indexOf(u8, status.items, "\"protection_cause\":\"PermissionDenied\"") != null);
+}
+
+test "metrics: all-log-only config skips the backend and reports protection_state log-only (ENH-006)" {
+    const a = testing.allocator;
+    var trackers = tracker_map_mod.TrackerMap.init(a);
+    defer trackers.deinit();
+    var metrics = metrics_mod.Metrics.init();
+    var jails = [_]config_mod.JailConfig{
+        .{ .name = "sshd", .enabled = true, .banaction = .@"log-only" },
+    };
+    var cfg = config_mod.Config{ .global = .{}, .defaults = .{ .banaction = .nftables }, .jails = &jails, .diag = .{} };
+    try testing.expect(!commands_mod.firewallNeeded(&cfg));
+    var cmd_ctx: commands_mod.Context = .{
+        .trackers = &trackers,
+        .config = &cfg,
+        .backend = null,
+        .firewall_state = .not_needed,
+        .stats_source = .{ .ctx = @ptrCast(&metrics), .snapshot = metricsStatsSnapshot },
+    };
+    var http_ctx: HttpSources = .{ .metrics = &metrics, .cmd_ctx = &cmd_ctx, .trackers = &trackers };
+
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    defer out.deinit(a);
+    try writeMetricsPayload(@ptrCast(&http_ctx), &out, a);
+    try testing.expect(std.mem.indexOf(u8, out.items, "fail2zig_protection_state{state=\"log-only\"} 1") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "fail2zig_protection_state{state=\"degraded\"} 0") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "fail2zig_jail_enforcing{jail=\"sshd\"} 0") != null);
+}
+
+test "metrics: a ready backend keeps protection_state active with the other series 0 (SYS-014)" {
+    const a = testing.allocator;
+    var trackers = tracker_map_mod.TrackerMap.init(a);
+    defer trackers.deinit();
+    var metrics = metrics_mod.Metrics.init();
+    var jails = [_]config_mod.JailConfig{
+        .{ .name = "sshd", .enabled = true, .banaction = .nftables },
+    };
+    var cfg = config_mod.Config{ .global = .{}, .defaults = .{ .banaction = .nftables }, .jails = &jails, .diag = .{} };
+    var backend_val: firewall.Backend = .{ .nftables = firewall.nftables.NftablesBackend{} };
+    defer backend_val.deinit();
+    var cmd_ctx: commands_mod.Context = .{
+        .trackers = &trackers,
+        .config = &cfg,
+        .backend = &backend_val,
+        .stats_source = .{ .ctx = @ptrCast(&metrics), .snapshot = metricsStatsSnapshot },
+    };
+    var http_ctx: HttpSources = .{ .metrics = &metrics, .cmd_ctx = &cmd_ctx, .trackers = &trackers };
+
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    defer out.deinit(a);
+    try writeMetricsPayload(@ptrCast(&http_ctx), &out, a);
+    try testing.expect(std.mem.indexOf(u8, out.items, "fail2zig_protection_state{state=\"active\"} 1") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "fail2zig_protection_state{state=\"degraded\"} 0") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "fail2zig_jail_enforcing{jail=\"sshd\"} 1") != null);
+}
+
+test "dispatch: degraded (no backend) jail resolves to log-only — would-ban counts, backend never touched (SYS-014)" {
+    const a = testing.allocator;
+    var tracker = try state_mod.StateTracker.init(a, .{ .findtime = 600, .maxretry = 1, .bantime = 600 });
+    defer tracker.deinit();
+    var metrics = metrics_mod.Metrics.init();
+    _ = metrics.registerJail("sshd");
+    const fw: commands_mod.FirewallState = .{ .unavailable = .{ .detect = error.KernelUnsupported } };
+    var ctx = JailContext{
+        .jail = try shared.JailId.fromSlice("sshd"),
+        .matcher = filter_registry_mod.matcherForFilter("sshd").?,
+        .state = &tracker,
+        .backend_ptr = null,
+        .banaction = fw.effectiveAction(.nftables),
+        .metrics = &metrics,
+    };
+    try testing.expectEqual(config_mod.BanAction.@"log-only", ctx.banaction);
+    const ip = try shared.IpAddress.parse("203.0.113.44");
+    dispatchBan(&ctx, .{ .ip = ip, .jail = ctx.jail, .duration = 600, .ban_count = 1 });
+    try testing.expectEqual(@as(u64, 1), metrics.snapshot().bans_total);
+    try testing.expectEqual(@as(u64, 1), tracker.lifetime_bans);
+}
+
 test "JailSourceDescriptors: records KIND-truthful resolved descriptors (SYS-017)" {
     const a = testing.allocator;
     var d = JailSourceDescriptors.init(a);
@@ -2273,7 +2756,9 @@ test "JailSourceDescriptors: records KIND-truthful resolved descriptors (SYS-017
     try d.putFile("nginx", &.{"/var/log/nginx/error.log"});
     try d.putFile("multi", &.{ "/var/log/a.log", "/var/log/b.log" });
     try d.putFile("weird", &.{});
+    try d.putInternal("recidive");
 
+    try testing.expectEqualStrings("internal", JailSourceDescriptors.lookup(@ptrCast(&d), "recidive").?);
     try testing.expectEqualStrings("journald (sshd)", JailSourceDescriptors.lookup(@ptrCast(&d), "sshd").?);
     try testing.expectEqualStrings("/var/log/nginx/error.log", JailSourceDescriptors.lookup(@ptrCast(&d), "nginx").?);
     try testing.expectEqualStrings("/var/log/a.log, /var/log/b.log", JailSourceDescriptors.lookup(@ptrCast(&d), "multi").?);
