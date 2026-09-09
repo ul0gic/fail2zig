@@ -1,14 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Built-in Apache filters.
-//!
-//! Three filter sets mirror fail2ban's apache-* family:
-//!   * `apache_auth`       — 401 basic-auth failures, bad credentials
-//!   * `apache_badbots`    — well-known scraping / scanning user-agents
-//!   * `apache_overflows`  — invalid URI / oversized request attacks
-//!
-//! Apache error-log shape:
-//!   `[Tue Apr 21 12:00:00.000 2026] [authz_core:error] [pid 1:tid 2] [client <IP>:PORT] msg`
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -16,26 +7,21 @@ const parser = @import("../core/parser.zig");
 
 pub const PatternDef = types.PatternDef;
 
-/// `apache-auth` — authentication failures.
 pub const auth_patterns = [_]PatternDef{
-    // [client 1.2.3.4] user x: authentication failure
     .{
         .name = "auth-failure",
         .match = parser.compile("<*>[client <IP>:<*>] user <*>authentication failure"),
     },
-    // [client 1.2.3.4] user x not found
     .{
         .name = "user-not-found",
         .match = parser.compile("<*>[client <IP>:<*>] user <*>not found"),
     },
-    // [client 1.2.3.4] AH01617: user x: password mismatch
     .{
         .name = "password-mismatch",
         .match = parser.compile("<*>[client <IP>:<*>] <*>password mismatch"),
     },
 };
 
-/// `apache-badbots` — known abusive user-agents (access log).
 pub const badbots_patterns = [_]PatternDef{
     .{
         .name = "ahrefs",
@@ -53,7 +39,6 @@ pub const badbots_patterns = [_]PatternDef{
         .name = "dot",
         .match = parser.compile("<IP> <*>DotBot"),
     },
-    // Bots probing wp-login / xmlrpc (access log 404).
     .{
         .name = "wp-login-404",
         .match = parser.compile("<IP> <*>wp-login"),
@@ -64,7 +49,6 @@ pub const badbots_patterns = [_]PatternDef{
     },
 };
 
-/// `apache-overflows` — malformed / oversized requests (error log).
 pub const overflows_patterns = [_]PatternDef{
     .{
         .name = "invalid-uri",
@@ -79,10 +63,6 @@ pub const overflows_patterns = [_]PatternDef{
         .match = parser.compile("<*>[client <IP>:<*>] request failed: error reading the headers"),
     },
 };
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 const testing = std.testing;
 

@@ -1,18 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Built-in `sshd` filter.
-//!
-//! The single most important fail2ban filter — covers roughly 80% of
-//! real-world fail2ban installs. Patterns are sourced from the current
-//! fail2ban `filter.d/sshd.conf` and cross-checked against OpenSSH log
-//! output across the 7.x / 8.x / 9.x line.
-//!
-//! All patterns are compiled at comptime via `parser.compile`. There is
-//! no runtime regex engine — a successful match is pure slice arithmetic.
-//!
-//! The fail2zig DSL tokens used below:
-//!   `<IP>` — required on every pattern, populates `ParseResult.ip`.
-//!   `<*>`  — wildcard (non-greedy-until-next-literal).
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -20,8 +7,6 @@ const parser = @import("../core/parser.zig");
 
 pub const PatternDef = types.PatternDef;
 
-/// sshd failregex patterns. Ordered so the most common (Failed password)
-/// is tested first — the matcher short-circuits on the first match.
 pub const patterns = [_]PatternDef{
     .{
         .name = "failed-password",
@@ -48,13 +33,7 @@ pub const patterns = [_]PatternDef{
         .match = parser.compile("error: PAM: Authentication failure for <*> from <IP>"),
     },
     .{
-        // CRITICAL: require the `[preauth]` suffix. OpenSSH writes
-        // `Received disconnect from <IP> port ...` on EVERY SSH
-        // disconnect, including normal operator logouts. Matching the
-        // bare form false-positives on legitimate sessions and bans
-        // the operator's own IP. fail2ban upstream only enables this
-        // pattern in `aggressive` mode for exactly this reason.
-        // Regression: SYS-011, operator self-ban 2026-04-22.
+        // [preauth] required: the bare form matches normal operator logouts (self-ban).
         .name = "received-disconnect-preauth",
         .match = parser.compile("Received disconnect from <IP> <*>[preauth]"),
     },
@@ -62,20 +41,14 @@ pub const patterns = [_]PatternDef{
         .name = "bad-protocol",
         .match = parser.compile("Bad protocol version identification <*> from <IP>"),
     },
-    // OpenSSH 8+ emits a distinct "maximum authentication attempts" line.
     .{
         .name = "max-auth-attempts",
         .match = parser.compile("maximum authentication attempts exceeded for <*> from <IP>"),
     },
 };
 
-// ============================================================================
-// Tests — each pattern gets >=3 positive and >=2 negative cases.
-// ============================================================================
-
 const testing = std.testing;
 
-/// Helper: find the first pattern in `patterns` that matches `line`.
 fn firstMatch(line: []const u8) ?usize {
     for (patterns, 0..) |p, i| {
         if (p.match(line)) |_| return i;
@@ -84,7 +57,6 @@ fn firstMatch(line: []const u8) ?usize {
 }
 
 test "sshd: Failed password (OpenSSH 7)" {
-    // Typical OpenSSH 7.x log line.
     try testing.expect(firstMatch("Failed password for root from 192.168.1.100 port 43210 ssh2") != null);
     try testing.expect(firstMatch("Failed password for admin from 10.0.0.1 port 22 ssh2") != null);
     try testing.expect(firstMatch("Failed password for ubuntu from 203.0.113.55 port 1234 ssh2") != null);
@@ -148,15 +120,10 @@ test "sshd: negative — no IP present must NOT match" {
 }
 
 test "sshd: received-disconnect requires [preauth] (SYS-011 regression)" {
-    // Positive: attacker pre-auth disconnect — the [preauth] suffix is
-    // the signal that this IP never authenticated. These MUST match.
     try testing.expect(firstMatch("Received disconnect from 1.2.3.4 port 22:11: Bye Bye [preauth]") != null);
     try testing.expect(firstMatch("Received disconnect from 203.0.113.5 port 5555:11: disconnected by user [preauth]") != null);
     try testing.expect(firstMatch("Received disconnect from 2001:db8::1 port 22:11: Bye Bye [preauth]") != null);
 
-    // Negative: normal successful-session disconnects. OpenSSH writes
-    // this exact line on every clean logout; catching it self-bans the
-    // operator's own IP under even modest maxretry.
     try testing.expect(firstMatch("Received disconnect from 1.2.3.4 port 22:11: disconnected by user") == null);
     try testing.expect(firstMatch("Received disconnect from 192.168.1.1 port 2222: disconnected by server request") == null);
 }

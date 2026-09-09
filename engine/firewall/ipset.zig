@@ -1,22 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! ipset backend — ipset sets + one iptables jump rule per jail.
-//!
-//! Why this exists: `iptables -s <ip> -j DROP` rules are O(n) per
-//! packet. For a jail with thousands of bans, that destroys CPU.
-//! ipset stores the ban list in a kernel hash set, and a single
-//! iptables rule (`-m set --match-set`) does O(1) lookup against
-//! it. It's the right backend for the iptables era.
-//!
-//! Architecture:
-//!   - `ipset create fail2zig-<jail> hash:ip timeout <bantime> maxelem 65536`
-//!   - `iptables -I INPUT -m set --match-set fail2zig-<jail> src -j DROP`
-//!
-//! Bans/unbans go to `ipset`, which is the hot path; the iptables
-//! rule is installed exactly once per jail at `init()` time and
-//! torn down on `deinit()` if the config says so.
-//!
-//! Tests assert argv construction + list parsing without executing.
 
 const std = @import("std");
 const mem = std.mem;
@@ -24,13 +7,9 @@ const shared = @import("shared");
 const backend = @import("backend.zig");
 const iptables = @import("iptables.zig");
 
-/// Per-operation argv builder for `ipset`.
 pub const CommandBuilder = struct {
     set_name: []const u8,
 
-    /// `ipset create <set> hash:ip timeout <t> maxelem 65536`.
-    /// `timeout_str` and `maxelem_str` are caller-owned buffers so
-    /// argv stays a flat `[][]const u8`.
     pub fn createSet(
         self: CommandBuilder,
         argv: *[9][]const u8,
@@ -45,11 +24,10 @@ pub const CommandBuilder = struct {
         argv[5] = timeout_str;
         argv[6] = "maxelem";
         argv[7] = maxelem_str;
-        argv[8] = "-exist"; // idempotent — don't fail if set exists
+        argv[8] = "-exist";
         return argv[0..9];
     }
 
-    /// `ipset destroy <set>`.
     pub fn destroySet(self: CommandBuilder, argv: *[3][]const u8) [][]const u8 {
         argv[0] = "ipset";
         argv[1] = "destroy";
@@ -57,8 +35,6 @@ pub const CommandBuilder = struct {
         return argv[0..3];
     }
 
-    /// `ipset add <set> <ip> timeout <t>`. `timeout_str` can be
-    /// an empty slice to omit the timeout tail.
     pub fn addEntry(
         self: CommandBuilder,
         argv: *[7][]const u8,
@@ -79,7 +55,6 @@ pub const CommandBuilder = struct {
         return argv[0..7];
     }
 
-    /// `ipset del <set> <ip>`.
     pub fn delEntry(
         self: CommandBuilder,
         argv: *[5][]const u8,
@@ -93,7 +68,6 @@ pub const CommandBuilder = struct {
         return argv[0..5];
     }
 
-    /// `ipset flush <set>`.
     pub fn flushSet(self: CommandBuilder, argv: *[3][]const u8) [][]const u8 {
         argv[0] = "ipset";
         argv[1] = "flush";
@@ -101,7 +75,6 @@ pub const CommandBuilder = struct {
         return argv[0..3];
     }
 
-    /// `ipset list <set>`.
     pub fn listSet(self: CommandBuilder, argv: *[3][]const u8) [][]const u8 {
         argv[0] = "ipset";
         argv[1] = "list";
@@ -109,7 +82,6 @@ pub const CommandBuilder = struct {
         return argv[0..3];
     }
 
-    /// `iptables -I INPUT -m set --match-set <set> src -j DROP`.
     pub fn installMatchRule(
         self: CommandBuilder,
         argv: *[10][]const u8,
@@ -128,7 +100,6 @@ pub const CommandBuilder = struct {
         return argv[0..10];
     }
 
-    /// `iptables -D INPUT -m set --match-set <set> src -j DROP`.
     pub fn removeMatchRule(
         self: CommandBuilder,
         argv: *[10][]const u8,
@@ -148,21 +119,6 @@ pub const CommandBuilder = struct {
     }
 };
 
-/// Parse `ipset list <set>` output. Member lines look like:
-///
-///     Name: fail2zig-sshd
-///     Type: hash:ip
-///     Revision: 6
-///     Header: family inet hashsize 1024 maxelem 65536 timeout 600
-///     Size in memory: 408
-///     References: 1
-///     Number of entries: 2
-///     Members:
-///     1.2.3.4 timeout 589
-///     5.6.7.8 timeout 122
-///
-/// We scan until the `Members:` header, then treat each subsequent
-/// non-empty line's first token as an IP.
 pub fn parseListOutput(
     allocator: std.mem.Allocator,
     stdout: []const u8,
@@ -186,7 +142,6 @@ pub fn parseListOutput(
     return list.toOwnedSlice();
 }
 
-/// Compose the set name: `<prefix>-<jail>`.
 pub fn setName(
     buf: []u8,
     prefix: []const u8,
@@ -194,10 +149,6 @@ pub fn setName(
 ) error{BufferTooSmall}![]const u8 {
     return iptables.chainName(buf, prefix, jail);
 }
-
-// ===========================================================================
-// Backend state + vtable wiring
-// ===========================================================================
 
 pub const IpsetBackend = struct {
     allocator: ?std.mem.Allocator = null,
@@ -251,7 +202,6 @@ fn initImpl(
     self.allocator = allocator;
     self.config = config;
     self.initialized = true;
-    // Set creation deferred until Phase 4 ban lifecycle wire-up.
 }
 
 fn deinitImpl(ctx: *anyopaque) void {
@@ -386,10 +336,6 @@ fn isAvailableImpl(ctx: *anyopaque) bool {
     _ = ctx;
     return probeAvailable();
 }
-
-// ===========================================================================
-// Tests
-// ===========================================================================
 
 test "ipset: CommandBuilder.createSet emits hash:ip + timeout + maxelem" {
     const cb: CommandBuilder = .{ .set_name = "fail2zig-sshd" };

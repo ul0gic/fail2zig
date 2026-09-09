@@ -1,41 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Native TOML config parser for fail2zig.
-//!
-//! This is NOT a full TOML implementation — it is a strict subset
-//! sufficient for fail2zig's own configuration file. Features we
-//! support:
-//!
-//!   * Comments: lines starting with `#` (after optional whitespace).
-//!     Trailing `#` comments on value lines.
-//!   * Tables: `[section]` and `[section.subsection]` (nested).
-//!     Nested tables form a path; we use this for `[jails.sshd]`.
-//!   * Keys: bare `key = value`, ASCII alnum + `_` + `-`.
-//!   * Strings: `"quoted"`, with `\"` and `\\` escapes. Slices into
-//!     the source buffer — no alloc for the string value itself.
-//!   * Integers: decimal `42`, with optional leading `-`.
-//!   * Booleans: `true` / `false`.
-//!   * Arrays: inline `[a, b, c]`. Members must be same-kind (strings
-//!     or integers). Trailing commas tolerated.
-//!
-//! Features we deliberately do NOT support:
-//!
-//!   * Multiline strings, literal `'...'` strings, heredocs.
-//!   * Float, datetime, hex / octal / binary integers.
-//!   * Inline tables `{ a = 1 }`, array-of-tables `[[x]]`.
-//!   * Dotted keys on the LHS (`a.b = 1`).
-//!
-//! Parser contract: returns errors with line + column context. The
-//! entire parse uses a caller-provided arena allocator; on error the
-//! arena is dropped by the caller. String values are slices into the
-//! original source buffer, which the caller must keep alive.
 
 const std = @import("std");
 const shared = @import("shared");
-
-// ============================================================================
-// Public error set
-// ============================================================================
 
 pub const Error = error{
     FileNotFound,
@@ -63,29 +30,10 @@ pub const Diagnostic = struct {
     message: []const u8 = "",
 };
 
-// ============================================================================
-// Schema types
-// ============================================================================
-
 pub const LogLevel = enum { debug, info, warn, err };
 
 pub const BanAction = enum { nftables, iptables, ipset, @"log-only" };
 
-/// Where a jail reads its log lines from (SYS-015).
-///   * `auto`     — resolve at startup, EXISTENCE-based (SYS-015 reopened):
-///                  a configured `logpath` that exists on disk wins (file
-///                  tailer); otherwise, if the jail's filter is
-///                  journald-supported and `journalctl` is present, read the
-///                  systemd journal; otherwise fall back to the file tailer
-///                  (which tolerates a late-appearing path). `auto` NEVER
-///                  fails closed.
-///   * `file`     — always the inotify file tailer over `logpath`.
-///   * `journald` — always the journald subprocess poller. Requires
-///                  `journalctl`; fails closed if absent.
-/// Default `.auto` keeps every existing config working: a jail whose
-/// `logpath` exists resolves to `file`, and a journald-only box (modern
-/// Debian/systemd, no /var/log/auth.log) resolves its sshd jail to
-/// `journald` because the configured auth.log/secure paths are absent.
 pub const LogSource = enum { auto, file, journald };
 
 pub const BantimeFormula = enum { linear, exponential };
@@ -95,39 +43,20 @@ pub const BanTimeIncrement = struct {
     multiplier: f64 = 1.0,
     factor: f64 = 1.0,
     formula: BantimeFormula = .linear,
-    max_bantime: shared.Duration = 86_400 * 7, // 1 week cap
+    max_bantime: shared.Duration = 86_400 * 7,
 };
 
 pub const GlobalConfig = struct {
     log_level: LogLevel = .info,
     pid_file: []const u8 = "/run/fail2zig/fail2zig.pid",
-    /// Unix domain socket for fail2zig-client. The daemon creates the
-    /// parent directory (mode 0710) on startup if missing. Matches the
-    /// client's `--socket` default and fail2ban convention of placing
-    /// runtime files under a dedicated `/run/<pkg>/` directory.
     socket_path: []const u8 = "/run/fail2zig/fail2zig.sock",
     state_file: []const u8 = "/var/lib/fail2zig/state.bin",
     memory_ceiling_mb: u32 = 64,
-    /// HTTP metrics endpoint (Prometheus + /api/status). Localhost-only
-    /// by default — exposing this publicly leaks operational telemetry.
     metrics_bind: []const u8 = "127.0.0.1",
-    /// Prometheus node_exporter convention is port 9100. Operators who
-    /// run both fail2zig and node_exporter on the same host should
-    /// override one of them.
     metrics_port: u16 = 9100,
-    /// Maximum simultaneous WebSocket clients on `/events`. Default is
-    /// operator-friendly (small trusted set of dashboards / curl users).
-    /// The honeypot demo config sets this to 128. Hard-capped at 1024 by
-    /// the validator; zero is rejected. Surface-level knob — each client
-    /// holds a small per-connection buffer, so growing this affects heap
-    /// footprint but not the hot parse path.
     websocket_max_clients: u32 = 16,
 };
 
-/// Absolute upper bound on `websocket_max_clients`. Kept in sync with
-/// `engine/net/ws.zig::hard_max_clients`; defined here so the config
-/// layer can enforce the bound without importing the ws module (and
-/// thus avoiding a circular dependency through main.zig).
 pub const websocket_hard_max_clients: u32 = 1024;
 
 pub const JailDefaults = struct {
@@ -136,12 +65,6 @@ pub const JailDefaults = struct {
     maxretry: u32 = 5,
     banaction: BanAction = .nftables,
     ignoreip: []const []const u8 = &.{},
-    /// Recidive escalation policy (SYS-008). The state tracker is
-    /// currently global (single-tracker for all jails), so the
-    /// per-jail `bantime_increment` field on `JailConfig` is parsed
-    /// but not wired through. For v0.1.0 this defaults-level setting
-    /// is the one that takes effect. Per-jail overrides become
-    /// meaningful once the tracker goes per-jail in Phase 2.
     bantime_increment: BanTimeIncrement = .{},
 };
 
@@ -149,11 +72,6 @@ pub const JailConfig = struct {
     name: []const u8,
     enabled: bool = true,
     logpath: []const []const u8 = &.{},
-    /// Log source backend for this jail (SYS-015). Defaults to `.auto`,
-    /// which resolves to the file tailer when a usable `logpath` is
-    /// configured and to the journald poller otherwise. See `LogSource`.
-    /// v1 has no per-jail `journalmatch` override — the journald selector
-    /// set is fixed per filter (see engine/core/journald_source.zig).
     source: LogSource = .auto,
     filter: []const u8 = "",
     maxretry: ?u32 = null,
@@ -161,18 +79,9 @@ pub const JailConfig = struct {
     bantime: ?shared.Duration = null,
     banaction: ?BanAction = null,
     ignoreip: ?[]const []const u8 = null,
-    /// Per-jail bantime-increment overrides. ISSUE-007 wired this into
-    /// the per-jail tracker — `ResolvedJailConfig.bantime_increment`
-    /// falls back to the defaults block only when this struct is
-    /// equal-by-value to its own default (i.e. operator never touched it).
     bantime_increment: BanTimeIncrement = .{},
-    /// Sentinel: true when the parser set `bantime_increment` (any
-    /// `bantime_increment_*` key seen under this jail). Lets us
-    /// distinguish "operator left it alone -> inherit defaults" from
-    /// "operator explicitly set it to the default-shaped values".
     bantime_increment_explicit: bool = false,
 
-    /// Resolved values after `applyDefaults` merges with `JailDefaults`.
     pub fn effectiveBantime(self: *const JailConfig, def: JailDefaults) shared.Duration {
         return self.bantime orelse def.bantime;
     }
@@ -187,10 +96,6 @@ pub const JailConfig = struct {
     }
 };
 
-/// Fully-resolved per-jail thresholds. Built by `resolveJail` — the
-/// single place where the "jail value if set, else default" rule lives.
-/// Downstream code (state tracker construction, IPC `list-jails`) reads
-/// from here so the rule isn't reimplemented at every call site.
 pub const ResolvedJailConfig = struct {
     name: []const u8,
     enabled: bool,
@@ -201,11 +106,6 @@ pub const ResolvedJailConfig = struct {
     bantime_increment: BanTimeIncrement,
 };
 
-/// Resolve a jail's effective configuration. Per-jail overrides win;
-/// unset fields fall back to `cfg.defaults`. The `bantime_increment`
-/// block is treated atomically — if the operator set any of its keys
-/// under the jail, the entire block is used; otherwise the defaults
-/// block applies.
 pub fn resolveJail(cfg: *const Config, jail_name: []const u8) ?ResolvedJailConfig {
     for (cfg.jails) |*j| {
         if (std.mem.eql(u8, j.name, jail_name)) {
@@ -215,8 +115,6 @@ pub fn resolveJail(cfg: *const Config, jail_name: []const u8) ?ResolvedJailConfi
     return null;
 }
 
-/// Same as `resolveJail` but takes a `*const JailConfig` directly. Useful
-/// when the caller is already iterating the jails slice.
 pub fn resolveJailFromConfig(j: *const JailConfig, defaults: JailDefaults) ResolvedJailConfig {
     return .{
         .name = j.name,
@@ -238,8 +136,6 @@ pub const Config = struct {
     jails: []JailConfig = &.{},
     diag: Diagnostic = .{},
 
-    /// Load config from a file. The `arena` must outlive the returned
-    /// Config — all string slices and the jails array live in `arena`.
     pub fn loadFile(arena: std.mem.Allocator, path: []const u8) Error!Config {
         const file = std.fs.cwd().openFile(path, .{}) catch |err| return switch (err) {
             error.FileNotFound => error.FileNotFound,
@@ -248,7 +144,7 @@ pub const Config = struct {
         };
         defer file.close();
 
-        const max_size: usize = 1024 * 1024; // 1 MB — config files never approach this
+        const max_size: usize = 1024 * 1024;
         const bytes = file.readToEndAlloc(arena, max_size) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.ReadFailed,
@@ -256,22 +152,15 @@ pub const Config = struct {
         return parse(arena, bytes);
     }
 
-    /// Parse config from an in-memory slice. The slice must outlive the
-    /// returned Config — string values are zero-copy slices into it.
     pub fn parse(arena: std.mem.Allocator, source: []const u8) Error!Config {
         var p = Parser.init(arena, source);
         return p.parseConfig();
     }
 
-    /// Convenience wrapper retained for API compatibility with the Phase 2 stub.
     pub fn load(allocator: std.mem.Allocator, path: []const u8) Error!Config {
         return loadFile(allocator, path);
     }
 };
-
-// ============================================================================
-// Validation
-// ============================================================================
 
 pub const ValidationError = error{
     InvalidBantime,
@@ -283,16 +172,7 @@ pub const ValidationError = error{
     DuplicateJailName,
 };
 
-/// Validate a parsed Config. Returns an error on hard problems (bantime=0,
-/// memory ceiling too low, duplicate jail names). Missing logpath files are
-/// logged as warnings via std.log — they are not fatal because a logpath
-/// can appear after fail2zig starts (log rotation, service startup).
 pub fn validate(cfg: *const Config) ValidationError!void {
-    // NOTE: validators return errors to the caller; we log at WARN (not
-    // ERR) so the test runner doesn't treat a purposefully-invalid
-    // validation case as a test failure. Callers observing the typed
-    // error value have full fidelity; the warn log is purely for the
-    // operator's console.
     if (cfg.global.memory_ceiling_mb < 16) {
         std.log.warn("config: memory_ceiling_mb={d} is below 16MB floor", .{cfg.global.memory_ceiling_mb});
         return error.MemoryCeilingTooLow;
@@ -310,14 +190,6 @@ pub fn validate(cfg: *const Config) ValidationError!void {
         return error.InvalidMaxretry;
     }
 
-    // Warn (don't fail) on a missing socket dir — like a logpath, the
-    // socket's parent directory (e.g. /run/fail2zig) legitimately appears
-    // at/after startup. systemd's RuntimeDirectory=fail2zig creates it, and
-    // the daemon itself creates it (mode 0710) via ensureSocketDir() before
-    // binding the socket. Standalone `--validate-config` runs before either
-    // of those, so a missing dir here is expected and must not be fatal.
-    // Startup still enforces reality: if the daemon cannot create or bind
-    // the socket dir, it fails at startup with a clear error.
     const sock_dir = std.fs.path.dirname(cfg.global.socket_path) orelse "/";
     if (sock_dir.len > 0) {
         std.fs.cwd().access(sock_dir, .{}) catch {
@@ -328,7 +200,6 @@ pub fn validate(cfg: *const Config) ValidationError!void {
     for (cfg.jails, 0..) |j, i| {
         if (j.name.len == 0) return error.EmptyJailName;
 
-        // Duplicate jail names within the config.
         var k: usize = i + 1;
         while (k < cfg.jails.len) : (k += 1) {
             if (std.mem.eql(u8, j.name, cfg.jails[k].name)) {
@@ -337,28 +208,16 @@ pub fn validate(cfg: *const Config) ValidationError!void {
             }
         }
 
-        // Per-jail overrides must be positive if set.
         if (j.bantime) |b| if (b == 0) return error.InvalidBantime;
         if (j.findtime) |f| if (f == 0) return error.InvalidFindtime;
         if (j.maxretry) |m| if (m == 0) return error.InvalidMaxretry;
 
-        // Warn (don't fail) on missing log paths — file may appear later.
         for (j.logpath) |lp| {
             std.fs.cwd().access(lp, .{}) catch {
                 std.log.warn("config: jail '{s}' logpath not found (may appear later): {s}", .{ j.name, lp });
             };
         }
 
-        // SYS-015: warn (don't fail) when a jail would read the journal but
-        // `journalctl` is not installed. Like a missing logpath, this is a
-        // warning here — `--validate-config` runs on operator laptops that
-        // may lack journalctl, and the real fail-closed happens at jail
-        // wiring time (runDaemon). The `auto` condition mirrors
-        // `journald_source.resolveSource` EXACTLY (SYS-015 reopened):
-        // existence-based, and gated on the filter actually being
-        // journald-supported, so an `auto` jail with an absent log but a
-        // non-journald filter (e.g. nginx) resolves to file and does NOT
-        // warn here.
         if (j.enabled) {
             const would_use_journald = switch (j.source) {
                 .journald => true,
@@ -373,18 +232,11 @@ pub fn validate(cfg: *const Config) ValidationError!void {
             }
         }
 
-        // Filter name is informational in Phase 3 — Phase 5 will check that
-        // it maps to a known comptime-compiled filter set. For now we only
-        // ensure it is non-empty.
         if (j.filter.len == 0 and j.enabled) {
             std.log.warn("config: jail '{s}' has no filter declared", .{j.name});
         }
     }
 }
-
-// ============================================================================
-// Parser state machine
-// ============================================================================
 
 const Parser = struct {
     arena: std.mem.Allocator,
@@ -393,11 +245,6 @@ const Parser = struct {
     line: u32,
     col: u32,
 
-    // Section tracking — the parser walks tables in order. Recognized
-    // top-level tables: "global", "defaults", "jails.<name>".
-    // Two key-sets in particular are accumulated separately: "global" and
-    // "defaults" go into their namesake structs; anything under
-    // "jails.<name>" becomes a JailConfig (created on first encounter).
     global: GlobalConfig,
     defaults: JailDefaults,
     jails: std.ArrayList(JailConfig),
@@ -421,8 +268,6 @@ const Parser = struct {
             .seen_keys = std.ArrayList([]const u8).init(arena),
         };
     }
-
-    // ------- Primitive scan helpers -------
 
     fn eof(self: *const Parser) bool {
         return self.pos >= self.src.len;
@@ -456,7 +301,6 @@ const Parser = struct {
     }
 
     fn skipTrailing(self: *Parser) void {
-        // Skip trailing whitespace and an optional `# ... \n` comment.
         self.skipSpaceTabs();
         if (!self.eof() and self.peek() == '#') {
             while (!self.eof() and self.peek() != '\n') self.advance();
@@ -481,8 +325,6 @@ const Parser = struct {
         }
     }
 
-    // ------- Top-level parse -------
-
     fn parseConfig(self: *Parser) Error!Config {
         var current_section: []const u8 = "";
         while (true) {
@@ -496,11 +338,10 @@ const Parser = struct {
                 continue;
             }
 
-            // key = value
             const key = try self.parseBareKey();
             self.skipSpaceTabs();
             if (self.eof() or self.peek() != '=') return error.UnexpectedToken;
-            self.advance(); // consume '='
+            self.advance();
             self.skipSpaceTabs();
 
             try self.dispatchKeyValue(current_section, key);
@@ -515,24 +356,18 @@ const Parser = struct {
         };
     }
 
-    // ------- Section header -------
-
     fn parseSectionHeader(self: *Parser) Error![]const u8 {
-        // Already at '['.
         if (self.peek() != '[') return error.UnexpectedToken;
         self.advance();
         const start = self.pos;
         while (!self.eof() and self.peek() != ']' and self.peek() != '\n') self.advance();
         if (self.eof() or self.peek() != ']') return error.UnexpectedToken;
         const name = self.src[start..self.pos];
-        self.advance(); // consume ']'
-        // Trim whitespace just in case `[ section ]`.
+        self.advance();
         const trimmed = std.mem.trim(u8, name, " \t");
         if (trimmed.len == 0) return error.UnexpectedToken;
         return trimmed;
     }
-
-    // ------- Bare key -------
 
     fn parseBareKey(self: *Parser) Error![]const u8 {
         const start = self.pos;
@@ -546,8 +381,6 @@ const Parser = struct {
         if (self.pos == start) return error.UnexpectedToken;
         return self.src[start..self.pos];
     }
-
-    // ------- Value parsing -------
 
     const Value = union(enum) {
         string: []const u8,
@@ -593,11 +426,10 @@ const Parser = struct {
             self.advance();
         }
         const end = self.pos;
-        self.advance(); // consume closing '"'
+        self.advance();
 
         if (!has_escape) return self.src[start..end];
 
-        // Process escapes into a new buffer allocated in the arena.
         var buf = std.ArrayList(u8).init(self.arena);
         errdefer buf.deinit();
         var i: usize = start;
@@ -648,12 +480,6 @@ const Parser = struct {
         return std.fmt.parseInt(i64, slice, 10) catch return error.InvalidInteger;
     }
 
-    /// Parse a numeric literal. Returns `.int` for integer literals (no
-    /// decimal point) and `.float` for literals containing a `.`. Used
-    /// for fields like `bantime_increment_factor` whose target type is
-    /// `f64` — operators expect to be able to write `factor = 1.5`.
-    /// The choice between int and float is made by the caller via
-    /// `asInt` / `asFloat` so int-only fields still reject `1.5`.
     fn parseNumber(self: *Parser) Error!Value {
         const start = self.pos;
         if (self.peek() == '-') self.advance();
@@ -669,7 +495,6 @@ const Parser = struct {
             const n = std.fmt.parseInt(i64, slice, 10) catch return error.InvalidInteger;
             return .{ .int = n };
         }
-        // Float path: consume '.' and at least one fractional digit.
         self.advance();
         const frac_start = self.pos;
         while (!self.eof()) {
@@ -697,7 +522,6 @@ const Parser = struct {
                 self.advance();
                 return try items.toOwnedSlice();
             }
-            // Must be a string (we only support string arrays).
             if (self.peek() != '"') return error.InvalidArray;
             const s = try self.parseString();
             try items.append(s);
@@ -727,10 +551,8 @@ const Parser = struct {
         }
     }
 
-    // ------- Section dispatch -------
-
     fn dispatchKeyValue(self: *Parser, section: []const u8, key: []const u8) Error!void {
-        if (section.len == 0) return error.UnexpectedToken; // top-level keys not allowed
+        if (section.len == 0) return error.UnexpectedToken;
         if (std.mem.eql(u8, section, TOP_GLOBAL)) {
             return self.applyGlobalKey(key);
         }
@@ -769,10 +591,6 @@ const Parser = struct {
             if (n < 0 or n > 65535) return error.InvalidValue;
             self.global.metrics_port = @intCast(n);
         } else if (std.mem.eql(u8, key, "websocket_max_clients")) {
-            // 9B.1.2: reject zero and anything past the hard cap at parse
-            // time. Zero would produce a WsServer that accepts no clients
-            // at all (silent breakage), and values past `hard_max_clients`
-            // open a heap-pressure vector via an allocatable slot table.
             const n = try asInt(v);
             if (n <= 0 or n > websocket_hard_max_clients) return error.InvalidValue;
             self.global.websocket_max_clients = @intCast(n);
@@ -883,10 +701,6 @@ const Parser = struct {
     }
 };
 
-// ============================================================================
-// Value coercion helpers
-// ============================================================================
-
 fn asString(v: Parser.Value) Error![]const u8 {
     return switch (v) {
         .string => |s| s,
@@ -901,9 +715,6 @@ fn asInt(v: Parser.Value) Error!i64 {
     };
 }
 
-/// Accept either a TOML integer or float literal and return f64. Used
-/// for fields whose schema type is `f64` (e.g. bantime increment
-/// growth rates) — `factor = 2` and `factor = 1.5` are both valid.
 fn asFloat(v: Parser.Value) Error!f64 {
     return switch (v) {
         .int => |n| @floatFromInt(n),
@@ -934,19 +745,8 @@ fn parseLogLevel(s: []const u8) Error!LogLevel {
     return error.InvalidValue;
 }
 
-/// Canonical journalctl path on the target distros (SYS-015). Probed by
-/// `journalctlPresent` and used by the runtime source resolver.
 pub const journalctl_path: []const u8 = "/usr/bin/journalctl";
 
-/// True when at least one configured logpath currently EXISTS on disk
-/// (SYS-015). This existence-based probe is what the `auto` resolver uses
-/// to decide file-vs-journald: on a journald-only box the shipped sshd
-/// jail's `/var/log/auth.log` / `/var/log/secure` are absent, so `auto`
-/// resolves to journald rather than tailing files that will never appear.
-/// Empty path strings are skipped. A read-only `access` probe, no open/read
-/// — cheap and non-mutating. (The file tailer still tolerates a configured
-/// path that doesn't exist yet once `.file` is chosen — it arms a
-/// parent-directory inotify watch and picks the file up on creation.)
 pub fn anyLogpathExists(logpath: []const []const u8) bool {
     for (logpath) |lp| {
         if (lp.len == 0) continue;
@@ -956,20 +756,10 @@ pub fn anyLogpathExists(logpath: []const []const u8) bool {
     return false;
 }
 
-/// True when `filter` has a journald selector set (i.e. `auto` may route it
-/// to the journald source). v1 supports `sshd` ONLY. This MUST stay in sync
-/// with `journald_source.selectorsForFilter` — that function is the
-/// authority for the actual selectors; this boolean mirror exists only so
-/// the config layer can apply the same `auto` filter gate without importing
-/// the journald source (which would create a config<->journald import
-/// cycle). A sync test in `journald_source.zig` asserts the two agree.
 pub fn filterSupportsJournald(filter: []const u8) bool {
     return std.mem.eql(u8, filter, "sshd");
 }
 
-/// True when the journalctl binary is present and executable. Used both
-/// by `validate()` (warn-only) and by the runtime source resolver
-/// (fail-closed). A read-only `access(X_OK)` probe — no spawn.
 pub fn journalctlPresent() bool {
     std.fs.cwd().access(journalctl_path, .{ .mode = .read_only }) catch return false;
     return true;
@@ -989,10 +779,6 @@ fn parseLogSource(s: []const u8) Error!LogSource {
     if (std.mem.eql(u8, s, "journald")) return .journald;
     return error.InvalidValue;
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 test "native: parse minimal config" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1026,7 +812,6 @@ test "native: parse defaults retains zero-copy string slices" {
         \\pid_file = "/tmp/pf.pid"
     ;
     const cfg = try Config.parse(arena.allocator(), src);
-    // Slice must point INTO `src` — verify by comparing address ranges.
     const s = cfg.global.pid_file;
     const src_start = @intFromPtr(src.ptr);
     const s_start = @intFromPtr(s.ptr);
@@ -1069,14 +854,11 @@ test "native: parse jails section with overrides" {
     try std.testing.expectEqualStrings("nginx", cfg.jails[1].name);
     try std.testing.expect(!cfg.jails[1].enabled);
 
-    // Overrides resolve against defaults for the ones not set.
     const eff_find = cfg.jails[0].effectiveFindtime(cfg.defaults);
     try std.testing.expectEqual(@as(shared.Duration, 600), eff_find);
     const eff_mr = cfg.jails[0].effectiveMaxretry(cfg.defaults);
     try std.testing.expectEqual(@as(u32, 3), eff_mr);
 }
-
-// ---------- SYS-015: per-jail log source ----------
 
 test "native: jail source defaults to auto when unset" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1123,10 +905,6 @@ test "native: jail source rejects an unknown token" {
 }
 
 test "native: unknown journalmatch key still trips UnknownKey (v1 has no override)" {
-    // The journald selector set is fixed in v1 — there is no per-jail
-    // `journalmatch` override. An operator who writes one must get a clear
-    // error, not a silently-ignored line. Regression guard for the
-    // deferred-to-v2 decision.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const src =
@@ -1148,14 +926,11 @@ test "native: anyLogpathExists is existence-based, not configured-based (SYS-015
     const present = try tmp.dir.realpathAlloc(arena.allocator(), "present.log");
     const absent = try std.fmt.allocPrint(arena.allocator(), "{s}/nope.log", .{std.fs.path.dirname(present).?});
 
-    // Empty list / empty strings / absent paths => false (this is the
-    // journald-only-box case for the shipped sshd jail).
     try std.testing.expect(!anyLogpathExists(&.{}));
     try std.testing.expect(!anyLogpathExists(&.{""}));
     try std.testing.expect(!anyLogpathExists(&.{absent}));
     try std.testing.expect(!anyLogpathExists(&.{ "", absent }));
 
-    // An existing path => true, even mixed with empty / absent entries.
     try std.testing.expect(anyLogpathExists(&.{present}));
     try std.testing.expect(anyLogpathExists(&.{ "", absent, present }));
 }
@@ -1169,10 +944,6 @@ test "native: filterSupportsJournald is sshd-only in v1" {
 }
 
 test "native: validate does not fail when a jail resolves to journald" {
-    // SYS-015: a journald-source jail must not turn `--validate-config`
-    // into a hard failure even when journalctl is missing — the resolver
-    // fails closed at startup, not at validate time. Same warn-not-fail
-    // discipline as the missing-logpath and missing-socket-dir cases.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const src =
@@ -1258,9 +1029,6 @@ test "native: bantime_increment accepts fractional factor in per-jail block" {
 }
 
 test "native: bantime_increment still accepts integer factor/multiplier (regression)" {
-    // Operators using the canonical "doubling per ban" recipe (factor = 2)
-    // must continue to work after fractional support landed. Integers
-    // coerce to f64 — verify both the defaults and per-jail paths.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const src =
@@ -1384,9 +1152,6 @@ test "native: validate rejects duplicate jail names" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    // Two separate "[jails.sshd]" headers — the parser merges them into
-    // the same jail (findOrCreateJail), so duplicates at section level
-    // are fine. Instead we verify duplicate by constructing by hand.
     const src =
         \\[global]
         \\memory_ceiling_mb = 32
@@ -1400,8 +1165,6 @@ test "native: validate rejects duplicate jail names" {
     ;
     var cfg = try Config.parse(arena.allocator(), src);
 
-    // Manually append a second jail with the same name to prove validate()
-    // catches it. (In a real config file the parser would silently merge.)
     var jails_buf = try arena.allocator().alloc(JailConfig, 2);
     jails_buf[0] = cfg.jails[0];
     jails_buf[1] = .{ .name = "sshd", .filter = "sshd" };
@@ -1410,12 +1173,6 @@ test "native: validate rejects duplicate jail names" {
 }
 
 test "native: validate warns on missing socket dir, does not fail" {
-    // A missing socket parent dir (e.g. /run/fail2zig before startup) is a
-    // warning, not a failure: the daemon creates it at startup via
-    // ensureSocketDir() and systemd's RuntimeDirectory. Standalone
-    // --validate-config runs before that, so it must still succeed. This is
-    // a regression guard for the fresh-install onboarding bug where
-    // validate() hard-failed with SocketDirMissing.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1525,8 +1282,6 @@ test "native: parse a full example with all options" {
 }
 
 test "native: websocket_max_clients default is 16" {
-    // 9B.1.2: unset key -> default preserved, so existing deployments
-    // that don't mention the key keep their old behaviour.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const src =
@@ -1538,8 +1293,6 @@ test "native: websocket_max_clients default is 16" {
 }
 
 test "native: websocket_max_clients accepts 16, 128, and hard cap" {
-    // 9B.1.2: representative valid values — the stock default, the
-    // honeypot demo setting, and the hard cap exactly at the boundary.
     const cases = [_]u32{ 16, 128, websocket_hard_max_clients };
     for (cases) |v| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1557,8 +1310,6 @@ test "native: websocket_max_clients accepts 16, 128, and hard cap" {
 }
 
 test "native: websocket_max_clients rejects 0" {
-    // 9B.1.2: a zero-cap WsServer is a silent-breakage config — no
-    // dashboard can ever connect. Fail closed at parse time.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const src =
@@ -1567,8 +1318,6 @@ test "native: websocket_max_clients rejects 0" {
     ;
     try std.testing.expectError(error.InvalidValue, Config.parse(arena.allocator(), src));
 }
-
-// ---------- ISSUE-007: per-jail resolver tests ----------
 
 test "native: resolveJail returns null for unknown jail" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1621,7 +1370,6 @@ test "native: resolveJail falls back to defaults for unset fields" {
     const cfg = try Config.parse(arena.allocator(), src);
     const r = resolveJail(&cfg, "sshd").?;
     try std.testing.expectEqual(@as(u32, 2), r.maxretry);
-    // findtime and bantime not set on the jail -> inherit defaults.
     try std.testing.expectEqual(@as(shared.Duration, 900), r.findtime);
     try std.testing.expectEqual(@as(shared.Duration, 1800), r.bantime);
 }
@@ -1666,13 +1414,10 @@ test "native: resolveJail takes per-jail bantime_increment when present" {
     const cfg = try Config.parse(arena.allocator(), src);
     const r = resolveJail(&cfg, "sshd").?;
     try std.testing.expect(r.bantime_increment.enabled);
-    // Jail's per-jail value wins over the defaults' factor=2.
     try std.testing.expectEqual(@as(f64, 5.0), r.bantime_increment.factor);
 }
 
 test "native: websocket_max_clients rejects values above hard cap" {
-    // 9B.1.2: reject anything past `websocket_hard_max_clients` (1024) so
-    // the allocator can't be asked for a gigantic slot table via config.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var buf: [128]u8 = undefined;

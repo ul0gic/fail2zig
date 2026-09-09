@@ -1,23 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Firewall backend interface.
-//!
-//! The engine speaks to the kernel packet filter through this single,
-//! backend-agnostic surface. Concrete implementations live in sibling
-//! files:
-//!
-//!   - `nftables.zig` — preferred: direct netlink, atomic, set-based.
-//!   - `ipset.zig`    — middle: `ipset` for O(1) membership + one
-//!                       `iptables` jump rule per jail.
-//!   - `iptables.zig` — fallback: pure CLI fork/exec, per-IP rules.
-//!
-//! All three implement the same `BackendVTable`. A `Backend` is a
-//! tagged union that owns the backend-specific state and exposes a
-//! uniform `ban` / `unban` / `listBans` / `flush` surface.
-//!
-//! Phase 3 scope: interface definition plus a stub for `detect()`.
-//! The real detection logic (task 3.6.2) probes the system at runtime
-//! and selects the best available backend.
 
 const std = @import("std");
 const shared = @import("shared");
@@ -27,49 +9,23 @@ pub const iptables = @import("iptables.zig");
 pub const ipset = @import("ipset.zig");
 pub const netlink = @import("netlink.zig");
 
-/// Errors any backend may return. Concrete backends map their
-/// underlying failure modes (syscall errno, CLI exit codes, parse
-/// errors) to one of these variants so the caller can stay
-/// backend-agnostic.
 pub const BackendError = error{
-    /// A system call, syscall wrapper, or subprocess failed.
     SystemError,
-    /// The backend is not available on this host (kernel module
-    /// missing, binary not on PATH, etc.).
     NotAvailable,
-    /// The backend's rule/element limit has been reached.
     RuleLimitReached,
-    /// The IP is already in the ban set (idempotency failure).
     AlreadyBanned,
-    /// The IP is not in the ban set.
     NotBanned,
-    /// Allocation failed.
     OutOfMemory,
 };
 
-/// Configuration shared by all backends. Individual backends may
-/// extend this with backend-specific fields in their own init paths.
 pub const BackendConfig = struct {
-    /// Prefix used when naming chains, sets, and tables. The
-    /// per-jail name is `chain_prefix ++ "-" ++ jail`.
     chain_prefix: []const u8 = "fail2zig",
-    /// Table name for nftables. Unused by iptables/ipset backends.
     table_name: []const u8 = "fail2zig",
-    /// Chain priority (hook ordering). `-1` runs before conntrack
-    /// so dropped packets bypass conntrack overhead.
     priority: i32 = -1,
 };
 
-/// Which backend is active. The tag doubles as a human-readable
-/// identifier for logging and metrics.
 pub const BackendTag = enum { nftables, ipset, iptables };
 
-/// Vtable wired at construction time. Concrete backends expose a
-/// `vtable` constant with their function pointers.
-///
-/// Every entry takes a `*anyopaque` context that concrete backends
-/// cast back to their owning struct. Callers never see the raw
-/// pointer — they go through `Backend`.
 pub const BackendVTable = struct {
     initFn: *const fn (ctx: *anyopaque, config: BackendConfig, allocator: std.mem.Allocator) BackendError!void,
     deinitFn: *const fn (ctx: *anyopaque) void,
@@ -93,14 +49,6 @@ pub const BackendVTable = struct {
     isAvailableFn: *const fn (ctx: *anyopaque) bool,
 };
 
-/// Tagged union over the three concrete backends. Owns the
-/// backend's state inline — the vtable is looked up via the
-/// selected variant and the `*anyopaque` context points back at
-/// the variant's stored struct.
-///
-/// Keep the union thin: the engine holds a single `Backend`; the
-/// variant determines behaviour but the caller only uses the
-/// methods below.
 pub const Backend = union(BackendTag) {
     nftables: nftables.NftablesBackend,
     ipset: ipset.IpsetBackend,
@@ -172,29 +120,16 @@ pub const Backend = union(BackendTag) {
     }
 };
 
-/// Availability probe hooks, separated so tests can inject mocks.
-/// The defaults call the real system.
-///
-/// SYS-014 #2: the nftables probe returns a `ProbeResult` (not a bare bool)
-/// so `detect` can log a cause-accurate message when nftables is skipped —
-/// "no nf_tables in kernel" vs a transient failure. The permission case is
-/// NOT distinguished here (opening the socket succeeds without CAP_NET_ADMIN;
-/// it is reported at init/scaffold time where EPERM genuinely lands).
 pub const AvailabilityProbes = struct {
     nftablesReason: *const fn () nftables.ProbeResult = defaultNftablesReason,
     ipsetAvailable: *const fn () bool = defaultIpsetAvailable,
     iptablesAvailable: *const fn () bool = defaultIptablesAvailable,
 };
 
-/// Detect the best available backend. Priority: nftables → ipset →
-/// iptables. Returns `BackendError.NotAvailable` if nothing works.
 pub fn detect(allocator: std.mem.Allocator) BackendError!Backend {
     return detectWithProbes(allocator, .{});
 }
 
-/// Same as `detect` but with pluggable availability checks. Used by
-/// the detection tests to exercise every branch without requiring
-/// the actual kernel / binaries.
 pub fn detectWithProbes(
     allocator: std.mem.Allocator,
     probes: AvailabilityProbes,
@@ -205,9 +140,6 @@ pub fn detectWithProbes(
             std.log.info("firewall backend: nftables selected", .{});
             return .{ .nftables = nftables.NftablesBackend{} };
         },
-        // SYS-014 #2: cause-accurate message before falling through. These
-        // are warn-level (a lower backend may still succeed); the fatal
-        // refusal, if nothing works, is logged by the caller.
         .kernel_unsupported => std.log.warn(
             "firewall backend: nftables unavailable — nf_tables not in kernel " ++
                 "(module not loaded or not compiled in); trying ipset",
@@ -230,10 +162,6 @@ pub fn detectWithProbes(
         return .{ .iptables = iptables.IptablesBackend{} };
     }
 
-    // Don't log at .err here — the caller receives the NotAvailable
-    // error and decides whether to log it fatally. Using .err inside a
-    // library path also trips the Zig test runner's error-log failure
-    // check during negative-path detection tests.
     std.log.warn("firewall backend: no backend available", .{});
     return error.NotAvailable;
 }
@@ -250,15 +178,9 @@ fn defaultIptablesAvailable() bool {
     return iptables.probeAvailable();
 }
 
-// ===========================================================================
-// Tests
-// ===========================================================================
-
 test "backend: tagged union dispatches to nftables vtable" {
     var be: Backend = .{ .nftables = nftables.NftablesBackend{} };
     try std.testing.expectEqual(BackendTag.nftables, be.tag());
-    // isAvailable must not crash even without root; the concrete
-    // implementation returns false when capabilities are missing.
     _ = be.isAvailable();
 }
 
@@ -319,8 +241,6 @@ test "backend: detect falls back to iptables when only it is available" {
 }
 
 test "backend: detect fails closed (NotAvailable) when nothing available (SYS-014)" {
-    // The cause distinction must NOT weaken fail-closed: a kernel-unsupported
-    // nftables with no other backend still refuses to run unprotected.
     const probes: AvailabilityProbes = .{
         .nftablesReason = testNftReasonKernelUnsupported,
         .ipsetAvailable = testAlwaysFalse,
@@ -353,9 +273,6 @@ fn testNftReasonTransient() nftables.ProbeResult {
 }
 
 test "backend: detect with default probes runs without crashing" {
-    // Whatever the host offers, default-probe detection must either
-    // succeed with a valid backend tag or fail cleanly with
-    // `NotAvailable`. It must never panic or leak file descriptors.
     const result = detect(std.testing.allocator);
     if (result) |be_val| {
         var be = be_val;

@@ -1,43 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! iptables backend — legacy fallback via CLI fork/exec.
-//!
-//! We shell out to `iptables` / `ip6tables` because most
-//! distributions still ship them and because the netfilter-era
-//! kernel ABI (`libiptc`) is deprecated. Performance is worse than
-//! nftables (one process spawn per op) but correctness is well
-//! understood and the code path is small.
-//!
-//! Every operation emits a command via `CommandBuilder` first, so
-//! tests can assert on the exact argv without ever forking.
-//!
-//! Error mapping:
-//!   - exit 0  → OK
-//!   - exit 1  + stderr contains "already exists"  → AlreadyBanned
-//!   - exit 2  + stderr contains "does a matching rule exist" → NotBanned
-//!   - exit 4  + stderr contains "Resource temporarily unavailable" (xtables lock) → retry
-//!   - anything else → SystemError
-//!
-//! Command string construction is pure; execution is isolated so
-//! tests can run without root.
 
 const std = @import("std");
 const mem = std.mem;
 const shared = @import("shared");
 const backend = @import("backend.zig");
 
-/// Per-operation argv builder. Uses a caller-owned backing buffer
-/// for argv storage — the individual strings live elsewhere
-/// (stack, config) but the argv slice is built in place.
 pub const CommandBuilder = struct {
-    /// Binary name: `"iptables"` or `"ip6tables"`.
     binary: []const u8,
-    /// Per-jail chain name (e.g. `"fail2zig-sshd"`). The caller
-    /// allocates this string and keeps it alive for the duration
-    /// of command construction.
     chain: []const u8,
 
-    /// `iptables -N <chain>` — create the jail chain.
     pub fn createChain(self: CommandBuilder, argv: *[4][]const u8) [][]const u8 {
         argv[0] = self.binary;
         argv[1] = "-N";
@@ -45,7 +17,6 @@ pub const CommandBuilder = struct {
         return argv[0..3];
     }
 
-    /// `iptables -F <chain>` — flush all rules out of the chain.
     pub fn flushChain(self: CommandBuilder, argv: *[4][]const u8) [][]const u8 {
         argv[0] = self.binary;
         argv[1] = "-F";
@@ -53,7 +24,6 @@ pub const CommandBuilder = struct {
         return argv[0..3];
     }
 
-    /// `iptables -X <chain>` — delete an empty chain.
     pub fn deleteChain(self: CommandBuilder, argv: *[4][]const u8) [][]const u8 {
         argv[0] = self.binary;
         argv[1] = "-X";
@@ -61,8 +31,6 @@ pub const CommandBuilder = struct {
         return argv[0..3];
     }
 
-    /// `iptables -I INPUT -j <chain>` — insert the jump at the top
-    /// of INPUT so our drops are evaluated before any other rule.
     pub fn installJump(self: CommandBuilder, argv: *[6][]const u8) [][]const u8 {
         argv[0] = self.binary;
         argv[1] = "-I";
@@ -72,8 +40,6 @@ pub const CommandBuilder = struct {
         return argv[0..5];
     }
 
-    /// `iptables -D INPUT -j <chain>` — remove the jump we
-    /// installed.
     pub fn removeJump(self: CommandBuilder, argv: *[6][]const u8) [][]const u8 {
         argv[0] = self.binary;
         argv[1] = "-D";
@@ -83,7 +49,6 @@ pub const CommandBuilder = struct {
         return argv[0..5];
     }
 
-    /// `iptables -A <chain> -s <ip> -j DROP`.
     pub fn banRule(
         self: CommandBuilder,
         argv: *[8][]const u8,
@@ -99,7 +64,6 @@ pub const CommandBuilder = struct {
         return argv[0..7];
     }
 
-    /// `iptables -D <chain> -s <ip> -j DROP`.
     pub fn unbanRule(
         self: CommandBuilder,
         argv: *[8][]const u8,
@@ -115,7 +79,6 @@ pub const CommandBuilder = struct {
         return argv[0..7];
     }
 
-    /// `iptables -L <chain> -n` — list rules, IP-only.
     pub fn listRules(self: CommandBuilder, argv: *[5][]const u8) [][]const u8 {
         argv[0] = self.binary;
         argv[1] = "-L";
@@ -125,7 +88,6 @@ pub const CommandBuilder = struct {
     }
 };
 
-/// Select the binary based on the IP family.
 pub fn binaryFor(ip: shared.IpAddress) []const u8 {
     return switch (ip) {
         .ipv4 => "iptables",
@@ -133,9 +95,6 @@ pub fn binaryFor(ip: shared.IpAddress) []const u8 {
     };
 }
 
-/// Compose the per-jail chain name: `<prefix>-<jail>`.
-/// Writes into `buf` and returns the slice; fails if `buf` is
-/// too small.
 pub fn chainName(
     buf: []u8,
     prefix: []const u8,
@@ -149,16 +108,10 @@ pub fn chainName(
     return buf[0..total];
 }
 
-/// Classify an iptables command exit: transient lock failures get
-/// retried; already-exists / no-such-rule map to their idempotency
-/// errors.
 pub const ExitClass = enum { ok, already_exists, not_found, locked, other };
 
 pub fn classifyExit(exit_code: u8, stderr: []const u8) ExitClass {
     if (exit_code == 0) return .ok;
-    // iptables-legacy prints distinct messages we can pattern-match
-    // on. We do not rely on exit codes alone because they've
-    // shifted between versions.
     if (mem.indexOf(u8, stderr, "already exists") != null) return .already_exists;
     if (mem.indexOf(u8, stderr, "does a matching rule exist") != null) return .not_found;
     if (mem.indexOf(u8, stderr, "No chain/target/match by that name") != null) return .not_found;
@@ -167,14 +120,6 @@ pub fn classifyExit(exit_code: u8, stderr: []const u8) ExitClass {
     return .other;
 }
 
-/// Parse IP addresses out of `iptables -L -n` output. Lines that
-/// describe DROP rules look like:
-///
-///     DROP       all  --  1.2.3.4              0.0.0.0/0
-///
-/// We walk tokens and yield the 4th column when column 1 is
-/// "DROP". Zero allocation in the parse path — callers pass an
-/// `ArrayList` for accumulation.
 pub fn parseListOutput(
     allocator: std.mem.Allocator,
     stdout: []const u8,
@@ -184,7 +129,6 @@ pub fn parseListOutput(
 
     var line_it = mem.splitScalar(u8, stdout, '\n');
     while (line_it.next()) |line| {
-        // Skip headers/empty lines.
         if (line.len == 0) continue;
         if (mem.startsWith(u8, line, "Chain ")) continue;
         if (mem.startsWith(u8, line, "target ")) continue;
@@ -192,8 +136,8 @@ pub fn parseListOutput(
         var tokens = mem.tokenizeScalar(u8, line, ' ');
         const target = tokens.next() orelse continue;
         if (!mem.eql(u8, target, "DROP")) continue;
-        _ = tokens.next() orelse continue; // protocol (all/tcp/udp)
-        _ = tokens.next() orelse continue; // opt (--)
+        _ = tokens.next() orelse continue;
+        _ = tokens.next() orelse continue;
         const source = tokens.next() orelse continue;
         const ip = shared.IpAddress.parse(source) catch continue;
         try list.append(ip);
@@ -201,12 +145,6 @@ pub fn parseListOutput(
     return list.toOwnedSlice();
 }
 
-/// Execute a single iptables command. Returns the exit class.
-/// Collects stderr so the caller can classify failures precisely.
-///
-/// Argv strings MUST be null-safe `[]const u8` — `std.process.Child`
-/// handles the terminators internally when it exec's, so callers
-/// don't need to carry `[:0]` themselves.
 pub fn runCommand(
     allocator: std.mem.Allocator,
     argv: []const []const u8,
@@ -217,7 +155,7 @@ pub fn runCommand(
     child.stderr_behavior = .Pipe;
     child.spawn() catch return error.SystemError;
 
-    // Drain stderr fully before waiting so the pipe doesn't fill.
+    // Drain stderr before wait(): a full pipe deadlocks the child.
     const stderr_reader = child.stderr orelse {
         _ = child.wait() catch {};
         return error.SystemError;
@@ -236,10 +174,6 @@ pub fn runCommand(
     return classifyExit(code, stderr_buf);
 }
 
-// ===========================================================================
-// Backend state + vtable wiring
-// ===========================================================================
-
 pub const IptablesBackend = struct {
     allocator: ?std.mem.Allocator = null,
     config: ?backend.BackendConfig = null,
@@ -256,7 +190,6 @@ pub const vtable: backend.BackendVTable = .{
     .isAvailableFn = isAvailableImpl,
 };
 
-/// Availability probe: look for `iptables` on `PATH`.
 pub fn probeAvailable() bool {
     return binaryExistsOnPath("iptables");
 }
@@ -294,10 +227,6 @@ fn initImpl(
     self.allocator = allocator;
     self.config = config;
     self.initialized = true;
-    // Chain + jump creation is deferred until the first ban so the
-    // daemon doesn't need CAP_NET_ADMIN for tests or for a warm
-    // start in a crippled namespace. The real wire-up happens in
-    // Phase 4's ban lifecycle integration.
 }
 
 fn deinitImpl(ctx: *anyopaque) void {
@@ -311,7 +240,7 @@ fn banImpl(
     jail: shared.JailId,
     duration: shared.Duration,
 ) backend.BackendError!void {
-    _ = duration; // iptables doesn't support per-rule timeouts
+    _ = duration;
     const self = castSelf(ctx);
     if (!self.initialized) return error.NotAvailable;
     const allocator = self.allocator orelse return error.NotAvailable;
@@ -337,8 +266,8 @@ fn banImpl(
     switch (try runCommand(allocator, argv)) {
         .ok => return,
         .already_exists => return error.AlreadyBanned,
-        .not_found => return error.SystemError, // chain missing
-        .locked => return error.SystemError, // Phase 4 adds retries
+        .not_found => return error.SystemError,
+        .locked => return error.SystemError,
         .other => return error.SystemError,
     }
 }
@@ -370,7 +299,7 @@ fn unbanImpl(
     switch (try runCommand(allocator, argv)) {
         .ok => return,
         .not_found => return error.NotBanned,
-        .already_exists => return error.SystemError, // impossible on delete
+        .already_exists => return error.SystemError,
         .locked => return error.SystemError,
         .other => return error.SystemError,
     }
@@ -389,7 +318,6 @@ fn listBansImpl(
     const chain = chainName(&chain_buf, cfg.chain_prefix, jail.slice()) catch {
         return error.SystemError;
     };
-    // IPv4 and IPv6 are separate binaries; we need to merge.
     const v4_bans = try runAndParse(allocator, "iptables", chain);
     defer allocator.free(v4_bans);
     const v6_bans = try runAndParse(allocator, "ip6tables", chain);
@@ -457,10 +385,6 @@ fn isAvailableImpl(ctx: *anyopaque) bool {
     _ = ctx;
     return probeAvailable();
 }
-
-// ===========================================================================
-// Tests — verify argv construction / parsing / classification only
-// ===========================================================================
 
 test "iptables: chainName composes prefix-jail" {
     var buf: [64]u8 = undefined;
@@ -602,6 +526,5 @@ test "iptables: IptablesBackend uninit ban returns NotAvailable" {
 }
 
 test "iptables: probeAvailable result is consistent with direct PATH scan" {
-    // Whatever the host is, a second probe returns the same answer.
     try std.testing.expectEqual(probeAvailable(), probeAvailable());
 }

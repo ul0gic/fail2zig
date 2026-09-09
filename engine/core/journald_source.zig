@@ -1,36 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! journald log source (SYS-015).
-//!
-//! Reads sshd authentication failures from the systemd journal on modern
-//! distros where `/var/log/auth.log` does not exist and auth events go to
-//! journald only. This is the sibling of `log_watcher.zig`: where the file
-//! tailer drives itself from an inotify FD, the journald source drives
-//! itself from a periodic poll timer, spawning `journalctl -o json` on
-//! each tick.
-//!
-//! Design constraints (see .project/SYS-015-journald-design.md):
-//!   * NO libsystemd / sd-journal linkage — subprocess `journalctl` only,
-//!     so the binary stays static + zero-dep.
-//!   * NO native journal-file parsing — `journalctl -o json` is the only
-//!     ingestion path.
-//!   * NO `journalctl -f` — we poll with `--after-cursor` on a 1 s timer;
-//!     each tick is an independent reconcile.
-//!   * Selector set is FIXED in v1 (sshd): the journal records that carry
-//!     auth failures are emitted by `sshd-session` (per-connection), not
-//!     just the `sshd` listener, so we OR four selectors. There is no
-//!     user-configurable `journalmatch` in v1 (too easy to make silently
-//!     AND-to-zero-rows).
-//!
-//! Hot path: a decoded journal `MESSAGE` has no syslog envelope, so it
-//! feeds the SAME `lineCallback` the file watcher uses
-//! (`stripSyslogPrefix` is a no-op on a bare message, then `parseLine`).
-//! No new parse path, no new callback contract.
-//!
-//! ALL journal content is attacker-influenced (an attacker controls the
-//! username / source IP that lands in `MESSAGE`). We treat the JSON, the
-//! cursor, and the byte-array MESSAGE form as untrusted: no `@panic`, no
-//! `unreachable`, malformed input is skipped, never fatal.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -54,82 +23,23 @@ pub const Error = error{
     EventLoopError,
     TooManyJails,
     PathTooLong,
-    /// A jail asked for the journald source with a filter the journald
-    /// backend does not support in v1 (only `sshd`). We fail closed
-    /// rather than silently apply sshd selectors to a non-sshd jail.
     UnsupportedJournaldFilter,
 };
 
-// ============================================================================
-// Tunables
-// ============================================================================
-
-/// Poll cadence. Hard-coded for v1 (Lead decision 4) to match the
-/// expiry-sweep / ws-tick cadence; no config knob yet.
 pub const poll_interval_ms: u64 = 1000;
 
-/// Maximum jails this source will host. journald jails are rare (sshd,
-/// maybe a couple more); a small fixed cap keeps the ArrayList bounded.
 pub const max_jails: usize = 64;
 
-/// Hard cap on journal entries processed per jail per poll tick. Bounds
-/// the work (and the attacker's ability to flood us via journal volume)
-/// done on the loop thread between epoll returns. Past this we stop
-/// reading the current batch and resume next tick — the cursor still
-/// advances to the last processed entry, so no entries are lost, only
-/// deferred. Mirrors the `max_per_tick` discipline in main.zig's expiry
-/// sweep.
 pub const max_entries_per_tick: usize = 4096;
 
-/// Maximum journalctl stdout we will buffer per invocation. A failed-auth
-/// JSON line is ~1 KB; `max_entries_per_tick` of them is a few MB. Cap at
-/// 16 MB so a pathological journal cannot make us allocate unbounded.
 pub const max_output_bytes: usize = 16 * 1024 * 1024;
 
-/// Cursor strings are opaque (`s=…;i=…;b=…;m=…;t=…;x=…`), ~150 bytes in
-/// practice. 512 is generous headroom; longer cursors are rejected (we
-/// simply don't advance, re-reading next tick).
 pub const max_cursor_len: usize = 512;
 
-/// Per-line scratch buffer for the decoded MESSAGE before it is handed to
-/// the line callback. 4 KB matches the engine's max-log-line convention.
 pub const max_line_len: usize = 4096;
-
-// ============================================================================
-// Source resolution — pure, injectable seams for tests
-// ============================================================================
 
 pub const ResolvedSource = enum { file, journald, fail };
 
-/// Resolve a jail's effective log source. Pure function: all filesystem /
-/// environment probes are injected as booleans by the caller, so this is
-/// unit-testable with no filesystem and no journald — see tests below.
-///
-/// Inputs:
-///   * `logpath_exists`            — at least one configured logpath EXISTS
-///                                   on disk (caller stats them, see
-///                                   `config_mod.anyLogpathExists`).
-///   * `journalctl_present`        — the journalctl binary is installed.
-///   * `filter_journald_supported` — the jail's filter has a journald
-///                                   selector set (`selectorsForFilter !=
-///                                   null`; sshd only in v1).
-///
-/// Resolution:
-///   * `.file`     → `.file` always (the watcher tolerates a not-yet-
-///                   present path; "fail-closed for file" only applies to
-///                   an empty/invalid path the watcher cannot handle,
-///                   which surfaces at `watchFile` time, not here).
-///   * `.journald` → `.journald` iff journalctl present, else `.fail`.
-///   * `.auto`     → SYS-015 (reopened): EXISTENCE-based.
-///       1. A configured logpath that exists on disk → `.file`.
-///       2. Else, if the filter is journald-supported AND journalctl is
-///          present → `.journald`. The filter gate is mandatory: without it
-///          a non-sshd jail with an absent log (e.g. nginx-http-auth on a
-///          box with no nginx logs) would resolve to journald and then fail
-///          closed at wiring time with `error.UnsupportedJournaldFilter`.
-///       3. Else → `.file`. The file tailer already tolerates a late-
-///          appearing path, so `auto` NEVER fails closed — it degrades to a
-///          (possibly-empty) file tail rather than refusing to start.
 pub fn resolveSource(
     source: config_mod.LogSource,
     logpath_exists: bool,
@@ -147,16 +57,6 @@ pub fn resolveSource(
     };
 }
 
-// ============================================================================
-// Selector sets — FIXED in v1, keyed by filter name
-// ============================================================================
-
-/// sshd selector set. Auth FAILURES on modern OpenSSH are emitted by the
-/// per-connection `sshd-session` process, NOT the `sshd` listener, so we
-/// must match both identifiers. We also match on `_COMM` as a belt-and-
-/// suspenders fallback for journal entries that lack SYSLOG_IDENTIFIER.
-/// These four are OR'd together at the journalctl command level (see
-/// `appendSelectorArgv`).
 pub const sshd_selectors = [_][]const u8{
     "SYSLOG_IDENTIFIER=sshd",
     "SYSLOG_IDENTIFIER=sshd-session",
@@ -164,34 +64,11 @@ pub const sshd_selectors = [_][]const u8{
     "_COMM=sshd-session",
 };
 
-/// Map a filter name to its journald selector set. v1 supports the `sshd`
-/// filter ONLY: only for an exact `"sshd"` match do we return the sshd
-/// selector set. Any other filter returns `null` — the journald backend
-/// has no selectors for it, so the jail MUST fail closed rather than
-/// silently apply sshd selectors to (say) an nginx jail and mis-cover it.
-/// Per-filter selector sets for other services are v2 work, gated on the
-/// same care that keeps a user-configurable `journalmatch` out of v1.
 pub fn selectorsForFilter(filter: []const u8) ?[]const []const u8 {
     if (std.mem.eql(u8, filter, "sshd")) return &sshd_selectors;
     return null;
 }
 
-// ============================================================================
-// journalctl argv construction
-// ============================================================================
-
-/// Append the OR'd selector tokens for `selectors` into `argv`, splitting
-/// same-field groups with a standalone `+` disjunction so that selectors
-/// across DIFFERENT fields are OR'd (journalctl ANDs different fields by
-/// default; the `+` turns the cross-field relation into OR).
-///
-/// For the sshd set the emitted tokens are:
-///   SYSLOG_IDENTIFIER=sshd  SYSLOG_IDENTIFIER=sshd-session  +  _COMM=sshd  _COMM=sshd-session
-///
-/// The grouping is by field prefix (`FIELD=`): consecutive selectors that
-/// share a field stay adjacent (auto-OR), and a `+` is inserted between
-/// groups of differing fields. `selectors` MUST be ordered so same-field
-/// entries are contiguous (the `sshd_selectors` table is).
 fn appendSelectorArgv(
     argv: *std.ArrayList([]const u8),
     selectors: []const []const u8,
@@ -209,19 +86,11 @@ fn appendSelectorArgv(
     }
 }
 
-/// The `FIELD` portion of a `FIELD=VALUE` selector (everything before the
-/// first `=`). Returns the whole string if there is no `=` (defensive —
-/// our selector table always has one).
 fn fieldOf(selector: []const u8) []const u8 {
     const eq = std.mem.indexOfScalar(u8, selector, '=') orelse return selector;
     return selector[0..eq];
 }
 
-/// Build the argv for the first-run baseline probe (Lead decision 3):
-///   journalctl <selectors> -n 1 -o json --no-pager -q
-/// Reads the LAST matching entry; we take its `__CURSOR` and start AFTER
-/// it, so no history is replayed. Caller owns the returned slice (and the
-/// ArrayList backing it lives in the supplied arena).
 pub fn buildBaselineArgv(
     arena: Allocator,
     selectors: []const []const u8,
@@ -238,10 +107,6 @@ pub fn buildBaselineArgv(
     return argv.toOwnedSlice();
 }
 
-/// Build the argv for a steady-state poll:
-///   journalctl <selectors> -o json --no-pager -q --after-cursor=<cursor>
-/// `cursor_flag` must be the full `--after-cursor=<cursor>` token; it is
-/// caller-owned and must outlive the argv. Caller owns the returned slice.
 pub fn buildPollArgv(
     arena: Allocator,
     selectors: []const []const u8,
@@ -258,19 +123,8 @@ pub fn buildPollArgv(
     return argv.toOwnedSlice();
 }
 
-// ============================================================================
-// JSON entry decoding
-// ============================================================================
-
-/// A single decoded journal entry: the MESSAGE body (already
-/// UTF-8/bytes-normalized) plus its cursor, if present. `message` and
-/// `cursor` are slices into the caller-provided scratch buffers, valid
-/// only for the duration of the processing of this entry.
 pub const DecodedEntry = struct {
     message: []const u8,
-    /// null when the entry's JSON had no `__CURSOR` field. The line is
-    /// still processed, but the pending cursor is NOT advanced from it
-    /// (advance-only-from-entries-that-have-a-cursor invariant).
     cursor: ?[]const u8,
 };
 
@@ -281,18 +135,6 @@ pub const DecodeError = error{
     MalformedMessage,
 };
 
-/// Decode one journalctl `-o json` object (a single stdout line) into a
-/// `DecodedEntry`. `msg_buf` receives the normalized MESSAGE bytes;
-/// `cursor_buf` receives the `__CURSOR` string. Both are caller-owned
-/// fixed buffers. Uses an arena for the transient JSON DOM so there is no
-/// leak and no per-entry heap churn beyond the arena.
-///
-/// MESSAGE forms handled (per the journal export format):
-///   * JSON string  — copied verbatim (already UTF-8).
-///   * JSON array of integers — non-UTF-8 message exported byte-by-byte;
-///     each element must be 0..255, written as a raw byte. A non-integer
-///     or out-of-range element makes the message malformed → skipped.
-///   * missing / wrong type → `error.NoMessage` (caller skips the entry).
 pub fn decodeEntry(
     arena: Allocator,
     json_line: []const u8,
@@ -309,23 +151,14 @@ pub fn decodeEntry(
     if (parsed != .object) return error.NotAnObject;
     const obj = parsed.object;
 
-    // ---- MESSAGE ----
     const msg_val = obj.get("MESSAGE") orelse return error.NoMessage;
     const message = try normalizeMessage(msg_val, msg_buf);
 
-    // ---- __CURSOR (optional) ----
-    // An over-long/empty/wrong-type cursor is treated as "no cursor" for
-    // this entry — the line is still processed but the cursor does not
-    // advance.
     const cursor = cursorFromObject(obj, cursor_buf);
 
     return .{ .message = message, .cursor = cursor };
 }
 
-/// Copy the `__CURSOR` string out of a parsed journal object into
-/// `cursor_buf`, returning a slice into it, or null when the field is
-/// absent, empty, the wrong type, or too long for the buffer. Shared by
-/// `decodeEntry` (steady-state) and `extractCursor` (first-run baseline).
 fn cursorFromObject(obj: std.json.ObjectMap, cursor_buf: []u8) ?[]const u8 {
     const cur_val = obj.get("__CURSOR") orelse return null;
     switch (cur_val) {
@@ -338,14 +171,6 @@ fn cursorFromObject(obj: std.json.ObjectMap, cursor_buf: []u8) ?[]const u8 {
     }
 }
 
-/// Extract ONLY the `__CURSOR` from one journalctl `-o json` line,
-/// independent of MESSAGE validity. Used for the first-run baseline, which
-/// needs the cursor but must NOT process (or even require) the entry's
-/// message — an entry with a missing or malformed MESSAGE but a valid
-/// `__CURSOR` must still seed the baseline. Returns a slice into
-/// `cursor_buf`, or null when the line is not a JSON object or carries no
-/// usable `__CURSOR`. `arena` backs the transient JSON DOM and is the
-/// caller's to reset/free (no hidden global heap).
 pub fn extractCursor(arena: Allocator, json_line: []const u8, cursor_buf: []u8) ?[]const u8 {
     const parsed = std.json.parseFromSliceLeaky(
         std.json.Value,
@@ -357,8 +182,6 @@ pub fn extractCursor(arena: Allocator, json_line: []const u8, cursor_buf: []u8) 
     return cursorFromObject(parsed.object, cursor_buf);
 }
 
-/// Normalize a MESSAGE JSON value into raw bytes in `out`. Returns a slice
-/// into `out`. Handles the string form and the byte-array form.
 fn normalizeMessage(val: std.json.Value, out: []u8) DecodeError![]const u8 {
     switch (val) {
         .string => |s| {
@@ -384,33 +207,10 @@ fn normalizeMessage(val: std.json.Value, out: []u8) DecodeError![]const u8 {
     }
 }
 
-// ============================================================================
-// Cursor sidecar persistence
-// ============================================================================
-//
-// Cursors live in their OWN file next to the engine state file rather than
-// in the binary state format (no wire-format bump). Layout, little-endian:
-//
-//   Header (10 bytes):
-//     magic        [4]u8  = 'F','2','Z','J'
-//     version      u16    = 1
-//     jail_count   u32
-//   Records (jail_count of them), then a trailing CRC32 over header+records:
-//     name_len     u16
-//     name         [name_len]u8
-//     cursor_len   u16
-//     cursor       [cursor_len]u8
-//   Trailer:
-//     checksum     u32    = CRC32 over everything before it
-//
-// Save is atomic (temp + fsync + fchmod 0600 + rename), mirroring
-// engine/core/persist.zig. Any integrity failure on load → empty result →
-// the source re-seeds each jail at "now" on the next tick (no replay).
-
 pub const cursor_magic: [4]u8 = .{ 'F', '2', 'Z', 'J' };
 pub const cursor_version: u16 = 1;
 const cursor_file_basename = "journald-cursors.bin";
-const max_sidecar_bytes: usize = 1024 * 1024; // generous; cursors are tiny
+const max_sidecar_bytes: usize = 1024 * 1024;
 
 pub const CursorEntry = struct {
     name: []const u8,
@@ -428,9 +228,6 @@ pub const SidecarError = error{
     PathTooLong,
 };
 
-/// Derive the cursor sidecar path from the engine `state_file` path:
-/// `dirname(state_file)/journald-cursors.bin`. Written into `buf`. The
-/// sidecar inherits the StateDirectory (0750) the state file lives in.
 pub fn cursorPath(state_file: []const u8, buf: []u8) SidecarError![]const u8 {
     const dir = std.fs.path.dirname(state_file) orelse ".";
     const need = dir.len + 1 + cursor_file_basename.len;
@@ -441,9 +238,6 @@ pub fn cursorPath(state_file: []const u8, buf: []u8) SidecarError![]const u8 {
     return buf[0..need];
 }
 
-/// Atomically write the cursor sidecar. Caller passes the live set of
-/// (jail, cursor) pairs; only jails with a non-empty cursor should be
-/// included. Empty input writes a valid zero-record file.
 pub fn saveCursors(entries: []const CursorEntry, path: []const u8) SidecarError!void {
     const max_path: usize = 4096;
     if (path.len == 0 or path.len + 4 > max_path) return error.PathTooLong;
@@ -463,7 +257,6 @@ pub fn saveCursors(entries: []const CursorEntry, path: []const u8) SidecarError!
     var crc = std.hash.Crc32.init();
     const writer = file.writer();
 
-    // Header.
     var hdr: [10]u8 = undefined;
     @memcpy(hdr[0..4], &cursor_magic);
     std.mem.writeInt(u16, hdr[4..6], cursor_version, .little);
@@ -471,7 +264,6 @@ pub fn saveCursors(entries: []const CursorEntry, path: []const u8) SidecarError!
     writer.writeAll(&hdr) catch return error.WriteFailed;
     crc.update(&hdr);
 
-    // Records.
     var len_buf: [2]u8 = undefined;
     for (entries) |e| {
         if (e.name.len > std.math.maxInt(u16) or e.cursor.len > std.math.maxInt(u16)) {
@@ -490,7 +282,6 @@ pub fn saveCursors(entries: []const CursorEntry, path: []const u8) SidecarError!
         crc.update(e.cursor);
     }
 
-    // Trailing checksum.
     var crc_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &crc_buf, crc.final(), .little);
     writer.writeAll(&crc_buf) catch return error.WriteFailed;
@@ -504,10 +295,6 @@ pub fn saveCursors(entries: []const CursorEntry, path: []const u8) SidecarError!
     std.fs.cwd().rename(tmp_path, path) catch return error.RenameFailed;
 }
 
-/// Load the cursor sidecar. Caller owns the returned slice AND each
-/// entry's `name`/`cursor` byte slices (all allocated from `allocator`).
-/// Missing file → empty slice (no warning). Any integrity failure →
-/// warning + empty slice (the source re-seeds at "now").
 pub fn loadCursors(allocator: Allocator, path: []const u8) SidecarError![]CursorEntry {
     var file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
         error.FileNotFound => return allocator.alloc(CursorEntry, 0) catch
@@ -543,7 +330,6 @@ pub fn loadCursors(allocator: Allocator, path: []const u8) SidecarError![]Cursor
     }
     const count = std.mem.readInt(u32, bytes[6..10], .little);
 
-    // Checksum covers everything except the trailing 4 bytes.
     const body = bytes[0 .. bytes.len - 4];
     const stored_crc = std.mem.readInt(u32, bytes[bytes.len - 4 ..][0..4], .little);
     if (std.hash.Crc32.hash(body) != stored_crc) {
@@ -607,37 +393,15 @@ fn failCorrupt(allocator: Allocator, out: *std.ArrayList(CursorEntry)) SidecarEr
     return allocator.alloc(CursorEntry, 0) catch error.OutOfMemory;
 }
 
-// ============================================================================
-// JournaldSource — the live poller
-// ============================================================================
-
-/// One journald-backed jail. Holds the fixed selector set, the callback +
-/// userdata (the `*JailContext`), the committed cursor, and a "seeded"
-/// flag distinguishing first-run (needs a baseline cursor) from steady
-/// state.
 pub const JournalJail = struct {
     jail: JailId,
     selectors: []const []const u8,
     callback: LineCallback,
     userdata: ?*anyopaque,
-    /// Last committed cursor. `cursor_len == 0` means "no cursor yet" —
-    /// the next tick fetches a baseline (-n 1) instead of polling.
     cursor: [max_cursor_len]u8 = [_]u8{0} ** max_cursor_len,
     cursor_len: usize = 0,
 
-    /// Read-health (SYS-017). Both written on the loop thread in
-    /// pollJail/processBatch and read on the cold status/metrics path —
-    /// same thread (the IPC/HTTP/WS servers are FD subscriptions on the
-    /// single event loop), so no atomics, mirroring the non-atomic
-    /// `cursor` discipline above.
-    ///
-    /// Wall-clock secs of the last `pollJail` that ran journalctl to a
-    /// clean `.Exited(0)` (entries or not — the empty-but-OK case counts).
-    /// `0` means "no clean poll has completed yet" → unhealthy per §2.2.
     last_read_ok_ts: i64 = 0,
-    /// Decoded MESSAGEs fed to the callback, lifetime. Baseline-seed
-    /// entries are deliberately NOT counted (they are never fed to the
-    /// callback — the no-history-replay invariant).
     lines_seen: u64 = 0,
 
     fn cursorSlice(self: *const JournalJail) []const u8 {
@@ -655,19 +419,9 @@ pub const JournaldSource = struct {
     allocator: Allocator,
     event_loop: *EventLoop,
     jails: std.ArrayList(JournalJail),
-    /// Sidecar file path (owned copy).
     cursor_path: []u8,
     poll_handle: ?TimerHandle = null,
-    /// True once any jail's cursor changed since the last sidecar flush —
-    /// lets `runDaemon`'s flush skip a no-op write.
     dirty: bool = false,
-    /// Periodic-flush hook (SYS-015). Invoked after a poll tick that
-    /// advanced any cursor, so engine state + the cursor sidecar are
-    /// persisted on the loop thread within ≤1 poll interval of the entries
-    /// they reflect (bounds crash-replay to one interval without a second
-    /// timer). The daemon points this at `journaldFlushHook`, which calls
-    /// `flushStateThenCursors` (state FIRST, then cursors). Null in tests
-    /// that drive `processBatch`/`maybeFlush` directly.
     flush_fn: ?*const fn (?*anyopaque) void = null,
     flush_userdata: ?*anyopaque = null,
 
@@ -700,21 +454,10 @@ pub const JournaldSource = struct {
         self.* = undefined;
     }
 
-    /// True when at least one jail has been registered — the daemon only
-    /// arms the poll timer if the journald source is actually in use.
     pub fn hasJails(self: *const JournaldSource) bool {
         return self.jails.items.len > 0;
     }
 
-    /// Register a journald-backed jail. `filter` selects the selector set.
-    /// The callback + userdata are the SAME `lineCallback` + `*JailContext`
-    /// the file watcher uses. Restored cursors are seeded separately via
-    /// `seedCursor` before `attach`.
-    ///
-    /// Fails closed with `error.UnsupportedJournaldFilter` when the journald
-    /// backend has no selector set for `filter` (v1: only `sshd`). The jail
-    /// is NOT registered in that case — applying sshd selectors to a
-    /// non-sshd jail would silently mis-cover it.
     pub fn addJail(
         self: *JournaldSource,
         jail: JailId,
@@ -733,9 +476,6 @@ pub const JournaldSource = struct {
         }) catch return error.OutOfMemory;
     }
 
-    /// Install the periodic-flush hook (SYS-015 Change 2). Call BEFORE
-    /// `attach()`. `fn_ptr(userdata)` is invoked by `maybeFlush` after any
-    /// poll tick that advanced a cursor.
     pub fn setFlushHook(
         self: *JournaldSource,
         fn_ptr: *const fn (?*anyopaque) void,
@@ -745,8 +485,6 @@ pub const JournaldSource = struct {
         self.flush_userdata = userdata;
     }
 
-    /// Seed a jail's committed cursor from a restored sidecar entry. No-op
-    /// if the jail isn't registered. Call between `addJail` and `attach`.
     pub fn seedCursor(self: *JournaldSource, jail_name: []const u8, cursor: []const u8) void {
         for (self.jails.items) |*jj| {
             if (std.mem.eql(u8, jj.jail.slice(), jail_name)) {
@@ -756,18 +494,12 @@ pub const JournaldSource = struct {
         }
     }
 
-    /// Arm the periodic poll timer. Must be called after all `addJail` /
-    /// `seedCursor` calls and after the source is in its permanent storage
-    /// (the timer callback receives a stable `*JournaldSource`).
     pub fn attach(self: *JournaldSource) Error!void {
         const h = self.event_loop.addTimer(poll_interval_ms, pollTick, self, false) catch
             return error.EventLoopError;
         self.poll_handle = h;
     }
 
-    /// Collect the current (jail, cursor) pairs for jails that have a
-    /// cursor, into `buf`. Returns the populated prefix. Used by the
-    /// daemon's flush to persist the sidecar AFTER engine state is saved.
     pub fn collectCursors(self: *const JournaldSource, buf: []CursorEntry) []CursorEntry {
         var n: usize = 0;
         for (self.jails.items) |*jj| {
@@ -783,17 +515,6 @@ pub const JournaldSource = struct {
         return self.jails.items.len;
     }
 
-    /// Per-jail read-HEALTH for the status surface (SYS-017). Pure
-    /// derivation over the live struct fields — no spawn, no I/O. Returns
-    /// `null` when `name` is not a journald-backed jail (the caller then
-    /// tries the file watcher). The SOURCE label is the daemon's resolved
-    /// descriptor, not this — see `commands.JailSourceSource`.
-    ///
-    /// journald verdict (§2.2): healthy iff at least one clean `journalctl`
-    /// poll has completed (`last_read_ok_ts > 0`). A journald jail that has
-    /// never read cleanly reports `healthy = false` — the genuine negative
-    /// probe that drives DEGRADED for an enforcing jail (§4). (File health
-    /// never reports `false`, so a `false` here is unambiguously journald.)
     pub fn healthForJail(self: *const JournaldSource, name: []const u8) ?JailHealth {
         for (self.jails.items) |*jj| {
             if (std.mem.eql(u8, jj.jail.slice(), name)) {
@@ -807,35 +528,20 @@ pub const JournaldSource = struct {
         return null;
     }
 
-    // ----- poll tick -----
-
     fn pollTick(expirations: u64, userdata: ?*anyopaque) void {
         _ = expirations;
         const self: *JournaldSource = @ptrCast(@alignCast(userdata.?));
         for (self.jails.items) |*jj| {
             self.pollJail(jj) catch |err| {
-                // Transient failure (spawn error, non-zero exit, decode
-                // hiccup) → warn + retry next tick, NEVER crash the daemon.
                 std.log.warn(
                     "journald: poll for jail '{s}' failed: {s}; retrying next tick",
                     .{ jj.jail.slice(), @errorName(err) },
                 );
             };
         }
-        // After processing every jail, flush IF this tick advanced any
-        // cursor — bounds crash-replay to ≤1 poll interval. Quiet ticks
-        // (no new entries) skip the write entirely.
         self.maybeFlush();
     }
 
-    /// Persist engine state + cursors IFF a poll tick advanced a cursor
-    /// since the last flush, then clear the dirty flag. Extracted from
-    /// `pollTick` as a testable seam — a recording hook can verify it
-    /// fires exactly once on a dirty source and not at all on a clean one,
-    /// without spawning journalctl. The hook itself enforces the
-    /// load-bearing ordering (engine state FIRST, then cursor sidecar).
-    /// Single-threaded loop: the hook never re-enters `pollTick`, so no
-    /// recursion.
     pub fn maybeFlush(self: *JournaldSource) void {
         if (!self.dirty) return;
         if (self.flush_fn) |f| {
@@ -850,18 +556,6 @@ pub const JournaldSource = struct {
         NonZeroExit,
     };
 
-    /// One reconcile for one jail: spawn journalctl, then either SEED the
-    /// baseline cursor (first run) or PROCESS new entries (steady state).
-    /// The cursor sidecar is NOT written here — the daemon flushes it AFTER
-    /// engine state, so a crash replays rather than skips (ordering is
-    /// load-bearing).
-    ///
-    /// First run (`cursor_len == 0`): run the `-n 1` baseline query and
-    /// seed the cursor from the single returned entry WITHOUT feeding it to
-    /// the callback. Replaying a pre-existing journal entry on first start
-    /// would ban an offender for an event that predates the daemon —
-    /// exactly the history-replay the locked first-run policy forbids. We
-    /// take only the entry's `__CURSOR` and start AFTER it next tick.
     fn pollJail(self: *JournaldSource, jj: *JournalJail) PollError!void {
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
@@ -869,8 +563,6 @@ pub const JournaldSource = struct {
 
         const first_run = jj.cursor_len == 0;
 
-        // Build argv: baseline (-n 1) on first run, --after-cursor in
-        // steady state.
         const argv = blk: {
             if (first_run) {
                 break :blk buildBaselineArgv(arena, jj.selectors) catch
@@ -892,9 +584,6 @@ pub const JournaldSource = struct {
 
         switch (result.term) {
             .Exited => |code| {
-                // journalctl exits non-zero on real errors. An empty
-                // result with exit 0 is normal (no new entries). We do not
-                // treat a non-zero exit as fatal — warn and bail this tick.
                 if (code != 0) {
                     std.log.warn(
                         "journald: journalctl exited {d} for jail '{s}'",
@@ -912,14 +601,9 @@ pub const JournaldSource = struct {
             },
         }
 
-        // Clean `.Exited(0)` reached (entries or not) — record the
-        // successful read for read-health (SYS-017). Covers both the
-        // baseline-seed first run and the steady-state batch, and the
-        // "no new entries" empty-but-OK case.
         jj.last_read_ok_ts = std.time.timestamp();
 
         if (first_run) {
-            // Seed only — NEVER feed the baseline entry to the callback.
             self.seedBaseline(jj, result.stdout);
             return;
         }
@@ -927,17 +611,6 @@ pub const JournaldSource = struct {
         self.processBatch(jj, result.stdout);
     }
 
-    /// Seed a jail's cursor from the first-run baseline stdout WITHOUT
-    /// processing any entry. Takes the first non-empty line of the `-n 1`
-    /// output, extracts its `__CURSOR` (independently of MESSAGE validity —
-    /// the baseline cares only about the cursor), and on success commits it
-    /// and marks the source dirty so the existing `maybeFlush` →
-    /// `flushStateThenCursors` persists it via the state-then-cursor path.
-    ///
-    /// No entry, or an entry without a `__CURSOR`: leave the cursor empty
-    /// so the next tick re-baselines. (An empty journal for these selectors
-    /// is the common case on a freshly-installed box with no SSH traffic
-    /// yet — we simply keep probing with `-n 1` until something appears.)
     fn seedBaseline(self: *JournaldSource, jj: *JournalJail, stdout: []const u8) void {
         var cursor_buf: [max_cursor_len]u8 = undefined;
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
@@ -946,7 +619,6 @@ pub const JournaldSource = struct {
         while (it.next()) |raw_line| {
             const line = std.mem.trim(u8, raw_line, " \t\r");
             if (line.len == 0) continue;
-            // First non-empty line is the single baseline entry.
             if (extractCursor(arena_state.allocator(), line, &cursor_buf)) |cur| {
                 jj.setCursor(cur);
                 self.dirty = true;
@@ -960,26 +632,10 @@ pub const JournaldSource = struct {
                     .{jj.jail.slice()},
                 );
             }
-            return; // only the first entry matters for the baseline
+            return;
         }
-        // Empty output: no matching entries yet. Stay un-baselined; the
-        // next tick retries the `-n 1` probe.
     }
 
-    /// Process a journalctl `-o json` stdout batch for one jail. Each
-    /// non-empty line is one JSON object. For each entry we decode the
-    /// MESSAGE, feed it to the line callback (which strips any syslog
-    /// prefix — a no-op on bare journal messages — and parses it), and
-    /// THEN advance the pending cursor from that entry's `__CURSOR`.
-    ///
-    /// Cursor invariant: advance ONLY after the callback has fully
-    /// processed the entry, and ONLY from entries that carried a
-    /// `__CURSOR`. An entry without a cursor is still processed but does
-    /// not move the cursor forward.
-    ///
-    /// Bounded by `max_entries_per_tick`: past the cap we stop and resume
-    /// next tick. Because the cursor advanced to the last processed entry,
-    /// the deferred entries are read again next tick — none are lost.
     fn processBatch(self: *JournaldSource, jj: *JournalJail, stdout: []const u8) void {
         var msg_buf: [max_line_len]u8 = undefined;
         var cursor_buf: [max_cursor_len]u8 = undefined;
@@ -997,7 +653,6 @@ pub const JournaldSource = struct {
                 break;
             }
 
-            // Per-entry arena for the transient JSON DOM.
             var arena_state = std.heap.ArenaAllocator.init(self.allocator);
             defer arena_state.deinit();
 
@@ -1007,7 +662,6 @@ pub const JournaldSource = struct {
                 &msg_buf,
                 &cursor_buf,
             ) catch |err| {
-                // Malformed entry — skip without crashing, do not advance.
                 std.log.warn(
                     "journald: skipping malformed entry for jail '{s}': {s}",
                     .{ jj.jail.slice(), @errorName(err) },
@@ -1016,14 +670,9 @@ pub const JournaldSource = struct {
                 continue;
             };
 
-            // Feed the decoded MESSAGE through the SAME callback the file
-            // watcher uses. `truncated = false`: we never deliver partial
-            // journal messages (a too-long MESSAGE is rejected in decode).
             jj.callback(entry.message, jj.jail, false, jj.userdata);
-            jj.lines_seen += 1; // read-health (SYS-017), lifetime
+            jj.lines_seen += 1;
 
-            // Advance the cursor ONLY after the callback has run, and ONLY
-            // from an entry that carried a cursor.
             if (entry.cursor) |cur| {
                 jj.setCursor(cur);
                 self.dirty = true;
@@ -1033,18 +682,9 @@ pub const JournaldSource = struct {
     }
 };
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 const testing = std.testing;
 
-// resolveSource args: (source, logpath_exists, journalctl_present,
-// filter_journald_supported). All probes are injected booleans — pure,
-// fs-free.
-
 test "journald: resolveSource explicit .file always picks file" {
-    // .file ignores every other input.
     try testing.expectEqual(ResolvedSource.file, resolveSource(.file, false, true, true));
     try testing.expectEqual(ResolvedSource.file, resolveSource(.file, false, false, false));
     try testing.expectEqual(ResolvedSource.file, resolveSource(.file, true, false, true));
@@ -1053,36 +693,25 @@ test "journald: resolveSource explicit .file always picks file" {
 test "journald: resolveSource explicit .journald needs journalctl, else fails closed" {
     try testing.expectEqual(ResolvedSource.journald, resolveSource(.journald, false, true, true));
     try testing.expectEqual(ResolvedSource.fail, resolveSource(.journald, false, false, true));
-    // .journald is unaffected by the filter-support flag — that gate is
-    // for `auto` only; an explicit journald jail with a bad filter fails
-    // closed later, at addJail (UnsupportedJournaldFilter).
     try testing.expectEqual(ResolvedSource.journald, resolveSource(.journald, false, true, false));
 }
 
 test "journald: resolveSource auto with an EXISTING logpath picks file (SYS-015)" {
-    // Existence wins regardless of journalctl / filter support.
     try testing.expectEqual(ResolvedSource.file, resolveSource(.auto, true, true, true));
     try testing.expectEqual(ResolvedSource.file, resolveSource(.auto, true, false, true));
     try testing.expectEqual(ResolvedSource.file, resolveSource(.auto, true, true, false));
 }
 
 test "journald: resolveSource auto with ABSENT log + sshd + journalctl picks journald (SYS-015)" {
-    // The reopened-bug case: shipped sshd jail, /var/log/auth.log absent on
-    // a journald-only box -> journald, not an inert file tail.
     try testing.expectEqual(ResolvedSource.journald, resolveSource(.auto, false, true, true));
 }
 
 test "journald: resolveSource auto with ABSENT log + NON-sshd filter stays file (no fail-closed)" {
-    // The filter gate: an absent-log nginx jail must NOT route to journald
-    // (which would fail closed at wiring with UnsupportedJournaldFilter).
-    // It degrades to a file tail so the daemon still starts.
     try testing.expectEqual(ResolvedSource.file, resolveSource(.auto, false, true, false));
 }
 
 test "journald: resolveSource auto with ABSENT log + sshd but NO journalctl stays file" {
-    // No journald available -> fall through to file (auto never fails closed).
     try testing.expectEqual(ResolvedSource.file, resolveSource(.auto, false, false, true));
-    // And with neither journalctl nor filter support, still file.
     try testing.expectEqual(ResolvedSource.file, resolveSource(.auto, false, false, false));
 }
 
@@ -1090,19 +719,13 @@ test "journald: selectorsForFilter returns the set for sshd, null otherwise" {
     const sshd = selectorsForFilter("sshd");
     try testing.expect(sshd != null);
     try testing.expectEqual(@as(usize, sshd_selectors.len), sshd.?.len);
-    // Any non-sshd filter is unsupported in v1 → null (fail closed).
     try testing.expect(selectorsForFilter("nginx-http-auth") == null);
     try testing.expect(selectorsForFilter("apache-auth") == null);
     try testing.expect(selectorsForFilter("") == null);
-    // Not a prefix/substring match — must be exact.
     try testing.expect(selectorsForFilter("sshd-ddos") == null);
 }
 
 test "journald: config_mod.filterSupportsJournald stays in sync with selectorsForFilter" {
-    // The config layer's boolean gate (used by validate's would-use-journald
-    // warning) MUST agree with the authoritative selector table here. If a
-    // v2 filter gains journald selectors, this test forces both to move
-    // together.
     const candidates = [_][]const u8{ "sshd", "nginx-http-auth", "apache-auth", "postfix", "dovecot", "", "sshd-ddos" };
     for (candidates) |f| {
         try testing.expectEqual(selectorsForFilter(f) != null, config_mod.filterSupportsJournald(f));
@@ -1121,11 +744,9 @@ test "journald: addJail fails closed on an unsupported filter and does not regis
         error.UnsupportedJournaldFilter,
         src.addJail(jail, "nginx-http-auth", CallRecorder.onLine, null),
     );
-    // The jail must NOT have been registered.
     try testing.expectEqual(@as(usize, 0), src.jailCount());
     try testing.expect(!src.hasJails());
 
-    // A supported filter still registers fine.
     const sshd = try JailId.fromSlice("sshd");
     try src.addJail(sshd, "sshd", CallRecorder.onLine, null);
     try testing.expectEqual(@as(usize, 1), src.jailCount());
@@ -1135,9 +756,6 @@ test "journald: selector argv ORs across fields with a standalone +" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const argv = try buildPollArgv(arena.allocator(), &sshd_selectors, "--after-cursor=s=abc");
-    // Expected token order:
-    //   journalctl SYSLOG_IDENTIFIER=sshd SYSLOG_IDENTIFIER=sshd-session
-    //   + _COMM=sshd _COMM=sshd-session -o json --no-pager -q --after-cursor=...
     const expect = [_][]const u8{
         config_mod.journalctl_path,
         "SYSLOG_IDENTIFIER=sshd",
@@ -1155,7 +773,6 @@ test "journald: selector argv ORs across fields with a standalone +" {
     for (expect, argv) |e, got| {
         try testing.expectEqualStrings(e, got);
     }
-    // The '+' must be its own standalone token.
     try testing.expectEqualStrings("+", argv[3]);
 }
 
@@ -1163,7 +780,6 @@ test "journald: baseline argv uses -n 1, no --after-cursor" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const argv = try buildBaselineArgv(arena.allocator(), &sshd_selectors);
-    // Must contain -n 1 and must NOT contain any --after-cursor token.
     var saw_n = false;
     var saw_one = false;
     for (argv, 0..) |tok, i| {
@@ -1195,7 +811,6 @@ test "journald: decodeEntry byte-array MESSAGE decodes to raw bytes" {
     defer arena.deinit();
     var msg_buf: [max_line_len]u8 = undefined;
     var cur_buf: [max_cursor_len]u8 = undefined;
-    // "Hi" + 0xFF (non-UTF8) exported as an integer array.
     const line =
         \\{"MESSAGE":[72,105,255],"__CURSOR":"s=x"}
     ;
@@ -1249,8 +864,6 @@ test "journald: decodeEntry without __CURSOR yields a null cursor (line still de
     try testing.expect(e.cursor == null);
 }
 
-// ----- A fake processBatch harness proving the cursor invariant -----
-
 const CallRecorder = struct {
     lines: std.ArrayList([]const u8),
     fn init(a: Allocator) CallRecorder {
@@ -1274,7 +887,6 @@ test "journald: processBatch feeds callback then advances cursor only from entri
     var loop = try EventLoop.init(testing.allocator);
     defer loop.deinit();
 
-    // We don't arm a timer here; we drive processBatch directly.
     var src = try JournaldSource.init(testing.allocator, &loop, "/tmp/fail2zig-test/state.bin");
     defer src.deinit();
 
@@ -1285,9 +897,6 @@ test "journald: processBatch feeds callback then advances cursor only from entri
     try src.addJail(jail, "sshd", CallRecorder.onLine, &rec);
     const jj = &src.jails.items[0];
 
-    // Two entries: the first with a cursor, the second WITHOUT. Both
-    // messages must reach the callback; the committed cursor must be the
-    // first entry's (the second carried none, so it cannot advance it).
     const batch =
         "{\"MESSAGE\":\"Invalid user a from 1.1.1.1 port 1\",\"__CURSOR\":\"s=first;i=1\"}\n" ++
         "{\"MESSAGE\":\"Invalid user b from 2.2.2.2 port 2\"}\n";
@@ -1366,7 +975,6 @@ test "journald: cursor sidecar corruption re-seeds (empty)" {
     const entries = [_]CursorEntry{.{ .name = "sshd", .cursor = "s=abc" }};
     try saveCursors(&entries, path);
 
-    // Flip a byte in the record region (after the 10-byte header).
     {
         const f = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
         defer f.close();
@@ -1397,7 +1005,6 @@ test "journald: collectCursors only includes jails with a cursor" {
     try src.addJail(sshd, "sshd", CallRecorder.onLine, null);
     try src.addJail(nginx, "sshd", CallRecorder.onLine, null);
 
-    // Seed only sshd's cursor.
     src.seedCursor("sshd", "s=seeded");
 
     var buf: [max_jails]CursorEntry = undefined;
@@ -1406,8 +1013,6 @@ test "journald: collectCursors only includes jails with a cursor" {
     try testing.expectEqualStrings("sshd", got[0].name);
     try testing.expectEqualStrings("s=seeded", got[0].cursor);
 }
-
-// ----- Change 2: periodic-flush seam -----
 
 const FlushSpy = struct {
     calls: u32 = 0,
@@ -1427,13 +1032,11 @@ test "journald: maybeFlush fires the hook once on a dirty source and clears dirt
     var spy = FlushSpy{};
     src.setFlushHook(FlushSpy.hook, &spy);
 
-    // Mark dirty (as a successful batch with an advanced cursor would).
     src.dirty = true;
     src.maybeFlush();
     try testing.expectEqual(@as(u32, 1), spy.calls);
     try testing.expect(!src.dirty);
 
-    // A second call with no new dirtiness must NOT fire the hook again.
     src.maybeFlush();
     try testing.expectEqual(@as(u32, 1), spy.calls);
 }
@@ -1448,7 +1051,6 @@ test "journald: maybeFlush does nothing on a clean source" {
     var spy = FlushSpy{};
     src.setFlushHook(FlushSpy.hook, &spy);
 
-    // Never marked dirty — a quiet tick must not write anything.
     src.maybeFlush();
     try testing.expectEqual(@as(u32, 0), spy.calls);
     try testing.expect(!src.dirty);
@@ -1478,14 +1080,11 @@ test "journald: processBatch marks dirty so maybeFlush will fire" {
     try testing.expect(!src.dirty);
 }
 
-// ----- First-run baseline: seed cursor WITHOUT replay -----
-
 test "journald: extractCursor returns the cursor even when MESSAGE is missing/malformed" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var cur_buf: [max_cursor_len]u8 = undefined;
 
-    // No MESSAGE at all, but a valid __CURSOR → must still extract.
     const no_msg =
         \\{"__CURSOR":"s=base;i=42","PRIORITY":"6"}
     ;
@@ -1493,8 +1092,6 @@ test "journald: extractCursor returns the cursor even when MESSAGE is missing/ma
     try testing.expect(c1 != null);
     try testing.expectEqualStrings("s=base;i=42", c1.?);
 
-    // Malformed MESSAGE (out-of-range byte-array) but valid __CURSOR → the
-    // baseline only cares about the cursor, so it must still extract.
     const bad_msg =
         \\{"MESSAGE":[999],"__CURSOR":"s=base2"}
     ;
@@ -1502,13 +1099,11 @@ test "journald: extractCursor returns the cursor even when MESSAGE is missing/ma
     try testing.expect(c2 != null);
     try testing.expectEqualStrings("s=base2", c2.?);
 
-    // No __CURSOR → null (cannot baseline from this entry).
     const no_cursor =
         \\{"MESSAGE":"Invalid user x from 1.2.3.4 port 22"}
     ;
     try testing.expect(extractCursor(arena.allocator(), no_cursor, &cur_buf) == null);
 
-    // Not even a JSON object → null.
     try testing.expect(extractCursor(arena.allocator(), "{not json", &cur_buf) == null);
 }
 
@@ -1529,18 +1124,12 @@ test "journald: seedBaseline sets cursor + dirty but does NOT invoke the callbac
         "{\"MESSAGE\":\"some recent journal line\",\"__CURSOR\":\"s=tail;i=7\"}\n";
     src.seedBaseline(jj, baseline);
 
-    // Cursor seeded, source dirty (so maybeFlush persists it), and the
-    // callback was NEVER invoked — the baseline entry is not processed.
     try testing.expectEqualStrings("s=tail;i=7", jj.cursorSlice());
     try testing.expect(src.dirty);
     try testing.expectEqual(@as(usize, 0), rec.lines.items.len);
 }
 
 test "journald: first-run baseline of a FAILURE entry does not ban (no callback)" {
-    // The exact SYS-015 acceptance: a pre-existing FAILURE in the journal
-    // must not be processed/banned on first start. With maxretry=1 the
-    // real lineCallback would ban this on a single match — proving the
-    // baseline entry never reaches the callback is proving it never bans.
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var loop = try EventLoop.init(testing.allocator);
     defer loop.deinit();
@@ -1556,8 +1145,8 @@ test "journald: first-run baseline of a FAILURE entry does not ban (no callback)
         "{\"MESSAGE\":\"Invalid user attacker from 203.0.113.9 port 22\",\"__CURSOR\":\"s=preexisting\"}\n";
     src.seedBaseline(jj, baseline);
 
-    try testing.expectEqual(@as(usize, 0), rec.lines.items.len); // not processed
-    try testing.expectEqualStrings("s=preexisting", jj.cursorSlice()); // but baselined
+    try testing.expectEqual(@as(usize, 0), rec.lines.items.len);
+    try testing.expectEqualStrings("s=preexisting", jj.cursorSlice());
 }
 
 test "journald: seedBaseline with empty output leaves the jail un-baselined" {
@@ -1572,17 +1161,13 @@ test "journald: seedBaseline with empty output leaves the jail un-baselined" {
     try src.addJail(jail, "sshd", CallRecorder.onLine, &rec);
     const jj = &src.jails.items[0];
 
-    // No matching journal entries yet (fresh box, no SSH traffic).
     src.seedBaseline(jj, "");
-    try testing.expectEqual(@as(usize, 0), jj.cursor_len); // stays un-baselined
+    try testing.expectEqual(@as(usize, 0), jj.cursor_len);
     try testing.expect(!src.dirty);
     try testing.expectEqual(@as(usize, 0), rec.lines.items.len);
 }
 
 test "journald: steady-state processBatch STILL invokes the callback (contrast with baseline)" {
-    // Guards the steady-state path: once a cursor exists, --after-cursor
-    // entries ARE processed (and advance the cursor). This is the
-    // deliberate counterpart to the no-replay baseline behaviour above.
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var loop = try EventLoop.init(testing.allocator);
     defer loop.deinit();
@@ -1594,21 +1179,16 @@ test "journald: steady-state processBatch STILL invokes the callback (contrast w
     try src.addJail(jail, "sshd", CallRecorder.onLine, &rec);
     const jj = &src.jails.items[0];
 
-    // Simulate "already baselined" by giving the jail a cursor.
     jj.setCursor("s=already-baselined");
     const batch =
         "{\"MESSAGE\":\"Invalid user x from 5.5.5.5 port 1\",\"__CURSOR\":\"s=new1\"}\n";
     src.processBatch(jj, batch);
 
-    try testing.expectEqual(@as(usize, 1), rec.lines.items.len); // processed
+    try testing.expectEqual(@as(usize, 1), rec.lines.items.len);
     try testing.expectEqualStrings("Invalid user x from 5.5.5.5 port 1", rec.lines.items[0]);
-    try testing.expectEqualStrings("s=new1", jj.cursorSlice()); // advanced
-    // SYS-017: a delivered MESSAGE increments lines_seen (baseline entries
-    // do not — see the seedBaseline tests above, which never touch it).
+    try testing.expectEqualStrings("s=new1", jj.cursorSlice());
     try testing.expectEqual(@as(u64, 1), jj.lines_seen);
 }
-
-// --- SYS-017 read-health verdict (pure: drive the struct fields directly) ---
 
 test "journald: healthForJail unhealthy until a clean poll completes (SYS-017)" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
@@ -1621,15 +1201,10 @@ test "journald: healthForJail unhealthy until a clean poll completes (SYS-017)" 
     try src.addJail(try JailId.fromSlice("sshd"), "sshd", CallRecorder.onLine, &rec);
     const jj = &src.jails.items[0];
 
-    // No clean poll yet → unhealthy (the genuine negative probe that can
-    // drive DEGRADED for an enforcing journald jail). HEALTH only — the
-    // SOURCE label is the daemon's resolved descriptor, not this.
     const h0 = src.healthForJail("sshd").?;
     try testing.expect(!h0.healthy);
     try testing.expectEqual(@as(u64, 0), h0.lines_seen);
 
-    // After one clean poll the jail is healthy regardless of traffic
-    // (the conservative "ever read successfully?" threshold).
     jj.last_read_ok_ts = 1234;
     jj.lines_seen = 7;
     const h1 = src.healthForJail("sshd").?;

@@ -1,27 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Command-line argument parser for fail2zig-client.
-//!
-//! Grammar:
-//!   fail2zig-client [global-flags] <command> [command-args]
-//!
-//! Global flags (order-independent, may appear before or after the command):
-//!   --socket <path>      Unix socket path
-//!   --output <fmt>       table | json | plain
-//!   --no-color           Disable ANSI color escapes
-//!   --timeout <ms>       Command timeout in milliseconds
-//!   --help, -h           Show help and exit
-//!   --version, -V        Print client version and exit (no daemon call)
-//!
-//! Commands:
-//!   status
-//!   ban <ip> [--jail <name>] [--duration <seconds>]
-//!   unban <ip> [--jail <name>]
-//!   list [--jail <name>]
-//!   jails
-//!   reload
-//!   version
-//!   completions <bash|zsh|fish>
 
 const std = @import("std");
 const shared = @import("shared");
@@ -55,18 +33,16 @@ pub const Shell = enum {
     }
 };
 
-/// All commands the client can dispatch. Strings hold borrowed views into argv
-/// — parsed args share lifetime with the caller's argv allocation.
 pub const Command = union(enum) {
-    help: ?[]const u8, // optional sub-topic
-    version: void, // client-side version (no daemon call)
+    help: ?[]const u8,
+    version: void,
     status: void,
     ban: BanArgs,
     unban: UnbanArgs,
     list: ListArgs,
     jails: void,
     reload: void,
-    remote_version: void, // daemon's version response
+    remote_version: void,
     completions: Shell,
 
     pub const BanArgs = struct {
@@ -88,7 +64,7 @@ pub const Command = union(enum) {
 pub const Globals = struct {
     socket_path: []const u8 = default_socket_path,
     output: OutputFormat = .table,
-    color: bool = true, // true if color allowed; still gated by isatty at render time
+    color: bool = true,
     timeout_ms: u64 = default_timeout_ms,
 };
 
@@ -107,8 +83,6 @@ pub const Error = error{
     TooManyArguments,
 };
 
-/// Parsed error context. The `message` lives in `buf` and is valid for the
-/// parser's lifetime OR until the caller copies it.
 pub const ParseDiag = struct {
     buf: [256]u8 = [_]u8{0} ** 256,
     len: usize = 0,
@@ -128,13 +102,10 @@ pub const ParseDiag = struct {
     }
 };
 
-/// Parse argv (excluding program name). Returns Parsed on success; on error,
-/// `diag` is populated with a user-facing message.
 pub fn parse(argv: []const []const u8, diag: *ParseDiag) Error!Parsed {
     var globals = Globals{};
     var i: usize = 0;
 
-    // Phase 1: eat global flags up to the first non-flag (the command).
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
         if (a.len == 0) continue;
@@ -181,7 +152,6 @@ pub fn parse(argv: []const []const u8, diag: *ParseDiag) Error!Parsed {
             };
             continue;
         }
-        // Non-flag -> it's the command. Stop phase 1.
         break;
     }
 
@@ -237,7 +207,6 @@ pub fn parse(argv: []const []const u8, diag: *ParseDiag) Error!Parsed {
 }
 
 fn expectNoPositional(rest: []const []const u8, cmd: []const u8, diag: *ParseDiag, globals: *Globals) Error!void {
-    // Allow trailing global flags (e.g. `status --output json`), but no positionals.
     var k: usize = 0;
     while (k < rest.len) : (k += 1) {
         const a = rest[k];
@@ -385,9 +354,6 @@ fn parseCompletions(rest: []const []const u8, globals: *Globals, diag: *ParseDia
     return Parsed{ .globals = globals.*, .command = .{ .completions = shell.? } };
 }
 
-/// Recognize a global flag appearing after the command. Returns true if
-/// consumed (and advances `idx` past the value). Unknown flags return false
-/// so the caller can emit a command-specific error.
 fn takeTrailingGlobal(
     a: []const u8,
     rest: []const []const u8,
@@ -435,10 +401,6 @@ fn takeTrailingGlobal(
     return false;
 }
 
-// ============================================================================
-// Command suggestion (Levenshtein distance)
-// ============================================================================
-
 pub const known_commands = [_][]const u8{
     "status",
     "ban",
@@ -451,8 +413,6 @@ pub const known_commands = [_][]const u8{
     "help",
 };
 
-/// Suggest the closest known command within edit distance 3; returns null if
-/// no command is close enough.
 pub fn closestCommand(input: []const u8) ?[]const u8 {
     var best_dist: usize = std.math.maxInt(usize);
     var best: ?[]const u8 = null;
@@ -463,15 +423,10 @@ pub fn closestCommand(input: []const u8) ?[]const u8 {
             best = cmd;
         }
     }
-    // Only suggest if we're within an edit distance of 3 (avoids nonsensical
-    // suggestions for totally unrelated input).
     if (best_dist <= 3) return best;
     return null;
 }
 
-/// Classic Levenshtein distance with a 2-row rolling buffer, case-insensitive
-/// for ASCII letters. Max supported input length: 128 bytes (CLI commands are
-/// tiny; longer inputs return max distance).
 pub fn editDistance(a: []const u8, b: []const u8) usize {
     const max_len = 128;
     if (a.len > max_len or b.len > max_len) return std.math.maxInt(usize);
@@ -502,10 +457,6 @@ pub fn editDistance(a: []const u8, b: []const u8) usize {
 fn asciiLower(c: u8) u8 {
     return if (c >= 'A' and c <= 'Z') c + 32 else c;
 }
-
-// ============================================================================
-// Help text
-// ============================================================================
 
 pub const help_top =
     \\fail2zig-client — query and control the fail2zig daemon
@@ -604,10 +555,6 @@ pub fn helpFor(topic: ?[]const u8) []const u8 {
     if (std.mem.eql(u8, t, "completions")) return help_completions;
     return help_top;
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 fn parseOk(argv: []const []const u8) !Parsed {
     var diag: ParseDiag = .{};
@@ -821,7 +768,6 @@ test "args: helpFor returns topical help" {
 }
 
 test "args: use shared types" {
-    // Ensure shared types are reachable from this module (keeps linkage honest).
     _ = shared.IpAddress;
     _ = shared.JailId;
 }

@@ -1,36 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! fail2ban → fail2zig migration tool.
-//!
-//! Reads a fail2ban config directory (jail.conf + jail.local + jail.d/
-//! + filter.d/*.conf) and produces an equivalent fail2zig native TOML
-//! config, emitting a MigrationReport that summarizes what was
-//! translated, what was skipped, and every warning encountered along
-//! the way.
-//!
-//! Design notes:
-//!   * Filters listed by name (`filter = sshd`) are resolved first
-//!     against the built-in filter registry; any name not found there
-//!     is attempted as a user filter via `filter.d/<name>.conf`.
-//!     Either path succeeding marks the jail as viable.
-//!   * Unknown backends / action names map to `.log-only` with a
-//!     warning — the operator still sees the ban decision in the log
-//!     and can iterate.
-//!   * Output is always written, even when no jails are viable, so
-//!     operators can see the skeleton and diff against their expected
-//!     layout. Zero-jail imports exit with code 1 at the CLI layer.
-//!   * All allocations flow through a caller-provided arena. The arena
-//!     outlives the `MigrationReport` — every slice in the report
-//!     (warnings, output_path) points into it.
 
 const std = @import("std");
 const fail2ban = @import("fail2ban.zig");
 const native = @import("native.zig");
 const registry = @import("../filters/registry.zig");
-
-// ============================================================================
-// Public error set
-// ============================================================================
 
 pub const Error = error{
     FileNotFound,
@@ -53,12 +27,6 @@ pub const Error = error{
     NoJailsImported,
 };
 
-// ============================================================================
-// MigrationReport
-// ============================================================================
-
-/// Summary of the migration outcome. String slices inside `warnings`
-/// and `output_path` live in the arena supplied to `importConfig`.
 pub const MigrationReport = struct {
     jails_imported: u32 = 0,
     jails_skipped: u32 = 0,
@@ -69,8 +37,6 @@ pub const MigrationReport = struct {
     output_path: []const u8 = "",
 };
 
-/// Pretty-print the migration report to `writer`. One line of summary,
-/// then any warnings indented beneath.
 pub fn printReport(report: MigrationReport, writer: anytype) !void {
     try writer.print(
         "migration: imported={d} skipped={d} filters(translated={d} builtin={d} skipped={d}) output='{s}'\n",
@@ -91,10 +57,6 @@ pub fn printReport(report: MigrationReport, writer: anytype) !void {
     }
 }
 
-// ============================================================================
-// Internal context
-// ============================================================================
-
 const Context = struct {
     arena: std.mem.Allocator,
     source_dir: []const u8,
@@ -107,14 +69,6 @@ const Context = struct {
     }
 };
 
-// ============================================================================
-// Public entry point
-// ============================================================================
-
-/// Run the migration. `source_dir` is the fail2ban config root (e.g.
-/// `/etc/fail2ban`). `output_path` is the file to write the native TOML
-/// config into (atomic write: tmp file + rename). `arena` must outlive
-/// the returned report.
 pub fn importConfig(
     arena: std.mem.Allocator,
     source_dir: []const u8,
@@ -122,23 +76,19 @@ pub fn importConfig(
 ) Error!MigrationReport {
     var ctx = Context{ .arena = arena, .source_dir = source_dir };
 
-    // Load the merged jail tree (jail.conf + jail.local + jail.d/*).
     var ini = fail2ban.loadJailConfig(arena, source_dir) catch |err| switch (err) {
         error.FileNotFound, error.AccessDenied, error.ReadFailed => return err,
         else => |e| return e,
     };
 
-    // Carry forward any warnings generated during INI parse/interpolation.
     for (ini.warnings.items) |w| {
         try ctx.warn("{s}:{d}: {s}", .{ w.source, w.line, w.message });
     }
 
-    // Build a native Config shell.
     var cfg = native.Config{};
     cfg.global = .{};
     cfg.defaults = try extractDefaults(&ctx, &ini);
 
-    // Translate each non-DEFAULT section into a JailConfig.
     var jails = std.ArrayListUnmanaged(native.JailConfig){};
     errdefer jails.deinit(arena);
 
@@ -157,8 +107,6 @@ pub fn importConfig(
 
     cfg.jails = try jails.toOwnedSlice(arena);
 
-    // Validate the native config. Warnings on validation failure, but
-    // we still write the output so the operator can fix up manually.
     native.validate(&cfg) catch |err| {
         try ctx.warn(
             "generated config failed validation: {s} — review the TOML before starting the daemon",
@@ -166,17 +114,12 @@ pub fn importConfig(
         );
     };
 
-    // Write the TOML.
     try writeTomlAtomic(arena, &cfg, output_path);
 
     ctx.report.warnings = try ctx.warnings.toOwnedSlice(arena);
     ctx.report.output_path = try arena.dupe(u8, output_path);
     return ctx.report;
 }
-
-// ============================================================================
-// Defaults extraction
-// ============================================================================
 
 fn extractDefaults(
     ctx: *Context,
@@ -212,25 +155,14 @@ fn extractDefaults(
     return out;
 }
 
-// ============================================================================
-// Jail translation
-// ============================================================================
-
 fn translateJail(
     ctx: *Context,
     sec: *fail2ban.Section,
     _: *fail2ban.ParsedIni,
 ) Error!?native.JailConfig {
-    // Honor `enabled = false` — skip entirely.
     if (sec.get("enabled")) |v| {
         if (!parseBool(v)) return null;
-    } else {
-        // fail2ban defaults enabled to false unless explicitly set in
-        // jail.local or DEFAULT. We mirror that — a jail that doesn't
-        // say enabled=true gets imported BUT marked disabled, so the
-        // operator can diff against fail2zig's native enabled-by-default
-        // posture and decide.
-    }
+    } else {}
 
     var jail = native.JailConfig{
         .name = try ctx.arena.dupe(u8, sec.name),
@@ -297,7 +229,6 @@ fn translateJail(
         jail.ignoreip = try splitWhitespaceList(ctx.arena, v);
     }
 
-    // bantime.increment (fail2ban) → bantime_increment (fail2zig)
     if (sec.get("bantime.increment")) |v| {
         jail.bantime_increment.enabled = parseBool(v);
     }
@@ -324,11 +255,9 @@ fn translateJail(
 
 const FilterResolution = enum { builtin, translated };
 
-/// Resolve a filter name: built-in first, then `filter.d/<name>.conf`.
 fn resolveFilter(ctx: *Context, name: []const u8) ?FilterResolution {
     if (registry.get(name) != null) return .builtin;
 
-    // Try filter.d/<name>.conf.
     const sub_path = std.fmt.allocPrint(ctx.arena, "filter.d/{s}.conf", .{name}) catch return null;
     const full = std.fs.path.join(ctx.arena, &[_][]const u8{ ctx.source_dir, sub_path }) catch return null;
 
@@ -348,22 +277,14 @@ fn resolveFilter(ctx: *Context, name: []const u8) ?FilterResolution {
         return null;
     }
 
-    // Log a one-line summary of what was translated.
     ctx.warn("filter '{s}': translated {d} pattern(s) from filter.d/{s}.conf", .{ name, f.failregex.len, name }) catch {};
     return .translated;
 }
 
-// ============================================================================
-// Value helpers
-// ============================================================================
-
-/// Parse a fail2ban duration (integer seconds, or suffixed form like
-/// `10m`, `1h`, `1d`, `1w`). Returns null on parse failure.
 pub fn parseDuration(raw: []const u8) ?u64 {
     const trimmed = std.mem.trim(u8, raw, " \t");
     if (trimmed.len == 0) return null;
 
-    // Split numeric prefix from optional suffix.
     var split: usize = 0;
     while (split < trimmed.len) : (split += 1) {
         const c = trimmed[split];
@@ -375,8 +296,6 @@ pub fn parseDuration(raw: []const u8) ?u64 {
     const rest = std.mem.trim(u8, trimmed[split..], " \t");
     if (rest.len == 0) return n;
 
-    // Support both single-letter and word suffixes (s, m, h, d, w, mo,
-    // y). fail2ban's docs call out these forms explicitly.
     const Unit = struct { suf: []const u8, mul: u64 };
     const units = [_]Unit{
         .{ .suf = "seconds", .mul = 1 },
@@ -432,8 +351,6 @@ fn splitWhitespaceList(arena: std.mem.Allocator, raw: []const u8) Error![]const 
 }
 
 fn splitLogpath(arena: std.mem.Allocator, raw: []const u8) Error![]const []const u8 {
-    // fail2ban's logpath is typically newline-separated (multi-line
-    // value) but some filters use whitespace. Honor both.
     var list = std.ArrayListUnmanaged([]const u8){};
     errdefer list.deinit(arena);
     var it = std.mem.tokenizeAny(u8, raw, "\n");
@@ -448,8 +365,6 @@ fn splitLogpath(arena: std.mem.Allocator, raw: []const u8) Error![]const []const
 
 fn mapBanaction(ctx: *Context, raw: []const u8) native.BanAction {
     const trimmed = std.mem.trim(u8, raw, " \t");
-    // fail2ban often uses `action[param=...]` syntax. Strip the bracket
-    // portion for mapping purposes.
     const bracket_idx = std.mem.indexOfScalar(u8, trimmed, '[') orelse trimmed.len;
     const name = std.mem.trim(u8, trimmed[0..bracket_idx], " \t");
 
@@ -461,10 +376,6 @@ fn mapBanaction(ctx: *Context, raw: []const u8) native.BanAction {
     return .@"log-only";
 }
 
-// ============================================================================
-// TOML writer (native-config subset)
-// ============================================================================
-
 fn writeTomlAtomic(
     arena: std.mem.Allocator,
     cfg: *const native.Config,
@@ -472,7 +383,6 @@ fn writeTomlAtomic(
 ) Error!void {
     const tmp_path = try std.fmt.allocPrint(arena, "{s}.tmp", .{output_path});
 
-    // Ensure parent directory exists.
     if (std.fs.path.dirname(output_path)) |parent| {
         std.fs.cwd().makePath(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
@@ -480,13 +390,11 @@ fn writeTomlAtomic(
         };
     }
 
-    // Render into a buffer so any error aborts before we touch disk.
     var buf = std.ArrayListUnmanaged(u8){};
     defer buf.deinit(arena);
     const w = buf.writer(arena);
     try renderToml(cfg, w);
 
-    // Atomic write: tmp file + rename.
     const tmp_file = std.fs.cwd().createFile(tmp_path, .{ .mode = 0o644 }) catch return error.WriteFailed;
     {
         defer tmp_file.close();
@@ -503,7 +411,6 @@ fn renderToml(cfg: *const native.Config, w: anytype) !void {
         \\
     );
 
-    // [global]
     try w.writeAll("[global]\n");
     try w.print("log_level = \"{s}\"\n", .{@tagName(cfg.global.log_level)});
     try writeQuoted(w, "pid_file", cfg.global.pid_file);
@@ -514,7 +421,6 @@ fn renderToml(cfg: *const native.Config, w: anytype) !void {
     try w.print("metrics_port = {d}\n", .{cfg.global.metrics_port});
     try w.writeAll("\n");
 
-    // [defaults]
     try w.writeAll("[defaults]\n");
     try w.print("bantime = {d}\n", .{cfg.defaults.bantime});
     try w.print("findtime = {d}\n", .{cfg.defaults.findtime});
@@ -525,7 +431,6 @@ fn renderToml(cfg: *const native.Config, w: anytype) !void {
     }
     try w.writeAll("\n");
 
-    // [jails.*]
     for (cfg.jails) |j| {
         try w.print("[jails.{s}]\n", .{j.name});
         try w.print("enabled = {s}\n", .{if (j.enabled) "true" else "false"});
@@ -574,10 +479,6 @@ fn writeStringArray(w: anytype, key: []const u8, items: []const []const u8) !voi
     try w.writeAll("]\n");
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 const testing = std.testing;
 
 test "migration: parseDuration plain integer" {
@@ -605,7 +506,6 @@ test "migration: writes valid TOML that native parser can reload" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Build a mock fail2ban config tree.
     try tmp.dir.writeFile(.{
         .sub_path = "jail.conf",
         .data =
@@ -639,13 +539,11 @@ test "migration: writes valid TOML that native parser can reload" {
     try testing.expectEqual(@as(u32, 2), report.jails_imported);
     try testing.expect(report.filters_builtin >= 2);
 
-    // Reload the emitted TOML through the native parser and assert it's valid.
     var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena2.deinit();
     const cfg = try native.Config.loadFile(arena2.allocator(), out);
     try testing.expectEqual(@as(usize, 2), cfg.jails.len);
 
-    // Find sshd jail and verify translated values.
     var sshd_jail: ?native.JailConfig = null;
     for (cfg.jails) |j| {
         if (std.mem.eql(u8, j.name, "sshd")) sshd_jail = j;
@@ -705,7 +603,6 @@ test "migration: warns on unknown filter but still writes output" {
     const out = try std.fs.path.join(arena.allocator(), &.{ source, "out.toml" });
 
     const report = try importConfig(arena.allocator(), source, out);
-    // The jail still appears — but disabled, and with a warning.
     try testing.expectEqual(@as(u32, 1), report.filters_skipped);
     var found_filter_warning = false;
     for (report.warnings) |w| {
@@ -713,12 +610,10 @@ test "migration: warns on unknown filter but still writes output" {
     }
     try testing.expect(found_filter_warning);
 
-    // Output exists and parses cleanly.
     var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena2.deinit();
     const cfg = try native.Config.loadFile(arena2.allocator(), out);
     try testing.expectEqual(@as(usize, 1), cfg.jails.len);
-    // Because the filter was unresolvable, the jail was forced off.
     try testing.expect(!cfg.jails[0].enabled);
 }
 

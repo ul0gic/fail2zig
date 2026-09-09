@@ -1,28 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Startup-time benchmark.
-//!
-//! Measures wall-clock time from process spawn to "daemon has opened its
-//! IPC socket and is ready to serve requests". Approximates the
-//! operator-visible cold-start metric the PRD promises (<100ms).
-//!
-//! How we measure:
-//!
-//!   * Write a minimal valid config into a fresh tmp directory.
-//!   * `std.process.Child.spawn` the already-built `zig-out/bin/fail2zig`.
-//!   * Start a monotonic timer immediately before spawn.
-//!   * Poll the IPC socket path until `connect(2)` succeeds.
-//!   * Stop the timer the moment the connection is accepted.
-//!
-//! The ready definition is "listen+accept working" — the daemon has
-//! processed config, set up the event loop, bound the socket, and is
-//! in `accept()` ready to serve. That's the first moment a client
-//! request could possibly succeed.
-//!
-//! Skips when the daemon binary isn't built OR the daemon can't actually
-//! come up (no firewall backend). Both are legitimate environment
-//! conditions and the operator-visible number is only meaningful when
-//! all preconditions line up.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -41,7 +18,6 @@ test "benchmark: daemon startup time under target" {
 
     const a = testing.allocator;
 
-    // Daemon binary must be present. Skip cleanly if it isn't.
     std.fs.cwd().access("zig-out/bin/fail2zig", .{}) catch return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
@@ -61,13 +37,11 @@ test "benchmark: daemon startup time under target" {
     const pid_path = try std.fmt.allocPrint(a, "{s}/fail2zig.pid", .{tmp_abs});
     defer a.free(pid_path);
 
-    // Log file has to exist before the watcher attaches.
     {
         var f = try std.fs.cwd().createFile(log_path, .{ .truncate = true });
         f.close();
     }
 
-    // Write config.
     {
         var f = try std.fs.cwd().createFile(config_path, .{ .truncate = true });
         defer f.close();
@@ -97,7 +71,6 @@ test "benchmark: daemon startup time under target" {
         );
     }
 
-    // Spawn the daemon.
     var argv = [_][]const u8{
         "zig-out/bin/fail2zig",
         "--foreground",
@@ -107,19 +80,17 @@ test "benchmark: daemon startup time under target" {
     var child = std.process.Child.init(&argv, a);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore; // suppressed — this is a measurement, not a functional test.
+    child.stderr_behavior = .Ignore;
 
     var timer = try std.time.Timer.start();
     const t0 = timer.read();
     child.spawn() catch return error.SkipZigTest;
     defer _ = child.kill() catch {};
 
-    // Poll for socket readiness. Cap at 3s so a daemon that never comes
-    // up produces a clean skip, not a hang.
     var ready_ns: u64 = 0;
     var connected = false;
     var waited: u64 = 0;
-    const poll_step_us: u64 = 500; // 0.5ms — fine-grained for <100ms target.
+    const poll_step_us: u64 = 500;
     while (waited < 3_000_000) : (waited += poll_step_us) {
         if (tryConnect(socket_path)) |fd| {
             posix.close(fd);
@@ -130,8 +101,6 @@ test "benchmark: daemon startup time under target" {
         std.time.sleep(poll_step_us * std.time.ns_per_us);
     }
 
-    // If the daemon never opened the socket, the environment can't run
-    // the daemon — emit a skip rather than a false-negative failure.
     if (!connected) return error.SkipZigTest;
 
     const stdout = std.io.getStdOut().writer();

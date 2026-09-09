@@ -1,20 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Unix-domain-socket client for the fail2zig daemon IPC protocol.
-//!
-//! Wire format is defined in `shared/protocol.zig`:
-//!   [u32 payload_size little-endian][payload_size bytes of body]
-//!
-//! The client performs a single synchronous round-trip per command:
-//!   1. `connect()`   — open AF_UNIX stream socket, set send/recv timeouts,
-//!                      connect to the daemon socket path.
-//!   2. `sendCommand()` — serialize `shared.protocol.Command`, write, read a
-//!                        response, deserialize.
-//!   3. `close()`     — shutdown and close the FD.
-//!
-//! Errors are normalized into a `ClientError` set plus an optional diagnostic
-//! message describing exactly what went wrong and how the user might fix it.
-//! `SocketClient.err_buf` stores the message for the lifetime of the client.
 
 const std = @import("std");
 const posix = std.posix;
@@ -23,17 +8,15 @@ const shared = @import("shared");
 pub const default_socket_path: []const u8 = "/run/fail2zig/fail2zig.sock";
 
 pub const ClientError = error{
-    DaemonUnreachable, // ENOENT / ECONNREFUSED on connect
-    PermissionDenied, // EACCES / EPERM on connect or send
-    Timeout, // SO_SNDTIMEO / SO_RCVTIMEO elapsed
-    ProtocolError, // deserialization failed (corrupt or oversized response)
-    SocketError, // any other socket/system error
-    PathTooLong, // sockaddr_un.sun_path overflow
+    DaemonUnreachable,
+    PermissionDenied,
+    Timeout,
+    ProtocolError,
+    SocketError,
+    PathTooLong,
     OutOfMemory,
 };
 
-/// A connected Unix-domain-socket client. The file descriptor is owned by the
-/// struct — always call `close()` (or `deinit()`) exactly once.
 pub const SocketClient = struct {
     fd: posix.socket_t,
     timeout_ms: u64,
@@ -41,7 +24,6 @@ pub const SocketClient = struct {
     err_buf: [256]u8 = [_]u8{0} ** 256,
     err_len: usize = 0,
 
-    /// Human-readable description of the most recent error (or empty string).
     pub fn errorMessage(self: *const SocketClient) []const u8 {
         return self.err_buf[0..self.err_len];
     }
@@ -56,21 +38,15 @@ pub const SocketClient = struct {
         self.err_len = slice.len;
     }
 
-    /// Cleanly close the socket. Idempotent — safe to call after an error.
     pub fn close(self: *SocketClient) void {
         posix.close(self.fd);
     }
 
-    /// Alias for `close` for API symmetry with Zig conventions.
     pub fn deinit(self: *SocketClient) void {
         self.close();
     }
 
-    /// Serialize `cmd`, send it, read the framed response, and return it.
-    /// The returned `Response` owns heap buffers — call `response.deinit(alloc)`.
     pub fn sendCommand(self: *SocketClient, cmd: shared.Command) ClientError!shared.Response {
-        // Serialize into a stack buffer (protocol bodies are small; 1 MiB cap is
-        // enforced by the deserializer but commands in practice are <100 bytes).
         var tx_buf: [4096]u8 = undefined;
         var stream = std.io.fixedBufferStream(&tx_buf);
         shared.serializeCommand(cmd, stream.writer()) catch {
@@ -81,7 +57,6 @@ pub const SocketClient = struct {
 
         writeAll(self.fd, written) catch |e| return self.mapSendErr(e);
 
-        // Read response via a buffered reader over the raw socket.
         const sock_reader = std.io.Reader(posix.socket_t, SocketReadError, socketRead){ .context = self.fd };
         var buffered = std.io.bufferedReader(sock_reader);
         const resp = shared.deserializeResponse(buffered.reader(), self.allocator) catch |e| {
@@ -91,9 +66,6 @@ pub const SocketClient = struct {
     }
 
     fn mapSendErr(self: *SocketClient, e: anyerror) ClientError {
-        // Blocking sockets with SO_SNDTIMEO set surface timeouts as WouldBlock.
-        // AccessDenied is the SendError; PermissionDenied is the ConnectError —
-        // list both to keep the mapping robust across OS + std version changes.
         if (e == error.WouldBlock) {
             self.setErr(
                 "Daemon did not respond within {d}ms. Check daemon health.",
@@ -134,16 +106,12 @@ pub const SocketClient = struct {
     }
 };
 
-/// Connect to a Unix domain socket, setting send/recv timeouts. On error, the
-/// returned struct is NOT valid — the FD is already closed and an error is
-/// returned with a populated diagnostic.
 pub fn connect(
     allocator: std.mem.Allocator,
     path: []const u8,
     timeout_ms: u64,
     diag: *DiagBuf,
 ) ClientError!SocketClient {
-    // sockaddr_un.sun_path is 108 bytes on Linux and must be null-terminated.
     if (path.len == 0) {
         diag.set("socket path is empty", .{});
         return error.PathTooLong;
@@ -170,9 +138,6 @@ pub fn connect(
     };
     errdefer posix.close(fd);
 
-    // Apply send/recv timeouts before connect so a non-responsive peer can't
-    // stall us indefinitely. SO_SNDTIMEO / SO_RCVTIMEO both apply — connect
-    // respects SO_SNDTIMEO on Linux when the socket is blocking.
     const tv = timeoutToTimeval(timeout_ms);
     setTimeout(fd, posix.SO.SNDTIMEO, tv) catch |e| {
         diag.set("failed to set send timeout: {s}", .{@errorName(e)});
@@ -219,13 +184,11 @@ pub fn connect(
         .timeout_ms = timeout_ms,
         .allocator = allocator,
     };
-    // Mirror diag into the client so error messages survive after `connect`.
     @memcpy(client.err_buf[0..diag.len], diag.buf[0..diag.len]);
     client.err_len = diag.len;
     return client;
 }
 
-/// A short pre-connect diagnostic buffer owned by the caller.
 pub const DiagBuf = struct {
     buf: [256]u8 = [_]u8{0} ** 256,
     len: usize = 0,
@@ -246,10 +209,6 @@ pub const DiagBuf = struct {
 };
 
 fn timeoutToTimeval(ms: u64) posix.timeval {
-    // `timeval.sec`/`.usec` are target-width-dependent (i32 on 32-bit arm,
-    // isize elsewhere). Let `@intCast` narrow into the actual field types
-    // instead of forcing i64 — a hardcoded i64 fails to compile on 32-bit
-    // targets where the field is i32.
     const secs: @FieldType(posix.timeval, "sec") = @intCast(ms / 1000);
     const usecs: @FieldType(posix.timeval, "usec") = @intCast((ms % 1000) * 1000);
     return .{ .sec = secs, .usec = usecs };
@@ -258,10 +217,6 @@ fn timeoutToTimeval(ms: u64) posix.timeval {
 fn setTimeout(fd: posix.socket_t, optname: u32, tv: posix.timeval) !void {
     try posix.setsockopt(fd, posix.SOL.SOCKET, optname, std.mem.asBytes(&tv));
 }
-
-// ============================================================================
-// Raw socket write / read (no std.net dependency)
-// ============================================================================
 
 const SocketReadError = error{
     WouldBlock,
@@ -291,10 +246,6 @@ fn writeAll(fd: posix.socket_t, data: []const u8) !void {
         offset += n;
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 const testing = std.testing;
 
@@ -326,13 +277,10 @@ test "socket: connect rejects oversize path" {
 }
 
 test "socket: roundtrip via socketpair — ok response" {
-    // socketpair(AF_UNIX, SOCK_STREAM) gives us two connected FDs; we simulate
-    // the daemon on one side and the client on the other.
     var fds: [2]i32 = undefined;
     const rc = std.os.linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
     if (std.os.linux.E.init(rc) != .SUCCESS) return error.SkipZigTest;
     defer posix.close(fds[0]);
-    // fds[1] is owned by SocketClient below.
 
     var client = SocketClient{
         .fd = fds[1],
@@ -341,7 +289,6 @@ test "socket: roundtrip via socketpair — ok response" {
     };
     defer client.close();
 
-    // Server thread: read the incoming command, respond with an OK payload.
     const ServerCtx = struct {
         fd: posix.socket_t,
         thread_err: ?anyerror = null,
@@ -353,7 +300,6 @@ test "socket: roundtrip via socketpair — ok response" {
         }
 
         fn runInner(ctx: *@This()) !void {
-            // Read the command using protocol helpers.
             var buf: [1024]u8 = undefined;
             const header = try readNExact(ctx.fd, buf[0..4]);
             _ = header;
@@ -361,7 +307,6 @@ test "socket: roundtrip via socketpair — ok response" {
             if (size > buf.len - 4) return error.Overflow;
             _ = try readNExact(ctx.fd, buf[4 .. 4 + size]);
 
-            // Send an OK response with payload "hello".
             const resp = shared.Response{ .ok = .{ .payload = "hello" } };
             var out_buf: [64]u8 = undefined;
             var s = std.io.fixedBufferStream(&out_buf);
@@ -457,9 +402,6 @@ test "socket: peer reads but closes without responding yields ProtocolError" {
     };
     defer client.close();
 
-    // Server reads the command bytes (so the client's send() succeeds) and
-    // then closes the socket without writing a response — client should surface
-    // a ProtocolError with an end-of-stream diagnostic.
     const ServerCtx = struct {
         fd: posix.socket_t,
 
@@ -479,7 +421,6 @@ test "socket: peer reads but closes without responding yields ProtocolError" {
     try testing.expect(client.errorMessage().len > 0);
 }
 
-// Test helper: read exactly `buf.len` bytes or fail.
 fn readNExact(fd: posix.socket_t, buf: []u8) !usize {
     var off: usize = 0;
     while (off < buf.len) {

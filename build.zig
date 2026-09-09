@@ -2,25 +2,13 @@
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
 
-// Single source of truth for the binary version. Both the daemon and the
-// client read this through the generated `build_options` module
-// (`@import("build_options").version`) — no per-binary literals to drift.
-//
-// Keep in sync with `build.zig.zon`'s `.version` field (the package manifest
-// copy). The release-stamp step bumps both together; the version regression
-// test asserts the two binaries agree, so engine/client drift is impossible.
-// `.zon` can't be the in-process source here: Zig 0.14.x `@import` of a `.zon`
-// file requires a full result-type mirror of the manifest schema, which would
-// couple build.zig to the manifest's shape on an unrelated axis.
+// Version single source of truth; build.zig.zon .version must match (release-stamp bumps both).
 const fail2zig_version = "0.2.2";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Version surfaced to both binaries as `@import("build_options").version`.
-    // Wired into `engine_mod` and `client_mod` below; the test artifacts reuse
-    // those modules, so `engine_tests`/`client_tests` see it too.
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", fail2zig_version);
     const enable_bench = b.option(
@@ -34,18 +22,12 @@ pub fn build(b: *std.Build) void {
         "Only compile tests matching this substring (e.g. -Dtest-filter=allocator)",
     );
 
-    // Shared types + IPC protocol. Imported by engine and client as
-    // `@import("shared")` — frozen contract between the two binaries.
     const shared_mod = b.addModule("shared", .{
         .root_source_file = b.path("shared/root.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    // ===== Engine (fail2zig daemon) =====
-    // Registered as a named module so integration tests can import the
-    // engine's public surface via `@import("engine")` instead of reaching
-    // in with relative paths.
     const engine_mod = b.addModule("engine", .{
         .root_source_file = b.path("engine/main.zig"),
         .target = target,
@@ -66,7 +48,6 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_engine.addArgs(args);
     b.step("run", "Run the fail2zig daemon").dependOn(&run_engine.step);
 
-    // ===== Client (fail2zig-client CLI) =====
     const client_mod = b.createModule(.{
         .root_source_file = b.path("client/main.zig"),
         .target = target,
@@ -81,7 +62,6 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(client_exe);
 
-    // ===== Tests =====
     const test_step = b.step("test", "Run all tests (engine, client, shared, integration)");
     const test_filters: []const []const u8 = if (test_filter) |f| &.{f} else &.{};
 
@@ -106,8 +86,6 @@ pub fn build(b: *std.Build) void {
     const run_shared_tests = b.addRunArtifact(shared_tests);
     test_step.dependOn(&run_shared_tests.step);
 
-    // Integration tests live under `tests/` and import `engine` + `shared`
-    // as named modules. No repo-root shim needed.
     const integration_mod = b.createModule(.{
         .root_source_file = b.path("tests/integration_ipc_roundtrip.zig"),
         .target = target,
@@ -123,8 +101,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_integration_tests = b.addRunArtifact(integration_tests);
     test_step.dependOn(&run_integration_tests.step);
-
-    // ----- Phase 7 test suite: integration harness, fuzz corpus, benchmarks -----
 
     const IntegrationFile = struct {
         name: []const u8,
@@ -152,10 +128,6 @@ pub fn build(b: *std.Build) void {
         if (f.needs_daemon_binary) run.step.dependOn(b.getInstallStep());
         test_step.dependOn(&run.step);
     }
-
-    // Fuzz corpus (tests/fuzz/). Each target has a minimal module graph —
-    // only the parse boundary it exercises — so the fuzz binaries stay small
-    // and fast to rebuild.
 
     const parser_only_mod = b.createModule(.{
         .root_source_file = b.path("engine/core/parser.zig"),
@@ -193,10 +165,6 @@ pub fn build(b: *std.Build) void {
         const t = b.addTest(.{ .root_module = mod, .filters = test_filters });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
-
-    // Benchmarks (tests/benchmark/). Gated behind `FAIL2ZIG_RUN_BENCH=1` at
-    // runtime — benchmark tests skip unless the env var is set so the default
-    // `zig build test` cycle stays fast. `-Dbench=true` flips that auto.
 
     const BenchFile = struct {
         path: []const u8,

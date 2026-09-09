@@ -1,17 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Built-in nginx filters.
-//!
-//! Three distinct filter sets:
-//!   * `nginx_http_auth`    — basic-auth 401 failures
-//!   * `nginx_limit_req`    — request-rate limit violations
-//!   * `nginx_botsearch`    — 404s against well-known attack paths
-//!
-//! Nginx access logs have the canonical format:
-//!   `<IP> - user [timestamp] "METHOD /path HTTP/1.1" STATUS SIZE "ref" "UA"`
-//!
-//! Error logs have the shape:
-//!   `TIMESTAMP [error] PID#TID: *CONNID message, client: <IP>, server: ..., request: "..."`
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -19,41 +7,33 @@ const parser = @import("../core/parser.zig");
 
 pub const PatternDef = types.PatternDef;
 
-/// `nginx-http-auth` — basic authentication failures.
 pub const http_auth_patterns = [_]PatternDef{
-    // Error log variant: "no user/password was provided for basic authentication ... client: <IP>"
     .{
         .name = "no-user-password",
         .match = parser.compile("<*>no user/password was provided for basic authentication<*>client: <IP>"),
     },
-    // Error log variant: "user \"x\": was not found ... client: <IP>"
     .{
         .name = "user-not-found",
         .match = parser.compile("<*>was not found in<*>client: <IP>"),
     },
-    // Error log variant: "user \"x\": password mismatch ... client: <IP>"
     .{
         .name = "password-mismatch",
         .match = parser.compile("<*>password mismatch<*>client: <IP>"),
     },
 };
 
-/// `nginx-limit-req` — rate-limit violations.
 pub const limit_req_patterns = [_]PatternDef{
     .{
         .name = "limit-req-zone",
         .match = parser.compile("<*>limiting requests, excess:<*>by zone<*>client: <IP>"),
     },
-    // Connection-rate variant emitted by limit_conn_zone.
     .{
         .name = "limit-conn-zone",
         .match = parser.compile("<*>limiting connections by zone<*>client: <IP>"),
     },
 };
 
-/// `nginx-botsearch` — bots probing known attack paths in access logs.
 pub const botsearch_patterns = [_]PatternDef{
-    // Access log 404 for wp-login.php.
     .{
         .name = "wp-login",
         .match = parser.compile("<IP> <*>wp-login"),
@@ -75,10 +55,6 @@ pub const botsearch_patterns = [_]PatternDef{
         .match = parser.compile("<IP> <*>/.git"),
     },
 };
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 const testing = std.testing;
 

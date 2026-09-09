@@ -1,43 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! fail2ban config compatibility parser.
-//!
-//! Parses fail2ban's INI-ish configuration format into an intermediate
-//! representation — NOT directly into the native `Config`. The
-//! translation to native config lives in `config/migration.zig`.
-//!
-//! Supported features (matches fail2ban's ConfigParser subset we need):
-//!
-//!   * `[Section]` headers. Section names are case-sensitive. The
-//!     pseudo-section `[DEFAULT]` provides defaults that propagate into
-//!     every other section as if inlined.
-//!   * `key = value` and `key: value` pairs.
-//!   * Multi-line values via leading-whitespace continuation (any line
-//!     whose first byte is a space or tab continues the previous value).
-//!   * Comments: lines starting with `#` or `;` (after optional indent)
-//!     are ignored. Inline `#`/`;` comments on value lines are NOT
-//!     stripped — fail2ban doesn't strip them either, and regex values
-//!     often legitimately contain `#`.
-//!   * `%(name)s` interpolation. A first pass builds a symbol table
-//!     merging `[DEFAULT]` and the enclosing section; a second pass
-//!     substitutes references recursively. Cycles and overflow are
-//!     bounded (depth cap 16, expanded-value cap 16KiB).
-//!   * Multi-file loading: `jail.conf`, `jail.local` (override), then
-//!     every `jail.d/*.conf` merged in lexical filename order.
-//!
-//! Bounded input: max file size 1 MiB per file, max 256 sections, max
-//! 64 keys per section, max 1024 files in a `.d` directory. Any of these
-//! ceilings triggers a typed error — no silent truncation of attacker /
-//! administrator input.
-//!
-//! All allocations flow through a caller-provided arena. On any parse
-//! error the caller drops the arena.
 
 const std = @import("std");
-
-// ============================================================================
-// Public error set
-// ============================================================================
 
 pub const Error = error{
     FileNotFound,
@@ -58,32 +22,19 @@ pub const Error = error{
     UnsupportedRegex,
 };
 
-// ============================================================================
-// Limits
-// ============================================================================
-
-pub const max_file_bytes: usize = 1024 * 1024; // 1 MiB
+pub const max_file_bytes: usize = 1024 * 1024;
 pub const max_sections: usize = 256;
 pub const max_keys_per_section: usize = 64;
 pub const max_files_per_dir: usize = 1024;
 pub const max_interp_depth: usize = 16;
 pub const max_value_bytes: usize = 16 * 1024;
 
-// ============================================================================
-// Intermediate representation
-// ============================================================================
-
-/// Warning surfaced to the caller. The `message` slice is allocated in
-/// the caller's arena and lives as long as the parse result does.
 pub const Warning = struct {
-    source: []const u8, // file path or synthetic label
+    source: []const u8,
     line: u32,
     message: []const u8,
 };
 
-/// A single section of an INI file. Keys are stored in insertion order
-/// so that when we print a migration report (or write a diff-able TOML)
-/// the output is stable.
 pub const Section = struct {
     name: []const u8,
     keys: std.StringArrayHashMapUnmanaged([]const u8) = .{},
@@ -93,9 +44,6 @@ pub const Section = struct {
     }
 };
 
-/// Result of parsing a single INI file OR a merged tree. Sections are
-/// addressed by name; `[DEFAULT]` is stored under the literal key
-/// `"DEFAULT"`.
 pub const ParsedIni = struct {
     sections: std.StringArrayHashMapUnmanaged(Section) = .{},
     warnings: std.ArrayListUnmanaged(Warning) = .{},
@@ -104,8 +52,6 @@ pub const ParsedIni = struct {
         return self.sections.getPtr(name);
     }
 
-    /// Iterate over all sections EXCEPT `[DEFAULT]`. Useful for callers
-    /// that treat `[DEFAULT]` as implicit inheritance rather than a jail.
     pub fn userSections(self: *const ParsedIni) SectionIter {
         return .{ .inner = self.sections.iterator(), .skip = "DEFAULT" };
     }
@@ -124,20 +70,12 @@ pub const ParsedIni = struct {
     };
 };
 
-// ============================================================================
-// Tokenizer — line-oriented
-// ============================================================================
-
 const RawLine = struct {
-    /// 1-based line number (for diagnostics).
     line_no: u32,
-    /// The raw bytes (trailing `\n` / `\r` already stripped).
     text: []const u8,
-    /// True when the line starts with a space or tab — marks continuations.
     indented: bool,
 };
 
-/// Split `src` into line records. Allocates the slice in the arena.
 fn tokenizeLines(arena: std.mem.Allocator, src: []const u8) Error![]RawLine {
     var list = std.ArrayListUnmanaged(RawLine){};
     errdefer list.deinit(arena);
@@ -156,19 +94,12 @@ fn tokenizeLines(arena: std.mem.Allocator, src: []const u8) Error![]RawLine {
             .text = text,
             .indented = indented,
         });
-        if (i < src.len) i += 1; // consume the '\n'
+        if (i < src.len) i += 1;
         line_no += 1;
     }
     return try list.toOwnedSlice(arena);
 }
 
-// ============================================================================
-// Core parser — single file into ParsedIni (pre-interpolation)
-// ============================================================================
-
-/// Parse a single INI source string. The resulting `ParsedIni` has raw
-/// (un-interpolated) values — call `interpolate` afterwards to expand
-/// `%(name)s` references.
 pub fn parseIniSource(
     arena: std.mem.Allocator,
     source_label: []const u8,
@@ -187,16 +118,9 @@ pub fn parseIniSource(
     errdefer pending_value.deinit(arena);
 
     for (lines) |ln| {
-        // --- Continuation of a multi-line value ---
         if (ln.indented and pending_key != null) {
-            // A continuation line's content is the line stripped of its
-            // leading indent. Preserve interior whitespace; fail2ban uses
-            // it for readability of regex lists.
             const stripped = stripLeadingSpace(ln.text);
             if (stripped.len == 0) {
-                // Blank indented line ends nothing — fail2ban treats
-                // these as part of the value. We preserve them by
-                // appending a newline + blank.
                 try pending_value.append(arena, '\n');
                 continue;
             }
@@ -208,20 +132,16 @@ pub fn parseIniSource(
             continue;
         }
 
-        // Commit any pending multi-line value before handling a new directive.
         if (pending_key) |key| {
             try commitKey(arena, current, key, try pending_value.toOwnedSlice(arena));
             pending_value = std.ArrayListUnmanaged(u8){};
             pending_key = null;
         }
 
-        // Trim leading ASCII whitespace for directive lines. Fully blank /
-        // comment lines are ignored.
         const trimmed = std.mem.trim(u8, ln.text, " \t");
         if (trimmed.len == 0) continue;
         if (trimmed[0] == '#' or trimmed[0] == ';') continue;
 
-        // --- Section header ---
         if (trimmed[0] == '[') {
             if (trimmed.len < 2 or trimmed[trimmed.len - 1] != ']') {
                 return error.UnterminatedSection;
@@ -235,7 +155,6 @@ pub fn parseIniSource(
                 return error.TooManySections;
             }
 
-            // A section may appear multiple times (fail2ban merges them).
             const gop = try result.sections.getOrPut(arena, name);
             if (!gop.found_existing) {
                 gop.value_ptr.* = .{ .name = name };
@@ -244,11 +163,7 @@ pub fn parseIniSource(
             continue;
         }
 
-        // --- key = value ---
         const sep_idx = findSeparator(trimmed) orelse {
-            // Emit a warning and continue — fail2ban tolerates malformed
-            // lines by silently ignoring; we surface one warning per
-            // occurrence so operators see the issue.
             try appendWarning(arena, &result, source_label, ln.line_no, "line has no '=' or ':' separator; ignoring");
             continue;
         };
@@ -258,19 +173,15 @@ pub fn parseIniSource(
         const value = std.mem.trim(u8, trimmed[sep_idx + 1 ..], " \t");
 
         if (current == null) {
-            // Bare key outside any section — fail2ban treats this as an
-            // error; surface a warning and drop the line.
             try appendWarning(arena, &result, source_label, ln.line_no, "key outside of any section; ignoring");
             continue;
         }
 
-        // Start collecting value — it may continue on indented lines below.
         pending_key = key;
         pending_value = std.ArrayListUnmanaged(u8){};
         try pending_value.appendSlice(arena, value);
     }
 
-    // Commit any pending key after the last line.
     if (pending_key) |key| {
         try commitKey(arena, current, key, try pending_value.toOwnedSlice(arena));
     }
@@ -284,7 +195,7 @@ fn commitKey(
     key: []const u8,
     value: []const u8,
 ) Error!void {
-    const sec = section_opt orelse return; // already warned upstream
+    const sec = section_opt orelse return;
     if (sec.keys.count() >= max_keys_per_section and sec.keys.get(key) == null) {
         return error.TooManyKeysInSection;
     }
@@ -298,7 +209,6 @@ fn appendWarning(
     line_no: u32,
     message: []const u8,
 ) Error!void {
-    // Dupe source and message into the arena so they outlive callers.
     const src_copy = try arena.dupe(u8, source_label);
     const msg_copy = try arena.dupe(u8, message);
     try result.warnings.append(arena, .{
@@ -315,11 +225,6 @@ fn stripLeadingSpace(s: []const u8) []const u8 {
 }
 
 fn findSeparator(s: []const u8) ?usize {
-    // fail2ban accepts `=` or `:` as separator. Prefer the earliest
-    // occurrence. We must be careful NOT to match colons inside a regex
-    // value, but for the key=value line the separator is always the
-    // first `=` or `:`, and regex values never contain these in a key
-    // position (they appear AFTER the separator).
     var eq_idx: ?usize = null;
     var colon_idx: ?usize = null;
     for (s, 0..) |c, i| {
@@ -334,14 +239,6 @@ fn findSeparator(s: []const u8) ?usize {
     return colon_idx;
 }
 
-// ============================================================================
-// Interpolation — %(name)s substitution
-// ============================================================================
-
-/// Expand `%(name)s` references across all sections. `[DEFAULT]` values
-/// are treated as fallbacks for every other section. Section-local keys
-/// shadow `[DEFAULT]` values with the same name. Cycles or excessive
-/// expansion trigger typed errors.
 pub fn interpolate(arena: std.mem.Allocator, ini: *ParsedIni) Error!void {
     const default_section = ini.section("DEFAULT");
 
@@ -367,7 +264,6 @@ pub fn interpolate(arena: std.mem.Allocator, ini: *ParsedIni) Error!void {
                 error.InterpolationUnterminated,
                 => {
                     try appendWarning(arena, ini, sec_name, 0, @errorName(err));
-                    // Leave the raw value in place — operator decides.
                     continue;
                 },
                 else => return err,
@@ -376,7 +272,6 @@ pub fn interpolate(arena: std.mem.Allocator, ini: *ParsedIni) Error!void {
         }
     }
 
-    // Also expand references INSIDE [DEFAULT] (they may chain).
     if (default_section) |def| {
         var keys_it = def.keys.iterator();
         while (keys_it.next()) |kv| {
@@ -385,7 +280,7 @@ pub fn interpolate(arena: std.mem.Allocator, ini: *ParsedIni) Error!void {
                 arena,
                 kv.value_ptr.*,
                 def,
-                null, // no outer fallback while expanding DEFAULT itself
+                null,
                 0,
                 key_name,
             ) catch |err| switch (err) {
@@ -403,10 +298,6 @@ pub fn interpolate(arena: std.mem.Allocator, ini: *ParsedIni) Error!void {
     }
 }
 
-/// Expand `%(name)s` references in `src`. `self_key` is the name of the
-/// key this value belongs to (or `""` for nested expansions) — used to
-/// detect self-references like `bantime = %(bantime)s` that fail2ban
-/// treats as a redirect to `[DEFAULT]`.
 fn expandValue(
     arena: std.mem.Allocator,
     src: []const u8,
@@ -425,7 +316,6 @@ fn expandValue(
     while (i < src.len) {
         const c = src[i];
         if (c == '%' and i + 1 < src.len and src[i + 1] == '(') {
-            // Find the closing `)s`. If we can't, it's malformed.
             var j: usize = i + 2;
             while (j < src.len and src[j] != ')') : (j += 1) {}
             if (j >= src.len or j + 1 >= src.len or src[j + 1] != 's') {
@@ -434,31 +324,23 @@ fn expandValue(
             const name = src[i + 2 .. j];
             if (name.len == 0) return error.InterpolationUnterminated;
 
-            // Resolve: local section first, then DEFAULT. BUT if the
-            // reference is to our own key (e.g. `bantime = %(bantime)s`
-            // inside [sshd]), skip the local lookup — fail2ban treats
-            // this as a redirect to [DEFAULT].
             const self_ref = self_key.len > 0 and std.mem.eql(u8, name, self_key);
             const raw_local = if (self_ref) null else local.get(name);
             const raw = raw_local orelse if (default) |d| d.get(name) else null;
             if (raw == null) {
-                // Reference to unknown name — fail2ban keeps it literal.
                 try out.appendSlice(arena, src[i .. j + 2]);
                 i = j + 2;
                 continue;
             }
 
-            // Recursively expand. Clear self_key when descending — the
-            // inner value is NOT the "self" of the outer expansion.
             const expanded = try expandValue(arena, raw.?, local, default, depth + 1, "");
             if (out.items.len + expanded.len > max_value_bytes) {
                 return error.InterpolationOverflow;
             }
             try out.appendSlice(arena, expanded);
-            i = j + 2; // skip past `)s`
+            i = j + 2;
             continue;
         }
-        // `%%` literal -> single `%`
         if (c == '%' and i + 1 < src.len and src[i + 1] == '%') {
             try out.append(arena, '%');
             i += 2;
@@ -471,12 +353,6 @@ fn expandValue(
     return try out.toOwnedSlice(arena);
 }
 
-// ============================================================================
-// Multi-file merging
-// ============================================================================
-
-/// Merge two ParsedIni objects: keys in `override` win over keys in `base`.
-/// Warnings from both are preserved. Sections unique to either are kept.
 fn mergeInto(
     arena: std.mem.Allocator,
     base: *ParsedIni,
@@ -506,29 +382,19 @@ fn mergeInto(
     }
 }
 
-/// Read the full fail2ban jail config tree from `source_dir`:
-///   1. `<source_dir>/jail.conf`      — base (required-ish; missing = empty)
-///   2. `<source_dir>/jail.local`     — operator overrides
-///   3. `<source_dir>/jail.d/*.conf`  — drop-in files, lexical order
-///
-/// The returned `ParsedIni` has already been interpolation-expanded.
-/// All slices live in `arena`.
 pub fn loadJailConfig(arena: std.mem.Allocator, source_dir: []const u8) Error!ParsedIni {
     var result = ParsedIni{};
 
-    // --- jail.conf ---
     if (try readOptionalFile(arena, source_dir, "jail.conf")) |bytes| {
         const parsed = try parseIniSource(arena, "jail.conf", bytes);
         try mergeInto(arena, &result, parsed);
     }
 
-    // --- jail.local ---
     if (try readOptionalFile(arena, source_dir, "jail.local")) |bytes| {
         const parsed = try parseIniSource(arena, "jail.local", bytes);
         try mergeInto(arena, &result, parsed);
     }
 
-    // --- jail.d/*.conf ---
     const jail_d = try std.fs.path.join(arena, &[_][]const u8{ source_dir, "jail.d" });
     if (openOptionalDir(jail_d)) |maybe_dir| {
         if (maybe_dir) |handle| {
@@ -605,55 +471,17 @@ fn stringLessThan(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.order(u8, a, b) == .lt;
 }
 
-// ============================================================================
-// filter.d parser (Phase 6.1.2)
-// ============================================================================
-
-/// One translated `failregex` pattern plus its source description.
-/// `pattern` uses fail2zig's DSL (`<IP>`, `<HOST>`, `<TIMESTAMP>`, `<*>`)
-/// and is directly consumable by `parser.matcher.compile`.
 pub const TranslatedPattern = struct {
-    /// Original Python regex, kept for diagnostics.
     original: []const u8,
-    /// Translated DSL pattern (arena-allocated).
     pattern: []const u8,
 };
 
 pub const ParsedFilter = struct {
-    /// Translated failregex patterns. Empty if none translated successfully.
     failregex: []const TranslatedPattern = &.{},
-    /// Translated ignoreregex patterns.
     ignoreregex: []const TranslatedPattern = &.{},
-    /// Everything we couldn't translate (with reason).
     warnings: []const Warning = &.{},
 };
 
-/// Parse a fail2ban `filter.d/<name>.conf` file.
-///
-/// The translator converts Python regex syntax into fail2zig's pattern
-/// DSL on a best-effort basis. Supported transformations:
-///
-///   * `<HOST>` passthrough (fail2ban's own IP placeholder).
-///   * `\S+`, `\w+`, `.*?`, `.*`, `.+` collapse to the `<*>` wildcard
-///     (`<*>` is non-greedy-until-next-literal in fail2zig's DSL).
-///   * `\d+\.\d+\.\d+\.\d+` → `<IP>` (explicit dotted quad pattern).
-///   * Named groups `(?P<name>...)` → inner contents translated.
-///   * `[...]` character classes stay literal only if they reduce to a
-///     single literal byte; otherwise they become `<*>`.
-///   * Backslash escapes for regex metachars (`\[`, `\]`, `\(`, `\)`,
-///     `\.`, `\+`, `\*`, `\?`, `\$`, `\^`, `\|`, `\/`, `\ `) emit the
-///     literal byte.
-///   * Anchors `^` and `$` are dropped (patterns are implicitly anchored
-///     as-needed by fail2zig's matcher).
-///
-/// Warn-and-skip (pattern NOT translated):
-///   * Lookahead `(?=`, `(?!`, lookbehind `(?<=`, `(?<!`.
-///   * Conditional `(?(name)...)`.
-///   * Backreferences `\1`–`\9`.
-///
-/// If `<IP>` cannot be produced (no `<HOST>` and no explicit IP pattern)
-/// the resulting pattern is rejected with a warning because every
-/// fail2zig pattern must contain exactly one `<IP>` token.
 pub fn parseFilterSource(
     arena: std.mem.Allocator,
     source_label: []const u8,
@@ -665,8 +493,6 @@ pub fn parseFilterSource(
     var warnings = std.ArrayListUnmanaged(Warning){};
     errdefer warnings.deinit(arena);
 
-    // Some filter files use `[Definition]`; others capitalize differently
-    // (`[DEFINITION]`). Match case-insensitively.
     const def_sec = findSectionCaseInsensitive(&ini, "Definition");
 
     var failregex_list = std.ArrayListUnmanaged(TranslatedPattern){};
@@ -685,7 +511,6 @@ pub fn parseFilterSource(
         try appendWarningList(arena, &warnings, source_label, 0, "filter has no [Definition] section");
     }
 
-    // Carry forward any warnings produced by the INI / interpolation phases.
     for (ini.warnings.items) |w| try warnings.append(arena, w);
 
     return .{
@@ -695,7 +520,6 @@ pub fn parseFilterSource(
     };
 }
 
-/// Convenience wrapper: read from disk + parse.
 pub fn parseFilterFile(
     arena: std.mem.Allocator,
     path: []const u8,
@@ -746,9 +570,6 @@ fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-/// A fail2ban `failregex` value may contain one pattern per line (after
-/// multi-line continuation collapses), separated by newlines. Split on
-/// newlines, translate each, and push the successful ones into `out`.
 fn translatePatternList(
     arena: std.mem.Allocator,
     source_label: []const u8,
@@ -781,9 +602,6 @@ fn translatePatternList(
     }
 }
 
-/// Translate a single Python regex (as fail2ban would have written it)
-/// into fail2zig's pattern DSL. Returns `error.UnsupportedRegex` when
-/// a feature we refuse to translate appears.
 pub fn translatePythonRegex(
     arena: std.mem.Allocator,
     regex: []const u8,
@@ -796,19 +614,16 @@ pub fn translatePythonRegex(
     while (i < regex.len) {
         const c = regex[i];
 
-        // --- Anchors (drop) ---
         if (c == '^' or c == '$') {
             i += 1;
             continue;
         }
 
-        // --- Escape sequences ---
         if (c == '\\') {
             if (i + 1 >= regex.len) return error.UnsupportedRegex;
             const nxt = regex[i + 1];
             switch (nxt) {
                 's', 'S' => {
-                    // Whitespace classes → wildcard.
                     try appendWildcard(&out, arena);
                     i += 2;
                     continue;
@@ -819,9 +634,6 @@ pub fn translatePythonRegex(
                     continue;
                 },
                 'd' => {
-                    // `\d+\.\d+\.\d+\.\d+` is an IPv4 literal. Detect the
-                    // full sequence; otherwise collapse `\d+` (or `\d`)
-                    // to a wildcard.
                     if (tryConsumeIpv4Literal(regex, i)) |consumed| {
                         try out.appendSlice(arena, "<IP>");
                         i = consumed;
@@ -829,7 +641,6 @@ pub fn translatePythonRegex(
                     }
                     try appendWildcard(&out, arena);
                     i += 2;
-                    // Also swallow a `+`, `*`, `?` quantifier if present.
                     if (i < regex.len and isQuantifier(regex[i])) i += 1;
                     continue;
                 },
@@ -853,9 +664,8 @@ pub fn translatePythonRegex(
                     i += 2;
                     continue;
                 },
-                '1'...'9' => return error.UnsupportedRegex, // backreference
+                '1'...'9' => return error.UnsupportedRegex,
                 else => {
-                    // Unknown escape — pass through the next byte literally.
                     try out.append(arena, nxt);
                     i += 2;
                     continue;
@@ -863,9 +673,7 @@ pub fn translatePythonRegex(
             }
         }
 
-        // --- Groups ---
         if (c == '(') {
-            // Detect unsupported constructs: `(?=`, `(?!`, `(?<=`, `(?<!`, `(?(`.
             if (i + 2 < regex.len and regex[i + 1] == '?') {
                 const p = regex[i + 2];
                 if (p == '=' or p == '!' or p == '(') return error.UnsupportedRegex;
@@ -875,30 +683,22 @@ pub fn translatePythonRegex(
                 }
             }
 
-            // Look for a <HOST> literal token wrapped inside named groups
-            // or plain groups: `(?P<host><HOST>)`, `(<HOST>)`, etc.
             if (findHostInGroup(regex[i..])) |host_end| {
                 try out.appendSlice(arena, "<IP>");
                 i += host_end;
                 continue;
             }
 
-            // Translate group contents recursively. We emit the inner
-            // translated form without the parens — fail2zig doesn't
-            // capture.
             const end = findMatchingParen(regex, i) orelse return error.UnsupportedRegex;
             const inner_start = innerGroupStart(regex, i);
             const inner = regex[inner_start..end];
             const inner_translated = try translatePythonRegex(arena, inner);
-            // If inner contains alternation `|`, collapse to wildcard
-            // because fail2zig's DSL has no alternation primitive.
             if (std.mem.indexOfScalar(u8, inner, '|') != null) {
                 try appendWildcard(&out, arena);
             } else {
                 try out.appendSlice(arena, inner_translated);
             }
             i = end + 1;
-            // Optional quantifier after the group — treat like `*?`.
             if (i < regex.len and isQuantifier(regex[i])) {
                 try appendWildcard(&out, arena);
                 i += 1;
@@ -906,11 +706,7 @@ pub fn translatePythonRegex(
             continue;
         }
 
-        // --- Character classes ---
         if (c == '[') {
-            // If the class is a single-literal negation like `[^ ]+`,
-            // emit `<*>`. Otherwise, collapse to wildcard (fail2zig has
-            // no character classes in its DSL).
             const end = std.mem.indexOfScalarPos(u8, regex, i + 1, ']') orelse return error.UnsupportedRegex;
             i = end + 1;
             try appendWildcard(&out, arena);
@@ -918,16 +714,13 @@ pub fn translatePythonRegex(
             continue;
         }
 
-        // --- Dot ---
         if (c == '.') {
             try appendWildcard(&out, arena);
             i += 1;
-            // Quantifier — already a wildcard, just swallow.
             if (i < regex.len and isQuantifier(regex[i])) i += 1;
             continue;
         }
 
-        // --- <HOST> / <IP> / <TIMESTAMP> passthrough tokens ---
         if (c == '<') {
             const close = std.mem.indexOfScalarPos(u8, regex, i + 1, '>') orelse return error.UnsupportedRegex;
             const name = regex[i + 1 .. close];
@@ -938,22 +731,17 @@ pub fn translatePythonRegex(
             } else if (asciiEqlIgnoreCase(name, "TIMESTAMP")) {
                 try out.appendSlice(arena, "<TIMESTAMP>");
             } else {
-                // Unknown token — pass literally so the user sees it in
-                // diagnostics, but warn via caller.
                 try appendWildcard(&out, arena);
             }
             i = close + 1;
             continue;
         }
 
-        // --- Quantifiers on literal chars: collapse to wildcard ---
         if (c == '*' or c == '+' or c == '?') {
-            // Orphan quantifier — skip (prior char already emitted literally).
             i += 1;
             continue;
         }
 
-        // --- Literal byte ---
         try out.append(arena, c);
         i += 1;
     }
@@ -966,33 +754,20 @@ fn isQuantifier(c: u8) bool {
 }
 
 fn appendWildcard(out: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) Error!void {
-    // Avoid emitting adjacent `<*><*>` — it's a no-op that makes patterns
-    // harder to read in diagnostics.
     const items = out.items;
     if (items.len >= 3 and std.mem.eql(u8, items[items.len - 3 ..], "<*>")) return;
     try out.appendSlice(arena, "<*>");
 }
 
 fn tryConsumeIpv4Literal(regex: []const u8, start: usize) ?usize {
-    // Match exactly: `\d+\.\d+\.\d+\.\d+` (12 chars) or with optional
-    // `+`/`*` quantifiers on each segment. For Phase 6 we only recognize
-    // the canonical `\d+\.\d+\.\d+\.\d+` (16 chars).
     const canonical = "\\d+\\.\\d+\\.\\d+\\.\\d+";
     if (start + canonical.len > regex.len) return null;
     if (!std.mem.eql(u8, regex[start .. start + canonical.len], canonical)) return null;
     return start + canonical.len;
 }
 
-/// If the group starting at `slice[0] == '('` immediately wraps a `<HOST>`
-/// token (optionally preceded by `?P<name>` or `?:`), return the index
-/// just PAST the closing paren. Otherwise return null.
 fn findHostInGroup(slice: []const u8) ?usize {
-    // Acceptable forms:
-    //   (<HOST>)
-    //   (?P<name><HOST>)
-    //   (?:<HOST>)
-    var i: usize = 1; // skip '('
-    // Optional `?P<name>` / `?:`
+    var i: usize = 1;
     if (i < slice.len and slice[i] == '?') {
         i += 1;
         if (i < slice.len and slice[i] == 'P') {
@@ -1001,12 +776,11 @@ fn findHostInGroup(slice: []const u8) ?usize {
             i += 1;
             while (i < slice.len and slice[i] != '>') : (i += 1) {}
             if (i >= slice.len) return null;
-            i += 1; // skip '>'
+            i += 1;
         } else if (i < slice.len and slice[i] == ':') {
             i += 1;
         } else return null;
     }
-    // Expect literal `<HOST>` now.
     const host_tok = "<HOST>";
     if (i + host_tok.len > slice.len) return null;
     if (!std.mem.eql(u8, slice[i .. i + host_tok.len], host_tok)) return null;
@@ -1015,8 +789,6 @@ fn findHostInGroup(slice: []const u8) ?usize {
     return i + 1;
 }
 
-/// Find the `)` that closes the `(` at index `open_idx`. Respects nested
-/// parens and escape sequences.
 fn findMatchingParen(regex: []const u8, open_idx: usize) ?usize {
     var depth: usize = 0;
     var i: usize = open_idx;
@@ -1036,7 +808,6 @@ fn findMatchingParen(regex: []const u8, open_idx: usize) ?usize {
 }
 
 fn innerGroupStart(regex: []const u8, open_idx: usize) usize {
-    // Skip `(`, then any `?...` prefix (`?:`, `?P<name>`).
     var i = open_idx + 1;
     if (i < regex.len and regex[i] == '?') {
         i += 1;
@@ -1047,28 +818,22 @@ fn innerGroupStart(regex: []const u8, open_idx: usize) usize {
             if (i < regex.len and regex[i] == '<') {
                 i += 1;
                 while (i < regex.len and regex[i] != '>') : (i += 1) {}
-                if (i < regex.len) i += 1; // skip '>'
+                if (i < regex.len) i += 1;
             }
         }
     }
     return i;
 }
 
-// ============================================================================
-// action.d parser (Phase 6.1.3)
-// ============================================================================
-
 pub const ActionBackend = enum {
     nftables,
     iptables,
     ipset,
-    log_only, // unmapped actions (sendmail, route, custom shells) fall here
+    log_only,
 };
 
 pub const ParsedAction = struct {
-    /// Name derived from the file basename (e.g. `iptables-multiport`).
     name: []const u8,
-    /// Mapped backend for native config.
     backend: ActionBackend,
     actionstart: []const u8 = "",
     actionstop: []const u8 = "",
@@ -1078,9 +843,6 @@ pub const ParsedAction = struct {
     warnings: []const Warning = &.{},
 };
 
-/// Parse an action.d source string. `action_name` is the file basename
-/// without extension (e.g. `"iptables-multiport"`) — used both for the
-/// returned struct's `name` field AND for backend mapping.
 pub fn parseActionSource(
     arena: std.mem.Allocator,
     action_name: []const u8,
@@ -1148,25 +910,12 @@ pub fn parseActionFile(
     return parseActionSource(arena, stem, bytes);
 }
 
-/// Map a fail2ban action name to the fail2zig backend enum. Known
-/// mappings:
-///   * `iptables*` → .iptables
-///   * `nftables*` → .nftables
-///   * `ipset*` → .ipset
-///   * anything else → .log_only (warn-and-keep so operators can still
-///     dry-run the migration output).
 pub fn mapActionNameToBackend(name: []const u8) ActionBackend {
-    // Longest prefix wins — `iptables-multiport` should map to iptables,
-    // not match `multiport` elsewhere.
     if (std.mem.startsWith(u8, name, "nftables")) return .nftables;
     if (std.mem.startsWith(u8, name, "iptables")) return .iptables;
     if (std.mem.startsWith(u8, name, "ipset")) return .ipset;
     return .log_only;
 }
-
-// ============================================================================
-// Tests — INI parser
-// ============================================================================
 
 const testing = std.testing;
 
@@ -1200,7 +949,6 @@ test "fail2ban: parse tolerates comments both # and ;" {
     ;
     var ini = try parseIniSource(arena.allocator(), "test", src);
     const sec = ini.section("sshd").?;
-    // Trailing `#` is NOT stripped — value contains it.
     try testing.expectEqualStrings("5 # trailing NOT stripped", sec.get("maxretry").?);
     try testing.expectEqualStrings("600", sec.get("findtime").?);
 }
@@ -1262,9 +1010,6 @@ test "fail2ban: interpolate detects cycles and keeps raw" {
     ;
     var ini = try parseIniSource(arena.allocator(), "test", src);
     try interpolate(arena.allocator(), &ini);
-    // We expect a warning to have been recorded, and the value to be left
-    // alone (NOT expanded). The exact raw form is implementation-defined —
-    // just ensure we didn't crash and produced at least one warning.
     try testing.expect(ini.warnings.items.len > 0);
 }
 
@@ -1318,7 +1063,6 @@ test "fail2ban: realistic jail.conf snippet" {
     const sshd = ini.section("sshd").?;
     try testing.expectEqualStrings("sshd", sshd.get("filter").?);
     try testing.expectEqualStrings("3", sshd.get("maxretry").?);
-    // bantime was interpolated from DEFAULT.
     try testing.expectEqualStrings("3600", sshd.get("bantime").?);
 }
 
@@ -1346,9 +1090,9 @@ test "fail2ban: merge jail.conf + jail.local override" {
     try interpolate(arena.allocator(), &result);
 
     const sshd = result.section("sshd").?;
-    try testing.expectEqualStrings("true", sshd.get("enabled").?); // override won
-    try testing.expectEqualStrings("3", sshd.get("maxretry").?); // override won
-    try testing.expectEqualStrings("sshd", sshd.get("filter").?); // preserved from base
+    try testing.expectEqualStrings("true", sshd.get("enabled").?);
+    try testing.expectEqualStrings("3", sshd.get("maxretry").?);
+    try testing.expectEqualStrings("sshd", sshd.get("filter").?);
 }
 
 test "fail2ban: loadJailConfig reads jail.conf + jail.local + jail.d" {
@@ -1409,10 +1153,6 @@ test "fail2ban: too many sections triggers typed error" {
     );
 }
 
-// ============================================================================
-// Tests — filter.d parser
-// ============================================================================
-
 test "fail2ban: translate simple sshd pattern via <HOST>" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1465,7 +1205,6 @@ test "fail2ban: translate unsupported lookahead generates warning" {
         \\failregex = ^Foo from <HOST>(?=bar)$
     ;
     const f = try parseFilterSource(arena.allocator(), "weird.conf", src);
-    // Lookahead caused the pattern to be skipped; at least one warning emitted.
     try testing.expectEqual(@as(usize, 0), f.failregex.len);
     try testing.expect(f.warnings.len >= 1);
 }
@@ -1493,7 +1232,6 @@ test "fail2ban: translate realistic postfix pattern" {
     ;
     const f = try parseFilterSource(arena.allocator(), "postfix.conf", src);
     try testing.expectEqual(@as(usize, 1), f.failregex.len);
-    // The translated form must contain <IP>.
     try testing.expect(std.mem.indexOf(u8, f.failregex[0].pattern, "<IP>") != null);
 }
 
@@ -1510,10 +1248,6 @@ test "fail2ban: translate missing [Definition] warns" {
     try testing.expect(f.warnings.len >= 1);
 }
 
-// ============================================================================
-// Tests — action.d parser
-// ============================================================================
-
 test "fail2ban: action iptables-multiport maps to iptables" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1528,9 +1262,6 @@ test "fail2ban: action iptables-multiport maps to iptables" {
     const a = try parseActionSource(arena.allocator(), "iptables-multiport", src);
     try testing.expectEqual(ActionBackend.iptables, a.backend);
     try testing.expect(std.mem.indexOf(u8, a.actionban, "iptables") != null);
-    // iptables is a known backend — no "unmapped" warning should be emitted
-    // (the ini parser may still emit unrelated warnings; filter for the
-    // specific phrase).
     for (a.warnings) |w| {
         try testing.expect(std.mem.indexOf(u8, w.message, "not recognized") == null);
     }
