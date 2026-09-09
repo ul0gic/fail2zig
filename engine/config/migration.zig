@@ -151,6 +151,9 @@ fn extractDefaults(
     if (def_sec.get("banaction")) |v| {
         out.banaction = mapBanaction(ctx, v);
     }
+    if (def_sec.get("backend")) |v| {
+        out.source = try mapBackend(ctx, "[DEFAULT]", v);
+    }
 
     return out;
 }
@@ -227,6 +230,10 @@ fn translateJail(
 
     if (sec.get("ignoreip")) |v| {
         jail.ignoreip = try splitWhitespaceList(ctx.arena, v);
+    }
+
+    if (sec.get("backend")) |v| {
+        jail.source = try mapBackend(ctx, sec.name, v);
     }
 
     if (sec.get("bantime.increment")) |v| {
@@ -363,6 +370,14 @@ fn splitLogpath(arena: std.mem.Allocator, raw: []const u8) Error![]const []const
     return try list.toOwnedSlice(arena);
 }
 
+fn mapBackend(ctx: *Context, scope: []const u8, raw: []const u8) Error!native.LogSource {
+    const trimmed = std.mem.trim(u8, raw, " \t");
+    return native.mapBackendAlias(trimmed) orelse {
+        try ctx.warn("{s}: backend = '{s}' not recognized; source left as auto", .{ scope, trimmed });
+        return .auto;
+    };
+}
+
 fn mapBanaction(ctx: *Context, raw: []const u8) native.BanAction {
     const trimmed = std.mem.trim(u8, raw, " \t");
     const bracket_idx = std.mem.indexOfScalar(u8, trimmed, '[') orelse trimmed.len;
@@ -426,6 +441,7 @@ fn renderToml(cfg: *const native.Config, w: anytype) !void {
     try w.print("findtime = {d}\n", .{cfg.defaults.findtime});
     try w.print("maxretry = {d}\n", .{cfg.defaults.maxretry});
     try w.print("banaction = \"{s}\"\n", .{@tagName(cfg.defaults.banaction)});
+    if (cfg.defaults.source != .auto) try w.print("source = \"{s}\"\n", .{@tagName(cfg.defaults.source)});
     if (cfg.defaults.ignoreip.len > 0) {
         try writeStringArray(w, "ignoreip", cfg.defaults.ignoreip);
     }
@@ -436,6 +452,7 @@ fn renderToml(cfg: *const native.Config, w: anytype) !void {
         try w.print("enabled = {s}\n", .{if (j.enabled) "true" else "false"});
         if (j.filter.len > 0) try writeQuoted(w, "filter", j.filter);
         if (j.logpath.len > 0) try writeStringArray(w, "logpath", j.logpath);
+        if (j.source != .auto) try w.print("source = \"{s}\"\n", .{@tagName(j.source)});
         if (j.maxretry) |v| try w.print("maxretry = {d}\n", .{v});
         if (j.findtime) |v| try w.print("findtime = {d}\n", .{v});
         if (j.bantime) |v| try w.print("bantime = {d}\n", .{v});
@@ -515,17 +532,21 @@ test "migration: writes valid TOML that native parser can reload" {
         \\maxretry = 5
         \\ignoreip = 127.0.0.1/8 10.0.0.0/8
         \\
+        \\backend = polling
+        \\
         \\[sshd]
         \\enabled = true
         \\filter = sshd
         \\logpath = /var/log/auth.log
         \\maxretry = 3
         \\bantime = 1h
+        \\backend = systemd
         \\
         \\[nginx-http-auth]
         \\enabled = true
         \\filter = nginx-http-auth
         \\logpath = /var/log/nginx/error.log
+        \\backend = pyinotify
         ,
     });
 
@@ -539,19 +560,65 @@ test "migration: writes valid TOML that native parser can reload" {
     try testing.expectEqual(@as(u32, 2), report.jails_imported);
     try testing.expect(report.filters_builtin >= 2);
 
+    const toml = try std.fs.cwd().readFileAlloc(arena.allocator(), out, 1 << 20);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, toml, "source = \"journald\""));
+    try testing.expect(std.mem.indexOf(u8, toml, "backend") == null);
+
     var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena2.deinit();
     const cfg = try native.Config.loadFile(arena2.allocator(), out);
     try testing.expectEqual(@as(usize, 2), cfg.jails.len);
+    try testing.expectEqual(native.LogSource.auto, cfg.defaults.source);
 
     var sshd_jail: ?native.JailConfig = null;
+    var nginx_jail: ?native.JailConfig = null;
     for (cfg.jails) |j| {
         if (std.mem.eql(u8, j.name, "sshd")) sshd_jail = j;
+        if (std.mem.eql(u8, j.name, "nginx-http-auth")) nginx_jail = j;
     }
     try testing.expect(sshd_jail != null);
     try testing.expectEqualStrings("sshd", sshd_jail.?.filter);
     try testing.expectEqual(@as(?u32, 3), sshd_jail.?.maxretry);
     try testing.expectEqual(@as(?u64, 3600), sshd_jail.?.bantime);
+    try testing.expectEqual(native.LogSource.journald, sshd_jail.?.source);
+    try testing.expectEqual(native.LogSource.auto, nginx_jail.?.source);
+}
+
+test "migration: DEFAULT backend = systemd becomes [defaults] source and an unknown backend warns" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "jail.conf",
+        .data =
+        \\[DEFAULT]
+        \\backend = systemd
+        \\
+        \\[sshd]
+        \\enabled = true
+        \\filter = sshd
+        \\backend = bogus
+        ,
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const source = try tmp.dir.realpathAlloc(arena.allocator(), ".");
+    const out = try std.fs.path.join(arena.allocator(), &.{ source, "out.toml" });
+
+    const report = try importConfig(arena.allocator(), source, out);
+    var warned = false;
+    for (report.warnings) |w| {
+        if (std.mem.indexOf(u8, w, "backend = 'bogus'") != null) warned = true;
+    }
+    try testing.expect(warned);
+
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    const cfg = try native.Config.loadFile(arena2.allocator(), out);
+    try testing.expectEqual(native.LogSource.journald, cfg.defaults.source);
+    try testing.expectEqual(native.LogSource.journald, cfg.jails[0].source);
 }
 
 test "migration: skips jails with enabled=false" {

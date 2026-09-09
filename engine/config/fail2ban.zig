@@ -1064,6 +1064,8 @@ test "fail2ban: realistic jail.conf snippet" {
     try testing.expectEqualStrings("sshd", sshd.get("filter").?);
     try testing.expectEqualStrings("3", sshd.get("maxretry").?);
     try testing.expectEqualStrings("3600", sshd.get("bantime").?);
+    try testing.expectEqualStrings("systemd", ini.section("DEFAULT").?.get("backend").?);
+    try testing.expect(sshd.get("backend") == null);
 }
 
 test "fail2ban: merge jail.conf + jail.local override" {

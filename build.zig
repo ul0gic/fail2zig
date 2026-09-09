@@ -113,6 +113,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "migration", .path = "tests/integration/migration_test.zig", .needs_daemon_binary = false },
         .{ .name = "persistence", .path = "tests/integration/persistence_test.zig", .needs_daemon_binary = true },
         .{ .name = "status_surface", .path = "tests/integration/status_surface_test.zig", .needs_daemon_binary = false },
+        .{ .name = "startup_failclosed", .path = "tests/integration/startup_failclosed_test.zig", .needs_daemon_binary = true },
+        .{ .name = "config_diag", .path = "tests/integration/config_diag_test.zig", .needs_daemon_binary = true },
     };
     for (integration_files) |f| {
         const mod = b.createModule(.{

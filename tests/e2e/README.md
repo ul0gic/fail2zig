@@ -136,6 +136,21 @@ fail2zig's own sshd jail and bans the operator. Override the key with
   this harness is the only check that runs the *shipped* binary through the real
   IPC + HTTP surfaces under the wall-clock debounce.
 
+- **`stabilization_live.sh`** (Phase 11 / Gate 11) — runs the *installed* shipped
+  binary + unit through the stabilization contract: `--validate-config` on a copy
+  of the live config with `backend = "systemd"` (exit 0, `source=journald`,
+  deprecation warning); an unknown key injected at a known line reported as
+  `file:line:col`; the live config `chmod 0666` → the unit fails closed with the
+  SEC-012 cause in its invocation's journal, then `0640` restored → active with
+  `NRestarts=0`; `state_file` under `/run` → the SYS-021 warning; and no Zig
+  error-return-trace in either invocation's journal (DBT-005). Bounces the
+  service and restores config bytes, mode and owner on every exit path. Run on
+  the box as root after `deploy_regression.sh` has installed:
+
+  ```bash
+  sudo tests/e2e/stabilization_live.sh --force
+  ```
+
 ## SYS-014 #2 — firewall cause-distinction (mostly automated; one manual check)
 
 The probe→cause logic is covered by inline tests tagged `SYS-014`

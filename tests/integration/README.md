@@ -12,59 +12,55 @@ real `zig-out/bin/fail2zig` binary and verify operator-visible flows.
 | `ban_test.zig` | Yes | Yes (IPC auth) | non-Linux, non-root, daemon binary missing, firewall unavailable |
 | `migration_test.zig` | No (pure module drive) | No | non-Linux |
 | `persistence_test.zig` | Mixed: 2 module tests always run; 1 subprocess test requires root | Yes (for subprocess case) | non-Linux, non-root (subprocess only) |
+| `status_surface_test.zig` | No (in-process command dispatch) | No | non-Linux |
+| `startup_failclosed_test.zig` | Yes (expects each run to exit 1) | No — one assertion in scenario (b) is root-only (ENH-006) | non-Linux, daemon binary missing |
+| `config_diag_test.zig` | Yes (`--validate-config` only) | No | non-Linux, daemon binary missing |
 
-Unprivileged developer machines see every subprocess case skip cleanly.
-A CI job with `sudo` (or a privileged container) exercises the full stack.
+Unprivileged developer machines see every root-gated subprocess case skip
+cleanly. A CI job with `sudo` (or a privileged container) exercises the full
+stack.
 
 ## Build
 
 Each file is self-contained: it imports `shared` and `engine` as named
-modules and can compile standalone via:
+modules. `engine` in turn imports `shared` and `build_options` (the `version`
+option `build.zig` generates), so a standalone run needs a one-line stub for
+the latter and `-lc`:
 
 ```bash
-zig test \
+printf 'pub const version: []const u8 = "test";\n' > /tmp/build_options.zig
+zig test -lc \
   --dep shared --dep engine -Mroot=tests/integration/<name>.zig \
-  --dep shared -Mengine=engine/main.zig \
-  -Mshared=shared/root.zig
+  --dep shared --dep build_options -Mengine=engine/main.zig \
+  -Mshared=shared/root.zig \
+  -Mbuild_options=/tmp/build_options.zig
 ```
 
-The `--dep shared -Mengine=engine/main.zig` clause is mandatory — the
-`engine` module itself imports `shared`, and the `-M` form is how that
-edge is expressed on the command line.
+The `--dep` clauses before an `-M` name that module's own imports; omitting
+`--dep build_options` before `-Mengine` fails with
+`no module named 'build_options' available within module engine`.
+
+Files that spawn the daemon look for `zig-out/bin/fail2zig` relative to the
+repo root: run `zig build` first and invoke `zig test` from the repo root.
 
 ## Wiring into `build.zig`
 
-When Lead adds these to `build.zig`, follow the existing
-`tests/integration_ipc_roundtrip.zig` pattern (`build.zig:103-117`):
+Every file is listed in the `integration_files` array in `build.zig`; the
+loop below it creates the module, adds the `shared` and `engine` imports,
+links libc, and registers the test run on `zig build test`:
 
 ```zig
-const harness_mod = b.createModule(.{
-    .root_source_file = b.path("tests/integration/<name>.zig"),
-    .target = target,
-    .optimize = optimize,
-    .link_libc = true,
-});
-harness_mod.addImport("shared", shared_mod);
-harness_mod.addImport("engine", engine_mod);
-
-const harness_tests = b.addTest(.{
-    .root_module = harness_mod,
-    .filters = test_filters,
-});
-test_step.dependOn(&b.addRunArtifact(harness_tests).step);
+const integration_files = [_]IntegrationFile{
+    .{ .name = "harness", .path = "tests/integration/harness.zig", .needs_daemon_binary = false },
+    .{ .name = "ban", .path = "tests/integration/ban_test.zig", .needs_daemon_binary = true },
+};
 ```
 
-Repeat for each file: `harness.zig`, `ban_test.zig`, `migration_test.zig`,
-`persistence_test.zig`. The `ban_test` and `persistence_test` files
-import `harness.zig` directly (relative), so they share the same test
-module layout.
-
-The subprocess-based tests expect `zig-out/bin/fail2zig` to already be
-built — `b.getInstallStep()` dependency is appropriate:
-
-```zig
-run_ban_tests.step.dependOn(b.getInstallStep());
-```
+To add a file, append one row. `needs_daemon_binary = true` makes the run
+depend on `b.getInstallStep()`, so `zig-out/bin/fail2zig` is built before the
+test spawns it; set it for every file that starts the daemon as a subprocess
+(`ban`, `persistence`, `startup_failclosed`, `config_diag`). Only Lead edits
+`build.zig`, at the sub-phase close.
 
 ## Skip semantics
 

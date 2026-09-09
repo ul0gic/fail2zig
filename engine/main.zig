@@ -428,10 +428,6 @@ fn wsTick(expirations: u64, userdata: ?*anyopaque) void {
 
 const SignalContext = struct {
     loop: *event_loop_mod.EventLoop,
-    trackers: *tracker_map_mod.TrackerMap,
-    state_path: []const u8,
-    journald: ?*journald_source_mod.JournaldSource = null,
-    save_requested: bool = false,
 };
 
 fn flushStateThenCursors(
@@ -439,9 +435,15 @@ fn flushStateThenCursors(
     state_path: []const u8,
     journald: ?*journald_source_mod.JournaldSource,
 ) void {
-    persist_mod.saveAll(trackers, state_path) catch |err| {
+    if (persist_mod.saveAll(trackers, state_path)) |_| {
+        if (std.fs.cwd().statFile(state_path)) |st| {
+            std.log.info("persist: state saved to {s} ({d} bytes)", .{ state_path, st.size });
+        } else |_| {
+            std.log.info("persist: state saved to {s}", .{state_path});
+        }
+    } else |err| {
         std.log.warn("persist: state save failed: {s}", .{@errorName(err)});
-    };
+    }
     if (journald) |jd| {
         if (jd.hasJails()) {
             var buf: [journald_source_mod.max_jails]journald_source_mod.CursorEntry = undefined;
@@ -467,10 +469,18 @@ fn journaldFlushHook(userdata: ?*anyopaque) void {
 fn onTerminate(siginfo: *const linux.signalfd_siginfo, userdata: ?*anyopaque) void {
     _ = siginfo;
     const ctx: *SignalContext = @ptrCast(@alignCast(userdata.?));
-    ctx.save_requested = true;
-    std.log.info("signal: termination requested, saving state and shutting down", .{});
-    flushStateThenCursors(ctx.trackers, ctx.state_path, ctx.journald);
+    std.log.info("signal: termination requested, shutting down", .{});
     ctx.loop.stop();
+}
+
+test "signal: onTerminate only stops the loop; the single state save happens after loop.run" {
+    var loop = event_loop_mod.EventLoop.init(std.testing.allocator) catch return error.SkipZigTest;
+    defer loop.deinit();
+    loop.running.store(true, .release);
+    var ctx = SignalContext{ .loop = &loop };
+    const info = std.mem.zeroes(linux.signalfd_siginfo);
+    onTerminate(&info, &ctx);
+    try std.testing.expectEqual(false, loop.running.load(.acquire));
 }
 
 fn onReload(siginfo: *const linux.signalfd_siginfo, userdata: ?*anyopaque) void {
@@ -557,9 +567,9 @@ pub fn main() !void {
 
     var cfg_arena = std.heap.ArenaAllocator.init(heap);
     defer cfg_arena.deinit();
-    const cfg = config_mod.Config.loadFile(cfg_arena.allocator(), opts.config_path) catch |err| {
-        const stderr = std.io.getStdErr().writer();
-        try stderr.print("config: failed to load '{s}': {s}\n", .{ opts.config_path, @errorName(err) });
+    var cfg_diag: config_mod.Diagnostic = .{};
+    const cfg = config_mod.Config.loadFileDiag(cfg_arena.allocator(), opts.config_path, &cfg_diag) catch |err| {
+        try printConfigLoadError(std.io.getStdErr().writer(), opts.config_path, err, &cfg_diag);
         std.process.exit(1);
     };
 
@@ -577,12 +587,120 @@ pub fn main() !void {
         try stderr.print("config: validation failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
+    warnIfVolatileStateDir(cfg.global.state_file);
     if (is_validate_only) {
-        try stdout.print("config: OK ({d} jail(s) configured)\n", .{cfg.jails.len});
+        try printValidateSummary(stdout, &cfg);
         return;
     }
 
     try runDaemon(heap, &cfg);
+}
+
+fn printConfigLoadError(
+    w: anytype,
+    path: []const u8,
+    err: config_mod.Error,
+    diag: *const config_mod.Diagnostic,
+) !void {
+    switch (err) {
+        error.ConfigWorldWritable => {
+            try w.print(
+                "config: {s}: world-writable (mode {o:0>4}); refusing to start — fix: chmod 0640 {s}\n",
+                .{ path, diag.mode, path },
+            );
+            return;
+        },
+        error.ConfigGroupWritable => {
+            try w.print(
+                "config: {s}: writable by a non-root group (mode {o:0>4}); refusing to start — fix: chmod 0640 {s}\n",
+                .{ path, diag.mode, path },
+            );
+            return;
+        },
+        else => {},
+    }
+    if (diag.line == 0) {
+        try w.print("config: {s}: {s}\n", .{ path, @errorName(err) });
+        return;
+    }
+    try w.print("config: {s}:{d}:{d}: {s}", .{ path, diag.line, diag.col, @errorName(err) });
+    const key = diag.key();
+    const section = diag.section();
+    if (key.len > 0 and section.len > 0) {
+        try w.print(" (key '{s}' in [{s}])", .{ key, section });
+    } else if (key.len > 0) {
+        try w.print(" (key '{s}')", .{key});
+    } else if (section.len > 0) {
+        try w.print(" (in [{s}])", .{section});
+    }
+    try w.writeAll("\n");
+}
+
+fn printValidateSummary(w: anytype, cfg: *const config_mod.Config) !void {
+    for (cfg.jails) |*j| {
+        const r = config_mod.resolveJailFromConfig(j, cfg.defaults);
+        try w.print(
+            "config: jail '{s}' enabled={} filter={s} source={s} banaction={s}\n",
+            .{ j.name, j.enabled, j.filter, @tagName(j.source), @tagName(r.banaction) },
+        );
+    }
+    try w.print("config: OK ({d} jail(s) configured)\n", .{cfg.jails.len});
+}
+
+test "cli: config load error prints path:line:col with key and section" {
+    var buf: [256]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    var diag: config_mod.Diagnostic = .{};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src = "[jails.sshd]\nenabled = true\nfilter = \"sshd\"\nbackend_typo = \"systemd\"\n";
+    _ = config_mod.Config.parseDiag(arena.allocator(), src, &diag) catch |err| {
+        try printConfigLoadError(stream.writer(), "/etc/fail2zig/config.toml", err, &diag);
+    };
+    try std.testing.expectEqualStrings(
+        "config: /etc/fail2zig/config.toml:4:1: UnknownKey (key 'backend_typo' in [jails.sshd])\n",
+        stream.getWritten(),
+    );
+}
+
+test "cli: config load error without a position prints only the cause" {
+    var buf: [256]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    const diag: config_mod.Diagnostic = .{};
+    try printConfigLoadError(stream.writer(), "/x.toml", error.FileNotFound, &diag);
+    try std.testing.expectEqualStrings("config: /x.toml: FileNotFound\n", stream.getWritten());
+}
+
+test "cli: config permission errors name the octal mode and the chmod fix" {
+    var buf: [256]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    const world: config_mod.Diagnostic = .{ .mode = 0o666 };
+    try printConfigLoadError(stream.writer(), "/etc/fail2zig/config.toml", error.ConfigWorldWritable, &world);
+    try std.testing.expectEqualStrings(
+        "config: /etc/fail2zig/config.toml: world-writable (mode 0666); refusing to start — fix: chmod 0640 /etc/fail2zig/config.toml\n",
+        stream.getWritten(),
+    );
+
+    stream.reset();
+    const group: config_mod.Diagnostic = .{ .mode = 0o660 };
+    try printConfigLoadError(stream.writer(), "/etc/fail2zig/config.toml", error.ConfigGroupWritable, &group);
+    try std.testing.expectEqualStrings(
+        "config: /etc/fail2zig/config.toml: writable by a non-root group (mode 0660); refusing to start — fix: chmod 0640 /etc/fail2zig/config.toml\n",
+        stream.getWritten(),
+    );
+}
+
+test "cli: validate summary names each jail's resolved source" {
+    var buf: [512]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cfg = try config_mod.Config.parse(arena.allocator(), "[jails.sshd]\nfilter = \"sshd\"\nbackend = \"systemd\"\n");
+    try printValidateSummary(stream.writer(), &cfg);
+    try std.testing.expectEqualStrings(
+        "config: jail 'sshd' enabled=true filter=sshd source=journald banaction=nftables\nconfig: OK (1 jail(s) configured)\n",
+        stream.getWritten(),
+    );
 }
 
 fn reconcileBanApply(
@@ -645,6 +763,16 @@ const StartupTrace = struct {
     }
 };
 
+// OutOfMemory is the one startup failure that is not a known fail-closed cause, so it keeps its error-return-trace.
+fn failClosed(err: anytype, comptime fmt: []const u8, args: anytype) @TypeOf(err) {
+    std.log.err(fmt, args);
+    const any: anyerror = err;
+    switch (any) {
+        error.OutOfMemory => return err,
+        else => std.process.exit(1),
+    }
+}
+
 fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     var trace = StartupTrace.init(heap);
     defer trace.report();
@@ -685,10 +813,8 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         if (!jc.enabled) continue;
         const resolved = config_mod.resolveJailFromConfig(jc, cfg.defaults);
         const tcfg = deriveJailTrackerConfig(resolved, per_tracker_capacity);
-        const tracker = trackers.addTracker(jc.name, tcfg) catch |err| {
-            std.log.err("state: tracker init for jail '{s}' failed: {s}", .{ jc.name, @errorName(err) });
-            return err;
-        };
+        const tracker = trackers.addTracker(jc.name, tcfg) catch |err|
+            return failClosed(err, "state: tracker init for jail '{s}' failed: {s}", .{ jc.name, @errorName(err) });
         const ignore_list: []const []const u8 = jc.ignoreip orelse cfg.defaults.ignoreip;
         for (ignore_list) |spec| {
             tracker.addIgnoreCidr(spec) catch |err| {
@@ -702,10 +828,8 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
 
     {
         const legacy_cfg = deriveLegacyTrackerConfig(cfg, per_tracker_capacity);
-        const legacy_tracker = trackers.ensureLegacy(legacy_cfg) catch |err| {
-            std.log.err("state: legacy tracker init failed: {s}", .{@errorName(err)});
-            return err;
-        };
+        const legacy_tracker = trackers.ensureLegacy(legacy_cfg) catch |err|
+            return failClosed(err, "state: legacy tracker init failed: {s}", .{@errorName(err)});
         for (cfg.defaults.ignoreip) |spec| {
             legacy_tracker.addIgnoreCidr(spec) catch |err| {
                 std.log.warn("state: legacy ignoreip '{s}' rejected: {s}", .{ spec, @errorName(err) });
@@ -770,17 +894,14 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     };
     defer loop.deinit();
 
-    var watcher = log_watcher_mod.LogWatcher.init(heap, &loop) catch |err| {
-        std.log.err("log_watcher: init failed: {s}", .{@errorName(err)});
-        return err;
-    };
+    var watcher = log_watcher_mod.LogWatcher.init(heap, &loop) catch |err|
+        return failClosed(err, "log_watcher: init failed: {s}", .{@errorName(err)});
     defer watcher.deinit();
-    try watcher.attach();
+    watcher.attach() catch |err|
+        return failClosed(err, "log_watcher: attach failed: {s}", .{@errorName(err)});
 
-    var journald = journald_source_mod.JournaldSource.init(heap, &loop, cfg.global.state_file) catch |err| {
-        std.log.err("journald: init failed: {s}", .{@errorName(err)});
-        return err;
-    };
+    var journald = journald_source_mod.JournaldSource.init(heap, &loop, cfg.global.state_file) catch |err|
+        return failClosed(err, "journald: init failed: {s}", .{@errorName(err)});
     defer journald.deinit();
 
     var journald_flush_ctx = JournaldFlushContext{
@@ -812,11 +933,11 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
             continue;
         };
         const jail_matcher = filter_registry_mod.matcherForFilter(jail_cfg.filter) orelse {
-            std.log.err(
+            return failClosed(
+                error.UnsupportedFilter,
                 "jail '{s}' uses filter '{s}', which has no builtin matcher — refusing to start (fail2zig will not run a jail with no patterns, as that would ban any line containing an IP). Use a supported builtin filter or remove the jail.",
                 .{ jail_cfg.name, jail_cfg.filter },
             );
-            return error.UnsupportedFilter;
         };
         const resolved = config_mod.resolveJailFromConfig(&jail_cfg, cfg.defaults);
         const ctx = try heap.create(JailContext);
@@ -861,20 +982,16 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
             },
             .journald => {
                 journald.addJail(jail, jail_cfg.filter, lineCallback, ctx) catch |err| switch (err) {
-                    error.UnsupportedJournaldFilter => {
-                        std.log.err(
-                            "journald source supports only the \"sshd\" filter in v1; jail '{s}' uses filter '{s}' — refusing to start (use source=file with a text logpath, or remove the jail)",
-                            .{ jail_cfg.name, jail_cfg.filter },
-                        );
-                        return err;
-                    },
-                    else => {
-                        std.log.err(
-                            "journald: addJail '{s}' failed: {s}",
-                            .{ jail_cfg.name, @errorName(err) },
-                        );
-                        return err;
-                    },
+                    error.UnsupportedJournaldFilter => return failClosed(
+                        err,
+                        "journald source supports only the \"sshd\" filter in v1; jail '{s}' uses filter '{s}' — refusing to start (use source=file with a text logpath, or remove the jail)",
+                        .{ jail_cfg.name, jail_cfg.filter },
+                    ),
+                    else => return failClosed(
+                        err,
+                        "journald: addJail '{s}' failed: {s}",
+                        .{ jail_cfg.name, @errorName(err) },
+                    ),
                 };
                 source_descriptors.putJournald(jail_cfg.name, jail_cfg.filter) catch |err| {
                     std.log.warn("status: source descriptor record failed for '{s}': {s}", .{ jail_cfg.name, @errorName(err) });
@@ -884,13 +1001,11 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
                     .{ jail_cfg.name, jail_cfg.filter },
                 );
             },
-            .fail => {
-                std.log.err(
-                    "jail '{s}' has no usable log source (source={s}, logpath={d}, journalctl={}); refusing to run a jail that protects nothing",
-                    .{ jail_cfg.name, @tagName(jail_cfg.source), jail_cfg.logpath.len, journalctl_present },
-                );
-                return error.JailHasNoUsableSource;
-            },
+            .fail => return failClosed(
+                error.JailHasNoUsableSource,
+                "jail '{s}' has no usable log source (source={s}, logpath={d}, journalctl={}); refusing to run a jail that protects nothing",
+                .{ jail_cfg.name, @tagName(jail_cfg.source), jail_cfg.logpath.len, journalctl_present },
+            ),
         }
     }
 
@@ -911,10 +1026,8 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
             std.log.warn("journald: cursor restore failed: {s}; baselining at now", .{@errorName(err)});
         }
         journald.setFlushHook(journaldFlushHook, &journald_flush_ctx);
-        journald.attach() catch |err| {
-            std.log.err("journald: attach (poll timer) failed: {s}", .{@errorName(err)});
-            return err;
-        };
+        journald.attach() catch |err|
+            return failClosed(err, "journald: attach (poll timer) failed: {s}", .{@errorName(err)});
         std.log.info("journald: polling {d} jail(s) every {d}ms", .{ journald.jailCount(), journald_source_mod.poll_interval_ms });
     }
 
@@ -943,10 +1056,8 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         .version = version,
     };
 
-    var ipc_server = ipc_mod.IpcServer.init(heap, &loop, cfg.global.socket_path) catch |err| {
-        std.log.err("ipc: init failed at '{s}': {s}", .{ cfg.global.socket_path, @errorName(err) });
-        return err;
-    };
+    var ipc_server = ipc_mod.IpcServer.init(heap, &loop, cfg.global.socket_path) catch |err|
+        return failClosed(err, "ipc: init failed at '{s}': {s}", .{ cfg.global.socket_path, @errorName(err) });
     defer ipc_server.deinit();
     ipc_server.setCommandHandler(cmd_ctx.asHandler());
     try ipc_server.start();
@@ -955,13 +1066,11 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         heap,
         &loop,
         cfg.global.websocket_max_clients,
-    ) catch |err| {
-        std.log.err(
-            "ws: init failed (max_clients={d}): {s}",
-            .{ cfg.global.websocket_max_clients, @errorName(err) },
-        );
-        return err;
-    };
+    ) catch |err| return failClosed(
+        err,
+        "ws: init failed (max_clients={d}): {s}",
+        .{ cfg.global.websocket_max_clients, @errorName(err) },
+    );
     defer ws_server.deinit();
 
     var http_ctx: HttpSources = .{
@@ -974,13 +1083,11 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         &loop,
         cfg.global.metrics_port,
         cfg.global.metrics_bind,
-    ) catch |err| {
-        std.log.err(
-            "http: init on {s}:{d} failed: {s}",
-            .{ cfg.global.metrics_bind, cfg.global.metrics_port, @errorName(err) },
-        );
-        return err;
-    };
+    ) catch |err| return failClosed(
+        err,
+        "http: init on {s}:{d} failed: {s}",
+        .{ cfg.global.metrics_bind, cfg.global.metrics_port, @errorName(err) },
+    );
     defer http_server.deinit();
     http_server.setMetricsSource(.{ .ctx = @ptrCast(&http_ctx), .write = writeMetricsPayload });
     http_server.setStatusSource(.{ .ctx = @ptrCast(&http_ctx), .write = writeStatusPayload });
@@ -993,12 +1100,7 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         jctx.ws_alloc = heap;
     }
 
-    var sig_ctx = SignalContext{
-        .loop = &loop,
-        .trackers = &trackers,
-        .state_path = cfg.global.state_file,
-        .journald = &journald,
-    };
+    var sig_ctx = SignalContext{ .loop = &loop };
     try loop.addSignalHandler(linux.SIG.TERM, onTerminate, &sig_ctx);
     try loop.addSignalHandler(linux.SIG.INT, onTerminate, &sig_ctx);
     try loop.addSignalHandler(linux.SIG.HUP, onReload, &sig_ctx);
@@ -1040,6 +1142,47 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     flushStateThenCursors(&trackers, cfg.global.state_file, &journald);
 
     std.log.info("fail2zig: shutting down", .{});
+}
+
+const tmpfs_magic: i64 = 0x01021994;
+
+fn stateDirIsVolatile(state_file: []const u8, fs_magic: ?i64) bool {
+    if (std.mem.startsWith(u8, state_file, "/run/")) return true;
+    return if (fs_magic) |m| m == tmpfs_magic else false;
+}
+
+fn fsMagicOfDir(dir: []const u8) ?i64 {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (dir.len >= path_buf.len) return null;
+    @memcpy(path_buf[0..dir.len], dir);
+    path_buf[dir.len] = 0;
+    // struct statfs is at most 120 bytes on every supported arch and f_type is always its first field.
+    var statfs_buf: [256]u8 align(8) = undefined;
+    const rc = linux.syscall2(.statfs, @intFromPtr(&path_buf), @intFromPtr(&statfs_buf));
+    if (linux.E.init(rc) != .SUCCESS) return null;
+    return @as(i64, std.mem.bytesToValue(c_long, statfs_buf[0..@sizeOf(c_long)]));
+}
+
+fn warnIfVolatileStateDir(state_file: []const u8) void {
+    const dir = std.fs.path.dirname(state_file) orelse "/";
+    if (!stateDirIsVolatile(state_file, fsMagicOfDir(dir))) return;
+    std.log.warn(
+        "persist: state_file '{s}' is on volatile storage (tmpfs or /run): state will not survive restart; use /var/lib/fail2zig",
+        .{state_file},
+    );
+}
+
+test "persist: state path under /run or on tmpfs is classified volatile" {
+    try std.testing.expect(stateDirIsVolatile("/run/fail2zig/state.bin", null));
+    try std.testing.expect(stateDirIsVolatile("/var/lib/fail2zig/state.bin", tmpfs_magic));
+    try std.testing.expect(!stateDirIsVolatile("/var/lib/fail2zig/state.bin", null));
+    try std.testing.expect(!stateDirIsVolatile("/var/lib/fail2zig/state.bin", 0xEF53));
+    try std.testing.expect(!stateDirIsVolatile("/runway/state.bin", null));
+}
+
+test "persist: fsMagicOfDir reads a real mount and rejects a missing one" {
+    try std.testing.expect(fsMagicOfDir("/") != null);
+    try std.testing.expect(fsMagicOfDir("/nonexistent-fail2zig-dir") == null);
 }
 
 fn ensureSocketDir(socket_path: []const u8) !void {
