@@ -3,7 +3,7 @@
 const std = @import("std");
 
 // Version single source of truth; build.zig.zon .version must match (release-stamp bumps both).
-const fail2zig_version = "0.2.2";
+const fail2zig_version = "0.3.0";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
