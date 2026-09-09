@@ -1,15 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! fail2zig-client — CLI entry point.
-//!
-//! Parses argv, dispatches to a handler, prints formatted output. Exit codes:
-//!   0 = success
-//!   1 = daemon returned an error response
-//!   2 = client-side error (bad args, invalid IP, invalid config)
-//!   3 = connection failed (daemon unreachable, timeout, permission)
-//!
-//! All I/O is synchronous and minimal — the client is a thin, fast shim over
-//! the binary IPC protocol defined in `shared/protocol.zig`.
 
 const std = @import("std");
 const shared = @import("shared");
@@ -20,9 +10,6 @@ pub const socket = @import("socket.zig");
 pub const format = @import("format.zig");
 pub const completions = @import("completions.zig");
 
-/// Client version. Single source of truth lives in `build.zig`
-/// (`fail2zig_version`), injected via the generated `build_options` module so
-/// the client and the daemon always report the same string.
 pub const client_version = build_options.version;
 
 pub const ExitCode = enum(u8) {
@@ -37,7 +24,6 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Gather argv (skipping program name).
     const raw_argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, raw_argv);
     const argv: []const []const u8 = if (raw_argv.len > 0) raw_argv[1..] else raw_argv;
@@ -46,9 +32,6 @@ pub fn main() !void {
     std.process.exit(@intFromEnum(code));
 }
 
-/// Execute the CLI with the given argv (excluding program name). Returns an
-/// exit code. Separated from `main` so it can be tested by passing in
-/// pre-built argv arrays and capturing output buffers.
 pub fn run(
     allocator: std.mem.Allocator,
     argv: []const []const u8,
@@ -111,10 +94,6 @@ pub fn run(
     }
 }
 
-// ============================================================================
-// Request plumbing
-// ============================================================================
-
 const FormatFn = *const fn (
     std.mem.Allocator,
     anytype,
@@ -160,8 +139,6 @@ fn doRequest(
     }
 }
 
-// Per-command formatter shims — these exist to give doRequest a stable signature
-// that works for every command, even ones with extra arguments (like version).
 fn formatStatusCmd(
     allocator: std.mem.Allocator,
     writer: anytype,
@@ -232,10 +209,6 @@ fn formatVersionCmd(
     return format.formatVersion(allocator, writer, client_version, payload, fmt, color);
 }
 
-// ============================================================================
-// Input validation helpers
-// ============================================================================
-
 fn parseIp(s: []const u8, stderr: anytype) !shared.IpAddress {
     return shared.IpAddress.parse(s) catch {
         stderr.print(
@@ -263,10 +236,6 @@ fn parseJailIdRequired(s: []const u8, stderr: anytype) !shared.JailId {
         return error.InvalidJail;
     };
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 const testing = std.testing;
 
@@ -302,18 +271,11 @@ test "client: --version exits 0 and prints client version" {
     defer testing.allocator.free(r.err);
     try testing.expectEqual(ExitCode.success, r.code);
 
-    // Assert against the build-injected version rather than a literal so this
-    // can never drift behind a release bump (the bug ISSUE-010 fixes).
     const expected = "fail2zig-client " ++ build_options.version;
     try testing.expect(std.mem.indexOf(u8, r.out, expected) != null);
 }
 
 test "client: client_version is the build-injected single source of truth" {
-    // Regression guard for ISSUE-010: the client must report exactly the
-    // version baked into the build, never a hand-maintained literal that can
-    // fall behind a release stamp. The engine asserts the matching identity
-    // (`version == build_options.version`) on its side, so both binaries are
-    // pinned to the same `build.zig` source — drift cannot silently return.
     try testing.expectEqualStrings(build_options.version, client_version);
 }
 

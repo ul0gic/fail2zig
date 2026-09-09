@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! IPC protocol between the fail2zig daemon and fail2zig-client.
-//!
-//! Wire format:
-//!   [u32 payload_size little-endian][payload_size bytes of body]
-//!
-//! Command body:
-//!   [u8 command_id][command-specific fields]
-//!
-//! Response body:
-//!   [u8 response_tag][response-specific fields]
+//! Wire format: [u32 payload_size LE][body]; command body = [u8 tag][fields], response = [u8 tag][fields].
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -18,9 +9,7 @@ pub const IpAddress = types.IpAddress;
 pub const JailId = types.JailId;
 pub const Duration = types.Duration;
 
-/// Hard cap on the size of a single message payload. Prevents DoS via
-/// attacker-claimed multi-gigabyte length prefixes on an unprivileged socket.
-pub const max_payload_size: u32 = 1 << 20; // 1 MiB
+pub const max_payload_size: u32 = 1 << 20;
 
 pub const CommandId = enum(u8) {
     status = 0,
@@ -69,7 +58,6 @@ pub const Response = union(ResponseTag) {
     pub const Ok = struct { payload: []const u8 };
     pub const Err = struct { code: u16, message: []const u8 };
 
-    /// Free slices owned by a response that was produced by deserializeResponse.
     pub fn deinit(self: Response, allocator: std.mem.Allocator) void {
         switch (self) {
             .ok => |o| allocator.free(o.payload),
@@ -91,10 +79,6 @@ pub const DeserializeError = error{
     ReadFailed,
 };
 
-// ============================================================================
-// Commands
-// ============================================================================
-
 pub fn serializeCommand(cmd: Command, writer: anytype) @TypeOf(writer).Error!void {
     const body_size = commandBodySize(cmd);
     try writer.writeInt(u32, body_size, .little);
@@ -114,7 +98,7 @@ fn commandBodySize(cmd: Command) u32 {
         .unban => |u| ipSize(u.ip) + optJailIdSize(u.jail),
         .list => |l| optJailIdSize(l.jail),
     };
-    return 1 + body; // +1 for command tag
+    return 1 + body;
 }
 
 fn writeCommandBody(cmd: Command, writer: anytype) @TypeOf(writer).Error!void {
@@ -159,10 +143,6 @@ fn readCommandBody(reader: anytype) DeserializeError!Command {
         },
     };
 }
-
-// ============================================================================
-// Responses
-// ============================================================================
 
 pub fn serializeResponse(resp: Response, writer: anytype) @TypeOf(writer).Error!void {
     const body_size = responseBodySize(resp);
@@ -219,10 +199,6 @@ fn writeResponseBody(resp: Response, writer: anytype) @TypeOf(writer).Error!void
         },
     }
 }
-
-// ============================================================================
-// Field encoders / decoders
-// ============================================================================
 
 fn ipSize(ip: IpAddress) u32 {
     return switch (ip) {
@@ -316,10 +292,6 @@ fn readOptionalDuration(reader: anytype) DeserializeError!?Duration {
     };
 }
 
-// ============================================================================
-// Reader primitives (wrap `anytype` reader, normalize errors)
-// ============================================================================
-
 fn readByte(reader: anytype) !u8 {
     return try reader.readByte();
 }
@@ -359,10 +331,6 @@ fn mapReadErr(err: anyerror) DeserializeError {
         else => error.ReadFailed,
     };
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 fn roundtripCommand(cmd: Command) !Command {
     var buf: [1024]u8 = undefined;
@@ -452,7 +420,7 @@ test "Command: roundtrip list without jail" {
 }
 
 test "Command: reject unknown command id" {
-    const bytes = [_]u8{ 0x01, 0x00, 0x00, 0x00, 0xFF }; // size=1, tag=0xFF
+    const bytes = [_]u8{ 0x01, 0x00, 0x00, 0x00, 0xFF };
     var stream = std.io.fixedBufferStream(&bytes);
     try std.testing.expectError(
         error.InvalidCommandId,

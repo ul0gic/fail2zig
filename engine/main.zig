@@ -1,32 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! fail2zig daemon entry point.
-//!
-//! Responsibilities:
-//!   1. Parse CLI args (--config, --version, --help, --test-config,
-//!      --foreground, --import-config).
-//!   2. Load + validate config.
-//!   3. Detect the firewall backend (or fail closed if none available).
-//!   4. Initialize the state tracker; seed it from the persisted state
-//!      file if present.
-//!   5. For each enabled jail, resolve its configured filter to a
-//!      `FilterMatcher` and wire a `LogWatcher` (or journald source) per
-//!      `logpath`, with a static line callback that routes matches
-//!      through the state tracker and on ban decisions into the
-//!      firewall backend.
-//!   6. Install signal handlers (SIGTERM/SIGINT save state + exit,
-//!      SIGHUP logs "reload not yet implemented").
-//!   7. Arm a 1s periodic timer that scans for expired bans and calls
-//!      `backend.unban` for each.
-//!   8. Enter the event loop until stopped.
-//!
-//! The steady-state hot path — log line → match → state update →
-//! (maybe) ban — is allocation-free on the happy path: the matcher
-//! operates on slices of the caller's buffer and the per-jail state
-//! tracker is a fixed-capacity map sized at startup. The memory ceiling
-//! (`memory_ceiling_mb`) is enforced as a ceiling-derived per-jail entry
-//! cap with eviction in the state tracker (ADR-005) — the single live
-//! mechanism (DBT-003 / DBT-004).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -36,9 +9,6 @@ const posix = std.posix;
 const shared = @import("shared");
 const build_options = @import("build_options");
 
-// Wire all engine modules into the build graph so their tests are discovered.
-// Modules reached by integration tests (via the named `engine` module) are
-// `pub const`; the rest stay private.
 pub const event_loop_mod = @import("core/event_loop.zig");
 const log_watcher_mod = @import("core/log_watcher.zig");
 pub const journald_source_mod = @import("core/journald_source.zig");
@@ -66,14 +36,7 @@ pub const ipc_mod = @import("net/ipc.zig");
 pub const commands_mod = @import("net/commands.zig");
 const metrics_mod = @import("core/metrics.zig");
 
-/// Daemon version. Single source of truth lives in `build.zig`
-/// (`fail2zig_version`), injected via the generated `build_options` module so
-/// the daemon and the client can never report different strings.
 pub const version = build_options.version;
-
-// ============================================================================
-// CLI argument parsing
-// ============================================================================
 
 pub const CliError = error{
     MissingValue,
@@ -90,26 +53,17 @@ pub const CliAction = enum {
     import_config,
 };
 
-/// Parsed command-line options. String fields are slices into the owning
-/// arena (for tests) or into the argv storage returned by `std.process.argsAlloc`.
 pub const CliOptions = struct {
     action: CliAction = .run,
     config_path: []const u8 = "/etc/fail2zig/config.toml",
-    /// Source directory passed to `--import-config`. Defaults to
-    /// fail2ban's standard location.
     import_path: ?[]const u8 = null,
-    /// Destination path for `--import-config` output. Defaults to
-    /// fail2zig's standard config location so the workflow
-    /// `fail2zig --import-config` → `fail2zig` just works.
     import_output: []const u8 = "/etc/fail2zig/config.toml",
-    foreground: bool = true, // v0.1: foreground-only
+    foreground: bool = true,
 };
 
-/// Parse command-line arguments from a slice (test-friendly; the real
-/// entry point feeds in `std.process.argsAlloc`-produced slices).
 pub fn parseArgs(args: []const []const u8) CliError!CliOptions {
     var out: CliOptions = .{};
-    var i: usize = 1; // skip argv[0]
+    var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
@@ -119,8 +73,6 @@ pub fn parseArgs(args: []const []const u8) CliError!CliOptions {
         } else if (std.mem.eql(u8, a, "--test-config")) {
             out.action = .test_config;
         } else if (std.mem.eql(u8, a, "--validate-config")) {
-            // Alias of --test-config with clearer naming — we still keep
-            // --test-config for backward compatibility with early release docs.
             out.action = .validate_config;
         } else if (std.mem.eql(u8, a, "--foreground")) {
             out.foreground = true;
@@ -131,8 +83,6 @@ pub fn parseArgs(args: []const []const u8) CliError!CliOptions {
         } else if (std.mem.startsWith(u8, a, "--config=")) {
             out.config_path = a["--config=".len..];
         } else if (std.mem.eql(u8, a, "--import-config")) {
-            // Optional argument: if the next token looks like a path (not
-            // a flag), consume it; otherwise default to /etc/fail2ban.
             if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "--")) {
                 i += 1;
                 out.import_path = args[i];
@@ -181,11 +131,6 @@ fn printHelp(w: anytype) !void {
     , .{version});
 }
 
-// ============================================================================
-// Migration driver — small wrapper so tests can drive it without spawning
-// the whole daemon. Returns the same exit code the CLI surfaces.
-// ============================================================================
-
 pub fn runImport(
     heap: std.mem.Allocator,
     source: []const u8,
@@ -204,66 +149,22 @@ pub fn runImport(
     return 0;
 }
 
-// ============================================================================
-// Jail context — glue between log watcher, parser, state, backend
-// ============================================================================
-
 const JailContext = struct {
     jail: shared.JailId,
-    /// Runtime matcher for THIS jail's configured filter (SYS-020). Built
-    /// once at construction from `jail.filter` via
-    /// `filter_registry_mod.matcherForFilter`, which resolves the filter
-    /// name to its comptime-compiled pattern set. This REPLACES the old
-    /// permissive `Parser.init` default (`<*><IP>` — "any line containing
-    /// an IP"), which matched benign IP-bearing lines (sshd's
-    /// `Server listening on 0.0.0.0 port 22`, successful logins) and caused
-    /// false bans. Both the file tailer and the journald source route
-    /// through `lineCallback`, so both resolve to the SAME configured
-    /// matcher for a given jail. A jail whose filter has no builtin matcher
-    /// fails closed at construction (never reaches here with a default).
     matcher: filter_registry_mod.FilterMatcher,
-    /// Per-jail state tracker (ISSUE-007). Each jail's tracker carries
-    /// its own resolved `maxretry`/`findtime`/`bantime` so per-jail
-    /// overrides actually take effect.
     state: *state_mod.StateTracker,
     backend_ptr: *firewall.Backend,
-    /// Resolved ban action for THIS jail (SYS-016). Drives ban dispatch:
-    /// `.@"log-only"` records the ban intent (would-ban log line + bans
-    /// metric) but skips the firewall mutation AND the `ip_banned` event;
-    /// every other value enforces through `backend_ptr` and emits the
-    /// event. Resolved once at context construction via
-    /// `config_mod.resolveJailFromConfig` so the per-jail-vs-defaults rule
-    /// isn't reimplemented here. Defaults to `.nftables` (the schema
-    /// default) so a context built without this field still enforces.
     banaction: config_mod.BanAction = .nftables,
-    /// Metrics is nullable for tests that don't care about counters —
-    /// the daemon always supplies a real pointer.
     metrics: ?*metrics_mod.Metrics = null,
-    /// Dashboard WS server. Nullable for tests; the daemon always
-    /// supplies a real pointer. When present, every parsed match
-    /// broadcasts `attack_detected` and every ban broadcasts
-    /// `ip_banned` so live dashboards can render in real time.
     ws: ?*ws.WsServer = null,
-    /// Allocator used to render event payload strings before handing
-    /// them to WS broadcast. A small FBA would be nicer, but the
-    /// broadcasts are rare (per-match, per-ban), payloads are tiny
-    /// (<200 B), and the daemon's heap allocator tolerates this fine.
     ws_alloc: ?std.mem.Allocator = null,
-    /// Current wall-clock is read at callback time; stored here so tests
-    /// can override it. In production this stays at null.
     now_override: ?shared.Timestamp = null,
-    /// Test seam (SYS-016). When non-null, the enforcing dispatch path
-    /// calls this instead of `backend_ptr.ban`, letting tests observe
-    /// whether enforcement was invoked without a real kernel/firewall.
-    /// In production this stays null and the real backend is called.
-    /// Mirrors the `now_override` test-seam idiom already used here.
     ban_hook: ?*const fn (
         userdata: ?*anyopaque,
         ip: shared.IpAddress,
         jail: shared.JailId,
         duration: shared.Duration,
     ) firewall.BackendError!void = null,
-    /// Opaque userdata handed to `ban_hook` (e.g. a call-count spy).
     ban_hook_ctx: ?*anyopaque = null,
 
     fn now(self: *const JailContext) shared.Timestamp {
@@ -271,9 +172,6 @@ const JailContext = struct {
         return std.time.timestamp();
     }
 
-    /// Enforce a ban through the configured backend, honoring the test
-    /// seam when present. Returns the backend error unchanged so callers
-    /// keep their existing error handling.
     fn enforceBan(
         self: *JailContext,
         ip: shared.IpAddress,
@@ -287,45 +185,21 @@ const JailContext = struct {
     }
 };
 
-/// Dispatch a ban decision (SYS-016). Honors the jail's resolved
-/// `banaction`:
-///
-///   * `.@"log-only"` — record the ban INTENT only: log a "would-ban"
-///     line and increment the bans counter so the operator can see the
-///     jail is doing its job, but DO NOT mutate the firewall and DO NOT
-///     emit the `ip_banned` WS event. That event asserts the IP was
-///     actually banned; emitting it for a log-only jail would be a lie —
-///     the same dishonesty (claiming an enforcement that didn't happen)
-///     this fix exists to remove. Honest audit/monitoring mode.
-///   * everything else — a real ban. Enforce through the backend first;
-///     on backend error, warn and return BEFORE incrementing metrics /
-///     broadcasting (preserving the original ordering) so a failed
-///     enforcement is not counted as a successful ban. Then broadcast the
-///     honest `ip_banned` event.
-///
-/// Extracted from `lineCallback` so the branch is unit-testable.
 fn dispatchBan(ctx: *JailContext, d: state_mod.BanDecision) void {
     if (ctx.banaction == .@"log-only") {
-        // Audit mode: record intent, touch nothing.
         std.log.info(
             "would-ban: jail='{s}' ip={} duration={d}s ban_count={d} action=log-only",
             .{ ctx.jail.slice(), d.ip, d.duration, d.ban_count },
         );
-        // BUG-006: count the NEW ban against the jail's persisted lifetime
-        // (log-only bans count too — the metric does, and a log-only jail's
-        // intent is still a ban event). Restores never reach here, so no
-        // double-count across restarts.
         ctx.state.recordLifetimeBan();
         if (ctx.metrics) |m| {
             m.incrementBans();
             m.jailIncrementBans(ctx.jail.slice());
         }
-        // Deliberately NO broadcastBanned() here: no firewall mutation
-        // occurred, so an `ip_banned` event would misrepresent reality.
+        // No broadcastBanned(): nothing changed in the firewall, so an ip_banned event would lie.
         return;
     }
 
-    // Enforcing path — a real ban.
     std.log.info(
         "ban: jail='{s}' ip={} duration={d}s ban_count={d} action={s}",
         .{ ctx.jail.slice(), d.ip, d.duration, d.ban_count, @tagName(ctx.banaction) },
@@ -337,14 +211,11 @@ fn dispatchBan(ctx: *JailContext, d: state_mod.BanDecision) void {
         );
         return;
     };
-    // BUG-006: a confirmed new ban bumps the jail's persisted lifetime
-    // count (only after the kernel ban succeeded, matching the metric).
     ctx.state.recordLifetimeBan();
     if (ctx.metrics) |m| {
         m.incrementBans();
         m.jailIncrementBans(ctx.jail.slice());
     }
-    // Broadcast `ip_banned` after the kernel ban is confirmed.
     if (ctx.ws) |ws_server| {
         if (ctx.ws_alloc) |a| {
             var ip_buf: [64]u8 = undefined;
@@ -363,10 +234,8 @@ fn lineCallback(
     truncated: bool,
     userdata: ?*anyopaque,
 ) void {
-    _ = _jail; // we use the jail from the context (authoritative)
+    _ = _jail;
     if (truncated) {
-        // Truncated lines are suspicious (too long). Drop and move on —
-        // a partial line can't reliably yield a ban decision.
         return;
     }
     const ctx: *JailContext = @ptrCast(@alignCast(userdata.?));
@@ -375,20 +244,8 @@ fn lineCallback(
         m.jailIncrementParsed(ctx.jail.slice());
     }
 
-    // QA-001: strip the syslog envelope before pattern anchoring. Built-in
-    // filter patterns match against the program-emitted message body
-    // (e.g. `Failed password for ...`), not against the rsyslog-framed
-    // line (`Apr 21 10:15:03 host sshd[1234]: Failed password ...`).
-    // `stripSyslogPrefix` returns the same slice unchanged when no
-    // syslog envelope is detected — zero-alloc, zero-cost on non-syslog
-    // inputs (e.g. journalctl-piped lines where the prefix is absent).
     const body = parser_mod.stripSyslogPrefix(line);
 
-    // SYS-020: match against THIS jail's CONFIGURED filter patterns, not a
-    // permissive default. A non-matching line is the common case (most log
-    // lines are not auth failures) — no count, no ban. `incrementParseErrors`
-    // is misnamed for "no match" but is the existing counter for "a line we
-    // saw but did not act on"; keep using it so metrics stay continuous.
     const result = ctx.matcher.match(body) orelse {
         if (ctx.metrics) |m| {
             m.incrementParseErrors();
@@ -397,13 +254,6 @@ fn lineCallback(
         return;
     };
 
-    // SYS-020 defense-in-depth: even a matched line may carry an
-    // unenforceable IP (the unspecified `0.0.0.0` / `::` a listener logs on
-    // start, or loopback). Banning these is noise at best, self-DoS at
-    // worst. Drop the match here — at the record boundary, so this rail
-    // protects EVERY matcher, not just sshd. We never coerce a missing IP
-    // to zero; extraction returns no match instead, so this only fires when
-    // a real-but-unenforceable token was parsed.
     if (result.ip.isUnenforceable()) {
         @branchHint(.unlikely);
         std.log.debug(
@@ -419,29 +269,8 @@ fn lineCallback(
     }
     const ts = ctx.now();
 
-    // CRITICAL PRIVACY CHECK: if the IP is in `ignoreip`, do NOT
-    // broadcast anything to the public WS feed. `ignoreip` exists
-    // specifically to exempt operator + trusted infrastructure IPs
-    // from ban decisions; before this guard, we were matching the
-    // filter and emitting `attack_detected` for every operator SSH
-    // session, leaking the operator's real IP to anyone watching
-    // see-it-live. `recordAttempt` short-circuits for ignored IPs
-    // internally (no ban decision), so we also skip it here — both
-    // to save a hash lookup and to keep the control flow obvious.
     const ignored = ctx.state.isIgnored(result.ip);
 
-    // Broadcast `attack_detected` on every non-ignored match. Live
-    // dashboards render these as they stream in; `ip_banned` alone
-    // would leave the terminal pane empty in findtime windows where
-    // hits don't cross the retry threshold. Failure to broadcast is
-    // non-fatal.
-    //
-    // `pattern_name` would ideally be the specific filter pattern
-    // (e.g. "failed-password"), but the parser exposes only
-    // `matched_pattern_id: u16` today — resolving id→name needs a
-    // per-jail lookup table. For now we pass the jail name so the
-    // frontend has something non-empty; plumbing actual pattern names
-    // through is Phase 10 polish (see SYS-012 TODO).
     if (!ignored) {
         if (ctx.ws) |ws_server| {
             if (ctx.ws_alloc) |a| {
@@ -455,9 +284,6 @@ fn lineCallback(
         }
     }
 
-    // Ignored IPs never yield a ban decision, so we skip the state
-    // tracker call entirely. Anything downstream (ban broadcasts,
-    // nftables install) is therefore unreachable for ignored IPs.
     if (ignored) return;
 
     const decision = ctx.state.recordAttempt(result.ip, ctx.jail, ts) catch |err| {
@@ -472,13 +298,7 @@ fn lineCallback(
     }
 }
 
-// ============================================================================
-// Ban expiry sweep (periodic timer)
-// ============================================================================
-
 const ExpiryContext = struct {
-    /// Walks every tracker each tick. With per-jail trackers
-    /// (ISSUE-007), expiry must visit every jail's ring buffer.
     trackers: *tracker_map_mod.TrackerMap,
     backend_ptr: *firewall.Backend,
     metrics: ?*metrics_mod.Metrics = null,
@@ -491,9 +311,6 @@ fn expirySweep(expirations: u64, userdata: ?*anyopaque) void {
     const ctx: *ExpiryContext = @ptrCast(@alignCast(userdata.?));
     const now = std.time.timestamp();
 
-    // Collect expired IPs into a small stack buffer; HashMap iteration
-    // while mutating the map is unsafe. 64 per tick keeps the cadence
-    // reasonable even under high expiry load.
     const max_per_tick: usize = 64;
     var to_unban: [max_per_tick]struct {
         ip: shared.IpAddress,
@@ -536,8 +353,6 @@ fn expirySweep(expirations: u64, userdata: ?*anyopaque) void {
             "unban: jail='{s}' ip={}",
             .{ item.jail.slice(), item.ip },
         );
-        // Broadcast `ip_unbanned` so dashboards can visually retire the
-        // entry as soon as nftables has dropped it. Non-fatal on error.
         if (ctx.ws) |ws_server| {
             if (ctx.ws_alloc) |a| {
                 var ip_buf: [64]u8 = undefined;
@@ -551,40 +366,25 @@ fn expirySweep(expirations: u64, userdata: ?*anyopaque) void {
     }
 }
 
-// ============================================================================
-// WS tick — heartbeat + periodic metrics push (1 Hz)
-// ============================================================================
-//
-// Without this, the /events stream is silent between filter matches.
-// Live dashboards need to show forward motion even during attack lulls;
-// they also need ping/pong so CF and clients keep the WS alive.
 const WsTickContext = struct {
     ws: *ws.WsServer,
     metrics: *metrics_mod.Metrics,
     ws_alloc: std.mem.Allocator,
     start_time: i64,
-    /// SYS-017: the command context, so the 1 Hz metrics push can emit the
-    /// overall `protection_state` + `degraded` flag. Read-only at tick time
-    /// (same event-loop thread).
     cmd_ctx: *commands_mod.Context,
 };
 
-/// Read `VmRSS` from `/proc/self/status` and return bytes. Linux-only.
-/// On any I/O or parse failure returns an error — callers should
-/// treat that as "gauge unavailable this tick" and skip the update.
 fn readSelfRssBytes() !u64 {
     var file = std.fs.openFileAbsolute("/proc/self/status", .{}) catch |err| return err;
     defer file.close();
     var buf: [8192]u8 = undefined;
     const n = file.readAll(&buf) catch |err| return err;
     const contents = buf[0..n];
-    // Line shape: "VmRSS:\t   12345 kB"
     const needle = "VmRSS:";
     const idx = std.mem.indexOf(u8, contents, needle) orelse return error.NotFound;
     const tail = contents[idx + needle.len ..];
     const nl = std.mem.indexOfScalar(u8, tail, '\n') orelse tail.len;
     const line = tail[0..nl];
-    // Extract the first run of decimal digits.
     var i: usize = 0;
     while (i < line.len and (line[i] < '0' or line[i] > '9')) : (i += 1) {}
     const start = i;
@@ -598,14 +398,8 @@ fn wsTick(expirations: u64, userdata: ?*anyopaque) void {
     _ = expirations;
     const ctx: *WsTickContext = @ptrCast(@alignCast(userdata.?));
 
-    // Heartbeat: send pings to silent clients, drop any that haven't
-    // pong'd in time. Cheap; no-op if there are no clients.
     ctx.ws.tickHeartbeat();
 
-    // Refresh the RSS gauge before snapshotting. /proc/self/status is
-    // kernel-maintained; the VmRSS line is ~40 bytes in a ~8 KiB text
-    // file — a single read + strtoul per second is vanishing overhead.
-    // Falls back silently on non-Linux or an open-failure.
     if (readSelfRssBytes()) |rss_bytes| {
         ctx.metrics.setMemoryBytes(rss_bytes);
     } else |_| {}
@@ -617,7 +411,6 @@ fn wsTick(expirations: u64, userdata: ?*anyopaque) void {
         break :blk @intCast(now - ctx.start_time);
     };
 
-    // SYS-017: overall protection state on the WS frame (additive).
     const protection_state = ctx.cmd_ctx.computeOverallState();
     ctx.ws.broadcastMetrics(ctx.ws_alloc, .{
         .lines_parsed = snap.lines_parsed,
@@ -633,32 +426,14 @@ fn wsTick(expirations: u64, userdata: ?*anyopaque) void {
     };
 }
 
-// ============================================================================
-// Signal handlers
-// ============================================================================
-
 const SignalContext = struct {
     loop: *event_loop_mod.EventLoop,
-    /// Snapshots every per-jail tracker on shutdown (ISSUE-007). The
-    /// flat on-disk format already carries per-entry jail names, so
-    /// load+route on next start rehydrates the right tracker.
     trackers: *tracker_map_mod.TrackerMap,
     state_path: []const u8,
-    /// journald source (SYS-015). Null when no jail reads the journal.
-    /// Its cursor sidecar is flushed AFTER engine state — see
-    /// `flushStateThenCursors`.
     journald: ?*journald_source_mod.JournaldSource = null,
     save_requested: bool = false,
 };
 
-/// Persist engine state, THEN the journald cursor sidecar — ordering is
-/// load-bearing (SYS-015 Lead decision 2). State must hit disk before the
-/// cursor so a crash between the two writes leaves the cursor OLDER than
-/// the state: the next start replays ≤1 poll interval of already-counted
-/// entries (safe at-least-once) and NEVER skips entries. Reversing the
-/// order would risk advancing the cursor past entries whose ban-state
-/// updates were lost. Both writes are best-effort: a failure is logged,
-/// never fatal.
 fn flushStateThenCursors(
     trackers: *tracker_map_mod.TrackerMap,
     state_path: []const u8,
@@ -678,21 +453,12 @@ fn flushStateThenCursors(
     }
 }
 
-/// Context for the journald periodic-flush hook (SYS-015 Change 2).
-/// Lives on `runDaemon`'s stack across `loop.run()`. The hook is invoked
-/// by `JournaldSource.maybeFlush` after any poll tick that advanced a
-/// cursor, so state + cursors are durable within ≤1 poll interval of the
-/// entries they reflect (without a separate flush timer).
 const JournaldFlushContext = struct {
     trackers: *tracker_map_mod.TrackerMap,
     state_path: []const u8,
     journald: *journald_source_mod.JournaldSource,
 };
 
-/// JournaldSource flush hook. Casts userdata → `*JournaldFlushContext` and
-/// delegates to `flushStateThenCursors`, which enforces the load-bearing
-/// state-first / cursor-second ordering. Single-threaded loop: this runs
-/// on the loop thread inside `pollTick` and never re-enters the poller.
 fn journaldFlushHook(userdata: ?*anyopaque) void {
     const ctx: *JournaldFlushContext = @ptrCast(@alignCast(userdata.?));
     flushStateThenCursors(ctx.trackers, ctx.state_path, ctx.journald);
@@ -713,13 +479,6 @@ fn onReload(siginfo: *const linux.signalfd_siginfo, userdata: ?*anyopaque) void 
     std.log.info("signal: SIGHUP received — reload not yet implemented", .{});
 }
 
-// ============================================================================
-// Tracker config derivation from parsed config
-// ============================================================================
-
-/// Translate a config-layer `BanTimeIncrement` into the state tracker's
-/// shape. The two structs carry the same fields but are defined
-/// independently so the state module has zero config-layer imports.
 fn translateBanTimeIncrement(incr: config_mod.BanTimeIncrement) state_mod.BanTimeIncrement {
     return .{
         .enabled = incr.enabled,
@@ -733,9 +492,6 @@ fn translateBanTimeIncrement(incr: config_mod.BanTimeIncrement) state_mod.BanTim
     };
 }
 
-/// Build the state-tracker config for a single jail from the resolved
-/// per-jail values (ISSUE-007). Each jail gets its own tracker with its
-/// own thresholds.
 fn deriveJailTrackerConfig(
     resolved: config_mod.ResolvedJailConfig,
     max_entries: u32,
@@ -750,11 +506,6 @@ fn deriveJailTrackerConfig(
     };
 }
 
-/// Synthesize a state-tracker config for the synthetic `__legacy__`
-/// tracker. Uses the defaults block since legacy entries have no
-/// surviving jail config to consult. Tuned for a small ceiling — the
-/// legacy bucket exists only to keep restored bans active until the
-/// operator either deletes the state file or re-adds the jail.
 fn deriveLegacyTrackerConfig(cfg: *const config_mod.Config, max_entries: u32) state_mod.Config {
     const d = cfg.defaults;
     return .{
@@ -766,10 +517,6 @@ fn deriveLegacyTrackerConfig(cfg: *const config_mod.Config, max_entries: u32) st
         .eviction_policy = .drop_oldest_unbanned,
     };
 }
-
-// ============================================================================
-// Entry point
-// ============================================================================
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -808,7 +555,6 @@ pub fn main() !void {
         .test_config, .validate_config, .run => {},
     }
 
-    // Load config.
     var cfg_arena = std.heap.ArenaAllocator.init(heap);
     defer cfg_arena.deinit();
     const cfg = config_mod.Config.loadFile(cfg_arena.allocator(), opts.config_path) catch |err| {
@@ -817,11 +563,6 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    // Ensure the socket directory exists before `validate()` checks it.
-    // On `--test-config` / `--validate-config` we skip the mkdir — the
-    // validator treats a missing dir as a hard error, which is what
-    // operators want when they're troubleshooting from a laptop without
-    // root.
     const is_validate_only = opts.action == .test_config or opts.action == .validate_config;
     if (!is_validate_only) {
         ensureSocketDir(cfg.global.socket_path) catch |err| {
@@ -841,15 +582,9 @@ pub fn main() !void {
         return;
     }
 
-    // Run the daemon.
     try runDaemon(heap, &cfg);
 }
 
-/// Bridges `reconcile_mod.reconcileRestoredBans` to the live firewall
-/// backend. `ctx` is a `*firewall.Backend`. Treats `AlreadyBanned` as
-/// idempotent success; surfaces any other failure as a warn log +
-/// error return so reconcile counts it as a failed apply and moves on
-/// to the next entry.
 fn reconcileBanApply(
     ctx: *anyopaque,
     ip: shared.IpAddress,
@@ -869,16 +604,10 @@ fn reconcileBanApply(
     };
 }
 
-/// QA-002: opt-in startup-phase profiler. Zero cost unless the
-/// `FAIL2ZIG_STARTUP_TRACE` env var is set (then it prints one JSON line of
-/// per-phase deltas to stderr at the end of init, so the ~98ms cold-start
-/// cost can be attributed before/after the lazy-init change). Not wired to
-/// any production behavior — purely a diagnostic the operator/CI opts into.
 const StartupTrace = struct {
     enabled: bool,
     timer: ?std.time.Timer,
     last_ns: u64 = 0,
-    /// One JSON line accumulated across `mark` calls.
     buf: std.ArrayListUnmanaged(u8) = .{},
     allocator: std.mem.Allocator,
 
@@ -895,8 +624,6 @@ const StartupTrace = struct {
         return self;
     }
 
-    /// Record the elapsed time since the previous `mark` (or start) under
-    /// `phase`. No-op when disabled.
     fn mark(self: *StartupTrace, phase: []const u8) void {
         if (!self.enabled) return;
         const now = self.timer.?.read();
@@ -906,11 +633,6 @@ const StartupTrace = struct {
         w.print(",\"{s}_ms\":{d:.2}", .{ phase, delta_ms }) catch {};
     }
 
-    /// Emit the accumulated line to stderr and release the buffer. Fully
-    /// idempotent — safe to call explicitly at the loop-ready point AND via
-    /// the `defer` on an early-return error path. The first call emits +
-    /// frees; later calls are no-ops (buffer is left empty, not undefined,
-    /// so a second free is harmless).
     fn report(self: *StartupTrace) void {
         if (self.enabled) {
             self.enabled = false;
@@ -927,8 +649,6 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     var trace = StartupTrace.init(heap);
     defer trace.report();
 
-    // Metrics (atomic counters). Cheap; construct before anything that
-    // increments them.
     var metrics = metrics_mod.Metrics.init();
     for (cfg.jails) |jc| {
         if (!jc.enabled) continue;
@@ -936,15 +656,6 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     }
     trace.mark("metrics");
 
-    // Firewall backend. No usable backend (or a backend that can't install
-    // its scaffold — e.g. missing CAP_NET_ADMIN) is a KNOWN fail-closed
-    // condition with a clear cause logged just above by detect()/init(). Exit
-    // cleanly with a non-zero status rather than `return err` — propagating
-    // the error to `main` would dump a ReleaseSafe error-return-trace that
-    // looks like a crash on top of the already-clear message. We still fail
-    // closed (exit 1, refuse to run unprotected). `std.process.exit` skips
-    // defers, which is fine here: no firewall rules are installed on this
-    // path and the only skipped defer is the opt-in startup trace.
     var backend_val = firewall.detect(heap) catch |err| {
         std.log.err("firewall: no backend available ({s}) — refusing to run unprotected", .{@errorName(err)});
         std.process.exit(1);
@@ -957,36 +668,19 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     defer backend_val.deinit();
     trace.mark("fw_init");
 
-    // Per-jail state trackers (ISSUE-007). The state-tracker memory
-    // budget is split evenly across the configured jails plus one
-    // legacy bucket for restored entries whose jail no longer matches
-    // the live config. Each tracker gets its own resolved thresholds,
-    // so per-jail `maxretry` / `findtime` / `bantime` / `bantime_increment`
-    // actually take effect.
     var trackers = tracker_map_mod.TrackerMap.init(heap);
     defer trackers.deinit();
 
-    // Determine per-tracker capacity. Count enabled jails + 1 (legacy);
-    // never fall below 1 to keep the division safe even with zero
-    // enabled jails (legacy still gets the whole budget).
     var enabled_count: u32 = 0;
     for (cfg.jails) |jc| {
         if (jc.enabled) enabled_count += 1;
     }
     const tracker_count: u32 = @max(1, enabled_count + 1);
-    // State-tracker share of the configured ceiling (ADR-005): half the
-    // ceiling, split evenly across trackers. This sizes the tracker
-    // HashMaps' entry counts only (via `capacityFromBudget`) — it is NOT an
-    // allocator byte budget. The state tracker is the single live
-    // memory-ceiling mechanism (DBT-004 removed the unused per-component
-    // budget scaffolding).
     const bytes_per_mb: usize = 1024 * 1024;
     const state_tracker_bytes: usize = (@as(usize, cfg.global.memory_ceiling_mb) * bytes_per_mb) / 2;
     const per_tracker_bytes: usize = state_tracker_bytes / tracker_count;
     const per_tracker_capacity = state_mod.capacityFromBudget(per_tracker_bytes);
 
-    // Install one tracker per enabled jail. Per-jail ignoreip resolves
-    // to defaults.ignoreip when the jail leaves the field unset.
     for (cfg.jails) |*jc| {
         if (!jc.enabled) continue;
         const resolved = config_mod.resolveJailFromConfig(jc, cfg.defaults);
@@ -995,7 +689,6 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
             std.log.err("state: tracker init for jail '{s}' failed: {s}", .{ jc.name, @errorName(err) });
             return err;
         };
-        // ignoreip: per-jail override wins; otherwise inherit defaults.
         const ignore_list: []const []const u8 = jc.ignoreip orelse cfg.defaults.ignoreip;
         for (ignore_list) |spec| {
             tracker.addIgnoreCidr(spec) catch |err| {
@@ -1007,9 +700,6 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         }
     }
 
-    // Ensure the legacy tracker exists. Receives restored entries whose
-    // jail name no longer matches a live jail; uses the defaults block
-    // for thresholds since the original jail is gone.
     {
         const legacy_cfg = deriveLegacyTrackerConfig(cfg, per_tracker_capacity);
         const legacy_tracker = trackers.ensureLegacy(legacy_cfg) catch |err| {
@@ -1025,10 +715,6 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
 
     trace.mark("trackers");
 
-    // Seed state from disk. Entries are routed by `jail` field on each
-    // record; orphans land in the legacy tracker. Per-jail lifetime ban
-    // counts (BUG-006) are seeded after routing — from the v3 block, or
-    // floored at active bans for an older v1/v2 file.
     if (persist_mod.loadFull(heap, cfg.global.state_file)) |loaded| {
         defer loaded.deinit(heap);
         if (loaded.entries.len > 0) {
@@ -1042,13 +728,7 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
                 .{ loaded.entries.len, routed, legacy_routed },
             );
         }
-        // Lifetime seeding runs even with zero entries (a v3 file may carry
-        // lifetime counts for jails whose bans have all since expired).
         persist_mod.seedLifetimes(&trackers, loaded.lifetimes);
-        // Mirror the persisted lifetime sum into the metrics ban counters
-        // so `/metrics` and the human `Total bans` agree and both survive
-        // restart (BUG-006). Per-jail counters are seeded individually; the
-        // global is the sum.
         var lifetime_sum: u64 = 0;
         var tit = trackers.iterator();
         while (tit.next()) |kv| {
@@ -1061,8 +741,6 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         std.log.warn("persist: load failed: {s}", .{@errorName(err)});
     }
 
-    // Reconcile the firewall backend with restored state (SYS-007).
-    // Walks every per-jail tracker so all restored bans are reinstalled.
     {
         const now = std.time.timestamp();
         const reinstalled = reconcile_mod.reconcileAllRestoredBans(
@@ -1086,14 +764,12 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
 
     trace.mark("state_load");
 
-    // Event loop.
     var loop = event_loop_mod.EventLoop.init(heap) catch |err| {
         std.log.err("event_loop: init failed: {s}", .{@errorName(err)});
         return err;
     };
     defer loop.deinit();
 
-    // Log watcher.
     var watcher = log_watcher_mod.LogWatcher.init(heap, &loop) catch |err| {
         std.log.err("log_watcher: init failed: {s}", .{@errorName(err)});
         return err;
@@ -1101,40 +777,24 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     defer watcher.deinit();
     try watcher.attach();
 
-    // journald log source (SYS-015). Sibling of the file watcher: a jail
-    // whose source resolves to `journald` reads the systemd journal via a
-    // polled `journalctl -o json` subprocess instead of an inotify file
-    // tail. The timer is armed only if at least one jail uses it.
     var journald = journald_source_mod.JournaldSource.init(heap, &loop, cfg.global.state_file) catch |err| {
         std.log.err("journald: init failed: {s}", .{@errorName(err)});
         return err;
     };
     defer journald.deinit();
 
-    // Flush context for the journald periodic-flush hook. Declared at
-    // function scope so it outlives `loop.run()` — the hook captures its
-    // address and fires from inside `pollTick`. Wired into `journald` only
-    // when the source is actually in use (after the per-jail loop below).
     var journald_flush_ctx = JournaldFlushContext{
         .trackers = &trackers,
         .state_path = cfg.global.state_file,
         .journald = &journald,
     };
 
-    // Per-jail contexts. Heap-allocated so their pointers remain stable
-    // across the event loop lifetime (the watcher's userdata field holds
-    // these pointers).
     var contexts = std.ArrayList(*JailContext).init(heap);
     defer {
         for (contexts.items) |ctx| heap.destroy(ctx);
         contexts.deinit();
     }
 
-    // SYS-017: resolved-source descriptor per enabled jail — the
-    // authoritative SOURCE label for the status surface. Recorded below as
-    // each jail's `file`/`journald` kind is decided, so a configured jail
-    // never renders `SOURCE: unknown` (an absent-path file jail shows its
-    // path). Outlives `cmd_ctx`; installed on `cmd_ctx.source_descriptor`.
     var source_descriptors = JailSourceDescriptors.init(heap);
     defer source_descriptors.deinit();
 
@@ -1144,9 +804,6 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
             std.log.warn("jail '{s}' rejected: {s}", .{ jail_cfg.name, @errorName(err) });
             continue;
         };
-        // Each JailContext points at its own tracker. The tracker map
-        // is keyed by jail name and was populated above; lookup here is
-        // infallible because we just inserted it.
         const tracker_ptr = trackers.get(jail_cfg.name) orelse {
             std.log.warn(
                 "jail '{s}' has no tracker — wiring bug, skipping",
@@ -1154,13 +811,6 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
             );
             continue;
         };
-        // SYS-020: resolve this jail's CONFIGURED filter to its runtime
-        // matcher BEFORE allocating anything. A filter with no builtin
-        // matcher must fail closed — refuse to start, NEVER fall back to a
-        // permissive default that bans benign IP-bearing lines. This is the
-        // file-path equivalent of the journald source's
-        // `error.UnsupportedJournaldFilter`; resolving here covers BOTH
-        // sources (file + journald share `lineCallback`/`JailContext`).
         const jail_matcher = filter_registry_mod.matcherForFilter(jail_cfg.filter) orelse {
             std.log.err(
                 "jail '{s}' uses filter '{s}', which has no builtin matcher — refusing to start (fail2zig will not run a jail with no patterns, as that would ban any line containing an IP). Use a supported builtin filter or remove the jail.",
@@ -1168,9 +818,6 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
             );
             return error.UnsupportedFilter;
         };
-        // Resolve this jail's effective ban action (SYS-016). Same
-        // per-jail-vs-defaults rule used for the tracker config above;
-        // `resolveJailFromConfig` is the single source of that rule.
         const resolved = config_mod.resolveJailFromConfig(&jail_cfg, cfg.defaults);
         const ctx = try heap.create(JailContext);
         ctx.* = .{
@@ -1183,19 +830,6 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         };
         try contexts.append(ctx);
 
-        // SYS-015: resolve this jail's effective log source. `.file` keeps
-        // the inotify tailer (and its late-appearance/rotation tolerance);
-        // `.journald` reads the journal via the polled subprocess; `.fail`
-        // means an EXPLICIT `source = journald` jail on a box without
-        // journalctl — fail closed (don't run a jail that protects nothing).
-        // `auto` never yields `.fail`: it degrades to a file tail instead.
-        // SYS-015 (reopened): `auto` is EXISTENCE-based, so the resolver
-        // needs to know whether a configured logpath is actually present on
-        // disk (stat here, keeping the resolver pure/fs-free) and whether
-        // this jail's filter has a journald selector set (sshd only in v1).
-        // The filter gate stops a non-sshd jail with an absent log from
-        // resolving to journald and then failing closed at wiring time.
-        // The journalctl probe is read-only (access X_OK), no spawn.
         const journalctl_present = config_mod.journalctlPresent();
         const logpath_exists = config_mod.anyLogpathExists(jail_cfg.logpath);
         const filter_journald_supported =
@@ -1217,9 +851,6 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
                         continue;
                     };
                 }
-                // SYS-017: record the resolved SOURCE descriptor (the
-                // resolved logpath(s)) — known even if no watch attached
-                // (absent path), so the status surface shows the path.
                 source_descriptors.putFile(jail_cfg.name, jail_cfg.logpath) catch |err| {
                     std.log.warn("status: source descriptor record failed for '{s}': {s}", .{ jail_cfg.name, @errorName(err) });
                 };
@@ -1230,11 +861,6 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
             },
             .journald => {
                 journald.addJail(jail, jail_cfg.filter, lineCallback, ctx) catch |err| switch (err) {
-                    // v1 journald supports the `sshd` filter only. A jail
-                    // asking for journald with any other filter would get
-                    // sshd selectors silently mis-applied — fail closed
-                    // with a message that tells the operator exactly how to
-                    // fix it, and refuse to start.
                     error.UnsupportedJournaldFilter => {
                         std.log.err(
                             "journald source supports only the \"sshd\" filter in v1; jail '{s}' uses filter '{s}' — refusing to start (use source=file with a text logpath, or remove the jail)",
@@ -1250,8 +876,6 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
                         return err;
                     },
                 };
-                // SYS-017: record the resolved SOURCE descriptor
-                // `journald (<filter>)` — the KIND-truthful label.
                 source_descriptors.putJournald(jail_cfg.name, jail_cfg.filter) catch |err| {
                     std.log.warn("status: source descriptor record failed for '{s}': {s}", .{ jail_cfg.name, @errorName(err) });
                 };
@@ -1270,10 +894,6 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         }
     }
 
-    // Seed journald cursors from the sidecar and arm the poll timer, but
-    // only if at least one jail actually reads the journal. Cursor restore
-    // failure is non-fatal — a jail with no restored cursor baselines at
-    // "now" on its first tick (no history replay).
     if (journald.hasJails()) {
         if (journald_source_mod.loadCursors(heap, journald.cursor_path)) |cursors| {
             defer {
@@ -1290,8 +910,6 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         } else |err| {
             std.log.warn("journald: cursor restore failed: {s}; baselining at now", .{@errorName(err)});
         }
-        // Install the periodic-flush hook BEFORE arming the timer, so the
-        // first dirty tick can persist state + cursors (SYS-015 Change 2).
         journald.setFlushHook(journaldFlushHook, &journald_flush_ctx);
         journald.attach() catch |err| {
             std.log.err("journald: attach (poll timer) failed: {s}", .{@errorName(err)});
@@ -1300,12 +918,6 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         std.log.info("journald: polling {d} jail(s) every {d}ms", .{ journald.jailCount(), journald_source_mod.poll_interval_ms });
     }
 
-    // IPC command handler context. Must outlive the IpcServer and HTTP
-    // status source. start_time captured here so uptime reflects the
-    // operational start.
-    // SYS-017: per-jail read-health source for the status surface. Bundle
-    // the two live log sources; the adapter reads them at status time.
-    // Declared at function scope so it outlives `cmd_ctx` and the servers.
     var health_sources = HealthSources{
         .watcher = &watcher,
         .journald = &journald,
@@ -1331,10 +943,6 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         .version = version,
     };
 
-    // IPC server. The caller (`main()`) has already ensured
-    // `socket_path`'s parent directory exists, so bind(2) can't fail on
-    // ENOENT here.
-
     var ipc_server = ipc_mod.IpcServer.init(heap, &loop, cfg.global.socket_path) catch |err| {
         std.log.err("ipc: init failed at '{s}': {s}", .{ cfg.global.socket_path, @errorName(err) });
         return err;
@@ -1343,9 +951,6 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     ipc_server.setCommandHandler(cmd_ctx.asHandler());
     try ipc_server.start();
 
-    // WebSocket server — state-only, the HTTP server owns the listener.
-    // Client cap comes from `[global] websocket_max_clients` (default 16,
-    // capped at `ws.hard_max_clients` by the config validator).
     var ws_server = ws.WsServer.init(
         heap,
         &loop,
@@ -1359,7 +964,6 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     };
     defer ws_server.deinit();
 
-    // HTTP server (metrics + status + /events WebSocket upgrade).
     var http_ctx: HttpSources = .{
         .metrics = &metrics,
         .cmd_ctx = &cmd_ctx,
@@ -1384,18 +988,11 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     http_server.setWsServer(&ws_server);
     try http_server.start();
 
-    // Now that the WS server exists, wire it into every per-jail
-    // context so lineCallback can broadcast `attack_detected` +
-    // `ip_banned` events. Without this, dashboards subscribe to a
-    // silent channel — every parse + every ban happens, but nothing
-    // streams to the see-it-live page.
     for (contexts.items) |jctx| {
         jctx.ws = &ws_server;
         jctx.ws_alloc = heap;
     }
 
-    // Signal handlers. Order matters: install TERM/INT before HUP so
-    // tests can observe TERM behaviour without HUP interference.
     var sig_ctx = SignalContext{
         .loop = &loop,
         .trackers = &trackers,
@@ -1406,7 +1003,6 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     try loop.addSignalHandler(linux.SIG.INT, onTerminate, &sig_ctx);
     try loop.addSignalHandler(linux.SIG.HUP, onReload, &sig_ctx);
 
-    // Ban expiry timer.
     var expiry_ctx = ExpiryContext{
         .trackers = &trackers,
         .backend_ptr = &backend_val,
@@ -1416,9 +1012,6 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     };
     _ = try loop.addTimer(1000, expirySweep, &expiry_ctx, false);
 
-    // WS heartbeat + 1 Hz metrics push. Keeps the dashboard's terminal
-    // pane alive between attack matches and keeps the WS pings flowing
-    // so CF doesn't idle-close the stream.
     var ws_tick_ctx = WsTickContext{
         .ws = &ws_server,
         .metrics = &metrics,
@@ -1439,45 +1032,16 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         },
     );
 
-    // QA-002: everything up to here is the operator-visible cold-start cost
-    // (servers bound, loop ready to serve). Emit the trace now, before we
-    // block in `loop.run()`.
     trace.mark("servers");
     trace.report();
 
     try loop.run();
 
-    // Final flush on clean shutdown (best-effort): engine state first,
-    // then the journald cursor sidecar (ordering is load-bearing — see
-    // `flushStateThenCursors`).
     flushStateThenCursors(&trackers, cfg.global.state_file, &journald);
 
-    // Explicit teardown order: close IPC/HTTP/WS first so their FDs are
-    // no longer registered with the loop when `loop.deinit` runs below
-    // via `defer`. Deferred calls run in reverse, so the defers above
-    // will fire in the correct order already — but if the loop exits
-    // abnormally, logging here surfaces it.
     std.log.info("fail2zig: shutting down", .{});
 }
 
-// ============================================================================
-// Service helpers
-// ============================================================================
-
-/// Ensure the parent directory of `socket_path` exists, mode 0750 (owner
-/// rwx, group r-x, other none). Group OWNERSHIP is deliberately NOT set
-/// here (SYS-019): under the shipped systemd unit, `RuntimeDirectory=
-/// fail2zig` + `Group=fail2zig` create `/run/fail2zig` as `root:fail2zig`
-/// and the socket inherits the `fail2zig` group from the daemon's egid —
-/// no chown needed. A daemon-side chown would be a `@privileged` syscall
-/// the hardened unit's seccomp filter (`~@privileged`) kills with SIGSYS,
-/// and CAP_CHOWN is not in the unit's bounding set, so it could not
-/// succeed even if permitted. For bare `--config` runs (no systemd) the
-/// dir/socket are `root:root` and only root may use the IPC socket — the
-/// correct least-privilege default. makeDir errors other than
-/// AlreadyExists are surfaced (they would block `bind(2)`); a chmod
-/// failure is non-fatal — bind() still works as long as the daemon (root)
-/// can traverse the dir.
 fn ensureSocketDir(socket_path: []const u8) !void {
     const dir = std.fs.path.dirname(socket_path) orelse return;
     std.fs.cwd().makeDir(dir) catch |err| switch (err) {
@@ -1491,10 +1055,6 @@ fn ensureSocketDir(socket_path: []const u8) !void {
         },
     };
 
-    // Mode 0750 — owner rwx, group r-x, other none. Group members need
-    // `x` to traverse into the dir and `r` to resolve the socket path.
-    // Best-effort: if chmod fails (e.g. not owned by us), log and
-    // continue; bind() still works if the daemon can traverse.
     std.posix.fchmodat(std.posix.AT.FDCWD, dir, 0o750, 0) catch |err| {
         std.log.warn(
             "ipc: chmod of socket parent dir '{s}' failed: {s}",
@@ -1503,44 +1063,21 @@ fn ensureSocketDir(socket_path: []const u8) !void {
     };
 }
 
-// ============================================================================
-// Metrics / HTTP glue — decoupling shims between metrics.zig and the
-// source-vtables defined by http.zig and commands.zig.
-// ============================================================================
-
-/// Adapter invoked from `commands.StatsSource.snapshot` to read the live
-/// metrics counters. Lives in main.zig so `net/commands.zig` doesn't
-/// take a compile-time dependency on `core/metrics.zig`.
 fn metricsStatsSnapshot(ctx: ?*anyopaque) commands_mod.StatsSnapshot {
     const m: *metrics_mod.Metrics = @ptrCast(@alignCast(ctx.?));
     const s = m.snapshot();
     return .{
         .memory_bytes_used = s.memory_bytes_used,
-        .parse_rate = 0, // computed across an interval; Phase 6 improvement.
-        .bans_total = s.bans_total, // SYS-017: lifetime total bans rollup.
+        .parse_rate = 0,
+        .bans_total = s.bans_total,
     };
 }
 
-/// Bundle of the two live log sources, installed on
-/// `commands.Context.health_source` (SYS-017). Both outlive `cmd_ctx` and
-/// the servers (they are `runDaemon` locals). Read-only at status time.
 const HealthSources = struct {
     watcher: *log_watcher_mod.LogWatcher,
     journald: *journald_source_mod.JournaldSource,
 };
 
-/// Adapter for `commands.JailHealthSource.lookup` (SYS-017, extended by
-/// ENH-004). Resolves a jail's read-HEALTH by scanning the journald source
-/// first, then the file watcher. Both can now report a hard `false` that
-/// drives DEGRADED (journald: never read cleanly; file: once-attached watch
-/// detached past the debounce, ENH-004). Returns `null` (unknown HEALTH)
-/// when neither source knows the jail, or the matched source has never had a
-/// real source (boot / late log). The SOURCE label is NOT here — it is the
-/// resolved descriptor (`jailSourceLookup`).
-///
-/// A jail name belongs to exactly one source kind in a valid config; the
-/// journald-first scan order only disambiguates the config-invalid case
-/// where a name appears in both (a journald verdict wins).
 fn jailHealthLookup(ctx: ?*anyopaque, jail_name: []const u8) ?commands_mod.JailHealth {
     const self: *HealthSources = @ptrCast(@alignCast(ctx.?));
     if (self.journald.healthForJail(jail_name)) |h| {
@@ -1552,19 +1089,6 @@ fn jailHealthLookup(ctx: ?*anyopaque, jail_name: []const u8) ?commands_mod.JailH
     return null;
 }
 
-/// Resolved-source descriptor store (SYS-017). Records, per enabled jail,
-/// the KIND-truthful SOURCE label decided at jail-resolution time —
-/// `journald (<filter>)` or the resolved logpath(s). This is the
-/// authoritative SOURCE: known for every configured jail even when no live
-/// source is attached, so a misconfigured (absent-path) file jail still
-/// shows its path, never "unknown".
-///
-/// Keys are config-owned jail-name slices (stable for the daemon lifetime).
-/// Descriptor strings are owned in `arena` (freed at daemon shutdown), so
-/// the returned slices are valid for as long as the status handler runs. No
-/// per-call allocation, no leak — `std.testing.allocator` is irrelevant
-/// here (production-only; the arena is freed on the daemon's normal teardown
-/// path). Read-only after the resolution loop populates it.
 const JailSourceDescriptors = struct {
     map: std.StringHashMap([]const u8),
     arena: std.heap.ArenaAllocator,
@@ -1581,16 +1105,12 @@ const JailSourceDescriptors = struct {
         self.arena.deinit();
     }
 
-    /// Record `jail_name`'s journald descriptor `journald (<filter>)`.
     fn putJournald(self: *JailSourceDescriptors, jail_name: []const u8, filter: []const u8) !void {
         const a = self.arena.allocator();
         const desc = try std.fmt.allocPrint(a, "journald ({s})", .{filter});
         try self.map.put(jail_name, desc);
     }
 
-    /// Record `jail_name`'s file descriptor from its resolved logpath(s):
-    /// the single path, or a bounded comma-join for multiple. Empty logpath
-    /// (shouldn't happen for a file-resolved jail) records "file".
     fn putFile(self: *JailSourceDescriptors, jail_name: []const u8, logpath: []const []const u8) !void {
         const a = self.arena.allocator();
         if (logpath.len == 0) {
@@ -1598,8 +1118,6 @@ const JailSourceDescriptors = struct {
             return;
         }
         if (logpath.len == 1) {
-            // Config-owned slice is stable; still dup into the arena so the
-            // store owns a single uniform lifetime.
             const desc = try a.dupe(u8, logpath[0]);
             try self.map.put(jail_name, desc);
             return;
@@ -1614,19 +1132,12 @@ const JailSourceDescriptors = struct {
     }
 };
 
-/// Bundle of pointers the HTTP `/metrics`, `/api/status`, and
-/// `/api/bans` handlers need. Kept together so we only plumb one `ctx`
-/// pointer through each source vtable.
 const HttpSources = struct {
     metrics: *metrics_mod.Metrics,
     cmd_ctx: *commands_mod.Context,
-    /// Tracker map for `/api/bans` aggregation. Walks every per-jail
-    /// tracker to assemble the active-ban snapshot.
     trackers: *tracker_map_mod.TrackerMap,
 };
 
-/// MetricsSource.write implementation — renders the Prometheus text
-/// exposition for all live counters.
 fn writeMetricsPayload(
     ctx: ?*anyopaque,
     out: *std.ArrayListUnmanaged(u8),
@@ -1668,10 +1179,6 @@ fn writeMetricsPayload(
     try w.writeAll("# TYPE fail2zig_memory_bytes_used gauge\n");
     try w.print("fail2zig_memory_bytes_used {d}\n", .{snap.memory_bytes_used});
 
-    // Uptime exposed directly (vs relying on Prometheus' derive-
-    // from-process_start_time convention). Operators scraping this
-    // get a simple counter they can render without client-side
-    // arithmetic; the dashboard's MetricsPane reads this verbatim.
     const uptime_s: u64 = blk: {
         const now = std.time.timestamp();
         if (now <= self.cmd_ctx.start_time) break :blk 0;
@@ -1681,10 +1188,6 @@ fn writeMetricsPayload(
     try w.writeAll("# TYPE fail2zig_uptime_seconds gauge\n");
     try w.print("fail2zig_uptime_seconds {d}\n", .{uptime_s});
 
-    // SYS-017: overall protection state as a single alerting-useful gauge.
-    // `1` only when the host is ACTIVELY enforcing right now (overall state
-    // `active` or `mixed`); `0` when `degraded` or `log-only`. A log-only
-    // host is intentionally not enforcing → 0.
     const overall = self.cmd_ctx.computeOverallState();
     const actively_enforcing =
         std.mem.eql(u8, overall, "active") or std.mem.eql(u8, overall, "mixed");
@@ -1692,12 +1195,6 @@ fn writeMetricsPayload(
     try w.writeAll("# TYPE fail2zig_protection_active gauge\n");
     try w.print("fail2zig_protection_active {d}\n", .{@intFromBool(actively_enforcing)});
 
-    // SYS-017: per-jail source-health gauges. `jail` label only (bounded
-    // cardinality), iterating the configured ENABLED jails. log_source
-    // health is tri-state; an "unknown" verdict (no signal yet, or a file
-    // source that has never read) is reported as `0` for the healthy gauge
-    // — the gauge answers "is this source confirmed reading?", and unknown
-    // is not yet confirmed.
     try w.writeAll("# HELP fail2zig_jail_log_source_healthy 1 when the jail's log source is confirmed reading, else 0\n");
     try w.writeAll("# TYPE fail2zig_jail_log_source_healthy gauge\n");
     try w.writeAll("# HELP fail2zig_jail_enforcing 1 when the jail's resolved action touches the firewall, else 0\n");
@@ -1717,7 +1214,6 @@ fn writeMetricsPayload(
         try w.print("fail2zig_jail_lines_seen_total{{jail=\"{s}\"}} {d}\n", .{ jc.name, lines_seen });
     }
 
-    // Per-jail labels.
     for (snap.perJail()) |pj| {
         const name = pj.name();
         try w.print("fail2zig_lines_parsed_total{{jail=\"{s}\"}} {d}\n", .{ name, pj.lines_parsed });
@@ -1728,17 +1224,12 @@ fn writeMetricsPayload(
     }
 }
 
-/// StatusSource.write implementation — delegates to the same JSON
-/// renderer the IPC `status` command uses. Guarantees the dashboard and
-/// the CLI see identical data shapes.
 fn writeStatusPayload(
     ctx: ?*anyopaque,
     out: *std.ArrayListUnmanaged(u8),
     a: std.mem.Allocator,
 ) anyerror!void {
     const self: *HttpSources = @ptrCast(@alignCast(ctx.?));
-    // Go through the installed handler vtable so `/api/status` emits
-    // byte-identical JSON to what the IPC `status` command produces.
     const handler = self.cmd_ctx.asHandler();
     const resp = try handler.dispatch(handler.ctx, .{ .status = {} }, a);
     defer resp.deinit(a);
@@ -1752,26 +1243,6 @@ fn writeStatusPayload(
     }
 }
 
-/// BansSource.write implementation — walks the state tracker and emits
-/// the active-ban snapshot consumed by `NftSetPane` on the see-it-live
-/// dashboard. Wire contract documented in
-/// `.project/design/demo-concept.md`:
-///
-/// ```
-/// {
-///   "total": N,
-///   "entries": [
-///     {"ip":"...","jail":"...","banned_at":"<ISO-8601 UTC>","seconds_remaining":N}
-///   ]
-/// }
-/// ```
-///
-/// `total` reflects the full number of active bans; `entries` is
-/// truncated at `http.max_bans_in_snapshot` (200) so the response
-/// stays bounded. `seconds_remaining` is `max(0, ban_expiry - now)`.
-/// `banned_at` is an ISO-8601 UTC string reconstructed from
-/// `ban_expiry - duration`; see Phase 10 for persisting a real ban
-/// start time.
 fn writeBansPayload(
     ctx: ?*anyopaque,
     out: *std.ArrayListUnmanaged(u8),
@@ -1780,8 +1251,6 @@ fn writeBansPayload(
     const self: *HttpSources = @ptrCast(@alignCast(ctx.?));
     const w = out.writer(a);
 
-    // First pass: count active bans across every tracker so `total`
-    // remains accurate even when we truncate `entries`.
     const total: u32 = self.trackers.totalActiveBans();
 
     try w.writeAll("{\"total\":");
@@ -1834,25 +1303,11 @@ fn writeBansPayload(
     try w.writeAll("]}");
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 test "engine: version constant tracks build_options" {
-    // The daemon's `version` is the build-injected single source of truth, not
-    // a hand-maintained literal. Asserting against `build_options.version`
-    // keeps this green across release bumps while still catching an accidental
-    // decoupling of the two.
     try std.testing.expectEqualStrings(build_options.version, version);
 }
 
 test "engine: all version identities agree (ISSUE-010 drift guard)" {
-    // Every engine-side version source must collapse to the same build-injected
-    // string: the exported `version`, and the IPC `Context.version` default
-    // (which used to carry a stale `0.1.0` literal). The client mirrors this on
-    // its side (`client_version == build_options.version`), so the two binaries
-    // are pinned to a single `build.zig` source — the version can never silently
-    // drift between them again.
     const ctx_default_version = (commands_mod.Context{
         .trackers = undefined,
         .config = undefined,
@@ -2000,7 +1455,6 @@ test "cli: runImport returns 1 when zero jails are imported" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Only a DEFAULT section — no user jails = zero imported.
     try tmp.dir.writeFile(.{
         .sub_path = "jail.conf",
         .data =
@@ -2025,13 +1479,6 @@ test "cli: runImport returns 2 on unreadable source dir" {
     var stderr_buf = std.ArrayList(u8).init(std.testing.allocator);
     defer stderr_buf.deinit();
 
-    // A source with an oversized jail.conf would exceed our bound and fail
-    // parsing. Here we just point at a non-existent path: loadJailConfig
-    // handles that gracefully (returns empty ini) so the next non-success
-    // code path to exercise is filesystem-level. We simulate by asking
-    // for an output path inside a nonexistent directory — writeTomlAtomic
-    // will attempt to create it, but we'll also feed an unwritable output
-    // to force WriteFailed.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2048,7 +1495,6 @@ test "cli: runImport returns 2 on unreadable source dir" {
     defer arena.deinit();
     const source = try tmp.dir.realpathAlloc(arena.allocator(), ".");
 
-    // Writing under a file-as-directory path fails.
     try tmp.dir.writeFile(.{ .sub_path = "blocker", .data = "x" });
     const bad_out = try std.fs.path.join(arena.allocator(), &.{ source, "blocker", "out.toml" });
 
@@ -2057,8 +1503,6 @@ test "cli: runImport returns 2 on unreadable source dir" {
 }
 
 test "main: deriveJailTrackerConfig uses resolved per-jail values" {
-    // ISSUE-007: the tracker config for a jail now reflects its
-    // resolved thresholds (jail value if set, else defaults).
     var jails = [_]config_mod.JailConfig{
         .{
             .name = "aggressive",
@@ -2082,16 +1526,6 @@ test "main: deriveJailTrackerConfig uses resolved per-jail values" {
     try std.testing.expectEqual(@as(u32, 1), t.maxretry);
 }
 
-// ---------- SYS-016: banaction honored at ban dispatch ----------
-//
-// These exercise `dispatchBan` directly with a real `BanDecision`
-// (produced by a real `StateTracker` crossing its threshold) and a spy
-// in place of the firewall backend. The spy lets us assert whether the
-// enforcing `ban` path was invoked WITHOUT a real kernel/firewall — the
-// core of the bug was that a `log-only` jail still mutated the firewall.
-
-/// Counts calls to the ban hook. The hook signature matches
-/// `JailContext.ban_hook`; the spy never touches the kernel.
 const BanSpy = struct {
     calls: u32 = 0,
     last_ip: ?shared.IpAddress = null,
@@ -2110,9 +1544,6 @@ const BanSpy = struct {
     }
 };
 
-/// Build a JailContext wired to a spy + metrics for dispatch tests.
-/// `backend_ptr` is required by the struct but is never dereferenced
-/// because the spy hook short-circuits the enforcing call.
 fn makeDispatchTestCtx(
     jail: shared.JailId,
     tracker: *state_mod.StateTracker,
@@ -2123,7 +1554,7 @@ fn makeDispatchTestCtx(
 ) JailContext {
     return .{
         .jail = jail,
-        .matcher = undefined, // dispatchBan never reads the matcher
+        .matcher = undefined,
         .state = tracker,
         .backend_ptr = backend,
         .banaction = action,
@@ -2133,8 +1564,6 @@ fn makeDispatchTestCtx(
     };
 }
 
-/// Drive a tracker across its `maxretry` threshold and return the
-/// resulting decision. Asserts a decision actually fired.
 fn produceDecision(
     tracker: *state_mod.StateTracker,
     ip: shared.IpAddress,
@@ -2161,9 +1590,6 @@ test "dispatch: log-only jail records ban intent but does NOT call backend" {
     const jail = try shared.JailId.fromSlice(jail_name);
     const ip = try shared.IpAddress.parse("203.0.113.66");
 
-    // A backend that must NOT be touched. If `dispatchBan` ever called
-    // through it instead of the spy, the iptables CLI path would run —
-    // but the spy hook intercepts first, so this stays inert.
     var backend: firewall.Backend = .{ .iptables = firewall.iptables.IptablesBackend{} };
     var spy: BanSpy = .{};
 
@@ -2172,10 +1598,8 @@ test "dispatch: log-only jail records ban intent but does NOT call backend" {
     const decision = try produceDecision(&tracker, ip, jail);
     dispatchBan(&ctx, decision);
 
-    // The firewall was NOT mutated: the enforcing path was never invoked.
     try testing.expectEqual(@as(u32, 0), spy.calls);
 
-    // ...yet the ban intent WAS recorded: global + per-jail counters move.
     const snap = metrics.snapshot();
     try testing.expectEqual(@as(u64, 1), snap.bans_total);
     var found = false;
@@ -2212,21 +1636,15 @@ test "dispatch: enforcing jail (nftables) DOES call the backend ban path" {
     const decision = try produceDecision(&tracker, ip, jail);
     dispatchBan(&ctx, decision);
 
-    // Enforcing path WAS invoked exactly once, with the offending IP.
     try testing.expectEqual(@as(u32, 1), spy.calls);
     try testing.expect(spy.last_ip != null);
     try testing.expect(shared.IpAddress.eql(spy.last_ip.?, ip));
 
-    // And accounting still happened (the enforcing path increments after
-    // a successful backend call).
     const snap = metrics.snapshot();
     try testing.expectEqual(@as(u64, 1), snap.bans_total);
 }
 
 test "dispatch: backend error on enforcing path skips metrics (no false ban)" {
-    // The enforcing path must NOT count a ban when the backend fails —
-    // it warns and returns before incrementing. This guards the ordering
-    // the original inline block relied on.
     const a = testing.allocator;
     var tracker = try state_mod.StateTracker.init(a, .{
         .max_entries = 16,
@@ -2269,10 +1687,8 @@ test "dispatch: backend error on enforcing path skips metrics (no false ban)" {
     const decision = try produceDecision(&tracker, ip, jail);
     dispatchBan(&ctx, decision);
 
-    // Backend failed -> no ban counted.
     const snap = metrics.snapshot();
     try testing.expectEqual(@as(u64, 0), snap.bans_total);
-    // BUG-006: a failed ban also does NOT bump the persisted lifetime.
     try testing.expectEqual(@as(u64, 0), tracker.lifetime_bans);
 }
 
@@ -2286,13 +1702,11 @@ test "dispatch: BUG-006 a new ban increments the jail's persisted lifetime" {
     var backend: firewall.Backend = .{ .iptables = firewall.iptables.IptablesBackend{} };
     var spy: BanSpy = .{};
 
-    // Enforcing jail: one new ban → lifetime 1.
     var ctx = makeDispatchTestCtx(jail, &tracker, &backend, &metrics, &spy, .nftables);
     const d1 = try produceDecision(&tracker, try shared.IpAddress.parse("203.0.113.10"), jail);
     dispatchBan(&ctx, d1);
     try testing.expectEqual(@as(u64, 1), tracker.lifetime_bans);
 
-    // Log-only jail counts toward lifetime too (intent is still a ban).
     tracker.clearBan(try shared.IpAddress.parse("203.0.113.10"));
     var ctx2 = makeDispatchTestCtx(jail, &tracker, &backend, &metrics, &spy, .@"log-only");
     const d2 = try produceDecision(&tracker, try shared.IpAddress.parse("203.0.113.11"), jail);
@@ -2301,10 +1715,6 @@ test "dispatch: BUG-006 a new ban increments the jail's persisted lifetime" {
 }
 
 test "dispatch: BUG-006 restored bans do NOT increment lifetime (no double-count)" {
-    // Restore goes through persist.seed/seedMap (NOT dispatchBan), and the
-    // lifetime is set by seedLifetimes — so re-surfacing a ban across a
-    // restart never re-counts it. Simulate: a v3 file with lifetime=4 and
-    // one active ban, loaded into a fresh tracker.
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2318,13 +1728,10 @@ test "dispatch: BUG-006 restored bans do NOT increment lifetime (no double-count
         defer tm.deinit();
         const sshd = try tm.addTracker("sshd", .{ .max_entries = 16, .maxretry = 1, .findtime = 600, .bantime = 600 });
         sshd.lifetime_bans = 4;
-        // One active ban present at save time.
         _ = try sshd.recordAttempt(try shared.IpAddress.parse("9.9.9.9"), try shared.JailId.fromSlice("sshd"), 1_000);
         try persist_mod.saveAll(&tm, path);
     }
 
-    // Restart: fresh map, load + seed. Lifetime is RESTORED to 4 (not
-    // re-incremented by the restored ban), and active is 1.
     var tm2 = tracker_map_mod.TrackerMap.init(a);
     defer tm2.deinit();
     _ = try tm2.addTracker("sshd", .{ .max_entries = 16 });
@@ -2335,21 +1742,9 @@ test "dispatch: BUG-006 restored bans do NOT increment lifetime (no double-count
     persist_mod.seedLifetimes(&tm2, loaded.lifetimes);
 
     try testing.expectEqual(@as(u64, 4), tm2.get("sshd").?.lifetime_bans);
-    // Total (4) ≥ Active (1) after restore — the BUG-006 invariant.
     try testing.expect(tm2.get("sshd").?.lifetime_bans >= tm2.totalActiveBans());
 }
 
-// ----------------------------------------------------------------------------
-// SYS-020: runtime applies the jail's CONFIGURED filter, not a permissive
-// default; reserved/unenforceable IPs never ban. These drive the SHARED
-// `lineCallback` directly — both the file tailer and the journald source
-// route through it with the same `*JailContext`, so exercising it here
-// proves BOTH paths resolve to the same configured matcher.
-// ----------------------------------------------------------------------------
-
-/// Build a `lineCallback`-ready context wired to the sshd filter matcher,
-/// a real tracker, a ban spy, and metrics. `maxretry` is the caller's so a
-/// test can force a single hit to cross the threshold.
 fn makeLineCallbackCtx(
     jail: shared.JailId,
     tracker: *state_mod.StateTracker,
@@ -2364,7 +1759,7 @@ fn makeLineCallbackCtx(
         .backend_ptr = backend,
         .banaction = .nftables,
         .metrics = metrics,
-        .now_override = 1_000, // deterministic clock
+        .now_override = 1_000,
         .ban_hook = BanSpy.ban,
         .ban_hook_ctx = spy,
     };
@@ -2382,8 +1777,6 @@ const LineCallbackFixture = struct {
     }
 };
 
-/// maxretry=1 so a single matching line that crosses the threshold bans
-/// immediately — makes "did this line ban?" a one-shot assertion.
 fn initLineCallbackFixture(self: *LineCallbackFixture) !void {
     self.tracker = try state_mod.StateTracker.init(testing.allocator, .{
         .max_entries = 16,
@@ -2404,9 +1797,6 @@ test "lineCallback: sshd listener startup line does NOT match/count/ban (SYS-020
     defer fx.deinit();
     var ctx = makeLineCallbackCtx(fx.jail, &fx.tracker, &fx.backend, &fx.metrics, &fx.spy);
 
-    // The exact lines sshd logs on (re)start. The old `<*><IP>` default
-    // matched these and banned 0.0.0.0 / ::; the configured sshd patterns
-    // do not match them at all.
     lineCallback("Server listening on 0.0.0.0 port 22.", fx.jail, false, &ctx);
     lineCallback("Server listening on :: port 22.", fx.jail, false, &ctx);
 
@@ -2435,13 +1825,11 @@ test "lineCallback: real sshd auth failures DO match and ban (no regression, SYS
     defer fx.deinit();
     var ctx = makeLineCallbackCtx(fx.jail, &fx.tracker, &fx.backend, &fx.metrics, &fx.spy);
 
-    // maxretry=1 -> the first failure crosses the threshold and bans.
     lineCallback("Failed password for root from 203.0.113.10 port 22 ssh2", fx.jail, false, &ctx);
     try testing.expectEqual(@as(u32, 1), fx.spy.calls);
     try testing.expect(fx.spy.last_ip != null);
     try testing.expect(shared.IpAddress.eql(fx.spy.last_ip.?, try shared.IpAddress.parse("203.0.113.10")));
 
-    // A second distinct offender via the "Invalid user" pattern also bans.
     lineCallback("Invalid user oracle from 203.0.113.20 port 22", fx.jail, false, &ctx);
     try testing.expectEqual(@as(u32, 2), fx.spy.calls);
 }
@@ -2452,15 +1840,9 @@ test "lineCallback: [preauth] self-ban guard takes effect at runtime (SYS-011 vi
     defer fx.deinit();
     var ctx = makeLineCallbackCtx(fx.jail, &fx.tracker, &fx.backend, &fx.metrics, &fx.spy);
 
-    // Clean operator logout — OpenSSH writes this on every normal session
-    // close. The configured pattern requires the `[preauth]` suffix, so a
-    // clean disconnect MUST NOT ban. Before SYS-020 the `<*><IP>` default
-    // matched it and could self-ban the operator.
     lineCallback("Received disconnect from 192.0.2.50 port 22:11: disconnected by user", fx.jail, false, &ctx);
     try testing.expectEqual(@as(u32, 0), fx.spy.calls);
 
-    // Attacker pre-auth disconnect — the `[preauth]` suffix means the IP
-    // never authenticated; this MUST ban.
     lineCallback("Received disconnect from 203.0.113.99 port 22:11: Bye Bye [preauth]", fx.jail, false, &ctx);
     try testing.expectEqual(@as(u32, 1), fx.spy.calls);
 }
@@ -2471,9 +1853,6 @@ test "lineCallback: matched line with unenforceable IP never bans (reserved-IP g
     defer fx.deinit();
     var ctx = makeLineCallbackCtx(fx.jail, &fx.tracker, &fx.backend, &fx.metrics, &fx.spy);
 
-    // These lines DO match the sshd "Invalid user" pattern, but the
-    // extracted token is unspecified/loopback — the record-boundary guard
-    // must drop them before any count or ban, even though a pattern matched.
     lineCallback("Invalid user attacker from 0.0.0.0 port 22", fx.jail, false, &ctx);
     lineCallback("Invalid user attacker from :: port 22", fx.jail, false, &ctx);
     lineCallback("Failed password for root from 127.0.0.1 port 22 ssh2", fx.jail, false, &ctx);
@@ -2481,31 +1860,20 @@ test "lineCallback: matched line with unenforceable IP never bans (reserved-IP g
     try testing.expectEqual(@as(u32, 0), fx.spy.calls);
     const snap = fx.metrics.snapshot();
     try testing.expectEqual(@as(u64, 0), snap.bans_total);
-    // The guard fires AFTER the match but BEFORE the matched counter, so a
-    // dropped unenforceable hit is not counted as a match either.
     try testing.expectEqual(@as(u64, 0), snap.lines_matched);
 }
 
 test "lineCallback: file and journald inputs resolve to the SAME configured matcher (SYS-020)" {
-    // The file tailer passes a syslog-framed line; the journald source
-    // passes the bare message body. Both reach this identical callback with
-    // the identical context. A benign-but-IP-bearing line must be rejected
-    // on BOTH shapes, proving neither path uses a permissive default.
     var fx: LineCallbackFixture = undefined;
     try initLineCallbackFixture(&fx);
     defer fx.deinit();
     var ctx = makeLineCallbackCtx(fx.jail, &fx.tracker, &fx.backend, &fx.metrics, &fx.spy);
 
-    // File-source shape: full rsyslog envelope (stripSyslogPrefix peels it).
     lineCallback("Apr 21 10:15:03 host sshd[1234]: Accepted password for root from 198.51.100.8 port 22 ssh2", fx.jail, false, &ctx);
-    // journald shape: bare message body, no envelope.
     lineCallback("Accepted password for root from 198.51.100.8 port 22 ssh2", fx.jail, false, &ctx);
 
-    // Neither shape banned — both ran the configured sshd matcher, which
-    // rejects successful auth.
     try testing.expectEqual(@as(u32, 0), fx.spy.calls);
 
-    // And a real failure in BOTH shapes DOES ban (same matcher, same result).
     lineCallback("Apr 21 10:15:04 host sshd[1234]: Failed password for root from 203.0.113.30 port 22 ssh2", fx.jail, false, &ctx);
     try testing.expectEqual(@as(u32, 1), fx.spy.calls);
 }
@@ -2529,12 +1897,6 @@ test "main: deriveLegacyTrackerConfig mirrors defaults" {
 }
 
 test {
-    // Force test discovery for every engine module. Zig only includes a
-    // file's tests in the test binary if it is referenced from inside a
-    // `test` block — top-level `@import` alone is not enough. Keep this
-    // list complete even for modules that `runDaemon` constructs
-    // directly, otherwise their unit tests disappear from `zig build
-    // test` output.
     _ = event_loop_mod;
     _ = log_watcher_mod;
     _ = journald_source_mod;
@@ -2563,17 +1925,8 @@ test {
     _ = shared;
 }
 
-// ---------- 9B.1.1: /api/bans payload tests ----------
-//
-// These exercise `writeBansPayload` directly with a state tracker we
-// control. We bypass `recordAttempt` and inject banned entries via the
-// map — mirrors the pattern used by `net/commands.zig` tests.
-
 const testing = std.testing;
 
-/// Helper: build a minimal HttpSources wired up only for the bans path.
-/// `metrics` and `cmd_ctx` fields get unused stub pointers — the bans
-/// writer reads only `trackers`.
 fn injectBan(
     tracker: *state_mod.StateTracker,
     ip_str: []const u8,
@@ -2633,8 +1986,6 @@ test "http: /api/bans single ban populates element fields" {
         .bantime = 600,
     });
 
-    // Use a banned_at comfortably in the past so `banned_at` field in
-    // the response is deterministic relative to the fixed bantime.
     try injectBan(sshd_tracker, "185.220.101.5", "sshd", 1_714_000_000, 600);
 
     var ctx: HttpSources = .{
@@ -2650,9 +2001,6 @@ test "http: /api/bans single ban populates element fields" {
     try testing.expect(std.mem.indexOf(u8, body, "\"total\":1") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"ip\":\"185.220.101.5\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"jail\":\"sshd\"") != null);
-    // ISO-8601 UTC renders 1_714_000_000 (2024-04-24T23:06:40Z).
-    // Check the stable parts — full date + minute-precision time —
-    // rather than exact seconds to decouple from format helper.
     try testing.expect(std.mem.indexOf(u8, body, "\"banned_at\":\"2024-04-24T23:06:") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"seconds_remaining\":") != null);
 }
@@ -2661,9 +2009,6 @@ test "http: /api/bans truncates elements at 200 but count reflects total" {
     const a = testing.allocator;
     var trackers = tracker_map_mod.TrackerMap.init(a);
     defer trackers.deinit();
-    // Capacity large enough to hold all 250 entries; the cap we enforce
-    // at the response layer is `http.max_bans_in_snapshot`, not the
-    // tracker's.
     const sshd_tracker = try trackers.addTracker("sshd", .{
         .max_entries = 512,
         .findtime = 600,
@@ -2671,7 +2016,6 @@ test "http: /api/bans truncates elements at 200 but count reflects total" {
         .bantime = 600,
     });
 
-    // 250 unique IPs in 10.x.y.z range — all banned.
     var i: u32 = 0;
     while (i < 250) : (i += 1) {
         var buf: [16]u8 = undefined;
@@ -2691,8 +2035,6 @@ test "http: /api/bans truncates elements at 200 but count reflects total" {
     const body = out.items;
     try testing.expect(std.mem.indexOf(u8, body, "\"total\":250") != null);
 
-    // Count the elements by counting `"ip":` occurrences — robust to
-    // element ordering since HashMap iteration isn't sorted.
     var element_count: usize = 0;
     var cursor: usize = 0;
     while (std.mem.indexOf(u8, body[cursor..], "\"ip\":")) |rel| {
@@ -2728,10 +2070,6 @@ test "http: /api/bans aggregates across per-jail trackers (ISSUE-007)" {
     try testing.expect(std.mem.indexOf(u8, body, "\"jail\":\"nginx\"") != null);
 }
 
-// ---------- SYS-017: /metrics protection + per-jail health gauges ----------
-
-/// Test-only health lookup: "sshd" is an unhealthy journald source
-/// (healthy=false) → drives DEGRADED for the enforcing sshd jail.
 fn testUnhealthySshdLookup(ctx: ?*anyopaque, jail_name: []const u8) ?commands_mod.JailHealth {
     _ = ctx;
     if (std.mem.eql(u8, jail_name, "sshd")) {
@@ -2772,12 +2110,9 @@ test "metrics: SYS-017 protection_active + per-jail gauges render with jail labe
     try writeMetricsPayload(@ptrCast(&http_ctx), &out, a);
     const body = out.items;
 
-    // Global gauge: enforcing jail with an unhealthy journald source →
-    // overall DEGRADED → protection_active 0.
     try testing.expect(std.mem.indexOf(u8, body, "# TYPE fail2zig_protection_active gauge") != null);
     try testing.expect(std.mem.indexOf(u8, body, "fail2zig_protection_active 0") != null);
 
-    // Per-jail gauges with the `jail` label only, plus their TYPE lines.
     try testing.expect(std.mem.indexOf(u8, body, "# TYPE fail2zig_jail_log_source_healthy gauge") != null);
     try testing.expect(std.mem.indexOf(u8, body, "fail2zig_jail_log_source_healthy{jail=\"sshd\"} 0") != null);
     try testing.expect(std.mem.indexOf(u8, body, "# TYPE fail2zig_jail_enforcing gauge") != null);
@@ -2794,35 +2129,14 @@ test "JailSourceDescriptors: records KIND-truthful resolved descriptors (SYS-017
     try d.putJournald("sshd", "sshd");
     try d.putFile("nginx", &.{"/var/log/nginx/error.log"});
     try d.putFile("multi", &.{ "/var/log/a.log", "/var/log/b.log" });
-    try d.putFile("weird", &.{}); // shouldn't happen, but must not crash
+    try d.putFile("weird", &.{});
 
     try testing.expectEqualStrings("journald (sshd)", JailSourceDescriptors.lookup(@ptrCast(&d), "sshd").?);
     try testing.expectEqualStrings("/var/log/nginx/error.log", JailSourceDescriptors.lookup(@ptrCast(&d), "nginx").?);
     try testing.expectEqualStrings("/var/log/a.log, /var/log/b.log", JailSourceDescriptors.lookup(@ptrCast(&d), "multi").?);
     try testing.expectEqualStrings("file", JailSourceDescriptors.lookup(@ptrCast(&d), "weird").?);
-    // An unrecorded jail → null → the handler renders "unknown" only for a
-    // jail the daemon never resolved (cannot happen for an enabled jail).
     try testing.expect(JailSourceDescriptors.lookup(@ptrCast(&d), "nope") == null);
 }
-
-// ---------------------------------------------------------------------------
-// ENH-004 end-to-end: a REAL file-source LogWatcher's read-health verdict
-// drives the REAL status + metrics surface.
-//
-// The inline `log_watcher.zig` tests prove `healthForJail`'s verdict over
-// crafted struct fields; the `commands.zig` / `writeMetricsPayload` tests
-// prove the DEGRADED + gauge consumption over a STUBBED health value. Nothing
-// connected the two: a real watcher attaching to a real file, the file being
-// moved away (a real `IN_MOVE_SELF` → `detachFileWatch` arming the structural
-// signal — see the test body for why rename-away, not unlink, is the
-// deterministic deletion-class signal while the daemon holds the fd open), and
-// that verdict flowing through the REAL `jailHealthLookup` adapter →
-// `computeOverallState` → `writeMetricsPayload`. A regression in the adapter,
-// the metric writer, or the watcher's detach bookkeeping would slip past every
-// existing test. This is that end-to-end seam.
-//
-// Local + CI-runnable: real inotify on a tmp file, no root, no journald, no
-// firewall. Linux-only (inotify); skips elsewhere.
 
 const enh004NoopLine = struct {
     fn cb(_: []const u8, _: shared.JailId, _: bool, _: ?*anyopaque) void {}
@@ -2845,11 +2159,6 @@ test "ENH-004 e2e: real file move-away → real detach → DEGRADED + log_source
         f.close();
     }
 
-    // A mutex-guarded line counter: the kick thread (file mutation + loop
-    // control) and the loop thread (callback) are the only writers/readers
-    // while the loop runs. The watcher's own per-jail state is read ONLY on
-    // the main thread after loop.run() returns — single-threaded, matching the
-    // rotation tests' discipline (no cross-thread read of mutable watch fields).
     const Sink = struct {
         mutex: std.Thread.Mutex = .{},
         lines: u32 = 0,
@@ -2876,16 +2185,6 @@ test "ENH-004 e2e: real file move-away → real detach → DEGRADED + log_source
     const jail = try shared.JailId.fromSlice("sshd");
     try watcher.watchFile(log_path, jail, Sink.cb, &sink);
 
-    // Kick thread: write a line (a real attach+read → was_ever_attached), wait
-    // until it's read, then RENAME the watched file out to a non-matching name
-    // (a real IN_MOVE_SELF the loop drains into detachFileWatch). Rename-away
-    // is the deterministic "source broke after reading" signal here: while the
-    // daemon holds the file fd open, an unlink (IN_DELETE_SELF) is NOT
-    // delivered until the last fd closes (verified) — the real-box analogue is
-    // a logrotate/`mv` that takes the active log away without a same-name
-    // replacement, so the parent-dir reopen never fires and the watch stays
-    // detached. A bounded drain window, then stop. No verdict read on this
-    // thread.
     const Ctx = struct { tmp_dir: std.fs.Dir, loop: *event_loop_mod.EventLoop, sink: *Sink };
     var ctx = Ctx{ .tmp_dir = tmp.dir, .loop = &loop, .sink = &sink };
     const th = try std.Thread.spawn(.{}, struct {
@@ -2897,13 +2196,10 @@ test "ENH-004 e2e: real file move-away → real detach → DEGRADED + log_source
                 _ = f.seekFromEnd(0) catch {};
                 _ = f.writeAll("Failed password for root from 203.0.113.7 port 22 ssh2\n") catch {};
             }
-            // Wait until a line is read (attach confirmed → was_ever_attached).
             var tries: u32 = 0;
             while (tries < 400 and c.sink.count() < 1) : (tries += 1) {
                 std.time.sleep(5 * std.time.ns_per_ms);
             }
-            // Move the watched file away under a NON-matching basename so the
-            // parent-dir watch does NOT reopen it — a genuine, sticky break.
             c.tmp_dir.rename("enh004.log", "enh004.log.gone") catch {};
             std.time.sleep(120 * std.time.ns_per_ms);
             c.loop.stop();
@@ -2913,22 +2209,15 @@ test "ENH-004 e2e: real file move-away → real detach → DEGRADED + log_source
     try loop.run();
     th.join();
 
-    // The loop thread is done — read watch state on the main thread only.
-    try testing.expect(sink.count() >= 1); // the line was actually read
-    // The real IN_MOVE_SELF drove a real structural detach: the watch was once
-    // attached and is now detached, with detached_at_ts armed.
+    try testing.expect(sink.count() >= 1);
     try assertStructuralDetach(&watcher, "sshd");
 
-    // Backdate the detach past the 2s debounce on the real watch struct (the
-    // only time-dependent input; the structural detach itself is real) so the
-    // verdict becomes a genuine `false` without a wall-clock wait — case (a).
     backdateDetach(&watcher, "sshd");
     {
         const h = watcher.healthForJail("sshd").?;
-        try testing.expect(!h.healthy); // a was-healthy-then-broken file source
+        try testing.expect(!h.healthy);
     }
 
-    // --- the end-to-end chain through the daemon's own wiring ---
     var trackers = tracker_map_mod.TrackerMap.init(a);
     defer trackers.deinit();
     var metrics = metrics_mod.Metrics.init();
@@ -2939,10 +2228,6 @@ test "ENH-004 e2e: real file move-away → real detach → DEGRADED + log_source
     var backend_val: firewall.Backend = .{ .nftables = firewall.nftables.NftablesBackend{} };
     defer backend_val.deinit();
 
-    // The REAL adapter over the REAL watcher. The journald source is empty
-    // (no jails registered → healthForJail returns null for every name), so
-    // the verdict comes from the file watcher — exactly the daemon's
-    // journald-first scan order falling through to the file source.
     var journald_src = journald_source_mod.JournaldSource.init(a, &loop, log_path) catch return error.SkipZigTest;
     defer journald_src.deinit();
     var health_sources = HealthSources{ .watcher = &watcher, .journald = &journald_src };
@@ -2955,23 +2240,16 @@ test "ENH-004 e2e: real file move-away → real detach → DEGRADED + log_source
         .health_source = .{ .ctx = @ptrCast(&health_sources), .lookup = jailHealthLookup },
     };
 
-    // (1) Overall state flips DEGRADED off the real file verdict (case a).
     try testing.expectEqualStrings("degraded", cmd_ctx.computeOverallState());
 
-    // (2) The metric gauge reports 0 for the broken source (case a).
     var http_ctx: HttpSources = .{ .metrics = &metrics, .cmd_ctx = &cmd_ctx, .trackers = &trackers };
     var out: std.ArrayListUnmanaged(u8) = .{};
     defer out.deinit(a);
     try writeMetricsPayload(@ptrCast(&http_ctx), &out, a);
     try testing.expect(std.mem.indexOf(u8, out.items, "fail2zig_jail_log_source_healthy{jail=\"sshd\"} 0") != null);
-    // Overall protection gauge follows: DEGRADED → not actively protecting.
     try testing.expect(std.mem.indexOf(u8, out.items, "fail2zig_protection_active 0") != null);
 }
 
-/// Reach into the real watcher and backdate the matching jail's detach
-/// timestamp past the debounce, simulating the elapse of the 2s window
-/// without a wall-clock wait. The detach itself (file_fd<0, was_ever_attached)
-/// must already be real — this only ages the timestamp the verdict compares.
 fn backdateDetach(watcher: *log_watcher_mod.LogWatcher, jail_name: []const u8) void {
     const jail = shared.JailId.fromSlice(jail_name) catch return;
     for (watcher.files.items) |fw| {
@@ -2981,15 +2259,11 @@ fn backdateDetach(watcher: *log_watcher_mod.LogWatcher, jail_name: []const u8) v
     }
 }
 
-/// Assert a real detach happened: at least one of the jail's watches was once
-/// attached, is now detached (`file_fd < 0`), and has a non-zero
-/// `detached_at_ts`. This is the structural fact the IN_DELETE_SELF must have
-/// produced — the precondition for the verdict's hard `false`.
 fn assertStructuralDetach(watcher: *log_watcher_mod.LogWatcher, jail_name: []const u8) !void {
     const jail = try shared.JailId.fromSlice(jail_name);
     for (watcher.files.items) |fw| {
         if (fw.jail.eql(jail) and fw.was_ever_attached and fw.file_fd < 0 and fw.detached_at_ts != 0) {
-            return; // a genuine was-attached-then-detached watch
+            return;
         }
     }
     return error.NoStructuralDetach;
@@ -3018,18 +2292,12 @@ test "ENH-004 e2e: a quiet healthy file jail stays ACTIVE, gauge 1 (no false fla
     defer watcher.deinit();
 
     const jail = try shared.JailId.fromSlice("sshd");
-    // Attach to an existing, NEVER-written file: the watch attaches (file_fd>=0)
-    // but no line is ever read → quiet-but-healthy. No event loop run needed;
-    // watchFile attaches synchronously when the file already exists.
     try watcher.watchFile(log_path, jail, enh004NoopLine, &watcher);
 
-    // Attached with zero traffic → healthy, NOT a false negative (case b).
     const h = watcher.healthForJail("sshd").?;
     try testing.expect(h.healthy);
     try testing.expectEqual(@as(u64, 0), h.lines_seen);
 
-    // Through the real surface: a quiet healthy enforcing file jail is ACTIVE,
-    // not DEGRADED, and its gauge reads 1.
     var trackers = tracker_map_mod.TrackerMap.init(a);
     defer trackers.deinit();
     var metrics = metrics_mod.Metrics.init();
@@ -3068,8 +2336,6 @@ test "ENH-004 e2e: a never-appeared (late) log is NOT degraded, gauge 0 (no fals
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = tmp.dir.realpath(".", &path_buf) catch return error.SkipZigTest;
     var full_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    // A path whose PARENT exists (the tmp dir) but whose file is absent at
-    // watch time → boot/late-log: was_ever_attached stays false (case d).
     const log_path = try std.fmt.bufPrint(&full_path_buf, "{s}/never_appears.log", .{dir_path});
 
     var loop = event_loop_mod.EventLoop.init(a) catch return error.SkipZigTest;
@@ -3081,7 +2347,6 @@ test "ENH-004 e2e: a never-appeared (late) log is NOT degraded, gauge 0 (no fals
     const jail = try shared.JailId.fromSlice("sshd");
     try watcher.watchFile(log_path, jail, enh004NoopLine, &watcher);
 
-    // Never attached → verdict is unknown (null), never a hard false (case d).
     try testing.expect(watcher.healthForJail("sshd") == null);
 
     var trackers = tracker_map_mod.TrackerMap.init(a);
@@ -3103,16 +2368,12 @@ test "ENH-004 e2e: a never-appeared (late) log is NOT degraded, gauge 0 (no fals
         .stats_source = .{ .ctx = @ptrCast(&metrics), .snapshot = metricsStatsSnapshot },
         .health_source = .{ .ctx = @ptrCast(&health_sources), .lookup = jailHealthLookup },
     };
-    // Unknown health → NOT degraded (no false DEGRADED flash at boot).
     try testing.expectEqualStrings("active", cmd_ctx.computeOverallState());
 
     var http_ctx: HttpSources = .{ .metrics = &metrics, .cmd_ctx = &cmd_ctx, .trackers = &trackers };
     var out: std.ArrayListUnmanaged(u8) = .{};
     defer out.deinit(a);
     try writeMetricsPayload(@ptrCast(&http_ctx), &out, a);
-    // The gauge reports 0 for an unknown source ("not confirmed reading"), but
-    // the OVERALL state is NOT degraded — the metric's tri-state collapse must
-    // never be mistaken for a DEGRADED trigger. This guards that distinction.
     try testing.expect(std.mem.indexOf(u8, out.items, "fail2zig_jail_log_source_healthy{jail=\"sshd\"} 0") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "fail2zig_protection_active 1") != null);
 }

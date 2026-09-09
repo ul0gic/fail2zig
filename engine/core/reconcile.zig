@@ -1,24 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! State-tracker → firewall-backend reconciliation on daemon startup.
-//!
-//! The scaffold installer (`nftables.zig::sendScaffold`) always leaves
-//! the backend in a clean state — empty sets, no active bans. The
-//! state tracker, however, may hold bans that were active when the
-//! previous instance exited and were persisted to disk. Without an
-//! explicit reconciliation step those bans would be visible via the
-//! IPC `list` command but silently un-enforced at the kernel layer
-//! until a fresh ban decision fires.
-//!
-//! This module is the bridge. It walks the tracker once, calls a
-//! caller-supplied `applyFn` for every entry whose ban is both
-//! active (`.banned`) and still in-window (`ban_expiry > now`), and
-//! optionally syncs the `active_bans` gauges in `Metrics`.
-//!
-//! Extracted from `main.zig` so the logic is testable without
-//! spinning up the whole daemon. The `applyFn` callback means unit
-//! tests can pass a recording closure; production code passes a
-//! thin wrapper around `Backend.ban`.
 
 const std = @import("std");
 const state_mod = @import("state.zig");
@@ -26,13 +7,6 @@ const tracker_map_mod = @import("tracker_map.zig");
 const metrics_mod = @import("metrics.zig");
 const shared = @import("shared");
 
-/// Callback invoked for each restored ban entry. Typically calls
-/// `backend.ban(ip, jail, remaining)` in production; record-and-return
-/// in tests.
-///
-/// Returning an error causes the entry to be counted as a failure
-/// (no metrics bump, no reinstalled++ tick) but does not abort the
-/// loop — other entries still get a chance.
 pub const BanApplyFn = *const fn (
     ctx: *anyopaque,
     ip: shared.IpAddress,
@@ -40,13 +14,6 @@ pub const BanApplyFn = *const fn (
     remaining: u64,
 ) anyerror!void;
 
-/// Walk `tracker`, invoke `applyFn` for each `.banned` entry with a
-/// future `ban_expiry`, and (if `metrics` is non-null) set the
-/// `active_bans` gauges to the reconciled count. Returns the number
-/// of entries successfully reinstalled.
-///
-/// `allocator` backs a short-lived `StringHashMap(u32)` for per-jail
-/// counting; it's freed before returning.
 pub fn reconcileRestoredBans(
     allocator: std.mem.Allocator,
     tracker: *state_mod.StateTracker,
@@ -85,10 +52,6 @@ pub fn reconcileRestoredBans(
     return reinstalled;
 }
 
-/// Multi-tracker variant of `reconcileRestoredBans` (ISSUE-007). Walks
-/// every tracker in `map` and reinstalls active bans against the
-/// firewall backend via `applyFn`. Returns the total number reinstalled
-/// across all jails. Metrics gauges are set to the aggregated counts.
 pub fn reconcileAllRestoredBans(
     allocator: std.mem.Allocator,
     map: *const tracker_map_mod.TrackerMap,
@@ -130,10 +93,6 @@ pub fn reconcileAllRestoredBans(
 
     return reinstalled;
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 const testing = std.testing;
 const persist_mod = @import("persist.zig");
@@ -183,10 +142,7 @@ test "reconcile: banned entries applied, expired + monitoring skipped (SYS-007)"
     const sshd_jail = try shared.JailId.fromSlice("sshd");
     const now: shared.Timestamp = 1_000_000;
 
-    // Seed via the same public path the daemon uses at startup
-    // (persist.seed -> StateTracker). Covers the production codepath.
     const entries = [_]persist_mod.StateEntry{
-        // One active ban, future expiry — must reconcile.
         .{
             .ip = makeIpV4(203, 0, 113, 1),
             .jail = sshd_jail,
@@ -196,7 +152,6 @@ test "reconcile: banned entries applied, expired + monitoring skipped (SYS-007)"
             .last_attempt = now - 60,
             .ban_expiry = now + 120,
         },
-        // Expired ban (ban_expiry in the past) — must skip.
         .{
             .ip = makeIpV4(203, 0, 113, 2),
             .jail = sshd_jail,
@@ -206,7 +161,6 @@ test "reconcile: banned entries applied, expired + monitoring skipped (SYS-007)"
             .last_attempt = now - 200,
             .ban_expiry = now - 10,
         },
-        // Monitoring only (ban_expiry null) — must skip.
         .{
             .ip = makeIpV4(203, 0, 113, 3),
             .jail = sshd_jail,
@@ -239,12 +193,8 @@ test "reconcile: banned entries applied, expired + monitoring skipped (SYS-007)"
     const banned_ip = makeIpV4(203, 0, 113, 1);
     try testing.expect(shared.IpAddress.eql(call.ip, banned_ip));
     try testing.expectEqualStrings("sshd", call.jailSlice());
-    // Remaining must equal ban_expiry - now.
     try testing.expectEqual(@as(u64, 120), call.remaining);
 
-    // Metrics synced: active_bans gauge reflects reconciled count, but
-    // bans_total (the monotonic counter) stays at 0 — reloads aren't
-    // fresh ban events and shouldn't inflate the lifetime total.
     const snap = metrics.snapshot();
     try testing.expectEqual(@as(u32, 1), snap.active_bans);
     try testing.expectEqual(@as(u64, 0), snap.bans_total);
@@ -302,8 +252,6 @@ test "reconcile: reconcileAllRestoredBans walks every tracker (ISSUE-007)" {
     const j_b = try shared.JailId.fromSlice("b");
     const now: shared.Timestamp = 1_000_000;
 
-    // Two active bans in `a`, one in `b`. One expired in `a` (skipped),
-    // one monitoring in `b` (skipped).
     try persist_mod.seed(tracker_a, &[_]persist_mod.StateEntry{
         .{ .ip = makeIpV4(203, 0, 113, 1), .jail = j_a, .attempt_count = 3, .ban_count = 1, .first_attempt = 0, .last_attempt = 0, .ban_expiry = now + 60 },
         .{ .ip = makeIpV4(203, 0, 113, 2), .jail = j_a, .attempt_count = 3, .ban_count = 1, .first_attempt = 0, .last_attempt = 0, .ban_expiry = now + 90 },
@@ -334,9 +282,6 @@ test "reconcile: reconcileAllRestoredBans walks every tracker (ISSUE-007)" {
 }
 
 test "reconcile: callback errors are non-fatal, loop continues (SYS-007)" {
-    // If applyFn errors on one entry (e.g. backend returns AlreadyBanned,
-    // or a real transient netlink error), reconcile keeps going for the
-    // rest. Only successful applies count toward the return value.
     const alloc = testing.allocator;
 
     var tracker = try state_mod.StateTracker.init(alloc, .{ .max_entries = 16 });

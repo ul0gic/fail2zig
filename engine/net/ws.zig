@@ -1,31 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Minimal WebSocket (RFC 6455) server for the fail2zig dashboard.
-//!
-//! Scope:
-//!   - Text frames only (server -> clients). Binary frames from clients
-//!     are rejected with close code 1003 (Unsupported Data).
-//!   - Ping / pong heartbeat: we send ping every 30s, close the client
-//!     if no pong within 10s.
-//!   - `broadcast(text)` writes the same text frame to every connected
-//!     client. Slow clients whose send buffer fills are dropped.
-//!
-//! The WsServer does NOT own a TCP listener. The `HttpServer` in
-//! `http.zig` owns the single user-facing port; when it sees an
-//! `Upgrade: websocket` request on `/events` it completes the handshake
-//! and calls `WsServer.admitUpgraded(fd, ...)` to hand the connected
-//! socket off to this module. The handoff re-registers the FD with the
-//! event loop under WsServer's frame-reading callback.
-//!
-//! Security notes:
-//!   - Per-instance client cap (`max_clients` on `WsServer`, supplied by
-//!     the daemon from `[global] websocket_max_clients`, default 16).
-//!     Excess connections rejected at the HTTP layer before the upgrade
-//!     completes.
-//!   - Payloads from clients capped at 64 KB (dashboard only ever
-//!     sends pings/pongs, so this is generous).
-//!   - Masking enforced on every frame we receive per RFC. Server
-//!     frames are never masked.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -35,19 +9,8 @@ const linux = std.os.linux;
 const event_loop_mod = @import("../core/event_loop.zig");
 const EventLoop = event_loop_mod.EventLoop;
 
-// ============================================================================
-// Constants
-// ============================================================================
-
-/// Default client cap when the daemon does not supply one (tests,
-/// unconfigured embeds). Production callers pass the configured value
-/// via `WsServer.init`'s `max_clients` parameter which originates from
-/// `[global] websocket_max_clients` in `config.toml`.
 pub const default_max_clients: usize = 16;
 
-/// Absolute upper bound on `max_clients`. The config parser rejects any
-/// `websocket_max_clients` value that exceeds this. Keeps a malformed
-/// config from asking us to allocate a gigantic slot table.
 pub const hard_max_clients: usize = 1024;
 pub const max_handshake_bytes: usize = 8 * 1024;
 pub const max_inbound_payload: usize = 64 * 1024;
@@ -55,13 +18,7 @@ pub const max_inbound_payload: usize = 64 * 1024;
 pub const ping_interval_ms: u64 = 30_000;
 pub const pong_timeout_ms: u64 = 10_000;
 
-/// RFC 6455 magic GUID. Concatenated to the client key, SHA-1'd, then
-/// base64-encoded to produce the `Sec-WebSocket-Accept` header value.
 pub const ws_magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-
-// ============================================================================
-// Opcodes (low nibble of the frame's first byte)
-// ============================================================================
 
 pub const Opcode = enum(u4) {
     continuation = 0x0,
@@ -73,10 +30,6 @@ pub const Opcode = enum(u4) {
     _,
 };
 
-// ============================================================================
-// Errors
-// ============================================================================
-
 pub const Error = error{
     EventLoopError,
     TooManyClients,
@@ -85,47 +38,21 @@ pub const Error = error{
     InvalidMaxClients,
 };
 
-// ============================================================================
-// Per-client state
-// ============================================================================
-
 const ClientReg = struct {
     server: *WsServer,
     fd: posix.fd_t,
-    /// True after the upgrade handshake has been completed (always true
-    /// in the HTTP-handoff architecture — the HttpServer only hands off
-    /// post-handshake sockets). Kept as a field so the broadcast and
-    /// heartbeat loops can be defensive.
     upgraded: bool = true,
-    /// Buffer for incoming frame bytes. Sized generously; one frame is
-    /// never allowed to exceed `max_inbound_payload`.
     buf: []u8,
     len: usize = 0,
-    /// Last time we sent a ping to this client (ms since an epoch).
     last_ping_ms: i64 = 0,
-    /// Last pong we received. Used for pong_timeout enforcement.
     last_pong_ms: i64 = 0,
 };
-
-// ============================================================================
-// WsServer
-// ============================================================================
 
 pub const WsServer = struct {
     allocator: std.mem.Allocator,
     loop: *EventLoop,
-    /// Heap-allocated slot table sized at `init` time. One `?*ClientReg`
-    /// per admissible client; `null` means the slot is free. Fixed-size
-    /// after construction — we never grow under load.
     clients: []?*ClientReg,
 
-    /// Construct a WsServer with no listening socket. The HttpServer
-    /// is expected to feed upgraded client FDs in via `admitUpgraded`.
-    ///
-    /// `max_clients` is the runtime cap (from `[global] websocket_max_clients`).
-    /// Must be in `1..=hard_max_clients` — zero or out-of-range values
-    /// return `error.InvalidMaxClients` rather than silently falling back,
-    /// so a misconfigured daemon fails closed at startup.
     pub fn init(
         allocator: std.mem.Allocator,
         loop: *EventLoop,
@@ -159,19 +86,6 @@ pub const WsServer = struct {
         self.* = undefined;
     }
 
-    /// Called by the HTTP server after it has observed a WebSocket
-    /// Upgrade request, written the `101 Switching Protocols` response
-    /// with a valid `Sec-WebSocket-Accept`, and removed the FD from its
-    /// own event-loop registration.
-    ///
-    /// `pre_read_tail` is any bytes the HTTP server read past the end of
-    /// the request headers (e.g. the first WebSocket frame arriving in
-    /// the same TCP segment as the upgrade). They are copied into the
-    /// new client's frame buffer so no data is lost.
-    ///
-    /// On success the FD's lifetime transfers to the WsServer. On error
-    /// the FD is closed by this function — the caller does NOT need
-    /// errdefer around the handoff.
     pub fn admitUpgraded(
         self: *WsServer,
         fd: posix.fd_t,
@@ -185,7 +99,6 @@ pub const WsServer = struct {
             }
         }
         if (idx == null) {
-            // FD ownership transferred to us on entry; close on reject.
             posix.close(fd);
             return error.TooManyClients;
         }
@@ -193,7 +106,7 @@ pub const WsServer = struct {
         const buf_size = @max(max_handshake_bytes, max_inbound_payload + 16);
         if (pre_read_tail.len > buf_size) {
             posix.close(fd);
-            return error.OutOfMemory; // caller-side bug: HTTP cap is smaller than ours.
+            return error.OutOfMemory;
         }
 
         const cli = self.allocator.create(ClientReg) catch {
@@ -225,8 +138,6 @@ pub const WsServer = struct {
         };
         self.clients[idx.?] = cli;
 
-        // If the HTTP server already delivered frame bytes, drain them now
-        // so we don't wait for the next EPOLLIN to process them.
         if (cli.len > 0) self.readFrames(cli);
     }
 
@@ -238,7 +149,6 @@ pub const WsServer = struct {
     }
 
     fn readFrames(self: *WsServer, cli: *ClientReg) void {
-        // Append to cli.buf; once a full frame is present, dispatch it.
         while (true) {
             const n = posix.read(cli.fd, cli.buf[cli.len..]) catch |err| switch (err) {
                 error.WouldBlock => break,
@@ -252,10 +162,9 @@ pub const WsServer = struct {
                 return;
             }
             cli.len += n;
-            if (cli.len == cli.buf.len) break; // buffer full — try to parse.
+            if (cli.len == cli.buf.len) break;
         }
 
-        // Drain as many complete frames as we can.
         var cursor: usize = 0;
         while (cursor < cli.len) {
             const parse = parseFrame(cli.buf[cursor..cli.len]) catch |err| switch (err) {
@@ -271,12 +180,7 @@ pub const WsServer = struct {
             };
             cursor += parse.consumed;
         }
-        // SEC-010: buffer-full but no frame consumed. The client either
-        // sent garbage or stalled mid-frame with enough bytes to fill
-        // the buffer. Either way, we cannot make progress and the next
-        // read would be into a zero-length slice — relying on the
-        // kernel's zero-length-read semantics is brittle. Close the
-        // client with an explicit policy-violation log.
+        // Buffer full with nothing consumed: the next read would be zero-length, so close instead of spinning.
         if (cursor == 0 and cli.len == cli.buf.len) {
             @branchHint(.unlikely);
             std.log.warn(
@@ -286,42 +190,30 @@ pub const WsServer = struct {
             self.closeClient(cli);
             return;
         }
-        // Compact leftover bytes to the front of the buffer.
         if (cursor > 0) {
             std.mem.copyForwards(u8, cli.buf[0 .. cli.len - cursor], cli.buf[cursor..cli.len]);
             cli.len -= cursor;
         }
     }
 
+    // Never closeClient() here: the caller keeps iterating cli after return (read-after-free). Return an error instead.
     fn dispatchFrame(self: *WsServer, cli: *ClientReg, frame: ParsedFrame) !void {
-        // CRITICAL: never call `self.closeClient(cli)` inside this function.
-        // The caller (`readFrames`) continues iterating `cli.len` after we
-        // return and would read-after-free. Signal "close me" by returning
-        // an error instead — the caller's existing `catch` branch invokes
-        // closeClient exactly once. (Regression history: SEGV observed on
-        // VM 2026-04-22 when a scanner sent a close/binary frame.)
         _ = self;
         switch (frame.opcode) {
             .close => {
-                // Best-effort echo of the peer's CLOSE, then bubble up so
-                // the caller frees.
-                const close_frame = [_]u8{ 0x88, 0x00 }; // FIN|CLOSE, len=0
+                const close_frame = [_]u8{ 0x88, 0x00 };
                 _ = posix.write(cli.fd, &close_frame) catch {};
                 return error.ClientClosing;
             },
             .ping => {
-                // Build a pong frame with the same payload.
                 try writePongFrame(cli.fd, frame.payload);
             },
             .pong => {
                 cli.last_pong_ms = std.time.milliTimestamp();
             },
-            .text => {
-                // Dashboard doesn't send messages; we accept + ignore.
-            },
+            .text => {},
             .binary => {
-                // Unsupported: send close 1003, then let the caller free.
-                const close_frame = [_]u8{ 0x88, 0x02, 0x03, 0xEB }; // 1003
+                const close_frame = [_]u8{ 0x88, 0x02, 0x03, 0xEB };
                 _ = posix.write(cli.fd, &close_frame) catch {};
                 return error.UnsupportedOpcode;
             },
@@ -329,8 +221,6 @@ pub const WsServer = struct {
         }
     }
 
-    /// Send a text message to every connected (post-upgrade) client.
-    /// Slow clients whose write would block are dropped.
     pub fn broadcast(self: *WsServer, text: []const u8) !void {
         for (self.clients) |*slot| {
             if (slot.*) |cli| {
@@ -341,15 +231,6 @@ pub const WsServer = struct {
             }
         }
     }
-
-    // Event wire contract, documented in `.project/design/demo-concept.md`:
-    //   { "type": <str>, "ts": <ISO8601 UTC>, "payload": { ... } }
-    //
-    // `ts` is the wall-clock time at broadcast in ISO-8601 UTC
-    // ("2026-04-23T00:07:42.123Z"). Epoch ints would be lighter on the
-    // wire but the doc specifies ISO for client-side readability and
-    // the cost here is trivial (~100 ns per event, far below parse
-    // overhead). `payload` shape is per-event.
 
     pub fn broadcastAttackDetected(
         self: *WsServer,
@@ -411,10 +292,6 @@ pub const WsServer = struct {
         active_bans: u32,
         memory_bytes_used: u64,
         uptime_s: u64,
-        /// SYS-017 (additive): overall protection state
-        /// ("active"/"mixed"/"log-only"/"degraded") and a degraded flag.
-        /// Defaulted so older callers / tests need not supply them; an
-        /// added JSON field is backward-safe for any consumer.
         protection_state: []const u8 = "active",
         degraded: bool = false,
     };
@@ -435,10 +312,6 @@ pub const WsServer = struct {
         try self.broadcast(buf.items);
     }
 
-    /// Heartbeat tick. Intended to be called once per second by an
-    /// event-loop timer. Sends pings to clients whose last_ping is
-    /// older than `ping_interval_ms`; drops clients whose
-    /// `last_pong` is older than `ping_interval_ms + pong_timeout_ms`.
     pub fn tickHeartbeat(self: *WsServer) void {
         const now = std.time.milliTimestamp();
         for (self.clients) |*slot| {
@@ -479,18 +352,7 @@ pub const WsServer = struct {
     }
 };
 
-// ============================================================================
-// Handshake helpers
-// ============================================================================
-
-/// Compute `Sec-WebSocket-Accept` = base64(SHA1(key ++ ws_magic)).
-/// `out` must be at least 32 bytes (SHA-1 is 20 bytes -> base64 28 chars).
-/// Format a Unix millisecond timestamp into ISO-8601 UTC with
-/// millisecond precision ("2026-04-23T00:07:42.123Z"). `buf` must be
-/// at least 24 bytes; 32 is the recommended size with headroom.
-/// Returns a slice of `buf` holding the rendered string.
 pub fn formatIso8601Utc(buf: []u8, ms_since_epoch: i64) ![]const u8 {
-    // epoch_ms -> y/m/d h:m:s.fff via std.time.epoch.
     const ms_u: u64 = if (ms_since_epoch < 0) 0 else @intCast(ms_since_epoch);
     const seconds_total: u64 = ms_u / 1000;
     const ms_part: u16 = @intCast(ms_u % 1000);
@@ -526,18 +388,15 @@ pub fn computeAccept(key: []const u8, out: []u8) ![]const u8 {
     return enc.encode(out[0..needed], &digest);
 }
 
-/// Find a header value (case-insensitive name). Returns the trimmed
-/// value slice, or null if the header is not present.
 pub fn findHeader(req: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitSequence(u8, req, "\r\n");
-    _ = it.next(); // skip request line
+    _ = it.next();
     while (it.next()) |line| {
         if (line.len == 0) break;
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
         const hname = line[0..colon];
         if (!asciiEqlIgnoreCase(hname, name)) continue;
         var value = line[colon + 1 ..];
-        // Trim leading space.
         while (value.len > 0 and (value[0] == ' ' or value[0] == '\t')) {
             value = value[1..];
         }
@@ -554,24 +413,15 @@ fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-// ============================================================================
-// Frame parsing / encoding
-// ============================================================================
-
 pub const ParsedFrame = struct {
     opcode: Opcode,
     fin: bool,
     payload: []const u8,
-    /// Total bytes this frame consumed from the input. May include
-    /// header bytes after unmasking.
     consumed: usize,
 };
 
 pub const ParseError = error{ Incomplete, BadMask, UnsupportedLength };
 
-/// Parse a single WebSocket frame from a caller-owned mutable buffer.
-/// The buffer is mutated to unmask the payload in place (WebSocket
-/// client frames are always masked).
 pub fn parseFrame(buf: []u8) ParseError!ParsedFrame {
     if (buf.len < 2) return error.Incomplete;
     const b0 = buf[0];
@@ -598,8 +448,7 @@ pub fn parseFrame(buf: []u8) ParseError!ParsedFrame {
     }
     if (payload_len > max_inbound_payload) return error.UnsupportedLength;
 
-    // Client frames MUST be masked. Server frames must NOT be. We only
-    // parse frames we receive (client->server), so enforce masked=true.
+    // RFC 6455 §5.1: client-to-server frames must be masked.
     if (!masked) return error.BadMask;
     if (buf.len < offset + 4) return error.Incomplete;
     const mask_key = buf[offset..][0..4].*;
@@ -607,7 +456,6 @@ pub fn parseFrame(buf: []u8) ParseError!ParsedFrame {
 
     const pl_len: usize = @intCast(payload_len);
     if (buf.len < offset + pl_len) return error.Incomplete;
-    // Unmask in place.
     var i: usize = 0;
     while (i < pl_len) : (i += 1) {
         buf[offset + i] ^= mask_key[i & 3];
@@ -620,7 +468,6 @@ pub fn parseFrame(buf: []u8) ParseError!ParsedFrame {
     };
 }
 
-/// Write an unmasked server -> client text frame.
 pub fn writeTextFrame(fd: posix.fd_t, text: []const u8) !void {
     try writeFrame(fd, .text, text);
 }
@@ -661,14 +508,9 @@ fn writeAll(fd: posix.fd_t, bytes: []const u8) !void {
     }
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 const testing = std.testing;
 
 test "ws: computeAccept matches RFC 6455 sample vector" {
-    // Sample from RFC 6455 section 1.3.
     const key = "dGhlIHNhbXBsZSBub25jZQ==";
     var out: [64]u8 = undefined;
     const accept = try computeAccept(key, &out);
@@ -683,11 +525,9 @@ test "ws: findHeader is case-insensitive and tolerant of whitespace" {
 }
 
 test "ws: parseFrame round-trip via encode + decode" {
-    // Build a masked client frame manually: opcode=text, FIN=1, len=5,
-    // mask=[0xaa,0xbb,0xcc,0xdd], payload="hello" xor'd.
     var buf: [64]u8 = undefined;
-    buf[0] = 0x81; // FIN + text
-    buf[1] = 0x85; // masked + len=5
+    buf[0] = 0x81;
+    buf[1] = 0x85;
     const mask = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
     @memcpy(buf[2..6], &mask);
     const payload = "hello";
@@ -702,7 +542,6 @@ test "ws: parseFrame round-trip via encode + decode" {
 }
 
 test "ws: parseFrame rejects unmasked client frame" {
-    // Server-origin frame (no mask bit). Must be rejected per RFC.
     var buf: [8]u8 = .{ 0x81, 0x05, 'h', 'e', 'l', 'l', 'o', 0 };
     try testing.expectError(error.BadMask, parseFrame(buf[0..7]));
 }
@@ -714,14 +553,13 @@ test "ws: parseFrame reports Incomplete on short buffers" {
 
 test "ws: parseFrame rejects payload larger than max_inbound_payload" {
     var buf: [10]u8 = undefined;
-    buf[0] = 0x81; // FIN + text
-    buf[1] = 0xFF; // masked + 127 (8-byte length follows)
+    buf[0] = 0x81;
+    buf[1] = 0xFF;
     std.mem.writeInt(u64, buf[2..10], max_inbound_payload + 1, .big);
     try testing.expectError(error.UnsupportedLength, parseFrame(&buf));
 }
 
 test "ws: writeTextFrame uses short length for payload < 126" {
-    // Use a socketpair — write into one end, verify the bytes arrive.
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var fds: [2]i32 = undefined;
     const stype_u32: u32 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
@@ -742,8 +580,8 @@ test "ws: writeTextFrame uses short length for payload < 126" {
     var buf: [16]u8 = undefined;
     const n = try posix.read(fds[1], &buf);
     try testing.expectEqual(@as(usize, 4), n);
-    try testing.expectEqual(@as(u8, 0x81), buf[0]); // FIN + text
-    try testing.expectEqual(@as(u8, 0x02), buf[1]); // len=2, not masked
+    try testing.expectEqual(@as(u8, 0x81), buf[0]);
+    try testing.expectEqual(@as(u8, 0x02), buf[1]);
     try testing.expectEqualStrings("hi", buf[2..4]);
 }
 
@@ -789,12 +627,6 @@ fn readExact(fd: posix.fd_t, buf: []u8) !void {
 }
 
 test "ws: buffer full with unparseable bytes closes client (SEC-010)" {
-    // SEC-010: a client that fills the read buffer with bytes that
-    // cannot form a complete frame (declared payload longer than the
-    // buffer can hold, no matter how many more bytes arrive) must be
-    // closed explicitly. Without the SEC-010 guard, the next read
-    // into cli.buf[cli.len..] is a zero-length slice and correctness
-    // depends on kernel semantics — brittle.
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const a = testing.allocator;
 
@@ -821,16 +653,6 @@ test "ws: buffer full with unparseable bytes closes client (SEC-010)" {
     try server.admitUpgraded(fds[0], &.{});
     const cli = server.clients[0].?;
 
-    // Forge a "first bytes of a valid masked frame whose declared payload
-    // is exactly max_inbound_payload (the biggest the parser accepts) but
-    // whose total frame size (14-byte header + payload) exceeds
-    // cli.buf.len". parseFrame accepts the length (at the cap), then
-    // requires `buf.len >= offset + payload_len` which is false, so
-    // returns Incomplete. cursor stays 0, cli.len == cli.buf.len → the
-    // SEC-010 guard closes the client.
-    //
-    // Wire shape (14-byte header): b0=0x81 (FIN + text), b1=0xFF
-    // (masked + 127-extended), u64 length = max_inbound_payload, u32 mask.
     std.debug.assert(cli.buf.len >= 16);
     cli.buf[0] = 0x81;
     cli.buf[1] = 0xFF;
@@ -842,7 +664,6 @@ test "ws: buffer full with unparseable bytes closes client (SEC-010)" {
     cli.len = cli.buf.len;
 
     server.readFrames(cli);
-    // Slot cleared ⇒ client was closed.
     try testing.expect(server.clients[0] == null);
 }
 
@@ -870,14 +691,13 @@ test "ws: admitUpgraded takes ownership of fd and broadcasts reach it" {
     }
     defer posix.close(fds[1]);
 
-    // Admitting transfers fds[0] ownership to server; empty pre-read tail.
     try server.admitUpgraded(fds[0], &.{});
 
     try server.broadcast("ping");
 
     var buf: [16]u8 = undefined;
     const n = try posix.read(fds[1], &buf);
-    try testing.expectEqual(@as(usize, 6), n); // 2 header + 4 payload
+    try testing.expectEqual(@as(usize, 6), n);
     try testing.expectEqual(@as(u8, 0x81), buf[0]);
     try testing.expectEqual(@as(u8, 4), buf[1]);
     try testing.expectEqualStrings("ping", buf[2..6]);
@@ -893,7 +713,6 @@ test "ws: admitUpgraded rejects past max_clients and closes the fd" {
     var server = try WsServer.init(a, &loop, default_max_clients);
     defer server.deinit();
 
-    // Fill all slots.
     var peer_fds: [default_max_clients]i32 = undefined;
     for (0..default_max_clients) |i| {
         var fds: [2]i32 = undefined;
@@ -913,7 +732,6 @@ test "ws: admitUpgraded rejects past max_clients and closes the fd" {
     }
     defer for (peer_fds) |pfd| posix.close(pfd);
 
-    // One more should be rejected.
     var extra: [2]i32 = undefined;
     const stype_u32: u32 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
     const rc = linux.socketpair(
@@ -928,7 +746,6 @@ test "ws: admitUpgraded rejects past max_clients and closes the fd" {
     }
     defer posix.close(extra[1]);
     try testing.expectError(error.TooManyClients, server.admitUpgraded(extra[0], &.{}));
-    // extra[0] was closed by admitUpgraded on rejection.
 }
 
 test "ws: broadcast to 3 in-memory clients all receive the same frame" {
@@ -938,9 +755,6 @@ test "ws: broadcast to 3 in-memory clients all receive the same frame" {
     var loop = try EventLoop.init(a);
     defer loop.deinit();
 
-    // We don't need a listener for this test — construct a WsServer
-    // and inject three "upgraded" clients backed by socketpair fds. The
-    // test reads from the peer side of each pair to verify the frame.
     var server = try WsServer.init(a, &loop, default_max_clients);
 
     var peer_fds: [3]i32 = undefined;
@@ -971,27 +785,19 @@ test "ws: broadcast to 3 in-memory clients all receive the same frame" {
             .buf = buf,
         };
         server.clients[i] = cli;
-        // NOTE: we do NOT register these fds with the loop — the loop
-        // is idle in this test. We only exercise broadcast().
     }
 
     try server.broadcast("hello world");
 
-    // Each peer must have received an unmasked text frame with the
-    // same payload.
     for (peer_fds) |pfd| {
         var buf: [32]u8 = undefined;
         const n = try posix.read(pfd, &buf);
-        try testing.expectEqual(@as(usize, 13), n); // 2 header + 11 payload
+        try testing.expectEqual(@as(usize, 13), n);
         try testing.expectEqual(@as(u8, 0x81), buf[0]);
         try testing.expectEqual(@as(u8, 11), buf[1]);
         try testing.expectEqualStrings("hello world", buf[2..13]);
     }
 
-    // Manual cleanup since we skipped the loop. We close each injected
-    // client by hand (the FDs were never registered with the loop), then
-    // free the slot table — mirror of what `deinit` would do without the
-    // `loop.removeFd` calls.
     for (server.clients) |*slot| {
         if (slot.*) |cli| {
             posix.close(cli.fd);
@@ -1004,9 +810,6 @@ test "ws: broadcast to 3 in-memory clients all receive the same frame" {
 }
 
 test "ws: init rejects max_clients == 0" {
-    // 9B.1.2: guard against a misconfigured `websocket_max_clients = 0`
-    // that slipped past the config parser — fail closed rather than
-    // silently fall back to a default.
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const a = testing.allocator;
     var loop = try EventLoop.init(a);
@@ -1015,8 +818,6 @@ test "ws: init rejects max_clients == 0" {
 }
 
 test "ws: init rejects max_clients above hard_max_clients" {
-    // 9B.1.2: operator cannot ask us to allocate an unbounded slot table
-    // via a huge `websocket_max_clients`. Hard cap at `hard_max_clients`.
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const a = testing.allocator;
     var loop = try EventLoop.init(a);
@@ -1028,9 +829,6 @@ test "ws: init rejects max_clients above hard_max_clients" {
 }
 
 test "ws: init with custom max_clients sizes slot table" {
-    // 9B.1.2: the slot table length must equal the configured cap, so
-    // admission-testing by counting successful `admitUpgraded` calls is
-    // meaningful.
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const a = testing.allocator;
     var loop = try EventLoop.init(a);
@@ -1040,22 +838,12 @@ test "ws: init with custom max_clients sizes slot table" {
     defer server.deinit();
     try testing.expectEqual(@as(usize, 3), server.clients.len);
 
-    // Also honours the boundary at `hard_max_clients` exactly.
     var big = try WsServer.init(a, &loop, hard_max_clients);
     defer big.deinit();
     try testing.expectEqual(hard_max_clients, big.clients.len);
 }
 
 test "ws: dispatchFrame returns error on close/binary/unknown (no self-close UAF)" {
-    // Regression for a SEGV observed on the demo VM 2026-04-22: scanner
-    // sent a CLOSE frame, dispatchFrame called closeClient() and freed
-    // the ClientReg, then returned success, and readFrames' subsequent
-    // `cursor += parse.consumed; while (cursor < cli.len)` dereferenced
-    // freed memory.
-    //
-    // The contract is: dispatchFrame MUST return an error on any opcode
-    // that warrants closing the client. The caller's catch branch then
-    // closes exactly once; there is never a UAF.
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const a = testing.allocator;
     var loop = try EventLoop.init(a);
@@ -1063,8 +851,6 @@ test "ws: dispatchFrame returns error on close/binary/unknown (no self-close UAF
     var server = try WsServer.init(a, &loop, default_max_clients);
     defer server.deinit();
 
-    // Socketpair so dispatchFrame's `posix.write(cli.fd, close_frame)`
-    // doesn't fail on a closed fd.
     var fds: [2]i32 = undefined;
     const stype_u32: u32 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
     switch (posix.errno(linux.socketpair(
@@ -1079,7 +865,6 @@ test "ws: dispatchFrame returns error on close/binary/unknown (no self-close UAF
     defer posix.close(fds[1]);
     try server.admitUpgraded(fds[0], &.{});
 
-    // Grab the ClientReg the server just registered.
     var cli: *ClientReg = undefined;
     for (server.clients) |slot| {
         if (slot) |c| {
@@ -1088,25 +873,19 @@ test "ws: dispatchFrame returns error on close/binary/unknown (no self-close UAF
         }
     } else return error.Unexpected;
 
-    // .close -> ClientClosing (not success, not a self-close).
     try testing.expectError(
         error.ClientClosing,
         server.dispatchFrame(cli, .{ .opcode = .close, .fin = true, .payload = &.{}, .consumed = 2 }),
     );
-    // .binary -> UnsupportedOpcode.
     try testing.expectError(
         error.UnsupportedOpcode,
         server.dispatchFrame(cli, .{ .opcode = .binary, .fin = true, .payload = &.{}, .consumed = 2 }),
     );
-    // Reserved opcode (continuation bit, say 0x3) -> UnsupportedOpcode.
     try testing.expectError(
         error.UnsupportedOpcode,
         server.dispatchFrame(cli, .{ .opcode = @enumFromInt(@as(u4, 3)), .fin = true, .payload = &.{}, .consumed = 2 }),
     );
 
-    // After all three error returns, the slot MUST still point at our
-    // ClientReg — dispatchFrame did not call closeClient itself. The
-    // caller (readFrames) would close on catch; we skip that here.
     var still_alive = false;
     for (server.clients) |slot| {
         if (slot) |c| {

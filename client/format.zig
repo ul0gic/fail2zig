@@ -1,30 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Output formatters for fail2zig-client responses.
-//!
-//! Three modes, selected by `OutputFormat`:
-//!   - table:  Human-readable. Box-drawing characters for the status view,
-//!             fixed-width columns for lists. ANSI color when stdout is a TTY
-//!             and the user hasn't passed --no-color.
-//!   - json:   Pretty-printed JSON. One root object per response. Scriptable.
-//!   - plain:  Tab-separated values, one record per line, no headers. Easy
-//!             to pipe into awk/cut/wc.
-//!
-//! The daemon returns a JSON payload inside `Response.ok.payload`. This
-//! module defines tolerant schemas for each response shape: every field is
-//! optional with a sensible default, so changes to the daemon's JSON (adding
-//! new fields, renaming obscure ones) don't break the client — they just
-//! show `-` in the table or are omitted from plain output.
 
 const std = @import("std");
 const shared = @import("shared");
 const args = @import("args.zig");
 
 pub const OutputFormat = args.OutputFormat;
-
-// ============================================================================
-// ANSI color helpers
-// ============================================================================
 
 pub const Color = struct {
     enabled: bool,
@@ -53,42 +34,25 @@ pub const Color = struct {
     }
 };
 
-/// Decide whether color should be emitted. `--no-color` wins. Otherwise color
-/// only if stdout is a TTY.
 pub fn shouldColor(allow_color: bool) bool {
     if (!allow_color) return false;
     const fd = std.io.getStdOut().handle;
     return std.posix.isatty(fd);
 }
 
-// ============================================================================
-// Response schemas
-// ============================================================================
-
-/// Daemon status response. Fields optional — client tolerates missing data.
 pub const StatusPayload = struct {
     version: ?[]const u8 = null,
     uptime_seconds: ?u64 = null,
     memory_bytes_used: ?u64 = null,
     memory_bytes_limit: ?u64 = null,
     active_bans: ?u32 = null,
-    /// Lifetime total bans issued by the daemon (SYS-017). Renamed from the
-    /// placeholder `total_bans_24h` — the daemon tracks lifetime, not a 24h
-    /// window, so the misleading `(24h)` suffix is dropped. Optional so an
-    /// older daemon that omits it renders "-".
     total_bans: ?u64 = null,
-    parse_rate: ?f64 = null, // lines/sec
-    /// Enforcement posture resolved across enabled jails by the daemon:
-    /// "active" (all enforcing), "log-only" (all non-enforcing), or
-    /// "mixed". Optional so an older daemon that omits it renders "-".
+    parse_rate: ?f64 = null,
     protection: ?[]const u8 = null,
     backend: ?[]const u8 = null,
     jails_active: ?u32 = null,
 };
 
-/// Matches the JSON emitted by `engine/net/commands.zig::writeListEntry`.
-/// `ban_expiry` is an absolute unix timestamp in seconds; the "time left"
-/// column is computed locally from `ban_expiry - now`.
 pub const BanEntry = struct {
     ip: ?[]const u8 = null,
     jail: ?[]const u8 = null,
@@ -98,9 +62,6 @@ pub const BanEntry = struct {
     ban_expiry: ?i64 = null,
 };
 
-/// Matches the JSON emitted by `engine/net/commands.zig::handleListJails`.
-/// Shows the effective `maxretry / findtime / bantime` the daemon resolved
-/// for each jail from its config + inherited defaults.
 pub const JailEntry = struct {
     name: ?[]const u8 = null,
     enabled: ?bool = null,
@@ -108,22 +69,10 @@ pub const JailEntry = struct {
     maxretry: ?u32 = null,
     findtime: ?u32 = null,
     bantime: ?u32 = null,
-    /// Effective banaction tag the daemon resolved for this jail
-    /// (`nftables`/`ipset`/`iptables`/`log-only`). Optional so an older
-    /// daemon that omits it renders "-".
     action: ?[]const u8 = null,
-    /// Whether this jail actually touches the firewall. False for a
-    /// `log-only` jail (records intent, no enforcement).
     enforcing: ?bool = null,
-    /// Display label for this jail's log source (SYS-017): a journald
-    /// selector (`journald (sshd)`) or a file path. Optional → older
-    /// daemons render "-".
     log_source: ?[]const u8 = null,
-    /// Tri-state read-health of the log source (SYS-017): `true` healthy,
-    /// `false` unhealthy (a genuine negative probe — journald only),
-    /// absent/null = unknown (no signal yet, or a best-effort file source).
     source_healthy: ?bool = null,
-    /// Lines this jail's source has delivered, lifetime (read-health proxy).
     lines_seen: ?u64 = null,
 };
 
@@ -137,24 +86,20 @@ pub const BanActionPayload = struct {
     ip: ?[]const u8 = null,
     jail: ?[]const u8 = null,
     duration_seconds: ?u64 = null,
-    result: ?[]const u8 = null, // e.g. "banned", "already_banned"
+    result: ?[]const u8 = null,
 };
 
 pub const UnbanActionPayload = struct {
     ip: ?[]const u8 = null,
     jail: ?[]const u8 = null,
-    result: ?[]const u8 = null, // e.g. "unbanned", "not_found"
+    result: ?[]const u8 = null,
 };
 
 pub const ReloadPayload = struct {
-    result: ?[]const u8 = null, // e.g. "reloaded"
+    result: ?[]const u8 = null,
     jails_loaded: ?u32 = null,
     warnings: ?[]const []const u8 = null,
 };
-
-// ============================================================================
-// Status
-// ============================================================================
 
 pub fn formatStatus(
     allocator: std.mem.Allocator,
@@ -207,7 +152,6 @@ fn writeStatusPlain(writer: anytype, s: StatusPayload) !void {
 fn writeStatusTable(writer: anytype, s: StatusPayload, color: Color) !void {
     const width: usize = 44;
     try drawTopLine(writer, width);
-    // Header
     try writer.writeAll("| ");
     try color.on(writer, Color.bold);
     try writer.print("fail2zig", .{});
@@ -233,14 +177,13 @@ fn writeStatusTable(writer: anytype, s: StatusPayload, color: Color) !void {
 }
 
 fn versionLen(v: ?[]const u8) usize {
-    if (v) |s| return s.len + 1; // leading space
+    if (v) |s| return s.len + 1;
     return 0;
 }
 
 fn rowLabel(writer: anytype, label: []const u8, value: []const u8, width: usize) !void {
     try writer.writeAll("| ");
     try writer.writeAll(label);
-    // Target: label in 13-char column, then value.
     const label_col = 13;
     if (label.len < label_col) {
         try writeSpaces(writer, label_col - label.len);
@@ -283,10 +226,6 @@ fn writeSpaces(writer: anytype, n: usize) !void {
 fn padTo(writer: anytype, used: usize, target: usize) !void {
     if (used < target) try writeSpaces(writer, target - used);
 }
-
-// ============================================================================
-// Human-readable formatters for status fields (use small stack buffers)
-// ============================================================================
 
 threadlocal var scratch: [64]u8 = undefined;
 
@@ -335,10 +274,6 @@ fn formatOptU64(opt: ?u64) []const u8 {
     const out = std.fmt.bufPrint(&scratch, "{d}", .{v}) catch return "-";
     return out;
 }
-
-// ============================================================================
-// List (active bans)
-// ============================================================================
 
 pub fn formatList(
     allocator: std.mem.Allocator,
@@ -399,9 +334,6 @@ fn writeListTable(writer: anytype, entries: []const BanEntry, color: Color, now:
     }
 
     const ip_col: usize = 18;
-    // Jail names can be hyphenated (e.g. `nginx-http-auth`, 15 chars).
-    // Width chosen to fit the longest built-in filter name with a
-    // single trailing space so it doesn't bleed into TIME LEFT.
     const jail_col: usize = 18;
     const time_col: usize = 12;
     const count_col: usize = 10;
@@ -451,10 +383,6 @@ fn formatOptU32Local(opt: ?u32) []const u8 {
     return out;
 }
 
-// ============================================================================
-// Jails
-// ============================================================================
-
 pub fn formatJails(
     allocator: std.mem.Allocator,
     writer: anytype,
@@ -492,8 +420,6 @@ pub fn formatJails(
 
 fn writeJailsPlain(writer: anytype, jails: []const JailEntry) !void {
     for (jails) |j| {
-        // SYS-017 appends three columns: source, source_healthy (tri-state),
-        // lines_seen. Older daemons omit them → "-"/"0".
         try writer.print("{s}\t{s}\t{d}\t{d}\t{d}\t{d}\t{s}\t{s}\t{s}\t{s}\t{d}\n", .{
             j.name orelse "-",
             if (j.enabled orelse false) "enabled" else "disabled",
@@ -510,8 +436,6 @@ fn writeJailsPlain(writer: anytype, jails: []const JailEntry) !void {
     }
 }
 
-/// Tri-state source-health → plain string. `null` (unknown) renders
-/// "unknown", never a misleading "healthy"/"unhealthy".
 fn sourceHealthStr(opt: ?bool) []const u8 {
     const h = opt orelse return "unknown";
     return if (h) "healthy" else "unhealthy";
@@ -566,8 +490,6 @@ fn writeJailsTable(writer: anytype, jails: []const JailEntry, color: Color) !voi
         try padRightPrint(writer, formatDurationSecs(j.findtime), find_col);
         try padRightPrint(writer, formatDurationSecs(j.bantime), ban_col);
         try padRightPrint(writer, j.action orelse "-", action_col);
-        // A non-enforcing jail is the surprising state — tint it yellow so
-        // an operator notices a jail that watches but never bans.
         if (j.enforcing) |e| {
             try color.on(writer, if (e) Color.green else Color.yellow);
             try padRightPrint(writer, if (e) "true" else "false", enforce_col);
@@ -575,10 +497,6 @@ fn writeJailsTable(writer: anytype, jails: []const JailEntry, color: Color) !voi
         } else {
             try padRightPrint(writer, "-", enforce_col);
         }
-        // SYS-017: source path/label + a health glyph. `source_healthy ==
-        // false` is the surprising state (a jail reading nothing) — tint it
-        // yellow, mirroring the non-enforcing precedent above. Unknown is
-        // neutral (no tint).
         try padRightPrint(writer, j.log_source orelse "-", source_col);
         if (j.source_healthy) |h| {
             try color.on(writer, if (h) Color.green else Color.yellow);
@@ -611,10 +529,6 @@ fn formatDurationSecs(opt: ?u32) []const u8 {
     return out;
 }
 
-// ============================================================================
-// Version
-// ============================================================================
-
 pub fn formatVersion(
     allocator: std.mem.Allocator,
     writer: anytype,
@@ -626,7 +540,6 @@ pub fn formatVersion(
     _ = color;
     switch (fmt) {
         .json => {
-            // Wrap daemon payload + client version in a single JSON object.
             try writer.print(
                 \\{{"client_version":"{s}","daemon":
             , .{client_version});
@@ -671,10 +584,6 @@ pub fn formatVersion(
         },
     }
 }
-
-// ============================================================================
-// Ban / Unban / Reload — simple action responses
-// ============================================================================
 
 pub fn formatBan(
     allocator: std.mem.Allocator,
@@ -821,10 +730,6 @@ pub fn formatReload(
     }
 }
 
-// ============================================================================
-// Error formatter — used for Response.err across all modes
-// ============================================================================
-
 pub fn formatError(
     writer: anytype,
     code: u16,
@@ -843,10 +748,6 @@ pub fn formatError(
         },
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 const testing = std.testing;
 
@@ -870,10 +771,8 @@ test "format: status table shows box lines and version" {
     try testing.expect(std.mem.indexOf(u8, out, "1d 0h 1m 1s") != null);
     try testing.expect(std.mem.indexOf(u8, out, "nftables") != null);
     try testing.expect(std.mem.indexOf(u8, out, "142") != null);
-    // SYS-017: lifetime total bans, no longer the misleading "(24h)" suffix.
     try testing.expect(std.mem.indexOf(u8, out, "3891") != null);
     try testing.expect(std.mem.indexOf(u8, out, "(24h)") == null);
-    // Jails rollup now actually populated.
     try testing.expect(std.mem.indexOf(u8, out, "8") != null);
 }
 
@@ -930,7 +829,6 @@ test "format: status plain renders protection when present" {
 }
 
 test "format: status table tolerates missing protection (older daemon)" {
-    // No protection field -> the row still draws with "-".
     const payload = "{\"backend\":\"nftables\"}";
     const out = try runStatus(testing.allocator, payload, .table);
     defer testing.allocator.free(out);
@@ -945,11 +843,6 @@ fn runList(alloc: std.mem.Allocator, payload: []const u8, fmt: OutputFormat) ![]
 }
 
 test "format: list table with entries (daemon-shape JSON, SYS-002)" {
-    // Matches engine/net/commands.zig::writeListEntry output exactly.
-    // ban_expiry is an absolute unix timestamp; table must compute "time left"
-    // from it using std.time.timestamp(). We can't pin the result without
-    // mocking the clock, but we can assert on the IPs, column headers and
-    // total count -- same shape real daemons produce.
     const payload =
         \\[
         \\  {"ip":"45.227.253.98","jail":"sshd","attempt_count":5,"last_attempt":0,"ban_count":3,"ban_expiry":9999999999},
@@ -966,7 +859,6 @@ test "format: list table with entries (daemon-shape JSON, SYS-002)" {
     try testing.expect(std.mem.indexOf(u8, out, "103.144.82.210") != null);
     try testing.expect(std.mem.indexOf(u8, out, "sshd") != null);
     try testing.expect(std.mem.indexOf(u8, out, "Total: 2 active bans") != null);
-    // Country column has been removed (GeoIP is a Phase 2 feature).
     try testing.expect(std.mem.indexOf(u8, out, "COUNTRY") == null);
 }
 
@@ -981,15 +873,11 @@ test "format: list plain tab-separated (SYS-002)" {
     const payload = "[{\"ip\":\"1.2.3.4\",\"jail\":\"sshd\",\"attempt_count\":3,\"last_attempt\":0,\"ban_count\":2,\"ban_expiry\":9999999999}]";
     const out = try runList(testing.allocator, payload, .plain);
     defer testing.allocator.free(out);
-    // Four tab-separated columns: ip, jail, remaining_seconds, ban_count.
-    // remaining is clock-dependent so we assert only on the stable prefix.
     try testing.expect(std.mem.startsWith(u8, out, "1.2.3.4\tsshd\t"));
     try testing.expect(std.mem.endsWith(u8, out, "\t2\n"));
 }
 
 test "format: list expired entry shows 'expired' (SYS-002)" {
-    // ban_expiry in the past (year 2001) must render as "expired" rather than
-    // a negative number or garbage.
     const payload = "[{\"ip\":\"5.5.5.5\",\"jail\":\"sshd\",\"attempt_count\":3,\"last_attempt\":0,\"ban_count\":1,\"ban_expiry\":1000000000}]";
     const out = try runList(testing.allocator, payload, .table);
     defer testing.allocator.free(out);
@@ -1004,9 +892,6 @@ test "format: list json passes through (SYS-002)" {
 }
 
 test "format: list rejects object-shape payload (SYS-002 regression)" {
-    // The old wrapper shape would have succeeded before SYS-002 was filed;
-    // the new parser must reject it so a future regression can't silently
-    // drift the wire format again.
     const payload = "{\"entries\":[]}";
     const out = try runList(testing.allocator, payload, .table);
     defer testing.allocator.free(out);
@@ -1021,7 +906,6 @@ fn runJails(alloc: std.mem.Allocator, payload: []const u8, fmt: OutputFormat) ![
 }
 
 test "format: jails table (daemon-shape JSON, SYS-002)" {
-    // Matches engine/net/commands.zig::handleListJails output exactly.
     const payload =
         \\[
         \\  {"name":"sshd","enabled":true,"active_bans":5,"maxretry":3,"findtime":600,"bantime":3600},
@@ -1039,19 +923,14 @@ test "format: jails table (daemon-shape JSON, SYS-002)" {
     try testing.expect(std.mem.indexOf(u8, out, "enabled") != null);
     try testing.expect(std.mem.indexOf(u8, out, "disabled") != null);
     try testing.expect(std.mem.indexOf(u8, out, "Total: 2 jails") != null);
-    // TOTAL and BACKEND columns removed (not per-jail data in v0.1.0).
     try testing.expect(std.mem.indexOf(u8, out, "TOTAL") == null);
     try testing.expect(std.mem.indexOf(u8, out, "BACKEND") == null);
 }
 
 test "format: jails plain (SYS-002)" {
-    // No action/enforcing/source in the payload (older daemon) -> those
-    // columns render "-"/"unknown"/"0" while the original six are unchanged.
     const payload = "[{\"name\":\"sshd\",\"enabled\":true,\"active_bans\":1,\"maxretry\":3,\"findtime\":600,\"bantime\":300}]";
     const out = try runJails(testing.allocator, payload, .plain);
     defer testing.allocator.free(out);
-    // Eleven tab-separated columns: name, state, active, maxretry, findtime,
-    // bantime, action, enforcing, source, source_healthy, lines_seen.
     try testing.expect(std.mem.indexOf(u8, out, "sshd\tenabled\t1\t3\t600\t300\t-\t-\t-\tunknown\t0\n") != null);
 }
 
@@ -1062,7 +941,6 @@ test "format: jails empty table (SYS-002)" {
 }
 
 test "format: jails human duration formatting (SYS-002)" {
-    // findtime=600 -> "10m", bantime=86400 -> "1d".
     const payload = "[{\"name\":\"sshd\",\"enabled\":true,\"active_bans\":0,\"maxretry\":3,\"findtime\":600,\"bantime\":86400}]";
     const out = try runJails(testing.allocator, payload, .table);
     defer testing.allocator.free(out);
@@ -1098,8 +976,6 @@ test "format: jails plain renders action and enforcing (SYS-017)" {
     const payload = "[{\"name\":\"sshd-test\",\"enabled\":true,\"active_bans\":0,\"maxretry\":3,\"findtime\":600,\"bantime\":600,\"action\":\"log-only\",\"enforcing\":false}]";
     const out = try runJails(testing.allocator, payload, .plain);
     defer testing.allocator.free(out);
-    // Trailing source columns render "-"/"unknown"/"0" when the daemon
-    // omits them (this older-shape payload has no log_source/health).
     try testing.expect(std.mem.indexOf(u8, out, "sshd-test\tenabled\t0\t3\t600\t600\tlog-only\tfalse\t-\tunknown\t0\n") != null);
 }
 
@@ -1108,7 +984,6 @@ test "format: status renders protection degraded (SYS-017)" {
     const table = try runStatus(testing.allocator, payload, .table);
     defer testing.allocator.free(table);
     try testing.expect(std.mem.indexOf(u8, table, "degraded") != null);
-    // Rollups populated.
     try testing.expect(std.mem.indexOf(u8, table, "Total bans:") != null);
     try testing.expect(std.mem.indexOf(u8, table, "7") != null);
 
@@ -1130,17 +1005,13 @@ test "format: jails table renders source + health, tints broken (SYS-017)" {
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "SOURCE") != null);
     try testing.expect(std.mem.indexOf(u8, out, "HEALTH") != null);
-    // sshd: journald source, unhealthy -> "broken".
     try testing.expect(std.mem.indexOf(u8, out, "journald (sshd)") != null);
     try testing.expect(std.mem.indexOf(u8, out, "broken") != null);
-    // nginx: file path, unknown health -> "unknown".
     try testing.expect(std.mem.indexOf(u8, out, "/var/log/nginx/error.log") != null);
     try testing.expect(std.mem.indexOf(u8, out, "unknown") != null);
 }
 
 test "format: jails table tolerates missing source fields (older daemon, SYS-017)" {
-    // No log_source/source_healthy/lines_seen -> "-"/"unknown" columns,
-    // original columns intact.
     const payload = "[{\"name\":\"sshd\",\"enabled\":true,\"active_bans\":0,\"maxretry\":3,\"findtime\":600,\"bantime\":3600,\"action\":\"nftables\",\"enforcing\":true}]";
     const out = try runJails(testing.allocator, payload, .table);
     defer testing.allocator.free(out);

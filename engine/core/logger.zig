@@ -1,18 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Operational logger for the fail2zig daemon.
-//!
-//! This is for fail2zig's OWN logs — startup messages, errors, metrics.
-//! It is NOT the log ingestion layer that parses third-party logs.
-//!
-//! Design invariants:
-//!   * Zero allocation per log call. Output is formatted into a
-//!     stack-allocated 4 KB buffer and written in one go.
-//!   * JSON line-per-log (ndjson). Fields are quoted, escapes
-//!     minimal but correct for `\"` and `\\`.
-//!   * Thread-safe via `std.Thread.Mutex` around the final write.
-//!   * Configurable minimum level — messages below it are dropped
-//!     before any formatting work.
 
 const std = @import("std");
 
@@ -32,8 +19,6 @@ pub const Level = enum(u2) {
     }
 };
 
-/// One structured key-value pair to attach to a log line. Values are
-/// emitted as JSON scalars or strings depending on the variant.
 pub const Field = struct {
     key: []const u8,
     value: Value,
@@ -66,8 +51,6 @@ pub const Field = struct {
 pub const max_line_bytes: usize = 4096;
 
 pub const Logger = struct {
-    /// Writer that receives one ndjson line per call. Stderr is the
-    /// default in production. Tests inject an `std.ArrayList(u8).Writer`.
     writer: std.io.AnyWriter,
     min_level: Level,
     component: []const u8,
@@ -119,9 +102,6 @@ pub const Logger = struct {
         self.log(.err, fmt, args, fields);
     }
 
-    /// Emit a log line at `level`. Silently drops if below min_level.
-    /// Silently truncates if the formatted line would exceed
-    /// `max_line_bytes` — we never allocate to make room.
     pub fn log(
         self: *Logger,
         level: Level,
@@ -136,9 +116,6 @@ pub const Logger = struct {
         const w = fbs.writer();
 
         writeLine(w, level, self.component, fmt, args, fields) catch {
-            // Formatting produced more bytes than our fixed buffer.
-            // Fall back to a minimal error record so we still emit
-            // *something* rather than dropping silently.
             fbs.reset();
             writeLine(w, .err, self.component, "log truncated", .{}, &.{}) catch return;
         };
@@ -147,14 +124,9 @@ pub const Logger = struct {
 
         self.mutex.lock();
         defer self.mutex.unlock();
-        // A single write is intentional — one ndjson line per syscall.
         _ = self.writer.writeAll(bytes) catch return;
     }
 };
-
-// ============================================================================
-// JSON emit helpers (file-private)
-// ============================================================================
 
 fn writeLine(
     w: anytype,
@@ -179,10 +151,6 @@ fn writeLine(
     try w.writeAll("\",");
 
     try w.writeAll("\"msg\":\"");
-    // Format the message into a small scratch buffer so we can emit it
-    // as a correctly-escaped JSON string. Reusing the line buffer in
-    // place is possible but wrappers around `std.fmt.format` make this
-    // cleaner and the ~256 byte msg is plenty for log messages.
     var msg_buf: [1024]u8 = undefined;
     var msg_fbs = std.io.fixedBufferStream(&msg_buf);
     try std.fmt.format(msg_fbs.writer(), fmt, args);
@@ -214,9 +182,6 @@ fn writeFieldValue(w: anytype, v: Field.Value) !void {
     }
 }
 
-/// JSON-escape a string. We only emit the mandatory minimum: `"`, `\`,
-/// and control bytes below 0x20 go through `\uXXXX`. Multibyte UTF-8 is
-/// passed through unchanged — valid UTF-8 is valid JSON per RFC 8259.
 fn writeEscaped(w: anytype, s: []const u8) !void {
     var i: usize = 0;
     while (i < s.len) : (i += 1) {
@@ -235,9 +200,6 @@ fn writeEscaped(w: anytype, s: []const u8) !void {
     }
 }
 
-/// Very small ISO-8601 formatter for a unix epoch timestamp. Emits the
-/// `YYYY-MM-DDTHH:MM:SSZ` form (UTC). No fractional seconds. Stable
-/// across architectures because we use the raw epoch math.
 fn writeIso8601(w: anytype, epoch_seconds: i64) !void {
     const es = std.time.epoch.EpochSeconds{ .secs = @intCast(@max(epoch_seconds, 0)) };
     const day = es.getEpochDay();
@@ -257,10 +219,6 @@ fn writeIso8601(w: anytype, epoch_seconds: i64) !void {
         s,
     });
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 const testing = std.testing;
 
@@ -301,7 +259,6 @@ test "Logger: filters below min_level" {
     logger.warn("shown", .{}, &.{});
     logger.err("also shown", .{}, &.{});
 
-    // Count newlines — should be exactly 2.
     var nl_count: usize = 0;
     for (buf.items) |c| if (c == '\n') {
         nl_count += 1;
@@ -320,7 +277,6 @@ test "Logger: escapes quotes and backslashes" {
     var parsed = try parseLine(testing.allocator, line);
     defer parsed.deinit();
     const msg = parsed.value.object.get("msg").?.string;
-    // Parsed msg should have literal chars back.
     try testing.expect(std.mem.indexOf(u8, msg, "quote=\"") != null);
     try testing.expect(std.mem.indexOf(u8, msg, "backslash=\\") != null);
     try testing.expect(std.mem.indexOf(u8, msg, "newline=\n") != null);
@@ -343,7 +299,6 @@ test "Logger: emits bool, uint, float fields" {
     const obj = parsed.value.object;
     try testing.expectEqual(true, obj.get("ok").?.bool);
     try testing.expectEqual(@as(i64, 1_234_567), obj.get("count").?.integer);
-    // Float parse tolerance — JSON parses small floats exactly.
     try testing.expectEqual(@as(f64, 3.14), obj.get("ratio").?.float);
 }
 
@@ -409,7 +364,6 @@ test "Logger: thread-safe concurrent writes do not interleave bytes" {
     t1.join();
     t2.join();
 
-    // Every line must parse as valid JSON — interleaving would break it.
     var it = std.mem.splitScalar(u8, buf.items, '\n');
     var count: usize = 0;
     while (it.next()) |line| {

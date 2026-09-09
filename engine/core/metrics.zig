@@ -1,59 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Metrics collector — lock-free atomic counters for the fail2zig daemon.
-//!
-//! The daemon's hot paths (log parser, state tracker, firewall backend)
-//! touch these counters on every event; the cold paths (HTTP metrics
-//! endpoint, IPC status command, WebSocket broadcast) read them via
-//! `snapshot()`. All operations use `.monotonic` ordering — we only
-//! need per-counter atomicity, not cross-counter consistency. Readers
-//! accept that a snapshot may capture the "middle" of a batch update;
-//! for rate-limiting and operator display that is correct by design.
-//!
-//! Per-jail stats live in a fixed-size array, indexed by a jail name
-//! we look up with a linear scan. 64 jails is a deliberate ceiling —
-//! exceeding it is a configuration smell, not a deployment pattern,
-//! and we'd rather surface the limit than silently grow.
-//!
-//! No allocations: the struct and its per-jail array are embedded in
-//! the daemon's long-lived context. Construct once at startup, never
-//! resize.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
-// ============================================================================
-// Counter — portable 64-bit monotonic counter
-// ============================================================================
-//
-// Our counters are u64 so a long-running daemon never wraps a lifetime total
-// (bans_total, lines_parsed_total) on a busy server. The problem: 32-bit
-// targets without native 64-bit CAS (arm-linux-musleabihf pre-LSE, mips) have
-// NO hardware instruction to atomically read-modify-write a u64, so
-// `std.atomic.Value(u64)` is REJECTED at compile time on those arches. x86_64
-// (cmpxchg16b) and aarch64 (LSE) compile fine, which is why this only shows up
-// when cross-compiling to embedded targets.
-//
-// Fix: `Counter` is a conditional type with one public API across all arches:
-//   - 64-bit targets  -> `AtomicCounter`: lock-free `std.atomic.Value(u64)`,
-//                        `.monotonic` ordering baked in (independent counters,
-//                        no cross-counter invariants — see module doc).
-//   - 32-bit targets  -> `MutexCounter`: a plain u64 guarded by a
-//                        `std.Thread.Mutex`. An uncontended mutex is ~tens of
-//                        ns; these are per-event increments + periodic snapshot
-//                        reads, so the cost is negligible and correctness holds
-//                        on every arch.
-//
-// Both expose identical methods (`init`/`inc`/`load`/`store`) so call sites
-// never branch on architecture. `MutexCounter` holds a mutex by value, which is
-// only sound because `Metrics`/`PerJail` are constructed once and thereafter
-// accessed exclusively through `*Metrics` — they are never copied by value
-// (snapshot() reads each counter through `load()` into a plain-u64 `Snapshot`,
-// never memcpy of the Counter itself).
-
-/// Lock-free counter for arches with native 64-bit atomics. `.monotonic`
-/// ordering is baked in: we only need per-counter atomicity, not cross-counter
-/// consistency (readers may observe the middle of a batch update by design).
 const AtomicCounter = struct {
     value: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
@@ -61,13 +11,10 @@ const AtomicCounter = struct {
         return .{ .value = std.atomic.Value(u64).init(v) };
     }
 
-    /// Atomically add 1. Hot path.
     fn inc(self: *AtomicCounter) void {
         _ = self.value.fetchAdd(1, .monotonic);
     }
 
-    // `self` is non-const to mirror MutexCounter.load (which must lock).
-    // Keeping the signatures identical lets call sites stay arch-agnostic.
     fn load(self: *AtomicCounter) u64 {
         return self.value.load(.monotonic);
     }
@@ -77,9 +24,6 @@ const AtomicCounter = struct {
     }
 };
 
-/// Mutex-guarded counter for 32-bit arches that lack a native 64-bit atomic.
-/// The mutex provides ordering, so no atomic ordering parameter is needed. Held
-/// by value — safe because Metrics/PerJail are never copied (see note above).
 const MutexCounter = struct {
     mutex: std.Thread.Mutex = .{},
     value: u64 = 0,
@@ -88,7 +32,6 @@ const MutexCounter = struct {
         return .{ .value = v };
     }
 
-    /// Add 1 under the lock. Critical section is a single u64 increment.
     fn inc(self: *MutexCounter) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -108,33 +51,14 @@ const MutexCounter = struct {
     }
 };
 
-/// Portable 64-bit monotonic counter. Lock-free on 64-bit targets,
-/// mutex-guarded on 32-bit targets (which lack native 64-bit atomics). Same API
-/// on both — call sites never branch on architecture. See the block comment
-/// above for the full rationale.
 const Counter = if (@bitSizeOf(usize) >= 64) AtomicCounter else MutexCounter;
 
-/// Hard upper bound on per-jail slots. Matches the configuration cap
-/// in `config.native` (no jail configuration beyond this ceiling is
-/// allowed). If a jail is registered beyond this, updates for it are
-/// silently ignored and a debug log is emitted once.
 pub const max_jails: usize = 64;
 
-/// Max jail-name length. Must be >= JailId.max_len in shared/types.zig
-/// so every valid jail id fits.
 pub const max_jail_name_len: usize = 64;
 
-/// Counter ordering used for every atomic update. `.monotonic` is
-/// enough because these are independent counters — no cross-counter
-/// invariants to preserve.
 const counter_order: std.builtin.AtomicOrder = .monotonic;
 
-// ============================================================================
-// Per-jail record
-// ============================================================================
-
-/// One fixed-size entry per jail. Zero-initialized; `name_len == 0`
-/// marks an empty slot.
 pub const PerJail = struct {
     name_buf: [max_jail_name_len]u8 = [_]u8{0} ** max_jail_name_len,
     name_len: u8 = 0,
@@ -142,8 +66,6 @@ pub const PerJail = struct {
     lines_matched: Counter = .{},
     bans_total: Counter = .{},
     unbans_total: Counter = .{},
-    // active_bans is u32 — 32-bit atomics are native on every target, so
-    // it stays a plain atomic (incl. its saturating fetchSub logic).
     active_bans: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     parse_errors: Counter = .{},
 
@@ -151,10 +73,6 @@ pub const PerJail = struct {
         return self.name_buf[0..self.name_len];
     }
 };
-
-// ============================================================================
-// Snapshot (non-atomic, owned by caller)
-// ============================================================================
 
 pub const PerJailSnapshot = struct {
     name_buf: [max_jail_name_len]u8,
@@ -187,38 +105,21 @@ pub const Snapshot = struct {
     }
 };
 
-// ============================================================================
-// Metrics
-// ============================================================================
-
 pub const Metrics = struct {
-    // Global counters. Field order is intentional: hottest counters
-    // first so they land on the same cache line on typical 64B CPUs
-    // (true on the 64-bit lock-free path; the 32-bit mutex path trades
-    // a little layout density for portability, which is the right call
-    // on the embedded targets that need it).
     lines_parsed: Counter = .{},
     lines_matched: Counter = .{},
     bans_total: Counter = .{},
     unbans_total: Counter = .{},
-    // active_bans is u32 — native 32-bit atomic on every target.
     active_bans: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     parse_errors: Counter = .{},
     memory_bytes_used: Counter = .{},
 
-    // Per-jail entries + number of currently-populated slots. The
-    // `jails_len` field is written only when a new jail is registered;
-    // after startup it's effectively read-only, so we keep it as a
-    // plain `usize` with release-store semantics on first write.
     jails: [max_jails]PerJail = [_]PerJail{.{}} ** max_jails,
     jails_len: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
-    /// Construct an empty Metrics. All counters start at zero.
     pub fn init() Metrics {
         return .{};
     }
-
-    // ----- Global increments -----
 
     pub fn incrementParsed(self: *Metrics) void {
         self.lines_parsed.inc();
@@ -235,7 +136,6 @@ pub const Metrics = struct {
 
     pub fn incrementUnbans(self: *Metrics) void {
         self.unbans_total.inc();
-        // Active bans is a gauge; saturate at zero rather than underflow.
         const prev = self.active_bans.load(counter_order);
         if (prev > 0) {
             _ = self.active_bans.fetchSub(1, counter_order);
@@ -250,35 +150,16 @@ pub const Metrics = struct {
         self.memory_bytes_used.store(bytes);
     }
 
-    /// Directly set the `active_bans` gauge without bumping the
-    /// `bans_total` lifetime counter. Used when reconciling state from
-    /// disk at startup — those bans aren't new, they're just being
-    /// re-surfaced to the running process, so the gauge is the thing
-    /// that needs correcting and the counter stays honest (SYS-007).
     pub fn setActiveBans(self: *Metrics, count: u32) void {
         self.active_bans.store(count, counter_order);
     }
 
-    /// Seed the GLOBAL lifetime `bans_total` counter from persisted state
-    /// at startup (BUG-006). Sets, never adds — the persisted lifetime sum
-    /// is the authority. A persisted monotonic counter that survives
-    /// restarts keeps the human `Total bans` and `/metrics`
-    /// `fail2zig_bans_total` in agreement and always ≥ active bans.
     pub fn setBansTotal(self: *Metrics, count: u64) void {
         self.bans_total.store(count);
     }
 
-    // ----- Per-jail operations -----
-
-    /// Register a jail so future per-jail updates under this name can
-    /// route to a slot. If the jail is already registered, this is a
-    /// no-op. Returns the slot index, or null if the max_jails cap has
-    /// been reached.
-    ///
-    /// Called once per configured jail at startup. NOT hot-path.
     pub fn registerJail(self: *Metrics, name: []const u8) ?usize {
         if (name.len == 0 or name.len > max_jail_name_len) return null;
-        // Linear scan for existing.
         const live = self.jails_len.load(.acquire);
         for (self.jails[0..live], 0..) |*slot, i| {
             if (slot.name_len == name.len and
@@ -295,8 +176,6 @@ pub const Metrics = struct {
         return live;
     }
 
-    /// Find the slot index for an already-registered jail, or null if
-    /// it hasn't been registered. Cheap (linear scan of <=64 entries).
     pub fn jailIndex(self: *const Metrics, name: []const u8) ?usize {
         const live = self.jails_len.load(.acquire);
         for (self.jails[0..live], 0..) |*slot, i| {
@@ -328,16 +207,12 @@ pub const Metrics = struct {
         }
     }
 
-    /// Per-jail counterpart of `setActiveBans`.
     pub fn jailSetActiveBans(self: *Metrics, jail: []const u8, count: u32) void {
         if (self.jailIndex(jail)) |i| {
             self.jails[i].active_bans.store(count, counter_order);
         }
     }
 
-    /// Per-jail counterpart of `setBansTotal` — seed a jail's lifetime
-    /// `bans_total` from persisted state (BUG-006). No-op for an
-    /// unregistered jail.
     pub fn jailSetBansTotal(self: *Metrics, jail: []const u8, count: u64) void {
         if (self.jailIndex(jail)) |i| {
             self.jails[i].bans_total.store(count);
@@ -360,13 +235,6 @@ pub const Metrics = struct {
         }
     }
 
-    // ----- Snapshot -----
-
-    /// Take a consistent-per-counter snapshot of all global and
-    /// per-jail values into a plain-u64 `Snapshot` (no allocation, no
-    /// memcpy of any `Counter`). `self` is `*Metrics` (not `*const`)
-    /// because `Counter.load` may take a mutex on 32-bit targets; reads
-    /// never mutate logical counter values.
     pub fn snapshot(self: *Metrics) Snapshot {
         var s = Snapshot{};
         s.lines_parsed = self.lines_parsed.load();
@@ -394,10 +262,6 @@ pub const Metrics = struct {
         return s;
     }
 };
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 const testing = std.testing;
 
@@ -514,7 +378,6 @@ test "metrics: setMemoryBytes updates the memory gauge" {
 test "metrics: BUG-006 setBansTotal / jailSetBansTotal seed the lifetime counters" {
     var m = Metrics.init();
     _ = m.registerJail("sshd");
-    // Seed from persisted lifetime, then a new ban increments on top.
     m.setBansTotal(100);
     m.jailSetBansTotal("sshd", 60);
     var s = m.snapshot();
@@ -528,8 +391,6 @@ test "metrics: BUG-006 setBansTotal / jailSetBansTotal seed the lifetime counter
     try testing.expectEqual(@as(u64, 61), s.perJail()[0].bans_total);
 }
 
-// Threading stress test: 4 threads x 1000 increments. Post-condition
-// must be exactly 4000 — any race would bleed.
 test "metrics: concurrent incrementParsed across 4 threads sums correctly" {
     var m = Metrics.init();
     const Worker = struct {
@@ -579,22 +440,8 @@ test "metrics: concurrent mixed operations preserve totals" {
     try testing.expectEqual(@as(u64, 2000), s.bans_total);
     try testing.expectEqual(@as(u64, 2000), s.unbans_total);
     try testing.expectEqual(@as(u64, 2000), s.perJail()[0].lines_parsed);
-    // active_bans increments by ban, decrements by unban -> net 0.
     try testing.expectEqual(@as(u32, 0), s.active_bans);
 }
-
-// ----------------------------------------------------------------------------
-// Direct Counter-impl coverage
-//
-// On the x86_64 CI host, `Counter` resolves to `AtomicCounter` at comptime, so
-// the production tests above NEVER exercise `MutexCounter` at runtime — the
-// 32-bit mutex path would otherwise be "verified" only by cross-compilation.
-// These tests instantiate BOTH impls explicitly (regardless of host arch) so
-// the mutex logic gets real runtime coverage here, and so AtomicCounter has a
-// symmetric direct test documenting the intended single-threaded contract.
-// File-private `MutexCounter`/`AtomicCounter` are reachable from inline test
-// blocks in the same file, so neither is made `pub` just for testing.
-// ----------------------------------------------------------------------------
 
 test "MutexCounter: single-threaded init/inc/load/store" {
     var c = MutexCounter.init(0);
@@ -607,14 +454,10 @@ test "MutexCounter: single-threaded init/inc/load/store" {
     c.store(123456789);
     try testing.expectEqual(@as(u64, 123456789), c.load());
 
-    // init(v) seeds a non-zero starting value.
     var seeded = MutexCounter.init(42);
     try testing.expectEqual(@as(u64, 42), seeded.load());
 }
 
-// Mirrors the Metrics-level 4x1000 stress test, but drives MutexCounter
-// directly. On x86_64 this is the ONLY runtime proof that the mutex actually
-// serializes concurrent inc() — any lost update would leave load() < 4000.
 test "MutexCounter: 4 threads x 1000 inc serialize to exactly 4000" {
     var c = MutexCounter.init(0);
     const Worker = struct {
@@ -648,9 +491,6 @@ test "AtomicCounter: single-threaded init/inc/load/store" {
     try testing.expectEqual(@as(u64, 42), seeded.load());
 }
 
-// Symmetric to the MutexCounter stress test so both impls have explicit,
-// parallel coverage of concurrent inc(). The production Metrics tests already
-// exercise this path on 64-bit hosts; this one documents intent directly.
 test "AtomicCounter: 4 threads x 1000 inc sum to exactly 4000" {
     var c = AtomicCounter.init(0);
     const Worker = struct {

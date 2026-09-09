@@ -1,17 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Built-in mail-server filters.
-//!
-//! Three filter sets:
-//!   * `postfix`  — SMTP abuse: reject RCPT, SASL auth failure, AUTH disconnect
-//!   * `dovecot`  — IMAP/POP3 auth failures
-//!   * `courier`  — Courier-IMAP login failures
-//!
-//! Postfix log shape (syslog):
-//!   `Apr 21 12:00:00 host postfix/smtpd[PID]: NOQUEUE: reject: RCPT from host[<IP>]: ...`
-//!
-//! Dovecot log shape:
-//!   `Apr 21 12:00:00 host dovecot: imap-login: Disconnected: ... rip=<IP>, lip=..., session=...`
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -19,71 +7,54 @@ const parser = @import("../core/parser.zig");
 
 pub const PatternDef = types.PatternDef;
 
-/// `postfix` — SMTP-level abuse.
 pub const postfix_patterns = [_]PatternDef{
-    // RCPT reject: `NOQUEUE: reject: RCPT from host[1.2.3.4]: ...`
     .{
         .name = "rcpt-reject",
         .match = parser.compile("<*>NOQUEUE: reject: RCPT from <*>[<IP>]"),
     },
-    // SASL auth failure: `warning: host[1.2.3.4]: SASL LOGIN authentication failed`
     .{
         .name = "sasl-auth-failed",
         .match = parser.compile("<*>warning: <*>[<IP>]: SASL <*>authentication failed"),
     },
-    // Lost connection after AUTH: `lost connection after AUTH from host[1.2.3.4]`
     .{
         .name = "lost-connection-auth",
         .match = parser.compile("<*>lost connection after AUTH from <*>[<IP>]"),
     },
-    // Disconnect after EHLO/HELO — DDoS-style hammer.
     .{
         .name = "disconnect-helo",
         .match = parser.compile("<*>disconnect from <*>[<IP>]<*>ehlo=<*>commands="),
     },
 };
 
-/// `dovecot` — IMAP/POP3 login failures.
 pub const dovecot_patterns = [_]PatternDef{
-    // imap-login: Disconnected (auth failed, 1 attempts): rip=1.2.3.4, lip=...
     .{
         .name = "imap-auth-failed",
         .match = parser.compile("<*>imap-login: <*>auth failed<*>rip=<IP>"),
     },
-    // pop3-login equivalent.
     .{
         .name = "pop3-auth-failed",
         .match = parser.compile("<*>pop3-login: <*>auth failed<*>rip=<IP>"),
     },
-    // auth-worker: pam(..., 1.2.3.4): pam_authenticate() failed
     .{
         .name = "pam-auth-failed",
         .match = parser.compile("<*>auth-worker<*>pam(<*>,<IP>)<*>pam_authenticate()"),
     },
-    // "no auth attempts in N secs" — aborted connection after slow-probe.
     .{
         .name = "no-auth-attempts",
         .match = parser.compile("<*>imap-login: <*>no auth attempts<*>rip=<IP>"),
     },
 };
 
-/// `courier` — Courier IMAP login failures.
 pub const courier_patterns = [_]PatternDef{
-    // `LOGIN FAILED, user=x, ip=[::ffff:1.2.3.4]`
     .{
         .name = "login-failed",
         .match = parser.compile("<*>LOGIN FAILED<*>ip=[<IP>"),
     },
-    // `FAILED, ip=[...]` — older format without LOGIN keyword.
     .{
         .name = "auth-failed",
         .match = parser.compile("<*>imaplogin: FAILED<*>ip=[<IP>"),
     },
 };
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 const testing = std.testing;
 

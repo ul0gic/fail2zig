@@ -1,18 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Shell-completion scripts for fail2zig-client.
-//!
-//! Three supported shells: bash, zsh, fish. Each `generate*()` returns a
-//! static string at comptime — no allocation needed. The scripts cover:
-//!   - subcommands: status, ban, unban, list, jails, reload, version,
-//!                  completions, help
-//!   - global flags: --socket, --output, --no-color, --timeout, --help,
-//!                   --version
-//!   - flag values: --output completes to `table json plain`; the
-//!                  `completions` subcommand's first positional completes
-//!                  to `bash zsh fish`.
-//!
-//! Install instructions are included as comments at the top of each script.
 
 const std = @import("std");
 
@@ -27,10 +14,6 @@ pub fn generateZsh() []const u8 {
 pub fn generateFish() []const u8 {
     return fish_script;
 }
-
-// ============================================================================
-// Scripts
-// ============================================================================
 
 const bash_script =
     \\#!/usr/bin/env bash
@@ -257,10 +240,6 @@ const fish_script =
     \\complete -c fail2zig-client -f -n '__fail2zig_client_using_command completions' -a 'bash zsh fish'
     \\
 ;
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 const testing = std.testing;
 

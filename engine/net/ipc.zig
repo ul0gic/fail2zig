@@ -1,31 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Unix-domain socket IPC server for the fail2zig daemon.
-//!
-//! The daemon exposes a single `AF_UNIX` stream socket. `fail2zig-client`
-//! and any other privileged tooling connect to this socket and exchange
-//! length-prefixed messages per `shared/protocol.zig`.
-//!
-//! Wire format (each direction):
-//!   [u32 body_size LE][body bytes]
-//! where body is the command or response body per the shared protocol.
-//!
-//! Security model:
-//!   - Socket file mode is 0660 after bind.
-//!   - Every `accept()` is authenticated via `SO_PEERCRED`. Peers are
-//!     allowed iff uid == 0 OR gid matches the `fail2zig` group.
-//!   - If the `fail2zig` group does not exist, only root is allowed and
-//!     a one-shot warning is logged at startup.
-//!   - Max 8 concurrent client connections; excess accepts are closed
-//!     immediately with a warn log.
-//!
-//! Memory model:
-//!   - One fixed 1 MiB read buffer per client (sized for the max
-//!     legitimate message per `protocol.max_payload_size`).
-//!   - Per-client state is a single allocation; freed on close.
-//!
-//! Threading: the server runs on the daemon's event loop thread. No
-//! internal locking; all callbacks execute serially under epoll.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -38,15 +12,8 @@ const event_loop_mod = @import("../core/event_loop.zig");
 
 const EventLoop = event_loop_mod.EventLoop;
 
-// ============================================================================
-// Public types
-// ============================================================================
-
 pub const max_clients: usize = 8;
 
-/// Per-client read buffer. Must hold one complete max-size frame:
-/// 4-byte length prefix + 1 MiB body. Messages beyond this are rejected
-/// by the deserializer's size check.
 pub const client_buffer_size: usize = protocol.max_payload_size + 4;
 
 pub const Error = error{
@@ -62,14 +29,6 @@ pub const Error = error{
     NotLinux,
 };
 
-/// Vtable-style handle the daemon installs at startup. The server
-/// forwards each decoded command to `dispatch` and serializes whatever
-/// `Response` comes back.
-///
-/// `dispatch` runs on the server's event-loop thread. Any buffers the
-/// handler places in the returned response (`ok.payload`,
-/// `err.message`) must be allocated from the passed-in `allocator`;
-/// the server frees them after serialization.
 pub const CommandHandler = struct {
     ctx: ?*anyopaque = null,
     dispatch: *const fn (
@@ -79,17 +38,6 @@ pub const CommandHandler = struct {
     ) anyerror!shared.Response,
 };
 
-// ============================================================================
-// Internal client registration
-// ============================================================================
-
-/// Allocated per connected client. The event loop holds a pointer to
-/// this struct as callback `userdata`, so the callback has O(1) access
-/// to both the server (via `server`) and the client buffer.
-///
-/// While `need == 0` we are reading the 4-byte size prefix.
-/// Once we have the prefix, `need = 4 + body_size`; we accumulate up
-/// to `need` bytes, then dispatch.
 const ClientReg = struct {
     server: *IpcServer,
     fd: posix.fd_t,
@@ -106,20 +54,11 @@ const ClientReg = struct {
     }
 };
 
-// ============================================================================
-// SO_PEERCRED layout
-// ============================================================================
-
-/// `ucred` isn't exposed by `std.os.linux`; we declare the layout we need.
 const ucred = extern struct {
     pid: i32,
     uid: u32,
     gid: u32,
 };
-
-// ============================================================================
-// libc glue for group lookup
-// ============================================================================
 
 const c_group = extern struct {
     gr_name: [*:0]const u8,
@@ -130,14 +69,7 @@ const c_group = extern struct {
 
 extern "c" fn getgrnam(name: [*:0]const u8) callconv(.C) ?*c_group;
 
-/// libc umask(2). Used around bind() to force the socket's on-disk mode
-/// to 0660 directly — closes the TOCTOU window before the follow-up
-/// fchmodat. Returns the previous umask.
 extern "c" fn umask(mask: u32) callconv(.C) u32;
-
-// ============================================================================
-// IpcServer
-// ============================================================================
 
 pub const IpcServer = struct {
     allocator: std.mem.Allocator,
@@ -146,43 +78,26 @@ pub const IpcServer = struct {
     listen_fd: posix.fd_t = -1,
     started: bool = false,
     allowed_gid: ?u32 = null,
-    /// Test escape hatch: when true, skip the uid/gid allowlist check
-    /// and admit every peer whose SO_PEERCRED read succeeds. Never set
-    /// this in production. Settable via `setAllowAnyPeer()`.
     allow_any_peer: bool = false,
     handler: CommandHandler = .{
         .ctx = null,
         .dispatch = defaultDispatch,
     },
-    /// Slots for currently connected clients. Linear scan on insert /
-    /// disconnect; max_clients is tiny so this stays trivially cheap.
     clients: [max_clients]?*ClientReg = [_]?*ClientReg{null} ** max_clients,
 
-    /// Create the listening socket. Does NOT register with the event
-    /// loop — call `start()` after installing the command handler.
     pub fn init(
         allocator: std.mem.Allocator,
         loop: *EventLoop,
         socket_path: []const u8,
     ) Error!IpcServer {
         if (builtin.os.tag != .linux) return error.NotLinux;
-        // sun_path is 108 bytes including the terminator — leave room for it.
         if (socket_path.len >= 108) return error.PathTooLong;
 
-        // SOCK.NONBLOCK on the listener is mandatory: `acceptPending()` drains
-        // the listen queue in a loop and relies on `error.WouldBlock` from
-        // accept4 to exit. That error is only raised when the *listener* is
-        // non-blocking — the SOCK.NONBLOCK flag on accept4's accepted-fd side
-        // doesn't help. Without it the event loop blocks inside accept4
-        // forever after the first client connects (SYS-001).
         const stype: u32 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
         const fd = posix.socket(posix.AF.UNIX, stype, 0) catch
             return error.SocketCreateFailed;
         errdefer posix.close(fd);
 
-        // Daemon restart: unlink stale socket file. Any error other
-        // than ENOENT is surfaced — we must not paper over EACCES /
-        // EBUSY that would cause bind() to fail with a confusing error.
         std.fs.cwd().deleteFile(socket_path) catch |err| switch (err) {
             error.FileNotFound => {},
             else => {
@@ -200,18 +115,11 @@ pub const IpcServer = struct {
         const addr_len: posix.socklen_t =
             @intCast(sun_path_offset + socket_path.len + 1);
 
-        // SEC-002: umask(0o117) forces the socket to be created mode 0660
-        // directly by bind(), closing the TOCTOU window between bind() and
-        // a follow-up fchmodat(). Restore the prior umask immediately after
-        // so we don't affect any files the daemon creates later in init.
         const prev_umask: u32 = umask(0o117);
         const bind_result = posix.bind(fd, @ptrCast(&addr), addr_len);
         _ = umask(prev_umask);
         bind_result catch return error.BindFailed;
 
-        // Belt-and-braces: still fchmod to 0660 in case the filesystem
-        // ignored the umask (some FUSE setups do). Safe because the socket
-        // was already created with the tight mode above.
         std.posix.fchmodat(std.posix.AT.FDCWD, socket_path, 0o660, 0) catch |err| {
             std.log.err("ipc: chmod '{s}' failed: {s}", .{ socket_path, @errorName(err) });
             return error.ChmodFailed;
@@ -231,17 +139,6 @@ pub const IpcServer = struct {
             );
         }
 
-        // Group ownership of the socket is NOT set by a daemon chown
-        // (SYS-019). Under the shipped systemd unit, `Group=fail2zig`
-        // makes the daemon's egid `fail2zig`, so the socket bound above is
-        // created `root:fail2zig` automatically — and a chown(2) here would
-        // be a `@privileged` syscall the unit's seccomp filter kills with
-        // SIGSYS (and CAP_CHOWN is not in its bounding set anyway). The
-        // `allowed_gid` resolved above still drives SO_PEERCRED
-        // authorization — its one purpose. Bare `--config` runs (no
-        // systemd) get a `root:root` socket: correct root-only IPC by
-        // default.
-
         return .{
             .allocator = allocator,
             .loop = loop,
@@ -251,7 +148,6 @@ pub const IpcServer = struct {
         };
     }
 
-    /// Release all resources. Safe even if `start()` was never called.
     pub fn deinit(self: *IpcServer) void {
         for (&self.clients) |*slot| {
             if (slot.*) |cli| {
@@ -274,33 +170,19 @@ pub const IpcServer = struct {
         self.* = undefined;
     }
 
-    /// Install the command handler. Must be called before `start()`.
     pub fn setCommandHandler(self: *IpcServer, h: CommandHandler) void {
         self.handler = h;
     }
 
-    /// Test-only: disable the uid/gid allowlist and admit any connected
-    /// peer. Production callers must not use this — the daemon's whole
-    /// authentication model relies on `SO_PEERCRED` + group membership.
     pub fn setAllowAnyPeer(self: *IpcServer, allow: bool) void {
         self.allow_any_peer = allow;
     }
 
-    /// Test-only: admit an already-connected socket as a client without
-    /// going through accept() + SO_PEERCRED. Intended for integration
-    /// tests that want to drive the per-client read/dispatch/write loop
-    /// over a pre-built `socketpair()`. Production code paths MUST
-    /// route through `start()` → `acceptPending()` so peer credentials
-    /// are authenticated.
-    ///
-    /// Gated on `allow_any_peer == true` to make misuse impossible in
-    /// production: an `IpcServer` created via `init()` has this off.
     pub fn admitTestPeer(self: *IpcServer, fd: posix.fd_t) !void {
         std.debug.assert(self.allow_any_peer);
         return self.admitClient(fd, .{ .pid = 0, .uid = 0, .gid = 0 });
     }
 
-    /// Register the listening socket with the event loop.
     pub fn start(self: *IpcServer) Error!void {
         if (self.started) return error.AlreadyStarted;
         self.loop.addFd(
@@ -311,8 +193,6 @@ pub const IpcServer = struct {
         ) catch return error.EventLoopError;
         self.started = true;
     }
-
-    // ------- Accept path -------
 
     fn onListenReadable(
         fd: posix.fd_t,
@@ -398,8 +278,6 @@ pub const IpcServer = struct {
         self.clients[idx.?] = cli;
     }
 
-    // ------- Client read path -------
-
     fn onClientReadable(
         fd: posix.fd_t,
         events: u32,
@@ -412,12 +290,9 @@ pub const IpcServer = struct {
     }
 
     fn handleClientReadable(self: *IpcServer, cli: *ClientReg) void {
-        // Read what we can. On EOF / error, close the client.
         while (true) {
-            // Determine how much we still need.
             const target = if (cli.need == 0) 4 else cli.need;
             if (cli.len >= target) {
-                // Either finished size prefix or full frame.
                 if (cli.need == 0) {
                     const size = std.mem.readInt(u32, cli.buf[0..4], .little);
                     if (size > protocol.max_payload_size) {
@@ -437,10 +312,8 @@ pub const IpcServer = struct {
                         self.closeClient(cli);
                         return;
                     }
-                    // Might already have body bytes; loop again to check.
                     continue;
                 } else {
-                    // Full frame: dispatch.
                     self.processFrame(cli) catch |err| {
                         std.log.warn(
                             "ipc: client fd={d} frame dispatch failed: {s}",
@@ -454,7 +327,6 @@ pub const IpcServer = struct {
                 }
             }
 
-            // Need more bytes from the socket.
             const want = target - cli.len;
             const dst = cli.buf[cli.len .. cli.len + want];
             const n = posix.read(cli.fd, dst) catch |err| switch (err) {
@@ -469,7 +341,6 @@ pub const IpcServer = struct {
                 },
             };
             if (n == 0) {
-                // Orderly EOF.
                 self.closeClient(cli);
                 return;
             }
@@ -477,22 +348,14 @@ pub const IpcServer = struct {
         }
     }
 
-    /// The buffer from [4 .. cli.need] holds one full command body
-    /// (tag + fields). We reconstruct a `std.io.FixedBufferStream` over
-    /// the prefix+body so the shared deserializer can read the length
-    /// prefix followed by the body.
     fn processFrame(self: *IpcServer, cli: *ClientReg) !void {
         var stream = std.io.fixedBufferStream(cli.buf[0..cli.need]);
         const cmd = protocol.deserializeCommand(stream.reader()) catch |err| {
             std.log.warn("ipc: bad command from fd={d}: {s}", .{ cli.fd, @errorName(err) });
-            // Reply with a generic error. Use stack storage via a small
-            // fixed buffer so we don't allocate on the error path.
             try self.writeErrResponse(cli, 400, "bad command");
             return;
         };
 
-        // Dispatch. The handler allocates response bodies from our
-        // allocator; we free them after serialization below.
         const resp = self.handler.dispatch(self.handler.ctx, cmd, self.allocator) catch |err| {
             std.log.warn("ipc: handler error fd={d}: {s}", .{ cli.fd, @errorName(err) });
             try self.writeErrResponse(cli, 500, "handler error");
@@ -504,10 +367,6 @@ pub const IpcServer = struct {
     }
 
     fn writeResponse(self: *IpcServer, cli: *ClientReg, resp: shared.Response) !void {
-        // Serialize into a scratch buffer first. The maximum serialized
-        // size is 4 (prefix) + 1 (tag) + 2 (err code or 4-byte ok len)
-        // + N (payload/message). Cap N at max_payload_size and size the
-        // buffer accordingly.
         const tmp = try self.allocator.alloc(u8, protocol.max_payload_size + 16);
         defer self.allocator.free(tmp);
         var stream = std.io.fixedBufferStream(tmp);
@@ -539,15 +398,8 @@ pub const IpcServer = struct {
     }
 };
 
-// ============================================================================
-// Helpers
-// ============================================================================
-
 fn readPeerCred(fd: posix.fd_t) !ucred {
-    // std.posix.getsockopt is not usable here: it leaves `optlen`
-    // uninitialized before calling, which the kernel rejects with EINVAL
-    // and the wrapper converts to `unreachable`. Call the raw syscall
-    // and pass a correctly initialized length.
+    // Raw syscall: std.posix.getsockopt leaves optlen uninitialized, the kernel EINVALs and the wrapper hits unreachable.
     var cred: ucred = undefined;
     var len: posix.socklen_t = @sizeOf(ucred);
     const rc = linux.getsockopt(
@@ -586,14 +438,9 @@ fn defaultDispatch(
     return .{ .err = .{ .code = 503, .message = msg } };
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 const testing = std.testing;
 
 fn makeTestPath(allocator: std.mem.Allocator) ![]u8 {
-    // Random suffix plus pid so parallel test processes never collide.
     const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
     var prng = std.Random.DefaultPrng.init(seed);
     const rnd = prng.random().int(u32);
@@ -618,11 +465,9 @@ test "ipc: init creates socket, deinit removes it" {
         var server = try IpcServer.init(a, &loop, path);
         defer server.deinit();
 
-        // Socket should be accessible (existence check).
         try std.fs.cwd().access(path, .{});
     }
 
-    // deinit must have removed the socket file.
     const exists = blk: {
         std.fs.cwd().access(path, .{}) catch break :blk false;
         break :blk true;
@@ -640,8 +485,6 @@ test "ipc: init with stale socket file unlinks and rebinds" {
     const path = try makeTestPath(a);
     defer a.free(path);
 
-    // Create a plain file at the path — simulates a stale socket from
-    // a prior run. init() must unlink it and continue.
     {
         const f = try std.fs.cwd().createFile(path, .{});
         f.close();
@@ -652,9 +495,6 @@ test "ipc: init with stale socket file unlinks and rebinds" {
 }
 
 test "ipc: socket has mode 0660 immediately after init (SEC-002)" {
-    // SEC-002: closes the TOCTOU window between bind() and chmod() by
-    // forcing umask 0o117 around bind. A stat() immediately after init
-    // (no sleep, no delay) must observe mode 0660.
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const a = testing.allocator;
 
@@ -676,14 +516,10 @@ test "ipc: socket has mode 0660 immediately after init (SEC-002)" {
         .SUCCESS => {},
         else => return error.SkipZigTest,
     }
-    // Mask off the type bits; check the 9 permission bits exactly.
     const perm = stbuf.mode & 0o777;
     try testing.expectEqual(@as(u32, 0o660), perm);
 }
 
-/// stat() a path and return its permission bits (0o777 masked), or
-/// `error.SkipZigTest` if the stat fails. Mirrors the SEC-002 test's
-/// approach so SYS-018 assertions stay consistent with it.
 fn statPerm(path: []const u8) !u32 {
     var path_z: [128]u8 = undefined;
     if (path.len >= path_z.len) return error.SkipZigTest;
@@ -698,10 +534,6 @@ fn statPerm(path: []const u8) !u32 {
     return stbuf.mode & 0o777;
 }
 
-/// stat() a path and return its owning group id, or `error.SkipZigTest`
-/// if the stat fails. Shares the `linux.Stat` mechanics of `statPerm` so
-/// the SYS-019 ownership-regression assertion stays consistent with the
-/// SEC-002 / SYS-018 mode assertions.
 fn statGid(path: []const u8) !u32 {
     var path_z: [128]u8 = undefined;
     if (path.len >= path_z.len) return error.SkipZigTest;
@@ -716,9 +548,6 @@ fn statGid(path: []const u8) !u32 {
     return stbuf.gid;
 }
 
-/// stat() a path and return its full mode word (type + permission +
-/// special bits), or `error.SkipZigTest` if the stat fails. Used to
-/// inspect the setgid bit of the socket's parent directory.
 fn statRawMode(path: []const u8) !u32 {
     var path_z: [128]u8 = undefined;
     if (path.len >= path_z.len) return error.SkipZigTest;
@@ -734,12 +563,6 @@ fn statRawMode(path: []const u8) !u32 {
 }
 
 test "ipc: init succeeds and socket stays 0660 with no fail2zig group (SYS-018)" {
-    // SYS-018/SYS-019: init() resolves the `fail2zig` gid for SO_PEERCRED
-    // authorization but does NOT chown the socket — group ownership comes
-    // from the daemon's egid under systemd `Group=fail2zig`. Whether or not
-    // the group exists, init must succeed with the socket at mode 0660: the
-    // group path never weakens the existing root-only guarantee. This is
-    // the testable invariant under a non-root test runner.
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const a = testing.allocator;
 
@@ -749,47 +572,18 @@ test "ipc: init succeeds and socket stays 0660 with no fail2zig group (SYS-018)"
     const path = try makeTestPath(a);
     defer a.free(path);
 
-    // init() must not fail regardless of whether `fail2zig` exists or
-    // whether a chown would EPERM under a non-root test runner.
     var server = try IpcServer.init(a, &loop, path);
     defer server.deinit();
 
-    // Assertion 1 — gid resolution (single source of truth). The resolved
-    // gid is exactly the gid used for SO_PEERCRED authorization. When the
-    // `fail2zig` group is absent it is null; when present it equals
-    // getgrnam("fail2zig").gr_gid. No other test asserts this — keep it
-    // here so there is one canonical check.
     const expected_gid: ?u32 = blk: {
         if (getgrnam("fail2zig")) |grp| break :blk grp.gr_gid;
         break :blk null;
     };
     try testing.expectEqual(expected_gid, server.allowed_gid);
 
-    // Assertion 2 — socket mode is 0660 after init. Socket exists and is
-    // connectable-by-mode (the umask+fchmodat path is undisturbed by the
-    // SYS-019 chown removal).
     try std.fs.cwd().access(path, .{});
     try testing.expectEqual(@as(u32, 0o660), try statPerm(path));
 
-    // Assertion 3 — SYS-019 ownership-regression guard. The earlier
-    // SYS-018 attempt set the socket's group with a daemon-side
-    // fchownat(); under the shipped hardened unit that `@privileged`
-    // syscall is killed with SIGSYS and crash-loops the daemon. The fix
-    // removed that chown entirely: the bound socket must simply INHERIT
-    // its group from the creating process's egid (which systemd sets to
-    // `fail2zig` via `Group=fail2zig`). We assert the observable form of
-    // "init performed no ownership change": the socket's group equals the
-    // test process's egid. If a chown were ever reintroduced into the
-    // socket-creation path, it would reassign the group to the resolved
-    // `fail2zig` gid (or fail) and this would no longer hold.
-    //
-    // One environmental caveat: if the socket's parent directory carries
-    // the setgid bit (S_ISGID), a newly created file inherits the
-    // DIRECTORY's group rather than the creator's egid — making the
-    // egid comparison invalid through no fault of `init`. /tmp normally
-    // has no setgid bit, but we detect and skip that case rather than
-    // assert something flaky. This holds identically under root and
-    // non-root runners: the socket group is the creator's egid either way.
     const parent = std.fs.path.dirname(path) orelse return error.SkipZigTest;
     const parent_mode = try statRawMode(parent);
     const s_isgid: u32 = 0o2000;
@@ -800,11 +594,6 @@ test "ipc: init succeeds and socket stays 0660 with no fail2zig group (SYS-018)"
 }
 
 test "ipc: listener socket is non-blocking (SYS-001)" {
-    // SYS-001 regression: the listener must have O_NONBLOCK set. The accept
-    // loop in `acceptPending()` drains the backlog until accept4 returns
-    // WouldBlock, which only happens on a non-blocking listener. A blocking
-    // listener freezes the entire event loop inside the kernel's unix_accept
-    // after the first client connects, making the daemon unusable.
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const a = testing.allocator;
 
@@ -835,7 +624,6 @@ test "ipc: init rejects path that is too long" {
     );
 }
 
-/// Capturing dispatch — stashes the command, returns a synthetic ok.
 const CaptureDispatch = struct {
     saw_version: bool = false,
 
@@ -855,17 +643,12 @@ const CaptureDispatch = struct {
 };
 
 test "ipc: end-to-end version command through unix socketpair" {
-    // We use socketpair() rather than spinning up the listener, because
-    // the test only needs to exercise the per-client read/dispatch/write
-    // loop. The accept path is tested separately by `init creates socket`.
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const a = testing.allocator;
 
     var loop = try EventLoop.init(a);
     defer loop.deinit();
 
-    // Create a socketpair. fds[0] = server side (fed through the
-    // IpcServer's handler), fds[1] = client side.
     var fds: [2]i32 = undefined;
     const stype_u32: u32 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
     const rc = linux.socketpair(
@@ -880,8 +663,6 @@ test "ipc: end-to-end version command through unix socketpair" {
     }
     defer posix.close(fds[1]);
 
-    // Skip init/bind — build a minimal server directly so the test does
-    // not depend on a real listening socket.
     var server: IpcServer = .{
         .allocator = a,
         .loop = &loop,
@@ -891,8 +672,6 @@ test "ipc: end-to-end version command through unix socketpair" {
         .allowed_gid = null,
         .allow_any_peer = true,
     };
-    // We do NOT call deinit() (it would attempt to unlink ""). We free
-    // client state manually at the end.
     defer {
         for (&server.clients) |*slot| {
             if (slot.*) |cli| {
@@ -911,10 +690,8 @@ test "ipc: end-to-end version command through unix socketpair" {
         .dispatch = CaptureDispatch.dispatch,
     });
 
-    // Register the server-side fd as an admitted client directly.
     try server.admitClient(fds[0], .{ .pid = 0, .uid = 0, .gid = 0 });
 
-    // Write a version command on the client side.
     var wbuf: [64]u8 = undefined;
     var ws = std.io.fixedBufferStream(&wbuf);
     try protocol.serializeCommand(.{ .version = {} }, ws.writer());
@@ -924,8 +701,6 @@ test "ipc: end-to-end version command through unix socketpair" {
         written += try posix.write(fds[1], wire[written..]);
     }
 
-    // Drive the event loop once. Use a short-lived thread that stops
-    // the loop after a bounded interval so a bug cannot hang the test.
     const Watchdog = struct {
         fn run(l: *EventLoop) void {
             std.time.sleep(500 * std.time.ns_per_ms);
@@ -936,12 +711,9 @@ test "ipc: end-to-end version command through unix socketpair" {
     try loop.run();
     wd.join();
 
-    // By now handleClientReadable should have dispatched version and
-    // written a response. Read it back on fds[1].
     var rbuf: [256]u8 = undefined;
-    // Response wire: [u32 size LE][body]. Try a single read.
     const n = try posix.read(fds[1], &rbuf);
-    try testing.expect(n >= 5); // minimum ok response: 4 prefix + 1 tag + 4 len
+    try testing.expect(n >= 5);
 
     var rs = std.io.fixedBufferStream(rbuf[0..n]);
     const resp = try protocol.deserializeResponse(rs.reader(), a);
@@ -954,10 +726,6 @@ test "ipc: end-to-end version command through unix socketpair" {
     try testing.expect(capture.saw_version);
 }
 
-/// Initialize an existing `*IpcServer` in-place for testing via a
-/// socketpair. The client registration holds a back-pointer to the
-/// server, so the caller MUST pass a stable pointer (not move the
-/// struct after this call).
 fn initFakeServer(
     server: *IpcServer,
     a: std.mem.Allocator,
@@ -1034,8 +802,6 @@ test "ipc: malformed command receives err response and client stays open" {
     defer drainFakeServer(a, &loop, &server);
     defer posix.close(fds[1]);
 
-    // Send a well-framed message but with an unknown command tag (0xFE).
-    // Size = 1 body byte; body = single unknown tag byte.
     const bad: [5]u8 = [_]u8{ 0x01, 0x00, 0x00, 0x00, 0xFE };
     _ = try posix.write(fds[1], &bad);
 
@@ -1080,15 +846,12 @@ test "ipc: oversized length prefix closes the client" {
     defer drainFakeServer(a, &loop, &server);
     defer posix.close(fds[1]);
 
-    // Size prefix beyond protocol.max_payload_size must trigger closure.
     var prefix: [4]u8 = undefined;
     std.mem.writeInt(u32, &prefix, protocol.max_payload_size + 1, .little);
     _ = try posix.write(fds[1], &prefix);
 
     try runLoopBriefly(&loop, 200);
 
-    // Server should have closed the fd. A subsequent read returns 0
-    // (orderly EOF) or an error — both confirm closure.
     var buf: [4]u8 = undefined;
     const n = posix.read(fds[1], &buf) catch 0;
     try testing.expectEqual(@as(usize, 0), n);

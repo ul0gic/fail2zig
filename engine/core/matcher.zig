@@ -1,25 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Multi-pattern matcher.
-//!
-//! Holds up to 256 comptime-compiled `MatchFn`s, each carrying its
-//! `JailId` / pattern id, and attempts them against incoming log lines.
-//! First matching pattern wins. The entire pattern set is materialized
-//! at comptime — there is no heap state and no per-line allocation.
-//!
-//! Early-exit optimizations:
-//!   * `min_line_len`: lines shorter than the shortest pattern's fixed
-//!     text are rejected immediately.
-//!   * `first_byte_prefix`: when a pattern begins with an anchored
-//!     literal, its first byte is cached. Matcher checks the line's
-//!     first byte against the union of all first-byte possibilities
-//!     before dispatching; a mismatch on every pattern rejects the line
-//!     without calling any match function.
-//!
-//! Public API:
-//!     const defs = [_]PatternDef{ .{ .pattern = "...", .jail = id, .id = 1 } };
-//!     const m = Matcher.init(defs);
-//!     if (m.match(line)) |res| { ... }
 
 const std = @import("std");
 const shared = @import("shared");
@@ -27,18 +7,12 @@ const parser = @import("parser.zig");
 
 pub const MAX_PATTERNS: usize = 256;
 
-/// Declarative pattern input. `pattern` is a comptime string interpreted by
-/// `parser.compile`. `jail` tags which jail owns the pattern (returned
-/// alongside the parse result). `id` is a stable identifier set by the
-/// caller — typically the pattern's index in the original list.
 pub const PatternDef = struct {
     pattern: []const u8,
     jail: shared.JailId,
     id: u16,
 };
 
-/// Result produced by `Matcher.match`. Extends `parser.ParseResult` with
-/// the owning jail so callers can route decisions (ban, unban, metric tag).
 pub const MatchResult = struct {
     ip: shared.IpAddress,
     timestamp: ?shared.Timestamp,
@@ -46,21 +20,13 @@ pub const MatchResult = struct {
     pattern_id: u16,
 };
 
-/// Multi-pattern matcher. Construct via `init(comptime patterns)`.
 pub const Matcher = struct {
     fns: []const parser.MatchFn,
     ids: []const u16,
     jails: []const shared.JailId,
     min_line_len: usize,
-    // Bitmap of viable first bytes across all patterns. Index = byte value.
-    // `true` means at least one pattern's anchored literal starts with this
-    // byte (or at least one pattern has no anchored literal, in which case
-    // every first byte is viable — the bitmap is saturated).
     first_byte_mask: [256]bool,
 
-    /// Build a matcher from a comptime list of pattern definitions. All
-    /// match functions are generated at comptime and stored as a static
-    /// slice — no runtime allocation.
     pub fn init(comptime patterns: []const PatternDef) Matcher {
         comptime {
             if (patterns.len == 0) @compileError("Matcher.init: at least one pattern required");
@@ -79,8 +45,6 @@ pub const Matcher = struct {
         };
     }
 
-    /// Try each pattern in order. Returns the first match, or null if
-    /// no pattern matches. Zero allocation.
     pub fn match(self: *const Matcher, line: []const u8) ?MatchResult {
         if (line.len < self.min_line_len) {
             @branchHint(.unlikely);
@@ -109,10 +73,6 @@ pub const Matcher = struct {
     }
 };
 
-// ============================================================================
-// Comptime construction
-// ============================================================================
-
 const Built = struct {
     fns_slice: []const parser.MatchFn,
     ids_slice: []const u16,
@@ -138,19 +98,14 @@ fn buildCompiled(comptime patterns: []const PatternDef) Built {
             const fixed = fixedLen(p.pattern);
             if (fixed < min_line_len) min_line_len = fixed;
 
-            // First-byte analysis: if the pattern starts with a literal
-            // segment, its first byte constrains the line. Otherwise the
-            // pattern accepts any first byte (saturate the mask).
             if (firstAnchoredByte(p.pattern)) |b| {
                 first_byte_mask[b] = true;
             } else {
-                // Saturate — no first-byte filter possible for this pattern.
                 for (&first_byte_mask) |*slot| slot.* = true;
             }
         }
         if (min_line_len == std.math.maxInt(usize)) min_line_len = 0;
 
-        // Freeze the arrays into immutable const slices.
         const fns_const = fns_arr;
         const ids_const = ids_arr;
         const jails_const = jails_arr;
@@ -164,9 +119,6 @@ fn buildCompiled(comptime patterns: []const PatternDef) Built {
     }
 }
 
-/// Minimum possible length of a line that can match `pattern`. Dynamic
-/// tokens contribute their shortest legal width: `<IP>` = 7 (`0.0.0.0`),
-/// `<TIMESTAMP>` = 10 (shortest epoch), `<HOST>` = 1, `<*>` = 0.
 fn fixedLen(comptime pattern: []const u8) usize {
     comptime {
         var total: usize = 0;
@@ -182,9 +134,7 @@ fn fixedLen(comptime pattern: []const u8) usize {
                     total += 10;
                 } else if (std.mem.eql(u8, name, "HOST")) {
                     total += 1;
-                } else if (std.mem.eql(u8, name, "*")) {
-                    // no minimum contribution
-                }
+                } else if (std.mem.eql(u8, name, "*")) {}
                 i = j + 1;
             } else {
                 total += 1;
@@ -198,16 +148,10 @@ fn fixedLen(comptime pattern: []const u8) usize {
 fn firstAnchoredByte(comptime pattern: []const u8) ?u8 {
     comptime {
         if (pattern.len == 0) return null;
-        // If the pattern starts with '<', the first segment is dynamic —
-        // no useful first-byte constraint.
         if (pattern[0] == '<') return null;
         return pattern[0];
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 fn comptimeJail(comptime name: []const u8) shared.JailId {
     comptime {
@@ -255,7 +199,6 @@ test "matcher: returns null on non-matching line" {
 
 test "matcher: min_line_len early exit" {
     const m = comptime Matcher.init(&.{
-        // Fixed bytes: "Failed password for  from " (26) + 7 for <IP> = 33.
         .{ .pattern = "Failed password for <*> from <IP>", .jail = comptimeJail("sshd"), .id = 1 },
     });
     try std.testing.expect(m.min_line_len >= 26);
@@ -267,7 +210,6 @@ test "matcher: first-byte filter rejects mismatched prefix" {
         .{ .pattern = "Failed password for <*> from <IP>", .jail = comptimeJail("sshd"), .id = 1 },
         .{ .pattern = "Invalid user <*> from <IP>", .jail = comptimeJail("sshd"), .id = 2 },
     });
-    // 'F' and 'I' are viable, 'Z' is not.
     try std.testing.expect(m.first_byte_mask['F']);
     try std.testing.expect(m.first_byte_mask['I']);
     try std.testing.expect(!m.first_byte_mask['Z']);
@@ -279,7 +221,6 @@ test "matcher: first-byte filter saturates when any pattern is unanchored" {
         .{ .pattern = "Fixed prefix <IP>", .jail = comptimeJail("any"), .id = 1 },
         .{ .pattern = "<*><IP>", .jail = comptimeJail("any"), .id = 2 },
     });
-    // Saturated — every first byte must be accepted.
     for (0..256) |b| try std.testing.expect(m.first_byte_mask[@intCast(b)]);
     const r = m.match("arbitrary prefix 9.9.9.9").?;
     try std.testing.expectEqual(@as(u16, 2), r.pattern_id);
