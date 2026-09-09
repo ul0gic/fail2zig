@@ -14,12 +14,7 @@ const firewall = engine.firewall;
 const state = engine.state_mod;
 const tracker_map = engine.tracker_map_mod;
 
-const persist = struct {
-    pub const saveAll = @import("../../engine/core/persist.zig").saveAll;
-    pub const loadFull = @import("../../engine/core/persist.zig").loadFull;
-    pub const seedMap = @import("../../engine/core/persist.zig").seedMap;
-    pub const seedLifetimes = @import("../../engine/core/persist.zig").seedLifetimes;
-};
+const persist = engine.persist_mod;
 
 const testing = std.testing;
 
