@@ -9,6 +9,7 @@ const linux = std.os.linux;
 const testing = std.testing;
 
 const daemon_path = "zig-out/bin/fail2zig";
+const client_path = "zig-out/bin/fail2zig-client";
 const max_output_bytes: usize = 1 << 20;
 const watchdog_timeout_ms: u64 = 10_000;
 const startup_timeout_ms: u64 = 5_000;
@@ -360,9 +361,32 @@ const Scenario = struct {
         try f.writeAll("\n");
     }
 
+    fn clientStatus(self: *Scenario, d: *LiveDaemon) ![]u8 {
+        std.fs.cwd().access(client_path, .{}) catch return error.TestClientBinaryMissing;
+        const argv = [_][]const u8{ client_path, "--socket", self.socket_path, "status" };
+        var r = try runToExit(self.a, &argv);
+        defer r.deinit(self.a);
+        if (r.exitCode() != 0) {
+            const rejected = d.waitForStderr("ipc: rejecting peer", 1_000);
+            std.debug.print("client status failed (exit {?d}, peer rejected={}):\n{s}{s}\n", .{ r.exitCode(), rejected, r.stdout, r.stderr });
+            return if (rejected) error.TestPeerRejected else error.TestClientStatusFailed;
+        }
+        return self.a.dupe(u8, r.stdout);
+    }
+
     fn httpStatus(self: *Scenario) ![]u8 {
         const addr = try std.net.Address.parseIp4("127.0.0.1", self.metrics_port);
-        const stream = try std.net.tcpConnectToAddress(addr);
+        var waited: u64 = 0;
+        const stream = while (true) {
+            if (std.net.tcpConnectToAddress(addr)) |st| break st else |err| switch (err) {
+                error.ConnectionRefused => {
+                    if (waited >= startup_timeout_ms) return error.TestHttpNeverListened;
+                    std.time.sleep(10 * std.time.ns_per_ms);
+                    waited += 10;
+                },
+                else => return err,
+            }
+        };
         defer stream.close();
         try stream.writer().writeAll("GET /api/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
         var raw: std.ArrayListUnmanaged(u8) = .{};
@@ -449,6 +473,11 @@ test "integration: no backend (b) on_no_backend = \"log-only\" stays up DEGRADED
     };
     try testing.expect(cause.len > 0);
 
+    const table = try s.clientStatus(d);
+    defer a.free(table);
+    try expectContains(table, "Protection:  DEGRADED (PermissionDenied)");
+    try expectContains(table, "Backend:     none");
+
     std.time.sleep(settle_ms * std.time.ns_per_ms);
     for (attacker_lines) |ln| try s.appendLogLine(ln);
 
@@ -491,6 +520,12 @@ test "integration: no backend (c) all-log-only config runs non-root with Protect
     try expectContains(status, "\"protection\":\"log-only\"");
     try expectContains(status, "\"backend\":\"none\"");
     try expectNotContains(status, "protection_cause");
+
+    const table = try s.clientStatus(d);
+    defer a.free(table);
+    try expectContains(table, "Protection:  log-only");
+    try expectContains(table, "Backend:     none");
+    try expectNotContains(table, "DEGRADED");
 
     std.time.sleep(settle_ms * std.time.ns_per_ms);
     for (attacker_lines) |ln| try s.appendLogLine(ln);

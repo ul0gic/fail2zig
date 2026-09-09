@@ -13,7 +13,7 @@ default `zig build test` cycle.
 | `memory_ceiling.zig` | Entries under attack over budget | Never exceed | 21,845 entries, 15,606 evictions across 50K attempts |
 | `startup_time.zig` | Process spawn → accepting IPC | < 100ms | Skips on unprivileged hosts (daemon can't run) |
 | `ban_latency.zig` | Match → ban decision | < 1ms | p50 365ns, p99 932ns |
-| `loop_latency.zig` | IPC `status` round-trip p99 while a 1 s fake `journalctl` is polled every tick (PRF-001) | p99 < 50ms | v0.2.2 baseline (sync poll, real journald on f2z-target): p99 21ms. v0.3 (ADR-011, 2026-09-09, dev box): p50 3.2ms, p99 4.3ms, max 8.7ms over 500 round-trips; no-poll floor p50 3.2ms (PRF-002) |
+| `loop_latency.zig` | IPC `status` round-trip p99 while a 1 s fake `journalctl` is polled every tick (PRF-001) | p99 < 50ms | v0.2.2 baseline (sync poll, real journald on f2z-target): p99 21ms. v0.3 (ADR-011, 2026-09-09, dev box): p50 3.2ms, p99 4.3ms, max 8.7ms over 500 round-trips; no-poll floor p50 3.2ms (PRF-002). After PRF-002 fix (pooled client + response buffers, same day): p50 0.75ms, p99 0.86–0.93ms, max 0.9–1.9ms; with a production-style `GeneralPurposeAllocator(.{})` for the server p50 0.58ms, p99 0.67ms. `strace -T -f` on the loop thread showed two 1 MiB mmap+munmap pairs per round-trip (client buffer, response scratch) now gone; the residual is `std.testing.allocator`'s 10-frame stack capture (`process_vm_readv`) on the dispatch allocations, a bench artifact the daemon does not pay |
 
 ## Running
 

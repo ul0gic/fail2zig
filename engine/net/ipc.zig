@@ -16,6 +16,8 @@ pub const max_clients: usize = 8;
 
 pub const client_buffer_size: usize = protocol.max_payload_size + 4;
 
+const response_buffer_size: usize = protocol.max_payload_size + 16;
+
 pub const Error = error{
     SocketCreateFailed,
     BindFailed,
@@ -78,12 +80,16 @@ pub const IpcServer = struct {
     listen_fd: posix.fd_t = -1,
     started: bool = false,
     allowed_gid: ?u32 = null,
+    self_uid: u32 = 0,
     allow_any_peer: bool = false,
     handler: CommandHandler = .{
         .ctx = null,
         .dispatch = defaultDispatch,
     },
+    pool: []u8 = &.{},
+    response_buf: []u8 = &.{},
     clients: [max_clients]?*ClientReg = [_]?*ClientReg{null} ** max_clients,
+    slots: [max_clients]ClientReg = undefined,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -139,12 +145,33 @@ pub const IpcServer = struct {
             );
         }
 
+        const pool = try allocator.alloc(u8, max_clients * client_buffer_size);
+        errdefer allocator.free(pool);
+        const response_buf = try allocator.alloc(u8, response_buffer_size);
+
         return .{
             .allocator = allocator,
             .loop = loop,
             .socket_path = socket_path,
             .listen_fd = fd,
             .allowed_gid = allowed_gid,
+            .self_uid = linux.geteuid(),
+            .pool = pool,
+            .response_buf = response_buf,
+        };
+    }
+
+    pub fn initDetached(allocator: std.mem.Allocator, loop: *EventLoop) Error!IpcServer {
+        const pool = try allocator.alloc(u8, max_clients * client_buffer_size);
+        errdefer allocator.free(pool);
+        const response_buf = try allocator.alloc(u8, response_buffer_size);
+        return .{
+            .allocator = allocator,
+            .loop = loop,
+            .socket_path = "",
+            .allow_any_peer = true,
+            .pool = pool,
+            .response_buf = response_buf,
         };
     }
 
@@ -153,8 +180,6 @@ pub const IpcServer = struct {
             if (slot.*) |cli| {
                 self.loop.removeFd(cli.fd) catch {};
                 posix.close(cli.fd);
-                self.allocator.free(cli.buf);
-                self.allocator.destroy(cli);
                 slot.* = null;
             }
         }
@@ -166,7 +191,9 @@ pub const IpcServer = struct {
             posix.close(self.listen_fd);
             self.listen_fd = -1;
         }
-        std.fs.cwd().deleteFile(self.socket_path) catch {};
+        if (self.socket_path.len != 0) std.fs.cwd().deleteFile(self.socket_path) catch {};
+        self.allocator.free(self.response_buf);
+        self.allocator.free(self.pool);
         self.* = undefined;
     }
 
@@ -240,6 +267,7 @@ pub const IpcServer = struct {
     fn peerAllowed(self: *const IpcServer, cred: ucred) bool {
         if (self.allow_any_peer) return true;
         if (cred.uid == 0) return true;
+        if (self.self_uid != 0 and cred.uid == self.self_uid) return true;
         if (self.allowed_gid) |gid| {
             if (cred.gid == gid) return true;
         }
@@ -259,23 +287,19 @@ pub const IpcServer = struct {
             return error.TooManyClients;
         }
 
-        const cli = try self.allocator.create(ClientReg);
-        errdefer self.allocator.destroy(cli);
-
-        const buf = try self.allocator.alloc(u8, client_buffer_size);
-        errdefer self.allocator.free(buf);
-
+        const i = idx.?;
+        const cli = &self.slots[i];
         cli.* = .{
             .server = self,
             .fd = fd,
             .peer_uid = cred.uid,
             .peer_pid = cred.pid,
             .peer_gid = cred.gid,
-            .buf = buf,
+            .buf = self.pool[i * client_buffer_size ..][0..client_buffer_size],
         };
 
         try self.loop.addFd(fd, linux.EPOLL.IN, onClientReadable, @ptrCast(cli));
-        self.clients[idx.?] = cli;
+        self.clients[i] = cli;
     }
 
     fn onClientReadable(
@@ -367,18 +391,14 @@ pub const IpcServer = struct {
     }
 
     fn writeResponse(self: *IpcServer, cli: *ClientReg, resp: shared.Response) !void {
-        const tmp = try self.allocator.alloc(u8, protocol.max_payload_size + 16);
-        defer self.allocator.free(tmp);
-        var stream = std.io.fixedBufferStream(tmp);
+        var stream = std.io.fixedBufferStream(self.response_buf);
         try protocol.serializeResponse(resp, stream.writer());
         const bytes = stream.getWritten();
         try writeAll(cli.fd, bytes);
     }
 
     fn writeErrResponse(self: *IpcServer, cli: *ClientReg, code: u16, msg: []const u8) !void {
-        const owned = try self.allocator.dupe(u8, msg);
-        defer self.allocator.free(owned);
-        const resp: shared.Response = .{ .err = .{ .code = code, .message = owned } };
+        const resp: shared.Response = .{ .err = .{ .code = code, .message = msg } };
         try self.writeResponse(cli, resp);
     }
 
@@ -393,8 +413,6 @@ pub const IpcServer = struct {
         }
         self.loop.removeFd(cli.fd) catch {};
         posix.close(cli.fd);
-        self.allocator.free(cli.buf);
-        self.allocator.destroy(cli);
     }
 };
 
@@ -624,6 +642,94 @@ test "ipc: init rejects path that is too long" {
     );
 }
 
+fn peerPolicy(self_uid: u32, allowed_gid: ?u32) IpcServer {
+    return .{
+        .allocator = testing.allocator,
+        .loop = undefined,
+        .socket_path = "",
+        .allowed_gid = allowed_gid,
+        .self_uid = self_uid,
+    };
+}
+
+test "ipc: root daemon admits uid 0 and the fail2zig gid only" {
+    const server = peerPolicy(0, 4242);
+    try testing.expect(server.peerAllowed(.{ .pid = 1, .uid = 0, .gid = 7 }));
+    try testing.expect(server.peerAllowed(.{ .pid = 1, .uid = 1000, .gid = 4242 }));
+    try testing.expect(!server.peerAllowed(.{ .pid = 1, .uid = 1000, .gid = 1000 }));
+    try testing.expect(!server.peerAllowed(.{ .pid = 1, .uid = 1000, .gid = 0 }));
+
+    const no_group = peerPolicy(0, null);
+    try testing.expect(no_group.peerAllowed(.{ .pid = 1, .uid = 0, .gid = 0 }));
+    try testing.expect(!no_group.peerAllowed(.{ .pid = 1, .uid = 1000, .gid = 4242 }));
+}
+
+test "ipc: non-root daemon additionally admits its own uid (QA-004)" {
+    const server = peerPolicy(1000, null);
+    try testing.expect(server.peerAllowed(.{ .pid = 1, .uid = 1000, .gid = 1000 }));
+    try testing.expect(server.peerAllowed(.{ .pid = 1, .uid = 1000, .gid = 9 }));
+    try testing.expect(server.peerAllowed(.{ .pid = 1, .uid = 0, .gid = 0 }));
+    try testing.expect(!server.peerAllowed(.{ .pid = 1, .uid = 1001, .gid = 1000 }));
+    try testing.expect(!server.peerAllowed(.{ .pid = 1, .uid = 1001, .gid = 4242 }));
+
+    const with_group = peerPolicy(1000, 4242);
+    try testing.expect(with_group.peerAllowed(.{ .pid = 1, .uid = 1001, .gid = 4242 }));
+    try testing.expect(!with_group.peerAllowed(.{ .pid = 1, .uid = 1001, .gid = 4243 }));
+}
+
+test "ipc: init records the daemon euid and allocates the client pool once" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = testing.allocator;
+
+    var loop = try EventLoop.init(a);
+    defer loop.deinit();
+
+    const path = try makeTestPath(a);
+    defer a.free(path);
+
+    var server = try IpcServer.init(a, &loop, path);
+    defer server.deinit();
+
+    try testing.expectEqual(@as(u32, linux.geteuid()), server.self_uid);
+    try testing.expectEqual(max_clients * client_buffer_size, server.pool.len);
+    try testing.expectEqual(response_buffer_size, server.response_buf.len);
+}
+
+test "ipc: admit and close reuse the pooled slot without allocating (PRF-002)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = testing.allocator;
+
+    var loop = try EventLoop.init(a);
+    defer loop.deinit();
+
+    var server = try IpcServer.initDetached(a, &loop);
+    defer server.deinit();
+
+    var failing = testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    server.allocator = failing.allocator();
+    defer server.allocator = a;
+
+    var round: usize = 0;
+    while (round < 3) : (round += 1) {
+        var fds: [2]i32 = undefined;
+        const stype_u32: u32 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
+        const rc = linux.socketpair(@as(i32, linux.AF.UNIX), @as(i32, @intCast(stype_u32)), 0, &fds);
+        switch (posix.errno(rc)) {
+            .SUCCESS => {},
+            else => return error.SkipZigTest,
+        }
+        defer posix.close(fds[1]);
+
+        try server.admitClient(fds[0], .{ .pid = 0, .uid = 0, .gid = 0 });
+        const cli = server.clients[0].?;
+        try testing.expectEqual(@as(usize, client_buffer_size), cli.buf.len);
+        try testing.expectEqual(@intFromPtr(server.pool.ptr), @intFromPtr(cli.buf.ptr));
+        server.closeClient(cli);
+        try testing.expect(server.clients[0] == null);
+    }
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
 const CaptureDispatch = struct {
     saw_version: bool = false,
 
@@ -663,26 +769,8 @@ test "ipc: end-to-end version command through unix socketpair" {
     }
     defer posix.close(fds[1]);
 
-    var server: IpcServer = .{
-        .allocator = a,
-        .loop = &loop,
-        .socket_path = "",
-        .listen_fd = -1,
-        .started = false,
-        .allowed_gid = null,
-        .allow_any_peer = true,
-    };
-    defer {
-        for (&server.clients) |*slot| {
-            if (slot.*) |cli| {
-                loop.removeFd(cli.fd) catch {};
-                posix.close(cli.fd);
-                a.free(cli.buf);
-                a.destroy(cli);
-                slot.* = null;
-            }
-        }
-    }
+    var server = try IpcServer.initDetached(a, &loop);
+    defer server.deinit();
 
     var capture = CaptureDispatch{};
     server.setCommandHandler(.{
@@ -745,30 +833,10 @@ fn initFakeServer(
         else => return error.SkipZigTest,
     }
 
-    server.* = .{
-        .allocator = a,
-        .loop = loop,
-        .socket_path = "",
-        .listen_fd = -1,
-        .started = false,
-        .allowed_gid = null,
-        .allow_any_peer = true,
-    };
+    server.* = try IpcServer.initDetached(a, loop);
+    errdefer server.deinit();
     server.setCommandHandler(handler);
     try server.admitClient(fds[0], .{ .pid = 0, .uid = 0, .gid = 0 });
-}
-
-fn drainFakeServer(a: std.mem.Allocator, loop: *EventLoop, server: *IpcServer) void {
-    _ = a;
-    for (&server.clients) |*slot| {
-        if (slot.*) |cli| {
-            loop.removeFd(cli.fd) catch {};
-            posix.close(cli.fd);
-            server.allocator.free(cli.buf);
-            server.allocator.destroy(cli);
-            slot.* = null;
-        }
-    }
 }
 
 fn runLoopBriefly(loop: *EventLoop, ms: u64) !void {
@@ -799,7 +867,7 @@ test "ipc: malformed command receives err response and client stays open" {
     var fds: [2]i32 = undefined;
     var server: IpcServer = undefined;
     try initFakeServer(&server, a, &loop, &fds, handler);
-    defer drainFakeServer(a, &loop, &server);
+    defer server.deinit();
     defer posix.close(fds[1]);
 
     const bad: [5]u8 = [_]u8{ 0x01, 0x00, 0x00, 0x00, 0xFE };
@@ -843,7 +911,7 @@ test "ipc: oversized length prefix closes the client" {
     var fds: [2]i32 = undefined;
     var server: IpcServer = undefined;
     try initFakeServer(&server, a, &loop, &fds, handler);
-    defer drainFakeServer(a, &loop, &server);
+    defer server.deinit();
     defer posix.close(fds[1]);
 
     var prefix: [4]u8 = undefined;
