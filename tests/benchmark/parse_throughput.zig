@@ -5,7 +5,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const engine = @import("engine");
-const parser = @import("../../engine/core/parser.zig");
+const parser = engine.parser_mod;
 
 const testing = std.testing;
 

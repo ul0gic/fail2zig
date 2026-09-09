@@ -8,7 +8,7 @@ const shared = @import("shared");
 const engine = @import("engine");
 
 const state = engine.state_mod;
-const parser = @import("../../engine/core/parser.zig");
+const parser = engine.parser_mod;
 
 const testing = std.testing;
 

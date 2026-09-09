@@ -17,6 +17,13 @@ build details.
   a Linux lab host — not part of `zig build test`. See
   [`harness/README.md`](harness/README.md).
 
+`module_graph_guard.zig` runs under `zig build test` and fails if any
+file under `tests/` uses a parent-relative `@import("..`. Tests reach
+engine code only through the `engine` module (or a named module such as
+`parser` for the fuzz targets); a second path to the same source file
+makes Zig's "file exists in multiple modules" error fire depending on
+analysis order (QA-005).
+
 Unit tests live inline with the code they test (`test "..." { ... }`
 blocks in the source files themselves) — that's Zig's convention.
 `zig build test` picks up both the inline tests and anything wired into

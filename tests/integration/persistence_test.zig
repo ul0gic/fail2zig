@@ -11,15 +11,8 @@ const engine = @import("engine");
 const harness_mod = @import("harness.zig");
 const Harness = harness_mod.Harness;
 
-const persist = engine.state_mod;
 const state = engine.state_mod;
-
-const persist_mod = struct {
-    pub const save = @import("../../engine/core/persist.zig").save;
-    pub const load = @import("../../engine/core/persist.zig").load;
-    pub const seed = @import("../../engine/core/persist.zig").seed;
-    pub const StateEntry = @import("../../engine/core/persist.zig").StateEntry;
-};
+const persist_mod = engine.persist_mod;
 
 const testing = std.testing;
 

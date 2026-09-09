@@ -86,6 +86,17 @@ pub fn build(b: *std.Build) void {
     const run_shared_tests = b.addRunArtifact(shared_tests);
     test_step.dependOn(&run_shared_tests.step);
 
+    const guard_options = b.addOptions();
+    guard_options.addOption([]const u8, "tests_dir", b.pathFromRoot("tests"));
+    const guard_mod = b.createModule(.{
+        .root_source_file = b.path("tests/module_graph_guard.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    guard_mod.addImport("guard_options", guard_options.createModule());
+    const guard_tests = b.addTest(.{ .root_module = guard_mod, .filters = test_filters });
+    test_step.dependOn(&b.addRunArtifact(guard_tests).step);
+
     const integration_mod = b.createModule(.{
         .root_source_file = b.path("tests/integration_ipc_roundtrip.zig"),
         .target = target,
