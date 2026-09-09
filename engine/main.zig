@@ -900,7 +900,7 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     watcher.attach() catch |err|
         return failClosed(err, "log_watcher: attach failed: {s}", .{@errorName(err)});
 
-    var journald = journald_source_mod.JournaldSource.init(heap, &loop, cfg.global.state_file) catch |err|
+    var journald = journald_source_mod.JournaldSource.init(heap, &loop, cfg.global.state_file, .{}) catch |err|
         return failClosed(err, "journald: init failed: {s}", .{@errorName(err)});
     defer journald.deinit();
 
@@ -2371,7 +2371,7 @@ test "ENH-004 e2e: real file move-away → real detach → DEGRADED + log_source
     var backend_val: firewall.Backend = .{ .nftables = firewall.nftables.NftablesBackend{} };
     defer backend_val.deinit();
 
-    var journald_src = journald_source_mod.JournaldSource.init(a, &loop, log_path) catch return error.SkipZigTest;
+    var journald_src = journald_source_mod.JournaldSource.init(a, &loop, log_path, .{}) catch return error.SkipZigTest;
     defer journald_src.deinit();
     var health_sources = HealthSources{ .watcher = &watcher, .journald = &journald_src };
 
@@ -2450,7 +2450,7 @@ test "ENH-004 e2e: a quiet healthy file jail stays ACTIVE, gauge 1 (no false fla
     var cfg = config_mod.Config{ .global = .{}, .defaults = .{ .banaction = .nftables }, .jails = &jails, .diag = .{} };
     var backend_val: firewall.Backend = .{ .nftables = firewall.nftables.NftablesBackend{} };
     defer backend_val.deinit();
-    var journald_src = journald_source_mod.JournaldSource.init(a, &loop, log_path) catch return error.SkipZigTest;
+    var journald_src = journald_source_mod.JournaldSource.init(a, &loop, log_path, .{}) catch return error.SkipZigTest;
     defer journald_src.deinit();
     var health_sources = HealthSources{ .watcher = &watcher, .journald = &journald_src };
     var cmd_ctx: commands_mod.Context = .{
@@ -2501,7 +2501,7 @@ test "ENH-004 e2e: a never-appeared (late) log is NOT degraded, gauge 0 (no fals
     var cfg = config_mod.Config{ .global = .{}, .defaults = .{ .banaction = .nftables }, .jails = &jails, .diag = .{} };
     var backend_val: firewall.Backend = .{ .nftables = firewall.nftables.NftablesBackend{} };
     defer backend_val.deinit();
-    var journald_src = journald_source_mod.JournaldSource.init(a, &loop, log_path) catch return error.SkipZigTest;
+    var journald_src = journald_source_mod.JournaldSource.init(a, &loop, log_path, .{}) catch return error.SkipZigTest;
     defer journald_src.deinit();
     var health_sources = HealthSources{ .watcher = &watcher, .journald = &journald_src };
     var cmd_ctx: commands_mod.Context = .{

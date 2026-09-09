@@ -135,17 +135,28 @@ fi
 
 # --- architecture detection ---------------------------------------------------
 
+# Release artifact suffixes are the Zig triples in .github/workflows/release.yml.
 detect_target() {
   local arch
   arch="$(uname -m)"
   case "${arch}" in
     x86_64|amd64)       echo "x86_64-linux-musl" ;;
     aarch64|arm64)      echo "aarch64-linux-musl" ;;
-    armv7l|armv7|armhf)
-      die "armv7 (${arch}) is not yet supported by fail2zig — see SYS-009. Build from source or wait for v0.2.x."
+    armv7l|armv7|armhf) echo "arm-linux-musleabihf" ;;
+    mips|mipsel)
+      # `uname -m` reports "mips" for both byte orders on most kernels, so
+      # read EI_DATA (offset 5) from the running shell's ELF header instead:
+      # 1 = little-endian, 2 = big-endian.
+      local ei_data
+      ei_data="$(od -An -tu1 -j5 -N1 /proc/self/exe | tr -d ' ')"
+      case "${ei_data}" in
+        1) echo "mipsel-linux-musleabi" ;;
+        2) echo "mips-linux-musleabi" ;;
+        *) die "could not determine MIPS byte order (EI_DATA='${ei_data}')" ;;
+      esac
       ;;
-    mips|mipsel|mips64|mips64el)
-      die "mips (${arch}) is not yet supported by fail2zig — see SYS-009."
+    mips64|mips64el)
+      die "64-bit MIPS (${arch}) is not supported; fail2zig ships 32-bit soft-float mips/mipsel builds only"
       ;;
     *)
       die "unsupported architecture: ${arch}"

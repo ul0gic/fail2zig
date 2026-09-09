@@ -15,10 +15,10 @@ SHELL := /usr/bin/env bash
 # binary for an embedded target.
 OPT ?= ReleaseSafe
 
-# Targets that `make cross` produces. `x86_64-linux-musl` and
-# `aarch64-linux-musl` are the two arches v0.1.0 ships for. armv7 + mips
-# are gated on SYS-009.
-CROSS_TARGETS := x86_64-linux-musl aarch64-linux-musl
+# Targets that `make cross` produces — keep identical to the matrix in
+# .github/workflows/release.yml, which is the source of truth.
+CROSS_TARGETS := x86_64-linux-musl aarch64-linux-musl arm-linux-musleabihf \
+                 mips-linux-musleabi mipsel-linux-musleabi
 
 # Install prefix for `make install`. Matches scripts/install.sh defaults.
 PREFIX ?= /usr/local

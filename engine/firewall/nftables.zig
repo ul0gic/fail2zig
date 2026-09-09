@@ -504,16 +504,24 @@ pub const vtable: backend.BackendVTable = .{
 pub const ProbeResult = enum {
     available,
     kernel_unsupported,
+    permission_denied,
     transient,
 };
 
 pub fn probeReason() ProbeResult {
-    var sock = netlink.NetlinkSocket.init(linux.NETLINK.NETFILTER) catch |err| switch (err) {
-        error.ProtocolUnsupported => return .kernel_unsupported,
-        else => return .transient,
+    var sock = netlink.NetlinkSocket.init(linux.NETLINK.NETFILTER) catch |err| {
+        return probeReasonFromInitError(err);
     };
     sock.close();
     return .available;
+}
+
+pub fn probeReasonFromInitError(err: netlink.Error) ProbeResult {
+    return switch (err) {
+        error.ProtocolUnsupported => .kernel_unsupported,
+        error.PermissionDenied => .permission_denied,
+        else => .transient,
+    };
 }
 
 pub fn probeAvailable() bool {
@@ -1438,4 +1446,11 @@ test "nftables: isAvailable on zeroed struct reports probeAvailable result" {
 test "nftables: probeAvailable agrees with probeReason (SYS-014)" {
     const reason = probeReason();
     try std.testing.expectEqual(reason == .available, probeAvailable());
+}
+
+test "nftables: probe maps each netlink init failure to its cause (SYS-014)" {
+    try std.testing.expectEqual(ProbeResult.kernel_unsupported, probeReasonFromInitError(error.ProtocolUnsupported));
+    try std.testing.expectEqual(ProbeResult.permission_denied, probeReasonFromInitError(error.PermissionDenied));
+    try std.testing.expectEqual(ProbeResult.transient, probeReasonFromInitError(error.SocketFailed));
+    try std.testing.expectEqual(ProbeResult.transient, probeReasonFromInitError(error.Timeout));
 }

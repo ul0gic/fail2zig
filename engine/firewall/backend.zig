@@ -126,30 +126,41 @@ pub const AvailabilityProbes = struct {
     iptablesAvailable: *const fn () bool = defaultIptablesAvailable,
 };
 
-pub fn detect(allocator: std.mem.Allocator) BackendError!Backend {
+/// Why no backend is usable. The nf_tables probe is the only kernel-facing one, so its
+/// outcome is the cause; ipset/iptables only fail when their binaries are off PATH.
+pub const DetectError = error{
+    KernelUnsupported,
+    PermissionDenied,
+    Transient,
+};
+
+pub fn causeName(cause: DetectError) []const u8 {
+    return switch (cause) {
+        error.KernelUnsupported => "nf_tables not in kernel (module not loaded or not compiled in)",
+        error.PermissionDenied => "netlink denied — missing CAP_NET_ADMIN (run as root or setcap cap_net_admin+ep)",
+        error.Transient => "netlink probe failed transiently (retry may succeed)",
+    };
+}
+
+pub fn detect(allocator: std.mem.Allocator) DetectError!Backend {
     return detectWithProbes(allocator, .{});
 }
 
 pub fn detectWithProbes(
     allocator: std.mem.Allocator,
     probes: AvailabilityProbes,
-) BackendError!Backend {
+) DetectError!Backend {
     _ = allocator;
-    switch (probes.nftablesReason()) {
+    const cause: DetectError = switch (probes.nftablesReason()) {
         .available => {
             std.log.info("firewall backend: nftables selected", .{});
             return .{ .nftables = nftables.NftablesBackend{} };
         },
-        .kernel_unsupported => std.log.warn(
-            "firewall backend: nftables unavailable — nf_tables not in kernel " ++
-                "(module not loaded or not compiled in); trying ipset",
-            .{},
-        ),
-        .transient => std.log.warn(
-            "firewall backend: nftables probe failed transiently; trying ipset",
-            .{},
-        ),
-    }
+        .kernel_unsupported => error.KernelUnsupported,
+        .permission_denied => error.PermissionDenied,
+        .transient => error.Transient,
+    };
+    std.log.warn("firewall backend: nftables unavailable — {s}; trying ipset", .{causeName(cause)});
 
     if (probes.ipsetAvailable()) {
         std.log.info("firewall backend: ipset selected", .{});
@@ -162,8 +173,8 @@ pub fn detectWithProbes(
         return .{ .iptables = iptables.IptablesBackend{} };
     }
 
-    std.log.warn("firewall backend: no backend available", .{});
-    return error.NotAvailable;
+    std.log.warn("firewall backend: no backend available — {s}", .{causeName(cause)});
+    return cause;
 }
 
 fn defaultNftablesReason() nftables.ProbeResult {
@@ -240,16 +251,62 @@ test "backend: detect falls back to iptables when only it is available" {
     try std.testing.expectEqual(BackendTag.iptables, be.tag());
 }
 
-test "backend: detect fails closed (NotAvailable) when nothing available (SYS-014)" {
+test "backend: detect falls back past a permission-denied nftables probe (SYS-014)" {
+    const probes: AvailabilityProbes = .{
+        .nftablesReason = testNftReasonPermissionDenied,
+        .ipsetAvailable = testAlwaysTrue,
+        .iptablesAvailable = testAlwaysTrue,
+    };
+    var be = try detectWithProbes(std.testing.allocator, probes);
+    defer be.deinit();
+    try std.testing.expectEqual(BackendTag.ipset, be.tag());
+}
+
+test "backend: detect reports KernelUnsupported when nf_tables absent and nothing else usable (SYS-014)" {
     const probes: AvailabilityProbes = .{
         .nftablesReason = testNftReasonKernelUnsupported,
         .ipsetAvailable = testAlwaysFalse,
         .iptablesAvailable = testAlwaysFalse,
     };
     try std.testing.expectError(
-        error.NotAvailable,
+        error.KernelUnsupported,
         detectWithProbes(std.testing.allocator, probes),
     );
+}
+
+test "backend: detect reports PermissionDenied when netlink is denied and nothing else usable (SYS-014)" {
+    const probes: AvailabilityProbes = .{
+        .nftablesReason = testNftReasonPermissionDenied,
+        .ipsetAvailable = testAlwaysFalse,
+        .iptablesAvailable = testAlwaysFalse,
+    };
+    try std.testing.expectError(
+        error.PermissionDenied,
+        detectWithProbes(std.testing.allocator, probes),
+    );
+}
+
+test "backend: detect reports Transient when the probe failed transiently and nothing else usable (SYS-014)" {
+    const probes: AvailabilityProbes = .{
+        .nftablesReason = testNftReasonTransient,
+        .ipsetAvailable = testAlwaysFalse,
+        .iptablesAvailable = testAlwaysFalse,
+    };
+    try std.testing.expectError(
+        error.Transient,
+        detectWithProbes(std.testing.allocator, probes),
+    );
+}
+
+test "backend: causeName is distinct and non-empty for every DetectError (SYS-014)" {
+    const causes = comptime @typeInfo(DetectError).error_set.?;
+    inline for (causes, 0..) |c, i| {
+        const name = causeName(@field(DetectError, c.name));
+        try std.testing.expect(name.len > 0);
+        inline for (causes[0..i]) |prev| {
+            try std.testing.expect(!std.mem.eql(u8, name, causeName(@field(DetectError, prev.name))));
+        }
+    }
 }
 
 fn testAlwaysTrue() bool {
@@ -272,6 +329,10 @@ fn testNftReasonTransient() nftables.ProbeResult {
     return .transient;
 }
 
+fn testNftReasonPermissionDenied() nftables.ProbeResult {
+    return .permission_denied;
+}
+
 test "backend: detect with default probes runs without crashing" {
     const result = detect(std.testing.allocator);
     if (result) |be_val| {
@@ -282,6 +343,6 @@ test "backend: detect with default probes runs without crashing" {
             t == .nftables or t == .ipset or t == .iptables,
         );
     } else |err| {
-        try std.testing.expectEqual(error.NotAvailable, err);
+        try std.testing.expect(causeName(err).len > 0);
     }
 }

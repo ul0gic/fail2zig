@@ -171,7 +171,7 @@ sudo fail2zig --foreground --config /etc/fail2zig/config.toml
 .fi
 .SS Cross-compile for aarch64 (from source)
 .nf
-zig build -Dtarget=aarch64-linux-musl -Doptimize=.ReleaseSafe
+zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe
 scp zig-out/bin/fail2zig user@arm-server:/usr/local/bin/
 .fi
 .
