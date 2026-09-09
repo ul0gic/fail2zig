@@ -17,11 +17,12 @@
 # the auto-generated commit list below. The file is transient: commit it
 # along with the tag, delete it after the release is published.
 #
-# Cross-compile matrix covers x86_64, aarch64, and armv7 (arm-linux-musleabihf).
-# mips-linux-musl is still excluded: SYS-009's code bugs (u64 atomics + timeval
-# casts) are fixed, but Zig 0.14.1 cannot provide musl libc for the
-# `mips-linux-musl` target ("unable to find or provide libc for target
-# 'mips-linux...-musl'"). That's a toolchain limitation, not our code.
+# Cross-compile matrix: x86_64, aarch64, armv7 (arm-linux-musleabihf), and
+# mips/mipsel (mips[el]-linux-musleabi, soft-float MIPS32r2). mips ships via
+# the float-ABI-suffixed triples because no Zig release provides libc for the
+# bare `mips-linux-musl` triple — the earlier "Zig 0.14.1 lacks mips musl libc"
+# diagnosis was wrong, the triple was (ADR-012, SYS-013). The mips pair is
+# smoke-run under qemu-user-static before it is published.
 
 name: Release
 
@@ -48,11 +49,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # mips-linux-musl excluded — Zig 0.14.1 lacks musl libc for it (SYS-009).
+        # The bare `mips-linux-musl` triple has no libc in any Zig release;
+        # the float-ABI-suffixed musleabi triples do (ADR-012).
         target:
           - x86_64-linux-musl
           - aarch64-linux-musl
           - arm-linux-musleabihf
+          - mips-linux-musleabi
+          - mipsel-linux-musleabi
+        include:
+          - target: mips-linux-musleabi
+            qemu: qemu-mips-static
+          - target: mipsel-linux-musleabi
+            qemu: qemu-mipsel-static
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -100,6 +109,24 @@ jobs:
             echo "::error::fail2zig is dynamically linked; expected static musl binary"
             exit 1
           fi
+
+      - name: Smoke-test under qemu-user-static
+        if: matrix.qemu != ''
+        # Runs after strip so the exact bytes that get published are what is
+        # executed. The version printed must match the tag being released.
+        env:
+          QEMU: ${{ matrix.qemu }}
+          EXPECTED: ${{ steps.version.outputs.version }}
+        run: |
+          sudo apt-get install -y qemu-user-static
+          for bin in fail2zig fail2zig-client; do
+            out="$("${QEMU}" "zig-out/bin/${bin}" --version)"
+            echo "${QEMU} ${bin} --version -> ${out}"
+            if [ "${out}" != "${bin} ${EXPECTED}" ]; then
+              echo "::error::${bin} --version printed '${out}', expected '${bin} ${EXPECTED}'"
+              exit 1
+            fi
+          done
 
       - name: Rename artifacts
         run: |

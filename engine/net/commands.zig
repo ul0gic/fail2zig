@@ -51,10 +51,60 @@ fn defaultNoSource(ctx: ?*anyopaque, jail_name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Why no firewall backend is usable: the probe cause (11.4.1) or the init failure of the backend it picked.
+pub const NoBackendCause = union(enum) {
+    detect: firewall.DetectError,
+    init: firewall.BackendError,
+
+    pub fn name(self: NoBackendCause) []const u8 {
+        return switch (self) {
+            .detect => |e| @errorName(e),
+            .init => |e| @errorName(e),
+        };
+    }
+
+    pub fn describe(self: NoBackendCause, buf: []u8) []const u8 {
+        return switch (self) {
+            .detect => |e| firewall.causeName(e),
+            .init => |e| std.fmt.bufPrint(buf, "backend init failed: {s}", .{@errorName(e)}) catch "backend init failed",
+        };
+    }
+};
+
+/// Single source of truth for whether a jail's configured banaction is actually enforced (ADR-006/007, ENH-006).
+pub const FirewallState = union(enum) {
+    ready,
+    not_needed,
+    unavailable: NoBackendCause,
+
+    pub fn effectiveAction(self: FirewallState, configured: config_mod.BanAction) config_mod.BanAction {
+        return switch (self) {
+            .ready => configured,
+            .not_needed, .unavailable => .@"log-only",
+        };
+    }
+
+    pub fn cause(self: FirewallState) ?NoBackendCause {
+        return switch (self) {
+            .unavailable => |c| c,
+            else => null,
+        };
+    }
+};
+
+pub fn firewallNeeded(cfg: *const config_mod.Config) bool {
+    for (cfg.jails) |*jc| {
+        if (!jc.enabled) continue;
+        if (config_mod.resolveJailFromConfig(jc, cfg.defaults).banaction != .@"log-only") return true;
+    }
+    return false;
+}
+
 pub const Context = struct {
     trackers: *tracker_map_mod.TrackerMap,
     config: *const config_mod.Config,
-    backend: *firewall.Backend,
+    backend: ?*firewall.Backend,
+    firewall_state: FirewallState = .ready,
     stats_source: StatsSource = .{},
     health_source: JailHealthSource = .{},
     source_descriptor: JailSourceSource = .{},
@@ -97,7 +147,7 @@ pub const Context = struct {
             0;
         const stats = self.stats_source.snapshot(self.stats_source.ctx);
         const active_bans = self.trackers.totalActiveBans();
-        const backend_name = @tagName(self.backend.tag());
+        const backend_name: []const u8 = if (self.backend) |be| @tagName(be.tag()) else "none";
         const protection = self.computeOverallState();
         const jails_active = self.enabledJailCount();
 
@@ -114,6 +164,9 @@ pub const Context = struct {
         try w.print("\"jail_count\":{d},", .{self.config.jails.len});
         try w.print("\"jails_active\":{d},", .{jails_active});
         try w.print("\"protection\":\"{s}\",", .{protection});
+        if (self.firewall_state.cause()) |c| {
+            try w.print("\"protection_cause\":\"{s}\",", .{c.name()});
+        }
         try w.print("\"backend\":\"{s}\"", .{backend_name});
         try w.writeAll("}");
 
@@ -129,14 +182,19 @@ pub const Context = struct {
         return n;
     }
 
+    pub fn jailEnforcing(self: *const Context, jc: *const config_mod.JailConfig) bool {
+        const resolved = config_mod.resolveJailFromConfig(jc, self.config.defaults);
+        return self.firewall_state.effectiveAction(resolved.banaction) != .@"log-only";
+    }
+
     pub fn computeOverallState(self: *const Context) []const u8 {
+        if (self.firewall_state == .unavailable) return "degraded";
         var any_enforcing = false;
         var any_log_only = false;
         var any_degraded = false;
         for (self.config.jails) |*jc| {
             if (!jc.enabled) continue;
-            const resolved = config_mod.resolveJailFromConfig(jc, self.config.defaults);
-            if (resolved.banaction == .@"log-only") {
+            if (!self.jailEnforcing(jc)) {
                 any_log_only = true;
             } else {
                 any_enforcing = true;
@@ -157,7 +215,8 @@ pub const Context = struct {
         args: shared.Command.Ban,
     ) !shared.Response {
         const duration: shared.Duration = args.duration orelse self.config.defaults.bantime;
-        self.backend.ban(args.ip, args.jail, duration) catch |err| {
+        const be = self.backend orelse return errResponse(a, 503, "no firewall backend");
+        be.ban(args.ip, args.jail, duration) catch |err| {
             return errResponse(a, 500, @errorName(err));
         };
 
@@ -176,8 +235,9 @@ pub const Context = struct {
         a: std.mem.Allocator,
         args: shared.Command.Unban,
     ) !shared.Response {
+        const be = self.backend orelse return errResponse(a, 503, "no firewall backend");
         if (args.jail) |j| {
-            self.backend.unban(args.ip, j) catch |err| {
+            be.unban(args.ip, j) catch |err| {
                 return errResponse(a, 500, @errorName(err));
             };
             if (self.trackers.getByJail(j)) |t| t.clearBan(args.ip);
@@ -185,7 +245,7 @@ pub const Context = struct {
             var any_ok = false;
             for (self.config.jails) |jc| {
                 const jid = shared.JailId.fromSlice(jc.name) catch continue;
-                self.backend.unban(args.ip, jid) catch continue;
+                be.unban(args.ip, jid) catch continue;
                 any_ok = true;
                 if (self.trackers.get(jc.name)) |t| t.clearBan(args.ip);
             }
@@ -210,7 +270,8 @@ pub const Context = struct {
         try w.writeAll("[");
 
         if (args.jail) |j| {
-            const ips = self.backend.listBans(j, a) catch |err| {
+            const be = self.backend orelse return errResponse(a, 503, "no firewall backend");
+            const ips = be.listBans(j, a) catch |err| {
                 return errResponse(a, 500, @errorName(err));
             };
             defer a.free(ips);
@@ -266,8 +327,8 @@ pub const Context = struct {
                     resolved.maxretry,
                     resolved.findtime,
                     resolved.bantime,
-                    @tagName(resolved.banaction),
-                    if (resolved.banaction != .@"log-only") "true" else "false",
+                    @tagName(self.firewall_state.effectiveAction(resolved.banaction)),
+                    if (self.jailEnforcing(jc)) "true" else "false",
                     log_source,
                     lines_seen,
                 },
@@ -1090,4 +1151,138 @@ test "commands: handleUnban without jail returns 404 when no jails configured" {
     defer resp.deinit(a);
     try testing.expect(resp == .err);
     try testing.expectEqual(@as(u16, 404), resp.err.code);
+}
+
+const ResolverCase = struct {
+    fw: FirewallState,
+    jails: []config_mod.JailConfig,
+    want_state: []const u8,
+    want_enforcing: []const bool,
+};
+
+test "commands: resolver truth table — firewall state × jail actions → protection + per-jail enforcing (SYS-014, ENH-006)" {
+    const a = testing.allocator;
+    var enforcing_jails = [_]config_mod.JailConfig{
+        .{ .name = "sshd", .enabled = true, .banaction = .nftables },
+        .{ .name = "audit", .enabled = true, .banaction = .@"log-only" },
+    };
+    var log_only_jails = [_]config_mod.JailConfig{
+        .{ .name = "sshd", .enabled = true, .banaction = .@"log-only" },
+        .{ .name = "off", .enabled = false, .banaction = .nftables },
+    };
+    const cases = [_]ResolverCase{
+        .{ .fw = .ready, .jails = &enforcing_jails, .want_state = "mixed", .want_enforcing = &.{ true, false } },
+        .{ .fw = .{ .unavailable = .{ .detect = error.PermissionDenied } }, .jails = &enforcing_jails, .want_state = "degraded", .want_enforcing = &.{ false, false } },
+        .{ .fw = .{ .unavailable = .{ .init = error.NotAvailable } }, .jails = &enforcing_jails, .want_state = "degraded", .want_enforcing = &.{ false, false } },
+        .{ .fw = .not_needed, .jails = &log_only_jails, .want_state = "log-only", .want_enforcing = &.{ false, false } },
+    };
+    for (cases) |c| {
+        var trackers = makeEmptyTrackerMap(a);
+        defer trackers.deinit();
+        var cfg = config_mod.Config{ .global = .{}, .defaults = .{ .banaction = .nftables }, .jails = c.jails, .diag = .{} };
+        var stub = StubBackend{};
+        var be = realBackendFromStub(&stub);
+        defer be.deinit();
+        var ctx = Context{ .trackers = &trackers, .config = &cfg, .backend = &be, .firewall_state = c.fw };
+        try testing.expectEqualStrings(c.want_state, ctx.computeOverallState());
+        for (c.jails, c.want_enforcing) |*jc, want| {
+            try testing.expectEqual(want, ctx.jailEnforcing(jc));
+        }
+    }
+}
+
+test "commands: firewallNeeded is false only when every enabled jail is log-only (ENH-006)" {
+    var all_log_only = [_]config_mod.JailConfig{
+        .{ .name = "sshd", .enabled = true, .banaction = .@"log-only" },
+        .{ .name = "nginx", .enabled = false, .banaction = .nftables },
+    };
+    const cfg_lo = config_mod.Config{ .global = .{}, .defaults = .{ .banaction = .nftables }, .jails = &all_log_only, .diag = .{} };
+    try testing.expect(!firewallNeeded(&cfg_lo));
+
+    var via_defaults = [_]config_mod.JailConfig{.{ .name = "sshd", .enabled = true }};
+    const cfg_def = config_mod.Config{ .global = .{}, .defaults = .{ .banaction = .@"log-only" }, .jails = &via_defaults, .diag = .{} };
+    try testing.expect(!firewallNeeded(&cfg_def));
+
+    var one_enforcing = [_]config_mod.JailConfig{
+        .{ .name = "sshd", .enabled = true, .banaction = .@"log-only" },
+        .{ .name = "nginx", .enabled = true, .banaction = .ipset },
+    };
+    const cfg_enf = config_mod.Config{ .global = .{}, .defaults = .{ .banaction = .@"log-only" }, .jails = &one_enforcing, .diag = .{} };
+    try testing.expect(firewallNeeded(&cfg_enf));
+}
+
+test "commands: status JSON carries degraded + protection_cause + backend none when no backend is usable (SYS-014)" {
+    const a = testing.allocator;
+    var trackers = makeEmptyTrackerMap(a);
+    defer trackers.deinit();
+    var jails = [_]config_mod.JailConfig{.{ .name = "sshd", .enabled = true, .banaction = .nftables }};
+    var cfg = config_mod.Config{ .global = .{}, .defaults = .{ .banaction = .nftables }, .jails = &jails, .diag = .{} };
+
+    var ctx = Context{
+        .trackers = &trackers,
+        .config = &cfg,
+        .backend = null,
+        .firewall_state = .{ .unavailable = .{ .detect = error.PermissionDenied } },
+    };
+    const resp = try ctx.handle(.{ .status = {} }, a);
+    defer resp.deinit(a);
+    try testing.expect(std.mem.indexOf(u8, resp.ok.payload, "\"protection\":\"degraded\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.ok.payload, "\"protection_cause\":\"PermissionDenied\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.ok.payload, "\"backend\":\"none\"") != null);
+
+    const jails_resp = try ctx.handle(.{ .list_jails = {} }, a);
+    defer jails_resp.deinit(a);
+    try testing.expect(std.mem.indexOf(u8, jails_resp.ok.payload, "\"action\":\"log-only\",\"enforcing\":false") != null);
+}
+
+test "commands: status JSON omits protection_cause and reports log-only when the backend is not needed (ENH-006)" {
+    const a = testing.allocator;
+    var trackers = makeEmptyTrackerMap(a);
+    defer trackers.deinit();
+    var jails = [_]config_mod.JailConfig{.{ .name = "sshd", .enabled = true, .banaction = .@"log-only" }};
+    var cfg = config_mod.Config{ .global = .{}, .defaults = .{ .banaction = .nftables }, .jails = &jails, .diag = .{} };
+
+    var ctx = Context{ .trackers = &trackers, .config = &cfg, .backend = null, .firewall_state = .not_needed };
+    const resp = try ctx.handle(.{ .status = {} }, a);
+    defer resp.deinit(a);
+    try testing.expect(std.mem.indexOf(u8, resp.ok.payload, "\"protection\":\"log-only\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.ok.payload, "protection_cause") == null);
+    try testing.expect(std.mem.indexOf(u8, resp.ok.payload, "\"backend\":\"none\"") != null);
+}
+
+test "commands: manual ban/unban/list-by-jail answer 503 with no backend instead of touching a firewall (SYS-014)" {
+    const a = testing.allocator;
+    var trackers = makeEmptyTrackerMap(a);
+    defer trackers.deinit();
+    var cfg = makeConfig();
+    var ctx = Context{
+        .trackers = &trackers,
+        .config = &cfg,
+        .backend = null,
+        .firewall_state = .{ .unavailable = .{ .detect = error.Transient } },
+    };
+    const ip = try shared.IpAddress.parse("203.0.113.9");
+    const jail = try shared.JailId.fromSlice("sshd");
+
+    const ban = try ctx.handle(.{ .ban = .{ .ip = ip, .jail = jail, .duration = null } }, a);
+    defer ban.deinit(a);
+    try testing.expectEqual(@as(u16, 503), ban.err.code);
+
+    const unban = try ctx.handle(.{ .unban = .{ .ip = ip, .jail = jail } }, a);
+    defer unban.deinit(a);
+    try testing.expectEqual(@as(u16, 503), unban.err.code);
+
+    const list = try ctx.handle(.{ .list = .{ .jail = jail } }, a);
+    defer list.deinit(a);
+    try testing.expectEqual(@as(u16, 503), list.err.code);
+}
+
+test "commands: NoBackendCause names and describes both detect and init causes (SYS-014)" {
+    var buf: [96]u8 = undefined;
+    const d: NoBackendCause = .{ .detect = error.KernelUnsupported };
+    try testing.expectEqualStrings("KernelUnsupported", d.name());
+    try testing.expectEqualStrings(firewall.causeName(error.KernelUnsupported), d.describe(&buf));
+    const i: NoBackendCause = .{ .init = error.NotAvailable };
+    try testing.expectEqualStrings("NotAvailable", i.name());
+    try testing.expectEqualStrings("backend init failed: NotAvailable", i.describe(&buf));
 }

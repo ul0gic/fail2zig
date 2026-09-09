@@ -113,6 +113,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "migration", .path = "tests/integration/migration_test.zig", .needs_daemon_binary = false },
         .{ .name = "persistence", .path = "tests/integration/persistence_test.zig", .needs_daemon_binary = true },
         .{ .name = "status_surface", .path = "tests/integration/status_surface_test.zig", .needs_daemon_binary = false },
+        .{ .name = "startup_failclosed", .path = "tests/integration/startup_failclosed_test.zig", .needs_daemon_binary = true },
+        .{ .name = "config_diag", .path = "tests/integration/config_diag_test.zig", .needs_daemon_binary = true },
+        .{ .name = "no_backend", .path = "tests/integration/no_backend_test.zig", .needs_daemon_binary = true },
     };
     for (integration_files) |f| {
         const mod = b.createModule(.{
@@ -175,6 +178,7 @@ pub fn build(b: *std.Build) void {
         .{ .path = "tests/benchmark/memory_ceiling.zig", .needs_daemon_binary = false },
         .{ .path = "tests/benchmark/startup_time.zig", .needs_daemon_binary = true },
         .{ .path = "tests/benchmark/ban_latency.zig", .needs_daemon_binary = false },
+        .{ .path = "tests/benchmark/loop_latency.zig", .needs_daemon_binary = false },
     };
     for (bench_files) |f| {
         const mod = b.createModule(.{

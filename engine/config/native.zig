@@ -22,21 +22,55 @@ pub const Error = error{
     TooManyJails,
     OutOfMemory,
     ReadFailed,
+    ConfigWorldWritable,
+    ConfigGroupWritable,
 };
 
 pub const Diagnostic = struct {
-    line: u32 = 1,
-    col: u32 = 1,
-    message: []const u8 = "",
+    line: u32 = 0,
+    col: u32 = 0,
+    mode: u32 = 0,
+    key_len: u8 = 0,
+    section_len: u8 = 0,
+    key_buf: [max_name]u8 = [_]u8{0} ** max_name,
+    section_buf: [max_name]u8 = [_]u8{0} ** max_name,
+
+    pub const max_name: usize = 64;
+
+    pub fn key(self: *const Diagnostic) []const u8 {
+        return self.key_buf[0..self.key_len];
+    }
+
+    pub fn section(self: *const Diagnostic) []const u8 {
+        return self.section_buf[0..self.section_len];
+    }
+
+    fn copyName(dst: *[max_name]u8, src: []const u8) u8 {
+        const n = @min(src.len, max_name);
+        for (src[0..n], 0..) |c, i| {
+            dst[i] = if (std.ascii.isPrint(c)) c else '?';
+        }
+        return @intCast(n);
+    }
 };
 
 pub const LogLevel = enum { debug, info, warn, err };
 
 pub const BanAction = enum { nftables, iptables, ipset, @"log-only" };
 
-pub const LogSource = enum { auto, file, journald };
+pub const LogSource = enum { auto, file, journald, internal };
+
+/// The only filter the in-process `internal` source feeds (ADR-013): confirmed bans from every other jail.
+pub const internal_filter: []const u8 = "recidive";
+
+pub fn filterSupportsInternal(filter: []const u8) bool {
+    return std.mem.eql(u8, filter, internal_filter);
+}
 
 pub const BantimeFormula = enum { linear, exponential };
+
+/// ADR-007: what the daemon does when an enforcing jail exists but no firewall backend is usable.
+pub const OnNoBackend = enum { @"fail-closed", @"log-only" };
 
 pub const BanTimeIncrement = struct {
     enabled: bool = false,
@@ -55,6 +89,7 @@ pub const GlobalConfig = struct {
     metrics_bind: []const u8 = "127.0.0.1",
     metrics_port: u16 = 9100,
     websocket_max_clients: u32 = 16,
+    on_no_backend: OnNoBackend = .@"fail-closed",
 };
 
 pub const websocket_hard_max_clients: u32 = 1024;
@@ -66,6 +101,7 @@ pub const JailDefaults = struct {
     banaction: BanAction = .nftables,
     ignoreip: []const []const u8 = &.{},
     bantime_increment: BanTimeIncrement = .{},
+    source: LogSource = .auto,
 };
 
 pub const JailConfig = struct {
@@ -137,6 +173,17 @@ pub const Config = struct {
     diag: Diagnostic = .{},
 
     pub fn loadFile(arena: std.mem.Allocator, path: []const u8) Error!Config {
+        var scratch: Diagnostic = .{};
+        return loadFileDiag(arena, path, &scratch);
+    }
+
+    pub fn parse(arena: std.mem.Allocator, source: []const u8) Error!Config {
+        var scratch: Diagnostic = .{};
+        return parseDiag(arena, source, &scratch);
+    }
+
+    pub fn loadFileDiag(arena: std.mem.Allocator, path: []const u8, out: *Diagnostic) Error!Config {
+        out.* = .{};
         const file = std.fs.cwd().openFile(path, .{}) catch |err| return switch (err) {
             error.FileNotFound => error.FileNotFound,
             error.AccessDenied => error.AccessDenied,
@@ -144,17 +191,29 @@ pub const Config = struct {
         };
         defer file.close();
 
+        const st = std.posix.fstat(file.handle) catch return error.ReadFailed;
+        out.mode = st.mode & 0o7777;
+        try checkConfigPerms(st.mode, st.gid);
+        if (st.uid != 0) {
+            std.log.warn("config: {s} is owned by uid {d}, not root", .{ path, st.uid });
+        }
+
         const max_size: usize = 1024 * 1024;
         const bytes = file.readToEndAlloc(arena, max_size) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.ReadFailed,
         };
-        return parse(arena, bytes);
+        return parseDiag(arena, bytes, out);
     }
 
-    pub fn parse(arena: std.mem.Allocator, source: []const u8) Error!Config {
+    pub fn checkConfigPerms(mode: u32, gid: u32) error{ ConfigWorldWritable, ConfigGroupWritable }!void {
+        if (mode & std.posix.S.IWOTH != 0) return error.ConfigWorldWritable;
+        if (mode & std.posix.S.IWGRP != 0 and gid != 0) return error.ConfigGroupWritable;
+    }
+
+    pub fn parseDiag(arena: std.mem.Allocator, source: []const u8, out: *Diagnostic) Error!Config {
         var p = Parser.init(arena, source);
-        return p.parseConfig();
+        return p.parseConfig(out);
     }
 
     pub fn load(allocator: std.mem.Allocator, path: []const u8) Error!Config {
@@ -222,7 +281,7 @@ pub fn validate(cfg: *const Config) ValidationError!void {
             const would_use_journald = switch (j.source) {
                 .journald => true,
                 .auto => !anyLogpathExists(j.logpath) and filterSupportsJournald(j.filter),
-                .file => false,
+                .file, .internal => false,
             };
             if (would_use_journald and !journalctlPresent()) {
                 std.log.warn(
@@ -248,7 +307,18 @@ const Parser = struct {
     global: GlobalConfig,
     defaults: JailDefaults,
     jails: std.ArrayList(JailConfig),
-    seen_keys: std.ArrayList([]const u8),
+    seen_keys: std.StringHashMap(void),
+    jail_source_origin: std.ArrayList(SourceOrigin),
+    defaults_source_origin: SourceOrigin = .unset,
+
+    cur_section: []const u8 = "",
+    cur_key: []const u8 = "",
+    section_pos: Pos = .{},
+    key_pos: Pos = .{},
+    value_pos: Pos = .{},
+
+    const Pos = struct { line: u32 = 1, col: u32 = 1 };
+    const SourceOrigin = enum { unset, source, backend };
 
     const TOP_GLOBAL: []const u8 = "global";
     const TOP_DEFAULTS: []const u8 = "defaults";
@@ -265,8 +335,33 @@ const Parser = struct {
             .global = .{},
             .defaults = .{},
             .jails = std.ArrayList(JailConfig).init(arena),
-            .seen_keys = std.ArrayList([]const u8).init(arena),
+            .seen_keys = std.StringHashMap(void).init(arena),
+            .jail_source_origin = std.ArrayList(SourceOrigin).init(arena),
         };
+    }
+
+    fn here(self: *const Parser) Pos {
+        return .{ .line = self.line, .col = self.col };
+    }
+
+    fn fillDiag(self: *const Parser, err: Error, out: *Diagnostic) void {
+        const pos: Pos = switch (err) {
+            error.UnknownSection => self.section_pos,
+            error.UnknownKey, error.DuplicateKey, error.TooManyJails => self.key_pos,
+            error.InvalidValue,
+            error.InvalidInteger,
+            error.InvalidFloat,
+            error.InvalidBool,
+            error.InvalidArray,
+            error.UnterminatedString,
+            error.InvalidEscape,
+            => self.value_pos,
+            else => self.here(),
+        };
+        out.line = pos.line;
+        out.col = pos.col;
+        out.key_len = Diagnostic.copyName(&out.key_buf, self.cur_key);
+        out.section_len = Diagnostic.copyName(&out.section_buf, self.cur_section);
     }
 
     fn eof(self: *const Parser) bool {
@@ -287,10 +382,6 @@ const Parser = struct {
         } else {
             self.col += 1;
         }
-    }
-
-    fn diag(self: *const Parser) Diagnostic {
-        return .{ .line = self.line, .col = self.col };
     }
 
     fn skipSpaceTabs(self: *Parser) void {
@@ -325,27 +416,42 @@ const Parser = struct {
         }
     }
 
-    fn parseConfig(self: *Parser) Error!Config {
-        var current_section: []const u8 = "";
+    fn parseConfig(self: *Parser, out: *Diagnostic) Error!Config {
+        return self.parseBody() catch |err| {
+            self.fillDiag(err, out);
+            return err;
+        };
+    }
+
+    fn parseBody(self: *Parser) Error!Config {
         while (true) {
             self.skipBlankAndComments();
             if (self.eof()) break;
 
             if (self.peek() == '[') {
-                const name = try self.parseSectionHeader();
-                current_section = name;
+                self.cur_section = "";
+                self.cur_key = "";
+                self.section_pos = self.here();
+                self.cur_section = try self.parseSectionHeader();
                 try self.expectEndOfLine();
                 continue;
             }
 
-            const key = try self.parseBareKey();
+            self.key_pos = self.here();
+            self.cur_key = try self.parseBareKey();
+            try self.noteKeySeen(self.cur_section, self.cur_key);
             self.skipSpaceTabs();
             if (self.eof() or self.peek() != '=') return error.UnexpectedToken;
             self.advance();
             self.skipSpaceTabs();
+            self.value_pos = self.here();
 
-            try self.dispatchKeyValue(current_section, key);
+            try self.dispatchKeyValue(self.cur_section, self.cur_key);
             try self.expectEndOfLine();
+        }
+
+        for (self.jails.items, self.jail_source_origin.items) |*j, origin| {
+            if (origin == .unset) j.source = self.defaults.source;
         }
 
         return .{
@@ -354,6 +460,12 @@ const Parser = struct {
             .jails = try self.jails.toOwnedSlice(),
             .diag = .{ .line = self.line, .col = self.col },
         };
+    }
+
+    fn noteKeySeen(self: *Parser, section: []const u8, key: []const u8) Error!void {
+        const composite = try std.fmt.allocPrint(self.arena, "{s}\x00{s}", .{ section, key });
+        const gop = self.seen_keys.getOrPut(composite) catch return error.OutOfMemory;
+        if (gop.found_existing) return error.DuplicateKey;
     }
 
     fn parseSectionHeader(self: *Parser) Error![]const u8 {
@@ -594,6 +706,9 @@ const Parser = struct {
             const n = try asInt(v);
             if (n <= 0 or n > websocket_hard_max_clients) return error.InvalidValue;
             self.global.websocket_max_clients = @intCast(n);
+        } else if (std.mem.eql(u8, key, "on_no_backend")) {
+            const s = try asString(v);
+            self.global.on_no_backend = try parseOnNoBackend(s);
         } else return error.UnknownKey;
     }
 
@@ -616,6 +731,14 @@ const Parser = struct {
             self.defaults.banaction = try parseBanAction(s);
         } else if (std.mem.eql(u8, key, "ignoreip")) {
             self.defaults.ignoreip = try asStringArray(v);
+        } else if (std.mem.eql(u8, key, "source")) {
+            if (self.defaults_source_origin == .backend) return error.InvalidValue;
+            self.defaults.source = try parseLogSource(try asString(v));
+            self.defaults_source_origin = .source;
+        } else if (std.mem.eql(u8, key, "backend")) {
+            if (self.defaults_source_origin == .source) return error.InvalidValue;
+            self.defaults.source = try backendAlias(self.cur_section, try asString(v));
+            self.defaults_source_origin = .backend;
         } else if (std.mem.eql(u8, key, "bantime_increment_enabled")) {
             self.defaults.bantime_increment.enabled = try asBool(v);
         } else if (std.mem.eql(u8, key, "bantime_increment_multiplier")) {
@@ -638,7 +761,9 @@ const Parser = struct {
 
     fn applyJailKey(self: *Parser, jail_name: []const u8, key: []const u8) Error!void {
         const v = try self.parseValue();
-        const j = try self.findOrCreateJail(jail_name);
+        const idx = try self.findOrCreateJail(jail_name);
+        const j = &self.jails.items[idx];
+        const origin = &self.jail_source_origin.items[idx];
 
         if (std.mem.eql(u8, key, "enabled")) {
             j.enabled = try asBool(v);
@@ -647,8 +772,13 @@ const Parser = struct {
         } else if (std.mem.eql(u8, key, "logpath")) {
             j.logpath = try asStringArray(v);
         } else if (std.mem.eql(u8, key, "source")) {
-            const s = try asString(v);
-            j.source = try parseLogSource(s);
+            if (origin.* == .backend) return error.InvalidValue;
+            j.source = try parseLogSource(try asString(v));
+            origin.* = .source;
+        } else if (std.mem.eql(u8, key, "backend")) {
+            if (origin.* == .source) return error.InvalidValue;
+            j.source = try backendAlias(self.cur_section, try asString(v));
+            origin.* = .backend;
         } else if (std.mem.eql(u8, key, "maxretry")) {
             const n = try asInt(v);
             if (n < 0) return error.InvalidValue;
@@ -691,15 +821,33 @@ const Parser = struct {
         } else return error.UnknownKey;
     }
 
-    fn findOrCreateJail(self: *Parser, name: []const u8) Error!*JailConfig {
-        for (self.jails.items) |*existing| {
-            if (std.mem.eql(u8, existing.name, name)) return existing;
+    fn findOrCreateJail(self: *Parser, name: []const u8) Error!usize {
+        for (self.jails.items, 0..) |existing, i| {
+            if (std.mem.eql(u8, existing.name, name)) return i;
         }
         if (self.jails.items.len >= MAX_JAILS) return error.TooManyJails;
         try self.jails.append(.{ .name = name });
-        return &self.jails.items[self.jails.items.len - 1];
+        errdefer _ = self.jails.pop();
+        try self.jail_source_origin.append(.unset);
+        return self.jails.items.len - 1;
     }
 };
+
+fn backendAlias(section: []const u8, s: []const u8) Error!LogSource {
+    const mapped = mapBackendAlias(s) orelse return error.InvalidValue;
+    std.log.warn(
+        "config: [{s}] 'backend' is a deprecated fail2ban compatibility alias; use source = \"{s}\"",
+        .{ section, @tagName(mapped) },
+    );
+    return mapped;
+}
+
+pub fn mapBackendAlias(s: []const u8) ?LogSource {
+    if (std.mem.eql(u8, s, "systemd")) return .journald;
+    const auto_names = [_][]const u8{ "auto", "polling", "pyinotify", "gamin" };
+    for (auto_names) |n| if (std.mem.eql(u8, s, n)) return .auto;
+    return null;
+}
 
 fn asString(v: Parser.Value) Error![]const u8 {
     return switch (v) {
@@ -773,10 +921,17 @@ fn parseBanAction(s: []const u8) Error!BanAction {
     return error.InvalidValue;
 }
 
+fn parseOnNoBackend(s: []const u8) Error!OnNoBackend {
+    if (std.mem.eql(u8, s, "fail-closed")) return .@"fail-closed";
+    if (std.mem.eql(u8, s, "log-only")) return .@"log-only";
+    return error.InvalidValue;
+}
+
 fn parseLogSource(s: []const u8) Error!LogSource {
     if (std.mem.eql(u8, s, "auto")) return .auto;
     if (std.mem.eql(u8, s, "file")) return .file;
     if (std.mem.eql(u8, s, "journald")) return .journald;
+    if (std.mem.eql(u8, s, "internal")) return .internal;
     return error.InvalidValue;
 }
 
@@ -1225,7 +1380,12 @@ test "native: loadFile parses a tmp file" {
         \\[global]
         \\memory_ceiling_mb = 32
     ;
-    try tmp.dir.writeFile(.{ .sub_path = "cfg.toml", .data = contents });
+    {
+        const f = try tmp.dir.createFile("cfg.toml", .{});
+        defer f.close();
+        try f.writeAll(contents);
+        try f.chmod(0o640);
+    }
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1427,4 +1587,304 @@ test "native: websocket_max_clients rejects values above hard cap" {
         .{websocket_hard_max_clients + 1},
     );
     try std.testing.expectError(error.InvalidValue, Config.parse(arena.allocator(), src));
+}
+
+test "native: diag reports UnknownKey at the key position with key and section" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[jails.sshd]
+        \\enabled = true
+        \\filter = "sshd"
+        \\bogus = "x"
+    ;
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.UnknownKey, Config.parseDiag(arena.allocator(), src, &diag));
+    try std.testing.expectEqual(@as(u32, 4), diag.line);
+    try std.testing.expectEqual(@as(u32, 1), diag.col);
+    try std.testing.expectEqualStrings("bogus", diag.key());
+    try std.testing.expectEqualStrings("jails.sshd", diag.section());
+}
+
+test "native: diag reports InvalidValue at the value position" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[global]
+        \\
+        \\metrics_port = 70000
+    ;
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.InvalidValue, Config.parseDiag(arena.allocator(), src, &diag));
+    try std.testing.expectEqual(@as(u32, 3), diag.line);
+    try std.testing.expectEqual(@as(u32, 16), diag.col);
+    try std.testing.expectEqualStrings("metrics_port", diag.key());
+    try std.testing.expectEqualStrings("global", diag.section());
+}
+
+test "native: on_no_backend defaults to fail-closed (SYS-014)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cfg = try Config.parse(arena.allocator(), "[global]\nmemory_ceiling_mb = 32\n");
+    try std.testing.expectEqual(OnNoBackend.@"fail-closed", cfg.global.on_no_backend);
+}
+
+test "native: on_no_backend parses both accepted values (SYS-014)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const lo = try Config.parse(arena.allocator(), "[global]\non_no_backend = \"log-only\"\n");
+    try std.testing.expectEqual(OnNoBackend.@"log-only", lo.global.on_no_backend);
+    const fc = try Config.parse(arena.allocator(), "[global]\non_no_backend = \"fail-closed\"\n");
+    try std.testing.expectEqual(OnNoBackend.@"fail-closed", fc.global.on_no_backend);
+}
+
+test "native: on_no_backend rejects any other value with a positioned diag (SYS-014)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[global]
+        \\on_no_backend = "degrade"
+    ;
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.InvalidValue, Config.parseDiag(arena.allocator(), src, &diag));
+    try std.testing.expectEqual(@as(u32, 2), diag.line);
+    try std.testing.expectEqualStrings("on_no_backend", diag.key());
+    try std.testing.expectEqualStrings("global", diag.section());
+
+    var diag_int: Diagnostic = .{};
+    try std.testing.expectError(error.InvalidValue, Config.parseDiag(arena.allocator(), "[global]\non_no_backend = 1\n", &diag_int));
+    try std.testing.expectEqualStrings("on_no_backend", diag_int.key());
+}
+
+test "native: diag reports UnknownSection at the header and UnterminatedString at the value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diagnostic = .{};
+
+    try std.testing.expectError(error.UnknownSection, Config.parseDiag(arena.allocator(), "\n[nope]\nfoo = 1\n", &diag));
+    try std.testing.expectEqual(@as(u32, 2), diag.line);
+    try std.testing.expectEqual(@as(u32, 1), diag.col);
+    try std.testing.expectEqualStrings("nope", diag.section());
+
+    try std.testing.expectError(error.UnterminatedString, Config.parseDiag(arena.allocator(), "[global]\nlog_level = \"info\n", &diag));
+    try std.testing.expectEqual(@as(u32, 2), diag.line);
+    try std.testing.expectEqual(@as(u32, 13), diag.col);
+    try std.testing.expectEqualStrings("log_level", diag.key());
+}
+
+test "native: diag bounds the copied key and sanitizes section bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diagnostic = .{};
+
+    const long_key = "k" ** 200;
+    try std.testing.expectError(error.UnknownKey, Config.parseDiag(arena.allocator(), "[global]\n" ++ long_key ++ " = 1\n", &diag));
+    try std.testing.expectEqual(Diagnostic.max_name, diag.key().len);
+
+    try std.testing.expectError(error.UnknownSection, Config.parseDiag(arena.allocator(), "[a\x01b]\nx = 1\n", &diag));
+    try std.testing.expectEqualStrings("a?b", diag.section());
+}
+
+test "native: duplicate key in one section reports DuplicateKey at the second key" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[jails.sshd]
+        \\filter = "sshd"
+        \\maxretry = 3
+        \\maxretry = 30
+        \\
+    ;
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.DuplicateKey, Config.parseDiag(arena.allocator(), src, &diag));
+    try std.testing.expectEqual(@as(u32, 4), diag.line);
+    try std.testing.expectEqual(@as(u32, 1), diag.col);
+    try std.testing.expectEqualStrings("maxretry", diag.key());
+    try std.testing.expectEqualStrings("jails.sshd", diag.section());
+}
+
+test "native: duplicate key across a repeated section header is still a duplicate" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src = "[jails.sshd]\nmaxretry = 3\n[jails.nginx]\nmaxretry = 5\n[jails.sshd]\nmaxretry = 30\n";
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.DuplicateKey, Config.parseDiag(arena.allocator(), src, &diag));
+    try std.testing.expectEqual(@as(u32, 6), diag.line);
+    try std.testing.expectEqualStrings("jails.sshd", diag.section());
+}
+
+test "native: same key in different sections is not a duplicate" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cfg = try Config.parse(arena.allocator(), "[defaults]\nmaxretry = 3\n[jails.sshd]\nmaxretry = 5\n[jails.nginx]\nmaxretry = 7\n");
+    try std.testing.expectEqual(@as(u32, 3), cfg.defaults.maxretry);
+    try std.testing.expectEqual(@as(u32, 5), cfg.jails[0].maxretry.?);
+    try std.testing.expectEqual(@as(u32, 7), cfg.jails[1].maxretry.?);
+}
+
+test "native: loadFileDiag resets the diagnostic on file errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diagnostic = .{ .line = 9, .col = 9 };
+    try std.testing.expectError(error.FileNotFound, Config.loadFileDiag(arena.allocator(), "/nonexistent/fail2zig.toml", &diag));
+    try std.testing.expectEqual(@as(u32, 0), diag.line);
+    try std.testing.expectEqual(@as(usize, 0), diag.key().len);
+}
+
+test "native: config permission classifier" {
+    try Config.checkConfigPerms(0o640, 1000);
+    try Config.checkConfigPerms(0o644, 1000);
+    try Config.checkConfigPerms(0o660, 0);
+    try std.testing.expectError(error.ConfigGroupWritable, Config.checkConfigPerms(0o660, 1000));
+    try std.testing.expectError(error.ConfigWorldWritable, Config.checkConfigPerms(0o666, 0));
+    try std.testing.expectError(error.ConfigWorldWritable, Config.checkConfigPerms(0o602, 1000));
+}
+
+fn writeTmpConfigWithMode(tmp: *std.testing.TmpDir, mode: std.posix.mode_t) !std.posix.gid_t {
+    const f = try tmp.dir.createFile("cfg.toml", .{});
+    defer f.close();
+    try f.writeAll("[global]\nmemory_ceiling_mb = 32\n");
+    try f.chmod(mode);
+    const st = try std.posix.fstat(f.handle);
+    return st.gid;
+}
+
+test "native: loadFileDiag accepts a 0640 config" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    _ = try writeTmpConfigWithMode(&tmp, 0o640);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const real = try tmp.dir.realpathAlloc(arena.allocator(), "cfg.toml");
+    var diag: Diagnostic = .{};
+    const cfg = try Config.loadFileDiag(arena.allocator(), real, &diag);
+    try std.testing.expectEqual(@as(u32, 32), cfg.global.memory_ceiling_mb);
+    try std.testing.expectEqual(@as(u32, 0o640), diag.mode);
+}
+
+test "native: loadFileDiag rejects a 0666 config and reports the mode" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    _ = try writeTmpConfigWithMode(&tmp, 0o666);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const real = try tmp.dir.realpathAlloc(arena.allocator(), "cfg.toml");
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.ConfigWorldWritable, Config.loadFileDiag(arena.allocator(), real, &diag));
+    try std.testing.expectEqual(@as(u32, 0o666), diag.mode);
+    try std.testing.expectEqual(@as(u32, 0), diag.line);
+}
+
+test "native: loadFileDiag rejects a 0660 config unless the group is root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const gid = try writeTmpConfigWithMode(&tmp, 0o660);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const real = try tmp.dir.realpathAlloc(arena.allocator(), "cfg.toml");
+    var diag: Diagnostic = .{};
+    const result = Config.loadFileDiag(arena.allocator(), real, &diag);
+    if (gid == 0) {
+        _ = try result;
+    } else {
+        try std.testing.expectError(error.ConfigGroupWritable, result);
+    }
+    try std.testing.expectEqual(@as(u32, 0o660), diag.mode);
+}
+
+test "native: backend alias maps every fail2ban name in a jail" {
+    const cases = [_]struct { tok: []const u8, want: LogSource }{
+        .{ .tok = "systemd", .want = .journald },
+        .{ .tok = "auto", .want = .auto },
+        .{ .tok = "polling", .want = .auto },
+        .{ .tok = "pyinotify", .want = .auto },
+        .{ .tok = "gamin", .want = .auto },
+    };
+    for (cases) |c| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var buf: [128]u8 = undefined;
+        const src = try std.fmt.bufPrint(
+            &buf,
+            "[jails.sshd]\nfilter = \"sshd\"\nbackend = \"{s}\"\n",
+            .{c.tok},
+        );
+        const cfg = try Config.parse(arena.allocator(), src);
+        try std.testing.expectEqual(c.want, cfg.jails[0].source);
+    }
+}
+
+test "native: backend alias rejects an unknown name with diag at the value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[jails.sshd]
+        \\filter = "sshd"
+        \\backend = "bogus"
+    ;
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.InvalidValue, Config.parseDiag(arena.allocator(), src, &diag));
+    try std.testing.expectEqual(@as(u32, 3), diag.line);
+    try std.testing.expectEqual(@as(u32, 11), diag.col);
+    try std.testing.expectEqualStrings("backend", diag.key());
+}
+
+test "native: backend and source in the same jail conflict in either order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a =
+        \\[jails.sshd]
+        \\backend = "systemd"
+        \\source = "journald"
+    ;
+    const b =
+        \\[jails.sshd]
+        \\source = "file"
+        \\backend = "systemd"
+    ;
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.InvalidValue, Config.parseDiag(arena.allocator(), a, &diag));
+    try std.testing.expectEqualStrings("source", diag.key());
+    try std.testing.expectError(error.InvalidValue, Config.parseDiag(arena.allocator(), b, &diag));
+    try std.testing.expectEqualStrings("backend", diag.key());
+}
+
+test "native: backend in [defaults] is inherited by jails without an explicit source" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[jails.sshd]
+        \\filter = "sshd"
+        \\[jails.nginx]
+        \\filter = "nginx-http-auth"
+        \\source = "file"
+        \\[defaults]
+        \\backend = "systemd"
+    ;
+    const cfg = try Config.parse(arena.allocator(), src);
+    try std.testing.expectEqual(LogSource.journald, cfg.defaults.source);
+    try std.testing.expectEqual(LogSource.journald, cfg.jails[0].source);
+    try std.testing.expectEqual(LogSource.file, cfg.jails[1].source);
+}
+
+test "native: backend and source conflict in [defaults] and unknown backend is rejected there" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.InvalidValue, Config.parse(arena.allocator(), "[defaults]\nsource = \"auto\"\nbackend = \"systemd\"\n"));
+    try std.testing.expectError(error.InvalidValue, Config.parse(arena.allocator(), "[defaults]\nbackend = \"systemd[journalflags=1]\"\n"));
+    const cfg = try Config.parse(arena.allocator(), "[defaults]\nsource = \"journald\"\n");
+    try std.testing.expectEqual(LogSource.journald, cfg.defaults.source);
+}
+
+test "native: source = \"internal\" parses per jail and in defaults (ENH-005)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cfg = try Config.parse(arena.allocator(), "[defaults]\nsource = \"internal\"\n[jails.recidive]\nfilter = \"recidive\"\nsource = \"internal\"\n");
+    try std.testing.expectEqual(LogSource.internal, cfg.defaults.source);
+    try std.testing.expectEqual(LogSource.internal, cfg.jails[0].source);
+    try std.testing.expect(filterSupportsInternal("recidive"));
+    try std.testing.expect(!filterSupportsInternal("sshd"));
 }

@@ -28,7 +28,7 @@ pub fn reconcileRestoredBans(
     var reinstalled: u32 = 0;
     var it = tracker.iterator();
     while (it.next()) |kv| {
-        if (kv.value_ptr.ban_state != .banned) continue;
+        if (kv.value_ptr.ban_state != .banned or !kv.value_ptr.enforced) continue;
         const expiry = kv.value_ptr.ban_expiry orelse continue;
         if (expiry <= now) continue;
         const remaining: u64 = @intCast(expiry - now);
@@ -69,7 +69,7 @@ pub fn reconcileAllRestoredBans(
         const tracker = kv.value_ptr.*;
         var tit = tracker.iterator();
         while (tit.next()) |entry| {
-            if (entry.value_ptr.ban_state != .banned) continue;
+            if (entry.value_ptr.ban_state != .banned or !entry.value_ptr.enforced) continue;
             const expiry = entry.value_ptr.ban_expiry orelse continue;
             if (expiry <= now) continue;
             const remaining: u64 = @intCast(expiry - now);
@@ -324,4 +324,46 @@ test "reconcile: callback errors are non-fatal, loop continues (SYS-007)" {
 
     try testing.expectEqual(@as(u32, 1), count);
     try testing.expectEqual(@as(u32, 1), ff.count);
+}
+
+test "reconcile: only enforced entries reach the backend; would-bans are skipped in every tracker (BUG-012)" {
+    const alloc = testing.allocator;
+    var tm = tracker_map_mod.TrackerMap.init(alloc);
+    defer tm.deinit();
+    _ = try tm.addTracker("sshd", .{ .max_entries = 16 });
+    _ = try tm.addTracker("audit", .{ .max_entries = 16 });
+    _ = try tm.ensureLegacy(.{ .max_entries = 16 });
+
+    const now: shared.Timestamp = 1_000_000;
+    const j_sshd = try shared.JailId.fromSlice("sshd");
+    const j_audit = try shared.JailId.fromSlice("audit");
+    const entries = [_]persist_mod.StateEntry{
+        .{ .ip = makeIpV4(203, 0, 113, 1), .jail = j_sshd, .attempt_count = 3, .ban_count = 1, .first_attempt = 0, .last_attempt = 0, .ban_expiry = now + 60, .enforced = true },
+        .{ .ip = makeIpV4(203, 0, 113, 2), .jail = j_sshd, .attempt_count = 3, .ban_count = 1, .first_attempt = 0, .last_attempt = 0, .ban_expiry = now + 60, .enforced = false },
+        .{ .ip = makeIpV4(198, 51, 100, 1), .jail = j_audit, .attempt_count = 3, .ban_count = 1, .first_attempt = 0, .last_attempt = 0, .ban_expiry = now + 60, .enforced = false },
+        .{ .ip = makeIpV4(198, 51, 100, 2), .jail = j_audit, .attempt_count = 3, .ban_count = 1, .first_attempt = 0, .last_attempt = 0, .ban_expiry = now + 60, .enforced = true },
+    };
+    try persist_mod.seedMap(&tm, &entries, null, null);
+
+    var metrics = metrics_mod.Metrics.init();
+    _ = metrics.registerJail("sshd");
+    _ = metrics.registerJail("audit");
+    var rec = Recorder.init(alloc);
+    defer rec.deinit();
+    const reinstalled = try reconcileAllRestoredBans(alloc, &tm, &metrics, now, recordApply, @ptrCast(&rec));
+    try testing.expectEqual(@as(u32, 2), reinstalled);
+    try testing.expectEqual(@as(usize, 2), rec.calls.items.len);
+    for (rec.calls.items) |c| {
+        const v4 = c.ip.ipv4;
+        try testing.expect(v4 == makeIpV4(203, 0, 113, 1).ipv4 or v4 == makeIpV4(198, 51, 100, 2).ipv4);
+    }
+    try testing.expectEqual(@as(u32, 2), metrics.snapshot().active_bans);
+
+    var single = try state_mod.StateTracker.init(alloc, .{ .max_entries = 16 });
+    defer single.deinit();
+    try persist_mod.seed(&single, entries[0..2]);
+    var rec2 = Recorder.init(alloc);
+    defer rec2.deinit();
+    try testing.expectEqual(@as(u32, 1), try reconcileRestoredBans(alloc, &single, null, now, recordApply, @ptrCast(&rec2)));
+    try testing.expectEqual(makeIpV4(203, 0, 113, 1).ipv4, rec2.calls.items[0].ip.ipv4);
 }

@@ -49,6 +49,7 @@ pub const StatusPayload = struct {
     total_bans: ?u64 = null,
     parse_rate: ?f64 = null,
     protection: ?[]const u8 = null,
+    protection_cause: ?[]const u8 = null,
     backend: ?[]const u8 = null,
     jails_active: ?u32 = null,
 };
@@ -145,12 +146,13 @@ fn writeStatusPlain(writer: anytype, s: StatusPayload) !void {
     if (s.total_bans) |a| try writer.print("total_bans\t{d}\n", .{a});
     if (s.parse_rate) |p| try writer.print("parse_rate\t{d:.2}\n", .{p});
     if (s.protection) |p| try writer.print("protection\t{s}\n", .{p});
+    if (s.protection_cause) |c| try writer.print("protection_cause\t{s}\n", .{c});
     if (s.backend) |b| try writer.print("backend\t{s}\n", .{b});
     if (s.jails_active) |j| try writer.print("jails_active\t{d}\n", .{j});
 }
 
 fn writeStatusTable(writer: anytype, s: StatusPayload, color: Color) !void {
-    const width: usize = 44;
+    const width = statusWidth(s);
     try drawTopLine(writer, width);
     try writer.writeAll("| ");
     try color.on(writer, Color.bold);
@@ -169,11 +171,37 @@ fn writeStatusTable(writer: anytype, s: StatusPayload, color: Color) !void {
     try rowLabel(writer, "Parse rate:", formatRate(s.parse_rate), width);
     try rowLabel(writer, "Active bans:", formatOptU32(s.active_bans), width);
     try rowLabel(writer, "Total bans:", formatOptU64(s.total_bans), width);
-    try rowLabel(writer, "Protection:", s.protection orelse "-", width);
+    try rowLabel(writer, "Protection:", formatProtection(s), width);
     try rowLabel(writer, "Backend:", s.backend orelse "-", width);
     try rowLabel(writer, "Jails:", formatOptU32(s.jails_active), width);
 
     try drawBotLine(writer, width);
+}
+
+fn statusWidth(s: StatusPayload) usize {
+    var used: usize = 11 + versionLen(s.version) + 10;
+    used = @max(used, rowUsed(formatUptime(s.uptime_seconds)));
+    used = @max(used, rowUsed(formatMemory(s.memory_bytes_used, s.memory_bytes_limit)));
+    used = @max(used, rowUsed(formatRate(s.parse_rate)));
+    used = @max(used, rowUsed(formatOptU32(s.active_bans)));
+    used = @max(used, rowUsed(formatOptU64(s.total_bans)));
+    used = @max(used, rowUsed(formatProtection(s)));
+    used = @max(used, rowUsed(s.backend orelse "-"));
+    used = @max(used, rowUsed(formatOptU32(s.jails_active)));
+    return @max(44, used + 2);
+}
+
+fn rowUsed(value: []const u8) usize {
+    return 2 + label_col + value.len;
+}
+
+const label_col: usize = 13;
+
+fn formatProtection(s: StatusPayload) []const u8 {
+    const p = s.protection orelse return "-";
+    if (!std.mem.eql(u8, p, "degraded")) return p;
+    const cause = s.protection_cause orelse return "DEGRADED";
+    return std.fmt.bufPrint(&scratch, "DEGRADED ({s})", .{cause}) catch "DEGRADED";
 }
 
 fn versionLen(v: ?[]const u8) usize {
@@ -184,7 +212,6 @@ fn versionLen(v: ?[]const u8) usize {
 fn rowLabel(writer: anytype, label: []const u8, value: []const u8, width: usize) !void {
     try writer.writeAll("| ");
     try writer.writeAll(label);
-    const label_col = 13;
     if (label.len < label_col) {
         try writeSpaces(writer, label_col - label.len);
     }
@@ -333,10 +360,16 @@ fn writeListTable(writer: anytype, entries: []const BanEntry, color: Color, now:
         return;
     }
 
-    const ip_col: usize = 18;
-    const jail_col: usize = 18;
-    const time_col: usize = 12;
-    const count_col: usize = 10;
+    const ip_col = colWidth("IP ADDRESS", longestLen(BanEntry, entries, "ip"));
+    const jail_col = colWidth("JAIL", longestLen(BanEntry, entries, "jail"));
+    var time_w: usize = 0;
+    var count_w: usize = 0;
+    for (entries) |e| {
+        time_w = @max(time_w, formatRemaining(remainingFromExpiry(e.ban_expiry, now)).len);
+        count_w = @max(count_w, formatOptU32Local(e.ban_count).len);
+    }
+    const time_col = colWidth("TIME LEFT", time_w);
+    const count_col = colWidth("BAN COUNT", count_w);
 
     try color.on(writer, Color.bold);
     try padRightPrint(writer, "IP ADDRESS", ip_col);
@@ -352,11 +385,11 @@ fn writeListTable(writer: anytype, entries: []const BanEntry, color: Color, now:
 
     for (entries) |e| {
         try color.on(writer, Color.cyan);
-        try padRightPrint(writer, e.ip orelse "-", ip_col);
+        try writeCell(writer, e.ip orelse "-", ip_col);
         try color.off(writer);
-        try padRightPrint(writer, e.jail orelse "-", jail_col);
-        try padRightPrint(writer, formatRemaining(remainingFromExpiry(e.ban_expiry, now)), time_col);
-        try padRightPrint(writer, formatOptU32Local(e.ban_count), count_col);
+        try writeCell(writer, e.jail orelse "-", jail_col);
+        try writeCell(writer, formatRemaining(remainingFromExpiry(e.ban_expiry, now)), time_col);
+        try writeCell(writer, formatOptU32Local(e.ban_count), count_col);
         try writer.writeAll("\n");
     }
 
@@ -447,16 +480,18 @@ fn writeJailsTable(writer: anytype, jails: []const JailEntry, color: Color) !voi
         return;
     }
 
-    const name_col: usize = 20;
-    const state_col: usize = 10;
-    const active_col: usize = 10;
-    const max_col: usize = 10;
-    const find_col: usize = 12;
-    const ban_col: usize = 12;
-    const action_col: usize = 12;
-    const enforce_col: usize = 10;
-    const source_col: usize = 28;
-    const health_col: usize = 10;
+    var w: JailsWidths = .{};
+    for (jails) |j| w.widen(j);
+    const name_col = colWidth("JAIL", longestLen(JailEntry, jails, "name"));
+    const state_col = colWidth("STATE", w.state);
+    const active_col = colWidth("ACTIVE", w.active);
+    const max_col = colWidth("MAX RETRY", w.max);
+    const find_col = colWidth("FIND TIME", w.find);
+    const ban_col = colWidth("BAN TIME", w.ban);
+    const action_col = colWidth("ACTION", longestLen(JailEntry, jails, "action"));
+    const enforce_col = colWidth("ENFORCING", w.enforce);
+    const source_col = colWidth("SOURCE", longestLen(JailEntry, jails, "log_source"));
+    const health_col = colWidth("HEALTH", w.health);
 
     try color.on(writer, Color.bold);
     try padRightPrint(writer, "JAIL", name_col);
@@ -476,39 +511,81 @@ fn writeJailsTable(writer: anytype, jails: []const JailEntry, color: Color) !voi
     try writer.writeAll("\n");
 
     for (jails) |j| {
-        try padRightPrint(writer, j.name orelse "-", name_col);
-        const state_str: []const u8 = if (j.enabled orelse false) "enabled" else "disabled";
-        if (j.enabled orelse false) {
-            try color.on(writer, Color.green);
-        } else {
-            try color.on(writer, Color.yellow);
-        }
-        try padRightPrint(writer, state_str, state_col);
+        try writeCell(writer, j.name orelse "-", name_col);
+        try color.on(writer, if (j.enabled orelse false) Color.green else Color.yellow);
+        try writeCell(writer, stateStr(j), state_col);
         try color.off(writer);
-        try padRightPrint(writer, formatOptU32Local(j.active_bans), active_col);
-        try padRightPrint(writer, formatOptU32Local(j.maxretry), max_col);
-        try padRightPrint(writer, formatDurationSecs(j.findtime), find_col);
-        try padRightPrint(writer, formatDurationSecs(j.bantime), ban_col);
-        try padRightPrint(writer, j.action orelse "-", action_col);
-        if (j.enforcing) |e| {
-            try color.on(writer, if (e) Color.green else Color.yellow);
-            try padRightPrint(writer, if (e) "true" else "false", enforce_col);
-            try color.off(writer);
-        } else {
-            try padRightPrint(writer, "-", enforce_col);
-        }
-        try padRightPrint(writer, j.log_source orelse "-", source_col);
-        if (j.source_healthy) |h| {
-            try color.on(writer, if (h) Color.green else Color.yellow);
-            try padRightPrint(writer, if (h) "ok" else "broken", health_col);
-            try color.off(writer);
-        } else {
-            try padRightPrint(writer, "unknown", health_col);
-        }
+        try writeCell(writer, formatOptU32Local(j.active_bans), active_col);
+        try writeCell(writer, formatOptU32Local(j.maxretry), max_col);
+        try writeCell(writer, formatDurationSecs(j.findtime), find_col);
+        try writeCell(writer, formatDurationSecs(j.bantime), ban_col);
+        try writeCell(writer, j.action orelse "-", action_col);
+        if (j.enforcing) |e| try color.on(writer, if (e) Color.green else Color.yellow);
+        try writeCell(writer, enforcingStr(j), enforce_col);
+        try color.off(writer);
+        try writeCell(writer, j.log_source orelse "-", source_col);
+        if (j.source_healthy) |h| try color.on(writer, if (h) Color.green else Color.yellow);
+        try writeCell(writer, healthStr(j), health_col);
+        try color.off(writer);
         try writer.writeAll("\n");
     }
 
     try writer.print("Total: {d} jails\n", .{jails.len});
+}
+
+const JailsWidths = struct {
+    state: usize = 0,
+    active: usize = 0,
+    max: usize = 0,
+    find: usize = 0,
+    ban: usize = 0,
+    enforce: usize = 0,
+    health: usize = 0,
+
+    fn widen(self: *JailsWidths, j: JailEntry) void {
+        self.state = @max(self.state, stateStr(j).len);
+        self.active = @max(self.active, formatOptU32Local(j.active_bans).len);
+        self.max = @max(self.max, formatOptU32Local(j.maxretry).len);
+        self.find = @max(self.find, formatDurationSecs(j.findtime).len);
+        self.ban = @max(self.ban, formatDurationSecs(j.bantime).len);
+        self.enforce = @max(self.enforce, enforcingStr(j).len);
+        self.health = @max(self.health, healthStr(j).len);
+    }
+};
+
+fn stateStr(j: JailEntry) []const u8 {
+    return if (j.enabled orelse false) "enabled" else "disabled";
+}
+
+fn enforcingStr(j: JailEntry) []const u8 {
+    const e = j.enforcing orelse return "-";
+    return if (e) "true" else "false";
+}
+
+fn healthStr(j: JailEntry) []const u8 {
+    const h = j.source_healthy orelse return "unknown";
+    return if (h) "ok" else "broken";
+}
+
+const col_max: usize = 48;
+
+fn longestLen(comptime T: type, entries: []const T, comptime field: []const u8) usize {
+    var widest: usize = 0;
+    for (entries) |e| widest = @max(widest, (@field(e, field) orelse "-").len);
+    return widest;
+}
+
+fn colWidth(header: []const u8, longest: usize) usize {
+    return @max(header.len, @min(longest, col_max)) + 1;
+}
+
+fn writeCell(writer: anytype, s: []const u8, width: usize) !void {
+    if (s.len <= col_max) return padRightPrint(writer, s, width);
+    var cut = col_max - 3;
+    while (cut > 0 and (s[cut] & 0xC0) == 0x80) cut -= 1;
+    try writer.writeAll(s[0..cut]);
+    try writer.writeAll("...");
+    try writeSpaces(writer, width - (cut + 3));
 }
 
 fn formatDurationSecs(opt: ?u32) []const u8 {
@@ -835,6 +912,44 @@ test "format: status table tolerates missing protection (older daemon)" {
     try testing.expect(std.mem.indexOf(u8, out, "Protection:") != null);
 }
 
+test "format: status degraded with protection_cause renders the cause" {
+    const payload = "{\"protection\":\"degraded\",\"protection_cause\":\"NftablesUnavailable\",\"backend\":\"none\"}";
+    const table = try runStatus(testing.allocator, payload, .table);
+    defer testing.allocator.free(table);
+    try testing.expect(std.mem.indexOf(u8, table, "Protection:  DEGRADED (NftablesUnavailable)") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "Backend:     none") != null);
+
+    const plain = try runStatus(testing.allocator, payload, .plain);
+    defer testing.allocator.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "protection\tdegraded\n") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "protection_cause\tNftablesUnavailable\n") != null);
+
+    const json = try runStatus(testing.allocator, payload, .json);
+    defer testing.allocator.free(json);
+    try testing.expect(std.mem.indexOf(u8, json, "\"protection_cause\":\"NftablesUnavailable\"") != null);
+}
+
+test "format: status degraded without protection_cause renders plain DEGRADED (older daemon)" {
+    const payload = "{\"protection\":\"degraded\",\"backend\":\"nftables\"}";
+    const table = try runStatus(testing.allocator, payload, .table);
+    defer testing.allocator.free(table);
+    try testing.expect(std.mem.indexOf(u8, table, "Protection:  DEGRADED ") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "DEGRADED (") == null);
+
+    const plain = try runStatus(testing.allocator, payload, .plain);
+    defer testing.allocator.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "protection_cause") == null);
+}
+
+test "format: status all-log-only renders Protection log-only and Backend none" {
+    const payload = "{\"protection\":\"log-only\",\"backend\":\"none\",\"jails_active\":2}";
+    const table = try runStatus(testing.allocator, payload, .table);
+    defer testing.allocator.free(table);
+    try testing.expect(std.mem.indexOf(u8, table, "Protection:  log-only ") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "Backend:     none ") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "DEGRADED") == null);
+}
+
 fn runList(alloc: std.mem.Allocator, payload: []const u8, fmt: OutputFormat) ![]u8 {
     var list = std.ArrayList(u8).init(alloc);
     errdefer list.deinit();
@@ -983,7 +1098,7 @@ test "format: status renders protection degraded (SYS-017)" {
     const payload = "{\"protection\":\"degraded\",\"total_bans\":7,\"jails_active\":2}";
     const table = try runStatus(testing.allocator, payload, .table);
     defer testing.allocator.free(table);
-    try testing.expect(std.mem.indexOf(u8, table, "degraded") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "Protection:  DEGRADED ") != null);
     try testing.expect(std.mem.indexOf(u8, table, "Total bans:") != null);
     try testing.expect(std.mem.indexOf(u8, table, "7") != null);
 
@@ -1018,6 +1133,115 @@ test "format: jails table tolerates missing source fields (older daemon, SYS-017
     try testing.expect(std.mem.indexOf(u8, out, "SOURCE") != null);
     try testing.expect(std.mem.indexOf(u8, out, "unknown") != null);
     try testing.expect(std.mem.indexOf(u8, out, "sshd") != null);
+}
+
+fn lineLens(out: []const u8) [3]usize {
+    var it = std.mem.splitScalar(u8, out, '\n');
+    return .{ it.next().?.len, it.next().?.len, it.next().?.len };
+}
+
+test "format: jails table sizes SOURCE from the longest path, keeps HEALTH separator (BUG-008)" {
+    const payload =
+        \\[
+        \\  {"name":"sshd","enabled":true,"log_source":"journald (sshd)","source_healthy":true},
+        \\  {"name":"recidive","enabled":true,"log_source":"/var/log/fail2zig/fail2zig.log"}
+        \\]
+    ;
+    const out = try runJails(testing.allocator, payload, .table);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "/var/log/fail2zig/fail2zig.log unknown") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "journald (sshd)                ok") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "fail2zig.logunknown") == null);
+    const lens = lineLens(out);
+    try testing.expectEqual(lens[0], lens[1]);
+    try testing.expectEqual(lens[0], lens[2]);
+}
+
+test "format: jails table ellipsis-truncates SOURCE beyond the column cap (BUG-008)" {
+    const payload = "[{\"name\":\"web\",\"enabled\":true,\"log_source\":\"/srv/very/deeply/nested/path/to/some/application/logs/access.log\",\"source_healthy\":false}]";
+    const out = try runJails(testing.allocator, payload, .table);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "access.log") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "/srv/very/deeply/nested/path/to/some/applicat... broken") != null);
+    const lens = lineLens(out);
+    try testing.expectEqual(lens[0], lens[1]);
+    try testing.expectEqual(lens[0], lens[2]);
+}
+
+test "format: jails table SOURCE truncation never splits a UTF-8 sequence (BUG-008)" {
+    const payload = "[{\"name\":\"web\",\"enabled\":true,\"log_source\":\"/var/log/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaééééé.log\"}]";
+    const out = try runJails(testing.allocator, payload, .table);
+    defer testing.allocator.free(out);
+    try testing.expect(std.unicode.utf8ValidateSlice(out));
+    try testing.expect(std.mem.indexOf(u8, out, "aaa...  unknown") != null);
+    const lens = lineLens(out);
+    try testing.expectEqual(lens[0], lens[1]);
+    try testing.expectEqual(lens[0], lens[2]);
+}
+
+test "format: jails table sizes JAIL from a 40-char jail name (BUG-010)" {
+    const payload = "[{\"name\":\"nginx-http-auth-strict-mode-for-tenant-a\",\"enabled\":true},{\"name\":\"sshd\",\"enabled\":false}]";
+    const out = try runJails(testing.allocator, payload, .table);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "nginx-http-auth-strict-mode-for-tenant-a enabled") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "tenant-aenabled") == null);
+    const lens = lineLens(out);
+    try testing.expectEqual(lens[0], lens[1]);
+    try testing.expectEqual(lens[0], lens[2]);
+}
+
+test "format: list table sizes IP ADDRESS and JAIL from the longest values (BUG-010)" {
+    const payload = "[{\"ip\":\"2001:0db8:85a3:0000:0000:8a2e:0370:7334\",\"jail\":\"nginx-http-auth-strict-mode-for-tenant-a\",\"ban_count\":1,\"ban_expiry\":1},{\"ip\":\"1.2.3.4\",\"jail\":\"sshd\",\"ban_count\":2,\"ban_expiry\":1}]";
+    const out = try runList(testing.allocator, payload, .table);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "2001:0db8:85a3:0000:0000:8a2e:0370:7334 nginx-http-auth-strict-mode-for-tenant-a ") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "7334nginx") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "tenant-a") != null);
+    const lens = lineLens(out);
+    try testing.expectEqual(lens[0], lens[1]);
+    try testing.expectEqual(lens[0], lens[2]);
+}
+
+test "format: list table TIME LEFT sized for a decades-long ban (BUG-011)" {
+    const payload = "[{\"ip\":\"1.2.3.4\",\"jail\":\"sshd\",\"ban_count\":4294967295,\"ban_expiry\":9999999999},{\"ip\":\"5.6.7.8\",\"jail\":\"sshd\",\"ban_count\":1,\"ban_expiry\":1}]";
+    const out = try runList(testing.allocator, payload, .table);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "s 4294967295") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "s4294967295") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "expired") != null);
+    const lens = lineLens(out);
+    try testing.expectEqual(lens[0], lens[1]);
+    try testing.expectEqual(lens[0], lens[2]);
+    var it = std.mem.splitScalar(u8, out, '\n');
+    _ = it.next();
+    _ = it.next();
+    _ = it.next();
+    try testing.expectEqual(lens[0], it.next().?.len);
+}
+
+test "format: jails table every column keeps its separator at extreme values (BUG-011)" {
+    const payload = "[{\"name\":\"sshd\",\"enabled\":false,\"active_bans\":4294967295,\"maxretry\":4294967295,\"findtime\":4294967295,\"bantime\":4294967295,\"action\":\"a-very-long-action-name-here\",\"enforcing\":false,\"log_source\":\"x\",\"source_healthy\":true}]";
+    const out = try runJails(testing.allocator, payload, .table);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "sshd disabled 4294967295 4294967295 49710d    49710d   a-very-long-action-name-here false     x      ok") != null);
+    const lens = lineLens(out);
+    try testing.expectEqual(lens[0], lens[1]);
+    try testing.expectEqual(lens[0], lens[2]);
+}
+
+test "format: status box widens for a long value (BUG-011)" {
+    const payload = "{\"backend\":\"nftables-with-an-unusually-long-descriptive-backend-name\",\"active_bans\":3}";
+    const out = try runStatus(testing.allocator, payload, .table);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "nftables-with-an-unusually-long-descriptive-backend-name |") != null);
+    var it = std.mem.splitScalar(u8, out, '\n');
+    const top = it.next().?;
+    _ = it.next();
+    _ = it.next();
+    while (it.next()) |line| {
+        if (line.len == 0) break;
+        try testing.expectEqual(top.len, line.len);
+    }
 }
 
 fn runVersion(alloc: std.mem.Allocator, payload: []const u8, fmt: OutputFormat) ![]u8 {

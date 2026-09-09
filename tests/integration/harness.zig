@@ -126,10 +126,11 @@ pub const Harness = struct {
     }
 
     pub fn writeConfig(self: *Harness) HarnessError!void {
-        var f = std.fs.cwd().createFile(self.config_path, .{ .truncate = true }) catch {
+        var f = std.fs.cwd().createFile(self.config_path, .{ .truncate = true, .mode = 0o640 }) catch {
             return error.ConfigWriteFailed;
         };
         defer f.close();
+        f.chmod(0o640) catch return error.ConfigWriteFailed;
         const w = f.writer();
 
         w.print(

@@ -94,14 +94,6 @@ pub fn run(
     }
 }
 
-const FormatFn = *const fn (
-    std.mem.Allocator,
-    anytype,
-    []const u8,
-    format.OutputFormat,
-    format.Color,
-) anyerror!void;
-
 fn doRequest(
     allocator: std.mem.Allocator,
     globals: args.Globals,
@@ -124,16 +116,29 @@ fn doRequest(
     };
     defer resp.deinit(allocator);
 
+    return renderResponse(allocator, resp, globals.output, stdout, stderr, color, formatter);
+}
+
+fn renderResponse(
+    allocator: std.mem.Allocator,
+    resp: shared.Response,
+    output: format.OutputFormat,
+    stdout: anytype,
+    stderr: anytype,
+    color: format.Color,
+    comptime formatter: anytype,
+) ExitCode {
     switch (resp) {
         .ok => |o| {
-            formatter(allocator, stdout, o.payload, globals.output, color) catch |e| {
+            formatter(allocator, stdout, o.payload, output, color) catch |e| {
+                if (e == error.BrokenPipe) return .success;
                 stderr.print("error: failed to format response: {s}\n", .{@errorName(e)}) catch {};
                 return .client_error;
             };
             return .success;
         },
         .err => |e| {
-            format.formatError(stderr, e.code, e.message, globals.output, color) catch {};
+            format.formatError(stderr, e.code, e.message, output, color) catch {};
             return .daemon_error;
         },
     }
@@ -373,6 +378,68 @@ test "client: help ban subtopic" {
     defer testing.allocator.free(r.err);
     try testing.expectEqual(ExitCode.success, r.code);
     try testing.expect(std.mem.indexOf(u8, r.out, "ban <ip>") != null);
+}
+
+const status_payload = "{\"version\":\"0.3.0\",\"uptime_seconds\":5,\"active_bans\":1}";
+
+test "client: BrokenPipe on stdout is a quiet success (BUG-009)" {
+    const BrokenPipe = error{BrokenPipe};
+    const writeFn = struct {
+        fn write(_: void, _: []const u8) BrokenPipe!usize {
+            return error.BrokenPipe;
+        }
+    }.write;
+    const stdout = std.io.GenericWriter(void, BrokenPipe, writeFn){ .context = {} };
+    var err_list = std.ArrayList(u8).init(testing.allocator);
+    defer err_list.deinit();
+
+    const resp = shared.Response{ .ok = .{ .payload = status_payload } };
+    const code = renderResponse(testing.allocator, resp, .table, stdout, err_list.writer(), .{ .enabled = false }, formatStatusCmd);
+    try testing.expectEqual(ExitCode.success, code);
+    try testing.expectEqualStrings("", err_list.items);
+}
+
+test "client: reader-closed pipe on stdout is a quiet success (BUG-009)" {
+    const fds = try std.posix.pipe();
+    std.posix.close(fds[0]);
+    const write_end = std.fs.File{ .handle = fds[1] };
+    defer write_end.close();
+    var err_list = std.ArrayList(u8).init(testing.allocator);
+    defer err_list.deinit();
+
+    const resp = shared.Response{ .ok = .{ .payload = status_payload } };
+    const code = renderResponse(testing.allocator, resp, .table, write_end.writer(), err_list.writer(), .{ .enabled = false }, formatStatusCmd);
+    try testing.expectEqual(ExitCode.success, code);
+    try testing.expectEqualStrings("", err_list.items);
+}
+
+test "client: other stdout write errors still exit 2 with a message (BUG-009)" {
+    const NoSpace = error{NoSpaceLeft};
+    const writeFn = struct {
+        fn write(_: void, _: []const u8) NoSpace!usize {
+            return error.NoSpaceLeft;
+        }
+    }.write;
+    const stdout = std.io.GenericWriter(void, NoSpace, writeFn){ .context = {} };
+    var err_list = std.ArrayList(u8).init(testing.allocator);
+    defer err_list.deinit();
+
+    const resp = shared.Response{ .ok = .{ .payload = status_payload } };
+    const code = renderResponse(testing.allocator, resp, .table, stdout, err_list.writer(), .{ .enabled = false }, formatStatusCmd);
+    try testing.expectEqual(ExitCode.client_error, code);
+    try testing.expect(std.mem.indexOf(u8, err_list.items, "failed to format response: NoSpaceLeft") != null);
+}
+
+test "client: daemon error response still exits 1 (BUG-009 unchanged path)" {
+    var out_list = std.ArrayList(u8).init(testing.allocator);
+    defer out_list.deinit();
+    var err_list = std.ArrayList(u8).init(testing.allocator);
+    defer err_list.deinit();
+
+    const resp = shared.Response{ .err = .{ .code = 4, .message = "no such jail" } };
+    const code = renderResponse(testing.allocator, resp, .table, out_list.writer(), err_list.writer(), .{ .enabled = false }, formatStatusCmd);
+    try testing.expectEqual(ExitCode.daemon_error, code);
+    try testing.expect(std.mem.indexOf(u8, err_list.items, "no such jail") != null);
 }
 
 test "client: imports compile" {

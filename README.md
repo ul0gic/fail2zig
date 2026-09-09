@@ -8,7 +8,7 @@
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/ul0gic/fail2zig/badge)](https://scorecard.dev/viewer/?uri=github.com/ul0gic/fail2zig)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 [![Zig](https://img.shields.io/badge/zig-0.14.1-F7A41D?logo=zig&logoColor=white)](https://ziglang.org/download/)
-[![Platform](https://img.shields.io/badge/platform-linux--x86__64%20%7C%20linux--aarch64-lightgrey)](#installation)
+[![Platform](https://img.shields.io/badge/platform-linux--x86__64%20%7C%20aarch64%20%7C%20armv7%20%7C%20mips-lightgrey)](#installation)
 [![Version](https://img.shields.io/github/v/release/ul0gic/fail2zig?label=version&color=orange)](https://github.com/ul0gic/fail2zig/releases/latest)
 
 </div>
@@ -171,13 +171,21 @@ installs the hardened `fail2zig.service` unit under
 `/etc/systemd/system/`. It does **not** auto-start the daemon — audit the
 config, then `systemctl enable --now fail2zig` when ready.
 
-**Supported targets (v0.2.0):**
-- `x86_64-linux-musl` (879 KB stripped)
-- `aarch64-linux-musl` (801 KB stripped)
-- `armv7-linux-musleabihf`
+**Supported targets** (release assets are named `fail2zig-<tag>-<triple>` and `fail2zig-client-<tag>-<triple>`):
 
-`mips-linux-musl` is deferred — the Zig 0.14.1 toolchain cannot yet provide musl
-libc for that triple (SYS-013).
+| Target | Hardware | Validation |
+|--------|----------|------------|
+| `x86_64-linux-musl` | servers, VPS | real systems, live honeypot |
+| `aarch64-linux-musl` | ARM64 servers, Raspberry Pi 3+ | cross-build + CI static check |
+| `arm-linux-musleabihf` | armv7 hard-float boards | cross-build + CI static check |
+| `mips-linux-musleabi` | big-endian MIPS32r2 routers, soft-float | qemu-user-static only |
+| `mipsel-linux-musleabi` | little-endian MIPS32r2 routers, soft-float | qemu-user-static only |
+
+All five are static musl binaries with no runtime dependencies. The mips pair
+targets the soft-float ABI common on OpenWrt-class hardware; CI runs
+`--version` under `qemu-mips[el]-static` on every build, but no one has yet
+reported a run on real MIPS hardware. Hard-float MIPS (`musleabihf`) is not
+built until a real target asks for it (ADR-012).
 
 ### Dry-run / inspect the installer
 
@@ -199,7 +207,7 @@ If you'd rather skip the script:
 ```bash
 # 1. Download the binary + manifest for your arch
 VERSION=v0.2.0
-ARCH=x86_64-linux-musl   # or aarch64-linux-musl, armv7-linux-musleabihf
+ARCH=x86_64-linux-musl   # or aarch64-linux-musl, arm-linux-musleabihf, mips-linux-musleabi, mipsel-linux-musleabi
 curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/fail2zig-${VERSION}-${ARCH}"
 curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/fail2zig-client-${VERSION}-${ARCH}"
 curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/SHA256SUMS"
@@ -224,7 +232,7 @@ git clone https://github.com/ul0gic/fail2zig
 cd fail2zig
 
 # Production build (safety checks retained on parser + network paths)
-zig build -Doptimize=.ReleaseSafe
+zig build -Doptimize=ReleaseSafe
 
 # Binaries land in zig-out/bin/
 ls zig-out/bin/
@@ -234,17 +242,23 @@ ls zig-out/bin/
 
 ### Cross-compile
 
-Supported shipped targets (see [.github/workflows/release.yml](.github/workflows/release.yml)):
+Every shipped target (see [.github/workflows/release.yml](.github/workflows/release.yml)):
 
 ```bash
-zig build -Dtarget=x86_64-linux-musl  -Doptimize=.ReleaseSafe
-zig build -Dtarget=aarch64-linux-musl -Doptimize=.ReleaseSafe
+zig build -Dtarget=x86_64-linux-musl     -Doptimize=ReleaseSafe
+zig build -Dtarget=aarch64-linux-musl    -Doptimize=ReleaseSafe
+zig build -Dtarget=arm-linux-musleabihf  -Doptimize=ReleaseSafe
+zig build -Dtarget=mips-linux-musleabi   -Doptimize=ReleaseSafe
+zig build -Dtarget=mipsel-linux-musleabi -Doptimize=ReleaseSafe
 ```
 
-Both produce statically linked musl binaries with no runtime dependencies.
-`armv7-linux-musleabihf` and `mips-linux-musl` are architected and partially
-implemented but gated on a portability fix (atomic counter mutex + `socklen_t`
-cast) tracked for a future release.
+All produce statically linked musl binaries with no runtime dependencies. Use
+the float-ABI-suffixed mips triples: the bare `mips-linux-musl` triple has no
+musl libc in any Zig release. To run a mips build on an x86_64 host:
+
+```bash
+qemu-mips-static zig-out/bin/fail2zig --version   # qemu-mipsel-static for mipsel
+```
 
 ### systemd setup
 
@@ -447,7 +461,7 @@ eBPF/XDP (NIC-level drop) is architected; ships in a future release.
 | DNS | `named-refused` (BIND) |
 | FTP | `vsftpd`, `proftpd` |
 | Database | `mysqld-auth` |
-| Meta | `recidive` (escalates repeat offenders) |
+| Meta | `recidive` (escalates repeat offenders — fed in-process from confirmed bans in other jails, `source = "internal"`; no ban log to tail) |
 
 Full reference: [reference/filters](https://fail2zig.com/docs/reference/filters/).
 Filter names accept hyphenated or underscore forms
@@ -617,7 +631,7 @@ bugs early and keep the binary small.
 **Zig:**
 - `zig fmt engine/ client/ shared/ tests/` before every commit — CI-enforced
 - `zig build` and `zig build test` pass, zero failures, zero leaks
-- Zero compiler warnings; `zig build -Doptimize=.ReleaseSafe` clean
+- Zero compiler warnings; `zig build -Doptimize=ReleaseSafe` clean
 - No `@panic` in production code — propagate errors explicitly
 - No `@setRuntimeSafety(false)` without a comment proving the safety invariant
 - All tests use `std.testing.allocator` for leak detection

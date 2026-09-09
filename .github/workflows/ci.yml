@@ -7,18 +7,20 @@
 #   fmt           — style gate, fastest to fail
 #   build-native  — `zig build` on ubuntu-latest
 #   test          — `zig build test` with std.testing.allocator leak detection
-#   cross-compile — x86_64 + aarch64 musl static release builds
+#   cross-compile — static musl ReleaseSafe builds for every shipped target,
+#                   with a qemu-user-static `--version` smoke on the mips pair
 #   shellcheck    — lint every tracked shell script
 #   yamllint      — lint the workflow files themselves
 #
-# Cross-compile matrix covers x86_64, aarch64, and armv7 (arm-linux-musleabihf).
-# SYS-009's portability bugs are fixed (u64 atomic counters now use a conditional
-# Counter that is mutex-backed on 32-bit arches; timeval casts narrow into the
-# target field types in client/socket.zig + engine/firewall/netlink.zig).
-# `mips-linux-musl` remains excluded: Zig 0.14.1 cannot provide musl libc for it
-# ("unable to find or provide libc for target 'mips-linux...-musl'") — a
-# toolchain limitation, not our code. See
-# .project/issue-management/open/SYS-009-armv7-cross-compile-broken.md.
+# Cross-compile matrix: x86_64, aarch64, armv7 (arm-linux-musleabihf), and
+# mips/mipsel (mips[el]-linux-musleabi, soft-float MIPS32r2). SYS-009's
+# portability bugs are fixed (u64 atomic counters are mutex-backed on 32-bit
+# arches; timeval casts narrow into the target field types).
+# mips uses the float-ABI-suffixed triples on purpose: no Zig release (0.14.1
+# through 0.17-dev) provides libc for the bare `mips-linux-musl` triple, so the
+# earlier "Zig 0.14.1 lacks mips musl libc" diagnosis was wrong — the triple
+# was. See ADR-012 and SYS-013 (closed). Hard-float (`musleabihf`) is not built
+# until a real target asks for it.
 #
 # Zig version is pinned to the toolchain that ships the project — see
 # build.zig.zon `minimum_zig_version`. Keep this in sync with any bump.
@@ -134,11 +136,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # mips-linux-musl excluded — Zig 0.14.1 lacks musl libc for it (SYS-009).
+        # The bare `mips-linux-musl` triple has no libc in any Zig release;
+        # the float-ABI-suffixed musleabi triples do (ADR-012).
         target:
           - x86_64-linux-musl
           - aarch64-linux-musl
           - arm-linux-musleabihf
+          - mips-linux-musleabi
+          - mipsel-linux-musleabi
+        include:
+          # Targets the runner cannot execute natively get a qemu-user-static
+          # smoke; `qemu` is empty for everything else.
+          - target: mips-linux-musleabi
+            qemu: qemu-mips-static
+          - target: mipsel-linux-musleabi
+            qemu: qemu-mipsel-static
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -164,6 +176,31 @@ jobs:
             zig-cache-cross-${{ matrix.target }}-${{ env.ZIG_VERSION }}-
       - name: Build ReleaseSafe static binaries
         run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
+      - name: Smoke-test under qemu-user-static
+        if: matrix.qemu != ''
+        # Proves the cross-built ELF actually loads and runs on the target ISA
+        # (correct float ABI, static startup, no bad relocations), not just
+        # that it linked. `--version` is the only code path that needs no
+        # root, no config, and no firewall. Expected version comes from
+        # build.zig.zon, the release-stamp SSoT.
+        env:
+          QEMU: ${{ matrix.qemu }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+          expected="$(sed -n 's/^ *\.version = "\([^"]*\)".*/\1/p' build.zig.zon)"
+          if [ -z "${expected}" ]; then
+            echo "::error::could not read .version from build.zig.zon"
+            exit 1
+          fi
+          for bin in fail2zig fail2zig-client; do
+            out="$("${QEMU}" "zig-out/bin/${bin}" --version)"
+            echo "${QEMU} ${bin} --version -> ${out}"
+            if [ "${out}" != "${bin} ${expected}" ]; then
+              echo "::error::${bin} --version printed '${out}', expected '${bin} ${expected}'"
+              exit 1
+            fi
+          done
       - name: Verify binary is statically linked
         run: |
           file zig-out/bin/fail2zig

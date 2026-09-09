@@ -102,26 +102,8 @@ test "integration: status command round-trips from client wire bytes to daemon J
     try socketpairNonblock(&fds);
     defer posix.close(fds[1]);
 
-    var server: ipc.IpcServer = .{
-        .allocator = a,
-        .loop = &loop,
-        .socket_path = "",
-        .listen_fd = -1,
-        .started = false,
-        .allowed_gid = null,
-        .allow_any_peer = true,
-    };
-    defer {
-        for (&server.clients) |*slot| {
-            if (slot.*) |cli| {
-                loop.removeFd(cli.fd) catch {};
-                posix.close(cli.fd);
-                a.free(cli.buf);
-                a.destroy(cli);
-                slot.* = null;
-            }
-        }
-    }
+    var server = try ipc.IpcServer.initDetached(a, &loop);
+    defer server.deinit();
 
     server.setCommandHandler(cmd_ctx.asHandler());
     try server.admitTestPeer(fds[0]);
@@ -183,26 +165,8 @@ test "integration: version command round-trips and echoes supplied version" {
     try socketpairNonblock(&fds);
     defer posix.close(fds[1]);
 
-    var server: ipc.IpcServer = .{
-        .allocator = a,
-        .loop = &loop,
-        .socket_path = "",
-        .listen_fd = -1,
-        .started = false,
-        .allowed_gid = null,
-        .allow_any_peer = true,
-    };
-    defer {
-        for (&server.clients) |*slot| {
-            if (slot.*) |cli| {
-                loop.removeFd(cli.fd) catch {};
-                posix.close(cli.fd);
-                a.free(cli.buf);
-                a.destroy(cli);
-                slot.* = null;
-            }
-        }
-    }
+    var server = try ipc.IpcServer.initDetached(a, &loop);
+    defer server.deinit();
 
     server.setCommandHandler(cmd_ctx.asHandler());
     try server.admitTestPeer(fds[0]);
