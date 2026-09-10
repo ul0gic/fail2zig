@@ -49,6 +49,7 @@
 # Exit 0 = all ENH-004 file-source assertions passed. Non-zero = first failure.
 
 set -euo pipefail
+ORIGINAL_ARGS=("$@")
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
@@ -84,6 +85,10 @@ done
 # --- preflight ----------------------------------------------------------------
 [ "$(id -u)" -eq 0 ] || { echo "e2e: must run as root (enforcing jail needs CAP_NET_ADMIN)" >&2; exit 2; }
 command -v curl >/dev/null 2>&1 || { echo "e2e: curl required to read /metrics" >&2; exit 2; }
+
+if [ "$(readlink /proc/self/ns/net)" = "$(readlink /proc/1/ns/net)" ]; then
+  exec unshare --net bash -c 'ip link set lo up; exec bash "$@"' _ "$0" "${ORIGINAL_ARGS[@]}"
+fi
 
 # --- build (optional) ---------------------------------------------------------
 if [ "$DO_BUILD" -eq 1 ]; then

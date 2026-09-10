@@ -49,11 +49,12 @@ fn watchdog(pid: posix.pid_t, done: *std.atomic.Value(bool)) void {
     posix.kill(pid, posix.SIG.KILL) catch {};
 }
 
-fn runToExit(a: std.mem.Allocator, argv: []const []const u8) !Run {
+fn runToExit(a: std.mem.Allocator, argv: []const []const u8, env: ?*const std.process.EnvMap) !Run {
     var child = std.process.Child.init(argv, a);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
+    child.env_map = env;
     try child.spawn();
 
     var done = std.atomic.Value(bool).init(false);
@@ -176,7 +177,7 @@ const LiveDaemon = struct {
     pump_thread: ?std.Thread = null,
     stopped: bool = false,
 
-    fn start(a: std.mem.Allocator, config_path: []const u8) !*LiveDaemon {
+    fn start(a: std.mem.Allocator, config_path: []const u8, env: ?*const std.process.EnvMap) !*LiveDaemon {
         const self = try a.create(LiveDaemon);
         errdefer a.destroy(self);
         const argv = [_][]const u8{ daemon_path, "--foreground", "--config", config_path };
@@ -187,6 +188,7 @@ const LiveDaemon = struct {
         self.child.stdin_behavior = .Ignore;
         self.child.stdout_behavior = .Ignore;
         self.child.stderr_behavior = .Pipe;
+        self.child.env_map = env;
         try self.child.spawn();
         errdefer {
             _ = self.child.kill() catch {};
@@ -274,6 +276,11 @@ const Scenario = struct {
     fn init(a: std.mem.Allocator) !Scenario {
         if (builtin.os.tag != .linux) return error.SkipZigTest;
         if (linux.geteuid() == 0) return error.SkipZigTest;
+        return initAnyUid(a);
+    }
+
+    fn initAnyUid(a: std.mem.Allocator) !Scenario {
+        if (builtin.os.tag != .linux) return error.SkipZigTest;
         std.fs.cwd().access(daemon_path, .{}) catch return error.SkipZigTest;
 
         var tmp = std.testing.tmpDir(.{});
@@ -348,9 +355,28 @@ const Scenario = struct {
         try f.chmod(0o640);
     }
 
-    fn runDaemonToExit(self: *Scenario) !Run {
+    fn runDaemonToExit(self: *Scenario, env: ?*const std.process.EnvMap) !Run {
         const argv = [_][]const u8{ daemon_path, "--foreground", "--config", self.config_path };
-        return runToExit(self.a, &argv);
+        return runToExit(self.a, &argv, env);
+    }
+
+    fn emptyPathEnv(self: *Scenario) !std.process.EnvMap {
+        var env = try std.process.getEnvMap(self.a);
+        errdefer env.deinit();
+        try env.put("PATH", "");
+        return env;
+    }
+
+    fn expectMetricsPortRefused(self: *Scenario) !void {
+        const addr = try std.net.Address.parseIp4("127.0.0.1", self.metrics_port);
+        if (std.net.tcpConnectToAddress(addr)) |stream| {
+            stream.close();
+            std.debug.print("something accepted on 127.0.0.1:{d}; expected connection refused\n", .{self.metrics_port});
+            return error.TestHttpListening;
+        } else |err| switch (err) {
+            error.ConnectionRefused => {},
+            else => return err,
+        }
     }
 
     fn appendLogLine(self: *Scenario, line: []const u8) !void {
@@ -364,7 +390,7 @@ const Scenario = struct {
     fn clientStatus(self: *Scenario, d: *LiveDaemon) ![]u8 {
         std.fs.cwd().access(client_path, .{}) catch return error.TestClientBinaryMissing;
         const argv = [_][]const u8{ client_path, "--socket", self.socket_path, "status" };
-        var r = try runToExit(self.a, &argv);
+        var r = try runToExit(self.a, &argv, null);
         defer r.deinit(self.a);
         if (r.exitCode() != 0) {
             const rejected = d.waitForStderr("ipc: rejecting peer", 1_000);
@@ -414,7 +440,7 @@ test "integration: no backend (a) enforcing jail + default on_no_backend exits 1
 
     try s.writeConfig("", "nftables");
 
-    var r = try s.runDaemonToExit();
+    var r = try s.runDaemonToExit(null);
     defer r.deinit(a);
 
     try testing.expectEqual(@as(?u8, 1), r.exitCode());
@@ -432,7 +458,7 @@ test "integration: no backend (a') on_no_backend = \"fail-closed\" is the same a
 
     try s.writeConfig("on_no_backend = \"fail-closed\"", "nftables");
 
-    var r = try s.runDaemonToExit();
+    var r = try s.runDaemonToExit(null);
     defer r.deinit(a);
 
     try testing.expectEqual(@as(?u8, 1), r.exitCode());
@@ -447,7 +473,7 @@ test "integration: no backend (b) on_no_backend = \"log-only\" stays up DEGRADED
 
     try s.writeConfig("on_no_backend = \"log-only\"", "nftables");
 
-    const d = try LiveDaemon.start(a, s.config_path);
+    const d = try LiveDaemon.start(a, s.config_path, null);
     defer d.destroy(a);
 
     d.waitForSocket(s.socket_path, startup_timeout_ms) catch |err| {
@@ -503,7 +529,7 @@ test "integration: no backend (c) all-log-only config runs non-root with Protect
 
     try s.writeConfig("", "log-only");
 
-    const d = try LiveDaemon.start(a, s.config_path);
+    const d = try LiveDaemon.start(a, s.config_path, null);
     defer d.destroy(a);
 
     d.waitForSocket(s.socket_path, startup_timeout_ms) catch |err| {
@@ -555,4 +581,204 @@ fn expectNotContainsIgnoreCase(haystack: []const u8, needle: []const u8) !void {
 test "integration: no backend helper: trace detector matches Zig frame lines and nothing else" {
     try testing.expect(hasErrorReturnTrace("error: PermissionDenied\n/x/main.zig:3:23: 0x10ddf13 in main (fail2zig)\n"));
     try testing.expect(!hasErrorReturnTrace("error: firewall: no usable backend (PermissionDenied) — refusing to run unprotected\n"));
+}
+
+const forced_iptables_cause = "iptables not usable (iptables binary not found on PATH)";
+const forced_ipset_cause = "ipset not usable (ipset or iptables binary not found on PATH)";
+
+test "integration: forced backend (d) firewall = \"iptables\" off PATH + default policy exits 1 naming the forced cause, binds nothing (ENH-007)" {
+    const a = testing.allocator;
+    var s = try Scenario.initAnyUid(a);
+    defer s.deinit();
+
+    try s.writeConfig("firewall = \"iptables\"", "nftables");
+    var env = try s.emptyPathEnv();
+    defer env.deinit();
+
+    var r = try s.runDaemonToExit(&env);
+    defer r.deinit(a);
+
+    try testing.expectEqual(@as(?u8, 1), r.exitCode());
+    try expectContains(r.stderr, "firewall backend: iptables forced by config but not usable — " ++ forced_iptables_cause);
+    try expectContains(r.stderr, "firewall: no usable backend (forced by config) (" ++ forced_iptables_cause ++ "); refusing to run unprotected");
+    try expectNotContains(r.stderr, "selected");
+    try expectNotContains(r.stderr, "scaffold installed");
+    try expectNotContains(r.stderr, "running; backend=");
+    try s.expectMetricsPortRefused();
+    try testing.expect(!hasErrorReturnTrace(r.stderr));
+}
+
+test "integration: forced backend (d') firewall = \"nftables\" unprivileged + default policy exits 1 with the netlink cause, no fallback (ENH-007)" {
+    const a = testing.allocator;
+    var s = try Scenario.init(a);
+    defer s.deinit();
+
+    try s.writeConfig("firewall = \"nftables\"", "nftables");
+
+    var r = try s.runDaemonToExit(null);
+    defer r.deinit(a);
+
+    try testing.expectEqual(@as(?u8, 1), r.exitCode());
+    try expectContains(r.stderr, "firewall backend: nftables forced by config but not usable — netlink denied");
+    try expectContains(r.stderr, "firewall: no usable backend (forced by config) (netlink denied");
+    try expectContains(r.stderr, "); refusing to run unprotected");
+    try expectNotContains(r.stderr, "selected");
+    try s.expectMetricsPortRefused();
+    try testing.expect(!hasErrorReturnTrace(r.stderr));
+}
+
+test "integration: forced backend (e) firewall = \"ipset\" off PATH + on_no_backend = \"log-only\" runs DEGRADED (IpsetUnavailable) on IPC and /api/status (ENH-007)" {
+    const a = testing.allocator;
+    var s = try Scenario.initAnyUid(a);
+    defer s.deinit();
+
+    try s.writeConfig("firewall = \"ipset\"\non_no_backend = \"log-only\"", "nftables");
+    var env = try s.emptyPathEnv();
+    defer env.deinit();
+
+    const d = try LiveDaemon.start(a, s.config_path, &env);
+    defer d.destroy(a);
+
+    d.waitForSocket(s.socket_path, startup_timeout_ms) catch |err| {
+        const text = try d.sink.snapshot(a);
+        defer a.free(text);
+        std.debug.print("daemon did not come up ({s}); stderr:\n{s}\n", .{ @errorName(err), text });
+        return error.TestDaemonDidNotStart;
+    };
+    try testing.expect(d.waitForStderr("running DEGRADED as log-only", log_wait_ms));
+    {
+        const early = try d.sink.snapshot(a);
+        defer a.free(early);
+        try expectContains(early, "firewall backend: ipset forced by config but not usable — " ++ forced_ipset_cause);
+        try expectContains(early, "firewall: no usable backend (forced by config) (" ++ forced_ipset_cause ++ "); running DEGRADED as log-only per on_no_backend");
+        try expectNotContains(early, "selected");
+    }
+
+    const status = try s.httpStatus();
+    defer a.free(status);
+    try expectContains(status, "\"protection\":\"degraded\"");
+    try expectContains(status, "\"backend\":\"none\"");
+    const cause = jsonStringField(status, "protection_cause") orelse {
+        std.debug.print("status lacks protection_cause:\n{s}\n", .{status});
+        return error.TestCauseMissing;
+    };
+    try testing.expectEqualStrings("IpsetUnavailable", cause);
+
+    const table = try s.clientStatus(d);
+    defer a.free(table);
+    try expectContains(table, "Protection:  DEGRADED (IpsetUnavailable)");
+    try expectContains(table, "Backend:     none");
+
+    std.time.sleep(settle_ms * std.time.ns_per_ms);
+    for (attacker_lines) |ln| try s.appendLogLine(ln);
+    try testing.expect(d.waitForStderr("would-ban: jail='sshd' ip=192.0.2.42", log_wait_ms));
+    try testing.expect(d.isAlive());
+
+    const term = try d.stop();
+    const text = try d.sink.snapshot(a);
+    defer a.free(text);
+    try testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, term);
+    try expectContains(text, "backend=none");
+    try expectNotContains(text, "info: ban: jail=");
+    try expectNotContains(text, "refusing to run unprotected");
+    try testing.expect(!hasErrorReturnTrace(text));
+}
+
+const userns_status_script =
+    \\"$1" --foreground --config "$4" & p=$!
+    \\i=0
+    \\while :; do
+    \\  if out=$("$2" --socket "$3" status 2>&1); then rc=0; break; else rc=$?; fi
+    \\  i=$((i + 1))
+    \\  if [ "$i" -ge 100 ]; then break; fi
+    \\  sleep 0.05
+    \\done
+    \\printf '%s\n' "$out"
+    \\echo "client-rc=$rc"
+    \\kill -TERM "$p" 2>/dev/null
+    \\wait "$p"
+    \\echo "daemon-rc=$?"
+;
+
+fn unprivilegedNetnsAvailable(a: std.mem.Allocator) bool {
+    const argv = [_][]const u8{ "unshare", "-Urn", "true" };
+    var r = runToExit(a, &argv, null) catch return false;
+    defer r.deinit(a);
+    return r.exitCode() == 0;
+}
+
+test "integration: forced backend (f) firewall = \"nftables\" in an owned netns is selected (forced by config) and enforces (ENH-007)" {
+    const a = testing.allocator;
+    var s = try Scenario.initAnyUid(a);
+    defer s.deinit();
+    std.fs.cwd().access(client_path, .{}) catch return error.SkipZigTest;
+    if (!unprivilegedNetnsAvailable(a)) return error.SkipZigTest;
+
+    try s.writeConfig("firewall = \"nftables\"", "nftables");
+
+    const argv = [_][]const u8{ "unshare", "-Urn", "sh", "-c", userns_status_script, "sh", daemon_path, client_path, s.socket_path, s.config_path };
+    var r = try runToExit(a, &argv, null);
+    defer r.deinit(a);
+
+    if (lineContaining(r.stderr, "no usable backend (forced by config)")) |line| {
+        if (std.mem.indexOf(u8, line, "nf_tables not in kernel") != null or std.mem.indexOf(u8, line, "netlink denied") != null) {
+            std.debug.print("skipping: nf_tables not reachable from an unprivileged user namespace here: {s}\n", .{line});
+            return error.SkipZigTest;
+        }
+    }
+
+    try testing.expectEqual(@as(?u8, 0), r.exitCode());
+    try expectContains(r.stderr, "firewall backend: nftables selected (forced by config)");
+    try expectContains(r.stderr, "nftables: scaffold installed");
+    try expectContains(r.stderr, "running; backend=nftables;");
+    try expectNotContains(r.stderr, "no usable backend");
+    try expectNotContains(r.stderr, "forced by config but not usable");
+    try expectContains(r.stdout, "Protection:  active");
+    try expectContains(r.stdout, "Backend:     nftables");
+    try expectContains(r.stdout, "client-rc=0");
+    try expectContains(r.stdout, "daemon-rc=0");
+    try testing.expect(!hasErrorReturnTrace(r.stderr));
+}
+
+test "integration: metrics_enabled = false (g) binds no HTTP listener, logs http: disabled by config, banner http=off, IPC status still answers (ENH-008)" {
+    const a = testing.allocator;
+    var s = try Scenario.initAnyUid(a);
+    defer s.deinit();
+
+    try s.writeConfig("metrics_enabled = false", "log-only");
+
+    const d = try LiveDaemon.start(a, s.config_path, null);
+    defer d.destroy(a);
+
+    d.waitForSocket(s.socket_path, startup_timeout_ms) catch |err| {
+        const text = try d.sink.snapshot(a);
+        defer a.free(text);
+        std.debug.print("daemon did not come up ({s}); stderr:\n{s}\n", .{ @errorName(err), text });
+        return error.TestDaemonDidNotStart;
+    };
+    try testing.expect(d.waitForStderr("running; backend=none;", log_wait_ms));
+    {
+        const early = try d.sink.snapshot(a);
+        defer a.free(early);
+        try expectContains(early, "http: disabled by config");
+        try expectContains(early, "; http=off");
+        try expectNotContains(early, "http: init");
+    }
+
+    try s.expectMetricsPortRefused();
+    try testing.expect(d.isAlive());
+
+    const table = try s.clientStatus(d);
+    defer a.free(table);
+    try expectContains(table, "Protection:  log-only");
+    try expectContains(table, "Backend:     none");
+
+    try s.expectMetricsPortRefused();
+
+    const term = try d.stop();
+    const text = try d.sink.snapshot(a);
+    defer a.free(text);
+    try testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, term);
+    try expectNotContains(text, "error:");
+    try testing.expect(!hasErrorReturnTrace(text));
 }

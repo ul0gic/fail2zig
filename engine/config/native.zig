@@ -3,6 +3,9 @@
 
 const std = @import("std");
 const shared = @import("shared");
+const filter_registry = @import("../filters/registry.zig");
+pub const max_supported_retry = @import("../core/state.zig").max_attempts_per_ip;
+pub const max_ban_duration: u64 = std.math.maxInt(u64) / 1000;
 
 pub const Error = error{
     FileNotFound,
@@ -30,6 +33,7 @@ pub const Diagnostic = struct {
     line: u32 = 0,
     col: u32 = 0,
     mode: u32 = 0,
+    hint: []const u8 = "",
     key_len: u8 = 0,
     section_len: u8 = 0,
     key_buf: [max_name]u8 = [_]u8{0} ** max_name,
@@ -72,6 +76,9 @@ pub const BantimeFormula = enum { linear, exponential };
 /// ADR-007: what the daemon does when an enforcing jail exists but no firewall backend is usable.
 pub const OnNoBackend = enum { @"fail-closed", @"log-only" };
 
+/// `auto` keeps the nftables → ipset → iptables probe order; anything else probes only that backend.
+pub const FirewallSelection = enum { auto, nftables, ipset, iptables };
+
 pub const BanTimeIncrement = struct {
     enabled: bool = false,
     multiplier: f64 = 1.0,
@@ -86,10 +93,12 @@ pub const GlobalConfig = struct {
     socket_path: []const u8 = "/run/fail2zig/fail2zig.sock",
     state_file: []const u8 = "/var/lib/fail2zig/state.bin",
     memory_ceiling_mb: u32 = 64,
+    metrics_enabled: bool = true,
     metrics_bind: []const u8 = "127.0.0.1",
     metrics_port: u16 = 9100,
     websocket_max_clients: u32 = 16,
     on_no_backend: OnNoBackend = .@"fail-closed",
+    firewall: FirewallSelection = .auto,
 };
 
 pub const websocket_hard_max_clients: u32 = 1024;
@@ -117,6 +126,7 @@ pub const JailConfig = struct {
     ignoreip: ?[]const []const u8 = null,
     bantime_increment: BanTimeIncrement = .{},
     bantime_increment_explicit: bool = false,
+    bantime_increment_fields: u8 = 0,
 
     pub fn effectiveBantime(self: *const JailConfig, def: JailDefaults) shared.Duration {
         return self.bantime orelse def.bantime;
@@ -152,6 +162,16 @@ pub fn resolveJail(cfg: *const Config, jail_name: []const u8) ?ResolvedJailConfi
 }
 
 pub fn resolveJailFromConfig(j: *const JailConfig, defaults: JailDefaults) ResolvedJailConfig {
+    var increment = defaults.bantime_increment;
+    if (j.bantime_increment_explicit and j.bantime_increment_fields == 0) {
+        increment = j.bantime_increment;
+    } else {
+        if (j.bantime_increment_fields & 1 != 0) increment.enabled = j.bantime_increment.enabled;
+        if (j.bantime_increment_fields & 2 != 0) increment.multiplier = j.bantime_increment.multiplier;
+        if (j.bantime_increment_fields & 4 != 0) increment.factor = j.bantime_increment.factor;
+        if (j.bantime_increment_fields & 8 != 0) increment.formula = j.bantime_increment.formula;
+        if (j.bantime_increment_fields & 16 != 0) increment.max_bantime = j.bantime_increment.max_bantime;
+    }
     return .{
         .name = j.name,
         .enabled = j.enabled,
@@ -159,10 +179,7 @@ pub fn resolveJailFromConfig(j: *const JailConfig, defaults: JailDefaults) Resol
         .findtime = j.effectiveFindtime(defaults),
         .bantime = j.effectiveBantime(defaults),
         .banaction = j.effectiveBanaction(defaults),
-        .bantime_increment = if (j.bantime_increment_explicit)
-            j.bantime_increment
-        else
-            defaults.bantime_increment,
+        .bantime_increment = increment,
     };
 }
 
@@ -226,8 +243,11 @@ pub const ValidationError = error{
     InvalidFindtime,
     InvalidMaxretry,
     MemoryCeilingTooLow,
+    MemoryCeilingTooHigh,
+    InvalidIncrement,
     UnknownFilter,
     EmptyJailName,
+    InvalidJailName,
     DuplicateJailName,
 };
 
@@ -236,7 +256,9 @@ pub fn validate(cfg: *const Config) ValidationError!void {
         std.log.warn("config: memory_ceiling_mb={d} is below 16MB floor", .{cfg.global.memory_ceiling_mb});
         return error.MemoryCeilingTooLow;
     }
-    if (cfg.defaults.bantime == 0) {
+    if (cfg.global.memory_ceiling_mb > std.math.maxInt(usize) / (1024 * 1024)) return error.MemoryCeilingTooHigh;
+    try validateIncrement(cfg.defaults.bantime_increment);
+    if (cfg.defaults.bantime == 0 or cfg.defaults.bantime > max_ban_duration) {
         std.log.warn("config: defaults.bantime must be > 0", .{});
         return error.InvalidBantime;
     }
@@ -244,8 +266,8 @@ pub fn validate(cfg: *const Config) ValidationError!void {
         std.log.warn("config: defaults.findtime must be > 0", .{});
         return error.InvalidFindtime;
     }
-    if (cfg.defaults.maxretry == 0) {
-        std.log.warn("config: defaults.maxretry must be > 0", .{});
+    if (cfg.defaults.maxretry == 0 or cfg.defaults.maxretry > max_supported_retry) {
+        std.log.warn("config: defaults.maxretry must be between 1 and 128", .{});
         return error.InvalidMaxretry;
     }
 
@@ -258,6 +280,7 @@ pub fn validate(cfg: *const Config) ValidationError!void {
 
     for (cfg.jails, 0..) |j, i| {
         if (j.name.len == 0) return error.EmptyJailName;
+        _ = shared.JailId.fromSlice(j.name) catch return error.InvalidJailName;
 
         var k: usize = i + 1;
         while (k < cfg.jails.len) : (k += 1) {
@@ -267,9 +290,14 @@ pub fn validate(cfg: *const Config) ValidationError!void {
             }
         }
 
-        if (j.bantime) |b| if (b == 0) return error.InvalidBantime;
+        try validateIncrement(resolveJailFromConfig(&j, cfg.defaults).bantime_increment);
+        if (j.enabled and filter_registry.matcherForFilter(j.filter) == null) {
+            std.log.warn("config: jail '{s}' filter '{s}' has no builtin matcher", .{ j.name, j.filter });
+            return error.UnknownFilter;
+        }
+        if (j.bantime) |b| if (b == 0 or b > max_ban_duration) return error.InvalidBantime;
         if (j.findtime) |f| if (f == 0) return error.InvalidFindtime;
-        if (j.maxretry) |m| if (m == 0) return error.InvalidMaxretry;
+        if (j.maxretry) |m| if (m == 0 or m > max_supported_retry) return error.InvalidMaxretry;
 
         for (j.logpath) |lp| {
             std.fs.cwd().access(lp, .{}) catch {
@@ -297,6 +325,12 @@ pub fn validate(cfg: *const Config) ValidationError!void {
     }
 }
 
+fn validateIncrement(incr: BanTimeIncrement) ValidationError!void {
+    if (!std.math.isFinite(incr.multiplier) or incr.multiplier <= 0 or
+        !std.math.isFinite(incr.factor) or incr.factor < 0 or
+        incr.max_bantime == 0 or incr.max_bantime > max_ban_duration) return error.InvalidIncrement;
+}
+
 const Parser = struct {
     arena: std.mem.Allocator,
     src: []const u8,
@@ -313,6 +347,7 @@ const Parser = struct {
 
     cur_section: []const u8 = "",
     cur_key: []const u8 = "",
+    hint: []const u8 = "",
     section_pos: Pos = .{},
     key_pos: Pos = .{},
     value_pos: Pos = .{},
@@ -360,6 +395,7 @@ const Parser = struct {
         };
         out.line = pos.line;
         out.col = pos.col;
+        out.hint = self.hint;
         out.key_len = Diagnostic.copyName(&out.key_buf, self.cur_key);
         out.section_len = Diagnostic.copyName(&out.section_buf, self.cur_section);
     }
@@ -688,18 +724,25 @@ const Parser = struct {
             self.global.log_level = try parseLogLevel(s);
         } else if (std.mem.eql(u8, key, "pid_file")) {
             self.global.pid_file = try asString(v);
+            std.log.warn("config: pid_file is a deprecated compatibility key and is not written; use systemd MainPID", .{});
         } else if (std.mem.eql(u8, key, "socket_path")) {
             self.global.socket_path = try asString(v);
         } else if (std.mem.eql(u8, key, "state_file")) {
             self.global.state_file = try asString(v);
         } else if (std.mem.eql(u8, key, "memory_ceiling_mb")) {
             const n = try asInt(v);
-            if (n < 0) return error.InvalidValue;
+            if (n < 0 or n > std.math.maxInt(u32)) return error.InvalidValue;
             self.global.memory_ceiling_mb = @intCast(n);
+        } else if (std.mem.eql(u8, key, "metrics_enabled")) {
+            self.global.metrics_enabled = try asBool(v);
         } else if (std.mem.eql(u8, key, "metrics_bind")) {
             self.global.metrics_bind = try asString(v);
         } else if (std.mem.eql(u8, key, "metrics_port")) {
             const n = try asInt(v);
+            if (n == 0) {
+                self.hint = metrics_port_zero_hint;
+                return error.InvalidValue;
+            }
             if (n < 0 or n > 65535) return error.InvalidValue;
             self.global.metrics_port = @intCast(n);
         } else if (std.mem.eql(u8, key, "websocket_max_clients")) {
@@ -709,6 +752,9 @@ const Parser = struct {
         } else if (std.mem.eql(u8, key, "on_no_backend")) {
             const s = try asString(v);
             self.global.on_no_backend = try parseOnNoBackend(s);
+        } else if (std.mem.eql(u8, key, "firewall")) {
+            const s = try asString(v);
+            self.global.firewall = try parseFirewallSelection(s);
         } else return error.UnknownKey;
     }
 
@@ -716,7 +762,7 @@ const Parser = struct {
         const v = try self.parseValue();
         if (std.mem.eql(u8, key, "bantime")) {
             const n = try asInt(v);
-            if (n < 0) return error.InvalidValue;
+            if (n < 0 or n > max_ban_duration) return error.InvalidValue;
             self.defaults.bantime = @intCast(n);
         } else if (std.mem.eql(u8, key, "findtime")) {
             const n = try asInt(v);
@@ -724,7 +770,10 @@ const Parser = struct {
             self.defaults.findtime = @intCast(n);
         } else if (std.mem.eql(u8, key, "maxretry")) {
             const n = try asInt(v);
-            if (n < 0) return error.InvalidValue;
+            if (n < 0 or n > max_supported_retry) {
+                self.hint = "maxretry must be between 1 and 128 (bounded attempt history)";
+                return error.InvalidValue;
+            }
             self.defaults.maxretry = @intCast(n);
         } else if (std.mem.eql(u8, key, "banaction")) {
             const s = try asString(v);
@@ -754,7 +803,7 @@ const Parser = struct {
             } else return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "bantime_increment_max_bantime")) {
             const n = try asInt(v);
-            if (n < 0) return error.InvalidValue;
+            if (n < 0 or n > max_ban_duration) return error.InvalidValue;
             self.defaults.bantime_increment.max_bantime = @intCast(n);
         } else return error.UnknownKey;
     }
@@ -781,7 +830,10 @@ const Parser = struct {
             origin.* = .backend;
         } else if (std.mem.eql(u8, key, "maxretry")) {
             const n = try asInt(v);
-            if (n < 0) return error.InvalidValue;
+            if (n < 0 or n > max_supported_retry) {
+                self.hint = "maxretry must be between 1 and 128 (bounded attempt history)";
+                return error.InvalidValue;
+            }
             j.maxretry = @intCast(n);
         } else if (std.mem.eql(u8, key, "findtime")) {
             const n = try asInt(v);
@@ -789,7 +841,7 @@ const Parser = struct {
             j.findtime = @intCast(n);
         } else if (std.mem.eql(u8, key, "bantime")) {
             const n = try asInt(v);
-            if (n < 0) return error.InvalidValue;
+            if (n < 0 or n > max_ban_duration) return error.InvalidValue;
             j.bantime = @intCast(n);
         } else if (std.mem.eql(u8, key, "banaction")) {
             const s = try asString(v);
@@ -799,12 +851,15 @@ const Parser = struct {
         } else if (std.mem.eql(u8, key, "bantime_increment_enabled")) {
             j.bantime_increment.enabled = try asBool(v);
             j.bantime_increment_explicit = true;
+            j.bantime_increment_fields |= 1;
         } else if (std.mem.eql(u8, key, "bantime_increment_multiplier")) {
             j.bantime_increment.multiplier = try asFloat(v);
             j.bantime_increment_explicit = true;
+            j.bantime_increment_fields |= 2;
         } else if (std.mem.eql(u8, key, "bantime_increment_factor")) {
             j.bantime_increment.factor = try asFloat(v);
             j.bantime_increment_explicit = true;
+            j.bantime_increment_fields |= 4;
         } else if (std.mem.eql(u8, key, "bantime_increment_formula")) {
             const s = try asString(v);
             if (std.mem.eql(u8, s, "linear")) {
@@ -813,11 +868,13 @@ const Parser = struct {
                 j.bantime_increment.formula = .exponential;
             } else return error.InvalidValue;
             j.bantime_increment_explicit = true;
+            j.bantime_increment_fields |= 8;
         } else if (std.mem.eql(u8, key, "bantime_increment_max_bantime")) {
             const n = try asInt(v);
-            if (n < 0) return error.InvalidValue;
+            if (n < 0 or n > max_ban_duration) return error.InvalidValue;
             j.bantime_increment.max_bantime = @intCast(n);
             j.bantime_increment_explicit = true;
+            j.bantime_increment_fields |= 16;
         } else return error.UnknownKey;
     }
 
@@ -918,6 +975,16 @@ fn parseBanAction(s: []const u8) Error!BanAction {
     if (std.mem.eql(u8, s, "iptables")) return .iptables;
     if (std.mem.eql(u8, s, "ipset")) return .ipset;
     if (std.mem.eql(u8, s, "log-only")) return .@"log-only";
+    return error.InvalidValue;
+}
+
+pub const metrics_port_zero_hint: []const u8 = "metrics_port = 0 does not disable the endpoint; set metrics_enabled = false";
+
+fn parseFirewallSelection(s: []const u8) Error!FirewallSelection {
+    if (std.mem.eql(u8, s, "auto")) return .auto;
+    if (std.mem.eql(u8, s, "nftables")) return .nftables;
+    if (std.mem.eql(u8, s, "ipset")) return .ipset;
+    if (std.mem.eql(u8, s, "iptables")) return .iptables;
     return error.InvalidValue;
 }
 
@@ -1887,4 +1954,115 @@ test "native: source = \"internal\" parses per jail and in defaults (ENH-005)" {
     try std.testing.expectEqual(LogSource.internal, cfg.jails[0].source);
     try std.testing.expect(filterSupportsInternal("recidive"));
     try std.testing.expect(!filterSupportsInternal("sshd"));
+}
+
+test "native: firewall defaults to auto and parses every backend name (ENH-007)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const def = try Config.parse(arena.allocator(), "[global]\n");
+    try std.testing.expectEqual(FirewallSelection.auto, def.global.firewall);
+    inline for (.{ "auto", "nftables", "ipset", "iptables" }) |name| {
+        const cfg = try Config.parse(arena.allocator(), "[global]\nfirewall = \"" ++ name ++ "\"\n");
+        try std.testing.expectEqual(@field(FirewallSelection, name), cfg.global.firewall);
+    }
+}
+
+test "native: firewall rejects unknown and non-string values with a positioned diag (ENH-007)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[global]
+        \\log_level = "info"
+        \\firewall = "ebpf"
+    ;
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.InvalidValue, Config.parseDiag(arena.allocator(), src, &diag));
+    try std.testing.expectEqual(@as(u32, 3), diag.line);
+    try std.testing.expectEqual(@as(u32, 12), diag.col);
+    try std.testing.expectEqualStrings("firewall", diag.key());
+    try std.testing.expectEqualStrings("global", diag.section());
+    try std.testing.expectEqualStrings("", diag.hint);
+
+    var diag_int: Diagnostic = .{};
+    try std.testing.expectError(error.InvalidValue, Config.parseDiag(arena.allocator(), "[global]\nfirewall = 1\n", &diag_int));
+    try std.testing.expectEqualStrings("firewall", diag_int.key());
+}
+
+test "native: firewall is global-only; UnknownKey in [jails.*] and [defaults] (ENH-007)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.UnknownKey, Config.parseDiag(arena.allocator(), "[jails.sshd]\nfilter = \"sshd\"\nfirewall = \"nftables\"\n", &diag));
+    try std.testing.expectEqualStrings("firewall", diag.key());
+    try std.testing.expectEqualStrings("jails.sshd", diag.section());
+    try std.testing.expectEqual(@as(u32, 3), diag.line);
+    try std.testing.expectError(error.UnknownKey, Config.parse(arena.allocator(), "[defaults]\nfirewall = \"nftables\"\n"));
+}
+
+test "native: metrics_enabled defaults true and parses false; non-bool is InvalidValue (ENH-008)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const def = try Config.parse(arena.allocator(), "[global]\n");
+    try std.testing.expect(def.global.metrics_enabled);
+    try std.testing.expectEqual(@as(u16, 9100), def.global.metrics_port);
+    const off = try Config.parse(arena.allocator(), "[global]\nmetrics_enabled = false\n");
+    try std.testing.expect(!off.global.metrics_enabled);
+    try std.testing.expectEqual(@as(u16, 9100), off.global.metrics_port);
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.InvalidValue, Config.parseDiag(arena.allocator(), "[global]\nmetrics_enabled = \"no\"\n", &diag));
+    try std.testing.expectEqualStrings("metrics_enabled", diag.key());
+    try std.testing.expectError(error.UnknownKey, Config.parse(arena.allocator(), "[jails.sshd]\nfilter = \"sshd\"\nmetrics_enabled = false\n"));
+}
+
+test "native: metrics_port = 0 is InvalidValue with a hint naming metrics_enabled (ENH-008, DBT-010)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[global]
+        \\metrics_port = 0
+    ;
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.InvalidValue, Config.parseDiag(arena.allocator(), src, &diag));
+    try std.testing.expectEqual(@as(u32, 2), diag.line);
+    try std.testing.expectEqual(@as(u32, 16), diag.col);
+    try std.testing.expectEqualStrings("metrics_port", diag.key());
+    try std.testing.expectEqualStrings(metrics_port_zero_hint, diag.hint);
+
+    var out_of_range: Diagnostic = .{};
+    try std.testing.expectError(error.InvalidValue, Config.parseDiag(arena.allocator(), "[global]\nmetrics_port = 65536\n", &out_of_range));
+    try std.testing.expectEqualStrings("", out_of_range.hint);
+    const one = try Config.parse(arena.allocator(), "[global]\nmetrics_port = 1\n");
+    try std.testing.expectEqual(@as(u16, 1), one.global.metrics_port);
+}
+
+test "native: retry and numeric bounds are rejected before narrowing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for ([_][]const u8{
+        "[defaults]\nmaxretry = 129\n",
+        "[jails.sshd]\nmaxretry = 4294967296\n",
+        "[global]\nmemory_ceiling_mb = 4294967296\n",
+        "[defaults]\nbantime = 9223372036854775807\n",
+    }) |source| try std.testing.expectError(error.InvalidValue, Config.parse(arena.allocator(), source));
+    const cfg = try Config.parse(arena.allocator(), "[defaults]\nmaxretry = 128\n");
+    try validate(&cfg);
+}
+
+test "native: unsupported enabled filter fails validation but disabled import can be retained" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg = try Config.parse(arena.allocator(), "[jails.custom]\nenabled = true\nfilter = \"custom\"\n");
+    try std.testing.expectError(error.UnknownFilter, validate(&cfg));
+    cfg.jails[0].enabled = false;
+    try validate(&cfg);
+}
+
+test "native: a single jail increment override inherits the other default fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cfg = try Config.parse(arena.allocator(), "[jails.sshd]\nfilter = \"sshd\"\nbantime_increment_factor = 1.5\n[defaults]\nbantime_increment_enabled = true\nbantime_increment_multiplier = 2\n");
+    const resolved = resolveJailFromConfig(&cfg.jails[0], cfg.defaults);
+    try std.testing.expect(resolved.bantime_increment.enabled);
+    try std.testing.expectEqual(@as(f64, 2), resolved.bantime_increment.multiplier);
+    try std.testing.expectEqual(@as(f64, 1.5), resolved.bantime_increment.factor);
 }

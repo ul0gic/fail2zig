@@ -3,7 +3,7 @@
 const std = @import("std");
 
 // Version single source of truth; build.zig.zon .version must match (release-stamp bumps both).
-const fail2zig_version = "0.3.0";
+const fail2zig_version = "0.3.1-dev";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -119,6 +119,7 @@ pub fn build(b: *std.Build) void {
         needs_daemon_binary: bool,
     };
     const integration_files = [_]IntegrationFile{
+        .{ .name = "filter_corpus", .path = "tests/integration/filter_corpus_test.zig", .needs_daemon_binary = false },
         .{ .name = "harness", .path = "tests/integration/harness.zig", .needs_daemon_binary = false },
         .{ .name = "ban", .path = "tests/integration/ban_test.zig", .needs_daemon_binary = true },
         .{ .name = "migration", .path = "tests/integration/migration_test.zig", .needs_daemon_binary = false },
@@ -150,13 +151,6 @@ pub fn build(b: *std.Build) void {
     });
     parser_only_mod.addImport("shared", shared_mod);
 
-    const config_native_only_mod = b.createModule(.{
-        .root_source_file = b.path("engine/config/native.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    config_native_only_mod.addImport("shared", shared_mod);
-
     const FuzzFile = struct {
         path: []const u8,
         extra_import_name: ?[]const u8,
@@ -166,7 +160,7 @@ pub fn build(b: *std.Build) void {
         .{ .path = "tests/fuzz/fuzz_parser.zig", .extra_import_name = "parser", .extra_import_mod = parser_only_mod },
         .{ .path = "tests/fuzz/fuzz_ip.zig", .extra_import_name = null, .extra_import_mod = null },
         .{ .path = "tests/fuzz/fuzz_protocol.zig", .extra_import_name = null, .extra_import_mod = null },
-        .{ .path = "tests/fuzz/fuzz_config.zig", .extra_import_name = "config_native", .extra_import_mod = config_native_only_mod },
+        .{ .path = "tests/fuzz/fuzz_config.zig", .extra_import_name = "engine", .extra_import_mod = engine_mod },
     };
     for (fuzz_files) |f| {
         const mod = b.createModule(.{

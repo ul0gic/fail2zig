@@ -2,6 +2,7 @@
 // Copyright (c) 2026 fail2zig maintainers
 
 const std = @import("std");
+const native_endian = @import("builtin").cpu.arch.endian();
 const linux = std.os.linux;
 const mem = std.mem;
 
@@ -184,8 +185,8 @@ fn appendAttr(
     const total = NLA_HDRLEN + value.len;
     const aligned = nlaAlign(total);
     if (offset + aligned > buf.len) return error.BufferTooSmall;
-    mem.writeInt(u16, buf[offset..][0..2], @intCast(total), .little);
-    mem.writeInt(u16, buf[offset + 2 ..][0..2], attr_type, .little);
+    mem.writeInt(u16, buf[offset..][0..2], @intCast(total), native_endian);
+    mem.writeInt(u16, buf[offset + 2 ..][0..2], attr_type, native_endian);
     if (value.len > 0) {
         @memcpy(buf[offset + NLA_HDRLEN .. offset + total], value);
     }
@@ -226,8 +227,8 @@ fn appendStringNul(
     const total = NLA_HDRLEN + str.len + 1;
     const aligned = nlaAlign(total);
     if (offset + aligned > buf.len) return error.BufferTooSmall;
-    mem.writeInt(u16, buf[offset..][0..2], @intCast(total), .little);
-    mem.writeInt(u16, buf[offset + 2 ..][0..2], attr_type, .little);
+    mem.writeInt(u16, buf[offset..][0..2], @intCast(total), native_endian);
+    mem.writeInt(u16, buf[offset + 2 ..][0..2], attr_type, native_endian);
     @memcpy(buf[offset + NLA_HDRLEN .. offset + NLA_HDRLEN + str.len], str);
     buf[offset + NLA_HDRLEN + str.len] = 0;
     if (aligned > total) {
@@ -242,8 +243,8 @@ fn beginNested(
     attr_type: u16,
 ) netlink.Error!usize {
     if (offset + NLA_HDRLEN > buf.len) return error.BufferTooSmall;
-    mem.writeInt(u16, buf[offset..][0..2], 0, .little);
-    mem.writeInt(u16, buf[offset + 2 ..][0..2], attr_type | NLA_F_NESTED, .little);
+    mem.writeInt(u16, buf[offset..][0..2], 0, native_endian);
+    mem.writeInt(u16, buf[offset + 2 ..][0..2], attr_type | NLA_F_NESTED, native_endian);
     return offset + NLA_HDRLEN;
 }
 
@@ -251,7 +252,7 @@ fn endNested(buf: []u8, header_offset: usize, cur_offset: usize) netlink.Error!u
     const inner_len = cur_offset - header_offset;
     const total = NLA_HDRLEN + inner_len;
     const aligned = nlaAlign(total);
-    mem.writeInt(u16, buf[header_offset - NLA_HDRLEN ..][0..2], @intCast(total), .little);
+    mem.writeInt(u16, buf[header_offset - NLA_HDRLEN ..][0..2], @intCast(total), native_endian);
     if (aligned > total) {
         if (cur_offset + (aligned - total) > buf.len) return error.BufferTooSmall;
         @memset(buf[cur_offset .. cur_offset + (aligned - total)], 0);
@@ -814,9 +815,20 @@ fn banImpl(
 ) backend.BackendError!void {
     _ = jail;
     const self = castSelf(ctx);
+    putElement(self, ip, duration, false) catch |err| switch (err) {
+        error.AlreadyBanned => putElement(self, ip, duration, true) catch |replace_err| switch (replace_err) {
+            error.NotBanned => try putElement(self, ip, duration, false),
+            else => return replace_err,
+        },
+        else => return err,
+    };
+}
+
+fn putElement(self: *NftablesBackend, ip: shared.IpAddress, duration: shared.Duration, replace: bool) backend.BackendError!void {
     if (!self.initialized) return error.NotAvailable;
     var sock_ptr = &(self.sock orelse return error.NotAvailable);
 
+    const milliseconds = std.math.mul(u64, duration, 1000) catch return error.SystemError;
     var msg_buf: [512]u8 = undefined;
     const payload = switch (ip) {
         .ipv4 => |v| blk: {
@@ -828,7 +840,7 @@ fn banImpl(
                 self.tableName(),
                 "banned_ipv4",
                 &key,
-                duration * 1000,
+                milliseconds,
             ) catch |e| return mapNetlinkErr(e);
         },
         .ipv6 => |v| blk: {
@@ -840,7 +852,7 @@ fn banImpl(
                 self.tableName(),
                 "banned_ipv6",
                 &key,
-                duration * 1000,
+                milliseconds,
             ) catch |e| return mapNetlinkErr(e);
         },
     };
@@ -849,10 +861,33 @@ fn banImpl(
     var batch = netlink.Batch.init(&batch_buf);
     const begin_seq = sock_ptr.nextSeq();
     batch.begin(begin_seq, sock_ptr.port_id, netlink.NFNL.SUBSYS_NFTABLES) catch |e| return mapNetlinkErr(e);
+    var sequences: [2]u32 = undefined;
+    var sequence_count: usize = 0;
+    if (replace) {
+        var key: [16]u8 = undefined;
+        const key_bytes = switch (ip) {
+            .ipv4 => |v| blk: {
+                mem.writeInt(u32, key[0..4], v, .big);
+                break :blk key[0..4];
+            },
+            .ipv6 => |v| blk: {
+                mem.writeInt(u128, &key, v, .big);
+                break :blk key[0..16];
+            },
+        };
+        var del_buf: [512]u8 = undefined;
+        const del_payload = buildSetElemDelPayload(&del_buf, netlink.NFPROTO.INET, self.tableName(), if (ip == .ipv4) "banned_ipv4" else "banned_ipv6", key_bytes) catch |e| return mapNetlinkErr(e);
+        const del_seq = sock_ptr.nextSeq();
+        batch.add(netlink.nfnlMsgType(netlink.NFNL.SUBSYS_NFTABLES, NFT_MSG.DELSETELEM), linux.NLM_F_REQUEST | linux.NLM_F_ACK, del_seq, sock_ptr.port_id, del_payload) catch |e| return mapNetlinkErr(e);
+        sequences[sequence_count] = del_seq;
+        sequence_count += 1;
+    }
     const elem_seq = sock_ptr.nextSeq();
+    sequences[sequence_count] = elem_seq;
+    sequence_count += 1;
     batch.add(
         netlink.nfnlMsgType(netlink.NFNL.SUBSYS_NFTABLES, NFT_MSG.NEWSETELEM),
-        linux.NLM_F_REQUEST | linux.NLM_F_ACK | linux.NLM_F_CREATE,
+        linux.NLM_F_REQUEST | linux.NLM_F_ACK | linux.NLM_F_CREATE | linux.NLM_F_EXCL,
         elem_seq,
         sock_ptr.port_id,
         payload,
@@ -863,7 +898,7 @@ fn banImpl(
     sock_ptr.send(out) catch return error.SystemError;
 
     var ack_buf: [1024]u8 = undefined;
-    sock_ptr.drainAck(&[_]u32{elem_seq}, &ack_buf) catch |e| return mapNetlinkErr(e);
+    sock_ptr.drainAck(sequences[0..sequence_count], &ack_buf) catch |e| return mapNetlinkErr(e);
 }
 
 fn unbanImpl(
@@ -1035,8 +1070,8 @@ test "nftables: buildChainPayload emits table + name + hook + type + policy" {
 
     var i: usize = 4;
     while (i + 4 <= out.len) {
-        const attr_len = mem.readInt(u16, out[i..][0..2], .little);
-        const attr_type_raw = mem.readInt(u16, out[i + 2 ..][0..2], .little);
+        const attr_len = mem.readInt(u16, out[i..][0..2], native_endian);
+        const attr_type_raw = mem.readInt(u16, out[i + 2 ..][0..2], native_endian);
         const attr_type = attr_type_raw & ~NLA_F_NESTED;
         const payload_start = i + 4;
         const payload_end = i + attr_len;
@@ -1055,8 +1090,8 @@ test "nftables: buildChainPayload emits table + name + hook + type + policy" {
                 seen_hook = true;
                 var j: usize = 0;
                 while (j + 4 <= payload.len) {
-                    const sub_len = mem.readInt(u16, payload[j..][0..2], .little);
-                    const sub_type = mem.readInt(u16, payload[j + 2 ..][0..2], .little) & ~NLA_F_NESTED;
+                    const sub_len = mem.readInt(u16, payload[j..][0..2], native_endian);
+                    const sub_type = mem.readInt(u16, payload[j + 2 ..][0..2], native_endian) & ~NLA_F_NESTED;
                     if (sub_len < 8 or j + sub_len > payload.len) break;
                     const sub_payload = payload[j + 4 .. j + sub_len];
                     if (sub_type == NFTA_HOOK.HOOKNUM) {
@@ -1248,8 +1283,8 @@ test "nftables: buildSetPayload omits NFTA_SET_TIMEOUT when timeout is 0 (SYS-00
     var saw_id = false;
     var i: usize = 4;
     while (i + 4 <= out.len) {
-        const attr_len = mem.readInt(u16, out[i..][0..2], .little);
-        const attr_type = mem.readInt(u16, out[i + 2 ..][0..2], .little) & ~NLA_F_NESTED;
+        const attr_len = mem.readInt(u16, out[i..][0..2], native_endian);
+        const attr_type = mem.readInt(u16, out[i + 2 ..][0..2], native_endian) & ~NLA_F_NESTED;
         if (attr_len < 4) break;
         if (attr_type == NFTA_SET.TIMEOUT) saw_timeout = true;
         if (attr_type == NFTA_SET.ID) saw_id = true;
@@ -1271,8 +1306,8 @@ test "nftables: appendAttr emits correct TLV layout" {
     var buf: [32]u8 = undefined;
     const end = try appendAttr(&buf, 0, NFTA_TABLE.NAME, "abc");
     try std.testing.expectEqual(@as(usize, 8), end);
-    try std.testing.expectEqual(@as(u16, 7), mem.readInt(u16, buf[0..2], .little));
-    try std.testing.expectEqual(@as(u16, NFTA_TABLE.NAME), mem.readInt(u16, buf[2..4], .little));
+    try std.testing.expectEqual(@as(u16, 7), mem.readInt(u16, buf[0..2], native_endian));
+    try std.testing.expectEqual(@as(u16, NFTA_TABLE.NAME), mem.readInt(u16, buf[2..4], native_endian));
     try std.testing.expectEqualSlices(u8, "abc", buf[4..7]);
     try std.testing.expectEqual(@as(u8, 0), buf[7]);
 }
@@ -1281,7 +1316,7 @@ test "nftables: appendStringNul includes terminating NUL" {
     var buf: [16]u8 = undefined;
     const end = try appendStringNul(&buf, 0, NFTA_TABLE.NAME, "ab");
     try std.testing.expectEqual(@as(usize, 8), end);
-    try std.testing.expectEqual(@as(u16, 7), mem.readInt(u16, buf[0..2], .little));
+    try std.testing.expectEqual(@as(u16, 7), mem.readInt(u16, buf[0..2], native_endian));
     try std.testing.expectEqualStrings("ab", buf[4..6]);
     try std.testing.expectEqual(@as(u8, 0), buf[6]);
 }
@@ -1301,8 +1336,8 @@ test "nftables: buildTablePayload contains nfgenmsg + name TLV" {
     try std.testing.expectEqual(@as(u8, 0), out[1]);
     try std.testing.expectEqual(@as(u16, 0), mem.readInt(u16, out[2..4], .big));
 
-    const tlv_len = mem.readInt(u16, out[4..6], .little);
-    const tlv_type = mem.readInt(u16, out[6..8], .little);
+    const tlv_len = mem.readInt(u16, out[4..6], native_endian);
+    const tlv_type = mem.readInt(u16, out[6..8], native_endian);
     try std.testing.expectEqual(@as(u16, NFTA_TABLE.NAME), tlv_type);
     try std.testing.expectEqual(@as(u16, 4 + 9), tlv_len);
     try std.testing.expectEqualStrings("fail2zig", out[8..16]);
@@ -1330,8 +1365,8 @@ test "nftables: buildSetPayload sets TIMEOUT flag and correct key type" {
     var seen_name = false;
     var i: usize = 4;
     while (i + 4 <= out.len) {
-        const attr_len = mem.readInt(u16, out[i..][0..2], .little);
-        const attr_type = mem.readInt(u16, out[i + 2 ..][0..2], .little);
+        const attr_len = mem.readInt(u16, out[i..][0..2], native_endian);
+        const attr_type = mem.readInt(u16, out[i + 2 ..][0..2], native_endian);
         const payload_start = i + 4;
         const payload_end = i + attr_len;
         if (payload_end > out.len) break;
@@ -1424,8 +1459,8 @@ test "nftables: buildSetElemAddPayload for IPv6 emits 16-byte key" {
     var saw_key = false;
     var i: usize = 0;
     while (i + 4 + 16 <= out.len) : (i += 1) {
-        const attr_len = mem.readInt(u16, out[i..][0..2], .little);
-        const attr_type = mem.readInt(u16, out[i + 2 ..][0..2], .little) & ~NLA_F_NESTED;
+        const attr_len = mem.readInt(u16, out[i..][0..2], native_endian);
+        const attr_type = mem.readInt(u16, out[i + 2 ..][0..2], native_endian) & ~NLA_F_NESTED;
         if (attr_type != NFTA_DATA_VALUE or attr_len != 4 + 16) continue;
         const payload = out[i + 4 .. i + 4 + 16];
         var all_zero_except_last = true;
@@ -1454,8 +1489,8 @@ test "nftables: buildSetElemDelPayload omits timeout attribute" {
     var contains_timeout = false;
     var i: usize = 4;
     while (i + 4 <= out.len) {
-        const attr_len = mem.readInt(u16, out[i..][0..2], .little);
-        const attr_type = mem.readInt(u16, out[i + 2 ..][0..2], .little) & ~NLA_F_NESTED;
+        const attr_len = mem.readInt(u16, out[i..][0..2], native_endian);
+        const attr_type = mem.readInt(u16, out[i + 2 ..][0..2], native_endian) & ~NLA_F_NESTED;
         if (attr_type == NFTA_SET_ELEM.TIMEOUT and attr_len == 12) contains_timeout = true;
         if (attr_len < 4) break;
         i += nlaAlign(attr_len);

@@ -8,18 +8,19 @@
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/ul0gic/fail2zig/badge)](https://scorecard.dev/viewer/?uri=github.com/ul0gic/fail2zig)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 [![Zig](https://img.shields.io/badge/zig-0.14.1-F7A41D?logo=zig&logoColor=white)](https://ziglang.org/download/)
-[![Platform](https://img.shields.io/badge/platform-linux--x86__64%20%7C%20aarch64%20%7C%20armv7%20%7C%20mips-lightgrey)](#installation)
+[![Platform](https://img.shields.io/badge/platform-linux--x86__64%20%7C%20aarch64%20%7C%20armv7%20%7C%20mips%20%7C%20mipsel-lightgrey)](#installation)
 [![Version](https://img.shields.io/github/v/release/ul0gic/fail2zig?label=version&color=orange)](https://github.com/ul0gic/fail2zig/releases/latest)
 
 </div>
 
-fail2zig is a drop-in replacement for fail2ban — written in Zig, shipped as a
+fail2zig is an intrusion prevention daemon inspired by fail2ban — written in Zig, shipped as a
 single static binary, with a parser that cannot be made to allocate unbounded
 memory by the traffic it's supposed to be stopping.
 
 fail2ban has served the industry for 20 years and the filter ecosystem it grew
-is fail2zig's direct inheritance — we consume fail2ban `jail.conf` and
-`filter.d/` unchanged. fail2zig focuses on the one thing the Python runtime
+is fail2zig's direct inheritance — `--import-config` translates an existing
+`jail.conf` and `filter.d/` into native TOML in one pass and reports what it
+could not translate. fail2zig focuses on the one thing the Python runtime
 makes hard: a small, static, memory-bounded daemon that safely runs as root on
 a shared host.
 
@@ -69,7 +70,7 @@ The installer pulls from the
 [latest GitHub Release](https://github.com/ul0gic/fail2zig/releases/latest)
 and verifies every asset against the published `SHA256SUMS` before placing
 anything on disk. Pin a specific version with
-`FAIL2ZIG_VERSION=v0.2.0` or inspect the script first with
+`FAIL2ZIG_VERSION=v0.3.0` or inspect the script first with
 `curl -fsSL … | less`.
 
 ---
@@ -78,26 +79,30 @@ anything on disk. Pin a specific version with
 
 - **Single static binary.** Copy it to any Linux host. No Python, no package
   manager, no runtime. Works on distroless containers, minimal VMs, and
-  routers. Stripped release binary is ~900 KB.
-- **Zero runtime dependencies.** No shell-out to `nft`, `iptables`, or any
-  other CLI. fail2zig speaks netlink directly to the kernel for every
-  firewall operation — the nftables userspace package (`nft`) does not need
-  to be installed. See
+  routers. The stripped x86_64 release binaries are 1.0 MB (daemon) and
+  535 KB (client).
+- **Zero runtime dependencies.** No Python, no shared libraries, no `nft`
+  userspace package. The nftables backend programs the kernel over netlink
+  directly. The ipset and iptables fallbacks spawn the CLI as a discrete
+  argv (no `/bin/sh`) and are used only where the kernel lacks nf_tables. See
   [architecture/zero-dependencies](https://fail2zig.com/docs/architecture/zero-dependencies/)
   for why this matters and how we verify it.
-- **Bounded under attack.** The IP state tracker is a fixed-capacity,
-  pre-allocated map sized from a configurable ceiling (`memory_ceiling_mb`,
-  default 64 MB) with an operator-defined eviction policy — so tracked state
-  does not grow under sustained brute-force or DDoS. The ceiling bounds
-  tracker capacity, not a hard per-component byte budget across every allocator.
+- **Bounded under attack.** The IP state tracker is a fixed-capacity map.
+  Half of `memory_ceiling_mb` (default 64 MB) is split evenly across the
+  enabled jails plus one spare tracker, at roughly 1.5 KB per tracked IP.
+  When a tracker is full, the oldest unbanned entry is evicted; this is not
+  configurable. The bound is on entries, not a byte budget across every
+  allocator.
 - **Comptime-generated parsers.** Built-in filter patterns compile into
   specialized match functions at build time. There is no regex engine in the
   process. Attacker-controlled input never reaches a Turing-complete matcher.
-- **Zero-copy hot path.** Log line → parse → state update → ban decision
-  performs no heap allocation on the common case. Verified with
-  `FailingAllocator` in tests.
-- **Fail closed.** If the firewall backend cannot be initialised, the daemon
-  exits rather than running unprotected.
+- **Zero-copy hot path.** Parsing a log line performs no heap allocation,
+  verified with `FailingAllocator` in tests. The state tracker reserves its
+  full capacity at first use, so steady-state updates do not allocate either.
+- **Fail closed.** If no firewall backend is usable, the daemon exits and
+  logs the cause. `on_no_backend = "log-only"` is an explicit opt-in to keep
+  running: bans are logged, not applied, and `status`, `/metrics`, and
+  `/events` report `DEGRADED` with the cause. It is never silent.
 - **fail2ban config import.** `--import-config /etc/fail2ban` translates
   `jail.conf` + `jail.local` + `jail.d/` + `filter.d/` into native TOML in
   one command. Migration report tells you what needed manual attention.
@@ -108,44 +113,35 @@ anything on disk. Pin a specific version with
 
 ```mermaid
 flowchart LR
-    subgraph Inputs["Log inputs"]
-        AL["/var/log/auth.log"]
-        JD["journald"]
+    subgraph Daemon["fail2zig — root: CAP_NET_ADMIN + CAP_DAC_READ_SEARCH (all-log-only configs run unprivileged)"]
+        subgraph Loop["one epoll loop, no threads"]
+            FS["File source<br/>inotify, rotation-aware"]
+            JS["Journal source<br/>journalctl child, non-blocking pipe"]
+            PE["Parser<br/>comptime filters"]
+            ST["State Tracker<br/>fixed-capacity per jail"]
+            DP["dispatch"]
+            IPC["IPC server<br/>Unix socket 0660 · SO_PEERCRED"]
+            HTTP["HTTP server<br/>127.0.0.1:9100 · /metrics · /api/status · /events (WS)"]
+        end
+        SF["State file"]
     end
 
-    subgraph Daemon["fail2zig (root, CAP_NET_ADMIN + CAP_DAC_READ_SEARCH)"]
-        LW["Log Watcher<br/>inotify + epoll<br/>rotation-aware"]
-        PE["Parser Engine<br/>comptime filters<br/>zero-copy slices"]
-        ST["State Tracker<br/>fixed-capacity map · sized from ceiling<br/>findtime · bantime increment"]
-        BE["Ban Executor"]
-        IPC["IPC Server<br/>Unix socket 0660<br/>SO_PEERCRED auth"]
-        HTTP["HTTP Server<br/>127.0.0.1:9100<br/>/metrics · /events (WS)"]
-    end
+    BE["Firewall backend (auto-detected or set by firewall = ...)<br/>nftables: netlink · ipset/iptables: argv"]
+    CLI["fail2zig-client"]
+    PROM["Prometheus / dashboard"]
 
-    subgraph Kernel["Kernel firewall (netlink, no shell-out)"]
-        NFT["nftables"]
-        IPT["iptables"]
-        IPS["ipset"]
-    end
-
-    AL --> LW
-    JD --> LW
-    LW -->|raw lines| PE
-    PE -->|events| ST
-    ST -->|ban decisions| BE
-    BE --> NFT
-    BE --> IPT
-    BE --> IPS
-    ST -.-> IPC
-    ST -.-> HTTP
-
-    CLI["fail2zig-client"] --> IPC
-    PROM["Prometheus"] --> HTTP
-    DASH["Dashboard / WS"] --> HTTP
-
-    style Daemon stroke:#E1A050,stroke-width:2px
-    style PE stroke:#E1A050
-    style ST stroke:#E1A050
+    FS --> PE
+    JS --> PE
+    PE --> ST
+    ST --> DP
+    DP --> BE
+    DP -->|"internal (recidive)"| ST
+    ST -->|save| SF
+    SF -->|restore| ST
+    IPC <--> CLI
+    HTTP <--> PROM
+    DP ~~~ IPC
+    DP ~~~ HTTP
 ```
 
 Deep-dive: [architecture/zero-dependencies](https://fail2zig.com/docs/architecture/zero-dependencies/).
@@ -164,7 +160,7 @@ curl -fsSL https://github.com/ul0gic/fail2zig/raw/main/scripts/install.sh | sudo
 the latest release (or `FAIL2ZIG_VERSION` if set), downloads `fail2zig` +
 `fail2zig-client` + `SHA256SUMS` from the
 [release](https://github.com/ul0gic/fail2zig/releases/latest) asset tree,
-verifies each binary against the signed manifest, creates the `fail2zig`
+verifies each binary's SHA256 against `SHA256SUMS`, creates the `fail2zig`
 system group, installs binaries to `/usr/local/bin`, drops the example
 config at `/etc/fail2zig/config.toml` (never clobbers an existing one), and
 installs the hardened `fail2zig.service` unit under
@@ -206,7 +202,7 @@ If you'd rather skip the script:
 
 ```bash
 # 1. Download the binary + manifest for your arch
-VERSION=v0.2.0
+VERSION=v0.3.0
 ARCH=x86_64-linux-musl   # or aarch64-linux-musl, arm-linux-musleabihf, mips-linux-musleabi, mipsel-linux-musleabi
 curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/fail2zig-${VERSION}-${ARCH}"
 curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/fail2zig-client-${VERSION}-${ARCH}"
@@ -214,6 +210,8 @@ curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/SHA
 
 # 2. Verify (bail if any line fails)
 sha256sum --check --ignore-missing SHA256SUMS
+# Optional: verify the SLSA build provenance (needs the gh CLI)
+gh attestation verify "fail2zig-${VERSION}-${ARCH}" --repo ul0gic/fail2zig
 
 # 3. Install
 sudo install -m 0755 "fail2zig-${VERSION}-${ARCH}"        /usr/local/bin/fail2zig
@@ -225,7 +223,8 @@ Then follow the [systemd setup](#systemd-setup) block below.
 
 ### Build from source
 
-Requires [Zig 0.14.1](https://ziglang.org/download/).
+Requires [Zig 0.14.x](https://ziglang.org/download/); CI pins 0.14.1.
+Zig 0.15 and later do not build this tree (ADR-012).
 
 ```bash
 git clone https://github.com/ul0gic/fail2zig
@@ -280,7 +279,7 @@ From a downloaded release (the same files are published alongside
 the binaries):
 
 ```bash
-VERSION=v0.2.0
+VERSION=v0.3.0
 for f in fail2zig.service fail2zig.socket fail2zig.toml.example; do
   curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/${f}"
 done
@@ -306,6 +305,10 @@ fail2zig` scores 2.4 (OK).
 The installer and the systemd setup both drop a fully-commented example
 there. Edit it, validate, restart.
 
+The file must not be world-writable or writable by a non-root group; the
+daemon refuses to start and prints the `chmod 0640` fix. Unknown and
+duplicate keys are rejected with `file:line:col`, the key, and its section.
+
 A minimal working config:
 
 ```toml
@@ -313,14 +316,16 @@ A minimal working config:
 socket_path        = "/run/fail2zig/fail2zig.sock"
 state_file         = "/var/lib/fail2zig/state.bin"
 memory_ceiling_mb  = 64
+metrics_enabled    = true         # false: no HTTP/WebSocket listener; IPC and the client still work
 metrics_bind       = "127.0.0.1"
 metrics_port       = 9100
+firewall           = "auto"       # probes nftables, ipset, iptables; naming one probes only it
 
 [defaults]
 bantime    = 600      # seconds
 findtime   = 600      # sliding window for counting attempts
 maxretry   = 5        # attempts inside findtime before a ban
-banaction  = "nftables"
+banaction  = "nftables"   # nftables / iptables / ipset all mean enforce (backend comes from [global] firewall); "log-only" observes
 ignoreip   = ["127.0.0.1/8", "::1"]
 
 # bantime_increment controls how repeat offenders get longer bans.
@@ -361,8 +366,12 @@ fail2zig --import-config /etc/fail2ban \
 ```
 
 The importer merges `jail.conf` → `jail.local` → `jail.d/*`, translates
-Python regex patterns to the fail2zig DSL where possible, maps action names
-to native backends, and prints a migration report.
+Python regex patterns to the fail2zig DSL where possible, and prints a
+migration report. `banaction` values `nftables`, `iptables`, and `ipset`
+are kept and mean enforce; they do not select a backend (see
+[Firewall backends](#firewall-backends)). Any other action name becomes
+`log-only` with a warning in the report. Filters and jails that cannot be
+translated are noted, not silently dropped.
 
 Step-by-step guide: [guides/migration-from-fail2ban](https://fail2zig.com/docs/guides/migration-from-fail2ban/).
 
@@ -377,7 +386,8 @@ fail2zig [OPTIONS]
 
 OPTIONS:
   --config <path>           Config file (default: /etc/fail2zig/config.toml)
-  --foreground              Run in foreground (v0.1: only mode)
+  --foreground              Run in foreground (only mode)
+  --test-config             Alias for --validate-config
   --validate-config         Load and validate config, exit
   --import-config [<dir>]   Import fail2ban config (default: /etc/fail2ban)
   --import-output <path>    Output path for imported config
@@ -392,7 +402,7 @@ man page: [docs/man/fail2zig.1](docs/man/fail2zig.1).
 
 | Command | Description |
 |---------|-------------|
-| `status` | Daemon uptime, active bans, parse rate, memory usage |
+| `status` | Protection state (`active` / `log-only` / `mixed` / `DEGRADED (<cause>)`), backend, uptime, active bans, parse rate, memory |
 | `ban <ip> --jail <name>` | Add a ban (`--duration <seconds>` optional) |
 | `unban <ip> [--jail <name>]` | Remove a ban |
 | `list [--jail <name>]` | List active bans |
@@ -416,12 +426,10 @@ man page: [docs/man/fail2zig-client.1](docs/man/fail2zig-client.1).
 Comptime DSL compiles pattern definitions into specialized `MatchFn` functions
 at build time. `<IP>`, `<HOST>`, `<TIMESTAMP>`, and `<*>` tokens produce
 zero-alloc parse paths. A multi-pattern `Matcher` adds min-length and
-first-byte early-exit probes. The entire hot path is verified zero-alloc via
-`FailingAllocator`.
+first-byte early-exit probes. The parser is verified zero-alloc via
+`FailingAllocator`; the state tracker reserves its capacity at first use.
 
 ### Firewall backends
-
-Backend-agnostic dispatch; best available is detected at startup:
 
 | Backend | Implementation | Notes |
 |---------|----------------|-------|
@@ -429,7 +437,19 @@ Backend-agnostic dispatch; best available is detected at startup:
 | iptables | argv subprocess (`engine/firewall/iptables.zig`) | Legacy fallback |
 | ipset | argv subprocess (`engine/firewall/ipset.zig`) | High-cardinality ban lists |
 
-eBPF/XDP (NIC-level drop) is architected; ships in a future release.
+`[global] firewall` selects the backend. `"auto"` (the default) probes
+nftables, then ipset, then iptables, and uses the first that is usable.
+`"nftables"`, `"ipset"`, or `"iptables"` probes only that backend. If it is
+unusable, `on_no_backend` decides: `"fail-closed"` (the default) exits with
+the cause logged; `"log-only"` runs DEGRADED, shown as
+`Protection: DEGRADED (<cause>)` by `fail2zig-client status` and in
+`/api/status`. There is no fallback to another backend.
+
+`banaction` does not select a backend. Its values `nftables`, `iptables`,
+and `ipset` are accepted for fail2ban compatibility and all mean enforce
+with the selected backend; `log-only` observes.
+
+eBPF/XDP (NIC-level drop) is on the roadmap; it is not scheduled.
 
 ### Ban lifecycle
 
@@ -437,10 +457,13 @@ eBPF/XDP (NIC-level drop) is architected; ships in a future release.
 - Linear and exponential `bantime_increment`, capped at `bantime_increment_max_bantime`
 - CIDR-based ignore list (IPv4 `/0`–`/32`, IPv6 `/0`–`/128`); ignored IPs
   short-circuit before any state update
-- Three eviction policies when the state table is full: `evict_oldest`,
-  `ban_all_and_alert`, `drop_oldest_unbanned`
+- Fixed-capacity tracker per jail; when full, the oldest unbanned entry is
+  evicted (sizing in [Why fail2zig](#why-fail2zig))
 - Atomic state persistence (write-to-temp + fsync + rename); CRC32-validated
   on load; restored bans are reconciled into the firewall on restart
+- State file format v4 records whether each ban was enforced; v1–v3 files
+  still load. A `state_file` under `/run` or on tmpfs logs a warning at
+  startup: it will not survive a reboot
 
 ### IPC & metrics
 
@@ -450,12 +473,15 @@ eBPF/XDP (NIC-level drop) is architected; ships in a future release.
 - HTTP on `127.0.0.1:9100` — `GET /metrics` (Prometheus), `GET /api/status`
   (JSON), `GET /events` (WebSocket, RFC 6455; broadcasts `attack_detected`,
   `ip_banned`, `ip_unbanned`, `metrics`; max 16 clients)
+- `metrics_enabled = false` binds neither listener; IPC and
+  `fail2zig-client` are unaffected. `metrics_port = 0` is rejected, it does
+  not disable the endpoint
 
 ### Built-in filters (15)
 
 | Category | Filters |
 |----------|---------|
-| SSH | `sshd` (9 patterns: OpenSSH 7.x / 8.x / 9.x auth failures, invalid user, PAM, disconnect, bad protocol, reverse mapping) |
+| SSH | `sshd` (9 patterns: authentication failures, invalid users, PAM failures and selected protocol errors) |
 | Web | `nginx-http-auth`, `nginx-limit-req`, `nginx-botsearch`, `apache-auth`, `apache-badbots`, `apache-overflows` |
 | Mail | `postfix`, `dovecot`, `courier` |
 | DNS | `named-refused` (BIND) |
@@ -471,16 +497,19 @@ Filter names accept hyphenated or underscore forms
 
 ## Benchmarks
 
-Measured on the reference lab box (x86_64, ReleaseSafe, stripped).
+Historical measurements from the reference lab box (x86_64, ReleaseSafe, stripped).
+Parser and decision microbenchmarks exclude log delivery and firewall installation;
+they do not establish an end-to-end speed advantage over fail2ban.
 Reproducible via `make bench` and the `tests/harness/measure.sh` probes.
 
 | Metric | Target | Measured |
 |--------|--------|----------|
 | Parse throughput (lines/sec) | ≥ 22,000 | **~5.96M** |
 | Ban decision latency (p99) | < 1 ms | **932 ns** (p50: 365 ns) |
-| Memory under attack (50K unique IPs) | ≤ ceiling, never exceed | 21,845 entries resident, 15,606 evictions — cap held |
-| Binary size (x86_64-linux-musl, stripped) | ≤ 5 MB | **877 KB** |
+| Tracked state (50K unique IPs) | Bounded entry count | 21,845 entries resident, 15,606 evictions — cap held |
+| Binary size (x86_64-linux-musl, stripped) | ≤ 5 MB | **1.0 MB** daemon · 535 KB client |
 | Cold start → ready for events | < 100 ms | Lab-dependent (skips unprivileged hosts) |
+| IPC `status` round-trip (p99) | < 50 ms | **< 1 ms** (p50 0.75 ms; 500 round-trips, dev box, not the lab box) |
 
 Benchmark harness and methodology:
 [tests/benchmark/README.md](tests/benchmark/README.md). Real-system validation
@@ -488,23 +517,27 @@ harness: [tests/harness/README.md](tests/harness/README.md).
 
 ---
 
-## Comparison
+## Compatibility and operational limits
 
-| | fail2ban | SSHGuard | CrowdSec | fail2zig |
-|---|---|---|---|---|
-| Language | Python | C | Go | Zig |
-| Deployment | Package + runtime | Single binary | Binary + cloud | Single static binary |
-| Runtime deps | Python 3 + libs | libc | Go runtime | None |
-| Config format | INI (jail.conf) | Custom | YAML | TOML (native) + fail2ban compat |
-| Migration path | — | Manual | Manual | `--import-config /etc/fail2ban` |
-| Memory ceiling | No (GC) | N/A | No | Hard configurable cap |
-| Static binary | No | Partial | No | Yes (musl-linked) |
-| Firewall calls | Shell-out | Shell-out | Shell-out | Direct netlink |
-| Banning mechanism | iptables / nftables | pf / iptables / nftables | iptables / nftables + cloud API | nftables / iptables / ipset |
+fail2zig supports built-in filters, per-jail thresholds, ignore lists, escalating
+bans, persistence, and nftables/iptables/ipset enforcement. The native format is
+TOML; `--import-config` translates supported fail2ban settings and disables
+unsupported custom filters with a warning. Review the generated configuration, especially increment formulas and caps: native
+escalation settings do not guarantee identical fail2ban semantics.
 
-fail2zig is pre-1.0. The table reflects shipped capability, not roadmap.
-fail2ban is the lineage fail2zig inherits from — filter regexes and
-`jail.conf` continue to work unchanged through the compatibility layer.
+Compatibility is not complete: runtime custom regex/action scripts, hot reload,
+and an in-client updater are not implemented. `reload` returns an error; validate
+configuration and restart the service to apply it. `maxretry` supports 1–128.
+The memory setting sizes bounded tracked state, not every daemon allocation.
+
+Manual bans honor jail defaults, appear in listings/status, and persist. An
+address shared by multiple jails stays blocked until its final owner expires or
+is removed. Repeating a manual ban extends its expiry without counting a new ban.
+iptables and ipset expiry is daemon-managed: their entries remain while the daemon
+is stopped, and expiry resumes on restart. nftables also uses kernel timeouts.
+
+The filter regression corpus is in `tests/integration/filter_corpus.json`.
+It contains synthetic cases, not a production-log compatibility certification.
 
 ---
 
@@ -525,7 +558,8 @@ fail2zig/
 │   ├── integration/     # Zig integration tests
 │   ├── benchmark/       # Zig microbenchmarks (-Dbench=true)
 │   ├── fuzz/            # Zig fuzz corpora (parsers, protocol, config)
-│   └── harness/         # Shell-based system harness (lab-box tests)
+│   ├── harness/         # Shell-based system harness (lab-box tests)
+│   └── e2e/             # Deploy-regression scripts (real install + shipped unit)
 ├── docs/                # Installable man pages
 │   └── man/             # troff: fail2zig(1), fail2zig-client(1), fail2zig.toml(5)
 ├── deploy/              # systemd unit, socket, example config
@@ -553,8 +587,8 @@ fail2zig/
 
 fail2zig wants to be the modern replacement for fail2ban — the drop-in
 tool that understands the services people actually run in 2026.
-Contributors are how it gets there. The codebase is small (~18K lines of
-Zig), the conventions are boring on purpose, and the contribution surface
+Contributors are how it gets there. The codebase is small (~29K lines of
+Zig, ~32K with `tests/`), the conventions are boring on purpose, and the contribution surface
 is wide open.
 
 ### The biggest ask: modern filters
@@ -618,7 +652,7 @@ zig build test          # ~2s · green, zero leaks
 ```
 
 **Requires:**
-- [Zig 0.14.1](https://ziglang.org/download/) exactly. Newer versions may break the build.
+- [Zig 0.14.x](https://ziglang.org/download/); CI pins 0.14.1. Zig 0.15 and later do not build this tree (ADR-012).
 
 The marketing site (fail2zig.com) lives in a separate repo and is not
 covered here.
@@ -658,7 +692,7 @@ immutable, just what we've decided against so far:
 - **GUI dashboards inside the daemon** — the `/events` WebSocket is the extension point. Dashboards live outside the daemon.
 - **Plugin systems or embedded scripting in the core** — see [architecture/zero-dependencies](https://fail2zig.com/docs/architecture/zero-dependencies/) for the reasoning.
 - **SIEM-specific adapters** — fail2zig emits Prometheus metrics + structured JSON; SIEM vendors handle ingestion on their side.
-- **Shell-out ban actions** — fail2ban's CVE history speaks for itself. Firewall access is via direct netlink in fail2zig, not subprocess chains.
+- **Shell-script ban actions** — no `action.d`-style scripts, no `/bin/sh`. nftables is programmed over netlink; the ipset/iptables backends exec a fixed argv when selected.
 
 ### Useful Makefile targets
 
@@ -668,7 +702,7 @@ make test           # zig build test
 make bench          # Microbenchmarks
 make fuzz           # Fuzz corpus run
 make release        # ReleaseSafe native build
-make cross          # ReleaseSafe x86_64 + aarch64 musl
+make cross          # ReleaseSafe for all five shipped musl targets
 make lint           # zig fmt --check, shellcheck, yamllint
 make harness-smoke  # Lab-box attack smoke test (requires a Linux host)
 ```

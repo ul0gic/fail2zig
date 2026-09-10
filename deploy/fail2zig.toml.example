@@ -23,7 +23,7 @@
 # One of: "debug", "info", "warn", "err"
 log_level = "info"
 
-# PID file location. Parent directory is created at startup if absent.
+# Accepted for forward compatibility; v0.3.0 does not write a PID file.
 pid_file = "/run/fail2zig/fail2zig.pid"
 
 # Unix domain socket for the fail2zig-client CLI.
@@ -36,19 +36,23 @@ socket_path = "/run/fail2zig/fail2zig.sock"
 # at shutdown and periodically. Parent dir must exist.
 state_file = "/var/lib/fail2zig/state.bin"
 
-# Memory ceiling for the daemon (MB). The state tracker is sized from
-# this value: ceiling → entry capacity (≈ ceiling_MB×1024²/1536 entries).
-# When that cap is reached, oldest unbanned entries are evicted rather
-# than growing — so tracked-IP state cannot expand under attack.
-# This is not a per-component byte cap on every allocator. Minimum 16 MB.
+# Half of this bounds the state trackers: split across enabled jails + 1 spare at ~1.5 KB per IP; full trackers evict the oldest unbanned entry. Minimum 16.
 memory_ceiling_mb = 64
 
 # HTTP endpoint that exposes Prometheus `/metrics` and JSON `/api/status`.
 # The same port also upgrades WebSocket connections on `/events` for the
 # real-time dashboard. Bound to localhost by default — exposing this
 # publicly leaks operational telemetry.
+# false = no HTTP/WebSocket listener at all (IPC and the client still work).
+metrics_enabled = true
 metrics_bind = "127.0.0.1"
 metrics_port = 9100
+
+# "auto" probes nftables, then ipset, then iptables. Naming one probes only it; if unusable, on_no_backend decides (no fallback).
+firewall = "auto"
+
+# "fail-closed" exits when an enforcing jail has no usable backend; "log-only" runs DEGRADED and observes instead.
+on_no_backend = "fail-closed"
 
 # ----------------------------------------------------------------------
 # [defaults] — applied to every jail unless overridden under [jails.X]
@@ -64,10 +68,7 @@ findtime = 600
 # Number of failures within `findtime` that triggers a ban.
 maxretry = 5
 
-# Firewall backend. fail2zig picks the best available at startup if
-# "nftables" is requested on a system without nf_tables; explicit values
-# here are honored exactly.
-# One of: "nftables", "iptables", "ipset", "log-only"
+# "nftables" / "iptables" / "ipset" enforce with the backend detected at startup; "log-only" observes and never touches the firewall.
 banaction = "nftables"
 
 # List of CIDRs / IPs that are never banned. Applied before any jail

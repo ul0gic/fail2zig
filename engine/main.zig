@@ -9,6 +9,14 @@ const posix = std.posix;
 const shared = @import("shared");
 const build_options = @import("build_options");
 
+var runtime_log_level = std.atomic.Value(u8).init(@intFromEnum(std.log.Level.info));
+pub const std_options: std.Options = .{ .log_level = .debug, .logFn = configuredLog };
+
+fn configuredLog(comptime level: std.log.Level, comptime scope: @Type(.enum_literal), comptime format: []const u8, args: anytype) void {
+    if (@intFromEnum(level) > runtime_log_level.load(.monotonic)) return;
+    std.log.defaultLog(level, scope, format, args);
+}
+
 pub const event_loop_mod = @import("core/event_loop.zig");
 const log_watcher_mod = @import("core/log_watcher.zig");
 pub const journald_source_mod = @import("core/journald_source.zig");
@@ -32,6 +40,7 @@ pub const filter_misc_mod = @import("filters/misc.zig");
 pub const filter_registry_mod = @import("filters/registry.zig");
 const http = @import("net/http.zig");
 const ws = @import("net/ws.zig");
+pub const ban_lifecycle_mod = @import("core/ban_lifecycle.zig");
 pub const ipc_mod = @import("net/ipc.zig");
 pub const commands_mod = @import("net/commands.zig");
 const metrics_mod = @import("core/metrics.zig");
@@ -115,7 +124,7 @@ fn printHelp(w: anytype) !void {
         \\
         \\OPTIONS:
         \\  --config <path>           Config file (default: /etc/fail2zig/config.toml)
-        \\  --foreground              Run in foreground (v0.1: only mode)
+        \\  --foreground              Run in foreground (only mode)
         \\  --test-config             Alias for --validate-config
         \\  --validate-config         Load + validate config, print result, exit
         \\  --import-config [<dir>]   Import fail2ban config (default: /etc/fail2ban)
@@ -125,7 +134,7 @@ fn printHelp(w: anytype) !void {
         \\
         \\EXIT CODES:
         \\  0   success
-        \\  1   config load / validation failure, or zero jails imported
+        \\  1   config load / validation failure, or zero enabled jails imported
         \\  2   hard parse error on import
         \\
     , .{version});
@@ -145,7 +154,7 @@ pub fn runImport(
         return 2;
     };
     migration_mod.printReport(report, stderr) catch {};
-    if (report.jails_imported == 0) return 1;
+    if (report.jails_enabled == 0) return 1;
     return 0;
 }
 
@@ -153,6 +162,7 @@ const JailContext = struct {
     jail: shared.JailId,
     matcher: filter_registry_mod.FilterMatcher,
     state: *state_mod.StateTracker,
+    lifecycle: ?*ban_lifecycle_mod.Lifecycle = null,
     backend_ptr: ?*firewall.Backend = null,
     banaction: config_mod.BanAction = .nftables,
     metrics: ?*metrics_mod.Metrics = null,
@@ -229,6 +239,35 @@ const InternalFeed = struct {
     }
 };
 
+fn lifecycleBanned(raw: ?*anyopaque, ip: shared.IpAddress, jail: shared.JailId, duration: shared.Duration) void {
+    const contexts: *std.ArrayList(*JailContext) = @ptrCast(@alignCast(raw.?));
+    for (contexts.items) |ctx| {
+        if (!std.mem.eql(u8, ctx.jail.slice(), jail.slice())) continue;
+        std.log.info("ban: jail='{s}' ip={} duration={d}s", .{ jail.slice(), ip, duration });
+        if (ctx.ws) |server| if (ctx.ws_alloc) |a| {
+            var buf: [64]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "{}", .{ip}) catch return;
+            server.broadcastBanned(a, text, jail.slice(), duration) catch {};
+        };
+        if (ctx.feed) |feed| feed.onConfirmedBan(ip, ctx);
+        return;
+    }
+}
+
+fn lifecycleUnbanned(raw: ?*anyopaque, ip: shared.IpAddress, jail: shared.JailId) void {
+    const contexts: *std.ArrayList(*JailContext) = @ptrCast(@alignCast(raw.?));
+    std.log.info("unban: jail='{s}' ip={}", .{ jail.slice(), ip });
+    for (contexts.items) |ctx| {
+        if (!std.mem.eql(u8, ctx.jail.slice(), jail.slice())) continue;
+        if (ctx.ws) |server| if (ctx.ws_alloc) |a| {
+            var buf: [64]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "{}", .{ip}) catch return;
+            server.broadcastUnbanned(a, text, jail.slice()) catch {};
+        };
+        return;
+    }
+}
+
 fn resolveJailSource(
     jail_cfg: *const config_mod.JailConfig,
     logpath_exists: bool,
@@ -242,6 +281,13 @@ fn resolveJailSource(
 }
 
 fn dispatchBan(ctx: *JailContext, d: state_mod.BanDecision) void {
+    if (ctx.lifecycle) |lifecycle| {
+        if (ctx.banaction == .@"log-only") std.log.info("would-ban: jail='{s}' ip={} duration={d}s action=log-only", .{ ctx.jail.slice(), d.ip, d.duration });
+        if (ctx.banaction != .@"log-only") ctx.state.markEnforced(d.ip);
+        lifecycle.apply(d.ip, d.jail, ctx.now()) catch |err|
+            std.log.warn("ban pending: {} jail='{s}': {s}", .{ d.ip, d.jail.slice(), @errorName(err) });
+        return;
+    }
     if (ctx.banaction == .@"log-only") {
         std.log.info(
             "would-ban: jail='{s}' ip={} duration={d}s ban_count={d} action=log-only",
@@ -358,6 +404,7 @@ fn lineCallback(
 }
 
 const ExpiryContext = struct {
+    lifecycle: ?*ban_lifecycle_mod.Lifecycle = null,
     trackers: *tracker_map_mod.TrackerMap,
     backend_ptr: ?*firewall.Backend,
     metrics: ?*metrics_mod.Metrics = null,
@@ -365,82 +412,24 @@ const ExpiryContext = struct {
     ws_alloc: ?std.mem.Allocator = null,
     unban_hook: ?*const fn (userdata: ?*anyopaque, ip: shared.IpAddress, jail: shared.JailId) firewall.BackendError!void = null,
     unban_hook_ctx: ?*anyopaque = null,
-
-    fn releaseBan(self: *ExpiryContext, ip: shared.IpAddress, jail: shared.JailId) firewall.BackendError!void {
-        if (self.unban_hook) |hook| return hook(self.unban_hook_ctx, ip, jail);
-        const be = self.backend_ptr orelse return error.NotAvailable;
-        return be.unban(ip, jail);
-    }
 };
 
 fn expirySweep(expirations: u64, userdata: ?*anyopaque) void {
     _ = expirations;
     const ctx: *ExpiryContext = @ptrCast(@alignCast(userdata.?));
-    const now = std.time.timestamp();
-
-    const max_per_tick: usize = 64;
-    var to_unban: [max_per_tick]struct {
-        ip: shared.IpAddress,
-        jail: shared.JailId,
-        tracker: *state_mod.StateTracker,
-        enforced: bool,
-    } = undefined;
-    var n: usize = 0;
-
-    var tit = ctx.trackers.iterator();
-    outer: while (tit.next()) |tkv| {
-        const tracker = tkv.value_ptr.*;
-        var it = tracker.iterator();
-        while (it.next()) |kv| {
-            if (n >= max_per_tick) break :outer;
-            const st = kv.value_ptr;
-            if (st.ban_state != .banned) continue;
-            const exp = st.ban_expiry orelse continue;
-            if (exp <= now) {
-                to_unban[n] = .{ .ip = kv.key_ptr.*, .jail = st.jail, .tracker = tracker, .enforced = st.enforced };
-                n += 1;
-            }
-        }
-    }
-
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        const item = to_unban[i];
-        item.tracker.clearBan(item.ip);
-        if (ctx.metrics) |m| {
-            m.incrementUnbans();
-            m.jailIncrementUnbans(item.jail.slice());
-        }
-        if (!item.enforced) {
-            // A would-ban never reached the firewall, so there is nothing to remove and no ip_unbanned event to emit.
-            std.log.info("would-ban expired: jail='{s}' ip={}", .{ item.jail.slice(), item.ip });
-            continue;
-        }
-        ctx.releaseBan(item.ip, item.jail) catch |err| {
-            std.log.warn(
-                "backend: unban failed for ip={} jail='{s}': {s}",
-                .{ item.ip, item.jail.slice(), @errorName(err) },
-            );
-        };
-        std.log.info(
-            "unban: jail='{s}' ip={}",
-            .{ item.jail.slice(), item.ip },
-        );
-        if (ctx.ws) |ws_server| {
-            if (ctx.ws_alloc) |a| {
-                var ip_buf: [64]u8 = undefined;
-                if (std.fmt.bufPrint(&ip_buf, "{}", .{item.ip})) |ip_str| {
-                    ws_server.broadcastUnbanned(a, ip_str, item.jail.slice()) catch |err| {
-                        std.log.warn("ws: broadcastUnbanned failed: {s}", .{@errorName(err)});
-                    };
-                } else |_| {}
-            }
-        }
-    }
+    var fallback = ban_lifecycle_mod.Lifecycle{
+        .trackers = ctx.trackers,
+        .backend = ctx.backend_ptr,
+        .metrics = ctx.metrics,
+        .unban_hook = ctx.unban_hook,
+        .hook_ctx = ctx.unban_hook_ctx,
+    };
+    const lifecycle = ctx.lifecycle orelse &fallback;
+    lifecycle.sweep(std.time.timestamp());
 }
 
 const WsTickContext = struct {
-    ws: *ws.WsServer,
+    ws: ?*ws.WsServer,
     metrics: *metrics_mod.Metrics,
     ws_alloc: std.mem.Allocator,
     start_time: i64,
@@ -471,11 +460,12 @@ fn wsTick(expirations: u64, userdata: ?*anyopaque) void {
     _ = expirations;
     const ctx: *WsTickContext = @ptrCast(@alignCast(userdata.?));
 
-    ctx.ws.tickHeartbeat();
-
     if (readSelfRssBytes()) |rss_bytes| {
         ctx.metrics.setMemoryBytes(rss_bytes);
     } else |_| {}
+
+    const ws_server = ctx.ws orelse return;
+    ws_server.tickHeartbeat();
 
     const snap = ctx.metrics.snapshot();
     const uptime_s: u64 = blk: {
@@ -485,7 +475,7 @@ fn wsTick(expirations: u64, userdata: ?*anyopaque) void {
     };
 
     const protection_state = ctx.cmd_ctx.computeOverallState();
-    ctx.ws.broadcastMetrics(ctx.ws_alloc, .{
+    ws_server.broadcastMetrics(ctx.ws_alloc, .{
         .lines_parsed = snap.lines_parsed,
         .lines_matched = snap.lines_matched,
         .bans_total = snap.bans_total,
@@ -706,10 +696,12 @@ fn printConfigLoadError(
     } else if (section.len > 0) {
         try w.print(" (in [{s}])", .{section});
     }
+    if (diag.hint.len > 0) try w.print(" — {s}", .{diag.hint});
     try w.writeAll("\n");
 }
 
 fn printValidateSummary(w: anytype, cfg: *const config_mod.Config) !void {
+    if (cfg.global.firewall != .auto) try w.print("config: firewall={s}\n", .{@tagName(cfg.global.firewall)});
     try w.print("config: on_no_backend={s}\n", .{@tagName(cfg.global.on_no_backend)});
     for (cfg.jails) |*j| {
         const r = config_mod.resolveJailFromConfig(j, cfg.defaults);
@@ -790,6 +782,54 @@ test "cli: validate summary shows an opted-in on_no_backend (SYS-014)" {
     );
 }
 
+fn httpBannerAddr(buf: []u8, g: *const config_mod.GlobalConfig) []const u8 {
+    if (!g.metrics_enabled) return "off";
+    return std.fmt.bufPrint(buf, "{s}:{d}", .{ g.metrics_bind, g.metrics_port }) catch "?";
+}
+
+test "cli: running banner shows http=off when metrics_enabled is false, else bind:port (ENH-008)" {
+    var buf: [64]u8 = undefined;
+    const on: config_mod.GlobalConfig = .{};
+    try std.testing.expectEqualStrings("127.0.0.1:9100", httpBannerAddr(&buf, &on));
+    const off: config_mod.GlobalConfig = .{ .metrics_enabled = false, .metrics_port = 1 };
+    try std.testing.expectEqualStrings("off", httpBannerAddr(&buf, &off));
+}
+
+test "cli: validate summary echoes firewall only when forced (ENH-007)" {
+    var buf: [512]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cfg = try config_mod.Config.parse(arena.allocator(), "[global]\nfirewall = \"ipset\"\n");
+    try printValidateSummary(stream.writer(), &cfg);
+    try std.testing.expectEqualStrings(
+        "config: firewall=ipset\nconfig: on_no_backend=fail-closed\nconfig: OK (0 jail(s) configured)\n",
+        stream.getWritten(),
+    );
+}
+
+test "cli: config load error appends the diag hint for metrics_port = 0 (ENH-008)" {
+    var buf: [256]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    var diag: config_mod.Diagnostic = .{};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    _ = config_mod.Config.parseDiag(arena.allocator(), "[global]\nmetrics_port = 0\n", &diag) catch |err| {
+        try printConfigLoadError(stream.writer(), "/etc/fail2zig/config.toml", err, &diag);
+    };
+    try std.testing.expectEqualStrings(
+        "config: /etc/fail2zig/config.toml:2:16: InvalidValue (key 'metrics_port' in [global]) — metrics_port = 0 does not disable the endpoint; set metrics_enabled = false\n",
+        stream.getWritten(),
+    );
+}
+
+test "cli: forcedBackend maps the firewall selection onto the detect argument (ENH-007)" {
+    try std.testing.expectEqual(@as(?firewall.BackendTag, null), forcedBackend(.auto));
+    try std.testing.expectEqual(@as(?firewall.BackendTag, .nftables), forcedBackend(.nftables));
+    try std.testing.expectEqual(@as(?firewall.BackendTag, .ipset), forcedBackend(.ipset));
+    try std.testing.expectEqual(@as(?firewall.BackendTag, .iptables), forcedBackend(.iptables));
+}
+
 // Pre-v4 state files never recorded whether a ban reached the firewall; a jail that enforces today is assumed to have enforced then.
 fn legacyEntryEnforced(ctx: ?*anyopaque, jail_name: []const u8) bool {
     const cfg: *const config_mod.Config = @ptrCast(@alignCast(ctx.?));
@@ -819,17 +859,9 @@ fn reconcileBanApply(
     jail: shared.JailId,
     remaining: u64,
 ) anyerror!void {
-    const be: *firewall.Backend = @ptrCast(@alignCast(ctx));
-    be.ban(ip, jail, remaining) catch |err| switch (err) {
-        error.AlreadyBanned => return,
-        else => {
-            std.log.warn(
-                "persist: backend re-ban failed for ip={}: {s}",
-                .{ ip, @errorName(err) },
-            );
-            return err;
-        },
-    };
+    _ = remaining;
+    const lifecycle: *ban_lifecycle_mod.Lifecycle = @ptrCast(@alignCast(ctx));
+    try lifecycle.apply(ip, jail, std.time.timestamp());
 }
 
 const StartupTrace = struct {
@@ -883,22 +915,34 @@ fn failClosed(err: anytype, comptime fmt: []const u8, args: anytype) @TypeOf(err
     }
 }
 
+fn forcedBackend(sel: config_mod.FirewallSelection) ?firewall.BackendTag {
+    return switch (sel) {
+        .auto => null,
+        .nftables => .nftables,
+        .ipset => .ipset,
+        .iptables => .iptables,
+    };
+}
+
 fn noUsableBackend(cfg: *const config_mod.Config, cause: commands_mod.NoBackendCause) commands_mod.FirewallState {
     var buf: [96]u8 = undefined;
     const why = cause.describe(&buf);
+    const forced: []const u8 = if (cfg.global.firewall == .auto) "" else " (forced by config)";
     switch (cfg.global.on_no_backend) {
         .@"fail-closed" => {
-            std.log.err("firewall: no usable backend ({s}); refusing to run unprotected", .{why});
+            std.log.err("firewall: no usable backend{s} ({s}); refusing to run unprotected", .{ forced, why });
             std.process.exit(1);
         },
         .@"log-only" => {
-            std.log.err("firewall: no usable backend ({s}); running DEGRADED as log-only per on_no_backend", .{why});
+            std.log.err("firewall: no usable backend{s} ({s}); running DEGRADED as log-only per on_no_backend", .{ forced, why });
             return .{ .unavailable = cause };
         },
     }
 }
 
 fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
+    const level = std.meta.stringToEnum(std.log.Level, @tagName(cfg.global.log_level)) orelse .info;
+    runtime_log_level.store(@intFromEnum(level), .monotonic);
     var trace = StartupTrace.init(heap);
     defer trace.report();
 
@@ -913,7 +957,7 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     var backend_opt: ?*firewall.Backend = null;
     var fw_state: commands_mod.FirewallState = .not_needed;
     if (commands_mod.firewallNeeded(cfg)) {
-        if (firewall.detect(heap)) |be| {
+        if (firewall.detect(heap, forcedBackend(cfg.global.firewall))) |be| {
             backend_storage = be;
             trace.mark("fw_detect");
             if (backend_storage.init(.{}, heap)) |_| {
@@ -1004,7 +1048,8 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         std.log.warn("persist: load failed: {s}", .{@errorName(err)});
     }
 
-    if (backend_opt) |be| {
+    var lifecycle = ban_lifecycle_mod.Lifecycle{ .trackers = &trackers, .backend = backend_opt, .metrics = &metrics };
+    if (backend_opt != null) {
         const now = std.time.timestamp();
         const reinstalled = reconcile_mod.reconcileAllRestoredBans(
             heap,
@@ -1012,7 +1057,7 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
             &metrics,
             now,
             reconcileBanApply,
-            @ptrCast(be),
+            @ptrCast(&lifecycle),
         ) catch |err| blk: {
             std.log.warn("persist: reconcile failed: {s}", .{@errorName(err)});
             break :blk 0;
@@ -1087,6 +1132,7 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
             .jail = jail,
             .matcher = jail_matcher,
             .state = tracker_ptr,
+            .lifecycle = &lifecycle,
             .backend_ptr = backend_opt,
             .banaction = fw_state.effectiveAction(resolved.banaction),
             .metrics = &metrics,
@@ -1200,7 +1246,11 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
         .internal = &internal_feed,
     };
 
+    lifecycle.event_ctx = @ptrCast(&contexts);
+    lifecycle.on_ban = lifecycleBanned;
+    lifecycle.on_unban = lifecycleUnbanned;
     var cmd_ctx: commands_mod.Context = .{
+        .lifecycle = &lifecycle,
         .trackers = &trackers,
         .config = cfg,
         .backend = backend_opt,
@@ -1227,41 +1277,51 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     ipc_server.setCommandHandler(cmd_ctx.asHandler());
     try ipc_server.start();
 
-    var ws_server = ws.WsServer.init(
-        heap,
-        &loop,
-        cfg.global.websocket_max_clients,
-    ) catch |err| return failClosed(
-        err,
-        "ws: init failed (max_clients={d}): {s}",
-        .{ cfg.global.websocket_max_clients, @errorName(err) },
-    );
-    defer ws_server.deinit();
-
     var http_ctx: HttpSources = .{
         .metrics = &metrics,
         .cmd_ctx = &cmd_ctx,
         .trackers = &trackers,
     };
-    var http_server = http.HttpServer.init(
-        heap,
-        &loop,
-        cfg.global.metrics_port,
-        cfg.global.metrics_bind,
-    ) catch |err| return failClosed(
-        err,
-        "http: init on {s}:{d} failed: {s}",
-        .{ cfg.global.metrics_bind, cfg.global.metrics_port, @errorName(err) },
-    );
-    defer http_server.deinit();
-    http_server.setMetricsSource(.{ .ctx = @ptrCast(&http_ctx), .write = writeMetricsPayload });
-    http_server.setStatusSource(.{ .ctx = @ptrCast(&http_ctx), .write = writeStatusPayload });
-    http_server.setBansSource(.{ .ctx = @ptrCast(&http_ctx), .write = writeBansPayload });
-    http_server.setWsServer(&ws_server);
-    try http_server.start();
+    var ws_storage: ws.WsServer = undefined;
+    var ws_opt: ?*ws.WsServer = null;
+    defer if (ws_opt) |s| s.deinit();
+    var http_storage: http.HttpServer = undefined;
+    var http_opt: ?*http.HttpServer = null;
+    defer if (http_opt) |s| s.deinit();
+    if (cfg.global.metrics_enabled) {
+        ws_storage = ws.WsServer.init(
+            heap,
+            &loop,
+            cfg.global.websocket_max_clients,
+        ) catch |err| return failClosed(
+            err,
+            "ws: init failed (max_clients={d}): {s}",
+            .{ cfg.global.websocket_max_clients, @errorName(err) },
+        );
+        ws_opt = &ws_storage;
+
+        http_storage = http.HttpServer.init(
+            heap,
+            &loop,
+            cfg.global.metrics_port,
+            cfg.global.metrics_bind,
+        ) catch |err| return failClosed(
+            err,
+            "http: init on {s}:{d} failed: {s}",
+            .{ cfg.global.metrics_bind, cfg.global.metrics_port, @errorName(err) },
+        );
+        http_opt = &http_storage;
+        http_storage.setMetricsSource(.{ .ctx = @ptrCast(&http_ctx), .write = writeMetricsPayload });
+        http_storage.setStatusSource(.{ .ctx = @ptrCast(&http_ctx), .write = writeStatusPayload });
+        http_storage.setBansSource(.{ .ctx = @ptrCast(&http_ctx), .write = writeBansPayload });
+        http_storage.setWsServer(ws_opt);
+        try http_storage.start();
+    } else {
+        std.log.info("http: disabled by config", .{});
+    }
 
     for (contexts.items) |jctx| {
-        jctx.ws = &ws_server;
+        jctx.ws = ws_opt;
         jctx.ws_alloc = heap;
     }
 
@@ -1271,16 +1331,17 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     try loop.addSignalHandler(linux.SIG.HUP, onReload, &sig_ctx);
 
     var expiry_ctx = ExpiryContext{
+        .lifecycle = &lifecycle,
         .trackers = &trackers,
         .backend_ptr = backend_opt,
         .metrics = &metrics,
-        .ws = &ws_server,
+        .ws = ws_opt,
         .ws_alloc = heap,
     };
     _ = try loop.addTimer(1000, expirySweep, &expiry_ctx, false);
 
     var ws_tick_ctx = WsTickContext{
-        .ws = &ws_server,
+        .ws = ws_opt,
         .metrics = &metrics,
         .ws_alloc = heap,
         .start_time = cmd_ctx.start_time,
@@ -1288,14 +1349,14 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     };
     _ = try loop.addTimer(1000, wsTick, &ws_tick_ctx, false);
 
+    var http_buf: [64]u8 = undefined;
     std.log.info(
-        "fail2zig {s} running; backend={s}; ipc={s}; http={s}:{d}",
+        "fail2zig {s} running; backend={s}; ipc={s}; http={s}",
         .{
             version,
             if (backend_opt) |be| @tagName(be.tag()) else "none",
             cfg.global.socket_path,
-            cfg.global.metrics_bind,
-            cfg.global.metrics_port,
+            httpBannerAddr(&http_buf, &cfg.global),
         },
     );
 
@@ -2105,6 +2166,8 @@ test "expiry: sweep unbans only enforced entries; an expired would-ban is cleare
     sshd.markEnforced(real);
     try testing.expect((try audit.recordAttempt(would, try shared.JailId.fromSlice("audit"), long_ago)) != null);
 
+    sshd.mutable(real).?.confirmed = true;
+    audit.mutable(would).?.confirmed = true;
     var metrics = metrics_mod.Metrics.init();
     _ = metrics.registerJail("sshd");
     _ = metrics.registerJail("audit");

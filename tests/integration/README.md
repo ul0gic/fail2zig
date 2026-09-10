@@ -15,7 +15,7 @@ real `zig-out/bin/fail2zig` binary and verify operator-visible flows.
 | `status_surface_test.zig` | No (in-process command dispatch) | No | non-Linux |
 | `startup_failclosed_test.zig` | Yes (expects each run to exit 1) | No — one assertion in scenario (b) is root-only (ENH-006) | non-Linux, daemon binary missing |
 | `config_diag_test.zig` | Yes (`--validate-config` only) | No | non-Linux, daemon binary missing |
-| `no_backend_test.zig` | Yes (2 runs expect exit 1; 2 keep the daemon up, query it via `/api/status` + the client binary, SIGTERM it) | No — **skips when root** (needs a real `PermissionDenied` from detect/init) | non-Linux, root, daemon binary missing, socket path ≥ 108 bytes |
+| `no_backend_test.zig` | Yes (4 runs expect exit 1; 4 keep the daemon up, query it via `/api/status` and/or the client binary, SIGTERM it; 1 runs daemon + client inside `unshare -Urn`) | No — scenarios (a)–(c) and (d') **skip when root** (need a real `PermissionDenied`); (d)–(g) run at any uid | non-Linux, daemon binary missing, socket path ≥ 108 bytes; (f) also skips without unprivileged user+net namespaces or when nf_tables is unreachable from one |
 
 Unprivileged developer machines see every root-gated subprocess case skip
 cleanly. A CI job with `sudo` (or a privileged container) exercises the full
@@ -75,6 +75,36 @@ outright. They assert on the stable strings
 the cause token, which is being corrected under SYS-022. Its
 `LiveDaemon` helper pumps the daemon's stderr on a thread so a test can
 wait for a log line (`would-ban:`) while the process is still running.
+
+The same file carries the ENH-007 / ENH-008 process-level coverage, because
+those scenarios reuse `Scenario`, `LiveDaemon` and the empty-`PATH`
+environment trick (ipset/iptables are probed by `PATH` lookup, so an empty
+`PATH` makes a forced ipset/iptables deterministically unusable at any uid):
+
+- (d) `firewall = "iptables"` + default policy → exit 1, `no usable backend
+  (forced by config) (iptables not usable …)`, nothing accepting on the
+  metrics port, no `selected` / scaffold line.
+- (d') `firewall = "nftables"` unprivileged → exit 1 with the `netlink denied`
+  cause and no fallback (root skips).
+- (e) `firewall = "ipset"` + `on_no_backend = "log-only"` → up and DEGRADED;
+  `/api/status` carries `protection_cause` `IpsetUnavailable`, the client
+  renders `Protection:  DEGRADED (IpsetUnavailable)`, a would-ban logs only.
+- (f) `firewall = "nftables"` inside `unshare -Urn` (an owned user+net
+  namespace grants CAP_NET_ADMIN over a throwaway nf_tables instance) → the
+  daemon logs `nftables selected (forced by config)`, installs its scaffold,
+  and the client, run inside the same namespace so its uid maps to 0, shows
+  `Backend:     nftables`. Skips where unprivileged namespaces are disabled or
+  nf_tables is not reachable from one.
+- (g) `metrics_enabled = false` → `http: disabled by config`, banner
+  `http=off`, `connect()` to the metrics port is refused before and after an
+  IPC `status` round-trip that still answers.
+
+`config_diag_test.zig` covers the matching `--validate-config` diagnostics:
+`metrics_port = 0` → `InvalidValue` at `line:col` plus the
+`set metrics_enabled = false` hint; `firewall = "bogus"` in `[global]` →
+`InvalidValue (key 'firewall' in [global])` at `line:col` with no hint; a
+forced `firewall = "ipset"` + `metrics_enabled = false` validates and echoes
+`config: firewall=ipset`.
 
 ## Skip semantics
 

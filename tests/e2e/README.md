@@ -82,15 +82,28 @@ active).
 ### Against the lab VM over SSH
 
 ```bash
-tests/e2e/run-remote.sh ul0gic@172.16.150.253 -- --build --purge
+tests/e2e/run-remote.sh ul0gic@172.16.150.253 -- --hold-seconds 30
 ```
 
-`run-remote.sh` is **transport only** — it `rsync`s the repo to the target
-and invokes `deploy_regression.sh` over SSH. It carries the mandatory
-self-ban guard flags (`-o IdentitiesOnly=yes -o
-PreferredAuthentications=publickey`) so the SSH connection never trips
-fail2zig's own sshd jail and bans the operator. Override the key with
-`F2Z_SSH_KEY`.
+`run-remote.sh` builds locally and sends only binaries, deployment files, scripts,
+and e2e harnesses using tar-over-SSH into a unique temporary directory. It runs
+`release_gate.sh`, which requires an existing baseline installation, saves its
+binaries/unit/config/state, exercises isolated backend checks and deployment gates,
+and restores the baseline even on failure. Temporary evidence and backups are
+retained; no fixed directory is deleted. `--force` is accepted for older callers;
+`--purge` is intentionally unavailable through this driver.
+
+The target needs Python 3, iproute2, util-linux, curl, nftables, iptables (including
+ip6tables), and ipset. Every SSH connection uses the specified key with
+`IdentitiesOnly=yes` and `PreferredAuthentications=publickey`; override the key
+with `F2Z_SSH_KEY`. No password-guessing traffic is needed: fixtures exercise
+normal detection, and ordinary TCP probes verify enforcement.
+
+`ban_lifecycle.py ABSOLUTE_BIN_DIR [nftables|iptables|ipset]` must run as root in a
+fresh network namespace. It tests detection, IPv4/IPv6 packet blocking and expiry,
+manual defaults/listing/counters, overlap, duplicate requests, restart, unban, and
+metrics-off listener absence. The file-source harness now enters a separate
+network namespace itself when invoked from the host namespace.
 
 ## Design notes
 

@@ -66,7 +66,7 @@ test "benchmark: memory stays under ceiling with eviction under sustained attack
     try testing.expect(stats.evictions > 0);
     try testing.expect(observed_decisions > 0);
 
-    const stdout = std.io.getStdOut().writer();
+    const stdout = std.io.getStdErr().writer();
     stdout.print(
         \\{{"bench":"memory_ceiling","attempts":{d},"capacity":{d},"entry_count":{d},"evictions":{d},"decisions":{d},"elapsed_ns":{d}}}
         \\

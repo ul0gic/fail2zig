@@ -103,7 +103,7 @@ test "benchmark: daemon startup time under target" {
 
     if (!connected) return error.SkipZigTest;
 
-    const stdout = std.io.getStdOut().writer();
+    const stdout = std.io.getStdErr().writer();
     stdout.print(
         \\{{"bench":"startup_time","elapsed_ns":{d},"elapsed_ms":{d:.2},"target_ms":{d}}}
         \\

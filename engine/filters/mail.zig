@@ -20,10 +20,6 @@ pub const postfix_patterns = [_]PatternDef{
         .name = "lost-connection-auth",
         .match = parser.compile("<*>lost connection after AUTH from <*>[<IP>]"),
     },
-    .{
-        .name = "disconnect-helo",
-        .match = parser.compile("<*>disconnect from <*>[<IP>]<*>ehlo=<*>commands="),
-    },
 };
 
 pub const dovecot_patterns = [_]PatternDef{
@@ -38,10 +34,6 @@ pub const dovecot_patterns = [_]PatternDef{
     .{
         .name = "pam-auth-failed",
         .match = parser.compile("<*>auth-worker<*>pam(<*>,<IP>)<*>pam_authenticate()"),
-    },
-    .{
-        .name = "no-auth-attempts",
-        .match = parser.compile("<*>imap-login: <*>no auth attempts<*>rip=<IP>"),
     },
 };
 

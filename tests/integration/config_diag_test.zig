@@ -275,3 +275,75 @@ test "integration: SYS-021 --validate-config stays quiet for a state_file under 
     try testing.expectEqual(@as(?u8, 0), r.exitCode());
     try expectNotContains(r.stderr, "will not survive");
 }
+
+test "integration: ENH-008 --validate-config rejects metrics_port = 0 at line:col with the metrics_enabled hint" {
+    const a = testing.allocator;
+    var fx = try Fixture.init(a);
+    defer fx.deinit();
+
+    const text = try fx.fortyLineConfig("# line 37");
+    defer a.free(text);
+    const swapped = try std.mem.replaceOwned(u8, a, text, "metrics_port = 19199\n", "metrics_port = 0\n");
+    defer a.free(swapped);
+    try testing.expectEqual(@as(?usize, 5), lineOf(swapped, "metrics_port = 0"));
+    try fx.write(swapped);
+
+    var r = try validateConfig(a, fx.config_path);
+    defer r.deinit(a);
+
+    try testing.expectEqual(@as(?u8, 1), r.exitCode());
+    const line = try std.fmt.allocPrint(
+        a,
+        "config: {s}:5:16: InvalidValue (key 'metrics_port' in [global]) — metrics_port = 0 does not disable the endpoint; set metrics_enabled = false\n",
+        .{fx.config_path},
+    );
+    defer a.free(line);
+    try expectContains(r.stderr, line);
+    try expectNotContains(r.stdout, "config: OK");
+    try testing.expect(!hasErrorReturnTrace(r.stderr));
+}
+
+test "integration: ENH-007 --validate-config rejects firewall = \"bogus\" in [global] as InvalidValue at line:col, no hint" {
+    const a = testing.allocator;
+    var fx = try Fixture.init(a);
+    defer fx.deinit();
+
+    const text = try fx.fortyLineConfig("# line 37");
+    defer a.free(text);
+    const swapped = try std.mem.replaceOwned(u8, a, text, "memory_ceiling_mb = 64\n", "memory_ceiling_mb = 64\nfirewall = \"bogus\"\n");
+    defer a.free(swapped);
+    try testing.expectEqual(@as(?usize, 7), lineOf(swapped, "firewall = \"bogus\""));
+    try fx.write(swapped);
+
+    var r = try validateConfig(a, fx.config_path);
+    defer r.deinit(a);
+
+    try testing.expectEqual(@as(?u8, 1), r.exitCode());
+    const line = try std.fmt.allocPrint(a, "config: {s}:7:12: InvalidValue (key 'firewall' in [global])\n", .{fx.config_path});
+    defer a.free(line);
+    try expectContains(r.stderr, line);
+    try expectNotContains(r.stderr, "metrics_enabled");
+    try expectNotContains(r.stdout, "config: OK");
+    try testing.expect(!hasErrorReturnTrace(r.stderr));
+}
+
+test "integration: ENH-007/008 --validate-config accepts firewall = \"ipset\" + metrics_enabled = false and echoes the forced backend" {
+    const a = testing.allocator;
+    var fx = try Fixture.init(a);
+    defer fx.deinit();
+
+    const text = try fx.fortyLineConfig("# line 37");
+    defer a.free(text);
+    const swapped = try std.mem.replaceOwned(u8, a, text, "memory_ceiling_mb = 64\n", "memory_ceiling_mb = 64\nfirewall = \"ipset\"\nmetrics_enabled = false\n");
+    defer a.free(swapped);
+    try fx.write(swapped);
+
+    var r = try validateConfig(a, fx.config_path);
+    defer r.deinit(a);
+
+    try testing.expectEqual(@as(?u8, 0), r.exitCode());
+    try expectContains(r.stdout, "config: firewall=ipset\n");
+    try expectContains(r.stdout, "config: OK (1 jail(s) configured)");
+    try expectNotContains(r.stderr, "InvalidValue");
+    try expectNotContains(r.stderr, "UnknownKey");
+}

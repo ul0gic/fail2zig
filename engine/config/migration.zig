@@ -25,10 +25,12 @@ pub const Error = error{
     InterpolationUnterminated,
     UnsupportedRegex,
     NoJailsImported,
+    InvalidGeneratedConfig,
 };
 
 pub const MigrationReport = struct {
     jails_imported: u32 = 0,
+    jails_enabled: u32 = 0,
     jails_skipped: u32 = 0,
     filters_translated: u32 = 0,
     filters_builtin: u32 = 0,
@@ -51,6 +53,7 @@ pub fn printReport(report: MigrationReport, writer: anytype) !void {
     );
     if (report.warnings.len > 0) {
         try writer.print("migration: {d} warning(s):\n", .{report.warnings.len});
+        try writer.print("migration: enabled_jails={d}\n", .{report.jails_enabled});
         for (report.warnings) |w| {
             try writer.print("  - {s}\n", .{w});
         }
@@ -103,15 +106,14 @@ pub fn importConfig(
         };
         try jails.append(arena, jail);
         ctx.report.jails_imported += 1;
+        if (jail.enabled) ctx.report.jails_enabled += 1;
     }
 
     cfg.jails = try jails.toOwnedSlice(arena);
 
     native.validate(&cfg) catch |err| {
-        try ctx.warn(
-            "generated config failed validation: {s} — review the TOML before starting the daemon",
-            .{@errorName(err)},
-        );
+        std.log.warn("import: generated configuration is invalid ({s}); output was not replaced", .{@errorName(err)});
+        return error.InvalidGeneratedConfig;
     };
 
     try writeTomlAtomic(arena, &cfg, output_path);
@@ -155,13 +157,14 @@ fn extractDefaults(
         out.source = try mapBackend(ctx, "[DEFAULT]", v);
     }
 
+    out.bantime_increment = try extractIncrement(ctx, def_sec, .{ .formula = .exponential, .factor = 2 });
     return out;
 }
 
 fn translateJail(
     ctx: *Context,
     sec: *fail2ban.Section,
-    _: *fail2ban.ParsedIni,
+    ini: *fail2ban.ParsedIni,
 ) Error!?native.JailConfig {
     if (sec.get("enabled")) |v| {
         if (!parseBool(v)) return null;
@@ -181,15 +184,16 @@ fn translateJail(
         jail.logpath = try splitLogpath(ctx.arena, v);
     }
 
-    if (sec.get("filter")) |v| {
+    {
+        const v = sec.get("filter") orelse sec.name;
         const trimmed = std.mem.trim(u8, v, " \t");
         if (trimmed.len == 0) {
             try ctx.warn("jail '{s}': empty filter name", .{sec.name});
             ctx.report.filters_skipped += 1;
+            jail.enabled = false;
         } else if (resolveFilter(ctx, trimmed)) |kind| {
             switch (kind) {
                 .builtin => ctx.report.filters_builtin += 1,
-                .translated => ctx.report.filters_translated += 1,
             }
             jail.filter = try ctx.arena.dupe(u8, trimmed);
         } else {
@@ -236,56 +240,32 @@ fn translateJail(
         jail.source = try mapBackend(ctx, sec.name, v);
     }
 
-    if (sec.get("bantime.increment")) |v| {
-        jail.bantime_increment.enabled = parseBool(v);
-    }
-    if (sec.get("bantime.factor")) |v| {
-        if (std.fmt.parseFloat(f64, std.mem.trim(u8, v, " \t"))) |f| {
-            jail.bantime_increment.factor = f;
-        } else |_| {
-            try ctx.warn("jail '{s}': bantime.factor = '{s}' invalid", .{ sec.name, v });
-        }
-    }
-    if (sec.get("bantime.multipliers")) |_| {
-        try ctx.warn("jail '{s}': bantime.multipliers is not supported; falling back to linear multiplier", .{sec.name});
-    }
-    if (sec.get("bantime.maxtime")) |v| {
-        if (parseDuration(v)) |d| {
-            jail.bantime_increment.max_bantime = d;
-        } else {
-            try ctx.warn("jail '{s}': bantime.maxtime = '{s}' invalid", .{ sec.name, v });
-        }
-    }
+    var base = native.BanTimeIncrement{ .formula = .exponential, .factor = 2 };
+    if (ini.section("DEFAULT")) |def| base = try extractIncrement(ctx, def, base);
+    jail.bantime_increment = try extractIncrement(ctx, sec, base);
+    jail.bantime_increment_explicit = sec.get("bantime.increment") != null or sec.get("bantime.factor") != null or sec.get("bantime.maxtime") != null;
 
     return jail;
 }
 
-const FilterResolution = enum { builtin, translated };
+fn extractIncrement(ctx: *Context, sec: *const fail2ban.Section, base: native.BanTimeIncrement) Error!native.BanTimeIncrement {
+    var incr = base;
+    if (sec.get("bantime.increment")) |v| incr.enabled = parseBool(v);
+    if (sec.get("bantime.factor")) |v| incr.multiplier = std.fmt.parseFloat(f64, std.mem.trim(u8, v, " \t")) catch return error.InvalidGeneratedConfig;
+    if (sec.get("bantime.maxtime")) |v| incr.max_bantime = parseDuration(v) orelse return error.InvalidGeneratedConfig;
+    if (sec.get("bantime.multipliers") != null or sec.get("bantime.formula") != null) {
+        try ctx.warn("jail '{s}': custom ban formulas/multiplier lists are unsupported; section cannot be imported", .{sec.name});
+        return error.InvalidGeneratedConfig;
+    }
+    return incr;
+}
+
+const FilterResolution = enum { builtin };
 
 fn resolveFilter(ctx: *Context, name: []const u8) ?FilterResolution {
     if (registry.get(name) != null) return .builtin;
-
-    const sub_path = std.fmt.allocPrint(ctx.arena, "filter.d/{s}.conf", .{name}) catch return null;
-    const full = std.fs.path.join(ctx.arena, &[_][]const u8{ ctx.source_dir, sub_path }) catch return null;
-
-    const f = fail2ban.parseFilterFile(ctx.arena, full) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => {
-            ctx.warn("filter '{s}': parse error {s}; skipping", .{ name, @errorName(err) }) catch return null;
-            return null;
-        },
-    };
-
-    if (f.failregex.len == 0) {
-        ctx.warn("filter '{s}': no translatable failregex patterns; skipping", .{name}) catch {};
-        for (f.warnings) |w| {
-            ctx.warn("  filter '{s}' warning: {s}", .{ name, w.message }) catch {};
-        }
-        return null;
-    }
-
-    ctx.warn("filter '{s}': translated {d} pattern(s) from filter.d/{s}.conf", .{ name, f.failregex.len, name }) catch {};
-    return .translated;
+    ctx.warn("filter '{s}': custom runtime filters are not supported; jail disabled (no patterns were installed)", .{name}) catch {};
+    return null;
 }
 
 pub fn parseDuration(raw: []const u8) ?u64 {
@@ -332,7 +312,7 @@ pub fn parseDuration(raw: []const u8) ?u64 {
     };
     for (units) |u| {
         if (std.ascii.eqlIgnoreCase(rest, u.suf)) {
-            return n * u.mul;
+            return std.math.mul(u64, n, u.mul) catch null;
         }
     }
     return null;
@@ -410,7 +390,7 @@ fn writeTomlAtomic(
     const w = buf.writer(arena);
     try renderToml(cfg, w);
 
-    const tmp_file = std.fs.cwd().createFile(tmp_path, .{ .mode = 0o644 }) catch return error.WriteFailed;
+    const tmp_file = std.fs.cwd().createFile(tmp_path, .{ .mode = 0o600 }) catch return error.WriteFailed;
     {
         defer tmp_file.close();
         tmp_file.writeAll(buf.items) catch return error.WriteFailed;
@@ -445,6 +425,7 @@ fn renderToml(cfg: *const native.Config, w: anytype) !void {
     if (cfg.defaults.ignoreip.len > 0) {
         try writeStringArray(w, "ignoreip", cfg.defaults.ignoreip);
     }
+    try writeIncrement(w, cfg.defaults.bantime_increment);
     try w.writeAll("\n");
 
     for (cfg.jails) |j| {
@@ -457,14 +438,18 @@ fn renderToml(cfg: *const native.Config, w: anytype) !void {
         if (j.findtime) |v| try w.print("findtime = {d}\n", .{v});
         if (j.bantime) |v| try w.print("bantime = {d}\n", .{v});
         if (j.banaction) |v| try w.print("banaction = \"{s}\"\n", .{@tagName(v)});
-        if (j.ignoreip) |list| if (list.len > 0) try writeStringArray(w, "ignoreip", list);
-        if (j.bantime_increment.enabled) {
-            try w.writeAll("bantime_increment_enabled = true\n");
-            try w.print("bantime_increment_formula = \"{s}\"\n", .{@tagName(j.bantime_increment.formula)});
-            try w.print("bantime_increment_max_bantime = {d}\n", .{j.bantime_increment.max_bantime});
-        }
+        if (j.ignoreip) |list| try writeStringArray(w, "ignoreip", list);
+        if (j.bantime_increment_explicit) try writeIncrement(w, j.bantime_increment);
         try w.writeAll("\n");
     }
+}
+
+fn writeIncrement(w: anytype, incr: native.BanTimeIncrement) !void {
+    try w.print("bantime_increment_enabled = {s}\n", .{if (incr.enabled) "true" else "false"});
+    try w.print("bantime_increment_multiplier = {d}\n", .{incr.multiplier});
+    try w.print("bantime_increment_factor = {d}\n", .{incr.factor});
+    try w.print("bantime_increment_formula = \"{s}\"\n", .{@tagName(incr.formula)});
+    try w.print("bantime_increment_max_bantime = {d}\n", .{incr.max_bantime});
 }
 
 fn writeQuoted(w: anytype, key: []const u8, value: []const u8) !void {
@@ -684,7 +669,7 @@ test "migration: warns on unknown filter but still writes output" {
     try testing.expect(!cfg.jails[0].enabled);
 }
 
-test "migration: translates user filter from filter.d/*.conf" {
+test "migration: unsupported custom filter is disabled rather than reported translated" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -714,7 +699,12 @@ test "migration: translates user filter from filter.d/*.conf" {
 
     const report = try importConfig(arena.allocator(), source, out);
     try testing.expectEqual(@as(u32, 1), report.jails_imported);
-    try testing.expectEqual(@as(u32, 1), report.filters_translated);
+    try testing.expectEqual(@as(u32, 0), report.filters_translated);
+    try testing.expectEqual(@as(u32, 1), report.filters_skipped);
+    const generated = try std.fs.cwd().readFileAlloc(arena.allocator(), out, 64 * 1024);
+    const cfg = try native.Config.parse(arena.allocator(), generated);
+    try testing.expect(!cfg.jails[0].enabled);
+    try native.validate(&cfg);
 }
 
 test "migration: maps jail action to backend" {
@@ -768,4 +758,67 @@ test "migration: printReport formats a summary line and warnings" {
     try testing.expect(std.mem.indexOf(u8, buf.items, "imported=3") != null);
     try testing.expect(std.mem.indexOf(u8, buf.items, "warning(s)") != null);
     try testing.expect(std.mem.indexOf(u8, buf.items, "sendmail") != null);
+}
+
+test "migration: generated config preserves increment overrides and empty ignore lists" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var jails = [_]native.JailConfig{.{ .name = "sshd", .filter = "sshd", .ignoreip = &.{}, .bantime_increment_explicit = true, .bantime_increment = .{ .enabled = false, .factor = 1.5, .multiplier = 2.5 } }};
+    const cfg = native.Config{ .defaults = .{ .ignoreip = &.{"192.0.2.1"}, .bantime_increment = .{ .enabled = true, .factor = 3.5 } }, .jails = &jails };
+    var output = std.ArrayList(u8).init(arena.allocator());
+    try renderToml(&cfg, output.writer());
+    const parsed = try native.Config.parse(arena.allocator(), output.items);
+    try testing.expect(parsed.defaults.bantime_increment.enabled);
+    try testing.expectEqual(@as(f64, 3.5), parsed.defaults.bantime_increment.factor);
+    try testing.expect(!parsed.jails[0].bantime_increment.enabled);
+    try testing.expect(parsed.jails[0].bantime_increment_explicit);
+    try testing.expectEqual(@as(f64, 1.5), parsed.jails[0].bantime_increment.factor);
+    try testing.expectEqual(@as(f64, 2.5), parsed.jails[0].bantime_increment.multiplier);
+    try testing.expectEqual(@as(usize, 0), parsed.jails[0].ignoreip.?.len);
+}
+
+test "migration: duration conversion preserves representable limits and rejects overflow" {
+    const units = [_]struct { name: []const u8, seconds: u64 }{
+        .{ .name = "s", .seconds = 1 },
+        .{ .name = "m", .seconds = 60 },
+        .{ .name = "h", .seconds = 3600 },
+        .{ .name = "d", .seconds = 86400 },
+        .{ .name = "w", .seconds = 604800 },
+        .{ .name = "mo", .seconds = 30 * 86400 },
+        .{ .name = "y", .seconds = 365 * 86400 },
+    };
+    var text: [64]u8 = undefined;
+    for (units) |unit| {
+        const limit = std.math.maxInt(u64) / unit.seconds;
+        const valid = try std.fmt.bufPrint(&text, "{d}{s}", .{ limit, unit.name });
+        try testing.expectEqual(@as(?u64, limit * unit.seconds), parseDuration(valid));
+        if (unit.seconds > 1) {
+            const invalid = try std.fmt.bufPrint(&text, "{d}{s}", .{ limit + 1, unit.name });
+            try testing.expectEqual(@as(?u64, null), parseDuration(invalid));
+        }
+    }
+}
+
+test "migration: invalid converted increment duration preserves existing output" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const invalid_minutes = std.math.maxInt(u64) / 60 + 1;
+    for ([_][]const u8{ "DEFAULT", "sshd" }) |section| {
+        const input = try std.fmt.allocPrint(
+            allocator,
+            "[{s}]\nbantime.maxtime = {d}m\n[sshd]\nenabled = true\nfilter = sshd\n",
+            .{ section, invalid_minutes },
+        );
+        try tmp.dir.writeFile(.{ .sub_path = "jail.conf", .data = input });
+        const sentinel = "existing operator configuration\n";
+        try tmp.dir.writeFile(.{ .sub_path = "out.toml", .data = sentinel });
+        const source = try tmp.dir.realpathAlloc(allocator, ".");
+        const output = try std.fs.path.join(allocator, &.{ source, "out.toml" });
+        try testing.expectError(error.InvalidGeneratedConfig, importConfig(allocator, source, output));
+        const unchanged = try tmp.dir.readFileAlloc(allocator, "out.toml", 4096);
+        try testing.expectEqualStrings(sentinel, unchanged);
+    }
 }

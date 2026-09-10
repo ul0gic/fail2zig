@@ -18,37 +18,20 @@ default `zig build test` cycle.
 ## Running
 
 ```bash
-# Release build first — Debug parsers are ~10x slower and miss the target.
-zig build -Doptimize=.ReleaseSafe
-
-# Individual benchmark:
-FAIL2ZIG_RUN_BENCH=1 zig test -O ReleaseSafe \
-  --dep shared --dep engine -Mroot=tests/benchmark/<name>.zig \
-  --dep shared -Mengine=engine/main.zig \
-  -Mshared=shared/root.zig
+zig build test -Doptimize=ReleaseSafe -Dbench=true -Dtest-filter=benchmark --summary all
 ```
 
-Every benchmark emits one JSON line to stdout for CI diffing, e.g.:
+Every benchmark emits one JSON line to stderr for CI diffing. Zig's build test
+runner reserves stdout for its control protocol; writing benchmark JSON there
+can leave `zig build test -Dbench=true` waiting indefinitely.
 
 ```json
 {"bench":"ban_latency","iterations":10000,"p50_ns":365,"p99_ns":932,"mean_ns":406,"target_ns":1000000}
 ```
 
-## Wiring into `build.zig`
-
-Follow the same pattern as the integration tests (see
-`tests/integration/README.md`). Additionally, Lead may want to expose
-a `-Dbench=true` build option that flips the gate without needing the
-env var. Suggested addition to `build.zig`:
-
-```zig
-const bench_opt = b.option(bool, "bench", "Run performance benchmarks") orelse false;
-if (bench_opt) {
-    // Create test modules per benchmark file as above, and set the env
-    // var on the run step so the test gate opens automatically.
-    run_bench_parse.setEnvironmentVariable("FAIL2ZIG_RUN_BENCH", "1");
-}
-```
+`-Dbench=true` sets `FAIL2ZIG_RUN_BENCH=1` for these test artifacts. Omit it for
+the normal suite, where benchmarks skip. Measurements in the table are historical;
+record machine, optimization and concurrent load for fresh comparisons.
 
 ## Skip semantics
 

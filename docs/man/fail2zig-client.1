@@ -1,4 +1,4 @@
-.TH FAIL2ZIG-CLIENT 1 "2026-04-21" "fail2zig 0.1.0" "User Commands"
+.TH FAIL2ZIG-CLIENT 1 "2026-09-09" "fail2zig 0.3.0" "User Commands"
 .
 .SH NAME
 fail2zig\-client \- query and control the fail2zig intrusion prevention daemon
@@ -68,33 +68,67 @@ Print usage information and exit.
 .SH COMMANDS
 .SS status
 Show a summary of daemon health: uptime, memory usage, parse rate, active bans,
-total bans, firewall backend, and jail count.
+total bans, protection state, firewall backend, and jail count.
+.PP
+The
+.B Protection
+row is one of
+.B active
+(every enabled jail enforces),
+.B log-only
+(no jail enforces),
+.B mixed
+(some jails enforce, some observe), or
+.B DEGRADED (\fIcause\fB)
+(an enforcing jail cannot be honoured: no usable firewall backend, or its log
+source is broken). The daemon never runs degraded silently; the same state is
+exported on
+.B /metrics
+and
+.BR /events .
+.B Backend
+is
+.B none
+when no firewall backend is in use. With
+.B \-\-output json
+the raw
+.B protection
+and
+.B protection_cause
+fields are emitted.
 .PP
 .nf
 .B "$ sudo fail2zig-client status"
 +------------------------------------------+
-| fail2zig 0.1.0 — running                |
+| fail2zig 0.3.0 — running                |
 +------------------------------------------+
 | Uptime:      0d 0h 40m 54s               |
 | Memory:      0.0 MB                      |
 | Parse rate:  0 lines/sec                 |
 | Active bans: 0                           |
-| Total bans:  -                           |
+| Total bans:  0                           |
+| Protection:  active                      |
 | Backend:     nftables                    |
-| Jails:       -                           |
+| Jails:       2                           |
 +------------------------------------------+
 .fi
 .PP
-.SS ban \fIip\fR [\fB\-\-jail\fR \fIname\fR] [\fB\-\-duration\fR \fIseconds\fR]
-Manually ban an IP address. The
+.SS ban \fIip\fR \fB\-\-jail\fR \fIname\fR [\fB\-\-duration\fR \fIseconds\fR]
+Manually ban an IP address.
 .B \-\-jail
-flag names which jail the ban is attributed to (used for per-jail accounting and
-for targeting the unban command). If omitted, the ban is attributed to an internal
-"manual" category. The optional
+is required and names the jail the ban is attributed to (per-jail accounting,
+and the target for
+.BR unban ).
+The optional
 .B \-\-duration
-flag sets the ban duration in seconds; if omitted, the jail's configured
+flag sets the ban duration in seconds; if omitted, the jail's resolved
 .B bantime
-is used.
+is used (its override or the global default). Repeated requests extend existing
+ownership without incrementing the ban counter again.
+.PP
+Requires a known, enabled, enforcing jail and an address outside its ignore list.
+Requests that cannot be enforced return an error; failed firewall applications
+remain tracked for retry and make protection degraded.
 .PP
 .nf
 .B "$ sudo fail2zig-client ban 45.227.253.98 --jail sshd"
@@ -105,7 +139,9 @@ banned: 45.227.253.98 (jail=sshd, duration=3600s)
 Remove a ban. If
 .B \-\-jail
 is specified, only the ban in that jail is removed. If omitted, the ban is
-removed from all jails.
+removed from all jails. Other jail ownership remains enforced when only one jail
+is cleared. Log-only tracked bans can be cleared without a firewall backend.
+Removal failures return an error and retain tracked state.
 .PP
 .nf
 .B "$ sudo fail2zig-client unban 45.227.253.98 --jail sshd"
@@ -113,40 +149,74 @@ unbanned: 45.227.253.98
 .fi
 .PP
 .SS list [\fB\-\-jail\fR \fIname\fR]
-List active bans. With
-.B \-\-jail
-, filter to a specific jail. Each row shows the IP, the jail it was banned by,
-the time of the ban, and the time remaining.
+List active bans. Each row shows the IP, the jail it was banned by, the time
+remaining, and how many times that IP has been banned. Without
+.BR \-\-jail ,
+the list comes from the daemon's own state and works with or without a
+firewall backend. With
+.BR \-\-jail ,
+the daemon reads that jail's set back from the firewall backend; without one
+it answers
+.B "no firewall backend"
+and the client exits 1.
 .PP
 .nf
 .B "$ sudo fail2zig-client list"
-IP                 JAIL    BANNED AT             TIME LEFT
-------------------------------------------------------------
-45.227.253.98      sshd    2026-04-21 12:03:10   57m 43s
+IP ADDRESS      JAIL  TIME LEFT  BAN COUNT
+------------------------------------------
+45.227.253.98   sshd  57m 43s    1
+Total: 1 active bans
 .fi
 .PP
+When nothing is banned the table output is the single line
+.BR "No active bans." ;
+JSON output is an empty array.
+.PP
 .SS jails
-List all configured jails with their current state, active ban count, and
-configured thresholds.
+List all configured jails with their state, active ban count, thresholds,
+effective action, and log source.
+.B ACTION
+is the backend the jail resolves to at runtime
+.RB ( nftables ", " iptables ", " ipset ", or " log-only )
+and
+.B ENFORCING
+is
+.B true
+only when bans actually reach the firewall.
+.B SOURCE
+is the log path (or comma-separated paths),
+.BI "journald (" filter )
+for the systemd journal, or
+.B internal
+for jails fed in-process from other jails' confirmed bans (the
+.B recidive
+filter).
+.B HEALTH
+is
+.B ok
+when the source was last read successfully,
+.B broken
+when the daemon can no longer read it (this also marks the daemon
+.BR DEGRADED ),
+or
+.B unknown
+before the first read. An
+.B internal
+source is always
+.BR ok .
 .PP
 .nf
 .B "$ sudo fail2zig-client jails"
-JAIL                STATE     ACTIVE    MAX RETRY FIND TIME   BAN TIME
------------------------------------------------------------------------
-sshd                enabled   0         3         10m         5m
-nginx-http-auth     enabled   0         3         10m         5m
-nginx-botsearch     enabled   0         3         10m         5m
-postfix             enabled   0         3         10m         5m
-apache-auth         enabled   0         3         10m         5m
-dovecot             enabled   0         3         10m         5m
-Total: 6 jails
+JAIL      STATE    ACTIVE  MAX RETRY  FIND TIME  BAN TIME  ACTION    ENFORCING  SOURCE           HEALTH
+--------------------------------------------------------------------------------------------------------
+sshd      enabled  0       3          10m        5m        nftables  true       journald (sshd)  ok
+recidive  enabled  0       3          1d         7d        nftables  true       internal         ok
+Total: 2 jails
 .fi
 .PP
 .SS reload
-Signal the daemon to reload its configuration. In v0.1.0 this command is
-implemented at the IPC level but the daemon-side handler is a stub; the daemon
-logs the request and acknowledges it, but does not reload the config. A service
-restart is required to pick up configuration changes.
+Not implemented. Returns an error (IPC status 501); no configuration is changed.
+Validate the new configuration and restart the service to apply it.
 .PP
 .SS version
 Print the daemon version (requires a daemon connection, unlike
@@ -154,7 +224,7 @@ Print the daemon version (requires a daemon connection, unlike
 .PP
 .nf
 .B "$ sudo fail2zig-client version"
-fail2zig-client 0.1.0
+fail2zig-client 0.3.0
 .fi
 .PP
 .SS completions \fIshell\fR
@@ -233,19 +303,20 @@ Report bugs at
 .UR https://github.com/ul0gic/fail2zig/issues
 .UE .
 .PP
-Known limitations in v0.1.0:
+Known limitations:
 .IP \(bu 2
 The
 .B reload
 command is a stub; restart the daemon to apply config changes.
 .IP \(bu 2
-The
-.B \-\-duration
-flag on the
+A manual
 .B ban
-command is accepted but the daemon currently uses the jail's configured
-.B bantime
-in all cases. This will be honored in v0.2.0.
+without
+.B \-\-duration
+uses the
+.B [defaults]
+bantime, not the target jail's own bantime.
 .
 .SH HISTORY
 fail2zig-client 0.1.0 was the first public release, April 2026.
+fail2zig-client 0.3.0 was released September 2026.

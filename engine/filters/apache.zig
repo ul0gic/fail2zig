@@ -4,6 +4,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const parser = @import("../core/parser.zig");
+const access = @import("access.zig");
 
 pub const PatternDef = types.PatternDef;
 
@@ -25,27 +26,27 @@ pub const auth_patterns = [_]PatternDef{
 pub const badbots_patterns = [_]PatternDef{
     .{
         .name = "ahrefs",
-        .match = parser.compile("<IP> <*>AhrefsBot"),
+        .match = access.agentMatcher("AhrefsBot"),
     },
     .{
         .name = "semrush",
-        .match = parser.compile("<IP> <*>SemrushBot"),
+        .match = access.agentMatcher("SemrushBot"),
     },
     .{
         .name = "mj12",
-        .match = parser.compile("<IP> <*>MJ12bot"),
+        .match = access.agentMatcher("MJ12bot"),
     },
     .{
         .name = "dot",
-        .match = parser.compile("<IP> <*>DotBot"),
+        .match = access.agentMatcher("DotBot"),
     },
     .{
         .name = "wp-login-404",
-        .match = parser.compile("<IP> <*>wp-login"),
+        .match = access.pathMatcher("/wp-login", false),
     },
     .{
         .name = "xmlrpc-404",
-        .match = parser.compile("<IP> <*>xmlrpc"),
+        .match = access.pathMatcher("/xmlrpc", false),
     },
 };
 

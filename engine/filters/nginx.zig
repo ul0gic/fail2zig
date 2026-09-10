@@ -4,6 +4,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const parser = @import("../core/parser.zig");
+const access = @import("access.zig");
 
 pub const PatternDef = types.PatternDef;
 
@@ -36,23 +37,23 @@ pub const limit_req_patterns = [_]PatternDef{
 pub const botsearch_patterns = [_]PatternDef{
     .{
         .name = "wp-login",
-        .match = parser.compile("<IP> <*>wp-login"),
+        .match = access.pathMatcher("/wp-login", true),
     },
     .{
         .name = "xmlrpc",
-        .match = parser.compile("<IP> <*>xmlrpc"),
+        .match = access.pathMatcher("/xmlrpc", true),
     },
     .{
         .name = "phpmyadmin",
-        .match = parser.compile("<IP> <*>phpmyadmin"),
+        .match = access.pathMatcher("/phpmyadmin", true),
     },
     .{
         .name = "env-file",
-        .match = parser.compile("<IP> <*>.env"),
+        .match = access.pathMatcher("/.env", true),
     },
     .{
         .name = "git-folder",
-        .match = parser.compile("<IP> <*>/.git"),
+        .match = access.pathMatcher("/.git", true),
     },
 };
 

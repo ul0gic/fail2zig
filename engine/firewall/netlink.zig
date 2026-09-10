@@ -2,6 +2,7 @@
 // Copyright (c) 2026 fail2zig maintainers
 
 const std = @import("std");
+const native_endian = @import("builtin").cpu.arch.endian();
 const builtin = @import("builtin");
 const posix = std.posix;
 const linux = std.os.linux;
@@ -252,7 +253,7 @@ pub const MessageIterator = struct {
 
 pub fn parseNlmsgerr(payload: []const u8) Error!i32 {
     if (payload.len < @sizeOf(i32)) return error.TruncatedMessage;
-    return mem.readInt(i32, payload[0..@sizeOf(i32)], .little);
+    return mem.readInt(i32, payload[0..@sizeOf(i32)], native_endian);
 }
 
 pub const NFNL = struct {
@@ -363,14 +364,14 @@ test "netlink: MessageBuilder writes correct header bytes" {
 
     const out = b.bytes();
     try std.testing.expectEqual(@as(usize, 20), out.len);
-    try std.testing.expectEqual(@as(u32, 18), mem.readInt(u32, out[0..4], .little));
-    try std.testing.expectEqual(@as(u16, 0x1234), mem.readInt(u16, out[4..6], .little));
+    try std.testing.expectEqual(@as(u32, 18), mem.readInt(u32, out[0..4], native_endian));
+    try std.testing.expectEqual(@as(u16, 0x1234), mem.readInt(u16, out[4..6], native_endian));
     try std.testing.expectEqual(
         @as(u16, linux.NLM_F_REQUEST | linux.NLM_F_ACK),
-        mem.readInt(u16, out[6..8], .little),
+        mem.readInt(u16, out[6..8], native_endian),
     );
-    try std.testing.expectEqual(@as(u32, 0x42), mem.readInt(u32, out[8..12], .little));
-    try std.testing.expectEqual(@as(u32, 0x1000), mem.readInt(u32, out[12..16], .little));
+    try std.testing.expectEqual(@as(u32, 0x42), mem.readInt(u32, out[8..12], native_endian));
+    try std.testing.expectEqual(@as(u32, 0x1000), mem.readInt(u32, out[12..16], native_endian));
     try std.testing.expectEqual(@as(u8, 0xAA), out[16]);
     try std.testing.expectEqual(@as(u8, 0xBB), out[17]);
     try std.testing.expectEqual(@as(u8, 0), out[18]);
@@ -536,7 +537,7 @@ fn testSocketpair() ?[2]i32 {
 fn buildNlmsgErr(buf: []u8, seq: u32, errno: i32) []const u8 {
     var b = MessageBuilder.init(buf);
     var payload: [4]u8 = undefined;
-    mem.writeInt(i32, &payload, errno, .little);
+    mem.writeInt(i32, &payload, errno, native_endian);
     b.append(@as(u16, 2), 0, seq, 0, &payload) catch unreachable;
     return b.bytes();
 }

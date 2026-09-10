@@ -26,6 +26,8 @@ pub const header_size: usize = 4 + 2 + 4 + 4;
 pub const entry_size_legacy: usize = 1 + 16 + 64 + 4 + 4 + 8 + 8 + 8;
 pub const entry_size: usize = entry_size_legacy + 1;
 pub const flag_enforced: u8 = 0x01;
+pub const flag_confirmed: u8 = 0x02;
+pub const flag_confirmation_known: u8 = 0x04;
 pub const jail_name_field: usize = 64;
 pub const lifetime_record_size: usize = jail_name_field + 8;
 
@@ -50,6 +52,7 @@ pub const StateEntry = struct {
     ban_expiry: ?Timestamp,
     /// null = pre-v4 file, which never recorded whether the ban reached the firewall; the seeder decides.
     enforced: ?bool = null,
+    confirmed: bool = true,
 
     pub fn isBanned(self: StateEntry) bool {
         return self.ban_expiry != null;
@@ -204,7 +207,8 @@ fn encodeEntry(buf: *[entry_size]u8, ip: IpAddress, st: *const IpState) void {
     const expiry: i64 = st.ban_expiry orelse 0;
     std.mem.writeInt(i64, buf[off .. off + 8][0..8], expiry, .little);
     off += 8;
-    buf[off] = if (st.enforced) flag_enforced else 0;
+    buf[off] = (if (st.enforced) flag_enforced else @as(u8, 0)) |
+        (if (st.confirmed) flag_confirmed else @as(u8, 0)) | flag_confirmation_known;
     off += 1;
 
     std.debug.assert(off == entry_size);
@@ -387,6 +391,7 @@ fn decodeEntry(buf: []const u8) ?StateEntry {
         .last_attempt = last_attempt,
         .ban_expiry = if (expiry_raw == 0) null else expiry_raw,
         .enforced = enforced,
+        .confirmed = if (buf.len == entry_size and buf[off] & flag_confirmation_known != 0) buf[off] & flag_confirmed != 0 else true,
     };
 }
 
@@ -403,6 +408,7 @@ pub fn seed(tracker: *StateTracker, entries: []const StateEntry) Error!void {
             .ban_state = if (e.ban_expiry != null) .banned else .monitoring,
             .ban_expiry = e.ban_expiry,
             .enforced = e.ban_expiry != null and (e.enforced orelse true),
+            .confirmed = e.confirmed,
             .ring = [_]Timestamp{0} ** state_mod.max_attempts_per_ip,
             .ring_len = 0,
         };
@@ -524,6 +530,7 @@ pub fn seedMapWith(
             .ban_expiry = e.ban_expiry,
             .enforced = e.ban_expiry != null and
                 (e.enforced orelse legacy_enforced.resolve(legacy_enforced.ctx, jail_name)),
+            .confirmed = e.confirmed,
             .ring = [_]Timestamp{0} ** state_mod.max_attempts_per_ip,
             .ring_len = 0,
         };
@@ -1204,4 +1211,24 @@ test "persist: v3 file loads with enforced unknown and the default seeder assume
     const again = try loadFull(testing.allocator, path);
     defer again.deinit(testing.allocator);
     try testing.expectEqual(@as(?bool, true), again.entries[0].enforced);
+}
+
+test "persist: pending and confirmed ownership survive v4 roundtrip without replaying counters" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmpStatePath(&tmp, &full);
+    var tm = TrackerMap.init(testing.allocator);
+    defer tm.deinit();
+    const tracker = try tm.addTracker("sshd", .{ .max_entries = 4 });
+    try tracker.manualBan(tIp("192.0.2.1"), tJail("sshd"), 100, 60);
+    try tracker.manualBan(tIp("192.0.2.2"), tJail("sshd"), 100, 60);
+    tracker.mutable(tIp("192.0.2.2")).?.confirmed = true;
+    try saveAll(&tm, path);
+    const loaded = try loadFull(testing.allocator, path);
+    defer loaded.deinit(testing.allocator);
+    for (loaded.entries) |entry| {
+        try testing.expect(entry.enforced.?);
+        try testing.expectEqual(std.meta.eql(entry.ip, tIp("192.0.2.2")), entry.confirmed);
+    }
 }

@@ -13,7 +13,7 @@
 # What it does (in order):
 #   1. Detect host architecture, map to a supported release target.
 #   2. Resolve the version (default: latest GitHub release; override with
-#      FAIL2ZIG_VERSION=v0.1.0).
+#      FAIL2ZIG_VERSION=v0.3.0).
 #   3. Download fail2zig + fail2zig-client + SHA256SUMS + systemd unit from
 #      that release's asset tree (skipped if --local-bin is supplied).
 #   4. Verify SHA256 of each binary against SHA256SUMS. Abort on mismatch.
@@ -28,8 +28,7 @@
 # Exit code: 0 on success, non-zero on any failure. Every error surfaces
 # with a `fail2zig:` prefix so callers grepping logs can find them.
 #
-# Supported architectures (v0.1.0): x86_64, aarch64.
-# 32-bit ARM and MIPS are tracked in SYS-009 and gated on the fix.
+# Supported targets: x86_64, aarch64, armv7 (hard-float), mips and mipsel (32-bit soft-float).
 
 set -euo pipefail
 
@@ -85,7 +84,7 @@ Options:
   -h, --help              Show this help.
 
 Environment overrides:
-  FAIL2ZIG_VERSION        Release tag, e.g. v0.1.0 (default: latest).
+  FAIL2ZIG_VERSION        Release tag, e.g. v0.3.0 (default: latest).
   FAIL2ZIG_REPO           GitHub owner/repo (default: ul0gic/fail2zig).
   FAIL2ZIG_PREFIX         Install prefix (default: /usr/local).
   FAIL2ZIG_CONFIG_DIR     Config directory (default: /etc/fail2zig).
@@ -179,7 +178,7 @@ resolve_version() {
     [ -n "${tag}" ] || die "could not resolve latest release tag (GitHub API returned no tag_name)"
     echo "${tag}"
   else
-    # Accept either "v0.1.0" or "0.1.0" and normalise.
+    # Accept either "v0.3.0" or "0.3.0" and normalise.
     case "${v}" in
       v*) echo "${v}" ;;
       *)  echo "v${v}" ;;

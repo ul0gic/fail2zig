@@ -65,7 +65,7 @@ test "benchmark: ban decision latency under target" {
 
     try testing.expectEqual(@as(u64, iterations), total_decisions);
 
-    const stdout = std.io.getStdOut().writer();
+    const stdout = std.io.getStdErr().writer();
     stdout.print(
         \\{{"bench":"ban_latency","iterations":{d},"p50_ns":{d},"p99_ns":{d},"mean_ns":{d},"target_ns":{d}}}
         \\

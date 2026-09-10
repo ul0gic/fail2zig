@@ -16,7 +16,6 @@ Type=simple
 # use fail2zig-client (mode 0660 socket, SO_PEERCRED-authenticated).
 Group=fail2zig
 ExecStart=/usr/local/bin/fail2zig --config /etc/fail2zig/config.toml
-ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=10

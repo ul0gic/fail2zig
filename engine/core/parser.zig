@@ -362,16 +362,20 @@ pub fn extractTimestampWithYear(
 }
 
 pub fn stripSyslogPrefix(line: []const u8) []const u8 {
-    const ts_hit = extractTimestamp(line);
-    if (ts_hit == null) return line;
-    const after_ts = ts_hit.?.len;
-    if (after_ts >= line.len or line[after_ts] != ' ') return line;
-    const scan_cap = @min(line.len, after_ts + 256);
-    var i: usize = after_ts + 1;
-    while (i + 1 < scan_cap) : (i += 1) {
-        if (line[i] == ':' and line[i + 1] == ' ') {
-            return line[i + 2 ..];
-        }
+    const timestamp = extractTimestamp(line) orelse return line;
+    var pos: usize = timestamp.len;
+    if (pos >= line.len or line[pos] != ' ') return line;
+    while (pos < line.len and line[pos] == ' ') : (pos += 1) {}
+    const host_len = extractHost(line[pos..]) orelse return line;
+    pos += host_len;
+    if (pos >= line.len or line[pos] != ' ') return line;
+    while (pos < line.len and line[pos] == ' ') : (pos += 1) {}
+    const start = pos;
+    const limit = @min(line.len, start + 128);
+    while (pos < limit) : (pos += 1) {
+        const c = line[pos];
+        if (c == ':' and pos > start and pos + 1 < line.len and line[pos + 1] == ' ') return line[pos + 2 ..];
+        if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-' and c != '.' and c != '/' and c != '[' and c != ']') return line;
     }
     return line;
 }
@@ -827,4 +831,9 @@ test "parser: Parser wrapper with custom match fn" {
 
 test {
     _ = matcher;
+}
+
+test "parser: service timestamp without a syslog host and tag preserves message colons" {
+    const raw = "2026-04-21 12:00:00 10 [Warning] Access denied for user 'root' from '192.0.2.42' (using password: YES)";
+    try std.testing.expectEqualStrings(raw, stripSyslogPrefix(raw));
 }

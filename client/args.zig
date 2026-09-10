@@ -470,7 +470,7 @@ pub const help_top =
     \\    unban <ip>          Manually unban an IP
     \\    list                List active bans (all or per-jail with --jail)
     \\    jails               List configured jails
-    \\    reload              Trigger config reload
+    \\    reload              Unsupported; validate config and restart
     \\    version             Show client and daemon version
     \\    completions <sh>    Emit shell-completion script (bash|zsh|fish)
     \\    help [command]      Show help for a command
