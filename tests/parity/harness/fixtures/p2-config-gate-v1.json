@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "scope": "Reviewed P2 CFG-01 regression evidence only; original P1 oracle and five SYS-029 failures retained. Not G2 or full configuration parity.",
+  "original_baseline_sha256": "653db0fb0f023d8d94464746a64d07be27f34863e361d161bbf81ae1f74835d2",
+  "original_gate_sha256": "b15eb067b5ca7870b13307fd1ae1c372aae6e05af2eb3bbcab02613db40a3d31",
+  "reviewed_receipt_sha256": "ee55c1020128a5bc7032fcf580a083103f8b32fb2ece495df7605f5033579dbc",
+  "reviewed_candidate_config_sha256": "327af39bfe54586c23cdbf1d1ec21b428e2462d0a296342a8474d3ce72da241a",
+  "reference_commit": "f60978618a101427b06924fc932b44350fec2b63",
+  "reviewed_closures": [
+    {
+      "id": "parity-cfg-002",
+      "original_issues": [
+        "SYS-026"
+      ],
+      "observations": [
+        {
+          "event": "config",
+          "sequence": 0,
+          "values": {
+            "value": "7"
+          }
+        }
+      ],
+      "fix": "Ordered conf/d-conf/local/d-local merge"
+    },
+    {
+      "id": "parity-cfg-003",
+      "original_issues": [
+        "SYS-026"
+      ],
+      "observations": [
+        {
+          "event": "config",
+          "sequence": 0,
+          "values": {
+            "value": "9"
+          }
+        }
+      ],
+      "fix": "Ordered conf/d-conf/local/d-local merge"
+    },
+    {
+      "id": "parity-cfg-004",
+      "original_issues": [
+        "SYS-027"
+      ],
+      "observations": [
+        {
+          "event": "config",
+          "sequence": 0,
+          "values": {
+            "value": "2"
+          }
+        }
+      ],
+      "fix": "Recursive before/after includes with adjacent local and source provenance"
+    },
+    {
+      "id": "parity-cfg-005",
+      "original_issues": [
+        "SYS-027"
+      ],
+      "observations": [
+        {
+          "event": "config",
+          "sequence": 0,
+          "values": {
+            "value": "9"
+          }
+        }
+      ],
+      "fix": "Recursive before/after includes with adjacent local and source provenance"
+    }
+  ]
+}

@@ -20,13 +20,19 @@ pub const Error = error{
     OutOfMemory,
     InvalidPath,
     UnsupportedRegex,
+    IncludeDepthExceeded,
+    InterpolationMissingOption,
+    InvalidParameter,
+    DuplicateSection,
+    DuplicateOption,
+    InvalidEncoding,
 };
 
 pub const max_file_bytes: usize = 1024 * 1024;
 pub const max_sections: usize = 256;
 pub const max_keys_per_section: usize = 64;
 pub const max_files_per_dir: usize = 1024;
-pub const max_interp_depth: usize = 16;
+pub const max_interp_depth: usize = 10;
 pub const max_value_bytes: usize = 16 * 1024;
 
 pub const Warning = struct {
@@ -35,9 +41,36 @@ pub const Warning = struct {
     message: []const u8,
 };
 
+pub const Origin = struct {
+    source: []const u8,
+    line: u32,
+    raw: []const u8,
+};
+
+pub const Assignment = struct {
+    section: []const u8,
+    key: []const u8,
+    origin: Origin,
+};
+
+pub const SourceEdge = enum { layer, before, after, local };
+
+pub const SourceOccurrence = struct {
+    edge: SourceEdge,
+    original_path: []const u8,
+    resolved_target: []const u8,
+    parent_path: ?[]const u8,
+    path: []const u8,
+    bytes: []const u8,
+    sha256: [32]u8,
+};
+
 pub const Section = struct {
     name: []const u8,
     keys: std.StringArrayHashMapUnmanaged([]const u8) = .{},
+
+    origins: std.StringArrayHashMapUnmanaged(Origin) = .{},
+    previous: std.StringArrayHashMapUnmanaged([]const u8) = .{},
 
     pub fn get(self: *const Section, key: []const u8) ?[]const u8 {
         return self.keys.get(key);
@@ -45,6 +78,8 @@ pub const Section = struct {
 };
 
 pub const ParsedIni = struct {
+    assignments: std.ArrayListUnmanaged(Assignment) = .{},
+    sources: std.ArrayListUnmanaged(SourceOccurrence) = .{},
     sections: std.StringArrayHashMapUnmanaged(Section) = .{},
     warnings: std.ArrayListUnmanaged(Warning) = .{},
 
@@ -62,7 +97,7 @@ pub const ParsedIni = struct {
 
         pub fn next(self: *SectionIter) ?*Section {
             while (self.inner.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, self.skip)) continue;
+                if (std.mem.eql(u8, entry.key_ptr.*, self.skip) or std.mem.eql(u8, entry.key_ptr.*, "INCLUDES")) continue;
                 return entry.value_ptr;
             }
             return null;
@@ -106,6 +141,7 @@ pub fn parseIniSource(
     src: []const u8,
 ) Error!ParsedIni {
     if (src.len > max_file_bytes) return error.FileTooLarge;
+    if (!std.unicode.utf8ValidateSlice(src)) return error.InvalidEncoding;
 
     var result = ParsedIni{};
     errdefer result.sections.deinit(arena);
@@ -114,12 +150,21 @@ pub fn parseIniSource(
 
     var current: ?*Section = null;
     var pending_key: ?[]const u8 = null;
+    var pending_line: u32 = 0;
+    var pending_indent: usize = 0;
     var pending_value = std.ArrayListUnmanaged(u8){};
     errdefer pending_value.deinit(arena);
 
     for (lines) |ln| {
-        if (ln.indented and pending_key != null) {
-            const stripped = stripLeadingSpace(ln.text);
+        const content = std.mem.trim(u8, ln.text, " \t");
+        if (content.len > 0 and (content[0] == '#' or content[0] == ';')) continue;
+        if (content.len == 0 and pending_key != null) {
+            try pending_value.append(arena, '\n');
+            continue;
+        }
+        const indent = ln.text.len - stripLeadingSpace(ln.text).len;
+        if (indent > pending_indent and pending_key != null) {
+            const stripped = stripInlineComment(std.mem.trim(u8, ln.text, " \t"));
             if (stripped.len == 0) {
                 try pending_value.append(arena, '\n');
                 continue;
@@ -133,7 +178,8 @@ pub fn parseIniSource(
         }
 
         if (pending_key) |key| {
-            try commitKey(arena, current, key, try pending_value.toOwnedSlice(arena));
+            try commitKey(arena, current, key, try pending_value.toOwnedSlice(arena), source_label, pending_line);
+            try result.assignments.append(arena, .{ .section = current.?.name, .key = key, .origin = current.?.origins.get(key).? });
             pending_value = std.ArrayListUnmanaged(u8){};
             pending_key = null;
         }
@@ -143,10 +189,11 @@ pub fn parseIniSource(
         if (trimmed[0] == '#' or trimmed[0] == ';') continue;
 
         if (trimmed[0] == '[') {
-            if (trimmed.len < 2 or trimmed[trimmed.len - 1] != ']') {
-                return error.UnterminatedSection;
-            }
-            const name = std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t");
+            // ConfigParser matches a greedy nonempty [header] prefix, permits
+            // trailing text, and preserves whitespace inside the header.
+            const header = stripInlineComment(trimmed);
+            const close = std.mem.lastIndexOfScalar(u8, header, ']') orelse return error.UnterminatedSection;
+            const name = header[1..close];
             if (name.len == 0) return error.EmptySectionName;
 
             if (result.sections.count() >= max_sections and
@@ -155,6 +202,7 @@ pub fn parseIniSource(
                 return error.TooManySections;
             }
 
+            if (!std.mem.eql(u8, name, "DEFAULT") and result.sections.contains(name)) return error.DuplicateSection;
             const gop = try result.sections.getOrPut(arena, name);
             if (!gop.found_existing) {
                 gop.value_ptr.* = .{ .name = name };
@@ -164,26 +212,27 @@ pub fn parseIniSource(
         }
 
         const sep_idx = findSeparator(trimmed) orelse {
-            try appendWarning(arena, &result, source_label, ln.line_no, "line has no '=' or ':' separator; ignoring");
-            continue;
+            return error.KeyWithoutValue;
         };
 
-        const key = std.mem.trim(u8, trimmed[0..sep_idx], " \t");
+        const key = try std.ascii.allocLowerString(arena, std.mem.trim(u8, trimmed[0..sep_idx], " \t"));
         if (key.len == 0) return error.KeyWithoutValue;
-        const value = std.mem.trim(u8, trimmed[sep_idx + 1 ..], " \t");
+        const value = stripInlineComment(std.mem.trim(u8, trimmed[sep_idx + 1 ..], " \t"));
 
         if (current == null) {
-            try appendWarning(arena, &result, source_label, ln.line_no, "key outside of any section; ignoring");
-            continue;
+            return error.EmptySectionName;
         }
 
         pending_key = key;
+        pending_line = ln.line_no;
+        pending_indent = indent;
         pending_value = std.ArrayListUnmanaged(u8){};
         try pending_value.appendSlice(arena, value);
     }
 
     if (pending_key) |key| {
-        try commitKey(arena, current, key, try pending_value.toOwnedSlice(arena));
+        try commitKey(arena, current, key, try pending_value.toOwnedSlice(arena), source_label, pending_line);
+        try result.assignments.append(arena, .{ .section = current.?.name, .key = key, .origin = current.?.origins.get(key).? });
     }
 
     return result;
@@ -194,12 +243,17 @@ fn commitKey(
     section_opt: ?*Section,
     key: []const u8,
     value: []const u8,
+    source: []const u8,
+    line: u32,
 ) Error!void {
     const sec = section_opt orelse return;
+    if (sec.keys.contains(key)) return error.DuplicateOption;
     if (sec.keys.count() >= max_keys_per_section and sec.keys.get(key) == null) {
         return error.TooManyKeysInSection;
     }
-    try sec.keys.put(arena, key, value);
+    const normalized = std.mem.trimRight(u8, value, " \t\r\n");
+    try sec.keys.put(arena, key, normalized);
+    try sec.origins.put(arena, key, .{ .source = source, .line = line, .raw = normalized });
 }
 
 fn appendWarning(
@@ -239,118 +293,92 @@ fn findSeparator(s: []const u8) ?usize {
     return colon_idx;
 }
 
-pub fn interpolate(arena: std.mem.Allocator, ini: *ParsedIni) Error!void {
-    const default_section = ini.section("DEFAULT");
+// Resolve from raw origins, never from another field's previously expanded result.
+// This preserves consumer context and literal percent escapes across repeated reads.
+pub fn resolve(arena: std.mem.Allocator, ini: *const ParsedIni, section_name: []const u8, key: []const u8) Error!?[]const u8 {
+    const sec = ini.section(section_name) orelse return null;
+    const raw = rawGet(sec, key) orelse if (ini.section("DEFAULT")) |d| rawGet(d, key) else null;
+    return if (raw) |v| try expandValue(arena, ini, section_name, v, 0, key) else null;
+}
 
+fn rawGet(sec: *const Section, key: []const u8) ?[]const u8 {
+    if (sec.origins.get(key)) |o| return o.raw;
+    return sec.get(key);
+}
+
+pub fn interpolate(arena: std.mem.Allocator, ini: *ParsedIni) Error!void {
     var it = ini.sections.iterator();
     while (it.next()) |entry| {
-        const sec_name = entry.key_ptr.*;
-        const sec = entry.value_ptr;
-        if (std.mem.eql(u8, sec_name, "DEFAULT")) continue;
-
-        var keys_it = sec.keys.iterator();
-        while (keys_it.next()) |kv| {
-            const key_name = kv.key_ptr.*;
-            const expanded = expandValue(
-                arena,
-                kv.value_ptr.*,
-                sec,
-                default_section,
-                0,
-                key_name,
-            ) catch |err| switch (err) {
-                error.InterpolationCycle,
-                error.InterpolationOverflow,
-                error.InterpolationUnterminated,
-                => {
-                    try appendWarning(arena, ini, sec_name, 0, @errorName(err));
+        var keys = entry.value_ptr.keys.iterator();
+        while (keys.next()) |kv| {
+            kv.value_ptr.* = (resolve(arena, ini, entry.key_ptr.*, kv.key_ptr.*) catch |err| switch (err) {
+                error.InterpolationCycle, error.InterpolationOverflow, error.InterpolationUnterminated, error.InterpolationMissingOption => {
+                    const origin = entry.value_ptr.origins.get(kv.key_ptr.*);
+                    try appendWarning(arena, ini, if (origin) |o| o.source else entry.key_ptr.*, if (origin) |o| o.line else 0, @errorName(err));
                     continue;
                 },
                 else => return err,
-            };
-            kv.value_ptr.* = expanded;
-        }
-    }
-
-    if (default_section) |def| {
-        var keys_it = def.keys.iterator();
-        while (keys_it.next()) |kv| {
-            const key_name = kv.key_ptr.*;
-            const expanded = expandValue(
-                arena,
-                kv.value_ptr.*,
-                def,
-                null,
-                0,
-                key_name,
-            ) catch |err| switch (err) {
-                error.InterpolationCycle,
-                error.InterpolationOverflow,
-                error.InterpolationUnterminated,
-                => {
-                    try appendWarning(arena, ini, "DEFAULT", 0, @errorName(err));
-                    continue;
-                },
-                else => return err,
-            };
-            kv.value_ptr.* = expanded;
+            }) orelse kv.value_ptr.*;
         }
     }
 }
 
-fn expandValue(
-    arena: std.mem.Allocator,
-    src: []const u8,
-    local: *const Section,
-    default: ?*const Section,
-    depth: usize,
-    self_key: []const u8,
-) Error![]const u8 {
+fn expandValue(arena: std.mem.Allocator, ini: *const ParsedIni, section_name: []const u8, src: []const u8, depth: usize, self_key: []const u8) Error![]const u8 {
     if (depth >= max_interp_depth) return error.InterpolationCycle;
-
     var out = std.ArrayListUnmanaged(u8){};
-    errdefer out.deinit(arena);
-    try out.ensureTotalCapacity(arena, src.len);
-
+    _ = self_key;
+    const local = ini.section(section_name).?;
+    const defaults = ini.section("DEFAULT");
     var i: usize = 0;
     while (i < src.len) {
-        const c = src[i];
-        if (c == '%' and i + 1 < src.len and src[i + 1] == '(') {
-            var j: usize = i + 2;
-            while (j < src.len and src[j] != ')') : (j += 1) {}
-            if (j >= src.len or j + 1 >= src.len or src[j + 1] != 's') {
-                return error.InterpolationUnterminated;
-            }
-            const name = src[i + 2 .. j];
-            if (name.len == 0) return error.InterpolationUnterminated;
-
-            const self_ref = self_key.len > 0 and std.mem.eql(u8, name, self_key);
-            const raw_local = if (self_ref) null else local.get(name);
-            const raw = raw_local orelse if (default) |d| d.get(name) else null;
-            if (raw == null) {
-                try out.appendSlice(arena, src[i .. j + 2]);
-                i = j + 2;
-                continue;
-            }
-
-            const expanded = try expandValue(arena, raw.?, local, default, depth + 1, "");
-            if (out.items.len + expanded.len > max_value_bytes) {
-                return error.InterpolationOverflow;
-            }
-            try out.appendSlice(arena, expanded);
-            i = j + 2;
-            continue;
-        }
-        if (c == '%' and i + 1 < src.len and src[i + 1] == '%') {
+        if (src[i] == '%' and i + 1 < src.len and src[i + 1] == '%') {
             try out.append(arena, '%');
             i += 2;
-            continue;
+        } else if (src[i] == '%' and i + 1 < src.len and src[i + 1] == '(') {
+            const close = std.mem.indexOfScalarPos(u8, src, i + 2, ')') orelse return error.InterpolationUnterminated;
+            if (close + 1 >= src.len or src[close + 1] != 's') return error.InterpolationUnterminated;
+            const name = try std.ascii.allocLowerString(arena, src[i + 2 .. close]);
+            var raw: ?[]const u8 = null;
+            if (std.mem.eql(u8, name, "__name__")) {
+                raw = section_name;
+            } else if (std.mem.indexOfScalar(u8, name, '/')) |slash| {
+                const prefix = name[0..slash];
+                const option = name[slash + 1 ..];
+                if (std.mem.eql(u8, prefix, "known")) {
+                    raw = rawGet(local, name) orelse local.previous.get(option);
+                } else if (!std.mem.eql(u8, prefix, "default")) {
+                    // BasicInterpolation folds the complete variable name before lookup.
+                    const other = ini.section(prefix) orelse return error.InterpolationMissingOption;
+                    raw = rawGet(other, option);
+                }
+                if (raw == null) if (defaults) |d| {
+                    raw = rawGet(d, option);
+                };
+            } else {
+                raw = rawGet(local, name);
+                if (raw == null) if (defaults) |d| {
+                    raw = rawGet(d, name);
+                };
+            }
+            const value = raw orelse return error.InterpolationMissingOption;
+            // BasicInterpolation recurses only when the replacement contains %.
+            try out.appendSlice(arena, if (std.mem.indexOfScalar(u8, value, '%') != null) try expandValue(arena, ini, section_name, value, depth + 1, "") else value);
+            i = close + 2;
+        } else {
+            if (src[i] == '%') return error.InterpolationUnterminated;
+            try out.append(arena, src[i]);
+            i += 1;
         }
-        try out.append(arena, c);
-        i += 1;
+        if (out.items.len > max_value_bytes) return error.InterpolationOverflow;
     }
-
     return try out.toOwnedSlice(arena);
+}
+
+fn stripInlineComment(value: []const u8) []const u8 {
+    for (value, 0..) |c, i| {
+        if (c == ';' and (i == 0 or std.ascii.isWhitespace(value[i - 1]))) return std.mem.trimRight(u8, value[0..i], " \t");
+    }
+    return value;
 }
 
 fn mergeInto(
@@ -360,62 +388,113 @@ fn mergeInto(
 ) Error!void {
     var sec_it = override.sections.iterator();
     while (sec_it.next()) |entry| {
-        const name = entry.key_ptr.*;
+        const original_name = entry.key_ptr.*;
+        const condition = std.mem.indexOfScalar(u8, original_name, '?');
+        const name = if (condition) |q| original_name[0..q] else original_name;
         const src_sec = entry.value_ptr;
+        if (base.sections.count() >= max_sections and base.section(name) == null) return error.TooManySections;
         const gop = try base.sections.getOrPut(arena, name);
         if (!gop.found_existing) {
             gop.value_ptr.* = .{ .name = name };
         }
         var key_it = src_sec.keys.iterator();
         while (key_it.next()) |kv| {
+            const key = if (condition) |q| try std.fmt.allocPrint(arena, "{s}{s}", .{ kv.key_ptr.*, original_name[q..] }) else kv.key_ptr.*;
             if (gop.value_ptr.keys.count() >= max_keys_per_section and
-                gop.value_ptr.keys.get(kv.key_ptr.*) == null)
+                gop.value_ptr.keys.get(key) == null)
             {
                 return error.TooManyKeysInSection;
             }
-            try gop.value_ptr.keys.put(arena, kv.key_ptr.*, kv.value_ptr.*);
+            if (!std.mem.eql(u8, name, "DEFAULT")) {
+                if (rawGet(gop.value_ptr, key)) |previous| try gop.value_ptr.previous.put(arena, key, previous);
+            }
+            try gop.value_ptr.keys.put(arena, key, kv.value_ptr.*);
+            if (src_sec.origins.get(kv.key_ptr.*)) |origin| try gop.value_ptr.origins.put(arena, key, origin);
         }
     }
 
+    try base.assignments.appendSlice(arena, override.assignments.items);
     for (override.warnings.items) |w| {
         try base.warnings.append(arena, w);
     }
 }
 
 pub fn loadJailConfig(arena: std.mem.Allocator, source_dir: []const u8) Error!ParsedIni {
+    return loadConfig(arena, source_dir, "jail");
+}
+
+pub fn loadConfig(arena: std.mem.Allocator, source_dir: []const u8, stem: []const u8) Error!ParsedIni {
     var result = ParsedIni{};
-
-    if (try readOptionalFile(arena, source_dir, "jail.conf")) |bytes| {
-        const parsed = try parseIniSource(arena, "jail.conf", bytes);
-        try mergeInto(arena, &result, parsed);
-    }
-
-    if (try readOptionalFile(arena, source_dir, "jail.local")) |bytes| {
-        const parsed = try parseIniSource(arena, "jail.local", bytes);
-        try mergeInto(arena, &result, parsed);
-    }
-
-    const jail_d = try std.fs.path.join(arena, &[_][]const u8{ source_dir, "jail.d" });
-    if (openOptionalDir(jail_d)) |maybe_dir| {
-        if (maybe_dir) |handle| {
+    var files = std.ArrayListUnmanaged([]const u8){};
+    const drop_dir = try std.fmt.allocPrint(arena, "{s}.d", .{stem});
+    for ([_][]const u8{ ".conf", ".local" }) |extension| {
+        try files.append(arena, try std.fmt.allocPrint(arena, "{s}{s}", .{ stem, extension }));
+        const full_dir = try std.fs.path.join(arena, &.{ source_dir, drop_dir });
+        if (try openOptionalDir(full_dir)) |handle| {
             var dir = handle;
             defer dir.close();
-            const entries = try collectConfFiles(arena, &dir);
-            for (entries) |name| {
-                const sub_path = try std.fs.path.join(arena, &[_][]const u8{ "jail.d", name });
-                const rel = try std.fs.path.join(arena, &[_][]const u8{ source_dir, "jail.d", name });
-                const bytes = (try readOptionalFile(arena, source_dir, sub_path)) orelse {
-                    _ = rel;
-                    continue;
-                };
-                const parsed = try parseIniSource(arena, sub_path, bytes);
-                try mergeInto(arena, &result, parsed);
-            }
+            for (try collectConfigFiles(arena, &dir, extension)) |name| try files.append(arena, try std.fs.path.join(arena, &.{ drop_dir, name }));
         }
-    } else |err| return err;
-
+    }
+    var stack = std.ArrayListUnmanaged([]const u8){};
+    for (files.items) |path| try loadOccurrence(arena, &result, source_dir, path, files.items, &stack, .layer);
     try interpolate(arena, &result);
     return result;
+}
+
+fn loadOccurrence(arena: std.mem.Allocator, result: *ParsedIni, root: []const u8, path: []const u8, top: []const []const u8, stack: *std.ArrayListUnmanaged([]const u8), source_edge: SourceEdge) Error!void {
+    const full = if (std.fs.path.isAbsolute(path)) try std.fs.path.resolve(arena, &.{path}) else try std.fs.path.resolve(arena, &.{ root, path });
+    for (stack.items) |ancestor| if (std.mem.eql(u8, ancestor, full)) {
+        try appendWarning(arena, result, full, 0, "include cycle skipped");
+        return;
+    };
+    if (stack.items.len >= 64) return error.IncludeDepthExceeded;
+    const bytes = (try readOptionalFile(arena, "", full)) orelse {
+        try loadAdjacentLocal(arena, result, root, full, top, stack);
+        return;
+    };
+    const target = std.fs.cwd().realpathAlloc(arena, full) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.AccessDenied => return error.AccessDenied,
+        else => return error.ReadFailed,
+    };
+    if (result.sources.items.len >= max_files_per_dir) return error.TooManyFiles;
+    try stack.append(arena, full);
+    defer _ = stack.pop();
+    var parsed = try parseIniSource(arena, full, bytes);
+    for ([_][]const u8{ "before", "after" }) |edge| {
+        if (std.mem.eql(u8, edge, "after")) {
+            try mergeInto(arena, result, parsed);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+            try result.sources.append(arena, .{ .edge = source_edge, .original_path = path, .resolved_target = target, .parent_path = if (stack.items.len > 1) stack.items[stack.items.len - 2] else null, .path = full, .bytes = bytes, .sha256 = digest });
+        }
+        if (try resolve(arena, &parsed, "INCLUDES", edge)) |value| {
+            var lines = std.mem.splitScalar(u8, value, '\n');
+            while (lines.next()) |line| {
+                const include = std.mem.trim(u8, line, " \t");
+                if (include.len == 0) continue;
+                try loadOccurrence(arena, result, std.fs.path.dirname(full).?, include, &.{}, stack, if (std.mem.eql(u8, edge, "before")) .before else .after);
+            }
+        }
+    }
+    try loadAdjacentLocal(arena, result, root, full, top, stack);
+}
+
+fn loadAdjacentLocal(arena: std.mem.Allocator, result: *ParsedIni, root: []const u8, full: []const u8, top: []const []const u8, stack: *std.ArrayListUnmanaged([]const u8)) Error!void {
+    if (!std.mem.endsWith(u8, full, ".local")) {
+        const ext = std.fs.path.extension(full);
+        const local = try std.fmt.allocPrint(arena, "{s}.local", .{full[0 .. full.len - ext.len]});
+        var listed = false;
+        for (top) |entry| {
+            const candidate = try std.fs.path.resolve(arena, &.{ root, entry });
+            if (std.mem.eql(u8, candidate, local)) {
+                listed = true;
+                break;
+            }
+        }
+        if (!listed) try loadOccurrence(arena, result, "", local, &.{}, stack, .local);
+    }
 }
 
 fn readOptionalFile(
@@ -449,14 +528,14 @@ fn openOptionalDir(path: []const u8) Error!?std.fs.Dir {
     return dir;
 }
 
-fn collectConfFiles(arena: std.mem.Allocator, dir: *std.fs.Dir) Error![]const []const u8 {
+fn collectConfigFiles(arena: std.mem.Allocator, dir: *std.fs.Dir, extension: []const u8) Error![]const []const u8 {
     var list = std.ArrayListUnmanaged([]const u8){};
     errdefer list.deinit(arena);
 
     var it = dir.iterate();
     while (it.next() catch return error.ReadFailed) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".conf")) continue;
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+        if (!std.mem.endsWith(u8, entry.name, extension)) continue;
         if (list.items.len >= max_files_per_dir) return error.TooManyFiles;
         const name_copy = try arena.dupe(u8, entry.name);
         try list.append(arena, name_copy);
@@ -985,7 +1064,7 @@ test "fail2ban: parse DEFAULT interpolation" {
         \\
         \\[sshd]
         \\enabled = true
-        \\bantime = %(bantime)s
+        \\bantime = %(default/bantime)s
         \\custom = ban=%(bantime)s find=%(findtime)s
     ;
     var ini = try parseIniSource(arena.allocator(), "test", src);
@@ -1039,7 +1118,7 @@ test "fail2ban: realistic jail.conf snippet" {
         \\filter = sshd
         \\logpath = /var/log/auth.log
         \\maxretry = 3
-        \\bantime = %(bantime)s
+        \\bantime = %(default/bantime)s
         \\
         \\[nginx-http-auth]
         \\enabled = true
@@ -1315,4 +1394,577 @@ test "fail2ban: mapActionNameToBackend direct" {
     try testing.expectEqual(ActionBackend.ipset, mapActionNameToBackend("ipset-proto6-allports"));
     try testing.expectEqual(ActionBackend.log_only, mapActionNameToBackend("sendmail"));
     try testing.expectEqual(ActionBackend.log_only, mapActionNameToBackend("route"));
+}
+
+test "p2 config layers includes previous values and provenance" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makeDir("jail.d");
+    try tmp.dir.writeFile(.{ .sub_path = "base.conf", .data = "[sample]\nmaxretry=2\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "jail.conf", .data = "[INCLUDES]\nbefore=base.conf\n[sample]\nvalue=base\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "jail.d/10.conf", .data = "[sample]\nmaxretry=3\nvalue=%(known/value)s-conf\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "jail.local", .data = "[sample]\nmaxretry=7\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "jail.d/20.local", .data = "[sample]\nmaxretry=9\nempty=\ncustom=x\n" });
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try tmp.dir.realpathAlloc(a, ".");
+    var ini = try loadJailConfig(a, path);
+    const sec = ini.section("sample").?;
+    try testing.expectEqualStrings("9", sec.get("maxretry").?);
+    try testing.expectEqualStrings("base-conf", sec.get("value").?);
+    try testing.expectEqualStrings("", sec.get("empty").?);
+    try testing.expect(sec.get("absent") == null);
+    try testing.expectEqual(@as(usize, 5), ini.sources.items.len);
+    try testing.expectEqual(@as(u32, 2), sec.origins.get("maxretry").?.line);
+    try testing.expect(std.mem.endsWith(u8, sec.origins.get("maxretry").?.source, "20.local"));
+    try testing.expectEqualStrings("7", sec.previous.get("maxretry").?); // previous is updated only when overwritten
+}
+
+test "p2 config after and included local order" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "jail.conf", .data = "[INCLUDES]\nafter=extra.conf\n[sample]\nmaxretry=2\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "extra.conf", .data = "[sample]\nmaxretry=8\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "extra.local", .data = "[sample]\nmaxretry=9\n" });
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ini = try loadJailConfig(arena.allocator(), try tmp.dir.realpathAlloc(arena.allocator(), "."));
+    try testing.expectEqualStrings("9", ini.section("sample").?.get("maxretry").?);
+}
+
+test "p2 config raw interpolation preserves context and repeated percent escapes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ini = try parseIniSource(a, "fixture", "[DEFAULT]\nword=base\nexpr=%(word)s\n[One]\nword=local\nvalue=%(expr)s %% %(other/text)s %(__name__)s\n[other]\ntext=other\n");
+    try interpolate(a, &ini);
+    try testing.expectEqualStrings("local % other One", ini.section("One").?.get("value").?);
+    try interpolate(a, &ini);
+    try testing.expectEqualStrings("local % other One", ini.section("One").?.get("value").?);
+    try testing.expectEqualStrings("%(expr)s %% %(other/text)s %(__name__)s", ini.section("One").?.origins.get("value").?.raw);
+}
+
+test "p2 config missing interpolation remains explicit error and source diagnostic" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ini = try parseIniSource(a, "fixture", "[x]\nMAXRETRY=%(missing)s ; comment\n");
+    try testing.expectError(error.InterpolationMissingOption, resolve(a, &ini, "x", "maxretry"));
+    try interpolate(a, &ini);
+    try testing.expectEqual(@as(u32, 2), ini.warnings.items[0].line);
+    try testing.expectEqualStrings("fixture", ini.warnings.items[0].source);
+}
+
+/// Open selector parameters remain strings until their consumer converts them.
+/// Commas inside quoted values and nested brackets do not split parameters.
+pub const Selector = struct {
+    name: []const u8,
+    parameters: std.StringArrayHashMapUnmanaged([]const u8) = .{},
+};
+
+/// Parse an asset name followed by ordered parameter groups. Repeated keys in
+/// later groups replace earlier values, including conditional parameter names.
+pub fn parseSelector(arena: std.mem.Allocator, input: []const u8) Error!Selector {
+    const text = std.mem.trim(u8, input, " \t\r\n");
+    const open = std.mem.indexOfScalar(u8, text, '[') orelse {
+        if (text.len == 0) return error.InvalidParameter;
+        return .{ .name = try arena.dupe(u8, text) };
+    };
+    const name = std.mem.trim(u8, text[0..open], " \t\r\n");
+    if (name.len == 0) return error.InvalidParameter;
+    var result = Selector{ .name = try arena.dupe(u8, name) };
+    var i = open;
+    while (i < text.len) {
+        while (i < text.len and std.ascii.isWhitespace(text[i])) : (i += 1) {}
+        if (i == text.len) break;
+        if (text[i] != '[') return error.InvalidParameter;
+        i += 1;
+        while (true) {
+            while (i < text.len and std.ascii.isWhitespace(text[i])) : (i += 1) {}
+            if (i == text.len) return error.InvalidParameter;
+            if (text[i] == ']') {
+                i += 1;
+                break;
+            }
+            const key_start = i;
+            while (i < text.len and text[i] != '=' and text[i] != ',' and text[i] != ']') : (i += 1) {}
+            if (i == text.len or text[i] != '=') return error.InvalidParameter;
+            // The first '=' belongs to a conditional key such as n?family=inet6.
+            if (std.mem.indexOfScalar(u8, text[key_start..i], '?') != null) {
+                i += 1;
+                while (i < text.len and text[i] != '=' and text[i] != ',' and text[i] != ']') : (i += 1) {}
+                if (i == text.len or text[i] != '=') return error.InvalidParameter;
+            }
+            const key = std.mem.trim(u8, text[key_start..i], " \t\r\n");
+            if (key.len == 0) return error.InvalidParameter;
+            i += 1;
+            while (i < text.len and std.ascii.isWhitespace(text[i])) : (i += 1) {}
+            var value: []const u8 = undefined;
+            if (i < text.len and (text[i] == '\'' or text[i] == '"')) {
+                const quote = text[i];
+                i += 1;
+                const value_start = i;
+                while (i < text.len and text[i] != quote) : (i += 1) {}
+                if (i == text.len) return error.InvalidParameter;
+                value = std.mem.trim(u8, text[value_start..i], " \t\r\n");
+                i += 1;
+                while (i < text.len and std.ascii.isWhitespace(text[i])) : (i += 1) {}
+            } else {
+                const value_start = i;
+                while (i < text.len and text[i] != ',' and text[i] != ']') : (i += 1) {}
+                value = std.mem.trim(u8, text[value_start..i], " \t\r\n");
+            }
+            if (i == text.len or (text[i] != ',' and text[i] != ']')) return error.InvalidParameter;
+            if (result.parameters.count() >= max_keys_per_section and !result.parameters.contains(key)) return error.TooManyKeysInSection;
+            try result.parameters.put(arena, try arena.dupe(u8, key), try arena.dupe(u8, value));
+            if (text[i] == ',') i += 1;
+        }
+    }
+    return result;
+}
+
+/// Ordered action instances: whitespace separates instances only outside brackets
+/// and quotes. The asset parser remains responsible for parameter syntax.
+pub fn splitSelectors(arena: std.mem.Allocator, input: []const u8) Error![]const []const u8 {
+    var result = std.ArrayListUnmanaged([]const u8){};
+    var start: usize = 0;
+    var depth: usize = 0;
+    var quote: u8 = 0;
+    var i: usize = 0;
+    while (i < input.len) : (i += 1) {
+        const c = input[i];
+        if (quote != 0) {
+            if (c == quote) quote = 0;
+            continue;
+        }
+        if (depth > 0 and (c == '\'' or c == '"')) {
+            quote = c;
+            continue;
+        }
+        if (c == '[') depth += 1;
+        if (c == ']') {
+            if (depth == 0) return error.InvalidParameter;
+            depth -= 1;
+        }
+        if (depth == 0 and std.ascii.isWhitespace(c)) {
+            var next = i;
+            while (next < input.len and std.ascii.isWhitespace(input[next])) : (next += 1) {}
+            if (next < input.len and input[next] == '[') continue;
+            const selection = std.mem.trim(u8, input[start..i], " \t\r\n");
+            if (selection.len > 0) try result.append(arena, selection);
+            start = next;
+            i = if (next == 0) 0 else next - 1;
+        }
+    }
+    if (depth != 0 or quote != 0) return error.InvalidParameter;
+    const selection = std.mem.trim(u8, input[start..], " \t\r\n");
+    if (selection.len > 0) try result.append(arena, selection);
+    return try result.toOwnedSlice(arena);
+}
+
+pub const ParameterizedAsset = struct {
+    selector: Selector,
+    config: ParsedIni,
+    // This is a lossless preparation view. Runtime tags and conditional branches
+    // stay explicit; admitting/executing a filter/action belongs to its consumer.
+    definition: std.StringArrayHashMapUnmanaged([]const u8) = .{},
+    init: std.StringArrayHashMapUnmanaged([]const u8) = .{},
+};
+
+pub fn loadParameterizedAsset(arena: std.mem.Allocator, root: []const u8, directory: []const u8, input: []const u8) Error!ParameterizedAsset {
+    const selector = try parseSelector(arena, input);
+    const stem = try std.fs.path.join(arena, &.{ directory, selector.name });
+    var asset = ParameterizedAsset{ .selector = selector, .config = try loadConfig(arena, root, stem) };
+    if (asset.config.section("DEFAULT")) |sec| {
+        var it = sec.keys.iterator();
+        while (it.next()) |kv| try asset.definition.put(arena, kv.key_ptr.*, (resolveWithParameters(arena, &asset.config, "Definition", kv.key_ptr.*, &selector.parameters) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        }) orelse kv.value_ptr.*);
+    }
+    if (asset.config.section("Definition")) |sec| {
+        var it = sec.keys.iterator();
+        while (it.next()) |kv| try asset.definition.put(arena, kv.key_ptr.*, (resolveWithParameters(arena, &asset.config, "Definition", kv.key_ptr.*, &selector.parameters) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        }) orelse kv.value_ptr.*);
+    }
+    if (asset.config.section("Init")) |sec| {
+        var it = sec.keys.iterator();
+        while (it.next()) |kv| {
+            const selected = if (std.mem.indexOfScalar(u8, kv.key_ptr.*, '?')) |q| selector.parameters.get(kv.key_ptr.*[0..q]) orelse kv.value_ptr.* else kv.value_ptr.*;
+            try asset.init.put(arena, kv.key_ptr.*, selected);
+            if (!std.mem.startsWith(u8, kv.key_ptr.*, "known/")) try asset.init.put(arena, try std.fmt.allocPrint(arena, "known/{s}", .{kv.key_ptr.*}), kv.value_ptr.*);
+        }
+    }
+    var params = selector.parameters.iterator();
+    while (params.next()) |kv| try asset.init.put(arena, kv.key_ptr.*, kv.value_ptr.*);
+    return asset;
+}
+
+test "p2 config selectors preserve open empty and quoted nested parameters" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var selector = try parseSelector(arena.allocator(), "custom[mode=aggressive, opaque='a,b', empty=, list='[x,y]']");
+    try testing.expectEqualStrings("custom", selector.name);
+    try testing.expectEqualStrings("a,b", selector.parameters.get("opaque").?);
+    try testing.expectEqualStrings("", selector.parameters.get("empty").?);
+    try testing.expectEqualStrings("[x,y]", selector.parameters.get("list").?);
+    try testing.expectError(error.InvalidParameter, parseSelector(arena.allocator(), "custom[x='broken]"));
+    try testing.expectError(error.InvalidParameter, parseSelector(arena.allocator(), "custom[list=[x,y]]"));
+}
+
+test "p2 config self interpolation is a cycle not default inheritance" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ini = try parseIniSource(a, "fixture", "[DEFAULT]\nx=5\n[jail]\nx=%(x)s\n");
+    try testing.expectError(error.InterpolationCycle, resolve(a, &ini, "jail", "x"));
+}
+
+pub fn resolveWithParameters(arena: std.mem.Allocator, ini: *const ParsedIni, section_name: []const u8, key: []const u8, parameters: *const std.StringArrayHashMapUnmanaged([]const u8)) Error!?[]const u8 {
+    var view = ini.*;
+    view.sections = try ini.sections.clone(arena);
+    const section = view.sections.getPtr(section_name) orelse return null;
+    section.keys = try section.keys.clone(arena);
+    section.origins = try section.origins.clone(arena);
+    var params = parameters.iterator();
+    while (params.next()) |kv| {
+        try section.keys.put(arena, kv.key_ptr.*, kv.value_ptr.*);
+        try section.origins.put(arena, kv.key_ptr.*, .{ .source = "selector", .line = 0, .raw = kv.value_ptr.* });
+    }
+    return resolve(arena, &view, section_name, key);
+}
+
+/// Returns static parameter expansion only. Unknown tags are preserved exactly:
+/// event tags and executable custom getters must be handled by later consumers.
+pub fn combineAsset(arena: std.mem.Allocator, asset: *const ParameterizedAsset, condition: []const u8) Error!std.StringArrayHashMapUnmanaged([]const u8) {
+    var combined = try asset.definition.clone(arena);
+    var init = asset.init.iterator();
+    while (init.next()) |kv| try combined.put(arena, kv.key_ptr.*, kv.value_ptr.*);
+    const output_count = combined.count();
+    // Include section-qualified helpers for the reader's late getCombOption
+    // fallback without invoking custom getters or touching external resources.
+    var sections = asset.config.sections.iterator();
+    while (sections.next()) |section| {
+        var keys = section.value_ptr.keys.iterator();
+        while (keys.next()) |kv| {
+            const qualified = try std.fmt.allocPrint(arena, "{s}/{s}", .{ section.key_ptr.*, kv.key_ptr.* });
+            if (!combined.contains(qualified)) try combined.put(arena, qualified, kv.value_ptr.*);
+        }
+    }
+    var out = std.StringArrayHashMapUnmanaged([]const u8){};
+    var it = combined.iterator();
+    var index: usize = 0;
+    while (it.next()) |kv| {
+        if (index == output_count) break;
+        index += 1;
+        const value = try expandTags(arena, &combined, kv.value_ptr.*, condition, 0);
+        try out.put(arena, kv.key_ptr.*, value);
+    }
+    return out;
+}
+
+fn expandTags(arena: std.mem.Allocator, values: *const std.StringArrayHashMapUnmanaged([]const u8), raw: []const u8, condition: []const u8, depth: usize) Error![]const u8 {
+    if (depth >= 64) return error.InterpolationCycle;
+    var out = std.ArrayListUnmanaged(u8){};
+    var i: usize = 0;
+    while (i < raw.len) {
+        if (raw[i] == '<') {
+            if (std.mem.indexOfScalarPos(u8, raw, i + 1, '>')) |close| {
+                const name = raw[i + 1 .. close];
+                var replacement: ?[]const u8 = null;
+                if (condition.len > 0) {
+                    replacement = values.get(try std.fmt.allocPrint(arena, "{s}?{s}", .{ name, condition }));
+                } else {
+                    // A conditional base is deferred until the runtime family is known.
+                    var keys = values.iterator();
+                    var deferred = false;
+                    while (keys.next()) |kv| {
+                        if (kv.key_ptr.len > name.len and std.mem.startsWith(u8, kv.key_ptr.*, name) and kv.key_ptr.*[name.len] == '?') {
+                            deferred = true;
+                            break;
+                        }
+                    }
+                    if (deferred) {
+                        try out.appendSlice(arena, raw[i .. close + 1]);
+                        i = close + 1;
+                        continue;
+                    }
+                }
+                if (replacement == null) replacement = values.get(name);
+                if (replacement) |value| {
+                    try out.appendSlice(arena, try expandTags(arena, values, value, condition, depth + 1));
+                    i = close + 1;
+                    if (out.items.len > max_value_bytes) return error.InterpolationOverflow;
+                    continue;
+                }
+            }
+        }
+        try out.append(arena, raw[i]);
+        i += 1;
+        if (out.items.len > max_value_bytes) return error.InterpolationOverflow;
+    }
+    const expanded = try out.toOwnedSlice(arena);
+    // Resolve tags assembled by adjacent substitutions as well as nested tags.
+    if (!std.mem.eql(u8, raw, expanded) and std.mem.indexOfScalar(u8, expanded, '<') != null) return expandTags(arena, values, expanded, condition, depth + 1);
+    return expanded;
+}
+
+test "p2 config static tags conditional deferral and cycles" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var values = std.StringArrayHashMapUnmanaged([]const u8){};
+    try values.put(a, "mode", "normal");
+    try values.put(a, "nested", "<mode>");
+    try values.put(a, "family", "v4");
+    try values.put(a, "family?family=inet6", "v6");
+    try testing.expectEqualStrings("normal <family> <HOST>", try expandTags(a, &values, "<nested> <family> <HOST>", "", 0));
+    try testing.expectEqualStrings("normal v6 <HOST>", try expandTags(a, &values, "<nested> <family> <HOST>", "family=inet6", 0));
+    try values.put(a, "loop", "<loop>");
+    try testing.expectError(error.InterpolationCycle, expandTags(a, &values, "<loop>", "", 0));
+}
+
+test "p2 config selector precedence applies before percent interpolation" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ini = try parseIniSource(a, "fixture", "[Definition]\nmode=normal\nresult=%(mode)s\n");
+    var params = std.StringArrayHashMapUnmanaged([]const u8){};
+    try params.put(a, "mode", "custom");
+    try testing.expectEqualStrings("custom", (try resolveWithParameters(a, &ini, "Definition", "result", &params)).?);
+    try testing.expectEqualStrings("normal", (try resolve(a, &ini, "Definition", "result")).?);
+}
+
+pub const CanonicalType = enum { string, integer, boolean };
+pub const CanonicalValue = union(enum) { null_value, string: []const u8, integer: []const u8, boolean: bool };
+pub const ResolvedOption = struct {
+    presence: enum { absent, explicit, derived },
+    resolution: enum { resolved, reference_fallback },
+    value_type: CanonicalType,
+    raw: ?[]const u8,
+    value: CanonicalValue,
+    origin: ?Origin,
+    default_identity: []const u8,
+};
+
+/// Consumer defaults are explicit arguments, because early/global and jail phases
+/// have different defaults. Arbitrary-sized integers use canonical decimal text;
+/// narrowing to a runtime integer remains an explicit consumer admission step.
+pub fn readTypedOption(arena: std.mem.Allocator, ini: *const ParsedIni, section_name: []const u8, key: []const u8, value_type: CanonicalType, fallback: CanonicalValue, default_identity: []const u8) Error!ResolvedOption {
+    const local = ini.section(section_name);
+    const def = ini.section("DEFAULT");
+    const own = if (local) |sec| sec.origins.get(key) else null;
+    const inherited = if (def) |sec| sec.origins.get(key) else null;
+    const origin = own orelse inherited;
+    const value = try resolve(arena, ini, section_name, key);
+    var result = ResolvedOption{ .presence = if (own != null) .explicit else if (inherited != null) .derived else .absent, .resolution = .resolved, .value_type = value_type, .raw = if (origin) |o| o.raw else null, .value = fallback, .origin = origin, .default_identity = default_identity };
+    const raw = value orelse return result;
+    switch (value_type) {
+        .string => result.value = .{ .string = raw },
+        .boolean => {
+            const lower = try std.ascii.allocLowerString(arena, raw);
+            // ConfigReader uses helpers._as_bool, not ConfigParser.getboolean.
+            result.value = .{ .boolean = std.mem.eql(u8, lower, "1") or std.mem.eql(u8, lower, "yes") or std.mem.eql(u8, lower, "true") or std.mem.eql(u8, lower, "on") };
+        },
+        .integer => {
+            if (try canonicalInteger(arena, raw)) |integer| result.value = .{ .integer = integer } else result.resolution = .reference_fallback;
+        },
+    }
+    return result;
+}
+
+pub fn canonicalInteger(arena: std.mem.Allocator, raw: []const u8) Error!?[]const u8 {
+    const ascii = (try normalizeInteger(arena, raw)) orelse return null;
+    const text = std.mem.trim(u8, ascii, " \t\r\n\x0b\x0c");
+    if (text.len == 0) return null;
+    var i: usize = 0;
+    const negative = text[0] == '-';
+    if (negative or text[0] == '+') i += 1;
+    if (i == text.len) return null;
+    var digits = std.ArrayListUnmanaged(u8){};
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (c == '_') {
+            if (i == 0 or i + 1 >= text.len or !std.ascii.isDigit(text[i - 1]) or !std.ascii.isDigit(text[i + 1])) return null;
+            continue;
+        }
+        if (!std.ascii.isDigit(c)) return null;
+        try digits.append(arena, c);
+    }
+    var first: usize = 0;
+    while (first + 1 < digits.items.len and digits.items[first] == '0') : (first += 1) {}
+    if (negative and !(digits.items.len - first == 1 and digits.items[first] == '0')) return try std.fmt.allocPrint(arena, "-{s}", .{digits.items[first..]});
+    return try arena.dupe(u8, digits.items[first..]);
+}
+
+test "p2 config conversion distinguishes empty missing inherited and fallback" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ini = try parseIniSource(a, "fixture", "[DEFAULT]\nflag=yes\n[x]\nempty=\nbad=perhaps\nhuge=+000123456789012345678901234567890\n");
+    const empty = try readTypedOption(a, &ini, "x", "empty", .string, .null_value, "test");
+    try testing.expectEqual(.explicit, empty.presence);
+    try testing.expectEqualStrings("", empty.value.string);
+    const missing = try readTypedOption(a, &ini, "x", "missing", .string, .null_value, "test");
+    try testing.expectEqual(.absent, missing.presence);
+    const inherited = try readTypedOption(a, &ini, "x", "flag", .boolean, .null_value, "test");
+    try testing.expectEqual(.derived, inherited.presence);
+    try testing.expect(inherited.value.boolean);
+    const bad = try readTypedOption(a, &ini, "x", "bad", .boolean, .null_value, "test");
+    try testing.expectEqual(.resolved, bad.resolution);
+    try testing.expect(!bad.value.boolean);
+    const huge = try readTypedOption(a, &ini, "x", "huge", .integer, .null_value, "test");
+    try testing.expectEqualStrings("123456789012345678901234567890", huge.value.integer);
+}
+
+test "p2 config syntax failures and indented assignments are explicit" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectError(error.DuplicateOption, parseIniSource(a, "fixture", "[x]\nA=1\na=2\n"));
+    try testing.expectError(error.DuplicateSection, parseIniSource(a, "fixture", "[x]\na=1\n[x]\nb=2\n"));
+    try testing.expectError(error.KeyWithoutValue, parseIniSource(a, "fixture", "[x]\ninvalid\n"));
+    try testing.expectError(error.InvalidEncoding, parseIniSource(a, "fixture", "[x]\na=\xff\n"));
+    var ini = try parseIniSource(a, "fixture", " [x]\n a=one\n   continued ; ignored\n b=two\n");
+    try testing.expectEqualStrings("one\ncontinued", ini.section("x").?.get("a").?);
+    try testing.expectEqualStrings("two", ini.section("x").?.get("b").?);
+}
+
+pub const ConfigDocument = struct {
+    schema_version: u32 = 1,
+    reference_profile: []const u8 = "fail2ban-1.1.1",
+    config_generation: [32]u8,
+    source: ParsedIni,
+};
+
+/// Source preparation is immutable to consumers: updates create a fresh document.
+/// Generation identity binds ordered occurrences, paths, edge roles and byte hashes.
+pub fn prepareConfigDocument(arena: std.mem.Allocator, root: []const u8, stem: []const u8) Error!ConfigDocument {
+    const source = try loadConfig(arena, root, stem);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("fail2zig-config-source-v1\x00fail2ban-1.1.1\x00");
+    for (source.sources.items) |occurrence| {
+        var size: [8]u8 = undefined;
+        std.mem.writeInt(u64, &size, @intCast(occurrence.path.len), .little);
+        hash.update(&size);
+        hash.update(occurrence.path);
+        std.mem.writeInt(u64, &size, @intCast(occurrence.resolved_target.len), .little);
+        hash.update(&size);
+        hash.update(occurrence.resolved_target);
+        hash.update(&.{@intFromEnum(occurrence.edge)});
+        hash.update(&occurrence.sha256);
+    }
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return .{ .source = source, .config_generation = digest };
+}
+
+// Unicode 15.1 Nd blocks, matching the pinned Python 3.13 reference profile.
+// This table normalizes numeric configuration only, not log text or regex input.
+fn normalizeInteger(arena: std.mem.Allocator, raw: []const u8) Error!?[]const u8 {
+    const zeroes = [_]u21{ 0x30, 0x660, 0x6f0, 0x7c0, 0x966, 0x9e6, 0xa66, 0xae6, 0xb66, 0xbe6, 0xc66, 0xce6, 0xd66, 0xde6, 0xe50, 0xed0, 0xf20, 0x1040, 0x1090, 0x17e0, 0x1810, 0x1946, 0x19d0, 0x1a80, 0x1a90, 0x1b50, 0x1bb0, 0x1c40, 0x1c50, 0xa620, 0xa8d0, 0xa900, 0xa9d0, 0xa9f0, 0xaa50, 0xabf0, 0xff10, 0x104a0, 0x10d30, 0x11066, 0x110f0, 0x11136, 0x111d0, 0x112f0, 0x11450, 0x114d0, 0x11650, 0x116c0, 0x11730, 0x118e0, 0x11950, 0x11c50, 0x11d50, 0x11da0, 0x11f50, 0x16a60, 0x16ac0, 0x16b50, 0x1d7ce, 0x1d7d8, 0x1d7e2, 0x1d7ec, 0x1d7f6, 0x1e140, 0x1e2f0, 0x1e4f0, 0x1e950, 0x1fbf0 };
+    const view = std.unicode.Utf8View.init(raw) catch return null;
+    var iter = view.iterator();
+    var out = std.ArrayListUnmanaged(u8){};
+    while (iter.nextCodepoint()) |cp| {
+        if (cp < 128) {
+            try out.append(arena, @intCast(cp));
+            continue;
+        }
+        if (cp == 0x85 or cp == 0xa0 or cp == 0x1680 or (cp >= 0x2000 and cp <= 0x200a) or cp == 0x2028 or cp == 0x2029 or cp == 0x202f or cp == 0x205f or cp == 0x3000) {
+            try out.append(arena, ' ');
+            continue;
+        }
+        var found = false;
+        for (zeroes) |zero| {
+            if (cp >= zero and cp < zero + 10) {
+                try out.append(arena, @as(u8, @intCast(cp - zero)) + '0');
+                found = true;
+                break;
+            }
+        }
+        if (!found) return null;
+    }
+    return try out.toOwnedSlice(arena);
+}
+
+test "p2 config integer unicode decimal profile and separator validation" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings("123", (try canonicalInteger(a, "\u{2003}+٠١_٢٣\u{a0}")).?);
+    try testing.expect((try canonicalInteger(a, "1__2")) == null);
+    try testing.expect((try canonicalInteger(a, "_12")) == null);
+    try testing.expect((try canonicalInteger(a, "12_")) == null);
+    try testing.expect((try canonicalInteger(a, "²")) == null);
+}
+
+test "p2 config symlink retargeting changes generation with identical content" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "one.conf", .data = "[probe]\nx=one\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "two.conf", .data = "[probe]\nx=one\n" });
+    try tmp.dir.symLink("one.conf", "jail.conf", .{});
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realpathAlloc(a, ".");
+    const before = try prepareConfigDocument(a, root, "jail");
+    try tmp.dir.deleteFile("jail.conf");
+    try tmp.dir.symLink("two.conf", "jail.conf", .{});
+    const after = try prepareConfigDocument(a, root, "jail");
+    try testing.expect(!std.mem.eql(u8, &before.config_generation, &after.config_generation));
+    try testing.expectEqualStrings(before.source.sources.items[0].bytes, after.source.sources.items[0].bytes);
+    try testing.expect(!std.mem.eql(u8, before.source.sources.items[0].resolved_target, after.source.sources.items[0].resolved_target));
+}
+
+test "p2 selectors preserve multiline groups ordered actions and conditional keys" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const values = try splitSelectors(a, "first[a=' one ',b=two][a=last,\nx?family=inet6=value]\nsecond[port='80,443']");
+    try testing.expectEqual(@as(usize, 2), values.len);
+    const first = try parseSelector(a, values[0]);
+    try testing.expectEqualStrings("first", first.name);
+    try testing.expectEqualStrings("last", first.parameters.get("a").?);
+    try testing.expectEqualStrings("value", first.parameters.get("x?family=inet6").?);
+    const second = try parseSelector(a, values[1]);
+    try testing.expectEqualStrings("80,443", second.parameters.get("port").?);
+    const quoted = try parseSelector(a, "original[value=' trimmed ']");
+    try testing.expectEqualStrings("trimmed", quoted.parameters.get("value").?);
+    try testing.expectError(error.InvalidParameter, parseSelector(a, "original[x='unterminated]"));
+    try testing.expectError(error.InvalidParameter, splitSelectors(a, "original[x=unfinished"));
+}
+
+test "p2 interpolation depth counts only recursive percent replacements" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]usize{ 9, 10, 11 }) |hops| {
+        for ([_][]const u8{ "literal", "100%%" }) |terminal| {
+            var bytes = std.ArrayList(u8).init(a);
+            try bytes.appendSlice("[probe]\n");
+            for (0..hops) |i| try bytes.writer().print("v{d}=%(v{d})s\n", .{ i, i + 1 });
+            try bytes.writer().print("v{d}={s}\n", .{ hops, terminal });
+            var parsed = try parseIniSource(a, "original-depth", bytes.items);
+            const limit: usize = if (std.mem.eql(u8, terminal, "literal")) 10 else 9;
+            if (hops <= limit) {
+                try testing.expectEqualStrings(if (terminal.len == 7) "literal" else "100%", (try resolve(a, &parsed, "probe", "v0")).?);
+            } else try testing.expectError(error.InterpolationCycle, resolve(a, &parsed, "probe", "v0"));
+        }
+    }
+}
+
+test "p2 section headers preserve spaces and accept greedy prefix match" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var parsed = try parseIniSource(a, "original-header", "[ probe ] trailing text\nv=one\n[other] ; ignored ]\nv=two\n[nested]suffix] trailing\nv=three\n");
+    try testing.expectEqualStrings("one", (try resolve(a, &parsed, " probe ", "v")).?);
+    try testing.expectEqualStrings("two", (try resolve(a, &parsed, "other", "v")).?);
+    try testing.expectEqualStrings("three", (try resolve(a, &parsed, "nested]suffix", "v")).?);
+    try testing.expectError(error.UnterminatedSection, parseIniSource(a, "original-header", "[bad ; ignored ]\nv=one\n"));
 }

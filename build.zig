@@ -72,6 +72,19 @@ pub fn build(b: *std.Build) void {
     const run_engine_tests = b.addRunArtifact(engine_tests);
     test_step.dependOn(&run_engine_tests.step);
 
+    // Full-profile foundations remain independently testable before daemon
+    // activation. These tests also participate in the ordinary test gate.
+    const parity_runtime_mod = b.createModule(.{
+        .root_source_file = b.path("engine/parity_runtime_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const parity_runtime_tests = b.addTest(.{ .root_module = parity_runtime_mod, .filters = test_filters });
+    const run_parity_runtime_tests = b.addRunArtifact(parity_runtime_tests);
+    test_step.dependOn(&run_parity_runtime_tests.step);
+    b.step("test-p2-runtime", "Test source, event-time and durable record foundations").dependOn(&run_parity_runtime_tests.step);
+
     const client_tests = b.addTest(.{
         .root_module = client_mod,
         .filters = test_filters,

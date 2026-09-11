@@ -4,11 +4,14 @@
 const std = @import("std");
 const shared = @import("shared");
 const filter_registry = @import("../filters/registry.zig");
+/// Includes protected preparation metadata; raw fail2ban INI files keep their own 1 MiB limit.
+pub const max_config_bytes: usize = 16 * 1024 * 1024;
 pub const max_supported_retry = @import("../core/state.zig").max_attempts_per_ip;
 pub const max_ban_duration: u64 = std.math.maxInt(u64) / 1000;
 
 pub const Error = error{
     FileNotFound,
+    FileTooLarge,
     AccessDenied,
     UnexpectedToken,
     UnterminatedString,
@@ -88,6 +91,9 @@ pub const BanTimeIncrement = struct {
 };
 
 pub const GlobalConfig = struct {
+    /// Protected preparation metadata; never interpreted as runtime commands.
+    compatibility_manifest: []const u8 = "",
+    compatibility_pending: bool = false,
     log_level: LogLevel = .info,
     pid_file: []const u8 = "/run/fail2zig/fail2zig.pid",
     socket_path: []const u8 = "/run/fail2zig/fail2zig.sock",
@@ -114,6 +120,7 @@ pub const JailDefaults = struct {
 };
 
 pub const JailConfig = struct {
+    compatibility_pending: bool = false,
     name: []const u8,
     enabled: bool = true,
     logpath: []const []const u8 = &.{},
@@ -215,9 +222,9 @@ pub const Config = struct {
             std.log.warn("config: {s} is owned by uid {d}, not root", .{ path, st.uid });
         }
 
-        const max_size: usize = 1024 * 1024;
-        const bytes = file.readToEndAlloc(arena, max_size) catch |err| return switch (err) {
+        const bytes = file.readToEndAlloc(arena, max_config_bytes) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
+            error.FileTooBig => error.FileTooLarge,
             else => error.ReadFailed,
         };
         return parseDiag(arena, bytes, out);
@@ -229,6 +236,7 @@ pub const Config = struct {
     }
 
     pub fn parseDiag(arena: std.mem.Allocator, source: []const u8, out: *Diagnostic) Error!Config {
+        if (source.len > max_config_bytes) return error.FileTooLarge;
         var p = Parser.init(arena, source);
         return p.parseConfig(out);
     }
@@ -239,6 +247,7 @@ pub const Config = struct {
 };
 
 pub const ValidationError = error{
+    CompatibilityNotAdmitted,
     InvalidBantime,
     InvalidFindtime,
     InvalidMaxretry,
@@ -291,6 +300,7 @@ pub fn validate(cfg: *const Config) ValidationError!void {
         }
 
         try validateIncrement(resolveJailFromConfig(&j, cfg.defaults).bantime_increment);
+        if (j.enabled and (j.compatibility_pending or cfg.global.compatibility_pending)) return error.CompatibilityNotAdmitted;
         if (j.enabled and filter_registry.matcherForFilter(j.filter) == null) {
             std.log.warn("config: jail '{s}' filter '{s}' has no builtin matcher", .{ j.name, j.filter });
             return error.UnknownFilter;
@@ -719,7 +729,13 @@ const Parser = struct {
 
     fn applyGlobalKey(self: *Parser, key: []const u8) Error!void {
         const v = try self.parseValue();
-        if (std.mem.eql(u8, key, "log_level")) {
+        if (std.mem.eql(u8, key, "compatibility_manifest")) {
+            const manifest = try asString(v);
+            _ = try decodeCompatibilityManifest(self.arena, manifest);
+            self.global.compatibility_manifest = manifest;
+        } else if (std.mem.eql(u8, key, "compatibility_pending")) {
+            self.global.compatibility_pending = try asBool(v);
+        } else if (std.mem.eql(u8, key, "log_level")) {
             const s = try asString(v);
             self.global.log_level = try parseLogLevel(s);
         } else if (std.mem.eql(u8, key, "pid_file")) {
@@ -814,7 +830,9 @@ const Parser = struct {
         const j = &self.jails.items[idx];
         const origin = &self.jail_source_origin.items[idx];
 
-        if (std.mem.eql(u8, key, "enabled")) {
+        if (std.mem.eql(u8, key, "compatibility_pending")) {
+            j.compatibility_pending = try asBool(v);
+        } else if (std.mem.eql(u8, key, "enabled")) {
             j.enabled = try asBool(v);
         } else if (std.mem.eql(u8, key, "filter")) {
             j.filter = try asString(v);
@@ -2065,4 +2083,41 @@ test "native: a single jail increment override inherits the other default fields
     try std.testing.expect(resolved.bantime_increment.enabled);
     try std.testing.expectEqual(@as(f64, 2), resolved.bantime_increment.multiplier);
     try std.testing.expectEqual(@as(f64, 1.5), resolved.bantime_increment.factor);
+}
+
+/// Decode metadata only. The schema explicitly represents a prepared, unadmitted
+/// graph and cannot grant permission to execute imported filters or actions.
+pub fn decodeCompatibilityManifest(arena: std.mem.Allocator, manifest: []const u8) Error!std.json.Value {
+    if (manifest.len > max_config_bytes) return error.FileTooLarge;
+    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, manifest, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidValue,
+    };
+    if (value != .object) return error.InvalidValue;
+    const version = value.object.get("schema_version") orelse return error.InvalidValue;
+    if (version != .integer or version.integer != 1) return error.InvalidValue;
+    const admission = value.object.get("admission") orelse return error.InvalidValue;
+    if (admission != .string or !std.mem.eql(u8, admission.string, "prepared")) return error.InvalidValue;
+    return value;
+}
+
+test "native preparation ceiling covers file parse and manifest entrypoints" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const oversized = try a.alloc(u8, max_config_bytes + 1);
+    @memset(oversized, ' ');
+    try std.testing.expectError(error.FileTooLarge, Config.parse(a, oversized));
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.FileTooLarge, Config.parseDiag(a, oversized, &diag));
+    try std.testing.expectError(error.FileTooLarge, decodeCompatibilityManifest(a, oversized));
+    // The exact bound remains admitted, proving the limit is not off by one.
+    _ = try Config.parse(a, oversized[0..max_config_bytes]);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile("oversized.toml", .{ .mode = 0o600 });
+    try file.writeAll(oversized);
+    file.close();
+    const path = try tmp.dir.realpathAlloc(a, "oversized.toml");
+    try std.testing.expectError(error.FileTooLarge, Config.loadFile(a, path));
 }

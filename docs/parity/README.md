@@ -1,43 +1,38 @@
-# Compatibility work and reference tests
+# Native replacement contracts and reference evidence
 
-Full fail2ban replacement and migration are under development. The reference is
-fail2ban 1.1.1, commit `f60978618a101427b06924fc932b44350fec2b63`.
-Current native filter names and successful configuration import do not establish
-equivalent behavior for modified filters, action scope, state or automation.
+Updated 2026-09-11. fail2ban informs operational completeness and supported migration;
+exact private APIs, Python behavior and universal catalog coverage are not product goals.
+The target is a Zig application, one delivered executable and **zero external runtime
+dependencies**, with upstream SQLite embedded statically and disclosed. This direction is
+not yet implemented throughout the current 0.3.1-dev checkout.
 
-The intended contract is equivalent effective configuration, detection, enforcement
-scope, administration and migration continuity on explicitly certified Linux profiles.
-Compatibility includes custom assets and retained state. Missing required behavior,
-silently skipped settings or unavailable profile evidence prevent certification.
+| Document | Purpose |
+|---|---|
+| [Current components](p2-components.md) | Actual importer/source/helper/storage seams and remaining integration limits |
+| [Configuration and commands](config-command-contract.md) | Faithful supported import, native validation/reload and administration |
+| [Runtime and storage](runtime-contract.md) | Bounded native processing, time/policy, embedded SQLite and recovery |
+| [Actions](action-contract.md) | Exact scope/ownership, typed effects and uncertainty reconciliation |
+| [Delivery/platforms](profile-contract.md) | Single executable, dependency disclosure and real target acceptance |
+| [Source foundations](source-runtime.md) | Current source implementation findings and native replacement obligations |
+| [Fixtures](fixture-contract.md) | Selected native acceptance and unchanged reference provenance |
+| [Harness transition](harness.md) | Replace useful Python verification with Zig and retire incidental equality checks |
 
-Native fast paths and a full compatibility profile may have different dependencies.
-Their dependencies and whole-process performance must be reported separately. No
-full-parity, lossless-migration or comparative speed claim follows from the probes below.
+## Current versus planned
 
-## Reproducible initial evidence
+The active daemon uses its existing compiled filters/state/lifecycle. New configuration
+preparation affects actual import/validation. New file/journal/record-processing sessions
+remain component foundations, with Python workers, dynamic SQLite/libsystemd and target
+limitations; they are not general daemon-wide native ingestion. The old active journald
+path invokes journalctl, legacy firewall modes invoke tools, and distribution has separate
+daemon/client binaries. These facts prevent a blanket current standalone claim.
 
-See [reference tests](../../tests/parity/README.md) for prerequisites and commands.
+The accepted storage direction retains useful SQLite transactions and removes dynamic
+loading. Custom-rule language/engine and journal/backend transport/support still need
+feasibility decisions. No arbitrary Python/shell extension runtime, private socket adapter
+or generic SQL dashboard is required. An optional future GUI remains uncommitted scope.
 
-| Probe | What it establishes | What it does not establish |
-|---|---|---|
-| Configuration comparison | Actual values from both readers for six synthetic layering/include/interpolation cases | Complete configuration compatibility; four initial cases differ |
-| Reference semantics | Pinned captures, raw identities, networks and worker outcome distinctions | Candidate filter parity or complete worker resource guarantees |
-| SQLite snapshots | Read-only backup of synthetic durable history, including committed WAL data | Live export, transient ticket/queue transfer or safe cutover |
-| Timing/ticket comparison | Seven actual component comparisons and 23 controlled reference cases | Candidate ingestion timing, scheduler/cleanup integration or enforcement |
-| [Action lifecycle](action-contract.md) | Sixteen reference dispatcher cases with original in-memory recorders | Configured action execution, production privilege separation or candidate parity |
-| Fixture inventory | Stock source metadata, option variants, record hashes and declared expectations | Condition execution, complete generated tests or detection accuracy |
-| [Mode/source contracts](fixture-contract.md) | Mapped definitions/generated families, resolved metadata and repeated config-reader outcomes | Candidate detection or action execution; proposed negatives still need validation |
-| [Configuration/operator contracts](config-command-contract.md) | Per-property reload/source domains and harmless reader/formatter observations | Implemented reload, CLI adapter or real effect transactions |
-| [Runtime contracts](runtime-contract.md) | Selected IPC/state/migration architecture and original data/transaction controls | Real workers, arbitrary extension compatibility or live state capture |
-| [Profile selection](profile-contract.md) | Exact selected userlands/source/package metadata and dependency contract | Installed full-profile recipes, booted kernels or certification |
-
-Executed behavioral fixtures are original synthetic data. Source inventory tools retain
-only upstream metadata/hashes and do not execute the upstream sample records or test bodies.
-Reference code is read from a separately obtained
-checkout; this repository does not vendor upstream source or logs. JSON reports identify
-the tested source/artifact, inputs, expected/observed outcomes and environment. Expected
-differences remain failures; reference-only passes never become candidate certification.
-
-The current development environment is Debian 13 x86_64 with Zig 0.14.1, Python 3.13.5
-and SQLite 3.46.1. Additional distribution/backend profiles require their own pinned
-packages and acceptance evidence. Cross-compilation alone does not certify a platform.
+Reference inventories and dated P0/P1/P2 receipts retain their original expectations. Old
+passes do not validate native replacements, and no changed requirement is certified merely
+by this documentation. Upstream source paths/metadata have provenance; the date_profile.json
+asset explicitly derives from upstream and retains its accompanying attribution. Do not
+claim every asset is independently originated or erase notices during a rewrite.

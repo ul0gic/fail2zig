@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "reference_commit": "f60978618a101427b06924fc932b44350fec2b63",
+  "profile": "upstream-1.1.1",
+  "cases": [
+    {
+      "id": "ssh-real-accepted",
+      "kind": "ssh_log",
+      "profile": "upstream-1.1.1",
+      "requirements": [
+        "FLT-01",
+        "FLT-CAT-SSHD"
+      ],
+      "issues": [],
+      "split": "held-out",
+      "input": {
+        "line": "Sep 10 12:00:00 fixture-host sshd-session[123]: Accepted publickey for fixture-user from 192.0.2.10 port 40000 ssh2: ED25519 SHA256:REDACTED"
+      },
+      "expected_reference": [
+        {
+          "event": "match",
+          "sequence": 0,
+          "values": {
+            "identity": null,
+            "result": "ignored"
+          }
+        }
+      ],
+      "provenance": {
+        "origin": "Independently sanitized existing successful authentication record from authorized f2z-target journal, captured read-only 2026-09-10",
+        "license": "AGPL-3.0-or-later (maintainer-owned sanitized fixture)",
+        "source_anchors": [
+          "config/filter.d/sshd.conf",
+          "engine/filters/sshd.zig"
+        ]
+      }
+    },
+    {
+      "id": "ssh-original-failed",
+      "kind": "ssh_log",
+      "profile": "upstream-1.1.1",
+      "requirements": [
+        "FLT-01",
+        "FLT-CAT-SSHD"
+      ],
+      "issues": [],
+      "split": "development",
+      "input": {
+        "line": "Sep 10 12:00:00 fixture-host sshd[123]: Failed password for fixture-user from 192.0.2.10 port 40000 ssh2"
+      },
+      "expected_reference": [
+        {
+          "event": "match",
+          "sequence": 0,
+          "values": {
+            "identity": "192.0.2.10",
+            "result": "matched"
+          }
+        }
+      ],
+      "provenance": {
+        "origin": "Original synthetic positive control; not represented as a real authentication failure",
+        "license": "AGPL-3.0-or-later",
+        "source_anchors": [
+          "config/filter.d/sshd.conf",
+          "engine/filters/sshd.zig"
+        ]
+      }
+    }
+  ]
+}

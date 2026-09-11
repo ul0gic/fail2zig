@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "source": "Read-only authorized f2z-target journal capture on 2026-09-10",
+  "records": [
+    {
+      "case": "ssh-real-accepted",
+      "provenance": {
+        "origin": "Independently sanitized existing successful authentication record from authorized f2z-target journal, captured read-only 2026-09-10",
+        "license": "AGPL-3.0-or-later (maintainer-owned sanitized fixture)",
+        "source_anchors": [
+          "config/filter.d/sshd.conf",
+          "engine/filters/sshd.zig"
+        ],
+        "raw_message_sha256": "2f08ed0f3fe9f91452549134d5017ee73fffcf510853e1cc156d589739c5df65",
+        "journal_process": {
+          "kind": "accepted",
+          "hash": "2f08ed0f3fe9f91452549134d5017ee73fffcf510853e1cc156d589739c5df65",
+          "exe": "/usr/lib/openssh/sshd-session",
+          "comm": "sshd-session",
+          "transport": "syslog",
+          "identifier": "sshd-session"
+        },
+        "source_package": "1:10.0p1-7+deb13u4",
+        "sanitization": {
+          "user": "fixture-user",
+          "address": "192.0.2.10",
+          "port": "40000",
+          "key_fingerprint": "SHA256:REDACTED",
+          "framing": "Synthetic Sep 10 12:00:00 fixture-host prefix and PID123; actual sshd-session identifier preserved"
+        },
+        "raw_logs_retained": false
+      },
+      "sanitized_line_sha256": "d4640b714f07dd14552a4dd7ea242d85c7cbd43aa6e9da7a27ad1464cc3dd09f"
+    },
+    {
+      "case": "ssh-original-failed",
+      "provenance": {
+        "origin": "Original synthetic positive control; not represented as a real authentication failure",
+        "license": "AGPL-3.0-or-later",
+        "source_anchors": [
+          "config/filter.d/sshd.conf",
+          "engine/filters/sshd.zig"
+        ]
+      },
+      "sanitized_line_sha256": "4dbd6be8a8b3f8d0aee76f61572e87fb37e3b441b826b1cee3f6b99963935836"
+    }
+  ],
+  "excluded": "Failed-password records in this journal were emitted by logger during earlier controlled tests. They are not labeled real authentication failures."
+}

@@ -2,7 +2,7 @@
 
 # fail2zig
 
-**A modern intrusion prevention system. Single binary. Zero runtime dependencies.**
+**A Linux intrusion prevention daemon written in Zig.**
 
 [![CI](https://img.shields.io/github/actions/workflow/status/ul0gic/fail2zig/ci.yml?branch=main&label=CI&logo=github)](https://github.com/ul0gic/fail2zig/actions/workflows/ci.yml)
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/ul0gic/fail2zig/badge)](https://scorecard.dev/viewer/?uri=github.com/ul0gic/fail2zig)
@@ -13,16 +13,20 @@
 
 </div>
 
-fail2zig is an intrusion prevention daemon inspired by fail2ban — written in Zig, shipped as a
-single static binary, with a parser that cannot be made to allocate unbounded
+fail2zig is an intrusion prevention daemon inspired by fail2ban — written in Zig, with a static daemon
+and companion client, and a parser that cannot be made to allocate unbounded
 memory by the traffic it's supposed to be stopping.
 
-fail2ban has served the industry for 20 years and the filter ecosystem it grew
-is fail2zig's direct inheritance — `--import-config` translates an existing
-`jail.conf` and `filter.d/` into native TOML in one pass and reports what it
-could not translate. fail2zig focuses on the one thing the Python runtime
-makes hard: a small, static, memory-bounded daemon that safely runs as root on
-a shared host.
+The importer translates supported fail2ban jail settings into native TOML and reports
+unsupported configurations that need operator changes. Broader supported migration and
+bounded native custom rules remain development work; exact fail2ban compatibility is not promised.
+
+This checkout is **0.3.1-dev**, unpublished. Its new source components still use Python and
+dynamically loaded SQLite/libsystemd; they are not the daemon's general processing path.
+The corrected direction removes project-owned Python, embeds upstream SQLite statically,
+and consolidates daemon/admin functions into one executable with **zero external runtime
+dependencies** for supported modes. That work is not complete. See
+[current components](docs/parity/p2-components.md) and [delivery contract](docs/parity/profile-contract.md).
 
 ---
 
@@ -63,8 +67,9 @@ sudo systemctl enable --now fail2zig
 fail2zig-client status
 ```
 
-That's it. No package manager, no Python runtime, no regex engine to
-CVE-surf around. One binary, one config file, one systemd unit.
+The released daemon uses compiled-in filters and needs no Python runtime. The current
+distribution also includes a companion client. Journald and legacy firewall modes require
+their documented tools; the nftables backend talks directly to the kernel.
 
 The installer pulls from the
 [latest GitHub Release](https://github.com/ul0gic/fail2zig/releases/latest)
@@ -77,16 +82,12 @@ anything on disk. Pin a specific version with
 
 ## Why fail2zig
 
-- **Single static binary.** Copy it to any Linux host. No Python, no package
-  manager, no runtime. Works on distroless containers, minimal VMs, and
-  routers. The stripped x86_64 release binaries are 1.0 MB (daemon) and
-  535 KB (client).
-- **Zero runtime dependencies.** No Python, no shared libraries, no `nft`
-  userspace package. The nftables backend programs the kernel over netlink
-  directly. The ipset and iptables fallbacks spawn the CLI as a discrete
-  argv (no `/bin/sh`) and are used only where the kernel lacks nf_tables. See
-  [architecture/zero-dependencies](https://fail2zig.com/docs/architecture/zero-dependencies/)
-  for why this matters and how we verify it.
+- **Static delivery.** Current releases provide a daemon and companion client for
+  supported Linux targets. Consolidating them into one executable is planned.
+- **Direct nftables enforcement.** No nft userspace package is required for that
+  backend. Current ipset/iptables modes invoke their tools with fixed argv, and
+  journald uses journalctl. See the [delivery contract](docs/parity/profile-contract.md)
+  for current dependencies and the planned standalone runtime.
 - **Bounded under attack.** The IP state tracker is a fixed-capacity map.
   Half of `memory_ceiling_mb` (default 64 MB) is split evenly across the
   enabled jails plus one spare tracker, at roughly 1.5 KB per tracked IP.
@@ -104,8 +105,8 @@ anything on disk. Pin a specific version with
   running: bans are logged, not applied, and `status`, `/metrics`, and
   `/events` report `DEGRADED` with the cause. It is never silent.
 - **fail2ban config import.** `--import-config /etc/fail2ban` translates
-  `jail.conf` + `jail.local` + `jail.d/` + `filter.d/` into native TOML in
-  one command. Migration report tells you what needed manual attention.
+  `jail.conf`, its layers and selected assets into a native projection plus
+  retained compatibility manifest. The report identifies settings awaiting support.
 
 ---
 
@@ -177,7 +178,8 @@ config, then `systemctl enable --now fail2zig` when ready.
 | `mips-linux-musleabi` | big-endian MIPS32r2 routers, soft-float | qemu-user-static only |
 | `mipsel-linux-musleabi` | little-endian MIPS32r2 routers, soft-float | qemu-user-static only |
 
-All five are static musl binaries with no runtime dependencies. The mips pair
+All five are static musl binaries. Legacy firewall modes and journal ingestion
+require their documented external tools. The mips pair
 targets the soft-float ABI common on OpenWrt-class hardware; CI runs
 `--version` under `qemu-mips[el]-static` on every build, but no one has yet
 reported a run on real MIPS hardware. Hard-float MIPS (`musleabihf`) is not
@@ -251,7 +253,7 @@ zig build -Dtarget=mips-linux-musleabi   -Doptimize=ReleaseSafe
 zig build -Dtarget=mipsel-linux-musleabi -Doptimize=ReleaseSafe
 ```
 
-All produce statically linked musl binaries with no runtime dependencies. Use
+All produce statically linked musl binaries; selected backends may require external tools. Use
 the float-ABI-suffixed mips triples: the bare `mips-linux-musl` triple has no
 musl libc in any Zig release. To run a mips build on an x86_64 host:
 
@@ -365,13 +367,16 @@ fail2zig --import-config /etc/fail2ban \
          --import-output /etc/fail2zig/config.toml
 ```
 
-The importer merges `jail.conf` → `jail.local` → `jail.d/*`, translates
-Python regex patterns to the fail2zig DSL where possible, and prints a
-migration report. `banaction` values `nftables`, `iptables`, and `ipset`
-are kept and mean enforce; they do not select a backend (see
-[Firewall backends](#firewall-backends)). Any other action name becomes
-`log-only` with a warning in the report. Filters and jails that cannot be
-translated are noted, not silently dropped.
+In this development checkout, configuration order is `jail.conf` → sorted
+`jail.d/*.conf` → `jail.local` → sorted `jail.d/*.local`, including ordered
+before/after includes. The importer retains raw settings, parameterized assets and
+provenance in a protected manifest alongside the native configuration projection.
+
+Supported native settings can be used after review. Custom filters, scoped actions and
+other unsupported semantics remain disabled and marked `compatibility_pending`; imported
+regexes are not automatically executed or replaced by a same-named builtin filter.
+The migration report identifies pending work. This preparation is not a complete or
+live migration from fail2ban. See [configuration preparation](docs/parity/p2-components.md#configuration-and-migration-preparation).
 
 Step-by-step guide: [guides/migration-from-fail2ban](https://fail2zig.com/docs/guides/migration-from-fail2ban/).
 
@@ -648,14 +653,18 @@ contributing — see [Trademark](#trademark) below.
 ```bash
 git clone https://github.com/ul0gic/fail2zig
 cd fail2zig
-zig build test          # ~2s · green, zero leaks
+zig build test          # Current dependency-bearing foundations are described below
 ```
 
 **Requires:**
+
 - [Zig 0.14.x](https://ziglang.org/download/); CI pins 0.14.1. Zig 0.15 and later do not build this tree (ADR-012).
 
-The marketing site (fail2zig.com) lives in a separate repo and is not
-covered here.
+The current P2 test foundations still require Python and dynamic libraries for applicable
+paths; see [component status](docs/parity/p2-components.md). The planned Zig-only project
+tooling gate is not implemented yet.
+
+The marketing site (fail2zig.com) lives in a separate repo and is not covered here.
 
 ### Standards
 

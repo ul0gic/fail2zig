@@ -1,0 +1,2051 @@
+{
+  "schema_version": 1,
+  "reference_commit": "f60978618a101427b06924fc932b44350fec2b63",
+  "profile": "upstream-1.1.1",
+  "cases": [
+    {
+      "id": "parity-cfg-001",
+      "kind": "config",
+      "profile": "upstream-1.1.1",
+      "requirements": [
+        "CFG-01"
+      ],
+      "issues": [],
+      "split": "development",
+      "input": {
+        "files": {
+          "jail.conf": "[probe]\nmaxretry = 2\n"
+        },
+        "section": "probe",
+        "option": "maxretry"
+      },
+      "expected_reference": [
+        {
+          "event": "config",
+          "sequence": 0,
+          "values": {
+            "value": "2"
+          }
+        }
+      ],
+      "provenance": {
+        "origin": "Original synthetic fail2zig fixture; source behavior inspected, no upstream sample or test body copied.",
+        "license": "AGPL-3.0-or-later",
+        "source_anchors": [
+          "fail2ban/client/configreader.py:ConfigReaderUnshared"
+        ]
+      }
+    },
+    {
+      "id": "parity-cfg-002",
+      "kind": "config",
+      "profile": "upstream-1.1.1",
+      "requirements": [
+        "CFG-01"
+      ],
+      "issues": [
+        "SYS-026"
+      ],
+      "split": "development",
+      "input": {
+        "files": {
+          "jail.conf": "[probe]\nmaxretry = 2\n",
+          "jail.d/20-package.conf": "[probe]\nmaxretry = 3\n",
+          "jail.local": "[probe]\nmaxretry = 7\n"
+        },
+        "section": "probe",
+        "option": "maxretry"
+      },
+      "expected_reference": [
+        {
+          "event": "config",
+          "sequence": 0,
+          "values": {
+            "value": "7"
+          }
+        }
+      ],
+      "provenance": {
+        "origin": "Original synthetic fail2zig fixture; source behavior inspected, no upstream sample or test body copied.",
+        "license": "AGPL-3.0-or-later",
+        "source_anchors": [
+          "fail2ban/client/configreader.py:ConfigReaderUnshared"
+        ]
+      }
+    },
+    {
+      "id": "parity-cfg-003",
+      "kind": "config",
+      "profile": "upstream-1.1.1",
+      "requirements": [
+        "CFG-01"
+      ],
+      "issues": [
+        "SYS-026"
+      ],
+      "split": "development",
+      "input": {
+        "files": {
+          "jail.conf": "[probe]\nmaxretry = 2\n",
+          "jail.local": "[probe]\nmaxretry = 7\n",
+          "jail.d/90-operator.local": "[probe]\nmaxretry = 9\n"
+        },
+        "section": "probe",
+        "option": "maxretry"
+      },
+      "expected_reference": [
+        {
+          "event": "config",
+          "sequence": 0,
+          "values": {
+            "value": "9"
+          }
+        }
+      ],
+      "provenance": {
+        "origin": "Original synthetic fail2zig fixture; source behavior inspected, no upstream sample or test body copied.",
+        "license": "AGPL-3.0-or-later",
+        "source_anchors": [
+          "fail2ban/client/configreader.py:ConfigReaderUnshared"
+        ]
+      }
+    },
+    {
+      "id": "parity-cfg-004",
+      "kind": "config",
+      "profile": "upstream-1.1.1",
+      "requirements": [
+        "CFG-01"
+      ],
+      "issues": [
+        "SYS-027"
+      ],
+      "split": "development",
+      "input": {
+        "files": {
+          "jail.conf": "[INCLUDES]\nbefore = common.conf\n[probe]\nenabled = true\n",
+          "common.conf": "[probe]\nmaxretry = 2\n"
+        },
+        "section": "probe",
+        "option": "maxretry"
+      },
+      "expected_reference": [
+        {
+          "event": "config",
+          "sequence": 0,
+          "values": {
+            "value": "2"
+          }
+        }
+      ],
+      "provenance": {
+        "origin": "Original synthetic fail2zig fixture; source behavior inspected, no upstream sample or test body copied.",
+        "license": "AGPL-3.0-or-later",
+        "source_anchors": [
+          "fail2ban/client/configreader.py:ConfigReaderUnshared"
+        ]
+      }
+    },
+    {
+      "id": "parity-cfg-005",
+      "kind": "config",
+      "profile": "upstream-1.1.1",
+      "requirements": [
+        "CFG-01"
+      ],
+      "issues": [
+        "SYS-027"
+      ],
+      "split": "development",
+      "input": {
+        "files": {
+          "jail.conf": "[INCLUDES]\nafter = override.conf\n[probe]\nmaxretry = 2\n",
+          "override.conf": "[probe]\nmaxretry = 9\n"
+        },
+        "section": "probe",
+        "option": "maxretry"
+      },
+      "expected_reference": [
+        {
+          "event": "config",
+          "sequence": 0,
+          "values": {
+            "value": "9"
+          }
+        }
+      ],
+      "provenance": {
+        "origin": "Original synthetic fail2zig fixture; source behavior inspected, no upstream sample or test body copied.",
+        "license": "AGPL-3.0-or-later",
+        "source_anchors": [
+          "fail2ban/client/configreader.py:ConfigReaderUnshared"
+        ]
+      }
+    },
+    {
+      "id": "parity-cfg-006",
+      "kind": "config",
+      "profile": "upstream-1.1.1",
+      "requirements": [
+        "CFG-01"
+      ],
+      "issues": [],
+      "split": "development",
+      "input": {
+        "files": {
+          "jail.conf": "[DEFAULT]\nretrybase = 4\n[probe]\nmaxretry = %(retrybase)s\n"
+        },
+        "section": "probe",
+        "option": "maxretry"
+      },
+      "expected_reference": [
+        {
+          "event": "config",
+          "sequence": 0,
+          "values": {
+            "value": "4"
+          }
+        }
+      ],
+      "provenance": {
+        "origin": "Original synthetic fail2zig fixture; source behavior inspected, no upstream sample or test body copied.",
+        "license": "AGPL-3.0-or-later",
+        "source_anchors": [
+          "fail2ban/client/configreader.py:ConfigReaderUnshared"
+        ]
+      }
+    },
+    {
+      "id": "parity-ticket-burst",
+      "kind": "tickets",
+      "profile": "upstream-1.1.1",
+      "requirements": [
+        "POL-01"
+      ],
+      "issues": [],
+      "split": "development",
+      "input": {
+        "events": [
+          1800000000,
+          1800000001,
+          1800000002
+        ],
+        "findtime": 600,
+        "maxretry": 10,
+        "now": 1800000000
+      },
+      "expected_reference": [
+        {
+          "event": "ticket",
+          "sequence": 0,
+          "values": {
+            "pending_retry": 1,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 1,
+          "values": {
+            "pending_retry": 2,
+            "pending_last_time": 1800000001,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 2,
+          "values": {
+            "pending_retry": 3,
+            "pending_last_time": 1800000002,
+            "threshold_reached": false
+          }
+        }
+      ],
+      "provenance": {
+        "origin": "Original synthetic fail2zig fixture; source behavior inspected, no upstream sample or test body copied.",
+        "license": "AGPL-3.0-or-later",
+        "source_anchors": [
+          "fail2ban/server/failmanager.py:FailManager.addFailure/toBan"
+        ]
+      }
+    },
+    {
+      "id": "parity-ticket-window-equality",
+      "kind": "tickets",
+      "profile": "upstream-1.1.1",
+      "requirements": [
+        "POL-01"
+      ],
+      "issues": [],
+      "split": "development",
+      "input": {
+        "events": [
+          1800000000,
+          1800000600
+        ],
+        "findtime": 600,
+        "maxretry": 10,
+        "now": 1800000000
+      },
+      "expected_reference": [
+        {
+          "event": "ticket",
+          "sequence": 0,
+          "values": {
+            "pending_retry": 1,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 1,
+          "values": {
+            "pending_retry": 2,
+            "pending_last_time": 1800000600,
+            "threshold_reached": false
+          }
+        }
+      ],
+      "provenance": {
+        "origin": "Original synthetic fail2zig fixture; source behavior inspected, no upstream sample or test body copied.",
+        "license": "AGPL-3.0-or-later",
+        "source_anchors": [
+          "fail2ban/server/failmanager.py:FailManager.addFailure/toBan"
+        ]
+      }
+    },
+    {
+      "id": "parity-ticket-rate-retention",
+      "kind": "tickets",
+      "profile": "upstream-1.1.1",
+      "requirements": [
+        "POL-01"
+      ],
+      "issues": [
+        "SYS-029"
+      ],
+      "split": "development",
+      "input": {
+        "events": [
+          1800000000,
+          1800000001,
+          1800000002,
+          1800000601
+        ],
+        "findtime": 600,
+        "maxretry": 10,
+        "now": 1800000000
+      },
+      "expected_reference": [
+        {
+          "event": "ticket",
+          "sequence": 0,
+          "values": {
+            "pending_retry": 1,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 1,
+          "values": {
+            "pending_retry": 2,
+            "pending_last_time": 1800000001,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 2,
+          "values": {
+            "pending_retry": 3,
+            "pending_last_time": 1800000002,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 3,
+          "values": {
+            "pending_retry": 4,
+            "pending_last_time": 1800000601,
+            "threshold_reached": false
+          }
+        }
+      ],
+      "provenance": {
+        "origin": "Original synthetic fail2zig fixture; source behavior inspected, no upstream sample or test body copied.",
+        "license": "AGPL-3.0-or-later",
+        "source_anchors": [
+          "fail2ban/server/failmanager.py:FailManager.addFailure/toBan"
+        ]
+      }
+    },
+    {
+      "id": "parity-ticket-rate-threshold",
+      "kind": "tickets",
+      "profile": "upstream-1.1.1",
+      "requirements": [
+        "POL-01"
+      ],
+      "issues": [
+        "SYS-029"
+      ],
+      "split": "development",
+      "input": {
+        "events": [
+          1800000000,
+          1800000001,
+          1800000002,
+          1800000601
+        ],
+        "findtime": 600,
+        "maxretry": 4,
+        "now": 1800000000
+      },
+      "expected_reference": [
+        {
+          "event": "ticket",
+          "sequence": 0,
+          "values": {
+            "pending_retry": 1,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 1,
+          "values": {
+            "pending_retry": 2,
+            "pending_last_time": 1800000001,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 2,
+          "values": {
+            "pending_retry": 3,
+            "pending_last_time": 1800000002,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 3,
+          "values": {
+            "pending_retry": 0,
+            "pending_last_time": null,
+            "threshold_reached": true
+          }
+        }
+      ],
+      "provenance": {
+        "origin": "Original synthetic fail2zig fixture; source behavior inspected, no upstream sample or test body copied.",
+        "license": "AGPL-3.0-or-later",
+        "source_anchors": [
+          "fail2ban/server/failmanager.py:FailManager.addFailure/toBan"
+        ]
+      }
+    },
+    {
+      "id": "parity-ticket-rate-decay",
+      "kind": "tickets",
+      "profile": "upstream-1.1.1",
+      "requirements": [
+        "POL-01"
+      ],
+      "issues": [
+        "SYS-029"
+      ],
+      "split": "development",
+      "input": {
+        "events": [
+          1800000000,
+          1800000001,
+          1800000002,
+          1800000900
+        ],
+        "findtime": 600,
+        "maxretry": 10,
+        "now": 1800000000
+      },
+      "expected_reference": [
+        {
+          "event": "ticket",
+          "sequence": 0,
+          "values": {
+            "pending_retry": 1,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 1,
+          "values": {
+            "pending_retry": 2,
+            "pending_last_time": 1800000001,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 2,
+          "values": {
+            "pending_retry": 3,
+            "pending_last_time": 1800000002,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 3,
+          "values": {
+            "pending_retry": 3,
+            "pending_last_time": 1800000900,
+            "threshold_reached": false
+          }
+        }
+      ],
+      "provenance": {
+        "origin": "Original synthetic fail2zig fixture; source behavior inspected, no upstream sample or test body copied.",
+        "license": "AGPL-3.0-or-later",
+        "source_anchors": [
+          "fail2ban/server/failmanager.py:FailManager.addFailure/toBan"
+        ]
+      }
+    },
+    {
+      "id": "parity-ticket-out-of-order",
+      "kind": "tickets",
+      "profile": "upstream-1.1.1",
+      "requirements": [
+        "POL-01"
+      ],
+      "issues": [
+        "SYS-029"
+      ],
+      "split": "development",
+      "input": {
+        "events": [
+          1800000100,
+          1800000000
+        ],
+        "findtime": 600,
+        "maxretry": 10,
+        "now": 1800000000
+      },
+      "expected_reference": [
+        {
+          "event": "ticket",
+          "sequence": 0,
+          "values": {
+            "pending_retry": 1,
+            "pending_last_time": 1800000100,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 1,
+          "values": {
+            "pending_retry": 2,
+            "pending_last_time": 1800000100,
+            "threshold_reached": false
+          }
+        }
+      ],
+      "provenance": {
+        "origin": "Original synthetic fail2zig fixture; source behavior inspected, no upstream sample or test body copied.",
+        "license": "AGPL-3.0-or-later",
+        "source_anchors": [
+          "fail2ban/server/failmanager.py:FailManager.addFailure/toBan"
+        ]
+      }
+    },
+    {
+      "id": "parity-ticket-129-threshold",
+      "kind": "tickets",
+      "profile": "upstream-1.1.1",
+      "requirements": [
+        "POL-01"
+      ],
+      "issues": [
+        "SYS-029"
+      ],
+      "split": "development",
+      "input": {
+        "events": [
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000,
+          1800000000
+        ],
+        "findtime": 600,
+        "maxretry": 129,
+        "now": 1800000000
+      },
+      "expected_reference": [
+        {
+          "event": "ticket",
+          "sequence": 0,
+          "values": {
+            "pending_retry": 1,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 1,
+          "values": {
+            "pending_retry": 2,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 2,
+          "values": {
+            "pending_retry": 3,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 3,
+          "values": {
+            "pending_retry": 4,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 4,
+          "values": {
+            "pending_retry": 5,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 5,
+          "values": {
+            "pending_retry": 6,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 6,
+          "values": {
+            "pending_retry": 7,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 7,
+          "values": {
+            "pending_retry": 8,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 8,
+          "values": {
+            "pending_retry": 9,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 9,
+          "values": {
+            "pending_retry": 10,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 10,
+          "values": {
+            "pending_retry": 11,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 11,
+          "values": {
+            "pending_retry": 12,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 12,
+          "values": {
+            "pending_retry": 13,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 13,
+          "values": {
+            "pending_retry": 14,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 14,
+          "values": {
+            "pending_retry": 15,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 15,
+          "values": {
+            "pending_retry": 16,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 16,
+          "values": {
+            "pending_retry": 17,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 17,
+          "values": {
+            "pending_retry": 18,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 18,
+          "values": {
+            "pending_retry": 19,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 19,
+          "values": {
+            "pending_retry": 20,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 20,
+          "values": {
+            "pending_retry": 21,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 21,
+          "values": {
+            "pending_retry": 22,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 22,
+          "values": {
+            "pending_retry": 23,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 23,
+          "values": {
+            "pending_retry": 24,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 24,
+          "values": {
+            "pending_retry": 25,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 25,
+          "values": {
+            "pending_retry": 26,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 26,
+          "values": {
+            "pending_retry": 27,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 27,
+          "values": {
+            "pending_retry": 28,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 28,
+          "values": {
+            "pending_retry": 29,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 29,
+          "values": {
+            "pending_retry": 30,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 30,
+          "values": {
+            "pending_retry": 31,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 31,
+          "values": {
+            "pending_retry": 32,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 32,
+          "values": {
+            "pending_retry": 33,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 33,
+          "values": {
+            "pending_retry": 34,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 34,
+          "values": {
+            "pending_retry": 35,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 35,
+          "values": {
+            "pending_retry": 36,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 36,
+          "values": {
+            "pending_retry": 37,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 37,
+          "values": {
+            "pending_retry": 38,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 38,
+          "values": {
+            "pending_retry": 39,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 39,
+          "values": {
+            "pending_retry": 40,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 40,
+          "values": {
+            "pending_retry": 41,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 41,
+          "values": {
+            "pending_retry": 42,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 42,
+          "values": {
+            "pending_retry": 43,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 43,
+          "values": {
+            "pending_retry": 44,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 44,
+          "values": {
+            "pending_retry": 45,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 45,
+          "values": {
+            "pending_retry": 46,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 46,
+          "values": {
+            "pending_retry": 47,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 47,
+          "values": {
+            "pending_retry": 48,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 48,
+          "values": {
+            "pending_retry": 49,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 49,
+          "values": {
+            "pending_retry": 50,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 50,
+          "values": {
+            "pending_retry": 51,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 51,
+          "values": {
+            "pending_retry": 52,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 52,
+          "values": {
+            "pending_retry": 53,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 53,
+          "values": {
+            "pending_retry": 54,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 54,
+          "values": {
+            "pending_retry": 55,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 55,
+          "values": {
+            "pending_retry": 56,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 56,
+          "values": {
+            "pending_retry": 57,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 57,
+          "values": {
+            "pending_retry": 58,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 58,
+          "values": {
+            "pending_retry": 59,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 59,
+          "values": {
+            "pending_retry": 60,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 60,
+          "values": {
+            "pending_retry": 61,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 61,
+          "values": {
+            "pending_retry": 62,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 62,
+          "values": {
+            "pending_retry": 63,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 63,
+          "values": {
+            "pending_retry": 64,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 64,
+          "values": {
+            "pending_retry": 65,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 65,
+          "values": {
+            "pending_retry": 66,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 66,
+          "values": {
+            "pending_retry": 67,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 67,
+          "values": {
+            "pending_retry": 68,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 68,
+          "values": {
+            "pending_retry": 69,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 69,
+          "values": {
+            "pending_retry": 70,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 70,
+          "values": {
+            "pending_retry": 71,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 71,
+          "values": {
+            "pending_retry": 72,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 72,
+          "values": {
+            "pending_retry": 73,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 73,
+          "values": {
+            "pending_retry": 74,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 74,
+          "values": {
+            "pending_retry": 75,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 75,
+          "values": {
+            "pending_retry": 76,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 76,
+          "values": {
+            "pending_retry": 77,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 77,
+          "values": {
+            "pending_retry": 78,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 78,
+          "values": {
+            "pending_retry": 79,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 79,
+          "values": {
+            "pending_retry": 80,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 80,
+          "values": {
+            "pending_retry": 81,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 81,
+          "values": {
+            "pending_retry": 82,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 82,
+          "values": {
+            "pending_retry": 83,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 83,
+          "values": {
+            "pending_retry": 84,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 84,
+          "values": {
+            "pending_retry": 85,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 85,
+          "values": {
+            "pending_retry": 86,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 86,
+          "values": {
+            "pending_retry": 87,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 87,
+          "values": {
+            "pending_retry": 88,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 88,
+          "values": {
+            "pending_retry": 89,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 89,
+          "values": {
+            "pending_retry": 90,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 90,
+          "values": {
+            "pending_retry": 91,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 91,
+          "values": {
+            "pending_retry": 92,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 92,
+          "values": {
+            "pending_retry": 93,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 93,
+          "values": {
+            "pending_retry": 94,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 94,
+          "values": {
+            "pending_retry": 95,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 95,
+          "values": {
+            "pending_retry": 96,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 96,
+          "values": {
+            "pending_retry": 97,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 97,
+          "values": {
+            "pending_retry": 98,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 98,
+          "values": {
+            "pending_retry": 99,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 99,
+          "values": {
+            "pending_retry": 100,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 100,
+          "values": {
+            "pending_retry": 101,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 101,
+          "values": {
+            "pending_retry": 102,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 102,
+          "values": {
+            "pending_retry": 103,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 103,
+          "values": {
+            "pending_retry": 104,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 104,
+          "values": {
+            "pending_retry": 105,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 105,
+          "values": {
+            "pending_retry": 106,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 106,
+          "values": {
+            "pending_retry": 107,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 107,
+          "values": {
+            "pending_retry": 108,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 108,
+          "values": {
+            "pending_retry": 109,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 109,
+          "values": {
+            "pending_retry": 110,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 110,
+          "values": {
+            "pending_retry": 111,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 111,
+          "values": {
+            "pending_retry": 112,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 112,
+          "values": {
+            "pending_retry": 113,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 113,
+          "values": {
+            "pending_retry": 114,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 114,
+          "values": {
+            "pending_retry": 115,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 115,
+          "values": {
+            "pending_retry": 116,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 116,
+          "values": {
+            "pending_retry": 117,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 117,
+          "values": {
+            "pending_retry": 118,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 118,
+          "values": {
+            "pending_retry": 119,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 119,
+          "values": {
+            "pending_retry": 120,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 120,
+          "values": {
+            "pending_retry": 121,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 121,
+          "values": {
+            "pending_retry": 122,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 122,
+          "values": {
+            "pending_retry": 123,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 123,
+          "values": {
+            "pending_retry": 124,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 124,
+          "values": {
+            "pending_retry": 125,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 125,
+          "values": {
+            "pending_retry": 126,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 126,
+          "values": {
+            "pending_retry": 127,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 127,
+          "values": {
+            "pending_retry": 128,
+            "pending_last_time": 1800000000,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 128,
+          "values": {
+            "pending_retry": 0,
+            "pending_last_time": null,
+            "threshold_reached": true
+          }
+        }
+      ],
+      "provenance": {
+        "origin": "Original synthetic fail2zig fixture; source behavior inspected, no upstream sample or test body copied.",
+        "license": "AGPL-3.0-or-later",
+        "source_anchors": [
+          "fail2ban/server/failmanager.py:FailManager.addFailure/toBan"
+        ]
+      }
+    },
+    {
+      "id": "held-config-direct",
+      "kind": "config",
+      "profile": "upstream-1.1.1",
+      "requirements": [
+        "CFG-01"
+      ],
+      "issues": [],
+      "split": "held-out",
+      "input": {
+        "files": {
+          "jail.conf": "[probe]\nmaxretry = 11\n"
+        },
+        "section": "probe",
+        "option": "maxretry"
+      },
+      "expected_reference": [
+        {
+          "event": "config",
+          "sequence": 0,
+          "values": {
+            "value": "11"
+          }
+        }
+      ],
+      "provenance": {
+        "origin": "Original synthetic fail2zig fixture; source behavior inspected, no upstream sample or test body copied.",
+        "license": "AGPL-3.0-or-later",
+        "source_anchors": [
+          "fail2ban/client/configreader.py:ConfigReaderUnshared"
+        ]
+      }
+    },
+    {
+      "id": "held-config-default",
+      "kind": "effective_config",
+      "profile": "upstream-1.1.1",
+      "requirements": [
+        "CFG-01"
+      ],
+      "issues": [],
+      "split": "held-out",
+      "input": {
+        "files": {
+          "jail.conf": "[DEFAULT]\nmaxretry = 6\n[probe]\nenabled = true\nfilter = sshd\nlogpath = /fixture/original-synthetic.log\n"
+        },
+        "section": "probe",
+        "option": "maxretry"
+      },
+      "expected_reference": [
+        {
+          "event": "config",
+          "sequence": 0,
+          "values": {
+            "value": "6"
+          }
+        }
+      ],
+      "provenance": {
+        "origin": "Original synthetic held-out effective configuration fixture. Reference ConfigReader resolves DEFAULT; candidate observes production importer plus native.resolveJail, not the raw INI section getter. Logpath is configuration text only; no log ingestion is performed.",
+        "license": "AGPL-3.0-or-later",
+        "source_anchors": [
+          "fail2ban/client/configreader.py:ConfigReaderUnshared",
+          "engine/config/migration.zig",
+          "engine/config/native.zig:resolveJail"
+        ]
+      }
+    },
+    {
+      "id": "held-ticket-burst",
+      "kind": "tickets",
+      "profile": "upstream-1.1.1",
+      "requirements": [
+        "POL-01"
+      ],
+      "issues": [],
+      "split": "held-out",
+      "input": {
+        "now": 1800000000,
+        "findtime": 600,
+        "maxretry": 10,
+        "events": [
+          1800000008,
+          1800000011
+        ]
+      },
+      "expected_reference": [
+        {
+          "event": "ticket",
+          "sequence": 0,
+          "values": {
+            "pending_retry": 1,
+            "pending_last_time": 1800000008,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 1,
+          "values": {
+            "pending_retry": 2,
+            "pending_last_time": 1800000011,
+            "threshold_reached": false
+          }
+        }
+      ],
+      "provenance": {
+        "origin": "Original synthetic fail2zig fixture; source behavior inspected, no upstream sample or test body copied.",
+        "license": "AGPL-3.0-or-later",
+        "source_anchors": [
+          "fail2ban/server/failmanager.py:FailManager.addFailure/toBan"
+        ]
+      }
+    },
+    {
+      "id": "held-ticket-short-window",
+      "kind": "tickets",
+      "profile": "upstream-1.1.1",
+      "requirements": [
+        "POL-01"
+      ],
+      "issues": [],
+      "split": "held-out",
+      "input": {
+        "now": 1800000000,
+        "findtime": 30,
+        "maxretry": 10,
+        "events": [
+          1800000015,
+          1800000019
+        ]
+      },
+      "expected_reference": [
+        {
+          "event": "ticket",
+          "sequence": 0,
+          "values": {
+            "pending_retry": 1,
+            "pending_last_time": 1800000015,
+            "threshold_reached": false
+          }
+        },
+        {
+          "event": "ticket",
+          "sequence": 1,
+          "values": {
+            "pending_retry": 2,
+            "pending_last_time": 1800000019,
+            "threshold_reached": false
+          }
+        }
+      ],
+      "provenance": {
+        "origin": "Original synthetic fail2zig fixture; source behavior inspected, no upstream sample or test body copied.",
+        "license": "AGPL-3.0-or-later",
+        "source_anchors": [
+          "fail2ban/server/failmanager.py:FailManager.addFailure/toBan"
+        ]
+      }
+    }
+  ]
+}

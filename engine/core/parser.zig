@@ -361,6 +361,74 @@ pub fn extractTimestampWithYear(
     return null;
 }
 
+/// Exact common-format parser. Arbitrary datepattern and named timezones require the
+/// compatibility date backend; this API does not pretend to implement that grammar.
+pub const ExactTimestampMatch = struct { seconds: f64, len: u16 };
+pub const DateContext = struct {
+    year: i64,
+    now: f64,
+    /// Explicit fixed offset for timestamps without a zone; never implicit host localtime.
+    default_offset_seconds: i32 = 0,
+};
+pub fn extractTimestampExact(text: []const u8, context: DateContext) ?ExactTimestampMatch {
+    if (text.len > std.math.maxInt(u16)) return null;
+    if (!std.math.isFinite(context.now) or context.year < 1 or context.year > 9999 or
+        context.default_offset_seconds <= -86400 or context.default_offset_seconds >= 86400) return null;
+    const legacy = extractTimestampWithYear(text, context.year) orelse return null;
+    var seconds: f64 = @floatFromInt(legacy.ts);
+    var consumed: usize = legacy.len;
+    const iso = text.len >= 19 and text[4] == '-' and text[7] == '-';
+    const bsd = text.len >= 15 and text[3] == ' ';
+    if (iso or bsd) {
+        const year = if (iso) parseU(i64, text[0..4]) orelse return null else context.year;
+        const month = if (iso) parseU(u8, text[5..7]) orelse return null else monthFromBsdName(text[0..3]) orelse return null;
+        const day = if (iso) parseU(u8, text[8..10]) orelse return null else parseU(u8, std.mem.trim(u8, text[4..6], " ")) orelse return null;
+        if (!validCivil(year, month, day)) return null;
+        const sec_start: usize = if (iso) 17 else 13;
+        if ((parseU(u8, text[sec_start .. sec_start + 2]) orelse return null) > 59) return null;
+        var end: usize = if (iso) 19 else 15;
+        if (iso and end < text.len and text[end] == '.') {
+            const start = end;
+            end += 1;
+            while (end < text.len and std.ascii.isDigit(text[end])) : (end += 1) {}
+            if (end == start + 1) return null;
+            seconds += std.fmt.parseFloat(f64, text[start..end]) catch return null;
+        }
+        const explicit_zone = iso and end < text.len and (text[end] == 'Z' or text[end] == '+' or text[end] == '-');
+        if (explicit_zone and text[end] != 'Z' and consumed == end) return null;
+        if (!explicit_zone) seconds -= @as(f64, @floatFromInt(context.default_offset_seconds));
+        if (bsd and seconds > context.now + 86400) {
+            if (!validCivil(year - 1, month, day)) return null;
+            seconds -= @as(f64, @floatFromInt((daysFromCivil(year, month, day) - daysFromCivil(year - 1, month, day)) * SECS_PER_DAY));
+        }
+    } else if (consumed < text.len and text[consumed] == '.') {
+        const start = consumed;
+        consumed += 1;
+        while (consumed < text.len and std.ascii.isDigit(text[consumed])) : (consumed += 1) {}
+        if (consumed == start + 1) return null;
+        seconds += std.fmt.parseFloat(f64, text[start..consumed]) catch return null;
+    }
+    if (!std.math.isFinite(seconds) or consumed > std.math.maxInt(u16)) return null;
+    return .{ .seconds = seconds, .len = @intCast(consumed) };
+}
+fn validCivil(year: i64, month: u8, day: u8) bool {
+    if (year < 1 or year > 9999 or month < 1 or month > 12 or day < 1) return false;
+    const lengths = [_]u8{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    const leap = @mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0);
+    const limit: u8 = lengths[month - 1] + @as(u8, if (month == 2 and leap) 1 else 0);
+    return day <= limit;
+}
+test "exact timestamps retain fractions offsets and infer previous year" {
+    const context: DateContext = .{ .year = 2026, .now = 1767225600, .default_offset_seconds = 3600 };
+    try std.testing.expectEqual(@as(f64, 1767225600.125), extractTimestampExact("2026-01-01T01:00:00.125+01:00 message", context).?.seconds);
+    try std.testing.expectEqual(@as(f64, 1767225600.125), extractTimestampExact("2026-01-01T01:00:00.125 message", context).?.seconds);
+    try std.testing.expectEqual(@as(f64, 1767225600.125), extractTimestampExact("1767225600.125 message", context).?.seconds);
+    try std.testing.expectEqual(@as(f64, 1767222000), extractTimestampExact("Dec 31 23:00:00 message", .{ .year = 2026, .now = 1767225600 }).?.seconds);
+    try std.testing.expect(extractTimestampExact("2026-02-29T00:00:00Z", context) == null);
+    try std.testing.expect(extractTimestampExact("2026-01-01T00:00:00.Z", context) == null);
+    try std.testing.expect(extractTimestampExact("2026-01-01T00:00:00+bad", context) == null);
+}
+
 pub fn stripSyslogPrefix(line: []const u8) []const u8 {
     const timestamp = extractTimestamp(line) orelse return line;
     var pos: usize = timestamp.len;
