@@ -28,6 +28,55 @@ absolute expiry; monotonic scheduling handles elapsed runtime intervals. State h
 and clock steps translate deadlines. Do not preserve Python float/truthiness/truncation
 quirks solely to reproduce an oracle.
 
+The accepted age policy preserves recognized past event timestamps in startup, live and
+replay processing. An event older than the configured retry window commits an obsolete
+disposition and source progress without becoming a fresh attempt or ban intent. Processing
+delay does not rejuvenate its timestamp. Report backlog/obsolete counts so operators can
+see reduced timely coverage. The staged normalizer now applies this correction; active
+daemon integration remains unfinished. Native missing/future-time component behavior is
+specified below.
+
+The native_time component now represents signed integer microseconds and parses bounded
+complete timestamp fields without a worker or float conversion. It requires missing year/
+timezone context explicitly and reports future time separately. Its integer age check and
+file/SQLite fixture tests do not replace the daemon's current timestamp behavior.
+
+Missing/malformed timestamp policy is approved: timestamped sources commit an explicit
+rejected outcome and counter with the cursor, without fresh detection evidence, then process
+later valid records. Receipt time requires an explicitly undated source policy. The native
+policy and staged normalizer implement this distinction; rejected records cannot enter
+retained matching context. SourceProcessor now checkpoints counters, publishes independent
+health after commit and exposes bounded notices. Staged sessions wire monotonic warning
+emission, but full session/daemon execution remains unqualified. Year/timezone policies
+remain open; missing configuration context is not an ordinary rejected log record.
+
+The approved native future tolerance is 60 seconds inclusive, measured against the
+occurrence's original receipt time. Within tolerance, retain the original timestamp and
+use receipt time for detection; beyond it, reject with a distinct counter and bounded
+warning. Retries retain the comparison boundary and cannot extend the detection window or
+eventually admit an excessive future date. Native policy implements and component-tests
+this behavior. Native pipeline opt-in now durably records receipt before preparation and
+recovers it across failed outcomes/restart using explicit schema-3 storage. Coordinator/journal
+receipt ownership, original/effective historical timestamps and replacing the staged
+float normalizer's future branch remain integration work; backward wall-clock recovery
+is a separate unresolved condition.
+
+The native source processor/file session now implements those time and decoder consumers
+with a bounded native checkpoint and explicit schema-4 typed time rows. Approved opt-in
+syslog inference now uses the durable receipt with an explicit fixed UTC offset, selects
+the nearest valid adjacent/current local year and rejects equal-distance ambiguity. Schema 5
+is separately activated to persist the inferred year, including future rejections. A future
+rejection cannot trigger selection of another year. No host timezone or DST is inferred.
+Session receipt and processing clocks are sampled in order, preserving
+the original receipt while applying event age at actual preparation time. Source configuration,
+journal transport and daemon activation remain incomplete.
+
+The native journal component now connects complete journalctl records to durable receipts,
+native time outcomes and exact cursor checkpoints. Fresh tail/empty-time baselines commit
+explicitly, and saved anchors/pending occurrences must verify before resume. This is still
+component integration; the active daemon, public configuration and native detector consumers
+have not switched over. Operator IPC and the full recovery/scheduling coordinator remain open.
+
 The retry policy must define window endpoints, duplicate suppression, out-of-order insertion,
 maximum supported counts and behavior when capacity is reached. Separate count correctness
 from retained example text. Never allow an older event to move a last-seen time backward
@@ -45,7 +94,8 @@ expressions and must report unsupported foreign formulas during import.
 
 Use upstream SQLite linked statically into the executable; no installed database service,
 libsqlite3 shared object or SQLite CLI. Retain useful transaction/schema/revision logic from
-the current record store. Replace dynamically loaded calls and Python checkpoint payloads.
+the current record store. The dynamic loader is now replaced by the pinned static amalgamation;
+Python checkpoint payload replacement and active daemon integration remain outstanding.
 Pin/version/disclose the embedded component; the application remains Zig. Storage-engine
 selection is settled. No custom append-log database or experimental SQLite port is planned.
 

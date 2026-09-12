@@ -23,6 +23,7 @@ pub const Session = struct {
     tail_resets: std.ArrayList([]u8),
     tail_reset_count: usize,
     restored_sources: usize,
+    notice_timer: std.time.Timer,
 
     /// Store and processing option strings must outlive the session. Allocation
     /// keeps processor/pipe callback addresses stable across discovery and restart.
@@ -31,6 +32,7 @@ pub const Session = struct {
         const self = try allocator.create(Session);
         errdefer allocator.destroy(self);
         self.allocator = allocator;
+        self.notice_timer = try std.time.Timer.start();
         self.tail_resets = std.ArrayList([]u8).init(allocator);
         self.tail_reset_count = 0;
         self.restored_sources = 0;
@@ -107,8 +109,9 @@ pub const Session = struct {
     /// attempt next call. Idle sources consume budget too; this bounds work even
     /// when thousands of files contain no complete record. Errors retain cursors.
     pub fn poll(self: *Session, budget: usize, now: f64, usage_time: f64) !usize {
+        defer self.processor.logTimeRejections(self.notice_timer.read() / std.time.ns_per_ms);
         if (budget == 0 or budget > self.sources.max_sources) return error.InvalidPollBudget;
-        if (!self.pipe.ready) return error.RestoreRequired;
+        try self.pipe.admit();
         try self.processor.setClock(now, usage_time);
         try self.sources.discover();
         const count = self.sources.sources.items.len;
@@ -246,15 +249,16 @@ test "file session: startup and live are per file and EOF follows successful pub
     var a = try session.processor.snapshot(allocator);
     defer a.deinit();
     try std.testing.expectEqual(@import("event_time.zig").Mode.live, a.value.last.?.mode);
-    try std.testing.expectEqual(@import("event_time.zig").Disposition.accepted, a.value.last.?.disposition);
-    try std.testing.expectEqual(@import("event_time.zig").Origin.live_correction, a.value.last.?.origin.?);
+    try std.testing.expectEqual(@import("event_time.zig").Disposition.obsolete, a.value.last.?.disposition);
+    try std.testing.expectEqual(@import("event_time.zig").Origin.parsed, a.value.last.?.origin.?);
+    try std.testing.expect(a.value.last.?.stored_bits == null);
     try tmp.dir.rename("a.log", "a.rotated");
     try tmp.dir.writeFile(.{ .sub_path = "a.log", .data = "1729998000 ordinary replacement\n" });
     try std.testing.expectEqual(@as(usize, 1), try session.poll(3, 1730000000, 1730000000));
     var replacement = try session.processor.snapshot(allocator);
     defer replacement.deinit();
     try std.testing.expectEqual(@import("event_time.zig").Mode.live, replacement.value.last.?.mode);
-    try std.testing.expectEqual(@import("event_time.zig").Disposition.accepted, replacement.value.last.?.disposition);
+    try std.testing.expectEqual(@import("event_time.zig").Disposition.obsolete, replacement.value.last.?.disposition);
 }
 
 test "file session: tail restart declares saved cursor reset and commits current EOF baseline" {

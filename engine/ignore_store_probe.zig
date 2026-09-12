@@ -17,7 +17,9 @@ const Request = struct {
 const Proposal = struct {
     request: Request,
     published: bool = false,
-    fn restore(_: ?[]const u8, _: ?*anyopaque) !void {}
+    fn restore(_: ?[]const u8, context: ?*anyopaque) !pipeline.Restored {
+        return .{ .context = context, .publish = release, .release = release };
+    }
     fn publish(context: ?*anyopaque) void {
         const self: *Proposal = @ptrCast(@alignCast(context.?));
         self.published = true;
@@ -40,7 +42,7 @@ pub fn main() !void {
     var store = try durable.Store.open(a, args[1]);
     defer store.close();
     var proposal = Proposal{ .request = request };
-    var owner = pipeline.Pipeline{ .store = &store, .jail = request.jail, .processor = .{ .context = &proposal, .prepare = Proposal.prepare, .restore = Proposal.restore } };
+    var owner = pipeline.Pipeline{ .store = &store, .jail = request.jail, .processor = .{ .context = &proposal, .prepare = Proposal.prepare, .prepare_restore = Proposal.restore } };
     var outcome: []const u8 = "read";
     if (request.occurrence) |occurrence| {
         if (request.fail) store.fail_at = .after_shared_checkpoint;

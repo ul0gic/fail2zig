@@ -39,6 +39,12 @@ pub fn stage(allocator: std.mem.Allocator, saved: Snapshot, input: Input, limits
     try validate(saved, limits);
     _ = try times.EventTime.init(input.now.seconds);
     if (input.event_input == .parsed) _ = try times.EventTime.init(input.event_input.parsed.seconds);
+    if (input.normalized.disposition == .rejected) return .{
+        .snapshot = saved,
+        .prospective = .{ .suffix = input.line },
+        .no_date = true,
+        .appended = false,
+    };
     var next = saved;
     var tuple = input.parts orelse Tuple{ .suffix = input.line };
     const no_date = input.event_input == .missing or input.event_input == .invalid;
@@ -125,4 +131,23 @@ test "date spans count Unicode codepoints and enforce buffer budget" {
 test "staged oversize context releases general allocator memory" {
     try std.testing.expectError(error.LineContextTooLarge, stage(std.testing.allocator, .{}, .{ .line = "oversize", .event_input = .missing, .previous_date = null, .now = try times.EventTime.init(1000), .normalized = .{ .disposition = .undated } }, .{ .max_bytes = 3 }));
     try std.testing.expectError(error.OutOfMemory, stage(std.testing.failing_allocator, .{}, .{ .line = "x", .event_input = .missing, .previous_date = null, .now = try times.EventTime.init(1000), .normalized = .{ .disposition = .undated } }, .{}));
+}
+
+test "time admission: rejected records cannot enter retained matching context" {
+    const saved = Snapshot{ .last_time_text = "999", .lines = &.{.{ .time = "999", .suffix = "ordinary valid" }}, .processed = .{ .time = "999", .suffix = "ordinary valid" } };
+    const input = times.Input.invalid;
+    var context = times.Context{ .last_date = .{ .seconds = 999 } };
+    const now = times.EventTime{ .seconds = 1000 };
+    const normalized = try context.normalize(input, now, 600, .live, true);
+    const rejected = try stage(std.testing.failing_allocator, saved, .{
+        .line = "ordinary malformed time",
+        .parts = .{ .time = "invalid", .suffix = "ordinary malformed time" },
+        .event_input = input,
+        .previous_date = context.last_date,
+        .now = now,
+        .normalized = normalized,
+    }, .{});
+    try std.testing.expectEqualDeep(saved, rejected.snapshot);
+    try std.testing.expect(!rejected.appended);
+    try std.testing.expectEqualStrings("", rejected.prospective.time);
 }

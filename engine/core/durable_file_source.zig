@@ -2,6 +2,7 @@
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
 const records = @import("source_record.zig");
+const native_text = @import("source_text.zig");
 const Allocator = std.mem.Allocator;
 pub const Start = enum { head, tail };
 pub const Framing = enum {
@@ -87,10 +88,46 @@ pub const FileSource = struct {
     frame_callback: ?records.FrameCallback = null,
     frame_context: ?*anyopaque = null,
     codec_configuration_hash: ?[32]u8 = null,
+    native_encoding: ?native_text.Encoding = null,
+
+    /// Native framing owns no helper/context. The caller binds all semantic
+    /// processing options in configuration_hash; this adds the framing format,
+    /// encoding and byte cap. A restored stream cannot silently change them.
+    pub fn setNativeFraming(self: *FileSource, encoding: native_text.Encoding, configuration_hash: [32]u8, max_bytes: usize) !void {
+        if (max_bytes < encoding.width() or max_bytes > native_text.max_record_bytes) return error.InvalidFramingLimit;
+        if (self.file != null) return error.SourceAlreadyOpened;
+        if (self.frame_callback != null) return error.FramerAlreadyBound;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("fail2zig-native-framing-v1\x00");
+        hash.update(&configuration_hash);
+        hash.update(@tagName(encoding));
+        var limit: [4]u8 = undefined;
+        std.mem.writeInt(u32, &limit, @intCast(max_bytes), .little);
+        hash.update(&limit);
+        var binding: [32]u8 = undefined;
+        hash.final(&binding);
+        const framing: Framing = switch (encoding) {
+            .utf8, .ascii, .latin1 => .bytes,
+            .utf16le => .utf16le,
+            .utf16be => .utf16be,
+            .utf32le => .utf32le,
+            .utf32be => .utf32be,
+        };
+        if (self.committed) |saved| {
+            const previous = saved.codec_configuration_hash orelse return error.FramingProfileMismatch;
+            if (!std.mem.eql(u8, &previous, &binding) or saved.framing != framing) return error.FramingProfileMismatch;
+            if (saved.offset % encoding.width() != 0) return error.MisalignedOffset;
+        }
+        self.native_encoding = encoding;
+        self.framing = framing;
+        self.codec_configuration_hash = binding;
+        self.max_record_bytes = max_bytes;
+    }
 
     pub fn setFramer(self: *FileSource, callback: records.FrameCallback, context: ?*anyopaque, configuration_hash: [32]u8, max_bytes: usize) !void {
         if (max_bytes == 0 or max_bytes > 1024 * 1024) return error.InvalidFramingLimit;
         if (self.file != null) return error.SourceAlreadyOpened;
+        if (self.native_encoding != null) return error.FramerAlreadyBound;
         if (self.committed) |saved_resume| {
             const old = saved_resume.codec_configuration_hash orelse return error.FramingProfileMismatch;
             if (!std.mem.eql(u8, &old, &configuration_hash)) return error.FramingProfileMismatch;
@@ -206,10 +243,43 @@ pub const FileSource = struct {
             }
         } else {
             const offset: u64 = if (self.start == .tail) @intCast(stat.size) else 0;
+            if (self.native_encoding) |encoding| if (offset % encoding.width() != 0) {
+                self.health = .malformed_record;
+                return error.MisalignedOffset;
+            };
             self.committed = try newResume(f, offset, self.framing, self.start);
             self.committed.?.codec_configuration_hash = self.codec_configuration_hash;
         }
         self.file = f;
+        self.health = .healthy;
+        return true;
+    }
+
+    /// Recovery checks the committed anchor even when its descriptor remained
+    /// open during an outage. Unlike ordinary copytruncate handling, this never
+    /// invents a new incarnation or advances/clears the acknowledged position.
+    /// False is only possible for a new source that has not appeared yet.
+    pub fn verifyContinuity(self: *FileSource) !bool {
+        if (self.committed) |r| if (r.codec_configuration_hash != null and self.frame_callback == null and self.native_encoding == null)
+            return error.FramingProfileMismatch;
+        if (!try self.attach()) return false;
+        const file = self.file.?;
+        const r = self.committed.?;
+        const stat = std.posix.fstat(file.handle) catch |err| {
+            self.health = .read_failed;
+            return err;
+        };
+        const fingerprint = prefix(file, r.prefix_len) catch |err| {
+            self.health = if (err == error.ResumeLost) .resume_lost else .read_failed;
+            return err;
+        };
+        if (!std.posix.S.ISREG(stat.mode) or stat.dev != r.device or stat.ino != r.inode or
+            stat.size < 0 or @as(u64, @intCast(stat.size)) < r.offset or
+            !std.mem.eql(u8, &fingerprint, &r.prefix_hash))
+        {
+            self.health = .resume_lost;
+            return error.ResumeLost;
+        }
         self.health = .healthy;
         return true;
     }
@@ -233,7 +303,7 @@ pub const FileSource = struct {
     /// A detected copytruncate starts a fresh incarnation. Truncate-and-regrow
     /// between observations with an identical prefix cannot be proven detectable.
     pub fn poll(self: *FileSource, callback: records.AckCallback, userdata: ?*anyopaque) !bool {
-        if (self.committed) |saved_resume| if (saved_resume.codec_configuration_hash != null and self.frame_callback == null) return error.FramingProfileMismatch;
+        if (self.committed) |saved_resume| if (saved_resume.codec_configuration_hash != null and self.frame_callback == null and self.native_encoding == null) return error.FramingProfileMismatch;
         if (!try self.attach()) return false;
         try self.finishEofCheck();
         const f = self.file.?;
@@ -263,6 +333,7 @@ pub const FileSource = struct {
         var frame_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer frame_arena.deinit();
         var predecoded: ?records.Predecoded = null;
+        var native_payload_len: ?usize = null;
         while (true) {
             const remaining = self.max_record_bytes -| line.items.len;
             const count = f.pread(chunk[0..@min(chunk.len, remaining)], offset) catch |err| {
@@ -295,6 +366,17 @@ pub const FileSource = struct {
                     self.in_operation = true;
                     self.health = .healthy;
                     return false;
+                }
+            } else if (self.native_encoding) |encoding| {
+                const framed = native_text.frame(encoding, line.items, r.offset) catch |err| {
+                    self.health = .malformed_record;
+                    return err;
+                };
+                if (framed) |result| {
+                    native_payload_len = result.payload.len;
+                    line.shrinkRetainingCapacity(result.consumed);
+                    offset = r.offset + result.consumed;
+                    break;
                 }
             } else if (recordEnd(self.framing, line.items, r.offset)) |end| {
                 line.shrinkRetainingCapacity(end);
@@ -353,7 +435,7 @@ pub const FileSource = struct {
         const cursor = try std.json.stringifyAlloc(self.allocator, next, .{});
         defer self.allocator.free(cursor);
         if (predecoded) |decoded| if (!std.mem.eql(u8, &decoded.raw_hash, &hash)) return error.InvalidFramingResult;
-        const message = if (predecoded != null) line.items else stripTerminator(self.framing, line.items);
+        const message = if (native_payload_len) |length| line.items[0..length] else if (predecoded != null) line.items else stripTerminator(self.framing, line.items);
         callback(.{ .source = self.source_id, .source_path = self.path, .occurrence = identity, .cursor = cursor, .message = message, .raw_hash = hash, .predecoded = predecoded, .byte_start = r.offset, .byte_end = offset }, userdata) catch |err| {
             self.health = .commit_failed;
             return err;
@@ -407,6 +489,27 @@ const Collector = struct {
         try self.lines.append(try testing.allocator.dupe(u8, r.message));
     }
 };
+
+test "durable file: recovery detects truncation on retained descriptors without resetting the cursor" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "input", .data = "ordinary first event\nordinary unread event\n" });
+    const path = try tmp.dir.realpathAlloc(testing.allocator, "input");
+    defer testing.allocator.free(path);
+    var source = try FileSource.init(testing.allocator, path, "fixture", .head, null);
+    defer source.deinit();
+    var collector = Collector.init();
+    defer collector.deinit();
+    try testing.expect(try source.poll(Collector.ack, &collector));
+    const saved = source.acknowledgedCheckpoint().?;
+    try testing.expect(try source.verifyContinuity());
+    // The descriptor stays open, as it would while storage pauses ingestion.
+    try tmp.dir.writeFile(.{ .sub_path = "input", .data = "new\n" });
+    try testing.expectError(error.ResumeLost, source.verifyContinuity());
+    try testing.expectEqual(records.Health.resume_lost, source.health);
+    try testing.expectEqualDeep(saved, source.acknowledgedCheckpoint().?);
+    try testing.expectEqual(@as(usize, 1), collector.lines.items.len);
+}
 
 test "durable file: partial records, failed commit, same-content occurrences and restart" {
     var tmp = testing.tmpDir(.{});
@@ -622,7 +725,9 @@ fn expandAt(allocator: Allocator, base: []const u8, remaining: []const u8, out: 
             };
             if (stat.kind != .file) continue;
             if (out.items.len >= limit) return error.SourceLimit;
-            try out.append(try allocator.dupe(u8, path));
+            const owned_path = try allocator.dupe(u8, path);
+            errdefer allocator.free(owned_path);
+            try out.append(owned_path);
         }
     }
 }

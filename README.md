@@ -21,11 +21,17 @@ The importer translates supported fail2ban jail settings into native TOML and re
 unsupported configurations that need operator changes. Broader supported migration and
 bounded native custom rules remain development work; exact fail2ban compatibility is not promised.
 
-This checkout is **0.3.1-dev**, unpublished. Its new source components still use Python and
-dynamically loaded SQLite/libsystemd; they are not the daemon's general processing path.
-The corrected direction removes project-owned Python, embeds upstream SQLite statically,
-and consolidates daemon/admin functions into one executable with **zero external runtime
-dependencies** for supported modes. That work is not complete. See
+This checkout is **0.3.1-dev**, unpublished. The default daemon retains its existing ingestion
+and binary state. An explicit [native ingestion preview](docs/parity/native-runtime.md) now
+connects native sources, transactional retry decisions and embedded SQLite to the daemon,
+with actual file/restart tests on Linux and static musl. It currently admits log-only policy;
+enforcing operation and full N2 acceptance remain open. Legacy staged Python/libsystemd
+consumers also remain until their replacements are qualified.
+The corrected direction removes the remaining project-owned Python
+and consolidates daemon/admin functions into one self-contained executable. OS requirements
+remain explicit: journal input uses the host's journald and journalctl. That integration is
+retained; the application does not need to embed its own journal reader. The broader
+transformation is not complete. See
 [current components](docs/parity/p2-components.md) and [delivery contract](docs/parity/profile-contract.md).
 
 ---
@@ -469,6 +475,18 @@ eBPF/XDP (NIC-level drop) is on the roadmap; it is not scheduled.
 - State file format v4 records whether each ban was enforced; v1–v3 files
   still load. A `state_file` under `/run` or on tmpfs logs a warning at
   startup: it will not survive a reboot
+
+The unpublished candidate reports the state/temporary-file path and underlying creation
+error when saving fails. A failed state save prevents advancing the saved journal cursor;
+failed journal flushes remain pending for retry. This improves recovery but does not make
+the two files a single crash-atomic transaction. The configured state directory must already
+exist and be writable inside the daemon's service environment. The shipped systemd unit
+provides `/var/lib/fail2zig`; custom paths must also satisfy its filesystem restrictions.
+The candidate refuses startup with exit code 1 if its persistence availability check fails,
+before firewall initialization or log ingestion. It checks the state path and, when journal
+input is selected, the cursor sidecar path. Disposable files test writing, syncing and renaming
+without overwriting saved state. The error names the path, operation and OS cause. Repair the
+directory or service access and restart; this check cannot guarantee against later disk failures.
 
 ### IPC & metrics
 

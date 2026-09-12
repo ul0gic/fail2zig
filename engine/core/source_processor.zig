@@ -8,6 +8,7 @@ const records = @import("source_record.zig");
 const pipeline = @import("record_pipeline.zig");
 const times = @import("event_time.zig");
 const lines = @import("line_context.zig");
+const time_policy = @import("source_time_policy.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Options = struct {
@@ -49,6 +50,7 @@ pub const Observation = struct {
     stored_bits: ?[]const u8,
     origin: ?times.Origin,
     diagnostic: bool,
+    rejection: ?time_policy.Reason = null,
 };
 pub const Snapshot = struct {
     schema_version: u32 = 2,
@@ -60,6 +62,7 @@ pub const Snapshot = struct {
     date_context: std.json.Value,
     last_date_bits: ?[]const u8 = null,
     last: ?Observation = null,
+    time_counters: time_policy.Counters = .{},
 };
 
 pub const ModeSelector = struct {
@@ -84,6 +87,25 @@ pub const SourceProcessor = struct {
     profile_hash: []u8,
     now: f64,
     usage_time: f64,
+    time_health: time_policy.Health = .{},
+
+    /// Readable without decoding a checkpoint or touching unavailable storage.
+    pub fn timeHealth(self: *const SourceProcessor) time_policy.Counters {
+        return self.time_health.snapshot();
+    }
+
+    /// The native coordinator supplies monotonic time and logs this bounded
+    /// notice. This component does not silently create another wall-clock timer.
+    pub fn timeNotice(self: *SourceProcessor, monotonic_ms: u64) ?time_policy.Notice {
+        return self.time_health.nextNotice(monotonic_ms);
+    }
+
+    pub fn logTimeRejections(self: *SourceProcessor, monotonic_ms: u64) void {
+        if (self.timeNotice(monotonic_ms)) |notice| std.log.scoped(.source_time).warn(
+            "jail {s}: records rejected since last notice: missing timestamps={d}, malformed timestamps={d}, future timestamps={d}; these records did not contribute detection evidence",
+            .{ self.options.identity.jail_id, notice.missing_since_notice, notice.malformed_since_notice, notice.future_since_notice },
+        );
+    }
 
     pub fn init(allocator: Allocator, options: Options, now: f64, usage_time: f64) !SourceProcessor {
         try lines.validate(.{}, options.line_limits);
@@ -219,7 +241,7 @@ pub const SourceProcessor = struct {
     }
 
     pub fn adapter(self: *SourceProcessor) pipeline.Processor {
-        return .{ .context = self, .prepare = prepare, .restore = restore };
+        return .{ .context = self, .prepare = prepare, .prepare_restore = prepareRestore };
     }
 
     pub fn snapshot(self: *const SourceProcessor, allocator: Allocator) !std.json.Parsed(Snapshot) {
@@ -241,11 +263,18 @@ pub const SourceProcessor = struct {
         if (value.schema_version != 2 or !std.mem.eql(u8, value.profile_hash, self.profile_hash) or !std.mem.eql(u8, value.config_generation, self.options.identity.config_generation)) return error.CheckpointProfileMismatch;
         if (!std.mem.eql(u8, &value.configuration_hash, &(try configurationHash(self.allocator, self.options)))) return error.CheckpointProfileMismatch;
         try lines.validate(value.line_context, self.options.line_limits);
+        try value.time_counters.validate();
         if (value.codec_context != .object or value.date_context != .object) return error.InvalidCheckpoint;
         if (value.last_date_bits) |bits| _ = try parseBits(bits);
     }
 
     fn restore(checkpoint: ?[]const u8, context: ?*anyopaque) !void {
+        const staged = try prepareRestore(checkpoint, context);
+        defer staged.release(staged.context);
+        staged.publish(staged.context);
+    }
+
+    fn prepareRestore(checkpoint: ?[]const u8, context: ?*anyopaque) !pipeline.Restored {
         const self: *SourceProcessor = @ptrCast(@alignCast(context orelse return error.MissingProcessor));
         if (self.in_flight) return error.ProcessorBusy;
         const payload = checkpoint orelse self.initial;
@@ -254,18 +283,26 @@ pub const SourceProcessor = struct {
         defer parsed.deinit();
         try self.validateSnapshot(parsed.value);
         const owned = try self.allocator.dupe(u8, payload);
-        self.allocator.free(self.committed);
-        self.committed = owned;
+        errdefer self.allocator.free(owned);
+        const staged = try self.allocator.create(Staged);
+        staged.* = .{ .owner = self, .bytes = owned, .time_counters = parsed.value.time_counters, .restoring = true };
+        self.in_flight = true;
+        return .{ .context = staged, .publish = Staged.publish, .release = Staged.release };
     }
 
     const Staged = struct {
         owner: *SourceProcessor,
         bytes: []u8,
         published: bool = false,
+        time_counters: time_policy.Counters,
+        restoring: bool = false,
         fn publish(context: ?*anyopaque) void {
             const self: *Staged = @ptrCast(@alignCast(context.?));
             self.owner.allocator.free(self.owner.committed);
             self.owner.committed = self.bytes;
+            if (self.restoring) {
+                self.owner.time_health = time_policy.Health.init(self.time_counters) catch unreachable;
+            } else self.owner.time_health.publish(self.time_counters);
             self.published = true;
         }
         fn release(context: ?*anyopaque) void {
@@ -380,18 +417,32 @@ pub const SourceProcessor = struct {
             else
                 self.options.mode;
             const normalized = try normalizer.normalize(input, try times.EventTime.init(self.now), self.options.findtime, mode, self.options.check_findtime);
+            next.time_counters = try next.time_counters.counted(switch (normalized.disposition) {
+                .accepted => .eligible,
+                .obsolete => .obsolete,
+                .rejected => switch (normalized.rejection.?) {
+                    .missing => .missing,
+                    .future => .future,
+                    else => .malformed,
+                },
+                .undated => return error.UndatedPolicyRequired,
+            }, .event);
             const staged_lines = try lines.stage(arena, next.line_context, .{ .line = text, .parts = parts, .event_input = input, .previous_date = previous_date, .now = try times.EventTime.init(self.now), .normalized = normalized }, self.options.line_limits);
             next.line_context = staged_lines.snapshot;
             next.last_date_bits = if (normalizer.last_date) |value| try bitsText(arena, value.seconds) else null;
             next.last = .{ .source = record.source, .occurrence = record.occurrence, .message = try stringField(decoded, "text"), .codec_disposition = try stringField(decoded, "disposition"), .codec_diagnostic = try optionalStringField(decoded, "diagnostic"), .codec_warning_due = try boolField(decoded, "warning_due"), .date_kind = date_kind, .date_raw_timestamp_bits = date_raw, .timestamp_us = record.timestamp_us, .now_bits = now_bits, .usage_time_bits = usage_bits, .disposition = normalized.disposition, .mode = mode, .raw_bits = try optionalBits(arena, normalized.raw), .effective_bits = try optionalBits(arena, normalized.effective), .stored_bits = try optionalBits(arena, normalized.stored), .origin = normalized.origin, .diagnostic = normalized.diagnostic };
-            disposition = @tagName(normalized.disposition);
+            next.last.?.rejection = normalized.rejection;
+            disposition = if (normalized.rejection) |rejection_reason|
+                (time_policy.Result{ .rejected = .{ .reason = rejection_reason } }).disposition()
+            else
+                @tagName(normalized.disposition);
             effective_time = if (normalized.effective) |value| value.seconds else null;
         }
         const bytes = try std.json.stringifyAlloc(self.allocator, next, .{});
         errdefer self.allocator.free(bytes);
         if (bytes.len > 16 * 1024 * 1024) return error.CheckpointLimit;
         const staged = try self.allocator.create(Staged);
-        staged.* = .{ .owner = self, .bytes = bytes };
+        staged.* = .{ .owner = self, .bytes = bytes, .time_counters = next.time_counters };
         self.in_flight = true;
         return .{ .checkpoint = bytes, .disposition = disposition, .event_time = effective_time, .context = staged, .publish = Staged.publish, .release = Staged.release };
     }
@@ -400,11 +451,52 @@ pub const SourceProcessor = struct {
 /// Operational startup/live/replay mode is per-record provenance, not immutable
 /// configuration. Decoder/date rules, window and findtime policy are bound here.
 fn configurationHash(allocator: Allocator, options: Options) ![32]u8 {
-    const bytes = try std.json.stringifyAlloc(allocator, .{ .encoding = options.encoding, .date_patterns = options.date_patterns, .reference_year = options.reference_year, .default_tz = options.default_tz, .findtime_bits = @as(u64, @bitCast(options.findtime)), .check_findtime = options.check_findtime, .line_limits = options.line_limits, .source_configuration_hash = options.source_configuration_hash, .expected_profile_hash = options.expected_profile_hash }, .{});
+    const bytes = try std.json.stringifyAlloc(allocator, .{ .event_time_policy_version = times.policy_version, .native_time_policy_version = time_policy.version, .encoding = options.encoding, .date_patterns = options.date_patterns, .reference_year = options.reference_year, .default_tz = options.default_tz, .findtime_bits = @as(u64, @bitCast(options.findtime)), .check_findtime = options.check_findtime, .line_limits = options.line_limits, .source_configuration_hash = options.source_configuration_hash, .expected_profile_hash = options.expected_profile_hash }, .{});
     defer allocator.free(bytes);
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
     return hash;
+}
+
+test "event age: previous-policy snapshots and file cursors cannot pass the new binding" {
+    const a = std.testing.allocator;
+    const options = Options{ .python = "", .script = "", .identity = .{ .daemon_epoch = "fixture", .worker_epoch = "fixture", .config_generation = "fixture", .jail_id = "fixture" }, .date_patterns = &.{"EPOCH"}, .reference_year = 2026 };
+    var profile = "fixture-profile".*;
+    // Binding validation and framingIdentity do not use a worker. All slices
+    // below are borrowed; do not call the worker-owning init/deinit methods.
+    var processor = SourceProcessor{ .allocator = a, .options = options, .worker = undefined, .committed = &.{}, .initial = &.{}, .profile_hash = &profile, .now = 0, .usage_time = 0, .max_record_bytes = 1024 * 1024 };
+    var saved = Snapshot{ .profile_hash = &profile, .config_generation = "fixture", .configuration_hash = try configurationHash(a, options), .codec_context = .{ .object = std.json.ObjectMap.init(a) }, .date_context = .{ .object = std.json.ObjectMap.init(a) } };
+    try processor.validateSnapshot(saved);
+    // Frozen canonical inputs before event-age versioning and before native
+    // missing/malformed rejection, plus the counter format before native future
+    // admission. Every previous binding must be refused.
+    const earlier = [_][]const u8{
+        "{\"encoding\":\"utf-8\",\"date_patterns\":[\"EPOCH\"],\"reference_year\":2026,\"default_tz\":null,\"findtime_bits\":4648488871632306176,\"check_findtime\":true,\"line_limits\":{\"max_lines\":1,\"max_bytes\":1048576},\"source_configuration_hash\":null,\"expected_profile_hash\":null}",
+        "{\"event_time_policy_version\":1,\"encoding\":\"utf-8\",\"date_patterns\":[\"EPOCH\"],\"reference_year\":2026,\"default_tz\":null,\"findtime_bits\":4648488871632306176,\"check_findtime\":true,\"line_limits\":{\"max_lines\":1,\"max_bytes\":1048576},\"source_configuration_hash\":null,\"expected_profile_hash\":null}",
+        "{\"event_time_policy_version\":2,\"encoding\":\"utf-8\",\"date_patterns\":[\"EPOCH\"],\"reference_year\":2026,\"default_tz\":null,\"findtime_bits\":4648488871632306176,\"check_findtime\":true,\"line_limits\":{\"max_lines\":1,\"max_bytes\":1048576},\"source_configuration_hash\":null,\"expected_profile_hash\":null}",
+    };
+    for (earlier) |previous| {
+        std.crypto.hash.sha2.Sha256.hash(previous, &saved.configuration_hash, .{});
+        try std.testing.expectError(error.CheckpointProfileMismatch, processor.validateSnapshot(saved));
+        var old_framing_hash = std.crypto.hash.sha2.Sha256.init(.{});
+        old_framing_hash.update(&saved.configuration_hash);
+        old_framing_hash.update(&profile);
+        var framing: [32]u8 = undefined;
+        old_framing_hash.final(&framing);
+        const file_mod = @import("durable_file_source.zig");
+        var source = try file_mod.FileSource.init(a, "unused-fixture.log", "fixture", .head, .{
+            .incarnation = [_]u8{0} ** 16,
+            .device = 0,
+            .inode = 0,
+            .offset = 0,
+            .prefix_len = 0,
+            .prefix_hash = [_]u8{0} ** 32,
+            .codec_configuration_hash = framing,
+        });
+        defer source.deinit();
+        try std.testing.expectError(error.FramingProfileMismatch, processor.bindFile(&source));
+        try std.testing.expectEqualSlices(u8, &framing, &source.acknowledgedCheckpoint().?.codec_configuration_hash.?);
+    }
 }
 
 pub fn journalTime(timestamp_us: u64) !times.EventTime {
@@ -412,6 +504,44 @@ pub fn journalTime(timestamp_us: u64) !times.EventTime {
     // has enough precision for every u64 microsecond value and binary64 result.
     const seconds: f128 = @as(f128, @floatFromInt(timestamp_us)) / 1_000_000.0;
     return times.EventTime.init(@floatCast(seconds));
+}
+
+test "time admission: staged processor restores health atomically without launching a worker" {
+    const a = std.testing.allocator;
+    const options = Options{ .python = "", .script = "", .identity = .{ .daemon_epoch = "fixture", .worker_epoch = "fixture", .config_generation = "fixture", .jail_id = "fixture" }, .date_patterns = &.{"EPOCH"}, .reference_year = 2026 };
+    var profile = "fixture-profile".*;
+    var saved = Snapshot{ .profile_hash = &profile, .config_generation = "fixture", .configuration_hash = try configurationHash(a, options), .codec_context = .{ .object = std.json.ObjectMap.init(a) }, .date_context = .{ .object = std.json.ObjectMap.init(a) } };
+    const initial = try std.json.stringifyAlloc(a, saved, .{});
+    defer a.free(initial);
+    // Only checkpoint prepare/restore paths are used. Worker-owned lifecycle and
+    // data operations must never be called by this native test.
+    var processor = SourceProcessor{ .allocator = a, .options = options, .worker = undefined, .committed = try a.dupe(u8, initial), .initial = initial, .profile_hash = &profile, .now = 1000, .usage_time = 1000, .max_record_bytes = 4096 };
+    defer a.free(processor.committed);
+    saved.time_counters = .{ .eligible = 2, .missing = 1, .malformed = 3, .adjusted = 1, .future = 2 };
+    const restored = try std.json.stringifyAlloc(a, saved, .{});
+    defer a.free(restored);
+    const discarded = try SourceProcessor.prepareRestore(restored, &processor);
+    try std.testing.expectEqualDeep(time_policy.Counters{}, processor.timeHealth());
+    try std.testing.expectError(error.ProcessorBusy, SourceProcessor.prepareRestore(restored, &processor));
+    discarded.release(discarded.context);
+    try std.testing.expectEqualStrings(initial, processor.committed);
+    const staged = try SourceProcessor.prepareRestore(restored, &processor);
+    staged.publish(staged.context);
+    staged.release(staged.context);
+    try std.testing.expectEqualDeep(saved.time_counters, processor.timeHealth());
+    try std.testing.expect(processor.timeNotice(0) == null); // restore is not a new rejection
+    saved.time_counters.receipt = 100;
+    const invalid = try std.json.stringifyAlloc(a, saved, .{});
+    defer a.free(invalid);
+    try std.testing.expectError(error.InvalidTimeCounters, SourceProcessor.prepareRestore(invalid, &processor));
+    try std.testing.expectEqualStrings(restored, processor.committed);
+    // Baseline records preserve the validated counters and do not count as data.
+    const baseline = try SourceProcessor.prepare(.{ .kind = .checkpoint, .source = "fixture", .occurrence = "baseline", .cursor = "0", .message = "", .raw_hash = [_]u8{0} ** 32 }, &processor);
+    baseline.publish(baseline.context);
+    baseline.release(baseline.context);
+    try std.testing.expectEqualDeep(time_policy.Counters{ .eligible = 2, .missing = 1, .malformed = 3, .adjusted = 1, .future = 2 }, processor.timeHealth());
+    try std.testing.expectEqual(@as(u64, 0), processor.sequence);
+    try std.testing.expect(processor.timeNotice(60_000) == null);
 }
 
 fn field(value: std.json.Value, name: []const u8) !std.json.Value {
@@ -536,15 +666,18 @@ test "source processor: actual file worker SQLite transaction rollback and resto
     try std.testing.expect(try reopened.poll(pipeline.Pipeline.acknowledge, &restarted_pipeline));
     var missing = try restarted.snapshot(allocator);
     defer missing.deinit();
-    try std.testing.expectEqual(@as(usize, 2), missing.value.line_context.lines.len);
+    try std.testing.expectEqual(@as(usize, 1), missing.value.line_context.lines.len);
     try std.testing.expectEqualStrings("1730000000.125", missing.value.line_context.processed.?.time);
-    try std.testing.expectEqualStrings("ordinary continuation", missing.value.line_context.processed.?.suffix);
-    try std.testing.expectEqual(times.Origin.recent_context, missing.value.last.?.origin.?);
-    try std.testing.expectEqual(@as(f64, 1730000000.125), (try parseBits(missing.value.last.?.effective_bits.?)).seconds);
+    try std.testing.expectEqualStrings(first.value.line_context.processed.?.suffix, missing.value.line_context.processed.?.suffix);
+    try std.testing.expectEqual(times.Disposition.rejected, missing.value.last.?.disposition);
+    try std.testing.expect(missing.value.last.?.origin == null);
+    try std.testing.expectEqual(@import("source_time_policy.zig").Reason.missing, missing.value.last.?.rejection.?);
+    try std.testing.expect(missing.value.last.?.effective_bits == null);
+    try std.testing.expect(missing.value.last.?.stored_bits == null);
     try std.testing.expect(try reopened.poll(pipeline.Pipeline.acknowledge, &restarted_pipeline));
     var obsolete = try restarted.snapshot(allocator);
     defer obsolete.deinit();
-    try std.testing.expectEqual(@as(usize, 2), obsolete.value.line_context.lines.len);
+    try std.testing.expectEqual(@as(usize, 1), obsolete.value.line_context.lines.len);
     try std.testing.expectEqualStrings("1729998000", obsolete.value.line_context.last_time_text);
     try std.testing.expectEqual(times.Disposition.obsolete, obsolete.value.last.?.disposition);
     try std.testing.expect(obsolete.value.last.?.stored_bits == null);
@@ -552,7 +685,7 @@ test "source processor: actual file worker SQLite transaction rollback and resto
     try std.testing.expect(try reopened.poll(pipeline.Pipeline.acknowledge, &restarted_pipeline));
     var corrected = try restarted.snapshot(allocator);
     defer corrected.deinit();
-    try std.testing.expectEqual(@as(usize, 3), corrected.value.line_context.lines.len);
+    try std.testing.expectEqual(@as(usize, 2), corrected.value.line_context.lines.len);
     try std.testing.expectEqualStrings("1730001000", corrected.value.line_context.processed.?.time);
     try std.testing.expectEqual(times.Origin.live_correction, corrected.value.last.?.origin.?);
     try std.testing.expectEqual(@as(f64, 1730000001.25), (try parseBits(corrected.value.last.?.effective_bits.?)).seconds);
@@ -625,7 +758,8 @@ test "source processor: actual codec-aware EOF framing preserves raw cursor and 
     var second = try processor.snapshot(allocator);
     defer second.deinit();
     try std.testing.expectEqualStrings("ordinary continuation", second.value.last.?.message);
-    try std.testing.expectEqual(times.Origin.recent_context, second.value.last.?.origin.?);
+    try std.testing.expectEqual(times.Disposition.rejected, second.value.last.?.disposition);
+    try std.testing.expect(second.value.last.?.origin == null);
     try std.testing.expectEqual(@as(u64, first_raw.len + second_raw.len), reopened.acknowledgedCheckpoint().?.offset);
     try writer.writeAll("partial");
     const before_partial = try allocator.dupe(u8, processor.committed);

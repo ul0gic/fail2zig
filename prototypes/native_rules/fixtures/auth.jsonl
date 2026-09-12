@@ -1,0 +1,3 @@
+{"event":"auth_failed","client":"192.0.2.10","account":"guest"}
+{"event":"auth_ok","client":"192.0.2.10","account":"guest"}
+{"event":"auth_failed","client":"192.0.2.10","account":"healthcheck"}

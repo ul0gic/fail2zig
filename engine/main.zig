@@ -26,6 +26,7 @@ pub const parser_mod = @import("core/parser.zig");
 pub const state_mod = @import("core/state.zig");
 pub const tracker_map_mod = @import("core/tracker_map.zig");
 pub const persist_mod = @import("core/persist.zig");
+pub const native_store_mod = @import("core/record_store.zig");
 const reconcile_mod = @import("core/reconcile.zig");
 pub const firewall = @import("firewall/backend.zig");
 pub const config_mod = @import("config/native.zig");
@@ -497,7 +498,7 @@ fn flushStateThenCursors(
     trackers: *tracker_map_mod.TrackerMap,
     state_path: []const u8,
     journald: ?*journald_source_mod.JournaldSource,
-) void {
+) bool {
     if (persist_mod.saveAll(trackers, state_path)) |_| {
         if (std.fs.cwd().statFile(state_path)) |st| {
             std.log.info("persist: state saved to {s} ({d} bytes)", .{ state_path, st.size });
@@ -505,17 +506,20 @@ fn flushStateThenCursors(
             std.log.info("persist: state saved to {s}", .{state_path});
         }
     } else |err| {
-        std.log.warn("persist: state save failed: {s}", .{@errorName(err)});
+        std.log.warn("persist: state save failed for '{s}' (temporary file '{s}.tmp'): {s}; journal cursor save skipped", .{ state_path, state_path, @errorName(err) });
+        return false;
     }
     if (journald) |jd| {
         if (jd.hasJails()) {
             var buf: [journald_source_mod.max_jails]journald_source_mod.CursorEntry = undefined;
             const cursors = jd.collectCursors(&buf);
             journald_source_mod.saveCursors(cursors, jd.cursor_path) catch |err| {
-                std.log.warn("journald: cursor sidecar save failed: {s}", .{@errorName(err)});
+                std.log.warn("journald: cursor sidecar save failed for '{s}' (temporary file '{s}.tmp'): {s}; save remains pending", .{ jd.cursor_path, jd.cursor_path, @errorName(err) });
+                return false;
             };
         }
     }
+    return true;
 }
 
 const JournaldFlushContext = struct {
@@ -524,9 +528,126 @@ const JournaldFlushContext = struct {
     journald: *journald_source_mod.JournaldSource,
 };
 
-fn journaldFlushHook(userdata: ?*anyopaque) void {
+fn journaldFlushHook(userdata: ?*anyopaque) bool {
     const ctx: *JournaldFlushContext = @ptrCast(@alignCast(userdata.?));
-    flushStateThenCursors(ctx.trackers, ctx.state_path, ctx.journald);
+    return flushStateThenCursors(ctx.trackers, ctx.state_path, ctx.journald);
+}
+
+test "persist: failed state save preserves cursor and retry commits both files" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+    const path = try std.fs.path.join(a, &.{ dir, "state.bin" });
+    defer a.free(path);
+    var loop = try event_loop_mod.EventLoop.init(a);
+    defer loop.deinit();
+    var source = try journald_source_mod.JournaldSource.init(a, &loop, path, .{});
+    defer source.deinit();
+    const jail = try shared.JailId.fromSlice("sshd");
+    try source.addJail(jail, "sshd", lineCallback, null);
+    var trackers = tracker_map_mod.TrackerMap.init(a);
+    defer trackers.deinit();
+    const tracker = try trackers.addTracker("sshd", .{ .max_entries = 8 });
+    tracker.lifetime_bans = 1;
+    source.seedCursor("sshd", "s=old");
+    try std.testing.expect(flushStateThenCursors(&trackers, path, &source));
+
+    // A directory at the temporary-file path reliably fails creation even as root.
+    try tmp.dir.makeDir("state.bin.tmp");
+    tracker.lifetime_bans = 2;
+    source.seedCursor("sshd", "s=new");
+    var ctx = JournaldFlushContext{ .trackers = &trackers, .state_path = path, .journald = &source };
+    source.setFlushHook(journaldFlushHook, &ctx);
+    source.dirty = true;
+    source.maybeFlush();
+    try std.testing.expect(source.dirty);
+    {
+        const saved = try journald_source_mod.loadCursors(a, source.cursor_path);
+        defer {
+            for (saved) |entry| {
+                a.free(entry.name);
+                a.free(entry.cursor);
+            }
+            a.free(saved);
+        }
+        try std.testing.expectEqual(@as(usize, 1), saved.len);
+        try std.testing.expectEqualStrings("s=old", saved[0].cursor);
+        const state = try persist_mod.loadFull(a, path);
+        defer state.deinit(a);
+        try std.testing.expectEqual(@as(u64, 1), state.lifetimes[0].lifetime_bans);
+    }
+    try tmp.dir.deleteDir("state.bin.tmp");
+    source.maybeFlush();
+    try std.testing.expect(!source.dirty);
+    const saved = try journald_source_mod.loadCursors(a, source.cursor_path);
+    defer {
+        for (saved) |entry| {
+            a.free(entry.name);
+            a.free(entry.cursor);
+        }
+        a.free(saved);
+    }
+    try std.testing.expectEqualStrings("s=new", saved[0].cursor);
+    const state = try persist_mod.loadFull(a, path);
+    defer state.deinit(a);
+    try std.testing.expectEqual(@as(u64, 2), state.lifetimes[0].lifetime_bans);
+}
+
+test "persist: failed sidecar save remains pending and retries without new records" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+    const path = try std.fs.path.join(a, &.{ dir, "state.bin" });
+    defer a.free(path);
+    var loop = try event_loop_mod.EventLoop.init(a);
+    defer loop.deinit();
+    var source = try journald_source_mod.JournaldSource.init(a, &loop, path, .{});
+    defer source.deinit();
+    try source.addJail(try shared.JailId.fromSlice("sshd"), "sshd", lineCallback, null);
+    source.seedCursor("sshd", "s=retry");
+    var trackers = tracker_map_mod.TrackerMap.init(a);
+    defer trackers.deinit();
+    var ctx = JournaldFlushContext{ .trackers = &trackers, .state_path = path, .journald = &source };
+    source.setFlushHook(journaldFlushHook, &ctx);
+    try tmp.dir.makeDir("journald-cursors.bin.tmp");
+    source.dirty = true;
+    source.maybeFlush();
+    try std.testing.expect(source.dirty);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile("journald-cursors.bin"));
+    _ = try tmp.dir.statFile("state.bin");
+    try tmp.dir.deleteDir("journald-cursors.bin.tmp");
+    source.maybeFlush();
+    try std.testing.expect(!source.dirty);
+    const saved = try journald_source_mod.loadCursors(a, source.cursor_path);
+    defer {
+        for (saved) |entry| {
+            a.free(entry.name);
+            a.free(entry.cursor);
+        }
+        a.free(saved);
+    }
+    try std.testing.expectEqual(@as(usize, 1), saved.len);
+    try std.testing.expectEqualStrings("s=retry", saved[0].cursor);
+}
+
+test "persist: save APIs preserve missing-directory errors" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+    const path = try std.fs.path.join(a, &.{ dir, "missing", "state.bin" });
+    defer a.free(path);
+    var trackers = tracker_map_mod.TrackerMap.init(a);
+    defer trackers.deinit();
+    try std.testing.expectError(error.FileNotFound, persist_mod.saveAll(&trackers, path));
+    try std.testing.expectError(error.FileNotFound, journald_source_mod.saveCursors(&.{}, path));
 }
 
 fn onTerminate(siginfo: *const linux.signalfd_siginfo, userdata: ?*anyopaque) void {
@@ -943,8 +1064,27 @@ fn noUsableBackend(cfg: *const config_mod.Config, cause: commands_mod.NoBackendC
 fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
     const level = std.meta.stringToEnum(std.log.Level, @tagName(cfg.global.log_level)) orelse .info;
     runtime_log_level.store(@intFromEnum(level), .monotonic);
+    if (cfg.global.native_ingestion) return @import("native_daemon.zig").run(heap, cfg) catch |err|
+        failClosed(err, "native: startup failed: {s}; refusing to start", .{@errorName(err)});
     var trace = StartupTrace.init(heap);
     defer trace.report();
+
+    // Refuse broken persistence before backend probing, firewall initialization or sources.
+    var storage_operation: persist_mod.PreflightOperation = .validate_path;
+    persist_mod.checkWritable(cfg.global.state_file, &storage_operation) catch |err|
+        return failClosed(err, "persist: startup check {s} failed for '{s}' (temporary path '{s}.tmp'): {s}; refusing to start", .{ @tagName(storage_operation), cfg.global.state_file, cfg.global.state_file, @errorName(err) });
+    for (cfg.jails) |*jc| {
+        if (!jc.enabled) continue;
+        const source = resolveJailSource(jc, config_mod.anyLogpathExists(jc.logpath), config_mod.journalctlPresent(), journald_source_mod.selectorsForFilter(jc.filter) != null);
+        if (source != .journald) continue;
+        var cursor_buf: [4096]u8 = undefined;
+        const cursor_path = journald_source_mod.cursorPath(cfg.global.state_file, &cursor_buf) catch |err|
+            return failClosed(err, "journald: cursor path for '{s}' is invalid: {s}; refusing to start", .{ cfg.global.state_file, @errorName(err) });
+        persist_mod.checkWritable(cursor_path, &storage_operation) catch |err|
+            return failClosed(err, "journald: startup check {s} failed for '{s}' (temporary path '{s}.tmp'): {s}; refusing to start", .{ @tagName(storage_operation), cursor_path, cursor_path, @errorName(err) });
+        break;
+    }
+    trace.mark("persistence_check");
 
     var metrics = metrics_mod.Metrics.init();
     for (cfg.jails) |jc| {
@@ -1365,7 +1505,7 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
 
     try loop.run();
 
-    flushStateThenCursors(&trackers, cfg.global.state_file, &journald);
+    _ = flushStateThenCursors(&trackers, cfg.global.state_file, &journald);
 
     std.log.info("fail2zig: shutting down", .{});
 }

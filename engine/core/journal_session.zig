@@ -33,6 +33,7 @@ pub const Session = struct {
     base_mode: times.Mode,
     selection_diagnostic: ?[]const u8,
     pending_mode: ?*ProposedMode = null,
+    notice_timer: std.time.Timer,
     const ProposedMode = struct { in_operation: bool, tail_marker: bool, boundary_time: f64 };
 
     /// Store, configuration strings and environment callback context must outlive
@@ -49,6 +50,7 @@ pub const Session = struct {
         const self = try allocator.create(Session);
         errdefer allocator.destroy(self);
         self.allocator = allocator;
+        self.notice_timer = try std.time.Timer.start();
         self.options = options;
         self.base_mode = processor_options.mode;
         self.selection_diagnostic = prepared.selectionDiagnostic();
@@ -129,7 +131,8 @@ pub const Session = struct {
     /// record or advancing durable state. Startup mode is reconstructed on restart
     /// against the new startup boundary, like the reference's run loop.
     pub fn poll(self: *Session, now: f64, usage_time: f64) !bool {
-        if (!self.pipe.ready) return error.RestoreRequired;
+        defer self.processor.logTimeRejections(self.notice_timer.read() / std.time.ns_per_ms);
+        try self.pipe.admit();
         try self.processor.setClock(now, usage_time);
         const delivered = try self.reader.poll(acknowledge, self);
         if (!delivered) self.in_operation = true;

@@ -91,6 +91,9 @@ pub const BanTimeIncrement = struct {
 };
 
 pub const GlobalConfig = struct {
+    /// Explicit development cutover. Native activation validates its supported
+    /// source/policy settings before opening state; existing state is not imported.
+    native_ingestion: bool = false,
     /// Protected preparation metadata; never interpreted as runtime commands.
     compatibility_manifest: []const u8 = "",
     compatibility_pending: bool = false,
@@ -120,6 +123,12 @@ pub const JailDefaults = struct {
 };
 
 pub const JailConfig = struct {
+    /// Native file input requires an explicit timestamp contract. The undated
+    /// setting is deliberate receipt-time admission, never a parser fallback.
+    timestamp: ?enum { iso8601, syslog, undated } = null,
+    timezone_offset_minutes: ?i16 = null,
+    /// Qualified installed SSH executables for native system-journal input.
+    journal_executables: []const []const u8 = &.{},
     compatibility_pending: bool = false,
     name: []const u8,
     enabled: bool = true,
@@ -247,6 +256,7 @@ pub const Config = struct {
 };
 
 pub const ValidationError = error{
+    NativeIngestionRequired,
     CompatibilityNotAdmitted,
     InvalidBantime,
     InvalidFindtime,
@@ -288,6 +298,7 @@ pub fn validate(cfg: *const Config) ValidationError!void {
     }
 
     for (cfg.jails, 0..) |j, i| {
+        if (!cfg.global.native_ingestion and (j.timestamp != null or j.timezone_offset_minutes != null or j.journal_executables.len != 0)) return error.NativeIngestionRequired;
         if (j.name.len == 0) return error.EmptyJailName;
         _ = shared.JailId.fromSlice(j.name) catch return error.InvalidJailName;
 
@@ -729,7 +740,9 @@ const Parser = struct {
 
     fn applyGlobalKey(self: *Parser, key: []const u8) Error!void {
         const v = try self.parseValue();
-        if (std.mem.eql(u8, key, "compatibility_manifest")) {
+        if (std.mem.eql(u8, key, "native_ingestion")) {
+            self.global.native_ingestion = try asBool(v);
+        } else if (std.mem.eql(u8, key, "compatibility_manifest")) {
             const manifest = try asString(v);
             _ = try decodeCompatibilityManifest(self.arena, manifest);
             self.global.compatibility_manifest = manifest;
@@ -830,7 +843,15 @@ const Parser = struct {
         const j = &self.jails.items[idx];
         const origin = &self.jail_source_origin.items[idx];
 
-        if (std.mem.eql(u8, key, "compatibility_pending")) {
+        if (std.mem.eql(u8, key, "timestamp")) {
+            j.timestamp = std.meta.stringToEnum(@typeInfo(@TypeOf(j.timestamp)).optional.child, try asString(v)) orelse return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "timezone_offset_minutes")) {
+            const n = try asInt(v);
+            if (n < -1439 or n > 1439) return error.InvalidValue;
+            j.timezone_offset_minutes = @intCast(n);
+        } else if (std.mem.eql(u8, key, "journal_executables")) {
+            j.journal_executables = try asStringArray(v);
+        } else if (std.mem.eql(u8, key, "compatibility_pending")) {
             j.compatibility_pending = try asBool(v);
         } else if (std.mem.eql(u8, key, "enabled")) {
             j.enabled = try asBool(v);

@@ -154,10 +154,16 @@ const Scenario = struct {
     }
 
     fn writeConfig(self: *Scenario, socket_path: []const u8, source_line: []const u8, mode: posix.mode_t) ![]u8 {
+        const state_path = try std.fmt.allocPrint(self.a, "{s}/state.bin", .{self.root});
+        defer self.a.free(state_path);
+        return self.writeConfigWithState(socket_path, source_line, mode, state_path);
+    }
+
+    fn writeConfigWithState(self: *Scenario, socket_path: []const u8, source_line: []const u8, mode: posix.mode_t, state_path: []const u8) ![]u8 {
         const text = try std.fmt.allocPrint(self.a,
             \\[global]
             \\socket_path = "{s}"
-            \\state_file = "{s}/state.bin"
+            \\state_file = "{s}"
             \\metrics_bind = "127.0.0.1"
             \\metrics_port = {d}
             \\memory_ceiling_mb = 64
@@ -171,7 +177,7 @@ const Scenario = struct {
             \\{s}
             \\logpath = ["{s}"]
             \\
-        , .{ socket_path, self.root, self.metrics_port, source_line, self.log_path });
+        , .{ socket_path, state_path, self.metrics_port, source_line, self.log_path });
         errdefer self.a.free(text);
 
         var f = try std.fs.cwd().createFile(self.config_path, .{ .truncate = true, .mode = 0o640 });
@@ -320,6 +326,119 @@ test "integration: fail-closed (d) backend = \"bogus\" exits 1 with path:line:co
     defer a.free(position);
     try expectContains(r.stderr, position);
     try expectContains(r.stderr, "(key 'backend' in [jails.sshd])");
+}
+
+fn expectStorageRefusal(r: *const Run, socket_path: []const u8) !void {
+    try expectFailClosed(r);
+    try expectContains(r.stderr, "refusing to start");
+    try expectNotContains(r.stderr, "firewall:");
+    try expectNotContains(r.stderr, "http:");
+    try testing.expectError(error.FileNotFound, std.fs.cwd().access(socket_path, .{}));
+}
+
+test "integration: persistence missing parent refuses startup before backend and listeners" {
+    const a = testing.allocator;
+    var s = try Scenario.init(a);
+    defer s.deinit();
+    const sock = try s.defaultSocketPath();
+    defer a.free(sock);
+    const state_path = try std.fmt.allocPrint(a, "{s}/missing/state.bin", .{s.root});
+    defer a.free(state_path);
+    const text = try s.writeConfigWithState(sock, "source = \"file\"", 0o640, state_path);
+    defer a.free(text);
+    var r = try s.run();
+    defer r.deinit(a);
+    try expectStorageRefusal(&r, sock);
+    try expectContains(r.stderr, state_path);
+    try expectContains(r.stderr, "persist: startup check open_directory failed");
+    try expectContains(r.stderr, "FileNotFound");
+}
+
+test "integration: blocked state save path refuses startup and preserves saved bytes" {
+    const a = testing.allocator;
+    var s = try Scenario.init(a);
+    defer s.deinit();
+    const sock = try s.defaultSocketPath();
+    defer a.free(sock);
+    const text = try s.writeConfig(sock, "source = \"file\"", 0o640);
+    defer a.free(text);
+    try s.tmp.dir.writeFile(.{ .sub_path = "state.bin", .data = "untouched saved bytes" });
+    try s.tmp.dir.makeDir("state.bin.tmp");
+    var r = try s.run();
+    defer r.deinit(a);
+    try expectStorageRefusal(&r, sock);
+    try expectContains(r.stderr, "persist: startup check inspect_temporary failed");
+    try expectContains(r.stderr, "state.bin.tmp");
+    try expectContains(r.stderr, "NotRegularFile");
+    const saved = try s.tmp.dir.readFileAlloc(a, "state.bin", 100);
+    defer a.free(saved);
+    try testing.expectEqualStrings("untouched saved bytes", saved);
+}
+
+test "integration: unwritable persistence refuses startup then advances after repair" {
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
+    const a = testing.allocator;
+    var s = try Scenario.init(a);
+    defer s.deinit();
+    const sock = try s.defaultSocketPath();
+    defer a.free(sock);
+    try s.tmp.dir.makeDir("storage");
+    var storage = try s.tmp.dir.openDir("storage", .{ .iterate = true });
+    defer storage.close();
+    const state_path = try std.fmt.allocPrint(a, "{s}/storage/state.bin", .{s.root});
+    defer a.free(state_path);
+    const text = try s.writeConfigWithState(sock, "source = \"file\"", 0o640, state_path);
+    defer a.free(text);
+    // A bound metrics port gives the repaired run a predictable, harmless stopping point.
+    const addr = try std.net.Address.parseIp4("127.0.0.1", s.metrics_port);
+    var holder = try addr.listen(.{ .reuse_address = true });
+    defer holder.deinit();
+    try posix.fchmod(storage.fd, 0o500);
+    defer posix.fchmod(storage.fd, 0o700) catch {};
+    {
+        var r = try s.run();
+        defer r.deinit(a);
+        try expectStorageRefusal(&r, sock);
+        try expectContains(r.stderr, "persist: startup check create_probe failed");
+        try expectContains(r.stderr, state_path);
+        try expectContains(r.stderr, "AccessDenied");
+    }
+    try posix.fchmod(storage.fd, 0o700);
+    var repaired = try s.run();
+    defer repaired.deinit(a);
+    try expectFailClosed(&repaired);
+    try expectContains(repaired.stderr, "http: init on");
+    try expectNotContains(repaired.stderr, "startup check");
+}
+
+test "integration: journal cursor persistence is required only for a selected journal source" {
+    const a = testing.allocator;
+    for ([_]bool{ false, true }) |journal| {
+        // Journal input has this documented host prerequisite; no reader is launched here.
+        if (journal) std.fs.cwd().access("/usr/bin/journalctl", .{}) catch return error.SkipZigTest;
+        var s = try Scenario.init(a);
+        defer s.deinit();
+        const sock = try s.defaultSocketPath();
+        defer a.free(sock);
+        try s.tmp.dir.makeDir("journald-cursors.bin.tmp");
+        const addr = try std.net.Address.parseIp4("127.0.0.1", s.metrics_port);
+        var holder = try addr.listen(.{ .reuse_address = true });
+        defer holder.deinit();
+        const text = try s.writeConfig(sock, if (journal) "source = \"journald\"" else "source = \"file\"", 0o640);
+        defer a.free(text);
+        var r = try s.run();
+        defer r.deinit(a);
+        if (journal) {
+            try expectStorageRefusal(&r, sock);
+            try expectContains(r.stderr, "journald: startup check inspect_temporary failed");
+            try expectContains(r.stderr, "journald-cursors.bin.tmp");
+            try expectContains(r.stderr, "NotRegularFile");
+        } else {
+            try expectFailClosed(&r);
+            try expectContains(r.stderr, "http: init on");
+            try expectNotContains(r.stderr, "startup check");
+        }
+    }
 }
 
 test "integration: fail-closed helper: trace detector matches Zig frame lines and nothing else" {

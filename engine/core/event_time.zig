@@ -3,6 +3,9 @@
 //! Source event-time normalization. No wall-clock reads or integer truncation of timestamps.
 const std = @import("std");
 
+/// Bind this policy change into source/checkpoint configuration fingerprints.
+pub const policy_version: u16 = 2;
+
 pub const Error = error{ NonFiniteTime, InvalidWindow };
 pub const EventTime = struct {
     seconds: f64,
@@ -26,7 +29,7 @@ pub const Input = union(enum) {
     optional_empty,
 };
 pub const Origin = enum { parsed, recent_context, optional_now, missing_now, invalid_now, live_correction };
-pub const Disposition = enum { accepted, obsolete, undated };
+pub const Disposition = enum { accepted, obsolete, undated, rejected };
 pub const Result = struct {
     disposition: Disposition,
     raw: ?EventTime = null,
@@ -34,10 +37,12 @@ pub const Result = struct {
     stored: ?EventTime = null,
     origin: ?Origin = null,
     diagnostic: bool = false,
+    rejection: ?@import("source_time_policy.zig").Reason = null,
 };
 pub const Context = struct {
     last_date: ?EventTime = null,
-    /// Replay explicitly opts out of findtime checks; startup uses restore semantics.
+    /// Valid past event times use the retry window in every mode. The remaining
+    /// legacy future-time branches await their native policy conversion.
     pub fn normalize(self: *Context, input: Input, now: EventTime, window: f64, mode: Mode, check_findtime: bool) Error!Result {
         if (!std.math.isFinite(window) or window < 0) return error.InvalidWindow;
         _ = try EventTime.init(now.seconds);
@@ -47,30 +52,31 @@ pub const Context = struct {
         switch (input) {
             .parsed => |value| {
                 _ = try EventTime.init(value.seconds);
+                if (value.seconds <= now.seconds) {
+                    const oldest = now.seconds - window;
+                    if (!std.math.isFinite(oldest)) return error.NonFiniteTime;
+                    const obsolete = value.seconds < oldest;
+                    self.last_date = value;
+                    // Receipt time, startup/live mode and legacy replay switches
+                    // cannot turn expired evidence into a fresh attempt.
+                    return .{
+                        .disposition = if (obsolete) .obsolete else .accepted,
+                        .raw = value,
+                        .effective = value,
+                        .stored = if (obsolete) null else value,
+                        .origin = .parsed,
+                    };
+                }
                 date = value;
                 self.last_date = value;
                 result.raw = value;
                 result.origin = .parsed;
             },
             .missing, .invalid, .optional_empty => {
-                result.diagnostic = input == .invalid or input == .missing;
-                if (self.last_date) |last| {
-                    _ = try EventTime.init(last.seconds);
-                    // Python's reference also tests truthiness: epoch zero is not reused.
-                    if (last.seconds != 0 and last.seconds > now.seconds - 60) {
-                        date = last;
-                        result.origin = .recent_context;
-                    }
-                }
-                if (date == null) {
-                    if (input == .optional_empty) {
-                        date = now;
-                        result.origin = .optional_now;
-                    } else if (check and mode == .live) {
-                        date = now;
-                        result.origin = if (input == .invalid) .invalid_now else .missing_now;
-                    }
-                }
+                // This adapter describes timestamped input. Optional-empty is
+                // still missing time, not authorization for an undated source.
+                // No borrowing another record's date or receipt-time fallback.
+                return .{ .disposition = .rejected, .diagnostic = true, .rejection = if (input == .invalid) .malformed else .missing };
             },
         }
         if (date == null) {
@@ -116,21 +122,60 @@ test "source event time preserves fractional boundaries and future storage clamp
     try std.testing.expectEqual(Origin.live_correction, corrected.origin.?);
     try std.testing.expectEqual(now.seconds, corrected.effective.?.seconds);
     const replay = try context.normalize(.{ .parsed = try EventTime.init(1.125) }, now, 600, .replay, true);
-    try std.testing.expectEqual(@as(f64, 1.125), replay.stored.?.seconds);
+    try std.testing.expectEqual(Disposition.obsolete, replay.disposition);
+    try std.testing.expectEqual(@as(f64, 1.125), replay.effective.?.seconds);
+    try std.testing.expect(replay.stored == null);
 }
-test "missing invalid and optional dates retain explicit provenance" {
-    var context: Context = .{};
-    const now = try EventTime.init(1000);
-    try std.testing.expectEqual(Disposition.undated, (try context.normalize(.missing, now, 600, .startup, true)).disposition);
-    const invalid = try context.normalize(.invalid, now, 600, .live, true);
-    try std.testing.expect(invalid.diagnostic);
-    try std.testing.expectEqual(Origin.invalid_now, invalid.origin.?);
-    context.last_date = try EventTime.init(940);
-    try std.testing.expectEqual(Disposition.undated, (try context.normalize(.missing, now, 600, .startup, true)).disposition);
-    context.last_date = try EventTime.init(940.001);
-    try std.testing.expectEqual(Origin.recent_context, (try context.normalize(.missing, now, 600, .startup, true)).origin.?);
-    context.last_date = null;
-    try std.testing.expectEqual(Origin.optional_now, (try context.normalize(.optional_empty, now, 600, .startup, true)).origin.?);
+
+test "event age: past timestamps remain authoritative across all modes and legacy switches" {
+    for ([_]Mode{ .startup, .live, .replay }) |mode| {
+        for ([_]bool{ true, false }) |check_findtime| {
+            for ([_]f64{ 399.999, 400, 700.125, 939.5, 1000 }) |seconds| {
+                var context = Context{};
+                const result = try context.normalize(.{ .parsed = try EventTime.init(seconds) }, try EventTime.init(1000), 600, mode, check_findtime);
+                try std.testing.expectEqual(if (seconds < 400) Disposition.obsolete else .accepted, result.disposition);
+                try std.testing.expectEqual(seconds, result.raw.?.seconds);
+                try std.testing.expectEqual(seconds, result.effective.?.seconds);
+                try std.testing.expectEqual(seconds, context.last_date.?.seconds);
+                try std.testing.expectEqual(Origin.parsed, result.origin.?);
+                try std.testing.expect(!result.diagnostic);
+                if (seconds < 400) try std.testing.expect(result.stored == null) else try std.testing.expectEqual(seconds, result.stored.?.seconds);
+            }
+        }
+    }
+}
+
+test "event age: zero window and epoch zero are explicit and invalid arithmetic cannot mutate context" {
+    var context = Context{};
+    const zero = try context.normalize(.{ .parsed = try EventTime.init(0) }, try EventTime.init(600), 600, .live, true);
+    try std.testing.expectEqual(Disposition.accepted, zero.disposition);
+    try std.testing.expectEqual(@as(f64, 0), zero.stored.?.seconds);
+    const current = try context.normalize(.{ .parsed = try EventTime.init(600) }, try EventTime.init(600), 0, .live, true);
+    try std.testing.expectEqual(Disposition.accepted, current.disposition);
+    const old = try context.normalize(.{ .parsed = try EventTime.init(599.999) }, try EventTime.init(600), 0, .live, true);
+    try std.testing.expectEqual(Disposition.obsolete, old.disposition);
+    const previous = context.last_date.?.bits();
+    try std.testing.expectError(error.NonFiniteTime, context.normalize(.{ .parsed = try EventTime.init(-1.0e308) }, try EventTime.init(-1.0e308), 1.0e308, .live, true));
+    try std.testing.expectEqual(previous, context.last_date.?.bits());
+    try std.testing.expectError(error.InvalidWindow, context.normalize(.{ .parsed = try EventTime.init(1) }, try EventTime.init(2), -1, .live, true));
+    try std.testing.expectEqual(previous, context.last_date.?.bits());
+}
+test "time admission: staged adapter cannot borrow dates or rejuvenate rejected input" {
+    for ([_]Mode{ .startup, .live, .replay }) |mode| {
+        for ([_]bool{ true, false }) |check| {
+            for ([_]?EventTime{ null, .{ .seconds = 0 }, .{ .seconds = 999.5 } }) |last| {
+                for ([_]Input{ .missing, .invalid, .optional_empty }) |input| {
+                    var context = Context{ .last_date = last };
+                    const result = try context.normalize(input, try EventTime.init(1000), 600, mode, check);
+                    try std.testing.expectEqual(Disposition.rejected, result.disposition);
+                    try std.testing.expectEqual(if (input == .invalid) @import("source_time_policy.zig").Reason.malformed else .missing, result.rejection.?);
+                    try std.testing.expect(result.diagnostic);
+                    try std.testing.expect(result.raw == null and result.effective == null and result.stored == null and result.origin == null);
+                    try std.testing.expectEqualDeep(last, context.last_date);
+                }
+            }
+        }
+    }
 }
 test "event-time transport rejects nonfinite values and preserves bits" {
     for ([_]f64{ 0, -0.0, 1000.123456789, -1.5 }) |value| {

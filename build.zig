@@ -9,6 +9,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Pinned upstream amalgamation: embedded storage, no installed SQLite library.
+    const sqlite = b.addStaticLibrary(.{
+        .name = "sqlite3",
+        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+    });
+    sqlite.root_module.addCSourceFile(.{
+        .file = b.path("vendor/sqlite/sqlite3.c"),
+        .flags = &.{"-DSQLITE_OMIT_LOAD_EXTENSION=1"},
+    });
+
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", fail2zig_version);
     const enable_bench = b.option(
@@ -36,6 +46,7 @@ pub fn build(b: *std.Build) void {
     });
     engine_mod.addImport("shared", shared_mod);
     engine_mod.addImport("build_options", build_options.createModule());
+    engine_mod.linkLibrary(sqlite);
 
     const engine_exe = b.addExecutable(.{
         .name = "fail2zig",
@@ -71,6 +82,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_engine_tests = b.addRunArtifact(engine_tests);
     test_step.dependOn(&run_engine_tests.step);
+    b.step("test-engine", "Run native daemon tests").dependOn(&run_engine_tests.step);
 
     // Full-profile foundations remain independently testable before daemon
     // activation. These tests also participate in the ordinary test gate.
@@ -81,9 +93,59 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     const parity_runtime_tests = b.addTest(.{ .root_module = parity_runtime_mod, .filters = test_filters });
+    parity_runtime_mod.linkLibrary(sqlite);
     const run_parity_runtime_tests = b.addRunArtifact(parity_runtime_tests);
     test_step.dependOn(&run_parity_runtime_tests.step);
     b.step("test-p2-runtime", "Test source, event-time and durable record foundations").dependOn(&run_parity_runtime_tests.step);
+
+    const native_foundations = b.addTest(.{ .root_module = parity_runtime_mod, .filters = &.{ "storage health:", "native processor:", "record store:", "pipeline:", "receipt recovery:", "future time:", "time admission:", "event age:", "year inference:", "native journal:", "clock recovery:", "native retry:" } });
+    b.step("test-native-foundations", "Test native storage, time, sources and recovery without legacy workers").dependOn(&b.addRunArtifact(native_foundations).step);
+
+    // Focused native consumer gate: no legacy worker test execution.
+    const detection_mod = b.createModule(.{
+        .root_source_file = b.path("engine/native_detection_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    detection_mod.addImport("shared", shared_mod);
+    detection_mod.linkLibrary(sqlite);
+    const detection_options = b.addOptions();
+    detection_options.addOption([]const u8, "corpus_path", b.pathFromRoot("tests/integration/filter_corpus.json"));
+    detection_mod.addImport("detection_test_options", detection_options.createModule());
+    const detection_tests = b.addTest(.{ .root_module = detection_mod, .filters = &.{"native detection:"} });
+    const run_detection_tests = b.addRunArtifact(detection_tests);
+    b.step("test-native-detection", "Test native file and origin-qualified journal detection").dependOn(&run_detection_tests.step);
+    test_step.dependOn(&run_detection_tests.step);
+
+    const retry_mod = b.createModule(.{
+        .root_source_file = b.path("engine/native_retry_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    retry_mod.addImport("shared", shared_mod);
+    retry_mod.linkLibrary(sqlite);
+    const retry_tests = b.addTest(.{ .root_module = retry_mod, .filters = &.{"native retry:"} });
+    const run_retry_tests = b.addRunArtifact(retry_tests);
+    b.step("test-native-retry", "Test transactional native retry state and decisions").dependOn(&run_retry_tests.step);
+    test_step.dependOn(&run_retry_tests.step);
+
+    // Explicit offline qualification against a separately captured lab journal.
+    // Never contact a host or require private lab artifacts in ordinary tests.
+    const journal_lab_mod = b.createModule(.{
+        .root_source_file = b.path("engine/journal_origin_lab_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    journal_lab_mod.addImport("shared", shared_mod);
+    const journal_lab_options = b.addOptions();
+    journal_lab_options.addOption(?[]const u8, "fixture", b.option([]const u8, "journal-origin-fixture", "Captured journal JSON lines for explicit lab qualification"));
+    journal_lab_options.addOption(?[]const u8, "machine_id", b.option([]const u8, "journal-origin-machine-id", "Independently captured machine ID for lab qualification"));
+    journal_lab_mod.addImport("journal_lab_options", journal_lab_options.createModule());
+    const journal_lab_tests = b.addTest(.{ .root_module = journal_lab_mod, .filters = &.{"lab journal:"} });
+    b.step("test-journal-origin-lab", "Qualify captured SSH journal records without contacting a host").dependOn(&b.addRunArtifact(journal_lab_tests).step);
 
     const client_tests = b.addTest(.{
         .root_module = client_mod,
@@ -139,6 +201,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "persistence", .path = "tests/integration/persistence_test.zig", .needs_daemon_binary = true },
         .{ .name = "status_surface", .path = "tests/integration/status_surface_test.zig", .needs_daemon_binary = false },
         .{ .name = "startup_failclosed", .path = "tests/integration/startup_failclosed_test.zig", .needs_daemon_binary = true },
+        .{ .name = "native_daemon", .path = "tests/integration/native_daemon_test.zig", .needs_daemon_binary = true },
+        .{ .name = "journalctl_contract", .path = "tests/integration/journalctl_contract_test.zig", .needs_daemon_binary = false },
         .{ .name = "config_diag", .path = "tests/integration/config_diag_test.zig", .needs_daemon_binary = true },
         .{ .name = "no_backend", .path = "tests/integration/no_backend_test.zig", .needs_daemon_binary = true },
     };
@@ -154,6 +218,12 @@ pub fn build(b: *std.Build) void {
         const t = b.addTest(.{ .root_module = mod, .filters = test_filters });
         const run = b.addRunArtifact(t);
         if (f.needs_daemon_binary) run.step.dependOn(b.getInstallStep());
+        if (std.mem.eql(u8, f.name, "startup_failclosed"))
+            b.step("test-startup", "Run daemon startup integration tests").dependOn(&run.step);
+        if (std.mem.eql(u8, f.name, "native_daemon"))
+            b.step("test-native-daemon", "Run actual native daemon ingestion and restart tests").dependOn(&run.step);
+        if (std.mem.eql(u8, f.name, "journalctl_contract"))
+            b.step("test-journalctl", "Qualify host journalctl against original offline fixtures").dependOn(&run.step);
         test_step.dependOn(&run.step);
     }
 

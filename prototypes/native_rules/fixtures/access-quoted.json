@@ -1,0 +1,1 @@
+{"id":"access-quoted","source":"access-log","format":"template","template":"{peer:ip} - - {request:quoted} {status:uint}","subject":"peer","conditions":[{"field":"status","number":401},{"field":"request","op":"starts_with","text":"GET /private/"}],"exclude":[{"field":"request","text":"GET /private/health HTTP/1.1"}]}

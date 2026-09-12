@@ -34,6 +34,9 @@ pub const Record = struct {
     raw_hash: [32]u8,
     predecoded: ?Predecoded = null,
     timestamp_us: ?u64 = null,
+    /// First durably accepted ingestion observation, supplied by the native
+    /// pipeline before preparation. This is distinct from journal event time.
+    receipt_time: ?@import("native_time.zig").Timestamp = null,
     journal_fields: ?[]const JournalField = null,
     journal_monotonic_us: ?u64 = null,
     byte_start: ?u64 = null,
@@ -52,4 +55,5 @@ pub const Health = enum {
     malformed_record,
     commit_failed,
     child_failed,
+    clock_failed,
 };

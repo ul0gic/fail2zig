@@ -1,0 +1,4 @@
+192.0.2.42 - - "GET /private/192.0.2.99 HTTP/1.1" 401
+192.0.2.42 - - "GET /private/login HTTP/1.1" 200
+192.0.2.42 - - "GET /private-other/login HTTP/1.1" 401
+192.0.2.42 - - "GET /private/health HTTP/1.1" 401
