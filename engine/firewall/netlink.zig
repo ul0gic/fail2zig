@@ -32,6 +32,294 @@ pub const Error = error{
     InvalidBatchState,
 };
 
+/// The native inspection path never treats malformed trailing bytes as EOF.
+/// Read integers from bytes so caller-provided datagrams need no alignment.
+pub const StrictMessages = struct {
+    bytes: []const u8,
+    offset: usize = 0,
+
+    pub fn next(self: *StrictMessages) Error!?MessageIterator.View {
+        if (self.offset == self.bytes.len) return null;
+        const tail = self.bytes[self.offset..];
+        if (tail.len < NLMSG_HDRLEN) return error.TruncatedMessage;
+        const hdr: linux.nlmsghdr = @bitCast(tail[0..@sizeOf(linux.nlmsghdr)].*);
+        const len: usize = hdr.len;
+        if (len < NLMSG_HDRLEN or len > tail.len) return error.TruncatedMessage;
+        const padded = std.math.add(usize, len, 3) catch return error.TruncatedMessage;
+        const aligned = padded & ~@as(usize, 3);
+        if (aligned > tail.len) return error.TruncatedMessage;
+        self.offset += aligned;
+        return .{ .hdr = hdr, .payload = tail[NLMSG_HDRLEN..len] };
+    }
+};
+
+pub const Attributes = struct {
+    bytes: []const u8,
+    offset: usize = 0,
+    pub const View = struct { kind: u16, flags: u16, value: []const u8 };
+
+    pub fn next(self: *Attributes) Error!?View {
+        if (self.offset == self.bytes.len) return null;
+        const tail = self.bytes[self.offset..];
+        if (tail.len < 4) return error.TruncatedMessage;
+        const len: usize = mem.readInt(u16, tail[0..2], native_endian);
+        const kind = mem.readInt(u16, tail[2..4], native_endian);
+        if (len < 4 or len > tail.len) return error.TruncatedMessage;
+        const aligned = (len + 3) & ~@as(usize, 3);
+        if (aligned > tail.len) return error.TruncatedMessage;
+        self.offset += aligned;
+        return .{ .kind = kind & 0x3fff, .flags = kind & 0xc000, .value = tail[4..len] };
+    }
+};
+
+/// Kernel provenance comes from recvmsg's sockaddr, not the untrusted nlmsg_pid.
+pub fn recvKernel(sock: *NetlinkSocket, scratch: []u8) Error![]const u8 {
+    var sender: linux.sockaddr.nl = .{ .pid = 0, .groups = 0 };
+    var iov = posix.iovec{ .base = scratch.ptr, .len = scratch.len };
+    var msg: linux.msghdr = .{
+        .name = @ptrCast(&sender),
+        .namelen = @sizeOf(linux.sockaddr.nl),
+        .iov = @ptrCast(&iov),
+        .iovlen = 1,
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    const rc = linux.recvmsg(sock.fd, &msg, 0);
+    switch (linux.E.init(rc)) {
+        .SUCCESS => {},
+        .AGAIN => return error.Timeout,
+        else => return error.RecvFailed,
+    }
+    try validateKernelEnvelope(sender, msg.namelen, msg.flags, rc, scratch.len);
+    return scratch[0..rc];
+}
+
+/// The native path bounds writes as well as reads. A timeout leaves the caller's
+/// operation uncertain; this helper never retries a possibly dispatched message.
+pub fn sendKernel(sock: *NetlinkSocket, bytes: []const u8, timeout_ms: u64) Error!void {
+    if (timeout_ms == 0 or timeout_ms > 2000) return error.InvalidArgument;
+    const value = posix.timeval{ .sec = @intCast(timeout_ms / 1000), .usec = @intCast((timeout_ms % 1000) * 1000) };
+    posix.setsockopt(sock.fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, mem.asBytes(&value)) catch return error.SocketFailed;
+    var address = linux.sockaddr.nl{ .pid = 0, .groups = 0 };
+    const sent = posix.sendto(sock.fd, bytes, 0, @ptrCast(&address), @sizeOf(linux.sockaddr.nl)) catch |err| return switch (err) {
+        error.WouldBlock => error.Timeout,
+        else => error.SendFailed,
+    };
+    if (sent != bytes.len) return error.SendFailed;
+}
+
+fn validateKernelEnvelope(sender: linux.sockaddr.nl, name_len: usize, flags: i32, received: usize, capacity: usize) Error!void {
+    if (name_len != @sizeOf(linux.sockaddr.nl) or sender.family != posix.AF.NETLINK or
+        sender.pid != 0 or sender.groups != 0) return error.RecvFailed;
+    if ((flags & (linux.MSG.TRUNC | linux.MSG.CTRUNC)) != 0 or received == 0 or received > capacity)
+        return error.TruncatedMessage;
+}
+
+test "native firewall: kernel provenance and datagram truncation are mandatory" {
+    var sender = linux.sockaddr.nl{ .pid = 0, .groups = 0 };
+    try validateKernelEnvelope(sender, @sizeOf(linux.sockaddr.nl), 0, 16, 32);
+    try std.testing.expectError(error.TruncatedMessage, validateKernelEnvelope(sender, @sizeOf(linux.sockaddr.nl), linux.MSG.TRUNC, 16, 32));
+    try std.testing.expectError(error.TruncatedMessage, validateKernelEnvelope(sender, @sizeOf(linux.sockaddr.nl), linux.MSG.CTRUNC, 16, 32));
+    try std.testing.expectError(error.TruncatedMessage, validateKernelEnvelope(sender, @sizeOf(linux.sockaddr.nl), 0, 33, 32));
+    try std.testing.expectError(error.RecvFailed, validateKernelEnvelope(sender, 0, 0, 16, 32));
+    sender.pid = 123;
+    try std.testing.expectError(error.RecvFailed, validateKernelEnvelope(sender, @sizeOf(linux.sockaddr.nl), 0, 16, 32));
+    sender.pid = 0;
+    sender.groups = 1;
+    try std.testing.expectError(error.RecvFailed, validateKernelEnvelope(sender, @sizeOf(linux.sockaddr.nl), 0, 16, 32));
+}
+
+/// Correlation and completion for a single dump. All datagrams count against a
+/// caller-owned total work/deadline budget, including unrelated traffic.
+pub const Dump = struct {
+    sequence: u32,
+    message_type: u16,
+    port_id: u32,
+    complete: bool = false,
+    count: usize = 0,
+    max_messages: usize = 65_536,
+
+    pub fn accept(self: *Dump, item: MessageIterator.View) Error!?[]const u8 {
+        if (self.count >= self.max_messages) return error.BufferTooSmall;
+        self.count += 1;
+        if (item.hdr.seq != self.sequence) return null;
+        if (self.complete or (item.hdr.pid != 0 and item.hdr.pid != self.port_id)) return error.NetlinkError;
+        if ((item.hdr.flags & 0x10) != 0) return error.NetlinkError; // NLM_F_DUMP_INTR
+        const kind = @intFromEnum(item.hdr.type);
+        if (kind == 2) {
+            if (item.payload.len < 4 + NLMSG_HDRLEN) return error.TruncatedMessage;
+            const request: linux.nlmsghdr = @bitCast(item.payload[4..][0..@sizeOf(linux.nlmsghdr)].*);
+            if (request.seq != self.sequence) return error.NetlinkError;
+            const code = try parseNlmsgerr(item.payload);
+            if (code != 0) return safeErrno(code);
+            return null; // ACK is not multipart completion.
+        }
+        if (kind == 3) {
+            if (item.payload.len != 0) {
+                const code = try parseNlmsgerr(item.payload);
+                if (code != 0) return safeErrno(code);
+            }
+            self.complete = true;
+            return null;
+        }
+        if (kind != self.message_type or (item.hdr.flags & 2) == 0) return error.NetlinkError;
+        return item.payload;
+    }
+};
+
+fn safeErrno(code: i32) Error {
+    if (code == std.math.minInt(i32)) return error.NetlinkError;
+    return errnoToError(code);
+}
+
+/// Required ACKs and related batch boundary sequences are distinct: an error on
+/// a batch begin/end is relevant even though no success ACK was requested there.
+pub const Acknowledgments = struct {
+    required: []const u32,
+    related: []const u32,
+    port_id: u32,
+    seen: u64 = 0,
+    count: usize = 0,
+
+    pub fn init(required: []const u32, related: []const u32, port_id: u32) Error!Acknowledgments {
+        if (required.len == 0 or required.len > 64 or related.len > 66) return error.InvalidArgument;
+        for (required, 0..) |seq, index| {
+            if (mem.indexOfScalar(u32, related, seq) == null or mem.indexOfScalar(u32, required[0..index], seq) != null) return error.InvalidArgument;
+        }
+        return .{ .required = required, .related = related, .port_id = port_id };
+    }
+    pub fn complete(self: *const Acknowledgments) bool {
+        const mask = if (self.required.len == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(self.required.len)) - 1;
+        return self.seen == mask;
+    }
+    pub fn accept(self: *Acknowledgments, item: MessageIterator.View) Error!void {
+        if (self.count >= 65_536) return error.BufferTooSmall;
+        self.count += 1;
+        if (mem.indexOfScalar(u32, self.related, item.hdr.seq) == null) return;
+        if ((item.hdr.pid != 0 and item.hdr.pid != self.port_id) or @intFromEnum(item.hdr.type) != 2) return error.NetlinkError;
+        if (item.payload.len < 4 + NLMSG_HDRLEN) return error.TruncatedMessage;
+        const request: linux.nlmsghdr = @bitCast(item.payload[4..][0..@sizeOf(linux.nlmsghdr)].*);
+        if (request.seq != item.hdr.seq) return error.NetlinkError;
+        const code = try parseNlmsgerr(item.payload);
+        if (code != 0) return safeErrno(code);
+        if (mem.indexOfScalar(u32, self.required, item.hdr.seq)) |index| self.seen |= @as(u64, 1) << @intCast(index);
+    }
+};
+
+pub fn receiveAcknowledgments(sock: *NetlinkSocket, required: []const u32, related: []const u32, timeout_ms: u64) Error!void {
+    if (timeout_ms == 0 or timeout_ms > 2000) return error.InvalidArgument;
+    var state = try Acknowledgments.init(required, related, sock.port_id);
+    var timer = std.time.Timer.start() catch return error.SocketFailed;
+    var bytes: [8192]u8 = undefined;
+    var datagrams: usize = 0;
+    while (!state.complete()) {
+        const elapsed = timer.read() / std.time.ns_per_ms;
+        if (elapsed >= timeout_ms) return error.Timeout;
+        if (datagrams >= 65_536) return error.BufferTooSmall;
+        datagrams += 1;
+        try sock.setRecvTimeout(timeout_ms - elapsed);
+        var messages = StrictMessages{ .bytes = try recvKernel(sock, &bytes) };
+        while (try messages.next()) |item| try state.accept(item);
+    }
+}
+
+fn acknowledgmentFixture(payload: *[20]u8, sequence: u32, code: i32) MessageIterator.View {
+    @memset(payload, 0);
+    mem.writeInt(i32, payload[0..4], code, native_endian);
+    mem.writeInt(u32, payload[4..8], @sizeOf(linux.nlmsghdr), native_endian);
+    mem.writeInt(u32, payload[12..16], sequence, native_endian);
+    return .{ .hdr = .{ .len = NLMSG_HDRLEN + payload.len, .type = @enumFromInt(2), .flags = 0, .seq = sequence, .pid = 0 }, .payload = payload };
+}
+
+test "native firewall: native acknowledgments retain related batch errors and ignore unrelated errors" {
+    var state = try Acknowledgments.init(&.{2}, &.{ 1, 2, 3 }, 0);
+    var bytes: [20]u8 = undefined;
+    try state.accept(acknowledgmentFixture(&bytes, 99, -1));
+    try std.testing.expect(!state.complete());
+    try std.testing.expectError(error.PermissionDenied, state.accept(acknowledgmentFixture(&bytes, 1, -1)));
+    try state.accept(acknowledgmentFixture(&bytes, 2, 0));
+    try std.testing.expect(state.complete());
+}
+
+test "native firewall: native acknowledgments require every expected sequence and validate embedded requests" {
+    var state = try Acknowledgments.init(&.{ 2, 3 }, &.{ 1, 2, 3, 4 }, 0);
+    var bytes: [20]u8 = undefined;
+    try state.accept(acknowledgmentFixture(&bytes, 2, 0));
+    try state.accept(acknowledgmentFixture(&bytes, 2, 0));
+    try std.testing.expect(!state.complete());
+    var malformed = acknowledgmentFixture(&bytes, 3, 0);
+    malformed.payload = bytes[0..19];
+    try std.testing.expectError(error.TruncatedMessage, state.accept(malformed));
+    malformed = acknowledgmentFixture(&bytes, 3, 0);
+    mem.writeInt(u32, bytes[12..16], 999, native_endian);
+    try std.testing.expectError(error.NetlinkError, state.accept(malformed));
+    try state.accept(acknowledgmentFixture(&bytes, 3, 0));
+    try std.testing.expect(state.complete());
+    try std.testing.expectError(error.InvalidArgument, Acknowledgments.init(&.{ 2, 2 }, &.{2}, 0));
+}
+
+test "native firewall: strict netlink iterator supports unaligned bytes and rejects tails" {
+    var storage: [65]u8 = @splat(0);
+    var encoded: [64]u8 align(4) = undefined;
+    var b = MessageBuilder.init(&encoded);
+    try b.append(0x101, 2, 7, 0, &.{ 1, 2, 3 });
+    @memcpy(storage[1..][0..b.bytes().len], b.bytes());
+    var it = StrictMessages{ .bytes = storage[1..][0..b.bytes().len] };
+    try std.testing.expectEqual(@as(u32, 7), (try it.next()).?.hdr.seq);
+    try std.testing.expect((try it.next()) == null);
+    var truncated = StrictMessages{ .bytes = b.bytes()[0 .. b.bytes().len - 1] };
+    try std.testing.expectError(error.TruncatedMessage, truncated.next());
+    var tail = StrictMessages{ .bytes = storage[1 .. 1 + b.bytes().len + 1] };
+    _ = try tail.next();
+    try std.testing.expectError(error.TruncatedMessage, tail.next());
+}
+
+test "native firewall: dump requires done and rejects interrupted and wrong-type replies" {
+    var bbuf: [128]u8 = undefined;
+    var b = MessageBuilder.init(&bbuf);
+    try b.append(0x101, 2, 7, 22, &.{ 1, 0, 0, 0 });
+    var it = StrictMessages{ .bytes = b.bytes() };
+    const view = (try it.next()).?;
+    var state = Dump{ .sequence = 7, .message_type = 0x101, .port_id = 22 };
+    try std.testing.expect((try state.accept(view)) != null);
+    try std.testing.expect(!state.complete);
+    var interrupted = view;
+    interrupted.hdr.flags |= 0x10;
+    try std.testing.expectError(error.NetlinkError, state.accept(interrupted));
+    var wrong = view;
+    wrong.hdr.type = @enumFromInt(0x102);
+    try std.testing.expectError(error.NetlinkError, state.accept(wrong));
+    var done = view;
+    done.hdr.type = @enumFromInt(3);
+    done.payload = &.{ 0, 0, 0, 0 };
+    try std.testing.expect((try state.accept(done)) == null);
+    try std.testing.expect(state.complete);
+    try std.testing.expectError(error.NetlinkError, state.accept(view));
+}
+
+test "native firewall: unrelated dump traffic is bounded and cannot complete" {
+    var bytes: [64]u8 = undefined;
+    var builder = MessageBuilder.init(&bytes);
+    try builder.append(3, 2, 99, 0, &.{});
+    var it = StrictMessages{ .bytes = builder.bytes() };
+    const view = (try it.next()).?;
+    var state = Dump{ .sequence = 1, .message_type = 0x101, .port_id = 0, .max_messages = 2 };
+    try std.testing.expect((try state.accept(view)) == null);
+    try std.testing.expect((try state.accept(view)) == null);
+    try std.testing.expect(!state.complete);
+    try std.testing.expectError(error.BufferTooSmall, state.accept(view));
+}
+
+test "native firewall: malformed attributes do not become empty inspection" {
+    var short = Attributes{ .bytes = &.{ 1, 0, 0 } };
+    try std.testing.expectError(error.TruncatedMessage, short.next());
+    var bytes: [8]u8 = @splat(0);
+    mem.writeInt(u16, bytes[0..2], 9, native_endian);
+    var oversized = Attributes{ .bytes = &bytes };
+    try std.testing.expectError(error.TruncatedMessage, oversized.next());
+}
+
 pub fn errnoToError(errno: i32) Error {
     const v: i32 = if (errno < 0) -errno else errno;
     return switch (v) {

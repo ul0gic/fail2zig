@@ -17,6 +17,8 @@ pub const Settings = struct {
     max_sources: usize,
 
     ignore_capacity: usize,
+    /// The caller supplies a required durable staged consumer before admission.
+    custom: bool = false,
     encoding: @import("../core/source_text.zig").Encoding = .utf8,
     bom: @import("../core/source_text.zig").Bom = .preserve,
     max_record_bytes: u32 = 2048,
@@ -25,14 +27,14 @@ pub const Settings = struct {
 
 pub const Plan = struct {
     processing: processing.Options,
-    detection: detector.Detector,
+    detection: ?detector.Detector,
     specs: []session.Spec,
     max_sources: usize,
 
     /// Keep the plan at a stable address for the lifetime of the created session.
     /// Caller supplies shared admission and clocks on this value before creation.
     pub fn sessionOptions(self: *const Plan) session.Options {
-        return .{ .processing = self.processing, .detection = self.detection.consumer(), .max_sources = self.max_sources };
+        return .{ .processing = self.processing, .detection = if (self.detection) |*value| value.consumer() else null, .max_sources = self.max_sources };
     }
 
     /// Config strings must remain immutable and outlive this plan and its sessions. The
@@ -69,18 +71,18 @@ pub const Plan = struct {
                 else => return error.SyslogTimestampRequired,
             }
         }
-        var detection = try detector.Detector.init(allocator, .{
+        var detection: ?detector.Detector = if (settings.custom) null else try detector.Detector.init(allocator, .{
             .filter = jail.filter,
             .body = settings.body,
             .ignore = jail.ignoreip orelse cfg.defaults.ignoreip,
             .ignore_capacity = settings.ignore_capacity,
             .max_decoded_bytes = settings.max_decoded_bytes,
         });
-        errdefer detection.deinit(allocator);
+        errdefer if (detection) |*value| value.deinit(allocator);
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("fail2zig-native-file-detection-v1\x00");
         hash.update(&parent_generation);
-        hash.update(&detection.generation);
+        if (detection) |value| hash.update(&value.generation) else hash.update("required-staged-consumer");
         var generation: [32]u8 = undefined;
         hash.final(&generation);
         const options = processing.Options{
@@ -104,7 +106,7 @@ pub const Plan = struct {
     }
 
     pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
-        self.detection.deinit(allocator);
+        if (self.detection) |*value| value.deinit(allocator);
         allocator.free(self.specs);
         self.* = undefined;
     }

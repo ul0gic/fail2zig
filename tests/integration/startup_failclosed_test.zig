@@ -174,6 +174,7 @@ const Scenario = struct {
             \\[jails.sshd]
             \\enabled = true
             \\filter = "sshd"
+            \\timestamp = "undated"
             \\{s}
             \\logpath = ["{s}"]
             \\
@@ -236,13 +237,9 @@ test "integration: fail-closed (b) metrics port already bound exits 1 with a cau
 
     try expectFailClosed(&r);
 
-    const http_cause = try std.fmt.allocPrint(a, "http: init on 127.0.0.1:{d} failed", .{s.metrics_port});
+    const http_cause = try std.fmt.allocPrint(a, "native: HTTP listener 127.0.0.1:{d}: AddressInUse", .{s.metrics_port});
     defer a.free(http_cause);
-    if (std.os.linux.geteuid() == 0) {
-        try expectContains(r.stderr, http_cause);
-    } else if (std.mem.indexOf(u8, r.stderr, http_cause) == null) {
-        try expectContains(r.stderr, "refusing to run unprotected");
-    }
+    try expectContains(r.stderr, http_cause);
 }
 
 test "integration: fail-closed (c) world-writable config exits 1 naming the mode and the fix, no trace" {
@@ -333,6 +330,7 @@ fn expectStorageRefusal(r: *const Run, socket_path: []const u8) !void {
     try expectContains(r.stderr, "refusing to start");
     try expectNotContains(r.stderr, "firewall:");
     try expectNotContains(r.stderr, "http:");
+    try expectNotContains(r.stderr, "native: HTTP listener");
     try testing.expectError(error.FileNotFound, std.fs.cwd().access(socket_path, .{}));
 }
 
@@ -350,11 +348,11 @@ test "integration: persistence missing parent refuses startup before backend and
     defer r.deinit(a);
     try expectStorageRefusal(&r, sock);
     try expectContains(r.stderr, state_path);
-    try expectContains(r.stderr, "persist: startup check open_directory failed");
+    try expectContains(r.stderr, "native: path admission");
     try expectContains(r.stderr, "FileNotFound");
 }
 
-test "integration: blocked state save path refuses startup and preserves saved bytes" {
+test "integration: legacy state format refuses before SQLite and preserves saved bytes" {
     const a = testing.allocator;
     var s = try Scenario.init(a);
     defer s.deinit();
@@ -362,17 +360,22 @@ test "integration: blocked state save path refuses startup and preserves saved b
     defer a.free(sock);
     const text = try s.writeConfig(sock, "source = \"file\"", 0o640);
     defer a.free(text);
-    try s.tmp.dir.writeFile(.{ .sub_path = "state.bin", .data = "untouched saved bytes" });
+    {
+        const file = try s.tmp.dir.createFile("state.bin", .{ .mode = 0o600 });
+        defer file.close();
+        try file.writeAll("F2ZS\x04retained legacy bytes");
+    }
     try s.tmp.dir.makeDir("state.bin.tmp");
     var r = try s.run();
     defer r.deinit(a);
     try expectStorageRefusal(&r, sock);
-    try expectContains(r.stderr, "persist: startup check inspect_temporary failed");
-    try expectContains(r.stderr, "state.bin.tmp");
-    try expectContains(r.stderr, "NotRegularFile");
+    try expectContains(r.stderr, "native: state authority");
+    try expectContains(r.stderr, "NativeStateMigrationRequired");
+    var retained_sidecar = try s.tmp.dir.openDir("state.bin.tmp", .{});
+    retained_sidecar.close();
     const saved = try s.tmp.dir.readFileAlloc(a, "state.bin", 100);
     defer a.free(saved);
-    try testing.expectEqualStrings("untouched saved bytes", saved);
+    try testing.expectEqualStrings("F2ZS\x04retained legacy bytes", saved);
 }
 
 test "integration: unwritable persistence refuses startup then advances after repair" {
@@ -399,7 +402,7 @@ test "integration: unwritable persistence refuses startup then advances after re
         var r = try s.run();
         defer r.deinit(a);
         try expectStorageRefusal(&r, sock);
-        try expectContains(r.stderr, "persist: startup check create_probe failed");
+        try expectContains(r.stderr, "native: state authority");
         try expectContains(r.stderr, state_path);
         try expectContains(r.stderr, "AccessDenied");
     }
@@ -407,38 +410,8 @@ test "integration: unwritable persistence refuses startup then advances after re
     var repaired = try s.run();
     defer repaired.deinit(a);
     try expectFailClosed(&repaired);
-    try expectContains(repaired.stderr, "http: init on");
+    try expectContains(repaired.stderr, "native: HTTP listener");
     try expectNotContains(repaired.stderr, "startup check");
-}
-
-test "integration: journal cursor persistence is required only for a selected journal source" {
-    const a = testing.allocator;
-    for ([_]bool{ false, true }) |journal| {
-        // Journal input has this documented host prerequisite; no reader is launched here.
-        if (journal) std.fs.cwd().access("/usr/bin/journalctl", .{}) catch return error.SkipZigTest;
-        var s = try Scenario.init(a);
-        defer s.deinit();
-        const sock = try s.defaultSocketPath();
-        defer a.free(sock);
-        try s.tmp.dir.makeDir("journald-cursors.bin.tmp");
-        const addr = try std.net.Address.parseIp4("127.0.0.1", s.metrics_port);
-        var holder = try addr.listen(.{ .reuse_address = true });
-        defer holder.deinit();
-        const text = try s.writeConfig(sock, if (journal) "source = \"journald\"" else "source = \"file\"", 0o640);
-        defer a.free(text);
-        var r = try s.run();
-        defer r.deinit(a);
-        if (journal) {
-            try expectStorageRefusal(&r, sock);
-            try expectContains(r.stderr, "journald: startup check inspect_temporary failed");
-            try expectContains(r.stderr, "journald-cursors.bin.tmp");
-            try expectContains(r.stderr, "NotRegularFile");
-        } else {
-            try expectFailClosed(&r);
-            try expectContains(r.stderr, "http: init on");
-            try expectNotContains(r.stderr, "startup check");
-        }
-    }
 }
 
 test "integration: fail-closed helper: trace detector matches Zig frame lines and nothing else" {

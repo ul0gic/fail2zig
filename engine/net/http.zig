@@ -27,7 +27,7 @@ pub const Error = error{
     AlreadyStarted,
     OutOfMemory,
     NotLinux,
-};
+} || posix.BindError;
 
 pub const MetricsSource = struct {
     ctx: ?*anyopaque = null,
@@ -138,8 +138,7 @@ pub const HttpServer = struct {
             .zero = [_]u8{0} ** 8,
         };
         const addr_len: posix.socklen_t = @sizeOf(linux.sockaddr.in);
-        posix.bind(fd, @ptrCast(&addr), addr_len) catch
-            return error.BindFailed;
+        try posix.bind(fd, @ptrCast(&addr), addr_len);
 
         posix.listen(fd, @intCast(max_clients)) catch return error.ListenFailed;
 

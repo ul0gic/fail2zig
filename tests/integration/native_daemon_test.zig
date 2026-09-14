@@ -49,6 +49,9 @@ fn waitRevision(h: *harness.Harness, expected: u32) !void {
         if ((harness.parseJsonUintField(result, "revision") orelse 0) >= expected) return;
         std.time.sleep(20 * std.time.ns_per_ms);
     }
+    const last = try h.sendCommand(.{ .list_jails = {} });
+    defer t.allocator.free(last);
+    std.debug.print("native daemon: missing revision {d}; last jails {s}\n", .{ expected, last });
     return error.TimedOut;
 }
 fn savedDeadline(h: *harness.Harness) !i64 {
@@ -134,9 +137,11 @@ test "native daemon: unsupported protection refuses before state access and chan
     try writeConfig(&h);
     const original = try std.fs.cwd().readFileAlloc(t.allocator, h.config_path, 8192);
     defer t.allocator.free(original);
-    const enforcing = try std.mem.replaceOwned(u8, t.allocator, original, "banaction = \"log-only\"", "banaction = \"nftables\"");
-    defer t.allocator.free(enforcing);
-    try std.fs.cwd().writeFile(.{ .sub_path = h.config_path, .data = enforcing });
+    // Constant enforcement has its own isolated-kernel suite. Escalation remains
+    // unsupported and must still refuse before creating or migrating state.
+    const unsupported = try std.mem.replaceOwned(u8, t.allocator, original, "banaction = \"log-only\"", "banaction = \"log-only\"\nbantime_increment_enabled = true");
+    defer t.allocator.free(unsupported);
+    try std.fs.cwd().writeFile(.{ .sub_path = h.config_path, .data = unsupported });
     try t.expectError(error.DaemonUnavailable, h.startDaemon());
     try t.expectError(error.FileNotFound, std.fs.cwd().access(h.state_path, .{}));
     try writeConfig(&h);

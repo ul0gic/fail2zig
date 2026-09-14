@@ -8,6 +8,7 @@ pub const nftables = @import("nftables.zig");
 pub const iptables = @import("iptables.zig");
 pub const ipset = @import("ipset.zig");
 pub const netlink = @import("netlink.zig");
+pub const inspection = @import("inspection.zig");
 
 pub const BackendError = error{
     SystemError,

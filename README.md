@@ -21,12 +21,13 @@ The importer translates supported fail2ban jail settings into native TOML and re
 unsupported configurations that need operator changes. Broader supported migration and
 bounded native custom rules remain development work; exact fail2ban compatibility is not promised.
 
-This checkout is **0.3.1-dev**, unpublished. The default daemon retains its existing ingestion
-and binary state. An explicit [native ingestion preview](docs/parity/native-runtime.md) now
-connects native sources, transactional retry decisions and embedded SQLite to the daemon,
-with actual file/restart tests on Linux and static musl. It currently admits log-only policy;
-enforcing operation and full N2 acceptance remain open. Legacy staged Python/libsystemd
-consumers also remain until their replacements are qualified.
+This checkout is **0.3.1-dev**, unpublished. Its default [native runtime](docs/parity/native-runtime.md)
+uses embedded SQLite for source receipts, consumer state and retry decisions, with durable
+firewall intent and confirmed history. Selected file/journal restart, enforcement and recovery
+checks pass across the three backends and both address families. Full N2 fault/platform
+qualification remains open. Existing binary state and unsupported settings are refused;
+there is no automatic migration. Replaced legacy consumers are being retired after their
+replacement acceptance.
 The corrected direction removes the remaining project-owned Python
 and consolidates daemon/admin functions into one self-contained executable. OS requirements
 remain explicit: journal input uses the host's journald and journalctl. That integration is

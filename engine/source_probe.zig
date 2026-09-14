@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
-const systemd = @import("core/systemd_reader.zig");
 const files = @import("core/durable_file_source.zig");
 const source_record = @import("core/source_record.zig");
 pub fn main() !void {
@@ -19,19 +18,9 @@ pub fn main() !void {
         while (try source.poll(onFile, null)) {}
         return;
     }
-    if (args.len < 3) return error.UsageJournalPathFlagsMatches;
-    const flags = try std.fmt.parseInt(u32, args[2], 10);
-    var reader = systemd.Reader.init(allocator, "private-fixture", .{ .files = &.{args[1]}, .flags = flags, .matches = args[3..] }, null) catch |err| {
-        try std.json.stringify(.{ .err = @errorName(err) }, .{}, std.io.getStdOut().writer());
-        try std.io.getStdOut().writer().writeByte('\n');
-        return;
-    };
-    defer reader.deinit();
-    while (try reader.poll(onRecord, null)) {}
-}
-fn onRecord(record: source_record.Record, _: ?*anyopaque) !void {
-    try std.json.stringify(.{ .message = record.message, .cursor = record.cursor, .timestamp_us = record.timestamp_us }, .{}, std.io.getStdOut().writer());
-    try std.io.getStdOut().writer().writeByte('\n');
+    // The old dynamic journal reader is retired. Actual journal observations
+    // belong to the native journalctl transport and its qualified fixtures.
+    return error.JournalReaderRetired;
 }
 
 fn onFile(record: source_record.Record, _: ?*anyopaque) !void {

@@ -84,8 +84,45 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_engine_tests.step);
     b.step("test-engine", "Run native daemon tests").dependOn(&run_engine_tests.step);
 
-    // Full-profile foundations remain independently testable before daemon
-    // activation. These tests also participate in the ordinary test gate.
+    // Independent N2 delivery roots do not install or share daemon artifacts.
+    inline for (.{
+        .{ "test-native-firewall", "engine/native_firewall_tests.zig", "native firewall:" },
+        .{ "test-native-rules", "engine/native_rule_tests.zig", "native rules:" },
+        .{ "test-native-correlation", "engine/native_correlation_tests.zig", "native correlation:" },
+        .{ "test-native-source-repair", "engine/source_repair_tests.zig", "source repair:" },
+        .{ "test-native-consumers", "engine/native_consumer_tests.zig", "native consumers:" },
+        .{ "test-native-effects", "engine/native_effect_tests.zig", "native effects:" },
+        .{ "test-native-effect-runtime", "engine/native_effect_runtime_tests.zig", "native effect runtime:" },
+        .{ "test-native-effect-history", "engine/native_effect_history_tests.zig", "native effect history:" },
+        .{ "test-native-effect-history-store", "engine/native_effect_history_store_tests.zig", "native effect history store:" },
+        .{ "test-native-consumer-manifest", "engine/native_consumer_manifest_tests.zig", "native consumer manifest:" },
+        .{ "test-native-consumer-coordinator", "engine/native_consumer_coordinator_tests.zig", "native coordinator:" },
+        .{ "test-native-consumer-runtime", "engine/native_consumer_runtime_tests.zig", "native consumer runtime:" },
+        .{ "test-native-consumer-plan", "engine/native_consumer_plan_tests.zig", "native consumer plan:" },
+        .{ "test-native-session-repair", "engine/native_session_repair_tests.zig", "native session repair:" },
+        .{ "test-native-resource-budget", "engine/native_resource_budget_tests.zig", "native resource budget:" },
+        .{ "test-native-maintenance", "engine/native_maintenance_tests.zig", "native maintenance:" },
+        .{ "test-native-effective", "engine/native_effective_tests.zig", "native effective:" },
+        .{ "test-native-timezone", "engine/native_timezone_tests.zig", "native timezone:" },
+        .{ "test-native-config", "engine/native_config_tests.zig", "native:" },
+        .{ "test-native-dns", "engine/native_dns_tests.zig", "native dns:" },
+        .{ "test-native-ignore", "engine/native_ignore_tests.zig", "native ignore:" },
+    }) |entry| {
+        const module = b.createModule(.{
+            .root_source_file = b.path(entry[1]),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        module.addImport("shared", shared_mod);
+        if (comptime std.mem.eql(u8, entry[0], "test-native-consumers") or std.mem.eql(u8, entry[0], "test-native-effects") or std.mem.eql(u8, entry[0], "test-native-effect-runtime") or std.mem.eql(u8, entry[0], "test-native-consumer-manifest") or std.mem.eql(u8, entry[0], "test-native-consumer-runtime") or std.mem.eql(u8, entry[0], "test-native-session-repair") or std.mem.eql(u8, entry[0], "test-native-resource-budget") or std.mem.eql(u8, entry[0], "test-native-effect-history-store") or std.mem.eql(u8, entry[0], "test-native-maintenance")) module.linkLibrary(sqlite);
+        const tests = b.addTest(.{ .root_module = module, .filters = &.{entry[2]} });
+        const run_tests = b.addRunArtifact(tests);
+        b.step(entry[0], "Test isolated N2 native component delivery").dependOn(&run_tests.step);
+    }
+
+    // Native source/storage foundations and retained pure preparation fixtures.
+    // The historical step name remains a command alias for this test root.
     const parity_runtime_mod = b.createModule(.{
         .root_source_file = b.path("engine/parity_runtime_tests.zig"),
         .target = target,
@@ -96,12 +133,12 @@ pub fn build(b: *std.Build) void {
     parity_runtime_mod.linkLibrary(sqlite);
     const run_parity_runtime_tests = b.addRunArtifact(parity_runtime_tests);
     test_step.dependOn(&run_parity_runtime_tests.step);
-    b.step("test-p2-runtime", "Test source, event-time and durable record foundations").dependOn(&run_parity_runtime_tests.step);
+    b.step("test-p2-runtime", "Test native source/storage and pure preparation foundations").dependOn(&run_parity_runtime_tests.step);
 
     const native_foundations = b.addTest(.{ .root_module = parity_runtime_mod, .filters = &.{ "storage health:", "native processor:", "record store:", "pipeline:", "receipt recovery:", "future time:", "time admission:", "event age:", "year inference:", "native journal:", "clock recovery:", "native retry:" } });
     b.step("test-native-foundations", "Test native storage, time, sources and recovery without legacy workers").dependOn(&b.addRunArtifact(native_foundations).step);
 
-    // Focused native consumer gate: no legacy worker test execution.
+    // Focused native detection gate.
     const detection_mod = b.createModule(.{
         .root_source_file = b.path("engine/native_detection_tests.zig"),
         .target = target,

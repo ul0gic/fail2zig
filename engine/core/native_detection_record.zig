@@ -3,6 +3,37 @@
 //! Detached native detection rows; no borrowed SQLite memory or native struct
 //! layout on disk. This is failure evidence, not an enforcement intent.
 const std = @import("std");
+pub const StagedInput = struct {
+    record: @import("source_record.zig").Record,
+    decoded: []const u8,
+    time: policy.Result,
+    processing_us: i64,
+    monotonic_ms: u64,
+};
+pub const StagedPrepared = struct {
+    outcomes: []const Outcome,
+    consumers: @import("native_consumer.zig").Batch,
+    context: ?*anyopaque,
+    publish: *const fn (?*anyopaque) void,
+    release: *const fn (?*anyopaque) void,
+};
+/// Checkpoints carry consumer dependencies without inventing a data outcome.
+pub const StagedState = struct {
+    consumers: @import("native_consumer.zig").Batch,
+    context: ?*anyopaque,
+    publish: *const fn (?*anyopaque) void,
+    release: *const fn (?*anyopaque) void,
+};
+pub const StagedConsumer = struct {
+    generation: [32]u8,
+    context: ?*anyopaque,
+    prepare: *const fn (StagedInput, ?*anyopaque) anyerror!StagedPrepared,
+    prepare_checkpoint: *const fn (@import("source_record.zig").Record, i64, u64, ?*anyopaque) anyerror!StagedState,
+    manifest: *const fn ([]const u8, [32]u8, ?*anyopaque) anyerror!@import("native_consumer.zig").Manifest,
+    /// A one-use DNS completion may retain its captured preparation clock. The
+    /// writer still samples its actual clock and checks the consumer turn guard.
+    processing_time: ?*const fn (@import("source_record.zig").Record, i64, ?*anyopaque) anyerror!i64 = null,
+};
 const policy = @import("source_time_policy.zig");
 pub const version: u16 = 1;
 pub const Kind = enum(u8) {

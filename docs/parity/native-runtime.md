@@ -1,35 +1,43 @@
-# Native ingestion preview
+# Native runtime development contract
 
-The development daemon has an explicit SQLite ingestion path selected by
-`global.native_ingestion = true`. This is an incomplete N2 implementation. Its admitted
-policies are **log-only**, with constant finite bantime and maxretry from 1 through 128.
-Enforcing policies, escalation, internal recidive, custom/correlated rules and DNS consumers
-are not admitted. The default daemon path remains unchanged.
+This unpublished 0.3.1 development checkout uses the native SQLite runtime by default.
+`global.native_ingestion = false` is refused. Existing binary state is neither imported
+nor reset. Full N2 fault/platform qualification and release readiness remain open.
+The published 0.3.0 behavior is separate from this development contract.
 
-Native file ingestion, retry evidence, decisions and source progress use SQLite as their
-authority. Each complete record first obtains a durable receipt; its final transaction
-commits time/detection results, retry state, any decision, checkpoint/cursor and receipt
-deletion together. Retry attempts preserve their individual times and occurrence identities.
-Late attempts are counted only within the inclusive window relative to processing time.
-Active decisions neither accumulate new attempts nor extend their committed expiry.
-Decisions are not confirmed firewall effects.
+The assembled runtime supports file ingestion, origin-qualified SSH journal input,
+bounded custom rules/correlation and their configured DNS/ignore dependencies. Policies
+use constant finite bantime and maxretry from 1 through 128. Log-only operation and typed
+host INPUT DROP enforcement have passed selected actual-daemon cases with nftables,
+iptables and ipset for IPv4 and IPv6. Full service/policy/scope coverage remains later work;
+escalation and internal recidive policies are refused at admission.
+
+## State and protection
+
+Each complete record obtains a durable receipt. Its final transaction commits consumer
+results, retry state, decisions, checkpoints/cursor and receipt deletion together. Original
+receipt/event times and occurrence identities survive retries and restarts. Active decisions
+do not accumulate attempts or extend their original expiry. A decision is not proof that a
+firewall effect was installed: effect intent is durable before dispatch, kernel readback
+establishes confirmation, and confirmed history is consumed separately.
+
+Use a state directory owned by the daemon UID without group/other write access. SQLite files
+must belong to that UID with mode 0600. One daemon holds the state authority lock; enforcing
+operation also holds the selected network-namespace authority. Incompatible stored state,
+required consumers or semantic generations cause refusal. Supported migration/conversion
+and transactional live reload remain unfinished; do not point the development daemon at
+published binary state expecting automatic conversion.
 
 ## File configuration
 
-Use a separate development state directory owned by the daemon UID, with no group/other
-write access. SQLite files must be owned by that UID and mode 0600. An existing binary state
-file is not imported or reset. Changing an admitted generation is refused; migration and
-reload boundaries still need implementation.
-
 ```toml
 [global]
-native_ingestion = true
-state_file = "/var/lib/fail2zig-preview/state.sqlite"
-socket_path = "/run/fail2zig-preview/control.sock"
+state_file = "/var/lib/fail2zig-dev/state.sqlite"
+socket_path = "/run/fail2zig-dev/control.sock"
 metrics_enabled = false
 
 [defaults]
-banaction = "log-only"
+enforce = false
 maxretry = 3
 findtime = 600
 bantime = 60
@@ -41,64 +49,66 @@ timestamp = "iso8601"
 logpath = ["/var/log/auth.log"]
 ```
 
-Select a timestamp contract matching the actual input:
+Choose an explicit timestamp contract matching the input:
 
 | Setting | Admitted file shape |
 |---|---|
-| `timestamp = "iso8601"` | ISO timestamp with an explicit offset, followed by a syslog envelope |
-| `timestamp = "syslog"` | Classic 15-byte syslog date/envelope; requires `timezone_offset_minutes` and infers the year from the durable receipt |
-| `timestamp = "undated"` | Service message bodies deliberately admitted using receipt time; no implicit timestamp-parser fallback |
+| `iso8601` | Timestamp with explicit offset; built-in detection expects a following syslog envelope |
+| `syslog` | Classic 15-byte date/envelope, inferred year and explicit fixed offset or named zone |
+| `undated` | Service bodies deliberately admitted using receipt time |
+| `epoch_seconds` | Leading seconds field separated by a space |
+| `common_log` | Bracketed common-log timestamp at its configured fixed position |
 
-Named zones, DST transitions and additional file date layouts are not implemented by this
-configuration projection. New files start at the head; saved positions control restart.
-Records default to UTF-8 with a 2 KiB bound. Invalid decoding pauses the affected jail without
-advancing it; other owners of a healthy store continue. Source repair/resumption is incomplete
-and can require a validated restart. Missing continuity is never repaired by seeking to tail.
+For classic syslog, select `timezone_offset_minutes` or `timezone` from the configured
+`timezone_root`; a named zone may specify `timezone_ambiguity = "reject"`, `"earlier"`
+or `"later"`. Zone bytes and policy participate in generation admission. Parser and
+service combinations still require their respective qualification; accepting a date format
+is not a claim of full service coverage.
 
-## System journal configuration
+New files start at the head; exact saved positions control restart. Records default to
+UTF-8 with a 2 KiB bound. Transient source failures use bounded repair attempts. Lost
+continuity or unsafe replay becomes visible intervention without guessing a new position.
+A failed physical source can leave healthy sibling sources progressing on a healthy store.
 
-For the qualified SSH syslog profile, use `source = "journald"`, omit file timestamp settings,
-and supply `journal_executables` containing the actual SSH executable paths qualified for
-that host. Startup checks that the paths identify root-owned regular executables without
-group/other write access. The coordinator reads `/etc/machine-id` locally. These checks do not
-certify a deployment or establish that an arbitrary configured program is SSH.
+## System journal
 
-The native OS journalctl session uses the existing SSH selectors as alternatives, a bounded
-one-record batch, and exact cursor validation. Detection independently requires the configured
-machine ID, root UID, an admitted executable and direct syslog transport. Client-supplied tags
-cannot authorize a candidate. Other transports and missing executable metadata remain outside
-this profile's detection coverage. Broad live-host qualification remains open.
+Use `source = "journald"`, omit file timestamp settings, and set `journal_executables`
+to the actual SSH executables qualified for the host. Admission checks root ownership,
+regular executable type and absence of group/other write permission. Detection separately
+requires the local machine ID, root UID, an admitted executable and direct syslog transport;
+client-supplied tags alone cannot authorize an event.
 
-## Operations and limits
+The runtime retains host `journalctl`, bounded complete records and exact cursor checks.
+Selected private-journal tests cover real SSH origins, excluded logger origins, all three
+backends, both address families, restart and continuity failures. Other origin/transport
+profiles and full deployment/platform coverage are not inferred from those tests.
 
-One worker owns source/database work. IPC and HTTP status use detached snapshots, so they
-continue responding when SQLite is blocked. The delivered client's status, jails, version
-and list commands remain available. Native status includes storage phase, failure cause,
-SQLite code, retry timing and decision totals. A log-only decision is listed with
-`enforced=false`, `confirmed=false` and its original `expiry_us`; `ban_expiry` provides the
-seconds projection for the existing client. Confirmed/installed ban totals remain zero.
-Native administrative ban/unban/reload mutations are refused without changing state.
+## Operations and resource limits
 
-Runtime storage errors pause shared ingestion and use the approved 1–30 second recovery
-schedule. Recovery reopens storage, restores state and validates source continuity. An
-uncommitted first receipt retains its in-memory time during runtime retry. Committed receipt
-and processing-time floors prevent a backward clock from silently shifting retry windows.
-Unavailable startup storage is refused, including after an initial clock wait. Corrupt state
-requires intervention. There is no native firewall recovery implementation in this preview.
+One worker owns source/database/effect work. Detached IPC/HTTP snapshots keep status
+responsive when it stops making progress. Status reports storage/source causes, worker
+heartbeat/busy age, clock uncertainty and overdue or uncertain committed expiry. The
+five-second stall threshold is diagnostic; it is not a filesystem I/O timeout. Kernel timer
+expiry is independent; iptables rules can remain installed while the worker is blocked.
+Recovery preserves original deadlines, inspects effects and verifies source continuity
+before healthy admission. Unknown ownership or time does not authorize new protection.
 
-Current admission ceilings are 64 enabled jails, eight file incarnations per jail and at most
-4,096 retry subjects distributed across the enabled jails. A conservative per-jail memory
-estimate limits admitted source plans to 64 MiB; this is not an allocator or process-RSS cap.
-Aggregate source/scratch accounting still needs full qualification. Subject capacity refuses
-new evidence rather than silently discarding protection history; state/ledger cleanup remains
-unfinished, so these limits are not qualified long-running release defaults.
+The separate client supports status, jails, version and list. Listed decisions retain
+`expiry_us`; `enforced`/`confirmed` require a coherent verified view. Administrative
+ban/unban/reload mutations remain explicitly refused without changing state.
 
-SQLite uses a process-wide 64 MiB heap ceiling, a 2 MiB advisory cache target, a 256 MiB main
-database page limit and approximately one million VM instructions per transaction. Its worker
-checks the WAL at a 16 MiB maintenance trigger before further admission. A failed or pinned
-checkpoint pauses ingestion. These controls exclude OS/helper memory, do not bound a blocked
-filesystem syscall, and do not constitute a total filesystem quota. Transactions can overshoot
-the WAL trigger. No ledger deletion or binary-state conversion is implemented.
+Admission limits include 64 enabled jails, eight file incarnations per jail and 4,096 live
+retry subjects shared across enabled jails. Native reservations default to 256 MiB and
+2,048 descriptors, with checked aggregate admission including recovery overlap. These
+are not process/helper RSS guarantees. SQLite has a separate 64 MiB heap ceiling, 2 MiB
+advisory cache and 256 MiB main-page limit. Its 16 MiB WAL trigger precedes further writes;
+a transaction may overshoot it, and a pinned/failed checkpoint pauses admission. VM work
+budgets do not bound blocked kernel I/O or constitute a filesystem quota.
 
-The preview establishes actual file-to-decision-to-restart behavior. It does not complete N2,
-qualify enforcing operation, replace the default daemon, or establish release readiness.
+Maintenance first persists replay guards and a reject-below boundary, then deletes eligible
+detail in separate bounded batches of at most 64 physical rows. Pending receipts, current
+anchors, live retry/effect references and required consumer/history dependencies remain
+pinned. Inactive subject compaction retains cumulative retry totals; reentry and restart
+preserve them. Guards and required history still consume bounded database capacity.
+Exhaustion pauses admission instead of discarding protection. Full fault, maximum-resource,
+long-running and target qualification remain required before release.

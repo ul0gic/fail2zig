@@ -16,13 +16,15 @@ pub const Settings = struct {
     journal: transport.Options = .{},
     source_id: []const u8 = "system-journal",
     ignore_capacity: usize,
+    custom: bool = false,
     max_record_bytes: u32 = 2048,
     max_decoded_bytes: u32 = 2048,
 };
 pub const Plan = struct {
     allocator: std.mem.Allocator,
-    base: builtin.Detector,
-    qualified: journal.Detector,
+    base: ?builtin.Detector,
+    qualified: ?journal.Detector,
+    profile: origin.Profile,
     processing: processing.Options,
     journal: transport.Options,
     source_id: []const u8,
@@ -49,20 +51,21 @@ pub const Plan = struct {
         const self = try a.create(Plan);
         errdefer a.destroy(self);
         self.allocator = a;
-        self.base = try builtin.Detector.init(a, .{ .filter = jail.filter, .body = .whole, .ignore = jail.ignoreip orelse cfg.defaults.ignoreip, .ignore_capacity = settings.ignore_capacity, .max_decoded_bytes = settings.max_decoded_bytes });
-        errdefer self.base.deinit(a);
-        self.qualified = try journal.Detector.init(&self.base, profile);
+        self.profile = profile;
+        self.base = if (settings.custom) null else try builtin.Detector.init(a, .{ .filter = jail.filter, .body = .whole, .ignore = jail.ignoreip orelse cfg.defaults.ignoreip, .ignore_capacity = settings.ignore_capacity, .max_decoded_bytes = settings.max_decoded_bytes });
+        errdefer if (self.base) |*value| value.deinit(a);
+        self.qualified = if (self.base) |*value| try journal.Detector.init(value, profile) else null;
         self.processing = .{ .jail = jail.name, .parent_generation = parent, .timestamp = .journal, .window_us = window, .max_record_bytes = settings.max_record_bytes, .max_decoded_bytes = settings.max_decoded_bytes };
         self.journal = settings.journal;
         self.source_id = settings.source_id;
         return self;
     }
     pub fn sessionOptions(self: *const Plan) session.Options {
-        return .{ .processing = self.processing, .detection = self.qualified.consumer(), .journal = self.journal, .source_id = self.source_id };
+        return .{ .processing = self.processing, .detection = if (self.qualified) |*value| value.consumer() else null, .journal = self.journal, .source_id = self.source_id };
     }
     pub fn destroy(self: *Plan) void {
         const a = self.allocator;
-        self.base.deinit(a);
+        if (self.base) |*value| value.deinit(a);
         a.destroy(self);
     }
 };

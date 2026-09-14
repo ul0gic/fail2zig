@@ -24,10 +24,15 @@ pub const Prepared = struct {
     disposition: []const u8,
     event_time: ?f64 = null,
     native_time: ?@import("source_time_policy.zig").Result = null,
+    zone_provenance: ?@import("native_time_record.zig").Provenance = null,
+    effects_clock: ?@import("native_effect.zig").Clock = null,
     native_detection: ?@import("native_detection_record.zig").Outcome = null,
+    native_detections: ?[]const @import("native_detection_record.zig").Outcome = null,
     native_retry: ?@import("native_retry.zig").Admission = null,
     intent: ?[]const u8 = null,
     shared_state: ?durable.SharedState = null,
+    consumers: ?@import("native_consumer.zig").Batch = null,
+    consumer_manifest: ?@import("native_consumer.zig").Manifest = null,
     context: ?*anyopaque,
     publish: *const fn (?*anyopaque) void,
     release: *const fn (?*anyopaque) void,
@@ -66,10 +71,6 @@ pub const Pipeline = struct {
     pub fn admit(self: *Pipeline) !void {
         if (self.gate) |gate| try gate.admit(self.recovery_generation);
         if (!self.ready) return error.RestoreRequired;
-        if (self.store.runtime_path) |path| self.store.maintainWal(path) catch |failure| {
-            self.failed(failure);
-            return failure;
-        };
         // Schema-7 owners check the global durable floor before reading another
         // record and again before publication. Older component schemas retain
         // their previous admission contract until explicitly migrated.
@@ -93,6 +94,27 @@ pub const Pipeline = struct {
     fn failed(self: *Pipeline, cause: anyerror) void {
         // A changed source occurrence/configuration is not evidence that the
         // shared store is unavailable. Isolate it without stopping other owners.
+        if (cause == error.ConsumerExpired or cause == error.ConsumerPending or cause == error.EffectExpired) return; // Release stage and resolve/reprepare the same receipt.
+        if (cause == error.EffectClockReversed) {
+            const floor = self.store.admissionClock() catch {
+                self.ready = false;
+                if (self.gate) |gate| gate.failed(cause, .{});
+                return;
+            };
+            self.receiptClockFailed(if (floor) |value| value.us else std.time.microTimestamp());
+            return;
+        }
+        if (cause == error.ConsumerClockReversed) {
+            const floor = self.store.consumer_clock_floor_us orelse {
+                self.ready = false;
+                if (self.gate) |gate| gate.failed(error.InvalidConsumer, .{});
+                return;
+            };
+            self.receiptClockFailed(floor);
+            return;
+        }
+        // Source sessions fence these inputs without changing committed state.
+        if (sourceLocalIntervention(cause)) return;
         if (cause == error.ReceiptConflict) {
             self.ready = false;
             return;
@@ -142,6 +164,13 @@ pub const Pipeline = struct {
         self.ready = true;
     }
 
+    /// These failures leave committed consumer state intact. The source session
+    /// retains its exact pending input and intervention cause; sibling sources
+    /// may continue through this restored pipeline.
+    pub fn sourceLocalIntervention(cause: anyerror) bool {
+        return cause == error.PrunedReplay or cause == error.OutsideTimezoneCoverage;
+    }
+
     pub fn acknowledge(record: records.Record, context: ?*anyopaque) anyerror!void {
         const self: *Pipeline = @ptrCast(@alignCast(context orelse return error.MissingPipeline));
         try self.admit();
@@ -149,7 +178,10 @@ pub const Pipeline = struct {
         self.acknowledgeAdmitted(record) catch |failure| {
             // Decoder/matcher failure belongs to this source owner. It does not
             // establish a storage outage for otherwise independent jails.
-            if (self.gate != null) self.ready = false;
+            // Dependency waits and expired preparation keep the same restored
+            // owner/receipt. Invalidating it here would discard a same-turn DNS
+            // answer even though failed() deliberately keeps the gate healthy.
+            if (self.gate != null and failure != error.ConsumerExpired and failure != error.ConsumerPending and failure != error.EffectExpired and !sourceLocalIntervention(failure)) self.ready = false;
             return failure;
         };
     }
@@ -219,15 +251,20 @@ pub const Pipeline = struct {
             .timestamp_us = record.timestamp_us,
             .receipt = receipt,
             .native_time_outcome = prepared.native_time,
+            .zone_provenance = prepared.zone_provenance,
+            .effects_clock = prepared.effects_clock,
             .native_detection = prepared.native_detection,
+            .native_detections = prepared.native_detections,
             .native_retry = prepared.native_retry,
             .expected_revision = self.revision,
             .disposition = prepared.disposition,
             .checkpoint = prepared.checkpoint,
             .action_intent = prepared.intent,
             .shared_state = prepared.shared_state,
+            .consumers = prepared.consumers,
+            .consumer_manifest = prepared.consumer_manifest,
         }) catch |err| {
-            if (err == error.StaleCheckpoint or err == error.StaleSharedCheckpoint) self.ready = false;
+            if (err == error.StaleCheckpoint or err == error.StaleSharedCheckpoint or err == error.StaleConsumerCheckpoint) self.ready = false;
             self.failed(err);
             return err;
         };
@@ -292,6 +329,59 @@ const TestProcessor = struct {
         return .{ .context = self, .prepare = prepare, .prepare_restore = restore };
     }
 };
+
+test "pipeline: guarded replay refuses preparation while preserving committed state for siblings" {
+    const a = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const base = try temp.dir.realpathAlloc(a, ".");
+    defer a.free(base);
+    const path = try std.fs.path.join(a, &.{ base, "guard.sqlite" });
+    defer a.free(path);
+    var store = try durable.Store.open(a, path);
+    defer store.close();
+    try store.enableReceipts(8);
+    try store.enableNativeTime();
+    try store.enableDetection();
+    try store.enableClockRecovery();
+    try store.enableJournalDetection();
+    try store.enableRetry();
+    try store.enableConsumers();
+    try store.enableEffects();
+    try store.enableConsumerManifests();
+    try store.enableConfirmedHistory();
+    try store.enableMaintenance();
+    const generation = [_]u8{7} ** 32;
+    const policy = @import("native_retry.zig").Policy{ .maxretry = 3, .window_us = 1000, .bantime_us = 1000, .max_subjects = 8 };
+    try store.admitRetry("fixture", generation, policy);
+    var checkpoint: [8]u8 = undefined;
+    std.mem.writeInt(u64, &checkpoint, 1, .little);
+    const record = records.Record{ .source = "file", .occurrence = "old", .cursor = "saved", .message = "ordinary event", .raw_hash = [_]u8{1} ** 32 };
+    _ = try store.commitRecord(.{ .jail = "fixture", .source = record.source, .occurrence = record.occurrence, .cursor = record.cursor, .raw_hash = record.raw_hash, .disposition = "source-checkpoint", .checkpoint = &checkpoint, .native_retry = .{ .generation = generation, .policy = policy } });
+    try store.fixtureReplayGuard("fixture", record.source, record.occurrence);
+    var clock = RecoveryClock{};
+    var gate = health.Gate.init(clock.clock());
+    var processor = TestProcessor{ .prepare_failure = error.UnexpectedPreparation };
+    var owner = Pipeline{ .store = &store, .jail = "fixture", .processor = processor.adapter(), .gate = &gate };
+    const initial = try gate.beginRecovery();
+    try gate.completed(initial, .storage);
+    try owner.restore(a);
+    for ([_]health.RecoveryStep{ .state, .ownership, .sources }) |step| try gate.completed(initial, step);
+    try std.testing.expectError(error.PrunedReplay, Pipeline.acknowledge(record, &owner));
+    try std.testing.expect(owner.ready);
+    try std.testing.expectEqual(health.Phase.healthy, gate.snapshot().phase);
+    try std.testing.expectEqual(@as(u64, 1), processor.count);
+    try std.testing.expectEqual(@as(u64, 1), try store.revision("fixture"));
+    try std.testing.expectEqual(@as(usize, 0), try store.pendingReceiptCount());
+    const cursor = (try store.sourceCursor(a, "fixture", "file")).?;
+    defer a.free(cursor);
+    try std.testing.expectEqualStrings("saved", cursor);
+    try std.testing.expectError(error.PrunedReplay, Pipeline.acknowledge(record, &owner));
+    var other_processor = TestProcessor{};
+    var other = Pipeline{ .store = &store, .jail = "other", .processor = other_processor.adapter(), .gate = &gate, .ready = true, .recovery_generation = initial };
+    try Pipeline.acknowledge(record, &other);
+    try std.testing.expectEqual(@as(u64, 1), other_processor.count);
+}
 
 test "pipeline: file acknowledgement waits for durable state, retry and restart do not repeat intents" {
     if (!@import("builtin").link_libc) return error.SkipZigTest;
@@ -649,4 +739,33 @@ test "pipeline: real SQLite capacity failure pauses admission without losing the
     try std.testing.expectError(error.StaleRecovery, gate.completed(recovered, .ownership));
     try std.testing.expectEqual(@as(i64, 1), try store.pendingIntents());
     try std.testing.expectEqual(@as(u64, 2), processor.count);
+}
+
+test "native consumers: dependency expiry reprepares while conflicts and clock pause recovery" {
+    const a = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const base = try temp.dir.realpathAlloc(a, ".");
+    defer a.free(base);
+    const path = try std.fs.path.join(a, &.{ base, "gate.sqlite" });
+    defer a.free(path);
+    var store = try durable.Store.open(a, path);
+    defer store.close();
+    const Clock = struct {
+        fn read(_: ?*anyopaque) u64 {
+            return 100;
+        }
+    };
+    var processor = TestProcessor{};
+    for ([_]anyerror{ error.ConsumerExpired, error.StaleConsumerCheckpoint, error.ConsumerClockReversed }) |cause| {
+        var gate = health.Gate.init(.{ .context = null, .read = Clock.read });
+        const generation = try gate.beginRecovery();
+        for ([_]health.RecoveryStep{ .storage, .state, .ownership, .sources }) |step| try gate.completed(generation, step);
+        var pipe = Pipeline{ .store = &store, .jail = "fixture", .processor = processor.adapter(), .ready = true, .gate = &gate };
+        store.consumer_clock_floor_us = 250;
+        pipe.failed(cause);
+        try std.testing.expectEqual(cause == error.ConsumerExpired, pipe.ready);
+        try std.testing.expectEqual(if (cause == error.ConsumerExpired) health.Phase.healthy else health.Phase.paused, gate.snapshot().phase);
+        if (cause == error.ConsumerClockReversed) try std.testing.expectEqual(@as(?i64, 250), gate.snapshot().receipt_clock_floor_us);
+    }
 }

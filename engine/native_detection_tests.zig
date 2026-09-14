@@ -186,12 +186,12 @@ test "native detection: file projection inheritance override and processor bindi
     defer plan.deinit(t.allocator);
     try t.expectEqual(@as(i64, 300_000_000), plan.processing.window_us);
     try t.expectEqualStrings(jails[0].logpath[0], plan.specs[0].pattern);
-    try t.expect((try plan.detection.evaluate(failure, eligible)) == .ignored);
+    try t.expect((try plan.detection.?.evaluate(failure, eligible)) == .ignored);
     jails[0].ignoreip = &.{};
     jails[0].findtime = 600;
     var override = try projection.Plan.init(t.allocator, &cfg, 0, [_]u8{0} ** 32, settings);
     defer override.deinit(t.allocator);
-    try t.expect((try override.detection.evaluate(failure, eligible)) == .candidate);
+    try t.expect((try override.detection.?.evaluate(failure, eligible)) == .candidate);
     try t.expectEqual(@as(i64, 600_000_000), override.processing.window_us);
     var scratch: [2048]u8 = undefined;
     var before = try processor.Processor.init(t.allocator, plan.processing, &scratch, .{ .us = 0 });
@@ -222,7 +222,7 @@ test "native detection: native decoding and time preparation feed a staged candi
     defer prepared.release(prepared.context);
     // This ASCII fixture has the same decoded length. The production consumer
     // integration must carry the decoder's actual slice for all other codecs.
-    const candidate = (try plan.detection.evaluate(scratch[0..line.len], prepared.native_time.?)).candidate;
+    const candidate = (try plan.detection.?.evaluate(scratch[0..line.len], prepared.native_time.?)).candidate;
     try t.expectEqual(now.us - 1_000_000, candidate.time.timestamp.us);
     try t.expectEqual(try shared.IpAddress.parse("203.0.113.7"), candidate.match.subject);
     // Preparation and pure detection cannot acknowledge or publish anything.
@@ -260,7 +260,7 @@ fn allocationScenario(allocator: std.mem.Allocator) !void {
     const cfg = fixtureConfig(&jails);
     var plan = try projection.Plan.init(allocator, &cfg, 0, [_]u8{0} ** 32, settings);
     defer plan.deinit(allocator);
-    try t.expect((try plan.detection.evaluate(failure, eligible)) == .ignored);
+    try t.expect((try plan.detection.?.evaluate(failure, eligible)) == .ignored);
 }
 test "native detection: all initialization allocation failures release ownership" {
     try t.checkAllAllocationFailures(t.allocator, allocationScenario, .{});
@@ -348,7 +348,7 @@ test "native detection: actual file consumers commit typed results and recover p
             try t.expectEqual(@import("core/native_detection_record.zig").Kind.candidate, found.kind);
             try t.expectEqual([4]u8{ 203, 0, 113, 7 }, found.subject.?.v4);
             try t.expectEqualStrings("sshd", found.filter.slice());
-            try t.expectEqual(plan.detection.generation, found.generation);
+            try t.expectEqual(plan.detection.?.generation, found.generation);
             const admitted = (try store.nativeTime("ssh", source.source_id, null)).?.eligible;
             try t.expectEqual(clock.now - 2_000_000, admitted.timestamp.us);
             try t.expectEqual(clock.now - 1_000_000, admitted.receipt.us);

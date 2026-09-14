@@ -91,9 +91,9 @@ pub const BanTimeIncrement = struct {
 };
 
 pub const GlobalConfig = struct {
-    /// Explicit development cutover. Native activation validates its supported
-    /// source/policy settings before opening state; existing state is not imported.
-    native_ingestion: bool = false,
+    /// The native runtime is the sole admitted authority. Retain the setting to
+    /// diagnose old opt-outs; existing binary state is never implicitly imported.
+    native_ingestion: bool = true,
     /// Protected preparation metadata; never interpreted as runtime commands.
     compatibility_manifest: []const u8 = "",
     compatibility_pending: bool = false,
@@ -102,12 +102,21 @@ pub const GlobalConfig = struct {
     socket_path: []const u8 = "/run/fail2zig/fail2zig.sock",
     state_file: []const u8 = "/var/lib/fail2zig/state.bin",
     memory_ceiling_mb: u32 = 64,
+    /// Native Zig reservations are separate from tracker and SQLite allowances.
+    native_memory_ceiling_mb: u32 = 256,
+    native_fd_ceiling: u32 = 2048,
     metrics_enabled: bool = true,
     metrics_bind: []const u8 = "127.0.0.1",
     metrics_port: u16 = 9100,
     websocket_max_clients: u32 = 16,
     on_no_backend: OnNoBackend = .@"fail-closed",
     firewall: FirewallSelection = .auto,
+    timezone_root: []const u8 = "/usr/share/zoneinfo",
+    /// Stable namespace handle selected by deployment; never a saved inode.
+    firewall_namespace: []const u8 = "/proc/1/ns/net",
+    /// Numeric recursive resolver for explicitly configured native hostname rules.
+    dns_server: ?[]const u8 = null,
+    dns_port: u16 = 53,
 };
 
 pub const websocket_hard_max_clients: u32 = 1024;
@@ -125,10 +134,15 @@ pub const JailDefaults = struct {
 pub const JailConfig = struct {
     /// Native file input requires an explicit timestamp contract. The undated
     /// setting is deliberate receipt-time admission, never a parser fallback.
-    timestamp: ?enum { iso8601, syslog, undated } = null,
+    timestamp: ?enum { iso8601, syslog, epoch_seconds, common_log, undated } = null,
     timezone_offset_minutes: ?i16 = null,
+    timezone: ?[]const u8 = null,
+    timezone_ambiguity: ?@import("../core/native_timezone.zig").Ambiguity = null,
     /// Qualified installed SSH executables for native system-journal input.
     journal_executables: []const []const u8 = &.{},
+    /// Protected files containing the approved bounded native JSON rule grammar.
+    rule_files: []const []const u8 = &.{},
+    ignore_file: ?[]const u8 = null,
     compatibility_pending: bool = false,
     name: []const u8,
     enabled: bool = true,
@@ -200,10 +214,14 @@ pub fn resolveJailFromConfig(j: *const JailConfig, defaults: JailDefaults) Resol
 }
 
 pub const Config = struct {
+    /// Retained parser arena capacity supplied by the application, not TOML.
+    retained_capacity: usize = 0,
     global: GlobalConfig = .{},
     defaults: JailDefaults = .{},
     jails: []JailConfig = &.{},
     diag: Diagnostic = .{},
+    /// Diagnostic provenance only; normalized jail policy retains legacy ABI.
+    legacy_banaction_used: bool = false,
 
     pub fn loadFile(arena: std.mem.Allocator, path: []const u8) Error!Config {
         var scratch: Diagnostic = .{};
@@ -256,6 +274,11 @@ pub const Config = struct {
 };
 
 pub const ValidationError = error{
+    InvalidNativePath,
+    InvalidNativeDns,
+    InvalidNativeRules,
+    InvalidNativeResources,
+    InvalidNativeTimezone,
     NativeIngestionRequired,
     CompatibilityNotAdmitted,
     InvalidBantime,
@@ -271,11 +294,34 @@ pub const ValidationError = error{
 };
 
 pub fn validate(cfg: *const Config) ValidationError!void {
+    if (!cfg.global.native_ingestion) return error.NativeIngestionRequired;
+    for ([_][]const u8{ cfg.global.socket_path, cfg.global.state_file, cfg.global.pid_file, cfg.global.timezone_root, cfg.global.firewall_namespace }) |path| {
+        if (path.len == 0 or path.len >= std.fs.max_path_bytes or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidNativePath;
+    }
+    if (cfg.global.socket_path.len >= 108) return error.InvalidNativePath;
+    if (cfg.global.dns_server) |server| {
+        if (!cfg.global.native_ingestion) return error.NativeIngestionRequired;
+        if (server.len == 0 or server.len > 64 or cfg.global.dns_port == 0 or std.mem.indexOfScalar(u8, server, 0) != null) return error.InvalidNativeDns;
+        _ = std.net.Address.parseIp(server, cfg.global.dns_port) catch return error.InvalidNativeDns;
+    } else if (cfg.global.dns_port != 53) return error.InvalidNativeDns;
+    if (cfg.global.native_ingestion and (!std.fs.path.isAbsolute(cfg.global.state_file) or !std.fs.path.isAbsolute(cfg.global.socket_path) or !std.fs.path.isAbsolute(cfg.global.firewall_namespace) or cfg.global.firewall_namespace.len > 256)) return error.InvalidNativePath;
+    for (cfg.jails) |jail| {
+        for (jail.logpath) |path| if (path.len == 0 or path.len >= std.fs.max_path_bytes or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidNativePath;
+        for (jail.journal_executables) |path| if (!std.fs.path.isAbsolute(path) or path.len >= std.fs.max_path_bytes or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidNativePath;
+        if (jail.rule_files.len > 8) return error.InvalidNativeRules;
+        if (!cfg.global.native_ingestion and (jail.rule_files.len != 0 or jail.ignore_file != null)) return error.NativeIngestionRequired;
+        for (jail.rule_files, 0..) |path, i| {
+            if (!std.fs.path.isAbsolute(path) or path.len >= std.fs.max_path_bytes or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidNativePath;
+            for (jail.rule_files[0..i]) |prior| if (std.mem.eql(u8, prior, path)) return error.InvalidNativeRules;
+        }
+        if (jail.ignore_file) |path| if (!std.fs.path.isAbsolute(path) or path.len >= std.fs.max_path_bytes or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidNativePath;
+    }
     if (cfg.global.memory_ceiling_mb < 16) {
         std.log.warn("config: memory_ceiling_mb={d} is below 16MB floor", .{cfg.global.memory_ceiling_mb});
         return error.MemoryCeilingTooLow;
     }
     if (cfg.global.memory_ceiling_mb > std.math.maxInt(usize) / (1024 * 1024)) return error.MemoryCeilingTooHigh;
+    if (cfg.global.native_memory_ceiling_mb == 0 or cfg.global.native_memory_ceiling_mb > std.math.maxInt(usize) / (1024 * 1024) or cfg.global.native_fd_ceiling == 0) return error.InvalidNativeResources;
     try validateIncrement(cfg.defaults.bantime_increment);
     if (cfg.defaults.bantime == 0 or cfg.defaults.bantime > max_ban_duration) {
         std.log.warn("config: defaults.bantime must be > 0", .{});
@@ -298,7 +344,9 @@ pub fn validate(cfg: *const Config) ValidationError!void {
     }
 
     for (cfg.jails, 0..) |j, i| {
-        if (!cfg.global.native_ingestion and (j.timestamp != null or j.timezone_offset_minutes != null or j.journal_executables.len != 0)) return error.NativeIngestionRequired;
+        if (!cfg.global.native_ingestion and (j.timestamp != null or j.timezone_offset_minutes != null or j.timezone != null or j.timezone_ambiguity != null or j.journal_executables.len != 0)) return error.NativeIngestionRequired;
+        if (j.timezone != null and j.timezone_offset_minutes != null) return error.InvalidNativeTimezone;
+        if (j.timezone_ambiguity != null and j.timezone == null) return error.InvalidNativeTimezone;
         if (j.name.len == 0) return error.EmptyJailName;
         _ = shared.JailId.fromSlice(j.name) catch return error.InvalidJailName;
 
@@ -312,7 +360,8 @@ pub fn validate(cfg: *const Config) ValidationError!void {
 
         try validateIncrement(resolveJailFromConfig(&j, cfg.defaults).bantime_increment);
         if (j.enabled and (j.compatibility_pending or cfg.global.compatibility_pending)) return error.CompatibilityNotAdmitted;
-        if (j.enabled and filter_registry.matcherForFilter(j.filter) == null) {
+        if (j.enabled and j.rule_files.len != 0) _ = @import("../core/native_detection_record.zig").Name.init(j.filter) catch return error.InvalidNativeRules;
+        if (j.enabled and j.rule_files.len == 0 and filter_registry.matcherForFilter(j.filter) == null) {
             std.log.warn("config: jail '{s}' filter '{s}' has no builtin matcher", .{ j.name, j.filter });
             return error.UnknownFilter;
         }
@@ -365,6 +414,7 @@ const Parser = struct {
     seen_keys: std.StringHashMap(void),
     jail_source_origin: std.ArrayList(SourceOrigin),
     defaults_source_origin: SourceOrigin = .unset,
+    legacy_banaction_used: bool = false,
 
     cur_section: []const u8 = "",
     cur_key: []const u8 = "",
@@ -516,6 +566,7 @@ const Parser = struct {
             .defaults = self.defaults,
             .jails = try self.jails.toOwnedSlice(),
             .diag = .{ .line = self.line, .col = self.col },
+            .legacy_banaction_used = self.legacy_banaction_used,
         };
     }
 
@@ -523,6 +574,16 @@ const Parser = struct {
         const composite = try std.fmt.allocPrint(self.arena, "{s}\x00{s}", .{ section, key });
         const gop = self.seen_keys.getOrPut(composite) catch return error.OutOfMemory;
         if (gop.found_existing) return error.DuplicateKey;
+    }
+
+    fn policySpelling(self: *Parser, key: []const u8) Error!void {
+        const alias = if (std.mem.eql(u8, key, "enforce")) "banaction" else "enforce";
+        const composite = try std.fmt.allocPrint(self.arena, "{s}\x00{s}", .{ self.cur_section, alias });
+        if (self.seen_keys.contains(composite)) {
+            self.hint = "enforce and banaction conflict in the same section; global.firewall selects the backend";
+            return error.InvalidValue;
+        }
+        if (std.mem.eql(u8, key, "banaction")) self.legacy_banaction_used = true;
     }
 
     fn parseSectionHeader(self: *Parser) Error![]const u8 {
@@ -740,7 +801,16 @@ const Parser = struct {
 
     fn applyGlobalKey(self: *Parser, key: []const u8) Error!void {
         const v = try self.parseValue();
-        if (std.mem.eql(u8, key, "native_ingestion")) {
+        if (std.mem.eql(u8, key, "firewall_namespace")) {
+            const path = try asString(v);
+            if (!std.fs.path.isAbsolute(path) or path.len > 256 or std.mem.indexOfScalar(u8, path, 0) != null or
+                std.mem.indexOf(u8, path, "/self/") != null or std.mem.indexOf(u8, path, "/thread-self/") != null) return error.InvalidValue;
+            self.global.firewall_namespace = path;
+        } else if (std.mem.eql(u8, key, "timezone_root")) {
+            const path = try asString(v);
+            if (!std.fs.path.isAbsolute(path) or path.len > 4096 or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidValue;
+            self.global.timezone_root = path;
+        } else if (std.mem.eql(u8, key, "native_ingestion")) {
             self.global.native_ingestion = try asBool(v);
         } else if (std.mem.eql(u8, key, "compatibility_manifest")) {
             const manifest = try asString(v);
@@ -762,6 +832,14 @@ const Parser = struct {
             const n = try asInt(v);
             if (n < 0 or n > std.math.maxInt(u32)) return error.InvalidValue;
             self.global.memory_ceiling_mb = @intCast(n);
+        } else if (std.mem.eql(u8, key, "native_memory_ceiling_mb")) {
+            const n = try asInt(v);
+            if (n <= 0 or n > std.math.maxInt(u32)) return error.InvalidValue;
+            self.global.native_memory_ceiling_mb = @intCast(n);
+        } else if (std.mem.eql(u8, key, "native_fd_ceiling")) {
+            const n = try asInt(v);
+            if (n <= 0 or n > std.math.maxInt(u32)) return error.InvalidValue;
+            self.global.native_fd_ceiling = @intCast(n);
         } else if (std.mem.eql(u8, key, "metrics_enabled")) {
             self.global.metrics_enabled = try asBool(v);
         } else if (std.mem.eql(u8, key, "metrics_bind")) {
@@ -784,6 +862,12 @@ const Parser = struct {
         } else if (std.mem.eql(u8, key, "firewall")) {
             const s = try asString(v);
             self.global.firewall = try parseFirewallSelection(s);
+        } else if (std.mem.eql(u8, key, "dns_server")) {
+            self.global.dns_server = try asString(v);
+        } else if (std.mem.eql(u8, key, "dns_port")) {
+            const n = try asInt(v);
+            if (n <= 0 or n > 65535) return error.InvalidValue;
+            self.global.dns_port = @intCast(n);
         } else return error.UnknownKey;
     }
 
@@ -804,7 +888,11 @@ const Parser = struct {
                 return error.InvalidValue;
             }
             self.defaults.maxretry = @intCast(n);
+        } else if (std.mem.eql(u8, key, "enforce")) {
+            try self.policySpelling(key);
+            self.defaults.banaction = if (try asBool(v)) .nftables else .@"log-only";
         } else if (std.mem.eql(u8, key, "banaction")) {
+            try self.policySpelling(key);
             const s = try asString(v);
             self.defaults.banaction = try parseBanAction(s);
         } else if (std.mem.eql(u8, key, "ignoreip")) {
@@ -849,8 +937,18 @@ const Parser = struct {
             const n = try asInt(v);
             if (n < -1439 or n > 1439) return error.InvalidValue;
             j.timezone_offset_minutes = @intCast(n);
+        } else if (std.mem.eql(u8, key, "timezone")) {
+            const identifier = try asString(v);
+            @import("../core/native_timezone.zig").validateIdentifier(identifier) catch return error.InvalidValue;
+            j.timezone = identifier;
+        } else if (std.mem.eql(u8, key, "timezone_ambiguity")) {
+            j.timezone_ambiguity = std.meta.stringToEnum(@import("../core/native_timezone.zig").Ambiguity, try asString(v)) orelse return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "journal_executables")) {
             j.journal_executables = try asStringArray(v);
+        } else if (std.mem.eql(u8, key, "rule_files")) {
+            j.rule_files = try asStringArray(v);
+        } else if (std.mem.eql(u8, key, "ignore_file")) {
+            j.ignore_file = try asString(v);
         } else if (std.mem.eql(u8, key, "compatibility_pending")) {
             j.compatibility_pending = try asBool(v);
         } else if (std.mem.eql(u8, key, "enabled")) {
@@ -882,7 +980,11 @@ const Parser = struct {
             const n = try asInt(v);
             if (n < 0 or n > max_ban_duration) return error.InvalidValue;
             j.bantime = @intCast(n);
+        } else if (std.mem.eql(u8, key, "enforce")) {
+            try self.policySpelling(key);
+            j.banaction = if (try asBool(v)) .nftables else .@"log-only";
         } else if (std.mem.eql(u8, key, "banaction")) {
+            try self.policySpelling(key);
             const s = try asString(v);
             j.banaction = try parseBanAction(s);
         } else if (std.mem.eql(u8, key, "ignoreip")) {
@@ -2141,4 +2243,66 @@ test "native preparation ceiling covers file parse and manifest entrypoints" {
     file.close();
     const path = try tmp.dir.realpathAlloc(a, "oversized.toml");
     try std.testing.expectError(error.FileTooLarge, Config.loadFile(a, path));
+}
+
+test "native: enforce normalizes policy before inheritance without choosing backend" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cfg = try Config.parse(arena.allocator(),
+        \\[global]
+        \\firewall = "ipset"
+        \\[defaults]
+        \\enforce = false
+        \\[jails.one]
+        \\filter = "sshd"
+        \\banaction = "iptables"
+        \\[jails.two]
+        \\filter = "sshd"
+    );
+    try std.testing.expectEqual(FirewallSelection.ipset, cfg.global.firewall);
+    try std.testing.expectEqual(BanAction.iptables, cfg.jails[0].effectiveBanaction(cfg.defaults));
+    try std.testing.expectEqual(BanAction.@"log-only", cfg.jails[1].effectiveBanaction(cfg.defaults));
+    try std.testing.expect(cfg.legacy_banaction_used);
+    const inverse = try Config.parse(arena.allocator(),
+        \\[defaults]
+        \\banaction = "log-only"
+        \\[jails.one]
+        \\filter = "sshd"
+        \\enforce = true
+    );
+    try std.testing.expect(inverse.jails[0].effectiveBanaction(inverse.defaults) != .@"log-only");
+    const native_only = try Config.parse(arena.allocator(), "[defaults]\nenforce = true\n");
+    try std.testing.expect(!native_only.legacy_banaction_used);
+}
+
+test "native: mixed policy spellings conflict in either order and section" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for ([_][]const u8{ "defaults", "jails.one" }) |section| {
+        for ([_][]const u8{ "enforce = true\nbanaction = \"nftables\"\n", "banaction = \"log-only\"\nenforce = false\n" }) |body| {
+            const text = try std.fmt.allocPrint(arena.allocator(), "[{s}]\n{s}", .{ section, body });
+            var diagnostic: Diagnostic = .{};
+            try std.testing.expectError(error.InvalidValue, Config.parseDiag(arena.allocator(), text, &diagnostic));
+            try std.testing.expectEqualStrings(section, diagnostic.section());
+            try std.testing.expect(std.mem.indexOf(u8, diagnostic.hint, "conflict") != null);
+        }
+    }
+    try std.testing.expectError(error.InvalidValue, Config.parse(arena.allocator(), "[defaults]\nenforce = \"false\"\n"));
+}
+
+test "native: named timezone configuration rejects conflicting and unused context" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cfg = try Config.parse(a, "[global]\nnative_ingestion = true\n[defaults]\nenforce = false\n[jails.sshd]\nfilter = \"sshd\"\ntimestamp = \"syslog\"\ntimezone = \"America/New_York\"\ntimezone_ambiguity = \"earlier\"\n");
+    try validate(&cfg);
+    try std.testing.expectEqualStrings("America/New_York", cfg.jails[0].timezone.?);
+    try std.testing.expectEqual(.earlier, cfg.jails[0].timezone_ambiguity.?);
+    cfg.jails[0].timezone_offset_minutes = 0;
+    try std.testing.expectError(error.InvalidNativeTimezone, validate(&cfg));
+    cfg.jails[0].timezone_offset_minutes = null;
+    cfg.jails[0].timezone = null;
+    try std.testing.expectError(error.InvalidNativeTimezone, validate(&cfg));
+    try std.testing.expectError(error.InvalidValue, Config.parse(a, "[jails.sshd]\ntimezone = \"../escape\"\n"));
+    try std.testing.expectError(error.InvalidValue, Config.parse(a, "[global]\ntimezone_root = \"relative\"\n"));
 }

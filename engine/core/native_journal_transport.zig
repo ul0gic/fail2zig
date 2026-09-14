@@ -189,6 +189,26 @@ pub const Entry = struct {
     fields: []records.JournalField,
     raw_hash: [32]u8,
 };
+
+/// The caller supplies the complete first line of an inclusive cursor query.
+/// No time seek, fresh baseline, cursor update or acknowledgment is performed.
+/// Returned origin fields borrow scratch and still require the configured origin
+/// qualifier; matching a cursor alone is not evidence of trusted log provenance.
+pub fn verifyAnchor(scratch: []u8, line: []const u8, expected_cursor: []const u8, message_limit: usize) !Entry {
+    try bounded(expected_cursor, max_cursor_bytes);
+    if (line.len == 0) return error.ResumeLost;
+    const entry = try decode(scratch, line, message_limit);
+    if (!std.mem.eql(u8, entry.cursor, expected_cursor)) return error.ResumeLost;
+    return entry;
+}
+
+/// Full canonical journal field hash includes origin fields and timestamps.
+/// Source/configuration and encoded checkpoint identity remain session checks.
+pub fn verifyPending(entry: Entry, expected_cursor: []const u8, expected_hash: [32]u8) !void {
+    try bounded(expected_cursor, max_cursor_bytes);
+    if (!std.mem.eql(u8, entry.cursor, expected_cursor) or !std.mem.eql(u8, &entry.raw_hash, &expected_hash)) return error.PendingRecordMismatch;
+}
+
 fn unsigned(value: ?std.json.Value) !?u64 {
     const v = value orelse return null;
     if (v != .string or v.string.len == 0 or v.string.len > 20) return error.MalformedJournalRecord;

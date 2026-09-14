@@ -3,7 +3,6 @@
 //! Effective journal arguments before opening any journal. Environment paths and
 //! readability are explicit captured inputs, allowing deterministic preparation.
 const std = @import("std");
-const reader = @import("systemd_reader.zig");
 const config = @import("../config/fail2ban.zig");
 const matching = @import("durable_file_source.zig");
 const Allocator = std.mem.Allocator;
@@ -11,6 +10,51 @@ const local_only: u8 = 1;
 const runtime_only: u8 = 2;
 const system_only: u8 = 4;
 const current_user: u8 = 8;
+
+/// Pure prepared selector values; validation never loads or opens a reader.
+pub const Selection = struct {
+    flags: u32 = 4,
+    namespace: ?[]const u8 = null,
+    directory: ?[]const u8 = null,
+    files: ?[]const []const u8 = null,
+    matches: []const []const u8 = &.{},
+    pub fn validate(self: Selection) !void {
+        if (self.flags > std.math.maxInt(c_int)) return error.InvalidFlags;
+        if (self.directory != null and self.files != null) return error.ConflictingJournalSelection;
+        if (self.namespace != null and (self.directory != null or self.files != null)) return error.ConflictingJournalSelection;
+        var total: usize = 0;
+        for ([_]?[]const u8{ self.namespace, self.directory }) |maybe| if (maybe) |value| {
+            if (value.len > 4096 or std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidJournalSelection;
+            total += value.len;
+        };
+        if (self.files) |paths| {
+            if (paths.len > 4096) return error.JournalSelectionLimit;
+            for (paths) |path| {
+                if (path.len > 4096 or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidJournalSelection;
+                total += path.len;
+            }
+        }
+        if (self.matches.len > 4096) return error.JournalSelectionLimit;
+        for (self.matches) |m| {
+            if (m.len > 65536) return error.JournalSelectionLimit;
+            total += m.len;
+        }
+        if (total > 1024 * 1024) return error.JournalSelectionLimit;
+        var need_match = true;
+        for (self.matches) |m| {
+            if (std.mem.eql(u8, m, "+")) {
+                if (need_match) return error.InvalidMatch;
+                need_match = true;
+            } else {
+                const eq = std.mem.indexOfScalar(u8, m, '=') orelse return error.InvalidMatch;
+                if (eq == 0 or std.mem.indexOfScalar(u8, m, 0) != null) return error.InvalidMatch;
+                for (m[0..eq]) |c| if (!(std.ascii.isUpper(c) or std.ascii.isDigit(c) or c == '_')) return error.InvalidMatch;
+                need_match = false;
+            }
+        }
+        if (self.matches.len > 0 and need_match) return error.InvalidMatch;
+    }
+};
 
 pub const Options = struct {
     path: ?[]const u8 = null,
@@ -45,12 +89,12 @@ pub const Prepared = struct {
         return if (self.namespace != null and (self.path != null or self.files != null)) "ignored_namespace" else null;
     }
 
-    pub fn selection(self: Prepared, matches: []const []const u8) !reader.Selection {
+    pub fn selection(self: Prepared, matches: []const []const u8) !Selection {
         // python-systemd's Reader chooses LOCAL_ONLY only when path/files are None.
         const flags: i64 = if (self.flags) |text| std.fmt.parseInt(i64, text, 10) catch return error.InvalidFlags else (if (self.path == null and self.files == null) local_only else 0);
         if (flags < 0 or flags > std.math.maxInt(c_int)) return error.InvalidFlags;
         if (self.path == null) if (self.files) |paths| if (paths.len == 0) return error.EmptyJournalFiles;
-        const result = reader.Selection{ .flags = @intCast(flags), .directory = self.path, .files = self.files, .namespace = if (self.path != null or self.files != null) null else self.namespace, .matches = matches };
+        const result = Selection{ .flags = @intCast(flags), .directory = self.path, .files = self.files, .namespace = if (self.path != null or self.files != null) null else self.namespace, .matches = matches };
         try result.validate();
         return result;
     }
@@ -246,6 +290,15 @@ fn globAt(allocator: Allocator, base: []const u8, remaining: []const u8, result:
 fn appendResult(allocator: Allocator, path: []const u8, result: *std.ArrayList([]const u8), limit: usize) !void {
     if (result.items.len >= limit) return error.JournalSelectionLimit;
     try result.append(try allocator.dupe(u8, path));
+}
+
+test "journal policy validates prepared selectors without a reader" {
+    try (Selection{ .files = &.{"/original/system.journal"}, .matches = &.{ "_SYSTEMD_UNIT=sshd.service", "+", "SYSLOG_IDENTIFIER=sshd" } }).validate();
+    try std.testing.expectError(error.ConflictingJournalSelection, (Selection{ .directory = "/original", .files = &.{"/original/system.journal"} }).validate());
+    try std.testing.expectError(error.InvalidJournalSelection, (Selection{ .directory = "/original\x00hidden" }).validate());
+    try std.testing.expectError(error.InvalidMatch, (Selection{ .matches = &.{ "_SYSTEMD_UNIT=sshd.service", "+" } }).validate());
+    try std.testing.expectError(error.InvalidMatch, (Selection{ .matches = &.{"lowercase=invalid"} }).validate());
+    try std.testing.expectError(error.InvalidFlags, (Selection{ .flags = std.math.maxInt(u32) }).validate());
 }
 
 test "journal policy separates absent flags from rotated default and explicit empty selection" {

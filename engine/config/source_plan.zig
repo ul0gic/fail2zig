@@ -9,10 +9,14 @@ const std = @import("std");
 const config = @import("fail2ban.zig");
 const policy = @import("../core/source_policy.zig");
 const journal = @import("../core/journal_policy.zig");
-const file_session = @import("../core/file_session.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Parameter = struct { name: []const u8, value: []const u8 };
+/// Prepared path registration only; no session or runtime admission is implied.
+pub const FileSpec = struct {
+    pattern: []const u8,
+    start: @import("../core/durable_file_source.zig").Start,
+};
 pub const Path = struct {
     raw: []const u8,
     pattern: []const u8,
@@ -64,15 +68,7 @@ pub const Processing = struct {
     date_patterns: []const []const u8,
     max_lines: ?usize,
     findtime: Option,
-    duration_operation: []const u8 = "compat.duration",
-    duration_admission: []const u8 = "required-when-configured",
     diagnostics: []const []const u8,
-};
-pub const DurationAdmission = struct {
-    raw: []const u8,
-    seconds: f64,
-    /// Caller must retain the exact compatibility helper profile used to convert.
-    profile_hash: []const u8,
 };
 
 pub const Plan = struct {
@@ -97,32 +93,10 @@ pub const Plan = struct {
     diagnostics: []const []const u8,
     runtime_defaults: struct { logencoding: []const u8 = "auto", maxlines: usize = 1 } = .{},
 
-    /// Identity/reference year, clocks, worker profile and byte limits remain
-    /// explicit caller inputs. Configured findtime requires a checked helper
-    /// conversion receipt; unsupported/permanent/overflow durations cannot bind.
-    pub fn processingOptions(self: Plan, base: @import("../core/source_processor.zig").Options, duration: ?DurationAdmission) !@import("../core/source_processor.zig").Options {
-        if (self.processing.diagnostics.len != 0) return error.InvalidProcessingPlan;
-        var result = base;
-        result.encoding = self.processing.encoding orelse return error.InvalidEncoding;
-        result.default_tz = self.processing.default_tz;
-        result.date_patterns = self.processing.date_patterns;
-        result.line_limits.max_lines = self.processing.max_lines orelse return error.UnsupportedMaxLines;
-        if (string(self.processing.findtime)) |raw| {
-            const admitted = duration orelse return error.DurationAdmissionRequired;
-            if (!std.mem.eql(u8, raw, admitted.raw) or admitted.profile_hash.len != 64 or !std.math.isFinite(admitted.seconds) or admitted.seconds < 0) return error.InvalidDurationAdmission;
-            for (admitted.profile_hash) |byte| if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return error.InvalidDurationAdmission;
-            var profile: [32]u8 = undefined;
-            _ = std.fmt.hexToBytes(&profile, admitted.profile_hash) catch return error.InvalidDurationAdmission;
-            result.expected_profile_hash = profile;
-            result.findtime = admitted.seconds;
-        } else result.findtime = 600;
-        return result;
-    }
-
     /// These specs carry the original registration order and each head/tail mode.
-    /// FileSession owns discovery, duplicate-path registration and saved cursors.
-    pub fn fileSpecs(self: Plan, allocator: Allocator) ![]file_session.Spec {
-        var specs = std.ArrayList(file_session.Spec).init(allocator);
+    /// Runtime source admission owns discovery, deduplication and saved cursors.
+    pub fn fileSpecs(self: Plan, allocator: Allocator) ![]FileSpec {
+        var specs = std.ArrayList(FileSpec).init(allocator);
         errdefer specs.deinit();
         for (self.paths) |path| {
             const start = path.start orelse return error.InvalidStartMode;
@@ -508,23 +482,22 @@ fn trimPythonWhitespace(input: []const u8) ![]const u8 {
     return input[begin orelse end .. end];
 }
 
-test "prepared source processing requires explicit duration and bounded line admission" {
+test "prepared source processing retains raw duration and bounded encoding date line settings" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var ini = try config.parseIniSource(a, "original", "[probe]\nlogencoding=auto\nlogtimezone=UTC\ndatepattern=\xC2\xA0EPOCH\xC2\xA0\n TAI64N\nmaxlines=3\nfindtime=2m + 1\n[huge]\nmaxlines=1001\n");
     var globals = try config.parseIniSource(a, "original", "[Definition]\n");
     const plan = try prepare(a, &ini, "probe", &globals, .{});
-    const base = @import("../core/source_processor.zig").Options{ .python = "python3", .script = "worker.py", .identity = .{ .daemon_epoch = "d", .worker_epoch = "w", .config_generation = "g", .jail_id = "probe" }, .date_patterns = &.{}, .reference_year = 2026 };
-    try std.testing.expectError(error.DurationAdmissionRequired, plan.processingOptions(base, null));
-    const admitted = try plan.processingOptions(base, .{ .raw = "2m + 1", .seconds = 121, .profile_hash = "a" ** 64 });
-    try std.testing.expectEqual(@as(f64, 121), admitted.findtime);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xaa} ** 32), &admitted.expected_profile_hash.?);
-    try std.testing.expectError(error.InvalidDurationAdmission, plan.processingOptions(base, .{ .raw = "2m + 1", .seconds = 121, .profile_hash = "A" ** 64 }));
-    try std.testing.expectEqualStrings("auto", admitted.encoding);
-    try std.testing.expectEqualStrings("UTC", admitted.default_tz.?);
-    try std.testing.expectEqualStrings("EPOCH", admitted.date_patterns[0]);
-    try std.testing.expectEqual(@as(usize, 3), admitted.line_limits.max_lines);
+    // Preparation preserves spelling; the native projection must separately
+    // admit supported durations instead of trusting a retired helper receipt.
+    try std.testing.expectEqualStrings("2m + 1", string(plan.processing.findtime).?);
+    try std.testing.expectEqualStrings("auto", plan.processing.encoding.?);
+    try std.testing.expectEqualStrings("UTC", plan.processing.default_tz.?);
+    try std.testing.expectEqualStrings("EPOCH", plan.processing.date_patterns[0]);
+    try std.testing.expectEqualStrings("TAI64N", plan.processing.date_patterns[1]);
+    try std.testing.expectEqual(@as(usize, 3), plan.processing.max_lines.?);
+    try std.testing.expectEqual(@as(usize, 0), plan.processing.diagnostics.len);
     const huge = try prepare(a, &ini, "huge", &globals, .{});
-    try std.testing.expectError(error.InvalidProcessingPlan, huge.processingOptions(base, null));
+    try std.testing.expect(huge.processing.diagnostics.len != 0);
 }

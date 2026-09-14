@@ -4,12 +4,25 @@
 const time = @import("native_time.zig");
 const policy = @import("source_time_policy.zig");
 const std = @import("std");
+pub const Provenance = struct {
+    zone_digest: [32]u8,
+    offset_seconds: i32,
+    ambiguity: @import("native_timezone.zig").Ambiguity,
+    fold_selected: bool,
+
+    pub fn validate(self: Provenance) error{InvalidNativeTime}!void {
+        if (std.mem.allEqual(u8, &self.zone_digest, 0) or self.offset_seconds == std.math.minInt(i32) or
+            (self.fold_selected and self.ambiguity == .reject))
+            return error.InvalidNativeTime;
+    }
+};
 pub const Kind = enum(u8) { eligible_event = 1, eligible_receipt, eligible_adjusted, obsolete_event, obsolete_receipt, obsolete_adjusted, missing, malformed, range, precision, future };
 pub const Stored = struct {
     kind: Kind,
     original_us: ?i64 = null,
     effective_us: ?i64 = null,
     inferred_year: ?u16 = null,
+    zone: ?Provenance = null,
 
     pub fn fromOutcome(result: policy.Result, receipt: time.Timestamp) !Stored {
         const stored: Stored = switch (result) {
@@ -41,6 +54,10 @@ pub const Stored = struct {
         return stored;
     }
     pub fn outcome(self: Stored, receipt: time.Timestamp) !policy.Result {
+        if (self.zone) |zone| {
+            try zone.validate();
+            if (self.original_us == null) return error.InvalidNativeTime;
+        }
         if (self.inferred_year) |year| {
             if (year == 0 or year > 9999 or self.original_us == null) return error.InvalidNativeTime;
         }

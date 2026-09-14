@@ -1,0 +1,322 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
+const std = @import("std");
+const durable = @import("core/record_store.zig");
+const effect = @import("core/native_effect.zig");
+const runtime = @import("native_effect_runtime.zig");
+const inspection = @import("firewall/inspection.zig");
+const command = @import("firewall/command.zig");
+const linux = std.os.linux;
+const t = std.testing;
+const bindings = [_]runtime.Binding{ .{ .jail = "fixture", .generation = [_]u8{3} ** 32 }, .{ .jail = "shared", .generation = [_]u8{3} ** 32 } };
+const subject = @import("core/native_detection_record.zig").Subject{ .v4 = .{ 192, 0, 2, 91 } };
+const Fixture = struct {
+    tmp: t.TmpDir,
+    path: []u8,
+    store: durable.Store,
+    installation: effect.Installation,
+    fn init(backend: effect.Backend) !Fixture {
+        var tmp = t.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const base = try tmp.dir.realpathAlloc(t.allocator, ".");
+        defer t.allocator.free(base);
+        const path = try std.fs.path.join(t.allocator, &.{ base, "manager.sqlite" });
+        errdefer t.allocator.free(path);
+        var store = try durable.Store.open(t.allocator, path);
+        errdefer store.close();
+        try store.enableReceipts(8);
+        try store.enableNativeTime();
+        try store.enableDetection();
+        try store.enableClockRecovery();
+        try store.enableJournalDetection();
+        try store.enableRetry();
+        try store.enableConsumers();
+        try store.enableEffects();
+        const installation = try effect.Installation.init([_]u8{0x83} ** 16, backend, "isolated-fixture");
+        try store.admitInstallation(installation, .{ .selector = "isolated-fixture", .disposition = .verified_absent });
+        return .{ .tmp = tmp, .path = path, .store = store, .installation = installation };
+    }
+    fn deinit(self: *Fixture) void {
+        self.store.close();
+        t.allocator.free(self.path);
+        self.tmp.cleanup();
+    }
+    fn manager(self: *Fixture) !*runtime.Manager {
+        const result = try runtime.Manager.create(t.allocator, &self.store, self.installation);
+        if (std.posix.getenv("F2Z_NATIVE_IPSET_PATH")) |path| result.inspector.ipset_path = path;
+        return result;
+    }
+    fn owner(self: *Fixture, jail: []const u8, decision: u8, lease: effect.Lease) !effect.Entry {
+        const now = std.time.microTimestamp();
+        return self.store.setOwner(.{ .scope = try effect.Scope.host(subject), .jail = jail, .generation = [_]u8{3} ** 32, .decision_id = [_]u8{decision} ** 32, .expected_revision = 0, .lease = lease, .decided_us = now }, .{ .prepared_us = now });
+    }
+};
+fn allocateManager(a: std.mem.Allocator, fixture: *Fixture) !void {
+    const manager = try runtime.Manager.create(a, &fixture.store, fixture.installation);
+    defer manager.destroy();
+    try t.expect(!manager.status.ready);
+    try t.expectEqual(effect.max_effects, manager.live.len);
+    try t.expectEqual(effect.max_effects, manager.staged.len);
+}
+test "native effect runtime: every manager allocation failure releases reserved buffers" {
+    var fixture = try Fixture.init(.nftables);
+    defer fixture.deinit();
+    try t.checkAllAllocationFailures(t.allocator, allocateManager, .{&fixture});
+}
+test "native effect runtime: clock and persistence failures clear previously published confirmation" {
+    var fixture = try Fixture.init(.nftables);
+    defer fixture.deinit();
+    var entry = try fixture.owner("fixture", 1, .permanent);
+    const manager = try fixture.manager();
+    defer manager.destroy();
+    // Synthetic prior health only: every tested failure occurs before firewall I/O.
+    entry.status = .applied;
+    manager.live[0] = entry;
+    manager.count = 1;
+    manager.cached_epoch = fixture.store.effect_publication_epoch;
+    manager.status.ready = true;
+    try t.expect(manager.confirmedSubject(subject, std.time.microTimestamp()));
+    manager.last_wall_us = std.math.maxInt(i64);
+    try t.expectError(error.EffectClockReversed, manager.turn(&bindings));
+    try t.expect(!manager.status.ready);
+    try t.expect(!manager.confirmedSubject(subject, std.time.microTimestamp()));
+    manager.status.ready = true;
+    try t.expectError(error.EffectClockReversed, manager.expireDuringOutage());
+    try t.expect(!manager.status.ready);
+    manager.status.ready = true;
+    fixture.store.reopen_required = true;
+    defer fixture.store.reopen_required = false;
+    try t.expectError(error.ReopenRequired, manager.admit());
+    try t.expect(!manager.status.ready);
+}
+fn isolatedBackend() !effect.Backend {
+    const name = std.posix.getenv("F2Z_NATIVE_FIREWALL_TRANSPORT") orelse return error.SkipZigTest;
+    const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const current = try std.fs.readLinkAbsolute("/proc/self/ns/net", &buffer);
+    try t.expect(!std.mem.eql(u8, prior, current));
+    if (linux.E.init(linux.unshare(linux.CLONE.NEWNET)) != .SUCCESS) return error.IsolationFailed;
+    return std.meta.stringToEnum(effect.Backend, name) orelse error.InvalidFixture;
+}
+fn ready(manager: *runtime.Manager) !void {
+    for (0..32) |_| if (try manager.turn(&bindings)) {
+        try t.expect(manager.status.ready);
+        return;
+    };
+    return error.RecoveryDidNotFinish;
+}
+fn driftRemove(manager: *runtime.Manager) !void {
+    var name_buf: [28]u8 = undefined;
+    const name = manager.inspector.installation.name(&name_buf);
+    var set_buf: [31]u8 = undefined;
+    const set = try std.fmt.bufPrint(&set_buf, "{s}_4", .{name});
+    const args: []const []const u8 = switch (manager.installation.backend) {
+        .nftables => &.{ "/usr/sbin/nft", "delete", "element", "inet", name, "banned_ipv4", "{", "192.0.2.91", "}" },
+        .iptables => &.{ manager.inspector.iptables_path, "-D", name, "-s", "192.0.2.91", "-j", "DROP" },
+        .ipset => &.{ manager.inspector.ipset_path, "del", set, "192.0.2.91" },
+    };
+    const result = try command.run(t.allocator, args, 2000);
+    defer result.deinit(t.allocator);
+    if (result.code != 0) {
+        std.debug.print("drift fixture: {s}\n", .{result.stderr});
+        return error.FixtureCommandFailed;
+    }
+}
+fn waitUntil(deadline: i64) void {
+    const delta = deadline - std.time.microTimestamp();
+    if (delta > 0) std.Thread.sleep(@as(u64, @intCast(delta)) * std.time.ns_per_us);
+}
+test "native effect runtime: isolated final inventory catches missing scope then recovers without duplicate confirmation" {
+    var fixture = try Fixture.init(try isolatedBackend());
+    defer fixture.deinit();
+    _ = try fixture.owner("fixture", 1, .permanent);
+    const manager = try fixture.manager();
+    defer manager.destroy();
+    try ready(manager);
+    try t.expect(manager.confirmedSubject(subject, std.time.microTimestamp()));
+    try t.expectEqual(@as(u64, 1), try fixture.store.confirmedEffectEvents());
+    // Simulate drift after individual scope checking but before final inventory.
+    manager.cursor = manager.count;
+    try driftRemove(manager);
+    try t.expect(!try manager.turn(&bindings));
+    try t.expect(!manager.status.ready);
+    try t.expect(!manager.confirmedSubject(subject, std.time.microTimestamp()));
+    try ready(manager);
+    try t.expectEqual(@as(u64, 1), try fixture.store.confirmedEffectEvents());
+    manager.inspector.limits.max_bytes = 1;
+    try t.expectError(error.LimitExceeded, manager.turn(&bindings));
+    try t.expect(!manager.confirmedSubject(subject, std.time.microTimestamp()));
+}
+const Db = std.meta.Child(@FieldType(durable.Store, "db"));
+const Exec = @FieldType(@FieldType(durable.Store, "api"), "exec");
+const ForbiddenSql = struct {
+    var calls: usize = 0;
+    fn exec(_: *Db, _: [*:0]const u8, _: ?*anyopaque, _: ?*anyopaque, _: ?*?[*:0]u8) callconv(.c) c_int {
+        calls += 1;
+        return 5; // SQLITE_BUSY: any attempted SQL is counted as a test failure.
+    }
+};
+const BlockedWriter = struct {
+    blocker: durable.Store,
+    selected: *durable.Store,
+    actual: Exec,
+    fn init(fixture: *Fixture) !BlockedWriter {
+        var blocker = try durable.Store.open(t.allocator, fixture.path);
+        errdefer blocker.close();
+        try t.expectEqual(@as(c_int, 0), blocker.api.exec(blocker.db, "BEGIN IMMEDIATE;", null, null, null));
+        errdefer _ = blocker.api.exec(blocker.db, "ROLLBACK;", null, null, null);
+        try t.expectError(error.Busy, fixture.store.enableEffects());
+        try t.expect(!fixture.store.reopen_required);
+        const actual = fixture.store.api.exec;
+        ForbiddenSql.calls = 0;
+        fixture.store.api.exec = ForbiddenSql.exec;
+        return .{ .blocker = blocker, .selected = &fixture.store, .actual = actual };
+    }
+    fn deinit(self: *BlockedWriter) void {
+        self.selected.api.exec = self.actual;
+        _ = self.blocker.api.exec(self.blocker.db, "ROLLBACK;", null, null, null);
+        self.blocker.close();
+    }
+};
+test "native effect runtime: isolated committed finite expiry proceeds while SQLite is unavailable" {
+    var fixture = try Fixture.init(try isolatedBackend());
+    defer fixture.deinit();
+    const deadline = std.time.microTimestamp() + 2_000_000;
+    _ = try fixture.owner("fixture", 1, .{ .finite = deadline });
+    const manager = try fixture.manager();
+    defer manager.destroy();
+    try ready(manager);
+    var blocked = try BlockedWriter.init(&fixture);
+    defer blocked.deinit();
+    waitUntil(deadline + 20_000);
+    try manager.expireDuringOutage();
+    try t.expectEqual(@as(usize, 0), ForbiddenSql.calls);
+    try t.expect(manager.outage_attempted[0]);
+    try t.expect(!manager.status.ready);
+    try t.expect(manager.status.uncertain);
+    var snapshot = try manager.inspector.inspect();
+    defer snapshot.deinit();
+    try t.expectEqual(@as(usize, 0), snapshot.entries.len);
+}
+test "native effect runtime: isolated permanent co-owner prevents finite-owner outage expiry" {
+    var fixture = try Fixture.init(try isolatedBackend());
+    defer fixture.deinit();
+    const deadline = std.time.microTimestamp() + 1_000_000;
+    _ = try fixture.owner("fixture", 1, .{ .finite = deadline });
+    _ = try fixture.owner("shared", 2, .permanent);
+    const manager = try fixture.manager();
+    defer manager.destroy();
+    try ready(manager);
+    {
+        var blocked = try BlockedWriter.init(&fixture);
+        defer blocked.deinit();
+        waitUntil(deadline + 20_000);
+        try manager.expireDuringOutage();
+        try t.expectEqual(@as(usize, 0), ForbiddenSql.calls);
+        try t.expect(!manager.outage_attempted[0]);
+        var snapshot = try manager.inspector.inspect();
+        defer snapshot.deinit();
+        try t.expectEqual(@as(usize, 1), snapshot.entries.len);
+        try t.expect(snapshot.entries[0].remaining_ms == null);
+    }
+    try ready(manager);
+    var entries: [1]effect.Entry = undefined;
+    const page = try fixture.store.effectPage(null, null, &entries);
+    try t.expectEqual(@as(usize, 1), page.count);
+    try t.expect(entries[0].desired == .permanent);
+    var owners: [effect.max_page]effect.Owner = undefined;
+    try t.expectEqual(@as(usize, 2), try fixture.store.effectOwners(entries[0].scope_key, entries[0].revision, &owners));
+    try t.expectEqualStrings("fixture", owners[0].jail.slice());
+    try t.expect(owners[0].lease == .absent);
+    try t.expectEqualStrings("shared", owners[1].jail.slice());
+    try t.expect(owners[1].lease == .permanent);
+    try t.expectEqual(@as(u64, 2), try fixture.store.confirmedEffectEvents());
+    var recovered = try manager.inspector.inspect();
+    defer recovered.deinit();
+    try t.expectEqual(@as(usize, 1), recovered.entries.len);
+    try t.expect(recovered.entries[0].remaining_ms == null);
+}
+test "native effect runtime: isolated newer publication saturation and reopen fence stale expiry authority" {
+    var fixture = try Fixture.init(try isolatedBackend());
+    defer fixture.deinit();
+    const deadline = std.time.microTimestamp() + 1_000_000;
+    _ = try fixture.owner("fixture", 1, .{ .finite = deadline });
+    const manager = try fixture.manager();
+    defer manager.destroy();
+    try ready(manager);
+    _ = try fixture.owner("shared", 2, .permanent);
+    waitUntil(deadline + 20_000);
+    var blocked = try BlockedWriter.init(&fixture);
+    defer blocked.deinit();
+    try manager.expireDuringOutage();
+    try t.expectEqual(@as(usize, 0), ForbiddenSql.calls);
+    try t.expect(!manager.outage_attempted[0]);
+    fixture.store.effect_publication_epoch = std.math.maxInt(u64);
+    manager.cached_epoch = std.math.maxInt(u64);
+    try manager.expireDuringOutage();
+    try t.expectEqual(@as(usize, 0), ForbiddenSql.calls);
+    try t.expect(!manager.outage_attempted[0]);
+    manager.storageReopened();
+    try t.expect(manager.cached_epoch == null);
+    try t.expect(!manager.admitted);
+    try manager.expireDuringOutage();
+    try t.expectEqual(@as(usize, 0), ForbiddenSql.calls);
+    try t.expect(!manager.outage_attempted[0]);
+}
+
+test "native effect runtime: isolated committed extension with ambiguous result poisons stale expiry authority" {
+    const backend = try isolatedBackend();
+    var fixture = try Fixture.init(backend);
+    defer fixture.deinit();
+    const original_deadline = std.time.microTimestamp() + 2_000_000;
+    _ = try fixture.owner("fixture", 1, .{ .finite = original_deadline });
+    const manager = try fixture.manager();
+    defer manager.destroy();
+    try ready(manager);
+    const old_epoch = fixture.store.effect_publication_epoch;
+    try t.expectEqual(@as(?u64, old_epoch), manager.cached_epoch);
+    const extended_deadline = original_deadline + 30_000_000;
+    const AmbiguousCommit = struct {
+        var actual: Exec = undefined;
+        var committed: bool = false;
+        fn exec(db: *Db, statement: [*:0]const u8, callback: ?*anyopaque, context: ?*anyopaque, message: ?*?[*:0]u8) callconv(.c) c_int {
+            const result = actual(db, statement, callback, context, message);
+            if (result == 0 and std.mem.eql(u8, std.mem.span(statement), "COMMIT;")) {
+                committed = true;
+                return 10; // Real SQLite commit completed, but its caller sees IOERR.
+            }
+            return result;
+        }
+    };
+    AmbiguousCommit.actual = fixture.store.api.exec;
+    AmbiguousCommit.committed = false;
+    fixture.store.api.exec = AmbiguousCommit.exec;
+    defer fixture.store.api.exec = AmbiguousCommit.actual;
+    try t.expectError(error.StorageIo, fixture.owner("shared", 2, .{ .finite = extended_deadline }));
+    fixture.store.api.exec = AmbiguousCommit.actual;
+    try t.expect(AmbiguousCommit.committed);
+    try t.expect(fixture.store.reopen_required);
+    try t.expectEqual(old_epoch, fixture.store.effect_publication_epoch);
+    try t.expectEqual(@as(?u64, old_epoch), manager.cached_epoch);
+    waitUntil(original_deadline + 20_000);
+    // Poison is checked before cached epoch equality or any transport dispatch.
+    try manager.expireDuringOutage();
+    try t.expect(!manager.outage_attempted[0]);
+    try t.expect(!manager.status.ready);
+    try t.expectEqual(@as(usize, 1), manager.status.overdue);
+    if (backend == .iptables) {
+        var snapshot = try manager.inspector.inspect();
+        defer snapshot.deinit();
+        try t.expectEqual(@as(usize, 1), snapshot.entries.len);
+    }
+    // nft/ipset may expire their original timers autonomously. The guard above
+    // proves no daemon removal attempt; it does not assert a nonexistent extension.
+    var reopened = try durable.Store.open(t.allocator, fixture.path);
+    defer reopened.close();
+    var entries: [1]effect.Entry = undefined;
+    const page = try reopened.effectPage(null, null, &entries);
+    try t.expectEqual(@as(usize, 1), page.count);
+    try t.expectEqual(extended_deadline, entries[0].desired.finite);
+    var owners: [effect.max_page]effect.Owner = undefined;
+    try t.expectEqual(@as(usize, 2), try reopened.effectOwners(entries[0].scope_key, entries[0].revision, &owners));
+}

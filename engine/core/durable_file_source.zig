@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
+// Linux F_DUPFD_CLOEXEC; Zig 0.14.1 omits this command constant.
+const linux_dupfd_cloexec = 1030;
 const records = @import("source_record.zig");
 const native_text = @import("source_text.zig");
 const Allocator = std.mem.Allocator;
 pub const Start = enum { head, tail };
+pub const discovery_entries_per_turn: usize = 256;
+pub const discovery_entries_per_episode: usize = 65_536;
+pub const discovery_max_depth: usize = 16;
+pub const DiscoveryStatus = enum { pending, complete };
 pub const Framing = enum {
     bytes,
     utf16le,
@@ -69,6 +75,11 @@ fn openRegularAt(directory: std.fs.Dir, path: []const u8) !std.fs.File {
 /// object when a path is renamed; open a second source for its replacement.
 /// No durable position is updated until the callback returns successfully.
 pub const FileSource = struct {
+    const ResumeSearch = struct {
+        directory: std.fs.Dir,
+        iterator: std.fs.Dir.Iterator,
+        visited: usize = 0,
+    };
     allocator: Allocator,
     path: []const u8,
     source_id: []const u8,
@@ -89,6 +100,9 @@ pub const FileSource = struct {
     frame_context: ?*anyopaque = null,
     codec_configuration_hash: ?[32]u8 = null,
     native_encoding: ?native_text.Encoding = null,
+    resume_search: ?ResumeSearch = null,
+    /// Injectable I/O boundary; errors remain operational, never fingerprints.
+    read_prefix: *const fn (std.fs.File, u8) anyerror![32]u8 = prefix,
 
     /// Native framing owns no helper/context. The caller binds all semantic
     /// processing options in configuration_hash; this adds the framing format,
@@ -139,7 +153,8 @@ pub const FileSource = struct {
     }
 
     pub fn init(allocator: Allocator, path: []const u8, source_id: []const u8, start: Start, checkpoint: ?Resume) !FileSource {
-        if (path.len == 0 or source_id.len == 0) return error.InvalidSource;
+        if (path.len == 0 or path.len > 16 * 1024 or source_id.len == 0 or source_id.len > 16 * 1024 or
+            std.mem.indexOfScalar(u8, path, 0) != null or std.mem.indexOfScalar(u8, source_id, 0) != null) return error.InvalidSource;
         if (checkpoint) |r| if (r.version != 2 or r.prefix_len > 64) return error.InvalidResume;
         const owned_path = try allocator.dupe(u8, path);
         errdefer allocator.free(owned_path);
@@ -151,6 +166,7 @@ pub const FileSource = struct {
     }
 
     pub fn deinit(self: *FileSource) void {
+        self.clearResumeSearch();
         if (self.file) |f| f.close();
         self.allocator.free(self.path);
         self.allocator.free(self.source_id);
@@ -185,24 +201,39 @@ pub const FileSource = struct {
                 f.close();
                 return err;
             };
-            if (stat.dev == expected.device and stat.ino == expected.inode) return f;
+            if (stat.dev == expected.device and stat.ino == expected.inode) {
+                self.clearResumeSearch();
+                return f;
+            }
             f.close();
         }
         // Rotation recovery searches only this configured parent and compares
         // kernel identity first, never equating unrelated files by content.
-        var parent = std.fs.cwd().openDir(std.fs.path.dirname(self.path) orelse ".", .{ .iterate = true }) catch |err| {
-            if (err == error.FileNotFound) return error.ResumeLost;
-            return err;
-        };
-        defer parent.close();
-        var it = parent.iterate();
-        while (try it.next()) |entry| {
-            const observed = std.posix.fstatat(parent.fd, entry.name, 0) catch |err| {
+        if (self.resume_search == null) {
+            var parent = std.fs.cwd().openDir(std.fs.path.dirname(self.path) orelse ".", .{ .iterate = true }) catch |err| {
+                if (err == error.FileNotFound) return error.ResumeLost;
+                return err;
+            };
+            self.resume_search = .{ .directory = parent, .iterator = parent.iterate() };
+        }
+        // A yielded search retains its descriptor and iterator. The caller must
+        // schedule another repair turn, not interpret partial enumeration as loss.
+        var yielded = false;
+        defer if (!yielded) self.clearResumeSearch();
+        const search = &self.resume_search.?;
+        for (0..discovery_entries_per_turn) |_| {
+            const entry = (try search.iterator.next()) orelse {
+                self.clearResumeSearch();
+                return error.ResumeLost;
+            };
+            if (search.visited >= discovery_entries_per_episode) return error.DiscoveryEntryLimit;
+            search.visited += 1;
+            const observed = std.posix.fstatat(search.directory.fd, entry.name, 0) catch |err| {
                 if (err == error.FileNotFound) continue;
                 return err;
             };
             if (!std.posix.S.ISREG(observed.mode) or observed.dev != expected.device or observed.ino != expected.inode) continue;
-            const f = openRegularAt(parent, entry.name) catch |err| {
+            const f = openRegularAt(search.directory, entry.name) catch |err| {
                 if (err == error.FileNotFound or err == error.NotRegularFile) continue;
                 return err;
             };
@@ -210,19 +241,29 @@ pub const FileSource = struct {
                 f.close();
                 return err;
             };
-            if (std.posix.S.ISREG(stat.mode) and stat.dev == expected.device and stat.ino == expected.inode) return f;
+            if (std.posix.S.ISREG(stat.mode) and stat.dev == expected.device and stat.ino == expected.inode) {
+                self.clearResumeSearch();
+                return f;
+            }
             f.close();
         }
-        return error.ResumeLost;
+        yielded = true;
+        return error.SourceRepairPending;
     }
 
-    fn attach(self: *FileSource) !bool {
+    fn clearResumeSearch(self: *FileSource) void {
+        if (self.resume_search) |*search| search.directory.close();
+        self.resume_search = null;
+    }
+
+    fn attachTurn(self: *FileSource) !bool {
         if (self.file != null) return true;
         const f = (self.openIncarnation() catch |err| {
             self.health = switch (err) {
                 error.FileNotFound => .missing,
                 error.AccessDenied => .permission_denied,
                 error.ResumeLost => .resume_lost,
+                error.SourceRepairPending => .waiting,
                 else => .read_failed,
             };
             return err;
@@ -230,14 +271,23 @@ pub const FileSource = struct {
             self.health = .missing;
             return false;
         };
+        try self.acceptDescriptor(f);
+        return true;
+    }
+
+    /// Takes ownership on both success and failure. Discovery already inspected
+    /// this descriptor; reopening the pathname could attach a different inode or
+    /// start a synchronous retained-inode scan inside a bounded discovery turn.
+    fn acceptDescriptor(self: *FileSource, f: std.fs.File) !void {
         errdefer f.close();
         const stat = try std.posix.fstat(f.handle);
         if (!std.posix.S.ISREG(stat.mode)) return error.NotRegularFile;
         if (self.committed) |r| {
-            if (r.device != stat.dev or r.inode != stat.ino or stat.size < 0 or @as(u64, @intCast(stat.size)) < r.offset or !std.mem.eql(u8, &(prefix(f, r.prefix_len) catch {
-                self.health = .resume_lost;
-                return error.ResumeLost;
-            }), &r.prefix_hash)) {
+            const fingerprint = self.read_prefix(f, r.prefix_len) catch |err| {
+                self.health = if (err == error.ResumeLost) .resume_lost else .read_failed;
+                return err;
+            };
+            if (r.device != stat.dev or r.inode != stat.ino or stat.size < 0 or @as(u64, @intCast(stat.size)) < r.offset or !std.mem.eql(u8, &fingerprint, &r.prefix_hash)) {
                 self.health = .resume_lost;
                 return error.ResumeLost;
             }
@@ -252,7 +302,16 @@ pub const FileSource = struct {
         }
         self.file = f;
         self.health = .healthy;
-        return true;
+    }
+
+    /// Borrowed retained descriptor, duplicated only after an authoritative
+    /// saved cursor (or explicit uncommitted proposal) has selected this source.
+    /// Failure leaves the retained descriptor owned by its transfer metadata.
+    pub fn attachRetained(self: *FileSource, retained: std.fs.File) !void {
+        if (self.file != null) return;
+        if (self.committed == null) return error.MissingFileCheckpoint;
+        const fd = try std.posix.fcntl(retained.handle, linux_dupfd_cloexec, 3);
+        try self.acceptDescriptor(.{ .handle = @intCast(fd) });
     }
 
     /// Recovery checks the committed anchor even when its descriptor remained
@@ -260,16 +319,27 @@ pub const FileSource = struct {
     /// invents a new incarnation or advances/clears the acknowledged position.
     /// False is only possible for a new source that has not appeared yet.
     pub fn verifyContinuity(self: *FileSource) !bool {
+        while (true) {
+            return self.verifyContinuityTurn() catch |err| {
+                if (err == error.SourceRepairPending) continue;
+                return err;
+            };
+        }
+    }
+
+    /// Resumable form for native source and recovery scheduling. Pending keeps
+    /// the retained-inode search cursor; it never proves loss or healthy EOF.
+    pub fn verifyContinuityTurn(self: *FileSource) !bool {
         if (self.committed) |r| if (r.codec_configuration_hash != null and self.frame_callback == null and self.native_encoding == null)
             return error.FramingProfileMismatch;
-        if (!try self.attach()) return false;
+        if (!try self.attachTurn()) return false;
         const file = self.file.?;
         const r = self.committed.?;
         const stat = std.posix.fstat(file.handle) catch |err| {
             self.health = .read_failed;
             return err;
         };
-        const fingerprint = prefix(file, r.prefix_len) catch |err| {
+        const fingerprint = self.read_prefix(file, r.prefix_len) catch |err| {
             self.health = if (err == error.ResumeLost) .resume_lost else .read_failed;
             return err;
         };
@@ -282,6 +352,53 @@ pub const FileSource = struct {
         }
         self.health = .healthy;
         return true;
+    }
+
+    /// Repair admission for a previously acknowledged source. Fresh-source
+    /// attachment belongs to explicit initial admission, never to repair.
+    pub fn verifyExistingContinuity(self: *FileSource) !void {
+        if (self.acknowledgedCheckpoint() == null) return error.MissingFileCheckpoint;
+        if (!try self.verifyContinuityTurn()) return error.ResumeLost;
+    }
+
+    pub const PendingIdentity = struct {
+        source: []const u8,
+        occurrence: []const u8,
+        cursor: []const u8,
+        raw_hash: [32]u8,
+    };
+
+    /// Probe exact pending bytes without acknowledging them. Even a concurrent
+    /// truncate detected by poll must not publish a replacement incarnation.
+    pub fn verifyPending(self: *FileSource, expected: PendingIdentity) !void {
+        try self.verifyExistingContinuity();
+        const saved = self.committed;
+        const baseline = self.baseline_committed;
+        const operational = self.in_operation;
+        const eof_check = self.pending_eof_check;
+        defer {
+            self.committed = saved;
+            self.baseline_committed = baseline;
+            self.in_operation = operational;
+            self.pending_eof_check = eof_check;
+        }
+        const Probe = struct {
+            fn verify(record: records.Record, context: ?*anyopaque) !void {
+                const identity: *const PendingIdentity = @ptrCast(@alignCast(context.?));
+                if (record.kind != .data or !std.mem.eql(u8, record.source, identity.source) or
+                    !std.mem.eql(u8, record.occurrence, identity.occurrence) or
+                    !std.mem.eql(u8, record.cursor, identity.cursor) or
+                    !std.mem.eql(u8, &record.raw_hash, &identity.raw_hash)) return error.PendingRecordMismatch;
+                return error.PendingRecordVerified;
+            }
+        };
+        var identity = expected;
+        _ = self.pollTurn(Probe.verify, &identity, true) catch |err| {
+            if (err != error.PendingRecordVerified) return err;
+            self.health = .healthy;
+            return;
+        };
+        return error.PendingRecordUnavailable;
     }
 
     /// True means the pathname now points at a different file. The retained FD
@@ -302,14 +419,34 @@ pub const FileSource = struct {
     /// the committed byte offset and are reread, never persisted as consumed.
     /// A detected copytruncate starts a fresh incarnation. Truncate-and-regrow
     /// between observations with an identical prefix cannot be proven detectable.
+    /// Synchronous compatibility wrapper. Native session schedulers call pollTurn.
     pub fn poll(self: *FileSource, callback: records.AckCallback, userdata: ?*anyopaque) !bool {
+        while (true) return self.pollTurn(callback, userdata, false) catch |err| {
+            if (err == error.SourceRepairPending) continue;
+            return err;
+        };
+    }
+    /// One retained-inode search turn at most. A repair/pending probe refuses a
+    /// new baseline on a truncate race after continuity verification.
+    pub fn pollTurn(self: *FileSource, callback: records.AckCallback, userdata: ?*anyopaque, preserve_checkpoint: bool) !bool {
         if (self.committed) |saved_resume| if (saved_resume.codec_configuration_hash != null and self.frame_callback == null and self.native_encoding == null) return error.FramingProfileMismatch;
-        if (!try self.attach()) return false;
+        if (!try self.attachTurn()) return false;
         try self.finishEofCheck();
         const f = self.file.?;
         var r = self.committed.?;
         const stat = try f.stat();
-        if (stat.size < r.offset or !std.mem.eql(u8, &(prefix(f, r.prefix_len) catch [_]u8{0} ** 32), &r.prefix_hash)) {
+        // A successful size observation can prove shrink without a prefix
+        // read. A failed read alone can never authorize a fresh incarnation.
+        const shrunk = stat.size < r.offset or stat.size < r.prefix_len;
+        const fingerprint = if (shrunk) r.prefix_hash else self.read_prefix(f, r.prefix_len) catch |err| {
+            self.health = if (err == error.ResumeLost) .resume_lost else .read_failed;
+            return err;
+        };
+        if (shrunk or !std.mem.eql(u8, &fingerprint, &r.prefix_hash)) {
+            if (preserve_checkpoint) {
+                self.health = .resume_lost;
+                return error.ResumeLost;
+            }
             r = try newResume(f, 0, self.framing, self.start);
             r.codec_configuration_hash = self.codec_configuration_hash;
             self.committed = r;
@@ -682,55 +819,152 @@ fn classMatch(pattern: []const u8, c: u32) ?struct { matched: bool, consumed: us
 }
 
 pub fn expandGlob(allocator: Allocator, pattern: []const u8, limit: usize) ![][]u8 {
-    var out = std.ArrayList([]u8).init(allocator);
-    errdefer {
-        for (out.items) |path| allocator.free(path);
-        out.deinit();
-    }
-    try expandAt(allocator, if (std.fs.path.isAbsolute(pattern)) "/" else ".", std.mem.trimLeft(u8, pattern, "/"), &out, limit);
-    std.mem.sort([]u8, out.items, {}, struct {
-        fn less(_: void, a: []u8, b: []u8) bool {
-            return std.mem.lessThan(u8, a, b);
-        }
-    }.less);
-    return out.toOwnedSlice();
+    var discovery = try Discovery.init(allocator, pattern, limit);
+    defer discovery.deinit();
+    // Compatibility API: finite total work. Native schedulers use pollTurn to
+    // retain fairness between batches instead of completing an entire episode.
+    while (try discovery.pollTurn(discovery_entries_per_turn) != .complete) {}
+    return discovery.takePaths();
 }
 
-fn expandAt(allocator: Allocator, base: []const u8, remaining: []const u8, out: *std.ArrayList([]u8), limit: usize) !void {
-    if (remaining.len == 0) return;
-    const slash = std.mem.indexOfScalar(u8, remaining, '/');
-    const component = if (slash) |s| remaining[0..s] else remaining;
-    const rest = if (slash) |s| std.mem.trimLeft(u8, remaining[s + 1 ..], "/") else "";
-    if (std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) {
-        const next_base = try std.fs.path.join(allocator, &.{ base, component });
-        defer allocator.free(next_base);
-        return expandAt(allocator, next_base, rest, out, limit);
-    }
-    var dir = std.fs.cwd().openDir(base, .{ .iterate = true }) catch |err| {
-        if (err == error.FileNotFound or err == error.NotDir) return;
-        return err;
+/// Bounded glob traversal. Frames own open directories and paths; iterator entry
+/// names are consumed before the next call. Results are private until complete.
+pub const Discovery = struct {
+    const Frame = struct {
+        directory: std.fs.Dir,
+        iterator: std.fs.Dir.Iterator,
+        base: []u8,
+        component: usize,
+        direct_done: bool = false,
     };
-    defer dir.close();
-    var it = dir.iterate();
-    while (try it.next()) |entry| {
-        if (!matchComponent(component, entry.name)) continue;
-        const path = try std.fs.path.join(allocator, &.{ base, entry.name });
-        defer allocator.free(path);
-        if (rest.len != 0) {
-            try expandAt(allocator, path, rest, out, limit);
-        } else {
-            const stat = dir.statFile(entry.name) catch |err| {
-                if (err == error.FileNotFound) continue;
-                return err;
-            };
-            if (stat.kind != .file) continue;
-            if (out.items.len >= limit) return error.SourceLimit;
-            const owned_path = try allocator.dupe(u8, path);
-            errdefer allocator.free(owned_path);
-            try out.append(owned_path);
+    allocator: Allocator,
+    pattern: []u8,
+    components: [discovery_max_depth][]const u8 = undefined,
+    component_count: usize = 0,
+    frames: [discovery_max_depth]Frame = undefined,
+    depth: usize = 0,
+    paths: std.ArrayList([]u8),
+    max_paths: usize,
+    visited: usize = 0,
+    max_entries: usize = discovery_entries_per_episode,
+    complete: bool = false,
+    failure: ?anyerror = null,
+
+    pub fn init(allocator: Allocator, pattern: []const u8, max_paths: usize) !Discovery {
+        if (pattern.len == 0 or pattern.len > 16 * 1024 or std.mem.indexOfScalar(u8, pattern, 0) != null) return error.InvalidSource;
+        if (max_paths == 0 or max_paths > 4096) return error.SourceLimit;
+        const owned = try allocator.dupe(u8, pattern);
+        var self = Discovery{ .allocator = allocator, .pattern = owned, .paths = std.ArrayList([]u8).init(allocator), .max_paths = max_paths };
+        errdefer self.deinit();
+        var parts = std.mem.tokenizeScalar(u8, owned, '/');
+        while (parts.next()) |part| {
+            if (self.component_count == discovery_max_depth) return error.DiscoveryDepthLimit;
+            self.components[self.component_count] = part;
+            self.component_count += 1;
         }
+        if (self.component_count == 0) {
+            self.complete = true;
+        } else _ = try self.push(if (std.fs.path.isAbsolute(pattern)) "/" else ".", 0);
+        return self;
     }
-}
+
+    fn push(self: *Discovery, base: []const u8, component: usize) !bool {
+        if (self.depth == discovery_max_depth) return error.DiscoveryDepthLimit;
+        const owned = try self.allocator.dupe(u8, base);
+        errdefer self.allocator.free(owned);
+        var directory = std.fs.cwd().openDir(base, .{ .iterate = true }) catch |err| {
+            if (err == error.FileNotFound or err == error.NotDir) {
+                self.allocator.free(owned);
+                return false;
+            }
+            return err;
+        };
+        self.frames[self.depth] = .{ .directory = directory, .iterator = directory.iterate(), .base = owned, .component = component };
+        self.depth += 1;
+        return true;
+    }
+
+    fn pop(self: *Discovery) void {
+        self.depth -= 1;
+        const frame = &self.frames[self.depth];
+        frame.directory.close();
+        self.allocator.free(frame.base);
+    }
+
+    pub fn deinit(self: *Discovery) void {
+        while (self.depth > 0) self.pop();
+        for (self.paths.items) |path| self.allocator.free(path);
+        self.paths.deinit();
+        self.allocator.free(self.pattern);
+    }
+
+    pub fn pollTurn(self: *Discovery, budget: usize) !DiscoveryStatus {
+        if (budget == 0 or budget > discovery_entries_per_turn or self.max_entries > discovery_entries_per_episode) return error.InvalidDiscoveryBudget;
+        if (self.failure) |failure| return failure;
+        if (self.complete) return .complete;
+        return self.pollAdmitted(budget) catch |err| {
+            self.failure = err;
+            while (self.depth > 0) self.pop();
+            return err;
+        };
+    }
+
+    fn pollAdmitted(self: *Discovery, budget: usize) !DiscoveryStatus {
+        var work: usize = 0;
+        while (self.depth > 0 and work < budget) {
+            work += 1; // Include empty-directory and literal-parent steps as work.
+            const frame = &self.frames[self.depth - 1];
+            const component = self.components[frame.component];
+            const direct = std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..");
+            const name = if (direct) blk: {
+                if (frame.direct_done) {
+                    self.pop();
+                    continue;
+                }
+                frame.direct_done = true;
+                break :blk component;
+            } else blk: {
+                const entry = (try frame.iterator.next()) orelse {
+                    self.pop();
+                    continue;
+                };
+                if (self.visited >= self.max_entries) return error.DiscoveryEntryLimit;
+                self.visited += 1;
+                if (!matchComponent(component, entry.name)) continue;
+                break :blk entry.name;
+            };
+            const path = try std.fs.path.join(self.allocator, &.{ frame.base, name });
+            defer self.allocator.free(path);
+            if (frame.component + 1 < self.component_count) {
+                _ = try self.push(path, frame.component + 1);
+            } else {
+                const stat = frame.directory.statFile(name) catch |err| {
+                    if (err == error.FileNotFound or err == error.NotDir) continue;
+                    return err;
+                };
+                if (stat.kind != .file) continue;
+                if (self.paths.items.len == self.max_paths) return error.SourceLimit;
+                const owned_path = try self.allocator.dupe(u8, path);
+                errdefer self.allocator.free(owned_path);
+                try self.paths.append(owned_path);
+            }
+        }
+        if (self.depth != 0) return .pending;
+        std.mem.sort([]u8, self.paths.items, {}, struct {
+            fn less(_: void, a: []u8, b: []u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.less);
+        self.complete = true;
+        return .complete;
+    }
+
+    pub fn takePaths(self: *Discovery) ![][]u8 {
+        if (self.failure) |failure| return failure;
+        if (!self.complete) return error.DiscoveryIncomplete;
+        return self.paths.toOwnedSlice();
+    }
+};
 
 pub const RestoreCallback = *const fn (source_id: []const u8, userdata: ?*anyopaque) anyerror!?Resume;
 
@@ -752,11 +986,16 @@ pub const FileSet = struct {
     /// initial cursor. The callback must leave ownership with this set.
     initialize_source: ?*const fn (*FileSource, ?*anyopaque) anyerror!void = null,
     initialize_userdata: ?*anyopaque = null,
+    discovery: ?Discovery = null,
+    discovery_spec: usize = 0,
+    discovery_path: usize = 0,
+    discovery_visited: usize = 0,
 
     pub fn init(allocator: Allocator, jail: []const u8) !FileSet {
         return .{ .allocator = allocator, .jail = try allocator.dupe(u8, jail), .specs = std.ArrayList(Spec).init(allocator), .sources = std.ArrayList(FileSource).init(allocator) };
     }
     pub fn deinit(self: *FileSet) void {
+        self.cancelDiscovery();
         for (self.sources.items) |*source| source.deinit();
         self.sources.deinit();
         for (self.specs.items) |spec| self.allocator.free(spec.pattern);
@@ -764,7 +1003,9 @@ pub const FileSet = struct {
         self.allocator.free(self.jail);
     }
     pub fn add(self: *FileSet, pattern: []const u8, start: Start) !void {
-        if (pattern.len == 0) return error.InvalidSource;
+        if (self.discovery != null or self.discovery_spec != 0) return error.DiscoveryInProgress;
+        if (pattern.len == 0 or pattern.len > 16 * 1024) return error.InvalidSource;
+        if (self.specs.items.len >= self.max_sources) return error.SourceLimit;
         const owned = try self.allocator.dupe(u8, pattern);
         errdefer self.allocator.free(owned);
         try self.specs.append(.{ .pattern = owned, .start = start });
@@ -781,78 +1022,123 @@ pub const FileSet = struct {
         try self.sources.append(source);
     }
 
+    /// Preserve an explicitly transferred first-attachment proposal. It is not
+    /// a durable cursor and remains unacknowledged until its baseline commits.
+    pub fn addProposal(self: *FileSet, path: []const u8, source_id: []const u8, proposal: Resume) !void {
+        try self.addResume(path, source_id, proposal);
+        self.sources.items[self.sources.items.len - 1].baseline_committed = false;
+    }
+
     pub fn discover(self: *FileSet) !void {
-        for (self.specs.items) |spec| {
-            const paths = expandGlob(self.allocator, spec.pattern, self.max_sources) catch |err| {
-                self.health = if (err == error.AccessDenied) .permission_denied else .read_failed;
-                return err;
-            };
-            defer {
-                for (paths) |path| self.allocator.free(path);
-                self.allocator.free(paths);
+        while (try self.discoverTurn() != .complete) {}
+    }
+
+    pub fn cancelDiscovery(self: *FileSet) void {
+        if (self.discovery) |*discovery| discovery.deinit();
+        self.discovery = null;
+        self.discovery_spec = 0;
+        self.discovery_path = 0;
+        self.discovery_visited = 0;
+    }
+
+    /// Enumerate at most one bounded scan turn OR admit one discovered path.
+    /// Completed paths are re-opened and their identity checked before attaching.
+    /// Partial enumeration is never called healthy or mistaken for an empty set.
+    pub fn discoverTurn(self: *FileSet) !DiscoveryStatus {
+        errdefer |err| {
+            self.health = if (err == error.AccessDenied) .permission_denied else .read_failed;
+            self.cancelDiscovery();
+        }
+        if (self.discovery_spec == self.specs.items.len) {
+            self.cancelDiscovery();
+            self.health = if (self.sources.items.len == 0) .missing else .healthy;
+            return .complete;
+        }
+        const spec = self.specs.items[self.discovery_spec];
+        if (self.discovery == null) {
+            self.discovery = try Discovery.init(self.allocator, spec.pattern, self.max_sources);
+            self.discovery.?.max_entries = discovery_entries_per_episode - self.discovery_visited;
+            self.discovery_path = 0;
+        }
+        const discovery = &self.discovery.?;
+        if (!discovery.complete) {
+            _ = try discovery.pollTurn(discovery_entries_per_turn);
+            return .pending;
+        }
+        if (self.discovery_path < discovery.paths.items.len) {
+            try self.admitDiscovered(discovery.paths.items[self.discovery_path], spec.start);
+            self.discovery_path += 1;
+            return .pending;
+        }
+        self.discovery_visited += discovery.visited;
+        discovery.deinit();
+        self.discovery = null;
+        self.discovery_spec += 1;
+        return .pending;
+    }
+
+    fn admitDiscovered(self: *FileSet, path: []const u8, start: Start) !void {
+        const f = openRegularAt(std.fs.cwd(), path) catch |err| {
+            self.health = if (err == error.AccessDenied) .permission_denied else .read_failed;
+            return err;
+        };
+        var owns_descriptor = true;
+        defer if (owns_descriptor) f.close();
+        const stat = try std.posix.fstat(f.handle);
+        const id = try std.fmt.allocPrint(self.allocator, "{s}:{s}:{d}:{d}", .{ self.jail, path, stat.dev, stat.ino });
+        defer self.allocator.free(id);
+        var found = false;
+        for (self.sources.items) |*source| {
+            if (std.mem.eql(u8, source.source_id, id)) {
+                found = true;
+                break;
             }
-            for (paths) |path| {
-                const f = openRegularAt(std.fs.cwd(), path) catch |err| {
-                    self.health = if (err == error.AccessDenied) .permission_denied else .read_failed;
-                    return err;
-                };
-                defer f.close();
-                const stat = try std.posix.fstat(f.handle);
-                const id = try std.fmt.allocPrint(self.allocator, "{s}:{s}:{d}:{d}", .{ self.jail, path, stat.dev, stat.ino });
-                defer self.allocator.free(id);
-                var found = false;
-                for (self.sources.items) |*source| {
-                    if (std.mem.eql(u8, source.source_id, id)) {
+            // Distinct configured aliases are independent inputs while
+            // both paths still name the inode. Only a disappeared or
+            // replaced old pathname identifies retained rotation here.
+            if (source.committed) |known| {
+                if (known.device == stat.dev and known.inode == stat.ino) {
+                    const current = std.posix.fstatat(std.fs.cwd().fd, source.path, 0) catch |err| {
+                        if (err == error.FileNotFound or err == error.NotDir) {
+                            found = true;
+                            break;
+                        }
+                        self.health = if (err == error.AccessDenied) .permission_denied else .read_failed;
+                        return err;
+                    };
+                    if (current.dev != known.device or current.ino != known.inode) {
                         found = true;
                         break;
                     }
-                    // Distinct configured aliases are independent inputs while
-                    // both paths still name the inode. Only a disappeared or
-                    // replaced old pathname identifies retained rotation here.
-                    if (source.committed) |known| {
-                        if (known.device == stat.dev and known.inode == stat.ino) {
-                            const current = std.posix.fstatat(std.fs.cwd().fd, source.path, 0) catch |err| {
-                                if (err == error.FileNotFound or err == error.NotDir) {
-                                    found = true;
-                                    break;
-                                }
-                                self.health = if (err == error.AccessDenied) .permission_denied else .read_failed;
-                                return err;
-                            };
-                            if (current.dev != known.device or current.ino != known.inode) {
-                                found = true;
-                                break;
-                            }
-                        }
-                    }
                 }
-                if (found) continue;
-                if (self.sources.items.len >= self.max_sources) {
-                    self.health = .read_failed;
-                    return error.SourceLimit;
-                }
-                const checkpoint = if (self.restore) |restore| try restore(id, self.restore_userdata) else null;
-                var source = try FileSource.init(self.allocator, path, id, spec.start, checkpoint);
-                errdefer source.deinit();
-                if (checkpoint == null) source.framing = self.framing;
-                // Replacing a configured pathname retains its operational mode;
-                // a newly configured pathname starts from its own head/tail policy.
-                for (self.sources.items) |previous| {
-                    if (std.mem.eql(u8, previous.path, path) and previous.in_operation) source.in_operation = true;
-                }
-                if (self.initialize_source) |initialize| try initialize(&source, self.initialize_userdata);
-                // Attach now to prevent a rename between discovery and poll from
-                // pairing this incarnation's identity with a replacement file.
-                if (!try source.attach()) {
-                    source.deinit();
-                    continue;
-                }
-                const observed = source.committed.?;
-                if (observed.device != stat.dev or observed.inode != stat.ino) return error.SourceChanged;
-                try self.sources.append(source);
             }
         }
-        self.health = if (self.sources.items.len == 0) .missing else .healthy;
+        if (found) return;
+        if (self.sources.items.len >= self.max_sources) {
+            self.health = .read_failed;
+            return error.SourceLimit;
+        }
+        // No allocation may discard the first observed tail after descriptor
+        // admission. Reserve the publication slot before capturing that boundary.
+        try self.sources.ensureUnusedCapacity(1);
+        const checkpoint = if (self.restore) |restore| try restore(id, self.restore_userdata) else null;
+        var source = try FileSource.init(self.allocator, path, id, start, checkpoint);
+        errdefer source.deinit();
+        if (checkpoint == null) source.framing = self.framing;
+        // Replacing a configured pathname retains its operational mode;
+        // a newly configured pathname starts from its own head/tail policy.
+        for (self.sources.items) |previous| {
+            if (std.mem.eql(u8, previous.path, path) and previous.in_operation) source.in_operation = true;
+        }
+        if (self.initialize_source) |initialize| try initialize(&source, self.initialize_userdata);
+        // Transfer the exact inspected descriptor, even if an initializer or
+        // concurrent writer renamed the pathname. A mismatching saved checkpoint
+        // refuses immediately; recovery scanning belongs to its separate owner.
+        owns_descriptor = false;
+        try source.acceptDescriptor(f);
+        const observed = source.committed.?;
+        if (observed.device != stat.dev or observed.inode != stat.ino) return error.SourceChanged;
+        self.sources.appendAssumeCapacity(source);
     }
     pub fn poll(self: *FileSet, callback: records.AckCallback, userdata: ?*anyopaque) !usize {
         try self.discover();

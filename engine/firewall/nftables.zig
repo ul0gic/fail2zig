@@ -274,6 +274,23 @@ pub fn buildTablePayload(
     return buf[0..offset];
 }
 
+/// Read-only native set query; no implicit table creation or reset.
+pub fn buildSetQueryPayload(buf: []u8, table_name: []const u8, set_name: []const u8) netlink.Error![]const u8 {
+    if (buf.len < @sizeOf(netlink.nfgenmsg)) return error.BufferTooSmall;
+    const header = netlink.nfgenmsg{ .nfgen_family = netlink.NFPROTO.INET, .version = 0, .res_id = 0 };
+    @memcpy(buf[0..@sizeOf(netlink.nfgenmsg)], mem.asBytes(&header));
+    var offset: usize = @sizeOf(netlink.nfgenmsg);
+    offset = try appendStringNul(buf, offset, NFTA_SET_ELEM_LIST.TABLE, table_name);
+    offset = try appendStringNul(buf, offset, NFTA_SET_ELEM_LIST.SET, set_name);
+    return buf[0..offset];
+}
+
+pub fn buildOwnedTablePayload(buf: []u8, table_name: []const u8, marker: []const u8) netlink.Error![]const u8 {
+    const base = try buildTablePayload(buf, netlink.NFPROTO.INET, table_name);
+    const end = try appendAttr(buf, base.len, 6, marker); // NFTA_TABLE_USERDATA
+    return buf[0..end];
+}
+
 pub fn buildSetPayload(
     buf: []u8,
     family: u8,

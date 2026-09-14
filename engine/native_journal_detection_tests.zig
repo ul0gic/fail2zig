@@ -186,7 +186,7 @@ test "native detection: journal session atomically excludes untrusted input and 
     owner.?.destroy();
     owner = null;
     mock.response = accepted;
-    var changed = plan.qualified;
+    var changed = plan.qualified.?;
     changed.generation[0] ^= 1;
     var changed_opts = opts;
     changed_opts.detection = changed.consumer();
