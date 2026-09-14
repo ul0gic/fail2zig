@@ -9,6 +9,7 @@ const mem = std.mem;
 const shared = @import("shared");
 const backend = @import("backend.zig");
 const netlink = @import("netlink.zig");
+const canonical = @import("scope.zig");
 
 pub const NFT_MSG = struct {
     pub const NEWTABLE: u16 = 0;
@@ -95,7 +96,9 @@ pub const NF_INET_HOOK = struct {
 pub const NFTA_RULE = struct {
     pub const TABLE: u16 = 1;
     pub const CHAIN: u16 = 2;
+    pub const HANDLE: u16 = 3;
     pub const EXPRESSIONS: u16 = 4;
+    pub const USERDATA: u16 = 7;
 };
 
 pub const NFTA_EXPR = struct {
@@ -136,6 +139,7 @@ pub const NFTA_META = struct {
 
 pub const NFT_META = struct {
     pub const NFPROTO: u32 = 15;
+    pub const L4PROTO: u32 = 16;
 };
 
 pub const NFTA_CMP = struct {
@@ -146,6 +150,16 @@ pub const NFTA_CMP = struct {
 
 pub const NFT_CMP = struct {
     pub const EQ: u32 = 0;
+    pub const LTE: u32 = 3;
+    pub const GTE: u32 = 5;
+};
+
+pub const NFTA_BITWISE = struct {
+    pub const SREG: u16 = 1;
+    pub const DREG: u16 = 2;
+    pub const LEN: u16 = 3;
+    pub const MASK: u16 = 4;
+    pub const XOR: u16 = 5;
 };
 
 pub const NFT_PAYLOAD = struct {
@@ -459,6 +473,182 @@ pub fn buildDropRulePayload(
     offset = try endNested(buf, e4_start, offset);
 
     offset = try endNested(buf, exprs_start, offset);
+    return buf[0..offset];
+}
+
+pub const max_scope_rule_parts: usize = 30;
+pub const ScopeBuildError = netlink.Error || canonical.Error || error{InvalidRulePart};
+pub const RulePart = struct { protocol: ?canonical.Protocol, port: ?canonical.PortRange };
+
+pub fn scopeRulePartCount(scope: canonical.Scope) ScopeBuildError!usize {
+    try scope.validate();
+    const protocols: usize = if (scope.protocols.isAll()) 1 else blk: {
+        var count: usize = 0;
+        inline for (.{ canonical.Protocol.tcp, .udp, .icmp_v4, .icmp_v6 }) |value|
+            count += @intFromBool(scope.protocols.contains(value));
+        break :blk count;
+    };
+    const ports: usize = if (scope.ports.isAll()) 1 else scope.ports.len;
+    const count = std.math.mul(usize, protocols, ports) catch return error.InvalidRulePart;
+    if (count == 0 or count > max_scope_rule_parts) return error.InvalidRulePart;
+    return count;
+}
+
+pub fn scopeRulePart(scope: canonical.Scope, wanted: usize) ScopeBuildError!RulePart {
+    const count = try scopeRulePartCount(scope);
+    if (wanted >= count) return error.InvalidRulePart;
+    var protocols: [4]?canonical.Protocol = @splat(null);
+    var protocol_count: usize = 0;
+    if (scope.protocols.isAll()) {
+        protocol_count = 1;
+    } else {
+        inline for (.{ canonical.Protocol.tcp, .udp, .icmp_v4, .icmp_v6 }) |value| {
+            if (scope.protocols.contains(value)) {
+                protocols[protocol_count] = value;
+                protocol_count += 1;
+            }
+        }
+    }
+    const port_count: usize = if (scope.ports.isAll()) 1 else scope.ports.len;
+    const protocol_index = wanted / port_count;
+    const port_index = wanted % port_count;
+    return .{
+        .protocol = if (scope.protocols.isAll()) null else protocols[protocol_index],
+        .port = if (scope.ports.isAll()) null else scope.ports.ranges[port_index],
+    };
+}
+
+fn appendExpressionStart(buf: []u8, offset: usize, name: []const u8) netlink.Error!struct { list: usize, data: usize, offset: usize } {
+    const list = try beginNested(buf, offset, NFTA_LIST_ELEM);
+    var next = try appendStringNul(buf, list, NFTA_EXPR.NAME, name);
+    const data = try beginNested(buf, next, NFTA_EXPR.DATA);
+    next = data;
+    return .{ .list = list, .data = data, .offset = next };
+}
+
+fn appendExpressionEnd(buf: []u8, value: anytype) netlink.Error!usize {
+    const data_end = try endNested(buf, value.data, value.offset);
+    return endNested(buf, value.list, data_end);
+}
+
+fn appendMetaLoad(buf: []u8, offset: usize, key: u32) netlink.Error!usize {
+    var expression = try appendExpressionStart(buf, offset, "meta");
+    expression.offset = try appendU32BE(buf, expression.offset, NFTA_META.DREG, NFT_REG.REG_1);
+    expression.offset = try appendU32BE(buf, expression.offset, NFTA_META.KEY, key);
+    return appendExpressionEnd(buf, expression);
+}
+
+fn appendPayloadLoad(buf: []u8, offset: usize, base: u32, at: u32, len: u32) netlink.Error!usize {
+    var expression = try appendExpressionStart(buf, offset, "payload");
+    expression.offset = try appendU32BE(buf, expression.offset, NFTA_PAYLOAD.DREG, NFT_REG.REG_1);
+    expression.offset = try appendU32BE(buf, expression.offset, NFTA_PAYLOAD.BASE, base);
+    expression.offset = try appendU32BE(buf, expression.offset, NFTA_PAYLOAD.OFFSET, at);
+    expression.offset = try appendU32BE(buf, expression.offset, NFTA_PAYLOAD.LEN, len);
+    return appendExpressionEnd(buf, expression);
+}
+
+fn appendCompare(buf: []u8, offset: usize, operation: u32, value: []const u8) netlink.Error!usize {
+    var expression = try appendExpressionStart(buf, offset, "cmp");
+    expression.offset = try appendU32BE(buf, expression.offset, NFTA_CMP.SREG, NFT_REG.REG_1);
+    expression.offset = try appendU32BE(buf, expression.offset, NFTA_CMP.OP, operation);
+    const data = try beginNested(buf, expression.offset, NFTA_CMP.DATA);
+    expression.offset = try appendAttr(buf, data, NFTA_DATA.VALUE, value);
+    expression.offset = try endNested(buf, data, expression.offset);
+    return appendExpressionEnd(buf, expression);
+}
+
+fn appendBitwiseMask(buf: []u8, offset: usize, mask: []const u8) netlink.Error!usize {
+    var expression = try appendExpressionStart(buf, offset, "bitwise");
+    expression.offset = try appendU32BE(buf, expression.offset, NFTA_BITWISE.SREG, NFT_REG.REG_1);
+    expression.offset = try appendU32BE(buf, expression.offset, NFTA_BITWISE.DREG, NFT_REG.REG_1);
+    expression.offset = try appendU32BE(buf, expression.offset, NFTA_BITWISE.LEN, @intCast(mask.len));
+    const mask_data = try beginNested(buf, expression.offset, NFTA_BITWISE.MASK);
+    expression.offset = try appendAttr(buf, mask_data, NFTA_DATA.VALUE, mask);
+    expression.offset = try endNested(buf, mask_data, expression.offset);
+    const zero: [16]u8 = @splat(0);
+    const xor_data = try beginNested(buf, expression.offset, NFTA_BITWISE.XOR);
+    expression.offset = try appendAttr(buf, xor_data, NFTA_DATA.VALUE, zero[0..mask.len]);
+    expression.offset = try endNested(buf, xor_data, expression.offset);
+    return appendExpressionEnd(buf, expression);
+}
+
+fn appendDrop(buf: []u8, offset: usize) netlink.Error!usize {
+    var expression = try appendExpressionStart(buf, offset, "immediate");
+    expression.offset = try appendU32BE(buf, expression.offset, NFTA_IMMEDIATE.DREG, NFT_REG.VERDICT);
+    const data = try beginNested(buf, expression.offset, NFTA_IMMEDIATE.DATA);
+    const verdict = try beginNested(buf, data, NFTA_DATA.VERDICT);
+    expression.offset = try appendU32BE(buf, verdict, NFTA_VERDICT.CODE, NF_VERDICT.DROP);
+    expression.offset = try endNested(buf, verdict, expression.offset);
+    expression.offset = try endNested(buf, data, expression.offset);
+    return appendExpressionEnd(buf, expression);
+}
+
+pub fn buildScopedDropRulePayload(
+    buf: []u8,
+    table_name: []const u8,
+    chain_name: []const u8,
+    scope: canonical.Scope,
+    part_index: usize,
+    userdata: []const u8,
+) ScopeBuildError![]const u8 {
+    const part = try scopeRulePart(scope, part_index);
+    if (userdata.len == 0 or userdata.len > 256) return error.InvalidRulePart;
+    if (buf.len < @sizeOf(netlink.nfgenmsg)) return error.BufferTooSmall;
+    const ng: *netlink.nfgenmsg = @alignCast(@ptrCast(&buf[0]));
+    ng.* = .{ .nfgen_family = netlink.NFPROTO.INET, .version = 0, .res_id = 0 };
+    var offset: usize = @sizeOf(netlink.nfgenmsg);
+    offset = try appendStringNul(buf, offset, NFTA_RULE.TABLE, table_name);
+    offset = try appendStringNul(buf, offset, NFTA_RULE.CHAIN, chain_name);
+    const expressions = try beginNested(buf, offset, NFTA_RULE.EXPRESSIONS);
+    offset = expressions;
+
+    offset = try appendMetaLoad(buf, offset, NFT_META.NFPROTO);
+    offset = try appendCompare(buf, offset, NFT_CMP.EQ, &.{if (scope.subject.family == .v4) netlink.NFPROTO.IPV4 else netlink.NFPROTO.IPV6});
+    const address_len: u32 = if (scope.subject.family == .v4) 4 else 16;
+    offset = try appendPayloadLoad(buf, offset, NFT_PAYLOAD.NETWORK_HEADER, if (scope.subject.family == .v4) IPV4_SADDR_OFFSET else IPV6_SADDR_OFFSET, address_len);
+    const width: u8 = if (scope.subject.family == .v4) 32 else 128;
+    if (scope.subject.prefix != width) {
+        var mask: [16]u8 = @splat(0);
+        for (0..scope.subject.prefix) |bit_index| mask[bit_index / 8] |= @as(u8, 0x80) >> @intCast(bit_index % 8);
+        offset = try appendBitwiseMask(buf, offset, mask[0..address_len]);
+    }
+    offset = try appendCompare(buf, offset, NFT_CMP.EQ, scope.subject.address[0..address_len]);
+    if (part.protocol) |protocol| {
+        offset = try appendMetaLoad(buf, offset, NFT_META.L4PROTO);
+        const number: u8 = switch (protocol) {
+            .tcp => 6,
+            .udp => 17,
+            .icmp_v4 => 1,
+            .icmp_v6 => 58,
+            .all => return error.InvalidRulePart,
+        };
+        offset = try appendCompare(buf, offset, NFT_CMP.EQ, &.{number});
+    }
+    if (part.port) |port| {
+        offset = try appendPayloadLoad(buf, offset, NFT_PAYLOAD.TRANSPORT_HEADER, 2, 2);
+        var first: [2]u8 = undefined;
+        mem.writeInt(u16, &first, port.first, .big);
+        offset = try appendCompare(buf, offset, if (port.first == port.last) NFT_CMP.EQ else NFT_CMP.GTE, &first);
+        if (port.first != port.last) {
+            var last: [2]u8 = undefined;
+            mem.writeInt(u16, &last, port.last, .big);
+            offset = try appendCompare(buf, offset, NFT_CMP.LTE, &last);
+        }
+    }
+    offset = try appendDrop(buf, offset);
+    offset = try endNested(buf, expressions, offset);
+    offset = try appendAttr(buf, offset, NFTA_RULE.USERDATA, userdata);
+    return buf[0..offset];
+}
+
+pub fn buildRuleDeletePayload(buf: []u8, table_name: []const u8, chain_name: []const u8, handle: u64) netlink.Error![]const u8 {
+    if (handle == 0 or buf.len < @sizeOf(netlink.nfgenmsg)) return error.BufferTooSmall;
+    const ng: *netlink.nfgenmsg = @alignCast(@ptrCast(&buf[0]));
+    ng.* = .{ .nfgen_family = netlink.NFPROTO.INET, .version = 0, .res_id = 0 };
+    var offset: usize = @sizeOf(netlink.nfgenmsg);
+    offset = try appendStringNul(buf, offset, NFTA_RULE.TABLE, table_name);
+    offset = try appendStringNul(buf, offset, NFTA_RULE.CHAIN, chain_name);
+    offset = try appendU64BE(buf, offset, NFTA_RULE.HANDLE, handle);
     return buf[0..offset];
 }
 

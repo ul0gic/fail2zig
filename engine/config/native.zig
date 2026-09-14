@@ -75,6 +75,8 @@ pub fn filterSupportsInternal(filter: []const u8) bool {
 }
 
 pub const BantimeFormula = enum { linear, exponential };
+pub const BantimeScope = enum { per_jail, overall };
+pub const BantimeKind = enum { finite, permanent };
 
 /// ADR-007: what the daemon does when an enforcing jail exists but no firewall backend is usable.
 pub const OnNoBackend = enum { @"fail-closed", @"log-only" };
@@ -87,7 +89,9 @@ pub const BanTimeIncrement = struct {
     multiplier: f64 = 1.0,
     factor: f64 = 1.0,
     formula: BantimeFormula = .linear,
+    scope: BantimeScope = .per_jail,
     max_bantime: shared.Duration = 86_400 * 7,
+    jitter: shared.Duration = 0,
 };
 
 pub const GlobalConfig = struct {
@@ -109,6 +113,8 @@ pub const GlobalConfig = struct {
     metrics_bind: []const u8 = "127.0.0.1",
     metrics_port: u16 = 9100,
     websocket_max_clients: u32 = 16,
+    history_retention: shared.Duration = 86_400,
+    history_max_matches: u16 = 10,
     on_no_backend: OnNoBackend = .@"fail-closed",
     firewall: FirewallSelection = .auto,
     timezone_root: []const u8 = "/usr/share/zoneinfo",
@@ -123,6 +129,7 @@ pub const websocket_hard_max_clients: u32 = 1024;
 
 pub const JailDefaults = struct {
     bantime: shared.Duration = 600,
+    bantime_kind: BantimeKind = .finite,
     findtime: shared.Duration = 600,
     maxretry: u32 = 5,
     banaction: BanAction = .nftables,
@@ -152,6 +159,7 @@ pub const JailConfig = struct {
     maxretry: ?u32 = null,
     findtime: ?shared.Duration = null,
     bantime: ?shared.Duration = null,
+    bantime_kind: ?BantimeKind = null,
     banaction: ?BanAction = null,
     ignoreip: ?[]const []const u8 = null,
     bantime_increment: BanTimeIncrement = .{},
@@ -160,6 +168,10 @@ pub const JailConfig = struct {
 
     pub fn effectiveBantime(self: *const JailConfig, def: JailDefaults) shared.Duration {
         return self.bantime orelse def.bantime;
+    }
+    pub fn effectiveBantimeKind(self: *const JailConfig, def: JailDefaults) BantimeKind {
+        if (self.bantime != null) return self.bantime_kind orelse .finite;
+        return self.bantime_kind orelse def.bantime_kind;
     }
     pub fn effectiveFindtime(self: *const JailConfig, def: JailDefaults) shared.Duration {
         return self.findtime orelse def.findtime;
@@ -178,6 +190,7 @@ pub const ResolvedJailConfig = struct {
     maxretry: u32,
     findtime: shared.Duration,
     bantime: shared.Duration,
+    bantime_kind: BantimeKind,
     banaction: BanAction,
     bantime_increment: BanTimeIncrement,
 };
@@ -201,6 +214,8 @@ pub fn resolveJailFromConfig(j: *const JailConfig, defaults: JailDefaults) Resol
         if (j.bantime_increment_fields & 4 != 0) increment.factor = j.bantime_increment.factor;
         if (j.bantime_increment_fields & 8 != 0) increment.formula = j.bantime_increment.formula;
         if (j.bantime_increment_fields & 16 != 0) increment.max_bantime = j.bantime_increment.max_bantime;
+        if (j.bantime_increment_fields & 32 != 0) increment.scope = j.bantime_increment.scope;
+        if (j.bantime_increment_fields & 64 != 0) increment.jitter = j.bantime_increment.jitter;
     }
     return .{
         .name = j.name,
@@ -208,6 +223,7 @@ pub fn resolveJailFromConfig(j: *const JailConfig, defaults: JailDefaults) Resol
         .maxretry = j.effectiveMaxretry(defaults),
         .findtime = j.effectiveFindtime(defaults),
         .bantime = j.effectiveBantime(defaults),
+        .bantime_kind = j.effectiveBantimeKind(defaults),
         .banaction = j.effectiveBanaction(defaults),
         .bantime_increment = increment,
     };
@@ -323,7 +339,7 @@ pub fn validate(cfg: *const Config) ValidationError!void {
     if (cfg.global.memory_ceiling_mb > std.math.maxInt(usize) / (1024 * 1024)) return error.MemoryCeilingTooHigh;
     if (cfg.global.native_memory_ceiling_mb == 0 or cfg.global.native_memory_ceiling_mb > std.math.maxInt(usize) / (1024 * 1024) or cfg.global.native_fd_ceiling == 0) return error.InvalidNativeResources;
     try validateIncrement(cfg.defaults.bantime_increment);
-    if (cfg.defaults.bantime == 0 or cfg.defaults.bantime > max_ban_duration) {
+    if (cfg.defaults.bantime_kind == .finite and (cfg.defaults.bantime == 0 or cfg.defaults.bantime > max_ban_duration)) {
         std.log.warn("config: defaults.bantime must be > 0", .{});
         return error.InvalidBantime;
     }
@@ -365,7 +381,7 @@ pub fn validate(cfg: *const Config) ValidationError!void {
             std.log.warn("config: jail '{s}' filter '{s}' has no builtin matcher", .{ j.name, j.filter });
             return error.UnknownFilter;
         }
-        if (j.bantime) |b| if (b == 0 or b > max_ban_duration) return error.InvalidBantime;
+        if ((j.bantime_kind orelse .finite) == .finite) if (j.bantime) |b| if (b == 0 or b > max_ban_duration) return error.InvalidBantime;
         if (j.findtime) |f| if (f == 0) return error.InvalidFindtime;
         if (j.maxretry) |m| if (m == 0 or m > max_supported_retry) return error.InvalidMaxretry;
 
@@ -398,7 +414,8 @@ pub fn validate(cfg: *const Config) ValidationError!void {
 fn validateIncrement(incr: BanTimeIncrement) ValidationError!void {
     if (!std.math.isFinite(incr.multiplier) or incr.multiplier <= 0 or
         !std.math.isFinite(incr.factor) or incr.factor < 0 or
-        incr.max_bantime == 0 or incr.max_bantime > max_ban_duration) return error.InvalidIncrement;
+        incr.max_bantime == 0 or incr.max_bantime > max_ban_duration or
+        incr.jitter > incr.max_bantime) return error.InvalidIncrement;
 }
 
 const Parser = struct {
@@ -856,6 +873,14 @@ const Parser = struct {
             const n = try asInt(v);
             if (n <= 0 or n > websocket_hard_max_clients) return error.InvalidValue;
             self.global.websocket_max_clients = @intCast(n);
+        } else if (std.mem.eql(u8, key, "history_retention")) {
+            const n = try asInt(v);
+            if (n < 0 or n > @divTrunc(std.math.maxInt(i64), 1_000_000)) return error.InvalidValue;
+            self.global.history_retention = @intCast(n);
+        } else if (std.mem.eql(u8, key, "history_max_matches")) {
+            const n = try asInt(v);
+            if (n < 0 or n > 1024) return error.InvalidValue;
+            self.global.history_max_matches = @intCast(n);
         } else if (std.mem.eql(u8, key, "on_no_backend")) {
             const s = try asString(v);
             self.global.on_no_backend = try parseOnNoBackend(s);
@@ -874,9 +899,17 @@ const Parser = struct {
     fn applyDefaultsKey(self: *Parser, key: []const u8) Error!void {
         const v = try self.parseValue();
         if (std.mem.eql(u8, key, "bantime")) {
-            const n = try asInt(v);
-            if (n < 0 or n > max_ban_duration) return error.InvalidValue;
-            self.defaults.bantime = @intCast(n);
+            switch (v) {
+                .int => |n| {
+                    if (n < 0 or n > max_ban_duration) return error.InvalidValue;
+                    self.defaults.bantime = @intCast(n);
+                    self.defaults.bantime_kind = .finite;
+                },
+                .string => |value| if (std.mem.eql(u8, value, "permanent")) {
+                    self.defaults.bantime_kind = .permanent;
+                } else return error.InvalidValue,
+                else => return error.InvalidValue,
+            }
         } else if (std.mem.eql(u8, key, "findtime")) {
             const n = try asInt(v);
             if (n < 0) return error.InvalidValue;
@@ -918,10 +951,21 @@ const Parser = struct {
             } else if (std.mem.eql(u8, s, "exponential")) {
                 self.defaults.bantime_increment.formula = .exponential;
             } else return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "bantime_increment_scope")) {
+            const s = try asString(v);
+            if (std.mem.eql(u8, s, "per-jail")) {
+                self.defaults.bantime_increment.scope = .per_jail;
+            } else if (std.mem.eql(u8, s, "overall")) {
+                self.defaults.bantime_increment.scope = .overall;
+            } else return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "bantime_increment_max_bantime")) {
             const n = try asInt(v);
             if (n < 0 or n > max_ban_duration) return error.InvalidValue;
             self.defaults.bantime_increment.max_bantime = @intCast(n);
+        } else if (std.mem.eql(u8, key, "bantime_increment_jitter")) {
+            const n = try asInt(v);
+            if (n < 0 or n > max_ban_duration) return error.InvalidValue;
+            self.defaults.bantime_increment.jitter = @intCast(n);
         } else return error.UnknownKey;
     }
 
@@ -977,9 +1021,18 @@ const Parser = struct {
             if (n < 0) return error.InvalidValue;
             j.findtime = @intCast(n);
         } else if (std.mem.eql(u8, key, "bantime")) {
-            const n = try asInt(v);
-            if (n < 0 or n > max_ban_duration) return error.InvalidValue;
-            j.bantime = @intCast(n);
+            switch (v) {
+                .int => |n| {
+                    if (n < 0 or n > max_ban_duration) return error.InvalidValue;
+                    j.bantime = @intCast(n);
+                    j.bantime_kind = .finite;
+                },
+                .string => |value| if (std.mem.eql(u8, value, "permanent")) {
+                    j.bantime = null;
+                    j.bantime_kind = .permanent;
+                } else return error.InvalidValue,
+                else => return error.InvalidValue,
+            }
         } else if (std.mem.eql(u8, key, "enforce")) {
             try self.policySpelling(key);
             j.banaction = if (try asBool(v)) .nftables else .@"log-only";
@@ -1010,12 +1063,27 @@ const Parser = struct {
             } else return error.InvalidValue;
             j.bantime_increment_explicit = true;
             j.bantime_increment_fields |= 8;
+        } else if (std.mem.eql(u8, key, "bantime_increment_scope")) {
+            const s = try asString(v);
+            if (std.mem.eql(u8, s, "per-jail")) {
+                j.bantime_increment.scope = .per_jail;
+            } else if (std.mem.eql(u8, s, "overall")) {
+                j.bantime_increment.scope = .overall;
+            } else return error.InvalidValue;
+            j.bantime_increment_explicit = true;
+            j.bantime_increment_fields |= 32;
         } else if (std.mem.eql(u8, key, "bantime_increment_max_bantime")) {
             const n = try asInt(v);
             if (n < 0 or n > max_ban_duration) return error.InvalidValue;
             j.bantime_increment.max_bantime = @intCast(n);
             j.bantime_increment_explicit = true;
             j.bantime_increment_fields |= 16;
+        } else if (std.mem.eql(u8, key, "bantime_increment_jitter")) {
+            const n = try asInt(v);
+            if (n < 0 or n > max_ban_duration) return error.InvalidValue;
+            j.bantime_increment.jitter = @intCast(n);
+            j.bantime_increment_explicit = true;
+            j.bantime_increment_fields |= 64;
         } else return error.UnknownKey;
     }
 
@@ -1335,7 +1403,9 @@ test "native: parse bantime_increment config" {
         \\bantime_increment_enabled = true
         \\bantime_increment_multiplier = 2
         \\bantime_increment_formula = "exponential"
+        \\bantime_increment_scope = "overall"
         \\bantime_increment_max_bantime = 604800
+        \\bantime_increment_jitter = 9
     ;
     const cfg = try Config.parse(arena.allocator(), src);
     try std.testing.expectEqual(@as(usize, 1), cfg.jails.len);
@@ -1343,7 +1413,23 @@ test "native: parse bantime_increment config" {
     try std.testing.expect(bi.enabled);
     try std.testing.expectEqual(@as(f64, 2.0), bi.multiplier);
     try std.testing.expectEqual(BantimeFormula.exponential, bi.formula);
+    try std.testing.expectEqual(BantimeScope.overall, bi.scope);
     try std.testing.expectEqual(@as(shared.Duration, 604800), bi.max_bantime);
+    try std.testing.expectEqual(@as(shared.Duration, 9), bi.jitter);
+}
+
+test "native: bantime_increment rejects invalid scope and jitter above cap" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.InvalidValue, Config.parse(
+        arena.allocator(),
+        "[defaults]\nbantime_increment_scope = \"global\"\n",
+    ));
+    const cfg = try Config.parse(
+        arena.allocator(),
+        "[defaults]\nbantime_increment_max_bantime = 10\nbantime_increment_jitter = 11\n",
+    );
+    try std.testing.expectError(error.InvalidIncrement, validate(&cfg));
 }
 
 test "native: bantime_increment accepts fractional factor in defaults" {
@@ -1658,6 +1744,18 @@ test "native: websocket_max_clients default is 16" {
     ;
     const cfg = try Config.parse(arena.allocator(), src);
     try std.testing.expectEqual(@as(u32, 16), cfg.global.websocket_max_clients);
+}
+
+test "native: history retention defaults and bounded overrides are explicit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const defaults = try Config.parse(arena.allocator(), "[global]\nmetrics_enabled = false\n");
+    try std.testing.expectEqual(@as(shared.Duration, 86_400), defaults.global.history_retention);
+    try std.testing.expectEqual(@as(u16, 10), defaults.global.history_max_matches);
+    const configured = try Config.parse(arena.allocator(), "[global]\nhistory_retention = 0\nhistory_max_matches = 1024\n");
+    try std.testing.expectEqual(@as(shared.Duration, 0), configured.global.history_retention);
+    try std.testing.expectEqual(@as(u16, 1024), configured.global.history_max_matches);
+    try std.testing.expectError(error.InvalidValue, Config.parse(arena.allocator(), "[global]\nhistory_max_matches = 1025\n"));
 }
 
 test "native: websocket_max_clients accepts 16, 128, and hard cap" {
@@ -2305,4 +2403,29 @@ test "native: named timezone configuration rejects conflicting and unused contex
     try std.testing.expectError(error.InvalidNativeTimezone, validate(&cfg));
     try std.testing.expectError(error.InvalidValue, Config.parse(a, "[jails.sshd]\ntimezone = \"../escape\"\n"));
     try std.testing.expectError(error.InvalidValue, Config.parse(a, "[global]\ntimezone_root = \"relative\"\n"));
+}
+
+test "native: permanent bantime is explicit and inherits without numeric sentinels" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cfg = try Config.parse(arena.allocator(),
+        \\[defaults]
+        \\bantime = "permanent"
+        \\[jails.inherited]
+        \\filter = "sshd"
+        \\[jails.finite]
+        \\filter = "sshd"
+        \\bantime = 45
+        \\[jails.permanent]
+        \\filter = "sshd"
+        \\bantime = "permanent"
+    );
+    try std.testing.expectEqual(BantimeKind.permanent, cfg.defaults.bantime_kind);
+    try std.testing.expectEqual(BantimeKind.permanent, resolveJailFromConfig(&cfg.jails[0], cfg.defaults).bantime_kind);
+    const finite = resolveJailFromConfig(&cfg.jails[1], cfg.defaults);
+    try std.testing.expectEqual(BantimeKind.finite, finite.bantime_kind);
+    try std.testing.expectEqual(@as(shared.Duration, 45), finite.bantime);
+    try std.testing.expectEqual(BantimeKind.permanent, resolveJailFromConfig(&cfg.jails[2], cfg.defaults).bantime_kind);
+    try std.testing.expectError(error.InvalidValue, Config.parse(arena.allocator(), "[defaults]\nbantime = -1\n"));
+    try std.testing.expectError(error.InvalidValue, Config.parse(arena.allocator(), "[defaults]\nbantime = \"forever\"\n"));
 }

@@ -8,7 +8,9 @@ const durable = @import("core/record_store.zig");
 const sessions = @import("core/native_file_session.zig");
 const builtin = @import("core/native_builtin_detector.zig");
 const time = @import("core/native_time.zig");
-const policy = retry.Policy{ .maxretry = 3, .window_us = 10_000_000, .bantime_us = 60_000_000, .max_subjects = 2 };
+const native_config = @import("config/native.zig");
+const retry_config = @import("config/native_retry_policy.zig");
+const policy = retry.Policy{ .maxretry = 3, .window_us = 10_000_000, .duration = .{ .finite_us = 60_000_000 }, .max_subjects = 2 };
 const ip = detection.Subject{ .v4 = .{ 203, 0, 113, 7 } };
 const failure = "Failed password for root from 203.0.113.7 port 22 ssh2\n";
 const Clock = struct {
@@ -26,6 +28,15 @@ fn admitted(store: *durable.Store) !void {
     try store.enableJournalDetection();
     try store.enableRetry();
 }
+fn enableLatestFromRetry(store: *durable.Store) !void {
+    try store.enableConsumers();
+    try store.enableEffects();
+    try store.enableConsumerManifests();
+    try store.enableConfirmedHistory();
+    try store.enableMaintenance();
+    try store.enableCleanup();
+    try store.enableRetryLeases();
+}
 fn attempt(stamp: i64, id: u8) retry.Attempt {
     return .{ .at_us = stamp, .occurrence = [_]u8{id} ** 32 };
 }
@@ -39,9 +50,12 @@ fn options(consumer: *const builtin.Detector, clock: *Clock) sessions.Options {
 const StoreFixture = struct {
     const generation = [_]u8{7} ** 32;
     fn record(store: *durable.Store, occurrence: []const u8, revision: u64, stamp: i64, address: detection.Subject) !durable.Record {
-        const identity = durable.ReceiptIdentity{ .jail = "ssh", .source = "file", .occurrence = occurrence, .cursor = occurrence, .raw_hash = [_]u8{8} ** 32, .generation = generation };
+        return recordWith(store, "ssh", occurrence, revision, stamp, address, policy);
+    }
+    fn recordWith(store: *durable.Store, jail: []const u8, occurrence: []const u8, revision: u64, stamp: i64, address: detection.Subject, selected: retry.Policy) !durable.Record {
+        const identity = durable.ReceiptIdentity{ .jail = jail, .source = "file", .occurrence = occurrence, .cursor = occurrence, .raw_hash = [_]u8{8} ** 32, .generation = generation };
         const receipt = try store.beginReceipt(identity, .{ .us = stamp }, revision);
-        return .{ .jail = identity.jail, .source = identity.source, .occurrence = identity.occurrence, .cursor = identity.cursor, .raw_hash = identity.raw_hash, .receipt = .{ .time = receipt, .generation = generation }, .native_time_outcome = .{ .eligible = .{ .timestamp = receipt, .receipt = receipt, .original = null, .origin = .receipt } }, .native_detection = .{ .kind = .candidate, .generation = [_]u8{2} ** 32, .filter = try detection.Name.init("sshd"), .pattern = try detection.Name.init("password"), .pattern_index = 0, .subject = address }, .native_retry = .{ .generation = generation, .policy = policy, .processing_us = stamp }, .expected_revision = revision, .disposition = "time-eligible-receipt", .checkpoint = "native-retry-test" };
+        return .{ .jail = identity.jail, .source = identity.source, .occurrence = identity.occurrence, .cursor = identity.cursor, .raw_hash = identity.raw_hash, .receipt = .{ .time = receipt, .generation = generation }, .native_time_outcome = .{ .eligible = .{ .timestamp = receipt, .receipt = receipt, .original = null, .origin = .receipt } }, .native_detection = .{ .kind = .candidate, .generation = [_]u8{2} ** 32, .filter = try detection.Name.init("sshd"), .pattern = try detection.Name.init("password"), .pattern_index = 0, .subject = address }, .native_retry = .{ .generation = generation, .policy = selected, .processing_us = stamp }, .expected_revision = revision, .disposition = "time-eligible-receipt", .checkpoint = "native-retry-test" };
     }
 };
 
@@ -162,18 +176,173 @@ test "native retry: committed processing floor preserves receipts and pauses adm
     try pipe.admit();
 }
 
+test "native retry: observation-time pruning is read-only across reopen" {
+    var temp = t.tmpDir(.{});
+    defer temp.cleanup();
+    const root = try temp.dir.realpathAlloc(t.allocator, ".");
+    defer t.allocator.free(root);
+    const path = try std.fs.path.join(t.allocator, &.{ root, "state.sqlite" });
+    defer t.allocator.free(path);
+    {
+        var store = try durable.Store.open(t.allocator, path);
+        defer store.close();
+        try admitted(&store);
+        try store.admitRetry("ssh", StoreFixture.generation, policy);
+        _ = try store.commitRecord(try StoreFixture.record(&store, "early", 0, 90_000_000, ip));
+        _ = try store.commitRecord(try StoreFixture.record(&store, "latest", 1, 100_000_000, ip));
+        try t.expectEqual(@as(u16, 2), (try store.retryStateAt("ssh", ip, 100_000_000)).?.count);
+        try t.expectEqual(@as(u16, 1), (try store.retryStateAt("ssh", ip, 100_000_001)).?.count);
+        try t.expectEqual(@as(u16, 2), (try store.retryState("ssh", ip)).?.count);
+        try t.expectEqual(@as(i64, 100_000_000), (try store.admissionClock()).?.us);
+        var snapshot: [policy.max_subjects]durable.Store.ActiveDecision = undefined;
+        try t.expectEqual(@as(usize, 1), (try store.retrySummary("ssh", 100_000_001, &snapshot)).subjects);
+        try t.expectEqual(@as(u16, 2), (try store.retryState("ssh", ip)).?.count);
+        try t.expectEqual(@as(i64, 100_000_000), (try store.admissionClock()).?.us);
+    }
+    {
+        var restored = try durable.Store.open(t.allocator, path);
+        defer restored.close();
+        try t.expectEqual(@as(u16, 1), (try restored.retryStateAt("ssh", ip, 100_000_001)).?.count);
+        try t.expectEqual(@as(u16, 2), (try restored.retryState("ssh", ip)).?.count);
+        try t.expectError(error.ReceiptClockReversed, restored.retryStateAt("ssh", ip, 99_999_999));
+    }
+}
+
+test "native retry: record evidence is bounded before mutation and cannot change counting" {
+    var temp = t.tmpDir(.{});
+    defer temp.cleanup();
+    const root = try temp.dir.realpathAlloc(t.allocator, ".");
+    defer t.allocator.free(root);
+    const path = try std.fs.path.join(t.allocator, &.{ root, "state.sqlite" });
+    defer t.allocator.free(path);
+    var store = try durable.Store.open(t.allocator, path);
+    defer store.close();
+    try admitted(&store);
+    try store.admitRetry("ssh", StoreFixture.generation, policy);
+    var valid = try StoreFixture.record(&store, "valid", 0, 100_000_000, ip);
+    valid.retry_evidence = .{ .text = failure };
+    try t.expectEqual(durable.CommitResult.committed, try store.commitRecord(valid));
+    try t.expectEqual(@as(u16, 1), (try store.retryState("ssh", ip)).?.count);
+
+    var invalid = try StoreFixture.record(&store, "invalid", 1, 100_000_001, ip);
+    invalid.retry_evidence = .{ .text = "\xff" };
+    try t.expectError(error.InvalidRetryEvidence, store.commitRecord(invalid));
+    try t.expectEqual(@as(u64, 1), try store.revision("ssh"));
+    try t.expectEqual(@as(u16, 1), (try store.retryState("ssh", ip)).?.count);
+}
+
 test "native retry: inclusive processing window sorts late attempts and never rejuvenates stale evidence" {
     var result = try retry.advance(policy, null, ip, attempt(100_000_000, 1), 100_000_000);
     result = try retry.advance(policy, result.state, ip, attempt(90_000_000, 2), 100_000_000);
     try t.expectEqual(@as(u16, 2), result.state.count);
     try t.expectEqual(@as(i64, 90_000_000), result.state.attempts[0].at_us);
+    try t.expectEqual(@as(?i64, 100_000_000), result.state.latestEventUs());
     result = try retry.advance(policy, result.state, ip, attempt(100_000_001, 3), 100_000_001);
     try t.expectEqual(@as(u16, 2), result.state.count);
     try t.expect(result.decision == null);
+    try t.expectEqual(@as(?i64, 100_000_001), result.state.latestEventUs());
     result = try retry.advance(policy, result.state, ip, attempt(99_000_000, 4), 100_000_001);
-    try t.expectEqual(@as(i64, 160_000_001), result.decision.?.expiry_us);
+    try t.expectEqualDeep(retry.Lease{ .finite = 160_000_001 }, result.decision.?.lease);
     try t.expectEqual(@as(u16, 0), result.state.count);
+    try t.expectEqual(@as(?i64, null), result.state.latestEventUs());
     try t.expectError(error.InvalidRetryState, retry.advance(policy, null, ip, attempt(89_999_999, 1), 100_000_000));
+}
+
+test "native retry: exact duplicate is idempotent while conflicting identity refuses" {
+    const first = try retry.advance(policy, null, ip, attempt(100_000_000, 1), 100_000_000);
+    const duplicate = try retry.advance(policy, first.state, ip, attempt(100_000_000, 1), 100_000_001);
+    try t.expectEqual(retry.Disposition.duplicate, duplicate.disposition);
+    try t.expect(duplicate.decision == null);
+    try t.expectEqual(first.state.last_processed_us, duplicate.state.last_processed_us);
+    try t.expectEqual(first.state.count, duplicate.state.count);
+    try t.expectEqual(first.state.attempts[0].at_us, duplicate.state.attempts[0].at_us);
+    try t.expectEqualSlices(u8, &first.state.attempts[0].occurrence, &duplicate.state.attempts[0].occurrence);
+    try t.expectError(error.InvalidRetryState, retry.advance(policy, first.state, ip, attempt(99_999_999, 1), 100_000_001));
+
+    const distinct = try retry.advance(policy, first.state, ip, attempt(100_000_000, 2), 100_000_001);
+    try t.expectEqual(retry.Disposition.counted, distinct.disposition);
+    try t.expectEqual(@as(u16, 2), distinct.state.count);
+}
+
+test "native retry: delayed cleanup preserves the inclusive endpoint" {
+    var state = (try retry.advance(policy, null, ip, attempt(90_000_000, 1), 100_000_000)).state;
+    state = (try retry.advance(policy, state, ip, attempt(100_000_000, 2), 100_000_000)).state;
+    const endpoint = try retry.prune(policy, state, 100_000_000);
+    try t.expect(!endpoint.changed);
+    try t.expectEqual(@as(u16, 2), endpoint.state.count);
+
+    const one_old = try retry.prune(policy, state, 100_000_001);
+    try t.expect(one_old.changed);
+    try t.expectEqual(@as(u16, 1), one_old.state.count);
+    try t.expectEqual(@as(?i64, 100_000_000), one_old.state.latestEventUs());
+
+    const empty = try retry.prune(policy, one_old.state, 110_000_001);
+    try t.expect(empty.changed);
+    try t.expectEqual(@as(u16, 0), empty.state.count);
+    try t.expectEqual(@as(?i64, null), empty.state.latestEventUs());
+    try t.expectError(error.RetryClockReversed, retry.prune(policy, empty.state, 110_000_000));
+}
+
+test "native retry: evidence validation is independent of numeric attempt state" {
+    const without = try retry.advance(policy, null, ip, attempt(100_000_000, 1), 100_000_000);
+    const with = try retry.advanceWithEvidence(policy, null, ip, attempt(100_000_000, 1), 100_000_000, .{ .text = "failed password: caf\xc3\xa9" });
+    try t.expectEqual(without.state.count, with.state.count);
+    try t.expectEqual(without.state.last_processed_us, with.state.last_processed_us);
+    try t.expectEqualSlices(u8, &without.state.attempts[0].occurrence, &with.state.attempts[0].occurrence);
+    try t.expectEqual(@as(usize, 2 * 1024), retry.max_evidence_text_bytes);
+    try t.expectEqual(@as(usize, 16 * 1024), retry.max_subject_evidence_bytes);
+    try t.expectError(error.InvalidRetryEvidence, retry.advanceWithEvidence(policy, null, ip, attempt(100_000_000, 1), 100_000_000, .{ .text = "" }));
+    try t.expectError(error.InvalidRetryEvidence, retry.advanceWithEvidence(policy, null, ip, attempt(100_000_000, 1), 100_000_000, .{ .text = "\xff" }));
+    var too_large: [retry.max_evidence_text_bytes + 1]u8 = undefined;
+    @memset(&too_large, 'x');
+    try t.expectError(error.InvalidRetryEvidence, retry.advanceWithEvidence(policy, null, ip, attempt(100_000_000, 1), 100_000_000, .{ .text = &too_large }));
+}
+
+test "native retry: SYS-029 literal native expectations and supported threshold boundary" {
+    var four = policy;
+    four.maxretry = 4;
+    four.window_us = 600;
+    var state: ?retry.State = null;
+    for ([_]i64{ 0, 1, 2, 601 }, 0..) |stamp, index| {
+        const result = try retry.advance(four, state, ip, attempt(stamp, @intCast(index)), stamp);
+        try t.expect(result.decision == null);
+        state = result.state;
+    }
+    // rate-retention/rate-threshold: t=0 is outside [1,601], so three
+    // literal occurrences remain and reference rate weighting is not imported.
+    try t.expectEqual(@as(u16, 3), state.?.count);
+    try t.expectEqual(@as(i64, 1), state.?.attempts[0].at_us);
+
+    var decay = four;
+    decay.maxretry = 5;
+    state = null;
+    for ([_]i64{ 0, 1, 2, 900 }, 0..) |stamp, index| {
+        state = (try retry.advance(decay, state, ip, attempt(stamp, @intCast(index)), stamp)).state;
+    }
+    // rate-decay: only the literal t=900 occurrence remains in [300,900].
+    try t.expectEqual(@as(u16, 1), state.?.count);
+    try t.expectEqual(@as(?i64, 900), state.?.latestEventUs());
+
+    var ordered = try retry.advance(decay, null, ip, attempt(100, 1), 100);
+    ordered = try retry.advance(decay, ordered.state, ip, attempt(0, 2), 100);
+    try t.expectEqual(@as(?i64, 100), ordered.state.latestEventUs());
+    try t.expectEqual(@as(i64, 0), ordered.state.attempts[0].at_us);
+
+    var one = policy;
+    one.maxretry = 1;
+    try t.expect((try retry.advance(one, null, ip, attempt(0, 1), 0)).decision != null);
+    var maximum = policy;
+    maximum.maxretry = retry.max_attempts;
+    state = null;
+    for (0..retry.max_attempts) |index| {
+        const result = try retry.advance(maximum, state, ip, attempt(@intCast(index), @intCast(index)), @intCast(index));
+        if (index + 1 == retry.max_attempts) try t.expect(result.decision != null) else try t.expect(result.decision == null);
+        state = result.state;
+    }
+    try t.expectEqual(@as(u16, 0), state.?.count);
+
+    const unsupported = native_config.JailConfig{ .name = "ssh", .filter = "sshd", .maxretry = 129 };
+    try t.expectError(error.InvalidRetryPolicy, retry_config.fromJail(&unsupported, .{}, 1));
 }
 
 test "native retry: active decisions retain deadline and no attempts leak into the next window" {
@@ -182,11 +351,12 @@ test "native retry: active decisions retain deadline and no attempts leak into t
     var result = try retry.advance(single, null, ip, attempt(100_000_000, 1), 100_000_000);
     result = try retry.advance(single, result.state, ip, attempt(110_000_000, 2), 110_000_000);
     try t.expect(result.decision == null);
-    try t.expectEqual(@as(i64, 160_000_000), result.state.expiry_us.?);
+    try t.expectEqual(retry.Disposition.active, result.disposition);
+    try t.expectEqualDeep(retry.Lease{ .finite = 160_000_000 }, result.state.lease);
     try t.expectEqual(@as(u16, 0), result.state.count);
     result = try retry.advance(single, result.state, ip, attempt(160_000_000, 3), 160_000_000);
     try t.expectEqual(@as(u64, 2), result.decision.?.ordinal);
-    try t.expectEqual(@as(i64, 220_000_000), result.decision.?.expiry_us);
+    try t.expectEqualDeep(retry.Lease{ .finite = 220_000_000 }, result.decision.?.lease);
     try t.expectError(error.RetryClockReversed, retry.advance(single, result.state, ip, attempt(159_999_999, 4), 159_999_999));
     try t.expectError(error.RetryTimeOverflow, retry.advance(single, null, ip, attempt(std.math.maxInt(i64), 4), std.math.maxInt(i64)));
 }
@@ -194,7 +364,7 @@ test "native retry: active decisions retain deadline and no attempts leak into t
 test "native retry: persisted encodings reject malformed versions limits duplicate identities and ordering" {
     var encoded = try policy.encode();
     try t.expectEqualDeep(policy, try retry.Policy.decode(&encoded));
-    encoded[4] = 2;
+    encoded[4] = 3;
     try t.expectError(error.InvalidRetryPolicy, retry.Policy.decode(&encoded));
     var maximum = policy;
     maximum.maxretry = 128;
@@ -210,6 +380,110 @@ test "native retry: persisted encodings reject malformed versions limits duplica
     try t.expectError(error.InvalidRetryState, restored.decodeAttempts(saved, maximum));
     maximum.maxretry = 129;
     try t.expectError(error.InvalidRetryPolicy, maximum.validate());
+}
+
+test "native retry: permanent policy uses the tagged wire format and explicit config" {
+    const permanent = retry.Policy{ .maxretry = 1, .window_us = 10, .duration = .permanent, .max_subjects = 1 };
+    const encoded = try permanent.encode();
+    try t.expectEqual(@as(u8, 2), encoded[4]);
+    try t.expectEqual(@as(u8, 2), encoded[28]);
+    try t.expectEqualDeep(permanent, try retry.Policy.decode(&encoded));
+    const decided = try retry.advance(permanent, null, ip, attempt(100, 1), 100);
+    try t.expectEqualDeep(retry.Lease.permanent, decided.state.lease);
+    try t.expectEqualDeep(retry.Lease.permanent, decided.decision.?.lease);
+    try t.expect(decided.state.lease.live(std.math.maxInt(i64)));
+
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const cfg = try native_config.Config.parse(arena.allocator(),
+        \\[defaults]
+        \\bantime = "permanent"
+        \\[jails.ssh]
+        \\filter = "sshd"
+    );
+    const configured = try retry_config.fromJail(&cfg.jails[0], cfg.defaults, 8);
+    try t.expectEqualDeep(retry.Duration.permanent, configured.duration);
+}
+
+test "native retry: escalation formula bounds encoding and config are explicit" {
+    const base = retry.Duration{ .finite_us = 60_000_000 };
+    var linear = retry.Escalation{ .enabled = true, .multiplier = 2, .factor = 0.5, .max_duration_us = 600_000_000, .jitter_us = 5_000_000 };
+    try t.expectEqualDeep(base, try linear.duration(base, 0, 0));
+    try t.expectEqualDeep(retry.Duration{ .finite_us = 305_000_000 }, try linear.duration(base, 3, 5_000_000));
+    const encoded = try linear.encode();
+    try t.expectEqualDeep(linear, try retry.Escalation.decode(&encoded));
+    try t.expectError(error.InvalidEscalationInput, linear.duration(base, 0, 1_000_000));
+    linear.formula = .exponential;
+    linear.factor = 2;
+    try t.expectEqualDeep(retry.Duration{ .finite_us = 485_000_000 }, try linear.duration(base, 2, 5_000_000));
+    try t.expectEqualDeep(retry.Duration{ .finite_us = 600_000_000 }, try linear.duration(base, std.math.maxInt(u64), 5_000_000));
+
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const cfg = try native_config.Config.parse(arena.allocator(),
+        \\[defaults]
+        \\bantime = 60
+        \\bantime_increment_enabled = true
+        \\bantime_increment_formula = "exponential"
+        \\bantime_increment_scope = "overall"
+        \\bantime_increment_multiplier = 2
+        \\bantime_increment_factor = 2
+        \\bantime_increment_max_bantime = 600
+        \\bantime_increment_jitter = 5
+        \\[jails.ssh]
+        \\filter = "sshd"
+    );
+    const configured = try retry_config.fromJail(&cfg.jails[0], cfg.defaults, 8);
+    try t.expect(configured.escalation.enabled);
+    try t.expectEqual(retry.EscalationScope.overall, configured.escalation.scope);
+    try t.expectEqual(@as(i64, 5_000_000), configured.escalation.jitter_us);
+    var permanent = configured;
+    permanent.duration = .permanent;
+    try t.expectError(error.InvalidRetryPolicy, permanent.validate());
+}
+
+test "native retry: schema 16 migrates exact finite leases and persists permanent decisions" {
+    var temp = t.tmpDir(.{});
+    defer temp.cleanup();
+    const root = try temp.dir.realpathAlloc(t.allocator, ".");
+    defer t.allocator.free(root);
+    const path = try std.fs.path.join(t.allocator, &.{ root, "leases.sqlite" });
+    defer t.allocator.free(path);
+    const one = retry.Policy{ .maxretry = 1, .window_us = policy.window_us, .duration = policy.duration, .max_subjects = 2 };
+    const permanent = retry.Policy{ .maxretry = 1, .window_us = policy.window_us, .duration = .permanent, .max_subjects = 2 };
+    {
+        var store = try durable.Store.open(t.allocator, path);
+        defer store.close();
+        try admitted(&store);
+        try store.admitRetry("finite", StoreFixture.generation, one);
+        _ = try store.commitRecord(try StoreFixture.recordWith(&store, "finite", "one", 0, 100_000_000, ip, one));
+        try store.enableConsumers();
+        try store.enableEffects();
+        try store.enableConsumerManifests();
+        try store.enableConfirmedHistory();
+        try store.enableMaintenance();
+        try store.enableCleanup();
+        try t.expectEqual(@as(i64, 15), store.schema_version);
+        try t.expectError(error.RetryStorageRequired, store.admitRetry("permanent", StoreFixture.generation, permanent));
+        store.fail_at = .before_retry_lease_schema_commit;
+        try t.expectError(error.InjectedFailure, store.enableRetryLeases());
+        try t.expectEqual(@as(i64, 15), store.schema_version);
+        store.fail_at = null;
+        try store.enableRetryLeases();
+        try t.expectEqual(@as(i64, 16), store.schema_version);
+        try t.expectEqualDeep(retry.Lease{ .finite = 160_000_000 }, (try store.retryState("finite", ip)).?.lease);
+        try t.expectEqualDeep(retry.Lease{ .finite = 160_000_000 }, (try store.retryDecision("finite", "file", "one")).?.lease);
+        try store.admitRetry("permanent", StoreFixture.generation, permanent);
+        _ = try store.commitRecord(try StoreFixture.recordWith(&store, "permanent", "two", 0, 100_000_001, ip, permanent));
+        try t.expectEqualDeep(retry.Lease.permanent, (try store.retryState("permanent", ip)).?.lease);
+        try t.expectEqualDeep(retry.Lease.permanent, (try store.retryDecision("permanent", "file", "two")).?.lease);
+    }
+    var reopened = try durable.Store.open(t.allocator, path);
+    defer reopened.close();
+    try reopened.enableReceipts(2);
+    try t.expectEqual(@as(i64, 16), reopened.schema_version);
+    try t.expectEqualDeep(retry.Lease{ .finite = 160_000_000 }, (try reopened.retryState("finite", ip)).?.lease);
+    try t.expectEqualDeep(retry.Lease.permanent, (try reopened.retryState("permanent", ip)).?.lease);
 }
 
 test "native retry: real file sessions retain attempts across restart and commit decision cursor receipt together" {
@@ -270,7 +544,7 @@ test "native retry: real file sessions retain attempts across restart and commit
             try t.expectEqual(@as(usize, 1), try session.poll(1));
             const source = &session.sources.sources.items[0];
             const decision = (try store.retryDecision("ssh", source.source_id, null)).?;
-            try t.expectEqual(clock.now + policy.bantime_us, decision.expiry_us);
+            try t.expectEqualDeep(retry.Lease{ .finite = clock.now + policy.duration.finite_us }, decision.lease);
             try t.expectEqual(@as(u64, 1), decision.ordinal);
             try t.expectEqual(committed_revision + 1, session.pipe.revision);
             try t.expectEqual(@as(usize, 0), try store.pendingReceiptCount());
@@ -281,7 +555,7 @@ test "native retry: real file sessions retain attempts across restart and commit
             try t.expectEqual(@as(usize, 1), try session.poll(1));
             try t.expect(try store.retryDecision("ssh", source.source_id, null) == null);
             const state = (try store.retryState("ssh", ip)).?;
-            try t.expectEqual(decision.expiry_us, state.expiry_us.?);
+            try t.expectEqualDeep(decision.lease, state.lease);
             try t.expectEqual(@as(u64, 1), state.decisions);
             try t.expectEqual(@as(u16, 0), state.count);
         }

@@ -4,9 +4,13 @@ const std = @import("std");
 const t = std.testing;
 const engine = @import("engine");
 const harness = @import("harness.zig");
+const linux = std.os.linux;
 const failure = "Failed password for root from 203.0.113.7 port 22 ssh2";
 
 fn writeConfig(h: *harness.Harness) !void {
+    // The opt-in kernel run executes only its dedicated enforcing scenario;
+    // ordinary daemon cases already run once without firewall mutation.
+    if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") != null) return error.SkipZigTest;
     var file = try std.fs.cwd().createFile(h.config_path, .{ .mode = 0o600 });
     defer file.close();
     try file.writer().print(
@@ -27,6 +31,30 @@ fn writeConfig(h: *harness.Harness) !void {
         \\logpath = ["{s}"]
         \\
     , .{ h.state_path, h.socket_path, h.log_path });
+}
+fn writeEnforcingConfig(h: *harness.Harness) !void {
+    var file = try std.fs.cwd().createFile(h.config_path, .{ .mode = 0o600 });
+    defer file.close();
+    try file.writer().print(
+        \\[global]
+        \\native_ingestion = true
+        \\state_file = "{s}"
+        \\socket_path = "{s}"
+        \\metrics_enabled = false
+        \\firewall = "iptables"
+        \\firewall_namespace = "/proc/{d}/ns/net"
+        \\[defaults]
+        \\enforce = true
+        \\maxretry = 1
+        \\findtime = 600
+        \\bantime = 60
+        \\[jails.sshd]
+        \\filter = "sshd"
+        \\source = "file"
+        \\timestamp = "undated"
+        \\logpath = ["{s}"]
+        \\
+    , .{ h.state_path, h.socket_path, linux.getpid(), h.log_path });
 }
 fn waitStatus(h: *harness.Harness, needle: []const u8) !void {
     var timer = try std.time.Timer.start();
@@ -63,6 +91,48 @@ fn savedDeadline(h: *harness.Harness) !i64 {
     try t.expectEqualStrings("203.0.113.7", parsed.value[0].ip);
     try t.expect(!parsed.value[0].enforced and !parsed.value[0].confirmed);
     return parsed.value[0].expiry_us;
+}
+
+fn expectActionTargets(path: []const u8) !void {
+    var store = try engine.native_store_mod.Store.open(t.allocator, path);
+    defer store.close();
+    var entries: [1]engine.native_effect_mod.Entry = undefined;
+    const page = try store.effectPage(null, null, &entries);
+    try t.expectEqual(@as(usize, 1), page.count);
+    var owners: [1]engine.native_effect_mod.Owner = undefined;
+    try t.expectEqual(@as(usize, 1), try store.effectOwners(entries[0].scope_key, entries[0].revision, &owners));
+    var targets: [engine.native_action_outcome_mod.max_targets_per_action]engine.native_action_outcome_mod.Target = undefined;
+    try t.expectEqual(@as(usize, 2), try store.actionTargets(owners[0].decision_id, &targets));
+    try t.expectEqual(engine.native_action_outcome_mod.Status.confirmed, targets[0].status);
+    try t.expectEqual(engine.native_action_outcome_mod.Status.confirmed, targets[1].status);
+    try t.expectEqual(@as(u64, 1), try store.confirmedEffectEvents());
+}
+
+test "native daemon: enforcing source commits targets before ack and restart does not duplicate outcomes" {
+    if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") == null) return error.SkipZigTest;
+    const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const current = try std.fs.readLinkAbsolute("/proc/self/ns/net", &buffer);
+    try t.expect(!std.mem.eql(u8, prior, current));
+    if (linux.E.init(linux.unshare(linux.CLONE.NEWNET)) != .SUCCESS) return error.IsolationFailed;
+
+    var h = try harness.Harness.init(t.allocator, .{ .spawn_daemon = false });
+    defer h.deinit();
+    try writeEnforcingConfig(&h);
+    try h.startDaemon();
+    try waitStatus(&h, "\"state\":\"enforcing\"");
+    try h.writeLine(failure);
+    try waitStatus(&h, "\"decisions_total\":1");
+    try h.waitForBan(try @import("shared").IpAddress.parse("203.0.113.7"), 8_000);
+    try waitStatus(&h, "\"state\":\"enforcing\"");
+    try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try h.stopDaemon());
+    try expectActionTargets(h.state_path);
+
+    try h.startDaemon();
+    try waitStatus(&h, "\"state\":\"enforcing\"");
+    try waitStatus(&h, "\"decisions_total\":1");
+    try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try h.stopDaemon());
+    try expectActionTargets(h.state_path);
 }
 
 test "native daemon: file retry history and original decision deadline survive graceful and killed restarts" {
@@ -131,25 +201,27 @@ test "native daemon: blocked SQLite writer leaves IPC responsive and resumes exa
     try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try h.stopDaemon());
 }
 
-test "native daemon: unsupported protection refuses before state access and changed generations preserve history" {
+test "native daemon: invalid escalation refuses before state access and changed generations preserve history" {
     var h = try harness.Harness.init(t.allocator, .{ .spawn_daemon = false });
     defer h.deinit();
     try writeConfig(&h);
     const original = try std.fs.cwd().readFileAlloc(t.allocator, h.config_path, 8192);
     defer t.allocator.free(original);
-    // Constant enforcement has its own isolated-kernel suite. Escalation remains
-    // unsupported and must still refuse before creating or migrating state.
-    const unsupported = try std.mem.replaceOwned(u8, t.allocator, original, "banaction = \"log-only\"", "banaction = \"log-only\"\nbantime_increment_enabled = true");
+    // Permanent leases cannot be multiplied; reject that unsupported pairing
+    // before creating state, then prove finite escalation reaches admission.
+    const unsupported = try std.mem.replaceOwned(u8, t.allocator, original, "bantime = 60", "bantime = \"permanent\"\nbantime_increment_enabled = true");
     defer t.allocator.free(unsupported);
     try std.fs.cwd().writeFile(.{ .sub_path = h.config_path, .data = unsupported });
     try t.expectError(error.DaemonUnavailable, h.startDaemon());
     try t.expectError(error.FileNotFound, std.fs.cwd().access(h.state_path, .{}));
-    try writeConfig(&h);
+    const supported = try std.mem.replaceOwned(u8, t.allocator, original, "banaction = \"log-only\"", "banaction = \"log-only\"\nbantime_increment_enabled = true");
+    defer t.allocator.free(supported);
+    try std.fs.cwd().writeFile(.{ .sub_path = h.config_path, .data = supported });
     try h.startDaemon();
     try h.writeLine(failure);
     try waitRevision(&h, 2);
     _ = try h.stopDaemon();
-    const changed = try std.mem.replaceOwned(u8, t.allocator, original, "maxretry = 3", "maxretry = 2");
+    const changed = try std.mem.replaceOwned(u8, t.allocator, supported, "maxretry = 3", "maxretry = 2");
     defer t.allocator.free(changed);
     try std.fs.cwd().writeFile(.{ .sub_path = h.config_path, .data = changed });
     try t.expectError(error.DaemonUnavailable, h.startDaemon());
@@ -157,6 +229,41 @@ test "native daemon: unsupported protection refuses before state access and chan
     defer store.close();
     try t.expectEqual(@as(u64, 2), try store.revision("sshd"));
     try t.expectEqual(@as(u16, 1), (try store.retryState("sshd", .{ .v4 = .{ 203, 0, 113, 7 } })).?.count);
+}
+
+test "native daemon: only explicit recidive may use the bounded internal source" {
+    var h = try harness.Harness.init(t.allocator, .{ .spawn_daemon = false });
+    defer h.deinit();
+    try writeConfig(&h);
+    const original = try std.fs.cwd().readFileAlloc(t.allocator, h.config_path, 8192);
+    defer t.allocator.free(original);
+    const invalid = try std.mem.replaceOwned(u8, t.allocator, original, "source = \"file\"", "source = \"internal\"");
+    defer t.allocator.free(invalid);
+    try std.fs.cwd().writeFile(.{ .sub_path = h.config_path, .data = invalid });
+    try t.expectError(error.DaemonUnavailable, h.startDaemon());
+    try t.expectError(error.FileNotFound, std.fs.cwd().access(h.state_path, .{}));
+
+    {
+        var file = try std.fs.cwd().createFile(h.config_path, .{ .mode = 0o600 });
+        defer file.close();
+        try file.writeAll(original);
+        try file.writeAll(
+            \\[jails.recidive]
+            \\filter = "recidive"
+            \\source = "internal"
+            \\maxretry = 2
+            \\findtime = 86400
+            \\bantime = 3600
+            \\
+        );
+    }
+    try h.startDaemon();
+    try waitStatus(&h, "\"state\":\"log-only\"");
+    const jails = try h.sendCommand(.{ .list_jails = {} });
+    defer t.allocator.free(jails);
+    try t.expect(std.mem.indexOf(u8, jails, "\"name\":\"recidive\"") != null);
+    try t.expect(std.mem.indexOf(u8, jails, "\"source\":\"internal\"") != null);
+    try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try h.stopDaemon());
 }
 
 test "native daemon: malformed source isolates its jail while independent file decisions continue" {

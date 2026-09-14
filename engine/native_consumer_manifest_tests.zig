@@ -186,7 +186,7 @@ test "native consumer manifest: exact batch required keys formats and source gen
 }
 
 const identity = durable.ReceiptIdentity{ .jail = "fixture", .source = "file", .occurrence = "1", .cursor = "1", .raw_hash = [_]u8{1} ** 32, .generation = [_]u8{1} ** 32 };
-const policy = retry.Policy{ .maxretry = 1, .window_us = 1000, .bantime_us = 400, .max_subjects = 32, .enforce = true };
+const policy = retry.Policy{ .maxretry = 1, .window_us = 1000, .duration = .{ .finite_us = 400 }, .max_subjects = 32, .enforce = true };
 fn candidate(last: u8) !detection.Outcome {
     return .{ .kind = .candidate, .generation = identity.generation, .filter = try detection.Name.init("dns-login"), .pattern = try detection.Name.init("failure"), .pattern_index = 0, .subject = .{ .v4 = .{ 192, 0, 2, last } } };
 }
@@ -231,7 +231,7 @@ test "native consumer manifest: sixteen subjects retry effects and receipt commi
     try t.expectError(error.AmbiguousNativeDetection, f.store.nativeDetection("fixture", "file", null));
     try t.expectError(error.AmbiguousRetryDecision, f.store.retryDecision("fixture", "file", null));
     try t.expectError(error.ConsumerCapacity, f.store.nativeDetections("fixture", "file", null, decoded[0..15]));
-    for (decisions) |decision| try t.expectEqual(@as(i64, 500), decision.expiry_us);
+    for (decisions) |decision| try t.expectEqual(@as(i64, 500), decision.lease.finite);
     var entries: [16]effects.Entry = undefined;
     try t.expectEqual(@as(usize, 16), (try f.store.effectPage(null, null, &entries)).count);
     try t.expectEqual(@as(usize, 0), try f.store.pendingReceiptCount());
@@ -270,7 +270,7 @@ test "native consumer manifest: schema migration preserves scalar detection retr
     f.store.fail_at = null;
     try f.store.enableConsumerManifests();
     try t.expectEqualDeep(input.native_detection.?, (try f.store.nativeDetection("fixture", "file", null)).?);
-    try t.expectEqual(@as(i64, 500), (try f.store.retryDecision("fixture", "file", null)).?.expiry_us);
+    try t.expectEqual(@as(i64, 500), (try f.store.retryDecision("fixture", "file", null)).?.lease.finite);
     try t.expectError(error.ConsumerMigrationRequired, f.store.admitConsumerManifest(manifest, .first_use));
 }
 
@@ -496,7 +496,7 @@ test "native consumer manifest: all-jail generation preflight refuses before fre
     var f = try Fixture.init();
     defer f.deinit();
     try f.store.enableConsumerManifests();
-    const startup_policy = retry.Policy{ .maxretry = 2, .window_us = 1000, .bantime_us = 1000, .max_subjects = 8 };
+    const startup_policy = retry.Policy{ .maxretry = 2, .window_us = 1000, .duration = .{ .finite_us = 1000 }, .max_subjects = 8 };
     const retained = [_]u8{7} ** 32;
     const changed = [_]u8{8} ** 32;
     try f.store.admitRetry("retained", retained, startup_policy);
@@ -526,7 +526,7 @@ test "native consumer manifest: generation preflight rejects unconfigured or cha
     var f = try Fixture.init();
     defer f.deinit();
     try f.store.enableConsumerManifests();
-    const startup_policy = retry.Policy{ .maxretry = 2, .window_us = 1000, .bantime_us = 1000, .max_subjects = 8 };
+    const startup_policy = retry.Policy{ .maxretry = 2, .window_us = 1000, .duration = .{ .finite_us = 1000 }, .max_subjects = 8 };
     try f.store.admitConsumerManifest(manifest, .first_use);
     const binding = durable.Store.RuntimeAdmission{ .jail = "fixture", .generation = manifest.source_generation, .policy = startup_policy, .custom = true };
     try f.store.validateRuntimeAdmissions(&.{binding}, null);

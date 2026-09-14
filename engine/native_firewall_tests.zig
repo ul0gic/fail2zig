@@ -365,7 +365,99 @@ test "native firewall: isolated denied admission leaves kernel unchanged" {
 }
 
 fn effectToken(reader: *const inspection.Inspector, v6: bool, operation: inspection.EffectOperation) !inspection.DispatchToken {
-    return .{ .installation = reader.installation, .effect_id = [_]u8{0x71} ** 32, .aggregate_revision = 1, .scope = .{ .address = try @import("shared").IpAddress.parse(if (v6) "2001:db8::7" else "192.0.2.7"), .prefix = if (v6) 128 else 32 }, .operation = operation };
+    return .{ .installation = reader.installation, .effect_id = [_]u8{0x71} ** 32, .aggregate_revision = 1, .scope = .{ .subject = inspection.canonical_scope.Subject.host(try @import("shared").IpAddress.parse(if (v6) "2001:db8::7" else "192.0.2.7")) }, .operation = operation };
+}
+
+fn scopedEffectToken(reader: *const inspection.Inspector, identity: u8, scope: inspection.CanonicalScope, operation: inspection.EffectOperation) inspection.DispatchToken {
+    return .{ .installation = reader.installation, .effect_id = [_]u8{identity} ** 32, .aggregate_revision = 1, .scope = scope, .operation = operation };
+}
+
+test "native firewall: nft scoped rule builder covers bounded network protocol and port parts" {
+    const canonical = inspection.canonical_scope;
+    const scopes = [_]canonical.Scope{
+        .{
+            .subject = try canonical.Subject.parseNetwork("2001:db8:1::/64"),
+            .protocols = try canonical.Protocols.one(.tcp),
+            .ports = try canonical.Ports.list(&.{canonical.PortRange.one(443)}),
+        },
+        .{
+            .subject = try canonical.Subject.parseNetwork("198.51.100.0/24"),
+            .protocols = try canonical.Protocols.one(.udp),
+            .ports = try canonical.Ports.list(&.{ canonical.PortRange.one(53), .{ .first = 8000, .last = 8010 } }),
+        },
+        .{
+            .subject = canonical.Subject.host(try @import("shared").IpAddress.parse("2001:db8::7")),
+            .protocols = try canonical.Protocols.one(.icmp_v6),
+        },
+    };
+    const expected_parts = [_]usize{ 1, 2, 1 };
+    const userdata = [_]u8{0x5a} ** 144;
+    for (scopes, expected_parts) |scope, expected| {
+        try std.testing.expectEqual(expected, try nft.scopeRulePartCount(scope));
+        for (0..expected) |part| {
+            var first_buf: [2048]u8 align(4) = undefined;
+            var second_buf: [2048]u8 align(4) = undefined;
+            const first_payload = try nft.buildScopedDropRulePayload(&first_buf, "f2z_scope", "input", scope, part, &userdata);
+            const second_payload = try nft.buildScopedDropRulePayload(&second_buf, "f2z_scope", "input", scope, part, &userdata);
+            try std.testing.expectEqualSlices(u8, first_payload, second_payload);
+            try std.testing.expect(first_payload.len > userdata.len);
+        }
+        var invalid_buf: [2048]u8 align(4) = undefined;
+        try std.testing.expectError(error.InvalidRulePart, nft.buildScopedDropRulePayload(&invalid_buf, "f2z_scope", "input", scope, expected, &userdata));
+    }
+}
+
+test "native firewall: scoped rule metadata is canonical bounded and rejects malformed identity" {
+    const canonical = inspection.canonical_scope;
+    const scope = canonical.Scope{
+        .subject = try canonical.Subject.parseNetwork("198.51.100.0/24"),
+        .protocols = try canonical.Protocols.one(.udp),
+        .ports = try canonical.Ports.list(&.{ canonical.PortRange.one(35271), .{ .first = 35280, .last = 35282 } }),
+    };
+    const metadata = inspection.ScopedRuleMetadata{
+        .effect_id = [_]u8{0x6a} ** 32,
+        .part = 1,
+        .count = 2,
+        .deadline_us = 9_000_000,
+        .scope = scope,
+    };
+    const wire = try metadata.encode();
+    try std.testing.expectEqualDeep(metadata, try inspection.ScopedRuleMetadata.decode(&wire));
+    try std.testing.expectError(error.UnknownState, inspection.ScopedRuleMetadata.decode(wire[0 .. wire.len - 1]));
+    for ([_]usize{ 4, 5, 6, 7, 48, 49, 50, 63 }) |index| {
+        var malformed = wire;
+        malformed[index] +%= 1;
+        try std.testing.expectError(error.UnknownState, inspection.ScopedRuleMetadata.decode(&malformed));
+    }
+    var unused_deadline = inspection.ScopedRuleMetadata{
+        .effect_id = [_]u8{0x6b} ** 32,
+        .part = 0,
+        .count = 2,
+        .deadline_us = null,
+        .scope = scope,
+    };
+    var noncanonical = try unused_deadline.encode();
+    noncanonical[40] = 1;
+    try std.testing.expectError(error.UnknownState, inspection.ScopedRuleMetadata.decode(&noncanonical));
+    unused_deadline.effect_id = [_]u8{0} ** 32;
+    try std.testing.expectError(error.UnsupportedScope, unused_deadline.encode());
+    unused_deadline.effect_id = [_]u8{0x6b} ** 32;
+    unused_deadline.deadline_us = -1;
+    try std.testing.expectError(error.UnsupportedDeadline, unused_deadline.encode());
+}
+
+test "native firewall: richer scope never falls back when selected fixed-argv tool is missing" {
+    var reader = try admissionReader(.ipset);
+    reader.ipset_path = "/nonexistent/fail2zig-fixture-ipset";
+    reader.iptables_path = "/nonexistent/fail2zig-fixture-iptables";
+    defer reader.close();
+    const canonical = inspection.canonical_scope;
+    const scope = canonical.Scope{
+        .subject = try canonical.Subject.parseNetwork("198.51.100.0/24"),
+        .protocols = try canonical.Protocols.one(.udp),
+        .ports = try canonical.Ports.list(&.{canonical.PortRange.one(35271)}),
+    };
+    try std.testing.expectError(error.ToolUnavailable, reader.applyExact(scopedEffectToken(&reader, 0x6c, scope, .{ .ensure_present = .permanent }), .{ .wall_us = 100 }));
 }
 fn applyVerified(reader: *inspection.Inspector, token: inspection.DispatchToken) !inspection.EffectResult {
     var result = try reader.applyExact(token, .{ .wall_us = std.time.microTimestamp() });
@@ -384,9 +476,9 @@ test "native firewall: exact intent rejects invalid scope expired deadline and o
     try std.testing.expectError(error.ExpiredIntent, reader.applyExact(token, .{ .wall_us = 100 }));
     token.operation = .{ .ensure_present = .{ .finite_deadline_us = std.math.maxInt(i64) } };
     try std.testing.expectError(error.UnsupportedDeadline, reader.applyExact(token, .{ .wall_us = 100 }));
-    token.scope.prefix = 24;
+    token.scope.subject.prefix = 24;
     try std.testing.expectError(error.UnsupportedScope, reader.applyExact(token, .{ .wall_us = 100 }));
-    token.scope.prefix = 32;
+    token.scope.subject.prefix = 32;
     token.aggregate_revision = 0;
     try std.testing.expectError(error.InvalidInstallation, reader.applyExact(token, .{ .wall_us = 100 }));
 }
@@ -473,7 +565,7 @@ test "native firewall: isolated finite retry retains original deadline and expir
         release.deinit();
     }
 }
-test "native firewall: isolated fresh authority refuses reserved objects across transports" {
+test "native firewall: isolated fresh authority inspects selected transport without unrelated tools" {
     _ = try isolatedTransport();
     var reader = try admissionReader(.nftables);
     try reader.inspectReservedNamespace();
@@ -486,23 +578,24 @@ test "native firewall: isolated fresh authority refuses reserved objects across 
     try fixtureCommand(&.{ reader.ip6tables_path, "-t", "mangle", "-N", "fail2zig-old" });
     try std.testing.expectError(error.ForeignState, reader.inspectReservedNamespace());
     try fixtureCommand(&.{ reader.ip6tables_path, "-t", "mangle", "-X", "fail2zig-old" });
-    try fixtureCommand(&.{ reader.ipset_path, "create", "fail2zig-lost", "hash:ip" });
-    try std.testing.expectError(error.ForeignState, reader.inspectReservedNamespace());
-    try fixtureCommand(&.{ reader.ipset_path, "destroy", "fail2zig-lost" });
-    try reader.inspectReservedNamespace();
-    try fixtureCommand(&.{ "/usr/sbin/iptables-legacy", "-t", "mangle", "-N", "fail2zig-old" });
-    try std.testing.expectError(error.ForeignState, reader.inspectReservedNamespace());
-    try fixtureCommand(&.{ "/usr/sbin/iptables-legacy", "-t", "mangle", "-X", "fail2zig-old" });
-    try reader.inspectReservedNamespace();
     reader.ipset_path = "/not/a/tool";
-    try std.testing.expectError(error.ToolUnavailable, reader.inspectReservedNamespace());
+    reader.iptables_legacy_save_path = "/not/a/tool";
+    reader.ip6tables_legacy_save_path = "/not/a/tool";
+    try reader.inspectReservedNamespace();
+
+    var fixed = try admissionReader(.iptables);
+    fixed.ipset_path = "/not/a/tool";
+    try fixed.inspectReservedNamespace();
+
+    var sets = try admissionReader(.ipset);
+    sets.ipset_path = "/not/a/tool";
+    try std.testing.expectError(error.ToolUnavailable, sets.inspectReservedNamespace());
 }
 
 const PacketPeer = struct {
     pid: std.posix.pid_t,
     control: std.posix.fd_t,
     ready: std.posix.fd_t,
-    receivers: [2]std.posix.fd_t,
     fn init() !PacketPeer {
         const control = try std.posix.pipe2(.{ .CLOEXEC = true });
         var parent_only = false;
@@ -540,23 +633,24 @@ const PacketPeer = struct {
         try configurePeerInterface("target0", "192.0.2.1/24", "2001:db8::1/64");
         try std.testing.expectEqual(@as(usize, 1), try std.posix.write(control[1], &.{1}));
         try expectPipeByte(ready[0], 2);
-        var receivers: [2]std.posix.fd_t = undefined;
-        receivers[0] = try packetSocket(false, "192.0.2.1", 35271);
-        errdefer std.posix.close(receivers[0]);
-        receivers[1] = try packetSocket(true, "2001:db8::1", 35271);
-        return .{ .pid = pid, .control = control[1], .ready = ready[0], .receivers = receivers };
+        return .{ .pid = pid, .control = control[1], .ready = ready[0] };
     }
     fn deinit(self: *PacketPeer) void {
         std.posix.close(self.control);
         std.posix.close(self.ready);
-        for (self.receivers) |fd| std.posix.close(fd);
         _ = std.posix.waitpid(self.pid, 0);
     }
     fn exchange(self: *PacketPeer, v6: bool, sequence: u8, delivered: bool) !void {
-        try std.testing.expectEqual(@as(usize, 2), try std.posix.write(self.control, &.{ if (v6) @as(u8, 6) else 4, sequence }));
+        try self.exchangeUdp(v6, 35271, sequence, delivered);
+    }
+    fn exchangeUdp(self: *PacketPeer, v6: bool, port: u16, sequence: u8, delivered: bool) !void {
+        const receiver = try packetSocket(v6, if (v6) "2001:db8::1" else "192.0.2.1", port);
+        defer std.posix.close(receiver);
+        try self.send(.udp, v6, port, sequence);
         try expectPipeByte(self.ready, sequence);
-        var fds = [_]std.posix.pollfd{.{ .fd = self.receivers[@intFromBool(v6)], .events = std.posix.POLL.IN, .revents = 0 }};
+        var fds = [_]std.posix.pollfd{.{ .fd = receiver, .events = std.posix.POLL.IN, .revents = 0 }};
         const count = try std.posix.poll(&fds, if (delivered) 1500 else 150);
+        if (count != @intFromBool(delivered)) std.debug.print("udp packet mismatch: v6={} port={d} sequence={d} expected={} count={d}\n", .{ v6, port, sequence, delivered, count });
         try std.testing.expectEqual(@as(usize, @intFromBool(delivered)), count);
         if (delivered) {
             var byte: [16]u8 = undefined;
@@ -564,6 +658,32 @@ const PacketPeer = struct {
             try std.testing.expectEqual(@as(usize, 1), length);
             try std.testing.expectEqual(sequence, byte[0]);
         }
+    }
+    fn exchangeTcp(self: *PacketPeer, v6: bool, port: u16, sequence: u8, delivered: bool) !void {
+        const listener = try tcpListener(v6, if (v6) "2001:db8::1" else "192.0.2.1", port);
+        defer std.posix.close(listener);
+        try self.send(.tcp, v6, port, sequence);
+        try expectPipeByte(self.ready, sequence);
+        var fds = [_]std.posix.pollfd{.{ .fd = listener, .events = std.posix.POLL.IN, .revents = 0 }};
+        const count = try std.posix.poll(&fds, if (delivered) 1500 else 150);
+        if (count != @intFromBool(delivered)) std.debug.print("tcp packet mismatch: v6={} port={d} sequence={d} expected={} count={d}\n", .{ v6, port, sequence, delivered, count });
+        try std.testing.expectEqual(@as(usize, @intFromBool(delivered)), count);
+    }
+    fn exchangeIcmpV6(self: *PacketPeer, sequence: u8, delivered: bool) !void {
+        const receiver = try std.posix.socket(std.posix.AF.INET6, std.posix.SOCK.RAW | std.posix.SOCK.CLOEXEC, 58);
+        defer std.posix.close(receiver);
+        const address = try std.net.Address.parseIp("2001:db8::1", 0);
+        try std.posix.bind(receiver, &address.any, address.getOsSockLen());
+        try self.send(.icmp_v6, true, 0, sequence);
+        try expectPipeByte(self.ready, sequence);
+        var fds = [_]std.posix.pollfd{.{ .fd = receiver, .events = std.posix.POLL.IN, .revents = 0 }};
+        const count = try std.posix.poll(&fds, if (delivered) 1500 else 150);
+        if (count != @intFromBool(delivered)) std.debug.print("icmpv6 packet mismatch: sequence={d} expected={} count={d}\n", .{ sequence, delivered, count });
+        try std.testing.expectEqual(@as(usize, @intFromBool(delivered)), count);
+    }
+    const Kind = enum(u8) { udp = 1, tcp = 2, icmp_v6 = 3 };
+    fn send(self: *PacketPeer, kind: Kind, v6: bool, port: u16, sequence: u8) !void {
+        try std.testing.expectEqual(@as(usize, 5), try std.posix.write(self.control, &.{ @intFromEnum(kind), @intFromBool(v6), sequence, @intCast(port >> 8), @truncate(port) }));
     }
 };
 fn expectPipeByte(fd: std.posix.fd_t, expected: u8) !void {
@@ -585,22 +705,56 @@ fn packetSocket(v6: bool, host: []const u8, port: u16) !std.posix.fd_t {
     try std.posix.bind(fd, &address.any, address.getOsSockLen());
     return fd;
 }
+fn tcpListener(v6: bool, host: []const u8, port: u16) !std.posix.fd_t {
+    const fd = try std.posix.socket(if (v6) std.posix.AF.INET6 else std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+    errdefer std.posix.close(fd);
+    const address = try std.net.Address.parseIp(host, port);
+    try std.posix.bind(fd, &address.any, address.getOsSockLen());
+    try std.posix.listen(fd, 1);
+    return fd;
+}
 fn packetPeerChild(control: std.posix.fd_t, ready: std.posix.fd_t) !void {
     if (linux.E.init(linux.unshare(linux.CLONE.NEWNET)) != .SUCCESS) return error.IsolationFailed;
     _ = try std.posix.write(ready, &.{1});
     try expectPipeByte(control, 1);
     try configurePeerInterface("peer0", "192.0.2.7/24", "2001:db8::7/64");
     const senders = [_]std.posix.fd_t{ try packetSocket(false, "192.0.2.7", 0), try packetSocket(true, "2001:db8::7", 0) };
+    defer for (senders) |fd| std.posix.close(fd);
     _ = try std.posix.write(ready, &.{2});
     while (true) {
-        var bytes: [2]u8 = undefined;
+        var bytes: [5]u8 = undefined;
         const count = try std.posix.read(control, &bytes);
         if (count == 0) return;
-        if (count != 2) return error.PeerProtocol;
-        const v6 = bytes[0] == 6;
-        const target = try std.net.Address.parseIp(if (v6) "2001:db8::1" else "192.0.2.1", 35271);
-        _ = try std.posix.sendto(senders[@intFromBool(v6)], bytes[1..2], 0, &target.any, target.getOsSockLen());
-        _ = try std.posix.write(ready, bytes[1..2]);
+        if (count != bytes.len) return error.PeerProtocol;
+        const kind = std.meta.intToEnum(PacketPeer.Kind, bytes[0]) catch return error.PeerProtocol;
+        const v6 = bytes[1] == 1;
+        if (!v6 and bytes[1] != 0) return error.PeerProtocol;
+        const port = (@as(u16, bytes[3]) << 8) | bytes[4];
+        const target = try std.net.Address.parseIp(if (v6) "2001:db8::1" else "192.0.2.1", port);
+        switch (kind) {
+            .udp => _ = try std.posix.sendto(senders[@intFromBool(v6)], bytes[2..3], 0, &target.any, target.getOsSockLen()),
+            .tcp => {
+                const fd = try std.posix.socket(if (v6) std.posix.AF.INET6 else std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK, 0);
+                defer std.posix.close(fd);
+                const source = try std.net.Address.parseIp(if (v6) "2001:db8::7" else "192.0.2.7", 0);
+                try std.posix.bind(fd, &source.any, source.getOsSockLen());
+                std.posix.connect(fd, &target.any, target.getOsSockLen()) catch |err| switch (err) {
+                    error.WouldBlock => {},
+                    else => return err,
+                };
+            },
+            .icmp_v6 => {
+                if (!v6 or port != 0) return error.PeerProtocol;
+                const fd = try std.posix.socket(std.posix.AF.INET6, std.posix.SOCK.RAW | std.posix.SOCK.CLOEXEC, 58);
+                defer std.posix.close(fd);
+                const source = try std.net.Address.parseIp("2001:db8::7", 0);
+                try std.posix.bind(fd, &source.any, source.getOsSockLen());
+                const request = [_]u8{ 128, 0, 0, 0, 0, bytes[2], 0, bytes[2] };
+                _ = try std.posix.sendto(fd, &request, 0, &target.any, target.getOsSockLen());
+            },
+        }
+        _ = try std.posix.write(ready, bytes[2..3]);
+        if (kind == .tcp) std.Thread.sleep(300 * std.time.ns_per_ms);
     }
 }
 test "native firewall: isolated benign namespace peer packets verify IPv4 IPv6 exact drop and release" {
@@ -627,6 +781,237 @@ test "native firewall: isolated benign namespace peer packets verify IPv4 IPv6 e
     var release6 = try applyVerified(&reader, try effectToken(&reader, true, .ensure_absent));
     release6.deinit();
     try peer.exchange(true, 18, true);
+}
+
+test "native firewall: isolated nftables realizes the frozen scoped packet cells and recovers uncertainty" {
+    if (try isolatedTransport() != .nftables) return error.SkipZigTest;
+    var reader = try admissionReader(.nftables);
+    defer reader.close();
+    var admitted = try reader.admitInstallation(intentFor(&reader));
+    defer admitted.deinit();
+    try std.testing.expect(admitted == .installed);
+    var peer = try PacketPeer.init();
+    defer peer.deinit();
+    const canonical = inspection.canonical_scope;
+
+    // Cell 1: the migrated host/all/all representation keeps its kernel timer.
+    const host_deadline = std.time.microTimestamp() + 1_500_000;
+    const host = try effectToken(&reader, false, .{ .ensure_present = .{ .finite_deadline_us = host_deadline } });
+    var host_applied = try applyVerified(&reader, host);
+    host_applied.deinit();
+    try peer.exchangeUdp(false, 35271, 40, false);
+    const host_wait = host_deadline + 100_000 - std.time.microTimestamp();
+    if (host_wait > 0) std.Thread.sleep(@as(u64, @intCast(host_wait)) * std.time.ns_per_us);
+    try peer.exchangeUdp(false, 35271, 41, true);
+
+    // Cell 2: an IPv6 network matches only TCP/443 and remains idempotent.
+    const network_tcp = canonical.Scope{
+        .subject = try canonical.Subject.parseNetwork("2001:db8::/64"),
+        .protocols = try canonical.Protocols.one(.tcp),
+        .ports = try canonical.Ports.list(&.{canonical.PortRange.one(443)}),
+    };
+    const network_tcp_token = scopedEffectToken(&reader, 0x72, network_tcp, .{ .ensure_present = .permanent });
+    try peer.exchangeTcp(true, 443, 42, true);
+    var network_tcp_applied = try applyVerified(&reader, network_tcp_token);
+    network_tcp_applied.deinit();
+    try peer.exchangeTcp(true, 443, 43, false);
+    try peer.exchangeTcp(true, 444, 44, true);
+    var network_tcp_duplicate = try applyVerified(&reader, network_tcp_token);
+    defer network_tcp_duplicate.deinit();
+    try std.testing.expect(!network_tcp_duplicate.verified.changed);
+
+    // Cell 3: a finite multi-port network coexists with a non-equivalent
+    // same-subject scope; removing one cannot broaden or remove the other.
+    const network_udp = canonical.Scope{
+        .subject = try canonical.Subject.parseNetwork("192.0.2.0/24"),
+        .protocols = try canonical.Protocols.one(.udp),
+        .ports = try canonical.Ports.list(&.{ canonical.PortRange.one(35271), .{ .first = 35280, .last = 35282 } }),
+    };
+    const udp_deadline = std.time.microTimestamp() + 30 * std.time.us_per_s;
+    const network_udp_token = scopedEffectToken(&reader, 0x73, network_udp, .{ .ensure_present = .{ .finite_deadline_us = udp_deadline } });
+    var network_udp_applied = try applyVerified(&reader, network_udp_token);
+    network_udp_applied.deinit();
+    try peer.exchangeUdp(false, 35271, 45, false);
+    try peer.exchangeUdp(false, 35281, 46, false);
+    try peer.exchangeUdp(false, 35272, 47, true);
+    const neighbor_udp = canonical.Scope{
+        .subject = network_udp.subject,
+        .protocols = try canonical.Protocols.one(.udp),
+        .ports = try canonical.Ports.list(&.{canonical.PortRange.one(35272)}),
+    };
+    const neighbor_udp_token = scopedEffectToken(&reader, 0x74, neighbor_udp, .{ .ensure_present = .permanent });
+    var neighbor_applied = try applyVerified(&reader, neighbor_udp_token);
+    neighbor_applied.deinit();
+    try peer.exchangeUdp(false, 35272, 48, false);
+    var neighbor_removed = try applyVerified(&reader, scopedEffectToken(&reader, 0x74, neighbor_udp, .ensure_absent));
+    neighbor_removed.deinit();
+    try peer.exchangeUdp(false, 35272, 49, true);
+    try peer.exchangeUdp(false, 35281, 50, false);
+
+    // A new inspector proves restart/readback identity before the remaining
+    // cell injects a post-ack uncertainty.
+    var reopened = try admissionReader(.nftables);
+    defer reopened.close();
+    var tcp_observed = try reopened.observeExact(network_tcp_token, .{ .wall_us = std.time.microTimestamp() });
+    defer tcp_observed.deinit();
+    try std.testing.expect(tcp_observed.matches_desired);
+    var udp_observed = try reopened.observeExact(network_udp_token, .{ .wall_us = std.time.microTimestamp() });
+    defer udp_observed.deinit();
+    try std.testing.expect(udp_observed.matches_desired);
+
+    // Cell 4: ICMPv6 is distinct from UDP/TCP. The injected timeout occurs
+    // after the atomic netlink batch; exact readback resolves it without a
+    // duplicate mutation.
+    const icmp_v6 = canonical.Scope{
+        .subject = try canonical.Subject.parseHost("2001:db8::7"),
+        .protocols = try canonical.Protocols.one(.icmp_v6),
+    };
+    const icmp_finite = scopedEffectToken(&reader, 0x75, icmp_v6, .{ .ensure_present = .{ .finite_deadline_us = std.time.microTimestamp() + 30 * std.time.us_per_s } });
+    const icmp_token = scopedEffectToken(&reader, 0x75, icmp_v6, .{ .ensure_present = .permanent });
+    try peer.exchangeIcmpV6(54, true);
+    var finite_icmp_applied = try applyVerified(&reader, icmp_finite);
+    finite_icmp_applied.deinit();
+    try peer.exchangeIcmpV6(55, false);
+    reader.test_fault_after_mutations = 1;
+    var uncertain = try reader.applyExact(icmp_token, .{ .wall_us = std.time.microTimestamp() });
+    defer uncertain.deinit();
+    try std.testing.expect(uncertain == .uncertain);
+    try std.testing.expectEqual(error.Timeout, uncertain.uncertain);
+    reader.test_fault_after_mutations = null;
+    try peer.exchangeIcmpV6(56, false);
+    try peer.exchangeUdp(true, 35271, 51, true);
+    var recovered = try applyVerified(&reader, icmp_token);
+    defer recovered.deinit();
+    try std.testing.expect(!recovered.verified.changed);
+
+    var remove_icmp = try applyVerified(&reader, scopedEffectToken(&reader, 0x75, icmp_v6, .ensure_absent));
+    remove_icmp.deinit();
+    try peer.exchangeIcmpV6(57, true);
+    var remove_udp = try applyVerified(&reader, scopedEffectToken(&reader, 0x73, network_udp, .ensure_absent));
+    remove_udp.deinit();
+    try peer.exchangeUdp(false, 35281, 52, true);
+    var remove_tcp = try applyVerified(&reader, scopedEffectToken(&reader, 0x72, network_tcp, .ensure_absent));
+    remove_tcp.deinit();
+    try peer.exchangeTcp(true, 443, 53, true);
+}
+
+test "native firewall: isolated fixed argv realizes the frozen scoped packet cells and exposes partial writes" {
+    const transport = try isolatedTransport();
+    if (transport == .nftables) return error.SkipZigTest;
+    var reader = try admissionReader(transport);
+    defer reader.close();
+    var admitted = try reader.admitInstallation(intentFor(&reader));
+    defer admitted.deinit();
+    try std.testing.expect(admitted == .installed);
+    var peer = try PacketPeer.init();
+    defer peer.deinit();
+    const canonical = inspection.canonical_scope;
+
+    const host_deadline = std.time.microTimestamp() + 1_500_000;
+    const host = try effectToken(&reader, false, .{ .ensure_present = .{ .finite_deadline_us = host_deadline } });
+    var host_applied = try applyVerified(&reader, host);
+    host_applied.deinit();
+    try peer.exchangeUdp(false, 35271, 60, false);
+    const host_wait = host_deadline + (if (transport == .ipset) @as(i64, 1_100_000) else 100_000) - std.time.microTimestamp();
+    if (host_wait > 0) std.Thread.sleep(@as(u64, @intCast(host_wait)) * std.time.ns_per_us);
+    try peer.exchangeUdp(false, 35271, 61, transport == .ipset);
+    var host_removed = try applyVerified(&reader, try effectToken(&reader, false, .ensure_absent));
+    host_removed.deinit();
+    try peer.exchangeUdp(false, 35271, 62, true);
+
+    const network_tcp = canonical.Scope{
+        .subject = try canonical.Subject.parseNetwork("2001:db8::/64"),
+        .protocols = try canonical.Protocols.one(.tcp),
+        .ports = try canonical.Ports.list(&.{canonical.PortRange.one(443)}),
+    };
+    const network_tcp_token = scopedEffectToken(&reader, 0x82, network_tcp, .{ .ensure_present = .permanent });
+    var network_tcp_applied = try applyVerified(&reader, network_tcp_token);
+    network_tcp_applied.deinit();
+    try peer.exchangeTcp(true, 443, 63, false);
+    try peer.exchangeTcp(true, 444, 64, true);
+    var network_tcp_duplicate = try applyVerified(&reader, network_tcp_token);
+    defer network_tcp_duplicate.deinit();
+    try std.testing.expect(!network_tcp_duplicate.verified.changed);
+
+    const network_udp = canonical.Scope{
+        .subject = try canonical.Subject.parseNetwork("192.0.2.0/24"),
+        .protocols = try canonical.Protocols.one(.udp),
+        .ports = try canonical.Ports.list(&.{ canonical.PortRange.one(35271), .{ .first = 35280, .last = 35282 } }),
+    };
+    const network_udp_token = scopedEffectToken(&reader, 0x83, network_udp, .{ .ensure_present = .{ .finite_deadline_us = std.time.microTimestamp() + 30 * std.time.us_per_s } });
+    var network_udp_applied = try applyVerified(&reader, network_udp_token);
+    network_udp_applied.deinit();
+    try peer.exchangeUdp(false, 35271, 65, false);
+    try peer.exchangeUdp(false, 35281, 66, false);
+    try peer.exchangeUdp(false, 35272, 67, true);
+    const neighbor_udp = canonical.Scope{
+        .subject = network_udp.subject,
+        .protocols = try canonical.Protocols.one(.udp),
+        .ports = try canonical.Ports.list(&.{canonical.PortRange.one(35272)}),
+    };
+    var neighbor_applied = try applyVerified(&reader, scopedEffectToken(&reader, 0x84, neighbor_udp, .{ .ensure_present = .permanent }));
+    neighbor_applied.deinit();
+    try peer.exchangeUdp(false, 35272, 68, false);
+    var neighbor_removed = try applyVerified(&reader, scopedEffectToken(&reader, 0x84, neighbor_udp, .ensure_absent));
+    neighbor_removed.deinit();
+    try peer.exchangeUdp(false, 35272, 69, true);
+    try peer.exchangeUdp(false, 35281, 70, false);
+
+    var reopened = try admissionReader(transport);
+    defer reopened.close();
+    var tcp_observed = try reopened.observeExact(network_tcp_token, .{ .wall_us = std.time.microTimestamp() });
+    defer tcp_observed.deinit();
+    try std.testing.expect(tcp_observed.matches_desired);
+    var udp_observed = try reopened.observeExact(network_udp_token, .{ .wall_us = std.time.microTimestamp() });
+    defer udp_observed.deinit();
+    try std.testing.expect(udp_observed.matches_desired);
+
+    const icmp_v6 = canonical.Scope{
+        .subject = try canonical.Subject.parseHost("2001:db8::7"),
+        .protocols = try canonical.Protocols.one(.icmp_v6),
+    };
+    const icmp_finite = scopedEffectToken(&reader, 0x85, icmp_v6, .{ .ensure_present = .{ .finite_deadline_us = std.time.microTimestamp() + 30 * std.time.us_per_s } });
+    const icmp_permanent = scopedEffectToken(&reader, 0x85, icmp_v6, .{ .ensure_present = .permanent });
+    var icmp_applied = try applyVerified(&reader, icmp_finite);
+    icmp_applied.deinit();
+    try peer.exchangeIcmpV6(71, false);
+    var icmp_prolonged = try applyVerified(&reader, icmp_permanent);
+    icmp_prolonged.deinit();
+    var icmp_duplicate = try applyVerified(&reader, icmp_permanent);
+    defer icmp_duplicate.deinit();
+    try std.testing.expect(!icmp_duplicate.verified.changed);
+    var icmp_removed = try applyVerified(&reader, scopedEffectToken(&reader, 0x85, icmp_v6, .ensure_absent));
+    icmp_removed.deinit();
+    try peer.exchangeIcmpV6(72, true);
+    reader.test_fault_after_mutations = 1;
+    var uncertain = try reader.applyExact(icmp_permanent, .{ .wall_us = std.time.microTimestamp() });
+    defer uncertain.deinit();
+    try std.testing.expect(uncertain == .uncertain);
+    try std.testing.expectEqual(error.Timeout, uncertain.uncertain);
+    reader.test_fault_after_mutations = null;
+    var recovered = try applyVerified(&reader, icmp_permanent);
+    defer recovered.deinit();
+    try std.testing.expect(!recovered.verified.changed);
+    try peer.exchangeIcmpV6(73, false);
+
+    // A multi-part command interruption is explicit incomplete state. The
+    // already-live TCP and original UDP rules remain effective; no fallback
+    // or cleanup guess is attempted in this disposable namespace.
+    const partial_scope = canonical.Scope{
+        .subject = network_udp.subject,
+        .protocols = try canonical.Protocols.one(.udp),
+        .ports = try canonical.Ports.list(&.{ canonical.PortRange.one(35301), canonical.PortRange.one(35303) }),
+    };
+    reader.test_fault_after_mutations = 1;
+    var partial = try reader.applyExact(scopedEffectToken(&reader, 0x86, partial_scope, .{ .ensure_present = .permanent }), .{ .wall_us = std.time.microTimestamp() });
+    defer partial.deinit();
+    try std.testing.expect(partial == .uncertain);
+    reader.test_fault_after_mutations = null;
+    try std.testing.expectError(error.Incomplete, reader.inspect());
+    try peer.exchangeUdp(false, 35301, 74, false);
+    try peer.exchangeUdp(false, 35303, 75, true);
+    try peer.exchangeUdp(false, 35281, 76, false);
+    try peer.exchangeTcp(true, 443, 77, false);
 }
 
 fn failedEffectAllocation(allocator: std.mem.Allocator, stable: *inspection.Inspector) !void {
@@ -680,13 +1065,16 @@ test "native firewall: snapshot classifier validates ownership interval scope an
     reader.iptables_path = "/not/a/tool";
     reader.ipset_path = "/not/a/tool";
     const token = try effectToken(&reader, false, .{ .ensure_present = .permanent });
-    var entries = [_]inspection.Entry{.{ .address = token.scope.address }};
+    var entries = [_]inspection.Entry{.{ .address = switch (token.scope.subject.family) {
+        .v4 => .{ .ipv4 = std.mem.readInt(u32, token.scope.subject.address[0..4], .big) },
+        .v6 => .{ .ipv6 = std.mem.readInt(u128, &token.scope.subject.address, .big) },
+    } }};
     var snapshot = inspection.Snapshot{ .allocator = std.testing.allocator, .installation = reader.installation, .state = .owned, .entries = &entries, .fingerprint = [_]u8{1} ** 32, .observed_start_ns = 1000, .observed_end_ns = 2000 };
     try std.testing.expect(try reader.matchesSnapshot(&snapshot, token, 100, 102));
     var wrong = token;
     wrong.scope = (try effectToken(&reader, true, .{ .ensure_present = .permanent })).scope;
     try std.testing.expect(!try reader.matchesSnapshot(&snapshot, wrong, 100, 102));
-    wrong.scope.prefix = 64;
+    wrong.scope.subject.prefix = 64;
     try std.testing.expectError(error.UnsupportedScope, reader.matchesSnapshot(&snapshot, wrong, 100, 102));
     try std.testing.expectError(error.UnsupportedDeadline, reader.matchesSnapshot(&snapshot, token, 102, 100));
     try std.testing.expectError(error.Incomplete, reader.matchesSnapshot(&snapshot, token, 100, 100));
@@ -712,4 +1100,42 @@ test "native firewall: snapshot classifier validates ownership interval scope an
     try std.testing.expect(!try reader.matchesSnapshot(&snapshot, wrong, 100, 102));
     wrong.operation = .{ .ensure_present = .{ .finite_deadline_us = 101 } };
     try std.testing.expect(!try reader.matchesSnapshot(&snapshot, wrong, 100, 102));
+}
+
+test "native firewall: scoped snapshot requires exact scope effect identity and deadline" {
+    var reader = try admissionReader(.nftables);
+    defer reader.close();
+    const canonical = inspection.canonical_scope;
+    const scope = canonical.Scope{
+        .subject = try canonical.Subject.parseNetwork("198.51.100.0/24"),
+        .protocols = try canonical.Protocols.one(.udp),
+        .ports = try canonical.Ports.list(&.{canonical.PortRange.one(35271)}),
+    };
+    const token = scopedEffectToken(&reader, 0x6d, scope, .{ .ensure_present = .permanent });
+    var entries = [_]inspection.Entry{.{
+        .address = .{ .ipv4 = std.mem.readInt(u32, scope.subject.address[0..4], .big) },
+        .scope = scope,
+        .effect_id = token.effect_id,
+    }};
+    var snapshot = inspection.Snapshot{
+        .allocator = std.testing.allocator,
+        .installation = reader.installation,
+        .state = .owned,
+        .entries = &entries,
+        .fingerprint = [_]u8{2} ** 32,
+        .observed_start_ns = 1000,
+        .observed_end_ns = 2000,
+    };
+    try std.testing.expect(try reader.matchesSnapshot(&snapshot, token, 100, 102));
+    var wrong_identity = token;
+    wrong_identity.effect_id[0] ^= 1;
+    try std.testing.expectError(error.ForeignState, reader.matchesSnapshot(&snapshot, wrong_identity, 100, 102));
+    var neighbor = token;
+    neighbor.scope.ports = try canonical.Ports.list(&.{canonical.PortRange.one(35272)});
+    try std.testing.expect(!try reader.matchesSnapshot(&snapshot, neighbor, 100, 102));
+    var absent = token;
+    absent.operation = .ensure_absent;
+    try std.testing.expect(!try reader.matchesSnapshot(&snapshot, absent, 100, 102));
+    entries[0].deadline_us = 200;
+    try std.testing.expect(!try reader.matchesSnapshot(&snapshot, token, 100, 102));
 }

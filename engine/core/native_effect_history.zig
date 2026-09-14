@@ -22,6 +22,8 @@ pub const Event = struct {
     jail: detection.Name,
     decision_id: [32]u8,
     confirmed_us: i64,
+    /// True only when Store joined this confirmation to a native retry detail.
+    native_retry: bool = false,
 
     pub fn validate(self: *const Event) Error!void {
         if (self.sequence == 0 or self.sequence > max_number or self.jail.len == 0 or self.jail.len > 64) return error.InvalidHistoryEvent;

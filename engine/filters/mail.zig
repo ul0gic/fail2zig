@@ -46,6 +46,12 @@ pub const courier_patterns = [_]PatternDef{
         .name = "auth-failed",
         .match = parser.compile("<*>imaplogin: FAILED<*>ip=[<IP>"),
     },
+    .{
+        // Courier SMTP emits the authenticated relay address before the 535
+        // result. This is a distinct selected workload from Courier IMAP/POP.
+        .name = "smtp-auth-failed",
+        .match = parser.compile("<*>error,relay=<IP>,<*>msg=\"535 Authentication failed.\""),
+    },
 };
 
 const testing = std.testing;
@@ -118,4 +124,9 @@ test "courier: negative — successful LOGIN" {
 
 test "courier: negative — service startup" {
     try testing.expect(firstMatchIn(&courier_patterns, "Apr 21 12:00:00 mail imapd: Connection, ip=[::ffff:1.2.3.4]") == null);
+}
+
+test "courier: SMTP authentication failure is distinct from successful SMTP" {
+    try testing.expect(firstMatchIn(&courier_patterns, "Sep 14 09:00:00 mail courieresmtpd[425070]: error,relay=::ffff:192.0.2.44,port=43632,msg=\"535 Authentication failed.\",cmd: AUTH LOGIN fixture") != null);
+    try testing.expect(firstMatchIn(&courier_patterns, "Sep 14 09:00:01 mail courieresmtpd[425070]: info,relay=::ffff:192.0.2.44,msg=\"235 Authentication succeeded.\"") == null);
 }

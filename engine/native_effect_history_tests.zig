@@ -83,7 +83,7 @@ test "native effect history: forged identity canonical name scope and installati
     bad.scope_key[0] ^= 1;
     try t.expectError(error.InvalidHistoryEvent, bad.validate());
     bad = good;
-    bad.scope.address[15] = 1;
+    bad.scope.canonical.subject.address[15] = 1;
     try t.expectError(error.InvalidHistoryEvent, bad.validate());
     bad = good;
     bad.jail.len = 255;

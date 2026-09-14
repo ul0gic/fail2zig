@@ -211,7 +211,7 @@ test "native detection: journal retry window and decision share the exact durabl
     const detector = try journal.Detector.init(&base, try profile());
     var clock = Clock{};
     var mock = Mock{};
-    const opts = sessions.Options{ .processing = .{ .jail = "ssh", .parent_generation = [_]u8{0} ** 32, .timestamp = .journal }, .detection = detector.consumer(), .retry = .{ .maxretry = 2, .window_us = 600_000_000, .bantime_us = 60_000_000, .max_subjects = 8 }, .clock = Clock.read, .clock_context = &clock, .executor = .{ .context = &mock, .run = Mock.run } };
+    const opts = sessions.Options{ .processing = .{ .jail = "ssh", .parent_generation = [_]u8{0} ** 32, .timestamp = .journal }, .detection = detector.consumer(), .retry = .{ .maxretry = 2, .window_us = 600_000_000, .duration = .{ .finite_us = 60_000_000 }, .max_subjects = 8 }, .clock = Clock.read, .clock_context = &clock, .executor = .{ .context = &mock, .run = Mock.run } };
     var owner: ?*sessions.Session = try sessions.Session.create(t.allocator, &store, opts);
     defer if (owner) |session| session.destroy();
     _ = try owner.?.poll(1);
@@ -240,7 +240,7 @@ test "native detection: journal retry window and decision share the exact durabl
     try t.expectEqual(@as(usize, 1), try owner.?.poll(1));
     const decision = (try store.retryDecision("ssh", "system-journal", null)).?;
     try t.expectEqual(@as(u64, 1), decision.ordinal);
-    try t.expectEqual(clock.value + 60_000_000, decision.expiry_us);
+    try t.expectEqual(clock.value + 60_000_000, decision.lease.finite);
     try t.expectEqual(@as(usize, 0), try store.pendingReceiptCount());
     mock.response = two;
     try t.expectEqual(@as(usize, 0), try owner.?.poll(1));

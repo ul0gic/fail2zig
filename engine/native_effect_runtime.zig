@@ -6,10 +6,14 @@ const std = @import("std");
 const shared = @import("shared");
 const durable = @import("core/record_store.zig");
 const effect = @import("core/native_effect.zig");
+const action_outcome = @import("core/native_action_outcome.zig");
 const firewall = @import("firewall/inspection.zig");
 
 pub const Binding = struct { jail: []const u8, generation: [32]u8 };
 pub const Health = struct { ready: bool = false, uncertain: bool = false, overdue: usize = 0, confirmed: usize = 0, cause: ?anyerror = null };
+fn systemWall(_: ?*anyopaque) i64 {
+    return std.time.microTimestamp();
+}
 pub const reserved_bytes = @sizeOf(Manager) + effect.max_effects * (2 * @sizeOf(effect.Entry) + @sizeOf(bool)) + (firewall.Limits{}).max_bytes;
 pub const Manager = struct {
     allocator: std.mem.Allocator,
@@ -26,8 +30,13 @@ pub const Manager = struct {
     cached_epoch: ?u64 = null,
     cursor: usize = 0,
     last_wall_us: i64,
+    wall_context: ?*anyopaque = null,
+    wall: *const fn (?*anyopaque) i64 = systemWall,
     status: Health = .{},
     admitted: bool = false,
+    repair_epoch: u64 = 1,
+    stop_cursor: usize = 0,
+    stopping: bool = false,
 
     pub fn create(a: std.mem.Allocator, store: *durable.Store, installation: effect.Installation) !*Manager {
         try installation.validate();
@@ -58,6 +67,27 @@ pub const Manager = struct {
         self.staged_count = 0;
         self.admitted = false;
         self.status.ready = false;
+        self.repair_epoch +|= 1;
+        self.stop_cursor = 0;
+        self.stopping = false;
+    }
+    /// Invalidate one coherent publication using a caller-fenced process-local
+    /// epoch. The next ordinary turns perform exact readback and same-intent
+    /// repair; this call itself never mutates storage or the kernel.
+    pub fn beginRepair(self: *Manager, expected_epoch: u64) !u64 {
+        if (expected_epoch == 0 or expected_epoch != self.repair_epoch or self.repair_epoch == std.math.maxInt(u64)) return error.StaleRepairEpoch;
+        self.repair_epoch += 1;
+        self.cached_epoch = null;
+        self.staged_revision = null;
+        self.staged_count = 0;
+        self.cursor = 0;
+        self.status.ready = false;
+        self.status.uncertain = false;
+        self.status.cause = null;
+        return self.repair_epoch;
+    }
+    pub fn repairEpoch(self: *const Manager) u64 {
+        return self.repair_epoch;
     }
     pub fn confirmedSubject(self: *const Manager, subject: @import("core/native_detection_record.zig").Subject, now_us: i64) bool {
         if (self.cached_epoch == null or self.cached_epoch.? != self.store.effect_publication_epoch or !self.status.ready) return false;
@@ -66,10 +96,22 @@ pub const Manager = struct {
         return false;
     }
     fn clock(self: *Manager) !effect.Clock {
-        const now = std.time.microTimestamp();
+        const now = self.wall(self.wall_context);
         if (now < self.last_wall_us) return error.EffectClockReversed;
         self.last_wall_us = now;
-        return .{ .prepared_us = now };
+        return .{ .prepared_us = now, .context = self.wall_context, .read = self.wall };
+    }
+    /// Commit a validated policy extension before the next dispatch turn. The
+    /// publication epoch invalidates any prior confirmed cache immediately.
+    pub fn prolongRetry(self: *Manager, change: durable.Store.RetryProlongation) !durable.Store.RetryProlongationResult {
+        errdefer |failure| {
+            self.status.ready = false;
+            self.status.uncertain = true;
+            self.status.cause = failure;
+        }
+        const result = try self.store.prolongRetryDecision(change, try self.clock());
+        if (result.changed) self.status.ready = false;
+        return result;
     }
     /// Installation row is the immutable desired scaffold, revision one. Its
     /// canonical identity deterministically binds the durable creation intent.
@@ -134,7 +176,7 @@ pub const Manager = struct {
         return true;
     }
     fn token(self: *Manager, entry: effect.Entry, lease: effect.Lease) firewall.DispatchToken {
-        return .{ .installation = self.inspector.installation, .effect_id = entry.scope_key, .aggregate_revision = entry.revision, .scope = .{ .address = address(entry.scope), .prefix = if (entry.scope.family == .v4) 32 else 128 }, .operation = switch (lease) {
+        return .{ .installation = self.inspector.installation, .effect_id = entry.scope_key, .aggregate_revision = entry.revision, .scope = entry.scope.canonical, .operation = switch (lease) {
             .absent => .ensure_absent,
             .finite => |deadline| .{ .ensure_present = .{ .finite_deadline_us = deadline } },
             .permanent => .{ .ensure_present = .permanent },
@@ -143,8 +185,60 @@ pub const Manager = struct {
     fn validateInventory(self: *Manager, snapshot: *const firewall.Snapshot) !void {
         if (snapshot.state != .owned) return error.InstallationMismatch;
         for (snapshot.entries) |installed| {
-            for (self.live[0..self.count]) |entry| if (installed.address.eql(address(entry.scope))) break else continue else return error.UnownedInstalledEffect;
+            const installed_scope = installed.scope orelse firewall.CanonicalScope{ .subject = firewall.canonical_scope.Subject.host(installed.address) };
+            for (self.live[0..self.count]) |entry| {
+                if (!std.meta.eql(installed_scope, entry.scope.canonical)) continue;
+                if (installed.scope != null and (installed.effect_id == null or !std.mem.eql(u8, &installed.effect_id.?, &entry.scope_key))) continue;
+                break;
+            } else return error.UnownedInstalledEffect;
         }
+    }
+    /// Complete at most one durable target transition per turn. The selected
+    /// notification is deliberately a no-op; its outcome can never certify the
+    /// mandatory enforcement target or delay an already terminal failure.
+    fn reconcileActionTargets(self: *Manager, entry: effect.Entry) !bool {
+        if (self.store.schema_version < 21) return true;
+        var owners: [effect.max_page]effect.Owner = undefined;
+        const owner_count = try self.store.effectOwners(entry.scope_key, entry.revision, &owners);
+        for (owners[0..owner_count]) |owner| {
+            var targets: [action_outcome.max_targets_per_action]action_outcome.Target = undefined;
+            const count = try self.store.actionTargets(owner.decision_id, &targets);
+            if (count == 0) continue; // Explicit component-owned effects have no source action.
+            if (count != action_outcome.max_targets_per_action) return error.InvalidActionTarget;
+            for (targets[0..count]) |target| {
+                if (!std.mem.eql(u8, &target.scope_key, &entry.scope_key) or !std.mem.eql(u8, target.jail.slice(), owner.jail.slice())) return error.InvalidActionTarget;
+                switch (target.kind) {
+                    .enforcement => switch (target.status) {
+                        .pending, .uncertain => {
+                            self.status.ready = false;
+                            try self.store.markActionTargetDispatched(target.action_id, .enforcement, try self.clock());
+                            return false;
+                        },
+                        .dispatched => {
+                            self.status.ready = false;
+                            try self.store.settleActionTarget(target.action_id, .enforcement, .confirmed, try self.clock());
+                            return false;
+                        },
+                        .confirmed => {},
+                        .failed, .suppressed_restored => return error.InvalidActionTarget,
+                    },
+                    .notification => switch (target.status) {
+                        .pending, .uncertain => {
+                            self.status.ready = false;
+                            try self.store.markActionTargetDispatched(target.action_id, .notification, try self.clock());
+                            return false;
+                        },
+                        .dispatched => {
+                            self.status.ready = false;
+                            try self.store.settleActionTarget(target.action_id, .notification, .confirmed, try self.clock());
+                            return false;
+                        },
+                        .confirmed, .failed, .suppressed_restored => {},
+                    },
+                }
+            }
+        }
+        return true;
     }
     /// One bounded page or one scope operation per turn. False fences new
     /// ingestion while required recovery or freshly committed effects are pending.
@@ -223,6 +317,7 @@ pub const Manager = struct {
             _ = try self.store.settleVerified(entry.token(), .{ .installation = entry.installation.id, .scope_key = entry.scope_key, .fingerprint = observed.snapshot.fingerprint, .observed_us = observed.observed_wall_us, .qualification = .complete_owned, .state = if (observed.matches_desired) entry.desired else null }, try self.clock());
             return false;
         }
+        if (!try self.reconcileActionTargets(entry)) return false;
         if (entry.desired == .permanent) {
             // A permanent aggregate still needs each elapsed finite co-owner
             // committed absent. Do this only after complete readback proves the
@@ -238,6 +333,54 @@ pub const Manager = struct {
         }
         self.cursor += 1;
         return self.status.ready;
+    }
+    /// Remove at most one realized exact effect while preserving every durable
+    /// owner and original deadline. A new manager restores those same intents.
+    /// The owned installation topology remains admitted and foreign state is
+    /// never deleted. This is not the durable jail-flush operation.
+    pub fn stopTurn(self: *Manager, expected_repair_epoch: u64) !bool {
+        if (expected_repair_epoch == 0 or expected_repair_epoch != self.repair_epoch) return error.StaleRepairEpoch;
+        if (!self.stopping) {
+            if (!self.admitted or !self.status.ready or self.cached_epoch == null or self.cached_epoch.? != self.store.effect_publication_epoch) return error.EffectReconciliationRequired;
+            self.stopping = true;
+            self.stop_cursor = 0;
+            self.status.ready = false;
+        }
+        errdefer |failure| {
+            self.status.uncertain = true;
+            self.status.cause = failure;
+        }
+        const sampled = try self.clock();
+        while (self.stop_cursor < self.count) {
+            const entry = self.live[self.stop_cursor];
+            if (entry.desired == .absent) {
+                self.stop_cursor += 1;
+                continue;
+            }
+            var result = try self.inspector.applyExact(self.token(entry, .absent), .{ .wall_us = sampled.prepared_us });
+            defer result.deinit();
+            switch (result) {
+                .uncertain => |cause| {
+                    self.status.cause = cause;
+                    self.status.uncertain = true;
+                    return error.EffectBackendUncertain;
+                },
+                .verified => |*observed| try self.validateInventory(&observed.snapshot),
+            }
+            self.stop_cursor += 1;
+            return false;
+        }
+        var final = try self.inspector.inspect();
+        defer final.deinit();
+        try self.validateInventory(&final);
+        if (final.entries.len != 0) return error.UnownedInstalledEffect;
+        self.stopping = false;
+        self.stop_cursor = 0;
+        self.admitted = false;
+        self.cached_epoch = null;
+        self.count = 0;
+        self.status = .{};
+        return true;
     }
     /// Sole exception to storage fencing: exact finite expiry already committed
     /// in a coherent owner view. One pre-reserved uncertain slot per scope; no
@@ -274,8 +417,8 @@ pub fn transportInstallation(value: effect.Installation) firewall.Installation {
     } };
 }
 pub fn address(scope: effect.Scope) shared.IpAddress {
-    return switch (scope.family) {
-        .v4 => .{ .ipv4 = std.mem.readInt(u32, scope.address[0..4], .big) },
-        .v6 => .{ .ipv6 = std.mem.readInt(u128, &scope.address, .big) },
+    return switch (scope.canonical.subject.family) {
+        .v4 => .{ .ipv4 = std.mem.readInt(u32, scope.canonical.subject.address[0..4], .big) },
+        .v6 => .{ .ipv6 = std.mem.readInt(u128, &scope.canonical.subject.address, .big) },
     };
 }

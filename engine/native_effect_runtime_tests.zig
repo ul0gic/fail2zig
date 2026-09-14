@@ -3,6 +3,7 @@
 const std = @import("std");
 const durable = @import("core/record_store.zig");
 const effect = @import("core/native_effect.zig");
+const action_outcome = @import("core/native_action_outcome.zig");
 const runtime = @import("native_effect_runtime.zig");
 const inspection = @import("firewall/inspection.zig");
 const command = @import("firewall/command.zig");
@@ -45,6 +46,21 @@ const Fixture = struct {
         const result = try runtime.Manager.create(t.allocator, &self.store, self.installation);
         if (std.posix.getenv("F2Z_NATIVE_IPSET_PATH")) |path| result.inspector.ipset_path = path;
         return result;
+    }
+    fn enableSchema19(self: *Fixture) !void {
+        try self.store.enableConsumerManifests();
+        try self.store.enableConfirmedHistory();
+        try self.store.enableMaintenance();
+        try self.store.enableCleanup();
+        try self.store.enableRetryLeases();
+        try self.store.enableApplicationHistory();
+        try self.store.enableEscalation();
+        try self.store.enableCanonicalEffects();
+    }
+    fn enableSchema21(self: *Fixture) !void {
+        try self.enableSchema19();
+        try self.store.enableHistoryResets();
+        try self.store.enableActionTargets();
     }
     fn owner(self: *Fixture, jail: []const u8, decision: u8, lease: effect.Lease) !effect.Entry {
         const now = std.time.microTimestamp();
@@ -146,6 +162,95 @@ test "native effect runtime: isolated final inventory catches missing scope then
     manager.inspector.limits.max_bytes = 1;
     try t.expectError(error.LimitExceeded, manager.turn(&bindings));
     try t.expect(!manager.confirmedSubject(subject, std.time.microTimestamp()));
+}
+
+test "native effect runtime: isolated canonical network survives manager restart and expires exactly" {
+    var fixture = try Fixture.init(try isolatedBackend());
+    defer fixture.deinit();
+    try fixture.enableSchema19();
+    const canonical = inspection.canonical_scope;
+    const scope = canonical.Scope{
+        .subject = try canonical.Subject.parseNetwork("192.0.2.0/24"),
+        .protocols = try canonical.Protocols.one(.udp),
+        .ports = try canonical.Ports.list(&.{ canonical.PortRange.one(35271), .{ .first = 35280, .last = 35282 } }),
+    };
+    const deadline = std.time.microTimestamp() + 2_500_000;
+    const entry = try fixture.store.setOwnerFromCanonical(.{
+        .scope = scope,
+        .jail = "fixture",
+        .generation = [_]u8{3} ** 32,
+        .decision_id = [_]u8{0x92} ** 32,
+        .expected_revision = 0,
+        .lease = .{ .finite = deadline },
+        .decided_us = std.time.microTimestamp(),
+    }, .{ .prepared_us = std.time.microTimestamp() });
+    {
+        const manager = try fixture.manager();
+        defer manager.destroy();
+        try ready(manager);
+        var snapshot = try manager.inspector.inspect();
+        defer snapshot.deinit();
+        try t.expectEqual(@as(usize, 1), snapshot.entries.len);
+        try t.expectEqualDeep(scope, snapshot.entries[0].scope.?);
+        try t.expectEqualSlices(u8, &entry.scope_key, &snapshot.entries[0].effect_id.?);
+        try t.expectEqual(deadline, snapshot.entries[0].deadline_us.?);
+    }
+    const restarted = try fixture.manager();
+    defer restarted.destroy();
+    try ready(restarted);
+    try t.expect(restarted.status.ready);
+    waitUntil(deadline + 100_000);
+    try ready(restarted);
+    var expired = try restarted.inspector.inspect();
+    defer expired.deinit();
+    try t.expectEqual(@as(usize, 0), expired.entries.len);
+}
+
+test "native effect runtime: isolated stop restores durable intent and repair epoch rejects stale work" {
+    var fixture = try Fixture.init(try isolatedBackend());
+    defer fixture.deinit();
+    try fixture.enableSchema21();
+    const deadline = std.time.microTimestamp() + 30_000_000;
+    const entry = try fixture.owner("fixture", 1, .{ .finite = deadline });
+    try fixture.store.prepareActionTargets(.{ .action_id = [_]u8{1} ** 32, .scope_key = entry.scope_key, .jail = "fixture" }, .{ .prepared_us = std.time.microTimestamp() });
+    // A terminal optional failure is independent: the manager still confirms
+    // the mandatory target from exact kernel readback and reaches readiness.
+    try fixture.store.markActionTargetDispatched([_]u8{1} ** 32, .notification, .{ .prepared_us = std.time.microTimestamp() });
+    try fixture.store.settleActionTarget([_]u8{1} ** 32, .notification, .failed, .{ .prepared_us = std.time.microTimestamp() });
+    {
+        const manager = try fixture.manager();
+        defer manager.destroy();
+        try ready(manager);
+        try t.expect(manager.status.ready);
+        var outcomes: [action_outcome.max_targets_per_action]action_outcome.Target = undefined;
+        try t.expectEqual(@as(usize, 2), try fixture.store.actionTargets([_]u8{1} ** 32, &outcomes));
+        try t.expectEqual(action_outcome.Status.confirmed, outcomes[0].status);
+        try t.expectEqual(action_outcome.Status.failed, outcomes[1].status);
+        const epoch = manager.repairEpoch();
+        while (!try manager.stopTurn(epoch)) {}
+        var stopped = try manager.inspector.inspect();
+        defer stopped.deinit();
+        try t.expectEqual(@as(usize, 0), stopped.entries.len);
+        try t.expectEqual(@as(u64, 1), try fixture.store.confirmedEffectEvents());
+    }
+    const restarted = try fixture.manager();
+    defer restarted.destroy();
+    try ready(restarted);
+    try t.expectEqual(@as(u64, 1), try fixture.store.confirmedEffectEvents());
+    try t.expect(restarted.confirmedSubject(subject, std.time.microTimestamp()));
+    var restored_rows: [1]effect.Entry = undefined;
+    const restored_page = try fixture.store.effectPage(null, null, &restored_rows);
+    try t.expectEqual(@as(usize, 1), restored_page.count);
+    try t.expectEqual(deadline, restored_rows[0].desired.finite);
+
+    try driftRemove(restarted);
+    const prior_epoch = restarted.repairEpoch();
+    const repair_epoch = try restarted.beginRepair(prior_epoch);
+    try t.expectEqual(prior_epoch + 1, repair_epoch);
+    try t.expectError(error.StaleRepairEpoch, restarted.beginRepair(prior_epoch));
+    try ready(restarted);
+    try t.expectEqual(@as(u64, 1), try fixture.store.confirmedEffectEvents());
+    try t.expect(restarted.confirmedSubject(subject, std.time.microTimestamp()));
 }
 const Db = std.meta.Child(@FieldType(durable.Store, "db"));
 const Exec = @FieldType(@FieldType(durable.Store, "api"), "exec");

@@ -28,16 +28,66 @@ const options = builtin.Options{ .filter = "sshd", .body = .whole, .ignore_capac
 const settings = projection.Settings{ .timestamp = .undated, .body = .whole, .start = .head, .max_sources = 2, .ignore_capacity = 8 };
 
 test "native detection: retained external filter corpus and rule identities" {
-    const Fixture = struct { filter: []const u8, ip: ?[]const u8, line: []const u8 };
+    const Class = enum { positive, benign, exclusion, noisy, malformed, truncated, boundary, scope_refusal };
+    const Fixture = struct {
+        id: []const u8,
+        workload: []const u8,
+        filter: []const u8,
+        class: Class,
+        pattern: ?[]const u8,
+        ip: ?[]const u8,
+        provenance: []const u8,
+        line: []const u8,
+    };
+    const Workload = struct { name: []const u8, filter: []const u8, external: bool = true };
+    const workloads = [_]Workload{
+        .{ .name = "apache-auth", .filter = "apache-auth" },
+        .{ .name = "apache-badbots", .filter = "apache-badbots" },
+        .{ .name = "apache-overflows", .filter = "apache-overflows" },
+        .{ .name = "courier-auth", .filter = "courier" },
+        .{ .name = "courier-smtp", .filter = "courier" },
+        .{ .name = "dovecot", .filter = "dovecot" },
+        .{ .name = "mysqld-auth", .filter = "mysqld-auth" },
+        .{ .name = "named-refused", .filter = "named-refused" },
+        .{ .name = "nginx-botsearch", .filter = "nginx-botsearch" },
+        .{ .name = "nginx-http-auth", .filter = "nginx-http-auth" },
+        .{ .name = "nginx-limit-req", .filter = "nginx-limit-req" },
+        .{ .name = "postfix", .filter = "postfix" },
+        .{ .name = "proftpd", .filter = "proftpd" },
+        .{ .name = "sshd", .filter = "sshd" },
+        .{ .name = "vsftpd", .filter = "vsftpd" },
+        // Positive/benign internal-event behavior belongs to N3.4.2. This
+        // batch proves only that an external recidive line cannot be admitted.
+        .{ .name = "recidive-internal", .filter = "recidive", .external = false },
+    };
     const bytes = try std.fs.cwd().readFileAlloc(t.allocator, @import("detection_test_options").corpus_path, 1 << 20);
     defer t.allocator.free(bytes);
     const corpus = try std.json.parseFromSlice([]Fixture, t.allocator, bytes, .{});
     defer corpus.deinit();
-    var positive = [_]usize{0} ** registry.registered_count;
-    var negative = positive;
-    for (corpus.value) |fixture| {
-        // Recidive is intentionally absent from the external-line consumer.
-        if (std.mem.eql(u8, fixture.filter, "recidive")) continue;
+    var positive = [_]usize{0} ** workloads.len;
+    var benign = positive;
+    var refused = positive;
+    var classes = [_]usize{0} ** @typeInfo(Class).@"enum".fields.len;
+    for (corpus.value, 0..) |fixture, fixture_index| {
+        if (fixture.id.len == 0 or fixture.provenance.len == 0 or fixture.provenance.len > 160 or fixture.line.len > 2048)
+            return error.InvalidCorpusMetadata;
+        for (corpus.value[0..fixture_index]) |prior|
+            if (std.mem.eql(u8, prior.id, fixture.id)) return error.DuplicateCorpusId;
+        classes[@intFromEnum(fixture.class)] += 1;
+        const workload_index = for (workloads, 0..) |workload, i| {
+            if (std.mem.eql(u8, workload.name, fixture.workload)) break i;
+        } else return error.UnknownCorpusWorkload;
+        if (!std.mem.eql(u8, workloads[workload_index].filter, fixture.filter)) return error.CorpusWorkloadFilterMismatch;
+        if (fixture.class == .scope_refusal) {
+            if (workloads[workload_index].external or fixture.ip != null or fixture.pattern != null) return error.InvalidScopeRefusal;
+            var opts = options;
+            opts.filter = fixture.filter;
+            try t.expectError(error.InternalEventsRequired, builtin.Detector.init(t.allocator, opts));
+            refused[workload_index] += 1;
+            continue;
+        }
+        if (!workloads[workload_index].external) return error.InternalFixtureInExternalCorpus;
+        if ((fixture.class == .positive) != (fixture.ip != null and fixture.pattern != null)) return error.InvalidCorpusOutcome;
         var opts = options;
         opts.filter = fixture.filter;
         var detector = try builtin.Detector.init(t.allocator, opts);
@@ -46,31 +96,40 @@ test "native detection: retained external filter corpus and rule identities" {
         // Their historical extractor is explicit here, not a detector fallback.
         const body = parser.stripSyslogPrefix(fixture.line);
         const result = try detector.evaluate(body, eligible);
-        const index = for (registry.entries, 0..) |entry, i| {
-            if (std.mem.eql(u8, entry.name, fixture.filter)) break i;
-        } else unreachable;
         if (fixture.ip) |ip| {
             const expected = try shared.IpAddress.parse(ip);
-            const match = if (expected.isUnenforceable()) blk: {
-                try t.expect(result == .unenforceable);
-                break :blk result.unenforceable;
-            } else blk: {
-                try t.expect(result == .candidate);
-                try t.expectEqualDeep(eligible.eligible, result.candidate.time);
-                break :blk result.candidate.match;
-            };
+            try t.expect(!expected.isUnenforceable());
+            try t.expect(result == .candidate);
+            try t.expectEqualDeep(eligible.eligible, result.candidate.time);
+            const match = result.candidate.match;
             try t.expectEqual(expected, match.subject);
             try t.expectEqualStrings(fixture.filter, match.filter);
-            try t.expectEqualStrings(registry.entries[index].patterns[match.pattern_index].name, match.pattern);
-            positive[index] += 1;
+            try t.expectEqualStrings(fixture.pattern.?, match.pattern);
+            positive[workload_index] += 1;
         } else {
             try t.expect(result == .no_match);
-            negative[index] += 1;
+            if (fixture.class == .benign) benign[workload_index] += 1;
         }
     }
-    for (registry.entries, 0..) |entry, i| {
+    for (classes) |count| try t.expect(count > 0);
+    for (workloads, 0..) |workload, i| {
+        if (workload.external) {
+            try t.expect(positive[i] > 0 and benign[i] > 0 and refused[i] == 0);
+        } else try t.expect(positive[i] == 0 and benign[i] == 0 and refused[i] == 1);
+    }
+    // Exactly one qualifying positive is retained for every selected external
+    // PatternDef. This catches unreachable identities and accidental omissions
+    // without multiplying cases across sources or backends.
+    for (registry.entries) |entry| {
         if (std.mem.eql(u8, entry.name, "recidive")) continue;
-        try t.expect(positive[i] > 0 and negative[i] > 0);
+        for (entry.patterns) |pattern| {
+            var count: usize = 0;
+            for (corpus.value) |fixture| {
+                if (fixture.class == .positive and std.mem.eql(u8, fixture.filter, entry.name) and
+                    std.mem.eql(u8, fixture.pattern.?, pattern.name)) count += 1;
+            }
+            try t.expectEqual(@as(usize, 1), count);
+        }
     }
 }
 
@@ -106,6 +165,27 @@ test "native detection: strict syslog envelope and complete decoded records" {
         try t.expectError(error.InvalidDecodedRecord, detector.evaluate(line, eligible));
     const oversized = [_]u8{'x'} ** 2049;
     try t.expectError(error.RecordTooLarge, detector.evaluate(&oversized, eligible));
+}
+
+test "native detection: compiled and access parser families share the exact 2 KiB boundary" {
+    var compiled = [_]u8{' '} ** 2048;
+    @memcpy(compiled[0..failure.len], failure);
+    var detector = try builtin.Detector.init(t.allocator, options);
+    defer detector.deinit(t.allocator);
+    try t.expect((try detector.evaluate(&compiled, eligible)) == .candidate);
+
+    const access_line = "192.0.2.50 - - [14/Sep/2026] \"GET /.env HTTP/1.1\" 404 0";
+    var access_record = [_]u8{' '} ** 2048;
+    @memcpy(access_record[0..access_line.len], access_line);
+    var access_options = options;
+    access_options.filter = "nginx-botsearch";
+    var access_detector = try builtin.Detector.init(t.allocator, access_options);
+    defer access_detector.deinit(t.allocator);
+    try t.expect((try access_detector.evaluate(&access_record, eligible)) == .candidate);
+
+    const too_large = [_]u8{'x'} ** 2049;
+    try t.expectError(error.RecordTooLarge, detector.evaluate(&too_large, eligible));
+    try t.expectError(error.RecordTooLarge, access_detector.evaluate(&too_large, eligible));
 }
 
 test "native detection: canonical address ignores and protected addresses" {

@@ -9,10 +9,13 @@ const time_policy = @import("source_time_policy.zig");
 const native_record = @import("native_time_record.zig");
 const detection = @import("native_detection_record.zig");
 const retry = @import("native_retry.zig");
+const action_context = @import("native_action_context.zig");
 const consumers = @import("native_consumer.zig");
 const effects = @import("native_effect.zig");
 const effect_history = @import("native_effect_history.zig");
-pub const latest_schema: i64 = 15;
+const application_history = @import("native_application_history.zig");
+const action_outcome = @import("native_action_outcome.zig");
+pub const latest_schema: i64 = 21;
 pub const max_native_detections = 16;
 const Db = opaque {};
 const Statement = opaque {};
@@ -46,7 +49,7 @@ const embedded_api: Api = blk: {
     }
     break :blk api;
 };
-pub const Error = retry.Error || consumers.Error || effects.Error || effect_history.Error || error{ MaintenancePinned, StaleMaintenance, PrunedReplay, InvalidMaintenanceState, MaintenanceStorageRequired, ConsumerManifestRequired, ConsumerManifestMismatch, ConsumerManifestMissing, ConsumerManifestExists, ConsumerMigrationRequired, MissingRequiredConsumer, AmbiguousNativeDetection, AmbiguousRetryDecision, ConsumerStorageRequired, StaleConsumerCheckpoint, OpenFailed, UnsafePermissions, ForeignDatabase, UnsupportedSchema, DatabaseFailure, Busy, StorageFull, ReadOnly, StorageIo, CorruptDatabase, StorageLimit, Interrupted, AccessDenied, ReopenRequired, InvalidRecord, OccurrenceConflict, StaleCheckpoint, StaleSharedCheckpoint, InjectedFailure, OutOfMemory, ReceiptStorageRequired, InferenceStorageRequired, DetectionStorageRequired, ReceiptConflict, ReceiptRequired, ReceiptAlreadyCommitted, ReceiptLimit, RetryStorageRequired, RetryAdmissionRequired, RetryGenerationMismatch, RetryMigrationRequired, RetryCapacity, ReceiptClockReversed };
+pub const Error = application_history.Error || action_outcome.Error || retry.Error || consumers.Error || effects.Error || effect_history.Error || action_context.Error || error{ MaintenancePinned, StaleMaintenance, PrunedReplay, InvalidMaintenanceState, MaintenanceStorageRequired, ConsumerManifestRequired, ConsumerManifestMismatch, ConsumerManifestMissing, ConsumerManifestExists, ConsumerMigrationRequired, MissingRequiredConsumer, AmbiguousNativeDetection, AmbiguousRetryDecision, ConsumerStorageRequired, StaleConsumerCheckpoint, OpenFailed, UnsafePermissions, ForeignDatabase, UnsupportedSchema, DatabaseFailure, Busy, StorageFull, ReadOnly, StorageIo, CorruptDatabase, StorageLimit, Interrupted, AccessDenied, ReopenRequired, InvalidRecord, OccurrenceConflict, StaleCheckpoint, StaleSharedCheckpoint, InjectedFailure, OutOfMemory, ReceiptStorageRequired, InferenceStorageRequired, DetectionStorageRequired, ReceiptConflict, ReceiptRequired, ReceiptAlreadyCommitted, ReceiptLimit, RetryStorageRequired, RetryAdmissionRequired, RetryGenerationMismatch, RetryMigrationRequired, RetryCapacity, ReceiptClockReversed, HistoryResetStorageRequired, InvalidHistoryReset, StaleHistoryReset };
 
 fn sqliteError(rc: c_int) Error {
     // Extended result codes retain their primary result in the low eight bits.
@@ -64,7 +67,7 @@ fn sqliteError(rc: c_int) Error {
         else => error.DatabaseFailure,
     };
 }
-pub const CommitStage = enum { before_cleanup_schema_commit, after_cleanup_mark, after_cleanup_delete, after_retry_retire, before_maintenance_schema_commit, after_source_sequence, after_replay_guard, after_record, after_checkpoint, after_shared_checkpoint, before_commit, before_receipt_commit, after_receipt_commit, after_receipt_delete, before_receipt_schema_commit, before_native_time_schema_commit, before_inference_schema_commit, before_detection_schema_commit, after_detection, before_clock_schema_commit, before_journal_detection_schema_commit, before_retry_schema_commit, after_retry_state, after_retry_decision, before_consumer_schema_commit, after_consumer_delta, before_effect_schema_commit, after_effect_owner, after_effect_intent, before_effect_dispatch_commit, before_effect_receipt_commit, before_manifest_schema_commit, before_manifest_commit, after_manifest_ready, before_consumer_input_commit };
+pub const CommitStage = enum { before_action_target_schema_commit, after_action_target_intent, before_action_target_dispatch_commit, before_action_target_settlement_commit, before_history_reset_schema_commit, after_history_reset, before_canonical_effect_schema_commit, after_history_detail_delete, after_history_event_delete, before_escalation_schema_commit, before_application_history_schema_commit, before_cleanup_schema_commit, before_retry_lease_schema_commit, after_cleanup_mark, after_cleanup_delete, after_retry_retire, before_maintenance_schema_commit, after_source_sequence, after_replay_guard, after_record, after_checkpoint, after_shared_checkpoint, before_commit, before_receipt_commit, after_receipt_commit, after_receipt_delete, before_receipt_schema_commit, before_native_time_schema_commit, before_inference_schema_commit, before_detection_schema_commit, after_detection, before_clock_schema_commit, before_journal_detection_schema_commit, before_retry_schema_commit, after_retry_state, after_retry_decision, before_consumer_schema_commit, after_consumer_delta, before_effect_schema_commit, after_effect_owner, after_effect_intent, before_effect_dispatch_commit, before_effect_receipt_commit, before_manifest_schema_commit, before_manifest_commit, after_manifest_ready, before_consumer_input_commit };
 /// Existing write admission limits also govern restored values. The SQLite row
 /// ceiling allows the largest checkpoint plus its key and record encoding.
 /// These are value/row bounds, not a process-wide memory or disk quota.
@@ -86,6 +89,14 @@ pub const ReceiptIdentity = struct {
     generation: [32]u8,
 };
 pub const Receipt = struct { time: native_time.Timestamp, generation: [32]u8 };
+pub const HistoryResetScope = union(enum) { jail: []const u8, overall };
+pub const HistoryResetIntent = struct {
+    scope: HistoryResetScope,
+    subject: detection.Subject,
+    expected_revision: u64,
+    intent_id: [32]u8,
+};
+pub const HistoryResetResult = struct { revision: u64, through_sequence: u64, reset_us: i64 };
 pub const SharedState = struct {
     name: []const u8,
     expected_revision: u64,
@@ -110,6 +121,9 @@ pub const Record = struct {
     native_detections: ?[]const detection.Outcome = null,
     consumer_manifest: ?consumers.Manifest = null,
     native_retry: ?retry.Admission = null,
+    /// Borrowed, validated observability input for this record. Retry counting
+    /// and deduplication never depend on these bytes.
+    retry_evidence: retry.Evidence = .{},
     expected_revision: u64 = 0,
     disposition: []const u8,
     /// Versioned caller-owned filter/ticket snapshot, atomically paired with cursor.
@@ -124,6 +138,13 @@ pub const Record = struct {
     effects_clock: ?effects.Clock = null,
 };
 pub const CommitResult = enum { committed, already_committed };
+pub const EscalationSelection = struct {
+    scope: retry.EscalationScope,
+    prior_confirmed: u64,
+    latest_confirmed_us: ?i64,
+    chosen_duration_us: i64,
+    jitter_us: i64,
+};
 pub const Store = struct {
     allocator: std.mem.Allocator,
     api: Api,
@@ -146,6 +167,12 @@ pub const Store = struct {
     runtime_limits: bool = false,
     runtime_path: ?[]const u8 = null,
     work_remaining: u32 = 1000,
+    escalation_jitter_context: ?*anyopaque = null,
+    escalation_jitter: *const fn (?*anyopaque, u64) u64 = systemEscalationJitter,
+
+    fn systemEscalationJitter(_: ?*anyopaque, maximum_seconds: u64) u64 {
+        return std.crypto.random.uintAtMost(u64, maximum_seconds);
+    }
 
     /// One daemon-wide SQLite heap ceiling and per-transaction VM allowance.
     /// These exclude Zig/OS/helper allocations and do not promise a disk quota.
@@ -842,6 +869,225 @@ pub const Store = struct {
         try self.commitTransaction();
         self.schema_version = @max(schema, 15);
     }
+
+    /// Schema 16 gives retry authority the same explicit absent/finite/permanent
+    /// lease tags already used by effects. Existing schema-15 values are finite
+    /// or absent and retain their exact absolute deadlines.
+    pub fn enableRetryLeases(self: *Store) Error!void {
+        try self.beginWrite();
+        errdefer self.rollback();
+        const schema = try self.integer("PRAGMA user_version;");
+        if (schema < 15 or schema > latest_schema) return error.UnsupportedSchema;
+        if (schema == 15) {
+            var names: [64][64]u8 = undefined;
+            var lengths: [64]u8 = undefined;
+            var policies: [64][retry.policy_bytes]u8 = undefined;
+            var count: usize = 0;
+            {
+                var rows = try self.statement("SELECT jail,policy FROM retry_policies ORDER BY jail;");
+                defer rows.deinit();
+                while (try rows.row()) {
+                    if (count == names.len or self.api.column_type(rows.ptr, 0) != 3) return error.InvalidRetryState;
+                    const jail = try rows.boundedBytes(0, 64);
+                    if (jail.len == 0) return error.InvalidRetryState;
+                    const raw = try rows.boundedBytes(1, retry.policy_bytes);
+                    if (raw.len != retry.policy_bytes or (raw[4] != 1 and raw[4] != 2)) return error.InvalidRetryPolicy;
+                    const policy = try retry.Policy.decode(raw);
+                    if (policy.duration == .permanent) return error.InvalidRetryPolicy;
+                    lengths[count] = @intCast(jail.len);
+                    @memcpy(names[count][0..jail.len], jail);
+                    policies[count] = try policy.encode();
+                    count += 1;
+                }
+            }
+            try self.exec(
+                \\CREATE TABLE retry_states_v16(jail TEXT NOT NULL,family INTEGER NOT NULL CHECK(typeof(family)='integer' AND family IN (4,6)),subject BLOB NOT NULL CHECK(typeof(subject)='blob' AND length(subject)=CASE family WHEN 4 THEN 4 ELSE 16 END),last_processed_us INTEGER NOT NULL CHECK(typeof(last_processed_us)='integer'),lease_kind INTEGER NOT NULL CHECK(typeof(lease_kind)='integer' AND lease_kind BETWEEN 0 AND 2),deadline_us INTEGER CHECK(deadline_us IS NULL OR typeof(deadline_us)='integer'),decisions INTEGER NOT NULL CHECK(typeof(decisions)='integer' AND decisions>=0),attempts BLOB NOT NULL CHECK(typeof(attempts)='blob' AND length(attempts)<=5120 AND length(attempts)%40=0),PRIMARY KEY(jail,family,subject),FOREIGN KEY(jail) REFERENCES retry_policies(jail),CHECK((lease_kind=1)=(deadline_us IS NOT NULL)),CHECK(lease_kind=0 OR decisions>0),CHECK(lease_kind=0 OR length(attempts)=0),CHECK(deadline_us IS NULL OR deadline_us>last_processed_us));
+                \\INSERT INTO retry_states_v16 SELECT jail,family,subject,last_processed_us,CASE WHEN expiry_us IS NULL THEN 0 ELSE 1 END,expiry_us,decisions,attempts FROM retry_states;
+                \\DROP TABLE retry_states;
+                \\ALTER TABLE retry_states_v16 RENAME TO retry_states;
+                \\CREATE TABLE retry_decisions_v16(jail TEXT NOT NULL,source TEXT NOT NULL,occurrence TEXT NOT NULL,family INTEGER NOT NULL CHECK(typeof(family)='integer' AND family IN (4,6)),subject BLOB NOT NULL CHECK(typeof(subject)='blob' AND length(subject)=CASE family WHEN 4 THEN 4 ELSE 16 END),decided_us INTEGER NOT NULL CHECK(typeof(decided_us)='integer'),lease_kind INTEGER NOT NULL CHECK(typeof(lease_kind)='integer' AND lease_kind IN (1,2)),deadline_us INTEGER CHECK(deadline_us IS NULL OR typeof(deadline_us)='integer'),ordinal INTEGER NOT NULL CHECK(typeof(ordinal)='integer' AND ordinal>0),enforce INTEGER NOT NULL CHECK(typeof(enforce)='integer' AND enforce IN (0,1)),PRIMARY KEY(jail,source,occurrence,family,subject),UNIQUE(jail,family,subject,ordinal),FOREIGN KEY(jail,source,occurrence) REFERENCES records(jail,source,occurrence),CHECK((lease_kind=1)=(deadline_us IS NOT NULL)),CHECK(deadline_us IS NULL OR deadline_us>decided_us));
+                \\INSERT INTO retry_decisions_v16 SELECT jail,source,occurrence,family,subject,decided_us,1,expiry_us,ordinal,enforce FROM retry_decisions;
+                \\DROP TABLE retry_decisions;
+                \\ALTER TABLE retry_decisions_v16 RENAME TO retry_decisions;
+            );
+            for (0..count) |index| {
+                var update = try self.statement("UPDATE retry_policies SET policy=?2 WHERE jail=?1;");
+                defer update.deinit();
+                try update.text(1, names[index][0..lengths[index]]);
+                try update.blob(2, &policies[index]);
+                try update.done();
+                if (self.api.changes(self.db) != 1) return error.InvalidRetryState;
+            }
+            try self.exec("PRAGMA user_version=16;");
+        }
+        try self.fault(.before_retry_lease_schema_commit);
+        try self.commitTransaction();
+        self.schema_version = @max(schema, 16);
+    }
+
+    /// Schema 17 retains bounded optional decision detail separately from live
+    /// retry rows and snapshots it only when an effect is actually confirmed.
+    /// Existing/manual events remain valid with explicitly unavailable detail.
+    pub fn enableApplicationHistory(self: *Store) Error!void {
+        try self.beginWrite();
+        errdefer self.rollback();
+        const schema = try self.integer("PRAGMA user_version;");
+        if (schema < 16 or schema > latest_schema) return error.UnsupportedSchema;
+        if (schema == 16) try self.exec(
+            \\CREATE TABLE retry_decision_details(jail TEXT NOT NULL,source TEXT NOT NULL,occurrence TEXT NOT NULL,family INTEGER NOT NULL CHECK(typeof(family)='integer' AND family IN (4,6)),subject BLOB NOT NULL CHECK(typeof(subject)='blob' AND length(subject)=CASE family WHEN 4 THEN 4 ELSE 16 END),ordinal INTEGER NOT NULL CHECK(typeof(ordinal)='integer' AND ordinal>0),decided_us INTEGER NOT NULL CHECK(typeof(decided_us)='integer'),effect_decision_id BLOB UNIQUE CHECK(effect_decision_id IS NULL OR (typeof(effect_decision_id)='blob' AND length(effect_decision_id)=32)),evidence TEXT CHECK(evidence IS NULL OR (typeof(evidence)='text' AND length(CAST(evidence AS BLOB)) BETWEEN 1 AND 2048)),PRIMARY KEY(jail,source,occurrence,family,subject));
+            \\CREATE TABLE confirmed_event_details(event_id BLOB PRIMARY KEY NOT NULL CHECK(typeof(event_id)='blob' AND length(event_id)=32),source TEXT NOT NULL,occurrence TEXT NOT NULL,decided_us INTEGER NOT NULL CHECK(typeof(decided_us)='integer'),ordinal INTEGER NOT NULL CHECK(typeof(ordinal)='integer' AND ordinal>0),evidence TEXT CHECK(evidence IS NULL OR (typeof(evidence)='text' AND length(CAST(evidence AS BLOB)) BETWEEN 1 AND 2048)),FOREIGN KEY(event_id) REFERENCES confirmed_effect_events(event_id));
+            \\CREATE INDEX confirmed_effect_events_jail_time ON confirmed_effect_events(jail,confirmed_us,event_id);
+            \\CREATE INDEX confirmed_effect_events_time ON confirmed_effect_events(confirmed_us,event_id);
+            \\CREATE TABLE policy_summary_clock(id INTEGER PRIMARY KEY CHECK(id=1),revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision BETWEEN 1 AND 9223372036854775806));
+            \\INSERT INTO policy_summary_clock VALUES(1,1);
+            \\CREATE TRIGGER policy_summary_state_insert AFTER INSERT ON retry_states BEGIN UPDATE policy_summary_clock SET revision=revision+1 WHERE id=1; END;
+            \\CREATE TRIGGER policy_summary_state_update AFTER UPDATE ON retry_states BEGIN UPDATE policy_summary_clock SET revision=revision+1 WHERE id=1; END;
+            \\CREATE TRIGGER policy_summary_state_delete AFTER DELETE ON retry_states BEGIN UPDATE policy_summary_clock SET revision=revision+1 WHERE id=1; END;
+            \\CREATE TRIGGER policy_summary_retired_insert AFTER INSERT ON retry_retired BEGIN UPDATE policy_summary_clock SET revision=revision+1 WHERE id=1; END;
+            \\CREATE TRIGGER policy_summary_retired_update AFTER UPDATE ON retry_retired BEGIN UPDATE policy_summary_clock SET revision=revision+1 WHERE id=1; END;
+            \\CREATE TRIGGER policy_summary_retired_delete AFTER DELETE ON retry_retired BEGIN UPDATE policy_summary_clock SET revision=revision+1 WHERE id=1; END;
+            \\PRAGMA user_version=17;
+        );
+        try self.fault(.before_application_history_schema_commit);
+        try self.commitTransaction();
+        self.schema_version = @max(schema, 17);
+    }
+
+    /// Schema 18 admits escalation policy bytes, confirmation-only subject
+    /// summaries, and the exact selected input/result for each escalated decision.
+    pub fn enableEscalation(self: *Store) Error!void {
+        try self.beginWrite();
+        errdefer self.rollback();
+        const schema = try self.integer("PRAGMA user_version;");
+        if (schema < 17 or schema > latest_schema) return error.UnsupportedSchema;
+        if (schema == 17) {
+            try self.exec(
+                \\CREATE TABLE retry_escalation_policies(jail TEXT PRIMARY KEY NOT NULL,generation BLOB NOT NULL CHECK(typeof(generation)='blob' AND length(generation)=32),policy BLOB NOT NULL CHECK(typeof(policy)='blob' AND length(policy)=40),FOREIGN KEY(jail) REFERENCES retry_policies(jail));
+                \\CREATE TABLE confirmed_policy_summaries(jail TEXT NOT NULL,family INTEGER NOT NULL CHECK(family IN (4,6)),subject BLOB NOT NULL CHECK(typeof(subject)='blob' AND length(subject)=CASE family WHEN 4 THEN 4 ELSE 16 END),confirmed_count INTEGER NOT NULL CHECK(typeof(confirmed_count)='integer' AND confirmed_count>0),latest_confirmed_us INTEGER NOT NULL CHECK(typeof(latest_confirmed_us)='integer'),PRIMARY KEY(jail,family,subject),FOREIGN KEY(jail) REFERENCES retry_policies(jail));
+                \\CREATE TABLE retry_decision_escalations(jail TEXT NOT NULL,source TEXT NOT NULL,occurrence TEXT NOT NULL,family INTEGER NOT NULL CHECK(family IN (4,6)),subject BLOB NOT NULL CHECK(typeof(subject)='blob' AND length(subject)=CASE family WHEN 4 THEN 4 ELSE 16 END),scope INTEGER NOT NULL CHECK(scope IN (1,2)),prior_confirmed INTEGER NOT NULL CHECK(typeof(prior_confirmed)='integer' AND prior_confirmed>=0),latest_confirmed_us INTEGER CHECK(latest_confirmed_us IS NULL OR typeof(latest_confirmed_us)='integer'),chosen_duration_us INTEGER NOT NULL CHECK(typeof(chosen_duration_us)='integer' AND chosen_duration_us>0 AND chosen_duration_us%1000000=0),jitter_us INTEGER NOT NULL CHECK(typeof(jitter_us)='integer' AND jitter_us>=0 AND jitter_us%1000000=0),PRIMARY KEY(jail,source,occurrence,family,subject),FOREIGN KEY(jail,source,occurrence,family,subject) REFERENCES retry_decisions(jail,source,occurrence,family,subject),CHECK((prior_confirmed=0)=(latest_confirmed_us IS NULL)));
+            );
+            const detailed = try self.integer("SELECT count(*) FROM confirmed_event_details;");
+            const joinable = try self.integer("SELECT count(*) FROM confirmed_event_details d JOIN confirmed_effect_events e USING(event_id) JOIN retry_decision_details r ON r.jail=e.jail AND r.effect_decision_id=e.decision_id;");
+            if (detailed != joinable) return error.RetryMigrationRequired;
+            try self.exec("INSERT INTO confirmed_policy_summaries SELECT r.jail,r.family,r.subject,count(*),max(e.confirmed_us) FROM confirmed_event_details d JOIN confirmed_effect_events e USING(event_id) JOIN retry_decision_details r ON r.jail=e.jail AND r.effect_decision_id=e.decision_id GROUP BY r.jail,r.family,r.subject;");
+            var names: [64][64]u8 = undefined;
+            var lengths: [64]u8 = undefined;
+            var generations: [64][32]u8 = undefined;
+            var count: usize = 0;
+            {
+                var rows = try self.statement("SELECT jail,generation FROM retry_policies ORDER BY jail;");
+                defer rows.deinit();
+                while (try rows.row()) {
+                    if (count == names.len or self.api.column_type(rows.ptr, 0) != 3) return error.InvalidRetryState;
+                    const jail = try rows.boundedBytes(0, 64);
+                    const generation = try rows.boundedBytes(1, 32);
+                    if (jail.len == 0 or generation.len != 32) return error.InvalidRetryState;
+                    lengths[count] = @intCast(jail.len);
+                    @memcpy(names[count][0..jail.len], jail);
+                    @memcpy(&generations[count], generation);
+                    count += 1;
+                }
+            }
+            const disabled = try (retry.Escalation{}).encode();
+            for (0..count) |index| {
+                var insert = try self.statement("INSERT INTO retry_escalation_policies VALUES(?1,?2,?3);");
+                defer insert.deinit();
+                try insert.text(1, names[index][0..lengths[index]]);
+                try insert.blob(2, &generations[index]);
+                try insert.blob(3, &disabled);
+                try insert.done();
+            }
+            try self.exec("PRAGMA user_version=18;");
+        }
+        try self.fault(.before_escalation_schema_commit);
+        try self.commitTransaction();
+        self.schema_version = @max(schema, 18);
+    }
+
+    /// Schema 19 makes the accepted F2FS-v2 canonical scope the sole decoded
+    /// effect scope. The retained 24-byte column is migration compatibility
+    /// storage only and is never consulted by a schema-19 reader.
+    pub fn enableCanonicalEffects(self: *Store) Error!void {
+        try self.beginWrite();
+        errdefer self.rollback();
+        const schema = try self.integer("PRAGMA user_version;");
+        if (schema < 18 or schema > latest_schema) return error.UnsupportedSchema;
+        if (schema == 18) {
+            const installation = try self.readInstallation();
+            var count: usize = 0;
+            {
+                var rows = try self.statement("SELECT scope_key,scope FROM native_effects ORDER BY scope_key;");
+                defer rows.deinit();
+                while (try rows.row()) {
+                    count += 1;
+                    if (count > effects.max_effects) return error.EffectCapacity;
+                    const scope = try effects.Scope.decode(&try effectBlob(&rows, 1, effects.Scope.encoded_bytes));
+                    const admitted = installation orelse return error.InstallationRequired;
+                    if (!std.mem.eql(u8, &try effectBlob(&rows, 0, 32), &try scope.key(admitted))) return error.InvalidEffect;
+                }
+            }
+            try self.exec(
+                \\ALTER TABLE native_effects ADD COLUMN canonical_scope BLOB CHECK(canonical_scope IS NULL OR (typeof(canonical_scope)='blob' AND length(canonical_scope)=92));
+                \\UPDATE native_effects SET canonical_scope=CAST(x'02'||substr(scope,2,1)||x'01'||substr(scope,3,1)||x'010000010101010101010100'||substr(scope,9,16)||zeroblob(60) AS BLOB);
+                \\CREATE TRIGGER native_effect_scope_v2_insert BEFORE INSERT ON native_effects WHEN NEW.canonical_scope IS NULL BEGIN SELECT RAISE(ABORT,'canonical effect scope required'); END;
+                \\CREATE TRIGGER native_effect_scope_v2_update BEFORE UPDATE OF canonical_scope ON native_effects WHEN NEW.canonical_scope IS NULL OR NEW.canonical_scope IS NOT OLD.canonical_scope BEGIN SELECT RAISE(ABORT,'canonical effect scope immutable'); END;
+                \\PRAGMA user_version=19;
+            );
+            var verified: usize = 0;
+            {
+                var canonical_rows = try self.statement("SELECT canonical_scope FROM native_effects ORDER BY scope_key;");
+                defer canonical_rows.deinit();
+                while (try canonical_rows.row()) {
+                    verified += 1;
+                    _ = try effects.Scope.decodeCanonical(&try effectBlob(&canonical_rows, 0, effects.Scope.canonical_encoded_bytes));
+                }
+            }
+            if (verified != count) return error.InvalidEffect;
+        }
+        try self.fault(.before_canonical_effect_schema_commit);
+        try self.commitTransaction();
+        self.schema_version = @max(schema, 19);
+    }
+
+    /// Schema 20 records only operator history-reset watermarks. Confirmed
+    /// events remain immutable, and effect/owner state is intentionally not
+    /// referenced so resetting history cannot change protection.
+    pub fn enableHistoryResets(self: *Store) Error!void {
+        try self.beginWrite();
+        errdefer self.rollback();
+        const schema = try self.integer("PRAGMA user_version;");
+        if (schema < 19 or schema > latest_schema) return error.UnsupportedSchema;
+        if (schema == 19) try self.exec(
+            \\CREATE TABLE history_reset_watermarks(scope INTEGER NOT NULL CHECK(scope IN(1,2)),jail TEXT NOT NULL CHECK((scope=1 AND length(jail) BETWEEN 1 AND 64) OR (scope=2 AND jail='')),family INTEGER NOT NULL CHECK(family IN(4,6)),subject BLOB NOT NULL CHECK(typeof(subject)='blob' AND length(subject)=CASE family WHEN 4 THEN 4 ELSE 16 END),through_sequence INTEGER NOT NULL CHECK(typeof(through_sequence)='integer' AND through_sequence>=0),reset_us INTEGER NOT NULL CHECK(typeof(reset_us)='integer'),revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0),intent_id BLOB NOT NULL CHECK(typeof(intent_id)='blob' AND length(intent_id)=32),PRIMARY KEY(scope,jail,family,subject));
+            \\PRAGMA user_version=20;
+        );
+        try self.fault(.before_history_reset_schema_commit);
+        try self.commitTransaction();
+        self.schema_version = @max(schema, 20);
+    }
+
+    /// Schema 21 stores exactly the selected enforcement and no-op notification
+    /// targets. It adds no executable/provider configuration and does not alter
+    /// effect authority.
+    pub fn enableActionTargets(self: *Store) Error!void {
+        try self.beginWrite();
+        errdefer self.rollback();
+        const schema = try self.integer("PRAGMA user_version;");
+        if (schema < 20 or schema > latest_schema) return error.UnsupportedSchema;
+        if (schema == 20) {
+            const owner_count = try self.integer("SELECT count(*) FROM effect_owners;");
+            if (owner_count < 0 or owner_count > action_outcome.max_rows / action_outcome.max_targets_per_action) return error.ActionTargetCapacity;
+            try self.exec(
+                \\CREATE TABLE action_targets(action_id BLOB NOT NULL CHECK(typeof(action_id)='blob' AND length(action_id)=32),kind INTEGER NOT NULL CHECK(kind IN(1,2)),scope_key BLOB NOT NULL CHECK(typeof(scope_key)='blob' AND length(scope_key)=32),jail TEXT NOT NULL CHECK(length(jail) BETWEEN 1 AND 64),required INTEGER NOT NULL CHECK(required IN(0,1) AND required=(kind=1)),restored INTEGER NOT NULL CHECK(restored IN(0,1)),status INTEGER NOT NULL CHECK(status BETWEEN 1 AND 6),intent_us INTEGER NOT NULL CHECK(typeof(intent_us)='integer'),dispatch_us INTEGER CHECK(dispatch_us IS NULL OR (typeof(dispatch_us)='integer' AND dispatch_us>=intent_us)),settled_us INTEGER CHECK(settled_us IS NULL OR (typeof(settled_us)='integer' AND settled_us>=dispatch_us)),metadata TEXT CHECK(metadata IS NULL OR (typeof(metadata)='text' AND length(CAST(metadata AS BLOB)) BETWEEN 1 AND 512)),PRIMARY KEY(action_id,kind),CHECK((status=1 AND dispatch_us IS NULL AND settled_us IS NULL) OR (status=2 AND dispatch_us IS NOT NULL AND settled_us IS NULL) OR (status BETWEEN 3 AND 5 AND dispatch_us IS NOT NULL AND settled_us IS NOT NULL) OR (status=6 AND kind=2 AND restored=1 AND dispatch_us IS NULL AND settled_us=intent_us)),CHECK(kind!=1 OR status!=6),CHECK(kind!=2 OR restored=0 OR status=6));
+                \\INSERT INTO action_targets(action_id,kind,scope_key,jail,required,restored,status,intent_us) SELECT decision_id,1,scope_key,jail,1,1,1,decided_us FROM effect_owners;
+                \\INSERT INTO action_targets(action_id,kind,scope_key,jail,required,restored,status,intent_us,settled_us) SELECT decision_id,2,scope_key,jail,0,1,6,decided_us,decided_us FROM effect_owners;
+                \\PRAGMA user_version=21;
+            );
+        }
+        try self.fault(.before_action_target_schema_commit);
+        try self.commitTransaction();
+        self.schema_version = @max(schema, 21);
+    }
     pub const CleanupFence = struct {
         jail: []const u8,
         source: []const u8,
@@ -976,7 +1222,7 @@ pub const Store = struct {
         }
         var decisions: [max_native_detections]retry.Decision = undefined;
         const decision_count = try self.retryDecisions(fence.jail, fence.source, occurrence, &decisions);
-        for (decisions[0..decision_count]) |decision| if (decision.expiry_us > now or try self.subjectEffectPinned(decision.subject)) return true;
+        for (decisions[0..decision_count]) |decision| if (decision.lease.live(now) or try self.subjectEffectPinned(decision.subject)) return true;
         return false;
     }
     fn orderRecord(self: *Store, fence: CleanupFence, sequence: u64) Error!Stmt {
@@ -1188,10 +1434,8 @@ pub const Store = struct {
         if (try self.readRetired(fence.jail, candidate.subject) != null) return error.StaleMaintenance;
         const state = try self.readRetryState(fence.jail, candidate.subject, admission.policy) orelse return error.StaleMaintenance;
         if (state.last_processed_us != candidate.last_processed_us or state.decisions != candidate.decisions) return error.StaleMaintenance;
-        var pinned = if (state.expiry_us) |expiry| expiry > now else false;
-        for (state.attempts[0..state.count]) |attempt| if (@as(i128, attempt.at_us) >= @as(i128, now) - admission.policy.window_us) {
-            pinned = true;
-        };
+        const logical = (try retry.prune(admission.policy, state, now)).state;
+        const pinned = logical.lease != .absent or logical.count != 0;
         if (pinned or try self.subjectEffectPinned(candidate.subject)) {
             try self.commitTransaction();
             return false;
@@ -1448,7 +1692,12 @@ pub const Store = struct {
         if (output.len == 0 or output.len > effect_history.max_page) return error.InvalidHistoryPage;
         var token = try self.historyHead(installation, after);
         if (expected_revision) |wanted_revision| if (wanted_revision != token.stream_revision) return error.StaleHistoryPage;
-        var row = try self.statement("SELECT s.sequence,e.event_id,e.scope_key,n.scope,e.jail,e.decision_id,e.confirmed_us FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;");
+        var row = try self.statement(if (self.schema_version >= 19)
+            "SELECT s.sequence,e.event_id,e.scope_key,n.canonical_scope,e.jail,e.decision_id,e.confirmed_us,EXISTS(SELECT 1 FROM confirmed_event_details d WHERE d.event_id=e.event_id) FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;"
+        else if (self.schema_version >= 17)
+            "SELECT s.sequence,e.event_id,e.scope_key,n.scope,e.jail,e.decision_id,e.confirmed_us,EXISTS(SELECT 1 FROM confirmed_event_details d WHERE d.event_id=e.event_id) FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;"
+        else
+            "SELECT s.sequence,e.event_id,e.scope_key,n.scope,e.jail,e.decision_id,e.confirmed_us FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;");
         defer row.deinit();
         try row.int(1, @intCast(after));
         try row.int(2, @intCast(output.len));
@@ -1456,7 +1705,12 @@ pub const Store = struct {
         while (try row.row()) {
             const sequence = try row.signed(0);
             if (sequence <= 0 or sequence != after + count + 1 or sequence > token.head_sequence) return error.HistoryGap;
-            const event = effect_history.Event{ .sequence = @intCast(sequence), .event_id = try effectBlob(&row, 1, 32), .installation = installation, .scope_key = try effectBlob(&row, 2, 32), .scope = try effects.Scope.decode(&try effectBlob(&row, 3, effects.Scope.encoded_bytes)), .jail = detection.Name.init(try row.boundedBytes(4, 64)) catch return error.InvalidHistoryEvent, .decision_id = try effectBlob(&row, 5, 32), .confirmed_us = try row.signed(6) };
+            const native_retry = if (self.schema_version >= 17) blk: {
+                const value = try row.signed(7);
+                if (value < 0 or value > 1) return error.InvalidHistoryEvent;
+                break :blk value == 1;
+            } else false;
+            const event = effect_history.Event{ .sequence = @intCast(sequence), .event_id = try effectBlob(&row, 1, 32), .installation = installation, .scope_key = try effectBlob(&row, 2, 32), .scope = try self.decodeStoredScope(&row, 3), .jail = detection.Name.init(try row.boundedBytes(4, 64)) catch return error.InvalidHistoryEvent, .decision_id = try effectBlob(&row, 5, 32), .confirmed_us = try row.signed(6), .native_retry = native_retry };
             try event.validate();
             output[count] = event;
             count += 1;
@@ -1476,6 +1730,378 @@ pub const Store = struct {
         try self.commitTransaction();
         return page;
     }
+
+    /// True when a retained immutable event is newer than every applicable
+    /// jail-specific or overall-subject reset. This is checked immediately
+    /// before recurrence projection so a stale page cannot replay reset input.
+    pub fn historyEventEligible(self: *Store, event: effect_history.Event) Error!bool {
+        try event.validate();
+        if (self.schema_version < 20) return true;
+        if (event.scope.canonical.subject.kind != .host) return error.InvalidHistoryReset;
+        const subject: detection.Subject = switch (event.scope.canonical.subject.family) {
+            .v4 => .{ .v4 = event.scope.canonical.subject.address[0..4].* },
+            .v6 => .{ .v6 = event.scope.canonical.subject.address },
+        };
+        try self.beginRead();
+        errdefer self.rollback();
+        var row = try self.statement("SELECT max(through_sequence) FROM history_reset_watermarks WHERE family=?1 AND subject=?2 AND ((scope=1 AND jail=?3) OR (scope=2 AND jail=''));");
+        defer row.deinit();
+        try bindSubjectAt(&row, &subject, 1);
+        try row.text(3, event.jail.slice());
+        if (!try row.row()) return error.InvalidHistoryReset;
+        const through = try row.optionalSigned(0);
+        if (try row.row()) return error.InvalidHistoryReset;
+        try self.commitTransaction();
+        if (through) |value| {
+            if (value < 0) return error.InvalidHistoryReset;
+            return event.sequence > @as(u64, @intCast(value));
+        }
+        return true;
+    }
+
+    /// Advance a typed reset watermark without modifying effect ownership or
+    /// immutable confirmed events. The matching escalation summaries are
+    /// removed in the same transaction; later confirmations start at one.
+    pub fn resetHistory(self: *Store, intent: HistoryResetIntent, clock: effects.Clock) Error!HistoryResetResult {
+        intent.subject.validate() catch return error.InvalidHistoryReset;
+        if (intent.subject.unenforceable() or intent.expected_revision > std.math.maxInt(i64) or std.mem.allEqual(u8, &intent.intent_id, 0)) return error.InvalidHistoryReset;
+        const scope_value: i64 = switch (intent.scope) {
+            .jail => |name| blk: {
+                _ = detection.Name.init(name) catch return error.InvalidHistoryReset;
+                break :blk 1;
+            },
+            .overall => 2,
+        };
+        const jail = switch (intent.scope) {
+            .jail => |name| name,
+            .overall => "",
+        };
+        try self.beginWrite();
+        errdefer self.rollback();
+        if (self.schema_version < 20) return error.HistoryResetStorageRequired;
+        var existing = try self.statement("SELECT through_sequence,reset_us,revision,intent_id FROM history_reset_watermarks WHERE scope=?1 AND jail=?2 AND family=?3 AND subject=?4;");
+        defer existing.deinit();
+        try existing.int(1, scope_value);
+        try existing.text(2, jail);
+        try bindSubjectAt(&existing, &intent.subject, 3);
+        var prior_revision: u64 = 0;
+        if (try existing.row()) {
+            const through = try existing.signed(0);
+            const reset_us = try existing.signed(1);
+            const saved_revision = try existing.signed(2);
+            const prior_intent = try effectBlob(&existing, 3, 32);
+            if (through < 0 or saved_revision <= 0 or try existing.row()) return error.InvalidHistoryReset;
+            if (std.mem.eql(u8, &prior_intent, &intent.intent_id)) {
+                try self.commitTransaction();
+                return .{ .revision = @intCast(saved_revision), .through_sequence = @intCast(through), .reset_us = reset_us };
+            }
+            prior_revision = @intCast(saved_revision);
+        }
+        if (prior_revision != intent.expected_revision) return error.StaleHistoryReset;
+        if (prior_revision == std.math.maxInt(i64)) return error.InvalidHistoryReset;
+        if (prior_revision == 0 and try self.integer("SELECT count(*) FROM history_reset_watermarks;") >= effects.max_effects) return error.EffectCapacity;
+        const now = try self.effectClock(clock);
+        const head_value = try self.integer("SELECT head FROM confirmed_history_stream WHERE id=1;");
+        if (head_value < 0) return error.InvalidHistoryReset;
+        const head: u64 = @intCast(head_value);
+        {
+            var write = try self.statement("INSERT INTO history_reset_watermarks VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(scope,jail,family,subject) DO UPDATE SET through_sequence=excluded.through_sequence,reset_us=excluded.reset_us,revision=excluded.revision,intent_id=excluded.intent_id;");
+            defer write.deinit();
+            try write.int(1, scope_value);
+            try write.text(2, jail);
+            try bindSubjectAt(&write, &intent.subject, 3);
+            try write.int(5, @intCast(head));
+            try write.int(6, now);
+            try write.int(7, @intCast(prior_revision + 1));
+            try write.blob(8, &intent.intent_id);
+            try write.done();
+            if (self.api.changes(self.db) != 1) return error.InvalidHistoryReset;
+        }
+        {
+            var summaries = try self.statement(if (scope_value == 1)
+                "DELETE FROM confirmed_policy_summaries WHERE jail=?1 AND family=?2 AND subject=?3;"
+            else
+                "DELETE FROM confirmed_policy_summaries WHERE family=?1 AND subject=?2;");
+            defer summaries.deinit();
+            if (scope_value == 1) {
+                try summaries.text(1, jail);
+                try bindSubjectAt(&summaries, &intent.subject, 2);
+            } else try bindSubjectAt(&summaries, &intent.subject, 1);
+            try summaries.done();
+        }
+        try self.fault(.after_history_reset);
+        _ = try self.commitEffectClock(clock);
+        try self.commitTransaction();
+        return .{ .revision = prior_revision + 1, .through_sequence = head, .reset_us = now };
+    }
+
+    fn readActionTargetsTx(self: *Store, action_id: [32]u8, output: *[action_outcome.max_targets_per_action]action_outcome.Target) Error!usize {
+        var row = try self.statement("SELECT scope_key,jail,kind,required,restored,status,intent_us,dispatch_us,settled_us,metadata FROM action_targets WHERE action_id=?1 ORDER BY kind;");
+        defer row.deinit();
+        try row.blob(1, &action_id);
+        var count: usize = 0;
+        while (try row.row()) {
+            if (count == output.len) return error.InvalidActionTarget;
+            const kind_value = try row.signed(2);
+            const required = try row.signed(3);
+            const restored = try row.signed(4);
+            const status_value = try row.signed(5);
+            const intent_us = try row.signed(6);
+            const dispatch_us = try row.optionalSigned(7);
+            const settled_us = try row.optionalSigned(8);
+            if (required < 0 or required > 1 or restored < 0 or restored > 1) return error.InvalidActionTarget;
+            const kind = std.meta.intToEnum(action_outcome.Kind, kind_value) catch return error.InvalidActionTarget;
+            const status = std.meta.intToEnum(action_outcome.Status, status_value) catch return error.InvalidActionTarget;
+            const jail = detection.Name.init(try row.boundedBytes(1, 64)) catch return error.InvalidActionTarget;
+            var target = action_outcome.Target{ .action_id = action_id, .scope_key = try effectBlob(&row, 0, 32), .jail = jail, .kind = kind, .required = required == 1, .restored = restored == 1, .status = status, .intent_us = intent_us, .dispatch_us = dispatch_us, .settled_us = settled_us, .metadata_len = 0 };
+            if (self.api.column_type(row.ptr, 9) != 5) {
+                const metadata = try row.boundedBytes(9, action_outcome.max_metadata_bytes);
+                if (metadata.len == 0 or !std.unicode.utf8ValidateSlice(metadata)) return error.InvalidActionTarget;
+                target.metadata_len = @intCast(metadata.len);
+                @memcpy(target.metadata_bytes[0..metadata.len], metadata);
+            }
+            output[count] = target;
+            count += 1;
+        }
+        return count;
+    }
+
+    fn prepareActionTargetsTx(self: *Store, intent: action_outcome.Intent, now: i64) Error!void {
+        try intent.validate();
+        var existing: [action_outcome.max_targets_per_action]action_outcome.Target = undefined;
+        const existing_count = try self.readActionTargetsTx(intent.action_id, &existing);
+        if (existing_count != 0) {
+            if (existing_count != action_outcome.max_targets_per_action) return error.InvalidActionTarget;
+            for (existing, 0..) |target, index| {
+                if (target.kind != @as(action_outcome.Kind, if (index == 0) .enforcement else .notification) or
+                    !std.mem.eql(u8, &target.scope_key, &intent.scope_key) or !std.mem.eql(u8, target.jail.slice(), intent.jail) or
+                    target.restored != intent.restored or !std.mem.eql(u8, target.metadata(), intent.metadata orelse "")) return error.InvalidActionTarget;
+            }
+            return;
+        }
+        if (try self.integer("SELECT count(*) FROM action_targets;") > action_outcome.max_rows - action_outcome.max_targets_per_action) return error.ActionTargetCapacity;
+        for ([_]action_outcome.Kind{ .enforcement, .notification }) |kind| {
+            const suppressed = kind == .notification and intent.restored;
+            var insert = try self.statement("INSERT INTO action_targets VALUES(?1,?2,?3,?4,?5,?6,?7,?8,NULL,?9,?10);");
+            defer insert.deinit();
+            try insert.blob(1, &intent.action_id);
+            try insert.int(2, @intFromEnum(kind));
+            try insert.blob(3, &intent.scope_key);
+            try insert.text(4, intent.jail);
+            try insert.int(5, if (kind == .enforcement) 1 else 0);
+            try insert.int(6, @intFromBool(intent.restored));
+            try insert.int(7, @intFromEnum(if (suppressed) action_outcome.Status.suppressed_restored else .pending));
+            try insert.int(8, now);
+            if (suppressed) try insert.int(9, now);
+            if (intent.metadata) |metadata| try insert.text(10, metadata);
+            try insert.done();
+        }
+        try self.fault(.after_action_target_intent);
+    }
+
+    /// Atomically persist the two selected target intents before either target
+    /// dispatches. Exact replay validates immutable identity and is a no-op.
+    pub fn prepareActionTargets(self: *Store, intent: action_outcome.Intent, clock: effects.Clock) Error!void {
+        try self.beginWrite();
+        errdefer self.rollback();
+        if (self.schema_version < 21) return error.ActionTargetStorageRequired;
+        const now = try self.effectClock(clock);
+        try self.prepareActionTargetsTx(intent, now);
+        _ = try self.commitEffectClock(clock);
+        try self.commitTransaction();
+    }
+
+    pub fn actionTargets(self: *Store, action_id: [32]u8, output: *[action_outcome.max_targets_per_action]action_outcome.Target) Error!usize {
+        if (std.mem.allEqual(u8, &action_id, 0) or self.schema_version < 21) return error.InvalidActionTarget;
+        try self.beginRead();
+        errdefer self.rollback();
+        const count = try self.readActionTargetsTx(action_id, output);
+        try self.commitTransaction();
+        return count;
+    }
+
+    /// Dispatch may be retried only from an uncertain outcome. Terminal target
+    /// outcomes never silently reopen.
+    pub fn markActionTargetDispatched(self: *Store, action_id: [32]u8, kind: action_outcome.Kind, clock: effects.Clock) Error!void {
+        try self.beginWrite();
+        errdefer self.rollback();
+        if (self.schema_version < 21) return error.ActionTargetStorageRequired;
+        const now = try self.effectClock(clock);
+        var row = try self.statement("SELECT status FROM action_targets WHERE action_id=?1 AND kind=?2;");
+        defer row.deinit();
+        try row.blob(1, &action_id);
+        try row.int(2, @intFromEnum(kind));
+        if (!try row.row()) return error.StaleActionTarget;
+        const status = std.meta.intToEnum(action_outcome.Status, try row.signed(0)) catch return error.InvalidActionTarget;
+        if (try row.row()) return error.InvalidActionTarget;
+        if (status == .dispatched) {
+            try self.commitTransaction();
+            return;
+        }
+        if (status != .pending and status != .uncertain) return error.StaleActionTarget;
+        var update = try self.statement("UPDATE action_targets SET status=2,dispatch_us=?3,settled_us=NULL WHERE action_id=?1 AND kind=?2 AND status IN(1,5);");
+        defer update.deinit();
+        try update.blob(1, &action_id);
+        try update.int(2, @intFromEnum(kind));
+        try update.int(3, now);
+        try update.done();
+        if (self.api.changes(self.db) != 1) return error.StaleActionTarget;
+        try self.fault(.before_action_target_dispatch_commit);
+        _ = try self.commitEffectClock(clock);
+        try self.commitTransaction();
+    }
+
+    /// Enforcement confirmation requires the existing immutable kernel-backed
+    /// confirmation. Optional target outcomes have no authority over effects.
+    pub fn settleActionTarget(self: *Store, action_id: [32]u8, kind: action_outcome.Kind, settlement: action_outcome.Settlement, clock: effects.Clock) Error!void {
+        try self.beginWrite();
+        errdefer self.rollback();
+        if (self.schema_version < 21) return error.ActionTargetStorageRequired;
+        var targets: [action_outcome.max_targets_per_action]action_outcome.Target = undefined;
+        const count = try self.readActionTargetsTx(action_id, &targets);
+        var selected: ?action_outcome.Target = null;
+        for (targets[0..count]) |target| {
+            if (target.kind == kind) selected = target;
+        }
+        const target = selected orelse return error.StaleActionTarget;
+        const wanted: action_outcome.Status = switch (settlement) {
+            .confirmed => .confirmed,
+            .failed => .failed,
+            .uncertain => .uncertain,
+        };
+        if (target.status == wanted) {
+            try self.commitTransaction();
+            return;
+        }
+        if (target.status != .dispatched) return error.StaleActionTarget;
+        if (kind == .enforcement and settlement == .confirmed) {
+            var proof = try self.statement("SELECT count(*) FROM confirmed_effect_events WHERE scope_key=?1 AND jail=?2 AND decision_id=?3;");
+            defer proof.deinit();
+            try proof.blob(1, &target.scope_key);
+            try proof.text(2, target.jail.slice());
+            try proof.blob(3, &action_id);
+            if (!try proof.row() or try proof.signed(0) != 1 or try proof.row()) return error.ActionTargetProofRequired;
+        }
+        const now = try self.effectClock(clock);
+        var update = try self.statement("UPDATE action_targets SET status=?3,settled_us=?4 WHERE action_id=?1 AND kind=?2 AND status=2;");
+        defer update.deinit();
+        try update.blob(1, &action_id);
+        try update.int(2, @intFromEnum(kind));
+        try update.int(3, @intFromEnum(wanted));
+        try update.int(4, now);
+        try update.done();
+        if (self.api.changes(self.db) != 1) return error.StaleActionTarget;
+        try self.fault(.before_action_target_settlement_commit);
+        _ = try self.commitEffectClock(clock);
+        try self.commitTransaction();
+    }
+
+    /// Versioned application projection. Filtering may leave sequence gaps, but
+    /// the immutable stream revision/head fence every continuation page.
+    pub fn applicationHistoryPage(self: *Store, allocator: std.mem.Allocator, installation: effects.Installation, query: application_history.EventQuery, output: []application_history.Event) Error!application_history.EventPage {
+        try query.validate();
+        if (output.len == 0 or output.len > application_history.max_page or self.schema_version < 17) return error.InvalidApplicationHistoryQuery;
+        try self.beginRead();
+        errdefer self.rollback();
+        const head = try self.historyHead(installation, query.after_sequence);
+        if (query.expected_stream_revision) |expected| if (expected != head.stream_revision) return error.StaleHistoryPage;
+        var row = try self.statement(if (self.schema_version >= 19)
+            "SELECT s.sequence,e.event_id,e.scope_key,n.canonical_scope,e.jail,e.decision_id,e.confirmed_us,d.source,d.occurrence,d.decided_us,d.ordinal,d.evidence FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key LEFT JOIN confirmed_event_details d ON d.event_id=e.event_id WHERE s.sequence>?1 AND s.sequence<=?2 AND (?3 IS NULL OR e.jail=?3) AND (?4 IS NULL OR e.confirmed_us>=?4) AND (?5 IS NULL OR e.confirmed_us<?5) ORDER BY s.sequence LIMIT ?6;"
+        else
+            "SELECT s.sequence,e.event_id,e.scope_key,n.scope,e.jail,e.decision_id,e.confirmed_us,d.source,d.occurrence,d.decided_us,d.ordinal,d.evidence FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key LEFT JOIN confirmed_event_details d ON d.event_id=e.event_id WHERE s.sequence>?1 AND s.sequence<=?2 AND (?3 IS NULL OR e.jail=?3) AND (?4 IS NULL OR e.confirmed_us>=?4) AND (?5 IS NULL OR e.confirmed_us<?5) ORDER BY s.sequence LIMIT ?6;");
+        defer row.deinit();
+        try row.int(1, @intCast(query.after_sequence));
+        try row.int(2, @intCast(head.head_sequence));
+        if (query.jail) |jail| try row.text(3, jail) else try self.check(self.api.bind_null(row.ptr, 3));
+        if (query.range.from_us) |stamp| try row.int(4, stamp) else try self.check(self.api.bind_null(row.ptr, 4));
+        if (query.range.to_us) |stamp| try row.int(5, stamp) else try self.check(self.api.bind_null(row.ptr, 5));
+        try row.int(6, @intCast(output.len + 1));
+        var count: usize = 0;
+        var more = false;
+        var last = query.after_sequence;
+        errdefer for (output[0..count]) |*event| event.deinit(allocator);
+        while (try row.row()) {
+            if (count == output.len) {
+                more = true;
+                break;
+            }
+            const sequence = try row.signed(0);
+            if (sequence <= 0 or sequence <= last or sequence > head.head_sequence) return error.InvalidApplicationHistoryRow;
+            const confirmed = effect_history.Event{ .sequence = @intCast(sequence), .event_id = try effectBlob(&row, 1, 32), .installation = installation, .scope_key = try effectBlob(&row, 2, 32), .scope = try self.decodeStoredScope(&row, 3), .jail = detection.Name.init(try row.boundedBytes(4, 64)) catch return error.InvalidApplicationHistoryRow, .decision_id = try effectBlob(&row, 5, 32), .confirmed_us = try row.signed(6) };
+            confirmed.validate() catch return error.InvalidApplicationHistoryRow;
+            output[count] = .{ .confirmed = confirmed };
+            if (self.api.column_type(row.ptr, 7) == 5) {
+                for (8..12) |column| if (self.api.column_type(row.ptr, @intCast(column)) != 5) return error.InvalidApplicationHistoryRow;
+            } else {
+                if (self.api.column_type(row.ptr, 7) != 3 or self.api.column_type(row.ptr, 8) != 3) return error.InvalidApplicationHistoryRow;
+                const source = try row.boundedBytes(7, Limits.source_bytes);
+                const occurrence = try row.boundedBytes(8, Limits.source_bytes);
+                const decided = try row.signed(9);
+                const ordinal = try row.signed(10);
+                if (source.len == 0 or occurrence.len == 0 or decided > confirmed.confirmed_us or ordinal <= 0) return error.InvalidApplicationHistoryRow;
+                const source_copy = allocator.dupe(u8, source) catch return error.OutOfMemory;
+                errdefer allocator.free(source_copy);
+                const occurrence_copy = allocator.dupe(u8, occurrence) catch return error.OutOfMemory;
+                errdefer allocator.free(occurrence_copy);
+                var evidence_copy: ?[]u8 = null;
+                if (self.api.column_type(row.ptr, 11) != 5) {
+                    if (self.api.column_type(row.ptr, 11) != 3) return error.InvalidApplicationHistoryRow;
+                    const evidence = try row.boundedBytes(11, retry.max_evidence_text_bytes);
+                    if (evidence.len == 0 or !std.unicode.utf8ValidateSlice(evidence)) return error.InvalidApplicationHistoryRow;
+                    evidence_copy = allocator.dupe(u8, evidence) catch return error.OutOfMemory;
+                }
+                output[count].detail = .{ .source = source_copy, .occurrence = occurrence_copy, .decided_us = decided, .ordinal = @intCast(ordinal), .evidence = evidence_copy };
+            }
+            count += 1;
+            last = @intCast(sequence);
+        }
+        try self.commitTransaction();
+        return .{ .stream_revision = head.stream_revision, .head_sequence = head.head_sequence, .last_sequence = last, .count = count, .more = more };
+    }
+
+    /// One coherent range snapshot: output[0] is overall, followed by bounded
+    /// per-jail rows. More reports that additional jail groups exist.
+    pub fn applicationHistoryAggregates(self: *Store, installation: effects.Installation, query: application_history.AggregateQuery, output: []application_history.Aggregate) Error!application_history.AggregatePage {
+        try query.validate();
+        if (output.len == 0 or output.len > application_history.max_page + 1 or self.schema_version < 17) return error.InvalidApplicationHistoryQuery;
+        try self.beginRead();
+        errdefer self.rollback();
+        const head = try self.historyHead(installation, 0);
+        if (query.expected_stream_revision) |expected| if (expected != head.stream_revision) return error.StaleHistoryPage;
+        const predicate = " FROM confirmed_effect_events WHERE (?1 IS NULL OR jail=?1) AND (?2 IS NULL OR confirmed_us>=?2) AND (?3 IS NULL OR confirmed_us<?3)";
+        var overall = try self.statement("SELECT count(*),min(confirmed_us),max(confirmed_us)" ++ predicate ++ ";");
+        defer overall.deinit();
+        if (query.jail) |jail| try overall.text(1, jail) else try self.check(self.api.bind_null(overall.ptr, 1));
+        if (query.range.from_us) |stamp| try overall.int(2, stamp) else try self.check(self.api.bind_null(overall.ptr, 2));
+        if (query.range.to_us) |stamp| try overall.int(3, stamp) else try self.check(self.api.bind_null(overall.ptr, 3));
+        if (!try overall.row()) return error.InvalidApplicationHistoryRow;
+        const total = try overall.signed(0);
+        if (total < 0) return error.InvalidApplicationHistoryRow;
+        output[0] = .{ .jail = null, .confirmed = @intCast(total), .first_confirmed_us = try overall.optionalSigned(1), .latest_confirmed_us = try overall.optionalSigned(2) };
+        if ((total == 0) != (output[0].first_confirmed_us == null and output[0].latest_confirmed_us == null)) return error.InvalidApplicationHistoryRow;
+
+        var groups = try self.statement("SELECT jail,count(*),min(confirmed_us),max(confirmed_us)" ++ predicate ++ " GROUP BY jail ORDER BY jail LIMIT ?4;");
+        defer groups.deinit();
+        if (query.jail) |jail| try groups.text(1, jail) else try self.check(self.api.bind_null(groups.ptr, 1));
+        if (query.range.from_us) |stamp| try groups.int(2, stamp) else try self.check(self.api.bind_null(groups.ptr, 2));
+        if (query.range.to_us) |stamp| try groups.int(3, stamp) else try self.check(self.api.bind_null(groups.ptr, 3));
+        try groups.int(4, @intCast(output.len));
+        var count: usize = 1;
+        var more = false;
+        while (try groups.row()) {
+            if (count == output.len) {
+                more = true;
+                break;
+            }
+            const group_count = try groups.signed(1);
+            if (self.api.column_type(groups.ptr, 0) != 3 or group_count <= 0) return error.InvalidApplicationHistoryRow;
+            output[count] = .{ .jail = detection.Name.init(try groups.boundedBytes(0, 64)) catch return error.InvalidApplicationHistoryRow, .confirmed = @intCast(group_count), .first_confirmed_us = try groups.optionalSigned(2), .latest_confirmed_us = try groups.optionalSigned(3) };
+            if (output[count].first_confirmed_us == null or output[count].latest_confirmed_us == null) return error.InvalidApplicationHistoryRow;
+            count += 1;
+        }
+        try self.commitTransaction();
+        return .{ .stream_revision = head.stream_revision, .head_sequence = head.head_sequence, .count = count, .more = more };
+    }
     fn validateConfirmedEffectPageTx(self: *Store, token: effect_history.PageToken) Error!void {
         try token.validate();
         const installation = try self.readInstallation() orelse return error.InstallationRequired;
@@ -1493,6 +2119,120 @@ pub const Store = struct {
         errdefer self.rollback();
         try self.validateConfirmedEffectPageTx(token);
         try self.commitTransaction();
+    }
+    pub const HistoryRetention = struct {
+        age_us: i64 = 86_400 * 1_000_000,
+        max_matches: u16 = 10,
+
+        pub fn validate(self: HistoryRetention) Error!void {
+            if (self.age_us < 0 or @mod(self.age_us, 1_000_000) != 0 or self.max_matches > 1024) return error.InvalidApplicationHistoryQuery;
+        }
+    };
+
+    /// Reclaim at most the immutable stream prefix row already consumed by the
+    /// durable history owner. Required summaries and live effect state are not
+    /// touched. False is caught up or pinned, not a cleanup failure.
+    pub fn cleanupConfirmedHistoryOne(self: *Store, policy: HistoryRetention, now_us: i64) Error!bool {
+        try policy.validate();
+        try self.beginWrite();
+        errdefer self.rollback();
+        const schema = try self.integer("PRAGMA user_version;");
+        if (schema < 18) return error.MaintenanceStorageRequired;
+        if (schema > latest_schema) return error.UnsupportedSchema;
+        var checkpoint_row = try self.statement("SELECT payload FROM consumer_checkpoints WHERE kind=5 AND jail='@history' AND source='confirmed-effects' AND rule='checkpoint';");
+        defer checkpoint_row.deinit();
+        if (!try checkpoint_row.row()) {
+            try self.commitTransaction();
+            return false;
+        }
+        const history_checkpoint = effect_history.Checkpoint.decode(try checkpoint_row.boundedBytes(0, effect_history.checkpoint_bytes)) catch return error.InvalidHistoryCheckpoint;
+        if (try checkpoint_row.row()) return error.InvalidHistoryCheckpoint;
+        const installation = try self.readInstallation() orelse return error.InstallationRequired;
+        if (!std.mem.eql(u8, &history_checkpoint.installation, &installation.id)) return error.InvalidHistoryCheckpoint;
+        const cutoff = std.math.sub(i64, now_us, policy.age_us) catch std.math.minInt(i64);
+        var detail_candidate = try self.statement(
+            "SELECT d.event_id FROM confirmed_event_details d JOIN confirmed_effect_events e USING(event_id) JOIN confirmed_history_sequence s USING(event_id) LEFT JOIN retry_decision_details r ON r.jail=e.jail AND r.effect_decision_id=e.decision_id WHERE s.sequence<=?1 AND (e.confirmed_us<=?2 OR (r.effect_decision_id IS NOT NULL AND ((SELECT count(*) FROM confirmed_event_details d2 JOIN confirmed_effect_events e2 USING(event_id) JOIN retry_decision_details r2 ON r2.jail=e2.jail AND r2.effect_decision_id=e2.decision_id WHERE r2.family=r.family AND r2.subject=r.subject)>?3 OR (d.evidence IS NOT NULL AND (SELECT coalesce(sum(length(CAST(d3.evidence AS BLOB))),0) FROM confirmed_event_details d3 JOIN confirmed_effect_events e3 USING(event_id) JOIN retry_decision_details r3 ON r3.jail=e3.jail AND r3.effect_decision_id=e3.decision_id WHERE r3.family=r.family AND r3.subject=r.subject)>16384)))) ORDER BY s.sequence LIMIT 1;",
+        );
+        defer detail_candidate.deinit();
+        try detail_candidate.int(1, std.math.cast(i64, history_checkpoint.last_sequence) orelse return error.InvalidHistoryCheckpoint);
+        try detail_candidate.int(2, cutoff);
+        try detail_candidate.int(3, policy.max_matches);
+        if (try detail_candidate.row()) {
+            const detail_event = try effectBlob(&detail_candidate, 0, 32);
+            var prune_detail = try self.statement("DELETE FROM confirmed_event_details WHERE event_id=?1;");
+            defer prune_detail.deinit();
+            try prune_detail.blob(1, &detail_event);
+            try prune_detail.done();
+            if (self.api.changes(self.db) != 1) return error.HistoryGap;
+            try self.fault(.after_history_detail_delete);
+            try self.commitTransaction();
+            return true;
+        }
+        var candidate = try self.statement("SELECT s.sequence,e.event_id,e.scope_key,e.jail,e.decision_id,e.confirmed_us FROM confirmed_history_sequence s JOIN confirmed_effect_events e USING(event_id) WHERE s.sequence=(SELECT retained_from FROM confirmed_history_stream WHERE id=1);");
+        defer candidate.deinit();
+        if (!try candidate.row()) {
+            try self.commitTransaction();
+            return false;
+        }
+        const sequence_value = try candidate.signed(0);
+        const confirmed_us = try candidate.signed(5);
+        if (sequence_value <= 0 or @as(u64, @intCast(sequence_value)) > history_checkpoint.last_sequence) {
+            try self.commitTransaction();
+            return false;
+        }
+        if (confirmed_us > cutoff) {
+            try self.commitTransaction();
+            return false;
+        }
+        const event_id = try effectBlob(&candidate, 1, 32);
+        const scope_key = try effectBlob(&candidate, 2, 32);
+        if (self.api.column_type(candidate.ptr, 3) != 3) return error.InvalidHistoryEvent;
+        const jail = try candidate.boundedBytes(3, 64);
+        const decision_id = try effectBlob(&candidate, 4, 32);
+        var owner = try self.statement("SELECT lease_kind,deadline_us FROM effect_owners WHERE scope_key=?1 AND jail=?2 AND decision_id=?3;");
+        defer owner.deinit();
+        try owner.blob(1, &scope_key);
+        try owner.text(2, jail);
+        try owner.blob(3, &decision_id);
+        if (try owner.row()) {
+            const lease = try effectLease(&owner, 0, 1);
+            if (lease.live(now_us)) {
+                try self.commitTransaction();
+                return false;
+            }
+        }
+        var pending = try self.statement("SELECT 1 FROM effect_intents WHERE scope_key=?1 AND status IN(1,2) LIMIT 1;");
+        defer pending.deinit();
+        try pending.blob(1, &scope_key);
+        if (try pending.row()) {
+            try self.commitTransaction();
+            return false;
+        }
+        var detail = try self.statement("DELETE FROM confirmed_event_details WHERE event_id=?1;");
+        defer detail.deinit();
+        try detail.blob(1, &event_id);
+        try detail.done();
+        try self.fault(.after_history_detail_delete);
+        var sequence = try self.statement("DELETE FROM confirmed_history_sequence WHERE sequence=?1 AND event_id=?2;");
+        defer sequence.deinit();
+        try sequence.int(1, sequence_value);
+        try sequence.blob(2, &event_id);
+        try sequence.done();
+        if (self.api.changes(self.db) != 1) return error.HistoryGap;
+        var event = try self.statement("DELETE FROM confirmed_effect_events WHERE event_id=?1;");
+        defer event.deinit();
+        try event.blob(1, &event_id);
+        try event.done();
+        if (self.api.changes(self.db) != 1) return error.HistoryGap;
+        try self.fault(.after_history_event_delete);
+        var stream = try self.statement("UPDATE confirmed_history_stream SET retained_from=?1,revision=revision+1 WHERE id=1 AND retained_from=?2;");
+        defer stream.deinit();
+        try stream.int(1, sequence_value + 1);
+        try stream.int(2, sequence_value);
+        try stream.done();
+        if (self.api.changes(self.db) != 1) return error.HistoryGap;
+        try self.commitTransaction();
+        return true;
     }
     fn canonicalHistoryManifest(manifest: consumers.Manifest) bool {
         return std.mem.eql(u8, manifest.jail, "@history") and std.mem.eql(u8, manifest.source, "confirmed-effects") and manifest.required.len == 1 and
@@ -1596,6 +2336,14 @@ pub const Store = struct {
         if (bytes.len != length) return error.InvalidEffect;
         return bytes[0..length].*;
     }
+    fn decodeStoredScope(self: *Store, row: *Stmt, column: c_int) Error!effects.Scope {
+        if (self.api.column_type(row.ptr, column) != 4) return error.InvalidEffect;
+        const bytes = try row.boundedBytes(column, effects.Scope.canonical_encoded_bytes);
+        return if (self.schema_version >= 19)
+            effects.Scope.decodeCanonical(bytes)
+        else
+            effects.Scope.decode(bytes);
+    }
     fn effectLease(row: *Stmt, kind_col: c_int, deadline_col: c_int) Error!effects.Lease {
         const kind = try row.signed(kind_col);
         const deadline = try row.optionalSigned(deadline_col);
@@ -1659,7 +2407,7 @@ pub const Store = struct {
     }
     fn decodeEffect(self: *Store, row: *Stmt, installation: effects.Installation) Error!effects.Entry {
         const scope_key = try effectBlob(row, 0, 32);
-        const scope = try effects.Scope.decode(&try effectBlob(row, 1, 24));
+        const scope = try self.decodeStoredScope(row, 1);
         if (!std.mem.eql(u8, &scope_key, &try scope.key(installation))) return error.InvalidEffect;
         const effect_revision = try row.signed(2);
         if (effect_revision <= 0 or effect_revision != try row.signed(8)) return error.InvalidEffect;
@@ -1704,9 +2452,11 @@ pub const Store = struct {
         if (!effects.Lease.eql(aggregate, desired)) return error.InvalidEffect;
         return .{ .installation = installation, .scope = scope, .scope_key = scope_key, .revision = @intCast(effect_revision), .desired = desired, .intent_id = intent_id, .status = status };
     }
-    const effect_select = "SELECT e.scope_key,e.scope,e.revision,e.lease_kind,e.deadline_us,e.intent_id,i.status,i.decision_id,i.revision,i.lease_kind,i.deadline_us,i.created_us,i.dispatch_us,i.observed_us,i.fingerprint FROM native_effects e LEFT JOIN effect_intents i ON i.intent_id=e.intent_id ";
     fn readEffect(self: *Store, key: effects.Hash, installation: effects.Installation) Error!?effects.Entry {
-        var row = try self.statement(effect_select ++ "WHERE e.scope_key=?1;");
+        var row = try self.statement(if (self.schema_version >= 19)
+            "SELECT e.scope_key,e.canonical_scope,e.revision,e.lease_kind,e.deadline_us,e.intent_id,i.status,i.decision_id,i.revision,i.lease_kind,i.deadline_us,i.created_us,i.dispatch_us,i.observed_us,i.fingerprint FROM native_effects e LEFT JOIN effect_intents i ON i.intent_id=e.intent_id WHERE e.scope_key=?1;"
+        else
+            "SELECT e.scope_key,e.scope,e.revision,e.lease_kind,e.deadline_us,e.intent_id,i.status,i.decision_id,i.revision,i.lease_kind,i.deadline_us,i.created_us,i.dispatch_us,i.observed_us,i.fingerprint FROM native_effects e LEFT JOIN effect_intents i ON i.intent_id=e.intent_id WHERE e.scope_key=?1;");
         defer row.deinit();
         try row.blob(1, &key);
         if (!try row.row()) return null;
@@ -1720,7 +2470,10 @@ pub const Store = struct {
         const effect_revision = try self.integer("SELECT revision FROM effect_clock WHERE singleton=1;");
         if (effect_revision < 0) return error.InvalidEffect;
         if (expected_revision) |expected| if (expected != effect_revision) return error.StaleEffect;
-        var row = try self.statement(effect_select ++ "WHERE (?1 IS NULL OR e.scope_key>?1) ORDER BY e.scope_key LIMIT ?2;");
+        var row = try self.statement(if (self.schema_version >= 19)
+            "SELECT e.scope_key,e.canonical_scope,e.revision,e.lease_kind,e.deadline_us,e.intent_id,i.status,i.decision_id,i.revision,i.lease_kind,i.deadline_us,i.created_us,i.dispatch_us,i.observed_us,i.fingerprint FROM native_effects e LEFT JOIN effect_intents i ON i.intent_id=e.intent_id WHERE (?1 IS NULL OR e.scope_key>?1) ORDER BY e.scope_key LIMIT ?2;"
+        else
+            "SELECT e.scope_key,e.scope,e.revision,e.lease_kind,e.deadline_us,e.intent_id,i.status,i.decision_id,i.revision,i.lease_kind,i.deadline_us,i.created_us,i.dispatch_us,i.observed_us,i.fingerprint FROM native_effects e LEFT JOIN effect_intents i ON i.intent_id=e.intent_id WHERE (?1 IS NULL OR e.scope_key>?1) ORDER BY e.scope_key LIMIT ?2;");
         defer row.deinit();
         const after_key = after orelse ([_]u8{0} ** 32);
         if (after != null) try row.blob(1, &after_key);
@@ -1814,6 +2567,7 @@ pub const Store = struct {
         if (change.expected_revision >= std.math.maxInt(i64) or change.decided_us > now or (change.lease == .finite and change.lease.finite <= change.decided_us)) return error.InvalidEffect;
         if (change.lease != .absent and !change.lease.live(now)) return error.EffectExpired;
         const installation = try self.readInstallation() orelse return error.InstallationRequired;
+        if (self.schema_version < 19) _ = try change.scope.encode();
         const key = try change.scope.key(installation);
         const previous = try self.readEffect(key, installation);
         if (previous) |entry| if (entry.status == .dispatched) return error.EffectReconciliationRequired;
@@ -1837,11 +2591,16 @@ pub const Store = struct {
         if (effect_revision > std.math.maxInt(i64)) return error.EffectCapacity;
         if (previous == null) {
             if (try self.integer("SELECT count(*) FROM native_effects;") >= effects.max_effects) return error.EffectCapacity;
-            const wire = try change.scope.encode();
-            var row = try self.statement("INSERT INTO native_effects(scope_key,scope,revision,lease_kind) VALUES(?1,?2,0,0);");
+            const legacy_wire = change.scope.encode() catch [_]u8{0} ** effects.Scope.encoded_bytes;
+            const canonical_wire = try change.scope.encodeCanonical();
+            var row = try self.statement(if (self.schema_version >= 19)
+                "INSERT INTO native_effects(scope_key,scope,revision,lease_kind,canonical_scope) VALUES(?1,?2,0,0,?3);"
+            else
+                "INSERT INTO native_effects(scope_key,scope,revision,lease_kind) VALUES(?1,?2,0,0);");
             defer row.deinit();
             try row.blob(1, &key);
-            try row.blob(2, &wire);
+            try row.blob(2, &legacy_wire);
+            if (self.schema_version >= 19) try row.blob(3, &canonical_wire);
             try row.done();
         }
         {
@@ -1871,6 +2630,102 @@ pub const Store = struct {
         try self.commitTransaction();
         self.effect_publication_epoch +|= 1;
         return entry;
+    }
+    /// Canonical validation and any pre-schema-19 legacy projection happen
+    /// before setOwner starts a writer transaction. Schema 19 preserves the
+    /// complete canonical identity; older schemas refuse richer scopes.
+    pub fn setOwnerFromCanonical(self: *Store, change: effects.CanonicalOwnerChange, clock: effects.Clock) Error!effects.Entry {
+        change.scope.validate() catch return error.InvalidEffect;
+        const projected = if (self.schema_version >= 19) try change.exact() else try change.legacy();
+        return self.setOwner(projected, clock);
+    }
+    const OwnerTransitionTx = struct { entry: effects.Entry, changed: bool };
+    fn transitionOwnerTx(self: *Store, change: effects.OwnerTransition, now: i64) Error!OwnerTransitionTx {
+        change.scope.validate() catch return error.InvalidEffect;
+        _ = detection.Name.init(change.jail) catch return error.InvalidEffect;
+        if (change.expected_owner_revision == 0 or change.expected_owner_revision >= std.math.maxInt(i64) or change.occurred_us > now or std.mem.allEqual(u8, &change.transition_id, 0)) return error.InvalidEffect;
+        if (change.mode == .retain and std.mem.eql(u8, &change.current_generation, &change.next_generation)) return error.InvalidEffect;
+        const installation = try self.readInstallation() orelse return error.InstallationRequired;
+        const scope = try effects.Scope.exact(change.scope);
+        const key = try scope.key(installation);
+        const prior = try self.readEffect(key, installation) orelse return error.StaleEffect;
+        if (prior.status == .dispatched) return error.EffectReconciliationRequired;
+        var owners: [effects.max_page]effects.Owner = undefined;
+        const count = try self.readOwners(key, &owners);
+        var selected: ?effects.Owner = null;
+        for (owners[0..count]) |owner| if (std.mem.eql(u8, owner.jail.slice(), change.jail)) {
+            if (selected != null) return error.InvalidEffect;
+            selected = owner;
+        };
+        const owner = selected orelse return error.StaleEffect;
+        if (owner.revision == change.expected_owner_revision + 1 and std.mem.eql(u8, &owner.generation, &change.next_generation)) {
+            const wanted_lease: effects.Lease = if (change.mode == .release) .absent else owner.lease;
+            const replay_id = effects.intentId(installation.id, key, change.transition_id, prior.revision, prior.desired);
+            if (effects.Lease.eql(owner.lease, wanted_lease) and std.mem.eql(u8, &prior.intent_id, &replay_id)) return .{ .entry = prior, .changed = false };
+        }
+        if (owner.revision != change.expected_owner_revision) return error.StaleEffect;
+        if (!std.mem.eql(u8, &owner.generation, &change.current_generation)) return error.EffectGenerationMismatch;
+        if (owner.lease == .absent) return error.StaleEffect;
+        if (try self.integer("SELECT count(*) FROM effect_owner_revisions;") >= effects.max_owner_revisions) return error.EffectCapacity;
+        const effect_revision = std.math.add(u64, prior.revision, 1) catch return error.EffectCapacity;
+        if (effect_revision > std.math.maxInt(i64)) return error.EffectCapacity;
+        {
+            var update = try self.statement("UPDATE effect_owners SET generation=?4,revision=?5,lease_kind=?6,deadline_us=?7 WHERE scope_key=?1 AND jail=?2 AND revision=?3;");
+            defer update.deinit();
+            try update.blob(1, &key);
+            try update.text(2, change.jail);
+            try update.int(3, @intCast(owner.revision));
+            try update.blob(4, &change.next_generation);
+            try update.int(5, @intCast(owner.revision + 1));
+            try bindEffectLease(&update, 6, if (change.mode == .release) .absent else owner.lease);
+            try update.done();
+            if (self.api.changes(self.db) != 1) return error.StaleEffect;
+        }
+        try self.fault(.after_effect_owner);
+        return .{ .entry = try self.replaceEffectIntent(installation, scope, key, effect_revision, change.transition_id, now), .changed = true };
+    }
+    /// Transition one exact owner while retaining its original decision/time.
+    /// Release is the core manual-unban primitive; retry/history rows are not
+    /// modified. Retain changes only generation authority and aggregate intent.
+    pub fn transitionOwner(self: *Store, change: effects.OwnerTransition, clock: effects.Clock) Error!effects.Entry {
+        try self.beginWrite();
+        errdefer self.rollback();
+        try self.effectSchema();
+        if (self.schema_version < 19) return error.EffectStorageRequired;
+        const now = try self.effectClock(clock);
+        const result = try self.transitionOwnerTx(change, now);
+        _ = try self.commitEffectClock(clock);
+        try self.commitTransaction();
+        if (result.changed) self.effect_publication_epoch +|= 1;
+        return result.entry;
+    }
+    /// Release at most one live owner for a jail. Repeated calls form a bounded
+    /// flush; every step has its own durable aggregate intent and stale fence.
+    pub fn flushJailOwner(self: *Store, jail: []const u8, generation: effects.Hash, transition_id: effects.Hash, clock: effects.Clock) Error!?effects.Entry {
+        _ = detection.Name.init(jail) catch return error.InvalidEffect;
+        if (std.mem.allEqual(u8, &transition_id, 0)) return error.InvalidEffect;
+        try self.beginWrite();
+        errdefer self.rollback();
+        try self.effectSchema();
+        if (self.schema_version < 19) return error.EffectStorageRequired;
+        const now = try self.effectClock(clock);
+        var row = try self.statement("SELECT n.canonical_scope,o.revision FROM effect_owners o JOIN native_effects n USING(scope_key) WHERE o.jail=?1 AND o.generation=?2 AND o.lease_kind!=0 ORDER BY o.scope_key LIMIT 1;");
+        defer row.deinit();
+        try row.text(1, jail);
+        try row.blob(2, &generation);
+        if (!try row.row()) {
+            _ = try self.commitEffectClock(clock);
+            try self.commitTransaction();
+            return null;
+        }
+        const scope = (try effects.Scope.decodeCanonical(&try effectBlob(&row, 0, effects.Scope.canonical_encoded_bytes))).canonical;
+        const owner_revision_value = try row.signed(1);
+        if (owner_revision_value <= 0 or try row.row()) return error.InvalidEffect;
+        const result = try self.transitionOwnerTx(.{ .scope = scope, .jail = jail, .current_generation = generation, .next_generation = generation, .expected_owner_revision = @intCast(owner_revision_value), .transition_id = transition_id, .mode = .release, .occurred_us = now }, now);
+        _ = try self.commitEffectClock(clock);
+        try self.commitTransaction();
+        if (result.changed) self.effect_publication_epoch +|= 1;
+        return result.entry;
     }
     fn checkedEffectToken(self: *Store, token: effects.Token) Error!effects.Entry {
         const installation = try self.readInstallation() orelse return error.InstallationRequired;
@@ -1985,6 +2840,26 @@ pub const Store = struct {
                 try event.blob(4, &owner.decision_id);
                 try event.int(5, observation.observed_us);
                 try event.done();
+                if (self.schema_version >= 17) {
+                    var detail_inserted = false;
+                    var detail = try self.statement("INSERT INTO confirmed_event_details(event_id,source,occurrence,decided_us,ordinal,evidence) SELECT ?1,source,occurrence,decided_us,ordinal,evidence FROM retry_decision_details WHERE jail=?2 AND effect_decision_id=?3;");
+                    defer detail.deinit();
+                    try detail.blob(1, &event_id);
+                    try detail.text(2, owner.jail.slice());
+                    try detail.blob(3, &owner.decision_id);
+                    try detail.done();
+                    if (self.api.changes(self.db) > 1) return error.InvalidApplicationHistoryRow;
+                    detail_inserted = self.api.changes(self.db) == 1;
+                    if (self.schema_version >= 18 and detail_inserted) {
+                        var summary = try self.statement("INSERT INTO confirmed_policy_summaries(jail,family,subject,confirmed_count,latest_confirmed_us) SELECT jail,family,subject,1,?3 FROM retry_decision_details WHERE jail=?1 AND effect_decision_id=?2 ON CONFLICT(jail,family,subject) DO UPDATE SET confirmed_count=confirmed_count+1,latest_confirmed_us=max(latest_confirmed_us,excluded.latest_confirmed_us);");
+                        defer summary.deinit();
+                        try summary.text(1, owner.jail.slice());
+                        try summary.blob(2, &owner.decision_id);
+                        try summary.int(3, observation.observed_us);
+                        try summary.done();
+                        if (self.api.changes(self.db) != 1) return error.InvalidRetryState;
+                    }
+                }
                 if (self.schema_version >= 13) {
                     // A missing or changed append trigger must roll back the
                     // receipt rather than publish an event outside the stream.
@@ -2485,6 +3360,15 @@ pub const Store = struct {
             try insert.blob(2, &generation);
             try insert.blob(3, &encoded);
             try insert.done();
+            if (self.schema_version >= 18) {
+                const escalation = try policy.escalation.encode();
+                var escalation_insert = try self.statement("INSERT INTO retry_escalation_policies VALUES(?1,?2,?3);");
+                defer escalation_insert.deinit();
+                try escalation_insert.text(1, jail);
+                try escalation_insert.blob(2, &generation);
+                try escalation_insert.blob(3, &escalation);
+                try escalation_insert.done();
+            }
         }
         try self.commitTransaction();
     }
@@ -2493,11 +3377,13 @@ pub const Store = struct {
     /// by each eventual registration transaction. False means genuinely fresh.
     fn checkRetryAdmission(self: *Store, jail: []const u8, generation: [32]u8, policy: retry.Policy) Error!bool {
         if (jail.len == 0 or jail.len > 64 or std.mem.indexOfScalar(u8, jail, 0) != null) return error.InvalidRecord;
-        const encoded = try policy.encode();
+        _ = try policy.encode();
         const schema = try self.integer("PRAGMA user_version;");
         if (schema < 9 or schema > latest_schema) return error.RetryStorageRequired;
+        if (schema < 16 and policy.duration == .permanent) return error.RetryStorageRequired;
+        if (schema < 18 and policy.escalation.enabled) return error.RetryStorageRequired;
         if (try self.readRetryPolicy(jail)) |saved| {
-            if (!std.mem.eql(u8, &saved.generation, &generation) or !std.mem.eql(u8, &try saved.policy.encode(), &encoded)) return error.RetryGenerationMismatch;
+            if (!std.mem.eql(u8, &saved.generation, &generation) or !try retryPoliciesEqual(saved.policy, policy)) return error.RetryGenerationMismatch;
             return true;
         }
         if (try self.revision(jail) != 0) return error.RetryMigrationRequired;
@@ -2559,51 +3445,100 @@ pub const Store = struct {
     }
 
     fn readRetryPolicy(self: *Store, jail: []const u8) Error!?retry.Admission {
-        var row = try self.statement("SELECT generation,policy FROM retry_policies WHERE jail=?1;");
+        var row = try self.statement(if (self.schema_version >= 18)
+            "SELECT p.generation,p.policy,e.generation,e.policy FROM retry_policies p JOIN retry_escalation_policies e USING(jail) WHERE p.jail=?1;"
+        else
+            "SELECT generation,policy FROM retry_policies WHERE jail=?1;");
         defer row.deinit();
         try row.text(1, jail);
         if (!try row.row()) return null;
         if (self.api.column_type(row.ptr, 0) != 4 or self.api.column_type(row.ptr, 1) != 4) return error.InvalidRetryState;
         const generation = try row.boundedBytes(0, 32);
         if (generation.len != 32) return error.InvalidRetryState;
-        var result = retry.Admission{ .generation = undefined, .policy = try retry.Policy.decode(try row.boundedBytes(1, retry.policy_bytes)) };
+        const raw = try row.boundedBytes(1, retry.policy_bytes);
+        if (self.schema_version >= 16 and (raw.len != retry.policy_bytes or raw[4] != 2)) return error.InvalidRetryPolicy;
+        var result = retry.Admission{ .generation = undefined, .policy = try retry.Policy.decode(raw) };
         @memcpy(&result.generation, generation);
+        if (self.schema_version >= 18) {
+            if (self.api.column_type(row.ptr, 2) != 4 or self.api.column_type(row.ptr, 3) != 4) return error.InvalidRetryState;
+            const escalation_generation = try row.boundedBytes(2, 32);
+            const escalation_raw = try row.boundedBytes(3, retry.escalation_bytes);
+            if (escalation_generation.len != 32 or !std.mem.eql(u8, generation, escalation_generation)) return error.InvalidRetryState;
+            result.policy.escalation = try retry.Escalation.decode(escalation_raw);
+            try result.policy.validate();
+        }
         return result;
     }
 
-    fn bindSubject(row: *Stmt, subject: *const detection.Subject) Error!void {
+    fn retryPoliciesEqual(left: retry.Policy, right: retry.Policy) Error!bool {
+        const left_base = try left.encode();
+        const right_base = try right.encode();
+        if (!std.mem.eql(u8, &left_base, &right_base)) return false;
+        const left_escalation = try left.escalation.encode();
+        const right_escalation = try right.escalation.encode();
+        return std.mem.eql(u8, &left_escalation, &right_escalation);
+    }
+
+    fn bindSubjectAt(row: *Stmt, subject: *const detection.Subject, family_index: c_int) Error!void {
         subject.validate() catch return error.InvalidRetryState;
         if (subject.unenforceable()) return error.InvalidRetryState;
         switch (subject.*) {
             .v4 => {
-                try row.int(2, 4);
-                try row.blob(3, &subject.v4);
+                try row.int(family_index, 4);
+                try row.blob(family_index + 1, &subject.v4);
             },
             .v6 => {
-                try row.int(2, 6);
-                try row.blob(3, &subject.v6);
+                try row.int(family_index, 6);
+                try row.blob(family_index + 1, &subject.v6);
             },
         }
     }
+    fn bindSubject(row: *Stmt, subject: *const detection.Subject) Error!void {
+        return bindSubjectAt(row, subject, 2);
+    }
 
-    fn readRetryState(self: *Store, jail: []const u8, subject: detection.Subject, policy: retry.Policy) Error!?retry.State {
-        var row = try self.statement("SELECT last_processed_us,expiry_us,decisions,attempts FROM retry_states WHERE jail=?1 AND family=?2 AND subject=?3;");
+    fn retryLease(row: *Stmt, kind_col: c_int, deadline_col: c_int) Error!retry.Lease {
+        const kind = try row.signed(kind_col);
+        const deadline = try row.optionalSigned(deadline_col);
+        return switch (kind) {
+            0 => if (deadline == null) .absent else error.InvalidRetryState,
+            1 => .{ .finite = deadline orelse return error.InvalidRetryState },
+            2 => if (deadline == null) .permanent else error.InvalidRetryState,
+            else => error.InvalidRetryState,
+        };
+    }
+
+    fn bindRetryLease(row: *Stmt, index: c_int, lease: retry.Lease) Error!void {
+        try row.int(index, @intFromEnum(lease));
+        if (lease == .finite) try row.int(index + 1, lease.finite) else try row.store.check(row.store.api.bind_null(row.ptr, index + 1));
+    }
+
+    fn readWorkingRetryState(self: *Store, jail: []const u8, subject: detection.Subject, policy: retry.Policy) Error!?retry.State {
+        var row = try self.statement(if (self.schema_version >= 16)
+            "SELECT last_processed_us,lease_kind,deadline_us,decisions,attempts FROM retry_states WHERE jail=?1 AND family=?2 AND subject=?3;"
+        else
+            "SELECT last_processed_us,CASE WHEN expiry_us IS NULL THEN 0 ELSE 1 END,expiry_us,decisions,attempts FROM retry_states WHERE jail=?1 AND family=?2 AND subject=?3;");
         defer row.deinit();
         try row.text(1, jail);
         try bindSubject(&row, &subject);
-        const retired = try self.readRetired(jail, subject);
-        if (!try row.row()) return retired;
-        if (retired != null) return error.InvalidRetryState;
+        if (!try row.row()) return null;
         const result = try self.decodeRetryState(&row, policy);
         if (result.last_processed_us > ((try self.readRetryClock()) orelse return error.InvalidRetryState)) return error.InvalidRetryState;
         return result;
     }
 
+    fn readRetryState(self: *Store, jail: []const u8, subject: detection.Subject, policy: retry.Policy) Error!?retry.State {
+        const working = try self.readWorkingRetryState(jail, subject, policy);
+        const retired = try self.readRetired(jail, subject);
+        if (working != null and retired != null) return error.InvalidRetryState;
+        return working orelse retired;
+    }
+
     fn decodeRetryState(self: *Store, row: *Stmt, policy: retry.Policy) Error!retry.State {
-        const decisions = try row.signed(2);
-        if (decisions < 0 or self.api.column_type(row.ptr, 3) != 4) return error.InvalidRetryState;
-        var result = retry.State{ .last_processed_us = try row.signed(0), .expiry_us = try row.optionalSigned(1), .decisions = @intCast(decisions) };
-        try result.decodeAttempts(try row.boundedBytes(3, retry.max_attempts * retry.attempt_bytes), policy);
+        const decisions = try row.signed(3);
+        if (decisions < 0 or self.api.column_type(row.ptr, 4) != 4) return error.InvalidRetryState;
+        var result = retry.State{ .last_processed_us = try row.signed(0), .lease = try retryLease(row, 1, 2), .decisions = @intCast(decisions) };
+        try result.decodeAttempts(try row.boundedBytes(4, retry.max_attempts * retry.attempt_bytes), policy);
         return result;
     }
 
@@ -2614,6 +3549,24 @@ pub const Store = struct {
         if (schema < 9 or schema > latest_schema) return error.RetryStorageRequired;
         const admission = (try self.readRetryPolicy(jail)) orelse return error.RetryAdmissionRequired;
         const result = try self.readRetryState(jail, subject, admission.policy);
+        try self.commitTransaction();
+        return result;
+    }
+
+    /// Return observation-time working state without changing durable retry
+    /// state or its admitted processing clock. Retired cumulative history has
+    /// no expiring attempts and is returned unchanged.
+    pub fn retryStateAt(self: *Store, jail: []const u8, subject: detection.Subject, now_us: i64) Error!?retry.State {
+        try self.beginRead();
+        errdefer self.rollback();
+        const schema = try self.integer("PRAGMA user_version;");
+        if (schema < 9 or schema > latest_schema) return error.RetryStorageRequired;
+        const admission = (try self.readRetryPolicy(jail)) orelse return error.RetryAdmissionRequired;
+        if (try self.readRetryClock()) |floor| if (now_us < floor) return error.ReceiptClockReversed;
+        const working = try self.readWorkingRetryState(jail, subject, admission.policy);
+        const retired = try self.readRetired(jail, subject);
+        if (working != null and retired != null) return error.InvalidRetryState;
+        const result = if (working) |state| (try retry.prune(admission.policy, state, now_us)).state else retired;
         try self.commitTransaction();
         return result;
     }
@@ -2724,7 +3677,7 @@ pub const Store = struct {
         try self.commitTransaction();
     }
 
-    pub const ActiveDecision = struct { subject: detection.Subject, expiry_us: i64, ordinal: u64 };
+    pub const ActiveDecision = struct { subject: detection.Subject, lease: retry.Lease, ordinal: u64 };
     pub const RetrySummary = struct { subjects: usize = 0, active: usize = 0, decisions: u64 = 0 };
     /// Detached, capacity-admitted status data. No read transaction survives the
     /// call, and expired decisions are excluded without rewriting their deadlines.
@@ -2737,26 +3690,85 @@ pub const Store = struct {
         // The clock may move after source admission but before publication.
         // Use the shared recoverable clock error, including for empty owners.
         if (floor) |value| if (now_us < value) return error.ReceiptClockReversed;
-        var row = try self.statement("SELECT last_processed_us,expiry_us,decisions,attempts,family,subject FROM retry_states WHERE jail=?1 ORDER BY family,subject;");
+        var row = try self.statement(if (self.schema_version >= 16)
+            "SELECT last_processed_us,lease_kind,deadline_us,decisions,attempts,family,subject FROM retry_states WHERE jail=?1 ORDER BY family,subject;"
+        else
+            "SELECT last_processed_us,CASE WHEN expiry_us IS NULL THEN 0 ELSE 1 END,expiry_us,decisions,attempts,family,subject FROM retry_states WHERE jail=?1 ORDER BY family,subject;");
         defer row.deinit();
         try row.text(1, jail);
         var summary = RetrySummary{};
         while (try row.row()) {
             summary.subjects += 1;
             if (summary.subjects > admission.policy.max_subjects) return error.RetryCapacity;
-            const state = try self.decodeRetryState(&row, admission.policy);
-            if (state.last_processed_us > (floor orelse return error.InvalidRetryState)) return error.InvalidRetryState;
-            const subject = try self.decodeRetrySubject(&row, 4, 5);
+            const stored = try self.decodeRetryState(&row, admission.policy);
+            if (stored.last_processed_us > (floor orelse return error.InvalidRetryState)) return error.InvalidRetryState;
+            const state = (try retry.prune(admission.policy, stored, now_us)).state;
+            const subject = try self.decodeRetrySubject(&row, 5, 6);
             summary.decisions = std.math.add(u64, summary.decisions, state.decisions) catch return error.InvalidRetryState;
-            if (state.expiry_us) |expiry| if (expiry > now_us) {
-                output[summary.active] = .{ .subject = subject, .expiry_us = expiry, .ordinal = state.decisions };
+            if (state.lease.live(now_us)) {
+                output[summary.active] = .{ .subject = subject, .lease = state.lease, .ordinal = state.decisions };
                 summary.active += 1;
-            };
+            }
         }
         if (self.schema_version >= 15)
             summary.decisions = std.math.add(u64, summary.decisions, try self.retiredTotal(jail)) catch return error.InvalidRetryState;
         try self.commitTransaction();
         return summary;
+    }
+
+    /// Coherent latest per-jail/address policy rows. A global trigger revision
+    /// refuses continuations after any working/retired state mutation.
+    pub fn retryPolicySummaryPage(self: *Store, query: application_history.PolicyQuery, output: []application_history.PolicySummary) Error!application_history.PolicyPage {
+        try query.validate();
+        if (output.len == 0 or output.len > application_history.max_page or self.schema_version < 17) return error.InvalidPolicySummary;
+        try self.beginRead();
+        errdefer self.rollback();
+        const revision_value = try self.integer("SELECT revision FROM policy_summary_clock WHERE id=1;");
+        if (revision_value <= 0) return error.InvalidPolicySummary;
+        const current_revision: u64 = @intCast(revision_value);
+        if (query.expected_revision) |expected| if (expected != current_revision) return error.StalePolicySummary;
+        var row = try self.statement("WITH summaries(jail,family,subject,generation,last_processed_us,lease_kind,deadline_us,decisions,retired) AS (SELECT s.jail,s.family,s.subject,p.generation,s.last_processed_us,s.lease_kind,s.deadline_us,s.decisions,0 FROM retry_states s JOIN retry_policies p ON p.jail=s.jail UNION ALL SELECT r.jail,r.family,r.subject,r.generation,r.last_processed_us,0,NULL,r.decisions,1 FROM retry_retired r) SELECT jail,family,subject,generation,last_processed_us,lease_kind,deadline_us,decisions,retired FROM summaries WHERE (?1 IS NULL OR jail=?1) AND (?2 IS NULL OR jail>?2 OR (jail=?2 AND (family>?3 OR (family=?3 AND subject>?4)))) ORDER BY jail,family,subject LIMIT ?5;");
+        defer row.deinit();
+        if (query.jail) |jail| try row.text(1, jail) else try self.check(self.api.bind_null(row.ptr, 1));
+        if (query.after) |after| {
+            try row.text(2, after.jail.slice());
+            switch (after.subject) {
+                .v4 => |address| {
+                    try row.int(3, 4);
+                    try row.blob(4, &address);
+                },
+                .v6 => |address| {
+                    try row.int(3, 6);
+                    try row.blob(4, &address);
+                },
+            }
+        } else {
+            try self.check(self.api.bind_null(row.ptr, 2));
+            try self.check(self.api.bind_null(row.ptr, 3));
+            try self.check(self.api.bind_null(row.ptr, 4));
+        }
+        try row.int(5, @intCast(output.len + 1));
+        var count: usize = 0;
+        var more = false;
+        while (try row.row()) {
+            if (count == output.len) {
+                more = true;
+                break;
+            }
+            if (self.api.column_type(row.ptr, 0) != 3) return error.InvalidPolicySummary;
+            const jail = detection.Name.init(try row.boundedBytes(0, 64)) catch return error.InvalidPolicySummary;
+            const subject = try self.decodeRetrySubject(&row, 1, 2);
+            const generation = try effectBlob(&row, 3, 32);
+            const decisions = try row.signed(7);
+            const retired = try row.signed(8);
+            const lease = try retryLease(&row, 5, 6);
+            if (decisions < 0 or retired < 0 or retired > 1 or (retired == 1 and lease != .absent)) return error.InvalidPolicySummary;
+            if (count > 0 and std.mem.eql(u8, output[count - 1].jail.slice(), jail.slice()) and std.meta.eql(output[count - 1].subject, subject)) return error.InvalidPolicySummary;
+            output[count] = .{ .jail = jail, .subject = subject, .generation = generation, .last_processed_us = try row.signed(4), .lease = lease, .decisions = @intCast(decisions), .retired = retired == 1 };
+            count += 1;
+        }
+        try self.commitTransaction();
+        return .{ .revision = current_revision, .count = count, .more = more };
     }
 
     /// Bounded startup validation, with no publication or callbacks while the
@@ -2767,9 +3779,12 @@ pub const Store = struct {
         const schema = try self.integer("PRAGMA user_version;");
         if (schema < 9 or schema > latest_schema) return error.RetryStorageRequired;
         const admission = (try self.readRetryPolicy(jail)) orelse return error.RetryAdmissionRequired;
-        if (!std.mem.eql(u8, &admission.generation, &generation) or !std.mem.eql(u8, &try admission.policy.encode(), &try policy.encode())) return error.RetryGenerationMismatch;
+        if (!std.mem.eql(u8, &admission.generation, &generation) or !try retryPoliciesEqual(admission.policy, policy)) return error.RetryGenerationMismatch;
         const floor = try self.readRetryClock();
-        var row = try self.statement("SELECT last_processed_us,expiry_us,decisions,attempts,family,subject FROM retry_states WHERE jail=?1;");
+        var row = try self.statement(if (self.schema_version >= 16)
+            "SELECT last_processed_us,lease_kind,deadline_us,decisions,attempts,family,subject FROM retry_states WHERE jail=?1;"
+        else
+            "SELECT last_processed_us,CASE WHEN expiry_us IS NULL THEN 0 ELSE 1 END,expiry_us,decisions,attempts,family,subject FROM retry_states WHERE jail=?1;");
         defer row.deinit();
         try row.text(1, jail);
         var count: usize = 0;
@@ -2778,7 +3793,7 @@ pub const Store = struct {
             if (count > policy.max_subjects) return error.RetryCapacity;
             const state = try self.decodeRetryState(&row, policy);
             if (state.last_processed_us > (floor orelse return error.InvalidRetryState)) return error.InvalidRetryState;
-            _ = try self.decodeRetrySubject(&row, 4, 5);
+            _ = try self.decodeRetrySubject(&row, 5, 6);
         }
         try self.commitTransaction();
     }
@@ -2808,10 +3823,15 @@ pub const Store = struct {
     }
     pub fn retryDecisions(self: *Store, jail: []const u8, source: []const u8, occurrence: ?[]const u8, output: []retry.Decision) Error!usize {
         if (output.len == 0 or output.len > max_native_detections) return error.ConsumerCapacity;
-        var row = try self.statement(if (occurrence != null)
-            "SELECT family,subject,decided_us,expiry_us,ordinal,enforce FROM retry_decisions WHERE jail=?1 AND source=?2 AND occurrence=?3;"
+        var row = try self.statement(if (self.schema_version >= 16)
+            if (occurrence != null)
+                "SELECT family,subject,decided_us,lease_kind,deadline_us,ordinal,enforce FROM retry_decisions WHERE jail=?1 AND source=?2 AND occurrence=?3;"
+            else
+                "SELECT d.family,d.subject,d.decided_us,d.lease_kind,d.deadline_us,d.ordinal,d.enforce FROM retry_decisions d JOIN source_cursors c USING(jail,source,occurrence) WHERE d.jail=?1 AND d.source=?2;"
+        else if (occurrence != null)
+            "SELECT family,subject,decided_us,1,expiry_us,ordinal,enforce FROM retry_decisions WHERE jail=?1 AND source=?2 AND occurrence=?3;"
         else
-            "SELECT d.family,d.subject,d.decided_us,d.expiry_us,d.ordinal,d.enforce FROM retry_decisions d JOIN source_cursors c USING(jail,source,occurrence) WHERE d.jail=?1 AND d.source=?2;");
+            "SELECT d.family,d.subject,d.decided_us,1,d.expiry_us,d.ordinal,d.enforce FROM retry_decisions d JOIN source_cursors c USING(jail,source,occurrence) WHERE d.jail=?1 AND d.source=?2;");
         defer row.deinit();
         try row.text(1, jail);
         try row.text(2, source);
@@ -2819,15 +3839,160 @@ pub const Store = struct {
         var count: usize = 0;
         while (try row.row()) {
             if (count >= output.len) return error.ConsumerCapacity;
-            const ordinal = try row.signed(4);
-            const enforce = try row.signed(5);
+            const ordinal = try row.signed(5);
+            const enforce = try row.signed(6);
             const now = try row.signed(2);
-            const expiry = try row.signed(3);
-            if (ordinal <= 0 or enforce < 0 or enforce > 1 or expiry <= now) return error.InvalidRetryState;
-            output[count] = .{ .subject = try self.decodeRetrySubject(&row, 0, 1), .decided_us = now, .expiry_us = expiry, .ordinal = @intCast(ordinal), .enforce = enforce == 1 };
+            const lease = try retryLease(&row, 3, 4);
+            if (ordinal <= 0 or enforce < 0 or enforce > 1 or lease == .absent or (lease == .finite and lease.finite <= now)) return error.InvalidRetryState;
+            output[count] = .{ .subject = try self.decodeRetrySubject(&row, 0, 1), .decided_us = now, .lease = lease, .ordinal = @intCast(ordinal), .enforce = enforce == 1 };
             count += 1;
         }
         return count;
+    }
+
+    pub fn retryEscalationDecision(self: *Store, jail: []const u8, source: []const u8, occurrence: []const u8, subject: detection.Subject) Error!?EscalationSelection {
+        if (self.schema_version < 18) return error.RetryStorageRequired;
+        var row = try self.statement("SELECT scope,prior_confirmed,latest_confirmed_us,chosen_duration_us,jitter_us FROM retry_decision_escalations WHERE jail=?1 AND family=?2 AND subject=?3 AND source=?4 AND occurrence=?5;");
+        defer row.deinit();
+        try row.text(1, jail);
+        try bindSubject(&row, &subject);
+        try row.text(4, source);
+        try row.text(5, occurrence);
+        if (!try row.row()) return null;
+        const scope_value = try row.signed(0);
+        const prior = try row.signed(1);
+        const latest = try row.optionalSigned(2);
+        const chosen = try row.signed(3);
+        const jitter = try row.signed(4);
+        if (prior < 0 or (prior == 0) != (latest == null) or chosen <= 0 or @mod(chosen, 1_000_000) != 0 or jitter < 0 or @mod(jitter, 1_000_000) != 0 or try row.row()) return error.InvalidRetryState;
+        return .{
+            .scope = std.meta.intToEnum(retry.EscalationScope, scope_value) catch return error.InvalidRetryState,
+            .prior_confirmed = @intCast(prior),
+            .latest_confirmed_us = latest,
+            .chosen_duration_us = chosen,
+            .jitter_us = jitter,
+        };
+    }
+
+    pub const RetryProlongation = struct {
+        jail: []const u8,
+        generation: [32]u8,
+        subject: detection.Subject,
+        ordinal: u64,
+        expected_owner_revision: u64,
+        requested: retry.Lease,
+    };
+    pub const RetryProlongationResult = struct { changed: bool, lease: retry.Lease, effect: effects.Entry };
+
+    /// Extend one still-active enforcing decision and its physical owner in the
+    /// same transaction. The decision identity/time and confirmed-history key
+    /// are immutable; a new aggregate intent carries only the longer lease.
+    pub fn prolongRetryDecision(self: *Store, change: RetryProlongation, clock: effects.Clock) Error!RetryProlongationResult {
+        if (change.ordinal == 0 or change.ordinal > std.math.maxInt(i64) or change.requested == .absent) return error.InvalidRetryState;
+        try self.beginWrite();
+        errdefer self.rollback();
+        try self.effectSchema();
+        if (self.schema_version < 16) return error.RetryStorageRequired;
+        const now = try self.effectClock(clock);
+        if (!change.requested.live(now)) return error.LeaseExpired;
+        const admission = (try self.readRetryPolicy(change.jail)) orelse return error.RetryAdmissionRequired;
+        if (!std.mem.eql(u8, &admission.generation, &change.generation)) return error.RetryGenerationMismatch;
+
+        var decision_row = try self.statement("SELECT d.source,d.occurrence,d.decided_us,d.lease_kind,d.deadline_us,d.enforce,s.lease_kind,s.deadline_us,s.decisions FROM retry_decisions d JOIN retry_states s ON s.jail=d.jail AND s.family=d.family AND s.subject=d.subject WHERE d.jail=?1 AND d.family=?2 AND d.subject=?3 AND d.ordinal=?4;");
+        defer decision_row.deinit();
+        try decision_row.text(1, change.jail);
+        try bindSubject(&decision_row, &change.subject);
+        try decision_row.int(4, @intCast(change.ordinal));
+        if (!try decision_row.row() or self.api.column_type(decision_row.ptr, 0) != 3 or self.api.column_type(decision_row.ptr, 1) != 3) return error.InvalidRetryState;
+        const source = try decision_row.boundedBytes(0, Limits.source_bytes);
+        const occurrence = try decision_row.boundedBytes(1, Limits.source_bytes);
+        const decided_us = try decision_row.signed(2);
+        const current = try retryLease(&decision_row, 3, 4);
+        const enforce = try decision_row.signed(5);
+        const state_lease = try retryLease(&decision_row, 6, 7);
+        const decisions = try decision_row.signed(8);
+        if (enforce != 1 or decisions != change.ordinal or !retry.Lease.eql(current, state_lease)) return error.InvalidRetryState;
+        const prolonged = try current.prolonged(change.requested, now);
+
+        const installation = try self.readInstallation() orelse return error.InstallationRequired;
+        const scope = try effects.Scope.host(change.subject);
+        const key = try scope.key(installation);
+        const entry = try self.readEffect(key, installation) orelse return error.StaleEffect;
+        if (entry.status == .dispatched) return error.EffectReconciliationRequired;
+        const decision_id = effects.hashParts("fail2zig-native-effect-decision-v2", &.{ change.jail, source, occurrence, &change.generation, &key });
+        var owners: [effects.max_page]effects.Owner = undefined;
+        const owner_count = try self.readOwners(key, &owners);
+        var owner: ?effects.Owner = null;
+        for (owners[0..owner_count]) |candidate| if (std.mem.eql(u8, candidate.jail.slice(), change.jail)) {
+            if (owner != null) return error.InvalidEffect;
+            owner = candidate;
+        };
+        const existing = owner orelse return error.StaleEffect;
+        if (existing.revision != change.expected_owner_revision) return error.StaleEffect;
+        if (!std.mem.eql(u8, &existing.generation, &change.generation) or !std.mem.eql(u8, &existing.decision_id, &decision_id)) return error.EffectGenerationMismatch;
+        if (existing.decided_us != decided_us or !effects.Lease.eql(existing.lease, current)) return error.InvalidEffect;
+        if (!prolonged.changed) {
+            try self.commitTransaction();
+            return .{ .changed = false, .lease = current, .effect = entry };
+        }
+
+        {
+            var state = try self.statement("UPDATE retry_states SET lease_kind=?4,deadline_us=?5 WHERE jail=?1 AND family=?2 AND subject=?3;");
+            defer state.deinit();
+            try state.text(1, change.jail);
+            try bindSubject(&state, &change.subject);
+            try bindRetryLease(&state, 4, prolonged.lease);
+            try state.done();
+            if (self.api.changes(self.db) != 1) return error.InvalidRetryState;
+        }
+        try self.fault(.after_retry_state);
+        {
+            var decision = try self.statement("UPDATE retry_decisions SET lease_kind=?5,deadline_us=?6 WHERE jail=?1 AND family=?2 AND subject=?3 AND ordinal=?4;");
+            defer decision.deinit();
+            try decision.text(1, change.jail);
+            try bindSubject(&decision, &change.subject);
+            try decision.int(4, @intCast(change.ordinal));
+            try bindRetryLease(&decision, 5, prolonged.lease);
+            try decision.done();
+            if (self.api.changes(self.db) != 1) return error.InvalidRetryState;
+        }
+        try self.fault(.after_retry_decision);
+        if (existing.revision >= std.math.maxInt(i64) or entry.revision >= std.math.maxInt(i64) or try self.integer("SELECT count(*) FROM effect_owner_revisions;") >= effects.max_owner_revisions) return error.EffectCapacity;
+        {
+            var update = try self.statement("UPDATE effect_owners SET revision=?4,lease_kind=?5,deadline_us=?6 WHERE scope_key=?1 AND jail=?2 AND revision=?3;");
+            defer update.deinit();
+            try update.blob(1, &key);
+            try update.text(2, change.jail);
+            try update.int(3, @intCast(existing.revision));
+            try update.int(4, @intCast(existing.revision + 1));
+            try bindEffectLease(&update, 5, prolonged.lease);
+            try update.done();
+            if (self.api.changes(self.db) != 1) return error.StaleEffect;
+        }
+        try self.fault(.after_effect_owner);
+        const next = try self.replaceEffectIntent(installation, scope, key, entry.revision + 1, decision_id, now);
+        const final = try self.commitEffectClock(clock);
+        if (!prolonged.lease.live(final) or (next.desired == .finite and !next.desired.live(final))) return error.EffectExpired;
+        try self.commitTransaction();
+        self.effect_publication_epoch +|= 1;
+        return .{ .changed = true, .lease = prolonged.lease, .effect = next };
+    }
+
+    fn readEscalationHistory(self: *Store, jail: []const u8, subject: detection.Subject, scope: retry.EscalationScope) Error!retry.EscalationHistoryInput {
+        var row = try self.statement(switch (scope) {
+            .per_jail => "SELECT confirmed_count,latest_confirmed_us FROM confirmed_policy_summaries WHERE jail=?1 AND family=?2 AND subject=?3;",
+            .overall => "SELECT coalesce(sum(confirmed_count),0),max(latest_confirmed_us) FROM confirmed_policy_summaries WHERE ?1 IS NOT NULL AND family=?2 AND subject=?3;",
+        });
+        defer row.deinit();
+        try row.text(1, jail);
+        try bindSubject(&row, &subject);
+        if (!try row.row()) return .{};
+        const signed_count = try row.signed(0);
+        if (signed_count < 0) return error.InvalidRetryState;
+        const count: u64 = @intCast(signed_count);
+        const latest = try row.optionalSigned(1);
+        if ((count == 0) != (latest == null) or try row.row()) return error.InvalidRetryState;
+        return .{ .prior_confirmed = count, .latest_confirmed_us = latest };
     }
 
     fn commitRetry(self: *Store, record: Record, admission: retry.Admission) Error!void {
@@ -2854,7 +4019,53 @@ pub const Store = struct {
             if (!try count.row()) return error.DatabaseFailure;
             if (try count.signed(0) >= admission.policy.max_subjects) return error.RetryCapacity;
         }
-        const next = try retry.advance(admission.policy, previous, subject, .{ .at_us = outcome.eligible.timestamp.us, .occurrence = retry.occurrenceKey(record.source, record.occurrence) }, now);
+        const current_attempt = retry.Attempt{ .at_us = outcome.eligible.timestamp.us, .occurrence = retry.occurrenceKey(record.source, record.occurrence) };
+        var next = try retry.advanceWithEvidence(admission.policy, previous, subject, current_attempt, now, record.retry_evidence);
+        var escalation_selection: ?EscalationSelection = null;
+        if (next.decision != null and admission.policy.escalation.enabled) {
+            if (self.schema_version < 18) return error.RetryStorageRequired;
+            const history = try self.readEscalationHistory(record.jail, subject, admission.policy.escalation.scope);
+            var sampled_seconds: u64 = 0;
+            if (history.prior_confirmed > 0 and admission.policy.escalation.jitter_us > 0) {
+                const maximum: u64 = @intCast(@divExact(admission.policy.escalation.jitter_us, 1_000_000));
+                sampled_seconds = self.escalation_jitter(self.escalation_jitter_context, maximum);
+                if (sampled_seconds > maximum) return error.InvalidEscalationInput;
+            }
+            const sampled_us = std.math.mul(i64, @as(i64, @intCast(sampled_seconds)), 1_000_000) catch return error.InvalidEscalationInput;
+            const chosen = try admission.policy.escalation.duration(admission.policy.duration, history.prior_confirmed, sampled_us);
+            const chosen_us = switch (chosen) {
+                .finite_us => |value| value,
+                .permanent => return error.InvalidEscalationInput,
+            };
+            var selected_policy = admission.policy;
+            selected_policy.duration = chosen;
+            next = try retry.advanceWithEvidence(selected_policy, previous, subject, current_attempt, now, record.retry_evidence);
+            if (next.decision == null) return error.InvalidRetryState;
+            escalation_selection = .{
+                .scope = admission.policy.escalation.scope,
+                .prior_confirmed = history.prior_confirmed,
+                .latest_confirmed_us = history.latest_confirmed_us,
+                .chosen_duration_us = chosen_us,
+                .jitter_us = sampled_us,
+            };
+        }
+        var prepared_context: ?action_context.Context = null;
+        if (next.decision) |decision| {
+            const confirmed_history_count: ?u64 = if (self.schema_version >= 18)
+                (try self.readEscalationHistory(record.jail, subject, .per_jail)).prior_confirmed
+            else
+                null;
+            prepared_context = try action_context.fromRetry(
+                record.jail,
+                record.source,
+                record.occurrence,
+                detected,
+                outcome.eligible.timestamp.us,
+                decision,
+                @intCast(admission.policy.maxretry),
+                confirmed_history_count,
+            );
+        }
         if (retired) |prior| {
             try self.changeRetiredTotal(record.jail, prior.decisions, false);
             var remove = try self.statement("DELETE FROM retry_retired WHERE jail=?1 AND family=?2 AND subject=?3;");
@@ -2865,35 +4076,71 @@ pub const Store = struct {
             if (self.api.changes(self.db) != 1) return error.InvalidRetryState;
         }
         var bytes: [retry.max_attempts * retry.attempt_bytes]u8 = undefined;
-        var row = try self.statement("INSERT INTO retry_states VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(jail,family,subject) DO UPDATE SET last_processed_us=excluded.last_processed_us,expiry_us=excluded.expiry_us,decisions=excluded.decisions,attempts=excluded.attempts;");
+        if (self.schema_version < 16 and next.state.lease == .permanent) return error.RetryStorageRequired;
+        var row = try self.statement(if (self.schema_version >= 16)
+            "INSERT INTO retry_states VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(jail,family,subject) DO UPDATE SET last_processed_us=excluded.last_processed_us,lease_kind=excluded.lease_kind,deadline_us=excluded.deadline_us,decisions=excluded.decisions,attempts=excluded.attempts;"
+        else
+            "INSERT INTO retry_states VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(jail,family,subject) DO UPDATE SET last_processed_us=excluded.last_processed_us,expiry_us=excluded.expiry_us,decisions=excluded.decisions,attempts=excluded.attempts;");
         defer row.deinit();
         try row.text(1, record.jail);
         try bindSubject(&row, &subject);
         try row.int(4, next.state.last_processed_us);
-        if (next.state.expiry_us) |expiry| try row.int(5, expiry);
-        try row.int(6, @intCast(next.state.decisions));
-        try row.blob(7, next.state.encodeAttempts(&bytes));
+        if (self.schema_version >= 16) {
+            try bindRetryLease(&row, 5, next.state.lease);
+            try row.int(7, @intCast(next.state.decisions));
+            try row.blob(8, next.state.encodeAttempts(&bytes));
+        } else {
+            if (next.state.lease == .finite) try row.int(5, next.state.lease.finite);
+            try row.int(6, @intCast(next.state.decisions));
+            try row.blob(7, next.state.encodeAttempts(&bytes));
+        }
         try row.done();
         try self.fault(.after_retry_state);
         if (next.decision) |decision| {
-            var decision_row = try self.statement("INSERT INTO retry_decisions(jail,family,subject,source,occurrence,decided_us,expiry_us,ordinal,enforce) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9);");
+            var effect_identity: ?effects.Hash = null;
+            const context = prepared_context orelse return error.InvalidActionContext;
+            var decision_row = try self.statement(if (self.schema_version >= 16)
+                "INSERT INTO retry_decisions(jail,family,subject,source,occurrence,decided_us,lease_kind,deadline_us,ordinal,enforce) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10);"
+            else
+                "INSERT INTO retry_decisions(jail,family,subject,source,occurrence,decided_us,expiry_us,ordinal,enforce) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9);");
             defer decision_row.deinit();
             try decision_row.text(1, record.jail);
             try bindSubject(&decision_row, &subject);
             try decision_row.text(4, record.source);
             try decision_row.text(5, record.occurrence);
             try decision_row.int(6, decision.decided_us);
-            try decision_row.int(7, decision.expiry_us);
-            try decision_row.int(8, @intCast(decision.ordinal));
-            try decision_row.int(9, @intFromBool(decision.enforce));
+            if (self.schema_version >= 16) {
+                try bindRetryLease(&decision_row, 7, decision.lease);
+                try decision_row.int(9, @intCast(decision.ordinal));
+                try decision_row.int(10, @intFromBool(decision.enforce));
+            } else {
+                if (decision.lease != .finite) return error.RetryStorageRequired;
+                try decision_row.int(7, decision.lease.finite);
+                try decision_row.int(8, @intCast(decision.ordinal));
+                try decision_row.int(9, @intFromBool(decision.enforce));
+            }
             try decision_row.done();
+            if (escalation_selection) |selection| {
+                var selected = try self.statement("INSERT INTO retry_decision_escalations(jail,family,subject,source,occurrence,scope,prior_confirmed,latest_confirmed_us,chosen_duration_us,jitter_us) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10);");
+                defer selected.deinit();
+                try selected.text(1, record.jail);
+                try bindSubject(&selected, &subject);
+                try selected.text(4, record.source);
+                try selected.text(5, record.occurrence);
+                try selected.int(6, @intFromEnum(selection.scope));
+                try selected.int(7, std.math.cast(i64, selection.prior_confirmed) orelse return error.InvalidEscalationInput);
+                if (selection.latest_confirmed_us) |latest| try selected.int(8, latest);
+                try selected.int(9, selection.chosen_duration_us);
+                try selected.int(10, selection.jitter_us);
+                try selected.done();
+            }
             try self.fault(.after_retry_decision);
             if (decision.enforce) {
                 if (self.schema_version < 11) return error.EffectStorageRequired;
                 const clock = record.effects_clock orelse return error.InstallationRequired;
                 const effect_now = try self.effectClock(clock);
                 const installation = try self.readInstallation() orelse return error.InstallationRequired;
-                const scope = try effects.Scope.host(subject);
+                const scope = try context.legacyEffectScope();
                 const key = try scope.key(installation);
                 var owners: [effects.max_page]effects.Owner = undefined;
                 const count = try self.readOwners(key, &owners);
@@ -2905,7 +4152,23 @@ pub const Store = struct {
                     effects.hashParts("fail2zig-native-effect-decision-v2", &.{ record.jail, record.source, record.occurrence, &admission.generation, &key })
                 else
                     effects.hashParts("fail2zig-native-effect-decision-v1", &.{ record.jail, record.source, record.occurrence, &admission.generation });
-                _ = try self.setOwnerTx(.{ .scope = scope, .jail = record.jail, .generation = admission.generation, .decision_id = identity, .expected_revision = effect_revision, .lease = .{ .finite = decision.expiry_us }, .decided_us = decision.decided_us }, effect_now);
+                effect_identity = identity;
+                _ = try self.setOwnerTx(.{ .scope = scope, .jail = record.jail, .generation = admission.generation, .decision_id = identity, .expected_revision = effect_revision, .lease = decision.lease, .decided_us = decision.decided_us }, effect_now);
+                if (self.schema_version >= 21) try self.prepareActionTargetsTx(.{ .action_id = identity, .scope_key = key, .jail = record.jail }, effect_now);
+            }
+            if (self.schema_version >= 17) {
+                if (try self.integer("SELECT count(*) FROM retry_decision_details;") >= application_history.max_details) return error.HistoryCapacity;
+                var detail = try self.statement("INSERT INTO retry_decision_details(jail,family,subject,source,occurrence,ordinal,decided_us,effect_decision_id,evidence) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9);");
+                defer detail.deinit();
+                try detail.text(1, record.jail);
+                try bindSubject(&detail, &subject);
+                try detail.text(4, record.source);
+                try detail.text(5, record.occurrence);
+                try detail.int(6, @intCast(decision.ordinal));
+                try detail.int(7, decision.decided_us);
+                if (effect_identity) |identity| try detail.blob(8, &identity);
+                if (record.retry_evidence.text) |evidence| try detail.text(9, evidence);
+                try detail.done();
             }
         }
     }
@@ -3361,6 +4624,8 @@ pub const Store = struct {
         if (record.source_path) |path| if (path.len > Limits.source_bytes or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidRecord;
         if (record.event_time) |time| if (!std.math.isFinite(time)) return error.InvalidRecord;
         if (record.action_intent) |intent| if (intent.len > 1024 * 1024) return error.InvalidRecord;
+        try record.retry_evidence.validate();
+        if (record.retry_evidence.text != null and record.native_retry == null) return error.InvalidRecord;
         if (record.shared_state) |shared| {
             if (shared.name.len == 0 or shared.name.len > 4096 or std.mem.indexOfScalar(u8, shared.name, 0) != null) return error.InvalidRecord;
             if (shared.payload) |payload| if (payload.len > Limits.shared_bytes) return error.InvalidRecord;
@@ -3380,7 +4645,7 @@ pub const Store = struct {
             if ((registered != null) != (record.native_retry != null)) return error.RetryAdmissionRequired;
             if (registered) |saved| {
                 const supplied = record.native_retry.?;
-                if (!std.mem.eql(u8, &saved.generation, &supplied.generation) or !std.mem.eql(u8, &try saved.policy.encode(), &try supplied.policy.encode())) return error.RetryGenerationMismatch;
+                if (!std.mem.eql(u8, &saved.generation, &supplied.generation) or !try retryPoliciesEqual(saved.policy, supplied.policy)) return error.RetryGenerationMismatch;
                 if (record.receipt) |receipt| {
                     if (!std.mem.eql(u8, &receipt.generation, &supplied.generation) or detections.len == 0 or
                         (supplied.processing_us orelse return error.InvalidRecord) < receipt.time.us) return error.InvalidRecord;
@@ -3643,7 +4908,7 @@ pub const Store = struct {
             const now = try self.commitEffectClock(clock);
             var decisions: [max_native_detections]retry.Decision = undefined;
             const count = try self.retryDecisions(record.jail, record.source, record.occurrence, &decisions);
-            for (decisions[0..count]) |decision| if (decision.enforce and now >= decision.expiry_us) return error.EffectExpired;
+            for (decisions[0..count]) |decision| if (decision.enforce and !decision.lease.live(now)) return error.EffectExpired;
         }
         const effect_changed = if (record.native_retry) |admission| admission.policy.enforce and try self.hasEnforcingDecision(record) else false;
         try self.commitTransaction();
@@ -5519,7 +6784,7 @@ test "native retry: runtime SQL limits interrupt bounded work and WAL maintenanc
 
 test "native retry: killed schema and decision commits reopen wholly before or after the boundary" {
     const a = std.testing.allocator;
-    const policy = retry.Policy{ .maxretry = 1, .window_us = 600_000_000, .bantime_us = 60_000_000, .max_subjects = 8 };
+    const policy = retry.Policy{ .maxretry = 1, .window_us = 600_000_000, .duration = .{ .finite_us = 60_000_000 }, .max_subjects = 8 };
     for ([_]bool{ false, true }) |migration| for ([_]bool{ false, true }) |after| {
         var temp = std.testing.tmpDir(.{});
         defer temp.cleanup();
@@ -5576,7 +6841,7 @@ test "native retry: killed schema and decision commits reopen wholly before or a
             try std.testing.expectEqual(after, state != null);
             try std.testing.expectEqual(after, decision != null);
             if (decision) |value| {
-                try std.testing.expectEqual(DetectionFixture.stamp + policy.bantime_us, value.expiry_us);
+                try std.testing.expectEqualDeep(retry.Lease{ .finite = DetectionFixture.stamp + policy.duration.finite_us }, value.lease);
                 try std.testing.expectEqual(@as(u64, 1), state.?.decisions);
             }
             try std.testing.expectEqual(@as(usize, @intFromBool(!after)), try restored.pendingReceiptCount());

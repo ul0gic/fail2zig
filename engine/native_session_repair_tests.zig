@@ -1183,7 +1183,7 @@ test "native session repair: pure generation equals file and journal builtin cus
         var mock = Mock{ .failure = error.UnexpectedSourceIo };
         var probe = GenerationProbe{};
         var scratch: [2048]u8 = undefined;
-        const retry: ?@import("core/native_retry.zig").Policy = if (with_retry) .{ .maxretry = 2, .window_us = 600_000_000, .bantime_us = 60_000_000, .max_subjects = 8 } else null;
+        const retry: ?@import("core/native_retry.zig").Policy = if (with_retry) .{ .maxretry = 2, .window_us = 600_000_000, .duration = .{ .finite_us = 60_000_000 }, .max_subjects = 8 } else null;
         const before = totalChanges(&f.store);
         if (is_journal) {
             var options = clock.journalOptions(&mock);

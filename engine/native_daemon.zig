@@ -18,13 +18,13 @@ const consumer_plan = @import("config/native_consumer_plan.zig");
 const consumer_bridge = @import("core/native_consumer_coordinator.zig");
 const resource = @import("native_resource_budget.zig");
 const history = @import("core/native_effect_history.zig");
+const recurrence = @import("core/native_recurrence.zig");
 const inspection = @import("firewall/inspection.zig");
 const path_guard = @import("config/native_paths.zig");
 const durable = @import("core/record_store.zig");
 const sessions = @import("core/native_file_session.zig");
 const journal_projection = @import("config/native_journal_detection.zig");
 const journal_sessions = @import("core/native_journal_session.zig");
-const pipeline = @import("core/record_pipeline.zig");
 const health = @import("core/storage_health.zig");
 const recovery = @import("core/native_recovery.zig");
 const loop_mod = @import("core/event_loop.zig");
@@ -38,32 +38,31 @@ const max_subjects_total = 4096;
 const Plan = union(enum) {
     file: projection.Plan,
     journal: *journal_projection.Plan,
+    internal: [32]u8,
     fn deinit(self: *Plan, a: std.mem.Allocator) void {
         switch (self.*) {
             .file => |*plan| plan.deinit(a),
             .journal => |plan| plan.destroy(),
+            .internal => {},
         }
     }
 };
 const Source = union(enum) {
     file: *sessions.Session,
     journal: *journal_sessions.Session,
+    internal: [32]u8,
     fn destroy(self: Source) void {
         switch (self) {
             .file => |source| source.destroy(),
             .journal => |source| source.destroy(),
+            .internal => {},
         }
-    }
-    fn pipe(self: Source) *pipeline.Pipeline {
-        return switch (self) {
-            .file => |source| &source.pipe,
-            .journal => |source| &source.pipe,
-        };
     }
     fn generation(self: Source) [32]u8 {
         return switch (self) {
             .file => |source| source.processor.generation,
             .journal => |source| source.processor.generation,
+            .internal => |value| value,
         };
     }
     fn poll(self: Source) !void {
@@ -74,46 +73,54 @@ const Source = union(enum) {
             .journal => |source| {
                 _ = try source.pollTurn(1);
             },
+            .internal => {},
         }
     }
     fn verify(self: Source) !bool {
         return switch (self) {
             .file => |source| try source.verifyRecoverySourcesTurn(),
             .journal => |source| try source.verifyRecoverySourcesTurn(),
+            .internal => true,
         };
     }
     fn healthy(self: Source) bool {
         return switch (self) {
             .file => |source| source.admission_phase == .ready and source.sources.sources.items.len > 0 and source.repairSnapshot().phase == .healthy,
             .journal => |source| source.admission_phase == .ready and source.source_health == .healthy and source.repairSnapshot().phase == .healthy,
+            .internal => true,
         };
     }
     fn exportRecovery(self: Source) !SourceSnapshot {
         return switch (self) {
             .file => |value| .{ .file = try value.exportRecovery() },
             .journal => |value| .{ .journal = try value.exportRecovery() },
+            .internal => .internal,
         };
     }
     fn importRecovery(self: Source, snapshot: SourceSnapshot) !void {
         switch (self) {
             .file => |value| if (snapshot == .file) try value.importRecovery(snapshot.file) else return error.SourceGenerationMismatch,
             .journal => |value| if (snapshot == .journal) try value.importRecovery(snapshot.journal) else return error.SourceGenerationMismatch,
+            .internal => if (snapshot != .internal) return error.SourceGenerationMismatch,
         }
     }
     fn resumeConsumer(self: Source, identity: []const u8) !void {
         switch (self) {
             .file => |value| _ = try value.resumeConsumerSource(identity),
             .journal => |value| _ = try value.resumeConsumerSource(identity),
+            .internal => return error.ConsumerRuntimeNotReady,
         }
     }
 };
 const SourceSnapshot = union(enum) {
     file: *sessions.RecoverySnapshot,
     journal: *journal_sessions.RecoverySnapshot,
+    internal,
     fn destroy(self: SourceSnapshot) void {
         switch (self) {
             .file => |value| value.destroy(),
             .journal => |value| value.destroy(),
+            .internal => {},
         }
     }
 };
@@ -228,6 +235,11 @@ pub const Coordinator = struct {
         const canonical = try std.fmt.bufPrint(&bytes, "{}", .{selected});
         return effect.hashParts("fail2zig-native-resolver-udp-v1", &.{canonical});
     }
+    fn internalGeneration(jail: []const u8, policy: retry.Policy) ![32]u8 {
+        const base = try policy.encode();
+        const escalation = try policy.escalationBytes();
+        return effect.hashParts("fail2zig-native-recidive-source-v1", &.{ jail, &base, &escalation });
+    }
     fn resourceRequirements(cfg: *const config.Config, selected: []config.LogSource) !resource.Requirements {
         const environment = try resource.currentEnvironment();
         const descriptors = try resource.FdContext.observe(cfg.global.native_fd_ceiling, 32);
@@ -239,19 +251,25 @@ pub const Coordinator = struct {
         // remain live alongside record preparation and detached IPC responses.
         try plan.include(.{ .live = .{ .bytes = try std.math.add(usize, cfg.retained_capacity, 16 * resource.mib), .allocations = 2, .fds = 2 } });
         var custom: usize = 0;
+        var internal_count: usize = 0;
         var enforcing = false;
         var index: usize = 0;
         for (cfg.jails) |jail| {
             if (!jail.enabled) continue;
             var source = if (jail.source == .auto) cfg.defaults.source else jail.source;
             if (source == .auto) source = if (config.anyLogpathExists(jail.logpath)) .file else if (config.filterSupportsJournald(jail.filter) and config.journalctlPresent()) .journald else .file;
+            if (source == .internal) {
+                internal_count += 1;
+                if (internal_count > 1 or !config.filterSupportsInternal(jail.filter) or jail.logpath.len != 0 or jail.journal_executables.len != 0 or jail.rule_files.len != 0) return error.NativeInternalEventsRequired;
+            } else if (config.filterSupportsInternal(jail.filter)) return error.NativeInternalEventsRequired;
             selected[index] = source;
             index += 1;
             const capacity: usize = if (source == .journald) 1 else max_sources_per_jail;
             switch (source) {
                 .file => try plan.include(try resource.fileCost(.{ .source_capacity = capacity, .spec_count = jail.logpath.len, .max_record_bytes = 2048, .max_decoded_bytes = 2048 })),
                 .journald => try plan.include(try resource.journalCost(.{ .max_record_bytes = 2048, .max_decoded_bytes = 2048, .batch_records = 1, .environment = environment })),
-                else => return error.NativeInternalEventsRequired,
+                .internal => try plan.include(.{ .workspace = .{ .bytes = 16 * 1024, .allocations = 4 }, .workspace_kind = .source }),
+                .auto => return error.NativeInternalEventsRequired,
             }
             const projection_bytes = @sizeOf(Plan) + @sizeOf(journal_projection.Plan) + jail.logpath.len * @sizeOf(sessions.Spec) + 128 * @sizeOf(@import("core/state.zig").Cidr);
             try plan.include(.{ .live = .{ .bytes = projection_bytes, .allocations = 4 }, .workspace = .{ .bytes = 65536, .allocations = 16, .fds = 2 }, .workspace_kind = .configuration });
@@ -375,7 +393,7 @@ pub const Coordinator = struct {
                     break :blk .{ .journal = try journal_projection.Plan.create(a, &selected_cfg, 0, parent_generation, .{ .machine_id = std.mem.trim(u8, machine, "\n"), .executables = selected.journal_executables, .ignore_capacity = 128, .custom = assets != null, .journal = .{ .batch_records = 1, .matches = &.{ "SYSLOG_IDENTIFIER=sshd", "SYSLOG_IDENTIFIER=sshd-session", "+", "_COMM=sshd", "_COMM=sshd-session" } } }) };
                 },
                 .auto => unreachable,
-                .internal => return error.NativeInternalEventsRequired,
+                .internal => .{ .internal = try internalGeneration(selected.name, policy) },
             };
             errdefer plan.deinit(a);
             const scratch = try a.alloc(durable.Store.ActiveDecision, per_jail);
@@ -455,6 +473,12 @@ pub const Coordinator = struct {
         try self.store.enableConfirmedHistory();
         try self.store.enableMaintenance();
         try self.store.enableCleanup();
+        try self.store.enableRetryLeases();
+        try self.store.enableApplicationHistory();
+        try self.store.enableEscalation();
+        try self.store.enableCanonicalEffects();
+        try self.store.enableHistoryResets();
+        try self.store.enableActionTargets();
         try self.validateAdmission();
     }
     fn validateAdmission(self: *Coordinator) !void {
@@ -487,6 +511,7 @@ pub const Coordinator = struct {
             settings.journal_origin = switch (jail.plan) {
                 .file => null,
                 .journal => |value| &value.profile,
+                .internal => null,
             };
             settings.monotonic_ms = monotonic;
             settings.authority_revision = if (self.dns_server != null) 1 else 0;
@@ -514,6 +539,7 @@ pub const Coordinator = struct {
                 const processor = try journal_sessions.Session.prepareProcessor(self.allocator, options, &scratch, .{ .us = 0 });
                 break :blk processor.generation;
             },
+            .internal => |generation| generation,
         };
     }
     fn driver(self: *Coordinator) recovery.Driver {
@@ -565,10 +591,7 @@ pub const Coordinator = struct {
         return true;
     }
     fn effectBindings(self: *Coordinator, output: *[max_jails]effect_runtime.Binding) void {
-        for (self.jails, 0..) |jail, i| output[i] = .{ .jail = jail.name, .generation = switch (jail.session.?) {
-            .file => |source| source.processor.generation,
-            .journal => |source| source.processor.generation,
-        } };
+        for (self.jails, 0..) |jail, i| output[i] = .{ .jail = jail.name, .generation = jail.session.?.generation() };
     }
     fn verifyNamespace(self: *Coordinator) !void {
         const selected = try std.fs.openFileAbsolute(self.cfg.global.firewall_namespace, .{});
@@ -726,6 +749,7 @@ pub const Coordinator = struct {
                     settings.journal_origin = switch (jail.plan) {
                         .file => null,
                         .journal => |value| &value.profile,
+                        .internal => null,
                     };
                     jail.consumer = try consumer_runtime.JailRuntime.create(self.allocator, &self.store, self.dns.?, .{
                         .settings = settings,
@@ -763,10 +787,12 @@ pub const Coordinator = struct {
                         }
                         break :blk .{ .journal = try journal_sessions.Session.createDeferred(self.allocator, &self.store, options) };
                     },
+                    .internal => |generation| .{ .internal = generation },
                 };
                 errdefer next.destroy();
                 if (jail.source_snapshot) |snapshot| try next.importRecovery(snapshot);
                 jail.session = next;
+                if (jail.plan == .internal) try self.store.admitRetry(jail.name, next.generation(), jail.policy);
                 if (jail.consumer != null) {
                     self.consumer_cursor_len = 0;
                     self.consumer_scan_revision = null;
@@ -846,6 +872,10 @@ pub const Coordinator = struct {
             stage.publish();
         }
     }
+    fn recidiveJail(self: *Coordinator) ?*Jail {
+        for (self.jails) |*jail| if (jail.plan == .internal) return jail;
+        return null;
+    }
     fn consumeHistory(self: *Coordinator) !bool {
         const owner = if (self.history_consumer) |*value| value else return true;
         var events: [history.max_page]history.Event = undefined;
@@ -854,6 +884,11 @@ pub const Coordinator = struct {
             const now = std.time.microTimestamp();
             const stage = try owner.prepare(page, events[0..page.count], now);
             defer stage.release();
+            if (self.recidiveJail()) |jail| {
+                for (events[0..page.count]) |event| {
+                    _ = try recurrence.consume(&self.store, .{ .jail = jail.name, .generation = jail.session.?.generation(), .policy = jail.policy }, event, now, .{ .prepared_us = now, .read = processingClock });
+                }
+            }
             try self.store.commitConfirmedHistory(owner.manifest(), try stage.batch(.{ .prepared_us = now, .read = processingClock }), page.token);
             stage.publish();
             self.history_page = null;
@@ -960,26 +995,27 @@ pub const Coordinator = struct {
         const summary = try self.store.retrySummary(jail.name, now, jail.scratch);
         for (jail.scratch[0..summary.active], 0..) |decision, i| jail.scratch_confirmed[i] = jail.policy.enforce and if (self.effects) |manager| manager.confirmedSubject(decision.subject, now) else false;
         const confirmations = if (self.effects != null) try self.store.confirmedEffectEvents() else 0;
-        const session = jail.session.?;
+        const revision = try self.store.revision(jail.name);
         self.mutex.lock();
         defer self.mutex.unlock();
         @memcpy(jail.active[0..summary.active], jail.scratch[0..summary.active]);
         @memcpy(jail.confirmed[0..summary.active], jail.scratch_confirmed[0..summary.active]);
         self.published_confirmations = confirmations;
         jail.summary = summary;
-        jail.revision = session.pipe().revision;
-        jail.healthy = session.healthy();
+        jail.revision = revision;
+        jail.healthy = jail.session.?.healthy();
     }
     fn publishSource(self: *Coordinator, jail: *Jail) void {
         const source = jail.session.?;
-        const snapshot = switch (source) {
-            .file => |value| value.repairSnapshot(),
-            .journal => |value| value.repairSnapshot(),
+        const cause: ?anyerror = switch (source) {
+            .file => |value| value.repairSnapshot().last_cause,
+            .journal => |value| value.repairSnapshot().last_cause,
+            .internal => null,
         };
         self.mutex.lock();
         defer self.mutex.unlock();
         jail.healthy = source.healthy();
-        jail.source_error = snapshot.last_cause;
+        jail.source_error = cause;
     }
     fn publishHealth(self: *Coordinator) void {
         const snapshot = self.gate.snapshot();
@@ -1127,10 +1163,24 @@ pub const Coordinator = struct {
     fn maintenanceTurn(self: *Coordinator) !void {
         if (self.gate.snapshot().phase != .healthy or self.jails.len == 0) return;
         if (self.effects) |manager| if (!manager.status.ready or manager.status.uncertain) return;
+        if (self.history_page) |page| {
+            if (page.after_sequence == page.head_sequence and page.last_sequence == page.head_sequence) {
+                const age_us = std.math.mul(i64, std.math.cast(i64, self.cfg.global.history_retention) orelse return error.InvalidApplicationHistoryQuery, 1_000_000) catch return error.InvalidApplicationHistoryQuery;
+                if (try self.store.cleanupConfirmedHistoryOne(.{ .age_us = age_us, .max_matches = self.cfg.global.history_max_matches }, std.time.microTimestamp())) {
+                    self.history_page = null;
+                    return;
+                }
+            }
+        }
         const jail = &self.jails[self.maintenance_jail % self.jails.len];
         self.maintenance_jail = (self.maintenance_jail + 1) % self.jails.len;
         const session = jail.session orelse return;
-        if (!session.healthy() or session.pipe().candidate_receipt != null) return;
+        if (!session.healthy()) return;
+        switch (session) {
+            .file => |value| if (value.pipe.candidate_receipt != null) return,
+            .journal => |value| if (value.pipe.candidate_receipt != null) return,
+            .internal => return,
+        }
         if (jail.consumer) |owner| {
             if (owner.ignores.in_flight) return;
             for (owner.registry.sources[0..owner.registry.count]) |source| {
@@ -1143,16 +1193,19 @@ pub const Coordinator = struct {
                 break :blk value.sources.sources.items.len;
             },
             .journal => 1,
+            .internal => return,
         };
         if (source_count == 0) return;
         const source_index = jail.maintenance_source % source_count;
         const source_id = switch (session) {
             .file => |value| value.sources.sources.items[source_index].source_id,
             .journal => |value| value.options.source_id,
+            .internal => return,
         };
         const generation = switch (session) {
             .file => |value| value.processor.generation,
             .journal => |value| value.processor.generation,
+            .internal => return,
         };
         if (self.effects != null) {
             const page = self.history_page orelse return;
@@ -1164,7 +1217,7 @@ pub const Coordinator = struct {
             .jail = jail.name,
             .source = source_id,
             .generation = generation,
-            .jail_revision = session.pipe().revision,
+            .jail_revision = try self.store.revision(jail.name),
             .consumer_revision = try self.store.maintenanceConsumerRevision(),
             .effect_revision = try self.store.maintenanceEffectRevision(),
             .history = self.history_page,
@@ -1242,7 +1295,7 @@ pub const Coordinator = struct {
     fn confirmedCount(self: *const Coordinator, jail: Jail, now: i64, observation: health.WorkerStatus) u32 {
         if (!self.confirmationReady(observation)) return 0;
         var count: u32 = 0;
-        for (jail.active[0..jail.summary.active], 0..) |decision, i| if (jail.confirmed[i] and decision.expiry_us > now) {
+        for (jail.active[0..jail.summary.active], 0..) |decision, i| if (jail.confirmed[i] and decision.lease.live(now)) {
             count += 1;
         };
         return count;
@@ -1262,7 +1315,7 @@ pub const Coordinator = struct {
         for (self.jails) |jail| {
             if (selected) |name| if (!std.mem.eql(u8, name.slice(), jail.name)) continue;
             for (jail.active[0..jail.summary.active], 0..) |decision, i| {
-                if (!observation.clock_uncertain and sampled_wall != null and decision.expiry_us <= sampled_wall.?) continue;
+                if (!observation.clock_uncertain and sampled_wall != null and !decision.lease.live(sampled_wall.?)) continue;
                 if (!first) try w.writeByte(',');
                 first = false;
                 const address: shared.IpAddress = switch (decision.subject) {
@@ -1272,7 +1325,12 @@ pub const Coordinator = struct {
                 var buffer: [64]u8 = undefined;
                 const formatted = try std.fmt.bufPrint(&buffer, "{}", .{address});
                 const confirmed = jail.confirmed[i] and self.confirmationReady(observation);
-                try std.json.stringify(.{ .ip = formatted, .jail = jail.name, .expiry_us = decision.expiry_us, .ban_expiry = @divFloor(decision.expiry_us, 1_000_000), .ban_count = decision.ordinal, .enforced = confirmed, .confirmed = confirmed }, .{}, w);
+                const expiry_us: ?i64 = switch (decision.lease) {
+                    .finite => |value| value,
+                    .permanent => null,
+                    .absent => return error.InvalidRetryState,
+                };
+                try std.json.stringify(.{ .ip = formatted, .jail = jail.name, .expiry_us = expiry_us, .ban_expiry = if (expiry_us) |value| @divFloor(value, 1_000_000) else null, .permanent = decision.lease == .permanent, .ban_count = decision.ordinal, .enforced = confirmed, .confirmed = confirmed }, .{}, w);
             }
         }
         try w.writeAll("]");
@@ -1302,7 +1360,11 @@ pub const Coordinator = struct {
                 try w.writeAll("[");
                 for (self.jails, 0..) |jail, index| {
                     if (index > 0) try w.writeByte(',');
-                    try std.json.stringify(.{ .name = jail.name, .healthy = jail.healthy and self.published_health.phase == .healthy and observationHealthy(observation), .enabled = true, .active_bans = self.confirmedCount(jail, sampled_wall orelse self.start_us, observation), .maxretry = jail.policy.maxretry, .findtime = @divTrunc(jail.policy.window_us, 1_000_000), .bantime = @divTrunc(jail.policy.bantime_us, 1_000_000), .action = if (jail.policy.enforce) self.published_backend else "log-only", .enforcing = jail.policy.enforce and self.confirmationReady(observation), .log_source = @tagName(jail.plan), .source_healthy = jail.healthy and self.published_health.phase == .healthy and observationHealthy(observation), .source = @tagName(jail.plan), .revision = jail.revision, .decisions = jail.summary.decisions, .cause = if (jail.source_error) |cause| @errorName(cause) else "none" }, .{}, w);
+                    const bantime: ?i64 = switch (jail.policy.duration) {
+                        .finite_us => |value| @divTrunc(value, 1_000_000),
+                        .permanent => null,
+                    };
+                    try std.json.stringify(.{ .name = jail.name, .healthy = jail.healthy and self.published_health.phase == .healthy and observationHealthy(observation), .enabled = true, .active_bans = self.confirmedCount(jail, sampled_wall orelse self.start_us, observation), .maxretry = jail.policy.maxretry, .findtime = @divTrunc(jail.policy.window_us, 1_000_000), .bantime = bantime, .bantime_permanent = jail.policy.duration == .permanent, .action = if (jail.policy.enforce) self.published_backend else "log-only", .enforcing = jail.policy.enforce and self.confirmationReady(observation), .log_source = @tagName(jail.plan), .source_healthy = jail.healthy and self.published_health.phase == .healthy and observationHealthy(observation), .source = @tagName(jail.plan), .revision = jail.revision, .decisions = jail.summary.decisions, .cause = if (jail.source_error) |cause| @errorName(cause) else "none" }, .{}, w);
                 }
                 try w.writeAll("]");
             },

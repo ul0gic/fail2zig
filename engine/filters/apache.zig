@@ -115,6 +115,11 @@ test "apache-badbots: MJ12bot" {
     try testing.expect(firstMatchIn(&badbots_patterns, "10.0.0.1 - - [21/Apr/2026] \"GET / HTTP/1.1\" 200 0 \"-\" \"MJ12bot\"") != null);
 }
 
+test "apache-badbots: remaining compiled submodes" {
+    try testing.expect(firstMatchIn(&badbots_patterns, "192.0.2.12 - - [14/Sep/2026] \"GET / HTTP/1.1\" 200 0 \"-\" \"DotBot/1.2\"") != null);
+    try testing.expect(firstMatchIn(&badbots_patterns, "192.0.2.13 - - [14/Sep/2026] \"POST /xmlrpc.php HTTP/1.1\" 404 0") != null);
+}
+
 test "apache-badbots: wp-login probe" {
     try testing.expect(firstMatchIn(&badbots_patterns, "1.2.3.4 - - [21/Apr/2026:12:00:00 +0000] \"GET /wp-login.php HTTP/1.1\" 404 162") != null);
     try testing.expect(firstMatchIn(&badbots_patterns, "203.0.113.50 - - [21/Apr/2026] \"POST /wp-login.php HTTP/1.1\" 404 0") != null);
@@ -137,6 +142,10 @@ test "apache-overflows: invalid URI" {
 test "apache-overflows: URI too long" {
     try testing.expect(firstMatchIn(&overflows_patterns, "[error] [client 1.2.3.4:80] request failed: URI too long") != null);
     try testing.expect(firstMatchIn(&overflows_patterns, "[error] [client 203.0.113.1:80] request failed: URI too long (longer than 8190)") != null);
+}
+
+test "apache-overflows: request headers too long" {
+    try testing.expect(firstMatchIn(&overflows_patterns, "[error] [client 192.0.2.14:443] request failed: error reading the headers") != null);
 }
 
 test "apache-overflows: negative — successful request" {

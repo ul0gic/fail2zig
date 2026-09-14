@@ -93,9 +93,10 @@ pub const Processor = struct {
         if (value.window_us != self.options.window_us) return error.InvalidRetryPolicy;
         const encoded = try value.encode();
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update("fail2zig-source-retry-v1\x00");
+        hash.update(if (value.escalation.enabled) "fail2zig-source-retry-v2\x00" else "fail2zig-source-retry-v1\x00");
         hash.update(&self.generation);
         hash.update(&encoded);
+        if (value.escalation.enabled) hash.update(&try value.escalationBytes());
         hash.final(&self.generation);
         self.retry_policy = value;
     }
@@ -285,6 +286,7 @@ pub const Processor = struct {
         var outcome: ?policy.Result = null;
         var detected: ?detection.Outcome = null;
         var detections: ?[]const detection.Outcome = null;
+        var retry_evidence: retry.Evidence = .{};
         var consumer_batch: ?@import("native_consumer.zig").Batch = null;
         var consumer_manifest: ?@import("native_consumer.zig").Manifest = null;
         errdefer if (self.consumer_stage) |stage_value| {
@@ -346,6 +348,16 @@ pub const Processor = struct {
                 detections = prepared.outcomes;
                 consumer_batch = prepared.consumers;
             }
+            if (self.retry_policy != null) {
+                var candidate = if (detected) |value| value.kind == .candidate else false;
+                if (detections) |values| for (values) |value| {
+                    if (value.kind == .candidate) {
+                        candidate = true;
+                        break;
+                    }
+                };
+                if (candidate) retry_evidence.text = decoded;
+            }
         }
         if (self.staged_detector) |consumer| {
             consumer_manifest = try consumer.manifest(record.source, self.generation, consumer.context);
@@ -358,7 +370,7 @@ pub const Processor = struct {
             }
         }
         self.stage(counters, false);
-        return .{ .checkpoint = &self.staged_bytes, .disposition = if (outcome) |value| value.disposition() else "source-checkpoint", .native_time = outcome, .zone_provenance = zone_provenance, .effects_clock = if (self.retry_policy != null and self.retry_policy.?.enforce and processing_us != null) .{ .prepared_us = processing_us.?, .read = commitClock, .context = self } else null, .native_detection = detected, .native_detections = detections, .consumers = consumer_batch, .consumer_manifest = consumer_manifest, .native_retry = if (self.retry_policy) |value| .{ .generation = self.generation, .policy = value, .processing_us = processing_us } else null, .context = self, .publish = publish, .release = release };
+        return .{ .checkpoint = &self.staged_bytes, .disposition = if (outcome) |value| value.disposition() else "source-checkpoint", .native_time = outcome, .zone_provenance = zone_provenance, .effects_clock = if (self.retry_policy != null and self.retry_policy.?.enforce and processing_us != null) .{ .prepared_us = processing_us.?, .read = commitClock, .context = self } else null, .native_detection = detected, .native_detections = detections, .consumers = consumer_batch, .consumer_manifest = consumer_manifest, .native_retry = if (self.retry_policy) |value| .{ .generation = self.generation, .policy = value, .processing_us = processing_us } else null, .retry_evidence = retry_evidence, .context = self, .publish = publish, .release = release };
     }
     fn commitClock(context: ?*anyopaque) i64 {
         const self: *Processor = @ptrCast(@alignCast(context.?));

@@ -13,7 +13,7 @@ const stored = @import("native_detection_record.zig");
 
 /// Bump when matching, body extraction or ignore semantics change. Registry
 /// pattern implementations are part of this version, not just their names.
-pub const version: u16 = 1;
+pub const version: u16 = 2;
 pub const Body = enum { whole, syslog };
 pub const Options = struct {
     filter: []const u8,

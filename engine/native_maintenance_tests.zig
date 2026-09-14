@@ -290,7 +290,7 @@ test "native maintenance: source sequence receipt and cursor commit or roll back
     try commitObserved(&f.store, other, 1);
     try t.expectEqual(@as(u64, 1), (try f.store.sourceMaintenance(identity.jail, identity.source, generation)).?.head_sequence);
     try t.expectEqual(@as(u64, 1), (try f.store.sourceMaintenance(other.jail, other.source, other.generation)).?.head_sequence);
-    const policy = @import("core/native_retry.zig").Policy{ .maxretry = 2, .window_us = 1000, .bantime_us = 1000, .max_subjects = 8 };
+    const policy = @import("core/native_retry.zig").Policy{ .maxretry = 2, .window_us = 1000, .duration = .{ .finite_us = 1000 }, .max_subjects = 8 };
     try f.store.admitRetry("baseline", generation, policy);
     const baseline = durable.Record{ .jail = "baseline", .source = "initial-inode", .occurrence = "start", .cursor = "head", .raw_hash = [_]u8{0} ** 32, .disposition = "source-checkpoint", .checkpoint = "state", .native_retry = .{ .generation = generation, .policy = policy } };
     _ = try f.store.commitRecord(baseline);
@@ -657,7 +657,7 @@ test "native maintenance: retired retries preserve counters and original clocks 
     try setupCleanup(&f);
     var now = CleanupClock{ .now = 500 };
     const retry = @import("core/native_retry.zig");
-    const policy = retry.Policy{ .maxretry = 1, .window_us = 100, .bantime_us = 100, .max_subjects = 1 };
+    const policy = retry.Policy{ .maxretry = 1, .window_us = 100, .duration = .{ .finite_us = 100 }, .max_subjects = 1 };
     try f.store.admitRetry(identity.jail, generation, policy);
     const subject = @import("core/native_detection_record.zig").Subject{ .v4 = .{ 192, 0, 2, 91 } };
     // Original working state with an expired decision; no protected effect.
@@ -737,7 +737,7 @@ test "native maintenance: inclusive retry window pins detail and retirement unti
     var f = try Fixture.init();
     defer f.deinit();
     try setupCleanup(&f);
-    const policy = @import("core/native_retry.zig").Policy{ .maxretry = 2, .window_us = 100, .bantime_us = 100, .max_subjects = 8 };
+    const policy = @import("core/native_retry.zig").Policy{ .maxretry = 2, .window_us = 100, .duration = .{ .finite_us = 100 }, .max_subjects = 8 };
     try f.store.admitRetry(identity.jail, generation, policy);
     _ = try f.store.beginReceipt(identity, .{ .us = 100 }, 0);
     _ = try f.store.commitRecord(try candidateRecord(identity, 0, 100, policy));
@@ -769,7 +769,7 @@ test "native maintenance: live physical effect and missing caught-up history pin
     var f = try Fixture.init();
     defer f.deinit();
     try setupCleanup(&f);
-    const policy = @import("core/native_retry.zig").Policy{ .maxretry = 2, .window_us = 100, .bantime_us = 100, .max_subjects = 8 };
+    const policy = @import("core/native_retry.zig").Policy{ .maxretry = 2, .window_us = 100, .duration = .{ .finite_us = 100 }, .max_subjects = 8 };
     try f.store.admitRetry(identity.jail, generation, policy);
     _ = try f.store.beginReceipt(identity, .{ .us = 100 }, 0);
     _ = try f.store.commitRecord(try candidateRecord(identity, 0, 100, policy));
@@ -859,7 +859,7 @@ test "native maintenance: killed production migration mark delete and retirement
             try commitObserved(&f.store, anchor, 1);
             if (operation == 2) _ = try f.store.cleanupAdvance(try cleanupFence(&f.store, identity, &now), (try f.store.sourceMaintenance(identity.jail, identity.source, generation)).?, 1);
         } else if (operation == 3) {
-            try f.store.admitRetry(identity.jail, generation, .{ .maxretry = 1, .window_us = 100, .bantime_us = 100, .max_subjects = 1 });
+            try f.store.admitRetry(identity.jail, generation, .{ .maxretry = 1, .window_us = 100, .duration = .{ .finite_us = 100 }, .max_subjects = 1 });
             try sql(&f.store, "UPDATE retry_clock SET floor_us=100; INSERT INTO retry_states VALUES('receipt',4,X'C000025B',100,200,7,X'');");
         }
         const pid = try std.posix.fork();
@@ -926,7 +926,7 @@ test "native maintenance: paged validation and health remain bounded with accumu
         \\UPDATE source_maintenance SET head_sequence=2048;
         \\COMMIT;
     );
-    try f.store.admitRetry("retired", generation, .{ .maxretry = 1, .window_us = 100, .bantime_us = 100, .max_subjects = 1 });
+    try f.store.admitRetry("retired", generation, .{ .maxretry = 1, .window_us = 100, .duration = .{ .finite_us = 100 }, .max_subjects = 1 });
     try sql(&f.store,
         \\BEGIN IMMEDIATE;
         \\UPDATE retry_clock SET floor_us=100;

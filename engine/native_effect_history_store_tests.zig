@@ -5,6 +5,11 @@ const t = std.testing;
 const history = @import("core/native_effect_history.zig");
 const effects = @import("core/native_effect.zig");
 const durable = @import("core/record_store.zig");
+const application = @import("core/native_application_history.zig");
+const detection = @import("core/native_detection_record.zig");
+const retry = @import("core/native_retry.zig");
+const recurrence = @import("core/native_recurrence.zig");
+const time_policy = @import("core/source_time_policy.zig");
 const Fixture = struct {
     tmp: t.TmpDir,
     path: []u8,
@@ -44,7 +49,10 @@ const Fixture = struct {
         try self.store.enableReceipts(8);
     }
     fn confirm(self: *Fixture, id: u8, clock: *Clock) !effects.Entry {
-        const entry = try self.store.setOwner(.{ .scope = try effects.Scope.host(.{ .v4 = .{ 192, 0, 2, id } }), .jail = "ssh", .generation = [_]u8{3} ** 32, .decision_id = [_]u8{id} ** 32, .expected_revision = 0, .lease = .permanent, .decided_us = clock.now }, clock.value());
+        return self.confirmAs("ssh", id, clock);
+    }
+    fn confirmAs(self: *Fixture, jail: []const u8, id: u8, clock: *Clock) !effects.Entry {
+        const entry = try self.store.setOwner(.{ .scope = try effects.Scope.host(.{ .v4 = .{ 192, 0, 2, id } }), .jail = jail, .generation = [_]u8{3} ** 32, .decision_id = [_]u8{id} ** 32, .expected_revision = 0, .lease = .permanent, .decided_us = clock.now }, clock.value());
         try self.store.markDispatched(entry.token(), clock.value());
         _ = try self.store.settleVerified(entry.token(), observation(entry, clock.now), clock.value());
         return entry;
@@ -69,9 +77,39 @@ const Clock = struct {
 fn observation(entry: effects.Entry, now: i64) effects.Observation {
     return .{ .installation = entry.installation.id, .scope_key = entry.scope_key, .fingerprint = [_]u8{9} ** 32, .observed_us = now, .qualification = .complete_owned, .state = entry.desired };
 }
+fn effectForSubject(store: *durable.Store, subject: detection.Subject) !effects.Entry {
+    var rows: [effects.max_page]effects.Entry = undefined;
+    const page = try store.effectPage(null, null, &rows);
+    const wanted = try effects.Scope.host(subject);
+    for (rows[0..page.count]) |entry| if (std.meta.eql(entry.scope, wanted)) return entry;
+    return error.MissingNativeEffect;
+}
 fn sql(store: *durable.Store, statement: [:0]const u8) !void {
     const run = @extern(*const fn (*anyopaque, [*:0]const u8, ?*anyopaque, ?*anyopaque, ?*?[*:0]u8) callconv(.c) c_int, .{ .name = "sqlite3_exec" });
     if (run(@ptrCast(store.db), statement, null, null, null) != 0) return error.TestSqlFailed;
+}
+
+fn enableApplicationHistory(store: *durable.Store) !void {
+    try store.enableConfirmedHistory();
+    try store.enableMaintenance();
+    try store.enableCleanup();
+    try store.enableRetryLeases();
+    try store.enableApplicationHistory();
+}
+
+fn nativeRecord(store: *durable.Store, clock: *Clock, jail: []const u8, occurrence: []const u8, revision: u64, address: detection.Subject, policy: retry.Policy, evidence: ?[]const u8) !durable.Record {
+    const generation = [_]u8{3} ** 32;
+    const identity = durable.ReceiptIdentity{ .jail = jail, .source = "file", .occurrence = occurrence, .cursor = occurrence, .raw_hash = [_]u8{4} ** 32, .generation = generation };
+    const receipt = try store.beginReceipt(identity, .{ .us = clock.now }, revision);
+    const outcome = try time_policy.evaluate(.timestamped, .{ .parsed = receipt }, receipt, receipt, 1_000);
+    return .{ .jail = jail, .source = identity.source, .occurrence = occurrence, .cursor = occurrence, .raw_hash = identity.raw_hash, .receipt = .{ .time = receipt, .generation = generation }, .native_time_outcome = outcome, .native_detection = .{ .kind = .candidate, .generation = generation, .filter = try detection.Name.init("fixture"), .pattern = try detection.Name.init("failure"), .pattern_index = 0, .subject = address }, .native_retry = .{ .generation = generation, .policy = policy, .processing_us = clock.now }, .retry_evidence = .{ .text = evidence }, .effects_clock = clock.value(), .expected_revision = revision, .disposition = outcome.disposition(), .checkpoint = "application-history" };
+}
+
+fn applicationAllocationRead(allocator: std.mem.Allocator, fixture: *Fixture) !void {
+    var rows: [2]application.Event = undefined;
+    const page = try fixture.store.applicationHistoryPage(allocator, fixture.installation, .{}, &rows);
+    defer for (rows[0..page.count]) |*row| row.deinit(allocator);
+    try t.expectEqual(@as(usize, 2), page.count);
 }
 
 test "native effect history store: migration backfill rollback deterministic append and reopen" {
@@ -99,6 +137,383 @@ test "native effect history store: migration backfill rollback deterministic app
     try t.expectEqual(@as(usize, 1), next.count);
     try t.expectEqual(@as(u64, 3), events[0].sequence);
     try t.expectError(error.StaleHistoryPage, f.store.validateConfirmedEffectPage(first.token));
+}
+
+test "native effect history store: application detail pages aggregates and policy summaries are bounded and fenced" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var clock = Clock{};
+    _ = try f.confirm(11, &clock); // Pre-schema-17 event has explicit absent detail.
+    try f.store.enableConfirmedHistory();
+    try f.store.enableMaintenance();
+    try f.store.enableCleanup();
+    try f.store.enableRetryLeases();
+    f.store.fail_at = .before_application_history_schema_commit;
+    try t.expectError(error.InjectedFailure, f.store.enableApplicationHistory());
+    try t.expectEqual(@as(i64, 16), f.store.schema_version);
+    f.store.fail_at = null;
+    try f.store.enableApplicationHistory();
+    try t.expectEqual(@as(i64, 17), f.store.schema_version);
+
+    var rows: [1]application.Event = undefined;
+    const migrated = try f.store.applicationHistoryPage(t.allocator, f.installation, .{}, &rows);
+    try t.expectEqual(@as(usize, 1), migrated.count);
+    try t.expect(rows[0].detail == null);
+    rows[0].deinit(t.allocator);
+
+    const permanent = retry.Policy{ .maxretry = 1, .window_us = 1_000, .duration = .permanent, .max_subjects = 8, .enforce = true };
+    try f.store.admitRetry("native", [_]u8{3} ** 32, permanent);
+    const native_subject = detection.Subject{ .v4 = .{ 192, 0, 2, 21 } };
+    try t.expectEqual(durable.CommitResult.committed, try f.store.commitRecord(try nativeRecord(&f.store, &clock, "native", "native-one", 0, native_subject, permanent, "bounded failure example")));
+    var effects_rows: [4]effects.Entry = undefined;
+    const effects_page = try f.store.effectPage(null, null, &effects_rows);
+    var native_effect: ?effects.Entry = null;
+    const native_scope = try effects.Scope.host(native_subject);
+    for (effects_rows[0..effects_page.count]) |entry| {
+        if (std.meta.eql(entry.scope, native_scope)) native_effect = entry;
+    }
+    const pending = native_effect orelse return error.MissingNativeEffect;
+    try f.store.markDispatched(pending.token(), clock.value());
+    try t.expectEqual(effects.Settlement.verified, try f.store.settleVerified(pending.token(), observation(pending, clock.now), clock.value()));
+
+    const first = try f.store.applicationHistoryPage(t.allocator, f.installation, .{}, &rows);
+    try t.expect(first.more);
+    try t.expect(rows[0].detail == null);
+    rows[0].deinit(t.allocator);
+    const second = try f.store.applicationHistoryPage(t.allocator, f.installation, .{ .after_sequence = first.last_sequence, .expected_stream_revision = first.stream_revision }, &rows);
+    try t.expectEqual(@as(usize, 1), second.count);
+    try t.expect(!second.more);
+    try t.expectEqualStrings("native", rows[0].confirmed.jail.slice());
+    try t.expectEqualStrings("file", rows[0].detail.?.source);
+    try t.expectEqualStrings("native-one", rows[0].detail.?.occurrence);
+    try t.expectEqualStrings("bounded failure example", rows[0].detail.?.evidence.?);
+    try t.expectEqual(@as(u64, 1), rows[0].detail.?.ordinal);
+    rows[0].deinit(t.allocator);
+    try t.checkAllAllocationFailures(t.allocator, applicationAllocationRead, .{&f});
+
+    try sql(&f.store, "DELETE FROM retry_decision_details;");
+    const retained = try f.store.applicationHistoryPage(t.allocator, f.installation, .{ .after_sequence = first.last_sequence, .expected_stream_revision = first.stream_revision }, &rows);
+    try t.expectEqual(@as(usize, 1), retained.count);
+    try t.expect(rows[0].detail != null);
+    rows[0].deinit(t.allocator);
+
+    var aggregates: [65]application.Aggregate = undefined;
+    const aggregate = try f.store.applicationHistoryAggregates(f.installation, .{ .range = .{ .from_us = 100, .to_us = 101 } }, &aggregates);
+    try t.expectEqual(@as(usize, 3), aggregate.count); // overall + native + ssh
+    try t.expectEqual(@as(u64, 2), aggregates[0].confirmed);
+    try t.expectEqual(@as(?i64, 100), aggregates[0].first_confirmed_us);
+    try t.expectEqual(@as(?i64, 100), aggregates[0].latest_confirmed_us);
+    const empty_aggregate = try f.store.applicationHistoryAggregates(f.installation, .{ .range = .{ .from_us = 99, .to_us = 100 } }, &aggregates);
+    try t.expectEqual(@as(u64, 0), aggregates[0].confirmed);
+    try t.expectEqual(@as(usize, 1), empty_aggregate.count);
+    try t.expectError(error.InvalidApplicationHistoryQuery, f.store.applicationHistoryPage(t.allocator, f.installation, .{ .range = .{ .from_us = 100, .to_us = 100 } }, &rows));
+    try t.expectError(error.InvalidApplicationHistoryQuery, f.store.applicationHistoryPage(t.allocator, f.installation, .{}, &.{}));
+
+    const log_only = retry.Policy{ .maxretry = 1, .window_us = 1_000, .duration = .{ .finite_us = 500 }, .max_subjects = 8 };
+    try f.store.admitRetry("zeta", [_]u8{3} ** 32, log_only);
+    _ = try f.store.commitRecord(try nativeRecord(&f.store, &clock, "zeta", "zeta-one", 0, .{ .v4 = .{ 192, 0, 2, 22 } }, log_only, null));
+    var summaries: [1]application.PolicySummary = undefined;
+    const policy_first = try f.store.retryPolicySummaryPage(.{}, &summaries);
+    try t.expectEqual(@as(usize, 1), policy_first.count);
+    try t.expect(policy_first.more);
+    const cursor = application.PolicyCursor{ .jail = summaries[0].jail, .subject = summaries[0].subject };
+    const policy_second = try f.store.retryPolicySummaryPage(.{ .after = cursor, .expected_revision = policy_first.revision }, &summaries);
+    try t.expectEqual(@as(usize, 1), policy_second.count);
+    try t.expect(!policy_second.more);
+
+    _ = try f.confirmAs("other", 12, &clock);
+    try t.expectError(error.StaleHistoryPage, f.store.applicationHistoryPage(t.allocator, f.installation, .{ .after_sequence = first.last_sequence, .expected_stream_revision = first.stream_revision }, &rows));
+    try t.expectError(error.StaleHistoryPage, f.store.applicationHistoryAggregates(f.installation, .{ .expected_stream_revision = aggregate.stream_revision }, &aggregates));
+    try f.store.admitRetry("omega", [_]u8{3} ** 32, log_only);
+    _ = try f.store.commitRecord(try nativeRecord(&f.store, &clock, "omega", "omega-one", 0, .{ .v4 = .{ 192, 0, 2, 23 } }, log_only, null));
+    try t.expectError(error.StalePolicySummary, f.store.retryPolicySummaryPage(.{ .after = cursor, .expected_revision = policy_first.revision }, &summaries));
+
+    try f.reopen();
+    const restored = try f.store.applicationHistoryPage(t.allocator, f.installation, .{ .jail = "native" }, &rows);
+    try t.expectEqual(@as(usize, 1), restored.count);
+    try t.expectEqualStrings("bounded failure example", rows[0].detail.?.evidence.?);
+    rows[0].deinit(t.allocator);
+}
+
+test "native effect history store: schema 18 escalation uses confirmed history and one durable jitter sample" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var clock = Clock{};
+    try enableApplicationHistory(&f.store);
+
+    const base = retry.Policy{ .maxretry = 1, .window_us = 60_000_000, .duration = .{ .finite_us = 10_000_000 }, .max_subjects = 8, .enforce = true };
+    var escalated = base;
+    escalated.escalation = .{ .enabled = true, .formula = .linear, .scope = .per_jail, .multiplier = 1, .factor = 1, .max_duration_us = 60_000_000, .jitter_us = 5_000_000 };
+    try t.expectError(error.RetryStorageRequired, f.store.admitRetry("escalated", [_]u8{3} ** 32, escalated));
+    try f.store.admitRetry("legacy", [_]u8{3} ** 32, base);
+    f.store.fail_at = .before_escalation_schema_commit;
+    try t.expectError(error.InjectedFailure, f.store.enableEscalation());
+    try t.expectEqual(@as(i64, 17), f.store.schema_version);
+    f.store.fail_at = null;
+    try f.store.enableEscalation();
+    try t.expectEqual(@as(i64, 18), f.store.schema_version);
+    try f.store.validateRetry("legacy", [_]u8{3} ** 32, base);
+    try f.store.admitRetry("escalated", [_]u8{3} ** 32, escalated);
+
+    const Jitter = struct {
+        calls: u32 = 0,
+        fn sample(context: ?*anyopaque, maximum_seconds: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.calls += 1;
+            return maximum_seconds;
+        }
+    };
+    var jitter = Jitter{};
+    f.store.escalation_jitter_context = &jitter;
+    f.store.escalation_jitter = Jitter.sample;
+    const subject = detection.Subject{ .v4 = .{ 192, 0, 2, 51 } };
+
+    _ = try f.store.commitRecord(try nativeRecord(&f.store, &clock, "escalated", "one", 0, subject, escalated, null));
+    const first_decision = (try f.store.retryDecision("escalated", "file", "one")).?;
+    try t.expectEqualDeep(retry.Lease{ .finite = clock.now + 10_000_000 }, first_decision.lease);
+    try t.expectEqual(@as(u32, 0), jitter.calls);
+    const first_effect = try effectForSubject(&f.store, subject);
+    try f.store.markDispatched(first_effect.token(), clock.value());
+    _ = try f.store.settleVerified(first_effect.token(), observation(first_effect, clock.now), clock.value());
+    _ = try f.store.settleVerified(first_effect.token(), observation(first_effect, clock.now), clock.value());
+
+    clock.now += 10_000_000;
+    _ = try f.store.commitRecord(try nativeRecord(&f.store, &clock, "escalated", "two", 1, subject, escalated, null));
+    const second_decision = (try f.store.retryDecision("escalated", "file", "two")).?;
+    try t.expectEqualDeep(retry.Lease{ .finite = clock.now + 25_000_000 }, second_decision.lease);
+    const selection = (try f.store.retryEscalationDecision("escalated", "file", "two", subject)).?;
+    try t.expectEqual(retry.EscalationScope.per_jail, selection.scope);
+    try t.expectEqual(@as(u64, 1), selection.prior_confirmed);
+    try t.expectEqual(@as(?i64, 100), selection.latest_confirmed_us);
+    try t.expectEqual(@as(i64, 25_000_000), selection.chosen_duration_us);
+    try t.expectEqual(@as(i64, 5_000_000), selection.jitter_us);
+    try t.expectEqual(@as(u32, 1), jitter.calls);
+
+    var overall = escalated;
+    overall.escalation.scope = .overall;
+    try f.store.admitRetry("overall", [_]u8{3} ** 32, overall);
+    _ = try f.store.commitRecord(try nativeRecord(&f.store, &clock, "overall", "overall-one", 0, subject, overall, null));
+    try t.expectEqualDeep(retry.Lease{ .finite = clock.now + 25_000_000 }, (try f.store.retryDecision("overall", "file", "overall-one")).?.lease);
+    try t.expectEqual(@as(u32, 2), jitter.calls);
+    var changed = escalated;
+    changed.escalation.scope = .overall;
+    try t.expectError(error.RetryGenerationMismatch, f.store.validateRetry("escalated", [_]u8{3} ** 32, changed));
+
+    try f.reopen();
+    try f.store.validateRetry("escalated", [_]u8{3} ** 32, escalated);
+    try t.expectEqualDeep(second_decision, (try f.store.retryDecision("escalated", "file", "two")).?);
+    try t.expectEqualDeep(selection, (try f.store.retryEscalationDecision("escalated", "file", "two", subject)).?);
+}
+
+test "native effect history store: recidive consumes only replay-safe foreign native confirmations" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var clock = Clock{};
+    try enableApplicationHistory(&f.store);
+    try f.store.enableEscalation();
+    var owner = try history.Consumer.init(f.installation, [_]u8{6} ** 32);
+    const initial = try owner.prepareInitial();
+    try f.store.bootstrapConfirmedHistory(owner.manifest(), try initial.batch(clock.value()), f.installation);
+    initial.publish();
+    initial.release();
+
+    const source_policy = retry.Policy{ .maxretry = 1, .window_us = 60_000_000, .duration = .permanent, .max_subjects = 8, .enforce = true };
+    const recidive_policy = retry.Policy{ .maxretry = 2, .window_us = 60_000_000, .duration = .{ .finite_us = 60_000_000 }, .max_subjects = 8 };
+    const recidive_generation = [_]u8{5} ** 32;
+    try f.store.admitRetry("source-a", [_]u8{3} ** 32, source_policy);
+    try f.store.admitRetry("source-b", [_]u8{3} ** 32, source_policy);
+    try f.store.admitRetry("recidive", recidive_generation, recidive_policy);
+    const subject = detection.Subject{ .v4 = .{ 198, 51, 100, 77 } };
+    const binding = recurrence.Binding{ .jail = "recidive", .generation = recidive_generation, .policy = recidive_policy };
+
+    _ = try f.store.commitRecord(try nativeRecord(&f.store, &clock, "source-a", "a-one", 0, subject, source_policy, null));
+    var pending = try effectForSubject(&f.store, subject);
+    try f.store.markDispatched(pending.token(), clock.value());
+    _ = try f.store.settleVerified(pending.token(), observation(pending, clock.now), clock.value());
+    var events: [history.max_page]history.Event = undefined;
+    const first_page = try f.store.confirmedEffectPage(f.installation, 0, null, &events);
+    try t.expectEqual(@as(usize, 1), first_page.count);
+    try t.expect(events[0].native_retry);
+    var first_stage = try owner.prepare(first_page, events[0..first_page.count], clock.now);
+    try t.expect(try recurrence.consume(&f.store, binding, events[0], clock.now, clock.value()));
+    try t.expectEqual(@as(u16, 1), (try f.store.retryState("recidive", subject)).?.count);
+    f.store.fail_at = .before_consumer_input_commit;
+    try t.expectError(error.InjectedFailure, f.store.commitConfirmedHistory(owner.manifest(), try first_stage.batch(clock.value()), first_page.token));
+    first_stage.release();
+
+    try f.reopen();
+    const replay_page = try f.store.confirmedEffectPage(f.installation, 0, null, &events);
+    try t.expect(try recurrence.consume(&f.store, binding, events[0], clock.now, clock.value()));
+    try t.expectEqual(@as(u16, 1), (try f.store.retryState("recidive", subject)).?.count);
+    const replay_stage = try owner.prepare(replay_page, events[0..replay_page.count], clock.now);
+    try f.store.commitConfirmedHistory(owner.manifest(), try replay_stage.batch(clock.value()), replay_page.token);
+    replay_stage.publish();
+    replay_stage.release();
+
+    _ = try f.store.commitRecord(try nativeRecord(&f.store, &clock, "source-b", "b-one", 0, subject, source_policy, null));
+    pending = try effectForSubject(&f.store, subject);
+    try f.store.markDispatched(pending.token(), clock.value());
+    _ = try f.store.settleVerified(pending.token(), observation(pending, clock.now), clock.value());
+    const second_page = try f.store.confirmedEffectPage(f.installation, 1, null, &events);
+    try t.expectEqual(@as(usize, 1), second_page.count);
+    try t.expect(events[0].native_retry);
+    try t.expect(try recurrence.consume(&f.store, binding, events[0], clock.now, clock.value()));
+    const occurrence = std.fmt.bytesToHex(events[0].event_id, .lower);
+    try t.expect((try f.store.retryDecision("recidive", recurrence.source_id, &occurrence)) != null);
+
+    var self_event = events[0];
+    self_event.jail = try detection.Name.init("recidive");
+    self_event.decision_id = [_]u8{99} ** 32;
+    self_event.event_id = effects.hashParts("fail2zig-native-confirmed-owner-v1", &.{ &self_event.installation.id, &self_event.scope_key, self_event.jail.slice(), &self_event.decision_id });
+    try t.expect(!try recurrence.consume(&f.store, binding, self_event, clock.now, clock.value()));
+
+    _ = try f.confirmAs("manual", 77, &clock);
+    const manual_page = try f.store.confirmedEffectPage(f.installation, 2, null, &events);
+    try t.expectEqual(@as(usize, 1), manual_page.count);
+    try t.expect(!events[0].native_retry);
+    try t.expect(!try recurrence.consume(&f.store, binding, events[0], clock.now, clock.value()));
+    try t.expectEqual(@as(u64, 1), (try f.store.retryState("recidive", subject)).?.decisions);
+}
+
+test "native effect history store: typed reset fences recurrence and escalation without changing protection" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var clock = Clock{};
+    try enableApplicationHistory(&f.store);
+    try f.store.enableEscalation();
+    try f.store.enableCanonicalEffects();
+    f.store.fail_at = .before_history_reset_schema_commit;
+    try t.expectError(error.InjectedFailure, f.store.enableHistoryResets());
+    try t.expectEqual(@as(i64, 19), f.store.schema_version);
+    f.store.fail_at = null;
+    try f.store.enableHistoryResets();
+    try t.expectEqual(@as(i64, 20), f.store.schema_version);
+
+    const source_policy = retry.Policy{ .maxretry = 1, .window_us = 60_000_000, .duration = .permanent, .max_subjects = 8, .enforce = true };
+    const recidive_policy = retry.Policy{ .maxretry = 3, .window_us = 60_000_000, .duration = .permanent, .max_subjects = 8 };
+    const recidive_generation = [_]u8{5} ** 32;
+    const subject = detection.Subject{ .v4 = .{ 198, 51, 100, 88 } };
+    try f.store.admitRetry("source-a", [_]u8{3} ** 32, source_policy);
+    try f.store.admitRetry("source-b", [_]u8{3} ** 32, source_policy);
+    try f.store.admitRetry("recidive", recidive_generation, recidive_policy);
+    const binding = recurrence.Binding{ .jail = "recidive", .generation = recidive_generation, .policy = recidive_policy };
+
+    for ([_][]const u8{ "source-a", "source-b" }, [_][]const u8{ "a", "b" }) |jail, occurrence| {
+        _ = try f.store.commitRecord(try nativeRecord(&f.store, &clock, jail, occurrence, 0, subject, source_policy, null));
+        const pending = try effectForSubject(&f.store, subject);
+        try f.store.markDispatched(pending.token(), clock.value());
+        _ = try f.store.settleVerified(pending.token(), observation(pending, clock.now), clock.value());
+    }
+    var events: [history.max_page]history.Event = undefined;
+    const initial = try f.store.confirmedEffectPage(f.installation, 0, null, &events);
+    try t.expectEqual(@as(usize, 2), initial.count);
+    try t.expect(try f.store.historyEventEligible(events[0]));
+
+    const jail_reset = durable.HistoryResetIntent{ .scope = .{ .jail = "source-a" }, .subject = subject, .expected_revision = 0, .intent_id = [_]u8{0xa1} ** 32 };
+    f.store.fail_at = .after_history_reset;
+    try t.expectError(error.InjectedFailure, f.store.resetHistory(jail_reset, clock.value()));
+    f.store.fail_at = null;
+    try t.expect(try f.store.historyEventEligible(events[0]));
+    const reset = try f.store.resetHistory(jail_reset, clock.value());
+    try t.expectEqual(@as(u64, 1), reset.revision);
+    try t.expectEqual(@as(u64, 2), reset.through_sequence);
+    try t.expectEqualDeep(reset, try f.store.resetHistory(jail_reset, clock.value()));
+    try t.expect(!try f.store.historyEventEligible(events[0]));
+    try t.expect(try f.store.historyEventEligible(events[1]));
+    try t.expect(!try recurrence.consume(&f.store, binding, events[0], clock.now, clock.value()));
+    try t.expect(try recurrence.consume(&f.store, binding, events[1], clock.now, clock.value()));
+
+    try f.reopen();
+    try t.expect(!try f.store.historyEventEligible(events[0]));
+    try t.expectError(error.StaleHistoryReset, f.store.resetHistory(.{ .scope = .{ .jail = "source-a" }, .subject = subject, .expected_revision = 0, .intent_id = [_]u8{0xa2} ** 32 }, clock.value()));
+    const overall = try f.store.resetHistory(.{ .scope = .overall, .subject = subject, .expected_revision = 0, .intent_id = [_]u8{0xb1} ** 32 }, clock.value());
+    try t.expectEqual(@as(u64, 2), overall.through_sequence);
+    try t.expect(!try f.store.historyEventEligible(events[1]));
+
+    var escalated = source_policy;
+    escalated.duration = .{ .finite_us = 10_000_000 };
+    escalated.escalation = .{ .enabled = true, .formula = .linear, .scope = .overall, .multiplier = 1, .factor = 1, .max_duration_us = 60_000_000 };
+    try f.store.admitRetry("after-reset", [_]u8{3} ** 32, escalated);
+    _ = try f.store.commitRecord(try nativeRecord(&f.store, &clock, "after-reset", "first", 0, subject, escalated, null));
+    try t.expectEqual(@as(u64, 0), (try f.store.retryEscalationDecision("after-reset", "file", "first", subject)).?.prior_confirmed);
+
+    const pending = try effectForSubject(&f.store, subject);
+    try f.store.markDispatched(pending.token(), clock.value());
+    _ = try f.store.settleVerified(pending.token(), observation(pending, clock.now), clock.value());
+    const fresh = try f.store.confirmedEffectPage(f.installation, 2, null, &events);
+    try t.expectEqual(@as(usize, 1), fresh.count);
+    try t.expect(try f.store.historyEventEligible(events[0]));
+    try t.expect(try recurrence.consume(&f.store, binding, events[0], clock.now, clock.value()));
+    var effect_rows: [1]effects.Entry = undefined;
+    try t.expectEqual(@as(usize, 1), (try f.store.effectPage(null, null, &effect_rows)).count);
+    try t.expect(effect_rows[0].desired == .permanent);
+}
+
+test "native effect history store: retention is consumed-prefix bounded rollback-safe and owner-pinned" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var clock = Clock{};
+    try enableApplicationHistory(&f.store);
+    try f.store.enableEscalation();
+    var owner = try history.Consumer.init(f.installation, [_]u8{8} ** 32);
+    const initial = try owner.prepareInitial();
+    try f.store.bootstrapConfirmedHistory(owner.manifest(), try initial.batch(clock.value()), f.installation);
+    initial.publish();
+    initial.release();
+
+    const finite = retry.Policy{ .maxretry = 1, .window_us = 60_000_000, .duration = .{ .finite_us = 10_000_000 }, .max_subjects = 8, .enforce = true };
+    const subject = detection.Subject{ .v4 = .{ 203, 0, 113, 91 } };
+    try f.store.admitRetry("finite-history", [_]u8{3} ** 32, finite);
+    _ = try f.store.commitRecord(try nativeRecord(&f.store, &clock, "finite-history", "one", 0, subject, finite, "retained detail"));
+    var pending = try effectForSubject(&f.store, subject);
+    try f.store.markDispatched(pending.token(), clock.value());
+    _ = try f.store.settleVerified(pending.token(), observation(pending, clock.now), clock.value());
+    var events: [history.max_page]history.Event = undefined;
+    const page = try f.store.confirmedEffectPage(f.installation, 0, null, &events);
+    const stage = try owner.prepare(page, events[0..page.count], clock.now);
+    try f.store.commitConfirmedHistory(owner.manifest(), try stage.batch(clock.value()), page.token);
+    stage.publish();
+    stage.release();
+
+    f.store.fail_at = .after_history_detail_delete;
+    try t.expectError(error.InjectedFailure, f.store.cleanupConfirmedHistoryOne(.{ .age_us = std.math.maxInt(i64) - @mod(std.math.maxInt(i64), 1_000_000), .max_matches = 0 }, clock.now));
+    var application_rows: [1]application.Event = undefined;
+    const before = try f.store.applicationHistoryPage(t.allocator, f.installation, .{}, &application_rows);
+    try t.expectEqual(@as(usize, 1), before.count);
+    try t.expect(application_rows[0].detail != null);
+    application_rows[0].deinit(t.allocator);
+    f.store.fail_at = null;
+    try t.expect(try f.store.cleanupConfirmedHistoryOne(.{ .age_us = std.math.maxInt(i64) - @mod(std.math.maxInt(i64), 1_000_000), .max_matches = 0 }, clock.now));
+    const stripped = try f.store.applicationHistoryPage(t.allocator, f.installation, .{}, &application_rows);
+    try t.expectEqual(@as(usize, 1), stripped.count);
+    try t.expect(application_rows[0].detail == null);
+    application_rows[0].deinit(t.allocator);
+
+    try t.expect(!try f.store.cleanupConfirmedHistoryOne(.{ .age_us = 0 }, clock.now));
+    clock.now += 10_000_000;
+    f.store.fail_at = .after_history_event_delete;
+    try t.expectError(error.InjectedFailure, f.store.cleanupConfirmedHistoryOne(.{ .age_us = 0 }, clock.now));
+    try t.expectEqual(@as(usize, 1), (try f.store.confirmedEffectPage(f.installation, 0, null, &events)).count);
+    f.store.fail_at = null;
+    try t.expect(try f.store.cleanupConfirmedHistoryOne(.{ .age_us = 0 }, clock.now));
+    try t.expectError(error.HistoryGap, f.store.confirmedEffectPage(f.installation, 0, null, &events));
+    try f.reopen();
+    try t.expectError(error.HistoryGap, f.store.confirmedEffectPage(f.installation, 0, null, &events));
+
+    const permanent = retry.Policy{ .maxretry = 1, .window_us = 60_000_000, .duration = .permanent, .max_subjects = 8, .enforce = true };
+    const pinned_subject = detection.Subject{ .v4 = .{ 203, 0, 113, 92 } };
+    try f.store.admitRetry("permanent-history", [_]u8{3} ** 32, permanent);
+    _ = try f.store.commitRecord(try nativeRecord(&f.store, &clock, "permanent-history", "one", 0, pinned_subject, permanent, null));
+    pending = try effectForSubject(&f.store, pinned_subject);
+    try f.store.markDispatched(pending.token(), clock.value());
+    _ = try f.store.settleVerified(pending.token(), observation(pending, clock.now), clock.value());
+    const pinned_page = try f.store.confirmedEffectPage(f.installation, 1, null, &events);
+    const pinned_stage = try owner.prepare(pinned_page, events[0..pinned_page.count], clock.now);
+    try f.store.commitConfirmedHistory(owner.manifest(), try pinned_stage.batch(clock.value()), pinned_page.token);
+    pinned_stage.publish();
+    pinned_stage.release();
+    try t.expect(try f.store.cleanupConfirmedHistoryOne(.{ .age_us = 0, .max_matches = 0 }, clock.now)); // optional detail
+    try t.expect(!try f.store.cleanupConfirmedHistoryOne(.{ .age_us = 0, .max_matches = 0 }, clock.now)); // permanent core owner
 }
 
 test "native effect history store: only first qualified receipt appends and repair replay is stable" {

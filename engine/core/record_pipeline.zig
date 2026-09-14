@@ -29,6 +29,7 @@ pub const Prepared = struct {
     native_detection: ?@import("native_detection_record.zig").Outcome = null,
     native_detections: ?[]const @import("native_detection_record.zig").Outcome = null,
     native_retry: ?@import("native_retry.zig").Admission = null,
+    retry_evidence: @import("native_retry.zig").Evidence = .{},
     intent: ?[]const u8 = null,
     shared_state: ?durable.SharedState = null,
     consumers: ?@import("native_consumer.zig").Batch = null,
@@ -256,6 +257,7 @@ pub const Pipeline = struct {
             .native_detection = prepared.native_detection,
             .native_detections = prepared.native_detections,
             .native_retry = prepared.native_retry,
+            .retry_evidence = prepared.retry_evidence,
             .expected_revision = self.revision,
             .disposition = prepared.disposition,
             .checkpoint = prepared.checkpoint,
@@ -352,7 +354,7 @@ test "pipeline: guarded replay refuses preparation while preserving committed st
     try store.enableConfirmedHistory();
     try store.enableMaintenance();
     const generation = [_]u8{7} ** 32;
-    const policy = @import("native_retry.zig").Policy{ .maxretry = 3, .window_us = 1000, .bantime_us = 1000, .max_subjects = 8 };
+    const policy = @import("native_retry.zig").Policy{ .maxretry = 3, .window_us = 1000, .duration = .{ .finite_us = 1000 }, .max_subjects = 8 };
     try store.admitRetry("fixture", generation, policy);
     var checkpoint: [8]u8 = undefined;
     std.mem.writeInt(u64, &checkpoint, 1, .little);
