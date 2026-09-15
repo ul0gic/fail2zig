@@ -13,8 +13,8 @@
 
 </div>
 
-fail2zig is an intrusion prevention daemon inspired by fail2ban — written in Zig, with a static daemon
-and companion client, and a parser that cannot be made to allocate unbounded
+fail2zig is an intrusion prevention daemon inspired by fail2ban — written in Zig, as one static
+executable, with a parser that cannot be made to allocate unbounded
 memory by the traffic it's supposed to be stopping.
 
 The importer translates supported fail2ban jail settings into native TOML and reports
@@ -71,12 +71,13 @@ sudo fail2zig --validate-config --config /etc/fail2zig/config.toml
 sudo systemctl enable --now fail2zig
 
 # 4. Check the daemon
-fail2zig-client status
+sudo fail2zig status
 ```
 
-The released daemon uses compiled-in filters and needs no Python runtime. The current
-distribution also includes a companion client. Journald and legacy firewall modes require
-their documented tools; the nftables backend talks directly to the kernel.
+One executable serves every entry point: the daemon, the administration commands,
+offline `rule-test` and `migrate`. It uses compiled-in filters and needs no Python
+runtime. Journald input and the ipset/iptables backends require their documented host
+tools; the nftables backend talks directly to the kernel.
 
 The installer pulls from the
 [latest GitHub Release](https://github.com/ul0gic/fail2zig/releases/latest)
@@ -129,13 +130,13 @@ flowchart LR
             ST["State Tracker<br/>fixed-capacity per jail"]
             DP["dispatch"]
             IPC["IPC server<br/>Unix socket 0660 · SO_PEERCRED"]
-            HTTP["HTTP server<br/>127.0.0.1:9100 · /metrics · /api/status · /events (WS)"]
+            HTTP["HTTP server<br/>127.0.0.1:9100 · /metrics · /api/status · /api/health · /events (WS)"]
         end
         SF["State file"]
     end
 
     BE["Firewall backend (auto-detected or set by firewall = ...)<br/>nftables: netlink · ipset/iptables: argv"]
-    CLI["fail2zig-client"]
+    CLI["fail2zig &lt;command&gt;"]
     PROM["Prometheus / dashboard"]
 
     FS --> PE
@@ -166,16 +167,17 @@ curl -fsSL https://github.com/ul0gic/fail2zig/raw/main/scripts/install.sh | sudo
 
 [`scripts/install.sh`](scripts/install.sh) detects your architecture, resolves
 the latest release (or `FAIL2ZIG_VERSION` if set), downloads `fail2zig` +
-`fail2zig-client` + `SHA256SUMS` from the
+`SHA256SUMS` from the
 [release](https://github.com/ul0gic/fail2zig/releases/latest) asset tree,
-verifies each binary's SHA256 against `SHA256SUMS`, creates the `fail2zig`
-system group, installs binaries to `/usr/local/bin`, drops the example
+verifies the executable's SHA256 against `SHA256SUMS`, creates the `fail2zig`
+system group, installs it to `/usr/local/bin` (removing a retired
+`fail2zig-client` if one is present), drops the example
 config at `/etc/fail2zig/config.toml` (never clobbers an existing one), and
 installs the hardened `fail2zig.service` unit under
 `/etc/systemd/system/`. It does **not** auto-start the daemon — audit the
 config, then `systemctl enable --now fail2zig` when ready.
 
-**Supported targets** (release assets are named `fail2zig-<tag>-<triple>` and `fail2zig-client-<tag>-<triple>`):
+**Supported targets** (release assets are named `fail2zig-<tag>-<triple>`):
 
 | Target | Hardware | Validation |
 |--------|----------|------------|
@@ -214,7 +216,6 @@ If you'd rather skip the script:
 VERSION=v0.3.0
 ARCH=x86_64-linux-musl   # or aarch64-linux-musl, arm-linux-musleabihf, mips-linux-musleabi, mipsel-linux-musleabi
 curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/fail2zig-${VERSION}-${ARCH}"
-curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/fail2zig-client-${VERSION}-${ARCH}"
 curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/SHA256SUMS"
 
 # 2. Verify (bail if any line fails)
@@ -223,8 +224,7 @@ sha256sum --check --ignore-missing SHA256SUMS
 gh attestation verify "fail2zig-${VERSION}-${ARCH}" --repo ul0gic/fail2zig
 
 # 3. Install
-sudo install -m 0755 "fail2zig-${VERSION}-${ARCH}"        /usr/local/bin/fail2zig
-sudo install -m 0755 "fail2zig-client-${VERSION}-${ARCH}" /usr/local/bin/fail2zig-client
+sudo install -m 0755 "fail2zig-${VERSION}-${ARCH}" /usr/local/bin/fail2zig
 sudo groupadd --system fail2zig 2>/dev/null || true
 ```
 
@@ -242,10 +242,9 @@ cd fail2zig
 # Production build (safety checks retained on parser + network paths)
 zig build -Doptimize=ReleaseSafe
 
-# Binaries land in zig-out/bin/
+# The one executable lands in zig-out/bin/
 ls zig-out/bin/
 # fail2zig
-# fail2zig-client
 ```
 
 ### Cross-compile
@@ -277,7 +276,6 @@ From a repo checkout:
 
 ```bash
 sudo install -m 0644 deploy/fail2zig.service /etc/systemd/system/
-sudo install -m 0644 deploy/fail2zig.socket  /etc/systemd/system/
 sudo install -d -m 0750 /etc/fail2zig
 sudo install -m 0640 deploy/fail2zig.toml.example /etc/fail2zig/config.toml
 sudo systemctl daemon-reload
@@ -289,11 +287,10 @@ the binaries):
 
 ```bash
 VERSION=v0.3.0
-for f in fail2zig.service fail2zig.socket fail2zig.toml.example; do
+for f in fail2zig.service fail2zig.toml.example; do
   curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/${f}"
 done
 sudo install -m 0644 fail2zig.service /etc/systemd/system/
-sudo install -m 0644 fail2zig.socket  /etc/systemd/system/
 sudo install -d -m 0750 /etc/fail2zig
 sudo install -m 0640 fail2zig.toml.example /etc/fail2zig/config.toml
 sudo systemctl daemon-reload
@@ -362,7 +359,7 @@ After editing:
 ```bash
 sudo fail2zig --validate-config --config /etc/fail2zig/config.toml
 sudo systemctl restart fail2zig
-fail2zig-client status
+sudo fail2zig status
 ```
 
 Full schema and every option: [reference/config](https://fail2zig.com/docs/reference/config/).
@@ -387,11 +384,19 @@ live migration from fail2ban. See [configuration preparation](docs/parity/p2-com
 
 Step-by-step guide: [guides/migration-from-fail2ban](https://fail2zig.com/docs/guides/migration-from-fail2ban/).
 
+The journaled cutover and rollback (`fail2zig migrate inspect|snapshot|plan|validate|cutover|status|rollback`)
+and the mapping of every `fail2ban-client` invocation to its native command, exit class
+and JSON schema are in
+[docs/operations/command-migration.md](docs/operations/command-migration.md).
+
 ---
 
 ## CLI usage
 
-### Daemon — `fail2zig(1)`
+One executable, three modes. Full reference: [docs/man/fail2zig.1](docs/man/fail2zig.1);
+script migration: [docs/operations/command-migration.md](docs/operations/command-migration.md).
+
+### Daemon — `fail2zig [daemon]`
 
 ```
 fail2zig [OPTIONS]
@@ -399,35 +404,56 @@ fail2zig [OPTIONS]
 OPTIONS:
   --config <path>           Config file (default: /etc/fail2zig/config.toml)
   --foreground              Run in foreground (only mode)
-  --test-config             Alias for --validate-config
-  --validate-config         Load and validate config, exit
+  --validate-config         Load and validate config, exit (--test-config is an alias)
   --import-config [<dir>]   Import fail2ban config (default: /etc/fail2ban)
   --import-output <path>    Output path for imported config
   --version, -V             Print version and exit
   --help, -h                Print help and exit
 ```
 
-Full reference: [reference/cli-fail2zig](https://fail2zig.com/docs/reference/cli-fail2zig/) ·
-man page: [docs/man/fail2zig.1](docs/man/fail2zig.1).
+Under systemd the unit is `Type=notify`: `READY=1` is sent only after configuration,
+storage, every source and enforcing protection are admitted; `RELOADING=1`/`READY=1`
+bracket a live reload (`ExecReload` sends `SIGHUP`); `STOPPING=1` precedes exit;
+`SIGUSR1` reopens `global.log_target`. No socket unit ships.
 
-### Client — `fail2zig-client(1)`
+### Administration — `fail2zig <command>`
 
 | Command | Description |
 |---------|-------------|
-| `status` | Protection state (`active` / `log-only` / `mixed` / `DEGRADED (<cause>)`), backend, uptime, active bans, parse rate, memory |
-| `ban <ip> --jail <name>` | Add a ban (`--duration <seconds>` optional) |
-| `unban <ip> [--jail <name>]` | Remove a ban |
-| `list [--jail <name>]` | List active bans |
-| `jails` | List configured jails |
-| `reload` | Signal the daemon to reload config |
-| `version` | Print daemon version |
-| `completions <bash\|zsh\|fish>` | Print shell completion script |
+| `status` | Protection state (`active` / `log-only` / `mixed` / `DEGRADED (<cause>)`), backend, storage phase, generation, active and total bans |
+| `jails` | Configured jails: enabled, paused, health, thresholds, action, source |
+| `list [--jail <name>]` | Active bans |
+| `ban <ip> --jail <name> [--duration <s>] [--scope host\|net <cidr>]` | Manual ban (exactly one jail; `net` needs nftables or ipset) |
+| `unban <ip> --jail <name> [--scope host\|net <cidr>]` | Release a ban |
+| `reload` | Propose the configuration file as a new generation: `noop`, `applied`, `rejected` or `restart_required` |
+| `history [--jail <name>] [--limit <n>] [--cursor <token>]` | Page through confirmed ban history |
+| `history reset <ip> (--jail <name> \| --all)` | Reset an address's durable history |
+| `jail enable\|disable\|pause\|resume <name>` | Administer one jail |
+| `config` | Effective configuration and generation (redacted for non-administrators) |
+| `version` | Daemon version over the socket |
+| `completions <bash\|zsh\|fish>` | Shell completion script |
+| `help [command]` | Help |
 
 Global flags: `--socket <path>`, `--output table|json|plain`, `--no-color`,
-`--timeout <ms>`.
+`--timeout <ms>`. Members of the `fail2zig` group may run the read-only commands
+through the 0660 socket; mutations require uid 0 or the daemon uid.
 
-Full reference: [reference/cli-fail2zig-client](https://fail2zig.com/docs/reference/cli-fail2zig-client/) ·
-man page: [docs/man/fail2zig-client.1](docs/man/fail2zig-client.1).
+Exit classes (every command): `0` success · `1` rejected or absent · `2` usage ·
+`3` daemon unavailable · `4` partial (kernel confirmation incomplete) · `5` uncertain.
+
+### Offline — `fail2zig rule-test` and `fail2zig migrate`
+
+```bash
+# Evaluate a log against a compiled service or a native rule file; no daemon needed.
+fail2zig rule-test --file /var/log/auth.log --service sshd --tz-offset 0 --output table
+fail2zig rule-test --record 'Denied login for x from 203.0.113.9 port 2201' --rule-file rule.json
+
+# Read-only migration preparation, then the journaled cutover.
+fail2zig migrate inspect --source-dir /etc/fail2ban
+```
+
+`rule-test` samples carry the extracted identity and reason, never the raw line unless
+`--print-lines` is given. Exit `0` processed, `1` refused, `2` usage.
 
 ---
 
@@ -454,7 +480,7 @@ nftables, then ipset, then iptables, and uses the first that is usable.
 `"nftables"`, `"ipset"`, or `"iptables"` probes only that backend. If it is
 unusable, `on_no_backend` decides: `"fail-closed"` (the default) exits with
 the cause logged; `"log-only"` runs DEGRADED, shown as
-`Protection: DEGRADED (<cause>)` by `fail2zig-client status` and in
+`Protection: DEGRADED (<cause>)` by `fail2zig status` and in
 `/api/status`. There is no fallback to another backend.
 
 `banaction` does not select a backend. Its values `nftables`, `iptables`,
@@ -495,10 +521,11 @@ directory or service access and restart; this check cannot guarantee against lat
   `SO_PEERCRED` authentication, length-prefixed binary protocol, 8 concurrent
   clients, 1 MiB frame cap
 - HTTP on `127.0.0.1:9100` — `GET /metrics` (Prometheus), `GET /api/status`
-  (JSON), `GET /events` (WebSocket, RFC 6455; broadcasts `attack_detected`,
-  `ip_banned`, `ip_unbanned`, `metrics`; max 16 clients)
-- `metrics_enabled = false` binds neither listener; IPC and
-  `fail2zig-client` are unaffected. `metrics_port = 0` is rejected, it does
+  (JSON), `GET /api/health` (readiness components: config, storage, sources,
+  clock, enforcement, admin; 200 when ready, 503 otherwise), `GET /events` (WebSocket, RFC 6455; broadcasts
+  `attack_detected`, `ip_banned`, `ip_unbanned`, `metrics`; max 16 clients)
+- `metrics_enabled = false` binds no HTTP listener; the socket and the
+  administration commands are unaffected. `metrics_port = 0` is rejected, it does
   not disable the endpoint
 
 ### Built-in filters (15)
@@ -549,9 +576,11 @@ TOML; `--import-config` translates supported fail2ban settings and disables
 unsupported custom filters with a warning. Review the generated configuration, especially increment formulas and caps: native
 escalation settings do not guarantee identical fail2ban semantics.
 
-Compatibility is not complete: runtime custom regex/action scripts, hot reload,
-and an in-client updater are not implemented. `reload` returns an error; validate
-configuration and restart the service to apply it. `maxretry` supports 1–128.
+Compatibility is not complete: runtime custom regex/action scripts and runtime
+`set` of thresholds are not implemented by design. `fail2zig reload` applies
+`maxretry`, `bantime`, `bantime_kind`, `bantime_increment`, `log_level` and a custom
+jail's `ignore_file` live; every other key is reported as `restart_required`.
+`maxretry` supports 1–128.
 The memory setting sizes bounded tracked state, not every daemon allocation.
 
 Manual bans honor jail defaults, appear in listings/status, and persist. An
@@ -576,7 +605,7 @@ fail2zig/
 │   ├── filters/         # Comptime-generated filter library (15 filters)
 │   ├── net/             # HTTP metrics + WebSocket event server
 │   └── main.zig         # Entry point, CLI args, daemon lifecycle
-├── client/              # fail2zig-client (unprivileged CLI)
+├── client/              # Administration modules linked into the one executable
 ├── shared/              # Common types (IPC protocol, IP addresses)
 ├── tests/               # See tests/README.md for the layout
 │   ├── integration/     # Zig integration tests
@@ -585,11 +614,12 @@ fail2zig/
 │   ├── harness/         # Shell-based system harness (lab-box tests)
 │   └── e2e/             # Deploy-regression scripts (real install + shipped unit)
 ├── docs/                # Installable man pages
-│   └── man/             # troff: fail2zig(1), fail2zig-client(1), fail2zig.toml(5)
-├── deploy/              # systemd unit, socket, example config
+│   ├── man/             # troff: fail2zig(1), fail2zig.toml(5)
+│   └── operations/      # Operator runbooks (command migration, continuity)
+├── deploy/              # systemd unit, example config
 ├── scripts/             # Public installer (scripts/install.sh)
 ├── .github/workflows/   # CI (ci.yml) + release pipeline (release.yml)
-├── build.zig            # Builds engine + client
+├── build.zig            # Builds the one executable
 └── build.zig.zon        # Zig package manifest
 ```
 
@@ -602,7 +632,8 @@ fail2zig/
 | Architecture | [fail2zig.com/docs](https://fail2zig.com/docs/) | Why decisions were made (zero-dependencies deep-dive) |
 | Guides | [fail2zig.com/docs](https://fail2zig.com/docs/) | Task-oriented walkthroughs (migration from fail2ban) |
 | Reference | [fail2zig.com/docs](https://fail2zig.com/docs/) | Config schema, CLI flags, filter catalogue |
-| Man pages | [docs/man/](docs/man/) | `fail2zig(1)`, `fail2zig-client(1)`, `fail2zig.toml(5)` |
+| Man pages | [docs/man/](docs/man/) | `fail2zig(1)`, `fail2zig.toml(5)` |
+| Operations | [docs/operations/](docs/operations/) | Command migration from fail2ban-client, continuity boundary |
 | Tests | [tests/README.md](tests/README.md) | Unit / integration / benchmark / fuzz / harness layout |
 
 ---

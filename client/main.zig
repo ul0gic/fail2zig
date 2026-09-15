@@ -17,6 +17,8 @@ pub const ExitCode = enum(u8) {
     daemon_error = 1,
     client_error = 2,
     connection_failed = 3,
+    partial_effect = 4,
+    uncertain_effect = 5,
 };
 
 pub fn main() !void {
@@ -41,7 +43,7 @@ pub fn run(
     var diag: args.ParseDiag = .{};
     const parsed = args.parse(argv, &diag) catch {
         stderr.print("error: {s}\n", .{diag.message()}) catch {};
-        stderr.writeAll("try 'fail2zig-client --help' for usage\n") catch {};
+        stderr.writeAll("try 'fail2zig --help' for usage\n") catch {};
         return .client_error;
     };
 
@@ -53,7 +55,7 @@ pub fn run(
             return .success;
         },
         .version => {
-            stdout.print("fail2zig-client {s}\n", .{client_version}) catch {};
+            stdout.print("fail2zig {s}\n", .{client_version}) catch {};
             return .success;
         },
         .completions => |shell| {
@@ -73,25 +75,234 @@ pub fn run(
             return doRequest(allocator, parsed.globals, cmd, stdout, stderr, color, formatListCmd);
         },
         .jails => return doRequest(allocator, parsed.globals, .{ .list_jails = {} }, stdout, stderr, color, formatJailsCmd),
-        .reload => return doRequest(allocator, parsed.globals, .{ .reload = {} }, stdout, stderr, color, formatReloadCmd),
+        .reload => return doReload(allocator, parsed.globals, stdout, stderr),
+        .config => return doQuery(allocator, parsed.globals, stdout, stderr, color, "config", null, null, null, format.formatConfig),
+        .history => |q| {
+            if (q.jail) |jail_str| _ = parseJailIdRequired(jail_str, stderr) catch return .client_error;
+            return doQuery(allocator, parsed.globals, stdout, stderr, color, "history", q.jail, q.limit, q.cursor, format.formatHistory);
+        },
+        .jail_admin => |j| {
+            _ = parseJailIdRequired(j.name, stderr) catch return .client_error;
+            const kind: []const u8 = switch (j.action) {
+                .enable => "group_enable",
+                .disable => "group_disable",
+                .pause => "group_pause",
+                .@"resume" => "group_resume",
+            };
+            return doAdmin(allocator, parsed.globals, stdout, stderr, .{ .kind = kind, .jail = j.name });
+        },
+        .history_reset => |h| {
+            if (h.jail) |jail_str| _ = parseJailIdRequired(jail_str, stderr) catch return .client_error;
+            _ = parseIp(h.address, stderr) catch return .client_error;
+            return doAdmin(allocator, parsed.globals, stdout, stderr, .{ .kind = "history_reset", .jail = h.jail, .address = h.address, .all = h.all });
+        },
         .remote_version => return doRequest(allocator, parsed.globals, .{ .version = {} }, stdout, stderr, color, formatVersionCmd),
         .ban => |b| {
-            const ip = parseIp(b.ip, stderr) catch return .client_error;
+            _ = parseIp(b.ip, stderr) catch return .client_error;
             const jail_str = b.jail orelse {
                 stderr.writeAll("error: ban requires --jail <name>\n") catch {};
                 return .client_error;
             };
-            const jail = parseJailIdRequired(jail_str, stderr) catch return .client_error;
-            const cmd = shared.Command{ .ban = .{ .ip = ip, .jail = jail, .duration = b.duration_s } };
-            return doRequest(allocator, parsed.globals, cmd, stdout, stderr, color, formatBanCmd);
+            _ = parseJailIdRequired(jail_str, stderr) catch return .client_error;
+            const scope = scopeSpec(b.ip, b.scope, stderr) catch return .client_error;
+            return doAdmin(allocator, parsed.globals, stdout, stderr, .{ .kind = "ban", .jail = jail_str, .address = scope.address, .prefix = scope.prefix, .duration_s = b.duration_s });
         },
         .unban => |u| {
-            const ip = parseIp(u.ip, stderr) catch return .client_error;
-            const jail: ?shared.JailId = parseJailId(u.jail, stderr) catch return .client_error;
-            const cmd = shared.Command{ .unban = .{ .ip = ip, .jail = jail } };
-            return doRequest(allocator, parsed.globals, cmd, stdout, stderr, color, formatUnbanCmd);
+            _ = parseIp(u.ip, stderr) catch return .client_error;
+            const jail_str = u.jail orelse {
+                stderr.writeAll("error: unban requires --jail <name>\n") catch {};
+                return .client_error;
+            };
+            _ = parseJailIdRequired(jail_str, stderr) catch return .client_error;
+            const scope = scopeSpec(u.ip, u.scope, stderr) catch return .client_error;
+            return doAdmin(allocator, parsed.globals, stdout, stderr, .{ .kind = "unban", .jail = jail_str, .address = scope.address, .prefix = scope.prefix });
         },
     }
+}
+
+const ScopeSpec = struct { address: []const u8, prefix: ?u8 };
+
+/// `--scope net <cidr>` names an exact network; the CIDR must contain the positional address.
+fn scopeSpec(ip: []const u8, scope: ?args.Command.ScopeArgs, stderr: anytype) !ScopeSpec {
+    const value = scope orelse return .{ .address = ip, .prefix = null };
+    switch (value.kind) {
+        .host => return .{ .address = ip, .prefix = null },
+        .net => {
+            const cidr = value.cidr orelse {
+                stderr.writeAll("error: --scope net requires a <cidr>\n") catch {};
+                return error.InvalidScope;
+            };
+            const slash = std.mem.indexOfScalar(u8, cidr, '/') orelse {
+                stderr.writeAll("error: --scope net requires <address>/<prefix>\n") catch {};
+                return error.InvalidScope;
+            };
+            const base = cidr[0..slash];
+            const prefix = std.fmt.parseInt(u8, cidr[slash + 1 ..], 10) catch {
+                stderr.writeAll("error: invalid network prefix\n") catch {};
+                return error.InvalidScope;
+            };
+            const parsed = shared.IpAddress.parse(base) catch {
+                stderr.writeAll("error: invalid network address\n") catch {};
+                return error.InvalidScope;
+            };
+            const max: u8 = if (parsed == .ipv4) 32 else 128;
+            if (prefix == 0 or prefix > max) {
+                stderr.writeAll("error: network prefix out of range\n") catch {};
+                return error.InvalidScope;
+            }
+            return .{ .address = base, .prefix = prefix };
+        },
+    }
+}
+
+/// Versioned read-only queries carry their bounded JSON request; the renderer receives the
+/// daemon's payload for every output format.
+fn doQuery(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype, color: format.Color, kind: []const u8, jail: ?[]const u8, limit: ?u32, cursor: ?[]const u8, comptime formatter: anytype) ExitCode {
+    var body_bytes: [shared.protocol.max_request_body]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&body_bytes);
+    std.json.stringify(.{ .schema_version = @as(u32, 1), .kind = kind, .jail = jail, .limit = limit, .cursor = cursor }, .{ .emit_null_optional_fields = false }, stream.writer()) catch return .client_error;
+    const body = shared.Command.Body.init(stream.getWritten()) catch return .client_error;
+    return doRequest(allocator, globals, .{ .query_v1 = body }, stdout, stderr, color, formatter);
+}
+
+pub const AdminSpec = struct {
+    kind: []const u8,
+    jail: ?[]const u8 = null,
+    address: ?[]const u8 = null,
+    prefix: ?u8 = null,
+    duration_s: ?u64 = null,
+    all: bool = false,
+    run_id: ?[]const u8 = null,
+};
+
+const StatusHead = struct { generation: []const u8 = "", mutation_revision: u64 = 0 };
+
+/// Typed administration binds the request to the generation and mutation revision the
+/// operator observed; a concurrent change makes the daemon reject it instead of acting on
+/// state the operator never saw.
+pub fn doAdmin(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype, spec: AdminSpec) ExitCode {
+    var diag: socket.DiagBuf = .{};
+    var client = socket.connect(allocator, globals.socket_path, globals.timeout_ms, &diag) catch {
+        stderr.print("error: {s}\n", .{diag.message()}) catch {};
+        return .connection_failed;
+    };
+    defer client.close();
+    const status_resp = client.sendCommand(.{ .status = {} }) catch {
+        stderr.print("error: {s}\n", .{client.errorMessage()}) catch {};
+        return .connection_failed;
+    };
+    defer status_resp.deinit(allocator);
+    const head_json = switch (status_resp) {
+        .ok => |o| o.payload,
+        .err => |e| {
+            format.formatError(stderr, e.code, e.message, globals.output, .{ .enabled = false }) catch {};
+            return .daemon_error;
+        },
+    };
+    const head = std.json.parseFromSlice(StatusHead, allocator, head_json, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch {
+        stderr.writeAll("error: daemon status did not carry a generation\n") catch {};
+        return .client_error;
+    };
+    defer head.deinit();
+    client.close();
+    client = socket.connect(allocator, globals.socket_path, globals.timeout_ms, &diag) catch {
+        stderr.print("error: {s}\n", .{diag.message()}) catch {};
+        return .connection_failed;
+    };
+    var body_bytes: [shared.protocol.max_request_body]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&body_bytes);
+    std.json.stringify(.{ .schema_version = @as(u32, 1), .kind = spec.kind, .jail = spec.jail, .address = spec.address, .prefix = spec.prefix, .duration_s = spec.duration_s, .all = spec.all, .run_id = spec.run_id, .expected_generation = head.value.generation, .expected_mutation_revision = head.value.mutation_revision }, .{ .emit_null_optional_fields = false }, stream.writer()) catch return .client_error;
+    const body = shared.Command.Body.init(stream.getWritten()) catch return .client_error;
+    var request_id: [shared.protocol.request_id_bytes]u8 = undefined;
+    std.crypto.random.bytes(&request_id);
+    const resp = client.sendCommand(.{ .admin_v1 = .{ .request_id = request_id, .body = body } }) catch {
+        stderr.print("error: {s}\n", .{client.errorMessage()}) catch {};
+        return .connection_failed;
+    };
+    defer resp.deinit(allocator);
+    const payload: []const u8 = switch (resp) {
+        .ok => |o| o.payload,
+        .err => |e| e.message,
+    };
+    writeAdminOutcome(allocator, stdout, payload, globals.output) catch |e| {
+        if (e != error.BrokenPipe) stderr.print("error: failed to format response: {s}\n", .{@errorName(e)}) catch {};
+    };
+    return switch (resp) {
+        .ok => .success,
+        .err => |e| switch (shared.Response.exitClassForCode(e.code)) {
+            .partial => .partial_effect,
+            .uncertain => .uncertain_effect,
+            else => .daemon_error,
+        },
+    };
+}
+
+const AdminOutcome = struct { schema_version: u32 = 0, kind: []const u8 = "", outcome: []const u8 = "", generation: []const u8 = "", mutation_revision: u64 = 0, enforced: bool = false, reasons: []const []const u8 = &.{} };
+
+fn writeAdminOutcome(allocator: std.mem.Allocator, writer: anytype, payload: []const u8, fmt: format.OutputFormat) !void {
+    if (fmt == .json) {
+        try writer.writeAll(payload);
+        if (payload.len == 0 or payload[payload.len - 1] != '\n') try writer.writeAll("\n");
+        return;
+    }
+    const parsed = std.json.parseFromSlice(AdminOutcome, allocator, payload, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch {
+        try writer.print("outcome\tunparseable\n{s}\n", .{payload});
+        return;
+    };
+    defer parsed.deinit();
+    try writer.print("kind\t{s}\noutcome\t{s}\nenforced\t{}\ngeneration\t{s}\nmutation_revision\t{d}\n", .{ parsed.value.kind, parsed.value.outcome, parsed.value.enforced, parsed.value.generation, parsed.value.mutation_revision });
+    for (parsed.value.reasons) |reason| try writer.print("reason\t{s}\n", .{reason});
+}
+
+/// Versioned reload carries a fresh request identity; the daemon's structured outcome is
+/// printed on stdout in every format and its error code selects the exit class.
+fn doReload(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype) ExitCode {
+    var request_id: [shared.protocol.request_id_bytes]u8 = undefined;
+    std.crypto.random.bytes(&request_id);
+    const body = shared.Command.Body.init("{\"schema_version\":1}") catch return .client_error;
+    var diag: socket.DiagBuf = .{};
+    var client = socket.connect(allocator, globals.socket_path, globals.timeout_ms, &diag) catch {
+        stderr.print("error: {s}\n", .{diag.message()}) catch {};
+        return .connection_failed;
+    };
+    defer client.close();
+    const resp = client.sendCommand(.{ .reload_v1 = .{ .request_id = request_id, .body = body } }) catch {
+        stderr.print("error: {s}\n", .{client.errorMessage()}) catch {};
+        return .connection_failed;
+    };
+    defer resp.deinit(allocator);
+    const payload: []const u8 = switch (resp) {
+        .ok => |o| o.payload,
+        .err => |e| e.message,
+    };
+    writeReloadOutcome(allocator, stdout, payload, globals.output) catch |e| {
+        if (e != error.BrokenPipe) stderr.print("error: failed to format response: {s}\n", .{@errorName(e)}) catch {};
+    };
+    return switch (resp) {
+        .ok => .success,
+        .err => |e| switch (shared.Response.exitClassForCode(e.code)) {
+            .partial => .partial_effect,
+            .uncertain => .uncertain_effect,
+            else => .daemon_error,
+        },
+    };
+}
+
+const ReloadOutcome = struct { schema_version: u32 = 0, outcome: []const u8 = "", generation: []const u8 = "", reasons: []const []const u8 = &.{} };
+
+fn writeReloadOutcome(allocator: std.mem.Allocator, writer: anytype, payload: []const u8, fmt: format.OutputFormat) !void {
+    if (fmt == .json) {
+        try writer.writeAll(payload);
+        if (payload.len == 0 or payload[payload.len - 1] != '\n') try writer.writeAll("\n");
+        return;
+    }
+    const parsed = std.json.parseFromSlice(ReloadOutcome, allocator, payload, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch {
+        try writer.print("outcome\tunparseable\n", .{});
+        return;
+    };
+    defer parsed.deinit();
+    try writer.print("outcome\t{s}\ngeneration\t{s}\n", .{ parsed.value.outcome, parsed.value.generation });
+    for (parsed.value.reasons) |reason| try writer.print("reason\t{s}\n", .{reason});
 }
 
 fn doRequest(
@@ -266,7 +477,7 @@ test "client: --help exits 0 and prints usage" {
     defer testing.allocator.free(r.out);
     defer testing.allocator.free(r.err);
     try testing.expectEqual(ExitCode.success, r.code);
-    try testing.expect(std.mem.indexOf(u8, r.out, "fail2zig-client") != null);
+    try testing.expect(std.mem.indexOf(u8, r.out, "fail2zig") != null);
     try testing.expect(std.mem.indexOf(u8, r.out, "COMMANDS:") != null);
 }
 
@@ -276,7 +487,7 @@ test "client: --version exits 0 and prints client version" {
     defer testing.allocator.free(r.err);
     try testing.expectEqual(ExitCode.success, r.code);
 
-    const expected = "fail2zig-client " ++ build_options.version;
+    const expected = "fail2zig " ++ build_options.version;
     try testing.expect(std.mem.indexOf(u8, r.out, expected) != null);
 }
 
@@ -335,6 +546,7 @@ test "client: unban against unreachable socket exits 3" {
         "--socket",  "/tmp/fail2zig-does-not-exist-xyzzy.sock",
         "--timeout", "500",
         "unban",     "1.2.3.4",
+        "--jail",    "sshd",
     });
     defer testing.allocator.free(r.out);
     defer testing.allocator.free(r.err);
@@ -354,7 +566,7 @@ test "client: completions zsh emits #compdef" {
     defer testing.allocator.free(r.out);
     defer testing.allocator.free(r.err);
     try testing.expectEqual(ExitCode.success, r.code);
-    try testing.expect(std.mem.startsWith(u8, r.out, "#compdef fail2zig-client"));
+    try testing.expect(std.mem.startsWith(u8, r.out, "#compdef fail2zig"));
 }
 
 test "client: completions fish emits complete -c" {
@@ -362,7 +574,7 @@ test "client: completions fish emits complete -c" {
     defer testing.allocator.free(r.out);
     defer testing.allocator.free(r.err);
     try testing.expectEqual(ExitCode.success, r.code);
-    try testing.expect(std.mem.indexOf(u8, r.out, "complete -c fail2zig-client") != null);
+    try testing.expect(std.mem.indexOf(u8, r.out, "complete -c fail2zig") != null);
 }
 
 test "client: completions unknown shell exits 2" {

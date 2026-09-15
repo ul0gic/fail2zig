@@ -99,12 +99,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y llvm
           llvm-strip --strip-all zig-out/bin/fail2zig
-          llvm-strip --strip-all zig-out/bin/fail2zig-client
 
       - name: Verify binary is statically linked
         run: |
           file zig-out/bin/fail2zig
-          file zig-out/bin/fail2zig-client
+          if [ -e zig-out/bin/fail2zig-client ]; then
+            echo "::error::a second executable was built; only fail2zig ships"
+            exit 1
+          fi
           if file zig-out/bin/fail2zig | grep -q "dynamically linked"; then
             echo "::error::fail2zig is dynamically linked; expected static musl binary"
             exit 1
@@ -119,22 +121,19 @@ jobs:
           EXPECTED: ${{ steps.version.outputs.version }}
         run: |
           sudo apt-get install -y qemu-user-static
-          for bin in fail2zig fail2zig-client; do
-            out="$("${QEMU}" "zig-out/bin/${bin}" --version)"
-            echo "${QEMU} ${bin} --version -> ${out}"
-            if [ "${out}" != "${bin} ${EXPECTED}" ]; then
-              echo "::error::${bin} --version printed '${out}', expected '${bin} ${EXPECTED}'"
-              exit 1
-            fi
-          done
+          out="$("${QEMU}" zig-out/bin/fail2zig --version)"
+          echo "${QEMU} fail2zig --version -> ${out}"
+          if [ "${out}" != "fail2zig ${EXPECTED}" ]; then
+            echo "::error::fail2zig --version printed '${out}', expected 'fail2zig ${EXPECTED}'"
+            exit 1
+          fi
 
       - name: Rename artifacts
         run: |
           mkdir -p dist
           v="${{ steps.version.outputs.version }}"
           t="${{ matrix.target }}"
-          cp zig-out/bin/fail2zig         "dist/fail2zig-v${v}-${t}"
-          cp zig-out/bin/fail2zig-client  "dist/fail2zig-client-v${v}-${t}"
+          cp zig-out/bin/fail2zig "dist/fail2zig-v${v}-${t}"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -189,7 +188,6 @@ jobs:
           # Bundle the systemd unit + example config so scripts/install.sh can
           # fetch them from the release page, not from a checkout.
           cp deploy/fail2zig.service release/ 2>/dev/null || true
-          cp deploy/fail2zig.socket  release/ 2>/dev/null || true
           cp deploy/fail2zig.toml.example release/ 2>/dev/null || true
           ls -la release/
 

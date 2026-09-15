@@ -260,7 +260,8 @@ pub fn controlCost(metrics: bool, response_capacity: usize) Error!Component {
     const Map = @TypeOf(@as(EventLoop, undefined).registrations);
     const registrations = ipc.max_clients + (if (metrics) http.max_clients else @as(usize, 0)) + 8;
     const loop_bytes = @sizeOf(EventLoop) + (4 * registrations + 16) * (@sizeOf(Map.KV) + 2);
-    var live = Cost{ .bytes = loop_bytes + @sizeOf(ipc.IpcServer) + ipc.max_clients * ipc.client_buffer_size + shared.protocol.max_payload_size + 16, .allocations = 3, .fds = ipc.max_clients + 1 + 8 };
+    // Each admitted client may hold one bounded response awaiting drain; the deadline timer adds one fd.
+    var live = Cost{ .bytes = loop_bytes + @sizeOf(ipc.IpcServer) + ipc.max_clients * (ipc.client_buffer_size + ipc.max_response_bytes), .allocations = 2 + 2 * ipc.max_clients, .fds = ipc.max_clients + 2 + 8 };
     if (metrics) {
         const Client = @typeInfo(@typeInfo(@TypeOf(@as(http.HttpServer, undefined).clients[0])).optional.child).pointer.child;
         live = try live.plus(.{ .bytes = @sizeOf(http.HttpServer) + http.max_clients * @sizeOf(Client), .allocations = http.max_clients + 1, .fds = http.max_clients + 1 });

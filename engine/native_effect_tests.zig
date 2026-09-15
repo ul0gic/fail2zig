@@ -759,6 +759,59 @@ fn admitRecord(store: *durable.Store) !void {
     _ = try store.beginReceipt(record_identity, .{ .us = 100 }, 0);
 }
 
+test "native effects: detection for a live owner is absorbed until its deadline and re-decides at expiry" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try admit(&f.store);
+    try enableSchema19(&f.store);
+    try f.store.enableHistoryResets();
+    try f.store.enableActionTargets();
+    var clock = TestClock{};
+    const existing = try f.store.setOwner(try change("one", 1, .{ .finite = 800 }), clock.value());
+    try f.store.markDispatched(existing.token(), clock.value());
+    _ = try f.store.settleVerified(existing.token(), observation(existing, clock.now, .{ .finite = 800 }), clock.value());
+    const confirmed = try f.store.confirmedEffectEvents();
+    var owners: [effects.max_page]effects.Owner = undefined;
+    try t.expectEqual(@as(usize, 1), try f.store.effectOwners(existing.scope_key, existing.revision, &owners));
+    const original = owners[0];
+    try f.store.admitRetry(record_identity.jail, record_identity.generation, enforcing_policy);
+
+    // One microsecond before the deadline the owner is live: the decision is recorded and
+    // absorbed without touching lease, decision identity, revision or confirmation.
+    _ = try f.store.beginReceipt(record_identity, .{ .us = 100 }, 0);
+    clock.now = 799;
+    var absorbed = try record(&clock);
+    absorbed.native_retry.?.processing_us = 400;
+    try t.expectEqual(durable.CommitResult.committed, try f.store.commitRecord(absorbed));
+    try t.expectEqual(@as(usize, 1), try f.store.effectOwners(existing.scope_key, existing.revision, &owners));
+    try t.expectEqualDeep(original, owners[0]);
+    try t.expectEqual(confirmed, try f.store.confirmedEffectEvents());
+    try t.expectEqual(@as(i64, 800), (try first(&f.store)).desired.finite);
+    try t.expectEqual(existing.revision, (try first(&f.store)).revision);
+
+    // At deadline equality the owner is no longer live and the next decision bans anew.
+    var identity = record_identity;
+    identity.occurrence = "2";
+    identity.cursor = "cursor-2";
+    identity.raw_hash = [_]u8{2} ** 32;
+    _ = try f.store.beginReceipt(identity, .{ .us = 100 }, try f.store.revision("one"));
+    clock.now = 800;
+    var rebanned = try record(&clock);
+    rebanned.occurrence = identity.occurrence;
+    rebanned.cursor = identity.cursor;
+    rebanned.raw_hash = identity.raw_hash;
+    rebanned.native_retry.?.processing_us = 800;
+    rebanned.expected_revision = try f.store.revision("one");
+    try t.expectEqual(durable.CommitResult.committed, try f.store.commitRecord(rebanned));
+    const replaced = try first(&f.store);
+    try t.expectEqual(existing.revision + 1, replaced.revision);
+    try t.expectEqual(@as(i64, 1200), replaced.desired.finite);
+    try t.expectEqual(@as(usize, 1), try f.store.effectOwners(existing.scope_key, replaced.revision, &owners));
+    try t.expect(!std.mem.eql(u8, &original.decision_id, &owners[0].decision_id));
+    try t.expectEqual(@as(i64, 800), owners[0].decided_us);
+    try t.expectEqualDeep(effects.Lease{ .finite = 1200 }, owners[0].lease);
+}
+
 test "native effects: composed schema 14 to 21 upgrade preserves source owner expiry history and suppresses restored notification" {
     var f = try Fixture.init();
     defer f.deinit();
@@ -1108,4 +1161,42 @@ test "native effects: full confirmation ledger permits existing dedup but refuse
     try t.expectEqual(epoch, f.store.effect_publication_epoch);
     try t.expectEqual(effects.Status.dispatched, (try first(&f.store)).status);
     try t.expectEqual(@as(u64, effects.max_confirmed_events), try f.store.confirmedEffectEvents());
+}
+
+test "native effects: reload generation re-key moves an applied owner through retain and keeps it dispatchable" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try admit(&f.store);
+    try enableSchema19(&f.store);
+    try f.store.enableHistoryResets();
+    try f.store.enableActionTargets();
+    try f.store.enableAdminState();
+    try f.store.enableMigrationState();
+    const policy = retry.Policy{ .maxretry = 3, .window_us = 600 * 1_000_000, .duration = .{ .finite_us = 60 * 1_000_000 }, .max_subjects = 64 };
+    const g_old = [_]u8{3} ** 32;
+    const g_new = [_]u8{4} ** 32;
+    try f.store.admitRetry("one", g_old, policy);
+    var clock = TestClock{};
+    const entry = try f.store.setOwner(try change("one", 9, .permanent), clock.value());
+    try f.store.markDispatched(entry.token(), clock.value());
+    _ = try f.store.settleVerified(entry.token(), observation(entry, clock.now, .permanent), clock.value());
+    const epoch = f.store.effect_publication_epoch;
+    var next = policy;
+    next.maxretry = 2;
+    try f.store.commitReloadGeneration(&.{.{ .jail = "one", .generation = g_old, .next_generation = g_new, .expected = policy, .next = next }}, .{ .generation = [_]u8{6} ** 32, .config_digest = [_]u8{5} ** 32, .config_path = "/p", .committed_us = clock.now, .published = false, .mutation_revision = 0 }, &.{}, clock.value());
+    try t.expect(f.store.effect_publication_epoch > epoch);
+    const moved = try first(&f.store);
+    try t.expect(moved.status != .superseded);
+    var owners: [effects.max_page]effects.Owner = undefined;
+    const count = try f.store.effectOwners(moved.scope_key, moved.revision, &owners);
+    try t.expectEqual(@as(usize, 1), count);
+    try t.expectEqualSlices(u8, &g_new, &owners[0].generation);
+    try t.expect(owners[0].lease == .permanent);
+    // The manager's next turn dispatches the replacement intent and settles it like any other.
+    try f.store.markDispatched(moved.token(), clock.value());
+    _ = try f.store.settleVerified(moved.token(), observation(moved, clock.now, .permanent), clock.value());
+    const settled = try first(&f.store);
+    try t.expectEqual(effects.Status.applied, settled.status);
+    var targets: [@import("core/native_action_outcome.zig").max_targets_per_action]@import("core/native_action_outcome.zig").Target = undefined;
+    _ = f.store.actionTargets(settled.intent_id, &targets) catch |err| std.debug.print("action targets after re-key: {s}\n", .{@errorName(err)});
 }

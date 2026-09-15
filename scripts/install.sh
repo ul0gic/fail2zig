@@ -14,11 +14,11 @@
 #   1. Detect host architecture, map to a supported release target.
 #   2. Resolve the version (default: latest GitHub release; override with
 #      FAIL2ZIG_VERSION=v0.3.0).
-#   3. Download fail2zig + fail2zig-client + SHA256SUMS + systemd unit from
-#      that release's asset tree (skipped if --local-bin is supplied).
-#   4. Verify SHA256 of each binary against SHA256SUMS. Abort on mismatch.
+#   3. Download fail2zig + SHA256SUMS + systemd unit from that release's
+#      asset tree (skipped if --local-bin is supplied).
+#   4. Verify the SHA256 of the executable against SHA256SUMS. Abort on mismatch.
 #   5. Create the `fail2zig` system group if missing.
-#   6. Install binaries to /usr/local/bin (mode 0755, root:root).
+#   6. Install the executable to /usr/local/bin (mode 0755, root:root).
 #   7. Create /etc/fail2zig (mode 0750) and copy the example config if the
 #      target config does not already exist. Never clobber operator state.
 #   8. Install /etc/systemd/system/fail2zig.service and run `daemon-reload`.
@@ -76,9 +76,9 @@ Usage: install.sh [OPTIONS]
 
 Options:
   --dry-run               Print every action without executing it.
-  --local-bin <dir>       Install from a local directory containing freshly
-                          built `fail2zig` and `fail2zig-client` binaries
-                          instead of downloading a release.
+  --local-bin <dir>       Install from a local directory containing a freshly
+                          built `fail2zig` executable instead of downloading
+                          a release.
   --version <tag>         Version tag to install (default: latest).
                           Equivalent to FAIL2ZIG_VERSION=<tag>.
   -h, --help              Show this help.
@@ -205,12 +205,9 @@ stage_from_release() {
   local version="${tag#v}"
 
   local daemon_asset="fail2zig-v${version}-${TARGET}"
-  local client_asset="fail2zig-client-v${version}-${TARGET}"
 
   log "downloading ${daemon_asset}"
   curl -fsSL --retry 3 -o "${WORKDIR}/${daemon_asset}" "${base}/${daemon_asset}"
-  log "downloading ${client_asset}"
-  curl -fsSL --retry 3 -o "${WORKDIR}/${client_asset}" "${base}/${client_asset}"
   log "downloading SHA256SUMS"
   curl -fsSL --retry 3 -o "${WORKDIR}/SHA256SUMS" "${base}/SHA256SUMS"
   log "downloading fail2zig.service"
@@ -223,12 +220,10 @@ stage_from_release() {
     rm -f "${WORKDIR}/fail2zig.toml.example"
   fi
 
-  # SHA256 verification — only for binaries we intend to install as root.
+  # SHA256 verification — only for the executable we intend to install as root.
   verify_sha "${daemon_asset}"
-  verify_sha "${client_asset}"
 
   echo "${daemon_asset}" > "${WORKDIR}/.daemon_name"
-  echo "${client_asset}" > "${WORKDIR}/.client_name"
 }
 
 verify_sha() {
@@ -249,12 +244,9 @@ stage_from_local() {
   local dir="$1"
   [ -d "${dir}" ] || die "--local-bin directory does not exist: ${dir}"
   [ -x "${dir}/fail2zig" ] || die "missing executable: ${dir}/fail2zig"
-  [ -x "${dir}/fail2zig-client" ] || die "missing executable: ${dir}/fail2zig-client"
 
-  cp "${dir}/fail2zig"        "${WORKDIR}/fail2zig"
-  cp "${dir}/fail2zig-client" "${WORKDIR}/fail2zig-client"
-  echo "fail2zig"        > "${WORKDIR}/.daemon_name"
-  echo "fail2zig-client" > "${WORKDIR}/.client_name"
+  cp "${dir}/fail2zig" "${WORKDIR}/fail2zig"
+  echo "fail2zig" > "${WORKDIR}/.daemon_name"
 
   # Pick up the systemd unit + example config from the repo tree.
   if [ -f "${REPO_ROOT}/deploy/fail2zig.service" ]; then
@@ -266,7 +258,7 @@ stage_from_local() {
     cp "${REPO_ROOT}/deploy/fail2zig.toml.example" "${WORKDIR}/fail2zig.toml.example"
   fi
 
-  log "staged binaries from ${dir}"
+  log "staged executable from ${dir}"
 }
 
 if [ -n "${LOCAL_BIN}" ]; then
@@ -276,7 +268,6 @@ else
 fi
 
 DAEMON_STAGED="${WORKDIR}/$(cat "${WORKDIR}/.daemon_name")"
-CLIENT_STAGED="${WORKDIR}/$(cat "${WORKDIR}/.client_name")"
 
 # --- system group -------------------------------------------------------------
 
@@ -289,10 +280,13 @@ fi
 
 # --- install binaries ---------------------------------------------------------
 
-log "installing binaries to ${PREFIX}/bin"
+log "installing executable to ${PREFIX}/bin"
 run install -d -o root -g root -m 0755 "${PREFIX}/bin"
 run install -o root -g root -m 0755 "${DAEMON_STAGED}" "${PREFIX}/bin/fail2zig"
-run install -o root -g root -m 0755 "${CLIENT_STAGED}" "${PREFIX}/bin/fail2zig-client"
+if [ -e "${PREFIX}/bin/fail2zig-client" ]; then
+  log "removing the retired ${PREFIX}/bin/fail2zig-client (one executable now serves every command)"
+  run rm -f "${PREFIX}/bin/fail2zig-client"
+fi
 
 # --- config directory ---------------------------------------------------------
 
@@ -333,8 +327,7 @@ cat <<SUMMARY
 fail2zig installed successfully.
 ----------------------------------------------------------------------
 
-  Binaries:     ${PREFIX}/bin/fail2zig
-                ${PREFIX}/bin/fail2zig-client
+  Executable:   ${PREFIX}/bin/fail2zig
   Config dir:   ${CONFIG_DIR}
   Unit file:    ${SYSTEMD_DIR}/fail2zig.service
 
@@ -346,8 +339,8 @@ Next steps (review the config before starting the daemon):
 
 Verify the daemon sees your jails:
 
-  sudo fail2zig-client status
-  sudo fail2zig-client list
+  sudo fail2zig status
+  sudo fail2zig list
 
 Documentation: https://github.com/${REPO}
 ----------------------------------------------------------------------

@@ -9,7 +9,7 @@ const linux = std.os.linux;
 const testing = std.testing;
 
 const daemon_path = "zig-out/bin/fail2zig";
-const client_path = "zig-out/bin/fail2zig-client";
+const client_path = daemon_path;
 const max_output_bytes: usize = 1 << 20;
 const watchdog_timeout_ms: u64 = 10_000;
 const startup_timeout_ms: u64 = 5_000;

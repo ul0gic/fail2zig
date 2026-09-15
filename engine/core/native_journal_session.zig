@@ -389,7 +389,12 @@ pub const Session = struct {
         defer if (pending) |saved| saved.deinit(self.allocator);
         const binding = self.bindPending(pending) catch |err| return if (self.last_failure_domain == .storage) err else self.sourceFailure(err);
         if (token != null) token = try self.source_repair.begin(self.nowMs(), true);
-        var lines = self.fetch(1) catch |err| return self.sourceFailure(err);
+        // An executable that cannot be spawned is an environment fault, not a journal condition
+        // the bounded repair loop can outwait: refuse admission explicitly instead of recovering.
+        var lines = self.fetch(1) catch |err| return switch (err) {
+            error.FileNotFound, error.AccessDenied => error.JournalExecutableUnavailable,
+            else => self.sourceFailure(err),
+        };
         if (pending) |saved| {
             if (!self.baseline_committed) return self.sourceFailure(error.MissingJournalCheckpoint);
             const line = (try lines.next()) orelse return self.sourceFailure(error.PendingRecordUnavailable);

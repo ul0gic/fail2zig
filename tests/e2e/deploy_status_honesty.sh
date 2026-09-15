@@ -49,7 +49,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 
 UNIT="fail2zig.service"
-CLIENT="/usr/local/bin/fail2zig-client"
+CLIENT="/usr/local/bin/fail2zig"
 GRP="fail2zig"
 TARGET="x86_64-linux-musl"
 
@@ -148,7 +148,7 @@ inject_sshd_failures() {
   done
 }
 
-# `fail2zig-client status --output plain` field by key (tab-separated).
+# `fail2zig status --output plain` field by key (tab-separated).
 status_field() { "$CLIENT" status --output plain 2>/dev/null | awk -F'\t' -v k="$1" '$1==k{print $2; exit}'; }
 
 # The SOURCE (log_source) column for a jail from `jails --output plain`.
@@ -186,7 +186,6 @@ if [ "$DO_BUILD" -eq 1 ]; then
   LOCAL_BIN="${REPO_ROOT}/zig-out/bin"
 fi
 [ -x "${LOCAL_BIN}/fail2zig" ]        || { echo "e2e: missing ${LOCAL_BIN}/fail2zig" >&2; exit 2; }
-[ -x "${LOCAL_BIN}/fail2zig-client" ] || { echo "e2e: missing ${LOCAL_BIN}/fail2zig-client" >&2; exit 2; }
 
 log "installing via scripts/install.sh --local-bin ${LOCAL_BIN}"
 "${REPO_ROOT}/scripts/install.sh" --local-bin "$LOCAL_BIN"

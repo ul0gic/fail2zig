@@ -43,7 +43,7 @@ can never silently reship.
    checks **steady state** after the service is active, so `0750` is the
    correct invariant.
 4. Socket `/run/fail2zig/fail2zig.sock` is `root:fail2zig` `0660`.
-5. A root client connects (`fail2zig-client status`).
+5. A root client connects (`fail2zig status`).
 6. A `fail2zig`-group user connects (non-root).
 7. A non-group user (`nobody`) is denied — client exit code `3` plus the
    daemon's own `requires group 'fail2zig' membership` message.
@@ -108,7 +108,7 @@ network namespace itself when invoked from the host namespace.
 ## Design notes
 
 - **Service only.** The harness mirrors exactly what `install.sh` deploys:
-  the daemon binds its own socket. `deploy/fail2zig.socket` is not involved.
+  the daemon binds its own socket; no systemd socket unit exists or is supported.
 - **Byte-identical unit guard.** After install, the harness `cmp`s the
   on-disk unit against `deploy/fail2zig.service` and refuses to proceed if
   they differ, and refuses if any drop-in exists under `fail2zig.service.d/`.

@@ -26,7 +26,7 @@ log_level = "info"
 # Accepted for forward compatibility; v0.3.0 does not write a PID file.
 pid_file = "/run/fail2zig/fail2zig.pid"
 
-# Unix domain socket for the fail2zig-client CLI.
+# Unix domain socket for the fail2zig administration commands.
 # Mode 0660, owned by root:fail2zig (see deploy/fail2zig.service).
 # The daemon creates the parent directory (mode 0710) on startup if it
 # does not exist — matches the client's default `--socket` path.

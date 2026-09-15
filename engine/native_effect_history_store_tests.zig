@@ -89,6 +89,34 @@ fn sql(store: *durable.Store, statement: [:0]const u8) !void {
     if (run(@ptrCast(store.db), statement, null, null, null) != 0) return error.TestSqlFailed;
 }
 
+const FilteredScan = struct {
+    matches: usize,
+    pages: usize,
+    resume_after: u64,
+    more: bool,
+};
+
+/// Drives the same storage cursor contract used by the daemon's bounded
+/// filtered reader. Query rendering and its empty-page cursor are covered in
+/// native_query_tests; this helper keeps the SQLite-backed half observable.
+fn scanFilteredHistory(store: *durable.Store, installation: effects.Installation, jail: []const u8, after_sequence: u64, limit: usize, max_pages: usize) !FilteredScan {
+    var rows: [history.max_page]history.Event = undefined;
+    var after = after_sequence;
+    var pages: usize = 0;
+    var matches: usize = 0;
+    while (matches < limit and pages < max_pages) : (pages += 1) {
+        const page = try store.confirmedEffectPage(installation, after, null, &rows);
+        if (page.count == 0) return .{ .matches = matches, .pages = pages + 1, .resume_after = after, .more = false };
+        for (rows[0..page.count]) |event| {
+            if (matches == limit) return .{ .matches = matches, .pages = pages + 1, .resume_after = after, .more = true };
+            after = event.sequence;
+            if (std.mem.eql(u8, event.jail.slice(), jail)) matches += 1;
+        }
+        if (!page.more) return .{ .matches = matches, .pages = pages + 1, .resume_after = after, .more = false };
+    }
+    return .{ .matches = matches, .pages = pages, .resume_after = after, .more = true };
+}
+
 fn enableApplicationHistory(store: *durable.Store) !void {
     try store.enableConfirmedHistory();
     try store.enableMaintenance();
@@ -137,6 +165,52 @@ test "native effect history store: migration backfill rollback deterministic app
     try t.expectEqual(@as(usize, 1), next.count);
     try t.expectEqual(@as(u64, 3), events[0].sequence);
     try t.expectError(error.StaleHistoryPage, f.store.validateConfirmedEffectPage(first.token));
+}
+
+test "native effect history store: large filtered scans stop at the page budget and resume in SQLite" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var clock = Clock{};
+    try f.store.enableConfirmedHistory();
+    const entry = try f.store.setOwner(.{
+        .scope = try effects.Scope.host(.{ .v4 = .{ 192, 0, 2, 1 } }),
+        .jail = "seed",
+        .generation = [_]u8{3} ** 32,
+        .decision_id = [_]u8{4} ** 32,
+        .expected_revision = 0,
+        .lease = .permanent,
+        .decided_us = 100,
+    }, clock.value());
+    // 1,024 non-matches fill the daemon's 16-page scan budget. The only
+    // matching row is the next durable sequence. Generate canonical event IDs
+    // so the store's provenance validation remains active in this fixture.
+    var statement = std.ArrayList(u8).init(t.allocator);
+    defer statement.deinit();
+    try statement.appendSlice("INSERT INTO confirmed_effect_events(event_id,scope_key,jail,decision_id,confirmed_us) VALUES");
+    const scope_hex = std.fmt.bytesToHex(entry.scope_key, .lower);
+    var n: u64 = 1;
+    while (n <= 1025) : (n += 1) {
+        const jail = if (n == 1025) "needle" else "decoy";
+        const decision_id = effects.hashParts("fail2zig-prf003-decision-v1", &.{std.mem.asBytes(&n)});
+        const event_id = effects.hashParts("fail2zig-native-confirmed-owner-v1", &.{ &f.installation.id, &entry.scope_key, jail, &decision_id });
+        const event_hex = std.fmt.bytesToHex(event_id, .lower);
+        const decision_hex = std.fmt.bytesToHex(decision_id, .lower);
+        try statement.writer().print("{s}(X'{s}',X'{s}','{s}',X'{s}',{d})", .{ if (n == 1) "" else ",", event_hex, scope_hex, jail, decision_hex, n });
+    }
+    try statement.appendSlice(";\x00");
+    try sql(&f.store, statement.items[0 .. statement.items.len - 1 :0]);
+
+    const first = try scanFilteredHistory(&f.store, f.installation, "needle", 0, 1, 16);
+    try t.expectEqual(@as(usize, 0), first.matches);
+    try t.expectEqual(@as(usize, 16), first.pages);
+    try t.expectEqual(@as(u64, 1024), first.resume_after);
+    try t.expect(first.more);
+
+    const second = try scanFilteredHistory(&f.store, f.installation, "needle", first.resume_after, 1, 16);
+    try t.expectEqual(@as(usize, 1), second.matches);
+    try t.expectEqual(@as(usize, 1), second.pages);
+    try t.expectEqual(@as(u64, 1025), second.resume_after);
+    try t.expect(!second.more);
 }
 
 test "native effect history store: application detail pages aggregates and policy summaries are bounded and fenced" {

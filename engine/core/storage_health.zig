@@ -229,6 +229,18 @@ pub const Gate = struct {
             self.notice(at);
     }
 
+    /// A live configuration change requests an immediate rebuild through the ordinary
+    /// recovery path so sessions re-admit under the new policy. It is not a failure: no
+    /// failure record is retained and the retry delay is not escalated.
+    pub fn requestRebuild(self: *Gate) !void {
+        const at = try self.now();
+        if (self.state.phase != .healthy) return error.RebuildNotAllowed;
+        self.state.phase = .paused;
+        self.state.recovery_step = null;
+        self.state.next_retry_ms = at;
+        self.notice(at);
+    }
+
     /// Startup may wait for a reversed wall clock; the caller must propagate
     /// other startup failures and refuse activation. Runtime retries start at 1s.
     /// Intervention needs operator repair/restart, not a timer-driven reset.

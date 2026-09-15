@@ -6,13 +6,14 @@ const linux = std.os.linux;
 
 const shared = @import("shared");
 const build_options = @import("build_options");
+const cli = @import("cli");
 
-var runtime_log_level = std.atomic.Value(u8).init(@intFromEnum(std.log.Level.info));
+const log_level = @import("core/log_level.zig");
 pub const std_options: std.Options = .{ .log_level = .debug, .logFn = configuredLog };
 
 fn configuredLog(comptime level: std.log.Level, comptime scope: @Type(.enum_literal), comptime format: []const u8, args: anytype) void {
-    if (@intFromEnum(level) > runtime_log_level.load(.monotonic)) return;
-    std.log.defaultLog(level, scope, format, args);
+    if (!log_level.enabled(level)) return;
+    @import("core/log_target.zig").logFn(level, scope, format, args);
 }
 
 pub const event_loop_mod = @import("core/event_loop.zig");
@@ -22,12 +23,21 @@ pub const state_mod = @import("core/state.zig");
 pub const tracker_map_mod = @import("core/tracker_map.zig");
 pub const persist_mod = @import("core/persist.zig");
 pub const native_store_mod = @import("core/record_store.zig");
+pub const firewall_scope_mod = @import("firewall/scope.zig");
 pub const native_action_outcome_mod = @import("core/native_action_outcome.zig");
 pub const native_effect_mod = @import("core/native_effect.zig");
 pub const firewall = @import("firewall/backend.zig");
 pub const config_mod = @import("config/native.zig");
 pub const fail2ban_mod = @import("config/fail2ban.zig");
 pub const migration_mod = @import("config/migration.zig");
+pub const migration_inspect_mod = @import("migration/inspect.zig");
+pub const migration_snapshot_mod = @import("migration/sqlite_snapshot.zig");
+pub const migration_fixture_mod = @import("migration/fail2ban_fixture.zig");
+pub const migrate_cli_mod = @import("cli/migrate.zig");
+pub const rule_test_cli_mod = @import("cli/rule_test.zig");
+/// Client modules of the same executable, exposed so integration tests can drive typed
+/// administration without a separate binary.
+pub const cli_mod = cli;
 pub const filter_types_mod = @import("filters/types.zig");
 pub const filter_sshd_mod = @import("filters/sshd.zig");
 pub const filter_nginx_mod = @import("filters/nginx.zig");
@@ -64,9 +74,45 @@ pub const CliOptions = struct {
     foreground: bool = true,
 };
 
+/// Which runtime path the one delivered executable takes for an argument vector (argv[0] excluded).
+pub const EntryMode = enum { daemon, operator, migrate, rule_test };
+
+const operator_words = [_][]const u8{ "status", "jails", "list", "ban", "unban", "reload", "version", "help", "completions" };
+const operator_globals = [_][]const u8{ "--socket", "--output", "--no-color", "--timeout" };
+
+/// The first token decides: an operator spelling or operator global selects the administration
+/// path with the complete vector; everything else (including the explicit `daemon` word) is the
+/// daemon/local path. Mixing daemon flags with operator spellings is a usage error there.
+pub fn classifyEntry(args: []const []const u8) EntryMode {
+    if (args.len == 0) return .daemon;
+    const first = args[0];
+    if (std.mem.eql(u8, first, "migrate")) return .migrate;
+    if (std.mem.eql(u8, first, "rule-test")) return .rule_test;
+    for (operator_words) |w| if (std.mem.eql(u8, first, w)) return .operator;
+    for (operator_globals) |g| {
+        if (std.mem.eql(u8, first, g)) return .operator;
+        if (first.len > g.len and std.mem.startsWith(u8, first, g) and first[g.len] == '=') return .operator;
+    }
+    return .daemon;
+}
+
+/// Administration outcomes map onto the native exit classes; 4/5 come only from typed
+/// administration, never from the retained client paths.
+pub fn exitClassForClient(code: cli.ExitCode) shared.ExitClass {
+    return switch (code) {
+        .success => .success,
+        .daemon_error => .rejected,
+        .client_error => .usage,
+        .connection_failed => .unavailable,
+        .partial_effect => .partial,
+        .uncertain_effect => .uncertain,
+    };
+}
+
 pub fn parseArgs(args: []const []const u8) CliError!CliOptions {
     var out: CliOptions = .{};
     var i: usize = 1;
+    if (args.len > 1 and std.mem.eql(u8, args[1], "daemon")) i = 2;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
@@ -114,7 +160,15 @@ fn printHelp(w: anytype) !void {
         \\fail2zig {s} — modern intrusion prevention
         \\
         \\USAGE:
-        \\  fail2zig [OPTIONS]
+        \\  fail2zig [daemon] [OPTIONS]                 start the daemon (installed service entry)
+        \\  fail2zig [GLOBALS] <command> [args]         administer a running daemon
+        \\
+        \\COMMANDS:
+        \\  status | jails | list | ban | unban | reload | version | help | completions
+        \\  migrate inspect|snapshot|plan|validate ... read-only migration preparation
+        \\  rule-test --file|--record|--journal ...   offline rule evaluation (no daemon needed)
+        \\  Globals: --socket <path> --output table|json|plain --no-color --timeout <ms>
+        \\  `fail2zig help <command>` documents each command; `fail2zig version` is the daemon's.
         \\
         \\OPTIONS:
         \\  --config <path>           Config file (default: /etc/fail2zig/config.toml)
@@ -126,10 +180,13 @@ fn printHelp(w: anytype) !void {
         \\  --version, -V             Print version and exit
         \\  --help, -h                Print this help and exit
         \\
-        \\EXIT CODES:
+        \\EXIT CLASSES:
         \\  0   success
-        \\  1   config load / validation failure, or zero enabled jails imported
-        \\  2   hard parse error on import
+        \\  1   valid request rejected by the daemon or local operation (fail-closed startup,
+        \\      zero enabled jails imported)
+        \\  2   usage, argument, config parse/validation or import parse failure
+        \\  3   daemon/transport unavailable
+        \\  4   partial durable effect (reserved)   5   uncertain durable effect (reserved)
         \\
     , .{version});
 }
@@ -160,14 +217,25 @@ pub fn main() !void {
     const argv = try std.process.argsAlloc(heap);
     defer std.process.argsFree(heap, argv);
 
+    const rest: []const []const u8 = if (argv.len > 0) argv[1..] else argv;
+    switch (classifyEntry(rest)) {
+        .operator => {
+            const code = cli.run(heap, rest, std.io.getStdOut().writer(), std.io.getStdErr().writer());
+            std.process.exit(exitClassForClient(code).code());
+        },
+        .migrate => std.process.exit(@import("cli/migrate.zig").run(heap, rest[1..], version, std.io.getStdOut().writer(), std.io.getStdErr().writer()).code()),
+        .rule_test => std.process.exit(@import("cli/rule_test.zig").run(heap, rest[1..], std.io.getStdOut().writer(), std.io.getStdErr().writer()).code()),
+        .daemon => {},
+    }
+
     const opts = parseArgs(argv) catch |err| {
         const stderr = std.io.getStdErr().writer();
         switch (err) {
             error.MissingValue => try stderr.print("error: missing value for flag\n", .{}),
-            error.UnknownFlag => try stderr.print("error: unknown flag (use --help)\n", .{}),
+            error.UnknownFlag => try stderr.print("error: unknown flag or command (use --help)\n", .{}),
             error.AllocFailure => try stderr.print("error: allocation failure\n", .{}),
         }
-        std.process.exit(1);
+        std.process.exit(shared.ExitClass.usage.code());
     };
 
     const stdout = std.io.getStdOut().writer();
@@ -194,7 +262,7 @@ pub fn main() !void {
     var cfg_diag: config_mod.Diagnostic = .{};
     var cfg = config_mod.Config.loadFileDiag(cfg_arena.allocator(), opts.config_path, &cfg_diag) catch |err| {
         try printConfigLoadError(std.io.getStdErr().writer(), opts.config_path, err, &cfg_diag);
-        std.process.exit(1);
+        std.process.exit(shared.ExitClass.usage.code());
     };
     cfg.retained_capacity = cfg_arena.queryCapacity();
 
@@ -204,13 +272,13 @@ pub fn main() !void {
     config_mod.validate(&cfg) catch |err| {
         const stderr = std.io.getStdErr().writer();
         try stderr.print("config: validation failed: {s}\n", .{@errorName(err)});
-        std.process.exit(1);
+        std.process.exit(shared.ExitClass.usage.code());
     };
     if (!is_validate_only) {
         ensureSocketDir(cfg.global.socket_path) catch |err| {
             const stderr = std.io.getStdErr().writer();
             try stderr.print("config: cannot prepare socket directory: {s}\n", .{@errorName(err)});
-            std.process.exit(1);
+            std.process.exit(shared.ExitClass.rejected.code());
         };
     }
 
@@ -220,7 +288,7 @@ pub fn main() !void {
         return;
     }
 
-    try runDaemon(heap, &cfg);
+    try runDaemon(heap, &cfg, opts.config_path);
 }
 
 fn printConfigLoadError(
@@ -380,14 +448,33 @@ fn failClosed(err: anytype, comptime fmt: []const u8, args: anytype) @TypeOf(err
     const any: anyerror = err;
     switch (any) {
         error.OutOfMemory => return err,
-        else => std.process.exit(1),
+        else => {
+            // A file log target is ring-buffered; exit skips the daemon's drain.
+            if (@import("native_daemon.zig").log_sink) |sink| sink.drain();
+            std.process.exit(shared.ExitClass.rejected.code());
+        },
     }
 }
 
-fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config) !void {
+fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config, config_path: []const u8) !void {
     const level = std.meta.stringToEnum(std.log.Level, @tagName(cfg.global.log_level)) orelse .info;
-    runtime_log_level.store(@intFromEnum(level), .monotonic);
-    return @import("native_daemon.zig").run(heap, cfg) catch |err|
+    log_level.set(level);
+    const log_target = @import("core/log_target.zig");
+    var sink: ?log_target.Sink = null;
+    defer if (sink) |*value| {
+        log_target.install(null);
+        value.drain();
+        value.deinit();
+    };
+    if (!std.mem.eql(u8, cfg.global.log_target, "stderr")) {
+        sink = log_target.Sink.init(heap, .{ .file = cfg.global.log_target }) catch |err| {
+            std.log.err("log target '{s}' unusable: {s}; refusing to start", .{ cfg.global.log_target, @errorName(err) });
+            std.process.exit(shared.ExitClass.rejected.code());
+        };
+        @import("native_daemon.zig").log_sink = &sink.?;
+        log_target.install(&sink.?);
+    }
+    return @import("native_daemon.zig").run(heap, cfg, config_path) catch |err|
         failClosed(err, "native: startup failed: {s}; refusing to start", .{@errorName(err)});
 }
 
@@ -465,6 +552,45 @@ test "engine: all version identities agree (ISSUE-010 drift guard)" {
     }).version;
     try std.testing.expectEqualStrings(build_options.version, version);
     try std.testing.expectEqualStrings(build_options.version, ctx_default_version);
+}
+
+test {
+    _ = @import("cli/migrate.zig");
+    _ = @import("cli/rule_test.zig");
+}
+
+test "cli: entry classification routes operator spellings and globals only" {
+    try std.testing.expectEqual(EntryMode.daemon, classifyEntry(&.{}));
+    try std.testing.expectEqual(EntryMode.daemon, classifyEntry(&.{"daemon"}));
+    try std.testing.expectEqual(EntryMode.daemon, classifyEntry(&.{ "--config", "/x" }));
+    try std.testing.expectEqual(EntryMode.daemon, classifyEntry(&.{"--version"}));
+    try std.testing.expectEqual(EntryMode.daemon, classifyEntry(&.{"--validate-config"}));
+    try std.testing.expectEqual(EntryMode.operator, classifyEntry(&.{"status"}));
+    try std.testing.expectEqual(EntryMode.operator, classifyEntry(&.{ "--socket", "/s", "status" }));
+    try std.testing.expectEqual(EntryMode.operator, classifyEntry(&.{ "--output=json", "version" }));
+    try std.testing.expectEqual(EntryMode.operator, classifyEntry(&.{"completions"}));
+    try std.testing.expectEqual(EntryMode.migrate, classifyEntry(&.{ "migrate", "inspect" }));
+    try std.testing.expectEqual(EntryMode.rule_test, classifyEntry(&.{ "rule-test", "--record", "x" }));
+    try std.testing.expectEqual(EntryMode.daemon, classifyEntry(&.{"--socketpath"}));
+    try std.testing.expectEqual(EntryMode.daemon, classifyEntry(&.{"statusx"}));
+}
+
+test "cli: explicit daemon word is the no-subcommand startup" {
+    const args = [_][]const u8{ "fail2zig", "daemon", "--config", "/tmp/c.toml" };
+    const opts = try parseArgs(&args);
+    try std.testing.expectEqual(CliAction.run, opts.action);
+    try std.testing.expectEqualStrings("/tmp/c.toml", opts.config_path);
+    const bad = [_][]const u8{ "fail2zig", "--config", "/tmp/c.toml", "status" };
+    try std.testing.expectError(error.UnknownFlag, parseArgs(&bad));
+}
+
+test "cli: client outcomes map onto frozen exit classes" {
+    try std.testing.expectEqual(shared.ExitClass.success, exitClassForClient(.success));
+    try std.testing.expectEqual(shared.ExitClass.rejected, exitClassForClient(.daemon_error));
+    try std.testing.expectEqual(shared.ExitClass.usage, exitClassForClient(.client_error));
+    try std.testing.expectEqual(shared.ExitClass.unavailable, exitClassForClient(.connection_failed));
+    try std.testing.expectEqual(shared.ExitClass.partial, exitClassForClient(.partial_effect));
+    try std.testing.expectEqual(shared.ExitClass.uncertain, exitClassForClient(.uncertain_effect));
 }
 
 test "cli: default action is run" {

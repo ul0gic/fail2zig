@@ -105,12 +105,8 @@ pub const FileSource = struct {
     read_prefix: *const fn (std.fs.File, u8) anyerror![32]u8 = prefix,
 
     /// Native framing owns no helper/context. The caller binds all semantic
-    /// processing options in configuration_hash; this adds the framing format,
-    /// encoding and byte cap. A restored stream cannot silently change them.
-    pub fn setNativeFraming(self: *FileSource, encoding: native_text.Encoding, configuration_hash: [32]u8, max_bytes: usize) !void {
-        if (max_bytes < encoding.width() or max_bytes > native_text.max_record_bytes) return error.InvalidFramingLimit;
-        if (self.file != null) return error.SourceAlreadyOpened;
-        if (self.frame_callback != null) return error.FramerAlreadyBound;
+    /// Persisted framing identity: the processing generation plus encoding and byte cap.
+    pub fn framingBinding(encoding: native_text.Encoding, configuration_hash: [32]u8, max_bytes: usize) [32]u8 {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("fail2zig-native-framing-v1\x00");
         hash.update(&configuration_hash);
@@ -120,6 +116,15 @@ pub const FileSource = struct {
         hash.update(&limit);
         var binding: [32]u8 = undefined;
         hash.final(&binding);
+        return binding;
+    }
+    /// processing options in configuration_hash; this adds the framing format,
+    /// encoding and byte cap. A restored stream cannot silently change them.
+    pub fn setNativeFraming(self: *FileSource, encoding: native_text.Encoding, configuration_hash: [32]u8, max_bytes: usize) !void {
+        if (max_bytes < encoding.width() or max_bytes > native_text.max_record_bytes) return error.InvalidFramingLimit;
+        if (self.file != null) return error.SourceAlreadyOpened;
+        if (self.frame_callback != null) return error.FramerAlreadyBound;
+        const binding = framingBinding(encoding, configuration_hash, max_bytes);
         const framing: Framing = switch (encoding) {
             .utf8, .ascii, .latin1 => .bytes,
             .utf16le => .utf16le,

@@ -67,7 +67,7 @@ Only Lead edits `build.zig`, at the sub-phase close.
 root-gated files: it must run unprivileged so the firewall really is
 unusable. Scenarios (b) and (c) assert the status surface twice: the JSON from
 `GET /api/status` on the metrics port, and the rendered rows from
-`zig-out/bin/fail2zig-client --socket <path> status` (the non-root daemon
+`zig-out/bin/fail2zig --socket <path> status` (the non-root daemon
 admits its own uid as an IPC peer, QA-004). A rejected peer fails the test
 outright. They assert on the stable strings
 (`no usable backend`, `refusing to run unprotected`,

@@ -15,7 +15,7 @@ const effects = @import("native_effect.zig");
 const effect_history = @import("native_effect_history.zig");
 const application_history = @import("native_application_history.zig");
 const action_outcome = @import("native_action_outcome.zig");
-pub const latest_schema: i64 = 21;
+pub const latest_schema: i64 = 23;
 pub const max_native_detections = 16;
 const Db = opaque {};
 const Statement = opaque {};
@@ -49,7 +49,7 @@ const embedded_api: Api = blk: {
     }
     break :blk api;
 };
-pub const Error = application_history.Error || action_outcome.Error || retry.Error || consumers.Error || effects.Error || effect_history.Error || action_context.Error || error{ MaintenancePinned, StaleMaintenance, PrunedReplay, InvalidMaintenanceState, MaintenanceStorageRequired, ConsumerManifestRequired, ConsumerManifestMismatch, ConsumerManifestMissing, ConsumerManifestExists, ConsumerMigrationRequired, MissingRequiredConsumer, AmbiguousNativeDetection, AmbiguousRetryDecision, ConsumerStorageRequired, StaleConsumerCheckpoint, OpenFailed, UnsafePermissions, ForeignDatabase, UnsupportedSchema, DatabaseFailure, Busy, StorageFull, ReadOnly, StorageIo, CorruptDatabase, StorageLimit, Interrupted, AccessDenied, ReopenRequired, InvalidRecord, OccurrenceConflict, StaleCheckpoint, StaleSharedCheckpoint, InjectedFailure, OutOfMemory, ReceiptStorageRequired, InferenceStorageRequired, DetectionStorageRequired, ReceiptConflict, ReceiptRequired, ReceiptAlreadyCommitted, ReceiptLimit, RetryStorageRequired, RetryAdmissionRequired, RetryGenerationMismatch, RetryMigrationRequired, RetryCapacity, ReceiptClockReversed, HistoryResetStorageRequired, InvalidHistoryReset, StaleHistoryReset };
+pub const Error = application_history.Error || action_outcome.Error || retry.Error || consumers.Error || effects.Error || effect_history.Error || action_context.Error || error{ MaintenancePinned, StaleMaintenance, PrunedReplay, InvalidMaintenanceState, MaintenanceStorageRequired, ConsumerManifestRequired, ConsumerManifestMismatch, ConsumerManifestMissing, ConsumerManifestExists, ConsumerMigrationRequired, MissingRequiredConsumer, AmbiguousNativeDetection, AmbiguousRetryDecision, ConsumerStorageRequired, StaleConsumerCheckpoint, OpenFailed, UnsafePermissions, ForeignDatabase, UnsupportedSchema, DatabaseFailure, Busy, StorageFull, ReadOnly, StorageIo, CorruptDatabase, StorageLimit, Interrupted, AccessDenied, ReopenRequired, InvalidRecord, OccurrenceConflict, StaleCheckpoint, StaleSharedCheckpoint, InjectedFailure, OutOfMemory, ReceiptStorageRequired, InferenceStorageRequired, DetectionStorageRequired, ReceiptConflict, ReceiptRequired, ReceiptAlreadyCommitted, ReceiptLimit, RetryStorageRequired, RetryAdmissionRequired, RetryGenerationMismatch, RetryMigrationRequired, RetryCapacity, ReceiptClockReversed, HistoryResetStorageRequired, InvalidHistoryReset, StaleHistoryReset, AdminStorageRequired, MigrationStorageRequired, StaleAdminRevision, InvalidAdminRequest, AdminRequestCapacity, RetryPolicyInFlight, StalePolicyTransition, ConfigGenerationExists, ConfigGenerationMissing, MigrationRunExists, MigrationRunMissing, MigrationStepMissing, MigrationStepOpen, MigrationStepOrder, InvalidMigrationRow, InvalidMigrationState, MigrationJailUnknown };
 
 fn sqliteError(rc: c_int) Error {
     // Extended result codes retain their primary result in the low eight bits.
@@ -67,7 +67,7 @@ fn sqliteError(rc: c_int) Error {
         else => error.DatabaseFailure,
     };
 }
-pub const CommitStage = enum { before_action_target_schema_commit, after_action_target_intent, before_action_target_dispatch_commit, before_action_target_settlement_commit, before_history_reset_schema_commit, after_history_reset, before_canonical_effect_schema_commit, after_history_detail_delete, after_history_event_delete, before_escalation_schema_commit, before_application_history_schema_commit, before_cleanup_schema_commit, before_retry_lease_schema_commit, after_cleanup_mark, after_cleanup_delete, after_retry_retire, before_maintenance_schema_commit, after_source_sequence, after_replay_guard, after_record, after_checkpoint, after_shared_checkpoint, before_commit, before_receipt_commit, after_receipt_commit, after_receipt_delete, before_receipt_schema_commit, before_native_time_schema_commit, before_inference_schema_commit, before_detection_schema_commit, after_detection, before_clock_schema_commit, before_journal_detection_schema_commit, before_retry_schema_commit, after_retry_state, after_retry_decision, before_consumer_schema_commit, after_consumer_delta, before_effect_schema_commit, after_effect_owner, after_effect_intent, before_effect_dispatch_commit, before_effect_receipt_commit, before_manifest_schema_commit, before_manifest_commit, after_manifest_ready, before_consumer_input_commit };
+pub const CommitStage = enum { before_admin_schema_commit, before_migration_schema_commit, after_admin_request, after_migration_step_intent, after_migration_step_outcome, before_migration_activation_commit, before_policy_transition_commit, before_config_generation_commit, before_config_generation_publish, before_action_target_schema_commit, after_action_target_intent, before_action_target_dispatch_commit, before_action_target_settlement_commit, before_history_reset_schema_commit, after_history_reset, before_canonical_effect_schema_commit, after_history_detail_delete, after_history_event_delete, before_escalation_schema_commit, before_application_history_schema_commit, before_cleanup_schema_commit, before_retry_lease_schema_commit, after_cleanup_mark, after_cleanup_delete, after_retry_retire, before_maintenance_schema_commit, after_source_sequence, after_replay_guard, after_record, after_checkpoint, after_shared_checkpoint, before_commit, before_receipt_commit, after_receipt_commit, after_receipt_delete, before_receipt_schema_commit, before_native_time_schema_commit, before_inference_schema_commit, before_detection_schema_commit, after_detection, before_clock_schema_commit, before_journal_detection_schema_commit, before_retry_schema_commit, after_retry_state, after_retry_decision, before_consumer_schema_commit, after_consumer_delta, before_effect_schema_commit, after_effect_owner, after_effect_intent, before_effect_dispatch_commit, before_effect_receipt_commit, before_manifest_schema_commit, before_manifest_commit, after_manifest_ready, before_consumer_input_commit };
 /// Existing write admission limits also govern restored values. The SQLite row
 /// ceiling allows the largest checkpoint plus its key and record encoding.
 /// These are value/row bounds, not a process-wide memory or disk quota.
@@ -121,6 +121,8 @@ pub const Record = struct {
     native_detections: ?[]const detection.Outcome = null,
     consumer_manifest: ?consumers.Manifest = null,
     native_retry: ?retry.Admission = null,
+    /// Administrative pause: the detection is recorded but no retry state advances.
+    retry_suspended: bool = false,
     /// Borrowed, validated observability input for this record. Retry counting
     /// and deduplication never depend on these bytes.
     retry_evidence: retry.Evidence = .{},
@@ -162,6 +164,7 @@ pub const Store = struct {
     startup_operation: bool = false,
     /// Tests inject an ordinary transaction error; no crash or external action is required.
     fail_at: ?CommitStage = null,
+    rekeyed_owners: bool = false,
     schema_version: i64 = 2,
     receipt_limit: ?usize = null,
     runtime_limits: bool = false,
@@ -282,16 +285,24 @@ pub const Store = struct {
     }
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) Error!Store {
-        return openImpl(allocator, path, false);
+        return openImpl(allocator, path, .plain);
     }
 
     /// Runtime reopen must cross the WAL barrier before its initial schema
     /// transaction too. The borrowed path must outlive this Store.
     pub fn openRuntime(allocator: std.mem.Allocator, path: []const u8) Error!Store {
-        return openImpl(allocator, path, true);
+        return openImpl(allocator, path, .runtime);
+    }
+    /// Second connection for readers beside the running daemon: opens SQLITE_OPEN_READONLY and
+    /// performs no schema seed or header write, so it never advances `PRAGMA data_version`
+    /// under the worker's multi-turn maintenance validation.
+    pub fn openReadOnly(allocator: std.mem.Allocator, path: []const u8) Error!Store {
+        return openImpl(allocator, path, .readonly);
     }
 
-    fn openImpl(allocator: std.mem.Allocator, path: []const u8, runtime: bool) Error!Store {
+    const OpenMode = enum { plain, runtime, readonly };
+    fn openImpl(allocator: std.mem.Allocator, path: []const u8, open_mode: OpenMode) Error!Store {
+        const runtime = open_mode == .runtime;
         if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return error.OpenFailed;
         var parent = std.fs.cwd().openDir(std.fs.path.dirname(path) orelse ".", .{ .no_follow = true }) catch return error.OpenFailed;
         defer parent.close();
@@ -302,7 +313,7 @@ pub const Store = struct {
         // existing files without opening them; create only absent files, before
         // SQLite owns any locks. Never manually close an existing database FD.
         const stat = std.posix.fstatat(std.posix.AT.FDCWD, path, std.posix.AT.SYMLINK_NOFOLLOW) catch |failure| blk: {
-            if (failure != error.FileNotFound) return error.OpenFailed;
+            if (failure != error.FileNotFound or open_mode == .readonly) return error.OpenFailed;
             const created = std.posix.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, 0o600) catch return error.OpenFailed;
             defer std.posix.close(created);
             break :blk std.posix.fstat(created) catch return error.OpenFailed;
@@ -313,7 +324,8 @@ pub const Store = struct {
         const filename = allocator.dupeZ(u8, path) catch return error.OutOfMemory;
         defer allocator.free(filename);
         var db: ?*Db = null;
-        const opened = api.open(filename, &db, 2 | 0x10000 | 0x01000000, null);
+        const access_flags: c_int = if (open_mode == .readonly) 1 else 2; // SQLITE_OPEN_READONLY / READWRITE
+        const opened = api.open(filename, &db, access_flags | 0x10000 | 0x01000000, null);
         if (opened != 0 or db == null) {
             if (db) |handle| _ = api.close(handle);
             return if (opened != 0) sqliteError(opened) else error.OpenFailed;
@@ -353,6 +365,11 @@ pub const Store = struct {
         } else if (application != 0x46325a31) return error.ForeignDatabase;
         if (schema < 0 or schema > latest_schema) return error.UnsupportedSchema;
         self.schema_version = @max(schema, 2);
+        if (open_mode == .readonly) {
+            if (application == 0) return error.ForeignDatabase;
+            try self.exec("PRAGMA foreign_keys=ON;");
+            return self;
+        }
         // Only an admitted application/schema may change database limits or WAL.
         if (runtime) {
             try self.configureRuntimeLimits();
@@ -1088,6 +1105,1078 @@ pub const Store = struct {
         try self.commitTransaction();
         self.schema_version = @max(schema, 21);
     }
+    /// Schema 22 admin state. Every id/digest is an exact 32-byte blob and
+    /// every boolean/enum/timestamp is CHECKed so a foreign or truncated writer cannot smuggle
+    /// an ambiguous row into administration authority. `admin_revision` is the single monotonic
+    /// mutation counter that fences replayed requests after their `admin_requests` row is reclaimed.
+    pub fn enableAdminState(self: *Store) Error!void {
+        try self.beginWrite();
+        errdefer self.rollback();
+        const schema = try self.integer("PRAGMA user_version;");
+        if (schema < 21 or schema > latest_schema) return error.UnsupportedSchema;
+        if (schema == 21) try self.exec(
+            \\CREATE TABLE config_generations(generation BLOB NOT NULL PRIMARY KEY CHECK(typeof(generation)='blob' AND length(generation)=32),config_digest BLOB NOT NULL CHECK(typeof(config_digest)='blob' AND length(config_digest)=32),config_path TEXT NOT NULL CHECK(typeof(config_path)='text' AND length(config_path) BETWEEN 1 AND 4096),committed_us INTEGER NOT NULL CHECK(typeof(committed_us)='integer' AND committed_us>=0),published INTEGER NOT NULL CHECK(published IN(0,1)),mutation_revision INTEGER NOT NULL CHECK(typeof(mutation_revision)='integer' AND mutation_revision>=0)) WITHOUT ROWID;
+            \\CREATE TABLE config_generation_jails(generation BLOB NOT NULL REFERENCES config_generations(generation) ON DELETE CASCADE,jail TEXT NOT NULL CHECK(typeof(jail)='text' AND length(jail) BETWEEN 1 AND 64),digest BLOB NOT NULL CHECK(typeof(digest)='blob' AND length(digest)=32),allowlist_snapshot BLOB NOT NULL CHECK(typeof(allowlist_snapshot)='blob' AND length(allowlist_snapshot)<=65536),PRIMARY KEY(generation,jail)) WITHOUT ROWID;
+            \\CREATE TABLE jail_admin_states(jail TEXT NOT NULL PRIMARY KEY CHECK(typeof(jail)='text' AND length(jail) BETWEEN 1 AND 64),enabled INTEGER NOT NULL CHECK(enabled IN(0,1)),paused INTEGER NOT NULL CHECK(paused IN(0,1)),generation BLOB NOT NULL REFERENCES config_generations(generation),changed_us INTEGER NOT NULL CHECK(typeof(changed_us)='integer' AND changed_us>=0),request_id BLOB NOT NULL CHECK(typeof(request_id)='blob' AND length(request_id)=32)) WITHOUT ROWID;
+            \\CREATE TABLE admin_requests(request_id BLOB NOT NULL PRIMARY KEY CHECK(typeof(request_id)='blob' AND length(request_id)=32),kind INTEGER NOT NULL CHECK(kind BETWEEN 1 AND 10),subject BLOB NOT NULL CHECK(typeof(subject)='blob' AND length(subject)<=4096),outcome INTEGER NOT NULL CHECK(outcome BETWEEN 1 AND 5),generation BLOB NOT NULL CHECK(typeof(generation)='blob' AND length(generation)=32),mutation_revision INTEGER NOT NULL CHECK(typeof(mutation_revision)='integer' AND mutation_revision>=0),committed_us INTEGER NOT NULL CHECK(typeof(committed_us)='integer' AND committed_us>=0),detail BLOB NOT NULL CHECK(typeof(detail)='blob' AND length(detail)<=4096)) WITHOUT ROWID;
+            \\CREATE INDEX admin_requests_by_revision ON admin_requests(mutation_revision);
+            \\CREATE TABLE admin_revision(id INTEGER NOT NULL PRIMARY KEY CHECK(id=1),mutation_revision INTEGER NOT NULL CHECK(typeof(mutation_revision)='integer' AND mutation_revision>=0));
+            \\INSERT INTO admin_revision(id,mutation_revision) VALUES(1,0);
+            \\PRAGMA user_version=22;
+        );
+        try self.fault(.before_admin_schema_commit);
+        try self.commitTransaction();
+        self.schema_version = @max(schema, 22);
+    }
+
+    /// Schema 23 migration state. Staged owners/history live only here until
+    /// `activate_owners` copies them under one write transaction; no runtime admission,
+    /// reconciliation or history reader consults these tables.
+    pub fn enableMigrationState(self: *Store) Error!void {
+        try self.beginWrite();
+        errdefer self.rollback();
+        const schema = try self.integer("PRAGMA user_version;");
+        if (schema < 22 or schema > latest_schema) return error.UnsupportedSchema;
+        if (schema == 22) try self.exec(
+            \\CREATE TABLE migration_runs(run_id BLOB NOT NULL PRIMARY KEY CHECK(typeof(run_id)='blob' AND length(run_id)=32),host_id BLOB NOT NULL CHECK(typeof(host_id)='blob' AND length(host_id)=32),source_db_fp BLOB NOT NULL CHECK(typeof(source_db_fp)='blob' AND length(source_db_fp)=32),source_cfg_fp BLOB NOT NULL CHECK(typeof(source_cfg_fp)='blob' AND length(source_cfg_fp)=32),plan_fp BLOB NOT NULL CHECK(typeof(plan_fp)='blob' AND length(plan_fp)=32),recovery_point TEXT NOT NULL CHECK(typeof(recovery_point)='text' AND length(recovery_point)<=4096),generation BLOB NOT NULL CHECK(typeof(generation)='blob' AND length(generation)=32),state INTEGER NOT NULL CHECK(state BETWEEN 1 AND 9),created_us INTEGER NOT NULL CHECK(typeof(created_us)='integer' AND created_us>=0),updated_us INTEGER NOT NULL CHECK(typeof(updated_us)='integer' AND updated_us>=created_us)) WITHOUT ROWID;
+            \\CREATE TABLE migration_steps(run_id BLOB NOT NULL REFERENCES migration_runs(run_id),seq INTEGER NOT NULL CHECK(typeof(seq)='integer' AND seq>=1),step INTEGER NOT NULL CHECK(step BETWEEN 1 AND 9),intent BLOB NOT NULL CHECK(typeof(intent)='blob' AND length(intent)<=4096),outcome INTEGER NOT NULL CHECK(outcome BETWEEN 0 AND 7),detail BLOB NOT NULL CHECK(typeof(detail)='blob' AND length(detail)<=4096),started_us INTEGER NOT NULL CHECK(typeof(started_us)='integer' AND started_us>=0),finished_us INTEGER CHECK(finished_us IS NULL OR (typeof(finished_us)='integer' AND finished_us>=started_us)),PRIMARY KEY(run_id,seq),CHECK((outcome=0 AND finished_us IS NULL) OR (outcome>0 AND finished_us IS NOT NULL))) WITHOUT ROWID;
+            \\CREATE TABLE migration_deltas(run_id BLOB NOT NULL REFERENCES migration_runs(run_id),seq INTEGER NOT NULL CHECK(typeof(seq)='integer' AND seq>=1),kind INTEGER NOT NULL CHECK(kind BETWEEN 1 AND 3),scope BLOB NOT NULL CHECK(typeof(scope)='blob' AND length(scope)=92),jail TEXT NOT NULL CHECK(typeof(jail)='text' AND length(jail) BETWEEN 1 AND 64),lease_kind INTEGER NOT NULL CHECK(lease_kind BETWEEN 0 AND 2),deadline_us INTEGER CHECK(deadline_us IS NULL OR typeof(deadline_us)='integer'),carry_back INTEGER NOT NULL CHECK(carry_back BETWEEN 1 AND 3),applied INTEGER NOT NULL CHECK(applied IN(0,1)),recorded_us INTEGER NOT NULL CHECK(typeof(recorded_us)='integer' AND recorded_us>=0),PRIMARY KEY(run_id,seq),CHECK((lease_kind=1 AND deadline_us IS NOT NULL) OR (lease_kind!=1 AND deadline_us IS NULL))) WITHOUT ROWID;
+            \\CREATE TABLE migration_staged_owners(run_id BLOB NOT NULL REFERENCES migration_runs(run_id),seq INTEGER NOT NULL CHECK(typeof(seq)='integer' AND seq>=1),jail TEXT NOT NULL CHECK(typeof(jail)='text' AND length(jail) BETWEEN 1 AND 64),scope BLOB NOT NULL CHECK(typeof(scope)='blob' AND length(scope)=92),lease_kind INTEGER NOT NULL CHECK(lease_kind BETWEEN 1 AND 2),deadline_us INTEGER CHECK(deadline_us IS NULL OR typeof(deadline_us)='integer'),source_event_us INTEGER NOT NULL CHECK(typeof(source_event_us)='integer'),source_row INTEGER NOT NULL CHECK(typeof(source_row)='integer' AND source_row>=0),PRIMARY KEY(run_id,seq),CHECK((lease_kind=1 AND deadline_us IS NOT NULL) OR (lease_kind=2 AND deadline_us IS NULL))) WITHOUT ROWID;
+            \\CREATE TABLE migration_staged_history(run_id BLOB NOT NULL REFERENCES migration_runs(run_id),seq INTEGER NOT NULL CHECK(typeof(seq)='integer' AND seq>=1),jail TEXT NOT NULL CHECK(typeof(jail)='text' AND length(jail) BETWEEN 1 AND 64),scope BLOB NOT NULL CHECK(typeof(scope)='blob' AND length(scope)=92),event_kind INTEGER NOT NULL CHECK(event_kind BETWEEN 1 AND 3),event_us INTEGER NOT NULL CHECK(typeof(event_us)='integer'),bancount INTEGER NOT NULL CHECK(typeof(bancount)='integer' AND bancount>=0),source_row INTEGER NOT NULL CHECK(typeof(source_row)='integer' AND source_row>=0),PRIMARY KEY(run_id,seq)) WITHOUT ROWID;
+            \\PRAGMA user_version=23;
+        );
+        try self.fault(.before_migration_schema_commit);
+        try self.commitTransaction();
+        self.schema_version = @max(schema, 23);
+    }
+
+    /// Current durable mutation revision (schema 22). Every applied administration or reload
+    /// mutation bumps it inside its own transaction; requests present their expected value.
+    /// Replace a jail's retry policy bytes under its unchanged plan generation.
+    /// The saved policy must equal `expected` and no receipt may be in flight for the jail, so
+    /// a concurrent record cannot commit under a policy the worker no longer holds. Existing
+    /// retry counts, leases, deadlines and history are untouched; only future decisions change.
+    /// Saved file cursors carry the framing binding derived from the generation; a re-key
+    /// rewrites that binding in place so restored streams keep their exact offsets.
+    pub const CursorRebinding = struct { old: [32]u8, new: [32]u8 };
+    pub const PolicyTransition = struct { jail: []const u8, generation: [32]u8, next_generation: [32]u8, expected: retry.Policy, next: retry.Policy, cursor_rebinding: ?CursorRebinding = null };
+    pub fn transitionRetryPolicy(self: *Store, jail: []const u8, generation: [32]u8, expected: retry.Policy, next: retry.Policy) Error!void {
+        try self.beginWrite();
+        errdefer self.rollback();
+        if (self.schema_version < 22) return error.AdminStorageRequired;
+        try self.transitionJailGenerationTx(.{ .jail = jail, .generation = generation, .next_generation = generation, .expected = expected, .next = next }, std.time.microTimestamp());
+        try self.bumpAdminRevisionTx();
+        try self.fault(.before_policy_transition_commit);
+        try self.commitTransaction();
+    }
+    /// The source processor hashes the retry policy into the jail generation, so a policy
+    /// change moves every generation-keyed row of that jail together: policies, source
+    /// maintenance/replay guards, custom consumer rows and effect owners. Retired retry rows
+    /// keep the generation they were retired under. Nothing moves while a receipt is in flight.
+    fn transitionJailGenerationTx(self: *Store, change: PolicyTransition, now_us: i64) Error!void {
+        const jail = change.jail;
+        if (jail.len == 0 or jail.len > 64 or std.mem.indexOfScalar(u8, jail, 0) != null) return error.InvalidRecord;
+        const encoded = try change.next.encode();
+        const escalation = try change.next.escalation.encode();
+        const saved = try self.readRetryPolicy(jail) orelse return error.RetryAdmissionRequired;
+        if (!std.mem.eql(u8, &saved.generation, &change.generation)) return error.RetryGenerationMismatch;
+        if (!try retryPoliciesEqual(saved.policy, change.expected)) return error.StalePolicyTransition;
+        var pending = try self.statement("SELECT 1 FROM pending_receipts WHERE jail=?1 LIMIT 1;");
+        defer pending.deinit();
+        try pending.text(1, jail);
+        if (try pending.row()) return error.RetryPolicyInFlight;
+        {
+            var update = try self.statement("UPDATE retry_policies SET generation=?4,policy=?2 WHERE jail=?1 AND generation=?3;");
+            defer update.deinit();
+            try update.text(1, jail);
+            try update.blob(2, &encoded);
+            try update.blob(3, &change.generation);
+            try update.blob(4, &change.next_generation);
+            try update.done();
+            if (self.api.changes(self.db) != 1) return error.StalePolicyTransition;
+        }
+        {
+            var update = try self.statement("UPDATE retry_escalation_policies SET generation=?4,policy=?2 WHERE jail=?1 AND generation=?3;");
+            defer update.deinit();
+            try update.text(1, jail);
+            try update.blob(2, &escalation);
+            try update.blob(3, &change.generation);
+            try update.blob(4, &change.next_generation);
+            try update.done();
+            if (self.api.changes(self.db) != 1) return error.StalePolicyTransition;
+        }
+        if (std.mem.eql(u8, &change.generation, &change.next_generation)) return;
+        // replay_guards references source_maintenance by generation; both move in this
+        // transaction, so the check is deferred to commit.
+        try self.exec("PRAGMA defer_foreign_keys=ON;");
+        const rekeyed = [_][:0]const u8{
+            "UPDATE records SET source_generation=?3 WHERE jail=?1 AND source_generation=?2;",
+            // Durable session checkpoints embed the generation after their magic/version header
+            // (file 'F2NT' at byte 8, journal 'F2JC' at byte 6); the counters/cursor bytes stay.
+            "UPDATE checkpoints SET payload=substr(payload,1,8)||?3||substr(payload,41) WHERE jail=?1 AND substr(payload,1,4)=CAST('F2NT' AS BLOB) AND substr(payload,9,32)=?2;",
+            "UPDATE checkpoints SET payload=substr(payload,1,6)||?3||substr(payload,39) WHERE jail=?1 AND substr(payload,1,4)=CAST('F2JC' AS BLOB) AND substr(payload,7,32)=?2;",
+            "UPDATE source_maintenance SET generation=?3 WHERE jail=?1 AND generation=?2;",
+            "UPDATE replay_guards SET generation=?3 WHERE jail=?1 AND generation=?2;",
+            "UPDATE consumer_checkpoints SET generation=?3 WHERE jail=?1 AND generation=?2;",
+            "UPDATE consumer_manifests SET generation=?3 WHERE jail=?1 AND generation=?2;",
+            "UPDATE consumer_requirements SET generation=?3 WHERE jail=?1 AND generation=?2;",
+        };
+        for (rekeyed) |sql| {
+            var update = try self.statement(sql);
+            defer update.deinit();
+            try update.text(1, jail);
+            try update.blob(2, &change.generation);
+            try update.blob(3, &change.next_generation);
+            try update.done();
+        }
+        if (change.cursor_rebinding) |rebinding| {
+            var old_fragment: [256]u8 = undefined;
+            var new_fragment: [256]u8 = undefined;
+            const old_text = try cursorBindingFragment(&old_fragment, rebinding.old);
+            const new_text = try cursorBindingFragment(&new_fragment, rebinding.new);
+            var update = try self.statement("UPDATE source_cursors SET cursor=CAST(replace(CAST(cursor AS TEXT),?2,?3) AS BLOB) WHERE jail=?1;");
+            defer update.deinit();
+            try update.text(1, jail);
+            try update.text(2, old_text);
+            try update.text(3, new_text);
+            try update.done();
+        }
+        // Owners keep their decision, deadline and revision history: each moves through the
+        // retain transition, which records a new owner revision and replacement intent.
+        const canonical_scope = @import("../firewall/scope.zig");
+        const Held = struct { key: [32]u8, revision: u64, scope: [canonical_scope.encoded_bytes]u8 };
+        var held = std.ArrayListUnmanaged(Held){};
+        defer held.deinit(self.allocator);
+        {
+            var owners = try self.statement("SELECT o.scope_key,o.revision,n.canonical_scope FROM effect_owners o JOIN native_effects n USING(scope_key) WHERE o.jail=?1 AND o.generation=?2 ORDER BY o.scope_key;");
+            defer owners.deinit();
+            try owners.text(1, jail);
+            try owners.blob(2, &change.generation);
+            while (try owners.row()) {
+                if (held.items.len == effects.max_effects) return error.EffectCapacity;
+                const owner_revision = try owners.signed(1);
+                if (owner_revision <= 0) return error.InvalidEffect;
+                try held.append(self.allocator, .{ .key = try effectBlob(&owners, 0, 32), .revision = @intCast(owner_revision), .scope = try effectBlob(&owners, 2, canonical_scope.encoded_bytes) });
+            }
+        }
+        for (held.items) |owner| {
+            const scope = canonical_scope.Scope.decode(&owner.scope) catch return error.InvalidEffect;
+            const transition_id = effects.hashParts("fail2zig-generation-rekey-v1", &.{ &change.next_generation, &owner.key });
+            _ = try self.transitionOwnerTx(.{ .scope = scope, .jail = jail, .current_generation = change.generation, .next_generation = change.next_generation, .expected_owner_revision = owner.revision, .transition_id = transition_id, .mode = .retain, .occurred_us = now_us }, now_us);
+        }
+        if (held.items.len != 0) self.rekeyed_owners = true;
+        var stale = try self.statement("SELECT 1 FROM effect_owners WHERE jail=?1 AND generation!=?2 LIMIT 1;");
+        defer stale.deinit();
+        try stale.text(1, jail);
+        try stale.blob(2, &change.next_generation);
+        if (try stale.row()) return error.StalePolicyTransition;
+    }
+
+    /// One write transaction for a live reload: every changed jail policy moves
+    /// together with the unpublished generation row, or nothing does.
+    pub fn commitReloadGeneration(self: *Store, transitions: []const PolicyTransition, record: ConfigGenerationRecord, jails: []const ConfigGenerationJail, clock: effects.Clock) Error!void {
+        if (transitions.len > 64) return error.InvalidAdminRequest;
+        try self.beginWrite();
+        errdefer self.rollback();
+        if (self.schema_version < 22) return error.AdminStorageRequired;
+        self.rekeyed_owners = false;
+        // Owner transitions are effect mutations: they take and advance the effect clock so
+        // the replacement intents decode against the committed floor.
+        const now = try self.effectClock(clock);
+        for (transitions) |change| try self.transitionJailGenerationTx(change, now);
+        if (self.rekeyed_owners) _ = try self.commitEffectClock(clock);
+        try self.bumpAdminRevisionTx();
+        const mutation_revision = try self.integer("SELECT mutation_revision FROM admin_revision WHERE id=1;");
+        var pinned = record;
+        pinned.mutation_revision = @intCast(mutation_revision);
+        // The re-key and its generation row publish together: after a crash the committed
+        // generation is the durable truth, never a half-adopted one.
+        pinned.published = true;
+        try self.exec("UPDATE config_generations SET published=0 WHERE published=1;");
+        try self.recordConfigGenerationTx(pinned, jails);
+        try self.fault(.before_config_generation_commit);
+        try self.commitTransaction();
+        if (self.rekeyed_owners) self.effect_publication_epoch +|= 1;
+        self.rekeyed_owners = false;
+    }
+
+    fn cursorBindingFragment(buffer: []u8, binding: [32]u8) Error![]const u8 {
+        var stream = std.io.fixedBufferStream(buffer);
+        const w = stream.writer();
+        w.writeAll("\"codec_configuration_hash\":[") catch return error.InvalidAdminRequest;
+        for (binding, 0..) |byte, i| {
+            if (i != 0) w.writeByte(',') catch return error.InvalidAdminRequest;
+            w.print("{d}", .{byte}) catch return error.InvalidAdminRequest;
+        }
+        w.writeByte(']') catch return error.InvalidAdminRequest;
+        return stream.getWritten();
+    }
+    fn bumpAdminRevisionTx(self: *Store) Error!void {
+        const current = try self.integer("SELECT mutation_revision FROM admin_revision WHERE id=1;");
+        if (current < 0 or current == std.math.maxInt(i64)) return error.DatabaseFailure;
+        var update = try self.statement("UPDATE admin_revision SET mutation_revision=?1 WHERE id=1;");
+        defer update.deinit();
+        try update.int(1, current + 1);
+        try update.done();
+        if (self.api.changes(self.db) != 1) return error.DatabaseFailure;
+    }
+
+    pub const ConfigGenerationRecord = struct {
+        generation: [32]u8,
+        config_digest: [32]u8,
+        config_path: []const u8,
+        committed_us: i64,
+        published: bool,
+        mutation_revision: u64,
+    };
+    pub const ConfigGenerationJail = struct {
+        jail: []const u8,
+        digest: [32]u8,
+        allowlist_snapshot: []const u8,
+    };
+
+    /// Persist a proposed configuration generation before it is published in memory.
+    /// A reload generation commits published inside its re-key transaction; `published` in the
+    /// record is honoured only for rows recorded outside a reload.
+    pub fn recordConfigGeneration(self: *Store, record: ConfigGenerationRecord, jails: []const ConfigGenerationJail) Error!void {
+        try self.beginWrite();
+        errdefer self.rollback();
+        if (self.schema_version < 22) return error.AdminStorageRequired;
+        try self.recordConfigGenerationTx(record, jails);
+        try self.fault(.before_config_generation_commit);
+        try self.commitTransaction();
+    }
+    fn recordConfigGenerationTx(self: *Store, record: ConfigGenerationRecord, jails: []const ConfigGenerationJail) Error!void {
+        if (record.config_path.len == 0 or record.config_path.len > 4096 or record.committed_us < 0 or record.mutation_revision > std.math.maxInt(i64) or jails.len > 64) return error.InvalidAdminRequest;
+        for (jails) |jail| if (jail.jail.len == 0 or jail.jail.len > 64 or jail.allowlist_snapshot.len > 65536) return error.InvalidAdminRequest;
+        {
+            var exists = try self.statement("SELECT 1 FROM config_generations WHERE generation=?1;");
+            defer exists.deinit();
+            try exists.blob(1, &record.generation);
+            if (try exists.row()) return error.ConfigGenerationExists;
+        }
+        {
+            var insert = try self.statement("INSERT INTO config_generations VALUES(?1,?2,?3,?4,?5,?6);");
+            defer insert.deinit();
+            try insert.blob(1, &record.generation);
+            try insert.blob(2, &record.config_digest);
+            try insert.text(3, record.config_path);
+            try insert.int(4, record.committed_us);
+            try insert.int(5, @intFromBool(record.published));
+            try insert.int(6, @intCast(record.mutation_revision));
+            try insert.done();
+        }
+        for (jails) |jail| {
+            var insert = try self.statement("INSERT INTO config_generation_jails VALUES(?1,?2,?3,?4);");
+            defer insert.deinit();
+            try insert.blob(1, &record.generation);
+            try insert.text(2, jail.jail);
+            try insert.blob(3, &jail.digest);
+            try insert.blob(4, jail.allowlist_snapshot);
+            try insert.done();
+        }
+    }
+
+    /// Mark a committed generation as the published one; every other row becomes unpublished.
+    pub fn publishConfigGeneration(self: *Store, generation: [32]u8) Error!void {
+        try self.beginWrite();
+        errdefer self.rollback();
+        if (self.schema_version < 22) return error.AdminStorageRequired;
+        try self.exec("UPDATE config_generations SET published=0 WHERE published=1;");
+        var update = try self.statement("UPDATE config_generations SET published=1 WHERE generation=?1;");
+        defer update.deinit();
+        try update.blob(1, &generation);
+        try update.done();
+        if (self.api.changes(self.db) != 1) return error.ConfigGenerationMissing;
+        try self.fault(.before_config_generation_publish);
+        try self.commitTransaction();
+    }
+
+    /// Remove an unpublished generation whose inputs no longer match (crash between commit
+    /// and publish); a published generation is never deleted here.
+    pub fn discardUnpublishedConfigGeneration(self: *Store, generation: [32]u8) Error!void {
+        try self.beginWrite();
+        errdefer self.rollback();
+        if (self.schema_version < 22) return error.AdminStorageRequired;
+        var delete = try self.statement("DELETE FROM config_generations WHERE generation=?1 AND published=0;");
+        defer delete.deinit();
+        try delete.blob(1, &generation);
+        try delete.done();
+        try self.commitTransaction();
+    }
+
+    pub const ConfigGenerationHead = struct { generation: [32]u8, config_digest: [32]u8, published: bool, committed_us: i64 };
+    /// Newest committed generation row (published or not), or null before the first reload.
+    pub fn latestConfigGeneration(self: *Store) Error!?ConfigGenerationHead {
+        if (self.schema_version < 22) return error.AdminStorageRequired;
+        var row = try self.statement("SELECT generation,config_digest,published,committed_us FROM config_generations ORDER BY committed_us DESC, generation DESC LIMIT 1;");
+        defer row.deinit();
+        if (!try row.row()) return null;
+        return .{ .generation = try effectBlob(&row, 0, 32), .config_digest = try effectBlob(&row, 1, 32), .published = (try row.signed(2)) == 1, .committed_us = try row.signed(3) };
+    }
+
+    /// Values 9-10 are the migration executor kinds; the schema CHECK admits both.
+    pub const AdminKind = enum(u8) { group_enable = 1, group_disable, group_pause, group_resume, setting_batch, ban, unban, history_reset, migration_activate, migration_rollback };
+    pub const AdminOutcome = enum(u8) { applied = 1, rejected, absent, partial, uncertain };
+    pub const admin_request_retention = 4096;
+    pub const admin_request_max_age_us: i64 = 30 * 24 * 60 * 60 * 1_000_000;
+    pub const AdminRequestRecord = struct {
+        request_id: [32]u8,
+        kind: AdminKind,
+        subject: []const u8,
+        outcome: AdminOutcome,
+        generation: [32]u8,
+        committed_us: i64,
+        detail: []const u8,
+    };
+    pub const AdminReplay = struct { kind: AdminKind, outcome: AdminOutcome, mutation_revision: u64 };
+    pub const AdminAdmission = union(enum) { fresh, replayed: AdminReplay };
+    pub const JailAdminState = struct {
+        jail: []const u8,
+        enabled: bool,
+        paused: bool,
+        generation: [32]u8,
+        changed_us: i64,
+        request_id: [32]u8,
+    };
+
+    /// A request whose row is still retained returns its recorded outcome instead of executing
+    /// again; a fresh request must present the current mutation revision so a request whose row
+    /// was reclaimed can never execute against newer state.
+    pub fn admitAdminRequest(self: *Store, request_id: [32]u8, expected_mutation_revision: u64) Error!AdminAdmission {
+        if (std.mem.allEqual(u8, &request_id, 0)) return error.InvalidAdminRequest;
+        try self.beginRead();
+        errdefer self.rollback();
+        if (self.schema_version < 22) return error.AdminStorageRequired;
+        var row = try self.statement("SELECT kind,outcome,mutation_revision FROM admin_requests WHERE request_id=?1;");
+        defer row.deinit();
+        try row.blob(1, &request_id);
+        if (try row.row()) {
+            const kind = std.meta.intToEnum(AdminKind, try row.signed(0)) catch return error.DatabaseFailure;
+            const outcome = std.meta.intToEnum(AdminOutcome, try row.signed(1)) catch return error.DatabaseFailure;
+            const recorded_revision = try row.signed(2);
+            try self.commitTransaction();
+            return .{ .replayed = .{ .kind = kind, .outcome = outcome, .mutation_revision = @intCast(recorded_revision) } };
+        }
+        const current = try self.integer("SELECT mutation_revision FROM admin_revision WHERE id=1;");
+        try self.commitTransaction();
+        if (current < 0 or @as(u64, @intCast(current)) != expected_mutation_revision) return error.StaleAdminRevision;
+        return .fresh;
+    }
+
+    /// Record the outcome of an executed request, bump the mutation revision when it applied,
+    /// optionally persist the jail's admin state in the same transaction, and reclaim retention.
+    pub fn finishAdminRequest(self: *Store, record: AdminRequestRecord, state: ?JailAdminState) Error!u64 {
+        if (std.mem.allEqual(u8, &record.request_id, 0) or record.subject.len > 4096 or record.detail.len > 4096 or record.committed_us < 0) return error.InvalidAdminRequest;
+        if (state) |value| if (value.jail.len == 0 or value.jail.len > 64 or value.changed_us < 0) return error.InvalidAdminRequest;
+        try self.beginWrite();
+        errdefer self.rollback();
+        if (self.schema_version < 22) return error.AdminStorageRequired;
+        if (record.outcome != .rejected) try self.bumpAdminRevisionTx();
+        const mutation_revision = try self.integer("SELECT mutation_revision FROM admin_revision WHERE id=1;");
+        if (mutation_revision < 0) return error.DatabaseFailure;
+        {
+            var insert = try self.statement("INSERT INTO admin_requests VALUES(?1,?2,?3,?4,?5,?6,?7,?8);");
+            defer insert.deinit();
+            try insert.blob(1, &record.request_id);
+            try insert.int(2, @intFromEnum(record.kind));
+            try insert.blob(3, record.subject);
+            try insert.int(4, @intFromEnum(record.outcome));
+            try insert.blob(5, &record.generation);
+            try insert.int(6, mutation_revision);
+            try insert.int(7, record.committed_us);
+            try insert.blob(8, record.detail);
+            try insert.done();
+        }
+        if (state) |value| {
+            var upsert = try self.statement("INSERT INTO jail_admin_states VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(jail) DO UPDATE SET enabled=excluded.enabled,paused=excluded.paused,generation=excluded.generation,changed_us=excluded.changed_us,request_id=excluded.request_id;");
+            defer upsert.deinit();
+            try upsert.text(1, value.jail);
+            try upsert.int(2, @intFromBool(value.enabled));
+            try upsert.int(3, @intFromBool(value.paused));
+            try upsert.blob(4, &value.generation);
+            try upsert.int(5, value.changed_us);
+            try upsert.blob(6, &value.request_id);
+            try upsert.done();
+        }
+        {
+            var age = try self.statement("DELETE FROM admin_requests WHERE committed_us<?1;");
+            defer age.deinit();
+            try age.int(1, record.committed_us -| admin_request_max_age_us);
+            try age.done();
+        }
+        {
+            var overflow = try self.statement("DELETE FROM admin_requests WHERE request_id IN (SELECT request_id FROM admin_requests ORDER BY mutation_revision ASC, committed_us ASC LIMIT max(0,(SELECT count(*) FROM admin_requests)-?1));");
+            defer overflow.deinit();
+            try overflow.int(1, admin_request_retention);
+            try overflow.done();
+        }
+        try self.fault(.after_admin_request);
+        try self.commitTransaction();
+        return @intCast(mutation_revision);
+    }
+
+    pub fn jailAdminState(self: *Store, jail: []const u8, output: *JailAdminState) Error!bool {
+        if (self.schema_version < 22) return error.AdminStorageRequired;
+        var row = try self.statement("SELECT enabled,paused,generation,changed_us,request_id FROM jail_admin_states WHERE jail=?1;");
+        defer row.deinit();
+        try row.text(1, jail);
+        if (!try row.row()) return false;
+        output.* = .{ .jail = jail, .enabled = (try row.signed(0)) == 1, .paused = (try row.signed(1)) == 1, .generation = try effectBlob(&row, 2, 32), .changed_us = try row.signed(3), .request_id = try effectBlob(&row, 4, 32) };
+        return true;
+    }
+
+    /// Current owner row for one physical effect and jail, or null when the jail holds none.
+    pub fn currentOwner(self: *Store, key: effects.Hash, jail: []const u8) Error!?effects.Owner {
+        try self.beginRead();
+        errdefer self.rollback();
+        var row = try self.statement("SELECT generation,decision_id,revision,lease_kind,deadline_us,decided_us FROM effect_owners WHERE scope_key=?1 AND jail=?2;");
+        defer row.deinit();
+        try row.blob(1, &key);
+        try row.text(2, jail);
+        if (!try row.row()) {
+            try self.commitTransaction();
+            return null;
+        }
+        const effect_revision = try row.signed(2);
+        if (effect_revision <= 0) return error.InvalidEffect;
+        const owner = effects.Owner{ .jail = detection.Name.init(jail) catch return error.InvalidEffect, .generation = try effectBlob(&row, 0, 32), .decision_id = try effectBlob(&row, 1, 32), .revision = @intCast(effect_revision), .lease = try effectLease(&row, 3, 4), .decided_us = try row.signed(5) };
+        try self.commitTransaction();
+        return owner;
+    }
+
+    /// Prior watermark revision for a history reset scope/subject (0 before the first reset).
+    pub fn historyResetRevision(self: *Store, scope: HistoryResetScope, subject: detection.Subject) Error!u64 {
+        if (self.schema_version < 20) return error.HistoryResetStorageRequired;
+        const scope_value: i64 = switch (scope) {
+            .jail => 1,
+            .overall => 2,
+        };
+        const jail = switch (scope) {
+            .jail => |name| name,
+            .overall => "",
+        };
+        try self.beginRead();
+        errdefer self.rollback();
+        var row = try self.statement("SELECT revision FROM history_reset_watermarks WHERE scope=?1 AND jail=?2 AND family=?3 AND subject=?4;");
+        defer row.deinit();
+        try row.int(1, scope_value);
+        try row.text(2, jail);
+        try bindSubjectAt(&row, &subject, 3);
+        const prior: u64 = if (try row.row()) @intCast(@max(0, try row.signed(0))) else 0;
+        try self.commitTransaction();
+        return prior;
+    }
+
+    pub const MigrationState = enum(u8) { planned = 1, validated, recovery_point, quiesced, staged, activating, complete, rolled_back, failed };
+    pub const MigrationStep = enum(u8) { validate_plan = 1, check_drift, capture_recovery_point, quiesce_source, stage_destination, activate_owners, verify_protection, complete, rollback };
+    /// 0 = intent recorded, outcome pending.
+    pub const MigrationOutcome = enum(u8) { pending = 0, success, incompatible, validation_failed, operational_failure, uncertain, rollback_failed, partial };
+    pub const MigrationRun = struct {
+        run_id: [32]u8,
+        host_id: [32]u8,
+        source_db_fp: [32]u8,
+        source_cfg_fp: [32]u8,
+        plan_fp: [32]u8,
+        recovery_point: []const u8,
+        generation: [32]u8,
+        state: MigrationState,
+        created_us: i64,
+        updated_us: i64,
+    };
+    pub const MigrationStepRow = struct { seq: u64, step: MigrationStep, outcome: MigrationOutcome, started_us: i64, finished_us: ?i64 };
+
+    pub fn createMigrationRun(self: *Store, run: MigrationRun) Error!void {
+        if (run.recovery_point.len > 4096 or run.created_us < 0 or run.updated_us < run.created_us) return error.InvalidMigrationRow;
+        try self.beginWrite();
+        errdefer self.rollback();
+        if (self.schema_version < 23) return error.MigrationStorageRequired;
+        {
+            var exists = try self.statement("SELECT 1 FROM migration_runs WHERE run_id=?1;");
+            defer exists.deinit();
+            try exists.blob(1, &run.run_id);
+            if (try exists.row()) return error.MigrationRunExists;
+        }
+        var insert = try self.statement("INSERT INTO migration_runs VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10);");
+        defer insert.deinit();
+        try insert.blob(1, &run.run_id);
+        try insert.blob(2, &run.host_id);
+        try insert.blob(3, &run.source_db_fp);
+        try insert.blob(4, &run.source_cfg_fp);
+        try insert.blob(5, &run.plan_fp);
+        try insert.text(6, run.recovery_point);
+        try insert.blob(7, &run.generation);
+        try insert.int(8, @intFromEnum(run.state));
+        try insert.int(9, run.created_us);
+        try insert.int(10, run.updated_us);
+        try insert.done();
+        try self.commitTransaction();
+    }
+
+    pub fn migrationRun(self: *Store, allocator: std.mem.Allocator, run_id: [32]u8) Error!?MigrationRun {
+        if (self.schema_version < 23) return error.MigrationStorageRequired;
+        try self.beginRead();
+        errdefer self.rollback();
+        var row = try self.statement("SELECT host_id,source_db_fp,source_cfg_fp,plan_fp,recovery_point,generation,state,created_us,updated_us FROM migration_runs WHERE run_id=?1;");
+        defer row.deinit();
+        try row.blob(1, &run_id);
+        if (!try row.row()) {
+            try self.commitTransaction();
+            return null;
+        }
+        const recovery = try allocator.dupe(u8, try row.boundedBytes(4, 4096));
+        errdefer allocator.free(recovery);
+        const state = std.meta.intToEnum(MigrationState, try row.signed(6)) catch return error.InvalidMigrationRow;
+        const run = MigrationRun{ .run_id = run_id, .host_id = try effectBlob(&row, 0, 32), .source_db_fp = try effectBlob(&row, 1, 32), .source_cfg_fp = try effectBlob(&row, 2, 32), .plan_fp = try effectBlob(&row, 3, 32), .recovery_point = recovery, .generation = try effectBlob(&row, 5, 32), .state = state, .created_us = try row.signed(7), .updated_us = try row.signed(8) };
+        try self.commitTransaction();
+        return run;
+    }
+
+    /// Record the intent for the next step before any mutation. Refuses while an earlier step
+    /// is still pending so a resumed command must settle it first.
+    pub fn beginMigrationStep(self: *Store, run_id: [32]u8, step: MigrationStep, intent: []const u8, now_us: i64) Error!u64 {
+        if (intent.len > 4096 or now_us < 0) return error.InvalidMigrationRow;
+        try self.beginWrite();
+        errdefer self.rollback();
+        if (self.schema_version < 23) return error.MigrationStorageRequired;
+        {
+            var exists = try self.statement("SELECT 1 FROM migration_runs WHERE run_id=?1;");
+            defer exists.deinit();
+            try exists.blob(1, &run_id);
+            if (!try exists.row()) return error.MigrationRunMissing;
+        }
+        var pending_step = try self.statement("SELECT seq FROM migration_steps WHERE run_id=?1 AND outcome=0;");
+        defer pending_step.deinit();
+        try pending_step.blob(1, &run_id);
+        if (try pending_step.row()) return error.MigrationStepOpen;
+        var last = try self.statement("SELECT coalesce(max(seq),0) FROM migration_steps WHERE run_id=?1;");
+        defer last.deinit();
+        try last.blob(1, &run_id);
+        if (!try last.row()) return error.DatabaseFailure;
+        const next_seq = std.math.add(i64, try last.signed(0), 1) catch return error.InvalidMigrationRow;
+        const seq = std.math.cast(u64, next_seq) orelse return error.InvalidMigrationRow;
+        {
+            var insert = try self.statement("INSERT INTO migration_steps VALUES(?1,?2,?3,?4,0,zeroblob(0),?5,NULL);");
+            defer insert.deinit();
+            try insert.blob(1, &run_id);
+            try insert.int(2, @intCast(seq));
+            try insert.int(3, @intFromEnum(step));
+            try insert.blob(4, intent);
+            try insert.int(5, now_us);
+            try insert.done();
+        }
+        try self.touchMigrationRunTx(run_id, null, now_us);
+        try self.fault(.after_migration_step_intent);
+        try self.commitTransaction();
+        return seq;
+    }
+
+    /// Settle the pending step with its observed outcome and optionally move the run state.
+    pub fn finishMigrationStep(self: *Store, run_id: [32]u8, seq: u64, outcome: MigrationOutcome, detail: []const u8, state: ?MigrationState, now_us: i64) Error!void {
+        if (outcome == .pending or detail.len > 4096 or now_us < 0 or seq == 0 or seq > std.math.maxInt(i64)) return error.InvalidMigrationRow;
+        try self.beginWrite();
+        errdefer self.rollback();
+        if (self.schema_version < 23) return error.MigrationStorageRequired;
+        var update = try self.statement("UPDATE migration_steps SET outcome=?3,detail=?4,finished_us=?5 WHERE run_id=?1 AND seq=?2 AND outcome=0 AND started_us<=?5;");
+        defer update.deinit();
+        try update.blob(1, &run_id);
+        try update.int(2, @intCast(seq));
+        try update.int(3, @intFromEnum(outcome));
+        try update.blob(4, detail);
+        try update.int(5, now_us);
+        try update.done();
+        if (self.api.changes(self.db) != 1) return error.MigrationStepMissing;
+        try self.touchMigrationRunTx(run_id, state, now_us);
+        try self.fault(.after_migration_step_outcome);
+        try self.commitTransaction();
+    }
+
+    fn touchMigrationRunTx(self: *Store, run_id: [32]u8, state: ?MigrationState, now_us: i64) Error!void {
+        var update = try self.statement(if (state != null) "UPDATE migration_runs SET state=?2,updated_us=max(updated_us,?3) WHERE run_id=?1;" else "UPDATE migration_runs SET updated_us=max(updated_us,?3) WHERE run_id=?1;");
+        defer update.deinit();
+        try update.blob(1, &run_id);
+        if (state) |value| try update.int(2, @intFromEnum(value));
+        try update.int(3, now_us);
+        try update.done();
+        if (self.api.changes(self.db) != 1) return error.MigrationRunMissing;
+    }
+
+    /// Steps in sequence order; `output.len` bounds the page.
+    pub fn migrationSteps(self: *Store, run_id: [32]u8, output: []MigrationStepRow) Error!usize {
+        if (self.schema_version < 23) return error.MigrationStorageRequired;
+        try self.beginRead();
+        errdefer self.rollback();
+        var row = try self.statement("SELECT seq,step,outcome,started_us,finished_us FROM migration_steps WHERE run_id=?1 ORDER BY seq LIMIT ?2;");
+        defer row.deinit();
+        try row.blob(1, &run_id);
+        try row.int(2, @intCast(output.len));
+        var count: usize = 0;
+        while (try row.row()) {
+            output[count] = .{ .seq = std.math.cast(u64, try row.signed(0)) orelse return error.InvalidMigrationRow, .step = std.meta.intToEnum(MigrationStep, try row.signed(1)) catch return error.InvalidMigrationRow, .outcome = std.meta.intToEnum(MigrationOutcome, try row.signed(2)) catch return error.InvalidMigrationRow, .started_us = try row.signed(3), .finished_us = try row.optionalSigned(4) };
+            count += 1;
+        }
+        try self.commitTransaction();
+        return count;
+    }
+
+    pub const StagedOwnerRow = struct { jail: []const u8, scope: [canonical_scope_bytes]u8, lease_kind: u8, deadline_us: ?i64, source_event_us: i64, source_row: u64 };
+    pub const StagedHistoryRow = struct { jail: []const u8, scope: [canonical_scope_bytes]u8, event_kind: u8, event_us: i64, bancount: i64, source_row: u64 };
+    pub const canonical_scope_bytes = 92;
+
+    /// Replace the staged rows of a run atomically; repeating an interrupted staging is idempotent.
+    pub fn stageMigrationRows(self: *Store, run_id: [32]u8, owners: []const StagedOwnerRow, history: []const StagedHistoryRow) Error!void {
+        if (owners.len > 200_000 or history.len > 200_000) return error.InvalidMigrationRow;
+        try self.beginWrite();
+        errdefer self.rollback();
+        if (self.schema_version < 23) return error.MigrationStorageRequired;
+        for ([_][:0]const u8{ "DELETE FROM migration_staged_owners WHERE run_id=?1;", "DELETE FROM migration_staged_history WHERE run_id=?1;" }) |sql| {
+            var delete = try self.statement(sql);
+            defer delete.deinit();
+            try delete.blob(1, &run_id);
+            try delete.done();
+        }
+        for (owners, 1..) |owner, seq| {
+            if (owner.jail.len == 0 or owner.jail.len > 64 or owner.lease_kind < 1 or owner.lease_kind > 2 or (owner.lease_kind == 1) != (owner.deadline_us != null)) return error.InvalidMigrationRow;
+            var insert = try self.statement("INSERT INTO migration_staged_owners VALUES(?1,?2,?3,?4,?5,?6,?7,?8);");
+            defer insert.deinit();
+            try insert.blob(1, &run_id);
+            try insert.int(2, @intCast(seq));
+            try insert.text(3, owner.jail);
+            try insert.blob(4, &owner.scope);
+            try insert.int(5, owner.lease_kind);
+            if (owner.deadline_us) |deadline| try insert.int(6, deadline);
+            try insert.int(7, owner.source_event_us);
+            try insert.int(8, @intCast(owner.source_row));
+            try insert.done();
+        }
+        for (history, 1..) |event, seq| {
+            if (event.jail.len == 0 or event.jail.len > 64 or event.event_kind < 1 or event.event_kind > 3 or event.bancount < 0) return error.InvalidMigrationRow;
+            var insert = try self.statement("INSERT INTO migration_staged_history VALUES(?1,?2,?3,?4,?5,?6,?7,?8);");
+            defer insert.deinit();
+            try insert.blob(1, &run_id);
+            try insert.int(2, @intCast(seq));
+            try insert.text(3, event.jail);
+            try insert.blob(4, &event.scope);
+            try insert.int(5, event.event_kind);
+            try insert.int(6, event.event_us);
+            try insert.int(7, event.bancount);
+            try insert.int(8, @intCast(event.source_row));
+            try insert.done();
+        }
+        try self.commitTransaction();
+    }
+
+    pub const StagedCounts = struct { owners: u64, history: u64 };
+    pub fn stagedMigrationCounts(self: *Store, run_id: [32]u8) Error!StagedCounts {
+        if (self.schema_version < 23) return error.MigrationStorageRequired;
+        try self.beginRead();
+        errdefer self.rollback();
+        var owners = try self.statement("SELECT count(*) FROM migration_staged_owners WHERE run_id=?1;");
+        defer owners.deinit();
+        try owners.blob(1, &run_id);
+        if (!try owners.row()) return error.DatabaseFailure;
+        const owner_count: u64 = @intCast(try owners.signed(0));
+        var history = try self.statement("SELECT count(*) FROM migration_staged_history WHERE run_id=?1;");
+        defer history.deinit();
+        try history.blob(1, &run_id);
+        if (!try history.row()) return error.DatabaseFailure;
+        const history_count: u64 = @intCast(try history.signed(0));
+        try self.commitTransaction();
+        return .{ .owners = owner_count, .history = history_count };
+    }
+
+    /// Copy every staged owner of the run into effect authority in one write transaction.
+    /// Each owner keeps its original decision time and absolute deadline; the decision id is
+    /// derived from the run and staged sequence so an interrupted activation replays exactly.
+    /// Returns the number of owners now present in authority for the run.
+    pub const JailGeneration = struct { jail: []const u8, generation: [32]u8 };
+    /// Copies the run's staged owners into effect authority inside one write transaction; the run
+    /// must be `staged` or already `activating` (a resumed attempt), and every staged jail needs a
+    /// planned generation. Expired finite owners are skipped; a repeat replays without new revisions.
+    pub fn activateStagedOwners(self: *Store, run_id: [32]u8, generations: []const JailGeneration, clock: effects.Clock) Error!u64 {
+        try self.beginWrite();
+        errdefer self.rollback();
+        if (self.schema_version < 23) return error.MigrationStorageRequired;
+        try self.effectSchema();
+        const now = try self.effectClock(clock);
+        {
+            var state = try self.statement("SELECT state FROM migration_runs WHERE run_id=?1;");
+            defer state.deinit();
+            try state.blob(1, &run_id);
+            if (!try state.row()) return error.MigrationRunMissing;
+            const current = try state.signed(0);
+            if (current != @intFromEnum(MigrationState.staged) and current != @intFromEnum(MigrationState.activating)) return error.InvalidMigrationState;
+        }
+        {
+            var mark = try self.statement("UPDATE migration_runs SET state=?2,updated_us=max(updated_us,?3) WHERE run_id=?1;");
+            defer mark.deinit();
+            try mark.blob(1, &run_id);
+            try mark.int(2, @intFromEnum(MigrationState.activating));
+            try mark.int(3, @max(0, now));
+            try mark.done();
+        }
+        const Staged = struct { seq: u64, jail: [64]u8, jail_len: u8, scope: [canonical_scope_bytes]u8, lease_kind: u8, deadline_us: ?i64, decided_us: i64 };
+        var held = std.ArrayListUnmanaged(Staged){};
+        defer held.deinit(self.allocator);
+        {
+            var rows = try self.statement("SELECT seq,jail,scope,lease_kind,deadline_us,source_event_us FROM migration_staged_owners WHERE run_id=?1 ORDER BY seq;");
+            defer rows.deinit();
+            try rows.blob(1, &run_id);
+            while (try rows.row()) {
+                if (held.items.len == effects.max_effects) return error.EffectCapacity;
+                var item = Staged{ .seq = std.math.cast(u64, try rows.signed(0)) orelse return error.InvalidMigrationRow, .jail = undefined, .jail_len = 0, .scope = try effectBlob(&rows, 2, canonical_scope_bytes), .lease_kind = std.math.cast(u8, try rows.signed(3)) orelse return error.InvalidMigrationRow, .deadline_us = try rows.optionalSigned(4), .decided_us = try rows.signed(5) };
+                const jail = try rows.boundedBytes(1, 64);
+                @memcpy(item.jail[0..jail.len], jail);
+                item.jail_len = @intCast(jail.len);
+                try held.append(self.allocator, item);
+            }
+        }
+        const canonical_scope = @import("../firewall/scope.zig");
+        const installation = try self.readInstallation() orelse return error.InstallationRequired;
+        var activated: u64 = 0;
+        for (held.items) |item| {
+            const scope = canonical_scope.Scope.decode(&item.scope) catch return error.InvalidMigrationRow;
+            const lease: effects.Lease = if (item.lease_kind == 2) .permanent else .{ .finite = item.deadline_us orelse return error.InvalidMigrationRow };
+            if (lease == .finite and lease.finite <= now) continue;
+            var counter: [8]u8 = undefined;
+            std.mem.writeInt(u64, &counter, item.seq, .little);
+            const decision_id = effects.hashParts("fail2zig-migration-owner-v1", &.{ &run_id, &counter });
+            const key = try (try effects.Scope.exact(scope)).key(installation);
+            const jail = item.jail[0..item.jail_len];
+            const generation = for (generations) |candidate| {
+                if (std.mem.eql(u8, candidate.jail, jail)) break candidate.generation;
+            } else return error.MigrationJailUnknown;
+            var existing_revision: u64 = 0;
+            var replay = false;
+            var native: ?struct { decision_id: [32]u8, permanent: bool, deadline_us: ?i64, decided_us: i64 } = null;
+            {
+                var row = try self.statement("SELECT decision_id,revision,lease_kind,deadline_us,decided_us FROM effect_owners WHERE scope_key=?1 AND jail=?2;");
+                defer row.deinit();
+                try row.blob(1, &key);
+                try row.text(2, jail);
+                if (try row.row()) {
+                    const saved = try effectBlob(&row, 0, 32);
+                    existing_revision = std.math.cast(u64, try row.signed(1)) orelse return error.InvalidMigrationRow;
+                    const kind = try row.signed(2);
+                    replay = std.mem.eql(u8, &saved, &decision_id) and kind != 0;
+                    if (!replay and kind != 0) native = .{ .decision_id = saved, .permanent = kind == 2, .deadline_us = try row.optionalSigned(3), .decided_us = try row.signed(4) };
+                }
+            }
+            if (replay) {
+                activated += 1;
+                continue;
+            }
+            if (native) |owner| {
+                // A live native owner keeps its decision and never loses protection: permanent or
+                // later deadlines stay untouched, an earlier one is extended to the imported deadline.
+                const native_live = owner.permanent or (owner.deadline_us orelse 0) > now;
+                if (native_live) {
+                    try self.recordMigrationConflictTx(run_id, item.seq, &item.scope, jail, item.lease_kind, item.deadline_us, now);
+                    // A decision is immutable, so the extension is a new decision derived from the run.
+                    const extend = !owner.permanent and lease == .finite and (owner.deadline_us orelse 0) < lease.finite;
+                    if (extend) _ = try self.setOwnerTx(try (effects.CanonicalOwnerChange{ .scope = scope, .jail = jail, .generation = generation, .decision_id = effects.hashParts("fail2zig-migration-extend-v1", &.{ &run_id, &counter }), .expected_revision = existing_revision, .lease = lease, .decided_us = @min(owner.decided_us, now) }).exact(), now);
+                    continue;
+                }
+            }
+            _ = try self.setOwnerTx(try (effects.CanonicalOwnerChange{ .scope = scope, .jail = jail, .generation = generation, .decision_id = decision_id, .expected_revision = existing_revision, .lease = lease, .decided_us = @min(item.decided_us, now) }).exact(), now);
+            activated += 1;
+        }
+        _ = try self.commitEffectClock(clock);
+        try self.fault(.before_migration_activation_commit);
+        try self.commitTransaction();
+        if (activated != 0) self.effect_publication_epoch +|= 1;
+        return activated;
+    }
+
+    /// Delta kind 3 (carry_back mapped) records a staged owner that met a live native owner; the row is
+    /// keyed by the staged sequence so a repeated activation does not duplicate it.
+    fn recordMigrationConflictTx(self: *Store, run_id: [32]u8, seq: u64, scope: *const [canonical_scope_bytes]u8, jail: []const u8, lease_kind: u8, deadline_us: ?i64, now: i64) Error!void {
+        {
+            var exists = try self.statement("SELECT 1 FROM migration_deltas WHERE run_id=?1 AND seq=?2;");
+            defer exists.deinit();
+            try exists.blob(1, &run_id);
+            try exists.int(2, @intCast(seq));
+            if (try exists.row()) return;
+        }
+        var insert = try self.statement("INSERT INTO migration_deltas VALUES(?1,?2,3,?3,?4,?5,?6,1,0,?7);");
+        defer insert.deinit();
+        try insert.blob(1, &run_id);
+        try insert.int(2, @intCast(seq));
+        try insert.blob(3, scope);
+        try insert.text(4, jail);
+        try insert.int(5, lease_kind);
+        if (deadline_us) |deadline| try insert.int(6, deadline) else try self.check(self.api.bind_null(insert.ptr, 6));
+        try insert.int(7, @max(0, now));
+        try insert.done();
+    }
+
+    pub const MigrationDeltaKind = enum(u8) { ban = 1, unban = 2, conflict = 3 };
+    pub const MigrationCarryBack = enum(u8) { mapped = 1, unsupported = 2, expired = 3 };
+    /// One post-cutover difference between the staged (source) owners and the destination's live
+    /// owners: a native ban to carry back, or a staged owner the destination released or expired.
+    pub const MigrationDelta = struct {
+        kind: MigrationDeltaKind,
+        jail: [64]u8,
+        jail_len: u8,
+        scope: [canonical_scope_bytes]u8,
+        lease_kind: u8,
+        deadline_us: ?i64,
+        decided_us: i64,
+        carry_back: MigrationCarryBack,
+        pub fn jailName(self: *const MigrationDelta) []const u8 {
+            return self.jail[0..self.jail_len];
+        }
+    };
+    /// Computes the ordered delta list for `jails` at `now_us` without writing anything. Rows are
+    /// compared by canonical scope and jail; scopes with protocol or port restrictions cannot be
+    /// expressed as fail2ban rows and are reported `unsupported`.
+    pub fn planMigrationDeltas(self: *Store, run_id: [32]u8, jails: []const []const u8, now_us: i64, output: []MigrationDelta) Error!usize {
+        if (self.schema_version < 23) return error.MigrationStorageRequired;
+        const installation = try self.readInstallation() orelse return error.InstallationRequired;
+        const canonical_scope = @import("../firewall/scope.zig");
+        var count: usize = 0;
+        var staged = try self.statement("SELECT jail,scope,lease_kind,deadline_us,seq FROM migration_staged_owners WHERE run_id=?1 ORDER BY seq;");
+        defer staged.deinit();
+        try staged.blob(1, &run_id);
+        while (try staged.row()) {
+            const jail = try staged.boundedBytes(0, 64);
+            const scope_bytes = try effectBlob(&staged, 1, canonical_scope_bytes);
+            const scope = canonical_scope.Scope.decode(&scope_bytes) catch return error.InvalidMigrationRow;
+            const key = try (try effects.Scope.exact(scope)).key(installation);
+            var live = false;
+            var native_decision = false;
+            var live_kind: u8 = 0;
+            var live_deadline: ?i64 = null;
+            var live_decided: i64 = now_us;
+            {
+                var owner = try self.statement("SELECT lease_kind,deadline_us,decided_us,decision_id FROM effect_owners WHERE scope_key=?1 AND jail=?2 AND lease_kind!=0 AND (lease_kind=2 OR deadline_us>?3);");
+                defer owner.deinit();
+                try owner.blob(1, &key);
+                try owner.text(2, jail);
+                try owner.int(3, now_us);
+                if (try owner.row()) {
+                    live = true;
+                    live_kind = std.math.cast(u8, try owner.signed(0)) orelse return error.InvalidMigrationRow;
+                    live_deadline = try owner.optionalSigned(1);
+                    live_decided = try owner.signed(2);
+                    var seq_counter: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &seq_counter, std.math.cast(u64, try staged.signed(4)) orelse return error.InvalidMigrationRow, .little);
+                    const migration_decision = effects.hashParts("fail2zig-migration-owner-v1", &.{ &run_id, &seq_counter });
+                    const extension_decision = effects.hashParts("fail2zig-migration-extend-v1", &.{ &run_id, &seq_counter });
+                    const decision = try effectBlob(&owner, 3, 32);
+                    native_decision = !std.mem.eql(u8, &decision, &migration_decision) and !std.mem.eql(u8, &decision, &extension_decision);
+                }
+            }
+            if (live and !native_decision) continue;
+            if (count == output.len) return error.EffectCapacity;
+            if (live) {
+                // A native decision (re-ban or conflict-kept owner) supersedes the source row: its
+                // current lease is what the source must carry.
+                var delta = MigrationDelta{ .kind = .ban, .jail = undefined, .jail_len = @intCast(jail.len), .scope = scope_bytes, .lease_kind = live_kind, .deadline_us = live_deadline, .decided_us = live_decided, .carry_back = if (scope.protocols.isAll() and scope.ports.isAll()) .mapped else .unsupported };
+                @memcpy(delta.jail[0..jail.len], jail);
+                output[count] = delta;
+                count += 1;
+                continue;
+            }
+            const staged_kind = std.math.cast(u8, try staged.signed(2)) orelse return error.InvalidMigrationRow;
+            const staged_deadline = try staged.optionalSigned(3);
+            const expired = staged_kind == 1 and (staged_deadline orelse 0) <= now_us;
+            var delta = MigrationDelta{ .kind = .unban, .jail = undefined, .jail_len = @intCast(jail.len), .scope = scope_bytes, .lease_kind = 0, .deadline_us = null, .decided_us = now_us, .carry_back = if (expired) .expired else .mapped };
+            @memcpy(delta.jail[0..jail.len], jail);
+            output[count] = delta;
+            count += 1;
+        }
+        for (jails) |jail| {
+            var owners = try self.statement("SELECT n.canonical_scope,o.lease_kind,o.deadline_us,o.decided_us FROM effect_owners o JOIN native_effects n USING(scope_key) WHERE o.jail=?1 AND o.lease_kind!=0 AND (o.lease_kind=2 OR o.deadline_us>?2) AND NOT EXISTS (SELECT 1 FROM migration_staged_owners s WHERE s.run_id=?3 AND s.jail=o.jail AND s.scope=n.canonical_scope) ORDER BY o.decided_us;");
+            defer owners.deinit();
+            try owners.text(1, jail);
+            try owners.int(2, now_us);
+            try owners.blob(3, &run_id);
+            while (try owners.row()) {
+                if (count == output.len) return error.EffectCapacity;
+                const scope_bytes = try effectBlob(&owners, 0, canonical_scope_bytes);
+                const scope = canonical_scope.Scope.decode(&scope_bytes) catch return error.InvalidMigrationRow;
+                const mapped = scope.protocols.isAll() and scope.ports.isAll();
+                var delta = MigrationDelta{ .kind = .ban, .jail = undefined, .jail_len = @intCast(jail.len), .scope = scope_bytes, .lease_kind = std.math.cast(u8, try owners.signed(1)) orelse return error.InvalidMigrationRow, .deadline_us = try owners.optionalSigned(2), .decided_us = try owners.signed(3), .carry_back = if (mapped) .mapped else .unsupported };
+                @memcpy(delta.jail[0..jail.len], jail);
+                output[count] = delta;
+                count += 1;
+            }
+        }
+        return count;
+    }
+    /// Persists deltas after the previous highest sequence; `applied` records whether the derived
+    /// source database received them.
+    pub fn recordMigrationDeltas(self: *Store, run_id: [32]u8, deltas: []const MigrationDelta, applied: bool, now_us: i64) Error!void {
+        try self.beginWrite();
+        errdefer self.rollback();
+        if (self.schema_version < 23) return error.MigrationStorageRequired;
+        {
+            var stale = try self.statement("DELETE FROM migration_deltas WHERE run_id=?1 AND kind IN (1,2) AND applied=0;");
+            defer stale.deinit();
+            try stale.blob(1, &run_id);
+            try stale.done();
+        }
+        var last = try self.statement("SELECT coalesce(max(seq),0) FROM migration_deltas WHERE run_id=?1;");
+        defer last.deinit();
+        try last.blob(1, &run_id);
+        if (!try last.row()) return error.DatabaseFailure;
+        var seq: i64 = try last.signed(0);
+        for (deltas) |delta| {
+            seq += 1;
+            var insert = try self.statement("INSERT INTO migration_deltas VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10);");
+            defer insert.deinit();
+            try insert.blob(1, &run_id);
+            try insert.int(2, seq);
+            try insert.int(3, @intFromEnum(delta.kind));
+            try insert.blob(4, &delta.scope);
+            try insert.text(5, delta.jailName());
+            try insert.int(6, delta.lease_kind);
+            if (delta.lease_kind == 1) try insert.int(7, delta.deadline_us orelse return error.InvalidMigrationRow) else try self.check(self.api.bind_null(insert.ptr, 7));
+            try insert.int(8, @intFromEnum(delta.carry_back));
+            try insert.int(9, @intFromBool(applied));
+            try insert.int(10, @max(0, now_us));
+            try insert.done();
+        }
+        try self.commitTransaction();
+    }
+    /// Releases every live destination owner at a staged scope of the run through the accepted
+    /// owner transition (history and other owners retained); returns how many were released.
+    pub fn releaseMigrationOwners(self: *Store, run_id: [32]u8, clock: effects.Clock) Error!u64 {
+        if (self.schema_version < 23) return error.MigrationStorageRequired;
+        const installation = try self.readInstallation() orelse return error.InstallationRequired;
+        const canonical_scope = @import("../firewall/scope.zig");
+        var released: u64 = 0;
+        var seq_index: u64 = 0;
+        var staged = try self.statement("SELECT seq,jail,scope FROM migration_staged_owners WHERE run_id=?1 ORDER BY seq;");
+        defer staged.deinit();
+        try staged.blob(1, &run_id);
+        var pending = std.ArrayListUnmanaged(struct { seq: u64, jail: [64]u8, jail_len: u8, scope: [canonical_scope_bytes]u8 }){};
+        defer pending.deinit(self.allocator);
+        while (try staged.row()) {
+            if (pending.items.len == effects.max_effects) return error.EffectCapacity;
+            const jail = try staged.boundedBytes(1, 64);
+            var item: @TypeOf(pending.items[0]) = .{ .seq = std.math.cast(u64, try staged.signed(0)) orelse return error.InvalidMigrationRow, .jail = undefined, .jail_len = @intCast(jail.len), .scope = try effectBlob(&staged, 2, canonical_scope_bytes) };
+            @memcpy(item.jail[0..jail.len], jail);
+            try pending.append(self.allocator, item);
+        }
+        for (pending.items) |item| {
+            seq_index += 1;
+            const scope = canonical_scope.Scope.decode(&item.scope) catch return error.InvalidMigrationRow;
+            const key = try (try effects.Scope.exact(scope)).key(installation);
+            const jail = item.jail[0..item.jail_len];
+            const owner = (try self.currentOwner(key, jail)) orelse continue;
+            if (owner.lease == .absent) continue;
+            var counter: [8]u8 = undefined;
+            std.mem.writeInt(u64, &counter, item.seq, .little);
+            _ = try self.transitionOwner(.{ .scope = scope, .jail = jail, .current_generation = owner.generation, .next_generation = owner.generation, .expected_owner_revision = owner.revision, .transition_id = effects.hashParts("fail2zig-migration-release-v1", &.{ &run_id, &counter }), .mode = .release, .occurred_us = clock.prepared_us }, clock);
+            released += 1;
+        }
+        return released;
+    }
+
+    /// Sequence of the run's step left without an outcome, if any; independent of the bounded
+    /// `migrationSteps` listing so long-running runs never hide an open step.
+    pub const PendingStep = struct { seq: u64, step: MigrationStep };
+    pub fn pendingMigrationStep(self: *Store, run_id: [32]u8) Error!?PendingStep {
+        if (self.schema_version < 23) return error.MigrationStorageRequired;
+        var row = try self.statement("SELECT seq,step FROM migration_steps WHERE run_id=?1 AND outcome=0;");
+        defer row.deinit();
+        try row.blob(1, &run_id);
+        if (!try row.row()) return null;
+        const step = std.meta.intToEnum(MigrationStep, try row.signed(1)) catch return error.InvalidMigrationRow;
+        return .{ .seq = std.math.cast(u64, try row.signed(0)) orelse return error.InvalidMigrationRow, .step = step };
+    }
+    /// Scope keys of every staged owner of the run, regardless of lease, for kernel readback.
+    pub fn migrationStagedKeys(self: *Store, run_id: [32]u8, output: [][32]u8) Error!usize {
+        if (self.schema_version < 23) return error.MigrationStorageRequired;
+        const installation = try self.readInstallation() orelse return error.InstallationRequired;
+        const canonical_scope = @import("../firewall/scope.zig");
+        var count: usize = 0;
+        var staged = try self.statement("SELECT scope FROM migration_staged_owners WHERE run_id=?1 ORDER BY seq;");
+        defer staged.deinit();
+        try staged.blob(1, &run_id);
+        while (try staged.row()) {
+            if (count == output.len) return error.EffectCapacity;
+            const scope = canonical_scope.Scope.decode(&try effectBlob(&staged, 0, canonical_scope_bytes)) catch return error.InvalidMigrationRow;
+            output[count] = try (try effects.Scope.exact(scope)).key(installation);
+            count += 1;
+        }
+        return count;
+    }
+    /// Marks the run's recorded ban/unban deltas as applied once the derived source is in place.
+    pub fn markMigrationDeltasApplied(self: *Store, run_id: [32]u8) Error!void {
+        try self.beginWrite();
+        errdefer self.rollback();
+        if (self.schema_version < 23) return error.MigrationStorageRequired;
+        var update = try self.statement("UPDATE migration_deltas SET applied=1 WHERE run_id=?1 AND kind IN (1,2);");
+        defer update.deinit();
+        try update.blob(1, &run_id);
+        try update.done();
+        try self.commitTransaction();
+    }
+    /// True when the run recorded a successful outcome for `step`.
+    pub fn migrationStepSucceeded(self: *Store, run_id: [32]u8, step: MigrationStep) Error!bool {
+        if (self.schema_version < 23) return error.MigrationStorageRequired;
+        var row = try self.statement("SELECT 1 FROM migration_steps WHERE run_id=?1 AND step=?2 AND outcome=?3;");
+        defer row.deinit();
+        try row.blob(1, &run_id);
+        try row.int(2, @intFromEnum(step));
+        try row.int(3, @intFromEnum(MigrationOutcome.success));
+        return try row.row();
+    }
+
+    /// Scope keys of the run's activated owners that are still live at `now_us`, for kernel readback
+    /// settlement; the count of live staged owners is returned separately so a missing key is visible.
+    pub fn migrationActivatedKeys(self: *Store, run_id: [32]u8, now_us: i64, output: [][32]u8) Error!struct { expected: u64, found: usize } {
+        if (self.schema_version < 23) return error.MigrationStorageRequired;
+        const installation = try self.readInstallation() orelse return error.InstallationRequired;
+        const canonical_scope = @import("../firewall/scope.zig");
+        var expected: u64 = 0;
+        var found: usize = 0;
+        var staged = try self.statement("SELECT jail,scope FROM migration_staged_owners WHERE run_id=?1 AND (lease_kind=2 OR deadline_us>?2) ORDER BY seq;");
+        defer staged.deinit();
+        try staged.blob(1, &run_id);
+        try staged.int(2, now_us);
+        while (try staged.row()) {
+            expected += 1;
+            // Protection at the scope is what matters: the owner may carry the migration decision,
+            // a conflict-kept native decision or the extension decision.
+            const jail = try staged.boundedBytes(0, 64);
+            const scope = canonical_scope.Scope.decode(&try effectBlob(&staged, 1, canonical_scope_bytes)) catch return error.InvalidMigrationRow;
+            const key = try (try effects.Scope.exact(scope)).key(installation);
+            var owner = try self.statement("SELECT scope_key FROM effect_owners WHERE scope_key=?1 AND jail=?2 AND lease_kind!=0 AND (lease_kind=2 OR deadline_us>?3);");
+            defer owner.deinit();
+            try owner.blob(1, &key);
+            try owner.text(2, jail);
+            try owner.int(3, now_us);
+            if (try owner.row()) {
+                if (found == output.len) return error.EffectCapacity;
+                output[found] = try effectBlob(&owner, 0, 32);
+                found += 1;
+            }
+        }
+        return .{ .expected = expected, .found = found };
+    }
+
+    /// Test-only raw inspection; product code cannot compile a call to it.
+    pub fn inspectInteger(self: *Store, sql: [:0]const u8) Error!i64 {
+        if (!@import("builtin").is_test) @compileError("inspectInteger is test-only");
+        return self.integer(sql);
+    }
+    /// Test-only raw statement execution for constraint checks; product code cannot compile a call to it.
+    pub fn inspectExec(self: *Store, sql: [:0]const u8) Error!void {
+        if (!@import("builtin").is_test) @compileError("inspectExec is test-only");
+        return self.exec(sql);
+    }
+
+    pub fn adminRevision(self: *Store) Error!u64 {
+        if (self.schema_version < 22) return error.AdminStorageRequired;
+        const value = try self.integer("SELECT mutation_revision FROM admin_revision WHERE id=1;");
+        if (value < 0) return error.DatabaseFailure;
+        return @intCast(value);
+    }
+
     pub const CleanupFence = struct {
         jail: []const u8,
         source: []const u8,
@@ -4145,16 +5234,25 @@ pub const Store = struct {
                 var owners: [effects.max_page]effects.Owner = undefined;
                 const count = try self.readOwners(key, &owners);
                 var effect_revision: u64 = 0;
+                var kept_existing = false;
                 for (owners[0..count]) |owner| if (std.mem.eql(u8, owner.jail.slice(), record.jail)) {
                     effect_revision = owner.revision;
+                    // A live owner keeps its decision, decision time, lease, revision and
+                    // confirmation: a later detection never re-decides, shortens or prolongs it.
+                    // Only an explicit prolongation (`prolongRetryDecision`) moves a deadline.
+                    // Owner rows outlive their deadline, so liveness is judged at the effect
+                    // clock: at or after expiry the detection decides a new ban.
+                    kept_existing = owner.lease.live(effect_now);
                 };
                 const identity = if (self.schema_version >= 12)
                     effects.hashParts("fail2zig-native-effect-decision-v2", &.{ record.jail, record.source, record.occurrence, &admission.generation, &key })
                 else
                     effects.hashParts("fail2zig-native-effect-decision-v1", &.{ record.jail, record.source, record.occurrence, &admission.generation });
                 effect_identity = identity;
-                _ = try self.setOwnerTx(.{ .scope = scope, .jail = record.jail, .generation = admission.generation, .decision_id = identity, .expected_revision = effect_revision, .lease = decision.lease, .decided_us = decision.decided_us }, effect_now);
-                if (self.schema_version >= 21) try self.prepareActionTargetsTx(.{ .action_id = identity, .scope_key = key, .jail = record.jail }, effect_now);
+                if (!kept_existing) {
+                    _ = try self.setOwnerTx(.{ .scope = scope, .jail = record.jail, .generation = admission.generation, .decision_id = identity, .expected_revision = effect_revision, .lease = decision.lease, .decided_us = decision.decided_us }, effect_now);
+                    if (self.schema_version >= 21) try self.prepareActionTargetsTx(.{ .action_id = identity, .scope_key = key, .jail = record.jail }, effect_now);
+                }
             }
             if (self.schema_version >= 17) {
                 if (try self.integer("SELECT count(*) FROM retry_decision_details;") >= application_history.max_details) return error.HistoryCapacity;
@@ -4847,12 +5945,14 @@ pub const Store = struct {
             try self.fault(.after_detection);
         }
         if (record.native_retry) |admission| {
-            if (detections.len == 0) try self.commitRetry(record, admission);
-            for (detections) |value| {
-                var scalar = record;
-                scalar.native_detection = value;
-                scalar.native_detections = null;
-                try self.commitRetry(scalar, admission);
+            if (!record.retry_suspended) {
+                if (detections.len == 0) try self.commitRetry(record, admission);
+                for (detections) |value| {
+                    var scalar = record;
+                    scalar.native_detection = value;
+                    scalar.native_detections = null;
+                    try self.commitRetry(scalar, admission);
+                }
             }
         }
         {

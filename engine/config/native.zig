@@ -102,6 +102,8 @@ pub const GlobalConfig = struct {
     compatibility_manifest: []const u8 = "",
     compatibility_pending: bool = false,
     log_level: LogLevel = .info,
+    /// "stderr" or an absolute regular-file path; rotation uses SIGUSR1 reopen.
+    log_target: []const u8 = "stderr",
     pid_file: []const u8 = "/run/fail2zig/fail2zig.pid",
     socket_path: []const u8 = "/run/fail2zig/fail2zig.sock",
     state_file: []const u8 = "/var/lib/fail2zig/state.bin",
@@ -838,6 +840,10 @@ const Parser = struct {
         } else if (std.mem.eql(u8, key, "log_level")) {
             const s = try asString(v);
             self.global.log_level = try parseLogLevel(s);
+        } else if (std.mem.eql(u8, key, "log_target")) {
+            const s = try asString(v);
+            if (!std.mem.eql(u8, s, "stderr") and (!std.fs.path.isAbsolute(s) or s.len >= std.fs.max_path_bytes or std.mem.indexOfScalar(u8, s, 0) != null)) return error.InvalidValue;
+            self.global.log_target = s;
         } else if (std.mem.eql(u8, key, "pid_file")) {
             self.global.pid_file = try asString(v);
             std.log.warn("config: pid_file is a deprecated compatibility key and is not written; use systemd MainPID", .{});

@@ -543,3 +543,59 @@ test "native consumer runtime: startup restore permits private state but refuses
     try f.store.finishStartupAdmission();
     try t.expect((try run.resolver.pollDns()).kind == .idle);
 }
+
+test "native consumer runtime: file-backed allowlist refresh commits a new shared revision and survives restart, failures retain the last valid set" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var run = try Run.init(&f, plain, null);
+    var live = true;
+    defer if (live) run.destroy();
+    try run.start();
+    _ = try run.deliver();
+    const jail = run.jail.?;
+    const before = jail.ignores.revision;
+    try t.expectEqual(@as(u64, 1), before);
+    const initial_payload = try t.allocator.dupe(u8, jail.ignores.live.payload);
+    defer t.allocator.free(initial_payload);
+
+    try writeAllowlist(&f, "192.0.2.0/24 # office\n198.51.100.7\n");
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const allow_path = try f.tmp.dir.realpath("allow.txt", &path_buf);
+    const first = jail.refreshAllowlist(allow_path, f.clock.us) catch |err| {
+        std.debug.print("allowlist refresh failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    try t.expectEqual(runtime.JailRuntime.AllowlistRefresh.applied, first);
+    try t.expectEqual(before + 1, jail.ignores.revision);
+    try t.expect(!std.mem.eql(u8, initial_payload, jail.ignores.live.payload));
+    try t.expectEqual(@as(usize, 2), jail.ignores.live.entries.len);
+    const refreshed = try t.allocator.dupe(u8, jail.ignores.live.payload);
+    defer t.allocator.free(refreshed);
+    try t.expectEqual(runtime.JailRuntime.AllowlistRefresh.unchanged, try jail.refreshAllowlist(allow_path, f.clock.us));
+    try t.expectEqual(before + 1, jail.ignores.revision);
+
+    // Unreadable or invalid replacements never touch the live snapshot.
+    try t.expectError(error.FileNotFound, jail.refreshAllowlist("/nonexistent/allow.txt", f.clock.us));
+    try writeAllowlist(&f, "not an address here\n");
+    try t.expectError(error.InvalidIgnoreEntry, jail.refreshAllowlist(allow_path, f.clock.us));
+    try t.expectEqualSlices(u8, refreshed, jail.ignores.live.payload);
+    try t.expectEqual(before + 1, jail.ignores.revision);
+
+    // Restart restores the committed revision, not the configured initial snapshot.
+    run.destroy();
+    live = false;
+    try f.reopen();
+    var restarted = try Run.init(&f, plain, null);
+    defer restarted.destroy();
+    try restarted.start();
+    try t.expectEqual(before + 1, restarted.jail.?.ignores.revision);
+    try t.expectEqualSlices(u8, refreshed, restarted.jail.?.ignores.live.payload);
+}
+
+/// Allowlist files must be non-group/world-writable to be trusted.
+fn writeAllowlist(f: *Fixture, data: []const u8) !void {
+    const file = try f.tmp.dir.createFile("allow.txt", .{ .truncate = true, .mode = 0o600 });
+    defer file.close();
+    try file.chmod(0o600);
+    try file.writeAll(data);
+}

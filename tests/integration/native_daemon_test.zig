@@ -312,7 +312,7 @@ test "native daemon: delivered client renders native status jails version and de
     const commands = [_][]const u8{ "status", "jails", "version", "list" };
     const expected = [_][]const u8{ "log-only", "sshd", "daemon\t0.3.1-dev", "203.0.113.7" };
     for (commands, expected) |command, text| {
-        const result = try std.process.Child.run(.{ .allocator = t.allocator, .argv = &.{ "zig-out/bin/fail2zig-client", "--socket", h.socket_path, "--timeout", "1000", "--output", "plain", command }, .max_output_bytes = 65536 });
+        const result = try std.process.Child.run(.{ .allocator = t.allocator, .argv = &.{ "zig-out/bin/fail2zig", "--socket", h.socket_path, "--timeout", "1000", "--output", "plain", command }, .max_output_bytes = 65536 });
         defer t.allocator.free(result.stdout);
         defer t.allocator.free(result.stderr);
         try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);

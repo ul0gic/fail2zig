@@ -2,6 +2,8 @@
 // Copyright (c) 2026 fail2zig maintainers
 pub const types = @import("types.zig");
 pub const protocol = @import("protocol.zig");
+pub const exit = @import("exit.zig");
+pub const ExitClass = exit.ExitClass;
 
 pub const IpAddress = types.IpAddress;
 pub const JailId = types.JailId;
@@ -19,4 +21,5 @@ pub const deserializeResponse = protocol.deserializeResponse;
 test {
     _ = types;
     _ = protocol;
+    _ = exit;
 }

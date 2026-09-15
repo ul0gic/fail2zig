@@ -434,6 +434,26 @@ pub const JailRuntime = struct {
         const allocator = self.allocator;
         allocator.destroy(self);
     }
+    pub const AllowlistRefresh = enum { unchanged, applied };
+    /// Re-read a file-backed allowlist and commit it as the next shared revision. Any read,
+    /// parse, capacity or commit failure leaves the last valid snapshot published.
+    pub fn refreshAllowlist(self: *JailRuntime, path: []const u8, now_us: i64) !AllowlistRefresh {
+        if (self.count == 0) return error.ConsumerRuntimeNotReady;
+        const next = try ignore.Snapshot.fromFile(self.allocator, self.ignores.live.options, path);
+        if (std.mem.eql(u8, next.payload, self.ignores.live.payload)) {
+            next.destroy();
+            return .unchanged;
+        }
+        const source = self.sources[0];
+        const stage = source.coordinator.prepareAllowlistRefresh(next, source.generation, now_us) catch |err| {
+            next.destroy();
+            return err;
+        };
+        defer stage.state.release(stage.state.context);
+        try self.store.commitConsumerInput(stage.manifest, stage.state.consumers);
+        stage.state.publish(stage.state.context);
+        return .applied;
+    }
     pub fn stagedConsumer(self: *JailRuntime) detection.StagedConsumer {
         return self.registry.consumer();
     }

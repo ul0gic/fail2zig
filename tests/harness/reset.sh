@@ -50,7 +50,7 @@ if [ "$start_after" = "1" ]; then
     # Wait up to 5s for the IPC socket to become ready — that's the
     # moment after which subsequent injections will be observed.
     for _ in $(seq 1 50); do
-        if sudo /usr/local/bin/fail2zig-client status >/dev/null 2>&1; then
+        if sudo /usr/local/bin/fail2zig status >/dev/null 2>&1; then
             echo "reset: daemon ready"
             exit 0
         fi

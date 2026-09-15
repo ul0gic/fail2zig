@@ -24,7 +24,7 @@
 #
 #   --build        Cross-build ReleaseSafe musl into zig-out/bin first
 #                  (requires zig on the host). Default: use --local-bin.
-#   --local-bin D  Directory holding prebuilt fail2zig + fail2zig-client
+#   --local-bin D  Directory holding the prebuilt fail2zig executable
 #                  (default: zig-out/bin).
 #   --purge        On exit, remove installed artifacts + harness-created
 #                  group/user. Default: leave installed.
@@ -43,7 +43,7 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 UNIT="fail2zig.service"
 RUN_DIR="/run/fail2zig"
 SOCK="${RUN_DIR}/fail2zig.sock"
-CLIENT="/usr/local/bin/fail2zig-client"
+CLIENT="/usr/local/bin/fail2zig"
 GRP="fail2zig"
 GRP_USER="f2z-e2e-grp"        # throwaway group-member test user
 TARGET="x86_64-linux-musl"
@@ -155,7 +155,6 @@ if [ "$DO_BUILD" -eq 1 ]; then
   LOCAL_BIN="${REPO_ROOT}/zig-out/bin"
 fi
 [ -x "${LOCAL_BIN}/fail2zig" ]        || { echo "e2e: missing ${LOCAL_BIN}/fail2zig" >&2; exit 2; }
-[ -x "${LOCAL_BIN}/fail2zig-client" ] || { echo "e2e: missing ${LOCAL_BIN}/fail2zig-client" >&2; exit 2; }
 
 # --- 2. install via the SHIPPED installer + SHIPPED unit ---------------------
 log "installing via scripts/install.sh --local-bin ${LOCAL_BIN}"
@@ -218,7 +217,7 @@ SS="$(stat -c '%U:%G %a' "$SOCK")"
 pass "socket = $SS"
 
 # === ASSERTION 5: root client connects =======================================
-"$CLIENT" status >/dev/null 2>&1 || fail "root: fail2zig-client status failed"
+"$CLIENT" status >/dev/null 2>&1 || fail "root: fail2zig status failed"
 pass "root client connected"
 
 # === ASSERTION 6: fail2zig-group user connects ===============================

@@ -110,7 +110,8 @@ pub const Coordinator = struct {
     ready: bool = false,
     busy: bool = false,
     published: bool = false,
-    mode: enum { record, checkpoint, bootstrap, restore, dns_input } = .record,
+    mode: enum { record, checkpoint, bootstrap, restore, dns_input, allowlist } = .record,
+    ignore_stage: ?ignore.Owner.Stage = null,
     stages: [max_rules]?rule.Prepared = [_]?rule.Prepared{null} ** max_rules,
     restore_revisions: [max_rules]u64 = undefined,
     deltas: [state.max_deltas]state.Delta = undefined,
@@ -490,6 +491,23 @@ pub const Coordinator = struct {
         try self.delta(.{ .key = key, .format_version = dns.version, .expected_revision = self.dns_stage.?.expected_revision, .payload = self.dns_stage.?.checkpoint(), .valid_until_us = result.valid_until_us });
         return .{ .manifest = .{ .jail = "@shared", .source = source, .source_generation = result.request.generation, .required = &self.dns_requirement }, .state = self.stateStage(), .bootstrap = self.dns_stage.?.expected_revision == 0 };
     }
+    /// Replace the shared allowlist as one consumer delta at the owner's current revision.
+    /// The snapshot's parent generation is unchanged, so restore paths read the new payload
+    /// through the same key; publish only after the store committed the delta.
+    pub fn prepareAllowlistRefresh(self: *Coordinator, next: *ignore.Snapshot, source_generation: [32]u8, now_us: i64) !StateStage {
+        if (!self.ready) return error.ConsumerStateNotReady;
+        if (!std.mem.eql(u8, &next.options.parent_generation, &self.ignores.live.options.parent_generation) or !std.mem.eql(u8, &next.options.resolver_generation, &self.ignores.live.options.resolver_generation)) return error.IgnoreGenerationMismatch;
+        try self.begin(now_us);
+        errdefer release(self);
+        self.mode = .allowlist;
+        if (self.ignores.revision == 0) return error.ConsumerStateNotReady;
+        for (self.owners, 0..) |_, i| try self.dependency(.{ .key = self.ruleKey(i), .expected_revision = self.revisions[i] });
+        try self.authorityRead();
+        self.ignore_stage = try self.ignores.prepare(next);
+        try self.delta(.{ .key = self.ignoreKey(), .format_version = ignore.version, .expected_revision = self.ignores.revision, .payload = next.payload });
+        try self.batch().validate();
+        return .{ .manifest = try self.manifest(source_generation), .state = self.stateStage(), .bootstrap = false };
+    }
     fn publish(context: ?*anyopaque) void {
         const self: *Coordinator = @ptrCast(@alignCast(context.?));
         if (!self.busy or self.published) return;
@@ -498,6 +516,7 @@ pub const Coordinator = struct {
             self.revisions[i] = if (self.mode == .restore) self.restore_revisions[i] else self.revisions[i] + 1;
         };
         if (self.ignore_reserved) self.ignores.revision = 1;
+        if (self.ignore_stage) |*stage| stage.publish();
         if (self.dns_stage) |*stage| {
             stage.publish();
             self.pending = null;
@@ -517,6 +536,8 @@ pub const Coordinator = struct {
         }
         if (self.dns_stage) |*stage| stage.release();
         self.dns_stage = null;
+        if (self.ignore_stage) |*stage| stage.release();
+        self.ignore_stage = null;
         if (self.ignore_reserved) self.ignores.in_flight = false;
         self.ignore_reserved = false;
         self.busy = false;

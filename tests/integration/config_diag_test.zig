@@ -168,7 +168,7 @@ test "integration: --validate-config on a 40-line config names line 37 for the b
     var r = try validateConfig(a, fx.config_path);
     defer r.deinit(a);
 
-    try testing.expectEqual(@as(?u8, 1), r.exitCode());
+    try testing.expectEqual(@as(?u8, 2), r.exitCode());
     const position = try std.fmt.allocPrint(a, "config: {s}:37:1: UnknownKey (key 'bogus_key' in [jails.sshd])", .{fx.config_path});
     defer a.free(position);
     try expectContains(r.stderr, position);
@@ -212,7 +212,9 @@ test "integration: --validate-config resolves backend = \"systemd\" to journald 
     try expectContains(r.stdout, "config: OK (1 jail(s) configured)");
     try expectContains(r.stderr, "[jails.sshd] 'backend' is a deprecated fail2ban compatibility alias");
     try expectContains(r.stderr, "use source = \"journald\"");
-    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.stderr, "deprecated"));
+    // The fixture also carries the deprecated `banaction` key, which warns separately;
+    // the backend alias itself must warn exactly once.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.stderr, "deprecated fail2ban compatibility alias"));
     try testing.expect(!hasErrorReturnTrace(r.stderr));
 }
 
@@ -228,7 +230,7 @@ test "integration: --validate-config rejects backend + source in the same jail a
     var r = try validateConfig(a, fx.config_path);
     defer r.deinit(a);
 
-    try testing.expectEqual(@as(?u8, 1), r.exitCode());
+    try testing.expectEqual(@as(?u8, 2), r.exitCode());
     const position = try std.fmt.allocPrint(a, "config: {s}:37:", .{fx.config_path});
     defer a.free(position);
     try expectContains(r.stderr, position);
@@ -291,7 +293,7 @@ test "integration: ENH-008 --validate-config rejects metrics_port = 0 at line:co
     var r = try validateConfig(a, fx.config_path);
     defer r.deinit(a);
 
-    try testing.expectEqual(@as(?u8, 1), r.exitCode());
+    try testing.expectEqual(@as(?u8, 2), r.exitCode());
     const line = try std.fmt.allocPrint(
         a,
         "config: {s}:5:16: InvalidValue (key 'metrics_port' in [global]) — metrics_port = 0 does not disable the endpoint; set metrics_enabled = false\n",
@@ -318,7 +320,7 @@ test "integration: ENH-007 --validate-config rejects firewall = \"bogus\" in [gl
     var r = try validateConfig(a, fx.config_path);
     defer r.deinit(a);
 
-    try testing.expectEqual(@as(?u8, 1), r.exitCode());
+    try testing.expectEqual(@as(?u8, 2), r.exitCode());
     const line = try std.fmt.allocPrint(a, "config: {s}:7:12: InvalidValue (key 'firewall' in [global])\n", .{fx.config_path});
     defer a.free(line);
     try expectContains(r.stderr, line);

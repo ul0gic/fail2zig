@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-client_bin="/usr/local/bin/fail2zig-client"
+client_bin="/usr/local/bin/fail2zig"
 metrics_url="http://127.0.0.1:9100/metrics"
 reset_sh="$(dirname "$0")/reset.sh"
 

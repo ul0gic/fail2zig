@@ -36,7 +36,7 @@ help: ## Show this help message
 	     /^[a-zA-Z_-]+:.*?## / { printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2 }' \
 	     $(MAKEFILE_LIST) | sort
 
-build: ## Build engine + client (Debug, with safety checks)
+build: ## Build the fail2zig executable (Debug, with safety checks)
 	zig build
 
 test: ## Run the full test suite (unit, integration, fuzz corpora)
@@ -48,22 +48,20 @@ fmt: ## Apply `zig fmt` to all tracked Zig source trees
 fmt-check: ## Verify `zig fmt` is a no-op (used by CI)
 	zig fmt --check engine/ client/ shared/ tests/
 
-release: ## Build ReleaseSafe static binaries for the native target
+release: ## Build the ReleaseSafe static executable for the native target
 	zig build -Doptimize=$(OPT)
 
-cross: ## Cross-compile ReleaseSafe binaries for every shipped target
+cross: ## Cross-compile the ReleaseSafe executable for every shipped target
 	@for t in $(CROSS_TARGETS); do \
 	  echo ">>> cross-compiling $$t"; \
 	  zig build -Dtarget=$$t -Doptimize=$(OPT); \
 	  mkdir -p zig-out/$$t/bin; \
-	  cp zig-out/bin/fail2zig        zig-out/$$t/bin/fail2zig; \
-	  cp zig-out/bin/fail2zig-client zig-out/$$t/bin/fail2zig-client; \
+	  cp zig-out/bin/fail2zig zig-out/$$t/bin/fail2zig; \
 	done
 
-install: release ## Install native release binaries into $(PREFIX)/bin (root)
+install: release ## Install the native release executable into $(PREFIX)/bin (root)
 	$(INSTALL) -d -o root -g root -m 0755 $(PREFIX)/bin
-	$(INSTALL) -o root -g root -m 0755 zig-out/bin/fail2zig        $(PREFIX)/bin/fail2zig
-	$(INSTALL) -o root -g root -m 0755 zig-out/bin/fail2zig-client $(PREFIX)/bin/fail2zig-client
+	$(INSTALL) -o root -g root -m 0755 zig-out/bin/fail2zig $(PREFIX)/bin/fail2zig
 	@echo "installed to $(PREFIX)/bin — run scripts/install.sh for full system setup"
 
 clean: ## Remove build artifacts and caches
@@ -80,7 +78,7 @@ harness-smoke: ## Run the lab-box attack smoke test (ssh_brute). Only useful on 
 	tests/harness/ssh_brute.sh
 
 lint: fmt-check ## Static analysis: zig fmt --check, shellcheck, yamllint
-	shellcheck -S warning tests/harness/*.sh tests/e2e/*.sh scripts/install.sh
+	shellcheck -S warning tests/harness/*.sh tests/e2e/*.sh tests/lab/*.sh scripts/install.sh
 	yamllint -c .yamllint .github/workflows/
 
 docs-check: ## Run the documentation quality gate (owned by DOC team; 8.1.6)

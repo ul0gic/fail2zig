@@ -138,6 +138,8 @@ pub const Context = struct {
             .list_jails => self.handleListJails(a),
             .reload => self.handleReload(a),
             .version => self.handleVersion(a),
+            // Versioned commands are served only by the native coordinator.
+            .query_v1, .admin_v1, .reload_v1 => .{ .err = .{ .code = 501, .message = try a.dupe(u8, "versioned commands require the native daemon") } },
         };
     }
 

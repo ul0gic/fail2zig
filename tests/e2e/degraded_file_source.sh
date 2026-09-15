@@ -98,7 +98,7 @@ if [ "$DO_BUILD" -eq 1 ]; then
   LOCAL_BIN="${REPO_ROOT}/zig-out/bin"
 fi
 DAEMON="${LOCAL_BIN}/fail2zig"
-CLIENT="${LOCAL_BIN}/fail2zig-client"
+CLIENT="${LOCAL_BIN}/fail2zig"
 [ -x "$DAEMON" ] || { echo "e2e: missing ${DAEMON}" >&2; exit 2; }
 [ -x "$CLIENT" ] || { echo "e2e: missing ${CLIENT}" >&2; exit 2; }
 

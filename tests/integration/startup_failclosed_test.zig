@@ -97,7 +97,13 @@ fn expectNotContains(haystack: []const u8, needle: []const u8) !void {
 }
 
 fn expectFailClosed(run: *const Run) !void {
-    try testing.expectEqual(@as(?u8, 1), run.exitCode());
+    try expectFailClosedClass(run, 1);
+}
+
+/// Configuration text/permission failures detected before daemon initialization are
+/// exit class 2 (local validation); startup refusals remain class 1.
+fn expectFailClosedClass(run: *const Run, class: u8) !void {
+    try testing.expectEqual(@as(?u8, class), run.exitCode());
     try testing.expect(run.stderr.len > 0);
     if (hasErrorReturnTrace(run.stderr)) {
         std.debug.print("error return trace leaked on a fail-closed exit:\n{s}\n", .{run.stderr});
@@ -242,7 +248,7 @@ test "integration: fail-closed (b) metrics port already bound exits 1 with a cau
     try expectContains(r.stderr, http_cause);
 }
 
-test "integration: fail-closed (c) world-writable config exits 1 naming the mode and the fix, no trace" {
+test "integration: fail-closed (c) world-writable config exits 2 naming the mode and the fix, no trace" {
     const a = testing.allocator;
     var s = try Scenario.init(a);
     defer s.deinit();
@@ -255,7 +261,7 @@ test "integration: fail-closed (c) world-writable config exits 1 naming the mode
     var r = try s.run();
     defer r.deinit(a);
 
-    try expectFailClosed(&r);
+    try expectFailClosedClass(&r, 2);
     try expectContains(r.stderr, s.config_path);
     try expectContains(r.stderr, "world-writable (mode 0666)");
     try expectContains(r.stderr, "refusing to start");
@@ -283,7 +289,7 @@ test "integration: fail-closed (c') group-writable config with a non-root group 
 
         var r = try s.run();
         defer r.deinit(a);
-        try expectFailClosed(&r);
+        try expectFailClosedClass(&r, 2);
         if (st.gid != 0) {
             try expectContains(r.stderr, "non-root group (mode 0660)");
             try expectContains(r.stderr, "refusing to start");
@@ -304,7 +310,7 @@ test "integration: fail-closed (c') group-writable config with a non-root group 
     }
 }
 
-test "integration: fail-closed (d) backend = \"bogus\" exits 1 with path:line:col, key and section, no trace" {
+test "integration: fail-closed (d) backend = \"bogus\" exits 2 with path:line:col, key and section, no trace" {
     const a = testing.allocator;
     var s = try Scenario.init(a);
     defer s.deinit();
@@ -318,7 +324,7 @@ test "integration: fail-closed (d) backend = \"bogus\" exits 1 with path:line:co
     var r = try s.run();
     defer r.deinit(a);
 
-    try expectFailClosed(&r);
+    try expectFailClosedClass(&r, 2);
     const position = try std.fmt.allocPrint(a, "config: {s}:{d}:11: InvalidValue", .{ s.config_path, line });
     defer a.free(position);
     try expectContains(r.stderr, position);

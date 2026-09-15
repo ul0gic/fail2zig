@@ -1,0 +1,1 @@
+{"id":"app-denied","source":"application","format":"template","template":"Denied login for {user:word} from {peer:ip} port {port:uint}","subject":"peer","conditions":[{"field":"port","number":2201}],"exclude":[{"field":"user","text":"probe"}]}

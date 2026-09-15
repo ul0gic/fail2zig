@@ -5,7 +5,10 @@ After=network-online.target rsyslog.service systemd-journald.service
 Wants=network-online.target
 
 [Service]
-Type=simple
+# The daemon sends READY=1 only after configuration, storage, every source and (for enforcing
+# jails) kernel protection are verified; RELOADING/READY bracket a live reload; STOPPING on exit.
+Type=notify
+NotifyAccess=main
 
 # Run as root (no User=) but with `fail2zig` as the primary group. The
 # daemon's egid is then `fail2zig`, so `RuntimeDirectory` below and the IPC
@@ -13,9 +16,13 @@ Type=simple
 # chown. This keeps the chown family (`@privileged`) denied by the seccomp
 # filter and CAP_CHOWN out of the bounding set — a daemon chown would be
 # SIGSYS-killed and could not succeed anyway (SYS-019). Group members can
-# use fail2zig-client (mode 0660 socket, SO_PEERCRED-authenticated).
+# run read-only `fail2zig status`/`jails`/`list` through the 0660 socket; mutations
+# require root or the daemon uid (SO_PEERCRED).
 Group=fail2zig
 ExecStart=/usr/local/bin/fail2zig --config /etc/fail2zig/config.toml
+# SIGHUP applies a validated configuration generation live; restart-only keys are reported,
+# not applied. SIGUSR1 reopens the log target.
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=10

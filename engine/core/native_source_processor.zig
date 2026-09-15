@@ -83,6 +83,9 @@ pub const Processor = struct {
         release: *const fn (?*anyopaque) void,
     } = null,
     retry_policy: ?retry.Policy = null,
+    /// Administrative pause: records are still consumed and checkpointed, but no detection
+    /// reaches retry evaluation, so existing owners and expiry continue unchanged.
+    paused: bool = false,
 
     /// Configure before source framing/receipt admission. The policy participates
     /// in the source generation; previous evidence-only checkpoints cannot be
@@ -288,6 +291,7 @@ pub const Processor = struct {
         var detections: ?[]const detection.Outcome = null;
         var retry_evidence: retry.Evidence = .{};
         var consumer_batch: ?@import("native_consumer.zig").Batch = null;
+        var paused_veto = false;
         var consumer_manifest: ?@import("native_consumer.zig").Manifest = null;
         errdefer if (self.consumer_stage) |stage_value| {
             stage_value.release(stage_value.context);
@@ -348,6 +352,7 @@ pub const Processor = struct {
                 detections = prepared.outcomes;
                 consumer_batch = prepared.consumers;
             }
+            if (self.paused and (detected != null or detections != null)) paused_veto = true;
             if (self.retry_policy != null) {
                 var candidate = if (detected) |value| value.kind == .candidate else false;
                 if (detections) |values| for (values) |value| {
@@ -370,7 +375,7 @@ pub const Processor = struct {
             }
         }
         self.stage(counters, false);
-        return .{ .checkpoint = &self.staged_bytes, .disposition = if (outcome) |value| value.disposition() else "source-checkpoint", .native_time = outcome, .zone_provenance = zone_provenance, .effects_clock = if (self.retry_policy != null and self.retry_policy.?.enforce and processing_us != null) .{ .prepared_us = processing_us.?, .read = commitClock, .context = self } else null, .native_detection = detected, .native_detections = detections, .consumers = consumer_batch, .consumer_manifest = consumer_manifest, .native_retry = if (self.retry_policy) |value| .{ .generation = self.generation, .policy = value, .processing_us = processing_us } else null, .retry_evidence = retry_evidence, .context = self, .publish = publish, .release = release };
+        return .{ .checkpoint = &self.staged_bytes, .disposition = if (outcome) |value| value.disposition() else "source-checkpoint", .native_time = outcome, .zone_provenance = zone_provenance, .effects_clock = if (self.retry_policy != null and self.retry_policy.?.enforce and processing_us != null) .{ .prepared_us = processing_us.?, .read = commitClock, .context = self } else null, .native_detection = detected, .native_detections = detections, .consumers = consumer_batch, .consumer_manifest = consumer_manifest, .native_retry = if (self.retry_policy) |value| .{ .generation = self.generation, .policy = value, .processing_us = processing_us } else null, .retry_suspended = paused_veto, .retry_evidence = retry_evidence, .context = self, .publish = publish, .release = release };
     }
     fn commitClock(context: ?*anyopaque) i64 {
         const self: *Processor = @ptrCast(@alignCast(context.?));

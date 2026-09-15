@@ -1,0 +1,15 @@
+[global]
+socket_path = "/run/fail2zig/fail2zig.sock"
+state_file = "/var/lib/fail2zig/state.bin"
+
+[defaults]
+ignoreip = ["10.0.0.0/8"]
+
+[jails.sshd]
+enabled = true
+filter = "sshd"
+logpath = ["/var/log/auth.log"]
+source = "file"
+timestamp = "syslog"
+timezone_offset_minutes = 120
+ignoreip = ["192.168.0.0/16"]

@@ -29,6 +29,8 @@ pub const Prepared = struct {
     native_detection: ?@import("native_detection_record.zig").Outcome = null,
     native_detections: ?[]const @import("native_detection_record.zig").Outcome = null,
     native_retry: ?@import("native_retry.zig").Admission = null,
+    /// Administrative pause: the detection is recorded but no retry state advances.
+    retry_suspended: bool = false,
     retry_evidence: @import("native_retry.zig").Evidence = .{},
     intent: ?[]const u8 = null,
     shared_state: ?durable.SharedState = null,
@@ -257,6 +259,7 @@ pub const Pipeline = struct {
             .native_detection = prepared.native_detection,
             .native_detections = prepared.native_detections,
             .native_retry = prepared.native_retry,
+            .retry_suspended = prepared.retry_suspended,
             .retry_evidence = prepared.retry_evidence,
             .expected_revision = self.revision,
             .disposition = prepared.disposition,

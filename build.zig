@@ -38,6 +38,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Reusable administration modules stay internal to the one delivered executable.
+    const client_mod = b.createModule(.{
+        .root_source_file = b.path("client/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    client_mod.addImport("shared", shared_mod);
+    const build_options_mod = build_options.createModule();
+    client_mod.addImport("build_options", build_options_mod);
+
     const engine_mod = b.addModule("engine", .{
         .root_source_file = b.path("engine/main.zig"),
         .target = target,
@@ -45,7 +55,8 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     engine_mod.addImport("shared", shared_mod);
-    engine_mod.addImport("build_options", build_options.createModule());
+    engine_mod.addImport("build_options", build_options_mod);
+    engine_mod.addImport("cli", client_mod);
     engine_mod.linkLibrary(sqlite);
 
     const engine_exe = b.addExecutable(.{
@@ -58,20 +69,6 @@ pub fn build(b: *std.Build) void {
     run_engine.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_engine.addArgs(args);
     b.step("run", "Run the fail2zig daemon").dependOn(&run_engine.step);
-
-    const client_mod = b.createModule(.{
-        .root_source_file = b.path("client/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    client_mod.addImport("shared", shared_mod);
-    client_mod.addImport("build_options", build_options.createModule());
-
-    const client_exe = b.addExecutable(.{
-        .name = "fail2zig-client",
-        .root_module = client_mod,
-    });
-    b.installArtifact(client_exe);
 
     const test_step = b.step("test", "Run all tests (engine, client, shared, integration)");
     const test_filters: []const []const u8 = if (test_filter) |f| &.{f} else &.{};
@@ -121,6 +118,51 @@ pub fn build(b: *std.Build) void {
         b.step(entry[0], "Test isolated N2 native component delivery").dependOn(&run_tests.step);
     }
 
+    // Isolated component roots: never install or read zig-out artifacts.
+    inline for (.{
+        .{ "test-native-ipc-auth", "engine/native_ipc_auth_tests.zig", "native ipc auth:", false },
+        .{ "test-native-migration-snapshot", "engine/migration_snapshot_tests.zig", "migration snapshot:", true },
+        .{ "test-native-migration-inspect", "engine/migration_inspect_tests.zig", "migration inspect:", false },
+        .{ "test-native-admin-store", "engine/native_admin_store_tests.zig", "native admin store:", true },
+        .{ "test-native-reload", "engine/native_reload_tests.zig", "native reload:", false },
+        .{ "test-native-readiness", "engine/native_readiness_tests.zig", "native readiness:", false },
+        .{ "test-native-query", "engine/native_query_tests.zig", "native query:", false },
+        .{ "test-native-migration-plan", "engine/migration_plan_tests.zig", "migration plan:", true },
+        .{ "test-native-rule-test", "engine/native_rule_test_tests.zig", "native rule test:", false },
+        .{ "test-native-migration-store", "engine/native_migration_store_tests.zig", "migration store:", true },
+        .{ "test-native-migration-import", "engine/migration_import_tests.zig", "migration import:", true },
+        .{ "test-native-migration-continuity", "engine/migration_continuity_tests.zig", "migration continuity:", true },
+        .{ "test-native-migration-journal", "engine/migration_journal_tests.zig", "migration journal:", true },
+        .{ "test-native-migration-conflict", "engine/native_migration_conflict_tests.zig", "migration conflict:", true },
+        .{ "test-native-reload-crash", "engine/native_reload_crash_tests.zig", "reload crash:", true },
+    }) |entry| {
+        const module = b.createModule(.{
+            .root_source_file = b.path(entry[1]),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        module.addImport("shared", shared_mod);
+        if (entry[3]) module.linkLibrary(sqlite);
+        const tests = b.addTest(.{ .root_module = module, .filters = &.{entry[2]} });
+        const run_tests = b.addRunArtifact(tests);
+        b.step(entry[0], "Test isolated native component delivery").dependOn(&run_tests.step);
+    }
+
+    // Deterministic coordinator ownership/publication races live beside the private state they
+    // exercise; this root collects only those cases without installing or spawning the daemon.
+    const coordination_mod = b.createModule(.{
+        .root_source_file = b.path("engine/native_daemon.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    coordination_mod.addImport("shared", shared_mod);
+    coordination_mod.addImport("build_options", build_options_mod);
+    coordination_mod.linkLibrary(sqlite);
+    const coordination_tests = b.addTest(.{ .root_module = coordination_mod, .filters = &.{"native daemon BUG-0"} });
+    b.step("test-native-coordination", "Test deterministic daemon ownership and publication races").dependOn(&b.addRunArtifact(coordination_tests).step);
+
     // Native source/storage foundations and retained pure preparation fixtures.
     // The historical step name remains a command alias for this test root.
     const parity_runtime_mod = b.createModule(.{
@@ -129,6 +171,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    parity_runtime_mod.addImport("shared", shared_mod);
     const parity_runtime_tests = b.addTest(.{ .root_module = parity_runtime_mod, .filters = test_filters });
     parity_runtime_mod.linkLibrary(sqlite);
     const run_parity_runtime_tests = b.addRunArtifact(parity_runtime_tests);
@@ -197,6 +240,9 @@ pub fn build(b: *std.Build) void {
     });
     const run_shared_tests = b.addRunArtifact(shared_tests);
     test_step.dependOn(&run_shared_tests.step);
+    const native_cli_step = b.step("test-native-cli", "Test the internal administration modules and shared exit classes");
+    native_cli_step.dependOn(&run_client_tests.step);
+    native_cli_step.dependOn(&run_shared_tests.step);
 
     const guard_options = b.addOptions();
     guard_options.addOption([]const u8, "tests_dir", b.pathFromRoot("tests"));
@@ -242,6 +288,10 @@ pub fn build(b: *std.Build) void {
         .{ .name = "journalctl_contract", .path = "tests/integration/journalctl_contract_test.zig", .needs_daemon_binary = false },
         .{ .name = "config_diag", .path = "tests/integration/config_diag_test.zig", .needs_daemon_binary = true },
         .{ .name = "no_backend", .path = "tests/integration/no_backend_test.zig", .needs_daemon_binary = true },
+        .{ .name = "cli_entry", .path = "tests/integration/cli_entry_test.zig", .needs_daemon_binary = true },
+        .{ .name = "reload", .path = "tests/integration/reload_test.zig", .needs_daemon_binary = true },
+        .{ .name = "service_lifecycle", .path = "tests/integration/service_lifecycle_test.zig", .needs_daemon_binary = true },
+        .{ .name = "admin", .path = "tests/integration/admin_test.zig", .needs_daemon_binary = true },
     };
     for (integration_files) |f| {
         const mod = b.createModule(.{
@@ -259,6 +309,16 @@ pub fn build(b: *std.Build) void {
             b.step("test-startup", "Run daemon startup integration tests").dependOn(&run.step);
         if (std.mem.eql(u8, f.name, "native_daemon"))
             b.step("test-native-daemon", "Run actual native daemon ingestion and restart tests").dependOn(&run.step);
+        if (std.mem.eql(u8, f.name, "config_diag"))
+            b.step("test-config-diag", "Run configuration diagnostic entry-point tests").dependOn(&run.step);
+        if (std.mem.eql(u8, f.name, "admin"))
+            b.step("test-admin", "Run typed administration daemon tests").dependOn(&run.step);
+        if (std.mem.eql(u8, f.name, "reload"))
+            b.step("test-reload", "Run live configuration reload daemon tests").dependOn(&run.step);
+        if (std.mem.eql(u8, f.name, "service_lifecycle"))
+            b.step("test-service-lifecycle", "Run installed service lifecycle (notify, signals, denied paths) tests").dependOn(&run.step);
+        if (std.mem.eql(u8, f.name, "cli_entry"))
+            b.step("test-cli-entry", "Run one-executable entry point and operator round trips").dependOn(&run.step);
         if (std.mem.eql(u8, f.name, "journalctl_contract"))
             b.step("test-journalctl", "Qualify host journalctl against original offline fixtures").dependOn(&run.step);
         test_step.dependOn(&run.step);
