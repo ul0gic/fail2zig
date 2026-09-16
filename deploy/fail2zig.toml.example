@@ -1,115 +1,61 @@
-# fail2zig — example native configuration file
-#
-# Copy this file to /etc/fail2zig/config.toml and edit to taste.
-# (scripts/install.sh seeds config.toml from this example automatically;
-#  the systemd unit runs `fail2zig --config /etc/fail2zig/config.toml`.)
-# All values shown here are the built-in defaults unless noted.
-#
-# Syntax is a strict subset of TOML:
-#   - [section]   and [section.subsection]
-#   - key = "string" | integer | true | false | ["array", "of", "strings"]
-#   - # comments to end of line
-#
-# fail2zig rejects unknown keys at load time — typos are not silently
-# ignored. Error messages include the line and column of the offending
-# token.
-
-# ----------------------------------------------------------------------
-# [global] — daemon-level settings
-# ----------------------------------------------------------------------
 [global]
 
-# Minimum log level emitted to stderr / journald.
-# One of: "debug", "info", "warn", "err"
 log_level = "info"
 
-# PID file location. Parent directory is created at startup if absent.
 pid_file = "/run/fail2zig/fail2zig.pid"
 
-# Unix domain socket for the fail2zig-client CLI.
-# Mode 0660, owned by root:fail2zig (see deploy/fail2zig.service).
-# The daemon creates the parent directory (mode 0710) on startup if it
-# does not exist — matches the client's default `--socket` path.
 socket_path = "/run/fail2zig/fail2zig.sock"
 
-# Persistent state file — restored on restart, atomically rewritten
-# at shutdown and periodically. Parent dir must exist.
 state_file = "/var/lib/fail2zig/state.bin"
 
-# Memory ceiling for the daemon (MB). The state tracker is sized from
-# this value: ceiling → entry capacity (≈ ceiling_MB×1024²/1536 entries).
-# When that cap is reached, oldest unbanned entries are evicted rather
-# than growing — so tracked-IP state cannot expand under attack.
-# This is not a per-component byte cap on every allocator. Minimum 16 MB.
 memory_ceiling_mb = 64
 
-# HTTP endpoint that exposes Prometheus `/metrics` and JSON `/api/status`.
-# The same port also upgrades WebSocket connections on `/events` for the
-# real-time dashboard. Bound to localhost by default — exposing this
-# publicly leaks operational telemetry.
+metrics_enabled = true
 metrics_bind = "127.0.0.1"
 metrics_port = 9100
 
-# ----------------------------------------------------------------------
-# [defaults] — applied to every jail unless overridden under [jails.X]
-# ----------------------------------------------------------------------
+firewall = "auto"
+
+on_no_backend = "fail-closed"
+
 [defaults]
 
-# Seconds a banned IP stays banned.
-bantime = 600
+bantime = "10m"
 
-# Sliding window (seconds) over which `maxretry` failures trigger a ban.
-findtime = 600
+findtime = "10m"
 
-# Number of failures within `findtime` that triggers a ban.
 maxretry = 5
 
-# Firewall backend. fail2zig picks the best available at startup if
-# "nftables" is requested on a system without nf_tables; explicit values
-# here are honored exactly.
-# One of: "nftables", "iptables", "ipset", "log-only"
 banaction = "nftables"
 
-# List of CIDRs / IPs that are never banned. Applied before any jail
-# logic — matching lines are dropped early.
 ignoreip = ["127.0.0.1/8", "::1"]
 
-# ----------------------------------------------------------------------
-# [jails.<name>] — one table per jail
-# ----------------------------------------------------------------------
 
-# Protect SSH — the classic fail2ban baseline jail.
 [jails.sshd]
 enabled = true
 filter  = "sshd"
-logpath = ["/var/log/auth.log", "/var/log/secure"]
-maxretry = 3              # stricter than the default 5
-bantime  = 3600           # 1 hour first offence
-# ignoreip is inherited from [defaults] when unset.
+source = "journald"
+journal_executables = ["/usr/sbin/sshd", "/usr/lib/openssh/sshd-session"]
+maxretry = 3
+bantime  = "1h"
 
-# Progressive bantime increase — each re-ban extends the window.
-# Formula: linear     -> next_bantime = bantime * multiplier * ban_count
-#          exponential-> next_bantime = bantime * multiplier ^ ban_count
-# Capped at `bantime_increment_max_bantime`.
 bantime_increment_enabled    = true
 bantime_increment_multiplier = 2
 bantime_increment_formula    = "exponential"
-bantime_increment_max_bantime = 604800   # 1 week ceiling
+bantime_increment_max_bantime = "1w"
 
-# Escalate repeat offenders. Every confirmed ban in any other jail counts as one
-# attempt here — fed in-process (source resolves to "internal"), no log file
-# needed. Two bans within a day earn a week.
 [jails.recidive]
 enabled  = true
 filter   = "recidive"
+source   = "internal"
 maxretry = 2
-findtime = 86400
-bantime  = 604800
+findtime = "1d"
+bantime  = "1w"
 
-# Protect nginx against credential-stuffing on basic-auth endpoints.
 [jails.nginx-http-auth]
-enabled = true
+enabled = false
 filter  = "nginx-http-auth"
+source = "file"
+timestamp = "undated"
 logpath = ["/var/log/nginx/error.log"]
-# maxretry / findtime / bantime inherit from [defaults].
 ignoreip = ["192.168.0.0/16"]

@@ -1,21 +1,4 @@
 #!/usr/bin/env bash
-# tests/harness/inject.sh — synthesize realistic log lines for a given jail.
-#
-# Runs on the *target* box. Writes lines matching the named filter's
-# patterns into the log file that jail is configured to watch, so
-# fail2zig's inotify watcher picks them up and drives the full
-# detect → state → backend pipeline.
-#
-# Usage:
-#     inject.sh <jail> <source-ip> <count> [--delay-ms N]
-#
-# Supported jails: sshd, nginx-http-auth, nginx-botsearch, postfix,
-# apache-auth, dovecot. Each corresponds to a built-in filter shipped
-# with fail2zig — see engine/filters/*.zig for the pattern definitions.
-#
-# For sshd, writes via `logger -p auth.info` (routes through rsyslog to
-# auth.log). For file-based jails (nginx/apache/mail), writes directly
-# to the log file via `sudo tee -a`.
 
 set -euo pipefail
 
@@ -46,10 +29,6 @@ done
 
 delay_s=$(awk -v ms="$delay_ms" 'BEGIN{printf "%.3f", ms/1000.0}')
 
-# Writer: either `logger` (for sshd via auth facility) or `sudo tee -a`
-# for jails reading a specific log file.
-#
-# Args: $1 = log-line body.
 emit() {
     local body="$1"
     case "$jail" in

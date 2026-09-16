@@ -2,12 +2,14 @@
 // Copyright (c) 2026 fail2zig maintainers
 
 const std = @import("std");
+const native_endian = @import("builtin").cpu.arch.endian();
 const linux = std.os.linux;
 const mem = std.mem;
 
 const shared = @import("shared");
 const backend = @import("backend.zig");
 const netlink = @import("netlink.zig");
+const canonical = @import("scope.zig");
 
 pub const NFT_MSG = struct {
     pub const NEWTABLE: u16 = 0;
@@ -47,7 +49,6 @@ pub const NFTA_HOOK = struct {
     pub const PRIORITY: u16 = 2;
 };
 
-// Kernel ABI: TIMEOUT is 11; 10 is NFTA_SET_ID and the kernel silently accepts it with no timeout.
 pub const NFTA_SET = struct {
     pub const TABLE: u16 = 1;
     pub const NAME: u16 = 2;
@@ -66,7 +67,6 @@ pub const NFTA_SET_ELEM_LIST = struct {
 
 pub const NFTA_LIST_ELEM: u16 = 1;
 
-// Kernel ABI: TIMEOUT is 4; 6 is USERDATA and yields untimed elements with garbage comments.
 pub const NFTA_SET_ELEM = struct {
     pub const KEY: u16 = 1;
     pub const TIMEOUT: u16 = 4;
@@ -94,7 +94,9 @@ pub const NF_INET_HOOK = struct {
 pub const NFTA_RULE = struct {
     pub const TABLE: u16 = 1;
     pub const CHAIN: u16 = 2;
+    pub const HANDLE: u16 = 3;
     pub const EXPRESSIONS: u16 = 4;
+    pub const USERDATA: u16 = 7;
 };
 
 pub const NFTA_EXPR = struct {
@@ -135,6 +137,7 @@ pub const NFTA_META = struct {
 
 pub const NFT_META = struct {
     pub const NFPROTO: u32 = 15;
+    pub const L4PROTO: u32 = 16;
 };
 
 pub const NFTA_CMP = struct {
@@ -145,6 +148,16 @@ pub const NFTA_CMP = struct {
 
 pub const NFT_CMP = struct {
     pub const EQ: u32 = 0;
+    pub const LTE: u32 = 3;
+    pub const GTE: u32 = 5;
+};
+
+pub const NFTA_BITWISE = struct {
+    pub const SREG: u16 = 1;
+    pub const DREG: u16 = 2;
+    pub const LEN: u16 = 3;
+    pub const MASK: u16 = 4;
+    pub const XOR: u16 = 5;
 };
 
 pub const NFT_PAYLOAD = struct {
@@ -184,8 +197,8 @@ fn appendAttr(
     const total = NLA_HDRLEN + value.len;
     const aligned = nlaAlign(total);
     if (offset + aligned > buf.len) return error.BufferTooSmall;
-    mem.writeInt(u16, buf[offset..][0..2], @intCast(total), .little);
-    mem.writeInt(u16, buf[offset + 2 ..][0..2], attr_type, .little);
+    mem.writeInt(u16, buf[offset..][0..2], @intCast(total), native_endian);
+    mem.writeInt(u16, buf[offset + 2 ..][0..2], attr_type, native_endian);
     if (value.len > 0) {
         @memcpy(buf[offset + NLA_HDRLEN .. offset + total], value);
     }
@@ -226,8 +239,8 @@ fn appendStringNul(
     const total = NLA_HDRLEN + str.len + 1;
     const aligned = nlaAlign(total);
     if (offset + aligned > buf.len) return error.BufferTooSmall;
-    mem.writeInt(u16, buf[offset..][0..2], @intCast(total), .little);
-    mem.writeInt(u16, buf[offset + 2 ..][0..2], attr_type, .little);
+    mem.writeInt(u16, buf[offset..][0..2], @intCast(total), native_endian);
+    mem.writeInt(u16, buf[offset + 2 ..][0..2], attr_type, native_endian);
     @memcpy(buf[offset + NLA_HDRLEN .. offset + NLA_HDRLEN + str.len], str);
     buf[offset + NLA_HDRLEN + str.len] = 0;
     if (aligned > total) {
@@ -242,8 +255,8 @@ fn beginNested(
     attr_type: u16,
 ) netlink.Error!usize {
     if (offset + NLA_HDRLEN > buf.len) return error.BufferTooSmall;
-    mem.writeInt(u16, buf[offset..][0..2], 0, .little);
-    mem.writeInt(u16, buf[offset + 2 ..][0..2], attr_type | NLA_F_NESTED, .little);
+    mem.writeInt(u16, buf[offset..][0..2], 0, native_endian);
+    mem.writeInt(u16, buf[offset + 2 ..][0..2], attr_type | NLA_F_NESTED, native_endian);
     return offset + NLA_HDRLEN;
 }
 
@@ -251,7 +264,7 @@ fn endNested(buf: []u8, header_offset: usize, cur_offset: usize) netlink.Error!u
     const inner_len = cur_offset - header_offset;
     const total = NLA_HDRLEN + inner_len;
     const aligned = nlaAlign(total);
-    mem.writeInt(u16, buf[header_offset - NLA_HDRLEN ..][0..2], @intCast(total), .little);
+    mem.writeInt(u16, buf[header_offset - NLA_HDRLEN ..][0..2], @intCast(total), native_endian);
     if (aligned > total) {
         if (cur_offset + (aligned - total) > buf.len) return error.BufferTooSmall;
         @memset(buf[cur_offset .. cur_offset + (aligned - total)], 0);
@@ -271,6 +284,22 @@ pub fn buildTablePayload(
     var offset: usize = @sizeOf(netlink.nfgenmsg);
     offset = try appendStringNul(buf, offset, NFTA_TABLE.NAME, table_name);
     return buf[0..offset];
+}
+
+pub fn buildSetQueryPayload(buf: []u8, table_name: []const u8, set_name: []const u8) netlink.Error![]const u8 {
+    if (buf.len < @sizeOf(netlink.nfgenmsg)) return error.BufferTooSmall;
+    const header = netlink.nfgenmsg{ .nfgen_family = netlink.NFPROTO.INET, .version = 0, .res_id = 0 };
+    @memcpy(buf[0..@sizeOf(netlink.nfgenmsg)], mem.asBytes(&header));
+    var offset: usize = @sizeOf(netlink.nfgenmsg);
+    offset = try appendStringNul(buf, offset, NFTA_SET_ELEM_LIST.TABLE, table_name);
+    offset = try appendStringNul(buf, offset, NFTA_SET_ELEM_LIST.SET, set_name);
+    return buf[0..offset];
+}
+
+pub fn buildOwnedTablePayload(buf: []u8, table_name: []const u8, marker: []const u8) netlink.Error![]const u8 {
+    const base = try buildTablePayload(buf, netlink.NFPROTO.INET, table_name);
+    const end = try appendAttr(buf, base.len, 6, marker);
+    return buf[0..end];
 }
 
 pub fn buildSetPayload(
@@ -444,6 +473,182 @@ pub fn buildDropRulePayload(
     return buf[0..offset];
 }
 
+pub const max_scope_rule_parts: usize = 30;
+pub const ScopeBuildError = netlink.Error || canonical.Error || error{InvalidRulePart};
+pub const RulePart = struct { protocol: ?canonical.Protocol, port: ?canonical.PortRange };
+
+pub fn scopeRulePartCount(scope: canonical.Scope) ScopeBuildError!usize {
+    try scope.validate();
+    const protocols: usize = if (scope.protocols.isAll()) 1 else blk: {
+        var count: usize = 0;
+        inline for (.{ canonical.Protocol.tcp, .udp, .icmp_v4, .icmp_v6 }) |value|
+            count += @intFromBool(scope.protocols.contains(value));
+        break :blk count;
+    };
+    const ports: usize = if (scope.ports.isAll()) 1 else scope.ports.len;
+    const count = std.math.mul(usize, protocols, ports) catch return error.InvalidRulePart;
+    if (count == 0 or count > max_scope_rule_parts) return error.InvalidRulePart;
+    return count;
+}
+
+pub fn scopeRulePart(scope: canonical.Scope, wanted: usize) ScopeBuildError!RulePart {
+    const count = try scopeRulePartCount(scope);
+    if (wanted >= count) return error.InvalidRulePart;
+    var protocols: [4]?canonical.Protocol = @splat(null);
+    var protocol_count: usize = 0;
+    if (scope.protocols.isAll()) {
+        protocol_count = 1;
+    } else {
+        inline for (.{ canonical.Protocol.tcp, .udp, .icmp_v4, .icmp_v6 }) |value| {
+            if (scope.protocols.contains(value)) {
+                protocols[protocol_count] = value;
+                protocol_count += 1;
+            }
+        }
+    }
+    const port_count: usize = if (scope.ports.isAll()) 1 else scope.ports.len;
+    const protocol_index = wanted / port_count;
+    const port_index = wanted % port_count;
+    return .{
+        .protocol = if (scope.protocols.isAll()) null else protocols[protocol_index],
+        .port = if (scope.ports.isAll()) null else scope.ports.ranges[port_index],
+    };
+}
+
+fn appendExpressionStart(buf: []u8, offset: usize, name: []const u8) netlink.Error!struct { list: usize, data: usize, offset: usize } {
+    const list = try beginNested(buf, offset, NFTA_LIST_ELEM);
+    var next = try appendStringNul(buf, list, NFTA_EXPR.NAME, name);
+    const data = try beginNested(buf, next, NFTA_EXPR.DATA);
+    next = data;
+    return .{ .list = list, .data = data, .offset = next };
+}
+
+fn appendExpressionEnd(buf: []u8, value: anytype) netlink.Error!usize {
+    const data_end = try endNested(buf, value.data, value.offset);
+    return endNested(buf, value.list, data_end);
+}
+
+fn appendMetaLoad(buf: []u8, offset: usize, key: u32) netlink.Error!usize {
+    var expression = try appendExpressionStart(buf, offset, "meta");
+    expression.offset = try appendU32BE(buf, expression.offset, NFTA_META.DREG, NFT_REG.REG_1);
+    expression.offset = try appendU32BE(buf, expression.offset, NFTA_META.KEY, key);
+    return appendExpressionEnd(buf, expression);
+}
+
+fn appendPayloadLoad(buf: []u8, offset: usize, base: u32, at: u32, len: u32) netlink.Error!usize {
+    var expression = try appendExpressionStart(buf, offset, "payload");
+    expression.offset = try appendU32BE(buf, expression.offset, NFTA_PAYLOAD.DREG, NFT_REG.REG_1);
+    expression.offset = try appendU32BE(buf, expression.offset, NFTA_PAYLOAD.BASE, base);
+    expression.offset = try appendU32BE(buf, expression.offset, NFTA_PAYLOAD.OFFSET, at);
+    expression.offset = try appendU32BE(buf, expression.offset, NFTA_PAYLOAD.LEN, len);
+    return appendExpressionEnd(buf, expression);
+}
+
+fn appendCompare(buf: []u8, offset: usize, operation: u32, value: []const u8) netlink.Error!usize {
+    var expression = try appendExpressionStart(buf, offset, "cmp");
+    expression.offset = try appendU32BE(buf, expression.offset, NFTA_CMP.SREG, NFT_REG.REG_1);
+    expression.offset = try appendU32BE(buf, expression.offset, NFTA_CMP.OP, operation);
+    const data = try beginNested(buf, expression.offset, NFTA_CMP.DATA);
+    expression.offset = try appendAttr(buf, data, NFTA_DATA.VALUE, value);
+    expression.offset = try endNested(buf, data, expression.offset);
+    return appendExpressionEnd(buf, expression);
+}
+
+fn appendBitwiseMask(buf: []u8, offset: usize, mask: []const u8) netlink.Error!usize {
+    var expression = try appendExpressionStart(buf, offset, "bitwise");
+    expression.offset = try appendU32BE(buf, expression.offset, NFTA_BITWISE.SREG, NFT_REG.REG_1);
+    expression.offset = try appendU32BE(buf, expression.offset, NFTA_BITWISE.DREG, NFT_REG.REG_1);
+    expression.offset = try appendU32BE(buf, expression.offset, NFTA_BITWISE.LEN, @intCast(mask.len));
+    const mask_data = try beginNested(buf, expression.offset, NFTA_BITWISE.MASK);
+    expression.offset = try appendAttr(buf, mask_data, NFTA_DATA.VALUE, mask);
+    expression.offset = try endNested(buf, mask_data, expression.offset);
+    const zero: [16]u8 = @splat(0);
+    const xor_data = try beginNested(buf, expression.offset, NFTA_BITWISE.XOR);
+    expression.offset = try appendAttr(buf, xor_data, NFTA_DATA.VALUE, zero[0..mask.len]);
+    expression.offset = try endNested(buf, xor_data, expression.offset);
+    return appendExpressionEnd(buf, expression);
+}
+
+fn appendDrop(buf: []u8, offset: usize) netlink.Error!usize {
+    var expression = try appendExpressionStart(buf, offset, "immediate");
+    expression.offset = try appendU32BE(buf, expression.offset, NFTA_IMMEDIATE.DREG, NFT_REG.VERDICT);
+    const data = try beginNested(buf, expression.offset, NFTA_IMMEDIATE.DATA);
+    const verdict = try beginNested(buf, data, NFTA_DATA.VERDICT);
+    expression.offset = try appendU32BE(buf, verdict, NFTA_VERDICT.CODE, NF_VERDICT.DROP);
+    expression.offset = try endNested(buf, verdict, expression.offset);
+    expression.offset = try endNested(buf, data, expression.offset);
+    return appendExpressionEnd(buf, expression);
+}
+
+pub fn buildScopedDropRulePayload(
+    buf: []u8,
+    table_name: []const u8,
+    chain_name: []const u8,
+    scope: canonical.Scope,
+    part_index: usize,
+    userdata: []const u8,
+) ScopeBuildError![]const u8 {
+    const part = try scopeRulePart(scope, part_index);
+    if (userdata.len == 0 or userdata.len > 256) return error.InvalidRulePart;
+    if (buf.len < @sizeOf(netlink.nfgenmsg)) return error.BufferTooSmall;
+    const ng: *netlink.nfgenmsg = @alignCast(@ptrCast(&buf[0]));
+    ng.* = .{ .nfgen_family = netlink.NFPROTO.INET, .version = 0, .res_id = 0 };
+    var offset: usize = @sizeOf(netlink.nfgenmsg);
+    offset = try appendStringNul(buf, offset, NFTA_RULE.TABLE, table_name);
+    offset = try appendStringNul(buf, offset, NFTA_RULE.CHAIN, chain_name);
+    const expressions = try beginNested(buf, offset, NFTA_RULE.EXPRESSIONS);
+    offset = expressions;
+
+    offset = try appendMetaLoad(buf, offset, NFT_META.NFPROTO);
+    offset = try appendCompare(buf, offset, NFT_CMP.EQ, &.{if (scope.subject.family == .v4) netlink.NFPROTO.IPV4 else netlink.NFPROTO.IPV6});
+    const address_len: u32 = if (scope.subject.family == .v4) 4 else 16;
+    offset = try appendPayloadLoad(buf, offset, NFT_PAYLOAD.NETWORK_HEADER, if (scope.subject.family == .v4) IPV4_SADDR_OFFSET else IPV6_SADDR_OFFSET, address_len);
+    const width: u8 = if (scope.subject.family == .v4) 32 else 128;
+    if (scope.subject.prefix != width) {
+        var mask: [16]u8 = @splat(0);
+        for (0..scope.subject.prefix) |bit_index| mask[bit_index / 8] |= @as(u8, 0x80) >> @intCast(bit_index % 8);
+        offset = try appendBitwiseMask(buf, offset, mask[0..address_len]);
+    }
+    offset = try appendCompare(buf, offset, NFT_CMP.EQ, scope.subject.address[0..address_len]);
+    if (part.protocol) |protocol| {
+        offset = try appendMetaLoad(buf, offset, NFT_META.L4PROTO);
+        const number: u8 = switch (protocol) {
+            .tcp => 6,
+            .udp => 17,
+            .icmp_v4 => 1,
+            .icmp_v6 => 58,
+            .all => return error.InvalidRulePart,
+        };
+        offset = try appendCompare(buf, offset, NFT_CMP.EQ, &.{number});
+    }
+    if (part.port) |port| {
+        offset = try appendPayloadLoad(buf, offset, NFT_PAYLOAD.TRANSPORT_HEADER, 2, 2);
+        var first: [2]u8 = undefined;
+        mem.writeInt(u16, &first, port.first, .big);
+        offset = try appendCompare(buf, offset, if (port.first == port.last) NFT_CMP.EQ else NFT_CMP.GTE, &first);
+        if (port.first != port.last) {
+            var last: [2]u8 = undefined;
+            mem.writeInt(u16, &last, port.last, .big);
+            offset = try appendCompare(buf, offset, NFT_CMP.LTE, &last);
+        }
+    }
+    offset = try appendDrop(buf, offset);
+    offset = try endNested(buf, expressions, offset);
+    offset = try appendAttr(buf, offset, NFTA_RULE.USERDATA, userdata);
+    return buf[0..offset];
+}
+
+pub fn buildRuleDeletePayload(buf: []u8, table_name: []const u8, chain_name: []const u8, handle: u64) netlink.Error![]const u8 {
+    if (handle == 0 or buf.len < @sizeOf(netlink.nfgenmsg)) return error.BufferTooSmall;
+    const ng: *netlink.nfgenmsg = @alignCast(@ptrCast(&buf[0]));
+    ng.* = .{ .nfgen_family = netlink.NFPROTO.INET, .version = 0, .res_id = 0 };
+    var offset: usize = @sizeOf(netlink.nfgenmsg);
+    offset = try appendStringNul(buf, offset, NFTA_RULE.TABLE, table_name);
+    offset = try appendStringNul(buf, offset, NFTA_RULE.CHAIN, chain_name);
+    offset = try appendU64BE(buf, offset, NFTA_RULE.HANDLE, handle);
+    return buf[0..offset];
+}
+
 fn buildSetElemPayload(
     buf: []u8,
     family: u8,
@@ -519,8 +724,6 @@ pub fn probeReason() ProbeResult {
     defer sock.close();
     sock.setRecvTimeout(PROBE_RECV_TIMEOUT_MS) catch return .transient;
 
-    // Opening the socket succeeds without CAP_NET_ADMIN; nfnetlink gates every message on it,
-    // so a read-only GETGEN round-trip is what actually proves the backend is usable.
     var msg_buf: [64]u8 = undefined;
     var builder = netlink.MessageBuilder.init(&msg_buf);
     const seq = sock.nextSeq();
@@ -547,7 +750,6 @@ pub fn probeReasonFromInitError(err: netlink.Error) ProbeResult {
     };
 }
 
-/// EINVAL on GETGEN means nfnetlink is present but the nf_tables subsystem could not be loaded.
 pub fn probeReasonFromAckError(err: netlink.Error) ProbeResult {
     return switch (err) {
         error.PermissionDenied => .permission_denied,
@@ -814,9 +1016,20 @@ fn banImpl(
 ) backend.BackendError!void {
     _ = jail;
     const self = castSelf(ctx);
+    putElement(self, ip, duration, false) catch |err| switch (err) {
+        error.AlreadyBanned => putElement(self, ip, duration, true) catch |replace_err| switch (replace_err) {
+            error.NotBanned => try putElement(self, ip, duration, false),
+            else => return replace_err,
+        },
+        else => return err,
+    };
+}
+
+fn putElement(self: *NftablesBackend, ip: shared.IpAddress, duration: shared.Duration, replace: bool) backend.BackendError!void {
     if (!self.initialized) return error.NotAvailable;
     var sock_ptr = &(self.sock orelse return error.NotAvailable);
 
+    const milliseconds = std.math.mul(u64, duration, 1000) catch return error.SystemError;
     var msg_buf: [512]u8 = undefined;
     const payload = switch (ip) {
         .ipv4 => |v| blk: {
@@ -828,7 +1041,7 @@ fn banImpl(
                 self.tableName(),
                 "banned_ipv4",
                 &key,
-                duration * 1000,
+                milliseconds,
             ) catch |e| return mapNetlinkErr(e);
         },
         .ipv6 => |v| blk: {
@@ -840,7 +1053,7 @@ fn banImpl(
                 self.tableName(),
                 "banned_ipv6",
                 &key,
-                duration * 1000,
+                milliseconds,
             ) catch |e| return mapNetlinkErr(e);
         },
     };
@@ -849,10 +1062,33 @@ fn banImpl(
     var batch = netlink.Batch.init(&batch_buf);
     const begin_seq = sock_ptr.nextSeq();
     batch.begin(begin_seq, sock_ptr.port_id, netlink.NFNL.SUBSYS_NFTABLES) catch |e| return mapNetlinkErr(e);
+    var sequences: [2]u32 = undefined;
+    var sequence_count: usize = 0;
+    if (replace) {
+        var key: [16]u8 = undefined;
+        const key_bytes = switch (ip) {
+            .ipv4 => |v| blk: {
+                mem.writeInt(u32, key[0..4], v, .big);
+                break :blk key[0..4];
+            },
+            .ipv6 => |v| blk: {
+                mem.writeInt(u128, &key, v, .big);
+                break :blk key[0..16];
+            },
+        };
+        var del_buf: [512]u8 = undefined;
+        const del_payload = buildSetElemDelPayload(&del_buf, netlink.NFPROTO.INET, self.tableName(), if (ip == .ipv4) "banned_ipv4" else "banned_ipv6", key_bytes) catch |e| return mapNetlinkErr(e);
+        const del_seq = sock_ptr.nextSeq();
+        batch.add(netlink.nfnlMsgType(netlink.NFNL.SUBSYS_NFTABLES, NFT_MSG.DELSETELEM), linux.NLM_F_REQUEST | linux.NLM_F_ACK, del_seq, sock_ptr.port_id, del_payload) catch |e| return mapNetlinkErr(e);
+        sequences[sequence_count] = del_seq;
+        sequence_count += 1;
+    }
     const elem_seq = sock_ptr.nextSeq();
+    sequences[sequence_count] = elem_seq;
+    sequence_count += 1;
     batch.add(
         netlink.nfnlMsgType(netlink.NFNL.SUBSYS_NFTABLES, NFT_MSG.NEWSETELEM),
-        linux.NLM_F_REQUEST | linux.NLM_F_ACK | linux.NLM_F_CREATE,
+        linux.NLM_F_REQUEST | linux.NLM_F_ACK | linux.NLM_F_CREATE | linux.NLM_F_EXCL,
         elem_seq,
         sock_ptr.port_id,
         payload,
@@ -863,7 +1099,7 @@ fn banImpl(
     sock_ptr.send(out) catch return error.SystemError;
 
     var ack_buf: [1024]u8 = undefined;
-    sock_ptr.drainAck(&[_]u32{elem_seq}, &ack_buf) catch |e| return mapNetlinkErr(e);
+    sock_ptr.drainAck(sequences[0..sequence_count], &ack_buf) catch |e| return mapNetlinkErr(e);
 }
 
 fn unbanImpl(
@@ -1035,8 +1271,8 @@ test "nftables: buildChainPayload emits table + name + hook + type + policy" {
 
     var i: usize = 4;
     while (i + 4 <= out.len) {
-        const attr_len = mem.readInt(u16, out[i..][0..2], .little);
-        const attr_type_raw = mem.readInt(u16, out[i + 2 ..][0..2], .little);
+        const attr_len = mem.readInt(u16, out[i..][0..2], native_endian);
+        const attr_type_raw = mem.readInt(u16, out[i + 2 ..][0..2], native_endian);
         const attr_type = attr_type_raw & ~NLA_F_NESTED;
         const payload_start = i + 4;
         const payload_end = i + attr_len;
@@ -1055,8 +1291,8 @@ test "nftables: buildChainPayload emits table + name + hook + type + policy" {
                 seen_hook = true;
                 var j: usize = 0;
                 while (j + 4 <= payload.len) {
-                    const sub_len = mem.readInt(u16, payload[j..][0..2], .little);
-                    const sub_type = mem.readInt(u16, payload[j + 2 ..][0..2], .little) & ~NLA_F_NESTED;
+                    const sub_len = mem.readInt(u16, payload[j..][0..2], native_endian);
+                    const sub_type = mem.readInt(u16, payload[j + 2 ..][0..2], native_endian) & ~NLA_F_NESTED;
                     if (sub_len < 8 or j + sub_len > payload.len) break;
                     const sub_payload = payload[j + 4 .. j + sub_len];
                     if (sub_type == NFTA_HOOK.HOOKNUM) {
@@ -1248,8 +1484,8 @@ test "nftables: buildSetPayload omits NFTA_SET_TIMEOUT when timeout is 0 (SYS-00
     var saw_id = false;
     var i: usize = 4;
     while (i + 4 <= out.len) {
-        const attr_len = mem.readInt(u16, out[i..][0..2], .little);
-        const attr_type = mem.readInt(u16, out[i + 2 ..][0..2], .little) & ~NLA_F_NESTED;
+        const attr_len = mem.readInt(u16, out[i..][0..2], native_endian);
+        const attr_type = mem.readInt(u16, out[i + 2 ..][0..2], native_endian) & ~NLA_F_NESTED;
         if (attr_len < 4) break;
         if (attr_type == NFTA_SET.TIMEOUT) saw_timeout = true;
         if (attr_type == NFTA_SET.ID) saw_id = true;
@@ -1271,8 +1507,8 @@ test "nftables: appendAttr emits correct TLV layout" {
     var buf: [32]u8 = undefined;
     const end = try appendAttr(&buf, 0, NFTA_TABLE.NAME, "abc");
     try std.testing.expectEqual(@as(usize, 8), end);
-    try std.testing.expectEqual(@as(u16, 7), mem.readInt(u16, buf[0..2], .little));
-    try std.testing.expectEqual(@as(u16, NFTA_TABLE.NAME), mem.readInt(u16, buf[2..4], .little));
+    try std.testing.expectEqual(@as(u16, 7), mem.readInt(u16, buf[0..2], native_endian));
+    try std.testing.expectEqual(@as(u16, NFTA_TABLE.NAME), mem.readInt(u16, buf[2..4], native_endian));
     try std.testing.expectEqualSlices(u8, "abc", buf[4..7]);
     try std.testing.expectEqual(@as(u8, 0), buf[7]);
 }
@@ -1281,7 +1517,7 @@ test "nftables: appendStringNul includes terminating NUL" {
     var buf: [16]u8 = undefined;
     const end = try appendStringNul(&buf, 0, NFTA_TABLE.NAME, "ab");
     try std.testing.expectEqual(@as(usize, 8), end);
-    try std.testing.expectEqual(@as(u16, 7), mem.readInt(u16, buf[0..2], .little));
+    try std.testing.expectEqual(@as(u16, 7), mem.readInt(u16, buf[0..2], native_endian));
     try std.testing.expectEqualStrings("ab", buf[4..6]);
     try std.testing.expectEqual(@as(u8, 0), buf[6]);
 }
@@ -1301,8 +1537,8 @@ test "nftables: buildTablePayload contains nfgenmsg + name TLV" {
     try std.testing.expectEqual(@as(u8, 0), out[1]);
     try std.testing.expectEqual(@as(u16, 0), mem.readInt(u16, out[2..4], .big));
 
-    const tlv_len = mem.readInt(u16, out[4..6], .little);
-    const tlv_type = mem.readInt(u16, out[6..8], .little);
+    const tlv_len = mem.readInt(u16, out[4..6], native_endian);
+    const tlv_type = mem.readInt(u16, out[6..8], native_endian);
     try std.testing.expectEqual(@as(u16, NFTA_TABLE.NAME), tlv_type);
     try std.testing.expectEqual(@as(u16, 4 + 9), tlv_len);
     try std.testing.expectEqualStrings("fail2zig", out[8..16]);
@@ -1330,8 +1566,8 @@ test "nftables: buildSetPayload sets TIMEOUT flag and correct key type" {
     var seen_name = false;
     var i: usize = 4;
     while (i + 4 <= out.len) {
-        const attr_len = mem.readInt(u16, out[i..][0..2], .little);
-        const attr_type = mem.readInt(u16, out[i + 2 ..][0..2], .little);
+        const attr_len = mem.readInt(u16, out[i..][0..2], native_endian);
+        const attr_type = mem.readInt(u16, out[i + 2 ..][0..2], native_endian);
         const payload_start = i + 4;
         const payload_end = i + attr_len;
         if (payload_end > out.len) break;
@@ -1424,8 +1660,8 @@ test "nftables: buildSetElemAddPayload for IPv6 emits 16-byte key" {
     var saw_key = false;
     var i: usize = 0;
     while (i + 4 + 16 <= out.len) : (i += 1) {
-        const attr_len = mem.readInt(u16, out[i..][0..2], .little);
-        const attr_type = mem.readInt(u16, out[i + 2 ..][0..2], .little) & ~NLA_F_NESTED;
+        const attr_len = mem.readInt(u16, out[i..][0..2], native_endian);
+        const attr_type = mem.readInt(u16, out[i + 2 ..][0..2], native_endian) & ~NLA_F_NESTED;
         if (attr_type != NFTA_DATA_VALUE or attr_len != 4 + 16) continue;
         const payload = out[i + 4 .. i + 4 + 16];
         var all_zero_except_last = true;
@@ -1454,8 +1690,8 @@ test "nftables: buildSetElemDelPayload omits timeout attribute" {
     var contains_timeout = false;
     var i: usize = 4;
     while (i + 4 <= out.len) {
-        const attr_len = mem.readInt(u16, out[i..][0..2], .little);
-        const attr_type = mem.readInt(u16, out[i + 2 ..][0..2], .little) & ~NLA_F_NESTED;
+        const attr_len = mem.readInt(u16, out[i..][0..2], native_endian);
+        const attr_type = mem.readInt(u16, out[i + 2 ..][0..2], native_endian) & ~NLA_F_NESTED;
         if (attr_type == NFTA_SET_ELEM.TIMEOUT and attr_len == 12) contains_timeout = true;
         if (attr_len < 4) break;
         i += nlaAlign(attr_len);

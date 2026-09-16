@@ -75,7 +75,7 @@ pub const SocketClient = struct {
         }
         if (e == error.AccessDenied) {
             self.setErr(
-                "Permission denied. fail2zig-client requires group 'fail2zig' membership.",
+                "Permission denied. fail2zig requires group 'fail2zig' membership.",
                 .{},
             );
             return error.PermissionDenied;
@@ -160,7 +160,7 @@ pub fn connect(
             },
             error.PermissionDenied => {
                 diag.set(
-                    "Permission denied. fail2zig-client requires group 'fail2zig' membership.",
+                    "Permission denied. fail2zig requires group 'fail2zig' membership.",
                     .{},
                 );
                 return error.PermissionDenied;

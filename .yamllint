@@ -1,7 +1,4 @@
 ---
-# yamllint configuration for fail2zig.
-# Used by CI (.github/workflows/ci.yml) and `make lint`.
-
 extends: default
 
 rules:
@@ -9,12 +6,10 @@ rules:
     max: 160
     level: error
   truthy:
-    # GitHub Actions uses `on:` as a key; don't reject it as "truthy".
     check-keys: false
   document-start: disable
   comments:
     min-spaces-from-content: 1
-  # CI uses long matrix blocks; allow slightly richer indentation.
   indentation:
     spaces: 2
     indent-sequences: true

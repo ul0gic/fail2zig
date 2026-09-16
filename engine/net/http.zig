@@ -27,7 +27,7 @@ pub const Error = error{
     AlreadyStarted,
     OutOfMemory,
     NotLinux,
-};
+} || posix.BindError;
 
 pub const MetricsSource = struct {
     ctx: ?*anyopaque = null,
@@ -107,6 +107,7 @@ pub const HttpServer = struct {
     started: bool = false,
     metrics_source: MetricsSource = .{},
     status_source: StatusSource = .{},
+    health_source: StatusSource = .{},
     bans_source: BansSource = .{},
     ws_server: ?*ws_mod.WsServer = null,
     clients: [max_clients]?*ClientReg = [_]?*ClientReg{null} ** max_clients,
@@ -138,8 +139,7 @@ pub const HttpServer = struct {
             .zero = [_]u8{0} ** 8,
         };
         const addr_len: posix.socklen_t = @sizeOf(linux.sockaddr.in);
-        posix.bind(fd, @ptrCast(&addr), addr_len) catch
-            return error.BindFailed;
+        try posix.bind(fd, @ptrCast(&addr), addr_len);
 
         posix.listen(fd, @intCast(max_clients)) catch return error.ListenFailed;
 
@@ -183,6 +183,9 @@ pub const HttpServer = struct {
         self.metrics_source = s;
     }
 
+    pub fn setHealthSource(self: *HttpServer, s: StatusSource) void {
+        self.health_source = s;
+    }
     pub fn setStatusSource(self: *HttpServer, s: StatusSource) void {
         self.status_source = s;
     }
@@ -365,6 +368,9 @@ pub const HttpServer = struct {
         } else if (std.mem.eql(u8, path, "/api/status")) {
             try self.respondStatus(cli.fd);
             return .close;
+        } else if (std.mem.eql(u8, path, "/api/health")) {
+            try self.respondHealth(cli.fd);
+            return .close;
         } else if (std.mem.eql(u8, path, "/api/bans")) {
             try self.respondBans(cli.fd);
             return .close;
@@ -417,7 +423,7 @@ pub const HttpServer = struct {
                 "Connection: Upgrade\r\n" ++
                 "Sec-WebSocket-Accept: {s}\r\n\r\n",
             .{accept},
-        ) catch unreachable; // fixed-size format: cannot overflow
+        ) catch unreachable;
         writeAll(cli.fd, hs) catch return .close;
 
         const tail_start = hdr_end_idx + 4;
@@ -451,6 +457,21 @@ pub const HttpServer = struct {
             return;
         }
         try writeResponse(fd, 200, "OK", "application/json", body.items);
+    }
+
+    fn respondHealth(self: *HttpServer, fd: posix.fd_t) !void {
+        var body: std.ArrayListUnmanaged(u8) = .{};
+        defer body.deinit(self.allocator);
+        try self.health_source.write(self.health_source.ctx, &body, self.allocator);
+        if (body.items.len > max_response_bytes) {
+            try writeSimpleResponse(fd, 500, "Internal Server Error", "text/plain", "health body too large\n");
+            return;
+        }
+        if (std.mem.indexOf(u8, body.items, "\"ready\":true") != null) {
+            try writeResponse(fd, 200, "OK", "application/json", body.items);
+        } else {
+            try writeResponse(fd, 503, "Service Unavailable", "application/json", body.items);
+        }
     }
 
     fn respondBans(self: *HttpServer, fd: posix.fd_t) !void {

@@ -1,5 +1,3 @@
-# Disable blank issues — force people through one of the templates.
-# Keeps the issue tracker scannable and consistent.
 blank_issues_enabled: false
 
 contact_links:

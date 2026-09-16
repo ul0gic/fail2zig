@@ -10,6 +10,7 @@ const tracker_map_mod = @import("../core/tracker_map.zig");
 const firewall = @import("../firewall/backend.zig");
 const config_mod = @import("../config/native.zig");
 const ipc = @import("ipc.zig");
+const lifecycle_mod = @import("../core/ban_lifecycle.zig");
 
 pub const StatsSnapshot = struct {
     memory_bytes_used: u64 = 0,
@@ -51,7 +52,6 @@ fn defaultNoSource(ctx: ?*anyopaque, jail_name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Why no firewall backend is usable: the probe cause (11.4.1) or the init failure of the backend it picked.
 pub const NoBackendCause = union(enum) {
     detect: firewall.DetectError,
     init: firewall.BackendError,
@@ -71,7 +71,6 @@ pub const NoBackendCause = union(enum) {
     }
 };
 
-/// Single source of truth for whether a jail's configured banaction is actually enforced (ADR-006/007, ENH-006).
 pub const FirewallState = union(enum) {
     ready,
     not_needed,
@@ -105,6 +104,7 @@ pub const Context = struct {
     config: *const config_mod.Config,
     backend: ?*firewall.Backend,
     firewall_state: FirewallState = .ready,
+    lifecycle: ?*lifecycle_mod.Lifecycle = null,
     stats_source: StatsSource = .{},
     health_source: JailHealthSource = .{},
     source_descriptor: JailSourceSource = .{},
@@ -136,6 +136,7 @@ pub const Context = struct {
             .list_jails => self.handleListJails(a),
             .reload => self.handleReload(a),
             .version => self.handleVersion(a),
+            .query_v1, .admin_v1, .reload_v1 => .{ .err = .{ .code = 501, .message = try a.dupe(u8, "versioned commands require the native daemon") } },
         };
     }
 
@@ -189,6 +190,17 @@ pub const Context = struct {
 
     pub fn computeOverallState(self: *const Context) []const u8 {
         if (self.firewall_state == .unavailable) return "degraded";
+        if (self.enabledJailCount() == 0) return "log-only";
+        if (self.lifecycle != null) {
+            var trackers = self.trackers.iterator();
+            while (trackers.next()) |entry| {
+                var states = entry.value_ptr.*.iterator();
+                while (states.next()) |kv| {
+                    const st = kv.value_ptr;
+                    if (st.ban_state == .banned and st.enforced and (!st.applied or (st.ban_expiry orelse 0) <= std.time.timestamp())) return "degraded";
+                }
+            }
+        }
         var any_enforcing = false;
         var any_log_only = false;
         var any_degraded = false;
@@ -214,11 +226,22 @@ pub const Context = struct {
         a: std.mem.Allocator,
         args: shared.Command.Ban,
     ) !shared.Response {
-        const duration: shared.Duration = args.duration orelse self.config.defaults.bantime;
-        const be = self.backend orelse return errResponse(a, 503, "no firewall backend");
-        be.ban(args.ip, args.jail, duration) catch |err| {
-            return errResponse(a, 500, @errorName(err));
-        };
+        const jc = for (self.config.jails) |*candidate| {
+            if (std.mem.eql(u8, candidate.name, args.jail.slice())) break candidate;
+        } else return errResponse(a, 404, "unknown jail");
+        if (!jc.enabled) return errResponse(a, 409, "jail is disabled");
+        if (!self.jailEnforcing(jc)) return errResponse(a, 409, "jail is not enforcing");
+        const requested_duration = args.duration orelse config_mod.resolveJailFromConfig(jc, self.config.defaults).bantime;
+        if (requested_duration == 0 or requested_duration > config_mod.max_ban_duration) return errResponse(a, 400, "duration is outside the supported range");
+        const tracker = self.trackers.getByJail(args.jail) orelse return errResponse(a, 404, "unknown jail");
+        if (args.ip.isUnenforceable() or tracker.isIgnored(args.ip)) return errResponse(a, 400, "address is ignored or unenforceable");
+        if (self.backend == null and self.lifecycle == null) return errResponse(a, 503, "no firewall backend");
+        const now = std.time.timestamp();
+        tracker.manualBan(args.ip, args.jail, now, requested_duration) catch |err| return errResponse(a, 503, @errorName(err));
+        var fallback = lifecycle_mod.Lifecycle{ .trackers = self.trackers, .backend = self.backend };
+        const lifecycle = self.lifecycle orelse &fallback;
+        lifecycle.apply(args.ip, args.jail, now) catch |err| return errResponse(a, 503, @errorName(err));
+        const duration: u64 = @intCast((tracker.get(args.ip).?.ban_expiry orelse now) -| now);
 
         var buf: std.ArrayListUnmanaged(u8) = .{};
         defer buf.deinit(a);
@@ -235,21 +258,25 @@ pub const Context = struct {
         a: std.mem.Allocator,
         args: shared.Command.Unban,
     ) !shared.Response {
-        const be = self.backend orelse return errResponse(a, 503, "no firewall backend");
+        var fallback = lifecycle_mod.Lifecycle{ .trackers = self.trackers, .backend = self.backend };
+        const lifecycle = self.lifecycle orelse &fallback;
+        const now = std.time.timestamp();
         if (args.jail) |j| {
-            be.unban(args.ip, j) catch |err| {
-                return errResponse(a, 500, @errorName(err));
-            };
-            if (self.trackers.getByJail(j)) |t| t.clearBan(args.ip);
+            lifecycle.release(args.ip, j, now) catch |err| return errResponse(a, if (err == error.NotBanned or err == error.NotAvailable) 404 else 503, @errorName(err));
         } else {
-            var any_ok = false;
-            for (self.config.jails) |jc| {
-                const jid = shared.JailId.fromSlice(jc.name) catch continue;
-                be.unban(args.ip, jid) catch continue;
-                any_ok = true;
-                if (self.trackers.get(jc.name)) |t| t.clearBan(args.ip);
+            var any = false;
+            var failed = false;
+            var it = self.trackers.iterator();
+            while (it.next()) |entry| {
+                const st = entry.value_ptr.*.get(args.ip) orelse continue;
+                if (st.ban_state != .banned) continue;
+                any = true;
+                lifecycle.release(args.ip, st.jail, now) catch {
+                    failed = true;
+                };
             }
-            if (!any_ok) return errResponse(a, 404, "no jail accepted unban");
+            if (failed) return errResponse(a, 503, "some bans could not be removed; retry unban");
+            if (!any) return errResponse(a, 404, "address is not banned");
         }
 
         var buf: std.ArrayListUnmanaged(u8) = .{};
@@ -270,28 +297,18 @@ pub const Context = struct {
         try w.writeAll("[");
 
         if (args.jail) |j| {
-            const be = self.backend orelse return errResponse(a, 503, "no firewall backend");
-            const ips = be.listBans(j, a) catch |err| {
-                return errResponse(a, 500, @errorName(err));
-            };
-            defer a.free(ips);
-            const jail_tracker = self.trackers.getByJail(j);
-            for (ips, 0..) |ip, i| {
-                if (i > 0) try w.writeAll(",");
-                const st = if (jail_tracker) |t| t.get(ip) else null;
-                try writeListEntry(w, ip, j, st);
-            }
-        } else {
-            var first = true;
-            var tit = self.trackers.iterator();
-            while (tit.next()) |tkv| {
-                var it = tkv.value_ptr.*.iterator();
-                while (it.next()) |kv| {
-                    if (kv.value_ptr.ban_state != .banned) continue;
-                    if (!first) try w.writeAll(",");
-                    first = false;
-                    try writeListEntry(w, kv.key_ptr.*, kv.value_ptr.jail, kv.value_ptr);
-                }
+            if (self.trackers.getByJail(j) == null) return errResponse(a, 404, "unknown jail");
+        }
+        var first = true;
+        var tit = self.trackers.iterator();
+        while (tit.next()) |tkv| {
+            var it = tkv.value_ptr.*.iterator();
+            while (it.next()) |kv| {
+                if (kv.value_ptr.ban_state != .banned) continue;
+                if (args.jail) |j| if (!std.mem.eql(u8, kv.value_ptr.jail.slice(), j.slice())) continue;
+                if (!first) try w.writeAll(",");
+                first = false;
+                try writeListEntry(w, kv.key_ptr.*, kv.value_ptr.jail, kv.value_ptr);
             }
         }
         try w.writeAll("]");
@@ -346,9 +363,7 @@ pub const Context = struct {
 
     fn handleReload(self: *Context, a: std.mem.Allocator) !shared.Response {
         _ = self;
-        std.log.info("ipc: reload requested (not yet implemented)", .{});
-        const payload = try a.dupe(u8, "{\"status\":\"reload not yet implemented\"}");
-        return .{ .ok = .{ .payload = payload } };
+        return errResponse(a, 501, "reload is not implemented; validate config and restart the service");
     }
 
     fn handleVersion(self: *Context, a: std.mem.Allocator) !shared.Response {
@@ -552,7 +567,6 @@ test "commands: handleVersion payload parses as client VersionPayload (ISSUE-011
     defer resp.deinit(a);
     try testing.expect(resp == .ok);
 
-    // Mirrors client/format.zig VersionPayload: the client parses exactly these field names.
     const VersionPayload = struct {
         daemon_version: ?[]const u8 = null,
         git_commit: ?[]const u8 = null,
@@ -607,7 +621,7 @@ test "commands: handleStatus produces expected JSON fields" {
     try testing.expect(std.mem.indexOf(u8, body, "\"active_bans\":1") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"jail_count\":0") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"backend\":\"nftables\"") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"protection\":\"active\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"protection\":\"log-only\"") != null);
 }
 
 test "commands: handleListJails counts banned entries per-jail" {
@@ -806,7 +820,7 @@ test "commands: handleList without jail returns only banned entries" {
     try testing.expect(std.mem.indexOf(u8, resp.ok.payload, "2.2.2.2") == null);
 }
 
-test "commands: handleReload is a stub but returns ok" {
+test "commands: handleReload reports unsupported without false success" {
     const a = testing.allocator;
 
     var trackers = makeEmptyTrackerMap(a);
@@ -819,8 +833,8 @@ test "commands: handleReload is a stub but returns ok" {
     var ctx = Context{ .trackers = &trackers, .config = &cfg, .backend = &be };
     const resp = try ctx.handle(.{ .reload = {} }, a);
     defer resp.deinit(a);
-    try testing.expect(resp == .ok);
-    try testing.expect(std.mem.indexOf(u8, resp.ok.payload, "not yet implemented") != null);
+    try testing.expect(resp == .err);
+    try testing.expectEqual(@as(u16, 501), resp.err.code);
 }
 
 test "commands: asHandler round-trips via the dispatch pointer" {
@@ -845,7 +859,10 @@ test "commands: handleBan on uninitialized backend returns err response" {
 
     var trackers = makeEmptyTrackerMap(a);
     defer trackers.deinit();
+    var jails = [_]config_mod.JailConfig{.{ .name = "sshd", .enabled = true }};
     var cfg = makeConfig();
+    cfg.jails = &jails;
+    _ = try trackers.addTracker("sshd", .{ .max_entries = 4 });
     var stub = StubBackend{};
     var be = realBackendFromStub(&stub);
     defer be.deinit();
@@ -859,7 +876,7 @@ test "commands: handleBan on uninitialized backend returns err response" {
     );
     defer resp.deinit(a);
     try testing.expect(resp == .err);
-    try testing.expectEqual(@as(u16, 500), resp.err.code);
+    try testing.expectEqual(@as(u16, 503), resp.err.code);
 }
 
 test "commands: handleStatus emits total_bans + jails_active rollups (SYS-017)" {
@@ -1250,31 +1267,28 @@ test "commands: status JSON omits protection_cause and reports log-only when the
     try testing.expect(std.mem.indexOf(u8, resp.ok.payload, "\"backend\":\"none\"") != null);
 }
 
-test "commands: manual ban/unban/list-by-jail answer 503 with no backend instead of touching a firewall (SYS-014)" {
+test "commands: log-only bans can be listed and cleared without a backend; manual enforcement is refused" {
     const a = testing.allocator;
     var trackers = makeEmptyTrackerMap(a);
     defer trackers.deinit();
+    var jails = [_]config_mod.JailConfig{.{ .name = "sshd", .enabled = true }};
     var cfg = makeConfig();
-    var ctx = Context{
-        .trackers = &trackers,
-        .config = &cfg,
-        .backend = null,
-        .firewall_state = .{ .unavailable = .{ .detect = error.Transient } },
-    };
+    cfg.jails = &jails;
+    const tracker = try trackers.addTracker("sshd", .{ .max_entries = 4, .maxretry = 1 });
+    var ctx = Context{ .trackers = &trackers, .config = &cfg, .backend = null, .firewall_state = .{ .unavailable = .{ .detect = error.Transient } } };
     const ip = try shared.IpAddress.parse("203.0.113.9");
     const jail = try shared.JailId.fromSlice("sshd");
-
+    _ = try tracker.recordAttempt(ip, jail, std.time.timestamp());
     const ban = try ctx.handle(.{ .ban = .{ .ip = ip, .jail = jail, .duration = null } }, a);
     defer ban.deinit(a);
-    try testing.expectEqual(@as(u16, 503), ban.err.code);
-
-    const unban = try ctx.handle(.{ .unban = .{ .ip = ip, .jail = jail } }, a);
-    defer unban.deinit(a);
-    try testing.expectEqual(@as(u16, 503), unban.err.code);
-
+    try testing.expectEqual(@as(u16, 409), ban.err.code);
     const list = try ctx.handle(.{ .list = .{ .jail = jail } }, a);
     defer list.deinit(a);
-    try testing.expectEqual(@as(u16, 503), list.err.code);
+    try testing.expect(std.mem.indexOf(u8, list.ok.payload, "203.0.113.9") != null);
+    const unban = try ctx.handle(.{ .unban = .{ .ip = ip, .jail = jail } }, a);
+    defer unban.deinit(a);
+    try testing.expect(unban == .ok);
+    try testing.expect(!tracker.get(ip).?.isBanned());
 }
 
 test "commands: NoBackendCause names and describes both detect and init causes (SYS-014)" {
@@ -1285,4 +1299,36 @@ test "commands: NoBackendCause names and describes both detect and init causes (
     const i: NoBackendCause = .{ .init = error.NotAvailable };
     try testing.expectEqualStrings("NotAvailable", i.name());
     try testing.expectEqualStrings("backend init failed: NotAvailable", i.describe(&buf));
+}
+
+test "commands: manual ban uses jail defaults, is listed consistently and counted once" {
+    const a = testing.allocator;
+    var trackers = tracker_map_mod.TrackerMap.init(a);
+    defer trackers.deinit();
+    const tracker = try trackers.addTracker("sshd", .{ .max_entries = 4 });
+    var jails = [_]config_mod.JailConfig{.{ .name = "sshd", .filter = "sshd", .bantime = 45 }};
+    var cfg = config_mod.Config{ .defaults = .{ .bantime = 600 }, .jails = &jails };
+    const Hooks = struct {
+        fn put(_: ?*anyopaque, _: shared.IpAddress, _: shared.JailId, duration: shared.Duration) firewall.BackendError!void {
+            if (duration != 45) return error.SystemError;
+        }
+    };
+    var lifecycle = lifecycle_mod.Lifecycle{ .trackers = &trackers, .backend = null, .ban_hook = Hooks.put };
+    var ctx = Context{ .trackers = &trackers, .config = &cfg, .backend = null, .lifecycle = &lifecycle };
+    const ip = try shared.IpAddress.parse("192.0.2.42");
+    const jail = try shared.JailId.fromSlice("sshd");
+    const ban = try ctx.handle(.{ .ban = .{ .ip = ip, .jail = jail, .duration = null } }, a);
+    defer ban.deinit(a);
+    try testing.expect(ban == .ok);
+    try testing.expect(std.mem.indexOf(u8, ban.ok.payload, "\"duration\":45") != null);
+    const repeated = try ctx.handle(.{ .ban = .{ .ip = ip, .jail = jail, .duration = null } }, a);
+    defer repeated.deinit(a);
+    try testing.expect(repeated == .ok);
+    try testing.expectEqual(@as(u64, 1), tracker.lifetime_bans);
+    const all = try ctx.handle(.{ .list = .{ .jail = null } }, a);
+    defer all.deinit(a);
+    const filtered = try ctx.handle(.{ .list = .{ .jail = jail } }, a);
+    defer filtered.deinit(a);
+    try testing.expectEqualStrings(all.ok.payload, filtered.ok.payload);
+    try testing.expect(std.mem.indexOf(u8, all.ok.payload, "192.0.2.42") != null);
 }

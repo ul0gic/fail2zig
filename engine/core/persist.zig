@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Header 14B (magic 'F2ZS', u16 version=4, u32 count, u32 crc32) + 114B entries (113B v1-v3 layout + flags) + per-jail lifetime block (v3+); v1-v3 loadable.
 
 const std = @import("std");
 const posix = std.posix;
@@ -26,6 +25,8 @@ pub const header_size: usize = 4 + 2 + 4 + 4;
 pub const entry_size_legacy: usize = 1 + 16 + 64 + 4 + 4 + 8 + 8 + 8;
 pub const entry_size: usize = entry_size_legacy + 1;
 pub const flag_enforced: u8 = 0x01;
+pub const flag_confirmed: u8 = 0x02;
+pub const flag_confirmation_known: u8 = 0x04;
 pub const jail_name_field: usize = 64;
 pub const lifetime_record_size: usize = jail_name_field + 8;
 
@@ -48,15 +49,14 @@ pub const StateEntry = struct {
     first_attempt: Timestamp,
     last_attempt: Timestamp,
     ban_expiry: ?Timestamp,
-    /// null = pre-v4 file, which never recorded whether the ban reached the firewall; the seeder decides.
     enforced: ?bool = null,
+    confirmed: bool = true,
 
     pub fn isBanned(self: StateEntry) bool {
         return self.ban_expiry != null;
     }
 };
 
-/// Decides `enforced` for entries loaded from a pre-v4 file, keyed by jail name.
 pub const LegacyEnforcedResolver = struct {
     ctx: ?*anyopaque = null,
     resolve: *const fn (ctx: ?*anyopaque, jail_name: []const u8) bool = assumeEnforced,
@@ -204,7 +204,8 @@ fn encodeEntry(buf: *[entry_size]u8, ip: IpAddress, st: *const IpState) void {
     const expiry: i64 = st.ban_expiry orelse 0;
     std.mem.writeInt(i64, buf[off .. off + 8][0..8], expiry, .little);
     off += 8;
-    buf[off] = if (st.enforced) flag_enforced else 0;
+    buf[off] = (if (st.enforced) flag_enforced else @as(u8, 0)) |
+        (if (st.confirmed) flag_confirmed else @as(u8, 0)) | flag_confirmation_known;
     off += 1;
 
     std.debug.assert(off == entry_size);
@@ -387,6 +388,7 @@ fn decodeEntry(buf: []const u8) ?StateEntry {
         .last_attempt = last_attempt,
         .ban_expiry = if (expiry_raw == 0) null else expiry_raw,
         .enforced = enforced,
+        .confirmed = if (buf.len == entry_size and buf[off] & flag_confirmation_known != 0) buf[off] & flag_confirmed != 0 else true,
     };
 }
 
@@ -403,6 +405,7 @@ pub fn seed(tracker: *StateTracker, entries: []const StateEntry) Error!void {
             .ban_state = if (e.ban_expiry != null) .banned else .monitoring,
             .ban_expiry = e.ban_expiry,
             .enforced = e.ban_expiry != null and (e.enforced orelse true),
+            .confirmed = e.confirmed,
             .ring = [_]Timestamp{0} ** state_mod.max_attempts_per_ip,
             .ring_len = 0,
         };
@@ -411,7 +414,77 @@ pub fn seed(tracker: *StateTracker, entries: []const StateEntry) Error!void {
     }
 }
 
-pub fn saveAll(map: *const TrackerMap, path: []const u8) Error!void {
+pub const SaveError = Error || std.fs.File.OpenError;
+
+pub const PreflightOperation = enum {
+    validate_path,
+    open_directory,
+    inspect_target,
+    open_target,
+    inspect_temporary,
+    open_temporary,
+    create_probe,
+    write_probe,
+    sync_probe,
+    chmod_probe,
+    rename_probe,
+    sync_directory,
+    remove_probe,
+};
+
+pub fn checkWritable(path: []const u8, operation: *PreflightOperation) !void {
+    operation.* = .validate_path;
+    if (path.len == 0 or path.len + 4 > 4096) return error.PathTooLong;
+    if (path[path.len - 1] == '/') return error.InvalidPath;
+    const basename = std.fs.path.basename(path);
+    if (basename.len == 0 or std.mem.eql(u8, basename, ".") or std.mem.eql(u8, basename, "..")) return error.InvalidPath;
+    const parent = std.fs.path.dirname(path) orelse ".";
+    operation.* = .open_directory;
+    var dir = try std.fs.cwd().openDir(parent, .{ .iterate = true });
+    defer dir.close();
+
+    var tmp_buf: [4096]u8 = undefined;
+    const temporary = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{basename});
+    for ([_][]const u8{ basename, temporary }, 0..) |name, i| {
+        operation.* = if (i == 0) .inspect_target else .inspect_temporary;
+        const stat = dir.statFile(name) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        if (stat.kind != .file) return error.NotRegularFile;
+        operation.* = if (i == 0) .open_target else .open_temporary;
+        const existing = try dir.openFile(name, .{ .mode = if (i == 0) .read_only else .read_write });
+        existing.close();
+    }
+
+    var random: [16]u8 = undefined;
+    std.crypto.random.bytes(&random);
+    const hex = std.fmt.bytesToHex(random, .lower);
+    var name_buf: [64]u8 = undefined;
+    const probe_name = try std.fmt.bufPrint(&name_buf, ".fail2zig-startup-{s}", .{hex});
+    operation.* = .create_probe;
+    const reservation = try dir.createFile(probe_name, .{ .exclusive = true, .mode = 0o600 });
+    reservation.close();
+    defer dir.deleteFile(probe_name) catch {};
+    var probe = try dir.atomicFile(probe_name, .{ .mode = 0o600 });
+    defer probe.deinit();
+    operation.* = .write_probe;
+    try probe.file.writeAll("fail2zig persistence startup check\n");
+    operation.* = .sync_probe;
+    try probe.file.sync();
+    operation.* = .chmod_probe;
+    try posix.fchmod(probe.file.handle, 0o600);
+    operation.* = .rename_probe;
+    try probe.finish();
+    operation.* = .sync_directory;
+    try posix.fsync(dir.fd);
+    operation.* = .remove_probe;
+    try dir.deleteFile(probe_name);
+    operation.* = .sync_directory;
+    try posix.fsync(dir.fd);
+}
+
+pub fn saveAll(map: *const TrackerMap, path: []const u8) SaveError!void {
     const max_path: usize = 4096;
     if (path.len == 0 or path.len + 4 > max_path) return error.PathTooLong;
     var tmp_buf: [max_path]u8 = undefined;
@@ -420,10 +493,10 @@ pub fn saveAll(map: *const TrackerMap, path: []const u8) Error!void {
     @memcpy(tmp_buf[path.len .. path.len + tmp_suffix.len], tmp_suffix);
     const tmp_path = tmp_buf[0 .. path.len + tmp_suffix.len];
 
-    var file = std.fs.cwd().createFile(tmp_path, .{
+    var file = try std.fs.cwd().createFile(tmp_path, .{
         .mode = 0o600,
         .truncate = true,
-    }) catch return error.OpenFailed;
+    });
     var close_handled = false;
     defer if (!close_handled) file.close();
 
@@ -524,6 +597,7 @@ pub fn seedMapWith(
             .ban_expiry = e.ban_expiry,
             .enforced = e.ban_expiry != null and
                 (e.enforced orelse legacy_enforced.resolve(legacy_enforced.ctx, jail_name)),
+            .confirmed = e.confirmed,
             .ring = [_]Timestamp{0} ** state_mod.max_attempts_per_ip,
             .ring_len = 0,
         };
@@ -1204,4 +1278,92 @@ test "persist: v3 file loads with enforced unknown and the default seeder assume
     const again = try loadFull(testing.allocator, path);
     defer again.deinit(testing.allocator);
     try testing.expectEqual(@as(?bool, true), again.entries[0].enforced);
+}
+
+test "persist: startup check preserves saved state and stale temporary contents" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmpStatePath(&tmp, &full);
+    try tmp.dir.writeFile(.{ .sub_path = "state.bin", .data = "saved state" });
+    try tmp.dir.writeFile(.{ .sub_path = "state.bin.tmp", .data = "interrupted save" });
+    var operation: PreflightOperation = .validate_path;
+    try checkWritable(path, &operation);
+    const saved = try tmp.dir.readFileAlloc(testing.allocator, "state.bin", 100);
+    defer testing.allocator.free(saved);
+    const stale = try tmp.dir.readFileAlloc(testing.allocator, "state.bin.tmp", 100);
+    defer testing.allocator.free(stale);
+    try testing.expectEqualStrings("saved state", saved);
+    try testing.expectEqualStrings("interrupted save", stale);
+    var it = tmp.dir.iterate();
+    var count: usize = 0;
+    while (try it.next()) |_| count += 1;
+    try testing.expectEqual(@as(usize, 2), count);
+}
+
+test "persist: startup check permits a fresh install and removes its probes" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmpStatePath(&tmp, &full);
+    var operation: PreflightOperation = .validate_path;
+    try checkWritable(path, &operation);
+    var it = tmp.dir.iterate();
+    try testing.expectEqual(@as(?std.fs.Dir.Entry, null), try it.next());
+}
+
+test "persist: startup check identifies a missing parent and invalid target types" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmpStatePath(&tmp, &full);
+    var operation: PreflightOperation = .validate_path;
+    const missing = try std.fmt.allocPrint(testing.allocator, "{s}/missing/state.bin", .{std.fs.path.dirname(path).?});
+    defer testing.allocator.free(missing);
+    try testing.expectError(error.FileNotFound, checkWritable(missing, &operation));
+    try testing.expectEqual(PreflightOperation.open_directory, operation);
+    try tmp.dir.makeDir("state.bin");
+    try testing.expectError(error.NotRegularFile, checkWritable(path, &operation));
+    try testing.expectEqual(PreflightOperation.inspect_target, operation);
+    try tmp.dir.deleteDir("state.bin");
+    try tmp.dir.makeDir("state.bin.tmp");
+    try testing.expectError(error.NotRegularFile, checkWritable(path, &operation));
+    try testing.expectEqual(PreflightOperation.inspect_temporary, operation);
+    try testing.expectError(error.InvalidPath, checkWritable("state.bin/", &operation));
+    try testing.expectEqual(PreflightOperation.validate_path, operation);
+}
+
+test "persist: startup check rejects an unwritable directory and succeeds after repair" {
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmpStatePath(&tmp, &full);
+    var operation: PreflightOperation = .validate_path;
+    try posix.fchmod(tmp.dir.fd, 0o500);
+    defer posix.fchmod(tmp.dir.fd, 0o700) catch {};
+    try testing.expectError(error.AccessDenied, checkWritable(path, &operation));
+    try testing.expectEqual(PreflightOperation.create_probe, operation);
+    try posix.fchmod(tmp.dir.fd, 0o700);
+    try checkWritable(path, &operation);
+}
+
+test "persist: pending and confirmed ownership survive v4 roundtrip without replaying counters" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmpStatePath(&tmp, &full);
+    var tm = TrackerMap.init(testing.allocator);
+    defer tm.deinit();
+    const tracker = try tm.addTracker("sshd", .{ .max_entries = 4 });
+    try tracker.manualBan(tIp("192.0.2.1"), tJail("sshd"), 100, 60);
+    try tracker.manualBan(tIp("192.0.2.2"), tJail("sshd"), 100, 60);
+    tracker.mutable(tIp("192.0.2.2")).?.confirmed = true;
+    try saveAll(&tm, path);
+    const loaded = try loadFull(testing.allocator, path);
+    defer loaded.deinit(testing.allocator);
+    for (loaded.entries) |entry| {
+        try testing.expect(entry.enforced.?);
+        try testing.expectEqual(std.meta.eql(entry.ip, tIp("192.0.2.2")), entry.confirmed);
+    }
 }

@@ -18,10 +18,16 @@ pub const named_refused_patterns = [_]PatternDef{
     },
 };
 
+fn matchRecidiveBan(line: []const u8) ?parser.ParseResult {
+    const bare = comptime parser.compile("ban: jail='<*>' ip=<IP>");
+    const prefixed = comptime parser.compile("<*> ban: jail='<*>' ip=<IP>");
+    return bare(line) orelse prefixed(line);
+}
+
 pub const recidive_patterns = [_]PatternDef{
     .{
         .name = "fail2zig-ban",
-        .match = parser.compile("<*> ban: jail='<*>' ip=<IP>"),
+        .match = matchRecidiveBan,
     },
 };
 

@@ -5,9 +5,7 @@ artifact** via `scripts/install.sh` and runs the daemon under the
 **unmodified shipped systemd unit** `deploy/fail2zig.service`, then asserts
 the deployment invariants that nothing else in the project can see.
 
-Not part of `zig build test` — like `tests/harness/`, it needs a real
-systemd host and root. It belongs to Phase 7.5 real-system validation
-(the `SYS-` issue prefix).
+Not part of the local aggregate: it needs a real systemd host and root.
 
 ## Why this exists
 
@@ -15,7 +13,9 @@ SYS-019 was a CRITICAL regression: the daemon crash-looped under its own
 shipped unit. A daemon-side `chown` is a `@privileged` syscall that the
 unit's `SystemCallFilter=~@privileged` SIGSYS-kills, and `CAP_CHOWN` is not
 in the bounding set — so the chown could never succeed anyway. The fix
-moved socket/dir ownership to systemd-native `Group=fail2zig`.
+moved socket/dir ownership to systemd. The current unit uses both
+`User=fail2zig` and `Group=fail2zig`; it permits SQLite's `fchown` call
+without granting `CAP_CHOWN`.
 
 That class of bug is **invisible** to everything else we run:
 
@@ -36,14 +36,14 @@ can never silently reship.
    systemd invocation — scoped via `_SYSTEMD_INVOCATION_ID`, never `-b`
    (boot history may contain pre-fix crash-loops, which would
    false-positive).
-3. `/run/fail2zig` is `root:fail2zig` `0750`. The shipped unit ships
+3. `/run/fail2zig` is `fail2zig:fail2zig` `0750`. The shipped unit ships
    `RuntimeDirectoryMode=0710` — that is only the transient pre-daemon
    value; the daemon chmods the directory to `0750` at startup (the
    `fchmodat` in `ensureSocketDir` kept by the SYS-019 fix). The harness
    checks **steady state** after the service is active, so `0750` is the
    correct invariant.
-4. Socket `/run/fail2zig/fail2zig.sock` is `root:fail2zig` `0660`.
-5. A root client connects (`fail2zig-client status`).
+4. Socket `/run/fail2zig/fail2zig.sock` is `fail2zig:fail2zig` `0660`.
+5. A root client connects (`fail2zig status`).
 6. A `fail2zig`-group user connects (non-root).
 7. A non-group user (`nobody`) is denied — client exit code `3` plus the
    daemon's own `requires group 'fail2zig' membership` message.
@@ -70,32 +70,68 @@ sudo tests/e2e/deploy_regression.sh --build
 zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe   # on a build box
 sudo tests/e2e/deploy_regression.sh --local-bin zig-out/bin
 
-# Hermetic run — remove everything the harness installed/created on exit:
+# Purge installed executable/unit/state and harness-created accounts on exit:
 sudo tests/e2e/deploy_regression.sh --build --purge
 ```
 
 Flags: `--build`, `--local-bin DIR`, `--purge` (teardown installed
-artifacts + the throwaway test user, and the `fail2zig` group only if the
-harness created it), `--force` (run even if a fail2zig service is already
+executable/unit/state + the throwaway test user, and the `fail2zig` service
+account/group only if the harness created them), `--skip-install` (check an
+already installed candidate), `--force` (run even if a fail2zig service is already
 active).
 
-### Against the lab VM over SSH
+### Against a disposable systemd baseline over SSH
+
+This driver stops and replaces the target's baseline service temporarily.
+Use a separately authorized disposable VM or booted container. Do not run it
+against the published lab service; use the isolated `service_user.sh` harness
+for checks beside that service.
 
 ```bash
-tests/e2e/run-remote.sh ul0gic@172.16.150.253 -- --build --purge
+tests/e2e/run-remote.sh user@disposable-systemd-host -- --hold-seconds 30
 ```
 
-`run-remote.sh` is **transport only** — it `rsync`s the repo to the target
-and invokes `deploy_regression.sh` over SSH. It carries the mandatory
-self-ban guard flags (`-o IdentitiesOnly=yes -o
-PreferredAuthentications=publickey`) so the SSH connection never trips
-fail2zig's own sshd jail and bans the operator. Override the key with
-`F2Z_SSH_KEY`.
+`run-remote.sh` builds locally and sends only binaries, deployment files, scripts,
+and e2e harnesses using tar-over-SSH into a unique temporary directory. It runs
+`release_gate.sh`, which requires an existing baseline installation, saves its
+binaries/unit/config/state, exercises isolated backend checks and deployment gates,
+and restores the baseline even on failure. With all writers stopped, it verifies a
+copy of the original state tree, moves the original out of the active state path,
+and installs the candidate with a fresh native SQLite database at the default
+`/var/lib/fail2zig/state.bin`. State and backup directories must share a filesystem
+so moving the original state uses an atomic rename. This is a fresh-state cutover, not conversion of
+legacy counters, bans or source positions. Before restarting the baseline, it
+restores and checks the original state bytes, ownership and modes. Any service
+account/group created by the installer is removed; pre-existing identities stay.
+A failed state restoration leaves the service stopped. A successful exact restoration removes
+its backup; a failed restoration retains the backup for recovery. No fixed directory
+is deleted. `--force` is accepted for older callers;
+`--purge` is intentionally unavailable through this driver.
+
+The target needs iproute2, util-linux, curl, nftables, iptables (including ip6tables), and
+ipset. No product or release-gate Python is required. Every SSH connection uses the specified key with
+`IdentitiesOnly=yes` and `PreferredAuthentications=publickey`; override the key
+with `F2Z_SSH_KEY`. No password-guessing traffic is needed: fixtures exercise
+normal detection, and ordinary TCP probes verify enforcement.
+
+Build the test-only lifecycle helper beside the product artifact; it is not a release payload:
+
+```bash
+zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe --prefix "$PREFIX"
+zig build test-release-lifecycle -Dtarget=x86_64-linux-musl \
+  -Doptimize=ReleaseSafe --prefix "$PREFIX"
+```
+
+`fail2zig-release-lifecycle ABSOLUTE_FAIL2ZIG_PATH (nftables|iptables|ipset)` must run as
+root in a fresh network namespace. The release gate uses the deep nftables profile for
+IPv4/IPv6, ownership overlap, restart, expiry and cleanup, then representative iptables/ipset
+install, readback, expiry and cleanup profiles. Common operator cases are not repeated for every
+backend.
 
 ## Design notes
 
 - **Service only.** The harness mirrors exactly what `install.sh` deploys:
-  the daemon binds its own socket. `deploy/fail2zig.socket` is not involved.
+  the daemon binds its own socket; no systemd socket unit exists or is supported.
 - **Byte-identical unit guard.** After install, the harness `cmp`s the
   on-disk unit against `deploy/fail2zig.service` and refuses to proceed if
   they differ, and refuses if any drop-in exists under `fail2zig.service.d/`.
@@ -109,7 +145,7 @@ fail2zig's own sshd jail and bans the operator. Override the key with
   uses `nobody`, asserting both exit code `3` and the daemon's wording.
 - **Idempotent / re-runnable.** A `trap … EXIT` stops the service, removes
   the throwaway user, and (with `--purge`) removes installed artifacts. The
-  `fail2zig` group is deleted on purge **only if the harness created it**,
+  `fail2zig` service account/group are deleted on purge **only if the harness created them**,
   so it never destroys pre-existing operator state.
 
 ## Other harnesses in this directory
@@ -118,25 +154,21 @@ fail2zig's own sshd jail and bans the operator. Override the key with
 
 - **`deploy_status_honesty.sh`** — asserts the status rollup, resolved-source
   labels, and persisted lifetime-ban surface (SYS-017, BUG-006).
-- **`degraded_file_source.sh`** (ENH-004) — runs the shipped binary in
-  `--foreground` against a real inotify break: a was-reading **file** jail whose
-  log is moved away flips `protection` to `degraded` and drops
-  `fail2zig_jail_log_source_healthy{jail} 0` after the ~2 s detach debounce,
-  while a quiet-healthy jail, a rotation flicker, and a never-appeared log do
-  **not** false-flag. Self-contained (throwaway temp socket/state/config, no
-  systemd, never touches operator state); needs **root** — an enforcing jail
-  fails closed without a firewall backend (principle #5). Run:
+- **`degraded_file_source.sh`** — runs the shipped binary in `--foreground`
+  with one enforcing file jail, rotates and recreates the source, writes new
+  failures only to the replacement inode, and requires a confirmed ban plus a
+  healthy source/protection surface. It is self-contained (throwaway socket,
+  SQLite state, config and network namespace) and never touches operator state.
+  It needs **root** because the jail uses a real firewall backend. Run:
 
   ```bash
   sudo tests/e2e/degraded_file_source.sh
   ```
 
-  The ENH-004 verdict is also covered in-process by the `ENH-004 e2e:` tests in
-  `engine/main.zig` (real watcher → adapter → `computeOverallState` → metrics);
-  this harness is the only check that runs the *shipped* binary through the real
-  IPC + HTTP surfaces under the wall-clock debounce.
+  Component tests retain the broader source-health edge cases; this release cell
+  covers only the critical candidate-level rotation/reopen boundary.
 
-- **`stabilization_live.sh`** (Phase 11 / Gate 11) — runs the *installed* shipped
+- **`stabilization_live.sh`** — runs the *installed* shipped
   binary + unit through the stabilization contract: `--validate-config` on a copy
   of the live config with `backend = "systemd"` (exit 0, `source=journald`,
   deprecation warning); an unknown key injected at a known line reported as
@@ -151,7 +183,7 @@ fail2zig's own sshd jail and bans the operator. Override the key with
   sudo tests/e2e/stabilization_live.sh --force
   ```
 
-## SYS-014 #2 — firewall cause-distinction (mostly automated; one manual check)
+## Firewall cause distinction
 
 The probe→cause logic is covered by inline tests tagged `SYS-014`
 (`backend.zig`: kernel-absent fall-through, transient fall-through, fail-closed;
@@ -166,20 +198,6 @@ op is denied, and the cause is a `std.log` line. Verify manually:
 - **No nf_tables in kernel** (`CONFIG_NF_TABLES` off / module blacklisted):
   `detect()` logs "nf_tables not in kernel" and falls through to ipset/iptables;
   if none is usable, the daemon fails closed.
-
-## QA-002 — startup-time bench (privileged host)
-
-The `startup_time` bench needs root/CAP_NET_ADMIN (the daemon binds the firewall
-+ IPC at startup), so it **skips** on an unprivileged dev box. Capture the number
-on a privileged host or in CI:
-
-```bash
-sudo zig build test -Dbench=true -Dtest-filter="startup_time" -Doptimize=ReleaseSafe
-# → {"bench":"startup_time","elapsed_ns":...,"elapsed_ms":<N>,"target_ms":100}
-```
-
-Pass: `elapsed_ms < target_ms` (100). v0.2.2 aim after the lazy-init fix:
-**< 80 ms**. Do **not** lower `target_ms` below 100 — it's the CI-flake margin.
 
 ## Lint
 

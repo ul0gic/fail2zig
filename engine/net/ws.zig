@@ -180,7 +180,6 @@ pub const WsServer = struct {
             };
             cursor += parse.consumed;
         }
-        // Buffer full with nothing consumed: the next read would be zero-length, so close instead of spinning.
         if (cursor == 0 and cli.len == cli.buf.len) {
             @branchHint(.unlikely);
             std.log.warn(
@@ -196,7 +195,6 @@ pub const WsServer = struct {
         }
     }
 
-    // Never closeClient() here: the caller keeps iterating cli after return (read-after-free). Return an error instead.
     fn dispatchFrame(self: *WsServer, cli: *ClientReg, frame: ParsedFrame) !void {
         _ = self;
         switch (frame.opcode) {
@@ -448,7 +446,6 @@ pub fn parseFrame(buf: []u8) ParseError!ParsedFrame {
     }
     if (payload_len > max_inbound_payload) return error.UnsupportedLength;
 
-    // RFC 6455 §5.1: client-to-server frames must be masked.
     if (!masked) return error.BadMask;
     if (buf.len < offset + 4) return error.Incomplete;
     const mask_key = buf[offset..][0..4].*;

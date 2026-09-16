@@ -5,6 +5,7 @@ const std = @import("std");
 const mem = std.mem;
 const shared = @import("shared");
 const backend = @import("backend.zig");
+pub const command = @import("command.zig");
 
 pub const CommandBuilder = struct {
     binary: []const u8,
@@ -149,29 +150,12 @@ pub fn runCommand(
     allocator: std.mem.Allocator,
     argv: []const []const u8,
 ) backend.BackendError!ExitClass {
-    var child = std.process.Child.init(argv, allocator);
-    child.stdin_behavior = .Close;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Pipe;
-    child.spawn() catch return error.SystemError;
-
-    // Drain stderr before wait(): a full pipe deadlocks the child.
-    const stderr_reader = child.stderr orelse {
-        _ = child.wait() catch {};
-        return error.SystemError;
-    };
-    const stderr_buf = stderr_reader.readToEndAlloc(allocator, 4096) catch {
-        _ = child.wait() catch {};
-        return error.SystemError;
-    };
-    defer allocator.free(stderr_buf);
-
-    const term = child.wait() catch return error.SystemError;
-    const code: u8 = switch (term) {
-        .Exited => |c| c,
-        else => return error.SystemError,
-    };
-    return classifyExit(code, stderr_buf);
+    const result = try command.run(allocator, argv, 2000);
+    defer result.deinit(allocator);
+    if (result.code != 0 and (std.ascii.indexOfIgnoreCase(result.stderr, "permission denied") != null or
+        std.ascii.indexOfIgnoreCase(result.stderr, "must be root") != null or
+        std.ascii.indexOfIgnoreCase(result.stderr, "operation not permitted") != null)) return error.PermissionDenied;
+    return classifyExit(result.code, result.stderr);
 }
 
 pub const IptablesBackend = struct {
@@ -191,7 +175,7 @@ pub const vtable: backend.BackendVTable = .{
 };
 
 pub fn probeAvailable() bool {
-    return binaryExistsOnPath("iptables");
+    return binaryExistsOnPath("iptables") and binaryExistsOnPath("ip6tables");
 }
 
 fn binaryExistsOnPath(name: []const u8) bool {
@@ -206,7 +190,7 @@ fn binaryExistsOnPath(name: []const u8) bool {
         stack_buf[dir.len] = '/';
         @memcpy(stack_buf[dir.len + 1 .. total_len], name);
         const full = stack_buf[0..total_len];
-        std.fs.accessAbsolute(full, .{ .mode = .read_only }) catch continue;
+        std.posix.access(full, std.posix.X_OK) catch continue;
         return true;
     }
     return false;
@@ -226,6 +210,21 @@ fn initImpl(
     if (!probeAvailable()) return error.NotAvailable;
     self.allocator = allocator;
     self.config = config;
+    var name_buf: [128]u8 = undefined;
+    const name = chainName(&name_buf, config.chain_prefix, "input") catch return error.SystemError;
+    if (name.len > 28) return error.SystemError;
+    for ([_][]const u8{ "iptables", "ip6tables" }) |binary| {
+        const builder = CommandBuilder{ .binary = binary, .chain = name };
+        var create: [4][]const u8 = undefined;
+        const created = try runCommand(allocator, builder.createChain(&create));
+        if (created != .ok and created != .already_exists) return error.SystemError;
+        const checked = try runCommand(allocator, &.{ binary, "-C", "INPUT", "-j", name });
+        if (checked != .ok) {
+            if (checked != .not_found) return error.SystemError;
+            var jump: [6][]const u8 = undefined;
+            if (try runCommand(allocator, builder.installJump(&jump)) != .ok) return error.SystemError;
+        }
+    }
     self.initialized = true;
 }
 
@@ -237,7 +236,7 @@ fn deinitImpl(ctx: *anyopaque) void {
 fn banImpl(
     ctx: *anyopaque,
     ip: shared.IpAddress,
-    jail: shared.JailId,
+    _: shared.JailId,
     duration: shared.Duration,
 ) backend.BackendError!void {
     _ = duration;
@@ -247,7 +246,7 @@ fn banImpl(
     const cfg = self.config orelse return error.NotAvailable;
 
     var chain_buf: [128]u8 = undefined;
-    const chain = chainName(&chain_buf, cfg.chain_prefix, jail.slice()) catch {
+    const chain = chainName(&chain_buf, cfg.chain_prefix, "input") catch {
         return error.SystemError;
     };
     const builder: CommandBuilder = .{
@@ -262,6 +261,9 @@ fn banImpl(
 
     var argv_storage: [8][]const u8 = undefined;
     const argv = builder.banRule(&argv_storage, ip_str);
+    const checked = try runCommand(allocator, &.{ binaryFor(ip), "-C", chain, "-s", ip_str, "-j", "DROP" });
+    if (checked == .ok) return;
+    if (checked != .not_found) return error.SystemError;
 
     switch (try runCommand(allocator, argv)) {
         .ok => return,
@@ -275,7 +277,7 @@ fn banImpl(
 fn unbanImpl(
     ctx: *anyopaque,
     ip: shared.IpAddress,
-    jail: shared.JailId,
+    _: shared.JailId,
 ) backend.BackendError!void {
     const self = castSelf(ctx);
     if (!self.initialized) return error.NotAvailable;
@@ -283,7 +285,7 @@ fn unbanImpl(
     const cfg = self.config orelse return error.NotAvailable;
 
     var chain_buf: [128]u8 = undefined;
-    const chain = chainName(&chain_buf, cfg.chain_prefix, jail.slice()) catch {
+    const chain = chainName(&chain_buf, cfg.chain_prefix, "input") catch {
         return error.SystemError;
     };
     const builder: CommandBuilder = .{ .binary = binaryFor(ip), .chain = chain };
@@ -307,7 +309,7 @@ fn unbanImpl(
 
 fn listBansImpl(
     ctx: *anyopaque,
-    jail: shared.JailId,
+    _: shared.JailId,
     allocator: std.mem.Allocator,
 ) backend.BackendError![]shared.IpAddress {
     const self = castSelf(ctx);
@@ -315,7 +317,7 @@ fn listBansImpl(
     const cfg = self.config orelse return error.NotAvailable;
 
     var chain_buf: [128]u8 = undefined;
-    const chain = chainName(&chain_buf, cfg.chain_prefix, jail.slice()) catch {
+    const chain = chainName(&chain_buf, cfg.chain_prefix, "input") catch {
         return error.SystemError;
     };
     const v4_bans = try runAndParse(allocator, "iptables", chain);
@@ -338,36 +340,20 @@ fn runAndParse(
     var argv_storage: [5][]const u8 = undefined;
     const argv = builder.listRules(&argv_storage);
 
-    var child = std.process.Child.init(argv, allocator);
-    child.stdin_behavior = .Close;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch return error.SystemError;
-    const stdout_reader = child.stdout orelse {
-        _ = child.wait() catch {};
-        return error.SystemError;
-    };
-    const stdout_buf = stdout_reader.readToEndAlloc(allocator, 64 * 1024) catch {
-        _ = child.wait() catch {};
-        return error.SystemError;
-    };
-    defer allocator.free(stdout_buf);
-    const term = child.wait() catch return error.SystemError;
-    switch (term) {
-        .Exited => |c| if (c != 0) return try allocator.alloc(shared.IpAddress, 0),
-        else => return error.SystemError,
-    }
-    return try parseListOutput(allocator, stdout_buf);
+    const result = try command.run(allocator, argv, 2000);
+    defer result.deinit(allocator);
+    if (result.code != 0) return error.SystemError;
+    return try parseListOutput(allocator, result.stdout);
 }
 
-fn flushImpl(ctx: *anyopaque, jail: shared.JailId) backend.BackendError!void {
+fn flushImpl(ctx: *anyopaque, _: shared.JailId) backend.BackendError!void {
     const self = castSelf(ctx);
     if (!self.initialized) return error.NotAvailable;
     const allocator = self.allocator orelse return error.NotAvailable;
     const cfg = self.config orelse return error.NotAvailable;
 
     var chain_buf: [128]u8 = undefined;
-    const chain = chainName(&chain_buf, cfg.chain_prefix, jail.slice()) catch {
+    const chain = chainName(&chain_buf, cfg.chain_prefix, "input") catch {
         return error.SystemError;
     };
     const builder: CommandBuilder = .{ .binary = "iptables", .chain = chain };

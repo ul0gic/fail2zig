@@ -24,7 +24,6 @@ pub const IpAddress = union(enum) {
     }
 
     pub fn fromIpv6Bits(v: u128) Error!IpAddress {
-        // Fold ::ffff:a.b.c.d to .ipv4 so the tracker cannot be evaded via the mapped form.
         const mapped_prefix: u128 = 0x0000_0000_0000_0000_0000_ffff_0000_0000;
         const mapped_mask: u128 = 0xffff_ffff_ffff_ffff_ffff_ffff_0000_0000;
         if ((v & mapped_mask) == mapped_prefix) {
@@ -44,7 +43,6 @@ pub const IpAddress = union(enum) {
         return std.meta.eql(a, b);
     }
 
-    /// Unspecified and loopback are never banned: a listener log line must not self-ban the host.
     pub fn isUnenforceable(self: IpAddress) bool {
         switch (self) {
             .ipv4 => |v| {

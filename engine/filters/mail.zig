@@ -20,10 +20,6 @@ pub const postfix_patterns = [_]PatternDef{
         .name = "lost-connection-auth",
         .match = parser.compile("<*>lost connection after AUTH from <*>[<IP>]"),
     },
-    .{
-        .name = "disconnect-helo",
-        .match = parser.compile("<*>disconnect from <*>[<IP>]<*>ehlo=<*>commands="),
-    },
 };
 
 pub const dovecot_patterns = [_]PatternDef{
@@ -39,10 +35,6 @@ pub const dovecot_patterns = [_]PatternDef{
         .name = "pam-auth-failed",
         .match = parser.compile("<*>auth-worker<*>pam(<*>,<IP>)<*>pam_authenticate()"),
     },
-    .{
-        .name = "no-auth-attempts",
-        .match = parser.compile("<*>imap-login: <*>no auth attempts<*>rip=<IP>"),
-    },
 };
 
 pub const courier_patterns = [_]PatternDef{
@@ -53,6 +45,10 @@ pub const courier_patterns = [_]PatternDef{
     .{
         .name = "auth-failed",
         .match = parser.compile("<*>imaplogin: FAILED<*>ip=[<IP>"),
+    },
+    .{
+        .name = "smtp-auth-failed",
+        .match = parser.compile("<*>error,relay=<IP>,<*>msg=\"535 Authentication failed.\""),
     },
 };
 
@@ -126,4 +122,9 @@ test "courier: negative — successful LOGIN" {
 
 test "courier: negative — service startup" {
     try testing.expect(firstMatchIn(&courier_patterns, "Apr 21 12:00:00 mail imapd: Connection, ip=[::ffff:1.2.3.4]") == null);
+}
+
+test "courier: SMTP authentication failure is distinct from successful SMTP" {
+    try testing.expect(firstMatchIn(&courier_patterns, "Sep 14 09:00:00 mail courieresmtpd[425070]: error,relay=::ffff:192.0.2.44,port=43632,msg=\"535 Authentication failed.\",cmd: AUTH LOGIN fixture") != null);
+    try testing.expect(firstMatchIn(&courier_patterns, "Sep 14 09:00:01 mail courieresmtpd[425070]: info,relay=::ffff:192.0.2.44,msg=\"235 Authentication succeeded.\"") == null);
 }

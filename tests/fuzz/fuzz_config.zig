@@ -2,7 +2,7 @@
 // Copyright (c) 2026 fail2zig maintainers
 
 const std = @import("std");
-const config_native = @import("config_native");
+const config_native = @import("engine").config_mod;
 
 const testing = std.testing;
 

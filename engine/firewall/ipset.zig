@@ -167,7 +167,7 @@ pub const vtable: backend.BackendVTable = .{
 };
 
 pub fn probeAvailable() bool {
-    return binaryExists("ipset") and binaryExists("iptables");
+    return binaryExists("ipset") and iptables.probeAvailable();
 }
 
 fn binaryExists(name: []const u8) bool {
@@ -181,7 +181,7 @@ fn binaryExists(name: []const u8) bool {
         @memcpy(stack_buf[0..dir.len], dir);
         stack_buf[dir.len] = '/';
         @memcpy(stack_buf[dir.len + 1 .. total_len], name);
-        std.fs.accessAbsolute(stack_buf[0..total_len], .{ .mode = .read_only }) catch continue;
+        std.posix.access(stack_buf[0..total_len], std.posix.X_OK) catch continue;
         return true;
     }
     return false;
@@ -201,6 +201,18 @@ fn initImpl(
     if (!probeAvailable()) return error.NotAvailable;
     self.allocator = allocator;
     self.config = config;
+    for ([_][]const u8{ "ipv4", "ipv6" }, [_][]const u8{ "inet", "inet6" }, [_][]const u8{ "iptables", "ip6tables" }) |suffix, family, binary| {
+        var buf: [128]u8 = undefined;
+        const name = setName(&buf, config.chain_prefix, suffix) catch return error.SystemError;
+        if (name.len > 31) return error.SystemError;
+        if (try iptables.runCommand(allocator, &.{ "ipset", "create", name, "hash:ip", "family", family, "timeout", "0", "maxelem", "1048576", "-exist" }) != .ok) return error.SystemError;
+        const check = try iptables.runCommand(allocator, &.{ binary, "-C", "INPUT", "-m", "set", "--match-set", name, "src", "-j", "DROP" });
+        if (check != .ok) {
+            if (check != .not_found) return error.SystemError;
+            var args: [10][]const u8 = undefined;
+            if (try iptables.runCommand(allocator, (CommandBuilder{ .set_name = name }).installMatchRule(&args, binary)) != .ok) return error.SystemError;
+        }
+    }
     self.initialized = true;
 }
 
@@ -212,16 +224,17 @@ fn deinitImpl(ctx: *anyopaque) void {
 fn banImpl(
     ctx: *anyopaque,
     ip: shared.IpAddress,
-    jail: shared.JailId,
+    _: shared.JailId,
     duration: shared.Duration,
 ) backend.BackendError!void {
+    _ = duration;
     const self = castSelf(ctx);
     if (!self.initialized) return error.NotAvailable;
     const allocator = self.allocator orelse return error.NotAvailable;
     const cfg = self.config orelse return error.NotAvailable;
 
     var name_buf: [128]u8 = undefined;
-    const set = setName(&name_buf, cfg.chain_prefix, jail.slice()) catch {
+    const set = setName(&name_buf, cfg.chain_prefix, if (ip == .ipv4) "ipv4" else "ipv6") catch {
         return error.SystemError;
     };
     const builder: CommandBuilder = .{ .set_name = set };
@@ -230,13 +243,8 @@ fn banImpl(
     const ip_str = std.fmt.bufPrint(&ip_buf, "{}", .{ip}) catch {
         return error.SystemError;
     };
-    var timeout_buf: [24]u8 = undefined;
-    const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{duration}) catch {
-        return error.SystemError;
-    };
-
     var argv_storage: [7][]const u8 = undefined;
-    const argv = builder.addEntry(&argv_storage, ip_str, timeout_str);
+    const argv = builder.addEntry(&argv_storage, ip_str, "0");
 
     const exit_class = try iptables.runCommand(allocator, argv);
     switch (exit_class) {
@@ -249,7 +257,7 @@ fn banImpl(
 fn unbanImpl(
     ctx: *anyopaque,
     ip: shared.IpAddress,
-    jail: shared.JailId,
+    _: shared.JailId,
 ) backend.BackendError!void {
     const self = castSelf(ctx);
     if (!self.initialized) return error.NotAvailable;
@@ -257,7 +265,7 @@ fn unbanImpl(
     const cfg = self.config orelse return error.NotAvailable;
 
     var name_buf: [128]u8 = undefined;
-    const set = setName(&name_buf, cfg.chain_prefix, jail.slice()) catch {
+    const set = setName(&name_buf, cfg.chain_prefix, if (ip == .ipv4) "ipv4" else "ipv6") catch {
         return error.SystemError;
     };
     const builder: CommandBuilder = .{ .set_name = set };
@@ -277,59 +285,35 @@ fn unbanImpl(
     }
 }
 
-fn listBansImpl(
-    ctx: *anyopaque,
-    jail: shared.JailId,
-    allocator: std.mem.Allocator,
-) backend.BackendError![]shared.IpAddress {
+fn listBansImpl(ctx: *anyopaque, _: shared.JailId, allocator: std.mem.Allocator) backend.BackendError![]shared.IpAddress {
     const self = castSelf(ctx);
     if (!self.initialized) return error.NotAvailable;
     const cfg = self.config orelse return error.NotAvailable;
-
-    var name_buf: [128]u8 = undefined;
-    const set = setName(&name_buf, cfg.chain_prefix, jail.slice()) catch {
-        return error.SystemError;
-    };
-    const builder: CommandBuilder = .{ .set_name = set };
-    var argv_storage: [3][]const u8 = undefined;
-    const argv = builder.listSet(&argv_storage);
-
-    var child = std.process.Child.init(argv, allocator);
-    child.stdin_behavior = .Close;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch return error.SystemError;
-    const stdout_reader = child.stdout orelse {
-        _ = child.wait() catch {};
-        return error.SystemError;
-    };
-    const stdout_buf = stdout_reader.readToEndAlloc(allocator, 1024 * 1024) catch {
-        _ = child.wait() catch {};
-        return error.SystemError;
-    };
-    defer allocator.free(stdout_buf);
-    const term = child.wait() catch return error.SystemError;
-    switch (term) {
-        .Exited => |c| if (c != 0) return try allocator.alloc(shared.IpAddress, 0),
-        else => return error.SystemError,
+    var list = std.ArrayList(shared.IpAddress).init(allocator);
+    errdefer list.deinit();
+    for ([_][]const u8{ "ipv4", "ipv6" }) |suffix| {
+        var buf: [128]u8 = undefined;
+        const name = setName(&buf, cfg.chain_prefix, suffix) catch return error.SystemError;
+        const result = try iptables.command.run(allocator, &.{ "ipset", "list", name }, 2000);
+        defer result.deinit(allocator);
+        if (result.code != 0) return error.SystemError;
+        const ips = try parseListOutput(allocator, result.stdout);
+        defer allocator.free(ips);
+        try list.appendSlice(ips);
     }
-    return parseListOutput(allocator, stdout_buf) catch return error.OutOfMemory;
+    return list.toOwnedSlice();
 }
 
-fn flushImpl(ctx: *anyopaque, jail: shared.JailId) backend.BackendError!void {
+fn flushImpl(ctx: *anyopaque, _: shared.JailId) backend.BackendError!void {
     const self = castSelf(ctx);
     if (!self.initialized) return error.NotAvailable;
     const allocator = self.allocator orelse return error.NotAvailable;
     const cfg = self.config orelse return error.NotAvailable;
-
-    var name_buf: [128]u8 = undefined;
-    const set = setName(&name_buf, cfg.chain_prefix, jail.slice()) catch {
-        return error.SystemError;
-    };
-    const builder: CommandBuilder = .{ .set_name = set };
-    var argv_storage: [3][]const u8 = undefined;
-    const argv = builder.flushSet(&argv_storage);
-    _ = try iptables.runCommand(allocator, argv);
+    for ([_][]const u8{ "ipv4", "ipv6" }) |suffix| {
+        var buf: [128]u8 = undefined;
+        const name = setName(&buf, cfg.chain_prefix, suffix) catch return error.SystemError;
+        if (try iptables.runCommand(allocator, &.{ "ipset", "flush", name }) != .ok) return error.SystemError;
+    }
 }
 
 fn isAvailableImpl(ctx: *anyopaque) bool {

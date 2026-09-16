@@ -9,12 +9,12 @@ pub const PatternDef = types.PatternDef;
 
 pub const patterns = [_]PatternDef{
     .{
-        .name = "failed-password",
-        .match = parser.compile("Failed password for <*> from <IP>"),
-    },
-    .{
         .name = "failed-password-invalid-user",
         .match = parser.compile("Failed password for invalid user <*> from <IP>"),
+    },
+    .{
+        .name = "failed-password",
+        .match = parser.compile("Failed password for <*> from <IP>"),
     },
     .{
         .name = "invalid-user",
@@ -33,7 +33,6 @@ pub const patterns = [_]PatternDef{
         .match = parser.compile("error: PAM: Authentication failure for <*> from <IP>"),
     },
     .{
-        // [preauth] required: the bare form matches normal operator logouts (self-ban).
         .name = "received-disconnect-preauth",
         .match = parser.compile("Received disconnect from <IP> <*>[preauth]"),
     },
@@ -63,9 +62,9 @@ test "sshd: Failed password (OpenSSH 7)" {
 }
 
 test "sshd: Failed password invalid user" {
-    try testing.expect(firstMatch("Failed password for invalid user oracle from 1.2.3.4 port 22 ssh2") != null);
-    try testing.expect(firstMatch("Failed password for invalid user postgres from 8.8.8.8 port 12345 ssh2") != null);
-    try testing.expect(firstMatch("Failed password for invalid user test from 172.16.0.5 port 55555 ssh2") != null);
+    try testing.expectEqual(@as(?usize, 0), firstMatch("Failed password for invalid user oracle from 1.2.3.4 port 22 ssh2"));
+    try testing.expectEqual(@as(?usize, 0), firstMatch("Failed password for invalid user postgres from 8.8.8.8 port 12345 ssh2"));
+    try testing.expectEqual(@as(?usize, 0), firstMatch("Failed password for invalid user test from 172.16.0.5 port 55555 ssh2"));
 }
 
 test "sshd: Invalid user" {
@@ -96,6 +95,10 @@ test "sshd: Bad protocol version" {
     try testing.expect(firstMatch("Bad protocol version identification 'GET / HTTP/1.1' from 1.2.3.4 port 1234") != null);
     try testing.expect(firstMatch("Bad protocol version identification 'SSH-1.99' from 5.6.7.8 port 22") != null);
     try testing.expect(firstMatch("Bad protocol version identification 'foo' from 9.9.9.9 port 1") != null);
+}
+
+test "sshd: maximum authentication attempts exceeded" {
+    try testing.expect(firstMatch("maximum authentication attempts exceeded for invalid user fixture from 192.0.2.49 port 22 ssh2 [preauth]") != null);
 }
 
 test "sshd: IPv6 addresses match" {

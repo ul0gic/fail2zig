@@ -11,7 +11,6 @@ const engine = @import("engine");
 const protocol = shared.protocol;
 
 pub const default_daemon_path = "zig-out/bin/fail2zig";
-pub const default_client_path = "zig-out/bin/fail2zig-client";
 
 pub const HarnessError = error{
     DaemonBinaryMissing,
@@ -36,7 +35,6 @@ pub const JailSpec = struct {
 
 pub const Options = struct {
     daemon_path: []const u8 = default_daemon_path,
-    client_path: []const u8 = default_client_path,
     jail: JailSpec = .{},
     startup_timeout_ms: u64 = 3_000,
     metrics_port: u16 = 0,

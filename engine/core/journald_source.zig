@@ -250,7 +250,9 @@ pub fn cursorPath(state_file: []const u8, buf: []u8) SidecarError![]const u8 {
     return buf[0..need];
 }
 
-pub fn saveCursors(entries: []const CursorEntry, path: []const u8) SidecarError!void {
+pub const CursorSaveError = SidecarError || std.fs.File.OpenError;
+
+pub fn saveCursors(entries: []const CursorEntry, path: []const u8) CursorSaveError!void {
     const max_path: usize = 4096;
     if (path.len == 0 or path.len + 4 > max_path) return error.PathTooLong;
     var tmp_buf: [max_path]u8 = undefined;
@@ -259,10 +261,10 @@ pub fn saveCursors(entries: []const CursorEntry, path: []const u8) SidecarError!
     @memcpy(tmp_buf[path.len .. path.len + tmp_suffix.len], tmp_suffix);
     const tmp_path = tmp_buf[0 .. path.len + tmp_suffix.len];
 
-    var file = std.fs.cwd().createFile(tmp_path, .{
+    var file = try std.fs.cwd().createFile(tmp_path, .{
         .mode = 0o600,
         .truncate = true,
-    }) catch return error.OpenFailed;
+    });
     var close_handled = false;
     defer if (!close_handled) file.close();
 
@@ -466,7 +468,7 @@ pub const JournaldSource = struct {
     baseline_timeout_ms: u64,
     poll_handle: ?TimerHandle = null,
     dirty: bool = false,
-    flush_fn: ?*const fn (?*anyopaque) void = null,
+    flush_fn: ?*const fn (?*anyopaque) bool = null,
     flush_userdata: ?*anyopaque = null,
 
     pub fn init(
@@ -534,7 +536,7 @@ pub const JournaldSource = struct {
 
     pub fn setFlushHook(
         self: *JournaldSource,
-        fn_ptr: *const fn (?*anyopaque) void,
+        fn_ptr: *const fn (?*anyopaque) bool,
         userdata: ?*anyopaque,
     ) void {
         self.flush_fn = fn_ptr;
@@ -658,9 +660,8 @@ pub const JournaldSource = struct {
     pub fn maybeFlush(self: *JournaldSource) void {
         if (!self.dirty) return;
         if (self.flush_fn) |f| {
-            f(self.flush_userdata);
+            if (f(self.flush_userdata)) self.dirty = false;
         }
-        self.dirty = false;
     }
 
     const PollError = error{
@@ -1306,11 +1307,33 @@ test "journald: collectCursors only includes jails with a cursor" {
 
 const FlushSpy = struct {
     calls: u32 = 0,
-    fn hook(ud: ?*anyopaque) void {
+    succeeds: bool = true,
+    fn hook(ud: ?*anyopaque) bool {
         const self: *FlushSpy = @ptrCast(@alignCast(ud.?));
         self.calls += 1;
+        return self.succeeds;
     }
 };
+
+test "journald: failed flush retries without new records and clears dirty only on success" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var loop = try EventLoop.init(testing.allocator);
+    defer loop.deinit();
+    var src = try JournaldSource.init(testing.allocator, &loop, "/tmp/fail2zig-test/state.bin", .{});
+    defer src.deinit();
+    var spy = FlushSpy{ .succeeds = false };
+    src.setFlushHook(FlushSpy.hook, &spy);
+    src.dirty = true;
+    src.maybeFlush();
+    try testing.expect(src.dirty);
+    try testing.expectEqual(@as(u32, 1), spy.calls);
+    spy.succeeds = true;
+    src.maybeFlush();
+    try testing.expect(!src.dirty);
+    try testing.expectEqual(@as(u32, 2), spy.calls);
+    src.maybeFlush();
+    try testing.expectEqual(@as(u32, 2), spy.calls);
+}
 
 test "journald: maybeFlush fires the hook once on a dirty source and clears dirty" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;

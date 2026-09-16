@@ -97,7 +97,11 @@ fn expectNotContains(haystack: []const u8, needle: []const u8) !void {
 }
 
 fn expectFailClosed(run: *const Run) !void {
-    try testing.expectEqual(@as(?u8, 1), run.exitCode());
+    try expectFailClosedClass(run, 1);
+}
+
+fn expectFailClosedClass(run: *const Run, class: u8) !void {
+    try testing.expectEqual(@as(?u8, class), run.exitCode());
     try testing.expect(run.stderr.len > 0);
     if (hasErrorReturnTrace(run.stderr)) {
         std.debug.print("error return trace leaked on a fail-closed exit:\n{s}\n", .{run.stderr});
@@ -154,10 +158,16 @@ const Scenario = struct {
     }
 
     fn writeConfig(self: *Scenario, socket_path: []const u8, source_line: []const u8, mode: posix.mode_t) ![]u8 {
+        const state_path = try std.fmt.allocPrint(self.a, "{s}/state.bin", .{self.root});
+        defer self.a.free(state_path);
+        return self.writeConfigWithState(socket_path, source_line, mode, state_path);
+    }
+
+    fn writeConfigWithState(self: *Scenario, socket_path: []const u8, source_line: []const u8, mode: posix.mode_t, state_path: []const u8) ![]u8 {
         const text = try std.fmt.allocPrint(self.a,
             \\[global]
             \\socket_path = "{s}"
-            \\state_file = "{s}/state.bin"
+            \\state_file = "{s}"
             \\metrics_bind = "127.0.0.1"
             \\metrics_port = {d}
             \\memory_ceiling_mb = 64
@@ -168,10 +178,11 @@ const Scenario = struct {
             \\[jails.sshd]
             \\enabled = true
             \\filter = "sshd"
+            \\timestamp = "undated"
             \\{s}
             \\logpath = ["{s}"]
             \\
-        , .{ socket_path, self.root, self.metrics_port, source_line, self.log_path });
+        , .{ socket_path, state_path, self.metrics_port, source_line, self.log_path });
         errdefer self.a.free(text);
 
         var f = try std.fs.cwd().createFile(self.config_path, .{ .truncate = true, .mode = 0o640 });
@@ -230,16 +241,12 @@ test "integration: fail-closed (b) metrics port already bound exits 1 with a cau
 
     try expectFailClosed(&r);
 
-    const http_cause = try std.fmt.allocPrint(a, "http: init on 127.0.0.1:{d} failed", .{s.metrics_port});
+    const http_cause = try std.fmt.allocPrint(a, "native: HTTP listener 127.0.0.1:{d}: AddressInUse", .{s.metrics_port});
     defer a.free(http_cause);
-    if (std.os.linux.geteuid() == 0) {
-        try expectContains(r.stderr, http_cause);
-    } else if (std.mem.indexOf(u8, r.stderr, http_cause) == null) {
-        try expectContains(r.stderr, "refusing to run unprotected");
-    }
+    try expectContains(r.stderr, http_cause);
 }
 
-test "integration: fail-closed (c) world-writable config exits 1 naming the mode and the fix, no trace" {
+test "integration: fail-closed (c) world-writable config exits 2 naming the mode and the fix, no trace" {
     const a = testing.allocator;
     var s = try Scenario.init(a);
     defer s.deinit();
@@ -252,7 +259,7 @@ test "integration: fail-closed (c) world-writable config exits 1 naming the mode
     var r = try s.run();
     defer r.deinit(a);
 
-    try expectFailClosed(&r);
+    try expectFailClosedClass(&r, 2);
     try expectContains(r.stderr, s.config_path);
     try expectContains(r.stderr, "world-writable (mode 0666)");
     try expectContains(r.stderr, "refusing to start");
@@ -280,7 +287,7 @@ test "integration: fail-closed (c') group-writable config with a non-root group 
 
         var r = try s.run();
         defer r.deinit(a);
-        try expectFailClosed(&r);
+        try expectFailClosedClass(&r, 2);
         if (st.gid != 0) {
             try expectContains(r.stderr, "non-root group (mode 0660)");
             try expectContains(r.stderr, "refusing to start");
@@ -301,7 +308,7 @@ test "integration: fail-closed (c') group-writable config with a non-root group 
     }
 }
 
-test "integration: fail-closed (d) backend = \"bogus\" exits 1 with path:line:col, key and section, no trace" {
+test "integration: fail-closed (d) backend = \"bogus\" exits 2 with path:line:col, key and section, no trace" {
     const a = testing.allocator;
     var s = try Scenario.init(a);
     defer s.deinit();
@@ -315,11 +322,101 @@ test "integration: fail-closed (d) backend = \"bogus\" exits 1 with path:line:co
     var r = try s.run();
     defer r.deinit(a);
 
-    try expectFailClosed(&r);
+    try expectFailClosedClass(&r, 2);
     const position = try std.fmt.allocPrint(a, "config: {s}:{d}:11: InvalidValue", .{ s.config_path, line });
     defer a.free(position);
     try expectContains(r.stderr, position);
     try expectContains(r.stderr, "(key 'backend' in [jails.sshd])");
+}
+
+fn expectStorageRefusal(r: *const Run, socket_path: []const u8) !void {
+    try expectFailClosed(r);
+    try expectContains(r.stderr, "refusing to start");
+    try expectNotContains(r.stderr, "firewall backend:");
+    try expectNotContains(r.stderr, "scaffold installed");
+    try expectNotContains(r.stderr, "no usable backend");
+    try expectNotContains(r.stderr, "http:");
+    try expectNotContains(r.stderr, "native: HTTP listener");
+    try testing.expectError(error.FileNotFound, std.fs.cwd().access(socket_path, .{}));
+}
+
+test "integration: persistence missing parent refuses startup before backend and listeners" {
+    const a = testing.allocator;
+    var s = try Scenario.init(a);
+    defer s.deinit();
+    const sock = try s.defaultSocketPath();
+    defer a.free(sock);
+    const state_path = try std.fmt.allocPrint(a, "{s}/missing/state.bin", .{s.root});
+    defer a.free(state_path);
+    const text = try s.writeConfigWithState(sock, "source = \"file\"", 0o640, state_path);
+    defer a.free(text);
+    var r = try s.run();
+    defer r.deinit(a);
+    try expectStorageRefusal(&r, sock);
+    try expectContains(r.stderr, state_path);
+    try expectContains(r.stderr, "native: path admission");
+    try expectContains(r.stderr, "FileNotFound");
+}
+
+test "integration: legacy state format refuses before SQLite and preserves saved bytes" {
+    const a = testing.allocator;
+    var s = try Scenario.init(a);
+    defer s.deinit();
+    const sock = try s.defaultSocketPath();
+    defer a.free(sock);
+    const text = try s.writeConfig(sock, "source = \"file\"", 0o640);
+    defer a.free(text);
+    {
+        const file = try s.tmp.dir.createFile("state.bin", .{ .mode = 0o600 });
+        defer file.close();
+        try file.writeAll("F2ZS\x04retained legacy bytes");
+    }
+    try s.tmp.dir.makeDir("state.bin.tmp");
+    var r = try s.run();
+    defer r.deinit(a);
+    try expectStorageRefusal(&r, sock);
+    try expectContains(r.stderr, "native: state authority");
+    try expectContains(r.stderr, "NativeStateMigrationRequired");
+    var retained_sidecar = try s.tmp.dir.openDir("state.bin.tmp", .{});
+    retained_sidecar.close();
+    const saved = try s.tmp.dir.readFileAlloc(a, "state.bin", 100);
+    defer a.free(saved);
+    try testing.expectEqualStrings("F2ZS\x04retained legacy bytes", saved);
+}
+
+test "integration: unwritable persistence refuses startup then advances after repair" {
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
+    const a = testing.allocator;
+    var s = try Scenario.init(a);
+    defer s.deinit();
+    const sock = try s.defaultSocketPath();
+    defer a.free(sock);
+    try s.tmp.dir.makeDir("storage");
+    var storage = try s.tmp.dir.openDir("storage", .{ .iterate = true });
+    defer storage.close();
+    const state_path = try std.fmt.allocPrint(a, "{s}/storage/state.bin", .{s.root});
+    defer a.free(state_path);
+    const text = try s.writeConfigWithState(sock, "source = \"file\"", 0o640, state_path);
+    defer a.free(text);
+    const addr = try std.net.Address.parseIp4("127.0.0.1", s.metrics_port);
+    var holder = try addr.listen(.{ .reuse_address = true });
+    defer holder.deinit();
+    try posix.fchmod(storage.fd, 0o500);
+    defer posix.fchmod(storage.fd, 0o700) catch {};
+    {
+        var r = try s.run();
+        defer r.deinit(a);
+        try expectStorageRefusal(&r, sock);
+        try expectContains(r.stderr, "native: state authority");
+        try expectContains(r.stderr, state_path);
+        try expectContains(r.stderr, "AccessDenied");
+    }
+    try posix.fchmod(storage.fd, 0o700);
+    var repaired = try s.run();
+    defer repaired.deinit(a);
+    try expectFailClosed(&repaired);
+    try expectContains(repaired.stderr, "native: HTTP listener");
+    try expectNotContains(repaired.stderr, "startup check");
 }
 
 test "integration: fail-closed helper: trace detector matches Zig frame lines and nothing else" {

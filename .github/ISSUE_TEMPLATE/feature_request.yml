@@ -53,7 +53,7 @@ body:
         - "engine — core daemon"
         - "filters — pattern library"
         - "firewall — backends"
-        - "client — fail2zig-client CLI"
+        - "cli — fail2zig administration commands"
         - "config — TOML / fail2ban compat"
         - "metrics / observability"
         - "docs"

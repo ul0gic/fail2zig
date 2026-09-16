@@ -57,7 +57,7 @@ test "benchmark: parser throughput >= target" {
     const elapsed_s: f64 = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, std.time.ns_per_s);
     const rate: f64 = @as(f64, @floatFromInt(total_lines)) / elapsed_s;
 
-    const stdout = std.io.getStdOut().writer();
+    const stdout = std.io.getStdErr().writer();
     stdout.print(
         \\{{"bench":"parse_throughput","lines":{d},"matched":{d},"elapsed_ns":{d},"lines_per_sec":{d:.0},"target":{d}}}
         \\

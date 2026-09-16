@@ -1,0 +1,1 @@
+{"id":"app-host","source":"application","format":"template","template":"Denied login from {peer:hostname} port {port:uint}","subject":"peer","subject_kind":"hostname","conditions":[{"field":"port","number":2201}]}

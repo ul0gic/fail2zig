@@ -1,15 +1,3 @@
-# Dependabot — keeps dependency versions safe without nagging.
-#
-# Scope:
-#   - .github/workflows/* GitHub Action pins: flag outdated SHA refs
-#
-# The Zig daemon has zero runtime dependencies by design (see
-# docs/architecture/zero-dependencies), so there is no Zig ecosystem
-# to scan here. build.zig.zon carries no third-party packages; if that
-# ever changes, a zig ecosystem block will need adding.
-#
-# The marketing site lives in a separate repo and runs its own
-# Dependabot config there.
 version: 2
 updates:
   - package-ecosystem: "github-actions"

@@ -54,8 +54,9 @@ pub const IpState = struct {
     last_attempt: Timestamp,
     ban_state: BanState,
     ban_expiry: ?Timestamp,
-    /// True only when the dispatcher handed this ban to the firewall; a log-only would-ban stays false so reconcile/expiry never touch the backend for it (BUG-012).
     enforced: bool = false,
+    applied: bool = false,
+    confirmed: bool = false,
 
     ring: [max_attempts_per_ip]Timestamp,
     ring_len: u8,
@@ -153,7 +154,6 @@ pub const Cidr = union(enum) {
 fn maskIpv4(prefix: u8) u32 {
     if (prefix == 0) return 0;
     if (prefix >= 32) return 0xFFFF_FFFF;
-    // Arithmetic shift avoids the UB of << 32 on a 32-bit value.
     return @as(u32, 0xFFFF_FFFF) << @intCast(32 - prefix);
 }
 
@@ -176,6 +176,7 @@ pub const Error = error{
     OutOfMemory,
     CapacityZero,
     InvalidIgnoreCidr,
+    CapacityReached,
 };
 
 const Map = std.AutoHashMap(IpAddress, IpState);
@@ -214,7 +215,7 @@ pub const StateTracker = struct {
     }
 
     pub fn recordLifetimeBan(self: *StateTracker) void {
-        self.lifetime_bans += 1;
+        self.lifetime_bans +|= 1;
     }
 
     pub fn seedLifetimeBans(self: *StateTracker, count: u64) void {
@@ -253,29 +254,20 @@ pub const StateTracker = struct {
 
         try self.ensureReserved();
 
+        if (!self.map.contains(ip) and self.map.count() >= self.config.max_entries) {
+            const evicted_any = self.evictForInsert(timestamp);
+            self.stats_inner.evictions += @intFromBool(evicted_any);
+            if (!evicted_any) {
+                std.log.warn("state: capacity reached and no entry evictable; dropping attempt", .{});
+                return null;
+            }
+        }
         const gop = self.map.getOrPut(ip) catch return error.OutOfMemory;
         if (!gop.found_existing) {
-            if (self.map.count() > self.config.max_entries) {
-                _ = self.map.remove(ip);
-                const evicted_any = self.evictForInsert(timestamp);
-                self.stats_inner.evictions += @intFromBool(evicted_any);
-                if (!evicted_any) {
-                    std.log.warn(
-                        "state: capacity reached and no entry evictable; dropping attempt",
-                        .{},
-                    );
-                    return null;
-                }
-                const gop2 = self.map.getOrPut(ip) catch return error.OutOfMemory;
-                gop2.value_ptr.* = freshState(jail, timestamp);
-            } else {
-                gop.value_ptr.* = freshState(jail, timestamp);
-            }
+            gop.value_ptr.* = freshState(jail, timestamp);
         } else {
-            const st = gop.value_ptr;
-            st.attempt_count +%= 1;
-            st.last_attempt = timestamp;
-            _ = &jail;
+            gop.value_ptr.attempt_count +|= 1;
+            gop.value_ptr.last_attempt = timestamp;
         }
 
         const st = self.map.getPtr(ip) orelse return null;
@@ -286,7 +278,7 @@ pub const StateTracker = struct {
         st.pushRing(timestamp);
 
         if (st.ban_state != .banned and st.ring_len >= self.config.maxretry) {
-            const new_ban_count = st.ban_count + 1;
+            const new_ban_count = st.ban_count +| 1;
             const duration = computeBantime(
                 self.config.bantime,
                 self.config.bantime_increment,
@@ -294,8 +286,9 @@ pub const StateTracker = struct {
             );
             st.ban_state = .banned;
             st.enforced = false;
+            st.applied = false;
+            st.confirmed = false;
             st.ban_count = new_ban_count;
-            // Saturate instead of overflow: a huge duration or near-max clock must not crash the daemon on first ban.
             const duration_i64: Timestamp = @intCast(@min(duration, std.math.maxInt(Timestamp)));
             st.ban_expiry = std.math.add(Timestamp, timestamp, duration_i64) catch blk: {
                 std.log.warn("state: ban_expiry overflow, clamping to Timestamp max", .{});
@@ -318,8 +311,35 @@ pub const StateTracker = struct {
             st.ban_state = .expired;
             st.ban_expiry = null;
             st.enforced = false;
+            st.applied = false;
+            st.confirmed = false;
             st.ring_len = 0;
         }
+    }
+
+    pub fn manualBan(self: *StateTracker, ip: IpAddress, jail: JailId, now: Timestamp, duration: Duration) Error!void {
+        try self.ensureReserved();
+        if (!self.map.contains(ip)) {
+            if (self.map.count() >= self.config.max_entries and self.evictOldest(false) == null)
+                return error.CapacityReached;
+            try self.map.put(ip, freshState(jail, now));
+            self.map.getPtr(ip).?.attempt_count = 0;
+        }
+        const st = self.map.getPtr(ip).?;
+        if (st.ban_state != .banned) {
+            st.ban_count +|= 1;
+            st.confirmed = false;
+        }
+        const expiry = now +| @as(Timestamp, @intCast(@min(duration, std.math.maxInt(Timestamp))));
+        st.ban_expiry = @max(st.ban_expiry orelse expiry, expiry);
+        st.ban_state = .banned;
+        st.enforced = true;
+        st.applied = false;
+        st.ring_len = 0;
+    }
+
+    pub fn mutable(self: *StateTracker, ip: IpAddress) ?*IpState {
+        return self.map.getPtr(ip);
     }
 
     pub fn markEnforced(self: *StateTracker, ip: IpAddress) void {
@@ -404,7 +424,8 @@ fn freshState(jail: JailId, timestamp: Timestamp) IpState {
 }
 
 pub fn computeBantime(base: Duration, incr: BanTimeIncrement, ban_count: u32) Duration {
-    if (!incr.enabled or ban_count == 0) {
+    if (!incr.enabled) return base;
+    if (ban_count == 0) {
         return @min(base, incr.max_bantime);
     }
     const base_f: f64 = @floatFromInt(base);
@@ -684,6 +705,11 @@ test "state: drop_oldest_unbanned returns null when every entry is banned" {
     try testing.expect(tracker.get(tIp("1.1.1.1")).?.ban_state == .banned);
     try testing.expect(tracker.get(tIp("2.2.2.2")).?.ban_state == .banned);
     try testing.expect(tracker.evict() == null);
+}
+
+test "state: disabled increments do not cap a longer configured base duration" {
+    const base: Duration = 30 * 86400;
+    try testing.expectEqual(base, computeBantime(base, .{ .enabled = false }, 5));
 }
 
 test "state: computeBantime disabled returns base" {

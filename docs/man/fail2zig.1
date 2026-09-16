@@ -1,210 +1,399 @@
-.TH FAIL2ZIG 1 "2026-04-21" "fail2zig 0.1.0" "User Commands"
+.TH FAIL2ZIG 1 "2026-09-16" "fail2zig 0.4.0" "User Commands"
 .
 .SH NAME
-fail2zig \- modern intrusion prevention daemon
+fail2zig \- intrusion prevention daemon and its administration commands
 .
 .SH SYNOPSIS
 .B fail2zig
 [\fB\-\-config\fR \fIpath\fR]
 [\fB\-\-foreground\fR]
 [\fB\-\-validate\-config\fR]
-[\fB\-\-test\-config\fR]
 [\fB\-\-import\-config\fR [\fIsource\-dir\fR]]
 [\fB\-\-import\-output\fR \fIpath\fR]
-[\fB\-\-version\fR | \fB\-V\fR]
-[\fB\-\-help\fR | \fB\-h\fR]
+.br
+.B fail2zig
+[\fIglobal flags\fR]
+\fIcommand\fR
+[\fIargs\fR]
+.br
+.B fail2zig rule-test
+(\fB\-\-file\fR \fIpath\fR | \fB\-\-record\fR \fIline\fR | \fB\-\-journal\fR [\fImatch\fR...])
+(\fB\-\-service\fR \fIname\fR | \fB\-\-rule\-file\fR \fIpath\fR)
+[\fIoptions\fR]
+.br
+.B fail2zig migrate
+\fBinspect\fR|\fBsnapshot\fR|\fBplan\fR|\fBvalidate\fR|\fBcutover\fR|\fBstatus\fR|\fBrollback\fR
+[\fIoptions\fR]
+.br
+.B fail2zig
+\fB\-\-version\fR | \fB\-\-help\fR
 .
 .SH DESCRIPTION
 .B fail2zig
-is a host-based intrusion prevention daemon. It watches log files for
-authentication failures and other abuse patterns, and applies temporary IP bans
-via the system firewall when a configured threshold of failures is crossed within
-a sliding time window.
+is a host-based intrusion prevention daemon. It reads log files or the systemd
+journal, matches compiled service filters or bounded native rules, and applies
+temporary bans through nftables (direct netlink), ipset or iptables.
 .PP
-The daemon is a single static binary with zero runtime dependencies. All firewall
-operations are performed via direct netlink communication with the kernel — no
-shell, no subprocess, no \fBnft\fR or \fBiptables\fR CLI tools are invoked.
+One executable provides every entry point. Without a command it starts the daemon;
+with a command it administers a running daemon over its Unix socket;
+.B rule-test
+and
+.B migrate
+work offline.
 .PP
-Configuration is read from a TOML file. Built-in filters for 15 common services
-(SSH, nginx, Apache, Postfix, Dovecot, and others) are compiled into the binary
-at build time. There is no runtime regex engine; all pattern matching is performed
-by specialized functions generated at compile time.
-.PP
-In version 0.1.0, the daemon runs in foreground mode only. Daemonization is
-planned for a future release. Run under
+The daemon runs in the foreground only and is designed for a
 .BR systemd (1)
-or a process supervisor.
+unit of
+.BR Type=notify :
+it sends
+.B READY=1
+only after configuration, storage, every source and enforcing protection are admitted,
+.B RELOADING=1
+then
+.B READY=1
+around a live reload, and
+.B STOPPING=1
+on exit.
+.B SIGHUP
+applies a validated configuration generation live;
+.B SIGUSR1
+reopens
+.B global.log_target
+after rotation;
+.B SIGTERM
+and
+.B SIGINT
+stop cleanly. No socket unit is shipped and
+.B LISTEN_FDS
+is not read.
 .
-.SH OPTIONS
+.SH DAEMON OPTIONS
 .TP
 .BI \-\-config " path"
-Path to the configuration file. Default:
+Configuration file. Default:
 .IR /etc/fail2zig/config.toml .
-The file must be valid TOML conforming to the fail2zig schema; unknown keys are
-rejected with line and column context.
+Unknown keys are rejected with line and column context.
 .TP
 .B \-\-foreground
-Run in foreground (log to stderr). This is the only supported mode in v0.1.0;
-the flag is accepted but has no additional effect.
+Run in the foreground. Accepted for clarity; it is the only mode.
 .TP
 .B \-\-validate\-config
-Load and validate the configuration file, print the result, and exit. Does not
-start log watchers, does not contact the firewall backend, does not write the
-PID file or state file.
-.sp
-.nf
-.B "$ fail2zig --validate-config --config /etc/fail2zig/config.toml"
-config: OK (6 jail(s) configured)
-.fi
-.TP
+Load and validate the configuration, print the result and exit without starting
+sources, touching the firewall or writing state.
 .B \-\-test\-config
-Alias for
-.BR \-\-validate\-config .
-Retained for compatibility with early release documentation.
+is an alias.
 .TP
 .BI \-\-import\-config " [source-dir]"
-Import a fail2ban configuration tree and write a native
-.B fail2zig.toml
-file. The optional
-.I source-dir
-argument is the fail2ban config root; it defaults to
-.IR /etc/fail2ban .
-The importer reads
-.IR jail.conf ,
-.IR jail.local ,
-.IR jail.d/*.conf ,
-and
-.IR filter.d/*.conf
-in fail2ban's precedence order, translates the enabled jails, and writes a
-migration report to stderr.
-.sp
-.nf
-.B "$ fail2zig --import-config /etc/fail2ban"
-.B "    --import-output /etc/fail2zig/config.toml"
-migration: imported=3 skipped=0 filters(translated=0 builtin=3 skipped=0) \
-output='/etc/fail2zig/config.toml'
-.fi
+Translate a fail2ban configuration tree (default
+.IR /etc/fail2ban )
+into a native configuration and a protected provenance manifest, then exit.
+Unsupported semantics are marked
+.B compatibility_pending
+rather than approximated.
 .TP
 .BI \-\-import\-output " path"
-Destination path for the generated TOML file when running
-.BR \-\-import\-config .
-Default:
+Destination of the imported configuration. Default:
 .IR /etc/fail2zig/config.toml .
-The write is atomic: the file is written to a temporary path and renamed into
-place. The parent directory is created if it does not exist.
 .TP
 .BR \-\-version ", " \-V
-Print the version string and exit.
-.sp
-.nf
-.B "$ fail2zig --version"
-fail2zig 0.1.0
-.fi
+Print the version and exit without contacting the daemon.
 .TP
 .BR \-\-help ", " \-h
-Print usage information and exit.
+Print usage and exit.
+.
+.SH GLOBAL FLAGS (ADMINISTRATION)
+.TP
+.BI \-\-socket " path"
+Unix socket. Default:
+.IR /run/fail2zig/fail2zig.sock .
+.TP
+.BI \-\-output " format"
+.BR table " (default), " json " or " plain
+(tab-separated).
+.TP
+.B \-\-no\-color
+Disable ANSI colour.
+.TP
+.BI \-\-timeout " ms"
+Command timeout. Default 5000. Expiry exits with class 3.
+.
+.SH COMMANDS
+Members of the
+.B fail2zig
+group may run the read-only commands through the 0660 socket. Mutations
+.RB ( ban ", " unban ", " reload ", " "history reset" ", " jail )
+require uid 0 or the daemon uid, verified with
+.BR SO_PEERCRED .
+.TP
+.B status
+Daemon summary: version, protection state
+.RB ( active ", " log-only ", " mixed " or " "DEGRADED (cause)" ),
+backend, active and total bans, storage phase, generation and worker/clock flags.
+.TP
+.B jails
+One row per configured jail: enabled, paused, health, active bans, thresholds,
+effective action, whether it enforces, and its source.
+.TP
+.BI list " [--jail name]"
+Active bans, optionally for one jail.
+.TP
+.BI ban " ip --jail name [--duration seconds] [--scope host|net cidr]"
+Manual ban. Exactly one
+.B \-\-jail
+is required.
+.B \-\-scope net
+bans a network and needs a backend with set support (nftables or ipset).
+A log-only jail rejects manual bans.
+.TP
+.BI unban " ip --jail name [--scope host|net cidr]"
+Release a manual or automatic ban in one jail.
+.TP
+.B reload
+Propose the current configuration file as a new generation. Outcomes:
+.BR noop ", " applied ", " rejected " or " restart_required
+(the restart-only keys are listed in
+.BR reasons ).
+Live keys: per-jail
+.BR maxretry ", " bantime ", " bantime_kind ", " bantime_increment ,
+global
+.BR log_level ,
+and the contents of a custom jail's
+.BR ignore_file .
+.TP
+.BI history " [--jail name] [--limit 1..256] [--cursor token]"
+Page through confirmed ban history;
+.B next_cursor
+continues a listing.
+.TP
+.BI "history reset " "ip (--jail name | --all)"
+Reset the durable history for one address.
+.TP
+.BI "jail enable|disable|pause|resume " name
+Administer one jail. Disabling releases its effects; pausing keeps them.
+.TP
+.B config
+The effective configuration and its generation. Paths and address lists are
+redacted unless the caller is an administrator.
+.TP
+.B version
+Daemon version over the socket (unlike
+.BR \-\-version ).
+.TP
+.BI completions " bash|zsh|fish"
+Shell completion script on stdout.
+.TP
+.BI help " [command]"
+General or per-command help.
+.
+.SH RULE-TEST
+.B fail2zig rule-test
+evaluates one input against one builtin service or one native rule file with the
+daemon's own decoder, time admission and detectors. It opens no state store, no
+firewall and no daemon socket.
+.TP
+Input (exactly one)
+.BI \-\-file " path"
+(regular file, streamed, at most 64 MiB, lines up to 64 KiB),
+.BI \-\-record " line" ,
+or
+.B \-\-journal
+[\fImatch\fR...] through the fixed
+.BR journalctl (1)
+invocation.
+.TP
+Rule (exactly one)
+.BI \-\-service " name"
+(one of the compiled services) or
+.BI \-\-rule\-file " path"
+(bounded native JSON rule, at most 4096 bytes).
+.TP
+Options
+.BI \-\-config " path"
+[\fB\-\-jail\fR \fIname\fR] resolves timestamp, time zone and ignore settings from a
+native configuration;
+.BI \-\-timestamp " iso8601|syslog|epoch_seconds|common_log|undated" ,
+.BI \-\-time\-zone " id" ,
+.BI \-\-tz\-offset " minutes" ,
+.BI \-\-year " yyyy" ,
+.BI \-\-encoding " utf8|ascii|latin1|utf16le|utf16be|utf32le|utf32be" ,
+.BI \-\-identity " raw|dns"
+(\fBdns\fR resolves hostnames only through
+.BI \-\-dns\-server " ip:port"
+with a bounded timeout; the default never touches the network),
+.BI \-\-ignore " cidr" ,
+.BI \-\-max\-lines " n" ,
+.BI \-\-limit " n"
+(samples, default 20),
+.BI \-\-output " json|table" ,
+.BR \-\-print\-lines ,
+.BI \-\-now " epoch-seconds" ,
+.BI \-\-window " seconds" .
+.PP
+Samples report the outcome
+.RB ( match ", " miss ", " ignore ", " reject ),
+the reason, the extracted identity, the event time and the time disposition.
+Raw lines are included only with
+.BR \-\-print\-lines .
+Exit 0 when the input was processed (even with zero matches), 1 when the rule,
+configuration or input was refused, 2 on usage errors.
+.
+.SH MIGRATE
+Read-only preparation:
+.B inspect
+(\fB\-\-source\-dir\fR),
+.B snapshot
+(\fB\-\-source\-db\fR \fB\-\-staging\-dir\fR),
+.B plan
+(\fB\-\-source\-dir\fR, optional \fB\-\-source\-db\fR with \fB\-\-staging\-dir\fR,
+\fB\-\-out\fR, \fB\-\-continuity lossless|reset-replay\fR, \fB\-\-replay\-window\fR,
+\fB\-\-runtime\-socket\fR)
+and
+.B validate
+(\fB\-\-plan\fR). The staging directory must be private (0700) and non-volatile.
+.PP
+.B cutover
+(\fB\-\-plan \-\-state\-file \-\-staging\-dir \-\-backend nftables|ipset|iptables\fR
+[\fB\-\-socket\fR] [\fB\-\-run\-id\fR]) stages the destination offline with the daemon
+stopped and drives activation and kernel verification inside the daemon. It is
+journaled: an unreachable socket exits 3 and prints the exact
+.B \-\-run\-id
+command to resume, and a rerun classifies the journal instead of replaying.
+.B status
+reports a run.
+.PP
+.B rollback
+(\fB\-\-plan \-\-state\-file \-\-staging\-dir \-\-backend \-\-run\-id\fR
+[\fB\-\-socket\fR] [\fB\-\-source\-verified\fR]) reverses an activated run in two
+journaled phases. First it validates the staging recovery point against the plan's
+snapshot and fingerprints the live source (WAL-aware); a mismatch is
+.B rollback_failed
+(exit 4) with nothing written, an environment failure is
+.B operational_failure
+(exit 1) and resumable. It then carries the post-cutover deltas back, moves the original
+with its journal siblings to
+.IR <source>.pre-rollback-<run16> ,
+renames the fsync'd derived database into place, records a
+.I restored-<run16>
+marker in the staging directory and exits 3 with the next command. Then, with
+.BR \-\-source\-verified ,
+the source control socket present and a running
+.B fail2ban-server
+process, it releases the migrated scopes from the daemon: exit 0 with state
+.BR rolled_back ;
+partial (4), uncertain (5) or refused (1) releases leave the step open; an unreachable
+daemon exits 3. See
+.IR docs/operations/command-migration.md .
+.
+.SH EXIT STATUS
+Every command returns one of the frozen classes.
+.TP
+.B 0
+Success; every claimed effect was observed.
+.TP
+.B 1
+Valid request rejected by the daemon or the local operation (fail-closed startup,
+log-only jail, zero jails imported, refused rule or input).
+.TP
+.B 2
+Usage, argument, configuration parse or validation failure.
+.TP
+.B 3
+Daemon or transport unavailable (no socket, refused, timeout).
+.TP
+.B 4
+A durable effect was applied but kernel confirmation is incomplete.
+.TP
+.B 5
+A durable effect may have been applied and could not be established.
 .
 .SH FILES
 .TP
 .I /etc/fail2zig/config.toml
-Default configuration file. See
-.BR fail2zig.toml (5)
-for the full format reference.
-.TP
-.I /run/fail2zig/fail2zig.pid
-PID file written on startup. Location configurable via
-.B global.pid_file
-in the configuration.
+Configuration; see
+.BR fail2zig.toml (5).
 .TP
 .I /run/fail2zig/fail2zig.sock
-Unix domain socket for
-.BR fail2zig\-client (1)
-communication. Mode 0660, group-restricted. Location configurable via
-.B global.socket_path
-in the configuration.
+Administration socket, mode 0660, group
+.BR fail2zig .
+The parent directory must be owned by root or the daemon uid with no group or
+other write bit; the daemon refuses to serve otherwise.
 .TP
 .I /var/lib/fail2zig/state.bin
-Binary ban-state file. Written on clean shutdown (SIGTERM, SIGINT), read on
-startup to restore active bans. CRC32-validated; discarded on mismatch. Mode
-0600, owned by root. Location configurable via
-.B global.state_file
-in the configuration.
+Durable SQLite state: records, decisions, effects, history and source positions.
+The parent and database must be owned by the daemon UID, with no group or
+other write access. This is not the legacy v0.3.0 binary state format.
+.TP
+.I global.log_target
+Optional append-only log file (mode 0640) instead of stderr; reopened on
+.BR SIGUSR1 .
 .
-.SH EXIT STATUS
-.TP
-.B 0
-Success. The daemon ran and exited cleanly (SIGTERM or SIGINT), or a
-non-daemon operation (
-.BR \-\-validate\-config ,
-.BR \-\-version ,
-.BR \-\-help )
-completed successfully.
-.TP
-.B 1
-Configuration load or validation failure; or
-.B \-\-import\-config
-completed with zero jails successfully imported.
-.TP
-.B 2
-Hard parse error during
-.B \-\-import\-config
-(file not found, permission denied, unrecoverable format error).
+.SH SERVICE ACCOUNT AND UPGRADE
+The shipped unit runs as the non-login user and group
+.BR fail2zig ,
+retaining CAP_NET_ADMIN, CAP_NET_RAW and CAP_DAC_READ_SEARCH for firewall and log access.
+Root or the daemon UID may mutate protection; service-group membership grants
+socket monitoring only. CAP_NET_RAW is required by the iptables ipset extension
+and also permits raw IP sockets. HTTP runs in the same process with the same capabilities.
+.PP
+Stop every daemon and state writer and preserve configuration, executable and
+coherent state backups before upgrading. The installer does not enable, start
+or restart services. It changes ownership only for the default native SQLite
+directory, database and existing WAL/SHM files; active writers, unsafe paths,
+legacy binary state and automatic custom-path upgrades are refused.
+.PP
+No automatic conversion of v0.3.0 binary state is provided. Starting a fresh
+native database does not preserve its saved bans, counters, history or source
+positions. Supported fail2ban schema-4 SQLite migration is a separate workflow.
+Native destination migration must run as the service UID with the required
+capabilities and caller-owned private staging, with the destination daemon
+stopped. See docs/operations/command-migration.md and migration-continuity.md.
 .
 .SH ENVIRONMENT
-No environment variables are read by the daemon in v0.1.0. Systemd socket
-activation environment variables (\fBLISTEN_FDS\fR, \fBNOTIFY_SOCKET\fR) are
-planned for Phase 2.
+.TP
+.B NOTIFY_SOCKET
+Set by
+.BR systemd (1)
+for
+.BR Type=notify ;
+absent means notifications are disabled.
+.TP
+.B PATH
+Searched for
+.B ipset
+and
+.B iptables
+when that backend is selected.
+.B journalctl
+is invoked at
+.I /usr/bin/journalctl
+only.
+.PP
+No other variables are read by the daemon or the administration commands.
 .
 .SH EXAMPLES
-.SS Validate configuration before starting
 .nf
 sudo fail2zig --validate-config --config /etc/fail2zig/config.toml
-.fi
-.SS Import fail2ban configuration
-.nf
-sudo fail2zig --import-config /etc/fail2ban \\
-              --import-output /etc/fail2zig/config.toml
-.fi
-.SS Run under systemd (manual invocation equivalent)
-.nf
-sudo fail2zig --foreground --config /etc/fail2zig/config.toml
-.fi
-.SS Cross-compile for aarch64 (from source)
-.nf
-zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe
-scp zig-out/bin/fail2zig user@arm-server:/usr/local/bin/
+sudo fail2zig status
+fail2zig list --jail sshd --output json
+sudo fail2zig ban 192.0.2.10 --jail sshd --duration 3600
+sudo fail2zig reload
+fail2zig rule-test --file /var/log/auth.log --service sshd --tz-offset 0
+fail2zig completions bash > /etc/bash_completion.d/fail2zig
 .fi
 .
 .SH SEE ALSO
-.BR fail2zig-client (1),
 .BR fail2zig.toml (5),
-.BR nft (8),
-.BR systemd.service (5)
+.BR systemd.service (5),
+.BR nft (8)
 .PP
-Documentation:
-.UR https://fail2zig.dev/docs
-.UE
-.
-.SH AUTHORS
-Written by the fail2zig contributors. See the project repository for the full
-contributor list.
+Migration of scripts and runbooks:
+.IR docs/operations/command-migration.md .
 .
 .SH BUGS
 Report bugs at
 .UR https://github.com/ul0gic/fail2zig/issues
 .UE .
-.PP
-Known limitations in v0.1.0:
-.IP \(bu 2
-Daemon mode (background process) is not yet implemented; run under a process
-supervisor.
-.IP \(bu 2
-Hot-reload (\fBfail2zig-client reload\fR) is implemented at the IPC level but
-the daemon-side handler is a stub; a restart is required to pick up config
-changes.
-.IP \(bu 2
-Per-jail bantime increment settings are parsed but only the \fB[defaults]\fR
-values take effect.
 .
 .SH HISTORY
 fail2zig 0.1.0 was the first public release, April 2026.
+fail2zig 0.3.0 was released September 2026.

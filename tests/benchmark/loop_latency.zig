@@ -171,7 +171,7 @@ test "benchmark: IPC status round-trip latency while a slow journalctl is polled
     for (got) |x| sum += x;
     const mean = sum / got.len;
 
-    const stdout = std.io.getStdOut().writer();
+    const stdout = std.io.getStdErr().writer();
     stdout.print(
         \\{{"bench":"loop_latency","iterations":{d},"p50_ns":{d},"p99_ns":{d},"max_ns":{d},"mean_ns":{d},"polls_consumed":{d},"elapsed_ms":{d},"target_ns":{d}}}
         \\

@@ -1,15 +1,4 @@
 #!/usr/bin/env bash
-# tests/harness/reset.sh — return the lab box to a clean testable state.
-#
-# Stops the daemon, wipes persistent state, flushes the nftables table,
-# truncates the watched log files, and starts the daemon again. Used
-# between scenarios to guarantee a deterministic starting point.
-#
-# Usage: reset.sh [--no-start]
-#
-# Exits 0 on success. Safe to run when the daemon is already stopped
-# (systemctl stop is idempotent) or when the nftables table doesn't
-# exist (DELTABLE returns ENOENT which we swallow).
 
 set -euo pipefail
 
@@ -30,10 +19,6 @@ sudo rm -f /var/lib/fail2zig/state.bin
 echo "reset: flushing nftables table"
 sudo nft delete table inet fail2zig 2>/dev/null || true
 
-# Truncate any log files that jails watch. Truncation preserves file
-# perms + ownership + inode (unlike rm-and-recreate which would race
-# rsyslog + reset the rotation tracking state). rsyslog reopens the
-# file automatically on subsequent writes.
 for f in /var/log/auth.log \
          /var/log/nginx/error.log \
          /var/log/nginx/access.log \
@@ -47,10 +32,8 @@ done
 if [ "$start_after" = "1" ]; then
     echo "reset: starting daemon"
     sudo systemctl start fail2zig
-    # Wait up to 5s for the IPC socket to become ready — that's the
-    # moment after which subsequent injections will be observed.
     for _ in $(seq 1 50); do
-        if sudo /usr/local/bin/fail2zig-client status >/dev/null 2>&1; then
+        if sudo /usr/local/bin/fail2zig status >/dev/null 2>&1; then
             echo "reset: daemon ready"
             exit 0
         fi
