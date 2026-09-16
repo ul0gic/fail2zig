@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Canonical N3 firewall scope values. Construction and validation are pure:
-//! callers must complete this boundary before persisting or dispatching effects.
 const std = @import("std");
 const shared = @import("shared");
 
@@ -31,16 +29,12 @@ pub const Subject = struct {
     family: Family,
     kind: SubjectKind,
     prefix: u8,
-    /// Network byte order. IPv4 occupies the first four bytes and requires a
-    /// zero tail, so native layout and host endianness never enter identity.
     address: [16]u8,
 
     pub fn host(address: shared.IpAddress) Subject {
         return fromAddress(address, .host, if (address == .ipv4) 32 else 128);
     }
 
-    /// Network input is already a typed network assertion. Host bits are not
-    /// masked here: doing so would silently broaden a malformed caller value.
     pub fn network(address: shared.IpAddress, prefix: u8) Error!Subject {
         const result = fromAddress(address, .network, prefix);
         try result.validate();
@@ -50,8 +44,6 @@ pub const Subject = struct {
     pub fn parseHost(text: []const u8) Error!Subject {
         if (std.mem.indexOfScalar(u8, text, '/')) |_| return error.InvalidSubject;
         const address = shared.IpAddress.parse(text) catch return error.InvalidSubject;
-        // shared.IpAddress deliberately folds mapped IPv6 hosts to IPv4. Scope
-        // admission rejects that alias spelling so family provenance is exact.
         if (address == .ipv4 and std.mem.indexOfScalar(u8, text, ':') != null) return error.InvalidSubject;
         return host(address);
     }
@@ -142,8 +134,6 @@ pub const Protocols = struct {
         return list(&.{value});
     }
 
-    /// Lists are set-valued: ordering and repeated members do not change scope
-    /// identity. `all` has its own representation and is never admitted here.
     pub fn list(values: []const Protocol) Error!Protocols {
         if (values.len == 0) return error.InvalidProtocol;
         var result = Protocols{ .mask = 0 };
@@ -204,8 +194,6 @@ pub const Ports = struct {
         return .{};
     }
 
-    /// Sorts and joins adjacent ranges because those transformations preserve
-    /// the exact selected port set. Overlap is rejected rather than guessed.
     pub fn list(values: []const PortRange) Error!Ports {
         if (values.len == 0) return error.InvalidPorts;
         if (values.len > max_port_ranges) return error.PortLimitExceeded;
@@ -320,8 +308,6 @@ pub const Scope = struct {
         if (!self.ports.isAll() and !self.protocols.portsMeaningful()) return error.UnsupportedCombination;
     }
 
-    /// Fixed wire proposal for common-effect integration. N2's 24-byte v1 host
-    /// scope remains unchanged; lead-owned durable state can discriminate v1/v2.
     pub fn encode(self: Scope) Error![encoded_bytes]u8 {
         try self.validate();
         var bytes = [_]u8{0} ** encoded_bytes;

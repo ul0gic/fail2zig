@@ -1,1 +1,0 @@
-{"id":"mail-delimited","source":"mail-log","format":"template","template":"warning: peer[{peer:ip}]: authentication {result:word}","subject":"peer","conditions":[{"field":"result","text":"failed"}]}

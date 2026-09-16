@@ -9,8 +9,6 @@ pub const PatternDef = types.PatternDef;
 
 pub const patterns = [_]PatternDef{
     .{
-        // Keep the specific form first: the general wildcard also accepts the
-        // words "invalid user" and would otherwise hide this rule identity.
         .name = "failed-password-invalid-user",
         .match = parser.compile("Failed password for invalid user <*> from <IP>"),
     },
@@ -35,7 +33,6 @@ pub const patterns = [_]PatternDef{
         .match = parser.compile("error: PAM: Authentication failure for <*> from <IP>"),
     },
     .{
-        // [preauth] required: the bare form matches normal operator logouts (self-ban).
         .name = "received-disconnect-preauth",
         .match = parser.compile("Received disconnect from <IP> <*>[preauth]"),
     },

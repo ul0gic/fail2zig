@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Bounded DNS packets and one nonblocking logical request. No libc resolver,
-//! shell, implicit nameserver discovery or unbounded packet/cache allocation.
 const std = @import("std");
 pub const Name = @import("native_rules.zig").Hostname;
 const Text = @import("native_rules.zig").Text;
@@ -29,19 +27,13 @@ pub const Answer = struct {
         self.count += 1;
     }
 };
-/// `id` is the coordinator's logical request token, echoed in live results.
-/// Cache identity excludes that token; restored/cache results are dependencies,
-/// never unsolicited completions of a currently pending request.
 pub const Request = struct { name: Name, family: Family, generation: [32]u8, id: u64 = 0 };
 pub const Result = struct {
     request: Request,
     answer: Answer,
     completed_us: i64,
     valid_until_us: i64,
-    /// Same total monotonic deadline survives aliases, families and retry.
     deadline_ms: u64,
-    /// Called after scheduler/storage waits before consuming a live reply.
-    /// Cache snapshots use their own revision/deadline dependency instead.
     pub fn validateCompletion(self: Result, expected: Request, now_ms: u64, now_us: i64) !void {
         try expected.name.validate();
         try self.request.name.validate();
@@ -52,7 +44,6 @@ pub const Result = struct {
         if (now_ms >= self.deadline_ms) return error.DnsResultExpired;
         if (self.answer.kind == .positive or self.answer.kind == .negative) {
             try validateResult(self);
-            // A zero-TTL subject answer has one immediate preparation only.
             if (now_us > self.valid_until_us or (self.valid_until_us != self.completed_us and now_us == self.valid_until_us)) return error.DnsResultExpired;
         }
     }
@@ -72,8 +63,6 @@ fn u32be(packet: []const u8, at: usize) !u32 {
     if (at > packet.len or packet.len - at < 4) return error.InvalidDnsPacket;
     return std.mem.readInt(u32, packet[at..][0..4], .big);
 }
-/// Names in SOA/authority may be root. Every pointer chain, label byte and
-/// expanded name is bounded; compression never makes a slice escape the packet.
 fn readName(packet: []const u8, position: *usize, budget: *Budget) !Text(253) {
     var out: Text(253) = .{};
     var at = position.*;
@@ -111,7 +100,6 @@ fn readName(packet: []const u8, position: *usize, budget: *Budget) !Text(253) {
         if (@as(usize, out.len) + length > out.bytes.len) return error.InvalidDnsPacket;
         try budget.spend(length);
         for (packet[at .. at + length]) |byte| {
-            // Host/zone names are ASCII labels under the admitted native route.
             if (!std.ascii.isAlphanumeric(byte) and byte != '-') return error.InvalidDnsPacket;
             out.bytes[out.len] = std.ascii.toLower(byte);
             out.len += 1;
@@ -124,7 +112,7 @@ pub fn encodeQuery(name: Name, question: Question, id: u16, output: []u8) ![]con
     if (output.len < 12 + name.slice().len + 2 + 4) return error.DnsBufferSmall;
     @memset(output[0..12], 0);
     std.mem.writeInt(u16, output[0..2], id, .big);
-    output[2] = 1; // recursion desired
+    output[2] = 1;
     output[5] = 1;
     var position: usize = 12;
     var labels = std.mem.splitScalar(u8, name.slice(), '.');
@@ -230,8 +218,6 @@ pub fn parseReply(packet: []const u8, name: Name, question: Question, id: u16) !
             negative_ttl = @min(negative_ttl orelse ttl, ttl);
         }
         if (negative_ttl) |ttl| {
-            // A recursive cache exclusion requires the configured resolver to
-            // echo RD and advertise RA; a referral is not negative evidence.
             if (flags & 0x0180 != 0x0180) return .{ .kind = .unknown, .reason = .incomplete, .canonical = name };
             result.kind = .negative;
             result.reason = .none;
@@ -329,8 +315,6 @@ pub const Client = struct {
         self.result = .{ .request = self.request, .answer = answer, .completed_us = now_us, .valid_until_us = expiry, .deadline_ms = self.deadline_ms };
         self.phase = .complete;
     }
-    /// Exactly one bounded readiness operation per turn. Caller services other
-    /// sources/health between calls; no stage or SQL transaction spans this wait.
     pub fn poll(self: *Client, now_ms: u64, now_us: i64) !?Result {
         if (self.phase == .idle) return error.DnsNotStarted;
         if (now_ms < self.last_ms) return error.DnsClockReversed;
@@ -446,8 +430,6 @@ pub const CacheEntry = struct { result: Result, revision: u64 };
 pub const Cache = struct {
     allocator: std.mem.Allocator,
     generation: [32]u8,
-    // Keep canonical wire bytes in the cache; detached expanded answers exist
-    // only for the current consumer. All 1024 slots fit below the 1 MiB bound.
     entries: []?[cache_entry_bytes]u8,
     in_flight: bool = false,
     pub const Stage = struct {
@@ -487,8 +469,6 @@ pub const Cache = struct {
         };
         return null;
     }
-    /// Detached snapshot. Missing/expired state never grants an exclusion. The
-    /// caller records a dependency even for an absent revision-zero result.
     pub fn lookup(self: *const Cache, request: Request, now_us: i64) !?CacheEntry {
         try request.name.validate();
         if (!std.mem.eql(u8, &request.generation, &self.generation)) return error.DnsGenerationMismatch;
@@ -503,8 +483,6 @@ pub const Cache = struct {
         if (!std.mem.eql(u8, &request.generation, &self.generation)) return error.DnsGenerationMismatch;
         return if (self.indexOf(request)) |index| std.mem.readInt(u64, self.entries[index].?[584..592], .little) else 0;
     }
-    /// Updating the same key preserves monotonic revision. New keys never evict
-    /// another key: retirement/reclamation needs the coordinator's durable pins.
     pub fn prepare(self: *Cache, result: Result, now_us: i64) !Stage {
         if (self.in_flight) return error.DnsCacheBusy;
         try validateResult(result);
@@ -526,8 +504,6 @@ pub const Cache = struct {
         self.in_flight = true;
         return stage;
     }
-    /// Coherent restore supplies each persisted key once before publication.
-    /// Unknown, malformed and foreign data never falls back to an empty cache.
     pub fn prepareRestore(self: *Cache, bytes: []const u8) !Stage {
         if (self.in_flight) return error.DnsCacheBusy;
         const entry = try decodeEntry(bytes);

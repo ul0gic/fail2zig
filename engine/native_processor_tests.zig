@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Actual native processing/session tests; ordinary inputs, no worker or detector fixture.
 const std = @import("std");
 const native = @import("core/native_source_processor.zig");
 const sessions = @import("core/native_file_session.zig");
@@ -35,7 +34,7 @@ test "native processor: preparation is bounded and checkpoints reject foreign or
     try std.testing.expect(prepared.event_time == null and prepared.intent == null);
     try std.testing.expectError(error.ProcessorBusy, processor.setClock(.{ .us = 0 }));
     try std.testing.expectError(error.ProcessorBusy, adapter.prepare(record("1000|ordinary event"), adapter.context));
-    prepared.release(prepared.context); // abort has no publication
+    prepared.release(prepared.context);
     try std.testing.expectEqual(@as(u64, 0), processor.timeHealth().eligible);
     prepared = try adapter.prepare(record("1000|ordinary event"), adapter.context);
     var saved: [native.checkpoint_bytes]u8 = undefined;
@@ -149,7 +148,7 @@ test "native processor: file sessions recover native state and pending time with
     defer session.destroy();
     try std.testing.expectEqual(@as(u64, 1), session.processor.timeHealth().eligible);
     const before = session.pipe.revision;
-    try std.testing.expectEqual(@as(usize, 1), try store.pendingReceiptCount()); // restoration did not acknowledge
+    try std.testing.expectEqual(@as(usize, 1), try store.pendingReceiptCount());
     try std.testing.expectEqual(before, try store.revision("ordinary"));
     try std.testing.expectEqual(@as(usize, 1), try session.poll(1));
     const source = &session.sources.sources.items[0];
@@ -159,7 +158,7 @@ test "native processor: file sessions recover native state and pending time with
     try file.writeAll("|ordinary missing timestamp\nbad|ordinary malformed timestamp\n100|ordinary obsolete event\n2000|ordinary current event\n");
     for (0..4) |_| try std.testing.expectEqual(@as(usize, 1), try session.poll(1));
     try std.testing.expectEqualDeep(policy.Counters{ .eligible = 2, .obsolete = 1, .missing = 1, .malformed = 1, .future = 1 }, session.processor.timeHealth());
-    try std.testing.expectEqual(@as(i64, 0), try store.pendingIntents()); // time admission does not invent detector effects
+    try std.testing.expectEqual(@as(i64, 0), try store.pendingIntents());
     try std.testing.expectEqual(@as(usize, 0), try store.pendingReceiptCount());
     try std.testing.expectEqual(@as(usize, 0), try session.poll(1));
     const saved = (try store.checkpoint(a, "ordinary")).?;
@@ -279,7 +278,6 @@ test "native processor: actual file sessions decode every admitted encoding befo
         try std.testing.expectEqual(@as(u64, bytes.len), source.acknowledgedCheckpoint().?.offset);
         try std.testing.expectEqual(@as(i64, 1_000_000_000), (try store.nativeTime("ordinary", source.source_id, null)).?.eligible.original.?.us);
     }
-    // UTF-8 expansion must respect decoded limits, not just the source byte cap.
     var scratch: [5]u8 = undefined;
     var config = options();
     config.encoding = .latin1;
@@ -332,7 +330,7 @@ test "native processor: pending source verification fails before activation and 
     try std.testing.checkAllAllocationFailures(a, Exercise.create, .{ &store, config, @as([]const sessions.Spec, &specs) });
     try std.testing.expectEqual(revision, try store.revision("ordinary"));
     try std.testing.expectEqual(@as(usize, 1), try store.pendingReceiptCount());
-    try file.setEndPos(5); // formerly complete pending record is now incomplete
+    try file.setEndPos(5);
     try std.testing.expectError(error.PendingRecordUnavailable, sessions.Session.create(a, &store, config, &specs));
     try std.testing.expectEqual(revision, try store.revision("ordinary"));
 }
@@ -393,7 +391,6 @@ test "year inference: native admission preserves inferred provenance and rejects
     try std.testing.expectEqual(policy.Origin.clock_adjusted, prepared.native_time.?.eligible.origin);
     try std.testing.expectEqual(receipt.us, prepared.native_time.?.eligible.timestamp.us);
     prepared.release(prepared.context);
-    // No fallback to last January when this January exceeds future tolerance.
     input.receipt_time.?.us -= 120_000_000;
     prepared = try processor.adapter().prepare(input, &processor);
     try std.testing.expectEqual(policy.Reason.future, prepared.native_time.?.rejected.reason);
@@ -445,7 +442,7 @@ test "year inference: actual file restart retains the original year and rejectio
             try store.enableYearInference();
             const session = try sessions.Session.create(a, &store, config, &specs);
             defer session.destroy();
-            _ = try session.poll(1); // baseline before pending input
+            _ = try session.poll(1);
             try file.writeAll(if (future) "Jan  1 00:00:00 ordinary future\n" else "Dec 31 23:59:59 ordinary past\n");
             store.fail_at = .after_checkpoint;
             try std.testing.expectError(error.InjectedFailure, session.poll(1));
@@ -456,7 +453,7 @@ test "year inference: actual file restart retains the original year and rejectio
         var store = try store_mod.Store.open(a, database);
         defer store.close();
         try store.enableReceipts(1);
-        try store.enableNativeTime(); // does not downgrade version 5
+        try store.enableNativeTime();
         try std.testing.expectEqual(@as(i64, 5), store.schema_version);
         const session = try sessions.Session.create(a, &store, config, &specs);
         defer session.destroy();
@@ -472,7 +469,6 @@ test "year inference: actual file restart retains the original year and rejectio
             try std.testing.expectEqual(@as(?u16, 2025), outcome.obsolete.inferred_year);
             try std.testing.expectEqual(receipt, outcome.obsolete.receipt.us);
         }
-        // Subsequent malformed input commits rejection, then valid input progresses.
         try file.writeAll("Jan 32 00:00:00 bad day\nJan  1 00:00:00 current event\n");
         try std.testing.expectEqual(@as(usize, 1), try session.poll(1));
         try std.testing.expectEqual(@as(usize, 1), try session.poll(1));

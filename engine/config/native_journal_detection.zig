@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Internal effective-config projection for the qualified native journal path.
-//! Host identity/executables are explicit inputs, not guessed from message tags.
 const std = @import("std");
 const config = @import("native.zig");
 const builtin = @import("../core/native_builtin_detector.zig");
@@ -29,9 +27,6 @@ pub const Plan = struct {
     journal: transport.Options,
     source_id: []const u8,
 
-    /// Stable owner: the qualified consumer points to this plan's base detector.
-    /// Immutable configuration and executable-path slices must outlive the plan.
-    /// Preparation performs no source IO, database mutation or command execution.
     pub fn create(a: std.mem.Allocator, cfg: *const config.Config, jail_index: usize, parent: [32]u8, settings: Settings) !*Plan {
         if (jail_index >= cfg.jails.len) return error.UnknownJail;
         const jail = &cfg.jails[jail_index];

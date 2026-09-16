@@ -72,7 +72,7 @@ test "native dns: validated recursive NXDOMAIN and NODATA bound negative TTL wit
     for ([_]u8{ 0, 3 }) |rcode| {
         var packet = try Packet.init(try queryName(), .a, 121);
         packet.bytes[3] = 0x80 | rcode;
-        var soa = [_]u8{0} ** 22; // bounded root MNAME/RNAME and five integer fields
+        var soa = [_]u8{0} ** 22;
         std.mem.writeInt(u32, soa[18..22], 90, .big);
         try packet.record(6, 70, &soa, true);
         const answer = try dns.parseReply(packet.slice(), try queryName(), .a, 121);
@@ -90,7 +90,6 @@ test "native dns: aliases need complete bounded records and never confuse other 
     try t.expectEqual(.alias, alias.kind);
     try t.expectEqualStrings("host.example", alias.canonical.slice());
     try t.expectEqual(@as(u32, 9), alias.ttl_seconds);
-    // A and CNAME at the same owner is ambiguous instead of a partial answer.
     try packet.record(1, 60, &.{ 192, 0, 2, 10 }, false);
     try t.expectError(error.InvalidDnsPacket, dns.parseReply(packet.slice(), try queryName(), .a, 123));
 }

@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Owned startup assets. No source polling, DNS, SQL or firewall operations.
 const std = @import("std");
 const native = @import("native.zig");
 const rules = @import("../core/native_rules.zig");
@@ -9,8 +8,6 @@ const bridge = @import("../core/native_consumer_coordinator.zig");
 const detection = @import("../core/native_detection_record.zig");
 const consumer = @import("../core/native_consumer.zig");
 
-/// Version 2 separates asset semantics from operational configuration. Previous
-/// persisted generations require explicit admission; this module never migrates.
 pub const version: u16 = 2;
 pub const max_rule_bytes = 4096;
 pub const Prepared = struct {
@@ -25,9 +22,7 @@ pub const Prepared = struct {
     ignore_options: ignore.Options = undefined,
     initial_ignore: *ignore.Snapshot = undefined,
     settings: bridge.Settings = undefined,
-    /// Requested retained allocator bytes, excluding allocator metadata.
     reserved_bytes: usize = 0,
-    /// Conservative peak allocator reservation during this bounded preparation.
     preparation_bytes: usize = 0,
 
     pub fn create(a: std.mem.Allocator, cfg: *const native.Config, jail_index: usize, resolver_generation: [32]u8) !*Prepared {
@@ -58,11 +53,6 @@ pub const Prepared = struct {
         var hash = Hash.init();
         try hash.part("fail2zig-native-consumer-plan-v2");
         try hash.part(&resolver_generation);
-        // Bind the effective asset policy, not logging/control/resource settings
-        // or shadowed defaults. Source specs, codec/time, retry and origin policy
-        // are bound by the final session/processor generation. Operational
-        // validation remains mandatory before admission; hash equality grants
-        // no permission to bypass it. No borrowed Config slices survive here.
         try std.json.stringify(.{
             .jail_name = jail.name,
             .filter = jail.filter,
@@ -94,8 +84,6 @@ pub const Prepared = struct {
             try hash.part(jail.ignore_file.?);
             try hash.part(bytes);
         }
-        // Same line/comment boundary as Snapshot.fromText. Snapshot.create is
-        // the authoritative address/network/hostname parser for the full union.
         var values: [ignore.max_entries][]const u8 = undefined;
         @memcpy(values[0..literals.len], literals);
         var value_count = literals.len;
@@ -121,7 +109,6 @@ pub const Prepared = struct {
             hostname_count += 1;
         };
         if (hostname_count != 0 and std.mem.allEqual(u8, &resolver_generation, 0)) return error.HostnameResolutionRequired;
-        // Reserve ignore + resolver dependencies, matching the consumer bridge.
         if (hostname_count > consumer.max_dependencies - 2) return error.ConsumerCapacity;
         self.initial_ignore = snapshot;
         self.settings = .{ .jail = self.jail_name, .logical_source = self.logical_source, .filter = filter, .parent_generation = self.parent_generation, .ignore_generation = snapshot.generation, .family = .both, .journal = source == .journald };
@@ -139,9 +126,6 @@ pub const Prepared = struct {
     }
 };
 
-/// Includes maximum retained snapshot and bounded ArrayList growth/copy during
-/// serialization, plus one protected file buffer. Stack and allocator overhead
-/// are separate coordinator reservations; file descriptors peak at one.
 pub fn reservationBytes(rule_count: usize) !usize {
     if (rule_count == 0 or rule_count > bridge.max_rules) return error.InvalidNativeRules;
     return @sizeOf(Prepared) + 64 + rule_count * @sizeOf(rules.Program) + @sizeOf(ignore.Snapshot) + ignore.max_entries * @sizeOf(ignore.Entry) + 4 * ignore.max_checkpoint_bytes + ignore.max_file_bytes;

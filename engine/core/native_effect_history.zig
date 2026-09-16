@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Bounded confirmed-effect input. Store supplies immutable verified events and
-//! atomically fences their stream token with the checkpoint CAS. No I/O or policy
-//! escalation occurs here; all original per-jail events remain in the Store.
 const std = @import("std");
 const effects = @import("native_effect.zig");
 const detection = @import("native_detection_record.zig");
@@ -22,7 +19,6 @@ pub const Event = struct {
     jail: detection.Name,
     decision_id: [32]u8,
     confirmed_us: i64,
-    /// True only when Store joined this confirmation to a native retry detail.
     native_retry: bool = false,
 
     pub fn validate(self: *const Event) Error!void {
@@ -41,7 +37,6 @@ pub const PageToken = struct {
     installation: [16]u8,
     stream_revision: u64,
     head_sequence: u64,
-    /// First retained sequence, or head+1 when the retained stream is empty.
     retained_from_sequence: u64,
     after_sequence: u64,
     last_sequence: u64,
@@ -79,7 +74,6 @@ pub const Checkpoint = struct {
     installation: [16]u8,
     last_sequence: u64 = 0,
     total_confirmed: u64 = 0,
-    /// Original maximum confirmation epoch, never a restore/processing timestamp.
     confirmed_watermark_us: i64 = 0,
     rolling_digest: [32]u8 = [_]u8{0} ** 32,
 
@@ -109,10 +103,6 @@ pub const Checkpoint = struct {
     }
 };
 
-/// Store must use the actual immutable event rows read inside the same writer
-/// transaction, not caller-supplied events. The stream token alone is not a hash
-/// of event contents. Global logical-event uniqueness belongs to that stream;
-/// this local validator additionally refuses duplicate identities within a page.
 pub fn validateTransition(before: Checkpoint, after: Checkpoint, page: Page, events: []const Event) Error!void {
     const expected = try advance(before, page, events);
     if (!std.mem.eql(u8, &try expected.encode(), &try after.encode())) return error.InvalidHistoryTransition;
@@ -145,8 +135,6 @@ pub const Stage = struct {
     token: ?PageToken,
     mode: enum { bootstrap, consume, restore },
 
-    /// Borrowed until release. The owner and callback clock must retain stable
-    /// addresses through Store.commitConfirmedHistory and subsequent publication.
     pub fn batch(self: Stage, clock: effects.Clock) Error!state.Batch {
         if (self.mode == .restore) return error.InvalidHistoryTransition;
         return .{ .deltas = &self.owner.delta, .prepared_us = clock.prepared_us, .clock_context = clock.context, .clock = clock.read };
@@ -154,7 +142,6 @@ pub const Stage = struct {
     pub fn checkpoint(self: Stage) []const u8 {
         return &self.owner.bytes;
     }
-    /// Call only after durable commit, or a final coherent Store restore fence.
     pub fn publish(self: Stage) void {
         self.owner.live = self.owner.staged;
         self.owner.revision = self.owner.staged_revision;
@@ -177,7 +164,6 @@ pub const Consumer = struct {
     delta: [1]state.Delta = undefined,
     required: [1]state.Requirement = undefined,
 
-    /// Move to a stable address before obtaining manifests or prepared stages.
     pub fn init(installation: effects.Installation, policy_generation: [32]u8) Error!Consumer {
         const binding = try generation(installation, policy_generation);
         return .{ .installation = installation, .binding = binding, .live = .{ .generation = binding, .installation = installation.id } };

@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Serialized durable effect execution. The coordinator holds its database and
-//! namespace authority across each call; status consumers receive detached data.
 const std = @import("std");
 const shared = @import("shared");
 const durable = @import("core/record_store.zig");
@@ -60,8 +58,6 @@ pub const Manager = struct {
         self.allocator.destroy(self);
     }
     pub fn storageReopened(self: *Manager) void {
-        // A process-local epoch starts over with the reopened Store. No old
-        // cached owner authority may survive that change by numeric coincidence.
         self.cached_epoch = null;
         self.staged_revision = null;
         self.staged_count = 0;
@@ -71,9 +67,6 @@ pub const Manager = struct {
         self.stop_cursor = 0;
         self.stopping = false;
     }
-    /// Invalidate one coherent publication using a caller-fenced process-local
-    /// epoch. The next ordinary turns perform exact readback and same-intent
-    /// repair; this call itself never mutates storage or the kernel.
     pub fn beginRepair(self: *Manager, expected_epoch: u64) !u64 {
         if (expected_epoch == 0 or expected_epoch != self.repair_epoch or self.repair_epoch == std.math.maxInt(u64)) return error.StaleRepairEpoch;
         self.repair_epoch += 1;
@@ -101,8 +94,6 @@ pub const Manager = struct {
         self.last_wall_us = now;
         return .{ .prepared_us = now, .context = self.wall_context, .read = self.wall };
     }
-    /// Commit a validated policy extension before the next dispatch turn. The
-    /// publication epoch invalidates any prior confirmed cache immediately.
     pub fn prolongRetry(self: *Manager, change: durable.Store.RetryProlongation) !durable.Store.RetryProlongationResult {
         errdefer |failure| {
             self.status.ready = false;
@@ -113,8 +104,6 @@ pub const Manager = struct {
         if (result.changed) self.status.ready = false;
         return result;
     }
-    /// Installation row is the immutable desired scaffold, revision one. Its
-    /// canonical identity deterministically binds the durable creation intent.
     pub fn admit(self: *Manager) !void {
         errdefer |failure| {
             self.status.ready = false;
@@ -127,7 +116,10 @@ pub const Manager = struct {
         var result = try self.inspector.admitInstallation(.{ .installation = self.inspector.installation, .intent_id = id, .revision = 1 });
         defer result.deinit();
         switch (result) {
-            .installed => self.admitted = true,
+            .installed => |installed| {
+                if (installed.created) std.log.info("{s}: scaffold installed and verified (selector={s})", .{ @tagName(saved.backend), saved.selector() });
+                self.admitted = true;
+            },
             .uncertain => |cause| {
                 self.status.cause = cause;
                 self.status.uncertain = true;
@@ -193,9 +185,6 @@ pub const Manager = struct {
             } else return error.UnownedInstalledEffect;
         }
     }
-    /// Complete at most one durable target transition per turn. The selected
-    /// notification is deliberately a no-op; its outcome can never certify the
-    /// mandatory enforcement target or delay an already terminal failure.
     fn reconcileActionTargets(self: *Manager, entry: effect.Entry) !bool {
         if (self.store.schema_version < 21) return true;
         var owners: [effect.max_page]effect.Owner = undefined;
@@ -203,7 +192,7 @@ pub const Manager = struct {
         for (owners[0..owner_count]) |owner| {
             var targets: [action_outcome.max_targets_per_action]action_outcome.Target = undefined;
             const count = try self.store.actionTargets(owner.decision_id, &targets);
-            if (count == 0) continue; // Explicit component-owned effects have no source action.
+            if (count == 0) continue;
             if (count != action_outcome.max_targets_per_action) return error.InvalidActionTarget;
             for (targets[0..count]) |target| {
                 if (!std.mem.eql(u8, &target.scope_key, &entry.scope_key) or !std.mem.eql(u8, target.jail.slice(), owner.jail.slice())) return error.InvalidActionTarget;
@@ -240,8 +229,6 @@ pub const Manager = struct {
         }
         return true;
     }
-    /// One bounded page or one scope operation per turn. False fences new
-    /// ingestion while required recovery or freshly committed effects are pending.
     pub fn turn(self: *Manager, bindings: []const Binding) !bool {
         errdefer |failure| {
             self.status.ready = false;
@@ -260,7 +247,6 @@ pub const Manager = struct {
             return false;
         }
         if (self.cursor == self.count) {
-            // Even an empty database must not adopt an unrecorded owned element.
             var snapshot = try self.inspector.inspect();
             defer snapshot.deinit();
             try self.validateInventory(&snapshot);
@@ -319,10 +305,6 @@ pub const Manager = struct {
         }
         if (!try self.reconcileActionTargets(entry)) return false;
         if (entry.desired == .permanent) {
-            // A permanent aggregate still needs each elapsed finite co-owner
-            // committed absent. Do this only after complete readback proves the
-            // permanent effect remains installed; prepareExpiry then preserves
-            // the permanent aggregate and never dispatches a physical removal.
             var owners: [effect.max_page]effect.Owner = undefined;
             const owner_count = try self.store.effectOwners(entry.scope_key, entry.revision, &owners);
             for (owners[0..owner_count]) |owner| if (owner.lease == .finite and !owner.lease.live(sampled.prepared_us)) {
@@ -334,10 +316,6 @@ pub const Manager = struct {
         self.cursor += 1;
         return self.status.ready;
     }
-    /// Remove at most one realized exact effect while preserving every durable
-    /// owner and original deadline. A new manager restores those same intents.
-    /// The owned installation topology remains admitted and foreign state is
-    /// never deleted. This is not the durable jail-flush operation.
     pub fn stopTurn(self: *Manager, expected_repair_epoch: u64) !bool {
         if (expected_repair_epoch == 0 or expected_repair_epoch != self.repair_epoch) return error.StaleRepairEpoch;
         if (!self.stopping) {
@@ -382,9 +360,6 @@ pub const Manager = struct {
         self.status = .{};
         return true;
     }
-    /// Sole exception to storage fencing: exact finite expiry already committed
-    /// in a coherent owner view. One pre-reserved uncertain slot per scope; no
-    /// new intent, extension, broad flush or database-dependent allocation.
     pub fn expireDuringOutage(self: *Manager) !void {
         self.status.ready = false;
         errdefer |failure| {

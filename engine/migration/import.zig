@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Converts a captured fail2ban snapshot plus a validated plan into typed
-//! staged owners and restored history, then persists them into the schema-23
-//! staging tables. Pure conversion first; the only write is `stage`, which is
-//! idempotent per run id. Nothing here proves kernel state.
 const std = @import("std");
 const db = @import("fail2ban_db.zig");
 const plan = @import("plan.zig");
@@ -12,7 +8,6 @@ const lease = @import("../core/native_lease.zig");
 
 pub const Error = db.Error || error{ PlanInvalid, TimeOverflow };
 
-/// Destination firewall transport; only nftables and ipset carry network scopes.
 pub const Backend = enum {
     nftables,
     ipset,
@@ -38,10 +33,8 @@ pub const StagedOwner = struct {
     encoded: [scope.encoded_bytes]u8,
     lease_kind: LeaseKind,
     deadline_us: ?i64,
-    /// Original decision instant from `timeofban`; never a fresh event.
     source_event_us: i64,
     bancount: i64,
-    /// 1-based ordinal of the `bans` row in snapshot rowid order.
     source_row: u64,
 };
 
@@ -52,7 +45,6 @@ pub const StagedHistory = struct {
     event_kind: EventKind = .restored_ban,
     event_us: i64,
     bancount: i64,
-    /// 1-based ordinal of the `bips` row in snapshot rowid order.
     source_row: u64,
 };
 
@@ -65,7 +57,6 @@ pub const Report = struct {
     skipped_unsupported: []const Skipped = &.{},
     blockers: []const plan.Blocker = &.{},
     double_count_avoided: u64 = 0,
-    /// Database history never establishes what the kernel enforces.
     kernel_state: []const u8 = "unknown",
     assumptions: []const []const u8 = &.{},
 
@@ -86,14 +77,9 @@ pub const Staging = struct {
     }
 };
 
-/// Plain wire rows for `Store.stageMigrationRows`; `scope` is `Scope.encode()`.
-/// The store owns the persisted row shapes; aliasing them keeps `stage` type-compatible with
-/// `Store.stageMigrationRows` without a second definition drifting.
 pub const StagedOwnerRow = @import("../core/record_store.zig").Store.StagedOwnerRow;
 pub const StagedHistoryRow = @import("../core/record_store.zig").Store.StagedHistoryRow;
 
-/// Statement text shared by the store method and its tests so both exercise
-/// the same delete-then-insert contract inside one transaction.
 pub const staging_sql = struct {
     pub const delete_owners: [:0]const u8 = "DELETE FROM migration_staged_owners WHERE run_id=?1;";
     pub const delete_history: [:0]const u8 = "DELETE FROM migration_staged_history WHERE run_id=?1;";
@@ -127,9 +113,6 @@ pub fn historyRows(allocator: std.mem.Allocator, staging: *const Staging) error{
     return rows;
 }
 
-/// Persists the staging through `store.stageMigrationRows`. A blocked staging
-/// is refused so partial ownership never reaches durable state. `store` is
-/// generic only because the store method lands in a lead-owned file.
 pub fn stage(store: anytype, run_id: [32]u8, staging: *const Staging) !void {
     if (staging.report.blocked()) return error.MigrationBlocked;
     const allocator = staging.arena.child_allocator;
@@ -153,7 +136,6 @@ const Converter = struct {
     options: Options,
     groups: []const Group,
     owners: std.ArrayListUnmanaged(StagedOwner) = .{},
-    /// (jail, encoded scope) → index into `owners`; keeps merging linear at the row limit.
     index: std.HashMapUnmanaged(OwnerKey, usize, OwnerKey.Context, std.hash_map.default_max_load_percentage) = .{},
     history: std.ArrayListUnmanaged(StagedHistory) = .{},
     skipped: std.ArrayListUnmanaged(Skipped) = .{},
@@ -176,8 +158,6 @@ const Converter = struct {
         self.skipped.append(self.a, .{ .group = self.a.dupe(u8, group_name) catch return error.OutOfMemory, .reason = reason }) catch return error.OutOfMemory;
     }
 
-    /// Every enabled snapshot jail needs a supported, selected plan group;
-    /// silence would drop protection the operator believes is migrating.
     fn classifyJails(self: *Converter, reader: *db.Reader) Error!void {
         var it = try reader.jails();
         defer it.deinit();
@@ -188,9 +168,6 @@ const Converter = struct {
                 .present => |v| v != 0,
                 .absent => false,
             };
-            // fail2ban clears `enabled` for every jail on a clean stop, so the flag
-            // records whether the jail was running at capture, not operator intent.
-            // A stopped source is exactly what gets migrated; the plan decides.
             if (!enabled) {
                 if (!self.importable(row.name)) try self.addSkipped(row.name, "jail-disabled-in-snapshot");
                 continue;
@@ -272,7 +249,6 @@ const Converter = struct {
             const jail = self.a.dupe(u8, row.jail) catch return error.OutOfMemory;
             const resolved = (try self.scopeFor(jail, row.ip, source_row)) orelse continue;
             const event_us = (try self.seconds(jail, row.timeofban, source_row)) orelse continue;
-            // A decision recorded after the import clock cannot be given a trustworthy deadline.
             if (event_us > self.options.now_us) {
                 try self.addBlocker(jail, "import", "timeofban-in-future:row:{d}", .{source_row});
                 continue;
@@ -316,9 +292,6 @@ const Converter = struct {
         }
     }
 
-    /// Repeated `bans` rows for one (jail, scope) are one live owner. The
-    /// newer decision wins, except that a permanent decision is never narrowed
-    /// to a finite one; the retained row keeps the highest bancount seen.
     fn mergeOwner(self: *Converter, candidate: StagedOwner) Error!void {
         const key = OwnerKey{ .jail = candidate.jail, .encoded = candidate.encoded };
         const slot = self.index.getOrPut(self.a, key) catch return error.OutOfMemory;
@@ -396,8 +369,6 @@ const OwnerKey = struct {
     };
 };
 
-/// Reads the plan's manifest groups and selection into the flat form the
-/// converter consults; any shape surprise is `PlanInvalid`, never a guess.
 fn readGroups(a: std.mem.Allocator, document: *const plan.Document) Error![]const Group {
     if (document.manifest != .object) return error.PlanInvalid;
     const groups_value = document.manifest.object.get("groups") orelse return error.PlanInvalid;
@@ -438,10 +409,6 @@ fn stringField(object: std.json.ObjectMap, name: []const u8) ?[]const u8 {
     };
 }
 
-/// Converts the snapshot into staged rows under the plan's selection. The
-/// snapshot is opened read-only and never modified. A plan that already
-/// carries blockers is refused outright; blockers found here leave the partial
-/// rows visible for the operator report but `stage` will not persist them.
 pub fn import(allocator: std.mem.Allocator, options: Options) Error!Staging {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     errdefer arena_state.deinit();

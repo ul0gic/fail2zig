@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Borrowed transaction inputs. Callers retain all slices through commit/release;
-//! canonical identities and bounds are checked before SQLite mutation.
 const std = @import("std");
 
 pub const max_deltas = 16;
@@ -38,13 +36,11 @@ pub const Delta = struct {
     format_version: u16,
     expected_revision: u64,
     payload: []const u8,
-    /// Null is nonexpiring state, not an unknown or missing deadline.
     valid_until_us: ?i64 = null,
 };
 pub const Dependency = struct {
     key: Key,
     expected_revision: u64,
-    /// Exact saved deadline, including null; caller cannot extend cache validity.
     valid_until_us: ?i64 = null,
 };
 pub const Requirement = struct { key: Key, format_version: u16 };
@@ -99,15 +95,10 @@ pub const Manifest = struct {
 pub const Batch = struct {
     deltas: []const Delta = &.{},
     dependencies: []const Dependency = &.{},
-    /// Preparation time is a floor, never the final cache-expiry admission clock.
     prepared_us: i64,
-    /// Preparation-only deadline (for example a completed correlation context).
-    /// Never persist it as the lifetime of the whole consumer checkpoint.
     commit_before_us: ?i64 = null,
     clock_context: ?*anyopaque = null,
     clock: *const fn (?*anyopaque) i64 = systemClock,
-    /// Extra bounded validation of ephemeral ownership (for example one DNS
-    /// completion turn). Runs again immediately before transaction COMMIT.
     admission: ?*const fn (?*anyopaque) Error!void = null,
 
     fn systemClock(_: ?*anyopaque) i64 {
@@ -149,7 +140,6 @@ pub const Batch = struct {
                 return error.InvalidConsumer;
             for (self.dependencies[0..i]) |prior|
                 if (Key.eql(prior.key, dependency.key)) return error.InvalidConsumer;
-            // A read and write of the same key are valid only against one revision.
             for (self.deltas) |delta| if (Key.eql(delta.key, dependency.key) and
                 delta.expected_revision != dependency.expected_revision) return error.InvalidConsumer;
         }

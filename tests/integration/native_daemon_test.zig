@@ -8,8 +8,6 @@ const linux = std.os.linux;
 const failure = "Failed password for root from 203.0.113.7 port 22 ssh2";
 
 fn writeConfig(h: *harness.Harness) !void {
-    // The opt-in kernel run executes only its dedicated enforcing scenario;
-    // ordinary daemon cases already run once without firewall mutation.
     if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") != null) return error.SkipZigTest;
     var file = try std.fs.cwd().createFile(h.config_path, .{ .mode = 0o600 });
     defer file.close();
@@ -120,16 +118,16 @@ test "native daemon: enforcing source commits targets before ack and restart doe
     defer h.deinit();
     try writeEnforcingConfig(&h);
     try h.startDaemon();
-    try waitStatus(&h, "\"state\":\"enforcing\"");
+    try waitStatus(&h, "\"state\":\"active\"");
     try h.writeLine(failure);
     try waitStatus(&h, "\"decisions_total\":1");
     try h.waitForBan(try @import("shared").IpAddress.parse("203.0.113.7"), 8_000);
-    try waitStatus(&h, "\"state\":\"enforcing\"");
+    try waitStatus(&h, "\"state\":\"active\"");
     try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try h.stopDaemon());
     try expectActionTargets(h.state_path);
 
     try h.startDaemon();
-    try waitStatus(&h, "\"state\":\"enforcing\"");
+    try waitStatus(&h, "\"state\":\"active\"");
     try waitStatus(&h, "\"decisions_total\":1");
     try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try h.stopDaemon());
     try expectActionTargets(h.state_path);
@@ -143,7 +141,7 @@ test "native daemon: file retry history and original decision deadline survive g
     try waitStatus(&h, "\"state\":\"log-only\"");
     try h.writeLine(failure);
     try h.writeLine(failure);
-    try waitRevision(&h, 3); // Empty-file baseline plus two distinct occurrences.
+    try waitRevision(&h, 3);
     try waitStatus(&h, "\"decisions_total\":0");
     try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try h.stopDaemon());
     try h.startDaemon();
@@ -207,8 +205,6 @@ test "native daemon: invalid escalation refuses before state access and changed 
     try writeConfig(&h);
     const original = try std.fs.cwd().readFileAlloc(t.allocator, h.config_path, 8192);
     defer t.allocator.free(original);
-    // Permanent leases cannot be multiplied; reject that unsupported pairing
-    // before creating state, then prove finite escalation reaches admission.
     const unsupported = try std.mem.replaceOwned(u8, t.allocator, original, "bantime = 60", "bantime = \"permanent\"\nbantime_increment_enabled = true");
     defer t.allocator.free(unsupported);
     try std.fs.cwd().writeFile(.{ .sub_path = h.config_path, .data = unsupported });
@@ -310,7 +306,7 @@ test "native daemon: delivered client renders native status jails version and de
     for (0..3) |_| try h.writeLine(failure);
     try waitStatus(&h, "\"decisions_total\":1");
     const commands = [_][]const u8{ "status", "jails", "version", "list" };
-    const expected = [_][]const u8{ "log-only", "sshd", "daemon\t0.3.1-dev", "203.0.113.7" };
+    const expected = [_][]const u8{ "log-only", "sshd", "daemon\t0.4.0", "203.0.113.7" };
     for (commands, expected) |command, text| {
         const result = try std.process.Child.run(.{ .allocator = t.allocator, .argv = &.{ "zig-out/bin/fail2zig", "--socket", h.socket_path, "--timeout", "1000", "--output", "plain", command }, .max_output_bytes = 65536 });
         defer t.allocator.free(result.stdout);
@@ -341,12 +337,9 @@ test "native daemon: retained rotation and detected copytruncate preserve retry 
     defer replacement.close();
     try old.writeAll(failure ++ "\n");
     try replacement.writeAll(failure ++ "\n");
-    // Two baselines and four records prove both incarnations were consumed.
     try waitRevision(&h, 6);
     try waitStatus(&h, "\"decisions_total\":1");
     const expiry = try savedDeadline(&h);
-    // Observe a smaller, different prefix; this does not claim undetectable
-    // truncate/regrow cycles with an identical prefix can be recovered.
     try replacement.setEndPos(0);
     try replacement.seekTo(0);
     try replacement.writeAll("ignored\n");

@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Component root: readiness derivation, systemd notification and the bounded log sink.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -14,10 +13,6 @@ const log_target = @import("core/log_target.zig");
 const storage_health = @import("core/storage_health.zig");
 
 extern "c" fn mkfifo(path: [*:0]const u8, mode: c_uint) c_int;
-
-// ---------------------------------------------------------------------------
-// Readiness
-// ---------------------------------------------------------------------------
 
 const healthy_worker: storage_health.WorkerStatus = .{
     .busy = false,
@@ -193,10 +188,6 @@ test "native readiness: json shape for ready and for a failed component" {
     try testing.expect(parsed.value.object.get("ready").?.bool == false);
 }
 
-// ---------------------------------------------------------------------------
-// sd_notify
-// ---------------------------------------------------------------------------
-
 const TmpPath = struct {
     tmp: testing.TmpDir,
     abs: []u8,
@@ -366,10 +357,6 @@ test "native readiness: sd_notify unreachable socket returns SendFailed and stay
     try testing.expectEqualStrings("READY=1\n", try rx.recv(&buf));
 }
 
-// ---------------------------------------------------------------------------
-// Log target
-// ---------------------------------------------------------------------------
-
 fn readFile(a: std.mem.Allocator, path: []const u8) ![]u8 {
     const f = try std.fs.cwd().openFile(path, .{});
     defer f.close();
@@ -496,7 +483,6 @@ test "native readiness: ring overflow drops beyond capacity and drain preserves 
     defer a.free(written);
     try testing.expectEqualStrings(expected.items, written);
 
-    // Slots are reusable after drain; the ring wraps without corrupting order.
     _ = sink.push("after\n");
     sink.drain();
     const again = try readFile(a, path);

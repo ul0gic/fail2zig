@@ -47,8 +47,6 @@ pub const courier_patterns = [_]PatternDef{
         .match = parser.compile("<*>imaplogin: FAILED<*>ip=[<IP>"),
     },
     .{
-        // Courier SMTP emits the authenticated relay address before the 535
-        // result. This is a distinct selected workload from Courier IMAP/POP.
         .name = "smtp-auth-failed",
         .match = parser.compile("<*>error,relay=<IP>,<*>msg=\"535 Authentication failed.\""),
     },

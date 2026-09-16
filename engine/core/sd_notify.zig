@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! systemd readiness protocol over an AF_UNIX datagram to `$NOTIFY_SOCKET`, without
-//! libsystemd. Absent environment disables the notifier; send failures are reported,
-//! never fatal, because service-manager visibility must not stop protection.
 
 const std = @import("std");
 const posix = std.posix;
@@ -36,7 +33,6 @@ pub const Notifier = struct {
         return initWithPath(path);
     }
 
-    /// A leading `@` selects the abstract namespace, as systemd does.
     pub fn initWithPath(path: []const u8) InitError!Notifier {
         if (path.len == 0 or path.len >= sun_path_len) return error.PathTooLong;
         var self: Notifier = .{};
@@ -69,15 +65,12 @@ pub const Notifier = struct {
         return self.reloadingAt(monotonicUsec());
     }
 
-    /// systemd rejects RELOADING without the monotonic timestamp of the reload start.
     pub fn reloadingAt(self: *const Notifier, monotonic_usec: u64) Error!Result {
         var buf: [64]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "RELOADING=1\nMONOTONIC_USEC={d}\n", .{monotonic_usec}) catch return error.MessageTooLong;
         return self.send(msg);
     }
 
-    /// Newlines terminate a field, so a status containing one is rejected rather than
-    /// letting the remainder be parsed as further assignments.
     pub fn status(self: *const Notifier, text: []const u8) Error!Result {
         if (text.len > max_status_bytes) return error.MessageTooLong;
         if (std.mem.indexOfScalar(u8, text, '\n') != null) return error.MessageTooLong;

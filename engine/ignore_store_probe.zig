@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Original fixture bridge to the actual durable record store, never actions.
 const std = @import("std");
 const durable = @import("core/record_store.zig");
 const pipeline = @import("core/record_pipeline.zig");

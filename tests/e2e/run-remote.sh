@@ -20,6 +20,7 @@ SSH_KEY="${F2Z_SSH_KEY:-$HOME/.ssh/id_ed25519_p33ker}"
 SSH_OPTS=(-i "$SSH_KEY" -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
 BUILD_DIR="$(mktemp -d /tmp/fail2zig-gate-build.XXXXXX)"
 (cd "$REPO_ROOT" && zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe --prefix "$BUILD_DIR")
+(cd "$REPO_ROOT" && zig build test-release-lifecycle -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe --prefix "$BUILD_DIR")
 REMOTE_DIR="$(ssh "${SSH_OPTS[@]}" "$TARGET" 'mktemp -d /tmp/fail2zig-e2e.XXXXXX')"
 [[ "$REMOTE_DIR" =~ ^/tmp/fail2zig-e2e\.[a-zA-Z0-9]+$ ]] || exit 1
 printf 'run-remote: artifacts=%s target=%s:%s\n' "$BUILD_DIR" "$TARGET" "$REMOTE_DIR"

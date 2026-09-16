@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Resumable migration journal: identity checks, step lifecycle, interruption
-//! at every step boundary, storage failure and clock refusal.
 const std = @import("std");
 const journal = @import("migration/journal.zig");
 const durable = @import("core/record_store.zig");
@@ -41,7 +39,6 @@ const Fixture = struct {
         self.tmp.cleanup();
     }
 
-    /// Simulates a crash: the process state is gone, the file remains.
     fn reopen(self: *Fixture) !void {
         self.store.close();
         self.store = try durable.Store.open(a, self.path);
@@ -109,7 +106,6 @@ const Probe = struct {
 const forward = [_]Step{ .validate_plan, .check_drift, .capture_recovery_point, .quiesce_source, .stage_destination, .activate_owners, .verify_protection, .complete };
 const state_after = [_]?journal.State{ .validated, null, .recovery_point, .quiesced, .staged, .activating, null, .complete };
 
-/// Runs the forward steps before `upto` to completion, then leaves `upto` pending.
 fn advanceTo(j: *journal.Journal, upto: Step, now: *i64) !journal.Pending {
     for (forward, 0..) |step, i| {
         now.* += 10;
@@ -169,7 +165,6 @@ test "migration journal: duplicate create, missing run and every stale fingerpri
     var generation_changed = identity;
     generation_changed.generation[0] ^= 1;
     try t.expectError(error.IncompatibleGeneration, journal.Journal.open(a, &f.store, run_id, generation_changed));
-    // Host mismatch wins even when everything else also differs.
     var all_changed = other_host;
     all_changed.plan_fp[0] ^= 1;
     try t.expectError(error.IncompatibleHost, journal.Journal.open(a, &f.store, run_id, all_changed));
@@ -230,7 +225,6 @@ test "migration journal: clock reversal and oversized detail are refused before 
     try t.expectError(error.ClockReversed, j.finish(pending, .success, "", null, t0));
     try t.expectError(error.DetailTooLarge, j.finish(pending, .success, big, null, t0 + 2));
     try t.expectError(error.InvalidMigrationRow, j.finish(pending, .pending, "", null, t0 + 2));
-    // The store's own guard surfaces as a typed error, never a panic.
     try t.expectError(error.MigrationStepMissing, f.store.finishMigrationStep(run_id, pending.seq, .success, "", null, t0));
     try t.expectError(error.InvalidMigrationRow, f.store.createMigrationRun(.{ .run_id = [_]u8{5} ** 32, .host_id = identity.host_id, .source_db_fp = identity.source_db_fp, .source_cfg_fp = identity.source_cfg_fp, .plan_fp = identity.plan_fp, .recovery_point = "", .generation = identity.generation, .state = .planned, .created_us = t0, .updated_us = t0 - 1 }));
     var probe = Probe{};
@@ -320,7 +314,6 @@ test "migration journal: interruption at every forward step boundary is classifi
         };
         try t.expectEqual(@as(u32, if (observed) 1 else 0), probe.calls);
 
-        // A second classification finds no pending step and must agree without re-observing.
         var again = Probe{};
         const second = try j.classify(again.observer(), now + 1);
         try t.expectEqual(@as(u32, 0), again.calls);
@@ -331,7 +324,6 @@ test "migration journal: interruption at every forward step boundary is classifi
             .complete => try t.expectEqual(journal.Resume.complete, second),
             .rolled_back => try t.expectEqual(journal.Resume.rolled_back, second),
         }
-        // Reopening after the settlement reads the same state back.
         try f.reopen();
         var reopened = try journal.Journal.open(a, &f.store, run_id, identity);
         defer reopened.deinit();
@@ -434,7 +426,6 @@ test "migration journal: storage full surfaces as a typed error and leaves no da
     }
     try t.expectEqual(@as(?anyerror, error.StorageFull), full);
     try f.store.inspectExec("PRAGMA max_page_count=1073741823;");
-    // Whatever failed was rolled back: either no step is pending, or the pending step is the one whose finish failed.
     if (try j.pendingStep()) |pending| {
         try j.finish(pending, .operational_failure, "storage-full", null, now + 1);
     }

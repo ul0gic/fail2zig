@@ -52,7 +52,6 @@ fn defaultNoSource(ctx: ?*anyopaque, jail_name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Why no firewall backend is usable: the probe cause (11.4.1) or the init failure of the backend it picked.
 pub const NoBackendCause = union(enum) {
     detect: firewall.DetectError,
     init: firewall.BackendError,
@@ -72,7 +71,6 @@ pub const NoBackendCause = union(enum) {
     }
 };
 
-/// Single source of truth for whether a jail's configured banaction is actually enforced (ADR-006/007, ENH-006).
 pub const FirewallState = union(enum) {
     ready,
     not_needed,
@@ -138,7 +136,6 @@ pub const Context = struct {
             .list_jails => self.handleListJails(a),
             .reload => self.handleReload(a),
             .version => self.handleVersion(a),
-            // Versioned commands are served only by the native coordinator.
             .query_v1, .admin_v1, .reload_v1 => .{ .err = .{ .code = 501, .message = try a.dupe(u8, "versioned commands require the native daemon") } },
         };
     }
@@ -570,7 +567,6 @@ test "commands: handleVersion payload parses as client VersionPayload (ISSUE-011
     defer resp.deinit(a);
     try testing.expect(resp == .ok);
 
-    // Mirrors client/format.zig VersionPayload: the client parses exactly these field names.
     const VersionPayload = struct {
         daemon_version: ?[]const u8 = null,
         git_commit: ?[]const u8 = null,

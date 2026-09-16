@@ -61,7 +61,7 @@ To add a file, append one row. `needs_daemon_binary = true` makes the run
 depend on `b.getInstallStep()`, so `zig-out/bin/fail2zig` is built before the
 test spawns it; set it for every file that starts the daemon as a subprocess
 (`ban`, `persistence`, `startup_failclosed`, `config_diag`, `no_backend`).
-Only Lead edits `build.zig`, at the sub-phase close.
+Keep changes to this registration table synchronized with the affected integration file.
 
 `no_backend_test.zig` (SYS-014 / ADR-007 / ENH-006) is the inverse of the
 root-gated files: it must run unprivileged so the firewall really is
@@ -72,7 +72,7 @@ admits its own uid as an IPC peer, QA-004). A rejected peer fails the test
 outright. They assert on the stable strings
 (`no usable backend`, `refusing to run unprotected`,
 `running DEGRADED as log-only`, a non-empty `protection_cause`), not on
-the cause token, which is being corrected under SYS-022. Its
+the cause token. Its
 `LiveDaemon` helper pumps the daemon's stderr on a thread so a test can
 wait for a log line (`would-ban:`) while the process is still running.
 

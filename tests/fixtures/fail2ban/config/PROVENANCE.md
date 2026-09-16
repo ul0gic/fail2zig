@@ -28,9 +28,9 @@ Inspection tests read these files and never modify them.
 
 `jail.conf`, `fail2ban.conf`, `paths-common.conf`, `paths-debian.conf`, `filter.d/sshd.conf`,
 `filter.d/common.conf`, `action.d/nftables.conf`, `action.d/nftables-allports.conf` and
-`action.d/nftables-multiport.conf` are byte-identical copies from the pinned fail2ban 1.1.1
-reference tree (`/tmp/fail2ban-parity-reference-1.1.1/config`, upstream GPL-2.0-or-later,
-Copyright the Fail2Ban authors). They are retained unmodified so the stock-asset SHA-256 table
+`action.d/nftables-multiport.conf` are byte-identical copies from fail2ban 1.1.1 commit
+`f60978618a101427b06924fc932b44350fec2b63` (upstream GPL-2.0-or-later, Copyright the Fail2Ban
+authors). They are retained unmodified so the stock-asset SHA-256 table
 in `engine/migration/inspect.zig` can be exercised against real bytes; any edit to them is a
 test of the "modified" path and must be made on a temporary copy. `jail.d/lab.conf` is an
 original minimal override (polling backend, nftables banaction, sshd enabled on a documentation

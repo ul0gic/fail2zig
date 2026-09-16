@@ -212,8 +212,6 @@ test "integration: --validate-config resolves backend = \"systemd\" to journald 
     try expectContains(r.stdout, "config: OK (1 jail(s) configured)");
     try expectContains(r.stderr, "[jails.sshd] 'backend' is a deprecated fail2ban compatibility alias");
     try expectContains(r.stderr, "use source = \"journald\"");
-    // The fixture also carries the deprecated `banaction` key, which warns separately;
-    // the backend alias itself must warn exactly once.
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.stderr, "deprecated fail2ban compatibility alias"));
     try testing.expect(!hasErrorReturnTrace(r.stderr));
 }
@@ -348,4 +346,99 @@ test "integration: ENH-007/008 --validate-config accepts firewall = \"ipset\" + 
     try expectContains(r.stdout, "config: OK (1 jail(s) configured)");
     try expectNotContains(r.stderr, "InvalidValue");
     try expectNotContains(r.stderr, "UnknownKey");
+}
+
+test "integration: duration strings validate defaults and jail overrides" {
+    const a = testing.allocator;
+    var fx = try Fixture.init(a);
+    defer fx.deinit();
+    const text = try std.fmt.allocPrint(a,
+        \\[global]
+        \\socket_path = "{s}/sock/fail2zig.sock"
+        \\state_file = "{s}/state.db"
+        \\metrics_enabled = false
+        \\[defaults]
+        \\banaction = "log-only"
+        \\bantime = "1h30m"
+        \\findtime = "5mm"
+        \\bantime_increment_max_bantime = "1mo"
+        \\bantime_increment_jitter = "0s"
+        \\[jails.sshd]
+        \\filter = "sshd"
+        \\bantime = "2h"
+        \\
+    , .{ fx.root, fx.root });
+    defer a.free(text);
+    try fx.write(text);
+    var r = try validateConfig(a, fx.config_path);
+    defer r.deinit(a);
+    try testing.expectEqual(@as(?u8, 0), r.exitCode());
+    try expectContains(r.stdout, "config: OK (1 jail(s) configured)");
+}
+
+test "integration: duration invalid value names key and location" {
+    const a = testing.allocator;
+    var fx = try Fixture.init(a);
+    defer fx.deinit();
+    const text = try fx.fortyLineConfig("bantime_increment_jitter = \"1.5h\"");
+    defer a.free(text);
+    try fx.write(text);
+    var r = try validateConfig(a, fx.config_path);
+    defer r.deinit(a);
+    try testing.expectEqual(@as(?u8, 2), r.exitCode());
+    const position = try std.fmt.allocPrint(a, "config: {s}:37:28: InvalidValue (key 'bantime_increment_jitter' in [jails.sshd])", .{fx.config_path});
+    defer a.free(position);
+    try expectContains(r.stderr, position);
+    try expectNotContains(r.stdout, "config: OK");
+    try testing.expect(!hasErrorReturnTrace(r.stderr));
+}
+
+test "integration: duration normalized seconds reach daemon effective policy" {
+    const harness = @import("harness.zig");
+    const a = testing.allocator;
+    var h = try harness.Harness.init(a, .{ .spawn_daemon = false });
+    defer h.deinit();
+    {
+        var f = try std.fs.cwd().createFile(h.config_path, .{ .mode = 0o600 });
+        defer f.close();
+        try f.writer().print(
+            \\[global]
+            \\state_file = "{s}"
+            \\socket_path = "{s}"
+            \\metrics_enabled = false
+            \\[defaults]
+            \\banaction = "log-only"
+            \\bantime = "1h"
+            \\findtime = "2mm"
+            \\bantime_increment_max_bantime = "1d"
+            \\bantime_increment_jitter = "0s"
+            \\[jails.sshd]
+            \\filter = "sshd"
+            \\source = "file"
+            \\timestamp = "undated"
+            \\logpath = ["{s}"]
+            \\bantime = "1h30m"
+            \\
+        , .{ h.state_path, h.socket_path, h.log_path });
+    }
+    try h.startDaemon();
+    defer _ = h.stopDaemon() catch {};
+    const r = try std.process.Child.run(.{
+        .allocator = a,
+        .argv = &.{ daemon_path, "--socket", h.socket_path, "--timeout", "5000", "--output", "json", "config" },
+        .max_output_bytes = max_output_bytes,
+    });
+    defer a.free(r.stdout);
+    defer a.free(r.stderr);
+    try testing.expect(r.term == .Exited);
+    try testing.expectEqual(@as(u8, 0), r.term.Exited);
+    const doc = try std.json.parseFromSlice(std.json.Value, a, r.stdout, .{});
+    defer doc.deinit();
+    const jails = doc.value.object.get("jails").?.array.items;
+    try testing.expectEqual(@as(usize, 1), jails.len);
+    const jail = jails[0].object;
+    try testing.expectEqualStrings("sshd", jail.get("name").?.string);
+    try testing.expectEqual(@as(i64, 5400), jail.get("bantime").?.integer);
+    try testing.expectEqual(@as(i64, 120), jail.get("findtime").?.integer);
+    try testing.expect(!jail.get("bantime_permanent").?.bool);
 }

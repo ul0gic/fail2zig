@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Native file ingestion owner: restore exact cursors and pending receipts before
-//! discovery, then stage native decoding/time checkpoints through SQLite.
 const std = @import("std");
-// Linux F_DUPFD_CLOEXEC; Zig 0.14.1 omits this command constant.
 const linux_dupfd_cloexec = 1030;
 const processing = @import("native_source_processor.zig");
 const files = @import("durable_file_source.zig");
@@ -25,13 +22,13 @@ pub const Options = struct {
     staged_detection: ?@import("native_detection_record.zig").StagedConsumer = null,
     consumer_sources: ?ConsumerSources = null,
     retry: ?@import("native_retry.zig").Policy = null,
+    suppress_retry_enforcement: bool = false,
     max_sources: usize,
     gate: ?*storage_health.Gate = null,
     monotonic_clock: ?storage_health.Clock = null,
     clock_context: ?*anyopaque = null,
     clock: ?*const fn (?*anyopaque) anyerror!time.Timestamp = null,
 };
-/// Owns copied receipt identity bytes across a session reconstruction.
 pub fn clonePending(a: std.mem.Allocator, saved: durable.Store.PendingSource) !durable.Store.PendingSource {
     var value = saved;
     value.identity.jail = try a.dupe(u8, saved.identity.jail);
@@ -64,8 +61,6 @@ const Retained = struct {
 
 pub const RecoveryReservation = struct { bytes: usize, allocations: usize, descriptors: usize };
 const CandidateReceipt = @FieldType(pipeline.Pipeline, "candidate_receipt");
-/// Detached retry/continuity evidence only. No processor, Store, configuration,
-/// clock callback or consumer registry pointer is retained in this owner.
 pub const RecoverySnapshot = struct {
     allocator: std.mem.Allocator,
     generation: [32]u8,
@@ -157,9 +152,6 @@ pub const Session = struct {
         if (options.processing.timestamp == .journal) return error.InvalidFileTimestampSource;
     }
 
-    /// Pure configuration binding shared by startup preflight and construction.
-    /// Never invokes clocks/consumers, Store, source I/O or DNS. Scratch/config
-    /// remain borrowed; callers reading only generation must not retain this owner.
     pub fn prepareProcessor(allocator: std.mem.Allocator, options: Options, specs: []const Spec, scratch: []u8, now: time.Timestamp) !processing.Processor {
         try validateOptions(options, specs);
         const configuration = try std.json.stringifyAlloc(allocator, .{ .parent = options.processing.parent_generation, .sources = specs, .maximum_sources = options.max_sources }, .{});
@@ -167,17 +159,13 @@ pub const Session = struct {
         var bound = options.processing;
         std.crypto.hash.sha2.Sha256.hash(configuration, &bound.parent_generation, .{});
         var processor = if (options.staged_detection) |consumer| try processing.Processor.initWithStaged(allocator, bound, scratch, now, consumer) else try processing.Processor.initWithDetection(allocator, bound, scratch, now, options.detection);
-        if (options.retry) |policy| try processor.bindRetry(policy);
+        if (options.retry) |policy| try processor.bindRetry(policy, options.suppress_retry_enforcement);
         return processor;
     }
 
-    /// Store admission/migration belongs to the coordinator, before constructing
-    /// any owner. Config strings and store must outlive this stable allocation.
     pub fn create(allocator: std.mem.Allocator, store: *durable.Store, options: Options, specs: []const Spec) !*Session {
         return createInternal(allocator, store, options, specs, false);
     }
-    /// Creates only owned configuration/state. Source I/O belongs to later
-    /// admissionTurn calls after the coordinator has reconciled ownership.
     pub fn createDeferred(allocator: std.mem.Allocator, store: *durable.Store, options: Options, specs: []const Spec) !*Session {
         return createInternal(allocator, store, options, specs, true);
     }
@@ -258,8 +246,6 @@ pub const Session = struct {
         self.allocator.destroy(self);
     }
 
-    /// Capture the complete latest metadata before destroying any borrower of a
-    /// consumer generation. Allocation/dup failure leaves this session intact.
     pub fn exportRecovery(self: *const Session) !*RecoverySnapshot {
         if (self.processor.in_flight) return error.ConsumerBusy;
         _ = try RecoverySnapshot.reservation(self.sources.max_sources);
@@ -285,9 +271,6 @@ pub const Session = struct {
                 const observed = source.committed orelse return error.MissingFileCheckpoint;
                 if (!std.mem.eql(u8, &expected, &observed.incarnation)) return error.ResumeLost;
             };
-            // An appended fresh source can have no repair slot yet. Only that
-            // genuinely new source receives an initial ticket. Retained tickets
-            // always win over uninitialized storage and preserve their episode.
             const state = if (initialized) self.repair_states[index] else if (previous) |entry| entry.state else try repair.Repair.init(try repair.Binding.init(self.processor.generation, source.source_id), self.discovery_repair.last_now_ms);
             const pending = if (initialized) self.pending_proofs[index] else if (previous) |entry| entry.pending else null;
             const original = Retained{
@@ -326,8 +309,6 @@ pub const Session = struct {
         return out;
     }
 
-    /// Import into an unpublished deferred owner. Original snapshot is retained
-    /// by the coordinator until healthy; all copied references have own lifetimes.
     pub fn importRecovery(self: *Session, snapshot: *const RecoverySnapshot) !void {
         if (self.processor.in_flight or self.admission_phase != .positions or self.sources.sources.items.len != 0 or self.retained.items.len != 0) return error.RecoveryOutOfOrder;
         if (self.sources.max_sources != snapshot.max_sources or !std.mem.eql(u8, &self.processor.generation, &snapshot.generation) or !std.mem.eql(u8, self.pipe.jail, snapshot.jail)) return error.SourceGenerationMismatch;
@@ -363,11 +344,7 @@ pub const Session = struct {
         errdefer if (proof) |value| value.deinit(self.allocator);
         try self.retained.append(.{ .source = source_copy, .path = path_copy, .state = state, .health = source_health, .in_operation = in_operation, .expected_durable = expected_durable, .incarnation = incarnation, .pending = proof });
     }
-    /// Copy retry metadata only, before deferred admission. No durable source
-    /// cursor or live processor state is imported from the old owner.
     pub fn copyRepairStateFrom(self: *Session, old: *const Session) !void {
-        // A failed deferred source admission can leave an appended source whose
-        // repair binding was not published. Never copy an uninitialized slot.
         if (old.repair_count != old.sources.sources.items.len) return error.RestoreRequired;
         if (self.admission_phase != .positions or self.sources.sources.items.len != 0 or self.retained.items.len != 0) return error.RecoveryOutOfOrder;
         if (!std.mem.eql(u8, &self.processor.generation, &old.processor.generation)) return error.SourceGenerationMismatch;
@@ -389,9 +366,6 @@ pub const Session = struct {
         self.discovery_repair = old.discovery_repair;
         self.notices = old.notices;
     }
-    /// Separately duplicate retained descriptors and uncommitted first-attach
-    /// proposals. Store positions always win; the duplicate is validated against
-    /// that fresh cursor before adoption. Caller may destroy old only on success.
     pub fn retainSourcesFrom(self: *Session, old: *const Session) !void {
         if (self.admission_phase != .positions or self.sources.sources.items.len != 0) return error.RecoveryOutOfOrder;
         if (!std.mem.eql(u8, &self.processor.generation, &old.processor.generation)) return error.SourceGenerationMismatch;
@@ -413,9 +387,6 @@ pub const Session = struct {
             value.proposal = proposal;
         }
     }
-    /// Recheck after ownership recovery, immediately before reopening admission.
-    /// Restore this owner's state first; a clock catch-up cannot replace source
-    /// validation because rotation/retention may have removed pending evidence.
     pub fn verifyRecoverySources(self: *Session) !void {
         if (self.pipe.gate) |gate| {
             const status = gate.snapshot();
@@ -563,8 +534,6 @@ pub const Session = struct {
             if (status.generation != self.pipe.recovery_generation) return error.RestoreRequired;
         }
     }
-    /// One stored source, one continuity probe, one pending row, or one bounded
-    /// discovery turn. No baseline/record acknowledgment occurs here.
     pub fn admissionTurn(self: *Session) !bool {
         try self.sourceIoAdmission();
         self.last_failure_domain = null;
@@ -686,8 +655,6 @@ pub const Session = struct {
             self.pending = null;
         }
     };
-    /// Native scheduling entry point. At most one scan OR one source poll;
-    /// failing/cooling sources do not hold the round-robin position.
     pub fn pollTurn(self: *Session, budget: usize) !usize {
         defer self.logNotices();
         if (budget == 0 or budget > self.sources.max_sources) return error.InvalidPollBudget;
@@ -718,8 +685,6 @@ pub const Session = struct {
         self.next_source = (index + 1) % count;
         return self.pollSourceTurn(index);
     }
-    /// Resume one exact pending consumer occurrence immediately after a shared
-    /// DNS input commits. The caller does not spend its transient TTL on discovery.
     pub fn resumeConsumerSource(self: *Session, source_id: []const u8) !usize {
         try self.pipe.admit();
         if (self.admission_phase != .ready) return error.RestoreRequired;
@@ -748,8 +713,6 @@ pub const Session = struct {
         const delivered = source.pollTurn(Acknowledgment.run, &acknowledgment, pending != null or self.candidate_source != null or state.state.phase == .polling) catch |err| {
             if (acknowledgment.committing) {
                 if (pipeline.Pipeline.sourceLocalIntervention(err)) return self.sourceFailure(state, err);
-                // Preparation/SQL failures are not file repair failures, even
-                // when their error name also exists in the filesystem domain.
                 self.last_failure_domain = if (repair.classify(err) == .pending) .pending else .storage;
                 return err;
             }
@@ -768,8 +731,6 @@ pub const Session = struct {
         if (path.len == 0) return error.InvalidFileCursor;
         const parsed = try std.json.parseFromSlice(files.Resume, self.allocator, cursor, .{});
         defer parsed.deinit();
-        // Tail controls the first attachment only. A saved tail position is just
-        // as authoritative as a saved head position; downtime must not skip data.
         try self.sources.addResume(path, source, parsed.value);
         if (!try self.sources.sources.items[self.sources.sources.items.len - 1].verifyContinuity()) return error.ResumeLost;
     }
@@ -780,8 +741,6 @@ pub const Session = struct {
             const saved = self.identity;
             if (record.kind != .data or !std.mem.eql(u8, record.source, saved.source) or !std.mem.eql(u8, record.occurrence, saved.occurrence) or
                 !std.mem.eql(u8, record.cursor, saved.cursor) or !std.mem.eql(u8, &record.raw_hash, &saved.raw_hash)) return error.PendingRecordMismatch;
-            // Deliberate abort: validation must never acknowledge the proposed
-            // cursor or publish processor state during source restoration.
             return error.PendingRecordVerified;
         }
     };

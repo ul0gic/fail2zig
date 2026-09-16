@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Explicit classic-syslog year inference using fixed offsets or immutable TZif
-//! data; no host locale, mutable previous date, allocation or retry clock is used.
 const std = @import("std");
 const time = @import("native_time.zig");
 const timezone = @import("native_timezone.zig");
@@ -10,10 +8,6 @@ pub const version: u16 = 1;
 pub const Inferred = struct { timestamp: time.Timestamp, year: u16 };
 pub const Zoned = struct { timestamp: time.Timestamp, year: u16, zone: provenance.Provenance };
 
-/// Compare the receipt-local year and its neighbors using each candidate's
-/// actual offset. An unresolved candidate may be skipped only when even its
-/// closest possible UTC instant cannot win; a gap/fold never selects another
-/// year merely because that year is easier to parse.
 pub fn inferZoned(field: []const u8, receipt: time.Timestamp, zone: *const timezone.Zone) !Zoned {
     const receipt_offset = try zone.utcOffsetAt(@divFloor(receipt.us, 1_000_000));
     const local_receipt = std.math.cast(i64, @as(i128, receipt.us) + @as(i128, receipt_offset) * 1_000_000) orelse return error.TimeOutOfRange;
@@ -65,9 +59,6 @@ pub fn inferZoned(field: []const u8, receipt: time.Timestamp, zone: *const timez
     return best orelse error.InvalidTimestamp;
 }
 
-/// Find the local calendar year with bounded binary search over admitted years.
-/// Parsing Jan 1 reuses the checked calendar conversion; wider offset arithmetic
-/// keeps extreme receipt values from overflowing before range rejection.
 pub fn receiptYear(receipt: time.Timestamp, offset_seconds: i32) !u16 {
     if (offset_seconds < -86340 or offset_seconds > 86340 or @mod(offset_seconds, 60) != 0) return error.InvalidTimeContext;
     const local = @as(i128, receipt.us) + @as(i128, offset_seconds) * 1_000_000;
@@ -82,12 +73,8 @@ pub fn receiptYear(receipt: time.Timestamp, offset_seconds: i32) !u16 {
     return low;
 }
 
-/// Select the closest valid candidate among the receipt's local year and its
-/// neighbors. Admission runs afterwards: a future rejection cannot cause this
-/// selection to fall back to a more convenient year. Equal distance is rejected.
 pub fn infer(field: []const u8, receipt: time.Timestamp, offset_seconds: i32) !Inferred {
     const reference = try receiptYear(receipt, offset_seconds);
-    // A leap year validates syntax/calendar independently of candidate years.
     _ = try time.parse(.syslog, field, .{ .year = 2000, .offset_seconds = offset_seconds });
     var best: ?Inferred = null;
     var distance: u128 = std.math.maxInt(u128);
@@ -97,7 +84,7 @@ pub fn infer(field: []const u8, receipt: time.Timestamp, offset_seconds: i32) !I
     var year = first;
     while (true) {
         const candidate: ?time.Timestamp = time.parse(.syslog, field, .{ .year = year, .offset_seconds = offset_seconds }) catch |err| switch (err) {
-            error.InvalidTimestamp => null, // Feb 29 in a non-leap candidate.
+            error.InvalidTimestamp => null,
             else => return err,
         };
         if (candidate) |timestamp| {
@@ -140,7 +127,6 @@ test "year inference: nearest local year handles New Year offsets leap days and 
 
 test "year inference: ties invalid calendars and out of range receipts cannot invent a date" {
     try std.testing.expectError(error.AmbiguousYear, infer("Jan  1 00:00:00", try iso("2025-07-02T12:00:00Z"), 0));
-    // One microsecond either side of the midpoint chooses the corresponding year.
     const middle = try iso("2025-07-02T12:00:00Z");
     try std.testing.expectEqual(@as(u16, 2025), (try infer("Jan  1 00:00:00", .{ .us = middle.us - 1 }, 0)).year);
     try std.testing.expectEqual(@as(u16, 2026), (try infer("Jan  1 00:00:00", .{ .us = middle.us + 1 }, 0)).year);
@@ -188,7 +174,6 @@ test "year inference: named zones use exact offsets and never hide gaps with ano
     try std.testing.expectEqual((try iso("2026-11-01T03:30:00Z")).us, last.timestamp.us);
     try std.testing.expectEqual(@as(i32, 0), last.zone.offset_seconds);
     try std.testing.expectError(error.OutsideTimezoneCoverage, inferZoned("Jan  1 00:00:00", try iso("2031-01-01T00:00:00Z"), &zone));
-    // A neighboring unsupported year cannot block an unambiguous covered date.
     try std.testing.expectEqual(@as(u16, 2024), (try inferZoned("Jan  1 00:00:00", try iso("2024-01-01T00:00:01Z"), &zone)).year);
 }
 

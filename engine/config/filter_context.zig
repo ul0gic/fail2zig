@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Pure FilterReader/JailReader preparation phases. Uses caller-owned arenas;
-//! source/asset bytes remain borrowed and no regex or action is executed.
 const std = @import("std");
 const config = @import("fail2ban.zig");
 const A = std.mem.Allocator;
@@ -34,7 +32,6 @@ pub fn readerDefaults(a: A, source: *const config.ParsedIni, root: []const u8) c
 pub fn prepare(a: A, source: *const config.ParsedIni, root: []const u8, jail: []const u8, selector: []const u8, backend: []const u8) config.Error!Prepared {
     var asset = try config.loadParameterizedAsset(a, root, "filter.d", selector);
     var parameters = try asset.selector.parameters.clone(a);
-    // JailReader's first option pass supplies these interpolation variables.
     if (!parameters.contains("backend")) try parameters.put(a, "backend", backend);
     if (!parameters.contains("filter")) try parameters.put(a, "filter", selector);
     var automatic: ?[]const u8 = null;
@@ -54,12 +51,8 @@ pub fn prepare(a: A, source: *const config.ParsedIni, root: []const u8, jail: []
     while (values.next()) |entry| {
         if (std.mem.startsWith(u8, entry.key_ptr.*, "known/") or std.mem.eql(u8, entry.key_ptr.*, "__name__")) continue;
         const key = try std.fmt.allocPrint(a, "known/{s}", .{entry.key_ptr.*});
-        // JailReader inserts the combined value verbatim. Percent directives
-        // here can therefore cause a subsequent interpolation syntax error.
         try jail_section.keys.put(a, key, entry.value_ptr.*);
     }
-    // Final filter pass sees jail options as substitution variables. Direct jail
-    // setters still have final priority; SourcePlan retains their own envelopes.
     for (options) |key| {
         if (try config.resolve(a, &graph, jail, key)) |value| {
             if (!asset.selector.parameters.contains(key)) try parameters.put(a, key, value);

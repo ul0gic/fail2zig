@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Observable source continuity at the migration boundary. Pure evaluation of a
-//! plan document, the snapshot `logs` rows and the live filesystem: no writes,
-//! no daemon, bounded reads. Pending records, in-window counters and multiline
-//! state never reach fail2ban's database, so they are never transferred.
 const std = @import("std");
 const plan_mod = @import("plan.zig");
 const db = @import("fail2ban_db.zig");
@@ -73,7 +69,6 @@ pub const Options = struct {
     cutover_us: i64,
 };
 
-/// Reads the `logs` table of a captured snapshot into owned rows.
 pub fn readLogs(allocator: std.mem.Allocator, snapshot_path: []const u8) Error![]LogRow {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -239,13 +234,6 @@ fn fallback(base: FileBoundary, requested: plan_mod.Continuity, replay: ?Replay,
     return result;
 }
 
-/// Digest of the first line including its terminator, over exactly the bytes fail2ban 1.1.1
-/// FileContainer hashes (reference filter.py:1347-1351 and :1409-1412: `handler.readline()`
-/// only when that line ends in \r or \n). The algorithm follows the recorded value: the
-/// reference's probe `md5sum(' ')` (filter.py:1314-1316) passes a str and raises TypeError on
-/// every Python 3, so its `except:` branch selects hashlib.sha1 and real 1.1.x databases carry
-/// a 40-hex SHA-1 under the historical `firstlinemd5` column; a 32-hex value is MD5 from a
-/// Python 2 era writer. Returns null for an empty file or a first line without a terminator.
 fn firstLineDigest(file: std.fs.File, recorded_len: usize) !?[40]u8 {
     var buffer: [first_line_max_bytes]u8 = undefined;
     const got = try file.preadAll(&buffer, 0);
@@ -274,9 +262,6 @@ fn digestRecognised(recorded: []const u8) bool {
     return true;
 }
 
-/// Same fingerprint contract as durable_file_source's private newResume, with
-/// a deterministic incarnation derived from the identity instead of a random one
-/// so repeated evaluation of the same file yields identical output.
 fn buildResume(file: std.fs.File, size: u64, offset: u64) !file_source.Resume {
     const stat = try std.posix.fstat(file.handle);
     const n: u8 = @intCast(@min(size, prefix_max_bytes));

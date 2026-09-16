@@ -189,8 +189,6 @@ pub fn parseIniSource(
         if (trimmed[0] == '#' or trimmed[0] == ';') continue;
 
         if (trimmed[0] == '[') {
-            // ConfigParser matches a greedy nonempty [header] prefix, permits
-            // trailing text, and preserves whitespace inside the header.
             const header = stripInlineComment(trimmed);
             const close = std.mem.lastIndexOfScalar(u8, header, ']') orelse return error.UnterminatedSection;
             const name = header[1..close];
@@ -293,8 +291,6 @@ fn findSeparator(s: []const u8) ?usize {
     return colon_idx;
 }
 
-// Resolve from raw origins, never from another field's previously expanded result.
-// This preserves consumer context and literal percent escapes across repeated reads.
 pub fn resolve(arena: std.mem.Allocator, ini: *const ParsedIni, section_name: []const u8, key: []const u8) Error!?[]const u8 {
     const sec = ini.section(section_name) orelse return null;
     const raw = rawGet(sec, key) orelse if (ini.section("DEFAULT")) |d| rawGet(d, key) else null;
@@ -347,7 +343,6 @@ fn expandValue(arena: std.mem.Allocator, ini: *const ParsedIni, section_name: []
                 if (std.mem.eql(u8, prefix, "known")) {
                     raw = rawGet(local, name) orelse local.previous.get(option);
                 } else if (!std.mem.eql(u8, prefix, "default")) {
-                    // BasicInterpolation folds the complete variable name before lookup.
                     const other = ini.section(prefix) orelse return error.InterpolationMissingOption;
                     raw = rawGet(other, option);
                 }
@@ -361,7 +356,6 @@ fn expandValue(arena: std.mem.Allocator, ini: *const ParsedIni, section_name: []
                 };
             }
             const value = raw orelse return error.InterpolationMissingOption;
-            // BasicInterpolation recurses only when the replacement contains %.
             try out.appendSlice(arena, if (std.mem.indexOfScalar(u8, value, '%') != null) try expandValue(arena, ini, section_name, value, depth + 1, "") else value);
             i = close + 2;
         } else {
@@ -1418,7 +1412,7 @@ test "p2 config layers includes previous values and provenance" {
     try testing.expectEqual(@as(usize, 5), ini.sources.items.len);
     try testing.expectEqual(@as(u32, 2), sec.origins.get("maxretry").?.line);
     try testing.expect(std.mem.endsWith(u8, sec.origins.get("maxretry").?.source, "20.local"));
-    try testing.expectEqualStrings("7", sec.previous.get("maxretry").?); // previous is updated only when overwritten
+    try testing.expectEqualStrings("7", sec.previous.get("maxretry").?);
 }
 
 test "p2 config after and included local order" {
@@ -1456,15 +1450,11 @@ test "p2 config missing interpolation remains explicit error and source diagnost
     try testing.expectEqualStrings("fixture", ini.warnings.items[0].source);
 }
 
-/// Open selector parameters remain strings until their consumer converts them.
-/// Commas inside quoted values and nested brackets do not split parameters.
 pub const Selector = struct {
     name: []const u8,
     parameters: std.StringArrayHashMapUnmanaged([]const u8) = .{},
 };
 
-/// Parse an asset name followed by ordered parameter groups. Repeated keys in
-/// later groups replace earlier values, including conditional parameter names.
 pub fn parseSelector(arena: std.mem.Allocator, input: []const u8) Error!Selector {
     const text = std.mem.trim(u8, input, " \t\r\n");
     const open = std.mem.indexOfScalar(u8, text, '[') orelse {
@@ -1490,7 +1480,6 @@ pub fn parseSelector(arena: std.mem.Allocator, input: []const u8) Error!Selector
             const key_start = i;
             while (i < text.len and text[i] != '=' and text[i] != ',' and text[i] != ']') : (i += 1) {}
             if (i == text.len or text[i] != '=') return error.InvalidParameter;
-            // The first '=' belongs to a conditional key such as n?family=inet6.
             if (std.mem.indexOfScalar(u8, text[key_start..i], '?') != null) {
                 i += 1;
                 while (i < text.len and text[i] != '=' and text[i] != ',' and text[i] != ']') : (i += 1) {}
@@ -1524,8 +1513,6 @@ pub fn parseSelector(arena: std.mem.Allocator, input: []const u8) Error!Selector
     return result;
 }
 
-/// Ordered action instances: whitespace separates instances only outside brackets
-/// and quotes. The asset parser remains responsible for parameter syntax.
 pub fn splitSelectors(arena: std.mem.Allocator, input: []const u8) Error![]const []const u8 {
     var result = std.ArrayListUnmanaged([]const u8){};
     var start: usize = 0;
@@ -1566,8 +1553,6 @@ pub fn splitSelectors(arena: std.mem.Allocator, input: []const u8) Error![]const
 pub const ParameterizedAsset = struct {
     selector: Selector,
     config: ParsedIni,
-    // This is a lossless preparation view. Runtime tags and conditional branches
-    // stay explicit; admitting/executing a filter/action belongs to its consumer.
     definition: std.StringArrayHashMapUnmanaged([]const u8) = .{},
     init: std.StringArrayHashMapUnmanaged([]const u8) = .{},
 };
@@ -1637,15 +1622,11 @@ pub fn resolveWithParameters(arena: std.mem.Allocator, ini: *const ParsedIni, se
     return resolve(arena, &view, section_name, key);
 }
 
-/// Returns static parameter expansion only. Unknown tags are preserved exactly:
-/// event tags and executable custom getters must be handled by later consumers.
 pub fn combineAsset(arena: std.mem.Allocator, asset: *const ParameterizedAsset, condition: []const u8) Error!std.StringArrayHashMapUnmanaged([]const u8) {
     var combined = try asset.definition.clone(arena);
     var init = asset.init.iterator();
     while (init.next()) |kv| try combined.put(arena, kv.key_ptr.*, kv.value_ptr.*);
     const output_count = combined.count();
-    // Include section-qualified helpers for the reader's late getCombOption
-    // fallback without invoking custom getters or touching external resources.
     var sections = asset.config.sections.iterator();
     while (sections.next()) |section| {
         var keys = section.value_ptr.keys.iterator();
@@ -1678,7 +1659,6 @@ fn expandTags(arena: std.mem.Allocator, values: *const std.StringArrayHashMapUnm
                 if (condition.len > 0) {
                     replacement = values.get(try std.fmt.allocPrint(arena, "{s}?{s}", .{ name, condition }));
                 } else {
-                    // A conditional base is deferred until the runtime family is known.
                     var keys = values.iterator();
                     var deferred = false;
                     while (keys.next()) |kv| {
@@ -1707,7 +1687,6 @@ fn expandTags(arena: std.mem.Allocator, values: *const std.StringArrayHashMapUnm
         if (out.items.len > max_value_bytes) return error.InterpolationOverflow;
     }
     const expanded = try out.toOwnedSlice(arena);
-    // Resolve tags assembled by adjacent substitutions as well as nested tags.
     if (!std.mem.eql(u8, raw, expanded) and std.mem.indexOfScalar(u8, expanded, '<') != null) return expandTags(arena, values, expanded, condition, depth + 1);
     return expanded;
 }
@@ -1750,9 +1729,6 @@ pub const ResolvedOption = struct {
     default_identity: []const u8,
 };
 
-/// Consumer defaults are explicit arguments, because early/global and jail phases
-/// have different defaults. Arbitrary-sized integers use canonical decimal text;
-/// narrowing to a runtime integer remains an explicit consumer admission step.
 pub fn readTypedOption(arena: std.mem.Allocator, ini: *const ParsedIni, section_name: []const u8, key: []const u8, value_type: CanonicalType, fallback: CanonicalValue, default_identity: []const u8) Error!ResolvedOption {
     const local = ini.section(section_name);
     const def = ini.section("DEFAULT");
@@ -1766,7 +1742,6 @@ pub fn readTypedOption(arena: std.mem.Allocator, ini: *const ParsedIni, section_
         .string => result.value = .{ .string = raw },
         .boolean => {
             const lower = try std.ascii.allocLowerString(arena, raw);
-            // ConfigReader uses helpers._as_bool, not ConfigParser.getboolean.
             result.value = .{ .boolean = std.mem.eql(u8, lower, "1") or std.mem.eql(u8, lower, "yes") or std.mem.eql(u8, lower, "true") or std.mem.eql(u8, lower, "on") };
         },
         .integer => {
@@ -1840,8 +1815,6 @@ pub const ConfigDocument = struct {
     source: ParsedIni,
 };
 
-/// Source preparation is immutable to consumers: updates create a fresh document.
-/// Generation identity binds ordered occurrences, paths, edge roles and byte hashes.
 pub fn prepareConfigDocument(arena: std.mem.Allocator, root: []const u8, stem: []const u8) Error!ConfigDocument {
     const source = try loadConfig(arena, root, stem);
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -1862,8 +1835,6 @@ pub fn prepareConfigDocument(arena: std.mem.Allocator, root: []const u8, stem: [
     return .{ .source = source, .config_generation = digest };
 }
 
-// Unicode 15.1 Nd blocks, matching the pinned Python 3.13 reference profile.
-// This table normalizes numeric configuration only, not log text or regex input.
 fn normalizeInteger(arena: std.mem.Allocator, raw: []const u8) Error!?[]const u8 {
     const zeroes = [_]u21{ 0x30, 0x660, 0x6f0, 0x7c0, 0x966, 0x9e6, 0xa66, 0xae6, 0xb66, 0xbe6, 0xc66, 0xce6, 0xd66, 0xde6, 0xe50, 0xed0, 0xf20, 0x1040, 0x1090, 0x17e0, 0x1810, 0x1946, 0x19d0, 0x1a80, 0x1a90, 0x1b50, 0x1bb0, 0x1c40, 0x1c50, 0xa620, 0xa8d0, 0xa900, 0xa9d0, 0xa9f0, 0xaa50, 0xabf0, 0xff10, 0x104a0, 0x10d30, 0x11066, 0x110f0, 0x11136, 0x111d0, 0x112f0, 0x11450, 0x114d0, 0x11650, 0x116c0, 0x11730, 0x118e0, 0x11950, 0x11c50, 0x11d50, 0x11da0, 0x11f50, 0x16a60, 0x16ac0, 0x16b50, 0x1d7ce, 0x1d7d8, 0x1d7e2, 0x1d7ec, 0x1d7f6, 0x1e140, 0x1e2f0, 0x1e4f0, 0x1e950, 0x1fbf0 };
     const view = std.unicode.Utf8View.init(raw) catch return null;

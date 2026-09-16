@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Native journal receipt/checkpoint owner. Fresh tail or empty-time baselines
-//! commit explicitly; saved opaque cursors require an exact inclusive anchor.
 const std = @import("std");
 const transport = @import("native_journal_transport.zig");
 const native = @import("native_source_processor.zig");
@@ -57,6 +55,7 @@ pub const Options = struct {
     staged_detection: ?@import("native_detection_record.zig").StagedConsumer = null,
     consumer_sources: ?@import("native_file_session.zig").ConsumerSources = null,
     retry: ?@import("native_retry.zig").Policy = null,
+    suppress_retry_enforcement: bool = false,
     journal: transport.Options = .{},
     source_id: []const u8 = "system-journal",
     gate: ?*health.Gate = null,
@@ -132,8 +131,6 @@ pub const Session = struct {
         if (options.processing.timestamp != .journal or options.processing.max_record_bytes > 64 * 1024 or options.processing.max_decoded_bytes > 64 * 1024 or options.processing.max_decoded_bytes == 0) return error.InvalidJournalProcessing;
     }
 
-    /// Pure binding only: no clock, executor, consumer, Store or DNS callback.
-    /// Scratch/config remain borrowed; preflight reads generation without escape.
     pub fn prepareProcessor(a: std.mem.Allocator, options: Options, scratch: []u8, now: time.Timestamp) !native.Processor {
         try validateOptions(options);
         if (now.us < 0) return error.InvalidJournalStart;
@@ -142,12 +139,10 @@ pub const Session = struct {
         var bound = options.processing;
         std.crypto.hash.sha2.Sha256.hash(specification, &bound.parent_generation, .{});
         var processor = if (options.staged_detection) |consumer| try native.Processor.initWithStaged(a, bound, scratch, now, consumer) else try native.Processor.initWithJournalDetection(a, bound, scratch, now, options.detection);
-        if (options.retry) |policy| try processor.bindRetry(policy);
+        if (options.retry) |policy| try processor.bindRetry(policy, options.suppress_retry_enforcement);
         return processor;
     }
 
-    /// Borrowed configuration/clock/executor context and store must outlive this
-    /// stable owner. Store schema admission belongs to the global coordinator.
     pub fn create(a: std.mem.Allocator, store: *durable.Store, options: Options) !*Session {
         return createInternal(a, store, options, false);
     }
@@ -205,7 +200,6 @@ pub const Session = struct {
         try self.checkStartClock();
         if (self.pipe.revision != 0 and !self.baseline_committed) return error.MissingJournalCheckpoint;
         if (self.baseline_committed) {
-            // Exact anchor verification also applies when no pending receipt exists.
             _ = try self.fetch(1);
         } else {
             self.initial_tail_attempted = true;
@@ -229,8 +223,6 @@ pub const Session = struct {
         self.allocator.free(self.decode_scratch);
         self.allocator.destroy(self);
     }
-    /// Export only detached continuity/repair evidence, never executor, consumer
-    /// or clock callbacks. No helper/query/Store access occurs in this operation.
     pub fn exportRecovery(self: *const Session) !*RecoverySnapshot {
         if (self.processor.in_flight or self.pending_expected != null) return error.ConsumerBusy;
         if (self.options.processing.jail.len > 64 or self.options.source_id.len > durable.Limits.source_bytes) return error.InvalidSourceLimit;
@@ -249,9 +241,6 @@ pub const Session = struct {
     }
     fn recoveryProposal(self: *const Session) ?Position {
         if (self.baseline_committed or self.expected_durable) return null;
-        // Before position restoration, the imported proposal is still newer
-        // than the fresh constructor's clock. Afterwards retain any newly
-        // observed first-tail cursor, not a stale imported empty proposal.
         return if (self.admission_phase == .positions) self.initial_proposal orelse self.position else self.position;
     }
     pub fn importRecovery(self: *Session, snapshot: *const RecoverySnapshot) !void {
@@ -268,8 +257,6 @@ pub const Session = struct {
         self.initial_proposal = snapshot.initial_proposal;
         self.initial_tail_attempted = snapshot.initial_tail_attempted;
     }
-    /// Import only generation-bound repair metadata and the uncommitted first
-    /// boundary. A freshly loaded durable position always takes precedence.
     pub fn copyRepairStateFrom(self: *Session, old: *const Session) !void {
         if (self.admission_phase != .positions or self.baseline_committed or self.restore_after != null or self.pending_proof != null) return error.RecoveryOutOfOrder;
         if (!std.mem.eql(u8, &self.processor.generation, &old.processor.generation) or !std.mem.eql(u8, self.options.source_id, old.options.source_id)) return error.SourceGenerationMismatch;
@@ -375,8 +362,6 @@ pub const Session = struct {
     fn checkCandidate(candidate: records.Record, identity: durable.ReceiptIdentity) !void {
         if (candidate.kind != .data or !std.mem.eql(u8, candidate.source, identity.source) or !std.mem.eql(u8, candidate.occurrence, identity.occurrence) or !std.mem.eql(u8, candidate.cursor, identity.cursor) or !std.mem.eql(u8, &candidate.raw_hash, &identity.raw_hash)) return error.PendingRecordMismatch;
     }
-    /// Validate the exact inclusive anchor and, when present, the complete next
-    /// pending entry including its origin fields. One fixed-argument query only.
     fn verifyTurn(self: *Session) !void {
         try self.sourceIoAdmission();
         if (self.source_repair.state.phase == .intervention) return error.SourceInterventionRequired;
@@ -389,8 +374,6 @@ pub const Session = struct {
         defer if (pending) |saved| saved.deinit(self.allocator);
         const binding = self.bindPending(pending) catch |err| return if (self.last_failure_domain == .storage) err else self.sourceFailure(err);
         if (token != null) token = try self.source_repair.begin(self.nowMs(), true);
-        // An executable that cannot be spawned is an environment fault, not a journal condition
-        // the bounded repair loop can outwait: refuse admission explicitly instead of recovering.
         var lines = self.fetch(1) catch |err| return switch (err) {
             error.FileNotFound, error.AccessDenied => error.JournalExecutableUnavailable,
             else => self.sourceFailure(err),
@@ -406,9 +389,6 @@ pub const Session = struct {
         }
         if (token) |value| if (self.source_repair.state.phase == .verifying) try self.source_repair.continuityVerified(value, binding);
     }
-    /// Deferred admission performs one detached state read or one journal query
-    /// per turn. A failed first tail query freezes the original start boundary;
-    /// retry must not seek a later tail and skip entries written during cooldown.
     pub fn admissionTurn(self: *Session) !bool {
         try self.sourceIoAdmission();
         self.last_failure_domain = null;
@@ -472,8 +452,6 @@ pub const Session = struct {
         if (!std.mem.eql(u8, &pending.identity.generation, &self.processor.generation)) return error.SourceGenerationMismatch;
         return self.pollTurn(1);
     }
-    /// Native scheduler entry point. Cooldown/intervention makes no helper call;
-    /// successful continuity alone never resets an episode before actual polling.
     pub fn pollTurn(self: *Session, budget: usize) !usize {
         defer self.reportNotices();
         if (budget == 0 or budget > self.options.journal.batch_records) return error.InvalidPollBudget;
@@ -541,7 +519,6 @@ pub const Session = struct {
         self.diagnostic = .{};
         const result = try self.options.executor.run(self.allocator, args, self.output, &self.diagnostic, self.options.journal.timeout_ms, self.options.executor.context);
         if (result.len > self.output.len) return error.JournalOutputLimit;
-        // Do not acknowledge any records from a truncated command response.
         if (result.len > 0 and result[result.len - 1] != '\n') return error.IncompleteJournalRecord;
         var framed = Lines{ .bytes = result, .remaining = count };
         while (try framed.next()) |_| {}

@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Local IPC authorization primitives: peer classification from SO_PEERCRED, command
-//! classification from the raw frame tag, request_id extraction, and the socket
-//! directory/path verification that OS-enforces monitor admission.
 
 const std = @import("std");
 const posix = std.posix;
@@ -14,8 +11,6 @@ pub const PeerCred = extern struct {
     gid: u32,
 };
 
-/// `admin` may mutate; `monitor` may only issue read-only commands. Group membership is
-/// never authority: monitor admission is enforced by the socket directory/path mode.
 pub const PeerClass = enum { admin, monitor };
 
 pub fn classifyPeer(cred: PeerCred, daemon_uid: u32) PeerClass {
@@ -27,9 +22,6 @@ pub const CommandClass = enum { read_only, mutation, unknown };
 
 pub const request_id_len: usize = 32;
 
-/// Classification is by raw tag before deserialization so that reserved tags
-/// (7 query_v1, 8 admin_v1, 9 reload_v1) receive the correct authorization class
-/// even though the current protocol cannot decode them.
 pub fn classifyTag(tag: u8) CommandClass {
     return switch (tag) {
         0, 3, 4, 6, 7 => .read_only,
@@ -38,8 +30,6 @@ pub fn classifyTag(tag: u8) CommandClass {
     };
 }
 
-/// Legacy mutation tags 1/2/5 keep the current wire format and carry no request_id.
-/// Tags 8/9 carry it in the 32 bytes after the tag; `body` starts at the tag byte.
 pub fn extractRequestId(body: []const u8) error{FrameTooShort}!?[request_id_len]u8 {
     if (body.len == 0) return error.FrameTooShort;
     switch (body[0]) {
@@ -81,8 +71,6 @@ pub const SocketPathError = error{
     SocketWrongMode,
 };
 
-/// Bits a socket parent directory may never carry: group write, other read/write/execute.
-/// Anything the directory permits beyond 0750 widens monitor admission past the contract.
 pub const forbidden_parent_bits: u32 = 0o027;
 pub const required_socket_mode: u32 = 0o660;
 
@@ -94,7 +82,6 @@ fn lstatPath(path: []const u8) error{ PathTooLong, StatFailed }!linux.Stat {
     @memcpy(z[0..path.len], path);
     z[path.len] = 0;
     var st: linux.Stat = undefined;
-    // fstatat exists on every Linux target; the lstat syscall does not (aarch64, riscv).
     const rc = linux.fstatat(linux.AT.FDCWD, @ptrCast(&z[0]), &st, linux.AT.SYMLINK_NOFOLLOW);
     switch (linux.E.init(rc)) {
         .SUCCESS => return st,
@@ -124,7 +111,6 @@ pub fn verifySocketFile(path: []const u8, daemon_uid: u32) SocketPathError!void 
     if ((st.mode & 0o777) != required_socket_mode) return error.SocketWrongMode;
 }
 
-/// Full post-bind verification, repeated on every accept: two lstat calls.
 pub fn verifySocketPath(path: []const u8, daemon_uid: u32) SocketPathError!void {
     try verifyParentDir(path, daemon_uid);
     try verifySocketFile(path, daemon_uid);
@@ -140,11 +126,6 @@ pub const BindPathError = error{
     ProbeFailed,
 };
 
-/// Decide whether a pre-existing object at the socket path may be unlinked before bind.
-/// Only a socket nobody listens on (connect → ECONNREFUSED) is disposable. The probe and
-/// the caller's unlink are not atomic; the parent-directory contract (owner root or the
-/// daemon uid, no group/other write) is what keeps another principal from swapping the
-/// object in between, so verification of that directory must precede any unlink.
 pub fn inspectBindPath(path: []const u8) BindPathError!BindPathState {
     if (path.len >= max_path) return error.PathTooLong;
     var z: [max_path]u8 = undefined;

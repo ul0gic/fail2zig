@@ -10,7 +10,7 @@ per-test temporary directory that is removed afterwards.
 | Item | Value |
 |---|---|
 | Upstream | fail2ban 1.1.1 (supported source set: 1.1.0 and 1.1.1) |
-| Reference checkout | `/tmp/fail2ban-parity-reference-1.1.1` (read-only, not vendored) |
+| Upstream commit | `f60978618a101427b06924fc932b44350fec2b63` |
 | Schema source | `fail2ban/server/database.py:114-160` (`Fail2BanDb.__version__ = 4`, `_CREATE_SCRIPTS`) |
 | Runtime journal mode | `database.py:208` sets `PRAGMA journal_mode = MEMORY` per connection |
 

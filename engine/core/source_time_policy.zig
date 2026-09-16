@@ -1,19 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Native admission of event time. Rejection is a durable record disposition,
-//! not an acknowledgment by itself. Callers commit its counters and cursor
-//! together, then publish health. No receipt-time fallback for timestamped input.
 const std = @import("std");
 const time = @import("native_time.zig");
 
-/// Include this version in native source configuration/checkpoint bindings.
 pub const version: u16 = 2;
 pub const future_tolerance_us: i64 = 60 * 1_000_000;
 pub const Policy = enum { timestamped, undated };
 
-/// Bind effective source configuration to the native time semantics. The parent
-/// must include extraction/codec/context options; receipt/processing clocks are
-/// per-occurrence values and intentionally do not change this identity.
 pub fn binding(parent: [32]u8, policy: Policy, window_us: i64) ![32]u8 {
     if (window_us < 0) return error.InvalidWindow;
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -33,12 +26,10 @@ pub const Reason = enum { missing, malformed, out_of_range, unsupported_precisio
 pub const Input = union(enum) { parsed: time.Timestamp, rejected: Reason };
 pub const Origin = enum { event, receipt, clock_adjusted };
 pub const Evidence = struct {
-    /// Effective detection time; original remains available for diagnosis.
     timestamp: time.Timestamp,
     origin: Origin,
     original: ?time.Timestamp,
     receipt: time.Timestamp,
-    /// Present only when native syslog inference selected the original year.
     inferred_year: ?u16 = null,
 };
 pub const Rejection = struct {
@@ -75,8 +66,6 @@ pub const Result = union(enum) {
     }
 };
 
-/// The source extractor distinguishes absent/empty fields from malformed ones.
-/// Configuration/context failures must not silently discard an entire source.
 pub fn parseField(format: time.Format, field: ?[]const u8, context: time.Context) !Input {
     const bytes = field orelse return .{ .rejected = .missing };
     if (bytes.len == 0) return .{ .rejected = .missing };
@@ -89,14 +78,9 @@ pub fn parseField(format: time.Format, field: ?[]const u8, context: time.Context
     return .{ .parsed = value };
 }
 
-/// receipt is supplied by the ingestion owner, not sampled here. Retries of an
-/// already observed occurrence must retain that observation time. Source capture
-/// and restart provenance belong to the native session/coordinator integration.
 pub fn evaluate(policy: Policy, input: Input, receipt: ?time.Timestamp, now: time.Timestamp, window_us: i64) !Result {
     if (window_us < 0) return error.InvalidWindow;
     if (policy == .timestamped and input == .rejected) return .{ .rejected = .{ .reason = input.rejected } };
-    // Every timed record needs its original receipt boundary. Comparing future
-    // time only against a later retry clock would eventually admit bad dates.
     const observed = receipt orelse return error.MissingReceiptTime;
     if (observed.us > now.us) return error.ReceiptClockReversed;
     const evidence: Evidence = switch (policy) {
@@ -118,13 +102,10 @@ pub fn evaluate(policy: Policy, input: Input, receipt: ?time.Timestamp, now: tim
     return switch (try time.age(evidence.timestamp, now, window_us)) {
         .eligible => .{ .eligible = evidence },
         .obsolete => .{ .obsolete = evidence },
-        // observed <= now and effective <= observed were checked above.
         .future => unreachable,
     };
 }
 
-/// Values fit nonnegative SQLite INTEGERs. Counter staging is allocation-free
-/// and cannot mutate the committed owner on failure. Baselines are not records.
 pub const Counters = struct {
     pub const Kind = enum { eligible, obsolete, missing, malformed, future };
     eligible: u64 = 0,
@@ -154,8 +135,6 @@ pub const Counters = struct {
         };
     }
 
-    /// Classification-only adapters need no lossy timestamp conversion to count
-    /// their outcome. Receipt origin is meaningful only for dated evidence.
     pub fn counted(self: Counters, kind: Kind, origin: Origin) !Counters {
         try self.validate();
         if (origin != .event and kind != .eligible and kind != .obsolete) return error.InvalidTimeCounters;
@@ -187,9 +166,6 @@ pub const Notice = struct {
     future_since_notice: u64,
 };
 
-/// One owner per source/jail generation. The coordinator supplies monotonic ms
-/// and routes notices to its logger. No input text, database writes or allocations
-/// are needed to read health or emit a deferred warning during idle periods.
 pub const Health = struct {
     committed: Counters = .{},
     reported_missing: u64 = 0,
@@ -202,8 +178,6 @@ pub const Health = struct {
         return .{ .committed = restored, .reported_missing = restored.missing, .reported_malformed = restored.malformed, .reported_future = restored.future };
     }
 
-    /// Only call after durable publication with previously validated counters.
-    /// A failed transaction must leave both these counters and notices unchanged.
     pub fn publish(self: *Health, committed: Counters) void {
         self.committed = committed;
     }
@@ -212,9 +186,6 @@ pub const Health = struct {
         return self.committed;
     }
 
-    /// First new rejection warns immediately; subsequent ones aggregate for at
-    /// least 60 seconds. Lifetime counters stay visible even after a notice.
-    /// A reversed monotonic sample cannot trigger an early warning or underflow.
     pub fn nextNotice(self: *Health, now_ms: u64) ?Notice {
         const missing = self.committed.missing -| self.reported_missing;
         const malformed = self.committed.malformed -| self.reported_malformed;
@@ -272,7 +243,7 @@ test "time admission: counters reject overflow and inconsistent restored values"
 test "time admission: warnings aggregate committed rejections and remain readable without storage" {
     var health = try Health.init(.{});
     const missing = try health.snapshot().advanced(.{ .rejected = .{ .reason = .missing } });
-    try std.testing.expect(health.nextNotice(0) == null); // preparation is not publication
+    try std.testing.expect(health.nextNotice(0) == null);
     health.publish(missing);
     try std.testing.expectEqual(@as(u64, 1), health.nextNotice(0).?.missing_since_notice);
     health.publish(try health.snapshot().advanced(.{ .rejected = .{ .reason = .malformed } }));
@@ -285,11 +256,10 @@ test "time admission: warnings aggregate committed rejections and remain readabl
     try std.testing.expectEqual(@as(u64, 2), health.snapshot().missing);
     var restored = try Health.init(health.snapshot());
     try std.testing.expectEqualDeep(health.snapshot(), restored.snapshot());
-    try std.testing.expect(restored.nextNotice(0) == null); // no replayed rejection event
+    try std.testing.expect(restored.nextNotice(0) == null);
 }
 
 test "future time: inclusive tolerance preserves original and effective timestamps exactly" {
-    // Include values beyond binary64 integer precision and both signed extremes.
     for ([_]i64{ std.math.minInt(i64), -1_000_000_000, 1_000_000_000, 9007199254740993, std.math.maxInt(i64) - future_tolerance_us - 1 }) |base| {
         const receipt = time.Timestamp{ .us = base };
         for ([_]i64{ 0, 1, future_tolerance_us - 1, future_tolerance_us, future_tolerance_us + 1 }) |delta| {

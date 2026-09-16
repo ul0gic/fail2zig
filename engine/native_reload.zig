@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 
-//! Configuration reload: build and classify a proposed generation without touching
-//! runtime state. The daemon applies only `live` classifications at a worker tick boundary
-//! after the durable transition committed; everything else leaves the current generation,
-//! ingestion and protection untouched and is reported with exact reasons.
-//!
-//! Live-changeable per jail: maxretry, bantime, bantime_kind and bantime_increment
-//! (retry policy bytes under an unchanged plan generation), plus global log_level and the
-//! contents of a custom jail's ignore_file. Every other key is restart-only by the frozen
-//! classification table because it is bound into a durable plan/effect generation.
-
 const std = @import("std");
 const config = @import("config/native.zig");
 const retry_config = @import("config/native_retry_policy.zig");
@@ -30,7 +20,6 @@ pub const Reason = struct {
 };
 
 pub const PolicyChange = struct {
-    /// Index into the current configuration's enabled-jail order (the coordinator's jail slice).
     jail: []const u8,
     next: retry.Policy,
 };
@@ -73,7 +62,6 @@ pub const Classification = struct {
     }
 };
 
-/// Restart-only global keys; `log_level` is the only live global key.
 fn globalsEqual(a: *const config.GlobalConfig, b: *const config.GlobalConfig, out: *Classification) void {
     inline for (std.meta.fields(config.GlobalConfig)) |field| {
         if (comptime std.mem.eql(u8, field.name, "log_level")) continue;
@@ -109,7 +97,6 @@ fn findJail(cfg: *const config.Config, name: []const u8) ?*const config.JailConf
     return null;
 }
 
-/// Compare the running configuration against a fully validated proposal.
 pub fn classify(current: *const config.Config, proposed: *const config.Config, per_jail_subjects: u32) Classification {
     var out: Classification = .{};
     globalsEqual(&current.global, &proposed.global, &out);
@@ -120,7 +107,6 @@ pub fn classify(current: *const config.Config, proposed: *const config.Config, p
             out.restart("jails.{s}: removed", .{jail.name});
             continue;
         };
-        // Plan/generation-bound keys: any difference needs a restart with state migration.
         inline for (.{ "enabled", "logpath", "source", "filter", "timestamp", "timezone_offset_minutes", "timezone", "timezone_ambiguity", "journal_executables", "rule_files", "ignore_file", "ignoreip", "compatibility_pending" }) |name| {
             const T = @TypeOf(@field(jail, name));
             if (!valuesEqual(T, @field(jail, name), @field(next, name))) out.restart("jails.{s}.{s}", .{ jail.name, name });
@@ -128,12 +114,9 @@ pub fn classify(current: *const config.Config, proposed: *const config.Config, p
         const before = config.resolveJailFromConfig(jail, current.defaults);
         const after = config.resolveJailFromConfig(next, proposed.defaults);
         if (before.banaction != after.banaction) out.restart("jails.{s}.banaction", .{jail.name});
-        // The retry window is bound into the source processor plan, so findtime cannot move live.
         if (before.findtime != after.findtime) out.restart("jails.{s}.findtime: bound to the source plan window", .{jail.name});
         const policy_changed = before.maxretry != after.maxretry or before.bantime != after.bantime or before.bantime_kind != after.bantime_kind or !std.meta.eql(before.bantime_increment, after.bantime_increment);
         if (!policy_changed) continue;
-        // A jail disabled in the file has no live generation to re-key; its policy edit takes
-        // effect at restart, and saying so keeps `jail enable` from running a stale policy unseen.
         if (!jail.enabled) {
             out.restart("jails.{s}: policy edit on a disabled jail applies at restart", .{jail.name});
             continue;
@@ -165,8 +148,6 @@ pub fn digestBytes(bytes: []const u8) [32]u8 {
     return digest;
 }
 
-/// Generation identity binds the config digest and the commit clock; equal files reloaded
-/// twice yield distinct generations so replayed responses cannot alias.
 pub fn generationId(config_digest: [32]u8, committed_us: i64) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("fail2zig-config-generation-v1\x00");

@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Original ordinary-file/SQLite fixture for future-time decisions. Receipt
-//! times are supplied by this fixture's owner, not captured/recovered by a daemon.
-//! The small JSON checkpoint/threshold are fixtures, not native production schema.
 const std = @import("std");
 const time = @import("core/native_time.zig");
 const policy = @import("core/source_time_policy.zig");
@@ -12,7 +9,6 @@ const durable = @import("core/record_store.zig");
 const pipeline = @import("core/record_pipeline.zig");
 
 const State = struct { counters: policy.Counters = .{}, outcome: ?policy.Result = null };
-/// Shared by receipt-recovery integration tests; never a production processor.
 pub const Fixture = struct {
     allocator: std.mem.Allocator,
     receipt: time.Timestamp,
@@ -109,7 +105,7 @@ test "future time: file rollback and reopen preserve receipt bounds original tim
         var source = try files.FileSource.init(a, path, "ordinary", .head, null);
         defer source.deinit();
         try source.setNativeFraming(.utf8, binding, 4096);
-        try std.testing.expect(!try source.poll(pipeline.Pipeline.acknowledge, &owner)); // committed baseline
+        try std.testing.expect(!try source.poll(pipeline.Pipeline.acknowledge, &owner));
         try log.writeAll(first);
         store.fail_at = .before_commit;
         try std.testing.expectError(error.InjectedFailure, source.poll(pipeline.Pipeline.acknowledge, &owner));
@@ -119,8 +115,6 @@ test "future time: file rollback and reopen preserve receipt bounds original tim
     }
     var store = try durable.Store.open(a, database);
     defer store.close();
-    // The owner retains the original observation while processing time advances.
-    // Native session capture/crash provenance is a separate integration obligation.
     var processor = Fixture{ .allocator = a, .receipt = .{ .us = 1_000_000_000 }, .now = .{ .us = 1_600_000_001 } };
     var owner = pipeline.Pipeline{ .store = &store, .jail = "fixture", .processor = processor.adapter() };
     try owner.restore(a);
@@ -130,7 +124,6 @@ test "future time: file rollback and reopen preserve receipt bounds original tim
     defer parsed.deinit();
     var source = try files.FileSource.init(a, path, "ordinary", .head, parsed.value);
     defer source.deinit();
-    // A policy/window/config change cannot reinterpret the saved source silently.
     try std.testing.expectError(error.FramingProfileMismatch, source.setNativeFraming(.utf8, try policy.binding([_]u8{7} ** 32, .undated, 600_000_000), 4096));
     try std.testing.expectError(error.FramingProfileMismatch, source.setNativeFraming(.utf8, try policy.binding([_]u8{7} ** 32, .timestamped, 599_000_000), 4096));
     try source.setNativeFraming(.utf8, binding, 4096);
@@ -144,8 +137,6 @@ test "future time: file rollback and reopen preserve receipt bounds original tim
     try std.testing.expectEqual(@as(i64, 0), try store.pendingIntents());
     try owner.restore(a);
     try std.testing.expectEqualDeep(evidence, processor.state.outcome.?.obsolete);
-    // Next observed record is beyond tolerance. A failed rejection commit does
-    // not publish its warning/counter; retry still rejects even after time catches up.
     processor.receipt = processor.now;
     try log.writeAll(second);
     store.fail_at = .before_commit;

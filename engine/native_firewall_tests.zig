@@ -66,13 +66,11 @@ test "native firewall: isolated kernel complete empty and owned dual-family read
 
 fn isolatedTransport() !inspection.Transport {
     const selected = std.posix.getenv("F2Z_NATIVE_FIREWALL_TRANSPORT") orelse return error.SkipZigTest;
-    // This opt-in fixture must be launched in a separate network namespace.
     var current_buf: [std.fs.max_path_bytes]u8 = undefined;
     var init_buf: [std.fs.max_path_bytes]u8 = undefined;
     const current = try std.fs.readLinkAbsolute("/proc/self/ns/net", &current_buf);
     const initial = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse try std.fs.readLinkAbsolute("/proc/1/ns/net", &init_buf);
     try std.testing.expect(!std.mem.eql(u8, current, initial));
-    // Every kernel case receives a fresh namespace, independent of test order.
     if (linux.E.init(linux.unshare(linux.CLONE.NEWNET)) != .SUCCESS) return error.IsolationFailed;
     return std.meta.stringToEnum(inspection.Transport, selected) orelse error.InvalidFixture;
 }
@@ -558,7 +556,6 @@ test "native firewall: isolated finite retry retains original deadline and expir
     if (remaining > 0) std.Thread.sleep(@as(u64, @intCast(remaining)) * 1000);
     var expired = try reader.inspect();
     defer expired.deinit();
-    // iptables owns no kernel timer: durable coordinator dispatches removal.
     try std.testing.expectEqual(@as(usize, if (transport == .iptables) 2 else 0), expired.entries.len);
     for ([_]bool{ false, true }) |v6| {
         var release = try applyVerified(&reader, try effectToken(&reader, v6, .ensure_absent));
@@ -794,7 +791,6 @@ test "native firewall: isolated nftables realizes the frozen scoped packet cells
     defer peer.deinit();
     const canonical = inspection.canonical_scope;
 
-    // Cell 1: the migrated host/all/all representation keeps its kernel timer.
     const host_deadline = std.time.microTimestamp() + 1_500_000;
     const host = try effectToken(&reader, false, .{ .ensure_present = .{ .finite_deadline_us = host_deadline } });
     var host_applied = try applyVerified(&reader, host);
@@ -804,7 +800,6 @@ test "native firewall: isolated nftables realizes the frozen scoped packet cells
     if (host_wait > 0) std.Thread.sleep(@as(u64, @intCast(host_wait)) * std.time.ns_per_us);
     try peer.exchangeUdp(false, 35271, 41, true);
 
-    // Cell 2: an IPv6 network matches only TCP/443 and remains idempotent.
     const network_tcp = canonical.Scope{
         .subject = try canonical.Subject.parseNetwork("2001:db8::/64"),
         .protocols = try canonical.Protocols.one(.tcp),
@@ -820,8 +815,6 @@ test "native firewall: isolated nftables realizes the frozen scoped packet cells
     defer network_tcp_duplicate.deinit();
     try std.testing.expect(!network_tcp_duplicate.verified.changed);
 
-    // Cell 3: a finite multi-port network coexists with a non-equivalent
-    // same-subject scope; removing one cannot broaden or remove the other.
     const network_udp = canonical.Scope{
         .subject = try canonical.Subject.parseNetwork("192.0.2.0/24"),
         .protocols = try canonical.Protocols.one(.udp),
@@ -848,8 +841,6 @@ test "native firewall: isolated nftables realizes the frozen scoped packet cells
     try peer.exchangeUdp(false, 35272, 49, true);
     try peer.exchangeUdp(false, 35281, 50, false);
 
-    // A new inspector proves restart/readback identity before the remaining
-    // cell injects a post-ack uncertainty.
     var reopened = try admissionReader(.nftables);
     defer reopened.close();
     var tcp_observed = try reopened.observeExact(network_tcp_token, .{ .wall_us = std.time.microTimestamp() });
@@ -859,9 +850,6 @@ test "native firewall: isolated nftables realizes the frozen scoped packet cells
     defer udp_observed.deinit();
     try std.testing.expect(udp_observed.matches_desired);
 
-    // Cell 4: ICMPv6 is distinct from UDP/TCP. The injected timeout occurs
-    // after the atomic netlink batch; exact readback resolves it without a
-    // duplicate mutation.
     const icmp_v6 = canonical.Scope{
         .subject = try canonical.Subject.parseHost("2001:db8::7"),
         .protocols = try canonical.Protocols.one(.icmp_v6),
@@ -994,9 +982,6 @@ test "native firewall: isolated fixed argv realizes the frozen scoped packet cel
     try std.testing.expect(!recovered.verified.changed);
     try peer.exchangeIcmpV6(73, false);
 
-    // A multi-part command interruption is explicit incomplete state. The
-    // already-live TCP and original UDP rules remain effective; no fallback
-    // or cleanup guess is attempted in this disposable namespace.
     const partial_scope = canonical.Scope{
         .subject = network_udp.subject,
         .protocols = try canonical.Protocols.one(.udp),

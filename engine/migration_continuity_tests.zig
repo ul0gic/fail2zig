@@ -82,7 +82,6 @@ const auth_first = "Sep 14 10:00:00 host sshd[1]: Failed password for root from 
 const auth_content = auth_first ++ "Sep 14 10:00:01 host sshd[1]: Failed password for root from 192.0.2.10 port 22 ssh2\n";
 const error_first = "2026/09/14 10:00:00 [error] 1#1: user \"a\": password mismatch, client: 192.0.2.11\r\n";
 const error_content = error_first ++ "2026/09/14 10:00:02 [error] 1#1: user \"b\": password mismatch, client: 192.0.2.12\r\n";
-/// fail2ban 1.1.x on Python 3 records SHA-1 in `firstlinemd5`; Python 2 era rows carry MD5.
 const auth_md5 = sha1Hex(auth_first);
 const error_md5 = md5Hex(error_first);
 

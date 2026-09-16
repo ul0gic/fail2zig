@@ -41,8 +41,6 @@ const Owner = struct {
     fail_stage: ?usize = null,
     failure: anyerror = error.CorruptDatabase,
     reverse_in_sources: bool = false,
-    /// Inert ownership fixture: proves recovery never rewrites an existing
-    /// absolute deadline, not actual kernel expiry or backend reconciliation.
     original_deadline: i64 = 1_060_000_000,
     fn cast(context: ?*anyopaque) *Owner {
         return @ptrCast(@alignCast(context.?));
@@ -132,7 +130,7 @@ test "clock recovery: actual file ingestion pauses globally and resumes automati
     try t.expectEqual(recovery.Status.waiting, try driver.poll());
     clocks.monotonic = 1000;
     try t.expectEqual(recovery.Status.waiting, try driver.poll());
-    try t.expectEqual(calls, owner.calls); // known reversed clock avoids restore/IO
+    try t.expectEqual(calls, owner.calls);
     try t.expectEqual(@as(?u64, 3000), gate.snapshot().next_retry_ms);
     clocks.wall = 1_000_000_000;
     clocks.monotonic = 3000;
@@ -165,7 +163,6 @@ test "clock recovery: startup behind a pending receipt waits and validates befor
         defer owner.deinit();
         var driver = owner.driver();
         _ = try driver.poll();
-        // A COMMIT-reported failure after the receipt actually became durable.
         store.fail_at = .after_receipt_commit;
         try t.expectError(error.InjectedFailure, owner.session.?.poll(1));
         try t.expectEqual(@as(usize, 1), try store.pendingReceiptCount());
@@ -241,7 +238,6 @@ test "clock recovery: catch-up cannot bypass corruption lost sources or a second
 test "clock recovery: unavailable startup persistence is still refused" {
     var clocks = Clocks{};
     var gate = health.Gate.init(.{ .context = &clocks, .read = Clocks.monoRead });
-    // The storage hook fails before touching this inert store value.
     var store: store_mod.Store = undefined;
     store.last_error_code = null;
     store.rollback_error_code = null;
@@ -251,7 +247,6 @@ test "clock recovery: unavailable startup persistence is still refused" {
     try t.expectError(error.OpenFailed, driver.poll());
     try t.expectEqual([4]usize{ 1, 0, 0, 0 }, owner.calls);
 
-    // Waiting for a clock during startup must not weaken persistence refusal.
     gate = health.Gate.init(.{ .context = &clocks, .read = Clocks.monoRead });
     owner.calls = [_]usize{0} ** 4;
     gate.receiptClockFailed(clocks.wall + 1);
@@ -267,8 +262,6 @@ test "clock recovery: unavailable startup persistence is still refused" {
 }
 
 test "clock recovery: reversal during preparation never publishes or loses the pending receipt" {
-    // Reverse after receipt commit: before decoding, during time preparation,
-    // and after preparation but before outcome commit.
     for (1..4) |reverse_after| {
         var temp = t.tmpDir(.{});
         defer temp.cleanup();

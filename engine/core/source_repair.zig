@@ -1,14 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Source-local repair scheduling. The coordinator owns one value per source;
-//! shared storage failures fence it without consuming a source retry attempt.
 const std = @import("std");
 
 pub const Phase = enum { healthy, waiting, verifying, polling, intervention };
 pub const Domain = enum { transient_source, source_intervention, storage, pending };
 
-/// Classify only after the caller has identified the failing subsystem. An
-/// AccessDenied from SQLite is a storage fault, not a source-file permission fault.
 pub fn classify(cause: anyerror) Domain {
     return switch (cause) {
         error.Busy,
@@ -40,8 +36,6 @@ pub fn classify(cause: anyerror) Domain {
     };
 }
 
-/// An immutable source/configuration binding. Pending identity hashes are made
-/// from length-delimited full identity fields, never from cursor text ordering.
 pub const Binding = struct {
     generation: [32]u8,
     source_digest: [32]u8,
@@ -105,8 +99,6 @@ pub const Repair = struct {
         return .{ .binding = binding, .last_now_ms = now_ms };
     }
 
-    /// Healthy polling may create/resolve a pending receipt. Preserve episode
-    /// serials and immutable source/generation identity when updating that proof.
     pub fn bindHealthy(self: *Repair, binding: Binding) !void {
         if (self.state.phase != .healthy) return error.StaleRepair;
         if (!std.mem.eql(u8, &binding.generation, &self.binding.generation) or
@@ -115,9 +107,6 @@ pub const Repair = struct {
         self.binding = binding;
     }
 
-    /// Caller has verified the exact immutable committed receipt, including
-    /// original timestamp. Absence of a pending row alone is never sufficient.
-    /// Preserve the episode/deadline; subsequent continuity and poll still gate reset.
     pub fn resolveCommittedPending(self: *Repair, expected: Binding) !void {
         if (self.binding.pending_digest == null or !std.meta.eql(self.binding, expected)) return error.PendingRecordMismatch;
         self.binding.pending_digest = null;
@@ -143,9 +132,6 @@ pub const Repair = struct {
         self.state.next_retry_ms = null;
     }
 
-    /// A fenced storage failure or a yielded scan does not alter this episode.
-    /// OOM/capacity and unknown deterministic errors require intervention rather
-    /// than an endless retry loop. The store gate owns global OOM policy.
     pub fn failed(self: *Repair, cause: anyerror, now_ms: u64) !Domain {
         const domain = classify(cause);
         if (domain == .storage or domain == .pending) return domain;
@@ -157,7 +143,6 @@ pub const Repair = struct {
         }
         if (self.state.first_cause == null) self.state.first_cause = cause;
         self.state.last_cause = cause;
-        // Repeated reports while waiting cannot postpone the existing deadline.
         if (self.state.phase != .waiting) {
             const delays = [_]u32{ 1000, 2000, 4000, 8000, 16000, 30000 };
             const delay = delays[@min(self.state.attempts, delays.len - 1)];
@@ -170,8 +155,6 @@ pub const Repair = struct {
         return domain;
     }
 
-    /// Returns null while fenced/not due. No sleeps, I/O, allocations or cursor
-    /// changes. A pending turn retains its token until verification completes.
     pub fn begin(self: *Repair, now_ms: u64, storage_available: bool) !?Token {
         if (!storage_available) return null;
         try self.observeClock(now_ms);
@@ -209,15 +192,11 @@ pub const Repair = struct {
         self.state.phase = .polling;
     }
 
-    /// Ignore completion from an older helper/repair attempt. Initial source
-    /// failures use failed(); asynchronous attempt results use this token gate.
     pub fn attemptFailed(self: *Repair, token: Token, cause: anyerror, now_ms: u64) !Domain {
         if (!std.meta.eql(token, self.currentToken()) or (self.state.phase != .verifying and self.state.phase != .polling)) return error.StaleRepair;
         return self.failed(cause, now_ms);
     }
 
-    /// Call only after a successful bounded poll/disposition, including proven
-    /// healthy EOF. Intermediate opens/anchor checks never reach this method.
     pub fn pollSucceeded(self: *Repair, token: Token) !void {
         try self.check(token, .polling);
         self.state = .{};

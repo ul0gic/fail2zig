@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Read-only inspection of a fail2ban configuration tree. Produces a manifest
-//! with one disposition per protection group and asset. Never writes, never
-//! executes imported expressions, never resolves names.
 const std = @import("std");
 const fail2ban = @import("../config/fail2ban.zig");
 const filter_context = @import("../config/filter_context.zig");
@@ -29,7 +26,6 @@ pub const Limits = struct {
 pub const Options = struct {
     source_dir: []const u8,
     reference_profile: []const u8 = "fail2ban-1.1.1",
-    /// Supplied by the CLI from build options; the library has no version module.
     tool_version: []const u8 = "unknown",
     limits: Limits = .{},
 };
@@ -107,7 +103,6 @@ pub const Manifest = struct {
     }
 };
 
-/// Keys with a known reference meaning. Anything else is retained as data.
 const known_keys = [_][]const u8{
     "enabled",           "filter",               "logpath",             "backend",             "journalmatch",
     "port",              "protocol",             "chain",               "bantime",             "findtime",
@@ -122,9 +117,6 @@ const known_keys = [_][]const u8{
     "logtarget",         "socket",               "pidfile",             "dbmaxmatches",        "allowipv6",
 };
 
-/// Keys whose value the disposition actually consumes. Interpolation failures elsewhere in
-/// DEFAULT (mail/notification templates that reference unset options) are how the stock
-/// jail.conf ships; the reference ConfigReader only interpolates a value when it is read.
 const consumed_keys = [_][]const u8{
     "enabled",              "filter",          "backend",             "logpath",         "journalmatch",
     "port",                 "protocol",        "chain",               "bantime",         "findtime",
@@ -134,17 +126,11 @@ const consumed_keys = [_][]const u8{
     "bantime.overalljails",
 };
 
-/// Stock default of `usedns` in the reference jail.conf; stricter settings need no change.
 const stock_usedns = "warn";
-/// Reference placeholder meaning "the action's own default chain".
 const known_chain_tag = "<known/chain>";
 
 const StockAsset = struct { kind: AssetKind, file: []const u8, version: []const u8, sha256: *const [64]u8 };
 
-/// SHA-256 of every stock filter.d/action.d file (including their include closure) that the
-/// builtin registry and supported backends correspond to, taken from the pinned upstream
-/// fail2ban 1.1.1 and 1.1.0 trees. A file whose bytes match is stock; a known name with other
-/// bytes is modified; a name outside the table cannot be verified.
 const stock_assets = [_]StockAsset{
     .{ .kind = .filter, .file = "apache-auth.conf", .version = "1.1.1/1.1.0", .sha256 = "dd83cc792f517486b0d06033c1ac1897673f0eec7c66d82f5545908fad91df0c" },
     .{ .kind = .filter, .file = "apache-badbots.conf", .version = "1.1.1", .sha256 = "48bf26a914ddaecd7cda13e480addca1165c0589baf222ad1e97fd4a01e093db" },
@@ -259,7 +245,6 @@ const Builder = struct {
     a: std.mem.Allocator,
     ini: *const fail2ban.ParsedIni,
     options: Options,
-    /// Reader graph with the reference's implicit `fail2ban_version`/`fail2ban_confpath` options.
     graph: ?fail2ban.ParsedIni = null,
     groups: std.ArrayListUnmanaged(Group) = .{},
     assets: std.ArrayListUnmanaged(Asset) = .{},
@@ -284,7 +269,6 @@ const Builder = struct {
     }
 
     fn collectGroups(self: *Builder) Error!void {
-        // DEFAULT is not a group, but its unknown keys still need provenance.
         if (self.ini.section("DEFAULT")) |def| try self.recordUnknownKeys(def);
         var it = self.ini.userSections();
         while (it.next()) |sec| {
@@ -354,7 +338,6 @@ const Builder = struct {
 
         for (eff.failures.items) |f| try self.addReason(&reasons, &kind, .blocker, f);
 
-        // Filter identity. Selector parameters change the reference regex set.
         const filter_raw = eff.get("filter") orelse sec.name;
         const filter_name = blk: {
             const sel = fail2ban.parseSelector(a, filter_raw) catch {
@@ -419,7 +402,6 @@ const Builder = struct {
             _ = try self.inspectAsset(.action, sel.name, true, &reasons, &kind);
             const type_param = sel.parameters.get("type");
             const allports = std.mem.indexOf(u8, sel.name, "allports") != null or (type_param != null and std.mem.eql(u8, type_param.?, "allports"));
-            // Native owners are host-scoped; the plan reports the widening as a semantic change.
             if (!allports) scope = "port";
         }
         const protocol = eff.get("protocol");
@@ -508,13 +490,10 @@ const Builder = struct {
                 }
                 return try std.fmt.allocPrint(self.a, "{d}s", .{seconds});
             },
-            .legacy_unknown => unreachable, // parse(raw, false) never yields it
+            .legacy_unknown => unreachable,
         }
     }
 
-    /// Selector parameters that equal the filter's own defaults (`[Init]`, else the value the
-    /// definition declares, as the stock `filter = %(__name__)s[mode=%(mode)s]` form relies on)
-    /// change nothing; anything else does.
     fn parametersAreDefaults(self: *Builder, selector: []const u8, sel: *const fail2ban.Selector) Error!bool {
         const asset = fail2ban.loadParameterizedAsset(self.a, self.options.source_dir, "filter.d", selector) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -531,8 +510,6 @@ const Builder = struct {
         return true;
     }
 
-    /// Records the on-disk asset when present. Returns whether it exists.
-    /// A present definition can never be proven equal to the compiled builtin here.
     fn inspectAsset(self: *Builder, asset_kind: AssetKind, name: []const u8, recognized: bool, reasons: *std.ArrayListUnmanaged([]const u8), kind: *DispositionKind) Error!bool {
         const dir = switch (asset_kind) {
             .filter => "filter.d",
@@ -607,8 +584,6 @@ fn isConsumedKey(key: []const u8) bool {
     return false;
 }
 
-/// `.local` files and `<name>.d/` drop-ins are operator overlays by definition; an INCLUDES
-/// target such as `common.conf` is part of the stock closure and verified by hash instead.
 fn isOverlay(occ: fail2ban.SourceOccurrence, name: []const u8) bool {
     if (occ.edge == .local or std.mem.endsWith(u8, occ.path, ".local")) return true;
     var buf: [128]u8 = undefined;
@@ -668,7 +643,6 @@ fn unknownLessThan(_: void, x: UnknownValue, y: UnknownValue) bool {
     return std.mem.order(u8, x.key, y.key) == .lt;
 }
 
-// JSON rendering: fixed key order, no map iteration, inputs pre-sorted.
 fn jsonString(writer: anytype, s: []const u8) !void {
     try std.json.stringify(s, .{}, writer);
 }

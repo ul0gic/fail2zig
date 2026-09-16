@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Durable canonical effect identities and the byte-stable legacy projection.
-//! This module performs no transport or filesystem operations.
 const std = @import("std");
 const detection = @import("native_detection_record.zig");
 const canonical_scope = @import("../firewall/scope.zig");
@@ -36,8 +34,6 @@ pub const Installation = struct {
         if (!std.mem.eql(u8, &canonical.selector_bytes, &self.selector_bytes)) return error.InvalidEffect;
     }
 };
-/// Caller assertion after read-only namespace/topology verification, not proof
-/// supplied by the store. Runtime namespace inode must never enter this value.
 pub const NamespaceAdmission = struct { selector: []const u8, disposition: enum { verified_absent, verified_owned } };
 
 pub const Scope = struct {
@@ -53,9 +49,6 @@ pub const Scope = struct {
         };
         return .{ .canonical = .{ .subject = canonical_scope.Subject.host(address) } };
     }
-    /// Pre-schema-19 storage admits only the exact legacy host/all/all INPUT
-    /// DROP realization. Validate the complete canonical value before this
-    /// projection so a richer valid scope is never widened.
     pub fn fromCanonical(value: canonical_scope.Scope) Error!Scope {
         value.validate() catch return error.InvalidEffect;
         if (value.subject.kind != .host or !value.protocols.isAll() or !value.ports.isAll())
@@ -85,8 +78,6 @@ pub const Scope = struct {
             if (subject.unenforceable()) return error.InvalidEffect;
         }
     }
-    /// Wire: version1,family4/6,prefix32/128,protocol0(any),hook1(INPUT),
-    /// verdict1(DROP),port-count0,interface-length0,network-order address16.
     pub fn encode(self: Scope) Error![encoded_bytes]u8 {
         try self.validate();
         if (self.canonical.subject.kind != .host or !self.canonical.protocols.isAll() or !self.canonical.ports.isAll())
@@ -211,8 +202,6 @@ pub const Observation = struct {
     fingerprint: Hash,
     observed_us: i64,
     qualification: enum { complete_owned, incomplete, foreign, changed },
-    /// Exact verified lease. The transport adapter applies its admitted timeout
-    /// tolerance before projecting the desired original deadline here.
     state: ?Lease,
 };
 pub const Settlement = enum { verified, retry_same_intent, expired };

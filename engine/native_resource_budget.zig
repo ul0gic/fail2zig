@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Checked native Zig capacity/descriptor admission. The ledger grants explicit
-//! owner reservations; callers must acquire them before allocation or opening.
-//! SQLite/C, helper RSS, allocator retention and kernel memory are reported
-//! separately. These admission charges are not a whole-process RSS hard limit.
 const std = @import("std");
 const store = @import("core/record_store.zig");
 const file = @import("core/durable_file_source.zig");
@@ -39,7 +35,6 @@ fn capacity(count: usize) Error!usize {
     return if (count == 0) 0 else add(try mul(count, 2), 8);
 }
 pub const Cost = struct {
-    /// Requested allocation capacities, including documented container growth.
     bytes: usize = 0,
     allocations: usize = 0,
     fds: usize = 0,
@@ -52,7 +47,6 @@ pub const Cost = struct {
     pub fn maximum(a: Cost, b: Cost) Cost {
         return .{ .bytes = @max(a.bytes, b.bytes), .allocations = @max(a.allocations, b.allocations), .fds = @max(a.fds, b.fds) };
     }
-    /// Explicit metadata/fragmentation allowance, not measured allocator RSS.
     pub fn chargedBytes(self: Cost) Error!usize {
         return add(try add(self.bytes, self.bytes / 4), try mul(self.allocations, allocation_allowance));
     }
@@ -75,9 +69,6 @@ pub const FdContext = struct {
         if (configured == 0 or unavailable >= self.soft_limit or unavailable >= configured) return error.NativeFdAdmission;
         return @min(self.soft_limit, configured) - unavailable;
     }
-    /// Read-only, bounded inventory. The scan's own descriptor is excluded.
-    /// Caller serializes opens and preserves this headroom until reservations
-    /// take over; an observation is not a kernel reservation.
     pub fn observe(configured: usize, headroom: usize) !FdContext {
         if (configured == 0) return error.InvalidResourceLimit;
         const limits = try std.posix.getrlimit(.NOFILE);
@@ -103,7 +94,6 @@ pub const Environment = struct {
     pub fn spawnCost(self: Environment, argv_entries: usize, argv_bytes: usize) Error!Cost {
         if (self.entries > 256 or self.bytes > 64 * 1024 or argv_entries > 256 or argv_bytes > 1024 * 1024) return error.EnvironmentLimit;
         const pointers = try mul(try add(try add(self.entries, argv_entries), 2), @sizeOf(?[*:0]u8));
-        // Child.spawn clones the full environment/argv into an ArenaAllocator.
         return .{ .bytes = try mul(try add(try add(self.bytes, argv_bytes), pointers), 3), .allocations = try add(try add(self.entries, argv_entries), 8), .fds = 7 };
     }
 };
@@ -138,8 +128,6 @@ pub const Plan = struct {
     restore_overlap: Cost = .{},
     workspaces: [6]Cost = [_]Cost{.{}} ** 6,
     detached: Cost = .{},
-    /// Outside the Zig ceiling; caller reports measured helper/OS usage and
-    /// cannot describe this allowance as enforced subprocess RSS.
     helper_os_allowance_bytes: usize = 0,
     pub fn include(self: *Plan, component: Component) Error!void {
         const live = try self.live.plus(component.live);
@@ -154,10 +142,6 @@ pub const Plan = struct {
     }
     pub fn finish(self: Plan, limits: Limits, fd: FdContext) Error!Requirements {
         try limits.validate();
-        // Source record buffers survive consumer prepare and SQLite commit.
-        // Reserve their separate maxima together; a maximum over these layers
-        // would undercount one ordinary acknowledgment call. Same-layer work is
-        // serialized across jails by the single native worker.
         var workspace: Cost = .{};
         for (self.workspaces) |cost| workspace = try workspace.plus(cost);
         const total = try (try (try self.live.plus(self.restore_overlap)).plus(workspace)).plus(self.detached);
@@ -177,8 +161,6 @@ pub fn fileCost(options: FileOptions) !Component {
     const Spec = std.meta.Child(@TypeOf(@as(file.FileSet, undefined).specs.items));
     const pending_bytes = 64 + store.Limits.source_bytes * 2 + store.Limits.cursor_bytes;
     const arrays = try add(try mul(try capacity(options.source_capacity), @sizeOf(file.FileSource) + @sizeOf(Retained)), try mul(options.source_capacity, @sizeOf(repair.Repair) + @sizeOf(?store.Store.PendingSource)));
-    // Current sources plus separately owned handoff metadata each retain a path
-    // and source identity. Saved pending proof retains all four identity strings.
     const per_source = 4 * store.Limits.source_bytes + pending_bytes;
     const specs = try add(try mul(try capacity(options.spec_count), @sizeOf(Spec)), try mul(options.spec_count, store.Limits.source_bytes));
     const discovery = try add(file.discovery_max_depth * store.Limits.source_bytes, try add(try mul(options.source_capacity, store.Limits.source_bytes), try mul(try capacity(options.source_capacity), @sizeOf([]u8))));
@@ -187,7 +169,6 @@ pub fn fileCost(options: FileOptions) !Component {
     const workspace = Cost{ .bytes = try add(try mul(options.max_record_bytes, 4), pending_bytes + store.Limits.cursor_bytes * 2), .allocations = 32 };
     const snapshot = try file_session.RecoverySnapshot.reservation(options.source_capacity);
     const snapshot_cost = Cost{ .bytes = snapshot.bytes, .allocations = snapshot.allocations, .fds = snapshot.descriptors };
-    // Held snapshot and replacement export coexist until capture succeeds.
     return .{ .live = try live.plus(snapshot_cost), .restore_overlap = try overlap.plus(snapshot_cost), .workspace = workspace, .workspace_kind = .source };
 }
 pub const JournalOptions = struct { max_record_bytes: usize, max_decoded_bytes: usize, batch_records: usize, environment: Environment };
@@ -196,9 +177,6 @@ pub fn journalCost(options: JournalOptions) !Component {
     const output = try mul(try add(options.batch_records, 1), journal.max_line_bytes + 1);
     const pending_bytes = 64 + store.Limits.source_bytes * 2 + store.Limits.cursor_bytes;
     const live = Cost{ .bytes = try add(@sizeOf(journal_session.Session) + journal.parse_bytes + pending_bytes, try add(options.max_decoded_bytes, output)), .allocations = 9 };
-    // At most64 file arguments +64 selectors, each <=4096 bytes, plus
-    // prefixes, executable and fixed switches. The query argv arena remains
-    // alive while Child.spawn clones argv/environment into its separate arena.
     const maximum_argv_bytes = 160 * 4160;
     const spawn = try options.environment.spawnCost(160, maximum_argv_bytes);
     const query_argv = Cost{ .bytes = 3 * (maximum_argv_bytes + 160 * @sizeOf([]const u8)), .allocations = 168 };
@@ -236,15 +214,11 @@ pub fn configurationCost(retained_capacity: usize, prepared_arena: usize, projec
     return .{ .live = live, .restore_overlap = live };
 }
 pub fn storeWorkspace() Component {
-    // A detached maximum checkpoint, shared checkpoint and consumer restore may
-    // coexist. No SQLite snapshot is retained while source/helper I/O executes.
     return .{ .live = .{ .fds = 4 }, .workspace = .{ .bytes = store.Limits.checkpoint_bytes + store.Limits.shared_bytes + consumer.max_prepared_bytes + store.Limits.sqlite_row_bytes, .allocations = 128 }, .workspace_kind = .storage };
 }
 pub fn effectCost(environment: Environment) Error!Component {
     const limits = inspection.Limits{};
     const live = Cost{ .bytes = @sizeOf(effect_runtime.Manager) + effect.max_effects * (2 * @sizeOf(effect.Entry) + @sizeOf(bool)), .allocations = 4 };
-    // max_bytes covers Builder/retained snapshot payload but not geometric
-    // netlink message-vector capacity nor Child.spawn environment/argv arenas.
     const vector = try mul(try mul(try add(limits.max_messages, 8), 3), @sizeOf([]u8));
     const spawn = try environment.spawnCost(64, 8192);
     const work = try spawn.plus(.{ .bytes = try add(limits.max_bytes, vector), .allocations = try add(limits.max_messages, 64) });
@@ -260,21 +234,17 @@ pub fn controlCost(metrics: bool, response_capacity: usize) Error!Component {
     const Map = @TypeOf(@as(EventLoop, undefined).registrations);
     const registrations = ipc.max_clients + (if (metrics) http.max_clients else @as(usize, 0)) + 8;
     const loop_bytes = @sizeOf(EventLoop) + (4 * registrations + 16) * (@sizeOf(Map.KV) + 2);
-    // Each admitted client may hold one bounded response awaiting drain; the deadline timer adds one fd.
     var live = Cost{ .bytes = loop_bytes + @sizeOf(ipc.IpcServer) + ipc.max_clients * (ipc.client_buffer_size + ipc.max_response_bytes), .allocations = 2 + 2 * ipc.max_clients, .fds = ipc.max_clients + 2 + 8 };
     if (metrics) {
         const Client = @typeInfo(@typeInfo(@TypeOf(@as(http.HttpServer, undefined).clients[0])).optional.child).pointer.child;
         live = try live.plus(.{ .bytes = @sizeOf(http.HttpServer) + http.max_clients * @sizeOf(Client), .allocations = http.max_clients + 1, .fds = http.max_clients + 1 });
     }
-    // Main-thread response generation may coexist with worker preparation.
     return .{ .live = try live.plus(.{ .bytes = try mul(response_capacity, 4), .allocations = 64 }) };
 }
 
 pub const Category = enum { configuration, source, consumer, effect, control, detached, workspace, other };
 pub const Token = struct { owner: *const Ledger, slot: u16, serial: u64 };
 const Slot = struct { serial: u64 = 0, active: bool = false, category: Category = .other, cost: Cost = .{} };
-/// Stable address, serialized with a mutex for worker/control ownership. Tokens
-/// reject stale release and never evict another owner when a ceiling is reached.
 pub const Ledger = struct {
     mutex: std.Thread.Mutex = .{},
     slots: [max_reservations]Slot = [_]Slot{.{}} ** max_reservations,

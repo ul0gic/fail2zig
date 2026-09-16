@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Native decoding/time qualification through actual file and SQLite adapters.
-//! The tiny counting checkpoint below is a fixture, not the native jail schema.
 const std = @import("std");
 const text = @import("core/source_text.zig");
 const time = @import("core/native_time.zig");
@@ -90,8 +88,6 @@ test "native source: UTF16 exact timestamps rollback reopen and invalid input re
     try asciiUtf16(log, "9007199254.741000 ordinary caf");
     try log.writeAll("\xe9\x00\n\x00");
     const second_end = try log.getPos();
-    // Invalid Unicode is followed by a valid record boundary. It must not be
-    // converted to replacement characters and passed to the counting fixture.
     try asciiUtf16(log, "9007199254.741001 ordinary ");
     try log.writeAll("\x00\xdc\n\x00");
     var revision: u64 = 0;
@@ -186,7 +182,6 @@ test "native source: partial code units CRLF and callback failure preserve raw b
     try log.writeAll("\x00\n");
     try std.testing.expect(!try source.poll(Sink.receive, &sink));
     try std.testing.expectEqual(@as(u64, 0), source.acknowledgedCheckpoint().?.offset);
-    // A new tail reader must not commit an offset inside a UTF-16 code unit.
     var tail = try files.FileSource.init(a, path, "tail", .tail, null);
     defer tail.deinit();
     try tail.setNativeFraming(.utf16le, [_]u8{1} ** 32, 64);

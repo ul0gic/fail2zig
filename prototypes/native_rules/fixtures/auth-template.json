@@ -1,1 +1,0 @@
-{"id":"private-text","source":"auth-log","format":"template","template":"login result={result:word} peer={client:ip} account={account:word}","subject":"client","conditions":[{"field":"result","text":"failure"}],"exclude":[{"field":"account","text":"healthcheck"}]}

@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Pure bounded duration escalation. Confirmed-history selection and durable
-//! decision snapshots belong to Store; randomness is injected exactly once.
 const std = @import("std");
 const lease = @import("native_lease.zig");
 
@@ -56,8 +54,6 @@ pub const Policy = struct {
         return result;
     }
 
-    /// `prior_confirmed=0` is the first ban and consumes no random sample.
-    /// Later calls accept a caller-sampled whole-second jitter in `[0,jitter]`.
     pub fn duration(self: Policy, base: lease.Duration, prior_confirmed: u64, sampled_jitter_us: i64) Error!lease.Duration {
         try self.validate();
         if (!self.enabled) {

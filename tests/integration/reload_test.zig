@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 
-//! Live configuration reload through IPC and SIGHUP: no-op, rejected, restart-required and
-//! applied outcomes, durable generation adoption across restart, and policy effect on decisions.
-
 const std = @import("std");
 const harness = @import("harness.zig");
 
@@ -121,6 +118,7 @@ test "reload: no-op, invalid, restart-only and live policy proposals return exac
     const noop = try client(a, &h, "reload");
     defer noop.deinit(a);
     try t.expectEqual(@as(u8, 0), noop.code);
+    try t.expect(std.mem.indexOf(u8, noop.stdout, "\"schema_version\":1") != null);
     try t.expect(std.mem.indexOf(u8, noop.stdout, "\"outcome\":\"noop\"") != null);
     try t.expect(std.mem.indexOf(u8, noop.stdout, g0) != null);
 
@@ -141,7 +139,6 @@ test "reload: no-op, invalid, restart-only and live policy proposals return exac
     defer a.free(still);
     try t.expectEqualStrings(g0, still);
 
-    // The legacy reload command id is retired with a typed error response.
     try t.expectError(error.UnexpectedResponse, h.sendCommand(.{ .reload = {} }));
 
     try writeConfig(&h, 2, 60, "");
@@ -155,7 +152,6 @@ test "reload: no-op, invalid, restart-only and live policy proposals return exac
     try waitJailsContains(a, &h, "\"maxretry\":2");
     try waitHealthy(&h);
 
-    // Two failures now ban under the live policy; the source continued from its checkpoint.
     try h.writeLine(failure);
     try h.writeLine(failure);
     try waitListContains(&h, "203.0.113.7");
@@ -182,7 +178,6 @@ test "reload: SIGHUP applies a live bantime change and the generation survives r
     defer a.free(g1);
     try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try h.stopDaemon());
 
-    // Same file bytes: the published generation is adopted, not re-minted.
     try h.startDaemon();
     try waitHealthy(&h);
     const g2 = try generation(a, &h);
@@ -191,7 +186,6 @@ test "reload: SIGHUP applies a live bantime change and the generation survives r
     try waitJailsContains(a, &h, "\"bantime\":120");
     try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try h.stopDaemon());
 
-    // Policy edits while stopped remain a refused generation mismatch at startup.
     try writeConfig(&h, 5, 120, "");
     try t.expectError(error.DaemonUnavailable, h.startDaemon());
     try writeConfig(&h, 3, 120, "");

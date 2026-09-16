@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Native owner/factory and one-request DNS scheduler. Store remains the only
-//! persistence authority. Construct this fresh runtime behind the global recovery
-//! gate; finish source/shared validation before making its generation usable.
 const std = @import("std");
 const durable = @import("core/record_store.zig");
 const state = @import("core/native_consumer.zig");
@@ -18,8 +15,6 @@ pub const Clock = struct {
     read_us: *const fn (?*anyopaque) anyerror!i64,
     read_ms: *const fn (?*anyopaque) u64,
 };
-/// Nonoverlapping Zig allocation envelopes, not measured RSS. Config/programs,
-/// SQLite/C and source-session memory are accounted by their respective owners.
 pub const AllocationPlan = struct {
     fixed_live_bytes: usize,
     per_source_live_bytes: usize,
@@ -129,8 +124,6 @@ pub const DnsRuntime = struct {
         if (self.store.api.get_autocommit(self.store.db) == 0) return error.ConsumerTransactionActive;
         try self.idleForRestore();
     }
-    // Only unpublished state construction/validation may share the startup
-    // admission transaction. Scheduling and DNS polling still require idle().
     fn idleForRestore(self: *const DnsRuntime) !void {
         if (self.failed) return error.ConsumerRuntimeFailed;
         if (self.store.api.get_autocommit(self.store.db) == 0 and !self.store.startupAdmissionActive()) return error.ConsumerTransactionActive;
@@ -182,8 +175,6 @@ pub const DnsRuntime = struct {
         try self.store.validateConsumerManifestSnapshot(manifest, &snapshot);
         self.authority_ready = true;
     }
-    /// At most sixteen durable manifests per call, with exact snapshot recheck.
-    /// Failure poisons this unpublished owner; rebuild instead of partial reset.
     pub fn restoreTurn(self: *DnsRuntime) !bool {
         try self.idleForRestore();
         if (self.restored) return true;
@@ -207,9 +198,6 @@ pub const DnsRuntime = struct {
         if (!self.restored) return error.ConsumerRuntimeNotReady;
         return self.scanDns(&self.validation, false);
     }
-    /// Root calls this after all own bootstrap writes and every validation scan,
-    /// immediately before opening its global generation gate. No write is allowed
-    /// between this check and publication into the serialized scheduler.
     pub fn finishValidation(self: *DnsRuntime, jails: []const *JailRuntime) !void {
         try self.idleForRestore();
         if (!self.validation.done or jails.len > 128) return error.ConsumerRuntimeNotReady;
@@ -286,8 +274,6 @@ pub const DnsRuntime = struct {
         }
         return scan.done;
     }
-    /// Call once per scheduler turn, after releasing every record stage. On
-    /// ready, retry exactly this source before the next advanceTurn/yield.
     pub fn pollDns(self: *DnsRuntime) !Poll {
         try self.advanceTurn();
         if (!self.restored) return error.ConsumerRuntimeNotReady;
@@ -347,7 +333,6 @@ pub const DnsRuntime = struct {
 pub const JailOptions = struct {
     settings: bridge.Settings,
     programs: []const *const rules.Program,
-    /// Borrowed immutable configured snapshot and exact current self policy.
     initial_ignore: *ignore.Snapshot,
     ignore_options: ignore.Options,
     max_sources: usize,
@@ -383,7 +368,6 @@ pub const JailRuntime = struct {
     pub fn allocationPlan(options: JailOptions) !AllocationPlan {
         return capacityPlan(options.programs.len, options.max_sources);
     }
-    /// Counts suffice for admission before rule assets are allocated.
     pub fn capacityPlan(rule_count: usize, source_capacity: usize) !AllocationPlan {
         if (source_capacity == 0 or source_capacity > bridge.max_sources or rule_count == 0 or rule_count > bridge.max_rules) return error.InvalidConsumerRuntimeLimits;
         const source_bytes = try add(@sizeOf(Source), try add(16384, try mul(rule_count, @sizeOf(rule.Consumer))));
@@ -435,8 +419,6 @@ pub const JailRuntime = struct {
         allocator.destroy(self);
     }
     pub const AllowlistRefresh = enum { unchanged, applied };
-    /// Re-read a file-backed allowlist and commit it as the next shared revision. Any read,
-    /// parse, capacity or commit failure leaves the last valid snapshot published.
     pub fn refreshAllowlist(self: *JailRuntime, path: []const u8, now_us: i64) !AllowlistRefresh {
         if (self.count == 0) return error.ConsumerRuntimeNotReady;
         const next = try ignore.Snapshot.fromFile(self.allocator, self.ignores.live.options, path);

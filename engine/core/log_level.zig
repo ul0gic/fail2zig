@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 
-//! Process-wide runtime log threshold shared by the root logFn and live reload.
-
 const std = @import("std");
 
 var runtime_level = std.atomic.Value(u8).init(@intFromEnum(std.log.Level.info));

@@ -1,37 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Read-only, provenance-recorded snapshot capture of a fail2ban 1.1.x SQLite
-//! database through the embedded SQLite online-backup API.
-//!
-//! Contract (.project/parity/migration-contract.md, "Durable state and continuity"):
-//! the source is opened `mode=ro` only, its WAL is honored (no `immutable=1`),
-//! nothing is ever executed against the source beyond read pragmas/selects,
-//! and the destination is created exclusively in a caller-owned staging
-//! directory. Every refusal is a typed error with the destination removed.
 const std = @import("std");
 const db = @import("fail2ban_db.zig");
 
 pub const Error = db.Error || error{
-    /// Source path is a symlink, not a regular file, or changed identity during capture.
     NotRegularFile,
-    /// Source main file exceeds `Limits.max_source_bytes`.
     SourceTooLarge,
-    /// Page budget or restart budget exhausted; a concurrent writer kept invalidating the copy.
     ConcurrentWriter,
     PageBudgetExceeded,
-    /// Destination row ceilings (`Limits.max_ban_rows`, `Limits.max_log_rows`) exceeded.
     RowLimitExceeded,
-    /// Staging directory refused the exclusive destination create.
     StagingUnavailable,
-    /// Staging directory is a symlink, not a directory, foreign-owned or group/other accessible.
     StagingUnsafe,
-    /// Test-injected interruption; identical cleanup to any other failure.
     InjectedFailure,
     PathTooLong,
 };
 
-/// Page budgets bound work per backup step and in total;
-/// the row ceilings bound what a later import would have to hold.
 pub const Limits = struct {
     pub const max_source_bytes: u64 = 1024 * 1024 * 1024;
     pub const max_pages_per_step: u32 = 4096;
@@ -40,13 +23,11 @@ pub const Limits = struct {
     pub const max_ban_rows: u64 = 200_000;
     pub const max_log_rows: u64 = 4096;
     pub const busy_timeout_ms: c_int = 1000;
-    /// Retries of a BUSY/LOCKED backup step before giving up (10 ms apart).
     pub const max_busy_retries: u32 = 200;
 };
 
 pub const RowCounts = db.RowCounts;
 
-/// Provenance of one captured snapshot. Slices are owned; free with `deinit`.
 pub const Snapshot = struct {
     source_path: []u8,
     source_dev: u64,
@@ -61,7 +42,6 @@ pub const Snapshot = struct {
     captured_us: i64,
     backup_steps: u32,
     pages_copied: u64,
-    /// Backup restarts forced by a concurrent writer (informational).
     restarts: u32,
 
     pub fn deinit(self: *Snapshot, allocator: std.mem.Allocator) void {
@@ -74,9 +54,6 @@ pub const Snapshot = struct {
 
 pub const IdentityHookStage = enum { before_open, after_open };
 
-/// Test injection hooks. `between_steps` runs after each backup step so a test
-/// can act as a concurrent writer; `identity_hook` brackets the source open;
-/// `fail_after_steps` aborts deterministically.
 pub const Options = struct {
     pages_per_step: u32 = Limits.max_pages_per_step,
     fail_after_steps: ?u32 = null,
@@ -94,9 +71,6 @@ const SourceIdentity = struct { dev: u64, ino: u64, size: u64, mtime_us: i64 };
 
 pub const StagingDirError = error{ NotFound, AccessDenied, SymlinkRefused, NotDirectory, ForeignOwner, PermissiveMode, StorageIo };
 
-/// A snapshot destination must be a directory owned by the effective uid with
-/// no group/other bits, reached without following a symlink: the copied
-/// database carries every banned address and the -journal files SQLite adds.
 pub fn verifyStagingDir(path: []const u8) StagingDirError!void {
     const stat = std.posix.fstatat(std.posix.AT.FDCWD, path, std.posix.AT.SYMLINK_NOFOLLOW) catch |err| return switch (err) {
         error.FileNotFound => error.NotFound,
@@ -109,16 +83,6 @@ pub fn verifyStagingDir(path: []const u8) StagingDirError!void {
     if (stat.mode & 0o077 != 0) return error.PermissiveMode;
 }
 
-/// Captures `source_path` into a new exclusively created 0600 file inside
-/// `staging_dir`, which must satisfy `verifyStagingDir` and be nonvolatile.
-/// On any error no destination file remains.
-///
-/// Source identity is checked by pathname before open, then bound to SQLite's
-/// opened file with `SQLITE_FCNTL_HAS_MOVED`, and checked again after the copy.
-///
-/// Side effect to know about: when the source header says WAL but no `-wal`
-/// file exists, SQLite creates zero-length `-wal`/`-shm` siblings beside the
-/// source to honor the mode read-only; the main file's bytes and mtime never change.
 pub fn capture(allocator: std.mem.Allocator, source_path: []const u8, staging_dir: []const u8, options: Options) Error!Snapshot {
     const pages_per_step: c_int = @intCast(@min(@max(options.pages_per_step, 1), Limits.max_pages_per_step));
 
@@ -130,7 +94,6 @@ pub fn capture(allocator: std.mem.Allocator, source_path: []const u8, staging_di
     };
     const identity = try statSource(source_path);
     if (identity.size > Limits.max_source_bytes) return error.SourceTooLarge;
-    // SQLite reports an unreadable file as CANTOPEN; distinguish permission refusal first.
     std.posix.access(source_path, std.posix.R_OK) catch |err| return switch (err) {
         error.PermissionDenied => error.AccessDenied,
         error.FileNotFound => error.OpenFailed,
@@ -151,8 +114,6 @@ pub fn capture(allocator: std.mem.Allocator, source_path: []const u8, staging_di
     defer source.close();
     if (options.identity_hook) |hook| hook.func(hook.context, .after_open);
     try source.busyTimeoutMs(Limits.busy_timeout_ms);
-    // Bind the pathname preflight to the file SQLite actually opened. HAS_MOVED
-    // catches a swap-back between open and this pathname recheck.
     const reopened = try statSource(source_path);
     if (reopened.dev != identity.dev or reopened.ino != identity.ino) return error.NotRegularFile;
     if (try sourceHasMoved(source)) return error.NotRegularFile;
@@ -180,9 +141,6 @@ pub fn capture(allocator: std.mem.Allocator, source_path: []const u8, staging_di
     var progress = try runBackup(source, destination_z, pages_per_step, options);
     progress.captured_us = captured_us;
 
-    // The copied page 1 carries the source's WAL/rollback header bytes, so a
-    // WAL source would leave the snapshot in WAL mode and later readers would
-    // create -wal/-shm siblings in staging. Normalize our own file to DELETE.
     const row_counts = try finalizeDestination(destination_z);
 
     if (row_counts.bans + row_counts.bips > Limits.max_ban_rows) return error.RowLimitExceeded;
@@ -215,12 +173,11 @@ pub fn capture(allocator: std.mem.Allocator, source_path: []const u8, staging_di
 fn sourceHasMoved(source: db.Connection) Error!bool {
     const file_control = @extern(*const fn (*db.Db, ?[*:0]const u8, c_int, ?*anyopaque) callconv(.c) c_int, .{ .name = "sqlite3_file_control" });
     var moved: c_int = 1;
-    const code = file_control(source.db, "main", 20, &moved); // SQLITE_FCNTL_HAS_MOVED
+    const code = file_control(source.db, "main", 20, &moved);
     if (code != db.rc.ok) return db.sqliteError(code);
     return moved != 0;
 }
 
-/// SHA-256 of a whole file, streamed. Also used by tests to prove source immutability.
 pub fn sha256File(path: []const u8) Error![32]u8 {
     var file = std.fs.cwd().openFile(path, .{}) catch |err| return switch (err) {
         error.AccessDenied => error.AccessDenied,
@@ -263,8 +220,6 @@ fn absolutePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return std.fs.path.resolve(allocator, &.{ cwd, path });
 }
 
-/// `file:<percent-encoded absolute path>?mode=ro`. Only the characters SQLite's
-/// URI parser treats specially are escaped, so ordinary paths stay readable.
 fn buildUri(allocator: std.mem.Allocator, absolute: []const u8) Error![:0]u8 {
     var out = std.ArrayList(u8).init(allocator);
     defer out.deinit();
@@ -295,10 +250,6 @@ fn createDestination(allocator: std.mem.Allocator, staging: std.fs.Dir, staging_
 
 const Progress = struct { steps: u32 = 0, pages: u64 = 0, restarts: u32 = 0, captured_us: i64 = 0 };
 
-/// Drives `sqlite3_backup_step` with a per-step page budget. SQLite silently
-/// restarts the copy from page 1 when another connection wrote to the source;
-/// that shows as `remaining` being higher than the previous count minus the
-/// pages this step was allowed to copy.
 fn runBackup(source: db.Connection, destination_z: [*:0]const u8, pages_per_step: c_int, options: Options) Error!Progress {
     var destination = try db.Connection.open(destination_z, db.open_flags.readwrite);
     defer destination.close();
@@ -352,8 +303,6 @@ fn runBackup(source: db.Connection, destination_z: [*:0]const u8, pages_per_step
     return progress;
 }
 
-/// Normalizes the destination journal mode, verifies integrity and schema, and
-/// counts rows. Runs on the snapshot only; the source connection is untouched.
 fn finalizeDestination(destination_z: [*:0]const u8) Error!RowCounts {
     var destination = try db.Connection.open(destination_z, db.open_flags.readwrite);
     defer destination.close();

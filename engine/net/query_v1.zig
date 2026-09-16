@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Version-1 structured read-only queries over daemon-supplied views.
-//! Pure: no storage access, no locks. The caller (IPC thread) hands in
-//! detached or mutex-held views and receives one bounded JSON payload.
 const std = @import("std");
 const shared = @import("shared");
 
@@ -16,8 +13,6 @@ pub const max_cursor_bytes: usize = 128;
 pub const Kind = enum { status, config, health, scopes, history };
 pub const PeerClass = enum { admin, monitor };
 
-/// Numeric fields stay `Value` so a quoted number ("5") is rejected rather
-/// than coerced by the std.json integer parser.
 pub const Request = struct {
     schema_version: ?std.json.Value = null,
     kind: ?[]const u8 = null,
@@ -28,7 +23,6 @@ pub const Request = struct {
 
 pub const Failure = struct { code: u16, message: []const u8 };
 
-/// `payload` is owned by the caller's allocator; failure messages are static.
 pub const Result = union(enum) {
     payload: []u8,
     failure: Failure,
@@ -41,7 +35,6 @@ pub const Result = union(enum) {
     }
 };
 
-/// Writes a complete JSON object (status or readiness) into `out`.
 pub const Callback = struct {
     ctx: ?*anyopaque,
     func: *const fn (ctx: ?*anyopaque, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) anyerror!void,
@@ -81,10 +74,8 @@ pub const ConfigView = struct {
 pub const Family = enum { v4, v6 };
 pub const LeaseKind = enum { finite, permanent };
 
-/// Kernel-facing scope of one owner, already reduced to plain values by the daemon.
 pub const ScopeFields = struct {
     family: Family,
-    /// Network byte order; IPv4 uses the first four bytes.
     address: [16]u8,
     prefix: u8,
     protocol: ?[]const u8 = null,
@@ -97,7 +88,6 @@ pub const ScopeItem = struct {
     scope: ScopeFields,
     lease: LeaseKind,
     deadline_us: ?i64,
-    /// Null when the published owner view carries no decision identity.
     decision_id: ?[32]u8,
     confirmed: bool,
 };
@@ -121,14 +111,8 @@ pub const HistoryEvent = struct {
     native_retry: bool,
 };
 
-/// Result of one bounded scan. `resume_after` is the last sequence the
-/// source examined (never below the requested `after_sequence`), so a page
-/// that scanned its budget without a match still moves the cursor forward.
 pub const HistoryRead = struct { more: bool, resume_after: u64 };
 
-/// Fills `out` with at most `limit` confirmed events whose sequence is greater
-/// than `after_sequence`, ascending, restricted to `jail` when given, scanning
-/// at most a source-defined budget. Must read a detached copy, never the live store.
 pub const HistorySource = struct {
     ctx: ?*anyopaque,
     read: *const fn (ctx: ?*anyopaque, jail: ?[]const u8, after_sequence: u64, limit: u16, out: *std.ArrayList(HistoryEvent)) anyerror!HistoryRead,
@@ -144,9 +128,6 @@ pub const Sources = struct {
 
 pub const Error = error{OutOfMemory};
 
-/// Parses `body`, dispatches on kind, and renders one bounded JSON response.
-/// Malformed input is a 400 failure; an oversized result is 413; a view the
-/// daemon has not supplied is 503. Nothing here can fail except allocation.
 pub fn handle(allocator: std.mem.Allocator, body: []const u8, peer_class: PeerClass, generation: [32]u8, sources: Sources) Error!Result {
     if (body.len > shared.protocol.max_request_body) return fail(400, "request body exceeds 16 KiB");
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -197,13 +178,11 @@ pub fn handle(allocator: std.mem.Allocator, body: []const u8, peer_class: PeerCl
     return .{ .payload = try out.toOwnedSlice() };
 }
 
-/// Opaque page cursor: base64url of `s:<jail>:<item>` or `h:<sequence>`.
 pub const Cursor = union(enum) {
     scopes: struct { jail: u32, item: u32 },
     history: struct { after_sequence: u64 },
 
     pub fn encode(self: Cursor, buffer: *[max_cursor_bytes]u8) []const u8 {
-        // Longest text is "s:4294967295:4294967295" (23 bytes), so 64 never overflows.
         var raw: [64]u8 = undefined;
         const text = switch (self) {
             .scopes => |s| std.fmt.bufPrint(&raw, "s:{d}:{d}", .{ s.jail, s.item }) catch return "",
@@ -243,8 +222,6 @@ fn fail(code: u16, message: []const u8) Result {
 
 const RenderError = error{ OutOfMemory, ResponseTooLarge, SourceUnavailable, UnknownJail, BadCursor, SourceFailed };
 
-/// ArrayList writer that refuses growth past `max_response_bytes` instead of
-/// allocating an unbounded response for a small request.
 const BoundedSink = struct {
     list: *std.ArrayList(u8),
     const WriteError = error{ OutOfMemory, ResponseTooLarge };
@@ -274,8 +251,6 @@ fn runCallback(arena: std.mem.Allocator, callback: Callback) RenderError!std.jso
     return value;
 }
 
-/// Re-emits a daemon-produced object with the envelope fields forced, so a
-/// pass-through source can neither omit nor override them.
 fn renderPassthrough(arena: std.mem.Allocator, writer: anytype, callback: ?Callback, generation_hex: []const u8) RenderError!void {
     const source = callback orelse return error.SourceUnavailable;
     var value = try runCallback(arena, source);
@@ -364,7 +339,6 @@ fn optionalString(out: anytype, name: []const u8, value: ?[]const u8) !void {
     if (value) |text| try out.write(text) else try out.write(null);
 }
 
-/// A redacted list keeps its array type so renderers stay schema-stable.
 fn stringList(out: anytype, name: []const u8, values: []const []const u8, redact: bool) !void {
     try out.objectField(name);
     try out.beginArray();
@@ -414,7 +388,6 @@ fn renderScopes(writer: anytype, view: ?ScopesView, jail_filter: ?[]const u8, cu
         }
     }
     out.endArray() catch |err| return mapWrite(err);
-    // Skip trailing empty jails so an exhausted page reports null, not a dead cursor.
     while (jail_index < last_jail and item_index >= scopes.jails[jail_index].items.len) {
         jail_index += 1;
         item_index = 0;
@@ -489,9 +462,7 @@ fn renderHistory(arena: std.mem.Allocator, writer: anytype, source: ?HistorySour
         error.OutOfMemory => error.OutOfMemory,
         else => error.SourceFailed,
     };
-    // A cursor that does not advance would let a client loop forever on one page.
     if (scanned.more and scanned.resume_after <= after_sequence) return error.SourceFailed;
-    // The source is trusted but bounded anyway: never emit more than asked.
     const items = events.items[0..@min(events.items.len, limit)];
 
     var out = std.json.writeStream(writer, .{});

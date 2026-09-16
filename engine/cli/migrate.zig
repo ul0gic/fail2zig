@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 
-//! `fail2zig migrate <inspect|snapshot|plan|validate|cutover|status>`. The preparation entry
-//! points are read-only: they refuse unknown flags, never touch the source service, storage or
-//! firewall, and map outcomes onto the native exit classes (0 success, 1 rejected, 2 usage/invalid
-//! input). `cutover` and `status` delegate to the journaled executor in `migrate_cutover.zig`.
-
 const std = @import("std");
 const shared = @import("shared");
 const inspect = @import("../migration/inspect.zig");

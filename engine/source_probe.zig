@@ -18,8 +18,6 @@ pub fn main() !void {
         while (try source.poll(onFile, null)) {}
         return;
     }
-    // The old dynamic journal reader is retired. Actual journal observations
-    // belong to the native journalctl transport and its qualified fixtures.
     return error.JournalReaderRetired;
 }
 

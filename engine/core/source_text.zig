@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Strict, allocation-free decoding into caller-owned bounded scratch. Invalid
-//! input is reported, never repaired into text that might match a security rule.
-//! The ingestion owner decides disposition/acknowledgment; no state lives here.
 const std = @import("std");
 
 pub const max_record_bytes = 1024 * 1024;
@@ -43,9 +40,6 @@ fn unit(encoding: Encoding, bytes: []const u8) u32 {
     };
 }
 
-/// Null leaves the entire unterminated record unacknowledged. Newline detection
-/// is code-unit aligned; a byte inside another character is never a separator.
-/// At most one CR immediately before LF is a terminator, preserving other data.
 pub fn frame(encoding: Encoding, bytes: []const u8, absolute_offset: u64) Error!?Frame {
     if (bytes.len > max_record_bytes) return error.RecordTooLarge;
     const width = encoding.width();
@@ -61,8 +55,6 @@ pub fn frame(encoding: Encoding, bytes: []const u8, absolute_offset: u64) Error!
 }
 
 fn bomLength(encoding: Encoding, input: []const u8) Error!usize {
-    // The configured encoding wins ambiguous signatures: UTF-16LE BOM followed
-    // by U+0000 is valid UTF-16LE, even though it resembles a UTF-32LE BOM.
     const Signature = struct { encoding: Encoding, bytes: []const u8 };
     const signatures = [_]Signature{
         .{ .encoding = .utf32le, .bytes = "\xff\xfe\x00\x00" },
@@ -83,9 +75,6 @@ fn bomLength(encoding: Encoding, input: []const u8) Error!usize {
     return 0;
 }
 
-/// Scratch contents on error are unspecified; callers must only publish the
-/// returned slice on success. Both input work and output length have hard caps.
-/// BOM handling is explicitly requested and only applies at raw stream offset 0.
 pub fn decode(encoding: Encoding, input: []const u8, scratch: []u8, absolute_offset: u64, bom: Bom) Error![]const u8 {
     if (input.len > max_record_bytes) return error.RecordTooLarge;
     if (absolute_offset % encoding.width() != 0) return error.MisalignedOffset;

@@ -226,7 +226,6 @@ pub const LogWatcher = struct {
 
         if (fw.file_fd >= 0) {
             blk: {
-                // lseek failure must detach, not be swallowed: reading from an unknown cursor is worse than no watch.
                 posix.lseek_END(fw.file_fd, 0) catch |err| {
                     std.log.warn(
                         "log_watcher: lseek_END failed on {s}: {s}; detaching file watch",

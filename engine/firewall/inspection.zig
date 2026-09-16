@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 
-//! Native inspection and installation admission. No entry point calls legacy init.
-//! The coordinator owns installation persistence, namespace selection and the
-//! operation lock; observations alone never authorize a foreign-state mutation.
 const std = @import("std");
 const shared = @import("shared");
 const nl = @import("netlink.zig");
@@ -17,8 +14,6 @@ pub const canonical_scope = @import("scope.zig");
 pub const CanonicalScope = canonical_scope.Scope;
 pub const Error = error{ UnknownState, ForeignState, Incomplete, Changed, LimitExceeded, UnsupportedScope, ExpiredIntent, UnsupportedDeadline, InvalidInstallation, ToolUnavailable, PermissionDenied, Timeout, OutOfMemory, SystemError };
 
-/// N3 retains one logical capability surface on every selected transport.
-/// This pure projection gate must run before durable intent or transport work.
 pub fn validateCanonicalScope(_: Transport, scope: CanonicalScope) Error!void {
     scope.validate() catch return error.UnsupportedScope;
 }
@@ -57,8 +52,6 @@ pub const Installation = struct {
     }
 };
 
-/// Byte-stable legacy projection boundary. Networks/scoped policy cannot enter
-/// this compatibility type, so a host-wide rule is never substituted for them.
 pub const Scope = struct {
     address: shared.IpAddress,
     prefix: u8,
@@ -74,8 +67,6 @@ pub const Scope = struct {
     }
 };
 
-/// Compatibility projection for accepted N2 24-byte scopes. Durable v1 decode
-/// remains lead-owned; it maps only to the exact N3 host/all/all INPUT DROP value.
 pub fn canonicalizeLegacyScope(scope: Scope) Error!CanonicalScope {
     try scope.validate();
     const result = CanonicalScope{ .subject = canonical_scope.Subject.host(scope.address) };
@@ -96,7 +87,6 @@ pub const Limits = struct {
 };
 pub const Entry = struct {
     address: shared.IpAddress,
-    /// Null denotes the retained v1 host/all/all set representation.
     scope: ?CanonicalScope = null,
     remaining_ms: ?u64 = null,
     deadline_us: ?i64 = null,
@@ -179,17 +169,12 @@ pub const Snapshot = struct {
         self.allocator.free(self.entries);
         self.* = undefined;
     }
-    /// Detached pages never claim a separate complete inspection. The caller
-    /// must retain this completed snapshot while borrowing a page.
     pub fn page(self: *const Snapshot, offset: usize) Error![]const Entry {
         if (offset > self.entries.len) return error.Incomplete;
         return self.entries[offset..@min(self.entries.len, offset + @min(@as(usize, 64), self.entries.len - offset))];
     }
 };
 
-/// The coordinator constructs this token only after committing installation
-/// identity/intent and binding its current namespace. Validation is structural;
-/// this transport is intentionally not a second durability authority.
 pub const DurableInstallationIntent = struct {
     installation: Installation,
     intent_id: [32]u8,
@@ -215,8 +200,6 @@ pub const AdmissionResult = union(enum) {
 pub const Lease = union(enum) { permanent, finite_deadline_us: i64 };
 pub const EffectOperation = union(enum) { ensure_present: Lease, ensure_absent };
 pub const ClockSample = struct { wall_us: i64 };
-/// Caller guarantees committed intent and holds aggregate revision/namespace
-/// serialization through this entire call. effect_id is the durable scope key.
 pub const DispatchToken = struct {
     installation: Installation,
     effect_id: [32]u8,
@@ -250,7 +233,6 @@ pub const Inspector = struct {
     allocator: mem.Allocator,
     installation: Installation,
     limits: Limits,
-    // Fixed OS paths prevent PATH changes from changing the selected program.
     iptables_path: []const u8 = "/usr/sbin/iptables",
     ip6tables_path: []const u8 = "/usr/sbin/ip6tables",
     ipset_path: []const u8 = "/usr/sbin/ipset",
@@ -268,9 +250,6 @@ pub const Inspector = struct {
     }
     pub fn close(_: *Inspector) void {}
 
-    /// Caller holds its durable installation/generation operation boundary.
-    /// Preinspection, creation and confirmation are separately bounded phases
-    /// (at most 3 * limits.timeout_ms). Partial state is never adopted by name.
     pub fn admitInstallation(self: *Inspector, intent: DurableInstallationIntent) Error!AdmissionResult {
         try intent.validate(self.installation);
         var before = try self.inspect();
@@ -289,16 +268,11 @@ pub const Inspector = struct {
         return .{ .installed = .{ .snapshot = after, .created = true } };
     }
 
-    /// No persisted identity: inspect every retained transport before issuing
-    /// fresh authority. Provisional prerequisite is all three installed tools;
-    /// a missing tool is unknown, never evidence of an absent kernel subsystem.
-    /// Coordinator serializes this scan through installation intent publication.
     pub fn inspectReservedNamespace(self: *Inspector) Error!void {
         self.work_messages = 0;
         self.retained_bytes = 0;
         self.live_bytes = 0;
         var timer = std.time.Timer.start() catch return error.SystemError;
-        // Two complete inventories detect reserved objects in either read.
         for (0..2) |_| {
             var sock = nl.NetlinkSocket.init(linux.NETLINK.NETFILTER) catch |err| return netlinkError(err);
             defer sock.close();
@@ -317,9 +291,6 @@ pub const Inspector = struct {
                     if (kind[0] != nft.NFT_MSG.GETTABLE and reservedName(try attributes.text(1))) return error.ForeignState;
                 }
             }
-            // Native dumps above cover nftables and the nft xtables variant.
-            // Fixed backends additionally inspect the legacy xtables stack;
-            // an explicitly selected backend never requires an unrelated tool.
             if (self.installation.transport != .nftables) {
                 for ([_][]const u8{ self.iptables_legacy_save_path, self.ip6tables_legacy_save_path }) |binary| {
                     const result = try self.run(&.{binary}, &timer);
@@ -343,8 +314,6 @@ pub const Inspector = struct {
         try self.checkTime(&timer);
     }
 
-    /// Read-only reconciliation boundary; expired finite intent remains a
-    /// valid observation request and yields matches_desired=false.
     pub fn observeExact(self: *Inspector, token: DispatchToken, clock: ClockSample) Error!ExactObservation {
         try (DurableInstallationIntent{ .installation = token.installation, .intent_id = token.effect_id, .revision = token.aggregate_revision }).validate(self.installation);
         try validateRealizedScope(self.installation.transport, token.scope);
@@ -357,9 +326,6 @@ pub const Inspector = struct {
         return .{ .snapshot = snapshot, .matches_desired = effectMatches(token.operation, self.installation.transport, try findEntry(snapshot.entries, token.scope, token.effect_id), clock.wall_us, end), .observed_wall_us = end };
     }
 
-    /// Classify a complete owned snapshot without I/O. Caller supplies the wall
-    /// interval enclosing that exact inspect() call, never a later cached time.
-    /// This shares the transport's admitted finite-timer tolerance with recovery.
     pub fn matchesSnapshot(self: *const Inspector, snapshot: *const Snapshot, token: DispatchToken, wall_start_us: i64, wall_end_us: i64) Error!bool {
         try (DurableInstallationIntent{ .installation = token.installation, .intent_id = token.effect_id, .revision = token.aggregate_revision }).validate(self.installation);
         try validateRealizedScope(self.installation.transport, token.scope);
@@ -373,8 +339,6 @@ pub const Inspector = struct {
         return effectMatches(token.operation, self.installation.transport, try findEntry(snapshot.entries, token.scope, token.effect_id), wall_start_us, wall_end_us);
     }
 
-    /// Positive deadlines are checked before any I/O and again immediately
-    /// before dispatch. Monotonic elapsed time consumes the original lease.
     pub fn applyExact(self: *Inspector, token: DispatchToken, clock: ClockSample) Error!EffectResult {
         try (DurableInstallationIntent{ .installation = token.installation, .intent_id = token.effect_id, .revision = token.aggregate_revision }).validate(self.installation);
         try validateRealizedScope(self.installation.transport, token.scope);
@@ -387,9 +351,6 @@ pub const Inspector = struct {
         }
         const existing = try findEntry(before.entries, token.scope, token.effect_id);
         const other_hash = otherEntriesHash(before.entries, token.scope);
-        // Direct scoped rules store the exact absolute deadline, so an equal
-        // finite intent is idempotent. Timed legacy sets refresh from that
-        // original deadline because their readback exposes only remaining time.
         const noop = switch (token.operation) {
             .ensure_absent => existing == null,
             .ensure_present => |lease| if (existing) |entry| if (entry.scope != null)
@@ -624,8 +585,6 @@ pub const Inspector = struct {
         }
         var mutations: usize = 0;
         for ([_][]const u8{ self.iptables_path, self.ip6tables_path }, 0..) |binary, index| {
-            // No -exist/-E/flush: every creation is exclusive, and a partial
-            // unmarked object after interruption needs visible intervention.
             try self.mutateCommand(&.{ binary, "-w", "1", "-N", name }, timer, &mutations);
             try self.mutateCommand(&.{ binary, "-w", "1", "-A", name, "-m", "comment", "--comment", marker, "-j", "RETURN" }, timer, &mutations);
             if (self.installation.transport == .ipset) {
@@ -665,8 +624,6 @@ pub const Inspector = struct {
         nl.receiveAcknowledgments(&sock, related[1..7], &related, @min(try self.remainingMs(timer), 2000)) catch |err| return netlinkError(err);
     }
 
-    /// Two complete semantic reads detect observable drift. External privileged
-    /// writers must not manage these owned objects; no OS-tool atomicity claim.
     pub fn inspect(self: *Inspector) Error!Snapshot {
         self.work_messages = 0;
         self.retained_bytes = 0;
@@ -780,7 +737,6 @@ fn deadlineUnits(operation: EffectOperation, transport: Transport, now_us: i64) 
     const delta: u64 = @intCast(deadline - now_us);
     const quantum: u64 = if (transport == .ipset) 1_000_000 else 1000;
     const units = delta / quantum + @intFromBool(delta % quantum != 0);
-    // Linux ip_set.h IPSET_MAX_TIMEOUT; never allow kernel silent clamping.
     if (transport == .ipset and units > 2_147_483) return error.UnsupportedDeadline;
     return units;
 }
@@ -829,8 +785,6 @@ fn effectMatches(operation: EffectOperation, transport: Transport, entry: ?Entry
     const remaining = present.remaining_ms orelse return false;
     const deadline = operation.ensure_present.finite_deadline_us;
     if (deadline <= end_us) return false;
-    // nft kernel expiration uses jiffies; 10ms is the admitted N2
-    // observation bound, qualified on HZ=250 here, not inferred from CLK_TCK.
     const tolerance: u64 = if (transport == .ipset) 1_000_000 else 10_000;
     const upper: u64 = @intCast(deadline - start_us);
     const lower: u64 = @intCast(deadline - end_us);
@@ -860,7 +814,6 @@ const Builder = struct {
         const capacity_limit = @min(self.limits.max_entries, (self.limits.max_bytes - self.transient_bytes) / (2 * @sizeOf(Entry)));
         if (self.entries.items.len >= capacity_limit) return error.LimitExceeded;
         if (self.entries.items.len == self.entries.capacity) {
-            // Reserve old+new buffers even when allocator resize cannot grow in place.
             const capacity = @min(capacity_limit, self.entries.capacity + self.entries.capacity / 2 + 8);
             try self.entries.ensureTotalCapacityPrecise(capacity);
         }
@@ -888,8 +841,6 @@ fn entryLess(_: void, a: Entry, b: Entry) bool {
     return mem.order(u8, &left, &right) == .lt;
 }
 
-/// Bounded shell-like *data* tokenizer for canonical OS-tool output. No escapes,
-/// substitutions or evaluation are supported; unknown syntax refuses inspection.
 const Tokens = struct {
     values: [32][]const u8 = undefined,
     count: usize = 0,
@@ -1023,7 +974,6 @@ fn fixedScopedMetadata(tokens: Tokens, chain: []const u8, v6: bool) Error!?Scope
     var port_buf: [16]u8 = undefined;
     var comment_buf: [scoped_comment_bytes]u8 = undefined;
     const expected = try buildFixedScopedArgv(&argv, &subject_buf, &port_buf, &comment_buf, if (v6) "/usr/sbin/ip6tables" else "/usr/sbin/iptables", chain, metadata, .delete);
-    // Drop binary,-w,1,-D from the deletion argv; `-S` always emits -A.
     if (tokens.count != expected.len - 3 or !mem.eql(u8, tokens.values[0], "-A") or !mem.eql(u8, tokens.values[1], chain)) return error.ForeignState;
     for (tokens.values[2..tokens.count], expected[5..]) |actual, wanted| if (!mem.eql(u8, actual, wanted)) return error.ForeignState;
     return metadata;
@@ -1064,8 +1014,6 @@ fn finishFixedScopedGroups(builder: *Builder, groups: []const FixedScopedGroup) 
     }
 }
 
-/// -S is a complete filter-table read: check all references to our chain, its
-/// final owner marker, and every owned rule. Other chains remain foreign data.
 fn parseIptables(builder: *Builder, output: []const u8, v6: bool) Error!bool {
     if (output.len == 0 or output[output.len - 1] != '\n') return error.Incomplete;
     var name_buf: [28]u8 = undefined;
@@ -1124,7 +1072,6 @@ fn parseIptables(builder: *Builder, output: []const u8, v6: bool) Error!bool {
                 if (!t.is(&.{ "-A", name, "-m", "set", "--match-set", set, "src", "-j", "DROP" })) return error.ForeignState;
                 if (lookup) return error.ForeignState;
                 lookup = true;
-                // Exactly one set lookup plus the final marker is admitted.
                 builder.topology.update(line);
             }
         } else {
@@ -1319,7 +1266,6 @@ fn dump(self: *Inspector, sock: *nl.NetlinkSocket, request_type: u16, response_t
         while (messages.next() catch |err| return netlinkError(err)) |item| {
             try self.chargeMessages(1);
             if (state.accept(item) catch |err| return netlinkError(err)) |payload| {
-                // Account record payload, vector capacity growth and detached entries.
                 const cost = std.math.add(usize, payload.len, 2 * @sizeOf([]u8)) catch return error.LimitExceeded;
                 const used = std.math.add(usize, records.bytes, reserved + self.retained_bytes) catch return error.LimitExceeded;
                 if (used > self.limits.max_bytes or cost > self.limits.max_bytes - used) return error.LimitExceeded;
@@ -1352,15 +1298,11 @@ fn equalAttributes(a: []const u8, b: []const u8, depth: usize, optional_zero_att
         const av = actual[bv.kind] orelse return false;
         actual[bv.kind] = null;
         count -= 1;
-        // nf_tables kernel dumps omit NLA_F_NESTED on legacy attributes.
-        // The known expression grammar determines nesting, never arbitrary bytes.
         if ((bv.flags & 0x8000) != 0) {
             if ((av.flags & 0x4000) != 0 or !try equalAttributes(av.value, bv.value, depth + 1, null)) return false;
         } else if (av.flags != bv.flags or !mem.eql(u8, av.value, bv.value)) return false;
     }
     if (count == 0) return true;
-    // Kernel dumps materialize selected zero defaults omitted by add messages:
-    // NFTA_LOOKUP_FLAGS (5) and NFTA_BITWISE_OP (6, boolean operation).
     if (optional_zero_attr) |kind| {
         if (count == 1) {
             const value = actual[kind] orelse return false;
@@ -1402,7 +1344,7 @@ fn readNft(self: *Inspector, builder: *Builder, timer: *std.time.Timer) Error!vo
             if (found) return error.UnknownState;
             found = true;
             if (!mem.eql(u8, try attrs.get(6), marker) or try attrs.number(u32, 2) != 0) return error.ForeignState;
-            builder.topology.update(try attrs.get(4)); // immutable table handle
+            builder.topology.update(try attrs.get(4));
         }
     }
     if (!found) return;
@@ -1439,7 +1381,6 @@ fn readNft(self: *Inspector, builder: *Builder, timer: *std.time.Timer) Error!vo
             if (try a.number(u32, 3) != nft.NFT_SET_TIMEOUT or try a.number(u32, 4) != (if (index == 0) @as(u32, 7) else 8) or
                 try a.number(u32, 5) != (if (index == 0) @as(u32, 4) else 16)) return error.ForeignState;
             if (a.values[11] != null and try a.number(u64, 11) != 0) return error.ForeignState;
-            // Kernel set handles are stable; descriptors are bounded metadata.
             if (a.values[16]) |handle| {
                 if (handle.len != 8) return error.UnknownState;
                 builder.topology.update(handle);

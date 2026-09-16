@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Closed native time outcome stored as typed SQLite columns, never float bits.
 const time = @import("native_time.zig");
 const policy = @import("source_time_policy.zig");
 const std = @import("std");

@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Original private filesystem admission and recovery controls; no services.
 const std = @import("std");
 const files = @import("core/durable_file_source.zig");
 const records = @import("core/source_record.zig");

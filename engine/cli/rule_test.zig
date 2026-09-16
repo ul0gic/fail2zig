@@ -1,12 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! `fail2zig rule-test`: offline evaluation of one input against one builtin service or
-//! native rule file using the daemon's own decoder, time admission and detectors. It
-//! never opens the state store, the firewall or the daemon socket. Time admission is
-//! reported per line but an obsolete event still exercises the rule, because operators
-//! test historical logs; a rejected timestamp is a `reject` sample exactly as ingestion
-//! would exclude it. Samples carry identity and reason only; raw lines appear solely
-//! with `--print-lines`.
 
 const std = @import("std");
 const shared = @import("shared");
@@ -66,7 +59,6 @@ pub const Options = struct {
     limit: u32 = default_limit,
     output: Output = .json,
     print_lines: bool = false,
-    /// Receipt and processing clock; wall clock when null.
     now_us: ?i64 = null,
     window_us: i64 = default_window_us,
     journal_executable: []const u8 = "/usr/bin/journalctl",
@@ -100,7 +92,6 @@ pub const Report = struct {
     rule_name: []const u8,
     counts: Counts = .{},
     samples: std.ArrayListUnmanaged(Sample) = .{},
-    /// Samples beyond `--limit` are counted but not retained.
     samples_omitted: u64 = 0,
 
     pub fn deinit(self: *Report) void {
@@ -196,7 +187,6 @@ fn describe(err: anyerror) []const u8 {
     };
 }
 
-/// `ignore_buf` outlives the returned options; `--ignore` values are stored there.
 pub fn parseArgs(args: []const []const u8, ignore_buf: *[max_ignore_flags][]const u8, stderr: anytype) ?Options {
     var input: ?Input = null;
     var rule: ?Rule = null;
@@ -334,7 +324,6 @@ fn bad(stderr: anytype, flag: []const u8, value: []const u8) ?Options {
     return null;
 }
 
-/// Field selection mirrors the daemon's native file projection for each format.
 const TimeField = struct {
     format: time.Format,
     start: u32 = 0,
@@ -578,10 +567,6 @@ fn resolveFromConfig(arena: std.mem.Allocator, path: []const u8, options: Option
     if (out.ignore.len == 0) out.ignore = jail.ignoreip orelse cfg.defaults.ignoreip;
 }
 
-// ---------------------------------------------------------------------------
-// Input drivers
-// ---------------------------------------------------------------------------
-
 const read_chunk: usize = 256 * 1024;
 
 fn processFileImpl(self: *Session, path: []const u8) Error!void {
@@ -633,8 +618,6 @@ fn processFileImpl(self: *Session, path: []const u8) Error!void {
             break;
         }
         if (len < buf.len and !eof) continue;
-        // No newline inside the bound: count one rejected line, then discard through the
-        // next newline so the following line is still evaluated.
         if (!skipping) {
             if (line_no == self.options.max_lines) break;
             line_no += 1;
@@ -694,10 +677,6 @@ fn processJournalImpl(self: *Session, matches: []const []const u8) Error!void {
     }
     self.report.lines_read = line_no;
 }
-
-// ---------------------------------------------------------------------------
-// Per-line evaluation
-// ---------------------------------------------------------------------------
 
 const ParsedTime = struct { input: policy.Input, inferred_year: ?u16 = null };
 
@@ -861,10 +840,6 @@ fn recordImpl(
     try self.report.samples.append(arena, sample);
 }
 
-// ---------------------------------------------------------------------------
-// DNS identity (opt-in only)
-// ---------------------------------------------------------------------------
-
 const Resolver = struct {
     client: dns.Client,
 
@@ -884,7 +859,6 @@ const Resolver = struct {
         self.client.deinit();
     }
 
-    /// Bounded, synchronous: one request, at most `dns_timeout_ms` of polling.
     fn resolve(self: *Resolver, name: rules.Hostname) Resolution {
         const start_ms = monotonicMs();
         self.client.begin(.{ .name = name, .family = .both, .generation = self.client.generation }, start_ms) catch |err| {
@@ -910,10 +884,6 @@ fn monotonicMs() u64 {
     const ts = posix.clock_gettime(.MONOTONIC) catch return 0;
     return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
 }
-
-// ---------------------------------------------------------------------------
-// Output
-// ---------------------------------------------------------------------------
 
 pub const schema_version: u32 = 1;
 

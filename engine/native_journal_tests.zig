@@ -47,7 +47,6 @@ test "clock recovery: empty journal baseline survives backward clock and automat
             self.session = try sessions.Session.create(t.allocator, self.store, self.options);
         }
         fn ownership(context: ?*anyopaque) !void {
-            // This fixture owns no rules. No kernel reconciliation is claimed.
             try t.expectEqual(@as(i64, 0), try cast(context).store.pendingIntents());
         }
         fn sources(context: ?*anyopaque) !void {
@@ -76,7 +75,7 @@ test "clock recovery: empty journal baseline survives backward clock and automat
         var driver = recovery.Driver{ .store = &store, .gate = &gate, .clock = .{ .generation = [_]u8{0} ** 32, .clock = Clock.read, .clock_context = &clock }, .hooks = .{ .context = &owner, .storage = Owner.storage, .state = Owner.state, .ownership = Owner.ownership, .sources = Owner.sources } };
         try t.expectEqual(recovery.Status.resumed, try driver.poll());
         try t.expectEqual(@as(usize, 0), try owner.session.?.poll(1));
-        try t.expect((try store.receiptClock()) == null); // no data receipt yet
+        try t.expect((try store.receiptClock()) == null);
         clock.now = 1;
         const queries = mock.calls;
         if (recreate) {
@@ -88,7 +87,7 @@ test "clock recovery: empty journal baseline survives backward clock and automat
             try t.expectError(error.ReceiptClockReversed, owner.session.?.poll(1));
             try t.expectEqual(records.Health.clock_failed, owner.session.?.source_health);
         }
-        try t.expectEqual(queries, mock.calls); // no query beyond a future baseline
+        try t.expectEqual(queries, mock.calls);
         try t.expectEqual(@as(?i64, 1_000_000_010), gate.snapshot().receipt_clock_floor_us);
         mono.ms = 1000;
         try t.expectEqual(recovery.Status.waiting, try driver.poll());
@@ -310,8 +309,6 @@ const Fixture = struct {
             else => return err,
         };
         errdefer a.free(executable);
-        // Qualification requires the OS tool. A missing tool is a failure here,
-        // never a skipped runtime path represented as a passing integration.
         try std.fs.cwd().access(executable, .{});
         var temp = t.tmpDir(.{});
         errdefer temp.cleanup();
@@ -354,7 +351,7 @@ test "native journal: real journalctl compressed fixtures batch oldest records a
             try store.enableNativeTime();
             const session = try sessions.Session.create(a, &store, options);
             defer session.destroy();
-            try t.expectEqual(@as(usize, 0), try session.poll(1)); // durable empty baseline
+            try t.expectEqual(@as(usize, 0), try session.poll(1));
             const original = try std.fmt.allocPrint(a, "fixtures/{s}.journal", .{codec});
             defer a.free(original);
             const destination = try std.fmt.allocPrint(a, "{s}/ordinary.journal", .{selected_name});
@@ -373,7 +370,7 @@ test "native journal: real journalctl compressed fixtures batch oldest records a
         try store.enableReceipts(1);
         const session = try sessions.Session.create(a, &store, options);
         defer session.destroy();
-        try t.expectEqual(@as(usize, 1), try store.pendingReceiptCount()); // validation is not acknowledgment
+        try t.expectEqual(@as(usize, 1), try store.pendingReceiptCount());
         try t.expectEqual(@as(usize, 1), try session.poll(1));
         const second = (try store.nativeTime("ordinary", "system-journal", null)).?.eligible;
         try t.expectEqual(@as(i64, 1_750_000_000_000_002), second.original.?.us);
@@ -409,8 +406,6 @@ test "native journal: real journalctl tail baseline and changed selected view ne
     var changed = options;
     changed.journal.matches = &.{"F2Z_KIND=allow"};
     try t.expectError(error.SourceGenerationMismatch, sessions.Session.create(a, &store, changed));
-    // Qualify the transport assumption directly: changed view can exit 0 and
-    // return no anchor. Session must not treat that as a successful cursor seek.
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const buffer = try a.alloc(u8, 256 * 1024);
@@ -504,7 +499,7 @@ test "native journal: shared storage failure blocks every session before another
     mock.response = row1 ++ row2;
     store.fail_at = .before_receipt_commit;
     try t.expectError(error.InjectedFailure, first.poll(1));
-    try t.expectEqual(health.Phase.intervention, gate.snapshot().phase); // synthetic faults require intervention
+    try t.expectEqual(health.Phase.intervention, gate.snapshot().phase);
     const calls = mock.calls;
     try t.expectError(error.StoragePaused, second.poll(1));
     try t.expectEqual(calls, mock.calls);

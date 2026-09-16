@@ -1,22 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! fail2ban 1.1.x `fail2ban.sqlite3` schema-4 validation and typed row readers.
-//! The reader only opens snapshot copies produced by `sqlite_snapshot.zig`; the
-//! original source database is never opened writable anywhere in this module.
-//!
-//! Schema reference (read-only, GPL-2.0 upstream; the DDL is restated here as
-//! a structural expectation, not copied into product output):
-//! `fail2ban-1.1.1/fail2ban/server/database.py:114-160` (`Fail2BanDb.__version__`
-//! and `_CREATE_SCRIPTS`).
+//! Schema reference: GPL-2.0 upstream `fail2ban-1.1.1/fail2ban/server/database.py:114-160`.
+//! The DDL is restated as a structural expectation and is not copied into product output.
 const std = @import("std");
 
 pub const Db = opaque {};
 pub const Statement = opaque {};
 pub const Backup = opaque {};
-const Destructor = ?*const fn (?*anyopaque) callconv(.c) void;
+// SQLite accepts the unaligned SQLITE_TRANSIENT (-1) sentinel as well as callbacks.
+const Destructor = ?*align(1) const fn (?*anyopaque) callconv(.c) void;
 
-/// Raw embedded SQLite entry points. Callers outside this directory use the
-/// safe wrappers below; the fixture builder also needs them for DDL/writes.
 pub const Api = struct {
     open_v2: *const fn ([*:0]const u8, *?*Db, c_int, ?[*:0]const u8) callconv(.c) c_int,
     close_v2: *const fn (*Db) callconv(.c) c_int,
@@ -85,17 +78,13 @@ pub const Error = error{
     Interrupted,
     DatabaseFailure,
     IntegrityCheckFailed,
-    /// Required table missing or its columns differ from the schema-4 reference.
     UnsupportedSchema,
-    /// `fail2banDb.version` is not exactly one row equal to 4.
     UnsupportedVersion,
-    /// A row violates the typed contract (wrong SQLite type, oversized text).
     InvalidRow,
     OutOfMemory,
 };
 
 pub fn sqliteError(code: c_int) Error {
-    // Extended result codes keep the primary code in the low eight bits.
     return switch (code & 0xff) {
         3, 23 => error.AccessDenied,
         5, 6 => error.Busy,
@@ -117,13 +106,9 @@ pub const max_path_bytes = 4096;
 pub const max_md5_bytes = 64;
 pub const max_data_bytes = 64 * 1024;
 
-/// Safe wrapper around one `sqlite3*` handle. Statement text is always a
-/// compile-time literal in this module; no external text reaches `prepare`.
 pub const Connection = struct {
     db: *Db,
 
-    /// `sqlite3_open_v2` with the exact caller flags. `sqlite3_close_v2` runs on
-    /// every failure so a partially opened handle never leaks.
     pub fn open(path_z: [*:0]const u8, flags: c_int) Error!Connection {
         var handle: ?*Db = null;
         const code = api.open_v2(path_z, &handle, flags | open_flags.exrescode, null);
@@ -145,8 +130,6 @@ pub const Connection = struct {
         if (code != rc.ok) return sqliteError(code);
     }
 
-    /// Keeps an on-disk WAL with pending frames when the last handle closes.
-    /// Fixture-only: the product never suppresses checkpoints on its own state.
     pub fn disableCheckpointOnClose(self: Connection) Error!void {
         var previous: c_int = 0;
         const code = api.db_config(self.db, dbconfig_no_ckpt_on_close, @as(c_int, 1), &previous);
@@ -167,7 +150,6 @@ pub const Connection = struct {
         return .{ .stmt = handle orelse return error.DatabaseFailure };
     }
 
-    /// Single integer scalar query; zero rows is `null`.
     pub fn scalarInt(self: Connection, sql: [*:0]const u8) Error!?i64 {
         var stmt = try self.prepare(sql);
         defer stmt.finalize();
@@ -176,9 +158,6 @@ pub const Connection = struct {
         return stmt.columnInt64(0);
     }
 
-    /// Runs `PRAGMA integrity_check` and demands the single literal `ok` row.
-    /// Any other output (including multiple rows) is reported as a typed error;
-    /// the text itself is not surfaced because it may echo file content.
     pub fn integrityCheck(self: Connection) Error!void {
         var stmt = try self.prepare("PRAGMA integrity_check");
         defer stmt.finalize();
@@ -193,8 +172,6 @@ pub const Connection = struct {
         if (rows != 1 or !ok) return error.IntegrityCheckFailed;
     }
 
-    /// Current journal mode as reported by SQLite (a read: no argument is
-    /// supplied, so the mode is never changed). Copied into `buffer`.
     pub fn journalMode(self: Connection, buffer: []u8) Error![]const u8 {
         var stmt = try self.prepare("PRAGMA journal_mode");
         defer stmt.finalize();
@@ -214,7 +191,6 @@ pub const Stmt = struct {
         self.* = undefined;
     }
 
-    /// True when a row is available; false at `SQLITE_DONE`.
     pub fn step(self: Stmt) Error!bool {
         const code = api.step(self.stmt);
         return switch (code) {
@@ -226,7 +202,7 @@ pub const Stmt = struct {
 
     pub fn bindText(self: Stmt, index: c_int, text: []const u8) Error!void {
         const len = std.math.cast(c_int, text.len) orelse return error.InvalidRow;
-        // SQLITE_TRANSIENT (-1 destructor): SQLite copies before returning.
+        // SQLite copies the bytes before returning; this sentinel is never called.
         const transient: Destructor = @ptrFromInt(std.math.maxInt(usize));
         const code = api.bind_text(self.stmt, index, text.ptr, len, transient);
         if (code != rc.ok) return sqliteError(code);
@@ -250,8 +226,6 @@ pub const Stmt = struct {
         return api.column_int64(self.stmt, index);
     }
 
-    /// Borrowed bytes of a TEXT or BLOB column, valid until the next step/finalize.
-    /// Returns null for SQL NULL. Other types are not coerced: the caller decides.
     pub fn columnBytes(self: Stmt, index: c_int) ?[]const u8 {
         const kind = self.columnType(index);
         if (kind != column_type.text and kind != column_type.blob) return null;
@@ -264,8 +238,6 @@ pub const Stmt = struct {
     }
 };
 
-/// Column expectations derived from the reference `_CREATE_SCRIPTS`; each row
-/// is (name, declared type) from `PRAGMA table_info` in declaration order.
 const Column = struct { name: []const u8, decl: []const u8 };
 const Table = struct { name: [:0]const u8, columns: []const Column, pragma: [*:0]const u8 };
 pub const required_tables = [_]Table{
@@ -300,9 +272,6 @@ pub const required_tables = [_]Table{
     } },
 };
 
-/// Every reference table must exist with exactly the reference columns, in
-/// order, with the same declared type. Extra or missing columns, or a view or
-/// index masquerading under the name, is `UnsupportedSchema`.
 pub fn validateSchema(conn: Connection) Error!void {
     inline for (required_tables) |table| {
         var kind = try conn.prepare("SELECT type FROM sqlite_master WHERE name = ?1");
@@ -326,7 +295,6 @@ pub fn validateSchema(conn: Connection) Error!void {
     }
 }
 
-/// Exactly one `fail2banDb` row whose integer version equals 4.
 pub fn readVersion(conn: Connection) Error!i64 {
     const rows = (try conn.scalarInt("SELECT count(*) FROM fail2banDb")) orelse return error.UnsupportedVersion;
     if (rows != 1) return error.UnsupportedVersion;
@@ -354,7 +322,6 @@ fn countTable(conn: Connection, sql: [*:0]const u8) Error!u64 {
     return std.math.cast(u64, value) orelse error.DatabaseFailure;
 }
 
-/// SQL NULL is reported explicitly rather than folded into a default.
 pub fn Optional(comptime T: type) type {
     return union(enum) { absent, present: T };
 }
@@ -379,15 +346,12 @@ pub const Log = struct {
         self.* = undefined;
     }
 };
-/// `bantime` keeps the raw source integer; -1/-2 sentinels are interpreted by
-/// the importer through `native_lease.ImportedDuration`, not here.
 pub const Ban = struct {
     jail: []u8,
     ip: Optional([]u8),
     timeofban: i64,
     bantime: i64,
     bancount: i64,
-    /// Raw JSON bytes, opaque and unparsed.
     data: Optional([]u8),
     pub fn deinit(self: *Ban, allocator: std.mem.Allocator) void {
         allocator.free(self.jail);
@@ -405,8 +369,6 @@ fn freeOptional(allocator: std.mem.Allocator, value: Optional([]u8)) void {
     }
 }
 
-/// Typed cursor over one table of an opened snapshot. Each `next` allocates the
-/// returned row's slices from the reader allocator; the caller frees with `deinit`.
 pub fn Iterator(comptime Row: type, comptime decode: fn (std.mem.Allocator, Stmt) Error!Row) type {
     return struct {
         const Self = @This();
@@ -426,8 +388,6 @@ pub const JailIterator = Iterator(Jail, decodeJail);
 pub const LogIterator = Iterator(Log, decodeLog);
 pub const BanIterator = Iterator(Ban, decodeBan);
 
-/// Read-only handle over a captured snapshot file. Validates schema and
-/// version on open so iterators only run against a supported layout.
 pub const Reader = struct {
     conn: Connection,
     allocator: std.mem.Allocator,
@@ -468,8 +428,6 @@ fn requiredText(allocator: std.mem.Allocator, stmt: Stmt, index: c_int, max: usi
     return allocator.dupe(u8, bytes) catch return error.OutOfMemory;
 }
 
-/// TEXT or BLOB is accepted for nullable payloads (SQLite `JSON` affinity is
-/// TEXT, but a client may bind bytes); integers/reals are a contract violation.
 fn optionalBytes(allocator: std.mem.Allocator, stmt: Stmt, index: c_int, max: usize) Error!Optional([]u8) {
     const kind = stmt.columnType(index);
     if (kind == column_type.null_value) return .absent;

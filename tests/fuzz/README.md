@@ -150,7 +150,7 @@ test_step.dependOn(&b.addRunArtifact(fuzz_config_tests).step);
 
 After wiring, `zig build test -Dtest-filter=fuzz` should list the five
 fuzz test names from `fuzz_parser`, and similar for the other three
-files. Build-plan task 7.1.6 considers this block installed + passing.
+files.
 
 ## Extending to real fuzzers
 
@@ -162,4 +162,5 @@ starter corpus. To run AFL++:
    entry point (e.g. `parser.compile(sshd_pattern)(input)`).
 3. Run `afl-fuzz -i fuzz-corpus/parser -o findings/parser -- ./harness`.
 
-That work is out of scope for Phase 7.1 but the groundwork is here.
+The repository currently provides the shared entry points and seed cases, not AFL++ harness
+binaries or automation.

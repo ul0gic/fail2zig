@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Immutable exclusion snapshots and reversible replacement. Files and self
-//! discovery are prepared before any record transaction. DNS reads are detached
-//! revision/deadline dependencies, never hidden resolver calls.
 const std = @import("std");
 const dns = @import("native_dns.zig");
 const Ip = @import("shared").IpAddress;
@@ -58,7 +55,6 @@ pub const Snapshot = struct {
         return build(allocator, options, entries);
     }
     fn build(allocator: std.mem.Allocator, options: Options, entries: []Entry) !*Snapshot {
-        // Caller retains entries on failure; success transfers ownership.
         const owner = try allocator.create(Snapshot);
         errdefer allocator.destroy(owner);
         var bytes = std.ArrayList(u8).init(allocator);
@@ -86,7 +82,6 @@ pub const Snapshot = struct {
         var generation: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(payload, &generation, .{});
         var held = options;
-        // Input self-address slices are not retained; their owned entries are.
         held.self_addresses = &.{};
         owner.* = .{ .allocator = allocator, .options = held, .entries = entries, .payload = payload, .generation = generation };
         return owner;
@@ -113,8 +108,6 @@ pub const Snapshot = struct {
         }
         return create(allocator, options, values[0..count]);
     }
-    /// Exact bounded read, outside SQL. A failed refresh returns no replacement,
-    /// so the owner retains its last valid snapshot and existing protection.
     pub fn fromFile(allocator: std.mem.Allocator, options: Options, path: []const u8) !*Snapshot {
         if (!std.fs.path.isAbsolute(path) or path.len > 4096 or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidIgnorePath;
         const fd = try std.posix.open(path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true, .NOFOLLOW = true }, 0);
@@ -133,8 +126,6 @@ pub const Snapshot = struct {
         return fromText(allocator, options, bytes);
     }
     pub fn restore(allocator: std.mem.Allocator, expected: Options, bytes: []const u8) !*Snapshot {
-        // The caller must reestablish the same complete self snapshot before
-        // restore. Parent configuration identity alone does not bind live NICs.
         if (expected.self_required and !expected.self_ready) return error.SelfStateUnavailable;
         if (bytes.len < 80 or bytes.len > max_checkpoint_bytes or !std.mem.eql(u8, bytes[0..4], "F2NI")) return error.InvalidIgnoreCheckpoint;
         if (std.mem.readInt(u16, bytes[4..6], .little) != version or bytes[6] > 1 or !std.mem.allEqual(u8, bytes[74..80], 0)) return error.UnsupportedIgnoreCheckpoint;
@@ -176,8 +167,6 @@ pub const Snapshot = struct {
         if (at != bytes.len) return error.InvalidIgnoreCheckpoint;
         return build(allocator, expected, entries);
     }
-    /// Positive literal/self membership short-circuits all cache reads. A DNS
-    /// match needs only its own dependency; a proven miss needs every hostname.
     pub fn check(self: *const Snapshot, ip: Ip, cache: ?*const dns.Cache, now_us: i64) !Decision {
         try validateIp(ip);
         for (self.entries) |entry| switch (entry) {
@@ -237,8 +226,6 @@ pub const Owner = struct {
             self.owner.in_flight = false;
         }
     };
-    /// Transfers replacement ownership only on success. Snapshot construction
-    /// failure never reaches this boundary, leaving the last valid owner intact.
     pub fn prepare(self: *Owner, replacement: *Snapshot) !Stage {
         if (self.in_flight) return error.IgnoreBusy;
         if (self.revision >= std.math.maxInt(i64) or replacement == self.live) return error.InvalidIgnoreRevision;

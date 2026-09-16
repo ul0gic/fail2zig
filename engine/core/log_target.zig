@@ -1,10 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Bounded log sink: any thread pushes formatted lines into a mutex-protected ring;
-//! only the control thread drains it with non-blocking writes. A blocked or full
-//! destination therefore degrades logging visibility, never ingestion or enforcement.
-//! Callers keep allowlist contents and credentials out of log arguments; this sink
-//! formats whatever it is given.
 
 const std = @import("std");
 const posix = std.posix;
@@ -50,7 +45,6 @@ pub const Sink = struct {
     dropped_total: u64 = 0,
     failed_total: u64 = 0,
     degraded: bool = false,
-    /// One stderr notice per failure episode; reset by the next successful write.
     fallback_noticed: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, target: Target) (OpenError || std.mem.Allocator.Error)!Sink {
@@ -75,8 +69,6 @@ pub const Sink = struct {
         self.* = undefined;
     }
 
-    /// Rotation support: the old descriptor stays valid until the new path opens, so a
-    /// failed reopen keeps logging to the renamed file rather than losing the stream.
     pub fn reopen(self: *Sink) OpenError!void {
         const path = switch (self.target) {
             .stderr => return,
@@ -90,7 +82,6 @@ pub const Sink = struct {
         self.owns_fd = true;
     }
 
-    /// Lines longer than the slot are cut and marked; the ring never blocks the caller.
     pub fn push(self: *Sink, line: []const u8) PushResult {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -114,9 +105,6 @@ pub const Sink = struct {
         return .queued;
     }
 
-    /// Control-thread only. A line that cannot be written now is counted as failed and
-    /// discarded so a wedged destination cannot pin the ring; the destination's state is
-    /// reported through `degraded`, not by retrying indefinitely.
     pub fn drain(self: *Sink) void {
         while (true) {
             var line_buf: [max_line_bytes]u8 = undefined;
@@ -157,7 +145,6 @@ pub const Sink = struct {
         }
     }
 
-    /// Counters are read by `stats()` from any thread, so they change only under the mutex.
     fn noteFailure(self: *Sink, err: anyerror) void {
         const notice_due = blk: {
             self.mutex.lock();
@@ -187,15 +174,12 @@ pub const Sink = struct {
     }
 };
 
-/// `std.log` has no context parameter, so the installed sink must be process-global.
-/// Set once at startup before any thread logs; cleared only at shutdown after drain.
 var installed: std.atomic.Value(?*Sink) = std.atomic.Value(?*Sink).init(null);
 
 pub fn install(sink: ?*Sink) void {
     installed.store(sink, .release);
 }
 
-/// Drop-in `std.Options.logFn`. Falls back to `std.log.defaultLog` until installed.
 pub fn logFn(
     comptime level: std.log.Level,
     comptime scope: @Type(.enum_literal),
@@ -222,8 +206,6 @@ fn formatLine(buf: *[max_line_bytes]u8, comptime format: []const u8, args: anyty
     return stream.getWritten();
 }
 
-/// Opens append-only without following symlinks, then refuses anything that is not a
-/// regular file so a device, FIFO or socket at the path cannot capture or block logging.
 pub fn openLogFile(path: []const u8) OpenError!posix.fd_t {
     if (!std.fs.path.isAbsolute(path)) return error.PathNotAbsolute;
     const flags: posix.O = .{

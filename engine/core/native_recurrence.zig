@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Replay-safe projection of one confirmed native retry event into the one
-//! admitted recidive jail. The history page checkpoint is committed separately
-//! only after every event in that page has resolved through this identity.
 const std = @import("std");
 const config = @import("../config/native.zig");
 const detection = @import("native_detection_record.zig");
@@ -18,10 +15,9 @@ pub const Binding = struct {
     jail: []const u8,
     generation: [32]u8,
     policy: retry.Policy,
+    suppress_enforcement: bool = false,
 };
 
-/// Returns false for non-native or self-origin events after validating the
-/// immutable stream event. Exact committed replay also resolves as success.
 pub fn consume(store: *durable.Store, binding: Binding, event: history.Event, now: i64, clock: effects.Clock) !bool {
     try event.validate();
     if (event.confirmed_us > now) return error.InvalidHistoryEvent;
@@ -65,8 +61,8 @@ pub fn consume(store: *durable.Store, binding: Binding, event: history.Event, no
             .pattern_index = 0,
             .subject = subject,
         },
-        .native_retry = .{ .generation = binding.generation, .policy = binding.policy, .processing_us = now },
-        .effects_clock = clock,
+        .native_retry = .{ .generation = binding.generation, .policy = binding.policy, .processing_us = now, .suppress_enforcement = binding.suppress_enforcement },
+        .effects_clock = if (binding.policy.enforce and !binding.suppress_enforcement) clock else null,
         .expected_revision = revision,
         .disposition = "time-eligible-event",
         .checkpoint = &occurrence,

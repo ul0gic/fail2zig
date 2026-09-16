@@ -137,8 +137,6 @@ test "native consumer plan: operational changes preserve rule and immutable igno
     const original = try plan.Prepared.create(t.allocator, &cfg, 0, resolver);
     defer original.destroy();
     const baseline = cfg.global;
-    // Each proposal differs in exactly one operational field. These still need
-    // their own resource/path/listener validation at the daemon admission gate.
     const changes = .{
         .{ "log_level", native.LogLevel.debug },
         .{ "native_memory_ceiling_mb", @as(u32, 512) },

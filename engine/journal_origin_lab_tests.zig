@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Explicit read-only captured-lab gate. Not part of the default test suite:
-//! requires a captured journal and independently obtained host machine identity.
 const std = @import("std");
 const t = std.testing;
 const options = @import("journal_lab_options");
@@ -35,8 +33,6 @@ test "lab journal: captured OpenSSH failures and successful logins pass origin-q
         rows += 1;
         const entry = try transport.decode(scratch, line, 2048);
         const stamp = try time.Timestamp.fromJournal(entry.realtime_us orelse return error.MissingJournalTimestamp);
-        // Historical classification only: receipt is a fixture at event time.
-        // This does not make old captured data eligible for a live daemon ban.
         const admitted = policy.Result{ .eligible = .{ .timestamp = stamp, .original = stamp, .receipt = stamp, .origin = .event } };
         const result = try consumer.evaluate(entry.message, entry.fields, admitted, consumer.context);
         if (std.mem.startsWith(u8, entry.message, "Invalid user ") or std.mem.startsWith(u8, entry.message, "Failed password ")) {

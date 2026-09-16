@@ -26,6 +26,12 @@ enforcing protection are admitted, `RELOADING=1` then `READY=1` around a live re
 `STOPPING=1` on exit. `ExecReload` is `SIGHUP`; `SIGUSR1` reopens `log_target` after rotation.
 No socket unit ships and `LISTEN_FDS` is not read.
 
+The shipped service runs as the non-login `fail2zig` account. Its group can be selected by
+`FAIL2ZIG_GROUP` during installation. `CAP_NET_ADMIN` supplies firewall access and
+`CAP_DAC_READ_SEARCH` supplies protected log/journal reads. `CAP_NET_RAW` supports the
+ipset backend’s iptables extension and grants raw IP socket authority. HTTP remains in the same process;
+`metrics_enabled = false` disables HTTP/WebSocket while socket monitoring stays available.
+
 ## Exit classes
 
 Every command returns one of the frozen classes. Scripts branch on these, never on text.
@@ -85,6 +91,10 @@ restart-only and reported as `outcome: "restart_required"` with the offending ke
 `filter`, `timestamp`, timezone keys, `journal_executables`, `rule_files`), and policy edits
 on a disabled jail. An invalid proposal is `rejected` and the running generation is untouched.
 
+Native `bantime`, `findtime`, `bantime_increment_max_bantime` and `bantime_increment_jitter`
+accept integer seconds or quoted durations such as `"1h30m"`. This does not change the reload
+boundary above or the numeric CLI `--duration`, `--timeout` and migration window arguments.
+
 ### Monitoring endpoints
 
 With `metrics_enabled = true` the HTTP listener serves `/metrics` (Prometheus), `/api/status`,
@@ -96,6 +106,10 @@ same report over the socket; there is no separate readiness spelling, use `statu
 storage and protection state.
 
 ## Migration workflow
+
+This workflow accepts supported **fail2ban schema-4 SQLite** input. It does not convert
+fail2zig v0.3.0 binary state. For an existing native database's service-account transition,
+follow [upgrading fail2zig state](migration-continuity.md#upgrading-fail2zig-state).
 
 The offline preparation commands never touch the running fail2ban service, its database or
 the firewall:
@@ -114,6 +128,34 @@ needs `--replay-window`, otherwise the plan records a `replay-window-missing` bl
 `--runtime-socket` records the source service's control socket for a later rollback
 (default `/var/run/fail2ban/fail2ban.sock`).
 
+Run preparation and native destination operations as the same UID that will own the native
+daemon store. A root-created destination database is not reopenable by the `fail2zig` service
+until a safe offline ownership transition. With the account installed, prepare a private,
+persistent staging directory owned by it, and invoke commands with the required capabilities:
+
+The source file and its ancestors must also grant the service UID ordinary read/search
+permission: the source admission check uses the real UID, so capabilities alone do not satisfy
+it. If the source already has a restricted reader group, grant that group only to the offline
+command with `-p 'SupplementaryGroups=<existing-source-reader-group>'`. Do not add that membership
+to the shipped daemon or make the source writable/world-readable to bypass the check.
+
+```bash
+sudo install -d -o fail2zig -g fail2zig -m 0700 /var/lib/fail2zig-migration
+sudo systemd-run --wait --pipe --uid=fail2zig --gid=fail2zig \
+  -p 'AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH' \
+  /usr/local/bin/fail2zig migrate snapshot \
+  --source-db /var/lib/fail2ban/fail2ban.sqlite3 \
+  --staging-dir /var/lib/fail2zig-migration
+```
+
+Use this invocation prefix for `plan`, `validate`, native `cutover` and `status` as well,
+with absolute paths. Substitute the configured service group if it differs. Staging must
+belong to the invoking UID, and the native destination parent/database must belong to the
+daemon UID; configuration and executable files remain administrator-owned. The capability
+grant does not make an inaccessible source path writable or bypass systemd mount restrictions.
+Keep the destination daemon stopped while creating/staging native state. The commands below
+show the migration arguments; apply the account/capability prefix above for destination access.
+
 The cutover is journaled and resumable:
 
 ```
@@ -131,9 +173,40 @@ after a mutation, incomplete protection is 4 (`partial`) and an unestablished ou
 (`uncertain`); `pending` is 3.
 
 The disclosed protection gap is the interval between stopping fail2ban and the daemon's
-activation.
+activation. Start the destination service explicitly after offline staging, then use the
+printed resume command against its socket to complete activation. The installer does not
+perform this handoff.
 
 ### Rollback
+
+Source restoration must write beside the original fail2ban database and restore its original
+UID, GID and mode. The ordinary service capabilities are insufficient. Stop **both** source
+and destination writers, preserve their current coherent databases, and run the offline restore
+as the native service UID with a temporary capability grant. For a root-owned source:
+
+```bash
+# RUN_ID is the recorded migration run ID. Use the original backend and paths.
+sudo systemctl stop fail2ban fail2zig
+sudo systemd-run --wait --pipe --uid=fail2zig --gid=fail2zig \
+  -p 'AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER' \
+  -p 'CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER' \
+  /usr/local/bin/fail2zig migrate rollback \
+  --plan /var/lib/fail2zig-migration/plan.json \
+  --state-file /var/lib/fail2zig/state.bin \
+  --staging-dir /var/lib/fail2zig-migration --backend nftables --run-id "$RUN_ID"
+```
+
+Substitute the configured group and, if needed, the transient source-reader group described
+above. These additional capabilities belong only to this operator-launched offline command;
+do not add them to `fail2zig.service`. The original source parent ownership is retained, and
+the restored database receives the source's original ownership and mode. Read-only mounts or
+other filesystem restrictions still require operator repair.
+
+After the restore reports its next step, start fail2ban and verify source protection, then
+start the destination daemon so the second `--source-verified` operation can release its
+owners through IPC. That second operation uses the ordinary migration invocation prefix;
+the extra restore capabilities are unnecessary. Keep the source serving until rollback
+completion is confirmed. The general arguments are:
 
 ```
 fail2zig migrate rollback --plan plan.json --state-file <db> --staging-dir <dir> \

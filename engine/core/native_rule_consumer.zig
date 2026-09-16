@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Stable owner adapter. Stages are local until the coordinator commits their
-//! checkpoint with the source occurrence and publishes once. No store or DNS I/O.
 const std = @import("std");
 const rules = @import("native_rules.zig");
 const correlation = @import("native_correlation.zig");
@@ -16,18 +14,14 @@ pub const Prepared = struct {
     outcome: ?rules.Outcome,
     prepared_us: ?i64 = null,
     valid_until_us: ?i64 = null,
-    /// Coordinator rechecks with a fresh clock after acquiring its writer lock.
-    /// This transient bound must not become an expiry for the checkpoint row.
     pub fn validateCommit(self: Prepared, now_us: i64) !void {
         if (self.prepared_us) |floor| if (now_us < floor) return error.ConsumerClockReversed;
         if (self.valid_until_us) |expiry| if (now_us >= expiry) return error.ConsumerExpired;
     }
-    /// Publication is infallible and allocation-free; caller owns the commit gate.
     pub fn publish(self: Prepared) void {
         self.owner.counters = self.owner.staged;
         if (self.owner.correlation_stage) |stage| stage.publish();
     }
-    /// Releasing without publish aborts every staged counter/context change.
     pub fn release(self: Prepared) void {
         if (self.owner.correlation_stage) |stage| stage.release();
         self.owner.correlation_stage = null;
@@ -45,8 +39,6 @@ pub const Consumer = struct {
     correlation_stage: ?correlation.Prepared = null,
     in_flight: bool = false,
 
-    /// Move into its final stable address before preparing. Program must outlive
-    /// this owner. Incarnation is trusted collector identity, never a log field.
     pub fn init(program: *const rules.Program, jail: []const u8, incarnation: []const u8, parent_generation: [32]u8, hostname_enabled: bool) !Consumer {
         if (jail.len == 0 or jail.len > 64 or incarnation.len == 0 or incarnation.len > 16384 or
             std.mem.indexOfScalar(u8, jail, 0) != null or std.mem.indexOfScalar(u8, incarnation, 0) != null) return error.InvalidConsumerBinding;
@@ -105,8 +97,6 @@ pub const Consumer = struct {
         self.in_flight = true;
         return .{ .owner = self, .checkpoint = &self.bytes, .outcome = null };
     }
-    /// Required first-use manifest rows preserve zero counters and empty context;
-    /// no synthetic record is evaluated to obtain canonical checkpoint bytes.
     pub fn prepareSnapshot(self: *Consumer) !Prepared {
         if (self.in_flight) return error.ConsumerBusy;
         for (self.counters) |counter| if (counter > std.math.maxInt(i64)) return error.ConsumerCounterOverflow;

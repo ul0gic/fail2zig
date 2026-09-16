@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Bounded journalctl invocation and complete JSON record decoding. No shell or
-//! libsystemd loading. All returned fields borrow caller-owned bounded scratch.
 const std = @import("std");
 const records = @import("source_record.zig");
 pub const max_line_bytes = 64 * 1024;
@@ -74,8 +72,6 @@ fn fieldName(value: []const u8) bool {
     for (value) |c| if (!(std.ascii.isUpper(c) or std.ascii.isDigit(c) or c == '_')) return false;
     return true;
 }
-/// Arena-owned argv. Positive-prefixed line counts preserve oldest-first bounded
-/// since queries on both old and newer journalctl versions; tail uses plain 1.
 pub fn argv(a: std.mem.Allocator, options: Options, query: Query, count: usize) ![]const []const u8 {
     try validate(options);
     if (count == 0 or count > @as(usize, options.batch_records) + 1) return error.InvalidPollBudget;
@@ -169,14 +165,12 @@ pub fn execute(a: std.mem.Allocator, args: []const []const u8, output: []u8, dia
         };
         _ = try std.posix.poll(&pollers, 10);
     }
-    try child.waitForSpawn(); // reaped: cannot block; also closes the exec error pipe.
+    try child.waitForSpawn();
     if (std.posix.W.IFEXITED(status)) diagnostic.exit_code = std.posix.W.EXITSTATUS(status) else {
         if (std.posix.W.IFSIGNALED(status)) diagnostic.signal = std.posix.W.TERMSIG(status);
         return error.JournalChildFailed;
     }
     if (diagnostic.exit_code.? != 0) return error.JournalChildFailed;
-    // Warnings may report inaccessible/corrupt files and an incomplete view even
-    // with exit 0. Never declare that view an empty healthy source.
     if (diagnostic.stderr_len != 0) return error.JournalDiagnostic;
     return output[0..used];
 }
@@ -190,10 +184,6 @@ pub const Entry = struct {
     raw_hash: [32]u8,
 };
 
-/// The caller supplies the complete first line of an inclusive cursor query.
-/// No time seek, fresh baseline, cursor update or acknowledgment is performed.
-/// Returned origin fields borrow scratch and still require the configured origin
-/// qualifier; matching a cursor alone is not evidence of trusted log provenance.
 pub fn verifyAnchor(scratch: []u8, line: []const u8, expected_cursor: []const u8, message_limit: usize) !Entry {
     try bounded(expected_cursor, max_cursor_bytes);
     if (line.len == 0) return error.ResumeLost;
@@ -202,8 +192,6 @@ pub fn verifyAnchor(scratch: []u8, line: []const u8, expected_cursor: []const u8
     return entry;
 }
 
-/// Full canonical journal field hash includes origin fields and timestamps.
-/// Source/configuration and encoded checkpoint identity remain session checks.
 pub fn verifyPending(entry: Entry, expected_cursor: []const u8, expected_hash: [32]u8) !void {
     try bounded(expected_cursor, max_cursor_bytes);
     if (!std.mem.eql(u8, entry.cursor, expected_cursor) or !std.mem.eql(u8, &entry.raw_hash, &expected_hash)) return error.PendingRecordMismatch;
@@ -250,8 +238,6 @@ pub fn decode(scratch: []u8, line: []const u8, message_limit: usize) !Entry {
     while (iterator.next()) |field| {
         if (!fieldName(field.key_ptr.*)) return error.MalformedJournalRecord;
         const v = field.value_ptr.*;
-        // Repeated string values are retained individually. Integer arrays are
-        // journalctl's binary representation; ambiguous duplicate MESSAGE fails.
         if (v == .array and v.array.items.len > 0 and v.array.items[0] == .string) {
             for (v.array.items) |item| {
                 if (item != .string or count == max_fields) return error.UnsupportedJournalField;

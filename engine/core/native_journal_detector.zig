@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Origin-qualified native SSH journal consumer. No tag or MESSAGE-based
-//! authentication; excluded origins are committed without matching a subject.
 const std = @import("std");
 const builtin = @import("native_builtin_detector.zig");
 const origin = @import("native_journal_origin.zig");

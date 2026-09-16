@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Production bounded native grammar, adapted from the approved N1 rule algorithms.
-//! No prototype imports, external I/O or live mutable matching state. Outcomes own
-//! their fields; parsed records borrow only caller scratch within analyze().
 const std = @import("std");
 pub const Ip = @import("shared").IpAddress;
 pub const version: u16 = 1;
@@ -43,7 +40,6 @@ pub const Hostname = struct {
             if (label.len == 0 or label.len > 63 or !std.ascii.isAlphanumeric(label[0]) or !std.ascii.isAlphanumeric(label[label.len - 1])) return error.InvalidSubject;
             for (label) |c| if (!std.ascii.isAlphanumeric(c) and c != '-') return error.InvalidSubject;
         }
-        // The hostname route must not reinterpret a literal address as DNS input.
         if (Ip.parse(input)) |_| return error.InvalidSubject else |_| {}
         var result = Hostname{ .text = try Text(253).init(input) };
         for (result.text.bytes[0..result.text.len]) |*c| c.* = std.ascii.toLower(c.*);
@@ -125,8 +121,6 @@ pub const Outcome = struct {
 pub const Input = struct { source: []const u8, record: []const u8, complete: bool = true };
 pub const Scratch = struct { bytes: [scratch_bytes]u8 = undefined };
 pub const CorrelationInput = struct { key: Key, phase: enum { start, finish, other } };
-/// Candidate outcomes may omit the subject only for a correlated finish. Only the
-/// correlation owner may turn that observation into a consumable candidate.
 pub const Observation = struct { outcome: Outcome, correlation: ?CorrelationInput = null };
 pub const Program = struct {
     owner: std.mem.Allocator,
@@ -216,12 +210,9 @@ pub const Program = struct {
             if (close + 1 < template.len and !space(template[close + 1])) {
                 const next = template[close + 1];
                 if (std.mem.indexOfScalar(u8, "[](),;:=|\"'", next) == null) return error.InvalidRule;
-                // A colon belongs to IPv6 addresses: require bracket/whitespace framing
-                // instead of accepting a valid prefix of a longer address.
                 if (kind == .ip and next == ':') return error.InvalidRule;
                 delimiter = next;
             }
-            // Quoted captures own their opening and closing quotes.
             if (kind == .quoted and ((pos > 0 and template[pos - 1] == '"') or delimiter == '"')) return error.InvalidRule;
             try self.append(.{ .capture = .{ .name = name, .kind = kind, .delimiter = delimiter } });
             pos = close + 1;
@@ -239,7 +230,6 @@ pub const Program = struct {
                 else => {},
             };
         };
-        // A subject token has explicit IP typing, not an arbitrary text search.
         for (self.segments[0..self.segment_count]) |seg| switch (seg) {
             .capture => |c| if (std.mem.eql(u8, c.name, self.parsed.value.subject) and c.kind != (if (self.parsed.value.subject_kind == .ip) Capture.ip else Capture.hostname)) return error.InvalidRule,
             else => {},
@@ -254,7 +244,6 @@ pub const Program = struct {
                 .max_value_len = value_cap,
                 .duplicate_field_behavior = .@"error",
             }) catch |err| return if (err == error.OutOfMemory or err == error.ValueTooLong) error.ResourceLimit else error.InvalidRecord;
-            // Fixed per-record allocator owns the parse for the entire evaluation.
             if (parsed.value != .object) return error.InvalidRecord;
             var it = parsed.value.object.iterator();
             while (it.next()) |entry| {
@@ -312,7 +301,6 @@ pub const Program = struct {
         return self.parsed.value;
     }
     pub fn result(self: *const Program, kind: Kind, reason: Reason) Outcome {
-        // Program validation establishes bounded names before this method is reachable.
         var rule: Name = .{ .len = @intCast(self.parsed.value.id.len) };
         var source: Name = .{ .len = @intCast(self.parsed.value.source.len) };
         @memcpy(rule.bytes[0..rule.len], self.parsed.value.id);
@@ -360,9 +348,6 @@ pub const Program = struct {
                 if (observation.outcome.subject == null) return .{ .outcome = withField(self.result(.rejected, .missing_field), spec.subject) };
                 observation.outcome.kind = .awaiting_context;
                 observation.outcome.reason = .context_stored;
-                // Start evidence must satisfy exclusions before it can populate
-                // context. Conditions remain finish predicates; missing exclusion
-                // fields reject instead of bypassing protection.
                 return self.applyExclusions(fields, observation, budget);
             }
         }
@@ -412,8 +397,6 @@ pub const Program = struct {
         };
     }
 };
-/// Own quotes and decode only escaped quote/backslash. Consume once, without searching
-/// for a later closing quote if the following literal fails. Storage is caller's fixed arena.
 fn decodeQuoted(allocator: std.mem.Allocator, input: []const u8, cursor: *usize, budget: *Budget) ![]const u8 {
     if (cursor.* == input.len or input[cursor.*] != '"') return error.InvalidRecord;
     try budget.spend(1);

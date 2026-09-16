@@ -55,8 +55,6 @@ pub const Command = union(enum) {
         cidr: ?[]const u8 = null,
     };
 
-    /// `jail` is always set after a successful parse; it stays optional only so
-    /// existing callers keep compiling.
     pub const BanArgs = struct {
         ip: []const u8,
         jail: ?[]const u8 = null,
@@ -361,8 +359,6 @@ fn parseUnban(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Err
     return Parsed{ .globals = globals.*, .command = .{ .unban = args } };
 }
 
-/// `--scope host` or `--scope net <cidr>`; `idx` points at `--scope` on entry
-/// and at the last consumed token on return.
 fn parseScope(rest: []const []const u8, idx: *usize, diag: *ParseDiag) Error!Command.ScopeArgs {
     idx.* += 1;
     if (idx.* >= rest.len) {

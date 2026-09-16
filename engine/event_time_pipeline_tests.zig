@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Original ordinary-log fixture for event age at the actual file/SQLite commit
-//! boundary. The counting processor and its 16-byte checkpoint are test fixtures,
-//! not a production detector, migration schema or firewall implementation.
 const std = @import("std");
 const times = @import("core/event_time.zig");
 const files = @import("core/durable_file_source.zig");
@@ -89,8 +86,6 @@ test "event age: file records aging out during failed commit stay obsolete after
         try std.testing.expectEqual(@as(i64, 0), try store.pendingIntents());
         offset = source.acknowledgedCheckpoint().?.offset;
         revision = owner.revision;
-        // The second event is eligible now, but neither its staged count nor
-        // its prospective intent/cursor may escape a failed transaction.
         store.fail_at = .before_commit;
         try std.testing.expectError(error.InjectedFailure, source.poll(pipeline.Pipeline.acknowledge, &owner));
         try std.testing.expectEqualDeep(Counts{ .obsolete = 1 }, initial.committed);
@@ -99,8 +94,6 @@ test "event age: file records aging out during failed commit stay obsolete after
         try std.testing.expectEqual(@as(i64, 0), try store.pendingIntents());
     }
 
-    // During the outage the event crosses the retry-window boundary. Reopening
-    // and selecting replay must not revive its prior uncommitted eligibility.
     var store = try durable.Store.open(a, database);
     defer store.close();
     var resumed = Timed{ .now = 1200, .mode = .replay };
@@ -119,7 +112,6 @@ test "event age: file records aging out during failed commit stay obsolete after
     try std.testing.expect(reopened.acknowledgedCheckpoint().?.offset > offset);
     try std.testing.expectEqual(revision + 1, owner.revision);
     try std.testing.expectEqual(@as(i64, 0), try store.pendingIntents());
-    // A still-recent event remains eligible at its original event time.
     try std.testing.expect(try reopened.poll(pipeline.Pipeline.acknowledge, &owner));
     try std.testing.expectEqualDeep(Counts{ .eligible = 1, .obsolete = 2 }, resumed.committed);
     try std.testing.expectEqual(@as(i64, 1), try store.pendingIntents());

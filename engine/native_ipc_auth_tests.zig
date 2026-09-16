@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Component root: peer/command authorization, socket path verification and
-//! frame/connection bounds of the local administrative IPC server.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -22,10 +20,6 @@ comptime {
     _ = ipc;
     _ = auth;
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 fn socketpairNonblock(fds: *[2]i32) !void {
     const stype: u32 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
@@ -61,7 +55,6 @@ fn writeAllFd(fd: posix.fd_t, bytes: []const u8) !void {
     }
 }
 
-/// Reads one complete response frame; returns null on EOF before any byte arrived.
 fn readResponse(a: std.mem.Allocator, fd: posix.fd_t) !?shared.Response {
     var header: [4]u8 = undefined;
     var got: usize = 0;
@@ -208,7 +201,6 @@ fn statusFrame(buf: []u8) ![]const u8 {
     return ws.getWritten();
 }
 
-/// Private 0750 directory for real bind tests; the parent mode contract forbids /tmp.
 const SocketDir = struct {
     tmp: testing.TmpDir,
     abs: []u8,
@@ -256,20 +248,13 @@ fn setSockBuf(fd: posix.fd_t, opt: u32, bytes: u32) !void {
     try posix.setsockopt(fd, posix.SOL.SOCKET, opt, &val);
 }
 
-// ---------------------------------------------------------------------------
-// Peer and command classification
-// ---------------------------------------------------------------------------
-
 test "native ipc auth: peer class is uid-only; gid is never authority" {
     const daemon_uid: u32 = 998;
     try testing.expectEqual(auth.PeerClass.admin, auth.classifyPeer(.{ .pid = 1, .uid = 0, .gid = 0 }, daemon_uid));
     try testing.expectEqual(auth.PeerClass.admin, auth.classifyPeer(.{ .pid = 1, .uid = 998, .gid = 12 }, daemon_uid));
-    // Primary group fail2zig (pretend gid 999 is that group) is still a monitor.
     try testing.expectEqual(auth.PeerClass.monitor, auth.classifyPeer(.{ .pid = 1, .uid = 1000, .gid = 999 }, daemon_uid));
-    // SO_PEERCRED only carries the primary gid; supplementary membership is invisible and irrelevant.
     try testing.expectEqual(auth.PeerClass.monitor, auth.classifyPeer(.{ .pid = 1, .uid = 1000, .gid = 1000 }, daemon_uid));
     try testing.expectEqual(auth.PeerClass.monitor, auth.classifyPeer(.{ .pid = 1, .uid = 1001, .gid = 0 }, daemon_uid));
-    // A root daemon: only uid 0 is admin.
     try testing.expectEqual(auth.PeerClass.monitor, auth.classifyPeer(.{ .pid = 1, .uid = 998, .gid = 0 }, 0));
 }
 
@@ -301,10 +286,6 @@ test "native ipc auth: request_id extraction for tags 8/9 and legacy null" {
     try testing.expectError(error.FrameTooShort, auth.extractRequestId(body[0..0]));
 }
 
-// ---------------------------------------------------------------------------
-// Authorization over a socketpair
-// ---------------------------------------------------------------------------
-
 test "native ipc auth: monitor mutation gets 403 and the connection stays open" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const a = testing.allocator;
@@ -325,7 +306,6 @@ test "native ipc auth: monitor mutation gets 403 and the connection stays open" 
     try testing.expectEqual(@as(usize, 0), rec.auth_calls);
     try testing.expectEqual(@as(usize, 1), fx.server.activeClients());
 
-    // Still usable for read-only work afterwards.
     try writeAllFd(fx.client(), try statusFrame(&buf));
     try runLoopBriefly(&fx.loop, 150);
     const resp2 = (try readResponse(a, fx.client())) orelse return error.UnexpectedEof;
@@ -456,10 +436,6 @@ test "native ipc auth: monitor sending reserved tag 8 is refused 403 before requ
     try testing.expectEqual(@as(u16, 403), resp.err.code);
 }
 
-// ---------------------------------------------------------------------------
-// Frame handling and bounds
-// ---------------------------------------------------------------------------
-
 test "native ipc auth: malformed tag gets 400 and empty frame gets 400" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const a = testing.allocator;
@@ -511,7 +487,7 @@ test "native ipc auth: exactly 1 MiB frame is accepted and answered" {
     defer a.free(frame);
     std.mem.writeInt(u32, frame[0..4], protocol.max_payload_size, .little);
     @memset(frame[4..], 0);
-    frame[4] = 0; // status tag; trailing bytes are ignored by the decoder
+    frame[4] = 0;
     const Writer = struct {
         fn run(fd: posix.fd_t, bytes: []const u8) void {
             writeAllFd(fd, bytes) catch {};
@@ -587,7 +563,6 @@ test "native ipc auth: idle connection uses its own bound rather than the frame 
     try expectEof(fx.client());
 }
 
-/// Shrinks both socket buffers so a large response cannot drain synchronously.
 fn makeSlowDrain(fx: *Fixture, rec: *Recorder) !void {
     try setSockBuf(fx.fds[0], posix.SO.SNDBUF, 4096);
     try setSockBuf(fx.fds[1], posix.SO.RCVBUF, 4096);
@@ -708,10 +683,6 @@ test "native ipc auth: ninth connection is refused while eight are held" {
     try testing.expectEqual(ipc.max_clients, server.activeClients());
 }
 
-// ---------------------------------------------------------------------------
-// Socket path and directory verification (real filesystem)
-// ---------------------------------------------------------------------------
-
 test "native ipc auth: correct 0750 directory and 0660 socket verify" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const a = testing.allocator;
@@ -738,7 +709,6 @@ test "native ipc auth: directory writable or listable by others is refused" {
         try dir.chmod(mode);
         try testing.expectError(error.ParentTooPermissive, auth.verifyParentDir(dir.path, linux.geteuid()));
         try testing.expectError(error.SocketPathInsecure, IpcServer.init(a, &loop, dir.path));
-        // A refused bind must not leave a socket behind.
         try testing.expectError(error.FileNotFound, std.fs.cwd().access(dir.path, .{}));
     }
     for ([_]u32{ 0o750, 0o710, 0o700 }) |mode| {
@@ -749,12 +719,10 @@ test "native ipc auth: directory writable or listable by others is refused" {
 
 test "native ipc auth: directory owned by a foreign uid is refused" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    // Debian: /var/cache/man is owned by `man`; skip when this host lacks such a directory.
     const candidate = "/var/cache/man/ipc.sock";
     const st = posix.fstatat(posix.AT.FDCWD, "/var/cache/man", 0) catch return error.SkipZigTest;
     if (st.uid == 0 or st.uid == linux.geteuid()) return error.SkipZigTest;
     try testing.expectError(error.ParentWrongOwner, auth.verifyParentDir(candidate, linux.geteuid()));
-    // Root-owned parents remain acceptable owners irrespective of the daemon uid.
     try testing.expectError(error.ParentTooPermissive, auth.verifyParentDir("/tmp/x.sock", linux.geteuid()));
 }
 
@@ -772,7 +740,6 @@ test "native ipc auth: symlinked socket path is refused at bind and by verificat
     try testing.expectError(error.SocketPathRefused, IpcServer.init(a, &loop, dir.path));
     try testing.expectError(error.IsSymlink, auth.inspectBindPath(dir.path));
     try testing.expectError(error.SocketIsSymlink, auth.verifySocketFile(dir.path, linux.geteuid()));
-    // The symlink itself is preserved, never unlinked.
     const st = try posix.fstatat(posix.AT.FDCWD, dir.path, posix.AT.SYMLINK_NOFOLLOW);
     try testing.expect(posix.S.ISLNK(st.mode));
 }
@@ -790,7 +757,6 @@ test "native ipc auth: live socket at path refuses startup and stale socket is r
     try testing.expectError(error.SocketPathInUse, IpcServer.init(a, &loop, dir.path));
     try std.fs.cwd().access(dir.path, .{});
 
-    // Simulate a crashed daemon: close the listener without unlinking the path.
     posix.close(first.listen_fd);
     first.listen_fd = -1;
     first.socket_path = "";
@@ -858,7 +824,6 @@ test "native ipc auth: post-bind directory widening stops new connections while 
     try testing.expectEqual(@as(usize, 1), server.activeClients());
     try expectEof(late);
 
-    // Restoring the mode re-arms serving on the next accept.
     try dir.chmod(0o750);
     const later = try connectUnix(dir.path);
     defer posix.close(later);
@@ -866,7 +831,6 @@ test "native ipc auth: post-bind directory widening stops new connections while 
     try testing.expect(server.isServing());
     try testing.expectEqual(@as(usize, 2), server.activeClients());
 
-    // The pre-existing connection still gets its answer and its real SO_PEERCRED class.
     var buf: [64]u8 = undefined;
     try writeAllFd(early, try statusFrame(&buf));
     try runLoopBriefly(&loop, 150);

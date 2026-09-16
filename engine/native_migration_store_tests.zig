@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 
-//! Schema-23 migration journal: run identity, step intent/outcome ordering, staged row
-//! replacement and staged-owner activation with original deadlines and exact replay.
-
 const std = @import("std");
 const durable = @import("core/record_store.zig");
 const effects = @import("core/native_effect.zig");
@@ -78,7 +75,6 @@ test "migration store: BUG-036 corrupt stored integers refuse and roll back acti
     try f.store.stageMigrationRows(run_id, &.{.{ .jail = "sshd", .scope = try hostScope(10), .lease_kind = 1, .deadline_us = 9_000_000, .source_event_us = 1_000_000, .source_row = 1 }}, &.{});
     const seq = try f.store.beginMigrationStep(run_id, .stage_destination, "", 300);
     try f.store.finishMigrationStep(run_id, seq, .success, "", .staged, 301);
-    // Bypass SQL checks to model corrupt durable values reaching the reader.
     try f.store.inspectExec("PRAGMA ignore_check_constraints=ON;");
     try f.store.inspectExec("UPDATE migration_staged_owners SET lease_kind=256;");
     const generations: []const durable.Store.JailGeneration = &.{.{ .jail = "sshd", .generation = [_]u8{5} ** 32 }};
@@ -146,9 +142,6 @@ test "migration store: staged rows replace atomically and stay outside authority
     try t.expectEqual(@as(i64, 0), try f.store.inspectInteger("SELECT count(*) FROM effect_owners;"));
     try f.store.stageMigrationRows(run_id, &owners, &history);
 
-    // Activation: only a staged run activates, every staged jail needs a generation, finite and
-    // permanent owners enter authority with original deadlines, the already-expired one is
-    // skipped and a repeat replays without new revisions.
     try t.expectError(error.InvalidMigrationState, f.store.activateStagedOwners(run_id, &.{.{ .jail = "sshd", .generation = [_]u8{5} ** 32 }}, clock()));
     const seq = try f.store.beginMigrationStep(run_id, .stage_destination, "", 300);
     try f.store.finishMigrationStep(run_id, seq, .success, "", .staged, 301);
@@ -190,7 +183,6 @@ test "migration store: rollback deltas name released, expired and native owners 
     const seq = try f.store.beginMigrationStep(run_id, .stage_destination, "", 300);
     try f.store.finishMigrationStep(run_id, seq, .success, "", .staged, 301);
     try t.expectEqual(@as(u64, 3), try f.store.activateStagedOwners(run_id, &.{.{ .jail = "sshd", .generation = [_]u8{5} ** 32 }}, clock()));
-    // A native ban after cutover and one staged owner released by the destination.
     const native = canonical.Scope{ .subject = canonical.Subject.host(.{ .ipv4 = (192 << 24) | (2 << 8) | 30 }) };
     _ = try f.store.setOwnerFromCanonical(.{ .scope = native, .jail = "sshd", .generation = [_]u8{5} ** 32, .decision_id = [_]u8{0x3a} ** 32, .expected_revision = 0, .lease = .{ .finite = 8_000_000 }, .decided_us = 4_900_000 }, clock());
     const released_scope = canonical.Scope{ .subject = canonical.Subject.host(.{ .ipv4 = (192 << 24) | (2 << 8) | 21 }) };
@@ -198,11 +190,8 @@ test "migration store: rollback deltas name released, expired and native owners 
     const released_key = try (try effects.Scope.exact(released_scope)).key(installation);
     const owner = (try f.store.currentOwner(released_key, "sshd")).?;
     _ = try f.store.transitionOwner(.{ .scope = released_scope, .jail = "sshd", .current_generation = owner.generation, .next_generation = owner.generation, .expected_owner_revision = owner.revision, .transition_id = [_]u8{0x3b} ** 32, .mode = .release, .occurred_us = 4_950_000 }, clock());
-    // The released scope (.21) is re-banned natively with a later finite lease: the source must
-    // carry that lease, not the original permanent row, so it is a ban delta rather than an unban.
     _ = try f.store.setOwnerFromCanonical(.{ .scope = released_scope, .jail = "sshd", .generation = [_]u8{5} ** 32, .decision_id = [_]u8{0x3c} ** 32, .expected_revision = (try f.store.currentOwner(released_key, "sshd")).?.revision, .lease = .{ .finite = 9_500_000 }, .decided_us = 4_960_000 }, clock());
     var deltas: [8]durable.Store.MigrationDelta = undefined;
-    // At 7 s the third staged owner (deadline 6 s) has expired on its own.
     const count = try f.store.planMigrationDeltas(run_id, &.{"sshd"}, 7_000_000, &deltas);
     try t.expectEqual(@as(usize, 3), count);
     try t.expectEqual(durable.Store.MigrationDeltaKind.ban, deltas[0].kind);
@@ -221,7 +210,6 @@ test "migration store: rollback deltas name released, expired and native owners 
     var keys: [8][32]u8 = undefined;
     try t.expectEqual(@as(usize, 3), try f.store.migrationStagedKeys(run_id, &keys));
     const history_before = try f.store.inspectInteger("SELECT count(*) FROM effect_owner_revisions;");
-    // Release: the live staged owner (.20) is released; the native owner (.30) is untouched.
     try t.expectEqual(@as(u64, 3), try f.store.releaseMigrationOwners(run_id, clock()));
     try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM effect_owners WHERE jail='sshd' AND lease_kind!=0 AND deadline_us=8000000;"));
     try t.expect(try f.store.inspectInteger("SELECT count(*) FROM effect_owner_revisions;") > history_before);

@@ -349,8 +349,6 @@ test "native effects: tagged duration import deadline prolong and schedule bound
     const schedule = try lease_policy.Schedule.fromLease(.{ .finite = 1_100 }, .{ .wall_us = 100, .monotonic_us = 5_000 });
     try t.expect(!schedule.due(5_999));
     try t.expect(schedule.due(6_000));
-    // A running process schedules elapsed time monotonically; a forward wall
-    // step alone cannot shorten the admitted lifetime.
     try t.expect(!schedule.due(5_500));
     try t.expect(!(try lease_policy.Schedule.fromLease(.permanent, .{ .wall_us = 100, .monotonic_us = 5_000 })).due(std.math.maxInt(u64)));
     try t.expect((try lease_policy.Schedule.fromLease(.{ .finite = 100 }, .{ .wall_us = 100, .monotonic_us = 5_000 })).due(5_000));
@@ -555,7 +553,7 @@ test "native effects: typed generation release flush and post-expiry reban prese
         .mode = .release,
         .occurred_us = clock.now,
     }, clock.value());
-    try t.expect(released.desired == .permanent); // The shared owner stays live.
+    try t.expect(released.desired == .permanent);
     try f.store.markDispatched(released.token(), clock.value());
     _ = try f.store.settleVerified(released.token(), observation(released, clock.now, .permanent), clock.value());
     try t.expectEqual(@as(u64, 2), try f.store.confirmedEffectEvents());
@@ -776,8 +774,6 @@ test "native effects: detection for a live owner is absorbed until its deadline 
     const original = owners[0];
     try f.store.admitRetry(record_identity.jail, record_identity.generation, enforcing_policy);
 
-    // One microsecond before the deadline the owner is live: the decision is recorded and
-    // absorbed without touching lease, decision identity, revision or confirmation.
     _ = try f.store.beginReceipt(record_identity, .{ .us = 100 }, 0);
     clock.now = 799;
     var absorbed = try record(&clock);
@@ -789,7 +785,6 @@ test "native effects: detection for a live owner is absorbed until its deadline 
     try t.expectEqual(@as(i64, 800), (try first(&f.store)).desired.finite);
     try t.expectEqual(existing.revision, (try first(&f.store)).revision);
 
-    // At deadline equality the owner is no longer live and the next decision bans anew.
     var identity = record_identity;
     identity.occurrence = "2";
     identity.cursor = "cursor-2";
@@ -1192,7 +1187,6 @@ test "native effects: reload generation re-key moves an applied owner through re
     try t.expectEqual(@as(usize, 1), count);
     try t.expectEqualSlices(u8, &g_new, &owners[0].generation);
     try t.expect(owners[0].lease == .permanent);
-    // The manager's next turn dispatches the replacement intent and settles it like any other.
     try f.store.markDispatched(moved.token(), clock.value());
     _ = try f.store.settleVerified(moved.token(), observation(moved, clock.now, .permanent), clock.value());
     const settled = try first(&f.store);

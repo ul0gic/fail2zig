@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Bounded arithmetic duration language. Never evaluates configuration as code.
 const std = @import("std");
 pub const Error = error{ InvalidDuration, NonFiniteDuration, TooComplex, NegativeDuration, PrecisionLoss, Overflow };
 pub const Duration = union(enum) {
@@ -19,7 +18,6 @@ pub const Duration = union(enum) {
         return @intFromFloat(value);
     }
 };
-/// -2 is historical unknown only when reading state, never a configured ban duration.
 pub fn parse(text: []const u8, allow_history_unknown: bool) Error!Duration {
     const value = try expression(text);
     if (value == -1) return .permanent;
@@ -71,7 +69,6 @@ const Parser = struct {
                 const rhs = try self.product(depth);
                 value = try checked(if (c == '+') value + rhs else value - rhs);
             } else if (std.ascii.isDigit(c)) {
-                // Reference unit sequences and whitespace-separated numbers imply addition.
                 value = try checked(value + try self.product(depth));
             } else return value;
         }
@@ -131,7 +128,6 @@ const Parser = struct {
         while (self.pos < self.text.len and (std.ascii.isDigit(self.text[self.pos]) or self.text[self.pos] == '.')) self.pos += 1;
         if (self.pos == start) return error.InvalidDuration;
         const numeric = self.text[start..self.pos];
-        // Do not round an integer token before checked conversion to legacy u64.
         if (std.mem.indexOfScalar(u8, numeric, '.') == null) {
             const integer = std.fmt.parseInt(u64, numeric, 10) catch return error.Overflow;
             if (integer > 9007199254740992) return error.PrecisionLoss;

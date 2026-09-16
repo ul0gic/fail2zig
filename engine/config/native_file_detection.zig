@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Internal configuration projection for native file detection. No new public
-//! configuration syntax and no automatic source selection or daemon activation.
 const std = @import("std");
 const config = @import("native.zig");
 const processing = @import("../core/native_source_processor.zig");
@@ -17,7 +15,6 @@ pub const Settings = struct {
     max_sources: usize,
 
     ignore_capacity: usize,
-    /// The caller supplies a required durable staged consumer before admission.
     custom: bool = false,
     encoding: @import("../core/source_text.zig").Encoding = .utf8,
     bom: @import("../core/source_text.zig").Bom = .preserve,
@@ -31,15 +28,10 @@ pub const Plan = struct {
     specs: []session.Spec,
     max_sources: usize,
 
-    /// Keep the plan at a stable address for the lifetime of the created session.
-    /// Caller supplies shared admission and clocks on this value before creation.
     pub fn sessionOptions(self: *const Plan) session.Options {
         return .{ .processing = self.processing, .detection = if (self.detection) |*value| value.consumer() else null, .max_sources = self.max_sources };
     }
 
-    /// Config strings must remain immutable and outlive this plan and its sessions. The
-    /// plan owns the spec array and detector CIDRs. No filesystem probe, DNS,
-    /// subprocess, database or firewall work occurs during this projection.
     pub fn init(allocator: std.mem.Allocator, cfg: *const config.Config, jail_index: usize, parent_generation: [32]u8, settings: Settings) !Plan {
         if (jail_index >= cfg.jails.len) return error.UnknownJail;
         const jail = &cfg.jails[jail_index];
@@ -58,9 +50,6 @@ pub const Plan = struct {
         const seconds = jail.effectiveFindtime(cfg.defaults);
         if (seconds == 0) return error.InvalidFindtime;
         const window_us = std.math.mul(i64, std.math.cast(i64, seconds) orelse return error.InvalidFindtime, 1_000_000) catch return error.InvalidFindtime;
-        // A syslog body must use the timestamp from that same envelope. Require
-        // the already-supported explicit BSD or ISO field, never a second date
-        // elsewhere in the message or implicit receipt time.
         if (settings.body == .syslog) {
             if (settings.timestamp != .field) return error.SyslogTimestampRequired;
             const field = settings.timestamp.field;
@@ -95,8 +84,6 @@ pub const Plan = struct {
             .max_record_bytes = settings.max_record_bytes,
             .max_decoded_bytes = settings.max_decoded_bytes,
         };
-        // Reuse the processor's authoritative validation, including bounded
-        // codecs and mandatory year/timezone context. Allocation is startup-only.
         const scratch = try allocator.alloc(u8, settings.max_decoded_bytes);
         defer allocator.free(scratch);
         _ = try processing.Processor.init(allocator, options, scratch, .{ .us = 0 });

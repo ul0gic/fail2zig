@@ -277,8 +277,6 @@ fn translateJail(
             else => null,
         };
         if (asset) |prepared| {
-            // A stock-looking name cannot authorize replacing a custom definition
-            // with the compiled builtin bearing the same name.
             if (prepared.config.sources.items.len > 0) pending = true;
         } else pending = true;
     }
@@ -919,8 +917,6 @@ fn requiresCompatibility(sec: *const fail2ban.Section) bool {
             found = true;
             break;
         };
-        // Imported action names do not prove equivalent scope/lifecycle. Preserve
-        // all explicit actions for admission, including names matching a backend.
         if (!found) return true;
         if (std.mem.indexOf(u8, kv.value_ptr.*, "%(") != null) return true;
     }
@@ -1042,8 +1038,6 @@ fn prepareManifest(ctx: *Context, document: *const fail2ban.ConfigDocument, glob
                 try assets.append(a, .{ .jail = section.key_ptr.*, .kind = kind, .selector = selector, .admission = admission, .sources = prepared.config.sources.items, .parameters = try entries(a, &prepared.selector.parameters), .combined = try entries(a, &combined), .diagnostics = prepared.config.warnings.items, .known_combined = known_values, .auto_logtype = auto_logtype, .consumer_phase = consumer_phase });
             }
         }
-        // The raw graph/provenance remains unchanged; expose the consuming jail
-        // view after the filter's known/ merge for effective option observations.
         for (options.items) |*option| {
             if (!std.mem.eql(u8, option.section, section.key_ptr.*)) continue;
             option.resolution_error = null;
@@ -1127,7 +1121,7 @@ test "p2 migration inherited values resolve in consuming jail context" {
     _ = try importConfig(a, root, output);
     const cfg = try native.Config.loadFile(a, output);
     try testing.expectEqual(@as(?u32, 7), cfg.jails[0].maxretry);
-    try testing.expect(cfg.jails[0].compatibility_pending); // retained open helper requires admission
+    try testing.expect(cfg.jails[0].compatibility_pending);
 }
 
 test "p2 migration same-name custom filter cannot silently activate builtin" {
@@ -1272,7 +1266,6 @@ test "p2 migration retains global layers and blocks unsupported activation" {
         }
     }
     try testing.expectEqual(@as(usize, 2), empty_targets);
-    // The global guard remains authoritative even if a per-jail guard is cleared.
     var jails = try a.dupe(native.JailConfig, cfg.jails);
     jails[0].enabled = true;
     jails[0].compatibility_pending = false;

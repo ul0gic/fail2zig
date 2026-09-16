@@ -56,8 +56,6 @@ test "native detection: retained external filter corpus and rule identities" {
         .{ .name = "proftpd", .filter = "proftpd" },
         .{ .name = "sshd", .filter = "sshd" },
         .{ .name = "vsftpd", .filter = "vsftpd" },
-        // Positive/benign internal-event behavior belongs to N3.4.2. This
-        // batch proves only that an external recidive line cannot be admitted.
         .{ .name = "recidive-internal", .filter = "recidive", .external = false },
     };
     const bytes = try std.fs.cwd().readFileAlloc(t.allocator, @import("detection_test_options").corpus_path, 1 << 20);
@@ -92,8 +90,6 @@ test "native detection: retained external filter corpus and rule identities" {
         opts.filter = fixture.filter;
         var detector = try builtin.Detector.init(t.allocator, opts);
         defer detector.deinit(t.allocator);
-        // Existing fixtures contain both service bodies and syslog envelopes.
-        // Their historical extractor is explicit here, not a detector fallback.
         const body = parser.stripSyslogPrefix(fixture.line);
         const result = try detector.evaluate(body, eligible);
         if (fixture.ip) |ip| {
@@ -117,9 +113,6 @@ test "native detection: retained external filter corpus and rule identities" {
             try t.expect(positive[i] > 0 and benign[i] > 0 and refused[i] == 0);
         } else try t.expect(positive[i] == 0 and benign[i] == 0 and refused[i] == 1);
     }
-    // Exactly one qualifying positive is retained for every selected external
-    // PatternDef. This catches unreachable identities and accidental omissions
-    // without multiplying cases across sources or backends.
     for (registry.entries) |entry| {
         if (std.mem.eql(u8, entry.name, "recidive")) continue;
         for (entry.patterns) |pattern| {
@@ -144,8 +137,6 @@ test "native detection: ineligible records never become candidates" {
     receipt.eligible.origin = .receipt;
     receipt.eligible.original = null;
     try t.expectEqualDeep(receipt.eligible, (try detector.evaluate(failure, receipt)).candidate.time);
-    // A later-declared pattern must retain its actual index, not ParseResult's
-    // default zero matched_pattern_id.
     const result = try detector.evaluate("Invalid user guest from 203.0.113.7 port 22", eligible);
     try t.expect(result.candidate.match.pattern_index > 0);
 }
@@ -300,12 +291,9 @@ test "native detection: native decoding and time preparation feed a staged candi
     const line = "Sep 12 10:00:00 host sshd[10]: " ++ failure;
     const prepared = try owner.adapter().prepare(.{ .source = "fixture", .occurrence = "one", .cursor = "cursor", .message = line, .raw_hash = [_]u8{0} ** 32, .byte_start = 0, .receipt_time = now }, &owner);
     defer prepared.release(prepared.context);
-    // This ASCII fixture has the same decoded length. The production consumer
-    // integration must carry the decoder's actual slice for all other codecs.
     const candidate = (try plan.detection.?.evaluate(scratch[0..line.len], prepared.native_time.?)).candidate;
     try t.expectEqual(now.us - 1_000_000, candidate.time.timestamp.us);
     try t.expectEqual(try shared.IpAddress.parse("203.0.113.7"), candidate.match.subject);
-    // Preparation and pure detection cannot acknowledge or publish anything.
     try t.expectEqual(@as(u64, 0), owner.timeHealth().eligible);
     try t.expect(prepared.intent == null);
 }
@@ -434,7 +422,6 @@ test "native detection: actual file consumers commit typed results and recover p
             try t.expectEqual(clock.now - 1_000_000, admitted.receipt.us);
             try t.expectEqual(@as(usize, 0), try session.poll(1));
             try t.expectEqual(@as(u64, 1), session.processor.timeHealth().eligible);
-            // A second occurrence can age out while its failed commit waits.
             try writeAscii(file, encoding, line);
             store.fail_at = .after_detection;
             try t.expectError(error.InjectedFailure, session.poll(1));
@@ -451,7 +438,6 @@ test "native detection: actual file consumers commit typed results and recover p
             var altered_opts = altered.sessionOptions();
             altered_opts.clock = Clock.read;
             altered_opts.clock_context = &clock;
-            // Pending-receipt generation is checked before checkpoint restore.
             try t.expectError(error.ReceiptConflict, sessions.Session.create(t.allocator, &store, altered_opts, altered.specs));
             const session = try sessions.Session.create(t.allocator, &store, opts, plan.specs);
             defer session.destroy();

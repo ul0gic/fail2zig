@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Staged pre-matching line tuples. Matching/removal/correlation belongs to P3.
 const std = @import("std");
 pub const times = @import("event_time.zig");
 pub const Tuple = struct { prefix: []const u8 = "", time: []const u8 = "", suffix: []const u8 = "" };
@@ -33,8 +32,6 @@ pub fn validate(saved: Snapshot, limits: Limits) !void {
     if (count > limits.max_bytes) return error.LineContextTooLarge;
 }
 
-/// Slices borrow the line and saved context; only the new tuple array is allocated.
-/// Serialize/copy the staged snapshot before releasing either backing allocation.
 pub fn stage(allocator: std.mem.Allocator, saved: Snapshot, input: Input, limits: Limits) !Staged {
     try validate(saved, limits);
     _ = try times.EventTime.init(input.now.seconds);
@@ -71,7 +68,6 @@ pub fn stage(allocator: std.mem.Allocator, saved: Snapshot, input: Input, limits
     return .{ .snapshot = next, .prospective = tuple, .no_date = no_date, .appended = appended };
 }
 
-/// Python DateResult start/end count Unicode codepoints, not UTF-8 bytes.
 pub fn splitCodepoints(line: []const u8, start: usize, end: usize) !Tuple {
     if (start > end) return error.InvalidDateSpan;
     var view = try std.unicode.Utf8View.init(line);
@@ -89,8 +85,6 @@ pub fn splitCodepoints(line: []const u8, start: usize, end: usize) !Tuple {
     return .{ .prefix = line[0..first], .time = line[first..last], .suffix = line[last..] };
 }
 
-/// A nonparticipating optional regex group reports (-1,-1). The reference uses
-/// Python slicing, preserving all but the final codepoint as the prefix.
 pub fn splitPythonSpan(line: []const u8, start: i64, end: i64) !Tuple {
     if (start == -1 and end == -1) {
         const count = try std.unicode.utf8CountCodepoints(line);

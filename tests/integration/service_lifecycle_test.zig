@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 
-//! Foreground lifecycle of the one executable under a service manager contract: READY only
-//! after admission, RELOADING/READY around SIGHUP, STOPPING on TERM/INT, SIGUSR1 log reopen,
-//! and typed startup refusals. A datagram receiver in the temp dir stands in for systemd.
-
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
@@ -92,7 +88,6 @@ fn writeConfig(h: *harness.Harness, p: *const Paths, opts: ConfigOptions) !void 
     }
 }
 
-/// Stands in for the service manager's NOTIFY_SOCKET.
 const NotifyReceiver = struct {
     fd: posix.fd_t,
 
@@ -109,7 +104,6 @@ const NotifyReceiver = struct {
         posix.close(self.fd);
     }
 
-    /// Returns null when nothing arrived within the budget.
     fn next(self: NotifyReceiver, buf: []u8, timeout_ns: u64) !?[]const u8 {
         var timer = try std.time.Timer.start();
         while (true) {
@@ -169,7 +163,6 @@ const Daemon = struct {
         return self.child.wait();
     }
 
-    /// Bounded wait so a hung daemon fails the test instead of the run.
     fn waitBounded(self: *Daemon, timeout_ns: u64) !std.process.Child.Term {
         var timer = try std.time.Timer.start();
         while (timer.read() < timeout_ns) {
@@ -206,7 +199,6 @@ fn storageHealthy(h: *harness.Harness) bool {
     return std.mem.indexOf(u8, s, "\"storage\":\"healthy\"") != null;
 }
 
-/// Storage passes through `recovering` after an applied reload; wait for it to settle.
 fn waitStorageHealthy(h: *harness.Harness, timeout_ns: u64) !void {
     var timer = try std.time.Timer.start();
     while (timer.read() < timeout_ns) {
@@ -216,7 +208,6 @@ fn waitStorageHealthy(h: *harness.Harness, timeout_ns: u64) !void {
     return error.TimedOut;
 }
 
-/// Waits for admission while proving READY never precedes it.
 fn waitReadyAfterAdmission(h: *harness.Harness, rx: NotifyReceiver) !void {
     var buf: [256]u8 = undefined;
     var timer = try std.time.Timer.start();
@@ -309,8 +300,6 @@ test "lifecycle: READY only after admission, RELOADING/READY around SIGHUP, STOP
     defer a.free(g1);
     try t.expect(!std.mem.eql(u8, g0, g1));
 
-    // A rejected edit never reaches the worker, so the service manager sees no RELOADING
-    // at all; the previous generation stays published and the daemon keeps serving.
     try writeConfig(&fx.h, &fx.p, .{ .bantime = 120, .extra = "bogus_key = 1" });
     try d.signal(posix.SIG.HUP);
     try fx.rx.expectSilence(&buf, 1 * std.time.ns_per_s);
@@ -360,7 +349,6 @@ test "lifecycle: SIGUSR1 after rename reopens the log target and leaves the rota
     std.time.sleep(300 * std.time.ns_per_ms);
     const old_len = (try std.fs.cwd().statFile(rotated)).size;
 
-    // A no-op reload is logged but, like a rejection, sends no RELOADING/READY.
     try d.signal(posix.SIG.HUP);
     try fx.rx.expectSilence(&buf, 500 * std.time.ns_per_ms);
     try waitFileContains(fx.p.log_target, "native reload (SIGHUP): outcome=noop", 5 * std.time.ns_per_s);
@@ -397,7 +385,6 @@ test "lifecycle: BUG-026 startup refusal reaches the file log before exit" {
     const a = t.allocator;
     var fx = try Fixture.init(a);
     defer fx.deinit(a);
-    // Opening a directory as the database fails even when the test runs as root.
     try writeConfig(&fx.h, &fx.p, .{ .log_target = fx.p.log_target, .state_file = fx.p.state_dir });
     var d = try Daemon.spawn(a, &fx.h, fx.p.notify, false);
     defer d.deinit();
@@ -433,8 +420,6 @@ test "lifecycle: log target with a missing parent is refused before the daemon s
 }
 
 test "lifecycle: journal jail without journalctl is refused naming the transport" {
-    // The daemon resolves journalctl at the fixed path /usr/bin/journalctl, never PATH, so an
-    // unprivileged run cannot hide it; the lab rehearsal covers this with InaccessiblePaths.
     if (std.fs.cwd().access("/usr/bin/journalctl", .{})) |_| return error.SkipZigTest else |_| {}
     const a = t.allocator;
     var fx = try Fixture.init(a);

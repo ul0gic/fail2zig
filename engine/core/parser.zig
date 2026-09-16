@@ -361,13 +361,10 @@ pub fn extractTimestampWithYear(
     return null;
 }
 
-/// Exact common-format parser. Arbitrary datepattern and named timezones require the
-/// compatibility date backend; this API does not pretend to implement that grammar.
 pub const ExactTimestampMatch = struct { seconds: f64, len: u16 };
 pub const DateContext = struct {
     year: i64,
     now: f64,
-    /// Explicit fixed offset for timestamps without a zone; never implicit host localtime.
     default_offset_seconds: i32 = 0,
 };
 pub fn extractTimestampExact(text: []const u8, context: DateContext) ?ExactTimestampMatch {

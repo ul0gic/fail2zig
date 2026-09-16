@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Snapshot-to-staging conversion and idempotent persistence into the
-//! schema-23 staging tables. The store method body is exercised here through
-//! the same statement text with real binds on the store's own connection.
 const std = @import("std");
 const import = @import("migration/import.zig");
 const db = @import("migration/fail2ban_db.zig");
@@ -43,7 +40,6 @@ const Source = struct {
         self.tmp.cleanup();
     }
 
-    /// Empty schema-4 database with the given enabled jails and no seeded rows.
     fn empty(self: *Source, jails: []const []const u8) !void {
         try fixture.build(self.path, .{ .profile = .delete, .seed_rows = false });
         var writer = try fixture.openWriter(self.path);
@@ -77,7 +73,6 @@ const Source = struct {
 
 const GroupSpec = struct { name: []const u8, enabled: bool = true, kind: []const u8 = "supported", scope: []const u8 = "host" };
 
-/// Minimal plan document: the manifest carries only what the importer reads.
 const Doc = struct {
     arena: std.heap.ArenaAllocator,
     doc: plan.Document,
@@ -207,7 +202,6 @@ test "migration import: unknown sentinel, zero, future and absent-ip rows are bl
     try t.expect(hasBlocker(staging.report, "sshd", "ip-invalid:row:5"));
     try t.expect(hasBlocker(staging.report, "sshd", "ip-invalid:row:6"));
     try t.expectEqual(@as(usize, 6), staging.report.blockers.len);
-    // The valid row is still converted so the report can show what would import.
     try t.expectEqual(@as(u64, 1), staging.report.imported_owners);
     try t.expectEqual(@as(u64, 7), staging.owners[0].source_row);
 }
@@ -262,7 +256,6 @@ test "migration import: repeated live rows collapse to one owner and bips histor
 
     try t.expect(!staging.report.blocked());
     try t.expectEqual(@as(usize, 1), staging.owners.len);
-    // A permanent decision is never narrowed by a later finite one.
     try t.expectEqual(import.LeaseKind.permanent, staging.owners[0].lease_kind);
     try t.expectEqual((now_s - 100) * std.time.us_per_s, staging.owners[0].source_event_us);
     try t.expectEqual(@as(i64, 2), staging.owners[0].bancount);
@@ -273,7 +266,6 @@ test "migration import: repeated live rows collapse to one owner and bips histor
     try t.expectEqual(@as(i64, 3), staging.history[0].bancount);
     try t.expectEqual(@as(u64, 2), staging.history[0].source_row);
     try t.expectEqual(import.EventKind.restored_ban, staging.history[0].event_kind);
-    // bips carries the raw sentinel; history does not interpret bantime.
     try t.expectEqualSlices(u8, &[_]u8{ 198, 51, 100, 8 }, staging.history[1].scope.subject.address[0..4]);
     try t.expectEqual(@as(u64, 2), staging.report.imported_history);
 }
@@ -316,7 +308,6 @@ test "migration import: enabled snapshot jails without a supported selected plan
 test "migration import: the snapshot enabled flag never gates import; the plan selection does" {
     var source = try Source.init();
     defer source.deinit();
-    // A cleanly stopped fail2ban leaves every jail with enabled=0.
     try source.empty(&.{});
     try source.exec("INSERT INTO jails(name, enabled) VALUES('sshd', 0), ('nginx-http-auth', 0), ('postfix', 0)");
     try source.ban(hostRow("sshd", "192.0.2.10", now_s - 600, 3600));
@@ -340,7 +331,6 @@ test "migration import: the snapshot enabled flag never gates import; the plan s
     try t.expectEqual(@as(usize, 0), staging.history.len);
     try t.expectEqual(@as(u64, 1), staging.report.skipped_expired);
     try t.expectEqual(@as(u64, 1), staging.report.double_count_avoided);
-    // Only the jail outside the selection is reported as disabled-and-skipped; unknown jails are never staged.
     try t.expectEqual(@as(usize, 1), staging.report.skipped_unsupported.len);
     try t.expectEqualStrings("postfix", staging.report.skipped_unsupported[0].group);
     try t.expectEqualStrings("jail-disabled-in-snapshot", staging.report.skipped_unsupported[0].reason);
@@ -383,7 +373,6 @@ test "migration import: a captured snapshot of the seeded fixture imports throug
     defer doc.deinit();
     var staging = try import.import(a, .{ .snapshot_path = snap.destination_path, .document = &doc.doc, .backend = .nftables, .now_us = now_us });
     defer staging.deinit();
-    // Seeded rows: active, expired, permanent, unknown (-2), IPv6, disabled-jail.
     try t.expect(hasBlocker(staging.report, "sshd", "bantime-unknown-sentinel:row:4"));
     try t.expectEqual(@as(usize, 1), staging.report.blockers.len);
     try t.expectEqual(@as(u64, 3), staging.report.imported_owners);
@@ -408,7 +397,6 @@ test "migration import: two hundred thousand generated bans rows import within t
         defer stmt.finalize();
         var i: u32 = 0;
         while (i < total) : (i += 1) {
-            // Every tenth row repeats the previous address so the merge path runs at scale.
             const n = if (i % 10 == 9) i - 1 else i;
             var ip: [40]u8 = undefined;
             try stmt.bindText(1, try std.fmt.bufPrint(&ip, "2001:db8:{x}:{x}::1", .{ n >> 16, n & 0xffff }));
@@ -428,13 +416,9 @@ test "migration import: two hundred thousand generated bans rows import within t
     try t.expectEqual(@as(u64, total - total / 10), staging.report.imported_owners);
     try t.expectEqual(@as(u64, total / 10), staging.report.double_count_avoided);
     try t.expectEqual(@as(u64, 0), staging.report.skipped_expired);
-    // This deliberately exercises the full supported snapshot ceiling. The
-    // generous wall bound rejects the former quadratic merge without making
-    // ordinary host-speed variance part of the product contract.
     try t.expect(elapsed_ns < 30 * std.time.ns_per_s);
 }
 
-/// Schema-23 store with one migration run row, mirroring the daemon's admission chain.
 const StoreFixture = struct {
     tmp: t.TmpDir,
     path: []u8,
@@ -501,7 +485,6 @@ const StoreFixture = struct {
         return @ptrCast(self.store.db);
     }
 
-    /// Same statements and binding order as the proposed `Store.stageMigrationRows`.
     fn stageRows(self: *StoreFixture, run_id: [32]u8, owners: []const import.StagedOwnerRow, history: []const import.StagedHistoryRow) !void {
         const conn = db.Connection{ .db = self.handle() };
         try self.store.inspectExec("BEGIN IMMEDIATE;");
@@ -592,7 +575,6 @@ test "migration import: staged rows persist into schema 23 and a repeat run is i
     try t.expectEqual(@as(i64, 3), try f.scalar("SELECT bancount FROM migration_staged_history WHERE seq=1;"));
     try t.expectEqual(@as(i64, 1), try f.scalar("SELECT event_kind FROM migration_staged_history WHERE seq=1;"));
 
-    // Interrupted earlier attempt: stale partial rows under the same run id, plus a foreign run.
     try f.store.inspectExec("INSERT INTO migration_staged_owners VALUES(X'1111111111111111111111111111111111111111111111111111111111111111',9,'stale',zeroblob(92),2,NULL,0,0);");
     try f.store.inspectExec("INSERT INTO migration_staged_owners VALUES(X'2222222222222222222222222222222222222222222222222222222222222222',1,'other',zeroblob(92),2,NULL,0,0);");
     try t.expectEqual(@as(i64, 4), try f.count("migration_staged_owners", run_id));
@@ -602,7 +584,6 @@ test "migration import: staged rows persist into schema 23 and a repeat run is i
     try t.expectEqual(@as(i64, 0), try f.scalar("SELECT count(*) FROM migration_staged_owners WHERE jail='stale';"));
     try t.expectEqual(@as(i64, 1), try f.count("migration_staged_owners", other));
 
-    // Runtime owner tables are untouched by staging.
     try t.expectEqual(@as(i64, 0), try f.scalar("SELECT count(*) FROM retry_states;"));
 }
 
@@ -629,7 +610,6 @@ test "migration import: staging refuses a blocked report and a run id without a 
     defer f.deinit();
     const owners = try import.ownerRows(a, &blocked);
     defer a.free(owners);
-    // Foreign keys are enforced: no migration_runs row means no staged rows.
     try t.expectError(error.DatabaseFailure, f.stageRows([_]u8{3} ** 32, owners, &.{}));
     try t.expectEqual(@as(i64, 0), try f.scalar("SELECT count(*) FROM migration_staged_owners;"));
 }

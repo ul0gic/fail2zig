@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Source-bound reversible bridge into the existing native record transaction.
-//! All owners, configuration slices and programs outlive this stable coordinator.
-//! DNS scheduling and SQL remain with the daemon; neither occurs during prepare.
 const std = @import("std");
 const rules = @import("native_rules.zig");
 const rule = @import("native_rule_consumer.zig");
@@ -19,10 +16,7 @@ pub const Settings = struct {
     logical_source: []const u8,
     filter: detection.Name,
     parent_generation: [32]u8,
-    /// Configured initial contents; construct against this immutable snapshot
-    /// before publishing a coherent saved mutable allowlist into its owner.
     ignore_generation: [32]u8,
-    /// Immutable resolver authority is durably admitted before source binding.
     authority_revision: u64 = 0,
     family: dns.Family = .both,
     journal: bool = false,
@@ -42,16 +36,12 @@ pub const StateStage = struct {
     bootstrap: bool,
 };
 pub const Pending = struct { request: dns.Request, purpose: enum { subject, exclusion }, occurrence: [32]u8 };
-/// Semantic identity deliberately excludes incarnation. The processor binds it
-/// to codec/time policy before the exact incarnation is known at source attach.
 pub fn generation(settings: Settings, programs: []const *const rules.Program, ignores: *const ignore.Owner, cache: ?*const dns.Cache) ![32]u8 {
     return generationFromInitial(settings, programs, ignores.live, cache);
 }
 fn generationFromInitial(settings: Settings, programs: []const *const rules.Program, initial: *const ignore.Snapshot, cache: ?*const dns.Cache) ![32]u8 {
     return generationFromPolicy(settings, programs, initial, if (cache) |owner| owner.generation else null);
 }
-/// Pure preflight of immutable policy; does not consult mutable resolver state
-/// or invoke clocks. Runtime construction uses this same semantic identity.
 pub fn generationFromPolicy(settings: Settings, programs: []const *const rules.Program, initial: *const ignore.Snapshot, resolver_generation: ?[32]u8) ![32]u8 {
     if (programs.len == 0 or programs.len > max_rules) return error.ConsumerCapacity;
     if (settings.filter.len == 0 or settings.filter.len > 64) return error.InvalidConsumer;
@@ -86,8 +76,6 @@ pub fn generationFromPolicy(settings: Settings, programs: []const *const rules.P
     for (initial.entries) |entry| if (entry == .hostname) {
         hostname_ignores += 1;
     };
-    // Dependencies reserve immutable ignore and configured resolver authority revisions. Admission uses
-    // a conservative union bound; never discovers an impossible batch at commit.
     if (hostname_rules + hostname_ignores > state.max_dependencies - 1 - @as(usize, @intFromBool(resolver_generation != null))) return error.ConsumerCapacity;
     if (hostname_rules + hostname_ignores != 0 and resolver_generation == null) return error.HostnameResolutionRequired;
     if (hostname_rules + hostname_ignores != 0 and settings.monotonic_ms == null) return error.DnsMonotonicClockRequired;
@@ -142,8 +130,6 @@ pub const Coordinator = struct {
     pub fn init(settings: Settings, incarnation: []const u8, owners: []const *rule.Consumer, ignores: *ignore.Owner, cache: ?*dns.Cache) !Coordinator {
         return initWithInitial(settings, incarnation, owners, ignores, ignores.live, cache);
     }
-    /// New sources may bind after a saved mutable ignore snapshot was restored.
-    /// Initial content identity remains immutable; live state must retain policy.
     pub fn initWithInitial(settings: Settings, incarnation: []const u8, owners: []const *rule.Consumer, ignores: *ignore.Owner, initial: *const ignore.Snapshot, cache: ?*dns.Cache) !Coordinator {
         if (!std.mem.eql(u8, &ignores.live.options.parent_generation, &initial.options.parent_generation) or
             !std.mem.eql(u8, &ignores.live.options.resolver_generation, &initial.options.resolver_generation) or
@@ -262,8 +248,6 @@ pub const Coordinator = struct {
         try self.batch().validate();
         return .{ .manifest = try self.manifest(source_generation), .state = self.stateStage(), .bootstrap = true };
     }
-    /// Caller supplies every row from one validated ready manifest snapshot. It
-    /// rechecks that snapshot before publishing all source/shared restored owners.
     pub fn prepareRestore(self: *Coordinator, source_generation: [32]u8, saved: []const Saved, now_us: i64) !StateStage {
         if (self.ready or saved.len != self.requiredCount()) return error.ConsumerRestoreMismatch;
         try self.begin(now_us);
@@ -432,8 +416,6 @@ pub const Coordinator = struct {
         self.name_count += 1;
         try self.dependency(.{ .key = key, .expected_revision = revision, .valid_until_us = expiry });
     }
-    /// One completion-turn reservation for a subject only. Any prepare consumes
-    /// it, including an aborted prepare; exclusion reads never see this answer.
     pub fn provideImmediate(self: *Coordinator, result: dns.Result, now_ms: u64, now_us: i64) !void {
         if (self.busy or self.immediate != null) return error.ConsumerBusy;
         const pending = self.pending orelse return error.DnsRequestMismatch;
@@ -474,8 +456,6 @@ pub const Coordinator = struct {
         if (self.pending == null or self.pending.?.request.id != request_id) return error.DnsRequestMismatch;
         self.pending = null;
     }
-    /// Commit this shared input first, without touching the waiting source ack.
-    /// Publish only after Store.bootstrapConsumerManifest/commitConsumerInput.
     pub fn prepareDnsResult(self: *Coordinator, result: dns.Result, now_ms: u64, now_us: i64) !StateStage {
         const pending = self.pending orelse return error.DnsRequestMismatch;
         try result.validateCompletion(pending.request, now_ms, now_us);
@@ -491,9 +471,6 @@ pub const Coordinator = struct {
         try self.delta(.{ .key = key, .format_version = dns.version, .expected_revision = self.dns_stage.?.expected_revision, .payload = self.dns_stage.?.checkpoint(), .valid_until_us = result.valid_until_us });
         return .{ .manifest = .{ .jail = "@shared", .source = source, .source_generation = result.request.generation, .required = &self.dns_requirement }, .state = self.stateStage(), .bootstrap = self.dns_stage.?.expected_revision == 0 };
     }
-    /// Replace the shared allowlist as one consumer delta at the owner's current revision.
-    /// The snapshot's parent generation is unchanged, so restore paths read the new payload
-    /// through the same key; publish only after the store committed the delta.
     pub fn prepareAllowlistRefresh(self: *Coordinator, next: *ignore.Snapshot, source_generation: [32]u8, now_us: i64) !StateStage {
         if (!self.ready) return error.ConsumerStateNotReady;
         if (!std.mem.eql(u8, &next.options.parent_generation, &self.ignores.live.options.parent_generation) or !std.mem.eql(u8, &next.options.resolver_generation, &self.ignores.live.options.resolver_generation)) return error.IgnoreGenerationMismatch;
@@ -549,8 +526,6 @@ pub fn resolverKey(resolver_generation: [32]u8) state.Key {
 pub fn dnsKey(name: []const u8, family: dns.Family, resolver_generation: [32]u8) state.Key {
     return .{ .kind = .dns, .jail = "@shared", .source = name, .rule = @tagName(family), .generation = resolver_generation };
 }
-/// Borrowed bounded registry; source factories allocate/admit owners before
-/// registering, after an actual file/journal incarnation has been established.
 pub const Registry = struct {
     generation: [32]u8,
     sources: [max_sources]*Coordinator = undefined,

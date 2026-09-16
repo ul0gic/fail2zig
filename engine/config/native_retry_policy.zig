@@ -6,9 +6,6 @@ const retry = @import("../core/native_retry.zig");
 
 pub fn fromJail(jail: *const config.JailConfig, defaults: config.JailDefaults, max_subjects: u32) !retry.Policy {
     const effective = config.resolveJailFromConfig(jail, defaults);
-    // Check the frozen native range before narrowing and before the caller opens
-    // or mutates durable state. Values above 128 remain an explicit supported-
-    // range refusal rather than a larger transient allocation.
     if (effective.maxretry == 0 or effective.maxretry > retry.max_attempts) return error.InvalidRetryPolicy;
     const value = retry.Policy{
         .maxretry = @intCast(effective.maxretry),

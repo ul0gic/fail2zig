@@ -102,8 +102,6 @@ test "journalctl contract: successful seek does not prove the saved anchor is in
     defer f.tmp.cleanup();
     const all = try f.query(a, "none", &.{"--all"});
     const cursor = try field(all[0], "__CURSOR");
-    // A changed selector excludes the original anchor but journalctl still succeeds.
-    // A durable adapter must bind source configuration and verify the returned anchor.
     const selected = try f.query(a, "none", &.{ "--all", "F2Z_KIND=allow", try std.fmt.allocPrint(a, "--cursor={s}", .{cursor}) });
     try t.expectEqual(@as(usize, 1), selected.len);
     try t.expectEqualStrings("2", try field(selected[0], "F2Z_SEQUENCE"));

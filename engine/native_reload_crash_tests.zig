@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Regression root for BUG-023: a reload re-key and its published generation row commit in
-//! one transaction. A failure before that commit leaves every generation-keyed object at the
-//! old generation with no new row; success leaves exactly one published head with every
-//! object at the new generation. An unpublished head is never adopted.
 const std = @import("std");
 const durable = @import("core/record_store.zig");
 const effects = @import("core/native_effect.zig");
@@ -189,7 +185,6 @@ test "reload crash: a committed re-key is published in the same transaction and 
     const head = (try f.store.latestConfigGeneration()).?;
     try t.expectEqualSlices(u8, &config_generation, &head.generation);
     try t.expect(head.published);
-    // The publish fault can no longer split a reload: the head is already published.
     f.store.fail_at = .before_config_generation_publish;
     try t.expectError(error.InjectedFailure, f.store.publishConfigGeneration(config_generation));
     f.store.fail_at = null;

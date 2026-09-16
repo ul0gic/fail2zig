@@ -660,7 +660,6 @@ pub const JournaldSource = struct {
     pub fn maybeFlush(self: *JournaldSource) void {
         if (!self.dirty) return;
         if (self.flush_fn) |f| {
-            // Failed state/cursor saves must remain pending even if no new records arrive.
             if (f(self.flush_userdata)) self.dirty = false;
         }
     }

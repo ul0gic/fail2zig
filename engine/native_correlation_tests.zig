@@ -78,7 +78,6 @@ test "native correlation: durable restart after start retains subject and origin
     const stage = try prepare(&before, start, timing(1, 9, 10, 12));
     const saved = try t.allocator.dupe(u8, stage.checkpoint);
     defer t.allocator.free(saved);
-    // Model a committed row followed by process death before live publication.
     stage.release();
     try t.expectEqual(@as(usize, 0), live(&before));
     var after = try adapter.Consumer.init(program, "application", "inode-a", [_]u8{0} ** 32, false);
@@ -126,7 +125,6 @@ test "native correlation: event interval and processing deadline both bound late
     try t.expectEqual(rules.Reason.event_order, (try commit(&consumer, finish, timing(2, 0, 11, 11))).reason);
     try t.expectEqual(rules.Reason.event_order, (try commit(&consumer, finish, timing(3, 32, 32, 32))).reason);
     try t.expectEqual(@as(usize, 1), live(&consumer));
-    // Out-of-order event is allowed within the original interval; processing never reverses.
     try t.expectEqual(rules.Kind.candidate, (try commit(&consumer, finish, timing(4, 31, 33, 33))).kind);
 }
 test "native correlation: processing clock reversal refuses without publishing anything" {

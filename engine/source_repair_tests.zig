@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Original source-local fixtures. Durable coordinator/SQLite integration is a
-//! separate daemon gate; these checks never start a service or modify a firewall.
 const std = @import("std");
 const repair = @import("core/source_repair.zig");
 const files = @import("core/durable_file_source.zig");
@@ -53,7 +51,6 @@ test "source repair: episode exhaustion and clock identity faults latch interven
         try t.expectEqual(delays[@min(index, delays.len - 1)], due - now);
         now = due;
         const token = (try state.begin(now, true)).?;
-        // Multi-turn directory verification cannot spend additional attempts.
         try t.expectEqual(token, (try state.begin(now, true)).?);
         try t.expectEqual(repair.Domain.pending, try state.failed(error.SourceRepairPending, now));
         _ = try state.failed(error.JournalTimeout, now);
@@ -231,8 +228,6 @@ test "source repair: pending file proof survives retained rename and restart wit
     try t.expectError(error.PendingRecordMismatch, source.verifyPending(changed));
     try t.expectEqualDeep(saved, source.acknowledgedCheckpoint().?);
 
-    // Reconstruct the saved checkpoint through its wire encoding, without any
-    // in-memory descriptor from the former owner.
     const encoded = try std.json.stringifyAlloc(t.allocator, saved, .{});
     defer t.allocator.free(encoded);
     const decoded = try std.json.parseFromSlice(files.Resume, t.allocator, encoded, .{});
@@ -304,8 +299,6 @@ test "source repair: retained-inode lookup yields without diagnosing missing anc
     try t.expectEqualDeep(saved, reopened.acknowledgedCheckpoint().?);
     try t.expectError(error.ResumeLost, reopened.verifyExistingContinuity());
     try t.expect(reopened.resume_search == null);
-    // The old synchronous API must complete a finite episode without exposing
-    // an intermediate yield to callers that do not yet own a repair scheduler.
     try t.expectError(error.ResumeLost, reopened.verifyContinuity());
     try t.expectEqualDeep(saved, reopened.acknowledgedCheckpoint().?);
 }

@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! One allocation-free admission gate per durable store. The coordinator owns
-//! this value and serializes access; status readers receive a detached Snapshot.
-//! A successful write probe alone never authorizes ingestion after a failure.
 const std = @import("std");
 
-/// Detached diagnostics only. This threshold is not an I/O deadline and grants
-/// no authority to interrupt work, acknowledge input or remove protection.
 pub const diagnostic_stall_ms: u64 = 5000;
 pub const WorkerStatus = struct {
     busy: bool,
@@ -19,11 +14,6 @@ pub const WorkerStatus = struct {
     next_committed_expiry_us: ?i64,
 };
 
-/// One fixed-size value, serialized by the coordinator's publication mutex.
-/// Every sample is explicit: null means unavailable, and wall values are checked
-/// epoch microseconds. No caller may substitute a monotonic value for wall time.
-/// Reads retain clock high-water marks; uncertainty clears only on a fresh,
-/// authoritative publication. This value never modifies the admission Gate.
 pub const WorkerObservation = struct {
     busy: bool = false,
     busy_since_ms: u64 = 0,
@@ -41,9 +31,6 @@ pub const WorkerObservation = struct {
         return result;
     }
 
-    /// Repeated begin calls cannot restart a blocked operation's diagnostic age.
-    /// Mark possible committed-owner changes uncertain with publication(...,
-    /// false) before an operation whose result has not yet been published.
     pub fn begin(self: *WorkerObservation, monotonic_ms: ?u64, wall_us: ?i64) void {
         _ = self.observe(monotonic_ms, wall_us);
         if (!self.busy) {
@@ -53,16 +40,12 @@ pub const WorkerObservation = struct {
         }
     }
 
-    /// An actual worker completion updates progress, not effect/clock authority.
     pub fn complete(self: *WorkerObservation, monotonic_ms: ?u64, wall_us: ?i64) void {
         _ = self.observe(monotonic_ms, wall_us);
         self.heartbeat_ms = self.monotonic_floor_ms;
         self.busy = false;
     }
 
-    /// A coherent committed view may replace the deadline, including null when
-    /// it proves there are no finite owners. Otherwise retain the last deadline;
-    /// neither unavailable authority nor a failed clock sample proves removal.
     pub fn publication(self: *WorkerObservation, monotonic_ms: ?u64, wall_us: ?i64, next_committed_expiry_us: ?i64, authority_current: bool) void {
         const clocks_valid = self.observe(monotonic_ms, wall_us);
         self.expiry_authority_current = authority_current and clocks_valid;
@@ -72,16 +55,12 @@ pub const WorkerObservation = struct {
         }
     }
 
-    /// Ages use nondecreasing last-valid samples, saturating naturally at u64's
-    /// range. On an unavailable/reversed sample they are diagnostic estimates
-    /// accompanied by uncertainty, never wrapped values or negative intervals.
     pub fn read(self: *WorkerObservation, monotonic_ms: ?u64, wall_us: ?i64) WorkerStatus {
         _ = self.observe(monotonic_ms, wall_us);
         const busy_age = if (self.busy) self.monotonic_floor_ms -| self.busy_since_ms else 0;
         const heartbeat_age = self.monotonic_floor_ms -| self.heartbeat_ms;
         return .{
             .busy = self.busy,
-            // A worker can stop between operations as well as inside one.
             .stalled = heartbeat_age >= diagnostic_stall_ms or busy_age >= diagnostic_stall_ms,
             .clock_uncertain = self.clock_uncertain,
             .expiry_overdue = !self.clock_uncertain and if (self.next_committed_expiry_us) |deadline| self.wall_floor_us.? >= deadline else false,
@@ -109,7 +88,6 @@ pub const WorkerObservation = struct {
 
 pub const Clock = struct {
     context: ?*anyopaque,
-    /// Milliseconds from a monotonic clock, shared with the coordinator scheduler.
     read: *const fn (?*anyopaque) u64,
 };
 pub const Phase = enum { starting, healthy, paused, recovering, intervention };
@@ -135,13 +113,8 @@ pub const Snapshot = struct {
     recovery_attempts: u64,
     last_commit_ms: ?u64,
     committed_records: u64,
-    /// Changes only for a state transition or a bounded periodic reminder.
     notice_sequence: u64,
-    /// Independent clock-fault detail; keep until validated recovery completes.
-    /// Epoch microseconds, never compared with this gate's monotonic scheduler.
     receipt_clock_floor_us: ?i64 = null,
-    /// A clock wait during startup does not convert startup storage failures
-    /// into runtime retries. Set only after every recovery stage succeeds.
     has_been_healthy: bool = false,
 };
 
@@ -167,7 +140,6 @@ pub const Gate = struct {
         return .{ .clock = clock, .last_clock_ms = clock.read(clock.context) };
     }
 
-    /// No database access, allocations, source text or dynamically owned strings.
     pub fn snapshot(self: *const Gate) Snapshot {
         return self.state;
     }
@@ -192,7 +164,6 @@ pub const Gate = struct {
         if (generation != self.state.generation) return error.RestoreRequired;
     }
 
-    /// Administrative mutations which require persistence use this same gate.
     pub fn admitMutation(self: *const Gate) !void {
         if (self.state.phase != .healthy) return error.PersistenceUnavailable;
     }
@@ -211,8 +182,6 @@ pub const Gate = struct {
         const failure = Failure{ .cause = cause, .diagnostics = diagnostics, .at_ms = at };
         if (self.state.first_failure == null) self.state.first_failure = failure;
         self.state.last_failure = failure;
-        // Intervention remains latched. Another source cannot turn corruption
-        // into an automatically retryable condition by reporting a later error.
         const next: Phase = if (self.state.phase == .intervention or !retryable(cause)) .intervention else .paused;
         const changed = self.state.phase != next;
         self.state.phase = next;
@@ -221,17 +190,12 @@ pub const Gate = struct {
         if (changed or self.state.notice_sequence == 0) self.notice(at);
     }
 
-    /// Called by the scheduler, never once per input record. A notice sequence
-    /// lets logging/status consumers report transitions without repeated alerts.
     pub fn tick(self: *Gate) !void {
         const at = try self.now();
         if (self.state.phase != .healthy and self.state.phase != .starting and at - self.last_notice_ms >= 60_000)
             self.notice(at);
     }
 
-    /// A live configuration change requests an immediate rebuild through the ordinary
-    /// recovery path so sessions re-admit under the new policy. It is not a failure: no
-    /// failure record is retained and the retry delay is not escalated.
     pub fn requestRebuild(self: *Gate) !void {
         const at = try self.now();
         if (self.state.phase != .healthy) return error.RebuildNotAllowed;
@@ -241,9 +205,6 @@ pub const Gate = struct {
         self.notice(at);
     }
 
-    /// Startup may wait for a reversed wall clock; the caller must propagate
-    /// other startup failures and refuse activation. Runtime retries start at 1s.
-    /// Intervention needs operator repair/restart, not a timer-driven reset.
     pub fn beginRecovery(self: *Gate) !u64 {
         const at = try self.now();
         switch (self.state.phase) {
@@ -265,10 +226,6 @@ pub const Gate = struct {
         return self.state.generation;
     }
 
-    /// Each operation must actually finish successfully before its completion
-    /// is supplied. The generation rejects completions from a previous attempt.
-    /// State includes committed configuration/revisions; ownership includes
-    /// uncertain effects/expiry; sources includes each required recovery anchor.
     pub fn completed(self: *Gate, generation: u64, step: RecoveryStep) !void {
         const at = try self.now();
         if (self.state.phase != .recovering or generation != self.state.generation) return error.StaleRecovery;
@@ -291,8 +248,6 @@ pub const Gate = struct {
     }
 
     pub fn committed(self: *Gate) void {
-        // Called only after a durable commit and infallible publication. A clock
-        // failure still pauses future work; it cannot undo this committed record.
         const at = self.now() catch return;
         self.state.last_commit_ms = at;
         self.state.committed_records +|= 1;
@@ -321,9 +276,6 @@ fn retryable(cause: anyerror) bool {
         error.StaleEffect,
         error.EffectReconciliationRequired,
         => true,
-        // Invalid state, unknown schema, unsupported resource requirements and
-        // unknown errors need intervention. Retrying the same deterministic work
-        // indefinitely is not recovery. Test faults likewise require a restart.
         else => false,
     };
 }

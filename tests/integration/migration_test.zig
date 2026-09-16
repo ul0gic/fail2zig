@@ -97,7 +97,6 @@ test "integration: migration round-trips jail.conf + jail.local into TOML" {
     try testing.expect(sshd != null);
     try testing.expect(nginx != null);
 
-    // A supplied same-name definition must not be replaced by the builtin.
     try testing.expect(!sshd.?.enabled);
     try testing.expect(sshd.?.compatibility_pending);
     try testing.expectEqual(@as(?u32, 3), sshd.?.maxretry);

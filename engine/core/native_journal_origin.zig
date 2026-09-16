@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Explicit local OpenSSH syslog origin profile. Journal files and journalctl
-//! remain trusted OS inputs; arbitrary imported JSON is not authenticated here.
 const std = @import("std");
 const records = @import("source_record.zig");
 const detection = @import("native_detection_record.zig");
 pub const version: u16 = 1;
 pub const Profile = struct {
     machine_id: [32]u8,
-    /// Validated immutable paths, borrowed for the profile's entire lifetime.
-    /// The coordinator must qualify these installed executables for its host.
     executables: []const []const u8,
     generation: [32]u8,
 
@@ -33,8 +29,6 @@ pub const Profile = struct {
         return .{ .machine_id = machine_id[0..32].*, .executables = executables, .generation = generation };
     }
 
-    /// Null means origin admitted. Rejection is a durable excluded outcome, not
-    /// a source error that lets an unrelated local logger stop the input stream.
     pub fn rejection(self: *const Profile, fields: ?[]const records.JournalField) ?detection.Kind {
         const values = fields orelse return .origin_missing;
         if (values.len > 256) return .origin_ambiguous;
@@ -49,8 +43,6 @@ pub const Profile = struct {
         for (found) |value| if (value == null or value.?.len == 0) return .origin_missing;
         if (!std.mem.eql(u8, found[0].?, &self.machine_id)) return .origin_machine;
         if (!std.mem.eql(u8, found[1].?, "0")) return .origin_uid;
-        // stdout credentials can describe a parent whose stream was inherited.
-        // This profile only qualifies direct OpenSSH syslog records.
         if (!std.mem.eql(u8, found[3].?, "syslog")) return .origin_transport;
         for (self.executables) |path| if (std.mem.eql(u8, found[2].?, path)) return null;
         return .origin_executable;

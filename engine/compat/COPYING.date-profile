@@ -1,3 +1,17 @@
+fail2zig date-profile provenance
+================================
+
+The embedded date templates and fixed timezone-abbreviation data in fail2zig
+are derived from Fail2Ban 1.1.1 at commit
+f60978618a101427b06924fc932b44350fec2b63, specifically:
+
+  fail2ban/server/datedetector.py
+  fail2ban/server/strptime.py
+
+Copyright (c) 2004 Cyril Jaquier and the Fail2Ban contributors.
+The derived data is distributed under GPL-2.0-or-later. The complete GNU
+General Public License version 2 text follows.
+
 The following copyright applies to all files present in the Fail2ban package,
 except if a different copyright is explicitly defined in this file.
 

@@ -1,1 +1,0 @@
-{"id":"http-login","source":"http-log","format":"json","subject":"remote","conditions":[{"field":"status","number":401},{"field":"path","op":"starts_with","text":"/private/"}],"exclude":[{"field":"path","text":"/private/health"}]}

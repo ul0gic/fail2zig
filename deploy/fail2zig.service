@@ -5,37 +5,21 @@ After=network-online.target rsyslog.service systemd-journald.service
 Wants=network-online.target
 
 [Service]
-# The daemon sends READY=1 only after configuration, storage, every source and (for enforcing
-# jails) kernel protection are verified; RELOADING/READY bracket a live reload; STOPPING on exit.
 Type=notify
 NotifyAccess=main
 
-# Run as root (no User=) but with `fail2zig` as the primary group. The
-# daemon's egid is then `fail2zig`, so `RuntimeDirectory` below and the IPC
-# socket the daemon binds both come out `root:fail2zig` with no daemon-side
-# chown. This keeps the chown family (`@privileged`) denied by the seccomp
-# filter and CAP_CHOWN out of the bounding set — a daemon chown would be
-# SIGSYS-killed and could not succeed anyway (SYS-019). Group members can
-# run read-only `fail2zig status`/`jails`/`list` through the 0660 socket; mutations
-# require root or the daemon uid (SO_PEERCRED).
+User=fail2zig
 Group=fail2zig
 ExecStart=/usr/local/bin/fail2zig --config /etc/fail2zig/config.toml
-# SIGHUP applies a validated configuration generation live; restart-only keys are reported,
-# not applied. SIGUSR1 reopens the log target.
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=10
 
-# Capability model — least privilege required for the product to function.
-# CAP_NET_ADMIN   — install/modify nftables + iptables rules, ipset entries.
-# CAP_DAC_READ_SEARCH — read /var/log/* files owned by root:adm even when the
-#                      daemon drops other privileges.
-AmbientCapabilities=CAP_NET_ADMIN CAP_DAC_READ_SEARCH
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH
 NoNewPrivileges=yes
 
-# Filesystem isolation. Everything writable is declared.
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
@@ -45,8 +29,6 @@ RuntimeDirectoryMode=0710
 StateDirectory=fail2zig
 StateDirectoryMode=0750
 
-# Kernel hardening — block kernel-adjacent attack surface the daemon never
-# legitimately needs.
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
@@ -56,7 +38,6 @@ ProtectHostname=yes
 ProtectProc=invisible
 ProcSubset=pid
 
-# Namespace, realtime, and miscellaneous exploit-surface reduction.
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
@@ -66,13 +47,11 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources @cpu-emulation @debug @module @mount @obsolete @raw-io @reboot @swap
+SystemCallFilter=fchown
 
-# Remove keyring access entirely — we never touch it.
 KeyringMode=private
 PrivateMounts=yes
 
-# Tighter umask than the systemd default (0022). Files we create under
-# /run/fail2zig and /var/lib/fail2zig should never be world-readable.
 UMask=0077
 
 [Install]

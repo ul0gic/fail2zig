@@ -1,3 +1,0 @@
-login result=failure peer=192.0.2.10 account=guest
-login result=success peer=192.0.2.10 account=guest
-login result=failure peer=192.0.2.10 account=healthcheck

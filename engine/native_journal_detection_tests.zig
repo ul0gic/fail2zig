@@ -59,7 +59,6 @@ test "native detection: journal origin requires complete unambiguous trusted met
     var child = valid_fields;
     child[2].value = "/usr/lib/openssh/sshd-session";
     try t.expect(p.rejection(&child) == null);
-    // Program tags, message text and field order do not authenticate a record.
     const tagged = [_]records.JournalField{ .{ .name = "SYSLOG_IDENTIFIER", .value = "anything" }, valid_fields[3], valid_fields[2], valid_fields[1], valid_fields[0] };
     try t.expect(p.rejection(&tagged) == null);
 }
@@ -154,7 +153,7 @@ test "native detection: journal session atomically excludes untrusted input and 
     opts.executor = .{ .context = &mock, .run = Mock.run };
     var owner: ?*sessions.Session = try sessions.Session.create(t.allocator, &store, opts);
     defer if (owner) |session| session.destroy();
-    try t.expectEqual(@as(usize, 0), try owner.?.poll(1)); // durable empty baseline
+    try t.expectEqual(@as(usize, 0), try owner.?.poll(1));
     clock.value += 30;
     const rejected = try jsonRow("one", "1000");
     defer t.allocator.free(rejected);

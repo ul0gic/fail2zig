@@ -1,10 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Typed, unactivated configuration/source handoff. Filesystem observations and
-//! backend availability enter explicitly; this module never creates a session.
-//! Preparation/conversion allocators must be caller-owned arenas, reclaimed as a
-//! unit on success or error. Returned strings may borrow the input graph/plan;
-//! those inputs must outlive every binding/session specification using them.
 const std = @import("std");
 const config = @import("fail2ban.zig");
 const policy = @import("../core/source_policy.zig");
@@ -12,7 +7,6 @@ const journal = @import("../core/journal_policy.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Parameter = struct { name: []const u8, value: []const u8 };
-/// Prepared path registration only; no session or runtime admission is implied.
 pub const FileSpec = struct {
     pattern: []const u8,
     start: @import("../core/durable_file_source.zig").Start,
@@ -93,8 +87,6 @@ pub const Plan = struct {
     diagnostics: []const []const u8,
     runtime_defaults: struct { logencoding: []const u8 = "auto", maxlines: usize = 1 } = .{},
 
-    /// These specs carry the original registration order and each head/tail mode.
-    /// Runtime source admission owns discovery, deduplication and saved cursors.
     pub fn fileSpecs(self: Plan, allocator: Allocator) ![]FileSpec {
         var specs = std.ArrayList(FileSpec).init(allocator);
         errdefer specs.deinit();
@@ -117,7 +109,6 @@ pub const Plan = struct {
         client: policy.Prepared,
         selected: ?policy.Selection = null,
         parameters: []const Parameter = &.{},
-        // Availability is captured evidence, not an actual initialized backend.
         admission: []const u8 = "prepared-only",
     };
 
@@ -135,7 +126,6 @@ pub const Plan = struct {
             .allow_no_files = environment.allow_no_files,
         }) };
         if (result.client.disposition != .admit) return result;
-        // Auto->systemd no-log switching discards the original auto parameters.
         const selector = try config.parseSelector(allocator, result.client.backend);
         result.parameters = try parameters(allocator, &selector.parameters);
         const Factory = struct {
@@ -158,7 +148,6 @@ pub const Plan = struct {
         var options = journal.Options{};
         for (binding.parameters) |parameter| {
             if (std.mem.eql(u8, parameter.name, "journalpath")) options.path = parameter.value else if (std.mem.eql(u8, parameter.name, "journalfiles")) options.files = try journal.splitFiles(allocator, parameter.value) else if (std.mem.eql(u8, parameter.name, "journalflags")) options.flags = parameter.value else if (std.mem.eql(u8, parameter.name, "rotated")) options.rotated = parameter.value else if (std.mem.eql(u8, parameter.name, "namespace")) options.namespace = parameter.value;
-            // Unknown parameters remain in Binding; no native activation admitted.
         }
         return options;
     }
@@ -207,7 +196,6 @@ fn read(allocator: Allocator, ini: *const config.ParsedIni, section: []const u8,
     if (option.reader.?.presence == .absent) {
         if (defaults.values) |values| if (values.get(key)) |value| {
             var parsed = try config.parseIniSource(allocator, "prepared-filter-default", "[Definition]\n");
-            // Asset combination has already resolved percent interpolation.
             const literal = try std.mem.replaceOwned(u8, allocator, value, "%", "%%");
             try parsed.sections.getPtr("Definition").?.keys.put(allocator, key, literal);
             const converted = config.readTypedOption(allocator, &parsed, "Definition", key, kind, fallback, default_id) catch |err| switch (err) {
@@ -304,8 +292,6 @@ pub fn prepare(allocator: Allocator, source_ini: *const config.ParsedIni, jail_n
             const spelling = if (split) |index| line[index + 1 ..] else "head";
             const start: ?@import("../core/durable_file_source.zig").Start = if (std.ascii.eqlIgnoreCase(spelling, "head")) .head else if (std.ascii.eqlIgnoreCase(spelling, "tail")) .tail else null;
             try paths.append(.{ .raw = line, .pattern = pattern, .start_spelling = spelling, .explicit_start = split != null, .start = start });
-            // Invalid file modes matter only if that source is selected; preserve
-            // them here because raw systemd backends deliberately ignore logpaths.
         }
     }
     var processing_diagnostics = std.ArrayList([]const u8).init(allocator);
@@ -344,7 +330,6 @@ pub fn prepare(allocator: Allocator, source_ini: *const config.ParsedIni, jail_n
     return result;
 }
 
-/// POSIX shlex-style words for journal match configuration, never a shell command.
 fn shellWords(allocator: Allocator, input: []const u8) ![]const []const u8 {
     var result = std.ArrayList([]const u8).init(allocator);
     var token = std.ArrayList(u8).init(allocator);
@@ -489,8 +474,6 @@ test "prepared source processing retains raw duration and bounded encoding date 
     var ini = try config.parseIniSource(a, "original", "[probe]\nlogencoding=auto\nlogtimezone=UTC\ndatepattern=\xC2\xA0EPOCH\xC2\xA0\n TAI64N\nmaxlines=3\nfindtime=2m + 1\n[huge]\nmaxlines=1001\n");
     var globals = try config.parseIniSource(a, "original", "[Definition]\n");
     const plan = try prepare(a, &ini, "probe", &globals, .{});
-    // Preparation preserves spelling; the native projection must separately
-    // admit supported durations instead of trusting a retired helper receipt.
     try std.testing.expectEqualStrings("2m + 1", string(plan.processing.findtime).?);
     try std.testing.expectEqualStrings("auto", plan.processing.encoding.?);
     try std.testing.expectEqualStrings("UTC", plan.processing.default_tz.?);

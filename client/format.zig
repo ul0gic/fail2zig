@@ -1418,6 +1418,27 @@ test "format: list plain tab-separated (SYS-002)" {
     try testing.expect(std.mem.endsWith(u8, out, "\t2\n"));
 }
 
+test "format: BUG-040 list preserves network CIDR and ordinary host presentation" {
+    const payload = "[{\"ip\":\"192.0.2.0/24\",\"jail\":\"sshd\",\"ban_count\":1},{\"ip\":\"198.51.100.7\",\"jail\":\"sshd\",\"ban_count\":2}]";
+
+    const json = try runList(testing.allocator, payload, .json);
+    defer testing.allocator.free(json);
+    try testing.expect(std.mem.indexOf(u8, json, "\"ip\":\"192.0.2.0/24\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"ip\":\"198.51.100.7\"") != null);
+
+    const plain = try runList(testing.allocator, payload, .plain);
+    defer testing.allocator.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "192.0.2.0/24\tsshd\t") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "198.51.100.7\tsshd\t") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "198.51.100.7/32") == null);
+
+    const table = try runList(testing.allocator, payload, .table);
+    defer testing.allocator.free(table);
+    try testing.expect(std.mem.indexOf(u8, table, "192.0.2.0/24") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "198.51.100.7") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "198.51.100.7/32") == null);
+}
+
 test "format: list expired entry shows 'expired' (SYS-002)" {
     const payload = "[{\"ip\":\"5.5.5.5\",\"jail\":\"sshd\",\"attempt_count\":3,\"last_attempt\":0,\"ban_count\":1,\"ban_expiry\":1000000000}]";
     const out = try runList(testing.allocator, payload, .table);
@@ -1796,7 +1817,7 @@ fn runFormatter(comptime formatter: anytype, payload: []const u8, fmt: OutputFor
 }
 
 test "format: status renders the generation field in plain and table" {
-    const payload = "{\"version\":\"0.3.1\",\"generation\":\"abcdef0123\",\"active_bans\":1}";
+    const payload = "{\"version\":\"0.4.0\",\"generation\":\"abcdef0123\",\"active_bans\":1}";
     const plain = try runStatus(testing.allocator, payload, .plain);
     defer testing.allocator.free(plain);
     try testing.expect(std.mem.indexOf(u8, plain, "generation\tabcdef0123") != null);

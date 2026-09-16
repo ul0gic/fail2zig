@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Detached native detection rows; no borrowed SQLite memory or native struct
-//! layout on disk. This is failure evidence, not an enforcement intent.
 const std = @import("std");
 pub const StagedInput = struct {
     record: @import("source_record.zig").Record,
@@ -17,7 +15,6 @@ pub const StagedPrepared = struct {
     publish: *const fn (?*anyopaque) void,
     release: *const fn (?*anyopaque) void,
 };
-/// Checkpoints carry consumer dependencies without inventing a data outcome.
 pub const StagedState = struct {
     consumers: @import("native_consumer.zig").Batch,
     context: ?*anyopaque,
@@ -30,8 +27,6 @@ pub const StagedConsumer = struct {
     prepare: *const fn (StagedInput, ?*anyopaque) anyerror!StagedPrepared,
     prepare_checkpoint: *const fn (@import("source_record.zig").Record, i64, u64, ?*anyopaque) anyerror!StagedState,
     manifest: *const fn ([]const u8, [32]u8, ?*anyopaque) anyerror!@import("native_consumer.zig").Manifest,
-    /// A one-use DNS completion may retain its captured preparation clock. The
-    /// writer still samples its actual clock and checks the consumer turn guard.
     processing_time: ?*const fn (@import("source_record.zig").Record, i64, ?*anyopaque) anyerror!i64 = null,
 };
 const policy = @import("source_time_policy.zig");
@@ -81,8 +76,6 @@ pub const Subject = union(enum) {
     pub fn validate(self: Subject) error{InvalidDetection}!void {
         if (self == .v6) {
             const value = std.mem.readInt(u128, &self.v6, .big);
-            // Mapped addresses must already be canonical IPv4. Compatible IPv6
-            // aliases are rejected by the shared address parser as well.
             if ((value >> 32) == 0xffff or (value > 1 and value >> 32 == 0)) return error.InvalidDetection;
         }
     }
@@ -112,17 +105,12 @@ pub const Outcome = struct {
     }
 };
 
-/// Stable borrowed consumer. Only immutable/stateless consumers fit this API;
-/// correlated rules require a staged checkpoint/publication contract of their own.
 pub const Consumer = struct {
     generation: [32]u8,
     context: ?*const anyopaque,
     evaluate: *const fn ([]const u8, policy.Result, ?*const anyopaque) anyerror!Outcome,
 };
 
-/// A journal consumer must validate the record's origin before matching. Kept
-/// separate from the file consumer so an unqualified detector cannot be selected
-/// for journal input accidentally. Fields borrow the current complete record.
 pub const JournalConsumer = struct {
     generation: [32]u8,
     context: ?*const anyopaque,

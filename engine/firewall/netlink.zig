@@ -32,8 +32,6 @@ pub const Error = error{
     InvalidBatchState,
 };
 
-/// The native inspection path never treats malformed trailing bytes as EOF.
-/// Read integers from bytes so caller-provided datagrams need no alignment.
 pub const StrictMessages = struct {
     bytes: []const u8,
     offset: usize = 0,
@@ -72,7 +70,6 @@ pub const Attributes = struct {
     }
 };
 
-/// Kernel provenance comes from recvmsg's sockaddr, not the untrusted nlmsg_pid.
 pub fn recvKernel(sock: *NetlinkSocket, scratch: []u8) Error![]const u8 {
     var sender: linux.sockaddr.nl = .{ .pid = 0, .groups = 0 };
     var iov = posix.iovec{ .base = scratch.ptr, .len = scratch.len };
@@ -95,8 +92,6 @@ pub fn recvKernel(sock: *NetlinkSocket, scratch: []u8) Error![]const u8 {
     return scratch[0..rc];
 }
 
-/// The native path bounds writes as well as reads. A timeout leaves the caller's
-/// operation uncertain; this helper never retries a possibly dispatched message.
 pub fn sendKernel(sock: *NetlinkSocket, bytes: []const u8, timeout_ms: u64) Error!void {
     if (timeout_ms == 0 or timeout_ms > 2000) return error.InvalidArgument;
     const value = posix.timeval{ .sec = @intCast(timeout_ms / 1000), .usec = @intCast((timeout_ms % 1000) * 1000) };
@@ -130,8 +125,6 @@ test "native firewall: kernel provenance and datagram truncation are mandatory" 
     try std.testing.expectError(error.RecvFailed, validateKernelEnvelope(sender, @sizeOf(linux.sockaddr.nl), 0, 16, 32));
 }
 
-/// Correlation and completion for a single dump. All datagrams count against a
-/// caller-owned total work/deadline budget, including unrelated traffic.
 pub const Dump = struct {
     sequence: u32,
     message_type: u16,
@@ -145,7 +138,7 @@ pub const Dump = struct {
         self.count += 1;
         if (item.hdr.seq != self.sequence) return null;
         if (self.complete or (item.hdr.pid != 0 and item.hdr.pid != self.port_id)) return error.NetlinkError;
-        if ((item.hdr.flags & 0x10) != 0) return error.NetlinkError; // NLM_F_DUMP_INTR
+        if ((item.hdr.flags & 0x10) != 0) return error.NetlinkError;
         const kind = @intFromEnum(item.hdr.type);
         if (kind == 2) {
             if (item.payload.len < 4 + NLMSG_HDRLEN) return error.TruncatedMessage;
@@ -153,7 +146,7 @@ pub const Dump = struct {
             if (request.seq != self.sequence) return error.NetlinkError;
             const code = try parseNlmsgerr(item.payload);
             if (code != 0) return safeErrno(code);
-            return null; // ACK is not multipart completion.
+            return null;
         }
         if (kind == 3) {
             if (item.payload.len != 0) {
@@ -173,8 +166,6 @@ fn safeErrno(code: i32) Error {
     return errnoToError(code);
 }
 
-/// Required ACKs and related batch boundary sequences are distinct: an error on
-/// a batch begin/end is relevant even though no success ACK was requested there.
 pub const Acknowledgments = struct {
     required: []const u32,
     related: []const u32,
@@ -398,7 +389,6 @@ pub const NetlinkSocket = struct {
     }
 
     pub fn setRecvTimeout(self: *NetlinkSocket, ms: u64) Error!void {
-        // timeval field widths are target-dependent (i32 on 32-bit musl); @FieldType keeps armv7 compiling.
         const secs: @FieldType(posix.timeval, "sec") = @intCast(ms / 1000);
         const usecs: @FieldType(posix.timeval, "usec") = @intCast((ms % 1000) * 1000);
         const tv: posix.timeval = .{ .sec = secs, .usec = usecs };

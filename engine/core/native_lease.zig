@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Canonical N3 relative durations, absolute leases and monotonic scheduling.
-//! Imported unknown values are inspection data and can never become authority.
 const std = @import("std");
 
 pub const micros_per_second: i64 = 1_000_000;
@@ -14,9 +12,6 @@ pub const Error = error{
     ClockReversed,
 };
 
-/// Relative policy duration in microseconds. Native configuration constructs
-/// whole seconds through finiteSeconds; deterministic component policies may
-/// use finer values without performing expiry-time rounding.
 pub const Duration = union(enum) {
     finite_us: i64,
     permanent,
@@ -43,8 +38,6 @@ pub const Duration = union(enum) {
     }
 };
 
-/// Migration-only interpretation of the pinned foreign sentinels. Unknown is
-/// deliberately absent from Duration and Lease, so activation must fail.
 pub const ImportedDuration = union(enum) {
     finite: Duration,
     permanent,
@@ -68,8 +61,6 @@ pub const ImportedDuration = union(enum) {
     }
 };
 
-/// Absolute durable authority. Finite leases are live strictly before their
-/// deadline and expire at equality; permanent leases have no deadline.
 pub const Lease = union(enum(u8)) {
     absent = 0,
     finite: i64 = 1,
@@ -87,8 +78,6 @@ pub const Lease = union(enum(u8)) {
         return std.meta.eql(a, b);
     }
 
-    /// Explicit prolongation never shortens protection. Expired/absent leases
-    /// require a distinct reban decision rather than revival through this API.
     pub fn prolonged(self: Lease, requested: Lease, now_us: i64) Error!struct { lease: Lease, changed: bool } {
         if (self == .absent or requested == .absent) return error.InvalidDuration;
         if (!self.live(now_us)) return error.LeaseExpired;
@@ -112,9 +101,6 @@ pub const ClockSample = struct {
     monotonic_us: u64,
 };
 
-/// Process-local wake authority derived from a durable absolute lease. Forward
-/// wall steps do not shorten the admitted elapsed lifetime; backward wall or
-/// monotonic samples fail the fence before destructive expiry.
 pub const Schedule = union(enum) {
     none,
     due_at_us: u64,

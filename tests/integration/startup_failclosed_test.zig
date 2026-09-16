@@ -100,8 +100,6 @@ fn expectFailClosed(run: *const Run) !void {
     try expectFailClosedClass(run, 1);
 }
 
-/// Configuration text/permission failures detected before daemon initialization are
-/// exit class 2 (local validation); startup refusals remain class 1.
 fn expectFailClosedClass(run: *const Run, class: u8) !void {
     try testing.expectEqual(@as(?u8, class), run.exitCode());
     try testing.expect(run.stderr.len > 0);
@@ -334,7 +332,9 @@ test "integration: fail-closed (d) backend = \"bogus\" exits 2 with path:line:co
 fn expectStorageRefusal(r: *const Run, socket_path: []const u8) !void {
     try expectFailClosed(r);
     try expectContains(r.stderr, "refusing to start");
-    try expectNotContains(r.stderr, "firewall:");
+    try expectNotContains(r.stderr, "firewall backend:");
+    try expectNotContains(r.stderr, "scaffold installed");
+    try expectNotContains(r.stderr, "no usable backend");
     try expectNotContains(r.stderr, "http:");
     try expectNotContains(r.stderr, "native: HTTP listener");
     try testing.expectError(error.FileNotFound, std.fs.cwd().access(socket_path, .{}));
@@ -398,7 +398,6 @@ test "integration: unwritable persistence refuses startup then advances after re
     defer a.free(state_path);
     const text = try s.writeConfigWithState(sock, "source = \"file\"", 0o640, state_path);
     defer a.free(text);
-    // A bound metrics port gives the repaired run a predictable, harmless stopping point.
     const addr = try std.net.Address.parseIp4("127.0.0.1", s.metrics_port);
     var holder = try addr.listen(.{ .reuse_address = true });
     defer holder.deinit();

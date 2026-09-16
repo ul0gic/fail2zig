@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 
-//! The one delivered `fail2zig` executable owns daemon startup, local diagnostics and
-//! the retained operator spellings, with the frozen exit classes 0-3.
-
 const std = @import("std");
 const harness = @import("harness.zig");
 
@@ -27,6 +24,17 @@ fn run(a: std.mem.Allocator, argv: []const []const u8) !Run {
         else => 255,
     };
     return .{ .code = code, .stdout = r.stdout, .stderr = r.stderr };
+}
+
+fn waitStatusContains(a: std.mem.Allocator, h: *harness.Harness, needle: []const u8) !Run {
+    var timer = try std.time.Timer.start();
+    while (timer.read() < 10 * std.time.ns_per_s) {
+        const result = try run(a, &.{ exe, "--socket", h.socket_path, "--timeout", "2000", "--output", "json", "status" });
+        if (result.code == 0 and std.mem.indexOf(u8, result.stdout, needle) != null) return result;
+        result.deinit(a);
+        std.time.sleep(50 * std.time.ns_per_ms);
+    }
+    return error.TimedOut;
 }
 
 fn writeConfig(h: *harness.Harness) !void {
@@ -121,21 +129,69 @@ test "cli entry: the same artifact starts the daemon and serves every retained o
     try h.startDaemon();
     defer _ = h.stopDaemon() catch {};
 
-    const spellings = [_][]const u8{ "status", "jails", "list", "version" };
-    for (spellings) |cmd| {
-        const r = try run(a, &.{ exe, "--socket", h.socket_path, "--timeout", "2000", "--output", "json", cmd });
-        defer r.deinit(a);
-        try testing.expectEqual(@as(u8, 0), r.code);
-        try testing.expect(r.stdout.len > 0 and r.stdout[0] == '{' or r.stdout[0] == '[');
-    }
+    const status = try waitStatusContains(a, &h, "\"protection\":\"log-only\"");
+    defer status.deinit(a);
+    const status_doc = try std.json.parseFromSlice(std.json.Value, a, status.stdout, .{});
+    defer status_doc.deinit();
+    const status_root = status_doc.value.object;
+    try testing.expectEqualStrings("log-only", status_root.get("protection").?.string);
+    try testing.expectEqualStrings("healthy", status_root.get("storage").?.string);
+    try testing.expect(status_root.get("active_bans").? == .integer);
+    try testing.expect(status_root.get("total_bans").? == .integer);
+    try testing.expectEqual(@as(usize, 64), status_root.get("generation").?.string.len);
+    try testing.expect(status_root.get("backend").? == .string);
+
     const plain = try run(a, &.{ exe, "--socket", h.socket_path, "--output", "plain", "status" });
     defer plain.deinit(a);
     try testing.expectEqual(@as(u8, 0), plain.code);
+    try testing.expect(std.mem.indexOf(u8, plain.stdout, "protection\tlog-only\n") != null);
+
+    const jails = try run(a, &.{ exe, "--socket", h.socket_path, "--timeout", "2000", "--output", "json", "jails" });
+    defer jails.deinit(a);
+    try testing.expectEqual(@as(u8, 0), jails.code);
+    const jails_doc = try std.json.parseFromSlice(std.json.Value, a, jails.stdout, .{});
+    defer jails_doc.deinit();
+    try testing.expectEqual(@as(usize, 1), jails_doc.value.array.items.len);
+    const jail = jails_doc.value.array.items[0].object;
+    try testing.expectEqualStrings("sshd", jail.get("name").?.string);
+    try testing.expect(jail.get("enabled").?.bool);
+    try testing.expect(!jail.get("paused").?.bool);
+    try testing.expect(!jail.get("enforcing").?.bool);
+    try testing.expectEqualStrings("log-only", jail.get("action").?.string);
+    try testing.expectEqual(@as(i64, 3), jail.get("maxretry").?.integer);
+    try testing.expectEqual(@as(i64, 60), jail.get("bantime").?.integer);
+    try testing.expectEqualStrings("file", jail.get("source").?.string);
+
+    const list = try run(a, &.{ exe, "--socket", h.socket_path, "--timeout", "2000", "--output", "json", "list" });
+    defer list.deinit(a);
+    try testing.expectEqual(@as(u8, 0), list.code);
+    const list_doc = try std.json.parseFromSlice(std.json.Value, a, list.stdout, .{});
+    defer list_doc.deinit();
+    try testing.expectEqual(@as(usize, 0), list_doc.value.array.items.len);
+
+    const version = try run(a, &.{ exe, "--socket", h.socket_path, "--timeout", "2000", "--output", "json", "version" });
+    defer version.deinit(a);
+    try testing.expectEqual(@as(u8, 0), version.code);
+    const version_doc = try std.json.parseFromSlice(std.json.Value, a, version.stdout, .{});
+    defer version_doc.deinit();
+    const version_root = version_doc.value.object;
+    try testing.expectEqualStrings(version_root.get("client_version").?.string, version_root.get("daemon").?.object.get("daemon_version").?.string);
+
+    const config = try run(a, &.{ exe, "--socket", h.socket_path, "--timeout", "2000", "--output", "json", "config" });
+    defer config.deinit(a);
+    try testing.expectEqual(@as(u8, 0), config.code);
+    const config_doc = try std.json.parseFromSlice(std.json.Value, a, config.stdout, .{});
+    defer config_doc.deinit();
+    const config_root = config_doc.value.object;
+    try testing.expectEqual(@as(i64, 1), config_root.get("schema_version").?.integer);
+    try testing.expectEqual(@as(usize, 64), config_root.get("generation").?.string.len);
+    try testing.expectEqualStrings("sshd", config_root.get("jails").?.array.items[0].object.get("filter").?.string);
+    try testing.expect(!config_root.get("global").?.object.get("metrics_enabled").?.bool);
+
     const table = try run(a, &.{ exe, "--socket", h.socket_path, "--no-color", "jails" });
     defer table.deinit(a);
     try testing.expectEqual(@as(u8, 0), table.code);
 
-    // Mutation spellings reach the daemon and its current native refusal is a rejected class.
     const ban = try run(a, &.{ exe, "--socket", h.socket_path, "ban", "192.0.2.10", "--jail", "sshd" });
     defer ban.deinit(a);
     try testing.expectEqual(@as(u8, 1), ban.code);
@@ -180,7 +236,6 @@ test "cli entry: migrate inspect and snapshot are read-only preparation with exa
     defer a.free(staging);
     try std.fs.cwd().makeDir(staging);
     try std.posix.fchmodat(std.posix.AT.FDCWD, staging, 0o700, 0);
-    // A permissive staging directory is refused before any snapshot is written (SEC-013).
     const loose = try std.fs.path.join(a, &.{ root, "loose" });
     defer a.free(loose);
     try std.fs.cwd().makeDir(loose);
@@ -207,10 +262,8 @@ test "cli entry: migrate inspect and snapshot are read-only preparation with exa
     defer nofile.deinit(a);
     try testing.expectEqual(@as(u8, 2), nofile.code);
 
-    // Plan and validate: deterministic plan file, valid re-validation, drift and blocker classes.
     const plan_path = try std.fs.path.join(a, &.{ root, "plan.json" });
     defer a.free(plan_path);
-    // A reset/replay compromise must name its window explicitly; it is reported as non-lossless.
     const unbounded = try run(a, &.{ exe, "migrate", "plan", "--source-dir", "tests/fixtures/fail2ban/config/supported", "--out", plan_path });
     defer unbounded.deinit(a);
     try testing.expectEqual(@as(u8, 1), unbounded.code);
@@ -323,8 +376,6 @@ test "cli entry: migrate cutover stages the destination offline, resumes by run 
     const plan_path = try std.fs.path.join(a, &.{ root, "plan.json" });
     defer a.free(plan_path);
 
-    // A source row the importer must refuse (unknown bantime sentinel) fails the run before any
-    // destination mutation, in the staging step, with the row named.
     try engine.migration_fixture_mod.build(db_path, .{});
     const blocked_plan = try std.fs.path.join(a, &.{ root, "blocked.json" });
     defer a.free(blocked_plan);
@@ -343,7 +394,6 @@ test "cli entry: migrate cutover stages the destination offline, resumes by run 
     defer planned.deinit(a);
     try testing.expectEqual(@as(u8, 0), planned.code);
 
-    // Offline steps run and the run stays staged because no daemon answers on the socket.
     const first = try run(a, &.{ exe, "migrate", "cutover", "--plan", plan_path, "--state-file", h.state_path, "--staging-dir", staging, "--backend", "nftables", "--socket", h.socket_path });
     defer first.deinit(a);
     if (first.code != 3) std.debug.print("cutover stdout:\n{s}\ncutover stderr:\n{s}\n", .{ first.stdout, first.stderr });
@@ -358,14 +408,12 @@ test "cli entry: migrate cutover stages the destination offline, resumes by run 
     try testing.expect(std.mem.indexOf(u8, status.stdout, "state\tstaged") != null);
     try testing.expect(std.mem.indexOf(u8, status.stdout, "step\t5\tstage_destination\tsuccess") != null);
 
-    // Resume classifies the journal instead of replaying: still staged, no extra steps.
     const again = try run(a, &.{ exe, "migrate", "cutover", "--plan", plan_path, "--state-file", h.state_path, "--staging-dir", staging, "--backend", "nftables", "--socket", h.socket_path, "--run-id", run_id });
     defer again.deinit(a);
     try testing.expectEqual(@as(u8, 3), again.code);
     try testing.expect(std.mem.indexOf(u8, again.stdout, "step\t6") == null);
     try testing.expect(std.mem.indexOf(u8, again.stdout, "\"state\":\"staged\"") != null);
 
-    // A different plan file cannot drive the run.
     const other_plan = try std.fs.path.join(a, &.{ root, "other.json" });
     defer a.free(other_plan);
     const replanned = try run(a, &.{ exe, "migrate", "plan", "--source-dir", "tests/fixtures/fail2ban/config/supported", "--source-db", db_path, "--staging-dir", staging, "--out", other_plan, "--replay-window", "300" });
@@ -376,7 +424,6 @@ test "cli entry: migrate cutover stages the destination offline, resumes by run 
     try testing.expectEqual(@as(u8, 1), foreign.code);
     try testing.expect(std.mem.indexOf(u8, foreign.stderr, "IncompatiblePlan") != null);
 
-    // With a log-only daemon the activation is refused by the daemon and the run stays staged.
     try h.startDaemon();
     defer _ = h.stopDaemon() catch {};
     try waitHealthy(&h);
@@ -459,9 +506,7 @@ test "cli entry: BUG-027 versioned queries, readiness and a file log target with
     defer bad_limit.deinit(a);
     try testing.expect(bad_limit.code != 0);
 
-    // Readiness and scopes are versioned query kinds behind the same bounded frame.
     const shared = @import("shared");
-    // Readiness is withheld until every source is admitted, even while storage is healthy.
     var ready = false;
     var ready_wait = try std.time.Timer.start();
     while (ready_wait.read() < 10 * std.time.ns_per_s) {
@@ -480,8 +525,6 @@ test "cli entry: BUG-027 versioned queries, readiness and a file log target with
     try testing.expect(std.mem.indexOf(u8, scopes, "\"items\"") != null);
     try testing.expectError(error.UnexpectedResponse, h.sendCommand(.{ .query_v1 = try shared.Command.Body.init("{\"schema_version\":1,\"kind\":\"nope\"}") }));
 
-    // A widened socket directory latches refusal on the next accept; restoring the mode is
-    // re-verified on the following accept and service resumes with readiness intact.
     const sock_dir = std.fs.path.dirname(h.socket_path).?;
     const before = (try std.fs.cwd().statFile(sock_dir)).mode & 0o7777;
     defer std.posix.fchmodat(std.posix.AT.FDCWD, sock_dir, before, 0) catch {};
@@ -511,7 +554,6 @@ test "cli entry: BUG-027 versioned queries, readiness and a file log target with
     defer a.free(health_after);
     try testing.expect(std.mem.indexOf(u8, health_after, "\"ready\":true") != null);
 
-    // The file log target received the startup lines; rotation + SIGUSR1 reopens the path.
     var stat = try std.fs.cwd().statFile(log_file);
     try testing.expect(stat.size > 0);
     const rotated = try std.fmt.allocPrint(a, "{s}.1", .{log_file});

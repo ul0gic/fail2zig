@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Bounded retry-window transition. SQLite owns publication and occurrence
-//! deduplication; this module never mutates live state or performs an effect.
 const std = @import("std");
 const detection = @import("native_detection_record.zig");
 const lease_policy = @import("native_lease.zig");
@@ -10,9 +8,6 @@ pub const max_attempts = 128;
 pub const attempt_bytes = 40;
 pub const policy_bytes = 32;
 pub const escalation_bytes = escalation_policy.encoded_bytes;
-/// Failure text is observability data, never retry-count authority. The store
-/// may retain fewer examples, but an individual typed/manual value is admitted
-/// against the same decoded-record bound used by selected N3 services.
 pub const max_evidence_text_bytes = 2 * 1024;
 pub const max_subject_evidence_bytes = 16 * 1024;
 pub const Error = lease_policy.Error || escalation_policy.Error || error{ InvalidRetryPolicy, InvalidRetryState, InvalidRetryEvidence, RetryClockReversed, RetryTimeOverflow };
@@ -84,7 +79,16 @@ pub const Policy = struct {
         return self.escalation.encode() catch return error.InvalidRetryPolicy;
     }
 };
-pub const Admission = struct { generation: [32]u8, policy: Policy, processing_us: ?i64 = null };
+pub const Admission = struct {
+    generation: [32]u8,
+    policy: Policy,
+    processing_us: ?i64 = null,
+    suppress_enforcement: bool = false,
+
+    pub fn enforces(self: Admission) bool {
+        return self.policy.enforce and !self.suppress_enforcement;
+    }
+};
 pub const Attempt = struct { at_us: i64, occurrence: [32]u8 };
 pub const Evidence = struct {
     text: ?[]const u8 = null,
@@ -102,9 +106,6 @@ pub const State = struct {
     attempts: [max_attempts]Attempt = undefined,
     count: u16 = 0,
 
-    /// Pending attempts are canonical event-time order. This watermark is
-    /// derived instead of duplicated in the schema, so it cannot disagree with
-    /// the authoritative count ring after restore.
     pub fn latestEventUs(self: *const State) ?i64 {
         return if (self.count == 0) null else self.attempts[self.count - 1].at_us;
     }
@@ -162,9 +163,6 @@ pub fn occurrenceKey(source: []const u8, occurrence: []const u8) [32]u8 {
     return hash.finalResult();
 }
 
-/// Advance only processing-time cleanup. Eligibility remains the same whether
-/// this is called promptly or by a delayed bounded scheduler: the inclusive
-/// endpoint is retained and expiry occurs at equality.
 pub fn prune(policy: Policy, previous: State, now_us: i64) Error!PruneResult {
     try previous.validate(policy);
     if (now_us < previous.last_processed_us) return error.RetryClockReversed;
@@ -190,10 +188,6 @@ pub fn prune(policy: Policy, previous: State, now_us: i64) Error!PruneResult {
     return .{ .state = next, .changed = changed };
 }
 
-/// Prune against processing time, keeping the existing inclusive findtime
-/// endpoint. Late evidence cannot retain stale attempts by moving the window
-/// backwards. A decision's finite deadline is fixed at its committed decision
-/// time; subsequent matching records never extend it or accumulate behind it.
 pub fn advance(policy: Policy, previous: ?State, subject: detection.Subject, attempt: Attempt, now_us: i64) Error!Transition {
     try policy.validate();
     subject.validate() catch return error.InvalidRetryState;
@@ -231,9 +225,6 @@ pub fn advance(policy: Policy, previous: ?State, subject: detection.Subject, att
     return .{ .state = next, .decision = .{ .subject = subject, .decided_us = now_us, .lease = lease, .ordinal = next.decisions, .enforce = policy.enforce } };
 }
 
-/// Evidence is validated independently and intentionally absent from State.
-/// Its retention belongs to the bounded detailed-history consumer, so changing
-/// text cannot alter attempt identity, threshold, expiry or wire encoding.
 pub fn advanceWithEvidence(policy: Policy, previous: ?State, subject: detection.Subject, attempt: Attempt, now_us: i64, evidence: Evidence) Error!Transition {
     try evidence.validate();
     return advance(policy, previous, subject, attempt, now_us);

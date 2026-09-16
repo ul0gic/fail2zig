@@ -17,8 +17,6 @@ pub const ReceiptAdmission = struct {
 };
 const CandidateReceipt = struct { identity: [32]u8, time: time.Timestamp };
 
-/// prepare must leave live state unchanged. Its payload owns all resources
-/// needed by publish; publish cannot allocate or fail after the durable commit.
 pub const Prepared = struct {
     checkpoint: []const u8,
     disposition: []const u8,
@@ -29,7 +27,6 @@ pub const Prepared = struct {
     native_detection: ?@import("native_detection_record.zig").Outcome = null,
     native_detections: ?[]const @import("native_detection_record.zig").Outcome = null,
     native_retry: ?@import("native_retry.zig").Admission = null,
-    /// Administrative pause: the detection is recorded but no retry state advances.
     retry_suspended: bool = false,
     retry_evidence: @import("native_retry.zig").Evidence = .{},
     intent: ?[]const u8 = null,
@@ -48,8 +45,6 @@ pub const Restored = struct {
 pub const Processor = struct {
     context: ?*anyopaque,
     prepare: *const fn (records.Record, ?*anyopaque) anyerror!Prepared,
-    /// Validate and stage without modifying live state. Publication follows the
-    /// revision recheck; allocation/decoder/CAS failure must keep the old owner.
     prepare_restore: *const fn (?[]const u8, ?*anyopaque) anyerror!Restored,
 };
 pub const Pipeline = struct {
@@ -58,25 +53,14 @@ pub const Pipeline = struct {
     processor: Processor,
     ready: bool = false,
     revision: u64 = 0,
-    /// Native coordinator supplies the same gate to every pipeline using a store.
-    /// Null preserves the staged legacy component interface during conversion.
     gate: ?*health.Gate = null,
     recovery_generation: u64 = 0,
-    /// Opt in only for native processors after explicit store/schema admission.
-    /// Capture occurs on a complete record, before decoding/time preparation.
     receipts: ?ReceiptAdmission = null,
-    /// An unsuccessful first receipt write retains its proposed clock boundary.
-    /// The serialized owner must retry this occurrence before observing another.
     candidate_receipt: ?CandidateReceipt = null,
 
-    /// Source sessions call this before reading/framing, and acknowledge checks
-    /// again before preparing state. Recovery must restore every admitted owner.
     pub fn admit(self: *Pipeline) !void {
         if (self.gate) |gate| try gate.admit(self.recovery_generation);
         if (!self.ready) return error.RestoreRequired;
-        // Schema-7 owners check the global durable floor before reading another
-        // record and again before publication. Older component schemas retain
-        // their previous admission contract until explicitly migrated.
         if (self.store.schema_version >= 7) if (self.receipts) |admission| {
             const floor = self.store.admissionClock() catch |failure| {
                 self.failed(failure);
@@ -95,9 +79,7 @@ pub const Pipeline = struct {
     }
 
     fn failed(self: *Pipeline, cause: anyerror) void {
-        // A changed source occurrence/configuration is not evidence that the
-        // shared store is unavailable. Isolate it without stopping other owners.
-        if (cause == error.ConsumerExpired or cause == error.ConsumerPending or cause == error.EffectExpired) return; // Release stage and resolve/reprepare the same receipt.
+        if (cause == error.ConsumerExpired or cause == error.ConsumerPending or cause == error.EffectExpired) return;
         if (cause == error.EffectClockReversed) {
             const floor = self.store.admissionClock() catch {
                 self.ready = false;
@@ -116,7 +98,6 @@ pub const Pipeline = struct {
             self.receiptClockFailed(floor);
             return;
         }
-        // Source sessions fence these inputs without changing committed state.
         if (sourceLocalIntervention(cause)) return;
         if (cause == error.ReceiptConflict) {
             self.ready = false;
@@ -133,8 +114,6 @@ pub const Pipeline = struct {
     }
 
     fn beginDiagnostics(self: *Pipeline) void {
-        // Preserve the original cause on a poisoned connection. Otherwise these
-        // fields describe this operation, including failures before SQLite runs.
         if (!self.store.reopen_required) {
             self.store.last_error_code = null;
             self.store.rollback_error_code = null;
@@ -167,9 +146,6 @@ pub const Pipeline = struct {
         self.ready = true;
     }
 
-    /// These failures leave committed consumer state intact. The source session
-    /// retains its exact pending input and intervention cause; sibling sources
-    /// may continue through this restored pipeline.
     pub fn sourceLocalIntervention(cause: anyerror) bool {
         return cause == error.PrunedReplay or cause == error.OutsideTimezoneCoverage;
     }
@@ -179,11 +155,6 @@ pub const Pipeline = struct {
         try self.admit();
         self.beginDiagnostics();
         self.acknowledgeAdmitted(record) catch |failure| {
-            // Decoder/matcher failure belongs to this source owner. It does not
-            // establish a storage outage for otherwise independent jails.
-            // Dependency waits and expired preparation keep the same restored
-            // owner/receipt. Invalidating it here would discard a same-turn DNS
-            // answer even though failed() deliberately keeps the gate healthy.
             if (self.gate != null and failure != error.ConsumerExpired and failure != error.ConsumerPending and failure != error.EffectExpired and !sourceLocalIntervention(failure)) self.ready = false;
             return failure;
         };
@@ -273,8 +244,6 @@ pub const Pipeline = struct {
             self.failed(err);
             return err;
         };
-        // A single owner processes each jail. Another writer appearing between
-        // lookup and commit invalidates this owner's in-memory snapshot.
         if (result == .already_committed) {
             self.ready = false;
             self.failed(error.ConcurrentWriter);
@@ -563,10 +532,10 @@ test "pipeline: one storage failure pauses every owner and reopen requires resto
     try other.restore(allocator);
     try gate.completed(initial, .state);
     try std.testing.expectEqual(@as(i64, 0), try store.pendingIntents());
-    try gate.completed(initial, .ownership); // no installed/queued effects in this fixture
+    try gate.completed(initial, .ownership);
     var source = try files.FileSource.init(allocator, input, "file", .head, null);
     defer source.deinit();
-    try gate.completed(initial, .sources); // new source; no durable anchor yet
+    try gate.completed(initial, .sources);
     try owner.admit();
     try std.testing.expect(try source.poll(Pipeline.acknowledge, &owner));
     const saved = source.acknowledgedCheckpoint().?;
@@ -586,7 +555,7 @@ test "pipeline: one storage failure pauses every owner and reopen requires resto
     const paused = gate.snapshot();
     try std.testing.expectEqual(@as(?c_int, 8), paused.first_failure.?.diagnostics.sqlite_code);
     try std.testing.expectEqual(@as(?u64, 0), paused.last_commit_ms);
-    try std.testing.expectEqual(@as(u64, 2), paused.committed_records); // baseline + first record
+    try std.testing.expectEqual(@as(u64, 2), paused.committed_records);
     for (0..10) |_| try std.testing.expectError(error.StoragePaused, Pipeline.acknowledge(record, &other));
     try std.testing.expectEqual(paused.notice_sequence, gate.snapshot().notice_sequence);
     try std.testing.expectEqual(paused.next_retry_ms, gate.snapshot().next_retry_ms);
@@ -610,8 +579,6 @@ test "pipeline: one storage failure pauses every owner and reopen requires resto
     defer parsed.deinit();
     var resumed = try files.FileSource.init(allocator, input, "file", .head, parsed.value);
     defer resumed.deinit();
-    // Validate the saved incarnation/prefix by opening it, before declaring
-    // source continuity. It may be gone even though the database is writable.
     try std.testing.expect(try resumed.verifyContinuity());
     try gate.completed(recovered, .sources);
     try owner.admit();
@@ -623,8 +590,6 @@ test "pipeline: one storage failure pauses every owner and reopen requires resto
     try Pipeline.acknowledge(record, &other);
     try Pipeline.acknowledge(record, &other);
     try std.testing.expectEqual(@as(u64, 1), second.count);
-    // A source-specific decoder failure is not a database outage. It must not
-    // let malformed input in one jail suspend otherwise independent protection.
     first.prepare_failure = error.InvalidEncoding;
     var next = record;
     next.occurrence = "next";
@@ -711,8 +676,6 @@ test "pipeline: real SQLite capacity failure pauses admission without losing the
     record.cursor = "2";
     try Pipeline.acknowledge(record, &owner);
     try std.testing.expectEqual(@as(i64, 1), try store.pendingIntents());
-    // SQLite clamps this below-current-size request to the existing page count.
-    // A large new cursor needs additional pages. This does not fill the host disk.
     try std.testing.expectEqual(@as(c_int, 0), store.api.exec(store.db, "PRAGMA max_page_count=1;", null, null, null));
     const large_cursor = [_]u8{'c'} ** 65536;
     record.occurrence = "3";
@@ -730,8 +693,6 @@ test "pipeline: real SQLite capacity failure pauses admission without losing the
     try std.testing.expectError(error.StoragePaused, Pipeline.acknowledge(record, &owner));
     try std.testing.expectError(error.PersistenceUnavailable, gate.admitMutation());
 
-    // Even after capacity is repaired, an unresolved ownership outcome or lost
-    // source anchor must keep admission closed. No cursor reset is attempted.
     clock.ms = gate.snapshot().next_retry_ms.?;
     const recovered = try gate.beginRecovery();
     try std.testing.expectEqual(@as(c_int, 0), store.api.exec(store.db, "PRAGMA max_page_count=65536;", null, null, null));

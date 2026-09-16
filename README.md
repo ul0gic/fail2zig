@@ -8,7 +8,7 @@
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/ul0gic/fail2zig/badge)](https://scorecard.dev/viewer/?uri=github.com/ul0gic/fail2zig)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 [![Zig](https://img.shields.io/badge/zig-0.14.1-F7A41D?logo=zig&logoColor=white)](https://ziglang.org/download/)
-[![Platform](https://img.shields.io/badge/platform-linux--x86__64%20%7C%20aarch64%20%7C%20armv7%20%7C%20mips%20%7C%20mipsel-lightgrey)](#installation)
+[![Platform](https://img.shields.io/badge/platform-Debian%2013%20x86__64-lightgrey)](#installation)
 [![Version](https://img.shields.io/github/v/release/ul0gic/fail2zig?label=version&color=orange)](https://github.com/ul0gic/fail2zig/releases/latest)
 
 </div>
@@ -17,23 +17,19 @@ fail2zig is an intrusion prevention daemon inspired by fail2ban — written in Z
 executable, with a parser that cannot be made to allocate unbounded
 memory by the traffic it's supposed to be stopping.
 
-The importer translates supported fail2ban jail settings into native TOML and reports
-unsupported configurations that need operator changes. Broader supported migration and
-bounded native custom rules remain development work; exact fail2ban compatibility is not promised.
+The supported migration workflow inspects fail2ban inputs, captures a read-only SQLite snapshot,
+plans and validates the native projection, and performs journaled cutover/rollback. Unsupported
+configuration is reported for operator action; exact fail2ban compatibility is not promised.
 
-This checkout is **0.3.1-dev**, unpublished. Its default [native runtime](docs/parity/native-runtime.md)
-uses embedded SQLite for source receipts, consumer state and retry decisions, with durable
-firewall intent and confirmed history. Selected file/journal restart, enforcement and recovery
-checks pass across the three backends and both address families. Full N2 fault/platform
-qualification remains open. Existing binary state and unsupported settings are refused;
-there is no automatic migration. Replaced legacy consumers are being retired after their
-replacement acceptance.
-The corrected direction removes the remaining project-owned Python
-and consolidates daemon/admin functions into one self-contained executable. OS requirements
-remain explicit: journal input uses the host's journald and journalctl. That integration is
-retained; the application does not need to embed its own journal reader. The broader
-transformation is not complete. See
-[current components](docs/parity/p2-components.md) and [delivery contract](docs/parity/profile-contract.md).
+Version 0.4.0 consolidates
+daemon and administration functions into one static executable per architecture and requires no Python or
+shared SQLite library at runtime. Its [runtime architecture](docs/architecture.md) uses
+statically embedded SQLite for source receipts, consumer state, protection ownership and
+confirmed history. Host requirements remain explicit: journal input uses journald and
+`journalctl`; the iptables and ipset backends invoke those tools with fixed arguments; nftables
+talks directly to the kernel. Selected live qualification passed on Debian 13 x86_64 before the version-only change
+from the unpublished 0.3.1 candidate to 0.4.0. The rebuilt artifacts passed cross-build and native/emulated command checks.
+Contemporary Ubuntu may work, but is untested and is not a release gate.
 
 ---
 
@@ -46,8 +42,6 @@ transformation is not complete. See
 - [Configuration](#configuration)
 - [CLI usage](#cli-usage)
 - [Features](#features)
-- [Benchmarks](#benchmarks)
-- [Comparison](#comparison)
 - [Project structure](#project-structure)
 - [Documentation](#documentation)
 - [Contributing](#contributing)
@@ -58,8 +52,8 @@ transformation is not complete. See
 ## Quick start
 
 ```bash
-# 1. Install (downloads the static musl binary, SHA256-verifies, installs
-#    systemd unit + example config)
+# 1. Install (downloads the static musl binary, SHA256-verifies the installed
+#    release files, and installs the service, config, man pages and notices)
 curl -fsSL https://github.com/ul0gic/fail2zig/raw/main/scripts/install.sh | sudo bash
 
 # 2. (Optional) Migrate from fail2ban
@@ -83,25 +77,22 @@ The installer pulls from the
 [latest GitHub Release](https://github.com/ul0gic/fail2zig/releases/latest)
 and verifies every asset against the published `SHA256SUMS` before placing
 anything on disk. Pin a specific version with
-`FAIL2ZIG_VERSION=v0.3.0` or inspect the script first with
+`FAIL2ZIG_VERSION=v0.4.0` or inspect the script first with
 `curl -fsSL … | less`.
 
 ---
 
 ## Why fail2zig
 
-- **Static delivery.** Current releases provide a daemon and companion client for
-  supported Linux targets. Consolidating them into one executable is planned.
+- **Static delivery.** One executable per supported architecture provides the daemon,
+  administration commands, rule testing and migration workflows.
 - **Direct nftables enforcement.** No nft userspace package is required for that
   backend. Current ipset/iptables modes invoke their tools with fixed argv, and
-  journald uses journalctl. See the [delivery contract](docs/parity/profile-contract.md)
-  for current dependencies and the planned standalone runtime.
-- **Bounded under attack.** The IP state tracker is a fixed-capacity map.
-  Half of `memory_ceiling_mb` (default 64 MB) is split evenly across the
-  enabled jails plus one spare tracker, at roughly 1.5 KB per tracked IP.
-  When a tracker is full, the oldest unbanned entry is evicted; this is not
-  configurable. The bound is on entries, not a byte budget across every
-  allocator.
+  journald uses journalctl. See the [runtime architecture](docs/architecture.md)
+  for the delivery and dependency boundary.
+- **Bounded under attack.** Native ingestion, detection, retry and administrative
+  inputs have explicit record, queue, subject and memory limits. Durable receipts,
+  enforcement intent and active ownership are not evicted to satisfy a ceiling.
 - **Comptime-generated parsers.** Built-in filter patterns compile into
   specialized match functions at build time. There is no regex engine in the
   process. Attacker-controlled input never reaches a Turing-complete matcher.
@@ -122,17 +113,17 @@ anything on disk. Pin a specific version with
 
 ```mermaid
 flowchart LR
-    subgraph Daemon["fail2zig — root: CAP_NET_ADMIN + CAP_DAC_READ_SEARCH (all-log-only configs run unprivileged)"]
-        subgraph Loop["one epoll loop, no threads"]
+    subgraph Daemon["fail2zig service UID: CAP_NET_ADMIN + CAP_NET_RAW + CAP_DAC_READ_SEARCH"]
+        subgraph Loop["bounded ingestion and storage worker; responsive IPC/HTTP"]
             FS["File source<br/>inotify, rotation-aware"]
             JS["Journal source<br/>journalctl child, non-blocking pipe"]
             PE["Parser<br/>comptime filters"]
-            ST["State Tracker<br/>fixed-capacity per jail"]
+            ST["Detection and policy<br/>bounded native state"]
             DP["dispatch"]
             IPC["IPC server<br/>Unix socket 0660 · SO_PEERCRED"]
             HTTP["HTTP server<br/>127.0.0.1:9100 · /metrics · /api/status · /api/health · /events (WS)"]
         end
-        SF["State file"]
+        SF["SQLite durable state"]
     end
 
     BE["Firewall backend (auto-detected or set by firewall = ...)<br/>nftables: netlink · ipset/iptables: argv"]
@@ -165,34 +156,51 @@ Deep-dive: [architecture/zero-dependencies](https://fail2zig.com/docs/architectu
 curl -fsSL https://github.com/ul0gic/fail2zig/raw/main/scripts/install.sh | sudo bash
 ```
 
-[`scripts/install.sh`](scripts/install.sh) detects your architecture, resolves
-the latest release (or `FAIL2ZIG_VERSION` if set), downloads `fail2zig` +
-`SHA256SUMS` from the
+[`scripts/install.sh`](scripts/install.sh) detects the architecture and byte order, resolves the latest
+release (or `FAIL2ZIG_VERSION` if set), and downloads the executable and installed
+support files plus `SHA256SUMS` from the
 [release](https://github.com/ul0gic/fail2zig/releases/latest) asset tree,
-verifies the executable's SHA256 against `SHA256SUMS`, creates the `fail2zig`
-system group, installs it to `/usr/local/bin` (removing a retired
-`fail2zig-client` if one is present), drops the example
-config at `/etc/fail2zig/config.toml` (never clobbers an existing one), and
-installs the hardened `fail2zig.service` unit under
-`/etc/systemd/system/`. It does **not** auto-start the daemon — audit the
-config, then `systemctl enable --now fail2zig` when ready.
+verifies every downloaded file that it will install, creates the `fail2zig`
+system group and non-login `fail2zig` account, installs the executable to `/usr/local/bin` (removing a retired
+`fail2zig-client` if one is present), installs the man pages and notices, drops
+the example config at `/etc/fail2zig/config.toml` without clobbering an existing
+configuration, and installs the hardened `fail2zig.service` unit under
+`/etc/systemd/system/`. It does **not** auto-start the daemon — audit the config,
+then run `systemctl enable --now fail2zig` when ready.
 
-**Supported targets** (release assets are named `fail2zig-<tag>-<triple>`):
+**0.4.0 release targets** (one combined daemon/admin executable each):
 
 | Target | Hardware | Validation |
 |--------|----------|------------|
-| `x86_64-linux-musl` | servers, VPS | real systems, live honeypot |
-| `aarch64-linux-musl` | ARM64 servers, Raspberry Pi 3+ | cross-build + CI static check |
-| `arm-linux-musleabihf` | armv7 hard-float boards | cross-build + CI static check |
-| `mips-linux-musleabi` | big-endian MIPS32r2 routers, soft-float | qemu-user-static only |
-| `mipsel-linux-musleabi` | little-endian MIPS32r2 routers, soft-float | qemu-user-static only |
+| `x86_64-linux-musl` | x86_64 servers and VPSes | Full live qualification on Debian 13 |
+| `aarch64-linux-musl` | ARM64 | Cross-build, static inspection and QEMU smoke |
+| `arm-linux-musleabihf` | ARMv7, hard float | Cross-build, static inspection and QEMU smoke |
+| `mips-linux-musleabi` | MIPS32r2, big endian, soft float | Cross-build, static inspection and QEMU smoke |
+| `mipsel-linux-musleabi` | MIPS32r2, little endian, soft float | Cross-build, static inspection and QEMU smoke |
 
-All five are static musl binaries. Legacy firewall modes and journal ingestion
-require their documented external tools. The mips pair
-targets the soft-float ABI common on OpenWrt-class hardware; CI runs
-`--version` under `qemu-mips[el]-static` on every build, but no one has yet
-reported a run on real MIPS hardware. Hard-float MIPS (`musleabihf`) is not
-built until a real target asks for it (ADR-012).
+The candidate passed these validation tiers. Publication remains a separate release step.
+Emulated checks do not qualify real hardware or kernel enforcement. Contemporary Ubuntu on
+x86_64 may work, but is untested. Legacy firewall modes
+and journal ingestion require their documented host tools.
+
+The release allowlist is exactly:
+
+```text
+fail2zig-v0.4.0-x86_64-linux-musl
+fail2zig-v0.4.0-aarch64-linux-musl
+fail2zig-v0.4.0-arm-linux-musleabihf
+fail2zig-v0.4.0-mips-linux-musleabi
+fail2zig-v0.4.0-mipsel-linux-musleabi
+fail2zig.service
+fail2zig.toml.example
+install.sh
+fail2zig.1
+fail2zig.toml.5
+LICENSE
+SQLITE-NOTICE.md
+COPYING.date-profile
+SHA256SUMS
+```
 
 ### Dry-run / inspect the installer
 
@@ -212,27 +220,39 @@ sudo scripts/install.sh --local-bin zig-out/bin
 If you'd rather skip the script:
 
 ```bash
-# 1. Download the binary + manifest for your arch
-VERSION=v0.3.0
-ARCH=x86_64-linux-musl   # or aarch64-linux-musl, arm-linux-musleabihf, mips-linux-musleabi, mipsel-linux-musleabi
-curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/fail2zig-${VERSION}-${ARCH}"
-curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/SHA256SUMS"
+# 1. Download the allowlisted release files
+set -euo pipefail
+VERSION=v0.4.0
+ARCH=x86_64-linux-musl
+BASE="https://github.com/ul0gic/fail2zig/releases/download/${VERSION}"
+for file in \
+  "fail2zig-${VERSION}-${ARCH}" fail2zig.service fail2zig.toml.example \
+  install.sh fail2zig.1 fail2zig.toml.5 LICENSE SQLITE-NOTICE.md \
+  COPYING.date-profile SHA256SUMS; do
+  curl -fsSLO "${BASE}/${file}"
+done
 
-# 2. Verify (bail if any line fails)
-sha256sum --check --ignore-missing SHA256SUMS
-# Optional: verify the SLSA build provenance (needs the gh CLI)
-gh attestation verify "fail2zig-${VERSION}-${ARCH}" --repo ul0gic/fail2zig
+# 2. Verify each downloaded content asset (the manifest also lists other CPUs)
+for file in "fail2zig-${VERSION}-${ARCH}" fail2zig.service fail2zig.toml.example \
+  install.sh fail2zig.1 fail2zig.toml.5 LICENSE SQLITE-NOTICE.md COPYING.date-profile; do
+  awk -v name="$file" '$2 == name { print; found++ } END { if (found != 1) exit 1 }' \
+    SHA256SUMS | sha256sum --check --strict || exit 1
+done
 
 # 3. Install
 sudo install -m 0755 "fail2zig-${VERSION}-${ARCH}" /usr/local/bin/fail2zig
-sudo groupadd --system fail2zig 2>/dev/null || true
+getent group fail2zig >/dev/null || sudo groupadd --system fail2zig
+sudo useradd --system --gid fail2zig --home-dir /nonexistent --no-create-home \
+  --shell /usr/sbin/nologin fail2zig
 ```
 
+These account commands are for a fresh installation. On an existing installation, inspect
+the account and follow the [upgrade boundary](docs/operations/migration-continuity.md#upgrading-fail2zig-state).
 Then follow the [systemd setup](#systemd-setup) block below.
 
 ### Build from source
 
-Requires [Zig 0.14.x](https://ziglang.org/download/); CI pins 0.14.1.
+Requires [Zig 0.14.1](https://ziglang.org/download/).
 Zig 0.15 and later do not build this tree (ADR-012).
 
 ```bash
@@ -247,25 +267,17 @@ ls zig-out/bin/
 # fail2zig
 ```
 
-### Cross-compile
+### Release build target
 
-Every shipped target (see [.github/workflows/release.yml](.github/workflows/release.yml)):
-
-```bash
-zig build -Dtarget=x86_64-linux-musl     -Doptimize=ReleaseSafe
-zig build -Dtarget=aarch64-linux-musl    -Doptimize=ReleaseSafe
-zig build -Dtarget=arm-linux-musleabihf  -Doptimize=ReleaseSafe
-zig build -Dtarget=mips-linux-musleabi   -Doptimize=ReleaseSafe
-zig build -Dtarget=mipsel-linux-musleabi -Doptimize=ReleaseSafe
-```
-
-All produce statically linked musl binaries; selected backends may require external tools. Use
-the float-ABI-suffixed mips triples: the bare `mips-linux-musl` triple has no
-musl libc in any Zig release. To run a mips build on an x86_64 host:
+The 0.4.0 release builds the five targets above (see
+[.github/workflows/release.yml](.github/workflows/release.yml)):
 
 ```bash
-qemu-mips-static zig-out/bin/fail2zig --version   # qemu-mipsel-static for mipsel
+make release-all
 ```
+
+This produces the static release executables. Selected backends may
+still require the documented host tools.
 
 ### systemd setup
 
@@ -274,41 +286,58 @@ If you used `scripts/install.sh`, the unit file is already in place — skip to
 
 From a repo checkout:
 
+Create the account as shown under manual install first. The following blocks are for a
+fresh installation; preserve existing configuration and follow the upgrade instructions
+for an existing database.
+
 ```bash
 sudo install -m 0644 deploy/fail2zig.service /etc/systemd/system/
-sudo install -d -m 0750 /etc/fail2zig
-sudo install -m 0640 deploy/fail2zig.toml.example /etc/fail2zig/config.toml
+sudo install -d -o root -g fail2zig -m 0750 /etc/fail2zig
+sudo install -o root -g fail2zig -m 0640 deploy/fail2zig.toml.example /etc/fail2zig/config.toml
+sudo install -d -o fail2zig -g fail2zig -m 0750 /var/lib/fail2zig
 sudo systemctl daemon-reload
 sudo systemctl enable --now fail2zig
 ```
 
-From a downloaded release (the same files are published alongside
-the binaries):
+From the verified files downloaded in the manual-install steps above:
 
 ```bash
-VERSION=v0.3.0
-for f in fail2zig.service fail2zig.toml.example; do
-  curl -fsSLO "https://github.com/ul0gic/fail2zig/releases/download/${VERSION}/${f}"
-done
 sudo install -m 0644 fail2zig.service /etc/systemd/system/
-sudo install -d -m 0750 /etc/fail2zig
-sudo install -m 0640 fail2zig.toml.example /etc/fail2zig/config.toml
+sudo install -d -o root -g fail2zig -m 0750 /etc/fail2zig
+sudo install -o root -g fail2zig -m 0640 fail2zig.toml.example /etc/fail2zig/config.toml
+sudo install -d -o fail2zig -g fail2zig -m 0750 /var/lib/fail2zig
 sudo systemctl daemon-reload
 sudo systemctl enable --now fail2zig
 ```
 
-The shipped unit is hardened: `ProtectSystem=strict`, `NoNewPrivileges=yes`,
-`CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH`,
+The shipped unit runs as the non-login `fail2zig` user and group. It uses
+`ProtectSystem=strict`, `NoNewPrivileges=yes`,
+`CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH`,
 `RuntimeDirectory=fail2zig` (auto-created on every start), no home
 directories, no device nodes, no kernel tunables. `systemd-analyze security
-fail2zig` scores 2.4 (OK).
+fail2zig` can inspect the effective hardening on a specific host.
+
+`CAP_NET_ADMIN` permits firewall operations and `CAP_DAC_READ_SEARCH` permits protected
+log and journal reads. `CAP_NET_RAW` is required by the ipset backend’s iptables extension
+and also grants raw IPv4/IPv6 socket authority. HTTP shares these daemon capabilities;
+keep it bound to loopback. The unit excludes AF_PACKET sockets.
+`FAIL2ZIG_GROUP` can select the service/monitor group during installation. Group membership
+permits socket monitoring, while mutations require root or the daemon UID.
+
+For an upgrade, stop all daemon and state writers, preserve the executable/configuration and
+a coherent state backup, then run the installer and explicitly start the service. The installer
+only transitions the default native SQLite parent, database and existing WAL/SHM siblings;
+it refuses active writers, legacy binary state and custom state paths. It never recursively
+changes ownership or starts/restarts a service. Follow the
+[state upgrade instructions](docs/operations/migration-continuity.md#upgrading-fail2zig-state)
+before replacing a 0.3.0 installation.
 
 ---
 
 ## Configuration
 
 `fail2zig` reads one TOML file — `/etc/fail2zig/config.toml` by default.
-The installer and the systemd setup both drop a fully-commented example
+The installer and the systemd setup both provide an example
 there. Edit it, validate, restart.
 
 The file must not be world-writable or writable by a non-root group; the
@@ -328,8 +357,8 @@ metrics_port       = 9100
 firewall           = "auto"       # probes nftables, ipset, iptables; naming one probes only it
 
 [defaults]
-bantime    = 600      # seconds
-findtime   = 600      # sliding window for counting attempts
+bantime    = "10m"    # integer seconds remain accepted
+findtime   = "10m"    # sliding window for counting attempts
 maxretry   = 5        # attempts inside findtime before a ban
 banaction  = "nftables"   # nftables / iptables / ipset all mean enforce (backend comes from [global] firewall); "log-only" observes
 ignoreip   = ["127.0.0.1/8", "::1"]
@@ -338,18 +367,18 @@ ignoreip   = ["127.0.0.1/8", "::1"]
 bantime_increment_enabled     = true
 bantime_increment_formula     = "exponential"
 bantime_increment_multiplier  = 2
-bantime_increment_max_bantime = 604800   # cap at 7 days
+bantime_increment_max_bantime = "1w"   # cap at 7 days
 
 [jails.sshd]
 enabled = true
 filter  = "sshd"
-# source = "auto" (the default) reads the systemd journal on modern minimal
-# systemd boxes where /var/log/auth.log is absent, and tails the files below
-# when they exist. Force it with source = "journald" or source = "file".
-logpath = ["/var/log/auth.log", "/var/log/secure"]
+source = "journald"
+# Debian 13 emits authentication records from sshd-session. Origin validation
+# accepts only the root-owned executable paths explicitly listed here.
+journal_executables = ["/usr/sbin/sshd", "/usr/lib/openssh/sshd-session"]
 
 [jails.nginx-botsearch]
-enabled = true
+enabled = false            # enable only when the log exists on this host
 filter  = "nginx-botsearch"
 logpath = ["/var/log/nginx/access.log"]
 ```
@@ -362,7 +391,16 @@ sudo systemctl restart fail2zig
 sudo fail2zig status
 ```
 
-Full schema and every option: [reference/config](https://fail2zig.com/docs/reference/config/).
+`bantime`, `findtime`, `bantime_increment_max_bantime` and `bantime_increment_jitter`
+accept integer seconds or quoted duration strings in defaults and jail overrides. Units are
+`s`, `m`, `mm`, `min`, `h`, `d`, `w`, `mo`, `y`; compounds such as `"1h30m"` or
+`"1h 30m"` work. Terms are nonnegative whole decimal numbers followed immediately by a
+unit. Fractions, arithmetic expressions and bare TOML values such as `24h` are rejected.
+Months and years mean fixed 2,629,800 and 31,557,600 seconds. Existing field limits apply;
+zero is allowed for jitter but not bantime, findtime or the escalation cap. `"permanent"`
+is available only for `bantime`. CLI durations and timeouts keep their existing numeric syntax.
+
+Full schema: [fail2zig.toml(5)](docs/man/fail2zig.toml.5).
 
 ### Migrate from fail2ban
 
@@ -371,16 +409,16 @@ fail2zig --import-config /etc/fail2ban \
          --import-output /etc/fail2zig/config.toml
 ```
 
-In this development checkout, configuration order is `jail.conf` → sorted
+Configuration import order is `jail.conf` → sorted
 `jail.d/*.conf` → `jail.local` → sorted `jail.d/*.local`, including ordered
 before/after includes. The importer retains raw settings, parameterized assets and
 provenance in a protected manifest alongside the native configuration projection.
 
-Supported native settings can be used after review. Custom filters, scoped actions and
-other unsupported semantics remain disabled and marked `compatibility_pending`; imported
-regexes are not automatically executed or replaced by a same-named builtin filter.
-The migration report identifies pending work. This preparation is not a complete or
-live migration from fail2ban. See [configuration preparation](docs/parity/p2-components.md#configuration-and-migration-preparation).
+The supported workflow inspects the source, captures a read-only SQLite snapshot, creates and
+validates a deterministic plan, and then performs a journaled cutover. Unsupported enabled
+protection, custom executable actions, changed input and unsafe continuity block activation
+before mutation. Imported regexes are not automatically executed or silently replaced by a
+same-named built-in filter.
 
 Step-by-step guide: [guides/migration-from-fail2ban](https://fail2zig.com/docs/guides/migration-from-fail2ban/).
 
@@ -495,25 +533,16 @@ eBPF/XDP (NIC-level drop) is on the roadmap; it is not scheduled.
 - Linear and exponential `bantime_increment`, capped at `bantime_increment_max_bantime`
 - CIDR-based ignore list (IPv4 `/0`–`/32`, IPv6 `/0`–`/128`); ignored IPs
   short-circuit before any state update
-- Fixed-capacity tracker per jail; when full, the oldest unbanned entry is
-  evicted (sizing in [Why fail2zig](#why-fail2zig))
-- Atomic state persistence (write-to-temp + fsync + rename); CRC32-validated
-  on load; restored bans are reconciled into the firewall on restart
-- State file format v4 records whether each ban was enforced; v1–v3 files
-  still load. A `state_file` under `/run` or on tmpfs logs a warning at
-  startup: it will not survive a reboot
+- Bounded native tracking that retains protection-critical receipts, retry
+  state, enforcement intent and active ownership at capacity
+- Embedded SQLite transactions for records, source progress, retry state,
+  decisions and effect intent; confirmed kernel state is reconciled on restart
 
-The unpublished candidate reports the state/temporary-file path and underlying creation
-error when saving fails. A failed state save prevents advancing the saved journal cursor;
-failed journal flushes remain pending for retry. This improves recovery but does not make
-the two files a single crash-atomic transaction. The configured state directory must already
-exist and be writable inside the daemon's service environment. The shipped systemd unit
-provides `/var/lib/fail2zig`; custom paths must also satisfy its filesystem restrictions.
-The candidate refuses startup with exit code 1 if its persistence availability check fails,
-before firewall initialization or log ingestion. It checks the state path and, when journal
-input is selected, the cursor sidecar path. Disposable files test writing, syncing and renaming
-without overwriting saved state. The error names the path, operation and OS cause. Repair the
-directory or service access and restart; this check cannot guarantee against later disk failures.
+The configured state directory must already exist and be writable inside the daemon's service
+environment. The shipped systemd unit provides `/var/lib/fail2zig`; custom paths must also satisfy
+its filesystem restrictions. The daemon refuses startup before firewall mutation or log
+ingestion when required persistence cannot be opened or validated. Runtime storage failures pause
+affected ingestion while protection and bounded degraded-health reporting remain available.
 
 ### IPC & metrics
 
@@ -546,28 +575,6 @@ Filter names accept hyphenated or underscore forms
 
 ---
 
-## Benchmarks
-
-Historical measurements from the reference lab box (x86_64, ReleaseSafe, stripped).
-Parser and decision microbenchmarks exclude log delivery and firewall installation;
-they do not establish an end-to-end speed advantage over fail2ban.
-Reproducible via `make bench` and the `tests/harness/measure.sh` probes.
-
-| Metric | Target | Measured |
-|--------|--------|----------|
-| Parse throughput (lines/sec) | ≥ 22,000 | **~5.96M** |
-| Ban decision latency (p99) | < 1 ms | **932 ns** (p50: 365 ns) |
-| Tracked state (50K unique IPs) | Bounded entry count | 21,845 entries resident, 15,606 evictions — cap held |
-| Binary size (x86_64-linux-musl, stripped) | ≤ 5 MB | **1.0 MB** daemon · 535 KB client |
-| Cold start → ready for events | < 100 ms | Lab-dependent (skips unprivileged hosts) |
-| IPC `status` round-trip (p99) | < 50 ms | **< 1 ms** (p50 0.75 ms; 500 round-trips, dev box, not the lab box) |
-
-Benchmark harness and methodology:
-[tests/benchmark/README.md](tests/benchmark/README.md). Real-system validation
-harness: [tests/harness/README.md](tests/harness/README.md).
-
----
-
 ## Compatibility and operational limits
 
 fail2zig supports built-in filters, per-jail thresholds, ignore lists, escalating
@@ -592,6 +599,11 @@ is stopped, and expiry resumes on restart. nftables also uses kernel timeouts.
 The filter regression corpus is in `tests/integration/filter_corpus.json`.
 It contains synthetic cases, not a production-log compatibility certification.
 
+Firewall effects are bound to the daemon's current network namespace. The built-in selector uses
+that namespace directly; the daemon does not enter a different namespace. Custom namespace
+selectors or service overrides that move the daemon between network namespaces are not supported
+in 0.4.0.
+
 ---
 
 ## Project structure
@@ -614,6 +626,7 @@ fail2zig/
 │   ├── harness/         # Shell-based system harness (lab-box tests)
 │   └── e2e/             # Deploy-regression scripts (real install + shipped unit)
 ├── docs/                # Installable man pages
+│   ├── architecture.md  # Runtime, durability and dependency boundaries
 │   ├── man/             # troff: fail2zig(1), fail2zig.toml(5)
 │   └── operations/      # Operator runbooks (command migration, continuity)
 ├── deploy/              # systemd unit, example config
@@ -629,7 +642,7 @@ fail2zig/
 
 | Kind | Where | What |
 |------|-------|------|
-| Architecture | [fail2zig.com/docs](https://fail2zig.com/docs/) | Why decisions were made (zero-dependencies deep-dive) |
+| Architecture | [docs/architecture.md](docs/architecture.md) | Runtime, durability and dependency boundaries |
 | Guides | [fail2zig.com/docs](https://fail2zig.com/docs/) | Task-oriented walkthroughs (migration from fail2ban) |
 | Reference | [fail2zig.com/docs](https://fail2zig.com/docs/) | Config schema, CLI flags, filter catalogue |
 | Man pages | [docs/man/](docs/man/) | `fail2zig(1)`, `fail2zig.toml(5)` |
@@ -640,7 +653,7 @@ fail2zig/
 
 ## Contributing
 
-fail2zig wants to be the modern replacement for fail2ban — the drop-in
+fail2zig wants to be a modern alternative to fail2ban — a native
 tool that understands the services people actually run in 2026.
 Contributors are how it gets there. The codebase is small (~29K lines of
 Zig, ~32K with `tests/`), the conventions are boring on purpose, and the contribution surface
@@ -703,16 +716,18 @@ contributing — see [Trademark](#trademark) below.
 ```bash
 git clone https://github.com/ul0gic/fail2zig
 cd fail2zig
-zig build test          # Current dependency-bearing foundations are described below
+zig build -Doptimize=ReleaseSafe
+zig build test-native-foundations -Doptimize=ReleaseSafe
 ```
 
 **Requires:**
 
-- [Zig 0.14.x](https://ziglang.org/download/); CI pins 0.14.1. Zig 0.15 and later do not build this tree (ADR-012).
+- [Zig 0.14.1](https://ziglang.org/download/); Zig 0.15 and later do not build this tree (ADR-012).
 
-The current P2 test foundations still require Python and dynamic libraries for applicable
-paths; see [component status](docs/parity/p2-components.md). The planned Zig-only project
-tooling gate is not implemented yet.
+Product builds, installation, runtime and maintained product-test paths require no Python or
+shared SQLite library. `test-standalone-surface` checks the repository and built executable for
+forbidden interpreter and shared-runtime dependencies; `test-release-local` assembles the bounded
+local release checks.
 
 The marketing site (fail2zig.com) lives in a separate repo and is not covered here.
 
@@ -723,7 +738,8 @@ bugs early and keep the binary small.
 
 **Zig:**
 - `zig fmt engine/ client/ shared/ tests/` before every commit — CI-enforced
-- `zig build` and `zig build test` pass, zero failures, zero leaks
+- `zig build` and the smallest affected registered test root pass with zero failures/leaks;
+  the bounded release-local composition runs once after converged release changes
 - Zero compiler warnings; `zig build -Doptimize=ReleaseSafe` clean
 - No `@panic` in production code — propagate errors explicitly
 - No `@setRuntimeSafety(false)` without a comment proving the safety invariant
@@ -761,7 +777,6 @@ make test           # zig build test
 make bench          # Microbenchmarks
 make fuzz           # Fuzz corpus run
 make release        # ReleaseSafe native build
-make cross          # ReleaseSafe for all five shipped musl targets
 make lint           # zig fmt --check, shellcheck, yamllint
 make harness-smoke  # Lab-box attack smoke test (requires a Linux host)
 ```

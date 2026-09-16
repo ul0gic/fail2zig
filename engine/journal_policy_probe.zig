@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Original fixture preparation only; this probe never opens a journal.
 const std = @import("std");
 const policy = @import("core/journal_policy.zig");
 const Request = struct {
@@ -11,7 +10,6 @@ const Request = struct {
     effective_uid: u32 = 0,
     default_flags: ?[]const u8 = null,
     unreadable: []const []const u8 = &.{},
-    // Accepted for historical request compatibility; no journal is opened.
     private_root: []const u8 = "",
 };
 const Response = struct {

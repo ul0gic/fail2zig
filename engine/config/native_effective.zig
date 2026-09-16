@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Immutable, bounded configuration preparation. Parsing retains provenance;
-//! only exact-generation consumer bindings can produce an admitted projection.
-//! No source session, SQLite store, resolver, executable action or effect runs.
 const std = @import("std");
 const ini = @import("fail2ban.zig");
 const context = @import("filter_context.zig");
@@ -94,8 +91,6 @@ pub const Prepared = struct {
         const graph = try self.load(stem);
         return .{ .source = graph, .config_generation = graphDigest(graph) };
     }
-    /// Equivalent layer/include ordering to the existing reader, with an
-    /// aggregate byte/occurrence/arena bound and every directory entry charged.
     fn load(self: *Prepared, stem: []const u8) anyerror!ini.ParsedIni {
         const a = self.alloc();
         var files = std.ArrayList([]const u8).init(a);
@@ -221,8 +216,6 @@ pub const Prepared = struct {
         const combined = try ini.combineAsset(a, &prepared, "");
         return .{ .kind = kind, .selector = selector_text, .prepared = prepared, .combined = combined, .generation = assetDigest(kind, selector_text, prepared.config, combined) };
     }
-    /// Same initial-known/final-jail parameter phases as filter_context.prepare,
-    /// using the bounded preloaded asset instead of its filesystem loader.
     fn filterContext(self: *Prepared, original: ini.ParsedIni, jail: []const u8, item: *Asset, backend: []const u8) !ini.ParsedIni {
         const a = self.alloc();
         var parameters = try item.prepared.selector.parameters.clone(a);
@@ -356,8 +349,6 @@ fn definition(a: std.mem.Allocator, asset: *ini.ParameterizedAsset, parameters: 
     var entries = asset.definition.iterator();
     while (entries.next()) |entry| entry.value_ptr.* = parameters.get(entry.key_ptr.*) orelse (try ini.resolveWithParameters(a, &asset.config, "Definition", entry.key_ptr.*, parameters)) orelse entry.value_ptr.*;
 }
-// Merge uses the established raw-origin previous-value and conditional-section
-// semantics. Filesystem traversal is deliberately separate from this pure phase.
 fn merge(a: std.mem.Allocator, base: *ini.ParsedIni, override: ini.ParsedIni) !void {
     var sections = override.sections.iterator();
     while (sections.next()) |entry| {
@@ -414,8 +405,6 @@ pub const Binding = struct {
         try writer.endObject();
     }
 };
-/// Caller keeps this value at a stable address while reading its slice fields.
-/// Diagnostics own their bytes and survive failed projection arena cleanup.
 pub const Diagnostic = struct {
     jail: []const u8 = "",
     key: []const u8 = "",
@@ -427,7 +416,6 @@ pub const Diagnostic = struct {
 };
 pub const GlobalBinding = struct {
     prepared_generation: [32]u8,
-    /// Explicit native target; source fail2ban SQLite is read-only migration input.
     state_file: []const u8,
     retention_generation: [32]u8 = [_]u8{0} ** 32,
 };
@@ -450,9 +438,6 @@ pub const Projection = struct {
     globals: GlobalSettings = .{},
     consumers: []ConsumerSettings,
     generation: [32]u8,
-    /// Prepared, original and binding owners must outlive this projection.
-    /// Unsupported settings fail here, before Store.open or source/effect work.
-    /// Original compatibility_pending flags are never edited in place.
     pub fn create(allocator: std.mem.Allocator, prepared: *const Prepared, original: *const native.Config, bindings: []const Binding, diagnostic: *Diagnostic) !*Projection {
         return createWithGlobal(allocator, prepared, original, null, bindings, diagnostic);
     }
@@ -539,8 +524,6 @@ pub const Projection = struct {
                 self_required = reader.value.boolean;
             };
             out.* = .{ .name = jail.name, .enabled = true, .filter = binding.native_filter, .source = binding.source_kind, .logpath = try paths.toOwnedSlice(), .maxretry = maxretry, .findtime = findtime, .bantime = bantime, .banaction = binding.effect, .ignoreip = try ignores.toOwnedSlice(), .compatibility_pending = false };
-            // Existing native Config is a compatibility seam; authoritative time,
-            // family, source modes and consumers remain in these typed settings.
             const window_us = std.math.mul(i64, @intCast(findtime), 1_000_000) catch return error.InvalidEffectiveValue;
             var consumer_hash = std.crypto.hash.sha2.Sha256.init(.{});
             consumer_hash.update("fail2zig-effective-consumer-binding-v1\x00");
@@ -566,8 +549,6 @@ pub const Projection = struct {
         try std.json.stringify(self.config.global, .{}, HashWriter{ .context = &identity });
         try std.json.stringify(self.config.defaults, .{}, HashWriter{ .context = &identity });
         try std.json.stringify(self.globals, .{}, HashWriter{ .context = &identity });
-        // Retain the complete original manifest; parsing never erases its source
-        // evidence. Native admission is represented by this separate owner.
         self.consumers = try consumers.toOwnedSlice();
         identity.final(&self.generation);
         return self;
@@ -694,8 +675,6 @@ fn checkGlobals(prepared: *const Prepared, diag: *Diagnostic) !void {
         if (std.mem.eql(u8, section.key_ptr.*, "INCLUDES")) continue;
         if (!std.mem.eql(u8, section.key_ptr.*, "DEFAULT") and !std.mem.eql(u8, section.key_ptr.*, "Definition")) return fail(diag, "", section.key_ptr.*, "unsupported global section", error.UnsupportedEffectiveGlobal);
         for (section.value_ptr.keys.keys()) |key| {
-            // Other global runtime settings need their own exact native mapping;
-            // an imported source graph cannot authorize guessed logging/state IO.
             var supported = false;
             for ([_][]const u8{ "allowipv6", "loglevel", "logtarget", "socket", "dbfile", "dbpurgeage", "dbmaxmatches" }) |name| if (std.mem.eql(u8, key, name)) {
                 supported = true;
@@ -732,8 +711,6 @@ fn checkJail(jail: Jail, binding: Binding, diag: *Diagnostic) !void {
         if (!std.mem.eql(u8, &asset.generation, &proof.generation)) return fail(diag, jail.name, asset.selector, "asset bytes/parameters differ from qualified consumer", error.UnqualifiedEffectiveAsset);
     }
 }
-/// Checked integer duration grammar: additive decimal terms with s/m/h/d/w.
-/// Unsupported fractions/formulas/permanent durations remain explicit refusal.
 fn seconds(raw: []const u8) !u64 {
     if (raw.len == 0 or raw.len > 256) return error.InvalidEffectiveDuration;
     var at: usize = 0;

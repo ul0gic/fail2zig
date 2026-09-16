@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Read-only fail2ban SQLite snapshot capture and schema-4 reader tests.
-//! Every test proves source immutability (main file and WAL SHA-256 + mtime).
 const std = @import("std");
 const snapshot = @import("migration/sqlite_snapshot.zig");
 const db = @import("migration/fail2ban_db.zig");
@@ -12,6 +10,23 @@ comptime {
 }
 
 const t = std.testing;
+
+test "migration snapshot: transient text binding copies caller bytes before stepping" {
+    var conn = try db.Connection.open(":memory:", db.open_flags.readwrite | db.open_flags.create);
+    defer conn.close();
+    var stmt = try conn.prepare("SELECT ?1, ?2");
+    defer stmt.finalize();
+
+    var text = [_]u8{ 's', 's', 'h', 'd', 0, 'x' };
+    try stmt.bindText(1, &text);
+    try stmt.bindText(2, "");
+    @memset(&text, '!');
+
+    try t.expect(try stmt.step());
+    try t.expectEqualStrings("sshd\x00x", stmt.columnBytes(0).?);
+    try t.expectEqualStrings("", stmt.columnBytes(1).?);
+    try t.expect(!try stmt.step());
+}
 
 const Env = struct {
     tmp: t.TmpDir,
@@ -49,7 +64,6 @@ const Env = struct {
     }
 };
 
-/// Fingerprint of the source main file and its WAL sibling (if any).
 const SourceFingerprint = struct {
     main_sha: [32]u8,
     main_mtime_ns: i128,
@@ -70,7 +84,6 @@ const SourceFingerprint = struct {
         if (self.wal_sha) |before| {
             try t.expectEqualSlices(u8, &before, &now.wal_sha.?);
         } else if (now.wal_sha != null) {
-            // Read-only WAL access may create an empty -wal sibling; it must carry no frames.
             const wal = try std.fmt.allocPrint(a, "{s}-wal", .{source});
             defer a.free(wal);
             try t.expectEqual(@as(u64, 0), (try std.fs.cwd().statFile(wal)).size);
@@ -89,7 +102,6 @@ fn expectSeededSnapshot(a: std.mem.Allocator, env: Env, snap: snapshot.Snapshot)
     try t.expectEqual(@as(u64, @intCast(stat.ino)), snap.source_ino);
     try t.expectEqual(@as(u64, @intCast(stat.size)), snap.source_size);
     try t.expect(std.mem.startsWith(u8, snap.destination_path, env.staging));
-    // Destination is our own exclusively created 0600 file whose hash matches.
     const dest_stat = try std.fs.cwd().statFile(snap.destination_path);
     try t.expectEqual(@as(u32, 0o600), @as(u32, @intCast(dest_stat.mode & 0o777)));
     try t.expectEqualSlices(u8, &snap.destination_sha256, &(try snapshot.sha256File(snap.destination_path)));
@@ -129,7 +141,6 @@ fn expectSeededSnapshot(a: std.mem.Allocator, env: Env, snap: snapshot.Snapshot)
         while (try rows.next()) |row_const| {
             var row = row_const;
             defer row.deinit(a);
-            // bips has a (ip, jail) primary key so its order is index order; match by ip.
             var matched = false;
             for (expected) |want| {
                 if (!std.mem.eql(u8, want.ip.?, row.ip.present)) continue;
@@ -189,7 +200,6 @@ test "migration snapshot: uncheckpointed WAL frames are visible and the source W
     try t.expectEqualStrings("wal", snap.journal_mode_observed);
     try before.expectUnchanged(a, env.source);
     try expectSeededSnapshot(a, env, snap);
-    // Only the normalized snapshot file lives in staging: no -wal/-shm siblings.
     try t.expectEqual(@as(usize, 1), try env.stagingEntries());
 }
 
@@ -231,7 +241,6 @@ test "migration snapshot: concurrent writer restarts the backup and the final co
     try t.expectEqual(fixture.seeded_ban_count + 3, snap.row_counts.bans);
     try t.expectEqualSlices(u8, &snap.destination_sha256, &(try snapshot.sha256File(snap.destination_path)));
 
-    // The copy is exactly the source as it stood after the last write.
     var source_reader = try db.Reader.open(a, env.source);
     defer source_reader.close();
     var reader = try db.Reader.open(a, snap.destination_path);
@@ -420,7 +429,7 @@ test "migration snapshot: missing file, unreadable file and symlink are refused"
     try t.expectError(error.NotRegularFile, snapshot.capture(a, link, env.staging, .{}));
     try t.expectError(error.NotRegularFile, snapshot.capture(a, env.root, env.staging, .{}));
 
-    if (std.os.linux.geteuid() == 0) return error.SkipZigTest; // root ignores 0000
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
     try std.posix.fchmodat(std.posix.AT.FDCWD, env.source, 0o000, 0);
     defer std.posix.fchmodat(std.posix.AT.FDCWD, env.source, 0o600, 0) catch {};
     try t.expectError(error.AccessDenied, snapshot.capture(a, env.source, env.staging, .{}));
@@ -438,7 +447,6 @@ test "migration snapshot: interruption after N backup steps removes the destinat
     try t.expectError(error.InjectedFailure, snapshot.capture(a, env.source, env.staging, .{ .pages_per_step = 1, .fail_after_steps = 2 }));
     try before.expectUnchanged(a, env.source);
     try t.expectEqual(@as(usize, 0), try env.stagingEntries());
-    // The same source still captures cleanly afterwards.
     var snap = try snapshot.capture(a, env.source, env.staging, .{ .pages_per_step = 1 });
     defer snap.deinit(a);
     try before.expectUnchanged(a, env.source);
@@ -452,7 +460,7 @@ test "migration snapshot: a source larger than 1 GiB is refused before any open"
     {
         const file = try std.fs.cwd().createFile(env.source, .{});
         defer file.close();
-        try file.setEndPos(snapshot.Limits.max_source_bytes + 1); // sparse: no data written
+        try file.setEndPos(snapshot.Limits.max_source_bytes + 1);
     }
     try t.expectError(error.SourceTooLarge, snapshot.capture(a, env.source, env.staging, .{}));
     try t.expectEqual(@as(usize, 0), try env.stagingEntries());
@@ -509,15 +517,10 @@ test "migration snapshot: reader reports NULL fields explicitly and rejects wron
         defer writer.close();
         try writer.exec("INSERT INTO jails(name, enabled) VALUES('sshd', 1)");
         try writer.exec("INSERT INTO logs(jail, path, firstlinemd5, lastfilepos) VALUES('sshd', NULL, NULL, NULL)");
-        // Row 1: NULL ip/data are legal and explicit.
         try writer.exec("INSERT INTO bans(jail, ip, timeofban, bantime, bancount, data) VALUES('sshd', NULL, 1, 2, 3, NULL)");
-        // Row 2: data stored as an integer (JSON affinity keeps it numeric).
         try writer.exec("INSERT INTO bans(jail, ip, timeofban, bantime, bancount, data) VALUES('sshd', '192.0.2.1', 1, 2, 3, 42)");
-        // Row 3: 65-byte ip.
         try writer.exec("INSERT INTO bans(jail, ip, timeofban, bantime, bancount, data) VALUES('sshd', '" ++ ("a" ** 65) ++ "', 1, 2, 3, NULL)");
-        // Row 4: text where an integer is required.
         try writer.exec("INSERT INTO bans(jail, ip, timeofban, bantime, bancount, data) VALUES('sshd', '192.0.2.2', 'soon', 2, 3, NULL)");
-        // Row 5: data above 64 KiB.
         var stmt = try writer.prepare("INSERT INTO bans(jail, ip, timeofban, bantime, bancount, data) VALUES('sshd', '192.0.2.3', 1, 2, 3, ?1)");
         defer stmt.finalize();
         const big = try a.alloc(u8, db.max_data_bytes + 1);
@@ -597,7 +600,6 @@ test "migration snapshot: staging directory must be a private 0700 directory own
 }
 
 test "migration snapshot: a staging directory owned by another uid is refused" {
-    // Producing a second uid requires root; the check itself is a single stat comparison.
     if (std.os.linux.geteuid() != 0) return error.SkipZigTest;
     const a = t.allocator;
     var env = try Env.init(a);

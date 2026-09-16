@@ -85,7 +85,6 @@ test "native effect runtime: clock and persistence failures clear previously pub
     var entry = try fixture.owner("fixture", 1, .permanent);
     const manager = try fixture.manager();
     defer manager.destroy();
-    // Synthetic prior health only: every tested failure occurs before firewall I/O.
     entry.status = .applied;
     manager.live[0] = entry;
     manager.count = 1;
@@ -151,7 +150,6 @@ test "native effect runtime: isolated final inventory catches missing scope then
     try ready(manager);
     try t.expect(manager.confirmedSubject(subject, std.time.microTimestamp()));
     try t.expectEqual(@as(u64, 1), try fixture.store.confirmedEffectEvents());
-    // Simulate drift after individual scope checking but before final inventory.
     manager.cursor = manager.count;
     try driftRemove(manager);
     try t.expect(!try manager.turn(&bindings));
@@ -213,8 +211,6 @@ test "native effect runtime: isolated stop restores durable intent and repair ep
     const deadline = std.time.microTimestamp() + 30_000_000;
     const entry = try fixture.owner("fixture", 1, .{ .finite = deadline });
     try fixture.store.prepareActionTargets(.{ .action_id = [_]u8{1} ** 32, .scope_key = entry.scope_key, .jail = "fixture" }, .{ .prepared_us = std.time.microTimestamp() });
-    // A terminal optional failure is independent: the manager still confirms
-    // the mandatory target from exact kernel readback and reaches readiness.
     try fixture.store.markActionTargetDispatched([_]u8{1} ** 32, .notification, .{ .prepared_us = std.time.microTimestamp() });
     try fixture.store.settleActionTarget([_]u8{1} ** 32, .notification, .failed, .{ .prepared_us = std.time.microTimestamp() });
     {
@@ -258,7 +254,7 @@ const ForbiddenSql = struct {
     var calls: usize = 0;
     fn exec(_: *Db, _: [*:0]const u8, _: ?*anyopaque, _: ?*anyopaque, _: ?*?[*:0]u8) callconv(.c) c_int {
         calls += 1;
-        return 5; // SQLITE_BUSY: any attempted SQL is counted as a test failure.
+        return 5;
     }
 };
 const BlockedWriter = struct {
@@ -388,7 +384,7 @@ test "native effect runtime: isolated committed extension with ambiguous result 
             const result = actual(db, statement, callback, context, message);
             if (result == 0 and std.mem.eql(u8, std.mem.span(statement), "COMMIT;")) {
                 committed = true;
-                return 10; // Real SQLite commit completed, but its caller sees IOERR.
+                return 10;
             }
             return result;
         }
@@ -404,7 +400,6 @@ test "native effect runtime: isolated committed extension with ambiguous result 
     try t.expectEqual(old_epoch, fixture.store.effect_publication_epoch);
     try t.expectEqual(@as(?u64, old_epoch), manager.cached_epoch);
     waitUntil(original_deadline + 20_000);
-    // Poison is checked before cached epoch equality or any transport dispatch.
     try manager.expireDuringOutage();
     try t.expect(!manager.outage_attempted[0]);
     try t.expect(!manager.status.ready);
@@ -414,8 +409,6 @@ test "native effect runtime: isolated committed extension with ambiguous result 
         defer snapshot.deinit();
         try t.expectEqual(@as(usize, 1), snapshot.entries.len);
     }
-    // nft/ipset may expire their original timers autonomously. The guard above
-    // proves no daemon removal attempt; it does not assert a nonexistent extension.
     var reopened = try durable.Store.open(t.allocator, fixture.path);
     defer reopened.close();
     var entries: [1]effect.Entry = undefined;

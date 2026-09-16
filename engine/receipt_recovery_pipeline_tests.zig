@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Real native file/pipeline/SQLite receipt ownership, with an ordinary time
-//! processor fixture. No production detector, daemon or Python execution.
 const std = @import("std");
 const time = @import("core/native_time.zig");
 const policy = @import("core/source_time_policy.zig");
@@ -46,7 +44,6 @@ test "receipt recovery: file pipeline owns receipt before preparation and restor
         defer store.close();
         try store.enableReceipts(2);
         var clock = Clock{ .now = 1_000_000_000 };
-        // A deliberately wrong fallback proves record.receipt_time is consumed.
         var processor = Fixture{ .allocator = a, .receipt = .{ .us = 999_000_000_000 }, .now = .{ .us = clock.now } };
         var owner = pipeline.Pipeline{ .store = &store, .jail = "fixture", .processor = processor.adapter(), .receipts = clock.admission(generation) };
         try owner.restore(a);
@@ -66,14 +63,12 @@ test "receipt recovery: file pipeline owns receipt before preparation and restor
         processor.now.us = clock.now;
         store.fail_at = .after_receipt_commit;
         try std.testing.expectError(error.InjectedFailure, source.poll(pipeline.Pipeline.acknowledge, &owner));
-        try std.testing.expectEqual(@as(usize, 1), clock.calls); // original candidate retained
+        try std.testing.expectEqual(@as(usize, 1), clock.calls);
         try std.testing.expectEqual(@as(usize, 0), processor.data_preparations);
         try std.testing.expectEqual(@as(usize, 1), try store.pendingReceiptCount());
-        try std.testing.expectEqual(@as(u64, 1), owner.revision); // baseline only
+        try std.testing.expectEqual(@as(u64, 1), owner.revision);
         try std.testing.expectEqual(@as(i64, 0), try store.pendingIntents());
     }
-    // Fresh store, clock, pipeline, processor and file owner. No old receipt is
-    // supplied by the fixture or retained in memory across this restart.
     {
         var store = try durable.Store.open(a, database);
         defer store.close();
@@ -122,13 +117,11 @@ test "receipt recovery: file pipeline owns receipt before preparation and restor
     var source = try files.FileSource.init(a, path, "ordinary", .head, parsed.value);
     defer source.deinit();
     try source.setNativeFraming(.utf8, generation, 4096);
-    // Same source offset, changed unread bytes: cannot inherit the pending time.
     try log.pwriteAll("2", first.len);
     try std.testing.expectError(error.ReceiptConflict, source.poll(pipeline.Pipeline.acknowledge, &owner));
     try std.testing.expectEqual(@as(usize, 0), processor.data_preparations);
     try std.testing.expectEqual(@as(u64, first.len), source.acknowledgedCheckpoint().?.offset);
     try log.pwriteAll("1", first.len);
-    // Recreate owner: a conflicting candidate is intentionally not repurposed.
     owner = .{ .store = &store, .jail = "fixture", .processor = processor.adapter(), .receipts = clock.admission(generation) };
     try owner.restore(a);
     try std.testing.expect(try source.poll(pipeline.Pipeline.acknowledge, &owner));
@@ -179,7 +172,7 @@ test "receipt recovery: receipt failure closes the shared gate before any proces
     const record = records.Record{ .source = "ordinary", .occurrence = "one", .cursor = "one", .message = "1000|ordinary event", .raw_hash = [_]u8{1} ** 32 };
     store.fail_at = .before_receipt_commit;
     try std.testing.expectError(error.InjectedFailure, pipeline.Pipeline.acknowledge(record, &one));
-    try std.testing.expectEqual(health.Phase.intervention, gate.snapshot().phase); // injected, not a retryable OS fault
+    try std.testing.expectEqual(health.Phase.intervention, gate.snapshot().phase);
     try std.testing.expectEqual(@as(u64, 0), gate.snapshot().committed_records);
     try std.testing.expectError(error.StoragePaused, pipeline.Pipeline.acknowledge(record, &two));
     try std.testing.expectEqual(@as(usize, 0), first.data_preparations + second.data_preparations);

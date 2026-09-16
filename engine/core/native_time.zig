@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Bounded timestamp values and field parsing. This layer never invents a year,
-//! timezone or receipt time and does not decide how ingestion handles bad dates.
 const std = @import("std");
 
 pub const Error = error{ InvalidTimestamp, TimeOutOfRange, MissingYear, MissingTimezone, UnsupportedPrecision };
@@ -34,16 +32,12 @@ pub const Context = struct {
 };
 pub const Age = enum { eligible, obsolete, future };
 
-/// Inclusive past window; the caller must decide what to do with .future.
-/// Wider intermediate arithmetic avoids overflow at signed epoch boundaries.
 pub fn age(event: Timestamp, now: Timestamp, window_us: i64) error{InvalidWindow}!Age {
     if (window_us < 0) return error.InvalidWindow;
     if (event.us > now.us) return .future;
     return if (@as(i128, now.us) - event.us <= window_us) .eligible else .obsolete;
 }
 
-/// Parse one complete timestamp field, not an arbitrary regex or an unbounded
-/// search through a message. Fractions must be exactly representable in µs.
 pub fn parse(format: Format, field: []const u8, context: Context) Error!Timestamp {
     if (field.len == 0 or field.len > 64) return error.InvalidTimestamp;
     return switch (format) {
@@ -96,7 +90,6 @@ fn zone(text: []const u8, colon: bool) Error!i32 {
     const hours = try number(text[1..3]);
     const minutes = try number(text[if (colon) @as(usize, 4) else 3..]);
     if (hours > 23 or minutes > 59) return error.InvalidTimestamp;
-    // An unknown offset must not be silently interpreted as UTC.
     if (text[0] == '-' and hours == 0 and minutes == 0) return error.MissingTimezone;
     const value: i32 = @intCast(hours * 3600 + minutes * 60);
     return if (text[0] == '-') -value else value;
@@ -121,7 +114,6 @@ fn calendar(year: i64, mon: i64, day: i64, clock: []const u8, microseconds: i64,
     if (mon > 2 and leap) days += 1;
     days += day - 1;
     const seconds = days * 86400 + hour * 3600 + minute * 60 + second - offset;
-    // Validated calendar and offset ranges are comfortably within i64 µs.
     return .{ .us = seconds * 1_000_000 + microseconds };
 }
 
@@ -213,8 +205,6 @@ test "native time: context and future policy cannot be silently inferred" {
 }
 
 test "native time: complete Gregorian cycle agrees with standard library dates" {
-    // Independent inverse conversion covers every day, including the three
-    // non-leap century boundaries, rather than repeating this parser's formula.
     for (10957..10957 + 146097) |day| {
         const year_day = (std.time.epoch.EpochDay{ .day = @intCast(day) }).calculateYearDay();
         const month_day = year_day.calculateMonthDay();

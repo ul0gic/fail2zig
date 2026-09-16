@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Allocation-free readiness derivation. The daemon fills `Inputs` from its published
-//! health values; this module only decides what they mean for operators and service
-//! managers. Readiness never grants authority; it reports it.
 
 const std = @import("std");
 const storage_health = @import("storage_health.zig");
@@ -34,40 +31,30 @@ pub const State = enum {
 };
 
 pub const Jail = struct {
-    /// Source admitted and continuity verified.
     healthy: bool,
-    /// Source continuity lost or admission refused; not merely waiting.
     source_error: bool,
-    /// Log-only jails do not require enforcement.
     enforce: bool,
 };
 
 pub const Effects = struct {
-    /// Selected backend installed and its scaffold verified.
     ready: bool,
-    /// Kernel state may differ from committed intent.
     uncertain: bool,
-    /// Committed expiries are past due and not yet applied.
     overdue: bool,
 };
 
 pub const Inputs = struct {
     config_loaded: bool,
-    /// null before the gate published anything.
     storage_phase: ?storage_health.Phase,
     worker: ?storage_health.WorkerStatus,
     jails: []const Jail,
-    /// null until the enforcement backend reported.
     effects: ?Effects,
     admin_generation_admitted: bool,
-    /// False once the IPC server stopped accepting (socket path no longer trustworthy).
     admin_serving: bool = true,
 };
 
 pub const Report = struct {
     components: [Component.count]State,
     ready: bool,
-    /// Static text naming the first non-ok component reason; null when ready.
     cause: ?[]const u8,
 
     pub fn state(self: Report, component: Component) State {

@@ -150,8 +150,6 @@ test "native session repair: pruned file replay stays fenced while sibling sourc
     const saved = (try f.store.sourceCursor(t.allocator, "fixture", source.source_id)).?;
     defer t.allocator.free(saved);
     const revision = try f.store.revision("fixture");
-    // Simulate an old source position after detail was marked. Durable state
-    // stays current; only the offered source occurrence is stale.
     source.committed = initial;
     session.next_source = index;
     session.discover_next = false;
@@ -639,8 +637,6 @@ test "native session repair: exact committed pending proof permits fresh cursor 
     source.frame_callback = failFrame;
     try t.expectError(error.SourceRepairPending, fileDelivery(old));
     source.frame_callback = frame;
-    // Commit through the same transactional adapter, then model lost publication
-    // by retaining the previous source cursor and unresolved repair ticket.
     _ = try source.poll(@import("core/record_pipeline.zig").Pipeline.acknowledge, &old.pipe);
     source.committed = saved;
     try t.expectEqual(@as(usize, 0), try f.store.pendingReceiptCount());
@@ -694,7 +690,6 @@ test "native session repair: first receipt write failure retries its exact sourc
     const old = try files.Session.createDeferred(t.allocator, &f.store, clock.fileOptions(), &.{.{ .pattern = pattern }});
     defer old.destroy();
     try admitFile(old);
-    // Drain both sources, then fail a later occurrence before receipt durability.
     for (old.sources.sources.items) |*source| {
         _ = try source.poll(@import("core/record_pipeline.zig").Pipeline.acknowledge, &old.pipe);
     }
@@ -824,7 +819,7 @@ test "native session repair: detached file snapshot survives old owner destructi
     var partial_live = true;
     defer if (partial_live) partial.destroy();
     try partial.importRecovery(snapshot);
-    _ = try partial.admissionTurn(); // Restored cursor, before descriptor adoption.
+    _ = try partial.admissionTurn();
     const next_snapshot = try partial.exportRecovery();
     defer next_snapshot.destroy();
     try t.expectEqual(@as(usize, 1), next_snapshot.descriptorCount());
@@ -861,7 +856,7 @@ test "native session repair: newly observed first file tail persists through det
     var partial_live = true;
     defer if (partial_live) partial.destroy();
     try partial.importRecovery(snapshot);
-    const repeated = try partial.exportRecovery(); // No source has yet been restored.
+    const repeated = try partial.exportRecovery();
     defer repeated.destroy();
     partial.destroy();
     partial_live = false;
@@ -920,7 +915,7 @@ test "native session repair: detached export handles uninitialized fresh slots a
     const old = try files.Session.createDeferred(t.allocator, &f.store, clock.fileOptions(), &.{.{ .pattern = f.path }});
     defer old.destroy();
     try admitFile(old);
-    old.repair_count = 0; // Appended source, repair slot not published yet.
+    old.repair_count = 0;
     const snapshot = try old.exportRecovery();
     defer snapshot.destroy();
     try t.expectEqual(@as(usize, 1), snapshot.entries.items.len);
@@ -1000,7 +995,7 @@ test "native session repair: detached first receipt candidate retains source and
         }
     };
     old.consumer_sources = .{ .context = null, .admit = Forbidden.call };
-    f.store.reopen_required = true; // Export must not read a poisoned Store.
+    f.store.reopen_required = true;
     const snapshot = try old.exportRecovery();
     defer snapshot.destroy();
     f.store.reopen_required = false;

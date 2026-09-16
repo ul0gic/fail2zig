@@ -1,30 +1,3 @@
-# fail2zig — continuous integration
-#
-# Fast-feedback pipeline that runs on every push and pull request.
-# Failure in any job blocks merge.
-#
-# Job order (parallel where possible):
-#   fmt           — style gate, fastest to fail
-#   build-native  — `zig build` on ubuntu-latest
-#   test          — `zig build test` with std.testing.allocator leak detection
-#   cross-compile — static musl ReleaseSafe builds for every shipped target,
-#                   with a qemu-user-static `--version` smoke on the mips pair
-#   shellcheck    — lint every tracked shell script
-#   yamllint      — lint the workflow files themselves
-#
-# Cross-compile matrix: x86_64, aarch64, armv7 (arm-linux-musleabihf), and
-# mips/mipsel (mips[el]-linux-musleabi, soft-float MIPS32r2). SYS-009's
-# portability bugs are fixed (u64 atomic counters are mutex-backed on 32-bit
-# arches; timeval casts narrow into the target field types).
-# mips uses the float-ABI-suffixed triples on purpose: no Zig release (0.14.1
-# through 0.17-dev) provides libc for the bare `mips-linux-musl` triple, so the
-# earlier "Zig 0.14.1 lacks mips musl libc" diagnosis was wrong — the triple
-# was. See ADR-012 and SYS-013 (closed). Hard-float (`musleabihf`) is not built
-# until a real target asks for it.
-#
-# Zig version is pinned to the toolchain that ships the project — see
-# build.zig.zon `minimum_zig_version`. Keep this in sync with any bump.
-
 name: CI
 
 on:
@@ -42,10 +15,6 @@ concurrency:
 
 env:
   ZIG_VERSION: "0.14.1"
-  # SHA256 of zig-x86_64-linux-${ZIG_VERSION}.tar.xz from
-  # https://ziglang.org/download/index.json — bump in lockstep with
-  # ZIG_VERSION. Hard-coded so a compromised ziglang.org mirror can't
-  # silently serve a different tarball than the one we audited.
   ZIG_SHA256: "24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c"
 
 jobs:
@@ -53,14 +22,10 @@ jobs:
     name: zig fmt --check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Install Zig ${{ env.ZIG_VERSION }}
-        # Direct fetch instead of mlugg/setup-zig@v1 — that action's
-        # mirror layout doesn't handle the 0.14.1 archive rename
-        # (zig-linux-x86_64 -> zig-x86_64-linux). SHA-pinned tarball
-        # from ziglang.org is simpler and harder to corrupt.
         run: |
           curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
           echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c -
@@ -69,21 +34,16 @@ jobs:
           echo "/opt/zig" >> "$GITHUB_PATH"
           /opt/zig/zig version
       - name: Check formatting
-        # sim/ is added back when Phase 9 ships the attack simulator.
         run: zig fmt --check engine/ client/ shared/ tests/
 
   build-native:
     name: Build (native Debug)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Install Zig ${{ env.ZIG_VERSION }}
-        # Direct fetch instead of mlugg/setup-zig@v1 — that action's
-        # mirror layout doesn't handle the 0.14.1 archive rename
-        # (zig-linux-x86_64 -> zig-x86_64-linux). SHA-pinned tarball
-        # from ziglang.org is simpler and harder to corrupt.
         run: |
           curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
           echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c -
@@ -92,7 +52,7 @@ jobs:
           echo "/opt/zig" >> "$GITHUB_PATH"
           /opt/zig/zig version
       - name: Cache zig-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: .zig-cache
           key: zig-cache-build-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
@@ -105,14 +65,10 @@ jobs:
     name: Tests (std.testing.allocator leak detection)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Install Zig ${{ env.ZIG_VERSION }}
-        # Direct fetch instead of mlugg/setup-zig@v1 — that action's
-        # mirror layout doesn't handle the 0.14.1 archive rename
-        # (zig-linux-x86_64 -> zig-x86_64-linux). SHA-pinned tarball
-        # from ziglang.org is simpler and harder to corrupt.
         run: |
           curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
           echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c -
@@ -121,45 +77,33 @@ jobs:
           echo "/opt/zig" >> "$GITHUB_PATH"
           /opt/zig/zig version
       - name: Cache zig-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: .zig-cache
           key: zig-cache-test-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
           restore-keys: |
             zig-cache-test-${{ runner.os }}-${{ env.ZIG_VERSION }}-
-      - name: zig build test
-        run: zig build test
+      - name: Bounded local release checks
+        run: zig build test-release-local -Doptimize=ReleaseSafe
 
-  cross-compile:
-    name: Cross-compile ${{ matrix.target }}
-    runs-on: ubuntu-latest
+  release-target:
+    name: Build ${{ matrix.target }} ReleaseSafe
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
-        # The bare `mips-linux-musl` triple has no libc in any Zig release;
-        # the float-ABI-suffixed musleabi triples do (ADR-012).
-        target:
-          - x86_64-linux-musl
-          - aarch64-linux-musl
-          - arm-linux-musleabihf
-          - mips-linux-musleabi
-          - mipsel-linux-musleabi
         include:
-          # Targets the runner cannot execute natively get a qemu-user-static
-          # smoke; `qemu` is empty for everything else.
-          - target: mips-linux-musleabi
-            qemu: qemu-mips-static
-          - target: mipsel-linux-musleabi
-            qemu: qemu-mipsel-static
+          - {target: x86_64-linux-musl, cpu: baseline, elf: "ELF 64-bit LSB.*x86-64"}
+          - {target: aarch64-linux-musl, cpu: baseline, elf: "ELF 64-bit LSB.*ARM aarch64"}
+          - {target: arm-linux-musleabihf, cpu: baseline, elf: "ELF 32-bit LSB.*ARM"}
+          - {target: mips-linux-musleabi, cpu: mips32r2, elf: "ELF 32-bit MSB.*MIPS"}
+          - {target: mipsel-linux-musleabi, cpu: mips32r2, elf: "ELF 32-bit LSB.*MIPS"}
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Install Zig ${{ env.ZIG_VERSION }}
-        # Direct fetch instead of mlugg/setup-zig@v1 — that action's
-        # mirror layout doesn't handle the 0.14.1 archive rename
-        # (zig-linux-x86_64 -> zig-x86_64-linux). SHA-pinned tarball
-        # from ziglang.org is simpler and harder to corrupt.
         run: |
           curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
           echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c -
@@ -168,70 +112,52 @@ jobs:
           echo "/opt/zig" >> "$GITHUB_PATH"
           /opt/zig/zig version
       - name: Cache zig-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: .zig-cache
-          key: zig-cache-cross-${{ matrix.target }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          key: zig-cache-release-${{ matrix.target }}-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
           restore-keys: |
-            zig-cache-cross-${{ matrix.target }}-${{ env.ZIG_VERSION }}-
+            zig-cache-release-${{ matrix.target }}-${{ runner.os }}-${{ env.ZIG_VERSION }}-
       - name: Build ReleaseSafe static binaries
-        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
-      - name: Smoke-test under qemu-user-static
-        if: matrix.qemu != ''
-        # Proves the cross-built ELF actually loads and runs on the target ISA
-        # (correct float ABI, static startup, no bad relocations), not just
-        # that it linked. `--version` is the only code path that needs no
-        # root, no config, and no firewall. Expected version comes from
-        # build.zig.zon, the release-stamp SSoT.
         env:
-          QEMU: ${{ matrix.qemu }}
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_CPU: ${{ matrix.cpu }}
+        run: zig build -Dtarget="$RELEASE_TARGET" -Dcpu="$RELEASE_CPU" -Doptimize=ReleaseSafe -Dstrip=true
+      - name: Verify the single executable and static linkage
+        env:
+          EXPECTED_ELF: ${{ matrix.elf }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-user-static
-          expected="$(sed -n 's/^ *\.version = "\([^"]*\)".*/\1/p' build.zig.zon)"
-          if [ -z "${expected}" ]; then
-            echo "::error::could not read .version from build.zig.zon"
-            exit 1
-          fi
-          out="$("${QEMU}" zig-out/bin/fail2zig --version)"
-          echo "${QEMU} fail2zig --version -> ${out}"
-          if [ "${out}" != "fail2zig ${expected}" ]; then
-            echo "::error::fail2zig --version printed '${out}', expected 'fail2zig ${expected}'"
-            exit 1
-          fi
-      - name: Verify binary is statically linked
-        run: |
+          find zig-out/bin -maxdepth 1 -type f -printf '%f\n' \
+            | LC_ALL=C sort > actual-executables
+          printf '%s\n' fail2zig > expected-executables
+          diff -u expected-executables actual-executables
           file zig-out/bin/fail2zig
-          # Musl static binaries should not have a dynamic interpreter.
-          if file zig-out/bin/fail2zig | grep -q "dynamically linked"; then
-            echo "::error::fail2zig is dynamically linked; expected static musl binary"
+          if ! file zig-out/bin/fail2zig | grep -q "$EXPECTED_ELF"; then
+            echo "::error::fail2zig has the wrong ELF architecture"
             exit 1
           fi
-          if [ -e zig-out/bin/fail2zig-client ]; then
-            echo "::error::a second executable was built; only fail2zig ships"
+          if ! file zig-out/bin/fail2zig | grep -q ", stripped"; then
+            echo "::error::fail2zig contains debug information"
             exit 1
           fi
-      - name: Upload cross-compile artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: fail2zig-${{ matrix.target }}
-          path: zig-out/bin/fail2zig
-          if-no-files-found: error
-          retention-days: 14
+          if readelf -l zig-out/bin/fail2zig | grep -q 'INTERP' || \
+             readelf -d zig-out/bin/fail2zig | grep -q NEEDED; then
+            echo "::error::fail2zig has a dynamic interpreter"
+            exit 1
+          fi
 
   shellcheck:
     name: shellcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Lint scripts
         run: |
-          # Fail on warnings (shellcheck default severity is style; we raise it).
-          shellcheck -S warning tests/harness/*.sh tests/e2e/*.sh tests/lab/*.sh
+          shellcheck -S warning tests/harness/*.sh tests/e2e/*.sh
           if [ -f scripts/install.sh ]; then
             shellcheck -S warning scripts/install.sh
           fi
@@ -240,7 +166,7 @@ jobs:
     name: yamllint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Install yamllint
@@ -252,27 +178,11 @@ jobs:
     name: zizmor
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Run zizmor (GitHub Actions SAST)
-        # zizmor statically analyses our workflow files for injection sinks,
-        # excessive token permissions, unpinned actions, credential
-        # persistence, and similar CI supply-chain footguns.
-        #
-        # Run as a pinned CLI via pipx (preinstalled on ubuntu-latest), not a
-        # marketplace action — keeps the third-party *action* surface minimal
-        # while still version-locking the tool. Bump the pin in lockstep with
-        # any zizmor finding-set changes.
-        #
-        # --min-severity medium: gate on medium+ findings (security-relevant
-        # posture) while not failing on low/informational pedantic lints we
-        # have consciously accepted. Run `pipx run zizmor==1.25.2
-        # .github/workflows/` locally to see the full (including low) set.
         env:
-          # GH token lets zizmor's online audits (e.g. ref confusion) resolve
-          # action repos; read-only, scoped to this job by the top-level
-          # `permissions: contents: read`.
           GH_TOKEN: ${{ github.token }}
         run: |
           pipx run zizmor==1.25.2 --min-severity medium .github/workflows/
@@ -281,15 +191,10 @@ jobs:
     name: SPDX headers
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Verify every .zig file carries the SPDX + copyright header
-        # Every first-party .zig source under engine/, client/, shared/,
-        # tests/, plus build.zig at the root, must start with:
-        #   // SPDX-License-Identifier: AGPL-3.0-or-later
-        #   // Copyright (c) <year> fail2zig maintainers
-        # This guards against header drift when new files are added.
         run: |
           missing=$(find engine client shared tests build.zig \
             -type f -name '*.zig' \

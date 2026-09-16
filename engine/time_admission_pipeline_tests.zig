@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Original native file/SQLite fixture for approved timestamp rejection. The
-//! field extractor, counting checkpoint and threshold intent are test fixtures;
-//! they do not stand in for daemon detection or the native jail schema.
 const std = @import("std");
 const admission = @import("core/source_time_policy.zig");
 const text = @import("core/source_text.zig");
@@ -57,7 +54,7 @@ const Fixture = struct {
     fn publish(context: ?*anyopaque) void {
         const self: *Fixture = @ptrCast(@alignCast(context.?));
         if (self.restoring) {
-            self.health = admission.Health.init(self.staged) catch unreachable; // validated during restore
+            self.health = admission.Health.init(self.staged) catch unreachable;
         } else self.health.publish(self.staged);
     }
     fn release(_: ?*anyopaque) void {}
@@ -120,9 +117,9 @@ test "time admission: rejected file records commit once without blocking subsequ
     try std.testing.expectEqual(@as(u64, first.len + missing.len + malformed.len), source.acknowledgedCheckpoint().?.offset);
     try std.testing.expect(processor.health.nextNotice(59_999) == null);
     try std.testing.expectEqual(@as(i64, 0), try store.pendingIntents());
-    try std.testing.expect(try source.poll(pipeline.Pipeline.acknowledge, &owner)); // obsolete
+    try std.testing.expect(try source.poll(pipeline.Pipeline.acknowledge, &owner));
     try std.testing.expectEqual(@as(i64, 0), try store.pendingIntents());
-    try std.testing.expect(try source.poll(pipeline.Pipeline.acknowledge, &owner)); // second eligible
+    try std.testing.expect(try source.poll(pipeline.Pipeline.acknowledge, &owner));
     const expected = admission.Counters{ .eligible = 2, .obsolete = 1, .missing = 1, .malformed = 1 };
     try std.testing.expectEqualDeep(expected, processor.health.snapshot());
     try std.testing.expectEqual(@as(u64, 1), processor.health.nextNotice(60_000).?.malformed_since_notice);

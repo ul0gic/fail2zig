@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Embedded SQLite record/cursor transaction foundation.
-//! A committed checkpoint is authoritative; external effects are queued, never executed here.
 const std = @import("std");
 const builtin = @import("builtin");
 const native_time = @import("native_time.zig");
@@ -52,7 +50,6 @@ const embedded_api: Api = blk: {
 pub const Error = application_history.Error || action_outcome.Error || retry.Error || consumers.Error || effects.Error || effect_history.Error || action_context.Error || error{ MaintenancePinned, StaleMaintenance, PrunedReplay, InvalidMaintenanceState, MaintenanceStorageRequired, ConsumerManifestRequired, ConsumerManifestMismatch, ConsumerManifestMissing, ConsumerManifestExists, ConsumerMigrationRequired, MissingRequiredConsumer, AmbiguousNativeDetection, AmbiguousRetryDecision, ConsumerStorageRequired, StaleConsumerCheckpoint, OpenFailed, UnsafePermissions, ForeignDatabase, UnsupportedSchema, DatabaseFailure, Busy, StorageFull, ReadOnly, StorageIo, CorruptDatabase, StorageLimit, Interrupted, AccessDenied, ReopenRequired, InvalidRecord, OccurrenceConflict, StaleCheckpoint, StaleSharedCheckpoint, InjectedFailure, OutOfMemory, ReceiptStorageRequired, InferenceStorageRequired, DetectionStorageRequired, ReceiptConflict, ReceiptRequired, ReceiptAlreadyCommitted, ReceiptLimit, RetryStorageRequired, RetryAdmissionRequired, RetryGenerationMismatch, RetryMigrationRequired, RetryCapacity, ReceiptClockReversed, HistoryResetStorageRequired, InvalidHistoryReset, StaleHistoryReset, AdminStorageRequired, MigrationStorageRequired, StaleAdminRevision, InvalidAdminRequest, AdminRequestCapacity, RetryPolicyInFlight, StalePolicyTransition, ConfigGenerationExists, ConfigGenerationMissing, MigrationRunExists, MigrationRunMissing, MigrationStepMissing, MigrationStepOpen, MigrationStepOrder, InvalidMigrationRow, InvalidMigrationState, MigrationJailUnknown };
 
 fn sqliteError(rc: c_int) Error {
-    // Extended result codes retain their primary result in the low eight bits.
     return switch (rc & 0xff) {
         3, 23 => error.AccessDenied,
         5, 6 => error.Busy,
@@ -68,11 +65,7 @@ fn sqliteError(rc: c_int) Error {
     };
 }
 pub const CommitStage = enum { before_admin_schema_commit, before_migration_schema_commit, after_admin_request, after_migration_step_intent, after_migration_step_outcome, before_migration_activation_commit, before_policy_transition_commit, before_config_generation_commit, before_config_generation_publish, before_action_target_schema_commit, after_action_target_intent, before_action_target_dispatch_commit, before_action_target_settlement_commit, before_history_reset_schema_commit, after_history_reset, before_canonical_effect_schema_commit, after_history_detail_delete, after_history_event_delete, before_escalation_schema_commit, before_application_history_schema_commit, before_cleanup_schema_commit, before_retry_lease_schema_commit, after_cleanup_mark, after_cleanup_delete, after_retry_retire, before_maintenance_schema_commit, after_source_sequence, after_replay_guard, after_record, after_checkpoint, after_shared_checkpoint, before_commit, before_receipt_commit, after_receipt_commit, after_receipt_delete, before_receipt_schema_commit, before_native_time_schema_commit, before_inference_schema_commit, before_detection_schema_commit, after_detection, before_clock_schema_commit, before_journal_detection_schema_commit, before_retry_schema_commit, after_retry_state, after_retry_decision, before_consumer_schema_commit, after_consumer_delta, before_effect_schema_commit, after_effect_owner, after_effect_intent, before_effect_dispatch_commit, before_effect_receipt_commit, before_manifest_schema_commit, before_manifest_commit, after_manifest_ready, before_consumer_input_commit };
-/// Existing write admission limits also govern restored values. The SQLite row
-/// ceiling allows the largest checkpoint plus its key and record encoding.
-/// These are value/row bounds, not a process-wide memory or disk quota.
 pub const Limits = struct {
-    /// Staged aggregate ceiling, not a new public daemon configuration setting.
     pub const pending_receipts = 4096;
     pub const checkpoint_bytes = 16 * 1024 * 1024;
     pub const shared_bytes = 4 * 1024 * 1024;
@@ -100,9 +93,6 @@ pub const HistoryResetResult = struct { revision: u64, through_sequence: u64, re
 pub const SharedState = struct {
     name: []const u8,
     expected_revision: u64,
-    /// Null validates a read dependency without rewriting or bumping its revision.
-    /// Supply the dependency whenever a decision reads shared state, even if its
-    /// bytes are unchanged. Zero revision explicitly depends on absent state.
     payload: ?[]const u8 = null,
 };
 pub const Record = struct {
@@ -117,23 +107,15 @@ pub const Record = struct {
     receipt: ?Receipt = null,
     native_time_outcome: ?time_policy.Result = null,
     native_detection: ?detection.Outcome = null,
-    /// Every outcome belongs to this one source occurrence; scalar and vector are exclusive.
     native_detections: ?[]const detection.Outcome = null,
     consumer_manifest: ?consumers.Manifest = null,
     native_retry: ?retry.Admission = null,
-    /// Administrative pause: the detection is recorded but no retry state advances.
     retry_suspended: bool = false,
-    /// Borrowed, validated observability input for this record. Retry counting
-    /// and deduplication never depend on these bytes.
     retry_evidence: retry.Evidence = .{},
     expected_revision: u64 = 0,
     disposition: []const u8,
-    /// Versioned caller-owned filter/ticket snapshot, atomically paired with cursor.
     checkpoint: []const u8,
-    /// Versioned typed intent payload. Null means no external effect requested.
     action_intent: ?[]const u8 = null,
-    /// Process-wide state (for example DNS caches) participates in the same
-    /// transaction as this jail's record, checkpoint, cursor and action intent.
     shared_state: ?SharedState = null,
     consumers: ?consumers.Batch = null,
     zone_provenance: ?native_record.Provenance = null,
@@ -151,18 +133,13 @@ pub const Store = struct {
     allocator: std.mem.Allocator,
     api: Api,
     db: *Db,
-    /// Sticky numeric diagnostics for the most recent SQLite failure. Successful
-    /// reads/cleanup do not erase its cause. SQL and record contents are not kept.
     last_error_code: ?c_int = null,
     rollback_error_code: ?c_int = null,
     consumer_clock_floor_us: ?i64 = null,
-    /// Process-local publication fence. Saturation invalidates detached expiry caches.
     effect_publication_epoch: u64 = 0,
     reopen_required: bool = false,
-    // Startup state is private until the coordinator commits all admissions.
     startup_admission: bool = false,
     startup_operation: bool = false,
-    /// Tests inject an ordinary transaction error; no crash or external action is required.
     fail_at: ?CommitStage = null,
     rekeyed_owners: bool = false,
     schema_version: i64 = 2,
@@ -177,8 +154,6 @@ pub const Store = struct {
         return std.crypto.random.uintAtMost(u64, maximum_seconds);
     }
 
-    /// One daemon-wide SQLite heap ceiling and per-transaction VM allowance.
-    /// These exclude Zig/OS/helper allocations and do not promise a disk quota.
     fn configureHeapLimit() void {
         const hard_limit = @extern(*const fn (i64) callconv(.c) i64, .{ .name = "sqlite3_hard_heap_limit64" });
         const prior = hard_limit(-1);
@@ -204,8 +179,6 @@ pub const Store = struct {
         self.work_remaining -= 1;
         return 0;
     }
-    /// Worker-only checkpoint barrier. A busy/failed checkpoint stops subsequent
-    /// ingestion; the WAL trigger allows transaction overshoot, not a hard quota.
     pub fn maintainWal(self: *Store, database_path: []const u8) Error!void {
         try self.usable();
         if (self.api.get_autocommit(self.db) == 0) return error.DatabaseFailure;
@@ -219,20 +192,16 @@ pub const Store = struct {
             else => return error.StorageIo,
         };
         if (stat.size < 16 * 1024 * 1024) return;
-        // This checkpoint is a separate unit of SQL work. The subsequent BEGIN
-        // resets the writer allowance; exhaustion here cannot borrow from it.
         self.work_remaining = 1000;
         var row = try self.statement("PRAGMA wal_checkpoint(TRUNCATE);");
         defer row.deinit();
         if (!try row.row()) return error.DatabaseFailure;
         if (try row.signed(0) != 0) {
-            self.last_error_code = 5; // checkpoint's explicit SQLITE_BUSY result
+            self.last_error_code = 5;
             return error.Busy;
         }
     }
 
-    /// Every runtime writer crosses the same WAL barrier before acquiring its
-    /// transaction. Reads and rollback remain usable while a reader pins WAL.
     fn beginWrite(self: *Store) Error!void {
         try self.usable();
         if (self.startup_admission) return error.DatabaseFailure;
@@ -240,8 +209,6 @@ pub const Store = struct {
         try self.exec("BEGIN IMMEDIATE;");
     }
 
-    /// Startup only: caller must keep all constructed owners unpublished and
-    /// destroy them on abort. No source, DNS request or effect dispatch is allowed.
     pub fn beginStartupAdmission(self: *Store) Error!void {
         try self.beginWrite();
         self.startup_admission = true;
@@ -263,8 +230,6 @@ pub const Store = struct {
     fn beginStartupOperation(self: *Store) Error!void {
         try self.usable();
         if (!self.startupAdmissionActive()) return error.DatabaseFailure;
-        // Separate bounded SQL allowance per existing operation. The outer
-        // startup loop has its own fixed owner/source/turn bound.
         self.work_remaining = 1000;
         try self.exec("SAVEPOINT native_startup_operation;");
         self.startup_operation = true;
@@ -288,19 +253,28 @@ pub const Store = struct {
         return openImpl(allocator, path, .plain);
     }
 
-    /// Runtime reopen must cross the WAL barrier before its initial schema
-    /// transaction too. The borrowed path must outlive this Store.
     pub fn openRuntime(allocator: std.mem.Allocator, path: []const u8) Error!Store {
         return openImpl(allocator, path, .runtime);
     }
-    /// Second connection for readers beside the running daemon: opens SQLITE_OPEN_READONLY and
-    /// performs no schema seed or header write, so it never advances `PRAGMA data_version`
-    /// under the worker's multi-turn maintenance validation.
     pub fn openReadOnly(allocator: std.mem.Allocator, path: []const u8) Error!Store {
         return openImpl(allocator, path, .readonly);
     }
 
-    const OpenMode = enum { plain, runtime, readonly };
+    pub const InstallationSnapshot = struct {
+        schema_version: i64,
+        installation: ?effects.Installation,
+    };
+
+    pub fn installationSnapshot(allocator: std.mem.Allocator, path: []const u8) Error!InstallationSnapshot {
+        var store = try openImpl(allocator, path, .preflight);
+        defer store.close();
+        return .{
+            .schema_version = store.schema_version,
+            .installation = if (store.schema_version >= 11) try store.readInstallation() else null,
+        };
+    }
+
+    const OpenMode = enum { plain, runtime, readonly, preflight };
     fn openImpl(allocator: std.mem.Allocator, path: []const u8, open_mode: OpenMode) Error!Store {
         const runtime = open_mode == .runtime;
         if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return error.OpenFailed;
@@ -308,12 +282,8 @@ pub const Store = struct {
         defer parent.close();
         const parent_stat = std.posix.fstat(parent.fd) catch return error.OpenFailed;
         if (parent_stat.uid != std.os.linux.geteuid() or parent_stat.mode & 0o022 != 0) return error.UnsafePermissions;
-        // Closing any descriptor for this inode releases the process's POSIX
-        // locks, including locks held by SQLite on another descriptor. Inspect
-        // existing files without opening them; create only absent files, before
-        // SQLite owns any locks. Never manually close an existing database FD.
         const stat = std.posix.fstatat(std.posix.AT.FDCWD, path, std.posix.AT.SYMLINK_NOFOLLOW) catch |failure| blk: {
-            if (failure != error.FileNotFound or open_mode == .readonly) return error.OpenFailed;
+            if (failure != error.FileNotFound or open_mode == .readonly or open_mode == .preflight) return error.OpenFailed;
             const created = std.posix.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, 0o600) catch return error.OpenFailed;
             defer std.posix.close(created);
             break :blk std.posix.fstat(created) catch return error.OpenFailed;
@@ -324,7 +294,7 @@ pub const Store = struct {
         const filename = allocator.dupeZ(u8, path) catch return error.OutOfMemory;
         defer allocator.free(filename);
         var db: ?*Db = null;
-        const access_flags: c_int = if (open_mode == .readonly) 1 else 2; // SQLITE_OPEN_READONLY / READWRITE
+        const access_flags: c_int = if (open_mode == .readonly or open_mode == .preflight) 1 else 2;
         const opened = api.open(filename, &db, access_flags | 0x10000 | 0x01000000, null);
         if (opened != 0 or db == null) {
             if (db) |handle| _ = api.close(handle);
@@ -332,23 +302,17 @@ pub const Store = struct {
         }
         var self = Store{ .allocator = allocator, .api = api, .db = db.? };
         errdefer _ = self.api.close(self.db);
-        // A rejected database is not ours to checkpoint, including implicitly
-        // when SQLite closes its last connection after reading a foreign WAL.
         const db_config = @extern(*const fn (*Db, c_int, ...) callconv(.c) c_int, .{ .name = "sqlite3_db_config" });
-        try self.check(db_config(self.db, 1006, @as(c_int, 1), @as(?*c_int, null))); // NO_CKPT_ON_CLOSE
-        // Bind preflight to SQLite's actual file before any schema/WAL mutation.
-        // HAS_MOVED also catches a swap-back between open and pathname recheck.
+        try self.check(db_config(self.db, 1006, @as(c_int, 1), @as(?*c_int, null)));
         const selected = std.posix.fstatat(std.posix.AT.FDCWD, path, std.posix.AT.SYMLINK_NOFOLLOW) catch return error.OpenFailed;
         if (selected.dev != stat.dev or selected.ino != stat.ino or selected.uid != stat.uid or selected.mode != stat.mode) return error.OpenFailed;
         const file_control = @extern(*const fn (*Db, ?[*:0]const u8, c_int, ?*anyopaque) callconv(.c) c_int, .{ .name = "sqlite3_file_control" });
         var moved: c_int = 1;
-        try self.check(file_control(self.db, "main", 20, &moved)); // SQLITE_FCNTL_HAS_MOVED
+        try self.check(file_control(self.db, "main", 20, &moved));
         if (moved != 0) return error.OpenFailed;
-        _ = api.limit(self.db, 0, Limits.sqlite_row_bytes); // SQLITE_LIMIT_LENGTH
+        _ = api.limit(self.db, 0, Limits.sqlite_row_bytes);
         if (api.limit(self.db, 0, -1) != Limits.sqlite_row_bytes) return error.StorageLimit;
         try self.check(api.busy_timeout(self.db, 1000));
-        // During opening this local Store is stable. Remove its callback before
-        // returning by value; the coordinator reinstalls it at its final address.
         const progress = @extern(*const fn (*Db, c_int, ?*const fn (?*anyopaque) callconv(.c) c_int, ?*anyopaque) callconv(.c) void, .{ .name = "sqlite3_progress_handler" });
         defer if (runtime) progress(self.db, 0, null, null);
         if (runtime) {
@@ -364,13 +328,12 @@ pub const Store = struct {
             if (schema != 0 or try self.integer("SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%';") != 0) return error.ForeignDatabase;
         } else if (application != 0x46325a31) return error.ForeignDatabase;
         if (schema < 0 or schema > latest_schema) return error.UnsupportedSchema;
-        self.schema_version = @max(schema, 2);
-        if (open_mode == .readonly) {
-            if (application == 0) return error.ForeignDatabase;
+        self.schema_version = if (open_mode == .preflight) schema else @max(schema, 2);
+        if (open_mode == .readonly or open_mode == .preflight) {
+            if (application == 0 and open_mode == .readonly) return error.ForeignDatabase;
             try self.exec("PRAGMA foreign_keys=ON;");
             return self;
         }
-        // Only an admitted application/schema may change database limits or WAL.
         if (runtime) {
             try self.configureRuntimeLimits();
             try self.maintainWal(path);
@@ -407,9 +370,6 @@ pub const Store = struct {
         return self;
     }
 
-    /// Explicit native admission; ordinary open does not upgrade a schema-2
-    /// database to receipt storage. No worker checkpoint conversion is implied.
-    /// The caller budgets one pending row per admitted source before activation.
     pub fn enableReceipts(self: *Store, maximum_pending: usize) Error!void {
         if (maximum_pending == 0 or maximum_pending > Limits.pending_receipts) return error.ReceiptLimit;
         try self.beginWrite();
@@ -436,8 +396,6 @@ pub const Store = struct {
             return error.InvalidRecord;
     }
 
-    /// Admit native time rows only after receipt storage. A schema-3 database
-    /// remains schema 3 until this native consumer is explicitly activated.
     pub fn enableNativeTime(self: *Store) Error!void {
         if (self.receipt_limit == null) return error.ReceiptStorageRequired;
         try self.beginWrite();
@@ -456,8 +414,6 @@ pub const Store = struct {
         self.schema_version = @max(schema, 4);
     }
 
-    /// Explicit opt-in preserves inference provenance. Ordinary schema-4 opens
-    /// and native-time admission never silently enable this migration.
     pub fn enableYearInference(self: *Store) Error!void {
         if (self.receipt_limit == null) return error.ReceiptStorageRequired;
         try self.beginWrite();
@@ -471,9 +427,6 @@ pub const Store = struct {
         self.schema_version = @max(schema, 5);
     }
 
-    /// Explicit native detection admission. A schema-4 upgrade adds inference
-    /// provenance and detection rows in ONE transaction; failure leaves schema 4.
-    /// Merely opening a prior store or enabling time never admits detection.
     pub fn enableDetection(self: *Store) Error!void {
         if (self.receipt_limit == null) return error.ReceiptStorageRequired;
         try self.beginWrite();
@@ -501,9 +454,6 @@ pub const Store = struct {
         self.schema_version = @max(schema, 6);
     }
 
-    /// Explicit startup migration. The scan of old receipts happens once while
-    /// no ingestion is admitted, never in the record-processing loop. The floor
-    /// survives later ledger retention and does not replace any event timestamp.
     pub fn enableClockRecovery(self: *Store) Error!void {
         if (self.receipt_limit == null) return error.ReceiptStorageRequired;
         try self.beginWrite();
@@ -511,7 +461,6 @@ pub const Store = struct {
         const schema = try self.integer("PRAGMA user_version;");
         if (schema < 6 or schema > latest_schema) return error.UnsupportedSchema;
         if (schema == 6) {
-            // Reject malformed prior types rather than letting MAX coerce them.
             if (try self.integer("SELECT EXISTS(SELECT 1 FROM records WHERE receipt_us IS NOT NULL AND typeof(receipt_us)!='integer') OR EXISTS(SELECT 1 FROM pending_receipts WHERE typeof(receipt_us)!='integer');") != 0) return error.DatabaseFailure;
             try self.exec(
                 \\CREATE TABLE receipt_clock(id INTEGER PRIMARY KEY CHECK(id=1),floor_us INTEGER CHECK(floor_us IS NULL OR typeof(floor_us)='integer'));
@@ -525,8 +474,6 @@ pub const Store = struct {
         self.schema_version = @max(schema, 7);
     }
 
-    /// Explicit schema-7 admission for typed journal-origin exclusions. Preserve
-    /// all previous detection rows and the durable clock floor atomically.
     pub fn enableJournalDetection(self: *Store) Error!void {
         if (self.receipt_limit == null) return error.ReceiptStorageRequired;
         try self.beginWrite();
@@ -560,7 +507,6 @@ pub const Store = struct {
         self.schema_version = @max(schema, 8);
     }
 
-    /// Explicit admission; opening a schema-8 database does not upgrade it.
     pub fn enableRetry(self: *Store) Error!void {
         if (self.receipt_limit == null) return error.ReceiptStorageRequired;
         try self.beginWrite();
@@ -580,8 +526,6 @@ pub const Store = struct {
         self.schema_version = @max(schema, 9);
     }
 
-    /// Add typed native consumer rows without activating any new consumer. The
-    /// coordinator still admits the exact required consumer set and generation.
     pub fn enableConsumers(self: *Store) Error!void {
         try self.beginWrite();
         errdefer self.rollback();
@@ -598,7 +542,6 @@ pub const Store = struct {
         self.schema_version = @max(schema, 10);
     }
 
-    /// Explicit schema12 admission preserves old scalar rows at ordinal zero.
     pub fn enableConsumerManifests(self: *Store) Error!void {
         try self.beginWrite();
         errdefer self.rollback();
@@ -636,9 +579,6 @@ pub const Store = struct {
         self.schema_version = @max(schema, 12);
     }
 
-    /// Establish one persistent append order before any history consumer exists.
-    /// The trigger appends only for a newly inserted confirmed event, in the same
-    /// transaction as its qualified effect receipt. Reconciliation dedup adds none.
     pub fn enableConfirmedHistory(self: *Store) Error!void {
         try self.beginWrite();
         errdefer self.rollback();
@@ -662,8 +602,6 @@ pub const Store = struct {
         self.schema_version = @max(schema, 13);
     }
 
-    /// Schema admission only. Legacy records retain NULL ordering and stay pinned.
-    /// No cleanup marker, guard, record deletion or inferred ordering is created.
     pub fn enableMaintenance(self: *Store) Error!void {
         try self.beginWrite();
         errdefer self.rollback();
@@ -695,7 +633,6 @@ pub const Store = struct {
         if (jail.len == 0 or jail.len > 4096 or source.len == 0 or source.len > Limits.source_bytes or
             std.mem.indexOfScalar(u8, jail, 0) != null or std.mem.indexOfScalar(u8, source, 0) != null) return error.InvalidRecord;
     }
-    /// One detached typed point read; no cursor text or receipt time defines order.
     pub fn sourceMaintenance(self: *Store, jail: []const u8, source: []const u8, generation: [32]u8) Error!?SourceMaintenance {
         try maintenanceKey(jail, source);
         if (self.schema_version < 14) return error.MaintenanceStorageRequired;
@@ -745,7 +682,6 @@ pub const Store = struct {
         if (self.schema_version >= 15) _ = try self.maintenanceRevision();
         const old = try self.sourceMaintenance(record.jail, record.source, generation);
         if (old == null) {
-            // A missing head is corruption once any ordered detail/guard exists.
             var retained = try self.statement("SELECT 1 FROM records WHERE jail=?1 AND source=?2 AND source_generation=?3 AND source_sequence IS NOT NULL UNION ALL SELECT 1 FROM replay_guards WHERE jail=?1 AND source=?2 AND generation=?3 LIMIT 1;");
             defer retained.deinit();
             try retained.text(1, record.jail);
@@ -755,8 +691,6 @@ pub const Store = struct {
         }
         const prior: u64 = if (old) |value| value.head_sequence else 0;
         if (old != null) {
-            // Detail and guards have separate unique indexes. Validate their
-            // shared durable high-water mark before allocating another sequence.
             var maximum: u64 = 0;
             for ([_][:0]const u8{
                 "SELECT source_sequence FROM records WHERE jail=?1 AND source=?2 AND source_generation=?3 AND source_sequence IS NOT NULL ORDER BY source_sequence DESC LIMIT 1;",
@@ -804,8 +738,6 @@ pub const Store = struct {
     fn identityGuardKey(identity: ReceiptIdentity) [32]u8 {
         return effects.hashParts("fail2zig-replay-identity-v1", &.{ identity.jail, identity.source, &identity.generation, identity.occurrence, &identity.raw_hash, identity.cursor });
     }
-    /// Absence permits normal lookup. Any existing guard prevents replay even
-    /// while its marked detail is still present. Guards are never reset/evicted.
     fn checkReplayGuard(self: *Store, jail: []const u8, source: []const u8, occurrence: []const u8, raw_hash: [32]u8, cursor: []const u8, supplied_generation: ?[32]u8, receipt_us: ?i64) Error!void {
         if (self.schema_version < 14) {
             const schema = try self.integer("PRAGMA user_version;");
@@ -834,8 +766,6 @@ pub const Store = struct {
         if (receipt_us) |wanted| if (original_receipt == null or original_receipt.? != wanted) return error.OccurrenceConflict;
         return error.PrunedReplay;
     }
-    /// Test-only seed of the future marker's guard insert. No production marking
-    /// or deletion API exists until reference/watermark validation is integrated.
     pub fn fixtureReplayGuard(self: *Store, jail: []const u8, source: []const u8, occurrence: []const u8) Error!void {
         if (!builtin.is_test) @compileError("fixtureReplayGuard is test-only");
         try self.beginWrite();
@@ -866,7 +796,6 @@ pub const Store = struct {
         try self.commitTransaction();
     }
 
-    /// Explicit production cleanup admission. Replay guards are never reclaimed.
     pub fn enableCleanup(self: *Store) Error!void {
         try self.beginWrite();
         errdefer self.rollback();
@@ -887,9 +816,6 @@ pub const Store = struct {
         self.schema_version = @max(schema, 15);
     }
 
-    /// Schema 16 gives retry authority the same explicit absent/finite/permanent
-    /// lease tags already used by effects. Existing schema-15 values are finite
-    /// or absent and retain their exact absolute deadlines.
     pub fn enableRetryLeases(self: *Store) Error!void {
         try self.beginWrite();
         errdefer self.rollback();
@@ -942,9 +868,6 @@ pub const Store = struct {
         self.schema_version = @max(schema, 16);
     }
 
-    /// Schema 17 retains bounded optional decision detail separately from live
-    /// retry rows and snapshots it only when an effect is actually confirmed.
-    /// Existing/manual events remain valid with explicitly unavailable detail.
     pub fn enableApplicationHistory(self: *Store) Error!void {
         try self.beginWrite();
         errdefer self.rollback();
@@ -970,8 +893,6 @@ pub const Store = struct {
         self.schema_version = @max(schema, 17);
     }
 
-    /// Schema 18 admits escalation policy bytes, confirmation-only subject
-    /// summaries, and the exact selected input/result for each escalated decision.
     pub fn enableEscalation(self: *Store) Error!void {
         try self.beginWrite();
         errdefer self.rollback();
@@ -1021,9 +942,6 @@ pub const Store = struct {
         self.schema_version = @max(schema, 18);
     }
 
-    /// Schema 19 makes the accepted F2FS-v2 canonical scope the sole decoded
-    /// effect scope. The retained 24-byte column is migration compatibility
-    /// storage only and is never consulted by a schema-19 reader.
     pub fn enableCanonicalEffects(self: *Store) Error!void {
         try self.beginWrite();
         errdefer self.rollback();
@@ -1066,9 +984,6 @@ pub const Store = struct {
         self.schema_version = @max(schema, 19);
     }
 
-    /// Schema 20 records only operator history-reset watermarks. Confirmed
-    /// events remain immutable, and effect/owner state is intentionally not
-    /// referenced so resetting history cannot change protection.
     pub fn enableHistoryResets(self: *Store) Error!void {
         try self.beginWrite();
         errdefer self.rollback();
@@ -1083,9 +998,6 @@ pub const Store = struct {
         self.schema_version = @max(schema, 20);
     }
 
-    /// Schema 21 stores exactly the selected enforcement and no-op notification
-    /// targets. It adds no executable/provider configuration and does not alter
-    /// effect authority.
     pub fn enableActionTargets(self: *Store) Error!void {
         try self.beginWrite();
         errdefer self.rollback();
@@ -1105,10 +1017,6 @@ pub const Store = struct {
         try self.commitTransaction();
         self.schema_version = @max(schema, 21);
     }
-    /// Schema 22 admin state. Every id/digest is an exact 32-byte blob and
-    /// every boolean/enum/timestamp is CHECKed so a foreign or truncated writer cannot smuggle
-    /// an ambiguous row into administration authority. `admin_revision` is the single monotonic
-    /// mutation counter that fences replayed requests after their `admin_requests` row is reclaimed.
     pub fn enableAdminState(self: *Store) Error!void {
         try self.beginWrite();
         errdefer self.rollback();
@@ -1129,9 +1037,6 @@ pub const Store = struct {
         self.schema_version = @max(schema, 22);
     }
 
-    /// Schema 23 migration state. Staged owners/history live only here until
-    /// `activate_owners` copies them under one write transaction; no runtime admission,
-    /// reconciliation or history reader consults these tables.
     pub fn enableMigrationState(self: *Store) Error!void {
         try self.beginWrite();
         errdefer self.rollback();
@@ -1150,14 +1055,6 @@ pub const Store = struct {
         self.schema_version = @max(schema, 23);
     }
 
-    /// Current durable mutation revision (schema 22). Every applied administration or reload
-    /// mutation bumps it inside its own transaction; requests present their expected value.
-    /// Replace a jail's retry policy bytes under its unchanged plan generation.
-    /// The saved policy must equal `expected` and no receipt may be in flight for the jail, so
-    /// a concurrent record cannot commit under a policy the worker no longer holds. Existing
-    /// retry counts, leases, deadlines and history are untouched; only future decisions change.
-    /// Saved file cursors carry the framing binding derived from the generation; a re-key
-    /// rewrites that binding in place so restored streams keep their exact offsets.
     pub const CursorRebinding = struct { old: [32]u8, new: [32]u8 };
     pub const PolicyTransition = struct { jail: []const u8, generation: [32]u8, next_generation: [32]u8, expected: retry.Policy, next: retry.Policy, cursor_rebinding: ?CursorRebinding = null };
     pub fn transitionRetryPolicy(self: *Store, jail: []const u8, generation: [32]u8, expected: retry.Policy, next: retry.Policy) Error!void {
@@ -1169,10 +1066,6 @@ pub const Store = struct {
         try self.fault(.before_policy_transition_commit);
         try self.commitTransaction();
     }
-    /// The source processor hashes the retry policy into the jail generation, so a policy
-    /// change moves every generation-keyed row of that jail together: policies, source
-    /// maintenance/replay guards, custom consumer rows and effect owners. Retired retry rows
-    /// keep the generation they were retired under. Nothing moves while a receipt is in flight.
     fn transitionJailGenerationTx(self: *Store, change: PolicyTransition, now_us: i64) Error!void {
         const jail = change.jail;
         if (jail.len == 0 or jail.len > 64 or std.mem.indexOfScalar(u8, jail, 0) != null) return error.InvalidRecord;
@@ -1206,13 +1099,9 @@ pub const Store = struct {
             if (self.api.changes(self.db) != 1) return error.StalePolicyTransition;
         }
         if (std.mem.eql(u8, &change.generation, &change.next_generation)) return;
-        // replay_guards references source_maintenance by generation; both move in this
-        // transaction, so the check is deferred to commit.
         try self.exec("PRAGMA defer_foreign_keys=ON;");
         const rekeyed = [_][:0]const u8{
             "UPDATE records SET source_generation=?3 WHERE jail=?1 AND source_generation=?2;",
-            // Durable session checkpoints embed the generation after their magic/version header
-            // (file 'F2NT' at byte 8, journal 'F2JC' at byte 6); the counters/cursor bytes stay.
             "UPDATE checkpoints SET payload=substr(payload,1,8)||?3||substr(payload,41) WHERE jail=?1 AND substr(payload,1,4)=CAST('F2NT' AS BLOB) AND substr(payload,9,32)=?2;",
             "UPDATE checkpoints SET payload=substr(payload,1,6)||?3||substr(payload,39) WHERE jail=?1 AND substr(payload,1,4)=CAST('F2JC' AS BLOB) AND substr(payload,7,32)=?2;",
             "UPDATE source_maintenance SET generation=?3 WHERE jail=?1 AND generation=?2;",
@@ -1241,8 +1130,6 @@ pub const Store = struct {
             try update.text(3, new_text);
             try update.done();
         }
-        // Owners keep their decision, deadline and revision history: each moves through the
-        // retain transition, which records a new owner revision and replacement intent.
         const canonical_scope = @import("../firewall/scope.zig");
         const Held = struct { key: [32]u8, revision: u64, scope: [canonical_scope.encoded_bytes]u8 };
         var held = std.ArrayListUnmanaged(Held){};
@@ -1272,16 +1159,12 @@ pub const Store = struct {
         if (try stale.row()) return error.StalePolicyTransition;
     }
 
-    /// One write transaction for a live reload: every changed jail policy moves
-    /// together with the unpublished generation row, or nothing does.
     pub fn commitReloadGeneration(self: *Store, transitions: []const PolicyTransition, record: ConfigGenerationRecord, jails: []const ConfigGenerationJail, clock: effects.Clock) Error!void {
         if (transitions.len > 64) return error.InvalidAdminRequest;
         try self.beginWrite();
         errdefer self.rollback();
         if (self.schema_version < 22) return error.AdminStorageRequired;
         self.rekeyed_owners = false;
-        // Owner transitions are effect mutations: they take and advance the effect clock so
-        // the replacement intents decode against the committed floor.
         const now = try self.effectClock(clock);
         for (transitions) |change| try self.transitionJailGenerationTx(change, now);
         if (self.rekeyed_owners) _ = try self.commitEffectClock(clock);
@@ -1289,8 +1172,6 @@ pub const Store = struct {
         const mutation_revision = try self.integer("SELECT mutation_revision FROM admin_revision WHERE id=1;");
         var pinned = record;
         pinned.mutation_revision = @intCast(mutation_revision);
-        // The re-key and its generation row publish together: after a crash the committed
-        // generation is the durable truth, never a half-adopted one.
         pinned.published = true;
         try self.exec("UPDATE config_generations SET published=0 WHERE published=1;");
         try self.recordConfigGenerationTx(pinned, jails);
@@ -1335,9 +1216,6 @@ pub const Store = struct {
         allowlist_snapshot: []const u8,
     };
 
-    /// Persist a proposed configuration generation before it is published in memory.
-    /// A reload generation commits published inside its re-key transaction; `published` in the
-    /// record is honoured only for rows recorded outside a reload.
     pub fn recordConfigGeneration(self: *Store, record: ConfigGenerationRecord, jails: []const ConfigGenerationJail) Error!void {
         try self.beginWrite();
         errdefer self.rollback();
@@ -1377,7 +1255,6 @@ pub const Store = struct {
         }
     }
 
-    /// Mark a committed generation as the published one; every other row becomes unpublished.
     pub fn publishConfigGeneration(self: *Store, generation: [32]u8) Error!void {
         try self.beginWrite();
         errdefer self.rollback();
@@ -1392,8 +1269,6 @@ pub const Store = struct {
         try self.commitTransaction();
     }
 
-    /// Remove an unpublished generation whose inputs no longer match (crash between commit
-    /// and publish); a published generation is never deleted here.
     pub fn discardUnpublishedConfigGeneration(self: *Store, generation: [32]u8) Error!void {
         try self.beginWrite();
         errdefer self.rollback();
@@ -1406,7 +1281,6 @@ pub const Store = struct {
     }
 
     pub const ConfigGenerationHead = struct { generation: [32]u8, config_digest: [32]u8, published: bool, committed_us: i64 };
-    /// Newest committed generation row (published or not), or null before the first reload.
     pub fn latestConfigGeneration(self: *Store) Error!?ConfigGenerationHead {
         if (self.schema_version < 22) return error.AdminStorageRequired;
         var row = try self.statement("SELECT generation,config_digest,published,committed_us FROM config_generations ORDER BY committed_us DESC, generation DESC LIMIT 1;");
@@ -1415,7 +1289,6 @@ pub const Store = struct {
         return .{ .generation = try effectBlob(&row, 0, 32), .config_digest = try effectBlob(&row, 1, 32), .published = (try row.signed(2)) == 1, .committed_us = try row.signed(3) };
     }
 
-    /// Values 9-10 are the migration executor kinds; the schema CHECK admits both.
     pub const AdminKind = enum(u8) { group_enable = 1, group_disable, group_pause, group_resume, setting_batch, ban, unban, history_reset, migration_activate, migration_rollback };
     pub const AdminOutcome = enum(u8) { applied = 1, rejected, absent, partial, uncertain };
     pub const admin_request_retention = 4096;
@@ -1440,9 +1313,6 @@ pub const Store = struct {
         request_id: [32]u8,
     };
 
-    /// A request whose row is still retained returns its recorded outcome instead of executing
-    /// again; a fresh request must present the current mutation revision so a request whose row
-    /// was reclaimed can never execute against newer state.
     pub fn admitAdminRequest(self: *Store, request_id: [32]u8, expected_mutation_revision: u64) Error!AdminAdmission {
         if (std.mem.allEqual(u8, &request_id, 0)) return error.InvalidAdminRequest;
         try self.beginRead();
@@ -1464,8 +1334,6 @@ pub const Store = struct {
         return .fresh;
     }
 
-    /// Record the outcome of an executed request, bump the mutation revision when it applied,
-    /// optionally persist the jail's admin state in the same transaction, and reclaim retention.
     pub fn finishAdminRequest(self: *Store, record: AdminRequestRecord, state: ?JailAdminState) Error!u64 {
         if (std.mem.allEqual(u8, &record.request_id, 0) or record.subject.len > 4096 or record.detail.len > 4096 or record.committed_us < 0) return error.InvalidAdminRequest;
         if (state) |value| if (value.jail.len == 0 or value.jail.len > 64 or value.changed_us < 0) return error.InvalidAdminRequest;
@@ -1526,7 +1394,6 @@ pub const Store = struct {
         return true;
     }
 
-    /// Current owner row for one physical effect and jail, or null when the jail holds none.
     pub fn currentOwner(self: *Store, key: effects.Hash, jail: []const u8) Error!?effects.Owner {
         try self.beginRead();
         errdefer self.rollback();
@@ -1545,7 +1412,6 @@ pub const Store = struct {
         return owner;
     }
 
-    /// Prior watermark revision for a history reset scope/subject (0 before the first reset).
     pub fn historyResetRevision(self: *Store, scope: HistoryResetScope, subject: detection.Subject) Error!u64 {
         if (self.schema_version < 20) return error.HistoryResetStorageRequired;
         const scope_value: i64 = switch (scope) {
@@ -1570,7 +1436,6 @@ pub const Store = struct {
 
     pub const MigrationState = enum(u8) { planned = 1, validated, recovery_point, quiesced, staged, activating, complete, rolled_back, failed };
     pub const MigrationStep = enum(u8) { validate_plan = 1, check_drift, capture_recovery_point, quiesce_source, stage_destination, activate_owners, verify_protection, complete, rollback };
-    /// 0 = intent recorded, outcome pending.
     pub const MigrationOutcome = enum(u8) { pending = 0, success, incompatible, validation_failed, operational_failure, uncertain, rollback_failed, partial };
     pub const MigrationRun = struct {
         run_id: [32]u8,
@@ -1632,8 +1497,6 @@ pub const Store = struct {
         return run;
     }
 
-    /// Record the intent for the next step before any mutation. Refuses while an earlier step
-    /// is still pending so a resumed command must settle it first.
     pub fn beginMigrationStep(self: *Store, run_id: [32]u8, step: MigrationStep, intent: []const u8, now_us: i64) Error!u64 {
         if (intent.len > 4096 or now_us < 0) return error.InvalidMigrationRow;
         try self.beginWrite();
@@ -1671,7 +1534,6 @@ pub const Store = struct {
         return seq;
     }
 
-    /// Settle the pending step with its observed outcome and optionally move the run state.
     pub fn finishMigrationStep(self: *Store, run_id: [32]u8, seq: u64, outcome: MigrationOutcome, detail: []const u8, state: ?MigrationState, now_us: i64) Error!void {
         if (outcome == .pending or detail.len > 4096 or now_us < 0 or seq == 0 or seq > std.math.maxInt(i64)) return error.InvalidMigrationRow;
         try self.beginWrite();
@@ -1701,7 +1563,6 @@ pub const Store = struct {
         if (self.api.changes(self.db) != 1) return error.MigrationRunMissing;
     }
 
-    /// Steps in sequence order; `output.len` bounds the page.
     pub fn migrationSteps(self: *Store, run_id: [32]u8, output: []MigrationStepRow) Error!usize {
         if (self.schema_version < 23) return error.MigrationStorageRequired;
         try self.beginRead();
@@ -1723,7 +1584,6 @@ pub const Store = struct {
     pub const StagedHistoryRow = struct { jail: []const u8, scope: [canonical_scope_bytes]u8, event_kind: u8, event_us: i64, bancount: i64, source_row: u64 };
     pub const canonical_scope_bytes = 92;
 
-    /// Replace the staged rows of a run atomically; repeating an interrupted staging is idempotent.
     pub fn stageMigrationRows(self: *Store, run_id: [32]u8, owners: []const StagedOwnerRow, history: []const StagedHistoryRow) Error!void {
         if (owners.len > 200_000 or history.len > 200_000) return error.InvalidMigrationRow;
         try self.beginWrite();
@@ -1785,14 +1645,7 @@ pub const Store = struct {
         return .{ .owners = owner_count, .history = history_count };
     }
 
-    /// Copy every staged owner of the run into effect authority in one write transaction.
-    /// Each owner keeps its original decision time and absolute deadline; the decision id is
-    /// derived from the run and staged sequence so an interrupted activation replays exactly.
-    /// Returns the number of owners now present in authority for the run.
     pub const JailGeneration = struct { jail: []const u8, generation: [32]u8 };
-    /// Copies the run's staged owners into effect authority inside one write transaction; the run
-    /// must be `staged` or already `activating` (a resumed attempt), and every staged jail needs a
-    /// planned generation. Expired finite owners are skipped; a repeat replays without new revisions.
     pub fn activateStagedOwners(self: *Store, run_id: [32]u8, generations: []const JailGeneration, clock: effects.Clock) Error!u64 {
         try self.beginWrite();
         errdefer self.rollback();
@@ -1867,12 +1720,9 @@ pub const Store = struct {
                 continue;
             }
             if (native) |owner| {
-                // A live native owner keeps its decision and never loses protection: permanent or
-                // later deadlines stay untouched, an earlier one is extended to the imported deadline.
                 const native_live = owner.permanent or (owner.deadline_us orelse 0) > now;
                 if (native_live) {
                     try self.recordMigrationConflictTx(run_id, item.seq, &item.scope, jail, item.lease_kind, item.deadline_us, now);
-                    // A decision is immutable, so the extension is a new decision derived from the run.
                     const extend = !owner.permanent and lease == .finite and (owner.deadline_us orelse 0) < lease.finite;
                     if (extend) _ = try self.setOwnerTx(try (effects.CanonicalOwnerChange{ .scope = scope, .jail = jail, .generation = generation, .decision_id = effects.hashParts("fail2zig-migration-extend-v1", &.{ &run_id, &counter }), .expected_revision = existing_revision, .lease = lease, .decided_us = @min(owner.decided_us, now) }).exact(), now);
                     continue;
@@ -1888,8 +1738,6 @@ pub const Store = struct {
         return activated;
     }
 
-    /// Delta kind 3 (carry_back mapped) records a staged owner that met a live native owner; the row is
-    /// keyed by the staged sequence so a repeated activation does not duplicate it.
     fn recordMigrationConflictTx(self: *Store, run_id: [32]u8, seq: u64, scope: *const [canonical_scope_bytes]u8, jail: []const u8, lease_kind: u8, deadline_us: ?i64, now: i64) Error!void {
         {
             var exists = try self.statement("SELECT 1 FROM migration_deltas WHERE run_id=?1 AND seq=?2;");
@@ -1912,8 +1760,6 @@ pub const Store = struct {
 
     pub const MigrationDeltaKind = enum(u8) { ban = 1, unban = 2, conflict = 3 };
     pub const MigrationCarryBack = enum(u8) { mapped = 1, unsupported = 2, expired = 3 };
-    /// One post-cutover difference between the staged (source) owners and the destination's live
-    /// owners: a native ban to carry back, or a staged owner the destination released or expired.
     pub const MigrationDelta = struct {
         kind: MigrationDeltaKind,
         jail: [64]u8,
@@ -1927,9 +1773,6 @@ pub const Store = struct {
             return self.jail[0..self.jail_len];
         }
     };
-    /// Computes the ordered delta list for `jails` at `now_us` without writing anything. Rows are
-    /// compared by canonical scope and jail; scopes with protocol or port restrictions cannot be
-    /// expressed as fail2ban rows and are reported `unsupported`.
     pub fn planMigrationDeltas(self: *Store, run_id: [32]u8, jails: []const []const u8, now_us: i64, output: []MigrationDelta) Error!usize {
         if (self.schema_version < 23) return error.MigrationStorageRequired;
         const installation = try self.readInstallation() orelse return error.InstallationRequired;
@@ -1970,8 +1813,6 @@ pub const Store = struct {
             if (live and !native_decision) continue;
             if (count == output.len) return error.EffectCapacity;
             if (live) {
-                // A native decision (re-ban or conflict-kept owner) supersedes the source row: its
-                // current lease is what the source must carry.
                 var delta = MigrationDelta{ .kind = .ban, .jail = undefined, .jail_len = @intCast(jail.len), .scope = scope_bytes, .lease_kind = live_kind, .deadline_us = live_deadline, .decided_us = live_decided, .carry_back = if (scope.protocols.isAll() and scope.ports.isAll()) .mapped else .unsupported };
                 @memcpy(delta.jail[0..jail.len], jail);
                 output[count] = delta;
@@ -2005,8 +1846,6 @@ pub const Store = struct {
         }
         return count;
     }
-    /// Persists deltas after the previous highest sequence; `applied` records whether the derived
-    /// source database received them.
     pub fn recordMigrationDeltas(self: *Store, run_id: [32]u8, deltas: []const MigrationDelta, applied: bool, now_us: i64) Error!void {
         try self.beginWrite();
         errdefer self.rollback();
@@ -2040,8 +1879,6 @@ pub const Store = struct {
         }
         try self.commitTransaction();
     }
-    /// Releases every live destination owner at a staged scope of the run through the accepted
-    /// owner transition (history and other owners retained); returns how many were released.
     pub fn releaseMigrationOwners(self: *Store, run_id: [32]u8, clock: effects.Clock) Error!u64 {
         if (self.schema_version < 23) return error.MigrationStorageRequired;
         const installation = try self.readInstallation() orelse return error.InstallationRequired;
@@ -2075,8 +1912,6 @@ pub const Store = struct {
         return released;
     }
 
-    /// Sequence of the run's step left without an outcome, if any; independent of the bounded
-    /// `migrationSteps` listing so long-running runs never hide an open step.
     pub const PendingStep = struct { seq: u64, step: MigrationStep };
     pub fn pendingMigrationStep(self: *Store, run_id: [32]u8) Error!?PendingStep {
         if (self.schema_version < 23) return error.MigrationStorageRequired;
@@ -2087,7 +1922,6 @@ pub const Store = struct {
         const step = std.meta.intToEnum(MigrationStep, try row.signed(1)) catch return error.InvalidMigrationRow;
         return .{ .seq = std.math.cast(u64, try row.signed(0)) orelse return error.InvalidMigrationRow, .step = step };
     }
-    /// Scope keys of every staged owner of the run, regardless of lease, for kernel readback.
     pub fn migrationStagedKeys(self: *Store, run_id: [32]u8, output: [][32]u8) Error!usize {
         if (self.schema_version < 23) return error.MigrationStorageRequired;
         const installation = try self.readInstallation() orelse return error.InstallationRequired;
@@ -2104,7 +1938,6 @@ pub const Store = struct {
         }
         return count;
     }
-    /// Marks the run's recorded ban/unban deltas as applied once the derived source is in place.
     pub fn markMigrationDeltasApplied(self: *Store, run_id: [32]u8) Error!void {
         try self.beginWrite();
         errdefer self.rollback();
@@ -2115,7 +1948,6 @@ pub const Store = struct {
         try update.done();
         try self.commitTransaction();
     }
-    /// True when the run recorded a successful outcome for `step`.
     pub fn migrationStepSucceeded(self: *Store, run_id: [32]u8, step: MigrationStep) Error!bool {
         if (self.schema_version < 23) return error.MigrationStorageRequired;
         var row = try self.statement("SELECT 1 FROM migration_steps WHERE run_id=?1 AND step=?2 AND outcome=?3;");
@@ -2126,8 +1958,6 @@ pub const Store = struct {
         return try row.row();
     }
 
-    /// Scope keys of the run's activated owners that are still live at `now_us`, for kernel readback
-    /// settlement; the count of live staged owners is returned separately so a missing key is visible.
     pub fn migrationActivatedKeys(self: *Store, run_id: [32]u8, now_us: i64, output: [][32]u8) Error!struct { expected: u64, found: usize } {
         if (self.schema_version < 23) return error.MigrationStorageRequired;
         const installation = try self.readInstallation() orelse return error.InstallationRequired;
@@ -2140,8 +1970,6 @@ pub const Store = struct {
         try staged.int(2, now_us);
         while (try staged.row()) {
             expected += 1;
-            // Protection at the scope is what matters: the owner may carry the migration decision,
-            // a conflict-kept native decision or the extension decision.
             const jail = try staged.boundedBytes(0, 64);
             const scope = canonical_scope.Scope.decode(&try effectBlob(&staged, 1, canonical_scope_bytes)) catch return error.InvalidMigrationRow;
             const key = try (try effects.Scope.exact(scope)).key(installation);
@@ -2159,12 +1987,10 @@ pub const Store = struct {
         return .{ .expected = expected, .found = found };
     }
 
-    /// Test-only raw inspection; product code cannot compile a call to it.
     pub fn inspectInteger(self: *Store, sql: [:0]const u8) Error!i64 {
         if (!@import("builtin").is_test) @compileError("inspectInteger is test-only");
         return self.integer(sql);
     }
-    /// Test-only raw statement execution for constraint checks; product code cannot compile a call to it.
     pub fn inspectExec(self: *Store, sql: [:0]const u8) Error!void {
         if (!@import("builtin").is_test) @compileError("inspectExec is test-only");
         return self.exec(sql);
@@ -2187,8 +2013,6 @@ pub const Store = struct {
         history: ?effect_history.PageToken = null,
         manifest: ?consumers.Manifest = null,
         clock: effects.Clock,
-        /// Caller has released ALL candidate receipts and consumer preparations
-        /// for this jail on the serialized worker. SQL independently checks pins.
         preparations: enum { held, released } = .held,
     };
     pub const CleanupToken = struct { binding: [32]u8, state: SourceMaintenance };
@@ -2272,8 +2096,6 @@ pub const Store = struct {
         const installation = try self.readInstallation() orelse return false;
         const scope = try effects.Scope.host(subject);
         if (try self.readEffect(try scope.key(installation), installation)) |entry| {
-            // Conservatively keep detail until the entire physical scope is
-            // settled absent, including protection shared with another jail.
             return entry.desired != .absent or entry.status != .absent;
         }
         return false;
@@ -2431,7 +2253,6 @@ pub const Store = struct {
             if (try self.recordCleanupPinned(fence, id.occurrence, now)) break;
             const group_rows = 1 + try self.countRecordChildren(fence, id.occurrence, "record_detections") + try self.countRecordChildren(fence, id.occurrence, "retry_decisions");
             if (group_rows > 64 - deleted) break;
-            // Copy the key before deleting the row that owns SQLite's bytes.
             var occurrence_buffer: [16384]u8 = undefined;
             @memcpy(occurrence_buffer[0..id.occurrence.len], id.occurrence);
             const occurrence = occurrence_buffer[0..id.occurrence.len];
@@ -2555,8 +2376,6 @@ pub const Store = struct {
         return true;
     }
 
-    /// Fixed owned keyset cursor. One call visits <=16 indexed entries and
-    /// <=1MiB identity bytes. Cursor publication follows the read COMMIT.
     pub const MaintenanceValidation = struct {
         phase: enum { headers, records, guards, retired, totals, done } = .headers,
         revision: ?u64 = null,
@@ -2593,8 +2412,6 @@ pub const Store = struct {
     };
     fn validateMaintenanceHeader(self: *Store, jail: []const u8, source: []const u8, generation: [32]u8) Error!void {
         const state = try self.sourceMaintenance(jail, source, generation) orelse return error.InvalidMaintenanceState;
-        // Separate indexed endpoint seeks. The paged record/guard walks below
-        // prove contiguity; aggregates here would scan an unbounded source.
         for ([_][:0]const u8{
             "SELECT source_sequence FROM records WHERE jail=?1 AND source=?2 AND source_generation=?3 AND source_sequence IS NOT NULL ORDER BY source_sequence LIMIT 1;",
             "SELECT source_sequence FROM records WHERE jail=?1 AND source=?2 AND source_generation=?3 AND source_sequence IS NOT NULL ORDER BY source_sequence DESC LIMIT 1;",
@@ -2810,8 +2627,6 @@ pub const Store = struct {
         try page.validate();
         return page;
     }
-    /// Detached original events in one coherent bounded read. No transaction or
-    /// SQLite-owned slice survives this call. Sequence order survives equal times.
     pub fn confirmedEffectPage(self: *Store, installation: effects.Installation, after_sequence: u64, expected_revision: ?u64, output: []effect_history.Event) Error!effect_history.Page {
         try self.beginRead();
         errdefer self.rollback();
@@ -2820,9 +2635,6 @@ pub const Store = struct {
         return page;
     }
 
-    /// True when a retained immutable event is newer than every applicable
-    /// jail-specific or overall-subject reset. This is checked immediately
-    /// before recurrence projection so a stale page cannot replay reset input.
     pub fn historyEventEligible(self: *Store, event: effect_history.Event) Error!bool {
         try event.validate();
         if (self.schema_version < 20) return true;
@@ -2848,9 +2660,6 @@ pub const Store = struct {
         return true;
     }
 
-    /// Advance a typed reset watermark without modifying effect ownership or
-    /// immutable confirmed events. The matching escalation summaries are
-    /// removed in the same transaction; later confirmations start at one.
     pub fn resetHistory(self: *Store, intent: HistoryResetIntent, clock: effects.Clock) Error!HistoryResetResult {
         intent.subject.validate() catch return error.InvalidHistoryReset;
         if (intent.subject.unenforceable() or intent.expected_revision > std.math.maxInt(i64) or std.mem.allEqual(u8, &intent.intent_id, 0)) return error.InvalidHistoryReset;
@@ -2988,8 +2797,6 @@ pub const Store = struct {
         try self.fault(.after_action_target_intent);
     }
 
-    /// Atomically persist the two selected target intents before either target
-    /// dispatches. Exact replay validates immutable identity and is a no-op.
     pub fn prepareActionTargets(self: *Store, intent: action_outcome.Intent, clock: effects.Clock) Error!void {
         try self.beginWrite();
         errdefer self.rollback();
@@ -3009,8 +2816,6 @@ pub const Store = struct {
         return count;
     }
 
-    /// Dispatch may be retried only from an uncertain outcome. Terminal target
-    /// outcomes never silently reopen.
     pub fn markActionTargetDispatched(self: *Store, action_id: [32]u8, kind: action_outcome.Kind, clock: effects.Clock) Error!void {
         try self.beginWrite();
         errdefer self.rollback();
@@ -3040,8 +2845,6 @@ pub const Store = struct {
         try self.commitTransaction();
     }
 
-    /// Enforcement confirmation requires the existing immutable kernel-backed
-    /// confirmation. Optional target outcomes have no authority over effects.
     pub fn settleActionTarget(self: *Store, action_id: [32]u8, kind: action_outcome.Kind, settlement: action_outcome.Settlement, clock: effects.Clock) Error!void {
         try self.beginWrite();
         errdefer self.rollback();
@@ -3085,8 +2888,6 @@ pub const Store = struct {
         try self.commitTransaction();
     }
 
-    /// Versioned application projection. Filtering may leave sequence gaps, but
-    /// the immutable stream revision/head fence every continuation page.
     pub fn applicationHistoryPage(self: *Store, allocator: std.mem.Allocator, installation: effects.Installation, query: application_history.EventQuery, output: []application_history.Event) Error!application_history.EventPage {
         try query.validate();
         if (output.len == 0 or output.len > application_history.max_page or self.schema_version < 17) return error.InvalidApplicationHistoryQuery;
@@ -3148,8 +2949,6 @@ pub const Store = struct {
         return .{ .stream_revision = head.stream_revision, .head_sequence = head.head_sequence, .last_sequence = last, .count = count, .more = more };
     }
 
-    /// One coherent range snapshot: output[0] is overall, followed by bounded
-    /// per-jail rows. More reports that additional jail groups exist.
     pub fn applicationHistoryAggregates(self: *Store, installation: effects.Installation, query: application_history.AggregateQuery, output: []application_history.Aggregate) Error!application_history.AggregatePage {
         try query.validate();
         if (output.len == 0 or output.len > application_history.max_page + 1 or self.schema_version < 17) return error.InvalidApplicationHistoryQuery;
@@ -3198,7 +2997,6 @@ pub const Store = struct {
         if (!std.mem.eql(u8, &current.installation, &token.installation)) return error.InstallationMismatch;
         if (current.stream_revision != token.stream_revision or current.head_sequence != token.head_sequence or current.retained_from_sequence != token.retained_from_sequence) return error.StaleHistoryPage;
         var events: [effect_history.max_page]effect_history.Event = undefined;
-        // Token validation bounds the difference to max_page on every target.
         const size: usize = @intCast(token.last_sequence - token.after_sequence);
         const page = try self.confirmedEffectPageTx(installation, token.after_sequence, token.stream_revision, events[0..@max(1, size)]);
         if (page.token.last_sequence != token.last_sequence) return error.StaleHistoryPage;
@@ -3218,9 +3016,6 @@ pub const Store = struct {
         }
     };
 
-    /// Reclaim at most the immutable stream prefix row already consumed by the
-    /// durable history owner. Required summaries and live effect state are not
-    /// touched. False is caught up or pinned, not a cleanup failure.
     pub fn cleanupConfirmedHistoryOne(self: *Store, policy: HistoryRetention, now_us: i64) Error!bool {
         try policy.validate();
         try self.beginWrite();
@@ -3337,8 +3132,6 @@ pub const Store = struct {
         if (!std.mem.eql(u8, &history_checkpoint.generation, &manifest.source_generation) or !std.mem.eql(u8, &history_checkpoint.installation, &installation)) return error.HistoryGenerationMismatch;
         return history_checkpoint;
     }
-    /// Generic record and consumer-input writers cannot initialize or advance
-    /// history. First use must retain the complete unread stream from sequence1.
     pub fn bootstrapConfirmedHistory(self: *Store, manifest: consumers.Manifest, batch: consumers.Batch, installation: effects.Installation) Error!void {
         const history_checkpoint = try checkHistoryBatch(manifest, batch, installation.id);
         if (history_checkpoint.last_sequence != 0 or batch.deltas[0].expected_revision != 0) return error.InvalidHistoryTransition;
@@ -3353,8 +3146,6 @@ pub const Store = struct {
         try self.commitConsumerClock(batch);
         try self.commitTransaction();
     }
-    /// Re-read the exact producer page under the writer lock before admitting its
-    /// checkpoint. Stream fence, consumer CAS/count/digest and clock commit once.
     pub fn commitConfirmedHistory(self: *Store, manifest: consumers.Manifest, batch: consumers.Batch, token: effect_history.PageToken) Error!void {
         const next = try checkHistoryBatch(manifest, batch, token.installation);
         try self.beginWrite();
@@ -3380,7 +3171,6 @@ pub const Store = struct {
         try self.commitTransaction();
     }
 
-    /// Schema admission creates no installation and authorizes no transport I/O.
     pub fn enableEffects(self: *Store) Error!void {
         try self.beginWrite();
         errdefer self.rollback();
@@ -3610,6 +3400,55 @@ pub const Store = struct {
         return count;
     }
 
+    pub const OperatorOwner = struct {
+        jail: detection.Name,
+        scope: effects.Scope,
+        lease: effects.Lease,
+        decision_id: effects.Hash,
+        ordinal: u64,
+    };
+    pub fn operatorOwners(self: *Store, now_us: i64, output: []OperatorOwner) Error!usize {
+        if (output.len == 0 or output.len > effects.max_owners) return error.EffectCapacity;
+        try self.beginRead();
+        errdefer self.rollback();
+        const installation = try self.readInstallation() orelse return error.InstallationRequired;
+        if (self.schema_version < 19) return error.EffectStorageRequired;
+        const floor = try self.readAdmissionClock(self.schema_version);
+        if (floor) |value| if (now_us < value.us) return error.EffectClockReversed;
+        var row = try self.statement(
+            "SELECT o.scope_key,n.canonical_scope,o.jail,o.decision_id,o.lease_kind,o.deadline_us,o.decided_us,d.ordinal," ++
+                "EXISTS(SELECT 1 FROM effect_owner_revisions h WHERE h.scope_key=o.scope_key AND h.jail=o.jail AND h.revision=o.revision AND h.generation=o.generation AND h.decision_id=o.decision_id AND h.lease_kind=o.lease_kind AND h.deadline_us IS o.deadline_us AND h.decided_us=o.decided_us) " ++
+                "FROM effect_owners o JOIN native_effects n USING(scope_key) LEFT JOIN retry_decision_details d ON d.jail=o.jail AND d.effect_decision_id=o.decision_id " ++
+                "WHERE o.lease_kind=2 OR (o.lease_kind=1 AND o.deadline_us>?1) ORDER BY o.jail,o.scope_key LIMIT ?2;",
+        );
+        defer row.deinit();
+        try row.int(1, now_us);
+        try row.int(2, @intCast(output.len + 1));
+        var count: usize = 0;
+        while (try row.row()) {
+            if (count == output.len) return error.EffectCapacity;
+            const key = try effectBlob(&row, 0, 32);
+            const scope = try self.decodeStoredScope(&row, 1);
+            if (!std.mem.eql(u8, &key, &try scope.key(installation))) return error.InvalidEffect;
+            if (self.api.column_type(row.ptr, 2) != 3 or try row.signed(8) != 1) return error.InvalidEffect;
+            const lease = try effectLease(&row, 4, 5);
+            const decided_us = try row.signed(6);
+            if (!lease.live(now_us) or decided_us > (if (floor) |value| value.us else return error.InvalidEffect)) return error.InvalidEffect;
+            const stored_ordinal = try row.optionalSigned(7);
+            if (stored_ordinal) |ordinal| if (ordinal <= 0) return error.InvalidEffect;
+            output[count] = .{
+                .jail = detection.Name.init(try row.boundedBytes(2, 64)) catch return error.InvalidEffect,
+                .scope = scope,
+                .lease = lease,
+                .decision_id = try effectBlob(&row, 3, 32),
+                .ordinal = if (stored_ordinal) |ordinal| @intCast(ordinal) else 1,
+            };
+            count += 1;
+        }
+        try self.commitTransaction();
+        return count;
+    }
+
     fn replaceEffectIntent(self: *Store, installation: effects.Installation, scope: effects.Scope, key: effects.Hash, effect_revision: u64, decision_id: effects.Hash, now: i64) Error!effects.Entry {
         var owners: [effects.max_page]effects.Owner = undefined;
         const count = try self.readOwners(key, &owners);
@@ -3720,9 +3559,6 @@ pub const Store = struct {
         self.effect_publication_epoch +|= 1;
         return entry;
     }
-    /// Canonical validation and any pre-schema-19 legacy projection happen
-    /// before setOwner starts a writer transaction. Schema 19 preserves the
-    /// complete canonical identity; older schemas refuse richer scopes.
     pub fn setOwnerFromCanonical(self: *Store, change: effects.CanonicalOwnerChange, clock: effects.Clock) Error!effects.Entry {
         change.scope.validate() catch return error.InvalidEffect;
         const projected = if (self.schema_version >= 19) try change.exact() else try change.legacy();
@@ -3773,9 +3609,6 @@ pub const Store = struct {
         try self.fault(.after_effect_owner);
         return .{ .entry = try self.replaceEffectIntent(installation, scope, key, effect_revision, change.transition_id, now), .changed = true };
     }
-    /// Transition one exact owner while retaining its original decision/time.
-    /// Release is the core manual-unban primitive; retry/history rows are not
-    /// modified. Retain changes only generation authority and aggregate intent.
     pub fn transitionOwner(self: *Store, change: effects.OwnerTransition, clock: effects.Clock) Error!effects.Entry {
         try self.beginWrite();
         errdefer self.rollback();
@@ -3788,8 +3621,6 @@ pub const Store = struct {
         if (result.changed) self.effect_publication_epoch +|= 1;
         return result.entry;
     }
-    /// Release at most one live owner for a jail. Repeated calls form a bounded
-    /// flush; every step has its own durable aggregate intent and stale fence.
     pub fn flushJailOwner(self: *Store, jail: []const u8, generation: effects.Hash, transition_id: effects.Hash, clock: effects.Clock) Error!?effects.Entry {
         _ = detection.Name.init(jail) catch return error.InvalidEffect;
         if (std.mem.allEqual(u8, &transition_id, 0)) return error.InvalidEffect;
@@ -3865,8 +3696,6 @@ pub const Store = struct {
         const matches = if (observation.state) |state| effects.Lease.eql(entry.desired, state) else false;
         const status: effects.Status = if (expired) .expired else if (!matches) .pending else if (entry.desired == .absent) .absent else .applied;
         if (previous_observed != null and observation.observed_us == previous_observed.? and status != entry.status) return error.StaleEffect;
-        // Complete fresh readback may reopen a settled intent after drift; its
-        // immutable identity/deadline and confirmed-event dedup remain intact.
         var stamps: [16]u8 = undefined;
         const dispatch_time = (try dispatch.optionalSigned(0)).?;
         std.mem.writeInt(i64, stamps[0..8], dispatch_time, .little);
@@ -3950,8 +3779,6 @@ pub const Store = struct {
                     }
                 }
                 if (self.schema_version >= 13) {
-                    // A missing or changed append trigger must roll back the
-                    // receipt rather than publish an event outside the stream.
                     var sequenced = try self.statement("SELECT s.event_id FROM confirmed_history_stream h JOIN confirmed_history_sequence s ON s.sequence=h.head WHERE h.id=1;");
                     defer sequenced.deinit();
                     if (!try sequenced.row() or !std.mem.eql(u8, &try effectBlob(&sequenced, 0, 32), &event_id)) return error.HistoryGap;
@@ -3961,7 +3788,6 @@ pub const Store = struct {
         try self.advanceEffectSnapshot();
         try self.fault(.before_effect_receipt_commit);
         const final = try self.commitEffectClock(clock);
-        // Crossing expiry during receipt commit cannot publish a live confirmation.
         if (status == .applied and entry.desired == .finite and !entry.desired.live(final)) return error.EffectExpired;
         try self.commitTransaction();
         self.effect_publication_epoch +|= 1;
@@ -3996,7 +3822,6 @@ pub const Store = struct {
         if (expired != 0) {
             const effect_revision = std.math.add(u64, prior.revision, expired) catch return error.EffectCapacity;
             if (effect_revision > std.math.maxInt(i64)) return error.EffectCapacity;
-            // Last immutable intent binds this expiry transition, never current duration.
             entry = try self.replaceEffectIntent(installation, prior.scope, key, effect_revision, prior.intent_id, now);
         }
         _ = try self.commitEffectClock(clock);
@@ -4008,7 +3833,6 @@ pub const Store = struct {
         const count = try self.integer("SELECT count(*) FROM confirmed_effect_events;");
         return std.math.cast(u64, count) orelse error.InvalidEffect;
     }
-    /// Exact historical finite authorization survives expiry/release and sharing.
     pub fn ownerRevision(self: *Store, key: effects.Hash, jail: []const u8, owner_revision: u64) Error!?effects.Owner {
         if (owner_revision == 0 or owner_revision > std.math.maxInt(i64)) return error.InvalidEffect;
         var row = try self.statement("SELECT generation,decision_id,lease_kind,deadline_us,decided_us FROM effect_owner_revisions WHERE scope_key=?1 AND jail=?2 AND revision=?3;");
@@ -4065,8 +3889,6 @@ pub const Store = struct {
         try self.exec("UPDATE consumer_revision SET revision=revision+1 WHERE id=1;");
         if (self.api.changes(self.db) != 1) return error.InvalidConsumer;
     }
-    /// Detached discovery for dynamically admitted DNS keys. Every page belongs
-    /// to the same durable consumer revision; retain even expired checkpoint keys.
     pub fn consumerManifestKeysPage(self: *Store, allocator: std.mem.Allocator, jail: []const u8, after_source: ?[]const u8, expected_revision: ?u64, output: []ManifestKey) Error!ManifestPage {
         if (output.len == 0 or output.len > consumers.max_dependencies or jail.len == 0 or jail.len > 64 or std.mem.indexOfScalar(u8, jail, 0) != null) return error.InvalidConsumer;
         if (after_source) |after| if (after.len == 0 or after.len > Limits.source_bytes or std.mem.indexOfScalar(u8, after, 0) != null) return error.InvalidConsumer;
@@ -4113,8 +3935,6 @@ pub const Store = struct {
         try row.text(2, source);
         return row.row();
     }
-    /// Validate both the manifest digest and every normalized required key. A
-    /// digest alone cannot conceal missing, added or corrupted requirement rows.
     fn checkManifest(self: *Store, manifest: consumers.Manifest) Error!ManifestStatus {
         const digest = try manifest.digest();
         var row = try self.statement("SELECT generation,digest,ready,required_count FROM consumer_manifests WHERE jail=?1 AND source=?2;");
@@ -4168,16 +3988,12 @@ pub const Store = struct {
         if (try self.manifestExists(manifest.jail, manifest.source)) return error.ConsumerManifestExists;
         if (try self.integer("SELECT count(*) FROM consumer_manifests;") >= 4096 or
             try self.integer("SELECT count(*) FROM consumer_requirements;") > 65536 - manifest.required.len) return error.ConsumerCapacity;
-        // First use is an explicit empty source boundary, never adoption of
-        // acknowledged history or a pending observation under another generation.
         var old = try self.statement("SELECT 1 FROM records WHERE jail=?1 AND source=?2 UNION ALL SELECT 1 FROM pending_receipts WHERE jail=?1 AND source=?2 LIMIT 1;");
         defer old.deinit();
         try old.text(1, manifest.jail);
         try old.text(2, manifest.source);
         if (try old.row()) return error.ConsumerMigrationRequired;
         for (manifest.required) |requirement| {
-            // Refuse incompatible retained generations/formats. No history is
-            // deleted or reinterpreted as part of ordinary restart admission.
             var incompatible = try self.statement("SELECT 1 FROM consumer_checkpoints WHERE kind=?1 AND jail=?2 AND source=?3 AND rule=?4 AND (generation!=?5 OR format!=?6) UNION ALL SELECT 1 FROM consumer_requirements WHERE kind=?1 AND jail=?2 AND source=?3 AND rule=?4 AND (generation!=?5 OR format!=?6) LIMIT 1;");
             defer incompatible.deinit();
             try bindConsumerKey(&incompatible, &requirement.key);
@@ -4241,8 +4057,6 @@ pub const Store = struct {
         try self.commitTransaction();
         return result;
     }
-    /// Recheck every detached restore revision immediately before publication.
-    /// Caller serialization still owns the interval after this method returns.
     pub fn validateConsumerManifestSnapshot(self: *Store, manifest: consumers.Manifest, saved_snapshot: *const ManifestSnapshot) Error!void {
         if (saved_snapshot.count != manifest.required.len or !std.mem.eql(u8, &saved_snapshot.digest, &try manifest.digest())) return error.ConsumerManifestMismatch;
         try self.beginRead();
@@ -4301,8 +4115,6 @@ pub const Store = struct {
             };
         }
         if (!bound) return error.ConsumerManifestMismatch;
-        // Only an exact ready shared-input manifest can grant a dynamic read.
-        // The source's immutable resolver authority binds its permitted generation.
         var name: [260]u8 = undefined;
         const source = std.fmt.bufPrint(&name, "{s}:{s}", .{ key.rule, key.source }) catch return error.ConsumerManifestMismatch;
         const required = [_]consumers.Requirement{.{ .key = key, .format_version = 1 }};
@@ -4320,12 +4132,9 @@ pub const Store = struct {
         if (self.api.changes(self.db) != 1) return error.ConsumerManifestMissing;
         try self.fault(.after_manifest_ready);
     }
-    /// DNS/shared inputs own an independent durable checkpoint transaction. It
-    /// never updates source receipts, source cursors or jail record revisions.
     pub fn commitConsumerInput(self: *Store, manifest: consumers.Manifest, batch: consumers.Batch) Error!void {
         try self.consumerInput(manifest, batch, false);
     }
-    /// First-use initializers and their required manifest appear atomically.
     pub fn bootstrapConsumerManifest(self: *Store, manifest: consumers.Manifest, batch: consumers.Batch) Error!void {
         try self.consumerInput(manifest, batch, true);
     }
@@ -4353,8 +4162,6 @@ pub const Store = struct {
             if (self.payload) |bytes| allocator.free(bytes);
         }
     };
-    // SQLITE_STATIC borrows generation bytes until step/finalize; never bind a
-    // by-value helper copy whose lifetime ends when this helper returns.
     fn bindConsumerKey(row: *Stmt, key: *const consumers.Key) Error!void {
         try key.validate();
         try row.int(1, @intFromEnum(key.kind));
@@ -4363,8 +4170,6 @@ pub const Store = struct {
         try row.text(4, key.rule);
         try row.blob(5, &key.generation);
     }
-    /// A detached bounded single row. Multi-owner restore must hold a coherent
-    /// snapshot/revision protocol around these reads before publishing anything.
     pub fn consumerSnapshot(self: *Store, allocator: std.mem.Allocator, key: consumers.Key) Error!ConsumerSnapshot {
         const schema = try self.integer("PRAGMA user_version;");
         if (schema < 10 or schema > latest_schema) return error.ConsumerStorageRequired;
@@ -4433,9 +4238,6 @@ pub const Store = struct {
         if (self.schema_version >= 12) try self.bumpConsumerRevision();
     }
 
-    /// Register the entire jail before source activation. Enabling retry on an
-    /// already acknowledged evidence-only jail requires a migration boundary;
-    /// silently starting with an empty window would lose protection history.
     pub fn admitRetry(self: *Store, jail: []const u8, generation: [32]u8, policy: retry.Policy) Error!void {
         if (jail.len == 0 or jail.len > 64 or std.mem.indexOfScalar(u8, jail, 0) != null) return error.InvalidRecord;
         _ = try policy.encode();
@@ -4462,8 +4264,6 @@ pub const Store = struct {
         try self.commitTransaction();
     }
 
-    /// The same read-only predicate is used by the all-jail startup fence and
-    /// by each eventual registration transaction. False means genuinely fresh.
     fn checkRetryAdmission(self: *Store, jail: []const u8, generation: [32]u8, policy: retry.Policy) Error!bool {
         if (jail.len == 0 or jail.len > 64 or std.mem.indexOfScalar(u8, jail, 0) != null) return error.InvalidRecord;
         _ = try policy.encode();
@@ -4489,9 +4289,6 @@ pub const Store = struct {
         policy: retry.Policy,
         custom: bool = false,
     };
-    /// Refuse any retained incompatible owner before first-use registrations.
-    /// One bounded read transaction observes all configured generations together;
-    /// per-owner write transactions still recheck their own exact admission.
     pub fn validateRuntimeAdmissions(self: *Store, admissions: []const RuntimeAdmission, resolver_generation: ?[32]u8) !void {
         if (admissions.len == 0 or admissions.len > 64) return error.InvalidRecord;
         try self.beginRead();
@@ -4642,9 +4439,6 @@ pub const Store = struct {
         return result;
     }
 
-    /// Return observation-time working state without changing durable retry
-    /// state or its admitted processing clock. Retired cumulative history has
-    /// no expiring attempts and is returned unchanged.
     pub fn retryStateAt(self: *Store, jail: []const u8, subject: detection.Subject, now_us: i64) Error!?retry.State {
         try self.beginRead();
         errdefer self.rollback();
@@ -4663,8 +4457,6 @@ pub const Store = struct {
     pub fn validateRuntimeOwners(self: *Store, names: []const []const u8) !void {
         return self.validateOwners(names, null);
     }
-    /// Complete configured manifest admission. This is a structural fence;
-    /// callers must still restore/decode/recheck every consumer before polling.
     pub fn validateRuntimeOwnersWithManifests(self: *Store, names: []const []const u8, manifests: []const consumers.Manifest) !void {
         return self.validateOwners(names, manifests);
     }
@@ -4694,8 +4486,6 @@ pub const Store = struct {
         try self.commitTransaction();
     }
 
-    /// Preliminary structural check only. This never authorizes source polling;
-    /// final consumer ownership and all decoded state fences remain mandatory.
     pub fn validateRuntimeOwnerNames(self: *Store, names: []const []const u8) !void {
         if (names.len == 0 or names.len > 64) return error.InvalidRecord;
         try self.beginRead();
@@ -4703,9 +4493,6 @@ pub const Store = struct {
         try self.validateOwnerNamesTx(names);
         try self.commitTransaction();
     }
-    /// A persisted source position or receipt proves this is not first use.
-    /// Required custom consumers must already have their durable manifest before
-    /// startup can reconcile effects, even if the source is currently absent.
     pub fn validateCustomSourceManifests(self: *Store, jail: []const u8) Error!void {
         if (jail.len == 0 or jail.len > 64) return error.InvalidConsumer;
         try self.beginRead();
@@ -4731,8 +4518,6 @@ pub const Store = struct {
         }
         if (try self.integer("SELECT EXISTS(SELECT 1 FROM source_cursors c LEFT JOIN checkpoints p ON c.jail=p.jail LEFT JOIN records r ON c.jail=r.jail AND c.source=r.source AND c.occurrence=r.occurrence WHERE p.jail IS NULL OR r.jail IS NULL);") != 0) return error.InvalidRecord;
     }
-    /// Call immediately after the runtime's coherent source/shared scans and
-    /// before publishing its global recovery gate, with no intervening writes.
     pub fn validateConsumerOwnership(self: *Store, names: []const []const u8, expected_manifest_count: usize, expected_consumer_revision: u64, allow_history: bool) !void {
         if (names.len == 0 or names.len > 64 or expected_manifest_count > 4096) return error.InvalidRecord;
         try self.beginRead();
@@ -4768,16 +4553,12 @@ pub const Store = struct {
 
     pub const ActiveDecision = struct { subject: detection.Subject, lease: retry.Lease, ordinal: u64 };
     pub const RetrySummary = struct { subjects: usize = 0, active: usize = 0, decisions: u64 = 0 };
-    /// Detached, capacity-admitted status data. No read transaction survives the
-    /// call, and expired decisions are excluded without rewriting their deadlines.
     pub fn retrySummary(self: *Store, jail: []const u8, now_us: i64, output: []ActiveDecision) Error!RetrySummary {
         try self.beginRead();
         errdefer self.rollback();
         const admission = (try self.readRetryPolicy(jail)) orelse return error.RetryAdmissionRequired;
         if (output.len < admission.policy.max_subjects) return error.RetryCapacity;
         const floor = try self.readRetryClock();
-        // The clock may move after source admission but before publication.
-        // Use the shared recoverable clock error, including for empty owners.
         if (floor) |value| if (now_us < value) return error.ReceiptClockReversed;
         var row = try self.statement(if (self.schema_version >= 16)
             "SELECT last_processed_us,lease_kind,deadline_us,decisions,attempts,family,subject FROM retry_states WHERE jail=?1 ORDER BY family,subject;"
@@ -4805,8 +4586,6 @@ pub const Store = struct {
         return summary;
     }
 
-    /// Coherent latest per-jail/address policy rows. A global trigger revision
-    /// refuses continuations after any working/retired state mutation.
     pub fn retryPolicySummaryPage(self: *Store, query: application_history.PolicyQuery, output: []application_history.PolicySummary) Error!application_history.PolicyPage {
         try query.validate();
         if (output.len == 0 or output.len > application_history.max_page or self.schema_version < 17) return error.InvalidPolicySummary;
@@ -4860,8 +4639,6 @@ pub const Store = struct {
         return .{ .revision = current_revision, .count = count, .more = more };
     }
 
-    /// Bounded startup validation, with no publication or callbacks while the
-    /// SQLite snapshot is open. The coordinator serializes this with ingestion.
     pub fn validateRetry(self: *Store, jail: []const u8, generation: [32]u8, policy: retry.Policy) Error!void {
         try self.beginRead();
         errdefer self.rollback();
@@ -4973,9 +4750,6 @@ pub const Store = struct {
     };
     pub const RetryProlongationResult = struct { changed: bool, lease: retry.Lease, effect: effects.Entry };
 
-    /// Extend one still-active enforcing decision and its physical owner in the
-    /// same transaction. The decision identity/time and confirmed-history key
-    /// are immutable; a new aggregate intent carries only the longer lease.
     pub fn prolongRetryDecision(self: *Store, change: RetryProlongation, clock: effects.Clock) Error!RetryProlongationResult {
         if (change.ordinal == 0 or change.ordinal > std.math.maxInt(i64) or change.requested == .absent) return error.InvalidRetryState;
         try self.beginWrite();
@@ -5138,6 +4912,7 @@ pub const Store = struct {
                 .jitter_us = sampled_us,
             };
         }
+        if (next.decision) |*decision| decision.enforce = admission.enforces();
         var prepared_context: ?action_context.Context = null;
         if (next.decision) |decision| {
             const confirmed_history_count: ?u64 = if (self.schema_version >= 18)
@@ -5237,11 +5012,6 @@ pub const Store = struct {
                 var kept_existing = false;
                 for (owners[0..count]) |owner| if (std.mem.eql(u8, owner.jail.slice(), record.jail)) {
                     effect_revision = owner.revision;
-                    // A live owner keeps its decision, decision time, lease, revision and
-                    // confirmation: a later detection never re-decides, shortens or prolongs it.
-                    // Only an explicit prolongation (`prolongRetryDecision`) moves a deadline.
-                    // Owner rows outlive their deadline, so liveness is judged at the effect
-                    // clock: at or after expiry the detection decides a new ban.
                     kept_existing = owner.lease.live(effect_now);
                 };
                 const identity = if (self.schema_version >= 12)
@@ -5271,8 +5041,6 @@ pub const Store = struct {
         }
     }
 
-    /// Null is an empty admitted store, not a missing/corrupt singleton. The
-    /// signed floor is the greatest durably accepted receipt across all owners.
     pub fn receiptClock(self: *Store) Error!?native_time.Timestamp {
         try self.beginRead();
         errdefer self.rollback();
@@ -5291,8 +5059,6 @@ pub const Store = struct {
         if (try row.row()) return error.InvalidRetryState;
         return floor;
     }
-    /// Retry decisions also use processing time. Preserve its committed floor
-    /// separately from first-observation receipts, and wait for both on recovery.
     pub fn admissionClock(self: *Store) Error!?native_time.Timestamp {
         try self.beginRead();
         errdefer self.rollback();
@@ -5338,8 +5104,6 @@ pub const Store = struct {
         return if (floor) |value| .{ .us = value } else null;
     }
 
-    /// Detached, validated result paired with its native time in one short read
-    /// snapshot. Null occurrence addresses the current committed source cursor.
     pub fn nativeDetection(self: *Store, jail: []const u8, source: []const u8, occurrence: ?[]const u8) Error!?detection.Outcome {
         var output: [max_native_detections]detection.Outcome = undefined;
         const count = try self.nativeDetections(jail, source, occurrence, &output);
@@ -5405,11 +5169,7 @@ pub const Store = struct {
         return count;
     }
 
-    /// Null occurrence reads the latest committed source position, including a
-    /// baseline (which has no native time). No long-lived reader escapes here.
     pub fn nativeTime(self: *Store, jail: []const u8, source: []const u8, occurrence: ?[]const u8) Error!?time_policy.Result {
-        // Pin schema and row to one read snapshot. Another connection may have
-        // upgraded since open; stale schema-4 knowledge must not erase provenance.
         try self.beginRead();
         errdefer self.rollback();
         const schema = try self.integer("PRAGMA user_version;");
@@ -5472,8 +5232,6 @@ pub const Store = struct {
         return value;
     }
 
-    /// Match the entire occurrence binding before returning a saved time. A
-    /// different occurrence cannot evict an unresolved record of this source.
     pub fn pendingReceipt(self: *Store, identity: ReceiptIdentity) Error!?native_time.Timestamp {
         try validateReceiptIdentity(identity);
         if (self.schema_version < 3) return error.ReceiptStorageRequired;
@@ -5494,8 +5252,6 @@ pub const Store = struct {
         return std.math.cast(usize, try self.integer("SELECT count(*) FROM pending_receipts;")) orelse error.DatabaseFailure;
     }
 
-    /// Read exact native receipt provenance for a committed occurrence. This
-    /// also prevents a duplicate retry from silently changing its generation.
     pub fn committedReceipt(self: *Store, identity: ReceiptIdentity) Error!?native_time.Timestamp {
         try validateReceiptIdentity(identity);
         if (self.schema_version < 3) return error.ReceiptStorageRequired;
@@ -5521,10 +5277,6 @@ pub const Store = struct {
         if (try row.row()) return error.ReceiptConflict;
     }
 
-    /// Recovery must account for every pending source, including ones absent
-    /// from current discovery. Each bounded row is detached and its statement
-    /// finalized before invoking source IO. Callbacks must not mutate this store;
-    /// another connection changing the snapshot refuses the entire traversal.
     pub fn visitPendingReceipts(self: *Store, callback: *const fn (ReceiptIdentity, native_time.Timestamp, ?*anyopaque) anyerror!void, context: ?*anyopaque) !void {
         const maximum = self.receipt_limit orelse return error.ReceiptStorageRequired;
         const initial_version = try self.integer("PRAGMA data_version;");
@@ -5532,8 +5284,6 @@ pub const Store = struct {
             if (try self.integer("PRAGMA data_version;") != initial_version) return error.StaleCheckpoint;
             return;
         }
-        // One page, well below the approved 1-MiB detached-read allowance. The
-        // separate key buffer survives reuse of the row during the next query.
         const buffer = try self.allocator.alloc(u8, 4096 + Limits.source_bytes + 16384 + Limits.cursor_bytes);
         defer self.allocator.free(buffer);
         const key = try self.allocator.alloc(u8, 4096 + Limits.source_bytes);
@@ -5585,8 +5335,6 @@ pub const Store = struct {
         }
     }
 
-    /// Observation commits no cursor, outcome, checkpoint or effect. Retries
-    /// read the saved receipt even when an earlier COMMIT's result was uncertain.
     pub fn beginReceipt(self: *Store, identity: ReceiptIdentity, proposed: native_time.Timestamp, expected_revision: u64) Error!native_time.Timestamp {
         try validateReceiptIdentity(identity);
         const maximum = self.receipt_limit orelse return error.ReceiptStorageRequired;
@@ -5648,7 +5396,6 @@ pub const Store = struct {
     }
     fn rollback(self: *Store) void {
         self.work_remaining = 1000;
-        // FULL/IOERR/NOMEM can already have rolled back the whole transaction.
         if (self.api.get_autocommit(self.db) != 0) {
             if (self.startup_admission) self.reopen_required = true;
             self.startup_operation = false;
@@ -5669,17 +5416,12 @@ pub const Store = struct {
         }
         const rc = self.api.exec(self.db, "ROLLBACK;", null, null, null);
         if (rc != 0) self.rollback_error_code = self.failureCode(rc);
-        // Never expose this connection's uncommitted state after failed cleanup.
         if (rc != 0 or self.api.get_autocommit(self.db) == 0) self.reopen_required = true;
     }
     fn exec(self: *Store, sql: [:0]const u8) Error!void {
         try self.usable();
         if (self.runtime_limits and self.api.get_autocommit(self.db) != 0) self.work_remaining = 1000;
         const rc = self.api.exec(self.db, sql, null, null, null);
-        // A failed COMMIT does not prove rollback. In particular an IO failure
-        // can leave autocommit enabled without establishing whether durable
-        // owners changed. Invalidate all process-local publication authority;
-        // reopening and coherent restoration must settle that uncertainty.
         if (rc != 0 and std.mem.eql(u8, sql, "COMMIT;") and
             (self.api.get_autocommit(self.db) != 0 or rc & 0xff == 10 or rc & 0xff == 11)) self.reopen_required = true;
         try self.check(rc);
@@ -5731,8 +5473,6 @@ pub const Store = struct {
         if (record.consumers) |batch| try batch.validate();
         try self.beginWrite();
         errdefer self.rollback();
-        // Never let an old adapter or a baseline skip unresolved native input.
-        // Another connection may have activated native storage since open.
         const schema = try self.integer("PRAGMA user_version;");
         if (schema < 2 or schema > latest_schema) return error.UnsupportedSchema;
         self.schema_version = schema;
@@ -6010,7 +5750,7 @@ pub const Store = struct {
             const count = try self.retryDecisions(record.jail, record.source, record.occurrence, &decisions);
             for (decisions[0..count]) |decision| if (decision.enforce and !decision.lease.live(now)) return error.EffectExpired;
         }
-        const effect_changed = if (record.native_retry) |admission| admission.policy.enforce and try self.hasEnforcingDecision(record) else false;
+        const effect_changed = if (record.native_retry != null) try self.hasEnforcingDecision(record) else false;
         try self.commitTransaction();
         if (effect_changed) self.effect_publication_epoch +|= 1;
         return .committed;
@@ -6077,8 +5817,6 @@ pub const Store = struct {
         return self.integer("SELECT count(*) FROM action_intents WHERE status='pending';");
     }
 
-    /// Callback slices live only until the callback returns. Enumerate before
-    /// discovering current paths so renamed incarnations are not forgotten.
     pub fn visitSources(self: *Store, jail: []const u8, callback: *const fn ([]const u8, []const u8, []const u8, ?*anyopaque) anyerror!void, context: ?*anyopaque) !void {
         var stmt = try self.statement("SELECT source,path,cursor FROM source_cursors WHERE jail=?1 ORDER BY source;");
         defer stmt.deinit();
@@ -6096,7 +5834,6 @@ pub const Store = struct {
             a.free(self.cursor);
         }
     };
-    /// One coherent detached row. No read transaction remains across source IO.
     pub fn readSourcePosition(self: *Store, a: std.mem.Allocator, jail: []const u8, after_source: ?[]const u8, expected_revision: u64) Error!?SourcePosition {
         try self.beginRead();
         errdefer self.rollback();
@@ -6219,8 +5956,6 @@ const Stmt = struct {
         return value;
     }
     fn bytes(self: *Stmt, column: c_int) Error![]const u8 {
-        // Fetch the blob before its byte count so any conversion cannot invalidate
-        // the returned pointer. A failed conversion must not look like empty state.
         const data = self.store.api.column_blob(self.ptr, column);
         if (data == null) {
             if (self.store.api.extended_errcode(self.store.db) == 7) try self.store.check(7);
@@ -6265,7 +6000,6 @@ test "record store: oversized restored values fail before caller allocation and 
     _ = try store.commitRecord(.{ .jail = "fixture", .source = "file", .occurrence = "1", .cursor = "1", .raw_hash = [_]u8{1} ** 32, .disposition = "counted", .checkpoint = "saved", .shared_state = .{ .name = "shared", .expected_revision = 0, .payload = "saved" } });
     var no_memory = std.heap.FixedBufferAllocator.init(&.{});
     const denied = no_memory.allocator();
-    // Direct SQL stands in for a foreign/older writer. Public writes reject these.
     try store.exec("UPDATE checkpoints SET payload=zeroblob(16777217);");
     try std.testing.expectError(error.StorageLimit, store.snapshot(denied, "fixture"));
     try std.testing.expectError(error.StorageLimit, store.checkpoint(denied, "fixture"));
@@ -6288,7 +6022,6 @@ test "record store: oversized restored values fail before caller allocation and 
     defer empty.deinit(denied);
     try std.testing.expectEqual(@as(usize, 0), empty.payload.?.len);
     try std.testing.expectEqual(@as(u64, 1), empty.revision);
-    // A valid nonempty value still reports caller OOM, not a size violation.
     try std.testing.expectError(error.OutOfMemory, store.sourceCursor(denied, "fixture", "file"));
 }
 
@@ -6310,8 +6043,6 @@ test "record store: opening and closing peers preserves SQLite process locks" {
         }
         const pid = try std.posix.fork();
         if (pid == 0) {
-            // No SQLite use after fork: independently probe its documented
-            // main-file shared-lock range from a different process.
             const fd = std.posix.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0) catch std.process.exit(2);
             var lock: std.posix.Flock = std.mem.zeroes(std.posix.Flock);
             lock.type = std.posix.F.WRLCK;
@@ -6323,7 +6054,7 @@ test "record store: opening and closing peers preserves SQLite process locks" {
                 std.process.exit(if (failure == error.Locked or failure == error.AccessDenied) 0 else 3);
             };
             std.posix.close(fd);
-            std.process.exit(4); // Acquiring this lock could permit WAL unlink.
+            std.process.exit(4);
         }
         const result = std.posix.waitpid(pid, 0);
         try std.testing.expectEqual(@as(u32, 0), result.status);
@@ -6349,7 +6080,6 @@ test "record store: SQLite row bound permits maximum admitted record and rejects
     defer saved.deinit(a);
     try std.testing.expectEqualSlices(u8, payload, saved.payload.?);
     try std.testing.expectEqual(@as(c_int, Limits.sqlite_row_bytes), store.api.limit(store.db, 0, -1));
-    // Simulate an older connection with larger limits, then restore our bound.
     _ = store.api.limit(store.db, 0, 32 * 1024 * 1024);
     try store.exec("UPDATE checkpoints SET payload=zeroblob(17825792);");
     _ = store.api.limit(store.db, 0, Limits.sqlite_row_bytes);
@@ -6366,8 +6096,6 @@ test "record store: SQLite heap budget feasibility and recovery after allocation
         extern "c" fn sqlite3_memory_used() i64;
         extern "c" fn sqlite3_memory_highwater(c_int) i64;
     };
-    // Test-only process-wide ceiling. Production configuration must own this
-    // once, before opening connections; it is not a per-Store or RSS limit.
     const old_soft = Memory.sqlite3_soft_heap_limit64(-1);
     const old_hard = Memory.sqlite3_hard_heap_limit64(64 * 1024 * 1024);
     defer {
@@ -6396,7 +6124,6 @@ test "record store: SQLite heap budget feasibility and recovery after allocation
         const peak = Memory.sqlite3_memory_highwater(0);
         try std.testing.expect(peak <= 64 * 1024 * 1024);
         std.debug.print("SQLite heap peak for 16 MiB checkpoint commit/restore: {d} bytes\n", .{peak});
-        // Deny a new allocation using SQLite's actual allocator, not an injected rc.
         _ = Memory.sqlite3_hard_heap_limit64(Memory.sqlite3_memory_used());
         record.occurrence = "2";
         record.cursor = "2";
@@ -6438,7 +6165,6 @@ test "record store: SQLite work budget feasibility interrupts excessive query an
     defer Progress.sqlite3_progress_handler(store.db, 0, null, null);
     const record = Record{ .jail = "fixture", .source = "file", .occurrence = "1", .cursor = "1", .raw_hash = [_]u8{1} ** 32, .disposition = "counted", .checkpoint = "saved", .action_intent = "saved-intent" };
     _ = try store.commitRecord(record);
-    // This read deliberately exceeds the test allowance. No external SQL input.
     try std.testing.expectError(error.Interrupted, store.integer("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000000) SELECT sum(x) FROM n;"));
     try std.testing.expectEqual(@as(u32, 0), budget.remaining);
     try std.testing.expectEqual(@as(?c_int, 9), store.last_error_code);
@@ -6460,8 +6186,6 @@ test "record store: capacity failure preserves every committed component and ret
     defer store.close();
     var record = Record{ .jail = "fixture", .source = "file", .occurrence = "1", .cursor = "1", .raw_hash = [_]u8{1} ** 32, .disposition = "counted", .checkpoint = "saved", .action_intent = "saved-intent", .shared_state = .{ .name = "shared", .expected_revision = 0, .payload = "saved-shared" } };
     _ = try store.commitRecord(record);
-    // Exercise real SQLITE_FULL without filling the host disk. This page ceiling
-    // is a test constraint, not a production disk/WAL quota or an OS ENOSPC test.
     const pages = try store.integer("PRAGMA page_count;");
     var sql: [80]u8 = undefined;
     try std.testing.expectEqual(pages, try store.integer(try std.fmt.bufPrintZ(&sql, "PRAGMA max_page_count={d};", .{pages})));
@@ -6474,7 +6198,6 @@ test "record store: capacity failure preserves every committed component and ret
     record.expected_revision = 1;
     record.shared_state.?.expected_revision = 1;
     record.shared_state.?.payload = "next-shared";
-    // Fail at the last write, after record/state/shared-state/cursor changes.
     record.action_intent = large;
     try std.testing.expectError(error.StorageFull, store.commitRecord(record));
     try std.testing.expectEqual(@as(?c_int, 13), store.last_error_code);
@@ -6521,7 +6244,6 @@ test "record store: rollback failure blocks reads and writes until close and rec
                 return embedded_api.exec(db, sql, callback, context, message);
             }
         };
-        // Per-connection fault injection; no global VFS or live disk changes.
         store.api.exec = Fault.exec;
         try std.testing.expectError(error.StorageIo, store.commitRecord(record));
         try std.testing.expectEqual(@as(?c_int, 10 | (3 << 8)), store.last_error_code);
@@ -6592,7 +6314,6 @@ test "record store: killed writer preserves committed WAL and rolls back unfinis
             } else {
                 store.exec("BEGIN IMMEDIATE; UPDATE checkpoints SET payload='uncommitted-state'; DELETE FROM source_cursors; DELETE FROM action_intents;") catch std.process.exit(4);
             }
-            // No close/checkpoint/destructor: exercise SQLite recovery after process death.
             std.posix.kill(std.os.linux.getpid(), std.posix.SIG.KILL) catch std.process.exit(5);
             unreachable;
         }
@@ -6700,7 +6421,6 @@ test "record store: shared read dependencies and writes are atomic across jails 
     var second = try Store.open(allocator, path);
     defer second.close();
     var record = Record{ .jail = "one", .source = "file", .occurrence = "1", .cursor = "1", .raw_hash = [_]u8{1} ** 32, .disposition = "ordinary", .checkpoint = "jail-one", .action_intent = "inert-intent", .shared_state = .{ .name = "dns", .expected_revision = 0 } };
-    // A dependency on absent state does not create an empty cache checkpoint.
     _ = try first.commitRecord(record);
     {
         const absent = try second.sharedSnapshot(allocator, "dns");
@@ -6741,7 +6461,6 @@ test "record store: shared read dependencies and writes are atomic across jails 
     stale.jail = "four";
     stale.shared_state.?.payload = "cache-two";
     _ = try first.commitRecord(stale);
-    // Replaying an old committed record cannot rewind the process-wide cache.
     try std.testing.expectEqual(CommitResult.already_committed, try second.commitRecord(record));
     const saved = try second.sharedSnapshot(allocator, "dns");
     defer saved.deinit(allocator);
@@ -6810,7 +6529,6 @@ test "clock recovery: pending verification releases its read before source work 
         fn check(identity: ReceiptIdentity, stamp: native_time.Timestamp, context: ?*anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(context.?));
             self.count += 1;
-            // An active SQLite read snapshot would make this return busy.
             if (self.checkpoint) try std.testing.expectEqual(@as(i64, 0), try self.writer.integer("PRAGMA wal_checkpoint(TRUNCATE);"));
             if (self.mutate) {
                 var next = identity;
@@ -6828,8 +6546,6 @@ test "clock recovery: pending verification releases its read before source work 
     try std.testing.expectEqual(@as(usize, 1), visitor.count);
     visitor.count = 0;
     visitor.checkpoint = true;
-    // SQLite also changes data_version when this checkpoint resets the WAL.
-    // Conservatively restart validation, even though no logical row changed.
     try std.testing.expectError(error.StaleCheckpoint, store.visitPendingReceipts(Visitor.check, &visitor));
     try std.testing.expectEqual(@as(usize, 1), visitor.count);
     try std.testing.expectEqual(@as(usize, 1), try store.pendingReceiptCount());
@@ -6925,8 +6641,6 @@ test "clock recovery: schema seven seeds exact durable floor and receipt failure
     try std.testing.expectEqual(greatest + 1, (try store.receiptClock()).?.us);
     store.fail_at = null;
     try std.testing.expectEqual(greatest + 1, (try store.beginReceipt(third, .{ .us = 1 }, 1)).us);
-    // The floor is independent of eventual detailed-ledger retention. This is
-    // a storage invariant check, not an implemented compaction policy.
     try store.exec("DELETE FROM record_detections; DELETE FROM source_cursors; DELETE FROM records; DELETE FROM pending_receipts;");
     var reopened = try Store.open(a, path);
     defer reopened.close();
@@ -7045,8 +6759,6 @@ test "native detection: journal schema migration preserves prior evidence and cl
     const record = try DetectionFixture.record();
     _ = try store.commitRecord(record);
     try store.enableClockRecovery();
-    // Real SQLite capacity refusal during table replacement must leave the
-    // previous schema/evidence usable; migration must never prune to make room.
     const original_maximum = try store.integer("PRAGMA max_page_count;");
     const pages = try store.integer("PRAGMA page_count;");
     const limited = try std.fmt.allocPrintZ(a, "PRAGMA max_page_count={d};", .{pages});
@@ -7394,7 +7106,6 @@ test "receipt recovery: identity limits atomic deletion and signed receipt histo
     defer a.free(path);
     var store = try Store.open(a, path);
     defer store.close();
-    // This connection predates schema activation and must not bypass a pending receipt.
     var earlier = try Store.open(a, path);
     defer earlier.close();
     try store.enableReceipts(1);
@@ -7498,19 +7209,16 @@ test "receipt recovery: killed writer preserves pending time and atomic final pu
     defer a.free(root);
     const path = try std.fs.path.join(a, &.{ root, "state.sqlite" });
     defer a.free(path);
-    // Each child dies without closing SQLite. The next phase recovers that WAL.
     for (0..4) |phase| {
         const pid = try std.posix.fork();
         if (pid == 0) {
             var child = Store.open(std.heap.page_allocator, path) catch std.process.exit(2);
             child.enableReceipts(1) catch std.process.exit(3);
             if (phase == 0) {
-                // Crash before the first observation transaction commits.
                 child.exec("BEGIN IMMEDIATE; INSERT INTO pending_receipts VALUES('fixture','ordinary',zeroblob(32),'one',zeroblob(32),'next',100);") catch std.process.exit(4);
             } else if (phase == 1) {
                 _ = child.beginReceipt(ReceiptFixture.identity, .{ .us = 100 }, 0) catch std.process.exit(5);
             } else if (phase == 2) {
-                // Kill inside the real outcome transaction after pending removal.
                 const Kill = struct {
                     fn exec(db: *Db, sql: [*:0]const u8, callback: ?*anyopaque, context: ?*anyopaque, message: ?*?[*:0]u8) callconv(.c) c_int {
                         if (std.mem.eql(u8, std.mem.span(sql), "COMMIT;")) {
@@ -7580,7 +7288,6 @@ test "receipt recovery: recovery enumeration is bounded and rejects malformed st
     second.source = "second";
     _ = try store.beginReceipt(second, .{ .us = 456 }, 0);
     try std.testing.expectError(error.ReceiptLimit, store.enableReceipts(1));
-    // Foreign/corrupt values must not be reinterpreted through SQLite coercion.
     try store.exec("PRAGMA ignore_check_constraints=ON; UPDATE pending_receipts SET receipt_us='not-an-integer' WHERE source='ordinary';");
     called = false;
     try std.testing.expectError(error.DatabaseFailure, store.visitPendingReceipts(Visitor.visit, &called));
@@ -8017,7 +7724,6 @@ test "native consumers: killed migration and multi-state commits retain original
                 try std.testing.expectError(error.OutOfMemory, restored.consumerSnapshot(failing.allocator(), key));
                 try restored.exec("PRAGMA ignore_check_constraints=ON; UPDATE consumer_checkpoints SET payload='foreign-text';");
                 try std.testing.expectError(error.InvalidConsumer, restored.consumerSnapshot(a, key));
-                // Type rejection does not destroy the authoritative checkpoint.
                 try std.testing.expectEqual(@as(i64, 1), try restored.integer("SELECT count(*) FROM consumer_checkpoints;"));
             }
         }

@@ -423,7 +423,7 @@ pub const HttpServer = struct {
                 "Connection: Upgrade\r\n" ++
                 "Sec-WebSocket-Accept: {s}\r\n\r\n",
             .{accept},
-        ) catch unreachable; // fixed-size format: cannot overflow
+        ) catch unreachable;
         writeAll(cli.fd, hs) catch return .close;
 
         const tail_start = hdr_end_idx + 4;
@@ -467,7 +467,6 @@ pub const HttpServer = struct {
             try writeSimpleResponse(fd, 500, "Internal Server Error", "text/plain", "health body too large\n");
             return;
         }
-        // Probes key on the status line: 503 while any readiness component withholds readiness.
         if (std.mem.indexOf(u8, body.items, "\"ready\":true") != null) {
             try writeResponse(fd, 200, "OK", "application/json", body.items);
         } else {

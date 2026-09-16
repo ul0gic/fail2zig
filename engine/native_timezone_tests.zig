@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Original bounded TZif fixtures plus read-only checks of installed zone data.
 const std = @import("std");
 const zone = @import("core/native_timezone.zig");
 const time = @import("core/native_time.zig");

@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Bounded typed query rendering over daemon-supplied views.
 const std = @import("std");
 const query = @import("net/query_v1.zig");
 
@@ -10,7 +9,7 @@ const generation: [32]u8 = [_]u8{0xab} ** 32;
 const generation_hex = "abababababababababababababababababababababababababababababababab";
 
 fn statusCallback(_: ?*anyopaque, _: std.mem.Allocator, out: *std.ArrayList(u8)) anyerror!void {
-    try out.appendSlice("{\"version\":\"0.3.1\",\"generation\":\"stale\",\"active_bans\":2}");
+    try out.appendSlice("{\"version\":\"0.4.0\",\"generation\":\"stale\",\"active_bans\":2}");
 }
 
 fn healthCallback(_: ?*anyopaque, _: std.mem.Allocator, out: *std.ArrayList(u8)) anyerror!void {
@@ -56,7 +55,6 @@ const scopes_view = query.ScopesView{ .jails = &.{
 const History = struct {
     events: []const query.HistoryEvent,
     calls: u32 = 0,
-    /// Rows examined per call, mirroring the daemon's page cap; 0 = unbounded.
     scan_budget: u32 = 0,
     stuck: bool = false,
     last_after: u64 = 0,
@@ -117,7 +115,7 @@ test "native query: status passes the daemon object through with the envelope fo
     defer doc.deinit();
     try t.expectEqual(@as(i64, 1), doc.value.object.get("schema_version").?.integer);
     try t.expectEqualStrings(generation_hex, doc.value.object.get("generation").?.string);
-    try t.expectEqualStrings("0.3.1", doc.value.object.get("version").?.string);
+    try t.expectEqualStrings("0.4.0", doc.value.object.get("version").?.string);
     try t.expectEqual(@as(i64, 2), doc.value.object.get("active_bans").?.integer);
 }
 
@@ -308,7 +306,6 @@ test "native query: history pages through the detached source with a sequence cu
 }
 
 test "native query: a filtered scan that exhausts its budget returns an empty page with an advancing cursor" {
-    // Only sequence 3 belongs to nginx; with a 2-row budget the first call scans 1..2 and finds nothing.
     var history = History{ .events = &history_events, .scan_budget = 2 };
     const first = try run("{\"schema_version\":1,\"kind\":\"history\",\"jail\":\"nginx\",\"limit\":10}", .admin, sources(&history));
     defer first.deinit(a);
@@ -331,7 +328,6 @@ test "native query: a filtered scan that exhausts its budget returns an empty pa
     try t.expectEqual(@as(u32, 2), history.calls);
     try t.expectEqual(query.Cursor{ .history = .{ .after_sequence = 4 } }, try query.Cursor.decode(second_doc.value.object.get("next_cursor").?.string));
 
-    // A source that reports more without advancing is refused rather than looped on.
     var stuck = History{ .events = &history_events, .stuck = true };
     try expectFailure(try run("{\"schema_version\":1,\"kind\":\"history\"}", .admin, sources(&stuck)), 500);
 }
@@ -410,7 +406,7 @@ test "native query: cursor encoding is opaque base64url and strict on decode" {
     const history = (query.Cursor{ .history = .{ .after_sequence = std.math.maxInt(u64) } }).encode(&buffer);
     try t.expectEqual(query.Cursor{ .history = .{ .after_sequence = std.math.maxInt(u64) } }, try query.Cursor.decode(history));
     try t.expectError(error.BadCursor, query.Cursor.decode(""));
-    try t.expectError(error.BadCursor, query.Cursor.decode("czo=")); // padded
-    try t.expectError(error.BadCursor, query.Cursor.decode("eDoxOjI")); // x:1:2
-    try t.expectError(error.BadCursor, query.Cursor.decode("czoxOg")); // s:1:
+    try t.expectError(error.BadCursor, query.Cursor.decode("czo="));
+    try t.expectError(error.BadCursor, query.Cursor.decode("eDoxOjI"));
+    try t.expectError(error.BadCursor, query.Cursor.decode("czoxOg"));
 }

@@ -128,8 +128,6 @@ pub const AvailabilityProbes = struct {
     iptablesAvailable: *const fn () bool = defaultIptablesAvailable,
 };
 
-/// Why no backend is usable. The nf_tables probe is the only kernel-facing one, so its
-/// outcome is the cause; ipset/iptables only fail when their binaries are off PATH.
 pub const DetectError = error{
     KernelUnsupported,
     PermissionDenied,
@@ -152,6 +150,11 @@ pub fn detect(allocator: std.mem.Allocator, forced: ?BackendTag) DetectError!Bac
     return detectWithProbes(allocator, .{}, forced);
 }
 
+pub fn detectExact(allocator: std.mem.Allocator, tag: BackendTag) DetectError!Backend {
+    _ = allocator;
+    return probeExact(.{}, tag);
+}
+
 pub fn detectWithProbes(
     allocator: std.mem.Allocator,
     probes: AvailabilityProbes,
@@ -163,24 +166,30 @@ pub fn detectWithProbes(
 }
 
 fn detectForced(probes: AvailabilityProbes, tag: BackendTag) DetectError!Backend {
-    const cause: DetectError = switch (tag) {
+    const selected = probeExact(probes, tag) catch |cause| {
+        std.log.warn("firewall backend: {s} forced by config but not usable — {s}", .{ @tagName(tag), causeName(cause) });
+        return cause;
+    };
+    return selectForced(selected);
+}
+
+fn probeExact(probes: AvailabilityProbes, tag: BackendTag) DetectError!Backend {
+    return switch (tag) {
         .nftables => switch (probes.nftablesReason()) {
-            .available => return selectForced(.{ .nftables = nftables.NftablesBackend{} }),
+            .available => .{ .nftables = nftables.NftablesBackend{} },
             .kernel_unsupported => error.KernelUnsupported,
             .transient => error.Transient,
             .permission_denied => error.PermissionDenied,
         },
         .ipset => if (probes.ipsetAvailable())
-            return selectForced(.{ .ipset = ipset.IpsetBackend{} })
+            .{ .ipset = ipset.IpsetBackend{} }
         else
             error.IpsetUnavailable,
         .iptables => if (probes.iptablesAvailable())
-            return selectForced(.{ .iptables = iptables.IptablesBackend{} })
+            .{ .iptables = iptables.IptablesBackend{} }
         else
             error.IptablesUnavailable,
     };
-    std.log.warn("firewall backend: {s} forced by config but not usable — {s}", .{ @tagName(tag), causeName(cause) });
-    return cause;
 }
 
 fn selectForced(be: Backend) Backend {
@@ -196,7 +205,6 @@ fn detectAuto(probes: AvailabilityProbes) DetectError!Backend {
         },
         .kernel_unsupported => error.KernelUnsupported,
         .transient => error.Transient,
-        // ipset/iptables need the same capability, so falling through would only mask the cause.
         .permission_denied => {
             std.log.warn("firewall backend: no backend available — {s}", .{causeName(error.PermissionDenied)});
             return error.PermissionDenied;

@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Stateless native failure-evidence consumer. It does not acknowledge records,
-//! count retries or request bans. A coordinator must commit its result with the
-//! source occurrence, time outcome and retry checkpoint before publication.
 const std = @import("std");
 const shared = @import("shared");
 const registry = @import("../filters/registry.zig");
@@ -11,16 +8,12 @@ const Cidr = @import("state.zig").Cidr;
 const policy = @import("source_time_policy.zig");
 const stored = @import("native_detection_record.zig");
 
-/// Bump when matching, body extraction or ignore semantics change. Registry
-/// pattern implementations are part of this version, not just their names.
 pub const version: u16 = 2;
 pub const Body = enum { whole, syslog };
 pub const Options = struct {
     filter: []const u8,
     body: Body,
     ignore: []const []const u8 = &.{},
-    /// Allocated from the eventual coordinator's per-jail budget, not a new
-    /// public configuration limit. Refuse excess entries; never truncate them.
     ignore_capacity: usize,
     max_decoded_bytes: u32,
 };
@@ -47,22 +40,17 @@ pub const Detector = struct {
     max_decoded_bytes: u32,
     generation: [32]u8,
 
-    /// The result owns the parsed CIDRs; all other slices point to compiled
-    /// registry data. No borrowed config strings or per-record allocation.
     pub fn init(allocator: std.mem.Allocator, options: Options) !Detector {
         if (options.max_decoded_bytes == 0 or options.max_decoded_bytes > @import("source_text.zig").max_record_bytes) return error.InvalidDetectorLimit;
         const patterns = registry.get(options.filter) orelse return error.UnknownFilter;
         const entry = for (registry.entries) |entry| {
             if (entry.patterns.ptr == patterns.ptr) break entry;
         } else unreachable;
-        // Recidive consumes confirmed native ban events, never external lines.
         if (std.mem.eql(u8, entry.name, "recidive")) return error.InternalEventsRequired;
         if (options.ignore.len > options.ignore_capacity) return error.IgnoreCapacityExceeded;
         const ignores = try allocator.alloc(Cidr, options.ignore.len);
         errdefer allocator.free(ignores);
         for (options.ignore, ignores) |spec, *cidr| {
-            // This consumer implements literal IP/CIDR rules only. Hostnames
-            // need the separately checkpointed native DNS consumer.
             if (spec.len == 0 or spec.len > 64) return error.InvalidStaticIgnore;
             cidr.* = Cidr.parse(spec) catch return error.InvalidStaticIgnore;
         }
@@ -75,7 +63,6 @@ pub const Detector = struct {
         hash.update(entry.name);
         hash.update(&.{0});
         hash.update(@tagName(options.body));
-        // JSON serializes values, never pointer addresses or struct padding.
         const encoded = try std.json.stringifyAlloc(allocator, ignores, .{});
         defer allocator.free(encoded);
         hash.update(encoded);
@@ -89,7 +76,6 @@ pub const Detector = struct {
         self.* = undefined;
     }
 
-    /// Keep this immutable detector at a stable address until the session ends.
     pub fn consumer(self: *const Detector) stored.Consumer {
         return .{ .generation = self.generation, .context = self, .evaluate = consume };
     }
@@ -125,9 +111,6 @@ pub const Detector = struct {
         return outcome;
     }
 
-    /// `decoded` must be the complete native-decoded record associated with
-    /// `admitted`. This pure API cannot authenticate their association or source.
-    /// Bounds and strict UTF-8 are still checked at this boundary.
     pub fn evaluate(self: *const Detector, decoded: []const u8, admitted: policy.Result) !Result {
         if (decoded.len > self.max_decoded_bytes) return error.RecordTooLarge;
         if (!std.unicode.utf8ValidateSlice(decoded) or std.mem.indexOfScalar(u8, decoded, 0) != null or
@@ -140,8 +123,6 @@ pub const Detector = struct {
             .whole => decoded,
             .syslog => blk: {
                 const extracted = parser.stripSyslogPrefix(decoded);
-                // Strict mode: a missing/invalid envelope cannot fall back to
-                // matching the whole record with a different interpretation.
                 if (extracted.ptr == decoded.ptr) return .malformed_body;
                 break :blk extracted;
             },

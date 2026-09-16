@@ -1,38 +1,90 @@
-# fail2zig v0.3.0
+# fail2zig v0.4.0
 
-Stabilization release: every open issue closed, validated on a real Debian 13 host with the shipping static binary. Adds an explicit observe-only escape hatch when no firewall backend is usable, makes `recidive` work on a default install, and ships mips. Thanks to @mwriter for the first external bug report (#45).
+Version 0.4.0 consolidates daemon and administration commands into one static executable per
+architecture, moves durable runtime state to embedded SQLite, adds quoted duration strings and
+runs the systemd service under a dedicated non-login account.
+
+Selected live qualification passed on Debian 13 x86_64 before the version-only change
+from the unpublished 0.3.1 candidate to 0.4.0. The rebuilt artifacts passed cross-build and native/emulated command checks. ARM64, ARMv7 hard float and both MIPS32r2 soft-float byte orders retain release
+artifacts, with cross-build, static inspection and QEMU smoke as their validation tier. Emulation
+does not establish real-hardware or kernel-enforcement support. Contemporary Ubuntu is untested.
+
+## Changes from v0.3.0
+
+- Use `fail2zig <command>` in place of `fail2zig-client <command>`. The installer removes the
+  retired client after installing its replacement. Rule testing and the supported fail2ban
+  inspect/snapshot/plan/validate/cutover/status/rollback workflow share this executable.
+- Statically embedded upstream SQLite 3.53.4 stores source receipts, retry state, protection
+  ownership, enforcement intent and confirmed history. No shared SQLite library or database
+  service is required. This native database is different from v0.3.0's binary state file.
+- `bantime`, `findtime`, `bantime_increment_max_bantime` and `bantime_increment_jitter`
+  accept quoted durations such as `"24h"` and `"1h30m"`, retaining integer seconds and existing
+  limits. Units: `s`, `m`, `mm`, `min`, `h`, `d`, `w`, `mo`, `y`. Months and years are fixed
+  2,629,800 and 31,557,600 seconds. `"permanent"` is exclusive to bantime.
+- The service uses `User=fail2zig` and `Group=fail2zig`, with `CAP_NET_ADMIN`, `CAP_NET_RAW` and
+  `CAP_DAC_READ_SEARCH` retained. The installer supports a custom service/monitor group.
+  Root or the daemon UID can administer protection; group membership grants monitoring only.
+  `CAP_NET_RAW` is required by the iptables ipset extension and permits raw IP sockets.
+  HTTP remains in the same privileged process and defaults to loopback.
+- `[global] firewall` selects the daemon-wide backend; an explicit backend never silently
+  falls back to another. `defaults.banaction` and jail overrides select enforcement or log-only
+  policy. `metrics_enabled = false` disables HTTP and WebSocket while IPC remains available.
+
+The backend compatibility alias and positioned configuration diagnostics from issue #45 shipped
+in v0.3.0 and are preserved. File/journal sources, nftables/iptables/ipset and five architecture
+artifacts also predate this release; the native persistence and command consolidation above are
+the relevant changes.
 
 ## Upgrade notes
 
-- **A world- or group-writable `config.toml` now refuses to start** with the mode and the fix (`chmod 0640`). The installer already writes 0640; hand-managed configs may need the chmod.
-- **State file format v4.** Older state files load unchanged; the first save writes v4. Downgrading to v0.2.x after that starts from empty state.
-- **`state_file` on `/run` or tmpfs warns at startup** that state will not survive a restart. If you copied an early example that used `/run/fail2zig/state.bin`, move it to `/var/lib/fail2zig/state.bin`.
-- **`recidive` no longer needs a log file.** A `[jails.recidive]` with no existing `logpath` is fed in-process from confirmed bans in the other jails; delete any `logpath` pointing at a log the daemon does not write.
+- Stop every daemon/state writer and back up the current executable, configuration and coherent
+  state before installing. The installer preserves operator configuration and never enables,
+  starts or restarts the service.
+- The installer transitions only the default current-native SQLite directory, database and
+  existing WAL/SHM siblings to the service account. It refuses active writers, unsafe paths,
+  legacy binary state and automatic custom-path upgrades. It does not recursively chown trees.
+- There is no automatic converter for v0.3.0 binary state. Preserve that state for rollback;
+  selecting a fresh native database explicitly loses its saved counters, bans/history and source
+  positions. This is distinct from supported fail2ban schema-4 SQLite migration. See the
+  [state upgrade boundary](docs/operations/migration-continuity.md#upgrading-fail2zig-state).
+- Run native destination migration under the service UID with the required capabilities and
+  a caller-owned private staging directory, with the destination daemon stopped. See
+  [command migration](docs/operations/command-migration.md#migration-workflow).
+- Journal input requires journald and `journalctl`. Debian 13 SSH jails must admit both
+  `/usr/sbin/sshd` and `/usr/lib/openssh/sshd-session` through `journal_executables`.
+  iptables and ipset require their host tools; nftables uses direct netlink.
 
-## Added
+## Known limitations
 
-- **`backend` jail key** accepted as a deprecated fail2ban alias of `source` (`systemd` → journald; `auto`/`polling`/`pyinotify`/`gamin` → auto). One deprecation warning per use. The importer emits `source`. (#45)
-- **Config errors carry `file:line:col`, key and section**: `config: /etc/fail2zig/config.toml:37:1: UnknownKey (key 'logpaht' in [jails.sshd])`. Duplicate keys in a section are rejected. `--validate-config` prints one resolution line per jail. (#45)
-- **`on_no_backend = "fail-closed" | "log-only"`** (default `fail-closed`). With `log-only`, a host with no usable firewall backend runs DEGRADED as observe-only instead of exiting; the cause (`missing CAP_NET_ADMIN`, no nf_tables, transient) is in `fail2zig-client status`, `/api/status`, `/metrics` (`fail2zig_protection_state{state="degraded"}`), and the event stream. A config whose jails are all `log-only` no longer needs a backend at all and runs unprivileged.
-- **`recidive` fed in-process** via a new `internal` source; the default config escalates repeat offenders for the first time.
-- **mips**: `mips-linux-musleabi` and `mipsel-linux-musleabi` static binaries (soft-float MIPS32r2), built and smoke-tested under qemu in CI. No real-hardware report yet; `install.sh` detects both byte orders.
+- A matching SSH failure originating from IPv4 loopback is classified as unenforceable, but a
+  later cleanup turn can put native storage into intervention. This local-only case is tracked
+  for repair after 0.4.0; it does not reproduce on the previously qualified remote SSH path.
+- Firewall effects are limited to the daemon's current network namespace. Custom namespace
+  selectors and service overrides that move it between namespaces are unsupported.
+- Persistence warnings on another host require its directory, ownership and filesystem evidence
+  to diagnose. This release does not establish the cause of previously reported save failures.
 
-## Changed
+## Release assets
 
-- **journald polling no longer blocks the event loop.** `journalctl` runs as a non-blocking child on the loop; IPC p99 under journald load is 4 ms (was 21 ms). No threads were added.
-- **IPC status round-trip p99 under 1 ms** (was 3–6 ms): client and response buffers are pooled at startup instead of mapped per connection.
-- **Firewall detection names its cause** and the nftables capability probe is a read-only `GETGEN`, so "missing CAP_NET_ADMIN" is reported at detect time instead of surfacing as a generic init failure.
-- **Known startup failures exit 1 with the cause and no error-return-trace.**
-- `fail2zig-client`: every table column sizes from its longest value; `Protection: DEGRADED (<cause>)`; a closed stdout pipe (`| head`) is a quiet exit.
-- Source tree comment purge: comments are now only the few load-bearing *why* lines.
+Five executables plus nine shared files make 14 assets; `SHA256SUMS` lists the 13 content files:
 
-## Fixed
+```text
+fail2zig-v0.4.0-x86_64-linux-musl
+fail2zig-v0.4.0-aarch64-linux-musl
+fail2zig-v0.4.0-arm-linux-musleabihf
+fail2zig-v0.4.0-mips-linux-musleabi
+fail2zig-v0.4.0-mipsel-linux-musleabi
+fail2zig.service
+fail2zig.toml.example
+install.sh
+fail2zig.1
+fail2zig.toml.5
+LICENSE
+SQLITE-NOTICE.md
+COPYING.date-profile
+SHA256SUMS
+```
 
-- **A log-only would-ban was persisted as a real ban** and reinstalled in the firewall by reconcile after a restart; expiry then called the backend to unban it. State v4 records enforcement; reconcile and expiry act only on enforced entries.
-- **journald: one file descriptor leaked per poll** in the new loop-driven path, and entries logged between service start and the first poll were dropped as history. Both found on the real-box gate, both now covered by regression tests.
-- State was saved twice on SIGTERM.
-- Non-root: the "no usable backend" cause read `NotAvailable` instead of `PermissionDenied`.
-
-## Internal
-
-- Integration suites `startup_failclosed`, `config_diag`, `no_backend`; benchmark `loop_latency`; e2e `stabilization_live.sh`. ADR-007, ADR-011, ADR-012, ADR-013 recorded.
+The installer verifies the selected executable and every downloaded file it installs against
+`SHA256SUMS` before privileged filesystem changes. It installs the service, example configuration,
+man pages and dependency/derived-data notices with the executable.

@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const engine = @import("engine");
 const posix = std.posix;
 const linux = std.os.linux;
 
@@ -217,7 +218,12 @@ const LiveDaemon = struct {
     fn waitForSocket(self: *LiveDaemon, socket_path: []const u8, timeout_ms: u64) !void {
         var waited: u64 = 0;
         while (waited < timeout_ms) : (waited += 10) {
-            if (!self.isAlive()) return error.DaemonExited;
+            if (!self.isAlive()) {
+                const diagnostic = try self.sink.snapshot(self.child.allocator);
+                defer self.child.allocator.free(diagnostic);
+                std.debug.print("daemon exited before socket publication:\n{s}\n", .{diagnostic});
+                return error.DaemonExited;
+            }
             if (dialOnce(socket_path)) |fd| {
                 posix.close(fd);
                 return;
@@ -324,11 +330,13 @@ const Scenario = struct {
         self.* = undefined;
     }
 
-    fn writeConfig(self: *Scenario, global_extra: []const u8, banaction: []const u8) !void {
+    fn writeConfig(self: *Scenario, global_extra: []const u8, enforce: bool) !void {
         const text = try std.fmt.allocPrint(self.a,
             \\[global]
+            \\native_ingestion = true
             \\socket_path = "{s}"
             \\state_file = "{s}/state.bin"
+            \\firewall_namespace = "/proc/{d}/ns/net"
             \\metrics_bind = "127.0.0.1"
             \\metrics_port = {d}
             \\memory_ceiling_mb = 64
@@ -338,21 +346,26 @@ const Scenario = struct {
             \\maxretry = 3
             \\findtime = 600
             \\bantime = 600
-            \\banaction = "{s}"
+            \\enforce = {}
             \\
             \\[jails.sshd]
             \\enabled = true
             \\filter = "sshd"
             \\source = "file"
+            \\timestamp = "undated"
             \\logpath = ["{s}"]
             \\
-        , .{ self.socket_path, self.root, self.metrics_port, global_extra, banaction, self.log_path });
+        , .{ self.socket_path, self.root, linux.getpid(), self.metrics_port, global_extra, enforce, self.log_path });
         defer self.a.free(text);
 
         var f = try std.fs.cwd().createFile(self.config_path, .{ .truncate = true, .mode = 0o640 });
         defer f.close();
         try f.writeAll(text);
         try f.chmod(0o640);
+    }
+
+    fn statePath(self: *Scenario) ![]u8 {
+        return std.fmt.allocPrint(self.a, "{s}/state.bin", .{self.root});
     }
 
     fn runDaemonToExit(self: *Scenario, env: ?*const std.process.EnvMap) !Run {
@@ -364,6 +377,23 @@ const Scenario = struct {
         var env = try std.process.getEnvMap(self.a);
         errdefer env.deinit();
         try env.put("PATH", "");
+        return env;
+    }
+
+    fn presentCommandEnv(self: *Scenario) !std.process.EnvMap {
+        const bin = try std.fmt.allocPrint(self.a, "{s}/probe-bin", .{self.root});
+        defer self.a.free(bin);
+        try std.fs.cwd().makeDir(bin);
+        for ([_][]const u8{ "iptables", "ip6tables" }) |name| {
+            const path = try std.fs.path.join(self.a, &.{ bin, name });
+            defer self.a.free(path);
+            var file = try std.fs.cwd().createFile(path, .{ .mode = 0o700 });
+            defer file.close();
+            try file.writeAll("#!/bin/sh\nexit 0\n");
+        }
+        var env = try std.process.getEnvMap(self.a);
+        errdefer env.deinit();
+        try env.put("PATH", bin);
         return env;
     }
 
@@ -438,7 +468,7 @@ test "integration: no backend (a) enforcing jail + default on_no_backend exits 1
     var s = try Scenario.init(a);
     defer s.deinit();
 
-    try s.writeConfig("", "nftables");
+    try s.writeConfig("", true);
 
     var r = try s.runDaemonToExit(null);
     defer r.deinit(a);
@@ -456,7 +486,7 @@ test "integration: no backend (a') on_no_backend = \"fail-closed\" is the same a
     var s = try Scenario.init(a);
     defer s.deinit();
 
-    try s.writeConfig("on_no_backend = \"fail-closed\"", "nftables");
+    try s.writeConfig("on_no_backend = \"fail-closed\"", true);
 
     var r = try s.runDaemonToExit(null);
     defer r.deinit(a);
@@ -471,7 +501,7 @@ test "integration: no backend (b) on_no_backend = \"log-only\" stays up DEGRADED
     var s = try Scenario.init(a);
     defer s.deinit();
 
-    try s.writeConfig("on_no_backend = \"log-only\"", "nftables");
+    try s.writeConfig("on_no_backend = \"log-only\"", true);
 
     const d = try LiveDaemon.start(a, s.config_path, null);
     defer d.destroy(a);
@@ -483,6 +513,7 @@ test "integration: no backend (b) on_no_backend = \"log-only\" stays up DEGRADED
         return error.TestDaemonDidNotStart;
     };
     try testing.expect(d.waitForStderr("no usable backend", log_wait_ms));
+    try testing.expect(d.waitForStderr("native ingestion: healthy", log_wait_ms));
     {
         const early = try d.sink.snapshot(a);
         defer a.free(early);
@@ -527,7 +558,7 @@ test "integration: no backend (c) all-log-only config runs non-root with Protect
     var s = try Scenario.init(a);
     defer s.deinit();
 
-    try s.writeConfig("", "log-only");
+    try s.writeConfig("", false);
 
     const d = try LiveDaemon.start(a, s.config_path, null);
     defer d.destroy(a);
@@ -540,6 +571,7 @@ test "integration: no backend (c) all-log-only config runs non-root with Protect
     };
 
     try testing.expect(d.waitForStderr("firewall: every enabled jail is log-only; backend detection skipped", log_wait_ms));
+    try testing.expect(d.waitForStderr("native: ready; all readiness components verified", log_wait_ms));
 
     const status = try s.httpStatus();
     defer a.free(status);
@@ -591,7 +623,7 @@ test "integration: forced backend (d) firewall = \"iptables\" off PATH + default
     var s = try Scenario.initAnyUid(a);
     defer s.deinit();
 
-    try s.writeConfig("firewall = \"iptables\"", "nftables");
+    try s.writeConfig("firewall = \"iptables\"", true);
     var env = try s.emptyPathEnv();
     defer env.deinit();
 
@@ -608,12 +640,34 @@ test "integration: forced backend (d) firewall = \"iptables\" off PATH + default
     try testing.expect(!hasErrorReturnTrace(r.stderr));
 }
 
+test "integration: present but unusable command backend refuses before state or socket creation (BUG-037)" {
+    const a = testing.allocator;
+    var s = try Scenario.init(a);
+    defer s.deinit();
+
+    try s.writeConfig("firewall = \"iptables\"", true);
+    var env = try s.presentCommandEnv();
+    defer env.deinit();
+    var r = try s.runDaemonToExit(&env);
+    defer r.deinit(a);
+
+    try testing.expectEqual(@as(?u8, 1), r.exitCode());
+    try expectContains(r.stderr, "firewall backend: iptables selected (forced by config)");
+    try expectSummaryLine(r.stderr, "refusing to run unprotected");
+    const state_path = try s.statePath();
+    defer a.free(state_path);
+    try testing.expectError(error.FileNotFound, std.fs.cwd().access(state_path, .{}));
+    try testing.expectError(error.FileNotFound, std.fs.cwd().access(s.socket_path, .{}));
+    try s.expectMetricsPortRefused();
+    try testing.expect(!hasErrorReturnTrace(r.stderr));
+}
+
 test "integration: forced backend (d') firewall = \"nftables\" unprivileged + default policy exits 1 with the netlink cause, no fallback (ENH-007)" {
     const a = testing.allocator;
     var s = try Scenario.init(a);
     defer s.deinit();
 
-    try s.writeConfig("firewall = \"nftables\"", "nftables");
+    try s.writeConfig("firewall = \"nftables\"", true);
 
     var r = try s.runDaemonToExit(null);
     defer r.deinit(a);
@@ -623,8 +677,81 @@ test "integration: forced backend (d') firewall = \"nftables\" unprivileged + de
     try expectContains(r.stderr, "firewall: no usable backend (forced by config) (netlink denied");
     try expectContains(r.stderr, "); refusing to run unprotected");
     try expectNotContains(r.stderr, "selected");
+    const state_path = try s.statePath();
+    defer a.free(state_path);
+    try testing.expectError(error.FileNotFound, std.fs.cwd().access(state_path, .{}));
+    try testing.expectError(error.FileNotFound, std.fs.cwd().access(s.socket_path, .{}));
     try s.expectMetricsPortRefused();
     try testing.expect(!hasErrorReturnTrace(r.stderr));
+}
+
+test "integration: log-only backend fallback preserves retry generation across same-state restart (BUG-037)" {
+    const a = testing.allocator;
+    var s = try Scenario.initAnyUid(a);
+    defer s.deinit();
+
+    try s.writeConfig("firewall = \"ipset\"\non_no_backend = \"log-only\"", true);
+    var env = try s.emptyPathEnv();
+    defer env.deinit();
+
+    {
+        const first = try LiveDaemon.start(a, s.config_path, &env);
+        defer first.destroy(a);
+        try first.waitForSocket(s.socket_path, startup_timeout_ms);
+        std.time.sleep(settle_ms * std.time.ns_per_ms);
+        for (attacker_lines) |line| try s.appendLogLine(line);
+        try testing.expect(first.waitForStderr("would-ban: jail='sshd' ip=192.0.2.42", log_wait_ms));
+        try testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, try first.stop());
+    }
+
+    const second = try LiveDaemon.start(a, s.config_path, &env);
+    defer second.destroy(a);
+    try second.waitForSocket(s.socket_path, startup_timeout_ms);
+    try testing.expect(second.waitForStderr("native ingestion: healthy", log_wait_ms));
+    const text = try second.sink.snapshot(a);
+    defer a.free(text);
+    try expectNotContains(text, "RetryGenerationMismatch");
+    try expectNotContains(text, "SourceGenerationMismatch");
+    try testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, try second.stop());
+}
+
+test "integration: auto selection remains bound to persisted installation transport (BUG-037)" {
+    const a = testing.allocator;
+    var s = try Scenario.initAnyUid(a);
+    defer s.deinit();
+
+    var env = try s.emptyPathEnv();
+    defer env.deinit();
+    try s.writeConfig("firewall = \"iptables\"\non_no_backend = \"log-only\"\nmetrics_enabled = false", true);
+    {
+        const seed = try LiveDaemon.start(a, s.config_path, &env);
+        defer seed.destroy(a);
+        try seed.waitForSocket(s.socket_path, startup_timeout_ms);
+        try testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, try seed.stop());
+    }
+
+    const state_path = try s.statePath();
+    defer a.free(state_path);
+    const id = [_]u8{0x37} ** 16;
+    const selector = try std.fmt.allocPrint(a, "/proc/{d}/ns/net", .{linux.getpid()});
+    defer a.free(selector);
+    const installation = try engine.native_effect_mod.Installation.init(id, .iptables, selector);
+    {
+        var store = try engine.native_store_mod.Store.open(a, state_path);
+        defer store.close();
+        try store.admitInstallation(installation, .{ .selector = selector, .disposition = .verified_absent });
+    }
+
+    try s.writeConfig("on_no_backend = \"log-only\"", true);
+    const daemon = try LiveDaemon.start(a, s.config_path, &env);
+    defer daemon.destroy(a);
+    try daemon.waitForSocket(s.socket_path, startup_timeout_ms);
+    try testing.expect(daemon.waitForStderr("iptables not usable", log_wait_ms));
+    const status = try s.httpStatus();
+    defer a.free(status);
+    try expectContains(status, "\"protection_cause\":\"IptablesUnavailable\"");
+    try expectNotContains(status, "PermissionDenied");
+    try testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, try daemon.stop());
 }
 
 test "integration: forced backend (e) firewall = \"ipset\" off PATH + on_no_backend = \"log-only\" runs DEGRADED (IpsetUnavailable) on IPC and /api/status (ENH-007)" {
@@ -632,7 +759,7 @@ test "integration: forced backend (e) firewall = \"ipset\" off PATH + on_no_back
     var s = try Scenario.initAnyUid(a);
     defer s.deinit();
 
-    try s.writeConfig("firewall = \"ipset\"\non_no_backend = \"log-only\"", "nftables");
+    try s.writeConfig("firewall = \"ipset\"\non_no_backend = \"log-only\"", true);
     var env = try s.emptyPathEnv();
     defer env.deinit();
 
@@ -646,6 +773,7 @@ test "integration: forced backend (e) firewall = \"ipset\" off PATH + on_no_back
         return error.TestDaemonDidNotStart;
     };
     try testing.expect(d.waitForStderr("running DEGRADED as log-only", log_wait_ms));
+    try testing.expect(d.waitForStderr("native ingestion: healthy", log_wait_ms));
     {
         const early = try d.sink.snapshot(a);
         defer a.free(early);
@@ -685,10 +813,14 @@ test "integration: forced backend (e) firewall = \"ipset\" off PATH + on_no_back
 }
 
 const userns_status_script =
+    \\sed -i "s#^firewall_namespace = .*#firewall_namespace = \"/proc/$$/ns/net\"#" "$4"
     \\"$1" --foreground --config "$4" & p=$!
     \\i=0
     \\while :; do
-    \\  if out=$("$2" --socket "$3" status 2>&1); then rc=0; break; else rc=$?; fi
+    \\  if out=$("$2" --socket "$3" status 2>&1); then
+    \\    case "$out" in *"Protection:  active"*) rc=0; break;; esac
+    \\    rc=1
+    \\  else rc=$?; fi
     \\  i=$((i + 1))
     \\  if [ "$i" -ge 100 ]; then break; fi
     \\  sleep 0.05
@@ -714,7 +846,7 @@ test "integration: forced backend (f) firewall = \"nftables\" in an owned netns 
     std.fs.cwd().access(client_path, .{}) catch return error.SkipZigTest;
     if (!unprivilegedNetnsAvailable(a)) return error.SkipZigTest;
 
-    try s.writeConfig("firewall = \"nftables\"", "nftables");
+    try s.writeConfig("firewall = \"nftables\"", true);
 
     const argv = [_][]const u8{ "unshare", "-Urn", "sh", "-c", userns_status_script, "sh", daemon_path, client_path, s.socket_path, s.config_path };
     var r = try runToExit(a, &argv, null);
@@ -745,7 +877,7 @@ test "integration: metrics_enabled = false (g) binds no HTTP listener, logs http
     var s = try Scenario.initAnyUid(a);
     defer s.deinit();
 
-    try s.writeConfig("metrics_enabled = false", "log-only");
+    try s.writeConfig("metrics_enabled = false", false);
 
     const d = try LiveDaemon.start(a, s.config_path, null);
     defer d.destroy(a);
@@ -757,6 +889,7 @@ test "integration: metrics_enabled = false (g) binds no HTTP listener, logs http
         return error.TestDaemonDidNotStart;
     };
     try testing.expect(d.waitForStderr("running; backend=none;", log_wait_ms));
+    try testing.expect(d.waitForStderr("native: ready; all readiness components verified", log_wait_ms));
     {
         const early = try d.sink.snapshot(a);
         defer a.free(early);

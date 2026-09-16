@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Read-only activation checks precede SQLite creation and IPC unlink. The
-//! protected parent and held inode lock remain required throughout operation.
 const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("native.zig");
@@ -39,7 +37,6 @@ pub fn validate(a: std.mem.Allocator, cfg: *const config.Config) !void {
         error.FileNotFound => null,
         else => return err,
     };
-    // A stale socket may be removed; no regular file or symlink is disposable.
     if (stat) |value| if (!std.posix.S.ISSOCK(value.mode) or value.uid != std.os.linux.geteuid()) return error.UnsafeNativeSocket;
     var parent = try std.fs.cwd().openDir(std.fs.path.dirname(socket) orelse ".", .{ .no_follow = true });
     defer parent.close();
@@ -52,8 +49,6 @@ pub fn validate(a: std.mem.Allocator, cfg: *const config.Config) !void {
         if (try same(a, socket, sidecar)) return error.NativePathAlias;
     }
     for (cfg.jails) |jail| for (jail.logpath) |path| {
-        // Missing nested source directories are repaired by ingestion. Existing
-        // or directly creatable paths still receive complete alias checks.
         for ([_][]const u8{ socket, cfg.global.state_file }) |target| {
             const aliases = same(a, path, target) catch |err| switch (err) {
                 error.FileNotFound => false,
@@ -63,13 +58,17 @@ pub fn validate(a: std.mem.Allocator, cfg: *const config.Config) !void {
         }
     };
 }
-fn openState(path: []const u8) !std.posix.fd_t {
+const StateOpen = enum { existing, absent };
+
+fn openState(path: []const u8, mode: StateOpen) !std.posix.fd_t {
     const terminated = try std.posix.toPosixPath(path);
-    // Zig 0.14.1 posix.open maps EROFS to Unexpected. Preserve the actual
-    // storage cause while using the same libc/large-file ABI and one open FD.
     const open = if (builtin.link_libc and (builtin.abi.isGnu() or builtin.abi.isAndroid())) std.posix.system.open64 else std.posix.system.open;
     while (true) {
-        const result = open(&terminated, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(std.posix.mode_t, 0o600));
+        const flags: std.posix.O = switch (mode) {
+            .existing => .{ .ACCMODE = .RDWR, .CLOEXEC = true, .NOFOLLOW = true },
+            .absent => .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true },
+        };
+        const result = open(&terminated, flags, @as(std.posix.mode_t, 0o600));
         switch (std.posix.errno(result)) {
             .SUCCESS => return @intCast(result),
             .INTR => continue,
@@ -98,25 +97,49 @@ fn openState(path: []const u8) !std.posix.fd_t {
     }
 }
 
-pub fn lockState(path: []const u8) !std.fs.File {
+fn validateStateParent(path: []const u8) !void {
     if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidNativePath;
     var parent = try std.fs.cwd().openDir(std.fs.path.dirname(path) orelse ".", .{ .no_follow = true });
     defer parent.close();
     const p = try std.posix.fstat(parent.fd);
     if (p.uid != std.os.linux.geteuid() or p.mode & 0o022 != 0) return error.UnsafePermissions;
-    const file = std.fs.File{ .handle = try openState(path) };
+}
+
+fn validateAndLockState(file: std.fs.File) !std.fs.File {
     errdefer file.close();
     const stat = try std.posix.fstat(file.handle);
     if (!std.posix.S.ISREG(stat.mode) or stat.uid != std.os.linux.geteuid() or stat.mode & 0o077 != 0) return error.UnsafePermissions;
     if (!try file.tryLock(.exclusive)) return error.NativeAuthorityAlreadyRunning;
-    // SQLite can recover/delete a journal or initialize shared memory even
-    // before reporting NOTADB. Reject foreign formats through the held lock FD
-    // first; opening/closing another FD later would release SQLite POSIX locks.
     var header: [16]u8 = undefined;
     const length = try file.preadAll(&header, 0);
     if (std.mem.startsWith(u8, header[0..length], "F2ZS")) return error.NativeStateMigrationRequired;
     if (length != 0 and !std.mem.eql(u8, header[0..length], "SQLite format 3\x00")) return error.CorruptDatabase;
     return file;
+}
+
+pub fn lockStateIfPresent(path: []const u8) !?std.fs.File {
+    try validateStateParent(path);
+    const fd = openState(path, .existing) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    return try validateAndLockState(.{ .handle = fd });
+}
+
+pub fn lockAbsentState(path: []const u8) !std.fs.File {
+    try validateStateParent(path);
+    return validateAndLockState(.{ .handle = openState(path, .absent) catch |err| switch (err) {
+        error.PathAlreadyExists => return error.NativeStateChanged,
+        else => return err,
+    } });
+}
+
+pub fn lockState(path: []const u8) !std.fs.File {
+    if (try lockStateIfPresent(path)) |file| return file;
+    return lockAbsentState(path) catch |err| switch (err) {
+        error.NativeStateChanged => (try lockStateIfPresent(path)) orelse return error.NativeStateChanged,
+        else => return err,
+    };
 }
 
 test "native: state format admission precedes SQLite sidecar recovery" {
@@ -141,8 +164,6 @@ test "native: state format admission precedes SQLite sidecar recovery" {
         defer a.free(retained);
         try std.testing.expectEqualStrings(fixture[0], retained);
     }
-    // The format check is only admission; SQLite still validates application,
-    // schema and content after this exact signature.
     const file = try tmp.dir.createFile("state", .{ .mode = 0o600 });
     try file.writeAll("SQLite format 3\x00");
     file.close();

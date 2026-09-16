@@ -96,9 +96,6 @@ const FilteredScan = struct {
     more: bool,
 };
 
-/// Drives the same storage cursor contract used by the daemon's bounded
-/// filtered reader. Query rendering and its empty-page cursor are covered in
-/// native_query_tests; this helper keeps the SQLite-backed half observable.
 fn scanFilteredHistory(store: *durable.Store, installation: effects.Installation, jail: []const u8, after_sequence: u64, limit: usize, max_pages: usize) !FilteredScan {
     var rows: [history.max_page]history.Event = undefined;
     var after = after_sequence;
@@ -181,9 +178,6 @@ test "native effect history store: large filtered scans stop at the page budget 
         .lease = .permanent,
         .decided_us = 100,
     }, clock.value());
-    // 1,024 non-matches fill the daemon's 16-page scan budget. The only
-    // matching row is the next durable sequence. Generate canonical event IDs
-    // so the store's provenance validation remains active in this fixture.
     var statement = std.ArrayList(u8).init(t.allocator);
     defer statement.deinit();
     try statement.appendSlice("INSERT INTO confirmed_effect_events(event_id,scope_key,jail,decision_id,confirmed_us) VALUES");
@@ -217,7 +211,7 @@ test "native effect history store: application detail pages aggregates and polic
     var f = try Fixture.init();
     defer f.deinit();
     var clock = Clock{};
-    _ = try f.confirm(11, &clock); // Pre-schema-17 event has explicit absent detail.
+    _ = try f.confirm(11, &clock);
     try f.store.enableConfirmedHistory();
     try f.store.enableMaintenance();
     try f.store.enableCleanup();
@@ -273,7 +267,7 @@ test "native effect history store: application detail pages aggregates and polic
 
     var aggregates: [65]application.Aggregate = undefined;
     const aggregate = try f.store.applicationHistoryAggregates(f.installation, .{ .range = .{ .from_us = 100, .to_us = 101 } }, &aggregates);
-    try t.expectEqual(@as(usize, 3), aggregate.count); // overall + native + ssh
+    try t.expectEqual(@as(usize, 3), aggregate.count);
     try t.expectEqual(@as(u64, 2), aggregates[0].confirmed);
     try t.expectEqual(@as(?i64, 100), aggregates[0].first_confirmed_us);
     try t.expectEqual(@as(?i64, 100), aggregates[0].latest_confirmed_us);
@@ -586,8 +580,8 @@ test "native effect history store: retention is consumed-prefix bounded rollback
     try f.store.commitConfirmedHistory(owner.manifest(), try pinned_stage.batch(clock.value()), pinned_page.token);
     pinned_stage.publish();
     pinned_stage.release();
-    try t.expect(try f.store.cleanupConfirmedHistoryOne(.{ .age_us = 0, .max_matches = 0 }, clock.now)); // optional detail
-    try t.expect(!try f.store.cleanupConfirmedHistoryOne(.{ .age_us = 0, .max_matches = 0 }, clock.now)); // permanent core owner
+    try t.expect(try f.store.cleanupConfirmedHistoryOne(.{ .age_us = 0, .max_matches = 0 }, clock.now));
+    try t.expect(!try f.store.cleanupConfirmedHistoryOne(.{ .age_us = 0, .max_matches = 0 }, clock.now));
 }
 
 test "native effect history store: only first qualified receipt appends and repair replay is stable" {
@@ -646,7 +640,7 @@ test "native effect history store: canonical bootstrap atomic consume rollback a
     f.store.fail_at = null;
     const committed = try owner.prepare(input, events[0..input.count], 100);
     try f.store.commitConfirmedHistory(owner.manifest(), try committed.batch(clock.value()), input.token);
-    committed.release(); // process death before in-memory publication
+    committed.release();
     try f.reopen();
     var snapshot = try f.store.consumerManifestSnapshot(t.allocator, owner.manifest());
     defer snapshot.deinit(t.allocator);

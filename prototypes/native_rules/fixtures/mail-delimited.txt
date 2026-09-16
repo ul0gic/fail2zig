@@ -1,4 +1,0 @@
-warning: peer[192.0.2.42]: authentication failed
-warning: peer[2001:db8::42]: authentication failed
-warning: peer[192.0.2.42]: authentication succeeded
-notice: mail queue drained

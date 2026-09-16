@@ -91,7 +91,6 @@ test "native reload: generation-bound jail keys, added/removed jails and globals
     const out = reload.classify(&current, &added, 64);
     try t.expectEqual(reload.Kind.restart_required, out.kind);
     try t.expect(std.mem.indexOf(u8, out.reasonSlice()[0].slice(), "set size") != null);
-    // A restart-required proposal never carries live policy changes even if some keys were live.
     const mixed = try parse(a, try std.mem.replaceOwned(u8, a, try edited(a, "maxretry = 3", "maxretry = 2"), "filter = \"sshd\"", "filter = \"vsftpd\""));
     const mixed_out = reload.classify(&current, &mixed, 64);
     try t.expectEqual(reload.Kind.restart_required, mixed_out.kind);

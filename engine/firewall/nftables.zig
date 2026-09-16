@@ -49,7 +49,6 @@ pub const NFTA_HOOK = struct {
     pub const PRIORITY: u16 = 2;
 };
 
-// Kernel ABI: TIMEOUT is 11; 10 is NFTA_SET_ID and the kernel silently accepts it with no timeout.
 pub const NFTA_SET = struct {
     pub const TABLE: u16 = 1;
     pub const NAME: u16 = 2;
@@ -68,7 +67,6 @@ pub const NFTA_SET_ELEM_LIST = struct {
 
 pub const NFTA_LIST_ELEM: u16 = 1;
 
-// Kernel ABI: TIMEOUT is 4; 6 is USERDATA and yields untimed elements with garbage comments.
 pub const NFTA_SET_ELEM = struct {
     pub const KEY: u16 = 1;
     pub const TIMEOUT: u16 = 4;
@@ -288,7 +286,6 @@ pub fn buildTablePayload(
     return buf[0..offset];
 }
 
-/// Read-only native set query; no implicit table creation or reset.
 pub fn buildSetQueryPayload(buf: []u8, table_name: []const u8, set_name: []const u8) netlink.Error![]const u8 {
     if (buf.len < @sizeOf(netlink.nfgenmsg)) return error.BufferTooSmall;
     const header = netlink.nfgenmsg{ .nfgen_family = netlink.NFPROTO.INET, .version = 0, .res_id = 0 };
@@ -301,7 +298,7 @@ pub fn buildSetQueryPayload(buf: []u8, table_name: []const u8, set_name: []const
 
 pub fn buildOwnedTablePayload(buf: []u8, table_name: []const u8, marker: []const u8) netlink.Error![]const u8 {
     const base = try buildTablePayload(buf, netlink.NFPROTO.INET, table_name);
-    const end = try appendAttr(buf, base.len, 6, marker); // NFTA_TABLE_USERDATA
+    const end = try appendAttr(buf, base.len, 6, marker);
     return buf[0..end];
 }
 
@@ -727,8 +724,6 @@ pub fn probeReason() ProbeResult {
     defer sock.close();
     sock.setRecvTimeout(PROBE_RECV_TIMEOUT_MS) catch return .transient;
 
-    // Opening the socket succeeds without CAP_NET_ADMIN; nfnetlink gates every message on it,
-    // so a read-only GETGEN round-trip is what actually proves the backend is usable.
     var msg_buf: [64]u8 = undefined;
     var builder = netlink.MessageBuilder.init(&msg_buf);
     const seq = sock.nextSeq();
@@ -755,7 +750,6 @@ pub fn probeReasonFromInitError(err: netlink.Error) ProbeResult {
     };
 }
 
-/// EINVAL on GETGEN means nfnetlink is present but the nf_tables subsystem could not be loaded.
 pub fn probeReasonFromAckError(err: netlink.Error) ProbeResult {
     return switch (err) {
         error.PermissionDenied => .permission_denied,

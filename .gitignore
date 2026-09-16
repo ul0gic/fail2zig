@@ -1,33 +1,26 @@
-# Local-only workflow + planning dirs (not committed)
 .claude/
 .project/
 
-# Build artifacts
 zig-out/
 zig-cache/
 .zig-cache/
 
-# Logs
 *.log
 
-# Editor / OS cruft
 .DS_Store
 *.o
 *.d
 *.swp
 
-# Editors / IDEs
 .vscode/*
 !.vscode/settings.json
 !.vscode/extensions.json
 .idea/
 
-# Agent / MCP debug artifacts dropped at repo root
 .playwright-mcp/
 /*.png
 Screenshot*.png
 Screenshot*.jpg
 Screenshot*.jpeg
 
-# Secrets
 .env

@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 
-/// All slices are borrowed for the duration of the callback. A successful return
-/// means disposition, correlated state and resume position committed together.
-/// Errors MUST leave the source position unacknowledged for retry.
 pub const Predecoded = struct {
     text: []const u8,
     codec: []const u8,
@@ -18,8 +15,6 @@ pub const Predecoded = struct {
     raw_hash: [32]u8,
 };
 pub const Framed = struct { consumed: usize, decoded: Predecoded };
-/// Result slices are allocated in the supplied per-poll arena. Null means
-/// incomplete input and never acknowledges a source position or codec state.
 pub const FrameCallback = *const fn ([]const u8, []const u8, bool, @import("std").mem.Allocator, ?*anyopaque) anyerror!?Framed;
 
 pub const JournalField = struct { name: []const u8, value: []const u8 };
@@ -34,8 +29,6 @@ pub const Record = struct {
     raw_hash: [32]u8,
     predecoded: ?Predecoded = null,
     timestamp_us: ?u64 = null,
-    /// First durably accepted ingestion observation, supplied by the native
-    /// pipeline before preparation. This is distinct from journal event time.
     receipt_time: ?@import("native_time.zig").Timestamp = null,
     journal_fields: ?[]const JournalField = null,
     journal_monotonic_us: ?u64 = null,

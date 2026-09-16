@@ -35,8 +35,6 @@ pub const migration_snapshot_mod = @import("migration/sqlite_snapshot.zig");
 pub const migration_fixture_mod = @import("migration/fail2ban_fixture.zig");
 pub const migrate_cli_mod = @import("cli/migrate.zig");
 pub const rule_test_cli_mod = @import("cli/rule_test.zig");
-/// Client modules of the same executable, exposed so integration tests can drive typed
-/// administration without a separate binary.
 pub const cli_mod = cli;
 pub const filter_types_mod = @import("filters/types.zig");
 pub const filter_sshd_mod = @import("filters/sshd.zig");
@@ -74,15 +72,11 @@ pub const CliOptions = struct {
     foreground: bool = true,
 };
 
-/// Which runtime path the one delivered executable takes for an argument vector (argv[0] excluded).
 pub const EntryMode = enum { daemon, operator, migrate, rule_test };
 
 const operator_words = [_][]const u8{ "status", "jails", "list", "ban", "unban", "reload", "version", "help", "completions" };
 const operator_globals = [_][]const u8{ "--socket", "--output", "--no-color", "--timeout" };
 
-/// The first token decides: an operator spelling or operator global selects the administration
-/// path with the complete vector; everything else (including the explicit `daemon` word) is the
-/// daemon/local path. Mixing daemon flags with operator spellings is a usage error there.
 pub fn classifyEntry(args: []const []const u8) EntryMode {
     if (args.len == 0) return .daemon;
     const first = args[0];
@@ -96,8 +90,6 @@ pub fn classifyEntry(args: []const []const u8) EntryMode {
     return .daemon;
 }
 
-/// Administration outcomes map onto the native exit classes; 4/5 come only from typed
-/// administration, never from the retained client paths.
 pub fn exitClassForClient(code: cli.ExitCode) shared.ExitClass {
     return switch (code) {
         .success => .success,
@@ -442,14 +434,12 @@ test "cli: config load error appends the diag hint for metrics_port = 0 (ENH-008
     );
 }
 
-// OutOfMemory is the one startup failure that is not a known fail-closed cause, so it keeps its error-return-trace.
 fn failClosed(err: anytype, comptime fmt: []const u8, args: anytype) @TypeOf(err) {
     std.log.err(fmt, args);
     const any: anyerror = err;
     switch (any) {
         error.OutOfMemory => return err,
         else => {
-            // A file log target is ring-buffered; exit skips the daemon's drain.
             if (@import("native_daemon.zig").log_sink) |sink| sink.drain();
             std.process.exit(shared.ExitClass.rejected.code());
         },
@@ -490,7 +480,6 @@ fn fsMagicOfDir(dir: []const u8) ?i64 {
     if (dir.len >= path_buf.len) return null;
     @memcpy(path_buf[0..dir.len], dir);
     path_buf[dir.len] = 0;
-    // struct statfs is at most 120 bytes on every supported arch and f_type is always its first field.
     var statfs_buf: [256]u8 align(8) = undefined;
     const rc = linux.syscall2(.statfs, @intFromPtr(&path_buf), @intFromPtr(&statfs_buf));
     if (linux.E.init(rc) != .SUCCESS) return null;

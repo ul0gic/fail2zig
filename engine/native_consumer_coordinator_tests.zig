@@ -444,7 +444,6 @@ test "native coordinator: failed outer preparation cannot reuse completion clock
     try f.coordinator.provideImmediate(completion, f.clock.ms, f.clock.us);
     const record = f.input(host_failure, "one").record;
     _ = try f.coordinator.processingTime(record, f.clock.us);
-    // An outer time/counter failure can occur before coordinator.prepare.
     try t.expectError(error.ConsumerExpired, f.coordinator.processingTime(record, f.clock.us));
     try t.expect(f.coordinator.immediate == null);
 }

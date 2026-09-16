@@ -88,9 +88,6 @@ pub fn runBounded(allocator: std.mem.Allocator, argv: []const []const u8, timeou
         };
         _ = std.posix.poll(&pollers, 10) catch return error.SystemError;
     }
-    // Zig0.14.1 Child reports pre-exec failures as one little-endian u64.
-    // Never call its blocking waitForSpawn after our bounded wait: even a
-    // retained writer must produce a bounded failure rather than hold us.
     if (child.err_pipe) |fd| try checkSpawnPipe(fd);
     const code = if (std.posix.W.IFEXITED(status.?)) std.posix.W.EXITSTATUS(status.?) else return error.SystemError;
     const stdout = buffers[0].toOwnedSlice() catch return error.OutOfMemory;

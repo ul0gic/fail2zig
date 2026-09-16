@@ -1,1 +1,0 @@
-{"id":"session-auth","source":"auth-log","format":"json","subject":"client","conditions":[{"field":"event","text":"auth_failed"}],"correlation":{"key":"session","phase":"event","start":"connected","finish":"auth_failed","ttl_seconds":30}}

@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Bounded native action-target identity and outcome types. Dispatch remains in
-//! typed callers; this module contains no provider, command or network logic.
 const std = @import("std");
 const detection = @import("native_detection_record.zig");
 

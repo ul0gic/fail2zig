@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Deterministic migration plans built from a read-only inspection plus an
-//! optional captured snapshot, with drift, staleness and blocker validation.
-//! Nothing here mutates the source tree, the snapshot or any service.
 const std = @import("std");
 const inspect = @import("inspect.zig");
 const fail2ban = @import("../config/fail2ban.zig");
@@ -53,9 +50,6 @@ pub const Blocker = struct { group: []const u8, kind: []const u8, reason: []cons
 pub const FileFingerprint = struct { path: []const u8, sha256: []const u8 };
 pub const Drift = struct { files: []const FileFingerprint, runtime_socket: []const u8, runtime_state: []const u8 };
 
-/// Serialized form; field order is the on-disk key order. `digest` is the
-/// SHA-256 of this document rendered with an empty digest, so any edit to the
-/// file is detected on read. It is an integrity check, not authentication.
 pub const Document = struct {
     schema_version: u32 = schema_version,
     tool_version: []const u8,
@@ -81,7 +75,6 @@ pub const Document = struct {
 pub const Plan = struct {
     arena: std.heap.ArenaAllocator,
     doc: Document,
-    /// SHA-256 of the file bytes when read from disk; null for a freshly built plan.
     plan_fp: ?[32]u8,
 
     pub fn deinit(self: *Plan) void {
@@ -186,7 +179,6 @@ const Builder = struct {
         }
     }
 
-    /// Secret-bearing keys are named by path only; values never enter the plan.
     fn collectSecretBoundaries(self: *Builder) Error!void {
         const ini = fail2ban.loadJailConfig(self.a, self.options.source_dir) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -374,7 +366,6 @@ pub fn renderTable(p: *const Plan, writer: anytype) !void {
     try writer.print("digest: {s}\n", .{d.digest});
 }
 
-/// Exclusive create of a 0600 temporary sibling, then rename over `path`.
 pub fn writePlanFile(p: *const Plan, path: []const u8) Error!void {
     var buf = std.ArrayListUnmanaged(u8){};
     defer buf.deinit(p.arena.child_allocator);
@@ -439,7 +430,6 @@ pub const Validation = struct {
     }
 };
 
-/// Outcome precedence: stale, then drifted, then blocked; reasons list everything found.
 pub fn validate(allocator: std.mem.Allocator, p: *const Plan, options: ValidateOptions) Error!Validation {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     errdefer arena_state.deinit();

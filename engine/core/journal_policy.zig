@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Effective journal arguments before opening any journal. Environment paths and
-//! readability are explicit captured inputs, allowing deterministic preparation.
 const std = @import("std");
 const config = @import("../config/fail2ban.zig");
 const matching = @import("durable_file_source.zig");
@@ -11,7 +9,6 @@ const runtime_only: u8 = 2;
 const system_only: u8 = 4;
 const current_user: u8 = 8;
 
-/// Pure prepared selector values; validation never loads or opens a reader.
 pub const Selection = struct {
     flags: u32 = 4,
     namespace: ?[]const u8 = null,
@@ -58,7 +55,6 @@ pub const Selection = struct {
 
 pub const Options = struct {
     path: ?[]const u8 = null,
-    /// Already split journalfiles list. Null means the argument was absent.
     files: ?[]const []const u8 = null,
     flags: ?[]const u8 = null,
     rotated: []const u8 = "0",
@@ -73,8 +69,6 @@ pub const Environment = struct {
     context: ?*anyopaque = null,
     max_files: usize = 4096,
 };
-/// Presence and null are retained separately because _getJournalArgs exposes both.
-/// All returned storage belongs to the caller's arena.
 pub const Prepared = struct {
     flags_present: bool = false,
     flags: ?[]const u8 = null,
@@ -90,7 +84,6 @@ pub const Prepared = struct {
     }
 
     pub fn selection(self: Prepared, matches: []const []const u8) !Selection {
-        // python-systemd's Reader chooses LOCAL_ONLY only when path/files are None.
         const flags: i64 = if (self.flags) |text| std.fmt.parseInt(i64, text, 10) catch return error.InvalidFlags else (if (self.path == null and self.files == null) local_only else 0);
         if (flags < 0 or flags > std.math.maxInt(c_int)) return error.InvalidFlags;
         if (self.path == null) if (self.files) |paths| if (paths.len == 0) return error.EmptyJournalFiles;
@@ -107,7 +100,6 @@ fn parseFlags(allocator: Allocator, value: []const u8) ![]const u8 {
     try validateString(value);
     return (try config.canonicalInteger(allocator, value)) orelse error.InvalidFlags;
 }
-/// Python bit tests on arbitrarily large integers only require these low bits.
 fn flagBits(value: []const u8) u8 {
     var modulo: u8 = 0;
     for (value) |digit| {
@@ -127,7 +119,6 @@ fn boolValue(value: []const u8) bool {
     return std.ascii.eqlIgnoreCase(value, "1") or std.ascii.eqlIgnoreCase(value, "on") or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "yes");
 }
 
-/// String journalfiles syntax splits commas and Unicode whitespace, like splitwords.
 pub fn splitFiles(allocator: Allocator, text: []const u8) ![]const []const u8 {
     try validateString(text);
     var result = std.ArrayList([]const u8).init(allocator);
@@ -239,8 +230,6 @@ fn appendJournalPattern(allocator: Allocator, path: []const u8, leaf: []const u8
     }
 }
 
-/// Python nonrecursive glob semantics: include directories and broken symlinks,
-/// retain lexical relative paths, and suppress filesystem lookup errors.
 fn appendGlob(allocator: Allocator, pattern: []const u8, result: *std.ArrayList([]const u8), limit: usize) !void {
     if (pattern.len == 0) return;
     const remaining = std.mem.trimLeft(u8, pattern, "/");

@@ -509,8 +509,6 @@ test "native consumer manifest: all-jail generation preflight refuses before fre
     try t.expectError(error.RetryGenerationMismatch, f.store.validateRuntimeAdmissions(&bindings, null));
     try t.expectEqual(before, total_changes(@ptrCast(f.store.db)));
     try f.reopen();
-    // Returning to the original configuration still succeeds. A leaked first
-    // registration would be detected as an unconfigured durable owner here.
     try f.store.validateRuntimeAdmissions(&.{.{ .jail = "retained", .generation = retained, .policy = startup_policy }}, null);
     var compatible = bindings;
     compatible[1].generation = retained;
@@ -548,7 +546,6 @@ test "native consumer manifest: startup admission is invisible until commit and 
     defer observer.close();
     try f.store.beginStartupAdmission();
     try f.store.admitRetry("fresh", key.generation, policy);
-    // Expected absent-state reads roll back their own scope, not the proposal.
     try t.expectError(error.ConsumerManifestMissing, f.store.consumerManifestSnapshot(t.allocator, manifest));
     try t.expect(f.store.startupAdmissionActive());
     try observer.validateRuntimeOwnerNames(&.{"retained"});
@@ -564,7 +561,6 @@ test "native consumer manifest: startup admission is invisible until commit and 
     try f.store.beginStartupAdmission();
     try f.store.admitRetry("fresh", key.generation, policy);
     try f.store.bootstrapConsumerManifest(manifest, clock.batch(&changes));
-    // Record/effect/ordinary consumer writers cannot dispatch through this scope.
     try t.expectError(error.DatabaseFailure, f.store.commitRecord(basicRecord()));
     try t.expectError(error.DatabaseFailure, f.store.commitConsumerInput(manifest, clock.batch(&changes)));
     try f.store.finishStartupAdmission();
@@ -610,7 +606,6 @@ test "native consumer manifest: killed startup admission leaves no partial regis
         var changes = [_]consumer.Delta{delta(0)};
         store.bootstrapConsumerManifest(manifest, clock.batch(&changes)) catch std.process.exit(6);
         _ = std.posix.write(ready[1], "R") catch std.process.exit(7);
-        // The parent kills only after both registration scopes have succeeded.
         while (true) std.Thread.sleep(std.time.ns_per_s);
     }
     std.posix.close(ready[1]);
@@ -625,7 +620,6 @@ test "native consumer manifest: killed startup admission leaves no partial regis
     try t.expectEqual(@as(usize, 1), try std.posix.read(ready[0], &marker));
     try t.expectEqual(@as(u8, 'R'), marker[0]);
     try std.posix.kill(pid, std.posix.SIG.KILL);
-    // Reopen while the child is already terminated (zombie retains no FDs).
     _ = std.posix.waitpid(pid, 0);
     reaped = true;
     var restored = try durable.Store.open(t.allocator, path);

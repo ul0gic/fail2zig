@@ -133,7 +133,6 @@ test "native consumers: shared dependency conflicts and expiry after writes roll
     input.consumers.?.dependencies = &dependency;
     try std.testing.expectError(error.StaleConsumerCheckpoint, store.commitRecord(input));
     dependency[0].expected_revision = 1;
-    // A caller cannot omit the saved expiry to turn it into permanent validity.
     try std.testing.expectError(error.StaleConsumerCheckpoint, store.commitRecord(input));
     dependency[0].valid_until_us = 200;
     clock = .{ .now = 199, .advance = 1 };

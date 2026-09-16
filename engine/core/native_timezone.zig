@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Bounded TZif v2/v3 interpretation. No host-local timezone, POSIX rule
-//! evaluation, leap-second correction or mutable lookup during record processing.
 const std = @import("std");
 pub const version: u16 = 1;
 pub const max_file_bytes = 1024 * 1024;
@@ -59,7 +57,6 @@ const Block = struct {
     }
     fn read(allocator: std.mem.Allocator, cursor: *Cursor, header: Header, wide: bool) !Block {
         const width: usize = if (wide) 8 else 4;
-        // Validated count limits make arithmetic bounded even on 32-bit targets.
         const raw_times = try cursor.take(header.time_count * width);
         const indices = try cursor.take(header.time_count);
         const raw_types = try cursor.take(header.type_count * 6);
@@ -101,8 +98,6 @@ pub const Zone = struct {
     tail_present: bool,
     fixed: bool,
 
-    /// The input buffer may be released after return. The owner keeps only its
-    /// identifier and validated typed tables; every result includes its digest.
     pub fn parse(allocator: std.mem.Allocator, id: []const u8, bytes: []const u8, policy: Ambiguity) !Zone {
         try validateIdentifier(id);
         if (bytes.len > max_file_bytes) return error.TimezoneLimit;
@@ -146,7 +141,6 @@ pub const Zone = struct {
             .generation = generation,
             .ambiguity = policy,
             .tail_present = tail.len != 0,
-            // A no-transition file with a seasonal tail is not a fixed zone.
             .fixed = block.transitions.len == 0 and !block.types[0].unspecified and (tail.len == 0 or fixedTailOffset(tail) == block.types[0].offset_seconds),
         };
     }
@@ -165,8 +159,6 @@ pub const Zone = struct {
         var offset_late: i32 = 0;
         var in_range_candidate = false;
         var specified_offset = false;
-        // At most 256 candidate offsets, each with a bounded binary transition
-        // lookup. Duplicate offsets cannot create false fold ambiguity.
         for (self.types) |kind| {
             if (kind.unspecified) continue;
             specified_offset = true;
@@ -190,8 +182,6 @@ pub const Zone = struct {
             return .{ .utc_seconds = if (later) latest.? else early, .offset_seconds = if (later) offset_late else offset_early, .zone_digest = self.data_digest, .generation = self.generation, .ambiguity = self.ambiguity, .fold_selected = fold };
         }
         if (specified_offset and !in_range_candidate) return error.TimeOutOfRange;
-        // Gaps are recognized only between two covered explicit intervals.
-        // The first/last transitions are coverage edges, not guessed history.
         if (self.transitions.len >= 3) for (1..self.transitions.len - 1) |i| {
             const before = self.types[self.transitions[i - 1].type_index];
             const after = self.types[self.transitions[i].type_index];
@@ -209,8 +199,6 @@ pub const Zone = struct {
         return .{ .utc_us = utc_us, .provenance = selected };
     }
 
-    /// Exact covered offset for an already absolute UTC instant, used to find
-    /// the receipt's local calendar year without interpreting host locale.
     pub fn utcOffsetAt(self: *const Zone, utc_seconds: i64) !i32 {
         const kind = self.typeAt(utc_seconds) orelse return error.OutsideTimezoneCoverage;
         if (kind.unspecified) return error.OutsideTimezoneCoverage;
@@ -229,8 +217,6 @@ pub const Zone = struct {
         return self.types[self.transitions[low - 1].type_index];
     }
 
-    /// Each pathname component is opened relative to a pinned directory with
-    /// NOFOLLOW. Symlink aliases, including in-root aliases, are explicitly refused.
     pub fn load(allocator: std.mem.Allocator, trusted_root: []const u8, id: []const u8, policy: Ambiguity) !Zone {
         try validateIdentifier(id);
         if (!std.fs.path.isAbsolute(trusted_root) or trusted_root.len > 4096 or std.mem.indexOfScalar(u8, trusted_root, 0) != null) return error.UnsafeTimezonePath;
@@ -299,8 +285,6 @@ fn trustedStat(stat: std.posix.Stat, directory: bool) !void {
         stat.mode & 0o022 != 0 or (stat.uid != 0 and stat.uid != std.os.linux.geteuid())) return error.UntrustedTimezoneFile;
 }
 
-/// Parse only the fixed POSIX subset needed to prove no-transition fixed zones.
-/// Seasonal/rule tails remain uninterpreted and never extend explicit coverage.
 fn fixedTailOffset(tail: []const u8) ?i32 {
     var at: usize = 0;
     if (tail.len > 0 and tail[0] == '<') {

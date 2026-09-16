@@ -1,4 +1,0 @@
-{"remote":"192.0.2.10","status":401,"path":"/private/login"}
-{"remote":"192.0.2.10","status":200,"path":"/private/login"}
-{"remote":"192.0.2.10","status":401,"path":"/private/health"}
-{"remote":"192.0.2.10","status":401,"path":"/private-other/login"}

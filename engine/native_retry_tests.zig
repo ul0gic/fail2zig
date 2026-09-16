@@ -107,6 +107,36 @@ test "native retry: schema admission is atomic and cannot reset acknowledged his
     try t.expectError(error.RetryMigrationRequired, store.admitRetry("old", StoreFixture.generation, policy));
 }
 
+test "native retry: ephemeral enforcement suppression preserves configured generation and durable policy" {
+    var temp = t.tmpDir(.{});
+    defer temp.cleanup();
+    const root = try temp.dir.realpathAlloc(t.allocator, ".");
+    defer t.allocator.free(root);
+    const path = try std.fs.path.join(t.allocator, &.{ root, "state.sqlite" });
+    defer t.allocator.free(path);
+    var enforcing = policy;
+    enforcing.maxretry = 1;
+    enforcing.enforce = true;
+    {
+        var store = try durable.Store.open(t.allocator, path);
+        defer store.close();
+        try admitted(&store);
+        try store.admitRetry("ssh", StoreFixture.generation, enforcing);
+        var record = try StoreFixture.recordWith(&store, "ssh", "suppressed", 0, 100_000_000, ip, enforcing);
+        record.native_retry.?.suppress_enforcement = true;
+        try t.expectEqual(durable.CommitResult.committed, try store.commitRecord(record));
+        try t.expectEqual(@as(u64, 0), store.effect_publication_epoch);
+        var active: [2]durable.Store.ActiveDecision = undefined;
+        const summary = try store.retrySummary("ssh", 100_000_000, &active);
+        try t.expectEqual(@as(u64, 1), summary.decisions);
+        try t.expectEqual(@as(usize, 1), summary.active);
+        try store.validateRetry("ssh", StoreFixture.generation, enforcing);
+    }
+    var reopened = try durable.Store.open(t.allocator, path);
+    defer reopened.close();
+    try reopened.validateRetry("ssh", StoreFixture.generation, enforcing);
+}
+
 test "native retry: capacity and malformed persisted state cannot advance the record" {
     var temp = t.tmpDir(.{});
     defer temp.cleanup();
@@ -172,7 +202,7 @@ test "native retry: committed processing floor preserves receipts and pauses adm
     var pipe = processing.Pipeline{ .store = &store, .jail = "ssh", .ready = true, .processor = .{ .context = null, .prepare = Stub.prepare, .prepare_restore = Stub.restore }, .receipts = .{ .generation = StoreFixture.generation, .clock_context = &clock, .clock = Clock.read } };
     try t.expectError(error.ReceiptClockReversed, pipe.admit());
     clock.now = 101_000_000;
-    pipe.ready = true; // The real coordinator restores/validates before this point.
+    pipe.ready = true;
     try pipe.admit();
 }
 
@@ -308,8 +338,6 @@ test "native retry: SYS-029 literal native expectations and supported threshold 
         try t.expect(result.decision == null);
         state = result.state;
     }
-    // rate-retention/rate-threshold: t=0 is outside [1,601], so three
-    // literal occurrences remain and reference rate weighting is not imported.
     try t.expectEqual(@as(u16, 3), state.?.count);
     try t.expectEqual(@as(i64, 1), state.?.attempts[0].at_us);
 
@@ -319,7 +347,6 @@ test "native retry: SYS-029 literal native expectations and supported threshold 
     for ([_]i64{ 0, 1, 2, 900 }, 0..) |stamp, index| {
         state = (try retry.advance(decay, state, ip, attempt(stamp, @intCast(index)), stamp)).state;
     }
-    // rate-decay: only the literal t=900 occurrence remains in [300,900].
     try t.expectEqual(@as(u16, 1), state.?.count);
     try t.expectEqual(@as(?i64, 900), state.?.latestEventUs());
 

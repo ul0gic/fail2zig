@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Source event-time normalization. No wall-clock reads or integer truncation of timestamps.
 const std = @import("std");
 
-/// Bind this policy change into source/checkpoint configuration fingerprints.
 pub const policy_version: u16 = 2;
 
 pub const Error = error{ NonFiniteTime, InvalidWindow };
@@ -25,7 +23,6 @@ pub const Input = union(enum) {
     parsed: EventTime,
     missing,
     invalid,
-    /// A configured date pattern matched an empty timestamp, unlike no match.
     optional_empty,
 };
 pub const Origin = enum { parsed, recent_context, optional_now, missing_now, invalid_now, live_correction };
@@ -41,8 +38,6 @@ pub const Result = struct {
 };
 pub const Context = struct {
     last_date: ?EventTime = null,
-    /// Valid past event times use the retry window in every mode. The remaining
-    /// legacy future-time branches await their native policy conversion.
     pub fn normalize(self: *Context, input: Input, now: EventTime, window: f64, mode: Mode, check_findtime: bool) Error!Result {
         if (!std.math.isFinite(window) or window < 0) return error.InvalidWindow;
         _ = try EventTime.init(now.seconds);
@@ -57,8 +52,6 @@ pub const Context = struct {
                     if (!std.math.isFinite(oldest)) return error.NonFiniteTime;
                     const obsolete = value.seconds < oldest;
                     self.last_date = value;
-                    // Receipt time, startup/live mode and legacy replay switches
-                    // cannot turn expired evidence into a fresh attempt.
                     return .{
                         .disposition = if (obsolete) .obsolete else .accepted,
                         .raw = value,
@@ -73,9 +66,6 @@ pub const Context = struct {
                 result.origin = .parsed;
             },
             .missing, .invalid, .optional_empty => {
-                // This adapter describes timestamped input. Optional-empty is
-                // still missing time, not authorization for an undated source.
-                // No borrowing another record's date or receipt-time fallback.
                 return .{ .disposition = .rejected, .diagnostic = true, .rejection = if (input == .invalid) .malformed else .missing };
             },
         }
@@ -85,11 +75,8 @@ pub const Context = struct {
         }
         if (check) {
             if (mode == .live) {
-                // Python int(date-now) also rejects a nonfinite intermediate,
-                // even when both input timestamps are individually finite.
                 const delta = date.?.seconds - now.seconds;
                 if (!std.math.isFinite(delta)) return error.NonFiniteTime;
-                // Truncate only the deviation, matching int(date-now), never the date.
                 if (@abs(@trunc(delta)) > 60) {
                     date = now;
                     self.last_date = now;

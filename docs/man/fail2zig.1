@@ -1,4 +1,4 @@
-.TH FAIL2ZIG 1 "2026-09-15" "fail2zig 0.3.1" "User Commands"
+.TH FAIL2ZIG 1 "2026-09-16" "fail2zig 0.4.0" "User Commands"
 .
 .SH NAME
 fail2zig \- intrusion prevention daemon and its administration commands
@@ -320,10 +320,33 @@ other write bit; the daemon refuses to serve otherwise.
 .TP
 .I /var/lib/fail2zig/state.bin
 Durable SQLite state: records, decisions, effects, history and source positions.
+The parent and database must be owned by the daemon UID, with no group or
+other write access. This is not the legacy v0.3.0 binary state format.
 .TP
 .I global.log_target
 Optional append-only log file (mode 0640) instead of stderr; reopened on
 .BR SIGUSR1 .
+.
+.SH SERVICE ACCOUNT AND UPGRADE
+The shipped unit runs as the non-login user and group
+.BR fail2zig ,
+retaining CAP_NET_ADMIN, CAP_NET_RAW and CAP_DAC_READ_SEARCH for firewall and log access.
+Root or the daemon UID may mutate protection; service-group membership grants
+socket monitoring only. CAP_NET_RAW is required by the iptables ipset extension
+and also permits raw IP sockets. HTTP runs in the same process with the same capabilities.
+.PP
+Stop every daemon and state writer and preserve configuration, executable and
+coherent state backups before upgrading. The installer does not enable, start
+or restart services. It changes ownership only for the default native SQLite
+directory, database and existing WAL/SHM files; active writers, unsafe paths,
+legacy binary state and automatic custom-path upgrades are refused.
+.PP
+No automatic conversion of v0.3.0 binary state is provided. Starting a fresh
+native database does not preserve its saved bans, counters, history or source
+positions. Supported fail2ban schema-4 SQLite migration is a separate workflow.
+Native destination migration must run as the service UID with the required
+capabilities and caller-owned private staging, with the destination daemon
+stopped. See docs/operations/command-migration.md and migration-continuity.md.
 .
 .SH ENVIRONMENT
 .TP

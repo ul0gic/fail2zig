@@ -2,8 +2,6 @@
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
 
-/// Client preparation precedes server backend parsing. Raw prefix checks are
-/// intentionally case sensitive; option absence differs from present-but-empty.
 pub const LogSelection = struct {
     raw_backend: []const u8 = "auto",
     logpath_present: bool = false,
@@ -51,9 +49,6 @@ pub const Selection = struct {
     explicit_fallback: bool,
 };
 
-/// The caller parses selector options once and passes them through its factory
-/// context unchanged. Only a missing backend dependency allows the next backend;
-/// initialization errors propagate instead of quietly changing the source.
 pub fn select(parsed_name: []const u8, context: ?*anyopaque, initialize: *const fn (Backend, ?*anyopaque) anyerror!void) !Selection {
     const automatic = std.ascii.eqlIgnoreCase(parsed_name, "auto");
     var start: usize = 0;

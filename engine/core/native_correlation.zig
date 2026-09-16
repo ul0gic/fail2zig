@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Bounded correlation stage and canonical checkpoint. The coordinator owns
-//! durable occurrence deduplication and commits this checkpoint before publish.
 const std = @import("std");
 const rules = @import("native_rules.zig");
 pub const capacity = 8;
@@ -32,10 +30,8 @@ pub const State = struct {
 pub const Prepared = struct {
     checkpoint: []const u8,
     outcome: ?rules.Outcome,
-    /// Transient commit bound, not the lifetime of the whole checkpoint row.
     valid_until_us: ?i64 = null,
     owner: *Session,
-    /// Caller invokes once after commit (or coordinated restore validation).
     pub fn publish(self: Prepared) void {
         self.owner.live = self.owner.staged;
     }
@@ -95,7 +91,6 @@ pub const Session = struct {
                             outcome.subject = null;
                         }
                         if (outcome.kind == .awaiting_context) valid_until_us = next.entries[index].?.deadline_us;
-                        // Same key/subject keeps the original occurrence and deadline.
                     } else {
                         const index = expired_same orelse empty orelse return error.ContextCapacity;
                         next.entries[index] = .{ .key = input.key, .subject = subject, .occurrence = timing.occurrence, .event_us = timing.event_us, .receipt_us = timing.receipt_us, .deadline_us = deadline };
@@ -146,7 +141,6 @@ pub const Session = struct {
         self.in_flight = true;
         return .{ .owner = self, .checkpoint = &self.bytes, .outcome = null };
     }
-    /// Bootstrap/snapshot never invents an observation or processing watermark.
     pub fn prepareSnapshot(self: *Session) !Prepared {
         if (self.in_flight) return error.ConsumerBusy;
         try self.encode(self.live);

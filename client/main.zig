@@ -122,7 +122,6 @@ pub fn run(
 
 const ScopeSpec = struct { address: []const u8, prefix: ?u8 };
 
-/// `--scope net <cidr>` names an exact network; the CIDR must contain the positional address.
 fn scopeSpec(ip: []const u8, scope: ?args.Command.ScopeArgs, stderr: anytype) !ScopeSpec {
     const value = scope orelse return .{ .address = ip, .prefix = null };
     switch (value.kind) {
@@ -155,8 +154,6 @@ fn scopeSpec(ip: []const u8, scope: ?args.Command.ScopeArgs, stderr: anytype) !S
     }
 }
 
-/// Versioned read-only queries carry their bounded JSON request; the renderer receives the
-/// daemon's payload for every output format.
 fn doQuery(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype, color: format.Color, kind: []const u8, jail: ?[]const u8, limit: ?u32, cursor: ?[]const u8, comptime formatter: anytype) ExitCode {
     var body_bytes: [shared.protocol.max_request_body]u8 = undefined;
     var stream = std.io.fixedBufferStream(&body_bytes);
@@ -177,9 +174,6 @@ pub const AdminSpec = struct {
 
 const StatusHead = struct { generation: []const u8 = "", mutation_revision: u64 = 0 };
 
-/// Typed administration binds the request to the generation and mutation revision the
-/// operator observed; a concurrent change makes the daemon reject it instead of acting on
-/// state the operator never saw.
 pub fn doAdmin(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype, spec: AdminSpec) ExitCode {
     var diag: socket.DiagBuf = .{};
     var client = socket.connect(allocator, globals.socket_path, globals.timeout_ms, &diag) catch {
@@ -254,8 +248,6 @@ fn writeAdminOutcome(allocator: std.mem.Allocator, writer: anytype, payload: []c
     for (parsed.value.reasons) |reason| try writer.print("reason\t{s}\n", .{reason});
 }
 
-/// Versioned reload carries a fresh request identity; the daemon's structured outcome is
-/// printed on stdout in every format and its error code selects the exit class.
 fn doReload(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype) ExitCode {
     var request_id: [shared.protocol.request_id_bytes]u8 = undefined;
     std.crypto.random.bytes(&request_id);

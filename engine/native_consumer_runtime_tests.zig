@@ -195,7 +195,7 @@ test "native consumer runtime: actual file baseline has no receipt and restart p
         var run = try Run.init(&f, plain, null);
         defer run.destroy();
         try run.start();
-        _ = try run.deliver(); // Empty source baseline checkpoint, without a receipt.
+        _ = try run.deliver();
         try t.expectEqual(@as(usize, 0), try f.store.pendingReceiptCount());
         try f.append(failure);
         try t.expectEqual(@as(usize, 1), try run.deliver());
@@ -335,7 +335,7 @@ test "native consumer runtime: same-turn zero TTL resolves subject without cache
     try t.expect(run.session.?.pipe.ready);
     try t.expectEqual(health.Phase.healthy, gate.snapshot().phase);
     const completion = try complete(&run, peer, 0);
-    f.clock.us += 25; // SQL and immediate preparation may take real time in one turn.
+    f.clock.us += 25;
     try t.expectEqual(@as(usize, 1), try run.session.?.resumeConsumerSource(completion.source.?.incarnation));
     const request = dns.Request{ .name = try dns.Name.init("client.example"), .family = .v4, .generation = gen };
     try t.expect((try run.resolver.cache.lookup(request, f.clock.us)) == null);
@@ -574,14 +574,12 @@ test "native consumer runtime: file-backed allowlist refresh commits a new share
     try t.expectEqual(runtime.JailRuntime.AllowlistRefresh.unchanged, try jail.refreshAllowlist(allow_path, f.clock.us));
     try t.expectEqual(before + 1, jail.ignores.revision);
 
-    // Unreadable or invalid replacements never touch the live snapshot.
     try t.expectError(error.FileNotFound, jail.refreshAllowlist("/nonexistent/allow.txt", f.clock.us));
     try writeAllowlist(&f, "not an address here\n");
     try t.expectError(error.InvalidIgnoreEntry, jail.refreshAllowlist(allow_path, f.clock.us));
     try t.expectEqualSlices(u8, refreshed, jail.ignores.live.payload);
     try t.expectEqual(before + 1, jail.ignores.revision);
 
-    // Restart restores the committed revision, not the configured initial snapshot.
     run.destroy();
     live = false;
     try f.reopen();
@@ -592,7 +590,6 @@ test "native consumer runtime: file-backed allowlist refresh commits a new share
     try t.expectEqualSlices(u8, refreshed, restarted.jail.?.ignores.live.payload);
 }
 
-/// Allowlist files must be non-group/world-writable to be trusted.
 fn writeAllowlist(f: *Fixture, data: []const u8) !void {
     const file = try f.tmp.dir.createFile("allow.txt", .{ .truncate = true, .mode = 0o600 });
     defer file.close();

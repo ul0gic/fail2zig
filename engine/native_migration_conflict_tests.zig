@@ -1,11 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Regression root for BUG-024: staged migration owners must never replace or shorten a
-//! live native owner on the same scope. Contract asserted: a permanent native lease is kept,
-//! a later native deadline is kept, an earlier native deadline is extended to the staged one,
-//! exactly one owner row per scope remains, the native decision id survives whenever the
-//! native lease was kept, each conflict is recorded as a migration delta (kind 3, carry_back
-//! 1 mapped, applied 0), and the returned activation count excludes conflicts.
 const std = @import("std");
 const durable = @import("core/record_store.zig");
 const effects = @import("core/native_effect.zig");
@@ -145,7 +139,6 @@ test "migration conflict: activation keeps live native owners, records conflicts
         std.debug.print("BUG-024: activateStagedOwners returned {d}; contract requires the count of fresh owners only (1)\n", .{activated});
         return error.TestUnexpectedResult;
     }
-    // Kept native leases (a)/(b) must not spend an owner revision; only (c) and (d) may.
     const revisions_after = try f.store.inspectInteger("SELECT count(*) FROM effect_owner_revisions;");
     if (revisions_after - revisions_before > 2) {
         std.debug.print("BUG-024: {d} owner revisions were written by activation; kept native owners must not be rewritten (at most 2 expected)\n", .{revisions_after - revisions_before});

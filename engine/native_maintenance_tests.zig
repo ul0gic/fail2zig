@@ -74,7 +74,6 @@ test "native maintenance: admitted overshoot pins all writer classes until check
     try sql(&reader, "BEGIN; SELECT count(*) FROM records;");
     var pinned = true;
     defer if (pinned) sql(&reader, "COMMIT;") catch {};
-    // Configure only after the Store reaches its stable fixture address.
     const hard_limit = @extern(*const fn (i64) callconv(.c) i64, .{ .name = "sqlite3_hard_heap_limit64" });
     const prior = hard_limit(-1);
     defer _ = hard_limit(prior);
@@ -106,13 +105,10 @@ test "native maintenance: admitted overshoot pins all writer classes until check
     try t.expectError(error.Busy, f.store.commitConfirmedHistory(history_owner.manifest(), empty_batch, page.token));
     try t.expect(!f.store.reopen_required);
     try t.expectEqual(@as(u64, 1), try f.store.revision("volume"));
-    // Runtime reopening is also a writer: its initial schema transaction must
-    // not slip through the barrier. SQLite alone cleans up its failed handle.
     try t.expectError(error.Busy, durable.Store.openRuntime(t.allocator, f.path));
     try t.expectEqual(@as(u64, 1), try f.store.revision("volume"));
     try sql(&reader, "COMMIT;");
     pinned = false;
-    // Prior work exhaustion does not borrow from checkpoint or next writer.
     f.store.work_remaining = 0;
     try t.expectEqual(@as(i64, 100), (try f.store.beginReceipt(identity, .{ .us = 100 }, 0)).us);
     try t.expect((try std.fs.cwd().statFile(wal)).size < 16 * 1024 * 1024);
@@ -127,7 +123,6 @@ test "native maintenance: admitted overshoot pins all writer classes until check
     try t.expectEqual(@as(u64, 1), history_owner.live.total_confirmed);
     var reopened = try durable.Store.openRuntime(t.allocator, f.path);
     defer reopened.close();
-    // Opening's local callback must not remain attached after the return move.
     try t.expect(!reopened.runtime_limits);
     try t.expectEqualStrings(f.path, reopened.runtime_path.?);
     try reopened.configureRuntimeLimits();
@@ -145,7 +140,7 @@ test "native maintenance: bounded path poison and read-only refusal preserve rea
     f.store.reopen_required = true;
     try t.expectError(error.ReopenRequired, f.store.beginReceipt(identity, .{ .us = 100 }, 0));
     try t.expectError(error.ReopenRequired, f.store.maintainWal(f.path));
-    f.store.reopen_required = false; // fixture-only poison injection
+    f.store.reopen_required = false;
     try sql(&f.store, "PRAGMA query_only=ON;");
     try t.expectError(error.ReadOnly, f.store.beginReceipt(identity, .{ .us = 100 }, 0));
     try t.expectEqual(@as(usize, 0), try f.store.pendingReceiptCount());
@@ -204,7 +199,6 @@ test "native maintenance: foreign overdue WAL is preserved before refusal and on
     try t.expectError(error.ForeignDatabase, durable.Store.openRuntime(t.allocator, path));
     try t.expectEqual(wal_size, (try std.fs.cwd().statFile(wal)).size);
     try t.expectEqual(before, try fileDigest(wal));
-    // Leave a valid foreign WAL without another connection to protect it.
     try t.expectEqual(@as(c_int, 0), Native.sqlite3_close_v2(db.?));
     opened = false;
     const database_before = try fileDigest(path);
@@ -243,7 +237,6 @@ test "native maintenance: schema14 migration pins legacy and orders only new bou
     try f.store.enableMaintenance();
     try t.expectEqual(@as(i64, 14), f.store.schema_version);
     try t.expectEqual(@as(?durable.Store.RecordSequence, null), try f.store.recordSequence("legacy", "inode", "before"));
-    // Native detail committed before migration is also explicitly unsequenced.
     try t.expectEqual(@as(?durable.Store.RecordSequence, null), try f.store.recordSequence(identity.jail, identity.source, identity.occurrence));
     var next = identity;
     next.occurrence = "z-last-lexically";
@@ -302,7 +295,6 @@ test "native maintenance: source sequence receipt and cursor commit or roll back
 test "native maintenance: compact guard refuses full identity replay before and after detail removal" {
     var f = try Fixture.init();
     defer f.deinit();
-    // A second connection observes schema14 lazily when first consulting guards.
     var stale = try durable.Store.open(t.allocator, f.path);
     defer stale.close();
     try f.store.enableMaintenance();
@@ -321,7 +313,6 @@ test "native maintenance: compact guard refuses full identity replay before and 
     try t.expectError(error.PrunedReplay, f.store.beginReceipt(identity, .{ .us = 999 }, 2));
     try t.expectError(error.PrunedReplay, f.store.committedReceipt(identity));
     try t.expectError(error.PrunedReplay, f.store.commitRecord(recordFor(identity, 2)));
-    // Test-only simulation of future deletion. The actual current source anchor stays full.
     try sql(&f.store, "DELETE FROM records WHERE jail='receipt' AND source='file' AND occurrence='original';");
     try reopen(&f);
     try t.expectError(error.PrunedReplay, f.store.hasRecord(identity.jail, identity.source, identity.occurrence, identity.raw_hash, identity.cursor));
@@ -374,7 +365,6 @@ test "native maintenance: checked sequence bounds and corrupt missing heads neve
     try t.expectError(error.ReadOnly, f.store.commitRecord(recordFor(next, 1)));
     try sql(&f.store, "PRAGMA query_only=OFF;");
     _ = try f.store.commitRecord(recordFor(next, 1));
-    // Point reads and guard hashing require no retained or transient Zig allocation.
     var failing = std.testing.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
     const original_allocator = f.store.allocator;
     f.store.allocator = failing.allocator();
@@ -398,7 +388,7 @@ test "native maintenance: SQLite allocation failure during guard lookup preserve
         fn prepare(db: Parameters[0].type.?, query: [*:0]const u8, length: c_int, statement: Parameters[3].type.?, tail: ?*?[*:0]const u8) callconv(.c) c_int {
             if (std.mem.startsWith(u8, std.mem.span(query), "SELECT generation,identity_key,receipt_us,source_sequence FROM replay_guards")) {
                 statement.* = null;
-                return 7; // SQLITE_NOMEM, before creating a statement.
+                return 7;
             }
             return original(db, query, length, statement, tail);
         }
@@ -436,7 +426,6 @@ test "native maintenance: killed schema record and guard commits expose complete
         if (operation == 2) try commitObserved(&f.store, identity, 0);
         const pid = try std.posix.fork();
         if (pid == 0) {
-            // The inherited idle handle is never used or manually closed.
             var child = durable.Store.open(std.heap.page_allocator, f.path) catch std.process.exit(2);
             child.enableReceipts(8) catch std.process.exit(2);
             Fault.actual = child.api.exec;
@@ -456,7 +445,7 @@ test "native maintenance: killed schema record and guard commits expose complete
         switch (operation) {
             0 => {
                 try t.expectEqual(@as(i64, if (after) 14 else 13), f.store.schema_version);
-                try f.store.enableMaintenance(); // before-kill schema is still cleanly migratable
+                try f.store.enableMaintenance();
             },
             1 => {
                 try t.expectEqual(@as(u64, @intFromBool(after)), try f.store.revision(identity.jail));
@@ -485,8 +474,6 @@ test "native maintenance: guard sequence prevents lowered head reuse after detai
     marked.cursor = "guarded-position";
     try commitObserved(&f.store, marked, 1);
     try f.store.fixtureReplayGuard(marked.jail, marked.source, marked.occurrence);
-    // Corrupt ordering after simulated pruning. The only retained sequence2 is
-    // now in the guard index; a records-only check could allocate it again.
     try sql(&f.store, "DELETE FROM records WHERE occurrence='guarded'; UPDATE source_maintenance SET head_sequence=1; UPDATE source_cursors SET occurrence='original',cursor=CAST('next' AS BLOB);");
     var next = identity;
     next.occurrence = "new-after-corruption";
@@ -497,7 +484,6 @@ test "native maintenance: guard sequence prevents lowered head reuse after detai
     try t.expectEqual(@as(u64, 2), try f.store.revision(identity.jail));
     try t.expectEqual(@as(i64, 100), (try f.store.pendingReceipt(next)).?.us);
     try t.expectEqual(@as(?durable.Store.RecordSequence, null), try f.store.recordSequence(next.jail, next.source, next.occurrence));
-    // Restore only the injected corrupt head to inspect the original guard.
     try sql(&f.store, "UPDATE source_maintenance SET head_sequence=2;");
     try t.expectError(error.PrunedReplay, f.store.committedReceipt(marked));
     try reopen(&f);
@@ -593,7 +579,6 @@ test "native maintenance: physical delete budget includes children and resumes w
         id.cursor = name;
         try commitObserved(&f.store, id.*, i);
     }
-    // Real schema12 child rows: sixteen non-candidate outcomes per record.
     for (names[0..4]) |name| for (0..16) |ordinal| {
         var query: [1024]u8 = undefined;
         const value = try std.fmt.bufPrintZ(&query, "INSERT INTO record_detections(jail,source,occurrence,ordinal,version,kind,generation,filter) VALUES('receipt','file','{s}',{d},1,1,zeroblob(32),'fixture');", .{ name, ordinal });
@@ -643,7 +628,7 @@ test "native maintenance: held preparation pending action and stale fences block
     fence = try cleanupFence(&f.store, identity, &now);
     try sql(&f.store, "INSERT INTO action_intents(jail,source,occurrence,payload) VALUES('receipt','file','original',X'00');");
     try t.expectEqual(@as(?durable.Store.CleanupToken, null), try f.store.cleanupAdvance(fence, state, 1));
-    try sql(&f.store, "DELETE FROM action_intents;"); // fixture clears the synthetic external-action pin
+    try sql(&f.store, "DELETE FROM action_intents;");
     next.occurrence = "pending";
     _ = try f.store.beginReceipt(next, .{ .us = 100 }, 2);
     try t.expectError(error.MaintenancePinned, f.store.cleanupAdvance(fence, state, 1));
@@ -660,7 +645,6 @@ test "native maintenance: retired retries preserve counters and original clocks 
     const policy = retry.Policy{ .maxretry = 1, .window_us = 100, .duration = .{ .finite_us = 100 }, .max_subjects = 1 };
     try f.store.admitRetry(identity.jail, generation, policy);
     const subject = @import("core/native_detection_record.zig").Subject{ .v4 = .{ 192, 0, 2, 91 } };
-    // Original working state with an expired decision; no protected effect.
     try sql(&f.store, "UPDATE retry_clock SET floor_us=100; INSERT INTO retry_states VALUES('receipt',4,X'C000025B',100,200,7,X'');");
     const candidate = (try f.store.retryRetirementCandidate(identity.jail, null)).?;
     try t.expectEqualDeep(subject, candidate.subject);
@@ -941,7 +925,7 @@ test "native maintenance: paged validation and health remain bounded with accumu
         var callbacks: usize = 0;
         fn tick(_: ?*anyopaque) callconv(.c) c_int {
             callbacks += 1;
-            return @intFromBool(callbacks > 40_000); // VM instructions per page
+            return @intFromBool(callbacks > 40_000);
         }
     };
     Progress.sqlite3_progress_handler(f.store.db, 1, Progress.tick, null);
@@ -968,7 +952,6 @@ test "native maintenance: paged validation and health remain bounded with accumu
     try t.expect(maximum > 0);
     std.debug.print("maintenance validation: {d} pages, maximum {d} VM instructions; retired health {d}\n", .{ turns, maximum, Progress.callbacks });
     Progress.sqlite3_progress_handler(f.store.db, 0, null, null);
-    // An interior hole has intact endpoints. The paged contiguous walk must refuse.
     try sql(&f.store, "DELETE FROM records WHERE source_sequence=1000;");
     try t.expectError(error.InvalidMaintenanceState, validateCleanup(&f.store));
     try sql(&f.store, "UPDATE retry_retired_totals SET total=2047;");
@@ -1026,7 +1009,6 @@ test "native maintenance: key budget no Zig allocation and failed writes preserv
     f.store.allocator = failing.allocator();
     defer f.store.allocator = allocator;
     const token = (try f.store.cleanupAdvance(fence, initial, 20)).?;
-    // 16 full64KiB cursors exceed1MiB once their identities are included.
     try t.expectEqual(@as(u64, 16), token.state.reject_below_sequence);
     try t.expectError(error.PrunedReplay, f.store.committedReceipt(first));
     try sql(&f.store, "PRAGMA query_only=ON;");
@@ -1038,7 +1020,6 @@ test "native maintenance: key budget no Zig allocation and failed writes preserv
     try t.expect(!removed.more);
     _ = try validateCleanup(&f.store);
     try t.expect(!failing.has_induced_failure);
-    // An ordered commit cannot hide a missing maintenance clock or consume its receipt.
     try sql(&f.store, "DELETE FROM maintenance_clock;");
     var id = first;
     id.occurrence = "missing-clock";
@@ -1062,7 +1043,6 @@ test "native maintenance: real SQLite page ceiling rolls back the entire guard p
     var now = CleanupClock{};
     const fence = try cleanupFence(&f.store, identity, &now);
     const before = (try f.store.sourceMaintenance(identity.jail, identity.source, generation)).?;
-    // SQLite clamps a requested maximum below current size to that current size.
     try sql(&f.store, "PRAGMA max_page_count=1;");
     try t.expectError(error.StorageFull, f.store.cleanupAdvance(fence, before, 65));
     try t.expectEqualDeep(before, (try f.store.sourceMaintenance(identity.jail, identity.source, generation)).?);

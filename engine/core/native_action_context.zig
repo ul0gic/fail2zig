@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Bounded typed metadata passed from a native retry decision to action
-//! preparation. This is not a template namespace or a durable schema.
 const std = @import("std");
 const shared = @import("shared");
 const detection = @import("native_detection_record.zig");
@@ -76,16 +74,12 @@ pub const Context = struct {
     enforcement: ?canonical.Subject,
     correlation: ?Value,
     user: ?Value,
-    /// Captured metadata only. A selected firewall port remains part of the
-    /// canonical enforcement scope and must never be inferred from this field.
     port: ?u16,
     event_us: i64,
     decision_us: i64,
     ordinal: u64,
     event_count: u8,
     confirmed_history_count: ?u64,
-    /// Oversized physical source/occurrence identities remain authoritative in
-    /// the record store. The action view uses an explicit canonical digest.
     source_digest: bool,
     occurrence_digest: bool,
 
@@ -129,9 +123,6 @@ pub const Context = struct {
         if (self.occurrence_digest and !canonicalDigest(self.occurrence.slice(), true)) return error.InvalidActionContext;
     }
 
-    /// The current durable effect format realizes only a canonical host with
-    /// all protocols and ports. `fromCanonical` rejects a valid network here;
-    /// it never masks or widens it into a host effect.
     pub fn legacyEffectScope(self: *const Context) (Error || effects.Error)!effects.Scope {
         try self.validate();
         const subject = self.enforcement orelse return error.InvalidActionContext;

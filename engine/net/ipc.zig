@@ -17,13 +17,10 @@ pub const max_clients: usize = 8;
 
 pub const client_buffer_size: usize = protocol.max_payload_size + 4;
 
-/// Serialized response bound: length prefix plus a body no larger than a request frame.
 pub const max_response_bytes: usize = protocol.max_payload_size + 4;
 
 pub const default_frame_deadline_ms: u64 = 5_000;
 pub const default_drain_deadline_ms: u64 = 5_000;
-/// Command-line clients reconnect for each request; an accepted peer that sends nothing must
-/// not retain one of the bounded connection slots indefinitely.
 pub const default_idle_deadline_ms: u64 = 30_000;
 const deadline_tick_ms: u64 = 1_000;
 
@@ -48,7 +45,6 @@ pub const Peer = struct {
     uid: u32,
     gid: u32,
     pid: i32,
-    /// Present only for mutation tags that carry one on the wire (8/9); legacy 1/2/5 → null.
     request_id: ?[auth.request_id_len]u8,
 };
 
@@ -65,8 +61,6 @@ pub const DispatchAuthFn = *const fn (
     allocator: std.mem.Allocator,
 ) anyerror!shared.Response;
 
-/// `dispatch_auth`, when set, receives every authorized command with its peer. Without it
-/// only read-only commands reach `dispatch`; every mutation is refused with 403.
 pub const CommandHandler = struct {
     ctx: ?*anyopaque = null,
     dispatch: DispatchFn,
@@ -81,13 +75,10 @@ const ClientReg = struct {
     buf: []u8,
     len: usize = 0,
     need: usize = 0,
-    /// Monotonic ms when the first byte of the current frame arrived; null between frames.
     frame_started_ms: ?u64 = null,
-    /// Owned serialized response awaiting drain; at most one per connection.
     pending: ?[]u8 = null,
     sent: usize = 0,
     drain_deadline_ms: u64 = 0,
-    /// Absolute monotonic deadline while waiting between frames.
     idle_deadline_ms: u64 = 0,
 
     fn reset(self: *ClientReg) void {
@@ -101,8 +92,6 @@ extern "c" fn umask(mask: u32) callconv(.C) u32;
 
 pub const ClockFn = *const fn () u64;
 
-/// A failed clock read returns the maximum so every armed deadline counts as expired:
-/// without a trustworthy clock the server cannot bound a stalled peer any other way.
 fn monotonicMs() u64 {
     const ts = posix.clock_gettime(.MONOTONIC) catch return std.math.maxInt(u64);
     const sec: u64 = @intCast(ts.sec);
@@ -117,10 +106,7 @@ pub const IpcServer = struct {
     listen_fd: posix.fd_t = -1,
     started: bool = false,
     self_uid: u32 = 0,
-    /// Detached servers (socketpair tests) skip path verification and accept injected creds.
     detached: bool = false,
-    /// Cleared once post-bind path verification fails; new connections are then closed
-    /// unanswered until a later accept finds the path trustworthy again.
     serving: bool = true,
     frame_deadline_ms: u64 = default_frame_deadline_ms,
     drain_deadline_ms: u64 = default_drain_deadline_ms,
@@ -144,8 +130,6 @@ pub const IpcServer = struct {
         if (socket_path.len >= 108) return error.PathTooLong;
         const self_uid = linux.geteuid();
 
-        // Directory verification precedes the stale-socket unlink so no other principal
-        // can place an object at the path between the liveness probe and the unlink.
         auth.verifyParentDir(socket_path, self_uid) catch |err| {
             std.log.warn("ipc: refusing to serve '{s}': {s}", .{ socket_path, @errorName(err) });
             return error.SocketPathInsecure;
@@ -274,7 +258,6 @@ pub const IpcServer = struct {
         return self.admitClient(fd, cred);
     }
 
-    /// Readiness input: false while the socket path fails verification.
     pub fn isServing(self: *const IpcServer) bool {
         return self.serving;
     }
@@ -317,8 +300,6 @@ pub const IpcServer = struct {
         self.checkDeadlines(self.clock());
     }
 
-    /// Closes clients that exceeded the idle, frame or drain deadline. Public so tests can drive
-    /// it with an injected clock instead of waiting on the periodic timer.
     pub fn checkDeadlines(self: *IpcServer, now_ms: u64) void {
         for (self.clients) |slot| {
             const cli = slot orelse continue;
@@ -370,9 +351,6 @@ pub const IpcServer = struct {
         }
     }
 
-    /// Re-verifies the socket directory and path on every accept. A failure logs once and
-    /// refuses new connections while existing ones drain; a later accept that verifies
-    /// again logs the recovery once and resumes serving.
     fn verifyServing(self: *IpcServer) bool {
         auth.verifySocketPath(self.socket_path, self.self_uid) catch |err| {
             if (self.serving) std.log.warn("ipc: socket path '{s}' no longer trustworthy ({s}); refusing new connections", .{ self.socket_path, @errorName(err) });
@@ -387,8 +365,6 @@ pub const IpcServer = struct {
     }
 
     fn admitClient(self: *IpcServer, fd: posix.fd_t, cred: auth.PeerCred) !void {
-        // The timer may not have fired yet at the deadline boundary. Reap first so expired
-        // monitor connections cannot make a newly authenticated administrator lose the race.
         self.checkDeadlines(self.clock());
         var idx: ?usize = null;
         for (self.clients, 0..) |slot, i| {
@@ -450,8 +426,6 @@ pub const IpcServer = struct {
         if (events & (linux.EPOLL.HUP | linux.EPOLL.ERR) != 0) self.closeClient(cli);
     }
 
-    /// One in-flight response per connection: any bytes (or EOF) arriving before the
-    /// previous response drained end the connection.
     fn rejectInputDuringDrain(self: *IpcServer, cli: *ClientReg) void {
         var probe: [64]u8 = undefined;
         const n = posix.read(cli.fd, &probe) catch |err| switch (err) {
@@ -501,7 +475,6 @@ pub const IpcServer = struct {
                         return;
                     };
                     cli.reset();
-                    // The response (if any) owns the connection until drained.
                     if (cli.pending != null) return;
                     continue;
                 }
@@ -601,8 +574,6 @@ pub const IpcServer = struct {
         };
     }
 
-    /// Serializes into an owned buffer, then writes as much as the socket accepts now;
-    /// the remainder drains on EPOLLOUT under the drain deadline.
     fn queueResponse(self: *IpcServer, cli: *ClientReg, resp: shared.Response) QueueError!void {
         std.debug.assert(cli.pending == null);
         const size = responseSize(resp);
@@ -672,7 +643,6 @@ pub const IpcServer = struct {
 };
 
 fn readPeerCred(fd: posix.fd_t) !auth.PeerCred {
-    // Raw syscall: std.posix.getsockopt leaves optlen uninitialized, the kernel EINVALs and the wrapper hits unreachable.
     var cred: auth.PeerCred = undefined;
     var len: posix.socklen_t = @sizeOf(auth.PeerCred);
     const rc = linux.getsockopt(
@@ -704,7 +674,6 @@ fn defaultDispatch(
 
 const testing = std.testing;
 
-/// Socket parent must satisfy the 0750 contract, so tests bind inside a private directory.
 const TestSocketDir = struct {
     tmp: testing.TmpDir,
     path: []u8,

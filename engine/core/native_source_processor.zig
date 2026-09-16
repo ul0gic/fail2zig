@@ -1,10 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Native source decoding/time admission. Immutable configuration, caller-owned
-//! scratch and a fixed checkpoint replace worker state on this path. An optional
-//! stateless detector consumes the decoded slice and stages a typed outcome in
-//! the same transaction. Optional retry policy joins that transaction in SQLite;
-//! correlation and enforcement integration remain separate work.
 const std = @import("std");
 const text = @import("source_text.zig");
 const time = @import("native_time.zig");
@@ -21,13 +16,9 @@ const time_record = @import("native_time_record.zig");
 pub const Field = struct {
     format: time.Format,
     start: u32 = 0,
-    /// Select one complete configured field: fixed width, or a single byte
-    /// delimiter. This is not a date search, regular expression or log grammar.
     boundary: union(enum) { length: u8, delimiter: u8 },
     context: time.Context = .{},
-    /// Opt-in syslog inference with a fixed offset or immutable named zone.
     infer_year: bool = false,
-    /// Immutable owner must outlive processor and all staged records.
     zone: ?*const timezone.Zone = null,
 
     pub fn jsonStringify(self: Field, writer: anytype) !void {
@@ -36,8 +27,6 @@ pub const Field = struct {
             try writer.objectField(name);
             try writer.write(@field(self, name));
         }
-        // Preserve existing fixed-offset generations. Never serialize allocator
-        // pointers or full transition tables into the configuration binding.
         if (self.zone) |zone| {
             try writer.objectField("zone_generation");
             try writer.write(zone.generation);
@@ -65,8 +54,6 @@ pub const Processor = struct {
     generation: [32]u8,
     scratch: []u8,
     now: time.Timestamp,
-    /// Native sessions sample processing time after receipt durability/decoding.
-    /// Standalone users can instead supply an explicit clock with setClock.
     processing_clock: ?struct { read: *const fn (?*anyopaque) anyerror!time.Timestamp, context: ?*anyopaque } = null,
     health: policy.Health = .{},
     in_flight: bool = false,
@@ -83,14 +70,10 @@ pub const Processor = struct {
         release: *const fn (?*anyopaque) void,
     } = null,
     retry_policy: ?retry.Policy = null,
-    /// Administrative pause: records are still consumed and checkpointed, but no detection
-    /// reaches retry evaluation, so existing owners and expiry continue unchanged.
+    retry_enforcement_suppressed: bool = false,
     paused: bool = false,
 
-    /// Configure before source framing/receipt admission. The policy participates
-    /// in the source generation; previous evidence-only checkpoints cannot be
-    /// silently reused with an empty retry window.
-    pub fn bindRetry(self: *Processor, value: retry.Policy) !void {
+    pub fn bindRetry(self: *Processor, value: retry.Policy, suppress_enforcement: bool) !void {
         if (self.in_flight or self.retry_policy != null) return error.ProcessorBusy;
         if (self.detector == null and self.journal_detector == null and self.staged_detector == null) return error.RetryDetectorRequired;
         if (value.window_us != self.options.window_us) return error.InvalidRetryPolicy;
@@ -102,6 +85,7 @@ pub const Processor = struct {
         if (value.escalation.enabled) hash.update(&try value.escalationBytes());
         hash.final(&self.generation);
         self.retry_policy = value;
+        self.retry_enforcement_suppressed = suppress_enforcement;
     }
 
     pub fn initWithJournalDetection(allocator: std.mem.Allocator, options: Options, scratch: []u8, now: time.Timestamp, consumer: ?detection.JournalConsumer) !Processor {
@@ -119,8 +103,6 @@ pub const Processor = struct {
         return self;
     }
 
-    /// File detection receives the actual decoded slice before scratch is reused.
-    /// Journals must use the separate origin-qualified consumer API above.
     pub fn initWithDetection(allocator: std.mem.Allocator, options: Options, scratch: []u8, now: time.Timestamp, consumer: ?detection.Consumer) !Processor {
         var self = try init(allocator, options, scratch, now);
         if (consumer) |value| {
@@ -135,8 +117,6 @@ pub const Processor = struct {
         return self;
     }
 
-    /// The staged consumer owns reversible rule/shared state and, for journals,
-    /// must apply its immutable origin policy before preparing detections.
     pub fn initWithStaged(allocator: std.mem.Allocator, options: Options, scratch: []u8, now: time.Timestamp, consumer: detection.StagedConsumer) !Processor {
         if (options.timestamp == .journal and (options.encoding != .utf8 or options.bom != .preserve)) return error.InvalidJournalProcessing;
         if (std.mem.allEqual(u8, &consumer.generation, 0)) return error.DetectorGenerationMismatch;
@@ -150,8 +130,6 @@ pub const Processor = struct {
         return self;
     }
 
-    /// Config strings and exclusive scratch must outlive the stable processor.
-    /// No record allocation or external helper is needed by this processor.
     pub fn init(allocator: std.mem.Allocator, options: Options, scratch: []u8, now: time.Timestamp) !Processor {
         if (options.jail.len == 0 or options.jail.len > 64 or std.mem.indexOfScalar(u8, options.jail, 0) != null) return error.InvalidJail;
         if (options.window_us < 0 or options.max_record_bytes < options.encoding.width() or options.max_record_bytes > text.max_record_bytes or
@@ -252,8 +230,6 @@ pub const Processor = struct {
             const parsed = zonedField(field, value, receipt, zone) catch |err| switch (err) {
                 error.InvalidTimestamp, error.AmbiguousYear, error.LocalTimeGap, error.AmbiguousLocalTime => return .{ .input = .{ .rejected = .malformed } },
                 error.TimeOutOfRange => return .{ .input = .{ .rejected = .out_of_range } },
-                // Missing coverage is operational context failure. Preserve the
-                // pending receipt and cursor until an admitted context exists.
                 else => return err,
             };
             return parsed;
@@ -375,12 +351,10 @@ pub const Processor = struct {
             }
         }
         self.stage(counters, false);
-        return .{ .checkpoint = &self.staged_bytes, .disposition = if (outcome) |value| value.disposition() else "source-checkpoint", .native_time = outcome, .zone_provenance = zone_provenance, .effects_clock = if (self.retry_policy != null and self.retry_policy.?.enforce and processing_us != null) .{ .prepared_us = processing_us.?, .read = commitClock, .context = self } else null, .native_detection = detected, .native_detections = detections, .consumers = consumer_batch, .consumer_manifest = consumer_manifest, .native_retry = if (self.retry_policy) |value| .{ .generation = self.generation, .policy = value, .processing_us = processing_us } else null, .retry_suspended = paused_veto, .retry_evidence = retry_evidence, .context = self, .publish = publish, .release = release };
+        return .{ .checkpoint = &self.staged_bytes, .disposition = if (outcome) |value| value.disposition() else "source-checkpoint", .native_time = outcome, .zone_provenance = zone_provenance, .effects_clock = if (self.retry_policy != null and self.retry_policy.?.enforce and !self.retry_enforcement_suppressed and processing_us != null) .{ .prepared_us = processing_us.?, .read = commitClock, .context = self } else null, .native_detection = detected, .native_detections = detections, .consumers = consumer_batch, .consumer_manifest = consumer_manifest, .native_retry = if (self.retry_policy) |value| .{ .generation = self.generation, .policy = value, .processing_us = processing_us, .suppress_enforcement = self.retry_enforcement_suppressed } else null, .retry_suspended = paused_veto, .retry_evidence = retry_evidence, .context = self, .publish = publish, .release = release };
     }
     fn commitClock(context: ?*anyopaque) i64 {
         const self: *Processor = @ptrCast(@alignCast(context.?));
-        // A failed clock cannot grant a later deadline or commit. The checked
-        // transaction clock classifies this sentinel as a reversed clock.
         return if (self.processing_clock) |clock| (clock.read(clock.context) catch return std.math.minInt(i64)).us else self.now.us;
     }
 };
@@ -393,7 +367,6 @@ test "native processor: named zone generation and staged provenance survive prep
     const options = Options{ .jail = "zone", .parent_generation = [_]u8{0} ** 32, .timestamp = .{ .field = .{ .format = .syslog, .boundary = .{ .length = 15 }, .infer_year = true, .zone = &zone } } };
     var processor = try Processor.init(std.testing.allocator, options, &scratch, receipt);
     const generation = processor.generation;
-    // The pointer/allocator identity does not enter the persisted generation.
     var second_zone = zone;
     var second_options = options;
     second_options.timestamp.field.zone = &second_zone;

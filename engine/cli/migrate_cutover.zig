@@ -1,12 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 
-//! `fail2zig migrate cutover|status`: the resumable, journaled protection cutover. Every step
-//! records its intent before acting and its observed outcome after; a rerun with `--run-id`
-//! classifies the durable journal and the actual store state instead of replaying. Activation
-//! and kernel verification run inside the daemon (`admin_v1 migration_activate`); this command
-//! only stages the destination offline and then drives that request over the socket.
-
 const std = @import("std");
 const shared = @import("shared");
 const cli = @import("cli");
@@ -21,10 +15,8 @@ const fail2ban_db = @import("../migration/fail2ban_db.zig");
 pub const ExitClass = shared.ExitClass;
 pub const Output = enum { json, table };
 
-/// Whole-run and per-step wall budgets.
 pub const run_deadline_ns: u64 = 30 * std.time.ns_per_min;
 pub const step_deadline_ns: u64 = 5 * std.time.ns_per_min;
-/// The source database must be byte-stable for this long before it counts as quiesced.
 pub const quiesce_window_ns: u64 = 2 * std.time.ns_per_s;
 
 pub const Options = struct {
@@ -35,12 +27,9 @@ pub const Options = struct {
     socket_path: []const u8,
     run_id: ?[32]u8,
     output: Output,
-    /// Rollback only: the operator attests that the restored source service is running and
-    /// protecting again, which is what permits releasing destination ownership.
     source_verified: bool = false,
 };
 
-/// Fixed recovery-point name inside the staging directory, so rollback can find it by identity.
 pub fn recoveryPointName(buffer: []u8, run_id: [32]u8) []const u8 {
     const hex = std.fmt.bytesToHex(run_id, .lower);
     return std.fmt.bufPrint(buffer, "recovery-point-{s}.sqlite3", .{hex[0..16]}) catch buffer[0..0];
@@ -56,8 +45,6 @@ const Context = struct {
     stderr_buffer: std.ArrayList(u8),
 };
 
-/// Outcome → exit class: before mutation every failure is a rejection; after a mutation
-/// step the observed protection decides between partial and uncertain.
 pub fn exitFor(outcome: journal.Outcome, state: journal.State) ExitClass {
     return switch (outcome) {
         .success => if (state == .complete or state == .rolled_back) .success else .unavailable,
@@ -170,7 +157,6 @@ pub fn runCutover(allocator: std.mem.Allocator, options: Options, stdout: anytyp
             },
         }
     }
-    // A fresh journal view reports the steps and state the daemon recorded meanwhile.
     var fresh = journal.Journal.open(allocator, &store, run_id, identity) catch |err| {
         stderr.print("migrate cutover: report: {s}\n", .{@errorName(err)}) catch {};
         return exit;
@@ -235,8 +221,6 @@ fn lastOutcome(log: *journal.Journal) journal.Outcome {
     return listed[listed.len - 1].outcome;
 }
 
-/// Identity binds the run to the plan file bytes, the snapshot's recorded source hash, the jail
-/// tree fingerprints the plan captured and the staging directory holding the recovery point.
 fn identityFor(loaded: *const plan_mod.Plan, staging_dir: []const u8) !journal.Identity {
     var source_db_fp: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&source_db_fp, loaded.doc.snapshot.?.recorded_sha256);
@@ -260,9 +244,6 @@ fn try_pending_rollback(log: *journal.Journal) bool {
     return open != null and open.?.step == .rollback;
 }
 
-/// Qualification hook: `F2Z_MIGRATE_FAULT=<step>` terminates the process right after that step's
-/// intent is journaled, leaving exactly the state a crash would; the resume classification is what
-/// the lab rehearsal then exercises. It can only stop the command early, never alter a step.
 fn faultAfterIntent(step: journal.Step) void {
     faultNamed(@tagName(step));
 }
@@ -367,8 +348,6 @@ fn executeStep(ctx: *Context, log: *journal.Journal, step: journal.Step, stderr:
     }
 }
 
-/// The daemon journals `activate_owners` and `verify_protection` itself; this side only relays
-/// the typed outcome. An unreachable socket leaves the run `staged` for a later `--run-id` rerun.
 fn activateThroughDaemon(ctx: *Context, stderr: anytype) !Control {
     var out = std.ArrayList(u8).init(ctx.allocator);
     defer out.deinit();
@@ -394,8 +373,6 @@ fn activateThroughDaemon(ctx: *Context, stderr: anytype) !Control {
     defer parsed.deinit();
     for (parsed.value.reasons) |reason| stderr.print("migrate cutover: daemon: {s}\n", .{reason}) catch {};
     if (std.mem.eql(u8, parsed.value.outcome, "applied")) {
-        // The daemon journaled activation and verification and moved the run to `complete`;
-        // the store row, not this process's cached view, is the authority for that.
         const run = (try ctx.store.migrationRun(ctx.allocator, ctx.run_id)) orelse return .{ .stop = .uncertain };
         defer ctx.allocator.free(run.recovery_point);
         return .{ .stop = if (run.state == .complete) .success else .uncertain };
@@ -407,8 +384,6 @@ fn activateThroughDaemon(ctx: *Context, stderr: anytype) !Control {
 
 const Quiesce = struct { stopped: bool, reason: []const u8 };
 
-/// A quiesced source has no control socket, no `fail2ban-server` process and a database whose
-/// size and mtime do not change across the observation window.
 fn sourceQuiesced(ctx: *Context) !Quiesce {
     const socket_path = ctx.loaded.doc.drift.runtime_socket;
     if (socket_path.len != 0) {
@@ -424,7 +399,6 @@ fn sourceQuiesced(ctx: *Context) !Quiesce {
     return .{ .stopped = true, .reason = "" };
 }
 
-/// Bounded `/proc` scan by `comm`; at most 65536 entries are inspected.
 fn processRunning(comm: []const u8) !bool {
     var proc = std.fs.openDirAbsolute("/proc", .{ .iterate = true }) catch return false;
     defer proc.close();
@@ -443,9 +417,6 @@ fn processRunning(comm: []const u8) !bool {
     return false;
 }
 
-/// Observer for resume classification: destination protection is judged from the run's activated
-/// owners in the store, source state from the quiescence check. Neither reaches the kernel; the
-/// daemon's own verification did, and its journaled outcome is what `classify` settles on.
 fn observe(raw: ?*anyopaque, step: journal.Step, _: *const durable.Store.MigrationRun, staged: journal.StagedCounts) anyerror!journal.Observation {
     const ctx: *Context = @ptrCast(@alignCast(raw.?));
     switch (step) {
@@ -484,12 +455,6 @@ test "migrate cutover: process scan finds this process and not a nonsense name" 
     try std.testing.expect(!try processRunning("fail2zig-no-such-process-name"));
 }
 
-/// `migrate rollback`: restore the source's protection from the recovery point plus the mapped
-/// post-cutover deltas, then, once the operator attests the restored service is running, release
-/// destination ownership. The `rollback` journal step stays open between the two invocations and
-/// a durable restore marker in the staging directory records that the swap completed, so a
-/// resumed command classifies the exact state (before, between, after the renames) instead of
-/// replaying or guessing.
 pub fn runRollback(allocator: std.mem.Allocator, options: Options, stdout: anytype, stderr: anytype) ExitClass {
     const run_id = options.run_id orelse {
         stderr.writeAll("error: migrate rollback requires --run-id <hex>\n") catch {};
@@ -593,11 +558,9 @@ fn rollbackPhases(ctx: *Context, log: *journal.Journal, stderr: anytype) !ExitCl
     return restoreSource(ctx, log, step, expected, &paths, stderr);
 }
 
-/// Resume with the step open and no restore marker: the exact on-disk state decides what remains.
 fn resumeRestore(ctx: *Context, log: *journal.Journal, step: journal.Pending, expected: [32]u8, paths: *RestorePaths, stderr: anytype) !ExitClass {
     if (!RestorePaths.exists(paths.source)) {
         if (RestorePaths.exists(paths.derived)) {
-            // Killed between the two renames: the derived file is complete, finish the swap.
             const derived_sha = try snapshot.sha256File(paths.derived);
             try finishSwap(ctx, paths);
             try writeMarker(paths.marker, derived_sha);
@@ -606,7 +569,6 @@ fn resumeRestore(ctx: *Context, log: *journal.Journal, step: journal.Pending, ex
             return .unavailable;
         }
         if (RestorePaths.exists(paths.kept)) {
-            // The original was moved aside but nothing replaced it: put it back and restore again.
             try moveDatabase(ctx.allocator, paths.kept, paths.source);
             return restoreSource(ctx, log, step, expected, paths, stderr);
         }
@@ -624,8 +586,6 @@ fn resumeRestore(ctx: *Context, log: *journal.Journal, step: journal.Pending, ex
     return .partial;
 }
 
-/// First phase under the open `rollback` step: validate, derive, replace. Only a fingerprint
-/// mismatch is terminal; environment failures leave the run resumable.
 fn restoreSource(ctx: *Context, log: *journal.Journal, step: journal.Pending, expected: [32]u8, paths: *RestorePaths, stderr: anytype) !ExitClass {
     const now = std.time.microTimestamp();
     var name_buffer: [64]u8 = undefined;
@@ -666,8 +626,6 @@ fn restoreSource(ctx: *Context, log: *journal.Journal, step: journal.Pending, ex
         stderr.print("migrate rollback: delta computation: {s} (the 4096-delta bound or storage); nothing was written\n", .{@errorName(err)}) catch {};
         return .rejected;
     };
-    // Deltas are recorded as not yet applied before anything is written, so an interrupted
-    // restore can be reasoned about from the journal alone.
     try ctx.store.recordMigrationDeltas(ctx.run_id, deltas[0..delta_count], false, now);
     const original = std.fs.openFileAbsolute(paths.source, .{}) catch |err| {
         try log.finish(step, .operational_failure, "source unreadable", null, std.time.microTimestamp());
@@ -703,12 +661,10 @@ fn restoreSource(ctx: *Context, log: *journal.Journal, step: journal.Pending, ex
             }
         }
     }
-    // Durable before the swap: the derived file's pages, then its directory entry after renaming.
     {
         const derived_file = try std.fs.openFileAbsolute(paths.derived, .{});
         defer derived_file.close();
         try derived_file.sync();
-        // The restored database must be usable by the service that owns the original.
         try derived_file.chown(original_stat.uid, original_stat.gid);
         try derived_file.chmod(@intCast(original_stat.mode & 0o7777));
     }
@@ -736,21 +692,16 @@ fn restoreSource(ctx: *Context, log: *journal.Journal, step: journal.Pending, ex
     return .unavailable;
 }
 
-/// Renames the derived file into place and makes the directory entry durable.
 fn finishSwap(ctx: *Context, paths: *RestorePaths) !void {
     _ = ctx;
     try std.fs.renameAbsolute(paths.derived, paths.source);
     const dir_path = std.fs.path.dirname(paths.source) orelse ".";
-    // A plain directory descriptor (not O_PATH) is required for fsync; the raw syscall is used
-    // because the std wrapper treats EINVAL/EBADF as unreachable.
     const fd = try std.posix.open(dir_path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
     defer std.posix.close(fd);
     const rc = std.os.linux.fsync(fd);
     if (std.os.linux.E.init(rc) != .SUCCESS) return error.DirectorySyncFailed;
 }
 
-/// Moves a SQLite database together with its `-wal`/`-shm` siblings so a journal never sits
-/// beside a file it does not belong to.
 fn moveDatabase(allocator: std.mem.Allocator, from: []const u8, to: []const u8) !void {
     try std.fs.renameAbsolute(from, to);
     inline for (.{ "-wal", "-shm" }) |suffix| {
@@ -769,9 +720,6 @@ fn writeMarker(path: []const u8, derived_sha: [32]u8) !void {
     try file.sync();
 }
 
-/// Second phase: only an operator attestation plus a running source service (control socket and
-/// process) permit releasing destination ownership; the daemon settles the release by kernel
-/// readback and only its `applied` closes the step, every other outcome leaves it open.
 fn releaseDestination(ctx: *Context, log: *journal.Journal, step: journal.Pending, stderr: anytype) !ExitClass {
     if (!ctx.options.source_verified) {
         stderr.writeAll("migrate rollback: the source is restored but destination ownership is still held; rerun with --source-verified once the source service protects again\n") catch {};
@@ -822,8 +770,6 @@ fn releaseDestination(ctx: *Context, log: *journal.Journal, step: journal.Pendin
         stderr.writeAll("migrate rollback: the release is uncertain; inspect the daemon, then rerun with --source-verified\n") catch {};
         return .uncertain;
     }
-    // A refusal because storage is not healthy at that instant is transient: the daemon is
-    // recovering or rebuilding, nothing was changed, and the same command succeeds once healthy.
     for (parsed.value.reasons) |reason| if (std.mem.indexOf(u8, reason, "PersistenceUnavailable") != null) {
         stderr.writeAll("migrate rollback: the daemon's storage is not healthy right now; nothing changed, rerun with --source-verified once `status` reports healthy\n") catch {};
         return .unavailable;
@@ -832,9 +778,6 @@ fn releaseDestination(ctx: *Context, log: *journal.Journal, step: journal.Pendin
     return .rejected;
 }
 
-/// Content fingerprint of the live source as the plan recorded it: a backup-API capture into the
-/// staging directory (WAL included), hashed and removed. A main-file hash would differ from the
-/// snapshot whenever the source has an uncheckpointed WAL.
 fn sourceFingerprint(ctx: *Context) ![32]u8 {
     var captured = try snapshot.capture(ctx.allocator, ctx.loaded.doc.source_db.?, ctx.options.staging_dir, .{});
     defer captured.deinit(ctx.allocator);
@@ -842,9 +785,6 @@ fn sourceFingerprint(ctx: *Context) ![32]u8 {
     return captured.destination_sha256;
 }
 
-/// Writes one delta into the derived fail2ban database: a native ban becomes `bans` history plus
-/// the current `bips` row with the original decision time and remaining lease; a released or
-/// expired staged owner removes its `bips` row while `bans` history is kept.
 fn carryBack(conn: fail2ban_db.Connection, delta: durable.Store.MigrationDelta, now_us: i64) !void {
     const canonical = @import("../firewall/scope.zig");
     const scope = try canonical.Scope.decode(&delta.scope);
@@ -884,7 +824,6 @@ fn subjectText(buffer: []u8, subject: anytype) ![]const u8 {
             var stream = std.io.fixedBufferStream(&address_buffer);
             try stream.writer().print("{}", .{v6});
             const written = stream.getWritten();
-            // `[addr]:port` → addr
             const close = std.mem.lastIndexOfScalar(u8, written, ']') orelse return error.InvalidSubject;
             break :blk written[1..close];
         },

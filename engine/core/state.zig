@@ -54,7 +54,6 @@ pub const IpState = struct {
     last_attempt: Timestamp,
     ban_state: BanState,
     ban_expiry: ?Timestamp,
-    /// True only when the dispatcher handed this ban to the firewall; a log-only would-ban stays false so reconcile/expiry never touch the backend for it (BUG-012).
     enforced: bool = false,
     applied: bool = false,
     confirmed: bool = false,
@@ -155,7 +154,6 @@ pub const Cidr = union(enum) {
 fn maskIpv4(prefix: u8) u32 {
     if (prefix == 0) return 0;
     if (prefix >= 32) return 0xFFFF_FFFF;
-    // Arithmetic shift avoids the UB of << 32 on a 32-bit value.
     return @as(u32, 0xFFFF_FFFF) << @intCast(32 - prefix);
 }
 
@@ -291,7 +289,6 @@ pub const StateTracker = struct {
             st.applied = false;
             st.confirmed = false;
             st.ban_count = new_ban_count;
-            // Saturate instead of overflow: a huge duration or near-max clock must not crash the daemon on first ban.
             const duration_i64: Timestamp = @intCast(@min(duration, std.math.maxInt(Timestamp)));
             st.ban_expiry = std.math.add(Timestamp, timestamp, duration_i64) catch blk: {
                 std.log.warn("state: ban_expiry overflow, clamping to Timestamp max", .{});

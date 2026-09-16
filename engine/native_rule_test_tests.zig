@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Component root for the offline rule-test tool: service and rule evaluation, time and
-//! encoding overrides, bounds, exit classes and the no-network default.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -20,7 +18,6 @@ fn iso(text: []const u8) i64 {
     return (time.parse(.iso8601, text, .{}) catch unreachable).us;
 }
 
-/// 2026-04-21T12:00:10Z: ten seconds after the fixture lines so they are all eligible.
 const now_us = iso("2026-04-21T12:00:10Z");
 
 fn base(input: rule_test.Input, rule: rule_test.Rule) rule_test.Options {
@@ -55,10 +52,6 @@ fn runCli(args: []const []const u8) RunResult {
     out.class = rule_test.run(testing.allocator, args, out.stdout.writer(), out.stderr.writer());
     return out;
 }
-
-// ---------------------------------------------------------------------------
-// Builtin services
-// ---------------------------------------------------------------------------
 
 test "native rule test: sshd fixture reports match, miss, ignore and reject with identity and event time" {
     var report = try rule_test.evaluate(testing.allocator, base(.{ .file = fixture("sshd.log") }, .{ .service = "sshd" }));
@@ -140,10 +133,6 @@ test "native rule test: unknown service, internal-event service and invalid rule
     try testing.expectError(error.RuleFileNotFound, rule_test.evaluate(testing.allocator, base(.{ .record = "x" }, .{ .rule_file = fixture("absent.json") })));
 }
 
-// ---------------------------------------------------------------------------
-// Custom native rules
-// ---------------------------------------------------------------------------
-
 test "native rule test: custom template rule reports the native Reason vocabulary" {
     var report = try rule_test.evaluate(testing.allocator, base(.{ .file = fixture("custom.log") }, .{ .rule_file = fixture("custom-rule.json") }));
     defer report.deinit();
@@ -183,10 +172,6 @@ test "native rule test: hostname subject stays raw without --identity dns and re
     const id = sample(&resolved, 1).identity.?;
     try testing.expect(std.mem.startsWith(u8, id, "attacker.invalid (dns:"));
 }
-
-// ---------------------------------------------------------------------------
-// Configuration and time overrides
-// ---------------------------------------------------------------------------
 
 test "native rule test: --config resolves the jail's timestamp, offset and ignoreip" {
     var opts: rule_test.Options = .{ .input = .{ .file = fixture("sshd.log") }, .rule = .{ .service = "sshd" }, .now_us = now_us, .config = fixture("jail.toml") };
@@ -243,7 +228,6 @@ test "native rule test: timestamp format override and future timestamps" {
     defer epoch.deinit();
     try testing.expectEqual(iso("2026-04-21T12:00:00Z"), sample(&epoch, 1).event_time_us.?);
     try testing.expectEqualStrings("time-eligible-event", sample(&epoch, 1).time.?);
-    // Non-syslog formats match the whole line, as the daemon does, so the epoch prefix misses.
     try testing.expectEqual(rule_test.Outcome.miss, sample(&epoch, 1).outcome);
 
     opts.input = .{ .record = "1776776400 Failed password for root from 203.0.113.3 port 22 ssh2" };
@@ -271,10 +255,6 @@ test "native rule test: named time zone is loaded from the zoneinfo root" {
     opts.time_zone = "Not/AZone";
     try testing.expectError(error.TimezoneUnavailable, rule_test.evaluate(testing.allocator, opts));
 }
-
-// ---------------------------------------------------------------------------
-// Encoding, malformed and oversized input
-// ---------------------------------------------------------------------------
 
 test "native rule test: encoding override decodes latin1 and rejects it as utf8" {
     var opts = base(.{ .file = fixture("latin1.log") }, .{ .service = "sshd" });
@@ -340,10 +320,6 @@ test "native rule test: oversized line is rejected and streaming continues; miss
     try testing.expectEqualStrings("line_too_long", sample(&rec, 1).reason);
 }
 
-// ---------------------------------------------------------------------------
-// Bounds and output
-// ---------------------------------------------------------------------------
-
 test "native rule test: samples are bounded by --limit while counts stay complete" {
     var opts = base(.{ .file = fixture("sshd.log") }, .{ .service = "sshd" });
     opts.limit = 2;
@@ -400,10 +376,6 @@ test "native rule test: json and table renderers carry the schema and counts" {
     try testing.expect(std.mem.indexOf(u8, buf.items, "\n1\tmatch\tmatched\t192.168.1.100\t") != null);
 }
 
-// ---------------------------------------------------------------------------
-// Command-line entry and exit classes
-// ---------------------------------------------------------------------------
-
 test "native rule test: run maps success, rejection and usage to the exit classes" {
     var ok = runCli(&.{ "--file", fixture("sshd.log"), "--service", "sshd", "--now", "1776772810", "--tz-offset", "0" });
     defer ok.deinit();
@@ -449,10 +421,6 @@ test "native rule test: run maps success, rejection and usage to the exit classe
     try testing.expectEqual(rule_test.ExitClass.success, table.class);
     try testing.expect(std.mem.indexOf(u8, table.stdout.items, "\n1\tignore\tignored\t203.0.113.5\t") != null);
 }
-
-// ---------------------------------------------------------------------------
-// Journal input
-// ---------------------------------------------------------------------------
 
 test "native rule test: journal input uses the fixed journalctl transport and journal time" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;

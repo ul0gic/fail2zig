@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Wire format: [u32 payload_size LE][body]; command body = [u8 tag][fields], response = [u8 tag][fields].
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -10,7 +9,6 @@ pub const JailId = types.JailId;
 pub const Duration = types.Duration;
 
 pub const max_payload_size: u32 = 1 << 20;
-/// Bounded inline body for the versioned commands; larger requests are rejected before allocation.
 pub const max_request_body: u32 = 16 * 1024;
 pub const request_id_bytes = 32;
 
@@ -22,11 +20,8 @@ pub const CommandId = enum(u8) {
     list_jails = 4,
     reload = 5,
     version = 6,
-    /// Version-1 structured read-only query; body is bounded JSON.
     query_v1 = 7,
-    /// Version-1 typed administration; carries a 32-byte request identity.
     admin_v1 = 8,
-    /// Version-1 configuration reload; carries a 32-byte request identity.
     reload_v1 = 9,
 };
 
@@ -42,7 +37,6 @@ pub const Command = union(CommandId) {
     admin_v1: Request,
     reload_v1: Request,
 
-    /// Inline bounded request body; `len` bytes of `bytes` are meaningful.
     pub const Body = struct {
         len: u32 = 0,
         bytes: [max_request_body]u8 = undefined,
@@ -56,7 +50,6 @@ pub const Command = union(CommandId) {
             return out;
         }
     };
-    /// Mutation request: durable identity first so replay protection never depends on the body.
     pub const Request = struct {
         request_id: [request_id_bytes]u8,
         body: Body,
@@ -90,10 +83,6 @@ pub const Response = union(ResponseTag) {
     pub const Ok = struct { payload: []const u8 };
     pub const Err = struct { code: u16, message: []const u8 };
 
-    /// Daemon error codes are classified, never interpreted from message text.
-    /// 4xx/5xx = the daemon refused or could not perform the request (class 1);
-    /// 507 = a durable effect was applied but verified incomplete (class 4);
-    /// 508 = a durable effect could not be established (class 5).
     pub fn exitClassForCode(code: u16) @import("exit.zig").ExitClass {
         return switch (code) {
             507 => .partial,

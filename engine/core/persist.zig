@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Header 14B (magic 'F2ZS', u16 version=4, u32 count, u32 crc32) + 114B entries (113B v1-v3 layout + flags) + per-jail lifetime block (v3+); v1-v3 loadable.
 
 const std = @import("std");
 const posix = std.posix;
@@ -50,7 +49,6 @@ pub const StateEntry = struct {
     first_attempt: Timestamp,
     last_attempt: Timestamp,
     ban_expiry: ?Timestamp,
-    /// null = pre-v4 file, which never recorded whether the ban reached the firewall; the seeder decides.
     enforced: ?bool = null,
     confirmed: bool = true,
 
@@ -59,7 +57,6 @@ pub const StateEntry = struct {
     }
 };
 
-/// Decides `enforced` for entries loaded from a pre-v4 file, keyed by jail name.
 pub const LegacyEnforcedResolver = struct {
     ctx: ?*anyopaque = null,
     resolve: *const fn (ctx: ?*anyopaque, jail_name: []const u8) bool = assumeEnforced,
@@ -417,7 +414,6 @@ pub fn seed(tracker: *StateTracker, entries: []const StateEntry) Error!void {
     }
 }
 
-/// Preserve temporary-file creation errors so callers can diagnose the actual OS failure.
 pub const SaveError = Error || std.fs.File.OpenError;
 
 pub const PreflightOperation = enum {
@@ -436,8 +432,6 @@ pub const PreflightOperation = enum {
     remove_probe,
 };
 
-/// Check the current save environment without changing saved state or an existing .tmp.
-/// This is not a reservation of disk space or a guarantee against later failures.
 pub fn checkWritable(path: []const u8, operation: *PreflightOperation) !void {
     operation.* = .validate_path;
     if (path.len == 0 or path.len + 4 > 4096) return error.PathTooLong;
@@ -469,7 +463,6 @@ pub fn checkWritable(path: []const u8, operation: *PreflightOperation) !void {
     var name_buf: [64]u8 = undefined;
     const probe_name = try std.fmt.bufPrint(&name_buf, ".fail2zig-startup-{s}", .{hex});
     operation.* = .create_probe;
-    // Reserve our own rename destination; never replace an administrator's file.
     const reservation = try dir.createFile(probe_name, .{ .exclusive = true, .mode = 0o600 });
     reservation.close();
     defer dir.deleteFile(probe_name) catch {};

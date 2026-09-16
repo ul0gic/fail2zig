@@ -2,14 +2,13 @@
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
 
-// Version single source of truth; build.zig.zon .version must match (release-stamp bumps both).
-const fail2zig_version = "0.3.1-dev";
+const fail2zig_version = "0.4.0";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const strip = b.option(bool, "strip", "Strip debug information from the executable") orelse false;
 
-    // Pinned upstream amalgamation: embedded storage, no installed SQLite library.
     const sqlite = b.addStaticLibrary(.{
         .name = "sqlite3",
         .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
@@ -38,7 +37,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Reusable administration modules stay internal to the one delivered executable.
     const client_mod = b.createModule(.{
         .root_source_file = b.path("client/main.zig"),
         .target = target,
@@ -54,6 +52,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    engine_mod.strip = strip;
     engine_mod.addImport("shared", shared_mod);
     engine_mod.addImport("build_options", build_options_mod);
     engine_mod.addImport("cli", client_mod);
@@ -65,12 +64,26 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(engine_exe);
 
+    const release_lifecycle_mod = b.createModule(.{
+        .root_source_file = b.path("tests/e2e/ban_lifecycle.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const release_lifecycle_exe = b.addExecutable(.{
+        .name = "fail2zig-release-lifecycle",
+        .root_module = release_lifecycle_mod,
+    });
+    const install_release_lifecycle = b.addInstallArtifact(release_lifecycle_exe, .{});
+    b.step("test-release-lifecycle", "Build the test-only privileged release lifecycle helper").dependOn(&install_release_lifecycle.step);
+
     const run_engine = b.addRunArtifact(engine_exe);
     run_engine.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_engine.addArgs(args);
     b.step("run", "Run the fail2zig daemon").dependOn(&run_engine.step);
 
     const test_step = b.step("test", "Run all tests (engine, client, shared, integration)");
+    const release_local_step = b.step("test-release-local", "Run the bounded assembled local release gate");
     const test_filters: []const []const u8 = if (test_filter) |f| &.{f} else &.{};
 
     const engine_tests = b.addTest(.{
@@ -81,7 +94,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_engine_tests.step);
     b.step("test-engine", "Run native daemon tests").dependOn(&run_engine_tests.step);
 
-    // Independent N2 delivery roots do not install or share daemon artifacts.
     inline for (.{
         .{ "test-native-firewall", "engine/native_firewall_tests.zig", "native firewall:" },
         .{ "test-native-rules", "engine/native_rule_tests.zig", "native rules:" },
@@ -118,7 +130,6 @@ pub fn build(b: *std.Build) void {
         b.step(entry[0], "Test isolated N2 native component delivery").dependOn(&run_tests.step);
     }
 
-    // Isolated component roots: never install or read zig-out artifacts.
     inline for (.{
         .{ "test-native-ipc-auth", "engine/native_ipc_auth_tests.zig", "native ipc auth:", false },
         .{ "test-native-migration-snapshot", "engine/migration_snapshot_tests.zig", "migration snapshot:", true },
@@ -149,8 +160,6 @@ pub fn build(b: *std.Build) void {
         b.step(entry[0], "Test isolated native component delivery").dependOn(&run_tests.step);
     }
 
-    // Deterministic coordinator ownership/publication races live beside the private state they
-    // exercise; this root collects only those cases without installing or spawning the daemon.
     const coordination_mod = b.createModule(.{
         .root_source_file = b.path("engine/native_daemon.zig"),
         .target = target,
@@ -163,25 +172,21 @@ pub fn build(b: *std.Build) void {
     const coordination_tests = b.addTest(.{ .root_module = coordination_mod, .filters = &.{"native daemon BUG-0"} });
     b.step("test-native-coordination", "Test deterministic daemon ownership and publication races").dependOn(&b.addRunArtifact(coordination_tests).step);
 
-    // Native source/storage foundations and retained pure preparation fixtures.
-    // The historical step name remains a command alias for this test root.
-    const parity_runtime_mod = b.createModule(.{
-        .root_source_file = b.path("engine/parity_runtime_tests.zig"),
+    const native_foundations_mod = b.createModule(.{
+        .root_source_file = b.path("engine/native_foundations_tests.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    parity_runtime_mod.addImport("shared", shared_mod);
-    const parity_runtime_tests = b.addTest(.{ .root_module = parity_runtime_mod, .filters = test_filters });
-    parity_runtime_mod.linkLibrary(sqlite);
-    const run_parity_runtime_tests = b.addRunArtifact(parity_runtime_tests);
-    test_step.dependOn(&run_parity_runtime_tests.step);
-    b.step("test-p2-runtime", "Test native source/storage and pure preparation foundations").dependOn(&run_parity_runtime_tests.step);
+    native_foundations_mod.addImport("shared", shared_mod);
+    const native_foundations_tests = b.addTest(.{ .root_module = native_foundations_mod, .filters = test_filters });
+    native_foundations_mod.linkLibrary(sqlite);
+    const run_native_foundations_tests = b.addRunArtifact(native_foundations_tests);
+    test_step.dependOn(&run_native_foundations_tests.step);
 
-    const native_foundations = b.addTest(.{ .root_module = parity_runtime_mod, .filters = &.{ "storage health:", "native processor:", "record store:", "pipeline:", "receipt recovery:", "future time:", "time admission:", "event age:", "year inference:", "native journal:", "clock recovery:", "native retry:" } });
+    const native_foundations = b.addTest(.{ .root_module = native_foundations_mod, .filters = &.{ "storage health:", "native processor:", "record store:", "pipeline:", "receipt recovery:", "future time:", "time admission:", "event age:", "year inference:", "native journal:", "clock recovery:", "native retry:" } });
     b.step("test-native-foundations", "Test native storage, time, sources and recovery without legacy workers").dependOn(&b.addRunArtifact(native_foundations).step);
 
-    // Focused native detection gate.
     const detection_mod = b.createModule(.{
         .root_source_file = b.path("engine/native_detection_tests.zig"),
         .target = target,
@@ -211,8 +216,6 @@ pub fn build(b: *std.Build) void {
     b.step("test-native-retry", "Test transactional native retry state and decisions").dependOn(&run_retry_tests.step);
     test_step.dependOn(&run_retry_tests.step);
 
-    // Explicit offline qualification against a separately captured lab journal.
-    // Never contact a host or require private lab artifacts in ordinary tests.
     const journal_lab_mod = b.createModule(.{
         .root_source_file = b.path("engine/journal_origin_lab_tests.zig"),
         .target = target,
@@ -255,6 +258,23 @@ pub fn build(b: *std.Build) void {
     const guard_tests = b.addTest(.{ .root_module = guard_mod, .filters = test_filters });
     test_step.dependOn(&b.addRunArtifact(guard_tests).step);
 
+    const standalone_options = b.addOptions();
+    standalone_options.addOption(?[]const u8, "release_dir", b.option([]const u8, "release-dir", "Directory of five named release artifacts for ELF inspection"));
+    standalone_options.addOption([]const u8, "repo_root", b.pathFromRoot("."));
+    standalone_options.addOption([]const u8, "daemon_path", b.pathFromRoot("zig-out/bin/fail2zig"));
+    const standalone_mod = b.createModule(.{
+        .strip = strip,
+        .root_source_file = b.path("tests/integration/standalone_surface_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    standalone_mod.addImport("standalone_test_options", standalone_options.createModule());
+    const standalone_tests = b.addTest(.{ .root_module = standalone_mod, .filters = &.{"standalone surface:"} });
+    const run_standalone_tests = b.addRunArtifact(standalone_tests);
+    run_standalone_tests.step.dependOn(b.getInstallStep());
+    b.step("test-standalone-surface", "Verify required product and release paths have no interpreter dependency").dependOn(&run_standalone_tests.step);
+    release_local_step.dependOn(&run_standalone_tests.step);
+
     const integration_mod = b.createModule(.{
         .root_source_file = b.path("tests/integration_ipc_roundtrip.zig"),
         .target = target,
@@ -295,6 +315,7 @@ pub fn build(b: *std.Build) void {
     };
     for (integration_files) |f| {
         const mod = b.createModule(.{
+            .strip = strip,
             .root_source_file = b.path(f.path),
             .target = target,
             .optimize = optimize,
@@ -305,12 +326,25 @@ pub fn build(b: *std.Build) void {
         const t = b.addTest(.{ .root_module = mod, .filters = test_filters });
         const run = b.addRunArtifact(t);
         if (f.needs_daemon_binary) run.step.dependOn(b.getInstallStep());
+        if (std.mem.eql(u8, f.name, "native_daemon") or
+            std.mem.eql(u8, f.name, "startup_failclosed") or
+            std.mem.eql(u8, f.name, "journalctl_contract") or
+            std.mem.eql(u8, f.name, "no_backend") or
+            std.mem.eql(u8, f.name, "cli_entry") or
+            std.mem.eql(u8, f.name, "reload") or
+            std.mem.eql(u8, f.name, "service_lifecycle") or
+            std.mem.eql(u8, f.name, "admin"))
+        {
+            release_local_step.dependOn(&run.step);
+        }
         if (std.mem.eql(u8, f.name, "startup_failclosed"))
             b.step("test-startup", "Run daemon startup integration tests").dependOn(&run.step);
         if (std.mem.eql(u8, f.name, "native_daemon"))
             b.step("test-native-daemon", "Run actual native daemon ingestion and restart tests").dependOn(&run.step);
         if (std.mem.eql(u8, f.name, "config_diag"))
             b.step("test-config-diag", "Run configuration diagnostic entry-point tests").dependOn(&run.step);
+        if (std.mem.eql(u8, f.name, "no_backend"))
+            b.step("test-no-backend", "Run native backend selection and fail-closed integration tests").dependOn(&run.step);
         if (std.mem.eql(u8, f.name, "admin"))
             b.step("test-admin", "Run typed administration daemon tests").dependOn(&run.step);
         if (std.mem.eql(u8, f.name, "reload"))
@@ -323,6 +357,24 @@ pub fn build(b: *std.Build) void {
             b.step("test-journalctl", "Qualify host journalctl against original offline fixtures").dependOn(&run.step);
         test_step.dependOn(&run.step);
     }
+
+    const release_migration_options = b.addOptions();
+    release_migration_options.addOption([]const u8, "daemon_path", b.pathFromRoot("zig-out/bin/fail2zig"));
+    release_migration_options.addOption([]const u8, "supported_fixture", b.pathFromRoot("tests/fixtures/fail2ban/config/stock-1.1.1"));
+    const release_migration_mod = b.createModule(.{
+        .strip = strip,
+        .root_source_file = b.path("tests/integration/release_migration_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    release_migration_mod.addImport("engine", engine_mod);
+    release_migration_mod.addImport("release_migration_test_options", release_migration_options.createModule());
+    const release_migration_tests = b.addTest(.{ .root_module = release_migration_mod, .filters = &.{"release migration:"} });
+    const run_release_migration = b.addRunArtifact(release_migration_tests);
+    run_release_migration.step.dependOn(b.getInstallStep());
+    b.step("test-release-migration", "Run bounded one-executable release migration tests").dependOn(&run_release_migration.step);
+    release_local_step.dependOn(&run_release_migration.step);
 
     const parser_only_mod = b.createModule(.{
         .root_source_file = b.path("engine/core/parser.zig"),

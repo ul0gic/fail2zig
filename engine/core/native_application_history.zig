@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Typed bounded application reads over immutable confirmed events and retry
-//! policy summaries. SQL construction and durable mutation remain in Store.
 const std = @import("std");
 const detection = @import("native_detection_record.zig");
 const effect_history = @import("native_effect_history.zig");
