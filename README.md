@@ -5,7 +5,6 @@
 **A Linux intrusion prevention daemon written in Zig.**
 
 [![CI](https://img.shields.io/github/actions/workflow/status/ul0gic/fail2zig/ci.yml?branch=main&label=CI&logo=github)](https://github.com/ul0gic/fail2zig/actions/workflows/ci.yml)
-[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/ul0gic/fail2zig/badge)](https://scorecard.dev/viewer/?uri=github.com/ul0gic/fail2zig)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 [![Zig](https://img.shields.io/badge/zig-0.14.1-F7A41D?logo=zig&logoColor=white)](https://ziglang.org/download/)
 [![Platform](https://img.shields.io/badge/platform-Debian%2013%20x86__64-lightgrey)](#installation)
