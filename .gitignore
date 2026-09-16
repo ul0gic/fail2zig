@@ -24,3 +24,8 @@ Screenshot*.jpg
 Screenshot*.jpeg
 
 .env
+
+# Committed test inputs, not generated logs or compiler dependency files.
+!tests/fixtures/**/*.log
+!tests/fixtures/**/*.d/
+!tests/fixtures/**/*.d/**

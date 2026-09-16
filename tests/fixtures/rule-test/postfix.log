@@ -1,0 +1,3 @@
+Apr 21 12:00:00 mail postfix/smtpd[1234]: NOQUEUE: reject: RCPT from unknown[203.0.113.20]: 554 5.7.1 Relay access denied
+Apr 21 12:00:01 mail postfix/smtpd[1234]: warning: unknown[203.0.113.21]: SASL LOGIN authentication failed: authentication failure
+Apr 21 12:00:02 mail postfix/smtpd[1234]: connect from mail.example.org[198.51.100.3]

@@ -1,0 +1,3 @@
+2026/04/21 12:00:00 [error] 1#1: *1 no user/password was provided for basic authentication, client: 203.0.113.60, server: example.org, request: "GET /admin HTTP/1.1"
+2026/04/21 12:00:01 [error] 1#1: *2 user "admin": password mismatch, client: 203.0.113.61, server: example.org, request: "GET /admin HTTP/1.1"
+2026/04/21 12:00:02 [notice] 1#1: signal process started

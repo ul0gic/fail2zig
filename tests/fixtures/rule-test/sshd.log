@@ -1,0 +1,6 @@
+Apr 21 12:00:00 host sshd[1001]: Failed password for root from 192.168.1.100 port 43210 ssh2
+Apr 21 12:00:01 host sshd[1001]: Failed password for invalid user oracle from 203.0.113.55 port 22 ssh2
+Apr 21 12:00:02 host sshd[1002]: Accepted publickey for ops from 198.51.100.7 port 5000 ssh2
+Apr 21 12:00:03 host sshd[1003]: Failed password for admin from 127.0.0.1 port 22 ssh2
+Failed password for root from 203.0.113.9 port 22 ssh2
+Apr 21 12:00:05 host sshd[1004]: Failed password for root from 10.0.0.1 port 22 ssh2

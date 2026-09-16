@@ -1,0 +1,2 @@
+Apr 21 12:00:00 mail dovecot: imap-login: Disconnected (auth failed, 1 attempts in 2 secs): user=<admin>, method=PLAIN, rip=203.0.113.30, lip=10.0.0.1
+Apr 21 12:00:01 mail dovecot: imap-login: Login: user=<ops>, method=PLAIN, rip=198.51.100.4, lip=10.0.0.1
