@@ -20,15 +20,16 @@ The supported migration workflow inspects fail2ban inputs, captures a read-only 
 plans and validates the native projection, and performs journaled cutover/rollback. Unsupported
 configuration is reported for operator action; exact fail2ban compatibility is not promised.
 
-Version 0.4.0 consolidates
+Version 0.4.1 provides
 daemon and administration functions into one static executable per architecture and requires no Python or
 shared SQLite library at runtime. Its [runtime architecture](docs/architecture.md) uses
 statically embedded SQLite for source receipts, consumer state, protection ownership and
 confirmed history. Host requirements remain explicit: journal input uses journald and
 `journalctl`; the iptables and ipset backends invoke those tools with fixed arguments; nftables
-talks directly to the kernel. Selected live qualification passed on Debian 13 x86_64 before the version-only change
-from the unpublished 0.3.1 candidate to 0.4.0. The rebuilt artifacts passed cross-build and native/emulated command checks.
-Contemporary Ubuntu may work, but is untested and is not a release gate.
+talks directly to the kernel. The 0.4.0 release received selected live qualification on
+Debian 13 x86_64. The 0.4.1 SSH-default repair additionally passed isolated log-only origin
+and restart checks on Debian 13 and Ubuntu 24.04; this does not establish Ubuntu firewall
+qualification or full platform support.
 
 ---
 
@@ -76,7 +77,7 @@ The installer pulls from the
 [latest GitHub Release](https://github.com/ul0gic/fail2zig/releases/latest)
 and verifies every asset against the published `SHA256SUMS` before placing
 anything on disk. Pin a specific version with
-`FAIL2ZIG_VERSION=v0.4.0` or inspect the script first with
+`FAIL2ZIG_VERSION=v0.4.1` or inspect the script first with
 `curl -fsSL … | less`.
 
 ---
@@ -167,29 +168,28 @@ configuration, and installs the hardened `fail2zig.service` unit under
 `/etc/systemd/system/`. It does **not** auto-start the daemon — audit the config,
 then run `systemctl enable --now fail2zig` when ready.
 
-**0.4.0 release targets** (one combined daemon/admin executable each):
+**0.4.1 release targets** (one combined daemon/admin executable each):
 
 | Target | Hardware | Validation |
 |--------|----------|------------|
-| `x86_64-linux-musl` | x86_64 servers and VPSes | Full live qualification on Debian 13 |
+| `x86_64-linux-musl` | x86_64 servers and VPSes | Prior 0.4.0 Debian baseline; 0.4.1 Debian/Ubuntu SSH log-only and restart checks |
 | `aarch64-linux-musl` | ARM64 | Cross-build, static inspection and QEMU smoke |
 | `arm-linux-musleabihf` | ARMv7, hard float | Cross-build, static inspection and QEMU smoke |
 | `mips-linux-musleabi` | MIPS32r2, big endian, soft float | Cross-build, static inspection and QEMU smoke |
 | `mipsel-linux-musleabi` | MIPS32r2, little endian, soft float | Cross-build, static inspection and QEMU smoke |
 
-The candidate passed these validation tiers. Publication remains a separate release step.
-Emulated checks do not qualify real hardware or kernel enforcement. Contemporary Ubuntu on
-x86_64 may work, but is untested. Legacy firewall modes
-and journal ingestion require their documented host tools.
+These are the release validation tiers. Emulated checks do not qualify real hardware or
+kernel enforcement. Ubuntu checks cover the SSH repair, not full platform support.
+Legacy firewall modes and journal ingestion require their documented host tools.
 
 The release allowlist is exactly:
 
 ```text
-fail2zig-v0.4.0-x86_64-linux-musl
-fail2zig-v0.4.0-aarch64-linux-musl
-fail2zig-v0.4.0-arm-linux-musleabihf
-fail2zig-v0.4.0-mips-linux-musleabi
-fail2zig-v0.4.0-mipsel-linux-musleabi
+fail2zig-v0.4.1-x86_64-linux-musl
+fail2zig-v0.4.1-aarch64-linux-musl
+fail2zig-v0.4.1-arm-linux-musleabihf
+fail2zig-v0.4.1-mips-linux-musleabi
+fail2zig-v0.4.1-mipsel-linux-musleabi
 fail2zig.service
 fail2zig.toml.example
 install.sh
@@ -221,7 +221,7 @@ If you'd rather skip the script:
 ```bash
 # 1. Download the allowlisted release files
 set -euo pipefail
-VERSION=v0.4.0
+VERSION=v0.4.1
 ARCH=x86_64-linux-musl
 BASE="https://github.com/ul0gic/fail2zig/releases/download/${VERSION}"
 for file in \
@@ -268,8 +268,9 @@ ls zig-out/bin/
 
 ### Release build target
 
-The 0.4.0 release builds the five targets above (see
-[.github/workflows/release.yml](.github/workflows/release.yml)):
+Build each of the five targets above before publication. The
+[release workflow](.github/workflows/release.yml) verifies and publishes retained artifacts
+without rebuilding them:
 
 ```bash
 make release-all
@@ -381,6 +382,12 @@ enabled = false            # enable only when the log exists on this host
 filter  = "nginx-botsearch"
 logpath = ["/var/log/nginx/access.log"]
 ```
+
+Version 0.4.1 restores automatic trusted SSH executable discovery for a built-in
+SSH journal jail when `journal_executables` is omitted. Version 0.4.0 requires an
+explicit list, as above. An explicit list remains an exact override; `[]` is rejected.
+Custom journal rules require an explicit profile. See `fail2zig.toml(5)` for discovery paths
+and restart limitations when an SSH layout or source profile changes.
 
 After editing:
 

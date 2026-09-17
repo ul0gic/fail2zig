@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing draft release tag (must be v0.4.0)
+        description: Existing draft release tag (must be v0.4.1)
         required: true
         type: string
       source_commit:
@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       binary_sha256:
-        description: Approved SHA-256 of fail2zig-v0.4.0-x86_64-linux-musl
+        description: Approved SHA-256 of fail2zig-v0.4.1-x86_64-linux-musl
         required: true
         type: string
       manifest_sha256:
@@ -48,8 +48,8 @@ jobs:
       - name: Verify approved source and tag
         shell: bash
         run: |
-          if [[ "${RELEASE_TAG}" != "v0.4.0" ]]; then
-            echo "::error::this workflow publishes only the approved v0.4.0 release"
+          if [[ "${RELEASE_TAG}" != "v0.4.1" ]]; then
+            echo "::error::this workflow publishes only the approved v0.4.1 release"
             exit 1
           fi
           if [[ ! "${SOURCE_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
@@ -99,15 +99,15 @@ jobs:
       - name: Verify exact candidate bytes
         shell: bash
         run: |
-          expected_version="0.4.0"
-          binary="fail2zig-v0.4.0-x86_64-linux-musl"
+          expected_version="0.4.1"
+          binary="fail2zig-v0.4.1-x86_64-linux-musl"
 
           printf '%s\n' \
             "${binary}" \
-            fail2zig-v0.4.0-aarch64-linux-musl \
-            fail2zig-v0.4.0-arm-linux-musleabihf \
-            fail2zig-v0.4.0-mips-linux-musleabi \
-            fail2zig-v0.4.0-mipsel-linux-musleabi \
+            fail2zig-v0.4.1-aarch64-linux-musl \
+            fail2zig-v0.4.1-arm-linux-musleabihf \
+            fail2zig-v0.4.1-mips-linux-musleabi \
+            fail2zig-v0.4.1-mipsel-linux-musleabi \
             COPYING.date-profile \
             LICENSE \
             SHA256SUMS \
@@ -129,10 +129,10 @@ jobs:
 
           printf '%s\n' \
             "${binary}" \
-            fail2zig-v0.4.0-aarch64-linux-musl \
-            fail2zig-v0.4.0-arm-linux-musleabihf \
-            fail2zig-v0.4.0-mips-linux-musleabi \
-            fail2zig-v0.4.0-mipsel-linux-musleabi \
+            fail2zig-v0.4.1-aarch64-linux-musl \
+            fail2zig-v0.4.1-arm-linux-musleabihf \
+            fail2zig-v0.4.1-mips-linux-musleabi \
+            fail2zig-v0.4.1-mipsel-linux-musleabi \
             COPYING.date-profile \
             LICENSE \
             SQLITE-NOTICE.md \
@@ -154,7 +154,7 @@ jobs:
 
           for target in x86_64-linux-musl aarch64-linux-musl arm-linux-musleabihf \
             mips-linux-musleabi mipsel-linux-musleabi; do
-            artifact="candidate/fail2zig-v0.4.0-${target}"
+            artifact="candidate/fail2zig-v0.4.1-${target}"
             case "$target" in
               x86_64-*) expected='ELF 64-bit LSB.*x86-64' ;;
               aarch64-*) expected='ELF 64-bit LSB.*ARM aarch64' ;;
@@ -219,15 +219,15 @@ jobs:
       - name: Verify published allowlist and checksums
         shell: bash
         run: |
-          expected_version="0.4.0"
-          binary="fail2zig-v0.4.0-x86_64-linux-musl"
+          expected_version="0.4.1"
+          binary="fail2zig-v0.4.1-x86_64-linux-musl"
 
           printf '%s\n' \
             "${binary}" \
-            fail2zig-v0.4.0-aarch64-linux-musl \
-            fail2zig-v0.4.0-arm-linux-musleabihf \
-            fail2zig-v0.4.0-mips-linux-musleabi \
-            fail2zig-v0.4.0-mipsel-linux-musleabi \
+            fail2zig-v0.4.1-aarch64-linux-musl \
+            fail2zig-v0.4.1-arm-linux-musleabihf \
+            fail2zig-v0.4.1-mips-linux-musleabi \
+            fail2zig-v0.4.1-mipsel-linux-musleabi \
             COPYING.date-profile \
             LICENSE \
             SHA256SUMS \
@@ -249,10 +249,10 @@ jobs:
 
           printf '%s\n' \
             "${binary}" \
-            fail2zig-v0.4.0-aarch64-linux-musl \
-            fail2zig-v0.4.0-arm-linux-musleabihf \
-            fail2zig-v0.4.0-mips-linux-musleabi \
-            fail2zig-v0.4.0-mipsel-linux-musleabi \
+            fail2zig-v0.4.1-aarch64-linux-musl \
+            fail2zig-v0.4.1-arm-linux-musleabihf \
+            fail2zig-v0.4.1-mips-linux-musleabi \
+            fail2zig-v0.4.1-mipsel-linux-musleabi \
             COPYING.date-profile \
             LICENSE \
             SQLITE-NOTICE.md \

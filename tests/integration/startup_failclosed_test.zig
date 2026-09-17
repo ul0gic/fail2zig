@@ -426,3 +426,206 @@ test "integration: fail-closed helper: trace detector matches Zig frame lines an
     try testing.expect(!hasErrorReturnTrace("config: /etc/fail2zig/config.toml:37:1: UnknownKey (key 'x' in [global])\n"));
     try testing.expect(!hasErrorReturnTrace("0x in nothing"));
 }
+
+// Journal startup cases use isolated log-only state; no host firewall mutation.
+fn writeJournalProfileConfig(s: *Scenario, source: []const u8, profile: []const u8) !void {
+    var file = try std.fs.cwd().createFile(s.config_path, .{ .mode = 0o600 });
+    defer file.close();
+    try file.writer().print(
+        \\[global]
+        \\socket_path = "{s}/control.sock"
+        \\state_file = "{s}/state.bin"
+        \\metrics_bind = "127.0.0.1"
+        \\metrics_port = {d}
+        \\[defaults]
+        \\enforce = false
+        \\[jails.sshd]
+        \\enabled = true
+        \\filter = "sshd"
+        \\{s}
+        \\{s}
+        \\
+    , .{ s.root, s.root, s.metrics_port, source, profile });
+}
+
+fn requireJournalProfileHost() !void {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // These are metadata fixtures, not SSH emitters; no detection claim follows
+    // from admitting them. Fail rather than silently skipping an unsafe fixture.
+    for ([_][]const u8{ "/usr/bin/true", "/usr/bin/false", "/usr/bin/journalctl" }) |path| {
+        var file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return error.SkipZigTest,
+            else => return err,
+        };
+        defer file.close();
+        const stat = try posix.fstat(file.handle);
+        try testing.expect(posix.S.ISREG(stat.mode));
+        try testing.expectEqual(@as(u32, 0), stat.uid);
+        try testing.expect(stat.mode & 0o022 == 0 and stat.mode & 0o111 != 0);
+    }
+}
+
+test "integration: journal profile BUG-051 omitted auto and explicit sources pass source admission" {
+    try requireJournalProfileHost();
+    // This connected case needs an installed SSH daemon; resolver unit fixtures
+    // cover absence independently. Genuine traffic is a separate isolated gate.
+    std.fs.accessAbsolute("/usr/sbin/sshd", .{}) catch return error.SkipZigTest;
+    const a = testing.allocator;
+    for ([_][]const u8{ "", "source = \"journald\"" }) |source| {
+        var s = try Scenario.init(a);
+        defer s.deinit();
+        const addr = try std.net.Address.parseIp4("127.0.0.1", s.metrics_port);
+        var holder = try addr.listen(.{ .reuse_address = true });
+        defer holder.deinit();
+        try writeJournalProfileConfig(&s, source, "");
+        var validation = try runDaemon(a, &.{ daemon_path, "--config", s.config_path, "--validate-config" });
+        defer validation.deinit(a);
+        try testing.expectEqual(@as(?u8, 0), validation.exitCode());
+        var run = try s.run();
+        defer run.deinit(a);
+        try expectFailClosed(&run);
+        try expectContains(run.stderr, "native: HTTP listener");
+        try expectContains(run.stderr, "AddressInUse");
+        try expectNotContains(run.stderr, "InvalidJournalExecutables");
+        try s.tmp.dir.access("state.bin", .{});
+        try testing.expectError(error.FileNotFound, s.tmp.dir.access("control.sock", .{}));
+    }
+}
+
+test "integration: journal profile explicit empty missing duplicate and excessive lists refuse before state creation" {
+    try requireJournalProfileHost();
+    const a = testing.allocator;
+    const cases = [_]struct { value: []const u8, cause: []const u8 }{
+        .{ .value = "[]", .cause = "InvalidJournalExecutables" },
+        .{ .value = "[\"/usr/bin/true\", \"/usr/bin/true\"]", .cause = "DuplicateJournalExecutable" },
+        .{ .value = "[\"/usr/bin/true\",\"/usr/bin/true\",\"/usr/bin/true\",\"/usr/bin/true\",\"/usr/bin/true\",\"/usr/bin/true\",\"/usr/bin/true\",\"/usr/bin/true\",\"/usr/bin/true\"]", .cause = "InvalidJournalExecutables" },
+    };
+    for (cases) |case| {
+        var s = try Scenario.init(a);
+        defer s.deinit();
+        const setting = try std.fmt.allocPrint(a, "journal_executables = {s}", .{case.value});
+        defer a.free(setting);
+        try writeJournalProfileConfig(&s, "source = \"journald\"", setting);
+        var run = try s.run();
+        defer run.deinit(a);
+        try expectFailClosed(&run);
+        try expectContains(run.stderr, case.cause);
+        try testing.expectError(error.FileNotFound, s.tmp.dir.access("state.bin", .{}));
+    }
+    var s = try Scenario.init(a);
+    defer s.deinit();
+    const setting = try std.fmt.allocPrint(a, "journal_executables = [\"{s}/missing-sshd\"]", .{s.root});
+    defer a.free(setting);
+    try writeJournalProfileConfig(&s, "source = \"journald\"", setting);
+    var run = try s.run();
+    defer run.deinit(a);
+    try expectFailClosed(&run);
+    try expectContains(run.stderr, "FileNotFound");
+    try testing.expectError(error.FileNotFound, s.tmp.dir.access("state.bin", .{}));
+}
+
+test "integration: journal profile custom rules cannot inherit automatic SSH trust" {
+    try requireJournalProfileHost();
+    const a = testing.allocator;
+    var s = try Scenario.init(a);
+    defer s.deinit();
+    const rule =
+        \\{"id":"login","source":"application","format":"json","subject":"peer","subject_kind":"ip","conditions":[{"field":"result","text":"denied"}]}
+    ;
+    try s.tmp.dir.writeFile(.{ .sub_path = "rule.json", .data = rule, .flags = .{ .mode = 0o600 } });
+    const setting = try std.fmt.allocPrint(a, "rule_files = [\"{s}/rule.json\"]", .{s.root});
+    defer a.free(setting);
+    try writeJournalProfileConfig(&s, "source = \"journald\"", setting);
+    var run = try s.run();
+    defer run.deinit(a);
+    try expectFailClosed(&run);
+    try expectContains(run.stderr, "InvalidJournalExecutables");
+    try expectContains(run.stderr, "nonempty explicit profile");
+    try testing.expectError(error.FileNotFound, s.tmp.dir.access("state.bin", .{}));
+}
+
+test "integration: journal profile refuses unsafe file and directory origins" {
+    try requireJournalProfileHost();
+    const a = testing.allocator;
+    var s = try Scenario.init(a);
+    defer s.deinit();
+    const setting = try std.fmt.allocPrint(a, "journal_executables = [\"{s}/origin\"]", .{s.root});
+    defer a.free(setting);
+    try writeJournalProfileConfig(&s, "source = \"journald\"", setting);
+    // Under a non-root runner, file UID alone also makes these unsafe. This
+    // proves refusal, not independent coverage of every mode predicate.
+    for ([_]posix.mode_t{ 0o777, 0o644 }) |mode| {
+        var file = try s.tmp.dir.createFile("origin", .{});
+        try file.chmod(mode);
+        file.close();
+        var run = try s.run();
+        defer run.deinit(a);
+        try expectFailClosed(&run);
+        try expectContains(run.stderr, "UnqualifiedJournalExecutable");
+        try testing.expectError(error.FileNotFound, s.tmp.dir.access("state.bin", .{}));
+    }
+    try s.tmp.dir.deleteFile("origin");
+    try s.tmp.dir.makeDir("origin");
+    var run = try s.run();
+    defer run.deinit(a);
+    try expectFailClosed(&run);
+    try expectContains(run.stderr, "UnqualifiedJournalExecutable");
+    try testing.expectError(error.FileNotFound, s.tmp.dir.access("state.bin", .{}));
+}
+
+fn expectJournalStateClosed(s: *Scenario) !void {
+    for ([_][]const u8{ "state.bin-wal", "state.bin-shm", "state.bin-journal" }) |name|
+        try testing.expectError(error.FileNotFound, s.tmp.dir.access(name, .{}));
+}
+
+test "integration: journal profile changed ordering refuses while retaining database contents" {
+    try requireJournalProfileHost();
+    const a = testing.allocator;
+    var s = try Scenario.init(a);
+    defer s.deinit();
+    // An occupied HTTP port terminates startup after source/state admission,
+    // without ingesting the host journal or leaving a daemon behind.
+    const addr = try std.net.Address.parseIp4("127.0.0.1", s.metrics_port);
+    var holder = try addr.listen(.{ .reuse_address = true });
+    defer holder.deinit();
+    const original = "journal_executables = [\"/usr/bin/true\", \"/usr/bin/false\"]";
+    try writeJournalProfileConfig(&s, "source = \"journald\"", original);
+    {
+        var run = try s.run();
+        defer run.deinit(a);
+        try expectFailClosed(&run);
+        try expectContains(run.stderr, "native: HTTP listener");
+        try expectContains(run.stderr, "AddressInUse");
+    }
+    try expectJournalStateClosed(&s);
+    const before = try s.tmp.dir.readFileAlloc(a, "state.bin", 16 * 1024 * 1024);
+    defer a.free(before);
+    try writeJournalProfileConfig(&s, "source = \"journald\"", "journal_executables = [\"/usr/bin/false\", \"/usr/bin/true\"]");
+    {
+        var run = try s.run();
+        defer run.deinit(a);
+        try expectFailClosed(&run);
+        try expectContains(run.stderr, "RetryGenerationMismatch");
+    }
+    try expectJournalStateClosed(&s);
+    const after = try s.tmp.dir.readFileAlloc(a, "state.bin", 16 * 1024 * 1024);
+    defer a.free(after);
+    try testing.expect(before.len >= 100);
+    try testing.expectEqual(before.len, after.len);
+    // Store.open commits its application_id pragma before runtime admission.
+    // SQLite may advance its two 4-byte header change counters (offsets 24/92;
+    // vendor/sqlite/sqlite3.c pager_write_changecounter). Compare every other
+    // byte, including all data pages, and require each counter pair to agree.
+    try testing.expectEqualSlices(u8, before[24..28], before[92..96]);
+    try testing.expectEqualSlices(u8, after[24..28], after[92..96]);
+    try testing.expectEqualSlices(u8, before[0..24], after[0..24]);
+    try testing.expectEqualSlices(u8, before[28..92], after[28..92]);
+    try testing.expectEqualSlices(u8, before[96..], after[96..]);
+    try writeJournalProfileConfig(&s, "source = \"journald\"", original);
+    var restored = try s.run();
+    defer restored.deinit(a);
+    try expectFailClosed(&restored);
+    try expectContains(restored.stderr, "native: HTTP listener");
+    try expectContains(restored.stderr, "AddressInUse");
+    try expectNotContains(restored.stderr, "RetryGenerationMismatch");
+}

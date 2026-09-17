@@ -49,6 +49,42 @@ test "native reload: identical proposals are no-ops" {
     try t.expectEqual(@as(u8, 0), out.policy_count);
 }
 
+test "native reload: explicit journal profile changes never become live policy updates" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const header =
+        \\[defaults]
+        \\enforce = false
+        \\[jails.sshd]
+        \\filter = "sshd"
+        \\source = "journald"
+        \\
+    ;
+    const initial = "journal_executables = [\"/usr/sbin/sshd\", \"/usr/lib/openssh/sshd-session\"]\n";
+    const current = try parse(a, try std.mem.concat(a, u8, &.{ header, initial }));
+    const omitted = try parse(a, header);
+    const empty = try parse(a, try std.mem.concat(a, u8, &.{ header, "journal_executables = []\n" }));
+    try t.expectEqual(reload.Kind.restart_required, reload.classify(&omitted, &empty, 64).kind);
+    try t.expectEqual(reload.Kind.restart_required, reload.classify(&empty, &omitted, 64).kind);
+    const equivalent = try parse(a, try std.mem.concat(a, u8, &.{ header, initial }));
+    try t.expectEqual(reload.Kind.noop, reload.classify(&current, &equivalent, 64).kind);
+    for ([_][]const u8{
+        "",
+        "journal_executables = []\n",
+        "journal_executables = [\"/usr/lib/openssh/sshd-session\", \"/usr/sbin/sshd\"]\n",
+        "journal_executables = [\"/usr/sbin/sshd\"]\n",
+        "journal_executables = [\"/usr/sbin/sshd\", \"/usr/lib/openssh/sshd-session\", \"/usr/lib/openssh/sshd-auth\"]\n",
+    }) |setting| {
+        const proposed = try parse(a, try std.mem.concat(a, u8, &.{ header, setting, "maxretry = 2\n" }));
+        const result = reload.classify(&current, &proposed, 64);
+        try t.expectEqual(reload.Kind.restart_required, result.kind);
+        try t.expectEqual(@as(u8, 0), result.policy_count);
+        try t.expectEqualStrings("jails.sshd.journal_executables", result.reasonSlice()[0].slice());
+        try t.expectEqualStrings("/usr/sbin/sshd", current.jails[0].journal_executables[0]);
+    }
+}
+
 test "native reload: retry policy and log level changes are live with exact policies" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();

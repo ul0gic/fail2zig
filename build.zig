@@ -2,7 +2,7 @@
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
 
-const fail2zig_version = "0.4.0";
+const fail2zig_version = "0.4.1";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});

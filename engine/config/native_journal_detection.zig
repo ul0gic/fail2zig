@@ -23,6 +23,7 @@ pub const Plan = struct {
     base: ?builtin.Detector,
     qualified: ?journal.Detector,
     profile: origin.Profile,
+    owned_executables: [][]const u8,
     processing: processing.Options,
     journal: transport.Options,
     source_id: []const u8,
@@ -41,12 +42,24 @@ pub const Plan = struct {
         const seconds = jail.effectiveFindtime(cfg.defaults);
         if (seconds == 0) return error.InvalidFindtime;
         const window = std.math.mul(i64, std.math.cast(i64, seconds) orelse return error.InvalidFindtime, 1_000_000) catch return error.InvalidFindtime;
-        const profile = try origin.Profile.init(settings.machine_id, settings.executables);
+        // Validate before allocating; profile bytes must outlive a temporary
+        // discovered profile as well as callers' configuration storage.
+        _ = try origin.Profile.init(settings.machine_id, settings.executables);
+        const executables = try a.alloc([]const u8, settings.executables.len);
+        errdefer a.free(executables);
+        var copied: usize = 0;
+        errdefer for (executables[0..copied]) |path| a.free(path);
+        for (settings.executables, 0..) |path, index| {
+            executables[index] = try a.dupe(u8, path);
+            copied += 1;
+        }
+        const profile = try origin.Profile.init(settings.machine_id, executables);
         try transport.validate(settings.journal);
         const self = try a.create(Plan);
         errdefer a.destroy(self);
         self.allocator = a;
         self.profile = profile;
+        self.owned_executables = executables;
         self.base = if (settings.custom) null else try builtin.Detector.init(a, .{ .filter = jail.filter, .body = .whole, .ignore = jail.ignoreip orelse cfg.defaults.ignoreip, .ignore_capacity = settings.ignore_capacity, .max_decoded_bytes = settings.max_decoded_bytes });
         errdefer if (self.base) |*value| value.deinit(a);
         self.qualified = if (self.base) |*value| try journal.Detector.init(value, profile) else null;
@@ -61,6 +74,8 @@ pub const Plan = struct {
     pub fn destroy(self: *Plan) void {
         const a = self.allocator;
         if (self.base) |*value| value.deinit(a);
+        for (self.owned_executables) |path| a.free(path);
+        a.free(self.owned_executables);
         a.destroy(self);
     }
 };
