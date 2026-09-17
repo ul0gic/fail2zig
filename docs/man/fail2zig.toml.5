@@ -1,4 +1,4 @@
-.TH FAIL2ZIG.TOML 5 "2026-09-16" "fail2zig 0.4.0" "File Formats"
+.TH FAIL2ZIG.TOML 5 "2026-09-17" "fail2zig 0.4.1" "File Formats"
 .
 .SH NAME
 fail2zig.toml \- fail2zig daemon configuration file
@@ -46,8 +46,11 @@ Default:
 .TP
 .B pid_file
 String (absolute path). Deprecated compatibility key; an explicit setting logs
-a warning and no PID file is created. Use systemd MainPID. Default:
-.IR /run/fail2zig/fail2zig.pid .
+a warning and no PID file is created. This setting can be omitted; no replacement
+setting is needed. With systemd, query the daemon's PID using:
+.nf
+systemctl show fail2zig.service --property=MainPID --value
+.fi
 .TP
 .B socket_path
 String (absolute path). Unix domain socket for
@@ -190,12 +193,26 @@ supports recidive. Journald and internal sources require no logpath.
 .TP
 .B journal_executables
 String array of absolute executable paths accepted as journal origins for an
-sshd jail. Required when journald is selected. The daemon requires each path to
-be a root-owned regular executable without group/other write permission. Debian
-13 authentication records use
-.IR /usr/lib/openssh/sshd-session ;
-the qualified list is
-.IR ["/usr/sbin/sshd", "/usr/lib/openssh/sshd-session"] .
+sshd jail. When omitted for the built-in sshd filter without custom rule_files,
+the daemon discovers available trusted SSH executables from a fixed list:
+/usr/sbin/sshd, /usr/bin/sshd, and sshd-session/sshd-auth beneath
+/usr/lib/openssh, /usr/lib/ssh, and /usr/libexec/openssh.
+Discovery resolves and deduplicates symlinks, requires root-owned directories
+and symlinks, and rejects group/other-writable directories or executables.
+At least one root-owned regular executable must qualify. Missing optional paths
+are skipped; unsafe existing paths cause startup refusal. PATH is not searched.
+.PP
+An explicit list replaces discovery completely and retains its configured order
+and spelling; an explicit empty list is rejected. Custom journal rules require
+an explicit nonempty list. Each explicit path must be a root-owned regular
+executable without group/other write permission.
+.PP
+Existing explicit profiles retain the 0.4.0 journal selectors for sshd and
+sshd-session. Automatic profiles that discover sshd-auth also select that name.
+The effective paths and query are part of saved source identity. Changed SSH
+layouts or switching profile modes may cause RetryGenerationMismatch on restart;
+live source-generation migration is not supported. Restore the previous source
+configuration and executable layout to recover; do not delete the state database.
 .TP
 .B backend
 Deprecated source alias for fail2ban compatibility (systemd means journald).

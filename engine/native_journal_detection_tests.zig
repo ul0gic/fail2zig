@@ -94,6 +94,75 @@ test "native detection: journal rejection never yields a subject and age still e
     try t.expectError(error.UnsupportedJournalDetector, journal.Detector.init(&base, try profile()));
 }
 
+test "native detection: explicit SSH emitter profiles stay exact across listener session and auth layouts" {
+    const executables = [_][]const u8{
+        "/usr/sbin/sshd",
+        "/usr/lib/openssh/sshd-session",
+        "/usr/lib/openssh/sshd-auth",
+        "/usr/libexec/openssh/sshd-session",
+        "/usr/libexec/openssh/sshd-auth",
+        "/opt/ssh/libexec/sshd-auth",
+    };
+    var base = try baseDetector();
+    defer base.deinit(t.allocator);
+    for (executables) |selected| {
+        const detector = try journal.Detector.init(&base, try origin.Profile.init(machine, &.{selected}));
+        const consumer = detector.consumer();
+        for (executables) |emitter| {
+            var fields = valid_fields ++ [_]records.JournalField{
+                .{ .name = "SYSLOG_IDENTIFIER", .value = "sshd" },
+                .{ .name = "_COMM", .value = "sshd" },
+            };
+            fields[2].value = emitter;
+            const result = try consumer.evaluate(failure, &fields, admitted, consumer.context);
+            if (std.mem.eql(u8, selected, emitter)) {
+                try t.expectEqual(stored.Kind.candidate, result.kind);
+                try t.expectEqualDeep(stored.Subject{ .v4 = .{ 203, 0, 113, 7 } }, result.subject.?);
+            } else {
+                try t.expectEqual(stored.Kind.origin_executable, result.kind);
+                try t.expect(result.subject == null and result.pattern == null);
+            }
+        }
+        const Case = struct { index: usize, value: []const u8, kind: stored.Kind };
+        for ([_]Case{
+            .{ .index = 0, .value = "1123456789abcdef0123456789abcdef", .kind = .origin_machine },
+            .{ .index = 1, .value = "1000", .kind = .origin_uid },
+            .{ .index = 3, .value = "stdout", .kind = .origin_transport },
+        }) |case| {
+            var fields = valid_fields;
+            fields[2].value = selected;
+            fields[case.index].value = case.value;
+            const result = try consumer.evaluate(failure, &fields, admitted, consumer.context);
+            try t.expectEqual(case.kind, result.kind);
+            try t.expect(result.subject == null and result.pattern == null);
+        }
+        for (0..valid_fields.len) |index| {
+            var fields = valid_fields ++ [_]records.JournalField{valid_fields[index]};
+            fields[2].value = selected;
+            fields[valid_fields.len] = fields[index];
+            const result = try consumer.evaluate(failure, &fields, admitted, consumer.context);
+            try t.expectEqual(stored.Kind.origin_ambiguous, result.kind);
+            try t.expect(result.subject == null and result.pattern == null);
+        }
+    }
+}
+
+test "native detection: existing explicit journal generation remains stable and order sensitive" {
+    const original = try profile();
+    // Pin the released explicit profile identity: default discovery must not migrate it.
+    var expected: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "27d6bebdacd18cdb9690f62e7bccf7d8c8085b635744fff3caa3fd6027179693");
+    try t.expectEqualSlices(u8, &expected, &original.generation);
+    const copied_path = try t.allocator.dupe(u8, "/usr/sbin/sshd");
+    defer t.allocator.free(copied_path);
+    const recreated = try origin.Profile.init(machine, &.{ copied_path, "/usr/lib/openssh/sshd-session" });
+    try t.expectEqualSlices(u8, &original.generation, &recreated.generation);
+    const reordered = try origin.Profile.init(machine, &.{ "/usr/lib/openssh/sshd-session", "/usr/sbin/sshd" });
+    const expanded = try origin.Profile.init(machine, &.{ "/usr/sbin/sshd", "/usr/lib/openssh/sshd-session", "/usr/lib/openssh/sshd-auth" });
+    try t.expect(!std.mem.eql(u8, &original.generation, &reordered.generation));
+    try t.expect(!std.mem.eql(u8, &original.generation, &expanded.generation));
+}
+
 test "native detection: journal parser preserves repeated origin fields for exclusion" {
     const p = try profile();
     const scratch = try t.allocator.alloc(u8, transport.parse_bytes);
@@ -244,6 +313,37 @@ test "native detection: journal retry window and decision share the exact durabl
     mock.response = two;
     try t.expectEqual(@as(usize, 0), try owner.?.poll(1));
     try t.expectEqual(@as(u64, 1), (try store.retryState("ssh", subject)).?.decisions);
+    const saved_state = (try store.retryState("ssh", subject)).?;
+    const saved_revision = try store.revision("ssh");
+    owner.?.destroy();
+    owner = null;
+    store.close();
+    store = try durable.Store.open(t.allocator, path);
+    try store.enableReceipts(1);
+    const changed_profiles = [_][]const []const u8{
+        &.{ "/usr/lib/openssh/sshd-session", "/usr/sbin/sshd" },
+        &.{ "/usr/sbin/sshd", "/usr/lib/openssh/sshd-session", "/usr/lib/openssh/sshd-auth" },
+    };
+    for (changed_profiles) |executables| {
+        const changed_detector = try journal.Detector.init(&base, try origin.Profile.init(machine, executables));
+        var changed_opts = opts;
+        changed_opts.detection = changed_detector.consumer();
+        try t.expectError(error.RetryGenerationMismatch, sessions.Session.create(t.allocator, &store, changed_opts));
+        try t.expectEqual(saved_revision, try store.revision("ssh"));
+        try t.expectEqual(saved_state.count, (try store.retryState("ssh", subject)).?.count);
+        try t.expectEqual(saved_state.decisions, (try store.retryState("ssh", subject)).?.decisions);
+        try t.expectEqual(decision.lease.finite, (try store.retryDecision("ssh", "system-journal", null)).?.lease.finite);
+    }
+    clock.value += 1_000_000;
+    owner = try sessions.Session.create(t.allocator, &store, opts);
+    try t.expectEqual(@as(usize, 0), try owner.?.poll(1));
+    try t.expectEqual(saved_revision, try store.revision("ssh"));
+    try t.expectEqual(saved_state.count, (try store.retryState("ssh", subject)).?.count);
+    try t.expectEqual(saved_state.decisions, (try store.retryState("ssh", subject)).?.decisions);
+    const resumed_decision = (try store.retryDecision("ssh", "system-journal", null)).?;
+    try t.expectEqual(decision.ordinal, resumed_decision.ordinal);
+    try t.expectEqual(decision.lease.finite, resumed_decision.lease.finite);
+    try t.expectEqual(@as(usize, 0), try store.pendingReceiptCount());
 }
 
 test "native detection: journal configuration preserves ignores and rejects unresolved preparation" {
@@ -277,6 +377,22 @@ test "native detection: journal configuration preserves ignores and rejects unre
     jails[0].filter = "sshd";
     cfg.global.compatibility_pending = true;
     try t.expectError(error.CompatibilityNotAdmitted, projection.Plan.create(t.allocator, &cfg, 0, [_]u8{0} ** 32, settings));
+}
+
+test "native detection: journal plan owns discovered executable storage after caller release" {
+    var jails = [_]config.JailConfig{.{ .name = "ssh", .filter = "sshd", .source = .journald }};
+    const cfg = config.Config{ .jails = &jails };
+    var temporary = std.heap.ArenaAllocator.init(t.allocator);
+    const plan = blk: {
+        defer temporary.deinit();
+        const paths = try temporary.allocator().alloc([]const u8, 1);
+        paths[0] = try temporary.allocator().dupe(u8, "/usr/sbin/sshd");
+        break :blk try projection.Plan.create(t.allocator, &cfg, 0, [_]u8{0} ** 32, .{ .machine_id = machine, .executables = paths, .ignore_capacity = 1 });
+    };
+    defer plan.destroy();
+    try t.expectEqualStrings("/usr/sbin/sshd", plan.profile.executables[0]);
+    const consumer = plan.sessionOptions().detection.?;
+    try t.expectEqual(stored.Kind.candidate, (try consumer.evaluate(failure, &valid_fields, admitted, consumer.context)).kind);
 }
 
 test "native detection: journal session admission and allocation failure cannot acknowledge input" {

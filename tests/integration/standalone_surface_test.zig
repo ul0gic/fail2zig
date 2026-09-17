@@ -646,7 +646,7 @@ test "standalone surface: five release artifacts have exact static ELF identitie
         .{ .name = "mipsel-linux-musleabi", .class = 1, .endian = .little, .machine = 8 },
     };
     for (targets) |target| {
-        const name = try std.fmt.allocPrint(testing.allocator, "{s}/fail2zig-v0.4.0-{s}", .{ release_dir, target.name });
+        const name = try std.fmt.allocPrint(testing.allocator, "{s}/fail2zig-v0.4.1-{s}", .{ release_dir, target.name });
         defer testing.allocator.free(name);
         const bytes = try std.fs.cwd().readFileAlloc(testing.allocator, name, max_elf_bytes);
         defer testing.allocator.free(bytes);

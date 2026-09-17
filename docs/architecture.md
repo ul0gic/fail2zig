@@ -1,6 +1,6 @@
 # Runtime architecture
 
-fail2zig 0.4.0 is one native executable containing the daemon, administration commands, rule
+fail2zig 0.4.1 is one native executable containing the daemon, administration commands, rule
 testing and migration tools. Zig application code statically embeds pinned upstream SQLite C.
 Runtime installation does not require Python, a SQLite service, the SQLite CLI or a shared SQLite
 library.
@@ -11,7 +11,9 @@ candidate to 0.4.0. Rebuilt artifacts passed cross-build and native/emulated com
 hard float and both MIPS32r2 soft-float byte orders have cross-build/static-inspection/QEMU
 smoke tiers, with no real-hardware or kernel-enforcement claim. Journal input uses journald and `journalctl`; iptables
 and ipset enforcement use those host tools with fixed argument arrays; nftables enforcement talks
-directly to the kernel through netlink. Contemporary Ubuntu remains untested.
+directly to the kernel through netlink. The 0.4.1 SSH-default repair passed isolated log-only journal-origin and restart checks
+on Debian 13 and Ubuntu 24.04, covering split-session and single-executable SSH layouts.
+These checks do not qualify Ubuntu kernel enforcement or a full platform release.
 
 ## Processing and durable state
 
@@ -32,10 +34,13 @@ File sources preserve exact saved positions and source identity across restart a
 Operators select an explicit timestamp contract appropriate to the log format. Lost continuity or
 unsafe replay becomes visible intervention rather than an invented position.
 
-Journal sources validate local machine identity, root UID, transport and a configured list of
-root-owned executable paths. On Debian 13, the qualified SSH profile admits both
-`/usr/sbin/sshd` and `/usr/lib/openssh/sshd-session`. A client-controlled journal tag alone cannot
-authorize a detection.
+Journal sources validate local machine identity, root UID, transport and an exact list of
+root-owned executable paths. Built-in SSH jails can discover a bounded standard profile when
+`journal_executables` is omitted; discovery verifies path components and resolves trusted
+symlinks. Explicit profiles keep their configured spelling/order and custom journal rules
+require one. A client-controlled journal tag alone cannot authorize a detection.
+Effective paths and journal queries remain part of persistent source identity: changing a
+profile or SSH layout can require intervention, never a silent reset of protection history.
 
 Built-in and bounded custom rules produce typed subjects rather than executable command strings.
 Ignore policy, DNS results, recurrence and finite, permanent or escalating bans are native state.

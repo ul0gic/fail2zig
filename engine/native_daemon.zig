@@ -22,6 +22,14 @@ const path_guard = @import("config/native_paths.zig");
 const durable = @import("core/record_store.zig");
 const sessions = @import("core/native_file_session.zig");
 const journal_projection = @import("config/native_journal_detection.zig");
+const journal_profile = @import("config/native_journal_profile.zig");
+
+// Keep the released query byte-for-byte for existing explicit profiles: it is
+// included in persistent source identity. New automatic auth-helper layouts
+// get their own query; changing an existing profile still requires admission.
+// These static slices remain valid for the lifetime of every journal plan.
+const legacy_ssh_matches: []const []const u8 = &.{ "SYSLOG_IDENTIFIER=sshd", "SYSLOG_IDENTIFIER=sshd-session", "+", "_COMM=sshd", "_COMM=sshd-session" };
+const auth_ssh_matches: []const []const u8 = &.{ "SYSLOG_IDENTIFIER=sshd", "SYSLOG_IDENTIFIER=sshd-session", "SYSLOG_IDENTIFIER=sshd-auth", "+", "_COMM=sshd", "_COMM=sshd-session", "_COMM=sshd-auth" };
 const journal_sessions = @import("core/native_journal_session.zig");
 const health = @import("core/storage_health.zig");
 const recovery = @import("core/native_recovery.zig");
@@ -864,7 +872,11 @@ pub const Coordinator = struct {
             const capacity: usize = if (source == .journald) 1 else max_sources_per_jail;
             switch (source) {
                 .file => try plan.include(try resource.fileCost(.{ .source_capacity = capacity, .spec_count = jail.logpath.len, .max_record_bytes = 2048, .max_decoded_bytes = 2048 })),
-                .journald => try plan.include(try resource.journalCost(.{ .max_record_bytes = 2048, .max_decoded_bytes = 2048, .batch_records = 1, .environment = environment })),
+                .journald => {
+                    try plan.include(try resource.journalCost(.{ .max_record_bytes = 2048, .max_decoded_bytes = 2048, .batch_records = 1, .environment = environment }));
+                    // Owned plan paths plus bounded discovery/copy overlap.
+                    try plan.include(.{ .live = .{ .bytes = 8 * (std.fs.max_path_bytes + @sizeOf([]const u8)), .allocations = 9 }, .workspace = .{ .bytes = 98304, .allocations = 16, .fds = 4 }, .workspace_kind = .configuration });
+                },
                 .internal => try plan.include(.{ .workspace = .{ .bytes = 16 * 1024, .allocations = 4 }, .workspace_kind = .source }),
                 .auto => return error.NativeInternalEventsRequired,
             }
@@ -1053,16 +1065,31 @@ pub const Coordinator = struct {
                 },
                 .journald => blk: {
                     if (selected.timestamp != null or selected.timezone_offset_minutes != null) return error.UnusedFileTimestamp;
-                    if (selected.journal_executables.len == 0 or selected.journal_executables.len > 8) return error.InvalidJournalExecutables;
-                    for (selected.journal_executables) |executable| {
-                        var file = try std.fs.openFileAbsolute(executable, .{});
-                        defer file.close();
-                        const stat = try std.posix.fstat(file.handle);
-                        if (!std.posix.S.ISREG(stat.mode) or stat.uid != 0 or stat.mode & 0o022 != 0 or stat.mode & 0o111 == 0) return error.UnqualifiedJournalExecutable;
+                    var discovered: ?journal_profile.Resolved = null;
+                    defer if (discovered) |*value| value.deinit();
+                    if (selected.journal_executables.len == 0) {
+                        if (selected.journal_executables_explicit or assets != null or !std.mem.eql(u8, selected.filter, "sshd")) {
+                            std.log.err("native: jail '{s}': journal_executables requires a nonempty explicit profile for this configuration", .{selected.name});
+                            return error.InvalidJournalExecutables;
+                        }
+                        discovered = journal_profile.discover(a) catch |err| {
+                            std.log.err("native: jail '{s}': cannot resolve trusted SSH journal executables: {s}; configure journal_executables explicitly for a nonstandard installation", .{ selected.name, @errorName(err) });
+                            return err;
+                        };
+                    } else {
+                        if (selected.journal_executables.len > 8) return error.InvalidJournalExecutables;
+                        for (selected.journal_executables) |executable| {
+                            journal_profile.qualifyExplicit(executable) catch |err| {
+                                std.log.err("native: jail '{s}': journal executable '{s}': {s}", .{ selected.name, executable, @errorName(err) });
+                                return err;
+                            };
+                        }
                     }
+                    const executables = if (discovered) |*value| value.executables() else selected.journal_executables;
+                    const matches: []const []const u8 = if (discovered != null and discovered.?.has_auth_helper) auth_ssh_matches else legacy_ssh_matches;
                     const machine = try std.fs.cwd().readFileAlloc(a, "/etc/machine-id", 33);
                     defer a.free(machine);
-                    break :blk .{ .journal = try journal_projection.Plan.create(a, &selected_cfg, 0, parent_generation, .{ .machine_id = std.mem.trim(u8, machine, "\n"), .executables = selected.journal_executables, .ignore_capacity = 128, .custom = assets != null, .journal = .{ .batch_records = 1, .matches = &.{ "SYSLOG_IDENTIFIER=sshd", "SYSLOG_IDENTIFIER=sshd-session", "+", "_COMM=sshd", "_COMM=sshd-session" } } }) };
+                    break :blk .{ .journal = try journal_projection.Plan.create(a, &selected_cfg, 0, parent_generation, .{ .machine_id = std.mem.trim(u8, machine, "\n"), .executables = executables, .ignore_capacity = 128, .custom = assets != null, .journal = .{ .batch_records = 1, .matches = matches } }) };
                 },
                 .auto => unreachable,
                 .internal => .{ .internal = try internalGeneration(selected.name, policy) },
@@ -1486,7 +1513,10 @@ pub const Coordinator = struct {
             .policy = jail.policy,
             .custom = jail.custom_plan != null,
         };
-        try self.store.validateRuntimeAdmissions(admissions[0..self.jails.len], if (self.custom_jails != 0 and self.dns_server != null) self.dns_generation else null);
+        self.store.validateRuntimeAdmissions(admissions[0..self.jails.len], if (self.custom_jails != 0 and self.dns_server != null) self.dns_generation else null) catch |err| {
+            if (err == error.RetryGenerationMismatch) std.log.err("native: source/profile or policy differs from saved state; restore the previous source configuration and SSH executable layout before restarting; retain the database", .{});
+            return err;
+        };
         if (self.startup_installation) |selected| if (try self.store.readInstallation()) |saved| {
             if (!std.meta.eql(saved, selected)) return error.InstallationMismatch;
         } else if (self.startup_installation_persisted) return error.InstallationMismatch;

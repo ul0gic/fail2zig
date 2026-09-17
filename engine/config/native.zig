@@ -136,6 +136,7 @@ pub const JailConfig = struct {
     timezone: ?[]const u8 = null,
     timezone_ambiguity: ?@import("../core/native_timezone.zig").Ambiguity = null,
     journal_executables: []const []const u8 = &.{},
+    journal_executables_explicit: bool = false,
     rule_files: []const []const u8 = &.{},
     ignore_file: ?[]const u8 = null,
     compatibility_pending: bool = false,
@@ -968,6 +969,7 @@ const Parser = struct {
             j.timezone_ambiguity = std.meta.stringToEnum(@import("../core/native_timezone.zig").Ambiguity, try asString(v)) orelse return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "journal_executables")) {
             j.journal_executables = try asStringArray(v);
+            j.journal_executables_explicit = true;
         } else if (std.mem.eql(u8, key, "rule_files")) {
             j.rule_files = try asStringArray(v);
         } else if (std.mem.eql(u8, key, "ignore_file")) {

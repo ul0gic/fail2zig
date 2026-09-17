@@ -107,7 +107,7 @@ pub fn classify(current: *const config.Config, proposed: *const config.Config, p
             out.restart("jails.{s}: removed", .{jail.name});
             continue;
         };
-        inline for (.{ "enabled", "logpath", "source", "filter", "timestamp", "timezone_offset_minutes", "timezone", "timezone_ambiguity", "journal_executables", "rule_files", "ignore_file", "ignoreip", "compatibility_pending" }) |name| {
+        inline for (.{ "enabled", "logpath", "source", "filter", "timestamp", "timezone_offset_minutes", "timezone", "timezone_ambiguity", "journal_executables", "journal_executables_explicit", "rule_files", "ignore_file", "ignoreip", "compatibility_pending" }) |name| {
             const T = @TypeOf(@field(jail, name));
             if (!valuesEqual(T, @field(jail, name), @field(next, name))) out.restart("jails.{s}.{s}", .{ jail.name, name });
         }

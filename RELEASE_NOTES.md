@@ -1,90 +1,59 @@
-# fail2zig v0.4.0
+# fail2zig v0.4.1
 
-Version 0.4.0 consolidates daemon and administration commands into one static executable per
-architecture, moves durable runtime state to embedded SQLite, adds quoted duration strings and
-runs the systemd service under a dedicated non-login account.
+This patch fixes SSH journal startup failing with `InvalidJournalExecutables` when
+`journal_executables` is omitted, including the minimal configuration reported in
+[issue #57](https://github.com/ul0gic/fail2zig/issues/57):
 
-Selected live qualification passed on Debian 13 x86_64 before the version-only change
-from the unpublished 0.3.1 candidate to 0.4.0. The rebuilt artifacts passed cross-build and native/emulated command checks. ARM64, ARMv7 hard float and both MIPS32r2 soft-float byte orders retain release
-artifacts, with cross-build, static inspection and QEMU smoke as their validation tier. Emulation
-does not establish real-hardware or kernel-enforcement support. Contemporary Ubuntu is untested.
+```toml
+[jails.sshd]
+enabled = true
+filter = "sshd"
+```
 
-## Changes from v0.3.0
+## Changes
 
-- Use `fail2zig <command>` in place of `fail2zig-client <command>`. The installer removes the
-  retired client after installing its replacement. Rule testing and the supported fail2ban
-  inspect/snapshot/plan/validate/cutover/status/rollback workflow share this executable.
-- Statically embedded upstream SQLite 3.53.4 stores source receipts, retry state, protection
-  ownership, enforcement intent and confirmed history. No shared SQLite library or database
-  service is required. This native database is different from v0.3.0's binary state file.
-- `bantime`, `findtime`, `bantime_increment_max_bantime` and `bantime_increment_jitter`
-  accept quoted durations such as `"24h"` and `"1h30m"`, retaining integer seconds and existing
-  limits. Units: `s`, `m`, `mm`, `min`, `h`, `d`, `w`, `mo`, `y`. Months and years are fixed
-  2,629,800 and 31,557,600 seconds. `"permanent"` is exclusive to bantime.
-- The service uses `User=fail2zig` and `Group=fail2zig`, with `CAP_NET_ADMIN`, `CAP_NET_RAW` and
-  `CAP_DAC_READ_SEARCH` retained. The installer supports a custom service/monitor group.
-  Root or the daemon UID can administer protection; group membership grants monitoring only.
-  `CAP_NET_RAW` is required by the iptables ipset extension and permits raw IP sockets.
-  HTTP remains in the same privileged process and defaults to loopback.
-- `[global] firewall` selects the daemon-wide backend; an explicit backend never silently
-  falls back to another. `defaults.banaction` and jail overrides select enforcement or log-only
-  policy. `metrics_enabled = false` disables HTTP and WebSocket while IPC remains available.
-
-The backend compatibility alias and positioned configuration diagnostics from issue #45 shipped
-in v0.3.0 and are preserved. File/journal sources, nftables/iptables/ipset and five architecture
-artifacts also predate this release; the native persistence and command consolidation above are
-the relevant changes.
+- Built-in SSH jails using journald now discover executable defaults from a bounded
+  catalog of standard SSH paths. Discovery verifies trusted ownership, permissions
+  and path components, resolves supported symlinks and deduplicates deterministically.
+  File sources and custom journal rules do not acquire these defaults.
+- Journal records still require the local machine ID, root UID, syslog transport and
+  an exact allowed executable. Missing or ambiguous origin fields remain rejected.
+- Explicit executable profiles retain their existing spelling, order and journal
+  selection behavior. An explicitly empty journal profile remains invalid.
+- The configuration manual clarifies that `pid_file` is deprecated and ignored.
+  Use `systemctl show fail2zig.service --property=MainPID --value` for the service PID.
 
 ## Upgrade notes
 
-- Stop every daemon/state writer and back up the current executable, configuration and coherent
-  state before installing. The installer preserves operator configuration and never enables,
-  starts or restarts the service.
-- The installer transitions only the default current-native SQLite directory, database and
-  existing WAL/SHM siblings to the service account. It refuses active writers, unsafe paths,
-  legacy binary state and automatic custom-path upgrades. It does not recursively chown trees.
-- There is no automatic converter for v0.3.0 binary state. Preserve that state for rollback;
-  selecting a fresh native database explicitly loses its saved counters, bans/history and source
-  positions. This is distinct from supported fail2ban schema-4 SQLite migration. See the
-  [state upgrade boundary](docs/operations/migration-continuity.md#upgrading-fail2zig-state).
-- Run native destination migration under the service UID with the required capabilities and
-  a caller-owned private staging directory, with the destination daemon stopped. See
-  [command migration](docs/operations/command-migration.md#migration-workflow).
-- Journal input requires journald and `journalctl`. Debian 13 SSH jails must admit both
-  `/usr/sbin/sshd` and `/usr/lib/openssh/sshd-session` through `journal_executables`.
-  iptables and ipset require their host tools; nftables uses direct netlink.
+Existing explicit SSH profiles can remain unchanged. Back up the executable,
+configuration and coherent state before upgrading; the installer preserves configuration
+and does not start or restart services.
 
-## Known limitations
+Changing the effective executable profile or source identity can require operator
+intervention. Adding or removing SSH helpers, changing symlink targets, or removing an
+explicit override may change that identity. The daemon refuses incompatible saved state;
+it does not silently reset history, retries or bans. This release does not promise seamless
+SSH layout changes. See the [configuration manual](docs/man/fail2zig.toml.5).
 
-- A matching SSH failure originating from IPv4 loopback is classified as unenforceable, but a
-  later cleanup turn can put native storage into intervention. This local-only case is tracked
-  for repair after 0.4.0; it does not reproduce on the previously qualified remote SSH path.
-- Firewall effects are limited to the daemon's current network namespace. Custom namespace
-  selectors and service overrides that move it between namespaces are unsupported.
-- Persistence warnings on another host require its directory, ownership and filesystem evidence
-  to diagnose. This release does not establish the cause of previously reported save failures.
+## Verification scope
 
-## Release assets
+Focused configuration, detection, reload and startup checks covered the repair. Connected
+log-only checks exercised genuine SSH journal input, forged-origin rejection and original
+retry/decision expiry preservation across restart on Debian 13 with an observed
+`sshd-session` origin and Ubuntu 24.04 LTS with an observed `/usr/sbin/sshd` origin.
+A populated v0.4.0 explicit-profile database also reopened with unchanged retry state and
+expiry. Genuine `sshd-auth` emission was not observed; synthetic tagged input tested its
+selection and rejection separately.
 
-Five executables plus nine shared files make 14 assets; `SHA256SUMS` lists the 13 content files:
+These checks do not establish new Ubuntu firewall support, socket-activation lifecycle
+coverage or real-hardware support for additional architectures. The existing IPv4-loopback
+maintenance limitation remains: an unenforceable loopback detection can cause a later
+cleanup turn to put storage into intervention.
 
-```text
-fail2zig-v0.4.0-x86_64-linux-musl
-fail2zig-v0.4.0-aarch64-linux-musl
-fail2zig-v0.4.0-arm-linux-musleabihf
-fail2zig-v0.4.0-mips-linux-musleabi
-fail2zig-v0.4.0-mipsel-linux-musleabi
-fail2zig.service
-fail2zig.toml.example
-install.sh
-fail2zig.1
-fail2zig.toml.5
-LICENSE
-SQLITE-NOTICE.md
-COPYING.date-profile
-SHA256SUMS
-```
+## Assets
 
-The installer verifies the selected executable and every downloaded file it installs against
-`SHA256SUMS` before privileged filesystem changes. It installs the service, example configuration,
-man pages and dependency/derived-data notices with the executable.
+The five static Linux executable targets remain x86_64, aarch64, ARMv7 hard float,
+MIPS32r2 big endian and MIPS32r2 little endian. Shared assets include the installer,
+service, example configuration, manuals and license notices. Verify downloads against
+`SHA256SUMS`; cross-build or emulated command checks do not establish kernel enforcement
+on those targets.
