@@ -193,6 +193,83 @@ test "integration: --validate-config on the same 40 lines with a valid line 37 p
     try expectNotContains(r.stderr, ":37:");
 }
 
+test "integration: --validate-config names the invalid global DNS setting" {
+    const a = testing.allocator;
+    var fx = try Fixture.init(a);
+    defer fx.deinit();
+
+    const text = try fx.fortyLineConfig("# line 37");
+    defer a.free(text);
+    const swapped = try std.mem.replaceOwned(
+        u8,
+        a,
+        text,
+        "memory_ceiling_mb = 64\n",
+        "memory_ceiling_mb = 64\ndns_server = \"invalid-address\"\n",
+    );
+    defer a.free(swapped);
+    try fx.write(swapped);
+
+    var r = try validateConfig(a, fx.config_path);
+    defer r.deinit(a);
+
+    try testing.expectEqual(@as(?u8, 2), r.exitCode());
+    try expectContains(
+        r.stderr,
+        "config: validation failed: InvalidNativeDns; [global].dns_server: must be a bounded IP address\n",
+    );
+    try expectNotContains(r.stdout, "config: OK");
+    try testing.expect(!hasErrorReturnTrace(r.stderr));
+}
+
+test "integration: --validate-config names the jail for a policy validation failure" {
+    const a = testing.allocator;
+    var fx = try Fixture.init(a);
+    defer fx.deinit();
+
+    const text = try fx.fortyLineConfig("# line 37");
+    defer a.free(text);
+    const swapped = try std.mem.replaceOwned(u8, a, text, "maxretry = 3\n", "maxretry = 0\n");
+    defer a.free(swapped);
+    try fx.write(swapped);
+
+    var r = try validateConfig(a, fx.config_path);
+    defer r.deinit(a);
+
+    try testing.expectEqual(@as(?u8, 2), r.exitCode());
+    try expectContains(
+        r.stderr,
+        "config: validation failed: InvalidMaxretry; maxretry: must be between 1 and 128; jail 'sshd'\n",
+    );
+    try expectNotContains(r.stdout, "config: OK");
+    try testing.expect(!hasErrorReturnTrace(r.stderr));
+}
+
+test "integration: --validate-config identifies an unknown filter without exposing its value" {
+    const a = testing.allocator;
+    var fx = try Fixture.init(a);
+    defer fx.deinit();
+
+    const text = try fx.fortyLineConfig("# line 37");
+    defer a.free(text);
+    const sensitive_value = "site-private-filter-name";
+    const swapped = try std.mem.replaceOwned(u8, a, text, "filter = \"sshd\"\n", "filter = \"" ++ sensitive_value ++ "\"\n");
+    defer a.free(swapped);
+    try fx.write(swapped);
+
+    var r = try validateConfig(a, fx.config_path);
+    defer r.deinit(a);
+
+    try testing.expectEqual(@as(?u8, 2), r.exitCode());
+    try expectContains(
+        r.stderr,
+        "config: validation failed: UnknownFilter; filter: must identify a built-in filter; jail 'sshd'\n",
+    );
+    try expectNotContains(r.stderr, sensitive_value);
+    try expectNotContains(r.stdout, "config: OK");
+    try testing.expect(!hasErrorReturnTrace(r.stderr));
+}
+
 test "integration: --validate-config resolves backend = \"systemd\" to journald and warns once" {
     const a = testing.allocator;
     var fx = try Fixture.init(a);

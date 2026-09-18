@@ -301,7 +301,10 @@ test "native firewall: isolated admission interruption stays uncertain until com
         var failed = try reader.admitInstallation(intentFor(&reader));
         defer failed.deinit();
         try std.testing.expect(failed == .uncertain);
-        try std.testing.expectEqual(error.Timeout, failed.uncertain);
+        try std.testing.expectEqual(selected, failed.uncertain.backend);
+        try std.testing.expectEqual(inspection.OperationStage.admission_dispatch, failed.uncertain.stage);
+        try std.testing.expectEqual(error.Timeout, failed.uncertain.cause);
+        try std.testing.expectEqual(inspection.MutationDisposition.outcome_uncertain, failed.uncertain.mutation);
         reader.test_fault_after_mutations = null;
         const before = try captureScaffold(&reader);
         defer std.testing.allocator.free(before);
@@ -461,7 +464,7 @@ fn applyVerified(reader: *inspection.Inspector, token: inspection.DispatchToken)
     var result = try reader.applyExact(token, .{ .wall_us = std.time.microTimestamp() });
     errdefer result.deinit();
     if (result == .uncertain) {
-        std.debug.print("exact effect uncertain: {s}\n", .{@errorName(result.uncertain)});
+        std.debug.print("exact effect uncertain: {s}\n", .{@errorName(result.uncertain.cause)});
         return error.UnexpectedUncertainty;
     }
     return result;
@@ -525,7 +528,10 @@ test "native firewall: isolated exact uncertain acknowledged mutation reconciles
     var failed = try reader.applyExact(token, .{ .wall_us = std.time.microTimestamp() });
     defer failed.deinit();
     try std.testing.expectEqual(.uncertain, std.meta.activeTag(failed));
-    try std.testing.expectEqual(error.Timeout, failed.uncertain);
+    try std.testing.expectEqual(transport, failed.uncertain.backend);
+    try std.testing.expectEqual(inspection.OperationStage.effect_dispatch, failed.uncertain.stage);
+    try std.testing.expectEqual(error.Timeout, failed.uncertain.cause);
+    try std.testing.expectEqual(inspection.MutationDisposition.outcome_uncertain, failed.uncertain.mutation);
     reader.test_fault_after_mutations = null;
     var recovered = try applyVerified(&reader, token);
     defer recovered.deinit();
@@ -864,7 +870,10 @@ test "native firewall: isolated nftables realizes the frozen scoped packet cells
     var uncertain = try reader.applyExact(icmp_token, .{ .wall_us = std.time.microTimestamp() });
     defer uncertain.deinit();
     try std.testing.expect(uncertain == .uncertain);
-    try std.testing.expectEqual(error.Timeout, uncertain.uncertain);
+    try std.testing.expectEqual(reader.installation.transport, uncertain.uncertain.backend);
+    try std.testing.expectEqual(inspection.OperationStage.effect_dispatch, uncertain.uncertain.stage);
+    try std.testing.expectEqual(error.Timeout, uncertain.uncertain.cause);
+    try std.testing.expectEqual(inspection.MutationDisposition.outcome_uncertain, uncertain.uncertain.mutation);
     reader.test_fault_after_mutations = null;
     try peer.exchangeIcmpV6(56, false);
     try peer.exchangeUdp(true, 35271, 51, true);
@@ -975,7 +984,10 @@ test "native firewall: isolated fixed argv realizes the frozen scoped packet cel
     var uncertain = try reader.applyExact(icmp_permanent, .{ .wall_us = std.time.microTimestamp() });
     defer uncertain.deinit();
     try std.testing.expect(uncertain == .uncertain);
-    try std.testing.expectEqual(error.Timeout, uncertain.uncertain);
+    try std.testing.expectEqual(transport, uncertain.uncertain.backend);
+    try std.testing.expectEqual(inspection.OperationStage.effect_dispatch, uncertain.uncertain.stage);
+    try std.testing.expectEqual(error.Timeout, uncertain.uncertain.cause);
+    try std.testing.expectEqual(inspection.MutationDisposition.outcome_uncertain, uncertain.uncertain.mutation);
     reader.test_fault_after_mutations = null;
     var recovered = try applyVerified(&reader, icmp_permanent);
     defer recovered.deinit();
@@ -991,6 +1003,10 @@ test "native firewall: isolated fixed argv realizes the frozen scoped packet cel
     var partial = try reader.applyExact(scopedEffectToken(&reader, 0x86, partial_scope, .{ .ensure_present = .permanent }), .{ .wall_us = std.time.microTimestamp() });
     defer partial.deinit();
     try std.testing.expect(partial == .uncertain);
+    try std.testing.expectEqual(transport, partial.uncertain.backend);
+    try std.testing.expectEqual(inspection.OperationStage.effect_dispatch, partial.uncertain.stage);
+    try std.testing.expectEqual(error.Timeout, partial.uncertain.cause);
+    try std.testing.expectEqual(inspection.MutationDisposition.outcome_uncertain, partial.uncertain.mutation);
     reader.test_fault_after_mutations = null;
     try std.testing.expectError(error.Incomplete, reader.inspect());
     try peer.exchangeUdp(false, 35301, 74, false);
@@ -1006,7 +1022,7 @@ fn failedEffectAllocation(allocator: std.mem.Allocator, stable: *inspection.Insp
     reader.ipset_path = stable.ipset_path;
     var result = try reader.applyExact(try effectToken(&reader, false, .{ .ensure_present = .permanent }), .{ .wall_us = std.time.microTimestamp() });
     defer result.deinit();
-    if (result == .uncertain) return result.uncertain;
+    if (result == .uncertain) return result.uncertain.cause;
     try std.testing.expectEqual(@as(usize, 1), result.verified.snapshot.entries.len);
 }
 test "native firewall: isolated exact allocation failure preserves recoverable owned scaffold" {

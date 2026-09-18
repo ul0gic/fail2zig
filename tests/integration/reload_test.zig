@@ -160,6 +160,22 @@ test "reload: no-op, invalid, restart-only and live policy proposals return exac
     defer plain.deinit(a);
     try t.expectEqual(@as(u8, 0), plain.code);
     try t.expect(std.mem.startsWith(u8, plain.stdout, "outcome\tnoop\ngeneration\t"));
+
+    const before_rejected = try h.queryList();
+    defer a.free(before_rejected);
+    try writeConfig(&h, 2, 60, "dns_server = \"invalid-address\"");
+    const semantic = try client(a, &h, "reload");
+    defer semantic.deinit(a);
+    try t.expectEqual(@as(u8, 1), semantic.code);
+    try t.expect(std.mem.indexOf(u8, semantic.stdout, "\"outcome\":\"rejected\"") != null);
+    try t.expect(std.mem.indexOf(u8, semantic.stdout, "InvalidNativeDns") != null);
+    try t.expect(std.mem.indexOf(u8, semantic.stdout, "[global].dns_server") != null);
+    const after_generation = try generation(a, &h);
+    defer a.free(after_generation);
+    try t.expectEqualStrings(g1, after_generation);
+    const after_rejected = try h.queryList();
+    defer a.free(after_rejected);
+    try t.expectEqualStrings(before_rejected, after_rejected);
 }
 
 test "reload: SIGHUP applies a live bantime change and the generation survives restart while a stopped-time edit still refuses" {

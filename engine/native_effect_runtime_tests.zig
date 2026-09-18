@@ -104,6 +104,26 @@ test "native effect runtime: clock and persistence failures clear previously pub
     try t.expectError(error.ReopenRequired, manager.admit());
     try t.expect(!manager.status.ready);
 }
+test "native effect runtime: admission diagnostic is bounded by value and retained until reconciliation" {
+    var fixture = try Fixture.init(.iptables);
+    defer fixture.deinit();
+    const manager = try fixture.manager();
+    defer manager.destroy();
+    manager.inspector.iptables_path = "/nonexistent/fail2zig-fixture-iptables";
+    try t.expectError(error.ToolUnavailable, manager.admit());
+    try t.expect(!manager.status.ready);
+    try t.expect(manager.status.uncertain);
+    const diagnostic = manager.status.diagnostic.?;
+    try t.expectEqual(inspection.Transport.iptables, diagnostic.backend);
+    try t.expectEqual(inspection.OperationStage.admission_probe, diagnostic.stage);
+    try t.expectEqual(error.ToolUnavailable, diagnostic.cause);
+    try t.expectEqual(inspection.MutationDisposition.not_started, diagnostic.mutation);
+    const epoch = manager.repairEpoch();
+    _ = try manager.beginRepair(epoch);
+    try t.expectEqualDeep(diagnostic, manager.status.diagnostic.?);
+    manager.storageReopened();
+    try t.expectEqualDeep(diagnostic, manager.status.diagnostic.?);
+}
 fn isolatedBackend() !effect.Backend {
     const name = std.posix.getenv("F2Z_NATIVE_FIREWALL_TRANSPORT") orelse return error.SkipZigTest;
     const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
@@ -160,6 +180,47 @@ test "native effect runtime: isolated final inventory catches missing scope then
     manager.inspector.limits.max_bytes = 1;
     try t.expectError(error.LimitExceeded, manager.turn(&bindings));
     try t.expect(!manager.confirmedSubject(subject, std.time.microTimestamp()));
+    const diagnostic = manager.status.diagnostic.?;
+    try t.expectEqual(manager.inspector.installation.transport, diagnostic.backend);
+    try t.expectEqual(inspection.OperationStage.readback, diagnostic.stage);
+    try t.expectEqual(error.LimitExceeded, diagnostic.cause);
+    try t.expectEqual(inspection.MutationDisposition.not_started, diagnostic.mutation);
+    manager.inspector.limits.max_bytes = (inspection.Limits{}).max_bytes;
+    try ready(manager);
+    try t.expect(manager.status.diagnostic == null);
+}
+
+test "native effect runtime: isolated dispatch uncertainty retains durable identity and clears at full readback" {
+    var fixture = try Fixture.init(try isolatedBackend());
+    defer fixture.deinit();
+    const deadline = std.time.microTimestamp() + 30_000_000;
+    const expected = try fixture.owner("fixture", 1, .{ .finite = deadline });
+    const manager = try fixture.manager();
+    defer manager.destroy();
+    try manager.admit();
+    manager.inspector.test_fault_after_mutations = 1;
+    for (0..8) |_| {
+        _ = manager.turn(&bindings) catch |failure| {
+            try t.expectEqual(error.EffectBackendUncertain, failure);
+            break;
+        };
+    } else return error.ExpectedDispatchUncertainty;
+    try t.expect(!manager.status.ready);
+    try t.expect(manager.status.uncertain);
+    const diagnostic = manager.status.diagnostic.?;
+    try t.expectEqual(manager.inspector.installation.transport, diagnostic.backend);
+    try t.expectEqual(inspection.OperationStage.effect_dispatch, diagnostic.stage);
+    try t.expectEqual(error.Timeout, diagnostic.cause);
+    try t.expectEqual(inspection.MutationDisposition.outcome_uncertain, diagnostic.mutation);
+    var rows: [1]effect.Entry = undefined;
+    const page = try fixture.store.effectPage(null, null, &rows);
+    try t.expectEqual(@as(usize, 1), page.count);
+    try t.expectEqual(effect.Status.dispatched, rows[0].status);
+    try t.expectEqualSlices(u8, &expected.scope_key, &rows[0].scope_key);
+    try t.expectEqual(deadline, rows[0].desired.finite);
+    manager.inspector.test_fault_after_mutations = null;
+    try ready(manager);
+    try t.expect(manager.status.diagnostic == null);
 }
 
 test "native effect runtime: isolated canonical network survives manager restart and expires exactly" {
@@ -223,7 +284,20 @@ test "native effect runtime: isolated stop restores durable intent and repair ep
         try t.expectEqual(action_outcome.Status.confirmed, outcomes[0].status);
         try t.expectEqual(action_outcome.Status.failed, outcomes[1].status);
         const epoch = manager.repairEpoch();
+        manager.inspector.test_fault_after_mutations = 1;
+        try t.expectError(error.EffectBackendUncertain, manager.stopTurn(epoch));
+        const diagnostic = manager.status.diagnostic.?;
+        try t.expectEqual(manager.inspector.installation.transport, diagnostic.backend);
+        try t.expectEqual(inspection.OperationStage.effect_dispatch, diagnostic.stage);
+        try t.expectEqual(error.Timeout, diagnostic.cause);
+        try t.expectEqual(inspection.MutationDisposition.outcome_uncertain, diagnostic.mutation);
+        var retained: [1]effect.Entry = undefined;
+        const retained_page = try fixture.store.effectPage(null, null, &retained);
+        try t.expectEqual(@as(usize, 1), retained_page.count);
+        try t.expectEqual(deadline, retained[0].desired.finite);
+        manager.inspector.test_fault_after_mutations = null;
         while (!try manager.stopTurn(epoch)) {}
+        try t.expect(manager.status.diagnostic == null);
         var stopped = try manager.inspector.inspect();
         defer stopped.deinit();
         try t.expectEqual(@as(usize, 0), stopped.entries.len);
@@ -287,17 +361,53 @@ test "native effect runtime: isolated committed finite expiry proceeds while SQL
     const manager = try fixture.manager();
     defer manager.destroy();
     try ready(manager);
-    var blocked = try BlockedWriter.init(&fixture);
-    defer blocked.deinit();
-    waitUntil(deadline + 20_000);
-    try manager.expireDuringOutage();
-    try t.expectEqual(@as(usize, 0), ForbiddenSql.calls);
-    try t.expect(manager.outage_attempted[0]);
-    try t.expect(!manager.status.ready);
-    try t.expect(manager.status.uncertain);
+    {
+        var blocked = try BlockedWriter.init(&fixture);
+        defer blocked.deinit();
+        waitUntil(deadline + 20_000);
+        try manager.expireDuringOutage();
+        try t.expectEqual(@as(usize, 0), ForbiddenSql.calls);
+        try t.expect(manager.outage_attempted[0]);
+        try t.expect(!manager.status.ready);
+        try t.expect(manager.status.uncertain);
+    }
+    var retained: [1]effect.Entry = undefined;
+    const retained_page = try fixture.store.effectPage(null, null, &retained);
+    try t.expectEqual(@as(usize, 1), retained_page.count);
+    try t.expectEqual(deadline, retained[0].desired.finite);
     var snapshot = try manager.inspector.inspect();
     defer snapshot.deinit();
     try t.expectEqual(@as(usize, 0), snapshot.entries.len);
+}
+test "native effect runtime: isolated outage readback failure preserves diagnostic and durable expiry" {
+    var fixture = try Fixture.init(try isolatedBackend());
+    defer fixture.deinit();
+    const deadline = std.time.microTimestamp() + 1_000_000;
+    _ = try fixture.owner("fixture", 1, .{ .finite = deadline });
+    const manager = try fixture.manager();
+    defer manager.destroy();
+    try ready(manager);
+    {
+        var blocked = try BlockedWriter.init(&fixture);
+        defer blocked.deinit();
+        waitUntil(deadline + 20_000);
+        manager.inspector.limits.max_bytes = 1;
+        try t.expectError(error.LimitExceeded, manager.expireDuringOutage());
+        try t.expectEqual(@as(usize, 0), ForbiddenSql.calls);
+        try t.expect(manager.outage_attempted[0]);
+        try t.expect(!manager.status.ready);
+        try t.expect(manager.status.uncertain);
+        const diagnostic = manager.status.diagnostic.?;
+        try t.expectEqual(manager.inspector.installation.transport, diagnostic.backend);
+        try t.expectEqual(inspection.OperationStage.effect_dispatch, diagnostic.stage);
+        try t.expectEqual(error.LimitExceeded, diagnostic.cause);
+        try t.expectEqual(inspection.MutationDisposition.not_started, diagnostic.mutation);
+    }
+    manager.inspector.limits.max_bytes = (inspection.Limits{}).max_bytes;
+    var retained: [1]effect.Entry = undefined;
+    const retained_page = try fixture.store.effectPage(null, null, &retained);
+    try t.expectEqual(@as(usize, 1), retained_page.count);
+    try t.expectEqual(deadline, retained[0].desired.finite);
 }
 test "native effect runtime: isolated permanent co-owner prevents finite-owner outage expiry" {
     var fixture = try Fixture.init(try isolatedBackend());

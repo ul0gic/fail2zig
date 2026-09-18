@@ -261,9 +261,11 @@ pub fn main() !void {
     if (cfg.legacy_banaction_used) std.log.warn("config: banaction is deprecated; use defaults/jail enforce; global.firewall selects the backend", .{});
 
     const is_validate_only = opts.action == .test_config or opts.action == .validate_config;
-    config_mod.validate(&cfg) catch |err| {
+    var validation_diag: config_mod.ValidationDiagnostic = .{};
+    config_mod.validateDiag(&cfg, &validation_diag) catch |err| {
         const stderr = std.io.getStdErr().writer();
-        try stderr.print("config: validation failed: {s}\n", .{@errorName(err)});
+        var detail: [160]u8 = undefined;
+        try stderr.print("config: validation failed: {s}; {s}\n", .{ @errorName(err), validation_diag.render(&detail) });
         std.process.exit(shared.ExitClass.usage.code());
     };
     if (!is_validate_only) {

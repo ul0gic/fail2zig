@@ -180,6 +180,8 @@ const Jail = struct {
     revision: u64 = 0,
     healthy: bool = false,
     source_error: ?anyerror = null,
+    source_diagnostic: ?journal_sessions.FailureDiagnostic = null,
+    last_journal_notice: ?journal_sessions.FailureDiagnostic = null,
     zone: ?*timezone.Zone = null,
     maintenance_source: usize = 0,
     retire_next: bool = false,
@@ -244,6 +246,35 @@ fn backendCauseName(cause: anyerror) []const u8 {
     };
 }
 
+fn logInstallationConflict(cfg: *const config.Config, saved: effect.Installation) void {
+    const fail_closed = cfg.global.on_no_backend == .@"fail-closed";
+    const disposition = if (fail_closed)
+        "refusing to run unprotected"
+    else
+        "running DEGRADED as log-only per on_no_backend";
+    // Match preflight's selector-first precedence without changing admission policy.
+    if (!std.mem.eql(u8, saved.selector(), cfg.global.firewall_namespace)) {
+        const message = "firewall: saved namespace selector '{'}' conflicts with requested selector '{'}' (InstallationMismatch); restore the previous firewall_namespace with the existing state database; {s}";
+        const args = .{ std.zig.fmtEscapes(saved.selector()), std.zig.fmtEscapes(cfg.global.firewall_namespace), disposition };
+        if (fail_closed) std.log.err(message, args) else std.log.warn(message, args);
+    } else {
+        const message = "firewall: saved backend '{s}' conflicts with requested backend '{s}' (InstallationMismatch); restore firewall = \"{s}\" or \"auto\" with the existing state database; {s}";
+        const args = .{ @tagName(saved.backend), @tagName(cfg.global.firewall), @tagName(saved.backend), disposition };
+        if (fail_closed) std.log.err(message, args) else std.log.warn(message, args);
+    }
+}
+
+// Paths are diagnostic context, never recovery instructions or unbounded log payloads.
+fn logStateOpenFailure(operation: []const u8, path: []const u8, failure: anyerror, detail: durable.OpenDiagnostic) void {
+    const prefix = path[0..@min(path.len, 256)];
+    std.log.warn("native: state {s} failed: {s}; stage={s}; posix_cause={s}; sqlite_code={?d}; path='{'}'{s}", .{
+        operation,                                                @errorName(failure),
+        if (detail.stage) |stage| @tagName(stage) else "unknown", if (detail.posix_cause) |cause| @tagName(cause) else "none",
+        detail.sqlite_code,                                       std.zig.fmtEscapes(prefix),
+        if (prefix.len != path.len) " [path truncated]" else "",
+    });
+}
+
 fn preflightBackend(a: std.mem.Allocator, cfg: *const config.Config, enforcing: bool, persisted: ?effect.Installation) BackendAdmission {
     if (!enforcing) {
         std.log.info("firewall: every enabled jail is log-only; backend detection skipped", .{});
@@ -260,11 +291,20 @@ fn preflightBackend(a: std.mem.Allocator, cfg: *const config.Config, enforcing: 
     var id: [16]u8 = undefined;
     std.crypto.random.bytes(&id);
     const candidate = persisted orelse effect.Installation.init(id, effectBackend(selected.tag()), cfg.global.firewall_namespace) catch |cause| return .{ .unavailable = cause };
-    var probe = inspection.Inspector.open(a, effect_runtime.transportInstallation(candidate), .{}) catch |cause| return .{ .unavailable = cause };
+    var probe = inspection.Inspector.open(a, effect_runtime.transportInstallation(candidate), .{}) catch |cause| {
+        std.log.warn("firewall {s}: admission probe open failed ({s}); no mutation attempted", .{ @tagName(candidate.backend), @errorName(cause) });
+        return .{ .unavailable = cause };
+    };
     defer probe.close();
-    var observed = probe.inspect() catch |cause| return .{ .unavailable = cause };
+    var observed = probe.inspect() catch |cause| {
+        std.log.warn("firewall {s}: admission readback failed ({s}); no mutation attempted", .{ @tagName(candidate.backend), @errorName(cause) });
+        return .{ .unavailable = cause };
+    };
     observed.deinit();
-    if (persisted == null) probe.inspectReservedNamespace() catch |cause| return .{ .unavailable = cause };
+    if (persisted == null) probe.inspectReservedNamespace() catch |cause| {
+        std.log.warn("firewall {s}: reserved namespace inspection failed ({s}); no mutation attempted", .{ @tagName(candidate.backend), @errorName(cause) });
+        return .{ .unavailable = cause };
+    };
     return .{ .selected = .{ .installation = candidate, .persisted = persisted != null } };
 }
 
@@ -274,6 +314,8 @@ pub const Coordinator = struct {
     jails: []Jail,
     store: durable.Store,
     store_open: bool = false,
+    last_open_failure: ?durable.OpenDiagnostic = null,
+    last_identity_failure: ?anyerror = null,
     authority_lock: ?std.fs.File = null,
     namespace_lock: ?std.fs.File = null,
     effects: ?*effect_runtime.Manager = null,
@@ -312,6 +354,7 @@ pub const Coordinator = struct {
     thread: ?std.Thread = null,
     start_us: i64,
     last_notice: u64 = 0,
+    last_effect_notice: ?effect_runtime.EffectDiagnostic = null,
     recovery_generation: ?u64 = null,
     restore_jail: usize = 0,
     verify_jail: usize = 0,
@@ -944,12 +987,16 @@ pub const Coordinator = struct {
             if (!try namespace_lock.?.tryLock(.exclusive)) return error.NativeNamespaceAlreadyRunning;
         }
         var authority_lock = path_guard.lockStateIfPresent(cfg.global.state_file) catch |err| {
-            std.log.err("native: state authority '{s}': {s}", .{ cfg.global.state_file, @errorName(err) });
+            std.log.err("native: state authority admission failed: {s}; path='{'}'{s}", .{ @errorName(err), std.zig.fmtEscapes(cfg.global.state_file[0..@min(cfg.global.state_file.len, 256)]), if (cfg.global.state_file.len > 256) " [path truncated]" else "" });
             return err;
         };
         errdefer if (authority_lock) |file| file.close();
+        var open_diag: durable.OpenDiagnostic = .{};
         const snapshot: durable.Store.InstallationSnapshot = if (authority_lock != null)
-            try durable.Store.installationSnapshot(a, cfg.global.state_file)
+            durable.Store.installationSnapshotDetailed(a, cfg.global.state_file, &open_diag) catch |err| {
+                logStateOpenFailure("installation snapshot", cfg.global.state_file, err, open_diag);
+                return err;
+            }
         else
             .{ .schema_version = 0, .installation = null };
         const backend_admission = preflightBackend(a, cfg, requested_enforcing, snapshot.installation);
@@ -957,7 +1004,9 @@ pub const Coordinator = struct {
             const failure = backend_admission.unavailable;
             const forced = cfg.global.firewall != .auto;
             const reason = backendCauseName(failure);
-            if (cfg.global.on_no_backend == .@"fail-closed") {
+            if (failure == error.InstallationMismatch and snapshot.installation != null) {
+                logInstallationConflict(cfg, snapshot.installation.?);
+            } else if (cfg.global.on_no_backend == .@"fail-closed") {
                 if (forced)
                     std.log.err("firewall: no usable backend (forced by config) ({s}); refusing to run unprotected", .{reason})
                 else
@@ -1107,11 +1156,14 @@ pub const Coordinator = struct {
             prepared += 1;
         }
         if (self.authority_lock == null) self.authority_lock = path_guard.lockAbsentState(cfg.global.state_file) catch |err| {
-            std.log.err("native: state authority '{s}': {s}", .{ cfg.global.state_file, @errorName(err) });
+            std.log.err("native: state authority admission failed: {s}; path='{'}'{s}", .{ @errorName(err), std.zig.fmtEscapes(cfg.global.state_file[0..@min(cfg.global.state_file.len, 256)]), if (cfg.global.state_file.len > 256) " [path truncated]" else "" });
             return err;
         };
         try self.verifyStateIdentity();
-        self.store = try durable.Store.openRuntime(a, cfg.global.state_file);
+        self.store = durable.Store.openRuntimeDetailed(a, cfg.global.state_file, &open_diag) catch |err| {
+            logStateOpenFailure("runtime open", cfg.global.state_file, err, open_diag);
+            return err;
+        };
         self.store_open = true;
         errdefer self.store.close();
         try self.verifyStateIdentity();
@@ -1227,7 +1279,14 @@ pub const Coordinator = struct {
         const bytes = file.readToEndAlloc(arena.allocator(), 16 * 1024 * 1024) catch |err| return ReloadOutcome.single(.rejected, "config: read: {s}", .{@errorName(err)});
         const proposed = arena.allocator().create(config.Config) catch return ReloadOutcome.single(.rejected, "out of memory", .{});
         proposed.* = config.Config.parseDiag(arena.allocator(), bytes, &diag) catch |err| return ReloadOutcome.single(.rejected, "config: {s}:{d}:{d}: {s}", .{ self.config_path, diag.line, diag.col, @errorName(err) });
-        config.validate(proposed) catch |err| return ReloadOutcome.single(.rejected, "config: validation failed: {s}", .{@errorName(err)});
+        var validation_diag: config.ValidationDiagnostic = .{};
+        config.validateDiag(proposed, &validation_diag) catch |err| {
+            var out = ReloadOutcome.single(.rejected, "config: validation failed: {s}", .{@errorName(err)});
+            const detail = validation_diag.render(&out.reasons[1].bytes);
+            out.reasons[1].len = @intCast(detail.len);
+            out.reason_count = 2;
+            return out;
+        };
         const digest = reload_mod.digestBytes(bytes);
         const classified = self.inspectPublicationLocked(ReloadClassificationInput{ .proposed = proposed }, classifyReloadLocked);
         const current_generation = classified.generation;
@@ -1627,9 +1686,16 @@ pub const Coordinator = struct {
         if (a.dev != held.dev or a.ino != held.ino) return error.FirewallNamespaceMismatch;
     }
     fn verifyStateIdentity(self: *Coordinator) !void {
+        errdefer |failure| {
+            if (!std.meta.eql(self.last_identity_failure, @as(?anyerror, failure))) {
+                logStateOpenFailure("authority identity check", self.cfg.global.state_file, failure, .{});
+                self.last_identity_failure = failure;
+            }
+        }
         const held = try std.posix.fstat((self.authority_lock orelse return error.NativeAuthorityLockRequired).handle);
         const selected = try std.posix.fstatat(std.posix.AT.FDCWD, self.cfg.global.state_file, std.posix.AT.SYMLINK_NOFOLLOW);
         if (held.dev != selected.dev or held.ino != selected.ino or !std.posix.S.ISREG(selected.mode)) return error.NativeStateReplaced;
+        self.last_identity_failure = null;
     }
     fn ensureEffects(self: *Coordinator) !void {
         if (self.effects != null) {
@@ -1663,7 +1729,16 @@ pub const Coordinator = struct {
                     self.store.rollback_error_code = null;
                     self.store.reopen_required = true;
                 }
-                self.store = try durable.Store.openRuntime(self.allocator, self.cfg.global.state_file);
+                var open_diag: durable.OpenDiagnostic = .{};
+                self.store = durable.Store.openRuntimeDetailed(self.allocator, self.cfg.global.state_file, &open_diag) catch |err| {
+                    if (!std.meta.eql(self.last_open_failure, @as(?durable.OpenDiagnostic, open_diag))) {
+                        logStateOpenFailure("runtime reopen", self.cfg.global.state_file, err, open_diag);
+                        self.last_open_failure = open_diag;
+                    }
+                    return err;
+                };
+                if (self.last_open_failure != null) std.log.info("native: state runtime reopened; recovery checks pending", .{});
+                self.last_open_failure = null;
                 self.store_open = true;
                 try self.verifyStateIdentity();
             }
@@ -1918,12 +1993,22 @@ pub const Coordinator = struct {
                 const jail = &self.jails[self.verify_jail];
                 const verified = jail.session.?.verify() catch |failure| {
                     self.publishSource(jail);
+                    // Some admission failures bypass the source-repair cause. Retain
+                    // their child context without changing recovery classification.
+                    if (jail.source_error == null and jail.session.? == .journal)
+                        logJournalFailure(jail, failure, journalFailureDetail(jail, failure));
                     return failure;
                 };
                 if (!verified) return;
-                self.mutex.lock();
-                jail.source_error = null;
-                self.mutex.unlock();
+                if (jail.session.? == .journal) {
+                    // A verified selection still needs a successful recovery poll.
+                    // Publish cause and child metadata from the same repair state.
+                    self.publishSource(jail);
+                } else {
+                    self.mutex.lock();
+                    jail.source_error = null;
+                    self.mutex.unlock();
+                }
                 self.verify_jail += 1;
             },
             .begin => {
@@ -2050,10 +2135,48 @@ pub const Coordinator = struct {
             .journal => |value| value.repairSnapshot().last_cause,
             .internal => null,
         };
+        const healthy = source.healthy();
+        const diagnostic = switch (source) {
+            .journal => |value| if (value.failureDiagnostic()) |detail|
+                (if (cause != null and detail.cause == cause.?) detail else null)
+            else
+                null,
+            else => null,
+        };
         self.mutex.lock();
-        defer self.mutex.unlock();
-        jail.healthy = source.healthy();
+        const previous_cause = jail.source_error;
+        const previous_diagnostic = jail.source_diagnostic;
+        const changed = jail.healthy != healthy or previous_cause != cause or !std.meta.eql(previous_diagnostic, diagnostic);
+        jail.healthy = healthy;
         jail.source_error = cause;
+        jail.source_diagnostic = diagnostic;
+        self.mutex.unlock();
+        if (source == .journal and changed) {
+            if (cause) |failure| {
+                logJournalFailure(jail, failure, diagnostic);
+            } else if (healthy and jail.last_journal_notice != null) {
+                jail.last_journal_notice = null;
+                std.log.info("journal source for jail '{'}' recovered", .{std.zig.fmtEscapes(jail.name)});
+            }
+        }
+    }
+    fn journalFailureDetail(jail: *const Jail, failure: anyerror) ?journal_sessions.FailureDiagnostic {
+        const source = jail.session orelse return null;
+        return switch (source) {
+            .journal => |value| if (value.failureDiagnostic()) |detail| (if (detail.cause == failure) detail else null) else null,
+            else => null,
+        };
+    }
+    fn logJournalFailure(jail: *Jail, failure: anyerror, diagnostic: ?journal_sessions.FailureDiagnostic) void {
+        // Worker-owned transition key; no raw subprocess output or unbounded history.
+        const notice = diagnostic orelse journal_sessions.FailureDiagnostic{ .cause = failure, .exit_code = null, .signal = null, .stderr_present = false };
+        if (std.meta.eql(jail.last_journal_notice, @as(?journal_sessions.FailureDiagnostic, notice))) return;
+        jail.last_journal_notice = notice;
+        std.log.warn("journal source for jail '{'}' is unhealthy: {s}; journalctl exit={?d}, signal={?d}, stderr_present={}; inspect journal access and selection", .{
+            std.zig.fmtEscapes(jail.name),                             @errorName(failure),
+            if (diagnostic) |detail| detail.exit_code else null,       if (diagnostic) |detail| detail.signal else null,
+            if (diagnostic) |detail| detail.stderr_present else false,
+        });
     }
     fn publishHealth(self: *Coordinator) void {
         const snapshot = self.gate.snapshot();
@@ -2081,6 +2204,19 @@ pub const Coordinator = struct {
             self.published_backend = @tagName(manager.installation.backend);
         }
         self.mutex.unlock();
+        if (self.effects) |manager| {
+            const detail = manager.status.diagnostic;
+            if (!std.meta.eql(self.last_effect_notice, detail)) {
+                if (detail) |failure| {
+                    std.log.warn("firewall {s}: {s} failed ({s}); mutation={s}; enforcement confirmation pending", .{
+                        @tagName(failure.backend), @tagName(failure.stage), @errorName(failure.cause), @tagName(failure.mutation),
+                    });
+                } else if (manager.status.ready) {
+                    std.log.info("firewall {s}: readback recovered", .{@tagName(manager.installation.backend)});
+                }
+                self.last_effect_notice = detail;
+            }
+        }
         if (snapshot.notice_sequence != self.last_notice) {
             self.last_notice = snapshot.notice_sequence;
             std.log.info("native ingestion: {s}; cause={s}; committed={d}", .{ @tagName(snapshot.phase), if (snapshot.last_failure) |failure| @errorName(failure.cause) else "none", snapshot.committed_records });
@@ -2192,12 +2328,16 @@ pub const Coordinator = struct {
                 }
                 if (failure == error.EffectExpired or failure == error.ConsumerExpired or failure == error.ConsumerPending) continue;
                 if (self.gate.snapshot().phase != .healthy) return failure;
+                const diagnostic = journalFailureDetail(jail, failure);
                 self.mutex.lock();
-                const changed = jail.source_error == null or jail.source_error.? != failure;
+                const changed = jail.source_error == null or jail.source_error.? != failure or !std.meta.eql(jail.source_diagnostic, diagnostic);
                 jail.source_error = failure;
+                jail.source_diagnostic = diagnostic;
                 jail.healthy = false;
                 self.mutex.unlock();
-                if (changed) std.log.err("native jail {s}: {s}; source paused pending repair", .{ jail.name, @errorName(failure) });
+                if (changed) {
+                    if (jail.session.? == .journal) logJournalFailure(jail, failure, diagnostic) else std.log.err("native jail {s}: {s}; source paused pending repair", .{ jail.name, @errorName(failure) });
+                }
                 continue;
             };
             self.publishSource(jail);
@@ -2341,9 +2481,11 @@ pub const Coordinator = struct {
         var healthy = gate.phase == .healthy and observationHealthy(observation);
         var decisions: u64 = 0;
         var installed: u32 = 0;
+        var unhealthy_sources: u32 = 0;
         const now = sampled_wall orelse self.start_us;
         for (self.jails) |jail| {
             healthy = healthy and jail.healthy;
+            if (!jail.healthy) unhealthy_sources += 1;
             decisions +|= jail.summary.decisions;
             installed +|= self.confirmedCount(jail, now, observation);
         }
@@ -2351,7 +2493,8 @@ pub const Coordinator = struct {
         if (self.backend_failure != null) healthy = false;
         const protection: []const u8 = if (!healthy) "degraded" else if (self.published_effects != null) "active" else "log-only";
         const generation_hex = std.fmt.bytesToHex(self.published_generation, .lower);
-        try std.json.stringify(.{ .version = version, .runtime = "native", .generation = &generation_hex, .mutation_revision = self.published_revision, .state = protection, .protection = protection, .protection_cause = if (self.backend_failure) |failure| @as(?[]const u8, @errorName(failure)) else null, .active_bans = installed, .total_bans = self.published_confirmations, .storage = @tagName(gate.phase), .cause = if (gate.phase == .intervention and gate.last_failure != null) @errorName(gate.last_failure.?.cause) else if (observation.clock_uncertain) "ClockUncertain" else if (observation.stalled) "WorkerStalled" else if (observation.expiry_overdue) "EffectExpiryOverdue" else if (observation.expiry_uncertain) "EffectViewUncertain" else if (gate.last_failure) |failure| @errorName(failure.cause) else if (self.published_effects) |effects| if (effects.cause) |cause| @errorName(cause) else "none" else if (self.backend_failure) |failure| @errorName(failure) else "none", .sqlite_code = if (gate.last_failure) |failure| failure.diagnostics.sqlite_code else null, .next_retry_ms = gate.next_retry_ms, .committed_records = gate.committed_records, .decisions_total = decisions, .jails_active = self.jails.len, .backend = self.published_backend, .effects_uncertain = observation.expiry_uncertain or (if (self.published_effects) |effects| effects.uncertain else false), .overdue_effects = if (self.published_effects) |effects| effects.overdue else 0, .worker_busy = observation.busy, .worker_stalled = observation.stalled, .worker_busy_age_ms = observation.busy_age_ms, .worker_heartbeat_age_ms = observation.heartbeat_age_ms, .clock_uncertain = observation.clock_uncertain, .expiry_overdue = observation.expiry_overdue, .expiry_uncertain = observation.expiry_uncertain, .next_committed_expiry_us = observation.next_committed_expiry_us, .uptime_seconds = if (observation.clock_uncertain) @as(?u64, null) else @as(u64, @intCast(@max(0, @divTrunc(now -| self.start_us, 1_000_000)))) }, .{ .emit_null_optional_fields = false }, out.writer(a));
+        const effect_diagnostic = if (self.published_effects) |effects| effects.diagnostic else null;
+        try std.json.stringify(.{ .version = version, .runtime = "native", .generation = &generation_hex, .mutation_revision = self.published_revision, .state = protection, .protection = protection, .protection_cause = if (self.backend_failure) |failure| @as(?[]const u8, @errorName(failure)) else null, .active_bans = installed, .total_bans = self.published_confirmations, .storage = @tagName(gate.phase), .cause = if (gate.phase == .intervention and gate.last_failure != null) @errorName(gate.last_failure.?.cause) else if (observation.clock_uncertain) "ClockUncertain" else if (observation.stalled) "WorkerStalled" else if (observation.expiry_overdue) "EffectExpiryOverdue" else if (observation.expiry_uncertain) "EffectViewUncertain" else if (gate.last_failure) |failure| @errorName(failure.cause) else if (self.published_effects) |effects| if (effects.cause) |cause| @errorName(cause) else "none" else if (self.backend_failure) |failure| @errorName(failure) else "none", .sqlite_code = if (gate.last_failure) |failure| failure.diagnostics.sqlite_code else null, .next_retry_ms = gate.next_retry_ms, .committed_records = gate.committed_records, .decisions_total = decisions, .jails_active = self.jails.len, .unhealthy_sources = unhealthy_sources, .backend = self.published_backend, .effect_backend = if (effect_diagnostic) |detail| @as(?[]const u8, @tagName(detail.backend)) else null, .effect_stage = if (effect_diagnostic) |detail| @as(?[]const u8, @tagName(detail.stage)) else null, .effect_cause = if (effect_diagnostic) |detail| @as(?[]const u8, @errorName(detail.cause)) else null, .effect_mutation = if (effect_diagnostic) |detail| @as(?[]const u8, @tagName(detail.mutation)) else null, .effects_uncertain = observation.expiry_uncertain or (if (self.published_effects) |effects| effects.uncertain else false), .overdue_effects = if (self.published_effects) |effects| effects.overdue else 0, .worker_busy = observation.busy, .worker_stalled = observation.stalled, .worker_busy_age_ms = observation.busy_age_ms, .worker_heartbeat_age_ms = observation.heartbeat_age_ms, .clock_uncertain = observation.clock_uncertain, .expiry_overdue = observation.expiry_overdue, .expiry_uncertain = observation.expiry_uncertain, .next_committed_expiry_us = observation.next_committed_expiry_us, .uptime_seconds = if (observation.clock_uncertain) @as(?u64, null) else @as(u64, @intCast(@max(0, @divTrunc(now -| self.start_us, 1_000_000)))) }, .{ .emit_null_optional_fields = false }, out.writer(a));
     }
     fn confirmationReady(self: *const Coordinator, observation: health.WorkerStatus) bool {
         return observationHealthy(observation) and self.published_health.phase == .healthy and if (self.published_effects) |effects| effects.ready and !effects.uncertain else false;
@@ -2606,7 +2749,7 @@ pub const Coordinator = struct {
                         .finite_us => |value| @divTrunc(value, 1_000_000),
                         .permanent => null,
                     };
-                    try std.json.stringify(.{ .name = jail.name, .healthy = jail.healthy and self.published_health.phase == .healthy and observationHealthy(observation), .enabled = jail.admin_enabled, .paused = jail.admin_paused, .active_bans = self.confirmedCount(jail, sampled_wall orelse self.start_us, observation), .maxretry = jail.policy.maxretry, .findtime = @divTrunc(jail.policy.window_us, 1_000_000), .bantime = bantime, .bantime_permanent = jail.policy.duration == .permanent, .action = if (self.jailEnforces(&jail)) self.published_backend else "log-only", .enforcing = self.jailEnforces(&jail) and self.confirmationReady(observation), .log_source = @tagName(jail.plan), .source_healthy = jail.healthy and self.published_health.phase == .healthy and observationHealthy(observation), .source = @tagName(jail.plan), .revision = jail.revision, .decisions = jail.summary.decisions, .cause = if (jail.source_error) |cause| @errorName(cause) else "none" }, .{}, w);
+                    try std.json.stringify(.{ .name = jail.name, .healthy = jail.healthy and self.published_health.phase == .healthy and observationHealthy(observation), .enabled = jail.admin_enabled, .paused = jail.admin_paused, .active_bans = self.confirmedCount(jail, sampled_wall orelse self.start_us, observation), .maxretry = jail.policy.maxretry, .findtime = @divTrunc(jail.policy.window_us, 1_000_000), .bantime = bantime, .bantime_permanent = jail.policy.duration == .permanent, .action = if (self.jailEnforces(&jail)) self.published_backend else "log-only", .enforcing = self.jailEnforces(&jail) and self.confirmationReady(observation), .log_source = @tagName(jail.plan), .source_healthy = jail.healthy and self.published_health.phase == .healthy and observationHealthy(observation), .source = @tagName(jail.plan), .revision = jail.revision, .decisions = jail.summary.decisions, .cause = if (jail.source_error) |cause| @errorName(cause) else "none", .source_exit_code = if (jail.source_diagnostic) |detail| detail.exit_code else null, .source_signal = if (jail.source_diagnostic) |detail| detail.signal else null, .source_stderr_present = if (jail.source_diagnostic) |detail| @as(?bool, detail.stderr_present) else null }, .{}, w);
                 }
                 try w.writeAll("]");
             },
@@ -2679,8 +2822,9 @@ pub fn run(a: std.mem.Allocator, cfg: *const config.Config, config_path: []const
     } else {
         std.log.info("http: disabled by config", .{});
     }
-    coordinator.history_reader = durable.Store.openReadOnly(a, cfg.global.state_file) catch |err| blk: {
-        std.log.warn("native: history reader unavailable: {s}", .{@errorName(err)});
+    var history_open_diag: durable.OpenDiagnostic = .{};
+    coordinator.history_reader = durable.Store.openReadOnlyDetailed(a, cfg.global.state_file, &history_open_diag) catch |err| blk: {
+        logStateOpenFailure("history reader open", cfg.global.state_file, err, history_open_diag);
         break :blk null;
     };
     try coordinator.start();

@@ -187,6 +187,13 @@ test "native daemon: blocked SQLite writer leaves IPC responsive and resumes exa
     try h.writeLine(failure);
     try waitStatus(&h, "\"storage\":\"paused\"");
     try waitStatus(&h, "\"state\":\"degraded\"");
+    const visible = try std.process.Child.run(.{ .allocator = t.allocator, .argv = &.{ "zig-out/bin/fail2zig", "--socket", h.socket_path, "--timeout", "1000", "--output", "plain", "status" }, .max_output_bytes = 65536 });
+    defer t.allocator.free(visible.stdout);
+    defer t.allocator.free(visible.stderr);
+    try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, visible.term);
+    try t.expect(std.mem.indexOf(u8, visible.stdout, "storage\tpaused") != null);
+    try t.expect(std.mem.indexOf(u8, visible.stdout, "cause\tBusy") != null);
+    try t.expect(std.mem.indexOf(u8, visible.stdout, "sqlite_code\t5") != null);
     try t.expectEqual(@as(u64, 1), try blocker.revision("sshd"));
     try t.expectEqual(@as(c_int, 0), blocker.api.exec(blocker.db, "ROLLBACK;", null, null, null));
     locked = false;
@@ -294,6 +301,33 @@ test "native daemon: malformed source isolates its jail while independent file d
     defer t.allocator.free(jails);
     try t.expect(std.mem.indexOf(u8, jails, "\"name\":\"sshd\",\"healthy\":false") != null);
     try t.expect(std.mem.indexOf(u8, jails, "\"name\":\"good\",\"healthy\":true") != null);
+    try waitStatus(&h, "\"unhealthy_sources\":1");
+    const CauseView = struct { name: []const u8, cause: []const u8 };
+    const causes = try std.json.parseFromSlice([]const CauseView, t.allocator, jails, .{ .ignore_unknown_fields = true });
+    defer causes.deinit();
+    var source_cause: ?[]const u8 = null;
+    for (causes.value) |entry| if (std.mem.eql(u8, entry.name, "sshd")) {
+        source_cause = entry.cause;
+    };
+    try t.expect(source_cause != null);
+    try t.expect(!std.mem.eql(u8, source_cause.?, "none"));
+    var cause_buffer: [160]u8 = undefined;
+    const cause_text = try std.fmt.bufPrint(&cause_buffer, "broken ({s}", .{source_cause.?});
+    // Exercise the delivered formatter against the same actual daemon fault.
+    const checks = [_]struct { format: []const u8, command: []const u8, needle: []const u8 }{
+        .{ .format = "plain", .command = "status", .needle = "unhealthy_sources\t1" },
+        .{ .format = "plain", .command = "status", .needle = "storage\thealthy" },
+        .{ .format = "table", .command = "status", .needle = "1 unhealthy; inspect fail2zig jails" },
+        .{ .format = "table", .command = "jails", .needle = cause_text },
+    };
+    for (checks) |check| {
+        const result = try std.process.Child.run(.{ .allocator = t.allocator, .argv = &.{ "zig-out/bin/fail2zig", "--socket", h.socket_path, "--timeout", "1000", "--output", check.format, check.command }, .max_output_bytes = 65536 });
+        defer t.allocator.free(result.stdout);
+        defer t.allocator.free(result.stderr);
+        try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+        try t.expect(std.mem.indexOf(u8, result.stdout, check.needle) != null);
+        try t.expect(std.mem.indexOf(u8, result.stdout, "could not parse") == null);
+    }
     _ = try h.stopDaemon();
 }
 

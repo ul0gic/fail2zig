@@ -110,7 +110,13 @@ and
 .B firewall
 String. Which firewall backend to use.
 .I auto
-probes nftables, then ipset, then iptables and uses the first that is usable.
+probes nftables, then ipset, then iptables and uses the first that is usable
+when no firewall installation is recorded in the state database.
+With an existing installation,
+.I auto
+uses its recorded backend and does not switch to another backend if it becomes
+unavailable. This binding survives daemon restarts and host reboots, including
+when there are no active bans.
 .IR nftables ,
 .IR ipset ,
 or
@@ -120,6 +126,15 @@ probes only that backend; if it is unusable,
 decides. There is no fallback to another backend. Unknown values are
 rejected with line and column context. Default:
 .IR auto .
+.PP
+An explicit backend that conflicts with the recorded installation is rejected
+before backend probing. Restore the recorded backend or
+.I auto
+with the existing state database. Changing this setting does not migrate
+firewall ownership; do not delete the database to switch backends.
+The existing
+.B on_no_backend
+policy controls whether admission failure exits or runs degraded as log-only.
 .TP
 .B firewall_namespace
 Absolute path selecting the network namespace whose firewall state is owned by
@@ -132,6 +147,9 @@ and
 aliases are rejected because they are not stable external anchors. Custom
 selectors and service overrides that move the daemon between namespaces are
 not supported in 0.4.0.
+An existing installation also records the selector spelling. A changed selector
+is rejected even if it currently names the same namespace; restore the previous
+setting with the existing state database.
 .TP
 .B on_no_backend
 String. What happens when an enforcing jail exists but no usable backend was

@@ -53,6 +53,25 @@ pub const StatusPayload = struct {
     backend: ?[]const u8 = null,
     jails_active: ?u32 = null,
     generation: ?[]const u8 = null,
+    storage: ?[]const u8 = null,
+    cause: ?[]const u8 = null,
+    sqlite_code: ?i32 = null,
+    next_retry_ms: ?u64 = null,
+    unhealthy_sources: ?u32 = null,
+    effect_backend: ?[]const u8 = null,
+    effect_stage: ?[]const u8 = null,
+    effect_cause: ?[]const u8 = null,
+    effect_mutation: ?[]const u8 = null,
+    effects_uncertain: ?bool = null,
+    overdue_effects: ?u64 = null,
+    worker_busy: ?bool = null,
+    worker_stalled: ?bool = null,
+    worker_busy_age_ms: ?u64 = null,
+    worker_heartbeat_age_ms: ?u64 = null,
+    clock_uncertain: ?bool = null,
+    expiry_overdue: ?bool = null,
+    expiry_uncertain: ?bool = null,
+    next_committed_expiry_us: ?i64 = null,
 };
 
 pub const BanEntry = struct {
@@ -76,6 +95,10 @@ pub const JailEntry = struct {
     log_source: ?[]const u8 = null,
     source_healthy: ?bool = null,
     lines_seen: ?u64 = null,
+    cause: ?[]const u8 = null,
+    source_exit_code: ?u8 = null,
+    source_signal: ?u32 = null,
+    source_stderr_present: ?bool = null,
 };
 
 pub const VersionPayload = struct {
@@ -147,10 +170,30 @@ fn writeStatusPlain(writer: anytype, s: StatusPayload) !void {
     if (s.total_bans) |a| try writer.print("total_bans\t{d}\n", .{a});
     if (s.parse_rate) |p| try writer.print("parse_rate\t{d:.2}\n", .{p});
     if (s.protection) |p| try writer.print("protection\t{s}\n", .{p});
-    if (s.protection_cause) |c| try writer.print("protection_cause\t{s}\n", .{c});
+    var diagnostic_buffer: [diagnostic_max_bytes]u8 = undefined;
+    if (s.protection_cause) |c| try writer.print("protection_cause\t{s}\n", .{renderDiagnostic(&diagnostic_buffer, c)});
     if (s.backend) |b| try writer.print("backend\t{s}\n", .{b});
     if (s.jails_active) |j| try writer.print("jails_active\t{d}\n", .{j});
     if (s.generation) |g| try writer.print("generation\t{s}\n", .{g});
+    if (s.storage) |storage| try writer.print("storage\t{s}\n", .{renderDiagnostic(&diagnostic_buffer, storage)});
+    if (s.cause) |cause| try writer.print("cause\t{s}\n", .{renderDiagnostic(&diagnostic_buffer, cause)});
+    if (s.sqlite_code) |code| try writer.print("sqlite_code\t{d}\n", .{code});
+    if (s.next_retry_ms) |deadline| try writer.print("next_retry_ms\t{d}\n", .{deadline});
+    if (s.unhealthy_sources) |count| try writer.print("unhealthy_sources\t{d}\n", .{count});
+    if (s.effect_backend) |backend| try writer.print("effect_backend\t{s}\n", .{renderDiagnostic(&diagnostic_buffer, backend)});
+    if (s.effect_stage) |stage| try writer.print("effect_stage\t{s}\n", .{renderDiagnostic(&diagnostic_buffer, stage)});
+    if (s.effect_cause) |cause| try writer.print("effect_cause\t{s}\n", .{renderDiagnostic(&diagnostic_buffer, cause)});
+    if (s.effect_mutation) |mutation| try writer.print("effect_mutation\t{s}\n", .{renderDiagnostic(&diagnostic_buffer, mutation)});
+    if (s.effects_uncertain) |uncertain| try writer.print("effects_uncertain\t{s}\n", .{boolValue(uncertain)});
+    if (s.overdue_effects) |count| try writer.print("overdue_effects\t{d}\n", .{count});
+    if (s.worker_busy) |busy| try writer.print("worker_busy\t{s}\n", .{boolValue(busy)});
+    if (s.worker_stalled) |stalled| try writer.print("worker_stalled\t{s}\n", .{boolValue(stalled)});
+    if (s.worker_busy_age_ms) |age| try writer.print("worker_busy_age_ms\t{d}\n", .{age});
+    if (s.worker_heartbeat_age_ms) |age| try writer.print("worker_heartbeat_age_ms\t{d}\n", .{age});
+    if (s.clock_uncertain) |uncertain| try writer.print("clock_uncertain\t{s}\n", .{boolValue(uncertain)});
+    if (s.expiry_overdue) |overdue| try writer.print("expiry_overdue\t{s}\n", .{boolValue(overdue)});
+    if (s.expiry_uncertain) |uncertain| try writer.print("expiry_uncertain\t{s}\n", .{boolValue(uncertain)});
+    if (s.next_committed_expiry_us) |deadline| try writer.print("next_committed_expiry_us\t{d}\n", .{deadline});
 }
 
 fn writeStatusTable(writer: anytype, s: StatusPayload, color: Color) !void {
@@ -173,10 +216,36 @@ fn writeStatusTable(writer: anytype, s: StatusPayload, color: Color) !void {
     try rowLabel(writer, "Parse rate:", formatRate(s.parse_rate), width);
     try rowLabel(writer, "Active bans:", formatOptU32(s.active_bans), width);
     try rowLabel(writer, "Total bans:", formatOptU64(s.total_bans), width);
-    try rowLabel(writer, "Protection:", formatProtection(s), width);
+    var protection_buffer: [diagnostic_max_bytes + 16]u8 = undefined;
+    try rowLabel(writer, "Protection:", formatProtection(&protection_buffer, s), width);
     try rowLabel(writer, "Backend:", s.backend orelse "-", width);
     try rowLabel(writer, "Jails:", formatOptU32(s.jails_active), width);
     if (s.generation) |g| try rowLabel(writer, "Generation:", g, width);
+
+    var diagnostic_buffer: [diagnostic_max_bytes]u8 = undefined;
+    if (s.storage) |storage| try rowLabel(writer, "Storage:", renderDiagnostic(&diagnostic_buffer, storage), width);
+    if (statusCause(s)) |cause| try rowLabel(writer, "Cause:", renderDiagnostic(&diagnostic_buffer, cause), width);
+    if (s.sqlite_code) |code| {
+        var code_buffer: [32]u8 = undefined;
+        try rowLabel(writer, "SQLite code:", std.fmt.bufPrint(&code_buffer, "{d}", .{code}) catch "-", width);
+    }
+    if (s.next_retry_ms) |deadline| {
+        var retry_buffer: [64]u8 = undefined;
+        try rowLabel(writer, "Retry at:", std.fmt.bufPrint(&retry_buffer, "{d} ms monotonic", .{deadline}) catch "-", width);
+    }
+    if (s.unhealthy_sources) |count| if (count > 0) {
+        var source_buffer: [96]u8 = undefined;
+        try rowLabel(writer, "Sources:", std.fmt.bufPrint(&source_buffer, "{d} unhealthy; inspect fail2zig jails", .{count}) catch "unhealthy; inspect fail2zig jails", width);
+    };
+    var summary_buffer: [160]u8 = undefined;
+    if (formatEffects(&summary_buffer, s)) |value| try rowLabel(writer, "Effects:", value, width);
+    if (s.effect_backend) |backend| try rowLabel(writer, "Effect:", renderDiagnostic(&diagnostic_buffer, backend), width);
+    if (s.effect_stage) |stage| try rowLabel(writer, "  Stage:", renderDiagnostic(&diagnostic_buffer, stage), width);
+    if (s.effect_cause) |cause| try rowLabel(writer, "  Cause:", renderDiagnostic(&diagnostic_buffer, cause), width);
+    if (s.effect_mutation) |mutation| try rowLabel(writer, "  Attempt:", renderDiagnostic(&diagnostic_buffer, mutation), width);
+    if (formatWorker(&summary_buffer, s)) |value| try rowLabel(writer, "Worker:", value, width);
+    if (s.clock_uncertain == true) try rowLabel(writer, "Clock:", "uncertain", width);
+    if (formatExpiry(&summary_buffer, s)) |value| try rowLabel(writer, "Expiry:", value, width);
 
     try drawBotLine(writer, width);
 }
@@ -188,10 +257,35 @@ fn statusWidth(s: StatusPayload) usize {
     used = @max(used, rowUsed(formatRate(s.parse_rate)));
     used = @max(used, rowUsed(formatOptU32(s.active_bans)));
     used = @max(used, rowUsed(formatOptU64(s.total_bans)));
-    used = @max(used, rowUsed(formatProtection(s)));
+    var protection_buffer: [diagnostic_max_bytes + 16]u8 = undefined;
+    used = @max(used, rowUsed(formatProtection(&protection_buffer, s)));
     used = @max(used, rowUsed(s.backend orelse "-"));
     used = @max(used, rowUsed(formatOptU32(s.jails_active)));
     if (s.generation) |g| used = @max(used, rowUsed(g));
+    var diagnostic_buffer: [diagnostic_max_bytes]u8 = undefined;
+    if (s.storage) |storage| used = @max(used, rowUsed(renderDiagnostic(&diagnostic_buffer, storage)));
+    if (statusCause(s)) |cause| used = @max(used, rowUsed(renderDiagnostic(&diagnostic_buffer, cause)));
+    if (s.sqlite_code) |code| {
+        var code_buffer: [32]u8 = undefined;
+        used = @max(used, rowUsed(std.fmt.bufPrint(&code_buffer, "{d}", .{code}) catch "-"));
+    }
+    if (s.next_retry_ms) |deadline| {
+        var retry_buffer: [64]u8 = undefined;
+        used = @max(used, rowUsed(std.fmt.bufPrint(&retry_buffer, "{d} ms monotonic", .{deadline}) catch "-"));
+    }
+    if (s.unhealthy_sources) |count| if (count > 0) {
+        var source_buffer: [96]u8 = undefined;
+        used = @max(used, rowUsed(std.fmt.bufPrint(&source_buffer, "{d} unhealthy; inspect fail2zig jails", .{count}) catch "unhealthy; inspect fail2zig jails"));
+    };
+    var summary_buffer: [160]u8 = undefined;
+    if (formatEffects(&summary_buffer, s)) |value| used = @max(used, rowUsed(value));
+    if (s.effect_backend) |backend| used = @max(used, rowUsed(renderDiagnostic(&diagnostic_buffer, backend)));
+    if (s.effect_stage) |stage| used = @max(used, rowUsed(renderDiagnostic(&diagnostic_buffer, stage)));
+    if (s.effect_cause) |cause| used = @max(used, rowUsed(renderDiagnostic(&diagnostic_buffer, cause)));
+    if (s.effect_mutation) |mutation| used = @max(used, rowUsed(renderDiagnostic(&diagnostic_buffer, mutation)));
+    if (formatWorker(&summary_buffer, s)) |value| used = @max(used, rowUsed(value));
+    if (s.clock_uncertain == true) used = @max(used, rowUsed("uncertain"));
+    if (formatExpiry(&summary_buffer, s)) |value| used = @max(used, rowUsed(value));
     return @max(44, used + 2);
 }
 
@@ -201,11 +295,138 @@ fn rowUsed(value: []const u8) usize {
 
 const label_col: usize = 13;
 
-fn formatProtection(s: StatusPayload) []const u8 {
+fn formatProtection(buffer: []u8, s: StatusPayload) []const u8 {
     const p = s.protection orelse return "-";
-    if (!std.mem.eql(u8, p, "degraded")) return p;
-    const cause = s.protection_cause orelse return "DEGRADED";
-    return std.fmt.bufPrint(&scratch, "DEGRADED ({s})", .{cause}) catch "DEGRADED";
+    if (!std.mem.eql(u8, p, "degraded")) return renderDiagnostic(buffer, p);
+    const value = s.protection_cause orelse return "DEGRADED";
+    if (std.mem.eql(u8, value, "none")) return "DEGRADED";
+    var cause_buffer: [diagnostic_max_bytes]u8 = undefined;
+    const cause = renderDiagnostic(&cause_buffer, value);
+    return std.fmt.bufPrint(buffer, "DEGRADED ({s})", .{cause}) catch "DEGRADED";
+}
+
+fn statusCause(s: StatusPayload) ?[]const u8 {
+    if (s.cause) |cause| {
+        if (!std.mem.eql(u8, cause, "none")) return cause;
+    }
+    if (s.protection) |protection| {
+        if (std.mem.eql(u8, protection, "degraded")) return "unknown";
+    }
+    return null;
+}
+
+fn boolValue(value: bool) []const u8 {
+    return if (value) "true" else "false";
+}
+
+fn formatEffects(buffer: []u8, s: StatusPayload) ?[]const u8 {
+    const uncertain = s.effects_uncertain == true;
+    const overdue = s.overdue_effects orelse 0;
+    if (!uncertain and overdue == 0) return null;
+    if (uncertain and overdue > 0) return std.fmt.bufPrint(buffer, "uncertain; {d} overdue", .{overdue}) catch "uncertain";
+    if (uncertain) return "uncertain";
+    return std.fmt.bufPrint(buffer, "{d} overdue", .{overdue}) catch "overdue";
+}
+
+fn formatWorker(buffer: []u8, s: StatusPayload) ?[]const u8 {
+    const busy = s.worker_busy == true;
+    const stalled = s.worker_stalled == true;
+    if (!busy and !stalled) return null;
+    const busy_age = s.worker_busy_age_ms;
+    const heartbeat_age = s.worker_heartbeat_age_ms;
+    if (stalled and busy and busy_age != null and heartbeat_age != null) return std.fmt.bufPrint(buffer, "stalled; busy {d} ms; heartbeat {d} ms ago", .{ busy_age.?, heartbeat_age.? }) catch "stalled; busy";
+    if (stalled and heartbeat_age != null) return std.fmt.bufPrint(buffer, "stalled; heartbeat {d} ms ago", .{heartbeat_age.?}) catch "stalled";
+    if (stalled) return "stalled";
+    if (busy_age) |age| return std.fmt.bufPrint(buffer, "busy for {d} ms", .{age}) catch "busy";
+    return "busy";
+}
+
+fn formatExpiry(buffer: []u8, s: StatusPayload) ?[]const u8 {
+    const overdue = s.expiry_overdue == true;
+    const uncertain = s.expiry_uncertain == true;
+    if (!overdue and !uncertain) return null;
+    const deadline = s.next_committed_expiry_us;
+    if (overdue and uncertain and deadline != null) return std.fmt.bufPrint(buffer, "overdue; view uncertain; next committed {d} us", .{deadline.?}) catch "overdue; view uncertain";
+    if (overdue and deadline != null) return std.fmt.bufPrint(buffer, "overdue; next committed {d} us", .{deadline.?}) catch "overdue";
+    if (uncertain and deadline != null) return std.fmt.bufPrint(buffer, "view uncertain; next committed {d} us", .{deadline.?}) catch "view uncertain";
+    if (overdue and uncertain) return "overdue; view uncertain";
+    return if (overdue) "overdue" else "view uncertain";
+}
+
+const diagnostic_max_bytes: usize = 96;
+
+const DiagnosticUnit = struct {
+    input_len: usize,
+    output_len: usize,
+    kind: enum { raw, slash, newline, carriage_return, tab, hex },
+};
+
+fn diagnosticUnit(input: []const u8) DiagnosticUnit {
+    const byte = input[0];
+    if (byte == '\\') return .{ .input_len = 1, .output_len = 2, .kind = .slash };
+    if (byte == '\n') return .{ .input_len = 1, .output_len = 2, .kind = .newline };
+    if (byte == '\r') return .{ .input_len = 1, .output_len = 2, .kind = .carriage_return };
+    if (byte == '\t') return .{ .input_len = 1, .output_len = 2, .kind = .tab };
+    if (byte < 0x20 or byte == 0x7f) return .{ .input_len = 1, .output_len = 4, .kind = .hex };
+    if (byte < 0x7f) return .{ .input_len = 1, .output_len = 1, .kind = .raw };
+    const sequence_len: usize = std.unicode.utf8ByteSequenceLength(byte) catch return .{ .input_len = 1, .output_len = 4, .kind = .hex };
+    if (sequence_len > input.len) return .{ .input_len = 1, .output_len = 4, .kind = .hex };
+    const codepoint = std.unicode.utf8Decode(input[0..sequence_len]) catch return .{ .input_len = 1, .output_len = 4, .kind = .hex };
+    if (isUnsafeUnicodeControl(codepoint)) return .{ .input_len = sequence_len, .output_len = sequence_len * 4, .kind = .hex };
+    return .{ .input_len = sequence_len, .output_len = sequence_len, .kind = .raw };
+}
+
+fn isUnsafeUnicodeControl(codepoint: u21) bool {
+    return (codepoint >= 0x80 and codepoint <= 0x9f) or
+        codepoint == 0x061c or
+        (codepoint >= 0x200e and codepoint <= 0x200f) or
+        (codepoint >= 0x202a and codepoint <= 0x202e) or
+        (codepoint >= 0x2066 and codepoint <= 0x2069);
+}
+
+fn renderDiagnostic(buffer: []u8, input: []const u8) []const u8 {
+    const capacity = @min(buffer.len, diagnostic_max_bytes);
+    if (capacity == 0) return buffer[0..0];
+    var input_index: usize = 0;
+    var escaped_len: usize = 0;
+    while (input_index < input.len and escaped_len <= capacity) {
+        const unit = diagnosticUnit(input[input_index..]);
+        escaped_len +|= unit.output_len;
+        input_index += unit.input_len;
+    }
+    const truncated = input_index < input.len or escaped_len > capacity;
+    const suffix_len = if (truncated) @min(capacity, 3) else 0;
+    const limit = capacity - suffix_len;
+    input_index = 0;
+    var output_index: usize = 0;
+    while (input_index < input.len) {
+        const unit = diagnosticUnit(input[input_index..]);
+        if (unit.output_len > limit - output_index) break;
+        switch (unit.kind) {
+            .raw => @memcpy(buffer[output_index..][0..unit.output_len], input[input_index..][0..unit.input_len]),
+            .slash => @memcpy(buffer[output_index..][0..2], "\\\\"),
+            .newline => @memcpy(buffer[output_index..][0..2], "\\n"),
+            .carriage_return => @memcpy(buffer[output_index..][0..2], "\\r"),
+            .tab => @memcpy(buffer[output_index..][0..2], "\\t"),
+            .hex => {
+                const hex = "0123456789ABCDEF";
+                for (input[input_index..][0..unit.input_len], 0..) |hex_byte, index| {
+                    const offset = output_index + index * 4;
+                    buffer[offset] = '\\';
+                    buffer[offset + 1] = 'x';
+                    buffer[offset + 2] = hex[hex_byte >> 4];
+                    buffer[offset + 3] = hex[hex_byte & 0x0f];
+                }
+            },
+        }
+        output_index += unit.output_len;
+        input_index += unit.input_len;
+    }
+    if (truncated) {
+        @memset(buffer[output_index..][0..suffix_len], '.');
+        output_index += suffix_len;
+    }
+    return buffer[0..output_index];
 }
 
 fn versionLen(v: ?[]const u8) usize {
@@ -274,7 +495,7 @@ fn formatMemory(used_opt: ?u64, limit_opt: ?u64) []const u8 {
     const used = used_opt orelse return "-";
     if (limit_opt) |limit| {
         if (limit == 0) return "-";
-        const pct = (used * 100) / limit;
+        const pct = (@as(u128, used) * 100) / limit;
         const r = std.fmt.bufPrint(&scratch, "{d:.1} / {d:.1} MB ({d}%)", .{
             mb(used), mb(limit), pct,
         }) catch return "-";
@@ -457,8 +678,9 @@ pub fn formatJails(
 
 fn writeJailsPlain(writer: anytype, jails: []const JailEntry) !void {
     for (jails) |j| {
+        var name_buffer: [diagnostic_max_bytes]u8 = undefined;
         try writer.print("{s}\t{s}\t{d}\t{d}\t{d}\t{d}\t{s}\t{s}\t{s}\t{s}\t{d}\n", .{
-            j.name orelse "-",
+            if (j.name) |name| renderDiagnostic(&name_buffer, name) else "-",
             if (j.enabled orelse false) "enabled" else "disabled",
             j.active_bans orelse 0,
             j.maxretry orelse 0,
@@ -486,7 +708,7 @@ fn writeJailsTable(writer: anytype, jails: []const JailEntry, color: Color) !voi
 
     var w: JailsWidths = .{};
     for (jails) |j| w.widen(j);
-    const name_col = colWidth("JAIL", longestLen(JailEntry, jails, "name"));
+    const name_col = colWidth("JAIL", longestJailNameLen(jails));
     const state_col = colWidth("STATE", w.state);
     const active_col = colWidth("ACTIVE", w.active);
     const max_col = colWidth("MAX RETRY", w.max);
@@ -495,7 +717,7 @@ fn writeJailsTable(writer: anytype, jails: []const JailEntry, color: Color) !voi
     const action_col = colWidth("ACTION", longestLen(JailEntry, jails, "action"));
     const enforce_col = colWidth("ENFORCING", w.enforce);
     const source_col = colWidth("SOURCE", longestLen(JailEntry, jails, "log_source"));
-    const health_col = colWidth("HEALTH", w.health);
+    const health_col = @max("HEALTH".len, @min(w.health, diagnostic_max_bytes)) + 1;
 
     try color.on(writer, Color.bold);
     try padRightPrint(writer, "JAIL", name_col);
@@ -515,7 +737,8 @@ fn writeJailsTable(writer: anytype, jails: []const JailEntry, color: Color) !voi
     try writer.writeAll("\n");
 
     for (jails) |j| {
-        try writeCell(writer, j.name orelse "-", name_col);
+        var name_buffer: [diagnostic_max_bytes]u8 = undefined;
+        try writeCell(writer, if (j.name) |name| renderDiagnostic(&name_buffer, name) else "-", name_col);
         try color.on(writer, if (j.enabled orelse false) Color.green else Color.yellow);
         try writeCell(writer, stateStr(j), state_col);
         try color.off(writer);
@@ -529,7 +752,8 @@ fn writeJailsTable(writer: anytype, jails: []const JailEntry, color: Color) !voi
         try color.off(writer);
         try writeCell(writer, j.log_source orelse "-", source_col);
         if (j.source_healthy) |h| try color.on(writer, if (h) Color.green else Color.yellow);
-        try writeCell(writer, healthStr(j), health_col);
+        var health_buffer: [diagnostic_max_bytes]u8 = undefined;
+        try writeCell(writer, formatJailHealth(&health_buffer, j), health_col);
         try color.off(writer);
         try writer.writeAll("\n");
     }
@@ -553,7 +777,8 @@ const JailsWidths = struct {
         self.find = @max(self.find, formatDurationSecs(j.findtime).len);
         self.ban = @max(self.ban, formatDurationSecs(j.bantime).len);
         self.enforce = @max(self.enforce, enforcingStr(j).len);
-        self.health = @max(self.health, healthStr(j).len);
+        var health_buffer: [diagnostic_max_bytes]u8 = undefined;
+        self.health = @max(self.health, formatJailHealth(&health_buffer, j).len);
     }
 };
 
@@ -566,9 +791,31 @@ fn enforcingStr(j: JailEntry) []const u8 {
     return if (e) "true" else "false";
 }
 
-fn healthStr(j: JailEntry) []const u8 {
-    const h = j.source_healthy orelse return "unknown";
-    return if (h) "ok" else "broken";
+fn formatJailHealth(buffer: []u8, jail: JailEntry) []const u8 {
+    const healthy = jail.source_healthy orelse return "unknown";
+    if (healthy) return "ok";
+    var cause_buffer: [40]u8 = undefined;
+    const cause = if (jail.cause) |value|
+        if (std.mem.eql(u8, value, "none")) "unknown" else renderDiagnostic(&cause_buffer, value)
+    else
+        "unknown";
+    var stream = std.io.fixedBufferStream(buffer[0..@min(buffer.len, diagnostic_max_bytes)]);
+    const writer = stream.writer();
+    writer.print("broken ({s}", .{cause}) catch return "broken (unknown)";
+    if (jail.source_exit_code) |code| writer.print("; exit={d}", .{code}) catch return "broken (unknown)";
+    if (jail.source_signal) |signal| writer.print("; signal={d}", .{signal}) catch return "broken (unknown)";
+    if (jail.source_stderr_present == true) writer.writeAll("; stderr") catch return "broken (unknown)";
+    writer.writeByte(')') catch return "broken (unknown)";
+    return stream.getWritten();
+}
+
+fn longestJailNameLen(jails: []const JailEntry) usize {
+    var widest: usize = 0;
+    for (jails) |jail| {
+        var buffer: [diagnostic_max_bytes]u8 = undefined;
+        widest = @max(widest, if (jail.name) |name| renderDiagnostic(&buffer, name).len else 1);
+    }
+    return widest;
 }
 
 const col_max: usize = 48;
@@ -584,8 +831,9 @@ fn colWidth(header: []const u8, longest: usize) usize {
 }
 
 fn writeCell(writer: anytype, s: []const u8, width: usize) !void {
-    if (s.len <= col_max) return padRightPrint(writer, s, width);
-    var cut = col_max - 3;
+    const value_max = width - 1;
+    if (s.len <= value_max) return padRightPrint(writer, s, width);
+    var cut = value_max - 3;
     while (cut > 0 and (s[cut] & 0xC0) == 0x80) cut -= 1;
     try writer.writeAll(s[0..cut]);
     try writer.writeAll("...");
@@ -1279,6 +1527,32 @@ test "format: status table shows box lines and version" {
     try testing.expect(std.mem.indexOf(u8, out, "8") != null);
 }
 
+test "format: BUG-059 status memory percentage handles the full u64 range" {
+    const cases = .{
+        .{ "18446744073709551615", "1", "17592186044416.0 / 0.0 MB (1844674407370955161500%)" },
+        .{ "18446744073709551615", "18446744073709551615", "17592186044416.0 / 17592186044416.0 MB (100%)" },
+        .{ "1", "18446744073709551615", "0.0 / 17592186044416.0 MB (0%)" },
+        .{ "8388608", "67108864", "8.0 / 64.0 MB (12%)" },
+        .{ "3", "2", "0.0 / 0.0 MB (150%)" },
+        .{ "0", "1", "0.0 / 0.0 MB (0%)" },
+        .{ "18446744073709551615", "0", "-" },
+    };
+    inline for (cases) |case| {
+        const payload = "{\"memory_bytes_used\":" ++ case[0] ++ ",\"memory_bytes_limit\":" ++ case[1] ++ "}";
+        const out = try runStatus(testing.allocator, payload, .table);
+        defer testing.allocator.free(out);
+        const start = (std.mem.indexOf(u8, out, "Memory:") orelse return error.MissingMemoryRow) + "Memory:".len;
+        const end = std.mem.indexOfScalarPos(u8, out, start, '\n') orelse return error.MissingMemoryRow;
+        try testing.expectEqualStrings(case[2], std.mem.trim(u8, out[start..end], " |\r"));
+    }
+
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var output: [128]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&output);
+    try formatStatus(failing.allocator(), stream.writer(), "{\"memory_bytes_used\":18446744073709551615,\"memory_bytes_limit\":1}", .table, .{ .enabled = false });
+    try testing.expect(std.mem.indexOf(u8, stream.getWritten(), "could not parse status payload (OutOfMemory)") != null);
+}
+
 test "format: status json passes through" {
     const payload = "{\"version\":\"0.1.0\"}";
     const out = try runStatus(testing.allocator, payload, .json);
@@ -1361,6 +1635,7 @@ test "format: status degraded without protection_cause renders plain DEGRADED (o
     defer testing.allocator.free(table);
     try testing.expect(std.mem.indexOf(u8, table, "Protection:  DEGRADED ") != null);
     try testing.expect(std.mem.indexOf(u8, table, "DEGRADED (") == null);
+    try testing.expect(std.mem.indexOf(u8, table, "Cause:       unknown") != null);
 
     const plain = try runStatus(testing.allocator, payload, .plain);
     defer testing.allocator.free(plain);
@@ -1374,6 +1649,158 @@ test "format: status all-log-only renders Protection log-only and Backend none" 
     try testing.expect(std.mem.indexOf(u8, table, "Protection:  log-only ") != null);
     try testing.expect(std.mem.indexOf(u8, table, "Backend:     none ") != null);
     try testing.expect(std.mem.indexOf(u8, table, "DEGRADED") == null);
+}
+
+test "format: BUG-054 status renders simultaneous scoped degradation details" {
+    const payload =
+        \\{"protection":"degraded","storage":"paused","cause":"StorageFull","sqlite_code":13,
+        \\"next_retry_ms":18446744073709551615,"unhealthy_sources":2,"effects_uncertain":true,
+        \\"overdue_effects":3,"effect_backend":"nftables","effect_stage":"dispatch",
+        \\"effect_cause":"PermissionDenied","effect_mutation":"not_started",
+        \\"worker_busy":true,"worker_stalled":true,"worker_busy_age_ms":6001,
+        \\"worker_heartbeat_age_ms":7002,"clock_uncertain":true,"expiry_overdue":true,
+        \\"expiry_uncertain":true,"next_committed_expiry_us":-42}
+    ;
+    const table = try runStatus(testing.allocator, payload, .table);
+    defer testing.allocator.free(table);
+    try testing.expect(std.mem.indexOf(u8, table, "Protection:  DEGRADED ") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "Protection:  DEGRADED (") == null);
+    try testing.expect(std.mem.indexOf(u8, table, "Storage:     paused") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "Cause:       StorageFull") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "SQLite code: 13") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "Retry at:    18446744073709551615 ms monotonic") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "Sources:     2 unhealthy; inspect fail2zig jails") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "Effects:     uncertain; 3 overdue") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "Effect:      nftables") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "  Stage:     dispatch") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "  Cause:     PermissionDenied") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "  Attempt:   not_started") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "Worker:      stalled; busy 6001 ms; heartbeat 7002 ms ago") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "Clock:       uncertain") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "Expiry:      overdue; view uncertain; next committed -42 us") != null);
+
+    const plain = try runStatus(testing.allocator, payload, .plain);
+    defer testing.allocator.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "storage\tpaused\n") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "cause\tStorageFull\n") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "sqlite_code\t13\n") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "next_retry_ms\t18446744073709551615\n") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "unhealthy_sources\t2\n") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "effect_backend\tnftables\n") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "effect_stage\tdispatch\n") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "effect_cause\tPermissionDenied\n") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "effect_mutation\tnot_started\n") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "effects_uncertain\ttrue\n") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "worker_stalled\ttrue\n") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "clock_uncertain\ttrue\n") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "next_committed_expiry_us\t-42\n") != null);
+}
+
+test "format: BUG-054 healthy log-only status does not invent fault context" {
+    const payload =
+        \\{"protection":"log-only","backend":"none","storage":"healthy","cause":"none",
+        \\"unhealthy_sources":0,"effects_uncertain":false,"overdue_effects":0,
+        \\"worker_busy":false,"worker_stalled":false,"worker_busy_age_ms":0,
+        \\"worker_heartbeat_age_ms":7,"clock_uncertain":false,"expiry_overdue":false,
+        \\"expiry_uncertain":false}
+    ;
+    const table = try runStatus(testing.allocator, payload, .table);
+    defer testing.allocator.free(table);
+    try testing.expect(std.mem.indexOf(u8, table, "Protection:  log-only") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "Storage:     healthy") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "Cause:") == null);
+    try testing.expect(std.mem.indexOf(u8, table, "Sources:") == null);
+    try testing.expect(std.mem.indexOf(u8, table, "Effects:") == null);
+    try testing.expect(std.mem.indexOf(u8, table, "Effect:") == null);
+    try testing.expect(std.mem.indexOf(u8, table, "Worker:") == null);
+    try testing.expect(std.mem.indexOf(u8, table, "Clock:") == null);
+    try testing.expect(std.mem.indexOf(u8, table, "Expiry:") == null);
+
+    const plain = try runStatus(testing.allocator, payload, .plain);
+    defer testing.allocator.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "cause\tnone\n") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "effects_uncertain\tfalse\n") != null);
+}
+
+test "format: BUG-054 diagnostic strings are escaped and capped without splitting UTF-8" {
+    const payload =
+        \\{"protection":"degraded","protection_cause":"bad\nline\tcol\u001b\\tail",
+        \\"storage":"paused\\rstate","cause":"éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"}
+    ;
+    const table = try runStatus(testing.allocator, payload, .table);
+    defer testing.allocator.free(table);
+    try testing.expect(std.unicode.utf8ValidateSlice(table));
+    try testing.expect(std.mem.indexOf(u8, table, "bad\\nline\\tcol\\x1B\\\\tail") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "paused\\\\rstate") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "...") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "\x1b") == null);
+
+    const plain = try runStatus(testing.allocator, payload, .plain);
+    defer testing.allocator.free(plain);
+    try testing.expect(std.unicode.utf8ValidateSlice(plain));
+    try testing.expect(std.mem.indexOf(u8, plain, "protection_cause\tbad\\nline\\tcol\\x1B\\\\tail\n") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "\nline") == null);
+}
+
+test "format: BUG-054 diagnostic renderer handles zero and tiny capacities" {
+    var empty: [0]u8 = .{};
+    try testing.expectEqual(@as(usize, 0), renderDiagnostic(&empty, "hostile\nvalue").len);
+    var tiny: [2]u8 = undefined;
+    try testing.expectEqualStrings("..", renderDiagnostic(&tiny, "hostile\nvalue"));
+}
+
+test "format: diagnostic renderer escapes C1 and bidi controls atomically" {
+    const hostile = "oké\u{009b}\u{061c}\u{200e}\u{202e}\u{2066}雪";
+    var buffer: [diagnostic_max_bytes]u8 = undefined;
+    try testing.expectEqualStrings(
+        "oké\\xC2\\x9B\\xD8\\x9C\\xE2\\x80\\x8E\\xE2\\x80\\xAE\\xE2\\x81\\xA6雪",
+        renderDiagnostic(&buffer, hostile),
+    );
+
+    var tight: [11]u8 = undefined;
+    try testing.expectEqualStrings("...", renderDiagnostic(&tight, "\u{202e}"));
+    try testing.expect(isUnsafeUnicodeControl(0x80));
+    try testing.expect(isUnsafeUnicodeControl(0x9f));
+    try testing.expect(isUnsafeUnicodeControl(0x202a));
+    try testing.expect(isUnsafeUnicodeControl(0x2069));
+    try testing.expect(!isUnsafeUnicodeControl(0x200d));
+    try testing.expect(!isUnsafeUnicodeControl(0x206a));
+}
+
+test "format: status escapes Unicode controls in effect diagnostics" {
+    const payload =
+        \\{"protection":"degraded","cause":"safe\u009bspoof\u202e",
+        \\"effect_backend":"nft\u2066","effect_stage":"verify","effect_cause":"Denied\u061c",
+        \\"effect_mutation":"outcome_uncertain"}
+    ;
+    const table = try runStatus(testing.allocator, payload, .table);
+    defer testing.allocator.free(table);
+    try testing.expect(std.mem.indexOf(u8, table, "safe\\xC2\\x9Bspoof\\xE2\\x80\\xAE") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "Effect:      nft\\xE2\\x81\\xA6") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "  Cause:     Denied\\xD8\\x9C") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "  Attempt:   outcome_uncertain") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "\u{009b}") == null);
+    try testing.expect(std.mem.indexOf(u8, table, "\u{202e}") == null);
+
+    const plain = try runStatus(testing.allocator, payload, .plain);
+    defer testing.allocator.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "effect_backend\tnft\\xE2\\x81\\xA6\n") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "effect_mutation\toutcome_uncertain\n") != null);
+}
+
+test "format: BUG-054 status JSON remains byte-for-byte passthrough" {
+    const payload = "{\"protection\":\"degraded\",\"cause\":\"x\\n y\",\"future\":{\"field\":1}}\n";
+    const json = try runStatus(testing.allocator, payload, .json);
+    defer testing.allocator.free(json);
+    try testing.expectEqualStrings(payload, json);
+}
+
+test "format: status reports parser allocation failure without retaining diagnostics" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var output: [128]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&output);
+    try formatStatus(failing.allocator(), stream.writer(), "{\"cause\":\"StorageFull\"}", .plain, .{ .enabled = false });
+    try testing.expect(std.mem.indexOf(u8, stream.getWritten(), "could not parse status payload (OutOfMemory)") != null);
 }
 
 fn runList(alloc: std.mem.Allocator, payload: []const u8, fmt: OutputFormat) ![]u8 {
@@ -1571,6 +1998,35 @@ test "format: jails table renders source + health, tints broken (SYS-017)" {
     try testing.expect(std.mem.indexOf(u8, out, "broken") != null);
     try testing.expect(std.mem.indexOf(u8, out, "/var/log/nginx/error.log") != null);
     try testing.expect(std.mem.indexOf(u8, out, "unknown") != null);
+}
+
+test "format: BUG-054 jail cause is bounded in HEALTH while plain stays eleven escaped columns" {
+    const payload =
+        \\[{"name":"ssh\tadmin\nrow\u2066","enabled":true,"active_bans":1,"maxretry":3,
+        \\"findtime":600,"bantime":3600,"action":"log-only","enforcing":false,
+        \\"log_source":"journal","source_healthy":false,"lines_seen":9,
+        \\"cause":"JournalChildFailed\nnext","source_exit_code":7,"source_signal":9,
+        \\"source_stderr_present":true}]
+    ;
+    const table = try runJails(testing.allocator, payload, .table);
+    defer testing.allocator.free(table);
+    try testing.expect(std.mem.indexOf(u8, table, "ssh\\tadmin\\nrow\\xE2\\x81\\xA6") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "broken (JournalChildFailed\\nnext; exit=7; signal=9; stderr)") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "\nrow") == null);
+
+    const plain = try runJails(testing.allocator, payload, .plain);
+    defer testing.allocator.free(plain);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, plain, "\n"));
+    try testing.expectEqual(@as(usize, 10), std.mem.count(u8, plain, "\t"));
+    try testing.expect(std.mem.startsWith(u8, plain, "ssh\\tadmin\\nrow\\xE2\\x81\\xA6\tenabled\t"));
+    try testing.expect(std.mem.indexOf(u8, plain, "JournalChildFailed") == null);
+}
+
+test "format: BUG-054 unhealthy jail without a cause reports unknown" {
+    const payload = "[{\"name\":\"sshd\",\"source_healthy\":false,\"cause\":\"none\"}]";
+    const table = try runJails(testing.allocator, payload, .table);
+    defer testing.allocator.free(table);
+    try testing.expect(std.mem.indexOf(u8, table, "broken (unknown)") != null);
 }
 
 test "format: jails table tolerates missing source fields (older daemon, SYS-017)" {
