@@ -485,7 +485,7 @@ through the 0660 socket; mutations require uid 0 or the daemon uid.
 Exit classes (every command): `0` success · `1` rejected or absent · `2` usage ·
 `3` daemon unavailable · `4` partial (kernel confirmation incomplete) · `5` uncertain.
 
-The development build adds diagnostic detail to `status` and `jails` (these additions
+Version 0.4.1 adds diagnostic detail to `status` and `jails` (these additions
 are not in v0.4.0). If protection is degraded, check the storage, source and firewall
 rows: more than one subsystem can need attention. `fail2zig jails` identifies the
 source cause and, when captured, journalctl exit/signal details. A missing detail
