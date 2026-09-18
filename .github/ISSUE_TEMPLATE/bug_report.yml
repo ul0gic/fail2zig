@@ -6,7 +6,9 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for filing a bug. Please give us enough detail to reproduce it on our end — the more concrete, the faster the fix.
+        Tell us what you saw and how fail2zig is running. These details help us recreate your setup without asking you to repeat the same checks.
+
+        If you don't know an answer or a command fails, say so and include the error. You don't need to install tools or change your firewall to file a report. Remove secrets and redact identifying details consistently so we can still follow the events.
 
         **For security vulnerabilities:** Do NOT use this template. Open a [private security advisory](https://github.com/ul0gic/fail2zig/security/advisories/new) instead.
 
@@ -14,8 +16,8 @@ body:
     id: what-happened
     attributes:
       label: What happened
-      description: A clear, concise description of the bug. What did you observe?
-      placeholder: "fail2zig stopped banning IPs after ~6 hours of uptime, even though `lines_matched_total` kept incrementing."
+      description: What did fail2zig do? Include the exact error or the behavior you observed.
+      placeholder: "The address appeared in the ban list, but a new SSH connection from that address still succeeded while the ban was active."
     validations:
       required: true
 
@@ -32,13 +34,12 @@ body:
     id: reproduction
     attributes:
       label: Steps to reproduce
-      description: Exact commands, config snippets, log lines — whatever makes this reproducible.
+      description: Include the commands or service used to start fail2zig and the config path. If this followed an upgrade, restart, backend change or state cleanup, include that sequence. Keep existing state while we investigate.
       placeholder: |
-        1. fail2zig.toml: `[defaults] maxretry=3, findtime=60, bantime=300`
-        2. Run: `sudo systemctl start fail2zig`
-        3. Trigger 3 ssh auth failures from a test IP within 60 s
-        4. `nft list set inet fail2zig fail2zig_bans` shows empty set
-      render: shell
+        1. Started fail2zig with ...
+        2. Triggered ...
+        3. Checked using ... and saw ...
+        Happens every time / sometimes / only after ...
     validations:
       required: true
 
@@ -46,37 +47,61 @@ body:
     id: version
     attributes:
       label: fail2zig version
-      description: Output of `fail2zig --version`
-      placeholder: "fail2zig 0.1.0"
+      description: Paste `fail2zig --version`. If you built it yourself, include the commit. Mention if the service runs a different binary from the one in your shell.
+      placeholder: "fail2zig 0.4.0, downloaded release binary"
     validations:
       required: true
 
   - type: input
     id: os
     attributes:
-      label: OS + kernel
-      description: Output of `uname -a` plus distro
-      placeholder: "Debian 13, Linux 6.12.74 x86_64"
+      label: Operating system, release and kernel
+      description: Include the distribution and release from `/etc/os-release`, plus `uname -r` and `uname -m`. For a container, give its OS and the host OS if known.
+      placeholder: "Ubuntu 24.04 LTS; kernel 6.8.0-…; x86_64"
     validations:
       required: true
 
-  - type: dropdown
-    id: backend
+  - type: textarea
+    id: runtime
     attributes:
-      label: Firewall backend
-      options:
-        - nftables
-        - iptables
-        - ipset
-        - not sure
+      label: Where is fail2zig running?
+      description: Physical host, VM, LXC, Docker, another container or a separate network namespace? For containers, name the runtime and network mode if known. Say where the protected service runs and where you ran any firewall inspection commands.
+      placeholder: "In a VM, protecting SSH in the same VM. All commands were run inside that VM."
     validations:
       required: true
+
+  - type: textarea
+    id: backend
+    attributes:
+      label: Firewall setup
+      description: Give the configured `firewall` setting (auto, nftables, iptables or ipset; say if omitted) and the backend shown by `sudo fail2zig status`. If startup fails, paste that error instead. Mention other firewall managers such as ufw, firewalld or Docker. For iptables/ipset reports, include their version output if available; `iptables --version` also identifies nf_tables versus legacy.
+      placeholder: |
+        Configured backend: auto
+        Backend reported by status: nftables
+        Other firewall managers: none / ... / not sure
+        Tool versions, if relevant: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: ban-check
+    attributes:
+      label: If this concerns a ban, how did you check it?
+      description: Include the service/port, IPv4 or IPv6, whether the connection was new or already open, and whether it succeeded while the ban was active. Paste the inspection command and relevant output, and say where you ran it. A missing entry in one tool's output and a successful connection are different observations; both are useful.
+      placeholder: |
+        Service and port: SSH / TCP 22
+        Address family: IPv4
+        Connection: new connection from the banned address / existing session / not tested
+        Result while the ban was active: ...
+        Inspection command, output and where it ran: ...
+    validations:
+      required: false
 
   - type: textarea
     id: logs
     attributes:
       label: Relevant logs
-      description: Output of `journalctl -u fail2zig --since "1 hour ago"`, or whatever's relevant. Strip anything sensitive.
+      description: Include the error and nearby startup/event logs, plus `sudo fail2zig status` and `sudo fail2zig jails` if available. For a systemd service, `sudo journalctl -u fail2zig --since "1 hour ago" --no-pager` is a useful starting point; otherwise use stderr or your service manager's logs. Keep timestamps and redact sensitive details.
       render: shell
     validations:
       required: false
@@ -85,7 +110,7 @@ body:
     id: config
     attributes:
       label: Config (redacted)
-      description: Your fail2zig.toml (or jail.conf) — strip IPs, hostnames, anything sensitive.
+      description: Include the affected jail and relevant global settings from fail2zig.toml, especially firewall, firewall_namespace and state_file. For detection issues, include the log source and a redacted input line you expected to match. Keep setting names and structure intact; omit secrets.
       render: toml
     validations:
       required: false
