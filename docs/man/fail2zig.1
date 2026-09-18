@@ -141,7 +141,23 @@ source failure cause and captured journalctl exit/signal metadata. Raw child std
 is not displayed. Plain output retains its 11-column layout.
 .TP
 .BI list " [--jail name]"
-Active bans, optionally for one jail.
+Active bans, optionally for one jail. Development table output distinguishes
+confirmed and pending intent, permanent leases and unknown expiry; narrow terminals
+use stacked rows. Existing plain columns and JSON fields retain their meaning.
+.TP
+.BI "firewall show" " [--limit 1..256] [--cursor token]"
+Development command (not in released 0.4.1). Read the last sampled fail2zig-owned
+kernel protection in the daemon's network namespace. Native nftables inspection
+does not require the nft executable. The query performs no firewall refresh or mutation.
+Observation age and the latest attempt distinguish retained data from a failed
+readback. Unavailable, absent and owned-but-empty are separate states; a successful
+query exit does not prove installed protection or packet reachability.
+At most 256 entries are sampled from a complete readback. The default page size is
+64. JSON reports observed_total, sample_count and sample_truncated separately from
+observation_complete. next_cursor pages only the retained sample; use the same limit.
+A replaced observation, daemon restart or 60-second cursor lifetime requires
+restarting pagination without a cursor. No jail filter or forced refresh is provided.
+Timeouts are sampled values; unexpected entries do not imply desired or confirmed bans.
 .TP
 .BI ban " ip --jail name [--duration seconds] [--scope host|net cidr]"
 Manual ban. Exactly one

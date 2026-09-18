@@ -46,6 +46,7 @@ pub const Command = union(enum) {
     completions: Shell,
     config: void,
     history: HistoryArgs,
+    firewall: FirewallArgs,
     jail_admin: JailAdminArgs,
     history_reset: HistoryResetArgs,
 
@@ -86,6 +87,11 @@ pub const Command = union(enum) {
 
     pub const HistoryArgs = struct {
         jail: ?[]const u8 = null,
+        limit: ?u32 = null,
+        cursor: ?[]const u8 = null,
+    };
+
+    pub const FirewallArgs = struct {
         limit: ?u32 = null,
         cursor: ?[]const u8 = null,
     };
@@ -217,6 +223,9 @@ pub fn parse(argv: []const []const u8, diag: *ParseDiag) Error!Parsed {
     if (std.mem.eql(u8, cmd_str, "history")) {
         if (rest.len > 0 and std.mem.eql(u8, rest[0], "reset")) return parseHistoryReset(rest[1..], &globals, diag);
         return parseHistory(rest, &globals, diag);
+    }
+    if (std.mem.eql(u8, cmd_str, "firewall")) {
+        return parseFirewall(rest, &globals, diag);
     }
     if (std.mem.eql(u8, cmd_str, "jail")) {
         return parseJailAdmin(rest, &globals, diag);
@@ -484,6 +493,7 @@ fn parseList(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Erro
 }
 
 pub const max_history_limit: u32 = 256;
+pub const max_firewall_limit: u32 = 256;
 
 fn parseHistory(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Error!Parsed {
     var args = Command.HistoryArgs{};
@@ -535,6 +545,54 @@ fn parseHistory(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) E
         return error.TooManyArguments;
     }
     return Parsed{ .globals = globals.*, .command = .{ .history = args } };
+}
+
+fn parseFirewall(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Error!Parsed {
+    if (rest.len == 0 or !std.mem.eql(u8, rest[0], "show")) {
+        diag.set("command 'firewall' requires 'show' (usage: firewall show [--limit <n>] [--cursor <token>])", .{});
+        return error.MissingArgument;
+    }
+
+    var out = Command.FirewallArgs{};
+    var k: usize = 1;
+    while (k < rest.len) : (k += 1) {
+        const a = rest[k];
+        if (try takeTrailingGlobal(a, rest, &k, globals, diag)) continue;
+        if (std.mem.eql(u8, a, "--limit")) {
+            k += 1;
+            if (k >= rest.len) {
+                diag.set("flag --limit requires a value (1..{d})", .{max_firewall_limit});
+                return error.MissingValue;
+            }
+            const value = std.fmt.parseInt(u32, rest[k], 10) catch 0;
+            if (value < 1 or value > max_firewall_limit) {
+                diag.set("invalid --limit value '{s}' (expected 1..{d})", .{ rest[k], max_firewall_limit });
+                return error.InvalidValue;
+            }
+            out.limit = value;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--cursor")) {
+            k += 1;
+            if (k >= rest.len) {
+                diag.set("flag --cursor requires a value (from a previous firewall page)", .{});
+                return error.MissingValue;
+            }
+            if (rest[k].len == 0 or rest[k].len > 128) {
+                diag.set("invalid --cursor value (expected 1..128 characters)", .{});
+                return error.InvalidValue;
+            }
+            out.cursor = rest[k];
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--")) {
+            diag.set("unknown flag for 'firewall show': {s}", .{a});
+            return error.UnknownFlag;
+        }
+        diag.set("command 'firewall show' takes no positional arguments, got '{s}'", .{a});
+        return error.TooManyArguments;
+    }
+    return Parsed{ .globals = globals.*, .command = .{ .firewall = out } };
 }
 
 fn parseCompletions(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Error!Parsed {
@@ -621,6 +679,7 @@ pub const known_commands = [_][]const u8{
     "version",
     "config",
     "history",
+    "firewall",
     "jail",
     "completions",
     "help",
@@ -687,6 +746,7 @@ pub const help_top =
     \\    version             Show client and daemon version
     \\    config              Show the daemon's effective configuration
     \\    history             Page through confirmed ban history
+    \\    firewall show       Inspect sampled fail2zig-owned kernel protection
     \\    history reset <ip>  Reset an address's ban history in one jail or all jails
     \\    jail <action> <n>   enable, disable, pause or resume a jail
     \\    completions <sh>    Emit shell-completion script (bash|zsh|fish)
@@ -707,6 +767,7 @@ pub const help_top =
     \\    fail2zig jail pause sshd
     \\    fail2zig list --jail sshd --output json
     \\    fail2zig history --jail sshd --limit 50
+    \\    fail2zig firewall show --limit 50
     \\    fail2zig completions bash > /etc/bash_completion.d/fail2zig
     \\
 ;
@@ -783,6 +844,21 @@ pub const help_history =
     \\
 ;
 
+pub const help_firewall =
+    \\fail2zig firewall show — inspect fail2zig-owned kernel protection
+    \\
+    \\USAGE:
+    \\    fail2zig firewall show [--limit <n>] [--cursor <token>]
+    \\
+    \\FLAGS:
+    \\    --limit <n>         Sample entries per page, 1..256 (default: daemon default)
+    \\    --cursor <token>    Continue the same retained observation page
+    \\
+    \\This reads the daemon's latest retained observation. It does not refresh, repair,
+    \\or enumerate firewall state owned by other applications.
+    \\
+;
+
 pub const help_jail =
     \\fail2zig jail — administer one jail
     \\
@@ -818,6 +894,7 @@ pub fn helpFor(topic: ?[]const u8) []const u8 {
     if (std.mem.eql(u8, t, "completions")) return help_completions;
     if (std.mem.eql(u8, t, "config")) return help_config;
     if (std.mem.eql(u8, t, "history")) return help_history;
+    if (std.mem.eql(u8, t, "firewall")) return help_firewall;
     if (std.mem.eql(u8, t, "jail")) return help_jail;
     return help_top;
 }
@@ -1128,11 +1205,40 @@ test "args: history rejects bad limits, empty cursor and positionals" {
     try std.testing.expectError(error.UnknownFlag, parse(&.{ "history", "--since", "1h" }, &diag));
 }
 
-test "args: help covers config and history" {
+test "args: firewall show defaults and paging flags" {
+    const defaults = try parseOk(&.{ "firewall", "show" });
+    try std.testing.expect(defaults.command == .firewall);
+    try std.testing.expect(defaults.command.firewall.limit == null);
+    try std.testing.expect(defaults.command.firewall.cursor == null);
+
+    const page = try parseOk(&.{ "firewall", "show", "--limit", "256", "--cursor", "fw-token", "--output", "plain" });
+    try std.testing.expectEqual(@as(u32, 256), page.command.firewall.limit.?);
+    try std.testing.expectEqualStrings("fw-token", page.command.firewall.cursor.?);
+    try std.testing.expectEqual(OutputFormat.plain, page.globals.output);
+}
+
+test "args: firewall show rejects missing action and invalid paging" {
+    var diag: ParseDiag = .{};
+    try std.testing.expectError(error.MissingArgument, parse(&.{"firewall"}, &diag));
+    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "firewall show") != null);
+    try std.testing.expectError(error.MissingArgument, parse(&.{ "firewall", "list" }, &diag));
+    try std.testing.expectError(error.InvalidValue, parse(&.{ "firewall", "show", "--limit", "0" }, &diag));
+    try std.testing.expectError(error.InvalidValue, parse(&.{ "firewall", "show", "--limit", "257" }, &diag));
+    try std.testing.expectError(error.InvalidValue, parse(&.{ "firewall", "show", "--limit", "many" }, &diag));
+    try std.testing.expectError(error.MissingValue, parse(&.{ "firewall", "show", "--cursor" }, &diag));
+    try std.testing.expectError(error.InvalidValue, parse(&.{ "firewall", "show", "--cursor", "" }, &diag));
+    try std.testing.expectError(error.UnknownFlag, parse(&.{ "firewall", "show", "--jail", "sshd" }, &diag));
+    try std.testing.expectError(error.TooManyArguments, parse(&.{ "firewall", "show", "extra" }, &diag));
+}
+
+test "args: help covers config history and firewall" {
     try std.testing.expect(std.mem.indexOf(u8, helpFor("config"), "effective configuration") != null);
     try std.testing.expect(std.mem.indexOf(u8, helpFor("history"), "--cursor") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_top, "history") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_top, "config") != null);
+    try std.testing.expect(std.mem.indexOf(u8, helpFor("firewall"), "firewall show") != null);
+    try std.testing.expect(std.mem.indexOf(u8, helpFor("firewall"), "does not refresh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_top, "firewall show") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_top, "fail2zig-client") == null);
     try std.testing.expectEqualStrings("history", closestCommand("histroy").?);
 }

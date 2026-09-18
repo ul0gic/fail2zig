@@ -98,6 +98,20 @@ The default configuration admits at most 64 enabled jails, eight file incarnatio
 and descriptor budgets. SQLite uses a separate bounded heap and page limit; required history and
 recovery anchors remain pinned.
 
+The development CLI inspection path uses an optional observation cache owned by the
+coordinator and borrowed by the effect manager. Existing complete readbacks publish
+at most 256 pointer-free entries; failures retain the prior sample and update attempt
+metadata. A separate cache mutex bounds copying to one page/sample. IPC serializes
+the copied page after unlocking and performs no kernel inspection. Cursors bind a
+process and observation identity, page limit and a 60-second pagination lifetime.
+Complete readback, sample truncation, inventory membership and durable confirmation
+remain separate facts.
+
+Cache and transient-page costs use actual Zig type sizes in resource admission.
+Optional cache admission or allocation failure makes inspection unavailable while
+preserving the baseline enforcement resource contract. It never evicts durable state
+or changes readiness. This path adds no persistence schema or telemetry history.
+
 ## Migration boundary
 
 Supported fail2ban migration uses `migrate inspect`, `snapshot`, `plan`, `validate`, `cutover`,

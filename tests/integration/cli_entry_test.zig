@@ -72,6 +72,7 @@ test "cli entry: local help and version come from the same artifact and never na
     defer help.deinit(a);
     try testing.expectEqual(@as(u8, 0), help.code);
     try testing.expect(std.mem.indexOf(u8, help.stdout, "fail2zig [daemon] [OPTIONS]") != null);
+    try testing.expect(std.mem.indexOf(u8, help.stdout, "firewall") != null);
     try testing.expect(std.mem.indexOf(u8, help.stdout, "fail2zig-client") == null);
     const ver = try run(a, &.{ exe, "--version" });
     defer ver.deinit(a);
@@ -82,10 +83,17 @@ test "cli entry: local help and version come from the same artifact and never na
     try testing.expectEqual(@as(u8, 0), ophelp.code);
     try testing.expect(std.mem.indexOf(u8, ophelp.stdout, "fail2zig ban") != null);
     try testing.expect(std.mem.indexOf(u8, ophelp.stdout, "fail2zig-client") == null);
+    const firewall_help = try run(a, &.{ exe, "help", "firewall" });
+    defer firewall_help.deinit(a);
+    try testing.expectEqual(@as(u8, 0), firewall_help.code);
+    try testing.expect(std.mem.indexOf(u8, firewall_help.stdout, "fail2zig firewall show") != null);
+    try testing.expect(std.mem.indexOf(u8, firewall_help.stdout, "--limit") != null);
+    try testing.expect(std.mem.indexOf(u8, firewall_help.stdout, "--cursor") != null);
     const comp = try run(a, &.{ exe, "completions", "bash" });
     defer comp.deinit(a);
     try testing.expectEqual(@as(u8, 0), comp.code);
     try testing.expect(std.mem.indexOf(u8, comp.stdout, "fail2zig-client") == null);
+    try testing.expect(std.mem.indexOf(u8, comp.stdout, "firewall") != null);
 }
 
 test "cli entry: usage failures are class 2 and absent service is class 3" {
@@ -103,6 +111,24 @@ test "cli entry: usage failures are class 2 and absent service is class 3" {
     const noban = try run(a, &.{ exe, "ban" });
     defer noban.deinit(a);
     try testing.expectEqual(@as(u8, 2), noban.code);
+    const no_firewall_action = try run(a, &.{ exe, "firewall" });
+    defer no_firewall_action.deinit(a);
+    try testing.expectEqual(@as(u8, 2), no_firewall_action.code);
+    const bad_firewall_action = try run(a, &.{ exe, "firewall", "inspect" });
+    defer bad_firewall_action.deinit(a);
+    try testing.expectEqual(@as(u8, 2), bad_firewall_action.code);
+    const zero_firewall_limit = try run(a, &.{ exe, "firewall", "show", "--limit", "0" });
+    defer zero_firewall_limit.deinit(a);
+    try testing.expectEqual(@as(u8, 2), zero_firewall_limit.code);
+    const large_firewall_limit = try run(a, &.{ exe, "firewall", "show", "--limit", "257" });
+    defer large_firewall_limit.deinit(a);
+    try testing.expectEqual(@as(u8, 2), large_firewall_limit.code);
+    const missing_firewall_cursor = try run(a, &.{ exe, "firewall", "show", "--cursor" });
+    defer missing_firewall_cursor.deinit(a);
+    try testing.expectEqual(@as(u8, 2), missing_firewall_cursor.code);
+    const firewall_jail_filter = try run(a, &.{ exe, "firewall", "show", "--jail", "sshd" });
+    defer firewall_jail_filter.deinit(a);
+    try testing.expectEqual(@as(u8, 2), firewall_jail_filter.code);
     const missing_cfg = try run(a, &.{ exe, "daemon", "--config", "/nonexistent/fail2zig.toml", "--validate-config" });
     defer missing_cfg.deinit(a);
     try testing.expectEqual(@as(u8, 2), missing_cfg.code);
@@ -112,6 +138,28 @@ test "cli entry: usage failures are class 2 and absent service is class 3" {
     const absent_json = try run(a, &.{ exe, "--socket", "/nonexistent/fail2zig.sock", "--output", "json", "version" });
     defer absent_json.deinit(a);
     try testing.expectEqual(@as(u8, 3), absent_json.code);
+}
+
+test "cli entry: direct operator commands route through the client before trailing global flags" {
+    const a = testing.allocator;
+    std.fs.cwd().access(exe, .{}) catch return error.SkipZigTest;
+    const missing_socket = "/nonexistent/fail2zig-direct-routing.sock";
+
+    const firewall = try run(a, &.{ exe, "firewall", "show", "--socket", missing_socket });
+    defer firewall.deinit(a);
+    try testing.expectEqual(@as(u8, 3), firewall.code);
+
+    const config = try run(a, &.{ exe, "config", "--socket", missing_socket });
+    defer config.deinit(a);
+    try testing.expectEqual(@as(u8, 3), config.code);
+
+    const history = try run(a, &.{ exe, "history", "--limit", "1", "--socket", missing_socket });
+    defer history.deinit(a);
+    try testing.expectEqual(@as(u8, 3), history.code);
+
+    const jail = try run(a, &.{ exe, "jail", "pause", "sshd", "--socket", missing_socket });
+    defer jail.deinit(a);
+    try testing.expectEqual(@as(u8, 3), jail.code);
 }
 
 test "cli entry: the same artifact starts the daemon and serves every retained operator spelling" {
@@ -168,6 +216,34 @@ test "cli entry: the same artifact starts the daemon and serves every retained o
     const list_doc = try std.json.parseFromSlice(std.json.Value, a, list.stdout, .{});
     defer list_doc.deinit();
     try testing.expectEqual(@as(usize, 0), list_doc.value.array.items.len);
+
+    const firewall_json = try run(a, &.{ exe, "--socket", h.socket_path, "--timeout", "2000", "--output", "json", "firewall", "show", "--limit", "1" });
+    defer firewall_json.deinit(a);
+    try testing.expectEqual(@as(u8, 0), firewall_json.code);
+    const firewall_doc = try std.json.parseFromSlice(std.json.Value, a, firewall_json.stdout, .{});
+    defer firewall_doc.deinit();
+    const firewall_root = firewall_doc.value.object;
+    try testing.expectEqual(@as(i64, 1), firewall_root.get("schema_version").?.integer);
+    try testing.expectEqualStrings("firewall", firewall_root.get("kind").?.string);
+    try testing.expect(!firewall_root.get("available").?.bool);
+    try testing.expectEqualStrings("no_manager", firewall_root.get("unavailable_reason").?.string);
+    try testing.expect(firewall_root.get("installation").? == .null);
+    try testing.expect(firewall_root.get("observation").? == .null);
+    try testing.expectEqualStrings("none", firewall_root.get("last_attempt").?.object.get("outcome").?.string);
+    try testing.expectEqual(@as(usize, 0), firewall_root.get("items").?.array.items.len);
+    try testing.expect(firewall_root.get("next_cursor").? == .null);
+
+    const firewall_plain = try run(a, &.{ exe, "--socket", h.socket_path, "--timeout", "2000", "--output", "plain", "firewall", "show" });
+    defer firewall_plain.deinit(a);
+    try testing.expectEqual(@as(u8, 0), firewall_plain.code);
+    try testing.expect(std.mem.indexOf(u8, firewall_plain.stdout, "available\tfalse") != null);
+    try testing.expect(std.mem.indexOf(u8, firewall_plain.stdout, "unavailable_reason\tno_manager") != null);
+
+    const firewall_table = try run(a, &.{ exe, "--socket", h.socket_path, "--timeout", "2000", "--no-color", "firewall", "show" });
+    defer firewall_table.deinit(a);
+    try testing.expectEqual(@as(u8, 0), firewall_table.code);
+    try testing.expect(std.mem.indexOf(u8, firewall_table.stdout, "unavailable") != null);
+    try testing.expect(std.mem.indexOf(u8, firewall_table.stdout, "no manager") != null or std.mem.indexOf(u8, firewall_table.stdout, "no_manager") != null);
 
     const version = try run(a, &.{ exe, "--socket", h.socket_path, "--timeout", "2000", "--output", "json", "version" });
     defer version.deinit(a);

@@ -471,6 +471,7 @@ bracket a live reload (`ExecReload` sends `SIGHUP`); `STOPPING=1` precedes exit;
 | `unban <ip> --jail <name> [--scope host\|net <cidr>]` | Release a ban |
 | `reload` | Propose the configuration file as a new generation: `noop`, `applied`, `rejected` or `restart_required` |
 | `history [--jail <name>] [--limit <n>] [--cursor <token>]` | Page through confirmed ban history |
+| `firewall show [--limit <n>] [--cursor <token>]` | Inspect the last sampled fail2zig-owned kernel protection (development version) |
 | `history reset <ip> (--jail <name> \| --all)` | Reset an address's durable history |
 | `jail enable\|disable\|pause\|resume <name>` | Administer one jail |
 | `config` | Effective configuration and generation (redacted for non-administrators) |
@@ -484,6 +485,39 @@ through the 0660 socket; mutations require uid 0 or the daemon uid.
 
 Exit classes (every command): `0` success · `1` rejected or absent · `2` usage ·
 `3` daemon unavailable · `4` partial (kernel confirmation incomplete) · `5` uncertain.
+
+The development version adds `firewall show` (not available in released 0.4.1):
+
+```bash
+sudo fail2zig firewall show
+sudo fail2zig --output json firewall show --limit 64
+```
+
+This read-only command reports the last complete readback returned to the daemon's
+effect manager, in the daemon's network namespace. Native nftables inspection does
+not require the `nft` executable. Queries read a bounded cache; they do not refresh
+the firewall or change rules. `list` describes ban intent and confirmation, while
+`firewall show` describes a sampled kernel observation. Neither establishes packet
+reachability through the complete host/network ruleset.
+
+Check observation age and the latest attempt together: a failed readback retains the
+previous observation. Unavailable data, an absent installation, and an owned
+installation containing zero entries are distinct results. Successful command exit
+means the query was answered, including when observation data is unavailable.
+Unexpected owned entries are reported without adopting or repairing them.
+
+The development tables also expose jail pause state and ban confirmation, preserve
+unknown values, and use stacked rows on narrow terminals. Existing plain and JSON
+formats remain suitable for scripts. Scope details preserve protocol sets and port
+ranges, including UDP and network subjects.
+
+At most 256 entries are retained from a complete readback. JSON distinguishes
+`observation_complete` from `sample_truncated`, and reports both `observed_total`
+and `sample_count`. Pages default to 64 entries (maximum 256); `next_cursor` pages
+only that sample. Reuse the same limit with a cursor. Observation replacement,
+daemon restart or the 60-second pagination lifetime invalidates it; start again
+without a cursor. No jail filter is offered because kernel effects may have several
+owners. Kernel timeouts are values at observation time, not live countdowns.
 
 Version 0.4.1 adds diagnostic detail to `status` and `jails` (these additions
 are not in v0.4.0). If protection is degraded, check the storage, source and firewall

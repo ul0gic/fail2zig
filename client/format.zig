@@ -40,6 +40,15 @@ pub fn shouldColor(allow_color: bool) bool {
     return std.posix.isatty(fd);
 }
 
+fn terminalColumns() usize {
+    const fd = std.io.getStdOut().handle;
+    if (!std.posix.isatty(fd)) return 80;
+    var winsize: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
+    const result = std.posix.system.ioctl(fd, std.posix.T.IOCGWINSZ, @intFromPtr(&winsize));
+    if (std.posix.errno(result) != .SUCCESS or winsize.col == 0) return 80;
+    return winsize.col;
+}
+
 pub const StatusPayload = struct {
     version: ?[]const u8 = null,
     uptime_seconds: ?u64 = null,
@@ -81,11 +90,15 @@ pub const BanEntry = struct {
     last_attempt: ?i64 = null,
     ban_count: ?u32 = null,
     ban_expiry: ?i64 = null,
+    permanent: ?bool = null,
+    enforced: ?bool = null,
+    confirmed: ?bool = null,
 };
 
 pub const JailEntry = struct {
     name: ?[]const u8 = null,
     enabled: ?bool = null,
+    paused: ?bool = null,
     active_bans: ?u32 = null,
     maxretry: ?u32 = null,
     findtime: ?u32 = null,
@@ -133,6 +146,17 @@ pub fn formatStatus(
     fmt: OutputFormat,
     color: Color,
 ) !void {
+    try formatStatusForWidth(allocator, writer, payload_json, fmt, color, terminalColumns());
+}
+
+fn formatStatusForWidth(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    payload_json: []const u8,
+    fmt: OutputFormat,
+    color: Color,
+    columns: usize,
+) !void {
     switch (fmt) {
         .json => {
             try writer.writeAll(payload_json);
@@ -155,26 +179,26 @@ pub fn formatStatus(
             if (fmt == .plain) {
                 try writeStatusPlain(writer, parsed.value);
             } else {
-                try writeStatusTable(writer, parsed.value, color);
+                try writeStatusTable(writer, parsed.value, color, columns);
             }
         },
     }
 }
 
 fn writeStatusPlain(writer: anytype, s: StatusPayload) !void {
-    if (s.version) |v| try writer.print("version\t{s}\n", .{v});
+    var diagnostic_buffer: [diagnostic_max_bytes]u8 = undefined;
+    if (s.version) |v| try writer.print("version\t{s}\n", .{renderDiagnostic(&diagnostic_buffer, v)});
     if (s.uptime_seconds) |u| try writer.print("uptime_seconds\t{d}\n", .{u});
     if (s.memory_bytes_used) |m| try writer.print("memory_bytes_used\t{d}\n", .{m});
     if (s.memory_bytes_limit) |m| try writer.print("memory_bytes_limit\t{d}\n", .{m});
     if (s.active_bans) |a| try writer.print("active_bans\t{d}\n", .{a});
     if (s.total_bans) |a| try writer.print("total_bans\t{d}\n", .{a});
     if (s.parse_rate) |p| try writer.print("parse_rate\t{d:.2}\n", .{p});
-    if (s.protection) |p| try writer.print("protection\t{s}\n", .{p});
-    var diagnostic_buffer: [diagnostic_max_bytes]u8 = undefined;
+    if (s.protection) |p| try writer.print("protection\t{s}\n", .{renderDiagnostic(&diagnostic_buffer, p)});
     if (s.protection_cause) |c| try writer.print("protection_cause\t{s}\n", .{renderDiagnostic(&diagnostic_buffer, c)});
-    if (s.backend) |b| try writer.print("backend\t{s}\n", .{b});
+    if (s.backend) |b| try writer.print("backend\t{s}\n", .{renderDiagnostic(&diagnostic_buffer, b)});
     if (s.jails_active) |j| try writer.print("jails_active\t{d}\n", .{j});
-    if (s.generation) |g| try writer.print("generation\t{s}\n", .{g});
+    if (s.generation) |g| try writer.print("generation\t{s}\n", .{renderDiagnostic(&diagnostic_buffer, g)});
     if (s.storage) |storage| try writer.print("storage\t{s}\n", .{renderDiagnostic(&diagnostic_buffer, storage)});
     if (s.cause) |cause| try writer.print("cause\t{s}\n", .{renderDiagnostic(&diagnostic_buffer, cause)});
     if (s.sqlite_code) |code| try writer.print("sqlite_code\t{d}\n", .{code});
@@ -196,18 +220,18 @@ fn writeStatusPlain(writer: anytype, s: StatusPayload) !void {
     if (s.next_committed_expiry_us) |deadline| try writer.print("next_committed_expiry_us\t{d}\n", .{deadline});
 }
 
-fn writeStatusTable(writer: anytype, s: StatusPayload, color: Color) !void {
+fn writeStatusTable(writer: anytype, s: StatusPayload, color: Color, columns: usize) !void {
     const width = statusWidth(s);
+    if (width > columns) return writeStatusNarrow(writer, s, color, columns);
     try drawTopLine(writer, width);
     try writer.writeAll("| ");
     try color.on(writer, Color.bold);
     try writer.print("fail2zig", .{});
-    if (s.version) |v| try writer.print(" {s}", .{v});
+    var heading_buffer: [diagnostic_max_bytes]u8 = undefined;
+    if (s.version) |v| try writer.print(" {s}", .{renderDiagnostic(&heading_buffer, v)});
     try color.off(writer);
-    try color.on(writer, Color.green);
-    try writer.writeAll(" — running");
-    try color.off(writer);
-    try padTo(writer, 11 + versionLen(s.version) + 10, width - 2);
+    try writer.writeAll(" — status");
+    try padTo(writer, statusHeadingLen(s.version), width - 2);
     try writer.writeAll(" |\n");
     try drawMidLine(writer, width);
 
@@ -218,11 +242,12 @@ fn writeStatusTable(writer: anytype, s: StatusPayload, color: Color) !void {
     try rowLabel(writer, "Total bans:", formatOptU64(s.total_bans), width);
     var protection_buffer: [diagnostic_max_bytes + 16]u8 = undefined;
     try rowLabel(writer, "Protection:", formatProtection(&protection_buffer, s), width);
-    try rowLabel(writer, "Backend:", s.backend orelse "-", width);
+    var backend_buffer: [diagnostic_max_bytes]u8 = undefined;
+    try rowLabel(writer, "Backend:", if (s.backend) |backend| renderDiagnostic(&backend_buffer, backend) else "-", width);
     try rowLabel(writer, "Jails:", formatOptU32(s.jails_active), width);
-    if (s.generation) |g| try rowLabel(writer, "Generation:", g, width);
-
     var diagnostic_buffer: [diagnostic_max_bytes]u8 = undefined;
+    if (s.generation) |g| try rowLabel(writer, "Generation:", renderDiagnostic(&diagnostic_buffer, g), width);
+
     if (s.storage) |storage| try rowLabel(writer, "Storage:", renderDiagnostic(&diagnostic_buffer, storage), width);
     if (statusCause(s)) |cause| try rowLabel(writer, "Cause:", renderDiagnostic(&diagnostic_buffer, cause), width);
     if (s.sqlite_code) |code| {
@@ -250,8 +275,62 @@ fn writeStatusTable(writer: anytype, s: StatusPayload, color: Color) !void {
     try drawBotLine(writer, width);
 }
 
+fn writeStatusNarrow(writer: anytype, s: StatusPayload, color: Color, columns: usize) !void {
+    var version_buffer: [diagnostic_max_bytes]u8 = undefined;
+    try color.on(writer, Color.bold);
+    try writer.writeAll("fail2zig");
+    if (s.version) |version| {
+        try writer.writeByte(' ');
+        try writeCell(writer, renderDiagnostic(&version_buffer, version), @max(@as(usize, 4), columns -| "fail2zig  status".len));
+    }
+    try writer.writeAll(" status\n");
+    try color.off(writer);
+
+    var protection_buffer: [diagnostic_max_bytes + 16]u8 = undefined;
+    var diagnostic_buffer: [diagnostic_max_bytes]u8 = undefined;
+    var backend_buffer: [diagnostic_max_bytes]u8 = undefined;
+    try writeStatusNarrowRow(writer, "Protection: ", formatProtection(&protection_buffer, s), columns);
+    try writeStatusNarrowRow(writer, "Backend: ", if (s.backend) |backend| renderDiagnostic(&backend_buffer, backend) else "-", columns);
+    try writeStatusNarrowRow(writer, "Active bans: ", formatOptU32(s.active_bans), columns);
+    try writeStatusNarrowRow(writer, "Total bans: ", formatOptU64(s.total_bans), columns);
+    try writeStatusNarrowRow(writer, "Jails: ", formatOptU32(s.jails_active), columns);
+    if (s.generation) |generation| try writeStatusNarrowRow(writer, "Generation: ", renderDiagnostic(&diagnostic_buffer, generation), columns);
+    try writeStatusNarrowRow(writer, "Uptime: ", formatUptime(s.uptime_seconds), columns);
+    try writeStatusNarrowRow(writer, "Memory: ", formatMemory(s.memory_bytes_used, s.memory_bytes_limit), columns);
+    try writeStatusNarrowRow(writer, "Parse rate: ", formatRate(s.parse_rate), columns);
+    if (s.storage) |storage| try writeStatusNarrowRow(writer, "Storage: ", renderDiagnostic(&diagnostic_buffer, storage), columns);
+    if (statusCause(s)) |cause| try writeStatusNarrowRow(writer, "Cause: ", renderDiagnostic(&diagnostic_buffer, cause), columns);
+    if (s.sqlite_code) |code| {
+        var code_buffer: [32]u8 = undefined;
+        try writeStatusNarrowRow(writer, "SQLite code: ", std.fmt.bufPrint(&code_buffer, "{d}", .{code}) catch "-", columns);
+    }
+    if (s.next_retry_ms) |deadline| {
+        var retry_buffer: [64]u8 = undefined;
+        try writeStatusNarrowRow(writer, "Retry at: ", std.fmt.bufPrint(&retry_buffer, "{d} ms monotonic", .{deadline}) catch "-", columns);
+    }
+    if (s.unhealthy_sources) |count| if (count > 0) {
+        var source_buffer: [96]u8 = undefined;
+        try writeStatusNarrowRow(writer, "Sources: ", std.fmt.bufPrint(&source_buffer, "{d} unhealthy", .{count}) catch "unhealthy", columns);
+    };
+    var summary_buffer: [160]u8 = undefined;
+    if (formatEffects(&summary_buffer, s)) |value| try writeStatusNarrowRow(writer, "Effects: ", value, columns);
+    if (s.effect_backend) |backend| try writeStatusNarrowRow(writer, "Effect: ", renderDiagnostic(&diagnostic_buffer, backend), columns);
+    if (s.effect_stage) |stage| try writeStatusNarrowRow(writer, "Stage: ", renderDiagnostic(&diagnostic_buffer, stage), columns);
+    if (s.effect_cause) |cause| try writeStatusNarrowRow(writer, "Effect cause: ", renderDiagnostic(&diagnostic_buffer, cause), columns);
+    if (s.effect_mutation) |mutation| try writeStatusNarrowRow(writer, "Attempt: ", renderDiagnostic(&diagnostic_buffer, mutation), columns);
+    if (formatWorker(&summary_buffer, s)) |value| try writeStatusNarrowRow(writer, "Worker: ", value, columns);
+    if (s.clock_uncertain == true) try writeStatusNarrowRow(writer, "Clock: ", "uncertain", columns);
+    if (formatExpiry(&summary_buffer, s)) |value| try writeStatusNarrowRow(writer, "Expiry: ", value, columns);
+}
+
+fn writeStatusNarrowRow(writer: anytype, label: []const u8, value: []const u8, columns: usize) !void {
+    try writer.writeAll(label);
+    try writeCell(writer, value, @max(@as(usize, 4), columns -| label.len));
+    try writer.writeAll("\n");
+}
+
 fn statusWidth(s: StatusPayload) usize {
-    var used: usize = 11 + versionLen(s.version) + 10;
+    var used: usize = statusHeadingLen(s.version);
     used = @max(used, rowUsed(formatUptime(s.uptime_seconds)));
     used = @max(used, rowUsed(formatMemory(s.memory_bytes_used, s.memory_bytes_limit)));
     used = @max(used, rowUsed(formatRate(s.parse_rate)));
@@ -259,10 +338,11 @@ fn statusWidth(s: StatusPayload) usize {
     used = @max(used, rowUsed(formatOptU64(s.total_bans)));
     var protection_buffer: [diagnostic_max_bytes + 16]u8 = undefined;
     used = @max(used, rowUsed(formatProtection(&protection_buffer, s)));
-    used = @max(used, rowUsed(s.backend orelse "-"));
+    var backend_buffer: [diagnostic_max_bytes]u8 = undefined;
+    used = @max(used, rowUsed(if (s.backend) |backend| renderDiagnostic(&backend_buffer, backend) else "-"));
     used = @max(used, rowUsed(formatOptU32(s.jails_active)));
-    if (s.generation) |g| used = @max(used, rowUsed(g));
     var diagnostic_buffer: [diagnostic_max_bytes]u8 = undefined;
+    if (s.generation) |g| used = @max(used, rowUsed(renderDiagnostic(&diagnostic_buffer, g)));
     if (s.storage) |storage| used = @max(used, rowUsed(renderDiagnostic(&diagnostic_buffer, storage)));
     if (statusCause(s)) |cause| used = @max(used, rowUsed(renderDiagnostic(&diagnostic_buffer, cause)));
     if (s.sqlite_code) |code| {
@@ -429,9 +509,10 @@ fn renderDiagnostic(buffer: []u8, input: []const u8) []const u8 {
     return buffer[0..output_index];
 }
 
-fn versionLen(v: ?[]const u8) usize {
-    if (v) |s| return s.len + 1;
-    return 0;
+fn statusHeadingLen(version: ?[]const u8) usize {
+    var version_buffer: [diagnostic_max_bytes]u8 = undefined;
+    const version_len = if (version) |value| 1 + renderDiagnostic(&version_buffer, value).len else 0;
+    return "fail2zig".len + version_len + " — status".len;
 }
 
 fn rowLabel(writer: anytype, label: []const u8, value: []const u8, width: usize) !void {
@@ -534,6 +615,17 @@ pub fn formatList(
     fmt: OutputFormat,
     color: Color,
 ) !void {
+    try formatListForWidth(allocator, writer, payload_json, fmt, color, terminalColumns());
+}
+
+fn formatListForWidth(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    payload_json: []const u8,
+    fmt: OutputFormat,
+    color: Color,
+    columns: usize,
+) !void {
     switch (fmt) {
         .json => {
             try writer.writeAll(payload_json);
@@ -557,7 +649,7 @@ pub fn formatList(
             if (fmt == .plain) {
                 try writeListPlain(writer, parsed.value, now);
             } else {
-                try writeListTable(writer, parsed.value, color, now);
+                try writeListTable(writer, parsed.value, color, now, columns);
             }
         },
     }
@@ -565,60 +657,121 @@ pub fn formatList(
 
 fn remainingFromExpiry(ban_expiry: ?i64, now: i64) ?i64 {
     const exp = ban_expiry orelse return null;
-    return exp - now;
+    return std.math.sub(i64, exp, now) catch if (exp < now) std.math.minInt(i64) else std.math.maxInt(i64);
 }
 
 fn writeListPlain(writer: anytype, entries: []const BanEntry, now: i64) !void {
     for (entries) |e| {
+        var ip_buffer: [diagnostic_max_bytes]u8 = undefined;
+        var jail_buffer: [diagnostic_max_bytes]u8 = undefined;
         try writer.print("{s}\t{s}\t{d}\t{d}\n", .{
-            e.ip orelse "-",
-            e.jail orelse "-",
+            if (e.ip) |ip| renderDiagnostic(&ip_buffer, ip) else "-",
+            if (e.jail) |jail| renderDiagnostic(&jail_buffer, jail) else "-",
             remainingFromExpiry(e.ban_expiry, now) orelse 0,
             e.ban_count orelse 0,
         });
     }
 }
 
-fn writeListTable(writer: anytype, entries: []const BanEntry, color: Color, now: i64) !void {
+fn writeListTable(writer: anytype, entries: []const BanEntry, color: Color, now: i64, columns: usize) !void {
     if (entries.len == 0) {
         try writer.writeAll("No active bans.\n");
         return;
     }
 
-    const ip_col = colWidth("IP ADDRESS", longestLen(BanEntry, entries, "ip"));
-    const jail_col = colWidth("JAIL", longestLen(BanEntry, entries, "jail"));
+    const ip_col = colWidth("IP ADDRESS", longestBanText(entries, "ip"));
+    const jail_col = colWidth("JAIL", longestBanText(entries, "jail"));
     var time_w: usize = 0;
     var count_w: usize = 0;
+    var confirmation_w: usize = 0;
     for (entries) |e| {
-        time_w = @max(time_w, formatRemaining(remainingFromExpiry(e.ban_expiry, now)).len);
+        time_w = @max(time_w, banExpiryText(e, now).len);
         count_w = @max(count_w, formatOptU32Local(e.ban_count).len);
+        confirmation_w = @max(confirmation_w, confirmationText(e).len);
     }
     const time_col = colWidth("TIME LEFT", time_w);
     const count_col = colWidth("BAN COUNT", count_w);
+    const confirmation_col = colWidth("CONFIRMATION", confirmation_w);
+    const full_width = ip_col + jail_col + time_col + confirmation_col + count_col;
+    if (full_width <= columns) return writeListColumns(writer, entries, color, now, ip_col, jail_col, time_col, confirmation_col, count_col, true);
+    if (columns >= 71) return writeListColumns(writer, entries, color, now, 25, 21, 12, 13, 0, false);
+    try writeListStacked(writer, entries, color, now, columns);
+}
 
+fn writeListColumns(writer: anytype, entries: []const BanEntry, color: Color, now: i64, ip_col: usize, jail_col: usize, time_col: usize, confirmation_col: usize, count_col: usize, include_count: bool) !void {
     try color.on(writer, Color.bold);
     try padRightPrint(writer, "IP ADDRESS", ip_col);
     try padRightPrint(writer, "JAIL", jail_col);
     try padRightPrint(writer, "TIME LEFT", time_col);
-    try padRightPrint(writer, "BAN COUNT", count_col);
+    try padRightPrint(writer, "CONFIRMATION", confirmation_col);
+    if (include_count) try padRightPrint(writer, "BAN COUNT", count_col);
     try color.off(writer);
     try writer.writeAll("\n");
 
-    const total_w = ip_col + jail_col + time_col + count_col;
+    const total_w = ip_col + jail_col + time_col + confirmation_col + if (include_count) count_col else 0;
     try repeatChar(writer, '-', total_w);
     try writer.writeAll("\n");
 
     for (entries) |e| {
+        var ip_buffer: [diagnostic_max_bytes]u8 = undefined;
+        var jail_buffer: [diagnostic_max_bytes]u8 = undefined;
         try color.on(writer, Color.cyan);
-        try writeCell(writer, e.ip orelse "-", ip_col);
+        try writeCell(writer, if (e.ip) |ip| renderDiagnostic(&ip_buffer, ip) else "-", ip_col);
         try color.off(writer);
-        try writeCell(writer, e.jail orelse "-", jail_col);
-        try writeCell(writer, formatRemaining(remainingFromExpiry(e.ban_expiry, now)), time_col);
-        try writeCell(writer, formatOptU32Local(e.ban_count), count_col);
+        try writeCell(writer, if (e.jail) |jail| renderDiagnostic(&jail_buffer, jail) else "-", jail_col);
+        try writeCell(writer, banExpiryText(e, now), time_col);
+        const confirmation = confirmationText(e);
+        if (std.mem.eql(u8, confirmation, "confirmed")) try color.on(writer, Color.green);
+        if (std.mem.eql(u8, confirmation, "pending")) try color.on(writer, Color.yellow);
+        try writeCell(writer, confirmation, confirmation_col);
+        try color.off(writer);
+        if (include_count) try writeCell(writer, formatOptU32Local(e.ban_count), count_col);
         try writer.writeAll("\n");
     }
 
     try writer.print("Total: {d} active bans\n", .{entries.len});
+}
+
+fn writeListStacked(writer: anytype, entries: []const BanEntry, color: Color, now: i64, columns: usize) !void {
+    const value_width = @max(@as(usize, 4), columns -| "CONFIRMATION: ".len);
+    for (entries, 0..) |e, index| {
+        var ip_buffer: [diagnostic_max_bytes]u8 = undefined;
+        var jail_buffer: [diagnostic_max_bytes]u8 = undefined;
+        if (index > 0) try writer.writeAll("\n");
+        try writer.writeAll("IP ADDRESS: ");
+        try color.on(writer, Color.cyan);
+        try writeCell(writer, if (e.ip) |ip| renderDiagnostic(&ip_buffer, ip) else "-", value_width);
+        try color.off(writer);
+        try writer.writeAll("\nJAIL:       ");
+        try writeCell(writer, if (e.jail) |jail| renderDiagnostic(&jail_buffer, jail) else "-", value_width);
+        try writer.writeAll("\nTIME LEFT:  ");
+        try writeCell(writer, banExpiryText(e, now), value_width);
+        try writer.writeAll("\nCONFIRMATION: ");
+        try writeCell(writer, confirmationText(e), value_width);
+        try writer.writeAll("\n");
+    }
+    try writer.print("Total: {d} active bans\n", .{entries.len});
+}
+
+fn banExpiryText(entry: BanEntry, now: i64) []const u8 {
+    if (entry.permanent == true) return "permanent";
+    if (entry.ban_expiry != null) return formatRemaining(remainingFromExpiry(entry.ban_expiry, now));
+    return "unknown";
+}
+
+fn confirmationText(entry: BanEntry) []const u8 {
+    const confirmed = entry.confirmed orelse entry.enforced orelse return "unknown";
+    if (entry.confirmed) |value| if (entry.enforced) |enforced| if (value != enforced) return "unknown";
+    return if (confirmed) "confirmed" else "pending";
+}
+
+fn longestBanText(entries: []const BanEntry, comptime field: []const u8) usize {
+    var widest: usize = 0;
+    for (entries) |entry| {
+        var buffer: [diagnostic_max_bytes]u8 = undefined;
+        widest = @max(widest, if (@field(entry, field)) |value| renderDiagnostic(&buffer, value).len else 1);
+    }
+    return widest;
 }
 
 fn padRightPrint(writer: anytype, s: []const u8, width: usize) !void {
@@ -648,6 +801,17 @@ pub fn formatJails(
     fmt: OutputFormat,
     color: Color,
 ) !void {
+    try formatJailsForWidth(allocator, writer, payload_json, fmt, color, terminalColumns());
+}
+
+fn formatJailsForWidth(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    payload_json: []const u8,
+    fmt: OutputFormat,
+    color: Color,
+    columns: usize,
+) !void {
     switch (fmt) {
         .json => {
             try writer.writeAll(payload_json);
@@ -670,7 +834,7 @@ pub fn formatJails(
             if (fmt == .plain) {
                 try writeJailsPlain(writer, parsed.value);
             } else {
-                try writeJailsTable(writer, parsed.value, color);
+                try writeJailsTable(writer, parsed.value, color, columns);
             }
         },
     }
@@ -679,6 +843,8 @@ pub fn formatJails(
 fn writeJailsPlain(writer: anytype, jails: []const JailEntry) !void {
     for (jails) |j| {
         var name_buffer: [diagnostic_max_bytes]u8 = undefined;
+        var action_buffer: [diagnostic_max_bytes]u8 = undefined;
+        var source_buffer: [diagnostic_max_bytes]u8 = undefined;
         try writer.print("{s}\t{s}\t{d}\t{d}\t{d}\t{d}\t{s}\t{s}\t{s}\t{s}\t{d}\n", .{
             if (j.name) |name| renderDiagnostic(&name_buffer, name) else "-",
             if (j.enabled orelse false) "enabled" else "disabled",
@@ -686,9 +852,9 @@ fn writeJailsPlain(writer: anytype, jails: []const JailEntry) !void {
             j.maxretry orelse 0,
             j.findtime orelse 0,
             j.bantime orelse 0,
-            j.action orelse "-",
+            if (j.action) |action| renderDiagnostic(&action_buffer, action) else "-",
             if (j.enforcing) |e| (if (e) "true" else "false") else "-",
-            j.log_source orelse "-",
+            if (j.log_source) |source| renderDiagnostic(&source_buffer, source) else "-",
             sourceHealthStr(j.source_healthy),
             j.lines_seen orelse 0,
         });
@@ -700,7 +866,9 @@ fn sourceHealthStr(opt: ?bool) []const u8 {
     return if (h) "healthy" else "unhealthy";
 }
 
-fn writeJailsTable(writer: anytype, jails: []const JailEntry, color: Color) !void {
+const compact_jail_health_width = 19;
+
+fn writeJailsTable(writer: anytype, jails: []const JailEntry, color: Color, columns: usize) !void {
     if (jails.len == 0) {
         try writer.writeAll("No jails configured.\n");
         return;
@@ -714,10 +882,16 @@ fn writeJailsTable(writer: anytype, jails: []const JailEntry, color: Color) !voi
     const max_col = colWidth("MAX RETRY", w.max);
     const find_col = colWidth("FIND TIME", w.find);
     const ban_col = colWidth("BAN TIME", w.ban);
-    const action_col = colWidth("ACTION", longestLen(JailEntry, jails, "action"));
+    const action_col = colWidth("ACTION", longestJailText(jails, "action"));
     const enforce_col = colWidth("ENFORCING", w.enforce);
-    const source_col = colWidth("SOURCE", longestLen(JailEntry, jails, "log_source"));
+    const source_col = colWidth("SOURCE", longestJailText(jails, "log_source"));
     const health_col = @max("HEALTH".len, @min(w.health, diagnostic_max_bytes)) + 1;
+    const full_width = name_col + state_col + active_col + max_col + find_col + ban_col + action_col + enforce_col + source_col + health_col;
+    if (full_width > columns) {
+        // Preserve ordinary source causes instead of clipping them in the compact column.
+        if (columns >= 74 and w.health < compact_jail_health_width) return writeJailsCompact(writer, jails, color);
+        return writeJailsStacked(writer, jails, color, columns);
+    }
 
     try color.on(writer, Color.bold);
     try padRightPrint(writer, "JAIL", name_col);
@@ -738,6 +912,8 @@ fn writeJailsTable(writer: anytype, jails: []const JailEntry, color: Color) !voi
 
     for (jails) |j| {
         var name_buffer: [diagnostic_max_bytes]u8 = undefined;
+        var action_buffer: [diagnostic_max_bytes]u8 = undefined;
+        var source_buffer: [diagnostic_max_bytes]u8 = undefined;
         try writeCell(writer, if (j.name) |name| renderDiagnostic(&name_buffer, name) else "-", name_col);
         try color.on(writer, if (j.enabled orelse false) Color.green else Color.yellow);
         try writeCell(writer, stateStr(j), state_col);
@@ -746,11 +922,11 @@ fn writeJailsTable(writer: anytype, jails: []const JailEntry, color: Color) !voi
         try writeCell(writer, formatOptU32Local(j.maxretry), max_col);
         try writeCell(writer, formatDurationSecs(j.findtime), find_col);
         try writeCell(writer, formatDurationSecs(j.bantime), ban_col);
-        try writeCell(writer, j.action orelse "-", action_col);
+        try writeCell(writer, if (j.action) |action| renderDiagnostic(&action_buffer, action) else "-", action_col);
         if (j.enforcing) |e| try color.on(writer, if (e) Color.green else Color.yellow);
         try writeCell(writer, enforcingStr(j), enforce_col);
         try color.off(writer);
-        try writeCell(writer, j.log_source orelse "-", source_col);
+        try writeCell(writer, if (j.log_source) |source| renderDiagnostic(&source_buffer, source) else "-", source_col);
         if (j.source_healthy) |h| try color.on(writer, if (h) Color.green else Color.yellow);
         var health_buffer: [diagnostic_max_bytes]u8 = undefined;
         try writeCell(writer, formatJailHealth(&health_buffer, j), health_col);
@@ -758,6 +934,64 @@ fn writeJailsTable(writer: anytype, jails: []const JailEntry, color: Color) !voi
         try writer.writeAll("\n");
     }
 
+    try writer.print("Total: {d} jails\n", .{jails.len});
+}
+
+fn writeJailsCompact(writer: anytype, jails: []const JailEntry, color: Color) !void {
+    const name_col = 21;
+    const state_col = 9;
+    const active_col = 8;
+    const action_col = 17;
+    const health_col = compact_jail_health_width;
+    try color.on(writer, Color.bold);
+    try padRightPrint(writer, "JAIL", name_col);
+    try padRightPrint(writer, "STATE", state_col);
+    try padRightPrint(writer, "ACTIVE", active_col);
+    try padRightPrint(writer, "ACTION", action_col);
+    try padRightPrint(writer, "HEALTH", health_col);
+    try color.off(writer);
+    try writer.writeAll("\n");
+    try repeatChar(writer, '-', name_col + state_col + active_col + action_col + health_col);
+    try writer.writeAll("\n");
+    for (jails) |j| {
+        var name_buffer: [diagnostic_max_bytes]u8 = undefined;
+        var action_buffer: [diagnostic_max_bytes]u8 = undefined;
+        var health_buffer: [diagnostic_max_bytes]u8 = undefined;
+        try writeCell(writer, if (j.name) |name| renderDiagnostic(&name_buffer, name) else "-", name_col);
+        try color.on(writer, if (j.paused == true or !(j.enabled orelse false)) Color.yellow else Color.green);
+        try writeCell(writer, stateStr(j), state_col);
+        try color.off(writer);
+        try writeCell(writer, formatOptU32Local(j.active_bans), active_col);
+        try writeCell(writer, if (j.action) |action| renderDiagnostic(&action_buffer, action) else "-", action_col);
+        if (j.source_healthy) |healthy| try color.on(writer, if (healthy) Color.green else Color.yellow);
+        try writeCell(writer, formatJailHealth(&health_buffer, j), health_col);
+        try color.off(writer);
+        try writer.writeAll("\n");
+    }
+    try writer.print("Total: {d} jails\n", .{jails.len});
+}
+
+fn writeJailsStacked(writer: anytype, jails: []const JailEntry, color: Color, columns: usize) !void {
+    const value_width = @max(@as(usize, 4), columns -| "HEALTH: ".len);
+    for (jails, 0..) |j, index| {
+        var name_buffer: [diagnostic_max_bytes]u8 = undefined;
+        var action_buffer: [diagnostic_max_bytes]u8 = undefined;
+        var health_buffer: [diagnostic_max_bytes]u8 = undefined;
+        if (index > 0) try writer.writeAll("\n");
+        try writer.writeAll("JAIL:   ");
+        try writeCell(writer, if (j.name) |name| renderDiagnostic(&name_buffer, name) else "-", value_width);
+        try writer.writeAll("\nSTATE:  ");
+        try color.on(writer, if (j.paused == true or !(j.enabled orelse false)) Color.yellow else Color.green);
+        try writeCell(writer, stateStr(j), value_width);
+        try color.off(writer);
+        try writer.writeAll("\nACTIVE: ");
+        try writeCell(writer, formatOptU32Local(j.active_bans), value_width);
+        try writer.writeAll("\nACTION: ");
+        try writeCell(writer, if (j.action) |action| renderDiagnostic(&action_buffer, action) else "-", value_width);
+        try writer.writeAll("\nHEALTH: ");
+        try writeCell(writer, formatJailHealth(&health_buffer, j), value_width);
+        try writer.writeAll("\n");
+    }
     try writer.print("Total: {d} jails\n", .{jails.len});
 }
 
@@ -783,7 +1017,9 @@ const JailsWidths = struct {
 };
 
 fn stateStr(j: JailEntry) []const u8 {
-    return if (j.enabled orelse false) "enabled" else "disabled";
+    if (j.paused == true) return "paused";
+    const enabled = j.enabled orelse return "unknown";
+    return if (enabled) "enabled" else "disabled";
 }
 
 fn enforcingStr(j: JailEntry) []const u8 {
@@ -814,6 +1050,15 @@ fn longestJailNameLen(jails: []const JailEntry) usize {
     for (jails) |jail| {
         var buffer: [diagnostic_max_bytes]u8 = undefined;
         widest = @max(widest, if (jail.name) |name| renderDiagnostic(&buffer, name).len else 1);
+    }
+    return widest;
+}
+
+fn longestJailText(jails: []const JailEntry, comptime field: []const u8) usize {
+    var widest: usize = 0;
+    for (jails) |jail| {
+        var buffer: [diagnostic_max_bytes]u8 = undefined;
+        widest = @max(widest, if (@field(jail, field)) |value| renderDiagnostic(&buffer, value).len else 1);
     }
     return widest;
 }
@@ -1063,10 +1308,19 @@ pub const ScopeView = struct {
     family: ?[]const u8 = null,
     address: ?[]const u8 = null,
     prefix: ?u8 = null,
+    subject_kind: ?[]const u8 = null,
+    protocols: ?[]const []const u8 = null,
+    port_ranges: ?[]const PortRangeView = null,
+    legacy_exact: ?bool = null,
     protocol: ?[]const u8 = null,
     port: ?u16 = null,
     direction: ?[]const u8 = null,
     target: ?[]const u8 = null,
+};
+
+pub const PortRangeView = struct {
+    first: ?u16 = null,
+    last: ?u16 = null,
 };
 
 pub const ConfigJail = struct {
@@ -1133,6 +1387,54 @@ pub const HistoryPayload = struct {
     next_cursor: ?[]const u8 = null,
 };
 
+pub const FirewallInstallation = struct {
+    id_hex: ?[]const u8 = null,
+    backend: ?[]const u8 = null,
+    namespace: ?[]const u8 = null,
+};
+
+pub const FirewallObservation = struct {
+    id: ?[]const u8 = null,
+    state: ?[]const u8 = null,
+    observed_wall_us: ?i64 = null,
+    age_ms: ?u64 = null,
+    observation_complete: ?bool = null,
+    observed_total: ?u64 = null,
+    sample_count: ?u64 = null,
+    sample_truncated: ?bool = null,
+    inventory: ?[]const u8 = null,
+    origin: ?[]const u8 = null,
+    comparison: ?[]const u8 = null,
+    comparison_reason: ?[]const u8 = null,
+};
+
+pub const FirewallAttempt = struct {
+    outcome: ?[]const u8 = null,
+    cause: ?[]const u8 = null,
+    stage: ?[]const u8 = null,
+    age_ms: ?u64 = null,
+};
+
+pub const FirewallItem = struct {
+    scope: ?ScopeView = null,
+    effect_id_hex: ?[]const u8 = null,
+    remaining_ms_at_observation: ?u64 = null,
+    deadline_us: ?i64 = null,
+};
+
+pub const FirewallPayload = struct {
+    schema_version: ?u32 = null,
+    generation: ?[]const u8 = null,
+    kind: ?[]const u8 = null,
+    available: ?bool = null,
+    unavailable_reason: ?[]const u8 = null,
+    installation: ?FirewallInstallation = null,
+    observation: ?FirewallObservation = null,
+    last_attempt: ?FirewallAttempt = null,
+    items: ?[]const FirewallItem = null,
+    next_cursor: ?[]const u8 = null,
+};
+
 pub fn formatConfig(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color) !void {
     return formatQuery(ConfigPayload, "config", writeConfigPlain, writeConfigTable, allocator, writer, payload_json, fmt, color);
 }
@@ -1143,6 +1445,10 @@ pub fn formatScopes(allocator: std.mem.Allocator, writer: anytype, payload_json:
 
 pub fn formatHistory(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color) !void {
     return formatQuery(HistoryPayload, "history", writeHistoryPlain, writeHistoryTable, allocator, writer, payload_json, fmt, color);
+}
+
+pub fn formatFirewall(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color) !void {
+    return formatFirewallForWidth(allocator, writer, payload_json, fmt, color, terminalColumns());
 }
 
 fn formatQuery(
@@ -1313,11 +1619,52 @@ fn scopeAddress(buffer: *[64]u8, scope: ?ScopeView) []const u8 {
     return std.fmt.bufPrint(buffer, "{s}/{d}", .{ address, prefix }) catch address;
 }
 
-fn scopeMatch(buffer: *[64]u8, scope: ?ScopeView) []const u8 {
+const scope_match_max_bytes: usize = 384;
+
+fn scopeMatch(buffer: []u8, scope: ?ScopeView) []const u8 {
     const s = scope orelse return "-";
+    if (s.protocols) |protocols| {
+        if (protocols.len == 0) return "unknown";
+        var stream = std.io.fixedBufferStream(buffer);
+        const writer = stream.writer();
+        const all = protocols.len == 1 and std.mem.eql(u8, protocols[0], "all");
+        if (all) {
+            writer.writeAll("any") catch return "unknown";
+        } else {
+            for (protocols, 0..) |protocol, index| {
+                if (index != 0) writer.writeByte(',') catch return "unknown";
+                var diagnostic: [diagnostic_max_bytes]u8 = undefined;
+                writer.writeAll(renderDiagnostic(&diagnostic, protocol)) catch return "unknown";
+            }
+        }
+        if (s.port_ranges) |ranges| if (ranges.len != 0) {
+            writer.writeByte('/') catch return "unknown";
+            for (ranges, 0..) |range, index| {
+                if (index != 0) writer.writeByte(',') catch return "unknown";
+                const first = range.first orelse {
+                    writer.writeByte('?') catch return "unknown";
+                    continue;
+                };
+                const last = range.last orelse {
+                    writer.writeByte('?') catch return "unknown";
+                    continue;
+                };
+                if (first == last) {
+                    writer.print("{d}", .{first}) catch return "unknown";
+                } else {
+                    writer.print("{d}-{d}", .{ first, last }) catch return "unknown";
+                }
+            }
+        };
+        return stream.getWritten();
+    }
     if (s.protocol == null and s.port == null) return "any";
-    if (s.port) |port| return std.fmt.bufPrint(buffer, "{s}/{d}", .{ s.protocol orelse "any", port }) catch "-";
-    return s.protocol.?;
+    if (s.port) |port| {
+        var diagnostic: [diagnostic_max_bytes]u8 = undefined;
+        const protocol = if (s.protocol) |value| renderDiagnostic(&diagnostic, value) else "any";
+        return std.fmt.bufPrint(buffer, "{s}/{d}", .{ protocol, port }) catch "unknown";
+    }
+    return renderDiagnostic(buffer, s.protocol.?);
 }
 
 fn writeScopesPlain(writer: anytype, p: ScopesPayload) !void {
@@ -1325,7 +1672,7 @@ fn writeScopesPlain(writer: anytype, p: ScopesPayload) !void {
     for (p.items orelse &.{}, 0..) |it, i| {
         var key: [64]u8 = undefined;
         var addr: [64]u8 = undefined;
-        var match: [64]u8 = undefined;
+        var match: [scope_match_max_bytes]u8 = undefined;
         try plainOpt(writer, try itemKey(&key, i, "jail"), it.jail);
         try plainOpt(writer, try itemKey(&key, i, "scope"), scopeAddress(&addr, it.scope));
         try plainOpt(writer, try itemKey(&key, i, "match"), scopeMatch(&match, it.scope));
@@ -1348,30 +1695,34 @@ fn writeScopesTable(writer: anytype, p: ScopesPayload, color: Color) !void {
     } else {
         const now = std.time.timestamp();
         var widest_addr: usize = 0;
+        var widest_match: usize = 0;
         for (items) |it| {
             var addr: [64]u8 = undefined;
+            var match: [scope_match_max_bytes]u8 = undefined;
             widest_addr = @max(widest_addr, scopeAddress(&addr, it.scope).len);
+            widest_match = @max(widest_match, scopeMatch(&match, it.scope).len);
         }
         const jail_col = colWidth("JAIL", longestLen(ScopeEntry, items, "jail"));
         const addr_col = colWidth("SCOPE", widest_addr);
+        const match_col = colWidth("MATCH", widest_match);
         try color.on(writer, Color.bold);
         try padRightPrint(writer, "JAIL", jail_col);
         try padRightPrint(writer, "SCOPE", addr_col);
-        try padRightPrint(writer, "MATCH", 10);
+        try padRightPrint(writer, "MATCH", match_col);
         try padRightPrint(writer, "LEASE", 11);
         try padRightPrint(writer, "REMAINING", 12);
         try padRightPrint(writer, "CONFIRMED", 11);
         try padRightPrint(writer, "DECISION", 13);
         try color.off(writer);
         try writer.writeAll("\n");
-        try repeatChar(writer, '-', jail_col + addr_col + 57);
+        try repeatChar(writer, '-', jail_col + addr_col + match_col + 47);
         try writer.writeAll("\n");
         for (items) |it| {
             var addr: [64]u8 = undefined;
-            var match: [64]u8 = undefined;
+            var match: [scope_match_max_bytes]u8 = undefined;
             try writeCell(writer, it.jail orelse "-", jail_col);
             try writeCell(writer, scopeAddress(&addr, it.scope), addr_col);
-            try padRightPrint(writer, scopeMatch(&match, it.scope), 10);
+            try writeCell(writer, scopeMatch(&match, it.scope), match_col);
             try padRightPrint(writer, it.lease orelse "-", 11);
             const remaining: []const u8 = if (std.mem.eql(u8, it.lease orelse "", "permanent")) "never" else formatRemaining(remainingFromDeadlineUs(it.deadline_us, now));
             try padRightPrint(writer, remaining, 12);
@@ -1423,32 +1774,39 @@ fn writeHistoryTable(writer: anytype, p: HistoryPayload, color: Color) !void {
         try writer.writeAll("No confirmed history.\n");
     } else {
         var widest_addr: usize = 0;
+        var widest_match: usize = 0;
         var widest_seq: usize = 0;
         for (items) |it| {
             var addr: [64]u8 = undefined;
+            var match: [scope_match_max_bytes]u8 = undefined;
             widest_addr = @max(widest_addr, scopeAddress(&addr, it.scope).len);
+            widest_match = @max(widest_match, scopeMatch(&match, it.scope).len);
             widest_seq = @max(widest_seq, formatOptU64Local(it.sequence).len);
         }
         const seq_col = colWidth("SEQ", widest_seq);
         const jail_col = colWidth("JAIL", longestLen(HistoryEntry, items, "jail"));
         const addr_col = colWidth("SCOPE", widest_addr);
+        const match_col = colWidth("MATCH", widest_match);
         try color.on(writer, Color.bold);
         try padRightPrint(writer, "SEQ", seq_col);
         try padRightPrint(writer, "JAIL", jail_col);
         try padRightPrint(writer, "SCOPE", addr_col);
+        try padRightPrint(writer, "MATCH", match_col);
         try padRightPrint(writer, "CONFIRMED (UTC)", 21);
         try padRightPrint(writer, "RETRY", 7);
         try padRightPrint(writer, "DECISION", 13);
         try color.off(writer);
         try writer.writeAll("\n");
-        try repeatChar(writer, '-', seq_col + jail_col + addr_col + 41);
+        try repeatChar(writer, '-', seq_col + jail_col + addr_col + match_col + 41);
         try writer.writeAll("\n");
         for (items) |it| {
             var addr: [64]u8 = undefined;
+            var match: [scope_match_max_bytes]u8 = undefined;
             var when: [32]u8 = undefined;
             try padRightPrint(writer, formatOptU64Local(it.sequence), seq_col);
             try writeCell(writer, it.jail orelse "-", jail_col);
             try writeCell(writer, scopeAddress(&addr, it.scope), addr_col);
+            try writeCell(writer, scopeMatch(&match, it.scope), match_col);
             try padRightPrint(writer, formatUtc(&when, it.confirmed_us), 21);
             try padRightPrint(writer, boolStr(it.native_retry), 7);
             try padRightPrint(writer, shortHex(it.decision_id_hex), 13);
@@ -1459,6 +1817,287 @@ fn writeHistoryTable(writer: anytype, p: HistoryPayload, color: Color) !void {
     try writePageFooter(writer, p.generation, p.next_cursor);
 }
 
+fn formatFirewallForWidth(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    payload_json: []const u8,
+    fmt: OutputFormat,
+    color: Color,
+    columns: usize,
+) !void {
+    if (fmt == .json) {
+        try writer.writeAll(payload_json);
+        if (payload_json.len == 0 or payload_json[payload_json.len - 1] != '\n') try writer.writeAll("\n");
+        return;
+    }
+    const parsed = try std.json.parseFromSlice(
+        FirewallPayload,
+        allocator,
+        payload_json,
+        .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
+    );
+    defer parsed.deinit();
+    if (parsed.value.available == true and parsed.value.observation == null) return error.InvalidFirewallPayload;
+    if (fmt == .plain) return writeFirewallPlain(writer, parsed.value);
+    return writeFirewallTable(writer, parsed.value, color, columns);
+}
+
+fn firewallPlainText(writer: anytype, key: []const u8, value: ?[]const u8) !void {
+    var buffer: [diagnostic_max_bytes]u8 = undefined;
+    try writer.print("{s}\t{s}\n", .{ key, if (value) |text| renderDiagnostic(&buffer, text) else "-" });
+}
+
+fn writeFirewallPlain(writer: anytype, payload: FirewallPayload) !void {
+    try plainInt(writer, "schema_version", payload.schema_version);
+    try firewallPlainText(writer, "generation", payload.generation);
+    try firewallPlainText(writer, "kind", payload.kind);
+    try plainBool(writer, "available", payload.available);
+    try firewallPlainText(writer, "unavailable_reason", payload.unavailable_reason);
+    if (payload.installation) |installation| {
+        try firewallPlainText(writer, "installation.id", installation.id_hex);
+        try firewallPlainText(writer, "installation.backend", installation.backend);
+        try firewallPlainText(writer, "installation.namespace", installation.namespace);
+    }
+    if (payload.observation) |observation| {
+        try firewallPlainText(writer, "observation.id", observation.id);
+        try firewallPlainText(writer, "observation.state", observation.state);
+        try plainInt(writer, "observation.observed_wall_us", observation.observed_wall_us);
+        try plainInt(writer, "observation.age_ms", observation.age_ms);
+        try plainBool(writer, "observation.complete", observation.observation_complete);
+        try plainInt(writer, "observation.observed_total", observation.observed_total);
+        try plainInt(writer, "observation.sample_count", observation.sample_count);
+        try plainBool(writer, "observation.sample_truncated", observation.sample_truncated);
+        try firewallPlainText(writer, "observation.inventory", observation.inventory);
+        try firewallPlainText(writer, "observation.origin", observation.origin);
+        try firewallPlainText(writer, "observation.comparison", observation.comparison);
+        try firewallPlainText(writer, "observation.comparison_reason", observation.comparison_reason);
+    }
+    if (payload.last_attempt) |attempt| {
+        try firewallPlainText(writer, "last_attempt.outcome", attempt.outcome);
+        try firewallPlainText(writer, "last_attempt.cause", attempt.cause);
+        try firewallPlainText(writer, "last_attempt.stage", attempt.stage);
+        try plainInt(writer, "last_attempt.age_ms", attempt.age_ms);
+    }
+    for (payload.items orelse &.{}, 0..) |item, index| {
+        var key: [64]u8 = undefined;
+        var address: [64]u8 = undefined;
+        var match: [scope_match_max_bytes]u8 = undefined;
+        try firewallPlainText(writer, try itemKey(&key, index, "scope"), scopeAddress(&address, item.scope));
+        try firewallPlainText(writer, try itemKey(&key, index, "match"), scopeMatch(&match, item.scope));
+        try firewallPlainText(writer, try itemKey(&key, index, "effect_id"), item.effect_id_hex);
+        try plainInt(writer, try itemKey(&key, index, "remaining_ms_at_observation"), item.remaining_ms_at_observation);
+        try plainInt(writer, try itemKey(&key, index, "deadline_us"), item.deadline_us);
+    }
+    try firewallPlainText(writer, "next_cursor", payload.next_cursor);
+}
+
+fn writeFirewallTable(writer: anytype, payload: FirewallPayload, color: Color, columns: usize) !void {
+    try color.on(writer, Color.bold);
+    try writer.writeAll("FIREWALL OBSERVATION\n");
+    try color.off(writer);
+
+    var state_buffer: [192]u8 = undefined;
+    const state = firewallState(&state_buffer, payload);
+    if (payload.available == true and firewallIsStale(payload)) try color.on(writer, Color.yellow);
+    try writeFirewallSummaryRow(writer, "State:        ", state, columns);
+    try color.off(writer);
+
+    var diagnostic: [diagnostic_max_bytes]u8 = undefined;
+    if (payload.installation) |installation| {
+        try writeFirewallSummaryRow(writer, "Backend:      ", if (installation.backend) |value| renderDiagnostic(&diagnostic, value) else "unknown", columns);
+        try writeFirewallSummaryRow(writer, "Installation: ", if (installation.id_hex) |value| renderDiagnostic(&diagnostic, value) else "unknown", columns);
+        try writeFirewallSummaryRow(writer, "Namespace:    ", if (installation.namespace) |value| renderDiagnostic(&diagnostic, value) else "unknown", columns);
+    }
+    if (payload.observation) |observation| {
+        try writeFirewallSummaryRow(writer, "Observation:  ", if (observation.id) |value| renderDiagnostic(&diagnostic, value) else "unknown", columns);
+        var age_buffer: [64]u8 = undefined;
+        try writeFirewallSummaryRow(writer, "Age:          ", formatMilliseconds(&age_buffer, observation.age_ms), columns);
+        var coverage_buffer: [160]u8 = undefined;
+        try writeFirewallSummaryRow(writer, "Coverage:     ", firewallCoverage(&coverage_buffer, observation), columns);
+        try writeFirewallSummaryRow(writer, "Inventory:    ", if (observation.inventory) |value| renderDiagnostic(&diagnostic, value) else "unknown", columns);
+        try writeFirewallSummaryRow(writer, "Origin:       ", if (observation.origin) |value| renderDiagnostic(&diagnostic, value) else "unknown", columns);
+        var comparison_buffer: [192]u8 = undefined;
+        try writeFirewallSummaryRow(writer, "Comparison:   ", firewallComparison(&comparison_buffer, observation), columns);
+    }
+    var attempt_buffer: [192]u8 = undefined;
+    try writeFirewallSummaryRow(writer, "Last attempt: ", firewallAttempt(&attempt_buffer, payload.last_attempt), columns);
+    try writeFirewallSummaryRow(writer, "Generation:   ", if (payload.generation) |value| renderDiagnostic(&diagnostic, value) else "unknown", columns);
+
+    const items = payload.items orelse &.{};
+    try writer.writeAll("\n");
+    if (items.len == 0) {
+        if (payload.available != true) {
+            try writer.writeAll("No sample is available.\n");
+        } else if (payload.observation) |observation| {
+            if (std.mem.eql(u8, observation.state orelse "", "absent"))
+                try writer.writeAll("The owned installation was absent at observation time.\n")
+            else
+                try writer.writeAll("No sampled protection entries.\n");
+        } else {
+            try writer.writeAll("No sampled protection entries.\n");
+        }
+    } else {
+        try writeFirewallItems(writer, items, color, columns);
+    }
+    if (payload.next_cursor) |cursor| {
+        var cursor_buffer: [diagnostic_max_bytes]u8 = undefined;
+        try writer.print("more available: rerun firewall show with --cursor {s}\n", .{renderDiagnostic(&cursor_buffer, cursor)});
+    }
+}
+
+fn writeFirewallSummaryRow(writer: anytype, label: []const u8, value: []const u8, columns: usize) !void {
+    try writer.writeAll(label);
+    try writeCell(writer, value, @max(@as(usize, 4), columns -| label.len));
+    try writer.writeAll("\n");
+}
+
+fn firewallState(buffer: []u8, payload: FirewallPayload) []const u8 {
+    if (payload.available != true) {
+        const reason = payload.unavailable_reason orelse "unknown";
+        var diagnostic: [diagnostic_max_bytes]u8 = undefined;
+        return std.fmt.bufPrint(buffer, "unavailable ({s})", .{renderDiagnostic(&diagnostic, reason)}) catch "unavailable";
+    }
+    const observation = payload.observation orelse return "unavailable (missing observation)";
+    const state = observation.state orelse "unknown";
+    if (std.mem.eql(u8, state, "absent")) return "absent";
+    if (observation.inventory) |inventory| if (std.mem.eql(u8, inventory, "unexpected_entries"))
+        return "owned (unexpected entries)";
+    if (firewallAttemptForeign(payload.last_attempt)) return "owned (stale; foreign state on last attempt)";
+    if (firewallIsStale(payload)) return "owned (stale; last attempt failed)";
+    if (std.mem.eql(u8, state, "owned")) return "owned (clean observation)";
+    return renderDiagnostic(buffer, state);
+}
+
+fn firewallIsStale(payload: FirewallPayload) bool {
+    const attempt = payload.last_attempt orelse return false;
+    return std.mem.eql(u8, attempt.outcome orelse "", "failed");
+}
+
+fn firewallAttemptForeign(attempt: ?FirewallAttempt) bool {
+    const value = attempt orelse return false;
+    return std.mem.eql(u8, value.cause orelse "", "ForeignState");
+}
+
+fn formatMilliseconds(buffer: []u8, value: ?u64) []const u8 {
+    const milliseconds = value orelse return "unknown";
+    return std.fmt.bufPrint(buffer, "{d} ms", .{milliseconds}) catch "unknown";
+}
+
+fn firewallCoverage(buffer: []u8, observation: FirewallObservation) []const u8 {
+    const complete = if (observation.observation_complete == true) "complete readback" else "unknown completeness";
+    var stream = std.io.fixedBufferStream(buffer);
+    const writer = stream.writer();
+    writer.writeAll(complete) catch return complete;
+    if (observation.observed_total) |observed|
+        writer.print("; {d} observed", .{observed}) catch return complete
+    else
+        writer.writeAll("; unknown observed") catch return complete;
+    if (observation.sample_count) |retained|
+        writer.print("; {d} retained", .{retained}) catch return complete
+    else
+        writer.writeAll("; unknown retained") catch return complete;
+    if (observation.sample_truncated == true) writer.writeAll("; sample truncated") catch return complete;
+    return stream.getWritten();
+}
+
+fn firewallComparison(buffer: []u8, observation: FirewallObservation) []const u8 {
+    var comparison_buffer: [diagnostic_max_bytes]u8 = undefined;
+    var reason_buffer: [diagnostic_max_bytes]u8 = undefined;
+    const comparison_text = observation.comparison orelse return "unknown";
+    if (observation.comparison_reason) |reason| {
+        const comparison = renderDiagnostic(&comparison_buffer, comparison_text);
+        return std.fmt.bufPrint(buffer, "{s} ({s})", .{ comparison, renderDiagnostic(&reason_buffer, reason) }) catch "unknown";
+    }
+    return renderDiagnostic(buffer, comparison_text);
+}
+
+fn firewallAttempt(buffer: []u8, attempt_opt: ?FirewallAttempt) []const u8 {
+    const attempt = attempt_opt orelse return "unknown";
+    var outcome_buffer: [diagnostic_max_bytes]u8 = undefined;
+    var cause_buffer: [diagnostic_max_bytes]u8 = undefined;
+    var stage_buffer: [diagnostic_max_bytes]u8 = undefined;
+    const outcome = if (attempt.outcome) |value| renderDiagnostic(&outcome_buffer, value) else "unknown";
+    var stream = std.io.fixedBufferStream(buffer);
+    const writer = stream.writer();
+    writer.writeAll(outcome) catch return "unknown";
+    if (attempt.cause) |cause| writer.print("; cause={s}", .{renderDiagnostic(&cause_buffer, cause)}) catch return "unknown";
+    if (attempt.stage) |stage| writer.print("; stage={s}", .{renderDiagnostic(&stage_buffer, stage)}) catch return "unknown";
+    if (attempt.age_ms) |age| writer.print("; {d} ms ago", .{age}) catch return "unknown";
+    return stream.getWritten();
+}
+
+fn writeFirewallItems(writer: anytype, items: []const FirewallItem, color: Color, columns: usize) !void {
+    var widest_scope: usize = 0;
+    var widest_match: usize = 0;
+    for (items) |item| {
+        var address: [64]u8 = undefined;
+        var safe_address: [diagnostic_max_bytes]u8 = undefined;
+        var match: [scope_match_max_bytes]u8 = undefined;
+        widest_scope = @max(widest_scope, firewallScopeText(&address, &safe_address, item.scope).len);
+        widest_match = @max(widest_match, scopeMatch(&match, item.scope).len);
+    }
+    const scope_col = colWidth("SCOPE", widest_scope);
+    const match_col = colWidth("MATCH", widest_match);
+    const full_width = scope_col + match_col + 13 + 18 + 21;
+    if (full_width > columns) return writeFirewallItemsStacked(writer, items, color, columns);
+
+    try color.on(writer, Color.bold);
+    try padRightPrint(writer, "SCOPE", scope_col);
+    try padRightPrint(writer, "MATCH", match_col);
+    try padRightPrint(writer, "EFFECT", 13);
+    try padRightPrint(writer, "REMAINING@OBS", 18);
+    try padRightPrint(writer, "DEADLINE (UTC)", 21);
+    try color.off(writer);
+    try writer.writeAll("\n");
+    try repeatChar(writer, '-', full_width);
+    try writer.writeAll("\n");
+    for (items) |item| {
+        var address: [64]u8 = undefined;
+        var safe_address: [diagnostic_max_bytes]u8 = undefined;
+        var match: [scope_match_max_bytes]u8 = undefined;
+        var effect: [diagnostic_max_bytes]u8 = undefined;
+        var remaining: [64]u8 = undefined;
+        var deadline: [32]u8 = undefined;
+        try writeCell(writer, firewallScopeText(&address, &safe_address, item.scope), scope_col);
+        try writeCell(writer, scopeMatch(&match, item.scope), match_col);
+        try writeCell(writer, firewallEffectText(&effect, item.effect_id_hex), 13);
+        try writeCell(writer, formatMilliseconds(&remaining, item.remaining_ms_at_observation), 18);
+        try writeCell(writer, if (item.deadline_us == null) "unknown" else formatUtc(&deadline, item.deadline_us), 21);
+        try writer.writeAll("\n");
+    }
+    try writer.print("Total: {d} sampled entries\n", .{items.len});
+}
+
+fn writeFirewallItemsStacked(writer: anytype, items: []const FirewallItem, color: Color, columns: usize) !void {
+    for (items, 0..) |item, index| {
+        if (index != 0) try writer.writeAll("\n");
+        var address: [64]u8 = undefined;
+        var safe_address: [diagnostic_max_bytes]u8 = undefined;
+        var match: [scope_match_max_bytes]u8 = undefined;
+        var effect: [diagnostic_max_bytes]u8 = undefined;
+        var remaining: [64]u8 = undefined;
+        var deadline: [32]u8 = undefined;
+        try color.on(writer, Color.bold);
+        try writer.print("ENTRY {d}\n", .{index + 1});
+        try color.off(writer);
+        try writeFirewallSummaryRow(writer, "Scope:        ", firewallScopeText(&address, &safe_address, item.scope), columns);
+        try writeFirewallSummaryRow(writer, "Match:        ", scopeMatch(&match, item.scope), columns);
+        try writeFirewallSummaryRow(writer, "Effect:       ", firewallEffectText(&effect, item.effect_id_hex), columns);
+        try writeFirewallSummaryRow(writer, "Remaining:    ", formatMilliseconds(&remaining, item.remaining_ms_at_observation), columns);
+        try writeFirewallSummaryRow(writer, "Deadline:     ", if (item.deadline_us == null) "unknown" else formatUtc(&deadline, item.deadline_us), columns);
+    }
+    try writer.print("Total: {d} sampled entries\n", .{items.len});
+}
+
+fn firewallScopeText(raw_buffer: *[64]u8, safe_buffer: *[diagnostic_max_bytes]u8, scope: ?ScopeView) []const u8 {
+    return renderDiagnostic(safe_buffer, scopeAddress(raw_buffer, scope));
+}
+
+fn firewallEffectText(buffer: *[diagnostic_max_bytes]u8, effect_id_hex: ?[]const u8) []const u8 {
+    const value = effect_id_hex orelse return "-";
+    return renderDiagnostic(buffer, value);
+}
+
 fn formatOptU64Local(opt: ?u64) []const u8 {
     const v = opt orelse return "-";
     return std.fmt.bufPrint(&scratch, "{d}", .{v}) catch "-";
@@ -1466,8 +2105,10 @@ fn formatOptU64Local(opt: ?u64) []const u8 {
 
 fn formatUtc(buffer: *[32]u8, confirmed_us: ?i64) []const u8 {
     const us = confirmed_us orelse return "-";
-    if (us < 0) return "-";
+    if (us < 0) return "out-of-range";
     const secs: u64 = @intCast(@divTrunc(us, std.time.us_per_s));
+    const max_supported_utc_seconds: u64 = 253_402_300_799;
+    if (secs > max_supported_utc_seconds) return "out-of-range";
     const day = std.time.epoch.EpochSeconds{ .secs = secs };
     const ymd = day.getEpochDay().calculateYearDay().calculateMonthDay();
     const hms = day.getDaySeconds();
@@ -1505,7 +2146,7 @@ const testing = std.testing;
 fn runStatus(alloc: std.mem.Allocator, payload: []const u8, fmt: OutputFormat) ![]u8 {
     var list = std.ArrayList(u8).init(alloc);
     errdefer list.deinit();
-    try formatStatus(alloc, list.writer(), payload, fmt, .{ .enabled = false });
+    try formatStatusForWidth(alloc, list.writer(), payload, fmt, .{ .enabled = false }, 160);
     return list.toOwnedSlice();
 }
 
@@ -1596,6 +2237,22 @@ test "format: status table renders Protection row when present" {
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "Protection:") != null);
     try testing.expect(std.mem.indexOf(u8, out, "log-only") != null);
+}
+
+test "format: CP-02 status heading is neutral and narrow output is bounded" {
+    const payload = "{\"version\":\"v\\t1\",\"protection\":\"degraded\",\"backend\":\"backend-with-a-very-long-name-that-must-not-overflow-a-narrow-terminal\",\"active_bans\":3}";
+    const table = try runStatus(testing.allocator, payload, .table);
+    defer testing.allocator.free(table);
+    try testing.expect(std.mem.indexOf(u8, table, "— status") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "running") == null);
+    try testing.expect(std.mem.indexOf(u8, table, "v\\t1") != null);
+
+    var narrow = std.ArrayList(u8).init(testing.allocator);
+    defer narrow.deinit();
+    try formatStatusForWidth(testing.allocator, narrow.writer(), payload, .table, .{ .enabled = false }, 40);
+    try testing.expect(std.mem.indexOf(u8, narrow.items, "Protection:") != null);
+    var lines = std.mem.splitScalar(u8, narrow.items, '\n');
+    while (lines.next()) |line| if (line.len != 0) try testing.expect(line.len <= 40);
 }
 
 test "format: status plain renders protection when present" {
@@ -1806,7 +2463,7 @@ test "format: status reports parser allocation failure without retaining diagnos
 fn runList(alloc: std.mem.Allocator, payload: []const u8, fmt: OutputFormat) ![]u8 {
     var list = std.ArrayList(u8).init(alloc);
     errdefer list.deinit();
-    try formatList(alloc, list.writer(), payload, fmt, .{ .enabled = false });
+    try formatListForWidth(alloc, list.writer(), payload, fmt, .{ .enabled = false }, 160);
     return list.toOwnedSlice();
 }
 
@@ -1880,6 +2537,45 @@ test "format: list json passes through (SYS-002)" {
     try testing.expect(std.mem.startsWith(u8, out, "["));
 }
 
+test "format: CP-02 list distinguishes permanent confirmed pending and unknown" {
+    const payload = "[{\"ip\":\"192.0.2.1\",\"jail\":\"sshd\",\"ban_count\":1,\"permanent\":true,\"confirmed\":true},{\"ip\":\"192.0.2.2\",\"jail\":\"sshd\",\"ban_count\":2,\"ban_expiry\":9999999999,\"enforced\":false},{\"ip\":\"192.0.2.3\",\"jail\":\"sshd\",\"ban_count\":3}]";
+    const table = try runList(testing.allocator, payload, .table);
+    defer testing.allocator.free(table);
+    try testing.expect(std.mem.indexOf(u8, table, "permanent") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "confirmed") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "pending") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "unknown") != null);
+
+    const plain = try runList(testing.allocator, payload, .plain);
+    defer testing.allocator.free(plain);
+    try testing.expectEqual(@as(usize, 9), std.mem.count(u8, plain, "\t"));
+    try testing.expect(std.mem.indexOf(u8, plain, "permanent") == null);
+
+    const json = try runList(testing.allocator, payload, .json);
+    defer testing.allocator.free(json);
+    try testing.expectEqualStrings(payload ++ "\n", json);
+}
+
+test "format: CP-02 list narrow fallback keeps core meaning" {
+    const payload = "[{\"ip\":\"192.0.2.1\",\"jail\":\"ssh\\tadmin\",\"permanent\":true,\"confirmed\":false}]";
+    var out = std.ArrayList(u8).init(testing.allocator);
+    defer out.deinit();
+    try formatListForWidth(testing.allocator, out.writer(), payload, .table, .{ .enabled = false }, 40);
+    try testing.expect(std.mem.indexOf(u8, out.items, "IP ADDRESS:") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "ssh\\tadmin") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "permanent") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "pending") != null);
+    var lines = std.mem.splitScalar(u8, out.items, '\n');
+    while (lines.next()) |line| if (line.len != 0) try testing.expect(line.len <= 40);
+}
+
+test "format: CP-02 ban expiry saturates hostile timestamps" {
+    const min = std.math.minInt(i64);
+    const max = std.math.maxInt(i64);
+    try testing.expectEqual(max, remainingFromExpiry(max, min).?);
+    try testing.expectEqual(min, remainingFromExpiry(min, max).?);
+}
+
 test "format: list rejects object-shape payload (SYS-002 regression)" {
     const payload = "{\"entries\":[]}";
     const out = try runList(testing.allocator, payload, .table);
@@ -1890,7 +2586,7 @@ test "format: list rejects object-shape payload (SYS-002 regression)" {
 fn runJails(alloc: std.mem.Allocator, payload: []const u8, fmt: OutputFormat) ![]u8 {
     var list = std.ArrayList(u8).init(alloc);
     errdefer list.deinit();
-    try formatJails(alloc, list.writer(), payload, fmt, .{ .enabled = false });
+    try formatJailsForWidth(alloc, list.writer(), payload, fmt, .{ .enabled = false }, 160);
     return list.toOwnedSlice();
 }
 
@@ -1966,6 +2662,41 @@ test "format: jails plain renders action and enforcing (SYS-017)" {
     const out = try runJails(testing.allocator, payload, .plain);
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "sshd-test\tenabled\t0\t3\t600\t600\tlog-only\tfalse\t-\tunknown\t0\n") != null);
+}
+
+test "format: CP-02 jails show paused without changing plain columns" {
+    const payload = "[{\"name\":\"sshd\",\"enabled\":true,\"paused\":true,\"active_bans\":1,\"action\":\"nftables\",\"source_healthy\":true}]";
+    const table = try runJails(testing.allocator, payload, .table);
+    defer testing.allocator.free(table);
+    try testing.expect(std.mem.indexOf(u8, table, "paused") != null);
+
+    const plain = try runJails(testing.allocator, payload, .plain);
+    defer testing.allocator.free(plain);
+    try testing.expectEqual(@as(usize, 10), std.mem.count(u8, plain, "\t"));
+    try testing.expect(std.mem.indexOf(u8, plain, "\tenabled\t") != null);
+}
+
+test "format: CP-02 jails keep an absent enabled field unknown in tables" {
+    const payload = "[{\"name\":\"sshd\"}]";
+    const table = try runJails(testing.allocator, payload, .table);
+    defer testing.allocator.free(table);
+    try testing.expect(std.mem.indexOf(u8, table, "sshd unknown") != null);
+
+    const plain = try runJails(testing.allocator, payload, .plain);
+    defer testing.allocator.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "sshd\tdisabled\t") != null);
+}
+
+test "format: CP-02 jails narrow fallback escapes untrusted text" {
+    const payload = "[{\"name\":\"ssh\\nadmin\",\"enabled\":true,\"paused\":true,\"active_bans\":1,\"action\":\"nf\\tables\",\"source_healthy\":false,\"cause\":\"bad\"}]";
+    var out = std.ArrayList(u8).init(testing.allocator);
+    defer out.deinit();
+    try formatJailsForWidth(testing.allocator, out.writer(), payload, .table, .{ .enabled = false }, 40);
+    try testing.expect(std.mem.indexOf(u8, out.items, "ssh\\nadmin") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "nf\\tables") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "paused") != null);
+    var lines = std.mem.splitScalar(u8, out.items, '\n');
+    while (lines.next()) |line| if (line.len != 0) try testing.expect(line.len <= 40);
 }
 
 test "format: status renders protection degraded (SYS-017)" {
@@ -2109,16 +2840,26 @@ test "format: list table TIME LEFT sized for a decades-long ban (BUG-011)" {
     const payload = "[{\"ip\":\"1.2.3.4\",\"jail\":\"sshd\",\"ban_count\":4294967295,\"ban_expiry\":9999999999},{\"ip\":\"5.6.7.8\",\"jail\":\"sshd\",\"ban_count\":1,\"ban_expiry\":1}]";
     const out = try runList(testing.allocator, payload, .table);
     defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "s 4294967295") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "s4294967295") == null);
     try testing.expect(std.mem.indexOf(u8, out, "expired") != null);
     const lens = lineLens(out);
     try testing.expectEqual(lens[0], lens[1]);
     try testing.expectEqual(lens[0], lens[2]);
     var it = std.mem.splitScalar(u8, out, '\n');
+    const header = it.next().?;
     _ = it.next();
-    _ = it.next();
-    _ = it.next();
+    const first_row = it.next().?;
+    const time_start = std.mem.indexOf(u8, header, "TIME LEFT").?;
+    const confirmation_start = std.mem.indexOf(u8, header, "CONFIRMATION").?;
+    const count_start = std.mem.indexOf(u8, header, "BAN COUNT").?;
+    try testing.expect(time_start < confirmation_start);
+    try testing.expect(confirmation_start < count_start);
+    const time_value = std.mem.trim(u8, first_row[time_start..confirmation_start], " ");
+    const confirmation_value = std.mem.trim(u8, first_row[confirmation_start..count_start], " ");
+    const count_value = std.mem.trim(u8, first_row[count_start..], " ");
+    try testing.expect(time_value.len > 1);
+    try testing.expect(std.mem.endsWith(u8, time_value, "s"));
+    try testing.expectEqualStrings("unknown", confirmation_value);
+    try testing.expectEqualStrings("4294967295", count_value);
     try testing.expectEqual(lens[0], it.next().?.len);
 }
 
@@ -2265,6 +3006,21 @@ const history_payload =
     \\"next_cursor":null}
 ;
 
+const firewall_payload =
+    \\{"schema_version":1,"generation":"ab12","kind":"firewall","available":true,"unavailable_reason":null,
+    \\"installation":{"id_hex":"00112233445566778899aabbccddeeff","backend":"nftables","namespace":"daemon-current"},
+    \\"observation":{"id":"00112233445566778899aabbccddeeff:7","state":"owned","observed_wall_us":1700000000000000,"age_ms":25,
+    \\"observation_complete":true,"observed_total":2,"sample_count":2,"sample_truncated":false,"inventory":"known_entries",
+    \\"origin":"normal_readback","comparison":"unavailable","comparison_reason":"intent_revision_not_aligned"},
+    \\"last_attempt":{"outcome":"success","cause":null,"stage":null,"age_ms":25},"items":[
+    \\{"scope":{"family":"v4","address":"192.0.2.9","prefix":32,"subject_kind":"host","protocols":["tcp","udp"],
+    \\"port_ranges":[{"first":53,"last":53},{"first":8000,"last":8010}],"legacy_exact":false,"direction":"input","target":"drop"},
+    \\"effect_id_hex":"1111111111111111ffff","remaining_ms_at_observation":3000,"deadline_us":1700000003000000},
+    \\{"scope":{"family":"v6","address":"2001:db8::","prefix":64,"subject_kind":"network","protocols":["all"],
+    \\"port_ranges":[],"legacy_exact":true,"direction":"input","target":"drop"},"effect_id_hex":null,
+    \\"remaining_ms_at_observation":null,"deadline_us":null}],"next_cursor":"fw-token"}
+;
+
 fn runFormatter(comptime formatter: anytype, payload: []const u8, fmt: OutputFormat) ![]u8 {
     var list = std.ArrayList(u8).init(testing.allocator);
     errdefer list.deinit();
@@ -2408,10 +3164,154 @@ test "format: history plain and table" {
     try testing.expect(std.mem.indexOf(u8, table, "--cursor") == null);
 }
 
+test "format: canonical scope sets stay exact in scope and history tables" {
+    const scope_payload =
+        \\{"generation":"g","items":[{"jail":"dns","scope":{"family":"v4","address":"192.0.2.0","prefix":24,
+        \\"subject_kind":"network","protocols":["tcp","udp"],"port_ranges":[{"first":53,"last":53},{"first":8000,"last":8010}],
+        \\"legacy_exact":false},"lease":"finite","confirmed":true}],"next_cursor":null}
+    ;
+    const scopes = try runFormatter(formatScopes, scope_payload, .table);
+    defer testing.allocator.free(scopes);
+    try testing.expect(std.mem.indexOf(u8, scopes, "tcp,udp/53,8000-8010") != null);
+
+    const history =
+        \\{"generation":"g","items":[{"sequence":1,"jail":"dns","confirmed_us":1700000000000000,
+        \\"scope":{"family":"v4","address":"192.0.2.0","prefix":24,"subject_kind":"network","protocols":["tcp","udp"],
+        \\"port_ranges":[{"first":53,"last":53},{"first":8000,"last":8010}],"legacy_exact":false},"native_retry":false}],"next_cursor":null}
+    ;
+    const table = try runFormatter(formatHistory, history, .table);
+    defer testing.allocator.free(table);
+    try testing.expect(std.mem.indexOf(u8, table, "MATCH") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "tcp,udp/53,8000-8010") != null);
+    const plain = try runFormatter(formatHistory, history, .plain);
+    defer testing.allocator.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "items.0.scope\t192.0.2.0/24\n") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "items.0.match") == null);
+}
+
+test "format: firewall table and plain distinguish observation from intent" {
+    const table = try runFormatter(formatFirewall, firewall_payload, .table);
+    defer testing.allocator.free(table);
+    try testing.expect(std.mem.indexOf(u8, table, "owned (clean observation)") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "complete readback; 2 observed; 2 retained") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "tcp,udp/53,8000-8010") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "unknown") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "--cursor fw-token") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "confirmed") == null);
+    try testing.expect(std.mem.indexOf(u8, table, "permanent") == null);
+
+    const plain = try runFormatter(formatFirewall, firewall_payload, .plain);
+    defer testing.allocator.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "observation.id\t00112233445566778899aabbccddeeff:7\n") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "items.0.match\ttcp,udp/53,8000-8010\n") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "items.1.remaining_ms_at_observation\t-\n") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "next_cursor\tfw-token\n") != null);
+}
+
+test "format: firewall states keep unavailable absent stale and foreign distinct" {
+    const unavailable = try runFormatter(formatFirewall, "{\"schema_version\":1,\"kind\":\"firewall\",\"available\":false,\"unavailable_reason\":\"no_manager\",\"installation\":null,\"observation\":null,\"last_attempt\":{\"outcome\":\"none\",\"cause\":null,\"stage\":null,\"age_ms\":null},\"items\":[],\"next_cursor\":null}", .table);
+    defer testing.allocator.free(unavailable);
+    try testing.expect(std.mem.indexOf(u8, unavailable, "unavailable (no_manager)") != null);
+    try testing.expect(std.mem.indexOf(u8, unavailable, "No sample is available") != null);
+
+    const absent = try runFormatter(formatFirewall, "{\"schema_version\":1,\"kind\":\"firewall\",\"available\":true,\"installation\":{\"backend\":\"iptables\"},\"observation\":{\"id\":\"n:1\",\"state\":\"absent\",\"observation_complete\":true,\"observed_total\":0,\"sample_count\":0,\"sample_truncated\":false},\"last_attempt\":{\"outcome\":\"success\"},\"items\":[],\"next_cursor\":null}", .table);
+    defer testing.allocator.free(absent);
+    try testing.expect(std.mem.indexOf(u8, absent, "State:        absent") != null);
+    try testing.expect(std.mem.indexOf(u8, absent, "owned installation was absent") != null);
+
+    const foreign = try runFormatter(formatFirewall, "{\"schema_version\":1,\"kind\":\"firewall\",\"available\":true,\"installation\":{\"backend\":\"nftables\"},\"observation\":{\"id\":\"n:2\",\"state\":\"owned\",\"observation_complete\":true,\"observed_total\":1,\"sample_count\":1,\"sample_truncated\":false},\"last_attempt\":{\"outcome\":\"failed\",\"cause\":\"ForeignState\",\"stage\":\"readback\",\"age_ms\":4},\"items\":[],\"next_cursor\":null}", .table);
+    defer testing.allocator.free(foreign);
+    try testing.expect(std.mem.indexOf(u8, foreign, "stale; foreign state on last attempt") != null);
+    try testing.expect(std.mem.indexOf(u8, foreign, "cause=ForeignState") != null);
+}
+
+test "format: firewall narrow output bounds and escapes diagnostic text" {
+    const payload =
+        "{\"schema_version\":1,\"kind\":\"firewall\",\"available\":true,\"installation\":{\"backend\":\"nf\\ntables-with-a-long-name\",\"namespace\":\"daemon-current\"},\"observation\":{\"id\":\"nonce:1\",\"state\":\"owned\",\"observation_complete\":true,\"observed_total\":0,\"sample_count\":0,\"sample_truncated\":false},\"last_attempt\":{\"outcome\":\"success\"},\"items\":[],\"next_cursor\":null}";
+    var out = std.ArrayList(u8).init(testing.allocator);
+    defer out.deinit();
+    try formatFirewallForWidth(testing.allocator, out.writer(), payload, .table, .{ .enabled = false }, 40);
+    try testing.expect(std.mem.indexOf(u8, out.items, "nf\\ntables") != null);
+    var lines = std.mem.splitScalar(u8, out.items, '\n');
+    while (lines.next()) |line| if (line.len != 0) try testing.expect(line.len <= 40);
+}
+
+test "format: firewall item fields escape controls in wide and stacked tables" {
+    const payload =
+        "{\"schema_version\":1,\"kind\":\"firewall\",\"available\":true,\"installation\":{\"backend\":\"nftables\"},\"observation\":{\"id\":\"nonce:3\",\"state\":\"owned\",\"observation_complete\":true,\"observed_total\":2,\"sample_count\":2,\"sample_truncated\":false},\"last_attempt\":{\"outcome\":\"success\"},\"items\":[{\"scope\":{\"family\":\"v4\",\"address\":\"192.0.2.1\\u001b\\nrow\",\"prefix\":32,\"protocols\":[\"tcp\",\"udp\"],\"port_ranges\":[{\"first\":53,\"last\":53},{\"first\":8000,\"last\":8010}]},\"effect_id_hex\":\"abc\\tdef\\u001b\",\"remaining_ms_at_observation\":1,\"deadline_us\":9223372036854775807},{\"scope\":{\"family\":\"v4\",\"address\":\"198.51.100.2\",\"prefix\":32,\"protocol\":\"u\\u001b\\np\\t\",\"port\":53},\"effect_id_hex\":null,\"remaining_ms_at_observation\":null,\"deadline_us\":null}],\"next_cursor\":null}";
+    inline for (.{ @as(usize, 200), @as(usize, 40) }) |columns| {
+        var out = std.ArrayList(u8).init(testing.allocator);
+        defer out.deinit();
+        try formatFirewallForWidth(testing.allocator, out.writer(), payload, .table, .{ .enabled = false }, columns);
+        try testing.expect(std.mem.indexOfScalar(u8, out.items, 0x1b) == null);
+        try testing.expect(std.mem.indexOfScalar(u8, out.items, '\t') == null);
+        try testing.expect(std.mem.indexOf(u8, out.items, "192.0.2.1\\x1B\\nrow") != null);
+        try testing.expect(std.mem.indexOf(u8, out.items, "abc\\tdef\\x1B") != null);
+        try testing.expect(std.mem.indexOf(u8, out.items, "tcp,udp/53,8000-8010") != null);
+        try testing.expect(std.mem.indexOf(u8, out.items, "u\\x1B\\np\\t/53") != null);
+        try testing.expect(std.mem.indexOf(u8, out.items, "out-of-range") != null);
+        if (columns == 40) {
+            var lines = std.mem.splitScalar(u8, out.items, '\n');
+            while (lines.next()) |line| if (line.len != 0) try testing.expect(line.len <= columns);
+        }
+    }
+}
+
+test "format: firewall coverage preserves missing counts as unknown" {
+    const payload =
+        "{\"schema_version\":1,\"kind\":\"firewall\",\"available\":true,\"installation\":{\"backend\":\"nftables\"},\"observation\":{\"id\":\"nonce:4\",\"state\":\"owned\",\"observation_complete\":true},\"last_attempt\":{\"outcome\":\"success\"},\"items\":[],\"next_cursor\":null}";
+    const table = try runFormatter(formatFirewall, payload, .table);
+    defer testing.allocator.free(table);
+    try testing.expect(std.mem.indexOf(u8, table, "unknown observed; unknown retained") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "0 observed; 0 retained") == null);
+}
+
+test "format: UTC rendering bounds hostile microsecond timestamps" {
+    var buffer: [32]u8 = undefined;
+    try testing.expectEqualStrings("out-of-range", formatUtc(&buffer, std.math.maxInt(i64)));
+    try testing.expectEqualStrings("out-of-range", formatUtc(&buffer, -1));
+    try testing.expectEqualStrings("9999-12-31 23:59:59", formatUtc(&buffer, 253_402_300_799_000_000));
+}
+
+test "format: firewall json remains raw passthrough" {
+    const out = try runFormatter(formatFirewall, firewall_payload, .json);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(firewall_payload ++ "\n", out);
+}
+
+test "format: firewall rejects available response without an observation" {
+    var out = std.ArrayList(u8).init(testing.allocator);
+    defer out.deinit();
+    try testing.expectError(error.InvalidFirewallPayload, formatFirewallForWidth(
+        testing.allocator,
+        out.writer(),
+        "{\"schema_version\":1,\"kind\":\"firewall\",\"available\":true,\"observation\":null}",
+        .table,
+        .{ .enabled = false },
+        80,
+    ));
+}
+
 test "format: query renderers report unparseable payloads without failing" {
     inline for (.{ formatConfig, formatScopes, formatHistory }) |formatter| {
         const out = try runFormatter(formatter, "nope", .table);
         defer testing.allocator.free(out);
         try testing.expect(std.mem.startsWith(u8, out, "error: could not parse"));
+    }
+}
+
+test "format: BUG-064 compact jail fallback preserves full source causes at default widths" {
+    const payload =
+        \\[{"name":"sshd","enabled":true,"source_healthy":false,"cause":"RestoreRequired"},
+        \\ {"name":"other","enabled":true,"source_healthy":false,"cause":"InvalidEncoding"}]
+    ;
+    for ([_]usize{ 74, 80 }) |width| {
+        var out = std.ArrayList(u8).init(testing.allocator);
+        defer out.deinit();
+        try formatJailsForWidth(testing.allocator, out.writer(), payload, .table, .{ .enabled = false }, width);
+        try testing.expect(std.mem.indexOf(u8, out.items, "broken (RestoreRequired)") != null);
+        try testing.expect(std.mem.indexOf(u8, out.items, "broken (InvalidEncoding)") != null);
+        var lines = std.mem.splitScalar(u8, out.items, '\n');
+        while (lines.next()) |line| try testing.expect(line.len <= width);
     }
 }
