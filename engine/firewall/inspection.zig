@@ -13,6 +13,16 @@ pub const Transport = enum { nftables, iptables, ipset };
 pub const canonical_scope = @import("scope.zig");
 pub const CanonicalScope = canonical_scope.Scope;
 pub const Error = error{ UnknownState, ForeignState, Incomplete, Changed, LimitExceeded, UnsupportedScope, ExpiredIntent, UnsupportedDeadline, InvalidInstallation, ToolUnavailable, PermissionDenied, Timeout, OutOfMemory, SystemError };
+pub const OperationStage = enum { admission_probe, admission_dispatch, admission_verify, readback, effect_dispatch, effect_verify };
+pub const MutationDisposition = enum { not_started, outcome_uncertain };
+pub const FailureContext = struct {
+    backend: Transport,
+    stage: OperationStage,
+    cause: Error,
+    mutation: MutationDisposition,
+};
+
+const MutationProgress = struct { requested: bool = false };
 
 pub fn validateCanonicalScope(_: Transport, scope: CanonicalScope) Error!void {
     scope.validate() catch return error.UnsupportedScope;
@@ -187,7 +197,7 @@ pub const DurableInstallationIntent = struct {
 };
 pub const AdmissionResult = union(enum) {
     installed: struct { snapshot: Snapshot, created: bool },
-    uncertain: Error,
+    uncertain: FailureContext,
     pub fn deinit(self: *AdmissionResult) void {
         switch (self.*) {
             .installed => |*result| result.snapshot.deinit(),
@@ -209,7 +219,7 @@ pub const DispatchToken = struct {
 };
 pub const EffectResult = union(enum) {
     verified: struct { snapshot: Snapshot, changed: bool, observed_wall_us: i64 },
-    uncertain: Error,
+    uncertain: FailureContext,
     pub fn deinit(self: *EffectResult) void {
         switch (self.*) {
             .verified => |*v| v.snapshot.deinit(),
@@ -259,11 +269,12 @@ pub const Inspector = struct {
         self.work_messages = 0;
         self.retained_bytes = 0;
         self.live_bytes = 0;
-        self.createInstallation(&timer) catch |err| return .{ .uncertain = err };
-        var after = self.inspect() catch |err| return .{ .uncertain = err };
+        var progress = MutationProgress{};
+        self.createInstallation(&timer, &progress) catch |err| return .{ .uncertain = self.failure(.admission_dispatch, err, progress) };
+        var after = self.inspect() catch |err| return .{ .uncertain = self.failure(.admission_verify, err, progress) };
         if (after.state != .owned) {
             after.deinit();
-            return .{ .uncertain = error.Incomplete };
+            return .{ .uncertain = self.failure(.admission_verify, error.Incomplete, progress) };
         }
         return .{ .installed = .{ .snapshot = after, .created = true } };
     }
@@ -376,34 +387,44 @@ pub const Inspector = struct {
         self.work_messages = 0;
         self.retained_bytes = 0;
         self.live_bytes = 0;
-        self.mutateExact(token, existing, units, &phase) catch |err| return .{ .uncertain = err };
-        const observation_start = clockAt(clock, &elapsed) catch |err| return .{ .uncertain = err };
-        var after = self.inspect() catch |err| return .{ .uncertain = err };
+        var progress = MutationProgress{};
+        self.mutateExact(token, existing, units, &phase, &progress) catch |err| return .{ .uncertain = self.failure(.effect_dispatch, err, progress) };
+        const observation_start = clockAt(clock, &elapsed) catch |err| return .{ .uncertain = self.failure(.effect_verify, err, progress) };
+        var after = self.inspect() catch |err| return .{ .uncertain = self.failure(.effect_verify, err, progress) };
         const observation_end = clockAt(clock, &elapsed) catch |err| {
             after.deinit();
-            return .{ .uncertain = err };
+            return .{ .uncertain = self.failure(.effect_verify, err, progress) };
         };
         const after_entry = findEntry(after.entries, token.scope, token.effect_id) catch |err| {
             after.deinit();
-            return .{ .uncertain = err };
+            return .{ .uncertain = self.failure(.effect_verify, err, progress) };
         };
         if (after.state != .owned or !mem.eql(u8, &other_hash, &otherEntriesHash(after.entries, token.scope)) or
             !effectMatches(token.operation, self.installation.transport, after_entry, observation_start, observation_end))
         {
             after.deinit();
-            return .{ .uncertain = error.Changed };
+            return .{ .uncertain = self.failure(.effect_verify, error.Changed, progress) };
         }
         return .{ .verified = .{ .snapshot = after, .changed = true, .observed_wall_us = observation_end } };
     }
-    fn mutateExact(self: *Inspector, token: DispatchToken, existing: ?Entry, units: u64, timer: *std.time.Timer) Error!void {
+    fn failure(self: *const Inspector, stage: OperationStage, cause: Error, progress: MutationProgress) FailureContext {
+        return .{
+            .backend = self.installation.transport,
+            .stage = stage,
+            .cause = cause,
+            .mutation = if (progress.requested) .outcome_uncertain else .not_started,
+        };
+    }
+
+    fn mutateExact(self: *Inspector, token: DispatchToken, existing: ?Entry, units: u64, timer: *std.time.Timer, progress: *MutationProgress) Error!void {
         var name_buf: [28]u8 = undefined;
         const name = self.installation.name(&name_buf);
         if (self.installation.transport == .nftables) {
-            try self.mutateNft(token, name, existing != null, units, timer);
+            try self.mutateNft(token, name, existing != null, units, timer, progress);
             try self.afterMutation(1);
             return;
         }
-        const scoped_address = legacyAddress(token.scope) catch return self.mutateFixedScoped(token, name, existing, timer);
+        const scoped_address = legacyAddress(token.scope) catch return self.mutateFixedScoped(token, name, existing, timer, progress);
         var address_buf: [64]u8 = undefined;
         const address = std.fmt.bufPrint(&address_buf, "{}", .{scoped_address}) catch return error.UnsupportedScope;
         var count: usize = 0;
@@ -411,18 +432,18 @@ pub const Inspector = struct {
             var set_buf: [31]u8 = undefined;
             const set = try setName(name, scoped_address == .ipv6, &set_buf);
             if (token.operation == .ensure_absent) {
-                try self.mutateCommand(&.{ self.ipset_path, "del", set, address }, timer, &count);
+                try self.mutateCommand(&.{ self.ipset_path, "del", set, address }, timer, &count, progress);
             } else {
                 var timeout_buf: [24]u8 = undefined;
                 const timeout = std.fmt.bufPrint(&timeout_buf, "{d}", .{units}) catch return error.UnsupportedDeadline;
-                try self.mutateCommand(&.{ self.ipset_path, "add", set, address, "timeout", timeout, "-exist" }, timer, &count);
+                try self.mutateCommand(&.{ self.ipset_path, "add", set, address, "timeout", timeout, "-exist" }, timer, &count, progress);
             }
         } else {
             const binary = if (scoped_address == .ipv4) self.iptables_path else self.ip6tables_path;
-            if (token.operation == .ensure_absent) try self.mutateCommand(&.{ binary, "-w", "1", "-D", name, "-s", address, "-j", "DROP" }, timer, &count) else try self.mutateCommand(&.{ binary, "-w", "1", "-I", name, "1", "-s", address, "-j", "DROP" }, timer, &count);
+            if (token.operation == .ensure_absent) try self.mutateCommand(&.{ binary, "-w", "1", "-D", name, "-s", address, "-j", "DROP" }, timer, &count, progress) else try self.mutateCommand(&.{ binary, "-w", "1", "-I", name, "1", "-s", address, "-j", "DROP" }, timer, &count, progress);
         }
     }
-    fn mutateFixedScoped(self: *Inspector, token: DispatchToken, name: []const u8, existing: ?Entry, timer: *std.time.Timer) Error!void {
+    fn mutateFixedScoped(self: *Inspector, token: DispatchToken, name: []const u8, existing: ?Entry, timer: *std.time.Timer, progress: *MutationProgress) Error!void {
         const binary = if (token.scope.subject.family == .v4) self.iptables_path else self.ip6tables_path;
         const part_count = nft.scopeRulePartCount(token.scope) catch return error.UnsupportedScope;
         var mutations: usize = 0;
@@ -434,7 +455,7 @@ pub const Inspector = struct {
                 var subject_buf: [64]u8 = undefined;
                 var port_buf: [16]u8 = undefined;
                 var comment_buf: [scoped_comment_bytes]u8 = undefined;
-                try self.mutateCommand(try buildFixedScopedArgv(&argv, &subject_buf, &port_buf, &comment_buf, binary, name, metadata, .insert), timer, &mutations);
+                try self.mutateCommand(try buildFixedScopedArgv(&argv, &subject_buf, &port_buf, &comment_buf, binary, name, metadata, .insert), timer, &mutations, progress);
             }
         }
         if (existing) |prior| {
@@ -445,16 +466,16 @@ pub const Inspector = struct {
                 var subject_buf: [64]u8 = undefined;
                 var port_buf: [16]u8 = undefined;
                 var comment_buf: [scoped_comment_bytes]u8 = undefined;
-                try self.mutateCommand(try buildFixedScopedArgv(&argv, &subject_buf, &port_buf, &comment_buf, binary, name, metadata, .delete), timer, &mutations);
+                try self.mutateCommand(try buildFixedScopedArgv(&argv, &subject_buf, &port_buf, &comment_buf, binary, name, metadata, .delete), timer, &mutations, progress);
             }
         }
         if (mutations == 0) return error.Changed;
     }
-    fn mutateNft(self: *Inspector, token: DispatchToken, name: []const u8, existed: bool, timeout_ms: u64, timer: *std.time.Timer) Error!void {
-        if (legacyAddress(token.scope)) |_| return self.mutateLegacyNft(token, name, existed, timeout_ms, timer) else |_| {}
-        return self.mutateScopedNft(token, name, existed, timer);
+    fn mutateNft(self: *Inspector, token: DispatchToken, name: []const u8, existed: bool, timeout_ms: u64, timer: *std.time.Timer, progress: *MutationProgress) Error!void {
+        if (legacyAddress(token.scope)) |_| return self.mutateLegacyNft(token, name, existed, timeout_ms, timer, progress) else |_| {}
+        return self.mutateScopedNft(token, name, existed, timer, progress);
     }
-    fn mutateLegacyNft(self: *Inspector, token: DispatchToken, name: []const u8, existed: bool, timeout_ms: u64, timer: *std.time.Timer) Error!void {
+    fn mutateLegacyNft(self: *Inspector, token: DispatchToken, name: []const u8, existed: bool, timeout_ms: u64, timer: *std.time.Timer, progress: *MutationProgress) Error!void {
         var sock = nl.NetlinkSocket.init(linux.NETLINK.NETFILTER) catch |err| return netlinkError(err);
         defer sock.close();
         var key_buf: [16]u8 = undefined;
@@ -491,11 +512,13 @@ pub const Inspector = struct {
         }
         related[count] = sock.nextSeq();
         const bytes = batch.commit(related[count], sock.port_id, nl.NFNL.SUBSYS_NFTABLES) catch |err| return netlinkError(err);
-        nl.sendKernel(&sock, bytes, @min(try self.remainingMs(timer), 2000)) catch |err| return netlinkError(err);
+        const send_timeout = @min(try self.remainingMs(timer), 2000);
+        progress.requested = true;
+        nl.sendKernel(&sock, bytes, send_timeout) catch |err| return netlinkError(err);
         nl.receiveAcknowledgments(&sock, related[1..count], related[0 .. count + 1], @min(try self.remainingMs(timer), 2000)) catch |err| return netlinkError(err);
     }
 
-    fn mutateScopedNft(self: *Inspector, token: DispatchToken, name: []const u8, existed: bool, timer: *std.time.Timer) Error!void {
+    fn mutateScopedNft(self: *Inspector, token: DispatchToken, name: []const u8, existed: bool, timer: *std.time.Timer, progress: *MutationProgress) Error!void {
         const part_count = nft.scopeRulePartCount(token.scope) catch |err| return scopeBuildError(err);
         if (part_count > nft.max_scope_rule_parts) return error.LimitExceeded;
         var sock = nl.NetlinkSocket.init(linux.NETLINK.NETFILTER) catch |err| return netlinkError(err);
@@ -557,7 +580,9 @@ pub const Inspector = struct {
         if (count == 1) return error.Changed;
         related[count] = sock.nextSeq();
         const bytes = batch.commit(related[count], sock.port_id, nl.NFNL.SUBSYS_NFTABLES) catch |err| return netlinkError(err);
-        nl.sendKernel(&sock, bytes, @min(try self.remainingMs(timer), 2000)) catch |err| return netlinkError(err);
+        const send_timeout = @min(try self.remainingMs(timer), 2000);
+        progress.requested = true;
+        nl.sendKernel(&sock, bytes, send_timeout) catch |err| return netlinkError(err);
         nl.receiveAcknowledgments(&sock, related[1..count], related[0 .. count + 1], @min(try self.remainingMs(timer), 2000)) catch |err| return netlinkError(err);
     }
 
@@ -566,37 +591,37 @@ pub const Inspector = struct {
             if (self.test_fault_after_mutations) |limit| if (count == limit) return error.Timeout;
         }
     }
-    fn mutateCommand(self: *Inspector, argv: []const []const u8, timer: *std.time.Timer, count: *usize) Error!void {
-        const result = try self.run(argv, timer);
+    fn mutateCommand(self: *Inspector, argv: []const []const u8, timer: *std.time.Timer, count: *usize, progress: *MutationProgress) Error!void {
+        const result = try self.runTracked(argv, timer, progress);
         defer result.deinit(self.allocator);
         if (result.stdout.len != 0) return error.UnknownState;
         count.* += 1;
         try self.afterMutation(count.*);
     }
-    fn createInstallation(self: *Inspector, timer: *std.time.Timer) Error!void {
+    fn createInstallation(self: *Inspector, timer: *std.time.Timer, progress: *MutationProgress) Error!void {
         var name_buf: [28]u8 = undefined;
         const name = self.installation.name(&name_buf);
         var marker_buf: [44]u8 = undefined;
         const marker = self.installation.marker(&marker_buf);
         if (self.installation.transport == .nftables) {
-            try self.createNft(name, marker, timer);
+            try self.createNft(name, marker, timer, progress);
             try self.afterMutation(1);
             return;
         }
         var mutations: usize = 0;
         for ([_][]const u8{ self.iptables_path, self.ip6tables_path }, 0..) |binary, index| {
-            try self.mutateCommand(&.{ binary, "-w", "1", "-N", name }, timer, &mutations);
-            try self.mutateCommand(&.{ binary, "-w", "1", "-A", name, "-m", "comment", "--comment", marker, "-j", "RETURN" }, timer, &mutations);
+            try self.mutateCommand(&.{ binary, "-w", "1", "-N", name }, timer, &mutations, progress);
+            try self.mutateCommand(&.{ binary, "-w", "1", "-A", name, "-m", "comment", "--comment", marker, "-j", "RETURN" }, timer, &mutations, progress);
             if (self.installation.transport == .ipset) {
                 var set_buf: [31]u8 = undefined;
                 const set = try setName(name, index == 1, &set_buf);
-                try self.mutateCommand(&.{ self.ipset_path, "create", set, "hash:ip", "family", if (index == 0) "inet" else "inet6", "timeout", "0", "maxelem", "65536" }, timer, &mutations);
-                try self.mutateCommand(&.{ binary, "-w", "1", "-I", name, "1", "-m", "set", "--match-set", set, "src", "-j", "DROP" }, timer, &mutations);
+                try self.mutateCommand(&.{ self.ipset_path, "create", set, "hash:ip", "family", if (index == 0) "inet" else "inet6", "timeout", "0", "maxelem", "65536" }, timer, &mutations, progress);
+                try self.mutateCommand(&.{ binary, "-w", "1", "-I", name, "1", "-m", "set", "--match-set", set, "src", "-j", "DROP" }, timer, &mutations, progress);
             }
-            try self.mutateCommand(&.{ binary, "-w", "1", "-I", "INPUT", "1", "-m", "comment", "--comment", marker, "-j", name }, timer, &mutations);
+            try self.mutateCommand(&.{ binary, "-w", "1", "-I", "INPUT", "1", "-m", "comment", "--comment", marker, "-j", name }, timer, &mutations, progress);
         }
     }
-    fn createNft(self: *Inspector, name: []const u8, marker: []const u8, timer: *std.time.Timer) Error!void {
+    fn createNft(self: *Inspector, name: []const u8, marker: []const u8, timer: *std.time.Timer, progress: *MutationProgress) Error!void {
         var sock = nl.NetlinkSocket.init(linux.NETLINK.NETFILTER) catch |err| return netlinkError(err);
         defer sock.close();
         var payloads: [6][1024]u8 align(4) = undefined;
@@ -620,7 +645,9 @@ pub const Inspector = struct {
         }
         related[7] = sock.nextSeq();
         const bytes = batch.commit(related[7], sock.port_id, nl.NFNL.SUBSYS_NFTABLES) catch |err| return netlinkError(err);
-        nl.sendKernel(&sock, bytes, @min(try self.remainingMs(timer), 2000)) catch |err| return netlinkError(err);
+        const send_timeout = @min(try self.remainingMs(timer), 2000);
+        progress.requested = true;
+        nl.sendKernel(&sock, bytes, send_timeout) catch |err| return netlinkError(err);
         nl.receiveAcknowledgments(&sock, related[1..7], &related, @min(try self.remainingMs(timer), 2000)) catch |err| return netlinkError(err);
     }
 
@@ -671,12 +698,16 @@ pub const Inspector = struct {
         self.work_messages += count;
     }
     fn run(self: *Inspector, argv: []const []const u8, timer: *std.time.Timer) Error!command.Result {
+        return self.runTracked(argv, timer, null);
+    }
+    fn runTracked(self: *Inspector, argv: []const []const u8, timer: *std.time.Timer, progress: ?*MutationProgress) Error!command.Result {
         try self.checkTime(timer);
         std.fs.accessAbsolute(argv[0], .{}) catch return error.ToolUnavailable;
         const remaining = try self.remainingMs(timer);
         const reserved = self.retained_bytes + self.live_bytes;
         if (reserved >= self.limits.max_bytes) return error.LimitExceeded;
         const allowance = (self.limits.max_bytes - reserved) / 4;
+        if (progress) |value| value.requested = true;
         const result = command.runBounded(self.allocator, argv, @min(remaining, 2000), @min(allowance, 1024 * 1024), @min(allowance, 4096)) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.PermissionDenied => error.PermissionDenied,

@@ -129,10 +129,16 @@ require uid 0 or the daemon uid, verified with
 Daemon summary: version, protection state
 .RB ( active ", " log-only ", " mixed " or " "DEGRADED (cause)" ),
 backend, active and total bans, storage phase, generation and worker/clock flags.
+Diagnostic rows show known storage, source and firewall causes. A missing cause is
+reported as unknown; it does not establish healthy protection. The recovery retry
+deadline is in absolute monotonic milliseconds, not a remaining delay.
+Plain output adds named diagnostic keys; JSON fields are additive and optional.
 .TP
 .B jails
 One row per configured jail: enabled, paused, health, active bans, thresholds,
-effective action, whether it enforces, and its source.
+effective action, whether it enforces, and its source. Table output includes the
+source failure cause and captured journalctl exit/signal metadata. Raw child stderr
+is not displayed. Plain output retains its 11-column layout.
 .TP
 .BI list " [--jail name]"
 Active bans, optionally for one jail.

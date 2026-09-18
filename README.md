@@ -354,7 +354,7 @@ memory_ceiling_mb  = 64
 metrics_enabled    = true         # false: no HTTP/WebSocket listener; IPC and the client still work
 metrics_bind       = "127.0.0.1"
 metrics_port       = 9100
-firewall           = "auto"       # probes nftables, ipset, iptables; naming one probes only it
+firewall           = "auto"       # probes on first use; retains the saved backend afterward
 
 [defaults]
 bantime    = "10m"    # integer seconds remain accepted
@@ -485,6 +485,29 @@ through the 0660 socket; mutations require uid 0 or the daemon uid.
 Exit classes (every command): `0` success · `1` rejected or absent · `2` usage ·
 `3` daemon unavailable · `4` partial (kernel confirmation incomplete) · `5` uncertain.
 
+The development build adds diagnostic detail to `status` and `jails` (these additions
+are not in v0.4.0). If protection is degraded, check the storage, source and firewall
+rows: more than one subsystem can need attention. `fail2zig jails` identifies the
+source cause and, when captured, journalctl exit/signal details. A missing detail
+means it was not captured; it does not mean the operation succeeded. Raw child stderr
+and journal records are not printed.
+
+For scripts, JSON preserves the existing fields and adds optional diagnostic fields.
+Plain `status` adds named keys; plain `jails` retains its 11-column layout. Recovery
+`next_retry_ms` is an absolute monotonic deadline, not a delay in milliseconds.
+Firewall `effect_mutation=not_started` describes the failing operation only;
+`outcome_uncertain` means a mutation may have been attempted. Neither proves whether
+an earlier rule is installed. Allow verified reconciliation before treating protection
+as restored or repeating an uncertain administrative request.
+An `intervention` state does not automatically resume when a dependency becomes
+available again. Investigate and correct the reported cause, retain the existing
+state, then restart and verify readiness and installed protection.
+
+State-opening errors identify the operation, failing stage and any captured POSIX
+cause or SQLite code. Check the named path and the daemon's service permissions for
+access failures. For identity, corruption or schema failures, preserve the database
+and sidecars and investigate the mismatch; deleting state is not a recovery step.
+
 ### Offline — `fail2zig rule-test` and `fail2zig migrate`
 
 ```bash
@@ -520,12 +543,23 @@ first-byte early-exit probes. The parser is verified zero-alloc via
 | ipset | argv subprocess (`engine/firewall/ipset.zig`) | High-cardinality ban lists |
 
 `[global] firewall` selects the backend. `"auto"` (the default) probes
-nftables, then ipset, then iptables, and uses the first that is usable.
+nftables, then ipset, then iptables, and uses the first that is usable when
+no installation is recorded in the state database. With an existing installation,
+`"auto"` reuses its recorded backend, including after restarts or reboots and when
+there are no active bans. It does not switch backends if the recorded one becomes
+unavailable.
 `"nftables"`, `"ipset"`, or `"iptables"` probes only that backend. If it is
 unusable, `on_no_backend` decides: `"fail-closed"` (the default) exits with
 the cause logged; `"log-only"` runs DEGRADED, shown as
 `Protection: DEGRADED (<cause>)` by `fail2zig status` and in
 `/api/status`. There is no fallback to another backend.
+
+An explicit backend that conflicts with the saved installation is rejected before
+probing; the same `on_no_backend` policy applies. Restore the recorded backend or
+`"auto"` with the existing database. Changing `firewall` does not migrate ownership;
+do not delete the database to switch backends. A changed `firewall_namespace`
+selector also conflicts with saved state, even if it names the same namespace;
+restore the previous setting.
 
 `banaction` does not select a backend. Its values `nftables`, `iptables`,
 and `ipset` are accepted for fail2ban compatibility and all mean enforce

@@ -64,6 +64,12 @@ pub const Options = struct {
     clock: ?*const fn (?*anyopaque) anyerror!time.Timestamp = null,
     executor: transport.Executor = .{},
 };
+pub const FailureDiagnostic = struct {
+    cause: anyerror,
+    exit_code: ?u8,
+    signal: ?u32,
+    stderr_present: bool,
+};
 pub const RecoverySnapshot = struct {
     allocator: std.mem.Allocator,
     generation: [32]u8,
@@ -74,6 +80,7 @@ pub const RecoverySnapshot = struct {
     source_repair: repair.Repair,
     source_health: records.Health,
     last_error: ?anyerror,
+    failure_diagnostic: ?FailureDiagnostic,
     notices: std.time.Timer,
     expected_durable: bool,
     initial_proposal: ?Position,
@@ -110,6 +117,8 @@ pub const Session = struct {
     parse_scratch: []u8,
     output: []u8,
     diagnostic: transport.Diagnostic = .{},
+    query_failure: ?FailureDiagnostic = null,
+    failure_diagnostic: ?FailureDiagnostic = null,
     source_health: records.Health = .waiting,
     last_error: ?anyerror = null,
     notices: std.time.Timer,
@@ -180,6 +189,8 @@ pub const Session = struct {
         self.position = .{ .generation = self.processor.generation, .start_us = now.us };
         self.baseline_committed = false;
         self.diagnostic = .{};
+        self.query_failure = null;
+        self.failure_diagnostic = null;
         self.source_health = .waiting;
         self.last_error = null;
         self.notices = try std.time.Timer.start();
@@ -236,7 +247,7 @@ pub const Session = struct {
         errdefer a.free(source);
         const pending = if (self.pending_proof) |saved| try @import("native_file_session.zig").clonePending(a, saved) else null;
         const expected_durable = self.baseline_committed or self.expected_durable;
-        out.* = .{ .allocator = a, .generation = self.processor.generation, .jail = jail, .source = source, .pending_proof = pending, .candidate_receipt = self.pipe.candidate_receipt, .source_repair = self.source_repair, .source_health = self.source_health, .last_error = self.last_error, .notices = self.notices, .expected_durable = expected_durable, .initial_proposal = self.recoveryProposal(), .initial_tail_attempted = self.initial_tail_attempted };
+        out.* = .{ .allocator = a, .generation = self.processor.generation, .jail = jail, .source = source, .pending_proof = pending, .candidate_receipt = self.pipe.candidate_receipt, .source_repair = self.source_repair, .source_health = self.source_health, .last_error = self.last_error, .failure_diagnostic = self.failure_diagnostic, .notices = self.notices, .expected_durable = expected_durable, .initial_proposal = self.recoveryProposal(), .initial_tail_attempted = self.initial_tail_attempted };
         return out;
     }
     fn recoveryProposal(self: *const Session) ?Position {
@@ -252,6 +263,7 @@ pub const Session = struct {
         self.source_repair = snapshot.source_repair;
         self.source_health = snapshot.source_health;
         self.last_error = snapshot.last_error;
+        self.failure_diagnostic = snapshot.failure_diagnostic;
         self.notices = snapshot.notices;
         self.expected_durable = snapshot.expected_durable;
         self.initial_proposal = snapshot.initial_proposal;
@@ -266,6 +278,7 @@ pub const Session = struct {
         self.source_repair = old.source_repair;
         self.source_health = old.source_health;
         self.last_error = old.last_error;
+        self.failure_diagnostic = old.failure_diagnostic;
         self.notices = old.notices;
         self.expected_durable = old.baseline_committed or old.expected_durable;
         self.initial_proposal = old.recoveryProposal();
@@ -279,6 +292,15 @@ pub const Session = struct {
         }
     }
     pub fn verifyRecoverySources(self: *Session) !void {
+        self.query_failure = null;
+        self.verifyRecoverySourcesInner() catch |failure| {
+            self.captureFailure(failure, failure);
+            return failure;
+        };
+        self.query_failure = null;
+        if (self.source_repair.state.phase == .healthy) self.failure_diagnostic = null;
+    }
+    fn verifyRecoverySourcesInner(self: *Session) !void {
         if (self.pipe.gate) |gate| {
             const status = gate.snapshot();
             if (status.phase != .recovering or status.recovery_step != .sources) return error.RecoveryOutOfOrder;
@@ -296,6 +318,9 @@ pub const Session = struct {
     pub fn repairSnapshot(self: *const Session) repair.Snapshot {
         return self.source_repair.snapshot();
     }
+    pub fn failureDiagnostic(self: *const Session) ?FailureDiagnostic {
+        return self.failure_diagnostic;
+    }
     fn storageFailure(self: *Session, cause: anyerror) anyerror {
         self.last_failure_domain = .storage;
         self.pipe.ready = false;
@@ -303,6 +328,7 @@ pub const Session = struct {
         return cause;
     }
     fn sourceFailure(self: *Session, cause: anyerror) anyerror {
+        self.captureFailure(cause, cause);
         self.last_error = cause;
         self.source_health = switch (cause) {
             error.ResumeLost, error.PendingRecordMismatch, error.PendingRecordUnavailable => .resume_lost,
@@ -311,13 +337,32 @@ pub const Session = struct {
             error.JournalChildFailed, error.JournalTimeout => .child_failed,
             else => .read_failed,
         };
-        const domain = self.source_repair.failed(cause, self.nowMs()) catch |failure| return failure;
+        const domain = self.source_repair.failed(cause, self.nowMs()) catch |failure| {
+            self.captureFailure(failure, null);
+            return failure;
+        };
         self.last_failure_domain = domain;
         return switch (domain) {
             .pending, .transient_source => error.SourceRepairPending,
             .source_intervention => error.SourceInterventionRequired,
             .storage => self.storageFailure(cause),
         };
+    }
+    fn captureFailure(self: *Session, cause: anyerror, query_cause: ?anyerror) void {
+        var captured = FailureDiagnostic{ .cause = cause, .exit_code = null, .signal = null, .stderr_present = false };
+        if (query_cause) |expected| if (self.query_failure) |attempt| {
+            if (attempt.cause == expected) {
+                captured.exit_code = attempt.exit_code;
+                captured.signal = attempt.signal;
+                captured.stderr_present = attempt.stderr_present;
+            }
+        };
+        self.query_failure = null;
+        self.failure_diagnostic = captured;
+    }
+    fn journalExecutableUnavailable(self: *Session, cause: anyerror) anyerror {
+        self.captureFailure(error.JournalExecutableUnavailable, cause);
+        return error.JournalExecutableUnavailable;
     }
     fn sourceBinding(self: *Session, pending: anytype) !repair.Binding {
         var binding = try repair.Binding.init(self.processor.generation, self.options.source_id);
@@ -375,7 +420,7 @@ pub const Session = struct {
         const binding = self.bindPending(pending) catch |err| return if (self.last_failure_domain == .storage) err else self.sourceFailure(err);
         if (token != null) token = try self.source_repair.begin(self.nowMs(), true);
         var lines = self.fetch(1) catch |err| return switch (err) {
-            error.FileNotFound, error.AccessDenied => error.JournalExecutableUnavailable,
+            error.FileNotFound, error.AccessDenied => self.journalExecutableUnavailable(err),
             else => self.sourceFailure(err),
         };
         if (pending) |saved| {
@@ -489,6 +534,7 @@ pub const Session = struct {
         if (had_baseline and self.source_repair.state.phase == .polling) try self.source_repair.pollSucceeded((try self.source_repair.begin(self.nowMs(), true)).?);
         self.last_error = null;
         self.source_health = .healthy;
+        if (self.source_repair.state.phase == .healthy) self.failure_diagnostic = null;
         return count;
     }
 
@@ -513,11 +559,17 @@ pub const Session = struct {
         }
     };
     fn query(self: *Session, q: transport.Query, count: usize) !Lines {
+        // Reset both the raw buffer and its attempt provenance before argv can
+        // allocate or fail. Only an executor error below may repopulate it.
+        self.diagnostic = .{};
+        self.query_failure = null;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const args = try transport.argv(arena.allocator(), self.options.journal, q, count);
-        self.diagnostic = .{};
-        const result = try self.options.executor.run(self.allocator, args, self.output, &self.diagnostic, self.options.journal.timeout_ms, self.options.executor.context);
+        const result = self.options.executor.run(self.allocator, args, self.output, &self.diagnostic, self.options.journal.timeout_ms, self.options.executor.context) catch |failure| {
+            self.query_failure = .{ .cause = failure, .exit_code = self.diagnostic.exit_code, .signal = self.diagnostic.signal, .stderr_present = self.diagnostic.stderr_len != 0 };
+            return failure;
+        };
         if (result.len > self.output.len) return error.JournalOutputLimit;
         if (result.len > 0 and result[result.len - 1] != '\n') return error.IncompleteJournalRecord;
         var framed = Lines{ .bytes = result, .remaining = count };
@@ -556,8 +608,10 @@ pub const Session = struct {
     }
     pub fn poll(self: *Session, budget: usize) !usize {
         defer self.reportNotices();
+        self.query_failure = null;
         var committing = false;
         const count = self.pollAdmitted(budget, &committing) catch |err| {
+            self.captureFailure(err, err);
             self.last_error = err;
             self.source_health = switch (err) {
                 error.ResumeLost, error.PendingRecordMismatch, error.PendingRecordUnavailable => .resume_lost,
@@ -572,8 +626,10 @@ pub const Session = struct {
             };
             return err;
         };
+        self.query_failure = null;
         self.last_error = null;
         self.source_health = .healthy;
+        if (self.source_repair.state.phase == .healthy) self.failure_diagnostic = null;
         return count;
     }
     fn monotonic(context: ?*anyopaque) u64 {

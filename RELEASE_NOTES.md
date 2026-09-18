@@ -22,6 +22,16 @@ filter = "sshd"
   selection behavior. An explicitly empty journal profile remains invalid.
 - The configuration manual clarifies that `pid_file` is deprecated and ignored.
   Use `systemctl show fail2zig.service --property=MainPID --value` for the service PID.
+- Firewall startup diagnostics distinguish a saved backend or namespace selector conflict
+  from an unavailable backend and explain how to restore the matching configuration.
+  The manual explains that `auto` reuses the backend recorded in an existing state database.
+- Status and jail output expose storage, source, recovery and firewall failure details.
+  Journal diagnostics retain captured child exit/signal information without printing raw stderr.
+- Configuration errors identify the setting and constraint. State-open errors retain the
+  failing stage and available POSIX or SQLite cause. Firewall diagnostics identify the
+  backend, operation and whether mutation may have been attempted.
+- Memory-percentage formatting handles the full unsigned 64-bit input range without
+  overflowing. Normal display formatting is unchanged.
 
 ## Upgrade notes
 
@@ -44,6 +54,14 @@ retry/decision expiry preservation across restart on Debian 13 with an observed
 A populated v0.4.0 explicit-profile database also reopened with unchanged retry state and
 expiry. Genuine `sshd-auth` emission was not observed; synthetic tagged input tested its
 selection and rejection separately.
+
+Diagnostic checks covered configuration/reload refusal, storage pause/recovery, journal
+child failure/recovery and firewall readback failures. Isolated nftables and iptables
+tests exercised kernel readback, IPv4/IPv6 packets, expiry and retained ownership.
+The formatter regression reproduced the old overflow and passed after repair.
+The startup report in [issue #61](https://github.com/ul0gic/fail2zig/issues/61) remains
+open pending the reporter's environment and reproduction details; this release does
+not claim to resolve that report.
 
 These checks do not establish new Ubuntu firewall support, socket-activation lifecycle
 coverage or real-hardware support for additional architectures. The existing IPv4-loopback

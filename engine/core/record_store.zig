@@ -49,6 +49,85 @@ const embedded_api: Api = blk: {
 };
 pub const Error = application_history.Error || action_outcome.Error || retry.Error || consumers.Error || effects.Error || effect_history.Error || action_context.Error || error{ MaintenancePinned, StaleMaintenance, PrunedReplay, InvalidMaintenanceState, MaintenanceStorageRequired, ConsumerManifestRequired, ConsumerManifestMismatch, ConsumerManifestMissing, ConsumerManifestExists, ConsumerMigrationRequired, MissingRequiredConsumer, AmbiguousNativeDetection, AmbiguousRetryDecision, ConsumerStorageRequired, StaleConsumerCheckpoint, OpenFailed, UnsafePermissions, ForeignDatabase, UnsupportedSchema, DatabaseFailure, Busy, StorageFull, ReadOnly, StorageIo, CorruptDatabase, StorageLimit, Interrupted, AccessDenied, ReopenRequired, InvalidRecord, OccurrenceConflict, StaleCheckpoint, StaleSharedCheckpoint, InjectedFailure, OutOfMemory, ReceiptStorageRequired, InferenceStorageRequired, DetectionStorageRequired, ReceiptConflict, ReceiptRequired, ReceiptAlreadyCommitted, ReceiptLimit, RetryStorageRequired, RetryAdmissionRequired, RetryGenerationMismatch, RetryMigrationRequired, RetryCapacity, ReceiptClockReversed, HistoryResetStorageRequired, InvalidHistoryReset, StaleHistoryReset, AdminStorageRequired, MigrationStorageRequired, StaleAdminRevision, InvalidAdminRequest, AdminRequestCapacity, RetryPolicyInFlight, StalePolicyTransition, ConfigGenerationExists, ConfigGenerationMissing, MigrationRunExists, MigrationRunMissing, MigrationStepMissing, MigrationStepOpen, MigrationStepOrder, InvalidMigrationRow, InvalidMigrationState, MigrationJailUnknown };
 
+pub const OpenStage = enum {
+    path_validation,
+    parent_open,
+    parent_stat,
+    parent_permissions,
+    file_stat,
+    file_create,
+    created_file_stat,
+    file_type,
+    file_permissions,
+    path_copy,
+    sqlite_open,
+    connection_setup,
+    file_identity_recheck,
+    file_identity_changed,
+    sqlite_file_identity,
+    sqlite_limits,
+    schema_inspection,
+    schema_validation,
+    runtime_setup,
+    schema_setup,
+    installation_read,
+};
+
+pub const OpenPosixCause = enum {
+    access_denied,
+    file_not_found,
+    not_directory,
+    symbolic_link_loop,
+    name_too_long,
+    path_already_exists,
+    no_space_left,
+    process_file_descriptor_limit,
+    system_file_descriptor_limit,
+    no_device,
+    system_resources,
+    file_too_big,
+    is_directory,
+    device_busy,
+    invalid_path,
+    unexpected,
+};
+
+pub const OpenDiagnostic = struct {
+    stage: ?OpenStage = null,
+    public_error: ?Error = null,
+    posix_cause: ?OpenPosixCause = null,
+    sqlite_code: ?c_int = null,
+};
+
+fn openPosixCause(failure: anyerror) OpenPosixCause {
+    if (failure == error.AccessDenied) return .access_denied;
+    if (failure == error.FileNotFound) return .file_not_found;
+    if (failure == error.NotDir) return .not_directory;
+    if (failure == error.SymLinkLoop) return .symbolic_link_loop;
+    if (failure == error.NameTooLong) return .name_too_long;
+    if (failure == error.PathAlreadyExists) return .path_already_exists;
+    if (failure == error.NoSpaceLeft) return .no_space_left;
+    if (failure == error.ProcessFdQuotaExceeded) return .process_file_descriptor_limit;
+    if (failure == error.SystemFdQuotaExceeded) return .system_file_descriptor_limit;
+    if (failure == error.NoDevice) return .no_device;
+    if (failure == error.SystemResources) return .system_resources;
+    if (failure == error.FileTooBig) return .file_too_big;
+    if (failure == error.IsDir) return .is_directory;
+    if (failure == error.DeviceBusy or failure == error.FileBusy) return .device_busy;
+    if (failure == error.BadPathName) return .invalid_path;
+    return .unexpected;
+}
+
+fn openFailure(diagnostic: *OpenDiagnostic, stage: OpenStage, failure: Error, posix_cause: ?OpenPosixCause, sqlite_code: ?c_int) Error {
+    diagnostic.* = .{
+        .stage = stage,
+        .public_error = failure,
+        .posix_cause = posix_cause,
+        .sqlite_code = sqlite_code,
+    };
+    return failure;
+}
+
 fn sqliteError(rc: c_int) Error {
     return switch (rc & 0xff) {
         3, 23 => error.AccessDenied,
@@ -250,14 +329,27 @@ pub const Store = struct {
     }
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) Error!Store {
-        return openImpl(allocator, path, .plain);
+        var ignored = OpenDiagnostic{};
+        return openImpl(allocator, path, .plain, &ignored, .{});
+    }
+
+    pub fn openDetailed(allocator: std.mem.Allocator, path: []const u8, diagnostic: *OpenDiagnostic) Error!Store {
+        return openImpl(allocator, path, .plain, diagnostic, .{});
     }
 
     pub fn openRuntime(allocator: std.mem.Allocator, path: []const u8) Error!Store {
-        return openImpl(allocator, path, .runtime);
+        var ignored = OpenDiagnostic{};
+        return openImpl(allocator, path, .runtime, &ignored, .{});
+    }
+    pub fn openRuntimeDetailed(allocator: std.mem.Allocator, path: []const u8, diagnostic: *OpenDiagnostic) Error!Store {
+        return openImpl(allocator, path, .runtime, diagnostic, .{});
     }
     pub fn openReadOnly(allocator: std.mem.Allocator, path: []const u8) Error!Store {
-        return openImpl(allocator, path, .readonly);
+        var ignored = OpenDiagnostic{};
+        return openImpl(allocator, path, .readonly, &ignored, .{});
+    }
+    pub fn openReadOnlyDetailed(allocator: std.mem.Allocator, path: []const u8, diagnostic: *OpenDiagnostic) Error!Store {
+        return openImpl(allocator, path, .readonly, diagnostic, .{});
     }
 
     pub const InstallationSnapshot = struct {
@@ -266,53 +358,89 @@ pub const Store = struct {
     };
 
     pub fn installationSnapshot(allocator: std.mem.Allocator, path: []const u8) Error!InstallationSnapshot {
-        var store = try openImpl(allocator, path, .preflight);
+        var ignored = OpenDiagnostic{};
+        return installationSnapshotDetailed(allocator, path, &ignored);
+    }
+
+    pub fn installationSnapshotDetailed(allocator: std.mem.Allocator, path: []const u8, diagnostic: *OpenDiagnostic) Error!InstallationSnapshot {
+        var store = try openImpl(allocator, path, .preflight, diagnostic, .{});
         defer store.close();
+        store.last_error_code = null;
+        const installation = if (store.schema_version >= 11)
+            store.readInstallation() catch |failure| return openFailure(diagnostic, .installation_read, failure, null, store.last_error_code)
+        else
+            null;
         return .{
             .schema_version = store.schema_version,
-            .installation = if (store.schema_version >= 11) try store.readInstallation() else null,
+            .installation = installation,
         };
     }
 
     const OpenMode = enum { plain, runtime, readonly, preflight };
-    fn openImpl(allocator: std.mem.Allocator, path: []const u8, open_mode: OpenMode) Error!Store {
+    const OpenHooks = struct {
+        context: ?*anyopaque = null,
+        before_identity_recheck: ?*const fn (?*anyopaque) void = null,
+    };
+    fn openImpl(allocator: std.mem.Allocator, path: []const u8, open_mode: OpenMode, diagnostic: *OpenDiagnostic, hooks: OpenHooks) Error!Store {
+        diagnostic.* = .{};
         const runtime = open_mode == .runtime;
-        if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return error.OpenFailed;
-        var parent = std.fs.cwd().openDir(std.fs.path.dirname(path) orelse ".", .{ .no_follow = true }) catch return error.OpenFailed;
+        if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null)
+            return openFailure(diagnostic, .path_validation, error.OpenFailed, null, null);
+        var parent = std.fs.cwd().openDir(std.fs.path.dirname(path) orelse ".", .{ .no_follow = true }) catch |failure|
+            return openFailure(diagnostic, .parent_open, error.OpenFailed, openPosixCause(failure), null);
         defer parent.close();
-        const parent_stat = std.posix.fstat(parent.fd) catch return error.OpenFailed;
-        if (parent_stat.uid != std.os.linux.geteuid() or parent_stat.mode & 0o022 != 0) return error.UnsafePermissions;
+        const parent_stat = std.posix.fstat(parent.fd) catch |failure|
+            return openFailure(diagnostic, .parent_stat, error.OpenFailed, openPosixCause(failure), null);
+        if (parent_stat.uid != std.os.linux.geteuid() or parent_stat.mode & 0o022 != 0)
+            return openFailure(diagnostic, .parent_permissions, error.UnsafePermissions, null, null);
         const stat = std.posix.fstatat(std.posix.AT.FDCWD, path, std.posix.AT.SYMLINK_NOFOLLOW) catch |failure| blk: {
-            if (failure != error.FileNotFound or open_mode == .readonly or open_mode == .preflight) return error.OpenFailed;
-            const created = std.posix.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, 0o600) catch return error.OpenFailed;
+            if (failure != error.FileNotFound or open_mode == .readonly or open_mode == .preflight)
+                return openFailure(diagnostic, .file_stat, error.OpenFailed, openPosixCause(failure), null);
+            const created = std.posix.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, 0o600) catch |create_failure|
+                return openFailure(diagnostic, .file_create, error.OpenFailed, openPosixCause(create_failure), null);
             defer std.posix.close(created);
-            break :blk std.posix.fstat(created) catch return error.OpenFailed;
+            break :blk std.posix.fstat(created) catch |stat_failure|
+                return openFailure(diagnostic, .created_file_stat, error.OpenFailed, openPosixCause(stat_failure), null);
         };
-        if (!std.posix.S.ISREG(stat.mode) or stat.mode & 0o077 != 0 or stat.uid != std.os.linux.geteuid())
-            return error.UnsafePermissions;
+        if (!std.posix.S.ISREG(stat.mode))
+            return openFailure(diagnostic, .file_type, error.UnsafePermissions, null, null);
+        if (stat.mode & 0o077 != 0 or stat.uid != std.os.linux.geteuid())
+            return openFailure(diagnostic, .file_permissions, error.UnsafePermissions, null, null);
         const api = embedded_api;
-        const filename = allocator.dupeZ(u8, path) catch return error.OutOfMemory;
+        const filename = allocator.dupeZ(u8, path) catch
+            return openFailure(diagnostic, .path_copy, error.OutOfMemory, null, null);
         defer allocator.free(filename);
         var db: ?*Db = null;
         const access_flags: c_int = if (open_mode == .readonly or open_mode == .preflight) 1 else 2;
         const opened = api.open(filename, &db, access_flags | 0x10000 | 0x01000000, null);
         if (opened != 0 or db == null) {
             if (db) |handle| _ = api.close(handle);
-            return if (opened != 0) sqliteError(opened) else error.OpenFailed;
+            const failure = if (opened != 0) sqliteError(opened) else error.OpenFailed;
+            return openFailure(diagnostic, .sqlite_open, failure, null, if (opened != 0) opened else null);
         }
         var self = Store{ .allocator = allocator, .api = api, .db = db.? };
         errdefer _ = self.api.close(self.db);
         const db_config = @extern(*const fn (*Db, c_int, ...) callconv(.c) c_int, .{ .name = "sqlite3_db_config" });
-        try self.check(db_config(self.db, 1006, @as(c_int, 1), @as(?*c_int, null)));
-        const selected = std.posix.fstatat(std.posix.AT.FDCWD, path, std.posix.AT.SYMLINK_NOFOLLOW) catch return error.OpenFailed;
-        if (selected.dev != stat.dev or selected.ino != stat.ino or selected.uid != stat.uid or selected.mode != stat.mode) return error.OpenFailed;
+        self.last_error_code = null;
+        self.check(db_config(self.db, 1006, @as(c_int, 1), @as(?*c_int, null))) catch |failure|
+            return openFailure(diagnostic, .connection_setup, failure, null, self.last_error_code);
+        if (builtin.is_test) if (hooks.before_identity_recheck) |hook| hook(hooks.context);
+        const selected = std.posix.fstatat(std.posix.AT.FDCWD, path, std.posix.AT.SYMLINK_NOFOLLOW) catch |failure|
+            return openFailure(diagnostic, .file_identity_recheck, error.OpenFailed, openPosixCause(failure), null);
+        if (selected.dev != stat.dev or selected.ino != stat.ino or selected.uid != stat.uid or selected.mode != stat.mode)
+            return openFailure(diagnostic, .file_identity_changed, error.OpenFailed, null, null);
         const file_control = @extern(*const fn (*Db, ?[*:0]const u8, c_int, ?*anyopaque) callconv(.c) c_int, .{ .name = "sqlite3_file_control" });
         var moved: c_int = 1;
-        try self.check(file_control(self.db, "main", 20, &moved));
-        if (moved != 0) return error.OpenFailed;
+        self.last_error_code = null;
+        self.check(file_control(self.db, "main", 20, &moved)) catch |failure|
+            return openFailure(diagnostic, .sqlite_file_identity, failure, null, self.last_error_code);
+        if (moved != 0) return openFailure(diagnostic, .sqlite_file_identity, error.OpenFailed, null, null);
         _ = api.limit(self.db, 0, Limits.sqlite_row_bytes);
-        if (api.limit(self.db, 0, -1) != Limits.sqlite_row_bytes) return error.StorageLimit;
-        try self.check(api.busy_timeout(self.db, 1000));
+        if (api.limit(self.db, 0, -1) != Limits.sqlite_row_bytes)
+            return openFailure(diagnostic, .sqlite_limits, error.StorageLimit, null, null);
+        self.last_error_code = null;
+        self.check(api.busy_timeout(self.db, 1000)) catch |failure|
+            return openFailure(diagnostic, .sqlite_limits, failure, null, self.last_error_code);
         const progress = @extern(*const fn (*Db, c_int, ?*const fn (?*anyopaque) callconv(.c) c_int, ?*anyopaque) callconv(.c) void, .{ .name = "sqlite3_progress_handler" });
         defer if (runtime) progress(self.db, 0, null, null);
         if (runtime) {
@@ -321,31 +449,60 @@ pub const Store = struct {
             self.runtime_limits = true;
             progress(self.db, 1000, workProgress, &self);
         }
-        try self.exec("PRAGMA trusted_schema=OFF;");
-        const application = try self.integer("PRAGMA application_id;");
-        const schema = try self.integer("PRAGMA user_version;");
+        self.last_error_code = null;
+        self.exec("PRAGMA trusted_schema=OFF;") catch |failure|
+            return openFailure(diagnostic, .schema_inspection, failure, null, self.last_error_code);
+        const application = self.integer("PRAGMA application_id;") catch |failure|
+            return openFailure(diagnostic, .schema_inspection, failure, null, self.last_error_code);
+        const schema = self.integer("PRAGMA user_version;") catch |failure|
+            return openFailure(diagnostic, .schema_inspection, failure, null, self.last_error_code);
         if (application == 0) {
-            if (schema != 0 or try self.integer("SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%';") != 0) return error.ForeignDatabase;
-        } else if (application != 0x46325a31) return error.ForeignDatabase;
-        if (schema < 0 or schema > latest_schema) return error.UnsupportedSchema;
+            if (schema != 0)
+                return openFailure(diagnostic, .schema_validation, error.ForeignDatabase, null, null);
+            const objects = self.integer("SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%';") catch |failure|
+                return openFailure(diagnostic, .schema_inspection, failure, null, self.last_error_code);
+            if (objects != 0) return openFailure(diagnostic, .schema_validation, error.ForeignDatabase, null, null);
+        } else if (application != 0x46325a31) return openFailure(diagnostic, .schema_validation, error.ForeignDatabase, null, null);
+        if (schema < 0 or schema > latest_schema)
+            return openFailure(diagnostic, .schema_validation, error.UnsupportedSchema, null, null);
         self.schema_version = if (open_mode == .preflight) schema else @max(schema, 2);
         if (open_mode == .readonly or open_mode == .preflight) {
-            if (application == 0 and open_mode == .readonly) return error.ForeignDatabase;
-            try self.exec("PRAGMA foreign_keys=ON;");
+            if (application == 0 and open_mode == .readonly)
+                return openFailure(diagnostic, .schema_validation, error.ForeignDatabase, null, null);
+            self.last_error_code = null;
+            self.exec("PRAGMA foreign_keys=ON;") catch |failure|
+                return openFailure(diagnostic, .schema_setup, failure, null, self.last_error_code);
+            diagnostic.* = .{};
             return self;
         }
         if (runtime) {
-            try self.configureRuntimeLimits();
-            try self.maintainWal(path);
+            self.last_error_code = null;
+            self.configureRuntimeLimits() catch |failure|
+                return openFailure(diagnostic, .runtime_setup, failure, null, self.last_error_code);
+            self.last_error_code = null;
+            self.maintainWal(path) catch |failure|
+                return openFailure(diagnostic, .runtime_setup, failure, null, self.last_error_code);
         }
-        try self.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;");
+        self.last_error_code = null;
+        self.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;") catch |failure|
+            return openFailure(diagnostic, .schema_setup, failure, null, self.last_error_code);
         {
-            var mode = try self.statement("PRAGMA journal_mode;");
+            var mode = self.statement("PRAGMA journal_mode;") catch |failure|
+                return openFailure(diagnostic, .schema_setup, failure, null, self.last_error_code);
             defer mode.deinit();
-            if (!try mode.row() or !std.mem.eql(u8, try mode.bytes(0), "wal") or try self.integer("PRAGMA synchronous;") != 2)
-                return error.DatabaseFailure;
+            const has_mode = mode.row() catch |failure|
+                return openFailure(diagnostic, .schema_setup, failure, null, self.last_error_code);
+            if (!has_mode) return openFailure(diagnostic, .schema_setup, error.DatabaseFailure, null, null);
+            const mode_name = mode.bytes(0) catch |failure|
+                return openFailure(diagnostic, .schema_setup, failure, null, self.last_error_code);
+            if (!std.mem.eql(u8, mode_name, "wal"))
+                return openFailure(diagnostic, .schema_setup, error.DatabaseFailure, null, null);
+            const synchronous = self.integer("PRAGMA synchronous;") catch |failure|
+                return openFailure(diagnostic, .schema_setup, failure, null, self.last_error_code);
+            if (synchronous != 2) return openFailure(diagnostic, .schema_setup, error.DatabaseFailure, null, null);
         }
-        try self.beginWrite();
+        self.beginWrite() catch |failure|
+            return openFailure(diagnostic, .schema_setup, failure, null, self.last_error_code);
         self.exec(
             \\CREATE TABLE IF NOT EXISTS records(jail TEXT NOT NULL,source TEXT NOT NULL,occurrence TEXT NOT NULL,raw_hash BLOB NOT NULL CHECK(length(raw_hash)=32),cursor BLOB NOT NULL,event_time BLOB CHECK(event_time IS NULL OR length(event_time)=8),timestamp_us TEXT,disposition TEXT NOT NULL,PRIMARY KEY(jail,source,occurrence));
             \\CREATE TABLE IF NOT EXISTS source_cursors(jail TEXT NOT NULL,source TEXT NOT NULL,cursor BLOB NOT NULL,occurrence TEXT NOT NULL,path TEXT,PRIMARY KEY(jail,source));
@@ -355,18 +512,21 @@ pub const Store = struct {
             \\PRAGMA application_id=1177705009;
         ) catch |err| {
             self.rollback();
-            return err;
+            return openFailure(diagnostic, .schema_setup, err, null, self.last_error_code);
         };
         if (schema < 2) self.exec("PRAGMA user_version=2;") catch |err| {
             self.rollback();
-            return err;
+            return openFailure(diagnostic, .schema_setup, err, null, self.last_error_code);
         };
         self.commitTransaction() catch |err| {
             self.rollback();
-            return err;
+            return openFailure(diagnostic, .schema_setup, err, null, self.last_error_code);
         };
-        try self.check(db_config(self.db, 1006, @as(c_int, 0), @as(?*c_int, null)));
+        self.last_error_code = null;
+        self.check(db_config(self.db, 1006, @as(c_int, 0), @as(?*c_int, null))) catch |failure|
+            return openFailure(diagnostic, .connection_setup, failure, null, self.last_error_code);
         if (runtime) self.runtime_limits = false;
+        diagnostic.* = .{};
         return self;
     }
 
@@ -5985,6 +6145,222 @@ test "record store: extended SQLite failures retain distinct operational causes"
         .{ 19, error.DatabaseFailure },
     };
     inline for (cases) |case| try std.testing.expectEqual(@as(Error, case[1]), sqliteError(case[0]));
+}
+
+test "record store: detailed open resets caller diagnostics and preserves allocation failure" {
+    const t = std.testing;
+    const a = t.allocator;
+    var temp = t.tmpDir(.{});
+    defer temp.cleanup();
+    const base = try temp.dir.realpathAlloc(a, ".");
+    defer a.free(base);
+    const path = try std.fs.path.join(a, &.{ base, "diagnostic.sqlite" });
+    defer a.free(path);
+
+    var diagnostic = OpenDiagnostic{
+        .stage = .sqlite_open,
+        .public_error = error.StorageFull,
+        .posix_cause = .no_space_left,
+        .sqlite_code = 13,
+    };
+    var store = try Store.openDetailed(a, path, &diagnostic);
+    store.close();
+    try t.expectEqualDeep(OpenDiagnostic{}, diagnostic);
+
+    diagnostic = .{ .stage = .path_validation, .public_error = error.OpenFailed };
+    var runtime = try Store.openRuntimeDetailed(a, path, &diagnostic);
+    runtime.close();
+    try t.expectEqualDeep(OpenDiagnostic{}, diagnostic);
+
+    diagnostic = .{ .stage = .path_validation, .public_error = error.OpenFailed };
+    var reader = try Store.openReadOnlyDetailed(a, path, &diagnostic);
+    reader.close();
+    try t.expectEqualDeep(OpenDiagnostic{}, diagnostic);
+
+    diagnostic = .{ .stage = .path_validation, .public_error = error.OpenFailed };
+    _ = try Store.installationSnapshotDetailed(a, path, &diagnostic);
+    try t.expectEqualDeep(OpenDiagnostic{}, diagnostic);
+
+    var failing = t.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try t.expectError(error.OutOfMemory, Store.openDetailed(failing.allocator(), path, &diagnostic));
+    try t.expectEqual(OpenStage.path_copy, diagnostic.stage.?);
+    try t.expectEqual(@as(Error, error.OutOfMemory), diagnostic.public_error.?);
+    try t.expectEqual(@as(?OpenPosixCause, null), diagnostic.posix_cause);
+    try t.expectEqual(@as(?c_int, null), diagnostic.sqlite_code);
+
+    var legacy_failing = t.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try t.expectError(error.OutOfMemory, Store.open(legacy_failing.allocator(), path));
+}
+
+test "record store: detailed open distinguishes path access type and permission failures" {
+    const t = std.testing;
+    const a = t.allocator;
+    var temp = t.tmpDir(.{});
+    defer temp.cleanup();
+    const base = try temp.dir.realpathAlloc(a, ".");
+    defer a.free(base);
+    var diagnostic = OpenDiagnostic{};
+
+    try t.expectError(error.OpenFailed, Store.openDetailed(a, "invalid\x00path", &diagnostic));
+    try t.expectEqual(OpenStage.path_validation, diagnostic.stage.?);
+    try t.expectEqual(@as(Error, error.OpenFailed), diagnostic.public_error.?);
+    try t.expectEqual(@as(?OpenPosixCause, null), diagnostic.posix_cause);
+    try t.expectEqual(@as(?c_int, null), diagnostic.sqlite_code);
+
+    const missing_parent = try std.fs.path.join(a, &.{ base, "missing", "state.sqlite" });
+    defer a.free(missing_parent);
+    try t.expectError(error.OpenFailed, Store.openDetailed(a, missing_parent, &diagnostic));
+    try t.expectEqual(OpenStage.parent_open, diagnostic.stage.?);
+    try t.expectEqual(OpenPosixCause.file_not_found, diagnostic.posix_cause.?);
+
+    const parent_file = try std.fs.path.join(a, &.{ base, "ordinary-file" });
+    defer a.free(parent_file);
+    var ordinary = try std.fs.cwd().createFile(parent_file, .{ .mode = 0o600 });
+    ordinary.close();
+    const below_file = try std.fs.path.join(a, &.{ parent_file, "state.sqlite" });
+    defer a.free(below_file);
+    try t.expectError(error.OpenFailed, Store.openDetailed(a, below_file, &diagnostic));
+    try t.expectEqual(OpenStage.parent_open, diagnostic.stage.?);
+    try t.expectEqual(OpenPosixCause.not_directory, diagnostic.posix_cause.?);
+
+    try temp.dir.makeDir("unsafe-parent");
+    var unsafe_parent = try temp.dir.openDir("unsafe-parent", .{ .iterate = true });
+    defer unsafe_parent.close();
+    try unsafe_parent.chmod(0o770);
+    defer unsafe_parent.chmod(0o700) catch {};
+    const unsafe_parent_path = try std.fs.path.join(a, &.{ base, "unsafe-parent", "state.sqlite" });
+    defer a.free(unsafe_parent_path);
+    try t.expectError(error.UnsafePermissions, Store.openDetailed(a, unsafe_parent_path, &diagnostic));
+    try t.expectEqual(OpenStage.parent_permissions, diagnostic.stage.?);
+    try t.expectEqual(@as(Error, error.UnsafePermissions), diagnostic.public_error.?);
+    try t.expectEqual(@as(?OpenPosixCause, null), diagnostic.posix_cause);
+
+    try temp.dir.makeDir("create-denied");
+    var create_denied = try temp.dir.openDir("create-denied", .{ .iterate = true });
+    defer create_denied.close();
+    try create_denied.chmod(0o500);
+    defer create_denied.chmod(0o700) catch {};
+    const create_denied_path = try std.fs.path.join(a, &.{ base, "create-denied", "state.sqlite" });
+    defer a.free(create_denied_path);
+    try t.expectError(error.OpenFailed, Store.openDetailed(a, create_denied_path, &diagnostic));
+    try t.expectEqual(OpenStage.file_create, diagnostic.stage.?);
+    try t.expectEqual(OpenPosixCause.access_denied, diagnostic.posix_cause.?);
+
+    try temp.dir.makeDir("directory.sqlite");
+    const directory_path = try std.fs.path.join(a, &.{ base, "directory.sqlite" });
+    defer a.free(directory_path);
+    try t.expectError(error.UnsafePermissions, Store.openDetailed(a, directory_path, &diagnostic));
+    try t.expectEqual(OpenStage.file_type, diagnostic.stage.?);
+
+    const permissive_path = try std.fs.path.join(a, &.{ base, "permissive.sqlite" });
+    defer a.free(permissive_path);
+    var permissive = try std.fs.cwd().createFile(permissive_path, .{ .mode = 0o640 });
+    permissive.close();
+    try t.expectError(error.UnsafePermissions, Store.openDetailed(a, permissive_path, &diagnostic));
+    try t.expectEqual(OpenStage.file_permissions, diagnostic.stage.?);
+    try t.expectEqual(@as(?c_int, null), diagnostic.sqlite_code);
+}
+
+test "record store: detailed open detects deterministic file identity replacement" {
+    const t = std.testing;
+    const a = t.allocator;
+    var temp = t.tmpDir(.{});
+    defer temp.cleanup();
+    const base = try temp.dir.realpathAlloc(a, ".");
+    defer a.free(base);
+    const path = try std.fs.path.join(a, &.{ base, "selected.sqlite" });
+    defer a.free(path);
+    const moved = try std.fs.path.join(a, &.{ base, "selected.sqlite.saved" });
+    defer a.free(moved);
+    var initial = try Store.open(a, path);
+    initial.close();
+
+    const Race = struct {
+        path: []const u8,
+        moved: []const u8,
+        ran: bool = false,
+        failed: bool = false,
+
+        fn replace(context: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.ran = true;
+            std.posix.rename(self.path, self.moved) catch {
+                self.failed = true;
+                return;
+            };
+            const replacement = std.posix.open(self.path, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, 0o600) catch {
+                self.failed = true;
+                return;
+            };
+            std.posix.close(replacement);
+        }
+    };
+    var race = Race{ .path = path, .moved = moved };
+    var diagnostic = OpenDiagnostic{};
+    try t.expectError(error.OpenFailed, Store.openImpl(a, path, .plain, &diagnostic, .{ .context = &race, .before_identity_recheck = Race.replace }));
+    try t.expect(race.ran);
+    try t.expect(!race.failed);
+    try t.expectEqual(OpenStage.file_identity_changed, diagnostic.stage.?);
+    try t.expectEqual(@as(Error, error.OpenFailed), diagnostic.public_error.?);
+    try t.expectEqual(@as(?OpenPosixCause, null), diagnostic.posix_cause);
+    try t.expectEqual(@as(?c_int, null), diagnostic.sqlite_code);
+}
+
+test "record store: detailed open separates corrupt foreign unsupported and installation failures" {
+    const t = std.testing;
+    const a = t.allocator;
+    var temp = t.tmpDir(.{});
+    defer temp.cleanup();
+    const base = try temp.dir.realpathAlloc(a, ".");
+    defer a.free(base);
+    var diagnostic = OpenDiagnostic{};
+
+    const corrupt_path = try std.fs.path.join(a, &.{ base, "corrupt.sqlite" });
+    defer a.free(corrupt_path);
+    const corrupt_bytes = [_]u8{0xa5} ** 64;
+    var corrupt_file = try std.fs.cwd().createFile(corrupt_path, .{ .mode = 0o600 });
+    try corrupt_file.writeAll(&corrupt_bytes);
+    corrupt_file.close();
+    try t.expectError(error.CorruptDatabase, Store.openDetailed(a, corrupt_path, &diagnostic));
+    try t.expectEqual(OpenStage.schema_inspection, diagnostic.stage.?);
+    try t.expectEqual(@as(Error, error.CorruptDatabase), diagnostic.public_error.?);
+    try t.expect(diagnostic.sqlite_code != null);
+    try t.expectEqual(@as(Error, error.CorruptDatabase), sqliteError(diagnostic.sqlite_code.?));
+
+    const foreign_path = try std.fs.path.join(a, &.{ base, "foreign.sqlite" });
+    defer a.free(foreign_path);
+    var foreign = try Store.open(a, foreign_path);
+    try foreign.exec("PRAGMA application_id=1;");
+    foreign.close();
+    try t.expectError(error.ForeignDatabase, Store.openDetailed(a, foreign_path, &diagnostic));
+    try t.expectEqual(OpenStage.schema_validation, diagnostic.stage.?);
+    try t.expectEqual(@as(Error, error.ForeignDatabase), diagnostic.public_error.?);
+    try t.expectEqual(@as(?c_int, null), diagnostic.sqlite_code);
+    try t.expectError(error.ForeignDatabase, Store.open(a, foreign_path));
+
+    const unsupported_path = try std.fs.path.join(a, &.{ base, "unsupported.sqlite" });
+    defer a.free(unsupported_path);
+    var unsupported = try Store.open(a, unsupported_path);
+    var version_sql: [64]u8 = undefined;
+    const set_version = try std.fmt.bufPrintZ(&version_sql, "PRAGMA user_version={d};", .{latest_schema + 1});
+    try unsupported.exec(set_version);
+    unsupported.close();
+    try t.expectError(error.UnsupportedSchema, Store.openDetailed(a, unsupported_path, &diagnostic));
+    try t.expectEqual(OpenStage.schema_validation, diagnostic.stage.?);
+    try t.expectEqual(@as(Error, error.UnsupportedSchema), diagnostic.public_error.?);
+    try t.expectEqual(@as(?c_int, null), diagnostic.sqlite_code);
+    try t.expectError(error.UnsupportedSchema, Store.installationSnapshot(a, unsupported_path));
+
+    const installation_path = try std.fs.path.join(a, &.{ base, "installation.sqlite" });
+    defer a.free(installation_path);
+    var installation = try Store.open(a, installation_path);
+    try installation.exec("CREATE TABLE effect_installation(broken INTEGER); PRAGMA user_version=11;");
+    installation.close();
+    try t.expectError(error.DatabaseFailure, Store.installationSnapshotDetailed(a, installation_path, &diagnostic));
+    try t.expectEqual(OpenStage.installation_read, diagnostic.stage.?);
+    try t.expectEqual(@as(Error, error.DatabaseFailure), diagnostic.public_error.?);
+    try t.expect(diagnostic.sqlite_code != null);
+    try t.expectEqual(@as(c_int, 1), diagnostic.sqlite_code.? & 0xff);
 }
 
 test "record store: oversized restored values fail before caller allocation and leave saved bytes intact" {

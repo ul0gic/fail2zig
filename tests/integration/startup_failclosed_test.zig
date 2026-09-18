@@ -419,6 +419,51 @@ test "integration: unwritable persistence refuses startup then advances after re
     try expectNotContains(repaired.stderr, "startup check");
 }
 
+test "integration: state admission identifies foreign and unsupported databases without changing bytes" {
+    const a = testing.allocator;
+    const cases = .{
+        .{ @as(u64, 68), @as(u32, 0x12345678), "ForeignDatabase" },
+        .{ @as(u64, 60), @as(u32, 0x7fffffff), "UnsupportedSchema" },
+    };
+    inline for (cases) |case| {
+        var s = try Scenario.init(a);
+        defer s.deinit();
+        const sock = try s.defaultSocketPath();
+        defer a.free(sock);
+        const text = try s.writeConfig(sock, "source = \"file\"", 0o640);
+        defer a.free(text);
+        const address = try std.net.Address.parseIp4("127.0.0.1", s.metrics_port);
+        var holder = try address.listen(.{ .reuse_address = true });
+        defer holder.deinit();
+        // Obtain a real daemon-created database, then alter only the SQLite
+        // header field under test while no daemon or database handle is open.
+        var initial = try s.run();
+        defer initial.deinit(a);
+        try expectFailClosed(&initial);
+        try expectContains(initial.stderr, "native: HTTP listener");
+        {
+            const file = try s.tmp.dir.openFile("state.bin", .{ .mode = .read_write });
+            defer file.close();
+            var value: [4]u8 = undefined;
+            std.mem.writeInt(u32, &value, case[1], .big);
+            try file.pwriteAll(&value, case[0]);
+        }
+        const before = try s.tmp.dir.readFileAlloc(a, "state.bin", 32 * 1024 * 1024);
+        defer a.free(before);
+        var refused = try s.run();
+        defer refused.deinit(a);
+        try expectStorageRefusal(&refused, sock);
+        try expectContains(refused.stderr, "state installation snapshot failed");
+        try expectContains(refused.stderr, case[2]);
+        try expectContains(refused.stderr, "stage=schema_validation");
+        try expectContains(refused.stderr, "posix_cause=none; sqlite_code=null");
+        try expectNotContains(refused.stderr, "delete");
+        const after = try s.tmp.dir.readFileAlloc(a, "state.bin", 32 * 1024 * 1024);
+        defer a.free(after);
+        try testing.expectEqualSlices(u8, before, after);
+    }
+}
+
 test "integration: fail-closed helper: trace detector matches Zig frame lines and nothing else" {
     try testing.expect(hasErrorReturnTrace("error: AddressInUse\n/x/main.zig:3:23: 0x10ddf13 in main (fail2zig)\n"));
     try testing.expect(hasErrorReturnTrace("... error return trace ..."));

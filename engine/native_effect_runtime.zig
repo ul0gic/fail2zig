@@ -8,7 +8,23 @@ const action_outcome = @import("core/native_action_outcome.zig");
 const firewall = @import("firewall/inspection.zig");
 
 pub const Binding = struct { jail: []const u8, generation: [32]u8 };
-pub const Health = struct { ready: bool = false, uncertain: bool = false, overdue: usize = 0, confirmed: usize = 0, cause: ?anyerror = null };
+pub const EffectDiagnostic = struct {
+    backend: firewall.Transport,
+    stage: firewall.OperationStage,
+    cause: anyerror,
+    mutation: firewall.MutationDisposition,
+};
+pub const Health = struct {
+    ready: bool = false,
+    uncertain: bool = false,
+    overdue: usize = 0,
+    confirmed: usize = 0,
+    cause: ?anyerror = null,
+    diagnostic: ?EffectDiagnostic = null,
+};
+fn propagateFirewall(comptime T: type, cause: firewall.Error) firewall.Error!T {
+    return cause;
+}
 fn systemWall(_: ?*anyopaque) i64 {
     return std.time.microTimestamp();
 }
@@ -88,6 +104,24 @@ pub const Manager = struct {
         for (self.live[0..self.count]) |entry| if (std.meta.eql(entry.scope, scope)) return entry.status == .applied and entry.desired.live(now_us);
         return false;
     }
+    fn recordFirewallFailure(self: *Manager, context: firewall.FailureContext) void {
+        self.status.cause = context.cause;
+        self.status.uncertain = true;
+        self.status.diagnostic = .{
+            .backend = context.backend,
+            .stage = context.stage,
+            .cause = context.cause,
+            .mutation = context.mutation,
+        };
+    }
+    fn recordFirewallDirect(self: *Manager, stage: firewall.OperationStage, cause: firewall.Error) void {
+        self.recordFirewallFailure(.{
+            .backend = self.inspector.installation.transport,
+            .stage = stage,
+            .cause = cause,
+            .mutation = .not_started,
+        });
+    }
     fn clock(self: *Manager) !effect.Clock {
         const now = self.wall(self.wall_context);
         if (now < self.last_wall_us) return error.EffectClockReversed;
@@ -113,16 +147,18 @@ pub const Manager = struct {
         const saved = try self.store.readInstallation() orelse return error.InstallationRequired;
         if (!std.meta.eql(saved, self.installation)) return error.InstallationMismatch;
         const id = effect.hashParts("fail2zig-native-installation-intent-v1", &.{ &saved.id, &.{@intFromEnum(saved.backend)}, saved.selector() });
-        var result = try self.inspector.admitInstallation(.{ .installation = self.inspector.installation, .intent_id = id, .revision = 1 });
+        var result = self.inspector.admitInstallation(.{ .installation = self.inspector.installation, .intent_id = id, .revision = 1 }) catch |failure| {
+            self.recordFirewallDirect(.admission_probe, failure);
+            return propagateFirewall(void, failure);
+        };
         defer result.deinit();
         switch (result) {
             .installed => |installed| {
                 if (installed.created) std.log.info("{s}: scaffold installed and verified (selector={s})", .{ @tagName(saved.backend), saved.selector() });
                 self.admitted = true;
             },
-            .uncertain => |cause| {
-                self.status.cause = cause;
-                self.status.uncertain = true;
+            .uncertain => |failure| {
+                self.recordFirewallFailure(failure);
                 return error.EffectBackendUncertain;
             },
         }
@@ -247,7 +283,10 @@ pub const Manager = struct {
             return false;
         }
         if (self.cursor == self.count) {
-            var snapshot = try self.inspector.inspect();
+            var snapshot = self.inspector.inspect() catch |failure| {
+                self.recordFirewallDirect(.readback, failure);
+                return propagateFirewall(bool, failure);
+            };
             defer snapshot.deinit();
             try self.validateInventory(&snapshot);
             const end = try self.clock();
@@ -277,15 +316,13 @@ pub const Manager = struct {
             try self.store.markDispatched(entry.token(), sampled);
             const dispatch_clock = try self.clock();
             var result = self.inspector.applyExact(self.token(entry, entry.desired), .{ .wall_us = dispatch_clock.prepared_us }) catch |failure| {
-                self.status.cause = failure;
-                self.status.uncertain = true;
+                self.recordFirewallDirect(.effect_dispatch, failure);
                 return error.EffectBackendUncertain;
             };
             defer result.deinit();
             switch (result) {
-                .uncertain => |cause| {
-                    self.status.cause = cause;
-                    self.status.uncertain = true;
+                .uncertain => |failure| {
+                    self.recordFirewallFailure(failure);
                     return error.EffectBackendUncertain;
                 },
                 .verified => |*observed| {
@@ -295,7 +332,10 @@ pub const Manager = struct {
             }
             return false;
         }
-        var observed = try self.inspector.observeExact(self.token(entry, entry.desired), .{ .wall_us = sampled.prepared_us });
+        var observed = self.inspector.observeExact(self.token(entry, entry.desired), .{ .wall_us = sampled.prepared_us }) catch |failure| {
+            self.recordFirewallDirect(.readback, failure);
+            return propagateFirewall(bool, failure);
+        };
         defer observed.deinit();
         try self.validateInventory(&observed.snapshot);
         if (entry.status == .dispatched or !observed.matches_desired) {
@@ -335,12 +375,14 @@ pub const Manager = struct {
                 self.stop_cursor += 1;
                 continue;
             }
-            var result = try self.inspector.applyExact(self.token(entry, .absent), .{ .wall_us = sampled.prepared_us });
+            var result = self.inspector.applyExact(self.token(entry, .absent), .{ .wall_us = sampled.prepared_us }) catch |failure| {
+                self.recordFirewallDirect(.effect_dispatch, failure);
+                return propagateFirewall(bool, failure);
+            };
             defer result.deinit();
             switch (result) {
-                .uncertain => |cause| {
-                    self.status.cause = cause;
-                    self.status.uncertain = true;
+                .uncertain => |failure| {
+                    self.recordFirewallFailure(failure);
                     return error.EffectBackendUncertain;
                 },
                 .verified => |*observed| try self.validateInventory(&observed.snapshot),
@@ -348,7 +390,10 @@ pub const Manager = struct {
             self.stop_cursor += 1;
             return false;
         }
-        var final = try self.inspector.inspect();
+        var final = self.inspector.inspect() catch |failure| {
+            self.recordFirewallDirect(.readback, failure);
+            return propagateFirewall(bool, failure);
+        };
         defer final.deinit();
         try self.validateInventory(&final);
         if (final.entries.len != 0) return error.UnownedInstalledEffect;
@@ -376,9 +421,12 @@ pub const Manager = struct {
             if (entry.desired != .finite or entry.desired.live(clock_sample.prepared_us) or self.outage_attempted[i]) continue;
             self.outage_attempted[i] = true;
             self.status.uncertain = true;
-            var result = try self.inspector.applyExact(self.token(entry, .absent), .{ .wall_us = clock_sample.prepared_us });
+            var result = self.inspector.applyExact(self.token(entry, .absent), .{ .wall_us = clock_sample.prepared_us }) catch |failure| {
+                self.recordFirewallDirect(.effect_dispatch, failure);
+                return propagateFirewall(void, failure);
+            };
             defer result.deinit();
-            if (result == .uncertain) self.status.cause = result.uncertain;
+            if (result == .uncertain) self.recordFirewallFailure(result.uncertain);
             return;
         }
     }
