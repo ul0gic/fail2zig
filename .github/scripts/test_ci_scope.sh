@@ -84,10 +84,10 @@ jq -n --arg base "$(git rev-parse HEAD)" --arg head "$head" \
 GITHUB_EVENT_NAME=pull_request expect_route light
 
 # Every job, including the matrix's aggregate outcome, must match the route.
-full='["fmt","build-native","test","components","fuzz","release-target","shellcheck","yamllint","zizmor","spdx"]'
+full='["lint","test","components","fuzz","release-target"]'
 for route in full light; do
     good=$(jq -n --arg route "$route" --argjson full "$full" '
-        reduce (["scope","community"] + $full)[] as $key ({};
+        reduce (["scope"] + $full)[] as $key ({};
           .[$key] = {result:(if $route == "light" and ($full | index($key)) != null then "skipped" else "success" end)}) |
         .scope.outputs.route = $route')
     CI_NEEDS=$good bash "$router" gate

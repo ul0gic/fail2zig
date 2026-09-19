@@ -2,7 +2,7 @@
 # Conservative CI routing and fail-closed result aggregation. Requires git and jq.
 set -euo pipefail
 
-full_jobs='["fmt","build-native","test","components","fuzz","release-target","shellcheck","yamllint","zizmor","spdx"]'
+full_jobs='["lint","test","components","fuzz","release-target"]'
 
 comparison() {
     local head
@@ -63,7 +63,7 @@ classify() {
 gate() {
     jq -es --argjson full "$full_jobs" '
       length == 1 and (.[0] | type == "object" and
-      (keys == (["scope", "community"] + $full | sort)) and
+      (keys == (["scope"] + $full | sort)) and
       (.scope.outputs.route as $route |
         ($route == "full" or $route == "light") and
         all(to_entries[];
