@@ -174,7 +174,17 @@ test "native rule test: hostname subject stays raw without --identity dns and re
 }
 
 test "native rule test: --config resolves the jail's timestamp, offset and ignoreip" {
-    var opts: rule_test.Options = .{ .input = .{ .file = fixture("sshd.log") }, .rule = .{ .service = "sshd" }, .now_us = now_us, .config = fixture("jail.toml") };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var config = try tmp.dir.createFile("jail.toml", .{ .mode = 0o600 });
+    defer config.close();
+    try config.chmod(0o600);
+    const config_text = try std.fs.cwd().readFileAlloc(testing.allocator, fixture("jail.toml"), 64 * 1024);
+    defer testing.allocator.free(config_text);
+    try config.writeAll(config_text);
+    const config_path = try tmp.dir.realpathAlloc(testing.allocator, "jail.toml");
+    defer testing.allocator.free(config_path);
+    var opts: rule_test.Options = .{ .input = .{ .file = fixture("sshd.log") }, .rule = .{ .service = "sshd" }, .now_us = now_us, .config = config_path };
     var report = try rule_test.evaluate(testing.allocator, opts);
     defer report.deinit();
     try testing.expectEqual(rule_test.Outcome.ignore, sample(&report, 1).outcome);

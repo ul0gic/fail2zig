@@ -4,21 +4,30 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing draft release tag (must be v0.4.1)
+        description: Existing draft release tag (vMAJOR.MINOR.PATCH)
         required: true
         type: string
       source_commit:
-        description: Approved 40-character source commit for the tag
+        description: Approved full lowercase source commit SHA
         required: true
         type: string
       binary_sha256:
-        description: Approved SHA-256 of fail2zig-v0.4.1-x86_64-linux-musl
+        description: Lab-approved SHA-256 of the x86_64 release executable
         required: true
         type: string
       manifest_sha256:
-        description: Approved SHA-256 of SHA256SUMS
+        description: Approved SHA-256 of the draft SHA256SUMS (all 13 payloads)
         required: true
         type: string
+      lab_scope:
+        description: Hash-bound lab qualification scope and limitations
+        required: true
+        type: string
+      verify_only:
+        description: Build, compare and attest without publishing the draft
+        required: true
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -27,254 +36,246 @@ concurrency:
   group: release-${{ inputs.release_tag }}
   cancel-in-progress: false
 
+env:
+  RELEASE_TAG: ${{ inputs.release_tag }}
+  SOURCE_COMMIT: ${{ inputs.source_commit }}
+  BINARY_SHA256: ${{ inputs.binary_sha256 }}
+  MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+  LAB_SCOPE: ${{ inputs.lab_scope }}
+  ZIG_VERSION: "0.14.1"
+  ZIG_SHA256: "24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c"
+
 jobs:
-  publish-retained-candidate:
-    name: Verify and publish retained candidate
+  qualify:
+    name: Qualify exact source and release authority
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
-      contents: write
-    env:
-      RELEASE_TAG: ${{ inputs.release_tag }}
-      SOURCE_COMMIT: ${{ inputs.source_commit }}
-      BINARY_SHA256: ${{ inputs.binary_sha256 }}
-      MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+      contents: read
+      actions: read
+    steps:
+      - name: Require the trusted main workflow
+        run: test "$GITHUB_REF" = refs/heads/main
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          path: control
+      - name: Validate fixed release inputs
+        run: bash control/.github/scripts/release.sh inputs
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source_commit }}
+          path: source
+      - name: Verify source, live tag, and successful full CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          checked_out="$(git -C source rev-parse HEAD)"
+          bash control/.github/scripts/release.sh identity "$checked_out" "$SOURCE_COMMIT"
+          bash control/.github/scripts/release.sh tag
+          source_version="$(sed -n 's/^ *\.version = "\([^"]*\)".*/\1/p' source/build.zig.zon)"
+          test "$source_version" = "${RELEASE_TAG#v}"
+          test -f source/RELEASE_NOTES.md
+          bash control/.github/scripts/release.sh qualify
+          draft="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+          test "$draft" = true
+      - name: Require configured publication approval
+        if: ${{ !inputs.verify_only }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLICATION_ENABLED: ${{ vars.RELEASE_PUBLICATION_ENABLED }}
+        run: bash control/.github/scripts/release.sh publication-guard
+      - name: Record approved candidate and lab scope
+        run: |
+          {
+            printf '## Approved release candidate\n\n'
+            printf 'Source: `%s`\n\nBinary SHA-256: `%s`\n\nManifest SHA-256: `%s`\n\n' \
+              "$SOURCE_COMMIT" "$BINARY_SHA256" "$MANIFEST_SHA256"
+            printf 'Maintainer-supplied lab scope (not performed by this workflow):\n\n'
+            printf '%s\n' "$LAB_SCOPE"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build release (${{ matrix.target }})
+    needs: qualify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - {target: x86_64-linux-musl, cpu: baseline}
+          - {target: aarch64-linux-musl, cpu: baseline}
+          - {target: arm-linux-musleabihf, cpu: baseline}
+          - {target: mips-linux-musleabi, cpu: mips32r2}
+          - {target: mipsel-linux-musleabi, cpu: mips32r2}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          fetch-depth: 0
           persist-credentials: false
           ref: ${{ inputs.source_commit }}
-
-      - name: Verify approved source and tag
-        shell: bash
+      - name: Install pinned Zig
         run: |
-          if [[ "${RELEASE_TAG}" != "v0.4.1" ]]; then
-            echo "::error::this workflow publishes only the approved v0.4.1 release"
-            exit 1
-          fi
-          if [[ ! "${SOURCE_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::source_commit must be a lowercase 40-character commit ID"
-            exit 1
-          fi
-          if [[ ! "${BINARY_SHA256}" =~ ^[0-9a-f]{64}$ ]] || \
-             [[ ! "${MANIFEST_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "::error::approved hashes must be lowercase SHA-256 values"
-            exit 1
-          fi
-
-          checked_out="$(git rev-parse HEAD)"
-          tagged="$(git rev-list -n 1 "${RELEASE_TAG}")"
-          if [[ "${checked_out}" != "${SOURCE_COMMIT}" ]] || \
-             [[ "${tagged}" != "${SOURCE_COMMIT}" ]]; then
-            echo "::error::approved commit, checkout, and release tag do not match"
-            exit 1
-          fi
-
-          expected_version="${RELEASE_TAG#v}"
-          source_version="$(sed -n 's/^ *\.version = "\([^"]*\)".*/\1/p' build.zig.zon)"
-          if [[ "${source_version}" != "${expected_version}" ]]; then
-            echo "::error::build.zig.zon version '${source_version}' does not match ${RELEASE_TAG}"
-            exit 1
-          fi
-          if [[ ! -f RELEASE_NOTES.md ]]; then
-            echo "::error::RELEASE_NOTES.md is required at the approved commit"
-            exit 1
-          fi
-
-      - name: Download the retained draft candidate
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
+          echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c -
+          sudo mkdir -p /opt/zig
+          sudo tar -xf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+          echo /opt/zig >> "$GITHUB_PATH"
+      - name: Build the one release executable
         env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_CPU: ${{ matrix.cpu }}
         run: |
-          draft="$(gh release view "${RELEASE_TAG}" \
-            --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft)"
-          if [[ "${draft}" != "true" ]]; then
-            echo "::error::${RELEASE_TAG} must exist as a draft release"
-            exit 1
-          fi
-          mkdir candidate
-          gh release download "${RELEASE_TAG}" \
-            --repo "${GITHUB_REPOSITORY}" --dir candidate
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          zig build -Dtarget="$RELEASE_TARGET" -Dcpu="$RELEASE_CPU" -Doptimize=ReleaseSafe -Dstrip=true
+          test "$(find zig-out/bin -mindepth 1 -maxdepth 1 -printf '%f\n')" = fail2zig
+          test -f zig-out/bin/fail2zig
+          test ! -L zig-out/bin/fail2zig
+          mkdir package
+          cp zig-out/bin/fail2zig "package/fail2zig-$RELEASE_TAG-$RELEASE_TARGET"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-binary-${{ matrix.target }}
+          path: package/*
+          if-no-files-found: error
+          retention-days: 7
 
-      - name: Verify exact candidate bytes
-        shell: bash
-        run: |
-          expected_version="0.4.1"
-          binary="fail2zig-v0.4.1-x86_64-linux-musl"
-
-          printf '%s\n' \
-            "${binary}" \
-            fail2zig-v0.4.1-aarch64-linux-musl \
-            fail2zig-v0.4.1-arm-linux-musleabihf \
-            fail2zig-v0.4.1-mips-linux-musleabi \
-            fail2zig-v0.4.1-mipsel-linux-musleabi \
-            COPYING.date-profile \
-            LICENSE \
-            SHA256SUMS \
-            SQLITE-NOTICE.md \
-            fail2zig.1 \
-            fail2zig.service \
-            fail2zig.toml.5 \
-            fail2zig.toml.example \
-            install.sh \
-            | LC_ALL=C sort > expected-files
-          find candidate -mindepth 1 -maxdepth 1 -type f -printf '%f\n' \
-            | LC_ALL=C sort > actual-files
-          if find candidate -mindepth 1 -maxdepth 1 ! -type f -print -quit \
-            | grep -q .; then
-            echo "::error::candidate contains a directory, symlink, or special file"
-            exit 1
-          fi
-          diff -u expected-files actual-files
-
-          printf '%s\n' \
-            "${binary}" \
-            fail2zig-v0.4.1-aarch64-linux-musl \
-            fail2zig-v0.4.1-arm-linux-musleabihf \
-            fail2zig-v0.4.1-mips-linux-musleabi \
-            fail2zig-v0.4.1-mipsel-linux-musleabi \
-            COPYING.date-profile \
-            LICENSE \
-            SQLITE-NOTICE.md \
-            fail2zig.1 \
-            fail2zig.service \
-            fail2zig.toml.5 \
-            fail2zig.toml.example \
-            install.sh \
-            | LC_ALL=C sort > expected-manifest-files
-          sed -E 's/^[0-9a-f]{64} [ *]//' candidate/SHA256SUMS \
-            | LC_ALL=C sort > actual-manifest-files
-          diff -u expected-manifest-files actual-manifest-files
-
-          echo "${MANIFEST_SHA256}  candidate/SHA256SUMS" \
-            | sha256sum --check --strict
-          echo "${BINARY_SHA256}  candidate/${binary}" \
-            | sha256sum --check --strict
-          (cd candidate && sha256sum --check --strict SHA256SUMS)
-
-          for target in x86_64-linux-musl aarch64-linux-musl arm-linux-musleabihf \
-            mips-linux-musleabi mipsel-linux-musleabi; do
-            artifact="candidate/fail2zig-v0.4.1-${target}"
-            case "$target" in
-              x86_64-*) expected='ELF 64-bit LSB.*x86-64' ;;
-              aarch64-*) expected='ELF 64-bit LSB.*ARM aarch64' ;;
-              arm-*) expected='ELF 32-bit LSB.*ARM' ;;
-              mips-*) expected='ELF 32-bit MSB.*MIPS' ;;
-              mipsel-*) expected='ELF 32-bit LSB.*MIPS' ;;
-            esac
-            file "$artifact"
-            if ! file "$artifact" | grep -q "$expected"; then
-              echo "::error::wrong architecture for $target"
-              exit 1
-            fi
-            if ! file "$artifact" | grep -q ", stripped"; then
-              echo "::error::debug information in $target"
-              exit 1
-            fi
-            if readelf -l "$artifact" | grep -q INTERP || \
-               readelf -d "$artifact" | grep -q NEEDED; then
-              echo "::error::dynamic linkage in $target"
-              exit 1
-            fi
-          done
-          chmod u+x "candidate/${binary}"
-          actual_version="$("candidate/${binary}" --version)"
-          if [[ "${actual_version}" != "fail2zig ${expected_version}" ]]; then
-            echo "::error::release executable printed '${actual_version}'"
-            exit 1
-          fi
-
-      - name: Publish the verified draft without replacing assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          gh release edit "${RELEASE_TAG}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "fail2zig ${RELEASE_TAG}" \
-            --notes-file RELEASE_NOTES.md \
-            --draft=false \
-            --latest
-
-  verify-published-release:
-    name: Re-download and verify published bytes
-    needs: publish-retained-candidate
+  verify:
+    name: Compare independently built package to approved bytes
+    needs: [qualify, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
-    env:
-      RELEASE_TAG: ${{ inputs.release_tag }}
-      BINARY_SHA256: ${{ inputs.binary_sha256 }}
-      MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+      actions: read
     steps:
-      - name: Download published assets
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          path: control
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source_commit }}
+          path: source
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: release-binary-*
+          merge-multiple: true
+          path: package
+      - name: Assemble all fixed source payloads and compare approval
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: bash
+        run: |
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_COMMIT"
+          bash control/.github/scripts/release.sh assemble source package
+          mkdir approved
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir approved
+          bash control/.github/scripts/release.sh compare package approved
+          bash control/.github/scripts/release.sh elf "$PWD/package"
+          bash control/.github/scripts/release.sh tag
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: verified-release-package
+          path: package/*
+          if-no-files-found: error
+          retention-days: 7
+
+  attest:
+    name: Attest the verified runner package
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: verified-release-package
+          path: package
+      - name: Describe actual build inputs, separately from the workflow commit
+        run: |
+          jq -n --arg repo "$GITHUB_REPOSITORY" --arg source "$SOURCE_COMMIT" \
+            --arg workflow "$GITHUB_SHA" --arg tag "$RELEASE_TAG" --arg run "$GITHUB_RUN_ID" \
+            --arg attempt "$GITHUB_RUN_ATTEMPT" --arg zig "$ZIG_VERSION" --arg zig_hash "$ZIG_SHA256" \
+            --arg binary "$BINARY_SHA256" --arg manifest "$MANIFEST_SHA256" --arg scope "$LAB_SCOPE" '
+            {
+              buildDefinition: {
+                buildType: ("https://github.com/" + $repo + "/blob/main/.github/workflows/release.yml"),
+                externalParameters: {
+                  source_commit: $source, release_tag: $tag,
+                  approved_binary_sha256: $binary, approved_manifest_sha256: $manifest,
+                  maintainer_reported_lab_scope: $scope
+                },
+                internalParameters: {workflow_commit: $workflow, run_attempt: $attempt},
+                resolvedDependencies: [
+                  {uri: ("git+https://github.com/" + $repo), digest: {gitCommit: $source}},
+                  {uri: ("https://ziglang.org/download/" + $zig + "/zig-x86_64-linux-" + $zig + ".tar.xz"),
+                   digest: {sha256: $zig_hash}}
+                ]
+              },
+              runDetails: {
+                builder: {id: ("https://github.com/" + $repo + "/.github/workflows/release.yml@" + $workflow)},
+                metadata: {invocationId: ("https://github.com/" + $repo + "/actions/runs/" + $run + "/attempts/" + $attempt)}
+              }
+            }' > predicate.json
+      - uses: actions/attest@ce27ba3b4a9a139d9a20a4a07d69fabb52f1e5bc
+        with:
+          subject-path: package/*
+          predicate-type: https://slsa.dev/provenance/v1
+          predicate-path: predicate.json
+
+  publish:
+    name: Approve publication and verify downloaded release
+    if: ${{ !inputs.verify_only }}
+    needs: [qualify, verify, attest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          path: control
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source_commit }}
+          path: source
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: verified-release-package
+          path: package
+      - name: Recheck approval, tag, and draft immediately before publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLICATION_ENABLED: ${{ vars.RELEASE_PUBLICATION_ENABLED }}
+        run: |
+          bash control/.github/scripts/release.sh publication-guard
+          draft="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+          test "$draft" = true
+          mkdir approved
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir approved
+          bash control/.github/scripts/release.sh compare package approved
+          bash control/.github/scripts/release.sh tag
+          # Draft bytes already equal every attested runner payload. Do not replace assets.
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --title "fail2zig $RELEASE_TAG" --notes-file source/RELEASE_NOTES.md --draft=false --latest
+      - name: Re-download and compare all published bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir published
-          gh release download "${RELEASE_TAG}" \
-            --repo "${GITHUB_REPOSITORY}" --dir published
-
-      - name: Verify published allowlist and checksums
-        shell: bash
-        run: |
-          expected_version="0.4.1"
-          binary="fail2zig-v0.4.1-x86_64-linux-musl"
-
-          printf '%s\n' \
-            "${binary}" \
-            fail2zig-v0.4.1-aarch64-linux-musl \
-            fail2zig-v0.4.1-arm-linux-musleabihf \
-            fail2zig-v0.4.1-mips-linux-musleabi \
-            fail2zig-v0.4.1-mipsel-linux-musleabi \
-            COPYING.date-profile \
-            LICENSE \
-            SHA256SUMS \
-            SQLITE-NOTICE.md \
-            fail2zig.1 \
-            fail2zig.service \
-            fail2zig.toml.5 \
-            fail2zig.toml.example \
-            install.sh \
-            | LC_ALL=C sort > expected-files
-          find published -mindepth 1 -maxdepth 1 -type f -printf '%f\n' \
-            | LC_ALL=C sort > actual-files
-          if find published -mindepth 1 -maxdepth 1 ! -type f -print -quit \
-            | grep -q .; then
-            echo "::error::published release contains a directory, symlink, or special file"
-            exit 1
-          fi
-          diff -u expected-files actual-files
-
-          printf '%s\n' \
-            "${binary}" \
-            fail2zig-v0.4.1-aarch64-linux-musl \
-            fail2zig-v0.4.1-arm-linux-musleabihf \
-            fail2zig-v0.4.1-mips-linux-musleabi \
-            fail2zig-v0.4.1-mipsel-linux-musleabi \
-            COPYING.date-profile \
-            LICENSE \
-            SQLITE-NOTICE.md \
-            fail2zig.1 \
-            fail2zig.service \
-            fail2zig.toml.5 \
-            fail2zig.toml.example \
-            install.sh \
-            | LC_ALL=C sort > expected-manifest-files
-          sed -E 's/^[0-9a-f]{64} [ *]//' published/SHA256SUMS \
-            | LC_ALL=C sort > actual-manifest-files
-          diff -u expected-manifest-files actual-manifest-files
-
-          echo "${MANIFEST_SHA256}  published/SHA256SUMS" \
-            | sha256sum --check --strict
-          echo "${BINARY_SHA256}  published/${binary}" \
-            | sha256sum --check --strict
-          (cd published && sha256sum --check --strict SHA256SUMS)
-
-          chmod u+x "published/${binary}"
-          actual_version="$("published/${binary}" --version)"
-          if [[ "${actual_version}" != "fail2zig ${expected_version}" ]]; then
-            echo "::error::published executable printed '${actual_version}'"
-            exit 1
-          fi
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir published
+          bash control/.github/scripts/release.sh compare package published
+          bash control/.github/scripts/release.sh tag

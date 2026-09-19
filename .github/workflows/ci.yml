@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
@@ -31,7 +32,7 @@ jobs:
           fetch-depth: 0
       - id: scope
         name: Select applicable checks
-        run: python3 -B .github/scripts/ci_scope.py classify
+        run: bash .github/scripts/ci_scope.sh classify
 
   community:
     name: Community files
@@ -43,9 +44,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - name: Check changed-file whitespace
-        run: python3 -B .github/scripts/ci_scope.py whitespace
-      - name: Test CI routing and failure handling
-        run: python3 -B -m unittest discover -s .github/scripts -p 'test_*.py' -v
+        run: bash .github/scripts/ci_scope.sh whitespace
       - name: Install YAML validator
         run: sudo apt-get update && sudo apt-get install -y yamllint
       - name: Check issue-form YAML syntax
@@ -71,7 +70,7 @@ jobs:
           echo "/opt/zig" >> "$GITHUB_PATH"
           /opt/zig/zig version
       - name: Check formatting
-        run: zig fmt --check engine/ client/ shared/ tests/
+        run: zig fmt --check build.zig build.zig.zon engine/ client/ shared/ tests/
 
   build-native:
     needs: scope
@@ -105,6 +104,7 @@ jobs:
     if: needs.scope.outputs.route == 'full'
     name: Tests (std.testing.allocator leak detection)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -124,8 +124,70 @@ jobs:
           key: zig-cache-test-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
           restore-keys: |
             zig-cache-test-${{ runner.os }}-${{ env.ZIG_VERSION }}-
-      - name: Bounded local release checks
-        run: zig build test-release-local -Doptimize=ReleaseSafe
+      - name: Assembled daemon and administrative checks
+        run: /usr/bin/time -v zig build test-ci-assembled -Doptimize=ReleaseSafe -j2 --summary all
+
+  components:
+    needs: scope
+    if: needs.scope.outputs.route == 'full'
+    name: Native components (${{ matrix.shard }})
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [a, b]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: |
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
+          echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c -
+          sudo mkdir -p /opt/zig
+          sudo tar -xf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+          echo "/opt/zig" >> "$GITHUB_PATH"
+          /opt/zig/zig version
+      - name: Cache zig-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .zig-cache
+          key: zig-cache-components-${{ matrix.shard }}-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            zig-cache-components-${{ matrix.shard }}-${{ runner.os }}-${{ env.ZIG_VERSION }}-
+      - name: Native component checks
+        env:
+          CI_SHARD: ${{ matrix.shard }}
+        run: /usr/bin/time -v zig build "test-ci-components-$CI_SHARD" -Doptimize=ReleaseSafe -j2 --summary all
+
+  fuzz:
+    needs: scope
+    if: needs.scope.outputs.route == 'full'
+    name: Bounded fuzz and module guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: |
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
+          echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c -
+          sudo mkdir -p /opt/zig
+          sudo tar -xf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+          echo "/opt/zig" >> "$GITHUB_PATH"
+          /opt/zig/zig version
+      - name: Cache zig-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .zig-cache
+          key: zig-cache-fuzz-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            zig-cache-fuzz-${{ runner.os }}-${{ env.ZIG_VERSION }}-
+      - name: Bounded malformed-input checks
+        run: /usr/bin/time -v zig build test-ci-fuzz -Doptimize=ReleaseSafe -j2 --summary all
 
   release-target:
     needs: scope
@@ -142,6 +204,7 @@ jobs:
           - {target: mips-linux-musleabi, cpu: mips32r2, elf: "ELF 32-bit MSB.*MIPS"}
           - {target: mipsel-linux-musleabi, cpu: mips32r2, elf: "ELF 32-bit LSB.*MIPS"}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -198,11 +261,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Test CI routing and failure handling
+        run: |
+          bash .github/scripts/test_ci_scope.sh
+          bash .github/scripts/release_test.sh
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Lint scripts
         run: |
-          shellcheck -S warning tests/harness/*.sh tests/e2e/*.sh
+          shellcheck -S warning tests/harness/*.sh tests/e2e/*.sh .github/scripts/*.sh
           if [ -f scripts/install.sh ]; then
             shellcheck -S warning scripts/install.sh
           fi
@@ -261,7 +328,7 @@ jobs:
     name: CI result
     timeout-minutes: 5
     if: always()
-    needs: [scope, community, fmt, build-native, test, release-target, shellcheck, yamllint, zizmor, spdx]
+    needs: [scope, community, fmt, build-native, test, components, fuzz, release-target, shellcheck, yamllint, zizmor, spdx]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -270,4 +337,18 @@ jobs:
       - name: Require every applicable check to pass
         env:
           CI_NEEDS: ${{ toJSON(needs) }}
-        run: python3 -B .github/scripts/ci_scope.py gate
+        run: bash .github/scripts/ci_scope.sh gate
+      - name: Bind full qualification to the actual checkout
+        if: needs.scope.outputs.route == 'full' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: bash .github/scripts/ci_scope.sh qualification
+      - name: Retain exact-commit full qualification
+        if: needs.scope.outputs.route == 'full' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ci-qualification
+          path: qualification.json
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true
