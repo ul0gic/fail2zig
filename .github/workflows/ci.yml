@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
@@ -18,13 +19,44 @@ env:
   ZIG_SHA256: "24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c"
 
 jobs:
-  fmt:
-    name: zig fmt --check
+  scope:
+    name: Classify changes
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      route: ${{ steps.scope.outputs.route }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+          fetch-depth: 0
+      - id: scope
+        name: Select applicable checks
+        run: bash .github/scripts/ci_scope.sh classify
+      - name: Ensure YAML validator is available
+        if: steps.scope.outputs.route == 'light'
+        run: |
+          if ! command -v yamllint >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y yamllint
+          fi
+      - name: Check community files
+        if: steps.scope.outputs.route == 'light'
+        run: |
+          bash .github/scripts/ci_scope.sh whitespace
+          yamllint -d '{extends: .yamllint, rules: {line-length: disable}}' .github/ISSUE_TEMPLATE/
+
+  lint:
+    needs: scope
+    if: needs.scope.outputs.route == 'full'
+    name: Source and workflow checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
       - name: Install Zig ${{ env.ZIG_VERSION }}
         run: |
           curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
@@ -34,36 +66,55 @@ jobs:
           echo "/opt/zig" >> "$GITHUB_PATH"
           /opt/zig/zig version
       - name: Check formatting
-        run: zig fmt --check engine/ client/ shared/ tests/
-
-  build-native:
-    name: Build (native Debug)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: zig fmt --check build.zig build.zig.zon engine/ client/ shared/ tests/
+      - name: Ensure lint tools are available
         run: |
-          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
-          echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c -
-          sudo mkdir -p /opt/zig
-          sudo tar -xf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
-          echo "/opt/zig" >> "$GITHUB_PATH"
-          /opt/zig/zig version
-      - name: Cache zig-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: .zig-cache
-          key: zig-cache-build-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
-          restore-keys: |
-            zig-cache-build-${{ runner.os }}-${{ env.ZIG_VERSION }}-
-      - name: zig build
-        run: zig build
+          missing=()
+          for tool in shellcheck yamllint; do
+            if ! command -v "$tool" >/dev/null; then missing+=("$tool"); fi
+          done
+          if ((${#missing[@]})); then
+            sudo apt-get update
+            sudo apt-get install -y "${missing[@]}"
+          fi
+      - name: Check changed-file whitespace and YAML
+        run: |
+          bash .github/scripts/ci_scope.sh whitespace
+          yamllint -c .yamllint .github/workflows/
+          yamllint -d '{extends: .yamllint, rules: {line-length: disable}}' .github/ISSUE_TEMPLATE/
+      - name: Test CI routing and failure handling
+        run: |
+          bash .github/scripts/test_ci_scope.sh
+          bash .github/scripts/release_test.sh
+      - name: Lint scripts
+        run: |
+          shellcheck -S warning tests/harness/*.sh tests/e2e/*.sh .github/scripts/*.sh
+          if [ -f scripts/install.sh ]; then
+            shellcheck -S warning scripts/install.sh
+          fi
+      - name: Run zizmor (GitHub Actions SAST)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pipx run zizmor==1.25.2 --min-severity medium .github/workflows/
+      - name: Verify every .zig file carries the SPDX + copyright header
+        run: |
+          missing=$(find engine client shared tests build.zig \
+            -type f -name '*.zig' \
+            -exec grep -L 'SPDX-License-Identifier' {} +)
+          if [ -n "$missing" ]; then
+            echo "::error::.zig files missing SPDX-License-Identifier header:"
+            echo "$missing"
+            exit 1
+          fi
+          echo "SPDX header present on every tracked .zig file."
 
   test:
-    name: Tests (std.testing.allocator leak detection)
+    needs: scope
+    if: needs.scope.outputs.route == 'full'
+    name: Assembled daemon and administrative tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -83,14 +134,77 @@ jobs:
           key: zig-cache-test-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
           restore-keys: |
             zig-cache-test-${{ runner.os }}-${{ env.ZIG_VERSION }}-
-      - name: Bounded local release checks
-        run: zig build test-release-local -Doptimize=ReleaseSafe
+      - name: Assembled daemon and administrative checks
+        run: /usr/bin/time -v zig build test-ci-assembled -Doptimize=ReleaseSafe -j2 --summary all
+
+  components:
+    needs: scope
+    if: needs.scope.outputs.route == 'full'
+    name: Native components (${{ matrix.shard }})
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [a, b]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: |
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
+          echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c -
+          sudo mkdir -p /opt/zig
+          sudo tar -xf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+          echo "/opt/zig" >> "$GITHUB_PATH"
+          /opt/zig/zig version
+      - name: Cache zig-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .zig-cache
+          key: zig-cache-components-${{ matrix.shard }}-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            zig-cache-components-${{ matrix.shard }}-${{ runner.os }}-${{ env.ZIG_VERSION }}-
+      - name: Native component checks
+        env:
+          CI_SHARD: ${{ matrix.shard }}
+        run: /usr/bin/time -v zig build "test-ci-components-$CI_SHARD" -Doptimize=ReleaseSafe -j2 --summary all
+
+  fuzz:
+    needs: scope
+    if: needs.scope.outputs.route == 'full'
+    name: Bounded fuzz and module guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: |
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
+          echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c -
+          sudo mkdir -p /opt/zig
+          sudo tar -xf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+          echo "/opt/zig" >> "$GITHUB_PATH"
+          /opt/zig/zig version
+      - name: Cache zig-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .zig-cache
+          key: zig-cache-fuzz-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            zig-cache-fuzz-${{ runner.os }}-${{ env.ZIG_VERSION }}-
+      - name: Bounded malformed-input checks
+        run: /usr/bin/time -v zig build test-ci-fuzz -Doptimize=ReleaseSafe -j2 --summary all
 
   release-target:
+    needs: scope
+    if: needs.scope.outputs.route == 'full'
     name: Cross-compile ${{ matrix.target }}
     strategy:
       fail-fast: false
-      max-parallel: 2
       matrix:
         include:
           - {target: x86_64-linux-musl, cpu: baseline, elf: "ELF 64-bit LSB.*x86-64"}
@@ -99,6 +213,7 @@ jobs:
           - {target: mips-linux-musleabi, cpu: mips32r2, elf: "ELF 32-bit MSB.*MIPS"}
           - {target: mipsel-linux-musleabi, cpu: mips32r2, elf: "ELF 32-bit LSB.*MIPS"}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -127,81 +242,49 @@ jobs:
         env:
           EXPECTED_ELF: ${{ matrix.elf }}
         run: |
-          find zig-out/bin -maxdepth 1 -type f -printf '%f\n' \
-            | LC_ALL=C sort > actual-executables
-          printf '%s\n' fail2zig > expected-executables
-          diff -u expected-executables actual-executables
-          file zig-out/bin/fail2zig
-          if ! file zig-out/bin/fail2zig | grep -q "$EXPECTED_ELF"; then
-            echo "::error::fail2zig has the wrong ELF architecture"
+          test "$(find zig-out/bin -mindepth 1 -maxdepth 1 -printf '%f\n')" = fail2zig
+          test -f zig-out/bin/fail2zig
+          test ! -L zig-out/bin/fail2zig
+          sha256sum zig-out/bin/fail2zig
+          description=$(file zig-out/bin/fail2zig)
+          printf '%s\n' "$description"
+          if [[ ! $description =~ $EXPECTED_ELF || $description != *', stripped'* ]]; then
+            echo "::error::fail2zig has the wrong ELF architecture or contains debug information"
             exit 1
           fi
-          if ! file zig-out/bin/fail2zig | grep -q ", stripped"; then
-            echo "::error::fail2zig contains debug information"
-            exit 1
-          fi
-          if readelf -l zig-out/bin/fail2zig | grep -q 'INTERP' || \
-             readelf -d zig-out/bin/fail2zig | grep -q NEEDED; then
-            echo "::error::fail2zig has a dynamic interpreter"
+          # A readelf failure must fail the job, not look like absent linkage.
+          headers=$(readelf -l zig-out/bin/fail2zig)
+          dynamic=$(readelf -d zig-out/bin/fail2zig)
+          if [[ $headers == *INTERP* || $dynamic == *NEEDED* ]]; then
+            echo "::error::fail2zig has a dynamic interpreter or dependency"
             exit 1
           fi
 
-  shellcheck:
-    name: shellcheck
+  ci-result:
+    name: CI result
+    timeout-minutes: 5
+    if: always()
+    needs: [scope, lint, test, components, fuzz, release-target]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
-      - name: Lint scripts
-        run: |
-          shellcheck -S warning tests/harness/*.sh tests/e2e/*.sh
-          if [ -f scripts/install.sh ]; then
-            shellcheck -S warning scripts/install.sh
-          fi
-
-  yamllint:
-    name: yamllint
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - name: Install yamllint
-        run: sudo apt-get update && sudo apt-get install -y yamllint
-      - name: Lint CI YAML
-        run: yamllint -c .yamllint .github/workflows/
-
-  zizmor:
-    name: zizmor
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - name: Run zizmor (GitHub Actions SAST)
+      - name: Require every applicable check to pass
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          pipx run zizmor==1.25.2 --min-severity medium .github/workflows/
-
-  spdx:
-    name: SPDX headers
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: bash .github/scripts/ci_scope.sh gate
+      - name: Bind full qualification to the actual checkout
+        if: needs.scope.outputs.route == 'full' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: bash .github/scripts/ci_scope.sh qualification
+      - name: Retain exact-commit full qualification
+        if: needs.scope.outputs.route == 'full' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          persist-credentials: false
-      - name: Verify every .zig file carries the SPDX + copyright header
-        run: |
-          missing=$(find engine client shared tests build.zig \
-            -type f -name '*.zig' \
-            -exec grep -L 'SPDX-License-Identifier' {} +)
-          if [ -n "$missing" ]; then
-            echo "::error::.zig files missing SPDX-License-Identifier header:"
-            echo "$missing"
-            exit 1
-          fi
-          echo "SPDX header present on every tracked .zig file."
+          name: ci-qualification
+          path: qualification.json
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true

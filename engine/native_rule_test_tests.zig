@@ -174,7 +174,17 @@ test "native rule test: hostname subject stays raw without --identity dns and re
 }
 
 test "native rule test: --config resolves the jail's timestamp, offset and ignoreip" {
-    var opts: rule_test.Options = .{ .input = .{ .file = fixture("sshd.log") }, .rule = .{ .service = "sshd" }, .now_us = now_us, .config = fixture("jail.toml") };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var config = try tmp.dir.createFile("jail.toml", .{ .mode = 0o600 });
+    defer config.close();
+    try config.chmod(0o600);
+    const config_text = try std.fs.cwd().readFileAlloc(testing.allocator, fixture("jail.toml"), 64 * 1024);
+    defer testing.allocator.free(config_text);
+    try config.writeAll(config_text);
+    const config_path = try tmp.dir.realpathAlloc(testing.allocator, "jail.toml");
+    defer testing.allocator.free(config_path);
+    var opts: rule_test.Options = .{ .input = .{ .file = fixture("sshd.log") }, .rule = .{ .service = "sshd" }, .now_us = now_us, .config = config_path };
     var report = try rule_test.evaluate(testing.allocator, opts);
     defer report.deinit();
     try testing.expectEqual(rule_test.Outcome.ignore, sample(&report, 1).outcome);
@@ -246,10 +256,18 @@ test "native rule test: timestamp format override and future timestamps" {
 
 test "native rule test: named time zone is loaded from the zoneinfo root" {
     std.fs.cwd().access("/usr/share/zoneinfo/Europe/Berlin", .{}) catch return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try @import("timezone_test_fixture.zig").copyInstalled(&tmp, &.{"Europe/Berlin"});
+    defer testing.allocator.free(root);
     var opts = base(.{ .record = "Apr 21 14:00:00 host sshd[1]: Failed password for root from 203.0.113.6 port 22 ssh2" }, .{ .service = "sshd" });
     opts.tz_offset_minutes = null;
     opts.time_zone = "Europe/Berlin";
-    var report = try rule_test.evaluate(testing.allocator, opts);
+    opts.timezone_root = root;
+    var report = rule_test.evaluate(testing.allocator, opts) catch |err| {
+        std.debug.print("installed Europe/Berlin rule evaluation: {s}\n", .{@errorName(err)});
+        return err;
+    };
     defer report.deinit();
     try testing.expectEqual(iso("2026-04-21T12:00:00Z"), sample(&report, 1).event_time_us.?);
     opts.time_zone = "Not/AZone";
