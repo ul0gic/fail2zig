@@ -875,21 +875,19 @@ few days; larger ones longer. Security advisories are acknowledged within
 
 ## License
 
-fail2zig is licensed under the **GNU Affero General Public License v3.0 or
-later** (AGPL-3.0-or-later). See [LICENSE](LICENSE) for the full text.
+**Free to use. Open to everyone. Built for the community.**
 
-In plain terms:
+Individuals and enterprises are welcome. Use it, contribute, or fork it under
+AGPL-3.0-or-later. Preserve attribution, and give your own derivative product
+a distinct name.
 
-- You can run, read, fork, modify, and redistribute fail2zig.
-- If you modify it, your modifications are also AGPL-3.0-or-later and must be
-  published on request — including when you only expose the software over a
-  network (the "network use is distribution" clause is the whole point of
-  AGPL).
-- Internal commercial use is fine. Self-hosting is fine. Forking for your
-  own needs is fine. Publishing a fork under a different name is fine.
+Commercial use is welcome. Taking this work, closing off source that AGPL
+requires you to share, and selling it without honoring those obligations is not.
 
-The AGPL covers **code rights**. Brand, name, and identity are separate — see
-Trademark below.
+**The same rules apply whether you're an individual developer or a trillion-dollar company.**
+
+See [LICENSE](LICENSE) for the terms. The fail2zig name and branding identify
+the official project; see [Trademark](#trademark) below.
 
 ## Trademark
 
@@ -905,7 +903,5 @@ You may fork and modify the code under the AGPL-3.0-or-later. You may **not**:
   affiliated with fail2zig;
 - use the name or branding for a commercial hosted service offering.
 
-If you ship a fork, give it a different name. This separation — permissive
-code rights, strict name rights — is the same model used by Redis
-(pre-2024), Elasticsearch, and Grafana Labs. Contact the maintainer for any
+If you ship a fork, give it a different name. Contact the maintainer for any
 trademark licensing question.
