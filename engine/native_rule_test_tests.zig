@@ -259,7 +259,10 @@ test "native rule test: named time zone is loaded from the zoneinfo root" {
     var opts = base(.{ .record = "Apr 21 14:00:00 host sshd[1]: Failed password for root from 203.0.113.6 port 22 ssh2" }, .{ .service = "sshd" });
     opts.tz_offset_minutes = null;
     opts.time_zone = "Europe/Berlin";
-    var report = try rule_test.evaluate(testing.allocator, opts);
+    var report = rule_test.evaluate(testing.allocator, opts) catch |err| {
+        std.debug.print("installed Europe/Berlin rule evaluation: {s}\n", .{@errorName(err)});
+        return err;
+    };
     defer report.deinit();
     try testing.expectEqual(iso("2026-04-21T12:00:00Z"), sample(&report, 1).event_time_us.?);
     opts.time_zone = "Not/AZone";
