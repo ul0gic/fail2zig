@@ -250,14 +250,31 @@ fn seconds(iso: []const u8) !i64 {
     return @divFloor((try time.parse(.iso8601, iso, .{})).us, 1_000_000);
 }
 
-test "native timezone: installed UTC and New York explicit transitions resolve read only" {
-    var utc = try zone.Zone.load(t.allocator, "/usr/share/zoneinfo", "Etc/UTC", .reject);
+test "native timezone: trusted copies of installed UTC and New York resolve read only" {
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try @import("timezone_test_fixture.zig").copyInstalled(&tmp, &.{ "Etc/UTC", "America/New_York" });
+    defer t.allocator.free(root);
+    var utc = zone.Zone.load(t.allocator, root, "Etc/UTC", .reject) catch |err| {
+        std.debug.print("installed Etc/UTC load: {s}\n", .{@errorName(err)});
+        return err;
+    };
     defer utc.deinit();
     try t.expect(utc.fixed);
     try t.expectEqual(@as(i64, -1), (try utc.resolveLocalMicros(-1)).utc_us);
-    var ny = try zone.Zone.load(t.allocator, "/usr/share/zoneinfo", "America/New_York", .reject);
+    var ny = zone.Zone.load(t.allocator, root, "America/New_York", .reject) catch |err| {
+        std.debug.print("installed America/New_York load: {s}\n", .{@errorName(err)});
+        return err;
+    };
     defer ny.deinit();
-    const winter = try ny.resolveLocalSeconds(try seconds("2026-01-15T12:00:00Z"));
+    const winter = ny.resolveLocalSeconds(try seconds("2026-01-15T12:00:00Z")) catch |err| {
+        std.debug.print("installed New York 2026 resolution: {s}; transitions={d}, first={d}, last={d}, tail={}\n", .{
+            @errorName(err),                                                  ny.transitions.len,
+            if (ny.transitions.len > 0) ny.transitions[0].utc_seconds else 0, if (ny.transitions.len > 0) ny.transitions[ny.transitions.len - 1].utc_seconds else 0,
+            ny.tail_present,
+        });
+        return err;
+    };
     try t.expectEqual(@as(i32, -18000), winter.offset_seconds);
     try t.expectEqual(try seconds("2026-01-15T17:00:00Z"), winter.utc_seconds);
     const summer = try ny.resolveLocalSeconds(try seconds("2026-07-15T12:00:00Z"));

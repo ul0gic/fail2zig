@@ -1,127 +1,127 @@
 # Contributing to fail2zig
 
-Thanks for being here. fail2zig is built in the open — issues, PRs,
-roadmap, all visible. Every shipped feature has been a public PR; that
-won't change.
+Bug reports, filters, documentation fixes and code contributions are welcome.
+Start with an existing [issue](https://github.com/ul0gic/fail2zig/issues), or
+open a [discussion](https://github.com/ul0gic/fail2zig/discussions) if you want
+to work through an idea first. You do not need to submit a PR to request a feature.
 
-This guide tells you where to start and what we expect of a good
-contribution.
+Security vulnerabilities belong in a [private report](SECURITY.md).
 
-## TL;DR
+## Where to start
 
-- **Start here:** the [`good first issue`](https://github.com/ul0gic/fail2zig/labels/good%20first%20issue) label.
-- **Easiest contribution:** add a filter for a service we don't cover yet. See the [Filter contribution template](https://github.com/ul0gic/fail2zig/issues/new?template=filter_contribution.yml).
-- **License:** AGPL-3.0-or-later. By submitting a PR you agree your contribution lands under that license.
-- **Discussions for questions, Issues for actionable work.** Don't open an Issue with "how do I…" — that goes in [Discussions](https://github.com/ul0gic/fail2zig/discussions).
-- **Security vulnerabilities go through [private advisories](https://github.com/ul0gic/fail2zig/security/advisories/new),** never public Issues.
+The [`good first issue`](https://github.com/ul0gic/fail2zig/labels/good%20first%20issue)
+label is a useful starting point. Filters for services we do not cover are another
+way to contribute. Include representative log lines that should match and ones
+that should not, with sensitive details removed.
 
-## The three contribution lanes
+| Area | Current implementation | Before proposing an extension |
+|------|------------------------|-------------------------------|
+| Filters and rules | Built-in filters in `engine/filters/` and bounded native custom rules | Explain the log format and how a match identifies the responsible address. |
+| Sources | Native file and journal ingestion in `engine/` | Discuss origin validation, restart continuity and resource limits. Remote/cloud sources are proposals, not supported source types. |
+| Firewall backends | nftables, iptables and ipset in `engine/firewall/` | Discuss exact scope, ownership, readback and recovery. Cloud APIs and other backends need a design discussion. |
 
-fail2zig has three plug-points where the community can land work without
-touching the engine core. Each is a clean module boundary; each gets
-comptime-baked into the binary at build time (no runtime plugins, no
-dynamic code loading).
+Contributions are compiled into the executable. There is no runtime plugin or
+arbitrary action-loading interface. See the [runtime architecture](docs/architecture.md)
+for the current boundaries. Fleet management and other broader ideas need their
+own scope and discussion; they are not part of the current host runtime.
 
-| Lane | What it is | Where the code lives | Effort |
-|------|-----------|---------------------|--------|
-| **Filters** | Pattern matchers for new services (Vaultwarden, Caddy, Authelia, k8s, etc.) | `engine/filters/` | Low — a few dozen lines per filter |
-| **Sources** | New places log lines come from (journald, syslog over network, Docker engine, k8s pod logs, cloud audit logs) | `engine/core/log_watcher.zig` and friends | Medium — needs a watcher implementation |
-| **Backends** | New places bans get applied (AWS WAF, Cloudflare, Tailscale ACLs, k8s NetworkPolicy, eBPF/XDP) | `engine/firewall/` | Medium-High — depends on the target API |
+## Build and check a change
 
-If you're not sure where to start, **start with a filter.** It's the
-shortest path from "I have an idea" to "my work shipped in a release."
-
-## Quick start
+Use Linux and **Zig 0.14.1 exactly**, available from
+[ziglang.org/download](https://ziglang.org/download/).
 
 ```bash
-# Clone
 git clone https://github.com/ul0gic/fail2zig
 cd fail2zig
+zig build -Doptimize=ReleaseSafe
+make fmt-check
 
-# Build (debug)
-zig build
-
-# Run tests (must pass clean, zero leaks)
-zig build test
-
-# Format check (CI-enforced)
-zig fmt --check engine/ client/ shared/ tests/
+# Run the maintained CI test aggregates locally.
+make test
 ```
 
-Requires **Zig 0.14.1 exactly.** Newer versions may break the build.
-Install from [ziglang.org/download](https://ziglang.org/download/).
+The build produces one executable, `zig-out/bin/fail2zig`, containing the daemon
+and administrative commands. SQLite C is vendored and linked statically. The
+runtime needs neither Python nor a SQLite service, CLI or shared library.
+Journal ingestion uses the host's `journalctl`; iptables and ipset backends use
+those host tools. nftables enforcement uses kernel netlink directly.
+
+While editing, run the relevant named suite, for example:
+
+```bash
+zig build test-native-detection -Doptimize=ReleaseSafe
+zig build test-native-ipc-auth -Doptimize=ReleaseSafe
+make fuzz
+```
+
+`make test` runs component shards, assembled integration tests and bounded fuzz
+cases in sequence. `make fuzz` runs bounded fuzz cases and the test module-graph
+guard, not an ongoing fuzzing campaign. Local test builds use two compile jobs by default;
+override this with `make test ZIG_JOBS=4` when resources allow. Avoid the broad
+`zig build test` entry point: it still includes legacy tests outside the maintained
+CI inventory. Suite definitions live in
+[build.zig](build.zig).
+
+Do not run daemon/startup test suites concurrently in the same checkout: they
+share `zig-out/bin/fail2zig`. Some integration tests need privileges, host tools
+or kernel features and may skip when those are absent. Include skips and the
+environment in your PR's verification notes; a hosted test pass does not prove
+live firewall enforcement on every supported architecture. Use an isolated test
+machine or namespace for tests that change firewall state.
+
+Local checks are optional conveniences, not substitutes for required CI. Docs
+and community-only changes take the small CI route; code, build and workflow
+changes take the full route. Formatting, shell/YAML checks, workflow security
+analysis, maintained test suites and five release cross-builds run where
+applicable. See [CI](.github/workflows/ci.yml) for the exact checks.
 
 ## Filing an issue
 
-Use one of the three templates — they ask the questions a maintainer
-needs answered.
+Choose the form that fits:
 
-- **[Bug report](https://github.com/ul0gic/fail2zig/issues/new?template=bug_report.yml)** — something doesn't work as documented.
-- **[Feature request](https://github.com/ul0gic/fail2zig/issues/new?template=feature_request.yml)** — propose new behavior or knobs.
-- **[Filter contribution](https://github.com/ul0gic/fail2zig/issues/new?template=filter_contribution.yml)** — propose a new service filter.
+- [Bug report](https://github.com/ul0gic/fail2zig/issues/new?template=bug_report.yml): what happened, what you expected and how to reproduce it.
+- [Feature request](https://github.com/ul0gic/fail2zig/issues/new?template=feature_request.yml): the problem you want to solve and what would help. Examples and interest in submitting a PR are optional.
+- [Filter contribution](https://github.com/ul0gic/fail2zig/issues/new?template=filter_contribution.yml): a service filter and representative input.
 
-Don't open a blank issue. The templates exist so triage doesn't have to
-go back and forth asking for basic info.
+Use [Discussions](https://github.com/ul0gic/fail2zig/discussions) for setup questions
+or ideas that are not yet actionable.
 
-## A good PR
+## Sending a PR
 
-- **One purpose per PR.** A bug fix is not a refactor + rename + unrelated cleanup. If the description wants to say "also," split it.
-- **Commit messages follow the existing style:** `feat(scope): …`, `fix(scope): …`, `docs(scope): …`, `chore(scope): …`. Scope is the directory or module.
-- **Description explains *why*.** The diff already shows *what*. If it fixes a bug, link the issue.
-- **Tests.** A bug fix includes a regression test that would have failed before the fix. A feature covers the happy path plus at least one error case. Filter contributions include positive + negative log lines.
-- **CI green.** If CI is broken on `main`, that's its own PR first.
+Keep each PR focused on one problem. Explain the resulting behavior, why it helps,
+and how you checked it. Link the relevant issue or discussion. For code changes,
+include tests for the behavior and meaningful failure cases; a bug fix should
+include a regression test where practical. Documentation changes do not need
+unrelated runtime tests.
 
-A PR that hits those marks gets reviewed. Feedback is aimed at landing
-the change, not gatekeeping — if something needs adjusting, we'll say
-what and why.
+Follow the existing commit style, such as `fix(client): ...` or `docs: ...`.
+Run `make fmt` for Zig changes, including build files. New Zig files need SPDX
+headers. Use checked arithmetic, explicit errors and clear allocation ownership;
+do not disable runtime safety or introduce attacker-reachable panics. Use leak
+checking where the test owns allocations. Some engineering rules need code review
+and are not mechanically enforced by CI.
 
-## Standards (CI enforces these)
+Preserve these runtime contracts:
 
-**Zig:**
-- `zig fmt engine/ client/ shared/ tests/` before every commit — CI-enforced
-- `zig build` and `zig build test` pass, zero failures, zero leaks
-- Zero compiler warnings; `zig build -Doptimize=.ReleaseSafe` clean
-- No `@panic` in production code — propagate errors explicitly
-- No `@setRuntimeSafety(false)` without a comment proving the safety invariant
-- All tests use `std.testing.allocator` for leak detection
-- SPDX header on every `.zig` file (CI-enforced via the `spdx` job)
+- Zig application code with pinned, statically embedded SQLite C. New dependencies need discussion; do not add runtime downloads or interpreters.
+- Persist receipts, source progress and consumer state consistently. Publish state after commit, and retain enforcement intent until its outcome is known.
+- Bound inputs, queues and storage. Do not evict critical receipts, active owners or unresolved effects to meet a budget. Exhaustion must remain visible without silently losing protection.
+- Treat logs, protocol frames and subprocess output as untrusted data. Never turn input into shell commands or dynamically loaded code.
+- Preserve authorization, exact firewall scope and ownership. A policy decision is not proof that the kernel installed protection.
 
-**Architecture invariants — do not violate without a design conversation first:**
-- **No runtime plugins / dynamic code loading.** The trusted computing base IS the binary. Contributions land at compile time, not at runtime.
-- **No third-party Zig packages.** Zero runtime dependencies is the product promise. C interop is allowed for stable kernel ABIs only.
-- **State tracker is bounded by the ceiling.** `memory_ceiling_mb` derives an entry-count cap for the state tracker (the dominant memory consumer); eviction fires before the cap is exceeded. The parser hot path is zero-alloc. `BudgetAllocator` exists in `engine/core/memory.zig` for components that need a hard per-component byte budget, but is not currently wired to a live consumer — if you add a new component with significant allocation, reach out before choosing an allocator strategy.
-- **No runtime regex engine in the daemon.** Patterns are comptime-specialized. Runtime regex is an attack surface we don't carry.
-
-## What we're intentionally NOT building
-
-These come up regularly. They are *deliberate* choices, not omissions:
-
-- A plugin system for filters or backends (see above — comptime contributions instead)
-- A configuration server, dashboard auth provider, or user-management layer
-- Cross-machine ban orchestration in v0.x (different product category; see roadmap)
-- Windows support (out of scope; the firewall layer is Linux-kernel native)
-
-Open a [Discussion](https://github.com/ul0gic/fail2zig/discussions) if
-you want to argue for any of these — the list is not immutable, just
-what we've decided against so far.
+The shipped systemd service runs as the dedicated `fail2zig` account with specific
+capabilities, rather than requiring a root daemon. Installation still needs root.
+See [SECURITY.md](SECURITY.md) for the privilege boundary.
 
 ## Conduct
 
-Be excellent to each other. Disrespectful behavior, harassment, or
-bad-faith engagement gets you removed from the project — no formal
-process, just judgment. Reports go to **devteam@corelift.io** and are
-handled privately.
+Treat other contributors with respect. Harassment and bad-faith engagement can
+result in removal from the project. Reports go to **devteam@corelift.io** and
+are handled privately.
 
 ## License
 
-By opening a pull request, you agree your contribution is licensed
-**AGPL-3.0-or-later** — the same license as the rest of the project.
-No CLA, no sign-off ceremony. `git blame` is the authorship record.
-
-The trademark on the "fail2zig" name and logo is separate and not
-granted by contributing — see [Trademark](README.md#trademark) in the
-README.
-
----
-
-That's it. Open the issue, write the PR, ship.
+By submitting a PR, you agree that your contribution is licensed
+**AGPL-3.0-or-later**, the same license as the project. There is no CLA or
+sign-off requirement. The trademark on the fail2zig name and logo is separate;
+see [Trademark](README.md#trademark).
