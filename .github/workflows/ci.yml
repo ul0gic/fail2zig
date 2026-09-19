@@ -18,7 +18,44 @@ env:
   ZIG_SHA256: "24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c"
 
 jobs:
+  scope:
+    name: Classify changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      route: ${{ steps.scope.outputs.route }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: scope
+        name: Select applicable checks
+        run: python3 -B .github/scripts/ci_scope.py classify
+
+  community:
+    name: Community files
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Check changed-file whitespace
+        run: python3 -B .github/scripts/ci_scope.py whitespace
+      - name: Test CI routing and failure handling
+        run: python3 -B -m unittest discover -s .github/scripts -p 'test_*.py' -v
+      - name: Install YAML validator
+        run: sudo apt-get update && sudo apt-get install -y yamllint
+      - name: Check issue-form YAML syntax
+        # Prose fields need not follow the workflow line-length limit.
+        run: |
+          yamllint -d '{extends: .yamllint, rules: {line-length: disable}}' .github/ISSUE_TEMPLATE/
+
   fmt:
+    needs: scope
+    if: needs.scope.outputs.route == 'full'
     name: zig fmt --check
     runs-on: ubuntu-latest
     steps:
@@ -37,6 +74,8 @@ jobs:
         run: zig fmt --check engine/ client/ shared/ tests/
 
   build-native:
+    needs: scope
+    if: needs.scope.outputs.route == 'full'
     name: Build (native Debug)
     runs-on: ubuntu-latest
     steps:
@@ -62,6 +101,8 @@ jobs:
         run: zig build
 
   test:
+    needs: scope
+    if: needs.scope.outputs.route == 'full'
     name: Tests (std.testing.allocator leak detection)
     runs-on: ubuntu-latest
     steps:
@@ -87,6 +128,8 @@ jobs:
         run: zig build test-release-local -Doptimize=ReleaseSafe
 
   release-target:
+    needs: scope
+    if: needs.scope.outputs.route == 'full'
     name: Cross-compile ${{ matrix.target }}
     strategy:
       fail-fast: false
@@ -147,6 +190,8 @@ jobs:
           fi
 
   shellcheck:
+    needs: scope
+    if: needs.scope.outputs.route == 'full'
     name: shellcheck
     runs-on: ubuntu-latest
     steps:
@@ -163,6 +208,8 @@ jobs:
           fi
 
   yamllint:
+    needs: scope
+    if: needs.scope.outputs.route == 'full'
     name: yamllint
     runs-on: ubuntu-latest
     steps:
@@ -175,6 +222,8 @@ jobs:
         run: yamllint -c .yamllint .github/workflows/
 
   zizmor:
+    needs: scope
+    if: needs.scope.outputs.route == 'full'
     name: zizmor
     runs-on: ubuntu-latest
     steps:
@@ -188,6 +237,8 @@ jobs:
           pipx run zizmor==1.25.2 --min-severity medium .github/workflows/
 
   spdx:
+    needs: scope
+    if: needs.scope.outputs.route == 'full'
     name: SPDX headers
     runs-on: ubuntu-latest
     steps:
@@ -205,3 +256,18 @@ jobs:
             exit 1
           fi
           echo "SPDX header present on every tracked .zig file."
+
+  ci-result:
+    name: CI result
+    timeout-minutes: 5
+    if: always()
+    needs: [scope, community, fmt, build-native, test, release-target, shellcheck, yamllint, zizmor, spdx]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Require every applicable check to pass
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: python3 -B .github/scripts/ci_scope.py gate
