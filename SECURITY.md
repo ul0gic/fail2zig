@@ -1,8 +1,33 @@
 # Security Policy
 
-fail2zig runs as root, parses attacker-controlled input, and writes kernel
-firewall state. The security of the tool matters more than the features of
-the tool. If you have found a vulnerability, we want to hear from you.
+fail2zig parses attacker-controlled input and manages kernel firewall state.
+If you have found a vulnerability, please report it privately.
+
+## Privileges and trust boundaries
+
+The shipped [systemd unit](deploy/fail2zig.service) runs as the dedicated
+`fail2zig` user and group, not root. It retains `CAP_NET_ADMIN` for firewall
+management, `CAP_NET_RAW` for the iptables ipset extension, and
+`CAP_DAC_READ_SEARCH` for protected log and journal access. These are significant
+privileges: the service account is not an unprivileged sandbox. HTTP monitoring
+runs in the same process and shares those capabilities.
+
+The unit also restricts filesystem access, syscalls and address families.
+The [installer](scripts/install.sh) requires root to install files, create the
+service account and prepare state ownership. It does not start or restart the
+service. Configuration and executable files remain administrator-owned;
+the native state directory and database belong to the daemon account.
+
+Manual invocation runs with the caller's identity and privileges. It does not
+acquire the systemd unit's capabilities or hardening automatically. All-log-only
+configurations can run without firewall capability when their source and state
+permissions allow it.
+
+Local administrative commands use the Unix socket. Peer credentials authorize
+mutations for root or the daemon UID; other users with socket access have
+read-only monitoring access. Attacker-controlled logs are data, not configuration
+or executable actions. See the [runtime architecture](docs/architecture.md) for
+source validation, durable state and enforcement boundaries.
 
 ## Reporting a vulnerability
 
@@ -11,7 +36,7 @@ the tool. If you have found a vulnerability, we want to hear from you.
 <https://github.com/ul0gic/fail2zig/security/advisories/new>
 
 This creates a private report visible only to the fail2zig maintainers. Do
-not open a public issue for a security vulnerability — public issues are
+not open a public issue for a security vulnerability. Public issues are
 indexed immediately and give attackers a fix window before we have one.
 
 If GitHub is unavailable, or you need an out-of-band channel, contact the
@@ -32,7 +57,7 @@ maintainer via the address listed on the GitHub profile.
 ## What we commit to
 
 - **Acknowledgement within 48 hours** of a valid report.
-- **An initial assessment, best-effort within 14 days** — severity,
+- **An initial assessment, best-effort within 14 days**, covering severity,
   affected versions, whether a fix path is clear.
 - **A fix before public disclosure** for high-severity issues, or a
   coordinated 90-day disclosure timeline agreed with the reporter.
@@ -47,9 +72,10 @@ We do not run a bug bounty program.
 
 In scope:
 
-- The fail2zig daemon and the `fail2zig-client` CLI.
+- The unified `fail2zig` executable, including the daemon and administrative CLI.
 - The filter definitions shipped in the repository.
-- The release binaries published on the releases page.
+- Embedded dependencies as used by fail2zig, including the vendored SQLite code.
+- The installer, service unit, release packaging and published release artifacts.
 - The fail2zig.com marketing and documentation site.
 
 Out of scope:
@@ -59,19 +85,22 @@ Out of scope:
 - Vulnerabilities in the services being protected (`sshd`, `nginx`,
   `postfix`, etc.).
 - Social engineering of maintainers or project contributors.
-- Denial-of-service attacks that require exhausting the host's resources
-  beyond what fail2zig itself consumes — the memory ceiling is a
-  hard bound on fail2zig, not on the host.
+- Host-wide exhaustion caused independently of fail2zig. Resource exhaustion
+  triggered through fail2zig's own input handling, state growth or administrative
+  interfaces is in scope. Internal budgets are not a promise to bound all host
+  memory or resources.
 
 ## Non-vulnerability bugs
 
-Operational bugs, crashes, regressions, and feature requests belong in
-the public issue tracker:
+Operational bugs and feature requests without security impact belong in the
+public issue tracker:
 
 <https://github.com/ul0gic/fail2zig/issues>
 
-Use that channel freely — public issues are how the project gets better.
-The private advisory channel is for vulnerabilities only.
+Use the private advisory channel for crashes, regressions or resource exhaustion
+that could affect security, including bypassed detection, unauthorized operations
+or loss of installed protection. If you are unsure whether a report is security
+sensitive, send it privately first.
 
 ## Audit and disclosure log
 
