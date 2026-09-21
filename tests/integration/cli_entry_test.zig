@@ -96,6 +96,55 @@ test "cli entry: local help and version come from the same artifact and never na
     try testing.expect(std.mem.indexOf(u8, comp.stdout, "firewall") != null);
 }
 
+test "cli entry: --import-config preserves documented exit classes" {
+    const a = testing.allocator;
+    std.fs.cwd().access(exe, .{}) catch return error.SkipZigTest;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(source);
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "jail.conf",
+        .data =
+        \\[DEFAULT]
+        \\bantime = 600
+        \\[sshd]
+        \\enabled = true
+        \\filter = sshd
+        \\logpath = /var/log/auth.log
+        ,
+    });
+    const enabled_output = try std.fs.path.join(a, &.{ source, "enabled.toml" });
+    defer a.free(enabled_output);
+    const enabled = try run(a, &.{ exe, "--import-config", source, "--import-output", enabled_output });
+    defer enabled.deinit(a);
+    try testing.expectEqual(@as(u8, 0), enabled.code);
+    try std.fs.cwd().access(enabled_output, .{});
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "jail.conf",
+        .data =
+        \\[DEFAULT]
+        \\bantime = 600
+        ,
+    });
+    const disabled_output = try std.fs.path.join(a, &.{ source, "disabled.toml" });
+    defer a.free(disabled_output);
+    const disabled = try run(a, &.{ exe, "--import-config", source, "--import-output", disabled_output });
+    defer disabled.deinit(a);
+    try testing.expectEqual(@as(u8, 1), disabled.code);
+
+    try tmp.dir.writeFile(.{ .sub_path = "jail.conf", .data = "[sshd\n" });
+    const invalid_output = try std.fs.path.join(a, &.{ source, "invalid.toml" });
+    defer a.free(invalid_output);
+    const invalid = try run(a, &.{ exe, "--import-config", source, "--import-output", invalid_output });
+    defer invalid.deinit(a);
+    try testing.expectEqual(@as(u8, 2), invalid.code);
+    try testing.expectEqualStrings("import: failed: UnterminatedSection\n", invalid.stderr);
+}
+
 test "cli entry: usage failures are class 2 and absent service is class 3" {
     const a = testing.allocator;
     std.fs.cwd().access(exe, .{}) catch return error.SkipZigTest;

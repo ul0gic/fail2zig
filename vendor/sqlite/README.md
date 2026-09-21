@@ -29,6 +29,6 @@ When updating, verify the archive against the upstream published hash, update th
 and the embedded-version test, and rerun transaction/restart/upgrade tests on supported
 targets. Do not patch the amalgamation or adopt extra feature-removal flags silently.
 
-The current integration replaces the staged record store's dynamic library loader. The
-active daemon still uses its existing binary state files until migration and native source
-integration pass their separate acceptance gates.
+The active daemon uses this statically embedded SQLite library for durable runtime state.
+Legacy state migration and continuity requirements are documented separately from the
+upstream amalgamation and its pinned provenance.

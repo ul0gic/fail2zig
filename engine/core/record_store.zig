@@ -2291,11 +2291,12 @@ pub const Store = struct {
         if (try action.row()) return true;
         const policy = try self.readRetryPolicy(fence.jail);
         const occurrence_key = retry.occurrenceKey(fence.source, occurrence);
-        var detections = try self.statement("SELECT family,subject FROM record_detections WHERE jail=?1 AND source=?2 AND occurrence=?3;");
+        var detections = try self.statement("SELECT family,subject FROM record_detections WHERE jail=?1 AND source=?2 AND occurrence=?3 AND kind=?4;");
         defer detections.deinit();
         try detections.text(1, fence.jail);
         try detections.text(2, fence.source);
         try detections.text(3, occurrence);
+        try detections.int(4, @intFromEnum(detection.Kind.candidate));
         var count: usize = 0;
         while (try detections.row()) {
             count += 1;
