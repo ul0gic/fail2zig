@@ -113,6 +113,18 @@ process and observation identity, page limit and a 60-second pagination lifetime
 Complete readback, sample truncation, inventory membership and durable confirmation
 remain separate facts.
 
+A fixed `exact_v1` structure proof is attached only after two complete matching
+inspector passes establish the owned installation. Cache metadata carries that
+proof with the observation; failures retain it and absent observations clear it.
+The query projects only the validated scaffold (tables, chains, sets, attachment
+and base rules), plus a chain/set placement for each sampled entry. Dynamic scope
+rules retain their canonical protocol/port/network projection and are subject to
+the existing sample/page bounds. The JSON additions are nullable `structure` and
+per-item `placement`; no proof means no inferred structure. Backend-native set
+key types are `ipv4_addr`/`ipv6_addr` for nftables and `hash:ip` for ipset, whose
+family is reported separately. These are normalized observations, not general
+host ruleset enumeration or assertions about packet reachability.
+
 Cache and transient-page costs use actual Zig type sizes in resource admission.
 Optional cache admission or allocation failure makes inspection unavailable while
 preserving the baseline enforcement resource contract. It never evicts durable state

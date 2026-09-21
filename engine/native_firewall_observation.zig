@@ -39,6 +39,7 @@ pub const Metadata = struct {
     process_nonce: [16]u8,
     sequence: u64 = 0,
     state: enum { unavailable, owned, absent } = .unavailable,
+    structure_proof: inspection.StructureProof = .unverified,
     observed_mono_ms: ?u64 = null,
     observed_wall_us: ?i64 = null,
     observed_total: usize = 0,
@@ -98,6 +99,7 @@ pub const Cache = struct {
             .owned => .owned,
             .absent => .absent,
         };
+        self.metadata.structure_proof = if (snapshot.state == .owned) snapshot.structure_proof else .unverified;
         self.metadata.observed_mono_ms = stamp.monotonic_ms;
         self.metadata.observed_wall_us = stamp.wall_us;
         self.metadata.observed_total = snapshot.entries.len;
@@ -296,6 +298,7 @@ test "native effect runtime: observation cache pages one immutable complete samp
 test "native effect runtime: observation failure retains stale data and replacement invalidates cursors" {
     var entries = [_]inspection.Entry{.{ .address = .{ .ipv4 = 0xc0000201 } }};
     var snapshot = testSnapshot(.owned, &entries);
+    snapshot.structure_proof = .exact_v1;
     var cache = Cache.init(snapshot.installation, [_]u8{0x53} ** 16);
     cache.capture(&snapshot, .{ .monotonic_ms = 1_000, .wall_us = 2_000, .origin = .effect, .inventory = .known_entries });
     var page: Page = undefined;
@@ -305,6 +308,7 @@ test "native effect runtime: observation failure retains stale data and replacem
     try cache.readPage(.{ .limit = 1, .now_ms = 1_030 }, &stale);
     try std.testing.expectEqual(@as(u64, 1), stale.metadata.sequence);
     try std.testing.expectEqual(error.Timeout, stale.metadata.attempt_failure.?);
+    try std.testing.expectEqual(.exact_v1, stale.metadata.structure_proof);
     try std.testing.expectEqualDeep(entries[0], stale.entries[0]);
 
     var no_entries: [0]inspection.Entry = .{};
@@ -313,6 +317,7 @@ test "native effect runtime: observation failure retains stale data and replacem
     try std.testing.expectEqual(@as(u64, 2), cache.metadata.sequence);
     try std.testing.expect(cache.metadata.attempt_failure == null);
     try std.testing.expectEqual(@as(usize, 0), cache.metadata.retained_count);
+    try std.testing.expectEqual(.unverified, cache.metadata.structure_proof);
 }
 
 test "native effect runtime: observation cursors bind snapshot parameters and lifetime" {

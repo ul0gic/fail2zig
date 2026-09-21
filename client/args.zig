@@ -36,11 +36,11 @@ pub const Shell = enum {
 pub const Command = union(enum) {
     help: ?[]const u8,
     version: void,
-    status: void,
+    status: DetailArgs,
     ban: BanArgs,
     unban: UnbanArgs,
     list: ListArgs,
-    jails: void,
+    jails: DetailArgs,
     reload: void,
     remote_version: void,
     completions: Shell,
@@ -83,7 +83,10 @@ pub const Command = union(enum) {
 
     pub const ListArgs = struct {
         jail: ?[]const u8 = null,
+        details: bool = false,
     };
+
+    pub const DetailArgs = struct { details: bool = false };
 
     pub const HistoryArgs = struct {
         jail: ?[]const u8 = null,
@@ -94,6 +97,7 @@ pub const Command = union(enum) {
     pub const FirewallArgs = struct {
         limit: ?u32 = null,
         cursor: ?[]const u8 = null,
+        details: bool = false,
     };
 };
 
@@ -201,12 +205,10 @@ pub fn parse(argv: []const []const u8, diag: *ParseDiag) Error!Parsed {
     const rest = argv[i..];
 
     if (std.mem.eql(u8, cmd_str, "status")) {
-        try expectNoPositional(rest, "status", diag, &globals);
-        return Parsed{ .globals = globals, .command = .status };
+        return parseDetailsOnly(rest, "status", &globals, diag, .status);
     }
     if (std.mem.eql(u8, cmd_str, "jails")) {
-        try expectNoPositional(rest, "jails", diag, &globals);
-        return Parsed{ .globals = globals, .command = .jails };
+        return parseDetailsOnly(rest, "jails", &globals, diag, .jails);
     }
     if (std.mem.eql(u8, cmd_str, "reload")) {
         try expectNoPositional(rest, "reload", diag, &globals);
@@ -254,6 +256,26 @@ pub fn parse(argv: []const []const u8, diag: *ParseDiag) Error!Parsed {
         diag.set("unknown command '{s}' (try 'fail2zig --help')", .{cmd_str});
     }
     return error.UnknownCommand;
+}
+
+fn parseDetailsOnly(rest: []const []const u8, cmd: []const u8, globals: *Globals, diag: *ParseDiag, comptime tag: enum { status, jails }) Error!Parsed {
+    var detail = Command.DetailArgs{};
+    var k: usize = 0;
+    while (k < rest.len) : (k += 1) {
+        const a = rest[k];
+        if (try takeTrailingGlobal(a, rest, &k, globals, diag)) continue;
+        if (std.mem.eql(u8, a, "--details")) {
+            detail.details = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--")) {
+            diag.set("unknown flag for '{s}': {s}", .{ cmd, a });
+            return error.UnknownFlag;
+        }
+        diag.set("command '{s}' takes no arguments, got '{s}'", .{ cmd, a });
+        return error.TooManyArguments;
+    }
+    return Parsed{ .globals = globals.*, .command = @unionInit(Command, @tagName(tag), detail) };
 }
 
 fn expectNoPositional(rest: []const []const u8, cmd: []const u8, diag: *ParseDiag, globals: *Globals) Error!void {
@@ -482,6 +504,10 @@ fn parseList(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Erro
             args.jail = rest[k];
             continue;
         }
+        if (std.mem.eql(u8, a, "--details")) {
+            args.details = true;
+            continue;
+        }
         if (std.mem.startsWith(u8, a, "--")) {
             diag.set("unknown flag for 'list': {s}", .{a});
             return error.UnknownFlag;
@@ -583,6 +609,10 @@ fn parseFirewall(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) 
                 return error.InvalidValue;
             }
             out.cursor = rest[k];
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--details")) {
+            out.details = true;
             continue;
         }
         if (std.mem.startsWith(u8, a, "--")) {
@@ -737,11 +767,11 @@ pub const help_top =
     \\    fail2zig [global-flags] <command> [args]
     \\
     \\COMMANDS:
-    \\    status              Show daemon status (uptime, memory, active bans)
+    \\    status              Show protection-first daemon status (--details for identifiers/metrics)
     \\    ban <ip>            Manually ban an IP
     \\    unban <ip>          Manually unban an IP
     \\    list                List active bans (all or per-jail with --jail)
-    \\    jails               List configured jails
+    \\    jails               List configured jails (--details for thresholds)
     \\    reload              Apply a validated configuration live (restart-only keys reported)
     \\    version             Show client and daemon version
     \\    config              Show the daemon's effective configuration
@@ -809,10 +839,11 @@ pub const help_list =
     \\fail2zig list — list active bans
     \\
     \\USAGE:
-    \\    fail2zig list [--jail <name>]
+    \\    fail2zig list [--jail <name>] [--details]
     \\
     \\FLAGS:
     \\    --jail <name>       Filter by jail
+    \\    --details           Include ban counts in table output
     \\
 ;
 
@@ -848,11 +879,12 @@ pub const help_firewall =
     \\fail2zig firewall show — inspect fail2zig-owned kernel protection
     \\
     \\USAGE:
-    \\    fail2zig firewall show [--limit <n>] [--cursor <token>]
+    \\    fail2zig firewall show [--limit <n>] [--cursor <token>] [--details]
     \\
     \\FLAGS:
     \\    --limit <n>         Sample entries per page, 1..256 (default: daemon default)
     \\    --cursor <token>    Continue the same retained observation page
+    \\    --details           Include observation and effect identifiers in table output
     \\
     \\This reads the daemon's latest retained observation. It does not refresh, repair,
     \\or enumerate firewall state owned by other applications.
@@ -917,6 +949,18 @@ test "args: status with defaults" {
     try std.testing.expectEqual(OutputFormat.table, p.globals.output);
     try std.testing.expect(p.globals.color);
     try std.testing.expectEqual(default_timeout_ms, p.globals.timeout_ms);
+}
+
+test "args: details is limited to table presentation commands" {
+    const status = try parseOk(&.{ "status", "--details", "--output", "json" });
+    try std.testing.expect(status.command.status.details);
+    try std.testing.expectEqual(OutputFormat.json, status.globals.output);
+    const jails = try parseOk(&.{ "jails", "--details" });
+    try std.testing.expect(jails.command.jails.details);
+    const list = try parseOk(&.{ "list", "--details" });
+    try std.testing.expect(list.command.list.details);
+    var diag: ParseDiag = .{};
+    try std.testing.expectError(error.UnknownFlag, parse(&.{ "history", "--details" }, &diag));
 }
 
 test "args: --help returns help command" {
@@ -1211,9 +1255,10 @@ test "args: firewall show defaults and paging flags" {
     try std.testing.expect(defaults.command.firewall.limit == null);
     try std.testing.expect(defaults.command.firewall.cursor == null);
 
-    const page = try parseOk(&.{ "firewall", "show", "--limit", "256", "--cursor", "fw-token", "--output", "plain" });
+    const page = try parseOk(&.{ "firewall", "show", "--limit", "256", "--cursor", "fw-token", "--details", "--output", "plain" });
     try std.testing.expectEqual(@as(u32, 256), page.command.firewall.limit.?);
     try std.testing.expectEqualStrings("fw-token", page.command.firewall.cursor.?);
+    try std.testing.expect(page.command.firewall.details);
     try std.testing.expectEqual(OutputFormat.plain, page.globals.output);
 }
 

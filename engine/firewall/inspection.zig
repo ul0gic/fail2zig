@@ -167,12 +167,16 @@ pub const ScopedRuleMetadata = struct {
         return metadata;
     }
 };
+pub const StructureProof = enum(u8) { unverified, exact_v1 };
+
 pub const Snapshot = struct {
     allocator: mem.Allocator,
     installation: Installation,
     state: enum { absent, owned },
     entries: []Entry,
     fingerprint: [32]u8,
+    // Only a complete, stable inspector readback establishes this scaffold proof.
+    structure_proof: StructureProof = .unverified,
     observed_start_ns: u64,
     observed_end_ns: u64,
     pub fn deinit(self: *Snapshot) void {
@@ -668,6 +672,7 @@ pub const Inspector = struct {
                 if ((after.remaining_ms orelse return error.Changed) > remaining) return error.Changed;
             }
         }
+        second.structure_proof = if (second.state == .owned) .exact_v1 else .unverified;
         second.observed_start_ns = first.observed_start_ns;
         return second;
     }
@@ -1129,7 +1134,7 @@ fn parseIptables(builder: *Builder, output: []const u8, v6: bool) Error!bool {
     return true;
 }
 
-fn setName(name: []const u8, v6: bool, buf: *[31]u8) Error![]const u8 {
+pub fn setName(name: []const u8, v6: bool, buf: *[31]u8) Error![]const u8 {
     return std.fmt.bufPrint(buf, "{s}_{s}", .{ name, if (v6) "6" else "4" }) catch error.LimitExceeded;
 }
 

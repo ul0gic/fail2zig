@@ -19,6 +19,7 @@ test "native firewall: isolated kernel complete empty and owned dual-family read
     var snapshot = try reader.inspect();
     defer snapshot.deinit();
     try std.testing.expectEqual(.absent, snapshot.state);
+    try std.testing.expectEqual(.unverified, snapshot.structure_proof);
     try std.testing.expectEqual(@as(usize, 0), snapshot.entries.len);
     var name_buf: [28]u8 = undefined;
     var marker_buf: [44]u8 = undefined;
@@ -34,6 +35,7 @@ test "native firewall: isolated kernel complete empty and owned dual-family read
     var owned = try reader.inspect();
     defer owned.deinit();
     try std.testing.expectEqual(.owned, owned.state);
+    try std.testing.expectEqual(.exact_v1, owned.structure_proof);
     try std.testing.expectEqual(@as(usize, 2), owned.entries.len);
     try std.testing.expectEqual(@as(u32, 0xc0000207), owned.entries[0].address.ipv4);
     try std.testing.expectEqual(.ipv6, std.meta.activeTag(owned.entries[1].address));

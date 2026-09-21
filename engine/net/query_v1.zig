@@ -3,6 +3,7 @@
 const std = @import("std");
 const shared = @import("shared");
 const canonical_scope = @import("../firewall/scope.zig");
+const inspection = @import("../firewall/inspection.zig");
 const firewall_observation = @import("../native_firewall_observation.zig");
 
 pub const schema_version: u32 = 1;
@@ -615,6 +616,7 @@ fn writeUnavailableFirewall(writer: anytype, generation_hex: []const u8, reason:
     out.objectField("observation") catch |err| return mapWrite(err);
     out.write(null) catch |err| return mapWrite(err);
     writeNoAttempt(&out) catch |err| return mapWrite(err);
+    field(&out, "structure", null) catch |err| return mapWrite(err);
     out.objectField("items") catch |err| return mapWrite(err);
     out.beginArray() catch |err| return mapWrite(err);
     out.endArray() catch |err| return mapWrite(err);
@@ -663,9 +665,10 @@ fn writeFirewallPage(writer: anytype, generation_hex: []const u8, page: *const f
         out.write(null) catch |err| return mapWrite(err);
     }
     writeAttempt(&out, metadata, now_ms) catch |err| return mapWrite(err);
+    writeFirewallStructure(&out, metadata) catch |err| return mapWrite(err);
     out.objectField("items") catch |err| return mapWrite(err);
     out.beginArray() catch |err| return mapWrite(err);
-    for (page.entries[0..page.count]) |entry| writeFirewallItem(&out, entry) catch |err| return switch (err) {
+    for (page.entries[0..page.count]) |entry| writeFirewallItem(&out, entry, metadata) catch |err| return switch (err) {
         error.InvalidScope => error.SourceFailed,
         else => mapWrite(err),
     };
@@ -674,6 +677,111 @@ fn writeFirewallPage(writer: anytype, generation_hex: []const u8, page: *const f
     var cursor_buffer: [max_cursor_bytes]u8 = undefined;
     if (page.nextCursor(&cursor_buffer)) |next| out.write(next) catch |err| return mapWrite(err) else out.write(null) catch |err| return mapWrite(err);
     out.endObject() catch |err| return mapWrite(err);
+}
+
+const StructureTable = struct { family: []const u8, name: []const u8 };
+const StructureChain = struct {
+    family: []const u8,
+    table: []const u8,
+    name: []const u8,
+    type: []const u8,
+    hook: ?[]const u8 = null,
+    priority: ?i32 = null,
+    policy: ?[]const u8 = null,
+};
+const StructureSet = struct { family: []const u8, table: ?[]const u8, name: []const u8, key_type: []const u8 };
+const StructureRule = struct {
+    family: []const u8,
+    table: []const u8,
+    chain: []const u8,
+    match: []const u8,
+    verdict: []const u8,
+    position: ?u8 = null,
+};
+
+fn hasFirewallStructure(metadata: firewall_observation.Metadata) bool {
+    return metadata.state == .owned and metadata.structure_proof == .exact_v1;
+}
+
+// exact_v1 is established by the inspector, not inferred from installation intent.
+// These fixed shapes are the scaffold that its complete readback validates.
+// Dynamic rules/elements remain in the bounded page with exact canonical scopes.
+fn writeFirewallStructure(out: anytype, metadata: firewall_observation.Metadata) !void {
+    try out.objectField("structure");
+    if (!hasFirewallStructure(metadata)) return out.write(null);
+    const installation = inspection.Installation{ .id = metadata.installation_id, .transport = metadata.backend };
+    var name_buffer: [28]u8 = undefined;
+    const name = installation.name(&name_buffer);
+    var set_buffers: [2][31]u8 = undefined;
+    const sets = [2][]const u8{
+        try inspection.setName(name, false, &set_buffers[0]),
+        try inspection.setName(name, true, &set_buffers[1]),
+    };
+    try out.beginObject();
+    try field(out, "proof", "exact_v1");
+    try out.objectField("tables");
+    if (metadata.backend == .nftables) {
+        try out.write([_]StructureTable{.{ .family = "inet", .name = name }});
+    } else {
+        try out.write([_]StructureTable{ .{ .family = "v4", .name = "filter" }, .{ .family = "v6", .name = "filter" } });
+    }
+    try out.objectField("chains");
+    if (metadata.backend == .nftables) {
+        try out.write([_]StructureChain{.{ .family = "inet", .table = name, .name = "input", .type = "filter", .hook = "input", .priority = -1, .policy = "accept" }});
+    } else {
+        try out.write([_]StructureChain{ .{ .family = "v4", .table = "filter", .name = name, .type = "regular" }, .{ .family = "v6", .table = "filter", .name = name, .type = "regular" } });
+    }
+    try out.objectField("sets");
+    try out.beginArray();
+    if (metadata.backend == .nftables) {
+        try out.write(StructureSet{ .family = "inet", .table = name, .name = "banned_ipv4", .key_type = "ipv4_addr" });
+        try out.write(StructureSet{ .family = "inet", .table = name, .name = "banned_ipv6", .key_type = "ipv6_addr" });
+    } else if (metadata.backend == .ipset) {
+        try out.write(StructureSet{ .family = "v4", .table = null, .name = sets[0], .key_type = "hash:ip" });
+        try out.write(StructureSet{ .family = "v6", .table = null, .name = sets[1], .key_type = "hash:ip" });
+    }
+    try out.endArray();
+    try out.objectField("rules");
+    try out.beginArray();
+    if (metadata.backend == .nftables) {
+        try out.write(StructureRule{ .family = "inet", .table = name, .chain = "input", .match = "ip saddr @banned_ipv4", .verdict = "drop" });
+        try out.write(StructureRule{ .family = "inet", .table = name, .chain = "input", .match = "ip6 saddr @banned_ipv6", .verdict = "drop" });
+    } else {
+        for ([_][]const u8{ "v4", "v6" }, 0..) |family, index| {
+            try out.write(StructureRule{ .family = family, .table = "filter", .chain = "INPUT", .match = "all", .verdict = name, .position = 1 });
+            if (metadata.backend == .ipset) {
+                var match_buffer: [48]u8 = undefined;
+                const match = try std.fmt.bufPrint(&match_buffer, "source in {s}", .{sets[index]});
+                try out.write(StructureRule{ .family = family, .table = "filter", .chain = name, .match = match, .verdict = "drop" });
+            }
+            try out.write(StructureRule{ .family = family, .table = "filter", .chain = name, .match = "all (ownership marker)", .verdict = "return" });
+        }
+    }
+    try out.endArray();
+    try out.endObject();
+}
+
+fn writeFirewallPlacement(out: anytype, entry: inspection.Entry, metadata: firewall_observation.Metadata) !void {
+    try out.objectField("placement");
+    if (!hasFirewallStructure(metadata)) return out.write(null);
+    const installation = inspection.Installation{ .id = metadata.installation_id, .transport = metadata.backend };
+    var name_buffer: [28]u8 = undefined;
+    const name = installation.name(&name_buffer);
+    const v6 = if (entry.scope) |scope| scope.subject.family == .v6 else entry.address == .ipv6;
+    const in_set = entry.scope == null and metadata.backend != .iptables;
+    var set_buffer: [31]u8 = undefined;
+    const set: ?[]const u8 = if (!in_set) null else if (metadata.backend == .nftables)
+        (if (v6) "banned_ipv6" else "banned_ipv4")
+    else
+        try inspection.setName(name, v6, &set_buffer);
+    try out.write(.{
+        .kind = @as([]const u8, if (entry.scope != null) "scoped_rule" else if (in_set) "set_element" else "address_rule"),
+        .family = @as([]const u8, if (metadata.backend == .nftables) "inet" else if (v6) "v6" else "v4"),
+        .table = if (metadata.backend == .nftables) name else "filter",
+        .chain = if (metadata.backend == .nftables) "input" else name,
+        .set = set,
+        .verdict = @as([]const u8, "drop"),
+    });
 }
 
 fn writeNoAttempt(out: anytype) !void {
@@ -715,7 +823,7 @@ fn optionalInteger(out: anytype, name: []const u8, value: anytype) !void {
     if (value) |number| try out.write(number) else try out.write(null);
 }
 
-fn writeFirewallItem(out: anytype, entry: @import("../firewall/inspection.zig").Entry) !void {
+fn writeFirewallItem(out: anytype, entry: inspection.Entry, metadata: firewall_observation.Metadata) !void {
     const canonical = entry.scope orelse canonical_scope.Scope{ .subject = canonical_scope.Subject.host(entry.address) };
     const scope = try projectScope(canonical);
     try out.beginObject();
@@ -728,6 +836,7 @@ fn writeFirewallItem(out: anytype, entry: @import("../firewall/inspection.zig").
     } else try out.write(null);
     try optionalInteger(out, "remaining_ms_at_observation", entry.remaining_ms);
     try optionalInteger(out, "deadline_us", entry.deadline_us);
+    try writeFirewallPlacement(out, entry, metadata);
     try out.endObject();
 }
 

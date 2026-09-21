@@ -464,14 +464,14 @@ bracket a live reload (`ExecReload` sends `SIGHUP`); `STOPPING=1` precedes exit;
 
 | Command | Description |
 |---------|-------------|
-| `status` | Protection state (`active` / `log-only` / `mixed` / `DEGRADED (<cause>)`), backend, storage phase, generation, active and total bans |
-| `jails` | Configured jails: enabled, paused, health, thresholds, action, source |
-| `list [--jail <name>]` | Active bans |
+| `status [--details]` | Protection state (`active` / `log-only` / `mixed` / `DEGRADED (<cause>)`), backend, storage phase, generation, active and total bans |
+| `jails [--details]` | Configured jails: enabled, paused, health, thresholds, action, source |
+| `list [--jail <name>] [--details]` | Active bans |
 | `ban <ip> --jail <name> [--duration <s>] [--scope host\|net <cidr>]` | Manual ban (exactly one jail; `net` needs nftables or ipset) |
 | `unban <ip> --jail <name> [--scope host\|net <cidr>]` | Release a ban |
 | `reload` | Propose the configuration file as a new generation: `noop`, `applied`, `rejected` or `restart_required` |
 | `history [--jail <name>] [--limit <n>] [--cursor <token>]` | Page through confirmed ban history |
-| `firewall show [--limit <n>] [--cursor <token>]` | Inspect the last sampled fail2zig-owned kernel protection (development version) |
+| `firewall show [--limit <n>] [--cursor <token>] [--details]` | Inspect the last sampled fail2zig-owned kernel protection (development version) |
 | `history reset <ip> (--jail <name> \| --all)` | Reset an address's durable history |
 | `jail enable\|disable\|pause\|resume <name>` | Administer one jail |
 | `config` | Effective configuration and generation (redacted for non-administrators) |
@@ -490,6 +490,7 @@ The development version adds `firewall show` (not available in released 0.4.1):
 
 ```bash
 sudo fail2zig firewall show
+sudo fail2zig firewall show --details
 sudo fail2zig --output json firewall show --limit 64
 ```
 
@@ -510,6 +511,20 @@ The development tables also expose jail pause state and ban confirmation, preser
 unknown values, and use stacked rows on narrow terminals. Existing plain and JSON
 formats remain suitable for scripts. Scope details preserve protocol sets and port
 ranges, including UDP and network subjects.
+
+Use `--details` with `status`, `jails`, `list` or `firewall show` to expand the
+table view. Summaries keep failures and unknown states visible; details include
+identifiers, thresholds and additional counters. The flag does not change plain
+or JSON output.
+
+`firewall show --details` adds the owned tables, chains, sets and attachment rules
+verified in that observation, and identifies the chain or set holding each sampled
+entry. It shows normalized structures, not a raw ruleset dump. Only the fixed
+scaffold is complete: dynamic rules and set elements follow the retained sample
+and page limits below. After a failed check these structures describe the retained
+observation, not current kernel state. Older daemons without structural metadata
+show it as unavailable. JSON adds nullable `structure` and per-item `placement`
+fields; existing fields and plain columns retain their meaning.
 
 At most 256 entries are retained from a complete readback. JSON distinguishes
 `observation_complete` from `sample_truncated`, and reports both `observed_total`

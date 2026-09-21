@@ -72,12 +72,14 @@ const bash_script =
     \\    fi
     \\
     \\    case "$cmd" in
-    \\        status|jails|reload|version|config)
+    \\        status|jails)
+    \\            COMPREPLY=( $(compgen -W "--details $global_flags" -- "$cur") ) ;;
+    \\        reload|version|config)
     \\            COMPREPLY=( $(compgen -W "$global_flags" -- "$cur") ) ;;
     \\        history)
     \\            COMPREPLY=( $(compgen -W "reset --jail --limit --cursor --all $global_flags" -- "$cur") ) ;;
     \\        firewall)
-    \\            COMPREPLY=( $(compgen -W "show --limit --cursor $global_flags" -- "$cur") ) ;;
+    \\            COMPREPLY=( $(compgen -W "show --limit --cursor --details $global_flags" -- "$cur") ) ;;
     \\        ban)
     \\            COMPREPLY=( $(compgen -W "--jail --duration --scope $global_flags" -- "$cur") ) ;;
     \\        unban)
@@ -85,7 +87,7 @@ const bash_script =
     \\        jail)
     \\            COMPREPLY=( $(compgen -W "enable disable pause resume" -- "$cur") ) ;;
     \\        list)
-    \\            COMPREPLY=( $(compgen -W "--jail $global_flags" -- "$cur") ) ;;
+    \\            COMPREPLY=( $(compgen -W "--jail --details $global_flags" -- "$cur") ) ;;
     \\        completions)
     \\            COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ) ;;
     \\        help)
@@ -165,7 +167,10 @@ const zsh_script =
     \\                list)
     \\                    _arguments \
     \\                        '--jail[Filter by jail]:jail name:' \
+    \\                        '--details[Include ban counts in table output]' \
     \\                        $global_flags ;;
+    \\                status|jails)
+    \\                    _arguments '--details[Include table detail]' $global_flags ;;
     \\                history)
     \\                    _arguments \
     \\                        '--jail[Filter by jail / reset one jail]:jail name:' \
@@ -179,6 +184,7 @@ const zsh_script =
     \\                        '1:action:(show)' \
     \\                        '--limit[Sample entries per page (1..256)]:limit:' \
     \\                        '--cursor[Continue the same retained observation]:cursor:' \
+    \\                        '--details[Include observation and effect identifiers in table output]' \
     \\                        $global_flags ;;
     \\                completions)
     \\                    _arguments '1:shell:(bash zsh fish)' ;;
@@ -277,12 +283,16 @@ const fish_script =
     \\complete -c fail2zig -f -n '__fail2zig_client_using_command history' -a 'reset' -d 'Reset an address ban history'
     \\complete -c fail2zig -n '__fail2zig_client_using_command history' -l all -d 'Reset history for all jails'
     \\complete -c fail2zig -n '__fail2zig_client_using_command list'  -l jail     -x -d 'Filter by jail'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command list'  -l details -d 'Include ban counts in table output'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command status' -l details -d 'Include table detail'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command jails'  -l details -d 'Include table detail'
     \\complete -c fail2zig -n '__fail2zig_client_using_command history' -l jail   -x -d 'Filter by jail'
     \\complete -c fail2zig -n '__fail2zig_client_using_command history' -l limit  -x -d 'Events per page (1..256)'
     \\complete -c fail2zig -n '__fail2zig_client_using_command history' -l cursor -x -d 'Continue from next_cursor'
     \\complete -c fail2zig -f -n '__fail2zig_client_using_command firewall' -a 'show' -d 'Show retained firewall observation'
     \\complete -c fail2zig -n '__fail2zig_client_using_command firewall' -l limit  -x -d 'Sample entries per page (1..256)'
     \\complete -c fail2zig -n '__fail2zig_client_using_command firewall' -l cursor -x -d 'Continue the same retained observation'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command firewall' -l details -d 'Include observation and effect identifiers in table output'
     \\
     \\# `completions` subcommand: shell argument
     \\complete -c fail2zig -f -n '__fail2zig_client_using_command completions' -a 'bash zsh fish'

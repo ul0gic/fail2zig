@@ -282,7 +282,7 @@ test "native query: firewall pages a complete canonical observation for monitor 
         .{ .address = try shared.IpAddress.parse("2001:db8::1"), .scope = v6_scope },
     };
     const installation = inspection.Installation{ .id = [_]u8{0x31} ** 16, .transport = .nftables };
-    const snapshot = inspection.Snapshot{ .allocator = a, .installation = installation, .state = .owned, .entries = &entries, .fingerprint = [_]u8{0x51} ** 32, .observed_start_ns = 1, .observed_end_ns = 2 };
+    const snapshot = inspection.Snapshot{ .allocator = a, .installation = installation, .state = .owned, .entries = &entries, .fingerprint = [_]u8{0x51} ** 32, .structure_proof = .exact_v1, .observed_start_ns = 1, .observed_end_ns = 2 };
     var cache = observation.Cache.init(installation, [_]u8{0x61} ** 16);
     cache.capture(&snapshot, .{ .monotonic_ms = 0, .wall_us = 1_700_000_000_000_000, .origin = .readback, .inventory = .known_entries });
 
@@ -310,6 +310,17 @@ test "native query: firewall pages a complete canonical observation for monitor 
     try t.expectEqualStrings("intent_revision_not_aligned", observed.get("comparison_reason").?.string);
     try t.expectEqualStrings("success", root.get("last_attempt").?.object.get("outcome").?.string);
     const observed_item = root.get("items").?.array.items[0].object;
+    const structure = root.get("structure").?.object;
+    try t.expectEqualStrings("exact_v1", structure.get("proof").?.string);
+    try t.expectEqualStrings("inet", structure.get("tables").?.array.items[0].object.get("family").?.string);
+    const chain = structure.get("chains").?.array.items[0].object;
+    try t.expectEqualStrings("input", chain.get("hook").?.string);
+    try t.expectEqual(@as(i64, -1), chain.get("priority").?.integer);
+    try t.expectEqualStrings("accept", chain.get("policy").?.string);
+    const placement = observed_item.get("placement").?.object;
+    try t.expectEqualStrings("scoped_rule", placement.get("kind").?.string);
+    try t.expectEqualStrings("input", placement.get("chain").?.string);
+    try t.expect(placement.get("set").? == .null);
     const scope = observed_item.get("scope").?.object;
     try t.expectEqualStrings("network", scope.get("subject_kind").?.string);
     try t.expectEqualStrings("tcp", scope.get("protocols").?.array.items[0].string);
@@ -339,6 +350,94 @@ test "native query: firewall pages a complete canonical observation for monitor 
     try expectFailure(try run(second_body, .monitor, .{ .firewall = firewallSource(&cache) }), 409);
 }
 
+test "native query: verified structures and placements track only their owned observation" {
+    for ([_]inspection.Transport{ .nftables, .iptables, .ipset }) |backend| {
+        const installation = inspection.Installation{ .id = [_]u8{0x31} ** 16, .transport = backend };
+        var cache = observation.Cache.init(installation, [_]u8{0x61} ** 16);
+        var entries = [_]inspection.Entry{
+            .{ .address = try shared.IpAddress.parse("192.0.2.1") },
+            .{ .address = try shared.IpAddress.parse("2001:db8::1") },
+            .{ .address = try shared.IpAddress.parse("2001:db8::"), .scope = .{
+                .subject = try canonical_scope.Subject.parseNetwork("2001:db8::/64"),
+                .protocols = try canonical_scope.Protocols.one(.udp),
+                .ports = try canonical_scope.Ports.list(&.{.{ .first = 53, .last = 54 }}),
+            } },
+        };
+        var snapshot = inspection.Snapshot{ .allocator = a, .installation = installation, .state = .owned, .entries = &entries, .fingerprint = [_]u8{0} ** 32, .observed_start_ns = 1, .observed_end_ns = 2 };
+        for ([_]inspection.StructureProof{ .unverified, .exact_v1 }) |proof| {
+            snapshot.structure_proof = proof;
+            cache.capture(&snapshot, .{ .monotonic_ms = 1, .wall_us = 2, .origin = .readback, .inventory = .known_entries });
+            // A failure retains but cannot establish the successful sample's proof.
+            cache.fail(.{ .monotonic_ms = 3, .wall_us = 4, .cause = error.Timeout, .stage = .readback });
+            const result = try run("{\"schema_version\":1,\"kind\":\"firewall\"}", .monitor, .{ .firewall = firewallSource(&cache) });
+            defer result.deinit(a);
+            const doc = try parse(result.payload);
+            defer doc.deinit();
+            const root = doc.value.object;
+            try t.expectEqualStrings("failed", root.get("last_attempt").?.object.get("outcome").?.string);
+            const structure = root.get("structure").?;
+            const items = root.get("items").?.array.items;
+            if (proof == .unverified) {
+                try t.expect(structure == .null);
+                for (items) |row| try t.expect(row.object.get("placement").? == .null);
+                continue;
+            }
+            const rules = structure.object.get("rules").?.array.items;
+            const sets = structure.object.get("sets").?.array.items;
+            try t.expectEqual(@as(usize, if (backend == .iptables) 0 else 2), sets.len);
+            if (backend == .nftables) {
+                try t.expectEqual(@as(usize, 2), rules.len);
+                for (rules) |rule| try t.expect(rule.object.get("position").? == .null);
+            } else {
+                try t.expectEqual(@as(usize, if (backend == .ipset) 6 else 4), rules.len);
+                try t.expectEqual(@as(i64, 1), rules[0].object.get("position").?.integer);
+                try t.expectEqualStrings("INPUT", rules[0].object.get("chain").?.string);
+                if (backend == .ipset) {
+                    try t.expect(rules[1].object.get("position").? == .null);
+                    try t.expect(rules[4].object.get("position").? == .null);
+                }
+                const chains = structure.object.get("chains").?.array.items;
+                for (chains) |chain| {
+                    try t.expect(chain.object.get("policy").? == .null);
+                    try t.expect(chain.object.get("hook").? == .null);
+                    try t.expect(chain.object.get("priority").? == .null);
+                }
+            }
+            for (items, 0..) |row, index| {
+                const placement = row.object.get("placement").?.object;
+                if (index == 2) {
+                    try t.expectEqualStrings("scoped_rule", placement.get("kind").?.string);
+                    try t.expect(placement.get("set").? == .null);
+                    try t.expectEqualStrings(if (backend == .nftables) "inet" else "v6", placement.get("family").?.string);
+                    try t.expectEqualStrings(if (backend == .nftables) "f2z_" ++ "31" ** 12 else "filter", placement.get("table").?.string);
+                    try t.expectEqualStrings(if (backend == .nftables) "input" else "f2z_" ++ "31" ** 12, placement.get("chain").?.string);
+                    const scope = row.object.get("scope").?.object;
+                    try t.expectEqualStrings("udp", scope.get("protocols").?.array.items[0].string);
+                    try t.expectEqual(@as(i64, 54), scope.get("port_ranges").?.array.items[0].object.get("last").?.integer);
+                    continue;
+                }
+                try t.expectEqualStrings(if (backend == .iptables) "address_rule" else "set_element", placement.get("kind").?.string);
+                try t.expectEqualStrings("drop", placement.get("verdict").?.string);
+                if (backend == .nftables) {
+                    try t.expectEqualStrings(if (index == 0) "banned_ipv4" else "banned_ipv6", placement.get("set").?.string);
+                } else if (backend == .ipset) {
+                    try t.expectEqualStrings(if (index == 0) "f2z_" ++ "31" ** 12 ++ "_4" else "f2z_" ++ "31" ** 12 ++ "_6", placement.get("set").?.string);
+                } else try t.expect(placement.get("set").? == .null);
+            }
+        }
+        // Even a malformed synthetic absent snapshot cannot carry owned proof.
+        snapshot.state = .absent;
+        snapshot.entries = &.{};
+        cache.capture(&snapshot, .{ .monotonic_ms = 5, .wall_us = 6, .origin = .stop, .inventory = .known_entries });
+        const absent = try run("{\"schema_version\":1,\"kind\":\"firewall\"}", .monitor, .{ .firewall = firewallSource(&cache) });
+        defer absent.deinit(a);
+        const absent_doc = try parse(absent.payload);
+        defer absent_doc.deinit();
+        try t.expect(absent_doc.value.object.get("structure").? == .null);
+        try t.expectEqualStrings("absent", absent_doc.value.object.get("observation").?.object.get("state").?.string);
+    }
+}
+
 test "native query: firewall distinguishes explicit unavailability initial cache stale data and reversed clocks" {
     inline for (.{
         query.FirewallUnavailableReason.no_manager,
@@ -354,6 +453,7 @@ test "native query: firewall distinguishes explicit unavailability initial cache
         try t.expectEqualStrings(@tagName(reason), doc.value.object.get("unavailable_reason").?.string);
         try t.expect(doc.value.object.get("installation").? == .null);
         try t.expect(doc.value.object.get("observation").? == .null);
+        try t.expect(doc.value.object.get("structure").? == .null);
         try t.expectEqualStrings("none", doc.value.object.get("last_attempt").?.object.get("outcome").?.string);
         try expectFailure(try run("{\"schema_version\":1,\"kind\":\"firewall\",\"cursor\":\"prior-process-token\"}", .monitor, .{ .firewall = .{ .unavailable = reason } }), 409);
     }
@@ -589,11 +689,37 @@ test "native query: firewall page and serialization allocations unwind without t
     const installation = inspection.Installation{ .id = [_]u8{0x35} ** 16, .transport = .nftables };
     var cache = observation.Cache.init(installation, [_]u8{0x65} ** 16);
     var entries = [_]inspection.Entry{.{ .address = try shared.IpAddress.parse("192.0.2.8") }};
-    const snapshot = inspection.Snapshot{ .allocator = a, .installation = installation, .state = .owned, .entries = &entries, .fingerprint = [_]u8{0} ** 32, .observed_start_ns = 0, .observed_end_ns = 0 };
+    const snapshot = inspection.Snapshot{ .allocator = a, .installation = installation, .state = .owned, .entries = &entries, .fingerprint = [_]u8{0} ** 32, .structure_proof = .exact_v1, .observed_start_ns = 0, .observed_end_ns = 0 };
     cache.capture(&snapshot, .{ .monotonic_ms = 0, .wall_us = 100, .origin = .readback, .inventory = .known_entries });
     try t.checkAllAllocationFailures(a, allocationProbe, .{&cache});
     try t.expectEqual(@as(u64, 1), cache.metadata.sequence);
     try t.expectEqualDeep(entries[0], cache.entries[0]);
+}
+
+test "native query: largest retained structure page fits the response bound" {
+    const installation = inspection.Installation{ .id = [_]u8{0x35} ** 16, .transport = .ipset };
+    var cache = observation.Cache.init(installation, [_]u8{0x65} ** 16);
+    var entries: [observation.max_entries]inspection.Entry = undefined;
+    for (&entries, 0..) |*entry, index| entry.* = .{
+        .address = .{ .ipv4 = @intCast(index + 1) },
+        .scope = .{
+            .subject = canonical_scope.Subject.host(.{ .ipv4 = @intCast(index + 1) }),
+            .protocols = try canonical_scope.Protocols.list(&.{ .tcp, .udp }),
+            .ports = try canonical_scope.Ports.list(&.{ .{ .first = 22, .last = 22 }, .{ .first = 80, .last = 443 } }),
+        },
+        .effect_id = [_]u8{0xff} ** 32,
+        .deadline_us = std.math.maxInt(i64),
+    };
+    const snapshot = inspection.Snapshot{ .allocator = a, .installation = installation, .state = .owned, .entries = &entries, .fingerprint = [_]u8{0} ** 32, .structure_proof = .exact_v1, .observed_start_ns = 0, .observed_end_ns = 0 };
+    cache.capture(&snapshot, .{ .monotonic_ms = 0, .wall_us = 100, .origin = .readback, .inventory = .known_entries });
+    const result = try run("{\"schema_version\":1,\"kind\":\"firewall\",\"limit\":256}", .monitor, .{ .firewall = firewallSource(&cache) });
+    defer result.deinit(a);
+    try t.expect(result == .payload);
+    try t.expect(result.payload.len < query.max_response_bytes);
+    const doc = try parse(result.payload);
+    defer doc.deinit();
+    try t.expectEqual(@as(usize, observation.max_entries), doc.value.object.get("items").?.array.items.len);
+    try t.expect(doc.value.object.get("next_cursor").? == .null);
 }
 
 test "native query: BUG-060 history JSON preserves compound protocols and ranges" {
