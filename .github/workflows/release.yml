@@ -51,7 +51,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: read
+      # GitHub exposes draft releases only to tokens with push access.
+      contents: write
       actions: read
     steps:
       - name: Require the trusted main workflow
@@ -150,7 +151,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: read
+      # The approved assets remain a draft until the publication job.
+      contents: write
       actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -167,16 +169,22 @@ jobs:
           pattern: release-binary-*
           merge-multiple: true
           path: package
-      - name: Assemble all fixed source payloads and compare approval
+      - name: Download approved draft assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          test "$(git -C source rev-parse HEAD)" = "$SOURCE_COMMIT"
-          bash control/.github/scripts/release.sh assemble source package
           mkdir approved
           gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir approved
+      - name: Assemble all fixed source payloads and compare approval
+        run: |
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_COMMIT"
+          bash control/.github/scripts/release.sh assemble source package
           bash control/.github/scripts/release.sh compare package approved
           bash control/.github/scripts/release.sh elf "$PWD/package"
+      - name: Recheck live tag after comparison
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
           bash control/.github/scripts/release.sh tag
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
