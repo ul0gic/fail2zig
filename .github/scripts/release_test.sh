@@ -25,6 +25,33 @@ accept bash "$helper" identity "$SOURCE_COMMIT" "$SOURCE_COMMIT"
 refuse bash "$helper" identity "$SOURCE_COMMIT" 2222222222222222222222222222222222222222
 refuse bash "$helper" identity 2222222222222222222222222222222222222222 "$SOURCE_COMMIT"
 
+provenance_fixture() {
+    env GITHUB_SERVER_URL=https://github.com GITHUB_REF=refs/heads/main \
+        GITHUB_SHA=2222222222222222222222222222222222222222 GITHUB_EVENT_NAME=workflow_dispatch \
+        GITHUB_REPOSITORY_ID=123 GITHUB_REPOSITORY_OWNER_ID=456 RUNNER_ENVIRONMENT=github-hosted \
+        GITHUB_RUN_ID=789 GITHUB_RUN_ATTEMPT=2 VERIFY_ONLY=true ZIG_VERSION=0.14.1 \
+        ZIG_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+        bash "$helper" provenance "$scratch/predicate.json"
+    jq -e --arg source "$SOURCE_COMMIT" --arg binary "$BINARY_SHA256" --arg manifest "$MANIFEST_SHA256" '
+        .buildDefinition.buildType == "https://actions.github.io/buildtypes/workflow/v1" and
+        .buildDefinition.externalParameters == {
+          inputs: {
+            release_tag: "v1.2.3", source_commit: $source,
+            binary_sha256: $binary, manifest_sha256: $manifest,
+            lab_scope: "fixture only", verify_only: "true"
+          },
+          workflow: {
+            ref: "refs/heads/main", repository: "https://github.com/owner/repo",
+            path: ".github/workflows/release.yml"
+          }
+        } and
+        .buildDefinition.resolvedDependencies[0].digest.gitCommit == "2222222222222222222222222222222222222222" and
+        .buildDefinition.resolvedDependencies[1].digest.gitCommit == $source and
+        .runDetails.builder.id == "https://github.com/owner/repo/.github/workflows/release.yml@refs/heads/main"
+    ' "$scratch/predicate.json" >/dev/null
+}
+accept provenance_fixture
+
 jq -n --arg sha "$SOURCE_COMMIT" '{repository:{full_name:"owner/repo"},head_repository:{full_name:"owner/repo"},
  workflow_id:42,path:".github/workflows/ci.yml",head_sha:$sha,status:"completed",conclusion:"success",
  event:"push",head_branch:"main",id:123,run_attempt:1}' > "$scratch/run"

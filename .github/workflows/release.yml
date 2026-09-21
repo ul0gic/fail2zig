@@ -204,36 +204,19 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          path: control
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: verified-release-package
           path: package
       - name: Describe actual build inputs, separately from the workflow commit
+        env:
+          VERIFY_ONLY: ${{ inputs.verify_only }}
         run: |
-          jq -n --arg repo "$GITHUB_REPOSITORY" --arg source "$SOURCE_COMMIT" \
-            --arg workflow "$GITHUB_SHA" --arg tag "$RELEASE_TAG" --arg run "$GITHUB_RUN_ID" \
-            --arg attempt "$GITHUB_RUN_ATTEMPT" --arg zig "$ZIG_VERSION" --arg zig_hash "$ZIG_SHA256" \
-            --arg binary "$BINARY_SHA256" --arg manifest "$MANIFEST_SHA256" --arg scope "$LAB_SCOPE" '
-            {
-              buildDefinition: {
-                buildType: ("https://github.com/" + $repo + "/blob/main/.github/workflows/release.yml"),
-                externalParameters: {
-                  source_commit: $source, release_tag: $tag,
-                  approved_binary_sha256: $binary, approved_manifest_sha256: $manifest,
-                  maintainer_reported_lab_scope: $scope
-                },
-                internalParameters: {workflow_commit: $workflow, run_attempt: $attempt},
-                resolvedDependencies: [
-                  {uri: ("git+https://github.com/" + $repo), digest: {gitCommit: $source}},
-                  {uri: ("https://ziglang.org/download/" + $zig + "/zig-x86_64-linux-" + $zig + ".tar.xz"),
-                   digest: {sha256: $zig_hash}}
-                ]
-              },
-              runDetails: {
-                builder: {id: ("https://github.com/" + $repo + "/.github/workflows/release.yml@" + $workflow)},
-                metadata: {invocationId: ("https://github.com/" + $repo + "/actions/runs/" + $run + "/attempts/" + $attempt)}
-              }
-            }' > predicate.json
+          bash control/.github/scripts/release.sh provenance predicate.json
       - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
           subject-path: package/*

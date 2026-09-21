@@ -79,6 +79,56 @@ qualify() {
     fail 'no available successful full CI qualification for the exact source commit; dispatch full CI first'
 }
 
+provenance() {
+    local output=$1 repo_url
+    [[ ${GITHUB_REF:-} == refs/heads/main ]] || fail 'provenance requires the trusted main ref'
+    [[ ${GITHUB_EVENT_NAME:-} == workflow_dispatch ]] || fail 'provenance requires workflow_dispatch'
+    [[ ${GITHUB_SHA:-} =~ ^[0-9a-f]{40}$ ]] || fail 'provenance requires the workflow commit'
+    [[ ${VERIFY_ONLY:-} == true || ${VERIFY_ONLY:-} == false ]] || fail 'provenance requires verify_only'
+    repo_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+    jq -n \
+        --arg repo_url "$repo_url" --arg ref "$GITHUB_REF" \
+        --arg workflow_commit "$GITHUB_SHA" --arg source "$SOURCE_COMMIT" \
+        --arg tag "$RELEASE_TAG" --arg binary "$BINARY_SHA256" --arg manifest "$MANIFEST_SHA256" \
+        --arg scope "$LAB_SCOPE" --arg verify_only "$VERIFY_ONLY" \
+        --arg event "$GITHUB_EVENT_NAME" --arg repo_id "$GITHUB_REPOSITORY_ID" \
+        --arg owner_id "$GITHUB_REPOSITORY_OWNER_ID" --arg runner "$RUNNER_ENVIRONMENT" \
+        --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" \
+        --arg zig "$ZIG_VERSION" --arg zig_hash "$ZIG_SHA256" '
+        {
+          buildDefinition: {
+            buildType: "https://actions.github.io/buildtypes/workflow/v1",
+            externalParameters: {
+              inputs: {
+                release_tag: $tag, source_commit: $source,
+                binary_sha256: $binary, manifest_sha256: $manifest,
+                lab_scope: $scope, verify_only: $verify_only
+              },
+              workflow: {
+                ref: $ref, repository: $repo_url,
+                path: ".github/workflows/release.yml"
+              }
+            },
+            internalParameters: {
+              github: {
+                event_name: $event, repository_id: $repo_id,
+                repository_owner_id: $owner_id, runner_environment: $runner
+              }
+            },
+            resolvedDependencies: [
+              {uri: ("git+" + $repo_url + "@" + $ref), digest: {gitCommit: $workflow_commit}},
+              {uri: ("git+" + $repo_url + "@" + $source), digest: {gitCommit: $source}},
+              {uri: ("https://ziglang.org/download/" + $zig + "/zig-x86_64-linux-" + $zig + ".tar.xz"),
+               digest: {sha256: $zig_hash}}
+            ]
+          },
+          runDetails: {
+            builder: {id: ($repo_url + "/.github/workflows/release.yml@" + $ref)},
+            metadata: {invocationId: ($repo_url + "/actions/runs/" + $run + "/attempts/" + $attempt)}
+          }
+        }' > "$output"
+}
+
 package_check() {
     local dir=$1 approved=${2:-false} line filename scratch
     scratch=$(mktemp -d)
@@ -168,6 +218,7 @@ case "$command" in
     tag) remote_tag ;;
     evidence) evidence "$@" ;;
     qualify) qualify ;;
+    provenance) provenance "$@" ;;
     package) package_check "$@" ;;
     assemble) assemble "$@" ;;
     compare) compare "$@" ;;
