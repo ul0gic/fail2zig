@@ -137,7 +137,7 @@ jobs:
           test ! -L zig-out/bin/fail2zig
           mkdir package
           cp zig-out/bin/fail2zig "package/fail2zig-$RELEASE_TAG-$RELEASE_TARGET"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: release-binary-${{ matrix.target }}
           path: package/*
@@ -162,7 +162,7 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.source_commit }}
           path: source
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           pattern: release-binary-*
           merge-multiple: true
@@ -178,7 +178,7 @@ jobs:
           bash control/.github/scripts/release.sh compare package approved
           bash control/.github/scripts/release.sh elf "$PWD/package"
           bash control/.github/scripts/release.sh tag
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: verified-release-package
           path: package/*
@@ -196,7 +196,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: verified-release-package
           path: package
@@ -226,7 +226,7 @@ jobs:
                 metadata: {invocationId: ("https://github.com/" + $repo + "/actions/runs/" + $run + "/attempts/" + $attempt)}
               }
             }' > predicate.json
-      - uses: actions/attest@ce27ba3b4a9a139d9a20a4a07d69fabb52f1e5bc
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
           subject-path: package/*
           predicate-type: https://slsa.dev/provenance/v1
@@ -252,7 +252,7 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.source_commit }}
           path: source
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: verified-release-package
           path: package
