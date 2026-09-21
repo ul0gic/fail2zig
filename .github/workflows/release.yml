@@ -137,7 +137,7 @@ jobs:
           test ! -L zig-out/bin/fail2zig
           mkdir package
           cp zig-out/bin/fail2zig "package/fail2zig-$RELEASE_TAG-$RELEASE_TARGET"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: release-binary-${{ matrix.target }}
           path: package/*
@@ -178,7 +178,7 @@ jobs:
           bash control/.github/scripts/release.sh compare package approved
           bash control/.github/scripts/release.sh elf "$PWD/package"
           bash control/.github/scripts/release.sh tag
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: verified-release-package
           path: package/*
