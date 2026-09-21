@@ -68,19 +68,27 @@ pub fn run(
             return .success;
         },
 
-        .status => return doRequest(allocator, parsed.globals, .{ .status = {} }, stdout, stderr, color, formatStatusCmd),
+        .status => |options| {
+            if (options.details) return doRequest(allocator, parsed.globals, .{ .status = {} }, stdout, stderr, color, formatStatusDetailsCmd);
+            return doRequest(allocator, parsed.globals, .{ .status = {} }, stdout, stderr, color, formatStatusCmd);
+        },
         .list => |l| {
             const jail: ?shared.JailId = parseJailId(l.jail, stderr) catch return .client_error;
             const cmd = shared.Command{ .list = .{ .jail = jail } };
+            if (l.details) return doRequest(allocator, parsed.globals, cmd, stdout, stderr, color, formatListDetailsCmd);
             return doRequest(allocator, parsed.globals, cmd, stdout, stderr, color, formatListCmd);
         },
-        .jails => return doRequest(allocator, parsed.globals, .{ .list_jails = {} }, stdout, stderr, color, formatJailsCmd),
+        .jails => |options| {
+            if (options.details) return doRequest(allocator, parsed.globals, .{ .list_jails = {} }, stdout, stderr, color, formatJailsDetailsCmd);
+            return doRequest(allocator, parsed.globals, .{ .list_jails = {} }, stdout, stderr, color, formatJailsCmd);
+        },
         .reload => return doReload(allocator, parsed.globals, stdout, stderr),
         .config => return doQuery(allocator, parsed.globals, stdout, stderr, color, "config", null, null, null, format.formatConfig),
         .history => |q| {
             if (q.jail) |jail_str| _ = parseJailIdRequired(jail_str, stderr) catch return .client_error;
             return doQuery(allocator, parsed.globals, stdout, stderr, color, "history", q.jail, q.limit, q.cursor, format.formatHistory);
         },
+        .firewall => |q| return doFirewallQuery(allocator, parsed.globals, stdout, stderr, color, q),
         .jail_admin => |j| {
             _ = parseJailIdRequired(j.name, stderr) catch return .client_error;
             const kind: []const u8 = switch (j.action) {
@@ -160,6 +168,35 @@ fn doQuery(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype,
     std.json.stringify(.{ .schema_version = @as(u32, 1), .kind = kind, .jail = jail, .limit = limit, .cursor = cursor }, .{ .emit_null_optional_fields = false }, stream.writer()) catch return .client_error;
     const body = shared.Command.Body.init(stream.getWritten()) catch return .client_error;
     return doRequest(allocator, globals, .{ .query_v1 = body }, stdout, stderr, color, formatter);
+}
+
+fn doFirewallQuery(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype, color: format.Color, query: args.Command.FirewallArgs) ExitCode {
+    var body_bytes: [shared.protocol.max_request_body]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&body_bytes);
+    std.json.stringify(.{ .schema_version = @as(u32, 1), .kind = "firewall", .limit = query.limit, .cursor = query.cursor }, .{ .emit_null_optional_fields = false }, stream.writer()) catch return .client_error;
+    const body = shared.Command.Body.init(stream.getWritten()) catch return .client_error;
+
+    var diag: socket.DiagBuf = .{};
+    var client = socket.connect(allocator, globals.socket_path, globals.timeout_ms, &diag) catch {
+        stderr.print("error: {s}\n", .{diag.message()}) catch {};
+        return .connection_failed;
+    };
+    defer client.close();
+    const response = client.sendCommand(.{ .query_v1 = body }) catch {
+        stderr.print("error: {s}\n", .{client.errorMessage()}) catch {};
+        return .connection_failed;
+    };
+    defer response.deinit(allocator);
+    return renderFirewallResponse(allocator, response, globals.output, stdout, stderr, color, query.details);
+}
+
+fn renderFirewallResponse(allocator: std.mem.Allocator, response: shared.Response, output: format.OutputFormat, stdout: anytype, stderr: anytype, color: format.Color, details: bool) ExitCode {
+    if (response == .err and response.err.code == 400 and std.mem.indexOf(u8, response.err.message, "unknown query kind") != null) {
+        format.formatError(stderr, response.err.code, "daemon does not support firewall inspection; upgrade and restart the fail2zig daemon", output, color) catch {};
+        return .daemon_error;
+    }
+    if (details) return renderResponse(allocator, response, output, stdout, stderr, color, formatFirewallDetailsCmd);
+    return renderResponse(allocator, response, output, stdout, stderr, color, format.formatFirewall);
 }
 
 pub const AdminSpec = struct {
@@ -357,6 +394,10 @@ fn formatStatusCmd(
     return format.formatStatus(allocator, writer, payload, fmt, color);
 }
 
+fn formatStatusDetailsCmd(allocator: std.mem.Allocator, writer: anytype, payload: []const u8, fmt: format.OutputFormat, color: format.Color) !void {
+    return format.formatStatusDetailed(allocator, writer, payload, fmt, color);
+}
+
 fn formatListCmd(
     allocator: std.mem.Allocator,
     writer: anytype,
@@ -367,6 +408,10 @@ fn formatListCmd(
     return format.formatList(allocator, writer, payload, fmt, color);
 }
 
+fn formatListDetailsCmd(allocator: std.mem.Allocator, writer: anytype, payload: []const u8, fmt: format.OutputFormat, color: format.Color) !void {
+    return format.formatListDetailed(allocator, writer, payload, fmt, color);
+}
+
 fn formatJailsCmd(
     allocator: std.mem.Allocator,
     writer: anytype,
@@ -375,6 +420,14 @@ fn formatJailsCmd(
     color: format.Color,
 ) !void {
     return format.formatJails(allocator, writer, payload, fmt, color);
+}
+
+fn formatJailsDetailsCmd(allocator: std.mem.Allocator, writer: anytype, payload: []const u8, fmt: format.OutputFormat, color: format.Color) !void {
+    return format.formatJailsDetailed(allocator, writer, payload, fmt, color);
+}
+
+fn formatFirewallDetailsCmd(allocator: std.mem.Allocator, writer: anytype, payload: []const u8, fmt: format.OutputFormat, color: format.Color) !void {
+    return format.formatFirewallDetailed(allocator, writer, payload, fmt, color);
 }
 
 fn formatReloadCmd(
@@ -644,6 +697,32 @@ test "client: daemon error response still exits 1 (BUG-009 unchanged path)" {
     const code = renderResponse(testing.allocator, resp, .table, out_list.writer(), err_list.writer(), .{ .enabled = false }, formatStatusCmd);
     try testing.expectEqual(ExitCode.daemon_error, code);
     try testing.expect(std.mem.indexOf(u8, err_list.items, "no such jail") != null);
+}
+
+test "client: old daemon firewall query error is actionable" {
+    var out_list = std.ArrayList(u8).init(testing.allocator);
+    defer out_list.deinit();
+    var err_list = std.ArrayList(u8).init(testing.allocator);
+    defer err_list.deinit();
+
+    const response = shared.Response{ .err = .{ .code = 400, .message = "unknown query kind" } };
+    const code = renderFirewallResponse(testing.allocator, response, .table, out_list.writer(), err_list.writer(), .{ .enabled = false }, false);
+    try testing.expectEqual(ExitCode.daemon_error, code);
+    try testing.expectEqual(@as(usize, 0), out_list.items.len);
+    try testing.expect(std.mem.indexOf(u8, err_list.items, "does not support firewall inspection") != null);
+    try testing.expect(std.mem.indexOf(u8, err_list.items, "upgrade and restart") != null);
+}
+
+test "client: firewall cursor conflict keeps daemon guidance" {
+    var out_list = std.ArrayList(u8).init(testing.allocator);
+    defer out_list.deinit();
+    var err_list = std.ArrayList(u8).init(testing.allocator);
+    defer err_list.deinit();
+
+    const response = shared.Response{ .err = .{ .code = 409, .message = "cursor expired or observation changed; restart pagination without a cursor" } };
+    const code = renderFirewallResponse(testing.allocator, response, .plain, out_list.writer(), err_list.writer(), .{ .enabled = false }, false);
+    try testing.expectEqual(ExitCode.daemon_error, code);
+    try testing.expect(std.mem.indexOf(u8, err_list.items, "restart pagination without a cursor") != null);
 }
 
 test "client: imports compile" {

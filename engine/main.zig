@@ -74,7 +74,7 @@ pub const CliOptions = struct {
 
 pub const EntryMode = enum { daemon, operator, migrate, rule_test };
 
-const operator_words = [_][]const u8{ "status", "jails", "list", "ban", "unban", "reload", "version", "help", "completions" };
+const operator_words = [_][]const u8{ "status", "jails", "list", "ban", "unban", "reload", "version", "help", "completions", "config", "history", "jail", "firewall" };
 const operator_globals = [_][]const u8{ "--socket", "--output", "--no-color", "--timeout" };
 
 pub fn classifyEntry(args: []const []const u8) EntryMode {
@@ -157,6 +157,7 @@ fn printHelp(w: anytype) !void {
         \\
         \\COMMANDS:
         \\  status | jails | list | ban | unban | reload | version | help | completions
+        \\  config | history | jail | firewall show
         \\  migrate inspect|snapshot|plan|validate ... read-only migration preparation
         \\  rule-test --file|--record|--journal ...   offline rule evaluation (no daemon needed)
         \\  Globals: --socket <path> --output table|json|plain --no-color --timeout <ms>
@@ -560,6 +561,8 @@ test "cli: entry classification routes operator spellings and globals only" {
     try std.testing.expectEqual(EntryMode.operator, classifyEntry(&.{ "--socket", "/s", "status" }));
     try std.testing.expectEqual(EntryMode.operator, classifyEntry(&.{ "--output=json", "version" }));
     try std.testing.expectEqual(EntryMode.operator, classifyEntry(&.{"completions"}));
+    inline for (.{ "config", "history", "jail", "firewall" }) |word|
+        try std.testing.expectEqual(EntryMode.operator, classifyEntry(&.{word}));
     try std.testing.expectEqual(EntryMode.migrate, classifyEntry(&.{ "migrate", "inspect" }));
     try std.testing.expectEqual(EntryMode.rule_test, classifyEntry(&.{ "rule-test", "--record", "x" }));
     try std.testing.expectEqual(EntryMode.daemon, classifyEntry(&.{"--socketpath"}));

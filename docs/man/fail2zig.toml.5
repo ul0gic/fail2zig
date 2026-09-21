@@ -1,4 +1,4 @@
-.TH FAIL2ZIG.TOML 5 "2026-09-17" "fail2zig 0.4.1" "File Formats"
+.TH FAIL2ZIG.TOML 5 "2026-09-21" "fail2zig 0.4.2" "File Formats"
 .
 .SH NAME
 fail2zig.toml \- fail2zig daemon configuration file
@@ -146,7 +146,7 @@ and
 .I /proc/thread-self
 aliases are rejected because they are not stable external anchors. Custom
 selectors and service overrides that move the daemon between namespaces are
-not supported in 0.4.0.
+unsupported.
 An existing installation also records the selector spelling. A changed selector
 is rejected even if it currently names the same namespace; restore the previous
 setting with the existing state database.
@@ -298,9 +298,27 @@ Boolean. When false, the jail is parsed but not started. Default:
 .IR true .
 .TP
 .B filter
-String. Built-in filter name or a name resolvable via the filter registry.
-Accepts hyphenated and underscore forms interchangeably. An enabled jail must
-name a supported built-in filter; empty or unknown names fail validation.
+String. Built-in filter name, or the bounded detection label for a jail with
+.BR rule_files .
+Built-in names accept hyphenated and underscore forms interchangeably. Without
+.BR rule_files ,
+an enabled jail must name a supported built-in filter; empty or unknown names
+fail validation.
+.TP
+.B rule_files
+Optional string array of one to eight unique absolute paths to bounded native
+JSON rules. Each file is limited to 4096 bytes, must be a regular file owned by
+root or the daemon user, must not be group/other writable, and is opened without
+following a final symlink. Native ingestion must be enabled; the jail source must
+resolve to file or journald. Custom journald rules also require an explicit
+nonempty
+.BR journal_executables
+list. Rule paths and contents are admitted at startup. Changes are restart-only
+and may be refused when durable retry or consumer state is bound to the prior
+generation; restore the prior rule and source configuration to recover rather
+than deleting state. Use
+.B fail2zig rule-test \-\-rule\-file
+to evaluate one rule without starting the daemon.
 .TP
 .B logpath
 String array. Absolute paths to log files. Missing files are warned about but

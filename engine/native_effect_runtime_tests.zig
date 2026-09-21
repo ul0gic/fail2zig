@@ -109,6 +109,8 @@ test "native effect runtime: admission diagnostic is bounded by value and retain
     defer fixture.deinit();
     const manager = try fixture.manager();
     defer manager.destroy();
+    var cache = runtime.observation.Cache.init(manager.inspector.installation, [_]u8{0x61} ** 16);
+    manager.attachObservationCache(&cache);
     manager.inspector.iptables_path = "/nonexistent/fail2zig-fixture-iptables";
     try t.expectError(error.ToolUnavailable, manager.admit());
     try t.expect(!manager.status.ready);
@@ -118,6 +120,11 @@ test "native effect runtime: admission diagnostic is bounded by value and retain
     try t.expectEqual(inspection.OperationStage.admission_probe, diagnostic.stage);
     try t.expectEqual(error.ToolUnavailable, diagnostic.cause);
     try t.expectEqual(inspection.MutationDisposition.not_started, diagnostic.mutation);
+    var observation_page: runtime.observation.Page = undefined;
+    try cache.readPage(.{ .now_ms = runtime.observation.monotonicMs() }, &observation_page);
+    try t.expectEqual(.unavailable, observation_page.metadata.state);
+    try t.expectEqual(error.ToolUnavailable, observation_page.metadata.attempt_failure.?);
+    try t.expectEqual(inspection.OperationStage.admission_probe, observation_page.metadata.attempt_stage.?);
     const epoch = manager.repairEpoch();
     _ = try manager.beginRepair(epoch);
     try t.expectEqualDeep(diagnostic, manager.status.diagnostic.?);
@@ -246,7 +253,17 @@ test "native effect runtime: isolated canonical network survives manager restart
     {
         const manager = try fixture.manager();
         defer manager.destroy();
+        var cache = runtime.observation.Cache.init(manager.inspector.installation, [_]u8{0x62} ** 16);
+        manager.attachObservationCache(&cache);
         try ready(manager);
+        var page: runtime.observation.Page = undefined;
+        try cache.readPage(.{ .now_ms = runtime.observation.monotonicMs() }, &page);
+        try t.expectEqual(.owned, page.metadata.state);
+        try t.expectEqual(runtime.observation.Inventory.known_entries, page.metadata.inventory);
+        try t.expectEqual(@as(usize, 1), page.count);
+        try t.expectEqualDeep(scope, page.entries[0].scope.?);
+        try t.expectEqualSlices(u8, &entry.scope_key, &page.entries[0].effect_id.?);
+        try t.expectEqual(deadline, page.entries[0].deadline_us.?);
         var snapshot = try manager.inspector.inspect();
         defer snapshot.deinit();
         try t.expectEqual(@as(usize, 1), snapshot.entries.len);

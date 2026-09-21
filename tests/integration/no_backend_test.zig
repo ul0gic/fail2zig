@@ -115,6 +115,19 @@ fn lineContaining(text: []const u8, needle: []const u8) ?[]const u8 {
     return text[start..end];
 }
 
+fn expectLabeledValue(text: []const u8, label: []const u8, expected: []const u8) !void {
+    const line = lineContaining(text, label) orelse {
+        std.debug.print("expected a {s} line in:\n{s}\n", .{ label, text });
+        return error.TestExpectedContains;
+    };
+    const marker = std.mem.indexOf(u8, line, label).? + label.len;
+    const value = std.mem.trim(u8, line[marker..], " \t|");
+    if (!std.mem.eql(u8, value, expected)) {
+        std.debug.print("expected {s} value \"{s}\", found \"{s}\" in:\n{s}\n", .{ label, expected, value, text });
+        return error.TestExpectedContains;
+    }
+}
+
 fn expectSummaryLine(text: []const u8, outcome: []const u8) !void {
     const line = lineContaining(text, "no usable backend") orelse {
         std.debug.print("expected a \"no usable backend\" line in:\n{s}\n", .{text});
@@ -532,8 +545,8 @@ test "integration: no backend (b) on_no_backend = \"log-only\" stays up DEGRADED
 
     const table = try s.clientStatus(d);
     defer a.free(table);
-    try expectContains(table, "Protection:  DEGRADED (PermissionDenied)");
-    try expectContains(table, "Backend:     none");
+    try expectLabeledValue(table, "Protection:", "DEGRADED (PermissionDenied)");
+    try expectLabeledValue(table, "Backend:", "none");
 
     std.time.sleep(settle_ms * std.time.ns_per_ms);
     for (attacker_lines) |ln| try s.appendLogLine(ln);
@@ -581,8 +594,8 @@ test "integration: no backend (c) all-log-only config runs non-root with Protect
 
     const table = try s.clientStatus(d);
     defer a.free(table);
-    try expectContains(table, "Protection:  log-only");
-    try expectContains(table, "Backend:     none");
+    try expectLabeledValue(table, "Protection:", "log-only");
+    try expectLabeledValue(table, "Backend:", "none");
     try expectNotContains(table, "DEGRADED");
 
     std.time.sleep(settle_ms * std.time.ns_per_ms);
@@ -794,8 +807,8 @@ test "integration: forced backend (e) firewall = \"ipset\" off PATH + on_no_back
 
     const table = try s.clientStatus(d);
     defer a.free(table);
-    try expectContains(table, "Protection:  DEGRADED (IpsetUnavailable)");
-    try expectContains(table, "Backend:     none");
+    try expectLabeledValue(table, "Protection:", "DEGRADED (IpsetUnavailable)");
+    try expectLabeledValue(table, "Backend:", "none");
 
     std.time.sleep(settle_ms * std.time.ns_per_ms);
     for (attacker_lines) |ln| try s.appendLogLine(ln);
@@ -817,8 +830,8 @@ const userns_status_script =
     \\"$1" --foreground --config "$4" & p=$!
     \\i=0
     \\while :; do
-    \\  if out=$("$2" --socket "$3" status 2>&1); then
-    \\    case "$out" in *"Protection:  active"*) rc=0; break;; esac
+    \\  if out=$("$2" --socket "$3" --output json status 2>&1); then
+    \\    case "$out" in *'"protection":"active"'*) rc=0; break;; esac
     \\    rc=1
     \\  else rc=$?; fi
     \\  i=$((i + 1))
@@ -865,8 +878,8 @@ test "integration: forced backend (f) firewall = \"nftables\" in an owned netns 
     try expectContains(r.stderr, "running; backend=nftables;");
     try expectNotContains(r.stderr, "no usable backend");
     try expectNotContains(r.stderr, "forced by config but not usable");
-    try expectContains(r.stdout, "Protection:  active");
-    try expectContains(r.stdout, "Backend:     nftables");
+    try expectContains(r.stdout, "\"protection\":\"active\"");
+    try expectContains(r.stdout, "\"backend\":\"nftables\"");
     try expectContains(r.stdout, "client-rc=0");
     try expectContains(r.stdout, "daemon-rc=0");
     try testing.expect(!hasErrorReturnTrace(r.stderr));
@@ -903,8 +916,8 @@ test "integration: metrics_enabled = false (g) binds no HTTP listener, logs http
 
     const table = try s.clientStatus(d);
     defer a.free(table);
-    try expectContains(table, "Protection:  log-only");
-    try expectContains(table, "Backend:     none");
+    try expectLabeledValue(table, "Protection:", "log-only");
+    try expectLabeledValue(table, "Backend:", "none");
 
     try s.expectMetricsPortRefused();
 

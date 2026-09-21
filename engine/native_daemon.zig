@@ -10,6 +10,7 @@ const detection = @import("core/native_detection_record.zig");
 const timezone = @import("core/native_timezone.zig");
 const effect = @import("core/native_effect.zig");
 const effect_runtime = @import("native_effect_runtime.zig");
+const firewall_observation = effect_runtime.observation;
 const consumer_runtime = @import("native_consumer_runtime.zig");
 const consumer_plan = @import("config/native_consumer_plan.zig");
 const consumer_bridge = @import("core/native_consumer_coordinator.zig");
@@ -366,6 +367,8 @@ pub const Coordinator = struct {
     consumer_scan_revision: ?u64 = null,
     resources: resource.Ledger,
     resource_reservation: ?resource.Token = null,
+    firewall_observation_cache: ?*firewall_observation.Cache = null,
+    firewall_observation_unavailable: query_v1.FirewallUnavailableReason = .no_manager,
     config_path: []const u8 = "",
     live_cfg: *const config.Config,
     live_arena: ?*std.heap.ArenaAllocator = null,
@@ -880,6 +883,17 @@ pub const Coordinator = struct {
     fn observationHealthy(observation: health.WorkerStatus) bool {
         return !observation.stalled and !observation.clock_uncertain and !observation.expiry_uncertain and !observation.expiry_overdue;
     }
+    fn bindEffectInvalidation(self: *Coordinator) void {
+        self.store.effect_invalidation = .{ .context = self, .invalidate = invalidateEffectPublication };
+    }
+    fn invalidateEffectPublication(ctx: ?*anyopaque) void {
+        const self: *Coordinator = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        // Fence readers before COMMIT; retain the prior deadline until readback
+        // verifies the new epoch. Routine read-only turns keep their last evidence.
+        self.worker_observation.publication(observationMs(), observationWall(), null, false);
+    }
     fn resolverGeneration(server: ?std.net.Address) ![32]u8 {
         const selected = server orelse return [_]u8{0} ** 32;
         var bytes: [128]u8 = undefined;
@@ -891,7 +905,7 @@ pub const Coordinator = struct {
         const escalation = try policy.escalationBytes();
         return effect.hashParts("fail2zig-native-recidive-source-v1", &.{ jail, &base, &escalation });
     }
-    fn resourceRequirements(cfg: *const config.Config, selected: []config.LogSource) !resource.Requirements {
+    fn resourceRequirements(cfg: *const config.Config, selected: []config.LogSource) !resource.OptionalRequirements {
         const environment = try resource.currentEnvironment();
         const descriptors = try resource.FdContext.observe(cfg.global.native_fd_ceiling, 32);
         var plan: resource.Plan = .{};
@@ -949,7 +963,9 @@ pub const Coordinator = struct {
             .clock = .{ .context = null, .read_us = wallClock, .read_ms = monotonic },
         }));
         if (enforcing) try plan.include(try resource.effectCost(environment));
-        return plan.finish(.{ .zig_bytes = @as(usize, cfg.global.native_memory_ceiling_mb) * resource.mib, .descriptors = cfg.global.native_fd_ceiling }, descriptors);
+        const limits = resource.Limits{ .zig_bytes = @as(usize, cfg.global.native_memory_ceiling_mb) * resource.mib, .descriptors = cfg.global.native_fd_ceiling };
+        if (!enforcing) return .{ .requirements = try plan.finish(limits, descriptors), .admitted = false };
+        return resource.finishWithOptional(plan, try resource.firewallObservationCost(firewall_observation.Cache, firewall_observation.Page), limits, descriptors);
     }
     fn releaseResources(self: *Coordinator) void {
         if (self.resource_reservation) |reservation| self.resources.release(reservation) catch |failure| {
@@ -1030,7 +1046,8 @@ pub const Coordinator = struct {
             namespace_lock = null;
         }
         var selected_sources: [max_jails]config.LogSource = undefined;
-        const requirements = try resourceRequirements(cfg, selected_sources[0..count]);
+        const observation_admission = try resourceRequirements(cfg, selected_sources[0..count]);
+        const requirements = observation_admission.requirements;
         const per_jail: u32 = @intCast(max_subjects_total / count);
         const self = try a.create(Coordinator);
         errdefer a.destroy(self);
@@ -1055,6 +1072,8 @@ pub const Coordinator = struct {
         self.worker_observation = health.WorkerObservation.init(observationMs(), observationWall());
         self.resource_reservation = try self.resources.reserve(.other, requirements.cost);
         errdefer self.releaseResources();
+        if (runtime_enforcing) self.initializeObservationCache(observation_admission.admitted, self.startup_installation.?);
+        errdefer if (self.firewall_observation_cache) |cache| a.destroy(cache);
         if (runtime_enforcing) {
             self.owner_scratch = try a.alloc(durable.Store.OperatorOwner, effect.max_owners);
             errdefer a.free(self.owner_scratch);
@@ -1165,6 +1184,7 @@ pub const Coordinator = struct {
             return err;
         };
         self.store_open = true;
+        self.bindEffectInvalidation();
         errdefer self.store.close();
         try self.verifyStateIdentity();
         try self.validatePreflightInstallation();
@@ -1714,7 +1734,9 @@ pub const Coordinator = struct {
             try self.store.admitInstallation(selected, .{ .selector = selected.selector(), .disposition = .verified_absent });
             installation = selected;
         }
-        self.effects = try effect_runtime.Manager.create(self.allocator, &self.store, installation.?);
+        const manager = try effect_runtime.Manager.create(self.allocator, &self.store, installation.?);
+        if (self.firewall_observation_cache) |cache| manager.attachObservationCache(cache);
+        self.effects = manager;
     }
     fn recoverStorage(ctx: ?*anyopaque) !void {
         const self: *Coordinator = @ptrCast(@alignCast(ctx.?));
@@ -1740,6 +1762,7 @@ pub const Coordinator = struct {
                 if (self.last_open_failure != null) std.log.info("native: state runtime reopened; recovery checks pending", .{});
                 self.last_open_failure = null;
                 self.store_open = true;
+                self.bindEffectInvalidation();
                 try self.verifyStateIdentity();
             }
             try self.admitStore();
@@ -2183,7 +2206,7 @@ pub const Coordinator = struct {
         var next_expiry: ?i64 = null;
         var expiry_current = self.effects == null;
         if (self.effects) |manager| {
-            expiry_current = manager.status.ready and manager.cached_epoch != null and manager.cached_epoch.? == self.store.effect_publication_epoch;
+            expiry_current = !self.store.reopen_required and manager.status.ready and !manager.status.uncertain and manager.cached_epoch != null and manager.cached_epoch.? == self.store.effect_publication_epoch;
             if (expiry_current) for (manager.live[0..manager.count]) |entry| {
                 if (entry.status == .expired or entry.status == .absent or entry.status == .superseded) continue;
                 if (entry.desired == .finite) next_expiry = if (next_expiry) |prior| @min(prior, entry.desired.finite) else entry.desired.finite;
@@ -2243,6 +2266,7 @@ pub const Coordinator = struct {
             }
             self.stop_mutex.unlock();
             self.mutex.lock();
+            self.worker_observation.begin(observationMs(), observationWall());
             if (self.reload_request) |request| {
                 self.reload_request = null;
                 self.mutex.unlock();
@@ -2258,8 +2282,6 @@ pub const Coordinator = struct {
                 }
                 self.mutex.lock();
             }
-            self.worker_observation.begin(observationMs(), observationWall());
-            if (self.effects != null) self.worker_observation.publication(observationMs(), observationWall(), null, false);
             self.mutex.unlock();
             self.tick() catch |failure| {
                 if (!self.gate.snapshot().has_been_healthy and failure != error.ReceiptClockReversed) {
@@ -2450,6 +2472,7 @@ pub const Coordinator = struct {
             self.allocator.destroy(arena);
         }
         if (self.effects) |manager| manager.destroy();
+        if (self.firewall_observation_cache) |cache| self.allocator.destroy(cache);
         self.destroyRuntime();
         for (self.jails) |*jail| {
             if (jail.custom_plan) |value| value.destroy();
@@ -2489,7 +2512,7 @@ pub const Coordinator = struct {
             decisions +|= jail.summary.decisions;
             installed +|= self.confirmedCount(jail, now, observation);
         }
-        if (self.published_effects) |effects| healthy = healthy and effects.ready;
+        if (self.published_effects) |effects| healthy = healthy and effects.ready and !effects.uncertain;
         if (self.backend_failure != null) healthy = false;
         const protection: []const u8 = if (!healthy) "degraded" else if (self.published_effects != null) "active" else "log-only";
         const generation_hex = std.fmt.bytesToHex(self.published_generation, .lower);
@@ -2644,81 +2667,117 @@ pub const Coordinator = struct {
                 if (appended == limit) return .{ .more = true, .resume_after = after };
                 after = event.sequence;
                 if (jail) |wanted| if (!std.mem.eql(u8, wanted, event.jail.slice())) continue;
-                try out.append(.{ .sequence = event.sequence, .event_id = event.event_id, .jail = try out.allocator.dupe(u8, event.jail.slice()), .decision_id = event.decision_id, .confirmed_us = event.confirmed_us, .scope = scopeFields(event.scope), .native_retry = event.native_retry });
+                try out.append(.{ .sequence = event.sequence, .event_id = event.event_id, .jail = try out.allocator.dupe(u8, event.jail.slice()), .decision_id = event.decision_id, .confirmed_us = event.confirmed_us, .scope = try query_v1.projectScope(event.scope.canonical), .native_retry = event.native_retry });
                 appended += 1;
             }
             if (!page.more) return .{ .more = false, .resume_after = after };
         }
         return .{ .more = true, .resume_after = after };
     }
-    fn scopeFields(scope: effect.Scope) query_v1.ScopeFields {
-        const subject = scope.canonical.subject;
-        const family: query_v1.Family = switch (subject.family) {
-            .v4 => .v4,
-            .v6 => .v6,
+    // Optional telemetry must not turn its allocation failure into startup failure.
+    fn initializeObservationCache(self: *Coordinator, admitted: bool, installation: effect.Installation) void {
+        if (!admitted) {
+            self.firewall_observation_unavailable = .memory_budget;
+            return;
+        }
+        const cache = self.allocator.create(firewall_observation.Cache) catch {
+            self.firewall_observation_unavailable = .allocation_failed;
+            return;
         };
-        return .{ .family = family, .address = subject.address, .prefix = subject.prefix, .protocol = if (scope.canonical.protocols.isAll()) null else "tcp", .port = null, .direction = "input", .target = "drop" };
+        var nonce: [16]u8 = undefined;
+        std.crypto.random.bytes(&nonce);
+        cache.* = firewall_observation.Cache.init(effect_runtime.transportInstallation(installation), nonce);
+        self.firewall_observation_cache = cache;
+        self.firewall_observation_unavailable = .not_observed;
+    }
+
+    fn firewallRead(ctx: ?*anyopaque, request: firewall_observation.PageRequest, out: *firewall_observation.Page) anyerror!void {
+        const cache: *firewall_observation.Cache = @ptrCast(@alignCast(ctx.?));
+        try cache.readPage(request, out);
     }
     fn queryResponse(self: *Coordinator, a: std.mem.Allocator, body: []const u8, peer_class: query_v1.PeerClass) !shared.Response {
         var arena_state = std.heap.ArenaAllocator.init(a);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
+        var scope_storage: []query_v1.ScopeItem = &.{};
+        defer a.free(scope_storage);
+        const requested_kind = query_v1.requestedKind(arena, body);
+        const firewall_request = requested_kind != null and requested_kind.? == .firewall;
         var generation: [32]u8 = undefined;
         var config_view: ?query_v1.ConfigView = null;
         var scopes_view: ?query_v1.ScopesView = null;
+        var firewall_source: ?query_v1.FirewallSource = null;
         {
             self.mutex.lock();
             defer self.mutex.unlock();
             generation = self.published_generation;
-            const cfg = self.live_cfg;
-            var jail_configs = try arena.alloc(query_v1.JailConfig, self.jails.len);
-            var jail_scopes = try arena.alloc(query_v1.JailScopes, self.jails.len);
-            const now = observationWall() orelse self.start_us;
-            const observation = self.observedWorker();
-            for (self.jails, 0..) |jail, i| {
-                const source_cfg = findConfigJail(cfg, jail.name);
-                const bantime: u64 = switch (jail.policy.duration) {
-                    .finite_us => |value| @intCast(@divTrunc(value, 1_000_000)),
-                    .permanent => 0,
-                };
-                jail_configs[i] = .{ .name = jail.name, .enabled = jail.admin_enabled, .filter = if (source_cfg) |c| c.filter else "", .source = @tagName(jail.plan), .logpath = if (source_cfg) |c| c.logpath else &.{}, .maxretry = jail.policy.maxretry, .findtime = @intCast(@divTrunc(jail.policy.window_us, 1_000_000)), .bantime = bantime, .bantime_permanent = jail.policy.duration == .permanent, .banaction = if (self.jailEnforces(&jail)) self.published_backend else "log-only", .ignoreip = if (source_cfg) |c| (c.ignoreip orelse cfg.defaults.ignoreip) else &.{} };
-                const item_count = if (self.jailEnforces(&jail)) blk: {
-                    var count: usize = 0;
-                    for (self.owner_active[0..self.owner_count]) |owner| if (std.mem.eql(u8, owner.jail.slice(), jail.name)) {
-                        count += 1;
-                    };
-                    break :blk count;
-                } else jail.summary.active;
-                var items = try arena.alloc(query_v1.ScopeItem, item_count);
-                if (self.jailEnforces(&jail)) {
-                    var k: usize = 0;
-                    for (self.owner_active[0..self.owner_count], 0..) |owner, owner_index| {
-                        if (!std.mem.eql(u8, owner.jail.slice(), jail.name)) continue;
-                        items[k] = .{ .scope = scopeFields(owner.scope), .lease = if (owner.lease == .permanent) .permanent else .finite, .deadline_us = if (owner.lease == .finite) owner.lease.finite else null, .decision_id = owner.decision_id, .confirmed = self.owner_confirmed[owner_index] and owner.lease.live(now) and self.confirmationReady(observation) };
-                        k += 1;
-                    }
-                } else {
-                    for (jail.active[0..jail.summary.active], 0..) |decision, k| {
-                        var address = [_]u8{0} ** 16;
-                        const family: query_v1.Family = switch (decision.subject) {
-                            .v4 => |v| blk: {
-                                @memcpy(address[0..4], &v);
-                                break :blk .v4;
-                            },
-                            .v6 => |v| blk: {
-                                @memcpy(address[0..16], &v);
-                                break :blk .v6;
-                            },
+            if (firewall_request) {
+                firewall_source = if (self.firewall_observation_cache) |cache|
+                    .{ .cache = .{ .ctx = cache, .read = firewallRead } }
+                else
+                    .{ .unavailable = self.firewall_observation_unavailable };
+            } else {
+                const cfg = self.live_cfg;
+                const jail_configs = try arena.alloc(query_v1.JailConfig, self.jails.len);
+                const jail_scopes = try arena.alloc(query_v1.JailScopes, self.jails.len);
+                // A single exact allocation avoids retaining geometrically grown arena
+                // blocks for per-jail scope arrays within the control scratch budget.
+                var counts: [max_jails]usize = undefined;
+                var total: usize = 0;
+                for (self.jails, 0..) |jail, i| {
+                    counts[i] = if (self.jailEnforces(&jail)) blk: {
+                        var count: usize = 0;
+                        for (self.owner_active[0..self.owner_count]) |owner| if (std.mem.eql(u8, owner.jail.slice(), jail.name)) {
+                            count += 1;
                         };
-                        items[k] = .{ .scope = .{ .family = family, .address = address, .prefix = if (family == .v4) 32 else 128 }, .lease = if (decision.lease == .permanent) .permanent else .finite, .deadline_us = if (decision.lease == .finite) decision.lease.finite else null, .decision_id = null, .confirmed = jail.confirmed[k] and decision.lease.live(now) and self.confirmationReady(observation) };
-                    }
+                        break :blk count;
+                    } else jail.summary.active;
+                    total = try std.math.add(usize, total, counts[i]);
                 }
-                jail_scopes[i] = .{ .name = jail.name, .items = items };
+                if (total > effect.max_owners + max_subjects_total) return error.NativeSubjectLimit;
+                scope_storage = try a.alloc(query_v1.ScopeItem, total);
+                var scope_offset: usize = 0;
+                const now = observationWall() orelse self.start_us;
+                const observation = self.observedWorker();
+                for (self.jails, 0..) |jail, i| {
+                    const source_cfg = findConfigJail(cfg, jail.name);
+                    const bantime: u64 = switch (jail.policy.duration) {
+                        .finite_us => |value| @intCast(@divTrunc(value, 1_000_000)),
+                        .permanent => 0,
+                    };
+                    jail_configs[i] = .{ .name = jail.name, .enabled = jail.admin_enabled, .filter = if (source_cfg) |c| c.filter else "", .source = @tagName(jail.plan), .logpath = if (source_cfg) |c| c.logpath else &.{}, .maxretry = jail.policy.maxretry, .findtime = @intCast(@divTrunc(jail.policy.window_us, 1_000_000)), .bantime = bantime, .bantime_permanent = jail.policy.duration == .permanent, .banaction = if (self.jailEnforces(&jail)) self.published_backend else "log-only", .ignoreip = if (source_cfg) |c| (c.ignoreip orelse cfg.defaults.ignoreip) else &.{} };
+                    const items = scope_storage[scope_offset..][0..counts[i]];
+                    scope_offset += counts[i];
+                    if (self.jailEnforces(&jail)) {
+                        var k: usize = 0;
+                        for (self.owner_active[0..self.owner_count], 0..) |owner, owner_index| {
+                            if (!std.mem.eql(u8, owner.jail.slice(), jail.name)) continue;
+                            items[k] = .{ .scope = try query_v1.projectScope(owner.scope.canonical), .lease = if (owner.lease == .permanent) .permanent else .finite, .deadline_us = if (owner.lease == .finite) owner.lease.finite else null, .decision_id = owner.decision_id, .confirmed = self.owner_confirmed[owner_index] and owner.lease.live(now) and self.confirmationReady(observation) };
+                            k += 1;
+                        }
+                    } else {
+                        for (jail.active[0..jail.summary.active], 0..) |decision, k| {
+                            var address = [_]u8{0} ** 16;
+                            const family: query_v1.Family = switch (decision.subject) {
+                                .v4 => |v| blk: {
+                                    @memcpy(address[0..4], &v);
+                                    break :blk .v4;
+                                },
+                                .v6 => |v| blk: {
+                                    @memcpy(address[0..16], &v);
+                                    break :blk .v6;
+                                },
+                            };
+                            items[k] = .{ .scope = .{ .family = family, .address = address, .prefix = if (family == .v4) 32 else 128 }, .lease = if (decision.lease == .permanent) .permanent else .finite, .deadline_us = if (decision.lease == .finite) decision.lease.finite else null, .decision_id = null, .confirmed = jail.confirmed[k] and decision.lease.live(now) and self.confirmationReady(observation) };
+                        }
+                    }
+                    jail_scopes[i] = .{ .name = jail.name, .items = items };
+                }
+                config_view = .{ .jails = jail_configs, .global = .{ .log_level = @tagName(cfg.global.log_level), .firewall = @tagName(cfg.global.firewall), .metrics_enabled = cfg.global.metrics_enabled, .metrics_bind = cfg.global.metrics_bind, .metrics_port = cfg.global.metrics_port, .socket_path = cfg.global.socket_path, .state_file = cfg.global.state_file, .dns_server = cfg.global.dns_server, .timezone_root = cfg.global.timezone_root } };
+                scopes_view = .{ .jails = jail_scopes };
             }
-            config_view = .{ .jails = jail_configs, .global = .{ .log_level = @tagName(cfg.global.log_level), .firewall = @tagName(cfg.global.firewall), .metrics_enabled = cfg.global.metrics_enabled, .metrics_bind = cfg.global.metrics_bind, .metrics_port = cfg.global.metrics_port, .socket_path = cfg.global.socket_path, .state_file = cfg.global.state_file, .dns_server = cfg.global.dns_server, .timezone_root = cfg.global.timezone_root } };
-            scopes_view = .{ .jails = jail_scopes };
         }
-        const result = try query_v1.handle(a, body, peer_class, generation, .{ .status = .{ .ctx = self, .func = statusCallback }, .health = .{ .ctx = self, .func = healthCallback }, .config = config_view, .scopes = scopes_view, .history = .{ .ctx = self, .read = historyRead } });
+        const result = try query_v1.handle(a, body, peer_class, generation, .{ .status = .{ .ctx = self, .func = statusCallback }, .health = .{ .ctx = self, .func = healthCallback }, .config = config_view, .scopes = scopes_view, .history = .{ .ctx = self, .read = historyRead }, .firewall = firewall_source });
         return switch (result) {
             .payload => |bytes| .{ .ok = .{ .payload = bytes } },
             .failure => |failure| .{ .err = .{ .code = failure.code, .message = try a.dupe(u8, failure.message) } },
@@ -2749,7 +2808,7 @@ pub const Coordinator = struct {
                         .finite_us => |value| @divTrunc(value, 1_000_000),
                         .permanent => null,
                     };
-                    try std.json.stringify(.{ .name = jail.name, .healthy = jail.healthy and self.published_health.phase == .healthy and observationHealthy(observation), .enabled = jail.admin_enabled, .paused = jail.admin_paused, .active_bans = self.confirmedCount(jail, sampled_wall orelse self.start_us, observation), .maxretry = jail.policy.maxretry, .findtime = @divTrunc(jail.policy.window_us, 1_000_000), .bantime = bantime, .bantime_permanent = jail.policy.duration == .permanent, .action = if (self.jailEnforces(&jail)) self.published_backend else "log-only", .enforcing = self.jailEnforces(&jail) and self.confirmationReady(observation), .log_source = @tagName(jail.plan), .source_healthy = jail.healthy and self.published_health.phase == .healthy and observationHealthy(observation), .source = @tagName(jail.plan), .revision = jail.revision, .decisions = jail.summary.decisions, .cause = if (jail.source_error) |cause| @errorName(cause) else "none", .source_exit_code = if (jail.source_diagnostic) |detail| detail.exit_code else null, .source_signal = if (jail.source_diagnostic) |detail| detail.signal else null, .source_stderr_present = if (jail.source_diagnostic) |detail| @as(?bool, detail.stderr_present) else null }, .{}, w);
+                    try std.json.stringify(.{ .name = jail.name, .healthy = jail.healthy and self.published_health.phase == .healthy and observationHealthy(observation), .enabled = jail.admin_enabled, .paused = jail.admin_paused, .active_bans = self.confirmedCount(jail, sampled_wall orelse self.start_us, observation), .maxretry = jail.policy.maxretry, .findtime = @divTrunc(jail.policy.window_us, 1_000_000), .bantime = bantime, .bantime_permanent = jail.policy.duration == .permanent, .action = if (self.jailEnforces(&jail)) self.published_backend else "log-only", .enforcing = self.jailEnforces(&jail) and self.confirmationReady(observation), .log_source = @tagName(jail.plan), .source_healthy = jail.healthy, .source = @tagName(jail.plan), .revision = jail.revision, .decisions = jail.summary.decisions, .cause = if (jail.source_error) |cause| @errorName(cause) else "none", .source_exit_code = if (jail.source_diagnostic) |detail| detail.exit_code else null, .source_signal = if (jail.source_diagnostic) |detail| detail.signal else null, .source_stderr_present = if (jail.source_diagnostic) |detail| @as(?bool, detail.stderr_present) else null }, .{}, w);
                 }
                 try w.writeAll("]");
             },
@@ -2889,6 +2948,88 @@ test "native daemon BUG-035: admin settlement requires coherent effect readback"
     try testing.expectEqual(AdminReadback.pending, adminReadback(.{ .ready = true }, 7, 8));
     try testing.expectEqual(AdminReadback.uncertain, adminReadback(.{ .ready = true, .uncertain = true }, 8, 8));
     try testing.expectEqual(AdminReadback.coherent, adminReadback(.{ .ready = true }, 8, 8));
+}
+
+test "native daemon BUG-065: queries retain read-only health and separate source failures from effect uncertainty" {
+    const testing = std.testing;
+    var jails = [_]Jail{.{
+        .name = "fixture",
+        .plan = .{ .internal = [_]u8{1} ** 32 },
+        .policy = .{ .maxretry = 3, .window_us = 600_000_000, .duration = .{ .finite_us = 60_000_000 }, .max_subjects = 1, .enforce = true },
+        .scratch = &.{},
+        .active = &.{},
+        .scratch_confirmed = &.{},
+        .confirmed = &.{},
+        .healthy = true,
+    }};
+    var coordinator: Coordinator = .{
+        .allocator = testing.allocator,
+        .cfg = undefined,
+        .live_cfg = undefined,
+        .jails = &jails,
+        .store = undefined,
+        .timer = try std.time.Timer.start(),
+        .gate = undefined,
+        .published_health = undefined,
+        .start_us = std.time.microTimestamp(),
+        .resources = undefined,
+        .published_backend = "nftables",
+        .published_effects = .{ .ready = true },
+    };
+    coordinator.gate = health.Gate.init(.{ .context = &coordinator, .read = Coordinator.monotonic });
+    const generation = try coordinator.gate.beginRecovery();
+    for ([_]health.RecoveryStep{ .storage, .state, .ownership, .sources }) |step| try coordinator.gate.completed(generation, step);
+    coordinator.published_health = coordinator.gate.snapshot();
+    const wall = Coordinator.observationWall().?;
+    const monotonic = Coordinator.observationMs().?;
+    const deadline = wall + 60_000_000;
+
+    const Case = enum { routine, commit, stalled, expired, backend_failure, source_failure, clock_uncertain, storage_paused };
+    for (std.enums.values(Case)) |case| {
+        coordinator.worker_observation = health.WorkerObservation.init(monotonic, wall);
+        coordinator.worker_observation.publication(monotonic, wall, deadline, true);
+        coordinator.worker_observation.begin(monotonic, wall);
+        coordinator.published_effects = .{ .ready = true };
+        coordinator.published_health.phase = .healthy;
+        jails[0].healthy = true;
+        jails[0].source_error = null;
+        switch (case) {
+            .routine => {},
+            .commit => {
+                Coordinator.invalidateEffectPublication(&coordinator);
+                try testing.expectEqual(@as(?i64, deadline), coordinator.worker_observation.next_committed_expiry_us);
+            },
+            .stalled => {
+                coordinator.worker_observation.busy_since_ms = monotonic -| health.diagnostic_stall_ms;
+                coordinator.worker_observation.heartbeat_ms = monotonic -| health.diagnostic_stall_ms;
+            },
+            .expired => coordinator.worker_observation.publication(monotonic, wall, wall - 1, true),
+            .backend_failure => coordinator.published_effects = .{ .ready = false, .uncertain = true, .cause = error.EffectBackendUncertain },
+            .source_failure => {
+                jails[0].healthy = false;
+                jails[0].source_error = error.AccessDenied;
+            },
+            .clock_uncertain => coordinator.worker_observation.clock_uncertain = true,
+            .storage_paused => coordinator.published_health.phase = .paused,
+        }
+        const response = try Coordinator.command(&coordinator, .{ .list_jails = {} }, testing.allocator);
+        defer testing.allocator.free(response.ok.payload);
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, response.ok.payload, .{});
+        defer parsed.deinit();
+        const jail = parsed.value.array.items[0].object;
+        try testing.expectEqual(case != .source_failure, jail.get("source_healthy").?.bool);
+        try testing.expectEqualStrings(if (case == .source_failure) "AccessDenied" else "none", jail.get("cause").?.string);
+        if (case != .routine and case != .source_failure) try testing.expect(!jail.get("enforcing").?.bool);
+        if (case == .routine) try testing.expect(jail.get("enforcing").?.bool);
+
+        var output: std.ArrayListUnmanaged(u8) = .{};
+        defer output.deinit(testing.allocator);
+        try Coordinator.status(&coordinator, &output, testing.allocator);
+        const status = try std.json.parseFromSlice(std.json.Value, testing.allocator, output.items, .{});
+        defer status.deinit();
+        try testing.expectEqualStrings(if (case == .routine) "active" else "degraded", status.value.object.get("protection").?.string);
+        try testing.expectEqual(@as(i64, if (case == .source_failure) 1 else 0), status.value.object.get("unhealthy_sources").?.integer);
+    }
 }
 
 const AdminOwnershipProbe = struct {
@@ -3082,4 +3223,25 @@ test "native daemon BUG-022: live config classification excludes arena replaceme
     try testing.expectEqual(reload_mod.Kind.noop, second.classification.kind);
     try testing.expect(coordinator.live_arena == null);
     try testing.expect(coordinator.live_cfg == &proposed);
+}
+
+test "native daemon BUG-060 optional observation allocation failure stays telemetry-only" {
+    const testing = std.testing;
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var coordinator: Coordinator = undefined;
+    coordinator.allocator = failing.allocator();
+    coordinator.firewall_observation_cache = null;
+    coordinator.firewall_observation_unavailable = .no_manager;
+    const installation = try effect.Installation.init([_]u8{0x51} ** 16, .nftables, "fixture");
+    coordinator.initializeObservationCache(false, installation);
+    try testing.expectEqual(.memory_budget, coordinator.firewall_observation_unavailable);
+    try testing.expect(!failing.has_induced_failure);
+    coordinator.initializeObservationCache(true, installation);
+    try testing.expect(failing.has_induced_failure);
+    try testing.expect(coordinator.firewall_observation_cache == null);
+    try testing.expectEqual(.allocation_failed, coordinator.firewall_observation_unavailable);
+    coordinator.allocator = testing.allocator;
+    coordinator.initializeObservationCache(true, installation);
+    defer testing.allocator.destroy(coordinator.firewall_observation_cache.?);
+    try testing.expectEqual(.not_observed, coordinator.firewall_observation_unavailable);
 }

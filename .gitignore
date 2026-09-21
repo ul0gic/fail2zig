@@ -1,6 +1,3 @@
-.claude/
-.project/
-
 zig-out/
 zig-cache/
 .zig-cache/

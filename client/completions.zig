@@ -28,7 +28,7 @@ const bash_script =
     \\    local cur prev words cword
     \\    _init_completion || return
     \\
-    \\    local subcommands="status ban unban list jails reload version config history jail completions help"
+    \\    local subcommands="status ban unban list jails reload version config history firewall jail completions help"
     \\    local global_flags="--socket --output --no-color --timeout --help --version"
     \\
     \\    # Flag-value completion for the previous word.
@@ -72,10 +72,14 @@ const bash_script =
     \\    fi
     \\
     \\    case "$cmd" in
-    \\        status|jails|reload|version|config)
+    \\        status|jails)
+    \\            COMPREPLY=( $(compgen -W "--details $global_flags" -- "$cur") ) ;;
+    \\        reload|version|config)
     \\            COMPREPLY=( $(compgen -W "$global_flags" -- "$cur") ) ;;
     \\        history)
     \\            COMPREPLY=( $(compgen -W "reset --jail --limit --cursor --all $global_flags" -- "$cur") ) ;;
+    \\        firewall)
+    \\            COMPREPLY=( $(compgen -W "show --limit --cursor --details $global_flags" -- "$cur") ) ;;
     \\        ban)
     \\            COMPREPLY=( $(compgen -W "--jail --duration --scope $global_flags" -- "$cur") ) ;;
     \\        unban)
@@ -83,7 +87,7 @@ const bash_script =
     \\        jail)
     \\            COMPREPLY=( $(compgen -W "enable disable pause resume" -- "$cur") ) ;;
     \\        list)
-    \\            COMPREPLY=( $(compgen -W "--jail $global_flags" -- "$cur") ) ;;
+    \\            COMPREPLY=( $(compgen -W "--jail --details $global_flags" -- "$cur") ) ;;
     \\        completions)
     \\            COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ) ;;
     \\        help)
@@ -116,6 +120,7 @@ const zsh_script =
     \\        'version:Show client and daemon version'
     \\        'config:Show effective configuration'
     \\        'history:Page through confirmed ban history (or: history reset)'
+    \\        'firewall:Inspect sampled fail2zig-owned kernel protection'
     \\        'jail:Enable, disable, pause or resume a jail'
     \\        'completions:Generate shell completion script'
     \\        'help:Show help for a command'
@@ -162,7 +167,10 @@ const zsh_script =
     \\                list)
     \\                    _arguments \
     \\                        '--jail[Filter by jail]:jail name:' \
+    \\                        '--details[Include ban counts in table output]' \
     \\                        $global_flags ;;
+    \\                status|jails)
+    \\                    _arguments '--details[Include table detail]' $global_flags ;;
     \\                history)
     \\                    _arguments \
     \\                        '--jail[Filter by jail / reset one jail]:jail name:' \
@@ -170,6 +178,13 @@ const zsh_script =
     \\                        '--cursor[Continue from next_cursor]:cursor:' \
     \\                        '--all[Reset history for all jails]' \
     \\                        '1:subcommand:(reset)' \
+    \\                        $global_flags ;;
+    \\                firewall)
+    \\                    _arguments \
+    \\                        '1:action:(show)' \
+    \\                        '--limit[Sample entries per page (1..256)]:limit:' \
+    \\                        '--cursor[Continue the same retained observation]:cursor:' \
+    \\                        '--details[Include verified owned structures, entry placement and identifiers]' \
     \\                        $global_flags ;;
     \\                completions)
     \\                    _arguments '1:shell:(bash zsh fish)' ;;
@@ -245,6 +260,7 @@ const fish_script =
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'version'      -d 'Show version'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'config'       -d 'Show effective configuration'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'history'      -d 'Page through confirmed ban history'
+    \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'firewall'     -d 'Inspect sampled fail2zig-owned kernel protection'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'jail'         -d 'Enable, disable, pause or resume a jail'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'completions'  -d 'Generate completion script'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'help'         -d 'Show help'
@@ -267,9 +283,16 @@ const fish_script =
     \\complete -c fail2zig -f -n '__fail2zig_client_using_command history' -a 'reset' -d 'Reset an address ban history'
     \\complete -c fail2zig -n '__fail2zig_client_using_command history' -l all -d 'Reset history for all jails'
     \\complete -c fail2zig -n '__fail2zig_client_using_command list'  -l jail     -x -d 'Filter by jail'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command list'  -l details -d 'Include ban counts in table output'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command status' -l details -d 'Include table detail'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command jails'  -l details -d 'Include table detail'
     \\complete -c fail2zig -n '__fail2zig_client_using_command history' -l jail   -x -d 'Filter by jail'
     \\complete -c fail2zig -n '__fail2zig_client_using_command history' -l limit  -x -d 'Events per page (1..256)'
     \\complete -c fail2zig -n '__fail2zig_client_using_command history' -l cursor -x -d 'Continue from next_cursor'
+    \\complete -c fail2zig -f -n '__fail2zig_client_using_command firewall' -a 'show' -d 'Show retained firewall observation'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command firewall' -l limit  -x -d 'Sample entries per page (1..256)'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command firewall' -l cursor -x -d 'Continue the same retained observation'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command firewall' -l details -d 'Include verified owned structures, entry placement and identifiers'
     \\
     \\# `completions` subcommand: shell argument
     \\complete -c fail2zig -f -n '__fail2zig_client_using_command completions' -a 'bash zsh fish'
@@ -291,13 +314,14 @@ test "completions: bash starts with shebang and installs complete -F" {
 
 test "completions: bash covers all subcommands" {
     const s = generateBash();
-    const subs = [_][]const u8{ "status", "ban", "unban", "list", "jails", "reload", "version", "config", "history", "completions", "help" };
+    const subs = [_][]const u8{ "status", "ban", "unban", "list", "jails", "reload", "version", "config", "history", "firewall", "completions", "help" };
     for (subs) |sub| {
         try testing.expect(std.mem.indexOf(u8, s, sub) != null);
     }
     try testing.expect(std.mem.indexOf(u8, s, "reset --jail --limit --cursor --all") != null);
     try testing.expect(std.mem.indexOf(u8, s, "enable disable pause resume") != null);
     try testing.expect(std.mem.indexOf(u8, s, "--jail --duration --scope") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "show --limit --cursor") != null);
 }
 
 test "completions: bash covers --output values" {
@@ -317,7 +341,7 @@ test "completions: zsh has #compdef header" {
 
 test "completions: zsh covers all subcommands in command list" {
     const s = generateZsh();
-    const subs = [_][]const u8{ "status:", "ban:", "unban:", "list:", "jails:", "reload:", "version:", "config:", "history:", "completions:", "help:" };
+    const subs = [_][]const u8{ "status:", "ban:", "unban:", "list:", "jails:", "reload:", "version:", "config:", "history:", "firewall:", "completions:", "help:" };
     for (subs) |sub| {
         try testing.expect(std.mem.indexOf(u8, s, sub) != null);
     }
@@ -325,6 +349,7 @@ test "completions: zsh covers all subcommands in command list" {
     try testing.expect(std.mem.indexOf(u8, s, "(enable disable pause resume)") != null);
     try testing.expect(std.mem.indexOf(u8, s, "jail:") != null);
     try testing.expect(std.mem.indexOf(u8, s, "scope:(host net)") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "1:action:(show)") != null);
 }
 
 test "completions: fish uses complete -c syntax" {
@@ -337,13 +362,14 @@ test "completions: fish uses complete -c syntax" {
 
 test "completions: fish has all subcommands" {
     const s = generateFish();
-    const subs = [_][]const u8{ "status", "ban", "unban", "list", "jails", "reload", "version", "config", "history", "completions", "help" };
+    const subs = [_][]const u8{ "status", "ban", "unban", "list", "jails", "reload", "version", "config", "history", "firewall", "completions", "help" };
     for (subs) |sub| {
         try testing.expect(std.mem.indexOf(u8, s, sub) != null);
     }
     try testing.expect(std.mem.indexOf(u8, s, "__fail2zig_client_using_command history' -l cursor") != null);
     try testing.expect(std.mem.indexOf(u8, s, "__fail2zig_client_using_command jail' -a 'enable disable pause resume'") != null);
     try testing.expect(std.mem.indexOf(u8, s, "-l scope    -x -a 'host net'") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "using_command firewall' -a 'show'") != null);
 }
 
 test "completions: fish references global flags" {

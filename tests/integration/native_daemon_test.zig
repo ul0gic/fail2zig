@@ -67,6 +67,27 @@ fn waitStatus(h: *harness.Harness, needle: []const u8) !void {
     std.debug.print("native daemon: missing {s}; last status {s}\n", .{ needle, last });
     return error.TimedOut;
 }
+
+fn expectUnhealthySourceSummary(text: []const u8) !void {
+    const label = "Sources:";
+    const position = std.mem.indexOf(u8, text, label) orelse return error.TestExpectedContains;
+    const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..position], '\n')) |index| index + 1 else 0;
+    const line_end = std.mem.indexOfScalarPos(u8, text, position, '\n') orelse text.len;
+    const value = std.mem.trim(u8, text[position + label.len .. line_end], " \t|");
+    const narrow = std.mem.eql(u8, value, "1 unhealthy");
+    const wide = std.mem.eql(u8, value, "1 unhealthy; inspect fail2zig jails");
+    if (!narrow and !wide) {
+        std.debug.print("native daemon: unhealthy source summary expected {s} or {s}; actual line {s}\n", .{ "1 unhealthy", "1 unhealthy; inspect fail2zig jails", text[line_start..line_end] });
+        return error.TestExpectedEqual;
+    }
+}
+
+fn expectContainsDiagnostic(context: []const u8, actual: []const u8, expected: []const u8) !void {
+    if (std.mem.indexOf(u8, actual, expected) != null) return;
+    const shown = actual[0..@min(actual.len, 2048)];
+    std.debug.print("native daemon: {s} expected substring {s}; actual first {d}/{d} bytes: {s}\n", .{ context, expected, shown.len, actual.len, shown });
+    return error.TestExpectedContains;
+}
 fn waitRevision(h: *harness.Harness, expected: u32) !void {
     var timer = try std.time.Timer.start();
     while (timer.read() < 8 * std.time.ns_per_s) {
@@ -299,8 +320,8 @@ test "native daemon: malformed source isolates its jail while independent file d
     try waitStatus(&h, "\"storage\":\"healthy\"");
     const jails = try h.sendCommand(.{ .list_jails = {} });
     defer t.allocator.free(jails);
-    try t.expect(std.mem.indexOf(u8, jails, "\"name\":\"sshd\",\"healthy\":false") != null);
-    try t.expect(std.mem.indexOf(u8, jails, "\"name\":\"good\",\"healthy\":true") != null);
+    try expectContainsDiagnostic("raw jails unhealthy source state", jails, "\"name\":\"sshd\",\"healthy\":false");
+    try expectContainsDiagnostic("raw jails independent source state", jails, "\"name\":\"good\",\"healthy\":true");
     try waitStatus(&h, "\"unhealthy_sources\":1");
     const CauseView = struct { name: []const u8, cause: []const u8 };
     const causes = try std.json.parseFromSlice([]const CauseView, t.allocator, jails, .{ .ignore_unknown_fields = true });
@@ -309,24 +330,42 @@ test "native daemon: malformed source isolates its jail while independent file d
     for (causes.value) |entry| if (std.mem.eql(u8, entry.name, "sshd")) {
         source_cause = entry.cause;
     };
-    try t.expect(source_cause != null);
-    try t.expect(!std.mem.eql(u8, source_cause.?, "none"));
+    if (source_cause == null) {
+        std.debug.print("native daemon: expected sshd source cause; actual jails {s}\n", .{jails[0..@min(jails.len, 2048)]});
+        return error.TestExpectedEqual;
+    }
+    if (std.mem.eql(u8, source_cause.?, "none")) {
+        std.debug.print("native daemon: expected non-none sshd source cause; actual cause {s}; jails {s}\n", .{ source_cause.?, jails[0..@min(jails.len, 2048)] });
+        return error.TestExpectedEqual;
+    }
     var cause_buffer: [160]u8 = undefined;
     const cause_text = try std.fmt.bufPrint(&cause_buffer, "broken ({s}", .{source_cause.?});
     // Exercise the delivered formatter against the same actual daemon fault.
     const checks = [_]struct { format: []const u8, command: []const u8, needle: []const u8 }{
         .{ .format = "plain", .command = "status", .needle = "unhealthy_sources\t1" },
         .{ .format = "plain", .command = "status", .needle = "storage\thealthy" },
-        .{ .format = "table", .command = "status", .needle = "1 unhealthy; inspect fail2zig jails" },
+        .{ .format = "table", .command = "status", .needle = "" },
         .{ .format = "table", .command = "jails", .needle = cause_text },
     };
     for (checks) |check| {
         const result = try std.process.Child.run(.{ .allocator = t.allocator, .argv = &.{ "zig-out/bin/fail2zig", "--socket", h.socket_path, "--timeout", "1000", "--output", check.format, check.command }, .max_output_bytes = 65536 });
         defer t.allocator.free(result.stdout);
         defer t.allocator.free(result.stderr);
-        try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
-        try t.expect(std.mem.indexOf(u8, result.stdout, check.needle) != null);
-        try t.expect(std.mem.indexOf(u8, result.stdout, "could not parse") == null);
+        if (!std.meta.eql(std.process.Child.Term{ .Exited = 0 }, result.term)) {
+            std.debug.print("native daemon: delivered {s} {s} expected exit 0; actual term {any}; stderr first {d}/{d} bytes: {s}\n", .{ check.format, check.command, result.term, @min(result.stderr.len, 2048), result.stderr.len, result.stderr[0..@min(result.stderr.len, 2048)] });
+            return error.TestExpectedEqual;
+        }
+        if (check.needle.len == 0)
+            try expectUnhealthySourceSummary(result.stdout)
+        else {
+            var context_buffer: [96]u8 = undefined;
+            const context = try std.fmt.bufPrint(&context_buffer, "delivered {s} {s}", .{ check.format, check.command });
+            try expectContainsDiagnostic(context, result.stdout, check.needle);
+        }
+        if (std.mem.indexOf(u8, result.stdout, "could not parse") != null) {
+            std.debug.print("native daemon: delivered {s} {s} unexpectedly reported a parse failure; stdout first {d}/{d} bytes: {s}\n", .{ check.format, check.command, @min(result.stdout.len, 2048), result.stdout.len, result.stdout[0..@min(result.stdout.len, 2048)] });
+            return error.TestUnexpectedResult;
+        }
     }
     _ = try h.stopDaemon();
 }
@@ -340,7 +379,7 @@ test "native daemon: delivered client renders native status jails version and de
     for (0..3) |_| try h.writeLine(failure);
     try waitStatus(&h, "\"decisions_total\":1");
     const commands = [_][]const u8{ "status", "jails", "version", "list" };
-    const expected = [_][]const u8{ "log-only", "sshd", "daemon\t0.4.1", "203.0.113.7" };
+    const expected = [_][]const u8{ "log-only", "sshd", "daemon\t0.4.2", "203.0.113.7" };
     for (commands, expected) |command, text| {
         const result = try std.process.Child.run(.{ .allocator = t.allocator, .argv = &.{ "zig-out/bin/fail2zig", "--socket", h.socket_path, "--timeout", "1000", "--output", "plain", command }, .max_output_bytes = 65536 });
         defer t.allocator.free(result.stdout);

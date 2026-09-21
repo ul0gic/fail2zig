@@ -1,6 +1,6 @@
 # Runtime architecture
 
-fail2zig 0.4.1 is one native executable containing the daemon, administration commands, rule
+fail2zig 0.4.2 is one native executable containing the daemon, administration commands, rule
 testing and migration tools. Zig application code statically embeds pinned upstream SQLite C.
 Runtime installation does not require Python, a SQLite service, the SQLite CLI or a shared SQLite
 library.
@@ -65,13 +65,19 @@ interface and enforcement target where the backend supports them.
 
 Firewall effects are limited to the daemon's current network namespace. The daemon does not enter
 another namespace, and custom namespace selectors or service overrides that move it between
-namespaces are not supported in 0.4.0.
+namespaces remain unsupported.
 
 ## Administration and privileges
 
 The local Unix socket uses peer credentials for authorization. Read-only monitoring remains
 available to the configured service/monitor group; mutations require root or the daemon UID. Status distinguishes
 policy decisions, installed protection, uncertainty and degraded dependencies.
+
+Routine worker activity retains the last verified protection
+view. Effect-changing transactions invalidate that view before commit; coherent readback
+restores confirmation. Overdue deadlines, stalled workers, clock uncertainty and failed
+readback still degrade protection. Jail `source_healthy` describes the source independently
+of storage and firewall health; it does not by itself establish enforcement.
 
 The shipped systemd unit uses the non-login `fail2zig` user and group. It restricts filesystem
 access, syscalls and capabilities while retaining the access required to read configured logs, own SQLite state and manage the selected firewall.
@@ -97,6 +103,32 @@ The default configuration admits at most 64 enabled jails, eight file incarnatio
 4,096 live retry subjects across enabled jails. Native reservation checks cover configured memory
 and descriptor budgets. SQLite uses a separate bounded heap and page limit; required history and
 recovery anchors remain pinned.
+
+The CLI inspection path uses an optional observation cache owned by the
+coordinator and borrowed by the effect manager. Existing complete readbacks publish
+at most 256 pointer-free entries; failures retain the prior sample and update attempt
+metadata. A separate cache mutex bounds copying to one page/sample. IPC serializes
+the copied page after unlocking and performs no kernel inspection. Cursors bind a
+process and observation identity, page limit and a 60-second pagination lifetime.
+Complete readback, sample truncation, inventory membership and durable confirmation
+remain separate facts.
+
+A fixed `exact_v1` structure proof is attached only after two complete matching
+inspector passes establish the owned installation. Cache metadata carries that
+proof with the observation; failures retain it and absent observations clear it.
+The query projects only the validated scaffold (tables, chains, sets, attachment
+and base rules), plus a chain/set placement for each sampled entry. Dynamic scope
+rules retain their canonical protocol/port/network projection and are subject to
+the existing sample/page bounds. The JSON additions are nullable `structure` and
+per-item `placement`; no proof means no inferred structure. Backend-native set
+key types are `ipv4_addr`/`ipv6_addr` for nftables and `hash:ip` for ipset, whose
+family is reported separately. These are normalized observations, not general
+host ruleset enumeration or assertions about packet reachability.
+
+Cache and transient-page costs use actual Zig type sizes in resource admission.
+Optional cache admission or allocation failure makes inspection unavailable while
+preserving the baseline enforcement resource contract. It never evicts durable state
+or changes readiness. This path adds no persistence schema or telemetry history.
 
 ## Migration boundary
 

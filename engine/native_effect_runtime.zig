@@ -6,6 +6,7 @@ const durable = @import("core/record_store.zig");
 const effect = @import("core/native_effect.zig");
 const action_outcome = @import("core/native_action_outcome.zig");
 const firewall = @import("firewall/inspection.zig");
+pub const observation = @import("native_firewall_observation.zig");
 
 pub const Binding = struct { jail: []const u8, generation: [32]u8 };
 pub const EffectDiagnostic = struct {
@@ -51,6 +52,7 @@ pub const Manager = struct {
     repair_epoch: u64 = 1,
     stop_cursor: usize = 0,
     stopping: bool = false,
+    observation_cache: ?*observation.Cache = null,
 
     pub fn create(a: std.mem.Allocator, store: *durable.Store, installation: effect.Installation) !*Manager {
         try installation.validate();
@@ -72,6 +74,11 @@ pub const Manager = struct {
         self.allocator.free(self.staged);
         self.allocator.free(self.outage_attempted);
         self.allocator.destroy(self);
+    }
+    /// The caller retains ownership and must keep the cache alive until after
+    /// the worker stops using this Manager.
+    pub fn attachObservationCache(self: *Manager, cache: *observation.Cache) void {
+        self.observation_cache = cache;
     }
     pub fn storageReopened(self: *Manager) void {
         self.cached_epoch = null;
@@ -113,6 +120,7 @@ pub const Manager = struct {
             .cause = context.cause,
             .mutation = context.mutation,
         };
+        self.recordObservationFailure(context.stage, context.cause);
     }
     fn recordFirewallDirect(self: *Manager, stage: firewall.OperationStage, cause: firewall.Error) void {
         self.recordFirewallFailure(.{
@@ -121,6 +129,36 @@ pub const Manager = struct {
             .cause = cause,
             .mutation = .not_started,
         });
+    }
+    fn observationWall() ?i64 {
+        const now = std.time.microTimestamp();
+        return if (now < 0) null else now;
+    }
+    fn recordObservationFailure(self: *Manager, stage: firewall.OperationStage, cause: anyerror) void {
+        const cache = self.observation_cache orelse return;
+        cache.fail(.{
+            .monotonic_ms = observation.monotonicMs(),
+            .wall_us = observationWall(),
+            .cause = cause,
+            .stage = stage,
+        });
+    }
+    fn captureObservation(self: *Manager, snapshot: *const firewall.Snapshot, origin: observation.Origin, wall_us: ?i64, inventory: observation.Inventory) void {
+        const cache = self.observation_cache orelse return;
+        cache.capture(snapshot, .{
+            .monotonic_ms = observation.monotonicMs(),
+            .wall_us = wall_us,
+            .origin = origin,
+            .inventory = inventory,
+        });
+    }
+    fn validateAndCaptureObservation(self: *Manager, snapshot: *const firewall.Snapshot, origin: observation.Origin, wall_us: ?i64, stage: firewall.OperationStage) !void {
+        self.validateInventory(snapshot) catch |failure| {
+            self.captureObservation(snapshot, origin, wall_us, if (failure == error.UnownedInstalledEffect) .unexpected_entries else .not_checked);
+            self.recordObservationFailure(stage, failure);
+            return failure;
+        };
+        self.captureObservation(snapshot, origin, wall_us, .known_entries);
     }
     fn clock(self: *Manager) !effect.Clock {
         const now = self.wall(self.wall_context);
@@ -154,6 +192,7 @@ pub const Manager = struct {
         defer result.deinit();
         switch (result) {
             .installed => |installed| {
+                self.captureObservation(&installed.snapshot, .admission, observationWall(), .not_checked);
                 if (installed.created) std.log.info("{s}: scaffold installed and verified (selector={s})", .{ @tagName(saved.backend), saved.selector() });
                 self.admitted = true;
             },
@@ -288,10 +327,14 @@ pub const Manager = struct {
                 return propagateFirewall(bool, failure);
             };
             defer snapshot.deinit();
-            try self.validateInventory(&snapshot);
+            try self.validateAndCaptureObservation(&snapshot, .readback, sampled.prepared_us, .readback);
             const end = try self.clock();
             for (self.live[0..self.count], 0..) |entry, index| {
-                if (!try self.inspector.matchesSnapshot(&snapshot, self.token(entry, entry.desired), sampled.prepared_us, end.prepared_us)) {
+                const matches = self.inspector.matchesSnapshot(&snapshot, self.token(entry, entry.desired), sampled.prepared_us, end.prepared_us) catch |failure| {
+                    self.recordObservationFailure(.readback, failure);
+                    return propagateFirewall(bool, failure);
+                };
+                if (!matches) {
                     self.cursor = index;
                     self.status.ready = false;
                     return false;
@@ -326,7 +369,7 @@ pub const Manager = struct {
                     return error.EffectBackendUncertain;
                 },
                 .verified => |*observed| {
-                    try self.validateInventory(&observed.snapshot);
+                    try self.validateAndCaptureObservation(&observed.snapshot, .effect, observed.observed_wall_us, .effect_verify);
                     _ = try self.store.settleVerified(entry.token(), .{ .installation = entry.installation.id, .scope_key = entry.scope_key, .fingerprint = observed.snapshot.fingerprint, .observed_us = observed.observed_wall_us, .qualification = .complete_owned, .state = entry.desired }, try self.clock());
                 },
             }
@@ -337,7 +380,7 @@ pub const Manager = struct {
             return propagateFirewall(bool, failure);
         };
         defer observed.deinit();
-        try self.validateInventory(&observed.snapshot);
+        try self.validateAndCaptureObservation(&observed.snapshot, .effect, observed.observed_wall_us, .effect_verify);
         if (entry.status == .dispatched or !observed.matches_desired) {
             self.status.ready = false;
             _ = try self.store.settleVerified(entry.token(), .{ .installation = entry.installation.id, .scope_key = entry.scope_key, .fingerprint = observed.snapshot.fingerprint, .observed_us = observed.observed_wall_us, .qualification = .complete_owned, .state = if (observed.matches_desired) entry.desired else null }, try self.clock());
@@ -385,7 +428,7 @@ pub const Manager = struct {
                     self.recordFirewallFailure(failure);
                     return error.EffectBackendUncertain;
                 },
-                .verified => |*observed| try self.validateInventory(&observed.snapshot),
+                .verified => |*observed| try self.validateAndCaptureObservation(&observed.snapshot, .stop, observed.observed_wall_us, .effect_verify),
             }
             self.stop_cursor += 1;
             return false;
@@ -395,8 +438,11 @@ pub const Manager = struct {
             return propagateFirewall(bool, failure);
         };
         defer final.deinit();
-        try self.validateInventory(&final);
-        if (final.entries.len != 0) return error.UnownedInstalledEffect;
+        try self.validateAndCaptureObservation(&final, .stop, sampled.prepared_us, .readback);
+        if (final.entries.len != 0) {
+            self.recordObservationFailure(.readback, error.UnownedInstalledEffect);
+            return error.UnownedInstalledEffect;
+        }
         self.stopping = false;
         self.stop_cursor = 0;
         self.admitted = false;
@@ -426,7 +472,10 @@ pub const Manager = struct {
                 return propagateFirewall(void, failure);
             };
             defer result.deinit();
-            if (result == .uncertain) self.recordFirewallFailure(result.uncertain);
+            switch (result) {
+                .uncertain => |failure| self.recordFirewallFailure(failure),
+                .verified => |*observed| self.captureObservation(&observed.snapshot, .outage, observed.observed_wall_us, .not_checked),
+            }
             return;
         }
     }
@@ -444,4 +493,35 @@ pub fn address(scope: effect.Scope) shared.IpAddress {
         .v4 => .{ .ipv4 = std.mem.readInt(u32, scope.canonical.subject.address[0..4], .big) },
         .v6 => .{ .ipv6 = std.mem.readInt(u128, &scope.canonical.subject.address, .big) },
     };
+}
+
+test "native effect runtime: absent inventory is distinct from unexpected owned entries" {
+    const t = std.testing;
+    const installation = firewall.Installation{ .id = [_]u8{0x71} ** 16, .transport = .nftables };
+    var cache = observation.Cache.init(installation, [_]u8{0x72} ** 16);
+    var manager: Manager = undefined;
+    manager.observation_cache = &cache;
+    manager.count = 0;
+    manager.live = &.{};
+    var snapshot = firewall.Snapshot{
+        .allocator = t.allocator,
+        .installation = installation,
+        .state = .absent,
+        .entries = &.{},
+        .fingerprint = [_]u8{0} ** 32,
+        .observed_start_ns = 0,
+        .observed_end_ns = 0,
+    };
+    try t.expectError(error.InstallationMismatch, manager.validateAndCaptureObservation(&snapshot, .readback, null, .readback));
+    var page: observation.Page = undefined;
+    try cache.readPage(.{}, &page);
+    try t.expectEqual(.absent, page.metadata.state);
+    try t.expectEqual(.not_checked, page.metadata.inventory);
+    var entries = [_]firewall.Entry{.{ .address = .{ .ipv4 = 0xc0000201 } }};
+    snapshot.state = .owned;
+    snapshot.entries = &entries;
+    try t.expectError(error.UnownedInstalledEffect, manager.validateAndCaptureObservation(&snapshot, .readback, null, .readback));
+    try cache.readPage(.{}, &page);
+    try t.expectEqual(.unexpected_entries, page.metadata.inventory);
+    try t.expectEqual(@as(usize, 1), page.count);
 }

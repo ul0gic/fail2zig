@@ -6,6 +6,7 @@ const budget = @import("native_resource_budget.zig");
 const files = @import("core/native_file_session.zig");
 const durable = @import("core/record_store.zig");
 const runtime = @import("native_consumer_runtime.zig");
+const firewall_observation = @import("native_firewall_observation.zig");
 const fd = budget.FdContext{ .soft_limit = 65536, .already_open = 3, .headroom = 32 };
 fn samplePlan() !budget.Plan {
     var plan = budget.Plan{};
@@ -37,6 +38,30 @@ test "native resource budget: source consumer and SQL work coexist while same-la
     try plan.include(.{ .workspace = .{ .bytes = 500 }, .workspace_kind = .storage });
     const result = try plan.finish(.{}, fd);
     try t.expectEqual(initial + 900, result.cost.bytes);
+}
+test "native resource budget: firewall observation accounts retained and transient objects with allocator overhead" {
+    const cost = try budget.firewallObservationCost(firewall_observation.Cache, firewall_observation.Page);
+    try t.expectEqual(@sizeOf(firewall_observation.Cache) + @sizeOf(firewall_observation.Page), cost.bytes);
+    try t.expectEqual(@as(usize, 2), cost.allocations);
+    try t.expectEqual(cost.bytes + cost.bytes / 4 + 2 * budget.allocation_allowance, try cost.chargedBytes());
+    try t.expectError(error.InvalidResourceLimit, budget.firewallObservationCost(struct { bytes: [50 * 1024 + 1]u8 }, firewall_observation.Page));
+    try t.expectError(error.InvalidResourceLimit, budget.firewallObservationCost(firewall_observation.Cache, struct { bytes: [50 * 1024 + 1]u8 }));
+    std.debug.print("firewall observation cache={d}, page={d}, admitted={d}, charged={d}\n", .{ @sizeOf(firewall_observation.Cache), @sizeOf(firewall_observation.Page), cost.bytes, try cost.chargedBytes() });
+}
+test "native resource budget: optional observation refusal preserves the admitted baseline" {
+    var plan = budget.Plan{};
+    try plan.includeDetached(.{ .bytes = 4096, .allocations = 1 });
+    const baseline = try plan.finish(.{}, fd);
+    const optional = try budget.firewallObservationCost(firewall_observation.Cache, firewall_observation.Page);
+    const exact = try budget.finishWithOptional(plan, optional, .{}, fd);
+    try t.expect(exact.admitted);
+    try t.expectEqual(try (try baseline.cost.plus(optional)).chargedBytes(), exact.requirements.zig_bytes);
+
+    const refused = try budget.finishWithOptional(plan, optional, .{ .zig_bytes = baseline.zig_bytes, .descriptors = 2048 }, fd);
+    try t.expect(!refused.admitted);
+    try t.expectEqualDeep(baseline, refused.requirements);
+
+    try t.expectError(error.NativeMemoryAdmission, budget.finishWithOptional(plan, optional, .{ .zig_bytes = baseline.zig_bytes - 1, .descriptors = 2048 }, fd));
 }
 test "native resource budget: overflow and malformed configured capacities refuse without changing plan" {
     var plan = budget.Plan{};
@@ -246,4 +271,96 @@ test "native resource budget: maximum journal argv arena coexists with child spa
         try t.expect(component.workspace.bytes >= observed.peak + child.bytes);
     }
     try t.expectEqual(@as(usize, 0), observed.current);
+}
+
+// Refuse allocator growth in place so arena/ArrayList replacement buffers are
+// charged simultaneously; a roomy backing allocator must not hide their peak.
+const QueryPeakAllocator = struct {
+    live: usize = 0,
+    peak: usize = 0,
+
+    fn allocator(self: *QueryPeakAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+        const self: *QueryPeakAllocator = @ptrCast(@alignCast(context));
+        const memory = t.allocator.rawAlloc(len, alignment, return_address) orelse return null;
+        self.live += len;
+        self.peak = @max(self.peak, self.live);
+        return memory;
+    }
+    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+    fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+        const self: *QueryPeakAllocator = @ptrCast(@alignCast(context));
+        self.live -= memory.len;
+        t.allocator.rawFree(memory, alignment, return_address);
+    }
+};
+
+test "native resource budget: exact aggregate scope projection and real query fit control scratch without in-place growth" {
+    const query = @import("net/query_v1.zig");
+    const effect = @import("core/native_effect.zig");
+    const scope = @import("firewall/scope.zig");
+    const shared = @import("shared");
+    const jail_count = 64;
+    // Conservative aggregate bound: all owner slots plus all detection slots,
+    // even though mixed jail configurations cannot fill both simultaneously.
+    const row_count = effect.max_owners + 4096;
+    var measured = QueryPeakAllocator{};
+    {
+        const a = measured.allocator();
+        var metadata = std.heap.ArenaAllocator.init(a);
+        defer metadata.deinit();
+        const arena = metadata.allocator();
+        var body: [shared.protocol.max_request_body]u8 = undefined;
+        @memset(&body, ' ');
+        const request = "{\"schema_version\":1,\"kind\":\"scopes\",\"limit\":256}";
+        @memcpy(body[0..request.len], request);
+        try t.expectEqual(query.Kind.scopes, query.requestedKind(arena, &body).?);
+        _ = try arena.alloc(query.JailConfig, jail_count);
+        const jails = try arena.alloc(query.JailScopes, jail_count);
+        // Match queryResponse's single exact owner, separate from its arena.
+        const rows = try a.alloc(query.ScopeItem, row_count);
+        defer a.free(rows);
+        var ports: [scope.max_port_ranges]scope.PortRange = undefined;
+        for (&ports, 0..) |*port, index| port.* = scope.PortRange.one(@intCast(65000 + index * 2));
+        const projected = try query.projectScope(.{
+            .subject = try scope.Subject.parseHost("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+            .protocols = try scope.Protocols.list(&.{ .tcp, .udp }),
+            .ports = try scope.Ports.list(&ports),
+        });
+        for (rows) |*row| row.* = .{
+            .scope = projected,
+            .lease = .finite,
+            .deadline_us = std.math.maxInt(i64),
+            .decision_id = [_]u8{0xff} ** 32,
+            .confirmed = true,
+        };
+        // Maximum escaped name width is conservative for the JSON producer.
+        const name = [_]u8{1} ** query.max_jail_bytes;
+        for (jails, 0..) |*jail, index| {
+            const start = index * row_count / jail_count;
+            const end = (index + 1) * row_count / jail_count;
+            jail.* = .{ .name = &name, .items = rows[start..end] };
+        }
+        const projection_bytes = measured.live;
+        const result = try query.handle(a, &body, .monitor, [_]u8{0xff} ** 32, .{ .scopes = .{ .jails = jails } });
+        defer result.deinit(a);
+        try t.expect(result == .payload);
+        // Reserve three full response ceilings beyond the measured projection:
+        // more than ArrayList's <1.5x growth plus toOwnedSlice's 1x overlap,
+        // with the remainder covering the small valid request parser workspace.
+        try t.expect(projection_bytes + 3 * query.max_response_bytes <= 8 * budget.mib);
+        try t.expect(measured.peak <= 8 * budget.mib);
+        const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, result.payload, .{});
+        defer parsed.deinit();
+        try t.expectEqual(@as(usize, 256), parsed.value.object.get("items").?.array.items.len);
+        std.debug.print("exact scope projection rows={d} bytes={d}, query peak={d}, response={d}, control scratch={d}\n", .{ row_count, projection_bytes, measured.peak, result.payload.len, 8 * budget.mib });
+    }
+    try t.expectEqual(@as(usize, 0), measured.live);
 }

@@ -45,7 +45,7 @@ const FrozenFile = struct {
 const frozen_files = [_]FrozenFile{
     .{ .path = "engine/compat/date_profile.json", .size = 4_806, .sha256 = "86009fdec328dd34bc5719fee315ea4416b8da2e22351ae66508591f37b015e3" },
     .{ .path = "engine/compat/COPYING.date-profile", .size = 19_789, .sha256 = "744bead43dfe32473d05f404b42d0fddd64e183612e4fe70037781983f8d2943" },
-    .{ .path = "vendor/sqlite/README.md", .size = 1_917, .sha256 = "a375aafc2c422ac2a97f83a8ce33cc4e68d60b5e0f58960c97d9e0bc720e98d9" },
+    .{ .path = "vendor/sqlite/README.md", .size = 1_914, .sha256 = "4fc5d7ce88b0cbcc7dba5d18768f5b01a0980c5a1b67739cdfd54b8f1aee97da" },
     .{ .path = "vendor/sqlite/sqlite3.c", .size = 9_515_341, .sha256 = "b1dd5d74ec7f29055a6684fa06fb3c2f6821c87dd38f9a458dfd2e8a1db28189" },
     .{ .path = "vendor/sqlite/sqlite3.h", .size = 690_838, .sha256 = "919e7f2e8ed1d8f56ac17b412b8971c76aa5d1a879752cc6058f75e7d5910e1d" },
 };
@@ -646,7 +646,7 @@ test "standalone surface: five release artifacts have exact static ELF identitie
         .{ .name = "mipsel-linux-musleabi", .class = 1, .endian = .little, .machine = 8 },
     };
     for (targets) |target| {
-        const name = try std.fmt.allocPrint(testing.allocator, "{s}/fail2zig-v0.4.1-{s}", .{ release_dir, target.name });
+        const name = try std.fmt.allocPrint(testing.allocator, "{s}/fail2zig-v0.4.2-{s}", .{ release_dir, target.name });
         defer testing.allocator.free(name);
         const bytes = try std.fs.cwd().readFileAlloc(testing.allocator, name, max_elf_bytes);
         defer testing.allocator.free(bytes);

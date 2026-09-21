@@ -9,8 +9,8 @@ updates:
       timezone: "America/Chicago"
     open-pull-requests-limit: 3
     labels:
-      - "dependencies"
-      - "ci"
+      - "type:debt"
+      - "area:ci"
     commit-message:
       prefix: "chore(ci)"
       include: "scope"

@@ -48,7 +48,7 @@ body:
     attributes:
       label: fail2zig version
       description: Paste `fail2zig --version`. If you built it yourself, include the commit. Mention if the service runs a different binary from the one in your shell.
-      placeholder: "fail2zig 0.4.0, downloaded release binary"
+      placeholder: "fail2zig 0.4.2, downloaded release binary"
     validations:
       required: true
 

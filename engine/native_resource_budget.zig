@@ -24,6 +24,7 @@ pub const sqlite_advisory_cache_bytes = 2 * mib;
 pub const wal_trigger_bytes = 16 * mib;
 pub const allocation_allowance = 64;
 pub const max_reservations = 512;
+pub const firewall_observation_object_bytes = 50 * 1024;
 pub const Error = error{ ResourceOverflow, InvalidResourceLimit, NativeMemoryAdmission, NativeFdAdmission, ResourceReservationLimit, StaleReservation, EnvironmentLimit };
 fn add(a: usize, b: usize) Error!usize {
     return std.math.add(usize, a, b) catch error.ResourceOverflow;
@@ -153,6 +154,31 @@ pub const Plan = struct {
     }
 };
 pub const Requirements = struct { cost: Cost, zig_bytes: usize, allocator_allowance_bytes: usize, descriptor_capacity: usize, sqlite_bytes: usize, helper_os_allowance_bytes: usize };
+
+pub const OptionalRequirements = struct {
+    requirements: Requirements,
+    admitted: bool,
+};
+
+pub fn firewallObservationCost(comptime Cache: type, comptime Page: type) Error!Cost {
+    if (@sizeOf(Cache) > firewall_observation_object_bytes or @sizeOf(Page) > firewall_observation_object_bytes)
+        return error.InvalidResourceLimit;
+    return .{ .bytes = try add(@sizeOf(Cache), @sizeOf(Page)), .allocations = 2 };
+}
+
+pub fn finishWithOptional(base: Plan, optional: Cost, limits: Limits, fd: FdContext) Error!OptionalRequirements {
+    const baseline = try base.finish(limits, fd);
+    var expanded = base;
+    expanded.includeDetached(optional) catch |err| return switch (err) {
+        error.ResourceOverflow => .{ .requirements = baseline, .admitted = false },
+        else => err,
+    };
+    const admitted = expanded.finish(limits, fd) catch |err| return switch (err) {
+        error.NativeMemoryAdmission, error.NativeFdAdmission, error.ResourceOverflow => .{ .requirements = baseline, .admitted = false },
+        else => err,
+    };
+    return .{ .requirements = admitted, .admitted = true };
+}
 
 pub const FileOptions = struct { source_capacity: usize, spec_count: usize, max_record_bytes: usize, max_decoded_bytes: usize };
 pub fn fileCost(options: FileOptions) !Component {

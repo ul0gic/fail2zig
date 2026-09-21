@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const linux = std.os.linux;
 const posix = std.posix;
 
 const testing = std.testing;
@@ -29,40 +30,199 @@ const Run = struct {
     }
 };
 
-fn watchdog(pid: posix.pid_t, done: *std.atomic.Value(bool)) void {
+fn watchdog(pid: posix.pid_t, done: *std.atomic.Value(bool), timeout_ms: u64) void {
     var waited: u64 = 0;
-    while (waited < watchdog_timeout_ms) : (waited += 50) {
+    while (waited < timeout_ms) : (waited += 10) {
         if (done.load(.acquire)) return;
-        std.time.sleep(50 * std.time.ns_per_ms);
+        std.time.sleep(10 * std.time.ns_per_ms);
     }
     posix.kill(pid, posix.SIG.KILL) catch {};
 }
 
-fn runDaemon(a: std.mem.Allocator, argv: []const []const u8) !Run {
+const RunFault = enum {
+    none,
+    watchdog_start,
+    output_collection,
+    output_eof,
+};
+
+fn terminateAndReap(child: *std.process.Child) void {
+    posix.kill(child.id, posix.SIG.KILL) catch {};
+    _ = child.wait() catch {
+        // Zig 0.14.1 caches a post-fork exec error in child.term without
+        // calling waitpid. Reap that known child and close its pipe handles.
+        _ = posix.waitpid(child.id, 0);
+        child.id = undefined;
+        if (child.stdout) |*file| file.close();
+        if (child.stderr) |*file| file.close();
+        child.stdout = null;
+        child.stderr = null;
+    };
+}
+
+fn startWatchdog(pid: posix.pid_t, done: *std.atomic.Value(bool), timeout_ms: u64, fault: RunFault) !std.Thread {
+    if (fault == .watchdog_start) return error.InjectedWatchdogStartFailure;
+    return std.Thread.spawn(.{}, watchdog, .{ pid, done, timeout_ms });
+}
+
+fn waitForExitWithoutReaping(pid: posix.pid_t) !void {
+    var info: linux.siginfo_t = undefined;
+    while (true) switch (posix.errno(linux.waitid(.PID, pid, &info, linux.W.EXITED | linux.W.NOWAIT))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        else => |err| return posix.unexpectedErrno(err),
+    };
+}
+
+fn collectChildOutput(
+    child: *std.process.Child,
+    a: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    err_out: *std.ArrayListUnmanaged(u8),
+    fault: RunFault,
+) !void {
+    if (fault == .output_collection) return error.InjectedOutputCollectionFailure;
+    if (fault == .output_eof) {
+        child.stdout.?.close();
+        child.stderr.?.close();
+        child.stdout = null;
+        child.stderr = null;
+        return;
+    }
+    return child.collectOutput(a, out, err_out, max_output_bytes);
+}
+
+fn runDaemonWithFault(
+    a: std.mem.Allocator,
+    argv: []const []const u8,
+    fault: RunFault,
+    timeout_ms: u64,
+    spawned_pid: ?*posix.pid_t,
+) !Run {
     var child = std.process.Child.init(argv, a);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
     try child.spawn();
+    var child_needs_reap = true;
+    errdefer if (child_needs_reap) terminateAndReap(&child);
+    if (spawned_pid) |pid| pid.* = child.id;
 
     var done = std.atomic.Value(bool).init(false);
-    const guard = try std.Thread.spawn(.{}, watchdog, .{ child.id, &done });
+    const guard = try startWatchdog(child.id, &done, timeout_ms, fault);
+    var guard_running = true;
+    defer if (guard_running) {
+        done.store(true, .release);
+        guard.join();
+    };
 
     var out: std.ArrayListUnmanaged(u8) = .{};
     errdefer out.deinit(a);
     var err_out: std.ArrayListUnmanaged(u8) = .{};
     errdefer err_out.deinit(a);
-    try child.collectOutput(a, &out, &err_out, max_output_bytes);
-    const term = try child.wait();
+    try collectChildOutput(&child, a, &out, &err_out, fault);
 
+    // Observe exit without reaping. The watchdog remains active through this
+    // wait, while WNOWAIT reserves the PID until the guard has joined.
+    try waitForExitWithoutReaping(child.id);
     done.store(true, .release);
     guard.join();
+    guard_running = false;
+    const term = try child.wait();
+    child_needs_reap = false;
+
+    const stdout = try out.toOwnedSlice(a);
+    errdefer a.free(stdout);
+    const stderr = try err_out.toOwnedSlice(a);
 
     return .{
         .term = term,
-        .stdout = try out.toOwnedSlice(a),
-        .stderr = try err_out.toOwnedSlice(a),
+        .stdout = stdout,
+        .stderr = stderr,
     };
+}
+
+fn runDaemon(a: std.mem.Allocator, argv: []const []const u8) !Run {
+    return runDaemonWithFault(a, argv, .none, watchdog_timeout_ms, null);
+}
+
+fn expectReaped(pid: posix.pid_t) !void {
+    try testing.expectError(error.ProcessNotFound, posix.kill(pid, 0));
+}
+
+fn expectFaultCleansUp(fault: RunFault, expected: anyerror) !void {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const sleep_path = "/usr/bin/sleep";
+    std.fs.accessAbsolute(sleep_path, .{}) catch return error.SkipZigTest;
+
+    var pid: posix.pid_t = undefined;
+    var timer = try std.time.Timer.start();
+    const result = runDaemonWithFault(
+        testing.allocator,
+        &.{ sleep_path, "30" },
+        fault,
+        watchdog_timeout_ms,
+        &pid,
+    );
+    if (result) |run_value| {
+        var run = run_value;
+        run.deinit(testing.allocator);
+        return error.ExpectedInjectedHarnessFailure;
+    } else |err| try testing.expectEqual(expected, err);
+
+    try testing.expect(timer.read() < 2 * std.time.ns_per_s);
+    try expectReaped(pid);
+}
+
+test "startup harness reaps child on watchdog-start and output-collection failures" {
+    try expectFaultCleansUp(.watchdog_start, error.InjectedWatchdogStartFailure);
+    try expectFaultCleansUp(.output_collection, error.InjectedOutputCollectionFailure);
+}
+
+test "startup harness deadline covers EOF before child exit" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const sleep_path = "/usr/bin/sleep";
+    std.fs.accessAbsolute(sleep_path, .{}) catch return error.SkipZigTest;
+
+    var pid: posix.pid_t = undefined;
+    var timer = try std.time.Timer.start();
+    var run = try runDaemonWithFault(
+        testing.allocator,
+        &.{ sleep_path, "30" },
+        .output_eof,
+        200,
+        &pid,
+    );
+    defer run.deinit(testing.allocator);
+
+    try testing.expectEqual(std.process.Child.Term{ .Signal = posix.SIG.KILL }, run.term);
+    try testing.expect(timer.read() < 2 * std.time.ns_per_s);
+    try expectReaped(pid);
+}
+
+test "startup harness reaps a post-spawn exec failure" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &path_buf);
+    const missing = try std.fmt.allocPrint(testing.allocator, "{s}/missing-executable", .{root});
+    defer testing.allocator.free(missing);
+
+    var pid: posix.pid_t = undefined;
+    const result = runDaemonWithFault(
+        testing.allocator,
+        &.{missing},
+        .none,
+        1_000,
+        &pid,
+    );
+    if (result) |run_value| {
+        var run = run_value;
+        run.deinit(testing.allocator);
+        return error.ExpectedExecFailure;
+    } else |err| try testing.expectEqual(error.FileNotFound, err);
+    try expectReaped(pid);
 }
 
 fn hasErrorReturnTrace(text: []const u8) bool {

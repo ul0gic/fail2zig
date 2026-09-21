@@ -566,6 +566,32 @@ test "native maintenance: production mark delete retains guard and current ancho
     try t.expectEqual(@as(u64, 3), (try f.store.recordSequence(next.jail, next.source, next.occurrence)).?.sequence);
 }
 
+test "native maintenance: unenforceable detection does not pin cleanup rejection boundary" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try setupCleanup(&f);
+    var now = CleanupClock{};
+    const detection = @import("core/native_detection_record.zig");
+    var older = recordFor(identity, 0);
+    older.native_time_outcome = .{ .eligible = .{ .timestamp = .{ .us = 100 }, .receipt = .{ .us = 100 }, .origin = .event, .original = .{ .us = 100 } } };
+    older.disposition = older.native_time_outcome.?.disposition();
+    older.native_detection = .{ .kind = .unenforceable, .generation = generation, .filter = try detection.Name.init("fixture"), .pattern = try detection.Name.init("failure"), .pattern_index = 0, .subject = .{ .v4 = .{ 127, 0, 0, 1 } } };
+    _ = try f.store.beginReceipt(identity, .{ .us = 100 }, 0);
+    try t.expectEqual(durable.CommitResult.committed, try f.store.commitRecord(older));
+    var anchor = identity;
+    anchor.occurrence = "current-anchor";
+    anchor.cursor = "current-anchor";
+    try commitObserved(&f.store, anchor, 1);
+
+    const stored = (try f.store.nativeDetection(identity.jail, identity.source, identity.occurrence)).?;
+    try t.expectEqual(detection.Kind.unenforceable, stored.kind);
+    try t.expectEqualDeep(detection.Subject{ .v4 = .{ 127, 0, 0, 1 } }, stored.subject.?);
+    const initial = (try f.store.sourceMaintenance(identity.jail, identity.source, generation)).?;
+    const token = (try f.store.cleanupAdvance(try cleanupFence(&f.store, identity, &now), initial, 2)).?;
+    try t.expectEqual(@as(u64, 2), token.state.reject_below_sequence);
+    try t.expectEqualDeep(stored, (try f.store.nativeDetection(identity.jail, identity.source, identity.occurrence)).?);
+}
+
 test "native maintenance: physical delete budget includes children and resumes whole groups" {
     var f = try Fixture.init();
     defer f.deinit();

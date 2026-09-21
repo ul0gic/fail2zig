@@ -1,4 +1,4 @@
-.TH FAIL2ZIG 1 "2026-09-17" "fail2zig 0.4.1" "User Commands"
+.TH FAIL2ZIG 1 "2026-09-21" "fail2zig 0.4.2" "User Commands"
 .
 .SH NAME
 fail2zig \- intrusion prevention daemon and its administration commands
@@ -133,15 +133,44 @@ Diagnostic rows show known storage, source and firewall causes. A missing cause 
 reported as unknown; it does not establish healthy protection. The recovery retry
 deadline is in absolute monotonic milliseconds, not a remaining delay.
 Plain output adds named diagnostic keys; JSON fields are additive and optional.
+Table output uses a compact protection summary. Add
+.B --details
+to include identifiers and additional counters; failures remain visible without it.
 .TP
 .B jails
 One row per configured jail: enabled, paused, health, active bans, thresholds,
 effective action, whether it enforces, and its source. Table output includes the
 source failure cause and captured journalctl exit/signal metadata. Raw child stderr
 is not displayed. Plain output retains its 11-column layout.
+Table output shows state, source health, enforcement and bans; add
+.B --details
+for thresholds and effective action.
 .TP
-.BI list " [--jail name]"
-Active bans, optionally for one jail.
+.BI list " [--jail name] [--details]"
+Active bans, optionally for one jail. Table output distinguishes
+confirmed and pending intent, permanent leases and unknown expiry; narrow terminals
+use stacked rows. Existing plain columns and JSON fields retain their meaning.
+The --details flag adds ban counts to the table view.
+.TP
+.BI "firewall show" " [--limit 1..256] [--cursor token] [--details]"
+Read the last sampled fail2zig-owned
+kernel protection in the daemon's network namespace. Native nftables inspection
+does not require the nft executable. The query performs no firewall refresh or mutation.
+Observation age and the latest attempt distinguish retained data from a failed
+readback. Unavailable, absent and owned-but-empty are separate states; a successful
+query exit does not prove installed protection or packet reachability.
+With --details, show the tables, chains, sets and attachment rules verified in
+the retained observation, plus the location of each sampled entry. This normalized
+owned view is not a raw ruleset dump. Structures retained after a failed check are
+stale observations, not current-state claims. Structural metadata from older
+daemons may be unavailable. JSON adds nullable structure and per-item placement;
+--details does not change plain or JSON output for any command.
+At most 256 entries are sampled from a complete readback. The default page size is
+64. JSON reports observed_total, sample_count and sample_truncated separately from
+observation_complete. next_cursor pages only the retained sample; use the same limit.
+A replaced observation, daemon restart or 60-second cursor lifetime requires
+restarting pagination without a cursor. No jail filter or forced refresh is provided.
+Timeouts are sampled values; unexpected entries do not imply desired or confirmed bans.
 .TP
 .BI ban " ip --jail name [--duration seconds] [--scope host|net cidr]"
 Manual ban. Exactly one
@@ -184,6 +213,9 @@ redacted unless the caller is an administrator.
 .B version
 Daemon version over the socket (unlike
 .BR \-\-version ).
+Table output combines matching client and daemon versions on one
+line and labels each separately when they differ. Plain and JSON output retain
+separate client and daemon fields.
 .TP
 .BI completions " bash|zsh|fish"
 Shell completion script on stdout.

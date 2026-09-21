@@ -20,13 +20,14 @@ The supported migration workflow inspects fail2ban inputs, captures a read-only 
 plans and validates the native projection, and performs journaled cutover/rollback. Unsupported
 configuration is reported for operator action; exact fail2ban compatibility is not promised.
 
-Version 0.4.1 provides
-daemon and administration functions into one static executable per architecture and requires no Python or
+Version 0.4.2 combines the
+daemon and administration functions in one static executable per architecture and requires no Python or
 shared SQLite library at runtime. Its [runtime architecture](docs/architecture.md) uses
 statically embedded SQLite for source receipts, consumer state, protection ownership and
 confirmed history. Host requirements remain explicit: journal input uses journald and
 `journalctl`; the iptables and ipset backends invoke those tools with fixed arguments; nftables
-talks directly to the kernel. The 0.4.0 release received selected live qualification on
+talks directly to the kernel. Version 0.4.2 adds bounded inspection of fail2zig-owned
+firewall observations through the CLI. The 0.4.0 release received selected live qualification on
 Debian 13 x86_64. The 0.4.1 SSH-default repair additionally passed isolated log-only origin
 and restart checks on Debian 13 and Ubuntu 24.04; this does not establish Ubuntu firewall
 qualification or full platform support.
@@ -77,7 +78,7 @@ The installer pulls from the
 [latest GitHub Release](https://github.com/ul0gic/fail2zig/releases/latest)
 and verifies every asset against the published `SHA256SUMS` before placing
 anything on disk. Pin a specific version with
-`FAIL2ZIG_VERSION=v0.4.1` or inspect the script first with
+`FAIL2ZIG_VERSION=v0.4.2` or inspect the script first with
 `curl -fsSL … | less`.
 
 ---
@@ -168,11 +169,11 @@ configuration, and installs the hardened `fail2zig.service` unit under
 `/etc/systemd/system/`. It does **not** auto-start the daemon — audit the config,
 then run `systemctl enable --now fail2zig` when ready.
 
-**0.4.1 release targets** (one combined daemon/admin executable each):
+**0.4.2 release targets** (one combined daemon/admin executable each):
 
 | Target | Hardware | Validation |
 |--------|----------|------------|
-| `x86_64-linux-musl` | x86_64 servers and VPSes | Prior 0.4.0 Debian baseline; 0.4.1 Debian/Ubuntu SSH log-only and restart checks |
+| `x86_64-linux-musl` | x86_64 servers and VPSes | Prior 0.4.0 Debian baseline; 0.4.1 Debian/Ubuntu SSH checks; 0.4.2 isolated nftables/iptables observation checks |
 | `aarch64-linux-musl` | ARM64 | Cross-build, static inspection and QEMU smoke |
 | `arm-linux-musleabihf` | ARMv7, hard float | Cross-build, static inspection and QEMU smoke |
 | `mips-linux-musleabi` | MIPS32r2, big endian, soft float | Cross-build, static inspection and QEMU smoke |
@@ -185,11 +186,11 @@ Legacy firewall modes and journal ingestion require their documented host tools.
 The release allowlist is exactly:
 
 ```text
-fail2zig-v0.4.1-x86_64-linux-musl
-fail2zig-v0.4.1-aarch64-linux-musl
-fail2zig-v0.4.1-arm-linux-musleabihf
-fail2zig-v0.4.1-mips-linux-musleabi
-fail2zig-v0.4.1-mipsel-linux-musleabi
+fail2zig-v0.4.2-x86_64-linux-musl
+fail2zig-v0.4.2-aarch64-linux-musl
+fail2zig-v0.4.2-arm-linux-musleabihf
+fail2zig-v0.4.2-mips-linux-musleabi
+fail2zig-v0.4.2-mipsel-linux-musleabi
 fail2zig.service
 fail2zig.toml.example
 install.sh
@@ -221,7 +222,7 @@ If you'd rather skip the script:
 ```bash
 # 1. Download the allowlisted release files
 set -euo pipefail
-VERSION=v0.4.1
+VERSION=v0.4.2
 ARCH=x86_64-linux-musl
 BASE="https://github.com/ul0gic/fail2zig/releases/download/${VERSION}"
 for file in \
@@ -464,13 +465,14 @@ bracket a live reload (`ExecReload` sends `SIGHUP`); `STOPPING=1` precedes exit;
 
 | Command | Description |
 |---------|-------------|
-| `status` | Protection state (`active` / `log-only` / `mixed` / `DEGRADED (<cause>)`), backend, storage phase, generation, active and total bans |
-| `jails` | Configured jails: enabled, paused, health, thresholds, action, source |
-| `list [--jail <name>]` | Active bans |
+| `status [--details]` | Protection state (`active` / `log-only` / `mixed` / `DEGRADED (<cause>)`), backend, storage phase, generation, active and total bans |
+| `jails [--details]` | Configured jails: enabled, paused, health, thresholds, action, source |
+| `list [--jail <name>] [--details]` | Active bans |
 | `ban <ip> --jail <name> [--duration <s>] [--scope host\|net <cidr>]` | Manual ban (exactly one jail; `net` needs nftables or ipset) |
 | `unban <ip> --jail <name> [--scope host\|net <cidr>]` | Release a ban |
 | `reload` | Propose the configuration file as a new generation: `noop`, `applied`, `rejected` or `restart_required` |
 | `history [--jail <name>] [--limit <n>] [--cursor <token>]` | Page through confirmed ban history |
+| `firewall show [--limit <n>] [--cursor <token>] [--details]` | Inspect the last sampled fail2zig-owned kernel protection |
 | `history reset <ip> (--jail <name> \| --all)` | Reset an address's durable history |
 | `jail enable\|disable\|pause\|resume <name>` | Administer one jail |
 | `config` | Effective configuration and generation (redacted for non-administrators) |
@@ -484,6 +486,54 @@ through the 0660 socket; mutations require uid 0 or the daemon uid.
 
 Exit classes (every command): `0` success · `1` rejected or absent · `2` usage ·
 `3` daemon unavailable · `4` partial (kernel confirmation incomplete) · `5` uncertain.
+
+Version 0.4.2 adds `firewall show`:
+
+```bash
+sudo fail2zig firewall show
+sudo fail2zig firewall show --details
+sudo fail2zig --output json firewall show --limit 64
+```
+
+This read-only command reports the last complete readback returned to the daemon's
+effect manager, in the daemon's network namespace. Native nftables inspection does
+not require the `nft` executable. Queries read a bounded cache; they do not refresh
+the firewall or change rules. `list` describes ban intent and confirmation, while
+`firewall show` describes a sampled kernel observation. Neither establishes packet
+reachability through the complete host/network ruleset.
+
+Check observation age and the latest attempt together: a failed readback retains the
+previous observation. Unavailable data, an absent installation, and an owned
+installation containing zero entries are distinct results. Successful command exit
+means the query was answered, including when observation data is unavailable.
+Unexpected owned entries are reported without adopting or repairing them.
+
+The 0.4.2 tables also expose jail pause state and ban confirmation, preserve
+unknown values, and use stacked rows on narrow terminals. Existing plain and JSON
+formats remain suitable for scripts. Scope details preserve protocol sets and port
+ranges, including UDP and network subjects.
+
+Use `--details` with `status`, `jails`, `list` or `firewall show` to expand the
+table view. Summaries keep failures and unknown states visible; details include
+identifiers, thresholds and additional counters. The flag does not change plain
+or JSON output.
+
+`firewall show --details` adds the owned tables, chains, sets and attachment rules
+verified in that observation, and identifies the chain or set holding each sampled
+entry. It shows normalized structures, not a raw ruleset dump. Only the fixed
+scaffold is complete: dynamic rules and set elements follow the retained sample
+and page limits below. After a failed check these structures describe the retained
+observation, not current kernel state. Older daemons without structural metadata
+show it as unavailable. JSON adds nullable `structure` and per-item `placement`
+fields; existing fields and plain columns retain their meaning.
+
+At most 256 entries are retained from a complete readback. JSON distinguishes
+`observation_complete` from `sample_truncated`, and reports both `observed_total`
+and `sample_count`. Pages default to 64 entries (maximum 256); `next_cursor` pages
+only that sample. Reuse the same limit with a cursor. Observation replacement,
+daemon restart or the 60-second pagination lifetime invalidates it; start again
+without a cursor. No jail filter is offered because kernel effects may have several
+owners. Kernel timeouts are values at observation time, not live countdowns.
 
 Version 0.4.1 adds diagnostic detail to `status` and `jails` (these additions
 are not in v0.4.0). If protection is degraded, check the storage, source and firewall
@@ -641,8 +691,8 @@ It contains synthetic cases, not a production-log compatibility certification.
 
 Firewall effects are bound to the daemon's current network namespace. The built-in selector uses
 that namespace directly; the daemon does not enter a different namespace. Custom namespace
-selectors or service overrides that move the daemon between network namespaces are not supported
-in 0.4.0.
+selectors and service overrides that move the daemon between network namespaces remain
+unsupported.
 
 ---
 
@@ -841,21 +891,19 @@ few days; larger ones longer. Security advisories are acknowledged within
 
 ## License
 
-fail2zig is licensed under the **GNU Affero General Public License v3.0 or
-later** (AGPL-3.0-or-later). See [LICENSE](LICENSE) for the full text.
+**Free to use. Open to everyone. Built for the community.**
 
-In plain terms:
+Individuals and enterprises are welcome. Use it, contribute, or fork it under
+AGPL-3.0-or-later. Preserve attribution, and give your own derivative product
+a distinct name.
 
-- You can run, read, fork, modify, and redistribute fail2zig.
-- If you modify it, your modifications are also AGPL-3.0-or-later and must be
-  published on request — including when you only expose the software over a
-  network (the "network use is distribution" clause is the whole point of
-  AGPL).
-- Internal commercial use is fine. Self-hosting is fine. Forking for your
-  own needs is fine. Publishing a fork under a different name is fine.
+Commercial use is welcome. Taking this work, closing off source that AGPL
+requires you to share, and selling it without honoring those obligations is not.
 
-The AGPL covers **code rights**. Brand, name, and identity are separate — see
-Trademark below.
+**The same rules apply whether you're an individual developer or a trillion-dollar company.**
+
+See [LICENSE](LICENSE) for the terms. The fail2zig name and branding identify
+the official project; see [Trademark](#trademark) below.
 
 ## Trademark
 
@@ -871,7 +919,5 @@ You may fork and modify the code under the AGPL-3.0-or-later. You may **not**:
   affiliated with fail2zig;
 - use the name or branding for a commercial hosted service offering.
 
-If you ship a fork, give it a different name. This separation — permissive
-code rights, strict name rights — is the same model used by Redis
-(pre-2024), Elasticsearch, and Grafana Labs. Contact the maintainer for any
+If you ship a fork, give it a different name. Contact the maintainer for any
 trademark licensing question.
