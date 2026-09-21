@@ -138,6 +138,10 @@ test "cli entry: usage failures are class 2 and absent service is class 3" {
     const absent_json = try run(a, &.{ exe, "--socket", "/nonexistent/fail2zig.sock", "--output", "json", "version" });
     defer absent_json.deinit(a);
     try testing.expectEqual(@as(u8, 3), absent_json.code);
+    const absent_version = try run(a, &.{ exe, "--socket", "/nonexistent/fail2zig.sock", "--timeout", "500", "version" });
+    defer absent_version.deinit(a);
+    try testing.expectEqual(@as(u8, 3), absent_version.code);
+    try testing.expectEqual(@as(usize, 0), absent_version.stdout.len);
 }
 
 test "cli entry: direct operator commands route through the client before trailing global flags" {
@@ -252,6 +256,13 @@ test "cli entry: the same artifact starts the daemon and serves every retained o
     defer version_doc.deinit();
     const version_root = version_doc.value.object;
     try testing.expectEqualStrings(version_root.get("client_version").?.string, version_root.get("daemon").?.object.get("daemon_version").?.string);
+
+    const version_table = try run(a, &.{ exe, "--socket", h.socket_path, "--timeout", "2000", "--no-color", "version" });
+    defer version_table.deinit(a);
+    try testing.expectEqual(@as(u8, 0), version_table.code);
+    try testing.expect(std.mem.indexOf(u8, version_table.stdout, "(client and daemon)") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, version_table.stdout, "\n"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, version_table.stdout, version_root.get("client_version").?.string));
 
     const config = try run(a, &.{ exe, "--socket", h.socket_path, "--timeout", "2000", "--output", "json", "config" });
     defer config.deinit(a);

@@ -208,6 +208,10 @@ pub const EscalationSelection = struct {
     chosen_duration_us: i64,
     jitter_us: i64,
 };
+pub const EffectInvalidation = struct {
+    context: ?*anyopaque,
+    invalidate: *const fn (?*anyopaque) void,
+};
 pub const Store = struct {
     allocator: std.mem.Allocator,
     api: Api,
@@ -216,6 +220,7 @@ pub const Store = struct {
     rollback_error_code: ?c_int = null,
     consumer_clock_floor_us: ?i64 = null,
     effect_publication_epoch: u64 = 0,
+    effect_invalidation: ?EffectInvalidation = null,
     reopen_required: bool = false,
     startup_admission: bool = false,
     startup_operation: bool = false,
@@ -326,6 +331,14 @@ pub const Store = struct {
         if (!self.startup_operation or self.api.get_autocommit(self.db) != 0) return error.DatabaseFailure;
         try self.exec("RELEASE native_startup_operation;");
         self.startup_operation = false;
+    }
+
+    // Invalidate before durable publication; a failed COMMIT stays conservatively
+    // uncertain until the caller republishes a verified view. Never restore here.
+    fn commitEffectTransaction(self: *Store, changed: bool) Error!void {
+        if (changed) if (self.effect_invalidation) |hook| hook.invalidate(hook.context);
+        try self.commitTransaction();
+        if (changed) self.effect_publication_epoch +|= 1;
     }
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) Error!Store {
@@ -1336,8 +1349,7 @@ pub const Store = struct {
         try self.exec("UPDATE config_generations SET published=0 WHERE published=1;");
         try self.recordConfigGenerationTx(pinned, jails);
         try self.fault(.before_config_generation_commit);
-        try self.commitTransaction();
-        if (self.rekeyed_owners) self.effect_publication_epoch +|= 1;
+        try self.commitEffectTransaction(self.rekeyed_owners);
         self.rekeyed_owners = false;
     }
 
@@ -1847,6 +1859,7 @@ pub const Store = struct {
         const canonical_scope = @import("../firewall/scope.zig");
         const installation = try self.readInstallation() orelse return error.InstallationRequired;
         var activated: u64 = 0;
+        var effect_changed = false;
         for (held.items) |item| {
             const scope = canonical_scope.Scope.decode(&item.scope) catch return error.InvalidMigrationRow;
             const lease: effects.Lease = if (item.lease_kind == 2) .permanent else .{ .finite = item.deadline_us orelse return error.InvalidMigrationRow };
@@ -1884,17 +1897,20 @@ pub const Store = struct {
                 if (native_live) {
                     try self.recordMigrationConflictTx(run_id, item.seq, &item.scope, jail, item.lease_kind, item.deadline_us, now);
                     const extend = !owner.permanent and lease == .finite and (owner.deadline_us orelse 0) < lease.finite;
-                    if (extend) _ = try self.setOwnerTx(try (effects.CanonicalOwnerChange{ .scope = scope, .jail = jail, .generation = generation, .decision_id = effects.hashParts("fail2zig-migration-extend-v1", &.{ &run_id, &counter }), .expected_revision = existing_revision, .lease = lease, .decided_us = @min(owner.decided_us, now) }).exact(), now);
+                    if (extend) {
+                        _ = try self.setOwnerTx(try (effects.CanonicalOwnerChange{ .scope = scope, .jail = jail, .generation = generation, .decision_id = effects.hashParts("fail2zig-migration-extend-v1", &.{ &run_id, &counter }), .expected_revision = existing_revision, .lease = lease, .decided_us = @min(owner.decided_us, now) }).exact(), now);
+                        effect_changed = true;
+                    }
                     continue;
                 }
             }
             _ = try self.setOwnerTx(try (effects.CanonicalOwnerChange{ .scope = scope, .jail = jail, .generation = generation, .decision_id = decision_id, .expected_revision = existing_revision, .lease = lease, .decided_us = @min(item.decided_us, now) }).exact(), now);
+            effect_changed = true;
             activated += 1;
         }
         _ = try self.commitEffectClock(clock);
         try self.fault(.before_migration_activation_commit);
-        try self.commitTransaction();
-        if (activated != 0) self.effect_publication_epoch +|= 1;
+        try self.commitEffectTransaction(effect_changed);
         return activated;
     }
 
@@ -3711,12 +3727,13 @@ pub const Store = struct {
         errdefer self.rollback();
         try self.effectSchema();
         const now = try self.effectClock(clock);
+        const prior_revision = try self.integer("SELECT revision FROM effect_clock WHERE singleton=1;");
         const entry = try self.setOwnerTx(change, now);
+        const changed = prior_revision != try self.integer("SELECT revision FROM effect_clock WHERE singleton=1;");
         const final = try self.commitEffectClock(clock);
         if (change.lease == .finite and !change.lease.live(final)) return error.EffectExpired;
         if (entry.desired == .finite and !entry.desired.live(final)) return error.EffectExpired;
-        try self.commitTransaction();
-        self.effect_publication_epoch +|= 1;
+        try self.commitEffectTransaction(changed);
         return entry;
     }
     pub fn setOwnerFromCanonical(self: *Store, change: effects.CanonicalOwnerChange, clock: effects.Clock) Error!effects.Entry {
@@ -3777,8 +3794,7 @@ pub const Store = struct {
         const now = try self.effectClock(clock);
         const result = try self.transitionOwnerTx(change, now);
         _ = try self.commitEffectClock(clock);
-        try self.commitTransaction();
-        if (result.changed) self.effect_publication_epoch +|= 1;
+        try self.commitEffectTransaction(result.changed);
         return result.entry;
     }
     pub fn flushJailOwner(self: *Store, jail: []const u8, generation: effects.Hash, transition_id: effects.Hash, clock: effects.Clock) Error!?effects.Entry {
@@ -3803,8 +3819,7 @@ pub const Store = struct {
         if (owner_revision_value <= 0 or try row.row()) return error.InvalidEffect;
         const result = try self.transitionOwnerTx(.{ .scope = scope, .jail = jail, .current_generation = generation, .next_generation = generation, .expected_owner_revision = @intCast(owner_revision_value), .transition_id = transition_id, .mode = .release, .occurred_us = now }, now);
         _ = try self.commitEffectClock(clock);
-        try self.commitTransaction();
-        if (result.changed) self.effect_publication_epoch +|= 1;
+        try self.commitEffectTransaction(result.changed);
         return result.entry;
     }
     fn checkedEffectToken(self: *Store, token: effects.Token) Error!effects.Entry {
@@ -3832,8 +3847,7 @@ pub const Store = struct {
         try self.fault(.before_effect_dispatch_commit);
         const final = try self.commitEffectClock(clock);
         if (entry.desired == .finite and !entry.desired.live(final)) return error.EffectExpired;
-        try self.commitTransaction();
-        self.effect_publication_epoch +|= 1;
+        try self.commitEffectTransaction(true);
     }
     pub fn settleVerified(self: *Store, token: effects.Token, observation: effects.Observation, clock: effects.Clock) Error!effects.Settlement {
         if (observation.qualification != .complete_owned or !std.mem.eql(u8, &observation.installation, &token.installation) or !std.mem.eql(u8, &observation.scope_key, &token.scope_key)) return error.IncompleteEffectObservation;
@@ -3949,8 +3963,7 @@ pub const Store = struct {
         try self.fault(.before_effect_receipt_commit);
         const final = try self.commitEffectClock(clock);
         if (status == .applied and entry.desired == .finite and !entry.desired.live(final)) return error.EffectExpired;
-        try self.commitTransaction();
-        self.effect_publication_epoch +|= 1;
+        try self.commitEffectTransaction(true);
         return if (expired) .expired else if (matches) .verified else .retry_same_intent;
     }
     pub fn prepareExpiry(self: *Store, key: effects.Hash, expected_revision: u64, clock: effects.Clock) Error!effects.Entry {
@@ -3985,8 +3998,7 @@ pub const Store = struct {
             entry = try self.replaceEffectIntent(installation, prior.scope, key, effect_revision, prior.intent_id, now);
         }
         _ = try self.commitEffectClock(clock);
-        try self.commitTransaction();
-        if (expired != 0) self.effect_publication_epoch +|= 1;
+        try self.commitEffectTransaction(expired != 0);
         return entry;
     }
     pub fn confirmedEffectEvents(self: *Store) Error!u64 {
@@ -4996,8 +5008,7 @@ pub const Store = struct {
         const next = try self.replaceEffectIntent(installation, scope, key, entry.revision + 1, decision_id, now);
         const final = try self.commitEffectClock(clock);
         if (!prolonged.lease.live(final) or (next.desired == .finite and !next.desired.live(final))) return error.EffectExpired;
-        try self.commitTransaction();
-        self.effect_publication_epoch +|= 1;
+        try self.commitEffectTransaction(true);
         return .{ .changed = true, .lease = prolonged.lease, .effect = next };
     }
 
@@ -5911,8 +5922,7 @@ pub const Store = struct {
             for (decisions[0..count]) |decision| if (decision.enforce and !decision.lease.live(now)) return error.EffectExpired;
         }
         const effect_changed = if (record.native_retry != null) try self.hasEnforcingDecision(record) else false;
-        try self.commitTransaction();
-        if (effect_changed) self.effect_publication_epoch +|= 1;
+        try self.commitEffectTransaction(effect_changed);
         return .committed;
     }
     fn hasEnforcingDecision(self: *Store, record: Record) Error!bool {
@@ -8104,4 +8114,156 @@ test "native consumers: killed migration and multi-state commits retain original
             }
         }
     };
+}
+
+const EffectPublicationProbe = struct {
+    store: *Store,
+    calls: usize = 0,
+    epoch_at_invalidation: u64 = 0,
+    inside_transaction: bool = false,
+    fn invalidate(context: ?*anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.calls += 1;
+        self.epoch_at_invalidation = self.store.effect_publication_epoch;
+        self.inside_transaction = self.store.api.get_autocommit(self.store.db) == 0;
+    }
+    fn clockRead(_: ?*anyopaque) i64 {
+        return 100;
+    }
+    fn clock() effects.Clock {
+        return .{ .prepared_us = 100, .context = null, .read = clockRead };
+    }
+    fn enable(store: *Store) !void {
+        try store.enableReceipts(8);
+        try store.enableNativeTime();
+        try store.enableYearInference();
+        try store.enableDetection();
+        try store.enableClockRecovery();
+        try store.enableJournalDetection();
+        try store.enableRetry();
+        try store.enableConsumers();
+        try store.enableEffects();
+        try store.admitInstallation(try effects.Installation.init([_]u8{7} ** 16, .nftables, "host-default"), .{ .selector = "host-default", .disposition = .verified_absent });
+    }
+    fn change() !effects.OwnerChange {
+        return .{ .scope = try effects.Scope.host(.{ .v4 = .{ 192, 0, 2, 7 } }), .jail = "sshd", .generation = [_]u8{5} ** 32, .decision_id = [_]u8{6} ** 32, .expected_revision = 0, .lease = .{ .finite = 500 }, .decided_us = 100 };
+    }
+};
+
+test "record store: effect invalidation precedes durable commit and unchanged owners keep authority" {
+    const t = std.testing;
+    var temp = t.tmpDir(.{});
+    defer temp.cleanup();
+    const base = try temp.dir.realpathAlloc(t.allocator, ".");
+    defer t.allocator.free(base);
+    const path = try std.fs.path.join(t.allocator, &.{ base, "publication.sqlite" });
+    defer t.allocator.free(path);
+    var store = try Store.open(t.allocator, path);
+    defer store.close();
+    try EffectPublicationProbe.enable(&store);
+    var probe = EffectPublicationProbe{ .store = &store };
+    store.effect_invalidation = .{ .context = &probe, .invalidate = EffectPublicationProbe.invalidate };
+    const entry = try store.setOwner(try EffectPublicationProbe.change(), EffectPublicationProbe.clock());
+    try t.expectEqual(@as(usize, 1), probe.calls);
+    try t.expect(probe.inside_transaction);
+    try t.expectEqual(@as(u64, 0), probe.epoch_at_invalidation);
+    try t.expectEqual(@as(u64, 1), store.effect_publication_epoch);
+    try t.expect(store.api.get_autocommit(store.db) != 0);
+    _ = try store.setOwner(try EffectPublicationProbe.change(), EffectPublicationProbe.clock());
+    _ = try store.prepareExpiry(entry.scope_key, entry.revision, EffectPublicationProbe.clock());
+    try t.expectEqual(@as(usize, 1), probe.calls);
+    try t.expectEqual(@as(u64, 1), store.effect_publication_epoch);
+}
+
+test "record store: failed effect commit retains invalidation without publishing an epoch and reopens unchanged" {
+    const t = std.testing;
+    var temp = t.tmpDir(.{});
+    defer temp.cleanup();
+    const base = try temp.dir.realpathAlloc(t.allocator, ".");
+    defer t.allocator.free(base);
+    const path = try std.fs.path.join(t.allocator, &.{ base, "failed-publication.sqlite" });
+    defer t.allocator.free(path);
+    for ([_]bool{ false, true }) |fail_rollback| {
+        {
+            var store = try Store.open(t.allocator, path);
+            defer store.close();
+            if (store.schema_version == 2) try EffectPublicationProbe.enable(&store);
+            var probe = EffectPublicationProbe{ .store = &store };
+            store.effect_invalidation = .{ .context = &probe, .invalidate = EffectPublicationProbe.invalidate };
+            const Fault = struct {
+                var active: *EffectPublicationProbe = undefined;
+                var rollback_failure: bool = false;
+                var saw_invalidated_commit: bool = false;
+                fn exec(db: *Db, sql: [*:0]const u8, callback: ?*anyopaque, context: ?*anyopaque, message: ?*?[*:0]u8) callconv(.c) c_int {
+                    if (std.mem.eql(u8, std.mem.span(sql), "COMMIT;")) {
+                        saw_invalidated_commit = active.calls == 1 and active.store.effect_publication_epoch == 0;
+                        return 10 | (3 << 8);
+                    }
+                    if (rollback_failure and std.mem.eql(u8, std.mem.span(sql), "ROLLBACK;")) return 10 | (4 << 8);
+                    return embedded_api.exec(db, sql, callback, context, message);
+                }
+            };
+            Fault.active = &probe;
+            Fault.rollback_failure = fail_rollback;
+            Fault.saw_invalidated_commit = false;
+            store.api.exec = Fault.exec;
+            try t.expectError(error.StorageIo, store.setOwner(try EffectPublicationProbe.change(), EffectPublicationProbe.clock()));
+            try t.expect(Fault.saw_invalidated_commit and probe.inside_transaction);
+            try t.expectEqual(@as(usize, 1), probe.calls);
+            try t.expectEqual(@as(u64, 0), store.effect_publication_epoch);
+            // COMMIT I/O uncertainty always requires reopen, even when rollback succeeds.
+            try t.expect(store.reopen_required);
+            try t.expectEqual(@as(?c_int, if (fail_rollback) 10 | (4 << 8) else null), store.rollback_error_code);
+            try t.expectEqual(fail_rollback, store.api.get_autocommit(store.db) == 0);
+            try t.expectEqual(@as(?c_int, 10 | (3 << 8)), store.last_error_code);
+        }
+        var reopened = try Store.open(t.allocator, path);
+        defer reopened.close();
+        try t.expectEqual(@as(i64, 0), try reopened.integer("SELECT count(*) FROM effect_owners;"));
+    }
+}
+
+test "record store: extension-only staged activation invalidates effects despite zero fresh owners" {
+    const t = std.testing;
+    var temp = t.tmpDir(.{});
+    defer temp.cleanup();
+    const base = try temp.dir.realpathAlloc(t.allocator, ".");
+    defer t.allocator.free(base);
+    const path = try std.fs.path.join(t.allocator, &.{ base, "extension-publication.sqlite" });
+    defer t.allocator.free(path);
+    var store = try Store.open(t.allocator, path);
+    defer store.close();
+    try EffectPublicationProbe.enable(&store);
+    try store.enableTimeProvenance();
+    try store.enableConsumerManifests();
+    try store.enableConfirmedHistory();
+    try store.enableMaintenance();
+    try store.enableCleanup();
+    try store.enableRetryLeases();
+    try store.enableApplicationHistory();
+    try store.enableEscalation();
+    try store.enableCanonicalEffects();
+    try store.enableHistoryResets();
+    try store.enableActionTargets();
+    try store.enableAdminState();
+    try store.enableMigrationState();
+    const change = try EffectPublicationProbe.change();
+    _ = try store.setOwner(change, EffectPublicationProbe.clock());
+    const run_id = [_]u8{9} ** 32;
+    try store.createMigrationRun(.{ .run_id = run_id, .host_id = [_]u8{1} ** 32, .source_db_fp = [_]u8{2} ** 32, .source_cfg_fp = [_]u8{3} ** 32, .plan_fp = [_]u8{4} ** 32, .recovery_point = "/fixture/recovery.sqlite", .generation = change.generation, .state = .planned, .created_us = 100, .updated_us = 100 });
+    try store.stageMigrationRows(run_id, &.{.{ .jail = change.jail, .scope = try (try change.scope.toCanonical()).encode(), .lease_kind = 1, .deadline_us = 1000, .source_event_us = 100, .source_row = 1 }}, &.{});
+    const seq = try store.beginMigrationStep(run_id, .stage_destination, "", 100);
+    try store.finishMigrationStep(run_id, seq, .success, "", .staged, 100);
+    var probe = EffectPublicationProbe{ .store = &store };
+    store.effect_invalidation = .{ .context = &probe, .invalidate = EffectPublicationProbe.invalidate };
+    const epoch = store.effect_publication_epoch;
+    try t.expectEqual(@as(u64, 0), try store.activateStagedOwners(run_id, &.{.{ .jail = change.jail, .generation = change.generation }}, EffectPublicationProbe.clock()));
+    try t.expectEqual(@as(usize, 1), probe.calls);
+    try t.expect(probe.inside_transaction);
+    try t.expectEqual(epoch, probe.epoch_at_invalidation);
+    try t.expectEqual(epoch + 1, store.effect_publication_epoch);
+    try t.expectEqual(@as(i64, 1000), try store.integer("SELECT deadline_us FROM effect_owners;"));
+    _ = try store.activateStagedOwners(run_id, &.{.{ .jail = change.jail, .generation = change.generation }}, EffectPublicationProbe.clock());
+    try t.expectEqual(@as(usize, 1), probe.calls);
+    try t.expectEqual(epoch + 1, store.effect_publication_epoch);
 }

@@ -73,6 +73,12 @@ The local Unix socket uses peer credentials for authorization. Read-only monitor
 available to the configured service/monitor group; mutations require root or the daemon UID. Status distinguishes
 policy decisions, installed protection, uncertainty and degraded dependencies.
 
+In the development branch, routine worker activity retains the last verified protection
+view. Effect-changing transactions invalidate that view before commit; coherent readback
+restores confirmation. Overdue deadlines, stalled workers, clock uncertainty and failed
+readback still degrade protection. Jail `source_healthy` describes the source independently
+of storage and firewall health; it does not by itself establish enforcement.
+
 The shipped systemd unit uses the non-login `fail2zig` user and group. It restricts filesystem
 access, syscalls and capabilities while retaining the access required to read configured logs, own SQLite state and manage the selected firewall.
 All-log-only configurations can run without firewall capability when started appropriately.

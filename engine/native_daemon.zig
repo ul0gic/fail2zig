@@ -883,6 +883,17 @@ pub const Coordinator = struct {
     fn observationHealthy(observation: health.WorkerStatus) bool {
         return !observation.stalled and !observation.clock_uncertain and !observation.expiry_uncertain and !observation.expiry_overdue;
     }
+    fn bindEffectInvalidation(self: *Coordinator) void {
+        self.store.effect_invalidation = .{ .context = self, .invalidate = invalidateEffectPublication };
+    }
+    fn invalidateEffectPublication(ctx: ?*anyopaque) void {
+        const self: *Coordinator = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        // Fence readers before COMMIT; retain the prior deadline until readback
+        // verifies the new epoch. Routine read-only turns keep their last evidence.
+        self.worker_observation.publication(observationMs(), observationWall(), null, false);
+    }
     fn resolverGeneration(server: ?std.net.Address) ![32]u8 {
         const selected = server orelse return [_]u8{0} ** 32;
         var bytes: [128]u8 = undefined;
@@ -1173,6 +1184,7 @@ pub const Coordinator = struct {
             return err;
         };
         self.store_open = true;
+        self.bindEffectInvalidation();
         errdefer self.store.close();
         try self.verifyStateIdentity();
         try self.validatePreflightInstallation();
@@ -1750,6 +1762,7 @@ pub const Coordinator = struct {
                 if (self.last_open_failure != null) std.log.info("native: state runtime reopened; recovery checks pending", .{});
                 self.last_open_failure = null;
                 self.store_open = true;
+                self.bindEffectInvalidation();
                 try self.verifyStateIdentity();
             }
             try self.admitStore();
@@ -2193,7 +2206,7 @@ pub const Coordinator = struct {
         var next_expiry: ?i64 = null;
         var expiry_current = self.effects == null;
         if (self.effects) |manager| {
-            expiry_current = manager.status.ready and manager.cached_epoch != null and manager.cached_epoch.? == self.store.effect_publication_epoch;
+            expiry_current = !self.store.reopen_required and manager.status.ready and !manager.status.uncertain and manager.cached_epoch != null and manager.cached_epoch.? == self.store.effect_publication_epoch;
             if (expiry_current) for (manager.live[0..manager.count]) |entry| {
                 if (entry.status == .expired or entry.status == .absent or entry.status == .superseded) continue;
                 if (entry.desired == .finite) next_expiry = if (next_expiry) |prior| @min(prior, entry.desired.finite) else entry.desired.finite;
@@ -2253,6 +2266,7 @@ pub const Coordinator = struct {
             }
             self.stop_mutex.unlock();
             self.mutex.lock();
+            self.worker_observation.begin(observationMs(), observationWall());
             if (self.reload_request) |request| {
                 self.reload_request = null;
                 self.mutex.unlock();
@@ -2268,8 +2282,6 @@ pub const Coordinator = struct {
                 }
                 self.mutex.lock();
             }
-            self.worker_observation.begin(observationMs(), observationWall());
-            if (self.effects != null) self.worker_observation.publication(observationMs(), observationWall(), null, false);
             self.mutex.unlock();
             self.tick() catch |failure| {
                 if (!self.gate.snapshot().has_been_healthy and failure != error.ReceiptClockReversed) {
@@ -2500,7 +2512,7 @@ pub const Coordinator = struct {
             decisions +|= jail.summary.decisions;
             installed +|= self.confirmedCount(jail, now, observation);
         }
-        if (self.published_effects) |effects| healthy = healthy and effects.ready;
+        if (self.published_effects) |effects| healthy = healthy and effects.ready and !effects.uncertain;
         if (self.backend_failure != null) healthy = false;
         const protection: []const u8 = if (!healthy) "degraded" else if (self.published_effects != null) "active" else "log-only";
         const generation_hex = std.fmt.bytesToHex(self.published_generation, .lower);
@@ -2796,7 +2808,7 @@ pub const Coordinator = struct {
                         .finite_us => |value| @divTrunc(value, 1_000_000),
                         .permanent => null,
                     };
-                    try std.json.stringify(.{ .name = jail.name, .healthy = jail.healthy and self.published_health.phase == .healthy and observationHealthy(observation), .enabled = jail.admin_enabled, .paused = jail.admin_paused, .active_bans = self.confirmedCount(jail, sampled_wall orelse self.start_us, observation), .maxretry = jail.policy.maxretry, .findtime = @divTrunc(jail.policy.window_us, 1_000_000), .bantime = bantime, .bantime_permanent = jail.policy.duration == .permanent, .action = if (self.jailEnforces(&jail)) self.published_backend else "log-only", .enforcing = self.jailEnforces(&jail) and self.confirmationReady(observation), .log_source = @tagName(jail.plan), .source_healthy = jail.healthy and self.published_health.phase == .healthy and observationHealthy(observation), .source = @tagName(jail.plan), .revision = jail.revision, .decisions = jail.summary.decisions, .cause = if (jail.source_error) |cause| @errorName(cause) else "none", .source_exit_code = if (jail.source_diagnostic) |detail| detail.exit_code else null, .source_signal = if (jail.source_diagnostic) |detail| detail.signal else null, .source_stderr_present = if (jail.source_diagnostic) |detail| @as(?bool, detail.stderr_present) else null }, .{}, w);
+                    try std.json.stringify(.{ .name = jail.name, .healthy = jail.healthy and self.published_health.phase == .healthy and observationHealthy(observation), .enabled = jail.admin_enabled, .paused = jail.admin_paused, .active_bans = self.confirmedCount(jail, sampled_wall orelse self.start_us, observation), .maxretry = jail.policy.maxretry, .findtime = @divTrunc(jail.policy.window_us, 1_000_000), .bantime = bantime, .bantime_permanent = jail.policy.duration == .permanent, .action = if (self.jailEnforces(&jail)) self.published_backend else "log-only", .enforcing = self.jailEnforces(&jail) and self.confirmationReady(observation), .log_source = @tagName(jail.plan), .source_healthy = jail.healthy, .source = @tagName(jail.plan), .revision = jail.revision, .decisions = jail.summary.decisions, .cause = if (jail.source_error) |cause| @errorName(cause) else "none", .source_exit_code = if (jail.source_diagnostic) |detail| detail.exit_code else null, .source_signal = if (jail.source_diagnostic) |detail| detail.signal else null, .source_stderr_present = if (jail.source_diagnostic) |detail| @as(?bool, detail.stderr_present) else null }, .{}, w);
                 }
                 try w.writeAll("]");
             },
@@ -2936,6 +2948,88 @@ test "native daemon BUG-035: admin settlement requires coherent effect readback"
     try testing.expectEqual(AdminReadback.pending, adminReadback(.{ .ready = true }, 7, 8));
     try testing.expectEqual(AdminReadback.uncertain, adminReadback(.{ .ready = true, .uncertain = true }, 8, 8));
     try testing.expectEqual(AdminReadback.coherent, adminReadback(.{ .ready = true }, 8, 8));
+}
+
+test "native daemon BUG-065: queries retain read-only health and separate source failures from effect uncertainty" {
+    const testing = std.testing;
+    var jails = [_]Jail{.{
+        .name = "fixture",
+        .plan = .{ .internal = [_]u8{1} ** 32 },
+        .policy = .{ .maxretry = 3, .window_us = 600_000_000, .duration = .{ .finite_us = 60_000_000 }, .max_subjects = 1, .enforce = true },
+        .scratch = &.{},
+        .active = &.{},
+        .scratch_confirmed = &.{},
+        .confirmed = &.{},
+        .healthy = true,
+    }};
+    var coordinator: Coordinator = .{
+        .allocator = testing.allocator,
+        .cfg = undefined,
+        .live_cfg = undefined,
+        .jails = &jails,
+        .store = undefined,
+        .timer = try std.time.Timer.start(),
+        .gate = undefined,
+        .published_health = undefined,
+        .start_us = std.time.microTimestamp(),
+        .resources = undefined,
+        .published_backend = "nftables",
+        .published_effects = .{ .ready = true },
+    };
+    coordinator.gate = health.Gate.init(.{ .context = &coordinator, .read = Coordinator.monotonic });
+    const generation = try coordinator.gate.beginRecovery();
+    for ([_]health.RecoveryStep{ .storage, .state, .ownership, .sources }) |step| try coordinator.gate.completed(generation, step);
+    coordinator.published_health = coordinator.gate.snapshot();
+    const wall = Coordinator.observationWall().?;
+    const monotonic = Coordinator.observationMs().?;
+    const deadline = wall + 60_000_000;
+
+    const Case = enum { routine, commit, stalled, expired, backend_failure, source_failure, clock_uncertain, storage_paused };
+    for (std.enums.values(Case)) |case| {
+        coordinator.worker_observation = health.WorkerObservation.init(monotonic, wall);
+        coordinator.worker_observation.publication(monotonic, wall, deadline, true);
+        coordinator.worker_observation.begin(monotonic, wall);
+        coordinator.published_effects = .{ .ready = true };
+        coordinator.published_health.phase = .healthy;
+        jails[0].healthy = true;
+        jails[0].source_error = null;
+        switch (case) {
+            .routine => {},
+            .commit => {
+                Coordinator.invalidateEffectPublication(&coordinator);
+                try testing.expectEqual(@as(?i64, deadline), coordinator.worker_observation.next_committed_expiry_us);
+            },
+            .stalled => {
+                coordinator.worker_observation.busy_since_ms = monotonic -| health.diagnostic_stall_ms;
+                coordinator.worker_observation.heartbeat_ms = monotonic -| health.diagnostic_stall_ms;
+            },
+            .expired => coordinator.worker_observation.publication(monotonic, wall, wall - 1, true),
+            .backend_failure => coordinator.published_effects = .{ .ready = false, .uncertain = true, .cause = error.EffectBackendUncertain },
+            .source_failure => {
+                jails[0].healthy = false;
+                jails[0].source_error = error.AccessDenied;
+            },
+            .clock_uncertain => coordinator.worker_observation.clock_uncertain = true,
+            .storage_paused => coordinator.published_health.phase = .paused,
+        }
+        const response = try Coordinator.command(&coordinator, .{ .list_jails = {} }, testing.allocator);
+        defer testing.allocator.free(response.ok.payload);
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, response.ok.payload, .{});
+        defer parsed.deinit();
+        const jail = parsed.value.array.items[0].object;
+        try testing.expectEqual(case != .source_failure, jail.get("source_healthy").?.bool);
+        try testing.expectEqualStrings(if (case == .source_failure) "AccessDenied" else "none", jail.get("cause").?.string);
+        if (case != .routine and case != .source_failure) try testing.expect(!jail.get("enforcing").?.bool);
+        if (case == .routine) try testing.expect(jail.get("enforcing").?.bool);
+
+        var output: std.ArrayListUnmanaged(u8) = .{};
+        defer output.deinit(testing.allocator);
+        try Coordinator.status(&coordinator, &output, testing.allocator);
+        const status = try std.json.parseFromSlice(std.json.Value, testing.allocator, output.items, .{});
+        defer status.deinit();
+        try testing.expectEqualStrings(if (case == .routine) "active" else "degraded", status.value.object.get("protection").?.string);
+        try testing.expectEqual(@as(i64, if (case == .source_failure) 1 else 0), status.value.object.get("unhealthy_sources").?.integer);
+    }
 }
 
 const AdminOwnershipProbe = struct {

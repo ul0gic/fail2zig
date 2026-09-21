@@ -1140,21 +1140,26 @@ pub fn formatVersion(
             }
         },
         .table => {
-            try writer.print("fail2zig {s}\n", .{client_version});
-            if (payload_json.len > 0) {
-                const parsed = std.json.parseFromSlice(
-                    VersionPayload,
-                    allocator,
-                    payload_json,
-                    .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
-                ) catch return;
-                defer parsed.deinit();
-                if (parsed.value.daemon_version) |v| try writer.print("fail2zig       {s}\n", .{v});
-                if (parsed.value.git_commit) |c| try writer.print("  commit:      {s}\n", .{c});
-                if (parsed.value.build_date) |d| try writer.print("  built:       {s}\n", .{d});
+            const parsed = try std.json.parseFromSlice(
+                VersionPayload,
+                allocator,
+                if (payload_json.len == 0) "{}" else payload_json,
+                .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
+            );
+            defer parsed.deinit();
+            var diagnostic: [diagnostic_max_bytes]u8 = undefined;
+            if (parsed.value.daemon_version) |v| {
+                if (std.mem.eql(u8, client_version, v)) {
+                    try writer.print("fail2zig {s} (client and daemon)\n", .{renderDiagnostic(&diagnostic, client_version)});
+                } else {
+                    try writer.print("Client: fail2zig {s}\n", .{renderDiagnostic(&diagnostic, client_version)});
+                    try writer.print("Daemon: fail2zig {s}\n", .{renderDiagnostic(&diagnostic, v)});
+                }
             } else {
-                try writer.writeAll("fail2zig       (daemon unreachable)\n");
+                try writer.print("Client: fail2zig {s}\nDaemon: version unavailable\n", .{renderDiagnostic(&diagnostic, client_version)});
             }
+            if (parsed.value.git_commit) |c| try writer.print("  commit: {s}\n", .{renderDiagnostic(&diagnostic, c)});
+            if (parsed.value.build_date) |d| try writer.print("  built:  {s}\n", .{renderDiagnostic(&diagnostic, d)});
         },
     }
 }
@@ -2895,20 +2900,35 @@ fn runVersion(alloc: std.mem.Allocator, payload: []const u8, fmt: OutputFormat) 
     return list.toOwnedSlice();
 }
 
-test "format: version table shows client and daemon" {
+test "format: version table combines matching client and daemon versions" {
     const payload = "{\"daemon_version\":\"0.1.0\",\"git_commit\":\"abc123\"}";
     const out = try runVersion(testing.allocator, payload, .table);
     defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "fail2zig 0.1.0") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "fail2zig       0.1.0") != null);
+    try testing.expect(std.mem.startsWith(u8, out, "fail2zig 0.1.0 (client and daemon)\n"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "0.1.0"));
     try testing.expect(std.mem.indexOf(u8, out, "abc123") != null);
 }
 
-test "format: version table with no daemon payload" {
-    const out = try runVersion(testing.allocator, "", .table);
+test "format: version table distinguishes mismatched client and daemon" {
+    const out = try runVersion(testing.allocator, "{\"daemon_version\":\"0.2.0\"}", .table);
     defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "fail2zig 0.1.0") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "daemon unreachable") != null);
+    try testing.expectEqualStrings("Client: fail2zig 0.1.0\nDaemon: fail2zig 0.2.0\n", out);
+}
+
+test "format: version table reports missing metadata without inventing a connection failure" {
+    for ([_][]const u8{ "", "{}", "{\"daemon_version\":null}" }) |payload| {
+        const out = try runVersion(testing.allocator, payload, .table);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("Client: fail2zig 0.1.0\nDaemon: version unavailable\n", out);
+    }
+}
+
+test "format: version table rejects malformed payload and escapes terminal data" {
+    try testing.expectError(error.UnexpectedEndOfInput, runVersion(testing.allocator, "{", .table));
+    const out = try runVersion(testing.allocator, "{\"daemon_version\":\"0.2.0\\u001b[2J\",\"git_commit\":\"a\\nb\"}", .table);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOfScalar(u8, out, 0x1b) == null);
+    try testing.expect(std.mem.indexOf(u8, out, "a\nb") == null);
 }
 
 test "format: version plain" {
