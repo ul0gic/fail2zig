@@ -1,4 +1,4 @@
-.TH FAIL2ZIG.TOML 5 "2026-09-17" "fail2zig 0.4.1" "File Formats"
+.TH FAIL2ZIG.TOML 5 "2026-09-21" "fail2zig 0.4.2" "File Formats"
 .
 .SH NAME
 fail2zig.toml \- fail2zig daemon configuration file
@@ -146,7 +146,7 @@ and
 .I /proc/thread-self
 aliases are rejected because they are not stable external anchors. Custom
 selectors and service overrides that move the daemon between namespaces are
-not supported in 0.4.0.
+unsupported.
 An existing installation also records the selector spelling. A changed selector
 is rejected even if it currently names the same namespace; restore the previous
 setting with the existing state database.

@@ -1,6 +1,6 @@
 # Runtime architecture
 
-fail2zig 0.4.1 is one native executable containing the daemon, administration commands, rule
+fail2zig 0.4.2 is one native executable containing the daemon, administration commands, rule
 testing and migration tools. Zig application code statically embeds pinned upstream SQLite C.
 Runtime installation does not require Python, a SQLite service, the SQLite CLI or a shared SQLite
 library.
@@ -65,7 +65,7 @@ interface and enforcement target where the backend supports them.
 
 Firewall effects are limited to the daemon's current network namespace. The daemon does not enter
 another namespace, and custom namespace selectors or service overrides that move it between
-namespaces are not supported in 0.4.0.
+namespaces remain unsupported.
 
 ## Administration and privileges
 
@@ -73,7 +73,7 @@ The local Unix socket uses peer credentials for authorization. Read-only monitor
 available to the configured service/monitor group; mutations require root or the daemon UID. Status distinguishes
 policy decisions, installed protection, uncertainty and degraded dependencies.
 
-In the development branch, routine worker activity retains the last verified protection
+Routine worker activity retains the last verified protection
 view. Effect-changing transactions invalidate that view before commit; coherent readback
 restores confirmation. Overdue deadlines, stalled workers, clock uncertainty and failed
 readback still degrade protection. Jail `source_healthy` describes the source independently
@@ -104,7 +104,7 @@ The default configuration admits at most 64 enabled jails, eight file incarnatio
 and descriptor budgets. SQLite uses a separate bounded heap and page limit; required history and
 recovery anchors remain pinned.
 
-The development CLI inspection path uses an optional observation cache owned by the
+The CLI inspection path uses an optional observation cache owned by the
 coordinator and borrowed by the effect manager. Existing complete readbacks publish
 at most 256 pointer-free entries; failures retain the prior sample and update attempt
 metadata. A separate cache mutex bounds copying to one page/sample. IPC serializes

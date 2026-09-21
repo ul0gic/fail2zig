@@ -770,7 +770,7 @@ pub const help_top =
     \\    status              Show protection-first daemon status (--details for identifiers/metrics)
     \\    ban <ip>            Manually ban an IP
     \\    unban <ip>          Manually unban an IP
-    \\    list                List active bans (all or per-jail with --jail)
+    \\    list                List active bans (--jail filter; --details for counts)
     \\    jails               List configured jails (--details for thresholds)
     \\    reload              Apply a validated configuration live (restart-only keys reported)
     \\    version             Show client and daemon version
@@ -884,10 +884,11 @@ pub const help_firewall =
     \\FLAGS:
     \\    --limit <n>         Sample entries per page, 1..256 (default: daemon default)
     \\    --cursor <token>    Continue the same retained observation page
-    \\    --details           Include observation and effect identifiers in table output
+    \\    --details           Include verified owned structures, entry placement and identifiers
     \\
     \\This reads the daemon's latest retained observation. It does not refresh, repair,
-    \\or enumerate firewall state owned by other applications.
+    \\or enumerate firewall state owned by other applications. Structural detail appears
+    \\only when the retained owned readback has exact verification.
     \\
 ;
 

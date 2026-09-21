@@ -20,13 +20,14 @@ The supported migration workflow inspects fail2ban inputs, captures a read-only 
 plans and validates the native projection, and performs journaled cutover/rollback. Unsupported
 configuration is reported for operator action; exact fail2ban compatibility is not promised.
 
-Version 0.4.1 provides
-daemon and administration functions into one static executable per architecture and requires no Python or
+Version 0.4.2 combines the
+daemon and administration functions in one static executable per architecture and requires no Python or
 shared SQLite library at runtime. Its [runtime architecture](docs/architecture.md) uses
 statically embedded SQLite for source receipts, consumer state, protection ownership and
 confirmed history. Host requirements remain explicit: journal input uses journald and
 `journalctl`; the iptables and ipset backends invoke those tools with fixed arguments; nftables
-talks directly to the kernel. The 0.4.0 release received selected live qualification on
+talks directly to the kernel. Version 0.4.2 adds bounded inspection of fail2zig-owned
+firewall observations through the CLI. The 0.4.0 release received selected live qualification on
 Debian 13 x86_64. The 0.4.1 SSH-default repair additionally passed isolated log-only origin
 and restart checks on Debian 13 and Ubuntu 24.04; this does not establish Ubuntu firewall
 qualification or full platform support.
@@ -77,7 +78,7 @@ The installer pulls from the
 [latest GitHub Release](https://github.com/ul0gic/fail2zig/releases/latest)
 and verifies every asset against the published `SHA256SUMS` before placing
 anything on disk. Pin a specific version with
-`FAIL2ZIG_VERSION=v0.4.1` or inspect the script first with
+`FAIL2ZIG_VERSION=v0.4.2` or inspect the script first with
 `curl -fsSL … | less`.
 
 ---
@@ -168,11 +169,11 @@ configuration, and installs the hardened `fail2zig.service` unit under
 `/etc/systemd/system/`. It does **not** auto-start the daemon — audit the config,
 then run `systemctl enable --now fail2zig` when ready.
 
-**0.4.1 release targets** (one combined daemon/admin executable each):
+**0.4.2 release targets** (one combined daemon/admin executable each):
 
 | Target | Hardware | Validation |
 |--------|----------|------------|
-| `x86_64-linux-musl` | x86_64 servers and VPSes | Prior 0.4.0 Debian baseline; 0.4.1 Debian/Ubuntu SSH log-only and restart checks |
+| `x86_64-linux-musl` | x86_64 servers and VPSes | Prior 0.4.0 Debian baseline; 0.4.1 Debian/Ubuntu SSH checks; 0.4.2 isolated nftables/iptables observation checks |
 | `aarch64-linux-musl` | ARM64 | Cross-build, static inspection and QEMU smoke |
 | `arm-linux-musleabihf` | ARMv7, hard float | Cross-build, static inspection and QEMU smoke |
 | `mips-linux-musleabi` | MIPS32r2, big endian, soft float | Cross-build, static inspection and QEMU smoke |
@@ -185,11 +186,11 @@ Legacy firewall modes and journal ingestion require their documented host tools.
 The release allowlist is exactly:
 
 ```text
-fail2zig-v0.4.1-x86_64-linux-musl
-fail2zig-v0.4.1-aarch64-linux-musl
-fail2zig-v0.4.1-arm-linux-musleabihf
-fail2zig-v0.4.1-mips-linux-musleabi
-fail2zig-v0.4.1-mipsel-linux-musleabi
+fail2zig-v0.4.2-x86_64-linux-musl
+fail2zig-v0.4.2-aarch64-linux-musl
+fail2zig-v0.4.2-arm-linux-musleabihf
+fail2zig-v0.4.2-mips-linux-musleabi
+fail2zig-v0.4.2-mipsel-linux-musleabi
 fail2zig.service
 fail2zig.toml.example
 install.sh
@@ -221,7 +222,7 @@ If you'd rather skip the script:
 ```bash
 # 1. Download the allowlisted release files
 set -euo pipefail
-VERSION=v0.4.1
+VERSION=v0.4.2
 ARCH=x86_64-linux-musl
 BASE="https://github.com/ul0gic/fail2zig/releases/download/${VERSION}"
 for file in \
@@ -471,7 +472,7 @@ bracket a live reload (`ExecReload` sends `SIGHUP`); `STOPPING=1` precedes exit;
 | `unban <ip> --jail <name> [--scope host\|net <cidr>]` | Release a ban |
 | `reload` | Propose the configuration file as a new generation: `noop`, `applied`, `rejected` or `restart_required` |
 | `history [--jail <name>] [--limit <n>] [--cursor <token>]` | Page through confirmed ban history |
-| `firewall show [--limit <n>] [--cursor <token>] [--details]` | Inspect the last sampled fail2zig-owned kernel protection (development version) |
+| `firewall show [--limit <n>] [--cursor <token>] [--details]` | Inspect the last sampled fail2zig-owned kernel protection |
 | `history reset <ip> (--jail <name> \| --all)` | Reset an address's durable history |
 | `jail enable\|disable\|pause\|resume <name>` | Administer one jail |
 | `config` | Effective configuration and generation (redacted for non-administrators) |
@@ -486,7 +487,7 @@ through the 0660 socket; mutations require uid 0 or the daemon uid.
 Exit classes (every command): `0` success · `1` rejected or absent · `2` usage ·
 `3` daemon unavailable · `4` partial (kernel confirmation incomplete) · `5` uncertain.
 
-The development version adds `firewall show` (not available in released 0.4.1):
+Version 0.4.2 adds `firewall show`:
 
 ```bash
 sudo fail2zig firewall show
@@ -507,7 +508,7 @@ installation containing zero entries are distinct results. Successful command ex
 means the query was answered, including when observation data is unavailable.
 Unexpected owned entries are reported without adopting or repairing them.
 
-The development tables also expose jail pause state and ban confirmation, preserve
+The 0.4.2 tables also expose jail pause state and ban confirmation, preserve
 unknown values, and use stacked rows on narrow terminals. Existing plain and JSON
 formats remain suitable for scripts. Scope details preserve protocol sets and port
 ranges, including UDP and network subjects.
@@ -690,8 +691,8 @@ It contains synthetic cases, not a production-log compatibility certification.
 
 Firewall effects are bound to the daemon's current network namespace. The built-in selector uses
 that namespace directly; the daemon does not enter a different namespace. Custom namespace
-selectors or service overrides that move the daemon between network namespaces are not supported
-in 0.4.0.
+selectors and service overrides that move the daemon between network namespaces remain
+unsupported.
 
 ---
 

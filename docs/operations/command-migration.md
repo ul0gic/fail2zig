@@ -54,9 +54,9 @@ as text. The native classes are the contract; the JSON `outcome` field carries t
 
 | fail2ban-client | fail2zig | Exit | JSON |
 |---|---|---|---|
-| `status` | `fail2zig status` | 0 / 3 | object: `version`, `protection`, `active_bans`, `total_bans`, `storage`, `backend`, `generation`, worker and clock flags |
-| `status <jail>` | `fail2zig jails` (all jails) or `fail2zig list --jail <jail>` (bans) | 0 / 3 | `jails`: array of `name`, `enabled`, `paused`, `healthy`, `active_bans`, `maxretry`, `findtime`, `bantime`, `action`, `enforcing`, `source`, `revision` |
-| `get <jail> banip` / `banned` | `fail2zig list [--jail <jail>]` | 0 / 3 | array of active bans |
+| `status` | `fail2zig status [--details]` | 0 / 3 | object: `version`, `protection`, `active_bans`, `total_bans`, `storage`, `backend`, `generation`, worker and clock flags |
+| `status <jail>` | `fail2zig jails [--details]` (all jails) or `fail2zig list --jail <jail> [--details]` (bans) | 0 / 3 | `jails`: array of `name`, `enabled`, `paused`, `healthy`, `active_bans`, `maxretry`, `findtime`, `bantime`, `action`, `enforcing`, `source`, `revision` |
+| `get <jail> banip` / `banned` | `fail2zig list [--jail <jail>] [--details]` | 0 / 3 | array of active bans |
 | `set <jail> banip <ip>` | `fail2zig ban <ip> --jail <jail> [--duration <s>] [--scope host\|net <cidr>]` | 0 / 1 / 4 / 5 | `schema_version` 1, `kind` `ban`, `outcome` `applied\|rejected\|…`, `generation`, `mutation_revision`, `enforced`, `reasons[]` |
 | `set <jail> unbanip <ip>` | `fail2zig unban <ip> --jail <jail> [--scope host\|net <cidr>]` | 0 / 1 / 4 / 5 | `kind` `unban`, otherwise as `ban` |
 | `unban --all` | not supported; loop `fail2zig list --output json` and `unban` per address and jail | | |
@@ -65,6 +65,7 @@ as text. The native classes are the contract; the JSON `outcome` field carries t
 | `set <jail> maxretry\|bantime\|findtime …` | not supported at runtime by design; edit the file, then `fail2zig reload` | | |
 | `start <jail>` / `stop <jail>` | `fail2zig jail enable <jail>` / `fail2zig jail disable <jail>` | 0 / 1 | `kind` `group_enable\|group_disable`, `outcome`, `mutation_revision` |
 | (no equivalent) | `fail2zig jail pause <jail>` / `fail2zig jail resume <jail>` | 0 / 1 | `kind` `group_pause\|group_resume` |
+| (no equivalent) | `fail2zig firewall show [--limit 1..256] [--cursor <token>] [--details]` | 0 / 3 | retained fail2zig-owned observation with bounded `items[]`, optional `structure`, per-item `placement` and `next_cursor` |
 | `get <jail> ...` history queries | `fail2zig history [--jail <jail>] [--limit 1..256] [--cursor <token>]` | 0 / 3 | `schema_version` 1, `generation`, `items[]`, `next_cursor` |
 | `set <jail> unbanip` to forget an address | `fail2zig history reset <ip> (--jail <jail> \| --all)` | 0 / 1 | `kind` `history_reset` |
 | `version` | `fail2zig version` (daemon) / `fail2zig --version` (local) | 0 / 3 | `client_version`, `daemon.daemon_version` |

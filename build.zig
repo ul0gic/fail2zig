@@ -2,7 +2,7 @@
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
 
-const fail2zig_version = "0.4.1";
+const fail2zig_version = "0.4.2";
 
 const CiLane = enum { components_a, components_b, assembled, fuzz, excluded, deferred };
 const CiGates = struct {

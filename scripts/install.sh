@@ -55,7 +55,7 @@ Options:
   -h, --help              Show this help.
 
 Environment overrides:
-  FAIL2ZIG_VERSION        Release tag, e.g. v0.4.1 (default: latest).
+  FAIL2ZIG_VERSION        Release tag, e.g. v0.4.2 (default: latest).
   FAIL2ZIG_REPO           GitHub owner/repo (default: ul0gic/fail2zig).
   FAIL2ZIG_PREFIX         Install prefix (default: /usr/local).
   FAIL2ZIG_CONFIG_DIR     Config directory (default: /etc/fail2zig).

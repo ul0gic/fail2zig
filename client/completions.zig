@@ -184,7 +184,7 @@ const zsh_script =
     \\                        '1:action:(show)' \
     \\                        '--limit[Sample entries per page (1..256)]:limit:' \
     \\                        '--cursor[Continue the same retained observation]:cursor:' \
-    \\                        '--details[Include observation and effect identifiers in table output]' \
+    \\                        '--details[Include verified owned structures, entry placement and identifiers]' \
     \\                        $global_flags ;;
     \\                completions)
     \\                    _arguments '1:shell:(bash zsh fish)' ;;
@@ -292,7 +292,7 @@ const fish_script =
     \\complete -c fail2zig -f -n '__fail2zig_client_using_command firewall' -a 'show' -d 'Show retained firewall observation'
     \\complete -c fail2zig -n '__fail2zig_client_using_command firewall' -l limit  -x -d 'Sample entries per page (1..256)'
     \\complete -c fail2zig -n '__fail2zig_client_using_command firewall' -l cursor -x -d 'Continue the same retained observation'
-    \\complete -c fail2zig -n '__fail2zig_client_using_command firewall' -l details -d 'Include observation and effect identifiers in table output'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command firewall' -l details -d 'Include verified owned structures, entry placement and identifiers'
     \\
     \\# `completions` subcommand: shell argument
     \\complete -c fail2zig -f -n '__fail2zig_client_using_command completions' -a 'bash zsh fish'
