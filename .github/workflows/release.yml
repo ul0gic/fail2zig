@@ -226,7 +226,7 @@ jobs:
                 metadata: {invocationId: ("https://github.com/" + $repo + "/actions/runs/" + $run + "/attempts/" + $attempt)}
               }
             }' > predicate.json
-      - uses: actions/attest@ce27ba3b4a9a139d9a20a4a07d69fabb52f1e5bc
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
           subject-path: package/*
           predicate-type: https://slsa.dev/provenance/v1
