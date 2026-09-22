@@ -570,6 +570,59 @@ test "native firewall: isolated finite retry retains original deadline and expir
         release.deinit();
     }
 }
+const BetweenReads = struct {
+    var wait_until_us: i64 = 0;
+    var remove_v6: bool = false;
+    var failed: bool = false;
+    fn run(reader: *inspection.Inspector) void {
+        if (!remove_v6) {
+            const delta = wait_until_us - std.time.microTimestamp();
+            if (delta > 0) std.Thread.sleep(@as(u64, @intCast(delta)) * std.time.ns_per_us);
+            return;
+        }
+        var name_buf: [28]u8 = undefined;
+        const name = reader.installation.name(&name_buf);
+        var set_buf: [31]u8 = undefined;
+        const set = std.fmt.bufPrint(&set_buf, "{s}_6", .{name}) catch {
+            failed = true;
+            return;
+        };
+        const argv: []const []const u8 = if (reader.installation.transport == .nftables)
+            &.{ "/usr/sbin/nft", "delete", "element", "inet", name, "banned_ipv6", "{", "2001:db8::7", "}" }
+        else
+            &.{ reader.ipset_path, "del", set, "2001:db8::7" };
+        fixtureCommand(argv) catch {
+            failed = true;
+        };
+    }
+};
+
+test "native firewall: isolated readback accepts kernel expiry between passes and refuses early removal" {
+    const transport = try isolatedTransport();
+    if (transport == .iptables) return error.SkipZigTest;
+    var reader = try admissionReader(transport);
+    defer reader.close();
+    var admitted = try reader.admitInstallation(intentFor(&reader));
+    admitted.deinit();
+    const deadline = std.time.microTimestamp() + 2_000_000;
+    var expiring = try applyVerified(&reader, try effectToken(&reader, false, .{ .ensure_present = .{ .finite_deadline_us = deadline } }));
+    expiring.deinit();
+    var lasting = try applyVerified(&reader, try effectToken(&reader, true, .{ .ensure_present = .{ .finite_deadline_us = deadline + 60_000_000 } }));
+    lasting.deinit();
+    BetweenReads.wait_until_us = deadline + 1_100_000;
+    BetweenReads.remove_v6 = false;
+    reader.test_between_reads = BetweenReads.run;
+    defer reader.test_between_reads = null;
+    var after = try reader.inspect();
+    defer after.deinit();
+    try std.testing.expectEqual(@as(usize, 1), after.entries.len);
+    try std.testing.expectEqual(.ipv6, std.meta.activeTag(after.entries[0].address));
+    try std.testing.expectEqual(.exact_v1, after.structure_proof);
+    BetweenReads.remove_v6 = true;
+    try std.testing.expectError(error.Changed, reader.inspect());
+    try std.testing.expect(!BetweenReads.failed);
+}
+
 test "native firewall: isolated fresh authority inspects selected transport without unrelated tools" {
     _ = try isolatedTransport();
     var reader = try admissionReader(.nftables);

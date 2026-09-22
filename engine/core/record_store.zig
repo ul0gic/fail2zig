@@ -143,7 +143,7 @@ fn sqliteError(rc: c_int) Error {
         else => error.DatabaseFailure,
     };
 }
-pub const CommitStage = enum { before_admin_schema_commit, before_migration_schema_commit, after_admin_request, after_migration_step_intent, after_migration_step_outcome, before_migration_activation_commit, before_policy_transition_commit, before_config_generation_commit, before_config_generation_publish, before_action_target_schema_commit, after_action_target_intent, before_action_target_dispatch_commit, before_action_target_settlement_commit, before_history_reset_schema_commit, after_history_reset, before_canonical_effect_schema_commit, after_history_detail_delete, after_history_event_delete, before_escalation_schema_commit, before_application_history_schema_commit, before_cleanup_schema_commit, before_retry_lease_schema_commit, after_cleanup_mark, before_cleanup_escalation_delete, after_cleanup_escalation_delete, before_cleanup_retry_delete, after_cleanup_retry_delete, after_cleanup_delete, before_cleanup_commit, after_retry_retire, before_maintenance_schema_commit, after_source_sequence, after_replay_guard, after_record, after_checkpoint, after_shared_checkpoint, before_commit, before_receipt_commit, after_receipt_commit, after_receipt_delete, before_receipt_schema_commit, before_native_time_schema_commit, before_inference_schema_commit, before_detection_schema_commit, after_detection, before_clock_schema_commit, before_journal_detection_schema_commit, before_retry_schema_commit, after_retry_state, after_retry_decision, before_consumer_schema_commit, after_consumer_delta, before_effect_schema_commit, after_effect_owner, after_effect_intent, before_effect_dispatch_commit, before_effect_receipt_commit, before_manifest_schema_commit, before_manifest_commit, after_manifest_ready, before_consumer_input_commit };
+pub const CommitStage = enum { after_retry_detail_prune, before_admin_schema_commit, before_migration_schema_commit, after_admin_request, after_migration_step_intent, after_migration_step_outcome, before_migration_activation_commit, before_policy_transition_commit, before_config_generation_commit, before_config_generation_publish, before_action_target_schema_commit, after_action_target_intent, before_action_target_dispatch_commit, before_action_target_settlement_commit, before_history_reset_schema_commit, after_history_reset, before_canonical_effect_schema_commit, after_history_detail_delete, after_history_event_delete, before_escalation_schema_commit, before_application_history_schema_commit, before_cleanup_schema_commit, before_retry_lease_schema_commit, after_cleanup_mark, before_cleanup_escalation_delete, after_cleanup_escalation_delete, before_cleanup_retry_delete, after_cleanup_retry_delete, after_cleanup_delete, before_cleanup_commit, after_retry_retire, before_maintenance_schema_commit, after_source_sequence, after_replay_guard, after_record, after_checkpoint, after_shared_checkpoint, before_commit, before_receipt_commit, after_receipt_commit, after_receipt_delete, before_receipt_schema_commit, before_native_time_schema_commit, before_inference_schema_commit, before_detection_schema_commit, after_detection, before_clock_schema_commit, before_journal_detection_schema_commit, before_retry_schema_commit, after_retry_state, after_retry_decision, before_consumer_schema_commit, after_consumer_delta, before_effect_schema_commit, after_effect_owner, after_effect_intent, before_effect_dispatch_commit, before_effect_receipt_commit, before_manifest_schema_commit, before_manifest_commit, after_manifest_ready, before_consumer_input_commit };
 pub const Limits = struct {
     pub const pending_receipts = 4096;
     pub const checkpoint_bytes = 16 * 1024 * 1024;
@@ -1060,6 +1060,13 @@ pub const Store = struct {
             \\CREATE TRIGGER policy_summary_retired_update AFTER UPDATE ON retry_retired BEGIN UPDATE policy_summary_clock SET revision=revision+1 WHERE id=1; END;
             \\CREATE TRIGGER policy_summary_retired_delete AFTER DELETE ON retry_retired BEGIN UPDATE policy_summary_clock SET revision=revision+1 WHERE id=1; END;
             \\PRAGMA user_version=17;
+        );
+        // Both are lookup keys for bounded detail reclamation. This additive
+        // index change is safe for existing schema-17..23 databases and older
+        // binaries; no stored record or checkpoint format changes.
+        try self.exec(
+            \\CREATE INDEX IF NOT EXISTS effect_owners_decision ON effect_owners(jail,decision_id);
+            \\CREATE INDEX IF NOT EXISTS confirmed_effect_events_decision ON confirmed_effect_events(jail,decision_id);
         );
         try self.fault(.before_application_history_schema_commit);
         try self.commitTransaction();
@@ -3212,6 +3219,63 @@ pub const Store = struct {
         }
     };
 
+    // Details are copied into confirmed_event_details at confirmation. Keep the
+    // original while a current owner or retained event can still consume it.
+    // One transaction removes at most 32 rows and 2 MiB of stored fields.
+    fn pruneRetryDecisionDetailsTx(self: *Store) Error!usize {
+        // A fully retained 65,536-row table takes more than the ordinary
+        // statement budget to prove that no row is eligible. The table cap and
+        // indexed decision lookups bound this scan; keep the larger allowance
+        // local to this operation.
+        const prior_work = self.work_remaining;
+        if (self.runtime_limits) self.work_remaining = 5000;
+        defer {
+            if (self.runtime_limits) self.work_remaining = prior_work;
+        }
+        const query: [:0]const u8 = if (self.schema_version >= 21)
+            "SELECT d.rowid,length(CAST(d.jail AS BLOB))+length(CAST(d.source AS BLOB))+length(CAST(d.occurrence AS BLOB))+length(d.subject)+coalesce(length(d.effect_decision_id),0)+coalesce(length(CAST(d.evidence AS BLOB)),0)+24 FROM retry_decision_details d WHERE d.effect_decision_id IS NULL OR (NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.jail=d.jail AND o.decision_id=d.effect_decision_id) AND NOT EXISTS(SELECT 1 FROM confirmed_effect_events e WHERE e.jail=d.jail AND e.decision_id=d.effect_decision_id) AND NOT EXISTS(SELECT 1 FROM action_targets a WHERE a.action_id=d.effect_decision_id AND a.status IN(1,2,5))) ORDER BY d.rowid LIMIT 32;"
+        else
+            "SELECT d.rowid,length(CAST(d.jail AS BLOB))+length(CAST(d.source AS BLOB))+length(CAST(d.occurrence AS BLOB))+length(d.subject)+coalesce(length(d.effect_decision_id),0)+coalesce(length(CAST(d.evidence AS BLOB)),0)+24 FROM retry_decision_details d WHERE d.effect_decision_id IS NULL OR (NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.jail=d.jail AND o.decision_id=d.effect_decision_id) AND NOT EXISTS(SELECT 1 FROM confirmed_effect_events e WHERE e.jail=d.jail AND e.decision_id=d.effect_decision_id)) ORDER BY d.rowid LIMIT 32;";
+        var ids: [32]i64 = undefined;
+        var count: usize = 0;
+        var bytes: usize = 0;
+        {
+            var rows = try self.statement(query);
+            defer rows.deinit();
+            while (try rows.row()) {
+                const id = try rows.signed(0);
+                const row_bytes = try rows.signed(1);
+                if (id <= 0 or row_bytes <= 0) return error.InvalidApplicationHistoryRow;
+                const size = std.math.cast(usize, row_bytes) orelse return error.StorageLimit;
+                if (size > 2 * 1024 * 1024) return error.StorageLimit;
+                if (size > 2 * 1024 * 1024 - bytes) break;
+                ids[count] = id;
+                count += 1;
+                bytes += size;
+            }
+        }
+        if (count == 0) return 0;
+        var remove = try self.statement("DELETE FROM retry_decision_details WHERE rowid=?1;");
+        defer remove.deinit();
+        for (ids[0..count]) |id| {
+            try remove.int(1, id);
+            try remove.done();
+            if (self.api.changes(self.db) != 1) return error.InvalidApplicationHistoryRow;
+            try remove.reset();
+        }
+        try self.fault(.after_retry_detail_prune);
+        return count;
+    }
+
+    pub fn pruneRetryDecisionDetailsOne(self: *Store) Error!bool {
+        if (self.schema_version < 17) return false;
+        try self.beginWrite();
+        errdefer self.rollback();
+        const deleted = try self.pruneRetryDecisionDetailsTx();
+        try self.commitTransaction();
+        return deleted != 0;
+    }
+
     pub fn cleanupConfirmedHistoryOne(self: *Store, policy: HistoryRetention, now_us: i64) Error!bool {
         try policy.validate();
         try self.beginWrite();
@@ -3312,6 +3376,70 @@ pub const Store = struct {
         try stream.done();
         if (self.api.changes(self.db) != 1) return error.HistoryGap;
         try self.commitTransaction();
+        return true;
+    }
+    /// A scope whose current owner still has an unsettled action outcome, if any.
+    pub fn unsettledActionScope(self: *Store) Error!?effects.Hash {
+        if (self.schema_version < 21) return null;
+        var row = try self.statement("SELECT a.scope_key FROM action_targets a JOIN effect_owners o ON o.scope_key=a.scope_key AND o.decision_id=a.action_id WHERE a.status IN(1,2,5) LIMIT 1;");
+        defer row.deinit();
+        if (!try row.row()) return null;
+        return try effectBlob(&row, 0, 32);
+    }
+    /// Removes one bounded step of a spent enforcement scope. A scope is spent when its
+    /// desired lease and current intent are absent, no owner holds a lease, no retained
+    /// confirmed event references it and no intent or action target is unsettled.
+    /// Without this, scopes accumulate for the life of the database until the fixed
+    /// effect capacities refuse new decisions. Child rows go in chunks; the final step
+    /// removes owners, the current intent and the scope row together and invalidates
+    /// the published effect view.
+    pub fn pruneSpentEffectOne(self: *Store) Error!bool {
+        if (self.schema_version < 13) return false;
+        try self.beginWrite();
+        errdefer self.rollback();
+        var candidate = try self.statement(if (self.schema_version >= 21)
+            "SELECT n.scope_key,n.intent_id FROM native_effects n JOIN effect_intents i ON i.intent_id=n.intent_id WHERE n.lease_kind=0 AND i.status=4 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=n.scope_key AND o.lease_kind<>0) AND NOT EXISTS(SELECT 1 FROM confirmed_effect_events e WHERE e.scope_key=n.scope_key) AND NOT EXISTS(SELECT 1 FROM action_targets a WHERE a.scope_key=n.scope_key AND a.status IN(1,2,5)) AND NOT EXISTS(SELECT 1 FROM effect_intents p WHERE p.scope_key=n.scope_key AND p.status IN(1,2)) ORDER BY n.scope_key LIMIT 1;"
+        else
+            "SELECT n.scope_key,n.intent_id FROM native_effects n JOIN effect_intents i ON i.intent_id=n.intent_id WHERE n.lease_kind=0 AND i.status=4 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=n.scope_key AND o.lease_kind<>0) AND NOT EXISTS(SELECT 1 FROM confirmed_effect_events e WHERE e.scope_key=n.scope_key) AND NOT EXISTS(SELECT 1 FROM effect_intents p WHERE p.scope_key=n.scope_key AND p.status IN(1,2)) ORDER BY n.scope_key LIMIT 1;");
+        defer candidate.deinit();
+        if (!try candidate.row()) {
+            try self.commitTransaction();
+            return false;
+        }
+        const scope_key = try effectBlob(&candidate, 0, 32);
+        const current = try effectBlob(&candidate, 1, 32);
+        const chunks = [_][:0]const u8{
+            "DELETE FROM effect_observations WHERE rowid IN (SELECT o.rowid FROM effect_intents i JOIN effect_observations o ON o.intent_id=i.intent_id WHERE i.scope_key=?1 LIMIT 256);",
+            "DELETE FROM effect_intents WHERE rowid IN (SELECT rowid FROM effect_intents WHERE scope_key=?1 AND intent_id<>?2 LIMIT 256);",
+            "DELETE FROM effect_owner_revisions WHERE rowid IN (SELECT h.rowid FROM effect_owner_revisions h WHERE h.scope_key=?1 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=h.scope_key AND o.jail=h.jail AND o.revision=h.revision) LIMIT 256);",
+            "DELETE FROM action_targets WHERE rowid IN (SELECT rowid FROM action_targets WHERE scope_key=?1 LIMIT 256);",
+        };
+        for (chunks, 0..) |sql, index| {
+            if (index == 3 and self.schema_version < 21) break;
+            var chunk = try self.statement(sql);
+            defer chunk.deinit();
+            try chunk.blob(1, &scope_key);
+            if (index == 1) try chunk.blob(2, &current);
+            try chunk.done();
+            if (self.api.changes(self.db) != 0) {
+                try self.commitTransaction();
+                return true;
+            }
+        }
+        for ([_][:0]const u8{
+            "DELETE FROM effect_owner_revisions WHERE scope_key=?1;",
+            "DELETE FROM effect_owners WHERE scope_key=?1;",
+            "DELETE FROM effect_intents WHERE scope_key=?1;",
+            "DELETE FROM native_effects WHERE scope_key=?1;",
+        }) |sql| {
+            var final = try self.statement(sql);
+            defer final.deinit();
+            try final.blob(1, &scope_key);
+            try final.done();
+        }
+        if (self.api.changes(self.db) != 1) return error.InvalidEffect;
+        try self.advanceEffectSnapshot();
+        try self.commitEffectTransaction(true);
         return true;
     }
     fn canonicalHistoryManifest(manifest: consumers.Manifest) bool {
@@ -5216,7 +5344,9 @@ pub const Store = struct {
                 }
             }
             if (self.schema_version >= 17) {
-                if (try self.integer("SELECT count(*) FROM retry_decision_details;") >= application_history.max_details) return error.HistoryCapacity;
+                if (try self.integer("SELECT count(*) FROM retry_decision_details;") >= application_history.max_details) {
+                    if (try self.pruneRetryDecisionDetailsTx() == 0) return error.HistoryCapacity;
+                }
                 var detail = try self.statement("INSERT INTO retry_decision_details(jail,family,subject,source,occurrence,ordinal,decided_us,effect_decision_id,evidence) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9);");
                 defer detail.deinit();
                 try detail.text(1, record.jail);
@@ -6138,6 +6268,12 @@ const Stmt = struct {
     }
     fn done(self: *Stmt) Error!void {
         if (try self.row()) return error.DatabaseFailure;
+    }
+    fn reset(self: *Stmt) Error!void {
+        const resetStatement = @extern(*const fn (*Statement) callconv(.c) c_int, .{ .name = "sqlite3_reset" });
+        const clearBindings = @extern(*const fn (*Statement) callconv(.c) c_int, .{ .name = "sqlite3_clear_bindings" });
+        try self.store.check(resetStatement(self.ptr));
+        try self.store.check(clearBindings(self.ptr));
     }
     fn boundedBytes(self: *Stmt, column: c_int, maximum: usize) Error![]const u8 {
         const value = try self.bytes(column);

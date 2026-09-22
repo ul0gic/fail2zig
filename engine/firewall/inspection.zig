@@ -256,6 +256,8 @@ pub const Inspector = struct {
     retained_bytes: usize = 0,
     live_bytes: usize = 0,
     test_fault_after_mutations: if (@import("builtin").is_test) ?usize else void = if (@import("builtin").is_test) null else {},
+    test_fault_readback: if (@import("builtin").is_test) ?Error else void = if (@import("builtin").is_test) null else {},
+    test_between_reads: if (@import("builtin").is_test) ?*const fn (*Inspector) void else void = if (@import("builtin").is_test) null else {},
 
     pub fn open(allocator: mem.Allocator, installation: Installation, limits: Limits) Error!Inspector {
         try installation.validate();
@@ -364,8 +366,10 @@ pub const Inspector = struct {
             before.deinit();
             return error.InvalidInstallation;
         }
-        const existing = try findEntry(before.entries, token.scope, token.effect_id);
-        const other_hash = otherEntriesHash(before.entries, token.scope);
+        const existing = findEntry(before.entries, token.scope, token.effect_id) catch |err| {
+            before.deinit();
+            return err;
+        };
         const noop = switch (token.operation) {
             .ensure_absent => existing == null,
             .ensure_present => |lease| if (existing) |entry| if (entry.scope != null)
@@ -385,11 +389,12 @@ pub const Inspector = struct {
             return err;
         };
         if (noop) return .{ .verified = .{ .snapshot = before, .changed = false, .observed_wall_us = before_end } };
-        before.deinit();
+        defer before.deinit();
         const units = try deadlineUnits(token.operation, timingTransport(self.installation.transport, token.scope), try clockAt(clock, &elapsed));
         var phase = std.time.Timer.start() catch return error.SystemError;
         self.work_messages = 0;
-        self.retained_bytes = 0;
+        self.retained_bytes = before.entries.len * @sizeOf(Entry);
+        defer self.retained_bytes = 0;
         self.live_bytes = 0;
         var progress = MutationProgress{};
         self.mutateExact(token, existing, units, &phase, &progress) catch |err| return .{ .uncertain = self.failure(.effect_dispatch, err, progress) };
@@ -403,7 +408,7 @@ pub const Inspector = struct {
             after.deinit();
             return .{ .uncertain = self.failure(.effect_verify, err, progress) };
         };
-        if (after.state != .owned or !mem.eql(u8, &other_hash, &otherEntriesHash(after.entries, token.scope)) or
+        if (after.state != .owned or !sameEntries(before.entries, after.entries, token.scope, elapsed.read(), self.installation.transport) or
             !effectMatches(token.operation, self.installation.transport, after_entry, observation_start, observation_end))
         {
             after.deinit();
@@ -656,27 +661,30 @@ pub const Inspector = struct {
     }
 
     pub fn inspect(self: *Inspector) Error!Snapshot {
+        if (comptime @import("builtin").is_test) {
+            if (self.test_fault_readback) |fault| return fault;
+        }
         self.work_messages = 0;
-        self.retained_bytes = 0;
-        defer self.retained_bytes = 0;
+        // Bytes of a snapshot the caller still holds stay charged against the limit.
+        const held = self.retained_bytes;
+        defer self.retained_bytes = held;
         var timer = std.time.Timer.start() catch return error.SystemError;
         var first = try self.readOnce(&timer);
-        defer first.deinit();
-        self.retained_bytes = first.entries.len * @sizeOf(Entry);
-        var second = try self.readOnce(&timer);
-        errdefer second.deinit();
-        if (first.entries.len != second.entries.len or !mem.eql(u8, &first.fingerprint, &second.fingerprint)) return error.Changed;
-        for (first.entries, second.entries) |before, after| {
-            if (!std.meta.eql(entryScope(before), entryScope(after)) or !std.meta.eql(before.effect_id, after.effect_id) or before.deadline_us != after.deadline_us) return error.Changed;
-            if (before.remaining_ms) |remaining| {
-                if ((after.remaining_ms orelse return error.Changed) > remaining) return error.Changed;
-            }
+        defer first.snapshot.deinit();
+        self.retained_bytes = held + first.snapshot.entries.len * @sizeOf(Entry);
+        if (comptime @import("builtin").is_test) {
+            if (self.test_between_reads) |hook| hook(self);
         }
-        second.structure_proof = if (second.state == .owned) .exact_v1 else .unverified;
-        second.observed_start_ns = first.observed_start_ns;
-        return second;
+        var second = try self.readOnce(&timer);
+        errdefer second.snapshot.deinit();
+        if (!mem.eql(u8, &first.structure, &second.structure)) return error.Changed;
+        if (!sameEntries(first.snapshot.entries, second.snapshot.entries, null, second.snapshot.observed_end_ns - first.snapshot.observed_start_ns, self.installation.transport)) return error.Changed;
+        second.snapshot.structure_proof = if (second.snapshot.state == .owned) .exact_v1 else .unverified;
+        second.snapshot.observed_start_ns = first.snapshot.observed_start_ns;
+        return second.snapshot;
     }
-    fn readOnce(self: *Inspector, timer: *std.time.Timer) Error!Snapshot {
+    const Reading = struct { snapshot: Snapshot, structure: [32]u8 };
+    fn readOnce(self: *Inspector, timer: *std.time.Timer) Error!Reading {
         var limits = self.limits;
         if (self.retained_bytes >= limits.max_bytes) return error.LimitExceeded;
         limits.max_bytes -= self.retained_bytes;
@@ -688,7 +696,8 @@ pub const Inspector = struct {
             .iptables, .ipset => try readTools(self, &builder, timer),
         }
         try self.checkTime(timer);
-        return builder.finish(start, timer.read());
+        const structure = builder.structureDigest();
+        return .{ .snapshot = try builder.finish(start, timer.read()), .structure = structure };
     }
     fn checkTime(self: *Inspector, timer: *std.time.Timer) Error!void {
         _ = try self.remainingMs(timer);
@@ -793,20 +802,49 @@ fn findEntry(entries: []const Entry, scope: CanonicalScope, effect_id: [32]u8) E
     }
     return null;
 }
-fn otherEntriesHash(entries: []const Entry, except: CanonicalScope) [32]u8 {
-    var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    for (entries) |entry| {
-        const candidate = entryScope(entry);
-        if (std.meta.eql(candidate, except)) continue;
-        const bytes = candidate.encode() catch continue;
-        hash.update(&bytes);
-        hash.update(&.{ @intFromBool(entry.remaining_ms != null), @intFromBool(entry.deadline_us != null), @intFromBool(entry.effect_id != null) });
-        if (entry.deadline_us) |deadline| hash.update(mem.asBytes(&deadline));
-        if (entry.effect_id) |identity| hash.update(&identity);
+/// Kernel set-element timeouts equal the ban deadline, so the kernel removes an element
+/// on schedule without any mutation by us. Two sorted readbacks describe the same owned
+/// state when every entry matches, except that an element whose remaining timeout could
+/// have elapsed within `window_ns` may be missing from the later one. Any other added,
+/// missing or altered entry is a change and must not be accepted as ownership proof.
+fn sameEntries(before: []const Entry, after: []const Entry, except: ?CanonicalScope, window_ns: u64, transport: Transport) bool {
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < before.len or j < after.len) {
+        if (except) |scope| {
+            if (i < before.len and std.meta.eql(entryScope(before[i]), scope)) {
+                i += 1;
+                continue;
+            }
+            if (j < after.len and std.meta.eql(entryScope(after[j]), scope)) {
+                j += 1;
+                continue;
+            }
+        }
+        if (i == before.len) return false;
+        if (j == after.len or entryLess({}, before[i], after[j])) {
+            if (!expiredWithin(before[i], window_ns, transport)) return false;
+            i += 1;
+            continue;
+        }
+        const old = before[i];
+        const new = after[j];
+        if (!std.meta.eql(entryScope(old), entryScope(new)) or !std.meta.eql(old.effect_id, new.effect_id) or
+            old.deadline_us != new.deadline_us or (old.remaining_ms == null) != (new.remaining_ms == null)) return false;
+        if (old.remaining_ms) |remaining| if (new.remaining_ms.? > remaining) return false;
+        i += 1;
+        j += 1;
     }
-    var result: [32]u8 = undefined;
-    hash.final(&result);
-    return result;
+    return true;
+}
+fn expiredWithin(entry: Entry, window_ns: u64, transport: Transport) bool {
+    const remaining = entry.remaining_ms orelse return false;
+    const remaining_us = std.math.mul(u64, remaining, 1000) catch return false;
+    return remaining_us <= window_ns / std.time.ns_per_us +| 1 +| timeoutToleranceUs(transport);
+}
+/// ipset reports whole seconds and nftables reports milliseconds at jiffy granularity.
+fn timeoutToleranceUs(transport: Transport) u64 {
+    return if (transport == .ipset) 1_000_000 else 10_000;
 }
 fn effectMatches(operation: EffectOperation, transport: Transport, entry: ?Entry, start_us: i64, end_us: i64) bool {
     if (operation == .ensure_absent) return entry == null;
@@ -821,7 +859,7 @@ fn effectMatches(operation: EffectOperation, transport: Transport, entry: ?Entry
     const remaining = present.remaining_ms orelse return false;
     const deadline = operation.ensure_present.finite_deadline_us;
     if (deadline <= end_us) return false;
-    const tolerance: u64 = if (transport == .ipset) 1_000_000 else 10_000;
+    const tolerance = timeoutToleranceUs(transport);
     const upper: u64 = @intCast(deadline - start_us);
     const lower: u64 = @intCast(deadline - end_us);
     const observed = std.math.mul(u64, remaining, 1000) catch return false;
@@ -854,6 +892,14 @@ const Builder = struct {
             try self.entries.ensureTotalCapacityPrecise(capacity);
         }
         self.entries.appendAssumeCapacity(e);
+    }
+    /// Tables, chains, sets, rules and markers only; entries are compared separately.
+    fn structureDigest(self: *const Builder) [32]u8 {
+        var structure = self.topology;
+        structure.update(&.{@intFromBool(self.present)});
+        var digest: [32]u8 = undefined;
+        structure.final(&digest);
+        return digest;
     }
     fn finish(self: *Builder, start: u64, end: u64) Error!Snapshot {
         mem.sort(Entry, self.entries.items, {}, entryLess);
@@ -1691,4 +1737,46 @@ test "native firewall: reserved inventory refuses incomplete framing and all leg
     try std.testing.expectError(error.Incomplete, scanSavedTables("COMMIT\n"));
     try std.testing.expectError(error.ForeignState, scanSavedTables("*mangle\n:FAIL2ZIG-old - [0:0]\nCOMMIT\n"));
     try std.testing.expectError(error.ForeignState, scanSavedTables("*filter\n:f2z_lost - [0:0]\nCOMMIT\n"));
+}
+
+test "native firewall: readback comparison accepts only scheduled kernel expiry" {
+    const t = std.testing;
+    const window = 2 * std.time.ns_per_ms;
+    const expiring = Entry{ .address = try shared.IpAddress.parse("192.0.2.1"), .remaining_ms = 5 };
+    const lasting = Entry{ .address = try shared.IpAddress.parse("192.0.2.2"), .remaining_ms = 60_000 };
+    const permanent = Entry{ .address = try shared.IpAddress.parse("192.0.2.3") };
+    const newcomer = Entry{ .address = try shared.IpAddress.parse("192.0.2.4"), .remaining_ms = 60_000 };
+    var before = [_]Entry{ expiring, lasting, permanent };
+    mem.sort(Entry, &before, {}, entryLess);
+    try t.expect(sameEntries(&before, &before, null, window, .nftables));
+    var expired = [_]Entry{ lasting, permanent };
+    mem.sort(Entry, &expired, {}, entryLess);
+    try t.expect(sameEntries(&before, &expired, null, window, .nftables));
+    var removed = [_]Entry{ expiring, permanent };
+    mem.sort(Entry, &removed, {}, entryLess);
+    try t.expect(!sameEntries(&before, &removed, null, window, .nftables));
+    var no_timeout_gone = [_]Entry{ expiring, lasting };
+    mem.sort(Entry, &no_timeout_gone, {}, entryLess);
+    try t.expect(!sameEntries(&before, &no_timeout_gone, null, window, .nftables));
+    var added = [_]Entry{ expiring, lasting, permanent, newcomer };
+    mem.sort(Entry, &added, {}, entryLess);
+    try t.expect(!sameEntries(&before, &added, null, window, .nftables));
+    var extended = before;
+    for (&extended) |*entry| {
+        if (entry.remaining_ms != null and entry.remaining_ms.? == 60_000) entry.remaining_ms = 60_001;
+    }
+    try t.expect(!sameEntries(&before, &extended, null, window, .nftables));
+    var rebound = before;
+    for (&rebound) |*entry| {
+        if (entry.remaining_ms == null) entry.effect_id = [_]u8{0x42} ** 32;
+    }
+    try t.expect(!sameEntries(&before, &rebound, null, window, .nftables));
+    try t.expect(sameEntries(&before, &added, entryScope(newcomer), window, .nftables));
+    try t.expect(sameEntries(&before, &removed, entryScope(lasting), window, .nftables));
+
+    const whole_second = [_]Entry{.{ .address = try shared.IpAddress.parse("192.0.2.5"), .remaining_ms = 1000 }};
+    const two_seconds = [_]Entry{.{ .address = try shared.IpAddress.parse("192.0.2.6"), .remaining_ms = 2000 }};
+    try t.expect(sameEntries(&whole_second, &.{}, null, window, .ipset));
+    try t.expect(!sameEntries(&whole_second, &.{}, null, window, .nftables));
+    try t.expect(!sameEntries(&two_seconds, &.{}, null, window, .ipset));
 }

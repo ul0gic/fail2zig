@@ -453,6 +453,32 @@ test "native daemon: file retry history and original decision deadline survive g
     try t.expectError(error.FileNotFound, std.fs.cwd().access(sidecar, .{}));
 }
 
+test "native daemon: ingests a new decision after obsolete detail capacity is reclaimed" {
+    if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") != null) return error.SkipZigTest;
+    var h = try harness.Harness.init(t.allocator, .{ .spawn_daemon = false });
+    defer h.deinit();
+    try writeEscalationCleanupConfig(&h);
+    try h.startDaemon();
+    try waitReady(&h);
+    try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try h.stopDaemon());
+    {
+        var store = try engine.native_store_mod.Store.open(t.allocator, h.state_path);
+        defer store.close();
+        try store.inspectExec("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<65536) INSERT INTO retry_decision_details SELECT 'unused','file',CAST(x AS TEXT),4,X'C0000201',x,100,NULL,NULL FROM n;");
+        try t.expectEqual(@as(i64, 65536), try store.inspectInteger("SELECT count(*) FROM retry_decision_details;"));
+    }
+    try h.startDaemon();
+    try waitReady(&h);
+    try h.writeLine(failure);
+    try waitStatus(&h, "\"decisions_total\":1");
+    try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try h.stopDaemon());
+    var store = try engine.native_store_mod.Store.openReadOnly(t.allocator, h.state_path);
+    defer store.close();
+    try t.expect(try store.inspectInteger("SELECT count(*) FROM retry_decision_details;") < 65536);
+    try t.expectEqual(@as(i64, 1), try store.inspectInteger("SELECT count(*) FROM retry_decision_details WHERE jail='sshd';"));
+    try t.expectEqual(@as(i64, 0), try store.inspectInteger("SELECT count(*) FROM pragma_foreign_key_check;"));
+}
+
 test "native daemon: schema23 resumes marked escalated cleanup and continues ingestion" {
     const enforcing = std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") != null;
     if (enforcing) try enterNestedNetworkNamespace();

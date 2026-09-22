@@ -1,6 +1,6 @@
 # Runtime architecture
 
-fail2zig 0.4.3 is one native executable containing the daemon, administration commands, rule
+fail2zig 0.4.4 is one native executable containing the daemon, administration commands, rule
 testing and migration tools. Zig application code statically embeds pinned upstream SQLite C.
 Runtime installation does not require Python, a SQLite service, the SQLite CLI or a shared SQLite
 library.
@@ -112,6 +112,14 @@ administrative frames have explicit limits. Critical receipts, active owners and
 intent are not evicted to satisfy a ceiling. Exhaustion pauses new admission or reports degraded
 health instead of silently losing protection.
 
+Spent enforcement records are removed in bounded background steps: a banned scope qualifies once
+its owners no longer hold a lease, the kernel entry is confirmed absent, no firewall work or action
+outcome is unsettled and its confirmed history has aged past the history retention (one day by
+default). Active and permanent bans and retained history are kept.
+Retry decision details are reclaimed separately once no current owner, retained
+confirmed event or unsettled action needs them. Cleanup is bounded by rows and
+stored bytes; the 65,536-row admission limit still applies to retained details.
+
 The default configuration admits at most 64 enabled jails, eight file incarnations per jail and
 4,096 live retry subjects across enabled jails. Native reservation checks cover configured memory
 and descriptor budgets. SQLite uses a separate bounded heap and page limit; required history and
@@ -127,7 +135,9 @@ Complete readback, sample truncation, inventory membership and durable confirmat
 remain separate facts.
 
 A fixed `exact_v1` structure proof is attached only after two complete matching
-inspector passes establish the owned installation. Cache metadata carries that
+inspector passes establish the owned installation. The passes may differ only by
+set elements whose kernel timeout could have elapsed between them; any other
+difference is a change and leaves enforcement uncertain. Cache metadata carries that
 proof with the observation; failures retain it and absent observations clear it.
 The query projects only the validated scaffold (tables, chains, sets, attachment
 and base rules), plus a chain/set placement for each sampled entry. Dynamic scope

@@ -47,6 +47,7 @@ const sd_notify = @import("core/sd_notify.zig");
 const log_target = @import("core/log_target.zig");
 const max_jails = 64;
 const max_sources_per_jail = 8;
+const recovery_validation_budget_ns = 100 * std.time.ns_per_ms;
 const max_subjects_total = 4096;
 
 fn notifyReloadReady(report: readiness.Report, notifier: anytype) void {
@@ -348,7 +349,9 @@ pub const Coordinator = struct {
     worker_observation: health.WorkerObservation = .{},
     maintenance_validation: durable.Store.MaintenanceValidation = .{},
     maintenance_validated: bool = false,
+    ownership_fenced: bool = false,
     maintenance_jail: usize = 0,
+    detail_prune_wait: u8 = 0,
     mutex: std.Thread.Mutex = .{},
     stop_mutex: std.Thread.Mutex = .{},
     wake: std.Thread.Condition = .{},
@@ -1654,6 +1657,7 @@ pub const Coordinator = struct {
             self.recovery_generation = generation;
             self.restore_jail = 0;
             self.verify_jail = 0;
+            self.ownership_fenced = false;
             self.rebuild_phase = .maintenance;
             if (self.gate.snapshot().has_been_healthy) {
                 self.maintenance_validation = .{};
@@ -1671,7 +1675,12 @@ pub const Coordinator = struct {
                 return self.rebuild_phase == .done;
             },
             .ownership => {
-                try self.store.finishMaintenanceValidation(&self.maintenance_validation);
+                // Later ownership turns drain confirmed history into recidive records,
+                // advancing the maintenance revision; the sources step revalidates it.
+                if (!self.ownership_fenced) {
+                    try self.store.finishMaintenanceValidation(&self.maintenance_validation);
+                    self.ownership_fenced = true;
+                }
                 try self.ensureEffects();
                 if (self.effects) |manager| {
                     var bindings: [max_jails]effect_runtime.Binding = undefined;
@@ -1784,12 +1793,22 @@ pub const Coordinator = struct {
         if (self.dns) |value| value.destroy();
         self.dns = null;
     }
+    /// One 16-row page per 100 ms worker tick made populated-state recovery take
+    /// minutes. Pages stay separate bounded read transactions; the time bound keeps
+    /// health publication and stop handling responsive between worker turns.
+    fn validateMaintenancePages(self: *Coordinator) !bool {
+        var timer = std.time.Timer.start() catch return self.store.validateMaintenanceTurn(&self.maintenance_validation);
+        while (!try self.store.validateMaintenanceTurn(&self.maintenance_validation)) {
+            if (timer.read() >= recovery_validation_budget_ns) return false;
+        }
+        return true;
+    }
     fn recoverState(ctx: ?*anyopaque) !void {
         const self: *Coordinator = @ptrCast(@alignCast(ctx.?));
         switch (self.rebuild_phase) {
             .maintenance => {
                 if (!self.maintenance_validated) {
-                    if (!try self.store.validateMaintenanceTurn(&self.maintenance_validation)) return;
+                    if (!try self.validateMaintenancePages()) return;
                     try self.store.finishMaintenanceValidation(&self.maintenance_validation);
                     self.maintenance_validated = true;
                 }
@@ -2055,7 +2074,7 @@ pub const Coordinator = struct {
             },
             .final => {
                 if (!self.maintenance_validated) {
-                    if (!try self.store.validateMaintenanceTurn(&self.maintenance_validation)) return;
+                    if (!try self.validateMaintenancePages()) return;
                     self.maintenance_validated = true;
                 }
                 var names: [max_jails][]const u8 = undefined;
@@ -2386,6 +2405,15 @@ pub const Coordinator = struct {
                     self.history_page = null;
                     return;
                 }
+                if (self.detail_prune_wait != 0) {
+                    self.detail_prune_wait -= 1;
+                } else if (try self.store.pruneRetryDecisionDetailsOne()) {
+                    return;
+                } else {
+                    // Avoid repeatedly scanning a full table of still-live details.
+                    self.detail_prune_wait = 63;
+                }
+                if (try self.store.pruneSpentEffectOne()) return;
             }
         }
         const jail = &self.jails[self.maintenance_jail % self.jails.len];
@@ -3245,4 +3273,92 @@ test "native daemon BUG-060 optional observation allocation failure stays teleme
     coordinator.initializeObservationCache(true, installation);
     defer testing.allocator.destroy(coordinator.firewall_observation_cache.?);
     try testing.expectEqual(.not_observed, coordinator.firewall_observation_unavailable);
+}
+
+fn recoveryClock(_: ?*anyopaque) u64 {
+    return 0;
+}
+const recovery_source_generation = [_]u8{9} ** 32;
+fn recoveryCoordinator(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) !*Coordinator {
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const path = try std.fs.path.join(allocator, &.{ base, "recovery.sqlite" });
+    defer allocator.free(path);
+    var store = try durable.Store.open(allocator, path);
+    errdefer store.close();
+    try store.enableReceipts(8);
+    try store.enableNativeTime();
+    try store.enableDetection();
+    try store.enableClockRecovery();
+    try store.enableJournalDetection();
+    try store.enableRetry();
+    try store.enableConsumers();
+    try store.enableEffects();
+    try store.enableConsumerManifests();
+    try store.enableConfirmedHistory();
+    try store.enableMaintenance();
+    try store.enableCleanup();
+    const coordinator = try allocator.create(Coordinator);
+    coordinator.* = undefined;
+    coordinator.store = store;
+    coordinator.store_open = true;
+    coordinator.jails = &.{};
+    coordinator.effects = null;
+    coordinator.history_consumer = null;
+    coordinator.gate = health.Gate.init(.{ .context = null, .read = recoveryClock });
+    coordinator.recovery_generation = null;
+    coordinator.maintenance_validation = .{};
+    coordinator.maintenance_validated = false;
+    coordinator.ownership_fenced = false;
+    return coordinator;
+}
+fn commitRecoveryRecord(store: *durable.Store, occurrence: []const u8) !void {
+    const revision = try store.revision("fixture");
+    const identity = durable.ReceiptIdentity{ .jail = "fixture", .source = "file", .occurrence = occurrence, .cursor = occurrence, .raw_hash = [_]u8{3} ** 32, .generation = recovery_source_generation };
+    _ = try store.beginReceipt(identity, .{ .us = 100 }, revision);
+    _ = try store.commitRecord(.{ .jail = identity.jail, .source = identity.source, .occurrence = occurrence, .cursor = occurrence, .raw_hash = identity.raw_hash, .receipt = .{ .time = .{ .us = 100 }, .generation = recovery_source_generation }, .expected_revision = revision, .disposition = "fixture", .checkpoint = occurrence });
+}
+
+test "native daemon recovery: ownership fences maintenance once per recovery generation" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const coordinator = try recoveryCoordinator(testing.allocator, &tmp);
+    defer testing.allocator.destroy(coordinator);
+    defer coordinator.store.close();
+    try commitRecoveryRecord(&coordinator.store, "first");
+    while (!try coordinator.store.validateMaintenanceTurn(&coordinator.maintenance_validation)) {}
+    try testing.expect(try Coordinator.recoverTurn(.ownership, coordinator));
+    // Stands in for the confirmed-history drain committing a recidive record.
+    try commitRecoveryRecord(&coordinator.store, "drained");
+    try testing.expect(try Coordinator.recoverTurn(.ownership, coordinator));
+    coordinator.gate.state.generation += 1;
+    try testing.expectError(error.StaleMaintenance, Coordinator.recoverTurn(.ownership, coordinator));
+}
+
+test "native daemon recovery: maintenance validation advances many pages per worker turn" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const coordinator = try recoveryCoordinator(testing.allocator, &tmp);
+    defer testing.allocator.destroy(coordinator);
+    defer coordinator.store.close();
+    try commitRecoveryRecord(&coordinator.store, "first");
+    const exec = @extern(*const fn (*anyopaque, [*:0]const u8, ?*anyopaque, ?*anyopaque, ?*?[*:0]u8) callconv(.c) c_int, .{ .name = "sqlite3_exec" });
+    try testing.expectEqual(@as(c_int, 0), exec(@ptrCast(coordinator.store.db),
+        \\BEGIN IMMEDIATE;
+        \\WITH RECURSIVE n(x) AS (VALUES(2) UNION ALL SELECT x+1 FROM n WHERE x<2048)
+        \\INSERT INTO records(jail,source,occurrence,raw_hash,cursor,disposition,source_generation,source_sequence,receipt_us,receipt_generation)
+        \\SELECT jail,source,printf('record-%d',x),raw_hash,cursor,disposition,source_generation,x,receipt_us,receipt_generation FROM records,n WHERE occurrence='first';
+        \\UPDATE source_maintenance SET head_sequence=2048;
+        \\COMMIT;
+    , null, null, null));
+    const pages = 2048 / 16;
+    var turns: usize = 0;
+    while (!coordinator.maintenance_validated) : (turns += 1) {
+        try testing.expect(turns <= pages);
+        _ = try Coordinator.recoverTurn(.state, coordinator);
+    }
+    try testing.expect(turns * 4 < pages);
+    try testing.expect(coordinator.rebuild_phase == .capture);
 }

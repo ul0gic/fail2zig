@@ -20,7 +20,7 @@ The supported migration workflow inspects fail2ban inputs, captures a read-only 
 plans and validates the native projection, and performs journaled cutover/rollback. Unsupported
 configuration is reported for operator action; exact fail2ban compatibility is not promised.
 
-Version 0.4.3 combines the
+Version 0.4.4 combines the
 daemon and administration functions in one static executable per architecture and requires no Python or
 shared SQLite library at runtime. Its [runtime architecture](docs/architecture.md) uses
 statically embedded SQLite for source receipts, consumer state, protection ownership and
@@ -28,15 +28,9 @@ confirmed history. Host requirements remain explicit: journal input uses journal
 `journalctl`; the iptables and ipset backends invoke those tools with fixed arguments; nftables
 talks directly to the kernel. Version 0.4.2 adds bounded inspection of fail2zig-owned
 firewall observations through the CLI. The 0.4.0 release received selected live qualification on
-Debian 13 x86_64. The 0.4.1 SSH-default repair additionally passed isolated log-only origin
-and restart checks on Debian 13 and Ubuntu 24.04; this does not establish Ubuntu firewall
+Debian 13 x86_64. Isolated log-only SSH log-origin and restart checks also passed
+on Debian 13 and Ubuntu 24.04; this does not establish Ubuntu firewall
 qualification or full platform support.
-
-Version 0.4.3 fixes escalation-cleanup foreign-key failures and stalled file ingestion
-from malformed encoding, and adds the qualified PortSentry v2.0.7 history-file recipe.
-Before upgrading, retain a coherent state backup with its matching binary. Older
-binaries cannot read the extended checkpoints and replacement markers; rollback
-requires restoring that backup, not only swapping the executable.
 
 ---
 
@@ -84,7 +78,7 @@ The installer pulls from the
 [latest GitHub Release](https://github.com/ul0gic/fail2zig/releases/latest)
 and verifies every asset against the published `SHA256SUMS` before placing
 anything on disk. Pin a specific version with
-`FAIL2ZIG_VERSION=v0.4.3` or inspect the script first with
+`FAIL2ZIG_VERSION=v0.4.4` or inspect the script first with
 `curl -fsSL … | less`.
 
 ---
@@ -175,7 +169,12 @@ configuration, and installs the hardened `fail2zig.service` unit under
 `/etc/systemd/system/`. It does **not** auto-start the daemon — audit the config,
 then run `systemctl enable --now fail2zig` when ready.
 
-**0.4.3 release targets** (one combined daemon/admin executable each):
+Before upgrading from a version earlier than 0.4.3, retain a coherent state backup
+with its matching binary. Older binaries cannot read 0.4.3's extended checkpoints
+and replacement markers; rollback requires restoring that backup, not only swapping
+the executable.
+
+**0.4.4 release targets** (one combined daemon/admin executable each):
 
 | Target | Hardware | Validation |
 |--------|----------|------------|
@@ -186,17 +185,17 @@ then run `systemctl enable --now fail2zig` when ready.
 | `mipsel-linux-musleabi` | MIPS32r2, little endian, soft float | Cross-build, static inspection and QEMU smoke |
 
 These are the release validation tiers. Emulated checks do not qualify real hardware or
-kernel enforcement. Ubuntu checks cover the SSH repair, not full platform support.
+kernel enforcement. Ubuntu checks cover SSH log-source behavior, not full platform support.
 Legacy firewall modes and journal ingestion require their documented host tools.
 
 The release allowlist is exactly:
 
 ```text
-fail2zig-v0.4.3-x86_64-linux-musl
-fail2zig-v0.4.3-aarch64-linux-musl
-fail2zig-v0.4.3-arm-linux-musleabihf
-fail2zig-v0.4.3-mips-linux-musleabi
-fail2zig-v0.4.3-mipsel-linux-musleabi
+fail2zig-v0.4.4-x86_64-linux-musl
+fail2zig-v0.4.4-aarch64-linux-musl
+fail2zig-v0.4.4-arm-linux-musleabihf
+fail2zig-v0.4.4-mips-linux-musleabi
+fail2zig-v0.4.4-mipsel-linux-musleabi
 fail2zig.service
 fail2zig.toml.example
 install.sh
@@ -228,7 +227,7 @@ If you'd rather skip the script:
 ```bash
 # 1. Download the allowlisted release files
 set -euo pipefail
-VERSION=v0.4.3
+VERSION=v0.4.4
 ARCH=x86_64-linux-musl
 BASE="https://github.com/ul0gic/fail2zig/releases/download/${VERSION}"
 for file in \

@@ -131,6 +131,56 @@ test "native effect runtime: admission diagnostic is bounded by value and retain
     manager.storageReopened();
     try t.expectEqualDeep(diagnostic, manager.status.diagnostic.?);
 }
+test "native effect runtime: transient readback stays uncertain and retries with bounded backoff" {
+    var fixture = try Fixture.init(.nftables);
+    defer fixture.deinit();
+    var entry = try fixture.owner("fixture", 1, .permanent);
+    const manager = try fixture.manager();
+    defer manager.destroy();
+    entry.status = .applied;
+    manager.live[0] = entry;
+    manager.count = 1;
+    manager.cached_epoch = fixture.store.effect_publication_epoch;
+    manager.inspector.test_fault_readback = error.Changed;
+    for ([_]usize{ 1, 0 }) |cursor| {
+        manager.admitted = true;
+        manager.status = .{ .ready = true };
+        manager.readback_failures = 0;
+        manager.cursor = cursor;
+        try t.expect(!try manager.turn(&bindings));
+        try t.expect(!manager.status.ready);
+        try t.expect(manager.status.uncertain);
+        try t.expect(!manager.confirmedSubject(subject, std.time.microTimestamp()));
+        const diagnostic = manager.status.diagnostic.?;
+        try t.expectEqual(inspection.OperationStage.readback, diagnostic.stage);
+        try t.expectEqual(error.Changed, diagnostic.cause);
+        try t.expectEqual(inspection.MutationDisposition.not_started, diagnostic.mutation);
+        try t.expectEqual(@as(u16, 0), manager.readback_wait);
+    }
+    manager.readback_failures = 0;
+    var attempts: usize = 0;
+    for (0..64) |_| {
+        const before = manager.readback_failures;
+        try t.expect(!try manager.turn(&bindings));
+        if (manager.readback_failures != before) attempts += 1;
+    }
+    try t.expectEqual(@as(usize, 7), attempts);
+    manager.readback_wait = 0;
+    manager.readback_failures = std.math.maxInt(u8);
+    try t.expect(!try manager.turn(&bindings));
+    try t.expectEqual(@as(u16, 255), manager.readback_wait);
+    manager.readback_wait = 0;
+    manager.readback_failures = 0;
+    manager.admitted = false;
+    try t.expect(!try manager.turn(&bindings));
+    try t.expect(!manager.admitted);
+    try t.expectEqual(inspection.OperationStage.admission_probe, manager.status.diagnostic.?.stage);
+    manager.readback_wait = 0;
+    manager.admitted = true;
+    manager.inspector.test_fault_readback = error.LimitExceeded;
+    try t.expectError(error.LimitExceeded, manager.turn(&bindings));
+    try t.expectEqual(error.LimitExceeded, manager.status.diagnostic.?.cause);
+}
 fn isolatedBackend() !effect.Backend {
     const name = std.posix.getenv("F2Z_NATIVE_FIREWALL_TRANSPORT") orelse return error.SkipZigTest;
     const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
@@ -195,6 +245,113 @@ test "native effect runtime: isolated final inventory catches missing scope then
     manager.inspector.limits.max_bytes = (inspection.Limits{}).max_bytes;
     try ready(manager);
     try t.expect(manager.status.diagnostic == null);
+}
+
+test "native effect runtime: isolated transient readback recovers at the next complete readback" {
+    var fixture = try Fixture.init(try isolatedBackend());
+    defer fixture.deinit();
+    _ = try fixture.owner("fixture", 1, .{ .finite = std.time.microTimestamp() + 30_000_000 });
+    const manager = try fixture.manager();
+    defer manager.destroy();
+    try ready(manager);
+    try t.expectEqual(@as(u64, 1), try fixture.store.confirmedEffectEvents());
+    manager.inspector.test_fault_readback = error.Changed;
+    manager.cursor = manager.count;
+    try t.expect(!try manager.turn(&bindings));
+    try t.expect(manager.status.uncertain);
+    try t.expect(!manager.confirmedSubject(subject, std.time.microTimestamp()));
+    manager.inspector.test_fault_readback = null;
+    try ready(manager);
+    try t.expect(manager.status.diagnostic == null);
+    try t.expect(manager.confirmedSubject(subject, std.time.microTimestamp()));
+    try t.expectEqual(@as(u64, 1), try fixture.store.confirmedEffectEvents());
+}
+
+fn hostOwner(fixture: *Fixture, index: u8, deadline: i64) !void {
+    const now = std.time.microTimestamp();
+    const host = @import("core/native_detection_record.zig").Subject{ .v4 = .{ 198, 51, 100, index } };
+    _ = try fixture.store.setOwner(.{ .scope = try effect.Scope.host(host), .jail = "fixture", .generation = [_]u8{3} ** 32, .decision_id = [_]u8{index} ** 32, .expected_revision = 0, .lease = .{ .finite = deadline }, .decided_us = now }, .{ .prepared_us = now });
+}
+
+test "native effect runtime: isolated new ban confirms in a few turns regardless of existing effects" {
+    var fixture = try Fixture.init(try isolatedBackend());
+    defer fixture.deinit();
+    const deadline = std.time.microTimestamp() + 120_000_000;
+    for (1..49) |index| try hostOwner(&fixture, @intCast(index), deadline);
+    const manager = try fixture.manager();
+    defer manager.destroy();
+    for (0..1024) |_| {
+        if (try manager.turn(&bindings)) break;
+    } else return error.RecoveryDidNotFinish;
+    try t.expectEqual(@as(usize, 48), manager.count);
+    try hostOwner(&fixture, 49, deadline);
+    var turns: usize = 0;
+    while (!try manager.turn(&bindings)) : (turns += 1) try t.expect(turns < 12);
+    try t.expectEqual(@as(usize, 49), manager.count);
+    try t.expect(manager.confirmedSubject(.{ .v4 = .{ 198, 51, 100, 49 } }, std.time.microTimestamp()));
+}
+
+test "native effect runtime: isolated new ban is enforced before pending expiry bookkeeping" {
+    const backend = try isolatedBackend();
+    var fixture = try Fixture.init(backend);
+    defer fixture.deinit();
+    // Fixed-argv backends reconcile each entry through subprocesses.
+    const bans: usize = if (backend == .nftables) 30 else 8;
+    const expiring = std.time.microTimestamp() + 12_000_000;
+    for (1..bans + 1) |index| try hostOwner(&fixture, @intCast(index), expiring);
+    const manager = try fixture.manager();
+    defer manager.destroy();
+    for (0..1024) |_| {
+        if (try manager.turn(&bindings)) break;
+    } else return error.RecoveryDidNotFinish;
+    try t.expect(std.time.microTimestamp() < expiring);
+    for (manager.live[0..manager.count]) |entry| try t.expect(entry.status == .applied and entry.desired.finite == expiring);
+    waitUntil(expiring + 1_100_000);
+    try hostOwner(&fixture, 99, expiring + 60_000_000);
+    const newcomer = try effect.Scope.host(.{ .v4 = .{ 198, 51, 100, 99 } });
+    for (0..16) |_| {
+        _ = try manager.turn(&bindings);
+        var enforced = false;
+        var expired_handled: usize = 0;
+        for (manager.live[0..manager.count]) |entry| {
+            if (std.meta.eql(entry.scope, newcomer)) enforced = entry.status == .applied;
+            if (entry.desired != .finite or entry.desired.finite != expiring) expired_handled += @intFromBool(!std.meta.eql(entry.scope, newcomer));
+        }
+        if (enforced) {
+            try t.expectEqual(@as(usize, 0), expired_handled);
+            return;
+        }
+    }
+    return error.NewBanNotEnforced;
+}
+
+test "native effect runtime: isolated pruning a spent scope keeps confirmation without another readback" {
+    var fixture = try Fixture.init(try isolatedBackend());
+    defer fixture.deinit();
+    try fixture.enableSchema19();
+    _ = try fixture.owner("fixture", 1, .permanent);
+    const deadline = std.time.microTimestamp() + 1_000_000;
+    try hostOwner(&fixture, 7, deadline);
+    const manager = try fixture.manager();
+    defer manager.destroy();
+    try ready(manager);
+    waitUntil(deadline + 50_000);
+    for (0..64) |_| {
+        if (!try manager.turn(&bindings)) continue;
+        var absent: usize = 0;
+        for (manager.live[0..manager.count]) |entry| absent += @intFromBool(entry.status == .absent);
+        if (absent == 1) break;
+    } else return error.RecoveryDidNotFinish;
+    const exec = @extern(*const fn (*anyopaque, [*:0]const u8, ?*anyopaque, ?*anyopaque, ?*?[*:0]u8) callconv(.c) c_int, .{ .name = "sqlite3_exec" });
+    try t.expectEqual(@as(c_int, 0), exec(@ptrCast(fixture.store.db), "DELETE FROM confirmed_event_details; DELETE FROM confirmed_history_sequence; DELETE FROM confirmed_effect_events;", null, null, null));
+    try t.expect(try manager.turn(&bindings));
+    var pruned = false;
+    while (try fixture.store.pruneSpentEffectOne()) pruned = true;
+    try t.expect(pruned);
+    try t.expect(try manager.turn(&bindings));
+    try t.expect(manager.status.ready);
+    try t.expectEqual(@as(usize, 1), manager.count);
+    try t.expect(manager.confirmedSubject(subject, std.time.microTimestamp()));
 }
 
 test "native effect runtime: isolated dispatch uncertainty retains durable identity and clears at full readback" {
