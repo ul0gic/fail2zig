@@ -415,9 +415,9 @@ is available only for `bantime`. CLI durations and timeouts keep their existing 
 
 Full schema: [fail2zig.toml(5)](docs/man/fail2zig.toml.5).
 
-### PortSentry 2.x history input (unreleased)
+### PortSentry 2.x history input (v0.4.3)
 
-The current development tree targets the history-file format from upstream
+Version 0.4.3 targets the history-file format from upstream
 [PortSentry v2.0.7](https://github.com/portsentry/portsentry/releases/tag/v2.0.7).
 TCP-connect operation has been qualified on Debian 13 with IPv4 and IPv6.
 This does not cover PortSentry 1.2, and fail2zig

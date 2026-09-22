@@ -60,7 +60,7 @@ timestamp = "undated"
 logpath = ["/var/log/nginx/error.log"]
 ignoreip = ["192.168.0.0/16"]
 
-# Unreleased PortSentry v2.0.7 history-file integration. The Debian 13 standard
+# v0.4.3 PortSentry v2.0.7 history-file integration. The Debian 13 standard
 # repository package is legacy 1.2, which is not compatible with this filter.
 # Run PortSentry with --connect and configure it separately with:
 #   TCP_PORTS="1,11,15"  # example; choose ports verified unused on this host
