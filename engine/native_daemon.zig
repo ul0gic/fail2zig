@@ -24,6 +24,7 @@ const durable = @import("core/record_store.zig");
 const sessions = @import("core/native_file_session.zig");
 const journal_projection = @import("config/native_journal_detection.zig");
 const journal_profile = @import("config/native_journal_profile.zig");
+const filter_registry = @import("filters/registry.zig");
 
 // Keep the released query byte-for-byte for existing explicit profiles: it is
 // included in persistent source identity. New automatic auth-helper layouts
@@ -1121,7 +1122,7 @@ pub const Coordinator = struct {
                     if (selected.journal_executables.len != 0) return error.UnusedJournalProfile;
                     const timestamp = selected.timestamp orelse return error.NativeTimestampRequired;
                     if (timestamp != .syslog and selected.timezone_offset_minutes != null) return error.UnusedTimezoneOffset;
-                    var settings = projection.Settings{ .timestamp = undefined, .body = if (assets == null and (timestamp == .iso8601 or timestamp == .syslog)) .syslog else .whole, .start = .head, .max_sources = max_sources_per_jail, .ignore_capacity = 128, .custom = assets != null };
+                    var settings = projection.Settings{ .timestamp = undefined, .body = if (assets == null and !filter_registry.requiresWholeRecord(selected.filter) and (timestamp == .iso8601 or timestamp == .syslog)) .syslog else .whole, .start = .head, .max_sources = max_sources_per_jail, .ignore_capacity = 128, .custom = assets != null };
                     settings.timestamp = switch (timestamp) {
                         .undated => .undated,
                         .iso8601 => .{ .field = .{ .format = .iso8601, .boundary = .{ .delimiter = ' ' } } },

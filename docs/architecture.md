@@ -1,6 +1,6 @@
 # Runtime architecture
 
-fail2zig 0.4.2 is one native executable containing the daemon, administration commands, rule
+fail2zig 0.4.3 is one native executable containing the daemon, administration commands, rule
 testing and migration tools. Zig application code statically embeds pinned upstream SQLite C.
 Runtime installation does not require Python, a SQLite service, the SQLite CLI or a shared SQLite
 library.
@@ -33,6 +33,19 @@ remain observable.
 File sources preserve exact saved positions and source identity across restart and rotation.
 Operators select an explicit timestamp contract appropriate to the log format. Lost continuity or
 unsafe replay becomes visible intervention rather than an invented position.
+
+The v0.4.3 malformed-file repair replaces invalid encoding sequences and embedded
+NUL/CR with U+FFFD for matching, while preserving the original raw hash, byte range,
+receipt and source generation. Damaged address tokens cannot supply a ban target;
+an intact address can still match when another field contains replacement text.
+Decoded output remains bounded: overflow rejects the complete record instead of
+matching a truncated prefix. Disposition, diagnostic counters and cursor movement
+commit together, and encoding warnings are rate-limited without printing raw payloads.
+This behavior is not present in releases through v0.4.2.
+
+The repair reads legacy processor checkpoints and retains SQLite schema 23, but
+older binaries cannot restore its extended checkpoints. Back up state coherently
+before upgrading; reverting the binary alone is not a supported rollback.
 
 Journal sources validate local machine identity, root UID, transport and an exact list of
 root-owned executable paths. Built-in SSH jails can discover a bounded standard profile when

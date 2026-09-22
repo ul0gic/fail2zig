@@ -614,17 +614,40 @@ pub fn compile(comptime pattern: []const u8) MatchFn {
 const IpHit = struct { ip: shared.IpAddress, end: usize };
 const TimestampHit = struct { ts: shared.Timestamp, end: usize };
 
+fn addressTokenBoundary(byte: u8) bool {
+    return std.ascii.isWhitespace(byte) or switch (byte) {
+        ',', ';', '"', '\'', '[', ']', '(', ')', '<', '>', '/', '=' => true,
+        else => false,
+    };
+}
+
+fn damagedAddressTokenEnd(line: []const u8, start: usize, end: usize) ?usize {
+    var first = start;
+    while (first > 0 and !addressTokenBoundary(line[first - 1])) : (first -= 1) {}
+    var last = end;
+    while (last < line.len and !addressTokenBoundary(line[last])) : (last += 1) {}
+    // Replacement must never turn a damaged address into a valid prefix or suffix.
+    // Keep the entire token in view, including bytes before a wildcard's candidate.
+    return if (std.mem.indexOf(u8, line[first..last], "\xef\xbf\xbd") != null) last else null;
+}
+
 fn scanForIp(line: []const u8, cursor: usize, scan: bool) ?IpHit {
     if (!scan) {
         if (cursor > line.len) return null;
         const r = extractIp(line[cursor..]) orelse return null;
+        if (damagedAddressTokenEnd(line, cursor, cursor + r.len) != null) return null;
         return .{ .ip = r.ip, .end = cursor + r.len };
     }
     var i: usize = cursor;
-    while (i < line.len) : (i += 1) {
+    while (i < line.len) {
         if (extractIp(line[i..])) |r| {
+            if (damagedAddressTokenEnd(line, i, i + r.len)) |end| {
+                i = end;
+                continue;
+            }
             return .{ .ip = r.ip, .end = i + r.len };
         }
+        i += 1;
     }
     return null;
 }
@@ -852,6 +875,39 @@ test "parser: compile pattern with ipv6" {
     const m = comptime compile("Failed password for <*> from <IP>");
     const r = m("Failed password for root from 2001:db8::1").?;
     try std.testing.expectEqual(@as(u128, 0x20010db8000000000000000000000001), r.ip.ipv6);
+}
+
+test "parser: replacement inside address tokens cannot select valid prefixes or suffixes" {
+    const exact = comptime compile("client: <IP>");
+    const wildcard = comptime compile("<*><IP>");
+    for ([_][]const u8{
+        "client: �192.0.2.1",
+        "client: 192.0.2.�1",
+        "client: 192.0.2.1�9",
+        "client: 192.0.2.1�192.0.2.2",
+        "client: �2001:db8::1",
+        "client: 2001:db8::�1",
+        "client: 2001:db8::1�9",
+        "client: 2001:db8::1�2001:db8::2",
+    }) |line| {
+        try std.testing.expect(exact(line) == null);
+        try std.testing.expect(wildcard(line) == null);
+    }
+    const next = wildcard("192.0.2.1�192.0.2.2, 198.51.100.7").?;
+    try std.testing.expectEqual(@as(u32, 0xc6336407), next.ip.ipv4);
+}
+
+test "parser: replacement in unrelated text preserves intact address matching" {
+    const auth = comptime compile("<*>password mismatch<*>client: <IP>");
+    const result = auth("user \"bad�name\": password mismatch, client: 192.0.2.1, server: _").?;
+    try std.testing.expectEqual(@as(u32, 0xc0000201), result.ip.ipv4);
+    const wildcard = comptime compile("<*><IP>");
+    for ([_][]const u8{
+        "bad�name [192.0.2.1]",
+        "bad�name (192.0.2.1)",
+        "bad�name '192.0.2.1'",
+        "bad�name address=192.0.2.1/32",
+    }) |line| try std.testing.expectEqual(@as(u32, 0xc0000201), wildcard(line).?.ip.ipv4);
 }
 
 test "parser: compile anchored literal failure" {

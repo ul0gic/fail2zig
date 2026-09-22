@@ -20,6 +20,8 @@ fn iso(text: []const u8) i64 {
 
 const now_us = iso("2026-04-21T12:00:10Z");
 
+const portsentry_positive = "2026-09-22T14:01:59.799+0000 Scan from: [192.0.2.2] (192.0.2.2) protocol: [TCP] port: [23456] type: [Connect] IP opts: [unknown] ignored: [false] triggered: [true] noblock: [true] blocked: [false]";
+
 fn base(input: rule_test.Input, rule: rule_test.Rule) rule_test.Options {
     return .{ .input = input, .rule = rule, .now_us = now_us, .tz_offset_minutes = 0 };
 }
@@ -92,6 +94,24 @@ test "native rule test: each syslog service fixture matches its expected lines" 
         try testing.expectEqualStrings(c.identity, sample(&report, 1).identity.?);
         try testing.expectEqual(iso("2026-04-21T12:00:00Z"), sample(&report, 1).event_time_us.?);
     }
+}
+
+test "native rule test: portsentry CLI uses ISO time and the whole authentic history record" {
+    var result = runCli(&.{ "--record", portsentry_positive, "--service", "portsentry", "--now", "1790085729" });
+    defer result.deinit();
+    try testing.expectEqual(rule_test.ExitClass.success, result.class);
+    try testing.expectEqual(@as(usize, 0), result.stderr.items.len);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, result.stdout.items, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try testing.expectEqualStrings("portsentry", root.get("rule").?.object.get("name").?.string);
+    try testing.expectEqual(@as(i64, 1), root.get("counts").?.object.get("matched").?.integer);
+    const first = root.get("samples").?.array.items[0].object;
+    try testing.expectEqualStrings("match", first.get("outcome").?.string);
+    try testing.expectEqualStrings("192.0.2.2", first.get("identity").?.string);
+    try testing.expectEqual(@as(i64, 1_790_085_719_799_000), first.get("event_time_us").?.integer);
+    try testing.expectEqualStrings("time-eligible-event", first.get("time").?.string);
 }
 
 test "native rule test: undated web services default to receipt time and whole-line matching" {

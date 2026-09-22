@@ -1,4 +1,4 @@
-.TH FAIL2ZIG.TOML 5 "2026-09-21" "fail2zig 0.4.2" "File Formats"
+.TH FAIL2ZIG.TOML 5 "2026-09-22" "fail2zig 0.4.3" "File Formats"
 .
 .SH NAME
 fail2zig.toml \- fail2zig daemon configuration file
@@ -404,6 +404,47 @@ source   = "journald"
 journal_executables = ["/usr/sbin/sshd", "/usr/lib/openssh/sshd-session"]
 maxretry = 3
 bantime  = 3600
+.fi
+.
+.SS PortSentry v2.0.7 history file (v0.4.3)
+This v0.4.3 integration targets the upstream PortSentry v2.0.7 history
+file at
+.IR /var/log/portsentry.log .
+It does not support the legacy PortSentry 1.2 format, including a same-named
+Fail2ban filter; migration refuses that incompatible mapping. The Debian 13
+standard repository package is legacy 1.2 and is distinct from the pinned
+upstream 2.0.7 target.
+.PP
+Run PortSentry with
+.B \-\-connect
+and retain one TCP_PORTS list containing ports verified unused on the protected
+host. Set HISTORY_FILE=/var/log/portsentry.log, RESOLVE_HOST=0, SCAN_TRIGGER=0,
+BLOCK_TCP=0 and BLOCK_UDP=0. Remove or comment every UDP_PORTS directive for
+this TCP-only recipe; do not set UDP_PORTS="", because PortSentry rejects an
+empty list. BLOCK_UDP=0 disables PortSentry's UDP response but does not stop
+UDP observations when UDP ports remain configured. These settings leave
+fail2zig as the only ban owner.
+.PP
+.nf
+[jails.portsentry]
+enabled    = true
+filter     = "portsentry"
+source     = "file"
+timestamp  = "iso8601"
+logpath    = ["/var/log/portsentry.log"]
+maxretry   = 1
+enforce = true
+.fi
+.PP
+Accepted events protect the source host across all protocols and ports. The
+live qualification covered IPv4 and IPv6 TCP-connect events on Debian 13
+through ban and expiry. UDP and stealth-mode deployment are unqualified,
+and stdout, syslog and journal envelopes are outside this integration.
+.PP
+Inspect a history file without starting the daemon:
+.PP
+.nf
+fail2zig rule-test --file /var/log/portsentry.log --service portsentry --output table
 .fi
 .
 .SH SEE ALSO

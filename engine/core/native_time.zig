@@ -129,12 +129,13 @@ fn iso(text: []const u8, context: Context) Error!Timestamp {
         microseconds = try fraction(text[start..end]);
     }
     const suffix = text[end..];
+    // ISO numeric zones accept both basic (+HHMM) and extended (+HH:MM) forms.
     const offset = if (suffix.len == 0)
         context.offset_seconds orelse return error.MissingTimezone
     else if (std.mem.eql(u8, suffix, "Z"))
         @as(i32, 0)
     else
-        try zone(suffix, true);
+        try zone(suffix, suffix.len != 5);
     return calendar(try number(text[0..4]), try number(text[5..7]), try number(text[8..10]), text[11..19], microseconds, offset);
 }
 
@@ -173,6 +174,9 @@ test "native time: common service fields and calendar validation" {
         .{ .format = .iso8601, .field = "1970-01-01T00:00:00Z", .us = 0 },
         .{ .format = .iso8601, .field = "1969-12-31T23:59:59.999999Z", .us = -1 },
         .{ .format = .iso8601, .field = "1970-01-01T02:30:00.123456+02:30", .us = 123456 },
+        .{ .format = .iso8601, .field = "1970-01-01T02:30:00.123+0230", .us = 123000 },
+        .{ .format = .iso8601, .field = "1969-12-31T19:00:00.456-0500", .us = 456000 },
+        .{ .format = .iso8601, .field = "1970-01-01T00:00:00.789+0000", .us = 789000 },
         .{ .format = .iso8601, .field = "1969-12-31 19:00:00-05:00", .us = 0 },
         .{ .format = .iso8601, .field = "2000-02-29T00:00:00Z", .us = 951782400000000 },
         .{ .format = .iso8601, .field = "0001-01-01T00:00:00Z", .us = -62135596800000000 },
@@ -181,11 +185,13 @@ test "native time: common service fields and calendar validation" {
         .{ .format = .syslog, .field = "Jan  1 00:00:00", .us = 0, .context = .{ .year = 1970, .offset_seconds = 0 } },
     }) |case| try std.testing.expectEqual(case.us, (try parse(case.format, case.field, case.context)).us);
     for ([_][]const u8{
-        "1900-02-29T00:00:00Z",      "2100-02-29T00:00:00Z",      "2000-04-31T00:00:00Z",
-        "2026-00-01T00:00:00Z",      "2026-13-01T00:00:00Z",      "0000-01-01T00:00:00Z",
-        "2026-01-00T00:00:00Z",      "2026-01-01T24:00:00Z",      "2026-01-01T00:60:00Z",
-        "2026-01-01T00:00:60Z",      "2026-01-01T00:00:00+24:00", "2026-01-01T00:00:00+01:60",
-        "2026-01-01T00:00:00Zextra", "2026-01-01T00:00:00.Z",
+        "1900-02-29T00:00:00Z",      "2100-02-29T00:00:00Z",          "2000-04-31T00:00:00Z",
+        "2026-00-01T00:00:00Z",      "2026-13-01T00:00:00Z",          "0000-01-01T00:00:00Z",
+        "2026-01-00T00:00:00Z",      "2026-01-01T24:00:00Z",          "2026-01-01T00:60:00Z",
+        "2026-01-01T00:00:60Z",      "2026-01-01T00:00:00+24:00",     "2026-01-01T00:00:00+01:60",
+        "2026-01-01T00:00:00Zextra", "2026-01-01T00:00:00.Z",         "2026-01-01T00:00:00+2400",
+        "2026-01-01T00:00:00+0160",  "2026-01-01T00:00:00+000",       "2026-01-01T00:00:00+00000",
+        "2026-01-01T00:00:00+00x0",  "2026-01-01T00:00:00+0000extra",
     }) |bad| try std.testing.expectError(error.InvalidTimestamp, parse(.iso8601, bad, .{}));
 }
 
@@ -194,6 +200,7 @@ test "native time: context and future policy cannot be silently inferred" {
     try std.testing.expectError(error.MissingTimezone, parse(.syslog, "Jan  1 00:00:00", .{ .year = 1970 }));
     try std.testing.expectError(error.MissingTimezone, parse(.iso8601, "1970-01-01T00:00:00", .{}));
     try std.testing.expectError(error.MissingTimezone, parse(.iso8601, "1970-01-01T00:00:00-00:00", .{ .offset_seconds = 0 }));
+    try std.testing.expectError(error.MissingTimezone, parse(.iso8601, "1970-01-01T00:00:00-0000", .{ .offset_seconds = 0 }));
     try std.testing.expectEqual(@as(i64, 0), (try parse(.iso8601, "1970-01-01T01:00:00", .{ .offset_seconds = 3600 })).us);
     const now = Timestamp{ .us = 1000 };
     try std.testing.expectEqual(.eligible, try age(.{ .us = 400 }, now, 600));

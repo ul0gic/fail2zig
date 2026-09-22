@@ -6,6 +6,9 @@ const durable = @import("core/record_store.zig");
 const consumer = @import("core/native_consumer.zig");
 const history = @import("core/native_effect_history.zig");
 const effect = @import("core/native_effect.zig");
+const native_detection = @import("core/native_detection_record.zig");
+const native_retry = @import("core/native_retry.zig");
+const time_policy = @import("core/source_time_policy.zig");
 const generation = [_]u8{9} ** 32;
 fn clock(_: ?*anyopaque) i64 {
     return 100;
@@ -214,6 +217,17 @@ fn recordFor(id: durable.ReceiptIdentity, revision: u64) durable.Record {
 fn commitObserved(store: *durable.Store, id: durable.ReceiptIdentity, revision: u64) !void {
     _ = try store.beginReceipt(id, .{ .us = 100 }, revision);
     try t.expectEqual(durable.CommitResult.committed, try store.commitRecord(recordFor(id, revision)));
+}
+fn commitObservedRetryAt(store: *durable.Store, id: durable.ReceiptIdentity, revision: u64, now: i64, policy: native_retry.Policy) !void {
+    const receipt = try store.beginReceipt(id, .{ .us = now }, revision);
+    const outcome = try time_policy.evaluate(.timestamped, .{ .parsed = receipt }, receipt, receipt, 1_000_000);
+    var record = recordFor(id, revision);
+    record.receipt.?.time = receipt;
+    record.native_time_outcome = outcome;
+    record.native_detection = .{ .kind = .no_match, .generation = id.generation, .filter = try native_detection.Name.init("fixture") };
+    record.native_retry = .{ .generation = id.generation, .policy = policy, .processing_us = receipt.us };
+    record.disposition = outcome.disposition();
+    try t.expectEqual(durable.CommitResult.committed, try store.commitRecord(record));
 }
 fn reopen(f: *Fixture) !void {
     f.store.close();
@@ -516,6 +530,226 @@ fn setupCleanup(f: *Fixture) !void {
     try f.store.enableMaintenance();
     try f.store.enableCleanup();
 }
+fn upgradeCleanupToLatest(f: *Fixture) !void {
+    try f.store.enableRetryLeases();
+    try f.store.enableApplicationHistory();
+    try f.store.enableEscalation();
+    try f.store.enableCanonicalEffects();
+    try f.store.enableHistoryResets();
+    try f.store.enableActionTargets();
+    try f.store.enableAdminState();
+    try f.store.enableMigrationState();
+}
+fn effectObservation(entry: effect.Entry, now: i64) effect.Observation {
+    return .{ .installation = entry.installation.id, .scope_key = entry.scope_key, .fingerprint = [_]u8{7} ** 32, .observed_us = now, .qualification = .complete_owned, .state = entry.desired };
+}
+fn escalatedRecord(store: *durable.Store, now: *CleanupClock, id: durable.ReceiptIdentity, revision: u64, subject: native_detection.Subject, policy: native_retry.Policy) !durable.Record {
+    const receipt = try store.beginReceipt(id, .{ .us = now.now }, revision);
+    const outcome = try time_policy.evaluate(.timestamped, .{ .parsed = receipt }, receipt, receipt, 1_000_000);
+    return .{
+        .jail = id.jail,
+        .source = id.source,
+        .occurrence = id.occurrence,
+        .cursor = id.cursor,
+        .raw_hash = id.raw_hash,
+        .receipt = .{ .time = receipt, .generation = id.generation },
+        .native_time_outcome = outcome,
+        .native_detection = .{ .kind = .candidate, .generation = id.generation, .filter = try native_detection.Name.init("fixture"), .pattern = try native_detection.Name.init("failure"), .pattern_index = 0, .subject = subject },
+        .native_retry = .{ .generation = id.generation, .policy = policy, .processing_us = now.now },
+        .retry_evidence = .{ .text = "retained escalation evidence" },
+        .effects_clock = now.value(),
+        .expected_revision = revision,
+        .disposition = outcome.disposition(),
+        .checkpoint = "escalation-cleanup",
+    };
+}
+
+test "native maintenance: schema23 resumes escalated cleanup atomically and retains confirmed history" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try setupCleanup(&f);
+    try upgradeCleanupToLatest(&f);
+
+    const installation = try effect.Installation.init([_]u8{6} ** 16, .nftables, "cleanup-escalation-fixture");
+    try f.store.admitInstallation(installation, .{ .selector = installation.selector(), .disposition = .verified_absent });
+    var now = CleanupClock{ .now = 100 };
+    const history_generation = effect.hashParts("fail2zig-native-confirmed-history-v1", &.{});
+    var history_owner = try history.Consumer.init(installation, history_generation);
+    const initial_history = try history_owner.prepareInitial();
+    try f.store.bootstrapConfirmedHistory(history_owner.manifest(), try initial_history.batch(now.value()), installation);
+    initial_history.publish();
+    initial_history.release();
+
+    var policy = native_retry.Policy{ .maxretry = 1, .window_us = 10_000_000, .duration = .{ .finite_us = 1_000_000 }, .max_subjects = 8, .enforce = true };
+    policy.escalation = .{ .enabled = true, .formula = .linear, .scope = .per_jail, .multiplier = 1, .factor = 1, .max_duration_us = 60_000_000 };
+    try f.store.admitRetry(identity.jail, generation, policy);
+    const subject = native_detection.Subject{ .v4 = .{ 192, 0, 2, 91 } };
+    try t.expectEqual(durable.CommitResult.committed, try f.store.commitRecord(try escalatedRecord(&f.store, &now, identity, 0, subject, policy)));
+    const selection = (try f.store.retryEscalationDecision(identity.jail, identity.source, identity.occurrence, subject)).?;
+    try t.expectEqual(@as(u64, 0), selection.prior_confirmed);
+
+    var effect_rows: [effect.max_page]effect.Entry = undefined;
+    const effect_page = try f.store.effectPage(null, null, &effect_rows);
+    try t.expectEqual(@as(usize, 1), effect_page.count);
+    const applied = effect_rows[0];
+    try f.store.markDispatched(applied.token(), now.value());
+    try t.expectEqual(effect.Settlement.verified, try f.store.settleVerified(applied.token(), effectObservation(applied, now.now), now.value()));
+
+    var events: [history.max_page]history.Event = undefined;
+    const history_page = try f.store.confirmedEffectPage(installation, 0, null, &events);
+    try t.expectEqual(@as(usize, 1), history_page.count);
+    const staged_history = try history_owner.prepare(history_page, events[0..history_page.count], now.now);
+    try f.store.commitConfirmedHistory(history_owner.manifest(), try staged_history.batch(now.value()), history_page.token);
+    staged_history.publish();
+    staged_history.release();
+    try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM confirmed_event_details;"));
+    try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM confirmed_policy_summaries;"));
+
+    now.now = 2_000_000;
+    const removing = try f.store.prepareExpiry(applied.scope_key, applied.revision, now.value());
+    try t.expectEqual(effect.Lease.absent, removing.desired);
+    try f.store.markDispatched(removing.token(), now.value());
+    try t.expectEqual(effect.Settlement.verified, try f.store.settleVerified(removing.token(), effectObservation(removing, now.now), now.value()));
+
+    var anchor = identity;
+    anchor.occurrence = "anchor";
+    anchor.cursor = "anchor";
+    try commitObservedRetryAt(&f.store, anchor, 1, now.now, policy);
+    const caught_up = try f.store.confirmedEffectPage(installation, history_page.token.last_sequence, null, &events);
+    try t.expectEqual(@as(usize, 0), caught_up.count);
+    const fence = durable.Store.CleanupFence{
+        .jail = identity.jail,
+        .source = identity.source,
+        .generation = identity.generation,
+        .jail_revision = try f.store.revision(identity.jail),
+        .consumer_revision = try f.store.maintenanceConsumerRevision(),
+        .effect_revision = try f.store.maintenanceEffectRevision(),
+        .history = caught_up.token,
+        .clock = now.value(),
+        .preparations = .released,
+    };
+    const marked = (try f.store.cleanupAdvance(fence, (try f.store.sourceMaintenance(identity.jail, identity.source, generation)).?, 2)).?;
+    try t.expectEqual(@as(i64, 0), try f.store.inspectInteger("SELECT count(*) FROM pragma_foreign_key_check;"));
+    try reopen(&f);
+
+    const rollback_stages = [_]durable.CommitStage{
+        .before_cleanup_escalation_delete,
+        .after_cleanup_escalation_delete,
+        .before_cleanup_retry_delete,
+        .after_cleanup_retry_delete,
+        .before_cleanup_commit,
+    };
+    for (rollback_stages) |stage| {
+        const resumed = (try f.store.cleanupResume(identity.jail, identity.source, generation)).?;
+        const resumed_fence = durable.Store.CleanupFence{
+            .jail = identity.jail,
+            .source = identity.source,
+            .generation = identity.generation,
+            .jail_revision = try f.store.revision(identity.jail),
+            .consumer_revision = try f.store.maintenanceConsumerRevision(),
+            .effect_revision = try f.store.maintenanceEffectRevision(),
+            .history = caught_up.token,
+            .clock = now.value(),
+            .preparations = .released,
+        };
+        f.store.fail_at = stage;
+        try t.expectError(error.InjectedFailure, f.store.cleanupDelete(resumed_fence, resumed));
+        f.store.fail_at = null;
+        try t.expectEqualDeep(marked.state, (try f.store.sourceMaintenance(identity.jail, identity.source, generation)).?);
+        try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM records WHERE jail='receipt' AND source='file' AND occurrence='original';"));
+        try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM record_detections WHERE jail='receipt' AND source='file' AND occurrence='original';"));
+        try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM retry_decisions WHERE jail='receipt' AND source='file' AND occurrence='original';"));
+        try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM retry_decision_escalations WHERE jail='receipt' AND source='file' AND occurrence='original';"));
+        try t.expectEqual(@as(i64, 0), try f.store.inspectInteger("SELECT count(*) FROM pragma_foreign_key_check;"));
+        try t.expectError(error.PrunedReplay, f.store.committedReceipt(identity));
+        try reopen(&f);
+    }
+
+    const resumed = (try f.store.cleanupResume(identity.jail, identity.source, generation)).?;
+    const resumed_fence = durable.Store.CleanupFence{
+        .jail = identity.jail,
+        .source = identity.source,
+        .generation = identity.generation,
+        .jail_revision = try f.store.revision(identity.jail),
+        .consumer_revision = try f.store.maintenanceConsumerRevision(),
+        .effect_revision = try f.store.maintenanceEffectRevision(),
+        .history = caught_up.token,
+        .clock = now.value(),
+        .preparations = .released,
+    };
+    const progress = try f.store.cleanupDelete(resumed_fence, resumed);
+    try t.expectEqual(@as(u8, 4), progress.deleted_rows);
+    try t.expect(!progress.more);
+    try t.expectEqual(@as(i64, 0), try f.store.inspectInteger("SELECT count(*) FROM pragma_foreign_key_check;"));
+    try t.expectEqual(@as(i64, 0), try f.store.inspectInteger("SELECT count(*) FROM retry_decision_escalations;"));
+    try t.expectEqual(@as(i64, 0), try f.store.inspectInteger("SELECT count(*) FROM retry_decisions;"));
+    try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM retry_decision_details;"));
+    try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM confirmed_event_details;"));
+    try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM confirmed_policy_summaries;"));
+    try t.expectError(error.PrunedReplay, f.store.committedReceipt(identity));
+
+    try reopen(&f);
+    try t.expectEqual(@as(?durable.Store.CleanupToken, null), try f.store.cleanupResume(identity.jail, identity.source, generation));
+    try t.expectEqual(@as(i64, 0), try f.store.inspectInteger("SELECT count(*) FROM pragma_foreign_key_check;"));
+    var after = identity;
+    after.occurrence = "after-cleanup";
+    after.cursor = "after-cleanup";
+    try t.expectEqual(durable.CommitResult.committed, try f.store.commitRecord(try escalatedRecord(&f.store, &now, after, 2, subject, policy)));
+    try t.expectEqual(@as(u64, 3), (try f.store.recordSequence(after.jail, after.source, after.occurrence)).?.sequence);
+    const next_selection = (try f.store.retryEscalationDecision(after.jail, after.source, after.occurrence, subject)).?;
+    try t.expectEqual(@as(u64, 1), next_selection.prior_confirmed);
+    try t.expectEqual(@as(?i64, 100), next_selection.latest_confirmed_us);
+    try t.expectEqual(@as(i64, 2_000_000), next_selection.chosen_duration_us);
+
+    const next_effect_page = try f.store.effectPage(null, null, &effect_rows);
+    try t.expectEqual(@as(usize, 1), next_effect_page.count);
+    const escalated_effect = effect_rows[0];
+    now.now = 5_000_000;
+    const removing_escalated = try f.store.prepareExpiry(escalated_effect.scope_key, escalated_effect.revision, now.value());
+    try t.expectEqual(effect.Lease.absent, removing_escalated.desired);
+    try f.store.markDispatched(removing_escalated.token(), now.value());
+    try t.expectEqual(effect.Settlement.verified, try f.store.settleVerified(removing_escalated.token(), effectObservation(removing_escalated, now.now), now.value()));
+
+    var final_anchor = identity;
+    final_anchor.occurrence = "final-anchor";
+    final_anchor.cursor = "final-anchor";
+    try commitObservedRetryAt(&f.store, final_anchor, 3, now.now, policy);
+    const second_fence = durable.Store.CleanupFence{
+        .jail = identity.jail,
+        .source = identity.source,
+        .generation = identity.generation,
+        .jail_revision = try f.store.revision(identity.jail),
+        .consumer_revision = try f.store.maintenanceConsumerRevision(),
+        .effect_revision = try f.store.maintenanceEffectRevision(),
+        .history = caught_up.token,
+        .clock = now.value(),
+        .preparations = .released,
+    };
+    const second_marked = (try f.store.cleanupAdvance(second_fence, (try f.store.sourceMaintenance(identity.jail, identity.source, generation)).?, 4)).?;
+    try reopen(&f);
+    const second_resumed = (try f.store.cleanupResume(identity.jail, identity.source, generation)).?;
+    try t.expectEqualDeep(second_marked, second_resumed);
+    const second_resumed_fence = durable.Store.CleanupFence{
+        .jail = identity.jail,
+        .source = identity.source,
+        .generation = identity.generation,
+        .jail_revision = try f.store.revision(identity.jail),
+        .consumer_revision = try f.store.maintenanceConsumerRevision(),
+        .effect_revision = try f.store.maintenanceEffectRevision(),
+        .history = caught_up.token,
+        .clock = now.value(),
+        .preparations = .released,
+    };
+    const second_progress = try f.store.cleanupDelete(second_resumed_fence, second_resumed);
+    try t.expectEqual(@as(u8, 6), second_progress.deleted_rows);
+    try t.expect(!second_progress.more);
+    try t.expectEqual(@as(i64, 0), try f.store.inspectInteger("SELECT count(*) FROM retry_decision_escalations;"));
+    try t.expectEqual(@as(i64, 2), try f.store.inspectInteger("SELECT count(*) FROM retry_decision_details;"));
+    try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM confirmed_event_details;"));
+    try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM confirmed_policy_summaries;"));
+    try t.expectEqual(@as(i64, 0), try f.store.inspectInteger("SELECT count(*) FROM pragma_foreign_key_check;"));
+    try t.expectError(error.PrunedReplay, f.store.committedReceipt(after));
+}
 
 test "native maintenance: production mark delete retains guard and current anchor across restart" {
     var f = try Fixture.init();
@@ -596,6 +830,9 @@ test "native maintenance: physical delete budget includes children and resumes w
     var f = try Fixture.init();
     defer f.deinit();
     try setupCleanup(&f);
+    try f.store.enableRetryLeases();
+    try f.store.enableApplicationHistory();
+    try f.store.enableEscalation();
     var now = CleanupClock{};
     var ids: [5]durable.ReceiptIdentity = undefined;
     const names = [_][]const u8{ "first", "second", "third", "fourth", "anchor" };
@@ -605,12 +842,14 @@ test "native maintenance: physical delete budget includes children and resumes w
         id.cursor = name;
         try commitObserved(&f.store, id.*, i);
     }
-    for (names[0..4]) |name| for (0..16) |ordinal| {
+    for (names[0..4], 0..) |name, group| for (0..16) |ordinal| {
         var query: [1024]u8 = undefined;
         const value = try std.fmt.bufPrintZ(&query, "INSERT INTO record_detections(jail,source,occurrence,ordinal,version,kind,generation,filter) VALUES('receipt','file','{s}',{d},1,1,zeroblob(32),'fixture');", .{ name, ordinal });
         try sql(&f.store, value);
-        const decision = try std.fmt.bufPrintZ(&query, "INSERT INTO retry_decisions VALUES('receipt','file','{s}',4,X'C00002{x:0>2}',100,200,1,0);", .{ name, ordinal });
+        const decision = try std.fmt.bufPrintZ(&query, "INSERT INTO retry_decisions VALUES('receipt','file','{s}',4,X'C000{x:0>2}{x:0>2}',100,1,200,1,0);", .{ name, group + 2, ordinal + 1 });
         try sql(&f.store, decision);
+        const escalation = try std.fmt.bufPrintZ(&query, "INSERT INTO retry_decision_escalations VALUES('receipt','file','{s}',4,X'C000{x:0>2}{x:0>2}',1,0,NULL,1000000,0);", .{ name, group + 2, ordinal + 1 });
+        try sql(&f.store, escalation);
     };
     const fence = try cleanupFence(&f.store, identity, &now);
     const token = (try f.store.cleanupAdvance(fence, (try f.store.sourceMaintenance(identity.jail, identity.source, generation)).?, 5)).?;
@@ -618,17 +857,17 @@ test "native maintenance: physical delete budget includes children and resumes w
     try t.expectError(error.InjectedFailure, f.store.cleanupDelete(fence, token));
     f.store.fail_at = null;
     var progress = try f.store.cleanupDelete(fence, token);
-    try t.expectEqual(@as(u8, 33), progress.deleted_rows);
+    try t.expectEqual(@as(u8, 49), progress.deleted_rows);
     try t.expect(progress.more);
     var total: usize = progress.deleted_rows;
     try reopen(&f);
     for (0..3) |_| {
         const resumed = (try f.store.cleanupResume(identity.jail, identity.source, generation)).?;
         progress = try f.store.cleanupDelete(try cleanupFence(&f.store, identity, &now), resumed);
-        try t.expectEqual(@as(u8, 33), progress.deleted_rows);
+        try t.expectEqual(@as(u8, 49), progress.deleted_rows);
         total += progress.deleted_rows;
     }
-    try t.expectEqual(@as(usize, 132), total);
+    try t.expectEqual(@as(usize, 196), total);
     try t.expect(!progress.more);
     try t.expect(try f.store.hasRecord(ids[4].jail, ids[4].source, ids[4].occurrence, ids[4].raw_hash, ids[4].cursor));
     _ = try validateCleanup(&f.store);
@@ -860,6 +1099,7 @@ test "native maintenance: killed production migration mark delete and retirement
         defer f.deinit();
         try f.store.enableMaintenance();
         if (operation != 0) try f.store.enableCleanup();
+        if (operation == 2) try upgradeCleanupToLatest(&f);
         var now = CleanupClock{};
         if (operation == 1 or operation == 2) {
             try commitObserved(&f.store, identity, 0);
@@ -867,7 +1107,11 @@ test "native maintenance: killed production migration mark delete and retirement
             anchor.occurrence = "anchor";
             anchor.cursor = "anchor";
             try commitObserved(&f.store, anchor, 1);
-            if (operation == 2) _ = try f.store.cleanupAdvance(try cleanupFence(&f.store, identity, &now), (try f.store.sourceMaintenance(identity.jail, identity.source, generation)).?, 1);
+            if (operation == 2) {
+                try sql(&f.store, "INSERT INTO retry_decisions VALUES('receipt','file','original',4,X'C000025B',100,1,200,1,0);");
+                try sql(&f.store, "INSERT INTO retry_decision_escalations VALUES('receipt','file','original',4,X'C000025B',1,0,NULL,1000000,0);");
+                _ = try f.store.cleanupAdvance(try cleanupFence(&f.store, identity, &now), (try f.store.sourceMaintenance(identity.jail, identity.source, generation)).?, 1);
+            }
         } else if (operation == 3) {
             try f.store.admitRetry(identity.jail, generation, .{ .maxretry = 1, .window_us = 100, .duration = .{ .finite_us = 100 }, .max_subjects = 1 });
             try sql(&f.store, "UPDATE retry_clock SET floor_us=100; INSERT INTO retry_states VALUES('receipt',4,X'C000025B',100,200,7,X'');");
@@ -909,6 +1153,10 @@ test "native maintenance: killed production migration mark delete and retirement
                 try t.expectEqual(!after, try f.store.recordSequence(identity.jail, identity.source, identity.occurrence) != null);
                 try t.expectError(error.PrunedReplay, f.store.committedReceipt(identity));
                 try t.expectEqual(@as(u64, @intFromBool(after)), (try f.store.sourceMaintenance(identity.jail, identity.source, generation)).?.sweep_sequence);
+                try t.expectEqual(@as(i64, @intFromBool(!after)), try f.store.inspectInteger("SELECT count(*) FROM retry_decisions;"));
+                try t.expectEqual(@as(i64, @intFromBool(!after)), try f.store.inspectInteger("SELECT count(*) FROM retry_decision_escalations;"));
+                try t.expectEqual(@as(i64, 0), try f.store.inspectInteger("SELECT count(*) FROM pragma_foreign_key_check;"));
+                try t.expectEqual(!after, try f.store.cleanupResume(identity.jail, identity.source, generation) != null);
             },
             3 => {
                 try t.expectEqual(!after, try f.store.retryRetirementCandidate(identity.jail, null) != null);

@@ -183,6 +183,32 @@ test "migration inspect: blocker tree reports custom filter, custom action, igno
     try t.expectEqualStrings("notify-admin", m.assets[1].name);
 }
 
+test "migration inspect: portsentry Fail2ban history format is a blocker" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const config =
+        \\[portsentry]
+        \\enabled = true
+        \\filter = portsentry
+        \\backend = polling
+        \\logpath = /var/lib/portsentry/portsentry.history
+        \\banaction = nftables-allports
+        \\
+    ;
+    try tmp.dir.writeFile(.{ .sub_path = "jail.conf", .data = config });
+    const path = try tmp.dir.realpathAlloc(t.allocator, ".");
+    defer t.allocator.free(path);
+    var m = try inspect.inspect(t.allocator, .{ .source_dir = path });
+    defer m.deinit();
+
+    try t.expectEqual(inspect.ExitClass.rejected, inspect.exitClass(&m));
+    const portsentry = group(&m, "portsentry");
+    try t.expect(portsentry.enabled);
+    try t.expectEqual(inspect.DispositionKind.blocker, portsentry.disposition.kind);
+    try t.expect(hasReason(portsentry.disposition, "portsentry-history-format-unverified"));
+    try t.expectEqualStrings("portsentry", portsentry.mapping.builtin_filter.?);
+}
+
 test "migration inspect: disabled tree keeps groups visible and retains unknown keys" {
     const opts = fixture("disabled");
     defer t.allocator.free(opts.source_dir);

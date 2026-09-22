@@ -20,7 +20,7 @@ The supported migration workflow inspects fail2ban inputs, captures a read-only 
 plans and validates the native projection, and performs journaled cutover/rollback. Unsupported
 configuration is reported for operator action; exact fail2ban compatibility is not promised.
 
-Version 0.4.2 combines the
+Version 0.4.3 combines the
 daemon and administration functions in one static executable per architecture and requires no Python or
 shared SQLite library at runtime. Its [runtime architecture](docs/architecture.md) uses
 statically embedded SQLite for source receipts, consumer state, protection ownership and
@@ -31,6 +31,12 @@ firewall observations through the CLI. The 0.4.0 release received selected live 
 Debian 13 x86_64. The 0.4.1 SSH-default repair additionally passed isolated log-only origin
 and restart checks on Debian 13 and Ubuntu 24.04; this does not establish Ubuntu firewall
 qualification or full platform support.
+
+Version 0.4.3 fixes escalation-cleanup foreign-key failures and stalled file ingestion
+from malformed encoding, and adds the qualified PortSentry v2.0.7 history-file recipe.
+Before upgrading, retain a coherent state backup with its matching binary. Older
+binaries cannot read the extended checkpoints and replacement markers; rollback
+requires restoring that backup, not only swapping the executable.
 
 ---
 
@@ -78,7 +84,7 @@ The installer pulls from the
 [latest GitHub Release](https://github.com/ul0gic/fail2zig/releases/latest)
 and verifies every asset against the published `SHA256SUMS` before placing
 anything on disk. Pin a specific version with
-`FAIL2ZIG_VERSION=v0.4.2` or inspect the script first with
+`FAIL2ZIG_VERSION=v0.4.3` or inspect the script first with
 `curl -fsSL … | less`.
 
 ---
@@ -169,7 +175,7 @@ configuration, and installs the hardened `fail2zig.service` unit under
 `/etc/systemd/system/`. It does **not** auto-start the daemon — audit the config,
 then run `systemctl enable --now fail2zig` when ready.
 
-**0.4.2 release targets** (one combined daemon/admin executable each):
+**0.4.3 release targets** (one combined daemon/admin executable each):
 
 | Target | Hardware | Validation |
 |--------|----------|------------|
@@ -186,11 +192,11 @@ Legacy firewall modes and journal ingestion require their documented host tools.
 The release allowlist is exactly:
 
 ```text
-fail2zig-v0.4.2-x86_64-linux-musl
-fail2zig-v0.4.2-aarch64-linux-musl
-fail2zig-v0.4.2-arm-linux-musleabihf
-fail2zig-v0.4.2-mips-linux-musleabi
-fail2zig-v0.4.2-mipsel-linux-musleabi
+fail2zig-v0.4.3-x86_64-linux-musl
+fail2zig-v0.4.3-aarch64-linux-musl
+fail2zig-v0.4.3-arm-linux-musleabihf
+fail2zig-v0.4.3-mips-linux-musleabi
+fail2zig-v0.4.3-mipsel-linux-musleabi
 fail2zig.service
 fail2zig.toml.example
 install.sh
@@ -222,7 +228,7 @@ If you'd rather skip the script:
 ```bash
 # 1. Download the allowlisted release files
 set -euo pipefail
-VERSION=v0.4.2
+VERSION=v0.4.3
 ARCH=x86_64-linux-musl
 BASE="https://github.com/ul0gic/fail2zig/releases/download/${VERSION}"
 for file in \
@@ -408,6 +414,60 @@ zero is allowed for jitter but not bantime, findtime or the escalation cap. `"pe
 is available only for `bantime`. CLI durations and timeouts keep their existing numeric syntax.
 
 Full schema: [fail2zig.toml(5)](docs/man/fail2zig.toml.5).
+
+### PortSentry 2.x history input (v0.4.3)
+
+Version 0.4.3 targets the history-file format from upstream
+[PortSentry v2.0.7](https://github.com/portsentry/portsentry/releases/tag/v2.0.7).
+TCP-connect operation has been qualified on Debian 13 with IPv4 and IPv6.
+This does not cover PortSentry 1.2, and fail2zig
+refuses to treat a legacy same-named Fail2ban filter as this integration. The Debian
+13 standard repository package is legacy 1.2; that package version does not mean 2.x
+cannot run on Debian, but it is not a substitute for the pinned 2.0.7 target.
+
+Run PortSentry as the sensor and leave its response actions disabled so fail2zig is
+the only ban owner. The initial deployment recipe uses `portsentry --connect` with
+one `TCP_PORTS` list containing ports verified unused on that host and these settings:
+
+```text
+TCP_PORTS="1,11,15" # example only; select unused ports for the protected host
+HISTORY_FILE="/var/log/portsentry.log"
+RESOLVE_HOST="0"
+SCAN_TRIGGER="0"
+BLOCK_TCP="0"
+BLOCK_UDP="0"
+```
+
+Remove or comment every `UDP_PORTS` directive for this TCP-only recipe. Do not set
+`UDP_PORTS=""`; PortSentry rejects an empty port list. `BLOCK_UDP="0"` disables
+PortSentry's UDP response, but it does not stop UDP observations when UDP ports are
+configured, and those accepted observations could still cause fail2zig bans.
+
+Then configure the enforcing jail:
+
+```toml
+[jails.portsentry]
+enabled = true
+filter = "portsentry"
+source = "file"
+timestamp = "iso8601"
+logpath = ["/var/log/portsentry.log"]
+maxretry = 1
+enforce = true
+```
+
+Each accepted event protects the source host across all protocols and ports. Check
+the real history file without starting the daemon:
+
+```bash
+sudo fail2zig rule-test --file /var/log/portsentry.log \
+  --service portsentry --output table
+```
+
+The live check covered IPv4 and IPv6 TCP-connect events through ban and expiry.
+UDP and stealth-mode
+deployment remain unqualified even though their v2.0.7 history grammar is recognized.
+PortSentry stdout, syslog and journal envelopes are outside this first integration.
 
 ### Migrate from fail2ban
 
@@ -647,7 +707,7 @@ affected ingestion while protection and bounded degraded-health reporting remain
   administration commands are unaffected. `metrics_port = 0` is rejected, it does
   not disable the endpoint
 
-### Built-in filters (15)
+### Built-in filters (16)
 
 | Category | Filters |
 |----------|---------|
@@ -657,6 +717,7 @@ affected ingestion while protection and bounded degraded-health reporting remain
 | DNS | `named-refused` (BIND) |
 | FTP | `vsftpd`, `proftpd` |
 | Database | `mysqld-auth` |
+| Network sensor | `portsentry` (v0.4.3; PortSentry v2.0.7 history files) |
 | Meta | `recidive` (escalates repeat offenders — fed in-process from confirmed bans in other jails, `source = "internal"`; no ban log to tail) |
 
 Full reference: [reference/filters](https://fail2zig.com/docs/reference/filters/).
@@ -704,7 +765,7 @@ fail2zig/
 │   ├── core/            # Event loop, log watcher, parser, state tracker
 │   ├── firewall/        # nftables (netlink), iptables, ipset backends
 │   ├── config/          # Native TOML + fail2ban jail.conf importer
-│   ├── filters/         # Comptime-generated filter library (15 filters)
+│   ├── filters/         # Comptime-generated filter library (16 filters)
 │   ├── net/             # HTTP metrics + WebSocket event server
 │   └── main.zig         # Entry point, CLI args, daemon lifecycle
 ├── client/              # Administration modules linked into the one executable

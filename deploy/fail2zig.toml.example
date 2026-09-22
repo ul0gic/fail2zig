@@ -59,3 +59,27 @@ source = "file"
 timestamp = "undated"
 logpath = ["/var/log/nginx/error.log"]
 ignoreip = ["192.168.0.0/16"]
+
+# v0.4.3 PortSentry v2.0.7 history-file integration. The Debian 13 standard
+# repository package is legacy 1.2, which is not compatible with this filter.
+# Run PortSentry with --connect and configure it separately with:
+#   TCP_PORTS="1,11,15"  # example; choose ports verified unused on this host
+#   HISTORY_FILE="/var/log/portsentry.log"
+#   RESOLVE_HOST="0"
+#   SCAN_TRIGGER="0"
+#   BLOCK_TCP="0"
+#   BLOCK_UDP="0"
+# Remove or comment every UDP_PORTS directive for this TCP-only recipe. Do not set
+# UDP_PORTS=""; PortSentry rejects an empty list. BLOCK_UDP=0 disables PortSentry's
+# response but does not stop UDP observations when UDP ports remain configured.
+# This leaves fail2zig as the only ban owner. Automatic bans cover the source host
+# across all protocols and ports. IPv4/IPv6 TCP-connect was qualified on Debian 13;
+# UDP and stealth-mode deployment are not qualified by this initial integration.
+[jails.portsentry]
+enabled = false
+filter = "portsentry"
+source = "file"
+timestamp = "iso8601"
+logpath = ["/var/log/portsentry.log"]
+maxretry = 1
+enforce = true

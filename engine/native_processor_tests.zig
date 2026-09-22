@@ -69,7 +69,10 @@ test "native processor: preparation is bounded and checkpoints reject foreign or
     restored.publish(restored.context);
     restored.release(restored.context);
     try std.testing.expectEqual(@as(u64, 1), processor.timeHealth().eligible);
-    try std.testing.expectError(error.InvalidEncoding, adapter.prepare(record("1000|\xff"), adapter.context));
+    prepared = try adapter.prepare(record("1000|\xff"), adapter.context);
+    try std.testing.expect(prepared.native_time.?.eligible.encoding_replaced);
+    try std.testing.expectEqual(@as(u64, 0), processor.timeHealth().malformed);
+    prepared.release(prepared.context);
     var missing_receipt = record("1000|ordinary");
     missing_receipt.receipt_time = null;
     try std.testing.expectError(error.MissingReceiptTime, adapter.prepare(missing_receipt, adapter.context));
@@ -207,13 +210,14 @@ test "native processor: saved tail cursors and rotated incarnations survive down
     }
     try temp.dir.rename("ordinary.log", "ordinary.rotated");
     try temp.dir.writeFile(.{ .sub_path = "ordinary.log", .data = "1000|ordinary replacement baseline\n" });
-    try file.writeAll("1000|ordinary late append\n");
+    try file.writeAll("1000|ordinary malformed late append\xff\n1000|ordinary late append\n");
     {
         const session = try sessions.Session.create(a, &store, config, &specs);
         defer session.destroy();
         try std.testing.expectEqual(@as(usize, 2), session.sources.sources.items.len);
-        try std.testing.expectEqual(@as(usize, 1), try session.poll(2));
-        try std.testing.expectEqual(@as(u64, 2), session.processor.timeHealth().eligible);
+        for (0..3) |_| _ = try session.poll(2);
+        try std.testing.expectEqual(@as(u64, 3), session.processor.timeHealth().eligible);
+        try std.testing.expectEqual(@as(u64, 1), session.processor.encodingReplaced());
     }
     const revision = try store.revision("ordinary");
     try temp.dir.deleteFile("ordinary.rotated");
@@ -283,8 +287,13 @@ test "native processor: actual file sessions decode every admitted encoding befo
     config.encoding = .latin1;
     config.max_decoded_bytes = scratch.len;
     var processor = try native.Processor.init(a, config, &scratch, .{ .us = 1_000_000_000 });
-    try std.testing.expectError(error.OutputTooSmall, processor.adapter().prepare(record("1|\xe9\xe9"), &processor));
+    const oversized = try processor.adapter().prepare(record("1|\xe9\xe9"), &processor);
+    try std.testing.expect(oversized.native_time.? == .rejected);
     try std.testing.expectEqual(policy.Counters{}, processor.timeHealth());
+    oversized.publish(oversized.context);
+    oversized.release(oversized.context);
+    try std.testing.expectEqual(@as(u64, 1), processor.timeHealth().malformed);
+    try std.testing.expectEqual(@as(u64, 0), processor.encodingReplaced());
 }
 
 test "native processor: pending source verification fails before activation and allocation failures leave state intact" {
@@ -484,4 +493,274 @@ test "year inference: actual file restart retains the original year and rejectio
         changed.processing.timestamp.field.context.offset_seconds = 3600;
         try std.testing.expectError(error.SourceGenerationMismatch, sessions.Session.create(a, &store, changed, &specs));
     }
+}
+
+test "native processor: malformed file records commit exact identity and resume after transaction faults" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { line: []const u8, rejected: bool = false }{
+        .{ .line = "\xff1000|untrusted\n", .rejected = true },
+        .{ .line = "1000|un\xfftrusted\n", .rejected = false },
+        .{ .line = "1000|untrusted\xff\n", .rejected = false },
+        .{ .line = "1000|untrusted\xe2\x82\n", .rejected = false },
+    };
+    const stages = [_]store_mod.CommitStage{ .after_record, .after_checkpoint, .after_receipt_delete, .before_commit };
+    for (cases) |case| for (stages) |stage| {
+        var temp = std.testing.tmpDir(.{});
+        defer temp.cleanup();
+        const root = try temp.dir.realpathAlloc(a, ".");
+        defer a.free(root);
+        const path = try std.fs.path.join(a, &.{ root, "ordinary.log" });
+        defer a.free(path);
+        const database = try std.fs.path.join(a, &.{ root, "state.sqlite" });
+        defer a.free(database);
+        const file = try temp.dir.createFile("ordinary.log", .{});
+        defer file.close();
+        var clock = Clock{};
+        const original_receipt = clock.now;
+        const config = sessions.Options{ .processing = options(), .max_sources = 1, .clock = Clock.read, .clock_context = &clock };
+        const specs = [_]sessions.Spec{.{ .pattern = path }};
+        var pending: store_mod.Store.PendingSource = undefined;
+        var initial: files.Resume = undefined;
+        var baseline_revision: u64 = undefined;
+        var generation: [32]u8 = undefined;
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(case.line, &hash, .{});
+        {
+            var store = try store_mod.Store.open(a, database);
+            defer store.close();
+            try store.enableReceipts(1);
+            try store.enableNativeTime();
+            const session = try sessions.Session.create(a, &store, config, &specs);
+            defer session.destroy();
+            _ = try session.poll(1);
+            initial = session.sources.sources.items[0].acknowledgedCheckpoint().?;
+            generation = session.processor.generation;
+            baseline_revision = try store.revision("ordinary");
+            try file.writeAll(case.line);
+            try file.writeAll("1000|valid after malformed\n");
+            store.fail_at = stage;
+            try std.testing.expectError(error.InjectedFailure, session.poll(1));
+            try std.testing.expectEqualDeep(policy.Counters{}, session.processor.timeHealth());
+            try std.testing.expectEqual(@as(u64, 0), session.processor.encodingReplaced());
+            try std.testing.expectEqualDeep(initial, session.sources.sources.items[0].acknowledgedCheckpoint().?);
+            try std.testing.expectEqual(baseline_revision, try store.revision("ordinary"));
+            pending = (try store.readPendingPosition(a, "ordinary", null)).?;
+            try std.testing.expectEqualSlices(u8, &hash, &pending.identity.raw_hash);
+            try std.testing.expectEqualSlices(u8, &generation, &pending.identity.generation);
+            try std.testing.expectEqual(original_receipt, pending.receipt_us);
+            try std.testing.expect(!try store.hasRecord("ordinary", pending.identity.source, pending.identity.occurrence, hash, pending.identity.cursor));
+        }
+        defer pending.deinit(a);
+        clock.now += 1_000_000;
+        {
+            var store = try store_mod.Store.open(a, database);
+            defer store.close();
+            try store.enableReceipts(1);
+            try store.enableNativeTime();
+            const session = try sessions.Session.create(a, &store, config, &specs);
+            defer session.destroy();
+            try std.testing.expectEqualSlices(u8, &generation, &session.processor.generation);
+            try std.testing.expectEqual(@as(usize, 1), try session.poll(1));
+            const source = &session.sources.sources.items[0];
+            const cursor = source.acknowledgedCheckpoint().?;
+            try std.testing.expectEqual(@as(u64, case.line.len), cursor.offset);
+            try std.testing.expectEqualDeep(initial.incarnation, cursor.incarnation);
+            try std.testing.expectEqualDeep(initial.codec_configuration_hash, cursor.codec_configuration_hash);
+            var identity: [256]u8 = undefined;
+            const expected = try std.fmt.bufPrint(&identity, "file:v1:{s}:0:{d}:{s}", .{ std.fmt.fmtSliceHexLower(&initial.incarnation), case.line.len, std.fmt.fmtSliceHexLower(&hash) });
+            try std.testing.expectEqualStrings(expected, pending.identity.occurrence);
+            try std.testing.expect(try store.hasRecord("ordinary", source.source_id, expected, hash, pending.identity.cursor));
+            const outcome = (try store.nativeTime("ordinary", source.source_id, expected)).?;
+            if (case.rejected) {
+                try std.testing.expectEqual(policy.Reason.malformed, outcome.rejected.reason);
+                try std.testing.expect(outcome.rejected.encoding_replaced);
+            } else {
+                try std.testing.expect(outcome.eligible.encoding_replaced);
+                try std.testing.expectEqual(original_receipt, outcome.eligible.receipt.us);
+            }
+            try std.testing.expectEqual(@as(u64, 1), session.processor.encodingReplaced());
+            try std.testing.expectEqual(@as(u64, if (case.rejected) 1 else 0), session.processor.timeHealth().malformed);
+            try std.testing.expectEqual(@as(u64, if (case.rejected) 0 else 1), session.processor.timeHealth().eligible);
+            try std.testing.expectEqual(@as(usize, 0), try store.pendingReceiptCount());
+            try std.testing.expectEqual(@as(i64, 0), try store.pendingIntents());
+            try std.testing.expectEqual(baseline_revision + 1, try store.revision("ordinary"));
+        }
+        // A second reopen proves the committed disposition is not replayed.
+        var store = try store_mod.Store.open(a, database);
+        defer store.close();
+        try store.enableReceipts(1);
+        try store.enableNativeTime();
+        const session = try sessions.Session.create(a, &store, config, &specs);
+        defer session.destroy();
+        try std.testing.expectEqual(@as(u64, 1), session.processor.encodingReplaced());
+        try std.testing.expectEqual(@as(usize, 1), try session.poll(1));
+        try std.testing.expectEqual(@as(u64, if (case.rejected) 1 else 2), session.processor.timeHealth().eligible);
+        try std.testing.expectEqual(@as(u64, if (case.rejected) 1 else 0), session.processor.timeHealth().malformed);
+        try std.testing.expectEqual(@as(u64, 1), session.processor.encodingReplaced());
+        try std.testing.expectEqual(baseline_revision + 2, try store.revision("ordinary"));
+        try std.testing.expectEqual(@as(usize, 0), try session.poll(1));
+    };
+}
+
+test "native processor: malformed disposition stays with old incarnation across copytruncate" {
+    const a = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const root = try temp.dir.realpathAlloc(a, ".");
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "ordinary.log" });
+    defer a.free(path);
+    const database = try std.fs.path.join(a, &.{ root, "state.sqlite" });
+    defer a.free(database);
+    try temp.dir.writeFile(.{ .sub_path = "ordinary.log", .data = "1000|malformed record before truncate\xff\n" });
+    var store = try store_mod.Store.open(a, database);
+    defer store.close();
+    try store.enableReceipts(1);
+    try store.enableNativeTime();
+    var clock = Clock{};
+    const config = sessions.Options{ .processing = options(), .max_sources = 1, .clock = Clock.read, .clock_context = &clock };
+    const session = try sessions.Session.create(a, &store, config, &.{.{ .pattern = path }});
+    defer session.destroy();
+    try std.testing.expectEqual(@as(usize, 1), try session.poll(1));
+    const old = session.sources.sources.items[0].acknowledgedCheckpoint().?;
+    try std.testing.expectEqual(@as(u64, 1), session.processor.encodingReplaced());
+    try temp.dir.writeFile(.{ .sub_path = "ordinary.log", .data = "1000|valid\n" });
+    for (0..3) |_| _ = try session.poll(1);
+    const current = session.sources.sources.items[0].acknowledgedCheckpoint().?;
+    try std.testing.expect(!std.mem.eql(u8, &old.incarnation, &current.incarnation));
+    try std.testing.expectEqual(@as(u64, "1000|valid\n".len), current.offset);
+    try std.testing.expectEqual(@as(u64, 2), session.processor.timeHealth().eligible);
+    try std.testing.expectEqual(@as(u64, 1), session.processor.encodingReplaced());
+    try std.testing.expectEqual(@as(usize, 0), try store.pendingReceiptCount());
+}
+
+test "native processor: replacement checkpoints accept legacy state and notices follow committed deltas" {
+    var scratch: [2048]u8 = undefined;
+    var processor = try native.Processor.init(std.testing.allocator, options(), &scratch, .{ .us = 1_000_000_000 });
+    const adapter = processor.adapter();
+    var prepared = try adapter.prepare(record("1000|untrusted\xff"), adapter.context);
+    try std.testing.expect(processor.encodingNotice(0) == null);
+    prepared.release(prepared.context);
+    try std.testing.expect(processor.encodingNotice(0) == null);
+    prepared = try adapter.prepare(record("1000|untrusted\xff"), adapter.context);
+    prepared.publish(prepared.context);
+    prepared.release(prepared.context);
+    try std.testing.expectEqual(@as(?u64, 1), processor.encodingNotice(100));
+    try std.testing.expect(processor.encodingNotice(100) == null);
+    prepared = try adapter.prepare(record("1000|untrusted\xff"), adapter.context);
+    var saved: [native.checkpoint_bytes]u8 = undefined;
+    @memcpy(&saved, prepared.checkpoint);
+    prepared.publish(prepared.context);
+    prepared.release(prepared.context);
+    try std.testing.expect(processor.encodingNotice(99) == null);
+    try std.testing.expect(processor.encodingNotice(60_099) == null);
+    try std.testing.expectEqual(@as(?u64, 1), processor.encodingNotice(60_100));
+    try std.testing.expect(processor.encodingNotice(120_100) == null);
+
+    var restarted = try native.Processor.init(std.testing.allocator, options(), &scratch, .{ .us = 1_000_000_000 });
+    var restore = try restarted.adapter().prepare_restore(&saved, &restarted);
+    restore.publish(restore.context);
+    restore.release(restore.context);
+    try std.testing.expectEqual(@as(u64, 2), restarted.encodingReplaced());
+    try std.testing.expect(restarted.encodingNotice(0) == null);
+    prepared = try restarted.adapter().prepare(record("1000|untrusted\xff"), &restarted);
+    prepared.publish(prepared.context);
+    prepared.release(prepared.context);
+    try std.testing.expectEqual(@as(?u64, 1), restarted.encodingNotice(0));
+
+    // Legacy checkpoints have the same generation and seven counters, without the extension.
+    restore = try restarted.adapter().prepare_restore(saved[0..96], &restarted);
+    restore.publish(restore.context);
+    restore.release(restore.context);
+    try std.testing.expectEqual(@as(u64, 2), restarted.timeHealth().eligible);
+    try std.testing.expectEqual(@as(u64, 0), restarted.encodingReplaced());
+    for ([_]u64{ 3, @as(u64, std.math.maxInt(i64)) + 1 }) |invalid_count| {
+        var invalid = saved;
+        std.mem.writeInt(u64, invalid[96..104], invalid_count, .little);
+        try std.testing.expectError(error.InvalidTimeCounters, restarted.adapter().prepare_restore(&invalid, &restarted));
+        try std.testing.expectEqual(@as(u64, 0), restarted.encodingReplaced());
+        try std.testing.expect(!restarted.in_flight);
+    }
+}
+
+test "native processor: legacy checkpoint and strict-decoder pending receipt recover together" {
+    const a = std.testing.allocator;
+    const Legacy = struct {
+        fn prepare(input: records.Record, context: ?*anyopaque) !@import("core/record_pipeline.zig").Prepared {
+            const processor: *native.Processor = @ptrCast(@alignCast(context.?));
+            if (input.kind == .data) _ = try text.decode(processor.options.encoding, input.message, processor.scratch, input.byte_start orelse 0, processor.options.bom);
+            var prepared = try processor.adapter().prepare(input, context);
+            prepared.checkpoint = prepared.checkpoint[0..96];
+            return prepared;
+        }
+    };
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const root = try temp.dir.realpathAlloc(a, ".");
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "ordinary.log" });
+    defer a.free(path);
+    const database = try std.fs.path.join(a, &.{ root, "state.sqlite" });
+    defer a.free(database);
+    const file = try temp.dir.createFile("ordinary.log", .{});
+    defer file.close();
+    const clean = "1000|initial clean record\n";
+    const damaged = "1000|damaged\xff record\n";
+    try file.writeAll(clean);
+    var clock = Clock{};
+    const original_receipt = clock.now;
+    const config = sessions.Options{ .processing = options(), .max_sources = 1, .clock = Clock.read, .clock_context = &clock };
+    const specs = [_]sessions.Spec{.{ .pattern = path }};
+    var pending: store_mod.Store.PendingSource = undefined;
+    var generation: [32]u8 = undefined;
+    var revision: u64 = undefined;
+    {
+        var store = try store_mod.Store.open(a, database);
+        defer store.close();
+        try store.enableReceipts(1);
+        try store.enableNativeTime();
+        const session = try sessions.Session.create(a, &store, config, &specs);
+        defer session.destroy();
+        session.pipe.processor.prepare = Legacy.prepare;
+        try std.testing.expectEqual(@as(usize, 1), try session.poll(1));
+        generation = session.processor.generation;
+        revision = try store.revision("ordinary");
+        const saved = (try store.checkpoint(a, "ordinary")).?;
+        defer a.free(saved);
+        try std.testing.expectEqual(@as(usize, 96), saved.len);
+        try file.writeAll(damaged);
+        try file.writeAll("1000|valid after recovery\n");
+        try std.testing.expectError(error.InvalidEncoding, session.poll(1));
+        try std.testing.expectEqual(@as(u64, clean.len), session.sources.sources.items[0].acknowledgedCheckpoint().?.offset);
+        try std.testing.expectEqual(revision, try store.revision("ordinary"));
+        pending = (try store.readPendingPosition(a, "ordinary", null)).?;
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(damaged, &hash, .{});
+        try std.testing.expectEqualSlices(u8, &hash, &pending.identity.raw_hash);
+        try std.testing.expectEqual(original_receipt, pending.receipt_us);
+    }
+    defer pending.deinit(a);
+    clock.now += 1_000_000;
+    var store = try store_mod.Store.open(a, database);
+    defer store.close();
+    try store.enableReceipts(1);
+    try store.enableNativeTime();
+    const session = try sessions.Session.create(a, &store, config, &specs);
+    defer session.destroy();
+    try std.testing.expectEqualSlices(u8, &generation, &session.processor.generation);
+    try std.testing.expectEqual(@as(u64, 1), session.processor.timeHealth().eligible);
+    try std.testing.expectEqual(@as(u64, 0), session.processor.encodingReplaced());
+    try std.testing.expectEqual(@as(usize, 1), try session.poll(1));
+    try std.testing.expect(try store.hasRecord("ordinary", pending.identity.source, pending.identity.occurrence, pending.identity.raw_hash, pending.identity.cursor));
+    const recovered = (try store.nativeTime("ordinary", pending.identity.source, pending.identity.occurrence)).?.eligible;
+    try std.testing.expect(recovered.encoding_replaced);
+    try std.testing.expectEqual(original_receipt, recovered.receipt.us);
+    try std.testing.expectEqual(@as(u64, clean.len + damaged.len), session.sources.sources.items[0].acknowledgedCheckpoint().?.offset);
+    try std.testing.expectEqual(@as(u64, 1), session.processor.encodingReplaced());
+    try std.testing.expectEqual(@as(usize, 0), try store.pendingReceiptCount());
+    try std.testing.expectEqual(@as(usize, 1), try session.poll(1));
+    try std.testing.expectEqual(@as(u64, 3), session.processor.timeHealth().eligible);
+    try std.testing.expectEqual(@as(u64, 1), session.processor.encodingReplaced());
+    try std.testing.expectEqual(revision + 2, try store.revision("ordinary"));
+    try std.testing.expectEqual(@as(usize, 0), try session.poll(1));
 }
