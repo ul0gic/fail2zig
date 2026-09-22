@@ -9,12 +9,14 @@ const nginx = @import("nginx.zig");
 const apache = @import("apache.zig");
 const mail = @import("mail.zig");
 const misc = @import("misc.zig");
+const portsentry = @import("portsentry.zig");
 
 pub const PatternDef = types.PatternDef;
 
 pub const Entry = struct {
     name: []const u8,
     patterns: []const PatternDef,
+    whole_record: bool = false,
 };
 
 pub const entries = [_]Entry{
@@ -29,6 +31,7 @@ pub const entries = [_]Entry{
     .{ .name = "nginx-http-auth", .patterns = &nginx.http_auth_patterns },
     .{ .name = "nginx-limit-req", .patterns = &nginx.limit_req_patterns },
     .{ .name = "postfix", .patterns = &mail.postfix_patterns },
+    .{ .name = "portsentry", .patterns = &portsentry.patterns, .whole_record = true },
     .{ .name = "proftpd", .patterns = &misc.proftpd_patterns },
     .{ .name = "recidive", .patterns = &misc.recidive_patterns },
     .{ .name = "sshd", .patterns = &sshd.patterns },
@@ -40,6 +43,14 @@ pub fn get(name: []const u8) ?[]const PatternDef {
         if (namesEqual(e.name, name)) return e.patterns;
     }
     return null;
+}
+
+/// Timestamped history files need not have a syslog host/daemon envelope.
+pub fn requiresWholeRecord(name: []const u8) bool {
+    for (entries) |entry| {
+        if (namesEqual(entry.name, name)) return entry.whole_record;
+    }
+    return false;
 }
 
 pub const FilterMatcher = struct {

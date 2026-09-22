@@ -26,6 +26,7 @@ pub const Reason = enum { missing, malformed, out_of_range, unsupported_precisio
 pub const Input = union(enum) { parsed: time.Timestamp, rejected: Reason };
 pub const Origin = enum { event, receipt, clock_adjusted };
 pub const Evidence = struct {
+    encoding_replaced: bool = false,
     timestamp: time.Timestamp,
     origin: Origin,
     original: ?time.Timestamp,
@@ -33,6 +34,7 @@ pub const Evidence = struct {
     inferred_year: ?u16 = null,
 };
 pub const Rejection = struct {
+    encoding_replaced: bool = false,
     reason: Reason,
     original: ?time.Timestamp = null,
     receipt: ?time.Timestamp = null,
@@ -43,24 +45,42 @@ pub const Result = union(enum) {
     obsolete: Evidence,
     rejected: Rejection,
 
+    pub fn encodingReplaced(self: Result) bool {
+        return switch (self) {
+            inline else => |value| value.encoding_replaced,
+        };
+    }
+
+    pub fn withEncodingReplacement(self: Result) Result {
+        var result = self;
+        switch (result) {
+            inline else => |*value| value.encoding_replaced = true,
+        }
+        return result;
+    }
+
+    fn marked(self: Result, comptime value: []const u8) []const u8 {
+        return if (self.encodingReplaced()) value ++ "-encoding-replaced" else value;
+    }
+
     pub fn disposition(self: Result) []const u8 {
         return switch (self) {
             .eligible => |value| switch (value.origin) {
-                .event => "time-eligible-event",
-                .receipt => "time-eligible-receipt",
-                .clock_adjusted => "time-eligible-clock-adjusted",
+                .event => self.marked("time-eligible-event"),
+                .receipt => self.marked("time-eligible-receipt"),
+                .clock_adjusted => self.marked("time-eligible-clock-adjusted"),
             },
             .obsolete => |value| switch (value.origin) {
-                .event => "time-obsolete-event",
-                .receipt => "time-obsolete-receipt",
-                .clock_adjusted => "time-obsolete-clock-adjusted",
+                .event => self.marked("time-obsolete-event"),
+                .receipt => self.marked("time-obsolete-receipt"),
+                .clock_adjusted => self.marked("time-obsolete-clock-adjusted"),
             },
             .rejected => |value| switch (value.reason) {
-                .missing => "time-rejected-missing",
-                .malformed => "time-rejected-malformed",
-                .out_of_range => "time-rejected-range",
-                .unsupported_precision => "time-rejected-precision",
-                .future => "time-rejected-future",
+                .missing => self.marked("time-rejected-missing"),
+                .malformed => self.marked("time-rejected-malformed"),
+                .out_of_range => self.marked("time-rejected-range"),
+                .unsupported_precision => self.marked("time-rejected-precision"),
+                .future => self.marked("time-rejected-future"),
             },
         };
     }

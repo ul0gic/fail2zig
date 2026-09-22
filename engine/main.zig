@@ -42,6 +42,7 @@ pub const filter_nginx_mod = @import("filters/nginx.zig");
 pub const filter_apache_mod = @import("filters/apache.zig");
 pub const filter_mail_mod = @import("filters/mail.zig");
 pub const filter_misc_mod = @import("filters/misc.zig");
+pub const filter_portsentry_mod = @import("filters/portsentry.zig");
 pub const filter_registry_mod = @import("filters/registry.zig");
 pub const ban_lifecycle_mod = @import("core/ban_lifecycle.zig");
 pub const ipc_mod = @import("net/ipc.zig");

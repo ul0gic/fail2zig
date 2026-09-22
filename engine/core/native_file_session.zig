@@ -762,8 +762,12 @@ pub const Session = struct {
         return error.PendingSourceMissing;
     }
     fn logNotices(self: *Session) void {
+        if (self.processor.encodingNotice(self.notices.read() / std.time.ns_per_ms)) |count| std.log.scoped(.source_text).warn(
+            "jail {s}: encoding damage in {d} committed records; invalid text replaced for matching, records exceeding decoded bounds excluded",
+            .{ self.pipe.jail, count },
+        );
         if (self.processor.timeNotice(self.notices.read() / std.time.ns_per_ms)) |notice| std.log.scoped(.source_time).warn(
-            "jail {s}: rejected timestamps: missing={d}, malformed={d}, future={d}; records excluded from detection evidence",
+            "jail {s}: rejected source records: missing timestamp={d}, malformed text/timestamp={d}, future timestamp={d}; records excluded from detection evidence",
             .{ self.pipe.jail, notice.missing_since_notice, notice.malformed_since_notice, notice.future_since_notice },
         );
     }

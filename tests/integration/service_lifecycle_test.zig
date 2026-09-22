@@ -41,6 +41,7 @@ const Paths = struct {
 };
 
 const ConfigOptions = struct {
+    maxretry: u32 = 3,
     bantime: u32 = 60,
     log_target: ?[]const u8 = null,
     state_file: ?[]const u8 = null,
@@ -63,11 +64,11 @@ fn writeConfig(h: *harness.Harness, p: *const Paths, opts: ConfigOptions) !void 
         \\{s}
         \\[defaults]
         \\banaction = "log-only"
-        \\maxretry = 3
+        \\maxretry = {d}
         \\findtime = 600
         \\bantime = {d}
         \\
-    , .{ opts.log_target orelse "stderr", opts.state_file orelse p.state_file, h.socket_path, opts.extra, opts.bantime });
+    , .{ opts.log_target orelse "stderr", opts.state_file orelse p.state_file, h.socket_path, opts.extra, opts.maxretry, opts.bantime });
     if (opts.journal) {
         try w.writeAll(
             \\[jails.sshd]
@@ -312,6 +313,66 @@ test "lifecycle: READY only after admission, RELOADING/READY around SIGHUP, STOP
     try fx.rx.expectNext(&buf, "STOPPING=1\n", 5 * std.time.ns_per_s);
     try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try d.waitBounded(10 * std.time.ns_per_s));
     try expectNoSocket(&fx.h);
+}
+
+test "lifecycle: malformed file records permit READY and retained-state restart" {
+    const a = t.allocator;
+    var fx = try Fixture.init(a);
+    defer fx.deinit(a);
+    try writeConfig(&fx.h, &fx.p, .{ .log_target = fx.p.log_target, .maxretry = 1 });
+    const valid = "Failed password for root from 203.0.113.7 port 22 ssh2\n";
+    // The first live decision pins the source prefix while the test inspects
+    // the retained encoding diagnostics.
+    const input = "Failed password for r\xffoot from 203.0.113.7 port 22 ssh2\nnonmatching \xff request\n" ++ valid ++ valid;
+    try fx.h.writeLine(input);
+    var buf: [256]u8 = undefined;
+    for (0..2) |_| {
+        var daemon = try Daemon.spawn(a, &fx.h, fx.p.notify, false);
+        defer daemon.deinit();
+        try fx.h.waitForSocket(5_000);
+        try waitReadyAfterAdmission(&fx.h, fx.rx);
+        var timer = try std.time.Timer.start();
+        var decided = false;
+        while (timer.read() < startup_timeout_ns) {
+            const status = try fx.h.queryStatus();
+            defer a.free(status);
+            if (std.mem.indexOf(u8, status, "\"decisions_total\":1") != null and std.mem.indexOf(u8, status, "\"unhealthy_sources\":0") != null) {
+                var store = try @import("engine").native_store_mod.Store.openReadOnly(a, fx.p.state_file);
+                defer store.close();
+                const Cursor = struct {
+                    offset: ?u64 = null,
+                    fn visit(_: []const u8, _: []const u8, bytes: []const u8, context: ?*anyopaque) !void {
+                        const self: *@This() = @ptrCast(@alignCast(context.?));
+                        if (self.offset != null) return error.UnexpectedSourceCount;
+                        const parsed = try std.json.parseFromSlice(struct { offset: u64 }, t.allocator, bytes, .{ .ignore_unknown_fields = true });
+                        defer parsed.deinit();
+                        self.offset = parsed.value.offset;
+                    }
+                };
+                var cursor = Cursor{};
+                try store.visitSources("sshd", Cursor.visit, &cursor);
+                if (cursor.offset != null and cursor.offset.? > input.len) return error.UnexpectedSourceOffset;
+                if (cursor.offset == input.len) {
+                    decided = true;
+                    break;
+                }
+            }
+            std.time.sleep(20 * std.time.ns_per_ms);
+        }
+        try t.expect(decided);
+        const shared = @import("shared");
+        const health = try fx.h.sendCommand(.{ .query_v1 = try shared.Command.Body.init("{\"schema_version\":1,\"kind\":\"health\"}") });
+        defer a.free(health);
+        try t.expect(std.mem.indexOf(u8, health, "\"ready\":true") != null);
+        try daemon.signal(posix.SIG.TERM);
+        try fx.rx.expectNext(&buf, "STOPPING=1\n", 5 * std.time.ns_per_s);
+        try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try daemon.waitBounded(10 * std.time.ns_per_s));
+        var store = try @import("engine").native_store_mod.Store.openReadOnly(a, fx.p.state_file);
+        defer store.close();
+        try t.expectEqual(@as(i64, 2), try store.inspectInteger("SELECT count(*) FROM records WHERE disposition='time-eligible-receipt-encoding-replaced';"));
+        try t.expectEqual(@as(i64, 1), try store.inspectInteger("SELECT count(*) FROM retry_decisions;"));
+        try t.expectEqual(@as(usize, 0), try store.pendingReceiptCount());
+    }
 }
 
 test "lifecycle: SIGINT stops cleanly with STOPPING and exit 0" {

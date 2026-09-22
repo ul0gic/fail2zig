@@ -131,6 +131,101 @@ pub fn decode(encoding: Encoding, input: []const u8, scratch: []u8, absolute_off
     return output[0..written];
 }
 
+pub const Decoded = struct { text: []const u8, replaced: bool, exceeded: bool = false };
+
+// File records are byte-framed before decoding. Replace maximal invalid subsequences
+// without consuming a following valid character or joining text across damaged bytes.
+pub fn decodeFile(encoding: Encoding, input: []const u8, scratch: []u8, absolute_offset: u64, bom: Bom) Error!Decoded {
+    if (input.len > max_record_bytes) return error.RecordTooLarge;
+    if (absolute_offset % encoding.width() != 0) return error.MisalignedOffset;
+    const skip = if (absolute_offset == 0 and bom == .strip_stream_start and encoding != .ascii and encoding != .latin1)
+        try bomLength(encoding, input)
+    else
+        0;
+    const bytes = input[skip..];
+    const output = scratch[0..@min(scratch.len, max_record_bytes)];
+    var i: usize = 0;
+    var written: usize = 0;
+    var replaced = false;
+    var exceeded = false;
+    while (i < bytes.len) {
+        var point: u32 = 0xfffd;
+        var damaged = false;
+        switch (encoding) {
+            .ascii, .latin1 => {
+                point = bytes[i];
+                i += 1;
+                if (encoding == .ascii and point > 127) damaged = true;
+            },
+            .utf8 => utf8: {
+                const first = bytes[i];
+                const count: usize = if (first < 0x80) 1 else if (first >= 0xc2 and first <= 0xdf) 2 else if (first >= 0xe0 and first <= 0xef) 3 else if (first >= 0xf0 and first <= 0xf4) 4 else 0;
+                if (count == 0) {
+                    i += 1;
+                    damaged = true;
+                    break :utf8;
+                }
+                var prefix: usize = 1;
+                while (prefix < count and prefix < bytes.len - i) : (prefix += 1) {
+                    const next = bytes[i + prefix];
+                    if (next < 0x80 or next > 0xbf) break;
+                    if (prefix == 1 and ((first == 0xe0 and next < 0xa0) or
+                        (first == 0xed and next > 0x9f) or (first == 0xf0 and next < 0x90) or
+                        (first == 0xf4 and next > 0x8f))) break;
+                }
+                if (prefix == count) {
+                    point = std.unicode.utf8Decode(bytes[i .. i + count]) catch return error.InvalidEncoding;
+                } else damaged = true;
+                i += prefix;
+            },
+            .utf16le, .utf16be => utf16: {
+                if (bytes.len - i < 2) {
+                    i = bytes.len;
+                    damaged = true;
+                    break :utf16;
+                }
+                point = unit(encoding, bytes[i..]);
+                i += 2;
+                if (point >= 0xd800 and point <= 0xdbff) {
+                    if (bytes.len - i < 2) {
+                        i = bytes.len;
+                        damaged = true;
+                    } else {
+                        const low = unit(encoding, bytes[i..]);
+                        if (low >= 0xdc00 and low <= 0xdfff) {
+                            point = 0x10000 + ((point - 0xd800) << 10) + low - 0xdc00;
+                            i += 2;
+                        } else damaged = true;
+                    }
+                } else if (point >= 0xdc00 and point <= 0xdfff) damaged = true;
+            },
+            .utf32le, .utf32be => {
+                if (bytes.len - i < 4) {
+                    i = bytes.len;
+                    damaged = true;
+                } else {
+                    point = unit(encoding, bytes[i..]);
+                    i += 4;
+                    damaged = point > 0x10ffff or (point >= 0xd800 and point <= 0xdfff);
+                }
+            },
+        }
+        // These embedded framing controls cannot be admitted to the detector as text.
+        if (damaged or point == 0 or point == '\r') {
+            point = 0xfffd;
+            replaced = true;
+        }
+        var encoded_point: [4]u8 = undefined;
+        const count = std.unicode.utf8Encode(@intCast(point), &encoded_point) catch return error.InvalidEncoding;
+        if (count > output.len - written) exceeded = true;
+        if (!exceeded) {
+            @memcpy(output[written .. written + count], encoded_point[0..count]);
+            written += count;
+        }
+    }
+    return .{ .text = if (exceeded) "" else output[0..written], .replaced = replaced, .exceeded = exceeded };
+}
+
 test "native text: strict codepoints and explicit encodings" {
     var scratch: [64]u8 = undefined;
     const Case = struct { encoding: Encoding, input: []const u8, output: []const u8 };
@@ -195,4 +290,57 @@ test "native text: every input split preserves aligned record boundaries" {
     try std.testing.expectError(error.RecordTooLarge, frame(.utf8, bytes, 0));
     try std.testing.expectError(error.RecordTooLarge, decode(.utf8, bytes, &.{}, 0, .preserve));
     try std.testing.expect((try frame(.utf8, bytes[0..max_record_bytes], 0)) == null);
+}
+
+test "native text: file replacement preserves valid boundaries and bounds expansion" {
+    var scratch: [128]u8 = undefined;
+    const replacement = "\xef\xbf\xbd";
+    const Case = struct { encoding: Encoding = .utf8, input: []const u8, expected: []const u8 };
+    for ([_]Case{
+        .{ .input = "\xffA", .expected = replacement ++ "A" },
+        .{ .input = "A\xe2\x82Z", .expected = "A" ++ replacement ++ "Z" },
+        .{ .input = "A\xe2\x82", .expected = "A" ++ replacement },
+        .{ .input = "\xc0\xaf", .expected = replacement ++ replacement },
+        .{ .input = "\xed\xa0\x80", .expected = replacement ++ replacement ++ replacement },
+        .{ .input = "\xf4\x90\x80\x80", .expected = replacement ++ replacement ++ replacement ++ replacement },
+        .{ .input = "192.0.\xff2.1", .expected = "192.0." ++ replacement ++ "2.1" },
+        .{ .input = "Ω\x00😀\rA", .expected = "Ω" ++ replacement ++ "😀" ++ replacement ++ "A" },
+        .{ .encoding = .ascii, .input = "A\xffZ", .expected = "A" ++ replacement ++ "Z" },
+        .{ .encoding = .utf16le, .input = "\x00\xd8A\x00", .expected = replacement ++ "A" },
+        .{ .encoding = .utf16be, .input = "\xd8\x00\x00A", .expected = replacement ++ "A" },
+        .{ .encoding = .utf16le, .input = "\x00\xd8A", .expected = replacement },
+        .{ .encoding = .utf16be, .input = "\xdc\x00\xd8\x3d\xde\x00", .expected = replacement ++ "😀" },
+        .{ .encoding = .utf32le, .input = "\x00\x00\x11\x00A\x00\x00\x00", .expected = replacement ++ "A" },
+        .{ .encoding = .utf32be, .input = "\x00\x00\xd8\x00\x00", .expected = replacement ++ replacement },
+    }) |case| {
+        const decoded = try decodeFile(case.encoding, case.input, &scratch, 0, .preserve);
+        try std.testing.expect(decoded.replaced and !decoded.exceeded);
+        try std.testing.expectEqualStrings(case.expected, decoded.text);
+    }
+    for ([_]Case{
+        .{ .input = "AΩ😀", .expected = "AΩ😀" },
+        .{ .input = replacement, .expected = replacement },
+        .{ .encoding = .latin1, .input = "caf\xe9", .expected = "café" },
+        .{ .encoding = .utf16le, .input = "A\x00\x3d\xd8\x00\xde", .expected = "A😀" },
+        .{ .encoding = .utf32be, .input = "\x00\x00\x00A\x00\x01\xf6\x00", .expected = "A😀" },
+    }) |case| {
+        const decoded = try decodeFile(case.encoding, case.input, &scratch, 0, .preserve);
+        try std.testing.expect(!decoded.replaced and !decoded.exceeded);
+        try std.testing.expectEqualStrings(case.expected, decoded.text);
+    }
+    const damaged_limit = try decodeFile(.utf8, "\xffA", scratch[0..3], 0, .preserve);
+    try std.testing.expect(damaged_limit.exceeded and damaged_limit.replaced);
+    try std.testing.expectEqualStrings("", damaged_limit.text);
+    const clean_limit = try decodeFile(.latin1, "\xe9\xe9", scratch[0..3], 0, .preserve);
+    try std.testing.expect(clean_limit.exceeded and !clean_limit.replaced);
+    try std.testing.expectEqualStrings("", clean_limit.text);
+    const late_damage = try decodeFile(.utf8, "ABCD\xff", scratch[0..3], 0, .preserve);
+    try std.testing.expect(late_damage.exceeded and late_damage.replaced);
+    try std.testing.expectEqualStrings("", late_damage.text);
+    try std.testing.expectEqualStrings(replacement ++ "A", (try decodeFile(.utf8, "\xffA", scratch[0..4], 0, .preserve)).text);
+    try std.testing.expectError(error.ConflictingBom, decodeFile(.utf8, "\xff\xfeA", &scratch, 0, .strip_stream_start));
+    try std.testing.expectError(error.MisalignedOffset, decodeFile(.utf16le, "A\x00", &scratch, 1, .preserve));
+    try std.testing.expectEqualStrings("A", (try decodeFile(.utf8, "\xef\xbb\xbfA", &scratch, 0, .strip_stream_start)).text);
+    // The journal/strict entry point retains its original rejection behavior.
+    try std.testing.expectError(error.InvalidEncoding, decode(.utf8, "\xffA", &scratch, 0, .preserve));
 }

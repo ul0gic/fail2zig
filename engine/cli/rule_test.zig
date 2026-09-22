@@ -401,6 +401,7 @@ pub fn evaluate(allocator: std.mem.Allocator, options: Options) Error!Report {
 }
 
 const service_defaults = [_]struct { name: []const u8, timestamp: TimestampKind }{
+    .{ .name = "portsentry", .timestamp = .iso8601 },
     .{ .name = "apache-auth", .timestamp = .undated },
     .{ .name = "apache-badbots", .timestamp = .undated },
     .{ .name = "apache-overflows", .timestamp = .undated },
@@ -458,7 +459,7 @@ fn openSession(allocator: std.mem.Allocator, options: Options, report: *Report) 
     };
 
     const timestamp: TimestampKind = if (options.input == .journal) .undated else resolved.timestamp orelse return error.TimestampRequired;
-    const body: builtin_detector.Body = if (options.rule == .service and options.input != .journal and (timestamp == .iso8601 or timestamp == .syslog)) .syslog else .whole;
+    const body: builtin_detector.Body = if (options.rule == .service and !registry.requiresWholeRecord(options.rule.service) and options.input != .journal and (timestamp == .iso8601 or timestamp == .syslog)) .syslog else .whole;
 
     var zone: ?*timezone.Zone = null;
     errdefer if (zone) |z| {

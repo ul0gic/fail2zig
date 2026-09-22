@@ -143,7 +143,7 @@ fn sqliteError(rc: c_int) Error {
         else => error.DatabaseFailure,
     };
 }
-pub const CommitStage = enum { before_admin_schema_commit, before_migration_schema_commit, after_admin_request, after_migration_step_intent, after_migration_step_outcome, before_migration_activation_commit, before_policy_transition_commit, before_config_generation_commit, before_config_generation_publish, before_action_target_schema_commit, after_action_target_intent, before_action_target_dispatch_commit, before_action_target_settlement_commit, before_history_reset_schema_commit, after_history_reset, before_canonical_effect_schema_commit, after_history_detail_delete, after_history_event_delete, before_escalation_schema_commit, before_application_history_schema_commit, before_cleanup_schema_commit, before_retry_lease_schema_commit, after_cleanup_mark, after_cleanup_delete, after_retry_retire, before_maintenance_schema_commit, after_source_sequence, after_replay_guard, after_record, after_checkpoint, after_shared_checkpoint, before_commit, before_receipt_commit, after_receipt_commit, after_receipt_delete, before_receipt_schema_commit, before_native_time_schema_commit, before_inference_schema_commit, before_detection_schema_commit, after_detection, before_clock_schema_commit, before_journal_detection_schema_commit, before_retry_schema_commit, after_retry_state, after_retry_decision, before_consumer_schema_commit, after_consumer_delta, before_effect_schema_commit, after_effect_owner, after_effect_intent, before_effect_dispatch_commit, before_effect_receipt_commit, before_manifest_schema_commit, before_manifest_commit, after_manifest_ready, before_consumer_input_commit };
+pub const CommitStage = enum { before_admin_schema_commit, before_migration_schema_commit, after_admin_request, after_migration_step_intent, after_migration_step_outcome, before_migration_activation_commit, before_policy_transition_commit, before_config_generation_commit, before_config_generation_publish, before_action_target_schema_commit, after_action_target_intent, before_action_target_dispatch_commit, before_action_target_settlement_commit, before_history_reset_schema_commit, after_history_reset, before_canonical_effect_schema_commit, after_history_detail_delete, after_history_event_delete, before_escalation_schema_commit, before_application_history_schema_commit, before_cleanup_schema_commit, before_retry_lease_schema_commit, after_cleanup_mark, before_cleanup_escalation_delete, after_cleanup_escalation_delete, before_cleanup_retry_delete, after_cleanup_retry_delete, after_cleanup_delete, before_cleanup_commit, after_retry_retire, before_maintenance_schema_commit, after_source_sequence, after_replay_guard, after_record, after_checkpoint, after_shared_checkpoint, before_commit, before_receipt_commit, after_receipt_commit, after_receipt_delete, before_receipt_schema_commit, before_native_time_schema_commit, before_inference_schema_commit, before_detection_schema_commit, after_detection, before_clock_schema_commit, before_journal_detection_schema_commit, before_retry_schema_commit, after_retry_state, after_retry_decision, before_consumer_schema_commit, after_consumer_delta, before_effect_schema_commit, after_effect_owner, after_effect_intent, before_effect_dispatch_commit, before_effect_receipt_commit, before_manifest_schema_commit, before_manifest_commit, after_manifest_ready, before_consumer_input_commit };
 pub const Limits = struct {
     pub const pending_receipts = 4096;
     pub const checkpoint_bytes = 16 * 1024 * 1024;
@@ -2428,13 +2428,30 @@ pub const Store = struct {
             };
             if (!guarded) return error.InvalidMaintenanceState;
             if (try self.recordCleanupPinned(fence, id.occurrence, now)) break;
-            const group_rows = 1 + try self.countRecordChildren(fence, id.occurrence, "record_detections") + try self.countRecordChildren(fence, id.occurrence, "retry_decisions");
+            var group_rows = 1 + try self.countRecordChildren(fence, id.occurrence, "record_detections") + try self.countRecordChildren(fence, id.occurrence, "retry_decisions");
+            // Escalation selections share their retry decision's lifetime and must remain visible to the physical row budget.
+            if (self.schema_version >= 18) group_rows += try self.countRecordChildren(fence, id.occurrence, "retry_decision_escalations");
             if (group_rows > 64 - deleted) break;
             var occurrence_buffer: [16384]u8 = undefined;
             @memcpy(occurrence_buffer[0..id.occurrence.len], id.occurrence);
             const occurrence = occurrence_buffer[0..id.occurrence.len];
             const deleted_before = deleted;
+            if (self.schema_version >= 18) {
+                try self.fault(.before_cleanup_escalation_delete);
+                var remove = try self.statement("DELETE FROM retry_decision_escalations WHERE jail=?1 AND source=?2 AND occurrence=?3;");
+                defer remove.deinit();
+                try remove.text(1, fence.jail);
+                try remove.text(2, fence.source);
+                try remove.text(3, occurrence);
+                try remove.done();
+                const changed = self.api.changes(self.db);
+                if (changed < 0 or changed > 64 - deleted) return error.InvalidMaintenanceState;
+                deleted += @intCast(changed);
+                try self.fault(.after_cleanup_escalation_delete);
+                try self.fault(.after_cleanup_delete);
+            }
             inline for (.{ "record_detections", "retry_decisions", "records" }) |table| {
+                if (comptime std.mem.eql(u8, table, "retry_decisions")) try self.fault(.before_cleanup_retry_delete);
                 var remove = try self.statement("DELETE FROM " ++ table ++ " WHERE jail=?1 AND source=?2 AND occurrence=?3;");
                 defer remove.deinit();
                 try remove.text(1, fence.jail);
@@ -2444,6 +2461,7 @@ pub const Store = struct {
                 const changed = self.api.changes(self.db);
                 if (changed < 0 or changed > 64 - deleted) return error.InvalidMaintenanceState;
                 deleted += @intCast(changed);
+                if (comptime std.mem.eql(u8, table, "retry_decisions")) try self.fault(.after_cleanup_retry_delete);
                 try self.fault(.after_cleanup_delete);
             }
             if (deleted - deleted_before != group_rows) return error.InvalidMaintenanceState;
@@ -2455,6 +2473,7 @@ pub const Store = struct {
             try self.updateCleanupState(fence, current, next);
             try self.finishCleanupClock(fence.clock, now);
         }
+        try self.fault(.before_cleanup_commit);
         try self.commitTransaction();
         return .{ .deleted_rows = @intCast(deleted), .more = next.sweep_sequence + 1 < next.reject_below_sequence, .state = next };
     }
@@ -5370,8 +5389,7 @@ pub const Store = struct {
         const kind = std.meta.intToEnum(native_record.Kind, try row.signed(0)) catch return error.DatabaseFailure;
         const inferred_year = if (try row.optionalSigned(5)) |year| std.math.cast(u16, year) orelse return error.DatabaseFailure else null;
         const stored = native_record.Stored{ .kind = kind, .original_us = try row.optionalSigned(1), .effective_us = try row.optionalSigned(2), .inferred_year = inferred_year, .zone = if (self.schema_version >= 11) try self.readTimeProvenance(jail, source, occurrence) else null };
-        const outcome = stored.outcome(.{ .us = try row.signed(3) }) catch return error.DatabaseFailure;
-        if (!std.mem.eql(u8, outcome.disposition(), try row.boundedBytes(4, 64))) return error.DatabaseFailure;
+        const outcome = stored.outcomeWithDisposition(.{ .us = try row.signed(3) }, try row.boundedBytes(4, 64)) catch return error.DatabaseFailure;
         return outcome;
     }
 

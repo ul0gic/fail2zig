@@ -46,7 +46,8 @@ pub const Options = struct {
     max_decoded_bytes: u32 = 2048,
 };
 pub const checkpoint_version: u16 = 1;
-pub const checkpoint_bytes = 96;
+const legacy_checkpoint_bytes = 96;
+pub const checkpoint_bytes = 104;
 const counter_fields = .{ "eligible", "obsolete", "missing", "malformed", "receipt", "adjusted", "future" };
 
 pub const Processor = struct {
@@ -60,6 +61,10 @@ pub const Processor = struct {
     staged_counters: policy.Counters = .{},
     staged_bytes: [checkpoint_bytes]u8 = undefined,
     restoring: bool = false,
+    encoding_replaced: u64 = 0,
+    staged_encoding_replaced: u64 = 0,
+    reported_encoding_replaced: u64 = 0,
+    last_encoding_notice_ms: ?u64 = null,
     detector: ?detection.Consumer = null,
     journal_detector: ?detection.JournalConsumer = null,
     staged_detector: ?detection.StagedConsumer = null,
@@ -176,15 +181,29 @@ pub const Processor = struct {
         return self.health.nextNotice(monotonic_ms);
     }
 
+    pub fn encodingReplaced(self: *const Processor) u64 {
+        return self.encoding_replaced;
+    }
+
+    pub fn encodingNotice(self: *Processor, now_ms: u64) ?u64 {
+        const count = self.encoding_replaced -| self.reported_encoding_replaced;
+        if (count == 0) return null;
+        if (self.last_encoding_notice_ms) |last| if (now_ms < last or now_ms - last < 60_000) return null;
+        self.reported_encoding_replaced = self.encoding_replaced;
+        self.last_encoding_notice_ms = now_ms;
+        return count;
+    }
+
     fn encode(self: *Processor, counters: policy.Counters) void {
         @memcpy(self.staged_bytes[0..4], "F2NT");
         std.mem.writeInt(u16, self.staged_bytes[4..6], checkpoint_version, .little);
         @memset(self.staged_bytes[6..8], 0);
         @memcpy(self.staged_bytes[8..40], &self.generation);
         inline for (counter_fields, 0..) |field, i| std.mem.writeInt(u64, self.staged_bytes[40 + i * 8 ..][0..8], @field(counters, field), .little);
+        std.mem.writeInt(u64, self.staged_bytes[96..104], self.staged_encoding_replaced, .little);
     }
     fn decode(self: *const Processor, bytes: []const u8) !policy.Counters {
-        if (bytes.len != checkpoint_bytes or !std.mem.eql(u8, bytes[0..4], "F2NT")) return error.ForeignSourceCheckpoint;
+        if ((bytes.len != checkpoint_bytes and bytes.len != legacy_checkpoint_bytes) or !std.mem.eql(u8, bytes[0..4], "F2NT")) return error.ForeignSourceCheckpoint;
         if (std.mem.readInt(u16, bytes[4..6], .little) != checkpoint_version or bytes[6] != 0 or bytes[7] != 0) return error.UnsupportedSourceCheckpoint;
         if (!std.mem.eql(u8, bytes[8..40], &self.generation)) return error.SourceGenerationMismatch;
         var counters = policy.Counters{};
@@ -192,7 +211,8 @@ pub const Processor = struct {
         try counters.validate();
         return counters;
     }
-    fn stage(self: *Processor, counters: policy.Counters, restoring: bool) void {
+    fn stage(self: *Processor, counters: policy.Counters, restoring: bool, replaced: u64) void {
+        self.staged_encoding_replaced = replaced;
         self.staged_counters = counters;
         self.restoring = restoring;
         self.encode(counters);
@@ -201,6 +221,8 @@ pub const Processor = struct {
     fn publish(context: ?*anyopaque) void {
         const self: *Processor = @ptrCast(@alignCast(context.?));
         if (self.consumer_stage) |stage_value| stage_value.publish(stage_value.context);
+        self.encoding_replaced = self.staged_encoding_replaced;
+        if (self.restoring) self.reported_encoding_replaced = self.encoding_replaced;
         if (self.restoring) self.health = policy.Health.init(self.staged_counters) catch unreachable else self.health.publish(self.staged_counters);
     }
     fn release(context: ?*anyopaque) void {
@@ -213,7 +235,10 @@ pub const Processor = struct {
         const self: *Processor = @ptrCast(@alignCast(context.?));
         if (self.in_flight) return error.ProcessorBusy;
         const counters = if (saved) |bytes| try self.decode(bytes) else policy.Counters{};
-        self.stage(counters, true);
+        const replaced = if (saved) |bytes| if (bytes.len == checkpoint_bytes) std.mem.readInt(u64, bytes[96..104], .little) else 0 else 0;
+        const total = counters.eligible + counters.obsolete + counters.missing + counters.malformed + counters.future;
+        if (replaced > total) return error.InvalidTimeCounters;
+        self.stage(counters, true, replaced);
         return .{ .context = self, .publish = publish, .release = release };
     }
 
@@ -262,6 +287,7 @@ pub const Processor = struct {
         if (self.in_flight) return error.ProcessorBusy;
         if (record.predecoded != null) return error.ForeignDecodedRecord;
         var counters = self.health.snapshot();
+        var replaced_count = self.encoding_replaced;
         var outcome: ?policy.Result = null;
         var detected: ?detection.Outcome = null;
         var detections: ?[]const detection.Outcome = null;
@@ -280,9 +306,19 @@ pub const Processor = struct {
             if (record.message.len > self.options.max_record_bytes) return error.RecordTooLarge;
             const offset = record.byte_start orelse 0;
             if (record.byte_start == null and self.options.timestamp != .journal) return error.MissingSourceOffset;
-            const decoded = try text.decode(self.options.encoding, record.message, self.scratch, offset, self.options.bom);
+            var encoding_replaced = false;
+            var decoding_limit = false;
+            const decoded = if (self.options.timestamp == .journal)
+                try text.decode(self.options.encoding, record.message, self.scratch, offset, self.options.bom)
+            else blk: {
+                const value = try text.decodeFile(self.options.encoding, record.message, self.scratch, offset, self.options.bom);
+                // Overflow produces no matchable prefix; the complete raw record still receives a disposition.
+                decoding_limit = value.exceeded;
+                encoding_replaced = value.replaced;
+                break :blk value.text;
+            };
             var inferred_year: ?u16 = null;
-            const input: policy.Input = switch (self.options.timestamp) {
+            const input: policy.Input = if (decoding_limit) .{ .rejected = .malformed } else switch (self.options.timestamp) {
                 .field => |field| blk: {
                     const parsed = try fieldInput(field, decoded, receipt);
                     inferred_year = parsed.inferred_year;
@@ -300,7 +336,12 @@ pub const Processor = struct {
                 now.us = try selected(record, now.us, consumer.context);
             };
             processing_us = now.us;
-            outcome = try policy.evaluate(if (self.options.timestamp == .undated) .undated else .timestamped, input, receipt, now, self.options.window_us);
+            outcome = if (decoding_limit) .{ .rejected = .{ .reason = .malformed, .receipt = receipt } } else try policy.evaluate(if (self.options.timestamp == .undated) .undated else .timestamped, input, receipt, now, self.options.window_us);
+            if (encoding_replaced) {
+                outcome = outcome.?.withEncodingReplacement();
+                replaced_count = std.math.add(u64, replaced_count, 1) catch return error.TimeCounterLimit;
+                if (replaced_count > std.math.maxInt(i64)) return error.TimeCounterLimit;
+            }
             switch (outcome.?) {
                 .eligible, .obsolete => |*e| e.inferred_year = inferred_year,
                 .rejected => |*r| {
@@ -350,7 +391,7 @@ pub const Processor = struct {
                 consumer_batch = prepared.consumers;
             }
         }
-        self.stage(counters, false);
+        self.stage(counters, false, replaced_count);
         return .{ .checkpoint = &self.staged_bytes, .disposition = if (outcome) |value| value.disposition() else "source-checkpoint", .native_time = outcome, .zone_provenance = zone_provenance, .effects_clock = if (self.retry_policy != null and self.retry_policy.?.enforce and !self.retry_enforcement_suppressed and processing_us != null) .{ .prepared_us = processing_us.?, .read = commitClock, .context = self } else null, .native_detection = detected, .native_detections = detections, .consumers = consumer_batch, .consumer_manifest = consumer_manifest, .native_retry = if (self.retry_policy) |value| .{ .generation = self.generation, .policy = value, .processing_us = processing_us, .suppress_enforcement = self.retry_enforcement_suppressed } else null, .retry_suspended = paused_veto, .retry_evidence = retry_evidence, .context = self, .publish = publish, .release = release };
     }
     fn commitClock(context: ?*anyopaque) i64 {

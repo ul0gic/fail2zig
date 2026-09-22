@@ -348,6 +348,9 @@ const Builder = struct {
             break :blk sel.name;
         };
         const builtin: ?[]const u8 = if (registry.get(filter_name) != null) filter_name else null;
+        // A same-named Fail2ban filter does not establish the 2.x history contract.
+        if (std.mem.eql(u8, filter_name, "portsentry"))
+            try self.addReason(&reasons, &kind, .blocker, "portsentry-history-format-unverified");
         if (builtin == null) try self.addReason(&reasons, &kind, .blocker, try std.fmt.allocPrint(a, "custom-filter:{s}", .{filter_name}));
         _ = try self.inspectAsset(.filter, filter_name, builtin != null, &reasons, &kind);
         if (eff.get("failregex") != null or eff.get("ignoreregex") != null or eff.get("prefregex") != null) {

@@ -13,6 +13,7 @@ const sessions = @import("core/native_file_session.zig");
 const store_mod = @import("core/record_store.zig");
 const text = @import("core/source_text.zig");
 const time = @import("core/native_time.zig");
+const portsentry = @import("filters/portsentry.zig");
 const t = std.testing;
 comptime {
     _ = @import("native_journal_detection_tests.zig");
@@ -53,6 +54,7 @@ test "native detection: retained external filter corpus and rule identities" {
         .{ .name = "nginx-http-auth", .filter = "nginx-http-auth" },
         .{ .name = "nginx-limit-req", .filter = "nginx-limit-req" },
         .{ .name = "postfix", .filter = "postfix" },
+        .{ .name = "portsentry", .filter = "portsentry" },
         .{ .name = "proftpd", .filter = "proftpd" },
         .{ .name = "sshd", .filter = "sshd" },
         .{ .name = "vsftpd", .filter = "vsftpd" },
@@ -90,7 +92,7 @@ test "native detection: retained external filter corpus and rule identities" {
         opts.filter = fixture.filter;
         var detector = try builtin.Detector.init(t.allocator, opts);
         defer detector.deinit(t.allocator);
-        const body = parser.stripSyslogPrefix(fixture.line);
+        const body = if (registry.requiresWholeRecord(fixture.filter)) fixture.line else parser.stripSyslogPrefix(fixture.line);
         const result = try detector.evaluate(body, eligible);
         if (fixture.ip) |ip| {
             const expected = try shared.IpAddress.parse(ip);
@@ -124,6 +126,25 @@ test "native detection: retained external filter corpus and rule identities" {
             try t.expectEqual(@as(usize, 1), count);
         }
     }
+}
+
+test "native detection: portsentry exact history grammar boundaries" {
+    const match = portsentry.patterns[0].match;
+    const ipv6 = match("2026-09-22T14:01:59.844+0000 Scan from: [2001:db8:42::2] (2001:db8:42::2) protocol: [TCP] port: [23456] type: [Connect] IP opts: [unknown] ignored: [false] triggered: [true] noblock: [true] blocked: [false]").?;
+    try t.expectEqual(try shared.IpAddress.parse("2001:db8:42::2"), ipv6.ip);
+
+    const udp = match("2026-09-22T14:01:59.844+0000 Scan from: [192.0.2.3] (192.0.2.3) protocol: [UDP] port: [1] type: [Connect] IP opts: [not set] ignored: [false] triggered: [true] noblock: [true] blocked: [false]").?;
+    try t.expectEqual(try shared.IpAddress.parse("192.0.2.3"), udp.ip);
+    try t.expect(match("2026-09-22T14:01:59.844+0000 Scan from: [192.0.2.3] (192.0.2.3) protocol: [UDP] port: [53] type: [UDP] IP opts: [set] ignored: [false] triggered: [true] noblock: [true] blocked: [false]") != null);
+    try t.expect(match("2026-09-22T14:01:59.844+0000 Scan from: [192.0.2.4] (192.0.2.4) protocol: [TCP] port: [65535] type: [TCP SYN/Normal scan] IP opts: [set] ignored: [false] triggered: [true] noblock: [true] blocked: [false]") != null);
+
+    for ([_][]const u8{
+        "2026-09-22T14:01:59.844+0000 Scan from: [192.0.2.3] (192.0.2.3) protocol: [UDP] port: [0] type: [UDP] IP opts: [not set] ignored: [false] triggered: [true] noblock: [true] blocked: [false]",
+        "2026-09-22T14:01:59.844+0000 Scan from: [192.0.2.3] (192.0.2.3) protocol: [UDP] port: [65536] type: [UDP] IP opts: [not set] ignored: [false] triggered: [true] noblock: [true] blocked: [false]",
+        "2026-09-22T14:01:59.844+0000 Scan from: [192.0.2.3] (192.0.2.3) protocol: [TCP] port: [53] type: [UDP] IP opts: [not set] ignored: [false] triggered: [true] noblock: [true] blocked: [false]",
+        "2026-02-29T14:01:59.844+0000 Scan from: [192.0.2.3] (192.0.2.3) protocol: [UDP] port: [53] type: [UDP] IP opts: [not set] ignored: [false] triggered: [true] noblock: [true] blocked: [false]",
+        "2026-09-22T14:01:59.844+0000 Scan from: [192.0.2.3] (192.0.2.3) protocol: [UDP] port: [53] type: [UDP] IP opts: [not set] ignored: [false] triggered: [true] noblock: [true] blocked: [false] trailing",
+    }) |rejected| try t.expect(match(rejected) == null);
 }
 
 test "native detection: ineligible records never become candidates" {
