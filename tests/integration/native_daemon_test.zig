@@ -939,7 +939,7 @@ test "native daemon: delivered client renders native status jails version and de
     for (0..3) |_| try h.writeLine(failure);
     try waitStatus(&h, "\"decisions_total\":1");
     const commands = [_][]const u8{ "status", "jails", "version", "list" };
-    const expected = [_][]const u8{ "log-only", "sshd", "daemon\t0.4.2", "203.0.113.7" };
+    const expected = [_][]const u8{ "log-only", "sshd", "daemon\t" ++ engine.version, "203.0.113.7" };
     for (commands, expected) |command, text| {
         const result = try std.process.Child.run(.{ .allocator = t.allocator, .argv = &.{ "zig-out/bin/fail2zig", "--socket", h.socket_path, "--timeout", "1000", "--output", "plain", command }, .max_output_bytes = 65536 });
         defer t.allocator.free(result.stdout);
