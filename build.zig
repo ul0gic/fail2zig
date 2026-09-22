@@ -2,7 +2,7 @@
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
 
-const fail2zig_version = "0.4.3";
+const fail2zig_version = "0.4.4";
 
 const CiLane = enum { components_a, components_b, assembled, fuzz, excluded, deferred };
 const CiGates = struct {
@@ -190,7 +190,7 @@ pub fn build(b: *std.Build) void {
     coordination_mod.addImport("shared", shared_mod);
     coordination_mod.addImport("build_options", build_options_mod);
     coordination_mod.linkLibrary(sqlite);
-    const coordination_tests = b.addTest(.{ .root_module = coordination_mod, .filters = &.{"native daemon BUG-0"} });
+    const coordination_tests = b.addTest(.{ .root_module = coordination_mod, .filters = &.{ "native daemon BUG-0", "native daemon recovery:" } });
     const run_coordination = b.addRunArtifact(coordination_tests);
     b.step("test-native-coordination", "Test deterministic daemon ownership and publication races").dependOn(&run_coordination.step);
     ci.add(.components_a, &run_coordination.step);

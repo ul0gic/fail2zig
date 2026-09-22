@@ -1194,3 +1194,67 @@ test "native effects: reload generation re-key moves an applied owner through re
     var targets: [@import("core/native_action_outcome.zig").max_targets_per_action]@import("core/native_action_outcome.zig").Target = undefined;
     _ = f.store.actionTargets(settled.intent_id, &targets) catch |err| std.debug.print("action targets after re-key: {s}\n", .{@errorName(err)});
 }
+
+fn rowCount(store: *durable.Store, statement: [:0]const u8) !i64 {
+    const Capture = struct {
+        fn row(ctx: ?*anyopaque, columns: c_int, values: [*c][*c]u8, _: [*c][*c]u8) callconv(.c) c_int {
+            const out: *i64 = @ptrCast(@alignCast(ctx.?));
+            if (columns != 1 or values[0] == null) return 1;
+            out.* = std.fmt.parseInt(i64, std.mem.span(values[0]), 10) catch return 1;
+            return 0;
+        }
+    };
+    const run = @extern(*const fn (*anyopaque, [*:0]const u8, ?*const anyopaque, ?*anyopaque, ?*?[*:0]u8) callconv(.c) c_int, .{ .name = "sqlite3_exec" });
+    var value: i64 = -1;
+    if (run(@ptrCast(store.db), statement, @ptrCast(&Capture.row), &value, null) != 0) return error.TestSqlFailed;
+    return value;
+}
+fn effectRows(store: *durable.Store) !i64 {
+    var total: i64 = 0;
+    for ([_][:0]const u8{
+        "SELECT count(*) FROM native_effects;",
+        "SELECT count(*) FROM effect_owners;",
+        "SELECT count(*) FROM effect_owner_revisions;",
+        "SELECT count(*) FROM effect_intents;",
+        "SELECT count(*) FROM effect_observations;",
+    }) |statement| total += try rowCount(store, statement);
+    return total;
+}
+
+test "native effects: spent scopes are pruned only after owners, intents and retained history are settled" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try admit(&f.store);
+    try enableSchema19(&f.store);
+    var clock = TestClock{};
+    var ban = try change("one", 1, .{ .finite = 200 });
+    const applied = try f.store.setOwner(ban, clock.value());
+    try f.store.markDispatched(applied.token(), clock.value());
+    _ = try f.store.settleVerified(applied.token(), observation(applied, clock.now, applied.desired), clock.value());
+    try t.expect(!try f.store.pruneSpentEffectOne());
+
+    clock.now = 200;
+    const expired = try f.store.prepareExpiry(applied.scope_key, applied.revision, clock.value());
+    try t.expect(!try f.store.pruneSpentEffectOne());
+    try f.store.markDispatched(expired.token(), clock.value());
+    _ = try f.store.settleVerified(expired.token(), observation(expired, clock.now, .absent), clock.value());
+    try t.expect(!try f.store.pruneSpentEffectOne());
+    try t.expectEqual(@as(u64, 1), try f.store.confirmedEffectEvents());
+
+    try sql(&f.store, "DELETE FROM confirmed_event_details; DELETE FROM confirmed_history_sequence; DELETE FROM confirmed_effect_events;");
+    const epoch = f.store.effect_publication_epoch;
+    var steps: usize = 0;
+    while (try f.store.pruneSpentEffectOne()) steps += 1;
+    try t.expect(steps >= 1 and steps < 16);
+    try t.expectEqual(@as(i64, 0), try effectRows(&f.store));
+    try t.expect(f.store.effect_publication_epoch > epoch);
+
+    ban.decision_id = [_]u8{2} ** 32;
+    ban.lease = .permanent;
+    ban.decided_us = clock.now;
+    const reban = try f.store.setOwner(ban, clock.value());
+    try f.store.markDispatched(reban.token(), clock.value());
+    _ = try f.store.settleVerified(reban.token(), observation(reban, clock.now, .permanent), clock.value());
+    try t.expectEqual(effects.Status.applied, (try first(&f.store)).status);
+    try t.expect(!try f.store.pruneSpentEffectOne());
+}

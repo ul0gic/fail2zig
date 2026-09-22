@@ -564,6 +564,83 @@ fn escalatedRecord(store: *durable.Store, now: *CleanupClock, id: durable.Receip
     };
 }
 
+test "native maintenance: decision detail pruning preserves current owners and retained history" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try setupCleanup(&f);
+    try upgradeCleanupToLatest(&f);
+    try sql(&f.store, "DROP INDEX effect_owners_decision; DROP INDEX confirmed_effect_events_decision;");
+    try f.store.enableApplicationHistory();
+    try t.expectEqual(@as(i64, 2), try f.store.inspectInteger("SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN('effect_owners_decision','confirmed_effect_events_decision');"));
+    const installation = try effect.Installation.init([_]u8{6} ** 16, .nftables, "detail-retention-fixture");
+    try f.store.admitInstallation(installation, .{ .selector = installation.selector(), .disposition = .verified_absent });
+    try f.store.admitRetry("receipt", generation, .{ .maxretry = 1, .window_us = 10_000_000, .duration = .{ .finite_us = 1_000_000 }, .max_subjects = 8, .enforce = true });
+    var now = CleanupClock{ .now = 100 };
+    const entry = try f.store.setOwner(.{ .scope = try effect.Scope.host(.{ .v4 = .{ 192, 0, 2, 91 } }), .jail = "receipt", .generation = generation, .decision_id = [_]u8{7} ** 32, .expected_revision = 0, .lease = .permanent, .decided_us = now.now }, now.value());
+    try sql(&f.store, "INSERT INTO retry_decision_details VALUES('receipt','file','protected',4,X'C000025B',1,100,X'0707070707070707070707070707070707070707070707070707070707070707','evidence');");
+    try t.expect(!try f.store.pruneRetryDecisionDetailsOne());
+    try sql(&f.store, "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<33) INSERT INTO retry_decision_details SELECT 'unused','file',CAST(x AS TEXT),4,X'C0000201',x,100,NULL,NULL FROM n;");
+    try f.store.markDispatched(entry.token(), now.value());
+    try t.expectEqual(effect.Settlement.verified, try f.store.settleVerified(entry.token(), effectObservation(entry, now.now), now.value()));
+    try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM confirmed_event_details WHERE evidence='evidence';"));
+    f.store.fail_at = .after_retry_detail_prune;
+    try t.expectError(error.InjectedFailure, f.store.pruneRetryDecisionDetailsOne());
+    f.store.fail_at = null;
+    try t.expectEqual(@as(i64, 34), try f.store.inspectInteger("SELECT count(*) FROM retry_decision_details;"));
+    try reopen(&f);
+    try t.expect(try f.store.pruneRetryDecisionDetailsOne());
+    try t.expectEqual(@as(i64, 2), try f.store.inspectInteger("SELECT count(*) FROM retry_decision_details;"));
+    try t.expect(try f.store.pruneRetryDecisionDetailsOne());
+    try t.expect(!try f.store.pruneRetryDecisionDetailsOne());
+    try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM retry_decision_details WHERE occurrence='protected';"));
+    try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM confirmed_event_details WHERE evidence='evidence';"));
+    try t.expectEqual(@as(i64, 0), try f.store.inspectInteger("SELECT count(*) FROM pragma_foreign_key_check;"));
+}
+
+test "native maintenance: decision at detail capacity atomically reclaims obsolete rows" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try setupCleanup(&f);
+    try upgradeCleanupToLatest(&f);
+    const policy = native_retry.Policy{ .maxretry = 1, .window_us = 10_000_000, .duration = .{ .finite_us = 1_000_000 }, .max_subjects = 8 };
+    try f.store.admitRetry(identity.jail, generation, policy);
+    var now = CleanupClock{ .now = 100 };
+    const subject = native_detection.Subject{ .v4 = .{ 192, 0, 2, 91 } };
+    const record = try escalatedRecord(&f.store, &now, identity, 0, subject, policy);
+    try sql(&f.store, "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<65536) INSERT INTO retry_decision_details SELECT 'unused','file',CAST(x AS TEXT),4,X'C0000201',x,100,NULL,NULL FROM n;");
+    try t.expectEqual(@as(i64, 65536), try f.store.inspectInteger("SELECT count(*) FROM retry_decision_details;"));
+    f.store.fail_at = .after_retry_detail_prune;
+    try t.expectError(error.InjectedFailure, f.store.commitRecord(record));
+    f.store.fail_at = null;
+    try t.expectEqual(@as(i64, 65536), try f.store.inspectInteger("SELECT count(*) FROM retry_decision_details;"));
+    try t.expectEqual(durable.CommitResult.committed, try f.store.commitRecord(record));
+    try t.expectEqual(@as(i64, 65505), try f.store.inspectInteger("SELECT count(*) FROM retry_decision_details;"));
+    try t.expectEqual(@as(i64, 0), try f.store.inspectInteger("SELECT count(*) FROM pragma_foreign_key_check;"));
+    try reopen(&f);
+    try t.expectEqual(@as(i64, 65505), try f.store.inspectInteger("SELECT count(*) FROM retry_decision_details;"));
+    try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM retry_decision_details WHERE jail='receipt';"));
+}
+
+test "native maintenance: fully retained detail capacity stays within runtime work budget" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try setupCleanup(&f);
+    try upgradeCleanupToLatest(&f);
+    try sql(&f.store, "INSERT INTO native_effects(scope_key,scope,revision,lease_kind,deadline_us,intent_id,canonical_scope) VALUES(zeroblob(32),zeroblob(24),0,0,NULL,NULL,zeroblob(92));");
+    try sql(&f.store, "CREATE TEMP TABLE retained_ids(x INTEGER PRIMARY KEY,id BLOB NOT NULL); WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<65536) INSERT INTO retained_ids SELECT x,CAST(zeroblob(24) || printf('%08X',x) AS BLOB) FROM n;");
+    try sql(&f.store, "INSERT INTO retry_decision_details SELECT 'unused','file',CAST(x AS TEXT),4,X'C0000201',x,100,id,NULL FROM retained_ids;");
+    try sql(&f.store, "INSERT INTO confirmed_effect_events SELECT CAST(zeroblob(24) || printf('%08X',x+65536) AS BLOB),zeroblob(32),'unused',id,100 FROM retained_ids;");
+    try sql(&f.store, "DROP TABLE retained_ids;");
+    try t.expectEqual(@as(i64, 65536), try f.store.inspectInteger("SELECT count(*) FROM retry_decision_details;"));
+    const hard_limit = @extern(*const fn (i64) callconv(.c) i64, .{ .name = "sqlite3_hard_heap_limit64" });
+    const prior = hard_limit(-1);
+    defer _ = hard_limit(prior);
+    try f.store.configureRuntimeLimits();
+    try t.expect(!try f.store.pruneRetryDecisionDetailsOne());
+    try t.expectEqual(@as(i64, 65536), try f.store.inspectInteger("SELECT count(*) FROM retry_decision_details;"));
+    try t.expectEqual(@as(i64, 0), try f.store.inspectInteger("SELECT count(*) FROM pragma_foreign_key_check;"));
+}
+
 test "native maintenance: schema23 resumes escalated cleanup atomically and retains confirmed history" {
     var f = try Fixture.init();
     defer f.deinit();

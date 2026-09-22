@@ -26,6 +26,29 @@ pub const Health = struct {
 fn propagateFirewall(comptime T: type, cause: firewall.Error) firewall.Error!T {
     return cause;
 }
+/// Two dumps can disagree without any fault, for example when a kernel element
+/// timeout expires between them. Such readbacks leave enforcement uncertain and are
+/// retried by the manager; they are not persistence failures.
+fn transientReadback(cause: anyerror) bool {
+    return cause == error.Changed or cause == error.Timeout or cause == error.Incomplete;
+}
+const max_readback_wait_turns: u16 = 255;
+/// True when `next` is `previous` minus at least one entry whose desired lease and
+/// kernel status are both absent, with every remaining entry unchanged. Both lists are
+/// ordered by scope key.
+fn removedOnlySpent(previous: []const effect.Entry, next: []const effect.Entry) bool {
+    if (next.len >= previous.len) return false;
+    var i: usize = 0;
+    for (next) |entry| {
+        while (i < previous.len and !std.mem.eql(u8, &previous[i].scope_key, &entry.scope_key)) : (i += 1) {
+            if (previous[i].desired != .absent or previous[i].status != .absent) return false;
+        }
+        if (i == previous.len or !std.meta.eql(previous[i], entry)) return false;
+        i += 1;
+    }
+    for (previous[i..]) |rest| if (rest.desired != .absent or rest.status != .absent) return false;
+    return true;
+}
 fn systemWall(_: ?*anyopaque) i64 {
     return std.time.microTimestamp();
 }
@@ -53,6 +76,10 @@ pub const Manager = struct {
     stop_cursor: usize = 0,
     stopping: bool = false,
     observation_cache: ?*observation.Cache = null,
+    readback_failures: u8 = 0,
+    readback_wait: u16 = 0,
+    refresh_was_ready: bool = false,
+    refresh_removed_only: bool = false,
 
     pub fn create(a: std.mem.Allocator, store: *durable.Store, installation: effect.Installation) !*Manager {
         try installation.validate();
@@ -97,6 +124,8 @@ pub const Manager = struct {
         self.staged_revision = null;
         self.staged_count = 0;
         self.cursor = 0;
+        self.readback_failures = 0;
+        self.readback_wait = 0;
         self.status.ready = false;
         self.status.uncertain = false;
         self.status.cause = null;
@@ -159,6 +188,15 @@ pub const Manager = struct {
             return failure;
         };
         self.captureObservation(snapshot, origin, wall_us, .known_entries);
+    }
+    /// The first retry follows on the next turn so a single race costs one turn;
+    /// consecutive failures double the skipped turns up to the cap.
+    fn deferReadback(self: *Manager) bool {
+        self.status.ready = false;
+        self.readback_failures +|= 1;
+        const shift: u4 = @intCast(@min(self.readback_failures - 1, 8));
+        self.readback_wait = @min((@as(u16, 1) << shift) - 1, max_readback_wait_turns);
+        return false;
     }
     fn clock(self: *Manager) !effect.Clock {
         const now = self.wall(self.wall_context);
@@ -234,11 +272,12 @@ pub const Manager = struct {
             self.staged_revision = null;
             return false;
         }
+        self.refresh_removed_only = removedOnlySpent(self.live[0..self.count], self.staged[0..self.staged_count]);
         std.mem.swap([]effect.Entry, &self.live, &self.staged);
         self.count = self.staged_count;
         self.cached_epoch = self.staged_epoch;
         self.staged_revision = null;
-        self.cursor = 0;
+        self.cursor = self.count;
         @memset(self.outage_attempted, false);
         return true;
     }
@@ -312,33 +351,68 @@ pub const Manager = struct {
         }
         if (self.store.effect_publication_epoch == std.math.maxInt(u64)) return error.EffectCapacity;
         const sampled = try self.clock();
+        if (self.readback_wait != 0) {
+            self.readback_wait -= 1;
+            self.status.ready = false;
+            return false;
+        }
         if (!self.admitted) {
-            try self.admit();
+            self.admit() catch |failure| switch (failure) {
+                error.Changed, error.Timeout, error.Incomplete => return self.deferReadback(),
+                else => |other| return @as(@TypeOf(other)!bool, other),
+            };
+            self.readback_failures = 0;
             return false;
         }
         if (self.cached_epoch == null or self.cached_epoch.? != self.store.effect_publication_epoch) {
+            if (self.staged_revision == null) self.refresh_was_ready = self.status.ready and self.cached_epoch != null;
             self.status.ready = false;
-            _ = try self.refreshTurn(bindings);
+            // Pruning spent scopes deletes only rows that are already absent in the
+            // kernel; the confirmed view stays valid without another full readback.
+            if (try self.refreshTurn(bindings) and self.refresh_was_ready and self.refresh_removed_only) {
+                self.status.ready = true;
+                self.cursor = 0;
+                return true;
+            }
             return false;
         }
         if (self.cursor == self.count) {
             var snapshot = self.inspector.inspect() catch |failure| {
                 self.recordFirewallDirect(.readback, failure);
+                if (transientReadback(failure)) return self.deferReadback();
                 return propagateFirewall(bool, failure);
             };
             defer snapshot.deinit();
+            self.readback_failures = 0;
             try self.validateAndCaptureObservation(&snapshot, .readback, sampled.prepared_us, .readback);
             const end = try self.clock();
+            const unsettled = try self.store.unsettledActionScope();
+            // Enforcing a live ban comes before expiry bookkeeping: expired kernel
+            // elements already time out on their own, while a new ban protects nothing
+            // until it is dispatched.
+            var next: ?usize = null;
             for (self.live[0..self.count], 0..) |entry, index| {
                 const matches = self.inspector.matchesSnapshot(&snapshot, self.token(entry, entry.desired), sampled.prepared_us, end.prepared_us) catch |failure| {
+                    if (transientReadback(failure)) {
+                        self.recordFirewallDirect(.readback, failure);
+                        return self.deferReadback();
+                    }
                     self.recordObservationFailure(.readback, failure);
                     return propagateFirewall(bool, failure);
                 };
-                if (!matches) {
-                    self.cursor = index;
-                    self.status.ready = false;
-                    return false;
+                const outcome_pending = if (unsettled) |scope_key| std.mem.eql(u8, &scope_key, &entry.scope_key) else false;
+                if (!matches or outcome_pending or entry.status == .pending or entry.status == .dispatched) {
+                    if (entry.desired.live(end.prepared_us)) {
+                        next = index;
+                        break;
+                    }
+                    if (next == null) next = index;
                 }
+            }
+            if (next) |index| {
+                self.cursor = index;
+                self.status.ready = false;
+                return false;
             }
             self.status = .{ .ready = true };
             for (self.live[0..self.count]) |entry| if (entry.status == .applied and entry.desired.live(sampled.prepared_us)) {
@@ -377,9 +451,11 @@ pub const Manager = struct {
         }
         var observed = self.inspector.observeExact(self.token(entry, entry.desired), .{ .wall_us = sampled.prepared_us }) catch |failure| {
             self.recordFirewallDirect(.readback, failure);
+            if (transientReadback(failure)) return self.deferReadback();
             return propagateFirewall(bool, failure);
         };
         defer observed.deinit();
+        self.readback_failures = 0;
         try self.validateAndCaptureObservation(&observed.snapshot, .effect, observed.observed_wall_us, .effect_verify);
         if (entry.status == .dispatched or !observed.matches_desired) {
             self.status.ready = false;
@@ -396,8 +472,14 @@ pub const Manager = struct {
                 return false;
             };
         }
+        // While unconfirmed, the next full readback finds the next divergent entry;
+        // stepping one entry per turn would make each change cost the whole table.
+        if (!self.status.ready) {
+            self.cursor = self.count;
+            return false;
+        }
         self.cursor += 1;
-        return self.status.ready;
+        return true;
     }
     pub fn stopTurn(self: *Manager, expected_repair_epoch: u64) !bool {
         if (expected_repair_epoch == 0 or expected_repair_epoch != self.repair_epoch) return error.StaleRepairEpoch;
