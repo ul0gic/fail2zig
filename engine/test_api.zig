@@ -6,6 +6,7 @@ pub const cli = struct {
 };
 pub const config = struct {
     pub const duration = @import("config/duration.zig");
+    pub const fail2ban = @import("config/fail2ban.zig");
     pub const native = @import("config/native.zig");
     pub const native_consumer_plan = @import("config/native_consumer_plan.zig");
     pub const native_effective = @import("config/native_effective.zig");
@@ -20,6 +21,7 @@ pub const core = struct {
     pub const event_loop = @import("core/event_loop.zig");
     pub const event_time = @import("core/event_time.zig");
     pub const journal_policy = @import("core/journal_policy.zig");
+    pub const journald_source = @import("core/journald_source.zig");
     pub const line_context = @import("core/line_context.zig");
     pub const log_target = @import("core/log_target.zig");
     pub const native_action_context = @import("core/native_action_context.zig");

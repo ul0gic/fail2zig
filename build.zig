@@ -196,6 +196,11 @@ pub fn build(b: *std.Build) void {
         .{ .name = "test-native-migration-journal", .path = "tests/component/migration_journal_tests.zig", .filter = "migration journal:", .sqlite = true, .ci = .components_b },
         .{ .name = "test-native-migration-conflict", .path = "tests/component/native_migration_conflict_tests.zig", .filter = "migration conflict:", .sqlite = true, .ci = .components_a },
         .{ .name = "test-native-reload-crash", .path = "tests/component/native_reload_crash_tests.zig", .filter = "reload crash:", .sqlite = true, .ci = .components_b },
+        .{ .name = "test-native-config-inline", .path = "tests/component/native_config_inline_tests.zig", .filter = "", .sqlite = false, .ci = .components_b },
+        .{ .name = "test-fail2ban-inline", .path = "tests/component/fail2ban_inline_tests.zig", .filter = "", .sqlite = false, .ci = .components_b },
+        .{ .name = "test-journald-source-inline", .path = "tests/component/journald_source_inline_tests.zig", .filter = "journald:", .sqlite = false, .ci = .components_a },
+        .{ .name = "test-firewall-inspection-inline", .path = "tests/component/firewall_inspection_inline_tests.zig", .filter = "native firewall:", .sqlite = false, .ci = .components_a },
+        .{ .name = "test-nftables-inline", .path = "tests/component/nftables_inline_tests.zig", .filter = "nftables:", .sqlite = false, .ci = .components_b },
     };
     for (components) |entry| {
         const module = b.createModule(.{
@@ -207,11 +212,31 @@ pub fn build(b: *std.Build) void {
         module.addImport("shared", shared_mod);
         module.addImport("engine_test", component_api);
         if (entry.sqlite) module.linkLibrary(sqlite);
-        const tests = b.addTest(.{ .root_module = module, .filters = &.{entry.filter} });
+        const filters: []const []const u8 = if (entry.filter.len == 0) &.{} else &.{entry.filter};
+        const tests = b.addTest(.{ .root_module = module, .filters = filters });
         const run_tests = b.addRunArtifact(tests);
         b.step(entry.name, "Test isolated native component delivery").dependOn(&run_tests.step);
         ci.add(entry.ci, &run_tests.step);
     }
+
+    const client_format_api = b.createModule(.{
+        .root_source_file = b.path("client/format.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    client_format_api.addImport("shared", shared_mod);
+    const client_format_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/component/client_format_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    client_format_test_mod.addImport("client_format", client_format_api);
+    const client_format_tests = b.addTest(.{ .root_module = client_format_test_mod, .filters = &.{"format:"} });
+    const run_client_format_tests = b.addRunArtifact(client_format_tests);
+    b.step("test-client-format", "Test client formatting").dependOn(&run_client_format_tests.step);
+    ci.add(.components_a, &run_client_format_tests.step);
 
     const coordination_mod = b.createModule(.{
         .root_source_file = b.path("engine/native_daemon.zig"),
