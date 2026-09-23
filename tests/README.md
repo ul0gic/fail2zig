@@ -1,30 +1,23 @@
 # fail2zig tests
 
-Four test surfaces. Each subdirectory has its own README with usage and
-build details.
+Tests are grouped by the boundary they exercise:
 
-- **`integration/`** — Zig integration tests: config loading, IPC
-  protocol, state persistence, firewall wiring. Runs under
-  `zig build test`. See [`integration/README.md`](integration/README.md).
-- **`benchmark/`** — Zig microbenchmarks gated behind `-Dbench=true` /
-  `FAIL2ZIG_RUN_BENCH=1`. Parse throughput, ban latency, memory ceiling,
-  startup time. See [`benchmark/README.md`](benchmark/README.md).
-- **`fuzz/`** — Zig fuzz corpora for the four attacker-reachable parse
-  boundaries (log lines, TOML config, IPC framing, IP addresses). See
-  [`fuzz/README.md`](fuzz/README.md).
-- **`harness/`** — shell-based system harness that drives a real running
-  daemon against synthesized traffic and real `nftables` state. Requires
-  a Linux lab host — not part of `zig build test`. See
-  [`harness/README.md`](harness/README.md).
+- **`component/`** — isolated Zig storage, detection, configuration, firewall,
+  migration and source tests. `build.zig` registers named `test-native-*` steps
+  and maintained CI shards. These tests import internal engine modules through
+  the test-only `engine/test_api.zig` module, which is not used by the product.
+- **`integration/`** — assembled CLI, IPC and daemon behavior. The daemon tests
+  share `zig-out/bin/fail2zig` and must be serialized; see its README.
+- **`e2e/`** — authorized live-system and remote qualification scripts.
+- **`fuzz/`** — bounded attacker-input fuzz targets.
+- **`benchmark/`** — explicit performance measurements, not correctness gates.
+- **`harness/`** — lab scripts for a running daemon and firewall.
+- **`fixtures/`** — captured and synthetic inputs with provenance where needed.
+- **`guards/`** — architecture checks, including the module graph guard.
 
-`module_graph_guard.zig` runs under `zig build test` and fails if any
-file under `tests/` uses a parent-relative `@import("..`. Tests reach
-engine code only through the `engine` module (or a named module such as
-`parser` for the fuzz targets); a second path to the same source file
-makes Zig's "file exists in multiple modules" error fire depending on
-analysis order (QA-005).
-
-Unit tests live inline with the code they test (`test "..." { ... }`
-blocks in the source files themselves) — that's Zig's convention.
-`zig build test` picks up both the inline tests and anything wired into
-`build.zig` under `tests/integration/`.
+Use the named steps in `build.zig` for affected components and assembled tests.
+The broad `zig build test` still includes deferred legacy paths; it is not the
+maintained acceptance gate. The module graph guard forbids parent-relative
+imports under `tests/` so a source file cannot enter a test binary through two
+different Zig modules. Inline tests remain appropriate for small local
+invariants; the record-store contract suite lives in `component/store/`.

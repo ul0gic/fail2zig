@@ -4,7 +4,7 @@ const std = @import("std");
 const shared = @import("shared");
 const canonical_scope = @import("../firewall/scope.zig");
 const inspection = @import("../firewall/inspection.zig");
-const firewall_observation = @import("../native_firewall_observation.zig");
+const firewall_observation = @import("../runtime/native_firewall_observation.zig");
 
 pub const schema_version: u32 = 1;
 pub const max_response_bytes: usize = 1 << 20;
