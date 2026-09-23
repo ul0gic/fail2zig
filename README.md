@@ -169,10 +169,12 @@ configuration, and installs the hardened `fail2zig.service` unit under
 `/etc/systemd/system/`. It does **not** auto-start the daemon — audit the config,
 then run `systemctl enable --now fail2zig` when ready.
 
-Before upgrading from a version earlier than 0.4.3, retain a coherent state backup
-with its matching binary. Older binaries cannot read 0.4.3's extended checkpoints
-and replacement markers; rollback requires restoring that backup, not only swapping
-the executable.
+The minimum supported release is v0.4.0; install the latest release when possible.
+Pre-v0.4.0 binaries are no longer distributed or supported for installation or rollback.
+For upgrades within the supported v0.4.x line from a version earlier than v0.4.3,
+retain a coherent state backup with its matching binary. Older binaries cannot read
+v0.4.3's extended checkpoints and replacement markers; rollback within the supported
+line requires restoring that backup, not only swapping the executable.
 
 **0.4.4 release targets** (one combined daemon/admin executable each):
 

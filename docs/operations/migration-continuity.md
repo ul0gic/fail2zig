@@ -4,9 +4,9 @@
 
 The filename `state.bin` does not identify its format. Keep these three cases distinct:
 
-| Existing state | 0.4.0 path |
+| Existing state | Supported path |
 |---|---|
-| Released fail2zig v0.3.0 binary state (including its format v4) | No automatic converter. Preserve it for rollback; a fresh native database does not carry its state forward. |
+| Released fail2zig v0.3.0 binary state (including its format v4) | Unsupported. No automatic converter exists; a fresh native database does not carry this state forward. Do not install or roll back to a pre-v0.4.0 release. |
 | Current native fail2zig SQLite state | Reopen the same compatible database after an offline ownership transition to the service UID. Preserve the database and any WAL/SHM siblings as one coherent set. |
 | fail2ban schema-4 SQLite state | Use the supported inspect/snapshot/plan/validate/cutover workflow. It is foreign input, never the native daemon database. |
 
@@ -32,12 +32,13 @@ recursively chown `/var`, a shared directory, log trees or arbitrary configurati
 The native database and its parent must belong to the UID that will run the daemon.
 
 For **released v0.3.0 binary state**, installation deliberately refuses to reinterpret the file
-as SQLite. Preserve the complete old installation for rollback and plan an explicit protection
-transition. A fresh native database loses saved bans, counters/history and source positions;
+as SQLite. Pre-v0.4.0 releases are unsupported and no longer distributed; do not install or
+roll back to them. Plan an explicit protection transition. A fresh native database loses saved
+bans, counters/history and source positions;
 the daemon does not adopt arbitrary legacy firewall rules as native owners. Review and record
 old protection, remove only verified old-owned effects during the planned cutover and verify
 the new daemon's protection independently. Do not run both authorities against the same state
-or assume source continuity. If this reset/gap is unacceptable, retain 0.3.0 until an acceptable
+or assume source continuity. If this reset/gap is unacceptable, defer cutover until an acceptable
 migration path is available; the fail2ban converter does not provide one for this binary format.
 
 ## Persistence failures
