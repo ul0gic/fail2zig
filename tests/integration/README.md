@@ -4,22 +4,13 @@ These tests exercise fail2zig's daemon behavior end-to-end. Some test the
 module-level save/load contract (no daemon spawn needed); others spawn the
 real `zig-out/bin/fail2zig` binary and verify operator-visible flows.
 
-## Files
+## Scope
 
-| File | Spawns daemon? | Requires root? | Skip conditions |
-|------|----------------|----------------|-----------------|
-| `harness.zig` | No (helpers only) | No | non-Linux |
-| `ban_test.zig` | Yes | Yes (IPC auth) | non-Linux, non-root, daemon binary missing, firewall unavailable |
-| `migration_test.zig` | No (pure module drive) | No | non-Linux |
-| `persistence_test.zig` | Mixed: 2 module tests always run; 1 subprocess test requires root | Yes (for subprocess case) | non-Linux, non-root (subprocess only) |
-| `status_surface_test.zig` | No (in-process command dispatch) | No | non-Linux |
-| `startup_failclosed_test.zig` | Yes (expects each run to exit 1) | No — one assertion in scenario (b) is root-only (ENH-006) | non-Linux, daemon binary missing |
-| `config_diag_test.zig` | Yes (`--validate-config` only) | No | non-Linux, daemon binary missing |
-| `no_backend_test.zig` | Yes (4 runs expect exit 1; 4 keep the daemon up, query it via `/api/status` and/or the client binary, SIGTERM it; 1 runs daemon + client inside `unshare -Urn`) | No — scenarios (a)–(c) and (d') **skip when root** (need a real `PermissionDenied`); (d)–(g) run at any uid | non-Linux, daemon binary missing, socket path ≥ 108 bytes; (f) also skips without unprivileged user+net namespaces or when nf_tables is unreachable from one |
-
-Unprivileged developer machines see every root-gated subprocess case skip
-cleanly. A CI job with `sudo` (or a privileged container) exercises the full
-stack.
+This directory holds assembled CLI, IPC and daemon tests. `build.zig` is the
+current source of truth for each test's CI lane, binary dependency and release
+local membership. `ipc_roundtrip_test.zig` has its own registered step; the
+other integration files are listed in `integration_files`. Tests that need
+root privileges, namespaces or a firewall use explicit skip conditions.
 
 ## Build
 
@@ -46,15 +37,14 @@ repo root: run `zig build` first and invoke `zig test` from the repo root.
 
 ## Wiring into `build.zig`
 
-Every file is listed in the `integration_files` array in `build.zig`; the
-loop below it creates the module, adds the `shared` and `engine` imports,
-links libc, and registers the test run on `zig build test`:
+Most files are listed in the `integration_files` array in `build.zig`; the
+loop creates the module, adds the `shared` and `engine` imports, links libc,
+and registers the selected maintained or deferred test lane. The IPC round-trip
+test is registered separately:
 
 ```zig
-const integration_files = [_]IntegrationFile{
-    .{ .name = "harness", .path = "tests/integration/harness.zig", .needs_daemon_binary = false },
-    .{ .name = "ban", .path = "tests/integration/ban_test.zig", .needs_daemon_binary = true },
-};
+.{ .name = "native_daemon", .path = "tests/integration/native_daemon_test.zig",
+   .needs_daemon_binary = true, .ci = .assembled, .release_local = true },
 ```
 
 To add a file, append one row. `needs_daemon_binary = true` makes the run

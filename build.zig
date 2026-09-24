@@ -128,43 +128,79 @@ pub fn build(b: *std.Build) void {
         sqlite: bool,
         ci: CiLane,
     };
+    const component_api = b.createModule(.{
+        .root_source_file = b.path("engine/test_api.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    component_api.addImport("shared", shared_mod);
+    component_api.addImport("build_options", build_options_mod);
+    const probes = [_]struct { name: []const u8, path: []const u8, sqlite: bool }{
+        .{ .name = "file-alias", .path = "engine/probes/file_alias_probe.zig", .sqlite = false },
+        .{ .name = "file-mode", .path = "engine/probes/file_mode_probe.zig", .sqlite = false },
+        .{ .name = "ignore-store", .path = "engine/probes/ignore_store_probe.zig", .sqlite = true },
+        .{ .name = "journal-policy", .path = "engine/probes/journal_policy_probe.zig", .sqlite = false },
+        .{ .name = "source", .path = "engine/probes/source_probe.zig", .sqlite = false },
+    };
+    for (probes) |probe| {
+        const module = b.createModule(.{
+            .root_source_file = b.path(probe.path),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        module.addImport("shared", shared_mod);
+        module.addImport("engine_probe", component_api);
+        if (probe.sqlite) module.linkLibrary(sqlite);
+        const executable = b.addExecutable(.{ .name = b.fmt("f2z-{s}-probe", .{probe.name}), .root_module = module });
+        b.step(b.fmt("build-probe-{s}", .{probe.name}), "Build a manual diagnostic probe").dependOn(&executable.step);
+        const run = b.addRunArtifact(executable);
+        if (b.args) |args| run.addArgs(args);
+        b.step(b.fmt("probe-{s}", .{probe.name}), "Run a manual diagnostic probe").dependOn(&run.step);
+    }
     const components = [_]Component{
-        .{ .name = "test-native-firewall", .path = "engine/native_firewall_tests.zig", .filter = "native firewall:", .sqlite = false, .ci = .components_a },
-        .{ .name = "test-native-rules", .path = "engine/native_rule_tests.zig", .filter = "native rules:", .sqlite = false, .ci = .components_b },
-        .{ .name = "test-native-correlation", .path = "engine/native_correlation_tests.zig", .filter = "native correlation:", .sqlite = false, .ci = .components_a },
-        .{ .name = "test-native-source-repair", .path = "engine/source_repair_tests.zig", .filter = "source repair:", .sqlite = false, .ci = .components_b },
-        .{ .name = "test-native-consumers", .path = "engine/native_consumer_tests.zig", .filter = "native consumers:", .sqlite = true, .ci = .components_a },
-        .{ .name = "test-native-effects", .path = "engine/native_effect_tests.zig", .filter = "native effects:", .sqlite = true, .ci = .components_b },
-        .{ .name = "test-native-effect-runtime", .path = "engine/native_effect_runtime_tests.zig", .filter = "native effect runtime:", .sqlite = true, .ci = .components_a },
-        .{ .name = "test-native-effect-history", .path = "engine/native_effect_history_tests.zig", .filter = "native effect history:", .sqlite = false, .ci = .components_b },
-        .{ .name = "test-native-effect-history-store", .path = "engine/native_effect_history_store_tests.zig", .filter = "native effect history store:", .sqlite = true, .ci = .components_a },
-        .{ .name = "test-native-consumer-manifest", .path = "engine/native_consumer_manifest_tests.zig", .filter = "native consumer manifest:", .sqlite = true, .ci = .components_b },
-        .{ .name = "test-native-consumer-coordinator", .path = "engine/native_consumer_coordinator_tests.zig", .filter = "native coordinator:", .sqlite = false, .ci = .components_a },
-        .{ .name = "test-native-consumer-runtime", .path = "engine/native_consumer_runtime_tests.zig", .filter = "native consumer runtime:", .sqlite = true, .ci = .components_b },
-        .{ .name = "test-native-consumer-plan", .path = "engine/native_consumer_plan_tests.zig", .filter = "native consumer plan:", .sqlite = false, .ci = .components_a },
-        .{ .name = "test-native-session-repair", .path = "engine/native_session_repair_tests.zig", .filter = "native session repair:", .sqlite = true, .ci = .components_b },
-        .{ .name = "test-native-resource-budget", .path = "engine/native_resource_budget_tests.zig", .filter = "native resource budget:", .sqlite = true, .ci = .components_a },
-        .{ .name = "test-native-maintenance", .path = "engine/native_maintenance_tests.zig", .filter = "native maintenance:", .sqlite = true, .ci = .components_b },
-        .{ .name = "test-native-effective", .path = "engine/native_effective_tests.zig", .filter = "native effective:", .sqlite = false, .ci = .components_a },
-        .{ .name = "test-native-timezone", .path = "engine/native_timezone_tests.zig", .filter = "native timezone:", .sqlite = false, .ci = .components_b },
-        .{ .name = "test-native-config", .path = "engine/native_config_tests.zig", .filter = "native:", .sqlite = false, .ci = .components_a },
-        .{ .name = "test-native-dns", .path = "engine/native_dns_tests.zig", .filter = "native dns:", .sqlite = false, .ci = .components_b },
-        .{ .name = "test-native-ignore", .path = "engine/native_ignore_tests.zig", .filter = "native ignore:", .sqlite = false, .ci = .components_a },
-        .{ .name = "test-native-ipc-auth", .path = "engine/native_ipc_auth_tests.zig", .filter = "native ipc auth:", .sqlite = false, .ci = .components_b },
-        .{ .name = "test-native-migration-snapshot", .path = "engine/migration_snapshot_tests.zig", .filter = "migration snapshot:", .sqlite = true, .ci = .components_a },
-        .{ .name = "test-native-migration-inspect", .path = "engine/migration_inspect_tests.zig", .filter = "migration inspect:", .sqlite = false, .ci = .components_b },
-        .{ .name = "test-native-admin-store", .path = "engine/native_admin_store_tests.zig", .filter = "native admin store:", .sqlite = true, .ci = .components_a },
-        .{ .name = "test-native-reload", .path = "engine/native_reload_tests.zig", .filter = "native reload:", .sqlite = false, .ci = .components_b },
-        .{ .name = "test-native-readiness", .path = "engine/native_readiness_tests.zig", .filter = "native readiness:", .sqlite = false, .ci = .components_a },
-        .{ .name = "test-native-query", .path = "engine/native_query_tests.zig", .filter = "native query:", .sqlite = false, .ci = .components_b },
-        .{ .name = "test-native-migration-plan", .path = "engine/migration_plan_tests.zig", .filter = "migration plan:", .sqlite = true, .ci = .components_a },
-        .{ .name = "test-native-rule-test", .path = "engine/native_rule_test_tests.zig", .filter = "native rule test:", .sqlite = false, .ci = .components_b },
-        .{ .name = "test-native-migration-store", .path = "engine/native_migration_store_tests.zig", .filter = "migration store:", .sqlite = true, .ci = .components_a },
-        .{ .name = "test-native-migration-import", .path = "engine/migration_import_tests.zig", .filter = "migration import:", .sqlite = true, .ci = .components_b },
-        .{ .name = "test-native-migration-continuity", .path = "engine/migration_continuity_tests.zig", .filter = "migration continuity:", .sqlite = true, .ci = .components_a },
-        .{ .name = "test-native-migration-journal", .path = "engine/migration_journal_tests.zig", .filter = "migration journal:", .sqlite = true, .ci = .components_b },
-        .{ .name = "test-native-migration-conflict", .path = "engine/native_migration_conflict_tests.zig", .filter = "migration conflict:", .sqlite = true, .ci = .components_a },
-        .{ .name = "test-native-reload-crash", .path = "engine/native_reload_crash_tests.zig", .filter = "reload crash:", .sqlite = true, .ci = .components_b },
+        .{ .name = "test-native-firewall", .path = "tests/component/native_firewall_tests.zig", .filter = "native firewall:", .sqlite = false, .ci = .components_a },
+        .{ .name = "test-native-rules", .path = "tests/component/native_rule_tests.zig", .filter = "native rules:", .sqlite = false, .ci = .components_b },
+        .{ .name = "test-native-correlation", .path = "tests/component/native_correlation_tests.zig", .filter = "native correlation:", .sqlite = false, .ci = .components_a },
+        .{ .name = "test-native-source-repair", .path = "tests/component/source_repair_tests.zig", .filter = "source repair:", .sqlite = false, .ci = .components_b },
+        .{ .name = "test-native-consumers", .path = "tests/component/native_consumer_tests.zig", .filter = "native consumers:", .sqlite = true, .ci = .components_a },
+        .{ .name = "test-native-effects", .path = "tests/component/native_effect_tests.zig", .filter = "native effects:", .sqlite = true, .ci = .components_b },
+        .{ .name = "test-native-effect-runtime", .path = "tests/component/native_effect_runtime_tests.zig", .filter = "native effect runtime:", .sqlite = true, .ci = .components_a },
+        .{ .name = "test-native-effect-history", .path = "tests/component/native_effect_history_tests.zig", .filter = "native effect history:", .sqlite = false, .ci = .components_b },
+        .{ .name = "test-native-effect-history-store", .path = "tests/component/native_effect_history_store_tests.zig", .filter = "native effect history store:", .sqlite = true, .ci = .components_a },
+        .{ .name = "test-native-consumer-manifest", .path = "tests/component/native_consumer_manifest_tests.zig", .filter = "native consumer manifest:", .sqlite = true, .ci = .components_b },
+        .{ .name = "test-native-consumer-coordinator", .path = "tests/component/native_consumer_coordinator_tests.zig", .filter = "native coordinator:", .sqlite = false, .ci = .components_a },
+        .{ .name = "test-native-consumer-runtime", .path = "tests/component/native_consumer_runtime_tests.zig", .filter = "native consumer runtime:", .sqlite = true, .ci = .components_b },
+        .{ .name = "test-native-consumer-plan", .path = "tests/component/native_consumer_plan_tests.zig", .filter = "native consumer plan:", .sqlite = false, .ci = .components_a },
+        .{ .name = "test-native-session-repair", .path = "tests/component/native_session_repair_tests.zig", .filter = "native session repair:", .sqlite = true, .ci = .components_b },
+        .{ .name = "test-native-resource-budget", .path = "tests/component/native_resource_budget_tests.zig", .filter = "native resource budget:", .sqlite = true, .ci = .components_a },
+        .{ .name = "test-native-maintenance", .path = "tests/component/native_maintenance_tests.zig", .filter = "native maintenance:", .sqlite = true, .ci = .components_b },
+        .{ .name = "test-native-effective", .path = "tests/component/native_effective_tests.zig", .filter = "native effective:", .sqlite = false, .ci = .components_a },
+        .{ .name = "test-native-timezone", .path = "tests/component/native_timezone_tests.zig", .filter = "native timezone:", .sqlite = false, .ci = .components_b },
+        .{ .name = "test-native-config", .path = "tests/component/native_config_tests.zig", .filter = "native:", .sqlite = false, .ci = .components_a },
+        .{ .name = "test-native-dns", .path = "tests/component/native_dns_tests.zig", .filter = "native dns:", .sqlite = false, .ci = .components_b },
+        .{ .name = "test-native-ignore", .path = "tests/component/native_ignore_tests.zig", .filter = "native ignore:", .sqlite = false, .ci = .components_a },
+        .{ .name = "test-native-ipc-auth", .path = "tests/component/native_ipc_auth_tests.zig", .filter = "native ipc auth:", .sqlite = false, .ci = .components_b },
+        .{ .name = "test-native-migration-snapshot", .path = "tests/component/migration_snapshot_tests.zig", .filter = "migration snapshot:", .sqlite = true, .ci = .components_a },
+        .{ .name = "test-native-migration-inspect", .path = "tests/component/migration_inspect_tests.zig", .filter = "migration inspect:", .sqlite = false, .ci = .components_b },
+        .{ .name = "test-native-admin-store", .path = "tests/component/native_admin_store_tests.zig", .filter = "native admin store:", .sqlite = true, .ci = .components_a },
+        .{ .name = "test-native-reload", .path = "tests/component/native_reload_tests.zig", .filter = "native reload:", .sqlite = false, .ci = .components_b },
+        .{ .name = "test-native-readiness", .path = "tests/component/native_readiness_tests.zig", .filter = "native readiness:", .sqlite = false, .ci = .components_a },
+        .{ .name = "test-native-query", .path = "tests/component/native_query_tests.zig", .filter = "native query:", .sqlite = false, .ci = .components_b },
+        .{ .name = "test-native-migration-plan", .path = "tests/component/migration_plan_tests.zig", .filter = "migration plan:", .sqlite = true, .ci = .components_a },
+        .{ .name = "test-native-rule-test", .path = "tests/component/native_rule_test_tests.zig", .filter = "native rule test:", .sqlite = false, .ci = .components_b },
+        .{ .name = "test-native-migration-store", .path = "tests/component/native_migration_store_tests.zig", .filter = "migration store:", .sqlite = true, .ci = .components_a },
+        .{ .name = "test-native-migration-import", .path = "tests/component/migration_import_tests.zig", .filter = "migration import:", .sqlite = true, .ci = .components_b },
+        .{ .name = "test-native-migration-continuity", .path = "tests/component/migration_continuity_tests.zig", .filter = "migration continuity:", .sqlite = true, .ci = .components_a },
+        .{ .name = "test-native-migration-journal", .path = "tests/component/migration_journal_tests.zig", .filter = "migration journal:", .sqlite = true, .ci = .components_b },
+        .{ .name = "test-native-migration-conflict", .path = "tests/component/native_migration_conflict_tests.zig", .filter = "migration conflict:", .sqlite = true, .ci = .components_a },
+        .{ .name = "test-native-reload-crash", .path = "tests/component/native_reload_crash_tests.zig", .filter = "reload crash:", .sqlite = true, .ci = .components_b },
+        .{ .name = "test-native-config-inline", .path = "tests/component/native_config_inline_tests.zig", .filter = "", .sqlite = false, .ci = .components_b },
+        .{ .name = "test-fail2ban-inline", .path = "tests/component/fail2ban_inline_tests.zig", .filter = "", .sqlite = false, .ci = .components_b },
+        .{ .name = "test-journald-source-inline", .path = "tests/component/journald_source_inline_tests.zig", .filter = "journald:", .sqlite = false, .ci = .components_a },
+        .{ .name = "test-firewall-inspection-inline", .path = "tests/component/firewall_inspection_inline_tests.zig", .filter = "native firewall:", .sqlite = false, .ci = .components_a },
+        .{ .name = "test-nftables-inline", .path = "tests/component/nftables_inline_tests.zig", .filter = "nftables:", .sqlite = false, .ci = .components_b },
     };
     for (components) |entry| {
         const module = b.createModule(.{
@@ -174,12 +210,33 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         });
         module.addImport("shared", shared_mod);
+        module.addImport("engine_test", component_api);
         if (entry.sqlite) module.linkLibrary(sqlite);
-        const tests = b.addTest(.{ .root_module = module, .filters = &.{entry.filter} });
+        const filters: []const []const u8 = if (entry.filter.len == 0) &.{} else &.{entry.filter};
+        const tests = b.addTest(.{ .root_module = module, .filters = filters });
         const run_tests = b.addRunArtifact(tests);
         b.step(entry.name, "Test isolated native component delivery").dependOn(&run_tests.step);
         ci.add(entry.ci, &run_tests.step);
     }
+
+    const client_format_api = b.createModule(.{
+        .root_source_file = b.path("client/format.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    client_format_api.addImport("shared", shared_mod);
+    const client_format_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/component/client_format_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    client_format_test_mod.addImport("client_format", client_format_api);
+    const client_format_tests = b.addTest(.{ .root_module = client_format_test_mod, .filters = &.{"format:"} });
+    const run_client_format_tests = b.addRunArtifact(client_format_tests);
+    b.step("test-client-format", "Test client formatting").dependOn(&run_client_format_tests.step);
+    ci.add(.components_a, &run_client_format_tests.step);
 
     const coordination_mod = b.createModule(.{
         .root_source_file = b.path("engine/native_daemon.zig"),
@@ -196,12 +253,13 @@ pub fn build(b: *std.Build) void {
     ci.add(.components_a, &run_coordination.step);
 
     const native_foundations_mod = b.createModule(.{
-        .root_source_file = b.path("engine/native_foundations_tests.zig"),
+        .root_source_file = b.path("tests/component/native_foundations_tests.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
     native_foundations_mod.addImport("shared", shared_mod);
+    native_foundations_mod.addImport("engine_test", component_api);
     const native_foundations_tests = b.addTest(.{ .root_module = native_foundations_mod, .filters = test_filters });
     native_foundations_mod.linkLibrary(sqlite);
     const run_native_foundations_tests = b.addRunArtifact(native_foundations_tests);
@@ -213,12 +271,13 @@ pub fn build(b: *std.Build) void {
     ci.add(.components_b, &run_foundations.step);
 
     const detection_mod = b.createModule(.{
-        .root_source_file = b.path("engine/native_detection_tests.zig"),
+        .root_source_file = b.path("tests/component/native_detection_tests.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
     detection_mod.addImport("shared", shared_mod);
+    detection_mod.addImport("engine_test", component_api);
     detection_mod.linkLibrary(sqlite);
     const detection_options = b.addOptions();
     detection_options.addOption([]const u8, "corpus_path", b.pathFromRoot("tests/integration/filter_corpus.json"));
@@ -230,12 +289,13 @@ pub fn build(b: *std.Build) void {
     ci.add(.components_a, &run_detection_tests.step);
 
     const retry_mod = b.createModule(.{
-        .root_source_file = b.path("engine/native_retry_tests.zig"),
+        .root_source_file = b.path("tests/component/native_retry_tests.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
     retry_mod.addImport("shared", shared_mod);
+    retry_mod.addImport("engine_test", component_api);
     retry_mod.linkLibrary(sqlite);
     const retry_tests = b.addTest(.{ .root_module = retry_mod, .filters = &.{"native retry:"} });
     const run_retry_tests = b.addRunArtifact(retry_tests);
@@ -244,12 +304,13 @@ pub fn build(b: *std.Build) void {
     ci.add(.components_b, &run_retry_tests.step);
 
     const journal_lab_mod = b.createModule(.{
-        .root_source_file = b.path("engine/journal_origin_lab_tests.zig"),
+        .root_source_file = b.path("tests/component/journal_origin_lab_tests.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
     journal_lab_mod.addImport("shared", shared_mod);
+    journal_lab_mod.addImport("engine_test", component_api);
     const journal_lab_options = b.addOptions();
     journal_lab_options.addOption(?[]const u8, "fixture", b.option([]const u8, "journal-origin-fixture", "Captured journal JSON lines for explicit lab qualification"));
     journal_lab_options.addOption(?[]const u8, "machine_id", b.option([]const u8, "journal-origin-machine-id", "Independently captured machine ID for lab qualification"));
@@ -278,7 +339,7 @@ pub fn build(b: *std.Build) void {
     const guard_options = b.addOptions();
     guard_options.addOption([]const u8, "tests_dir", b.pathFromRoot("tests"));
     const guard_mod = b.createModule(.{
-        .root_source_file = b.path("tests/module_graph_guard.zig"),
+        .root_source_file = b.path("tests/guards/module_graph_guard.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -307,7 +368,7 @@ pub fn build(b: *std.Build) void {
     ci.add(.assembled, &run_standalone_tests.step);
 
     const integration_mod = b.createModule(.{
-        .root_source_file = b.path("tests/integration_ipc_roundtrip.zig"),
+        .root_source_file = b.path("tests/integration/ipc_roundtrip_test.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
