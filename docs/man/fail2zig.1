@@ -25,6 +25,11 @@ fail2zig \- intrusion prevention daemon and its administration commands
 \fBinspect\fR|\fBsnapshot\fR|\fBplan\fR|\fBvalidate\fR|\fBcutover\fR|\fBstatus\fR|\fBrollback\fR
 [\fIoptions\fR]
 .br
+.B fail2zig repair-source
+\fB\-\-jail\fR \fIname\fR \fB\-\-source\fR \fIpath\fR \fB\-\-token\fR \fItoken\fR
+\fB\-\-acknowledge\-truncation\fR
+[\fB\-\-config\fR \fIpath\fR]
+.br
 .B fail2zig
 \fB\-\-version\fR | \fB\-\-help\fR
 .
@@ -127,8 +132,15 @@ require uid 0 or the daemon uid, verified with
 .TP
 .B status
 Daemon summary: version, protection state
-.RB ( active ", " log-only ", " mixed " or " "DEGRADED (cause)" ),
+.RB ( active ", " log-only ", " unknown ", " mixed " or " "DEGRADED (cause)" ),
 backend, active and total bans, storage phase, generation and worker/clock flags.
+Active bans are what the last complete kernel readback showed. The
+.B knowledge
+field reports whether that readback is fresh (within the verification cadence), stale
+or absent, with its wall time and age; a stale readback keeps the last count and
+reports degraded protection, and no readback reports the count as absent rather than
+zero. Pending bans, overdue removals and their oldest ages describe work the daemon
+has not yet confirmed; a served backlog alone does not degrade protection.
 Diagnostic rows show known storage, source and firewall causes. A missing cause is
 reported as unknown; it does not establish healthy protection. The recovery retry
 deadline is in absolute monotonic milliseconds, not a remaining delay.
@@ -322,6 +334,28 @@ partial (4), uncertain (5) or refused (1) releases leave the step open; an unrea
 daemon exits 3. See
 .IR docs/operations/command-migration.md .
 .
+.SH REPAIR-SOURCE
+A file source truncated in place below its committed position (for example a
+PortSentry history file that the scanner empties on start) is refused at startup
+rather than silently re-read; the log names the jail and source. With the daemon
+stopped,
+.B repair-source
+acknowledges that truncation for one configured file source and restarts it at
+offset 0 of the current file. It holds the state lock, never creates state, and
+refuses a replaced or rotated file, a pending receipt for that source, consumer
+state that is not ready, or a checkpoint changed since observation. Other sources,
+owners and ban deadlines are not changed.
+.PP
+The
+.I token
+(1\(en128 of A\(enZ a\(enz 0\(en9 . _ : \-) identifies the repair: repeating the
+same command replays the committed outcome without a second repair. The newest 256
+outcomes are retained; an older token stays reserved and is refused. Data written
+after the committed position and removed by the truncation was never read and cannot
+be recovered, and lines still in the file are read again. Stopping the daemon for the
+repair withdraws its firewall rules for every jail until the next start reinstalls
+them from durable state. Exit 0 on success or replay, 1 on refusal, 2 on usage errors.
+.
 .SH EXIT STATUS
 Every command returns one of the frozen classes.
 .TP
@@ -385,6 +419,16 @@ positions. Supported fail2ban schema-4 SQLite migration is a separate workflow.
 Native destination migration must run as the service UID with the required
 capabilities and caller-owned private staging, with the destination daemon
 stopped. See docs/operations/command-migration.md and migration-continuity.md.
+.PP
+The first start of this version on v0.4.x state (schema 23) upgrades it to
+schema 24. Before its first change the daemon writes a coherent copy to
+.IR <state_file>.pre24-backup ,
+which needs free space of twice the database size plus 32 MiB, and refuses to start
+if that file already exists. The upgrade commits in small resumable steps: an
+interrupted upgrade resumes on the next start, and a partly upgraded database is
+refused by older binaries. Keep the backup until the upgraded daemon has been checked.
+Rollback means restoring that backup (removing the upgraded database's WAL/SHM files)
+together with the previous binary; an older binary cannot open schema 24 state.
 .
 .SH ENVIRONMENT
 .TP

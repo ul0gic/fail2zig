@@ -215,3 +215,35 @@ test "migration store: rollback deltas name released, expired and native owners 
     try t.expect(try f.store.inspectInteger("SELECT count(*) FROM effect_owner_revisions;") > history_before);
     try t.expectEqual(@as(u64, 0), try f.store.releaseMigrationOwners(run_id, clock()));
 }
+
+test "migration store: re-activation never reinstates a released and replaced migration decision" {
+    // Failure: activation only compared with the current owner, so after the migration owner
+    // was released and a later native decision ended, re-running it revived the retired
+    // migration decision (A -> B -> A).
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.store.enableLoadRepair(.{ .state_path = f.path, .now_us = 4_000_000, .history_max_matches = 10 }, null);
+    const run_id = [_]u8{0x0d} ** 32;
+    try f.store.createMigrationRun(run(0x0d));
+    const staged = [_]durable.Store.StagedOwnerRow{.{ .jail = "sshd", .scope = try hostScope(40), .lease_kind = 1, .deadline_us = 9_000_000, .source_event_us = 1_000_000, .source_row = 1 }};
+    try f.store.stageMigrationRows(run_id, &staged, &.{});
+    const seq = try f.store.beginMigrationStep(run_id, .stage_destination, "", 300);
+    try f.store.finishMigrationStep(run_id, seq, .success, "", .staged, 301);
+    const generations = [_]durable.Store.JailGeneration{.{ .jail = "sshd", .generation = [_]u8{5} ** 32 }};
+    try t.expectEqual(@as(u64, 1), try f.store.activateStagedOwners(run_id, &generations, clock()));
+    try t.expectEqual(@as(u64, 1), try f.store.activateStagedOwners(run_id, &generations, clock()));
+
+    const scope = canonical.Scope{ .subject = canonical.Subject.host(.{ .ipv4 = (192 << 24) | (2 << 8) | 40 }) };
+    const key = try (try effects.Scope.exact(scope)).key((try f.store.readInstallation()).?);
+    const migrated = (try f.store.currentOwner(key, "sshd")).?;
+    _ = try f.store.transitionOwner(.{ .scope = scope, .jail = "sshd", .current_generation = migrated.generation, .next_generation = migrated.generation, .expected_owner_revision = migrated.revision, .transition_id = [_]u8{0x41} ** 32, .mode = .release, .occurred_us = 4_950_000 }, clock());
+    _ = try f.store.setOwnerFromCanonical(.{ .scope = scope, .jail = "sshd", .generation = [_]u8{5} ** 32, .decision_id = [_]u8{0x42} ** 32, .expected_revision = (try f.store.currentOwner(key, "sshd")).?.revision, .lease = .{ .finite = 9_500_000 }, .decided_us = 4_960_000 }, clock());
+    const native = (try f.store.currentOwner(key, "sshd")).?;
+    _ = try f.store.transitionOwner(.{ .scope = scope, .jail = "sshd", .current_generation = native.generation, .next_generation = native.generation, .expected_owner_revision = native.revision, .transition_id = [_]u8{0x43} ** 32, .mode = .release, .occurred_us = 4_970_000 }, clock());
+
+    try t.expectEqual(@as(u64, 0), try f.store.activateStagedOwners(run_id, &generations, clock()));
+    const after = (try f.store.currentOwner(key, "sshd")).?;
+    try t.expectEqualSlices(u8, &native.decision_id, &after.decision_id);
+    try t.expectEqual(effects.Lease.absent, after.lease);
+    try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM migration_activations;"));
+}

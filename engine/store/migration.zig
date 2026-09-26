@@ -261,13 +261,21 @@ pub fn Methods(comptime Store: type) type {
             const installation = try self.readInstallation() orelse return error.InstallationRequired;
             var activated: u64 = 0;
             var effect_changed = false;
+            const ledger = self.schema_version >= @import("store.zig").load_repair_schema;
             for (held.items) |item| {
                 const scope = canonical_scope.Scope.decode(&item.scope) catch return error.InvalidMigrationRow;
                 const lease: effects.Lease = if (item.lease_kind == 2) .permanent else .{ .finite = item.deadline_us orelse return error.InvalidMigrationRow };
-                if (lease == .finite and lease.finite <= now) continue;
                 var counter: [8]u8 = undefined;
                 std.mem.writeInt(u64, &counter, item.seq, .little);
                 const decision_id = effects.hashParts("fail2zig-migration-owner-v1", &.{ &run_id, &counter });
+                // A sequence is activated at most once. After its owner was released or
+                // replaced, re-running activation must not reinstate the retired decision, so
+                // only a still-current owner counts as replayed.
+                if (ledger and !try self.recordMigrationActivationTx(run_id, item.seq, now)) {
+                    if (try self.migrationOwnerCurrentTx(try (try effects.Scope.exact(scope)).key(installation), item.jail[0..item.jail_len], decision_id)) activated += 1;
+                    continue;
+                }
+                if (lease == .finite and lease.finite <= now) continue;
                 const key = try (try effects.Scope.exact(scope)).key(installation);
                 const jail = item.jail[0..item.jail_len];
                 const generation = for (generations) |candidate| {
@@ -313,6 +321,25 @@ pub fn Methods(comptime Store: type) type {
             try self.fault(.before_migration_activation_commit);
             try self.commitEffectTransaction(effect_changed);
             return activated;
+        }
+
+        // False when the sequence was already activated.
+        fn recordMigrationActivationTx(self: *Store, run_id: [32]u8, seq: u64, now: i64) Error!bool {
+            var insert = try self.statement("INSERT INTO migration_activations VALUES(?1,?2,?3) ON CONFLICT(run_id,seq) DO NOTHING;");
+            defer insert.deinit();
+            try insert.blob(1, &run_id);
+            try insert.int(2, std.math.cast(i64, seq) orelse return error.InvalidMigrationRow);
+            try insert.int(3, @max(0, now));
+            try insert.done();
+            return self.api.changes(self.db) == 1;
+        }
+        fn migrationOwnerCurrentTx(self: *Store, key: [32]u8, jail: []const u8, decision_id: [32]u8) Error!bool {
+            var row = try self.statement("SELECT 1 FROM effect_owners WHERE scope_key=?1 AND jail=?2 AND decision_id=?3 AND lease_kind<>0;");
+            defer row.deinit();
+            try row.blob(1, &key);
+            try row.text(2, jail);
+            try row.blob(3, &decision_id);
+            return row.row();
         }
 
         fn recordMigrationConflictTx(self: *Store, run_id: [32]u8, seq: u64, scope: *const [canonical_scope_bytes]u8, jail: []const u8, lease_kind: u8, deadline_us: ?i64, now: i64) Error!void {

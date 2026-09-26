@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
+const builtin = @import("builtin");
 const consumers = @import("../core/native_consumer.zig");
 const detection = @import("../core/native_detection_record.zig");
 const retry = @import("../core/native_retry.zig");
@@ -8,6 +9,7 @@ const effects = @import("../core/native_effect.zig");
 const effect_history = @import("../core/native_effect_history.zig");
 const application_history = @import("../core/native_application_history.zig");
 const action_outcome = @import("../core/native_action_outcome.zig");
+const health = @import("../core/storage_health.zig");
 const store = @import("store.zig");
 const Error = store.Error;
 const Stmt = store.Stmt;
@@ -342,6 +344,37 @@ pub fn Methods(comptime Store: type) type {
             if (decisions < 0) return error.InvalidRetryState;
             return .{ .subject = try self.decodeRetrySubject(&row, 0, 1), .last_processed_us = try row.signed(2), .decisions = @intCast(decisions) };
         }
+        /// Like `retryRetirementCandidate`, but skips subjects that cannot retire yet: a
+        /// live lease, or an attempt inside the retry window. Bounded by one row read.
+        pub fn retirableSubject(self: *Store, jail: []const u8, after: ?detection.Subject, now_us: i64, window_us: i64) Error!?RetryRetirementCandidate {
+            if (self.schema_version < 16) return self.retryRetirementCandidate(jail, after);
+            _ = try self.maintenanceRevision();
+            try Store.maintenanceKey(jail, "@retired");
+            var row = try self.statement(if (after == null)
+                "SELECT family,subject,last_processed_us,decisions FROM retry_states WHERE jail=?1 AND (lease_kind=0 OR deadline_us<=?4) AND last_processed_us<?5 ORDER BY family,subject LIMIT 1;"
+            else
+                "SELECT family,subject,last_processed_us,decisions FROM retry_states WHERE jail=?1 AND (family,subject)>(?2,?3) AND (lease_kind=0 OR deadline_us<=?4) AND last_processed_us<?5 ORDER BY family,subject LIMIT 1;");
+            defer row.deinit();
+            try row.text(1, jail);
+            if (after) |*subject| try Store.bindSubject(&row, subject);
+            try row.int(4, now_us);
+            try row.int(5, now_us -| window_us);
+            if (!try row.row()) return null;
+            const decisions = try row.signed(3);
+            if (decisions < 0) return error.InvalidRetryState;
+            return .{ .subject = try self.decodeRetrySubject(&row, 0, 1), .last_processed_us = try row.signed(2), .decisions = @intCast(decisions) };
+        }
+        /// Retirement touches only retry state, so it needs the revision and policy
+        /// fence but not the receipt, manifest or history conditions of record cleanup;
+        /// those would pin retirement for as long as ingestion is blocked.
+        fn checkRetirementFence(self: *Store, fence: CleanupFence) Error!i64 {
+            _ = try self.maintenanceRevision();
+            try Store.maintenanceKey(fence.jail, "@retired");
+            if (try self.revision(fence.jail) != fence.jail_revision or try self.consumerRevision() != fence.consumer_revision or
+                try self.maintenanceEffectRevision() != fence.effect_revision) return error.StaleMaintenance;
+            if (try self.readRetryPolicy(fence.jail)) |policy| if (!std.mem.eql(u8, &policy.generation, &fence.generation)) return error.RetryGenerationMismatch;
+            return self.cleanupClock(fence.clock);
+        }
         pub fn retiredTotal(self: *Store, jail: []const u8) Error!u64 {
             var row = try self.statement("SELECT total FROM retry_retired_totals WHERE jail=?1;");
             defer row.deinit();
@@ -384,17 +417,77 @@ pub fn Methods(comptime Store: type) type {
         pub fn retireRetrySubject(self: *Store, fence: CleanupFence, candidate: RetryRetirementCandidate) Error!bool {
             try self.beginWrite();
             errdefer self.rollback();
-            const now = try self.checkCleanupFence(fence);
+            const now = try self.checkRetirementFence(fence);
             const admission = try self.readRetryPolicy(fence.jail) orelse return error.RetryAdmissionRequired;
-            if (try self.readRetired(fence.jail, candidate.subject) != null) return error.StaleMaintenance;
-            const state = try self.readRetryState(fence.jail, candidate.subject, admission.policy) orelse return error.StaleMaintenance;
-            if (state.last_processed_us != candidate.last_processed_us or state.decisions != candidate.decisions) return error.StaleMaintenance;
-            const logical = (try retry.prune(admission.policy, state, now)).state;
-            const pinned = logical.lease != .absent or logical.count != 0;
-            if (pinned or try self.subjectEffectPinned(candidate.subject)) {
+            if (try self.retireOneTx(fence, admission.policy, candidate, now) != .retired) {
                 try self.commitTransaction();
                 return false;
             }
+            try self.finishRetirementTx(fence, now);
+            try self.commitTransaction();
+            return true;
+        }
+        pub const max_retirement_batch = Store.attribution_batch;
+        /// Candidates examined per retirement slot before a batch gives up on pinned subjects.
+        const retirement_examinations_per_slot: usize = 4;
+        /// One retirement commit: candidates examined, subjects retired, and candidates
+        /// skipped because a logical lease or count still pins them (`pinned_state`) or a
+        /// live effect does (`pinned_effect`). `last` is the last examined subject.
+        /// `exhausted` says the batch reached the end of the eligible set rather than a
+        /// cap, so the caller restarts its sweep instead of advancing past `last`.
+        pub const RetirementBatch = struct { examined: usize = 0, retired: usize = 0, pinned_state: usize = 0, pinned_effect: usize = 0, last: ?detection.Subject = null, exhausted: bool = false };
+        /// Retires up to `max` retirable subjects after `after` in one commit. `max` bounds
+        /// the subjects retired; examinations are bounded separately so pinned candidates
+        /// do not consume the batch. The fence is checked once; each subject keeps its own
+        /// prune, pin and state checks. The batch is all-or-nothing: a rollback leaves every
+        /// subject in `retry_states`.
+        pub fn retireRetrySubjects(self: *Store, fence: CleanupFence, after: ?detection.Subject, now_us: i64, window_us: i64, max: usize) Error!RetirementBatch {
+            if (max == 0 or max > max_retirement_batch) return error.InvalidRetryState;
+            try self.beginWrite();
+            errdefer self.rollback();
+            const now = try self.checkRetirementFence(fence);
+            const admission = try self.readRetryPolicy(fence.jail) orelse return error.RetryAdmissionRequired;
+            var batch = RetirementBatch{};
+            var cursor = after;
+            while (batch.retired < max and batch.examined < max * retirement_examinations_per_slot) {
+                const candidate = (try self.retirableSubject(fence.jail, cursor, now_us, window_us)) orelse {
+                    batch.exhausted = true;
+                    break;
+                };
+                cursor = candidate.subject;
+                batch.last = candidate.subject;
+                batch.examined += 1;
+                switch (try self.retireOneTx(fence, admission.policy, candidate, now)) {
+                    .retired => batch.retired += 1,
+                    .pinned_state => batch.pinned_state += 1,
+                    .pinned_effect => batch.pinned_effect += 1,
+                }
+            }
+            if (batch.retired == 0) {
+                try self.commitTransaction();
+                return batch;
+            }
+            try self.finishRetirementTx(fence, now);
+            try self.commitTransaction();
+            return batch;
+        }
+        fn finishRetirementTx(self: *Store, fence: CleanupFence, now: i64) Error!void {
+            var floor = try self.statement("UPDATE retry_clock SET floor_us=?1 WHERE id=1;");
+            defer floor.deinit();
+            try floor.int(1, now);
+            try floor.done();
+            if (self.api.changes(self.db) != 1) return error.InvalidRetryState;
+            try self.fault(.after_retry_retire);
+            try self.finishCleanupClock(fence.clock, now);
+        }
+        const Retirement = enum { retired, pinned_state, pinned_effect };
+        fn retireOneTx(self: *Store, fence: CleanupFence, policy: retry.Policy, candidate: RetryRetirementCandidate, now: i64) Error!Retirement {
+            if (try self.readRetired(fence.jail, candidate.subject) != null) return error.StaleMaintenance;
+            const state = try self.readRetryState(fence.jail, candidate.subject, policy) orelse return error.StaleMaintenance;
+            if (state.last_processed_us != candidate.last_processed_us or state.decisions != candidate.decisions) return error.StaleMaintenance;
+            const logical = (try retry.prune(policy, state, now)).state;
+            if (logical.lease != .absent or logical.count != 0) return .pinned_state;
+            if (try self.subjectEffectPinned(candidate.subject)) return .pinned_effect;
             try self.changeRetiredTotal(fence.jail, state.decisions, true);
             var saved = try self.statement("INSERT INTO retry_retired VALUES(?1,?2,?3,?4,?5,?6);");
             defer saved.deinit();
@@ -410,15 +503,7 @@ pub fn Methods(comptime Store: type) type {
             try Store.bindSubject(&remove, &candidate.subject);
             try remove.done();
             if (self.api.changes(self.db) != 1) return error.StaleMaintenance;
-            var floor = try self.statement("UPDATE retry_clock SET floor_us=?1 WHERE id=1;");
-            defer floor.deinit();
-            try floor.int(1, now);
-            try floor.done();
-            if (self.api.changes(self.db) != 1) return error.InvalidRetryState;
-            try self.fault(.after_retry_retire);
-            try self.finishCleanupClock(fence.clock, now);
-            try self.commitTransaction();
-            return true;
+            return .retired;
         }
 
         pub const MaintenanceValidation = struct {
@@ -643,7 +728,11 @@ pub fn Methods(comptime Store: type) type {
             if (output.len == 0 or output.len > effect_history.max_page) return error.InvalidHistoryPage;
             var token = try self.historyHead(installation, after);
             if (expected_revision) |wanted_revision| if (wanted_revision != token.stream_revision) return error.StaleHistoryPage;
-            var row = try self.statement(if (self.schema_version >= 19)
+            // From schema 24 an event carries its own scope provenance, so a pruned spent scope
+            // never hides retained history.
+            var row = try self.statement(if (self.schema_version >= store.load_repair_schema)
+                "SELECT s.sequence,e.event_id,e.scope_key,e.canonical_scope,e.jail,e.decision_id,e.confirmed_us,EXISTS(SELECT 1 FROM confirmed_event_details d WHERE d.event_id=e.event_id) FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;"
+            else if (self.schema_version >= 19)
                 "SELECT s.sequence,e.event_id,e.scope_key,n.canonical_scope,e.jail,e.decision_id,e.confirmed_us,EXISTS(SELECT 1 FROM confirmed_event_details d WHERE d.event_id=e.event_id) FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;"
             else if (self.schema_version >= 17)
                 "SELECT s.sequence,e.event_id,e.scope_key,n.scope,e.jail,e.decision_id,e.confirmed_us,EXISTS(SELECT 1 FROM confirmed_event_details d WHERE d.event_id=e.event_id) FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;"
@@ -873,7 +962,9 @@ pub fn Methods(comptime Store: type) type {
             if (!try row.row()) return error.StaleActionTarget;
             const status = std.meta.intToEnum(action_outcome.Status, try row.signed(0)) catch return error.InvalidActionTarget;
             if (try row.row()) return error.InvalidActionTarget;
-            if (status == .dispatched) {
+            // Dispatch and confirmation can already have been recorded with the intent's
+            // own commits; a later mark never regresses that state.
+            if (status == .dispatched or status == .confirmed) {
                 try self.commitTransaction();
                 return;
             }
@@ -890,6 +981,22 @@ pub fn Methods(comptime Store: type) type {
             try self.commitTransaction();
         }
 
+        /// Confirms every dispatched target of the scope's live decisions inside the caller's
+        /// transaction. An enforcement target needs its confirmation proof (marker or retained
+        /// event), which the settlement writes first. Returns the rows settled; none on a
+        /// schema without action targets.
+        pub fn settleActionTargetsTx(self: *Store, scope_key: effects.Hash, now: i64) Error!usize {
+            if (self.schema_version < 21) return 0;
+            var update = try self.statement(if (self.schema_version >= store.load_repair_schema)
+                "UPDATE action_targets SET status=3,settled_us=?2 WHERE scope_key=?1 AND status=2 AND action_id IN (SELECT decision_id FROM effect_owners WHERE scope_key=?1 AND lease_kind<>0) AND (kind<>1 OR EXISTS(SELECT 1 FROM confirmation_markers m WHERE m.scope_key=action_targets.scope_key AND m.jail=action_targets.jail AND m.decision_id=action_targets.action_id) OR EXISTS(SELECT 1 FROM confirmed_effect_events e WHERE e.scope_key=action_targets.scope_key AND e.jail=action_targets.jail AND e.decision_id=action_targets.action_id));"
+            else
+                "UPDATE action_targets SET status=3,settled_us=?2 WHERE scope_key=?1 AND status=2 AND action_id IN (SELECT decision_id FROM effect_owners WHERE scope_key=?1 AND lease_kind<>0) AND (kind<>1 OR EXISTS(SELECT 1 FROM confirmed_effect_events e WHERE e.scope_key=action_targets.scope_key AND e.jail=action_targets.jail AND e.decision_id=action_targets.action_id));");
+            defer update.deinit();
+            try update.blob(1, &scope_key);
+            try update.int(2, now);
+            try update.done();
+            return @intCast(@max(0, self.api.changes(self.db)));
+        }
         pub fn settleActionTarget(self: *Store, action_id: [32]u8, kind: action_outcome.Kind, settlement: action_outcome.Settlement, clock: effects.Clock) Error!void {
             try self.beginWrite();
             errdefer self.rollback();
@@ -912,7 +1019,11 @@ pub fn Methods(comptime Store: type) type {
             }
             if (target.status != .dispatched) return error.StaleActionTarget;
             if (kind == .enforcement and settlement == .confirmed) {
-                var proof = try self.statement("SELECT count(*) FROM confirmed_effect_events WHERE scope_key=?1 AND jail=?2 AND decision_id=?3;");
+                // The marker proves confirmation after its event was pruned from history.
+                var proof = try self.statement(if (self.schema_version >= store.load_repair_schema)
+                    "SELECT (SELECT count(*) FROM confirmation_markers WHERE scope_key=?1 AND jail=?2 AND decision_id=?3)+(SELECT count(*) FROM confirmed_effect_events WHERE scope_key=?1 AND jail=?2 AND decision_id=?3)>0;"
+                else
+                    "SELECT count(*) FROM confirmed_effect_events WHERE scope_key=?1 AND jail=?2 AND decision_id=?3;");
                 defer proof.deinit();
                 try proof.blob(1, &target.scope_key);
                 try proof.text(2, target.jail.slice());
@@ -940,7 +1051,9 @@ pub fn Methods(comptime Store: type) type {
             errdefer self.rollback();
             const head = try self.historyHead(installation, query.after_sequence);
             if (query.expected_stream_revision) |expected| if (expected != head.stream_revision) return error.StaleHistoryPage;
-            var row = try self.statement(if (self.schema_version >= 19)
+            var row = try self.statement(if (self.schema_version >= store.load_repair_schema)
+                "SELECT s.sequence,e.event_id,e.scope_key,e.canonical_scope,e.jail,e.decision_id,e.confirmed_us,d.source,d.occurrence,d.decided_us,d.ordinal,d.evidence FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id LEFT JOIN confirmed_event_details d ON d.event_id=e.event_id WHERE s.sequence>?1 AND s.sequence<=?2 AND (?3 IS NULL OR e.jail=?3) AND (?4 IS NULL OR e.confirmed_us>=?4) AND (?5 IS NULL OR e.confirmed_us<?5) ORDER BY s.sequence LIMIT ?6;"
+            else if (self.schema_version >= 19)
                 "SELECT s.sequence,e.event_id,e.scope_key,n.canonical_scope,e.jail,e.decision_id,e.confirmed_us,d.source,d.occurrence,d.decided_us,d.ordinal,d.evidence FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key LEFT JOIN confirmed_event_details d ON d.event_id=e.event_id WHERE s.sequence>?1 AND s.sequence<=?2 AND (?3 IS NULL OR e.jail=?3) AND (?4 IS NULL OR e.confirmed_us>=?4) AND (?5 IS NULL OR e.confirmed_us<?5) ORDER BY s.sequence LIMIT ?6;"
             else
                 "SELECT s.sequence,e.event_id,e.scope_key,n.scope,e.jail,e.decision_id,e.confirmed_us,d.source,d.occurrence,d.decided_us,d.ordinal,d.evidence FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key LEFT JOIN confirmed_event_details d ON d.event_id=e.event_id WHERE s.sequence>?1 AND s.sequence<=?2 AND (?3 IS NULL OR e.jail=?3) AND (?4 IS NULL OR e.confirmed_us>=?4) AND (?5 IS NULL OR e.confirmed_us<?5) ORDER BY s.sequence LIMIT ?6;");
@@ -1118,107 +1231,463 @@ pub fn Methods(comptime Store: type) type {
             return deleted != 0;
         }
 
-        pub fn cleanupConfirmedHistoryOne(self: *Store, policy: HistoryRetention, now_us: i64) Error!bool {
+        pub const RetentionPolicy = struct { generation: i64, max_matches: i64, published: bool, sweep_cursor: i64 };
+        pub const RetentionOutcome = enum { idle, rebuilt, published, details, prefix, yielded };
+        const retained_evidence_limit = "16384";
+        // Measured schema-24 transaction units (repair phase 0): summaries per candidate sweep,
+        // age-eligible rows before the sequence-index path, and stream events per prefix page.
+        const sweep_rows: i64 = 1024;
+        const age_path_threshold: i64 = 4096;
+        const prefix_page: usize = 64;
+        /// Consumed history is pruned before its age from 90% of the event cap on, so a
+        /// confirmation never fails because history is full.
+        pub const history_overload_events: i64 = 58_982;
+        const overload_notice_us: i64 = 60 * 1_000_000;
+
+        fn readRetentionPolicy(self: *Store) Error!RetentionPolicy {
+            var row = try self.statement("SELECT generation,max_matches,state,sweep_cursor FROM retention_policy WHERE id=1;");
+            defer row.deinit();
+            if (!try row.row()) return error.InvalidApplicationHistoryRow;
+            const result = RetentionPolicy{ .generation = try row.signed(0), .max_matches = try row.signed(1), .published = try row.signed(2) == 2, .sweep_cursor = try row.signed(3) };
+            if (result.generation <= 0 or result.max_matches < 0 or result.max_matches > 1024 or result.sweep_cursor < 0) return error.InvalidApplicationHistoryRow;
+            return result;
+        }
+
+        /// Starts a complete candidate generation for a changed detail limit. Deletion waits
+        /// until every retained subject has been evaluated under it; a later change supersedes
+        /// an unfinished build and restarts it. Returns whether a generation started.
+        pub fn setRetentionPolicy(self: *Store, max_matches: u16) Error!bool {
+            if (max_matches > 1024) return error.InvalidApplicationHistoryQuery;
+            try self.beginWrite();
+            errdefer self.rollback();
+            if (self.schema_version < store.load_repair_schema) return error.MaintenanceStorageRequired;
+            const started = try self.beginRetentionGenerationTx(max_matches);
+            try self.commitTransaction();
+            return started;
+        }
+        fn beginRetentionGenerationTx(self: *Store, max_matches: i64) Error!bool {
+            const current = try self.readRetentionPolicy();
+            if (current.max_matches == max_matches) return false;
+            var row = try self.statement("UPDATE retention_policy SET generation=generation+1,max_matches=?1,state=1,sweep_cursor=0 WHERE id=1 AND generation=?2 AND generation<9223372036854775807;");
+            defer row.deinit();
+            try row.int(1, max_matches);
+            try row.int(2, current.generation);
+            try row.done();
+            if (self.api.changes(self.db) != 1) return error.StorageLimit;
+            return true;
+        }
+
+        /// Adds a detail inserted in the caller's transaction to its retained subject summary.
+        /// The candidate is evaluated under the current policy, including while a generation
+        /// is still being built, so concurrent arrivals never need a second pass.
+        pub fn retainDetailTx(self: *Store, family: i64, subject: []const u8, bytes: ?i64, sequence: i64) Error!void {
+            const policy = try self.readRetentionPolicy();
+            var row = try self.statement("INSERT INTO retained_subject_summaries(family,subject,detail_count,evidence_bytes,earliest_sequence,earliest_evidence_sequence,evaluated_generation,candidate_sequence) VALUES(?1,?2,1,coalesce(?3,0),?4,CASE WHEN ?3 IS NOT NULL THEN ?4 END,?5,NULL) ON CONFLICT(family,subject) DO UPDATE SET detail_count=detail_count+1,evidence_bytes=evidence_bytes+excluded.evidence_bytes,earliest_sequence=min(earliest_sequence,excluded.earliest_sequence),earliest_evidence_sequence=coalesce(earliest_evidence_sequence,excluded.earliest_evidence_sequence);");
+            defer row.deinit();
+            try row.int(1, family);
+            try row.blob(2, subject);
+            if (bytes) |value| try row.int(3, value) else try self.check(self.api.bind_null(row.ptr, 3));
+            try row.int(4, sequence);
+            try row.int(5, policy.generation);
+            try row.done();
+            try self.updateCandidateTx(family, subject, policy);
+        }
+        fn updateCandidateTx(self: *Store, family: i64, subject: []const u8, policy: RetentionPolicy) Error!void {
+            var row = try self.statement("UPDATE retained_subject_summaries SET candidate_sequence=CASE WHEN detail_count>?3 THEN earliest_sequence WHEN evidence_bytes>" ++ retained_evidence_limit ++ " THEN earliest_evidence_sequence END,evaluated_generation=?4 WHERE family=?1 AND subject=?2;");
+            defer row.deinit();
+            try row.int(1, family);
+            try row.blob(2, subject);
+            try row.int(3, policy.max_matches);
+            try row.int(4, policy.generation);
+            try row.done();
+            if (self.api.changes(self.db) != 1) return error.InvalidApplicationHistoryRow;
+        }
+
+        const RetainedDetail = struct {
+            sequence: i64,
+            event_id: [32]u8,
+            family: ?i64,
+            subject: [16]u8 = undefined,
+            subject_len: usize = 0,
+            bytes: ?i64,
+
+            // Columns: sequence, event_id, family, subject, evidence_bytes.
+            fn read(row: *Stmt) Error!RetainedDetail {
+                var detail = RetainedDetail{ .sequence = try row.signed(0), .event_id = try Store.effectBlob(row, 1, 32), .family = try row.optionalSigned(2), .bytes = try row.optionalSigned(4) };
+                if (detail.family != null) {
+                    const subject = try row.boundedBytes(3, detail.subject.len);
+                    @memcpy(detail.subject[0..subject.len], subject);
+                    detail.subject_len = subject.len;
+                }
+                if (detail.sequence <= 0) return error.InvalidApplicationHistoryRow;
+                return detail;
+            }
+        };
+
+        /// Every detail deletion goes through here so the retained summary, its earliest
+        /// sequences and its candidate change in the same transaction.
+        fn deleteRetainedDetailTx(self: *Store, detail: RetainedDetail, policy: RetentionPolicy) Error!void {
+            {
+                var remove = try self.statement("DELETE FROM confirmed_event_details WHERE event_id=?1 AND sequence=?2;");
+                defer remove.deinit();
+                try remove.blob(1, &detail.event_id);
+                try remove.int(2, detail.sequence);
+                try remove.done();
+                if (self.api.changes(self.db) != 1) return error.HistoryGap;
+            }
+            try self.fault(.after_history_detail_delete);
+            const family = detail.family orelse return;
+            const subject = detail.subject[0..detail.subject_len];
+            {
+                var last = try self.statement("DELETE FROM retained_subject_summaries WHERE family=?1 AND subject=?2 AND detail_count=1;");
+                defer last.deinit();
+                try last.int(1, family);
+                try last.blob(2, subject);
+                try last.done();
+                if (self.api.changes(self.db) == 1) return;
+            }
+            {
+                var decrement = try self.statement("UPDATE retained_subject_summaries SET detail_count=detail_count-1,evidence_bytes=evidence_bytes-?3,candidate_sequence=NULL,earliest_sequence=(SELECT min(sequence) FROM confirmed_event_details INDEXED BY confirmed_details_subject WHERE family=?1 AND subject=?2),earliest_evidence_sequence=(SELECT min(sequence) FROM confirmed_event_details INDEXED BY confirmed_details_evidence WHERE family=?1 AND subject=?2 AND evidence_bytes IS NOT NULL) WHERE family=?1 AND subject=?2 AND detail_count>1;");
+                defer decrement.deinit();
+                try decrement.int(1, family);
+                try decrement.blob(2, subject);
+                try decrement.int(3, detail.bytes orelse 0);
+                try decrement.done();
+                if (self.api.changes(self.db) != 1) return error.InvalidApplicationHistoryRow;
+            }
+            try self.updateCandidateTx(family, subject, policy);
+        }
+
+        // History beyond the consumer checkpoint has not been read and is never deleted.
+        fn historyFence(self: *Store) Error!?i64 {
+            var row = try self.statement("SELECT payload FROM consumer_checkpoints WHERE kind=5 AND jail='@history' AND source='confirmed-effects' AND rule='checkpoint';");
+            defer row.deinit();
+            if (!try row.row()) return null;
+            const saved = effect_history.Checkpoint.decode(try row.boundedBytes(0, effect_history.checkpoint_bytes)) catch return error.InvalidHistoryCheckpoint;
+            if (try row.row()) return error.InvalidHistoryCheckpoint;
+            const installation = try self.readInstallation() orelse return error.InstallationRequired;
+            if (!std.mem.eql(u8, &saved.installation, &installation.id)) return error.InvalidHistoryCheckpoint;
+            return std.math.cast(i64, saved.last_sequence) orelse error.InvalidHistoryCheckpoint;
+        }
+
+        // One page of the exact retention order: every detail at or below the fence that is
+        // age-eligible or its subject's over-limit candidate, ascending by sequence. Age rows
+        // are taken only below the earliest competing candidate, which is deleted next.
+        fn deleteDetailPage(self: *Store, policy: RetentionPolicy, fence: i64, cutoff: i64, page: usize, wrote: *bool) Error!usize {
+            const age_count = blk: {
+                var row = try self.statement("SELECT count(*) FROM (SELECT 1 FROM confirmed_event_details INDEXED BY confirmed_details_age WHERE confirmed_us<=?1 LIMIT ?2);");
+                defer row.deinit();
+                try row.int(1, cutoff);
+                try row.int(2, age_path_threshold);
+                if (!try row.row()) return error.DatabaseFailure;
+                break :blk try row.signed(0);
+            };
+            const age_sql: [:0]const u8 = if (age_count >= age_path_threshold)
+                "SELECT sequence,event_id,family,subject,evidence_bytes FROM confirmed_event_details INDEXED BY confirmed_details_sequence WHERE sequence<=?2 AND confirmed_us<=?1 ORDER BY sequence LIMIT ?3;"
+            else
+                "SELECT sequence,event_id,family,subject,evidence_bytes FROM confirmed_event_details INDEXED BY confirmed_details_age WHERE confirmed_us<=?1 AND sequence<=?2 ORDER BY sequence LIMIT ?3;";
+            var rows: [store.max_retention_page]RetainedDetail = undefined;
+            var deleted: usize = 0;
+            while (deleted < page) {
+                const competing: ?i64 = blk: {
+                    var row = try self.statement("SELECT min(candidate_sequence) FROM retained_subject_summaries INDEXED BY retained_subject_candidates WHERE candidate_sequence IS NOT NULL;");
+                    defer row.deinit();
+                    if (!try row.row()) return error.DatabaseFailure;
+                    const value = try row.optionalSigned(0) orelse break :blk null;
+                    break :blk if (value <= fence) value else null;
+                };
+                const limit = if (competing) |value| value - 1 else fence;
+                if (limit > 0) {
+                    var count: usize = 0;
+                    {
+                        var row = try self.statement(age_sql);
+                        defer row.deinit();
+                        try row.int(1, cutoff);
+                        try row.int(2, limit);
+                        try row.int(3, @intCast(page - deleted));
+                        while (try row.row()) {
+                            if (count == rows.len) return error.InvalidApplicationHistoryRow;
+                            rows[count] = try RetainedDetail.read(&row);
+                            if (count > 0 and rows[count].sequence <= rows[count - 1].sequence) return error.InvalidApplicationHistoryRow;
+                            count += 1;
+                        }
+                    }
+                    for (rows[0..count]) |detail| {
+                        wrote.* = true;
+                        try self.deleteRetainedDetailTx(detail, policy);
+                    }
+                    deleted += count;
+                    if (deleted >= page) break;
+                }
+                const sequence = competing orelse break;
+                const candidate = blk: {
+                    var valid = try self.statement("SELECT count(*) FROM retained_subject_summaries s JOIN confirmed_event_details d INDEXED BY confirmed_details_sequence ON d.sequence=?1 WHERE s.family=d.family AND s.subject=d.subject AND s.candidate_sequence=?1 AND ((s.detail_count>?2 AND s.earliest_sequence=?1) OR (s.evidence_bytes>" ++ retained_evidence_limit ++ " AND s.earliest_evidence_sequence=?1));");
+                    defer valid.deinit();
+                    try valid.int(1, sequence);
+                    try valid.int(2, policy.max_matches);
+                    if (!try valid.row() or try valid.signed(0) != 1) return error.InvalidApplicationHistoryRow;
+                    var row = try self.statement("SELECT sequence,event_id,family,subject,evidence_bytes FROM confirmed_event_details INDEXED BY confirmed_details_sequence WHERE sequence=?1;");
+                    defer row.deinit();
+                    try row.int(1, sequence);
+                    if (!try row.row()) return error.InvalidApplicationHistoryRow;
+                    const detail = try RetainedDetail.read(&row);
+                    if (try row.row()) return error.InvalidApplicationHistoryRow;
+                    break :blk detail;
+                };
+                wrote.* = true;
+                try self.deleteRetainedDetailTx(candidate, policy);
+                deleted += 1;
+            }
+            return deleted;
+        }
+
+        // Frees the consumed stream prefix. A live owner no longer pins it: its marker keeps
+        // deduplication. Unsettled outcomes of the event's decision and pending intents on its
+        // scope still stop the page.
+        fn prunePrefixPage(self: *Store, policy: RetentionPolicy, fence: i64, cutoff: i64, now_us: i64) Error!usize {
+            var events = try self.integer("SELECT count(*) FROM confirmed_effect_events;");
+            var pruned: usize = 0;
+            var overloaded = false;
+            while (pruned < prefix_page) {
+                const retained_from = blk: {
+                    var stream = try self.statement("SELECT retained_from,head FROM confirmed_history_stream WHERE id=1;");
+                    defer stream.deinit();
+                    if (!try stream.row()) return error.HistoryGap;
+                    const from = try stream.signed(0);
+                    if (from > try stream.signed(1) or from > fence) return self.prefixPruned(pruned, overloaded, events, now_us);
+                    break :blk from;
+                };
+                const over = events >= history_overload_events;
+                var candidate = try self.statement("SELECT e.event_id,e.confirmed_us,EXISTS(SELECT 1 FROM effect_intents p INDEXED BY effect_intents_pending WHERE p.scope_key=e.scope_key AND p.status IN(1,2)),EXISTS(SELECT 1 FROM action_targets a WHERE a.action_id=e.decision_id AND a.scope_key=e.scope_key AND a.jail=e.jail AND a.status IN(1,2,5)) FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id WHERE s.sequence=?1;");
+                defer candidate.deinit();
+                try candidate.int(1, retained_from);
+                if (!try candidate.row()) return error.HistoryGap;
+                const event_id = try Store.effectBlob(&candidate, 0, 32);
+                if ((!over and try candidate.signed(1) > cutoff) or try candidate.signed(2) != 0 or try candidate.signed(3) != 0) break;
+                {
+                    var detail = try self.statement("SELECT sequence,event_id,family,subject,evidence_bytes FROM confirmed_event_details WHERE event_id=?1;");
+                    defer detail.deinit();
+                    try detail.blob(1, &event_id);
+                    if (try detail.row()) {
+                        const retained = try RetainedDetail.read(&detail);
+                        if (retained.sequence != retained_from) return error.HistoryGap;
+                        try self.deleteRetainedDetailTx(retained, policy);
+                    }
+                }
+                var sequence = try self.statement("DELETE FROM confirmed_history_sequence WHERE sequence=?1 AND event_id=?2;");
+                defer sequence.deinit();
+                try sequence.int(1, retained_from);
+                try sequence.blob(2, &event_id);
+                try sequence.done();
+                if (self.api.changes(self.db) != 1) return error.HistoryGap;
+                var event = try self.statement("DELETE FROM confirmed_effect_events WHERE event_id=?1;");
+                defer event.deinit();
+                try event.blob(1, &event_id);
+                try event.done();
+                if (self.api.changes(self.db) != 1) return error.HistoryGap;
+                try self.fault(.after_history_event_delete);
+                var stream = try self.statement("UPDATE confirmed_history_stream SET retained_from=?1,revision=revision+1 WHERE id=1 AND retained_from=?2;");
+                defer stream.deinit();
+                try stream.int(1, retained_from + 1);
+                try stream.int(2, retained_from);
+                try stream.done();
+                if (self.api.changes(self.db) != 1) return error.HistoryGap;
+                pruned += 1;
+                events -= 1;
+                overloaded = overloaded or over;
+            }
+            return self.prefixPruned(pruned, overloaded, events, now_us);
+        }
+        fn prefixPruned(self: *Store, pruned: usize, overloaded: bool, events: i64, now_us: i64) Error!usize {
+            if (!overloaded) return pruned;
+            if (self.history_overload_notice_us) |last| if (now_us -| last < overload_notice_us) return pruned;
+            self.history_overload_notice_us = now_us;
+            const horizon = try self.integer("SELECT coalesce(min(e.confirmed_us),0) FROM confirmed_history_stream h JOIN confirmed_history_sequence s ON s.sequence=h.retained_from JOIN confirmed_effect_events e ON e.event_id=s.event_id WHERE h.id=1;");
+            std.log.warn("native history: {d} confirmed events at the overload threshold; consumed history is pruned before its retention age, oldest retained confirmation at {d} us", .{ events, horizon });
+            return pruned;
+        }
+
+        fn sweepCandidatesTx(self: *Store, policy: RetentionPolicy) Error!RetentionOutcome {
+            const rows = if (builtin.is_test) self.test_hooks.retention_sweep_rows orelse sweep_rows else sweep_rows;
+            const maximum = try self.integer("SELECT coalesce(max(rowid),0) FROM retained_subject_summaries;");
+            const high = std.math.add(i64, policy.sweep_cursor, rows) catch return error.StorageLimit;
+            if (policy.sweep_cursor < maximum) {
+                var sweep = try self.statement("UPDATE retained_subject_summaries SET candidate_sequence=CASE WHEN detail_count>?3 THEN earliest_sequence WHEN evidence_bytes>" ++ retained_evidence_limit ++ " THEN earliest_evidence_sequence END,evaluated_generation=?4 WHERE rowid>?1 AND rowid<=?2;");
+                defer sweep.deinit();
+                try sweep.int(1, policy.sweep_cursor);
+                try sweep.int(2, high);
+                try sweep.int(3, policy.max_matches);
+                try sweep.int(4, policy.generation);
+                try sweep.done();
+            }
+            const done = high >= maximum;
+            var advance = try self.statement(if (done)
+                "UPDATE retention_policy SET state=2,sweep_cursor=0 WHERE id=1 AND generation=?2 AND state=1 AND ?1>=0;"
+            else
+                "UPDATE retention_policy SET sweep_cursor=?1 WHERE id=1 AND generation=?2 AND state=1;");
+            defer advance.deinit();
+            try advance.int(1, high);
+            try advance.int(2, policy.generation);
+            try advance.done();
+            if (self.api.changes(self.db) != 1) return error.InvalidApplicationHistoryRow;
+            return if (done) .published else .rebuilt;
+        }
+
+        /// One bounded retention transaction. A changed detail limit first builds a complete
+        /// candidate generation; then details are deleted in the exact shipped order, and only
+        /// when none are due is the consumed stream prefix freed. The selection, writes and
+        /// COMMIT share the ordinary work guard.
+        pub fn historyRetentionStep(self: *Store, policy: HistoryRetention, now_us: i64) Error!RetentionOutcome {
             try policy.validate();
             try self.beginWrite();
             errdefer self.rollback();
             const schema = try self.integer("PRAGMA user_version;");
-            if (schema < 18) return error.MaintenanceStorageRequired;
+            if (schema < store.load_repair_schema) return error.MaintenanceStorageRequired;
             if (schema > latest_schema) return error.UnsupportedSchema;
-            var checkpoint_row = try self.statement("SELECT payload FROM consumer_checkpoints WHERE kind=5 AND jail='@history' AND source='confirmed-effects' AND rule='checkpoint';");
-            defer checkpoint_row.deinit();
-            if (!try checkpoint_row.row()) {
+            const fence = try self.historyFence() orelse {
                 try self.commitTransaction();
-                return false;
+                return .idle;
+            };
+            var current = try self.readRetentionPolicy();
+            if (current.max_matches != policy.max_matches) {
+                _ = try self.beginRetentionGenerationTx(policy.max_matches);
+                current = try self.readRetentionPolicy();
             }
-            const history_checkpoint = effect_history.Checkpoint.decode(try checkpoint_row.boundedBytes(0, effect_history.checkpoint_bytes)) catch return error.InvalidHistoryCheckpoint;
-            if (try checkpoint_row.row()) return error.InvalidHistoryCheckpoint;
-            const installation = try self.readInstallation() orelse return error.InstallationRequired;
-            if (!std.mem.eql(u8, &history_checkpoint.installation, &installation.id)) return error.InvalidHistoryCheckpoint;
+            if (!current.published) {
+                const outcome = try self.sweepCandidatesTx(current);
+                try self.commitTransaction();
+                return outcome;
+            }
             const cutoff = std.math.sub(i64, now_us, policy.age_us) catch std.math.minInt(i64);
-            var detail_candidate = try self.statement(
-                "SELECT d.event_id FROM confirmed_event_details d JOIN confirmed_effect_events e USING(event_id) JOIN confirmed_history_sequence s USING(event_id) LEFT JOIN retry_decision_details r ON r.jail=e.jail AND r.effect_decision_id=e.decision_id WHERE s.sequence<=?1 AND (e.confirmed_us<=?2 OR (r.effect_decision_id IS NOT NULL AND ((SELECT count(*) FROM confirmed_event_details d2 JOIN confirmed_effect_events e2 USING(event_id) JOIN retry_decision_details r2 ON r2.jail=e2.jail AND r2.effect_decision_id=e2.decision_id WHERE r2.family=r.family AND r2.subject=r.subject)>?3 OR (d.evidence IS NOT NULL AND (SELECT coalesce(sum(length(CAST(d3.evidence AS BLOB))),0) FROM confirmed_event_details d3 JOIN confirmed_effect_events e3 USING(event_id) JOIN retry_decision_details r3 ON r3.jail=e3.jail AND r3.effect_decision_id=e3.decision_id WHERE r3.family=r.family AND r3.subject=r.subject)>16384)))) ORDER BY s.sequence LIMIT 1;",
-            );
-            defer detail_candidate.deinit();
-            try detail_candidate.int(1, std.math.cast(i64, history_checkpoint.last_sequence) orelse return error.InvalidHistoryCheckpoint);
-            try detail_candidate.int(2, cutoff);
-            try detail_candidate.int(3, policy.max_matches);
-            if (try detail_candidate.row()) {
-                const detail_event = try Store.effectBlob(&detail_candidate, 0, 32);
-                var prune_detail = try self.statement("DELETE FROM confirmed_event_details WHERE event_id=?1;");
-                defer prune_detail.deinit();
-                try prune_detail.blob(1, &detail_event);
-                try prune_detail.done();
-                if (self.api.changes(self.db) != 1) return error.HistoryGap;
-                try self.fault(.after_history_detail_delete);
-                try self.commitTransaction();
-                return true;
+            var wrote = false;
+            if (builtin.is_test) if (self.test_hooks.retention_select_work) |work| {
+                self.work_remaining = work;
+            };
+            const deleted = self.deleteDetailPage(current, fence, cutoff, self.retention_page, &wrote) catch |failure| {
+                if (failure != error.Interrupted or wrote) return failure;
+                return self.yieldRetention();
+            };
+            const outcome: RetentionOutcome = if (deleted != 0) .details else if (try self.prunePrefixPage(current, fence, cutoff, now_us) != 0) .prefix else .idle;
+            try self.fault(.before_history_retention_commit);
+            try self.commitTransaction();
+            if (outcome == .details) self.retention_page = @min(store.max_retention_page, self.retention_page *| 2);
+            return outcome;
+        }
+        // The named pre-write interruption: a selection that exhausted the guard before any
+        // write retries with half the page, but only after a verified clean rollback. Any
+        // other interruption, or one at the smallest page, stays a storage failure.
+        fn yieldRetention(self: *Store) Error!RetentionOutcome {
+            const prior_rollback = self.rollback_error_code;
+            self.rollback_error_code = null;
+            self.rollback();
+            const clean = !self.reopen_required and self.rollback_error_code == null and self.api.get_autocommit(self.db) != 0;
+            if (self.rollback_error_code == null) self.rollback_error_code = prior_rollback;
+            if (!clean) return error.Interrupted;
+            if (self.retention_page <= 1) return error.MaintenanceWorkExhausted;
+            self.retention_page /= 2;
+            return .yielded;
+        }
+        pub fn cleanupConfirmedHistoryOne(self: *Store, policy: HistoryRetention, now_us: i64) Error!bool {
+            return try self.historyRetentionStep(policy, now_us) != .idle;
+        }
+
+        const reclaim_window: i64 = 1024;
+        // Obsolete lifecycle rows: settled outcomes of decisions no owner holds any more,
+        // intents that are neither current nor pending (with their observations), and
+        // owner revisions other than the current one. Anything an unsettled outcome still
+        // references is kept.
+        const obsolete_intent = "i.intent_id IS NOT n.intent_id AND i.status NOT IN(1,2) AND NOT EXISTS(SELECT 1 FROM action_targets a WHERE a.action_id=i.decision_id AND a.scope_key=i.scope_key AND a.status IN(1,2,5))";
+        const reclaim_phases = [_]struct { max_sql: [:0]const u8, statements: []const [:0]const u8 }{
+            .{ .max_sql = "SELECT coalesce(max(rowid),0) FROM action_targets;", .statements = &.{"DELETE FROM action_targets WHERE rowid IN (SELECT a.rowid FROM action_targets a WHERE a.rowid>?1 AND a.rowid<=?2 AND a.status NOT IN(1,2,5) AND NOT EXISTS(SELECT 1 FROM effect_owners o INDEXED BY effect_owners_decision WHERE o.jail=a.jail AND o.decision_id=a.action_id));"} },
+            .{ .max_sql = "SELECT coalesce(max(rowid),0) FROM effect_intents;", .statements = &.{
+                "DELETE FROM effect_observations WHERE intent_id IN (SELECT i.intent_id FROM effect_intents i JOIN native_effects n ON n.scope_key=i.scope_key WHERE i.rowid>?1 AND i.rowid<=?2 AND " ++ obsolete_intent ++ ");",
+                "DELETE FROM effect_intents WHERE rowid IN (SELECT i.rowid FROM effect_intents i JOIN native_effects n ON n.scope_key=i.scope_key WHERE i.rowid>?1 AND i.rowid<=?2 AND " ++ obsolete_intent ++ ");",
+            } },
+            .{ .max_sql = "SELECT coalesce(max(rowid),0) FROM effect_owner_revisions;", .statements = &.{"DELETE FROM effect_owner_revisions WHERE rowid IN (SELECT h.rowid FROM effect_owner_revisions h WHERE h.rowid>?1 AND h.rowid<=?2 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=h.scope_key AND o.jail=h.jail AND o.revision=h.revision) AND NOT EXISTS(SELECT 1 FROM action_targets a WHERE a.action_id=h.decision_id AND a.scope_key=h.scope_key AND a.status IN(1,2,5)));"} },
+        };
+
+        pub const ReclaimOutcome = enum { deleted, scanned, idle };
+        /// One rowid window of obsolete-row reclamation, rotating over outcomes, intents and
+        /// revisions. `idle` only after a complete rotation found nothing to delete.
+        pub fn reclaimObsoleteOne(self: *Store) Error!ReclaimOutcome {
+            if (self.schema_version < store.load_repair_schema) return .idle;
+            if (self.reclaim.rest != 0) {
+                self.reclaim.rest -= 1;
+                return .idle;
             }
-            var candidate = try self.statement("SELECT s.sequence,e.event_id,e.scope_key,e.jail,e.decision_id,e.confirmed_us FROM confirmed_history_sequence s JOIN confirmed_effect_events e USING(event_id) WHERE s.sequence=(SELECT retained_from FROM confirmed_history_stream WHERE id=1);");
-            defer candidate.deinit();
-            if (!try candidate.row()) {
-                try self.commitTransaction();
-                return false;
-            }
-            const sequence_value = try candidate.signed(0);
-            const confirmed_us = try candidate.signed(5);
-            if (sequence_value <= 0 or @as(u64, @intCast(sequence_value)) > history_checkpoint.last_sequence) {
-                try self.commitTransaction();
-                return false;
-            }
-            if (confirmed_us > cutoff) {
-                try self.commitTransaction();
-                return false;
-            }
-            const event_id = try Store.effectBlob(&candidate, 1, 32);
-            const scope_key = try Store.effectBlob(&candidate, 2, 32);
-            if (self.api.column_type(candidate.ptr, 3) != 3) return error.InvalidHistoryEvent;
-            const jail = try candidate.boundedBytes(3, 64);
-            const decision_id = try Store.effectBlob(&candidate, 4, 32);
-            var owner = try self.statement("SELECT lease_kind,deadline_us FROM effect_owners WHERE scope_key=?1 AND jail=?2 AND decision_id=?3;");
-            defer owner.deinit();
-            try owner.blob(1, &scope_key);
-            try owner.text(2, jail);
-            try owner.blob(3, &decision_id);
-            if (try owner.row()) {
-                const lease = try Store.effectLease(&owner, 0, 1);
-                if (lease.live(now_us)) {
-                    try self.commitTransaction();
-                    return false;
+            try self.beginWrite();
+            errdefer self.rollback();
+            var next = self.reclaim;
+            var deleted = false;
+            const phase = reclaim_phases[next.phase];
+            const maximum = try self.integer(phase.max_sql);
+            const high = std.math.add(i64, next.cursor, reclaim_window) catch return error.StorageLimit;
+            if (next.cursor < maximum) for (phase.statements) |sql| {
+                var row = try self.statement(sql);
+                defer row.deinit();
+                try row.int(1, next.cursor);
+                try row.int(2, high);
+                try row.done();
+                if (self.api.changes(self.db) != 0) deleted = true;
+            };
+            next.found = next.found or deleted;
+            var idle = false;
+            if (high >= maximum) {
+                next.cursor = 0;
+                next.phase += 1;
+                if (next.phase == reclaim_phases.len) {
+                    next.phase = 0;
+                    idle = !next.found;
+                    next.found = false;
+                }
+            } else next.cursor = high;
+            // A rotation that found nothing rests before rescanning unchanged tables.
+            if (idle) next.rest = 63;
+            try self.commitTransaction();
+            self.reclaim = next;
+            return if (deleted) .deleted else if (idle) .idle else .scanned;
+        }
+
+        pub const MaintenanceRequest = struct {
+            retention: HistoryRetention,
+            now_us: i64,
+            // The history consumer has read the whole stream.
+            history_caught_up: bool,
+            // Effects are ready with no expiry backlog; spent scopes wait otherwise so an
+            // expiry wave is not slowed by their deletion.
+            spent_scopes: bool,
+        };
+        /// One bounded maintenance transaction in priority order: history retention, retry
+        /// details, spent scopes, obsolete rows. Errors are storage failures for the caller's
+        /// gate; `wait` asks for the next wake with a smaller unit.
+        pub fn maintenanceStep(self: *Store, request: MaintenanceRequest) Error!health.MaintenanceOutcome {
+            const outcome = try self.maintenanceStepInner(request);
+            self.maintenance_operation = null;
+            return outcome;
+        }
+        fn maintenanceStepInner(self: *Store, request: MaintenanceRequest) Error!health.MaintenanceOutcome {
+            if (request.history_caught_up) {
+                self.maintenance_operation = .history_details;
+                switch (try self.historyRetentionStep(request.retention, request.now_us)) {
+                    .idle => {},
+                    .yielded => return .{ .wait = .history_details },
+                    .rebuilt, .published => return .{ .progress = .history_rebuild },
+                    .details => return .{ .progress = .history_details },
+                    .prefix => return .{ .progress = .history_prefix },
                 }
             }
-            var pending = try self.statement("SELECT 1 FROM effect_intents WHERE scope_key=?1 AND status IN(1,2) LIMIT 1;");
-            defer pending.deinit();
-            try pending.blob(1, &scope_key);
-            if (try pending.row()) {
-                try self.commitTransaction();
-                return false;
-            }
-            var detail = try self.statement("DELETE FROM confirmed_event_details WHERE event_id=?1;");
-            defer detail.deinit();
-            try detail.blob(1, &event_id);
-            try detail.done();
-            try self.fault(.after_history_detail_delete);
-            var sequence = try self.statement("DELETE FROM confirmed_history_sequence WHERE sequence=?1 AND event_id=?2;");
-            defer sequence.deinit();
-            try sequence.int(1, sequence_value);
-            try sequence.blob(2, &event_id);
-            try sequence.done();
-            if (self.api.changes(self.db) != 1) return error.HistoryGap;
-            var event = try self.statement("DELETE FROM confirmed_effect_events WHERE event_id=?1;");
-            defer event.deinit();
-            try event.blob(1, &event_id);
-            try event.done();
-            if (self.api.changes(self.db) != 1) return error.HistoryGap;
-            try self.fault(.after_history_event_delete);
-            var stream = try self.statement("UPDATE confirmed_history_stream SET retained_from=?1,revision=revision+1 WHERE id=1 AND retained_from=?2;");
-            defer stream.deinit();
-            try stream.int(1, sequence_value + 1);
-            try stream.int(2, sequence_value);
-            try stream.done();
-            if (self.api.changes(self.db) != 1) return error.HistoryGap;
-            try self.commitTransaction();
-            return true;
+            self.maintenance_operation = .retry_details;
+            if (self.retry_detail_rest != 0) {
+                self.retry_detail_rest -= 1;
+            } else if (try self.pruneRetryDecisionDetailsOne()) {
+                return .{ .progress = .retry_details };
+            } else self.retry_detail_rest = 63;
+            self.maintenance_operation = .spent_scopes;
+            if (request.spent_scopes and try self.pruneSpentEffects(max_prune_batch)) return .{ .progress = .spent_scopes };
+            self.maintenance_operation = .obsolete_rows;
+            // A window that only scanned leaves the rest of this turn to other maintenance.
+            if (try self.reclaimObsoleteOne() == .deleted) return .{ .progress = .obsolete_rows };
+            return .idle;
         }
         /// A scope whose current owner still has an unsettled action outcome, if any.
         pub fn unsettledActionScope(self: *Store) Error!?effects.Hash {
@@ -1236,37 +1705,73 @@ pub fn Methods(comptime Store: type) type {
         /// removes owners, the current intent and the scope row together and invalidates
         /// the published effect view.
         pub fn pruneSpentEffectOne(self: *Store) Error!bool {
+            return self.pruneSpentEffects(1);
+        }
+        pub const max_prune_batch = Store.attribution_batch;
+        /// Removes up to `max_scopes` spent scopes in one commit within the 256-row budget.
+        /// Each scope's spent predicate is evaluated inside the transaction and its final
+        /// delete happens only once its child rows are gone; a scope cut short by the budget
+        /// stays a candidate for the next call, as before.
+        pub fn pruneSpentEffects(self: *Store, max_scopes: usize) Error!bool {
             if (self.schema_version < 13) return false;
+            if (max_scopes == 0 or max_scopes > max_prune_batch) return error.InvalidEffect;
             try self.beginWrite();
             errdefer self.rollback();
-            var candidate = try self.statement(if (self.schema_version >= 21)
+            var deleted: i64 = 0;
+            var scopes: usize = 0;
+            while (scopes < max_scopes) {
+                const outcome = try self.pruneSpentScopeTx(&deleted);
+                if (outcome == .none) break;
+                scopes += 1;
+                if (outcome == .budget) break;
+            }
+            if (scopes == 0) {
+                try self.commitTransaction();
+                return false;
+            }
+            try self.commitEffectTransaction(true);
+            return true;
+        }
+        const PruneOutcome = enum { none, removed, budget };
+        fn pruneSpentScopeTx(self: *Store, deleted: *i64) Error!PruneOutcome {
+            // From schema 24 a spent scope no longer waits for history: events carry their own
+            // provenance and markers are retired with the owner's lease.
+            var candidate = try self.statement(if (self.schema_version >= store.load_repair_schema)
+                "SELECT n.scope_key,n.intent_id FROM native_effects n INDEXED BY native_effects_spent JOIN effect_intents i ON i.intent_id=n.intent_id WHERE n.lease_kind=0 AND i.status=4 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=n.scope_key AND o.lease_kind<>0) AND NOT EXISTS(SELECT 1 FROM action_targets a INDEXED BY action_targets_unsettled WHERE a.scope_key=n.scope_key AND a.status IN(1,2,5)) AND NOT EXISTS(SELECT 1 FROM effect_intents p INDEXED BY effect_intents_pending WHERE p.scope_key=n.scope_key AND p.status IN(1,2)) AND NOT EXISTS(SELECT 1 FROM confirmation_markers m WHERE m.scope_key=n.scope_key) ORDER BY n.scope_key LIMIT 1;"
+            else if (self.schema_version >= 21)
                 "SELECT n.scope_key,n.intent_id FROM native_effects n JOIN effect_intents i ON i.intent_id=n.intent_id WHERE n.lease_kind=0 AND i.status=4 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=n.scope_key AND o.lease_kind<>0) AND NOT EXISTS(SELECT 1 FROM confirmed_effect_events e WHERE e.scope_key=n.scope_key) AND NOT EXISTS(SELECT 1 FROM action_targets a WHERE a.scope_key=n.scope_key AND a.status IN(1,2,5)) AND NOT EXISTS(SELECT 1 FROM effect_intents p WHERE p.scope_key=n.scope_key AND p.status IN(1,2)) ORDER BY n.scope_key LIMIT 1;"
             else
                 "SELECT n.scope_key,n.intent_id FROM native_effects n JOIN effect_intents i ON i.intent_id=n.intent_id WHERE n.lease_kind=0 AND i.status=4 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=n.scope_key AND o.lease_kind<>0) AND NOT EXISTS(SELECT 1 FROM confirmed_effect_events e WHERE e.scope_key=n.scope_key) AND NOT EXISTS(SELECT 1 FROM effect_intents p WHERE p.scope_key=n.scope_key AND p.status IN(1,2)) ORDER BY n.scope_key LIMIT 1;");
             defer candidate.deinit();
-            if (!try candidate.row()) {
-                try self.commitTransaction();
-                return false;
-            }
+            if (!try candidate.row()) return .none;
             const scope_key = try Store.effectBlob(&candidate, 0, 32);
             const current = try Store.effectBlob(&candidate, 1, 32);
             const chunks = [_][:0]const u8{
-                "DELETE FROM effect_observations WHERE rowid IN (SELECT o.rowid FROM effect_intents i JOIN effect_observations o ON o.intent_id=i.intent_id WHERE i.scope_key=?1 LIMIT 256);",
+                if (self.schema_version >= store.load_repair_schema)
+                    "DELETE FROM effect_observations WHERE rowid IN (SELECT o.rowid FROM effect_intents i JOIN effect_observations o INDEXED BY effect_observations_intent ON o.intent_id=i.intent_id WHERE i.scope_key=?1 LIMIT 256);"
+                else
+                    "DELETE FROM effect_observations WHERE rowid IN (SELECT o.rowid FROM effect_intents i JOIN effect_observations o ON o.intent_id=i.intent_id WHERE i.scope_key=?1 LIMIT 256);",
                 "DELETE FROM effect_intents WHERE rowid IN (SELECT rowid FROM effect_intents WHERE scope_key=?1 AND intent_id<>?2 LIMIT 256);",
                 "DELETE FROM effect_owner_revisions WHERE rowid IN (SELECT h.rowid FROM effect_owner_revisions h WHERE h.scope_key=?1 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=h.scope_key AND o.jail=h.jail AND o.revision=h.revision) LIMIT 256);",
                 "DELETE FROM action_targets WHERE rowid IN (SELECT rowid FROM action_targets WHERE scope_key=?1 LIMIT 256);",
             };
-            for (chunks, 0..) |sql, index| {
-                if (index == 3 and self.schema_version < 21) break;
-                var chunk = try self.statement(sql);
-                defer chunk.deinit();
-                try chunk.blob(1, &scope_key);
-                if (index == 1) try chunk.blob(2, &current);
-                try chunk.done();
-                if (self.api.changes(self.db) != 0) {
-                    try self.commitTransaction();
-                    return true;
+            // Chunks of one scope share the transaction while the row budget lasts, so a
+            // typical spent scope costs no commit of its own.
+            while (true) {
+                var pass: i64 = 0;
+                for (chunks, 0..) |sql, index| {
+                    if (index == 3 and self.schema_version < 21) break;
+                    var chunk = try self.statement(sql);
+                    defer chunk.deinit();
+                    try chunk.blob(1, &scope_key);
+                    if (index == 1) try chunk.blob(2, &current);
+                    try chunk.done();
+                    const changed = self.api.changes(self.db);
+                    pass += changed;
+                    deleted.* += changed;
+                    if (deleted.* >= 256) return .budget;
                 }
+                if (pass == 0) break;
             }
             for ([_][:0]const u8{
                 "DELETE FROM effect_owner_revisions WHERE scope_key=?1;",
@@ -1280,9 +1785,10 @@ pub fn Methods(comptime Store: type) type {
                 try final.done();
             }
             if (self.api.changes(self.db) != 1) return error.InvalidEffect;
+            deleted.* += 1;
             try self.advanceEffectSnapshot();
-            try self.commitEffectTransaction(true);
-            return true;
+            self.noteEffectChange(scope_key);
+            return if (deleted.* >= 256) .budget else .removed;
         }
         pub fn canonicalHistoryManifest(manifest: consumers.Manifest) bool {
             return std.mem.eql(u8, manifest.jail, "@history") and std.mem.eql(u8, manifest.source, "confirmed-effects") and manifest.required.len == 1 and

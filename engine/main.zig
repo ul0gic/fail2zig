@@ -73,7 +73,7 @@ pub const CliOptions = struct {
     foreground: bool = true,
 };
 
-pub const EntryMode = enum { daemon, operator, migrate, rule_test };
+pub const EntryMode = enum { daemon, operator, migrate, rule_test, repair_source };
 
 const operator_words = [_][]const u8{ "status", "jails", "list", "ban", "unban", "reload", "version", "help", "completions", "config", "history", "jail", "firewall" };
 const operator_globals = [_][]const u8{ "--socket", "--output", "--no-color", "--timeout" };
@@ -83,6 +83,7 @@ pub fn classifyEntry(args: []const []const u8) EntryMode {
     const first = args[0];
     if (std.mem.eql(u8, first, "migrate")) return .migrate;
     if (std.mem.eql(u8, first, "rule-test")) return .rule_test;
+    if (std.mem.eql(u8, first, "repair-source")) return .repair_source;
     for (operator_words) |w| if (std.mem.eql(u8, first, w)) return .operator;
     for (operator_globals) |g| {
         if (std.mem.eql(u8, first, g)) return .operator;
@@ -161,6 +162,7 @@ fn printHelp(w: anytype) !void {
         \\  config | history | jail | firewall show
         \\  migrate inspect|snapshot|plan|validate ... read-only migration preparation
         \\  rule-test --file|--record|--journal ...   offline rule evaluation (no daemon needed)
+        \\  repair-source --jail J --source PATH --token T --acknowledge-truncation   acknowledge a truncated file source (daemon stopped)
         \\  Globals: --socket <path> --output table|json|plain --no-color --timeout <ms>
         \\  `fail2zig help <command>` documents each command; `fail2zig version` is the daemon's.
         \\
@@ -219,6 +221,7 @@ pub fn main() !void {
         },
         .migrate => std.process.exit(@import("cli/migrate.zig").run(heap, rest[1..], version, std.io.getStdOut().writer(), std.io.getStdErr().writer()).code()),
         .rule_test => std.process.exit(@import("cli/rule_test.zig").run(heap, rest[1..], std.io.getStdOut().writer(), std.io.getStdErr().writer()).code()),
+        .repair_source => std.process.exit(@import("cli/repair_source.zig").run(heap, rest[1..], std.io.getStdOut().writer(), std.io.getStdErr().writer()).code()),
         .daemon => {},
     }
 
@@ -566,6 +569,7 @@ test "cli: entry classification routes operator spellings and globals only" {
         try std.testing.expectEqual(EntryMode.operator, classifyEntry(&.{word}));
     try std.testing.expectEqual(EntryMode.migrate, classifyEntry(&.{ "migrate", "inspect" }));
     try std.testing.expectEqual(EntryMode.rule_test, classifyEntry(&.{ "rule-test", "--record", "x" }));
+    try std.testing.expectEqual(EntryMode.repair_source, classifyEntry(&.{ "repair-source", "--jail", "j" }));
     try std.testing.expectEqual(EntryMode.daemon, classifyEntry(&.{"--socketpath"}));
     try std.testing.expectEqual(EntryMode.daemon, classifyEntry(&.{"statusx"}));
 }

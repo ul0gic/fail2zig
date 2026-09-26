@@ -131,6 +131,8 @@ pub const Entry = struct {
     desired: Lease,
     intent_id: Hash,
     status: Status,
+    /// Creation time of the current intent; pending work is served oldest first.
+    intent_us: i64,
     pub fn token(self: Entry) Token {
         return .{ .installation = self.installation.id, .scope_key = self.scope_key, .intent_id = self.intent_id, .revision = self.revision };
     }

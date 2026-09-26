@@ -104,10 +104,12 @@ pub fn Methods(comptime Store: type) type {
                     try held.append(self.allocator, .{ .key = try effectBlob(&owners, 0, 32), .revision = @intCast(owner_revision), .scope = try effectBlob(&owners, 2, canonical_scope.encoded_bytes) });
                 }
             }
+            const count: i64 = @intCast(held.items.len);
+            try self.reserveEffectRows(.{ .revisions = count, .intents = count, .observations = count * @import("store.zig").load_repair.observations_per_intent });
             for (held.items) |owner| {
                 const scope = canonical_scope.Scope.decode(&owner.scope) catch return error.InvalidEffect;
                 const transition_id = effects.hashParts("fail2zig-generation-rekey-v1", &.{ &change.next_generation, &owner.key });
-                _ = try self.transitionOwnerTx(.{ .scope = scope, .jail = jail, .current_generation = change.generation, .next_generation = change.next_generation, .expected_owner_revision = owner.revision, .transition_id = transition_id, .mode = .retain, .occurred_us = now_us }, now_us);
+                _ = try self.transitionOwnerReservedTx(.{ .scope = scope, .jail = jail, .current_generation = change.generation, .next_generation = change.next_generation, .expected_owner_revision = owner.revision, .transition_id = transition_id, .mode = .retain, .occurred_us = now_us }, now_us, false);
             }
             if (held.items.len != 0) self.rekeyed_owners = true;
             var stale = try self.statement("SELECT 1 FROM effect_owners WHERE jail=?1 AND generation!=?2 LIMIT 1;");
@@ -258,7 +260,17 @@ pub fn Methods(comptime Store: type) type {
             generation: [32]u8,
             committed_us: i64,
             detail: []const u8,
+            // Admin revision the request was admitted at; it is part of a ban's decision.
+            admission_revision: ?u64 = null,
         };
+        /// A ban's owner decision. Binding the admission revision makes a replay after the
+        /// request row was evicted a new decision instead of a revived retired one, while a
+        /// retry at the same revision stays idempotent.
+        pub fn adminDecisionId(request_id: [32]u8, admission_revision: u64) [32]u8 {
+            var revision: [8]u8 = undefined;
+            std.mem.writeInt(u64, &revision, admission_revision, .little);
+            return effects.hashParts("fail2zig-admin-decision-v2", &.{ &request_id, &revision });
+        }
         pub const AdminReplay = struct { kind: AdminKind, outcome: AdminOutcome, mutation_revision: u64 };
         pub const AdminAdmission = union(enum) { fresh, replayed: AdminReplay };
         pub const JailAdminState = struct {
@@ -297,11 +309,15 @@ pub fn Methods(comptime Store: type) type {
             try self.beginWrite();
             errdefer self.rollback();
             if (self.schema_version < 22) return error.AdminStorageRequired;
+            if (record.admission_revision) |value| if (value > std.math.maxInt(i64)) return error.InvalidAdminRequest;
             if (record.outcome != .rejected) try self.bumpAdminRevisionTx();
             const mutation_revision = try self.integer("SELECT mutation_revision FROM admin_revision WHERE id=1;");
             if (mutation_revision < 0) return error.DatabaseFailure;
             {
-                var insert = try self.statement("INSERT INTO admin_requests VALUES(?1,?2,?3,?4,?5,?6,?7,?8);");
+                var insert = try self.statement(if (self.schema_version >= @import("store.zig").load_repair_schema)
+                    "INSERT INTO admin_requests(request_id,kind,subject,outcome,generation,mutation_revision,committed_us,detail,admission_revision) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9);"
+                else
+                    "INSERT INTO admin_requests(request_id,kind,subject,outcome,generation,mutation_revision,committed_us,detail) VALUES(?1,?2,?3,?4,?5,?6,?7,?8);");
                 defer insert.deinit();
                 try insert.blob(1, &record.request_id);
                 try insert.int(2, @intFromEnum(record.kind));
@@ -311,6 +327,9 @@ pub fn Methods(comptime Store: type) type {
                 try insert.int(6, mutation_revision);
                 try insert.int(7, record.committed_us);
                 try insert.blob(8, record.detail);
+                if (self.schema_version >= @import("store.zig").load_repair_schema) {
+                    if (record.admission_revision) |value| try insert.int(9, @intCast(value));
+                } else if (record.admission_revision != null) return error.AdminStorageRequired;
                 try insert.done();
             }
             if (state) |value| {

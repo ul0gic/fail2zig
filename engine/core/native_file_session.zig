@@ -51,6 +51,8 @@ const Retained = struct {
     pending: ?durable.Store.PendingSource = null,
     descriptor: ?std.fs.File = null,
     proposal: ?files.Resume = null,
+    continuity: ?files.ContinuityFailure = null,
+    continuity_reported: bool = false,
     fn deinit(self: Retained, a: std.mem.Allocator) void {
         if (self.pending) |value| value.deinit(a);
         if (self.descriptor) |value| value.close();
@@ -129,6 +131,9 @@ pub const Session = struct {
     repair_count: usize = 0,
     pending_proofs: []?durable.Store.PendingSource,
     retained: std.ArrayList(Retained),
+    /// Capacity refusal holding the next record; the receipt is kept and ingestion
+    /// resumes when cleanup frees space. Reported as an unhealthy source meanwhile.
+    blocked_cause: ?anyerror = null,
     retained_index: usize = 0,
     discovery_repair: repair.Repair,
     scheduler_clock: ?storage_health.Clock,
@@ -284,6 +289,8 @@ pub const Session = struct {
                 .pending = pending,
                 .descriptor = source.file orelse if (previous) |entry| entry.descriptor else null,
                 .proposal = if (!source.baseline_committed) source.committed orelse (if (previous) |entry| entry.proposal else null) else null,
+                .continuity = if (initialized) source.continuity_failure else if (previous) |entry| entry.continuity else source.continuity_failure,
+                .continuity_reported = if (initialized) source.continuity_reported else if (previous) |entry| entry.continuity_reported else source.continuity_reported,
             };
             if (out.entries.items.len == self.sources.max_sources) return error.SourceLimit;
             out.entries.appendAssumeCapacity(try cloneRetained(a, original));
@@ -334,7 +341,7 @@ pub const Session = struct {
         for (self.retained.items) |*value| if (std.mem.eql(u8, value.source, source)) return value;
         return null;
     }
-    fn addRetained(self: *Session, source: []const u8, path: []const u8, state: repair.Repair, source_health: records.Health, in_operation: bool, expected_durable: bool, incarnation: ?[16]u8, pending: ?durable.Store.PendingSource) !void {
+    fn addRetained(self: *Session, source: []const u8, path: []const u8, state: repair.Repair, source_health: records.Health, in_operation: bool, expected_durable: bool, incarnation: ?[16]u8, pending: ?durable.Store.PendingSource, continuity: ?files.ContinuityFailure, continuity_reported: bool) !void {
         if (self.retained.items.len >= self.sources.max_sources) return error.SourceLimit;
         const source_copy = try self.allocator.dupe(u8, source);
         errdefer self.allocator.free(source_copy);
@@ -342,7 +349,7 @@ pub const Session = struct {
         errdefer self.allocator.free(path_copy);
         const proof = if (pending) |value| try clonePending(self.allocator, value) else null;
         errdefer if (proof) |value| value.deinit(self.allocator);
-        try self.retained.append(.{ .source = source_copy, .path = path_copy, .state = state, .health = source_health, .in_operation = in_operation, .expected_durable = expected_durable, .incarnation = incarnation, .pending = proof });
+        try self.retained.append(.{ .source = source_copy, .path = path_copy, .state = state, .health = source_health, .in_operation = in_operation, .expected_durable = expected_durable, .incarnation = incarnation, .pending = proof, .continuity = continuity, .continuity_reported = continuity_reported });
     }
     pub fn copyRepairStateFrom(self: *Session, old: *const Session) !void {
         if (old.repair_count != old.sources.sources.items.len) return error.RestoreRequired;
@@ -353,10 +360,10 @@ pub const Session = struct {
             self.retained.clearRetainingCapacity();
         }
         for (old.sources.sources.items, 0..) |source, index| {
-            try self.addRetained(source.source_id, source.path, old.repair_states[index], source.health, source.in_operation, source.baseline_committed, if (source.committed) |saved| saved.incarnation else null, old.pending_proofs[index]);
+            try self.addRetained(source.source_id, source.path, old.repair_states[index], source.health, source.in_operation, source.baseline_committed, if (source.committed) |saved| saved.incarnation else null, old.pending_proofs[index], source.continuity_failure, source.continuity_reported);
         }
         for (old.retained.items) |value| if (self.retainedSource(value.source) == null) {
-            try self.addRetained(value.source, value.path, value.state, value.health, value.in_operation, value.expected_durable, value.incarnation, value.pending);
+            try self.addRetained(value.source, value.path, value.state, value.health, value.in_operation, value.expected_durable, value.incarnation, value.pending, value.continuity, value.continuity_reported);
         };
         if (old.pipe.candidate_receipt != null) {
             const source = old.candidate_source orelse return error.PendingSourceMissing;
@@ -393,7 +400,17 @@ pub const Session = struct {
             if (status.phase != .recovering or status.recovery_step != .sources) return error.RecoveryOutOfOrder;
         }
         if (!self.pipe.ready) return error.RestoreRequired;
-        for (self.sources.sources.items) |*source| if (!try source.verifyContinuity()) return error.ResumeLost;
+        for (self.sources.sources.items, 0..) |*source, index| {
+            // A source already in intervention keeps the discontinuity that put it there.
+            const held = index < self.repair_count and self.repair_states[index].state.phase == .intervention and source.continuity_failure != null;
+            const failure = source.continuity_failure;
+            const reported = source.continuity_reported;
+            defer if (held) {
+                source.continuity_failure = failure;
+                source.continuity_reported = reported;
+            };
+            if (!try source.verifyContinuity()) return error.ResumeLost;
+        }
         try self.pipe.store.visitPendingReceipts(restorePending, self);
         if (try self.pipe.store.revision(self.pipe.jail) != self.pipe.revision) return error.StaleCheckpoint;
     }
@@ -422,6 +439,8 @@ pub const Session = struct {
                 self.pending_proofs[self.repair_count] = previous.pending;
                 previous.pending = null;
                 source.health = previous.health;
+                source.continuity_failure = previous.continuity;
+                source.continuity_reported = previous.continuity_reported;
                 source.in_operation = previous.in_operation;
             } else self.repair_states[self.repair_count] = try repair.Repair.init(try repair.Binding.init(self.processor.generation, source.source_id), self.nowMs());
         }
@@ -450,6 +469,58 @@ pub const Session = struct {
         }
         return result;
     }
+    /// Slices are borrowed from the session and valid until it is destroyed.
+    pub const ContinuityReport = struct {
+        jail: []const u8,
+        source: []const u8,
+        path: []const u8,
+        failure: files.ContinuityFailure,
+    };
+
+    /// The first source held in intervention by a checkpoint discontinuity, if any.
+    pub fn continuityFailure(self: *const Session) ?ContinuityReport {
+        for (self.sources.sources.items[0..self.repair_count], self.repair_states[0..self.repair_count]) |source, state| {
+            if (state.state.phase != .intervention) continue;
+            const failure = source.continuity_failure orelse continue;
+            return .{ .jail = self.pipe.jail, .source = source.source_id, .path = source.path, .failure = failure };
+        }
+        for (self.retained.items) |value| {
+            if (value.state.state.phase != .intervention) continue;
+            const failure = value.continuity orelse continue;
+            var adopted = false;
+            for (self.sources.sources.items) |source| if (std.mem.eql(u8, source.source_id, value.source)) {
+                adopted = true;
+                break;
+            };
+            if (adopted) continue;
+            return .{ .jail = self.pipe.jail, .source = value.source, .path = value.path, .failure = failure };
+        }
+        return null;
+    }
+
+    /// Like `continuityFailure`, but returns each source's discontinuity once; the mark
+    /// clears when that source records a new discontinuity or recovers.
+    pub fn nextUnreportedContinuityFailure(self: *Session) ?ContinuityReport {
+        for (self.sources.sources.items[0..self.repair_count], self.repair_states[0..self.repair_count]) |*source, state| {
+            if (state.state.phase != .intervention or source.continuity_reported) continue;
+            const failure = source.continuity_failure orelse continue;
+            source.continuity_reported = true;
+            return .{ .jail = self.pipe.jail, .source = source.source_id, .path = source.path, .failure = failure };
+        }
+        for (self.retained.items) |*value| {
+            if (value.state.state.phase != .intervention or value.continuity_reported) continue;
+            const failure = value.continuity orelse continue;
+            var adopted = false;
+            for (self.sources.sources.items) |source| if (std.mem.eql(u8, source.source_id, value.source)) {
+                adopted = true;
+                break;
+            };
+            if (adopted) continue;
+            value.continuity_reported = true;
+            return .{ .jail = self.pipe.jail, .source = value.source, .path = value.path, .failure = failure };
+        }
+        return null;
+    }
     fn storageFailure(self: *Session, cause: anyerror) anyerror {
         self.last_failure_domain = .storage;
         self.pipe.ready = false;
@@ -459,8 +530,9 @@ pub const Session = struct {
     fn sourceFailure(self: *Session, state: *repair.Repair, cause: anyerror) anyerror {
         const domain = state.failed(cause, self.nowMs()) catch |failure| return failure;
         self.last_failure_domain = domain;
+        self.blocked_cause = if (cause == error.ReserveBackpressure or cause == error.RetryCapacity) cause else null;
         self.sources.health = switch (cause) {
-            error.SourceRepairPending => .waiting,
+            error.SourceRepairPending, error.ReserveBackpressure, error.RetryCapacity => .waiting,
             error.FileNotFound => .missing,
             error.AccessDenied => .permission_denied,
             error.ResumeLost, error.PendingRecordMismatch, error.PendingRecordUnavailable => .resume_lost,
@@ -719,6 +791,7 @@ pub const Session = struct {
             return self.sourceFailure(state, err);
         };
         if (source.health == .healthy) {
+            self.blocked_cause = null;
             if (state.state.phase == .polling) try state.pollSucceeded((try state.begin(self.nowMs(), true)).?);
             if (self.discovery_repair.state.phase == .polling) try self.discovery_repair.pollSucceeded((try self.discovery_repair.begin(self.nowMs(), true)).?);
         }

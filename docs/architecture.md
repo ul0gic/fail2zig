@@ -43,9 +43,14 @@ matching a truncated prefix. Disposition, diagnostic counters and cursor movemen
 commit together, and encoding warnings are rate-limited without printing raw payloads.
 This behavior is not present in releases through v0.4.2.
 
-The repair reads legacy processor checkpoints and retains SQLite schema 23, but
-older binaries cannot restore its extended checkpoints. Back up state coherently
-before upgrading; reverting the binary alone is not a supported rollback.
+The repair reads legacy processor checkpoints; older binaries cannot restore its
+extended checkpoints. Later state uses SQLite schema 24, upgraded from schema 23 in
+resumable steps after a coherent pre-upgrade backup. Reverting the binary alone is not a
+supported rollback; restore the matching backup with the previous binary.
+
+A file truncated in place below its saved position is refused rather than re-read. The
+offline `repair-source` command acknowledges one such truncation under the state lock,
+records a replayable token outcome and changes only that source's position.
 
 Journal sources validate local machine identity, root UID, transport and an exact list of
 root-owned executable paths. Built-in SSH jails can discover a bounded standard profile when
@@ -76,6 +81,52 @@ Multiple jails can own the same protected subject. Removing or expiring one owne
 another owner's protection. Scope includes the subject and address family plus protocol, ports,
 interface and enforcement target where the backend supports them.
 
+The enforcement view follows storage incrementally: a commit that changes one scope is
+folded into the view in place, and only an unattributed change (for example a migration
+activation) rebuilds it from storage. The kernel is read back as one coherent
+observation per step: on nftables a single netlink pass whose coherence is the kernel's
+own interrupted-dump flag (an interrupted dump is retried), on iptables and ipset the
+two-pass agreement over tool output. The most recent readback is the inventory; a
+readback that started after the daemon's last own mutation and shows every desired
+entry confirms the set, and no second readback is taken to prove it. A confirmed view
+is re-read on a 5 s cadence or as soon as a ban deadline passes. That cadence is not a
+detection guarantee: external removal of a rule is noticed at the next complete
+readback, which pass work, retries and storage pauses can delay, and status reports
+the age of the last readback so the actual latency is visible.
+
+A new ban is dispatched from the inventory (no separate pre-read on nftables; the tool
+transports keep theirs because their mutations are several invocations), marked in
+memory as sent, and settled by the readback that returns with the mutation. A mutation
+whose acknowledgment times out is settled by the next readback that postdates the send;
+a kernel-rejected nftables batch is a non-mutation retried from a fresh readback.
+Transient readback and mutation signals (an interrupted dump, a two-pass disagreement,
+a timeout) retry with bounded backoff and never pause ingestion. A scoped rule group
+whose parts are missing, duplicated or dated inconsistently (an interrupted
+multi-command mutation) is repaired by re-dispatch, bounded to rules that validate as
+the daemon's own; anything else remains foreign. The durable intent is written at
+ingest; each ban's outcome is one commit that records the dispatch time, the
+observation, the confirmation and the action-target settlement together.
+
+Expiry follows the entry's kernel representation. nftables set elements and ipset
+entries carry the deadline as a kernel timeout, so the daemon prepares up to eight due
+entries per commit and settles up to eight per commit from a readback that shows them
+absent. Scoped rules on every backend and iptables host rules carry no timeout and are
+deleted explicitly. Live dispatches keep at least every other selection; expiry work is
+served at parity while its backlog exceeds the live backlog, otherwise once per four
+live dispatches, and continuously when nothing live is pending; overdue removals
+precede bookkeeping. Retry-subject retirement and spent-scope pruning each handle up to
+eight subjects or scopes per commit. A quiet worker (confirmed view, caught-up history,
+no maintenance progress, no new commits) publishes owners and runs maintenance once per
+second; sources are still polled every 100 ms, and a source with waiting records is
+drained up to four records per wake. Maintenance runs on a 250 ms cadence under load.
+With `synchronous=FULL` every commit is an `fsync`, which bounds sustained throughput
+by the storage's sync latency; no throughput figure is promised.
+
+A healthy stop withdraws the daemon's realized rules and keeps owners and deadlines for the next
+start. When storage is unhealthy at stop, durable intent cannot be confirmed, so the daemon neither
+writes nor dispatches: installed rules stay in place, the log reports how many, and the next start
+reconciles them. Restart reinstalls live bans with their original deadlines before READY.
+
 Firewall effects are limited to the daemon's current network namespace. The daemon does not enter
 another namespace, and custom namespace selectors or service overrides that move it between
 namespaces remain unsupported.
@@ -86,11 +137,22 @@ The local Unix socket uses peer credentials for authorization. Read-only monitor
 available to the configured service/monitor group; mutations require root or the daemon UID. Status distinguishes
 policy decisions, installed protection, uncertainty and degraded dependencies.
 
-Routine worker activity retains the last verified protection
-view. Effect-changing transactions invalidate that view before commit; coherent readback
-restores confirmation. Overdue deadlines, stalled workers, clock uncertainty and failed
-readback still degrade protection. Jail `source_healthy` describes the source independently
-of storage and firewall health; it does not by itself establish enforcement.
+Status separates what the daemon knows from what is installed. `active_bans` is what
+the last complete readback showed; `knowledge` is `fresh` within the verification
+cadence plus one wake, `stale` after it, and `none` before the first readback or under
+a fatal backend cause, with `confirmed_at_us` and `knowledge_age_ms` alongside. A stale
+readback keeps the last count and reports protection as `degraded`; no knowledge
+reports the count as absent and protection as `unknown`, never as zero.
+`pending_bans`, `overdue_removals`, `overdue_bookkeeping` and their oldest ages describe
+work not yet confirmed; a served backlog does not degrade protection. Expiry is split by
+what the kernel holds: an expired rule the last readback still shows installed
+(`overdue_removals`, deletion-class entries) keeps blocking traffic and degrades
+protection with cause `EffectRemovalOverdue`; an element the kernel already removed and
+the daemon has not yet booked (`overdue_bookkeeping`) does not. Effect-changing
+transactions still invalidate the expiry authority before commit and the next readback
+restores it. Stalled workers, clock uncertainty and a fatal backend cause degrade
+protection. Jail `source_healthy` describes the source independently of storage and
+firewall health; it does not by itself establish enforcement.
 
 The shipped systemd unit uses the non-login `fail2zig` user and group. It restricts filesystem
 access, syscalls and capabilities while retaining the access required to read configured logs, own SQLite state and manage the selected firewall.
@@ -113,9 +175,22 @@ intent are not evicted to satisfy a ceiling. Exhaustion pauses new admission or 
 health instead of silently losing protection.
 
 Spent enforcement records are removed in bounded background steps: a banned scope qualifies once
-its owners no longer hold a lease, the kernel entry is confirmed absent, no firewall work or action
-outcome is unsettled and its confirmed history has aged past the history retention (one day by
-default). Active and permanent bans and retained history are kept.
+its owners no longer hold a lease, the kernel entry is confirmed absent and no firewall work or
+action outcome is unsettled. Confirmed history keeps its own copy of the scope and ban decision, so
+it stays readable after the scope is removed and ages out on its own retention. Obsolete owner
+revisions, intents and observations of a still-active scope are reclaimed the same way; each intent
+keeps at most four observations. Active and permanent bans are kept.
+
+Admission reserves room for every live ban to expire, be released or be confirmed, so terminal
+transitions never meet a row limit. A request that would break that reserve, or that would
+exceed a jail's retry-subject capacity (4,096 divided by the number of enabled jails), is
+refused as retryable backpressure: the source keeps its receipt, nothing is evicted, the
+jail reports its source unhealthy with the cause (`ReserveBackpressure` or
+`RetryCapacity`) in `status` and `jails`, and ingestion resumes once expiry or retirement
+frees space. Retry subjects whose lease and retry window have both lapsed are retired one
+per maintenance turn regardless of load. At 58,982 confirmed
+events, consumed history older than every consumer's checkpoint may be pruned before its retention
+age, with a warning; history still pinned by a consumer or unsettled work is never removed.
 Retry decision details are reclaimed separately once no current owner, retained
 confirmed event or unsettled action needs them. Cleanup is bounded by rows and
 stored bytes; the 65,536-row admission limit still applies to retained details.

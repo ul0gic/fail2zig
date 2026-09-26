@@ -1197,6 +1197,7 @@ fn mapNetlinkErr(err: netlink.Error) backend.BackendError {
         error.InvalidArgument,
         error.Timeout,
         error.TruncatedMessage,
+        error.DumpInterrupted,
         => backend.BackendError.SystemError,
     };
 }

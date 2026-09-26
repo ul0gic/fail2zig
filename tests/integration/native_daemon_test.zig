@@ -515,7 +515,7 @@ test "native daemon: schema23 resumes marked escalated cleanup and continues ing
     {
         var store = try engine.native_store_mod.Store.open(t.allocator, h.state_path);
         defer store.close();
-        try t.expectEqual(@as(i64, 23), store.schema_version);
+        try t.expectEqual(@as(i64, 24), store.schema_version);
         try t.expectEqual(@as(i64, 1), try store.inspectInteger("SELECT count(*) FROM retry_decision_escalations;"));
         try t.expectEqual(@as(i64, 0), try store.inspectInteger("SELECT count(*) FROM pragma_foreign_key_check;"));
         const escalated_sequence_value = try store.inspectInteger("SELECT r.source_sequence FROM records r JOIN retry_decision_escalations e USING(jail,source,occurrence) LIMIT 1;");
@@ -533,7 +533,7 @@ test "native daemon: schema23 resumes marked escalated cleanup and continues ing
             const expired = try store.prepareExpiry(entries[0].scope_key, entries[0].revision, .{ .prepared_us = std.time.microTimestamp() });
             try t.expectEqual(engine.native_effect_mod.Status.pending, expired.status);
             try t.expectEqual(.absent, std.meta.activeTag(expired.desired));
-            try store.markDispatched(expired.token(), .{ .prepared_us = std.time.microTimestamp() });
+            const dispatched_us = std.time.microTimestamp();
             var observed = try reader.observeExact(.{
                 .installation = reader.installation,
                 .effect_id = expired.scope_key,
@@ -543,7 +543,7 @@ test "native daemon: schema23 resumes marked escalated cleanup and continues ing
             }, .{ .wall_us = std.time.microTimestamp() });
             defer observed.deinit();
             try t.expect(observed.matches_desired);
-            try t.expectEqual(engine.native_effect_mod.Settlement.verified, try store.settleVerified(expired.token(), .{
+            try t.expectEqual(engine.native_effect_mod.Settlement.verified, try store.settleOutcome(expired.token(), dispatched_us, .{
                 .installation = expired.installation.id,
                 .scope_key = expired.scope_key,
                 .fingerprint = observed.snapshot.fingerprint,

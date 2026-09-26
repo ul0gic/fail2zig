@@ -779,6 +779,7 @@ pub const help_top =
     \\    firewall show       Inspect sampled fail2zig-owned kernel protection
     \\    history reset <ip>  Reset an address's ban history in one jail or all jails
     \\    jail <action> <n>   enable, disable, pause or resume a jail
+    \\    repair-source       Acknowledge a truncated file source (daemon stopped)
     \\    completions <sh>    Emit shell-completion script (bash|zsh|fish)
     \\    help [command]      Show help for a command
     \\
@@ -903,6 +904,31 @@ pub const help_jail =
     \\
 ;
 
+pub const help_repair_source =
+    \\fail2zig repair-source — acknowledge an in-place truncated file source
+    \\
+    \\USAGE:
+    \\    fail2zig repair-source --jail <name> --source <absolute path> --token <token>
+    \\                           --acknowledge-truncation [--config <path>]
+    \\
+    \\Runs locally against the state file named by the config, only while the daemon is
+    \\stopped; it refuses when the state is locked or absent and never creates state.
+    \\It accepts only a same-inode truncation of a recorded source with no pending
+    \\receipt, and restarts that source at offset 0 of the current file.
+    \\
+    \\Data removed by the truncation before it was read is lost; its extent is unknown.
+    \\Protection for every jail may be absent while the daemon is stopped; the next
+    \\start reinstalls it before reporting READY.
+    \\
+    \\Repeating the command with the same token and arguments reports the committed
+    \\outcome. The newest 256 outcomes are retained; an older token stays reserved and
+    \\is refused, so it can never apply a second repair. The source must be a configured
+    \\logpath of the jail. The repair binds the source generation recorded in the state,
+    \\not one recomputed from the configuration; a changed configuration is applied by
+    \\the next start.
+    \\
+;
+
 pub const help_completions =
     \\fail2zig completions — generate shell completion script
     \\
@@ -929,6 +955,7 @@ pub fn helpFor(topic: ?[]const u8) []const u8 {
     if (std.mem.eql(u8, t, "history")) return help_history;
     if (std.mem.eql(u8, t, "firewall")) return help_firewall;
     if (std.mem.eql(u8, t, "jail")) return help_jail;
+    if (std.mem.eql(u8, t, "repair-source")) return help_repair_source;
     return help_top;
 }
 

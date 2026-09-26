@@ -56,6 +56,14 @@ pub const StatusPayload = struct {
     memory_bytes_limit: ?u64 = null,
     active_bans: ?u32 = null,
     total_bans: ?u64 = null,
+    knowledge: ?[]const u8 = null,
+    confirmed_at_us: ?i64 = null,
+    knowledge_age_ms: ?u64 = null,
+    pending_bans: ?u64 = null,
+    oldest_pending_ms: ?u64 = null,
+    overdue_removals: ?u64 = null,
+    oldest_overdue_ms: ?u64 = null,
+    overdue_bookkeeping: ?u64 = null,
     parse_rate: ?f64 = null,
     protection: ?[]const u8 = null,
     protection_cause: ?[]const u8 = null,
@@ -213,6 +221,14 @@ fn writeStatusPlain(writer: anytype, s: StatusPayload) !void {
     if (s.memory_bytes_limit) |m| try writer.print("memory_bytes_limit\t{d}\n", .{m});
     if (s.active_bans) |a| try writer.print("active_bans\t{d}\n", .{a});
     if (s.total_bans) |a| try writer.print("total_bans\t{d}\n", .{a});
+    if (s.knowledge) |k| try writer.print("knowledge\t{s}\n", .{renderDiagnostic(&diagnostic_buffer, k)});
+    if (s.confirmed_at_us) |at| try writer.print("confirmed_at_us\t{d}\n", .{at});
+    if (s.knowledge_age_ms) |age| try writer.print("knowledge_age_ms\t{d}\n", .{age});
+    if (s.pending_bans) |count| try writer.print("pending_bans\t{d}\n", .{count});
+    if (s.oldest_pending_ms) |age| try writer.print("oldest_pending_ms\t{d}\n", .{age});
+    if (s.overdue_removals) |count| try writer.print("overdue_removals\t{d}\n", .{count});
+    if (s.oldest_overdue_ms) |age| try writer.print("oldest_overdue_ms\t{d}\n", .{age});
+    if (s.overdue_bookkeeping) |count| try writer.print("overdue_bookkeeping\t{d}\n", .{count});
     if (s.parse_rate) |p| try writer.print("parse_rate\t{d:.2}\n", .{p});
     if (s.protection) |p| try writer.print("protection\t{s}\n", .{renderDiagnostic(&diagnostic_buffer, p)});
     if (s.protection_cause) |c| try writer.print("protection_cause\t{s}\n", .{renderDiagnostic(&diagnostic_buffer, c)});
@@ -261,6 +277,10 @@ fn writeStatusTable(writer: anytype, s: StatusPayload, color: Color, columns: us
     try rowLabel(writer, "Parse rate:", formatRate(s.parse_rate), width);
     try rowLabel(writer, "Active bans:", formatOptU32(s.active_bans), width);
     try rowLabel(writer, "Total bans:", formatOptU64(s.total_bans), width);
+    var knowledge_buffer: [diagnostic_max_bytes + 32]u8 = undefined;
+    if (formatKnowledge(&knowledge_buffer, s)) |value| try rowLabel(writer, "Knowledge:", value, width);
+    var pending_buffer: [96]u8 = undefined;
+    if (formatPending(&pending_buffer, s)) |value| try rowLabel(writer, "Pending:", value, width);
     var protection_buffer: [diagnostic_max_bytes + 16]u8 = undefined;
     try rowLabel(writer, "Protection:", formatProtection(&protection_buffer, s), width);
     var backend_buffer: [diagnostic_max_bytes]u8 = undefined;
@@ -451,6 +471,21 @@ fn formatProtection(buffer: []u8, s: StatusPayload) []const u8 {
     return std.fmt.bufPrint(buffer, "DEGRADED ({s})", .{cause}) catch "DEGRADED";
 }
 
+fn formatKnowledge(buffer: []u8, s: StatusPayload) ?[]const u8 {
+    const knowledge = s.knowledge orelse return null;
+    var knowledge_buffer: [diagnostic_max_bytes]u8 = undefined;
+    const rendered = renderDiagnostic(&knowledge_buffer, knowledge);
+    const age = s.knowledge_age_ms orelse return std.fmt.bufPrint(buffer, "{s}", .{rendered}) catch "-";
+    return std.fmt.bufPrint(buffer, "{s} (readback {d} ms ago)", .{ rendered, age }) catch "-";
+}
+fn formatPending(buffer: []u8, s: StatusPayload) ?[]const u8 {
+    const pending = s.pending_bans orelse 0;
+    const overdue = s.overdue_removals orelse 0;
+    if (pending == 0 and overdue == 0) return null;
+    if (pending != 0 and overdue != 0) return std.fmt.bufPrint(buffer, "{d} bans (oldest {d} ms); {d} overdue (oldest {d} ms)", .{ pending, s.oldest_pending_ms orelse 0, overdue, s.oldest_overdue_ms orelse 0 }) catch "-";
+    if (pending != 0) return std.fmt.bufPrint(buffer, "{d} bans (oldest {d} ms)", .{ pending, s.oldest_pending_ms orelse 0 }) catch "-";
+    return std.fmt.bufPrint(buffer, "{d} overdue (oldest {d} ms)", .{ overdue, s.oldest_overdue_ms orelse 0 }) catch "-";
+}
 fn statusCause(s: StatusPayload) ?[]const u8 {
     if (s.cause) |cause| {
         if (!std.mem.eql(u8, cause, "none")) return cause;

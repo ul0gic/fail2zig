@@ -53,8 +53,7 @@ const Fixture = struct {
     }
     fn confirmAs(self: *Fixture, jail: []const u8, id: u8, clock: *Clock) !effects.Entry {
         const entry = try self.store.setOwner(.{ .scope = try effects.Scope.host(.{ .v4 = .{ 192, 0, 2, id } }), .jail = jail, .generation = [_]u8{3} ** 32, .decision_id = [_]u8{id} ** 32, .expected_revision = 0, .lease = .permanent, .decided_us = clock.now }, clock.value());
-        try self.store.markDispatched(entry.token(), clock.value());
-        _ = try self.store.settleVerified(entry.token(), observation(entry, clock.now), clock.value());
+        _ = try self.store.settleOutcome(entry.token(), clock.now, observation(entry, clock.now), clock.value());
         return entry;
     }
     fn bootstrap(self: *Fixture, owner: *history.Consumer, clock: *Clock) !void {
@@ -241,8 +240,7 @@ test "native effect history store: application detail pages aggregates and polic
         if (std.meta.eql(entry.scope, native_scope)) native_effect = entry;
     }
     const pending = native_effect orelse return error.MissingNativeEffect;
-    try f.store.markDispatched(pending.token(), clock.value());
-    try t.expectEqual(effects.Settlement.verified, try f.store.settleVerified(pending.token(), observation(pending, clock.now), clock.value()));
+    try t.expectEqual(effects.Settlement.verified, try f.store.settleOutcome(pending.token(), clock.now, observation(pending, clock.now), clock.value()));
 
     const first = try f.store.applicationHistoryPage(t.allocator, f.installation, .{}, &rows);
     try t.expect(first.more);
@@ -341,9 +339,8 @@ test "native effect history store: schema 18 escalation uses confirmed history a
     try t.expectEqualDeep(retry.Lease{ .finite = clock.now + 10_000_000 }, first_decision.lease);
     try t.expectEqual(@as(u32, 0), jitter.calls);
     const first_effect = try effectForSubject(&f.store, subject);
-    try f.store.markDispatched(first_effect.token(), clock.value());
-    _ = try f.store.settleVerified(first_effect.token(), observation(first_effect, clock.now), clock.value());
-    _ = try f.store.settleVerified(first_effect.token(), observation(first_effect, clock.now), clock.value());
+    _ = try f.store.settleOutcome(first_effect.token(), clock.now, observation(first_effect, clock.now), clock.value());
+    _ = try f.store.settleOutcome(first_effect.token(), clock.now, observation(first_effect, clock.now), clock.value());
 
     clock.now += 10_000_000;
     _ = try f.store.commitRecord(try nativeRecord(&f.store, &clock, "escalated", "two", 1, subject, escalated, null));
@@ -396,8 +393,7 @@ test "native effect history store: recidive consumes only replay-safe foreign na
 
     _ = try f.store.commitRecord(try nativeRecord(&f.store, &clock, "source-a", "a-one", 0, subject, source_policy, null));
     var pending = try effectForSubject(&f.store, subject);
-    try f.store.markDispatched(pending.token(), clock.value());
-    _ = try f.store.settleVerified(pending.token(), observation(pending, clock.now), clock.value());
+    _ = try f.store.settleOutcome(pending.token(), clock.now, observation(pending, clock.now), clock.value());
     var events: [history.max_page]history.Event = undefined;
     const first_page = try f.store.confirmedEffectPage(f.installation, 0, null, &events);
     try t.expectEqual(@as(usize, 1), first_page.count);
@@ -420,8 +416,7 @@ test "native effect history store: recidive consumes only replay-safe foreign na
 
     _ = try f.store.commitRecord(try nativeRecord(&f.store, &clock, "source-b", "b-one", 0, subject, source_policy, null));
     pending = try effectForSubject(&f.store, subject);
-    try f.store.markDispatched(pending.token(), clock.value());
-    _ = try f.store.settleVerified(pending.token(), observation(pending, clock.now), clock.value());
+    _ = try f.store.settleOutcome(pending.token(), clock.now, observation(pending, clock.now), clock.value());
     const second_page = try f.store.confirmedEffectPage(f.installation, 1, null, &events);
     try t.expectEqual(@as(usize, 1), second_page.count);
     try t.expect(events[0].native_retry);
@@ -469,8 +464,7 @@ test "native effect history store: typed reset fences recurrence and escalation 
     for ([_][]const u8{ "source-a", "source-b" }, [_][]const u8{ "a", "b" }) |jail, occurrence| {
         _ = try f.store.commitRecord(try nativeRecord(&f.store, &clock, jail, occurrence, 0, subject, source_policy, null));
         const pending = try effectForSubject(&f.store, subject);
-        try f.store.markDispatched(pending.token(), clock.value());
-        _ = try f.store.settleVerified(pending.token(), observation(pending, clock.now), clock.value());
+        _ = try f.store.settleOutcome(pending.token(), clock.now, observation(pending, clock.now), clock.value());
     }
     var events: [history.max_page]history.Event = undefined;
     const initial = try f.store.confirmedEffectPage(f.installation, 0, null, &events);
@@ -506,8 +500,7 @@ test "native effect history store: typed reset fences recurrence and escalation 
     try t.expectEqual(@as(u64, 0), (try f.store.retryEscalationDecision("after-reset", "file", "first", subject)).?.prior_confirmed);
 
     const pending = try effectForSubject(&f.store, subject);
-    try f.store.markDispatched(pending.token(), clock.value());
-    _ = try f.store.settleVerified(pending.token(), observation(pending, clock.now), clock.value());
+    _ = try f.store.settleOutcome(pending.token(), clock.now, observation(pending, clock.now), clock.value());
     const fresh = try f.store.confirmedEffectPage(f.installation, 2, null, &events);
     try t.expectEqual(@as(usize, 1), fresh.count);
     try t.expect(try f.store.historyEventEligible(events[0]));
@@ -521,8 +514,7 @@ test "native effect history store: retention is consumed-prefix bounded rollback
     var f = try Fixture.init();
     defer f.deinit();
     var clock = Clock{};
-    try enableApplicationHistory(&f.store);
-    try f.store.enableEscalation();
+    try upgradeToLoadRepair(&f, &clock, 0);
     var owner = try history.Consumer.init(f.installation, [_]u8{8} ** 32);
     const initial = try owner.prepareInitial();
     try f.store.bootstrapConfirmedHistory(owner.manifest(), try initial.batch(clock.value()), f.installation);
@@ -533,9 +525,15 @@ test "native effect history store: retention is consumed-prefix bounded rollback
     const subject = detection.Subject{ .v4 = .{ 203, 0, 113, 91 } };
     try f.store.admitRetry("finite-history", [_]u8{3} ** 32, finite);
     _ = try f.store.commitRecord(try nativeRecord(&f.store, &clock, "finite-history", "one", 0, subject, finite, "retained detail"));
-    var pending = try effectForSubject(&f.store, subject);
-    try f.store.markDispatched(pending.token(), clock.value());
-    _ = try f.store.settleVerified(pending.token(), observation(pending, clock.now), clock.value());
+    const pending = try effectForSubject(&f.store, subject);
+    _ = try f.store.settleOutcome(pending.token(), clock.now, observation(pending, clock.now), clock.value());
+    // The runtime settles the decision's outcomes after confirmation; only unsettled
+    // outcomes pin the stream prefix from schema 24 on.
+    const decision = (try f.store.currentOwner(pending.scope_key, "finite-history")).?.decision_id;
+    for ([_]@import("engine_test").core.native_action_outcome.Kind{ .enforcement, .notification }) |kind| {
+        try f.store.markActionTargetDispatched(decision, kind, clock.value());
+        try f.store.settleActionTarget(decision, kind, .confirmed, clock.value());
+    }
     var events: [history.max_page]history.Event = undefined;
     const page = try f.store.confirmedEffectPage(f.installation, 0, null, &events);
     const stage = try owner.prepare(page, events[0..page.count], clock.now);
@@ -557,31 +555,18 @@ test "native effect history store: retention is consumed-prefix bounded rollback
     try t.expect(application_rows[0].detail == null);
     application_rows[0].deinit(t.allocator);
 
-    try t.expect(!try f.store.cleanupConfirmedHistoryOne(.{ .age_us = 0 }, clock.now));
+    // Schema 24 removes the live-owner pin: the still-live owner no longer holds the
+    // consumed prefix, which now waits only for its retention age.
+    try t.expect(!try f.store.cleanupConfirmedHistoryOne(.{ .age_us = 1_000_000, .max_matches = 0 }, clock.now));
     clock.now += 10_000_000;
     f.store.fail_at = .after_history_event_delete;
-    try t.expectError(error.InjectedFailure, f.store.cleanupConfirmedHistoryOne(.{ .age_us = 0 }, clock.now));
+    try t.expectError(error.InjectedFailure, f.store.cleanupConfirmedHistoryOne(.{ .age_us = 0, .max_matches = 0 }, clock.now));
     try t.expectEqual(@as(usize, 1), (try f.store.confirmedEffectPage(f.installation, 0, null, &events)).count);
     f.store.fail_at = null;
-    try t.expect(try f.store.cleanupConfirmedHistoryOne(.{ .age_us = 0 }, clock.now));
+    try t.expect(try f.store.cleanupConfirmedHistoryOne(.{ .age_us = 0, .max_matches = 0 }, clock.now));
     try t.expectError(error.HistoryGap, f.store.confirmedEffectPage(f.installation, 0, null, &events));
     try f.reopen();
     try t.expectError(error.HistoryGap, f.store.confirmedEffectPage(f.installation, 0, null, &events));
-
-    const permanent = retry.Policy{ .maxretry = 1, .window_us = 60_000_000, .duration = .permanent, .max_subjects = 8, .enforce = true };
-    const pinned_subject = detection.Subject{ .v4 = .{ 203, 0, 113, 92 } };
-    try f.store.admitRetry("permanent-history", [_]u8{3} ** 32, permanent);
-    _ = try f.store.commitRecord(try nativeRecord(&f.store, &clock, "permanent-history", "one", 0, pinned_subject, permanent, null));
-    pending = try effectForSubject(&f.store, pinned_subject);
-    try f.store.markDispatched(pending.token(), clock.value());
-    _ = try f.store.settleVerified(pending.token(), observation(pending, clock.now), clock.value());
-    const pinned_page = try f.store.confirmedEffectPage(f.installation, 1, null, &events);
-    const pinned_stage = try owner.prepare(pinned_page, events[0..pinned_page.count], clock.now);
-    try f.store.commitConfirmedHistory(owner.manifest(), try pinned_stage.batch(clock.value()), pinned_page.token);
-    pinned_stage.publish();
-    pinned_stage.release();
-    try t.expect(try f.store.cleanupConfirmedHistoryOne(.{ .age_us = 0, .max_matches = 0 }, clock.now));
-    try t.expect(!try f.store.cleanupConfirmedHistoryOne(.{ .age_us = 0, .max_matches = 0 }, clock.now));
 }
 
 test "native effect history store: only first qualified receipt appends and repair replay is stable" {
@@ -592,21 +577,20 @@ test "native effect history store: only first qualified receipt appends and repa
     const entry = try f.confirm(1, &clock);
     var events: [64]history.Event = undefined;
     const first = try f.store.confirmedEffectPage(f.installation, 0, null, &events);
-    _ = try f.store.settleVerified(entry.token(), observation(entry, 100), clock.value());
+    _ = try f.store.settleOutcome(entry.token(), 100, observation(entry, 100), clock.value());
     const repeated = try f.store.confirmedEffectPage(f.installation, 0, first.token.stream_revision, &events);
     try t.expectEqualDeep(first, repeated);
     const pending = try f.store.setOwner(.{ .scope = try effects.Scope.host(.{ .v4 = .{ 192, 0, 2, 2 } }), .jail = "ssh", .generation = [_]u8{3} ** 32, .decision_id = [_]u8{2} ** 32, .expected_revision = 0, .lease = .permanent, .decided_us = 100 }, clock.value());
-    try f.store.markDispatched(pending.token(), clock.value());
     var uncertain = observation(pending, 100);
     uncertain.qualification = .incomplete;
-    try t.expectError(error.IncompleteEffectObservation, f.store.settleVerified(pending.token(), uncertain, clock.value()));
+    try t.expectError(error.IncompleteEffectObservation, f.store.settleOutcome(pending.token(), 100, uncertain, clock.value()));
     try f.store.validateConfirmedEffectPage(first.token);
     f.store.fail_at = .before_effect_receipt_commit;
-    try t.expectError(error.InjectedFailure, f.store.settleVerified(pending.token(), observation(pending, 100), clock.value()));
+    try t.expectError(error.InjectedFailure, f.store.settleOutcome(pending.token(), 100, observation(pending, 100), clock.value()));
     f.store.fail_at = null;
     try f.store.validateConfirmedEffectPage(first.token);
     try f.reopen();
-    _ = try f.store.settleVerified(pending.token(), observation(pending, 100), clock.value());
+    _ = try f.store.settleOutcome(pending.token(), 100, observation(pending, 100), clock.value());
     try t.expectEqual(@as(u64, 2), (try f.store.confirmedEffectPage(f.installation, 0, null, &events)).token.head_sequence);
 }
 
@@ -829,4 +813,598 @@ test "native effect history store: bounded page source revision CAS and fresh cl
     next.publish();
     try t.expectEqual(@as(u64, 2), owner.live.total_confirmed);
     try t.expectError(error.InvalidHistoryPage, f.store.confirmedEffectPage(f.installation, 2, null, &.{}));
+}
+
+// ---- Schema 24: retention order, deduplication and history capacity ----
+
+extern fn sqlite3_open_v2(path: [*:0]const u8, db: *?*anyopaque, flags: c_int, vfs: ?[*:0]const u8) c_int;
+extern fn sqlite3_close_v2(db: *anyopaque) c_int;
+extern fn sqlite3_backup_init(dest: *anyopaque, dest_name: [*:0]const u8, source: *anyopaque, source_name: [*:0]const u8) ?*anyopaque;
+extern fn sqlite3_backup_step(backup: *anyopaque, pages: c_int) c_int;
+extern fn sqlite3_backup_finish(backup: *anyopaque) c_int;
+extern fn sqlite3_prepare_v2(db: *anyopaque, sql: [*:0]const u8, bytes: c_int, statement: *?*anyopaque, tail: ?*anyopaque) c_int;
+extern fn sqlite3_step(statement: *anyopaque) c_int;
+extern fn sqlite3_finalize(statement: *anyopaque) c_int;
+extern fn sqlite3_bind_int64(statement: *anyopaque, index: c_int, value: i64) c_int;
+extern fn sqlite3_bind_blob(statement: *anyopaque, index: c_int, value: ?*const anyopaque, bytes: c_int, destructor: ?*anyopaque) c_int;
+extern fn sqlite3_column_int64(statement: *anyopaque, column: c_int) i64;
+extern fn sqlite3_column_blob(statement: *anyopaque, column: c_int) ?*const anyopaque;
+extern fn sqlite3_changes(db: *anyopaque) c_int;
+
+fn upgradeToLoadRepair(f: *Fixture, clock: *Clock, max_matches: u16) !void {
+    try enableApplicationHistory(&f.store);
+    try f.store.enableEscalation();
+    try f.store.enableCanonicalEffects();
+    try f.store.enableHistoryResets();
+    try f.store.enableActionTargets();
+    try f.store.enableAdminState();
+    try f.store.enableMigrationState();
+    try f.store.enableLoadRepair(.{ .state_path = f.path, .now_us = clock.now, .history_max_matches = max_matches }, null);
+    try t.expectEqual(durable.latest_schema, f.store.schema_version);
+}
+
+fn scalar(store: *durable.Store, statement: [:0]const u8) !i64 {
+    return store.inspectInteger(statement);
+}
+
+// Copied verbatim from the schema-23 cleanupConfirmedHistoryOne detail branch
+// (tests/harness/load_repro/oracle.c keeps the same text): the one-row shipped predicate.
+const shipped_detail_sql = "SELECT d.event_id FROM confirmed_event_details d JOIN confirmed_effect_events e USING(event_id) JOIN confirmed_history_sequence s USING(event_id) LEFT JOIN retry_decision_details r ON r.jail=e.jail AND r.effect_decision_id=e.decision_id WHERE s.sequence<=?1 AND (e.confirmed_us<=?2 OR (r.effect_decision_id IS NOT NULL AND ((SELECT count(*) FROM confirmed_event_details d2 JOIN confirmed_effect_events e2 USING(event_id) JOIN retry_decision_details r2 ON r2.jail=e2.jail AND r2.effect_decision_id=e2.decision_id WHERE r2.family=r.family AND r2.subject=r.subject)>?3 OR (d.evidence IS NOT NULL AND (SELECT coalesce(sum(length(CAST(d3.evidence AS BLOB))),0) FROM confirmed_event_details d3 JOIN confirmed_effect_events e3 USING(event_id) JOIN retry_decision_details r3 ON r3.jail=e3.jail AND r3.effect_decision_id=e3.decision_id WHERE r3.family=r.family AND r3.subject=r.subject)>16384)))) ORDER BY s.sequence LIMIT 1;";
+
+const OracleStatement = struct {
+    handle: *anyopaque,
+    fn init(db: *anyopaque, text: [:0]const u8) !OracleStatement {
+        var handle: ?*anyopaque = null;
+        if (sqlite3_prepare_v2(db, text, -1, &handle, null) != 0) return error.TestSqlFailed;
+        return .{ .handle = handle orelse return error.TestSqlFailed };
+    }
+    fn deinit(self: OracleStatement) void {
+        _ = sqlite3_finalize(self.handle);
+    }
+};
+
+// Repeats the shipped one-row decision on an in-memory copy and returns the complete
+// deletion vector for one retention transaction.
+fn shippedVector(store: *durable.Store, fence: i64, cutoff: i64, max_matches: u16, output: []i64) !usize {
+    var opened: ?*anyopaque = null;
+    if (sqlite3_open_v2(":memory:", &opened, 0x06, null) != 0) return error.TestSqlFailed;
+    const copy = opened orelse return error.TestSqlFailed;
+    defer _ = sqlite3_close_v2(copy);
+    const backup = sqlite3_backup_init(copy, "main", @ptrCast(store.db), "main") orelse return error.TestSqlFailed;
+    const copied = sqlite3_backup_step(backup, -1);
+    if (sqlite3_backup_finish(backup) != 0 or copied != 101) return error.TestSqlFailed;
+    var count: usize = 0;
+    while (count < output.len) : (count += 1) {
+        var event_id: [32]u8 = undefined;
+        {
+            const choose = try OracleStatement.init(copy, shipped_detail_sql);
+            defer choose.deinit();
+            _ = sqlite3_bind_int64(choose.handle, 1, fence);
+            _ = sqlite3_bind_int64(choose.handle, 2, cutoff);
+            _ = sqlite3_bind_int64(choose.handle, 3, max_matches);
+            const rc = sqlite3_step(choose.handle);
+            if (rc == 101) break;
+            if (rc != 100) return error.TestSqlFailed;
+            const bytes: [*]const u8 = @ptrCast(sqlite3_column_blob(choose.handle, 0) orelse return error.TestSqlFailed);
+            @memcpy(&event_id, bytes[0..32]);
+        }
+        {
+            const sequence = try OracleStatement.init(copy, "SELECT sequence FROM confirmed_history_sequence WHERE event_id=?1;");
+            defer sequence.deinit();
+            _ = sqlite3_bind_blob(sequence.handle, 1, &event_id, 32, null);
+            if (sqlite3_step(sequence.handle) != 100) return error.TestSqlFailed;
+            output[count] = sqlite3_column_int64(sequence.handle, 0);
+        }
+        const remove = try OracleStatement.init(copy, "DELETE FROM confirmed_event_details WHERE event_id=?1;");
+        defer remove.deinit();
+        _ = sqlite3_bind_blob(remove.handle, 1, &event_id, 32, null);
+        if (sqlite3_step(remove.handle) != 101 or sqlite3_changes(copy) != 1) return error.TestSqlFailed;
+    }
+    return count;
+}
+
+const DetailSet = struct {
+    present: [256]bool = [_]bool{false} ** 256,
+    fn read(store: *durable.Store) !DetailSet {
+        var result = DetailSet{};
+        var row = try store.statement("SELECT sequence FROM confirmed_event_details;");
+        defer row.deinit();
+        while (try row.row()) result.present[@intCast(try row.signed(0))] = true;
+        return result;
+    }
+    fn removed(before: DetailSet, after: DetailSet, output: []i64) !usize {
+        var count: usize = 0;
+        for (before.present, after.present, 0..) |was, is, sequence| {
+            if (is and !was) return error.DetailAppeared;
+            if (was and !is) {
+                output[count] = @intCast(sequence);
+                count += 1;
+            }
+        }
+        return count;
+    }
+};
+
+// Independent recomputation of every maintained summary and candidate from the details.
+fn expectSummariesExact(store: *durable.Store) !void {
+    try t.expectEqual(@as(i64, 0), try scalar(store, "SELECT count(*) FROM (SELECT family,subject,count(*) c,coalesce(sum(evidence_bytes),0) b,min(sequence) m,min(CASE WHEN evidence_bytes IS NOT NULL THEN sequence END) me FROM confirmed_event_details WHERE family IS NOT NULL GROUP BY family,subject) x FULL OUTER JOIN retained_subject_summaries s ON s.family=x.family AND s.subject=x.subject WHERE s.detail_count IS NOT x.c OR s.evidence_bytes IS NOT x.b OR s.earliest_sequence IS NOT x.m OR s.earliest_evidence_sequence IS NOT x.me;"));
+    try t.expectEqual(@as(i64, 0), try scalar(store, "SELECT count(*) FROM retained_subject_summaries s JOIN retention_policy p ON p.id=1 WHERE p.state=2 AND (s.evaluated_generation<>p.generation OR s.candidate_sequence IS NOT (CASE WHEN s.detail_count>p.max_matches THEN s.earliest_sequence WHEN s.evidence_bytes>16384 THEN s.earliest_evidence_sequence END));"));
+}
+
+const retention_policy = retry.Policy{ .maxretry = 1, .window_us = 60_000_000, .duration = .{ .finite_us = 3_600_000_000 }, .max_subjects = 64, .enforce = true };
+
+// A schema-24 state whose details come from the production record, dispatch and
+// confirmation path. Repeated details of one subject use distinct jails, so each has its
+// own live owner and confirmation.
+const RetainedHistory = struct {
+    f: Fixture,
+    clock: Clock = .{},
+    owner: history.Consumer,
+    names: [24][4]u8 = undefined,
+    revisions: [24]u64 = [_]u64{0} ** 24,
+    admitted: [24]bool = [_]bool{false} ** 24,
+    details_per_subject: [8]u8 = [_]u8{0} ** 8,
+    confirmed_at: [256]i64 = [_]i64{0} ** 256,
+    head: usize = 0,
+    consumed: u64 = 0,
+    occurrence: u32 = 0,
+
+    fn init(self: *RetainedHistory, max_matches: u16) !void {
+        self.* = .{ .f = try Fixture.init(), .owner = undefined };
+        errdefer self.f.deinit();
+        try upgradeToLoadRepair(&self.f, &self.clock, max_matches);
+        self.owner = try history.Consumer.init(self.f.installation, [_]u8{8} ** 32);
+        try self.f.bootstrap(&self.owner, &self.clock);
+    }
+    fn deinit(self: *RetainedHistory) void {
+        self.f.deinit();
+    }
+    fn subject(index: u8) detection.Subject {
+        return .{ .v4 = .{ 198, 51, 100, index + 1 } };
+    }
+    fn jail(self: *RetainedHistory, index: usize) ![]const u8 {
+        const name = try std.fmt.bufPrint(&self.names[index], "r{d}", .{index});
+        if (!self.admitted[index]) {
+            try self.f.store.admitRetry(name, [_]u8{3} ** 32, retention_policy);
+            self.admitted[index] = true;
+        }
+        return name;
+    }
+    fn arrive(self: *RetainedHistory, arrival: Arrival) !void {
+        const index = self.details_per_subject[arrival.subject];
+        self.details_per_subject[arrival.subject] += 1;
+        const name = try self.jail(index);
+        var occurrence_buffer: [16]u8 = undefined;
+        const occurrence = try std.fmt.bufPrint(&occurrence_buffer, "o{d}", .{self.occurrence});
+        self.occurrence += 1;
+        var evidence_buffer: [2048]u8 = undefined;
+        const evidence: ?[]const u8 = if (arrival.evidence) |length| blk: {
+            @memset(evidence_buffer[0..length], 'e');
+            break :blk evidence_buffer[0..length];
+        } else null;
+        _ = try self.f.store.commitRecord(try nativeRecord(&self.f.store, &self.clock, name, occurrence, self.revisions[index], subject(arrival.subject), retention_policy, evidence));
+        self.revisions[index] += 1;
+        const entry = try effectForSubject(&self.f.store, subject(arrival.subject));
+        _ = try self.f.store.settleOutcome(entry.token(), self.clock.now, observation(entry, self.clock.now), self.clock.value());
+        self.head += 1;
+        self.confirmed_at[self.head] = self.clock.now;
+        self.clock.now += 1_000_000;
+    }
+    fn consumeTo(self: *RetainedHistory, target: u64) !void {
+        var events: [history.max_page]history.Event = undefined;
+        while (self.consumed < target) {
+            const wanted: usize = @intCast(@min(history.max_page, target - self.consumed));
+            const page = try self.f.store.confirmedEffectPage(self.f.installation, self.consumed, null, events[0..wanted]);
+            const stage = try self.owner.prepare(page, events[0..page.count], self.clock.now);
+            defer stage.release();
+            try self.f.store.commitConfirmedHistory(self.owner.manifest(), try stage.batch(self.clock.value()), page.token);
+            stage.publish();
+            self.consumed = page.token.last_sequence;
+        }
+    }
+};
+
+const Arrival = struct { subject: u8, evidence: ?u16 = null };
+const RetentionCheck = struct {
+    arrivals: []const Arrival = &.{},
+    // Applied in order; every value but the last is superseded after one sweep page.
+    policies: []const u16,
+    // Confirmations up to this sequence are age-eligible; null makes none eligible by age.
+    cutoff: ?usize = null,
+    // Consumer checkpoint; null consumes to the head.
+    fence: ?usize = null,
+};
+const RetentionCase = struct { name: []const u8, initial_max: u16, arrivals: []const Arrival, checks: []const RetentionCheck };
+
+fn repeatArrival(comptime count: usize, arrival: Arrival) [count]Arrival {
+    return [_]Arrival{arrival} ** count;
+}
+
+const retention_cases = [_]RetentionCase{
+    .{ .name = "OR-1 age, count and byte candidates compete", .initial_max = 10, .arrivals = &([_]Arrival{.{ .subject = 2 }} ++ repeatArrival(6, .{ .subject = 0 }) ++ repeatArrival(9, .{ .subject = 1, .evidence = 2048 }) ++ repeatArrival(6, .{ .subject = 0 })), .checks = &.{.{ .policies = &.{10}, .cutoff = 1 }} },
+    .{ .name = "OR-2 consumer lag keeps the eligible detail after the fence", .initial_max = 1, .arrivals = &.{ .{ .subject = 1 }, .{ .subject = 0 }, .{ .subject = 0 } }, .checks = &.{.{ .policies = &.{1}, .fence = 1 }} },
+    .{ .name = "OR-3 partial rebuild lowering 10 to 1 deletes sequence 1 first", .initial_max = 10, .arrivals = &.{ .{ .subject = 1 }, .{ .subject = 0 }, .{ .subject = 1 }, .{ .subject = 0 } }, .checks = &.{.{ .policies = &.{1} }} },
+    .{ .name = "OR-4 raising 1 to 10 drops the stale candidate", .initial_max = 1, .arrivals = &.{ .{ .subject = 0 }, .{ .subject = 0 }, .{ .subject = 1 } }, .checks = &.{.{ .policies = &.{10} }} },
+    .{ .name = "OR-5 lower, raise and lower again with superseded builds", .initial_max = 10, .arrivals = &.{ .{ .subject = 0 }, .{ .subject = 1 }, .{ .subject = 0 }, .{ .subject = 1 }, .{ .subject = 0 } }, .checks = &.{ .{ .policies = &.{ 1, 10, 1 } }, .{ .arrivals = &.{ .{ .subject = 1 }, .{ .subject = 1 } }, .policies = &.{ 10, 2 } } } },
+    .{ .name = "OR-6 only non-NULL evidence is a byte candidate", .initial_max = 20, .arrivals = &(repeatArrival(2, .{ .subject = 0 }) ++ repeatArrival(8, .{ .subject = 0, .evidence = 2048 })), .checks = &.{ .{ .policies = &.{20} }, .{ .arrivals = &.{.{ .subject = 0, .evidence = 1 }}, .policies = &.{20} } } },
+    .{ .name = "OR-7 limit 0 makes every subject detail a candidate", .initial_max = 10, .arrivals = &.{ .{ .subject = 0 }, .{ .subject = 1 }, .{ .subject = 0 } }, .checks = &.{.{ .policies = &.{0} }} },
+    .{ .name = "OR-7 limit 10 deletes only the eleventh", .initial_max = 10, .arrivals = &(repeatArrival(11, .{ .subject = 0 }) ++ [_]Arrival{.{ .subject = 1 }}), .checks = &.{.{ .policies = &.{10} }} },
+    .{ .name = "OR-7 limit 1024 deletes nothing", .initial_max = 10, .arrivals = &repeatArrival(11, .{ .subject = 0 }), .checks = &.{.{ .policies = &.{1024} }} },
+    .{ .name = "OR-8 an advancing cutoff chooses the earlier newly eligible sequence", .initial_max = 1, .arrivals = &.{ .{ .subject = 0 }, .{ .subject = 1 }, .{ .subject = 1 }, .{ .subject = 2 } }, .checks = &.{ .{ .policies = &.{1} }, .{ .policies = &.{1}, .cutoff = 1 }, .{ .policies = &.{1}, .cutoff = 4 } } },
+    .{ .name = "OR-9 a live insert competes from the next transaction", .initial_max = 1, .arrivals = &.{ .{ .subject = 0 }, .{ .subject = 0 } }, .checks = &.{ .{ .policies = &.{1} }, .{ .arrivals = &.{.{ .subject = 0 }}, .policies = &.{1} } } },
+};
+
+fn retentionPublished(store: *durable.Store) !bool {
+    return try scalar(store, "SELECT state FROM retention_policy WHERE id=1;") == 2;
+}
+
+test "native effect history store: schema 24 retention deletes exactly the shipped predicate's ascending vector" {
+    // Guards the replacement selector: any order, fence, policy-generation or summary drift
+    // from the shipped one-row predicate is a deletion the old daemon would not have made.
+    var deleted_total: usize = 0;
+    for (retention_cases) |case| {
+        errdefer std.debug.print("retention case: {s}\n", .{case.name});
+        var world: RetainedHistory = undefined;
+        try world.init(case.initial_max);
+        defer world.deinit();
+        world.f.store.test_hooks.retention_sweep_rows = 1;
+        for (case.arrivals) |arrival| try world.arrive(arrival);
+        for (case.checks) |check| {
+            for (check.arrivals) |arrival| try world.arrive(arrival);
+            try world.consumeTo(check.fence orelse world.head);
+            const cutoff = if (check.cutoff) |sequence| world.confirmed_at[sequence] else 0;
+            const final = check.policies[check.policies.len - 1];
+            const before = try DetailSet.read(&world.f.store);
+            var removed: [256]i64 = undefined;
+            // A partial or superseded candidate generation never deletes.
+            for (check.policies[0 .. check.policies.len - 1]) |superseded| {
+                _ = try world.f.store.setRetentionPolicy(superseded);
+                const outcome = try world.f.store.historyRetentionStep(.{ .age_us = 0, .max_matches = superseded }, cutoff);
+                try t.expect(outcome == .rebuilt or outcome == .published);
+                try t.expectEqual(@as(usize, 0), try DetailSet.removed(before, try DetailSet.read(&world.f.store), &removed));
+            }
+            _ = try world.f.store.setRetentionPolicy(final);
+            while (!try retentionPublished(&world.f.store)) {
+                const outcome = try world.f.store.historyRetentionStep(.{ .age_us = 0, .max_matches = final }, cutoff);
+                try t.expect(outcome == .rebuilt or outcome == .published);
+                try t.expectEqual(@as(usize, 0), try DetailSet.removed(before, try DetailSet.read(&world.f.store), &removed));
+            }
+            try expectSummariesExact(&world.f.store);
+            var expected: [256]i64 = undefined;
+            const expected_count = try shippedVector(&world.f.store, @intCast(world.consumed), cutoff, final, &expected);
+            for (expected[0..expected_count], 0..) |sequence, i| if (i > 0) try t.expect(expected[i - 1] < sequence);
+            const outcome = try world.f.store.historyRetentionStep(.{ .age_us = 0, .max_matches = final }, cutoff);
+            try t.expectEqual(@as(@TypeOf(outcome), if (expected_count == 0) .idle else .details), outcome);
+            const removed_count = try DetailSet.removed(before, try DetailSet.read(&world.f.store), &removed);
+            try t.expectEqualSlices(i64, expected[0..expected_count], removed[0..removed_count]);
+            try expectSummariesExact(&world.f.store);
+            deleted_total += removed_count;
+        }
+    }
+    try t.expect(deleted_total >= 12);
+}
+
+const outcome_kinds = [_]@import("engine_test").core.native_action_outcome.Kind{ .enforcement, .notification };
+
+// The runtime settles a confirmed decision's outcomes; tests do it directly.
+fn settleOutcomes(store: *durable.Store, decision: effects.Hash, clock: *Clock) !void {
+    for (outcome_kinds) |kind| {
+        try store.markActionTargetDispatched(decision, kind, clock.value());
+        try store.settleActionTarget(decision, kind, .confirmed, clock.value());
+    }
+}
+
+fn ownerOf(store: *durable.Store, subject: detection.Subject, jail: []const u8) !effects.Owner {
+    const entry = try effectForSubject(store, subject);
+    return (try store.currentOwner(entry.scope_key, jail)) orelse error.MissingOwner;
+}
+
+fn dispatchAndSettle(store: *durable.Store, subject: detection.Subject, clock: *Clock) !void {
+    const entry = try effectForSubject(store, subject);
+    _ = try store.settleOutcome(entry.token(), clock.now, observation(entry, clock.now), clock.value());
+}
+
+fn stateDigest(store: *durable.Store) ![32]u8 {
+    var row = try store.statement("SELECT coalesce((SELECT group_concat(sequence||':'||hex(event_id),',') FROM (SELECT * FROM confirmed_event_details ORDER BY sequence)),'')||'|'||coalesce((SELECT group_concat(family||':'||hex(subject)||':'||detail_count||':'||evidence_bytes||':'||earliest_sequence||':'||coalesce(earliest_evidence_sequence,'-')||':'||coalesce(candidate_sequence,'-')||':'||evaluated_generation,',') FROM (SELECT * FROM retained_subject_summaries ORDER BY family,subject)),'')||'|'||(SELECT retained_from||':'||head||':'||revision FROM confirmed_history_stream)||'|'||(SELECT count(*) FROM confirmed_effect_events)||'|'||(SELECT generation||':'||max_matches||':'||state||':'||sweep_cursor FROM retention_policy);");
+    defer row.deinit();
+    if (!try row.row()) return error.TestSqlFailed;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(try row.bytes(0), &digest, .{});
+    return digest;
+}
+
+fn countOf(store: *durable.Store, comptime table: []const u8) !i64 {
+    return scalar(store, "SELECT count(*) FROM " ++ table ++ ";");
+}
+
+// A consumer checkpoint at `sequence`, written directly: retention reads only its fence.
+fn setFence(world: *RetainedHistory, sequence: u64) !void {
+    const checkpoint = history.Checkpoint{ .generation = world.owner.manifest().source_generation, .installation = world.f.installation.id, .last_sequence = sequence, .total_confirmed = sequence, .confirmed_watermark_us = world.clock.now, .rolling_digest = [_]u8{1} ** 32 };
+    var row = try world.f.store.statement("UPDATE consumer_checkpoints SET payload=?1 WHERE kind=5 AND jail='@history' AND source='confirmed-effects' AND rule='checkpoint';");
+    defer row.deinit();
+    try row.blob(1, &try checkpoint.encode());
+    try row.done();
+}
+
+// Consumed-history filler with its own provenance; the append trigger sequences it.
+fn fillEvents(store: *durable.Store, count: i64, confirmed_us: i64) !void {
+    var row = try store.statement("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<?1) INSERT INTO confirmed_effect_events(event_id,scope_key,jail,decision_id,confirmed_us,canonical_scope) SELECT randomblob(32),randomblob(32),'filler',randomblob(32),?2,(SELECT canonical_scope FROM native_effects LIMIT 1) FROM n;");
+    defer row.deinit();
+    try row.int(1, count);
+    try row.int(2, confirmed_us);
+    try row.done();
+}
+
+test "native effect history store: reconfirmation after the stream prune never counts or appends twice" {
+    // Failure: with the event as the only deduplication key, pruning it lets the next
+    // readback of a still-live decision append again and increment its policy count; a
+    // reinstated decision whose event is retained must gain only its marker.
+    var world: RetainedHistory = undefined;
+    try world.init(10);
+    defer world.deinit();
+    const store = &world.f.store;
+    const subject = RetainedHistory.subject(0);
+    try world.arrive(.{ .subject = 0, .evidence = 16 });
+    try settleOutcomes(store, (try ownerOf(store, subject, "r0")).decision_id, &world.clock);
+    try world.consumeTo(world.head);
+    try t.expectEqual(.details, try store.historyRetentionStep(.{ .age_us = 0, .max_matches = 10 }, world.clock.now));
+    try t.expectEqual(.prefix, try store.historyRetentionStep(.{ .age_us = 0, .max_matches = 10 }, world.clock.now));
+    try t.expectEqual(@as(i64, 0), try countOf(store, "confirmed_effect_events"));
+    try t.expect((try ownerOf(store, subject, "r0")).lease.live(world.clock.now));
+
+    world.clock.now += 1_000_000;
+    const applied = try effectForSubject(store, subject);
+    _ = try store.settleOutcome(applied.token(), world.clock.now, observation(applied, world.clock.now), world.clock.value());
+    try t.expectEqual(@as(i64, 1), try scalar(store, "SELECT head FROM confirmed_history_stream;"));
+    try t.expectEqual(@as(i64, 0), try countOf(store, "confirmed_effect_events"));
+    try t.expectEqual(@as(i64, 1), try scalar(store, "SELECT confirmed_count FROM confirmed_policy_summaries WHERE jail='r0';"));
+
+    // A -> B -> A on one owner while A's event is still retained.
+    const scope = try effects.Scope.host(.{ .v4 = .{ 198, 51, 100, 200 } });
+    const decisions = [_]effects.Hash{ [_]u8{0xa} ** 32, [_]u8{0xb} ** 32, [_]u8{0xa} ** 32 };
+    const heads = [_]i64{ 2, 3, 3 };
+    for (decisions, heads) |decision, head| {
+        world.clock.now += 1_000_000;
+        const current = try store.currentOwner(try scope.key(world.f.installation), "swap");
+        const entry = try store.setOwner(.{ .scope = scope, .jail = "swap", .generation = [_]u8{3} ** 32, .decision_id = decision, .expected_revision = if (current) |owner| owner.revision else 0, .lease = .permanent, .decided_us = world.clock.now }, world.clock.value());
+        _ = try store.settleOutcome(entry.token(), world.clock.now, observation(entry, world.clock.now), world.clock.value());
+        try t.expectEqual(head, try scalar(store, "SELECT head FROM confirmed_history_stream;"));
+    }
+    try t.expectEqual(@as(i64, 1), try scalar(store, "SELECT count(*) FROM confirmed_effect_events WHERE jail='swap' AND decision_id=x'0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a';"));
+    try t.expectEqual(@as(i64, 1), try scalar(store, "SELECT count(*) FROM confirmation_markers WHERE jail='swap' AND decision_id=x'0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a';"));
+}
+
+test "native effect history store: a full reserve refuses admission as backpressure until expiry and reclamation free it" {
+    // Failure: at the boundary an admission used to take the rows its owners' expiry needs,
+    // or fail with a capacity error that latched intervention. The refusal must keep the
+    // receipt, expiry must still complete, and admission must resume unaided.
+    var world: RetainedHistory = undefined;
+    try world.init(10);
+    defer world.deinit();
+    const store = &world.f.store;
+    const short = retry.Policy{ .maxretry = 1, .window_us = 60_000_000, .duration = .{ .finite_us = 10_000_000 }, .max_subjects = 8, .enforce = true };
+    try store.admitRetry("short", [_]u8{3} ** 32, short);
+    _ = try store.commitRecord(try nativeRecord(store, &world.clock, "short", "first", 0, RetainedHistory.subject(0), short, null));
+    try dispatchAndSettle(store, RetainedHistory.subject(0), &world.clock);
+    const held = try ownerOf(store, RetainedHistory.subject(0), "short");
+    try settleOutcomes(store, held.decision_id, &world.clock);
+    // Obsolete revisions of another decision leave room for the live owner's expiry only.
+    const fill = effects.max_owner_revisions - 2 - try countOf(store, "effect_owner_revisions");
+    {
+        var row = try store.statement("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<?1) INSERT INTO effect_owner_revisions SELECT o.scope_key,o.jail,o.generation,randomblob(32),o.revision+1000000+x,o.lease_kind,o.deadline_us,o.decided_us FROM effect_owners o,n;");
+        defer row.deinit();
+        try row.int(1, fill);
+        try row.done();
+    }
+    world.clock.now += 1_000_000;
+    const name = try world.jail(0);
+    const record = try nativeRecord(store, &world.clock, name, "refused", 0, RetainedHistory.subject(1), retention_policy, null);
+    const receipt = durable.ReceiptIdentity{ .jail = name, .source = "file", .occurrence = "refused", .cursor = "refused", .raw_hash = [_]u8{4} ** 32, .generation = [_]u8{3} ** 32 };
+    try t.expectError(error.ReserveBackpressure, store.commitRecord(record));
+    try t.expect(try store.pendingReceipt(receipt) != null);
+    try t.expect(!store.reopen_required);
+
+    world.clock.now = held.lease.finite + 1;
+    const expiring = try effectForSubject(store, RetainedHistory.subject(0));
+    _ = try store.prepareExpiry(expiring.scope_key, expiring.revision, world.clock.value());
+    try t.expectEqual(effects.Lease.absent, (try ownerOf(store, RetainedHistory.subject(0), "short")).lease);
+    try t.expectError(error.ReserveBackpressure, store.commitRecord(record));
+    while (try store.reclaimObsoleteOne() != .idle) {}
+    try t.expectEqual(durable.CommitResult.committed, try store.commitRecord(record));
+    try t.expect(try store.pendingReceipt(receipt) == null);
+    try t.expectEqual(@as(i64, 2), try countOf(store, "effect_owner_revisions"));
+}
+
+test "native effect history store: history at the overload threshold prunes consumed events first and admitted work still settles" {
+    // Failure: a full event table failed confirmation and blocked enforcement proof. Only
+    // consumed history may give way; an admitted owner's confirmation must always fit.
+    var world: RetainedHistory = undefined;
+    try world.init(10);
+    defer world.deinit();
+    const store = &world.f.store;
+    const young = world.clock.now;
+    const retention = durable.Store.HistoryRetention{ .age_us = 86_400_000_000, .max_matches = 10 };
+    const held_scope = try effects.Scope.host(RetainedHistory.subject(7));
+    const held = try store.setOwner(.{ .scope = held_scope, .jail = "held", .generation = [_]u8{3} ** 32, .decision_id = [_]u8{7} ** 32, .expected_revision = 0, .lease = .permanent, .decided_us = young }, world.clock.value());
+    try fillEvents(store, durable.Store.history_overload_events, young);
+    try setFence(&world, 40_000);
+    try t.expectEqual(.prefix, try store.historyRetentionStep(retention, young));
+    try t.expectEqual(durable.Store.history_overload_events - 1, try countOf(store, "confirmed_effect_events"));
+    try t.expectEqual(@as(i64, 2), try scalar(store, "SELECT retained_from FROM confirmed_history_stream;"));
+    _ = try store.settleOutcome(held.token(), world.clock.now, observation(held, young), world.clock.value());
+    try t.expectEqual(.prefix, try store.historyRetentionStep(retention, young));
+    try t.expectEqual(.idle, try store.historyRetentionStep(retention, young));
+    try t.expectEqual(@as(i64, 3), try scalar(store, "SELECT retained_from FROM confirmed_history_stream;"));
+
+    // A lagging consumer: nothing unconsumed is pruned, admission keeps each admitted
+    // owner's confirmation in reserve, and that owner still confirms at the cap.
+    const lagging_scope = try effects.Scope.host(RetainedHistory.subject(6));
+    const lagging = try store.setOwner(.{ .scope = lagging_scope, .jail = "held", .generation = [_]u8{3} ** 32, .decision_id = [_]u8{6} ** 32, .expected_revision = 0, .lease = .permanent, .decided_us = young }, world.clock.value());
+    try setFence(&world, 2);
+    try fillEvents(store, effects.max_confirmed_events - 1 - try countOf(store, "confirmed_effect_events"), young);
+    const before = try stateDigest(store);
+    try t.expectEqual(.idle, try store.historyRetentionStep(retention, young));
+    try t.expectEqualSlices(u8, &before, &try stateDigest(store));
+    try t.expectError(error.ReserveBackpressure, store.setOwner(.{ .scope = try effects.Scope.host(RetainedHistory.subject(5)), .jail = "held", .generation = [_]u8{3} ** 32, .decision_id = [_]u8{5} ** 32, .expected_revision = 0, .lease = .permanent, .decided_us = young }, world.clock.value()));
+    _ = try store.settleOutcome(lagging.token(), world.clock.now, observation(lagging, young), world.clock.value());
+    try t.expectEqual(@as(i64, effects.max_confirmed_events), try countOf(store, "confirmed_effect_events"));
+}
+
+// The store's work guard checked on every VM step, so a zero selection budget interrupts
+// the first selection statement itself.
+fn everyStepProgress(context: ?*anyopaque) callconv(.c) c_int {
+    const store: *durable.Store = @ptrCast(@alignCast(context.?));
+    if (store.work_remaining == 0) return 1;
+    store.work_remaining -= 1;
+    return 0;
+}
+extern fn sqlite3_progress_handler(db: *anyopaque, instructions: c_int, callback: ?*const fn (?*anyopaque) callconv(.c) c_int, context: ?*anyopaque) void;
+
+test "native effect history store: interrupted selection, failed writes and failed commit leave retention state unchanged" {
+    // Failure: a page that deleted a detail without its summary or stream update, or an
+    // interruption after a write treated as a harmless yield.
+    var world: RetainedHistory = undefined;
+    try world.init(1);
+    defer world.deinit();
+    const store = &world.f.store;
+    for ([_]u8{ 0, 0, 0, 1 }) |subject| try world.arrive(.{ .subject = subject });
+    try world.consumeTo(world.head);
+    const retention = durable.Store.HistoryRetention{ .age_us = 86_400_000_000, .max_matches = 1 };
+    const unchanged = try stateDigest(store);
+
+    // The named pre-write yield halves the page; at one row it is an actionable failure.
+    try store.configureRuntimeLimits();
+    sqlite3_progress_handler(@ptrCast(store.db), 1, everyStepProgress, store);
+    store.test_hooks.retention_select_work = 0;
+    try t.expectEqual(.yielded, try store.historyRetentionStep(retention, world.clock.now));
+    try t.expectEqual(durable.max_retention_page / 2, store.retention_page);
+    store.retention_page = 1;
+    try t.expectError(error.MaintenanceWorkExhausted, store.historyRetentionStep(retention, world.clock.now));
+    store.test_hooks.retention_select_work = null;
+    store.retention_page = durable.max_retention_page;
+    try store.configureRuntimeLimits();
+    try t.expect(!store.reopen_required);
+    try t.expectEqualSlices(u8, &unchanged, &try stateDigest(store));
+
+    for ([_]durable.CommitStage{ .after_history_detail_delete, .before_history_retention_commit }) |stage| {
+        store.fail_at = stage;
+        try t.expectError(error.InjectedFailure, store.historyRetentionStep(retention, world.clock.now));
+        store.fail_at = null;
+        try t.expectEqualSlices(u8, &unchanged, &try stateDigest(store));
+    }
+    try t.expectEqual(.details, try store.historyRetentionStep(retention, world.clock.now));
+    try expectSummariesExact(store);
+    try t.expectEqual(@as(i64, 2), try countOf(store, "confirmed_event_details"));
+
+    // The stream prefix page rolls back as a unit too.
+    for ([_]u8{ 0, 1 }) |subject| try settleOutcomes(store, (try ownerOf(store, RetainedHistory.subject(subject), "r0")).decision_id, &world.clock);
+    for (1..3) |index| try settleOutcomes(store, (try ownerOf(store, RetainedHistory.subject(0), try world.jail(index))).decision_id, &world.clock);
+    const aged = durable.Store.HistoryRetention{ .age_us = 0, .max_matches = 1 };
+    // The two remaining details are deleted by age first.
+    try t.expectEqual(.details, try store.historyRetentionStep(aged, world.clock.now));
+    const prefix_before = try stateDigest(store);
+    store.fail_at = .after_history_event_delete;
+    try t.expectError(error.InjectedFailure, store.historyRetentionStep(aged, world.clock.now));
+    store.fail_at = null;
+    try t.expectEqualSlices(u8, &prefix_before, &try stateDigest(store));
+    try t.expectEqual(.prefix, try store.historyRetentionStep(aged, world.clock.now));
+    try t.expectEqual(@as(i64, 0), try countOf(store, "confirmed_effect_events"));
+}
+
+test "native effect history store: reused, permanent and multi-jail scopes keep counters and expiry through reclamation" {
+    // Failure: a scope that is never spent (a permanent owner in one jail, a reused finite
+    // owner in another) accumulated obsolete lifecycle rows forever; reclaiming them must
+    // not touch current revisions, intents, deadlines or confirmation counts.
+    var world: RetainedHistory = undefined;
+    try world.init(10);
+    defer world.deinit();
+    const store = &world.f.store;
+    const subject = RetainedHistory.subject(0);
+    const permanent = retry.Policy{ .maxretry = 1, .window_us = 60_000_000, .duration = .permanent, .max_subjects = 8, .enforce = true };
+    const short = retry.Policy{ .maxretry = 1, .window_us = 1_000_000, .duration = .{ .finite_us = 10_000_000 }, .max_subjects = 8, .enforce = true };
+    try store.admitRetry("perm", [_]u8{3} ** 32, permanent);
+    try store.admitRetry("short", [_]u8{3} ** 32, short);
+    _ = try store.commitRecord(try nativeRecord(store, &world.clock, "perm", "p", 0, subject, permanent, null));
+    try dispatchAndSettle(store, subject, &world.clock);
+    try settleOutcomes(store, (try ownerOf(store, subject, "perm")).decision_id, &world.clock);
+    const cycles = 4;
+    var deadline: i64 = 0;
+    for (0..cycles) |cycle| {
+        world.clock.now += 2_000_000;
+        var occurrence: [8]u8 = undefined;
+        _ = try store.commitRecord(try nativeRecord(store, &world.clock, "short", try std.fmt.bufPrint(&occurrence, "s{d}", .{cycle}), cycle, subject, short, null));
+        try dispatchAndSettle(store, subject, &world.clock);
+        const owner = try ownerOf(store, subject, "short");
+        try settleOutcomes(store, owner.decision_id, &world.clock);
+        deadline = owner.lease.finite;
+        if (cycle + 1 == cycles) break;
+        world.clock.now = deadline + 1;
+        const expiring = try effectForSubject(store, subject);
+        _ = try store.prepareExpiry(expiring.scope_key, expiring.revision, world.clock.value());
+        try dispatchAndSettle(store, subject, &world.clock);
+    }
+    while (try store.reclaimObsoleteOne() != .idle) {}
+    try t.expectEqual(@as(i64, cycles), try scalar(store, "SELECT confirmed_count FROM confirmed_policy_summaries WHERE jail='short';"));
+    try t.expectEqual(@as(i64, 1), try scalar(store, "SELECT confirmed_count FROM confirmed_policy_summaries WHERE jail='perm';"));
+    try t.expectEqual(@as(i64, 2), try countOf(store, "effect_owner_revisions"));
+    try t.expectEqual(@as(i64, 1), try countOf(store, "effect_intents"));
+    try t.expectEqual(@as(i64, 4), try countOf(store, "action_targets"));
+    try t.expect(try countOf(store, "effect_observations") <= 4);
+    try t.expectEqual(deadline, (try ownerOf(store, subject, "short")).lease.finite);
+    try t.expectEqual(effects.Lease.permanent, (try ownerOf(store, subject, "perm")).lease);
+    try t.expectEqual(effects.Lease.permanent, (try effectForSubject(store, subject)).desired);
+    try t.expectEqual(@as(i64, 2), try scalar(store, "SELECT live FROM effect_owner_live;"));
+    try t.expectEqual(@as(?durable.Store.LiveOwnerRecount, null), try store.reconcileLiveOwners());
+}
+
+test "native effect history store: startup recount repairs a drifted live-owner counter and refuses altered triggers" {
+    // Failure: the reserve trusts a derived counter; drift must be repaired before admission
+    // and a missing maintenance trigger refused rather than silently recounted forever.
+    var world: RetainedHistory = undefined;
+    try world.init(10);
+    defer world.deinit();
+    const store = &world.f.store;
+    try world.arrive(.{ .subject = 0 });
+    try sql(store, "UPDATE effect_owner_live SET live=5;");
+    try t.expectEqual(durable.Store.LiveOwnerRecount{ .stored = 5, .counted = 1 }, (try store.reconcileLiveOwners()).?);
+    try t.expectEqual(@as(?durable.Store.LiveOwnerRecount, null), try store.reconcileLiveOwners());
+    try sql(store, "DROP TRIGGER effect_owner_live_delete;");
+    try t.expectError(error.LiveOwnerCounterInvalid, store.reconcileLiveOwners());
+}
+
+test "native effect history store: a spent scope is pruned while its confirmed history stays readable" {
+    // Failure: retained events referenced the scope row, so a spent scope waited for its
+    // history to age out and page readers lost events whose scope had been pruned.
+    var world: RetainedHistory = undefined;
+    try world.init(10);
+    defer world.deinit();
+    const store = &world.f.store;
+    const subject = RetainedHistory.subject(0);
+    try world.arrive(.{ .subject = 0, .evidence = 8 });
+    const owner = try ownerOf(store, subject, "r0");
+    try settleOutcomes(store, owner.decision_id, &world.clock);
+    world.clock.now = owner.lease.finite + 1;
+    const expiring = try effectForSubject(store, subject);
+    _ = try store.prepareExpiry(expiring.scope_key, expiring.revision, world.clock.value());
+    try dispatchAndSettle(store, subject, &world.clock);
+    try world.consumeTo(world.head);
+    const request = durable.Store.MaintenanceRequest{ .retention = .{ .age_us = 86_400_000_000, .max_matches = 10 }, .now_us = world.clock.now, .history_caught_up = true, .spent_scopes = true };
+    var spent = false;
+    var steps: usize = 0;
+    while (steps < 64) : (steps += 1) switch (try store.maintenanceStep(request)) {
+        .idle => break,
+        .progress => |operation| spent = spent or operation == .spent_scopes,
+        .wait => return error.TestUnexpectedWait,
+    };
+    try t.expect(spent);
+    try t.expectEqual(@as(i64, 0), try countOf(store, "native_effects"));
+    try t.expectEqual(@as(i64, 1), try countOf(store, "confirmed_effect_events"));
+    var events: [1]history.Event = undefined;
+    const page = try store.confirmedEffectPage(world.f.installation, 0, null, &events);
+    try t.expectEqual(@as(usize, 1), page.count);
+    try t.expect(std.meta.eql(events[0].scope, try effects.Scope.host(subject)));
+    var rows: [1]application.Event = undefined;
+    const detailed = try store.applicationHistoryPage(t.allocator, world.f.installation, .{}, &rows);
+    defer for (rows[0..detailed.count]) |*row| row.deinit(t.allocator);
+    try t.expect(rows[0].detail != null);
 }

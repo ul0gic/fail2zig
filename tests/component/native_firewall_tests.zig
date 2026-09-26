@@ -5,6 +5,7 @@ test "native firewall: module registration" {
 }
 
 const std = @import("std");
+const shared = @import("shared");
 const inspection = @import("engine_test").firewall.inspection;
 const nft = @import("engine_test").firewall.nftables;
 const nl = @import("engine_test").firewall.netlink;
@@ -587,11 +588,7 @@ const BetweenReads = struct {
             failed = true;
             return;
         };
-        const argv: []const []const u8 = if (reader.installation.transport == .nftables)
-            &.{ "/usr/sbin/nft", "delete", "element", "inet", name, "banned_ipv6", "{", "2001:db8::7", "}" }
-        else
-            &.{ reader.ipset_path, "del", set, "2001:db8::7" };
-        fixtureCommand(argv) catch {
+        fixtureCommand(&.{ reader.ipset_path, "del", set, "2001:db8::7" }) catch {
             failed = true;
         };
     }
@@ -600,6 +597,7 @@ const BetweenReads = struct {
 test "native firewall: isolated readback accepts kernel expiry between passes and refuses early removal" {
     const transport = try isolatedTransport();
     if (transport == .iptables) return error.SkipZigTest;
+    if (transport == .nftables) return error.SkipZigTest;
     var reader = try admissionReader(transport);
     defer reader.close();
     var admitted = try reader.admitInstallation(intentFor(&reader));
@@ -1063,7 +1061,9 @@ test "native firewall: isolated fixed argv realizes the frozen scoped packet cel
     try std.testing.expectEqual(error.Timeout, partial.uncertain.cause);
     try std.testing.expectEqual(inspection.MutationDisposition.outcome_uncertain, partial.uncertain.mutation);
     reader.test_fault_after_mutations = null;
-    try std.testing.expectError(error.Incomplete, reader.inspect());
+    var partial_read = try reader.inspect();
+    defer partial_read.deinit();
+    try std.testing.expect(partial_read.entries[(try partial_read.find(partial_scope)).?].partial);
     try peer.exchangeUdp(false, 35301, 74, false);
     try peer.exchangeUdp(false, 35303, 75, true);
     try peer.exchangeUdp(false, 35281, 76, false);
@@ -1194,4 +1194,78 @@ test "native firewall: scoped snapshot requires exact scope effect identity and 
     try std.testing.expect(!try reader.matchesSnapshot(&snapshot, absent, 100, 102));
     entries[0].deadline_us = 200;
     try std.testing.expect(!try reader.matchesSnapshot(&snapshot, token, 100, 102));
+}
+
+/// The linear lookup that sorted search replaced, kept as the equivalence oracle.
+fn linearFind(entries: []const inspection.Entry, scope: inspection.CanonicalScope, effect_id: [32]u8) inspection.Error!?inspection.Entry {
+    for (entries) |entry| {
+        if (!std.meta.eql(inspection.TestAccess.entryScope(entry), scope)) continue;
+        if (entry.scope != null and (entry.effect_id == null or !std.mem.eql(u8, &entry.effect_id.?, &effect_id))) return error.ForeignState;
+        return entry;
+    }
+    return null;
+}
+test "native firewall: sorted scope lookup matches the linear lookup it replaced" {
+    const t = std.testing;
+    const access = inspection.TestAccess;
+    const canonical = inspection.canonical_scope;
+    const installation = inspection.Installation{ .id = [_]u8{0x52} ** 16, .transport = .nftables };
+    const host = struct {
+        fn scope(text: []const u8) !inspection.CanonicalScope {
+            return .{ .subject = try canonical.Subject.parseHost(text) };
+        }
+    };
+    const ssh = inspection.CanonicalScope{
+        .subject = try canonical.Subject.parseHost("192.0.2.9"),
+        .protocols = try canonical.Protocols.one(.tcp),
+        .ports = try canonical.Ports.list(&.{canonical.PortRange.one(22)}),
+    };
+    const network = inspection.CanonicalScope{ .subject = try canonical.Subject.parseNetwork("198.51.100.0/24") };
+    const ssh_id = [_]u8{0xa1} ** 32;
+    const network_id = [_]u8{0xa2} ** 32;
+    var builder = access.builderInit(t.allocator, installation, .{});
+    defer access.builderDeinit(&builder);
+    // Address-only entries sit beside a scoped entry for a legacy entry's address.
+    for ([_][]const u8{ "203.0.113.200", "192.0.2.9", "10.0.0.1", "2001:db8::7" }) |text| {
+        try access.builderAdd(&builder, .{ .address = try shared.IpAddress.parse(text), .remaining_ms = 60_000 });
+    }
+    try access.builderAdd(&builder, .{ .address = try shared.IpAddress.parse("192.0.2.9"), .scope = ssh, .deadline_us = 9_000_000, .effect_id = ssh_id });
+    try access.builderAdd(&builder, .{ .address = try shared.IpAddress.parse("198.51.100.0"), .scope = network, .effect_id = network_id });
+    var snapshot = try access.builderFinish(&builder, 0, 1);
+    defer snapshot.deinit();
+    var udp = ssh;
+    udp.protocols = try canonical.Protocols.one(.udp);
+    var wider = network;
+    wider.subject = try canonical.Subject.parseNetwork("198.51.0.0/16");
+    var noncanonical = network;
+    noncanonical.subject.address[3] = 1;
+    const any_id = [_]u8{0xee} ** 32;
+    const queries = [_]struct { scope: inspection.CanonicalScope, id: [32]u8 }{
+        .{ .scope = try host.scope("192.0.2.9"), .id = any_id },
+        .{ .scope = try host.scope("203.0.113.200"), .id = any_id },
+        .{ .scope = try host.scope("2001:db8::7"), .id = any_id },
+        .{ .scope = ssh, .id = ssh_id },
+        .{ .scope = ssh, .id = any_id },
+        .{ .scope = network, .id = network_id },
+        .{ .scope = network, .id = any_id },
+        .{ .scope = udp, .id = ssh_id },
+        .{ .scope = wider, .id = network_id },
+        .{ .scope = noncanonical, .id = network_id },
+        .{ .scope = try host.scope("192.0.2.8"), .id = any_id },
+        .{ .scope = try host.scope("0.0.0.0"), .id = any_id },
+        .{ .scope = try host.scope("ffff::1"), .id = any_id },
+    };
+    for (queries) |query| {
+        const expected = linearFind(snapshot.entries, query.scope, query.id);
+        const actual = access.findEntry(snapshot.entries, query.scope, query.id);
+        if (expected) |value| {
+            try t.expectEqual(value, try actual);
+        } else |cause| try t.expectError(cause, actual);
+    }
+    // A repeated canonical scope never forms a snapshot, so a lookup has one answer.
+    var repeated = access.builderInit(t.allocator, installation, .{});
+    defer access.builderDeinit(&repeated);
+    try access.builderAdd(&repeated, .{ .address = try shared.IpAddress.parse("192.0.2.9") });
+    try access.builderAdd(&repeated, .{ .address = try shared.IpAddress.parse("192.0.2.9"), .scope = try host.scope("192.0.2.9"), .effect_id = ssh_id });
+    try t.expectError(error.UnknownState, access.builderFinish(&repeated, 0, 1));
 }

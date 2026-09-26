@@ -592,3 +592,64 @@ test "native readiness: std.log sink formats level, scope and truncates oversize
     try testing.expect(std.mem.endsWith(u8, out, log_target.truncation_marker));
     try testing.expectEqual(@as(usize, "warning: ipc: peer uid=7\ninfo(storage): committed 3\n".len + log_target.max_line_bytes), out.len);
 }
+
+const FakeClock = struct {
+    usec: ?u64 = 1_000_000,
+    fn read(context: ?*anyopaque) ?u64 {
+        const self: *FakeClock = @ptrCast(@alignCast(context.?));
+        return self.usec;
+    }
+};
+
+test "native readiness: startup progress extends only for new work and never after finish" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = testing.allocator;
+    var dir = try TmpPath.init(a);
+    defer dir.deinit(a);
+    const path = try dir.join(a, "notify");
+    defer a.free(path);
+    const rx = try Receiver.bindPath(path);
+    defer rx.deinit();
+    var n = try sd_notify.Notifier.initWithPath(path);
+    defer n.deinit();
+    var clock = FakeClock{};
+    var progress = sd_notify.Progress{ .notifier = &n, .clock_context = &clock, .clock = FakeClock.read };
+    var buf: [600]u8 = undefined;
+
+    // The first report sends at once, ahead of any initial deadline.
+    progress.report(.admission, "admission", 0, 0);
+    try testing.expectEqualStrings("EXTEND_TIMEOUT_USEC=30000000\nSTATUS=admission 0\n", try rx.recv(&buf));
+    // A new phase is progress and bypasses the cadence.
+    clock.usec.? += 1_000_000;
+    progress.report(.schema, "schema", 0, 0);
+    try testing.expectEqualStrings("EXTEND_TIMEOUT_USEC=30000000\nSTATUS=schema 0\n", try rx.recv(&buf));
+    // Progress inside the cadence is held; a later repeat of the same count sends it,
+    // shortened by its age so the deadline stays 30 s after the work happened.
+    clock.usec.? += 2_000_000;
+    progress.report(.schema, "schema", 5, 20);
+    try rx.expectNothing();
+    clock.usec.? += 9_000_000;
+    progress.report(.schema, "schema", 5, 20);
+    try testing.expectEqualStrings("EXTEND_TIMEOUT_USEC=21000000\nSTATUS=schema 5/20\n", try rx.recv(&buf));
+    // A stall — repeated, lower or earlier-phase counts — sends nothing.
+    clock.usec.? += 11_000_000;
+    progress.report(.schema, "schema", 5, 20);
+    progress.report(.schema, "schema", 3, 20);
+    progress.report(.admission, "admission", 99, 0);
+    try rx.expectNothing();
+    progress.report(.schema, "schema", 6, 20);
+    try testing.expectEqualStrings("EXTEND_TIMEOUT_USEC=30000000\nSTATUS=schema 6/20\n", try rx.recv(&buf));
+    // Held progress is dropped once the extension it would grant has lapsed.
+    clock.usec.? += 1_000_000;
+    progress.report(.schema, "schema", 7, 20);
+    clock.usec.? += 31_000_000;
+    progress.report(.schema, "schema", 7, 20);
+    try rx.expectNothing();
+    // Storage migration, a later phase, reports through the type-erased hook.
+    progress.migrationHook().report(1, 4);
+    try testing.expectEqualStrings("EXTEND_TIMEOUT_USEC=30000000\nSTATUS=migration 1/4\n", try rx.recv(&buf));
+    // Nothing extends the deadline after READY or a fatal exit has finished it.
+    progress.finish();
+    progress.report(.readiness, "enforcement", 100, 0);
+    try rx.expectNothing();
+}

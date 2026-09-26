@@ -67,6 +67,27 @@ const Fixture = struct {
         return self.store.setOwner(.{ .scope = try effect.Scope.host(subject), .jail = jail, .generation = [_]u8{3} ** 32, .decision_id = [_]u8{decision} ** 32, .expected_revision = 0, .lease = lease, .decided_us = now }, .{ .prepared_us = now });
     }
 };
+fn stepOk(manager: *runtime.Manager) !runtime.Step {
+    return switch (manager.step(&bindings)) {
+        .fatal => |cause| cause,
+        else => |outcome| outcome,
+    };
+}
+fn stopOk(manager: *runtime.Manager, epoch: u64) !runtime.Step {
+    return switch (manager.stopStep(epoch, .healthy)) {
+        .fatal => |cause| cause,
+        else => |outcome| outcome,
+    };
+}
+fn expectFatal(expected: anyerror, outcome: runtime.Step) !void {
+    switch (outcome) {
+        .fatal => |cause| try t.expectEqual(expected, cause),
+        else => return error.TestExpectedFatal,
+    }
+}
+fn wake(manager: *runtime.Manager) runtime.Slice {
+    return manager.runSlice(&bindings, .{}, null);
+}
 fn allocateManager(a: std.mem.Allocator, fixture: *Fixture) !void {
     const manager = try runtime.Manager.create(a, &fixture.store, fixture.installation);
     defer manager.destroy();
@@ -92,7 +113,7 @@ test "native effect runtime: clock and persistence failures clear previously pub
     manager.status.ready = true;
     try t.expect(manager.confirmedSubject(subject, std.time.microTimestamp()));
     manager.last_wall_us = std.math.maxInt(i64);
-    try t.expectError(error.EffectClockReversed, manager.turn(&bindings));
+    try expectFatal(error.EffectClockReversed, manager.step(&bindings));
     try t.expect(!manager.status.ready);
     try t.expect(!manager.confirmedSubject(subject, std.time.microTimestamp()));
     manager.status.ready = true;
@@ -147,7 +168,9 @@ test "native effect runtime: transient readback stays uncertain and retries with
         manager.status = .{ .ready = true };
         manager.readback_failures = 0;
         manager.cursor = cursor;
-        try t.expect(!try manager.turn(&bindings));
+        const slice = wake(manager);
+        try t.expect(slice.outcome == .wait);
+        try t.expectEqual(@as(u16, 1), slice.steps);
         try t.expect(!manager.status.ready);
         try t.expect(manager.status.uncertain);
         try t.expect(!manager.confirmedSubject(subject, std.time.microTimestamp()));
@@ -161,24 +184,26 @@ test "native effect runtime: transient readback stays uncertain and retries with
     var attempts: usize = 0;
     for (0..64) |_| {
         const before = manager.readback_failures;
-        try t.expect(!try manager.turn(&bindings));
+        const slice = wake(manager);
+        try t.expect(slice.outcome == .wait);
+        try t.expect(slice.steps <= 1);
         if (manager.readback_failures != before) attempts += 1;
     }
     try t.expectEqual(@as(usize, 7), attempts);
     manager.readback_wait = 0;
     manager.readback_failures = std.math.maxInt(u8);
-    try t.expect(!try manager.turn(&bindings));
+    try t.expect(wake(manager).outcome == .wait);
     try t.expectEqual(@as(u16, 255), manager.readback_wait);
     manager.readback_wait = 0;
     manager.readback_failures = 0;
     manager.admitted = false;
-    try t.expect(!try manager.turn(&bindings));
+    try t.expect(wake(manager).outcome == .wait);
     try t.expect(!manager.admitted);
     try t.expectEqual(inspection.OperationStage.admission_probe, manager.status.diagnostic.?.stage);
     manager.readback_wait = 0;
     manager.admitted = true;
     manager.inspector.test_fault_readback = error.LimitExceeded;
-    try t.expectError(error.LimitExceeded, manager.turn(&bindings));
+    try expectFatal(error.LimitExceeded, wake(manager).outcome);
     try t.expectEqual(error.LimitExceeded, manager.status.diagnostic.?.cause);
 }
 fn isolatedBackend() !effect.Backend {
@@ -191,21 +216,28 @@ fn isolatedBackend() !effect.Backend {
     return std.meta.stringToEnum(effect.Backend, name) orelse error.InvalidFixture;
 }
 fn ready(manager: *runtime.Manager) !void {
-    for (0..32) |_| if (try manager.turn(&bindings)) {
-        try t.expect(manager.status.ready);
-        return;
+    for (0..32) |_| switch (wake(manager).outcome) {
+        .idle => {
+            try t.expect(manager.status.ready);
+            return;
+        },
+        .fatal => |cause| return cause,
+        .progress, .wait, .stop => {},
     };
     return error.RecoveryDidNotFinish;
 }
 fn driftRemove(manager: *runtime.Manager) !void {
+    return driftRemoveAddress(manager, "192.0.2.91");
+}
+fn driftRemoveAddress(manager: *runtime.Manager, address: []const u8) !void {
     var name_buf: [28]u8 = undefined;
     const name = manager.inspector.installation.name(&name_buf);
     var set_buf: [31]u8 = undefined;
     const set = try std.fmt.bufPrint(&set_buf, "{s}_4", .{name});
     const args: []const []const u8 = switch (manager.installation.backend) {
-        .nftables => &.{ "/usr/sbin/nft", "delete", "element", "inet", name, "banned_ipv4", "{", "192.0.2.91", "}" },
-        .iptables => &.{ manager.inspector.iptables_path, "-D", name, "-s", "192.0.2.91", "-j", "DROP" },
-        .ipset => &.{ manager.inspector.ipset_path, "del", set, "192.0.2.91" },
+        .nftables => &.{ "/usr/sbin/nft", "delete", "element", "inet", name, "banned_ipv4", "{", address, "}" },
+        .iptables => &.{ manager.inspector.iptables_path, "-D", name, "-s", address, "-j", "DROP" },
+        .ipset => &.{ manager.inspector.ipset_path, "del", set, address },
     };
     const result = try command.run(t.allocator, args, 2000);
     defer result.deinit(t.allocator);
@@ -229,13 +261,13 @@ test "native effect runtime: isolated final inventory catches missing scope then
     try t.expectEqual(@as(u64, 1), try fixture.store.confirmedEffectEvents());
     manager.cursor = manager.count;
     try driftRemove(manager);
-    try t.expect(!try manager.turn(&bindings));
+    try t.expect(try stepOk(manager) == .progress);
     try t.expect(!manager.status.ready);
     try t.expect(!manager.confirmedSubject(subject, std.time.microTimestamp()));
     try ready(manager);
     try t.expectEqual(@as(u64, 1), try fixture.store.confirmedEffectEvents());
     manager.inspector.limits.max_bytes = 1;
-    try t.expectError(error.LimitExceeded, manager.turn(&bindings));
+    try expectFatal(error.LimitExceeded, manager.step(&bindings));
     try t.expect(!manager.confirmedSubject(subject, std.time.microTimestamp()));
     const diagnostic = manager.status.diagnostic.?;
     try t.expectEqual(manager.inspector.installation.transport, diagnostic.backend);
@@ -257,9 +289,9 @@ test "native effect runtime: isolated transient readback recovers at the next co
     try t.expectEqual(@as(u64, 1), try fixture.store.confirmedEffectEvents());
     manager.inspector.test_fault_readback = error.Changed;
     manager.cursor = manager.count;
-    try t.expect(!try manager.turn(&bindings));
+    try t.expect(try stepOk(manager) == .wait);
     try t.expect(manager.status.uncertain);
-    try t.expect(!manager.confirmedSubject(subject, std.time.microTimestamp()));
+    try t.expect(manager.confirmedSubject(subject, std.time.microTimestamp()));
     manager.inspector.test_fault_readback = null;
     try ready(manager);
     try t.expect(manager.status.diagnostic == null);
@@ -281,12 +313,12 @@ test "native effect runtime: isolated new ban confirms in a few turns regardless
     const manager = try fixture.manager();
     defer manager.destroy();
     for (0..1024) |_| {
-        if (try manager.turn(&bindings)) break;
+        if (try stepOk(manager) == .idle) break;
     } else return error.RecoveryDidNotFinish;
     try t.expectEqual(@as(usize, 48), manager.count);
     try hostOwner(&fixture, 49, deadline);
     var turns: usize = 0;
-    while (!try manager.turn(&bindings)) : (turns += 1) try t.expect(turns < 12);
+    while (try stepOk(manager) != .idle) : (turns += 1) try t.expect(turns < 12);
     try t.expectEqual(@as(usize, 49), manager.count);
     try t.expect(manager.confirmedSubject(.{ .v4 = .{ 198, 51, 100, 49 } }, std.time.microTimestamp()));
 }
@@ -302,7 +334,7 @@ test "native effect runtime: isolated new ban is enforced before pending expiry 
     const manager = try fixture.manager();
     defer manager.destroy();
     for (0..1024) |_| {
-        if (try manager.turn(&bindings)) break;
+        if (try stepOk(manager) == .idle) break;
     } else return error.RecoveryDidNotFinish;
     try t.expect(std.time.microTimestamp() < expiring);
     for (manager.live[0..manager.count]) |entry| try t.expect(entry.status == .applied and entry.desired.finite == expiring);
@@ -310,7 +342,7 @@ test "native effect runtime: isolated new ban is enforced before pending expiry 
     try hostOwner(&fixture, 99, expiring + 60_000_000);
     const newcomer = try effect.Scope.host(.{ .v4 = .{ 198, 51, 100, 99 } });
     for (0..16) |_| {
-        _ = try manager.turn(&bindings);
+        _ = try stepOk(manager);
         var enforced = false;
         var expired_handled: usize = 0;
         for (manager.live[0..manager.count]) |entry| {
@@ -337,18 +369,22 @@ test "native effect runtime: isolated pruning a spent scope keeps confirmation w
     try ready(manager);
     waitUntil(deadline + 50_000);
     for (0..64) |_| {
-        if (!try manager.turn(&bindings)) continue;
+        if (try stepOk(manager) != .idle) continue;
         var absent: usize = 0;
         for (manager.live[0..manager.count]) |entry| absent += @intFromBool(entry.status == .absent);
         if (absent == 1) break;
     } else return error.RecoveryDidNotFinish;
     const exec = @extern(*const fn (*anyopaque, [*:0]const u8, ?*anyopaque, ?*anyopaque, ?*?[*:0]u8) callconv(.c) c_int, .{ .name = "sqlite3_exec" });
     try t.expectEqual(@as(c_int, 0), exec(@ptrCast(fixture.store.db), "DELETE FROM confirmed_event_details; DELETE FROM confirmed_history_sequence; DELETE FROM confirmed_effect_events;", null, null, null));
-    try t.expect(try manager.turn(&bindings));
+    for (0..4) |_| {
+        const outcome = try stepOk(manager);
+        if (outcome == .idle) break;
+        try t.expect(outcome == .progress);
+    } else return error.RecoveryDidNotFinish;
     var pruned = false;
     while (try fixture.store.pruneSpentEffectOne()) pruned = true;
     try t.expect(pruned);
-    try t.expect(try manager.turn(&bindings));
+    try t.expect(try stepOk(manager) == .idle);
     try t.expect(manager.status.ready);
     try t.expectEqual(@as(usize, 1), manager.count);
     try t.expect(manager.confirmedSubject(subject, std.time.microTimestamp()));
@@ -364,10 +400,7 @@ test "native effect runtime: isolated dispatch uncertainty retains durable ident
     try manager.admit();
     manager.inspector.test_fault_after_mutations = 1;
     for (0..8) |_| {
-        _ = manager.turn(&bindings) catch |failure| {
-            try t.expectEqual(error.EffectBackendUncertain, failure);
-            break;
-        };
+        if (try stepOk(manager) == .wait) break;
     } else return error.ExpectedDispatchUncertainty;
     try t.expect(!manager.status.ready);
     try t.expect(manager.status.uncertain);
@@ -379,7 +412,7 @@ test "native effect runtime: isolated dispatch uncertainty retains durable ident
     var rows: [1]effect.Entry = undefined;
     const page = try fixture.store.effectPage(null, null, &rows);
     try t.expectEqual(@as(usize, 1), page.count);
-    try t.expectEqual(effect.Status.dispatched, rows[0].status);
+    try t.expectEqual(effect.Status.pending, rows[0].status);
     try t.expectEqualSlices(u8, &expected.scope_key, &rows[0].scope_key);
     try t.expectEqual(deadline, rows[0].desired.finite);
     manager.inspector.test_fault_after_mutations = null;
@@ -459,7 +492,7 @@ test "native effect runtime: isolated stop restores durable intent and repair ep
         try t.expectEqual(action_outcome.Status.failed, outcomes[1].status);
         const epoch = manager.repairEpoch();
         manager.inspector.test_fault_after_mutations = 1;
-        try t.expectError(error.EffectBackendUncertain, manager.stopTurn(epoch));
+        try expectFatal(error.EffectBackendUncertain, manager.stopStep(epoch, .healthy));
         const diagnostic = manager.status.diagnostic.?;
         try t.expectEqual(manager.inspector.installation.transport, diagnostic.backend);
         try t.expectEqual(inspection.OperationStage.effect_dispatch, diagnostic.stage);
@@ -470,7 +503,7 @@ test "native effect runtime: isolated stop restores durable intent and repair ep
         try t.expectEqual(@as(usize, 1), retained_page.count);
         try t.expectEqual(deadline, retained[0].desired.finite);
         manager.inspector.test_fault_after_mutations = null;
-        while (!try manager.stopTurn(epoch)) {}
+        while (try stopOk(manager, epoch) != .idle) {}
         try t.expect(manager.status.diagnostic == null);
         var stopped = try manager.inspector.inspect();
         defer stopped.deinit();
@@ -701,4 +734,359 @@ test "native effect runtime: isolated committed extension with ambiguous result 
     try t.expectEqual(extended_deadline, entries[0].desired.finite);
     var owners: [effect.max_page]effect.Owner = undefined;
     try t.expectEqual(@as(usize, 2), try reopened.effectOwners(entries[0].scope_key, entries[0].revision, &owners));
+}
+
+fn scopeOwner(fixture: *Fixture, jail: []const u8, index: u8, decision: u8, lease: effect.Lease) !effect.Entry {
+    const now = std.time.microTimestamp();
+    const host = @import("engine_test").core.native_detection_record.Subject{ .v4 = .{ 198, 51, 100, index } };
+    return fixture.store.setOwner(.{ .scope = try effect.Scope.host(host), .jail = jail, .generation = [_]u8{3} ** 32, .decision_id = [_]u8{decision} ** 32, .expected_revision = 0, .lease = lease, .decided_us = now }, .{ .prepared_us = now });
+}
+/// Loads the stored view without a backend; the admission probe is covered elsewhere.
+fn loadView(fixture: *Fixture, manager: *runtime.Manager) !void {
+    manager.admitted = true;
+    while (manager.cached_epoch == null or manager.cached_epoch.? != fixture.store.effect_publication_epoch) {
+        try t.expect(try stepOk(manager) == .progress);
+    }
+}
+test "native effect runtime: a no-op expiry commit rebuilds the view and waits for the next wake" {
+    var fixture = try Fixture.init(.nftables);
+    defer fixture.deinit();
+    _ = try scopeOwner(&fixture, "fixture", 1, 1, .{ .finite = std.time.microTimestamp() + 60_000_000 });
+    const manager = try fixture.manager();
+    defer manager.destroy();
+    try loadView(&fixture, manager);
+    const stored = manager.live[0];
+    manager.live[0].desired = .{ .finite = std.time.microTimestamp() - 1 };
+    manager.cursor = 0;
+    const epoch = fixture.store.effect_publication_epoch;
+    try t.expect(try stepOk(manager) == .wait);
+    try t.expectEqual(epoch, fixture.store.effect_publication_epoch);
+    try t.expect(manager.cached_epoch == null);
+    try t.expect(!manager.status.ready);
+    try t.expect(!manager.confirmedSubject(.{ .v4 = .{ 198, 51, 100, 1 } }, std.time.microTimestamp()));
+    try t.expect(try stepOk(manager) == .progress);
+    try t.expectEqual(@as(?u64, epoch), manager.cached_epoch);
+    try t.expect(std.meta.eql(stored, manager.live[0]));
+}
+test "native effect runtime: an own co-owned expiry commit refreshes only that scope" {
+    var fixture = try Fixture.init(.nftables);
+    defer fixture.deinit();
+    const soon = std.time.microTimestamp() + 150_000;
+    _ = try scopeOwner(&fixture, "fixture", 1, 1, .{ .finite = soon + 60_000_000 });
+    _ = try scopeOwner(&fixture, "fixture", 2, 2, .{ .finite = soon });
+    const shared = try scopeOwner(&fixture, "shared", 2, 3, .{ .finite = soon + 50_000 });
+    const manager = try fixture.manager();
+    defer manager.destroy();
+    try loadView(&fixture, manager);
+    try t.expectEqual(@as(usize, 2), manager.count);
+    waitUntil(soon + 70_000);
+    const expired: usize = if (std.mem.eql(u8, &manager.live[0].scope_key, &shared.scope_key)) 0 else 1;
+    const untouched = manager.live[1 - expired];
+    manager.cursor = expired;
+    const epoch = fixture.store.effect_publication_epoch;
+    try t.expect(try stepOk(manager) == .progress);
+    try t.expectEqual(epoch + 1, fixture.store.effect_publication_epoch);
+    try t.expectEqual(@as(?u64, epoch + 1), manager.cached_epoch);
+    try t.expect(manager.staged_revision == null);
+    try t.expect(manager.live[expired].revision > shared.revision);
+    try t.expect(manager.live[expired].desired == .absent);
+    try t.expect(std.meta.eql(untouched, manager.live[1 - expired]));
+    var owners: [effect.max_page]effect.Owner = undefined;
+    const owner_count = try fixture.store.effectOwners(shared.scope_key, manager.live[expired].revision, &owners);
+    try t.expectEqual(@as(usize, 2), owner_count);
+    for (owners[0..owner_count]) |owner| try t.expect(owner.lease == .absent);
+    var stored: [2]effect.Entry = undefined;
+    const page = try fixture.store.effectPage(null, null, &stored);
+    try t.expectEqual(@as(usize, 2), page.count);
+    for (stored[0..page.count], manager.live[0..manager.count]) |row, cached| try t.expect(std.meta.eql(row, cached));
+    try t.expect(!manager.status.ready);
+}
+const StopAfter = struct {
+    fixture: *Fixture,
+    calls: usize = 0,
+    fn requested(context: ?*anyopaque) bool {
+        const self: *StopAfter = @ptrCast(@alignCast(context.?));
+        self.calls += 1;
+        if (self.calls == 2) _ = scopeOwner(self.fixture, "shared", 9, 9, .permanent) catch return true;
+        return false;
+    }
+};
+test "native effect runtime: a change committed between slice steps rebuilds the whole view" {
+    var fixture = try Fixture.init(.nftables);
+    defer fixture.deinit();
+    const soon = std.time.microTimestamp() + 150_000;
+    _ = try scopeOwner(&fixture, "fixture", 1, 1, .{ .finite = soon });
+    const manager = try fixture.manager();
+    defer manager.destroy();
+    try loadView(&fixture, manager);
+    waitUntil(soon + 20_000);
+    manager.cursor = 0;
+    manager.inspector.test_fault_readback = error.Changed;
+    var intervening = StopAfter{ .fixture = &fixture };
+    // Synchronous commits can exhaust the default time budget on slow storage.
+    const slice = manager.runSlice(&bindings, .{ .max_ns = std.math.maxInt(u64) }, .{ .context = &intervening, .requested = StopAfter.requested });
+    try t.expect(slice.outcome == .wait);
+    try t.expectEqual(@as(u16, 3), slice.steps);
+    try t.expectEqual(@as(usize, 2), manager.count);
+    try t.expectEqual(@as(?u64, fixture.store.effect_publication_epoch), manager.cached_epoch);
+    try t.expect(!manager.status.ready);
+    try t.expect(manager.status.uncertain);
+}
+const ForeignPublication = struct {
+    fn invalidate(context: ?*anyopaque) void {
+        const store: *durable.Store = @ptrCast(@alignCast(context.?));
+        store.effect_publication_epoch += 1;
+    }
+};
+test "native effect runtime: an own commit that is not the sole epoch advance rebuilds the whole view" {
+    for ([_]enum { foreign_advance, saturated }{ .foreign_advance, .saturated }) |case| {
+        var fixture = try Fixture.init(.nftables);
+        defer fixture.deinit();
+        const soon = std.time.microTimestamp() + 150_000;
+        _ = try scopeOwner(&fixture, "fixture", 1, 1, .{ .finite = soon });
+        const manager = try fixture.manager();
+        defer manager.destroy();
+        try loadView(&fixture, manager);
+        waitUntil(soon + 20_000);
+        manager.cursor = 0;
+        switch (case) {
+            .foreign_advance => fixture.store.effect_invalidation = .{ .context = &fixture.store, .invalidate = ForeignPublication.invalidate },
+            .saturated => {
+                fixture.store.effect_publication_epoch = std.math.maxInt(u64) - 1;
+                manager.cached_epoch = fixture.store.effect_publication_epoch;
+            },
+        }
+        const epoch = fixture.store.effect_publication_epoch;
+        try t.expect(try stepOk(manager) == .progress);
+        fixture.store.effect_invalidation = null;
+        try t.expect(manager.cached_epoch == null);
+        switch (case) {
+            .foreign_advance => {
+                try t.expectEqual(epoch + 2, fixture.store.effect_publication_epoch);
+                try t.expect(try stepOk(manager) == .progress);
+                try t.expectEqual(@as(?u64, epoch + 2), manager.cached_epoch);
+                try t.expect(manager.live[0].desired == .absent);
+            },
+            .saturated => {
+                try t.expectEqual(std.math.maxInt(u64), fixture.store.effect_publication_epoch);
+                try expectFatal(error.EffectCapacity, manager.step(&bindings));
+            },
+        }
+    }
+}
+const CommitFault = struct {
+    var actual: Exec = undefined;
+    var code: c_int = 0;
+    var apply_first = false;
+    var hits: usize = 0;
+    fn exec(db: *Db, statement: [*:0]const u8, callback: ?*anyopaque, context: ?*anyopaque, message: ?*?[*:0]u8) callconv(.c) c_int {
+        if (!std.mem.eql(u8, std.mem.span(statement), "COMMIT;")) return actual(db, statement, callback, context, message);
+        hits += 1;
+        if (apply_first and actual(db, statement, callback, context, message) != 0) return 1;
+        return code;
+    }
+    fn install(store: *durable.Store, fault: c_int, committed: bool) void {
+        actual = store.api.exec;
+        code = fault;
+        apply_first = committed;
+        hits = 0;
+        store.api.exec = exec;
+    }
+};
+test "native effect runtime: a failed expiry commit keeps the view only when it provably rolled back" {
+    const cases = [_]struct { code: c_int, committed: bool, cause: anyerror }{
+        .{ .code = 10, .committed = true, .cause = error.StorageIo },
+        .{ .code = 5, .committed = false, .cause = error.Busy },
+    };
+    for (cases) |case| {
+        var fixture = try Fixture.init(.nftables);
+        defer fixture.deinit();
+        const soon = std.time.microTimestamp() + 150_000;
+        _ = try scopeOwner(&fixture, "fixture", 1, 1, .{ .finite = soon });
+        const manager = try fixture.manager();
+        defer manager.destroy();
+        try loadView(&fixture, manager);
+        waitUntil(soon + 20_000);
+        manager.cursor = 0;
+        const epoch = fixture.store.effect_publication_epoch;
+        const before = manager.live[0];
+        CommitFault.install(&fixture.store, case.code, case.committed);
+        defer fixture.store.api.exec = CommitFault.actual;
+        try expectFatal(case.cause, manager.step(&bindings));
+        fixture.store.api.exec = CommitFault.actual;
+        try t.expectEqual(@as(usize, 1), CommitFault.hits);
+        try t.expectEqual(case.committed, fixture.store.reopen_required);
+        try t.expectEqual(epoch, fixture.store.effect_publication_epoch);
+        try t.expect(!manager.status.ready);
+        try t.expect(manager.status.uncertain);
+        if (case.committed) {
+            // The commit may have landed: no expiry authority survives it.
+            try t.expect(manager.cached_epoch == null);
+            manager.outage_attempted[0] = false;
+            try manager.expireDuringOutage();
+            try t.expect(!manager.outage_attempted[0]);
+            try t.expectEqual(@as(usize, 1), manager.status.overdue);
+        } else {
+            try t.expectEqual(@as(?u64, epoch), manager.cached_epoch);
+            try t.expect(std.meta.eql(before, manager.live[0]));
+            try t.expect(try stepOk(manager) == .progress);
+            try t.expectEqual(@as(?u64, epoch + 1), manager.cached_epoch);
+            try t.expect(manager.live[0].desired == .absent);
+        }
+    }
+}
+fn stopNow(_: ?*anyopaque) bool {
+    return true;
+}
+test "native effect runtime: a slice yields at the first transient wait and each wake counts backoff once" {
+    var fixture = try Fixture.init(.nftables);
+    defer fixture.deinit();
+    _ = try scopeOwner(&fixture, "fixture", 1, 1, .permanent);
+    const manager = try fixture.manager();
+    defer manager.destroy();
+    try loadView(&fixture, manager);
+    try t.expectEqual(manager.count, manager.cursor);
+    manager.inspector.test_fault_readback = error.Changed;
+    const expected = [_]struct { steps: u16, failures: u8, wait: u16 }{
+        .{ .steps = 1, .failures = 1, .wait = 0 },
+        .{ .steps = 1, .failures = 2, .wait = 1 },
+        .{ .steps = 0, .failures = 2, .wait = 0 },
+        .{ .steps = 1, .failures = 3, .wait = 3 },
+        .{ .steps = 0, .failures = 3, .wait = 2 },
+    };
+    for (expected) |case| {
+        const slice = wake(manager);
+        try t.expect(slice.outcome == .wait);
+        try t.expectEqual(case.steps, slice.steps);
+        try t.expectEqual(case.failures, manager.readback_failures);
+        try t.expectEqual(case.wait, manager.readback_wait);
+    }
+    // Direct steps never consume a wake's backoff.
+    try t.expect(try stepOk(manager) == .wait);
+    try t.expectEqual(@as(u16, 2), manager.readback_wait);
+    manager.readback_wait = 0;
+    const stopped = manager.runSlice(&bindings, .{}, .{ .requested = stopNow });
+    try t.expect(stopped.outcome == .stop);
+    try t.expectEqual(@as(u16, 0), stopped.steps);
+    try t.expectEqual(@as(u8, 3), manager.readback_failures);
+}
+test "native effect runtime: stop through an unhealthy storage gate neither dispatches nor touches SQLite" {
+    var fixture = try Fixture.init(.nftables);
+    defer fixture.deinit();
+    _ = try scopeOwner(&fixture, "fixture", 1, 1, .permanent);
+    const manager = try fixture.manager();
+    defer manager.destroy();
+    try loadView(&fixture, manager);
+    // A coherent ready view would otherwise let stop withdraw at once.
+    manager.status.ready = true;
+    manager.inspector.test_fault_after_mutations = 0;
+    manager.inspector.test_fault_readback = error.Timeout;
+    var blocked = try BlockedWriter.init(&fixture);
+    defer blocked.deinit();
+    try expectFatal(error.StorageUnhealthy, manager.stopStep(manager.repairEpoch(), .unhealthy));
+    try t.expect(!manager.stopping);
+    const residual = manager.residualInstalled();
+    try t.expect(residual.installed == null);
+    try t.expectEqual(error.Timeout, residual.cause.?);
+    try t.expectEqual(@as(usize, 0), ForbiddenSql.calls);
+}
+test "native effect runtime: isolated stop through an unhealthy gate reports and keeps installed rules" {
+    var fixture = try Fixture.init(try isolatedBackend());
+    defer fixture.deinit();
+    _ = try fixture.owner("fixture", 1, .permanent);
+    const manager = try fixture.manager();
+    defer manager.destroy();
+    try ready(manager);
+    const pending = try scopeOwner(&fixture, "fixture", 7, 7, .permanent);
+    {
+        var blocked = try BlockedWriter.init(&fixture);
+        defer blocked.deinit();
+        try expectFatal(error.StorageUnhealthy, manager.stopStep(manager.repairEpoch(), .unhealthy));
+        const residual = manager.residualInstalled();
+        try t.expectEqual(@as(?usize, 1), residual.installed);
+        try t.expect(residual.cause == null);
+        try t.expectEqual(@as(usize, 0), ForbiddenSql.calls);
+    }
+    var snapshot = try manager.inspector.inspect();
+    defer snapshot.deinit();
+    try t.expectEqual(@as(usize, 1), snapshot.entries.len);
+    var rows: [2]effect.Entry = undefined;
+    const page = try fixture.store.effectPage(null, null, &rows);
+    try t.expectEqual(@as(usize, 2), page.count);
+    for (rows[0..page.count]) |row| if (std.mem.eql(u8, &row.scope_key, &pending.scope_key)) try t.expectEqual(effect.Status.pending, row.status);
+}
+test "native effect runtime: isolated persistent readback disagreement yields each wake instead of spinning" {
+    var fixture = try Fixture.init(try isolatedBackend());
+    defer fixture.deinit();
+    _ = try fixture.owner("fixture", 1, .permanent);
+    const manager = try fixture.manager();
+    defer manager.destroy();
+    try ready(manager);
+    manager.test_readback_disagrees = true;
+    manager.cursor = manager.count;
+    const epoch = fixture.store.effect_publication_epoch;
+    for (0..3) |_| {
+        const slice = manager.runSlice(&bindings, .{ .max_ns = std.math.maxInt(u64) }, null);
+        try t.expect(slice.outcome == .wait);
+        try t.expectEqual(@as(u16, 2), slice.steps);
+        try t.expect(!manager.status.ready);
+    }
+    try t.expectEqual(epoch, fixture.store.effect_publication_epoch);
+    manager.test_readback_disagrees = false;
+    try ready(manager);
+}
+fn populated(fixture: *Fixture, count: usize, deadline: i64) !void {
+    for (0..count) |index| {
+        const now = std.time.microTimestamp();
+        const host = @import("engine_test").core.native_detection_record.Subject{ .v4 = .{ 203, 0, @intCast(index / 256), @intCast(index % 256) } };
+        var decision = [_]u8{0x40} ** 32;
+        std.mem.writeInt(u32, decision[0..4], @intCast(index), .little);
+        _ = try fixture.store.setOwner(.{ .scope = try effect.Scope.host(host), .jail = "fixture", .generation = [_]u8{3} ** 32, .decision_id = decision, .expected_revision = 0, .lease = .{ .finite = deadline }, .decided_us = now }, .{ .prepared_us = now });
+    }
+}
+test "native effect runtime: isolated populated restart settles in wakes proportional to its effects" {
+    var fixture = try Fixture.init(try isolatedBackend());
+    defer fixture.deinit();
+    const effects: usize = 200;
+    const deadline = std.time.microTimestamp() + 600_000_000;
+    try populated(&fixture, effects, deadline);
+    // Stored effects are applied but the kernel set is empty, as after a reboot.
+    try driftRemoveAll(&fixture);
+    const manager = try fixture.manager();
+    defer manager.destroy();
+    // Only the step budget ends a slice here, so the bound counts work rather than
+    // this host's speed: a page per 64 rows, then per effect one full readback, a
+    // mismatch settlement, the dispatch and its verification.
+    const limits = runtime.SliceLimits{ .max_steps = 32, .max_ns = std.math.maxInt(u64) };
+    const bound = (4 * effects + effects / effect.max_page + 3) / limits.max_steps + 2;
+    var wakes: usize = 0;
+    while (true) : (wakes += 1) {
+        if (wakes > bound) return error.RecoveryTooSlow;
+        switch (manager.runSlice(&bindings, limits, null).outcome) {
+            .idle => break,
+            .fatal => |cause| return cause,
+            .progress, .wait, .stop => {},
+        }
+    }
+    try t.expect(manager.status.ready);
+    try t.expectEqual(effects, manager.status.confirmed);
+    // Each dispatch reads before and after its mutation; otherwise only admission
+    // and a few pass readbacks read the whole set, never one per effect.
+    try t.expect(manager.inspector.test_inspections <= 2 * effects + 8);
+    var snapshot = try manager.inspector.inspect();
+    defer snapshot.deinit();
+    try t.expectEqual(effects, snapshot.entries.len);
+    // iptables rules carry no kernel timeout.
+    if (manager.installation.backend != .iptables) for (snapshot.entries) |entry| try t.expect(entry.remaining_ms != null);
+}
+fn driftRemoveAll(fixture: *Fixture) !void {
+    const stop_all = try fixture.manager();
+    defer stop_all.destroy();
+    for (0..1024) |_| switch (stop_all.runSlice(&bindings, .{ .max_ns = std.math.maxInt(u64) }, null).outcome) {
+        .idle => break,
+        .fatal => |cause| return cause,
+        .progress, .wait, .stop => {},
+    } else return error.RecoveryDidNotFinish;
+    const epoch = stop_all.repairEpoch();
+    while (try stopOk(stop_all, epoch) != .idle) {}
 }

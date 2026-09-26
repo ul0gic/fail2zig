@@ -105,6 +105,9 @@ const NotifyReceiver = struct {
         posix.close(self.fd);
     }
 
+    /// Returns the next state notification. Progress datagrams (start-deadline
+    /// extensions and status text) are discarded: the cases here assert when the
+    /// daemon claims READY, reloads or stops, not how it reports progress meanwhile.
     fn next(self: NotifyReceiver, buf: []u8, timeout_ns: u64) !?[]const u8 {
         var timer = try std.time.Timer.start();
         while (true) {
@@ -116,7 +119,9 @@ const NotifyReceiver = struct {
                 },
                 else => return err,
             };
-            return buf[0..n];
+            const message = buf[0..n];
+            if (std.mem.startsWith(u8, message, "EXTEND_TIMEOUT_USEC=") or std.mem.startsWith(u8, message, "STATUS=")) continue;
+            return message;
         }
     }
 

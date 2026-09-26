@@ -24,7 +24,7 @@ pub fn classify(cause: anyerror) Domain {
         error.StoragePaused,
         error.PersistenceUnavailable,
         => .storage,
-        error.SourceRepairPending, error.ConsumerPending, error.ConsumerExpired, error.EffectExpired => .pending,
+        error.SourceRepairPending, error.ConsumerPending, error.ConsumerExpired, error.EffectExpired, error.ReserveBackpressure, error.RetryCapacity => .pending,
         error.FileNotFound,
         error.AccessDenied,
         error.InputOutput,

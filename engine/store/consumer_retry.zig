@@ -8,6 +8,7 @@ const effects = @import("../core/native_effect.zig");
 const application_history = @import("../core/native_application_history.zig");
 const effect_history = @import("../core/native_effect_history.zig");
 const action_context = @import("../core/native_action_context.zig");
+const action_outcome = @import("../core/native_action_outcome.zig");
 const store = @import("store.zig");
 const Error = store.Error;
 const Stmt = store.Stmt;
@@ -993,6 +994,7 @@ pub fn Methods(comptime Store: type) type {
                 if (self.api.changes(self.db) != 1) return error.InvalidRetryState;
             }
             try self.fault(.after_retry_decision);
+            try self.reserveEffectRows(.{ .revisions = 1, .intents = 1, .observations = store.load_repair.observations_per_intent });
             if (existing.revision >= std.math.maxInt(i64) or entry.revision >= std.math.maxInt(i64) or try self.integer("SELECT count(*) FROM effect_owner_revisions;") >= effects.max_owner_revisions) return error.EffectCapacity;
             {
                 var update = try self.statement("UPDATE effect_owners SET revision=?4,lease_kind=?5,deadline_us=?6 WHERE scope_key=?1 AND jail=?2 AND revision=?3;");
@@ -1192,7 +1194,8 @@ pub fn Methods(comptime Store: type) type {
                         effects.hashParts("fail2zig-native-effect-decision-v1", &.{ record.jail, record.source, record.occurrence, &admission.generation });
                     effect_identity = identity;
                     if (!kept_existing) {
-                        _ = try self.setOwnerTx(.{ .scope = scope, .jail = record.jail, .generation = admission.generation, .decision_id = identity, .expected_revision = effect_revision, .lease = decision.lease, .decided_us = decision.decided_us }, effect_now);
+                        const targets: i64 = if (self.schema_version >= 21) @intCast(action_outcome.max_targets_per_action) else 0;
+                        _ = try self.setOwnerReservedTx(.{ .scope = scope, .jail = record.jail, .generation = admission.generation, .decision_id = identity, .expected_revision = effect_revision, .lease = decision.lease, .decided_us = decision.decided_us }, effect_now, targets);
                         if (self.schema_version >= 21) try self.prepareActionTargetsTx(.{ .action_id = identity, .scope_key = key, .jail = record.jail }, effect_now);
                     }
                 }

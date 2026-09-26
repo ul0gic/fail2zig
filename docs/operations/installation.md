@@ -96,6 +96,31 @@ WAL/SHM siblings. For upgrades within v0.4.x from before v0.4.3, an older binary
 cannot read newer checkpoint and marker data. Rollback within the supported line
 requires the matching backup and binary, not an executable swap.
 
+The first start of a version with schema 24 upgrades v0.4.x (schema 23) state in
+place:
+
+- Before its first change it writes a coherent copy to
+  `<state_file>.pre24-backup`. It needs free space of twice the database size plus
+  32 MiB, and refuses to start if that backup file already exists. Move an old
+  backup aside only when it is not the sole copy of earlier state.
+- The upgrade commits in small resumable steps. An interrupted upgrade resumes on
+  the next start; older binaries refuse the partly or fully upgraded database.
+  While it runs, the daemon extends its systemd start deadline only as steps
+  commit. The log reports completion, the backup path and how many unsettled
+  outcomes of already-replaced ban decisions were closed as `superseded`.
+- To roll back, stop the daemon, restore the backup over the state file, remove
+  the upgraded database's `-wal`/`-shm` files and reinstall the previous binary.
+
+A file source truncated in place below its saved position is refused at startup
+instead of being re-read silently. Stop the daemon and acknowledge it with
+`fail2zig repair-source` (see `fail2zig(1)`); data removed by the truncation
+before it was read is lost, and the stop withdraws firewall rules until the next
+start reinstalls them.
+
+If storage is unhealthy when the daemon stops, it leaves installed firewall rules
+in place and logs how many remain; the next start reconciles them. A healthy stop
+withdraws its rules while keeping owners and deadlines.
+
 The installer changes ownership only for the default native SQLite state path
 and refuses custom paths, active writers and legacy binary state. Follow the
 [state upgrade boundary](migration-continuity.md#upgrading-fail2zig-state) before

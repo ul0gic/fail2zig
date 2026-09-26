@@ -90,12 +90,40 @@ pub const Clock = struct {
     context: ?*anyopaque,
     read: *const fn (?*anyopaque) u64,
 };
+
+/// Bounded maintenance operations; the label names the latched cause's operation.
+pub const MaintenanceOperation = enum { history_rebuild, history_details, history_prefix, retry_details, spent_scopes, obsolete_rows };
+pub const MaintenanceOutcome = union(enum) {
+    progress: MaintenanceOperation,
+    // A pre-write selection yielded; retry on the next wake with a smaller unit.
+    wait: MaintenanceOperation,
+    idle,
+};
+
+/// Service guarantees for one worker: sources and history are served on every wake,
+/// and one maintenance step runs every `maintenance_interval_ms` whether or not effect
+/// work is backlogged, so cleanup neither waits for the backlog to drain nor consumes
+/// every wake with its own commits while ingestion waits.
+pub const Fairness = struct {
+    pub const maintenance_interval_ms: u64 = 250;
+    last_maintenance_ms: ?u64 = null,
+
+    pub fn maintenanceDue(self: *const Fairness, now_ms: u64) bool {
+        const last = self.last_maintenance_ms orelse return true;
+        return now_ms -| last >= maintenance_interval_ms;
+    }
+    pub fn maintained(self: *Fairness, now_ms: u64) void {
+        self.last_maintenance_ms = now_ms;
+    }
+};
+
 pub const Phase = enum { starting, healthy, paused, recovering, intervention };
 pub const RecoveryStep = enum { storage, state, ownership, sources };
 pub const Diagnostics = struct {
     sqlite_code: ?c_int = null,
     rollback_code: ?c_int = null,
     reopen_required: bool = false,
+    operation: ?MaintenanceOperation = null,
 };
 pub const Failure = struct {
     cause: anyerror,
@@ -275,6 +303,11 @@ fn retryable(cause: anyerror) bool {
         error.EffectBackendUncertain,
         error.StaleEffect,
         error.EffectReconciliationRequired,
+        // Admission reserve and retry-subject capacity refusals: source-scoped
+        // backpressure that expiry and retirement clear; they never latch intervention
+        // even if they reach the gate. The source reports them as blocked meanwhile.
+        error.ReserveBackpressure,
+        error.RetryCapacity,
         => true,
         else => false,
     };

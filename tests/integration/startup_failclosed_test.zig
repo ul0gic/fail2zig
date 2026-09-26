@@ -834,3 +834,175 @@ test "integration: journal profile changed ordering refuses while retaining data
     try expectContains(restored.stderr, "AddressInUse");
     try expectNotContains(restored.stderr, "RetryGenerationMismatch");
 }
+
+// Log-only, HTTP-off daemon with a file log target; no host firewall mutation.
+fn writeFileLogConfig(s: *Scenario) !void {
+    var file = try std.fs.cwd().createFile(s.config_path, .{ .truncate = true, .mode = 0o640 });
+    defer file.close();
+    try file.writer().print(
+        \\[global]
+        \\socket_path = "{s}/sock/fail2zig.sock"
+        \\state_file = "{s}/state.bin"
+        \\metrics_enabled = false
+        \\memory_ceiling_mb = 64
+        \\log_target = "{s}/daemon.log"
+        \\[defaults]
+        \\enforce = false
+        \\[jails.sshd]
+        \\enabled = true
+        \\filter = "sshd"
+        \\timestamp = "undated"
+        \\source = "file"
+        \\logpath = ["{s}"]
+        \\
+    , .{ s.root, s.root, s.root, s.log_path });
+    try file.chmod(0o640);
+}
+
+fn spawnDaemon(s: *Scenario, env: ?*const std.process.EnvMap) !std.process.Child {
+    const argv = [_][]const u8{ daemon_path, "--foreground", "--config", s.config_path };
+    var child = std.process.Child.init(&argv, s.a);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    child.env_map = env;
+    try child.spawn();
+    return child;
+}
+
+fn stopDaemon(child: *std.process.Child) !void {
+    try posix.kill(child.id, posix.SIG.TERM);
+    const term = try child.wait();
+    try testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, term);
+}
+
+fn waitForFileText(dir: std.fs.Dir, name: []const u8, needle: []const u8, timeout_ms: u64) !void {
+    var waited: u64 = 0;
+    while (waited < timeout_ms) : (waited += 50) {
+        const text = dir.readFileAlloc(testing.allocator, name, max_output_bytes) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (text) |bytes| {
+            defer testing.allocator.free(bytes);
+            if (std.mem.indexOf(u8, bytes, needle) != null) return;
+        }
+        std.time.sleep(50 * std.time.ns_per_ms);
+    }
+    return error.TestExpectedTextMissing;
+}
+
+test "integration: fatal startup recovery writes its cause to a file log target before exit" {
+    const a = testing.allocator;
+    var s = try Scenario.init(a);
+    defer s.deinit();
+    try writeFileLogConfig(&s);
+    {
+        var child = try spawnDaemon(&s, null);
+        errdefer terminateAndReap(&child);
+        try waitForFileText(s.tmp.dir, "daemon.log", "native: ready", watchdog_timeout_ms);
+        var log = try std.fs.cwd().openFile(s.log_path, .{ .mode = .write_only });
+        defer log.close();
+        try log.seekFromEnd(0);
+        for (1..4) |i| try log.writer().print("sshd[123]: Failed password for root from 203.0.113.{d} port 22 ssh2\n", .{i});
+        // The worker commits the source position within a few 100 ms wakes.
+        std.time.sleep(2 * std.time.ns_per_s);
+        try stopDaemon(&child);
+    }
+    // Truncating below the committed offset loses continuity, which the worker
+    // refuses during startup recovery and exits from its own thread.
+    try s.tmp.dir.writeFile(.{ .sub_path = "auth.log", .data = "" });
+    try s.tmp.dir.writeFile(.{ .sub_path = "daemon.log", .data = "" });
+    var r = try s.run();
+    defer r.deinit(a);
+    try testing.expectEqual(@as(?u8, 1), r.exitCode());
+    const logged = try s.tmp.dir.readFileAlloc(a, "daemon.log", max_output_bytes);
+    defer a.free(logged);
+    try expectContains(logged, "native: startup recovery failed: ");
+    try expectContains(logged, "refusing to start");
+}
+
+const NotifyReceiver = struct {
+    fd: posix.fd_t,
+
+    fn bind(path: []const u8) !NotifyReceiver {
+        const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
+        errdefer posix.close(fd);
+        var addr = try std.net.Address.initUnix(path);
+        try posix.bind(fd, &addr.any, addr.getOsSockLen());
+        return .{ .fd = fd };
+    }
+
+    /// Next datagram, or null when none arrives within `timeout_ms`.
+    fn recv(self: NotifyReceiver, buf: []u8, timeout_ms: i32) !?[]const u8 {
+        var fds = [_]posix.pollfd{.{ .fd = self.fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&fds, timeout_ms) == 0) return null;
+        const n = try posix.recv(self.fd, buf, 0);
+        return buf[0..n];
+    }
+};
+
+fn extensionUsec(message: []const u8) !?u64 {
+    const key = "EXTEND_TIMEOUT_USEC=";
+    if (!std.mem.startsWith(u8, message, key)) return null;
+    const end = std.mem.indexOfScalar(u8, message, '\n') orelse return error.TestMalformedNotify;
+    return try std.fmt.parseInt(u64, message[key.len..end], 10);
+}
+
+test "integration: startup notify extends the deadline through construction and sends READY once at readiness" {
+    const a = testing.allocator;
+    var s = try Scenario.init(a);
+    defer s.deinit();
+    try writeFileLogConfig(&s);
+    const socket_path = try std.fmt.allocPrint(a, "{s}/notify", .{s.root});
+    defer a.free(socket_path);
+    const rx = try NotifyReceiver.bind(socket_path);
+    defer posix.close(rx.fd);
+    var env = try std.process.getEnvMap(a);
+    defer env.deinit();
+    try env.put("NOTIFY_SOCKET", socket_path);
+
+    var messages = std.ArrayList([]u8).init(a);
+    defer {
+        for (messages.items) |message| a.free(message);
+        messages.deinit();
+    }
+    var child = try spawnDaemon(&s, &env);
+    {
+        errdefer terminateAndReap(&child);
+        var buf: [600]u8 = undefined;
+        var ready = false;
+        var waited: u64 = 0;
+        while (!ready and waited < watchdog_timeout_ms) : (waited += 100) {
+            const message = try rx.recv(&buf, 100) orelse continue;
+            try messages.append(try a.dupe(u8, message));
+            ready = std.mem.eql(u8, message, "READY=1\n");
+        }
+        try testing.expect(ready);
+        try stopDaemon(&child);
+        while (try rx.recv(&buf, 0)) |message| try messages.append(try a.dupe(u8, message));
+    }
+
+    // The first message is sent before construction starts, so it precedes any
+    // initial start deadline.
+    try testing.expect(try extensionUsec(messages.items[0]) != null);
+    try expectContains(messages.items[0], "STATUS=admission 0\n");
+    const phases = [_][]const u8{ "STATUS=admission", "STATUS=schema", "STATUS=maintenance validation", "STATUS=recovery" };
+    var next_phase: usize = 0;
+    var ready_index: ?usize = null;
+    for (messages.items, 0..) |message, i| {
+        if (try extensionUsec(message)) |usec| {
+            try testing.expect(ready_index == null);
+            try testing.expect(usec > 0 and usec <= 30 * std.time.us_per_s);
+            if (next_phase < phases.len and std.mem.indexOf(u8, message, phases[next_phase]) != null) next_phase += 1;
+        } else if (std.mem.eql(u8, message, "READY=1\n")) {
+            try testing.expectEqual(@as(?usize, null), ready_index);
+            ready_index = i;
+        }
+    }
+    try testing.expectEqual(phases.len, next_phase);
+    try testing.expect(ready_index.? > 0);
+    const logged = try s.tmp.dir.readFileAlloc(a, "daemon.log", max_output_bytes);
+    defer a.free(logged);
+    try expectContains(logged, "native: ready; all readiness components verified");
+}

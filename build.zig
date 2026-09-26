@@ -159,6 +159,19 @@ pub fn build(b: *std.Build) void {
         if (b.args) |args| run.addArgs(args);
         b.step(b.fmt("probe-{s}", .{probe.name}), "Run a manual diagnostic probe").dependOn(&run.step);
     }
+    // Manual load-reproduction state generator; not a test or CI member.
+    const load_fixture_mod = b.createModule(.{
+        .root_source_file = b.path("tests/harness/load_repro/fixture.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    load_fixture_mod.addImport("shared", shared_mod);
+    load_fixture_mod.addImport("engine_test", component_api);
+    load_fixture_mod.linkLibrary(sqlite);
+    const load_fixture = b.addExecutable(.{ .name = "f2z-load-fixture", .root_module = load_fixture_mod });
+    b.step("build-load-fixture", "Build the load reproduction state fixture generator").dependOn(&b.addInstallArtifact(load_fixture, .{}).step);
+
     const components = [_]Component{
         .{ .name = "test-native-firewall", .path = "tests/component/native_firewall_tests.zig", .filter = "native firewall:", .sqlite = false, .ci = .components_a },
         .{ .name = "test-native-rules", .path = "tests/component/native_rule_tests.zig", .filter = "native rules:", .sqlite = false, .ci = .components_b },
@@ -190,6 +203,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "test-native-query", .path = "tests/component/native_query_tests.zig", .filter = "native query:", .sqlite = false, .ci = .components_b },
         .{ .name = "test-native-migration-plan", .path = "tests/component/migration_plan_tests.zig", .filter = "migration plan:", .sqlite = true, .ci = .components_a },
         .{ .name = "test-native-rule-test", .path = "tests/component/native_rule_test_tests.zig", .filter = "native rule test:", .sqlite = false, .ci = .components_b },
+        .{ .name = "test-offline-source-repair", .path = "tests/component/store/offline_source_repair_tests.zig", .filter = "offline source repair:", .sqlite = true, .ci = .components_a },
+        .{ .name = "test-load-repair-migration", .path = "tests/component/store/load_repair_migration_tests.zig", .filter = "load repair migration:", .sqlite = true, .ci = .components_b },
         .{ .name = "test-native-migration-store", .path = "tests/component/native_migration_store_tests.zig", .filter = "migration store:", .sqlite = true, .ci = .components_a },
         .{ .name = "test-native-migration-import", .path = "tests/component/migration_import_tests.zig", .filter = "migration import:", .sqlite = true, .ci = .components_b },
         .{ .name = "test-native-migration-continuity", .path = "tests/component/migration_continuity_tests.zig", .filter = "migration continuity:", .sqlite = true, .ci = .components_a },
@@ -269,6 +284,10 @@ pub fn build(b: *std.Build) void {
     const run_foundations = b.addRunArtifact(native_foundations);
     b.step("test-native-foundations", "Test native storage, time, sources and recovery without legacy workers").dependOn(&run_foundations.step);
     ci.add(.components_b, &run_foundations.step);
+    const native_source = b.addTest(.{ .root_module = native_foundations_mod, .filters = &.{"native source:"} });
+    const run_native_source = b.addRunArtifact(native_source);
+    b.step("test-native-source", "Test durable file source continuity and framing").dependOn(&run_native_source.step);
+    ci.add(.components_a, &run_native_source.step);
 
     const detection_mod = b.createModule(.{
         .root_source_file = b.path("tests/component/native_detection_tests.zig"),

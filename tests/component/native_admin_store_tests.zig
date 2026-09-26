@@ -428,3 +428,53 @@ fn staticRead(_: ?*anyopaque) i64 {
 fn testClock() effects.Clock {
     return .{ .prepared_us = 1_000_000, .context = null, .read = staticRead };
 }
+
+fn observed(entry: effects.Entry) effects.Observation {
+    return .{ .installation = entry.installation.id, .scope_key = entry.scope_key, .fingerprint = [_]u8{9} ** 32, .observed_us = 1_000_000, .qualification = .complete_owned, .state = entry.desired };
+}
+
+test "native admin store: a ban replayed after its request record was evicted is a new decision, never the retired one" {
+    // Failure: with the request id as the decision, a replay after eviction reinstated the
+    // retired decision (A -> B -> A) and let its confirmation identity count again.
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.store.enableAdminState();
+    try f.store.enableMigrationState();
+    try f.store.enableLoadRepair(.{ .state_path = f.path, .now_us = 1_000_000, .history_max_matches = 10 }, null);
+    const gen = [_]u8{6} ** 32;
+    try f.store.recordConfigGeneration(.{ .generation = gen, .config_digest = gen, .config_path = "/p", .committed_us = 1, .published = true, .mutation_revision = 0 }, &.{});
+    const request = [_]u8{0x51} ** 32;
+    const scope = try effects.Scope.host(.{ .v4 = .{ 203, 0, 113, 5 } });
+    const key = try scope.key((try f.store.readInstallation()).?);
+    const Ban = struct {
+        fn set(store: *durable.Store, owner_key: effects.Hash, target: effects.Scope, decision: effects.Hash) !void {
+            const current = try store.currentOwner(owner_key, "sshd");
+            const entry = try store.setOwner(.{ .scope = target, .jail = "sshd", .generation = [_]u8{3} ** 32, .decision_id = decision, .expected_revision = if (current) |owner| owner.revision else 0, .lease = .permanent, .decided_us = 1_000_000 }, testClock());
+            _ = try store.settleOutcome(entry.token(), 1_000_000, observed(entry), testClock());
+        }
+    };
+
+    try t.expectEqual(durable.Store.AdminAdmission.fresh, try f.store.admitAdminRequest(request, 0));
+    const first = durable.Store.adminDecisionId(request, 0);
+    try Ban.set(&f.store, key, scope, first);
+    // A retry at the same admission revision is the same decision and changes nothing.
+    const revisions = try f.store.inspectInteger("SELECT count(*) FROM effect_owner_revisions;");
+    const owner = (try f.store.currentOwner(key, "sshd")).?;
+    _ = try f.store.setOwner(.{ .scope = scope, .jail = "sshd", .generation = [_]u8{3} ** 32, .decision_id = durable.Store.adminDecisionId(request, 0), .expected_revision = owner.revision, .lease = .permanent, .decided_us = 1_000_000 }, testClock());
+    try t.expectEqual(revisions, try f.store.inspectInteger("SELECT count(*) FROM effect_owner_revisions;"));
+    _ = try f.store.finishAdminRequest(.{ .request_id = request, .kind = .ban, .subject = "sshd", .outcome = .applied, .generation = gen, .committed_us = 100, .detail = "", .admission_revision = 0 }, null);
+    try t.expectEqual(@as(i64, 0), try f.store.inspectInteger("SELECT admission_revision FROM admin_requests;"));
+    try Ban.set(&f.store, key, scope, [_]u8{0x52} ** 32);
+    // Age eviction removes the request record.
+    _ = try f.store.finishAdminRequest(.{ .request_id = [_]u8{0x53} ** 32, .kind = .unban, .subject = "sshd", .outcome = .applied, .generation = gen, .committed_us = 100 + durable.Store.admin_request_max_age_us + 1, .detail = "", .admission_revision = 1 }, null);
+    try t.expectEqual(@as(i64, 0), try f.store.inspectInteger("SELECT count(*) FROM admin_requests WHERE request_id=x'5151515151515151515151515151515151515151515151515151515151515151';"));
+
+    const revision = try f.store.adminRevision();
+    try t.expectEqual(durable.Store.AdminAdmission.fresh, try f.store.admitAdminRequest(request, revision));
+    const replayed = durable.Store.adminDecisionId(request, revision);
+    try t.expect(!std.mem.eql(u8, &first, &replayed));
+    try Ban.set(&f.store, key, scope, replayed);
+    try t.expectEqual(@as(i64, 3), try f.store.inspectInteger("SELECT count(*) FROM confirmed_effect_events;"));
+    try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM confirmation_markers;"));
+    try t.expect(std.mem.eql(u8, &replayed, &(try f.store.currentOwner(key, "sshd")).?.decision_id));
+}
