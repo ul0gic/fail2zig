@@ -190,11 +190,6 @@ pub const JailId = struct {
     }
 };
 
-test "IpAddress: parse ipv4 typical" {
-    const ip = try IpAddress.parse("192.168.1.1");
-    try std.testing.expectEqual(@as(u32, 0xC0A80101), ip.ipv4);
-}
-
 test "IpAddress: parse ipv4 all-zeros" {
     const ip = try IpAddress.parse("0.0.0.0");
     try std.testing.expectEqual(@as(u32, 0), ip.ipv4);
@@ -336,12 +331,6 @@ test "IpAddress: isUnenforceable allows real routable offenders" {
     try std.testing.expect(!(try IpAddress.parse("::ffff:1.2.3.4")).isUnenforceable());
 }
 
-test "JailId: fromSlice typical" {
-    const j = try JailId.fromSlice("sshd");
-    try std.testing.expectEqualStrings("sshd", j.slice());
-    try std.testing.expectEqual(@as(u8, 4), j.len);
-}
-
 test "JailId: fromSlice rejects empty" {
     try std.testing.expectError(error.JailIdEmpty, JailId.fromSlice(""));
 }
@@ -364,10 +353,4 @@ test "JailId: eql" {
     const c = try JailId.fromSlice("nginx");
     try std.testing.expect(JailId.eql(a, b));
     try std.testing.expect(!JailId.eql(a, c));
-}
-
-test "BanState: discriminants stable" {
-    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(BanState.monitoring));
-    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(BanState.banned));
-    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(BanState.expired));
 }

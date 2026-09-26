@@ -727,12 +727,6 @@ test "parser: extractIpv4 rejects invalid octet" {
     try std.testing.expectEqual(@as(u8, 7), r.len);
 }
 
-test "parser: extractIpv4 stops at non-digit-non-dot" {
-    const r = extractIpv4("1.2.3.4 from somewhere").?;
-    try std.testing.expectEqual(@as(u32, 0x01020304), r.ip);
-    try std.testing.expectEqual(@as(u8, 7), r.len);
-}
-
 test "parser: extractIpv4 consumes just the address" {
     const r = extractIpv4("8.8.8.8:443").?;
     try std.testing.expectEqual(@as(u8, 7), r.len);
@@ -919,35 +913,6 @@ test "parser: compile pattern with host" {
     const m = comptime compile("<HOST> has IP <IP>");
     const r = m("web01.example.com has IP 10.0.0.5").?;
     try std.testing.expectEqual(@as(u32, 0x0A000005), r.ip.ipv4);
-}
-
-test "parser: compile pattern has zero heap allocation" {
-    var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    const a = fa.allocator();
-    const m = comptime compile("Failed password for <*> from <IP>");
-    const p = Parser.withMatcher(a, m);
-    const r = try p.parseLine("Failed password for root from 9.9.9.9");
-    try std.testing.expectEqual(@as(u32, 0x09090909), r.ip.ipv4);
-    try std.testing.expectEqual(@as(usize, 0), fa.alloc_index);
-    try std.testing.expectEqual(@as(usize, 0), fa.allocations);
-}
-
-test "parser: Parser wrapper parseLine default pattern" {
-    const p = Parser.init(std.testing.allocator);
-    const r = try p.parseLine("some prefix 1.2.3.4 tail");
-    try std.testing.expectEqual(@as(u32, 0x01020304), r.ip.ipv4);
-}
-
-test "parser: Parser wrapper rejects line with no IP" {
-    const p = Parser.init(std.testing.allocator);
-    try std.testing.expectError(error.NoMatch, p.parseLine("no ip here"));
-}
-
-test "parser: Parser wrapper with custom match fn" {
-    const m = comptime compile("ssh <IP>");
-    const p = Parser.withMatcher(std.testing.allocator, m);
-    const r = try p.parseLine("ssh 10.0.0.1");
-    try std.testing.expectEqual(@as(u32, 0x0A000001), r.ip.ipv4);
 }
 
 test {

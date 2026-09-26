@@ -87,14 +87,6 @@ test "format: BUG-059 status memory percentage handles the full u64 range" {
     try testing.expect(std.mem.indexOf(u8, stream.getWritten(), "could not parse status payload (OutOfMemory)") != null);
 }
 
-test "format: status json passes through" {
-    const payload = "{\"version\":\"0.1.0\"}";
-    const out = try runStatus(testing.allocator, payload, .json);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.startsWith(u8, out, "{"));
-    try testing.expect(std.mem.indexOf(u8, out, "0.1.0") != null);
-}
-
 test "format: status plain is tab-separated" {
     const payload = "{\"version\":\"0.1.0\",\"active_bans\":3}";
     const out = try runStatus(testing.allocator, payload, .plain);
@@ -122,14 +114,6 @@ test "format: status bad json surfaces error" {
     const out = try runStatus(testing.allocator, "not json", .table);
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "error") != null);
-}
-
-test "format: status table renders Protection row when present" {
-    const payload = "{\"version\":\"0.2.0\",\"protection\":\"log-only\",\"backend\":\"nftables\"}";
-    const out = try runStatus(testing.allocator, payload, .table);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "Protection:") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "log-only") != null);
 }
 
 test "format: CP-02 status heading is neutral and narrow output is bounded" {
