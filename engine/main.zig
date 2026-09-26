@@ -20,8 +20,6 @@ pub const event_loop_mod = @import("core/event_loop.zig");
 pub const journald_source_mod = @import("core/journald_source.zig");
 pub const parser_mod = @import("core/parser.zig");
 pub const state_mod = @import("core/state.zig");
-pub const tracker_map_mod = @import("core/tracker_map.zig");
-pub const persist_mod = @import("core/persist.zig");
 pub const native_store_mod = @import("core/record_store.zig");
 pub const firewall_scope_mod = @import("firewall/scope.zig");
 pub const native_action_outcome_mod = @import("core/native_action_outcome.zig");
@@ -44,9 +42,7 @@ pub const filter_mail_mod = @import("filters/mail.zig");
 pub const filter_misc_mod = @import("filters/misc.zig");
 pub const filter_portsentry_mod = @import("filters/portsentry.zig");
 pub const filter_registry_mod = @import("filters/registry.zig");
-pub const ban_lifecycle_mod = @import("core/ban_lifecycle.zig");
 pub const ipc_mod = @import("net/ipc.zig");
-pub const commands_mod = @import("net/commands.zig");
 
 pub const version = build_options.version;
 
@@ -536,20 +532,6 @@ fn ensureSocketDir(socket_path: []const u8) !void {
     };
 }
 
-test "engine: version constant tracks build_options" {
-    try std.testing.expectEqualStrings(build_options.version, version);
-}
-
-test "engine: all version identities agree (ISSUE-010 drift guard)" {
-    const ctx_default_version = (commands_mod.Context{
-        .trackers = undefined,
-        .config = undefined,
-        .backend = undefined,
-    }).version;
-    try std.testing.expectEqualStrings(build_options.version, version);
-    try std.testing.expectEqualStrings(build_options.version, ctx_default_version);
-}
-
 test {
     _ = @import("cli/migrate.zig");
     _ = @import("cli/rule_test.zig");
@@ -782,8 +764,6 @@ test {
     _ = journald_source_mod;
     _ = parser_mod;
     _ = state_mod;
-    _ = tracker_map_mod;
-    _ = persist_mod;
     _ = firewall;
     _ = config_mod;
     _ = fail2ban_mod;
@@ -797,6 +777,5 @@ test {
     _ = filter_registry_mod;
     _ = ipc_mod;
     _ = @import("net/http.zig");
-    _ = commands_mod;
     _ = shared;
 }

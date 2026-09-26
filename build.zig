@@ -386,23 +386,6 @@ pub fn build(b: *std.Build) void {
     release_local_step.dependOn(&run_standalone_tests.step);
     ci.add(.assembled, &run_standalone_tests.step);
 
-    const integration_mod = b.createModule(.{
-        .root_source_file = b.path("tests/integration/ipc_roundtrip_test.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    integration_mod.addImport("shared", shared_mod);
-    integration_mod.addImport("engine", engine_mod);
-
-    const integration_tests = b.addTest(.{
-        .root_module = integration_mod,
-        .filters = test_filters,
-    });
-    const run_integration_tests = b.addRunArtifact(integration_tests);
-    test_step.dependOn(&run_integration_tests.step);
-    ci.add(.deferred, &run_integration_tests.step); // Mixed legacy and current behavior.
-
     const IntegrationFile = struct {
         ci: CiLane,
         release_local: bool,
@@ -415,8 +398,6 @@ pub fn build(b: *std.Build) void {
         .{ .name = "harness", .path = "tests/integration/harness.zig", .needs_daemon_binary = false, .ci = .excluded, .release_local = false },
         .{ .name = "ban", .path = "tests/integration/ban_test.zig", .needs_daemon_binary = true, .ci = .excluded, .release_local = false },
         .{ .name = "migration", .path = "tests/integration/migration_test.zig", .needs_daemon_binary = false, .ci = .assembled, .release_local = false },
-        .{ .name = "persistence", .path = "tests/integration/persistence_test.zig", .needs_daemon_binary = true, .ci = .deferred, .release_local = false },
-        .{ .name = "status_surface", .path = "tests/integration/status_surface_test.zig", .needs_daemon_binary = false, .ci = .excluded, .release_local = false },
         .{ .name = "startup_failclosed", .path = "tests/integration/startup_failclosed_test.zig", .needs_daemon_binary = true, .ci = .assembled, .release_local = true },
         .{ .name = "native_daemon", .path = "tests/integration/native_daemon_test.zig", .needs_daemon_binary = true, .ci = .assembled, .release_local = true },
         .{ .name = "journalctl_contract", .path = "tests/integration/journalctl_contract_test.zig", .needs_daemon_binary = false, .ci = .assembled, .release_local = true },

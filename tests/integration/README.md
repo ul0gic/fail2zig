@@ -39,8 +39,8 @@ repo root: run `zig build` first and invoke `zig test` from the repo root.
 
 Most files are listed in the `integration_files` array in `build.zig`; the
 loop creates the module, adds the `shared` and `engine` imports, links libc,
-and registers the selected maintained or deferred test lane. The IPC round-trip
-test is registered separately:
+and registers the selected maintained or deferred test lane. Retired tracker/command-handler round trips were removed; the native daemon
+suite checks the delivered CLI against current handlers:
 
 ```zig
 .{ .name = "native_daemon", .path = "tests/integration/native_daemon_test.zig",
@@ -50,7 +50,7 @@ test is registered separately:
 To add a file, append one row. `needs_daemon_binary = true` makes the run
 depend on `b.getInstallStep()`, so `zig-out/bin/fail2zig` is built before the
 test spawns it; set it for every file that starts the daemon as a subprocess
-(`ban`, `persistence`, `startup_failclosed`, `config_diag`, `no_backend`).
+(`ban`, `startup_failclosed`, `config_diag`, `no_backend`).
 Keep changes to this registration table synchronized with the affected integration file.
 
 `no_backend_test.zig` (SYS-014 / ADR-007 / ENH-006) is the inverse of the
