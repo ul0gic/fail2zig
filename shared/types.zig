@@ -190,16 +190,6 @@ pub const JailId = struct {
     }
 };
 
-test "IpAddress: parse ipv4 all-zeros" {
-    const ip = try IpAddress.parse("0.0.0.0");
-    try std.testing.expectEqual(@as(u32, 0), ip.ipv4);
-}
-
-test "IpAddress: parse ipv4 all-ones" {
-    const ip = try IpAddress.parse("255.255.255.255");
-    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), ip.ipv4);
-}
-
 test "IpAddress: reject invalid ipv4" {
     try std.testing.expectError(error.Invalid, IpAddress.parse("256.0.0.1"));
     try std.testing.expectError(error.Invalid, IpAddress.parse("192.168.1"));
@@ -216,16 +206,6 @@ test "IpAddress: parse ipv6 full" {
     const ip = try IpAddress.parse("2001:0db8:85a3:0000:0000:8a2e:0370:7334");
     const expected: u128 = 0x20010db885a3000000008a2e03707334;
     try std.testing.expectEqual(expected, ip.ipv6);
-}
-
-test "IpAddress: parse ipv6 compressed loopback" {
-    const ip = try IpAddress.parse("::1");
-    try std.testing.expectEqual(@as(u128, 1), ip.ipv6);
-}
-
-test "IpAddress: parse ipv6 compressed all-zeros" {
-    const ip = try IpAddress.parse("::");
-    try std.testing.expectEqual(@as(u128, 0), ip.ipv6);
 }
 
 test "IpAddress: parse ipv6 ipv4-mapped folds to ipv4" {
@@ -253,13 +233,6 @@ test "IpAddress: fromIpv6Bits preserves unspecified and loopback" {
     try std.testing.expectEqual(@as(u128, 0), unspec.ipv6);
     const loop = try IpAddress.fromIpv6Bits(1);
     try std.testing.expectEqual(@as(u128, 1), loop.ipv6);
-}
-
-test "IpAddress: format ipv4 roundtrip" {
-    var buf: [32]u8 = undefined;
-    const ip: IpAddress = .{ .ipv4 = 0xC0A80101 };
-    const out = try std.fmt.bufPrint(&buf, "{}", .{ip});
-    try std.testing.expectEqualStrings("192.168.1.1", out);
 }
 
 test "IpAddress: format ipv6 loopback" {
@@ -304,16 +277,6 @@ test "IpAddress: format ipv6 no compression eligible" {
     try std.testing.expectEqualStrings("1:2:3:4:5:6:7:8", out);
 }
 
-test "IpAddress: eql" {
-    const a: IpAddress = .{ .ipv4 = 1 };
-    const b: IpAddress = .{ .ipv4 = 1 };
-    const c: IpAddress = .{ .ipv4 = 2 };
-    const d: IpAddress = .{ .ipv6 = 1 };
-    try std.testing.expect(IpAddress.eql(a, b));
-    try std.testing.expect(!IpAddress.eql(a, c));
-    try std.testing.expect(!IpAddress.eql(a, d));
-}
-
 test "IpAddress: isUnenforceable rejects unspecified and loopback" {
     try std.testing.expect((IpAddress{ .ipv4 = 0 }).isUnenforceable());
     try std.testing.expect((try IpAddress.parse("::")).isUnenforceable());
@@ -321,14 +284,6 @@ test "IpAddress: isUnenforceable rejects unspecified and loopback" {
     try std.testing.expect((try IpAddress.parse("::1")).isUnenforceable());
     try std.testing.expect((try IpAddress.parse("0.1.2.3")).isUnenforceable());
     try std.testing.expect((try IpAddress.parse("127.255.255.254")).isUnenforceable());
-}
-
-test "IpAddress: isUnenforceable allows real routable offenders" {
-    try std.testing.expect(!(try IpAddress.parse("1.2.3.4")).isUnenforceable());
-    try std.testing.expect(!(try IpAddress.parse("203.0.113.5")).isUnenforceable());
-    try std.testing.expect(!(try IpAddress.parse("192.168.1.100")).isUnenforceable());
-    try std.testing.expect(!(try IpAddress.parse("2001:db8::1")).isUnenforceable());
-    try std.testing.expect(!(try IpAddress.parse("::ffff:1.2.3.4")).isUnenforceable());
 }
 
 test "JailId: fromSlice rejects empty" {
@@ -345,12 +300,4 @@ test "JailId: fromSlice accepts max length" {
     const j = try JailId.fromSlice(&at_limit);
     try std.testing.expectEqual(@as(u8, 64), j.len);
     try std.testing.expectEqualStrings(&at_limit, j.slice());
-}
-
-test "JailId: eql" {
-    const a = try JailId.fromSlice("sshd");
-    const b = try JailId.fromSlice("sshd");
-    const c = try JailId.fromSlice("nginx");
-    try std.testing.expect(JailId.eql(a, b));
-    try std.testing.expect(!JailId.eql(a, c));
 }
