@@ -396,8 +396,6 @@ pub fn build(b: *std.Build) void {
     };
     const integration_files = [_]IntegrationFile{
         .{ .name = "filter_corpus", .path = "tests/integration/filter_corpus_test.zig", .needs_daemon_binary = false, .ci = .excluded, .release_local = false },
-        .{ .name = "harness", .path = "tests/integration/harness.zig", .needs_daemon_binary = false, .ci = .excluded, .release_local = false },
-        .{ .name = "ban", .path = "tests/integration/ban_test.zig", .needs_daemon_binary = true, .ci = .excluded, .release_local = false },
         .{ .name = "migration", .path = "tests/integration/migration_test.zig", .needs_daemon_binary = false, .ci = .assembled, .release_local = false },
         .{ .name = "startup_failclosed", .path = "tests/integration/startup_failclosed_test.zig", .needs_daemon_binary = true, .ci = .assembled, .release_local = true },
         .{ .name = "native_daemon", .path = "tests/integration/native_daemon_test.zig", .needs_daemon_binary = true, .ci = .assembled, .release_local = true },

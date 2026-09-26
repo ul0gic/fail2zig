@@ -13,26 +13,14 @@ root privileges, namespaces or a firewall use explicit skip conditions.
 
 ## Build
 
-Each file is self-contained: it imports `shared` and `engine` as named
-modules. `engine` in turn imports `shared` and `build_options` (the `version`
-option `build.zig` generates), so a standalone run needs a one-line stub for
-the latter and `-lc`:
+Use the named `zig build test-native-daemon`, `test-cli-entry`, `test-config-diag`,
+`test-startup`, `test-admin` or `test-service-lifecycle` steps as applicable, with
+`-Doptimize=ReleaseSafe`. These supply the current module and SQLite wiring.
+`test-ci-assembled` is the explicit combined gate; do not also invoke its members.
 
-```bash
-printf 'pub const version: []const u8 = "test";\n' > /tmp/build_options.zig
-zig test -lc \
-  --dep shared --dep engine -Mroot=tests/integration/<name>.zig \
-  --dep shared --dep build_options -Mengine=engine/main.zig \
-  -Mshared=shared/root.zig \
-  -Mbuild_options=/tmp/build_options.zig
-```
-
-The `--dep` clauses before an `-M` name that module's own imports; omitting
-`--dep build_options` before `-Mengine` fails with
-`no module named 'build_options' available within module engine`.
-
-Files that spawn the daemon look for `zig-out/bin/fail2zig` relative to the
-repo root: run `zig build` first and invoke `zig test` from the repo root.
+Files spawning the daemon currently share `zig-out/bin/fail2zig`; serialize builds
+and consumers. `harness.zig` is shared support, not a separately registered suite.
+Its behavior is exercised by the actual daemon cases using it.
 
 ## Wiring into `build.zig`
 
@@ -49,7 +37,7 @@ suite checks the delivered CLI against current handlers:
 To add a file, append one row. `needs_daemon_binary = true` makes the run
 depend on `b.getInstallStep()`, so `zig-out/bin/fail2zig` is built before the
 test spawns it; set it for every file that starts the daemon as a subprocess
-(`ban`, `startup_failclosed`, `config_diag`, `no_backend`).
+(`native_daemon`, `startup_failclosed`, `config_diag`, `no_backend`).
 Keep changes to this registration table synchronized with the affected integration file.
 
 `no_backend_test.zig` (SYS-014 / ADR-007 / ENH-006) is the inverse of the
@@ -97,6 +85,6 @@ forced `firewall = "ipset"` + `metrics_enabled = false` validates and echoes
 
 ## Skip semantics
 
-Every test that can't run in the current environment returns
-`error.SkipZigTest` rather than failing. That's a hard contract — a test
-that would fail in an unprivileged CI must skip, never turn red.
+Missing required privileges or explicit lab fixtures produce a named skip, not
+a pass. Unexpected daemon startup or behavioral failures must fail. Local skips
+do not establish kernel/backend qualification.
