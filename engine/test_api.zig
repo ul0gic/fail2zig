@@ -25,7 +25,6 @@ pub const core = struct {
     pub const event_loop = @import("core/event_loop.zig");
     pub const event_time = @import("core/event_time.zig");
     pub const journal_policy = @import("core/journal_policy.zig");
-    pub const journald_source = @import("core/journald_source.zig");
     pub const line_context = @import("core/line_context.zig");
     pub const log_target = @import("core/log_target.zig");
     pub const native_action_context = @import("core/native_action_context.zig");

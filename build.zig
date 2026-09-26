@@ -213,7 +213,6 @@ pub fn build(b: *std.Build) void {
         .{ .name = "test-native-reload-crash", .path = "tests/component/native_reload_crash_tests.zig", .filter = "reload crash:", .sqlite = true, .ci = .components_b },
         .{ .name = "test-native-config-inline", .path = "tests/component/native_config_inline_tests.zig", .filter = "", .sqlite = false, .ci = .components_b },
         .{ .name = "test-fail2ban-inline", .path = "tests/component/fail2ban_inline_tests.zig", .filter = "", .sqlite = false, .ci = .components_b },
-        .{ .name = "test-journald-source-inline", .path = "tests/component/journald_source_inline_tests.zig", .filter = "journald:", .sqlite = false, .ci = .components_a },
         .{ .name = "test-firewall-inspection-inline", .path = "tests/component/firewall_inspection_inline_tests.zig", .filter = "native firewall:", .sqlite = false, .ci = .components_a },
         .{ .name = "test-nftables-inline", .path = "tests/component/nftables_inline_tests.zig", .filter = "nftables:", .sqlite = false, .ci = .components_b },
     };
@@ -284,6 +283,8 @@ pub fn build(b: *std.Build) void {
     const run_foundations = b.addRunArtifact(native_foundations);
     b.step("test-native-foundations", "Test native storage, time, sources and recovery without legacy workers").dependOn(&run_foundations.step);
     ci.add(.components_b, &run_foundations.step);
+    const native_journal = b.addTest(.{ .root_module = native_foundations_mod, .filters = &.{"native journal:"} });
+    b.step("test-native-journal", "Test current journal continuity and bounded recovery").dependOn(&b.addRunArtifact(native_journal).step);
     const native_source = b.addTest(.{ .root_module = native_foundations_mod, .filters = &.{"native source:"} });
     const run_native_source = b.addRunArtifact(native_source);
     b.step("test-native-source", "Test durable file source continuity and framing").dependOn(&run_native_source.step);

@@ -450,11 +450,6 @@ pub const JournalJail = struct {
         self.entries = 0;
         self.baseline_done = false;
     }
-
-    pub const TestAccess = if (builtin.is_test) struct {
-        pub const cursorSlice = JournalJail.cursorSlice;
-        pub const setCursor = JournalJail.setCursor;
-    } else struct {};
 };
 
 pub const Options = struct {
@@ -949,14 +944,6 @@ pub const JournaldSource = struct {
             if (!self.processEntry(jj, line)) break;
         }
     }
-
-    pub const TestAccess = if (builtin.is_test) struct {
-        pub const consumeLines = JournaldSource.consumeLines;
-        pub const finishChild = JournaldSource.finishChild;
-        pub const pollJail = JournaldSource.pollJail;
-        pub const processBatch = JournaldSource.processBatch;
-        pub const seedBaseline = JournaldSource.seedBaseline;
-    } else struct {};
 };
 
 fn reapNoHang(pid: posix.pid_t) ?u32 {
