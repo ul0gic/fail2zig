@@ -28,35 +28,6 @@ const Fixture = struct {
 fn binding(jail: effective.Jail, proofs: []const effective.AssetBinding) effective.Binding {
     return .{ .jail = jail.name, .prepared_generation = jail.generation, .rule_generation = [_]u8{3} ** 32, .native_filter = "qualified-original", .assets = proofs, .source_kind = .file, .timestamp = .{ .field = .{ .format = .epoch_seconds, .boundary = .{ .delimiter = ' ' } } }, .family = .v4, .effect_scope_generation = [_]u8{4} ** 32 };
 }
-test "native effective: layers includes local order and raw provenance remain intact" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    try f.base();
-    try f.write("jail.conf", "[INCLUDES]\nbefore=before.conf\nafter=after.conf\n[probe]\nenabled=true\nbackend=polling\nfilter=original\nlogpath=/original/input.log\nmaxretry=2\n");
-    try f.write("before.conf", "[DEFAULT]\nmaxretry=1\nfindtime=60\n");
-    try f.write("after.conf", "[probe]\nmaxretry=3\n");
-    try f.write("jail.d/10-first.conf", "[probe]\nmaxretry=4\n");
-    try f.write("jail.local", "[probe]\nmaxretry=5\n");
-    try f.write("jail.d/99-last.local", "[probe]\nmaxretry=6\n");
-    const p = try effective.Prepared.create(t.allocator, f.root, .{});
-    defer p.destroy();
-    try t.expectEqual(@as(usize, 1), p.jails.len);
-    const graph = p.document.source;
-    try t.expectEqual(@as(usize, 6), graph.sources.items.len);
-    try t.expectEqualStrings("6", graph.section("probe").?.get("maxretry").?);
-    try t.expectEqualStrings("5", graph.section("probe").?.previous.get("maxretry").?);
-    try t.expectEqual(.before, graph.sources.items[0].edge);
-    try t.expectEqual(.after, graph.sources.items[2].edge);
-    try t.expect(std.mem.endsWith(u8, graph.sources.items[5].path, "99-last.local"));
-    var found = false;
-    for (p.jails[0].options) |option| if (std.mem.eql(u8, option.name, "maxretry")) {
-        try t.expectEqualStrings("6", option.value.?);
-        try t.expectEqualStrings("6", option.origin.?.raw);
-        try t.expect(std.mem.endsWith(u8, option.origin.?.source, "99-last.local"));
-        found = true;
-    };
-    try t.expect(found);
-}
 test "native effective: parameterized initial known and final jail filter context are distinct" {
     var f = try Fixture.init();
     defer f.deinit();

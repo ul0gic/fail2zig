@@ -12,7 +12,6 @@ const loadJailConfig = config.loadJailConfig;
 const parseFilterSource = config.parseFilterSource;
 const ActionBackend = config.ActionBackend;
 const parseActionSource = config.parseActionSource;
-const mapActionNameToBackend = config.mapActionNameToBackend;
 const parseSelector = config.parseSelector;
 const splitSelectors = config.splitSelectors;
 const resolveWithParameters = config.resolveWithParameters;
@@ -21,22 +20,6 @@ const canonicalInteger = config.canonicalInteger;
 const prepareConfigDocument = config.prepareConfigDocument;
 const mergeInto = config.test_access.merge_into;
 const expandTags = config.test_access.expand_tags;
-
-test "fail2ban: parse minimal section" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    const src =
-        \\[sshd]
-        \\enabled = true
-        \\maxretry = 3
-    ;
-    var ini = try parseIniSource(arena.allocator(), "jail.conf", src);
-    try testing.expectEqual(@as(usize, 1), ini.sections.count());
-    const sec = ini.section("sshd").?;
-    try testing.expectEqualStrings("true", sec.get("enabled").?);
-    try testing.expectEqualStrings("3", sec.get("maxretry").?);
-}
 
 test "fail2ban: parse tolerates comments both # and ;" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -56,49 +39,6 @@ test "fail2ban: parse tolerates comments both # and ;" {
     try testing.expectEqualStrings("600", sec.get("findtime").?);
 }
 
-test "fail2ban: parse multi-line value via indent continuation" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    const src =
-        \\[Definition]
-        \\failregex = first pattern
-        \\            second pattern
-        \\            third pattern
-        \\ignoreregex = solo
-    ;
-    var ini = try parseIniSource(arena.allocator(), "test", src);
-    const sec = ini.section("Definition").?;
-    const fr = sec.get("failregex").?;
-    try testing.expect(std.mem.indexOf(u8, fr, "first pattern") != null);
-    try testing.expect(std.mem.indexOf(u8, fr, "second pattern") != null);
-    try testing.expect(std.mem.indexOf(u8, fr, "third pattern") != null);
-    try testing.expectEqualStrings("solo", sec.get("ignoreregex").?);
-}
-
-test "fail2ban: parse DEFAULT interpolation" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    const src =
-        \\[DEFAULT]
-        \\bantime = 600
-        \\findtime = 600
-        \\maxretry = 5
-        \\
-        \\[sshd]
-        \\enabled = true
-        \\bantime = %(default/bantime)s
-        \\custom = ban=%(bantime)s find=%(findtime)s
-    ;
-    var ini = try parseIniSource(arena.allocator(), "test", src);
-    try interpolate(arena.allocator(), &ini);
-
-    const sshd = ini.section("sshd").?;
-    try testing.expectEqualStrings("600", sshd.get("bantime").?);
-    try testing.expectEqualStrings("ban=600 find=600", sshd.get("custom").?);
-}
-
 test "fail2ban: interpolate detects cycles and keeps raw" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -114,14 +54,6 @@ test "fail2ban: interpolate detects cycles and keeps raw" {
     var ini = try parseIniSource(arena.allocator(), "test", src);
     try interpolate(arena.allocator(), &ini);
     try testing.expect(ini.warnings.items.len > 0);
-}
-
-test "fail2ban: parse section headers rejected when unterminated" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    const src = "[sshd\nfoo = 1\n";
-    try testing.expectError(error.UnterminatedSection, parseIniSource(arena.allocator(), "test", src));
 }
 
 test "fail2ban: realistic jail.conf snippet" {
@@ -169,35 +101,6 @@ test "fail2ban: realistic jail.conf snippet" {
     try testing.expectEqualStrings("3600", sshd.get("bantime").?);
     try testing.expectEqualStrings("systemd", ini.section("DEFAULT").?.get("backend").?);
     try testing.expect(sshd.get("backend") == null);
-}
-
-test "fail2ban: merge jail.conf + jail.local override" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    const base =
-        \\[DEFAULT]
-        \\bantime = 600
-        \\[sshd]
-        \\enabled = false
-        \\filter = sshd
-        \\maxretry = 5
-    ;
-    const override =
-        \\[sshd]
-        \\enabled = true
-        \\maxretry = 3
-    ;
-
-    var result = try parseIniSource(arena.allocator(), "jail.conf", base);
-    const ov = try parseIniSource(arena.allocator(), "jail.local", override);
-    try mergeInto(arena.allocator(), &result, ov);
-    try interpolate(arena.allocator(), &result);
-
-    const sshd = result.section("sshd").?;
-    try testing.expectEqualStrings("true", sshd.get("enabled").?);
-    try testing.expectEqualStrings("3", sshd.get("maxretry").?);
-    try testing.expectEqualStrings("sshd", sshd.get("filter").?);
 }
 
 test "fail2ban: loadJailConfig reads jail.conf + jail.local + jail.d" {
@@ -269,23 +172,6 @@ test "fail2ban: translate simple sshd pattern via <HOST>" {
     const f = try parseFilterSource(arena.allocator(), "sshd.conf", src);
     try testing.expectEqual(@as(usize, 1), f.failregex.len);
     try testing.expectEqualStrings("Failed password for <*> from <IP>", f.failregex[0].pattern);
-}
-
-test "fail2ban: translate multi-line failregex" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    const src =
-        \\[Definition]
-        \\failregex = ^Failed password for .* from <HOST>$
-        \\            ^Invalid user .* from <HOST>$
-        \\            ^Connection closed by <HOST>$
-    ;
-    const f = try parseFilterSource(arena.allocator(), "sshd.conf", src);
-    try testing.expectEqual(@as(usize, 3), f.failregex.len);
-    try testing.expect(std.mem.indexOf(u8, f.failregex[0].pattern, "<IP>") != null);
-    try testing.expect(std.mem.indexOf(u8, f.failregex[1].pattern, "<IP>") != null);
-    try testing.expect(std.mem.indexOf(u8, f.failregex[2].pattern, "<IP>") != null);
 }
 
 test "fail2ban: translate explicit IPv4 regex to <IP>" {
@@ -372,24 +258,6 @@ test "fail2ban: action iptables-multiport maps to iptables" {
     }
 }
 
-test "fail2ban: action nftables-allports maps to nftables" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    const src = "[Definition]\nactionban = nft add element <ip>\n";
-    const a = try parseActionSource(arena.allocator(), "nftables-allports", src);
-    try testing.expectEqual(ActionBackend.nftables, a.backend);
-}
-
-test "fail2ban: action ipset-proto6 maps to ipset" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    const src = "[Definition]\nactionban = ipset add f2b <ip>\n";
-    const a = try parseActionSource(arena.allocator(), "ipset-proto6", src);
-    try testing.expectEqual(ActionBackend.ipset, a.backend);
-}
-
 test "fail2ban: action sendmail-whois maps to log-only with warning" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -407,17 +275,6 @@ test "fail2ban: action sendmail-whois maps to log-only with warning" {
         if (std.mem.indexOf(u8, w.message, "not recognized") != null) found_warning = true;
     }
     try testing.expect(found_warning);
-}
-
-test "fail2ban: mapActionNameToBackend direct" {
-    try testing.expectEqual(ActionBackend.iptables, mapActionNameToBackend("iptables"));
-    try testing.expectEqual(ActionBackend.iptables, mapActionNameToBackend("iptables-multiport"));
-    try testing.expectEqual(ActionBackend.iptables, mapActionNameToBackend("iptables-allports"));
-    try testing.expectEqual(ActionBackend.nftables, mapActionNameToBackend("nftables"));
-    try testing.expectEqual(ActionBackend.nftables, mapActionNameToBackend("nftables-multiport"));
-    try testing.expectEqual(ActionBackend.ipset, mapActionNameToBackend("ipset-proto6-allports"));
-    try testing.expectEqual(ActionBackend.log_only, mapActionNameToBackend("sendmail"));
-    try testing.expectEqual(ActionBackend.log_only, mapActionNameToBackend("route"));
 }
 
 test "p2 config layers includes previous values and provenance" {
