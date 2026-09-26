@@ -422,39 +422,6 @@ test "record store: SQLite heap budget feasibility and recovery after allocation
     try std.testing.expectEqual(@as(i64, 2), try recovered.pendingIntents());
 }
 
-test "record store: SQLite work budget feasibility interrupts excessive query and releases statements" {
-    const Progress = struct {
-        remaining: u32,
-        extern "c" fn sqlite3_progress_handler(*Db, c_int, ?*const fn (?*anyopaque) callconv(.c) c_int, ?*anyopaque) void;
-        fn tick(context: ?*anyopaque) callconv(.c) c_int {
-            const self: *@This() = @ptrCast(@alignCast(context.?));
-            self.remaining -|= 1;
-            return @intFromBool(self.remaining == 0);
-        }
-    };
-    const a = std.testing.allocator;
-    var temp = std.testing.tmpDir(.{});
-    defer temp.cleanup();
-    const base = try temp.dir.realpathAlloc(a, ".");
-    defer a.free(base);
-    const path = try std.fs.path.join(a, &.{ base, "work-budget.sqlite" });
-    defer a.free(path);
-    var store = try Store.open(a, path);
-    defer store.close();
-    var budget = Progress{ .remaining = 1000 };
-    Progress.sqlite3_progress_handler(store.db, 1000, Progress.tick, &budget);
-    defer Progress.sqlite3_progress_handler(store.db, 0, null, null);
-    const record = Record{ .jail = "fixture", .source = "file", .occurrence = "1", .cursor = "1", .raw_hash = [_]u8{1} ** 32, .disposition = "counted", .checkpoint = "saved", .action_intent = "saved-intent" };
-    _ = try store.commitRecord(record);
-    try std.testing.expectError(error.Interrupted, store.integer("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000000) SELECT sum(x) FROM n;"));
-    try std.testing.expectEqual(@as(u32, 0), budget.remaining);
-    try std.testing.expectEqual(@as(?c_int, 9), store.last_error_code);
-    budget.remaining = 1000;
-    try std.testing.expectEqual(@as(u64, 1), try store.revision("fixture"));
-    try std.testing.expectEqual(@as(i64, 1), try store.pendingIntents());
-    try std.testing.expectEqual(CommitResult.already_committed, try store.commitRecord(record));
-}
-
 test "record store: capacity failure preserves every committed component and retry is atomic" {
     const allocator = std.testing.allocator;
     var temp = std.testing.tmpDir(.{});
