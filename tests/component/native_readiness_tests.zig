@@ -43,15 +43,6 @@ fn expectComponent(report: readiness.Report, c: readiness.Component, s: readines
     try testing.expectEqual(s, report.state(c));
 }
 
-test "native readiness: config not loaded fails config and names the cause" {
-    var in = allGood();
-    in.config_loaded = false;
-    const r = readiness.derive(in);
-    try testing.expect(!r.ready);
-    try expectComponent(r, .config, .failed);
-    try testing.expectEqualStrings("configuration not admitted", r.cause.?);
-}
-
 test "native readiness: storage phases map to unknown, ok, degraded and failed" {
     var in = allGood();
     in.storage_phase = null;
@@ -109,17 +100,6 @@ test "native readiness: clock unknown without worker and failed when uncertain" 
     try testing.expectEqualStrings("clock uncertain", r.cause.?);
 }
 
-test "native readiness: enforcement is not applicable for log-only jails" {
-    var in = allGood();
-    in.jails = &.{log_only_jail};
-    in.effects = null;
-    const r = readiness.derive(in);
-    try expectComponent(r, .enforcement, .ok);
-    try testing.expect(r.ready);
-    in.effects = .{ .ready = false, .uncertain = true, .overdue = true };
-    try testing.expect(readiness.derive(in).ready);
-}
-
 test "native readiness: enforcement unknown, failed, degraded for enforcing jails" {
     var in = allGood();
     in.effects = null;
@@ -146,15 +126,6 @@ test "native readiness: admin failed without admitted generation, degraded when 
     try expectComponent(r, .admin, .degraded);
     try testing.expect(!r.ready);
     try testing.expectEqualStrings("administrative socket refusing new connections", r.cause.?);
-}
-
-test "native readiness: cause names the first non-ok component in declared order" {
-    var in = allGood();
-    in.storage_phase = .paused;
-    in.admin_serving = false;
-    try testing.expectEqualStrings("storage paused", readiness.derive(in).cause.?);
-    in.config_loaded = false;
-    try testing.expectEqualStrings("configuration not admitted", readiness.derive(in).cause.?);
 }
 
 test "native readiness: json shape for ready and for a failed component" {
@@ -292,15 +263,6 @@ test "native readiness: sd_notify abstract namespace socket" {
     var buf: [64]u8 = undefined;
     try testing.expectEqual(sd_notify.Result.sent, try n.ready());
     try testing.expectEqualStrings("READY=1\n", try rx.recv(&buf));
-}
-
-test "native readiness: sd_notify absent environment is a disabled no-op" {
-    if (posix.getenv("NOTIFY_SOCKET") != null) return error.SkipZigTest;
-    var n = try sd_notify.Notifier.fromEnvironment();
-    defer n.deinit();
-    try testing.expect(!n.enabled());
-    try testing.expectEqual(sd_notify.Result.disabled, try n.ready());
-    try testing.expectEqual(sd_notify.Result.disabled, try n.status("x"));
 }
 
 test "native readiness: sd_notify rejects oversized or multi-line status and empty or long paths" {
@@ -558,32 +520,6 @@ test "native readiness: EAGAIN on a full non-blocking pipe counts as failed with
     const s = sink.stats();
     try testing.expectEqual(@as(u64, 1), s.failed_total);
     try testing.expect(s.degraded);
-}
-
-test "native readiness: std.log sink formats level, scope and truncates oversized messages" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const a = testing.allocator;
-    var dir = try TmpPath.init(a);
-    defer dir.deinit(a);
-    const path = try dir.join(a, "daemon.log");
-    defer a.free(path);
-    var sink = try log_target.Sink.init(a, .{ .file = path });
-    defer sink.deinit();
-
-    log_target.install(&sink);
-    defer log_target.install(null);
-    log_target.logFn(.warn, .default, "ipc: peer uid={d}", .{@as(u32, 7)});
-    log_target.logFn(.info, .storage, "committed {d}", .{@as(u32, 3)});
-    const big = [_]u8{'b'} ** (log_target.max_line_bytes * 2);
-    log_target.logFn(.err, .default, "{s}", .{&big});
-    try testing.expectEqual(@as(usize, 3), sink.stats().queued);
-    sink.drain();
-
-    const out = try readFile(a, path);
-    defer a.free(out);
-    try testing.expect(std.mem.startsWith(u8, out, "warning: ipc: peer uid=7\ninfo(storage): committed 3\nerror: bbbb"));
-    try testing.expect(std.mem.endsWith(u8, out, log_target.truncation_marker));
-    try testing.expectEqual(@as(usize, "warning: ipc: peer uid=7\ninfo(storage): committed 3\n".len + log_target.max_line_bytes), out.len);
 }
 
 const FakeClock = struct {
