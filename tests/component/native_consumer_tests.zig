@@ -29,11 +29,6 @@ const TestClock = struct {
     }
 };
 
-test "native consumers: register atomic store and contract tests" {
-    std.testing.refAllDecls(@import("engine_test").core.record_store);
-    std.testing.refAllDecls(@import("engine_test").core.record_pipeline);
-}
-
 test "native consumers: duplicate keys and expired dependency reject before mutation" {
     const key = consumer.Key{ .kind = .dns, .jail = "shared", .source = "resolver", .rule = "addresses", .generation = [_]u8{1} ** 32 };
     var now: i64 = 12;

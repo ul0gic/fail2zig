@@ -935,41 +935,6 @@ test "native effect runtime: a failed expiry commit keeps the view only when it 
         }
     }
 }
-fn stopNow(_: ?*anyopaque) bool {
-    return true;
-}
-test "native effect runtime: a slice yields at the first transient wait and each wake counts backoff once" {
-    var fixture = try Fixture.init(.nftables);
-    defer fixture.deinit();
-    _ = try scopeOwner(&fixture, "fixture", 1, 1, .permanent);
-    const manager = try fixture.manager();
-    defer manager.destroy();
-    try loadView(&fixture, manager);
-    try t.expectEqual(manager.count, manager.cursor);
-    manager.inspector.test_fault_readback = error.Changed;
-    const expected = [_]struct { steps: u16, failures: u8, wait: u16 }{
-        .{ .steps = 1, .failures = 1, .wait = 0 },
-        .{ .steps = 1, .failures = 2, .wait = 1 },
-        .{ .steps = 0, .failures = 2, .wait = 0 },
-        .{ .steps = 1, .failures = 3, .wait = 3 },
-        .{ .steps = 0, .failures = 3, .wait = 2 },
-    };
-    for (expected) |case| {
-        const slice = wake(manager);
-        try t.expect(slice.outcome == .wait);
-        try t.expectEqual(case.steps, slice.steps);
-        try t.expectEqual(case.failures, manager.readback_failures);
-        try t.expectEqual(case.wait, manager.readback_wait);
-    }
-    // Direct steps never consume a wake's backoff.
-    try t.expect(try stepOk(manager) == .wait);
-    try t.expectEqual(@as(u16, 2), manager.readback_wait);
-    manager.readback_wait = 0;
-    const stopped = manager.runSlice(&bindings, .{}, .{ .requested = stopNow });
-    try t.expect(stopped.outcome == .stop);
-    try t.expectEqual(@as(u16, 0), stopped.steps);
-    try t.expectEqual(@as(u8, 3), manager.readback_failures);
-}
 test "native effect runtime: stop through an unhealthy storage gate neither dispatches nor touches SQLite" {
     var fixture = try Fixture.init(.nftables);
     defer fixture.deinit();

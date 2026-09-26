@@ -8,8 +8,7 @@ real `zig-out/bin/fail2zig` binary and verify operator-visible flows.
 
 This directory holds assembled CLI, IPC and daemon tests. `build.zig` is the
 current source of truth for each test's CI lane, binary dependency and release
-local membership. `ipc_roundtrip_test.zig` has its own registered step; the
-other integration files are listed in `integration_files`. Tests that need
+local membership. Integration files are listed in `integration_files`. Tests that need
 root privileges, namespaces or a firewall use explicit skip conditions.
 
 ## Build

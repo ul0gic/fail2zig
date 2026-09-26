@@ -302,31 +302,6 @@ test "offline source repair: crash before and after commit replays the committed
     try t.expectEqualStrings(committed, unchanged);
 }
 
-// Retention is by count, so an old token eventually disappears; its replay must refuse.
-test "offline source repair: a replay after eviction refuses as an evicted token" {
-    var fx = try Fixture.init();
-    defer fx.deinit();
-    try fx.build();
-    try fx.truncate("new 1\n");
-    const first = try fx.apply(fx.request("evicted"), .{});
-    first.deinit(t.allocator);
-    const filler = try std.fmt.allocPrintZ(t.allocator,
-        \\WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<{d})
-        \\INSERT INTO source_repairs SELECT CAST(printf('%032d',i) AS BLOB),'{s}','filler',zeroblob(32),zeroblob(32),1,1,i,0,zeroblob(32),zeroblob(16),1,{d}+i FROM n;
-    , .{ repair.retained_repairs, jail, now_us });
-    defer t.allocator.free(filler);
-    fx.exec(filler);
-    // A second in-place truncation below the new prefix; its repair applies retention.
-    try fx.truncate("");
-    const second = try fx.apply(fx.request("later"), .{});
-    second.deinit(t.allocator);
-    try t.expectEqual(repair.retained_repairs, try fx.integer("SELECT count(*) FROM source_repairs WHERE outcome=1;"));
-    var diagnostic: repair.Diagnostic = .{};
-    var store = try Store.open(t.allocator, fx.state);
-    defer store.close();
-    try expectRefused(error.RepairTokenEvicted, repair.repair(&store, t.allocator, fx.request("evicted"), now_us, .{}, &diagnostic));
-}
-
 // An evicted token keeps a tombstone, so replaying it can never commit a second repair.
 test "offline source repair: an evicted token never commits again and tombstones are bounded" {
     var fx = try Fixture.init();

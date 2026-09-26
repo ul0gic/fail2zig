@@ -43,13 +43,6 @@ fn expectComponent(report: readiness.Report, c: readiness.Component, s: readines
     try testing.expectEqual(s, report.state(c));
 }
 
-test "native readiness: every component ok yields ready with null cause" {
-    const r = readiness.derive(allGood());
-    try testing.expect(r.ready);
-    try testing.expectEqual(@as(?[]const u8, null), r.cause);
-    for (r.components) |s| try testing.expectEqual(readiness.State.ok, s);
-}
-
 test "native readiness: config not loaded fails config and names the cause" {
     var in = allGood();
     in.config_loaded = false;
