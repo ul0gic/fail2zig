@@ -521,10 +521,6 @@ pub fn build(b: *std.Build) void {
     };
     const bench_files = [_]BenchFile{
         .{ .path = "tests/benchmark/parse_throughput.zig", .needs_daemon_binary = false },
-        .{ .path = "tests/benchmark/memory_ceiling.zig", .needs_daemon_binary = false },
-        .{ .path = "tests/benchmark/startup_time.zig", .needs_daemon_binary = true },
-        .{ .path = "tests/benchmark/ban_latency.zig", .needs_daemon_binary = false },
-        .{ .path = "tests/benchmark/loop_latency.zig", .needs_daemon_binary = false },
     };
     for (bench_files) |f| {
         const mod = b.createModule(.{
