@@ -65,6 +65,7 @@ test "native maintenance: admitted overshoot pins all writer classes until check
     const change = effect.OwnerChange{ .scope = try effect.Scope.host(.{ .v4 = .{ 192, 0, 2, 44 } }), .jail = "effects", .generation = generation, .decision_id = [_]u8{7} ** 32, .expected_revision = 0, .lease = .permanent, .decided_us = 100 };
     const pending = try f.store.setOwner(change, .{ .prepared_us = 100, .read = clock });
     var delta: [1]consumer.Delta = undefined;
+    const observed = effect.Observation{ .installation = owner.id, .scope_key = pending.scope_key, .fingerprint = [_]u8{8} ** 32, .observed_us = 100, .qualification = .complete_owned, .state = .permanent };
     try f.store.bootstrapConsumerManifest(manifest, batch(0, "original", &delta));
     var history_owner = try history.Consumer.init(owner, generation);
     const initial = try history_owner.prepareInitial();
@@ -99,7 +100,7 @@ test "native maintenance: admitted overshoot pins all writer classes until check
     var saved = try f.store.consumerManifestSnapshot(t.allocator, manifest);
     defer saved.deinit(t.allocator);
     try t.expectEqualStrings("original", saved.states[0].payload.?);
-    try t.expectError(error.Busy, f.store.markDispatched(pending.token(), .{ .prepared_us = 100, .read = clock }));
+    try t.expectError(error.Busy, f.store.settleOutcome(pending.token(), 100, observed, .{ .prepared_us = 100, .read = clock }));
     try t.expectEqual(@as(u64, 0), try f.store.confirmedEffectEvents());
     var events: [1]history.Event = undefined;
     const page = try f.store.confirmedEffectPage(owner, 0, null, &events);
@@ -116,8 +117,7 @@ test "native maintenance: admitted overshoot pins all writer classes until check
     try t.expectEqual(@as(i64, 100), (try f.store.beginReceipt(identity, .{ .us = 100 }, 0)).us);
     try t.expect((try std.fs.cwd().statFile(wal)).size < 16 * 1024 * 1024);
     try f.store.commitConsumerInput(manifest, batch(1, "replacement", &delta));
-    try f.store.markDispatched(pending.token(), .{ .prepared_us = 100, .read = clock });
-    _ = try f.store.settleVerified(pending.token(), .{ .installation = owner.id, .scope_key = pending.scope_key, .fingerprint = [_]u8{8} ** 32, .observed_us = 100, .qualification = .complete_owned, .state = .permanent }, .{ .prepared_us = 100, .read = clock });
+    _ = try f.store.settleOutcome(pending.token(), 100, observed, .{ .prepared_us = 100, .read = clock });
     const fresh = try f.store.confirmedEffectPage(owner, 0, null, &events);
     const staged = try history_owner.prepare(fresh, events[0..fresh.count], 100);
     defer staged.release();
@@ -580,8 +580,7 @@ test "native maintenance: decision detail pruning preserves current owners and r
     try sql(&f.store, "INSERT INTO retry_decision_details VALUES('receipt','file','protected',4,X'C000025B',1,100,X'0707070707070707070707070707070707070707070707070707070707070707','evidence');");
     try t.expect(!try f.store.pruneRetryDecisionDetailsOne());
     try sql(&f.store, "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<33) INSERT INTO retry_decision_details SELECT 'unused','file',CAST(x AS TEXT),4,X'C0000201',x,100,NULL,NULL FROM n;");
-    try f.store.markDispatched(entry.token(), now.value());
-    try t.expectEqual(effect.Settlement.verified, try f.store.settleVerified(entry.token(), effectObservation(entry, now.now), now.value()));
+    try t.expectEqual(effect.Settlement.verified, try f.store.settleOutcome(entry.token(), now.now, effectObservation(entry, now.now), now.value()));
     try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM confirmed_event_details WHERE evidence='evidence';"));
     f.store.fail_at = .after_retry_detail_prune;
     try t.expectError(error.InjectedFailure, f.store.pruneRetryDecisionDetailsOne());
@@ -669,8 +668,7 @@ test "native maintenance: schema23 resumes escalated cleanup atomically and reta
     const effect_page = try f.store.effectPage(null, null, &effect_rows);
     try t.expectEqual(@as(usize, 1), effect_page.count);
     const applied = effect_rows[0];
-    try f.store.markDispatched(applied.token(), now.value());
-    try t.expectEqual(effect.Settlement.verified, try f.store.settleVerified(applied.token(), effectObservation(applied, now.now), now.value()));
+    try t.expectEqual(effect.Settlement.verified, try f.store.settleOutcome(applied.token(), now.now, effectObservation(applied, now.now), now.value()));
 
     var events: [history.max_page]history.Event = undefined;
     const history_page = try f.store.confirmedEffectPage(installation, 0, null, &events);
@@ -685,8 +683,7 @@ test "native maintenance: schema23 resumes escalated cleanup atomically and reta
     now.now = 2_000_000;
     const removing = try f.store.prepareExpiry(applied.scope_key, applied.revision, now.value());
     try t.expectEqual(effect.Lease.absent, removing.desired);
-    try f.store.markDispatched(removing.token(), now.value());
-    try t.expectEqual(effect.Settlement.verified, try f.store.settleVerified(removing.token(), effectObservation(removing, now.now), now.value()));
+    try t.expectEqual(effect.Settlement.verified, try f.store.settleOutcome(removing.token(), now.now, effectObservation(removing, now.now), now.value()));
 
     var anchor = identity;
     anchor.occurrence = "anchor";
@@ -784,8 +781,7 @@ test "native maintenance: schema23 resumes escalated cleanup atomically and reta
     now.now = 5_000_000;
     const removing_escalated = try f.store.prepareExpiry(escalated_effect.scope_key, escalated_effect.revision, now.value());
     try t.expectEqual(effect.Lease.absent, removing_escalated.desired);
-    try f.store.markDispatched(removing_escalated.token(), now.value());
-    try t.expectEqual(effect.Settlement.verified, try f.store.settleVerified(removing_escalated.token(), effectObservation(removing_escalated, now.now), now.value()));
+    try t.expectEqual(effect.Settlement.verified, try f.store.settleOutcome(removing_escalated.token(), now.now, effectObservation(removing_escalated, now.now), now.value()));
 
     var final_anchor = identity;
     final_anchor.occurrence = "final-anchor";

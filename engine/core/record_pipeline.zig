@@ -79,7 +79,7 @@ pub const Pipeline = struct {
     }
 
     fn failed(self: *Pipeline, cause: anyerror) void {
-        if (cause == error.ConsumerExpired or cause == error.ConsumerPending or cause == error.EffectExpired) return;
+        if (cause == error.ConsumerExpired or cause == error.ConsumerPending or cause == error.EffectExpired or cause == error.ReserveBackpressure or cause == error.RetryCapacity) return;
         if (cause == error.EffectClockReversed) {
             const floor = self.store.admissionClock() catch {
                 self.ready = false;
@@ -155,7 +155,7 @@ pub const Pipeline = struct {
         try self.admit();
         self.beginDiagnostics();
         self.acknowledgeAdmitted(record) catch |failure| {
-            if (self.gate != null and failure != error.ConsumerExpired and failure != error.ConsumerPending and failure != error.EffectExpired and !sourceLocalIntervention(failure)) self.ready = false;
+            if (self.gate != null and failure != error.ConsumerExpired and failure != error.ConsumerPending and failure != error.EffectExpired and failure != error.ReserveBackpressure and failure != error.RetryCapacity and !sourceLocalIntervention(failure)) self.ready = false;
             return failure;
         };
     }

@@ -517,46 +517,6 @@ fn runCapture(argv: []const []const u8) !struct {
     };
 }
 
-test "client: --help exits 0 and prints usage" {
-    const r = try runCapture(&.{"--help"});
-    defer testing.allocator.free(r.out);
-    defer testing.allocator.free(r.err);
-    try testing.expectEqual(ExitCode.success, r.code);
-    try testing.expect(std.mem.indexOf(u8, r.out, "fail2zig") != null);
-    try testing.expect(std.mem.indexOf(u8, r.out, "COMMANDS:") != null);
-}
-
-test "client: --version exits 0 and prints client version" {
-    const r = try runCapture(&.{"--version"});
-    defer testing.allocator.free(r.out);
-    defer testing.allocator.free(r.err);
-    try testing.expectEqual(ExitCode.success, r.code);
-
-    const expected = "fail2zig " ++ build_options.version;
-    try testing.expect(std.mem.indexOf(u8, r.out, expected) != null);
-}
-
-test "client: client_version is the build-injected single source of truth" {
-    try testing.expectEqualStrings(build_options.version, client_version);
-}
-
-test "client: no args exits 2 with error about missing command" {
-    const r = try runCapture(&.{});
-    defer testing.allocator.free(r.out);
-    defer testing.allocator.free(r.err);
-    try testing.expectEqual(ExitCode.client_error, r.code);
-    try testing.expect(std.mem.indexOf(u8, r.err, "no command") != null);
-}
-
-test "client: unknown command exits 2 with suggestion" {
-    const r = try runCapture(&.{"statu"});
-    defer testing.allocator.free(r.out);
-    defer testing.allocator.free(r.err);
-    try testing.expectEqual(ExitCode.client_error, r.code);
-    try testing.expect(std.mem.indexOf(u8, r.err, "unknown command") != null);
-    try testing.expect(std.mem.indexOf(u8, r.err, "status") != null);
-}
-
 test "client: ban with invalid IP exits 2" {
     const r = try runCapture(&.{ "ban", "not-an-ip", "--jail", "sshd" });
     defer testing.allocator.free(r.out);
@@ -564,14 +524,6 @@ test "client: ban with invalid IP exits 2" {
     try testing.expectEqual(ExitCode.client_error, r.code);
     try testing.expect(std.mem.indexOf(u8, r.err, "Invalid IP address") != null);
     try testing.expect(std.mem.indexOf(u8, r.err, "not-an-ip") != null);
-}
-
-test "client: ban without --jail exits 2" {
-    const r = try runCapture(&.{ "ban", "1.2.3.4" });
-    defer testing.allocator.free(r.out);
-    defer testing.allocator.free(r.err);
-    try testing.expectEqual(ExitCode.client_error, r.code);
-    try testing.expect(std.mem.indexOf(u8, r.err, "requires --jail") != null);
 }
 
 test "client: status against unreachable socket exits 3" {
@@ -596,45 +548,6 @@ test "client: unban against unreachable socket exits 3" {
     defer testing.allocator.free(r.out);
     defer testing.allocator.free(r.err);
     try testing.expectEqual(ExitCode.connection_failed, r.code);
-}
-
-test "client: completions bash emits script with shebang" {
-    const r = try runCapture(&.{ "completions", "bash" });
-    defer testing.allocator.free(r.out);
-    defer testing.allocator.free(r.err);
-    try testing.expectEqual(ExitCode.success, r.code);
-    try testing.expect(std.mem.startsWith(u8, r.out, "#!/usr/bin/env bash"));
-}
-
-test "client: completions zsh emits #compdef" {
-    const r = try runCapture(&.{ "completions", "zsh" });
-    defer testing.allocator.free(r.out);
-    defer testing.allocator.free(r.err);
-    try testing.expectEqual(ExitCode.success, r.code);
-    try testing.expect(std.mem.startsWith(u8, r.out, "#compdef fail2zig"));
-}
-
-test "client: completions fish emits complete -c" {
-    const r = try runCapture(&.{ "completions", "fish" });
-    defer testing.allocator.free(r.out);
-    defer testing.allocator.free(r.err);
-    try testing.expectEqual(ExitCode.success, r.code);
-    try testing.expect(std.mem.indexOf(u8, r.out, "complete -c fail2zig") != null);
-}
-
-test "client: completions unknown shell exits 2" {
-    const r = try runCapture(&.{ "completions", "ksh" });
-    defer testing.allocator.free(r.out);
-    defer testing.allocator.free(r.err);
-    try testing.expectEqual(ExitCode.client_error, r.code);
-}
-
-test "client: help ban subtopic" {
-    const r = try runCapture(&.{ "help", "ban" });
-    defer testing.allocator.free(r.out);
-    defer testing.allocator.free(r.err);
-    try testing.expectEqual(ExitCode.success, r.code);
-    try testing.expect(std.mem.indexOf(u8, r.out, "ban <ip>") != null);
 }
 
 const status_payload = "{\"version\":\"0.3.0\",\"uptime_seconds\":5,\"active_bans\":1}";

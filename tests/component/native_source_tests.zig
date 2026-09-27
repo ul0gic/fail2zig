@@ -197,3 +197,282 @@ test "native source: partial code units CRLF and callback failure preserve raw b
     try std.testing.expect(!try source.poll(Sink.receive, &sink));
     try std.testing.expectEqual(@as(usize, 1), sink.delivered);
 }
+
+const sessions = @import("engine_test").core.native_file_session;
+const repair = @import("engine_test").core.source_repair;
+
+const SessionFixture = struct {
+    tmp: std.testing.TmpDir,
+    root: []u8,
+    path: []u8,
+    database: []u8,
+    store: durable.Store,
+    us: i64 = 1_000_000_000,
+    ms: u64 = 0,
+
+    fn init(self: *SessionFixture) !void {
+        const a = std.testing.allocator;
+        self.tmp = std.testing.tmpDir(.{});
+        errdefer self.tmp.cleanup();
+        self.root = try self.tmp.dir.realpathAlloc(a, ".");
+        errdefer a.free(self.root);
+        self.path = try std.fs.path.join(a, &.{ self.root, "active.log" });
+        errdefer a.free(self.path);
+        self.database = try std.fs.path.join(a, &.{ self.root, "state.sqlite" });
+        errdefer a.free(self.database);
+        self.store = try durable.Store.open(a, self.database);
+        errdefer self.store.close();
+        try self.store.enableReceipts(8);
+        try self.store.enableNativeTime();
+        try self.store.enableDetection();
+        try self.store.enableClockRecovery();
+        self.us = 1_000_000_000;
+        self.ms = 0;
+    }
+    fn deinit(self: *SessionFixture) void {
+        const a = std.testing.allocator;
+        self.store.close();
+        a.free(self.database);
+        a.free(self.path);
+        a.free(self.root);
+        self.tmp.cleanup();
+    }
+    fn wall(context: ?*anyopaque) !time.Timestamp {
+        const self: *SessionFixture = @ptrCast(@alignCast(context.?));
+        return .{ .us = self.us };
+    }
+    fn mono(context: ?*anyopaque) u64 {
+        const self: *SessionFixture = @ptrCast(@alignCast(context.?));
+        return self.ms;
+    }
+    fn open(self: *SessionFixture) !*sessions.Session {
+        const options = sessions.Options{ .processing = .{ .jail = "fixture", .parent_generation = [_]u8{1} ** 32, .timestamp = .undated }, .max_sources = 8, .clock = wall, .clock_context = self, .monotonic_clock = .{ .context = self, .read = mono } };
+        return sessions.Session.createDeferred(std.testing.allocator, &self.store, options, &.{.{ .pattern = self.path }});
+    }
+};
+
+fn admitSession(session: *sessions.Session) !void {
+    for (0..4096) |_| if (try session.admissionTurn()) return;
+    return error.AdmissionDidNotComplete;
+}
+
+fn deliverSession(session: *sessions.Session) !usize {
+    for (0..64) |_| {
+        const count = try session.pollTurn(1);
+        if (count > 0) return count;
+    }
+    return 0;
+}
+
+const ContinuityChange = enum { truncate, shrink_prefix, prefix, remove, replace, rotate };
+
+fn expectRestartContinuity(change: ContinuityChange, expected: ?files.Discontinuity) !void {
+    var f: SessionFixture = undefined;
+    try f.init();
+    defer f.deinit();
+    // The shrink case keeps an unread line so the recorded prefix extends past the offset.
+    const shrink = change == .shrink_prefix;
+    const initial = if (shrink) "first\nsecond line, unread here\n" else "first event\nsecond event\n";
+    const committed_offset: u64 = if (shrink) 6 else 25;
+    try f.tmp.dir.writeFile(.{ .sub_path = "active.log", .data = initial });
+    var checkpoint: files.Resume = undefined;
+    var source_id: [256]u8 = undefined;
+    var source_id_len: usize = 0;
+    {
+        const first = try f.open();
+        defer first.destroy();
+        try admitSession(first);
+        try std.testing.expectEqual(@as(usize, 1), try deliverSession(first));
+        if (!shrink) try std.testing.expectEqual(@as(usize, 1), try deliverSession(first));
+        const source = &first.sources.sources.items[0];
+        checkpoint = source.acknowledgedCheckpoint().?;
+        try std.testing.expectEqual(committed_offset, checkpoint.offset);
+        if (shrink) try std.testing.expectEqual(@as(u8, 31), checkpoint.prefix_len);
+        @memcpy(source_id[0..source.source_id.len], source.source_id);
+        source_id_len = source.source_id.len;
+    }
+    var observed_inode: ?u64 = null;
+    var observed_size: ?u64 = null;
+    switch (change) {
+        .truncate => {
+            const file = try f.tmp.dir.openFile("active.log", .{ .mode = .write_only });
+            defer file.close();
+            try file.setEndPos(4);
+            observed_inode = checkpoint.inode;
+            observed_size = 4;
+        },
+        .shrink_prefix => {
+            const file = try f.tmp.dir.openFile("active.log", .{ .mode = .write_only });
+            defer file.close();
+            try file.setEndPos(20);
+            observed_inode = checkpoint.inode;
+            observed_size = 20;
+        },
+        .prefix => {
+            const file = try f.tmp.dir.openFile("active.log", .{ .mode = .write_only });
+            defer file.close();
+            try file.pwriteAll("FIRST", 0);
+            try file.seekFromEnd(0);
+            try file.writeAll("third event\n");
+            observed_inode = checkpoint.inode;
+            observed_size = 37;
+        },
+        .remove => try f.tmp.dir.deleteFile("active.log"),
+        .replace => {
+            try f.tmp.dir.writeFile(.{ .sub_path = "active.log.new", .data = "replacement\n" });
+            observed_inode = (try f.tmp.dir.statFile("active.log.new")).inode;
+            try f.tmp.dir.rename("active.log.new", "active.log");
+            observed_size = 12;
+        },
+        .rotate => {
+            try f.tmp.dir.rename("active.log", "active.log.1");
+            try f.tmp.dir.writeFile(.{ .sub_path = "active.log", .data = "replacement\n" });
+            const old = try f.tmp.dir.openFile("active.log.1", .{ .mode = .write_only });
+            defer old.close();
+            try old.seekFromEnd(0);
+            try old.writeAll("late\n");
+        },
+    }
+    const restarted = try f.open();
+    defer restarted.destroy();
+    const kind = expected orelse {
+        try admitSession(restarted);
+        try std.testing.expect(restarted.continuityFailure() == null);
+        try std.testing.expectEqual(@as(usize, 1), try deliverSession(restarted));
+        try std.testing.expectEqual(repair.Phase.healthy, restarted.repairSnapshot().phase);
+        return;
+    };
+    try std.testing.expectError(error.SourceInterventionRequired, admitSession(restarted));
+    try std.testing.expectError(error.SourceInterventionRequired, admitSession(restarted));
+    try std.testing.expectEqual(repair.Phase.intervention, restarted.repairSnapshot().phase);
+    try std.testing.expectEqual(@as(?anyerror, error.ResumeLost), restarted.repairSnapshot().last_cause);
+    try std.testing.expectEqual(records.Health.resume_lost, restarted.sources.sources.items[0].health);
+    try std.testing.expectEqualDeep(checkpoint, restarted.sources.sources.items[0].acknowledgedCheckpoint().?);
+    const report = restarted.continuityFailure() orelse return error.MissingContinuityReport;
+    try std.testing.expectEqualStrings("fixture", report.jail);
+    try std.testing.expectEqualStrings(f.path, report.path);
+    try std.testing.expectEqualStrings(source_id[0..source_id_len], report.source);
+    const failure = report.failure;
+    try std.testing.expectEqual(kind, failure.kind);
+    try std.testing.expectEqualSlices(u8, &checkpoint.incarnation, &failure.incarnation);
+    try std.testing.expectEqual(checkpoint.offset, failure.committed_offset);
+    try std.testing.expectEqual(checkpoint.device, failure.committed_device);
+    try std.testing.expectEqual(checkpoint.inode, failure.committed_inode);
+    try std.testing.expectEqual(observed_size, failure.observed_size);
+    try std.testing.expectEqual(observed_inode, failure.observed_inode);
+    try std.testing.expectEqual(if (observed_inode == null) null else @as(?u64, checkpoint.device), failure.observed_device);
+    var rendered: [512]u8 = undefined;
+    const text_out = try std.fmt.bufPrint(&rendered, "{}", .{failure});
+    try std.testing.expect(std.mem.indexOf(u8, text_out, @tagName(kind)) != null);
+    var offset_text: [32]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, text_out, try std.fmt.bufPrint(&offset_text, "committed_offset={d} ", .{committed_offset})) != null);
+    for ([_][]const u8{ "first", "FIRST", "second", "unread", "replacement", "event" }) |content|
+        try std.testing.expect(std.mem.indexOf(u8, text_out, content) == null);
+}
+
+test "native source: restart classifies truncate, prefix change, missing and replaced files; rename rotation resumes" {
+    try expectRestartContinuity(.truncate, .truncated);
+    try expectRestartContinuity(.shrink_prefix, .truncated);
+    try expectRestartContinuity(.prefix, .prefix_changed);
+    try expectRestartContinuity(.remove, .missing);
+    try expectRestartContinuity(.replace, .replaced);
+    try expectRestartContinuity(.rotate, null);
+}
+
+test "native source: runtime truncation under a pending receipt pauses with facts and no reset" {
+    var f: SessionFixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.tmp.dir.writeFile(.{ .sub_path = "active.log", .data = "first\n" });
+    const session = try f.open();
+    var session_live = true;
+    defer if (session_live) session.destroy();
+    try admitSession(session);
+    _ = try deliverSession(session);
+    {
+        const file = try f.tmp.dir.openFile("active.log", .{ .mode = .write_only });
+        defer file.close();
+        try file.seekFromEnd(0);
+        try file.writeAll("pending\n");
+    }
+    f.store.fail_at = .after_receipt_delete;
+    try std.testing.expectError(error.InjectedFailure, deliverSession(session));
+    f.store.fail_at = null;
+    const saved = session.sources.sources.items[0].acknowledgedCheckpoint().?;
+    try f.tmp.dir.writeFile(.{ .sub_path = "active.log", .data = "x\n" });
+    try std.testing.expectError(error.SourceInterventionRequired, deliverSession(session));
+    try std.testing.expectError(error.SourceInterventionRequired, deliverSession(session));
+    try std.testing.expectEqualDeep(saved, session.sources.sources.items[0].acknowledgedCheckpoint().?);
+    try std.testing.expectEqual(@as(usize, 1), try f.store.pendingReceiptCount());
+    const report = session.continuityFailure() orelse return error.MissingContinuityReport;
+    try std.testing.expectEqual(files.Discontinuity.truncated, report.failure.kind);
+    try std.testing.expectEqual(saved.offset, report.failure.committed_offset);
+    try std.testing.expectEqual(@as(?u64, 2), report.failure.observed_size);
+    try std.testing.expectEqual(@as(?u64, saved.inode), report.failure.observed_inode);
+    const once = session.nextUnreportedContinuityFailure() orelse return error.MissingContinuityReport;
+    try std.testing.expectEqualDeep(report.failure, once.failure);
+    try std.testing.expect(session.nextUnreportedContinuityFailure() == null);
+    try f.tmp.dir.writeFile(.{ .sub_path = "active.log", .data = "different and longer content\n" });
+    try std.testing.expectError(error.ResumeLost, session.verifyRecoverySources());
+    try std.testing.expectEqualDeep(report.failure, session.continuityFailure().?.failure);
+    try std.testing.expect(session.nextUnreportedContinuityFailure() == null);
+
+    const replacement = try f.open();
+    defer replacement.destroy();
+    try replacement.copyRepairStateFrom(session);
+    try replacement.retainSourcesFrom(session);
+    session.destroy();
+    session_live = false;
+    try std.testing.expectEqual(repair.Phase.intervention, replacement.repairSnapshot().phase);
+    const retained = replacement.continuityFailure() orelse return error.MissingContinuityReport;
+    try std.testing.expectEqualDeep(report.failure, retained.failure);
+    try std.testing.expectEqualStrings(f.path, retained.path);
+    try std.testing.expect(replacement.nextUnreportedContinuityFailure() == null);
+}
+
+fn lostPrefix(_: std.fs.File, _: u8) ![32]u8 {
+    return error.ResumeLost;
+}
+
+fn pollUntilIntervention(session: *sessions.Session, index: usize) !void {
+    for (0..64) |_| {
+        _ = session.pollTurn(1) catch |err| switch (err) {
+            error.SourceInterventionRequired, error.SourceRepairPending => {},
+            else => return err,
+        };
+        if ((try session.sourceRepairSnapshot(index)).phase == .intervention) return;
+    }
+    return error.InterventionNotReached;
+}
+
+test "native source: each source discontinuity in a jail is reported exactly once" {
+    var f: SessionFixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.tmp.dir.writeFile(.{ .sub_path = "a.log", .data = "first owner\n" });
+    try f.tmp.dir.writeFile(.{ .sub_path = "b.log", .data = "second owner\n" });
+    const pattern = try std.fs.path.join(std.testing.allocator, &.{ f.root, "*.log" });
+    defer std.testing.allocator.free(pattern);
+    const options = sessions.Options{ .processing = .{ .jail = "fixture", .parent_generation = [_]u8{1} ** 32, .timestamp = .undated }, .max_sources = 8, .clock = SessionFixture.wall, .clock_context = &f, .monotonic_clock = .{ .context = &f, .read = SessionFixture.mono } };
+    const session = try sessions.Session.createDeferred(std.testing.allocator, &f.store, options, &.{.{ .pattern = pattern }});
+    var session_live = true;
+    defer if (session_live) session.destroy();
+    try admitSession(session);
+    try std.testing.expectEqual(@as(usize, 2), session.sources.sources.items.len);
+    try std.testing.expect(session.nextUnreportedContinuityFailure() == null);
+    for (0..2) |index| {
+        session.sources.sources.items[index].read_prefix = lostPrefix;
+        try pollUntilIntervention(session, index);
+        const report = session.nextUnreportedContinuityFailure() orelse return error.MissingContinuityReport;
+        try std.testing.expectEqualStrings(session.sources.sources.items[index].source_id, report.source);
+        try std.testing.expectEqual(files.Discontinuity.prefix_changed, report.failure.kind);
+        try std.testing.expect(session.nextUnreportedContinuityFailure() == null);
+    }
+    const replacement = try sessions.Session.createDeferred(std.testing.allocator, &f.store, options, &.{.{ .pattern = pattern }});
+    defer replacement.destroy();
+    try replacement.copyRepairStateFrom(session);
+    session.destroy();
+    session_live = false;
+    try std.testing.expect(replacement.continuityFailure() != null);
+    try std.testing.expect(replacement.nextUnreportedContinuityFailure() == null);
+}

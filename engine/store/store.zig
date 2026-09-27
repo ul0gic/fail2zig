@@ -13,7 +13,11 @@ const effects = @import("../core/native_effect.zig");
 const effect_history = @import("../core/native_effect_history.zig");
 const application_history = @import("../core/native_application_history.zig");
 const action_outcome = @import("../core/native_action_outcome.zig");
-pub const latest_schema: i64 = 23;
+// Newest schema the ordinary writers maintain. Schema 24 is reached only through the
+// load-repair migration and admitted once that migration has completed.
+pub const latest_schema: i64 = 24;
+pub const load_repair_schema: i64 = 24;
+pub const load_repair = @import("load_repair_migration.zig");
 pub const max_native_detections = 16;
 const Db = opaque {};
 const Statement = opaque {};
@@ -47,7 +51,7 @@ const embedded_api: Api = blk: {
     }
     break :blk api;
 };
-pub const Error = application_history.Error || action_outcome.Error || retry.Error || consumers.Error || effects.Error || effect_history.Error || action_context.Error || error{ MaintenancePinned, StaleMaintenance, PrunedReplay, InvalidMaintenanceState, MaintenanceStorageRequired, ConsumerManifestRequired, ConsumerManifestMismatch, ConsumerManifestMissing, ConsumerManifestExists, ConsumerMigrationRequired, MissingRequiredConsumer, AmbiguousNativeDetection, AmbiguousRetryDecision, ConsumerStorageRequired, StaleConsumerCheckpoint, OpenFailed, UnsafePermissions, ForeignDatabase, UnsupportedSchema, DatabaseFailure, Busy, StorageFull, ReadOnly, StorageIo, CorruptDatabase, StorageLimit, Interrupted, AccessDenied, ReopenRequired, InvalidRecord, OccurrenceConflict, StaleCheckpoint, StaleSharedCheckpoint, InjectedFailure, OutOfMemory, ReceiptStorageRequired, InferenceStorageRequired, DetectionStorageRequired, ReceiptConflict, ReceiptRequired, ReceiptAlreadyCommitted, ReceiptLimit, RetryStorageRequired, RetryAdmissionRequired, RetryGenerationMismatch, RetryMigrationRequired, RetryCapacity, ReceiptClockReversed, HistoryResetStorageRequired, InvalidHistoryReset, StaleHistoryReset, AdminStorageRequired, MigrationStorageRequired, StaleAdminRevision, InvalidAdminRequest, AdminRequestCapacity, RetryPolicyInFlight, StalePolicyTransition, ConfigGenerationExists, ConfigGenerationMissing, MigrationRunExists, MigrationRunMissing, MigrationStepMissing, MigrationStepOpen, MigrationStepOrder, InvalidMigrationRow, InvalidMigrationState, MigrationJailUnknown };
+pub const Error = application_history.Error || action_outcome.Error || retry.Error || consumers.Error || effects.Error || effect_history.Error || action_context.Error || error{ MaintenancePinned, StaleMaintenance, PrunedReplay, InvalidMaintenanceState, MaintenanceStorageRequired, ConsumerManifestRequired, ConsumerManifestMismatch, ConsumerManifestMissing, ConsumerManifestExists, ConsumerMigrationRequired, MissingRequiredConsumer, AmbiguousNativeDetection, AmbiguousRetryDecision, ConsumerStorageRequired, StaleConsumerCheckpoint, OpenFailed, UnsafePermissions, ForeignDatabase, UnsupportedSchema, DatabaseFailure, Busy, StorageFull, ReadOnly, StorageIo, CorruptDatabase, StorageLimit, Interrupted, AccessDenied, ReopenRequired, InvalidRecord, OccurrenceConflict, StaleCheckpoint, StaleSharedCheckpoint, InjectedFailure, OutOfMemory, ReceiptStorageRequired, InferenceStorageRequired, DetectionStorageRequired, ReceiptConflict, ReceiptRequired, ReceiptAlreadyCommitted, ReceiptLimit, RetryStorageRequired, RetryAdmissionRequired, RetryGenerationMismatch, RetryMigrationRequired, RetryCapacity, ReceiptClockReversed, HistoryResetStorageRequired, InvalidHistoryReset, StaleHistoryReset, AdminStorageRequired, MigrationStorageRequired, StaleAdminRevision, InvalidAdminRequest, AdminRequestCapacity, RetryPolicyInFlight, StalePolicyTransition, ConfigGenerationExists, ConfigGenerationMissing, MigrationRunExists, MigrationRunMissing, MigrationStepMissing, MigrationStepOpen, MigrationStepOrder, InvalidMigrationRow, InvalidMigrationState, MigrationJailUnknown, LoadRepairMigrationIncomplete, LoadRepairWritersPending, LoadRepairBackupExists, LoadRepairBackupInvalid, LoadRepairDiskSpace, LoadRepairVerificationFailed, LoadRepairInvalidState, ReserveBackpressure, MaintenanceWorkExhausted, LiveOwnerCounterInvalid };
 
 pub const OpenStage = enum {
     path_validation,
@@ -128,7 +132,7 @@ fn openFailure(diagnostic: *OpenDiagnostic, stage: OpenStage, failure: Error, po
     return failure;
 }
 
-fn sqliteError(rc: c_int) Error {
+pub fn sqliteError(rc: c_int) Error {
     return switch (rc & 0xff) {
         3, 23 => error.AccessDenied,
         5, 6 => error.Busy,
@@ -143,7 +147,7 @@ fn sqliteError(rc: c_int) Error {
         else => error.DatabaseFailure,
     };
 }
-pub const CommitStage = enum { after_retry_detail_prune, before_admin_schema_commit, before_migration_schema_commit, after_admin_request, after_migration_step_intent, after_migration_step_outcome, before_migration_activation_commit, before_policy_transition_commit, before_config_generation_commit, before_config_generation_publish, before_action_target_schema_commit, after_action_target_intent, before_action_target_dispatch_commit, before_action_target_settlement_commit, before_history_reset_schema_commit, after_history_reset, before_canonical_effect_schema_commit, after_history_detail_delete, after_history_event_delete, before_escalation_schema_commit, before_application_history_schema_commit, before_cleanup_schema_commit, before_retry_lease_schema_commit, after_cleanup_mark, before_cleanup_escalation_delete, after_cleanup_escalation_delete, before_cleanup_retry_delete, after_cleanup_retry_delete, after_cleanup_delete, before_cleanup_commit, after_retry_retire, before_maintenance_schema_commit, after_source_sequence, after_replay_guard, after_record, after_checkpoint, after_shared_checkpoint, before_commit, before_receipt_commit, after_receipt_commit, after_receipt_delete, before_receipt_schema_commit, before_native_time_schema_commit, before_inference_schema_commit, before_detection_schema_commit, after_detection, before_clock_schema_commit, before_journal_detection_schema_commit, before_retry_schema_commit, after_retry_state, after_retry_decision, before_consumer_schema_commit, after_consumer_delta, before_effect_schema_commit, after_effect_owner, after_effect_intent, before_effect_dispatch_commit, before_effect_receipt_commit, before_manifest_schema_commit, before_manifest_commit, after_manifest_ready, before_consumer_input_commit };
+pub const CommitStage = enum { during_load_repair_events_swap, after_retry_detail_prune, before_admin_schema_commit, before_migration_schema_commit, after_admin_request, after_migration_step_intent, after_migration_step_outcome, before_migration_activation_commit, before_policy_transition_commit, before_config_generation_commit, before_config_generation_publish, before_action_target_schema_commit, after_action_target_intent, before_action_target_dispatch_commit, before_action_target_settlement_commit, before_history_reset_schema_commit, after_history_reset, before_canonical_effect_schema_commit, after_history_detail_delete, after_history_event_delete, before_history_retention_commit, before_escalation_schema_commit, before_application_history_schema_commit, before_cleanup_schema_commit, before_retry_lease_schema_commit, after_cleanup_mark, before_cleanup_escalation_delete, after_cleanup_escalation_delete, before_cleanup_retry_delete, after_cleanup_retry_delete, after_cleanup_delete, before_cleanup_commit, after_retry_retire, before_maintenance_schema_commit, after_source_sequence, after_replay_guard, after_record, after_checkpoint, after_shared_checkpoint, before_commit, before_receipt_commit, after_receipt_commit, after_receipt_delete, before_receipt_schema_commit, before_native_time_schema_commit, before_inference_schema_commit, before_detection_schema_commit, after_detection, before_clock_schema_commit, before_journal_detection_schema_commit, before_retry_schema_commit, after_retry_state, after_retry_decision, before_consumer_schema_commit, after_consumer_delta, before_effect_schema_commit, after_effect_owner, after_effect_intent, before_effect_dispatch_commit, before_effect_receipt_commit, before_manifest_schema_commit, before_manifest_commit, after_manifest_ready, before_consumer_input_commit };
 pub const Limits = struct {
     pub const pending_receipts = 4096;
     pub const checkpoint_bytes = 16 * 1024 * 1024;
@@ -212,6 +216,15 @@ pub const EffectInvalidation = struct {
     context: ?*anyopaque,
     invalidate: *const fn (?*anyopaque) void,
 };
+pub const max_retention_page: u16 = 256;
+// Position of the rotating obsolete-row reclamation; in memory only, so a restart rescans.
+pub const ReclaimCursor = struct { phase: u2 = 0, cursor: i64 = 0, found: bool = false, rest: u8 = 0 };
+pub const TestHooks = if (builtin.is_test) struct {
+    // Work budget left when the retention selection starts, instead of the transaction's.
+    retention_select_work: ?u32 = null,
+    // Summary rows per candidate-generation sweep page instead of the measured window.
+    retention_sweep_rows: ?i64 = null,
+} else struct {};
 pub const Store = struct {
     allocator: std.mem.Allocator,
     api: Api,
@@ -221,6 +234,13 @@ pub const Store = struct {
     consumer_clock_floor_us: ?i64 = null,
     effect_publication_epoch: u64 = 0,
     effect_invalidation: ?EffectInvalidation = null,
+    /// Scope changed by each recent epoch, so the runtime can fold a single-scope
+    /// commit into its view instead of rebuilding it. A transaction that touched more
+    /// than one scope, or none it noted, publishes an unattributed epoch.
+    attributed_changes: [attribution_ring]AttributedChange = [_]AttributedChange{.{}} ** attribution_ring,
+    noted_keys: [attribution_batch]effects.Hash = undefined,
+    noted_count: u8 = 0,
+    noted_ambiguous: bool = false,
     reopen_required: bool = false,
     startup_admission: bool = false,
     startup_operation: bool = false,
@@ -231,6 +251,16 @@ pub const Store = struct {
     runtime_limits: bool = false,
     runtime_path: ?[]const u8 = null,
     work_remaining: u32 = 1000,
+    load_repair_backup_verified: bool = false,
+    // Retention page size; an interrupted selection halves it for the next attempt.
+    retention_page: u16 = max_retention_page,
+    reclaim: ReclaimCursor = .{},
+    // Maintenance turns skipped after a full retry-detail scan found nothing to prune.
+    retry_detail_rest: u8 = 0,
+    // Operation of an unfinished maintenance step, kept when it fails for the gate's cause.
+    maintenance_operation: ?@import("../core/storage_health.zig").MaintenanceOperation = null,
+    history_overload_notice_us: ?i64 = null,
+    test_hooks: TestHooks = .{},
     escalation_jitter_context: ?*anyopaque = null,
     escalation_jitter: *const fn (?*anyopaque, u64) u64 = systemEscalationJitter,
 
@@ -291,6 +321,8 @@ pub const Store = struct {
         if (self.startup_admission) return error.DatabaseFailure;
         if (self.runtime_path) |path| try self.maintainWal(path);
         try self.exec("BEGIN IMMEDIATE;");
+        self.noted_count = 0;
+        self.noted_ambiguous = false;
     }
 
     pub fn beginStartupAdmission(self: *Store) Error!void {
@@ -317,6 +349,8 @@ pub const Store = struct {
         self.work_remaining = 1000;
         try self.exec("SAVEPOINT native_startup_operation;");
         self.startup_operation = true;
+        self.noted_count = 0;
+        self.noted_ambiguous = false;
     }
     pub fn beginAdmissionWrite(self: *Store) Error!void {
         if (self.startup_admission) return self.beginStartupOperation();
@@ -338,12 +372,54 @@ pub const Store = struct {
     pub fn commitEffectTransaction(self: *Store, changed: bool) Error!void {
         if (changed) if (self.effect_invalidation) |hook| hook.invalidate(hook.context);
         try self.commitTransaction();
-        if (changed) self.effect_publication_epoch +|= 1;
+        if (changed) {
+            self.effect_publication_epoch +|= 1;
+            const epoch = self.effect_publication_epoch;
+            var slot = AttributedChange{ .epoch = epoch, .count = if (self.noted_ambiguous) 0 else self.noted_count };
+            slot.keys = self.noted_keys;
+            self.attributed_changes[@intCast(epoch % attribution_ring)] = slot;
+        }
+        self.noted_count = 0;
+        self.noted_ambiguous = false;
+    }
+    pub const attribution_ring = 256;
+    /// Scopes one commit may change and still be folded into the view incrementally;
+    /// equals the largest maintenance batch so an ordinary batch never forces a rebuild.
+    pub const attribution_batch = 8;
+    pub const AttributedChange = struct {
+        epoch: u64 = 0,
+        count: u8 = 0,
+        keys: [attribution_batch]effects.Hash = undefined,
+        pub fn slice(self: *const AttributedChange) []const effects.Hash {
+            return self.keys[0..self.count];
+        }
+    };
+    /// Called by every writer that changes one scope's published effect state.
+    pub fn noteEffectChange(self: *Store, key: effects.Hash) void {
+        for (self.noted_keys[0..self.noted_count]) |noted| if (std.mem.eql(u8, &noted, &key)) return;
+        if (self.noted_count == attribution_batch) {
+            self.noted_ambiguous = true;
+            return;
+        }
+        self.noted_keys[self.noted_count] = key;
+        self.noted_count += 1;
+    }
+    /// The scopes changed by `epoch`, or null when it is unknown or unattributed.
+    pub fn attributedChange(self: *const Store, epoch: u64) ?*const AttributedChange {
+        if (epoch == 0) return null;
+        const slot = &self.attributed_changes[@intCast(epoch % attribution_ring)];
+        return if (slot.epoch == epoch and slot.count != 0) slot else null;
     }
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) Error!Store {
         var ignored = OpenDiagnostic{};
         return openImpl(allocator, path, .plain, &ignored, .{});
+    }
+
+    /// Like `open`, but a missing state file is an error rather than a new database.
+    pub fn openExisting(allocator: std.mem.Allocator, path: []const u8) Error!Store {
+        var ignored = OpenDiagnostic{};
+        return openImpl(allocator, path, .existing, &ignored, .{});
     }
 
     pub fn openDetailed(allocator: std.mem.Allocator, path: []const u8, diagnostic: *OpenDiagnostic) Error!Store {
@@ -389,7 +465,7 @@ pub const Store = struct {
         };
     }
 
-    const OpenMode = enum { plain, runtime, readonly, preflight };
+    const OpenMode = enum { plain, runtime, readonly, preflight, existing };
     pub const TestAccess = if (builtin.is_test) struct {
         pub const openImpl = Store.openImpl;
     } else struct {};
@@ -410,7 +486,7 @@ pub const Store = struct {
         if (parent_stat.uid != std.os.linux.geteuid() or parent_stat.mode & 0o022 != 0)
             return openFailure(diagnostic, .parent_permissions, error.UnsafePermissions, null, null);
         const stat = std.posix.fstatat(std.posix.AT.FDCWD, path, std.posix.AT.SYMLINK_NOFOLLOW) catch |failure| blk: {
-            if (failure != error.FileNotFound or open_mode == .readonly or open_mode == .preflight)
+            if (failure != error.FileNotFound or open_mode == .readonly or open_mode == .preflight or open_mode == .existing)
                 return openFailure(diagnostic, .file_stat, error.OpenFailed, openPosixCause(failure), null);
             const created = std.posix.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, 0o600) catch |create_failure|
                 return openFailure(diagnostic, .file_create, error.OpenFailed, openPosixCause(create_failure), null);
@@ -479,8 +555,15 @@ pub const Store = struct {
                 return openFailure(diagnostic, .schema_inspection, failure, null, self.last_error_code);
             if (objects != 0) return openFailure(diagnostic, .schema_validation, error.ForeignDatabase, null, null);
         } else if (application != 0x46325a31) return openFailure(diagnostic, .schema_validation, error.ForeignDatabase, null, null);
-        if (schema < 0 or schema > latest_schema)
+        if (schema < 0 or schema > load_repair_schema)
             return openFailure(diagnostic, .schema_validation, error.UnsupportedSchema, null, null);
+        // Schema 24 is only ever produced by the load-repair migration, whose progress row
+        // arrives in the same commit as the version.
+        if (schema == load_repair_schema) {
+            const migration_rows = self.integer("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='load_repair_migration';") catch |failure|
+                return openFailure(diagnostic, .schema_inspection, failure, null, self.last_error_code);
+            if (migration_rows != 1) return openFailure(diagnostic, .schema_validation, error.UnsupportedSchema, null, null);
+        }
         self.schema_version = if (open_mode == .preflight) schema else @max(schema, 2);
         if (open_mode == .readonly or open_mode == .preflight) {
             if (application == 0 and open_mode == .readonly)
@@ -727,6 +810,8 @@ pub const Store = struct {
     pub usingnamespace @import("admin.zig").Methods(@This());
 
     pub usingnamespace @import("migration.zig").Methods(@This());
+
+    pub usingnamespace @import("load_repair_migration.zig").Methods(@This());
 
     pub fn inspectInteger(self: *Store, sql: [:0]const u8) Error!i64 {
         if (!@import("builtin").is_test) @compileError("inspectInteger is test-only");

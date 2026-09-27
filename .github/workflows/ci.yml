@@ -25,6 +25,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       route: ${{ steps.scope.outputs.route }}
+      targets: ${{ steps.scope.outputs.targets }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -48,7 +49,7 @@ jobs:
 
   lint:
     needs: scope
-    if: needs.scope.outputs.route == 'full'
+    if: needs.scope.outputs.route != 'light'
     name: Source and workflow checks
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -88,7 +89,7 @@ jobs:
           bash .github/scripts/release_test.sh
       - name: Lint scripts
         run: |
-          shellcheck -S warning tests/harness/*.sh tests/e2e/*.sh .github/scripts/*.sh
+          shellcheck -S warning tests/harness/*.sh tests/harness/acceptance/*/*.sh tests/e2e/*.sh .github/scripts/*.sh
           if [ -f scripts/install.sh ]; then
             shellcheck -S warning scripts/install.sh
           fi
@@ -111,8 +112,8 @@ jobs:
 
   test:
     needs: scope
-    if: needs.scope.outputs.route == 'full'
-    name: Assembled daemon and administrative tests
+    if: needs.scope.outputs.route != 'light'
+    name: Smoke, scoped or assembled tests
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -135,7 +136,13 @@ jobs:
           restore-keys: |
             zig-cache-test-${{ runner.os }}-${{ env.ZIG_VERSION }}-
       - name: Assembled daemon and administrative checks
+        if: needs.scope.outputs.route == 'full'
         run: /usr/bin/time -v zig build test-ci-assembled -Doptimize=ReleaseSafe -j2 --summary all
+      - name: Scoped smoke and affected capability checks
+        if: needs.scope.outputs.route == 'scoped'
+        env:
+          CI_TARGETS: ${{ needs.scope.outputs.targets }}
+        run: bash .github/scripts/ci_scope.sh run-scoped
 
   components:
     needs: scope

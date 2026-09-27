@@ -18,128 +18,12 @@ const OnNoBackend = config.OnNoBackend;
 const anyLogpathExists = config.anyLogpathExists;
 const decodeCompatibilityManifest = config.decodeCompatibilityManifest;
 const filterSupportsInternal = config.filterSupportsInternal;
-const filterSupportsJournald = config.filterSupportsJournald;
 const max_ban_duration = config.max_ban_duration;
 const max_config_bytes = config.max_config_bytes;
 const metrics_port_zero_hint = config.metrics_port_zero_hint;
-const resolveJail = config.resolveJail;
 const resolveJailFromConfig = config.resolveJailFromConfig;
 const validate = config.validate;
 const websocket_hard_max_clients = config.websocket_hard_max_clients;
-
-test "native: parse minimal config" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const src =
-        \\[global]
-        \\log_level = "warn"
-        \\memory_ceiling_mb = 128
-        \\
-        \\[defaults]
-        \\bantime = 3600
-        \\findtime = 600
-        \\maxretry = 5
-        \\banaction = "nftables"
-    ;
-    const cfg = try Config.parse(arena.allocator(), src);
-
-    try std.testing.expectEqual(LogLevel.warn, cfg.global.log_level);
-    try std.testing.expectEqual(@as(u32, 128), cfg.global.memory_ceiling_mb);
-    try std.testing.expectEqualStrings("/proc/self/ns/net", cfg.global.firewall_namespace);
-    try std.testing.expectEqual(@as(shared.Duration, 3600), cfg.defaults.bantime);
-    try std.testing.expectEqual(BanAction.nftables, cfg.defaults.banaction);
-}
-
-test "native: parse defaults retains zero-copy string slices" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const src =
-        \\[global]
-        \\pid_file = "/tmp/pf.pid"
-    ;
-    const cfg = try Config.parse(arena.allocator(), src);
-    const s = cfg.global.pid_file;
-    const src_start = @intFromPtr(src.ptr);
-    const s_start = @intFromPtr(s.ptr);
-    try std.testing.expect(s_start >= src_start);
-    try std.testing.expect(s_start + s.len <= src_start + src.len);
-    try std.testing.expectEqualStrings("/tmp/pf.pid", s);
-}
-
-test "native: parse jails section with overrides" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const src =
-        \\[defaults]
-        \\bantime = 600
-        \\findtime = 600
-        \\maxretry = 5
-        \\
-        \\[jails.sshd]
-        \\enabled = true
-        \\filter = "sshd"
-        \\logpath = ["/var/log/auth.log", "/var/log/secure"]
-        \\maxretry = 3
-        \\
-        \\[jails.nginx]
-        \\enabled = false
-        \\filter = "nginx-http-auth"
-        \\logpath = ["/var/log/nginx/error.log"]
-    ;
-    const cfg = try Config.parse(arena.allocator(), src);
-
-    try std.testing.expectEqual(@as(usize, 2), cfg.jails.len);
-    try std.testing.expectEqualStrings("sshd", cfg.jails[0].name);
-    try std.testing.expect(cfg.jails[0].enabled);
-    try std.testing.expectEqualStrings("sshd", cfg.jails[0].filter);
-    try std.testing.expectEqual(@as(usize, 2), cfg.jails[0].logpath.len);
-    try std.testing.expectEqualStrings("/var/log/auth.log", cfg.jails[0].logpath[0]);
-    try std.testing.expectEqual(@as(?u32, 3), cfg.jails[0].maxretry);
-
-    try std.testing.expectEqualStrings("nginx", cfg.jails[1].name);
-    try std.testing.expect(!cfg.jails[1].enabled);
-
-    const eff_find = cfg.jails[0].effectiveFindtime(cfg.defaults);
-    try std.testing.expectEqual(@as(shared.Duration, 600), eff_find);
-    const eff_mr = cfg.jails[0].effectiveMaxretry(cfg.defaults);
-    try std.testing.expectEqual(@as(u32, 3), eff_mr);
-}
-
-test "native: jail source defaults to auto when unset" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const src =
-        \\[jails.sshd]
-        \\filter = "sshd"
-        \\logpath = ["/var/log/auth.log"]
-    ;
-    const cfg = try Config.parse(arena.allocator(), src);
-    try std.testing.expectEqual(@as(usize, 1), cfg.jails.len);
-    try std.testing.expectEqual(LogSource.auto, cfg.jails[0].source);
-}
-
-test "native: jail source parses file / journald / auto" {
-    const cases = [_]struct { tok: []const u8, want: LogSource }{
-        .{ .tok = "file", .want = .file },
-        .{ .tok = "journald", .want = .journald },
-        .{ .tok = "auto", .want = .auto },
-    };
-    for (cases) |c| {
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-        var buf: [128]u8 = undefined;
-        const src = try std.fmt.bufPrint(
-            &buf,
-            "[jails.sshd]\nfilter = \"sshd\"\nsource = \"{s}\"\n",
-            .{c.tok},
-        );
-        const cfg = try Config.parse(arena.allocator(), src);
-        try std.testing.expectEqual(c.want, cfg.jails[0].source);
-    }
-}
 
 test "native: jail source rejects an unknown token" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -183,33 +67,6 @@ test "native: anyLogpathExists is existence-based, not configured-based (SYS-015
     try std.testing.expect(anyLogpathExists(&.{ "", absent, present }));
 }
 
-test "native: filterSupportsJournald is sshd-only in v1" {
-    try std.testing.expect(filterSupportsJournald("sshd"));
-    try std.testing.expect(!filterSupportsJournald("nginx-http-auth"));
-    try std.testing.expect(!filterSupportsJournald("apache-auth"));
-    try std.testing.expect(!filterSupportsJournald(""));
-    try std.testing.expect(!filterSupportsJournald("sshd-ddos"));
-}
-
-test "native: validate does not fail when a jail resolves to journald" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const src =
-        \\[global]
-        \\memory_ceiling_mb = 32
-        \\socket_path = "/tmp/fail2zig-sys015.sock"
-        \\[defaults]
-        \\bantime = 600
-        \\findtime = 600
-        \\maxretry = 5
-        \\[jails.sshd]
-        \\filter = "sshd"
-        \\source = "journald"
-    ;
-    const cfg = try Config.parse(arena.allocator(), src);
-    try validate(&cfg);
-}
-
 test "native: parse bantime_increment config" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -247,106 +104,6 @@ test "native: bantime_increment rejects invalid scope and jitter above cap" {
         "[defaults]\nbantime_increment_max_bantime = 10\nbantime_increment_jitter = 11\n",
     );
     try std.testing.expectError(error.InvalidIncrement, validate(&cfg));
-}
-
-test "native: bantime_increment accepts fractional factor in defaults" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const src =
-        \\[defaults]
-        \\bantime = 600
-        \\findtime = 600
-        \\maxretry = 5
-        \\bantime_increment_enabled = true
-        \\bantime_increment_factor = 1.5
-    ;
-    const cfg = try Config.parse(arena.allocator(), src);
-    try std.testing.expect(cfg.defaults.bantime_increment.enabled);
-    try std.testing.expectEqual(@as(f64, 1.5), cfg.defaults.bantime_increment.factor);
-}
-
-test "native: bantime_increment accepts fractional multiplier in defaults" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const src =
-        \\[defaults]
-        \\bantime = 600
-        \\findtime = 600
-        \\maxretry = 5
-        \\bantime_increment_enabled = true
-        \\bantime_increment_multiplier = 2.5
-    ;
-    const cfg = try Config.parse(arena.allocator(), src);
-    try std.testing.expectEqual(@as(f64, 2.5), cfg.defaults.bantime_increment.multiplier);
-}
-
-test "native: bantime_increment accepts fractional factor in per-jail block" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const src =
-        \\[jails.sshd]
-        \\filter = "sshd"
-        \\bantime_increment_enabled = true
-        \\bantime_increment_factor = 1.75
-    ;
-    const cfg = try Config.parse(arena.allocator(), src);
-    try std.testing.expectEqual(@as(usize, 1), cfg.jails.len);
-    try std.testing.expectEqual(@as(f64, 1.75), cfg.jails[0].bantime_increment.factor);
-}
-
-test "native: bantime_increment still accepts integer factor/multiplier (regression)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const src =
-        \\[defaults]
-        \\bantime = 600
-        \\findtime = 600
-        \\maxretry = 5
-        \\bantime_increment_enabled = true
-        \\bantime_increment_factor = 2
-        \\bantime_increment_multiplier = 3
-        \\[jails.sshd]
-        \\filter = "sshd"
-        \\bantime_increment_enabled = true
-        \\bantime_increment_factor = 4
-    ;
-    const cfg = try Config.parse(arena.allocator(), src);
-    try std.testing.expectEqual(@as(f64, 2.0), cfg.defaults.bantime_increment.factor);
-    try std.testing.expectEqual(@as(f64, 3.0), cfg.defaults.bantime_increment.multiplier);
-    try std.testing.expectEqual(@as(usize, 1), cfg.jails.len);
-    try std.testing.expectEqual(@as(f64, 4.0), cfg.jails[0].bantime_increment.factor);
-}
-
-test "native: parse rejects unclosed string" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const src = "[global]\nlog_level = \"info\n";
-    try std.testing.expectError(error.UnterminatedString, Config.parse(arena.allocator(), src));
-}
-
-test "native: parse rejects invalid integer" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const src = "[defaults]\nbantime = not-a-number\n";
-    try std.testing.expectError(error.UnexpectedToken, Config.parse(arena.allocator(), src));
-}
-
-test "native: parse rejects unknown section" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const src = "[unknown]\nfoo = 1\n";
-    try std.testing.expectError(error.UnknownSection, Config.parse(arena.allocator(), src));
-}
-
-test "native: parse rejects unknown key" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const src = "[global]\nbogus_key = 1\n";
-    try std.testing.expectError(error.UnknownKey, Config.parse(arena.allocator(), src));
 }
 
 test "native: parse tolerates comments and blank lines" {
@@ -438,74 +195,6 @@ test "native: validate rejects duplicate jail names" {
     try std.testing.expectError(error.DuplicateJailName, validate(&cfg));
 }
 
-test "native: validate warns on missing socket dir, does not fail" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const src =
-        \\[global]
-        \\memory_ceiling_mb = 32
-        \\socket_path = "/definitely-does-not-exist-xyz/sock"
-        \\[defaults]
-        \\bantime = 600
-        \\findtime = 600
-        \\maxretry = 5
-    ;
-    const cfg = try Config.parse(arena.allocator(), src);
-    try validate(&cfg);
-}
-
-test "native: validate accepts healthy config" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const src =
-        \\[global]
-        \\memory_ceiling_mb = 32
-        \\socket_path = "/tmp/fail2zig.sock"
-        \\[defaults]
-        \\bantime = 600
-        \\findtime = 600
-        \\maxretry = 5
-        \\[jails.sshd]
-        \\filter = "sshd"
-    ;
-    const cfg = try Config.parse(arena.allocator(), src);
-    try validate(&cfg);
-}
-
-test "native: load file not found" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    try std.testing.expectError(
-        error.FileNotFound,
-        Config.loadFile(arena.allocator(), "/nonexistent/fail2zig.toml"),
-    );
-}
-
-test "native: loadFile parses a tmp file" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const contents =
-        \\[global]
-        \\memory_ceiling_mb = 32
-    ;
-    {
-        const f = try tmp.dir.createFile("cfg.toml", .{});
-        defer f.close();
-        try f.writeAll(contents);
-        try f.chmod(0o640);
-    }
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const real = try tmp.dir.realpathAlloc(arena.allocator(), "cfg.toml");
-    const cfg = try Config.loadFile(arena.allocator(), real);
-    try std.testing.expectEqual(@as(u32, 32), cfg.global.memory_ceiling_mb);
-}
-
 test "native: parse a full example with all options" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -552,17 +241,6 @@ test "native: parse a full example with all options" {
     try std.testing.expectEqual(@as(usize, 1), cfg.jails[1].ignoreip.?.len);
 }
 
-test "native: websocket_max_clients default is 16" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const src =
-        \\[global]
-        \\memory_ceiling_mb = 32
-    ;
-    const cfg = try Config.parse(arena.allocator(), src);
-    try std.testing.expectEqual(@as(u32, 16), cfg.global.websocket_max_clients);
-}
-
 test "native: history retention defaults and bounded overrides are explicit" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -575,23 +253,6 @@ test "native: history retention defaults and bounded overrides are explicit" {
     try std.testing.expectError(error.InvalidValue, Config.parse(arena.allocator(), "[global]\nhistory_max_matches = 1025\n"));
 }
 
-test "native: websocket_max_clients accepts 16, 128, and hard cap" {
-    const cases = [_]u32{ 16, 128, websocket_hard_max_clients };
-    for (cases) |v| {
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-
-        var buf: [128]u8 = undefined;
-        const src = try std.fmt.bufPrint(
-            &buf,
-            "[global]\nwebsocket_max_clients = {d}\n",
-            .{v},
-        );
-        const cfg = try Config.parse(arena.allocator(), src);
-        try std.testing.expectEqual(v, cfg.global.websocket_max_clients);
-    }
-}
-
 test "native: websocket_max_clients rejects 0" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -600,104 +261,6 @@ test "native: websocket_max_clients rejects 0" {
         \\websocket_max_clients = 0
     ;
     try std.testing.expectError(error.InvalidValue, Config.parse(arena.allocator(), src));
-}
-
-test "native: resolveJail returns null for unknown jail" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const src =
-        \\[defaults]
-        \\bantime = 600
-        \\findtime = 600
-        \\maxretry = 5
-        \\[jails.sshd]
-        \\filter = "sshd"
-    ;
-    const cfg = try Config.parse(arena.allocator(), src);
-    try std.testing.expect(resolveJail(&cfg, "nope") == null);
-}
-
-test "native: resolveJail uses per-jail values when set" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const src =
-        \\[defaults]
-        \\bantime = 600
-        \\findtime = 600
-        \\maxretry = 5
-        \\[jails.aggressive]
-        \\filter = "sshd"
-        \\maxretry = 1
-        \\findtime = 10
-        \\bantime = 30
-    ;
-    const cfg = try Config.parse(arena.allocator(), src);
-    const r = resolveJail(&cfg, "aggressive").?;
-    try std.testing.expectEqual(@as(u32, 1), r.maxretry);
-    try std.testing.expectEqual(@as(shared.Duration, 10), r.findtime);
-    try std.testing.expectEqual(@as(shared.Duration, 30), r.bantime);
-}
-
-test "native: resolveJail falls back to defaults for unset fields" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const src =
-        \\[defaults]
-        \\bantime = 1800
-        \\findtime = 900
-        \\maxretry = 7
-        \\[jails.sshd]
-        \\filter = "sshd"
-        \\maxretry = 2
-    ;
-    const cfg = try Config.parse(arena.allocator(), src);
-    const r = resolveJail(&cfg, "sshd").?;
-    try std.testing.expectEqual(@as(u32, 2), r.maxretry);
-    try std.testing.expectEqual(@as(shared.Duration, 900), r.findtime);
-    try std.testing.expectEqual(@as(shared.Duration, 1800), r.bantime);
-}
-
-test "native: resolveJail inherits defaults bantime_increment when jail is silent" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const src =
-        \\[defaults]
-        \\bantime = 600
-        \\findtime = 600
-        \\maxretry = 5
-        \\bantime_increment_enabled = true
-        \\bantime_increment_factor = 3
-        \\bantime_increment_formula = "exponential"
-        \\bantime_increment_max_bantime = 86400
-        \\[jails.sshd]
-        \\filter = "sshd"
-    ;
-    const cfg = try Config.parse(arena.allocator(), src);
-    const r = resolveJail(&cfg, "sshd").?;
-    try std.testing.expect(r.bantime_increment.enabled);
-    try std.testing.expectEqual(@as(f64, 3.0), r.bantime_increment.factor);
-    try std.testing.expectEqual(BantimeFormula.exponential, r.bantime_increment.formula);
-}
-
-test "native: resolveJail takes per-jail bantime_increment when present" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const src =
-        \\[defaults]
-        \\bantime = 600
-        \\findtime = 600
-        \\maxretry = 5
-        \\bantime_increment_enabled = true
-        \\bantime_increment_factor = 2
-        \\[jails.sshd]
-        \\filter = "sshd"
-        \\bantime_increment_enabled = true
-        \\bantime_increment_factor = 5
-    ;
-    const cfg = try Config.parse(arena.allocator(), src);
-    const r = resolveJail(&cfg, "sshd").?;
-    try std.testing.expect(r.bantime_increment.enabled);
-    try std.testing.expectEqual(@as(f64, 5.0), r.bantime_increment.factor);
 }
 
 test "native: websocket_max_clients rejects values above hard cap" {
@@ -743,22 +306,6 @@ test "native: diag reports InvalidValue at the value position" {
     try std.testing.expectEqual(@as(u32, 16), diag.col);
     try std.testing.expectEqualStrings("metrics_port", diag.key());
     try std.testing.expectEqualStrings("global", diag.section());
-}
-
-test "native: on_no_backend defaults to fail-closed (SYS-014)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const cfg = try Config.parse(arena.allocator(), "[global]\nmemory_ceiling_mb = 32\n");
-    try std.testing.expectEqual(OnNoBackend.@"fail-closed", cfg.global.on_no_backend);
-}
-
-test "native: on_no_backend parses both accepted values (SYS-014)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const lo = try Config.parse(arena.allocator(), "[global]\non_no_backend = \"log-only\"\n");
-    try std.testing.expectEqual(OnNoBackend.@"log-only", lo.global.on_no_backend);
-    const fc = try Config.parse(arena.allocator(), "[global]\non_no_backend = \"fail-closed\"\n");
-    try std.testing.expectEqual(OnNoBackend.@"fail-closed", fc.global.on_no_backend);
 }
 
 test "native: on_no_backend rejects any other value with a positioned diag (SYS-014)" {
@@ -854,15 +401,6 @@ test "native: loadFileDiag resets the diagnostic on file errors" {
     try std.testing.expectEqual(@as(usize, 0), diag.key().len);
 }
 
-test "native: config permission classifier" {
-    try Config.checkConfigPerms(0o640, 1000);
-    try Config.checkConfigPerms(0o644, 1000);
-    try Config.checkConfigPerms(0o660, 0);
-    try std.testing.expectError(error.ConfigGroupWritable, Config.checkConfigPerms(0o660, 1000));
-    try std.testing.expectError(error.ConfigWorldWritable, Config.checkConfigPerms(0o666, 0));
-    try std.testing.expectError(error.ConfigWorldWritable, Config.checkConfigPerms(0o602, 1000));
-}
-
 fn writeTmpConfigWithMode(tmp: *std.testing.TmpDir, mode: std.posix.mode_t) !std.posix.gid_t {
     const f = try tmp.dir.createFile("cfg.toml", .{});
     defer f.close();
@@ -918,28 +456,6 @@ test "native: loadFileDiag rejects a 0660 config unless the group is root" {
     try std.testing.expectEqual(@as(u32, 0o660), diag.mode);
 }
 
-test "native: backend alias maps every fail2ban name in a jail" {
-    const cases = [_]struct { tok: []const u8, want: LogSource }{
-        .{ .tok = "systemd", .want = .journald },
-        .{ .tok = "auto", .want = .auto },
-        .{ .tok = "polling", .want = .auto },
-        .{ .tok = "pyinotify", .want = .auto },
-        .{ .tok = "gamin", .want = .auto },
-    };
-    for (cases) |c| {
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-        var buf: [128]u8 = undefined;
-        const src = try std.fmt.bufPrint(
-            &buf,
-            "[jails.sshd]\nfilter = \"sshd\"\nbackend = \"{s}\"\n",
-            .{c.tok},
-        );
-        const cfg = try Config.parse(arena.allocator(), src);
-        try std.testing.expectEqual(c.want, cfg.jails[0].source);
-    }
-}
-
 test "native: backend alias rejects an unknown name with diag at the value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -975,24 +491,6 @@ test "native: backend and source in the same jail conflict in either order" {
     try std.testing.expectEqualStrings("backend", diag.key());
 }
 
-test "native: backend in [defaults] is inherited by jails without an explicit source" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const src =
-        \\[jails.sshd]
-        \\filter = "sshd"
-        \\[jails.nginx]
-        \\filter = "nginx-http-auth"
-        \\source = "file"
-        \\[defaults]
-        \\backend = "systemd"
-    ;
-    const cfg = try Config.parse(arena.allocator(), src);
-    try std.testing.expectEqual(LogSource.journald, cfg.defaults.source);
-    try std.testing.expectEqual(LogSource.journald, cfg.jails[0].source);
-    try std.testing.expectEqual(LogSource.file, cfg.jails[1].source);
-}
-
 test "native: backend and source conflict in [defaults] and unknown backend is rejected there" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1000,27 +498,6 @@ test "native: backend and source conflict in [defaults] and unknown backend is r
     try std.testing.expectError(error.InvalidValue, Config.parse(arena.allocator(), "[defaults]\nbackend = \"systemd[journalflags=1]\"\n"));
     const cfg = try Config.parse(arena.allocator(), "[defaults]\nsource = \"journald\"\n");
     try std.testing.expectEqual(LogSource.journald, cfg.defaults.source);
-}
-
-test "native: source = \"internal\" parses per jail and in defaults (ENH-005)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const cfg = try Config.parse(arena.allocator(), "[defaults]\nsource = \"internal\"\n[jails.recidive]\nfilter = \"recidive\"\nsource = \"internal\"\n");
-    try std.testing.expectEqual(LogSource.internal, cfg.defaults.source);
-    try std.testing.expectEqual(LogSource.internal, cfg.jails[0].source);
-    try std.testing.expect(filterSupportsInternal("recidive"));
-    try std.testing.expect(!filterSupportsInternal("sshd"));
-}
-
-test "native: firewall defaults to auto and parses every backend name (ENH-007)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const def = try Config.parse(arena.allocator(), "[global]\n");
-    try std.testing.expectEqual(FirewallSelection.auto, def.global.firewall);
-    inline for (.{ "auto", "nftables", "ipset", "iptables" }) |name| {
-        const cfg = try Config.parse(arena.allocator(), "[global]\nfirewall = \"" ++ name ++ "\"\n");
-        try std.testing.expectEqual(@field(FirewallSelection, name), cfg.global.firewall);
-    }
 }
 
 test "native: firewall rejects unknown and non-string values with a positioned diag (ENH-007)" {

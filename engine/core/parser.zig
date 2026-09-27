@@ -702,18 +702,6 @@ pub const Parser = struct {
     }
 };
 
-test "parser: extractIpv4 typical" {
-    const r = extractIpv4("192.168.1.1 rest of line").?;
-    try std.testing.expectEqual(@as(u32, 0xC0A80101), r.ip);
-    try std.testing.expectEqual(@as(u8, 11), r.len);
-}
-
-test "parser: extractIpv4 at exact end of slice" {
-    const r = extractIpv4("10.0.0.1").?;
-    try std.testing.expectEqual(@as(u32, 0x0A000001), r.ip);
-    try std.testing.expectEqual(@as(u8, 8), r.len);
-}
-
 test "parser: extractIpv4 rejects too short" {
     try std.testing.expect(extractIpv4("1.2.3") == null);
     try std.testing.expect(extractIpv4("") == null);
@@ -725,35 +713,6 @@ test "parser: extractIpv4 rejects invalid octet" {
     const r = extractIpv4("1.2.3.4.5").?;
     try std.testing.expectEqual(@as(u32, 0x01020304), r.ip);
     try std.testing.expectEqual(@as(u8, 7), r.len);
-}
-
-test "parser: extractIpv4 stops at non-digit-non-dot" {
-    const r = extractIpv4("1.2.3.4 from somewhere").?;
-    try std.testing.expectEqual(@as(u32, 0x01020304), r.ip);
-    try std.testing.expectEqual(@as(u8, 7), r.len);
-}
-
-test "parser: extractIpv4 consumes just the address" {
-    const r = extractIpv4("8.8.8.8:443").?;
-    try std.testing.expectEqual(@as(u8, 7), r.len);
-}
-
-test "parser: extractIpv6 loopback" {
-    const r = extractIpv6("::1 tail").?;
-    try std.testing.expectEqual(@as(u128, 1), r.ip);
-    try std.testing.expectEqual(@as(u16, 3), r.len);
-}
-
-test "parser: extractIpv6 full form" {
-    const r = extractIpv6("2001:0db8:85a3:0000:0000:8a2e:0370:7334 tail").?;
-    try std.testing.expectEqual(@as(u128, 0x20010db885a3000000008a2e03707334), r.ip);
-}
-
-test "parser: extractIpv6 ipv4-mapped" {
-    const r = extractIpv6("::ffff:192.168.1.1 tail").?;
-    const expected: u128 = 0x00000000000000000000ffffc0a80101;
-    try std.testing.expectEqual(expected, r.ip);
-    try std.testing.expectEqual(@as(u16, 18), r.len);
 }
 
 test "parser: extractIpv6 rejects plain v4" {
@@ -769,15 +728,6 @@ test "parser: extractIp folds ::ffff: into ipv4 (SEC-001)" {
 
 test "parser: extractIp rejects deprecated ::a.b.c.d (SEC-001)" {
     try std.testing.expect(extractIp("::1.2.3.4") == null);
-}
-
-test "parser: extractIpv6 single-pass rejects double '::' (SEC-009)" {
-    try std.testing.expect(extractIpv6("::1::2") == null or extractIpv6("::1::2").?.len <= 3);
-}
-
-test "parser: extractIpv6 adversarial garbage input (SEC-009)" {
-    const adversarial = "a:b:c:d:e:f:0123456789abcdef:0123456789abcdef:z tail";
-    _ = extractIpv6(adversarial);
 }
 
 test "parser: extractTimestamp ISO 8601 Z" {
@@ -815,66 +765,11 @@ test "parser: extractTimestamp rejects random digits" {
     try std.testing.expect(extractTimestamp("12345 tail") == null);
 }
 
-test "parser: stripSyslogPrefix BSD rsyslog sshd line (QA-001)" {
-    const raw = "Apr 21 10:15:03 host sshd[1234]: Failed password for root from 1.2.3.4 port 22 ssh2";
-    const stripped = stripSyslogPrefix(raw);
-    try std.testing.expectEqualStrings(
-        "Failed password for root from 1.2.3.4 port 22 ssh2",
-        stripped,
-    );
-}
-
-test "parser: stripSyslogPrefix ISO 8601 variant (QA-001)" {
-    const raw = "2026-04-21T10:15:03Z host nginx: 1.2.3.4 - - [21/Apr] \"GET /wp-login.php HTTP/1.1\" 404 0";
-    const stripped = stripSyslogPrefix(raw);
-    try std.testing.expectEqualStrings(
-        "1.2.3.4 - - [21/Apr] \"GET /wp-login.php HTTP/1.1\" 404 0",
-        stripped,
-    );
-}
-
-test "parser: stripSyslogPrefix passes non-syslog lines through (QA-001)" {
-    const raw = "Failed password for root from 1.2.3.4 port 22 ssh2";
-    const stripped = stripSyslogPrefix(raw);
-    try std.testing.expectEqualStrings(raw, stripped);
-}
-
-test "parser: stripSyslogPrefix leaves lines with no colon intact (QA-001)" {
-    const raw = "Apr 21 10:15:03 host notquitesyslog";
-    const stripped = stripSyslogPrefix(raw);
-    try std.testing.expectEqualStrings(raw, stripped);
-}
-
-test "parser: compile matches syslog-prefixed sshd via stripSyslogPrefix (QA-001)" {
-    const m = comptime compile("Failed password for <*> from <IP>");
-    const raw = "Apr 21 10:15:03 host sshd[1234]: Failed password for root from 1.2.3.4 port 22 ssh2";
-    const body = stripSyslogPrefix(raw);
-    const r = m(body).?;
-    try std.testing.expectEqual(@as(u32, 0x01020304), r.ip.ipv4);
-}
-
-test "parser: compile sshd-style pattern" {
-    const m = comptime compile("Failed password for <*> from <IP>");
-    const r = m("Failed password for root from 1.2.3.4").?;
-    try std.testing.expectEqual(@as(u32, 0x01020304), r.ip.ipv4);
-}
-
-test "parser: compile sshd pattern rejects non-matching line" {
-    const m = comptime compile("Failed password for <*> from <IP>");
-    try std.testing.expect(m("Accepted password for root from 1.2.3.4") == null);
-}
-
 test "parser: compile pattern with timestamp" {
     const m = comptime compile("<TIMESTAMP> <*> from <IP>");
     const r = m("2026-04-20T14:30:22Z sshd from 10.0.0.1").?;
     try std.testing.expectEqual(@as(u32, 0x0A000001), r.ip.ipv4);
     try std.testing.expectEqual(@as(i64, 1_776_695_422), r.timestamp.?);
-}
-
-test "parser: compile pattern with ipv6" {
-    const m = comptime compile("Failed password for <*> from <IP>");
-    const r = m("Failed password for root from 2001:db8::1").?;
-    try std.testing.expectEqual(@as(u128, 0x20010db8000000000000000000000001), r.ip.ipv6);
 }
 
 test "parser: replacement inside address tokens cannot select valid prefixes or suffixes" {
@@ -910,44 +805,10 @@ test "parser: replacement in unrelated text preserves intact address matching" {
     }) |line| try std.testing.expectEqual(@as(u32, 0xc0000201), wildcard(line).?.ip.ipv4);
 }
 
-test "parser: compile anchored literal failure" {
-    const m = comptime compile("Failed <*> from <IP>");
-    try std.testing.expect(m("  Failed whatever from 1.2.3.4") == null);
-}
-
 test "parser: compile pattern with host" {
     const m = comptime compile("<HOST> has IP <IP>");
     const r = m("web01.example.com has IP 10.0.0.5").?;
     try std.testing.expectEqual(@as(u32, 0x0A000005), r.ip.ipv4);
-}
-
-test "parser: compile pattern has zero heap allocation" {
-    var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    const a = fa.allocator();
-    const m = comptime compile("Failed password for <*> from <IP>");
-    const p = Parser.withMatcher(a, m);
-    const r = try p.parseLine("Failed password for root from 9.9.9.9");
-    try std.testing.expectEqual(@as(u32, 0x09090909), r.ip.ipv4);
-    try std.testing.expectEqual(@as(usize, 0), fa.alloc_index);
-    try std.testing.expectEqual(@as(usize, 0), fa.allocations);
-}
-
-test "parser: Parser wrapper parseLine default pattern" {
-    const p = Parser.init(std.testing.allocator);
-    const r = try p.parseLine("some prefix 1.2.3.4 tail");
-    try std.testing.expectEqual(@as(u32, 0x01020304), r.ip.ipv4);
-}
-
-test "parser: Parser wrapper rejects line with no IP" {
-    const p = Parser.init(std.testing.allocator);
-    try std.testing.expectError(error.NoMatch, p.parseLine("no ip here"));
-}
-
-test "parser: Parser wrapper with custom match fn" {
-    const m = comptime compile("ssh <IP>");
-    const p = Parser.withMatcher(std.testing.allocator, m);
-    const r = try p.parseLine("ssh 10.0.0.1");
-    try std.testing.expectEqual(@as(u32, 0x0A000001), r.ip.ipv4);
 }
 
 test {

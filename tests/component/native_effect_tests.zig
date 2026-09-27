@@ -494,8 +494,7 @@ test "native effects: typed generation release flush and post-expiry reban prese
     var clock = TestClock{};
     const first_owner = try f.store.setOwner(try change("one", 1, .permanent), clock.value());
     const shared = try f.store.setOwner(try change("two", 2, .permanent), clock.value());
-    try f.store.markDispatched(shared.token(), clock.value());
-    _ = try f.store.settleVerified(shared.token(), observation(shared, clock.now, .permanent), clock.value());
+    _ = try f.store.settleOutcome(shared.token(), clock.now, observation(shared, clock.now, .permanent), clock.value());
     try t.expectEqual(@as(u64, 2), try f.store.confirmedEffectEvents());
 
     const next_generation = [_]u8{4} ** 32;
@@ -519,8 +518,7 @@ test "native effects: typed generation release flush and post-expiry reban prese
     f.store.fail_at = null;
     const retained = try f.store.transitionOwner(transition, clock.value());
     try t.expect(retained.desired == .permanent);
-    try f.store.markDispatched(retained.token(), clock.value());
-    _ = try f.store.settleVerified(retained.token(), observation(retained, clock.now, .permanent), clock.value());
+    _ = try f.store.settleOutcome(retained.token(), clock.now, observation(retained, clock.now, .permanent), clock.value());
     try t.expectEqual(@as(u64, 2), try f.store.confirmedEffectEvents());
     const replay_epoch = f.store.effect_publication_epoch;
     const replayed = try f.store.transitionOwner(transition, clock.value());
@@ -554,31 +552,26 @@ test "native effects: typed generation release flush and post-expiry reban prese
         .occurred_us = clock.now,
     }, clock.value());
     try t.expect(released.desired == .permanent);
-    try f.store.markDispatched(released.token(), clock.value());
-    _ = try f.store.settleVerified(released.token(), observation(released, clock.now, .permanent), clock.value());
+    _ = try f.store.settleOutcome(released.token(), clock.now, observation(released, clock.now, .permanent), clock.value());
     try t.expectEqual(@as(u64, 2), try f.store.confirmedEffectEvents());
     const flushed = (try f.store.flushJailOwner("two", [_]u8{3} ** 32, [_]u8{0xc1} ** 32, clock.value())).?;
     try t.expect(flushed.desired == .absent);
     try t.expect((try f.store.flushJailOwner("two", [_]u8{3} ** 32, [_]u8{0xc1} ** 32, clock.value())) == null);
-    try f.store.markDispatched(flushed.token(), clock.value());
-    _ = try f.store.settleVerified(flushed.token(), observation(flushed, clock.now, .absent), clock.value());
+    _ = try f.store.settleOutcome(flushed.token(), clock.now, observation(flushed, clock.now, .absent), clock.value());
     try t.expectEqual(@as(u64, 2), try f.store.confirmedEffectEvents());
 
     var reban_change = try change("reban", 3, .{ .finite = 200 });
     const finite = try f.store.setOwner(reban_change, clock.value());
-    try f.store.markDispatched(finite.token(), clock.value());
-    _ = try f.store.settleVerified(finite.token(), observation(finite, clock.now, finite.desired), clock.value());
+    _ = try f.store.settleOutcome(finite.token(), clock.now, observation(finite, clock.now, finite.desired), clock.value());
     clock.now = 200;
     const expired = try f.store.prepareExpiry(finite.scope_key, finite.revision, clock.value());
-    try f.store.markDispatched(expired.token(), clock.value());
-    _ = try f.store.settleVerified(expired.token(), observation(expired, clock.now, .absent), clock.value());
+    _ = try f.store.settleOutcome(expired.token(), clock.now, observation(expired, clock.now, .absent), clock.value());
     reban_change.decision_id = [_]u8{4} ** 32;
     reban_change.expected_revision = 2;
     reban_change.lease = .permanent;
     reban_change.decided_us = clock.now;
     const reban = try f.store.setOwner(reban_change, clock.value());
-    try f.store.markDispatched(reban.token(), clock.value());
-    _ = try f.store.settleVerified(reban.token(), observation(reban, clock.now, .permanent), clock.value());
+    _ = try f.store.settleOutcome(reban.token(), clock.now, observation(reban, clock.now, .permanent), clock.value());
     try t.expectEqual(@as(u64, 4), try f.store.confirmedEffectEvents());
 }
 
@@ -622,8 +615,7 @@ test "native effects: independent target outcomes require enforcement proof and 
     try t.expectEqual(action_outcome.Status.dispatched, targets[0].status);
     try t.expectEqual(action_outcome.Status.failed, targets[1].status);
 
-    try f.store.markDispatched(entry.token(), clock.value());
-    _ = try f.store.settleVerified(entry.token(), observation(entry, clock.now, .permanent), clock.value());
+    _ = try f.store.settleOutcome(entry.token(), clock.now, observation(entry, clock.now, .permanent), clock.value());
     try f.store.settleActionTarget(intent.action_id, .enforcement, .confirmed, clock.value());
     try f.reopen();
     try t.expectEqual(@as(usize, 2), try f.store.actionTargets(intent.action_id, &targets));
@@ -660,24 +652,22 @@ test "native effects: dispatch fences replacement and complete reconciliation re
     try admit(&f.store);
     var clock = TestClock{};
     const entry = try f.store.setOwner(try change("one", 1, .{ .finite = 500 }), clock.value());
-    try f.store.markDispatched(entry.token(), clock.value());
+    try f.store.dispatchedForTest(entry.token(), clock.now, clock.value());
     try t.expectError(error.EffectReconciliationRequired, f.store.setOwner(try change("two", 2, .permanent), clock.value()));
     var incomplete = observation(entry, 100, .absent);
     incomplete.qualification = .incomplete;
-    try t.expectError(error.IncompleteEffectObservation, f.store.settleVerified(entry.token(), incomplete, clock.value()));
-    try t.expectEqual(effects.Settlement.retry_same_intent, try f.store.settleVerified(entry.token(), observation(entry, 100, .absent), clock.value()));
+    try t.expectError(error.IncompleteEffectObservation, f.store.settleOutcome(entry.token(), 100, incomplete, clock.value()));
+    try t.expectEqual(effects.Settlement.retry_same_intent, try f.store.settleOutcome(entry.token(), 100, observation(entry, 100, .absent), clock.value()));
     try t.expectEqualDeep(entry.intent_id, (try first(&f.store)).intent_id);
-    try f.store.markDispatched(entry.token(), clock.value());
-    try t.expectEqual(effects.Settlement.verified, try f.store.settleVerified(entry.token(), observation(entry, 100, entry.desired), clock.value()));
+    try t.expectEqual(effects.Settlement.verified, try f.store.settleOutcome(entry.token(), clock.now, observation(entry, 100, entry.desired), clock.value()));
     try t.expectEqual(@as(u64, 1), try f.store.confirmedEffectEvents());
-    _ = try f.store.settleVerified(entry.token(), observation(entry, 100, entry.desired), clock.value());
+    _ = try f.store.settleOutcome(entry.token(), 100, observation(entry, 100, entry.desired), clock.value());
     try t.expectEqual(@as(u64, 1), try f.store.confirmedEffectEvents());
     clock.now = 101;
     var drift = observation(entry, 101, .absent);
     drift.state = null;
-    try t.expectEqual(effects.Settlement.retry_same_intent, try f.store.settleVerified(entry.token(), drift, clock.value()));
-    try f.store.markDispatched(entry.token(), clock.value());
-    _ = try f.store.settleVerified(entry.token(), observation(entry, 101, entry.desired), clock.value());
+    try t.expectEqual(effects.Settlement.retry_same_intent, try f.store.settleOutcome(entry.token(), 101, drift, clock.value()));
+    _ = try f.store.settleOutcome(entry.token(), clock.now, observation(entry, 101, entry.desired), clock.value());
     try t.expectEqual(@as(u64, 1), try f.store.confirmedEffectEvents());
 }
 
@@ -687,15 +677,14 @@ test "native effects: expired uncertain add reconciles before exact removal with
     try admit(&f.store);
     var clock = TestClock{};
     const entry = try f.store.setOwner(try change("one", 1, .{ .finite = 200 }), clock.value());
-    try f.store.markDispatched(entry.token(), clock.value());
+    try f.store.dispatchedForTest(entry.token(), clock.now, clock.value());
     try f.reopen();
     clock.now = 250;
     try t.expectError(error.EffectReconciliationRequired, f.store.prepareExpiry(entry.scope_key, entry.revision, clock.value()));
-    try t.expectEqual(effects.Settlement.expired, try f.store.settleVerified(entry.token(), observation(entry, 250, entry.desired), clock.value()));
+    try t.expectEqual(effects.Settlement.expired, try f.store.settleOutcome(entry.token(), 250, observation(entry, 250, entry.desired), clock.value()));
     const remove = try f.store.prepareExpiry(entry.scope_key, entry.revision, clock.value());
     try t.expect(remove.desired == .absent);
-    try f.store.markDispatched(remove.token(), clock.value());
-    _ = try f.store.settleVerified(remove.token(), observation(remove, 250, .absent), clock.value());
+    _ = try f.store.settleOutcome(remove.token(), clock.now, observation(remove, 250, .absent), clock.value());
     try t.expectEqual(@as(u64, 0), try f.store.confirmedEffectEvents());
 }
 
@@ -713,22 +702,22 @@ test "native effects: rollback preserves owner intent publication epoch and fina
         try t.expectEqualDeep(entry, try first(&f.store));
     }
     f.store.fail_at = .before_effect_dispatch_commit;
-    try t.expectError(error.InjectedFailure, f.store.markDispatched(entry.token(), clock.value()));
+    try t.expectError(error.InjectedFailure, f.store.settleOutcome(entry.token(), clock.now, observation(entry, clock.now, entry.desired), clock.value()));
     try t.expectEqualDeep(entry, try first(&f.store));
     f.store.fail_at = null;
     clock.now = 499;
     clock.advance = 1;
-    try t.expectError(error.EffectExpired, f.store.markDispatched(entry.token(), clock.value()));
+    try t.expectError(error.EffectExpired, f.store.settleOutcome(entry.token(), clock.now, observation(entry, clock.now, entry.desired), clock.value()));
     try t.expectEqualDeep(entry, try first(&f.store));
     clock.now = 200;
     clock.advance = 0;
-    try f.store.markDispatched(entry.token(), clock.value());
+    try f.store.dispatchedForTest(entry.token(), clock.now, clock.value());
     f.store.fail_at = .before_effect_receipt_commit;
-    try t.expectError(error.InjectedFailure, f.store.settleVerified(entry.token(), observation(entry, 200, entry.desired), clock.value()));
+    try t.expectError(error.InjectedFailure, f.store.settleOutcome(entry.token(), 200, observation(entry, 200, entry.desired), clock.value()));
     try t.expectEqual(@as(u64, 0), try f.store.confirmedEffectEvents());
     try f.reopen();
     clock.now = 199;
-    try t.expectError(error.EffectClockReversed, f.store.settleVerified(entry.token(), observation(entry, 199, entry.desired), clock.value()));
+    try t.expectError(error.EffectClockReversed, f.store.settleOutcome(entry.token(), 199, observation(entry, 199, entry.desired), clock.value()));
 }
 
 test "native effects: detached pages detect changed snapshot and malformed canonical persisted values" {
@@ -766,8 +755,7 @@ test "native effects: detection for a live owner is absorbed until its deadline 
     try f.store.enableActionTargets();
     var clock = TestClock{};
     const existing = try f.store.setOwner(try change("one", 1, .{ .finite = 800 }), clock.value());
-    try f.store.markDispatched(existing.token(), clock.value());
-    _ = try f.store.settleVerified(existing.token(), observation(existing, clock.now, .{ .finite = 800 }), clock.value());
+    _ = try f.store.settleOutcome(existing.token(), clock.now, observation(existing, clock.now, .{ .finite = 800 }), clock.value());
     const confirmed = try f.store.confirmedEffectEvents();
     var owners: [effects.max_page]effects.Owner = undefined;
     try t.expectEqual(@as(usize, 1), try f.store.effectOwners(existing.scope_key, existing.revision, &owners));
@@ -819,8 +807,7 @@ test "native effects: composed schema 14 to 21 upgrade preserves source owner ex
     var clock = TestClock{};
     try t.expectEqual(durable.CommitResult.committed, try f.store.commitRecord(try record(&clock)));
     const entry = try first(&f.store);
-    try f.store.markDispatched(entry.token(), clock.value());
-    _ = try f.store.settleVerified(entry.token(), observation(entry, clock.now, entry.desired), clock.value());
+    _ = try f.store.settleOutcome(entry.token(), clock.now, observation(entry, clock.now, entry.desired), clock.value());
     try t.expectEqual(@as(u64, 1), try f.store.confirmedEffectEvents());
 
     try f.reopen();
@@ -907,8 +894,7 @@ test "native effects: retry prolong commits state owner intent and stable histor
     var clock = TestClock{};
     try t.expectEqual(durable.CommitResult.committed, try f.store.commitRecord(try record(&clock)));
     const initial = try first(&f.store);
-    try f.store.markDispatched(initial.token(), clock.value());
-    try t.expectEqual(effects.Settlement.verified, try f.store.settleVerified(initial.token(), observation(initial, 100, initial.desired), clock.value()));
+    try t.expectEqual(effects.Settlement.verified, try f.store.settleOutcome(initial.token(), clock.now, observation(initial, 100, initial.desired), clock.value()));
     try t.expectEqual(@as(u64, 1), try f.store.confirmedEffectEvents());
     var owners: [effects.max_page]effects.Owner = undefined;
     try t.expectEqual(@as(usize, 1), try f.store.effectOwners(initial.scope_key, initial.revision, &owners));
@@ -946,8 +932,7 @@ test "native effects: retry prolong commits state owner intent and stable histor
     try t.expect(!manager.confirmedSubject(subject, clock.now));
     try t.expectEqualDeep(retry.Lease{ .finite = 800 }, longer.lease);
     try t.expectEqualDeep(longer.lease, longer.effect.desired);
-    try f.store.markDispatched(longer.effect.token(), clock.value());
-    try t.expectEqual(effects.Settlement.verified, try f.store.settleVerified(longer.effect.token(), observation(longer.effect, 100, longer.effect.desired), clock.value()));
+    try t.expectEqual(effects.Settlement.verified, try f.store.settleOutcome(longer.effect.token(), clock.now, observation(longer.effect, 100, longer.effect.desired), clock.value()));
     try t.expectEqual(@as(u64, 1), try f.store.confirmedEffectEvents());
     try t.expectEqual(@as(usize, 1), try f.store.effectOwners(longer.effect.scope_key, longer.effect.revision, &owners));
     try t.expectEqual(original_owner.revision + 1, owners[0].revision);
@@ -967,8 +952,7 @@ test "native effects: retry prolong commits state owner intent and stable histor
     try t.expectEqualDeep(retry.Lease.permanent, permanent.lease);
     try t.expectEqualDeep(retry.Lease.permanent, (try f.store.retryState("one", subject)).?.lease);
     try t.expectEqualDeep(retry.Lease.permanent, (try f.store.retryDecision("one", "file", "1")).?.lease);
-    try f.store.markDispatched(permanent.effect.token(), clock.value());
-    try t.expectEqual(effects.Settlement.verified, try f.store.settleVerified(permanent.effect.token(), observation(permanent.effect, 100, .permanent), clock.value()));
+    try t.expectEqual(effects.Settlement.verified, try f.store.settleOutcome(permanent.effect.token(), clock.now, observation(permanent.effect, 100, .permanent), clock.value()));
     try t.expectEqual(@as(u64, 1), try f.store.confirmedEffectEvents());
     try f.reopen();
     manager.storageReopened();
@@ -993,7 +977,7 @@ test "native effects: actual killed migration record dispatch and receipt commit
         if (stage != .migration) try admit(&f.store);
         if (stage == .record) try admitRecord(&f.store);
         if (stage == .dispatch or stage == .receipt) entry = try f.store.setOwner(try change("one", 1, .{ .finite = 500 }), clock.value());
-        if (stage == .receipt) try f.store.markDispatched(entry.token(), clock.value());
+        if (stage == .receipt) try f.store.dispatchedForTest(entry.token(), clock.now, clock.value());
         f.store.close();
         const pid = try std.posix.fork();
         if (pid == 0) {
@@ -1020,9 +1004,11 @@ test "native effects: actual killed migration record dispatch and receipt commit
                     const value = record(&clock) catch std.process.exit(7);
                     _ = child.commitRecord(value) catch std.process.exit(8);
                 },
-                .dispatch => child.markDispatched(entry.token(), clock.value()) catch std.process.exit(9),
+                .dispatch => {
+                    _ = child.settleOutcome(entry.token(), 100, observation(entry, 100, entry.desired), clock.value()) catch std.process.exit(9);
+                },
                 .receipt => {
-                    _ = child.settleVerified(entry.token(), observation(entry, 100, entry.desired), clock.value()) catch std.process.exit(10);
+                    _ = child.settleOutcome(entry.token(), 100, observation(entry, 100, entry.desired), clock.value()) catch std.process.exit(10);
                 },
             }
             std.process.exit(11);
@@ -1041,7 +1027,7 @@ test "native effects: actual killed migration record dispatch and receipt commit
                 try t.expectEqual(@as(usize, @intFromBool(after)), (try f.store.effectPage(null, null, &rows)).count);
                 if (after) try t.expectEqual(@as(i64, 500), rows[0].desired.finite);
             },
-            .dispatch => try t.expectEqual(if (after) effects.Status.dispatched else effects.Status.pending, (try first(&f.store)).status),
+            .dispatch => try t.expectEqual(if (after) effects.Status.applied else effects.Status.pending, (try first(&f.store)).status),
             .receipt => {
                 try t.expectEqual(if (after) effects.Status.applied else effects.Status.dispatched, (try first(&f.store)).status);
                 try t.expectEqual(@as(u64, @intFromBool(after)), try f.store.confirmedEffectEvents());
@@ -1114,21 +1100,20 @@ test "native effects: advancing same-intent retry reopens with original observat
     try admit(&f.store);
     var clock = TestClock{};
     const entry = try f.store.setOwner(try change("one", 1, .{ .finite = 500 }), clock.value());
-    try f.store.markDispatched(entry.token(), clock.value());
     clock.now = 110;
-    _ = try f.store.settleVerified(entry.token(), observation(entry, 110, .absent), clock.value());
+    _ = try f.store.settleOutcome(entry.token(), 100, observation(entry, 110, .absent), clock.value());
     clock.now = 120;
-    try f.store.markDispatched(entry.token(), clock.value());
+    try f.store.dispatchedForTest(entry.token(), clock.now, clock.value());
     try f.reopen();
     try t.expectEqual(effects.Status.dispatched, (try first(&f.store)).status);
     clock.now = 130;
-    _ = try f.store.settleVerified(entry.token(), observation(entry, 130, entry.desired), clock.value());
+    _ = try f.store.settleOutcome(entry.token(), 130, observation(entry, 130, entry.desired), clock.value());
     try sql(&f.store, "CREATE TEMP TABLE receipt_count(n INTEGER CHECK(n=2)); INSERT INTO receipt_count SELECT count(*) FROM effect_observations;");
     clock.now = 140;
-    try t.expectError(error.StaleEffect, f.store.settleVerified(entry.token(), observation(entry, 125, .absent), clock.value()));
+    try t.expectError(error.StaleEffect, f.store.settleOutcome(entry.token(), 125, observation(entry, 125, .absent), clock.value()));
     var conflict = observation(entry, 130, .absent);
     conflict.fingerprint[0] = 8;
-    try t.expectError(error.StaleEffect, f.store.settleVerified(entry.token(), conflict, clock.value()));
+    try t.expectError(error.StaleEffect, f.store.settleOutcome(entry.token(), 130, conflict, clock.value()));
     try t.expectEqual(effects.Status.applied, (try first(&f.store)).status);
     try t.expectEqual(@as(i64, 500), (try first(&f.store)).desired.finite);
 }
@@ -1139,20 +1124,18 @@ test "native effects: full confirmation ledger permits existing dedup but refuse
     try admit(&f.store);
     var clock = TestClock{};
     const entry = try f.store.setOwner(try change("one", 1, .permanent), clock.value());
-    try f.store.markDispatched(entry.token(), clock.value());
-    _ = try f.store.settleVerified(entry.token(), observation(entry, 100, .permanent), clock.value());
+    _ = try f.store.settleOutcome(entry.token(), clock.now, observation(entry, 100, .permanent), clock.value());
     try sql(&f.store, "WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n<65535) INSERT INTO confirmed_effect_events SELECT CAST(printf('%032d',n) AS BLOB),(SELECT scope_key FROM native_effects LIMIT 1),'filler-'||n,zeroblob(32),100 FROM numbers;");
     try t.expectEqual(@as(u64, effects.max_confirmed_events), try f.store.confirmedEffectEvents());
-    _ = try f.store.settleVerified(entry.token(), observation(entry, 100, .permanent), clock.value());
+    _ = try f.store.settleOutcome(entry.token(), 100, observation(entry, 100, .permanent), clock.value());
     clock.now = 110;
-    _ = try f.store.settleVerified(entry.token(), observation(entry, 110, .absent), clock.value());
+    _ = try f.store.settleOutcome(entry.token(), 110, observation(entry, 110, .absent), clock.value());
     clock.now = 120;
-    try f.store.markDispatched(entry.token(), clock.value());
-    _ = try f.store.settleVerified(entry.token(), observation(entry, 120, .permanent), clock.value());
+    _ = try f.store.settleOutcome(entry.token(), clock.now, observation(entry, 120, .permanent), clock.value());
     const second = try f.store.setOwner(try change("two", 2, .permanent), clock.value());
-    try f.store.markDispatched(second.token(), clock.value());
+    try f.store.dispatchedForTest(second.token(), clock.now, clock.value());
     const epoch = f.store.effect_publication_epoch;
-    try t.expectError(error.EffectCapacity, f.store.settleVerified(second.token(), observation(second, 120, .permanent), clock.value()));
+    try t.expectError(error.EffectCapacity, f.store.settleOutcome(second.token(), 120, observation(second, 120, .permanent), clock.value()));
     try t.expectEqual(epoch, f.store.effect_publication_epoch);
     try t.expectEqual(effects.Status.dispatched, (try first(&f.store)).status);
     try t.expectEqual(@as(u64, effects.max_confirmed_events), try f.store.confirmedEffectEvents());
@@ -1173,8 +1156,7 @@ test "native effects: reload generation re-key moves an applied owner through re
     try f.store.admitRetry("one", g_old, policy);
     var clock = TestClock{};
     const entry = try f.store.setOwner(try change("one", 9, .permanent), clock.value());
-    try f.store.markDispatched(entry.token(), clock.value());
-    _ = try f.store.settleVerified(entry.token(), observation(entry, clock.now, .permanent), clock.value());
+    _ = try f.store.settleOutcome(entry.token(), clock.now, observation(entry, clock.now, .permanent), clock.value());
     const epoch = f.store.effect_publication_epoch;
     var next = policy;
     next.maxretry = 2;
@@ -1187,8 +1169,7 @@ test "native effects: reload generation re-key moves an applied owner through re
     try t.expectEqual(@as(usize, 1), count);
     try t.expectEqualSlices(u8, &g_new, &owners[0].generation);
     try t.expect(owners[0].lease == .permanent);
-    try f.store.markDispatched(moved.token(), clock.value());
-    _ = try f.store.settleVerified(moved.token(), observation(moved, clock.now, .permanent), clock.value());
+    _ = try f.store.settleOutcome(moved.token(), clock.now, observation(moved, clock.now, .permanent), clock.value());
     const settled = try first(&f.store);
     try t.expectEqual(effects.Status.applied, settled.status);
     var targets: [@import("engine_test").core.native_action_outcome.max_targets_per_action]@import("engine_test").core.native_action_outcome.Target = undefined;
@@ -1229,15 +1210,13 @@ test "native effects: spent scopes are pruned only after owners, intents and ret
     var clock = TestClock{};
     var ban = try change("one", 1, .{ .finite = 200 });
     const applied = try f.store.setOwner(ban, clock.value());
-    try f.store.markDispatched(applied.token(), clock.value());
-    _ = try f.store.settleVerified(applied.token(), observation(applied, clock.now, applied.desired), clock.value());
+    _ = try f.store.settleOutcome(applied.token(), clock.now, observation(applied, clock.now, applied.desired), clock.value());
     try t.expect(!try f.store.pruneSpentEffectOne());
 
     clock.now = 200;
     const expired = try f.store.prepareExpiry(applied.scope_key, applied.revision, clock.value());
     try t.expect(!try f.store.pruneSpentEffectOne());
-    try f.store.markDispatched(expired.token(), clock.value());
-    _ = try f.store.settleVerified(expired.token(), observation(expired, clock.now, .absent), clock.value());
+    _ = try f.store.settleOutcome(expired.token(), clock.now, observation(expired, clock.now, .absent), clock.value());
     try t.expect(!try f.store.pruneSpentEffectOne());
     try t.expectEqual(@as(u64, 1), try f.store.confirmedEffectEvents());
 
@@ -1253,8 +1232,7 @@ test "native effects: spent scopes are pruned only after owners, intents and ret
     ban.lease = .permanent;
     ban.decided_us = clock.now;
     const reban = try f.store.setOwner(ban, clock.value());
-    try f.store.markDispatched(reban.token(), clock.value());
-    _ = try f.store.settleVerified(reban.token(), observation(reban, clock.now, .permanent), clock.value());
+    _ = try f.store.settleOutcome(reban.token(), clock.now, observation(reban, clock.now, .permanent), clock.value());
     try t.expectEqual(effects.Status.applied, (try first(&f.store)).status);
     try t.expect(!try f.store.pruneSpentEffectOne());
 }

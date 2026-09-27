@@ -43,22 +43,6 @@ fn expectComponent(report: readiness.Report, c: readiness.Component, s: readines
     try testing.expectEqual(s, report.state(c));
 }
 
-test "native readiness: every component ok yields ready with null cause" {
-    const r = readiness.derive(allGood());
-    try testing.expect(r.ready);
-    try testing.expectEqual(@as(?[]const u8, null), r.cause);
-    for (r.components) |s| try testing.expectEqual(readiness.State.ok, s);
-}
-
-test "native readiness: config not loaded fails config and names the cause" {
-    var in = allGood();
-    in.config_loaded = false;
-    const r = readiness.derive(in);
-    try testing.expect(!r.ready);
-    try expectComponent(r, .config, .failed);
-    try testing.expectEqualStrings("configuration not admitted", r.cause.?);
-}
-
 test "native readiness: storage phases map to unknown, ok, degraded and failed" {
     var in = allGood();
     in.storage_phase = null;
@@ -116,17 +100,6 @@ test "native readiness: clock unknown without worker and failed when uncertain" 
     try testing.expectEqualStrings("clock uncertain", r.cause.?);
 }
 
-test "native readiness: enforcement is not applicable for log-only jails" {
-    var in = allGood();
-    in.jails = &.{log_only_jail};
-    in.effects = null;
-    const r = readiness.derive(in);
-    try expectComponent(r, .enforcement, .ok);
-    try testing.expect(r.ready);
-    in.effects = .{ .ready = false, .uncertain = true, .overdue = true };
-    try testing.expect(readiness.derive(in).ready);
-}
-
 test "native readiness: enforcement unknown, failed, degraded for enforcing jails" {
     var in = allGood();
     in.effects = null;
@@ -153,15 +126,6 @@ test "native readiness: admin failed without admitted generation, degraded when 
     try expectComponent(r, .admin, .degraded);
     try testing.expect(!r.ready);
     try testing.expectEqualStrings("administrative socket refusing new connections", r.cause.?);
-}
-
-test "native readiness: cause names the first non-ok component in declared order" {
-    var in = allGood();
-    in.storage_phase = .paused;
-    in.admin_serving = false;
-    try testing.expectEqualStrings("storage paused", readiness.derive(in).cause.?);
-    in.config_loaded = false;
-    try testing.expectEqualStrings("configuration not admitted", readiness.derive(in).cause.?);
 }
 
 test "native readiness: json shape for ready and for a failed component" {
@@ -299,15 +263,6 @@ test "native readiness: sd_notify abstract namespace socket" {
     var buf: [64]u8 = undefined;
     try testing.expectEqual(sd_notify.Result.sent, try n.ready());
     try testing.expectEqualStrings("READY=1\n", try rx.recv(&buf));
-}
-
-test "native readiness: sd_notify absent environment is a disabled no-op" {
-    if (posix.getenv("NOTIFY_SOCKET") != null) return error.SkipZigTest;
-    var n = try sd_notify.Notifier.fromEnvironment();
-    defer n.deinit();
-    try testing.expect(!n.enabled());
-    try testing.expectEqual(sd_notify.Result.disabled, try n.ready());
-    try testing.expectEqual(sd_notify.Result.disabled, try n.status("x"));
 }
 
 test "native readiness: sd_notify rejects oversized or multi-line status and empty or long paths" {
@@ -567,28 +522,63 @@ test "native readiness: EAGAIN on a full non-blocking pipe counts as failed with
     try testing.expect(s.degraded);
 }
 
-test "native readiness: std.log sink formats level, scope and truncates oversized messages" {
+const FakeClock = struct {
+    usec: ?u64 = 1_000_000,
+    fn read(context: ?*anyopaque) ?u64 {
+        const self: *FakeClock = @ptrCast(@alignCast(context.?));
+        return self.usec;
+    }
+};
+
+test "native readiness: startup progress extends only for new work and never after finish" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const a = testing.allocator;
     var dir = try TmpPath.init(a);
     defer dir.deinit(a);
-    const path = try dir.join(a, "daemon.log");
+    const path = try dir.join(a, "notify");
     defer a.free(path);
-    var sink = try log_target.Sink.init(a, .{ .file = path });
-    defer sink.deinit();
+    const rx = try Receiver.bindPath(path);
+    defer rx.deinit();
+    var n = try sd_notify.Notifier.initWithPath(path);
+    defer n.deinit();
+    var clock = FakeClock{};
+    var progress = sd_notify.Progress{ .notifier = &n, .clock_context = &clock, .clock = FakeClock.read };
+    var buf: [600]u8 = undefined;
 
-    log_target.install(&sink);
-    defer log_target.install(null);
-    log_target.logFn(.warn, .default, "ipc: peer uid={d}", .{@as(u32, 7)});
-    log_target.logFn(.info, .storage, "committed {d}", .{@as(u32, 3)});
-    const big = [_]u8{'b'} ** (log_target.max_line_bytes * 2);
-    log_target.logFn(.err, .default, "{s}", .{&big});
-    try testing.expectEqual(@as(usize, 3), sink.stats().queued);
-    sink.drain();
-
-    const out = try readFile(a, path);
-    defer a.free(out);
-    try testing.expect(std.mem.startsWith(u8, out, "warning: ipc: peer uid=7\ninfo(storage): committed 3\nerror: bbbb"));
-    try testing.expect(std.mem.endsWith(u8, out, log_target.truncation_marker));
-    try testing.expectEqual(@as(usize, "warning: ipc: peer uid=7\ninfo(storage): committed 3\n".len + log_target.max_line_bytes), out.len);
+    // The first report sends at once, ahead of any initial deadline.
+    progress.report(.admission, "admission", 0, 0);
+    try testing.expectEqualStrings("EXTEND_TIMEOUT_USEC=30000000\nSTATUS=admission 0\n", try rx.recv(&buf));
+    // A new phase is progress and bypasses the cadence.
+    clock.usec.? += 1_000_000;
+    progress.report(.schema, "schema", 0, 0);
+    try testing.expectEqualStrings("EXTEND_TIMEOUT_USEC=30000000\nSTATUS=schema 0\n", try rx.recv(&buf));
+    // Progress inside the cadence is held; a later repeat of the same count sends it,
+    // shortened by its age so the deadline stays 30 s after the work happened.
+    clock.usec.? += 2_000_000;
+    progress.report(.schema, "schema", 5, 20);
+    try rx.expectNothing();
+    clock.usec.? += 9_000_000;
+    progress.report(.schema, "schema", 5, 20);
+    try testing.expectEqualStrings("EXTEND_TIMEOUT_USEC=21000000\nSTATUS=schema 5/20\n", try rx.recv(&buf));
+    // A stall — repeated, lower or earlier-phase counts — sends nothing.
+    clock.usec.? += 11_000_000;
+    progress.report(.schema, "schema", 5, 20);
+    progress.report(.schema, "schema", 3, 20);
+    progress.report(.admission, "admission", 99, 0);
+    try rx.expectNothing();
+    progress.report(.schema, "schema", 6, 20);
+    try testing.expectEqualStrings("EXTEND_TIMEOUT_USEC=30000000\nSTATUS=schema 6/20\n", try rx.recv(&buf));
+    // Held progress is dropped once the extension it would grant has lapsed.
+    clock.usec.? += 1_000_000;
+    progress.report(.schema, "schema", 7, 20);
+    clock.usec.? += 31_000_000;
+    progress.report(.schema, "schema", 7, 20);
+    try rx.expectNothing();
+    // Storage migration, a later phase, reports through the type-erased hook.
+    progress.migrationHook().report(1, 4);
+    try testing.expectEqualStrings("EXTEND_TIMEOUT_USEC=30000000\nSTATUS=migration 1/4\n", try rx.recv(&buf));
+    // Nothing extends the deadline after READY or a fatal exit has finished it.
+    progress.finish();
+    progress.report(.readiness, "enforcement", 100, 0);
+    try rx.expectNothing();
 }

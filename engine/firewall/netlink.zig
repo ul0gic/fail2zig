@@ -30,6 +30,7 @@ pub const Error = error{
     TruncatedMessage,
     BufferTooSmall,
     InvalidBatchState,
+    DumpInterrupted,
 };
 
 pub const StrictMessages = struct {
@@ -138,7 +139,9 @@ pub const Dump = struct {
         self.count += 1;
         if (item.hdr.seq != self.sequence) return null;
         if (self.complete or (item.hdr.pid != 0 and item.hdr.pid != self.port_id)) return error.NetlinkError;
-        if ((item.hdr.flags & 0x10) != 0) return error.NetlinkError;
+        // NLM_F_DUMP_INTR: the kernel's generation moved during this dump, so the
+        // reply is not one consistent picture and the whole dump must be re-read.
+        if ((item.hdr.flags & 0x10) != 0) return error.DumpInterrupted;
         const kind = @intFromEnum(item.hdr.type);
         if (kind == 2) {
             if (item.payload.len < 4 + NLMSG_HDRLEN) return error.TruncatedMessage;
@@ -277,7 +280,7 @@ test "native firewall: dump requires done and rejects interrupted and wrong-type
     try std.testing.expect(!state.complete);
     var interrupted = view;
     interrupted.hdr.flags |= 0x10;
-    try std.testing.expectError(error.NetlinkError, state.accept(interrupted));
+    try std.testing.expectError(error.DumpInterrupted, state.accept(interrupted));
     var wrong = view;
     wrong.hdr.type = @enumFromInt(0x102);
     try std.testing.expectError(error.NetlinkError, state.accept(wrong));

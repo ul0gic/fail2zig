@@ -12,7 +12,7 @@ const mem = std.mem;
 pub const Transport = enum { nftables, iptables, ipset };
 pub const canonical_scope = @import("scope.zig");
 pub const CanonicalScope = canonical_scope.Scope;
-pub const Error = error{ UnknownState, ForeignState, Incomplete, Changed, LimitExceeded, UnsupportedScope, ExpiredIntent, UnsupportedDeadline, InvalidInstallation, ToolUnavailable, PermissionDenied, Timeout, OutOfMemory, SystemError };
+pub const Error = error{ UnknownState, ForeignState, Incomplete, Changed, DumpInterrupted, LimitExceeded, UnsupportedScope, ExpiredIntent, UnsupportedDeadline, InvalidInstallation, ToolUnavailable, PermissionDenied, Timeout, OutOfMemory, SystemError };
 pub const OperationStage = enum { admission_probe, admission_dispatch, admission_verify, readback, effect_dispatch, effect_verify };
 pub const MutationDisposition = enum { not_started, outcome_uncertain };
 pub const FailureContext = struct {
@@ -84,13 +84,17 @@ pub fn canonicalizeLegacyScope(scope: Scope) Error!CanonicalScope {
     return result;
 }
 
+/// The largest inventory any `Limits` admits.
+pub const max_inventory_entries: usize = 65_536;
+/// Readings of one nftables inventory before an interrupted dump is reported.
+const max_dump_attempts: usize = 3;
 pub const Limits = struct {
-    max_entries: usize = 65_536,
+    max_entries: usize = max_inventory_entries,
     max_bytes: usize = 16 * 1024 * 1024,
     max_messages: usize = 65_536,
     timeout_ms: u64 = 5000,
     pub fn validate(self: Limits) Error!void {
-        if (self.max_entries == 0 or self.max_entries > 65_536 or self.max_bytes == 0 or
+        if (self.max_entries == 0 or self.max_entries > max_inventory_entries or self.max_bytes == 0 or
             self.max_bytes > 16 * 1024 * 1024 or self.max_messages == 0 or self.max_messages > 65_536 or
             self.timeout_ms == 0 or self.timeout_ms > 5000) return error.LimitExceeded;
     }
@@ -101,6 +105,9 @@ pub const Entry = struct {
     remaining_ms: ?u64 = null,
     deadline_us: ?i64 = null,
     effect_id: ?[32]u8 = null,
+    /// A validated owned scoped group with parts missing, repeated or dated
+    /// differently: still ours, never a match, so the entry is re-dispatched.
+    partial: bool = false,
 };
 
 pub const scoped_rule_metadata_bytes: usize = 140;
@@ -183,6 +190,10 @@ pub const Snapshot = struct {
         self.allocator.free(self.entries);
         self.* = undefined;
     }
+    /// Position of the entry for exactly `scope`, if installed.
+    pub fn find(self: *const Snapshot, scope: CanonicalScope) Error!?usize {
+        return entryIndex(self.entries, scope);
+    }
     pub fn page(self: *const Snapshot, offset: usize) Error![]const Entry {
         if (offset > self.entries.len) return error.Incomplete;
         return self.entries[offset..@min(self.entries.len, offset + @min(@as(usize, 64), self.entries.len - offset))];
@@ -222,7 +233,8 @@ pub const DispatchToken = struct {
     operation: EffectOperation,
 };
 pub const EffectResult = union(enum) {
-    verified: struct { snapshot: Snapshot, changed: bool, observed_wall_us: i64 },
+    /// `snapshot` was read within [observed_start_wall_us, observed_wall_us].
+    verified: struct { snapshot: Snapshot, changed: bool, observed_start_wall_us: i64, observed_wall_us: i64 },
     uncertain: FailureContext,
     pub fn deinit(self: *EffectResult) void {
         switch (self.*) {
@@ -255,9 +267,14 @@ pub const Inspector = struct {
     work_messages: usize = 0,
     retained_bytes: usize = 0,
     live_bytes: usize = 0,
+    /// nftables dumps the kernel flagged as interrupted, including those retried at once.
+    dump_interruptions: u64 = 0,
     test_fault_after_mutations: if (@import("builtin").is_test) ?usize else void = if (@import("builtin").is_test) null else {},
     test_fault_readback: if (@import("builtin").is_test) ?Error else void = if (@import("builtin").is_test) null else {},
+    /// Runs between the two passes of a tool-transport inventory read only.
     test_between_reads: if (@import("builtin").is_test) ?*const fn (*Inspector) void else void = if (@import("builtin").is_test) null else {},
+    /// Inventory reads started, one per `inspect` call, including those inside `applyExact`.
+    test_inspections: if (@import("builtin").is_test) usize else void = if (@import("builtin").is_test) 0 else {},
 
     pub fn open(allocator: mem.Allocator, installation: Installation, limits: Limits) Error!Inspector {
         try installation.validate();
@@ -356,45 +373,60 @@ pub const Inspector = struct {
         return effectMatches(token.operation, self.installation.transport, try findEntry(snapshot.entries, token.scope, token.effect_id), wall_start_us, wall_end_us);
     }
 
+    /// Reads the inventory and applies from it. Tool transports use this path: a stale
+    /// `existed` there would produce a duplicate insert, not a rejected batch.
     pub fn applyExact(self: *Inspector, token: DispatchToken, clock: ClockSample) Error!EffectResult {
         try (DurableInstallationIntent{ .installation = token.installation, .intent_id = token.effect_id, .revision = token.aggregate_revision }).validate(self.installation);
         try validateRealizedScope(self.installation.transport, token.scope);
         _ = try deadlineUnits(token.operation, timingTransport(self.installation.transport, token.scope), clock.wall_us);
         var elapsed = std.time.Timer.start() catch return error.SystemError;
-        var before = try self.inspect();
-        if (before.state != .owned) {
-            before.deinit();
-            return error.InvalidInstallation;
-        }
-        const existing = findEntry(before.entries, token.scope, token.effect_id) catch |err| {
-            before.deinit();
-            return err;
-        };
+        var baseline = try self.inspect();
+        defer baseline.deinit();
+        // The pre-read is held across the mutation and its readback, so it stays charged.
+        const held = self.retained_bytes;
+        self.retained_bytes = held + baseline.entries.len * @sizeOf(Entry);
+        defer self.retained_bytes = held;
+        var result = try self.applyFromBaseline(token, .{ .wall_us = try clockAt(clock, &elapsed) }, &baseline);
+        // A no-op was judged from the pre-read, which this call observed from its start.
+        if (result == .verified and !result.verified.changed) result.verified.observed_start_wall_us = clock.wall_us;
+        return result;
+    }
+
+    /// The single mutate-and-verify path. `baseline` is the caller's accepted readback of
+    /// this installation: it decides whether the entry exists and whether the desired
+    /// state already holds. The caller keeps ownership of `baseline` and, when it holds
+    /// it across calls, has charged it to `retained_bytes` itself. A no-op returns
+    /// `changed = false` with a copy of `baseline` that the caller owns, observed over
+    /// this call's window. Otherwise the kernel is mutated and exactly one readback is
+    /// returned, judged for the target scope only; any other difference from the
+    /// baseline is kernel expiry or foreign change, which the next readback classifies.
+    /// A batch the kernel rejected whole is `error.Changed` with `mutation = .not_started`.
+    pub fn applyFromBaseline(self: *Inspector, token: DispatchToken, clock: ClockSample, baseline: *const Snapshot) Error!EffectResult {
+        try (DurableInstallationIntent{ .installation = token.installation, .intent_id = token.effect_id, .revision = token.aggregate_revision }).validate(self.installation);
+        const transport = self.installation.transport;
+        try validateRealizedScope(transport, token.scope);
+        _ = try deadlineUnits(token.operation, timingTransport(transport, token.scope), clock.wall_us);
+        if (!mem.eql(u8, &baseline.installation.id, &self.installation.id) or baseline.installation.transport != transport or baseline.state != .owned) return error.InvalidInstallation;
+        var elapsed = std.time.Timer.start() catch return error.SystemError;
+        const existing = try findEntry(baseline.entries, token.scope, token.effect_id);
         const noop = switch (token.operation) {
             .ensure_absent => existing == null,
             .ensure_present => |lease| if (existing) |entry| if (entry.scope != null)
-                switch (lease) {
+                !entry.partial and switch (lease) {
                     .permanent => entry.deadline_us == null,
                     .finite_deadline_us => |deadline| entry.deadline_us != null and entry.deadline_us.? == deadline,
                 }
             else
-                (self.installation.transport == .iptables or (lease == .permanent and entry.remaining_ms == null)) else false,
+                (transport == .iptables or (lease == .permanent and entry.remaining_ms == null)) else false,
         };
-        const before_end = clockAt(clock, &elapsed) catch |err| {
-            before.deinit();
-            return err;
-        };
-        _ = deadlineUnits(token.operation, timingTransport(self.installation.transport, token.scope), before_end) catch |err| {
-            before.deinit();
-            return err;
-        };
-        if (noop) return .{ .verified = .{ .snapshot = before, .changed = false, .observed_wall_us = before_end } };
-        defer before.deinit();
-        const units = try deadlineUnits(token.operation, timingTransport(self.installation.transport, token.scope), try clockAt(clock, &elapsed));
+        if (noop) {
+            const end = try clockAt(clock, &elapsed);
+            _ = try deadlineUnits(token.operation, timingTransport(transport, token.scope), end);
+            return .{ .verified = .{ .snapshot = try copySnapshot(self.allocator, baseline), .changed = false, .observed_start_wall_us = clock.wall_us, .observed_wall_us = end } };
+        }
+        const units = try deadlineUnits(token.operation, timingTransport(transport, token.scope), try clockAt(clock, &elapsed));
         var phase = std.time.Timer.start() catch return error.SystemError;
         self.work_messages = 0;
-        self.retained_bytes = before.entries.len * @sizeOf(Entry);
-        defer self.retained_bytes = 0;
         self.live_bytes = 0;
         var progress = MutationProgress{};
         self.mutateExact(token, existing, units, &phase, &progress) catch |err| return .{ .uncertain = self.failure(.effect_dispatch, err, progress) };
@@ -408,13 +440,11 @@ pub const Inspector = struct {
             after.deinit();
             return .{ .uncertain = self.failure(.effect_verify, err, progress) };
         };
-        if (after.state != .owned or !sameEntries(before.entries, after.entries, token.scope, elapsed.read(), self.installation.transport) or
-            !effectMatches(token.operation, self.installation.transport, after_entry, observation_start, observation_end))
-        {
+        if (after.state != .owned or !effectMatches(token.operation, transport, after_entry, observation_start, observation_end)) {
             after.deinit();
             return .{ .uncertain = self.failure(.effect_verify, error.Changed, progress) };
         }
-        return .{ .verified = .{ .snapshot = after, .changed = true, .observed_wall_us = observation_end } };
+        return .{ .verified = .{ .snapshot = after, .changed = true, .observed_start_wall_us = observation_start, .observed_wall_us = observation_end } };
     }
     fn failure(self: *const Inspector, stage: OperationStage, cause: Error, progress: MutationProgress) FailureContext {
         return .{
@@ -433,7 +463,7 @@ pub const Inspector = struct {
             try self.afterMutation(1);
             return;
         }
-        const scoped_address = legacyAddress(token.scope) catch return self.mutateFixedScoped(token, name, existing, timer, progress);
+        const scoped_address = legacyAddress(token.scope) catch return self.mutateFixedScoped(token, name, timer, progress);
         var address_buf: [64]u8 = undefined;
         const address = std.fmt.bufPrint(&address_buf, "{}", .{scoped_address}) catch return error.UnsupportedScope;
         var count: usize = 0;
@@ -452,37 +482,68 @@ pub const Inspector = struct {
             if (token.operation == .ensure_absent) try self.mutateCommand(&.{ binary, "-w", "1", "-D", name, "-s", address, "-j", "DROP" }, timer, &count, progress) else try self.mutateCommand(&.{ binary, "-w", "1", "-I", name, "1", "-s", address, "-j", "DROP" }, timer, &count, progress);
         }
     }
-    fn mutateFixedScoped(self: *Inspector, token: DispatchToken, name: []const u8, existing: ?Entry, timer: *std.time.Timer, progress: *MutationProgress) Error!void {
-        const binary = if (token.scope.subject.family == .v4) self.iptables_path else self.ip6tables_path;
+    /// Converges one scoped effect's fixed-argv rules from whatever validated owned state
+    /// the chain holds: every missing part of the wanted metadata is inserted first, then
+    /// every rule of the effect with other metadata, and every repeated part, is deleted,
+    /// so protection never lapses across a renewal. Each invocation is bounded by the
+    /// call's timer; a failure after the first one is an uncertain outcome whose readback
+    /// shows the partial entry for the next dispatch.
+    fn mutateFixedScoped(self: *Inspector, token: DispatchToken, name: []const u8, timer: *std.time.Timer, progress: *MutationProgress) Error!void {
+        const v6 = token.scope.subject.family == .v6;
+        const binary = if (v6) self.ip6tables_path else self.iptables_path;
         const part_count = nft.scopeRulePartCount(token.scope) catch return error.UnsupportedScope;
+        const installed = try self.listFixedScoped(token, name, binary, v6, timer);
+        var metadata = ScopedRuleMetadata{ .effect_id = token.effect_id, .part = 0, .count = @intCast(part_count), .deadline_us = null, .scope = token.scope };
         var mutations: usize = 0;
         if (token.operation == .ensure_present) {
-            const deadline: ?i64 = if (token.operation.ensure_present == .finite_deadline_us) token.operation.ensure_present.finite_deadline_us else null;
+            metadata.deadline_us = leaseDeadline(token.operation.ensure_present);
             for (0..part_count) |part| {
-                const metadata = ScopedRuleMetadata{ .effect_id = token.effect_id, .part = @intCast(part), .count = @intCast(part_count), .deadline_us = deadline, .scope = token.scope };
-                var argv: [24][]const u8 = undefined;
-                var subject_buf: [64]u8 = undefined;
-                var port_buf: [16]u8 = undefined;
-                var comment_buf: [scoped_comment_bytes]u8 = undefined;
-                try self.mutateCommand(try buildFixedScopedArgv(&argv, &subject_buf, &port_buf, &comment_buf, binary, name, metadata, .insert), timer, &mutations, progress);
+                if (installed.count(metadata.deadline_us, part) != 0) continue;
+                metadata.part = @intCast(part);
+                try self.runFixedScoped(binary, name, metadata, .insert, timer, &mutations, progress);
             }
         }
-        if (existing) |prior| {
-            if (prior.scope == null or prior.effect_id == null or !mem.eql(u8, &prior.effect_id.?, &token.effect_id)) return error.ForeignState;
+        for (installed.variants[0..installed.len]) |variant| {
+            const kept: u16 = @intFromBool(token.operation == .ensure_present and variant.deadline_us == leaseDeadline(token.operation.ensure_present));
+            metadata.deadline_us = variant.deadline_us;
             for (0..part_count) |part| {
-                const metadata = ScopedRuleMetadata{ .effect_id = token.effect_id, .part = @intCast(part), .count = @intCast(part_count), .deadline_us = prior.deadline_us, .scope = token.scope };
-                var argv: [24][]const u8 = undefined;
-                var subject_buf: [64]u8 = undefined;
-                var port_buf: [16]u8 = undefined;
-                var comment_buf: [scoped_comment_bytes]u8 = undefined;
-                try self.mutateCommand(try buildFixedScopedArgv(&argv, &subject_buf, &port_buf, &comment_buf, binary, name, metadata, .delete), timer, &mutations, progress);
+                if (variant.counts[part] <= kept) continue;
+                metadata.part = @intCast(part);
+                for (0..variant.counts[part] - kept) |_| try self.runFixedScoped(binary, name, metadata, .delete, timer, &mutations, progress);
             }
         }
         if (mutations == 0) return error.Changed;
     }
+    fn runFixedScoped(self: *Inspector, binary: []const u8, chain: []const u8, metadata: ScopedRuleMetadata, operation: FixedScopedOperation, timer: *std.time.Timer, mutations: *usize, progress: *MutationProgress) Error!void {
+        var argv: [24][]const u8 = undefined;
+        var subject_buf: [64]u8 = undefined;
+        var port_buf: [16]u8 = undefined;
+        var comment_buf: [scoped_comment_bytes]u8 = undefined;
+        try self.mutateCommand(try buildFixedScopedArgv(&argv, &subject_buf, &port_buf, &comment_buf, binary, chain, metadata, operation), timer, mutations, progress);
+    }
+    /// The effect's rules as `iptables -S` lists them now, validated exactly as the
+    /// readback validates them, so a stale baseline can only add or remove work here.
+    fn listFixedScoped(self: *Inspector, token: DispatchToken, name: []const u8, binary: []const u8, v6: bool, timer: *std.time.Timer) Error!FixedScopedVariants {
+        const result = try self.run(&.{ binary, "-w", "1", "-S" }, timer);
+        defer result.deinit(self.allocator);
+        if (result.stdout.len == 0 or result.stdout[result.stdout.len - 1] != '\n') return error.Incomplete;
+        var found = FixedScopedVariants{};
+        var lines = mem.splitScalar(u8, result.stdout, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            const t = try Tokens.parse(line);
+            if (t.count < 2) return error.UnknownState;
+            if (!mem.eql(u8, t.values[0], "-A") or !mem.eql(u8, t.values[1], name)) continue;
+            const metadata = (try fixedScopedMetadata(t, name, v6)) orelse continue;
+            if (!mem.eql(u8, &metadata.effect_id, &token.effect_id)) continue;
+            if (!std.meta.eql(metadata.scope, token.scope)) return error.ForeignState;
+            found.note(metadata.deadline_us, metadata.part);
+        }
+        return found;
+    }
     fn mutateNft(self: *Inspector, token: DispatchToken, name: []const u8, existed: bool, timeout_ms: u64, timer: *std.time.Timer, progress: *MutationProgress) Error!void {
         if (legacyAddress(token.scope)) |_| return self.mutateLegacyNft(token, name, existed, timeout_ms, timer, progress) else |_| {}
-        return self.mutateScopedNft(token, name, existed, timer, progress);
+        return self.mutateScopedNft(token, name, timer, progress);
     }
     fn mutateLegacyNft(self: *Inspector, token: DispatchToken, name: []const u8, existed: bool, timeout_ms: u64, timer: *std.time.Timer, progress: *MutationProgress) Error!void {
         var sock = nl.NetlinkSocket.init(linux.NETLINK.NETFILTER) catch |err| return netlinkError(err);
@@ -524,10 +585,15 @@ pub const Inspector = struct {
         const send_timeout = @min(try self.remainingMs(timer), 2000);
         progress.requested = true;
         nl.sendKernel(&sock, bytes, send_timeout) catch |err| return netlinkError(err);
-        nl.receiveAcknowledgments(&sock, related[1..count], related[0 .. count + 1], @min(try self.remainingMs(timer), 2000)) catch |err| return netlinkError(err);
+        nl.receiveAcknowledgments(&sock, related[1..count], related[0 .. count + 1], @min(try self.remainingMs(timer), 2000)) catch |err| return rejectedBatch(err, progress);
     }
 
-    fn mutateScopedNft(self: *Inspector, token: DispatchToken, name: []const u8, existed: bool, timer: *std.time.Timer, progress: *MutationProgress) Error!void {
+    /// Converges one scoped effect in a single atomic batch: every validated owned rule
+    /// carrying the effect id is deleted, whatever its part or deadline, and all wanted
+    /// parts are added. The batch acknowledges at most 64 messages, so the handles
+    /// deleted per dispatch are bounded to one group's worth; any beyond that stay a
+    /// partial entry in the readback and the next dispatch removes them.
+    fn mutateScopedNft(self: *Inspector, token: DispatchToken, name: []const u8, timer: *std.time.Timer, progress: *MutationProgress) Error!void {
         const part_count = nft.scopeRulePartCount(token.scope) catch |err| return scopeBuildError(err);
         if (part_count > nft.max_scope_rule_parts) return error.LimitExceeded;
         var sock = nl.NetlinkSocket.init(linux.NETLINK.NETFILTER) catch |err| return netlinkError(err);
@@ -539,28 +605,19 @@ pub const Inspector = struct {
         defer rules.deinit();
         var handles: [nft.max_scope_rule_parts]u64 = undefined;
         var handle_count: usize = 0;
-        var seen: u32 = 0;
-        var existing_deadline: ?i64 = null;
-        var deadline_initialized = false;
         for (rules.values.items) |payload| {
             const attributes = try payloadAttrs(payload, &.{ 1, 2, 3, 4, 6, 7, 8 });
             if (!mem.eql(u8, try attributes.text(1), name) or !mem.eql(u8, try attributes.text(2), "input") or attributes.values[7] == null) continue;
             const metadata = try ScopedRuleMetadata.decode(try attributes.get(7));
             if (!mem.eql(u8, &metadata.effect_id, &token.effect_id)) continue;
-            if (!std.meta.eql(metadata.scope, token.scope) or metadata.count != part_count or metadata.part >= 32) return error.ForeignState;
-            if (!deadline_initialized) {
-                existing_deadline = metadata.deadline_us;
-                deadline_initialized = true;
-            } else if (metadata.deadline_us != existing_deadline) return error.ForeignState;
-            const bit = @as(u32, 1) << @intCast(metadata.part);
-            if (seen & bit != 0 or handle_count == handles.len) return error.UnknownState;
-            seen |= bit;
-            handles[handle_count] = try attributes.number(u64, 3);
-            if (handles[handle_count] == 0) return error.UnknownState;
+            if (!std.meta.eql(metadata.scope, token.scope)) return error.ForeignState;
+            try validateScopedDropRule(name, attributes, metadata);
+            const handle = try attributes.number(u64, 3);
+            if (handle == 0) return error.UnknownState;
+            if (handle_count == handles.len) continue;
+            handles[handle_count] = handle;
             handle_count += 1;
         }
-        const wanted = (@as(u32, 1) << @intCast(part_count)) - 1;
-        if (existed != (handle_count != 0) or (handle_count != 0 and (handle_count != part_count or seen != wanted))) return error.Changed;
 
         var payloads: [nft.max_scope_rule_parts * 2][2048]u8 align(4) = undefined;
         var batch_bytes: [128 * 1024]u8 align(4) = undefined;
@@ -576,7 +633,7 @@ pub const Inspector = struct {
             count += 1;
         }
         if (token.operation == .ensure_present) {
-            const deadline: ?i64 = if (token.operation.ensure_present == .finite_deadline_us) token.operation.ensure_present.finite_deadline_us else null;
+            const deadline = leaseDeadline(token.operation.ensure_present);
             for (0..part_count) |part| {
                 const metadata = ScopedRuleMetadata{ .effect_id = token.effect_id, .part = @intCast(part), .count = @intCast(part_count), .deadline_us = deadline, .scope = token.scope };
                 const userdata = try metadata.encode();
@@ -586,13 +643,14 @@ pub const Inspector = struct {
                 count += 1;
             }
         }
+        // Nothing to delete and nothing to add: the baseline's `existed` was stale.
         if (count == 1) return error.Changed;
         related[count] = sock.nextSeq();
         const bytes = batch.commit(related[count], sock.port_id, nl.NFNL.SUBSYS_NFTABLES) catch |err| return netlinkError(err);
         const send_timeout = @min(try self.remainingMs(timer), 2000);
         progress.requested = true;
         nl.sendKernel(&sock, bytes, send_timeout) catch |err| return netlinkError(err);
-        nl.receiveAcknowledgments(&sock, related[1..count], related[0 .. count + 1], @min(try self.remainingMs(timer), 2000)) catch |err| return netlinkError(err);
+        nl.receiveAcknowledgments(&sock, related[1..count], related[0 .. count + 1], @min(try self.remainingMs(timer), 2000)) catch |err| return rejectedBatch(err, progress);
     }
 
     fn afterMutation(self: *Inspector, count: usize) Error!void {
@@ -662,13 +720,15 @@ pub const Inspector = struct {
 
     pub fn inspect(self: *Inspector) Error!Snapshot {
         if (comptime @import("builtin").is_test) {
+            self.test_inspections += 1;
             if (self.test_fault_readback) |fault| return fault;
         }
-        self.work_messages = 0;
         // Bytes of a snapshot the caller still holds stay charged against the limit.
         const held = self.retained_bytes;
         defer self.retained_bytes = held;
         var timer = std.time.Timer.start() catch return error.SystemError;
+        if (self.installation.transport == .nftables) return self.readCoherent(&timer);
+        self.work_messages = 0;
         var first = try self.readOnce(&timer);
         defer first.snapshot.deinit();
         self.retained_bytes = held + first.snapshot.entries.len * @sizeOf(Entry);
@@ -682,6 +742,24 @@ pub const Inspector = struct {
         second.snapshot.structure_proof = if (second.snapshot.state == .owned) .exact_v1 else .unverified;
         second.snapshot.observed_start_ns = first.snapshot.observed_start_ns;
         return second.snapshot;
+    }
+    /// The kernel serves each nftables dump at one generation and flags a dump whose
+    /// generation moved, so a single pass is a coherent picture of the owned objects.
+    /// An interrupted dump is re-read at once within the same time budget; each retry
+    /// discards the interrupted messages, so it starts a fresh work count.
+    fn readCoherent(self: *Inspector, timer: *std.time.Timer) Error!Snapshot {
+        var attempt: usize = 1;
+        while (true) : (attempt += 1) {
+            self.work_messages = 0;
+            var reading = self.readOnce(timer) catch |err| {
+                if (err != error.DumpInterrupted) return err;
+                self.dump_interruptions += 1;
+                if (attempt == max_dump_attempts) return err;
+                continue;
+            };
+            reading.snapshot.structure_proof = if (reading.snapshot.state == .owned) .exact_v1 else .unverified;
+            return reading.snapshot;
+        }
     }
     const Reading = struct { snapshot: Snapshot, structure: [32]u8 };
     fn readOnce(self: *Inspector, timer: *std.time.Timer) Error!Reading {
@@ -794,13 +872,28 @@ fn timingTransport(transport: Transport, scope: CanonicalScope) Transport {
 fn entryScope(entry: Entry) CanonicalScope {
     return entry.scope orelse .{ .subject = canonical_scope.Subject.host(entry.address) };
 }
-fn findEntry(entries: []const Entry, scope: CanonicalScope, effect_id: [32]u8) Error!?Entry {
-    for (entries) |entry| {
-        if (!std.meta.eql(entryScope(entry), scope)) continue;
-        if (entry.scope != null and (entry.effect_id == null or !mem.eql(u8, &entry.effect_id.?, &effect_id))) return error.ForeignState;
-        return entry;
+/// Snapshot entries are ordered by `entryLess` with no repeated scope, as
+/// `Builder.finish` enforces, so an exact scope occupies at most one position.
+fn entryIndex(entries: []const Entry, scope: CanonicalScope) Error!?usize {
+    // A scope that cannot be encoded is invalid and so equals no installed entry.
+    const key = scope.encode() catch return null;
+    var low: usize = 0;
+    var high = entries.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        const probe = entryScope(entries[middle]).encode() catch return error.UnknownState;
+        switch (mem.order(u8, &probe, &key)) {
+            .lt => low = middle + 1,
+            .gt => high = middle,
+            .eq => return if (std.meta.eql(entryScope(entries[middle]), scope)) middle else null,
+        }
     }
     return null;
+}
+fn findEntry(entries: []const Entry, scope: CanonicalScope, effect_id: [32]u8) Error!?Entry {
+    const entry = entries[try entryIndex(entries, scope) orelse return null];
+    if (entry.scope != null and (entry.effect_id == null or !mem.eql(u8, &entry.effect_id.?, &effect_id))) return error.ForeignState;
+    return entry;
 }
 /// Kernel set-element timeouts equal the ban deadline, so the kernel removes an element
 /// on schedule without any mutation by us. Two sorted readbacks describe the same owned
@@ -830,7 +923,7 @@ fn sameEntries(before: []const Entry, after: []const Entry, except: ?CanonicalSc
         const old = before[i];
         const new = after[j];
         if (!std.meta.eql(entryScope(old), entryScope(new)) or !std.meta.eql(old.effect_id, new.effect_id) or
-            old.deadline_us != new.deadline_us or (old.remaining_ms == null) != (new.remaining_ms == null)) return false;
+            old.deadline_us != new.deadline_us or old.partial != new.partial or (old.remaining_ms == null) != (new.remaining_ms == null)) return false;
         if (old.remaining_ms) |remaining| if (new.remaining_ms.? > remaining) return false;
         i += 1;
         j += 1;
@@ -849,6 +942,7 @@ fn timeoutToleranceUs(transport: Transport) u64 {
 fn effectMatches(operation: EffectOperation, transport: Transport, entry: ?Entry, start_us: i64, end_us: i64) bool {
     if (operation == .ensure_absent) return entry == null;
     const present = entry orelse return false;
+    if (present.partial) return false;
     if (operation.ensure_present == .finite_deadline_us and operation.ensure_present.finite_deadline_us <= end_us) return false;
     if (present.scope != null) {
         if (operation.ensure_present == .permanent) return present.deadline_us == null;
@@ -907,7 +1001,7 @@ const Builder = struct {
             if (index > 0 and !entryLess({}, self.entries.items[index - 1], e)) return error.UnknownState;
             const scope_bytes = entryScope(e).encode() catch return error.UnknownState;
             self.topology.update(&scope_bytes);
-            self.topology.update(&.{ @intFromBool(e.remaining_ms != null), @intFromBool(e.deadline_us != null), @intFromBool(e.effect_id != null) });
+            self.topology.update(&.{ @intFromBool(e.remaining_ms != null), @intFromBool(e.deadline_us != null), @intFromBool(e.effect_id != null), @intFromBool(e.partial) });
             if (e.deadline_us) |deadline| self.topology.update(mem.asBytes(&deadline));
             if (e.effect_id) |identity| self.topology.update(&identity);
         }
@@ -990,6 +1084,8 @@ fn scopedProtocolText(protocol: canonical_scope.Protocol) Error![]const u8 {
     };
 }
 
+const FixedScopedOperation = enum { insert, delete };
+
 fn buildFixedScopedArgv(
     argv: *[24][]const u8,
     subject_buf: *[64]u8,
@@ -998,7 +1094,7 @@ fn buildFixedScopedArgv(
     binary: []const u8,
     chain: []const u8,
     metadata: ScopedRuleMetadata,
-    operation: enum { insert, delete },
+    operation: FixedScopedOperation,
 ) Error![]const []const u8 {
     const part = nft.scopeRulePart(metadata.scope, metadata.part) catch return error.UnsupportedScope;
     const comment = try metadata.encodeComment();
@@ -1061,39 +1157,81 @@ fn fixedScopedMetadata(tokens: Tokens, chain: []const u8, v6: bool) Error!?Scope
     return metadata;
 }
 
-const FixedScopedGroup = struct { metadata: ScopedRuleMetadata, parts: u32 = 0 };
+/// The rules of one effect id, each already validated as our exact scoped drop for its
+/// own metadata. Parts that disagree on the deadline or repeat are our own interrupted
+/// mutation, so the group is reported partial rather than failing the readback; a
+/// scope that differs within one effect id is not ours to repair.
+const ScopedGroup = struct { metadata: ScopedRuleMetadata, parts: u32 = 0, partial: bool = false };
 
-fn collectFixedScopedGroup(groups: *std.ArrayList(FixedScopedGroup), metadata: ScopedRuleMetadata, limits: Limits) Error!void {
+fn collectScopedGroup(groups: *std.ArrayList(ScopedGroup), metadata: ScopedRuleMetadata, limits: Limits) Error!void {
     var group_index: ?usize = null;
     for (groups.items, 0..) |group, index| if (mem.eql(u8, &group.metadata.effect_id, &metadata.effect_id)) {
         group_index = index;
         break;
     };
     if (group_index == null) {
-        if (groups.items.len >= limits.max_entries or groups.items.len >= limits.max_bytes / @sizeOf(FixedScopedGroup)) return error.LimitExceeded;
+        if (groups.items.len >= limits.max_entries or groups.items.len >= limits.max_bytes / @sizeOf(ScopedGroup)) return error.LimitExceeded;
         try groups.append(.{ .metadata = metadata });
         group_index = groups.items.len - 1;
     }
     const group = &groups.items[group_index.?];
-    if (!std.meta.eql(group.metadata.scope, metadata.scope) or group.metadata.count != metadata.count or
-        group.metadata.deadline_us != metadata.deadline_us or metadata.part >= 32)
+    if (!std.meta.eql(group.metadata.scope, metadata.scope) or group.metadata.count != metadata.count or metadata.part >= 32)
         return error.ForeignState;
+    if (group.metadata.deadline_us != metadata.deadline_us) group.partial = true;
     const bit = @as(u32, 1) << @intCast(metadata.part);
-    if (group.parts & bit != 0) return error.UnknownState;
+    if (group.parts & bit != 0) group.partial = true;
     group.parts |= bit;
 }
 
-fn finishFixedScopedGroups(builder: *Builder, groups: []const FixedScopedGroup) Error!void {
+fn finishScopedGroups(builder: *Builder, groups: []const ScopedGroup) Error!void {
     for (groups) |group| {
         const wanted = (@as(u32, 1) << @intCast(group.metadata.count)) - 1;
-        if (group.parts != wanted) return error.Incomplete;
         try builder.add(.{
             .address = subjectAddress(group.metadata.scope.subject),
             .scope = group.metadata.scope,
             .deadline_us = group.metadata.deadline_us,
             .effect_id = group.metadata.effect_id,
+            .partial = group.partial or group.parts != wanted,
         });
     }
+}
+
+/// Rules of one scoped effect as `iptables -S` lists them, counted per metadata variant
+/// and part. Bounded so the recovery work of one dispatch is finite; rules beyond the
+/// bound remain a partial entry in the readback and wait for the next dispatch.
+const FixedScopedVariants = struct {
+    const max_variants = 8;
+    const Variant = struct { deadline_us: ?i64, counts: [nft.max_scope_rule_parts]u16 = @splat(0) };
+    variants: [max_variants]Variant = undefined,
+    len: usize = 0,
+    fn note(self: *FixedScopedVariants, deadline_us: ?i64, part: u8) void {
+        for (self.variants[0..self.len]) |*variant| if (variant.deadline_us == deadline_us) {
+            variant.counts[part] +|= 1;
+            return;
+        };
+        if (self.len == max_variants) return;
+        self.variants[self.len] = .{ .deadline_us = deadline_us };
+        self.variants[self.len].counts[part] = 1;
+        self.len += 1;
+    }
+    fn count(self: *const FixedScopedVariants, deadline_us: ?i64, part: usize) u16 {
+        for (self.variants[0..self.len]) |variant| if (variant.deadline_us == deadline_us) return variant.counts[part];
+        return 0;
+    }
+};
+
+fn leaseDeadline(lease: Lease) ?i64 {
+    return switch (lease) {
+        .permanent => null,
+        .finite_deadline_us => |deadline| deadline,
+    };
+}
+
+fn copySnapshot(allocator: mem.Allocator, source: *const Snapshot) Error!Snapshot {
+    var copy = source.*;
+    copy.allocator = allocator;
+    copy.entries = try allocator.dupe(Entry, source.entries);
+    return copy;
 }
 
 fn parseIptables(builder: *Builder, output: []const u8, v6: bool) Error!bool {
@@ -1109,7 +1247,7 @@ fn parseIptables(builder: *Builder, output: []const u8, v6: bool) Error!bool {
     var policy_seen = [_]bool{ false, false, false };
     var lookup = false;
     var input_rules: usize = 0;
-    var scoped = std.ArrayList(FixedScopedGroup).init(builder.allocator);
+    var scoped = std.ArrayList(ScopedGroup).init(builder.allocator);
     defer scoped.deinit();
     var lines = mem.splitScalar(u8, output, '\n');
     while (lines.next()) |line| {
@@ -1142,7 +1280,7 @@ fn parseIptables(builder: *Builder, output: []const u8, v6: bool) Error!bool {
                 continue;
             }
             if (try fixedScopedMetadata(t, name, v6)) |metadata| {
-                try collectFixedScopedGroup(&scoped, metadata, builder.limits);
+                try collectScopedGroup(&scoped, metadata, builder.limits);
                 continue;
             }
             if (builder.installation.transport == .iptables) {
@@ -1175,7 +1313,7 @@ fn parseIptables(builder: *Builder, output: []const u8, v6: bool) Error!bool {
     }
     if (!mark or jump_count != 1) return error.ForeignState;
     if (builder.installation.transport == .ipset and !lookup) return error.ForeignState;
-    try finishFixedScopedGroups(builder, scoped.items);
+    try finishScopedGroups(builder, scoped.items);
     builder.topology.update(marker);
     return true;
 }
@@ -1312,8 +1450,20 @@ fn netlinkError(err: nl.Error) Error {
         error.Timeout => error.Timeout,
         error.TruncatedMessage => error.Incomplete,
         error.BufferTooSmall => error.LimitExceeded,
+        error.DumpInterrupted => error.DumpInterrupted,
         else => error.UnknownState,
     };
+}
+/// The kernel applies a batch whole or rejects it whole, so an element or rule the
+/// baseline misjudged rejects the batch with nothing applied: a non-mutation.
+fn rejectedBatch(err: nl.Error, progress: *MutationProgress) Error {
+    switch (err) {
+        error.AlreadyExists, error.NotFound => {
+            progress.requested = false;
+            return error.Changed;
+        },
+        else => return netlinkError(err),
+    }
 }
 fn scopeBuildError(err: anyerror) Error {
     return switch (err) {
@@ -1392,6 +1542,17 @@ fn equalAttributes(a: []const u8, b: []const u8, depth: usize, optional_zero_att
         }
     }
     return false;
+}
+/// A rule carrying our metadata is ours only when its expression is the exact scoped
+/// drop for that metadata. The same check gates readback and recovery deletion, so
+/// recovery never deletes a rule the readback would not have accepted as ours.
+fn validateScopedDropRule(table: []const u8, attributes: AttrMap, metadata: ScopedRuleMetadata) Error!void {
+    const part_count = nft.scopeRulePartCount(metadata.scope) catch |err| return scopeBuildError(err);
+    if (part_count != metadata.count) return error.ForeignState;
+    var expected_buf: [2048]u8 align(4) = undefined;
+    const expected = nft.buildScopedDropRulePayload(&expected_buf, table, "input", metadata.scope, metadata.part, try attributes.get(7)) catch |err| return scopeBuildError(err);
+    const expected_attrs = try payloadAttrs(expected, &.{ 1, 2, 4, 7 });
+    if (!try equalExpressions(try attributes.get(4), try expected_attrs.get(4))) return error.ForeignState;
 }
 fn equalExpressions(a: []const u8, b: []const u8) Error!bool {
     var actual = nl.Attributes{ .bytes = a };
@@ -1474,7 +1635,6 @@ fn readNft(self: *Inspector, builder: *Builder, timer: *std.time.Timer) Error!vo
         var rules = try dump(self, &sock, nft.NFT_MSG.GETRULE, nft.NFT_MSG.NEWRULE, request, timer, 0);
         defer rules.deinit();
         var seen = [_]bool{ false, false };
-        const ScopedGroup = struct { metadata: ScopedRuleMetadata, parts: u32 = 0 };
         var scoped = std.ArrayList(ScopedGroup).init(self.allocator);
         defer scoped.deinit();
         for (rules.values.items) |payload| {
@@ -1499,43 +1659,13 @@ fn readNft(self: *Inspector, builder: *Builder, timer: *std.time.Timer) Error!vo
                 continue;
             }
             const metadata = try ScopedRuleMetadata.decode(try a.get(7));
-            const part_count = nft.scopeRulePartCount(metadata.scope) catch |err| return scopeBuildError(err);
-            if (part_count != metadata.count) return error.ForeignState;
-            var expected_buf: [2048]u8 align(4) = undefined;
-            const expected = nft.buildScopedDropRulePayload(&expected_buf, name, "input", metadata.scope, metadata.part, try a.get(7)) catch |err| return scopeBuildError(err);
-            const expected_attrs = try payloadAttrs(expected, &.{ 1, 2, 4, 7 });
-            if (!try equalExpressions(try a.get(4), try expected_attrs.get(4))) return error.ForeignState;
+            try validateScopedDropRule(name, a, metadata);
             _ = try a.number(u64, 3);
-            var group_index: ?usize = null;
-            for (scoped.items, 0..) |group, index| if (mem.eql(u8, &group.metadata.effect_id, &metadata.effect_id)) {
-                group_index = index;
-                break;
-            };
-            if (group_index == null) {
-                if (scoped.items.len >= builder.limits.max_entries or scoped.items.len >= builder.limits.max_bytes / @sizeOf(ScopedGroup)) return error.LimitExceeded;
-                try scoped.append(.{ .metadata = metadata });
-                group_index = scoped.items.len - 1;
-            }
-            const group = &scoped.items[group_index.?];
-            if (!std.meta.eql(group.metadata.scope, metadata.scope) or group.metadata.count != metadata.count or
-                group.metadata.deadline_us != metadata.deadline_us or metadata.part >= 32)
-                return error.ForeignState;
-            const bit = @as(u32, 1) << @intCast(metadata.part);
-            if (group.parts & bit != 0) return error.UnknownState;
-            group.parts |= bit;
+            try collectScopedGroup(&scoped, metadata, builder.limits);
             builder.topology.update(try a.get(3));
         }
         if (!seen[0] or !seen[1]) return error.ForeignState;
-        for (scoped.items) |group| {
-            const wanted = if (group.metadata.count == 32) std.math.maxInt(u32) else (@as(u32, 1) << @intCast(group.metadata.count)) - 1;
-            if (group.parts != wanted) return error.Incomplete;
-            try builder.add(.{
-                .address = subjectAddress(group.metadata.scope.subject),
-                .scope = group.metadata.scope,
-                .deadline_us = group.metadata.deadline_us,
-                .effect_id = group.metadata.effect_id,
-            });
-        }
+        try finishScopedGroups(builder, scoped.items);
     }
     for (0..2) |index| {
         var element_request_buf: [256]u8 = undefined;
@@ -1585,4 +1715,5 @@ pub const TestAccess = if (@import("builtin").is_test) struct {
     pub const entryLess = Self.entryLess;
     pub const sameEntries = Self.sameEntries;
     pub const entryScope = Self.entryScope;
+    pub const findEntry = Self.findEntry;
 } else struct {};

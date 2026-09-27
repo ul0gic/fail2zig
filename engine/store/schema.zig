@@ -17,14 +17,50 @@ const effects = @import("../core/native_effect.zig");
 const effect_history = @import("../core/native_effect_history.zig");
 const application_history = @import("../core/native_application_history.zig");
 const action_outcome = @import("../core/native_action_outcome.zig");
+const sd_notify = @import("../core/sd_notify.zig");
 
 pub fn Methods(comptime Store: type) type {
     return struct {
+        // Schema 24 is admitted only once its migration completed; an interrupted migration
+        // resumes through enableLoadRepair before the chain runs.
+        pub fn chainSchema(self: *Store) Error!i64 {
+            const schema = try self.integer("PRAGMA user_version;");
+            if (schema == store.load_repair_schema and try self.loadRepairStatus() != .complete) return error.LoadRepairMigrationIncomplete;
+            return schema;
+        }
+
+        // Starts or resumes the schema-23 to 24 migration. Earlier schemas return unchanged
+        // so the chain can build them to 23 first; call again after enableMigrationState.
+        // `progress` receives the committed page count so a service manager can extend its
+        // start deadline while the migration advances.
+        pub fn enableLoadRepair(self: *Store, options: store.load_repair.Options, progress: ?sd_notify.Hook) Error!void {
+            var pages: u64 = 0;
+            while (true) switch (try self.loadRepairStatus()) {
+                .earlier_schema => return,
+                .ready, .incomplete => {
+                    _ = try self.stepLoadRepairMigration(options);
+                    pages += 1;
+                    if (progress) |hook| hook.report(pages, 0);
+                },
+                .complete => break,
+            };
+            if (try self.loadRepairStatus() != .complete) return error.LoadRepairMigrationIncomplete;
+            self.schema_version = store.load_repair_schema;
+            if (pages != 0) {
+                var row = try self.statement("SELECT superseded_targets,backup_path FROM load_repair_migration WHERE id=1;");
+                defer row.deinit();
+                if (!try row.row()) return error.LoadRepairInvalidState;
+                // Superseded outcomes belonged to decisions already replaced before the upgrade;
+                // no action status surface reports them, so the count is disclosed here once.
+                std.log.info("native storage: schema 24 migration complete after {d} transactions; {d} unsettled action outcomes of replaced decisions marked superseded; pre-upgrade backup {s}", .{ pages, try row.signed(0), try row.bytes(1) });
+            }
+        }
+
         pub fn enableReceipts(self: *Store, maximum_pending: usize) Error!void {
             if (maximum_pending == 0 or maximum_pending > Limits.pending_receipts) return error.ReceiptLimit;
             try self.beginWrite();
             errdefer self.rollback();
-            const schema = try self.integer("PRAGMA user_version;");
+            const schema = try self.chainSchema();
             if (schema == 2) {
                 try self.exec(
                     \\CREATE TABLE pending_receipts(jail TEXT NOT NULL,source TEXT NOT NULL,generation BLOB NOT NULL CHECK(length(generation)=32),occurrence TEXT NOT NULL,raw_hash BLOB NOT NULL CHECK(length(raw_hash)=32),cursor BLOB NOT NULL,receipt_us INTEGER NOT NULL CHECK(typeof(receipt_us)='integer'),PRIMARY KEY(jail,source));
@@ -50,7 +86,7 @@ pub fn Methods(comptime Store: type) type {
             if (self.receipt_limit == null) return error.ReceiptStorageRequired;
             try self.beginWrite();
             errdefer self.rollback();
-            const schema = try self.integer("PRAGMA user_version;");
+            const schema = try self.chainSchema();
             if (schema == 3) {
                 try self.exec(
                     \\ALTER TABLE records ADD COLUMN native_time_kind INTEGER CHECK(native_time_kind IS NULL OR (typeof(native_time_kind)='integer' AND native_time_kind BETWEEN 1 AND 11 AND receipt_us IS NOT NULL));
@@ -68,7 +104,7 @@ pub fn Methods(comptime Store: type) type {
             if (self.receipt_limit == null) return error.ReceiptStorageRequired;
             try self.beginWrite();
             errdefer self.rollback();
-            const schema = try self.integer("PRAGMA user_version;");
+            const schema = try self.chainSchema();
             if (schema == 4) {
                 try self.exec("ALTER TABLE records ADD COLUMN inferred_year INTEGER CHECK(inferred_year IS NULL OR (typeof(inferred_year)='integer' AND inferred_year BETWEEN 1 AND 9999 AND original_us IS NOT NULL AND native_time_kind IN (1,3,4,6,11))); PRAGMA user_version=5;");
             } else if (schema < 5 or schema > latest_schema) return error.UnsupportedSchema;
@@ -81,7 +117,7 @@ pub fn Methods(comptime Store: type) type {
             if (self.receipt_limit == null) return error.ReceiptStorageRequired;
             try self.beginWrite();
             errdefer self.rollback();
-            const schema = try self.integer("PRAGMA user_version;");
+            const schema = try self.chainSchema();
             if (schema < 4 or schema > latest_schema) return error.UnsupportedSchema;
             if (schema == 4) try self.exec("ALTER TABLE records ADD COLUMN inferred_year INTEGER CHECK(inferred_year IS NULL OR (typeof(inferred_year)='integer' AND inferred_year BETWEEN 1 AND 9999 AND original_us IS NOT NULL AND native_time_kind IN (1,3,4,6,11)));");
             if (schema < 6) try self.exec(
@@ -108,7 +144,7 @@ pub fn Methods(comptime Store: type) type {
             if (self.receipt_limit == null) return error.ReceiptStorageRequired;
             try self.beginWrite();
             errdefer self.rollback();
-            const schema = try self.integer("PRAGMA user_version;");
+            const schema = try self.chainSchema();
             if (schema < 6 or schema > latest_schema) return error.UnsupportedSchema;
             if (schema == 6) {
                 if (try self.integer("SELECT EXISTS(SELECT 1 FROM records WHERE receipt_us IS NOT NULL AND typeof(receipt_us)!='integer') OR EXISTS(SELECT 1 FROM pending_receipts WHERE typeof(receipt_us)!='integer');") != 0) return error.DatabaseFailure;
@@ -128,7 +164,7 @@ pub fn Methods(comptime Store: type) type {
             if (self.receipt_limit == null) return error.ReceiptStorageRequired;
             try self.beginWrite();
             errdefer self.rollback();
-            const schema = try self.integer("PRAGMA user_version;");
+            const schema = try self.chainSchema();
             if (schema < 7 or schema > latest_schema) return error.UnsupportedSchema;
             _ = try self.readReceiptClock();
             if (schema == 7) {
@@ -161,7 +197,7 @@ pub fn Methods(comptime Store: type) type {
             if (self.receipt_limit == null) return error.ReceiptStorageRequired;
             try self.beginWrite();
             errdefer self.rollback();
-            const schema = try self.integer("PRAGMA user_version;");
+            const schema = try self.chainSchema();
             if (schema < 8 or schema > latest_schema) return error.UnsupportedSchema;
             if (schema == 8) try self.exec(
                 \\CREATE TABLE retry_policies(jail TEXT PRIMARY KEY NOT NULL,generation BLOB NOT NULL CHECK(typeof(generation)='blob' AND length(generation)=32),policy BLOB NOT NULL CHECK(typeof(policy)='blob' AND length(policy)=32));
@@ -179,7 +215,7 @@ pub fn Methods(comptime Store: type) type {
         pub fn enableConsumers(self: *Store) Error!void {
             try self.beginWrite();
             errdefer self.rollback();
-            const schema = try self.integer("PRAGMA user_version;");
+            const schema = try self.chainSchema();
             if (schema < 9 or schema > latest_schema) return error.UnsupportedSchema;
             if (schema == 9) try self.exec(
                 \\CREATE TABLE consumer_checkpoints(kind INTEGER NOT NULL CHECK(typeof(kind)='integer' AND kind BETWEEN 1 AND 5),jail TEXT NOT NULL,source TEXT NOT NULL,rule TEXT NOT NULL,generation BLOB NOT NULL CHECK(typeof(generation)='blob' AND length(generation)=32),format INTEGER NOT NULL CHECK(typeof(format)='integer' AND format BETWEEN 1 AND 65535),revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0),payload BLOB NOT NULL CHECK(typeof(payload)='blob' AND length(payload)<=65536),valid_until_us INTEGER CHECK(valid_until_us IS NULL OR typeof(valid_until_us)='integer'),PRIMARY KEY(kind,jail,source,rule,generation));
@@ -195,7 +231,7 @@ pub fn Methods(comptime Store: type) type {
         pub fn enableConsumerManifests(self: *Store) Error!void {
             try self.beginWrite();
             errdefer self.rollback();
-            const schema = try self.integer("PRAGMA user_version;");
+            const schema = try self.chainSchema();
             if (schema < 11 or schema > latest_schema) return error.UnsupportedSchema;
             if (schema == 11) try self.exec(
                 \\CREATE TABLE record_detections_v12(
@@ -232,7 +268,7 @@ pub fn Methods(comptime Store: type) type {
         pub fn enableConfirmedHistory(self: *Store) Error!void {
             try self.beginWrite();
             errdefer self.rollback();
-            const schema = try self.integer("PRAGMA user_version;");
+            const schema = try self.chainSchema();
             if (schema < 12 or schema > latest_schema) return error.UnsupportedSchema;
             if (schema == 12) {
                 if (try self.integer("SELECT count(*) FROM confirmed_effect_events;") > effects.max_confirmed_events) return error.EffectCapacity;
@@ -255,7 +291,7 @@ pub fn Methods(comptime Store: type) type {
         pub fn enableMaintenance(self: *Store) Error!void {
             try self.beginWrite();
             errdefer self.rollback();
-            const schema = try self.integer("PRAGMA user_version;");
+            const schema = try self.chainSchema();
             if (schema < 13 or schema > latest_schema) return error.UnsupportedSchema;
             if (schema == 13) try self.exec(
                 \\CREATE TABLE source_maintenance(jail TEXT NOT NULL,source TEXT NOT NULL,generation BLOB NOT NULL CHECK(typeof(generation)='blob' AND length(generation)=32),head_sequence INTEGER NOT NULL CHECK(typeof(head_sequence)='integer' AND head_sequence>=1 AND head_sequence<9223372036854775807),reject_below_sequence INTEGER NOT NULL CHECK(typeof(reject_below_sequence)='integer' AND reject_below_sequence>=1 AND reject_below_sequence<=head_sequence+1),cleanup_revision INTEGER NOT NULL CHECK(typeof(cleanup_revision)='integer' AND cleanup_revision>=0),sweep_sequence INTEGER NOT NULL CHECK(typeof(sweep_sequence)='integer' AND sweep_sequence>=0 AND sweep_sequence<reject_below_sequence),PRIMARY KEY(jail,source,generation));
@@ -275,7 +311,7 @@ pub fn Methods(comptime Store: type) type {
         pub fn enableCleanup(self: *Store) Error!void {
             try self.beginWrite();
             errdefer self.rollback();
-            const schema = try self.integer("PRAGMA user_version;");
+            const schema = try self.chainSchema();
             if (schema < 14 or schema > latest_schema) return error.UnsupportedSchema;
             if (schema == 14) try self.exec(
                 \\CREATE TABLE maintenance_clock(id INTEGER PRIMARY KEY CHECK(id=1),revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>=0),floor_us INTEGER CHECK(floor_us IS NULL OR typeof(floor_us)='integer'));
@@ -295,7 +331,7 @@ pub fn Methods(comptime Store: type) type {
         pub fn enableRetryLeases(self: *Store) Error!void {
             try self.beginWrite();
             errdefer self.rollback();
-            const schema = try self.integer("PRAGMA user_version;");
+            const schema = try self.chainSchema();
             if (schema < 15 or schema > latest_schema) return error.UnsupportedSchema;
             if (schema == 15) {
                 var names: [64][64]u8 = undefined;
@@ -347,7 +383,7 @@ pub fn Methods(comptime Store: type) type {
         pub fn enableApplicationHistory(self: *Store) Error!void {
             try self.beginWrite();
             errdefer self.rollback();
-            const schema = try self.integer("PRAGMA user_version;");
+            const schema = try self.chainSchema();
             if (schema < 16 or schema > latest_schema) return error.UnsupportedSchema;
             if (schema == 16) try self.exec(
                 \\CREATE TABLE retry_decision_details(jail TEXT NOT NULL,source TEXT NOT NULL,occurrence TEXT NOT NULL,family INTEGER NOT NULL CHECK(typeof(family)='integer' AND family IN (4,6)),subject BLOB NOT NULL CHECK(typeof(subject)='blob' AND length(subject)=CASE family WHEN 4 THEN 4 ELSE 16 END),ordinal INTEGER NOT NULL CHECK(typeof(ordinal)='integer' AND ordinal>0),decided_us INTEGER NOT NULL CHECK(typeof(decided_us)='integer'),effect_decision_id BLOB UNIQUE CHECK(effect_decision_id IS NULL OR (typeof(effect_decision_id)='blob' AND length(effect_decision_id)=32)),evidence TEXT CHECK(evidence IS NULL OR (typeof(evidence)='text' AND length(CAST(evidence AS BLOB)) BETWEEN 1 AND 2048)),PRIMARY KEY(jail,source,occurrence,family,subject));
@@ -379,7 +415,7 @@ pub fn Methods(comptime Store: type) type {
         pub fn enableEscalation(self: *Store) Error!void {
             try self.beginWrite();
             errdefer self.rollback();
-            const schema = try self.integer("PRAGMA user_version;");
+            const schema = try self.chainSchema();
             if (schema < 17 or schema > latest_schema) return error.UnsupportedSchema;
             if (schema == 17) {
                 try self.exec(
@@ -428,7 +464,7 @@ pub fn Methods(comptime Store: type) type {
         pub fn enableCanonicalEffects(self: *Store) Error!void {
             try self.beginWrite();
             errdefer self.rollback();
-            const schema = try self.integer("PRAGMA user_version;");
+            const schema = try self.chainSchema();
             if (schema < 18 or schema > latest_schema) return error.UnsupportedSchema;
             if (schema == 18) {
                 const installation = try self.readInstallation();
@@ -470,7 +506,7 @@ pub fn Methods(comptime Store: type) type {
         pub fn enableHistoryResets(self: *Store) Error!void {
             try self.beginWrite();
             errdefer self.rollback();
-            const schema = try self.integer("PRAGMA user_version;");
+            const schema = try self.chainSchema();
             if (schema < 19 or schema > latest_schema) return error.UnsupportedSchema;
             if (schema == 19) try self.exec(
                 \\CREATE TABLE history_reset_watermarks(scope INTEGER NOT NULL CHECK(scope IN(1,2)),jail TEXT NOT NULL CHECK((scope=1 AND length(jail) BETWEEN 1 AND 64) OR (scope=2 AND jail='')),family INTEGER NOT NULL CHECK(family IN(4,6)),subject BLOB NOT NULL CHECK(typeof(subject)='blob' AND length(subject)=CASE family WHEN 4 THEN 4 ELSE 16 END),through_sequence INTEGER NOT NULL CHECK(typeof(through_sequence)='integer' AND through_sequence>=0),reset_us INTEGER NOT NULL CHECK(typeof(reset_us)='integer'),revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0),intent_id BLOB NOT NULL CHECK(typeof(intent_id)='blob' AND length(intent_id)=32),PRIMARY KEY(scope,jail,family,subject));
@@ -484,7 +520,7 @@ pub fn Methods(comptime Store: type) type {
         pub fn enableActionTargets(self: *Store) Error!void {
             try self.beginWrite();
             errdefer self.rollback();
-            const schema = try self.integer("PRAGMA user_version;");
+            const schema = try self.chainSchema();
             if (schema < 20 or schema > latest_schema) return error.UnsupportedSchema;
             if (schema == 20) {
                 const owner_count = try self.integer("SELECT count(*) FROM effect_owners;");
@@ -503,7 +539,7 @@ pub fn Methods(comptime Store: type) type {
         pub fn enableAdminState(self: *Store) Error!void {
             try self.beginWrite();
             errdefer self.rollback();
-            const schema = try self.integer("PRAGMA user_version;");
+            const schema = try self.chainSchema();
             if (schema < 21 or schema > latest_schema) return error.UnsupportedSchema;
             if (schema == 21) try self.exec(
                 \\CREATE TABLE config_generations(generation BLOB NOT NULL PRIMARY KEY CHECK(typeof(generation)='blob' AND length(generation)=32),config_digest BLOB NOT NULL CHECK(typeof(config_digest)='blob' AND length(config_digest)=32),config_path TEXT NOT NULL CHECK(typeof(config_path)='text' AND length(config_path) BETWEEN 1 AND 4096),committed_us INTEGER NOT NULL CHECK(typeof(committed_us)='integer' AND committed_us>=0),published INTEGER NOT NULL CHECK(published IN(0,1)),mutation_revision INTEGER NOT NULL CHECK(typeof(mutation_revision)='integer' AND mutation_revision>=0)) WITHOUT ROWID;
@@ -523,7 +559,7 @@ pub fn Methods(comptime Store: type) type {
         pub fn enableMigrationState(self: *Store) Error!void {
             try self.beginWrite();
             errdefer self.rollback();
-            const schema = try self.integer("PRAGMA user_version;");
+            const schema = try self.chainSchema();
             if (schema < 22 or schema > latest_schema) return error.UnsupportedSchema;
             if (schema == 22) try self.exec(
                 \\CREATE TABLE migration_runs(run_id BLOB NOT NULL PRIMARY KEY CHECK(typeof(run_id)='blob' AND length(run_id)=32),host_id BLOB NOT NULL CHECK(typeof(host_id)='blob' AND length(host_id)=32),source_db_fp BLOB NOT NULL CHECK(typeof(source_db_fp)='blob' AND length(source_db_fp)=32),source_cfg_fp BLOB NOT NULL CHECK(typeof(source_cfg_fp)='blob' AND length(source_cfg_fp)=32),plan_fp BLOB NOT NULL CHECK(typeof(plan_fp)='blob' AND length(plan_fp)=32),recovery_point TEXT NOT NULL CHECK(typeof(recovery_point)='text' AND length(recovery_point)<=4096),generation BLOB NOT NULL CHECK(typeof(generation)='blob' AND length(generation)=32),state INTEGER NOT NULL CHECK(state BETWEEN 1 AND 9),created_us INTEGER NOT NULL CHECK(typeof(created_us)='integer' AND created_us>=0),updated_us INTEGER NOT NULL CHECK(typeof(updated_us)='integer' AND updated_us>=created_us)) WITHOUT ROWID;

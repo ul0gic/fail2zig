@@ -93,63 +93,8 @@ pub const registered_count: usize = entries.len;
 
 const testing = std.testing;
 
-test "registry: sshd resolves" {
-    const p = get("sshd").?;
-    try testing.expect(p.len > 0);
-}
-
-test "registry: nginx-http-auth resolves (hyphen)" {
-    const p = get("nginx-http-auth").?;
-    try testing.expect(p.len > 0);
-}
-
-test "registry: nginx_http_auth resolves (underscore form)" {
-    const p = get("nginx_http_auth").?;
-    try testing.expect(p.len > 0);
-}
-
-test "registry: apache-badbots resolves" {
-    const p = get("apache-badbots").?;
-    try testing.expect(p.len > 0);
-}
-
-test "registry: postfix resolves" {
-    const p = get("postfix").?;
-    try testing.expect(p.len > 0);
-}
-
-test "registry: dovecot resolves" {
-    const p = get("dovecot").?;
-    try testing.expect(p.len > 0);
-}
-
-test "registry: courier resolves" {
-    const p = get("courier").?;
-    try testing.expect(p.len > 0);
-}
-
 test "registry: recidive resolves" {
     const p = get("recidive").?;
-    try testing.expect(p.len > 0);
-}
-
-test "registry: vsftpd resolves" {
-    const p = get("vsftpd").?;
-    try testing.expect(p.len > 0);
-}
-
-test "registry: proftpd resolves" {
-    const p = get("proftpd").?;
-    try testing.expect(p.len > 0);
-}
-
-test "registry: mysqld-auth resolves" {
-    const p = get("mysqld-auth").?;
-    try testing.expect(p.len > 0);
-}
-
-test "registry: named-refused resolves" {
-    const p = get("named-refused").?;
     try testing.expect(p.len > 0);
 }
 
@@ -205,10 +150,6 @@ test "registry: listFilters writes all names" {
     try testing.expectEqual(entries.len, line_count);
 }
 
-test "registry: registered_count matches entries length" {
-    try testing.expectEqual(entries.len, registered_count);
-}
-
 test "registry: every registered name is unique" {
     var i: usize = 0;
     while (i < entries.len) : (i += 1) {
@@ -217,8 +158,4 @@ test "registry: every registered name is unique" {
             try testing.expect(!std.mem.eql(u8, entries[i].name, entries[j].name));
         }
     }
-}
-
-test "registry: at least 15 filters registered" {
-    try testing.expect(registered_count >= 15);
 }

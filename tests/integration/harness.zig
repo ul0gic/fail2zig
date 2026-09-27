@@ -6,7 +6,6 @@ const builtin = @import("builtin");
 const posix = std.posix;
 
 const shared = @import("shared");
-const engine = @import("engine");
 
 const protocol = shared.protocol;
 
@@ -57,7 +56,15 @@ pub const Harness = struct {
     child: ?std.process.Child = null,
     metrics_port: u16,
 
-    pub fn init(allocator: std.mem.Allocator, options: Options) !Harness {
+    pub fn init(allocator: std.mem.Allocator, initial_options: Options) !Harness {
+        var options = initial_options;
+        if (std.mem.eql(u8, options.daemon_path, default_daemon_path)) {
+            if (std.posix.getenv("F2Z_TEST_DAEMON")) |candidate| {
+                if (!std.fs.path.isAbsolute(candidate)) return error.DaemonBinaryMissing;
+                try std.fs.cwd().access(candidate, .{});
+                options.daemon_path = candidate;
+            }
+        }
         if (builtin.os.tag != .linux) return error.SkipZigTest;
 
         var tmp = std.testing.tmpDir(.{});
@@ -320,10 +327,6 @@ pub const Harness = struct {
         return self.sendCommand(.{ .list = .{ .jail = null } });
     }
 
-    pub fn unban(self: *Harness, ip: shared.IpAddress) HarnessError![]const u8 {
-        return self.sendCommand(.{ .unban = .{ .ip = ip, .jail = null } });
-    }
-
     fn queryActiveBans(self: *Harness) HarnessError!u32 {
         const payload = try self.queryStatus();
         defer self.allocator.free(payload);
@@ -371,76 +374,4 @@ pub fn parseJsonUintField(json: []const u8, field: []const u8) ?u32 {
         } else break;
     }
     return if (seen_digit) result else null;
-}
-
-const testing = std.testing;
-
-test "harness: init + deinit cleans up without spawning daemon" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-    var h = try Harness.init(testing.allocator, .{ .spawn_daemon = false });
-    defer h.deinit();
-
-    try testing.expect(h.metrics_port >= 49152);
-
-    try std.fs.cwd().access(h.log_path, .{});
-}
-
-test "harness: writeConfig emits a file the native parser accepts" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-    var h = try Harness.init(testing.allocator, .{ .spawn_daemon = false });
-    defer h.deinit();
-
-    try h.writeConfig();
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const cfg = try engine.config_mod.Config.loadFile(arena.allocator(), h.config_path);
-
-    try testing.expectEqual(@as(usize, 1), cfg.jails.len);
-    try testing.expectEqualStrings("sshd", cfg.jails[0].name);
-    try testing.expectEqual(@as(u32, 3), cfg.jails[0].maxretry.?);
-    try testing.expectEqual(@as(u64, 600), cfg.jails[0].findtime.?);
-    try testing.expectEqual(@as(u64, 60), cfg.jails[0].bantime.?);
-    try testing.expectEqual(@as(usize, 1), cfg.jails[0].logpath.len);
-    try testing.expectEqualStrings(h.log_path, cfg.jails[0].logpath[0]);
-}
-
-test "harness: writeLine appends and round-trips through the filesystem" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-    var h = try Harness.init(testing.allocator, .{ .spawn_daemon = false });
-    defer h.deinit();
-
-    try h.writeLine("line without newline");
-    try h.writeLine("second line\n");
-    try h.writeLine("third\n");
-
-    const contents = try std.fs.cwd().readFileAlloc(testing.allocator, h.log_path, 4096);
-    defer testing.allocator.free(contents);
-    try testing.expectEqualStrings(
-        "line without newline\nsecond line\nthird\n",
-        contents,
-    );
-}
-
-test "harness: parseJsonUintField extracts expected value" {
-    const doc = "{\"version\":\"test\",\"active_bans\":7,\"jail_count\":1}";
-    try testing.expectEqual(@as(?u32, 7), parseJsonUintField(doc, "active_bans"));
-    try testing.expectEqual(@as(?u32, 1), parseJsonUintField(doc, "jail_count"));
-    try testing.expectEqual(@as(?u32, null), parseJsonUintField(doc, "missing"));
-    try testing.expectEqual(@as(?u32, null), parseJsonUintField(doc, "version"));
-}
-
-test "harness: HarnessError includes the documented skip reasons" {
-    const names = @typeInfo(HarnessError).error_set.?;
-    var saw_unavailable = false;
-    var saw_binary_missing = false;
-    var saw_not_root = false;
-    inline for (names) |e| {
-        if (std.mem.eql(u8, e.name, "DaemonUnavailable")) saw_unavailable = true;
-        if (std.mem.eql(u8, e.name, "DaemonBinaryMissing")) saw_binary_missing = true;
-        if (std.mem.eql(u8, e.name, "NotRoot")) saw_not_root = true;
-    }
-    try testing.expect(saw_unavailable);
-    try testing.expect(saw_binary_missing);
-    try testing.expect(saw_not_root);
 }

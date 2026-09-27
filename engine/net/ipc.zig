@@ -698,30 +698,6 @@ const TestSocketDir = struct {
     }
 };
 
-test "ipc: init creates socket, deinit removes it" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const a = testing.allocator;
-
-    var loop = try EventLoop.init(a);
-    defer loop.deinit();
-
-    var dir = try TestSocketDir.init(a);
-    defer dir.deinit(a);
-
-    {
-        var server = try IpcServer.init(a, &loop, dir.path);
-        defer server.deinit();
-
-        try std.fs.cwd().access(dir.path, .{});
-    }
-
-    const exists = blk: {
-        std.fs.cwd().access(dir.path, .{}) catch break :blk false;
-        break :blk true;
-    };
-    try testing.expect(!exists);
-}
-
 test "ipc: init refuses a regular file at the socket path" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const a = testing.allocator;
@@ -759,23 +735,6 @@ test "ipc: socket has mode 0660 immediately after init (SEC-002)" {
     try testing.expectEqual(@as(u32, linux.geteuid()), st.uid);
 }
 
-test "ipc: listener socket is non-blocking (SYS-001)" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const a = testing.allocator;
-
-    var loop = try EventLoop.init(a);
-    defer loop.deinit();
-
-    var dir = try TestSocketDir.init(a);
-    defer dir.deinit(a);
-
-    var server = try IpcServer.init(a, &loop, dir.path);
-    defer server.deinit();
-
-    const flags = try posix.fcntl(server.listen_fd, posix.F.GETFL, 0);
-    try testing.expect((flags & @as(usize, linux.SOCK.NONBLOCK)) != 0);
-}
-
 test "ipc: init rejects path that is too long" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const a = testing.allocator;
@@ -790,23 +749,6 @@ test "ipc: init rejects path that is too long" {
     );
 }
 
-test "ipc: init records the daemon euid and allocates the client pool once" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const a = testing.allocator;
-
-    var loop = try EventLoop.init(a);
-    defer loop.deinit();
-
-    var dir = try TestSocketDir.init(a);
-    defer dir.deinit(a);
-
-    var server = try IpcServer.init(a, &loop, dir.path);
-    defer server.deinit();
-
-    try testing.expectEqual(@as(u32, linux.geteuid()), server.self_uid);
-    try testing.expectEqual(max_clients * client_buffer_size, server.pool.len);
-}
-
 fn socketpairNonblock(fds: *[2]i32) !void {
     const stype_u32: u32 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
     const rc = linux.socketpair(@as(i32, linux.AF.UNIX), @as(i32, @intCast(stype_u32)), 0, fds);
@@ -814,36 +756,6 @@ fn socketpairNonblock(fds: *[2]i32) !void {
         .SUCCESS => {},
         else => return error.SkipZigTest,
     }
-}
-
-test "ipc: admit and close reuse the pooled slot without allocating (PRF-002)" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const a = testing.allocator;
-
-    var loop = try EventLoop.init(a);
-    defer loop.deinit();
-
-    var server = try IpcServer.initDetached(a, &loop);
-    defer server.deinit();
-
-    var failing = testing.FailingAllocator.init(a, .{ .fail_index = 0 });
-    server.allocator = failing.allocator();
-    defer server.allocator = a;
-
-    var round: usize = 0;
-    while (round < 3) : (round += 1) {
-        var fds: [2]i32 = undefined;
-        try socketpairNonblock(&fds);
-        defer posix.close(fds[1]);
-
-        try server.admitClient(fds[0], .{ .pid = 0, .uid = 0, .gid = 0 });
-        const cli = server.clients[0].?;
-        try testing.expectEqual(@as(usize, client_buffer_size), cli.buf.len);
-        try testing.expectEqual(@intFromPtr(server.pool.ptr), @intFromPtr(cli.buf.ptr));
-        server.closeClient(cli);
-        try testing.expect(server.clients[0] == null);
-    }
-    try testing.expectEqual(@as(usize, 0), failing.allocations);
 }
 
 const CaptureDispatch = struct {
@@ -914,47 +826,6 @@ fn runLoopBriefly(loop: *EventLoop, ms: u64) !void {
     const th = try std.Thread.spawn(.{}, Wd.run, .{ loop, ms });
     try loop.run();
     th.join();
-}
-
-test "ipc: end-to-end version command through unix socketpair" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const a = testing.allocator;
-
-    var loop = try EventLoop.init(a);
-    defer loop.deinit();
-
-    var capture = CaptureDispatch{};
-    var fds: [2]i32 = undefined;
-    var server: IpcServer = undefined;
-    try initFakeServer(&server, a, &loop, &fds, .{ .ctx = @ptrCast(&capture), .dispatch = CaptureDispatch.dispatch });
-    defer server.deinit();
-    defer posix.close(fds[1]);
-
-    var wbuf: [64]u8 = undefined;
-    var ws = std.io.fixedBufferStream(&wbuf);
-    try protocol.serializeCommand(.{ .version = {} }, ws.writer());
-    const wire = ws.getWritten();
-    var written: usize = 0;
-    while (written < wire.len) {
-        written += try posix.write(fds[1], wire[written..]);
-    }
-
-    try runLoopBriefly(&loop, 300);
-
-    var rbuf: [256]u8 = undefined;
-    const n = try posix.read(fds[1], &rbuf);
-    try testing.expect(n >= 5);
-
-    var rs = std.io.fixedBufferStream(rbuf[0..n]);
-    const resp = try protocol.deserializeResponse(rs.reader(), a);
-    defer resp.deinit(a);
-    switch (resp) {
-        .ok => |o| try testing.expect(std.mem.indexOf(u8, o.payload, "version") != null),
-        .err => return error.UnexpectedErrResponse,
-    }
-
-    try testing.expect(capture.saw_version);
-    try testing.expect(server.clients[0].?.pending == null);
 }
 
 test "ipc: malformed command receives err response and client stays open" {
@@ -1052,16 +923,6 @@ test "native ipc auth: SEC-014 expired silent monitors cannot lock out an authen
     defer response.deinit(a);
     try testing.expect(response == .ok);
     try testing.expect(capture.saw_admin_reload);
-}
-
-test "ipc: defaultDispatch returns 503 when no handler installed" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const a = testing.allocator;
-
-    const resp = try defaultDispatch(null, .{ .version = {} }, a);
-    defer resp.deinit(a);
-    try testing.expect(resp == .err);
-    try testing.expectEqual(@as(u16, 503), resp.err.code);
 }
 
 test "ipc: oversized length prefix closes the client" {

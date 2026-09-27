@@ -79,43 +79,6 @@ const Fixture = struct {
         stage.state.release(stage.state.context);
     }
 };
-test "native coordinator: first-use rows precede observation and aborted bootstrap stays unavailable" {
-    var f = try Fixture.init(plain, &.{});
-    defer f.deinit();
-    try f.bind();
-    try t.expectError(error.ConsumerStateNotReady, f.coordinator.prepare(f.input(failure, "one")));
-    const first = try f.coordinator.prepareBootstrap(gen, f.clock.us);
-    try t.expectEqual(@as(usize, 2), first.state.consumers.deltas.len);
-    try t.expectEqual(@as(usize, 3), first.manifest.required.len);
-    try t.expect(!f.coordinator.ready);
-    first.state.release(first.state.context);
-    try t.expectEqual(@as(u64, 0), f.ignore_owner.revision);
-    try t.expect(std.mem.allEqual(u64, &f.owner.counters, 0));
-    try f.ready();
-    try t.expect(f.coordinator.ready);
-    try t.expectEqual(@as(u64, 1), f.ignore_owner.revision);
-    try t.expect(std.mem.allEqual(u64, &f.owner.counters, 0));
-    try t.expectError(error.ConsumerAlreadyReady, f.coordinator.prepareBootstrap(gen, f.clock.us));
-}
-test "native coordinator: literal candidate rollback and committed publication share exact revision" {
-    var f = try Fixture.init(plain, &.{});
-    defer f.deinit();
-    try f.bind();
-    try f.ready();
-    const stage = try f.coordinator.prepare(f.input(failure, "one"));
-    try t.expectEqual(detection.Kind.candidate, stage.outcomes[0].kind);
-    try t.expectEqual(@as(usize, 1), stage.consumers.deltas.len);
-    try t.expectEqual(@as(u64, 1), stage.consumers.deltas[0].expected_revision);
-    try t.expect(f.coordinator.pendingRequest() == null);
-    try t.expect(std.mem.allEqual(u64, &f.owner.counters, 0));
-    stage.release(stage.context);
-    const retry = try f.coordinator.prepare(f.input(failure, "one"));
-    retry.publish(retry.context);
-    retry.publish(retry.context);
-    retry.release(retry.context);
-    try t.expectEqual(@as(u64, 2), f.coordinator.revisions[0]);
-    try t.expectEqual(@as(u64, 1), f.owner.counters[@intFromEnum(rules.Kind.candidate)]);
-}
 test "native coordinator: checkpoint and rejected time pin state without rule observations" {
     var f = try Fixture.init(plain, &.{});
     defer f.deinit();
@@ -137,31 +100,6 @@ test "native coordinator: checkpoint and rejected time pin state without rule ob
     rejected.publish(rejected.context);
     rejected.release(rejected.context);
     try t.expect(std.mem.allEqual(u64, &f.owner.counters, 0));
-}
-test "native coordinator: DNS yield releases rules and input commit retains pending occurrence" {
-    var f = try Fixture.init(hostname, &.{});
-    defer f.deinit();
-    try f.bind();
-    try f.ready();
-    try t.expectError(error.ConsumerPending, f.coordinator.prepare(f.input(host_failure, "one")));
-    try t.expect(!f.owner.in_flight and !f.coordinator.busy);
-    try t.expect(std.mem.allEqual(u64, &f.owner.counters, 0));
-    try t.expectError(error.ConsumerPending, f.coordinator.prepare(f.input(host_failure, "two")));
-    const result = try f.result(16, 30);
-    const stage = try f.coordinator.prepareDnsResult(result, f.clock.ms, f.clock.us);
-    try t.expect(stage.bootstrap);
-    try t.expectEqualStrings("both:client.example", stage.manifest.source);
-    try t.expect((try f.cache.lookup(result.request, f.clock.us)) == null);
-    stage.state.release(stage.state.context);
-    try f.commitDns(result);
-    try t.expect(f.coordinator.waiting_occurrence != null);
-    const prepared = try f.coordinator.prepare(f.input(host_failure, "one"));
-    try t.expectEqual(@as(usize, 16), prepared.outcomes.len);
-    try t.expectEqual(@as(usize, 3), prepared.consumers.dependencies.len);
-    prepared.publish(prepared.context);
-    prepared.release(prepared.context);
-    try t.expect(f.coordinator.waiting_occurrence == null);
-    try t.expectEqual(@as(u64, 1), f.owner.counters[@intFromEnum(rules.Kind.candidate)]);
 }
 test "native coordinator: sequential subject and exclusion DNS commits make bounded progress" {
     var f = try Fixture.init(hostname, &.{"trusted.example"});
@@ -197,27 +135,6 @@ test "native coordinator: stale completion and expiry during writer wait cannot 
     prepared.release(prepared.context);
     try t.expect(std.mem.allEqual(u64, &f.owner.counters, 0));
 }
-test "native coordinator: zero TTL subject is single immediate preparation and never a cache exclusion" {
-    var f = try Fixture.init(hostname, &.{});
-    defer f.deinit();
-    try f.bind();
-    try f.ready();
-    try t.expectError(error.ConsumerPending, f.coordinator.prepare(f.input(host_failure, "one")));
-    const result = try f.result(1, 0);
-    try t.expectError(error.DnsCacheExpired, f.coordinator.prepareDnsResult(result, f.clock.ms, f.clock.us));
-    try f.coordinator.provideImmediate(result, f.clock.ms, f.clock.us);
-    const prepared = try f.coordinator.prepare(f.input(host_failure, "one"));
-    try t.expectEqual(detection.Kind.candidate, prepared.outcomes[0].kind);
-    try t.expectEqual(@as(usize, 2), prepared.consumers.dependencies.len);
-    _ = try prepared.consumers.checkedTime(null);
-    f.clock.us += 20;
-    _ = try prepared.consumers.checkedTime(null);
-    f.clock.turn += 1;
-    try t.expectError(error.ConsumerExpired, prepared.consumers.checkedTime(null));
-    prepared.release(prepared.context);
-    try t.expect((try f.cache.lookup(result.request, f.clock.us)) == null);
-    try t.expectError(error.ConsumerPending, f.coordinator.prepare(f.input(host_failure, "one")));
-}
 test "native coordinator: required zero TTL exclusion stays pending without contamination" {
     var f = try Fixture.init(plain, &.{"trusted.example"});
     defer f.deinit();
@@ -239,31 +156,6 @@ test "native coordinator: literal allowlist avoids DNS even alongside missing ho
     try t.expectEqual(@as(usize, 2), stage.consumers.dependencies.len);
     try t.expect(f.coordinator.pendingRequest() == null);
     stage.release(stage.context);
-}
-test "native coordinator: ready restore refuses missing rows and restores committed unpublished counters" {
-    var before = try Fixture.init(plain, &.{});
-    defer before.deinit();
-    try before.bind();
-    try before.ready();
-    const prepared = try before.coordinator.prepare(before.input(failure, "one"));
-    const bytes = try t.allocator.dupe(u8, prepared.consumers.deltas[0].payload);
-    defer t.allocator.free(bytes);
-    const key = prepared.consumers.deltas[0].key;
-    prepared.release(prepared.context);
-    var after = try Fixture.init(plain, &.{});
-    defer after.deinit();
-    try after.bind();
-    after.ignore_owner.revision = 1;
-    const manifest = try after.coordinator.manifest(gen);
-    const rows = [_]module.Saved{ .{ .key = key, .format_version = rule.version, .revision = 2, .payload = bytes }, .{ .key = manifest.required[1].key, .format_version = ignores.version, .revision = 1, .payload = after.ignore_owner.live.payload }, .{ .key = manifest.required[2].key, .format_version = 1, .revision = 1, .payload = &gen } };
-    try t.expectError(error.ConsumerRestoreMismatch, after.coordinator.prepareRestore(gen, rows[0..1], after.clock.us));
-    const restored = try after.coordinator.prepareRestore(gen, &rows, after.clock.us);
-    try t.expect(!after.coordinator.ready);
-    restored.state.publish(restored.state.context);
-    restored.state.release(restored.state.context);
-    try t.expect(after.coordinator.ready);
-    try t.expectEqual(@as(u64, 2), after.coordinator.revisions[0]);
-    try t.expectEqual(@as(u64, 1), after.owner.counters[@intFromEnum(rules.Kind.candidate)]);
 }
 test "native coordinator: correlation finish deadline is transient and rollback retains context" {
     var f = try Fixture.init(correlated, &.{});

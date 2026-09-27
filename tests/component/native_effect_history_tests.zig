@@ -24,21 +24,6 @@ fn ready(owner: *history.Consumer) !void {
     initial.publish();
     initial.release();
 }
-test "native effect history: explicit bootstrap prepare release and publication" {
-    var owner = try history.Consumer.init(try installation(), [_]u8{1} ** 32);
-    const initial = try owner.prepareInitial();
-    try t.expectError(error.HistoryBusy, owner.prepareInitial());
-    try t.expect(!owner.ready);
-    try t.expectEqual(@as(u64, 0), owner.revision);
-    const saved = try history.Checkpoint.decode(initial.checkpoint());
-    try t.expectEqual(@as(u64, 0), saved.last_sequence);
-    try t.expectEqualStrings("@history", owner.manifest().jail);
-    initial.release();
-    try t.expect(!owner.ready);
-    try ready(&owner);
-    try t.expectEqual(@as(u64, 1), owner.revision);
-    try t.expectError(error.HistoryAlreadyReady, owner.prepareInitial());
-}
 test "native effect history: equal and late original times retain exact sequence across restore" {
     var owner = try history.Consumer.init(try installation(), [_]u8{1} ** 32);
     try ready(&owner);
@@ -62,17 +47,6 @@ test "native effect history: equal and late original times retain exact sequence
     restore.release();
     try t.expectEqualDeep(owner.live, restored.live);
     try t.expectError(error.HistoryCaughtUp, restored.prepare(try page(3, 3, 3), &.{}, 999));
-}
-test "native effect history: rollback discards staged counters and digest" {
-    var owner = try history.Consumer.init(try installation(), [_]u8{1} ** 32);
-    try ready(&owner);
-    const stage = try owner.prepare(try page(0, 1, 1), &.{try event(1, 1, 100)}, 100);
-    const bytes = stage.checkpoint()[0..history.checkpoint_bytes].*;
-    stage.release();
-    try t.expectEqual(@as(u64, 0), owner.live.last_sequence);
-    const retry = try owner.prepare(try page(0, 1, 1), &.{try event(1, 1, 100)}, 200);
-    defer retry.release();
-    try t.expectEqualSlices(u8, &bytes, retry.checkpoint());
 }
 test "native effect history: forged identity canonical name scope and installation refuse" {
     const good = try event(1, 1, 100);

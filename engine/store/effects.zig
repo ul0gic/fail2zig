@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
+const builtin = @import("builtin");
 const effects = @import("../core/native_effect.zig");
 const detection = @import("../core/native_detection_record.zig");
 const retry = @import("../core/native_retry.zig");
+const action_outcome = @import("../core/native_action_outcome.zig");
+const application_history = @import("../core/native_application_history.zig");
 const store = @import("store.zig");
 const Error = store.Error;
 const Stmt = store.Stmt;
@@ -14,7 +17,7 @@ pub fn Methods(comptime Store: type) type {
         pub fn enableEffects(self: *Store) Error!void {
             try self.beginWrite();
             errdefer self.rollback();
-            const schema = try self.integer("PRAGMA user_version;");
+            const schema = try self.chainSchema();
             if (schema < 10 or schema > latest_schema) return error.UnsupportedSchema;
             if (schema == 10) try self.exec(
                 \\CREATE TABLE effect_installation(singleton INTEGER PRIMARY KEY CHECK(singleton=1),identity BLOB NOT NULL CHECK(typeof(identity)='blob' AND length(identity)=16),backend INTEGER NOT NULL CHECK(typeof(backend)='integer' AND backend BETWEEN 1 AND 3),selector TEXT NOT NULL CHECK(typeof(selector)='text' AND length(selector) BETWEEN 1 AND 256));
@@ -124,6 +127,115 @@ pub fn Methods(comptime Store: type) type {
             try self.exec("UPDATE effect_clock SET revision=revision+1 WHERE singleton=1 AND revision<9223372036854775807;");
             if (self.api.changes(self.db) != 1) return error.EffectCapacity;
         }
+
+        /// Rows a non-terminal writer adds itself; the terminal reserve for every live owner
+        /// afterwards is added by `reserveEffectRows`.
+        pub const ReserveCost = struct {
+            owners: i64 = 0,
+            effects: i64 = 0,
+            revisions: i64 = 0,
+            intents: i64 = 0,
+            observations: i64 = 0,
+            targets: i64 = 0,
+            live_owners: i64 = 0,
+            /// Confirmation markers this writer deletes; their owners become unconfirmed again.
+            retired_markers: i64 = 0,
+        };
+        const observations_per_intent = store.load_repair.observations_per_intent;
+
+        /// Admission keeps room for every live owner to expire or be released and for every
+        /// unconfirmed live owner to confirm, so terminal work never meets a cap. A refusal is
+        /// retryable backpressure: the caller keeps its receipt and nothing is evicted.
+        pub fn reserveEffectRows(self: *Store, own: ReserveCost) Error!void {
+            if (self.schema_version < store.load_repair_schema) return;
+            const live = try self.integer("SELECT live FROM effect_owner_live WHERE id=1;");
+            if (live < 0) return error.LiveOwnerCounterInvalid;
+            const live_after = live + own.live_owners;
+            const unsettled_after = @max(0, live_after - (try self.integer("SELECT count(*) FROM confirmation_markers;") - own.retired_markers));
+            const limits = [_]struct { sql: [:0]const u8, own: i64, reserve: i64, cap: i64 }{
+                .{ .sql = "SELECT count(*) FROM effect_owners;", .own = own.owners, .reserve = 0, .cap = effects.max_owners },
+                .{ .sql = "SELECT count(*) FROM native_effects;", .own = own.effects, .reserve = 0, .cap = effects.max_effects },
+                .{ .sql = "SELECT count(*) FROM effect_owner_revisions;", .own = own.revisions, .reserve = live_after, .cap = effects.max_owner_revisions },
+                .{ .sql = "SELECT count(*) FROM effect_intents;", .own = own.intents, .reserve = live_after, .cap = effects.max_intents },
+                .{ .sql = "SELECT count(*) FROM effect_observations;", .own = own.observations, .reserve = live_after * observations_per_intent, .cap = effects.max_observations },
+                .{ .sql = "SELECT count(*) FROM action_targets;", .own = own.targets, .reserve = 0, .cap = action_outcome.max_rows },
+                .{ .sql = "SELECT count(*) FROM confirmed_effect_events;", .own = 0, .reserve = unsettled_after, .cap = effects.max_confirmed_events },
+                .{ .sql = "SELECT count(*) FROM confirmed_event_details;", .own = 0, .reserve = unsettled_after, .cap = application_history.max_details },
+            };
+            for (limits) |limit| {
+                if (try self.integer(limit.sql) + limit.own + limit.reserve > limit.cap) return error.ReserveBackpressure;
+            }
+        }
+
+        /// `prior_streak` counts the consecutive earlier startups that also found a mismatch;
+        /// a nonzero value means a writer keeps bypassing the counter triggers.
+        pub const LiveOwnerRecount = struct { stored: i64, counted: i64, prior_streak: i64 = 0 };
+        const max_mismatch_streak = 1_000_000;
+        // Trigger text as created by the load-repair migration; any other text is refused.
+        const live_owner_triggers = [_]struct { name: []const u8, sql: []const u8 }{
+            .{ .name = "effect_owner_live_insert", .sql = "CREATE TRIGGER effect_owner_live_insert AFTER INSERT ON effect_owners WHEN NEW.lease_kind<>0 BEGIN UPDATE effect_owner_live SET live=live+1 WHERE id=1; END" },
+            .{ .name = "effect_owner_live_update", .sql = "CREATE TRIGGER effect_owner_live_update AFTER UPDATE OF lease_kind ON effect_owners WHEN (OLD.lease_kind<>0)<>(NEW.lease_kind<>0) BEGIN UPDATE effect_owner_live SET live=live+CASE WHEN NEW.lease_kind<>0 THEN 1 ELSE -1 END WHERE id=1; END" },
+            .{ .name = "effect_owner_live_delete", .sql = "CREATE TRIGGER effect_owner_live_delete AFTER DELETE ON effect_owners WHEN OLD.lease_kind<>0 BEGIN UPDATE effect_owner_live SET live=live-1 WHERE id=1; END" },
+        };
+
+        /// The live-owner counter is derived data: startup recounts it before any reserve
+        /// check and repairs a mismatch. Missing or altered triggers, a missing counter row or
+        /// an owner without its current revision are refused instead.
+        pub fn reconcileLiveOwners(self: *Store) Error!?LiveOwnerRecount {
+            try self.beginAdmissionWrite();
+            errdefer self.rollback();
+            if (self.schema_version < store.load_repair_schema) {
+                try self.commitTransaction();
+                return null;
+            }
+            for (live_owner_triggers) |trigger| {
+                var row = try self.statement("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?1 AND tbl_name='effect_owners';");
+                defer row.deinit();
+                try row.text(1, trigger.name);
+                if (!try row.row() or !std.mem.eql(u8, try row.bytes(0), trigger.sql) or try row.row()) return error.LiveOwnerCounterInvalid;
+            }
+            if (try self.integer("SELECT count(*) FROM effect_owner_live;") != 1) return error.LiveOwnerCounterInvalid;
+            if (try self.integer("SELECT count(*) FROM effect_owners o WHERE NOT EXISTS(SELECT 1 FROM effect_owner_revisions h WHERE h.scope_key=o.scope_key AND h.jail=o.jail AND h.revision=o.revision AND h.decision_id=o.decision_id AND h.lease_kind=o.lease_kind);") != 0) return error.InvalidEffect;
+            const stored = try self.integer("SELECT live FROM effect_owner_live WHERE id=1;");
+            const streak = try self.integer("SELECT mismatch_streak FROM effect_owner_live WHERE id=1;");
+            if (streak < 0) return error.LiveOwnerCounterInvalid;
+            const counted = try self.integer("SELECT count(*) FROM effect_owners WHERE lease_kind<>0;");
+            if (stored == counted) {
+                if (streak != 0) try self.exec("UPDATE effect_owner_live SET mismatch_streak=0 WHERE id=1;");
+                try self.commitTransaction();
+                return null;
+            }
+            // The streak is committed with the repair so a mismatch that returns on the next
+            // startup is recognised as recurring rather than logged as a fresh one-off.
+            var repair = try self.statement("UPDATE effect_owner_live SET live=?1,mismatch_streak=?2 WHERE id=1;");
+            defer repair.deinit();
+            try repair.int(1, counted);
+            try repair.int(2, @min(streak + 1, max_mismatch_streak));
+            try repair.done();
+            if (self.api.changes(self.db) != 1) return error.LiveOwnerCounterInvalid;
+            try self.commitTransaction();
+            return .{ .stored = stored, .counted = counted, .prior_streak = streak };
+        }
+
+        // A decision that stops being its owner's current live decision gives up its
+        // confirmation marker; when it is replaced, its unsettled outcomes become terminal
+        // `superseded` because the runtime only ever drives the current decision.
+        fn retireOwnerDecisionTx(self: *Store, key: effects.Hash, jail: []const u8, replaced: ?effects.Hash, now: i64) Error!void {
+            if (self.schema_version < store.load_repair_schema) return;
+            var marker = try self.statement("DELETE FROM confirmation_markers WHERE scope_key=?1 AND jail=?2;");
+            defer marker.deinit();
+            try marker.blob(1, &key);
+            try marker.text(2, jail);
+            try marker.done();
+            const decision = replaced orelse return;
+            var targets = try self.statement("UPDATE action_targets SET status=7,settled_us=max(coalesce(dispatch_us,intent_us),?4) WHERE action_id=?1 AND scope_key=?2 AND jail=?3 AND status IN(1,2,5);");
+            defer targets.deinit();
+            try targets.blob(1, &decision);
+            try targets.blob(2, &key);
+            try targets.text(3, jail);
+            try targets.int(4, now);
+            try targets.done();
+        }
         fn decodeEffect(self: *Store, row: *Stmt, installation: effects.Installation) Error!effects.Entry {
             const scope_key = try effectBlob(row, 0, 32);
             const scope = try self.decodeStoredScope(row, 1);
@@ -169,7 +281,7 @@ pub fn Methods(comptime Store: type) type {
                 }
             }
             if (!effects.Lease.eql(aggregate, desired)) return error.InvalidEffect;
-            return .{ .installation = installation, .scope = scope, .scope_key = scope_key, .revision = @intCast(effect_revision), .desired = desired, .intent_id = intent_id, .status = status };
+            return .{ .installation = installation, .scope = scope, .scope_key = scope_key, .revision = @intCast(effect_revision), .desired = desired, .intent_id = intent_id, .status = status, .intent_us = created };
         }
         pub fn readEffect(self: *Store, key: effects.Hash, installation: effects.Installation) Error!?effects.Entry {
             var row = try self.statement(if (self.schema_version >= 19)
@@ -328,9 +440,15 @@ pub fn Methods(comptime Store: type) type {
             }
             try self.advanceEffectSnapshot();
             try self.fault(.after_effect_intent);
-            return .{ .installation = installation, .scope = scope, .scope_key = key, .revision = effect_revision, .desired = lease, .intent_id = id, .status = .pending };
+            self.noteEffectChange(key);
+            return .{ .installation = installation, .scope = scope, .scope_key = key, .revision = effect_revision, .desired = lease, .intent_id = id, .status = .pending, .intent_us = now };
         }
         pub fn setOwnerTx(self: *Store, change: effects.OwnerChange, now: i64) Error!effects.Entry {
+            return self.setOwnerReservedTx(change, now, 0);
+        }
+        /// `targets` are the action-target rows the caller adds for this decision in the same
+        /// transaction; they join the reserve check made before any row is written.
+        pub fn setOwnerReservedTx(self: *Store, change: effects.OwnerChange, now: i64, targets: i64) Error!effects.Entry {
             const jail = detection.Name.init(change.jail) catch return error.InvalidEffect;
             if (change.expected_revision >= std.math.maxInt(i64) or change.decided_us > now or (change.lease == .finite and change.lease.finite <= change.decided_us)) return error.InvalidEffect;
             if (change.lease != .absent and !change.lease.live(now)) return error.EffectExpired;
@@ -342,6 +460,7 @@ pub fn Methods(comptime Store: type) type {
             var owners: [effects.max_page]effects.Owner = undefined;
             const count = try self.readOwners(key, &owners);
             var owner_revision: u64 = 0;
+            var replaced: ?effects.Owner = null;
             for (owners[0..count]) |owner| if (std.mem.eql(u8, owner.jail.slice(), jail.slice())) {
                 owner_revision = owner.revision;
                 if (!std.mem.eql(u8, &owner.generation, &change.generation)) return error.EffectGenerationMismatch;
@@ -349,8 +468,31 @@ pub fn Methods(comptime Store: type) type {
                     if (!effects.Lease.eql(owner.lease, change.lease) or owner.decided_us != change.decided_us) return error.InvalidEffect;
                     return previous orelse error.InvalidEffect;
                 }
+                replaced = owner;
             };
             if (owner_revision != change.expected_revision) return error.StaleEffect;
+            const was_live = if (replaced) |owner| owner.lease != .absent else false;
+            const is_live = change.lease != .absent;
+            // Replacing a confirmed live decision retires its marker, so the new decision
+            // needs its own confirmation reserve even though the live count is unchanged.
+            const retired_markers: i64 = if (replaced != null and self.schema_version >= store.load_repair_schema) blk: {
+                var marker = try self.statement("SELECT count(*) FROM confirmation_markers WHERE scope_key=?1 AND jail=?2;");
+                defer marker.deinit();
+                try marker.blob(1, &key);
+                try marker.text(2, change.jail);
+                if (!try marker.row()) return error.InvalidEffect;
+                break :blk try marker.signed(0);
+            } else 0;
+            try self.reserveEffectRows(.{
+                .owners = @intFromBool(replaced == null),
+                .effects = @intFromBool(previous == null),
+                .revisions = 1,
+                .intents = 1,
+                .observations = observations_per_intent,
+                .targets = targets,
+                .live_owners = @as(i64, @intFromBool(is_live)) - @intFromBool(was_live),
+                .retired_markers = retired_markers,
+            });
             if (try self.integer("SELECT count(*) FROM effect_owner_revisions;") >= effects.max_owner_revisions) return error.EffectCapacity;
             if (owner_revision == 0) {
                 if (count == effects.max_page or try self.integer("SELECT count(*) FROM effect_owners;") >= effects.max_owners) return error.EffectCapacity;
@@ -371,6 +513,7 @@ pub fn Methods(comptime Store: type) type {
                 if (self.schema_version >= 19) try row.blob(3, &canonical_wire);
                 try row.done();
             }
+            if (replaced) |owner| try self.retireOwnerDecisionTx(key, change.jail, owner.decision_id, now);
             {
                 var owner = try self.statement("INSERT INTO effect_owners VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(scope_key,jail) DO UPDATE SET decision_id=excluded.decision_id,revision=excluded.revision,lease_kind=excluded.lease_kind,deadline_us=excluded.deadline_us,decided_us=excluded.decided_us;");
                 defer owner.deinit();
@@ -407,6 +550,11 @@ pub fn Methods(comptime Store: type) type {
         }
         const OwnerTransitionTx = struct { entry: effects.Entry, changed: bool };
         pub fn transitionOwnerTx(self: *Store, change: effects.OwnerTransition, now: i64) Error!OwnerTransitionTx {
+            return self.transitionOwnerReservedTx(change, now, true);
+        }
+        /// `reserve` false means the caller already reserved this retain transition, as a
+        /// reload does once for all of a jail's owners.
+        pub fn transitionOwnerReservedTx(self: *Store, change: effects.OwnerTransition, now: i64, reserve: bool) Error!OwnerTransitionTx {
             change.scope.validate() catch return error.InvalidEffect;
             _ = detection.Name.init(change.jail) catch return error.InvalidEffect;
             if (change.expected_owner_revision == 0 or change.expected_owner_revision >= std.math.maxInt(i64) or change.occurred_us > now or std.mem.allEqual(u8, &change.transition_id, 0)) return error.InvalidEffect;
@@ -432,6 +580,12 @@ pub fn Methods(comptime Store: type) type {
             if (owner.revision != change.expected_owner_revision) return error.StaleEffect;
             if (!std.mem.eql(u8, &owner.generation, &change.current_generation)) return error.EffectGenerationMismatch;
             if (owner.lease == .absent) return error.StaleEffect;
+            switch (change.mode) {
+                // A retained decision stays live and keeps its marker; release is terminal and
+                // draws on the reserve the admission kept for it.
+                .retain => if (reserve) try self.reserveEffectRows(.{ .revisions = 1, .intents = 1, .observations = observations_per_intent }),
+                .release => try self.retireOwnerDecisionTx(key, change.jail, null, now),
+            }
             if (try self.integer("SELECT count(*) FROM effect_owner_revisions;") >= effects.max_owner_revisions) return error.EffectCapacity;
             const effect_revision = std.math.add(u64, prior.revision, 1) catch return error.EffectCapacity;
             if (effect_revision > std.math.maxInt(i64)) return error.EffectCapacity;
@@ -493,7 +647,33 @@ pub fn Methods(comptime Store: type) type {
             if (entry.revision != token.revision or !std.mem.eql(u8, &entry.intent_id, &token.intent_id)) return error.StaleEffect;
             return entry;
         }
-        pub fn markDispatched(self: *Store, token: effects.Token, clock: effects.Clock) Error!void {
+        /// Marks the intent and the current decisions' action targets dispatched at
+        /// `dispatch_us` inside the caller's transaction. Nothing commits this on its own:
+        /// the outcome commit carries the dispatch time with its observation, so an attempt
+        /// whose outcome is never observed leaves the durable intent `pending`.
+        fn markDispatchedTx(self: *Store, token: effects.Token, dispatch_us: i64) Error!void {
+            var row = try self.statement("UPDATE effect_intents SET status=2,dispatch_us=?2,observed_us=NULL,fingerprint=NULL WHERE intent_id=?1 AND status=1;");
+            defer row.deinit();
+            try row.blob(1, &token.intent_id);
+            try row.int(2, dispatch_us);
+            try row.done();
+            if (self.api.changes(self.db) != 1) return error.StaleEffect;
+            try self.markActionTargetsTx(token.scope_key, dispatch_us);
+        }
+        /// The current decisions' pending or uncertain action targets move with the
+        /// intent's attempt, so one settlement can settle them all.
+        fn markActionTargetsTx(self: *Store, scope_key: effects.Hash, dispatch_us: i64) Error!void {
+            if (self.schema_version < 21) return;
+            var targets = try self.statement("UPDATE action_targets SET status=2,dispatch_us=?2,settled_us=NULL WHERE scope_key=?1 AND status IN(1,5) AND action_id IN (SELECT decision_id FROM effect_owners WHERE scope_key=?1);");
+            defer targets.deinit();
+            try targets.blob(1, &scope_key);
+            try targets.int(2, dispatch_us);
+            try targets.done();
+        }
+        /// Test-only. Commits the durable `dispatched` intent state that earlier releases
+        /// wrote before every mutation, so recovery cases can start from such rows.
+        pub fn dispatchedForTest(self: *Store, token: effects.Token, dispatch_us: i64, clock: effects.Clock) Error!void {
+            if (!builtin.is_test) @compileError("dispatchedForTest is test-only");
             try self.beginWrite();
             errdefer self.rollback();
             const entry = try self.checkedEffectToken(token);
@@ -501,30 +681,37 @@ pub fn Methods(comptime Store: type) type {
             if (entry.status != .pending) return error.StaleEffect;
             const now = try self.effectClock(clock);
             if (entry.desired == .finite and !entry.desired.live(now)) return error.EffectExpired;
-            var row = try self.statement("UPDATE effect_intents SET status=2,dispatch_us=?2,observed_us=NULL,fingerprint=NULL WHERE intent_id=?1 AND status=1;");
-            defer row.deinit();
-            try row.blob(1, &token.intent_id);
-            try row.int(2, now);
-            try row.done();
-            if (self.api.changes(self.db) != 1) return error.StaleEffect;
+            try self.markDispatchedTx(token, dispatch_us);
             try self.advanceEffectSnapshot();
-            try self.fault(.before_effect_dispatch_commit);
+            self.noteEffectChange(token.scope_key);
             const final = try self.commitEffectClock(clock);
             if (entry.desired == .finite and !entry.desired.live(final)) return error.EffectExpired;
             try self.commitEffectTransaction(true);
         }
-        pub fn settleVerified(self: *Store, token: effects.Token, observation: effects.Observation, clock: effects.Clock) Error!effects.Settlement {
-            if (observation.qualification != .complete_owned or !std.mem.eql(u8, &observation.installation, &token.installation) or !std.mem.eql(u8, &observation.scope_key, &token.scope_key)) return error.IncompleteEffectObservation;
-            try self.beginWrite();
-            errdefer self.rollback();
+        const SettledIntent = struct { entry: effects.Entry, status: effects.Status, settlement: effects.Settlement };
+        /// One intent's settlement from an observation, inside the caller's transaction.
+        /// A `pending` intent records `dispatch_us` here. A row an earlier release left
+        /// `dispatched`, or a settled row being re-verified, keeps its stored dispatch time
+        /// and the argument is ignored; ordering is always checked against the recorded value.
+        fn settleTx(self: *Store, token: effects.Token, dispatch_us: i64, observation: effects.Observation, clock: effects.Clock) Error!SettledIntent {
             const entry = try self.checkedEffectToken(token);
-            if (entry.status != .dispatched and entry.status != .applied and entry.status != .absent and entry.status != .expired) return error.StaleEffect;
+            switch (entry.status) {
+                .pending => {
+                    try self.markDispatchedTx(token, dispatch_us);
+                    try self.fault(.before_effect_dispatch_commit);
+                },
+                .dispatched, .applied, .absent, .expired => {},
+                .superseded => return error.StaleEffect,
+            }
+            self.noteEffectChange(token.scope_key);
             const now = try self.effectClock(clock);
             if (observation.observed_us > now) return error.InvalidEffect;
             var dispatch = try self.statement("SELECT dispatch_us,observed_us,fingerprint FROM effect_intents WHERE intent_id=?1;");
             defer dispatch.deinit();
             try dispatch.blob(1, &token.intent_id);
-            if (!try dispatch.row() or observation.observed_us < (try dispatch.optionalSigned(0) orelse return error.InvalidEffect)) return error.InvalidEffect;
+            if (!try dispatch.row()) return error.InvalidEffect;
+            const dispatch_time = try dispatch.optionalSigned(0) orelse return error.InvalidEffect;
+            if (observation.observed_us < dispatch_time) return error.InvalidEffect;
             const previous_observed = try dispatch.optionalSigned(1);
             if (previous_observed) |previous| {
                 if (observation.observed_us < previous) return error.StaleEffect;
@@ -535,7 +722,6 @@ pub fn Methods(comptime Store: type) type {
             const status: effects.Status = if (expired) .expired else if (!matches) .pending else if (entry.desired == .absent) .absent else .applied;
             if (previous_observed != null and observation.observed_us == previous_observed.? and status != entry.status) return error.StaleEffect;
             var stamps: [16]u8 = undefined;
-            const dispatch_time = (try dispatch.optionalSigned(0)).?;
             std.mem.writeInt(i64, stamps[0..8], dispatch_time, .little);
             std.mem.writeInt(i64, stamps[8..16], observation.observed_us, .little);
             var observed_state: [10]u8 = [_]u8{0} ** 10;
@@ -566,6 +752,15 @@ pub fn Methods(comptime Store: type) type {
                     try receipt.done();
                 }
             }
+            if (self.schema_version >= store.load_repair_schema) {
+                // Re-settlement of one intent keeps only its newest observations, bounding
+                // the per-transition cost the admission reserve counts.
+                var trim = try self.statement("DELETE FROM effect_observations WHERE intent_id=?1 AND rowid NOT IN (SELECT rowid FROM effect_observations INDEXED BY effect_observations_intent WHERE intent_id=?1 ORDER BY observed_us DESC,rowid DESC LIMIT ?2);");
+                defer trim.deinit();
+                try trim.blob(1, &token.intent_id);
+                try trim.int(2, observations_per_intent);
+                try trim.done();
+            }
             var row = try self.statement("UPDATE effect_intents SET status=?2,observed_us=?3,fingerprint=?4 WHERE intent_id=?1;");
             defer row.deinit();
             try row.blob(1, &token.intent_id);
@@ -573,7 +768,16 @@ pub fn Methods(comptime Store: type) type {
             try row.int(3, observation.observed_us);
             try row.blob(4, &observation.fingerprint);
             try row.done();
-            if (status == .applied) {
+            // Targets an earlier release left unsettled on an already settled scope join
+            // this settlement the way a dispatch would take them, so its outcome settles them.
+            if (entry.status != .pending) try self.markActionTargetsTx(token.scope_key, dispatch_time);
+            if (status == .applied and self.schema_version >= store.load_repair_schema) {
+                var owners: [effects.max_page]effects.Owner = undefined;
+                const count = try self.readOwners(token.scope_key, &owners);
+                for (owners[0..count]) |owner| if (owner.lease.live(now)) {
+                    try self.confirmOwnerTx(token, owner, observation.observed_us);
+                };
+            } else if (status == .applied) {
                 var owners: [effects.max_page]effects.Owner = undefined;
                 const count = try self.readOwners(token.scope_key, &owners);
                 for (owners[0..count]) |owner| if (owner.lease.live(now)) {
@@ -623,21 +827,156 @@ pub fn Methods(comptime Store: type) type {
                     }
                 };
             }
+            // The confirmation proof above is what lets the enforcement targets settle.
+            if (status == .applied) _ = try self.settleActionTargetsTx(token.scope_key, now);
+            return .{ .entry = entry, .status = status, .settlement = if (expired) .expired else if (matches) .verified else .retry_same_intent };
+        }
+        /// Settles one intent from a readback in a single commit: dispatch time, observation
+        /// receipt, intent status, owner confirmation and the action targets' settlement.
+        pub fn settleOutcome(self: *Store, token: effects.Token, dispatch_us: i64, observation: effects.Observation, clock: effects.Clock) Error!effects.Settlement {
+            if (observation.qualification != .complete_owned or !std.mem.eql(u8, &observation.installation, &token.installation) or !std.mem.eql(u8, &observation.scope_key, &token.scope_key)) return error.IncompleteEffectObservation;
+            try self.beginWrite();
+            errdefer self.rollback();
+            const settled = try self.settleTx(token, dispatch_us, observation, clock);
             try self.advanceEffectSnapshot();
             try self.fault(.before_effect_receipt_commit);
             const final = try self.commitEffectClock(clock);
-            if (status == .applied and entry.desired == .finite and !entry.desired.live(final)) return error.EffectExpired;
+            if (settled.status == .applied and settled.entry.desired == .finite and !settled.entry.desired.live(final)) return error.EffectExpired;
             try self.commitEffectTransaction(true);
-            return if (expired) .expired else if (matches) .verified else .retry_same_intent;
+            return settled.settlement;
         }
+        /// Settles up to `max_expiry_batch` prepared removals (desired `absent`) that one
+        /// readback at `observed_us` proved absent, in one commit. A prepared removal has no
+        /// dispatch of its own, so the readback time is recorded as its dispatch time. Every
+        /// token keeps its identity, status and ordering checks and its receipt; one stale
+        /// token fails the batch and the rollback leaves all of them unsettled. Returns the
+        /// number settled.
+        pub fn settleExpired(self: *Store, tokens: []const effects.Token, fingerprint: effects.Hash, observed_us: i64, clock: effects.Clock) Error!usize {
+            if (tokens.len == 0 or tokens.len > max_expiry_batch) return error.InvalidEffect;
+            try self.beginWrite();
+            errdefer self.rollback();
+            for (tokens) |token| {
+                const observation = effects.Observation{ .installation = token.installation, .scope_key = token.scope_key, .fingerprint = fingerprint, .observed_us = observed_us, .qualification = .complete_owned, .state = .absent };
+                const settled = try self.settleTx(token, observed_us, observation, clock);
+                if (settled.entry.desired != .absent or settled.settlement != .verified) return error.InvalidEffect;
+            }
+            try self.advanceEffectSnapshot();
+            try self.fault(.before_effect_receipt_commit);
+            _ = try self.commitEffectClock(clock);
+            try self.commitEffectTransaction(true);
+            return tokens.len;
+        }
+        /// Records one owner decision's confirmation once. The marker, not the event row, is
+        /// the deduplication key, so pruning the event never lets the same decision count or
+        /// append again. An event without a marker (a decision confirmed before, retired and
+        /// reinstated) gains only the marker.
+        fn confirmOwnerTx(self: *Store, token: effects.Token, owner: effects.Owner, observed_us: i64) Error!void {
+            const jail = owner.jail.slice();
+            const event_id = effects.hashParts("fail2zig-native-confirmed-owner-v1", &.{ &token.installation, &token.scope_key, jail, &owner.decision_id });
+            {
+                var marker = try self.statement("SELECT decision_id,event_id FROM confirmation_markers WHERE scope_key=?1 AND jail=?2;");
+                defer marker.deinit();
+                try marker.blob(1, &token.scope_key);
+                try marker.text(2, jail);
+                if (try marker.row()) {
+                    if (!std.mem.eql(u8, &try effectBlob(&marker, 0, 32), &owner.decision_id) or !std.mem.eql(u8, &try effectBlob(&marker, 1, 32), &event_id)) return error.InvalidEffect;
+                    return;
+                }
+            }
+            var retained = try self.statement("SELECT event_id FROM confirmed_effect_events WHERE scope_key=?1 AND jail=?2 AND decision_id=?3;");
+            defer retained.deinit();
+            try retained.blob(1, &token.scope_key);
+            try retained.text(2, jail);
+            try retained.blob(3, &owner.decision_id);
+            const already_confirmed = try retained.row();
+            if (already_confirmed and !std.mem.eql(u8, &event_id, &try effectBlob(&retained, 0, 32))) return error.InvalidEffect;
+            if (!already_confirmed) {
+                if (try self.integer("SELECT count(*) FROM confirmed_effect_events;") >= effects.max_confirmed_events) return error.EffectCapacity;
+                {
+                    var event = try self.statement("INSERT INTO confirmed_effect_events(event_id,scope_key,jail,decision_id,confirmed_us,canonical_scope) SELECT ?1,scope_key,?3,?4,?5,canonical_scope FROM native_effects WHERE scope_key=?2;");
+                    defer event.deinit();
+                    try event.blob(1, &event_id);
+                    try event.blob(2, &token.scope_key);
+                    try event.text(3, jail);
+                    try event.blob(4, &owner.decision_id);
+                    try event.int(5, observed_us);
+                    try event.done();
+                    if (self.api.changes(self.db) != 1) return error.InvalidEffect;
+                }
+                var sequence: i64 = undefined;
+                {
+                    var head = try self.statement("SELECT h.head,s.event_id FROM confirmed_history_stream h JOIN confirmed_history_sequence s ON s.sequence=h.head WHERE h.id=1;");
+                    defer head.deinit();
+                    if (!try head.row() or !std.mem.eql(u8, &try effectBlob(&head, 1, 32), &event_id)) return error.HistoryGap;
+                    sequence = try head.signed(0);
+                }
+                var detail = try self.statement("INSERT INTO confirmed_event_details(event_id,source,occurrence,decided_us,ordinal,evidence,family,subject,sequence,confirmed_us,evidence_bytes) SELECT ?1,source,occurrence,decided_us,ordinal,evidence,family,subject,?4,?5,CASE WHEN evidence IS NULL THEN NULL ELSE length(CAST(evidence AS BLOB)) END FROM retry_decision_details WHERE jail=?2 AND effect_decision_id=?3 RETURNING family,subject,evidence_bytes;");
+                defer detail.deinit();
+                try detail.blob(1, &event_id);
+                try detail.text(2, jail);
+                try detail.blob(3, &owner.decision_id);
+                try detail.int(4, sequence);
+                try detail.int(5, observed_us);
+                if (try detail.row()) {
+                    var subject: [16]u8 = undefined;
+                    const stored = try detail.boundedBytes(1, subject.len);
+                    @memcpy(subject[0..stored.len], stored);
+                    const family = try detail.signed(0);
+                    const bytes = try detail.optionalSigned(2);
+                    if (try detail.row()) return error.InvalidApplicationHistoryRow;
+                    try self.retainDetailTx(family, subject[0..stored.len], bytes, sequence);
+                    var summary = try self.statement("INSERT INTO confirmed_policy_summaries(jail,family,subject,confirmed_count,latest_confirmed_us) SELECT jail,family,subject,1,?3 FROM retry_decision_details WHERE jail=?1 AND effect_decision_id=?2 ON CONFLICT(jail,family,subject) DO UPDATE SET confirmed_count=confirmed_count+1,latest_confirmed_us=max(latest_confirmed_us,excluded.latest_confirmed_us);");
+                    defer summary.deinit();
+                    try summary.text(1, jail);
+                    try summary.blob(2, &owner.decision_id);
+                    try summary.int(3, observed_us);
+                    try summary.done();
+                    if (self.api.changes(self.db) != 1) return error.InvalidRetryState;
+                }
+            }
+            var marker = try self.statement("INSERT INTO confirmation_markers VALUES(?1,?2,?3,?4);");
+            defer marker.deinit();
+            try marker.blob(1, &token.scope_key);
+            try marker.text(2, jail);
+            try marker.blob(3, &owner.decision_id);
+            try marker.blob(4, &event_id);
+            try marker.done();
+        }
+        pub const ExpiryItem = struct { key: effects.Hash, revision: u64 };
+        pub const max_expiry_batch = store.Store.attribution_batch;
         pub fn prepareExpiry(self: *Store, key: effects.Hash, expected_revision: u64, clock: effects.Clock) Error!effects.Entry {
             try self.beginWrite();
             errdefer self.rollback();
             const installation = try self.readInstallation() orelse return error.InstallationRequired;
+            const now = try self.effectClock(clock);
+            const prepared = try self.prepareExpiryTx(installation, key, expected_revision, now);
+            _ = try self.commitEffectClock(clock);
+            try self.commitEffectTransaction(prepared.expired != 0);
+            return prepared.entry;
+        }
+        /// Prepares up to `max_expiry_batch` expired scopes in one commit. Every scope keeps
+        /// its own token/revision, owner-retirement and capacity checks; one stale item fails
+        /// the batch and the rollback leaves all of them unprepared. Returns how many scopes
+        /// had an expired owner.
+        pub fn prepareExpiries(self: *Store, items: []const ExpiryItem, clock: effects.Clock) Error!usize {
+            if (items.len == 0 or items.len > max_expiry_batch) return error.InvalidEffect;
+            try self.beginWrite();
+            errdefer self.rollback();
+            const installation = try self.readInstallation() orelse return error.InstallationRequired;
+            const now = try self.effectClock(clock);
+            var expired_scopes: usize = 0;
+            for (items) |item| {
+                if ((try self.prepareExpiryTx(installation, item.key, item.revision, now)).expired != 0) expired_scopes += 1;
+            }
+            _ = try self.commitEffectClock(clock);
+            try self.commitEffectTransaction(expired_scopes != 0);
+            return expired_scopes;
+        }
+        fn prepareExpiryTx(self: *Store, installation: effects.Installation, key: effects.Hash, expected_revision: u64, now: i64) Error!struct { entry: effects.Entry, expired: u64 } {
             const prior = try self.readEffect(key, installation) orelse return error.StaleEffect;
             if (prior.revision != expected_revision) return error.StaleEffect;
             if (prior.status == .dispatched) return error.EffectReconciliationRequired;
-            const now = try self.effectClock(clock);
+            self.noteEffectChange(key);
             var owners: [effects.max_page]effects.Owner = undefined;
             const count = try self.readOwners(key, &owners);
             var expired: u64 = 0;
@@ -648,6 +987,7 @@ pub fn Methods(comptime Store: type) type {
             if (try self.integer("SELECT count(*) FROM effect_owner_revisions;") > effects.max_owner_revisions - expiring_count) return error.EffectCapacity;
             for (owners[0..count]) |owner| if (owner.lease == .finite and !owner.lease.live(now)) {
                 if (owner.revision == std.math.maxInt(i64)) return error.EffectCapacity;
+                try self.retireOwnerDecisionTx(key, owner.jail.slice(), null, now);
                 var row = try self.statement("UPDATE effect_owners SET lease_kind=0,deadline_us=NULL,revision=revision+1 WHERE scope_key=?1 AND jail=?2;");
                 defer row.deinit();
                 try row.blob(1, &key);
@@ -661,9 +1001,7 @@ pub fn Methods(comptime Store: type) type {
                 if (effect_revision > std.math.maxInt(i64)) return error.EffectCapacity;
                 entry = try self.replaceEffectIntent(installation, prior.scope, key, effect_revision, prior.intent_id, now);
             }
-            _ = try self.commitEffectClock(clock);
-            try self.commitEffectTransaction(expired != 0);
-            return entry;
+            return .{ .entry = entry, .expired = expired };
         }
         pub fn confirmedEffectEvents(self: *Store) Error!u64 {
             const count = try self.integer("SELECT count(*) FROM confirmed_effect_events;");

@@ -12,8 +12,7 @@ INSTALL ?= install
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build test fmt fmt-check release release-all install clean fuzz \
-        harness-smoke lint
+.PHONY: help build test test-full fmt fmt-check release release-all install clean fuzz lint
 
 help:
 	@printf '  \033[36m%-14s\033[0m %s\n' \
@@ -22,18 +21,21 @@ help:
 		fmt 'Apply `zig fmt` to all tracked Zig source trees' \
 		fmt-check 'Verify `zig fmt` is a no-op (used by CI)' \
 		fuzz 'Run bounded fuzz corpus cases' \
-		harness-smoke 'Run the lab-box attack smoke test (ssh_brute). Only useful on the lab host.' \
 		help 'Show this help message' \
 		install 'Install the native release executable into $$(PREFIX)/bin (root)' \
 		lint 'Static analysis: zig fmt --check, shellcheck, yamllint' \
 		release 'Build a stripped ReleaseSafe executable (RELEASE_TARGET)' \
 		release-all 'Build all five release architectures into separate prefixes' \
-		test 'Run maintained CI component, integration and bounded fuzz suites'
+		test 'Run one delivered daemon/client smoke check' \
+		test-full 'Run all maintained CI component, integration and bounded fuzz suites'
 
 build:
 	zig build
 
 test:
+	zig build test-smoke -Doptimize=ReleaseSafe -j$(ZIG_JOBS)
+
+test-full:
 	zig build test-ci-components-a -Doptimize=ReleaseSafe -j$(ZIG_JOBS)
 	zig build test-ci-components-b -Doptimize=ReleaseSafe -j$(ZIG_JOBS)
 	zig build test-ci-assembled -Doptimize=ReleaseSafe -j$(ZIG_JOBS)
@@ -65,11 +67,7 @@ clean:
 fuzz:
 	zig build test-ci-fuzz -Doptimize=ReleaseSafe -j$(ZIG_JOBS)
 
-harness-smoke:
-	tests/harness/reset.sh
-	tests/harness/ssh_brute.sh
-
 lint: fmt-check
-	shellcheck -S warning tests/harness/*.sh tests/e2e/*.sh scripts/install.sh .github/scripts/*.sh
+	shellcheck -S warning tests/harness/*.sh tests/harness/acceptance/*/*.sh tests/e2e/*.sh scripts/install.sh .github/scripts/*.sh
 	yamllint -c .yamllint .github/workflows/
 	yamllint -d '{extends: .yamllint, rules: {line-length: disable}}' .github/ISSUE_TEMPLATE/

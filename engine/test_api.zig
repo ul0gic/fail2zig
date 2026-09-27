@@ -2,7 +2,11 @@
 // Copyright (c) 2026 fail2zig maintainers
 // Direct internal imports for isolated component test modules. Not used by the product.
 pub const cli = struct {
+    pub const repair_source = @import("cli/repair_source.zig");
     pub const rule_test = @import("cli/rule_test.zig");
+};
+pub const store = struct {
+    pub const source_repair = @import("store/source_repair.zig");
 };
 pub const config = struct {
     pub const duration = @import("config/duration.zig");
@@ -21,7 +25,6 @@ pub const core = struct {
     pub const event_loop = @import("core/event_loop.zig");
     pub const event_time = @import("core/event_time.zig");
     pub const journal_policy = @import("core/journal_policy.zig");
-    pub const journald_source = @import("core/journald_source.zig");
     pub const line_context = @import("core/line_context.zig");
     pub const log_target = @import("core/log_target.zig");
     pub const native_action_context = @import("core/native_action_context.zig");

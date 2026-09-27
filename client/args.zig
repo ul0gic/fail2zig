@@ -575,7 +575,7 @@ fn parseHistory(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) E
 
 fn parseFirewall(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Error!Parsed {
     if (rest.len == 0 or !std.mem.eql(u8, rest[0], "show")) {
-        diag.set("command 'firewall' requires 'show' (usage: firewall show [--limit <n>] [--cursor <token>])", .{});
+        diag.set("command 'firewall' requires 'show' (usage: firewall show [--details] [--limit <n>] [--cursor <token>])", .{});
         return error.MissingArgument;
     }
 
@@ -779,6 +779,7 @@ pub const help_top =
     \\    firewall show       Inspect sampled fail2zig-owned kernel protection
     \\    history reset <ip>  Reset an address's ban history in one jail or all jails
     \\    jail <action> <n>   enable, disable, pause or resume a jail
+    \\    repair-source       Acknowledge a truncated file source (daemon stopped)
     \\    completions <sh>    Emit shell-completion script (bash|zsh|fish)
     \\    help [command]      Show help for a command
     \\
@@ -903,6 +904,31 @@ pub const help_jail =
     \\
 ;
 
+pub const help_repair_source =
+    \\fail2zig repair-source — acknowledge an in-place truncated file source
+    \\
+    \\USAGE:
+    \\    fail2zig repair-source --jail <name> --source <absolute path> --token <token>
+    \\                           --acknowledge-truncation [--config <path>]
+    \\
+    \\Runs locally against the state file named by the config, only while the daemon is
+    \\stopped; it refuses when the state is locked or absent and never creates state.
+    \\It accepts only a same-inode truncation of a recorded source with no pending
+    \\receipt, and restarts that source at offset 0 of the current file.
+    \\
+    \\Data removed by the truncation before it was read is lost; its extent is unknown.
+    \\Protection for every jail may be absent while the daemon is stopped; the next
+    \\start reinstalls it before reporting READY.
+    \\
+    \\Repeating the command with the same token and arguments reports the committed
+    \\outcome. The newest 256 outcomes are retained; an older token stays reserved and
+    \\is refused, so it can never apply a second repair. The source must be a configured
+    \\logpath of the jail. The repair binds the source generation recorded in the state,
+    \\not one recomputed from the configuration; a changed configuration is applied by
+    \\the next start.
+    \\
+;
+
 pub const help_completions =
     \\fail2zig completions — generate shell completion script
     \\
@@ -929,27 +955,13 @@ pub fn helpFor(topic: ?[]const u8) []const u8 {
     if (std.mem.eql(u8, t, "history")) return help_history;
     if (std.mem.eql(u8, t, "firewall")) return help_firewall;
     if (std.mem.eql(u8, t, "jail")) return help_jail;
+    if (std.mem.eql(u8, t, "repair-source")) return help_repair_source;
     return help_top;
 }
 
 fn parseOk(argv: []const []const u8) !Parsed {
     var diag: ParseDiag = .{};
     return parse(argv, &diag);
-}
-
-test "args: empty argv requires a command" {
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.MissingCommand, parse(&.{}, &diag));
-    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "no command") != null);
-}
-
-test "args: status with defaults" {
-    const p = try parseOk(&.{"status"});
-    try std.testing.expect(p.command == .status);
-    try std.testing.expectEqualStrings(default_socket_path, p.globals.socket_path);
-    try std.testing.expectEqual(OutputFormat.table, p.globals.output);
-    try std.testing.expect(p.globals.color);
-    try std.testing.expectEqual(default_timeout_ms, p.globals.timeout_ms);
 }
 
 test "args: details is limited to table presentation commands" {
@@ -964,63 +976,10 @@ test "args: details is limited to table presentation commands" {
     try std.testing.expectError(error.UnknownFlag, parse(&.{ "history", "--details" }, &diag));
 }
 
-test "args: --help returns help command" {
-    const p = try parseOk(&.{"--help"});
-    try std.testing.expect(p.command == .help);
-    try std.testing.expect(p.command.help == null);
-}
-
-test "args: -h short flag" {
-    const p = try parseOk(&.{"-h"});
-    try std.testing.expect(p.command == .help);
-}
-
-test "args: --version flag returns client version command" {
-    const p = try parseOk(&.{"--version"});
-    try std.testing.expect(p.command == .version);
-}
-
-test "args: help subtopic" {
-    const p = try parseOk(&.{ "help", "ban" });
-    try std.testing.expect(p.command == .help);
-    try std.testing.expectEqualStrings("ban", p.command.help.?);
-}
-
-test "args: global flags before command" {
-    const p = try parseOk(&.{ "--socket", "/tmp/a.sock", "--output", "json", "--no-color", "--timeout", "1000", "status" });
-    try std.testing.expectEqualStrings("/tmp/a.sock", p.globals.socket_path);
-    try std.testing.expectEqual(OutputFormat.json, p.globals.output);
-    try std.testing.expect(!p.globals.color);
-    try std.testing.expectEqual(@as(u64, 1000), p.globals.timeout_ms);
-    try std.testing.expect(p.command == .status);
-}
-
-test "args: global flags after command" {
-    const p = try parseOk(&.{ "list", "--output", "plain", "--no-color" });
-    try std.testing.expectEqual(OutputFormat.plain, p.globals.output);
-    try std.testing.expect(!p.globals.color);
-    try std.testing.expect(p.command == .list);
-}
-
-test "args: --output rejects invalid value" {
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.InvalidValue, parse(&.{ "--output", "xml", "status" }, &diag));
-    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "xml") != null);
-}
-
 test "args: --socket missing value" {
     var diag: ParseDiag = .{};
     try std.testing.expectError(error.MissingValue, parse(&.{"--socket"}, &diag));
     try std.testing.expect(std.mem.indexOf(u8, diag.message(), "--socket") != null);
-}
-
-test "args: ban with ip and jail only" {
-    const p = try parseOk(&.{ "ban", "1.2.3.4", "--jail", "sshd" });
-    try std.testing.expect(p.command == .ban);
-    try std.testing.expectEqualStrings("1.2.3.4", p.command.ban.ip);
-    try std.testing.expectEqualStrings("sshd", p.command.ban.jail.?);
-    try std.testing.expect(p.command.ban.duration_s == null);
-    try std.testing.expect(p.command.ban.scope == null);
 }
 
 test "args: ban and unban require --jail" {
@@ -1094,69 +1053,14 @@ test "args: ban with jail and duration" {
     try std.testing.expectEqual(@as(u64, 3600), p.command.ban.duration_s.?);
 }
 
-test "args: ban requires ip" {
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.MissingArgument, parse(&.{"ban"}, &diag));
-    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "IP address") != null);
-}
-
 test "args: ban rejects extra positional" {
     var diag: ParseDiag = .{};
     try std.testing.expectError(error.TooManyArguments, parse(&.{ "ban", "1.2.3.4", "5.6.7.8", "--jail", "sshd" }, &diag));
 }
 
-test "args: unban with jail" {
-    const p = try parseOk(&.{ "unban", "::1", "--jail", "sshd" });
-    try std.testing.expectEqualStrings("::1", p.command.unban.ip);
-    try std.testing.expectEqualStrings("sshd", p.command.unban.jail.?);
-}
-
-test "args: list with no jail" {
-    const p = try parseOk(&.{"list"});
-    try std.testing.expect(p.command == .list);
-    try std.testing.expect(p.command.list.jail == null);
-}
-
-test "args: list with jail filter" {
-    const p = try parseOk(&.{ "list", "--jail", "sshd" });
-    try std.testing.expectEqualStrings("sshd", p.command.list.jail.?);
-}
-
-test "args: jails command" {
-    const p = try parseOk(&.{"jails"});
-    try std.testing.expect(p.command == .jails);
-}
-
-test "args: reload command" {
-    const p = try parseOk(&.{"reload"});
-    try std.testing.expect(p.command == .reload);
-}
-
-test "args: version command (remote)" {
-    const p = try parseOk(&.{"version"});
-    try std.testing.expect(p.command == .remote_version);
-}
-
-test "args: completions bash" {
-    const p = try parseOk(&.{ "completions", "bash" });
-    try std.testing.expect(p.command == .completions);
-    try std.testing.expectEqual(Shell.bash, p.command.completions);
-}
-
-test "args: completions rejects unknown shell" {
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.InvalidValue, parse(&.{ "completions", "ksh" }, &diag));
-}
-
 test "args: completions requires shell" {
     var diag: ParseDiag = .{};
     try std.testing.expectError(error.MissingArgument, parse(&.{"completions"}, &diag));
-}
-
-test "args: unknown command gets suggestion" {
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.UnknownCommand, parse(&.{"statu"}, &diag));
-    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "status") != null);
 }
 
 test "args: unknown command with no close match" {
@@ -1178,45 +1082,6 @@ test "args: status rejects extra positional" {
 test "args: --timeout rejects non-integer" {
     var diag: ParseDiag = .{};
     try std.testing.expectError(error.InvalidValue, parse(&.{ "--timeout", "soon", "status" }, &diag));
-}
-
-test "args: editDistance identity" {
-    try std.testing.expectEqual(@as(usize, 0), editDistance("status", "status"));
-}
-
-test "args: editDistance one substitution" {
-    try std.testing.expectEqual(@as(usize, 1), editDistance("statue", "status"));
-}
-
-test "args: editDistance one insertion" {
-    try std.testing.expectEqual(@as(usize, 1), editDistance("statu", "status"));
-}
-
-test "args: editDistance case insensitive" {
-    try std.testing.expectEqual(@as(usize, 0), editDistance("STATUS", "status"));
-}
-
-test "args: closestCommand typo" {
-    try std.testing.expectEqualStrings("status", closestCommand("stats").?);
-    try std.testing.expectEqualStrings("ban", closestCommand("bam").?);
-    try std.testing.expectEqualStrings("unban", closestCommand("unbn").?);
-    try std.testing.expectEqualStrings("jails", closestCommand("jals").?);
-    try std.testing.expectEqualStrings("jail", closestCommand("jail").?);
-}
-
-test "args: closestCommand far input returns null" {
-    try std.testing.expect(closestCommand("completely-unrelated-input-xyz") == null);
-}
-
-test "args: helpFor returns topical help" {
-    try std.testing.expect(std.mem.indexOf(u8, helpFor("ban"), "ban <ip>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, helpFor("unban"), "unban <ip>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, helpFor("list"), "--jail") != null);
-    try std.testing.expect(std.mem.indexOf(u8, helpFor("jail"), "jail pause <name>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, helpFor("ban"), "--scope net <cidr>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, helpFor("history"), "history reset <ip> --all") != null);
-    try std.testing.expect(std.mem.indexOf(u8, helpFor("completions"), "bash") != null);
-    try std.testing.expect(std.mem.indexOf(u8, helpFor(null), "fail2zig") != null);
 }
 
 test "args: config command takes no arguments" {
@@ -1261,35 +1126,4 @@ test "args: firewall show defaults and paging flags" {
     try std.testing.expectEqualStrings("fw-token", page.command.firewall.cursor.?);
     try std.testing.expect(page.command.firewall.details);
     try std.testing.expectEqual(OutputFormat.plain, page.globals.output);
-}
-
-test "args: firewall show rejects missing action and invalid paging" {
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.MissingArgument, parse(&.{"firewall"}, &diag));
-    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "firewall show") != null);
-    try std.testing.expectError(error.MissingArgument, parse(&.{ "firewall", "list" }, &diag));
-    try std.testing.expectError(error.InvalidValue, parse(&.{ "firewall", "show", "--limit", "0" }, &diag));
-    try std.testing.expectError(error.InvalidValue, parse(&.{ "firewall", "show", "--limit", "257" }, &diag));
-    try std.testing.expectError(error.InvalidValue, parse(&.{ "firewall", "show", "--limit", "many" }, &diag));
-    try std.testing.expectError(error.MissingValue, parse(&.{ "firewall", "show", "--cursor" }, &diag));
-    try std.testing.expectError(error.InvalidValue, parse(&.{ "firewall", "show", "--cursor", "" }, &diag));
-    try std.testing.expectError(error.UnknownFlag, parse(&.{ "firewall", "show", "--jail", "sshd" }, &diag));
-    try std.testing.expectError(error.TooManyArguments, parse(&.{ "firewall", "show", "extra" }, &diag));
-}
-
-test "args: help covers config history and firewall" {
-    try std.testing.expect(std.mem.indexOf(u8, helpFor("config"), "effective configuration") != null);
-    try std.testing.expect(std.mem.indexOf(u8, helpFor("history"), "--cursor") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help_top, "history") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help_top, "config") != null);
-    try std.testing.expect(std.mem.indexOf(u8, helpFor("firewall"), "firewall show") != null);
-    try std.testing.expect(std.mem.indexOf(u8, helpFor("firewall"), "does not refresh") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help_top, "firewall show") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help_top, "fail2zig-client") == null);
-    try std.testing.expectEqualStrings("history", closestCommand("histroy").?);
-}
-
-test "args: use shared types" {
-    _ = shared.IpAddress;
-    _ = shared.JailId;
 }

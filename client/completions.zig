@@ -28,7 +28,7 @@ const bash_script =
     \\    local cur prev words cword
     \\    _init_completion || return
     \\
-    \\    local subcommands="status ban unban list jails reload version config history firewall jail completions help"
+    \\    local subcommands="status ban unban list jails reload version config history firewall jail repair-source completions help"
     \\    local global_flags="--socket --output --no-color --timeout --help --version"
     \\
     \\    # Flag-value completion for the previous word.
@@ -122,6 +122,7 @@ const zsh_script =
     \\        'history:Page through confirmed ban history (or: history reset)'
     \\        'firewall:Inspect sampled fail2zig-owned kernel protection'
     \\        'jail:Enable, disable, pause or resume a jail'
+    \\        'repair-source:Acknowledge a truncated file source (daemon stopped)'
     \\        'completions:Generate shell completion script'
     \\        'help:Show help for a command'
     \\    )
@@ -262,6 +263,7 @@ const fish_script =
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'history'      -d 'Page through confirmed ban history'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'firewall'     -d 'Inspect sampled fail2zig-owned kernel protection'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'jail'         -d 'Enable, disable, pause or resume a jail'
+    \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'repair-source' -d 'Acknowledge a truncated file source (daemon stopped)'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'completions'  -d 'Generate completion script'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'help'         -d 'Show help'
     \\

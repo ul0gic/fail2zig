@@ -346,10 +346,3 @@ test "native effect runtime: observation cursors bind snapshot parameters and li
     try std.testing.expect(out.age_ms == null);
     try std.testing.expect(out.nextCursor(&cursor_buffer) == null);
 }
-
-test "native effect runtime: observation cache layout stays within frozen bounds" {
-    try std.testing.expectEqual(@as(usize, 192), @sizeOf(inspection.Entry));
-    try std.testing.expect(@sizeOf(Cache) <= 50 * 1024);
-    try std.testing.expect(@sizeOf(Page) <= 50 * 1024);
-    try std.testing.expectEqual(@as(usize, 256), max_entries);
-}

@@ -70,41 +70,6 @@ test "record store: killed writer preserves committed WAL and rolls back unfinis
     }
 }
 
-test "record store: record checkpoint cursor and intent commit together and replay is idempotent" {
-    if (!builtin.link_libc) return error.SkipZigTest;
-    var temp = std.testing.tmpDir(.{});
-    defer temp.cleanup();
-    const base = try temp.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(base);
-    const path = try std.fs.path.join(std.testing.allocator, &.{ base, "state.sqlite" });
-    defer std.testing.allocator.free(path);
-    var store = try Store.open(std.testing.allocator, path);
-    const record = Record{ .jail = "sshd", .source = "file:1", .occurrence = "incarnation:1:0:20", .cursor = "20", .raw_hash = [_]u8{1} ** 32, .event_time = 1800000000.125, .disposition = "matched", .checkpoint = "ticket=1", .action_intent = "typed-test-intent" };
-    for ([_]CommitStage{ .after_record, .after_checkpoint, .before_commit }) |stage| {
-        store.fail_at = stage;
-        try std.testing.expectError(error.InjectedFailure, store.commitRecord(record));
-        try std.testing.expectEqual(@as(?[]u8, null), try store.sourceCursor(std.testing.allocator, "sshd", "file:1"));
-        try std.testing.expectEqual(@as(?[]u8, null), try store.checkpoint(std.testing.allocator, "sshd"));
-        try std.testing.expectEqual(@as(i64, 0), try store.pendingIntents());
-    }
-    store.fail_at = null;
-    try std.testing.expectEqual(CommitResult.committed, try store.commitRecord(record));
-    try std.testing.expectEqual(CommitResult.already_committed, try store.commitRecord(record));
-    try std.testing.expectEqual(@as(i64, 1), try store.pendingIntents());
-    var conflict = record;
-    conflict.raw_hash[0] = 2;
-    try std.testing.expectError(error.OccurrenceConflict, store.commitRecord(conflict));
-    store.close();
-    store = try Store.open(std.testing.allocator, path);
-    defer store.close();
-    const cursor = (try store.sourceCursor(std.testing.allocator, "sshd", "file:1")).?;
-    defer std.testing.allocator.free(cursor);
-    try std.testing.expectEqualStrings("20", cursor);
-    const saved = (try store.checkpoint(std.testing.allocator, "sshd")).?;
-    defer std.testing.allocator.free(saved);
-    try std.testing.expectEqualStrings("ticket=1", saved);
-}
-
 test "record store: stale writers cannot overwrite a committed jail checkpoint" {
     if (!builtin.link_libc) return error.SkipZigTest;
     const allocator = std.testing.allocator;

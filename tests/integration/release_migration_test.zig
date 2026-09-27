@@ -120,6 +120,7 @@ fn initializeState(path: []const u8) !void {
     try store.enableActionTargets();
     try store.enableAdminState();
     try store.enableMigrationState();
+    try store.enableLoadRepair(.{ .state_path = path, .now_us = std.time.microTimestamp(), .history_max_matches = 10 }, null);
     try testing.expectEqual(durable.latest_schema, store.schema_version);
 }
 

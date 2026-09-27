@@ -515,7 +515,7 @@ test "native daemon: schema23 resumes marked escalated cleanup and continues ing
     {
         var store = try engine.native_store_mod.Store.open(t.allocator, h.state_path);
         defer store.close();
-        try t.expectEqual(@as(i64, 23), store.schema_version);
+        try t.expectEqual(@as(i64, 24), store.schema_version);
         try t.expectEqual(@as(i64, 1), try store.inspectInteger("SELECT count(*) FROM retry_decision_escalations;"));
         try t.expectEqual(@as(i64, 0), try store.inspectInteger("SELECT count(*) FROM pragma_foreign_key_check;"));
         const escalated_sequence_value = try store.inspectInteger("SELECT r.source_sequence FROM records r JOIN retry_decision_escalations e USING(jail,source,occurrence) LIMIT 1;");
@@ -533,7 +533,7 @@ test "native daemon: schema23 resumes marked escalated cleanup and continues ing
             const expired = try store.prepareExpiry(entries[0].scope_key, entries[0].revision, .{ .prepared_us = std.time.microTimestamp() });
             try t.expectEqual(engine.native_effect_mod.Status.pending, expired.status);
             try t.expectEqual(.absent, std.meta.activeTag(expired.desired));
-            try store.markDispatched(expired.token(), .{ .prepared_us = std.time.microTimestamp() });
+            const dispatched_us = std.time.microTimestamp();
             var observed = try reader.observeExact(.{
                 .installation = reader.installation,
                 .effect_id = expired.scope_key,
@@ -543,7 +543,7 @@ test "native daemon: schema23 resumes marked escalated cleanup and continues ing
             }, .{ .wall_us = std.time.microTimestamp() });
             defer observed.deinit();
             try t.expect(observed.matches_desired);
-            try t.expectEqual(engine.native_effect_mod.Settlement.verified, try store.settleVerified(expired.token(), .{
+            try t.expectEqual(engine.native_effect_mod.Settlement.verified, try store.settleOutcome(expired.token(), dispatched_us, .{
                 .installation = expired.installation.id,
                 .scope_key = expired.scope_key,
                 .fingerprint = observed.snapshot.fingerprint,
@@ -635,7 +635,7 @@ test "native daemon: blocked SQLite writer leaves IPC responsive and resumes exa
     try h.writeLine(failure);
     try waitStatus(&h, "\"storage\":\"paused\"");
     try waitStatus(&h, "\"state\":\"degraded\"");
-    const visible = try std.process.Child.run(.{ .allocator = t.allocator, .argv = &.{ "zig-out/bin/fail2zig", "--socket", h.socket_path, "--timeout", "1000", "--output", "plain", "status" }, .max_output_bytes = 65536 });
+    const visible = try std.process.Child.run(.{ .allocator = t.allocator, .argv = &.{ h.options.daemon_path, "--socket", h.socket_path, "--timeout", "1000", "--output", "plain", "status" }, .max_output_bytes = 65536 });
     defer t.allocator.free(visible.stdout);
     defer t.allocator.free(visible.stderr);
     try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, visible.term);
@@ -934,7 +934,7 @@ test "native daemon: oversized source isolates its jail while independent file d
         .{ .format = "table", .command = "jails", .needle = cause_text },
     };
     for (checks) |check| {
-        const result = try std.process.Child.run(.{ .allocator = t.allocator, .argv = &.{ "zig-out/bin/fail2zig", "--socket", h.socket_path, "--timeout", "1000", "--output", check.format, check.command }, .max_output_bytes = 65536 });
+        const result = try std.process.Child.run(.{ .allocator = t.allocator, .argv = &.{ h.options.daemon_path, "--socket", h.socket_path, "--timeout", "1000", "--output", check.format, check.command }, .max_output_bytes = 65536 });
         defer t.allocator.free(result.stdout);
         defer t.allocator.free(result.stderr);
         if (!std.meta.eql(std.process.Child.Term{ .Exited = 0 }, result.term)) {
@@ -967,7 +967,7 @@ test "native daemon: delivered client renders native status jails version and de
     const commands = [_][]const u8{ "status", "jails", "version", "list" };
     const expected = [_][]const u8{ "log-only", "sshd", "daemon\t" ++ engine.version, "203.0.113.7" };
     for (commands, expected) |command, text| {
-        const result = try std.process.Child.run(.{ .allocator = t.allocator, .argv = &.{ "zig-out/bin/fail2zig", "--socket", h.socket_path, "--timeout", "1000", "--output", "plain", command }, .max_output_bytes = 65536 });
+        const result = try std.process.Child.run(.{ .allocator = t.allocator, .argv = &.{ h.options.daemon_path, "--socket", h.socket_path, "--timeout", "1000", "--output", "plain", command }, .max_output_bytes = 65536 });
         defer t.allocator.free(result.stdout);
         defer t.allocator.free(result.stderr);
         try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);

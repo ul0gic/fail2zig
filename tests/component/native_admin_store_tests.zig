@@ -340,15 +340,51 @@ test "native admin store: generation re-key moves every generation-keyed row of 
     try f.store.admitRetry("vsftpd", g_other, policy(3, 60));
     try f.store.enableAdminState();
     try f.store.enableMigrationState();
+    const live_scope = try effects.Scope.host(.{ .v4 = .{ 203, 0, 113, 11 } });
+    const absent_scope = try effects.Scope.host(.{ .v4 = .{ 203, 0, 113, 12 } });
+    const installation = (try f.store.readInstallation()).?;
+    const live_key = try live_scope.key(installation);
+    const absent_key = try absent_scope.key(installation);
+    _ = try f.store.setOwner(.{ .scope = live_scope, .jail = "sshd", .generation = g_old, .decision_id = [_]u8{0x11} ** 32, .expected_revision = 0, .lease = .{ .finite = 2_000_000 }, .decided_us = 900_000 }, testClock());
+    _ = try f.store.setOwner(.{ .scope = absent_scope, .jail = "sshd", .generation = g_old, .decision_id = [_]u8{0x12} ** 32, .expected_revision = 0, .lease = .absent, .decided_us = 900_000 }, testClock());
     try f.store.inspectExec("INSERT INTO source_maintenance(jail,source,generation,head_sequence,reject_below_sequence,cleanup_revision,sweep_sequence) VALUES('sshd','/var/log/auth.log',x'0101010101010101010101010101010101010101010101010101010101010101',1,1,0,0);");
     try f.store.inspectExec("INSERT INTO source_maintenance(jail,source,generation,head_sequence,reject_below_sequence,cleanup_revision,sweep_sequence) VALUES('vsftpd','/var/log/vsftpd.log',x'0303030303030303030303030303030303030303030303030303030303030303',1,1,0,0);");
     try f.store.inspectExec("INSERT INTO replay_guards(jail,source,generation,occurrence_key,identity_key,receipt_us,source_sequence) VALUES('sshd','/var/log/auth.log',x'0101010101010101010101010101010101010101010101010101010101010101',zeroblob(32),zeroblob(32),5,1);");
     try f.store.inspectExec("INSERT INTO source_cursors(jail,source,cursor,occurrence,path) VALUES('sshd','/var/log/auth.log',CAST('{\"offset\":10,\"codec_configuration_hash\":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7],\"prefix_len\":4}' AS BLOB),'occ','/var/log/auth.log');");
     const record = durable.Store.ConfigGenerationRecord{ .generation = [_]u8{6} ** 32, .config_digest = [_]u8{4} ** 32, .config_path = "/p", .committed_us = 50, .published = false, .mutation_revision = 0 };
-    f.store.commitReloadGeneration(&.{.{ .jail = "sshd", .generation = g_old, .next_generation = g_new, .expected = policy(3, 60), .next = policy(2, 60), .cursor_rebinding = .{ .old = [_]u8{7} ** 32, .new = [_]u8{8} ** 32 } }}, record, &.{}, testClock()) catch |err| {
-        std.debug.print("re-key failed: {s}\n", .{@errorName(err)});
-        return err;
-    };
+    const transition = durable.Store.PolicyTransition{ .jail = "sshd", .generation = g_old, .next_generation = g_new, .expected = policy(3, 60), .next = policy(2, 60), .cursor_rebinding = .{ .old = [_]u8{7} ** 32, .new = [_]u8{8} ** 32 } };
+    f.store.fail_at = .before_config_generation_commit;
+    try t.expectError(error.InjectedFailure, f.store.commitReloadGeneration(&.{transition}, record, &.{}, testClock()));
+    f.store.fail_at = null;
+    try t.expectEqualSlices(u8, &g_old, &(try f.store.currentOwner(live_key, "sshd")).?.generation);
+    try t.expectEqualSlices(u8, &g_old, &(try f.store.currentOwner(absent_key, "sshd")).?.generation);
+    try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM effect_owner_revisions WHERE jail='sshd' AND lease_kind=0;"));
+    try f.reopen();
+    try enableThrough21(&f.store);
+    try f.store.enableAdminState();
+    try f.store.enableMigrationState();
+    try f.store.commitReloadGeneration(&.{transition}, record, &.{}, testClock());
+    const live = (try f.store.currentOwner(live_key, "sshd")).?;
+    const absent = (try f.store.currentOwner(absent_key, "sshd")).?;
+    try t.expectEqualSlices(u8, &g_new, &live.generation);
+    try t.expectEqualSlices(u8, &g_new, &absent.generation);
+    try t.expectEqual(@as(i64, 2_000_000), live.lease.finite);
+    try t.expect(absent.lease == .absent);
+    try t.expectEqual(@as(u64, 2), absent.revision);
+    try t.expectEqual(@as(i64, 2), try f.store.inspectInteger("SELECT count(*) FROM effect_owner_revisions WHERE jail='sshd' AND lease_kind=0;"));
+    try t.expectEqual(@as(i64, 0), try f.store.inspectInteger("SELECT count(*) FROM effect_owners WHERE jail='sshd' AND generation=x'0101010101010101010101010101010101010101010101010101010101010101';"));
+    try f.reopen();
+    try enableThrough21(&f.store);
+    try f.store.enableAdminState();
+    try f.store.enableMigrationState();
+    const reopened_live = (try f.store.currentOwner(live_key, "sshd")).?;
+    const reopened_absent = (try f.store.currentOwner(absent_key, "sshd")).?;
+    try t.expectEqualSlices(u8, &g_new, &reopened_live.generation);
+    try t.expectEqual(@as(i64, 2_000_000), reopened_live.lease.finite);
+    try t.expectEqualSlices(u8, &g_new, &reopened_absent.generation);
+    try t.expect(reopened_absent.lease == .absent);
+    try t.expectEqual(@as(u64, 2), reopened_absent.revision);
+    try t.expectEqual(@as(i64, 2), try f.store.inspectInteger("SELECT count(*) FROM effect_owner_revisions WHERE jail='sshd' AND lease_kind=0;"));
     try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM source_cursors WHERE jail='sshd' AND instr(cursor,CAST('\"codec_configuration_hash\":[8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8]' AS BLOB))>0 AND instr(cursor,CAST('\"offset\":10' AS BLOB))>0;"));
     try f.store.inspectExec("DELETE FROM source_cursors WHERE jail='sshd';");
     try f.store.validateRuntimeAdmissions(&.{ .{ .jail = "sshd", .generation = g_new, .policy = policy(2, 60) }, .{ .jail = "vsftpd", .generation = g_other, .policy = policy(3, 60) } }, null);
@@ -427,4 +463,54 @@ fn staticRead(_: ?*anyopaque) i64 {
 }
 fn testClock() effects.Clock {
     return .{ .prepared_us = 1_000_000, .context = null, .read = staticRead };
+}
+
+fn observed(entry: effects.Entry) effects.Observation {
+    return .{ .installation = entry.installation.id, .scope_key = entry.scope_key, .fingerprint = [_]u8{9} ** 32, .observed_us = 1_000_000, .qualification = .complete_owned, .state = entry.desired };
+}
+
+test "native admin store: a ban replayed after its request record was evicted is a new decision, never the retired one" {
+    // Failure: with the request id as the decision, a replay after eviction reinstated the
+    // retired decision (A -> B -> A) and let its confirmation identity count again.
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.store.enableAdminState();
+    try f.store.enableMigrationState();
+    try f.store.enableLoadRepair(.{ .state_path = f.path, .now_us = 1_000_000, .history_max_matches = 10 }, null);
+    const gen = [_]u8{6} ** 32;
+    try f.store.recordConfigGeneration(.{ .generation = gen, .config_digest = gen, .config_path = "/p", .committed_us = 1, .published = true, .mutation_revision = 0 }, &.{});
+    const request = [_]u8{0x51} ** 32;
+    const scope = try effects.Scope.host(.{ .v4 = .{ 203, 0, 113, 5 } });
+    const key = try scope.key((try f.store.readInstallation()).?);
+    const Ban = struct {
+        fn set(store: *durable.Store, owner_key: effects.Hash, target: effects.Scope, decision: effects.Hash) !void {
+            const current = try store.currentOwner(owner_key, "sshd");
+            const entry = try store.setOwner(.{ .scope = target, .jail = "sshd", .generation = [_]u8{3} ** 32, .decision_id = decision, .expected_revision = if (current) |owner| owner.revision else 0, .lease = .permanent, .decided_us = 1_000_000 }, testClock());
+            _ = try store.settleOutcome(entry.token(), 1_000_000, observed(entry), testClock());
+        }
+    };
+
+    try t.expectEqual(durable.Store.AdminAdmission.fresh, try f.store.admitAdminRequest(request, 0));
+    const first = durable.Store.adminDecisionId(request, 0);
+    try Ban.set(&f.store, key, scope, first);
+    // A retry at the same admission revision is the same decision and changes nothing.
+    const revisions = try f.store.inspectInteger("SELECT count(*) FROM effect_owner_revisions;");
+    const owner = (try f.store.currentOwner(key, "sshd")).?;
+    _ = try f.store.setOwner(.{ .scope = scope, .jail = "sshd", .generation = [_]u8{3} ** 32, .decision_id = durable.Store.adminDecisionId(request, 0), .expected_revision = owner.revision, .lease = .permanent, .decided_us = 1_000_000 }, testClock());
+    try t.expectEqual(revisions, try f.store.inspectInteger("SELECT count(*) FROM effect_owner_revisions;"));
+    _ = try f.store.finishAdminRequest(.{ .request_id = request, .kind = .ban, .subject = "sshd", .outcome = .applied, .generation = gen, .committed_us = 100, .detail = "", .admission_revision = 0 }, null);
+    try t.expectEqual(@as(i64, 0), try f.store.inspectInteger("SELECT admission_revision FROM admin_requests;"));
+    try Ban.set(&f.store, key, scope, [_]u8{0x52} ** 32);
+    // Age eviction removes the request record.
+    _ = try f.store.finishAdminRequest(.{ .request_id = [_]u8{0x53} ** 32, .kind = .unban, .subject = "sshd", .outcome = .applied, .generation = gen, .committed_us = 100 + durable.Store.admin_request_max_age_us + 1, .detail = "", .admission_revision = 1 }, null);
+    try t.expectEqual(@as(i64, 0), try f.store.inspectInteger("SELECT count(*) FROM admin_requests WHERE request_id=x'5151515151515151515151515151515151515151515151515151515151515151';"));
+
+    const revision = try f.store.adminRevision();
+    try t.expectEqual(durable.Store.AdminAdmission.fresh, try f.store.admitAdminRequest(request, revision));
+    const replayed = durable.Store.adminDecisionId(request, revision);
+    try t.expect(!std.mem.eql(u8, &first, &replayed));
+    try Ban.set(&f.store, key, scope, replayed);
+    try t.expectEqual(@as(i64, 3), try f.store.inspectInteger("SELECT count(*) FROM confirmed_effect_events;"));
+    try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM confirmation_markers;"));
+    try t.expect(std.mem.eql(u8, &replayed, &(try f.store.currentOwner(key, "sshd")).?.decision_id));
 }

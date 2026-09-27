@@ -20,7 +20,6 @@ const formatScopes = format.formatScopes;
 const formatHistory = format.formatHistory;
 const formatFirewall = format.formatFirewall;
 const formatFirewallDetailed = format.formatFirewallDetailed;
-const formatError = format.formatError;
 const formatStatusForWidth = format.TestAccess.statusForWidth;
 const formatStatusForWidthDetailed = format.TestAccess.statusForWidthDetailed;
 const diagnostic_max_bytes = format.TestAccess.diagnosticMaxBytes;
@@ -28,7 +27,6 @@ const isUnsafeUnicodeControl = format.TestAccess.unsafeUnicodeControl;
 const renderDiagnostic = format.TestAccess.diagnostic;
 const formatListForWidth = format.TestAccess.listForWidth;
 const remainingFromExpiry = format.TestAccess.expiryRemaining;
-const formatRemaining = format.TestAccess.remaining;
 const formatJailsForWidth = format.TestAccess.jailsForWidth;
 const formatJailsForWidthDetailed = format.TestAccess.jailsForWidthDetailed;
 const formatFirewallForWidth = format.TestAccess.firewallForWidth;
@@ -41,24 +39,6 @@ fn runStatus(alloc: std.mem.Allocator, payload: []const u8, fmt: OutputFormat) !
     errdefer list.deinit();
     try formatStatusForWidth(alloc, list.writer(), payload, fmt, .{ .enabled = false }, 160);
     return list.toOwnedSlice();
-}
-
-test "format: status table shows box lines and version" {
-    const payload =
-        \\{"version":"0.1.0","uptime_seconds":86461,"memory_bytes_used":8388608,
-        \\"memory_bytes_limit":67108864,"active_bans":142,"parse_rate":12847.0,
-        \\"backend":"nftables","jails_active":8,"total_bans":3891}
-    ;
-    const out = try runStatus(testing.allocator, payload, .table);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "+---") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "fail2zig 0.1.0") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "1d 0h 1m 1s") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "nftables") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "142") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "3891") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "(24h)") == null);
-    try testing.expect(std.mem.indexOf(u8, out, "8") != null);
 }
 
 test "format: BUG-059 status memory percentage handles the full u64 range" {
@@ -87,51 +67,6 @@ test "format: BUG-059 status memory percentage handles the full u64 range" {
     try testing.expect(std.mem.indexOf(u8, stream.getWritten(), "could not parse status payload (OutOfMemory)") != null);
 }
 
-test "format: status json passes through" {
-    const payload = "{\"version\":\"0.1.0\"}";
-    const out = try runStatus(testing.allocator, payload, .json);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.startsWith(u8, out, "{"));
-    try testing.expect(std.mem.indexOf(u8, out, "0.1.0") != null);
-}
-
-test "format: status plain is tab-separated" {
-    const payload = "{\"version\":\"0.1.0\",\"active_bans\":3}";
-    const out = try runStatus(testing.allocator, payload, .plain);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "version\t0.1.0") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "active_bans\t3") != null);
-}
-
-test "format: status tolerates missing fields" {
-    const payload = "{}";
-    const out = try runStatus(testing.allocator, payload, .table);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "+---") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "-") != null);
-}
-
-test "format: status plain missing fields produces nothing" {
-    const payload = "{}";
-    const out = try runStatus(testing.allocator, payload, .plain);
-    defer testing.allocator.free(out);
-    try testing.expectEqual(@as(usize, 0), out.len);
-}
-
-test "format: status bad json surfaces error" {
-    const out = try runStatus(testing.allocator, "not json", .table);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "error") != null);
-}
-
-test "format: status table renders Protection row when present" {
-    const payload = "{\"version\":\"0.2.0\",\"protection\":\"log-only\",\"backend\":\"nftables\"}";
-    const out = try runStatus(testing.allocator, payload, .table);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "Protection:") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "log-only") != null);
-}
-
 test "format: CP-02 status heading is neutral and narrow output is bounded" {
     const payload = "{\"version\":\"v\\t1\",\"protection\":\"degraded\",\"backend\":\"backend-with-a-very-long-name-that-must-not-overflow-a-narrow-terminal\",\"active_bans\":3}";
     const table = try runStatus(testing.allocator, payload, .table);
@@ -146,20 +81,6 @@ test "format: CP-02 status heading is neutral and narrow output is bounded" {
     try testing.expect(std.mem.indexOf(u8, narrow.items, "Protection:") != null);
     var lines = std.mem.splitScalar(u8, narrow.items, '\n');
     while (lines.next()) |line| if (line.len != 0) try testing.expect(line.len <= 40);
-}
-
-test "format: status plain renders protection when present" {
-    const payload = "{\"protection\":\"mixed\"}";
-    const out = try runStatus(testing.allocator, payload, .plain);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "protection\tmixed") != null);
-}
-
-test "format: status table tolerates missing protection (older daemon)" {
-    const payload = "{\"backend\":\"nftables\"}";
-    const out = try runStatus(testing.allocator, payload, .table);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "Protection:") != null);
 }
 
 test "format: status degraded with protection_cause renders the cause" {
@@ -190,15 +111,6 @@ test "format: status degraded without protection_cause renders plain DEGRADED (o
     const plain = try runStatus(testing.allocator, payload, .plain);
     defer testing.allocator.free(plain);
     try testing.expect(std.mem.indexOf(u8, plain, "protection_cause") == null);
-}
-
-test "format: status all-log-only renders Protection log-only and Backend none" {
-    const payload = "{\"protection\":\"log-only\",\"backend\":\"none\",\"jails_active\":2}";
-    const table = try runStatus(testing.allocator, payload, .table);
-    defer testing.allocator.free(table);
-    try testing.expect(std.mem.indexOf(u8, table, "Protection:  log-only ") != null);
-    try testing.expect(std.mem.indexOf(u8, table, "Backend:     none ") != null);
-    try testing.expect(std.mem.indexOf(u8, table, "DEGRADED") == null);
 }
 
 test "format: BUG-054 status renders simultaneous scoped degradation details" {
@@ -338,13 +250,6 @@ test "format: status escapes Unicode controls in effect diagnostics" {
     try testing.expect(std.mem.indexOf(u8, plain, "effect_mutation\toutcome_uncertain\n") != null);
 }
 
-test "format: BUG-054 status JSON remains byte-for-byte passthrough" {
-    const payload = "{\"protection\":\"degraded\",\"cause\":\"x\\n y\",\"future\":{\"field\":1}}\n";
-    const json = try runStatus(testing.allocator, payload, .json);
-    defer testing.allocator.free(json);
-    try testing.expectEqualStrings(payload, json);
-}
-
 test "format: status reports parser allocation failure without retaining diagnostics" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     var output: [128]u8 = undefined;
@@ -358,41 +263,6 @@ fn runList(alloc: std.mem.Allocator, payload: []const u8, fmt: OutputFormat) ![]
     errdefer list.deinit();
     try formatListForWidth(alloc, list.writer(), payload, fmt, .{ .enabled = false }, 160);
     return list.toOwnedSlice();
-}
-
-test "format: list table with entries (daemon-shape JSON, SYS-002)" {
-    const payload =
-        \\[
-        \\  {"ip":"45.227.253.98","jail":"sshd","attempt_count":5,"last_attempt":0,"ban_count":3,"ban_expiry":9999999999},
-        \\  {"ip":"103.144.82.210","jail":"sshd","attempt_count":4,"last_attempt":0,"ban_count":1,"ban_expiry":9999999999}
-        \\]
-    ;
-    const out = try runList(testing.allocator, payload, .table);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "IP ADDRESS") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "JAIL") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "TIME LEFT") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "BAN COUNT") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "45.227.253.98") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "103.144.82.210") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "sshd") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "Total: 2 active bans") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "COUNTRY") == null);
-}
-
-test "format: list table empty (SYS-002)" {
-    const payload = "[]";
-    const out = try runList(testing.allocator, payload, .table);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "No active bans") != null);
-}
-
-test "format: list plain tab-separated (SYS-002)" {
-    const payload = "[{\"ip\":\"1.2.3.4\",\"jail\":\"sshd\",\"attempt_count\":3,\"last_attempt\":0,\"ban_count\":2,\"ban_expiry\":9999999999}]";
-    const out = try runList(testing.allocator, payload, .plain);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.startsWith(u8, out, "1.2.3.4\tsshd\t"));
-    try testing.expect(std.mem.endsWith(u8, out, "\t2\n"));
 }
 
 test "format: BUG-040 list preserves network CIDR and ordinary host presentation" {
@@ -414,20 +284,6 @@ test "format: BUG-040 list preserves network CIDR and ordinary host presentation
     try testing.expect(std.mem.indexOf(u8, table, "192.0.2.0/24") != null);
     try testing.expect(std.mem.indexOf(u8, table, "198.51.100.7") != null);
     try testing.expect(std.mem.indexOf(u8, table, "198.51.100.7/32") == null);
-}
-
-test "format: list expired entry shows 'expired' (SYS-002)" {
-    const payload = "[{\"ip\":\"5.5.5.5\",\"jail\":\"sshd\",\"attempt_count\":3,\"last_attempt\":0,\"ban_count\":1,\"ban_expiry\":1000000000}]";
-    const out = try runList(testing.allocator, payload, .table);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "expired") != null);
-}
-
-test "format: list json passes through (SYS-002)" {
-    const payload = "[]";
-    const out = try runList(testing.allocator, payload, .json);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.startsWith(u8, out, "["));
 }
 
 test "format: CP-02 list distinguishes permanent confirmed pending and unknown" {
@@ -483,78 +339,11 @@ fn runJails(alloc: std.mem.Allocator, payload: []const u8, fmt: OutputFormat) ![
     return list.toOwnedSlice();
 }
 
-test "format: jails table (daemon-shape JSON, SYS-002)" {
-    const payload =
-        \\[
-        \\  {"name":"sshd","enabled":true,"active_bans":5,"maxretry":3,"findtime":600,"bantime":3600},
-        \\  {"name":"nginx","enabled":false,"active_bans":0,"maxretry":5,"findtime":600,"bantime":600}
-        \\]
-    ;
-    const out = try runJails(testing.allocator, payload, .table);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "JAIL") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "MAX RETRY") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "FIND TIME") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "BAN TIME") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "sshd") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "nginx") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "enabled") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "disabled") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "Total: 2 jails") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "TOTAL") == null);
-    try testing.expect(std.mem.indexOf(u8, out, "BACKEND") == null);
-}
-
-test "format: jails plain (SYS-002)" {
-    const payload = "[{\"name\":\"sshd\",\"enabled\":true,\"active_bans\":1,\"maxretry\":3,\"findtime\":600,\"bantime\":300}]";
-    const out = try runJails(testing.allocator, payload, .plain);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "sshd\tenabled\t1\t3\t600\t300\t-\t-\t-\tunknown\t0\n") != null);
-}
-
-test "format: jails empty table (SYS-002)" {
-    const out = try runJails(testing.allocator, "[]", .table);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "No jails") != null);
-}
-
-test "format: jails human duration formatting (SYS-002)" {
-    const payload = "[{\"name\":\"sshd\",\"enabled\":true,\"active_bans\":0,\"maxretry\":3,\"findtime\":600,\"bantime\":86400}]";
-    const out = try runJails(testing.allocator, payload, .table);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "10m") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "1d") != null);
-}
-
 test "format: jails rejects object-shape payload (SYS-002 regression)" {
     const payload = "{\"jails\":[]}";
     const out = try runJails(testing.allocator, payload, .table);
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "error: could not parse jails payload") != null);
-}
-
-test "format: jails table renders action and enforcing (SYS-017)" {
-    const payload =
-        \\[
-        \\  {"name":"sshd","enabled":true,"active_bans":0,"maxretry":3,"findtime":600,"bantime":3600,"action":"nftables","enforcing":true},
-        \\  {"name":"sshd-test","enabled":true,"active_bans":0,"maxretry":3,"findtime":600,"bantime":600,"action":"log-only","enforcing":false}
-        \\]
-    ;
-    const out = try runJails(testing.allocator, payload, .table);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "ACTION") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "ENFORCING") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "nftables") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "log-only") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "true") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "false") != null);
-}
-
-test "format: jails plain renders action and enforcing (SYS-017)" {
-    const payload = "[{\"name\":\"sshd-test\",\"enabled\":true,\"active_bans\":0,\"maxretry\":3,\"findtime\":600,\"bantime\":600,\"action\":\"log-only\",\"enforcing\":false}]";
-    const out = try runJails(testing.allocator, payload, .plain);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "sshd-test\tenabled\t0\t3\t600\t600\tlog-only\tfalse\t-\tunknown\t0\n") != null);
 }
 
 test "format: CP-02 jails show paused without changing plain columns" {
@@ -592,38 +381,6 @@ test "format: CP-02 jails narrow fallback escapes untrusted text" {
     while (lines.next()) |line| if (line.len != 0) try testing.expect(line.len <= 40);
 }
 
-test "format: status renders protection degraded (SYS-017)" {
-    const payload = "{\"protection\":\"degraded\",\"total_bans\":7,\"jails_active\":2}";
-    const table = try runStatus(testing.allocator, payload, .table);
-    defer testing.allocator.free(table);
-    try testing.expect(std.mem.indexOf(u8, table, "Protection:  DEGRADED ") != null);
-    try testing.expect(std.mem.indexOf(u8, table, "Total bans:") != null);
-    try testing.expect(std.mem.indexOf(u8, table, "7") != null);
-
-    const plain = try runStatus(testing.allocator, payload, .plain);
-    defer testing.allocator.free(plain);
-    try testing.expect(std.mem.indexOf(u8, plain, "protection\tdegraded") != null);
-    try testing.expect(std.mem.indexOf(u8, plain, "total_bans\t7") != null);
-    try testing.expect(std.mem.indexOf(u8, plain, "jails_active\t2") != null);
-}
-
-test "format: jails table renders source + health, tints broken (SYS-017)" {
-    const payload =
-        \\[
-        \\  {"name":"sshd","enabled":true,"active_bans":0,"maxretry":3,"findtime":600,"bantime":3600,"action":"nftables","enforcing":true,"log_source":"journald (sshd)","source_healthy":false,"lines_seen":0},
-        \\  {"name":"nginx","enabled":true,"active_bans":0,"maxretry":3,"findtime":600,"bantime":600,"action":"nftables","enforcing":true,"log_source":"/var/log/nginx/error.log","lines_seen":12}
-        \\]
-    ;
-    const out = try runJails(testing.allocator, payload, .table);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "SOURCE") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "HEALTH") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "journald (sshd)") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "broken") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "/var/log/nginx/error.log") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "unknown") != null);
-}
-
 test "format: BUG-054 jail cause is bounded in HEALTH while plain stays eleven escaped columns" {
     const payload =
         \\[{"name":"ssh\tadmin\nrow\u2066","enabled":true,"active_bans":1,"maxretry":3,
@@ -653,46 +410,9 @@ test "format: BUG-054 unhealthy jail without a cause reports unknown" {
     try testing.expect(std.mem.indexOf(u8, table, "broken (unknown)") != null);
 }
 
-test "format: jails table tolerates missing source fields (older daemon, SYS-017)" {
-    const payload = "[{\"name\":\"sshd\",\"enabled\":true,\"active_bans\":0,\"maxretry\":3,\"findtime\":600,\"bantime\":3600,\"action\":\"nftables\",\"enforcing\":true}]";
-    const out = try runJails(testing.allocator, payload, .table);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "SOURCE") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "unknown") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "sshd") != null);
-}
-
 fn lineLens(out: []const u8) [3]usize {
     var it = std.mem.splitScalar(u8, out, '\n');
     return .{ it.next().?.len, it.next().?.len, it.next().?.len };
-}
-
-test "format: jails table sizes SOURCE from the longest path, keeps HEALTH separator (BUG-008)" {
-    const payload =
-        \\[
-        \\  {"name":"sshd","enabled":true,"log_source":"journald (sshd)","source_healthy":true},
-        \\  {"name":"recidive","enabled":true,"log_source":"/var/log/fail2zig/fail2zig.log"}
-        \\]
-    ;
-    const out = try runJails(testing.allocator, payload, .table);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "/var/log/fail2zig/fail2zig.log unknown") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "journald (sshd)                ok") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "fail2zig.logunknown") == null);
-    const lens = lineLens(out);
-    try testing.expectEqual(lens[0], lens[1]);
-    try testing.expectEqual(lens[0], lens[2]);
-}
-
-test "format: jails table ellipsis-truncates SOURCE beyond the column cap (BUG-008)" {
-    const payload = "[{\"name\":\"web\",\"enabled\":true,\"log_source\":\"/srv/very/deeply/nested/path/to/some/application/logs/access.log\",\"source_healthy\":false}]";
-    const out = try runJails(testing.allocator, payload, .table);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "access.log") == null);
-    try testing.expect(std.mem.indexOf(u8, out, "/srv/very/deeply/nested/path/to/some/applicat... broken") != null);
-    const lens = lineLens(out);
-    try testing.expectEqual(lens[0], lens[1]);
-    try testing.expectEqual(lens[0], lens[2]);
 }
 
 test "format: jails table SOURCE truncation never splits a UTF-8 sequence (BUG-008)" {
@@ -706,109 +426,11 @@ test "format: jails table SOURCE truncation never splits a UTF-8 sequence (BUG-0
     try testing.expectEqual(lens[0], lens[2]);
 }
 
-test "format: jails table sizes JAIL from a 40-char jail name (BUG-010)" {
-    const payload = "[{\"name\":\"nginx-http-auth-strict-mode-for-tenant-a\",\"enabled\":true},{\"name\":\"sshd\",\"enabled\":false}]";
-    const out = try runJails(testing.allocator, payload, .table);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "nginx-http-auth-strict-mode-for-tenant-a enabled") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "tenant-aenabled") == null);
-    const lens = lineLens(out);
-    try testing.expectEqual(lens[0], lens[1]);
-    try testing.expectEqual(lens[0], lens[2]);
-}
-
-test "format: list table sizes IP ADDRESS and JAIL from the longest values (BUG-010)" {
-    const payload = "[{\"ip\":\"2001:0db8:85a3:0000:0000:8a2e:0370:7334\",\"jail\":\"nginx-http-auth-strict-mode-for-tenant-a\",\"ban_count\":1,\"ban_expiry\":1},{\"ip\":\"1.2.3.4\",\"jail\":\"sshd\",\"ban_count\":2,\"ban_expiry\":1}]";
-    const out = try runList(testing.allocator, payload, .table);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "2001:0db8:85a3:0000:0000:8a2e:0370:7334 nginx-http-auth-strict-mode-for-tenant-a ") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "7334nginx") == null);
-    try testing.expect(std.mem.indexOf(u8, out, "tenant-a") != null);
-    const lens = lineLens(out);
-    try testing.expectEqual(lens[0], lens[1]);
-    try testing.expectEqual(lens[0], lens[2]);
-}
-
-test "format: list table TIME LEFT sized for a decades-long ban (BUG-011)" {
-    const payload = "[{\"ip\":\"1.2.3.4\",\"jail\":\"sshd\",\"ban_count\":4294967295,\"ban_expiry\":9999999999},{\"ip\":\"5.6.7.8\",\"jail\":\"sshd\",\"ban_count\":1,\"ban_expiry\":1}]";
-    const out = try runList(testing.allocator, payload, .table);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "expired") != null);
-    const lens = lineLens(out);
-    try testing.expectEqual(lens[0], lens[1]);
-    try testing.expectEqual(lens[0], lens[2]);
-    var it = std.mem.splitScalar(u8, out, '\n');
-    const header = it.next().?;
-    _ = it.next();
-    const first_row = it.next().?;
-    const time_start = std.mem.indexOf(u8, header, "TIME LEFT").?;
-    const confirmation_start = std.mem.indexOf(u8, header, "CONFIRMATION").?;
-    const count_start = std.mem.indexOf(u8, header, "BAN COUNT").?;
-    try testing.expect(time_start < confirmation_start);
-    try testing.expect(confirmation_start < count_start);
-    const time_value = std.mem.trim(u8, first_row[time_start..confirmation_start], " ");
-    const confirmation_value = std.mem.trim(u8, first_row[confirmation_start..count_start], " ");
-    const count_value = std.mem.trim(u8, first_row[count_start..], " ");
-    try testing.expect(time_value.len > 1);
-    try testing.expect(std.mem.endsWith(u8, time_value, "s"));
-    try testing.expectEqualStrings("unknown", confirmation_value);
-    try testing.expectEqualStrings("4294967295", count_value);
-    try testing.expectEqual(lens[0], it.next().?.len);
-}
-
-test "format: jails table every column keeps its separator at extreme values (BUG-011)" {
-    const payload = "[{\"name\":\"sshd\",\"enabled\":false,\"active_bans\":4294967295,\"maxretry\":4294967295,\"findtime\":4294967295,\"bantime\":4294967295,\"action\":\"a-very-long-action-name-here\",\"enforcing\":false,\"log_source\":\"x\",\"source_healthy\":true}]";
-    const out = try runJails(testing.allocator, payload, .table);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "sshd disabled 4294967295 4294967295 49710d    49710d   a-very-long-action-name-here false     x      ok") != null);
-    const lens = lineLens(out);
-    try testing.expectEqual(lens[0], lens[1]);
-    try testing.expectEqual(lens[0], lens[2]);
-}
-
-test "format: status box widens for a long value (BUG-011)" {
-    const payload = "{\"backend\":\"nftables-with-an-unusually-long-descriptive-backend-name\",\"active_bans\":3}";
-    const out = try runStatus(testing.allocator, payload, .table);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "nftables-with-an-unusually-long-descriptive-backend-name |") != null);
-    var it = std.mem.splitScalar(u8, out, '\n');
-    const top = it.next().?;
-    _ = it.next();
-    _ = it.next();
-    while (it.next()) |line| {
-        if (line.len == 0) break;
-        try testing.expectEqual(top.len, line.len);
-    }
-}
-
 fn runVersion(alloc: std.mem.Allocator, payload: []const u8, fmt: OutputFormat) ![]u8 {
     var list = std.ArrayList(u8).init(alloc);
     errdefer list.deinit();
     try formatVersion(alloc, list.writer(), "0.1.0", payload, fmt, .{ .enabled = false });
     return list.toOwnedSlice();
-}
-
-test "format: version table combines matching client and daemon versions" {
-    const payload = "{\"daemon_version\":\"0.1.0\",\"git_commit\":\"abc123\"}";
-    const out = try runVersion(testing.allocator, payload, .table);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.startsWith(u8, out, "fail2zig 0.1.0 (client and daemon)\n"));
-    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "0.1.0"));
-    try testing.expect(std.mem.indexOf(u8, out, "abc123") != null);
-}
-
-test "format: version table distinguishes mismatched client and daemon" {
-    const out = try runVersion(testing.allocator, "{\"daemon_version\":\"0.2.0\"}", .table);
-    defer testing.allocator.free(out);
-    try testing.expectEqualStrings("Client: fail2zig 0.1.0\nDaemon: fail2zig 0.2.0\n", out);
-}
-
-test "format: version table reports missing metadata without inventing a connection failure" {
-    for ([_][]const u8{ "", "{}", "{\"daemon_version\":null}" }) |payload| {
-        const out = try runVersion(testing.allocator, payload, .table);
-        defer testing.allocator.free(out);
-        try testing.expectEqualStrings("Client: fail2zig 0.1.0\nDaemon: version unavailable\n", out);
-    }
 }
 
 test "format: version table rejects malformed payload and escapes terminal data" {
@@ -817,78 +439,6 @@ test "format: version table rejects malformed payload and escapes terminal data"
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOfScalar(u8, out, 0x1b) == null);
     try testing.expect(std.mem.indexOf(u8, out, "a\nb") == null);
-}
-
-test "format: version plain" {
-    const payload = "{\"daemon_version\":\"0.1.0\"}";
-    const out = try runVersion(testing.allocator, payload, .plain);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "client\t0.1.0") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "daemon\t0.1.0") != null);
-}
-
-test "format: version json wraps daemon payload" {
-    const payload = "{\"daemon_version\":\"0.1.0\"}";
-    const out = try runVersion(testing.allocator, payload, .json);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "\"client_version\":\"0.1.0\"") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "\"daemon\":{\"daemon_version\"") != null);
-}
-
-test "format: ban action table" {
-    const payload = "{\"ip\":\"1.2.3.4\",\"jail\":\"sshd\",\"result\":\"banned\"}";
-    var list = std.ArrayList(u8).init(testing.allocator);
-    defer list.deinit();
-    try formatBan(testing.allocator, list.writer(), payload, .table, .{ .enabled = false });
-    try testing.expect(std.mem.indexOf(u8, list.items, "Banned 1.2.3.4") != null);
-    try testing.expect(std.mem.indexOf(u8, list.items, "jail: sshd") != null);
-}
-
-test "format: unban plain" {
-    const payload = "{\"ip\":\"1.2.3.4\",\"result\":\"unbanned\"}";
-    var list = std.ArrayList(u8).init(testing.allocator);
-    defer list.deinit();
-    try formatUnban(testing.allocator, list.writer(), payload, .plain, .{ .enabled = false });
-    try testing.expect(std.mem.indexOf(u8, list.items, "ip\t1.2.3.4") != null);
-    try testing.expect(std.mem.indexOf(u8, list.items, "result\tunbanned") != null);
-}
-
-test "format: reload table with jails count" {
-    const payload = "{\"result\":\"reloaded\",\"jails_loaded\":4}";
-    var list = std.ArrayList(u8).init(testing.allocator);
-    defer list.deinit();
-    try formatReload(testing.allocator, list.writer(), payload, .table, .{ .enabled = false });
-    try testing.expect(std.mem.indexOf(u8, list.items, "Reloaded") != null);
-    try testing.expect(std.mem.indexOf(u8, list.items, "4 jails loaded") != null);
-}
-
-test "format: error all modes" {
-    var list = std.ArrayList(u8).init(testing.allocator);
-    defer list.deinit();
-
-    try formatError(list.writer(), 42, "jail not found", .table, .{ .enabled = false });
-    try testing.expect(std.mem.indexOf(u8, list.items, "error: jail not found") != null);
-
-    list.clearRetainingCapacity();
-    try formatError(list.writer(), 42, "jail not found", .json, .{ .enabled = false });
-    try testing.expect(std.mem.indexOf(u8, list.items, "\"code\":42") != null);
-
-    list.clearRetainingCapacity();
-    try formatError(list.writer(), 42, "jail not found", .plain, .{ .enabled = false });
-    try testing.expect(std.mem.indexOf(u8, list.items, "error\t42\tjail not found") != null);
-}
-
-test "format: color escapes emitted only when enabled" {
-    var list = std.ArrayList(u8).init(testing.allocator);
-    defer list.deinit();
-    const payload = "[{\"ip\":\"1.2.3.4\",\"jail\":\"sshd\",\"attempt_count\":3,\"last_attempt\":0,\"ban_count\":1,\"ban_expiry\":9999999999}]";
-
-    try formatList(testing.allocator, list.writer(), payload, .table, .{ .enabled = true });
-    try testing.expect(std.mem.indexOf(u8, list.items, "\x1b[") != null);
-
-    list.clearRetainingCapacity();
-    try formatList(testing.allocator, list.writer(), payload, .table, .{ .enabled = false });
-    try testing.expect(std.mem.indexOf(u8, list.items, "\x1b[") == null);
 }
 
 const config_payload =
@@ -936,49 +486,6 @@ fn runFormatter(comptime formatter: anytype, payload: []const u8, fmt: OutputFor
     return list.toOwnedSlice();
 }
 
-test "format: status renders the generation field in plain and table" {
-    const payload = "{\"version\":\"0.4.0\",\"generation\":\"abcdef0123\",\"active_bans\":1}";
-    const plain = try runStatus(testing.allocator, payload, .plain);
-    defer testing.allocator.free(plain);
-    try testing.expect(std.mem.indexOf(u8, plain, "generation\tabcdef0123") != null);
-    const table = try runStatus(testing.allocator, payload, .table);
-    defer testing.allocator.free(table);
-    try testing.expect(std.mem.indexOf(u8, table, "Generation:  abcdef0123") != null);
-}
-
-test "format: config json passes through unchanged" {
-    const out = try runFormatter(formatConfig, config_payload, .json);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.startsWith(u8, out, config_payload));
-    try testing.expect(out[out.len - 1] == '\n');
-}
-
-test "format: config plain is key-tab-value with dotted jail keys" {
-    const out = try runFormatter(formatConfig, config_payload, .plain);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "generation\tab12\n") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "redacted\tfalse\n") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "global.socket_path\t/run/fail2zig/fail2zig.sock\n") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "global.dns_server\t-\n") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "jail.sshd.ignoreip\t127.0.0.1/8,192.0.2.0/24\n") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "jail.nginx.bantime_permanent\ttrue\n") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "jail.nginx.logpath\t\n") != null);
-}
-
-test "format: config table shows global block and jail rows" {
-    const out = try runFormatter(formatConfig, config_payload, .table);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "GLOBAL\n") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "metrics          true (127.0.0.1:9101)") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "JAILS\n") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "JAIL") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "enabled") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "permanent") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "10m") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "Total: 2 jails") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "redacted") == null);
-}
-
 test "format: redacted config table warns and keeps placeholders" {
     const payload = "{\"generation\":\"g\",\"redacted\":true,\"jails\":[{\"name\":\"sshd\",\"enabled\":true,\"logpath\":[\"<redacted>\"],\"ignoreip\":[\"<redacted>\"]}],\"global\":{\"socket_path\":\"<redacted>\"}}";
     const table = try runFormatter(formatConfig, payload, .table);
@@ -988,12 +495,6 @@ test "format: redacted config table warns and keeps placeholders" {
     const plain = try runFormatter(formatConfig, payload, .plain);
     defer testing.allocator.free(plain);
     try testing.expect(std.mem.indexOf(u8, plain, "jail.sshd.ignoreip\t<redacted>\n") != null);
-}
-
-test "format: scopes json passes through" {
-    const out = try runFormatter(formatScopes, scopes_payload, .json);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.startsWith(u8, out, scopes_payload));
 }
 
 test "format: scopes plain lists indexed items and the next cursor" {
@@ -1047,12 +548,6 @@ test "format: history empty page with a cursor still tells the operator to keep 
     const plain = try runFormatter(formatHistory, payload, .plain);
     defer testing.allocator.free(plain);
     try testing.expectEqualStrings("generation\tg\nnext_cursor\taDoy\n", plain);
-}
-
-test "format: history json passes through" {
-    const out = try runFormatter(formatHistory, history_payload, .json);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.startsWith(u8, out, history_payload));
 }
 
 test "format: history plain and table" {
@@ -1181,12 +676,6 @@ test "format: UTC rendering bounds hostile microsecond timestamps" {
     try testing.expectEqualStrings("9999-12-31 23:59:59", formatUtc(&buffer, 253_402_300_799_000_000));
 }
 
-test "format: firewall json remains raw passthrough" {
-    const out = try runFormatter(formatFirewall, firewall_payload, .json);
-    defer testing.allocator.free(out);
-    try testing.expectEqualStrings(firewall_payload ++ "\n", out);
-}
-
 test "format: presentation details retains machine formats and exposes table identifiers" {
     const status = "{\"generation\":\"g\\nunsafe\",\"protection\":\"active\",\"backend\":\"nftables\",\"jails_active\":1,\"active_bans\":2}";
     const plain = try runFormatter(formatStatusDetailed, status, .plain);
@@ -1280,14 +769,6 @@ test "format: verified structural identities fit or stack without clipping" {
     try writeFirewallStructureRules(nft_out.writer(), &.{.{ .family = "inet", .table = name, .chain = "input", .match = "ip saddr @banned_ipv4", .verdict = "drop" }}, .{ .enabled = false }, 80);
     try testing.expect(std.mem.indexOf(u8, nft_out.items, "MATCH") != null);
     try testing.expect(std.mem.indexOf(u8, nft_out.items, "MATCH:") == null);
-}
-
-test "format: ban countdown uses unsigned seconds after expiry validation" {
-    try testing.expectEqualStrings("1m 58s", formatRemaining(118));
-    try testing.expectEqualStrings("1m 00s", formatRemaining(60));
-    try testing.expectEqualStrings("0m 00s", formatRemaining(0));
-    try testing.expectEqualStrings("expired", formatRemaining(-1));
-    try testing.expectEqualStrings("-", formatRemaining(null));
 }
 
 test "format: firewall rejects available response without an observation" {

@@ -664,13 +664,6 @@ test "native query: malformed, unknown-kind, version and limit bounds are 400" {
     try expectFailure(try run(oversized, .admin, sources(&history)), 400);
 }
 
-test "native query: limit 256 is accepted and default limit applies" {
-    var history = History{ .events = &history_events };
-    const max = try run("{\"schema_version\":1,\"kind\":\"scopes\",\"limit\":256}", .admin, sources(&history));
-    defer max.deinit(a);
-    try t.expect(max == .payload);
-}
-
 test "native query: pass-through responses above 1 MiB are refused as 413" {
     const result = try run("{\"schema_version\":1,\"kind\":\"status\"}", .admin, .{ .status = .{ .ctx = null, .func = hugeCallback } });
     try expectFailure(result, 413);

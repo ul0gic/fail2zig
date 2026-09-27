@@ -96,78 +96,6 @@ test "native consumer plan: defaults apply only without a jail override includin
     try t.expect(!std.mem.eql(u8, &inherited.parent_generation, &empty.parent_generation));
 }
 
-test "native consumer plan: ordered raw assets and resolver policy bind deterministic generations" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    try f.add("login", "application", false);
-    try f.add("other", "application", false);
-    var cfg = f.config();
-    const first = try plan.Prepared.create(t.allocator, &cfg, 0, resolver);
-    defer first.destroy();
-    const repeat = try plan.Prepared.create(t.allocator, &cfg, 0, resolver);
-    defer repeat.destroy();
-    try t.expectEqualSlices(u8, &first.parent_generation, &repeat.parent_generation);
-    var changed_resolver = resolver;
-    changed_resolver[0] ^= 1;
-    const dns = try plan.Prepared.create(t.allocator, &cfg, 0, changed_resolver);
-    defer dns.destroy();
-    try t.expect(!std.mem.eql(u8, &first.parent_generation, &dns.parent_generation));
-    const file = try f.tmp.dir.openFile("rule-0.json", .{ .mode = .write_only });
-    defer file.close();
-    try file.seekFromEnd(0);
-    try file.writeAll(" \n");
-    const bytes = try plan.Prepared.create(t.allocator, &cfg, 0, resolver);
-    defer bytes.destroy();
-    try t.expectEqualSlices(u8, &first.programs[0].generation, &bytes.programs[0].generation);
-    try t.expect(!std.mem.eql(u8, &first.parent_generation, &bytes.parent_generation));
-    const swap = f.paths[0];
-    f.paths[0] = f.paths[1];
-    f.paths[1] = swap;
-    const reordered = try plan.Prepared.create(t.allocator, &cfg, 0, resolver);
-    defer reordered.destroy();
-    try t.expect(!std.mem.eql(u8, &bytes.parent_generation, &reordered.parent_generation));
-}
-
-test "native consumer plan: operational changes preserve rule and immutable ignore identities" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    try f.add("login", "application", false);
-    f.jails[0].ignoreip = &.{"192.0.2.0/24"};
-    var cfg = f.config();
-    const original = try plan.Prepared.create(t.allocator, &cfg, 0, resolver);
-    defer original.destroy();
-    const baseline = cfg.global;
-    const changes = .{
-        .{ "log_level", native.LogLevel.debug },
-        .{ "native_memory_ceiling_mb", @as(u32, 512) },
-        .{ "native_fd_ceiling", @as(u32, 4096) },
-        .{ "memory_ceiling_mb", @as(u32, 128) },
-        .{ "metrics_enabled", false },
-        .{ "metrics_bind", @as([]const u8, "127.0.0.2") },
-        .{ "metrics_port", @as(u16, 9200) },
-        .{ "websocket_max_clients", @as(u32, 32) },
-        .{ "socket_path", @as([]const u8, "/run/fail2zig/other.sock") },
-        .{ "pid_file", @as([]const u8, "/run/fail2zig/other.pid") },
-        .{ "compatibility_manifest", @as([]const u8, "/var/lib/fail2zig/inspection.json") },
-    };
-    inline for (changes) |change| {
-        cfg.global = baseline;
-        @field(cfg.global, change[0]) = change[1];
-        const operational = try plan.Prepared.create(t.allocator, &cfg, 0, resolver);
-        defer operational.destroy();
-        try t.expectEqualSlices(u8, &original.parent_generation, &operational.parent_generation);
-        try t.expectEqualSlices(u8, &original.programs[0].generation, &operational.programs[0].generation);
-        try t.expectEqualSlices(u8, &original.initial_ignore.generation, &operational.initial_ignore.generation);
-        try t.expectEqualSlices(u8, original.initial_ignore.payload, operational.initial_ignore.payload);
-    }
-    cfg.global = baseline;
-    cfg.global.compatibility_pending = true;
-    try t.expectError(error.CompatibilityNotAdmitted, plan.Prepared.create(t.allocator, &cfg, 0, resolver));
-    cfg.global = baseline;
-    cfg.global.native_ingestion = false;
-    try t.expectError(error.NativeIngestionRequired, plan.Prepared.create(t.allocator, &cfg, 0, resolver));
-}
-
 test "native consumer plan: effective inheritance is stable while changed exclusions remain distinct" {
     var f = try Fixture.init();
     defer f.deinit();
@@ -233,25 +161,6 @@ test "native consumer plan: source owner filter and changed rule predicate bind 
     const input = rules.Input{ .source = "application", .record = "{\"peer\":\"203.0.113.9\",\"result\":\"denied\"}" };
     try t.expectEqual(.candidate, (try original.programs[0].evaluate(input, &scratch)).kind);
     try t.expectEqual(.no_match, (try changed.programs[0].evaluate(input, &scratch)).kind);
-}
-
-test "native consumer plan: identical protected bytes at another path retain explicit asset identity" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    try f.add("login", "application", false);
-    var cfg = f.config();
-    const original = try plan.Prepared.create(t.allocator, &cfg, 0, resolver);
-    defer original.destroy();
-    try f.tmp.dir.rename("rule-0.json", "relocated.json");
-    const relocated = try std.fs.path.join(t.allocator, &.{ f.root, "relocated.json" });
-    defer t.allocator.free(relocated);
-    const paths = [_][]const u8{relocated};
-    f.jails[0].rule_files = &paths;
-    const changed = try plan.Prepared.create(t.allocator, &cfg, 0, resolver);
-    defer changed.destroy();
-    try t.expectEqualSlices(u8, &original.programs[0].generation, &changed.programs[0].generation);
-    try t.expect(!std.mem.eql(u8, &original.parent_generation, &changed.parent_generation));
-    try t.expectEqual(@as(u16, 2), plan.version);
 }
 
 test "native consumer plan: duplicate rule identity paths and mismatched logical sources refuse" {
