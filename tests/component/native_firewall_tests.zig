@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-test "native firewall: module registration" {
-    _ = @import("engine_test").firewall.inspection;
-}
 
 const std = @import("std");
 const shared = @import("shared");

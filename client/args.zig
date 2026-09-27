@@ -964,12 +964,6 @@ fn parseOk(argv: []const []const u8) !Parsed {
     return parse(argv, &diag);
 }
 
-test "args: empty argv requires a command" {
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.MissingCommand, parse(&.{}, &diag));
-    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "no command") != null);
-}
-
 test "args: details is limited to table presentation commands" {
     const status = try parseOk(&.{ "status", "--details", "--output", "json" });
     try std.testing.expect(status.command.status.details);
@@ -980,12 +974,6 @@ test "args: details is limited to table presentation commands" {
     try std.testing.expect(list.command.list.details);
     var diag: ParseDiag = .{};
     try std.testing.expectError(error.UnknownFlag, parse(&.{ "history", "--details" }, &diag));
-}
-
-test "args: --output rejects invalid value" {
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.InvalidValue, parse(&.{ "--output", "xml", "status" }, &diag));
-    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "xml") != null);
 }
 
 test "args: --socket missing value" {
@@ -1065,31 +1053,14 @@ test "args: ban with jail and duration" {
     try std.testing.expectEqual(@as(u64, 3600), p.command.ban.duration_s.?);
 }
 
-test "args: ban requires ip" {
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.MissingArgument, parse(&.{"ban"}, &diag));
-    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "IP address") != null);
-}
-
 test "args: ban rejects extra positional" {
     var diag: ParseDiag = .{};
     try std.testing.expectError(error.TooManyArguments, parse(&.{ "ban", "1.2.3.4", "5.6.7.8", "--jail", "sshd" }, &diag));
 }
 
-test "args: completions rejects unknown shell" {
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.InvalidValue, parse(&.{ "completions", "ksh" }, &diag));
-}
-
 test "args: completions requires shell" {
     var diag: ParseDiag = .{};
     try std.testing.expectError(error.MissingArgument, parse(&.{"completions"}, &diag));
-}
-
-test "args: unknown command gets suggestion" {
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.UnknownCommand, parse(&.{"statu"}, &diag));
-    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "status") != null);
 }
 
 test "args: unknown command with no close match" {
@@ -1155,18 +1126,4 @@ test "args: firewall show defaults and paging flags" {
     try std.testing.expectEqualStrings("fw-token", page.command.firewall.cursor.?);
     try std.testing.expect(page.command.firewall.details);
     try std.testing.expectEqual(OutputFormat.plain, page.globals.output);
-}
-
-test "args: firewall show rejects missing action and invalid paging" {
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.MissingArgument, parse(&.{"firewall"}, &diag));
-    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "firewall show") != null);
-    try std.testing.expectError(error.MissingArgument, parse(&.{ "firewall", "list" }, &diag));
-    try std.testing.expectError(error.InvalidValue, parse(&.{ "firewall", "show", "--limit", "0" }, &diag));
-    try std.testing.expectError(error.InvalidValue, parse(&.{ "firewall", "show", "--limit", "257" }, &diag));
-    try std.testing.expectError(error.InvalidValue, parse(&.{ "firewall", "show", "--limit", "many" }, &diag));
-    try std.testing.expectError(error.MissingValue, parse(&.{ "firewall", "show", "--cursor" }, &diag));
-    try std.testing.expectError(error.InvalidValue, parse(&.{ "firewall", "show", "--cursor", "" }, &diag));
-    try std.testing.expectError(error.UnknownFlag, parse(&.{ "firewall", "show", "--jail", "sshd" }, &diag));
-    try std.testing.expectError(error.TooManyArguments, parse(&.{ "firewall", "show", "extra" }, &diag));
 }

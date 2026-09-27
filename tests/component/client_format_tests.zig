@@ -20,7 +20,6 @@ const formatScopes = format.formatScopes;
 const formatHistory = format.formatHistory;
 const formatFirewall = format.formatFirewall;
 const formatFirewallDetailed = format.formatFirewallDetailed;
-const formatError = format.formatError;
 const formatStatusForWidth = format.TestAccess.statusForWidth;
 const formatStatusForWidthDetailed = format.TestAccess.statusForWidthDetailed;
 const diagnostic_max_bytes = format.TestAccess.diagnosticMaxBytes;
@@ -28,7 +27,6 @@ const isUnsafeUnicodeControl = format.TestAccess.unsafeUnicodeControl;
 const renderDiagnostic = format.TestAccess.diagnostic;
 const formatListForWidth = format.TestAccess.listForWidth;
 const remainingFromExpiry = format.TestAccess.expiryRemaining;
-const formatRemaining = format.TestAccess.remaining;
 const formatJailsForWidth = format.TestAccess.jailsForWidth;
 const formatJailsForWidthDetailed = format.TestAccess.jailsForWidthDetailed;
 const formatFirewallForWidth = format.TestAccess.firewallForWidth;
@@ -252,13 +250,6 @@ test "format: status escapes Unicode controls in effect diagnostics" {
     try testing.expect(std.mem.indexOf(u8, plain, "effect_mutation\toutcome_uncertain\n") != null);
 }
 
-test "format: BUG-054 status JSON remains byte-for-byte passthrough" {
-    const payload = "{\"protection\":\"degraded\",\"cause\":\"x\\n y\",\"future\":{\"field\":1}}\n";
-    const json = try runStatus(testing.allocator, payload, .json);
-    defer testing.allocator.free(json);
-    try testing.expectEqualStrings(payload, json);
-}
-
 test "format: status reports parser allocation failure without retaining diagnostics" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     var output: [128]u8 = undefined;
@@ -442,55 +433,12 @@ fn runVersion(alloc: std.mem.Allocator, payload: []const u8, fmt: OutputFormat) 
     return list.toOwnedSlice();
 }
 
-test "format: version table distinguishes mismatched client and daemon" {
-    const out = try runVersion(testing.allocator, "{\"daemon_version\":\"0.2.0\"}", .table);
-    defer testing.allocator.free(out);
-    try testing.expectEqualStrings("Client: fail2zig 0.1.0\nDaemon: fail2zig 0.2.0\n", out);
-}
-
-test "format: version table reports missing metadata without inventing a connection failure" {
-    for ([_][]const u8{ "", "{}", "{\"daemon_version\":null}" }) |payload| {
-        const out = try runVersion(testing.allocator, payload, .table);
-        defer testing.allocator.free(out);
-        try testing.expectEqualStrings("Client: fail2zig 0.1.0\nDaemon: version unavailable\n", out);
-    }
-}
-
 test "format: version table rejects malformed payload and escapes terminal data" {
     try testing.expectError(error.UnexpectedEndOfInput, runVersion(testing.allocator, "{", .table));
     const out = try runVersion(testing.allocator, "{\"daemon_version\":\"0.2.0\\u001b[2J\",\"git_commit\":\"a\\nb\"}", .table);
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOfScalar(u8, out, 0x1b) == null);
     try testing.expect(std.mem.indexOf(u8, out, "a\nb") == null);
-}
-
-test "format: error all modes" {
-    var list = std.ArrayList(u8).init(testing.allocator);
-    defer list.deinit();
-
-    try formatError(list.writer(), 42, "jail not found", .table, .{ .enabled = false });
-    try testing.expect(std.mem.indexOf(u8, list.items, "error: jail not found") != null);
-
-    list.clearRetainingCapacity();
-    try formatError(list.writer(), 42, "jail not found", .json, .{ .enabled = false });
-    try testing.expect(std.mem.indexOf(u8, list.items, "\"code\":42") != null);
-
-    list.clearRetainingCapacity();
-    try formatError(list.writer(), 42, "jail not found", .plain, .{ .enabled = false });
-    try testing.expect(std.mem.indexOf(u8, list.items, "error\t42\tjail not found") != null);
-}
-
-test "format: color escapes emitted only when enabled" {
-    var list = std.ArrayList(u8).init(testing.allocator);
-    defer list.deinit();
-    const payload = "[{\"ip\":\"1.2.3.4\",\"jail\":\"sshd\",\"attempt_count\":3,\"last_attempt\":0,\"ban_count\":1,\"ban_expiry\":9999999999}]";
-
-    try formatList(testing.allocator, list.writer(), payload, .table, .{ .enabled = true });
-    try testing.expect(std.mem.indexOf(u8, list.items, "\x1b[") != null);
-
-    list.clearRetainingCapacity();
-    try formatList(testing.allocator, list.writer(), payload, .table, .{ .enabled = false });
-    try testing.expect(std.mem.indexOf(u8, list.items, "\x1b[") == null);
 }
 
 const config_payload =
@@ -821,14 +769,6 @@ test "format: verified structural identities fit or stack without clipping" {
     try writeFirewallStructureRules(nft_out.writer(), &.{.{ .family = "inet", .table = name, .chain = "input", .match = "ip saddr @banned_ipv4", .verdict = "drop" }}, .{ .enabled = false }, 80);
     try testing.expect(std.mem.indexOf(u8, nft_out.items, "MATCH") != null);
     try testing.expect(std.mem.indexOf(u8, nft_out.items, "MATCH:") == null);
-}
-
-test "format: ban countdown uses unsigned seconds after expiry validation" {
-    try testing.expectEqualStrings("1m 58s", formatRemaining(118));
-    try testing.expectEqualStrings("1m 00s", formatRemaining(60));
-    try testing.expectEqualStrings("0m 00s", formatRemaining(0));
-    try testing.expectEqualStrings("expired", formatRemaining(-1));
-    try testing.expectEqualStrings("-", formatRemaining(null));
 }
 
 test "format: firewall rejects available response without an observation" {

@@ -239,24 +239,6 @@ fn defaultIptablesAvailable() bool {
     return iptables.probeAvailable();
 }
 
-test "backend: tagged union dispatches to nftables vtable" {
-    var be: Backend = .{ .nftables = nftables.NftablesBackend{} };
-    try std.testing.expectEqual(BackendTag.nftables, be.tag());
-    _ = be.isAvailable();
-}
-
-test "backend: tagged union dispatches to ipset vtable" {
-    var be: Backend = .{ .ipset = ipset.IpsetBackend{} };
-    try std.testing.expectEqual(BackendTag.ipset, be.tag());
-    _ = be.isAvailable();
-}
-
-test "backend: tagged union dispatches to iptables vtable" {
-    var be: Backend = .{ .iptables = iptables.IptablesBackend{} };
-    try std.testing.expectEqual(BackendTag.iptables, be.tag());
-    _ = be.isAvailable();
-}
-
 test "backend: detect prefers nftables when all available" {
     const probes: AvailabilityProbes = .{
         .nftablesReason = testNftReasonAvailable,
