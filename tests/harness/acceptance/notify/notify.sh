@@ -71,9 +71,9 @@ make_run() {
     NAMESPACES+=("$NS")
     timeout 15 sudo -n ip netns add "$NS"
     timeout 15 sudo -n ip netns exec "$NS" ip link set lo up
-    awk -v socket="$SOCKDIR/$RUN.sock" -v log="$LOG" '
+    awk -v socket="$SOCKDIR/$RUN.sock" -v log_path="$LOG" '
         /^socket_path = / { print "socket_path = \"" socket "\""; next }
-        /^log_target = / { print "log_target = \"" log "\""; next }
+        /^log_target = / { print "log_target = \"" log_path "\""; next }
         { print }
     ' "$W/config-restart-populate.toml" > "$CFG"
     : > "$LOG"
@@ -103,13 +103,13 @@ done
 [[ ${ACTIVE:-} == active ]] || fail 'progressing startup exceeded 150 seconds'
 ELAPSED=$((SECONDS-START))
 [[ $(property "$UNIT" SubState) == running ]] || fail 'unit did not reach running'
-grep -q 'native: ready' "$LOG" || fail 'active service lacks READY log'
 timeout 10 sudo -n ip netns exec "$NS" "$ORACLE" > "$W/notify-kernel.txt"
 python3 -B "$RECOVERY_DIR/recovery_check.py" "$W/state/fail2zig.sqlite" count "$W/notify-kernel.txt" 400
 journal "$UNIT" progress
 printf 'notify: progressing READY=%ss kernel=400\n' "$ELAPSED" | tee "$W/notify-progress-result.txt"
 timeout 20 sudo -n systemctl stop "$UNIT"
 [[ $(property "$UNIT" ActiveState) == inactive ]] || fail 'progressing unit did not stop cleanly'
+grep -q 'native: ready' "$LOG" || fail 'active service lacks READY log'
 # A fast startup cannot qualify timeout extension; still exercise stalled startup.
 FAST=0
 (( ELAPSED > 20 )) || FAST=1
