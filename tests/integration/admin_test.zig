@@ -829,12 +829,14 @@ test "admin: enforcing manual ban, unban and disable settle only by kernel readb
     try t.expect(std.mem.indexOf(u8, reload.stdout, "\"outcome\":\"applied\"") != null);
     // Reload commits before recovery republishes health. Require a new readback
     // so the pre-reload active snapshot cannot admit the next admin operation.
-    const reloaded_us: u64 = @intCast(std.time.microTimestamp());
+    const reloaded_us = std.time.microTimestamp();
     var reload_timer = try std.time.Timer.start();
     while (true) {
         const snapshot = try h.queryStatus();
         defer a.free(snapshot);
-        if ((harness.parseJsonUintField(snapshot, "confirmed_at_us") orelse 0) >= reloaded_us) break;
+        const view = try std.json.parseFromSlice(struct { confirmed_at_us: ?i64 = null }, a, snapshot, .{ .ignore_unknown_fields = true });
+        defer view.deinit();
+        if ((view.value.confirmed_at_us orelse 0) >= reloaded_us) break;
         if (reload_timer.read() >= 10 * std.time.ns_per_s) return error.TimedOut;
         std.time.sleep(25 * std.time.ns_per_ms);
     }
