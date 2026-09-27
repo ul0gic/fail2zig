@@ -185,6 +185,9 @@ fn inspectFile(
     findings: *std.ArrayList(Finding),
 ) !void {
     if (isFrozenData(path)) return;
+    // Explicit lab-only tooling is neither packaged nor invoked by product
+    // builds. Callers in engine, scripts and build/release paths stay scanned.
+    if (std.mem.startsWith(u8, path, "tests/harness/acceptance/")) return;
     if (isInterpreterExtension(path)) {
         try findings.append(.{
             .path = try allocator.dupe(u8, path),
