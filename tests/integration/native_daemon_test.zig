@@ -635,7 +635,7 @@ test "native daemon: blocked SQLite writer leaves IPC responsive and resumes exa
     try h.writeLine(failure);
     try waitStatus(&h, "\"storage\":\"paused\"");
     try waitStatus(&h, "\"state\":\"degraded\"");
-    const visible = try std.process.Child.run(.{ .allocator = t.allocator, .argv = &.{ "zig-out/bin/fail2zig", "--socket", h.socket_path, "--timeout", "1000", "--output", "plain", "status" }, .max_output_bytes = 65536 });
+    const visible = try std.process.Child.run(.{ .allocator = t.allocator, .argv = &.{ h.options.daemon_path, "--socket", h.socket_path, "--timeout", "1000", "--output", "plain", "status" }, .max_output_bytes = 65536 });
     defer t.allocator.free(visible.stdout);
     defer t.allocator.free(visible.stderr);
     try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, visible.term);
@@ -934,7 +934,7 @@ test "native daemon: oversized source isolates its jail while independent file d
         .{ .format = "table", .command = "jails", .needle = cause_text },
     };
     for (checks) |check| {
-        const result = try std.process.Child.run(.{ .allocator = t.allocator, .argv = &.{ "zig-out/bin/fail2zig", "--socket", h.socket_path, "--timeout", "1000", "--output", check.format, check.command }, .max_output_bytes = 65536 });
+        const result = try std.process.Child.run(.{ .allocator = t.allocator, .argv = &.{ h.options.daemon_path, "--socket", h.socket_path, "--timeout", "1000", "--output", check.format, check.command }, .max_output_bytes = 65536 });
         defer t.allocator.free(result.stdout);
         defer t.allocator.free(result.stderr);
         if (!std.meta.eql(std.process.Child.Term{ .Exited = 0 }, result.term)) {
@@ -967,7 +967,7 @@ test "native daemon: delivered client renders native status jails version and de
     const commands = [_][]const u8{ "status", "jails", "version", "list" };
     const expected = [_][]const u8{ "log-only", "sshd", "daemon\t" ++ engine.version, "203.0.113.7" };
     for (commands, expected) |command, text| {
-        const result = try std.process.Child.run(.{ .allocator = t.allocator, .argv = &.{ "zig-out/bin/fail2zig", "--socket", h.socket_path, "--timeout", "1000", "--output", "plain", command }, .max_output_bytes = 65536 });
+        const result = try std.process.Child.run(.{ .allocator = t.allocator, .argv = &.{ h.options.daemon_path, "--socket", h.socket_path, "--timeout", "1000", "--output", "plain", command }, .max_output_bytes = 65536 });
         defer t.allocator.free(result.stdout);
         defer t.allocator.free(result.stderr);
         try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);

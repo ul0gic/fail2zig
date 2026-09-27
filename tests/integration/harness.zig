@@ -56,7 +56,15 @@ pub const Harness = struct {
     child: ?std.process.Child = null,
     metrics_port: u16,
 
-    pub fn init(allocator: std.mem.Allocator, options: Options) !Harness {
+    pub fn init(allocator: std.mem.Allocator, initial_options: Options) !Harness {
+        var options = initial_options;
+        if (std.mem.eql(u8, options.daemon_path, default_daemon_path)) {
+            if (std.posix.getenv("F2Z_TEST_DAEMON")) |candidate| {
+                if (!std.fs.path.isAbsolute(candidate)) return error.DaemonBinaryMissing;
+                try std.fs.cwd().access(candidate, .{});
+                options.daemon_path = candidate;
+            }
+        }
         if (builtin.os.tag != .linux) return error.SkipZigTest;
 
         var tmp = std.testing.tmpDir(.{});

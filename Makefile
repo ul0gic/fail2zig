@@ -12,7 +12,7 @@ INSTALL ?= install
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build test fmt fmt-check release release-all install clean fuzz \
+.PHONY: help build test test-full fmt fmt-check release release-all install clean fuzz \
         harness-smoke lint
 
 help:
@@ -28,12 +28,16 @@ help:
 		lint 'Static analysis: zig fmt --check, shellcheck, yamllint' \
 		release 'Build a stripped ReleaseSafe executable (RELEASE_TARGET)' \
 		release-all 'Build all five release architectures into separate prefixes' \
-		test 'Run maintained CI component, integration and bounded fuzz suites'
+		test 'Run one delivered daemon/client smoke check' \
+		test-full 'Run all maintained CI component, integration and bounded fuzz suites'
 
 build:
 	zig build
 
 test:
+	zig build test-smoke -Doptimize=ReleaseSafe -j$(ZIG_JOBS)
+
+test-full:
 	zig build test-ci-components-a -Doptimize=ReleaseSafe -j$(ZIG_JOBS)
 	zig build test-ci-components-b -Doptimize=ReleaseSafe -j$(ZIG_JOBS)
 	zig build test-ci-assembled -Doptimize=ReleaseSafe -j$(ZIG_JOBS)

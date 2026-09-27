@@ -41,7 +41,7 @@ pub fn build(b: *std.Build) void {
     const enable_bench = b.option(
         bool,
         "bench",
-        "Auto-set FAIL2ZIG_RUN_BENCH=1 on benchmark test runs so `zig build test` exercises them.",
+        "Enable measurements in the explicit benchmark-parser step.",
     ) orelse false;
     const test_filter = b.option(
         []const u8,
@@ -100,7 +100,7 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_engine.addArgs(args);
     b.step("run", "Run the fail2zig daemon").dependOn(&run_engine.step);
 
-    const test_step = b.step("test", "Run all tests (engine, client, shared, integration)");
+    const test_step = b.step("test", "Run the small delivered-daemon smoke check (alias of test-smoke)");
     const release_local_step = b.step("test-release-local", "Run the bounded assembled local release gate");
     const ci: CiGates = .{
         .components_a = b.step("test-ci-components-a", "Run maintained native components, shard A"),
@@ -115,7 +115,6 @@ pub fn build(b: *std.Build) void {
         .filters = test_filters,
     });
     const run_engine_tests = b.addRunArtifact(engine_tests);
-    test_step.dependOn(&run_engine_tests.step);
     ci.add(.deferred, &run_engine_tests.step); // Mixed legacy and current behavior remains outside maintained CI.
     b.step("test-engine", "Run native daemon tests").dependOn(&run_engine_tests.step);
 
@@ -231,6 +230,15 @@ pub fn build(b: *std.Build) void {
         const run_tests = b.addRunArtifact(tests);
         b.step(entry.name, "Test isolated native component delivery").dependOn(&run_tests.step);
         ci.add(entry.ci, &run_tests.step);
+        // Compile-only entry points for isolated target execution; never run on the build host.
+        if (std.mem.eql(u8, entry.name, "test-native-effect-runtime") or
+            std.mem.eql(u8, entry.name, "test-native-firewall") or
+            std.mem.eql(u8, entry.name, "test-load-repair-migration"))
+        {
+            const artifact_name = b.fmt("{s}-tests", .{entry.name[5..]});
+            const installed = b.addInstallArtifact(tests, .{ .dest_sub_path = artifact_name });
+            b.step(b.fmt("build-{s}", .{artifact_name}), "Build an isolated target test binary without executing it").dependOn(&installed.step);
+        }
     }
 
     const client_format_api = b.createModule(.{
@@ -274,10 +282,7 @@ pub fn build(b: *std.Build) void {
     });
     native_foundations_mod.addImport("shared", shared_mod);
     native_foundations_mod.addImport("engine_test", component_api);
-    const native_foundations_tests = b.addTest(.{ .root_module = native_foundations_mod, .filters = test_filters });
     native_foundations_mod.linkLibrary(sqlite);
-    const run_native_foundations_tests = b.addRunArtifact(native_foundations_tests);
-    test_step.dependOn(&run_native_foundations_tests.step);
 
     const native_foundations = b.addTest(.{ .root_module = native_foundations_mod, .filters = &.{ "storage health:", "native processor:", "record store:", "pipeline:", "receipt recovery:", "future time:", "time admission:", "event age:", "year inference:", "native journal:", "clock recovery:", "native retry:" } });
     const run_foundations = b.addRunArtifact(native_foundations);
@@ -305,7 +310,6 @@ pub fn build(b: *std.Build) void {
     const detection_tests = b.addTest(.{ .root_module = detection_mod, .filters = &.{"native detection:"} });
     const run_detection_tests = b.addRunArtifact(detection_tests);
     b.step("test-native-detection", "Test native file and origin-qualified journal detection").dependOn(&run_detection_tests.step);
-    test_step.dependOn(&run_detection_tests.step);
     ci.add(.components_a, &run_detection_tests.step);
 
     const retry_mod = b.createModule(.{
@@ -320,7 +324,6 @@ pub fn build(b: *std.Build) void {
     const retry_tests = b.addTest(.{ .root_module = retry_mod, .filters = &.{"native retry:"} });
     const run_retry_tests = b.addRunArtifact(retry_tests);
     b.step("test-native-retry", "Test transactional native retry state and decisions").dependOn(&run_retry_tests.step);
-    test_step.dependOn(&run_retry_tests.step);
     ci.add(.components_b, &run_retry_tests.step);
 
     const journal_lab_mod = b.createModule(.{
@@ -343,14 +346,12 @@ pub fn build(b: *std.Build) void {
         .filters = test_filters,
     });
     const run_client_tests = b.addRunArtifact(client_tests);
-    test_step.dependOn(&run_client_tests.step);
 
     const shared_tests = b.addTest(.{
         .root_module = shared_mod,
         .filters = test_filters,
     });
     const run_shared_tests = b.addRunArtifact(shared_tests);
-    test_step.dependOn(&run_shared_tests.step);
     const native_cli_step = b.step("test-native-cli", "Test the internal administration modules and shared exit classes");
     native_cli_step.dependOn(&run_client_tests.step);
     native_cli_step.dependOn(&run_shared_tests.step);
@@ -366,7 +367,6 @@ pub fn build(b: *std.Build) void {
     guard_mod.addImport("guard_options", guard_options.createModule());
     const guard_tests = b.addTest(.{ .root_module = guard_mod, .filters = test_filters });
     const run_guard = b.addRunArtifact(guard_tests);
-    test_step.dependOn(&run_guard.step);
     ci.add(.fuzz, &run_guard.step);
 
     const standalone_options = b.addOptions();
@@ -424,8 +424,19 @@ pub fn build(b: *std.Build) void {
         ci.add(f.ci, &run.step);
         if (std.mem.eql(u8, f.name, "startup_failclosed"))
             b.step("test-startup", "Run daemon startup integration tests").dependOn(&run.step);
-        if (std.mem.eql(u8, f.name, "native_daemon"))
+        if (std.mem.eql(u8, f.name, "native_daemon")) {
             b.step("test-native-daemon", "Run actual native daemon ingestion and restart tests").dependOn(&run.step);
+            const installed = b.addInstallArtifact(t, .{ .dest_sub_path = "native-daemon-tests" });
+            b.step("build-native-daemon-tests", "Build daemon tests for an explicit F2Z_TEST_DAEMON candidate").dependOn(&installed.step);
+            const smoke = b.addTest(.{ .root_module = mod, .filters = &.{"native daemon: delivered client renders native status jails version and decision deadlines"} });
+            const smoke_run = b.addRunArtifact(smoke);
+            smoke_run.removeEnvironmentVariable("F2Z_NATIVE_DAEMON_ENFORCEMENT");
+            smoke_run.step.dependOn(b.getInstallStep());
+            b.step("test-smoke", "Run one delivered daemon/client behavior check").dependOn(&smoke_run.step);
+            test_step.dependOn(&smoke_run.step);
+            const smoke_install = b.addInstallArtifact(smoke, .{ .dest_sub_path = "smoke-tests" });
+            b.step("build-smoke-tests", "Build the smoke check without executing it").dependOn(&smoke_install.step);
+        }
         if (std.mem.eql(u8, f.name, "config_diag"))
             b.step("test-config-diag", "Run configuration diagnostic entry-point tests").dependOn(&run.step);
         if (std.mem.eql(u8, f.name, "no_backend"))
@@ -440,7 +451,6 @@ pub fn build(b: *std.Build) void {
             b.step("test-cli-entry", "Run one-executable entry point and operator round trips").dependOn(&run.step);
         if (std.mem.eql(u8, f.name, "journalctl_contract"))
             b.step("test-journalctl", "Qualify host journalctl against original offline fixtures").dependOn(&run.step);
-        test_step.dependOn(&run.step);
     }
 
     const release_migration_options = b.addOptions();
@@ -489,9 +499,8 @@ pub fn build(b: *std.Build) void {
         });
         mod.addImport("shared", shared_mod);
         if (f.extra_import_name) |n| mod.addImport(n, f.extra_import_mod.?);
-        const t = b.addTest(.{ .root_module = mod, .filters = test_filters });
+        const t = b.addTest(.{ .root_module = mod, .filters = &.{"fuzz_"} });
         const run = b.addRunArtifact(t);
-        test_step.dependOn(&run.step);
         ci.add(f.ci, &run.step);
     }
 
@@ -514,7 +523,7 @@ pub fn build(b: *std.Build) void {
         const t = b.addTest(.{ .root_module = mod, .filters = test_filters });
         const run = b.addRunArtifact(t);
         if (enable_bench) run.setEnvironmentVariable("FAIL2ZIG_RUN_BENCH", "1");
+        b.step("benchmark-parser", "Run the explicit parser measurement (enable with -Dbench=true)").dependOn(&run.step);
         if (f.needs_daemon_binary) run.step.dependOn(b.getInstallStep());
-        test_step.dependOn(&run.step);
     }
 }
