@@ -40,9 +40,24 @@ light_path() {
     esac
 }
 
+# Narrow PR mapping. Unknown paths deliberately select the full maintained gate.
+# Space-separated build steps are constants here, never derived from path text.
+scoped_path() {
+    case $1 in
+        client/*|tests/component/client_format_tests.zig|tests/integration/cli_entry_test.zig)
+            echo 'test-client-format test-cli-entry test-native-cli' ;;
+        engine/cli/rule_test.zig|tests/component/native_rule_test_tests.zig)
+            echo 'test-native-rule-test test-native-rules' ;;
+        engine/filters/*|engine/core/parser.zig|tests/component/native_detection_tests.zig)
+            echo 'test-native-detection test-ci-fuzz' ;;
+        engine/core/native_rules.zig|tests/component/native_rule_tests.zig)
+            echo 'test-native-rules test-native-consumer-plan test-ci-fuzz' ;;
+        *) return 1 ;;
+    esac
+}
+
 classify() {
-    local status path count=0
-    # A dispatch is deliberately full, including after a docs-only commit.
+    local status path count=0 all_light=true targets='' selected
     [[ ${GITHUB_EVENT_NAME:-} != workflow_dispatch ]] || { echo full; return; }
     comparison || { echo full; return; }
     local diff
@@ -51,13 +66,40 @@ classify() {
     git diff --name-status --no-renames -z "$base" "$tip" -- > "$diff" || { echo full; return; }
     while IFS= read -r -d '' status; do
         IFS= read -r -d '' path || { echo full; return; }
-        # Renames become deletion/addition pairs. Both deletions and type changes
-        # must run full even if all names happen to be documentation.
+        # Deletions, renames and type changes remain conservative.
         [[ $status == A || $status == M ]] || { echo full; return; }
-        light_path "$path" || { echo full; return; }
+        case $path in
+            /*|*'/../'*|../*|*'/./'*|*//*|*$'\n'*|*$'\r'*) echo full; return ;;
+        esac
         count=$((count + 1))
+        if light_path "$path"; then continue; fi
+        all_light=false
+        [[ ${GITHUB_EVENT_NAME:-} == pull_request ]] || { echo full; return; }
+        selected=$(scoped_path "$path") || { echo full; return; }
+        targets+=" $selected"
     done < "$diff"
-    if ((count > 0)); then echo light; else echo full; fi
+    if ((count == 0)); then echo full
+    elif $all_light; then echo light
+    else
+        # Stable deduplication also avoids rerunning a component for two changed paths.
+        printf 'scoped|test-smoke'
+        printf '%s\n' "$targets" | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ' | sed 's/^/ /;s/ $/\n/'
+    fi
+}
+
+validate_targets() {
+    local target seen=' '
+    [[ ${CI_TARGETS:-} == test-smoke\ * ]] || return 1
+    [[ $CI_TARGETS != *$'\n'* && $CI_TARGETS != *$'\r'* ]] || return 1
+    read -r -a targets <<< "$CI_TARGETS"
+    for target in "${targets[@]}"; do
+        case $target in
+            test-smoke|test-client-format|test-cli-entry|test-native-cli|test-native-rule-test|test-native-rules|test-native-consumer-plan|test-native-detection|test-ci-fuzz) ;;
+            *) return 1 ;;
+        esac
+        [[ $seen != *" $target "* ]] || return 1
+        seen+="$target "
+    done
 }
 
 gate() {
@@ -65,25 +107,40 @@ gate() {
       length == 1 and (.[0] | type == "object" and
       (keys == (["scope"] + $full | sort)) and
       (.scope.outputs.route as $route |
-        ($route == "full" or $route == "light") and
+        ($route == "full" or $route == "light" or $route == "scoped") and
         all(to_entries[];
-          .value.result == (if $route == "light" and (.key as $k | $full | index($k)) != null
+          .value.result == (if ($route == "light" and (.key as $k | $full | index($k)) != null) or
+                               ($route == "scoped" and (.key as $k | ["components","fuzz","release-target"] | index($k)) != null)
                             then "skipped" else "success" end))))
     ' <<< "${CI_NEEDS:-}" >/dev/null || {
         echo 'CI failed: missing, malformed, failed, cancelled or unexpectedly skipped checks.' >&2
         return 1
     }
+    if [[ $(jq -r '.scope.outputs.route' <<< "$CI_NEEDS") == scoped ]]; then
+        CI_TARGETS=$(jq -er '.scope.outputs.targets' <<< "$CI_NEEDS") validate_targets
+    fi
 }
 
 case ${1:-} in
     classify)
-        route=$(classify)
+        selection=$(classify)
+        route=${selection%%|*}
+        if [[ $route == scoped ]]; then
+            printf 'targets=%s\n' "${selection#*|}" >> "${GITHUB_OUTPUT:?}"
+        fi
         printf 'route=%s\n' "$route" >> "${GITHUB_OUTPUT:?}"
         printf 'CI route: %s\n' "$route"
         ;;
     whitespace)
         if comparison; then git diff --check "$base" "$tip" --;
         else git show --format= --check HEAD --; fi
+        ;;
+    run-scoped)
+        validate_targets || { echo 'Invalid scoped build targets' >&2; exit 2; }
+        # Separate invocations serialize any steps sharing zig-out/bin.
+        for target in "${targets[@]}"; do
+            zig build "$target" -Doptimize=ReleaseSafe -j2 --summary all
+        done
         ;;
     gate) gate ;;
     qualification)
@@ -100,5 +157,5 @@ case ${1:-} in
               source_commit:$source_commit, route:"full", event:$event,
               run_id:$run_id, run_attempt:$run_attempt}' > qualification.json
         ;;
-    *) echo 'Usage: ci_scope.sh classify|whitespace|gate|qualification' >&2; exit 2 ;;
+    *) echo 'Usage: ci_scope.sh classify|whitespace|run-scoped|gate|qualification' >&2; exit 2 ;;
 esac
