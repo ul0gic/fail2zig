@@ -1108,14 +1108,17 @@ pub const Manager = struct {
                     // Nothing was sent: the desired state already held in the baseline.
                     self.last_mutation_ns = prior_mutation_ns;
                     self.last_mutation_wall_us = prior_mutation_wall_us;
-                    // A held inventory read before this intent existed cannot date its
-                    // outcome; the next step reads the kernel and settles from that.
-                    if (self.inventory) |held| if (held.start_us < entry.intent_us) {
-                        snapshot.deinit();
-                        self.dropInventory();
-                        return .progress;
-                    };
-                    if (self.inventory == null) {
+                    // nftables reused the held baseline; tool transports made a fresh
+                    // pre-read in applyExact, which may show an element expired since
+                    // the held inventory. Settle from that fresh result.
+                    if (self.inspector.installation.transport == .nftables) {
+                        if (self.inventory) |held| if (held.start_us < entry.intent_us) {
+                            snapshot.deinit();
+                            self.dropInventory();
+                            return .progress;
+                        };
+                    }
+                    if (self.inventory == null or self.inspector.installation.transport != .nftables) {
                         {
                             errdefer snapshot.deinit();
                             try self.validateAndCaptureObservation(&snapshot, .effect, verified.observed_wall_us, .effect_verify);
