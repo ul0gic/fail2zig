@@ -2,7 +2,7 @@
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
 
-const fail2zig_version = "0.4.4";
+const fail2zig_version = "0.4.5";
 
 const CiLane = enum { components_a, components_b, assembled, fuzz, excluded, deferred };
 const CiGates = struct {
@@ -441,8 +441,11 @@ pub fn build(b: *std.Build) void {
             b.step("test-config-diag", "Run configuration diagnostic entry-point tests").dependOn(&run.step);
         if (std.mem.eql(u8, f.name, "no_backend"))
             b.step("test-no-backend", "Run native backend selection and fail-closed integration tests").dependOn(&run.step);
-        if (std.mem.eql(u8, f.name, "admin"))
+        if (std.mem.eql(u8, f.name, "admin")) {
             b.step("test-admin", "Run typed administration daemon tests").dependOn(&run.step);
+            const installed = b.addInstallArtifact(t, .{ .dest_sub_path = "admin-tests" });
+            b.step("build-admin-tests", "Build administration checks for isolated target execution").dependOn(&installed.step);
+        }
         if (std.mem.eql(u8, f.name, "reload"))
             b.step("test-reload", "Run live configuration reload daemon tests").dependOn(&run.step);
         if (std.mem.eql(u8, f.name, "service_lifecycle"))

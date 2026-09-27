@@ -999,6 +999,17 @@ test "admin: enforcing manual ban, unban and disable settle only by kernel readb
     defer native.deinit(a);
     try t.expect(native.code == 0 or native.code == 4);
     try waitKernel(a, "203.0.113.99", true, 10000);
+    // A later native decision on a migrated scope must survive rollback too.
+    const replacement = try admin(a, &h, &.{ "ban", "192.0.2.10", "--jail", "sshd", "--duration", "900" });
+    defer replacement.deinit(a);
+    try t.expectEqual(@as(u8, 0), replacement.code);
+    const retained = blk: {
+        var store = try engine.native_store_mod.Store.open(a, h.state_path);
+        defer store.close();
+        const scope = engine.firewall_scope_mod.Scope{ .subject = engine.firewall_scope_mod.Subject.host(.{ .ipv4 = (192 << 24) | (2 << 8) | 10 }) };
+        const key = try (try engine.native_effect_mod.Scope.exact(scope)).key((try store.readInstallation()).?);
+        break :blk .{ .key = key, .owner = (try store.currentOwner(key, "sshd")).? };
+    };
     const restore = try run(a, &.{ exe, "migrate", "rollback", "--plan", plan_path, "--state-file", h.state_path, "--staging-dir", staging, "--backend", "iptables", "--socket", h.socket_path, "--run-id", cutover_run });
     defer restore.deinit(a);
     if (restore.code != 3) std.debug.print("rollback stdout:\n{s}\nrollback stderr:\n{s}\n", .{ restore.stdout, restore.stderr });
@@ -1048,11 +1059,18 @@ test "admin: enforcing manual ban, unban and disable settle only by kernel readb
     try t.expectEqual(@as(u8, 0), released.code);
     const rules_after = try run(a, &.{ "iptables", "-S" });
     defer rules_after.deinit(a);
-    if (std.mem.indexOf(u8, released.stdout, "\"state\":\"rolled_back\"") == null or try kernelHas(a, "192.0.2.10") or !try kernelHas(a, "203.0.113.99")) std.debug.print("release report:\n{s}\nrules after release:\n{s}\n", .{ released.stdout, rules_after.stdout });
+    if (std.mem.indexOf(u8, released.stdout, "\"state\":\"rolled_back\"") == null or !try kernelHas(a, "192.0.2.10") or !try kernelHas(a, "203.0.113.99")) std.debug.print("release report:\n{s}\nrules after release:\n{s}\n", .{ released.stdout, rules_after.stdout });
     try t.expect(std.mem.indexOf(u8, released.stdout, "\"state\":\"rolled_back\"") != null);
     try waitKernel(a, "198.51.100.7", false, 5000);
-    try t.expect(!try kernelHas(a, "192.0.2.10"));
+    try t.expect(try kernelHas(a, "192.0.2.10"));
     try t.expect(try kernelHas(a, "203.0.113.99"));
+    {
+        var store = try engine.native_store_mod.Store.open(a, h.state_path);
+        defer store.close();
+        const owner = (try store.currentOwner(retained.key, "sshd")).?;
+        try t.expectEqualSlices(u8, &retained.owner.decision_id, &owner.decision_id);
+        try t.expectEqual(retained.owner.lease, owner.lease);
+    }
     const again_rolled = try run(a, &.{ exe, "migrate", "rollback", "--plan", plan_path, "--state-file", h.state_path, "--staging-dir", staging, "--backend", "iptables", "--socket", h.socket_path, "--run-id", cutover_run, "--source-verified" });
     defer again_rolled.deinit(a);
     try t.expectEqual(@as(u8, 0), again_rolled.code);

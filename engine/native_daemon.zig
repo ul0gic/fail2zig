@@ -805,6 +805,7 @@ pub const Coordinator = struct {
             return (view.withOutcome(.uncertain)).withReason("effect outcome uncertain: {s}", .{if (manager.status.cause) |cause| @errorName(cause) else "unknown"});
         }
         if (request.kind == .migration_rollback) {
+            const remaining = self.store.migrationOwnersRemaining(run_id) catch |err| return (view.withOutcome(.uncertain)).withReason("migration owners unreadable: {s}", .{@errorName(err)});
             const staged_count = self.store.migrationStagedKeys(run_id, keys) catch |err| return (view.withOutcome(.uncertain)).withReason("staged scopes unreadable: {s}", .{@errorName(err)});
             var realized: usize = 0;
             for (keys[0..staged_count]) |key| {
@@ -814,14 +815,14 @@ pub const Coordinator = struct {
                 };
             }
             const coherent = manager.status.ready and manager.cached_epoch != null and manager.cached_epoch.? == self.store.effect_publication_epoch;
-            if (coherent and realized == 0 and report.found == 0) {
+            if (coherent and remaining == 0) {
                 view.outcome = .applied;
-                view.destination = "absent";
-                return view.withReason("every migrated scope released; {d} staged scopes absent in the kernel", .{staged_count});
+                view.destination = if (realized == 0) "absent" else "present";
+                return view.withReason("migration owners released; {d} of {d} staged scopes remain protected by other owners", .{ realized, staged_count });
             }
             if (monotonic(self) < request.deadline_ms) return null;
             view.destination = "partial";
-            return view.withReason("{d} of {d} migrated scopes still realized after the deadline", .{ realized, staged_count });
+            return view.withReason("{d} migration owners remain; current protection not confirmed before the deadline", .{remaining});
         }
         if (report.found == report.expected and applied == report.found) {
             view.outcome = .applied;

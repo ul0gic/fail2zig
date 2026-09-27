@@ -210,8 +210,13 @@ test "migration store: rollback deltas name released, expired and native owners 
     var keys: [8][32]u8 = undefined;
     try t.expectEqual(@as(usize, 3), try f.store.migrationStagedKeys(run_id, &keys));
     const history_before = try f.store.inspectInteger("SELECT count(*) FROM effect_owner_revisions;");
-    try t.expectEqual(@as(u64, 3), try f.store.releaseMigrationOwners(run_id, clock()));
+    try t.expectEqual(@as(usize, 2), try f.store.migrationOwnersRemaining(run_id));
+    try t.expectEqual(@as(u64, 2), try f.store.releaseMigrationOwners(run_id, clock()));
     try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM effect_owners WHERE jail='sshd' AND lease_kind!=0 AND deadline_us=8000000;"));
+    const retained = (try f.store.currentOwner(released_key, "sshd")).?;
+    try t.expectEqualSlices(u8, &([_]u8{0x3c} ** 32), &retained.decision_id);
+    try t.expectEqual(effects.Lease{ .finite = 9_500_000 }, retained.lease);
+    try t.expectEqual(@as(usize, 0), try f.store.migrationOwnersRemaining(run_id));
     try t.expect(try f.store.inspectInteger("SELECT count(*) FROM effect_owner_revisions;") > history_before);
     try t.expectEqual(@as(u64, 0), try f.store.releaseMigrationOwners(run_id, clock()));
 }

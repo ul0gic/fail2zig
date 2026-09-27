@@ -21,7 +21,7 @@ the unit and man pages, and refuses active state writers or a legacy binary stat
 file. It does not recursively change state ownership. To use a locally built
 binary, run `sudo scripts/install.sh --local-bin zig-out/bin` from the checkout.
 
-The v0.4.4 release provides one combined daemon/admin executable per target:
+The v0.4.5 release provides one combined daemon/admin executable per target:
 
 | Target | Qualification |
 |---|---|
@@ -38,11 +38,11 @@ requires `journalctl`; iptables and ipset backends require their host tools.
 
 If the installer is unsuitable, download only the needed executable and support
 files from the same release, then verify each against `SHA256SUMS` before use. For
-v0.4.4 on x86_64:
+v0.4.5 on x86_64:
 
 ```bash
 set -euo pipefail
-VERSION=v0.4.4
+VERSION=v0.4.5
 ARCH=x86_64-linux-musl
 BASE="https://github.com/ul0gic/fail2zig/releases/download/${VERSION}"
 for file in \

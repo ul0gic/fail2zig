@@ -144,6 +144,11 @@ test "migration conflict: activation keeps live native owners, records conflicts
         std.debug.print("BUG-024: {d} owner revisions were written by activation; kept native owners must not be rewritten (at most 2 expected)\n", .{revisions_after - revisions_before});
         return error.TestUnexpectedResult;
     }
+    try t.expectEqual(@as(usize, 2), try f.store.migrationOwnersRemaining(run_id));
+    try t.expectEqual(@as(u64, 2), try f.store.releaseMigrationOwners(run_id, clock()));
+    try expectOwner("rollback keeps permanent native owner", try ownerRow(&f.store, 10), .{ .count = 1, .lease_kind = 2, .deadline_us = null, .native_decision = true });
+    try expectOwner("rollback keeps later native deadline", try ownerRow(&f.store, 11), .{ .count = 1, .lease_kind = 1, .deadline_us = staged_deadline + 1_000_000_000, .native_decision = true });
+    try t.expectEqual(@as(usize, 0), try f.store.migrationOwnersRemaining(run_id));
 }
 
 test "migration conflict: repeated activation after a conflict replays without new revisions" {

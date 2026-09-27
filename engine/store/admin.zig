@@ -89,25 +89,50 @@ pub fn Methods(comptime Store: type) type {
                 try update.done();
             }
             const canonical_scope = @import("../firewall/scope.zig");
-            const Held = struct { key: [32]u8, revision: u64, scope: [canonical_scope.encoded_bytes]u8 };
+            const Held = struct { key: [32]u8, revision: u64, scope: [canonical_scope.encoded_bytes]u8, absent: bool };
             var held = std.ArrayListUnmanaged(Held){};
             defer held.deinit(self.allocator);
             {
-                var owners = try self.statement("SELECT o.scope_key,o.revision,n.canonical_scope FROM effect_owners o JOIN native_effects n USING(scope_key) WHERE o.jail=?1 AND o.generation=?2 ORDER BY o.scope_key;");
+                var owners = try self.statement("SELECT o.scope_key,o.revision,n.canonical_scope,o.lease_kind,o.deadline_us,EXISTS(SELECT 1 FROM effect_owner_revisions h WHERE h.scope_key=o.scope_key AND h.jail=o.jail AND h.revision=o.revision AND h.generation=o.generation AND h.decision_id=o.decision_id AND h.lease_kind=o.lease_kind AND h.deadline_us IS o.deadline_us AND h.decided_us=o.decided_us) FROM effect_owners o JOIN native_effects n USING(scope_key) WHERE o.jail=?1 AND o.generation=?2 ORDER BY o.scope_key;");
                 defer owners.deinit();
                 try owners.text(1, jail);
                 try owners.blob(2, &change.generation);
                 while (try owners.row()) {
                     if (held.items.len == effects.max_effects) return error.EffectCapacity;
                     const owner_revision = try owners.signed(1);
-                    if (owner_revision <= 0) return error.InvalidEffect;
-                    try held.append(self.allocator, .{ .key = try effectBlob(&owners, 0, 32), .revision = @intCast(owner_revision), .scope = try effectBlob(&owners, 2, canonical_scope.encoded_bytes) });
+                    if (owner_revision <= 0 or owner_revision >= std.math.maxInt(i64) or try owners.signed(5) != 1) return error.InvalidEffect;
+                    const lease = try effectLease(&owners, 3, 4);
+                    try held.append(self.allocator, .{ .key = try effectBlob(&owners, 0, 32), .revision = @intCast(owner_revision), .scope = try effectBlob(&owners, 2, canonical_scope.encoded_bytes), .absent = lease == .absent });
                 }
             }
             const count: i64 = @intCast(held.items.len);
-            try self.reserveEffectRows(.{ .revisions = count, .intents = count, .observations = count * @import("store.zig").load_repair.observations_per_intent });
+            var live_count: i64 = 0;
+            for (held.items) |owner| if (!owner.absent) {
+                live_count += 1;
+            };
+            try self.reserveEffectRows(.{ .revisions = count, .intents = live_count, .observations = live_count * @import("store.zig").load_repair.observations_per_intent });
+            if (try self.integer("SELECT count(*) FROM effect_owner_revisions;") + count > effects.max_owner_revisions) return error.EffectCapacity;
             for (held.items) |owner| {
                 const scope = canonical_scope.Scope.decode(&owner.scope) catch return error.InvalidEffect;
+                if (owner.absent) {
+                    const installation = try self.readInstallation() orelse return error.InstallationRequired;
+                    const exact = try effects.Scope.exact(scope);
+                    if (!std.mem.eql(u8, &owner.key, &try exact.key(installation))) return error.InvalidEffect;
+                    // The owner-update trigger records this new generation/revision while
+                    // retaining the terminal lease and its original decision history.
+                    var update = try self.statement("UPDATE effect_owners SET generation=?4,revision=?5 WHERE scope_key=?1 AND jail=?2 AND revision=?3 AND generation=?6 AND lease_kind=0 AND deadline_us IS NULL;");
+                    defer update.deinit();
+                    try update.blob(1, &owner.key);
+                    try update.text(2, jail);
+                    try update.int(3, @intCast(owner.revision));
+                    try update.blob(4, &change.next_generation);
+                    try update.int(5, @intCast(owner.revision + 1));
+                    try update.blob(6, &change.generation);
+                    try update.done();
+                    if (self.api.changes(self.db) != 1) return error.StalePolicyTransition;
+                    try self.advanceEffectSnapshot();
+                    continue;
+                }
                 const transition_id = effects.hashParts("fail2zig-generation-rekey-v1", &.{ &change.next_generation, &owner.key });
                 _ = try self.transitionOwnerReservedTx(.{ .scope = scope, .jail = jail, .current_generation = change.generation, .next_generation = change.next_generation, .expected_owner_revision = owner.revision, .transition_id = transition_id, .mode = .retain, .occurred_us = now_us }, now_us, false);
             }

@@ -488,7 +488,6 @@ pub fn Methods(comptime Store: type) type {
             const installation = try self.readInstallation() orelse return error.InstallationRequired;
             const canonical_scope = @import("../firewall/scope.zig");
             var released: u64 = 0;
-            var seq_index: u64 = 0;
             var staged = try self.statement("SELECT seq,jail,scope FROM migration_staged_owners WHERE run_id=?1 ORDER BY seq;");
             defer staged.deinit();
             try staged.blob(1, &run_id);
@@ -502,18 +501,50 @@ pub fn Methods(comptime Store: type) type {
                 try pending.append(self.allocator, item);
             }
             for (pending.items) |item| {
-                seq_index += 1;
                 const scope = canonical_scope.Scope.decode(&item.scope) catch return error.InvalidMigrationRow;
                 const key = try (try effects.Scope.exact(scope)).key(installation);
                 const jail = item.jail[0..item.jail_len];
                 const owner = (try self.currentOwner(key, jail)) orelse continue;
                 if (owner.lease == .absent) continue;
+                if (!migrationOwnsDecision(run_id, item.seq, owner.decision_id)) continue;
                 var counter: [8]u8 = undefined;
                 std.mem.writeInt(u64, &counter, item.seq, .little);
                 _ = try self.transitionOwner(.{ .scope = scope, .jail = jail, .current_generation = owner.generation, .next_generation = owner.generation, .expected_owner_revision = owner.revision, .transition_id = effects.hashParts("fail2zig-migration-release-v1", &.{ &run_id, &counter }), .mode = .release, .occurred_us = clock.prepared_us }, clock);
                 released += 1;
             }
             return released;
+        }
+
+        fn migrationOwnsDecision(run_id: [32]u8, seq: u64, decision: [32]u8) bool {
+            var counter: [8]u8 = undefined;
+            std.mem.writeInt(u64, &counter, seq, .little);
+            const original = effects.hashParts("fail2zig-migration-owner-v1", &.{ &run_id, &counter });
+            const extension = effects.hashParts("fail2zig-migration-extend-v1", &.{ &run_id, &counter });
+            return std.mem.eql(u8, &decision, &original) or std.mem.eql(u8, &decision, &extension);
+        }
+
+        /// Rollback releases decisions belonging to this run, not every owner of
+        /// a staged scope. Replacements and other jails can keep that scope live.
+        pub fn migrationOwnersRemaining(self: *Store, run_id: [32]u8) Error!usize {
+            if (self.schema_version < 23) return error.MigrationStorageRequired;
+            const installation = try self.readInstallation() orelse return error.InstallationRequired;
+            const canonical_scope = @import("../firewall/scope.zig");
+            var staged = try self.statement("SELECT seq,jail,scope FROM migration_staged_owners WHERE run_id=?1 ORDER BY seq;");
+            defer staged.deinit();
+            try staged.blob(1, &run_id);
+            var examined: usize = 0;
+            var remaining: usize = 0;
+            while (try staged.row()) {
+                if (examined == effects.max_effects) return error.EffectCapacity;
+                examined += 1;
+                const seq = std.math.cast(u64, try staged.signed(0)) orelse return error.InvalidMigrationRow;
+                const jail = try staged.boundedBytes(1, 64);
+                const scope = canonical_scope.Scope.decode(&try effectBlob(&staged, 2, canonical_scope_bytes)) catch return error.InvalidMigrationRow;
+                const key = try (try effects.Scope.exact(scope)).key(installation);
+                const owner = (try self.currentOwner(key, jail)) orelse continue;
+                if (owner.lease != .absent and migrationOwnsDecision(run_id, seq, owner.decision_id)) remaining += 1;
+            }
+            return remaining;
         }
 
         pub const PendingStep = struct { seq: u64, step: MigrationStep };
