@@ -575,7 +575,7 @@ fn parseHistory(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) E
 
 fn parseFirewall(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Error!Parsed {
     if (rest.len == 0 or !std.mem.eql(u8, rest[0], "show")) {
-        diag.set("command 'firewall' requires 'show' (usage: firewall show [--limit <n>] [--cursor <token>])", .{});
+        diag.set("command 'firewall' requires 'show' (usage: firewall show [--details] [--limit <n>] [--cursor <token>])", .{});
         return error.MissingArgument;
     }
 
