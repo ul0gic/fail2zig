@@ -377,7 +377,7 @@ pub const Store = struct {
             const epoch = self.effect_publication_epoch;
             var slot = AttributedChange{ .epoch = epoch, .count = if (self.noted_ambiguous) 0 else self.noted_count };
             slot.keys = self.noted_keys;
-            self.attributed_changes[epoch % attribution_ring] = slot;
+            self.attributed_changes[@intCast(epoch % attribution_ring)] = slot;
         }
         self.noted_count = 0;
         self.noted_ambiguous = false;
@@ -407,7 +407,7 @@ pub const Store = struct {
     /// The scopes changed by `epoch`, or null when it is unknown or unattributed.
     pub fn attributedChange(self: *const Store, epoch: u64) ?*const AttributedChange {
         if (epoch == 0) return null;
-        const slot = &self.attributed_changes[epoch % attribution_ring];
+        const slot = &self.attributed_changes[@intCast(epoch % attribution_ring)];
         return if (slot.epoch == epoch and slot.count != 0) slot else null;
     }
 
