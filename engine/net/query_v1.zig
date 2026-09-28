@@ -13,7 +13,7 @@ pub const default_limit: u32 = 64;
 pub const max_jail_bytes: usize = 64;
 pub const max_cursor_bytes: usize = 128;
 
-pub const Kind = enum { status, config, health, scopes, history, firewall };
+pub const Kind = enum { status, config, health, scopes, history, firewall, stats };
 pub const PeerClass = enum { admin, monitor };
 
 pub const Request = struct {
@@ -207,7 +207,41 @@ pub const FirewallSource = union(enum) {
     cache: FirewallReader,
 };
 
+/// Fixed-size worker publication; string values are static labels, never borrowed config.
+pub const Stats = struct {
+    schema_version: u32 = 1,
+    kind: []const u8 = "stats",
+    generation: []const u8 = "",
+    available: bool = false,
+    reason: ?[]const u8 = "not_published",
+    backend: ?[]const u8 = null,
+    uptime_seconds: ?u64 = null,
+    snapshot_age_ms: ?u64 = null,
+    knowledge: ?[]const u8 = null,
+    knowledge_age_ms: ?u64 = null,
+    view_ready: ?bool = null,
+    view_entries: ?u64 = null,
+    last_observed_installed: ?u64 = null,
+    pending_live_dispatches: ?u64 = null,
+    overdue_blocking_removals: ?u64 = null,
+    overdue_bookkeeping: ?u64 = null,
+    accepted_readbacks: ?u64 = null,
+    dump_interruptions: ?u64 = null,
+    view_rebuilds: ?u64 = null,
+    view_restarts: ?u64 = null,
+    incremental_updates: ?u64 = null,
+    expiry_batches: ?u64 = null,
+    expiries_prepared: ?u64 = null,
+    retirement_batches: ?u64 = null,
+    retry_subjects_retired: ?u64 = null,
+    retry_subjects_examined: ?u64 = null,
+    retirement_pinned_state: ?u64 = null,
+    retirement_pinned_effect: ?u64 = null,
+    retirement_refused: ?u64 = null,
+};
+
 pub const Sources = struct {
+    stats: ?Stats = null,
     status: ?Callback = null,
     config: ?ConfigView = null,
     health: ?Callback = null,
@@ -243,6 +277,7 @@ pub fn handle(allocator: std.mem.Allocator, body: []const u8, peer_class: PeerCl
     if (parsed.cursor) |cursor| {
         if (cursor.len == 0 or cursor.len > max_cursor_bytes) return fail(400, "cursor is malformed");
     }
+    if (kind == .stats and (parsed.jail != null or parsed.limit != null or parsed.cursor != null)) return fail(400, "stats query does not accept jail, limit or cursor");
     if (kind == .firewall and parsed.jail != null) return fail(400, "firewall query does not accept a jail filter");
 
     var out = std.ArrayList(u8).init(allocator);
@@ -252,6 +287,7 @@ pub fn handle(allocator: std.mem.Allocator, body: []const u8, peer_class: PeerCl
     const generation_hex = std.fmt.bytesToHex(generation, .lower);
 
     const outcome: RenderError!void = switch (kind) {
+        .stats => renderStats(writer, sources.stats, &generation_hex),
         .status => renderPassthrough(arena, writer, sources.status, &generation_hex),
         .health => renderHealth(arena, writer, sources.health, &generation_hex),
         .config => renderConfig(writer, sources.config, peer_class, &generation_hex),
@@ -368,6 +404,12 @@ fn runCallback(arena: std.mem.Allocator, callback: Callback) RenderError!std.jso
     };
     if (value != .object) return error.SourceFailed;
     return value;
+}
+
+fn renderStats(writer: anytype, source: ?Stats, generation_hex: []const u8) RenderError!void {
+    var snapshot = source orelse return error.SourceUnavailable;
+    snapshot.generation = generation_hex;
+    std.json.stringify(snapshot, .{}, writer) catch |err| return mapWrite(err);
 }
 
 fn renderPassthrough(arena: std.mem.Allocator, writer: anytype, callback: ?Callback, generation_hex: []const u8) RenderError!void {

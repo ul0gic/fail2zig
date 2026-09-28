@@ -28,7 +28,7 @@ const bash_script =
     \\    local cur prev words cword
     \\    _init_completion || return
     \\
-    \\    local subcommands="status ban unban list jails reload version config history firewall jail repair-source completions help"
+    \\    local subcommands="status stats ban unban list jails reload version config history firewall jail repair-source completions help"
     \\    local global_flags="--socket --output --no-color --timeout --help --version"
     \\
     \\    # Flag-value completion for the previous word.
@@ -72,7 +72,7 @@ const bash_script =
     \\    fi
     \\
     \\    case "$cmd" in
-    \\        status|jails)
+    \\        status|stats|jails)
     \\            COMPREPLY=( $(compgen -W "--details $global_flags" -- "$cur") ) ;;
     \\        reload|version|config)
     \\            COMPREPLY=( $(compgen -W "$global_flags" -- "$cur") ) ;;
@@ -87,7 +87,7 @@ const bash_script =
     \\        jail)
     \\            COMPREPLY=( $(compgen -W "enable disable pause resume" -- "$cur") ) ;;
     \\        list)
-    \\            COMPREPLY=( $(compgen -W "--jail --details $global_flags" -- "$cur") ) ;;
+    \\            COMPREPLY=( $(compgen -W "--jail --details --sort $global_flags" -- "$cur") ) ;;
     \\        completions)
     \\            COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ) ;;
     \\        help)
@@ -112,11 +112,12 @@ const zsh_script =
     \\    local -a commands global_flags
     \\    commands=(
     \\        'status:Show daemon status'
+    \\        'stats:Show retained enforcement statistics'
     \\        'ban:Manually ban an IP'
     \\        'unban:Manually unban an IP'
     \\        'list:List active bans'
     \\        'jails:List configured jails'
-    \\        'reload:Unsupported; restart to apply config'
+    \\        'reload:Apply supported changes live; restart-only settings require restart'
     \\        'version:Show client and daemon version'
     \\        'config:Show effective configuration'
     \\        'history:Page through confirmed ban history (or: history reset)'
@@ -169,8 +170,9 @@ const zsh_script =
     \\                    _arguments \
     \\                        '--jail[Filter by jail]:jail name:' \
     \\                        '--details[Include ban counts in table output]' \
+    \\                        '--sort[Sort by numeric IP address, then jail name]' \
     \\                        $global_flags ;;
-    \\                status|jails)
+    \\                status|stats|jails)
     \\                    _arguments '--details[Include table detail]' $global_flags ;;
     \\                history)
     \\                    _arguments \
@@ -253,11 +255,12 @@ const fish_script =
     \\
     \\# Primary subcommands
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'status'       -d 'Show daemon status'
+    \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'stats'        -d 'Show retained enforcement statistics'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'ban'          -d 'Manually ban an IP'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'unban'        -d 'Manually unban an IP'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'list'         -d 'List active bans'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'jails'        -d 'List configured jails'
-    \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'reload'       -d 'Unsupported; restart to apply config'
+    \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'reload'       -d 'Apply supported changes live; restart-only settings require restart'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'version'      -d 'Show version'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'config'       -d 'Show effective configuration'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'history'      -d 'Page through confirmed ban history'
@@ -286,7 +289,9 @@ const fish_script =
     \\complete -c fail2zig -n '__fail2zig_client_using_command history' -l all -d 'Reset history for all jails'
     \\complete -c fail2zig -n '__fail2zig_client_using_command list'  -l jail     -x -d 'Filter by jail'
     \\complete -c fail2zig -n '__fail2zig_client_using_command list'  -l details -d 'Include ban counts in table output'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command list'  -l sort -d 'Sort by numeric IP address, then jail name'
     \\complete -c fail2zig -n '__fail2zig_client_using_command status' -l details -d 'Include table detail'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command stats' -l details -d 'Include additional counters'
     \\complete -c fail2zig -n '__fail2zig_client_using_command jails'  -l details -d 'Include table detail'
     \\complete -c fail2zig -n '__fail2zig_client_using_command history' -l jail   -x -d 'Filter by jail'
     \\complete -c fail2zig -n '__fail2zig_client_using_command history' -l limit  -x -d 'Events per page (1..256)'
@@ -316,7 +321,7 @@ test "completions: bash starts with shebang and installs complete -F" {
 
 test "completions: bash covers all subcommands" {
     const s = generateBash();
-    const subs = [_][]const u8{ "status", "ban", "unban", "list", "jails", "reload", "version", "config", "history", "firewall", "completions", "help" };
+    const subs = [_][]const u8{ "status", "stats", "ban", "unban", "list", "jails", "reload", "version", "config", "history", "firewall", "completions", "help" };
     for (subs) |sub| {
         try testing.expect(std.mem.indexOf(u8, s, sub) != null);
     }
@@ -343,7 +348,7 @@ test "completions: zsh has #compdef header" {
 
 test "completions: zsh covers all subcommands in command list" {
     const s = generateZsh();
-    const subs = [_][]const u8{ "status:", "ban:", "unban:", "list:", "jails:", "reload:", "version:", "config:", "history:", "firewall:", "completions:", "help:" };
+    const subs = [_][]const u8{ "status:", "stats:", "ban:", "unban:", "list:", "jails:", "reload:", "version:", "config:", "history:", "firewall:", "completions:", "help:" };
     for (subs) |sub| {
         try testing.expect(std.mem.indexOf(u8, s, sub) != null);
     }
@@ -364,7 +369,7 @@ test "completions: fish uses complete -c syntax" {
 
 test "completions: fish has all subcommands" {
     const s = generateFish();
-    const subs = [_][]const u8{ "status", "ban", "unban", "list", "jails", "reload", "version", "config", "history", "firewall", "completions", "help" };
+    const subs = [_][]const u8{ "status", "stats", "ban", "unban", "list", "jails", "reload", "version", "config", "history", "firewall", "completions", "help" };
     for (subs) |sub| {
         try testing.expect(std.mem.indexOf(u8, s, sub) != null);
     }

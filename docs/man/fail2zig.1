@@ -1,4 +1,4 @@
-.TH FAIL2ZIG 1 "2026-09-22" "fail2zig 0.4.3" "User Commands"
+.TH FAIL2ZIG 1 "2026-09-28" "fail2zig 0.4.6" "User Commands"
 .
 .SH NAME
 fail2zig \- intrusion prevention daemon and its administration commands
@@ -42,9 +42,9 @@ temporary bans through nftables (direct netlink), ipset or iptables.
 One executable provides every entry point. Without a command it starts the daemon;
 with a command it administers a running daemon over its Unix socket;
 .B rule-test
-and
-.B migrate
-work offline.
+works offline. Migration preparation is offline; cutover, status and rollback form a journaled workflow whose
+activation and release steps use the daemon socket. Follow the migration guide for
+the required stop/start sequence and safety checks.
 .PP
 The daemon runs in the foreground only and is designed for a
 .BR systemd (1)
@@ -133,7 +133,7 @@ require uid 0 or the daemon uid, verified with
 .B status
 Daemon summary: version, protection state
 .RB ( active ", " log-only ", " unknown ", " mixed " or " "DEGRADED (cause)" ),
-backend, active and total bans, storage phase, generation and worker/clock flags.
+backend, active bans, retained history confirmations, storage phase, generation and worker/clock flags.
 Active bans are what the last complete kernel readback showed. The
 .B knowledge
 field reports whether that readback is fresh (within the verification cadence), stale
@@ -148,21 +148,53 @@ Plain output adds named diagnostic keys; JSON fields are additive and optional.
 Table output uses a compact protection summary. Add
 .B --details
 to include identifiers and additional counters; failures remain visible without it.
+History counts retained confirmed effect events; maintenance can remove these rows,
+so this is not a lifetime ban count. The machine-readable key remains
+.BR total_bans .
+.TP
+.BI stats " [--details] [--output table|plain|json]"
+Show one retained enforcement-manager worker snapshot. It reports snapshot age
+separately from firewall readback knowledge and age. A stale snapshot remains
+labeled with its age; unavailable counters are null in JSON and shown as unavailable
+in human output. Counters start at zero when the daemon starts and remain cumulative
+across reloads and storage reopen for that daemon process. Accepted readbacks count
+accepted inventories, not every dump or readback attempt. This query does not read
+SQLite, scan bans, or request a firewall readback. Use
+.B status
+for protection and health; stats is not a current health assertion. JSON and plain
+output include the complete schema regardless of
+.BR --details .
 .TP
 .B jails
 One row per configured jail: enabled, paused, health, active bans, thresholds,
-effective action, whether it enforces, and its source. Table output includes the
+effective action, configured mode, observed protection, and source. Table output includes the
 source failure cause and captured journalctl exit/signal metadata. Raw child stderr
 is not displayed. Plain output retains its 11-column layout.
-Table output shows state, source health, enforcement and bans; add
+Table output distinguishes MODE (enforce, log-only or unknown) from PROTECTION
+(active, unconfirmed, log-only or unknown).
+Active means the daemon's existing protection criteria are met; it is not an
+independent per-jail kernel verification and does not promise zero pending bans.
+Unconfirmed does not mean installed rules are absent. Missing query fields remain
+unknown; action names do not determine mode. JSON includes the additive Boolean
+\fBenforce_configured\fR while preserving \fBenforcing\fR and \fBaction\fR.
+Plain output retains its 11 columns and enforcing Boolean position; an unknown ban
+count is shown as \fB-\fR, while a known zero remains \fB0\fR. Table output shows state, source health, enforcement and bans; add
 .B --details
-for thresholds and effective action.
+for thresholds and effective action. When the detailed table does not fit the
+terminal width, all detail fields are shown in stacked rows per jail.
 .TP
-.BI list " [--jail name] [--details]"
+.BI list " [--jail name] [--details] [--sort]"
 Active bans, optionally for one jail. Table output distinguishes
 confirmed and pending intent, permanent leases and unknown expiry; narrow terminals
 use stacked rows. Existing plain columns and JSON fields retain their meaning.
 The --details flag adds ban counts to the table view.
+.B --sort
+sorts returned rows client-side in every output format: IPv4 before IPv6, numeric
+address ascending, prefix length ascending, host before an explicit equal-width
+network, jail name bytewise, then original row position. IPv4-mapped IPv6 remains
+IPv6. It preserves duplicate rows and additive JSON fields. Without the flag, the
+existing order is unchanged. Malformed or missing address/jail sort keys fail before
+output.
 .TP
 .BI "firewall show" " [--limit 1..256] [--cursor token] [--details]"
 Read the last sampled fail2zig-owned
@@ -206,6 +238,7 @@ global
 .BR log_level ,
 and the contents of a custom jail's
 .BR ignore_file .
+Live reload applies supported changes; restart-only settings require a daemon restart.
 .TP
 .BI history " [--jail name] [--limit 1..256] [--cursor token]"
 Page through confirmed ban history;
@@ -216,15 +249,31 @@ continues a listing.
 Reset the durable history for one address.
 .TP
 .BI "jail enable|disable|pause|resume " name
-Administer one jail. Disabling releases its effects; pausing keeps them.
+Administer one jail. Disabling releases its effects; pausing keeps them. An unknown
+jail action lists valid actions and points to
+.B list --jail name
+to inspect jail bans,
+.B ban ip --jail name
+to add one, and
+.B unban ip --jail name
+to release one.
 .TP
 .B config
 The effective configuration and its generation. Paths and address lists are
 redacted unless the caller is an administrator.
+.PP
+Use
+.B enforce = true|false
+in defaults or a jail to configure protection intent. The legacy
+.B banaction
+input remains accepted as a deprecated compatibility setting; it is not the
+recommended spelling. The global
+.B firewall
+setting selects the backend. Configured intent and observed protection are separate.
 .TP
 .B version
-Daemon version over the socket (unlike
-.BR \-\-version ).
+Daemon version over the socket. It contacts the daemon, unlike
+.BR \-\-version .
 Table output combines matching client and daemon versions on one
 line and labels each separately when they differ. Plain and JSON output retain
 separate client and daemon fields.
@@ -456,6 +505,8 @@ No other variables are read by the daemon or the administration commands.
 .nf
 sudo fail2zig --validate-config --config /etc/fail2zig/config.toml
 sudo fail2zig status
+fail2zig stats --output plain
+fail2zig list --sort --jail sshd
 fail2zig list --jail sshd --output json
 sudo fail2zig ban 192.0.2.10 --jail sshd --duration 3600
 sudo fail2zig reload

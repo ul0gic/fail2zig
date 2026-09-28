@@ -112,6 +112,7 @@ pub const JailEntry = struct {
     findtime: ?u32 = null,
     bantime: ?u32 = null,
     action: ?[]const u8 = null,
+    enforce_configured: ?bool = null,
     enforcing: ?bool = null,
     log_source: ?[]const u8 = null,
     source_healthy: ?bool = null,
@@ -120,6 +121,38 @@ pub const JailEntry = struct {
     source_exit_code: ?u8 = null,
     source_signal: ?u32 = null,
     source_stderr_present: ?bool = null,
+};
+
+pub const StatsPayload = struct {
+    schema_version: ?u32 = null,
+    kind: ?[]const u8 = null,
+    generation: ?[]const u8 = null,
+    available: ?bool = null,
+    reason: ?[]const u8 = null,
+    backend: ?[]const u8 = null,
+    uptime_seconds: ?u64 = null,
+    snapshot_age_ms: ?u64 = null,
+    knowledge: ?[]const u8 = null,
+    knowledge_age_ms: ?u64 = null,
+    view_ready: ?bool = null,
+    view_entries: ?u64 = null,
+    last_observed_installed: ?u64 = null,
+    pending_live_dispatches: ?u64 = null,
+    overdue_blocking_removals: ?u64 = null,
+    overdue_bookkeeping: ?u64 = null,
+    accepted_readbacks: ?u64 = null,
+    dump_interruptions: ?u64 = null,
+    view_rebuilds: ?u64 = null,
+    view_restarts: ?u64 = null,
+    incremental_updates: ?u64 = null,
+    expiry_batches: ?u64 = null,
+    expiries_prepared: ?u64 = null,
+    retirement_batches: ?u64 = null,
+    retry_subjects_retired: ?u64 = null,
+    retry_subjects_examined: ?u64 = null,
+    retirement_pinned_state: ?u64 = null,
+    retirement_pinned_effect: ?u64 = null,
+    retirement_refused: ?u64 = null,
 };
 
 pub const VersionPayload = struct {
@@ -276,11 +309,11 @@ fn writeStatusTable(writer: anytype, s: StatusPayload, color: Color, columns: us
     try rowLabel(writer, "Memory:", formatMemory(s.memory_bytes_used, s.memory_bytes_limit), width);
     try rowLabel(writer, "Parse rate:", formatRate(s.parse_rate), width);
     try rowLabel(writer, "Active bans:", formatOptU32(s.active_bans), width);
-    try rowLabel(writer, "Total bans:", formatOptU64(s.total_bans), width);
+    try rowLabel(writer, "History:", formatHistoryCount(s.total_bans), width);
     var knowledge_buffer: [diagnostic_max_bytes + 32]u8 = undefined;
-    if (formatKnowledge(&knowledge_buffer, s)) |value| try rowLabel(writer, "Knowledge:", value, width);
+    try rowLabel(writer, "Knowledge:", formatKnowledge(&knowledge_buffer, s), width);
     var pending_buffer: [96]u8 = undefined;
-    if (formatPending(&pending_buffer, s)) |value| try rowLabel(writer, "Pending:", value, width);
+    try rowLabel(writer, "Pending:", formatPending(&pending_buffer, s), width);
     var protection_buffer: [diagnostic_max_bytes + 16]u8 = undefined;
     try rowLabel(writer, "Protection:", formatProtection(&protection_buffer, s), width);
     var backend_buffer: [diagnostic_max_bytes]u8 = undefined;
@@ -333,6 +366,11 @@ fn writeStatusSummary(writer: anytype, s: StatusPayload, color: Color, columns: 
     if (s.storage) |value| try writeStatusNarrowRow(writer, "Storage: ", renderDiagnostic(&diagnostic, value), columns);
     try writeStatusNarrowRow(writer, "Jails: ", formatOptU32(s.jails_active), columns);
     try writeStatusNarrowRow(writer, "Active bans: ", formatOptU32(s.active_bans), columns);
+    try writeStatusNarrowRow(writer, "History: ", formatHistoryCount(s.total_bans), columns);
+    var knowledge_buffer: [diagnostic_max_bytes + 32]u8 = undefined;
+    try writeStatusNarrowRow(writer, "Knowledge: ", formatKnowledge(&knowledge_buffer, s), columns);
+    var pending_buffer: [96]u8 = undefined;
+    try writeStatusNarrowRow(writer, "Pending: ", formatPending(&pending_buffer, s), columns);
     try writeStatusNarrowRow(writer, "Uptime: ", formatUptime(s.uptime_seconds), columns);
     if (statusCause(s)) |value| try writeStatusNarrowRow(writer, "Cause: ", renderDiagnostic(&diagnostic, value), columns);
     if (s.sqlite_code) |value| {
@@ -378,7 +416,11 @@ fn writeStatusNarrow(writer: anytype, s: StatusPayload, color: Color, columns: u
     try writeStatusNarrowRow(writer, "Protection: ", formatProtection(&protection_buffer, s), columns);
     try writeStatusNarrowRow(writer, "Backend: ", if (s.backend) |backend| renderDiagnostic(&backend_buffer, backend) else "-", columns);
     try writeStatusNarrowRow(writer, "Active bans: ", formatOptU32(s.active_bans), columns);
-    try writeStatusNarrowRow(writer, "Total bans: ", formatOptU64(s.total_bans), columns);
+    try writeStatusNarrowRow(writer, "History: ", formatHistoryCount(s.total_bans), columns);
+    var knowledge_buffer: [diagnostic_max_bytes + 32]u8 = undefined;
+    try writeStatusNarrowRow(writer, "Knowledge: ", formatKnowledge(&knowledge_buffer, s), columns);
+    var pending_buffer: [96]u8 = undefined;
+    try writeStatusNarrowRow(writer, "Pending: ", formatPending(&pending_buffer, s), columns);
     try writeStatusNarrowRow(writer, "Jails: ", formatOptU32(s.jails_active), columns);
     if (s.generation) |generation| try writeStatusNarrowRow(writer, "Generation: ", renderDiagnostic(&diagnostic_buffer, generation), columns);
     try writeStatusNarrowRow(writer, "Uptime: ", formatUptime(s.uptime_seconds), columns);
@@ -421,12 +463,16 @@ fn statusWidth(s: StatusPayload) usize {
     used = @max(used, rowUsed(formatMemory(s.memory_bytes_used, s.memory_bytes_limit)));
     used = @max(used, rowUsed(formatRate(s.parse_rate)));
     used = @max(used, rowUsed(formatOptU32(s.active_bans)));
-    used = @max(used, rowUsed(formatOptU64(s.total_bans)));
+    used = @max(used, rowUsed(formatHistoryCount(s.total_bans)));
     var protection_buffer: [diagnostic_max_bytes + 16]u8 = undefined;
     used = @max(used, rowUsed(formatProtection(&protection_buffer, s)));
     var backend_buffer: [diagnostic_max_bytes]u8 = undefined;
     used = @max(used, rowUsed(if (s.backend) |backend| renderDiagnostic(&backend_buffer, backend) else "-"));
     used = @max(used, rowUsed(formatOptU32(s.jails_active)));
+    var knowledge_buffer: [diagnostic_max_bytes + 32]u8 = undefined;
+    used = @max(used, rowUsed(formatKnowledge(&knowledge_buffer, s)));
+    var pending_buffer: [96]u8 = undefined;
+    used = @max(used, rowUsed(formatPending(&pending_buffer, s)));
     var diagnostic_buffer: [diagnostic_max_bytes]u8 = undefined;
     if (s.generation) |g| used = @max(used, rowUsed(renderDiagnostic(&diagnostic_buffer, g)));
     if (s.storage) |storage| used = @max(used, rowUsed(renderDiagnostic(&diagnostic_buffer, storage)));
@@ -471,17 +517,17 @@ fn formatProtection(buffer: []u8, s: StatusPayload) []const u8 {
     return std.fmt.bufPrint(buffer, "DEGRADED ({s})", .{cause}) catch "DEGRADED";
 }
 
-fn formatKnowledge(buffer: []u8, s: StatusPayload) ?[]const u8 {
-    const knowledge = s.knowledge orelse return null;
+fn formatKnowledge(buffer: []u8, s: StatusPayload) []const u8 {
+    const knowledge = s.knowledge orelse return "unknown";
     var knowledge_buffer: [diagnostic_max_bytes]u8 = undefined;
     const rendered = renderDiagnostic(&knowledge_buffer, knowledge);
     const age = s.knowledge_age_ms orelse return std.fmt.bufPrint(buffer, "{s}", .{rendered}) catch "-";
     return std.fmt.bufPrint(buffer, "{s} (readback {d} ms ago)", .{ rendered, age }) catch "-";
 }
-fn formatPending(buffer: []u8, s: StatusPayload) ?[]const u8 {
-    const pending = s.pending_bans orelse 0;
-    const overdue = s.overdue_removals orelse 0;
-    if (pending == 0 and overdue == 0) return null;
+fn formatPending(buffer: []u8, s: StatusPayload) []const u8 {
+    const pending = s.pending_bans orelse return "unknown";
+    const overdue = s.overdue_removals orelse return "unknown";
+    if (pending == 0 and overdue == 0) return "none";
     if (pending != 0 and overdue != 0) return std.fmt.bufPrint(buffer, "{d} bans (oldest {d} ms); {d} overdue (oldest {d} ms)", .{ pending, s.oldest_pending_ms orelse 0, overdue, s.oldest_overdue_ms orelse 0 }) catch "-";
     if (pending != 0) return std.fmt.bufPrint(buffer, "{d} bans (oldest {d} ms)", .{ pending, s.oldest_pending_ms orelse 0 }) catch "-";
     return std.fmt.bufPrint(buffer, "{d} overdue (oldest {d} ms)", .{ overdue, s.oldest_overdue_ms orelse 0 }) catch "-";
@@ -707,6 +753,140 @@ fn formatOptU64(opt: ?u64) []const u8 {
     const v = opt orelse return "-";
     const out = std.fmt.bufPrint(&scratch, "{d}", .{v}) catch return "-";
     return out;
+}
+
+fn formatHistoryCount(opt: ?u64) []const u8 {
+    const value = opt orelse return "unknown";
+    return std.fmt.bufPrint(&scratch, "{d} retained confirmations", .{value}) catch "unknown";
+}
+
+pub fn formatStats(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color) !void {
+    try formatStatsWithDetails(allocator, writer, payload_json, fmt, color, terminalColumns(), false);
+}
+
+pub fn formatStatsDetailed(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color) !void {
+    try formatStatsWithDetails(allocator, writer, payload_json, fmt, color, terminalColumns(), true);
+}
+
+fn formatStatsForWidth(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color, columns: usize, details: bool) !void {
+    try formatStatsWithDetails(allocator, writer, payload_json, fmt, color, columns, details);
+}
+
+fn formatStatsWithDetails(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color, columns: usize, details: bool) !void {
+    if (fmt == .json) {
+        try writer.writeAll(payload_json);
+        if (payload_json.len == 0 or payload_json[payload_json.len - 1] != '\n') try writer.writeByte('\n');
+        return;
+    }
+    const parsed = std.json.parseFromSlice(StatsPayload, allocator, payload_json, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |e| {
+        try writer.print("error: could not parse stats payload ({s})\n", .{@errorName(e)});
+        return;
+    };
+    defer parsed.deinit();
+    if (fmt == .plain) return writeStatsPlain(writer, parsed.value);
+    return writeStatsTable(writer, parsed.value, color, columns, details);
+}
+
+fn writeStatsPlain(writer: anytype, s: StatsPayload) !void {
+    var diagnostic: [diagnostic_max_bytes]u8 = undefined;
+    try writer.print("schema_version\t{s}\n", .{formatOptU32(s.schema_version)});
+    try writer.print("kind\t{s}\n", .{if (s.kind) |v| renderDiagnostic(&diagnostic, v) else "-"});
+    try writer.print("generation\t{s}\n", .{if (s.generation) |v| renderDiagnostic(&diagnostic, v) else "-"});
+    try writeStatsPlainBool(writer, "available", s.available);
+    try writer.print("reason\t{s}\n", .{if (s.reason) |v| renderDiagnostic(&diagnostic, v) else "-"});
+    try writer.print("backend\t{s}\n", .{if (s.backend) |v| renderDiagnostic(&diagnostic, v) else "-"});
+    try writeStatsPlainNumber(writer, "uptime_seconds", s.uptime_seconds);
+    try writeStatsPlainNumber(writer, "snapshot_age_ms", s.snapshot_age_ms);
+    try writer.print("knowledge\t{s}\n", .{if (s.knowledge) |v| renderDiagnostic(&diagnostic, v) else "-"});
+    try writeStatsPlainNumber(writer, "knowledge_age_ms", s.knowledge_age_ms);
+    try writeStatsPlainBool(writer, "view_ready", s.view_ready);
+    try writeStatsPlainNumber(writer, "view_entries", s.view_entries);
+    try writeStatsPlainNumber(writer, "last_observed_installed", s.last_observed_installed);
+    try writeStatsPlainNumber(writer, "pending_live_dispatches", s.pending_live_dispatches);
+    try writeStatsPlainNumber(writer, "overdue_blocking_removals", s.overdue_blocking_removals);
+    try writeStatsPlainNumber(writer, "overdue_bookkeeping", s.overdue_bookkeeping);
+    try writeStatsPlainNumber(writer, "accepted_readbacks", s.accepted_readbacks);
+    try writeStatsPlainNumber(writer, "dump_interruptions", s.dump_interruptions);
+    try writeStatsPlainNumber(writer, "view_rebuilds", s.view_rebuilds);
+    try writeStatsPlainNumber(writer, "view_restarts", s.view_restarts);
+    try writeStatsPlainNumber(writer, "incremental_updates", s.incremental_updates);
+    try writeStatsPlainNumber(writer, "expiry_batches", s.expiry_batches);
+    try writeStatsPlainNumber(writer, "expiries_prepared", s.expiries_prepared);
+    try writeStatsPlainNumber(writer, "retirement_batches", s.retirement_batches);
+    try writeStatsPlainNumber(writer, "retry_subjects_retired", s.retry_subjects_retired);
+    try writeStatsPlainNumber(writer, "retry_subjects_examined", s.retry_subjects_examined);
+    try writeStatsPlainNumber(writer, "retirement_pinned_state", s.retirement_pinned_state);
+    try writeStatsPlainNumber(writer, "retirement_pinned_effect", s.retirement_pinned_effect);
+    try writeStatsPlainNumber(writer, "retirement_refused", s.retirement_refused);
+}
+
+fn writeStatsPlainNumber(writer: anytype, name: []const u8, value: ?u64) !void {
+    try writer.print("{s}\t{s}\n", .{ name, formatOptU64(value) });
+}
+
+fn writeStatsPlainBool(writer: anytype, name: []const u8, value: ?bool) !void {
+    try writer.print("{s}\t{s}\n", .{ name, if (value) |v| boolValue(v) else "-" });
+}
+
+fn writeStatsTable(writer: anytype, s: StatsPayload, color: Color, columns: usize, details: bool) !void {
+    try color.on(writer, Color.bold);
+    try writer.writeAll("Enforcement stats\n");
+    try color.off(writer);
+    if (s.available != true) {
+        var diagnostic: [diagnostic_max_bytes]u8 = undefined;
+        try writeStatsRow(writer, "Available:", "no", columns);
+        try writeStatsRow(writer, "Reason:", if (s.reason) |v| renderDiagnostic(&diagnostic, v) else "unknown", columns);
+        if (s.backend) |backend| try writeStatsRow(writer, "Backend:", renderDiagnostic(&diagnostic, backend), columns);
+        return;
+    }
+    var diagnostic: [diagnostic_max_bytes]u8 = undefined;
+    try writeStatsRow(writer, "Backend:", if (s.backend) |v| renderDiagnostic(&diagnostic, v) else "unknown", columns);
+    try writeStatsRow(writer, "Uptime:", if (s.uptime_seconds) |v| formatUptime(v) else "unknown", columns);
+    try writeStatsRow(writer, "Snapshot age:", if (s.snapshot_age_ms) |v| formatAge(v) else "unknown", columns);
+    var knowledge: [96]u8 = undefined;
+    const knowledge_text = if (s.knowledge) |value| blk: {
+        if (s.knowledge_age_ms) |age| break :blk std.fmt.bufPrint(&knowledge, "{s} (readback {s} ago)", .{ renderDiagnostic(&diagnostic, value), formatAge(age) }) catch "unknown";
+        break :blk renderDiagnostic(&diagnostic, value);
+    } else "unknown";
+    try writeStatsRow(writer, "Knowledge:", knowledge_text, columns);
+    try writer.writeAll("\nCurrent view\n");
+    try writeStatsRow(writer, "Ready:", if (s.view_ready) |v| boolValue(v) else "unknown", columns);
+    try writeStatsRow(writer, "Entries:", formatOptU64(s.view_entries), columns);
+    try writeStatsRow(writer, "Last observed installed:", formatOptU64(s.last_observed_installed), columns);
+    try writeStatsRow(writer, "Pending live dispatches:", formatOptU64(s.pending_live_dispatches), columns);
+    try writeStatsRow(writer, "Overdue blocking removals:", formatOptU64(s.overdue_blocking_removals), columns);
+    try writer.writeAll("\nActivity since daemon start\n");
+    try writeStatsRow(writer, "Accepted readbacks:", formatOptU64(s.accepted_readbacks), columns);
+    try writeStatsRow(writer, "Dump interruptions:", formatOptU64(s.dump_interruptions), columns);
+    var completed_buffer: [32]u8 = undefined;
+    var restarted_buffer: [32]u8 = undefined;
+    var counts: [96]u8 = undefined;
+    const completed = if (s.view_rebuilds) |value| std.fmt.bufPrint(&completed_buffer, "{d}", .{value}) catch "-" else "-";
+    const restarted = if (s.view_restarts) |value| std.fmt.bufPrint(&restarted_buffer, "{d}", .{value}) catch "-" else "-";
+    try writeStatsRow(writer, "View rebuilds:", std.fmt.bufPrint(&counts, "{s} completed, {s} restarted", .{ completed, restarted }) catch "-", columns);
+    try writeStatsRow(writer, "Incremental updates:", formatOptU64(s.incremental_updates), columns);
+    try writeStatsRow(writer, "Expiry batches:", formatOptU64(s.expiry_batches), columns);
+    try writeStatsRow(writer, "Expiries prepared:", formatOptU64(s.expiries_prepared), columns);
+    try writeStatsRow(writer, "Retirement batches:", formatOptU64(s.retirement_batches), columns);
+    try writeStatsRow(writer, "Retry subjects retired:", formatOptU64(s.retry_subjects_retired), columns);
+    if (details) {
+        try writeStatsRow(writer, "Overdue bookkeeping:", formatOptU64(s.overdue_bookkeeping), columns);
+        try writeStatsRow(writer, "Retry subjects examined:", formatOptU64(s.retry_subjects_examined), columns);
+        try writeStatsRow(writer, "Retirement pinned state:", formatOptU64(s.retirement_pinned_state), columns);
+        try writeStatsRow(writer, "Retirement pinned effect:", formatOptU64(s.retirement_pinned_effect), columns);
+        try writeStatsRow(writer, "Retirement refused:", formatOptU64(s.retirement_refused), columns);
+    }
+}
+
+fn writeStatsRow(writer: anytype, label: []const u8, value: []const u8, columns: usize) !void {
+    try writer.writeAll(label);
+    try writer.writeByte(' ');
+    try writeCell(writer, value, @max(@as(usize, 4), columns -| label.len -| 1));
+    try writer.writeByte('\n');
+}
+
+fn formatAge(ms: u64) []const u8 {
+    return std.fmt.bufPrint(&scratch, "{d} ms", .{ms}) catch "unknown";
 }
 
 pub fn formatList(
@@ -970,10 +1150,10 @@ fn writeJailsPlain(writer: anytype, jails: []const JailEntry) !void {
         var name_buffer: [diagnostic_max_bytes]u8 = undefined;
         var action_buffer: [diagnostic_max_bytes]u8 = undefined;
         var source_buffer: [diagnostic_max_bytes]u8 = undefined;
-        try writer.print("{s}\t{s}\t{d}\t{d}\t{d}\t{d}\t{s}\t{s}\t{s}\t{s}\t{d}\n", .{
+        try writer.print("{s}\t{s}\t{s}\t{d}\t{d}\t{d}\t{s}\t{s}\t{s}\t{s}\t{d}\n", .{
             if (j.name) |name| renderDiagnostic(&name_buffer, name) else "-",
             if (j.enabled orelse false) "enabled" else "disabled",
-            j.active_bans orelse 0,
+            formatOptU32Local(j.active_bans),
             j.maxretry orelse 0,
             j.findtime orelse 0,
             j.bantime orelse 0,
@@ -991,8 +1171,6 @@ fn sourceHealthStr(opt: ?bool) []const u8 {
     return if (h) "healthy" else "unhealthy";
 }
 
-const compact_jail_health_width = 19;
-
 fn writeJailsTable(writer: anytype, jails: []const JailEntry, color: Color, columns: usize, details: bool) !void {
     if (jails.len == 0) {
         try writer.writeAll("No jails configured.\n");
@@ -1009,15 +1187,13 @@ fn writeJailsTable(writer: anytype, jails: []const JailEntry, color: Color, colu
     const find_col = colWidth("FIND TIME", w.find);
     const ban_col = colWidth("BAN TIME", w.ban);
     const action_col = colWidth("ACTION", longestJailText(jails, "action"));
-    const enforce_col = colWidth("ENFORCING", w.enforce);
+    const mode_col = colWidth("MODE", w.mode);
+    const protection_col = colWidth("PROTECTION", w.protection);
     const source_col = colWidth("SOURCE", longestJailText(jails, "log_source"));
     const health_col = @max("HEALTH".len, @min(w.health, diagnostic_max_bytes)) + 1;
-    const full_width = name_col + state_col + active_col + max_col + find_col + ban_col + action_col + enforce_col + source_col + health_col;
-    if (full_width > columns) {
-        // Preserve ordinary source causes instead of clipping them in the compact column.
-        if (columns >= 74 and w.health < compact_jail_health_width) return writeJailsCompact(writer, jails, color);
-        return writeJailsStacked(writer, jails, color, columns);
-    }
+    const full_width = name_col + state_col + active_col + max_col + find_col + ban_col + action_col + mode_col + protection_col + source_col + health_col;
+    // Requested detail fields must survive the narrow layout.
+    if (full_width > columns) return writeJailsStacked(writer, jails, color, columns, true);
 
     try color.on(writer, Color.bold);
     try padRightPrint(writer, "JAIL", name_col);
@@ -1027,13 +1203,14 @@ fn writeJailsTable(writer: anytype, jails: []const JailEntry, color: Color, colu
     try padRightPrint(writer, "FIND TIME", find_col);
     try padRightPrint(writer, "BAN TIME", ban_col);
     try padRightPrint(writer, "ACTION", action_col);
-    try padRightPrint(writer, "ENFORCING", enforce_col);
+    try padRightPrint(writer, "MODE", mode_col);
+    try padRightPrint(writer, "PROTECTION", protection_col);
     try padRightPrint(writer, "SOURCE", source_col);
     try padRightPrint(writer, "HEALTH", health_col);
     try color.off(writer);
     try writer.writeAll("\n");
 
-    try repeatChar(writer, '-', name_col + state_col + active_col + max_col + find_col + ban_col + action_col + enforce_col + source_col + health_col);
+    try repeatChar(writer, '-', name_col + state_col + active_col + max_col + find_col + ban_col + action_col + mode_col + protection_col + source_col + health_col);
     try writer.writeAll("\n");
 
     for (jails) |j| {
@@ -1049,8 +1226,9 @@ fn writeJailsTable(writer: anytype, jails: []const JailEntry, color: Color, colu
         try writeCell(writer, formatDurationSecs(j.findtime), find_col);
         try writeCell(writer, formatDurationSecs(j.bantime), ban_col);
         try writeCell(writer, if (j.action) |action| renderDiagnostic(&action_buffer, action) else "-", action_col);
-        if (j.enforcing) |e| try color.on(writer, if (e) Color.green else Color.yellow);
-        try writeCell(writer, enforcingStr(j), enforce_col);
+        try writeCell(writer, modeStr(j), mode_col);
+        if (std.mem.eql(u8, protectionStr(j), "active") or std.mem.eql(u8, protectionStr(j), "log-only")) try color.on(writer, Color.green) else try color.on(writer, Color.yellow);
+        try writeCell(writer, protectionStr(j), protection_col);
         try color.off(writer);
         try writeCell(writer, if (j.log_source) |source| renderDiagnostic(&source_buffer, source) else "-", source_col);
         if (j.source_healthy) |h| try color.on(writer, if (h) Color.green else Color.yellow);
@@ -1068,16 +1246,18 @@ fn writeJailsSummary(writer: anytype, jails: []const JailEntry, color: Color, co
     const state_col = colWidth("STATE", 8);
     const source_col = colWidth("SOURCE", longestJailText(jails, "log_source"));
     const health_col = @max("SOURCE HEALTH".len, longestJailHealth(jails)) + 1;
-    const enforcing_col = colWidth("ENFORCING", 7);
+    const mode_col = colWidth("MODE", "log-only".len);
+    const protection_col = colWidth("PROTECTION", 11);
     const bans_col = colWidth("BANS", 10);
-    const full_width = name_col + state_col + source_col + health_col + enforcing_col + bans_col;
-    if (full_width > columns) return writeJailsStacked(writer, jails, color, columns);
+    const full_width = name_col + state_col + source_col + health_col + mode_col + protection_col + bans_col;
+    if (full_width > columns) return writeJailsStacked(writer, jails, color, columns, false);
     try color.on(writer, Color.bold);
     try padRightPrint(writer, "JAIL", name_col);
     try padRightPrint(writer, "STATE", state_col);
     try padRightPrint(writer, "SOURCE", source_col);
     try padRightPrint(writer, "SOURCE HEALTH", health_col);
-    try padRightPrint(writer, "ENFORCING", enforcing_col);
+    try padRightPrint(writer, "MODE", mode_col);
+    try padRightPrint(writer, "PROTECTION", protection_col);
     try padRightPrint(writer, "BANS", bans_col);
     try color.off(writer);
     try writer.writeAll("\n");
@@ -1095,7 +1275,8 @@ fn writeJailsSummary(writer: anytype, jails: []const JailEntry, color: Color, co
         if (j.source_healthy) |value| try color.on(writer, if (value) Color.green else Color.yellow);
         try writeCell(writer, formatJailHealth(&health, j), health_col);
         try color.off(writer);
-        try writeCell(writer, enforcingStr(j), enforcing_col);
+        try writeCell(writer, modeStr(j), mode_col);
+        try writeCell(writer, protectionStr(j), protection_col);
         try writeCell(writer, formatOptU32Local(j.active_bans), bans_col);
         try writer.writeAll("\n");
     }
@@ -1111,41 +1292,7 @@ fn longestJailHealth(jails: []const JailEntry) usize {
     return widest;
 }
 
-fn writeJailsCompact(writer: anytype, jails: []const JailEntry, color: Color) !void {
-    const name_col = 21;
-    const state_col = 9;
-    const active_col = 8;
-    const action_col = 17;
-    const health_col = compact_jail_health_width;
-    try color.on(writer, Color.bold);
-    try padRightPrint(writer, "JAIL", name_col);
-    try padRightPrint(writer, "STATE", state_col);
-    try padRightPrint(writer, "ACTIVE", active_col);
-    try padRightPrint(writer, "ACTION", action_col);
-    try padRightPrint(writer, "HEALTH", health_col);
-    try color.off(writer);
-    try writer.writeAll("\n");
-    try repeatChar(writer, '-', name_col + state_col + active_col + action_col + health_col);
-    try writer.writeAll("\n");
-    for (jails) |j| {
-        var name_buffer: [diagnostic_max_bytes]u8 = undefined;
-        var action_buffer: [diagnostic_max_bytes]u8 = undefined;
-        var health_buffer: [diagnostic_max_bytes]u8 = undefined;
-        try writeCell(writer, if (j.name) |name| renderDiagnostic(&name_buffer, name) else "-", name_col);
-        try color.on(writer, if (j.paused == true or !(j.enabled orelse false)) Color.yellow else Color.green);
-        try writeCell(writer, stateStr(j), state_col);
-        try color.off(writer);
-        try writeCell(writer, formatOptU32Local(j.active_bans), active_col);
-        try writeCell(writer, if (j.action) |action| renderDiagnostic(&action_buffer, action) else "-", action_col);
-        if (j.source_healthy) |healthy| try color.on(writer, if (healthy) Color.green else Color.yellow);
-        try writeCell(writer, formatJailHealth(&health_buffer, j), health_col);
-        try color.off(writer);
-        try writer.writeAll("\n");
-    }
-    try writer.print("Total: {d} jails\n", .{jails.len});
-}
-
-fn writeJailsStacked(writer: anytype, jails: []const JailEntry, color: Color, columns: usize) !void {
+fn writeJailsStacked(writer: anytype, jails: []const JailEntry, color: Color, columns: usize, details: bool) !void {
     const value_width = @max(@as(usize, 4), columns -| "HEALTH: ".len);
     for (jails, 0..) |j, index| {
         var name_buffer: [diagnostic_max_bytes]u8 = undefined;
@@ -1163,13 +1310,20 @@ fn writeJailsStacked(writer: anytype, jails: []const JailEntry, color: Color, co
         try writeCell(writer, formatOptU32Local(j.active_bans), value_width);
         try writer.writeAll("\nSOURCE: ");
         try writeCell(writer, if (j.log_source) |source| renderDiagnostic(&source_buffer, source) else "-", value_width);
-        try writer.writeAll("\nENFORCING: ");
-        try writeCell(writer, enforcingStr(j), @max(@as(usize, 4), columns -| "ENFORCING: ".len));
+        try writer.writeAll("\nMODE:   ");
+        try writeCell(writer, modeStr(j), @max(@as(usize, 4), columns -| "MODE:   ".len));
+        try writer.writeAll("\nPROTECTION: ");
+        try writeCell(writer, protectionStr(j), @max(@as(usize, 4), columns -| "PROTECTION: ".len));
         try writer.writeAll("\nACTION: ");
         try writeCell(writer, if (j.action) |action| renderDiagnostic(&action_buffer, action) else "-", value_width);
         try writer.writeAll("\nHEALTH: ");
         try writeCell(writer, formatJailHealth(&health_buffer, j), value_width);
         try writer.writeAll("\n");
+        if (details) {
+            try writeStatusNarrowRow(writer, "MAX RETRY: ", formatOptU32Local(j.maxretry), columns);
+            try writeStatusNarrowRow(writer, "FIND TIME: ", formatDurationSecs(j.findtime), columns);
+            try writeStatusNarrowRow(writer, "BAN TIME: ", formatDurationSecs(j.bantime), columns);
+        }
     }
     try writer.print("Total: {d} jails\n", .{jails.len});
 }
@@ -1180,7 +1334,8 @@ const JailsWidths = struct {
     max: usize = 0,
     find: usize = 0,
     ban: usize = 0,
-    enforce: usize = 0,
+    mode: usize = 0,
+    protection: usize = 0,
     health: usize = 0,
 
     fn widen(self: *JailsWidths, j: JailEntry) void {
@@ -1189,7 +1344,8 @@ const JailsWidths = struct {
         self.max = @max(self.max, formatOptU32Local(j.maxretry).len);
         self.find = @max(self.find, formatDurationSecs(j.findtime).len);
         self.ban = @max(self.ban, formatDurationSecs(j.bantime).len);
-        self.enforce = @max(self.enforce, enforcingStr(j).len);
+        self.mode = @max(self.mode, modeStr(j).len);
+        self.protection = @max(self.protection, protectionStr(j).len);
         var health_buffer: [diagnostic_max_bytes]u8 = undefined;
         self.health = @max(self.health, formatJailHealth(&health_buffer, j).len);
     }
@@ -1201,9 +1357,16 @@ fn stateStr(j: JailEntry) []const u8 {
     return if (enabled) "enabled" else "disabled";
 }
 
-fn enforcingStr(j: JailEntry) []const u8 {
-    const e = j.enforcing orelse return "-";
-    return if (e) "true" else "false";
+fn modeStr(j: JailEntry) []const u8 {
+    const configured = j.enforce_configured orelse return "unknown";
+    return if (configured) "enforce" else "log-only";
+}
+
+fn protectionStr(j: JailEntry) []const u8 {
+    const configured = j.enforce_configured orelse return "unknown";
+    if (!configured) return "log-only";
+    const active = j.enforcing orelse return "unknown";
+    return if (active) "active" else "unconfirmed";
 }
 
 fn formatJailHealth(buffer: []u8, jail: JailEntry) []const u8 {
@@ -2572,6 +2735,7 @@ pub fn formatError(
 pub const TestAccess = if (@import("builtin").is_test) struct {
     pub const statusForWidth = formatStatusForWidth;
     pub const statusForWidthDetailed = formatStatusForWidthDetailed;
+    pub const statsForWidth = formatStatsForWidth;
     pub const diagnosticMaxBytes = diagnostic_max_bytes;
     pub const unsafeUnicodeControl = isUnsafeUnicodeControl;
     pub const diagnostic = renderDiagnostic;

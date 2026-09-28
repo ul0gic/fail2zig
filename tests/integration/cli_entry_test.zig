@@ -184,6 +184,9 @@ test "cli entry: usage failures are class 2 and absent service is class 3" {
     const absent = try run(a, &.{ exe, "--socket", "/nonexistent/fail2zig.sock", "--timeout", "500", "status" });
     defer absent.deinit(a);
     try testing.expectEqual(@as(u8, 3), absent.code);
+    const absent_stats = try run(a, &.{ exe, "stats", "--socket", "/nonexistent/fail2zig.sock", "--timeout", "500" });
+    defer absent_stats.deinit(a);
+    try testing.expectEqual(@as(u8, 3), absent_stats.code);
     const absent_json = try run(a, &.{ exe, "--socket", "/nonexistent/fail2zig.sock", "--output", "json", "version" });
     defer absent_json.deinit(a);
     try testing.expectEqual(@as(u8, 3), absent_json.code);
@@ -269,6 +272,21 @@ test "cli entry: the same artifact starts the daemon and serves every retained o
     const list_doc = try std.json.parseFromSlice(std.json.Value, a, list.stdout, .{});
     defer list_doc.deinit();
     try testing.expectEqual(@as(usize, 0), list_doc.value.array.items.len);
+
+    const stats = try run(a, &.{ exe, "stats", "--socket", h.socket_path, "--output", "json" });
+    defer stats.deinit(a);
+    try testing.expectEqual(@as(u8, 0), stats.code);
+    const stats_doc = try std.json.parseFromSlice(std.json.Value, a, stats.stdout, .{});
+    defer stats_doc.deinit();
+    try testing.expect(!stats_doc.value.object.get("available").?.bool);
+    try testing.expectEqualStrings("log_only", stats_doc.value.object.get("reason").?.string);
+    try testing.expect(stats_doc.value.object.get("last_observed_installed").? == .null);
+    try testing.expect(!jail.get("enforce_configured").?.bool);
+    for ([_][]const u8{ "table", "plain", "json" }) |output| {
+        const sorted = try run(a, &.{ exe, "list", "--sort", "--jail", "sshd", "--socket", h.socket_path, "--output", output });
+        defer sorted.deinit(a);
+        try testing.expectEqual(@as(u8, 0), sorted.code);
+    }
 
     const firewall_json = try run(a, &.{ exe, "--socket", h.socket_path, "--timeout", "2000", "--output", "json", "firewall", "show", "--limit", "1" });
     defer firewall_json.deinit(a);

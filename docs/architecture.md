@@ -1,6 +1,6 @@
 # Runtime architecture
 
-fail2zig 0.4.5 is one native executable containing the daemon, administration commands, rule
+fail2zig 0.4.6 is one native executable containing the daemon, administration commands, rule
 testing and migration tools. Zig application code statically embeds pinned upstream SQLite C.
 Runtime installation does not require Python, a SQLite service, the SQLite CLI or a shared SQLite
 library.

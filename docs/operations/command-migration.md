@@ -50,13 +50,35 @@ as text. The native classes are the contract; the JSON `outcome` field carries t
 
 ## Command mapping
 
-`table` output is for people; `json` for scripts; `plain` is tab-separated.
+`table` output is for people; `json` for scripts; `plain` is tab-separated. `list --sort`
+sorts the returned rows in every format and does not change default ordering. Sorted
+malformed or missing IP/jail keys fail before any output. Jail mode is configured
+`enforce_configured` intent; observed protection remains the separate `enforcing`
+field. Human jail output labels configured `MODE` and observed `PROTECTION` separately.
+`active` means the daemon's existing protection criteria are met, not per-jail kernel
+verification; `unconfirmed` does not mean installed rules are absent. Unknown values
+remain unknown. Plain jail output keeps its 11 columns; an unknown active-ban count is
+`-`, while known zero remains `0`. Plain list output keeps its existing `0` expiry
+convention for permanent or unknown expiry; use JSON for explicit fields.
+
+`stats` returns the worker's retained snapshot and does not read SQLite, scan bans,
+or trigger a firewall readback. Snapshot age differs from readback age, and stale data
+is labeled with its age. `available: false` uses `reason` (`log_only`,
+`backend_unavailable` or `not_published`); unavailable values are JSON `null` and
+plain output uses `-`. Counter fields are null when no snapshot exists. Known counters
+start at zero on daemon start and remain cumulative across reloads and storage reopen;
+they reset on daemon restart. `accepted_readbacks` counts accepted inventories, not
+every dump or readback attempt. Stats does not assert current worker health; use
+`status` for protection and health. Older daemons without query-v1 stats support return
+an unsupported-query failure; clients should report that a daemon with stats support
+is required and must not substitute fabricated zero values.
 
 | fail2ban-client | fail2zig | Exit | JSON |
 |---|---|---|---|
-| `status` | `fail2zig status [--details]` | 0 / 3 | object: `version`, `protection`, `active_bans`, `total_bans`, `storage`, `backend`, `generation`, worker and clock flags |
-| `status <jail>` | `fail2zig jails [--details]` (all jails) or `fail2zig list --jail <jail> [--details]` (bans) | 0 / 3 | `jails`: array of `name`, `enabled`, `paused`, `healthy`, `active_bans`, `maxretry`, `findtime`, `bantime`, `action`, `enforcing`, `source`, `revision` |
-| `get <jail> banip` / `banned` | `fail2zig list [--jail <jail>] [--details]` | 0 / 3 | array of active bans |
+| `status` | `fail2zig status [--details]` | 0 / 3 | object: `version`, `protection`, `active_bans`, `total_bans` (retained confirmed effect events, not lifetime bans), `storage`, `backend`, `generation`, worker and clock flags |
+| `status <jail>` | `fail2zig jails [--details]` (all jails) or `fail2zig list --jail <jail> [--details]` (bans) | 0 / 3 | `jails`: array of `name`, `enabled`, `paused`, `healthy`, `active_bans`, `maxretry`, `findtime`, `bantime`, `action`, `enforce_configured`, `enforcing`, `source`, `revision` |
+| `get <jail> banip` / `banned` | `fail2zig list [--jail <jail>] [--details] [--sort]` | 0 / 3 | array of active bans; `--sort` orders rows numerically by IP, IPv4 before IPv6, then prefix, host/network form and jail name; without it order is unchanged |
+| (no equivalent) | `fail2zig stats [--details] [--output table\|plain\|json]` | 0 / 3 | query-v1 `kind: "stats"`; one retained worker snapshot with explicit nullable fields, separate snapshot/readback ages and daemon-start counters |
 | `set <jail> banip <ip>` | `fail2zig ban <ip> --jail <jail> [--duration <s>] [--scope host\|net <cidr>]` | 0 / 1 / 4 / 5 | `schema_version` 1, `kind` `ban`, `outcome` `applied\|rejected\|…`, `generation`, `mutation_revision`, `enforced`, `reasons[]` |
 | `set <jail> unbanip <ip>` | `fail2zig unban <ip> --jail <jail> [--scope host\|net <cidr>]` | 0 / 1 / 4 / 5 | `kind` `unban`, otherwise as `ban` |
 | `unban --all` | not supported; loop `fail2zig list --output json` and `unban` per address and jail | | |

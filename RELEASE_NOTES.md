@@ -1,67 +1,62 @@
-# fail2zig v0.4.5
+# fail2zig v0.4.6
 
-Version 0.4.5 repairs the load-triggered storage intervention and restart failures
-reported in #91, and the incomplete firewall command usage text in #90. It also
-corrects reload and migration ownership handling. No new integrations are added.
+Version 0.4.6 improves operator commands and output: sorted ban lists, on-demand
+runtime statistics, and clearer protection status. It addresses #94 and #95.
 
-## Fixes
+## Changes
 
-- Bound storage retention and recovery work so the reproduced 199-ban incident
-  can continue ingesting and enforcing bans instead of entering intervention.
-- Restore populated state with the original ban deadlines. Progressing startup
-  extends the systemd notification timeout without claiming readiness early.
-- Reduce repeated firewall readback and settlement work, service expiry and
-  cleanup under load, and absorb transient backend uncertainty without pausing
-  otherwise healthy ingestion. nftables, iptables and ipset remain supported.
-- Report protection knowledge age, pending bans and overdue removals, keeping
-  bookkeeping delay separate from confirmed over-blocking.
-- Provide `repair-source` for explicit offline recovery from a truncated file
-  source. Startup still refuses unacknowledged loss of source continuity.
-- Preserve live bans and absent-owner history during a generation-changing reload.
-- Limit migration rollback release to that migration's decisions; later native
-  decisions and other owners of the same scope keep their protection.
-- Include the already-supported `--details` option in `firewall --help` usage.
+- Add `fail2zig list --sort` for numeric address ordering in human, plain and JSON
+  output. IPv4 precedes IPv6; the default listing order is unchanged.
+- Add read-only `fail2zig stats` and `stats --details`. These show the worker's
+  published runtime snapshot, freshness and counters without triggering database
+  scans or firewall inspection. Counters are cumulative since daemon start.
+- Move periodic effect-view diagnostics from info to debug logging. Use `stats`
+  when you want to inspect current counters without enabling debug logs.
+- Distinguish configured MODE from observed PROTECTION in jail output. Unknown
+  active counts are shown as unknown rather than zero; history is described as
+  retained confirmations rather than lifetime bans.
+- Keep every field visible in narrow-terminal `jails --details` using a stacked
+  layout, including max retry, find time and ban time.
+- Align command help, completions, example configuration and manual pages. Add
+  pointers to existing per-jail commands and recommend `enforce` configuration
+  instead of the deprecated `banaction` spelling.
 
-## Upgrade and rollback
+## Upgrade and compatibility
 
-The first start upgrades native schema-23 state to schema 24. A coherent
-pre-upgrade backup is created before migration changes the database, and an
-interrupted migration can resume. Keep that backup with its matching old binary.
-Older binaries refuse schema-24 state: rollback requires restoring the matching
-backup, and does not retain decisions made after that backup. Do not replace only
-the binary and expect it to read the upgraded state. SQLite WAL with
-`synchronous=FULL` remains unchanged by this release.
+Upgrading from v0.4.5 keeps native schema 24. This release does not change SQLite
+WAL/FULL durability, ban deadlines, source-continuity checks or firewall ownership.
+nftables, iptables and ipset remain supported.
 
-See the installation guide and `fail2zig(1)` for migration and source-repair
-instructions. Source repair acknowledges a continuity break; it cannot recover
-log entries already removed by truncation.
+Existing JSON fields are retained; jail output adds `enforce_configured` and the
+query interface adds statistics. Scripts parsing plain jail counts must handle
+`-` for an unknown count; known zero remains `0`. Human-readable layouts and labels
+have changed. See the command migration guide for details.
+
+Back up existing state before upgrading. The known direct v0.4.3-state upgrade
+failure remains unresolved; do not assume an intermediate upgrade or a database
+reset preserves that state. Schema-23 upgrades from v0.4.4 retain the existing
+backup/rollback requirements described in the installation guide.
 
 ## Known limitations
 
-- Sustained input can outpace ingestion on small, slow-storage systems. A
-  30-minute lab workload at approximately 3.4 records/s on a one-vCPU,
-  HDD-backed VM installed every subject but had p95 append-to-kernel latency
-  of 57 seconds. This release does not promise five-second enforcement under
-  that workload. New attackers remain unblocked until their records are handled.
-- A 400-ban restart hold can report stale protection knowledge and degraded
-  status. The observed failures retained 400 reported active bans and healthy
-  storage; they did not demonstrate a lost ban. The readback cause and full
-  transient duration remain under investigation. Stale status is not a
-  confirmation of current kernel protection.
-
-Both findings remain separate follow-up work. The original failed measurements
-have not been relabeled as passing.
+- Sustained input can still outpace ingestion on small, slow-storage systems.
+  This release makes no new throughput or enforcement-latency guarantee.
+- A populated restart hold can report stale protection knowledge. Stale status
+  is not confirmation of current kernel protection.
+- A file truncated below its committed position still requires explicit offline
+  source repair. The reported PortSentry reboot-truncation behavior is separate
+  follow-up work; this release does not add automatic recovery or acknowledge
+  missing input on the operator's behalf.
 
 ## Verification scope
 
-Qualification covers the 210-ban incident reproduction, scoped source repair,
-schema migration and rollback, and independent nftables, iptables and ipset
-ban/readback/restart/expiry checks. Focused checks cover the reload and migration
-ownership corrections. Existing unaffected scope and failure-path evidence is
-retained; the known long-load and populated-hold limitations above are excluded
-from this release's passing checks.
+Focused CLI, formatting and query checks, isolated enforcing-daemon/restart and
+logging checks, independent source review, and manual command-output review cover
+these changes. Release qualification also checks the versioned executable and the
+existing PR/main CI and package-verification gates. Existing enforcement/storage
+qualification is retained; long-load and populated-hold campaigns are not rerun
+for this interface release.
 
 The five static Linux targets remain x86_64, aarch64, ARMv7 hard float, MIPS32r2
-big endian and MIPS32r2 little endian. Live kernel qualification is on the
-Debian 13 x86_64 lab; cross-builds do not claim live qualification on the other
-architectures. Verify downloaded assets against `SHA256SUMS`.
+big endian and MIPS32r2 little endian. Cross-builds do not imply live-kernel
+qualification on every architecture. Verify downloads against `SHA256SUMS`.

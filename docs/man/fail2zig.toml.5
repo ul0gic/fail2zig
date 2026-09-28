@@ -1,4 +1,4 @@
-.TH FAIL2ZIG.TOML 5 "2026-09-22" "fail2zig 0.4.3" "File Formats"
+.TH FAIL2ZIG.TOML 5 "2026-09-28" "fail2zig 0.4.6" "File Formats"
 .
 .SH NAME
 fail2zig.toml \- fail2zig daemon configuration file
@@ -185,18 +185,34 @@ Integer. Number of failures within
 required to trigger a ban. Minimum: 1. Default: 5.
 .TP
 .B banaction
-String. Whether the jail enforces or observes.
+Deprecated compatibility input. Use
+.B enforce
+to state whether the jail is configured to enforce or observe.
 .BR nftables ,
 .BR iptables ,
 and
 .B ipset
 all mean enforce with the backend selected by
 .BR global.firewall ;
-the names are accepted for fail2ban compatibility and do not select a
-backend.
+the names are accepted for fail2ban compatibility and do not select a backend.
 .B log-only
 observes and never touches the firewall. Default:
 .IR nftables .
+An explicit setting emits a deprecation warning. It remains supported for existing
+configurations; new configurations should use
+.BR enforce .
+.TP
+.B enforce
+Boolean. Configured enforcement intent, inherited from
+.B defaults.enforce
+unless overridden in a jail. True selects enforcement using
+.BR global.firewall ;
+false configures log-only observation. The effective configured intent is reported
+separately from observed protection: a jail may be configured to enforce while
+protection is unconfirmed because backend or daemon criteria are not met. Conversely,
+.B active
+protection reflects existing daemon criteria and is not an independent per-jail
+kernel verification. Default: true.
 .TP
 .B ignoreip
 String array. CIDR ranges and exact IPs that are never banned. Example:
@@ -343,8 +359,15 @@ Optional integer seconds, quoted duration or "permanent". Overrides
 for this jail.
 .TP
 .B banaction
-Optional string. Overrides
+Deprecated optional compatibility string. Overrides
 .B defaults.banaction
+for this jail. Prefer
+.B enforce
+to express jail intent.
+.TP
+.B enforce
+Optional Boolean. Overrides
+.B defaults.enforce
 for this jail.
 .TP
 .B ignoreip
@@ -373,7 +396,7 @@ memory_ceiling_mb = 64
 bantime   = 600
 findtime  = 600
 maxretry  = 5
-banaction = "nftables"
+enforce  = true
 ignoreip  = ["127.0.0.1/8", "::1"]
 
 [jails.sshd]
@@ -389,7 +412,7 @@ journal_executables = ["/usr/sbin/sshd", "/usr/lib/openssh/sshd-session"]
 bantime                       = 600
 findtime                      = 600
 maxretry                      = 5
-banaction                     = "nftables"
+enforce                        = true
 ignoreip                      = ["127.0.0.1/8", "::1"]
 bantime_increment_enabled     = true
 bantime_increment_formula     = "exponential"

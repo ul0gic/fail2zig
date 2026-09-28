@@ -37,6 +37,7 @@ pub const Command = union(enum) {
     help: ?[]const u8,
     version: void,
     status: DetailArgs,
+    stats: DetailArgs,
     ban: BanArgs,
     unban: UnbanArgs,
     list: ListArgs,
@@ -84,6 +85,7 @@ pub const Command = union(enum) {
     pub const ListArgs = struct {
         jail: ?[]const u8 = null,
         details: bool = false,
+        sort: bool = false,
     };
 
     pub const DetailArgs = struct { details: bool = false };
@@ -207,6 +209,9 @@ pub fn parse(argv: []const []const u8, diag: *ParseDiag) Error!Parsed {
     if (std.mem.eql(u8, cmd_str, "status")) {
         return parseDetailsOnly(rest, "status", &globals, diag, .status);
     }
+    if (std.mem.eql(u8, cmd_str, "stats")) {
+        return parseDetailsOnly(rest, "stats", &globals, diag, .stats);
+    }
     if (std.mem.eql(u8, cmd_str, "jails")) {
         return parseDetailsOnly(rest, "jails", &globals, diag, .jails);
     }
@@ -258,7 +263,7 @@ pub fn parse(argv: []const []const u8, diag: *ParseDiag) Error!Parsed {
     return error.UnknownCommand;
 }
 
-fn parseDetailsOnly(rest: []const []const u8, cmd: []const u8, globals: *Globals, diag: *ParseDiag, comptime tag: enum { status, jails }) Error!Parsed {
+fn parseDetailsOnly(rest: []const []const u8, cmd: []const u8, globals: *Globals, diag: *ParseDiag, comptime tag: enum { status, stats, jails }) Error!Parsed {
     var detail = Command.DetailArgs{};
     var k: usize = 0;
     while (k < rest.len) : (k += 1) {
@@ -423,7 +428,7 @@ fn parseJailAdmin(rest: []const []const u8, globals: *Globals, diag: *ParseDiag)
         }
         if (action == null) {
             action = std.meta.stringToEnum(Command.JailAction, a) orelse {
-                diag.set("invalid jail action '{s}' (expected: enable, disable, pause, resume)", .{a});
+                diag.set("invalid jail action '{s}' (expected: enable, disable, pause, resume); use 'list --jail <name>', 'ban <ip> --jail <name>', or 'unban <ip> --jail <name>' to manage bans", .{a});
                 return error.InvalidValue;
             };
             continue;
@@ -506,6 +511,10 @@ fn parseList(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Erro
         }
         if (std.mem.eql(u8, a, "--details")) {
             args.details = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--sort")) {
+            args.sort = true;
             continue;
         }
         if (std.mem.startsWith(u8, a, "--")) {
@@ -704,6 +713,7 @@ pub const known_commands = [_][]const u8{
     "ban",
     "unban",
     "list",
+    "stats",
     "jails",
     "reload",
     "version",
@@ -768,11 +778,12 @@ pub const help_top =
     \\
     \\COMMANDS:
     \\    status              Show protection-first daemon status (--details for identifiers/metrics)
+    \\    stats               Show the retained enforcement statistics snapshot
     \\    ban <ip>            Manually ban an IP
     \\    unban <ip>          Manually unban an IP
     \\    list                List active bans (--jail filter; --details for counts)
     \\    jails               List configured jails (--details for thresholds)
-    \\    reload              Apply a validated configuration live (restart-only keys reported)
+    \\    reload              Apply supported changes live; restart-only settings require restart
     \\    version             Show client and daemon version
     \\    config              Show the daemon's effective configuration
     \\    history             Page through confirmed ban history
@@ -793,6 +804,7 @@ pub const help_top =
     \\
     \\EXAMPLES:
     \\    fail2zig status
+    \\    fail2zig stats
     \\    fail2zig ban 192.0.2.10 --jail sshd --duration 3600
     \\    fail2zig ban 192.0.2.10 --jail sshd --scope net 192.0.2.0/24
     \\    fail2zig jail pause sshd
@@ -840,11 +852,16 @@ pub const help_list =
     \\fail2zig list — list active bans
     \\
     \\USAGE:
-    \\    fail2zig list [--jail <name>] [--details]
+    \\    fail2zig list [--jail <name>] [--details] [--sort]
     \\
     \\FLAGS:
     \\    --jail <name>       Filter by jail
     \\    --details           Include ban counts in table output
+    \\    --sort              Sort by numeric IP address, then jail name
+    \\    IPv4 sorts before IPv6; networks sort by address and prefix length.
+    \\    Without --sort, the daemon's existing order is preserved.
+    \\    Plain output keeps four columns; expiry 0 means permanent or unknown.
+    \\    Use JSON for explicit expiry fields.
     \\
 ;
 
@@ -855,6 +872,35 @@ pub const help_config =
     \\    fail2zig config
     \\
     \\Paths and address lists are redacted unless the caller is an administrator.
+    \\
+;
+
+pub const help_jails =
+    \\fail2zig jails — show configured jails and observed protection
+    \\
+    \\USAGE:
+    \\    fail2zig jails [--details]
+    \\
+    \\MODE reports configured enforcement intent (enforce or log-only).
+    \\PROTECTION active means the daemon's current protection criteria are met;
+    \\pending bans may remain. It is not an independent per-jail kernel verification.
+    \\Unconfirmed does not mean installed rules are absent. Unknown means no value
+    \\was supplied. Plain output preserves the enforcing boolean and uses - for
+    \\an unknown active-ban count; a known zero remains 0.
+    \\
+;
+
+pub const help_stats =
+    \\fail2zig stats — show one retained enforcement statistics snapshot
+    \\
+    \\USAGE:
+    \\    fail2zig stats [--details]
+    \\
+    \\The snapshot may be stale; its age and readback knowledge are shown separately.
+    \\Use status to inspect current protection and daemon health. A stats snapshot is
+    \\not per-jail kernel verification and does not trigger a firewall readback.
+    \\
+    \\An older daemon may not support this query; upgrade the daemon to use stats.
     \\
 ;
 
@@ -901,6 +947,9 @@ pub const help_jail =
     \\    fail2zig jail disable <name>
     \\    fail2zig jail pause <name>
     \\    fail2zig jail resume <name>
+    \\
+    \\Manage bans with 'fail2zig list --jail <name>', 'fail2zig ban <ip> --jail <name>',
+    \\or 'fail2zig unban <ip> --jail <name>'.
     \\
 ;
 
@@ -950,6 +999,8 @@ pub fn helpFor(topic: ?[]const u8) []const u8 {
     if (std.mem.eql(u8, t, "ban")) return help_ban;
     if (std.mem.eql(u8, t, "unban")) return help_unban;
     if (std.mem.eql(u8, t, "list")) return help_list;
+    if (std.mem.eql(u8, t, "stats")) return help_stats;
+    if (std.mem.eql(u8, t, "jails")) return help_jails;
     if (std.mem.eql(u8, t, "completions")) return help_completions;
     if (std.mem.eql(u8, t, "config")) return help_config;
     if (std.mem.eql(u8, t, "history")) return help_history;
@@ -970,8 +1021,13 @@ test "args: details is limited to table presentation commands" {
     try std.testing.expectEqual(OutputFormat.json, status.globals.output);
     const jails = try parseOk(&.{ "jails", "--details" });
     try std.testing.expect(jails.command.jails.details);
-    const list = try parseOk(&.{ "list", "--details" });
+    const list = try parseOk(&.{ "list", "--details", "--sort" });
     try std.testing.expect(list.command.list.details);
+    try std.testing.expect(list.command.list.sort);
+    const stats = try parseOk(&.{ "--output", "plain", "stats", "--details", "--no-color" });
+    try std.testing.expect(stats.command.stats.details);
+    try std.testing.expectEqual(OutputFormat.plain, stats.globals.output);
+    try std.testing.expect(!stats.globals.color);
     var diag: ParseDiag = .{};
     try std.testing.expectError(error.UnknownFlag, parse(&.{ "history", "--details" }, &diag));
 }
@@ -1019,6 +1075,9 @@ test "args: jail admin actions" {
     try std.testing.expectError(error.MissingArgument, parse(&.{ "jail", "pause" }, &diag));
     try std.testing.expect(std.mem.indexOf(u8, diag.message(), "jail pause") != null);
     try std.testing.expectError(error.InvalidValue, parse(&.{ "jail", "delete", "sshd" }, &diag));
+    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "list --jail <name>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "ban <ip> --jail <name>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "unban <ip> --jail <name>") != null);
     try std.testing.expectError(error.TooManyArguments, parse(&.{ "jail", "enable", "sshd", "nginx" }, &diag));
     try std.testing.expectError(error.UnknownFlag, parse(&.{ "jail", "enable", "sshd", "--force" }, &diag));
 }

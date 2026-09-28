@@ -758,3 +758,28 @@ test "native query: cursor encoding is opaque base64url and strict on decode" {
     try t.expectError(error.BadCursor, query.Cursor.decode("eDoxOjI"));
     try t.expectError(error.BadCursor, query.Cursor.decode("czoxOg"));
 }
+
+test "native query: stats serves fixed snapshots to monitors and rejects unrelated filters" {
+    for ([_]query.PeerClass{ .admin, .monitor }) |peer| {
+        const result = try run("{\"schema_version\":1,\"kind\":\"stats\"}", peer, .{ .stats = .{ .available = true, .reason = null, .knowledge = "stale", .last_observed_installed = 7, .accepted_readbacks = 12 } });
+        defer result.deinit(a);
+        const doc = try parse(result.payload);
+        defer doc.deinit();
+        try t.expectEqualStrings(generation_hex, doc.value.object.get("generation").?.string);
+        try t.expectEqual(@as(i64, 7), doc.value.object.get("last_observed_installed").?.integer);
+        try t.expectEqualStrings("stale", doc.value.object.get("knowledge").?.string);
+        try t.expect(doc.value.object.get("snapshot_age_ms").? == .null);
+    }
+    for ([_][]const u8{
+        "{\"schema_version\":1,\"kind\":\"stats\",\"jail\":\"sshd\"}",
+        "{\"schema_version\":1,\"kind\":\"stats\",\"limit\":1}",
+        "{\"schema_version\":1,\"kind\":\"stats\",\"cursor\":\"x\"}",
+    }) |body| {
+        const result = try run(body, .monitor, .{ .stats = .{} });
+        defer result.deinit(a);
+        try expectFailure(result, 400);
+    }
+    const missing = try run("{\"schema_version\":1,\"kind\":\"stats\"}", .monitor, .{});
+    defer missing.deinit(a);
+    try expectFailure(missing, 503);
+}

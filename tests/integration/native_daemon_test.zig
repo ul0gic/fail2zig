@@ -43,7 +43,9 @@ fn writeConfig(h: *harness.Harness) !void {
         \\
     , .{ h.state_path, h.socket_path, h.log_path });
 }
-fn writeEnforcingConfig(h: *harness.Harness) !void {
+fn writeEnforcingConfig(h: *harness.Harness, level: []const u8) ![]u8 {
+    const daemon_log = try std.fmt.allocPrint(t.allocator, "{s}/daemon-{s}.log", .{ h.tmp_abs, level });
+    errdefer t.allocator.free(daemon_log);
     var file = try std.fs.cwd().createFile(h.config_path, .{ .mode = 0o600 });
     defer file.close();
     try file.writer().print(
@@ -52,6 +54,8 @@ fn writeEnforcingConfig(h: *harness.Harness) !void {
         \\state_file = "{s}"
         \\socket_path = "{s}"
         \\metrics_enabled = false
+        \\log_level = "{s}"
+        \\log_target = "{s}"
         \\firewall = "iptables"
         \\firewall_namespace = "/proc/{d}/ns/net"
         \\[defaults]
@@ -65,7 +69,8 @@ fn writeEnforcingConfig(h: *harness.Harness) !void {
         \\timestamp = "undated"
         \\logpath = ["{s}"]
         \\
-    , .{ h.state_path, h.socket_path, linux.getpid(), h.log_path });
+    , .{ h.state_path, h.socket_path, level, daemon_log, linux.getpid(), h.log_path });
+    return daemon_log;
 }
 fn writePortSentryConfig(h: *harness.Harness) !void {
     if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") != null) return error.SkipZigTest;
@@ -153,6 +158,66 @@ fn waitReady(h: *harness.Harness) !void {
         defer t.allocator.free(result);
         if (std.mem.indexOf(u8, result, "\"ready\":true") != null) return;
         std.time.sleep(20 * std.time.ns_per_ms);
+    }
+    return error.TimedOut;
+}
+
+const LiveStats = struct {
+    installed: u64,
+    entries: u64,
+};
+
+fn waitLiveStats(h: *harness.Harness) !LiveStats {
+    const shared = @import("shared");
+    const StatsResponse = struct {
+        kind: []const u8,
+        available: bool,
+        backend: ?[]const u8,
+        knowledge: ?[]const u8,
+        view_ready: ?bool,
+        view_entries: ?u64,
+        last_observed_installed: ?u64,
+        pending_live_dispatches: ?u64,
+        accepted_readbacks: ?u64,
+    };
+    var timer = try std.time.Timer.start();
+    while (timer.read() < 8 * std.time.ns_per_s) {
+        const result = try h.sendCommand(.{ .query_v1 = try shared.Command.Body.init("{\"schema_version\":1,\"kind\":\"stats\"}") });
+        defer t.allocator.free(result);
+        const parsed = try std.json.parseFromSlice(StatsResponse, t.allocator, result, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const stats = parsed.value;
+        try t.expectEqualStrings("stats", stats.kind);
+        if (stats.available and stats.backend != null and std.mem.eql(u8, stats.backend.?, "iptables") and
+            stats.knowledge != null and std.mem.eql(u8, stats.knowledge.?, "fresh") and
+            stats.view_ready == true and stats.view_entries != null and stats.view_entries.? == 1 and
+            stats.last_observed_installed != null and stats.last_observed_installed.? == 1 and
+            stats.pending_live_dispatches != null and stats.pending_live_dispatches.? == 0 and
+            stats.accepted_readbacks != null and stats.accepted_readbacks.? > 0)
+        {
+            return .{
+                .installed = stats.last_observed_installed.?,
+                .entries = stats.view_entries.?,
+            };
+        }
+        std.time.sleep(20 * std.time.ns_per_ms);
+    }
+    return error.TimedOut;
+}
+
+fn waitDaemonLog(path: []const u8, needle: []const u8) !void {
+    var timer = try std.time.Timer.start();
+    while (timer.read() < 12 * std.time.ns_per_s) {
+        const log = std.fs.cwd().readFileAlloc(t.allocator, path, 256 * 1024) catch |err| switch (err) {
+            error.FileNotFound => {
+                std.time.sleep(50 * std.time.ns_per_ms);
+                continue;
+            },
+            else => return err,
+        };
+        defer t.allocator.free(log);
+        if (std.mem.indexOf(u8, log, needle) != null) return;
+        std.time.sleep(50 * std.time.ns_per_ms);
     }
     return error.TimedOut;
 }
@@ -373,19 +438,38 @@ test "native daemon: enforcing source commits targets before ack and restart doe
 
     var h = try harness.Harness.init(t.allocator, .{ .spawn_daemon = false });
     defer h.deinit();
-    try writeEnforcingConfig(&h);
+    const info_log_path = try writeEnforcingConfig(&h, "info");
+    defer t.allocator.free(info_log_path);
     try h.startDaemon();
     try waitStatus(&h, "\"state\":\"active\"");
     try h.writeLine(failure);
     try waitStatus(&h, "\"decisions_total\":1");
     try h.waitForBan(try @import("shared").IpAddress.parse("203.0.113.7"), 8_000);
     try waitStatus(&h, "\"state\":\"active\"");
+    const stats = try waitLiveStats(&h);
+    const status = try h.queryStatus();
+    defer t.allocator.free(status);
+    try t.expectEqual(@as(u64, harness.parseJsonUintField(status, "active_bans") orelse return error.MissingActiveBanCount), stats.installed);
+    const bans = try h.queryList();
+    defer t.allocator.free(bans);
+    const parsed_bans = try std.json.parseFromSlice([]struct { ip: []const u8 }, t.allocator, bans, .{ .ignore_unknown_fields = true });
+    defer parsed_bans.deinit();
+    try t.expectEqual(@as(usize, stats.entries), parsed_bans.value.len);
+    try t.expectEqualStrings("203.0.113.7", parsed_bans.value[0].ip);
     try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try h.stopDaemon());
+    const info_log = try std.fs.cwd().readFileAlloc(t.allocator, info_log_path, 256 * 1024);
+    defer t.allocator.free(info_log);
+    try expectContainsDiagnostic("info daemon log", info_log, "native: ready");
+    try t.expect(std.mem.indexOf(u8, info_log, "native: effect view:") == null);
     try expectActionTargets(h.state_path);
 
+    const debug_log_path = try writeEnforcingConfig(&h, "debug");
+    defer t.allocator.free(debug_log_path);
     try h.startDaemon();
     try waitStatus(&h, "\"state\":\"active\"");
     try waitStatus(&h, "\"decisions_total\":1");
+    _ = try waitLiveStats(&h);
+    try waitDaemonLog(debug_log_path, "native: effect view:");
     try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try h.stopDaemon());
     try expectActionTargets(h.state_path);
 }

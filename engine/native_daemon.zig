@@ -363,6 +363,9 @@ pub const Coordinator = struct {
     custom_jails: usize = 0,
     published_effects: ?effect_runtime.Health = null,
     published_view: PublishedView = .{},
+    published_stats: query_v1.Stats = .{},
+    stats_published_ms: ?u64 = null,
+    stats_generation: [32]u8 = [_]u8{0} ** 32,
     published_backend: []const u8 = "none",
     startup_backend: ?effect.Backend = null,
     startup_installation: ?effect.Installation = null,
@@ -2417,6 +2420,32 @@ pub const Coordinator = struct {
                 .wake_interval_ns = manager.wake_interval_ns,
                 .transient_uncertain = manager.status.uncertain and manager.status.cause != null and effect_runtime.transientCause(manager.status.cause.?),
             };
+            self.published_stats = .{
+                .available = true,
+                .reason = null,
+                .backend = @tagName(manager.installation.backend),
+                .view_ready = self.published_effects.?.ready,
+                .view_entries = manager.count,
+                .last_observed_installed = manager.installed_live,
+                .pending_live_dispatches = manager.counters.pending,
+                .overdue_blocking_removals = manager.counters.overdue_blocking,
+                .overdue_bookkeeping = manager.counters.overdue_bookkeeping,
+                .accepted_readbacks = manager.counters.full_readbacks,
+                .dump_interruptions = manager.counters.dump_interrupted,
+                .view_rebuilds = manager.counters.rebuilds_completed,
+                .view_restarts = manager.counters.rebuild_restarts,
+                .incremental_updates = manager.counters.incremental_updates,
+                .expiry_batches = manager.counters.expiry_batches,
+                .expiries_prepared = manager.counters.expiries_prepared,
+                .retirement_batches = self.retire_batches,
+                .retry_subjects_retired = self.retired_total,
+                .retry_subjects_examined = self.retire_examined,
+                .retirement_pinned_state = self.retire_pinned_state,
+                .retirement_pinned_effect = self.retire_pinned_effect,
+                .retirement_refused = self.retire_refused,
+            };
+            self.stats_published_ms = observationMs();
+            self.stats_generation = self.published_generation;
         }
         self.mutex.unlock();
         if (self.effects) |manager| {
@@ -2612,7 +2641,7 @@ pub const Coordinator = struct {
         if (self.last_view_report_ms) |last| if (now_ms -| last < 10_000) return;
         const c = manager.counters;
         if (std.meta.eql(c, self.last_view_counters)) return;
-        std.log.info("native: effect view: rebuilds={d} restarted={d} incremental={d} readbacks={d} interrupted={d} entries={d} installed={d} ready={} pending={d} overdue={d} blocking={d} expiry_batches={d}/{d} retired={d}/{d} examined={d} pinned={d}/{d} refused={d}", .{ c.rebuilds_completed, c.rebuild_restarts, c.incremental_updates, c.full_readbacks, c.dump_interrupted, manager.count, manager.installed_live, manager.status.ready, c.pending, c.overdue, c.overdue_blocking, c.expiries_prepared, c.expiry_batches, self.retired_total, self.retire_batches, self.retire_examined, self.retire_pinned_state, self.retire_pinned_effect, self.retire_refused });
+        std.log.debug("native: effect view: rebuilds={d} restarted={d} incremental={d} readbacks={d} interrupted={d} entries={d} installed={d} ready={} pending={d} overdue={d} blocking={d} expiry_batches={d}/{d} retired={d}/{d} examined={d} pinned={d}/{d} refused={d}", .{ c.rebuilds_completed, c.rebuild_restarts, c.incremental_updates, c.full_readbacks, c.dump_interrupted, manager.count, manager.installed_live, manager.status.ready, c.pending, c.overdue, c.overdue_blocking, c.expiries_prepared, c.expiry_batches, self.retired_total, self.retire_batches, self.retire_examined, self.retire_pinned_state, self.retire_pinned_effect, self.retire_refused });
         self.last_view_report_ms = now_ms;
         self.last_view_counters = c;
     }
@@ -3054,6 +3083,36 @@ pub const Coordinator = struct {
         var scope_storage: []query_v1.ScopeItem = &.{};
         defer a.free(scope_storage);
         const requested_kind = query_v1.requestedKind(arena, body);
+        if (requested_kind == .stats) {
+            // Copy only the fixed publication. No owner scans, store access or backend work.
+            self.mutex.lock();
+            var snapshot = self.published_stats;
+            const generation = if (snapshot.available) self.stats_generation else self.published_generation;
+            const now_ms = observationMs();
+            const now_wall = observationWall();
+            const observation = self.worker_observation.read(now_ms, now_wall);
+            if (snapshot.available) {
+                const known = self.knowledge(now_ms) orelse .none;
+                snapshot.knowledge = @tagName(known);
+                snapshot.knowledge_age_ms = if (known == .none) null else self.knowledgeAgeMs(now_ms);
+                if (known == .none) snapshot.last_observed_installed = null;
+                if (!observation.clock_uncertain) {
+                    if (now_ms) |now| if (self.stats_published_ms) |then| {
+                        if (now >= then) snapshot.snapshot_age_ms = now - then;
+                    };
+                    if (now_wall) |now| snapshot.uptime_seconds = @intCast(@max(0, @divTrunc(now -| self.start_us, 1_000_000)));
+                }
+            } else {
+                snapshot.reason = if (self.backend_failure != null or self.suppress_enforcement) "backend_unavailable" else if (self.startup_backend != null) "not_published" else "log_only";
+                snapshot.backend = if (self.startup_backend) |backend| @tagName(backend) else null;
+            }
+            self.mutex.unlock();
+            const result = try query_v1.handle(a, body, peer_class, generation, .{ .stats = snapshot });
+            return switch (result) {
+                .payload => |bytes| .{ .ok = .{ .payload = bytes } },
+                .failure => |failure| .{ .err = .{ .code = failure.code, .message = try a.dupe(u8, failure.message) } },
+            };
+        }
         const firewall_request = requested_kind != null and requested_kind.? == .firewall;
         var generation: [32]u8 = undefined;
         var config_view: ?query_v1.ConfigView = null;
@@ -3160,7 +3219,7 @@ pub const Coordinator = struct {
                         .finite_us => |value| @divTrunc(value, 1_000_000),
                         .permanent => null,
                     };
-                    try std.json.stringify(.{ .name = jail.name, .healthy = jail.healthy and self.published_health.phase == .healthy and observationSound(observation), .enabled = jail.admin_enabled, .paused = jail.admin_paused, .active_bans = self.confirmedCount(jail, sampled_wall orelse self.start_us, sampled_ms), .maxretry = jail.policy.maxretry, .findtime = @divTrunc(jail.policy.window_us, 1_000_000), .bantime = bantime, .bantime_permanent = jail.policy.duration == .permanent, .action = if (self.jailEnforces(&jail)) self.published_backend else "log-only", .enforcing = self.jailEnforces(&jail) and self.enforcementActive(observation, sampled_ms), .log_source = @tagName(jail.plan), .source_healthy = jail.healthy, .source = @tagName(jail.plan), .revision = jail.revision, .decisions = jail.summary.decisions, .cause = if (jail.source_error) |cause| @errorName(cause) else "none", .source_exit_code = if (jail.source_diagnostic) |detail| detail.exit_code else null, .source_signal = if (jail.source_diagnostic) |detail| detail.signal else null, .source_stderr_present = if (jail.source_diagnostic) |detail| @as(?bool, detail.stderr_present) else null }, .{}, w);
+                    try std.json.stringify(.{ .name = jail.name, .healthy = jail.healthy and self.published_health.phase == .healthy and observationSound(observation), .enabled = jail.admin_enabled, .paused = jail.admin_paused, .active_bans = self.confirmedCount(jail, sampled_wall orelse self.start_us, sampled_ms), .maxretry = jail.policy.maxretry, .findtime = @divTrunc(jail.policy.window_us, 1_000_000), .bantime = bantime, .bantime_permanent = jail.policy.duration == .permanent, .action = if (self.jailEnforces(&jail)) self.published_backend else "log-only", .enforce_configured = jail.policy.enforce, .enforcing = self.jailEnforces(&jail) and self.enforcementActive(observation, sampled_ms), .log_source = @tagName(jail.plan), .source_healthy = jail.healthy, .source = @tagName(jail.plan), .revision = jail.revision, .decisions = jail.summary.decisions, .cause = if (jail.source_error) |cause| @errorName(cause) else "none", .source_exit_code = if (jail.source_diagnostic) |detail| detail.exit_code else null, .source_signal = if (jail.source_diagnostic) |detail| detail.signal else null, .source_stderr_present = if (jail.source_diagnostic) |detail| @as(?bool, detail.stderr_present) else null }, .{}, w);
                 }
                 try w.writeAll("]");
             },
