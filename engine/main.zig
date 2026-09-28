@@ -71,7 +71,7 @@ pub const CliOptions = struct {
 
 pub const EntryMode = enum { daemon, operator, migrate, rule_test, repair_source };
 
-const operator_words = [_][]const u8{ "status", "jails", "list", "ban", "unban", "reload", "version", "help", "completions", "config", "history", "jail", "firewall" };
+const operator_words = [_][]const u8{ "status", "jails", "list", "ban", "unban", "reload", "version", "help", "completions", "config", "history", "jail", "firewall", "stats" };
 const operator_globals = [_][]const u8{ "--socket", "--output", "--no-color", "--timeout" };
 
 pub fn classifyEntry(args: []const []const u8) EntryMode {
@@ -155,12 +155,12 @@ fn printHelp(w: anytype) !void {
         \\
         \\COMMANDS:
         \\  status | jails | list | ban | unban | reload | version | help | completions
-        \\  config | history | jail | firewall show
-        \\  migrate inspect|snapshot|plan|validate ... read-only migration preparation
+        \\  config | history | jail | firewall show | stats
+        \\  migrate inspect|snapshot|plan|validate|cutover|status|rollback ...
         \\  rule-test --file|--record|--journal ...   offline rule evaluation (no daemon needed)
         \\  repair-source --jail J --source PATH --token T --acknowledge-truncation   acknowledge a truncated file source (daemon stopped)
         \\  Globals: --socket <path> --output table|json|plain --no-color --timeout <ms>
-        \\  `fail2zig help <command>` documents each command; `fail2zig version` is the daemon's.
+        \\  `fail2zig help <command>` documents each command; `fail2zig version` shows client and daemon versions.
         \\
         \\OPTIONS:
         \\  --config <path>           Config file (default: /etc/fail2zig/config.toml)
@@ -178,7 +178,7 @@ fn printHelp(w: anytype) !void {
         \\      zero enabled jails imported)
         \\  2   usage, argument, config parse/validation or import parse failure
         \\  3   daemon/transport unavailable
-        \\  4   partial durable effect (reserved)   5   uncertain durable effect (reserved)
+        \\  4   partial durable effect              5   uncertain durable effect
         \\
     , .{version});
 }

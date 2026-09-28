@@ -3,11 +3,14 @@
 
 const std = @import("std");
 const format = @import("client_format");
+const list_order = @import("client_list_order");
 const testing = std.testing;
 const OutputFormat = format.OutputFormat;
 const Color = format.Color;
 const formatStatus = format.formatStatus;
 const formatStatusDetailed = format.formatStatusDetailed;
+const formatStats = format.formatStats;
+const formatStatsDetailed = format.formatStatsDetailed;
 const formatList = format.formatList;
 const formatJails = format.formatJails;
 const formatVersion = format.formatVersion;
@@ -29,6 +32,7 @@ const formatListForWidth = format.TestAccess.listForWidth;
 const remainingFromExpiry = format.TestAccess.expiryRemaining;
 const formatJailsForWidth = format.TestAccess.jailsForWidth;
 const formatJailsForWidthDetailed = format.TestAccess.jailsForWidthDetailed;
+const formatStatsForWidth = format.TestAccess.statsForWidth;
 const formatFirewallForWidth = format.TestAccess.firewallForWidth;
 const formatFirewallForWidthDetailed = format.TestAccess.firewallForWidthDetailed;
 const writeFirewallStructureRules = format.TestAccess.firewallStructureRules;
@@ -81,6 +85,25 @@ test "format: CP-02 status heading is neutral and narrow output is bounded" {
     try testing.expect(std.mem.indexOf(u8, narrow.items, "Protection:") != null);
     var lines = std.mem.splitScalar(u8, narrow.items, '\n');
     while (lines.next()) |line| if (line.len != 0) try testing.expect(line.len <= 40);
+}
+
+test "format: status history, knowledge and pending are explicit in compact and detailed output" {
+    const payload = "{\"total_bans\":0,\"active_bans\":0,\"knowledge\":\"stale\",\"knowledge_age_ms\":1234,\"pending_bans\":0,\"overdue_removals\":0}";
+    const summary = try runStatus(testing.allocator, payload, .table);
+    defer testing.allocator.free(summary);
+    try testing.expect(std.mem.indexOf(u8, summary, "History:") != null);
+    try testing.expect(std.mem.indexOf(u8, summary, "0 retained confirmations") != null);
+    try testing.expect(std.mem.indexOf(u8, summary, "Knowledge:") != null);
+    try testing.expect(std.mem.indexOf(u8, summary, "stale (readback 1234 ms ago)") != null);
+    try testing.expect(std.mem.indexOf(u8, summary, "Pending:") != null);
+    try testing.expect(std.mem.indexOf(u8, summary, "none") != null);
+
+    var narrow = std.ArrayList(u8).init(testing.allocator);
+    defer narrow.deinit();
+    try formatStatusForWidth(testing.allocator, narrow.writer(), "{}", .table, .{ .enabled = false }, 38);
+    try testing.expect(std.mem.indexOf(u8, narrow.items, "History: unknown") != null);
+    try testing.expect(std.mem.indexOf(u8, narrow.items, "Knowledge: unknown") != null);
+    try testing.expect(std.mem.indexOf(u8, narrow.items, "Pending: unknown") != null);
 }
 
 test "format: status degraded with protection_cause renders the cause" {
@@ -265,6 +288,59 @@ fn runList(alloc: std.mem.Allocator, payload: []const u8, fmt: OutputFormat) ![]
     return list.toOwnedSlice();
 }
 
+fn runStats(alloc: std.mem.Allocator, payload: []const u8, fmt: OutputFormat, details: bool) ![]u8 {
+    var list = std.ArrayList(u8).init(alloc);
+    errdefer list.deinit();
+    if (details) {
+        try formatStatsDetailed(alloc, list.writer(), payload, fmt, .{ .enabled = false });
+    } else {
+        try formatStats(alloc, list.writer(), payload, fmt, .{ .enabled = false });
+    }
+    return list.toOwnedSlice();
+}
+
+test "format: stats labels retained snapshots and emits complete nullable plain schema" {
+    const payload = "{\"schema_version\":1,\"kind\":\"stats\",\"generation\":\"g-1\",\"available\":true,\"reason\":null,\"backend\":\"nftables\",\"uptime_seconds\":60,\"snapshot_age_ms\":17,\"knowledge\":\"stale\",\"knowledge_age_ms\":9000,\"view_ready\":true,\"view_entries\":4,\"last_observed_installed\":0,\"pending_live_dispatches\":0,\"overdue_blocking_removals\":1,\"overdue_bookkeeping\":2,\"accepted_readbacks\":3,\"dump_interruptions\":0,\"view_rebuilds\":12,\"view_restarts\":3,\"incremental_updates\":5,\"expiry_batches\":6,\"expiries_prepared\":7,\"retirement_batches\":8,\"retry_subjects_retired\":9,\"retry_subjects_examined\":10,\"retirement_pinned_state\":11,\"retirement_pinned_effect\":12,\"retirement_refused\":13}";
+    const table = try runStats(testing.allocator, payload, .table, false);
+    defer testing.allocator.free(table);
+    try testing.expect(std.mem.indexOf(u8, table, "Enforcement stats") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "Knowledge: stale (readback 9000 ms ago)") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "Last observed installed: 0") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "View rebuilds: 12 completed, 3 restarted") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "Overdue bookkeeping:") == null);
+
+    const detailed = try runStats(testing.allocator, payload, .table, true);
+    defer testing.allocator.free(detailed);
+    try testing.expect(std.mem.indexOf(u8, detailed, "Overdue bookkeeping: 2") != null);
+    try testing.expect(std.mem.indexOf(u8, detailed, "Retirement refused: 13") != null);
+
+    const plain = try runStats(testing.allocator, payload, .plain, false);
+    defer testing.allocator.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "last_observed_installed\t0\n") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "reason\t-\n") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "retirement_refused\t13\n") != null);
+
+    const unavailable = try runStats(testing.allocator, "{\"available\":false,\"reason\":\"log_only\",\"view_entries\":null}", .table, true);
+    defer testing.allocator.free(unavailable);
+    try testing.expect(std.mem.indexOf(u8, unavailable, "Available: no") != null);
+    try testing.expect(std.mem.indexOf(u8, unavailable, "Reason: log_only") != null);
+    try testing.expect(std.mem.indexOf(u8, unavailable, "Entries:") == null);
+
+    var fresh = std.ArrayList(u8).init(testing.allocator);
+    defer fresh.deinit();
+    try formatStatsForWidth(testing.allocator, fresh.writer(), "{\"available\":true,\"knowledge\":\"fresh\",\"knowledge_age_ms\":0,\"last_observed_installed\":0,\"view_ready\":true,\"view_entries\":0}", .table, .{ .enabled = false }, 38, false);
+    try testing.expect(std.mem.indexOf(u8, fresh.items, "fresh (readback 0 ms ago)") != null);
+    try testing.expect(std.mem.indexOf(u8, fresh.items, "Last observed installed: 0") != null);
+    var lines = std.mem.splitScalar(u8, fresh.items, '\n');
+    while (lines.next()) |line| if (line.len != 0) try testing.expect(line.len <= 38);
+
+    var no_knowledge = std.ArrayList(u8).init(testing.allocator);
+    defer no_knowledge.deinit();
+    try formatStatsForWidth(testing.allocator, no_knowledge.writer(), "{\"available\":true,\"knowledge\":\"none\",\"knowledge_age_ms\":null,\"last_observed_installed\":null}", .table, .{ .enabled = false }, 80, false);
+    try testing.expect(std.mem.indexOf(u8, no_knowledge.items, "Knowledge: none") != null);
+    try testing.expect(std.mem.indexOf(u8, no_knowledge.items, "Last observed installed: -") != null);
+}
+
 test "format: BUG-040 list preserves network CIDR and ordinary host presentation" {
     const payload = "[{\"ip\":\"192.0.2.0/24\",\"jail\":\"sshd\",\"ban_count\":1},{\"ip\":\"198.51.100.7\",\"jail\":\"sshd\",\"ban_count\":2}]";
 
@@ -284,6 +360,59 @@ test "format: BUG-040 list preserves network CIDR and ordinary host presentation
     try testing.expect(std.mem.indexOf(u8, table, "192.0.2.0/24") != null);
     try testing.expect(std.mem.indexOf(u8, table, "198.51.100.7") != null);
     try testing.expect(std.mem.indexOf(u8, table, "198.51.100.7/32") == null);
+}
+
+fn expectIdOrder(output: []const u8, expected: []const []const u8) !void {
+    var cursor: usize = 0;
+    for (expected) |id| {
+        const found = std.mem.indexOfPos(u8, output, cursor, id) orelse return error.MissingExpectedListRow;
+        cursor = found + id.len;
+    }
+}
+
+fn expectBefore(output: []const u8, first_marker: []const u8, second_marker: []const u8) !void {
+    const first = std.mem.indexOf(u8, output, first_marker) orelse return error.MissingFirstExpectedRow;
+    const second = std.mem.indexOf(u8, output, second_marker) orelse return error.MissingSecondExpectedRow;
+    try testing.expect(first < second);
+}
+
+test "format: sorted mixed list preserves unknown JSON fields and row order across formats" {
+    const payload =
+        \\[{"ip":"2001:db8::1","jail":"v6","ban_count":1,"future_field":"kept"},
+        \\{"ip":"192.0.2.0/24","jail":"net","ban_count":2,"future_field":"kept"},
+        \\{"ip":"192.0.2.1/32","jail":"network-host","ban_count":3,"future_field":"kept"},
+        \\{"ip":"192.0.2.1","jail":"zeta","ban_count":4,"future_field":"kept"},
+        \\{"ip":"192.0.2.1","jail":"alpha","ban_count":5,"future_field":"kept"},
+        \\{"ip":"10.0.0.0/24","jail":"v4-net","ban_count":6,"future_field":"kept"},
+        \\{"ip":"192.0.2.2","jail":"v4-host","ban_count":7,"future_field":"kept"}]
+    ;
+    const sorted = try list_order.sortPayload(testing.allocator, payload);
+    defer testing.allocator.free(sorted);
+    const expected_json = &[_][]const u8{ "\"ban_count\":6", "\"ban_count\":2", "\"ban_count\":5", "\"ban_count\":4", "\"ban_count\":3", "\"ban_count\":7", "\"ban_count\":1" };
+
+    const json = try runList(testing.allocator, sorted, .json);
+    defer testing.allocator.free(json);
+    try expectIdOrder(json, expected_json);
+    try testing.expect(std.mem.indexOf(u8, json, "\"future_field\":\"kept\"") != null);
+    try expectBefore(json, "\"ip\":\"192.0.2.1\",\"jail\":\"alpha\"", "\"ip\":\"192.0.2.1\",\"jail\":\"zeta\"");
+    try expectBefore(json, "\"jail\":\"zeta\"", "\"ip\":\"192.0.2.1/32\"");
+
+    const plain = try runList(testing.allocator, sorted, .plain);
+    defer testing.allocator.free(plain);
+    const expected_plain = &[_][]const u8{
+        "10.0.0.0/24\tv4-net\t", "192.0.2.0/24\tnet\t",          "192.0.2.1\talpha\t",
+        "192.0.2.1\tzeta\t",     "192.0.2.1/32\tnetwork-host\t", "192.0.2.2\tv4-host\t",
+        "2001:db8::1\tv6\t",
+    };
+    try expectIdOrder(plain, expected_plain);
+    const table = try runList(testing.allocator, sorted, .table);
+    defer testing.allocator.free(table);
+    const expected_table = &[_][]const u8{
+        "10.0.0.0/24", "192.0.2.0/24", "192.0.2.1", "192.0.2.1/32", "192.0.2.2", "2001:db8::1",
+    };
+    try expectIdOrder(table, expected_table);
+    try expectBefore(table, "192.0.2.1", "192.0.2.1/32");
+    try expectBefore(table, "192.0.2.1/32", "192.0.2.2");
 }
 
 test "format: CP-02 list distinguishes permanent confirmed pending and unknown" {
@@ -367,6 +496,31 @@ test "format: CP-02 jails keep an absent enabled field unknown in tables" {
     const plain = try runJails(testing.allocator, payload, .plain);
     defer testing.allocator.free(plain);
     try testing.expect(std.mem.indexOf(u8, plain, "sshd\tdisabled\t") != null);
+}
+
+test "format: BUG-085 unknown jail count stays distinct from zero and mode reflects configuration" {
+    const payload = "[{\"name\":\"unknown-count\",\"enabled\":true,\"active_bans\":null,\"enforce_configured\":true,\"enforcing\":false,\"source_healthy\":true},{\"name\":\"empty-log-only\",\"enabled\":true,\"active_bans\":0,\"enforce_configured\":false,\"enforcing\":true,\"source_healthy\":true}]";
+    const plain = try runJails(testing.allocator, payload, .plain);
+    defer testing.allocator.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "unknown-count\tenabled\t-\t") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "empty-log-only\tenabled\t0\t") != null);
+    var plain_rows = std.mem.splitScalar(u8, plain, '\n');
+    while (plain_rows.next()) |row| if (row.len != 0) try testing.expectEqual(@as(usize, 10), std.mem.count(u8, row, "\t"));
+
+    const table = try runJails(testing.allocator, payload, .table);
+    defer testing.allocator.free(table);
+    try testing.expect(std.mem.indexOf(u8, table, "MODE") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "PROTECTION") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "enforce") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "unconfirmed") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "log-only") != null);
+
+    var narrow = std.ArrayList(u8).init(testing.allocator);
+    defer narrow.deinit();
+    try formatJailsForWidth(testing.allocator, narrow.writer(), payload, .table, .{ .enabled = false }, 36);
+    try testing.expect(std.mem.indexOf(u8, narrow.items, "MODE:") != null);
+    try testing.expect(std.mem.indexOf(u8, narrow.items, "PROTECTION:") != null);
+    try testing.expect(std.mem.indexOf(u8, narrow.items, "HEALTH:") != null);
 }
 
 test "format: CP-02 jails narrow fallback escapes untrusted text" {
@@ -714,7 +868,7 @@ test "format: presentation details retains machine formats and exposes table ide
 }
 
 test "format: compact jail summary stacks safely on narrow terminals" {
-    const payload = "[{\"name\":\"ssh\\nud\",\"enabled\":true,\"active_bans\":3,\"enforcing\":true,\"log_source\":\"journal\\u001bctl\",\"source_healthy\":false,\"cause\":\"PermissionDenied\"}]";
+    const payload = "[{\"name\":\"ssh\\nud\",\"enabled\":true,\"active_bans\":3,\"enforce_configured\":true,\"enforcing\":true,\"log_source\":\"journal\\u001bctl\",\"source_healthy\":false,\"cause\":\"PermissionDenied\"}]";
     var wide = std.ArrayList(u8).init(testing.allocator);
     defer wide.deinit();
     try formatJailsForWidthDetailed(testing.allocator, wide.writer(), payload, .table, .{ .enabled = false }, 160, false);
@@ -725,19 +879,20 @@ test "format: compact jail summary stacks safely on narrow terminals" {
     try formatJailsForWidthDetailed(testing.allocator, narrow.writer(), payload, .table, .{ .enabled = false }, 36, false);
     try testing.expect(std.mem.indexOf(u8, narrow.items, "JAIL:") != null);
     try testing.expect(std.mem.indexOf(u8, narrow.items, "SOURCE:") != null);
-    try testing.expect(std.mem.indexOf(u8, narrow.items, "ENFORCING:") != null);
+    try testing.expect(std.mem.indexOf(u8, narrow.items, "MODE:") != null);
+    try testing.expect(std.mem.indexOf(u8, narrow.items, "PROTECTION:") != null);
     try testing.expect(std.mem.indexOf(u8, narrow.items, "HEALTH:") != null);
     var lines = std.mem.splitScalar(u8, narrow.items, '\n');
     while (lines.next()) |line| if (line.len != 0) try testing.expect(line.len <= 36);
 }
 
 test "format: BUG-068 default summaries retain health and failure context" {
-    const jails = "[{\"name\":\"sshd\",\"enabled\":true,\"active_bans\":1,\"enforcing\":false,\"log_source\":\"journal\",\"source_healthy\":false,\"cause\":\"JournalCursorLost\",\"source_exit_code\":125,\"source_signal\":15,\"source_stderr_present\":true}]";
+    const jails = "[{\"name\":\"sshd\",\"enabled\":true,\"active_bans\":1,\"enforce_configured\":true,\"enforcing\":false,\"log_source\":\"journal\",\"source_healthy\":false,\"cause\":\"JournalCursorLost\",\"source_exit_code\":125,\"source_signal\":15,\"source_stderr_present\":true}]";
     var jail_output = std.ArrayList(u8).init(testing.allocator);
     defer jail_output.deinit();
     try formatJailsForWidthDetailed(testing.allocator, jail_output.writer(), jails, .table, .{ .enabled = false }, 120, false);
     try testing.expect(std.mem.indexOf(u8, jail_output.items, "broken (JournalCursorLost; exit=125; signal=15; stderr)") != null);
-    try testing.expect(std.mem.indexOf(u8, jail_output.items, "false") != null);
+    try testing.expect(std.mem.indexOf(u8, jail_output.items, "unconfirmed") != null);
 
     const status = "{\"protection\":\"degraded\",\"sqlite_code\":5,\"next_retry_ms\":1234,\"effect_mutation\":\"retry-17\"}";
     const output = try runFormatter(formatStatus, status, .table);
@@ -792,17 +947,27 @@ test "format: query renderers report unparseable payloads without failing" {
     }
 }
 
-test "format: BUG-064 compact jail fallback preserves full source causes at default widths" {
+test "format: BUG-064 BUG-086 jail details preserve causes and thresholds across widths" {
     const payload =
-        \\[{"name":"sshd","enabled":true,"source_healthy":false,"cause":"RestoreRequired"},
+        \\[{"name":"sshd","enabled":true,"source_healthy":false,"cause":"RestoreRequired","maxretry":7,"findtime":600,"bantime":1800},
         \\ {"name":"other","enabled":true,"source_healthy":false,"cause":"InvalidEncoding"}]
     ;
-    for ([_]usize{ 74, 80 }) |width| {
+    for ([_]usize{ 36, 74, 80, 160 }) |width| {
         var out = std.ArrayList(u8).init(testing.allocator);
         defer out.deinit();
         try formatJailsForWidth(testing.allocator, out.writer(), payload, .table, .{ .enabled = false }, width);
         try testing.expect(std.mem.indexOf(u8, out.items, "broken (RestoreRequired)") != null);
         try testing.expect(std.mem.indexOf(u8, out.items, "broken (InvalidEncoding)") != null);
+        if (width < 160) {
+            try testing.expect(std.mem.indexOf(u8, out.items, "MAX RETRY: 7") != null);
+            try testing.expect(std.mem.indexOf(u8, out.items, "FIND TIME: 10m") != null);
+            try testing.expect(std.mem.indexOf(u8, out.items, "BAN TIME: 30m") != null);
+        } else {
+            try testing.expect(std.mem.indexOf(u8, out.items, "MAX RETRY") != null);
+            try testing.expect(std.mem.indexOf(u8, out.items, "MAX RETRY:") == null);
+            try testing.expect(std.mem.indexOf(u8, out.items, "10m") != null);
+            try testing.expect(std.mem.indexOf(u8, out.items, "30m") != null);
+        }
         var lines = std.mem.splitScalar(u8, out.items, '\n');
         while (lines.next()) |line| try testing.expect(line.len <= width);
     }

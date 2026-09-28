@@ -53,7 +53,7 @@ installation and rollback are unsupported.
 - **Scoped enforcement.** nftables uses netlink directly. ipset and iptables use
   fixed-argument host tools. An unavailable backend fails closed unless an operator
   explicitly chooses `on_no_backend = "log-only"`.
-- **Operator visibility.** `status`, `jails`, `list`, `history` and the read-only
+- **Operator visibility.** `status`, `stats`, `jails`, `list`, `history` and the read-only
   `firewall show` command expose protection and its last sampled firewall
   observation. Optional loopback HTTP serves metrics, health and events.
 - **Controlled migration.** The fail2ban importer reports unsupported settings;
@@ -96,12 +96,28 @@ switch backends. The full [example configuration](deploy/fail2zig.toml.example),
 [online guide](https://fail2zig.com/docs/reference/config/) cover jail settings,
 source validation, durations, reload limits and firewall selection.
 
+Use `enforce = true` or `false` in defaults or a jail to express protection
+intent. `jails` reports that configured mode separately from observed protection;
+`active` means the daemon's existing protection criteria are met, not an independent
+per-jail kernel verification. The older `banaction` setting remains accepted as a
+deprecated compatibility input.
+
+`list --sort` orders returned rows by numeric IP address (IPv4 before IPv6), then
+prefix length, host before an explicit equal-width network, jail name and original
+row position. IPv4-mapped IPv6 stays IPv6; duplicate rows are retained. Without the
+flag the existing order is retained.
+`stats` reports one retained worker snapshot. Its ages and knowledge state make
+staleness visible; it does not trigger a firewall readback. Use `status` for the
+current protection and health decision. Snapshot counters start at zero when the
+daemon starts and last for that daemon process.
+
 ## Commands and operations
 
 ```bash
 sudo fail2zig status                       # protection, storage and source health
+sudo fail2zig stats                        # retained enforcement-manager snapshot
 sudo fail2zig jails --details              # per-jail state and diagnostic detail
-sudo fail2zig list                         # active bans
+sudo fail2zig list --sort                  # active bans in numeric address order
 sudo fail2zig firewall show --details      # last sampled owned firewall state
 sudo fail2zig rule-test --file /var/log/auth.log --service sshd --output table
 ```

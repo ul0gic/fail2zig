@@ -2,7 +2,7 @@
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
 
-const fail2zig_version = "0.4.5";
+const fail2zig_version = "0.4.6";
 
 const CiLane = enum { components_a, components_b, assembled, fuzz, excluded, deferred };
 const CiGates = struct {
@@ -255,6 +255,13 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     client_format_test_mod.addImport("client_format", client_format_api);
+    const client_list_order = b.createModule(.{
+        .root_source_file = b.path("client/list_order.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    client_list_order.addImport("shared", shared_mod);
+    client_format_test_mod.addImport("client_list_order", client_list_order);
     const client_format_tests = b.addTest(.{ .root_module = client_format_test_mod, .filters = &.{"format:"} });
     const run_client_format_tests = b.addRunArtifact(client_format_tests);
     b.step("test-client-format", "Test client formatting").dependOn(&run_client_format_tests.step);

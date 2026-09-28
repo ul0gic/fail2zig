@@ -9,6 +9,7 @@ pub const args = @import("args.zig");
 pub const socket = @import("socket.zig");
 pub const format = @import("format.zig");
 pub const completions = @import("completions.zig");
+const list_order = @import("list_order.zig");
 
 pub const client_version = build_options.version;
 
@@ -72,9 +73,17 @@ pub fn run(
             if (options.details) return doRequest(allocator, parsed.globals, .{ .status = {} }, stdout, stderr, color, formatStatusDetailsCmd);
             return doRequest(allocator, parsed.globals, .{ .status = {} }, stdout, stderr, color, formatStatusCmd);
         },
+        .stats => |options| {
+            if (options.details) return doQuery(allocator, parsed.globals, stdout, stderr, color, "stats", null, null, null, format.formatStatsDetailed);
+            return doQuery(allocator, parsed.globals, stdout, stderr, color, "stats", null, null, null, format.formatStats);
+        },
         .list => |l| {
             const jail: ?shared.JailId = parseJailId(l.jail, stderr) catch return .client_error;
             const cmd = shared.Command{ .list = .{ .jail = jail } };
+            if (l.sort) {
+                if (l.details) return doRequest(allocator, parsed.globals, cmd, stdout, stderr, color, formatSortedListDetailsCmd);
+                return doRequest(allocator, parsed.globals, cmd, stdout, stderr, color, formatSortedListCmd);
+            }
             if (l.details) return doRequest(allocator, parsed.globals, cmd, stdout, stderr, color, formatListDetailsCmd);
             return doRequest(allocator, parsed.globals, cmd, stdout, stderr, color, formatListCmd);
         },
@@ -167,7 +176,7 @@ fn doQuery(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype,
     var stream = std.io.fixedBufferStream(&body_bytes);
     std.json.stringify(.{ .schema_version = @as(u32, 1), .kind = kind, .jail = jail, .limit = limit, .cursor = cursor }, .{ .emit_null_optional_fields = false }, stream.writer()) catch return .client_error;
     const body = shared.Command.Body.init(stream.getWritten()) catch return .client_error;
-    return doRequest(allocator, globals, .{ .query_v1 = body }, stdout, stderr, color, formatter);
+    return doRequestWithHint(allocator, globals, .{ .query_v1 = body }, stdout, stderr, color, formatter, if (std.mem.eql(u8, kind, "stats")) "daemon does not support stats; upgrade and restart the fail2zig daemon" else null);
 }
 
 fn doFirewallQuery(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype, color: format.Color, query: args.Command.FirewallArgs) ExitCode {
@@ -343,6 +352,19 @@ fn doRequest(
     color: format.Color,
     comptime formatter: anytype,
 ) ExitCode {
+    return doRequestWithHint(allocator, globals, cmd, stdout, stderr, color, formatter, null);
+}
+
+fn doRequestWithHint(
+    allocator: std.mem.Allocator,
+    globals: args.Globals,
+    cmd: shared.Command,
+    stdout: anytype,
+    stderr: anytype,
+    color: format.Color,
+    comptime formatter: anytype,
+    unsupported_hint: ?[]const u8,
+) ExitCode {
     var diag: socket.DiagBuf = .{};
     var client = socket.connect(allocator, globals.socket_path, globals.timeout_ms, &diag) catch {
         stderr.print("error: {s}\n", .{diag.message()}) catch {};
@@ -356,6 +378,12 @@ fn doRequest(
     };
     defer resp.deinit(allocator);
 
+    if (unsupported_hint) |hint| {
+        if (resp == .err and resp.err.code == 400 and std.mem.eql(u8, resp.err.message, "unknown query kind")) {
+            format.formatError(stderr, resp.err.code, hint, globals.output, color) catch {};
+            return .daemon_error;
+        }
+    }
     return renderResponse(allocator, resp, globals.output, stdout, stderr, color, formatter);
 }
 
@@ -410,6 +438,18 @@ fn formatListCmd(
 
 fn formatListDetailsCmd(allocator: std.mem.Allocator, writer: anytype, payload: []const u8, fmt: format.OutputFormat, color: format.Color) !void {
     return format.formatListDetailed(allocator, writer, payload, fmt, color);
+}
+
+fn formatSortedListCmd(allocator: std.mem.Allocator, writer: anytype, payload: []const u8, fmt: format.OutputFormat, color: format.Color) !void {
+    const sorted = try list_order.sortPayload(allocator, payload);
+    defer allocator.free(sorted);
+    try format.formatList(allocator, writer, sorted, fmt, color);
+}
+
+fn formatSortedListDetailsCmd(allocator: std.mem.Allocator, writer: anytype, payload: []const u8, fmt: format.OutputFormat, color: format.Color) !void {
+    const sorted = try list_order.sortPayload(allocator, payload);
+    defer allocator.free(sorted);
+    try format.formatListDetailed(allocator, writer, sorted, fmt, color);
 }
 
 fn formatJailsCmd(
