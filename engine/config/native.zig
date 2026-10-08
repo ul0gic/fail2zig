@@ -30,6 +30,9 @@ pub const Error = error{
     ReadFailed,
     ConfigWorldWritable,
     ConfigGroupWritable,
+    InvalidTruncationPolicy,
+    TruncationPolicyNotFileSource,
+    TruncationPolicyNotAllowedInDefaults,
 };
 
 pub const Diagnostic = struct {
@@ -66,6 +69,8 @@ pub const LogLevel = enum { debug, info, warn, err };
 pub const BanAction = enum { nftables, iptables, ipset, @"log-only" };
 
 pub const LogSource = enum { auto, file, journald, internal };
+
+pub const TruncationPolicy = enum { refuse, restart };
 
 pub const internal_filter: []const u8 = "recidive";
 
@@ -154,6 +159,7 @@ pub const JailConfig = struct {
     bantime_increment: BanTimeIncrement = .{},
     bantime_increment_explicit: bool = false,
     bantime_increment_fields: u8 = 0,
+    on_truncation: ?TruncationPolicy = null,
 
     pub fn effectiveBantime(self: *const JailConfig, def: JailDefaults) shared.Duration {
         return self.bantime orelse def.bantime;
@@ -182,6 +188,7 @@ pub const ResolvedJailConfig = struct {
     bantime_kind: BantimeKind,
     banaction: BanAction,
     bantime_increment: BanTimeIncrement,
+    on_truncation: TruncationPolicy,
 };
 
 pub fn resolveJail(cfg: *const Config, jail_name: []const u8) ?ResolvedJailConfig {
@@ -215,6 +222,7 @@ pub fn resolveJailFromConfig(j: *const JailConfig, defaults: JailDefaults) Resol
         .bantime_kind = j.effectiveBantimeKind(defaults),
         .banaction = j.effectiveBanaction(defaults),
         .bantime_increment = increment,
+        .on_truncation = j.on_truncation orelse .refuse,
     };
 }
 
@@ -722,6 +730,7 @@ const Parser = struct {
     jails: std.ArrayList(JailConfig),
     seen_keys: std.StringHashMap(void),
     jail_source_origin: std.ArrayList(SourceOrigin),
+    jail_truncation_key: std.ArrayList(?TruncationKey),
     defaults_source_origin: SourceOrigin = .unset,
     legacy_banaction_used: bool = false,
 
@@ -733,6 +742,7 @@ const Parser = struct {
     value_pos: Pos = .{},
 
     const Pos = struct { line: u32 = 1, col: u32 = 1 };
+    const TruncationKey = struct { pos: Pos, section: []const u8 };
     const SourceOrigin = enum { unset, source, backend };
 
     const TOP_GLOBAL: []const u8 = "global";
@@ -752,6 +762,7 @@ const Parser = struct {
             .jails = std.ArrayList(JailConfig).init(arena),
             .seen_keys = std.StringHashMap(void).init(arena),
             .jail_source_origin = std.ArrayList(SourceOrigin).init(arena),
+            .jail_truncation_key = std.ArrayList(?TruncationKey).init(arena),
         };
     }
 
@@ -762,8 +773,14 @@ const Parser = struct {
     fn fillDiag(self: *const Parser, err: Error, out: *Diagnostic) void {
         const pos: Pos = switch (err) {
             error.UnknownSection => self.section_pos,
-            error.UnknownKey, error.DuplicateKey, error.TooManyJails => self.key_pos,
+            error.UnknownKey,
+            error.DuplicateKey,
+            error.TooManyJails,
+            error.TruncationPolicyNotFileSource,
+            error.TruncationPolicyNotAllowedInDefaults,
+            => self.key_pos,
             error.InvalidValue,
+            error.InvalidTruncationPolicy,
             error.InvalidInteger,
             error.InvalidFloat,
             error.InvalidBool,
@@ -868,6 +885,19 @@ const Parser = struct {
 
         for (self.jails.items, self.jail_source_origin.items) |*j, origin| {
             if (origin == .unset) j.source = self.defaults.source;
+        }
+        for (self.jails.items, self.jail_truncation_key.items) |*j, maybe_key| {
+            const key = maybe_key orelse continue;
+            const hint: []const u8 = switch (resolvedSource(j)) {
+                .file => continue,
+                .journald => truncation_not_file_hint ++ "journald",
+                .internal => truncation_not_file_hint ++ "internal",
+            };
+            self.cur_key = "on_truncation";
+            self.cur_section = key.section;
+            self.key_pos = key.pos;
+            self.hint = hint;
+            return error.TruncationPolicyNotFileSource;
         }
 
         return .{
@@ -1217,6 +1247,9 @@ const Parser = struct {
             try self.policySpelling(key);
             const s = try asString(v);
             self.defaults.banaction = try parseBanAction(s);
+        } else if (std.mem.eql(u8, key, "on_truncation")) {
+            self.hint = "set on_truncation in each file jail that needs it";
+            return error.TruncationPolicyNotAllowedInDefaults;
         } else if (std.mem.eql(u8, key, "ignoreip")) {
             self.defaults.ignoreip = try asStringArray(v);
         } else if (std.mem.eql(u8, key, "source")) {
@@ -1319,6 +1352,9 @@ const Parser = struct {
             try self.policySpelling(key);
             const s = try asString(v);
             j.banaction = try parseBanAction(s);
+        } else if (std.mem.eql(u8, key, "on_truncation")) {
+            j.on_truncation = try self.parseTruncationPolicy(v);
+            self.jail_truncation_key.items[idx] = .{ .pos = self.key_pos, .section = self.cur_section };
         } else if (std.mem.eql(u8, key, "ignoreip")) {
             j.ignoreip = try asStringArray(v);
         } else if (std.mem.eql(u8, key, "bantime_increment_enabled")) {
@@ -1370,7 +1406,14 @@ const Parser = struct {
         try self.jails.append(.{ .name = name });
         errdefer _ = self.jails.pop();
         try self.jail_source_origin.append(.unset);
+        try self.jail_truncation_key.append(null);
         return self.jails.items.len - 1;
+    }
+
+    fn parseTruncationPolicy(self: *Parser, v: Value) Error!TruncationPolicy {
+        if (v == .string) if (std.meta.stringToEnum(TruncationPolicy, v.string)) |policy| return policy;
+        self.hint = "accepted values: \"refuse\", \"restart\"";
+        return error.InvalidTruncationPolicy;
     }
 };
 
@@ -1445,6 +1488,17 @@ fn parseLogLevel(s: []const u8) Error!LogLevel {
 }
 
 pub const journalctl_path: []const u8 = "/usr/bin/journalctl";
+
+const truncation_not_file_hint = "on_truncation applies only to a jail whose source is file; this jail's source is ";
+
+fn resolvedSource(j: *const JailConfig) enum { file, journald, internal } {
+    return switch (j.source) {
+        .auto => if (!anyLogpathExists(j.logpath) and filterSupportsJournald(j.filter) and journalctlPresent()) .journald else .file,
+        .file => .file,
+        .journald => .journald,
+        .internal => .internal,
+    };
+}
 
 pub fn anyLogpathExists(logpath: []const []const u8) bool {
     for (logpath) |lp| {

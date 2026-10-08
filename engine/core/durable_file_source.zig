@@ -60,7 +60,24 @@ pub const Resume = struct {
     offset: u64,
     prefix_len: u8,
     prefix_hash: [32]u8,
+    observed_size: ?u64 = null,
 };
+
+pub const LossReason = enum(u8) { truncated = 1, rotated_unread_removed = 2 };
+
+pub const LossEvent = struct {
+    sequence: u64,
+    jail: []const u8,
+    path: []const u8,
+    source_id: []const u8,
+    wall_us: i64,
+    reason: LossReason,
+    inode: u64,
+    committed_offset: u64,
+    observed_size: u64,
+};
+
+pub const RemovedVerdict = enum { drained, unread, unknown };
 
 /// Why a committed checkpoint cannot resume. Every kind is reported as `error.ResumeLost`;
 /// the extent of unread data lost is unknown in each case.
@@ -231,7 +248,7 @@ pub const FileSource = struct {
         var incarnation: [16]u8 = undefined;
         std.crypto.random.bytes(&incarnation);
         const n: u8 = @intCast(@min(@as(u64, @intCast(stat.size)), 64));
-        return .{ .start = start, .framing = framing, .incarnation = incarnation, .device = @intCast(stat.dev), .inode = @intCast(stat.ino), .offset = offset, .prefix_len = n, .prefix_hash = try prefix(f, n) };
+        return .{ .start = start, .framing = framing, .incarnation = incarnation, .device = @intCast(stat.dev), .inode = @intCast(stat.ino), .offset = offset, .prefix_len = n, .prefix_hash = try prefix(f, n), .observed_size = std.math.cast(u64, stat.size) };
     }
 
     const Observed = struct { size: ?u64, device: u64, inode: u64 };
@@ -588,6 +605,7 @@ pub const FileSource = struct {
         const after_read = try f.stat();
         var next = r;
         next.offset = offset;
+        next.observed_size = after_read.size;
         next.prefix_len = @max(r.prefix_len, @as(u8, @intCast(@min(offset, 64))));
         var captured_prefix: [64]u8 = undefined;
         const captured = try f.preadAll(captured_prefix[0..next.prefix_len], 0);

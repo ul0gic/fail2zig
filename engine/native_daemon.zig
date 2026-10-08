@@ -645,6 +645,7 @@ pub const Coordinator = struct {
         const now = std.time.microTimestamp();
         switch (kind) {
             .setting_batch => return self.adminDetail(request, (AdminOutcomeView{ .outcome = .rejected, .kind = kind }).withReason("runtime-only settings are not supported; edit the configuration and reload", .{}), null),
+            .ignore_add, .ignore_remove => return self.adminDetail(request, (AdminOutcomeView{ .outcome = .rejected, .kind = kind }).withReason("unknown admin kind", .{}), null),
             .group_enable, .group_disable, .group_pause, .group_resume => {
                 const jail = self.findJail(request.jailName()) orelse return self.adminDetail(request, (AdminOutcomeView{ .outcome = .absent, .kind = kind }).withReason("unknown jail", .{}), null);
                 var state = durable.Store.JailAdminState{ .jail = jail.name, .enabled = true, .paused = false, .generation = self.published_generation, .changed_us = @max(0, now), .request_id = request.request_id };
@@ -1391,6 +1392,7 @@ pub const Coordinator = struct {
         try self.store.enableAdminState();
         try self.store.enableMigrationState();
         try self.store.enableLoadRepair(self.loadRepairOptions(), if (self.startup_progress) |progress| progress.migrationHook() else null);
+        try self.store.enableRuntimeState(self.loadRepairOptions(), !self.store.load_repair_migrated);
         _ = try self.store.setRetentionPolicy(self.cfg.global.history_max_matches);
         try self.validateAdmission();
         if (!self.generation_admitted) {
@@ -1665,6 +1667,7 @@ pub const Coordinator = struct {
         const body = parsed.value;
         if (body.schema_version != 1) return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "unsupported schema_version") } };
         const kind = std.meta.stringToEnum(durable.Store.AdminKind, body.kind) orelse return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "unknown admin kind") } };
+        if (kind == .ignore_add or kind == .ignore_remove) return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "unknown admin kind") } };
         if (body.expected_generation.len != 64) return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "expected_generation must be 64 hex characters") } };
         const request = try self.allocator.create(AdminRequest);
         var destroy_on_exit = true;

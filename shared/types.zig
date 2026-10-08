@@ -155,6 +155,77 @@ pub const IpAddress = union(enum) {
     }
 };
 
+pub const IgnoreEntry = struct {
+    family: Family,
+    address: [16]u8,
+    prefix: u8,
+
+    pub const Family = enum(u8) { v4 = 4, v6 = 6 };
+    pub const max_text_bytes: usize = 64;
+
+    pub fn parse(text: []const u8) error{ InvalidAddress, InvalidPrefix }!IgnoreEntry {
+        if (text.len == 0 or text.len > max_text_bytes) return error.InvalidAddress;
+        const slash = std.mem.indexOfScalar(u8, text, '/');
+        const ip = IpAddress.parse(text[0 .. slash orelse text.len]) catch return error.InvalidAddress;
+        const requested: ?u8 = if (slash) |index|
+            std.fmt.parseInt(u8, text[index + 1 ..], 10) catch return error.InvalidPrefix
+        else
+            null;
+        var address = [_]u8{0} ** 16;
+        switch (ip) {
+            .ipv4 => |bits| {
+                const prefix = requested orelse 32;
+                if (prefix > 32) return error.InvalidPrefix;
+                std.mem.writeInt(u32, address[0..4], bits & prefixMask(u32, prefix), .big);
+                return .{ .family = .v4, .address = address, .prefix = prefix };
+            },
+            .ipv6 => |bits| {
+                const prefix = requested orelse 128;
+                if (prefix > 128) return error.InvalidPrefix;
+                std.mem.writeInt(u128, &address, bits & prefixMask(u128, prefix), .big);
+                return .{ .family = .v6, .address = address, .prefix = prefix };
+            },
+        }
+    }
+
+    pub fn network(self: IgnoreEntry) IpAddress {
+        return switch (self.family) {
+            .v4 => .{ .ipv4 = std.mem.readInt(u32, self.address[0..4], .big) },
+            .v6 => .{ .ipv6 = std.mem.readInt(u128, &self.address, .big) },
+        };
+    }
+
+    pub fn canonical(self: IgnoreEntry, buf: *[64]u8) []const u8 {
+        const full_prefix: u8 = if (self.family == .v4) 32 else 128;
+        const printed = if (self.prefix == full_prefix)
+            std.fmt.bufPrint(buf, "{}", .{self.network()})
+        else
+            std.fmt.bufPrint(buf, "{}/{d}", .{ self.network(), self.prefix });
+        // Longest form is 39 address bytes plus "/128", inside the 64-byte buffer.
+        return printed catch unreachable;
+    }
+
+    pub fn contains(self: IgnoreEntry, ip: IpAddress) bool {
+        return switch (ip) {
+            .ipv4 => |bits| self.family == .v4 and (bits & prefixMask(u32, self.prefix)) == std.mem.readInt(u32, self.address[0..4], .big),
+            .ipv6 => |bits| self.family == .v6 and (bits & prefixMask(u128, self.prefix)) == std.mem.readInt(u128, &self.address, .big),
+        };
+    }
+
+    pub fn order(a: IgnoreEntry, b: IgnoreEntry) std.math.Order {
+        const family = std.math.order(@intFromEnum(a.family), @intFromEnum(b.family));
+        if (family != .eq) return family;
+        const address = std.mem.order(u8, &a.address, &b.address);
+        if (address != .eq) return address;
+        return std.math.order(a.prefix, b.prefix);
+    }
+
+    fn prefixMask(comptime T: type, prefix: u8) T {
+        if (prefix == 0) return 0;
+        return ~@as(T, 0) << @intCast(@bitSizeOf(T) - prefix);
+    }
+};
+
 pub const JailId = struct {
     bytes: [max_len]u8 = [_]u8{0} ** max_len,
     len: u8 = 0,

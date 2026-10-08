@@ -17,8 +17,27 @@ pub const migration_verify: u32 = 116_400;
 pub const observations_per_intent: i64 = 4;
 // Space kept free beyond the backup and the rebuild overlap for WAL and temporary B-trees.
 const disk_reserve_bytes: u64 = 32 * 1024 * 1024;
-const backup_suffix = ".pre24-backup";
-const partial_suffix = ".pre24-backup.partial";
+
+pub const BackupKind = enum {
+    pre24,
+    pre25,
+
+    fn suffix(self: BackupKind) []const u8 {
+        return switch (self) {
+            .pre24 => ".pre24-backup",
+            .pre25 => ".pre25-backup",
+        };
+    }
+
+    fn target(self: BackupKind) i64 {
+        return switch (self) {
+            .pre24 => target_schema,
+            .pre25 => latest_schema,
+        };
+    }
+};
+
+pub const SchemaBackup = struct { path: [:0]const u8, sha256: [32]u8, pages: i64 };
 
 pub const Phase = enum(u8) {
     live_counter = 1,
@@ -344,7 +363,7 @@ const expected_objects = blk: {
 };
 
 pub fn backupPath(buffer: []u8, state_path: []const u8) Error![:0]u8 {
-    return std.fmt.bufPrintZ(buffer, "{s}" ++ backup_suffix, .{state_path}) catch error.StorageLimit;
+    return std.fmt.bufPrintZ(buffer, "{s}{s}", .{ state_path, BackupKind.pre24.suffix() }) catch error.StorageLimit;
 }
 
 pub fn Methods(comptime Store: type) type {
@@ -356,7 +375,7 @@ pub fn Methods(comptime Store: type) type {
                 if (try self.integer("SELECT count(*) FROM sqlite_schema WHERE name='load_repair_migration';") != 0) return error.LoadRepairInvalidState;
                 return .ready;
             }
-            if (schema != target_schema) return error.UnsupportedSchema;
+            if (schema != target_schema and schema != latest_schema) return error.UnsupportedSchema;
             const progress = try self.loadRepairProgress();
             return if (progress.phase == .complete) .complete else .incomplete;
         }
@@ -422,25 +441,10 @@ pub fn Methods(comptime Store: type) type {
         }
 
         fn startLoadRepair(self: *Store, options: Options) Error!Step {
-            var final_buffer: [std.fs.max_path_bytes]u8 = undefined;
-            var partial_buffer: [std.fs.max_path_bytes]u8 = undefined;
-            const final_path = try backupPath(&final_buffer, options.state_path);
-            const partial_path = std.fmt.bufPrintZ(&partial_buffer, "{s}" ++ partial_suffix, .{options.state_path}) catch return error.StorageLimit;
-            // An unrecorded backup may predate writes by another binary; never adopt it.
-            if (std.fs.cwd().access(final_path, .{})) |_| {
-                std.log.warn("native storage: schema 24 migration refused: backup {s} already exists; keep it if it is the only copy of earlier state, otherwise move it aside and restart", .{final_path});
-                return error.LoadRepairBackupExists;
-            } else |failure| if (failure != error.FileNotFound) return error.StorageIo;
-            const page_size = try self.integer("PRAGMA page_size;");
-            const pages = try self.integer("PRAGMA page_count;");
-            if (page_size <= 0 or pages <= 0) return error.DatabaseFailure;
-            const database_bytes = std.math.mul(u64, @intCast(page_size), @intCast(pages)) catch return error.StorageLimit;
-            // Backup copy plus rebuild overlap: the duplicated tables and new indexes are
-            // bounded by the existing database size.
-            try requireFreeSpace(options.state_path, database_bytes *| 2 +| disk_reserve_bytes);
-            const backup = try self.takeLoadRepairBackup(options, final_path, partial_path, pages);
+            var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const backup = try self.takeSchemaBackup(options, .pre24, &path_buffer);
             // Remove the backup only when the fence certainly did not commit.
-            errdefer if (!self.reopen_required) std.fs.cwd().deleteFileZ(final_path) catch {};
+            errdefer if (!self.reopen_required) std.fs.cwd().deleteFileZ(backup.path) catch {};
 
             try self.beginWrite();
             errdefer self.rollback();
@@ -452,9 +456,9 @@ pub fn Methods(comptime Store: type) type {
                 defer row.deinit();
                 try row.int(1, @intFromEnum(Phase.live_counter));
                 try row.int(2, options.now_us);
-                try row.text(3, final_path);
+                try row.text(3, backup.path);
                 try row.blob(4, &backup.sha256);
-                try row.int(5, pages);
+                try row.int(5, backup.pages);
                 try row.done();
             }
             {
@@ -468,9 +472,32 @@ pub fn Methods(comptime Store: type) type {
             return self.commitLoadRepair(options, null, .live_counter, budget);
         }
 
+        pub fn takeSchemaBackup(self: *Store, options: Options, kind: BackupKind, path_buffer: []u8) Error!SchemaBackup {
+            var partial_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const final_path = std.fmt.bufPrintZ(path_buffer, "{s}{s}", .{ options.state_path, kind.suffix() }) catch return error.StorageLimit;
+            const partial_path = std.fmt.bufPrintZ(&partial_buffer, "{s}{s}.partial", .{ options.state_path, kind.suffix() }) catch return error.StorageLimit;
+            // An unrecorded backup may predate writes by another binary; never adopt it.
+            if (std.fs.cwd().access(final_path, .{})) |_| {
+                std.log.warn("native storage: schema {d} migration refused: backup {s} already exists; keep it if it is the only copy of earlier state, otherwise move it aside and restart", .{ kind.target(), final_path });
+                return switch (kind) {
+                    .pre24 => error.LoadRepairBackupExists,
+                    .pre25 => error.SchemaBackupExists,
+                };
+            } else |failure| if (failure != error.FileNotFound) return error.StorageIo;
+            const page_size = try self.integer("PRAGMA page_size;");
+            const pages = try self.integer("PRAGMA page_count;");
+            if (page_size <= 0 or pages <= 0) return error.DatabaseFailure;
+            const database_bytes = std.math.mul(u64, @intCast(page_size), @intCast(pages)) catch return error.StorageLimit;
+            // Backup copy plus rebuild overlap: the duplicated tables and new indexes are
+            // bounded by the existing database size.
+            try requireFreeSpace(options.state_path, database_bytes *| 2 +| disk_reserve_bytes);
+            const copied = try self.copyBackup(options, final_path, partial_path, pages, kind.target() - 1);
+            return .{ .path = final_path, .sha256 = copied.sha256, .pages = pages };
+        }
+
         const BackupIdentity = struct { sha256: [32]u8 };
 
-        fn takeLoadRepairBackup(self: *Store, options: Options, final_path: [:0]const u8, partial_path: [:0]const u8, pages: i64) Error!BackupIdentity {
+        fn copyBackup(self: *Store, options: Options, final_path: [:0]const u8, partial_path: [:0]const u8, pages: i64, schema: i64) Error!BackupIdentity {
             std.fs.cwd().deleteFileZ(partial_path) catch |failure| if (failure != error.FileNotFound) return error.StorageIo;
             const created = std.posix.openZ(partial_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, 0o600) catch return error.StorageIo;
             std.posix.close(created);
@@ -498,7 +525,7 @@ pub fn Methods(comptime Store: type) type {
                 if (journal != 0) return store_mod.sqliteError(journal);
             }
             try syncPath(partial_path, false);
-            try verifyBackupFile(partial_path, pages);
+            try verifyBackupFile(partial_path, pages, schema);
             std.posix.renameZ(partial_path, final_path) catch return error.StorageIo;
             try syncPath(std.fs.path.dirname(final_path) orelse ".", true);
             return .{ .sha256 = try fileSha256(final_path) };
@@ -691,6 +718,7 @@ pub fn Methods(comptime Store: type) type {
                 "SELECT count(*)=0 FROM effect_owners o WHERE NOT EXISTS(SELECT 1 FROM effect_owner_revisions h WHERE h.scope_key=o.scope_key AND h.jail=o.jail AND h.revision=o.revision);",
                 "SELECT count(*)=0 FROM native_effects n WHERE n.intent_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM effect_intents i WHERE i.intent_id=n.intent_id);",
             }) |sql| if (try self.integer(sql) != 1) return error.LoadRepairVerificationFailed;
+            const created_index = try self.ensureLoadRepairPrerequisites();
             try self.verifyLoadRepairObjects();
             {
                 var check = try self.statement("PRAGMA foreign_key_check;");
@@ -712,7 +740,16 @@ pub fn Methods(comptime Store: type) type {
                 try row.done();
                 if (self.api.changes(self.db) != 1) return error.LoadRepairInvalidState;
             }
-            return self.commitLoadRepair(options, progress.phase, .complete, budget);
+            const step = try self.commitLoadRepair(options, progress.phase, .complete, budget);
+            if (created_index) std.log.info("native storage: schema 23 database lacked index effect_owners_decision (created by v0.4.4); created it before schema 24 verification", .{});
+            return step;
+        }
+
+        // v0.4.3 state never had this index; v0.4.4 added it at schema 23 without a version bump.
+        pub fn ensureLoadRepairPrerequisites(self: *Store) Error!bool {
+            const absent = try self.integer("SELECT count(*)=0 FROM sqlite_schema WHERE type='index' AND name='effect_owners_decision';") == 1;
+            if (absent) try self.exec("CREATE INDEX IF NOT EXISTS effect_owners_decision ON effect_owners(jail,decision_id);");
+            return absent;
         }
 
         fn verifyLoadRepairObjects(self: *Store) Error!void {
@@ -788,13 +825,13 @@ fn backupInteger(db: *anyopaque, sql: [:0]const u8) Error!i64 {
     return sqlite3_column_int64(prepared, 0);
 }
 
-fn verifyBackupFile(path: [:0]const u8, pages: i64) Error!void {
+fn verifyBackupFile(path: [:0]const u8, pages: i64, schema: i64) Error!void {
     var handle: ?*anyopaque = null;
     const opened = sqlite3_open_v2(path, &handle, 0x01 | 0x10000 | 0x01000000, null);
     const db = handle orelse return error.LoadRepairBackupInvalid;
     defer _ = sqlite3_close_v2(db);
     if (opened != 0) return error.LoadRepairBackupInvalid;
-    if (try backupInteger(db, "PRAGMA user_version;") != source_schema) return error.LoadRepairBackupInvalid;
+    if (try backupInteger(db, "PRAGMA user_version;") != schema) return error.LoadRepairBackupInvalid;
     if (try backupInteger(db, "PRAGMA page_count;") != pages) return error.LoadRepairBackupInvalid;
     var statement: ?*anyopaque = null;
     if (sqlite3_prepare_v2(db, "PRAGMA quick_check;", -1, &statement, null) != 0) return error.LoadRepairBackupInvalid;
