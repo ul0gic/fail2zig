@@ -230,6 +230,7 @@ pub const Session = struct {
         self.discover_next = true;
         self.last_failure_domain = null;
         self.candidate_source = null;
+        self.blocked_cause = null;
         self.recorded_loss = null;
         self.recorded_loss_text = null;
         if (options.retry) |policy| {
@@ -973,7 +974,7 @@ pub const Session = struct {
         const receipt_in_flight = pending != null or if (self.candidate_source) |candidate| std.mem.eql(u8, candidate, source.source_id) else false;
         try self.settleLoss(index, receipt_in_flight);
         var acknowledgment = Acknowledgment{ .session = self, .pending = if (pending) |saved| saved.identity else null };
-        var delivered = try self.pollFile(source, state, &acknowledgment, pending != null or self.candidate_source != null or state.state.phase == .polling);
+        var delivered = try self.pollFile(source, state, &acknowledgment, source.policy == .refuse or pending != null or self.candidate_source != null or state.state.phase == .polling);
         if (source.pending_loss != null) {
             try self.settleLoss(index, receipt_in_flight);
             delivered = try self.pollFile(source, state, &acknowledgment, state.state.phase == .polling);

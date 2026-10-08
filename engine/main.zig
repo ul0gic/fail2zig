@@ -333,9 +333,11 @@ fn printValidateSummary(w: anytype, cfg: *const config_mod.Config) !void {
     for (cfg.jails) |*j| {
         const r = config_mod.resolveJailFromConfig(j, cfg.defaults);
         try w.print(
-            "config: jail '{s}' enabled={} filter={s} source={s} banaction={s}\n",
+            "config: jail '{s}' enabled={} filter={s} source={s} banaction={s}",
             .{ j.name, j.enabled, j.filter, @tagName(j.source), @tagName(r.banaction) },
         );
+        if (j.source == .file or (j.source == .auto and j.on_truncation != null)) try w.print(" on_truncation={s}", .{@tagName(r.on_truncation)});
+        try w.writeByte('\n');
     }
     try w.print("config: OK ({d} jail(s) configured)\n", .{cfg.jails.len});
 }

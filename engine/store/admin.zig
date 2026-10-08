@@ -58,24 +58,8 @@ pub fn Methods(comptime Store: type) type {
             }
             if (std.mem.eql(u8, &change.generation, &change.next_generation)) return;
             try self.exec("PRAGMA defer_foreign_keys=ON;");
-            const rekeyed = [_][:0]const u8{
-                "UPDATE records SET source_generation=?3 WHERE jail=?1 AND source_generation=?2;",
-                "UPDATE checkpoints SET payload=substr(payload,1,8)||?3||substr(payload,41) WHERE jail=?1 AND substr(payload,1,4)=CAST('F2NT' AS BLOB) AND substr(payload,9,32)=?2;",
-                "UPDATE checkpoints SET payload=substr(payload,1,6)||?3||substr(payload,39) WHERE jail=?1 AND substr(payload,1,4)=CAST('F2JC' AS BLOB) AND substr(payload,7,32)=?2;",
-                "UPDATE source_maintenance SET generation=?3 WHERE jail=?1 AND generation=?2;",
-                "UPDATE replay_guards SET generation=?3 WHERE jail=?1 AND generation=?2;",
-                "UPDATE consumer_checkpoints SET generation=?3 WHERE jail=?1 AND generation=?2;",
-                "UPDATE consumer_manifests SET generation=?3 WHERE jail=?1 AND generation=?2;",
-                "UPDATE consumer_requirements SET generation=?3 WHERE jail=?1 AND generation=?2;",
-            };
-            for (rekeyed) |sql| {
-                var update = try self.statement(sql);
-                defer update.deinit();
-                try update.text(1, jail);
-                try update.blob(2, &change.generation);
-                try update.blob(3, &change.next_generation);
-                try update.done();
-            }
+            var discarded = Store.RekeyReport{ .retry_rows = 0, .pending_receipts = 0, .manifests = 0, .cursors = 0 };
+            try self.rekeyGenerationTablesTx(jail, change.generation, change.next_generation, &discarded);
             if (change.cursor_rebinding) |rebinding| {
                 var old_fragment: [256]u8 = undefined;
                 var new_fragment: [256]u8 = undefined;

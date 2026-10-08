@@ -770,14 +770,27 @@ pub fn Methods(comptime Store: type) type {
             return @intCast(revision_value);
         }
 
-        pub const RekeyReport = struct { retry_rows: u32, pending_receipts: u32, manifests: u32 };
+        pub const RekeyReport = struct { retry_rows: u32, pending_receipts: u32, manifests: u32, cursors: u32 };
+        pub const CursorRekey = union(enum) { none, file: struct { legacy: [32]u8, planned: [32]u8 }, journal };
 
         // One-time startup rewrite of v0.4.6 rows; a single statement over a large records table needs more than the ordinary statement budget.
         const rekey_work_callbacks: u32 = 100_000;
         const OwnerHeld = struct { key: [32]u8, revision: u64, scope: [canonical_scope.encoded_bytes]u8, absent: bool };
 
-        pub fn rekeySavedGenerations(self: *Store, jail: []const u8, legacy: [32]u8, planned: [32]u8) Error!RekeyReport {
-            var report = RekeyReport{ .retry_rows = 0, .pending_receipts = 0, .manifests = 0 };
+        fn cursorBindingFragment(buffer: []u8, binding: [32]u8) Error![]const u8 {
+            var stream = std.io.fixedBufferStream(buffer);
+            const w = stream.writer();
+            w.writeAll("\"codec_configuration_hash\":[") catch return error.InvalidRecord;
+            for (binding, 0..) |byte, i| {
+                if (i != 0) w.writeByte(',') catch return error.InvalidRecord;
+                w.print("{d}", .{byte}) catch return error.InvalidRecord;
+            }
+            w.writeByte(']') catch return error.InvalidRecord;
+            return stream.getWritten();
+        }
+
+        pub fn rekeySavedGenerations(self: *Store, jail: []const u8, legacy: [32]u8, planned: [32]u8, cursors: CursorRekey) Error!RekeyReport {
+            var report = RekeyReport{ .retry_rows = 0, .pending_receipts = 0, .manifests = 0, .cursors = 0 };
             if (std.mem.eql(u8, &legacy, &planned)) return report;
             if (jail.len == 0 or jail.len > 64 or std.mem.indexOfScalar(u8, jail, 0) != null) return error.InvalidRecord;
             try self.beginAdmissionWrite();
@@ -788,12 +801,41 @@ pub fn Methods(comptime Store: type) type {
             defer if (self.runtime_limits) {
                 self.work_remaining = prior_work;
             };
+            var old_fragment: [256]u8 = undefined;
+            var new_fragment: [256]u8 = undefined;
+            const old_text = switch (cursors) {
+                .file => |binding| try cursorBindingFragment(&old_fragment, binding.legacy),
+                .none, .journal => "",
+            };
+            const new_text = switch (cursors) {
+                .file => |binding| try cursorBindingFragment(&new_fragment, binding.planned),
+                .none, .journal => "",
+            };
             const bound = blk: {
-                var row = try self.statement("SELECT 1 FROM retry_policies WHERE jail=?1 AND generation=?2;");
-                defer row.deinit();
-                try row.text(1, jail);
-                try row.blob(2, &legacy);
-                break :blk try row.row();
+                {
+                    var row = try self.statement("SELECT 1 FROM retry_policies WHERE jail=?1 AND generation=?2;");
+                    defer row.deinit();
+                    try row.text(1, jail);
+                    try row.blob(2, &legacy);
+                    if (try row.row()) break :blk true;
+                }
+                switch (cursors) {
+                    .none => break :blk false,
+                    .file => {
+                        var row = try self.statement("SELECT 1 FROM source_cursors WHERE jail=?1 AND instr(CAST(cursor AS TEXT),?2)>0 LIMIT 1;");
+                        defer row.deinit();
+                        try row.text(1, jail);
+                        try row.text(2, old_text);
+                        break :blk try row.row();
+                    },
+                    .journal => {
+                        var row = try self.statement("SELECT 1 FROM source_cursors WHERE jail=?1 AND substr(CAST(cursor AS BLOB),1,4)=CAST('F2JC' AS BLOB) AND substr(CAST(cursor AS BLOB),7,32)=?2 LIMIT 1;");
+                        defer row.deinit();
+                        try row.text(1, jail);
+                        try row.blob(2, &legacy);
+                        break :blk try row.row();
+                    },
+                }
             };
             if (!bound) {
                 try self.commitTransaction();
@@ -803,23 +845,99 @@ pub fn Methods(comptime Store: type) type {
             for ([_][:0]const u8{
                 "UPDATE retry_policies SET generation=?3 WHERE jail=?1 AND generation=?2;",
                 "UPDATE retry_escalation_policies SET generation=?3 WHERE jail=?1 AND generation=?2;",
-                "UPDATE retry_retired SET generation=?3 WHERE jail=?1 AND generation=?2;",
             }) |sql| report.retry_rows = std.math.add(u32, report.retry_rows, try self.rekeyRows(sql, jail, legacy, planned)) catch return error.StorageLimit;
-            report.pending_receipts = try self.rekeyRows("UPDATE pending_receipts SET generation=?3 WHERE jail=?1 AND generation=?2;", jail, legacy, planned);
-            report.manifests = try self.rekeyRows("UPDATE consumer_manifests SET generation=?3 WHERE jail=?1 AND generation=?2;", jail, legacy, planned);
-            for ([_][:0]const u8{
-                "UPDATE records SET source_generation=?3 WHERE jail=?1 AND source_generation=?2;",
-                "UPDATE records SET receipt_generation=?3 WHERE jail=?1 AND receipt_generation=?2;",
-                "UPDATE checkpoints SET payload=substr(payload,1,8)||?3||substr(payload,41) WHERE jail=?1 AND substr(payload,1,4)=CAST('F2NT' AS BLOB) AND substr(payload,9,32)=?2;",
-                "UPDATE checkpoints SET payload=substr(payload,1,6)||?3||substr(payload,39) WHERE jail=?1 AND substr(payload,1,4)=CAST('F2JC' AS BLOB) AND substr(payload,7,32)=?2;",
-                "UPDATE source_maintenance SET generation=?3 WHERE jail=?1 AND generation=?2;",
-                "UPDATE replay_guards SET generation=?3 WHERE jail=?1 AND generation=?2;",
-                "UPDATE consumer_checkpoints SET generation=?3 WHERE jail=?1 AND generation=?2;",
-                "UPDATE consumer_requirements SET generation=?3 WHERE jail=?1 AND generation=?2;",
-            }) |sql| _ = try self.rekeyRows(sql, jail, legacy, planned);
+            try self.rekeyGenerationTablesTx(jail, legacy, planned, &report);
+            switch (cursors) {
+                .none => {},
+                .file => {
+                    var update = try self.statement("UPDATE source_cursors SET cursor=CAST(replace(CAST(cursor AS TEXT),?2,?3) AS BLOB) WHERE jail=?1 AND instr(CAST(cursor AS TEXT),?2)>0;");
+                    defer update.deinit();
+                    try update.text(1, jail);
+                    try update.text(2, old_text);
+                    try update.text(3, new_text);
+                    try update.done();
+                    report.cursors = std.math.add(u32, report.cursors, std.math.cast(u32, self.api.changes(self.db)) orelse return error.StorageLimit) catch return error.StorageLimit;
+                },
+                .journal => {},
+            }
             const owners_changed = try self.rekeyOwnersTx(jail, legacy, planned);
             try self.commitEffectTransaction(owners_changed);
             return report;
+        }
+
+        const GenerationStatement = struct { sql: [:0]const u8, counted: enum { retry, pending, manifests, cursors, none } };
+        const generation_statements = [_]GenerationStatement{
+            .{ .sql = "UPDATE retry_retired SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .retry },
+            .{ .sql = "UPDATE pending_receipts SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .pending },
+            .{ .sql = "UPDATE consumer_manifests SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .manifests },
+            .{ .sql = "UPDATE records SET source_generation=?3 WHERE jail=?1 AND source_generation=?2;", .counted = .none },
+            .{ .sql = "UPDATE records SET receipt_generation=?3 WHERE jail=?1 AND receipt_generation=?2;", .counted = .none },
+            .{ .sql = "UPDATE checkpoints SET payload=CAST(substr(CAST(payload AS BLOB),1,8)||?3||substr(CAST(payload AS BLOB),41) AS BLOB) WHERE jail=?1 AND substr(CAST(payload AS BLOB),1,4)=CAST('F2NT' AS BLOB) AND substr(CAST(payload AS BLOB),9,32)=?2;", .counted = .none },
+            .{ .sql = "UPDATE checkpoints SET payload=CAST(substr(CAST(payload AS BLOB),1,6)||?3||substr(CAST(payload AS BLOB),39) AS BLOB) WHERE jail=?1 AND substr(CAST(payload AS BLOB),1,4)=CAST('F2JC' AS BLOB) AND substr(CAST(payload AS BLOB),7,32)=?2;", .counted = .none },
+            .{ .sql = "UPDATE source_maintenance SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .none },
+            .{ .sql = "UPDATE replay_guards SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .none },
+            .{ .sql = "UPDATE consumer_checkpoints SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .none },
+            .{ .sql = "UPDATE consumer_requirements SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .none },
+            .{ .sql = "UPDATE source_cursors SET cursor=CAST(substr(CAST(cursor AS BLOB),1,6)||?3||substr(CAST(cursor AS BLOB),39) AS BLOB) WHERE jail=?1 AND substr(CAST(cursor AS BLOB),1,4)=CAST('F2JC' AS BLOB) AND substr(CAST(cursor AS BLOB),7,32)=?2;", .counted = .cursors },
+        };
+
+        pub fn rekeyGenerationTablesTx(self: *Store, jail: []const u8, old: [32]u8, new: [32]u8, report: *RekeyReport) Error!void {
+            for (generation_statements) |entry| {
+                const rows = try self.rekeyRows(entry.sql, jail, old, new);
+                const total: *u32 = switch (entry.counted) {
+                    .retry => &report.retry_rows,
+                    .pending => &report.pending_receipts,
+                    .manifests => &report.manifests,
+                    .cursors => &report.cursors,
+                    .none => continue,
+                };
+                total.* = std.math.add(u32, total.*, rows) catch return error.StorageLimit;
+            }
+        }
+
+        pub const GenerationRepair = struct { receipts: u32, retired: u32, cursors: u32 };
+
+        pub fn completeGenerationRekey(self: *Store, jail: []const u8) Error!GenerationRepair {
+            var repair = GenerationRepair{ .receipts = 0, .retired = 0, .cursors = 0 };
+            if (jail.len == 0 or jail.len > 64 or std.mem.indexOfScalar(u8, jail, 0) != null) return error.InvalidRecord;
+            try self.beginAdmissionWrite();
+            errdefer self.rollback();
+            if (self.schema_version < 22) return error.AdminStorageRequired;
+            const prior_work = self.work_remaining;
+            if (self.runtime_limits) self.work_remaining = rekey_work_callbacks;
+            defer if (self.runtime_limits) {
+                self.work_remaining = prior_work;
+            };
+            const bound = (try self.readRetryPolicy(jail)) orelse {
+                try self.commitTransaction();
+                return repair;
+            };
+            {
+                var update = try self.statement("UPDATE records SET receipt_generation=?2 WHERE jail=?1 AND receipt_us IS NOT NULL AND (source_generation IS NULL OR source_generation=?2) AND receipt_generation IS NOT ?2;");
+                defer update.deinit();
+                try update.text(1, jail);
+                try update.blob(2, &bound.generation);
+                try update.done();
+                repair.receipts = std.math.cast(u32, self.api.changes(self.db)) orelse return error.StorageLimit;
+            }
+            {
+                var update = try self.statement("UPDATE retry_retired SET generation=?2 WHERE jail=?1 AND generation IS NOT ?2;");
+                defer update.deinit();
+                try update.text(1, jail);
+                try update.blob(2, &bound.generation);
+                try update.done();
+                repair.retired = std.math.cast(u32, self.api.changes(self.db)) orelse return error.StorageLimit;
+            }
+            {
+                var update = try self.statement("UPDATE source_cursors SET cursor=CAST(substr(CAST(cursor AS BLOB),1,6)||?2||substr(CAST(cursor AS BLOB),39) AS BLOB) WHERE jail=?1 AND substr(CAST(cursor AS BLOB),1,4)=CAST('F2JC' AS BLOB) AND substr(CAST(cursor AS BLOB),7,32) IS NOT ?2;");
+                defer update.deinit();
+                try update.text(1, jail);
+                try update.blob(2, &bound.generation);
+                try update.done();
+                repair.cursors = std.math.cast(u32, self.api.changes(self.db)) orelse return error.StorageLimit;
+            }
+            try self.commitEffectTransaction(false);
+            return repair;
         }
 
         fn rekeyRows(self: *Store, sql: [:0]const u8, jail: []const u8, legacy: [32]u8, planned: [32]u8) Error!u32 {

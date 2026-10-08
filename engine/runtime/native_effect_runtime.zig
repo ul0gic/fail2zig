@@ -313,10 +313,9 @@ pub const Manager = struct {
     pub fn confirmedSubject(self: *const Manager, subject: @import("../core/native_detection_record.zig").Subject, now_us: i64) bool {
         if (self.status.uncertain and !(self.status.cause != null and transientCause(self.status.cause.?))) return false;
         const scope = effect.Scope.host(subject) catch return false;
-        for (self.live[0..self.count], 0..) |entry, index| if (std.meta.eql(entry.scope, scope)) {
-            return entry.status == .applied and entry.desired.live(now_us) and (self.confirmed[index] or self.status.ready);
-        };
-        return false;
+        const key = scope.key(self.installation) catch return false;
+        const index = self.findLive(key) orelse return false;
+        return self.live[index].status == .applied and self.live[index].desired.live(now_us) and (self.confirmed[index] or self.status.ready);
     }
     fn recordFirewallFailure(self: *Manager, context: firewall.FailureContext) void {
         self.status.cause = context.cause;

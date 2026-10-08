@@ -57,6 +57,15 @@ pub const Notifier = struct {
         return self.send("READY=1\n");
     }
 
+    pub fn readyWithStatus(self: *const Notifier, text: []const u8) Error!Result {
+        if (std.mem.indexOfScalar(u8, text, '\n') != null) return error.MessageTooLong;
+        const ellipsis = "...";
+        const shown = if (text.len <= max_status_bytes) text else text[0 .. max_status_bytes - ellipsis.len];
+        var buf: [max_message_bytes]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "READY=1\nSTATUS={s}{s}\n", .{ shown, if (shown.len < text.len) ellipsis else "" }) catch return error.MessageTooLong;
+        return self.send(msg);
+    }
+
     pub fn stopping(self: *const Notifier) Error!Result {
         return self.send("STOPPING=1\n");
     }

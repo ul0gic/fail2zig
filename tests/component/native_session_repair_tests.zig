@@ -4,6 +4,7 @@ const std = @import("std");
 const t = std.testing;
 const durable = @import("engine_test").core.record_store;
 const files = @import("engine_test").core.native_file_session;
+const loss_files = @import("engine_test").core.durable_file_source;
 const journal = @import("engine_test").core.native_journal_session;
 const transport = @import("engine_test").core.native_journal_transport;
 const repair = @import("engine_test").core.source_repair;
@@ -747,8 +748,29 @@ test "native session repair: successfully observed ordinary shrink retains expli
     var f = try Fixture.init();
     defer f.deinit();
     try f.tmp.dir.writeFile(.{ .sub_path = "active.log", .data = "original sufficiently long line\n" });
+    try f.store.enableLoadRepair(.{ .state_path = f.database, .now_us = 1_000_000, .history_max_matches = 10 }, null);
+    try f.store.enableJournalDetection();
+    try f.store.enableRetry();
+    try f.store.enableConsumers();
+    try f.store.enableTimeProvenance();
+    try f.store.enableConsumerManifests();
+    try f.store.enableConfirmedHistory();
+    try f.store.enableMaintenance();
+    try f.store.enableCleanup();
+    try f.store.enableRetryLeases();
+    try f.store.enableApplicationHistory();
+    try f.store.enableEscalation();
+    try f.store.enableCanonicalEffects();
+    try f.store.enableHistoryResets();
+    try f.store.enableActionTargets();
+    try f.store.enableAdminState();
+    try f.store.enableMigrationState();
+    try f.store.enableLoadRepair(.{ .state_path = f.database, .now_us = 1_000_000, .history_max_matches = 10 }, null);
+    try f.store.enableRuntimeState(.{ .state_path = f.database, .now_us = 1_000_000, .history_max_matches = 10 }, true);
     var clock = Clock{};
-    const session = try files.Session.createDeferred(t.allocator, &f.store, clock.fileOptions(), &.{.{ .pattern = f.path }});
+    var options = clock.fileOptions();
+    options.on_truncation = .restart;
+    const session = try files.Session.createDeferred(t.allocator, &f.store, options, &.{.{ .pattern = f.path }});
     defer session.destroy();
     try admitFile(session);
     _ = try fileDelivery(session);
@@ -757,6 +779,11 @@ test "native session repair: successfully observed ordinary shrink retains expli
     try t.expectEqual(@as(usize, 1), try fileDelivery(session));
     try t.expect(!std.mem.eql(u8, &incarnation, &session.sources.sources.items[0].committed.?.incarnation));
     try t.expectEqual(repair.Phase.healthy, session.repairSnapshot().phase);
+    const loss = session.policyLossEvent().?;
+    try t.expectEqual(@as(u64, 1), loss.sequence);
+    try t.expectEqual(loss_files.LossReason.truncated, loss.reason);
+    try t.expectEqual(@as(u64, 32), loss.committed_offset);
+    try t.expectEqual(@as(?u64, 4), loss.observed_size);
 }
 
 test "native session repair: synchronous fresh journal tail is not repeated after metadata transfer" {

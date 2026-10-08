@@ -52,7 +52,7 @@ unit of
 .BR Type=notify :
 it sends
 .B READY=1
-only after configuration, storage, every source and enforcing protection are admitted,
+only after configuration, storage, every source that can resume and enforcing protection are admitted,
 .B RELOADING=1
 then
 .B READY=1
@@ -71,6 +71,18 @@ and
 stop cleanly. No socket unit is shipped and
 .B LISTEN_FDS
 is not read.
+.PP
+A source that cannot resume does not hold back
+.BR READY=1 :
+the daemon pauses that source, restores bans for every jail, enforces every other
+enabled jail, sends
+.B READY=1
+and keeps running, so
+.B systemctl is-active fail2zig
+reports
+.BR active .
+Protection stays degraded while a source is paused; see STATUS and REPAIR-SOURCE.
+Configuration, storage, firewall and schema refusals still stop the start with exit 1.
 .
 .SH DAEMON OPTIONS
 .TP
@@ -151,6 +163,129 @@ to include identifiers and additional counters; failures remain visible without 
 History counts retained confirmed effect events; maintenance can remove these rows,
 so this is not a lifetime ban count. The machine-readable key remains
 .BR total_bans .
+.RS
+.PP
+Paused sources. A file source that cannot resume (truncated in place below its
+committed offset, or a rotated-out file removed with unread bytes, under
+.BR "on_truncation = \(dqrefuse\(dq" )
+is paused, and the daemon keeps running. When paused sources are the only reason protection
+is degraded, the cause is
+.B SourcePaused
+instead of unknown. Table output adds one
+.B Paused:
+block per source with the jail, path and cause, then the exact
+.B repair-source
+command and the reminder that firewall rules for every jail are withdrawn while the
+daemon is stopped. The command is never truncated to the terminal width. When no
+offline repair applies to the cause, the block reads that and points to the daemon log.
+.PP
+Loss events. A source that resumed under
+.B on_truncation = \(dqrestart\(dq
+shows one
+.B Loss events:
+row with its retained event count and the latest event.
+.B --details
+adds a section listing every retained continuity-loss event, newest first, up to 256
+per source: jail, path, time, reason
+.RB ( truncated
+or
+.BR rotated_unread_removed ),
+inode, committed offset and observed size. Records written after the committed offset
+and removed before they were read were never read; an event records that loss and does
+not recover the records.
+.PP
+New JSON keys, all additive. The existing keys, including
+.BR unhealthy_sources ,
+keep their meaning.
+.IP \(bu 2
+.B paused_sources
+\(em integer, the sources currently paused.
+.IP \(bu 2
+.B sources
+\(em array, always present, empty when none: every source that is paused or has at least one
+retained loss event, ordered by jail then path. Each element has
+.BR jail ,
+.B kind
+.RB ( file
+or
+.BR journal ),
+.B path
+(null for a journal),
+.B on_truncation
+.RB ( refuse ,
+.B restart
+or null),
+.B state
+.RB ( paused
+or
+.BR reading ),
+.B cause
+(null unless paused),
+.BR inode ,
+.BR committed_offset ,
+.B observed_size
+(integers or null),
+.B repair
+(the exact command, or null when no repair applies),
+.B loss_events
+(retained count, 0 to 256) and
+.B last_loss
+(null, or an object with
+.BR sequence ,
+.BR wall_us ,
+.BR reason ,
+.BR inode ,
+.B committed_offset
+and
+.BR observed_size ).
+.IP \(bu 2
+.B cause
+gains the value
+.BR SourcePaused .
+.IP \(bu 2
+.B loss_events
+\(em only with
+.BR --details :
+the client adds the array of every retained event, each with
+.BR sequence ,
+.BR jail ,
+.BR path ,
+.BR wall_us ,
+.BR reason ,
+.BR inode ,
+.B committed_offset
+and
+.BR observed_size .
+This is the one case where
+.B --details
+changes JSON output, and it adds a key without changing any other.
+.PP
+Plain output adds, after every existing key,
+.BR paused_sources ,
+one tab-separated
+.B source
+line per listed source (jail, kind, path or \-, state, cause or \-, on_truncation or \-,
+loss event count, latest loss wall_us or \-, latest loss committed offset or \-), one
+.B source_repair
+line (jail, path, command) for each source whose repair is non-null, and with
+.B --details
+one
+.B loss_event
+line per event. Callers who are not administrators see
+.B <redacted>
+for a source path and repair command.
+.PP
+If the events cannot be read after the status was read, table output prints
+.BR "Continuity loss events: unavailable (message)" ,
+plain output prints
+.BR loss_events_unavailable ,
+and JSON sets
+.B loss_events
+to null with
+.BR loss_events_unavailable .
+The exit status is 3 for a transport failure and 1 when the daemon does not support the
+query; upgrade and restart the daemon in that case.
+.RE
 .TP
 .BI stats " [--details] [--output table|plain|json]"
 Show one retained enforcement-manager worker snapshot. It reports snapshot age
@@ -177,6 +312,8 @@ independent per-jail kernel verification and does not promise zero pending bans.
 Unconfirmed does not mean installed rules are absent. Missing query fields remain
 unknown; action names do not determine mode. JSON includes the additive Boolean
 \fBenforce_configured\fR while preserving \fBenforcing\fR and \fBaction\fR.
+JSON also carries the additive Boolean \fBsource_paused\fR, true when any source of the jail is paused;
+\fBsource_healthy\fR and \fBcause\fR keep their meaning.
 Plain output retains its 11 columns and enforcing Boolean position; an unknown ban
 count is shown as \fB-\fR, while a known zero remains \fB0\fR. Table output shows state, source health, enforcement and bans; add
 .B --details
@@ -385,23 +522,41 @@ daemon exits 3. See
 .
 .SH REPAIR-SOURCE
 A file source truncated in place below its committed position (for example a
-PortSentry history file that the scanner empties on start) is refused at startup
-rather than silently re-read; the log names the jail and source. With the daemon
+PortSentry history file that the scanner empties on start), or a rotated-out file
+removed while it still held unread bytes, is not silently re-read under the default
+.BR "on_truncation = \(dqrefuse\(dq" .
+The daemon starts with that source paused: the startup journal line and
+.B fail2zig status
+name the jail and source and print the exact command to run. With the daemon
 stopped,
 .B repair-source
-acknowledges that truncation for one configured file source and restarts it at
-offset 0 of the current file. It holds the state lock, never creates state, and
-refuses a replaced or rotated file, a pending receipt for that source, consumer
+acknowledges the loss for one configured file source. After a truncation in place it
+restarts the source at offset 0 of the current file. After a removed rotated file it
+records the loss of that file's unread bytes and resumes the current file at its
+committed offset, not at 0. It holds the state lock, never creates state, and
+refuses a source that is neither truncated in place nor missing a removed rotated
+incarnation (nothing to acknowledge), a pending receipt for that source, consumer
 state that is not ready, or a checkpoint changed since observation. Other sources,
 owners and ban deadlines are not changed.
 .PP
+If the source is not paused because
+.B on_truncation = \(dqrestart\(dq
+already recorded the loss, the command prints that event, performs no repair, does not
+reserve the token and exits 0.
+.PP
 The
 .I token
-(1\(en128 of A\(enZ a\(enz 0\(en9 . _ : \-) identifies the repair: repeating the
-same command replays the committed outcome without a second repair. The newest 256
+(1\(en128 of A\(enZ a\(enz 0\(en9 . _ : \-) identifies the repair. The daemon proposes one
+of the form
+.IR ack-<inode>-<committed_offset>-<detected_unix_seconds> ,
+so each incident has its own token and the printed command can be copied as it is.
+Repeating the same command replays the committed outcome without a second repair; a
+different token after a successful repair is refused, because the source is no longer
+truncated. The newest 256
 outcomes are retained; an older token stays reserved and is refused. Data written
 after the committed position and removed by the truncation was never read and cannot
-be recovered, and lines still in the file are read again. Stopping the daemon for the
+be recovered (for a removed rotated file, the records after its committed offset), and lines
+still in the file are read again. Stopping the daemon for the
 repair withdraws its firewall rules for every jail until the next start reinstalls
 them from durable state. Exit 0 on success or replay, 1 on refusal, 2 on usage errors.
 .
@@ -469,15 +624,31 @@ Native destination migration must run as the service UID with the required
 capabilities and caller-owned private staging, with the destination daemon
 stopped. See docs/operations/command-migration.md and migration-continuity.md.
 .PP
-The first start of this version on v0.4.x state (schema 23) upgrades it to
-schema 24. Before its first change the daemon writes a coherent copy to
-.IR <state_file>.pre24-backup ,
-which needs free space of twice the database size plus 32 MiB, and refuses to start
-if that file already exists. The upgrade commits in small resumable steps: an
-interrupted upgrade resumes on the next start, and a partly upgraded database is
-refused by older binaries. Keep the backup until the upgraded daemon has been checked.
-Rollback means restoring that backup (removing the upgraded database's WAL/SHM files)
-together with the previous binary; an older binary cannot open schema 24 state.
+The first start of this version upgrades a state last written by v0.4.6 (schema 24)
+to schema 25, which adds the tables for runtime ignore entries and continuity-loss
+events. States last written by releases before v0.4.6 are not a supported upgrade
+path; start from a fresh state. Before its first change the daemon writes a coherent
+copy of the database to a backup, which needs free space of twice the database size plus 32 MiB, and refuses to start if that file already
+exists; move an old backup aside only when it is not the sole copy of earlier state.
+.IP \(bu 2
+The backup is
+.IR <state_file>.pre25-backup .
+.PP
+The upgrade commits in small resumable steps: an interrupted upgrade resumes on the
+next start. v0.4.6 and older binaries refuse schema 25 state with their
+.B UnsupportedSchema
+message, as they refuse a partly upgraded database. Keep the backup until the
+upgraded daemon has been checked. Rollback means stopping the daemon, restoring the
+backup the upgrade wrote over the state file, removing the upgraded database's
+WAL/SHM files, and reinstalling the binary that last wrote that state.
+.PP
+The first start on state whose saved detection generations hashed the ignore list
+rekeys them once, before admission validation, and logs
+.BR "saved detection generations rekeyed without the ignore list" .
+No ban, deadline, checkpoint or retry subject changes, and later starts write nothing.
+A configuration that still differs from saved state in another way keeps its existing
+.B RetryGenerationMismatch
+refusal.
 .
 .SH ENVIRONMENT
 .TP

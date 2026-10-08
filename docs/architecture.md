@@ -44,8 +44,9 @@ commit together, and encoding warnings are rate-limited without printing raw pay
 This behavior is not present in releases through v0.4.2.
 
 The repair reads legacy processor checkpoints; older binaries cannot restore its
-extended checkpoints. Later state uses SQLite schema 24, upgraded from schema 23 in
-resumable steps after a coherent pre-upgrade backup. Reverting the binary alone is not a
+extended checkpoints. Later state uses SQLite schema 25, upgraded from a state last written
+by v0.4.6 (schema 24) in resumable steps after a coherent `.pre25-backup`; states last
+written by earlier releases are not an upgrade path. Reverting the binary alone is not a
 supported rollback; restore the matching backup with the previous binary.
 
 A file truncated in place below its saved position is refused rather than re-read. The

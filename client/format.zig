@@ -89,6 +89,39 @@ pub const StatusPayload = struct {
     expiry_overdue: ?bool = null,
     expiry_uncertain: ?bool = null,
     next_committed_expiry_us: ?i64 = null,
+    paused_sources: ?u32 = null,
+    sources: ?[]const SourceEntry = null,
+};
+
+pub const LossEvent = struct {
+    sequence: ?u64 = null,
+    jail: ?[]const u8 = null,
+    path: ?[]const u8 = null,
+    wall_us: ?i64 = null,
+    reason: ?[]const u8 = null,
+    inode: ?u64 = null,
+    committed_offset: ?u64 = null,
+    observed_size: ?u64 = null,
+};
+
+pub const SourceEntry = struct {
+    jail: ?[]const u8 = null,
+    kind: ?[]const u8 = null,
+    path: ?[]const u8 = null,
+    on_truncation: ?[]const u8 = null,
+    state: ?[]const u8 = null,
+    cause: ?[]const u8 = null,
+    inode: ?u64 = null,
+    committed_offset: ?u64 = null,
+    observed_size: ?u64 = null,
+    repair: ?[]const u8 = null,
+    loss_events: ?u32 = null,
+    last_loss: ?LossEvent = null,
+};
+
+pub const LossReport = union(enum) {
+    events: []const LossEvent,
+    unavailable: []const u8,
 };
 
 pub const BanEntry = struct {
@@ -121,6 +154,7 @@ pub const JailEntry = struct {
     source_exit_code: ?u8 = null,
     source_signal: ?u32 = null,
     source_stderr_present: ?bool = null,
+    source_paused: ?bool = null,
 };
 
 pub const StatsPayload = struct {
@@ -187,15 +221,19 @@ pub fn formatStatus(
     fmt: OutputFormat,
     color: Color,
 ) !void {
-    try formatStatusWithDetails(allocator, writer, payload_json, fmt, color, false);
+    try formatStatusWithDetails(allocator, writer, payload_json, fmt, color, false, null);
 }
 
 pub fn formatStatusDetailed(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color) !void {
-    try formatStatusWithDetails(allocator, writer, payload_json, fmt, color, true);
+    try formatStatusWithDetails(allocator, writer, payload_json, fmt, color, true, null);
 }
 
-fn formatStatusWithDetails(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color, details: bool) !void {
-    try formatStatusForWidthDetailed(allocator, writer, payload_json, fmt, color, terminalColumns(), details);
+pub fn formatStatusWithLoss(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color, loss: LossReport) !void {
+    try formatStatusWithDetails(allocator, writer, payload_json, fmt, color, true, loss);
+}
+
+fn formatStatusWithDetails(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color, details: bool, loss: ?LossReport) !void {
+    try formatStatusReport(allocator, writer, payload_json, fmt, color, terminalColumns(), details, loss);
 }
 
 fn formatStatusForWidth(
@@ -218,8 +256,22 @@ fn formatStatusForWidthDetailed(
     columns: usize,
     details: bool,
 ) !void {
+    return formatStatusReport(allocator, writer, payload_json, fmt, color, columns, details, null);
+}
+
+fn formatStatusReport(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    payload_json: []const u8,
+    fmt: OutputFormat,
+    color: Color,
+    columns: usize,
+    details: bool,
+    loss: ?LossReport,
+) !void {
     switch (fmt) {
         .json => {
+            if (loss) |report| return writeStatusJsonWithLoss(writer, payload_json, report);
             try writer.writeAll(payload_json);
             if (payload_json.len == 0 or payload_json[payload_json.len - 1] != '\n') {
                 try writer.writeAll("\n");
@@ -239,11 +291,32 @@ fn formatStatusForWidthDetailed(
 
             if (fmt == .plain) {
                 try writeStatusPlain(writer, parsed.value);
+                if (loss) |report| try writeLossPlain(writer, report);
             } else {
                 try writeStatusTable(writer, parsed.value, color, columns, details);
+                if (loss) |report| try writeLossTable(writer, report, color, columns);
             }
         },
     }
+}
+
+fn writeStatusJsonWithLoss(writer: anytype, payload_json: []const u8, report: LossReport) !void {
+    const object = std.mem.trim(u8, payload_json, " \t\r\n");
+    if (object.len < 2 or object[0] != '{' or object[object.len - 1] != '}') return error.InvalidStatusPayload;
+    const members = std.mem.trim(u8, object[1 .. object.len - 1], " \t\r\n");
+    try writer.writeAll(object[0 .. object.len - 1]);
+    if (members.len != 0) try writer.writeByte(',');
+    switch (report) {
+        .events => |events| {
+            try writer.writeAll("\"loss_events\":");
+            try std.json.stringify(events, .{}, writer);
+        },
+        .unavailable => |message| {
+            try writer.writeAll("\"loss_events\":null,\"loss_events_unavailable\":");
+            try std.json.encodeJsonString(message, .{}, writer);
+        },
+    }
+    try writer.writeAll("}\n");
 }
 
 fn writeStatusPlain(writer: anytype, s: StatusPayload) !void {
@@ -287,6 +360,74 @@ fn writeStatusPlain(writer: anytype, s: StatusPayload) !void {
     if (s.expiry_overdue) |overdue| try writer.print("expiry_overdue\t{s}\n", .{boolValue(overdue)});
     if (s.expiry_uncertain) |uncertain| try writer.print("expiry_uncertain\t{s}\n", .{boolValue(uncertain)});
     if (s.next_committed_expiry_us) |deadline| try writer.print("next_committed_expiry_us\t{d}\n", .{deadline});
+    if (s.paused_sources) |count| try writer.print("paused_sources\t{d}\n", .{count});
+    for (s.sources orelse &.{}) |source| try writeSourcePlain(writer, source);
+}
+
+fn writeSourcePlain(writer: anytype, source: SourceEntry) !void {
+    try writer.writeAll("source\t");
+    try writeEscaped(writer, source.jail orelse "-");
+    try writer.writeByte('\t');
+    try writeEscaped(writer, source.kind orelse "-");
+    try writer.writeByte('\t');
+    try writeEscaped(writer, source.path orelse "-");
+    try writer.writeByte('\t');
+    try writeEscaped(writer, source.state orelse "-");
+    try writer.writeByte('\t');
+    try writeEscaped(writer, source.cause orelse "-");
+    try writer.writeByte('\t');
+    try writeEscaped(writer, source.on_truncation orelse "-");
+    try writer.print("\t{d}\t", .{source.loss_events orelse 0});
+    if (source.last_loss) |last| {
+        try writeOptInt(writer, last.wall_us, "-");
+        try writer.writeByte('\t');
+        try writeOptInt(writer, last.committed_offset, "-");
+    } else {
+        try writer.writeAll("-\t-");
+    }
+    try writer.writeByte('\n');
+    if (source.repair) |repair| {
+        try writer.writeAll("source_repair\t");
+        try writeEscaped(writer, source.jail orelse "-");
+        try writer.writeByte('\t');
+        try writeEscaped(writer, source.path orelse "-");
+        try writer.writeByte('\t');
+        try writeEscaped(writer, repair);
+        try writer.writeByte('\n');
+    }
+}
+
+fn writeOptInt(writer: anytype, value: anytype, absent: []const u8) !void {
+    if (value) |number| try writer.print("{d}", .{number}) else try writer.writeAll(absent);
+}
+
+fn writeLossPlain(writer: anytype, report: LossReport) !void {
+    switch (report) {
+        .unavailable => |message| {
+            try writer.writeAll("loss_events_unavailable\t");
+            try writeEscaped(writer, message);
+            try writer.writeByte('\n');
+        },
+        .events => |events| for (events) |event| {
+            try writer.writeAll("loss_event\t");
+            try writeOptInt(writer, event.sequence, "-");
+            try writer.writeByte('\t');
+            try writeEscaped(writer, event.jail orelse "-");
+            try writer.writeByte('\t');
+            try writeEscaped(writer, event.path orelse "-");
+            try writer.writeByte('\t');
+            try writeOptInt(writer, event.wall_us, "-");
+            try writer.writeByte('\t');
+            try writeEscaped(writer, event.reason orelse "-");
+            try writer.writeByte('\t');
+            try writeOptInt(writer, event.inode, "-");
+            try writer.writeByte('\t');
+            try writeOptInt(writer, event.committed_offset, "-");
+            try writer.writeByte('\t');
+            try writeOptInt(writer, event.observed_size, "unknown");
+            try writer.writeByte('\n');
+        },
+    }
 }
 
 fn writeStatusTable(writer: anytype, s: StatusPayload, color: Color, columns: usize, details: bool) !void {
@@ -336,6 +477,7 @@ fn writeStatusTable(writer: anytype, s: StatusPayload, color: Color, columns: us
         var source_buffer: [96]u8 = undefined;
         try rowLabel(writer, "Sources:", std.fmt.bufPrint(&source_buffer, "{d} unhealthy; inspect fail2zig jails", .{count}) catch "unhealthy; inspect fail2zig jails", width);
     };
+    try writeSourcesBoxed(writer, s, color, width);
     var summary_buffer: [160]u8 = undefined;
     if (formatEffects(&summary_buffer, s)) |value| try rowLabel(writer, "Effects:", value, width);
     if (s.effect_backend) |backend| try rowLabel(writer, "Effect:", renderDiagnostic(&diagnostic_buffer, backend), width);
@@ -385,6 +527,7 @@ fn writeStatusSummary(writer: anytype, s: StatusPayload, color: Color, columns: 
         var source: [96]u8 = undefined;
         try writeStatusNarrowRow(writer, "Sources: ", std.fmt.bufPrint(&source, "{d} unhealthy; inspect fail2zig jails", .{count}) catch "unhealthy", columns);
     };
+    try writeSourcesNarrow(writer, s, color, columns);
     var summary: [160]u8 = undefined;
     const effects_problem = formatEffects(&summary, s);
     if (effects_problem) |value| try writeStatusNarrowRow(writer, "Effects: ", value, columns);
@@ -440,6 +583,7 @@ fn writeStatusNarrow(writer: anytype, s: StatusPayload, color: Color, columns: u
         var source_buffer: [96]u8 = undefined;
         try writeStatusNarrowRow(writer, "Sources: ", std.fmt.bufPrint(&source_buffer, "{d} unhealthy", .{count}) catch "unhealthy", columns);
     };
+    try writeSourcesNarrow(writer, s, color, columns);
     var summary_buffer: [160]u8 = undefined;
     if (formatEffects(&summary_buffer, s)) |value| try writeStatusNarrowRow(writer, "Effects: ", value, columns);
     if (s.effect_backend) |backend| try writeStatusNarrowRow(writer, "Effect: ", renderDiagnostic(&diagnostic_buffer, backend), columns);
@@ -455,6 +599,269 @@ fn writeStatusNarrowRow(writer: anytype, label: []const u8, value: []const u8, c
     try writer.writeAll(label);
     try writeCell(writer, value, @max(@as(usize, 4), columns -| label.len));
     try writer.writeAll("\n");
+}
+
+const repair_steps = "stop fail2zig, then run:";
+const repair_none = "no offline repair applies to this cause; see the daemon log.";
+const repair_restart = "Then start fail2zig. While it is stopped, firewall rules for every jail are withdrawn.";
+
+fn isPaused(source: SourceEntry) bool {
+    const state = source.state orelse return false;
+    return std.mem.eql(u8, state, "paused");
+}
+
+fn hasLossEvents(source: SourceEntry) bool {
+    return (source.loss_events orelse 0) > 0;
+}
+
+fn sourceLocation(buffer: []u8, source: SourceEntry) []const u8 {
+    var jail_buffer: [diagnostic_max_bytes]u8 = undefined;
+    var place_buffer: [diagnostic_max_bytes]u8 = undefined;
+    const jail = renderDiagnostic(&jail_buffer, source.jail orelse "-");
+    const place = renderDiagnostic(&place_buffer, source.path orelse source.kind orelse "-");
+    return std.fmt.bufPrint(buffer, "{s} {s}", .{ jail, place }) catch jail;
+}
+
+fn pausedValue(buffer: []u8, source: SourceEntry) []const u8 {
+    var location_buffer: [2 * diagnostic_max_bytes + 1]u8 = undefined;
+    var cause_buffer: [diagnostic_max_bytes]u8 = undefined;
+    const location = sourceLocation(&location_buffer, source);
+    const cause = renderDiagnostic(&cause_buffer, source.cause orelse "unknown");
+    return std.fmt.bufPrint(buffer, "{s} ({s})", .{ location, cause }) catch "paused source";
+}
+
+fn utcWithZone(buffer: *[40]u8, wall_us: ?i64) []const u8 {
+    var time_buffer: [32]u8 = undefined;
+    const time = formatUtc(&time_buffer, wall_us);
+    if (time.len != 19) return std.fmt.bufPrint(buffer, "{s}", .{time}) catch "-";
+    return std.fmt.bufPrint(buffer, "{s} UTC", .{time}) catch "-";
+}
+
+fn lossValue(buffer: []u8, source: SourceEntry) []const u8 {
+    var location_buffer: [2 * diagnostic_max_bytes + 1]u8 = undefined;
+    const location = sourceLocation(&location_buffer, source);
+    const count = source.loss_events orelse 0;
+    const last = source.last_loss orelse return std.fmt.bufPrint(buffer, "{s}: {d}", .{ location, count }) catch "loss events";
+    var time_buffer: [40]u8 = undefined;
+    var reason_buffer: [diagnostic_max_bytes]u8 = undefined;
+    return std.fmt.bufPrint(buffer, "{s}: {d}; latest {s}, {s} at offset {d}", .{
+        location,
+        count,
+        utcWithZone(&time_buffer, last.wall_us),
+        renderDiagnostic(&reason_buffer, last.reason orelse "-"),
+        last.committed_offset orelse 0,
+    }) catch "loss events";
+}
+
+fn writeWrapped(writer: anytype, text: []const u8, first_indent: []const u8, rest_indent: []const u8, columns: usize) !void {
+    var rest = text;
+    var indent = first_indent;
+    while (true) {
+        try writer.writeAll(indent);
+        const room = @max(@as(usize, 8), columns -| indent.len);
+        if (rest.len <= room) {
+            try writer.writeAll(rest);
+            try writer.writeByte('\n');
+            return;
+        }
+        var cut = room;
+        while (cut > 0 and rest[cut] != ' ') cut -= 1;
+        if (cut == 0) cut = room;
+        try writer.writeAll(rest[0..cut]);
+        try writer.writeByte('\n');
+        rest = std.mem.trimLeft(u8, rest[cut..], " ");
+        indent = rest_indent;
+    }
+}
+
+fn writeSourcesNarrow(writer: anytype, s: StatusPayload, color: Color, columns: usize) !void {
+    for (s.sources orelse &.{}) |source| {
+        if (!isPaused(source)) continue;
+        var value_buffer: [512]u8 = undefined;
+        try writer.writeAll("Paused: ");
+        try color.on(writer, Color.yellow);
+        try writeCell(writer, pausedValue(&value_buffer, source), @max(@as(usize, 4), columns -| "Paused: ".len));
+        try color.off(writer);
+        try writer.writeByte('\n');
+        if (source.repair) |repair| {
+            try writer.print("  Repair: {s}\n    ", .{repair_steps});
+            try writeEscaped(writer, repair);
+            try writer.writeByte('\n');
+            try writeWrapped(writer, repair_restart, "  ", "    ", columns);
+        } else {
+            try writer.print("  Repair: {s}\n", .{repair_none});
+        }
+    }
+    for (s.sources orelse &.{}) |source| {
+        if (!hasLossEvents(source)) continue;
+        var value_buffer: [512]u8 = undefined;
+        try writeStatusNarrowRow(writer, "Loss events: ", lossValue(&value_buffer, source), columns);
+    }
+}
+
+fn writeSourcesBoxed(writer: anytype, s: StatusPayload, color: Color, width: usize) !void {
+    for (s.sources orelse &.{}) |source| {
+        if (!isPaused(source)) continue;
+        var value_buffer: [512]u8 = undefined;
+        try rowLabelStyled(writer, color, Color.yellow, "Paused:", pausedValue(&value_buffer, source), width, false);
+        if (source.repair) |repair| {
+            try rowLabel(writer, "  Repair:", repair_steps, width);
+            try rowLabelStyled(writer, .{ .enabled = false }, "", "", repair, width, true);
+            try rowLabel(writer, "", repair_restart, width);
+        } else {
+            try rowLabel(writer, "  Repair:", repair_none, width);
+        }
+    }
+    for (s.sources orelse &.{}) |source| {
+        if (!hasLossEvents(source)) continue;
+        var value_buffer: [512]u8 = undefined;
+        try rowLabel(writer, "Loss events:", lossValue(&value_buffer, source), width);
+    }
+}
+
+fn sourcesWidth(s: StatusPayload) usize {
+    var used: usize = 0;
+    for (s.sources orelse &.{}) |source| {
+        var value_buffer: [512]u8 = undefined;
+        if (isPaused(source)) {
+            used = @max(used, rowUsed(pausedValue(&value_buffer, source)));
+            if (source.repair) |repair| {
+                used = @max(used, rowUsed(repair_restart));
+                used = @max(used, 2 + label_col + escapedLen(repair));
+            } else {
+                used = @max(used, rowUsed(repair_none));
+            }
+        }
+        if (hasLossEvents(source)) used = @max(used, rowUsed(lossValue(&value_buffer, source)));
+    }
+    return used;
+}
+
+const loss_gap: usize = 2;
+
+fn lossColumn(header: []const u8, longest: usize) usize {
+    return @max(header.len, @min(longest, col_max)) + loss_gap;
+}
+
+fn numberCell(buffer: *[24]u8, value: ?u64, absent: []const u8) []const u8 {
+    const number = value orelse return absent;
+    return std.fmt.bufPrint(buffer, "{d}", .{number}) catch "-";
+}
+
+const LossRow = struct {
+    jail_buffer: [diagnostic_max_bytes]u8 = undefined,
+    path_buffer: [diagnostic_max_bytes]u8 = undefined,
+    time_buffer: [40]u8 = undefined,
+    reason_buffer: [diagnostic_max_bytes]u8 = undefined,
+    inode_buffer: [24]u8 = undefined,
+    offset_buffer: [24]u8 = undefined,
+    size_buffer: [24]u8 = undefined,
+    jail: []const u8 = "",
+    path: []const u8 = "",
+    time: []const u8 = "",
+    reason: []const u8 = "",
+    inode: []const u8 = "",
+    offset: []const u8 = "",
+    size: []const u8 = "",
+
+    fn fill(self: *LossRow, event: LossEvent) void {
+        self.jail = renderDiagnostic(&self.jail_buffer, event.jail orelse "-");
+        self.path = renderDiagnostic(&self.path_buffer, event.path orelse "-");
+        self.time = utcWithZone(&self.time_buffer, event.wall_us);
+        self.reason = renderDiagnostic(&self.reason_buffer, event.reason orelse "-");
+        self.inode = numberCell(&self.inode_buffer, event.inode, "-");
+        self.offset = numberCell(&self.offset_buffer, event.committed_offset, "-");
+        self.size = numberCell(&self.size_buffer, event.observed_size, "unknown");
+    }
+};
+
+const LossWidths = struct {
+    jail: usize = 0,
+    path: usize = 0,
+    time: usize = 0,
+    reason: usize = 0,
+    inode: usize = 0,
+    offset: usize = 0,
+    size: usize = 0,
+
+    fn widen(self: *LossWidths, row: LossRow) void {
+        self.jail = @max(self.jail, row.jail.len);
+        self.path = @max(self.path, row.path.len);
+        self.time = @max(self.time, row.time.len);
+        self.reason = @max(self.reason, row.reason.len);
+        self.inode = @max(self.inode, row.inode.len);
+        self.offset = @max(self.offset, row.offset.len);
+        self.size = @max(self.size, row.size.len);
+    }
+};
+
+fn writeLossTable(writer: anytype, report: LossReport, color: Color, columns: usize) !void {
+    try writer.writeByte('\n');
+    switch (report) {
+        .unavailable => |message| {
+            try writer.writeAll("Continuity loss events: unavailable (");
+            try writeEscaped(writer, message);
+            try writer.writeAll(")\n");
+        },
+        .events => |events| {
+            if (events.len == 0) return writer.writeAll("Continuity loss events: none\n");
+            try writer.writeAll("Continuity loss events (newest first)\n");
+            var widest: LossWidths = .{};
+            for (events) |event| {
+                var row: LossRow = .{};
+                row.fill(event);
+                widest.widen(row);
+            }
+            const jail_col = lossColumn("JAIL", widest.jail);
+            const path_col = lossColumn("PATH", widest.path);
+            const time_col = lossColumn("TIME", widest.time);
+            const reason_col = lossColumn("REASON", widest.reason);
+            const inode_col = lossColumn("INODE", widest.inode);
+            const offset_col = lossColumn("OFFSET", widest.offset);
+            const size_width = @max("SIZE".len, widest.size);
+            if (jail_col + path_col + time_col + reason_col + inode_col + offset_col + size_width > columns) {
+                try writeLossStacked(writer, events, columns);
+            } else {
+                try color.on(writer, Color.bold);
+                try padRightPrint(writer, "JAIL", jail_col);
+                try padRightPrint(writer, "PATH", path_col);
+                try padRightPrint(writer, "TIME", time_col);
+                try padRightPrint(writer, "REASON", reason_col);
+                try padRightPrint(writer, "INODE", inode_col);
+                try padRightPrint(writer, "OFFSET", offset_col);
+                try writer.writeAll("SIZE");
+                try color.off(writer);
+                try writer.writeByte('\n');
+                for (events) |event| {
+                    var row: LossRow = .{};
+                    row.fill(event);
+                    try writeCell(writer, row.jail, jail_col);
+                    try writeCell(writer, row.path, path_col);
+                    try writeCell(writer, row.time, time_col);
+                    try writeCell(writer, row.reason, reason_col);
+                    try writeCell(writer, row.inode, inode_col);
+                    try writeCell(writer, row.offset, offset_col);
+                    try writer.print("{s}\n", .{row.size});
+                }
+            }
+            try writer.print("Total: {d} events\n", .{events.len});
+        },
+    }
+}
+
+fn writeLossStacked(writer: anytype, events: []const LossEvent, columns: usize) !void {
+    for (events, 0..) |event, index| {
+        var row: LossRow = .{};
+        row.fill(event);
+        if (index > 0) try writer.writeByte('\n');
+        try writeStatusNarrowRow(writer, "JAIL:   ", row.jail, columns);
+        try writeStatusNarrowRow(writer, "PATH:   ", row.path, columns);
+        try writeStatusNarrowRow(writer, "TIME:   ", row.time, columns);
+        try writeStatusNarrowRow(writer, "REASON: ", row.reason, columns);
+        try writeStatusNarrowRow(writer, "INODE:  ", row.inode, columns);
+        try writeStatusNarrowRow(writer, "OFFSET: ", row.offset, columns);
+        try writeStatusNarrowRow(writer, "SIZE:   ", row.size, columns);
+    }
 }
 
 fn statusWidth(s: StatusPayload) usize {
@@ -498,6 +905,7 @@ fn statusWidth(s: StatusPayload) usize {
     if (formatWorker(&summary_buffer, s)) |value| used = @max(used, rowUsed(value));
     if (s.clock_uncertain == true) used = @max(used, rowUsed("uncertain"));
     if (formatExpiry(&summary_buffer, s)) |value| used = @max(used, rowUsed(value));
+    used = @max(used, sourcesWidth(s));
     return @max(44, used + 2);
 }
 
@@ -611,6 +1019,48 @@ fn isUnsafeUnicodeControl(codepoint: u21) bool {
         (codepoint >= 0x2066 and codepoint <= 0x2069);
 }
 
+fn emitUnit(out: []u8, input: []const u8, unit: DiagnosticUnit) void {
+    switch (unit.kind) {
+        .raw => @memcpy(out, input),
+        .slash => @memcpy(out, "\\\\"),
+        .newline => @memcpy(out, "\\n"),
+        .carriage_return => @memcpy(out, "\\r"),
+        .tab => @memcpy(out, "\\t"),
+        .hex => {
+            const hex = "0123456789ABCDEF";
+            for (input, 0..) |hex_byte, index| {
+                const offset = index * 4;
+                out[offset] = '\\';
+                out[offset + 1] = 'x';
+                out[offset + 2] = hex[hex_byte >> 4];
+                out[offset + 3] = hex[hex_byte & 0x0f];
+            }
+        },
+    }
+}
+
+fn escapedLen(input: []const u8) usize {
+    var index: usize = 0;
+    var total: usize = 0;
+    while (index < input.len) {
+        const unit = diagnosticUnit(input[index..]);
+        total += unit.output_len;
+        index += unit.input_len;
+    }
+    return total;
+}
+
+fn writeEscaped(writer: anytype, input: []const u8) !void {
+    var unit_buffer: [16]u8 = undefined;
+    var index: usize = 0;
+    while (index < input.len) {
+        const unit = diagnosticUnit(input[index..]);
+        emitUnit(unit_buffer[0..unit.output_len], input[index..][0..unit.input_len], unit);
+        try writer.writeAll(unit_buffer[0..unit.output_len]);
+        index += unit.input_len;
+    }
+}
+
 fn renderDiagnostic(buffer: []u8, input: []const u8) []const u8 {
     const capacity = @min(buffer.len, diagnostic_max_bytes);
     if (capacity == 0) return buffer[0..0];
@@ -629,23 +1079,7 @@ fn renderDiagnostic(buffer: []u8, input: []const u8) []const u8 {
     while (input_index < input.len) {
         const unit = diagnosticUnit(input[input_index..]);
         if (unit.output_len > limit - output_index) break;
-        switch (unit.kind) {
-            .raw => @memcpy(buffer[output_index..][0..unit.output_len], input[input_index..][0..unit.input_len]),
-            .slash => @memcpy(buffer[output_index..][0..2], "\\\\"),
-            .newline => @memcpy(buffer[output_index..][0..2], "\\n"),
-            .carriage_return => @memcpy(buffer[output_index..][0..2], "\\r"),
-            .tab => @memcpy(buffer[output_index..][0..2], "\\t"),
-            .hex => {
-                const hex = "0123456789ABCDEF";
-                for (input[input_index..][0..unit.input_len], 0..) |hex_byte, index| {
-                    const offset = output_index + index * 4;
-                    buffer[offset] = '\\';
-                    buffer[offset + 1] = 'x';
-                    buffer[offset + 2] = hex[hex_byte >> 4];
-                    buffer[offset + 3] = hex[hex_byte & 0x0f];
-                }
-            },
-        }
+        emitUnit(buffer[output_index..][0..unit.output_len], input[input_index..][0..unit.input_len], unit);
         output_index += unit.output_len;
         input_index += unit.input_len;
     }
@@ -663,13 +1097,20 @@ fn statusHeadingLen(version: ?[]const u8) usize {
 }
 
 fn rowLabel(writer: anytype, label: []const u8, value: []const u8, width: usize) !void {
+    return rowLabelStyled(writer, .{ .enabled = false }, "", label, value, width, false);
+}
+
+fn rowLabelStyled(writer: anytype, color: Color, style: []const u8, label: []const u8, value: []const u8, width: usize, comptime escape: bool) !void {
     try writer.writeAll("| ");
     try writer.writeAll(label);
     if (label.len < label_col) {
         try writeSpaces(writer, label_col - label.len);
     }
-    try writer.writeAll(value);
-    const used = 1 + 1 + @max(label.len, label_col) + value.len;
+    try color.on(writer, style);
+    if (escape) try writeEscaped(writer, value) else try writer.writeAll(value);
+    try color.off(writer);
+    const value_len = if (escape) escapedLen(value) else value.len;
+    const used = 1 + 1 + @max(label.len, label_col) + value_len;
     if (used < width - 1) {
         try writeSpaces(writer, width - 1 - used);
     }
@@ -1379,6 +1820,10 @@ fn formatJailHealth(buffer: []u8, jail: JailEntry) []const u8 {
         "unknown";
     var stream = std.io.fixedBufferStream(buffer[0..@min(buffer.len, diagnostic_max_bytes)]);
     const writer = stream.writer();
+    if (jail.source_paused == true) {
+        writer.print("paused ({s})", .{cause}) catch return "paused (unknown)";
+        return stream.getWritten();
+    }
     writer.print("broken ({s}", .{cause}) catch return "broken (unknown)";
     if (jail.source_exit_code) |code| writer.print("; exit={d}", .{code}) catch return "broken (unknown)";
     if (jail.source_signal) |signal| writer.print("; signal={d}", .{signal}) catch return "broken (unknown)";

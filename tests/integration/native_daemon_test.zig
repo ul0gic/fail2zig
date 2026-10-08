@@ -820,7 +820,7 @@ test "native daemon: oversized source isolates its jail while independent file d
         return error.TestExpectedEqual;
     }
     var cause_buffer: [160]u8 = undefined;
-    const cause_text = try std.fmt.bufPrint(&cause_buffer, "broken ({s}", .{source_cause.?});
+    const cause_text = try std.fmt.bufPrint(&cause_buffer, "paused ({s}", .{source_cause.?});
     // Exercise the delivered formatter against the same actual daemon fault.
     const checks = [_]struct { format: []const u8, command: []const u8, needle: []const u8 }{
         .{ .format = "plain", .command = "status", .needle = "unhealthy_sources\t1" },
@@ -876,6 +876,12 @@ test "native daemon: retained rotation and detected copytruncate preserve retry 
     var h = try harness.Harness.init(t.allocator, .{ .spawn_daemon = false });
     defer h.deinit();
     try writeConfig(&h);
+    {
+        var config = try std.fs.cwd().openFile(h.config_path, .{ .mode = .write_only });
+        defer config.close();
+        try config.seekFromEnd(0);
+        try config.writeAll("on_truncation = \"restart\"\n");
+    }
     try h.startDaemon();
     try waitStatus(&h, "\"state\":\"log-only\"");
     try h.writeLine(failure);
@@ -898,6 +904,7 @@ test "native daemon: retained rotation and detected copytruncate preserve retry 
     try replacement.seekTo(0);
     try replacement.writeAll("ignored\n");
     try waitRevision(&h, 8);
+    try waitStatus(&h, "\"loss_events\":1");
     try std.posix.kill(h.child.?.id, std.posix.SIG.KILL);
     try t.expectEqual(std.process.Child.Term{ .Signal = std.posix.SIG.KILL }, try h.child.?.wait());
     h.child = null;

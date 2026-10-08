@@ -70,7 +70,7 @@ pub fn run(
         },
 
         .status => |options| {
-            if (options.details) return doRequest(allocator, parsed.globals, .{ .status = {} }, stdout, stderr, color, formatStatusDetailsCmd);
+            if (options.details) return doStatusDetails(allocator, parsed.globals, stdout, stderr, color);
             return doRequest(allocator, parsed.globals, .{ .status = {} }, stdout, stderr, color, formatStatusCmd);
         },
         .stats => |options| {
@@ -177,6 +177,91 @@ fn doQuery(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype,
     std.json.stringify(.{ .schema_version = @as(u32, 1), .kind = kind, .jail = jail, .limit = limit, .cursor = cursor }, .{ .emit_null_optional_fields = false }, stream.writer()) catch return .client_error;
     const body = shared.Command.Body.init(stream.getWritten()) catch return .client_error;
     return doRequestWithHint(allocator, globals, .{ .query_v1 = body }, stdout, stderr, color, formatter, if (std.mem.eql(u8, kind, "stats")) "daemon does not support stats; upgrade and restart the fail2zig daemon" else null);
+}
+
+const max_continuity_pages: usize = 512;
+const continuity_page_limit: u32 = 256;
+const continuity_unsupported = "daemon does not support continuity events; upgrade and restart the fail2zig daemon";
+
+const ContinuityPage = struct {
+    items: []const format.LossEvent = &.{},
+    next_cursor: ?[]const u8 = null,
+};
+
+const ContinuityResult = struct { report: format.LossReport, exit: ExitCode };
+
+fn continuityUnavailable(arena: std.mem.Allocator, exit: ExitCode, message: []const u8) ContinuityResult {
+    return .{ .report = .{ .unavailable = arena.dupe(u8, message) catch "out of memory" }, .exit = exit };
+}
+
+fn doStatusDetails(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype, color: format.Color) ExitCode {
+    var diag: socket.DiagBuf = .{};
+    var client = socket.connect(allocator, globals.socket_path, globals.timeout_ms, &diag) catch {
+        stderr.print("error: {s}\n", .{diag.message()}) catch {};
+        return .connection_failed;
+    };
+    const resp = client.sendCommand(.{ .status = {} }) catch {
+        stderr.print("error: {s}\n", .{client.errorMessage()}) catch {};
+        client.close();
+        return .connection_failed;
+    };
+    client.close();
+    defer resp.deinit(allocator);
+    const payload = switch (resp) {
+        .ok => |ok| ok.payload,
+        .err => |e| {
+            format.formatError(stderr, e.code, e.message, globals.output, color) catch {};
+            return .daemon_error;
+        },
+    };
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const result = pageContinuity(allocator, arena.allocator(), globals);
+    format.formatStatusWithLoss(allocator, stdout, payload, globals.output, color, result.report) catch |e| {
+        if (e == error.BrokenPipe) return .success;
+        stderr.print("error: failed to format response: {s}\n", .{@errorName(e)}) catch {};
+        return .client_error;
+    };
+    return result.exit;
+}
+
+fn pageContinuity(allocator: std.mem.Allocator, arena: std.mem.Allocator, globals: args.Globals) ContinuityResult {
+    var events: std.ArrayListUnmanaged(format.LossEvent) = .empty;
+    var cursor: ?[]const u8 = null;
+    var pages: usize = 0;
+    while (pages < max_continuity_pages) : (pages += 1) {
+        var body_bytes: [shared.protocol.max_request_body]u8 = undefined;
+        var stream = std.io.fixedBufferStream(&body_bytes);
+        std.json.stringify(.{ .schema_version = @as(u32, 1), .kind = "continuity", .limit = continuity_page_limit, .cursor = cursor }, .{ .emit_null_optional_fields = false }, stream.writer()) catch
+            return continuityUnavailable(arena, .client_error, "could not encode the continuity request");
+        const body = shared.Command.Body.init(stream.getWritten()) catch
+            return continuityUnavailable(arena, .client_error, "could not encode the continuity request");
+
+        var diag: socket.DiagBuf = .{};
+        var client = socket.connect(allocator, globals.socket_path, globals.timeout_ms, &diag) catch
+            return continuityUnavailable(arena, .connection_failed, diag.message());
+        const resp = client.sendCommand(.{ .query_v1 = body }) catch {
+            const failed = continuityUnavailable(arena, .connection_failed, client.errorMessage());
+            client.close();
+            return failed;
+        };
+        client.close();
+        defer resp.deinit(allocator);
+
+        const payload = switch (resp) {
+            .ok => |ok| ok.payload,
+            .err => |e| {
+                const unsupported = e.code == 400 and std.mem.eql(u8, e.message, "unknown query kind");
+                return continuityUnavailable(arena, .daemon_error, if (unsupported) continuity_unsupported else e.message);
+            },
+        };
+        const page = std.json.parseFromSliceLeaky(ContinuityPage, arena, payload, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch
+            return continuityUnavailable(arena, .daemon_error, "malformed continuity response from daemon");
+        events.appendSlice(arena, page.items) catch return continuityUnavailable(arena, .client_error, "out of memory");
+        cursor = page.next_cursor orelse return .{ .report = .{ .events = events.items }, .exit = .success };
+    }
+    return continuityUnavailable(arena, .daemon_error, "continuity events exceed 512 pages");
 }
 
 fn doFirewallQuery(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype, color: format.Color, query: args.Command.FirewallArgs) ExitCode {
@@ -420,10 +505,6 @@ fn formatStatusCmd(
     color: format.Color,
 ) !void {
     return format.formatStatus(allocator, writer, payload, fmt, color);
-}
-
-fn formatStatusDetailsCmd(allocator: std.mem.Allocator, writer: anytype, payload: []const u8, fmt: format.OutputFormat, color: format.Color) !void {
-    return format.formatStatusDetailed(allocator, writer, payload, fmt, color);
 }
 
 fn formatListCmd(

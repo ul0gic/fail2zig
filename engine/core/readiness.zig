@@ -34,6 +34,7 @@ pub const Jail = struct {
     healthy: bool,
     source_error: bool,
     enforce: bool,
+    source_paused: bool = false,
 };
 
 pub const Effects = struct {
@@ -104,6 +105,7 @@ fn deriveSources(jails: []const Jail) Verdict {
     if (jails.len == 0) return .{ .state = .unknown, .cause = "no enabled jail sources" };
     var waiting = false;
     for (jails) |jail| {
+        if (jail.source_paused) continue;
         if (jail.source_error) return .{ .state = .failed, .cause = "source continuity lost" };
         if (!jail.healthy) waiting = true;
     }
