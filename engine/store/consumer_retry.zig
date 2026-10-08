@@ -10,6 +10,7 @@ const effect_history = @import("../core/native_effect_history.zig");
 const action_context = @import("../core/native_action_context.zig");
 const action_outcome = @import("../core/native_action_outcome.zig");
 const store = @import("store.zig");
+const canonical_scope = @import("../firewall/scope.zig");
 const Error = store.Error;
 const Stmt = store.Stmt;
 const Limits = store.Limits;
@@ -758,6 +759,129 @@ pub fn Methods(comptime Store: type) type {
                 summary.decisions = std.math.add(u64, summary.decisions, try self.retiredTotal(jail)) catch return error.InvalidRetryState;
             try self.commitTransaction();
             return summary;
+        }
+
+        pub fn retryStateRevision(self: *Store) Error!u64 {
+            try self.beginRead();
+            errdefer self.rollback();
+            const revision_value = try self.integer("SELECT revision FROM policy_summary_clock WHERE id=1;");
+            if (revision_value <= 0) return error.InvalidPolicySummary;
+            try self.commitTransaction();
+            return @intCast(revision_value);
+        }
+
+        pub const RekeyReport = struct { retry_rows: u32, pending_receipts: u32, manifests: u32 };
+
+        // One-time startup rewrite of v0.4.6 rows; a single statement over a large records table needs more than the ordinary statement budget.
+        const rekey_work_callbacks: u32 = 100_000;
+        const OwnerHeld = struct { key: [32]u8, revision: u64, scope: [canonical_scope.encoded_bytes]u8, absent: bool };
+
+        pub fn rekeySavedGenerations(self: *Store, jail: []const u8, legacy: [32]u8, planned: [32]u8) Error!RekeyReport {
+            var report = RekeyReport{ .retry_rows = 0, .pending_receipts = 0, .manifests = 0 };
+            if (std.mem.eql(u8, &legacy, &planned)) return report;
+            if (jail.len == 0 or jail.len > 64 or std.mem.indexOfScalar(u8, jail, 0) != null) return error.InvalidRecord;
+            try self.beginAdmissionWrite();
+            errdefer self.rollback();
+            if (self.schema_version < 22) return error.AdminStorageRequired;
+            const prior_work = self.work_remaining;
+            if (self.runtime_limits) self.work_remaining = rekey_work_callbacks;
+            defer if (self.runtime_limits) {
+                self.work_remaining = prior_work;
+            };
+            const bound = blk: {
+                var row = try self.statement("SELECT 1 FROM retry_policies WHERE jail=?1 AND generation=?2;");
+                defer row.deinit();
+                try row.text(1, jail);
+                try row.blob(2, &legacy);
+                break :blk try row.row();
+            };
+            if (!bound) {
+                try self.commitTransaction();
+                return report;
+            }
+            try self.exec("PRAGMA defer_foreign_keys=ON;");
+            for ([_][:0]const u8{
+                "UPDATE retry_policies SET generation=?3 WHERE jail=?1 AND generation=?2;",
+                "UPDATE retry_escalation_policies SET generation=?3 WHERE jail=?1 AND generation=?2;",
+                "UPDATE retry_retired SET generation=?3 WHERE jail=?1 AND generation=?2;",
+            }) |sql| report.retry_rows = std.math.add(u32, report.retry_rows, try self.rekeyRows(sql, jail, legacy, planned)) catch return error.StorageLimit;
+            report.pending_receipts = try self.rekeyRows("UPDATE pending_receipts SET generation=?3 WHERE jail=?1 AND generation=?2;", jail, legacy, planned);
+            report.manifests = try self.rekeyRows("UPDATE consumer_manifests SET generation=?3 WHERE jail=?1 AND generation=?2;", jail, legacy, planned);
+            for ([_][:0]const u8{
+                "UPDATE records SET source_generation=?3 WHERE jail=?1 AND source_generation=?2;",
+                "UPDATE records SET receipt_generation=?3 WHERE jail=?1 AND receipt_generation=?2;",
+                "UPDATE checkpoints SET payload=substr(payload,1,8)||?3||substr(payload,41) WHERE jail=?1 AND substr(payload,1,4)=CAST('F2NT' AS BLOB) AND substr(payload,9,32)=?2;",
+                "UPDATE checkpoints SET payload=substr(payload,1,6)||?3||substr(payload,39) WHERE jail=?1 AND substr(payload,1,4)=CAST('F2JC' AS BLOB) AND substr(payload,7,32)=?2;",
+                "UPDATE source_maintenance SET generation=?3 WHERE jail=?1 AND generation=?2;",
+                "UPDATE replay_guards SET generation=?3 WHERE jail=?1 AND generation=?2;",
+                "UPDATE consumer_checkpoints SET generation=?3 WHERE jail=?1 AND generation=?2;",
+                "UPDATE consumer_requirements SET generation=?3 WHERE jail=?1 AND generation=?2;",
+            }) |sql| _ = try self.rekeyRows(sql, jail, legacy, planned);
+            const owners_changed = try self.rekeyOwnersTx(jail, legacy, planned);
+            try self.commitEffectTransaction(owners_changed);
+            return report;
+        }
+
+        fn rekeyRows(self: *Store, sql: [:0]const u8, jail: []const u8, legacy: [32]u8, planned: [32]u8) Error!u32 {
+            var update = try self.statement(sql);
+            defer update.deinit();
+            try update.text(1, jail);
+            try update.blob(2, &legacy);
+            try update.blob(3, &planned);
+            try update.done();
+            return std.math.cast(u32, self.api.changes(self.db)) orelse error.StorageLimit;
+        }
+
+        fn rekeyOwnersTx(self: *Store, jail: []const u8, legacy: [32]u8, planned: [32]u8) Error!bool {
+            var held = std.ArrayListUnmanaged(OwnerHeld){};
+            defer held.deinit(self.allocator);
+            {
+                var owners = try self.statement("SELECT o.scope_key,o.revision,n.canonical_scope,o.lease_kind,o.deadline_us,EXISTS(SELECT 1 FROM effect_owner_revisions h WHERE h.scope_key=o.scope_key AND h.jail=o.jail AND h.revision=o.revision AND h.generation=o.generation AND h.decision_id=o.decision_id AND h.lease_kind=o.lease_kind AND h.deadline_us IS o.deadline_us AND h.decided_us=o.decided_us) FROM effect_owners o JOIN native_effects n USING(scope_key) WHERE o.jail=?1 AND o.generation=?2 ORDER BY o.scope_key;");
+                defer owners.deinit();
+                try owners.text(1, jail);
+                try owners.blob(2, &legacy);
+                while (try owners.row()) {
+                    if (held.items.len == effects.max_effects) return error.EffectCapacity;
+                    const owner_revision = try owners.signed(1);
+                    if (owner_revision <= 0 or owner_revision >= std.math.maxInt(i64) or try owners.signed(5) != 1) return error.InvalidEffect;
+                    const lease = try Store.effectLease(&owners, 3, 4);
+                    try held.append(self.allocator, .{ .key = try Store.effectBlob(&owners, 0, 32), .revision = @intCast(owner_revision), .scope = try Store.effectBlob(&owners, 2, canonical_scope.encoded_bytes), .absent = lease == .absent });
+                }
+            }
+            if (held.items.len == 0) return false;
+            const clock = effects.Clock{ .prepared_us = 0 };
+            const now = try self.effectClock(clock);
+            const count: i64 = @intCast(held.items.len);
+            var live_count: i64 = 0;
+            for (held.items) |owner| if (!owner.absent) {
+                live_count += 1;
+            };
+            try self.reserveEffectRows(.{ .revisions = count, .intents = live_count, .observations = live_count * store.load_repair.observations_per_intent });
+            if (try self.integer("SELECT count(*) FROM effect_owner_revisions;") + count > effects.max_owner_revisions) return error.EffectCapacity;
+            for (held.items) |owner| {
+                const scope = canonical_scope.Scope.decode(&owner.scope) catch return error.InvalidEffect;
+                if (owner.absent) {
+                    const installation = try self.readInstallation() orelse return error.InstallationRequired;
+                    const exact = try effects.Scope.exact(scope);
+                    if (!std.mem.eql(u8, &owner.key, &try exact.key(installation))) return error.InvalidEffect;
+                    var update = try self.statement("UPDATE effect_owners SET generation=?4,revision=?5 WHERE scope_key=?1 AND jail=?2 AND revision=?3 AND generation=?6 AND lease_kind=0 AND deadline_us IS NULL;");
+                    defer update.deinit();
+                    try update.blob(1, &owner.key);
+                    try update.text(2, jail);
+                    try update.int(3, @intCast(owner.revision));
+                    try update.blob(4, &planned);
+                    try update.int(5, @intCast(owner.revision + 1));
+                    try update.blob(6, &legacy);
+                    try update.done();
+                    if (self.api.changes(self.db) != 1) return error.StaleEffect;
+                    try self.advanceEffectSnapshot();
+                    continue;
+                }
+                const transition_id = effects.hashParts("fail2zig-generation-rekey-v1", &.{ &planned, &owner.key });
+                _ = try self.transitionOwnerReservedTx(.{ .scope = scope, .jail = jail, .current_generation = legacy, .next_generation = planned, .expected_owner_revision = owner.revision, .transition_id = transition_id, .mode = .retain, .occurred_us = now }, now, false);
+            }
+            _ = try self.commitEffectClock(clock);
+            return true;
         }
 
         pub fn retryPolicySummaryPage(self: *Store, query: application_history.PolicyQuery, output: []application_history.PolicySummary) Error!application_history.PolicyPage {

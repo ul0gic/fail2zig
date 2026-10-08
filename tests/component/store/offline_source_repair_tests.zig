@@ -116,6 +116,7 @@ const Fixture = struct {
         try store.configureRuntimeLimits();
         try store.completeLoadRepairMigration(.{ .state_path = self.state, .now_us = now_us, .history_max_matches = 4 });
         try t.expectEqual(.complete, try store.loadRepairStatus());
+        try store.enableRuntimeState(.{ .state_path = self.state, .now_us = now_us, .history_max_matches = 4 }, true);
     }
 
     // Same inode, shorter than the committed offset: what PortSentry does on start.

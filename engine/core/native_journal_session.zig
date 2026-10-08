@@ -10,6 +10,8 @@ const time = @import("native_time.zig");
 const health = @import("storage_health.zig");
 const repair = @import("source_repair.zig");
 pub const checkpoint_bytes = 560;
+// Same one-second quiet interval as journald_source.poll_interval_ms and native_daemon quiet_interval_ms.
+const empty_poll_floor_ms: u64 = 1000;
 const Position = struct {
     generation: [32]u8,
     start_us: i64,
@@ -131,6 +133,7 @@ pub const Session = struct {
     initial_proposal: ?Position = null,
     expected_durable: bool = false,
     last_failure_domain: ?repair.Domain = null,
+    empty_poll_at_ms: ?u64 = null,
 
     fn validateOptions(options: Options) !void {
         if (options.staged_detection != null and (options.detection != null or options.consumer_sources == null)) return error.ConsumerManifestRequired;
@@ -204,6 +207,7 @@ pub const Session = struct {
         self.initial_proposal = null;
         self.expected_durable = false;
         self.last_failure_domain = null;
+        self.empty_poll_at_ms = null;
         if (options.consumer_sources) |binding| try binding.admit(options.source_id, self.processor.generation, binding.context);
         try self.pipe.restore(a);
         if (deferred) return self;
@@ -495,6 +499,7 @@ pub const Session = struct {
         const pending = (try self.pipe.store.readPendingSource(self.allocator, self.pipe.jail, source_id)) orelse return error.PendingRecordUnavailable;
         defer pending.deinit(self.allocator);
         if (!std.mem.eql(u8, &pending.identity.generation, &self.processor.generation)) return error.SourceGenerationMismatch;
+        self.empty_poll_at_ms = null;
         return self.pollTurn(1);
     }
     pub fn pollTurn(self: *Session, budget: usize) !usize {
@@ -512,7 +517,10 @@ pub const Session = struct {
                 try self.verifyTurn();
                 return 0;
             },
-            .healthy, .polling => {},
+            .healthy, .polling => if (self.empty_poll_at_ms) |at| {
+                const now = self.nowMs();
+                if (now >= at and now - at < empty_poll_floor_ms) return 0;
+            },
         }
         const pending = self.pipe.store.readPendingSource(self.allocator, self.pipe.jail, self.options.source_id) catch |err| return self.storageFailure(err);
         defer if (pending) |saved| saved.deinit(self.allocator);
@@ -521,6 +529,7 @@ pub const Session = struct {
         defer self.pending_expected = null;
         var committing = false;
         const had_baseline = self.baseline_committed;
+        self.empty_poll_at_ms = null;
         const count = self.pollAdmitted(budget, &committing) catch |err| {
             if (committing) {
                 if (pipeline.Pipeline.sourceLocalIntervention(err)) return self.sourceFailure(err);
@@ -532,6 +541,7 @@ pub const Session = struct {
             return self.sourceFailure(err);
         };
         if (had_baseline and self.source_repair.state.phase == .polling) try self.source_repair.pollSucceeded((try self.source_repair.begin(self.nowMs(), true)).?);
+        if (had_baseline and count == 0) self.empty_poll_at_ms = self.nowMs();
         self.last_error = null;
         self.source_health = .healthy;
         if (self.source_repair.state.phase == .healthy) self.failure_diagnostic = null;

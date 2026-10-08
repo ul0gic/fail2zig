@@ -7,6 +7,7 @@ const detector = @import("../core/native_builtin_detector.zig");
 const session = @import("../core/native_file_session.zig");
 const files = @import("../core/durable_file_source.zig");
 const durable = @import("../core/record_store.zig");
+const ignore_set = @import("../core/native_ignore_set.zig");
 
 pub const Settings = struct {
     timestamp: processing.TimestampSource,
@@ -25,11 +26,20 @@ pub const Settings = struct {
 pub const Plan = struct {
     processing: processing.Options,
     detection: ?detector.Detector,
+    ignore_cell: ?**ignore_set.EffectiveIgnore,
+    legacy_generation: [32]u8,
     specs: []session.Spec,
     max_sources: usize,
 
     pub fn sessionOptions(self: *const Plan) session.Options {
         return .{ .processing = self.processing, .detection = if (self.detection) |*value| value.consumer() else null, .max_sources = self.max_sources };
+    }
+
+    pub fn legacySessionOptions(self: *const Plan) session.Options {
+        var options = self.sessionOptions();
+        options.processing.parent_generation = self.legacy_generation;
+        if (self.detection) |*value| options.detection = value.legacyConsumer();
+        return options;
     }
 
     pub fn init(allocator: std.mem.Allocator, cfg: *const config.Config, jail_index: usize, parent_generation: [32]u8, settings: Settings) !Plan {
@@ -60,20 +70,29 @@ pub const Plan = struct {
                 else => return error.SyslogTimestampRequired,
             }
         }
+        const literals = jail.ignoreip orelse cfg.defaults.ignoreip;
+        var ignore_cell: ?**ignore_set.EffectiveIgnore = null;
+        if (!settings.custom) {
+            const cell = try allocator.create(*ignore_set.EffectiveIgnore);
+            errdefer allocator.destroy(cell);
+            cell.* = try ignore_set.EffectiveIgnore.build(allocator, literals, &.{});
+            ignore_cell = cell;
+        }
+        errdefer if (ignore_cell) |cell| {
+            cell.*.deinit(allocator);
+            allocator.destroy(cell);
+        };
         var detection: ?detector.Detector = if (settings.custom) null else try detector.Detector.init(allocator, .{
             .filter = jail.filter,
             .body = settings.body,
-            .ignore = jail.ignoreip orelse cfg.defaults.ignoreip,
+            .ignore = literals,
+            .ignores = ignore_cell,
             .ignore_capacity = settings.ignore_capacity,
             .max_decoded_bytes = settings.max_decoded_bytes,
         });
         errdefer if (detection) |*value| value.deinit(allocator);
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update("fail2zig-native-file-detection-v1\x00");
-        hash.update(&parent_generation);
-        if (detection) |value| hash.update(&value.generation) else hash.update("required-staged-consumer");
-        var generation: [32]u8 = undefined;
-        hash.final(&generation);
+        const generation = fileGeneration(parent_generation, if (detection) |value| value.generation else null);
+        const legacy_generation = fileGeneration(parent_generation, if (detection) |value| value.legacy_generation else null);
         const options = processing.Options{
             .jail = jail.name,
             .parent_generation = generation,
@@ -89,11 +108,25 @@ pub const Plan = struct {
         _ = try processing.Processor.init(allocator, options, scratch, .{ .us = 0 });
         const specs = try allocator.alloc(session.Spec, jail.logpath.len);
         for (specs, jail.logpath) |*spec, path| spec.* = .{ .pattern = path, .start = settings.start };
-        return .{ .processing = options, .detection = detection, .specs = specs, .max_sources = settings.max_sources };
+        return .{ .processing = options, .detection = detection, .ignore_cell = ignore_cell, .legacy_generation = legacy_generation, .specs = specs, .max_sources = settings.max_sources };
+    }
+
+    fn fileGeneration(parent_generation: [32]u8, detection_generation: ?[32]u8) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("fail2zig-native-file-detection-v1\x00");
+        hash.update(&parent_generation);
+        if (detection_generation) |value| hash.update(&value) else hash.update("required-staged-consumer");
+        var generation: [32]u8 = undefined;
+        hash.final(&generation);
+        return generation;
     }
 
     pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
         if (self.detection) |*value| value.deinit(allocator);
+        if (self.ignore_cell) |cell| {
+            cell.*.deinit(allocator);
+            allocator.destroy(cell);
+        }
         allocator.free(self.specs);
         self.* = undefined;
     }

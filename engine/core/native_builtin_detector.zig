@@ -7,13 +7,16 @@ const parser = @import("parser.zig");
 const Cidr = @import("state.zig").Cidr;
 const policy = @import("source_time_policy.zig");
 const stored = @import("native_detection_record.zig");
+const ignore_set = @import("native_ignore_set.zig");
 
-pub const version: u16 = 2;
+pub const version: u16 = 3;
+const legacy_version: u16 = 2;
 pub const Body = enum { whole, syslog };
 pub const Options = struct {
     filter: []const u8,
     body: Body,
     ignore: []const []const u8 = &.{},
+    ignores: ?*const *const ignore_set.EffectiveIgnore = null,
     ignore_capacity: usize,
     max_decoded_bytes: u32,
 };
@@ -36,9 +39,11 @@ pub const Result = union(enum) {
 pub const Detector = struct {
     entry: registry.Entry,
     body: Body,
-    ignores: []const Cidr,
+    ignores: *const *const ignore_set.EffectiveIgnore,
+    owned_cell: ?**ignore_set.EffectiveIgnore,
     max_decoded_bytes: u32,
     generation: [32]u8,
+    legacy_generation: [32]u8,
 
     pub fn init(allocator: std.mem.Allocator, options: Options) !Detector {
         if (options.max_decoded_bytes == 0 or options.max_decoded_bytes > @import("source_text.zig").max_record_bytes) return error.InvalidDetectorLimit;
@@ -48,36 +53,61 @@ pub const Detector = struct {
         } else unreachable;
         if (std.mem.eql(u8, entry.name, "recidive")) return error.InternalEventsRequired;
         if (options.ignore.len > options.ignore_capacity) return error.IgnoreCapacityExceeded;
-        const ignores = try allocator.alloc(Cidr, options.ignore.len);
-        errdefer allocator.free(ignores);
-        for (options.ignore, ignores) |spec, *cidr| {
+        const cidrs = try allocator.alloc(Cidr, options.ignore.len);
+        defer allocator.free(cidrs);
+        for (options.ignore, cidrs) |spec, *cidr| {
             if (spec.len == 0 or spec.len > 64) return error.InvalidStaticIgnore;
             cidr.* = Cidr.parse(spec) catch return error.InvalidStaticIgnore;
         }
+        const encoded = try std.json.stringifyAlloc(allocator, cidrs, .{});
+        defer allocator.free(encoded);
+        var owned_cell: ?**ignore_set.EffectiveIgnore = null;
+        if (options.ignores == null) {
+            const cell = try allocator.create(*ignore_set.EffectiveIgnore);
+            errdefer allocator.destroy(cell);
+            cell.* = try ignore_set.EffectiveIgnore.build(allocator, options.ignore, &.{});
+            owned_cell = cell;
+        }
+        return .{
+            .entry = entry,
+            .body = options.body,
+            .ignores = options.ignores orelse owned_cell.?,
+            .owned_cell = owned_cell,
+            .max_decoded_bytes = options.max_decoded_bytes,
+            .generation = digest(entry.name, options, version, null),
+            .legacy_generation = digest(entry.name, options, legacy_version, encoded),
+        };
+    }
+
+    fn digest(name: []const u8, options: Options, version_value: u16, encoded: ?[]const u8) [32]u8 {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("fail2zig-native-builtin\x00");
         var numbers: [6]u8 = undefined;
-        std.mem.writeInt(u16, numbers[0..2], version, .little);
+        std.mem.writeInt(u16, numbers[0..2], version_value, .little);
         std.mem.writeInt(u32, numbers[2..6], options.max_decoded_bytes, .little);
         hash.update(&numbers);
-        hash.update(entry.name);
+        hash.update(name);
         hash.update(&.{0});
         hash.update(@tagName(options.body));
-        const encoded = try std.json.stringifyAlloc(allocator, ignores, .{});
-        defer allocator.free(encoded);
-        hash.update(encoded);
-        var generation: [32]u8 = undefined;
-        hash.final(&generation);
-        return .{ .entry = entry, .body = options.body, .ignores = ignores, .max_decoded_bytes = options.max_decoded_bytes, .generation = generation };
+        if (encoded) |list| hash.update(list);
+        var out: [32]u8 = undefined;
+        hash.final(&out);
+        return out;
     }
 
     pub fn deinit(self: *Detector, allocator: std.mem.Allocator) void {
-        allocator.free(self.ignores);
+        if (self.owned_cell) |cell| {
+            cell.*.deinit(allocator);
+            allocator.destroy(cell);
+        }
         self.* = undefined;
     }
 
     pub fn consumer(self: *const Detector) stored.Consumer {
         return .{ .generation = self.generation, .context = self, .evaluate = consume };
+    }
+    pub fn legacyConsumer(self: *const Detector) stored.Consumer {
+        return .{ .generation = self.legacy_generation, .context = self, .evaluate = consume };
     }
     fn consume(decoded: []const u8, admitted: policy.Result, context: ?*const anyopaque) !stored.Outcome {
         const self: *const Detector = @ptrCast(@alignCast(context.?));
@@ -131,7 +161,7 @@ pub const Detector = struct {
             const parsed = pattern.match(body) orelse continue;
             const matched = Match{ .subject = parsed.ip, .filter = self.entry.name, .pattern = pattern.name, .pattern_index = @intCast(index) };
             if (parsed.ip.isUnenforceable()) return .{ .unenforceable = matched };
-            for (self.ignores) |cidr| if (cidr.contains(parsed.ip)) return .{ .ignored = matched };
+            if (self.ignores.*.check(parsed.ip) != null) return .{ .ignored = matched };
             return .{ .candidate = .{ .match = matched, .time = evidence } };
         }
         return .no_match;

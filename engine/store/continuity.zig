@@ -38,7 +38,7 @@ fn readEvent(row: *Stmt, jail: []const u8, path: []const u8, source_id: []const 
         .reason = std.meta.intToEnum(files.LossReason, try row.signed(2)) catch return error.DatabaseFailure,
         .inode = try unsigned(try row.signed(3)),
         .committed_offset = try unsigned(try row.signed(4)),
-        .observed_size = try unsigned(try row.signed(5)),
+        .observed_size = if (try row.optionalSigned(5)) |size| try unsigned(size) else null,
     };
 }
 
@@ -54,7 +54,7 @@ pub fn Methods(comptime Store: type) type {
             }
             const inode = try signedFrom(event.inode);
             const committed_offset = try signedFrom(event.committed_offset);
-            const observed_size = try signedFrom(event.observed_size);
+            const observed_size: ?i64 = if (event.observed_size) |size| try signedFrom(size) else null;
             try self.beginWrite();
             errdefer self.rollback();
             if (self.schema_version < store.latest_schema) return error.UnsupportedSchema;
@@ -68,7 +68,7 @@ pub fn Methods(comptime Store: type) type {
                 try insert.int(5, @intFromEnum(event.reason));
                 try insert.int(6, inode);
                 try insert.int(7, committed_offset);
-                try insert.int(8, observed_size);
+                if (observed_size) |size| try insert.int(8, size) else try self.check(self.api.bind_null(insert.ptr, 8));
                 try insert.done();
             }
             const sequence = try unsigned(try self.integer("SELECT last_insert_rowid();"));

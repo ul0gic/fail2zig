@@ -32,6 +32,7 @@ pub fn classify(cause: anyerror) Domain {
         error.JournalChildFailed,
         error.SourceChanged,
         => .transient_source,
+        error.RotatedIncarnationLost => .source_intervention,
         else => .source_intervention,
     };
 }

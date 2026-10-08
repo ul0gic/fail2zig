@@ -5,9 +5,14 @@ const std = @import("std");
 const config = @import("../config/native.zig");
 const retry_config = @import("../config/native_retry_policy.zig");
 const retry = @import("../core/native_retry.zig");
+const ignore_set = @import("../core/native_ignore_set.zig");
+const shared = @import("shared");
 
 pub const max_reasons = 32;
-pub const max_reason_bytes = 160;
+pub const max_reason_bytes = 240;
+pub const max_jails = 64;
+
+pub const RuntimeCount = struct { jail: []const u8, runtime_only: u16 };
 
 pub const Kind = enum { noop, live, restart_required, rejected };
 
@@ -29,6 +34,8 @@ pub const Classification = struct {
     log_level: ?config.LogLevel = null,
     policies: [64]PolicyChange = undefined,
     policy_count: u8 = 0,
+    ignore_jails: [max_jails][]const u8 = undefined,
+    ignore_count: u8 = 0,
     reasons: [max_reasons]Reason = undefined,
     reason_count: u8 = 0,
 
@@ -56,6 +63,9 @@ pub const Classification = struct {
     }
     pub fn reasonSlice(self: *const Classification) []const Reason {
         return self.reasons[0..self.reason_count];
+    }
+    pub fn ignoreSlice(self: *const Classification) []const []const u8 {
+        return self.ignore_jails[0..self.ignore_count];
     }
     pub fn policySlice(self: *const Classification) []const PolicyChange {
         return self.policies[0..self.policy_count];
@@ -97,7 +107,33 @@ fn findJail(cfg: *const config.Config, name: []const u8) ?*const config.JailConf
     return null;
 }
 
+fn distinctConfigured(literals: []const []const u8) usize {
+    var seen: [ignore_set.max_entries_per_part]shared.types.IgnoreEntry = undefined;
+    var count: usize = 0;
+    for (literals) |literal| {
+        const entry = shared.types.IgnoreEntry.parse(literal) catch continue;
+        var duplicate = false;
+        for (seen[0..count]) |prior| {
+            if (prior.order(entry) == .eq) duplicate = true;
+        }
+        if (duplicate) continue;
+        if (count == seen.len) return literals.len;
+        seen[count] = entry;
+        count += 1;
+    }
+    return count;
+}
+
+fn runtimeOnly(counts: []const RuntimeCount, jail: []const u8) u16 {
+    for (counts) |count| if (std.mem.eql(u8, count.jail, jail)) return count.runtime_only;
+    return 0;
+}
+
 pub fn classify(current: *const config.Config, proposed: *const config.Config, per_jail_subjects: u32) Classification {
+    return classifyWithRuntime(current, proposed, per_jail_subjects, &.{});
+}
+
+pub fn classifyWithRuntime(current: *const config.Config, proposed: *const config.Config, per_jail_subjects: u32, runtime_counts: []const RuntimeCount) Classification {
     var out: Classification = .{};
     globalsEqual(&current.global, &proposed.global, &out);
     if (current.jails.len != proposed.jails.len) out.restart("jails: set size {d} -> {d}", .{ current.jails.len, proposed.jails.len });
@@ -107,9 +143,28 @@ pub fn classify(current: *const config.Config, proposed: *const config.Config, p
             out.restart("jails.{s}: removed", .{jail.name});
             continue;
         };
-        inline for (.{ "enabled", "logpath", "source", "filter", "timestamp", "timezone_offset_minutes", "timezone", "timezone_ambiguity", "journal_executables", "journal_executables_explicit", "rule_files", "ignore_file", "ignoreip", "compatibility_pending" }) |name| {
+        inline for (.{ "enabled", "logpath", "source", "filter", "timestamp", "timezone_offset_minutes", "timezone", "timezone_ambiguity", "journal_executables", "journal_executables_explicit", "rule_files", "ignore_file", "on_truncation", "compatibility_pending" }) |name| {
             const T = @TypeOf(@field(jail, name));
             if (!valuesEqual(T, @field(jail, name), @field(next, name))) out.restart("jails.{s}.{s}", .{ jail.name, name });
+        }
+        if (jail.rule_files.len != 0) {
+            if (!valuesEqual(@TypeOf(jail.ignoreip), jail.ignoreip, next.ignoreip)) out.restart("jails.{s}.ignoreip", .{jail.name});
+        } else {
+            const before_literals = jail.ignoreip orelse current.defaults.ignoreip;
+            const after_literals = next.ignoreip orelse proposed.defaults.ignoreip;
+            if (!sliceEqual([]const u8, before_literals, after_literals)) {
+                const configured = distinctConfigured(after_literals);
+                const runtime = runtimeOnly(runtime_counts, jail.name);
+                if (configured + runtime > ignore_set.distinct_bound) {
+                    out.reject("jails.{s}.ignoreip: {d} configured and {d} runtime-only entries exceed the {d}-entry limit; remove runtime entries with fail2zig ignore remove or shorten ignoreip", .{ jail.name, configured, runtime, ignore_set.distinct_bound });
+                } else if (out.ignore_count == out.ignore_jails.len) {
+                    out.reject("jails: too many ignoreip changes", .{});
+                } else {
+                    out.ignore_jails[out.ignore_count] = jail.name;
+                    out.ignore_count += 1;
+                    out.live();
+                }
+            }
         }
         const before = config.resolveJailFromConfig(jail, current.defaults);
         const after = config.resolveJailFromConfig(next, proposed.defaults);
@@ -138,7 +193,10 @@ pub fn classify(current: *const config.Config, proposed: *const config.Config, p
         out.policy_count += 1;
         out.live();
     }
-    if (out.kind == .restart_required or out.kind == .rejected) out.policy_count = 0;
+    if (out.kind == .restart_required or out.kind == .rejected) {
+        out.policy_count = 0;
+        out.ignore_count = 0;
+    }
     return out;
 }
 
