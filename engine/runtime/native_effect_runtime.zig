@@ -317,6 +317,10 @@ pub const Manager = struct {
         const index = self.findLive(key) orelse return false;
         return self.live[index].status == .applied and self.live[index].desired.live(now_us) and (self.confirmed[index] or self.status.ready);
     }
+    pub fn confirmedKey(self: *const Manager, key: [32]u8, now_us: i64) bool {
+        const index = self.findLive(key) orelse return false;
+        return self.live[index].status == .applied and self.live[index].desired.live(now_us) and (self.confirmed[index] or self.status.ready);
+    }
     fn recordFirewallFailure(self: *Manager, context: firewall.FailureContext) void {
         self.status.cause = context.cause;
         self.status.uncertain = true;

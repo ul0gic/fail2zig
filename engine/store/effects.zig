@@ -353,6 +353,7 @@ pub fn Methods(comptime Store: type) type {
         }
 
         pub const OperatorOwner = struct {
+            key: [32]u8,
             jail: detection.Name,
             scope: effects.Scope,
             lease: effects.Lease,
@@ -389,6 +390,7 @@ pub fn Methods(comptime Store: type) type {
                 const stored_ordinal = try row.optionalSigned(7);
                 if (stored_ordinal) |ordinal| if (ordinal <= 0) return error.InvalidEffect;
                 output[count] = .{
+                    .key = key,
                     .jail = detection.Name.init(try row.boundedBytes(2, 64)) catch return error.InvalidEffect,
                     .scope = scope,
                     .lease = lease,

@@ -2448,11 +2448,7 @@ pub const Coordinator = struct {
     fn ownerConfirmed(self: *const Coordinator, owner: durable.Store.OperatorOwner, now: i64) bool {
         const manager = self.effects orelse return false;
         if (manager.cached_epoch == null or manager.cached_epoch.? != self.store.effect_publication_epoch) return false;
-        for (manager.live[0..manager.count], 0..) |entry, index| {
-            if (!std.meta.eql(entry.scope, owner.scope)) continue;
-            return entry.status == .applied and entry.desired.live(now) and owner.lease.live(now) and (manager.confirmed[index] or manager.status.ready);
-        }
-        return false;
+        return owner.lease.live(now) and manager.confirmedKey(owner.key, now);
     }
     fn publishOwners(self: *Coordinator) !void {
         const manager = self.effects orelse return;
