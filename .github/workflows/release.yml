@@ -138,7 +138,7 @@ jobs:
           test ! -L zig-out/bin/fail2zig
           mkdir package
           cp zig-out/bin/fail2zig "package/fail2zig-$RELEASE_TAG-$RELEASE_TARGET"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: release-binary-${{ matrix.target }}
           path: package/*
@@ -186,7 +186,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           bash control/.github/scripts/release.sh tag
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: verified-release-package
           path: package/*
