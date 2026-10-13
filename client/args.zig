@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const shared = @import("shared");
+const format = @import("format.zig");
 
 pub const default_socket_path: []const u8 = "/run/fail2zig/fail2zig.sock";
 pub const default_timeout_ms: u64 = 5000;
@@ -50,6 +51,7 @@ pub const Command = union(enum) {
     firewall: FirewallArgs,
     jail_admin: JailAdminArgs,
     history_reset: HistoryResetArgs,
+    ignore: IgnoreArgs,
 
     pub const ScopeKind = enum { host, net };
     pub const ScopeArgs = struct {
@@ -80,6 +82,14 @@ pub const Command = union(enum) {
         address: []const u8,
         jail: ?[]const u8 = null,
         all: bool = false,
+    };
+
+    pub const IgnoreAction = enum { add, remove, list };
+    pub const IgnoreArgs = struct {
+        action: IgnoreAction,
+        address: ?[]const u8 = null,
+        jail: ?[]const u8 = null,
+        unban: bool = false,
     };
 
     pub const ListArgs = struct {
@@ -247,6 +257,9 @@ pub fn parse(argv: []const []const u8, diag: *ParseDiag) Error!Parsed {
     if (std.mem.eql(u8, cmd_str, "unban")) {
         return parseUnban(rest, &globals, diag);
     }
+    if (std.mem.eql(u8, cmd_str, "ignore")) {
+        return parseIgnore(rest, &globals, diag);
+    }
     if (std.mem.eql(u8, cmd_str, "list")) {
         return parseList(rest, &globals, diag);
     }
@@ -393,6 +406,80 @@ fn parseUnban(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Err
         return error.MissingArgument;
     }
     return Parsed{ .globals = globals.*, .command = .{ .unban = args } };
+}
+
+fn parseIgnore(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Error!Parsed {
+    var echo: [format.diagnostic_max_bytes]u8 = undefined;
+    var action: ?Command.IgnoreAction = null;
+    var k: usize = 0;
+    while (k < rest.len) : (k += 1) {
+        const a = rest[k];
+        if (try takeTrailingGlobal(a, rest, &k, globals, diag)) continue;
+        if (std.mem.startsWith(u8, a, "--")) break;
+        action = std.meta.stringToEnum(Command.IgnoreAction, a) orelse {
+            diag.set("unknown ignore subcommand '{s}' (expected: add, remove, list)", .{format.escapeArgument(&echo, a)});
+            return error.InvalidValue;
+        };
+        k += 1;
+        break;
+    }
+    const chosen = action orelse {
+        diag.set("command 'ignore' requires a subcommand: add, remove or list", .{});
+        return error.MissingArgument;
+    };
+    const name = @tagName(chosen);
+
+    var out = Command.IgnoreArgs{ .action = chosen };
+    while (k < rest.len) : (k += 1) {
+        const a = rest[k];
+        if (try takeTrailingGlobal(a, rest, &k, globals, diag)) continue;
+        if (std.mem.eql(u8, a, "--jail")) {
+            k += 1;
+            if (k >= rest.len) {
+                diag.set("flag --jail requires a value (jail name)", .{});
+                return error.MissingValue;
+            }
+            out.jail = rest[k];
+            continue;
+        }
+        if (chosen == .add and std.mem.eql(u8, a, "--unban")) {
+            out.unban = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--")) {
+            diag.set("unknown flag for 'ignore {s}': {s}", .{ name, format.escapeArgument(&echo, a) });
+            return error.UnknownFlag;
+        }
+        if (chosen == .list) {
+            diag.set("command 'ignore list' takes no arguments, got '{s}'", .{format.escapeArgument(&echo, a)});
+            return error.TooManyArguments;
+        }
+        if (out.address == null) {
+            out.address = a;
+            continue;
+        }
+        diag.set("command 'ignore {s}' takes one address argument, got extra '{s}'", .{ name, format.escapeArgument(&echo, a) });
+        return error.TooManyArguments;
+    }
+    if (chosen == .list) return Parsed{ .globals = globals.*, .command = .{ .ignore = out } };
+
+    const address = out.address orelse {
+        const usage = if (chosen == .add) "ignore add <address|cidr> --jail <name> [--unban]" else "ignore remove <address|cidr> --jail <name>";
+        diag.set("command 'ignore {s}' requires an address (usage: {s})", .{ name, usage });
+        return error.MissingArgument;
+    };
+    if (out.jail == null) {
+        diag.set("command 'ignore {s}' requires --jail <name>", .{name});
+        return error.MissingArgument;
+    }
+    _ = shared.types.IgnoreEntry.parse(address) catch |err| {
+        switch (err) {
+            error.InvalidAddress => diag.set("invalid address '{s}' for 'ignore {s}': expected an IPv4 or IPv6 address or CIDR such as 192.0.2.10 or 2001:db8::/32", .{ format.escapeArgument(&echo, address), name }),
+            error.InvalidPrefix => diag.set("invalid prefix in '{s}': IPv4 prefixes are 0-32, IPv6 prefixes are 0-128", .{format.escapeArgument(&echo, address)}),
+        }
+        return error.InvalidValue;
+    };
+    return Parsed{ .globals = globals.*, .command = .{ .ignore = out } };
 }
 
 fn parseScope(rest: []const []const u8, idx: *usize, diag: *ParseDiag) Error!Command.ScopeArgs {
@@ -721,6 +808,7 @@ pub const known_commands = [_][]const u8{
     "history",
     "firewall",
     "jail",
+    "ignore",
     "completions",
     "help",
 };
@@ -781,6 +869,7 @@ pub const help_top =
     \\    stats               Show the retained enforcement statistics snapshot
     \\    ban <ip>            Manually ban an IP
     \\    unban <ip>          Manually unban an IP
+    \\    ignore <sub>        Manage per-jail exclusions: add, remove, list
     \\    list                List active bans (--jail filter; --details for counts)
     \\    jails               List configured jails (--details for thresholds)
     \\    reload              Apply supported changes live; restart-only settings require restart
@@ -807,6 +896,8 @@ pub const help_top =
     \\    fail2zig stats
     \\    fail2zig ban 192.0.2.10 --jail sshd --duration 3600
     \\    fail2zig ban 192.0.2.10 --jail sshd --scope net 192.0.2.0/24
+    \\    fail2zig ignore add 198.51.100.20 --jail sshd
+    \\    fail2zig ignore list --jail sshd
     \\    fail2zig jail pause sshd
     \\    fail2zig list --jail sshd --output json
     \\    fail2zig history --jail sshd --limit 50
@@ -978,6 +1069,37 @@ pub const help_repair_source =
     \\
 ;
 
+pub const help_ignore =
+    \\fail2zig ignore — manage per-jail exclusions at runtime
+    \\
+    \\USAGE:
+    \\    fail2zig ignore add <address|cidr> --jail <name> [--unban]
+    \\    fail2zig ignore remove <address|cidr> --jail <name>
+    \\    fail2zig ignore list [--jail <name>]
+    \\
+    \\ARGS:
+    \\    <address|cidr>      IPv4 or IPv6 address or network, as accepted by ignoreip
+    \\                        (e.g. 198.51.100.20, 203.0.113.0/24, 2001:db8::/32)
+    \\
+    \\FLAGS:
+    \\    --jail <name>       Jail whose list is changed (required for add and remove);
+    \\                        for list, show one jail instead of every enabled jail
+    \\    --unban             add only: also lift that jail's bans inside the entry
+    \\
+    \\Entries added here are stored in the state database and survive restart and
+    \\reload. They are merged with the jail's configured ignoreip; SOURCE shows
+    \\config, runtime or config+runtime. Entries set in the configuration file are
+    \\changed there, not here.
+    \\
+    \\An ignore entry stops future bans from detection. It does not lift a ban that
+    \\already exists: add tells you when the address is banned, until when, and how
+    \\to lift it. Use --unban to lift it in the same command.
+    \\
+    \\Each jail holds at most 128 entries, configuration and runtime combined.
+    \\Addresses are redacted for callers who are not administrators.
+    \\
+;
+
 pub const help_completions =
     \\fail2zig completions — generate shell completion script
     \\
@@ -1006,6 +1128,7 @@ pub fn helpFor(topic: ?[]const u8) []const u8 {
     if (std.mem.eql(u8, t, "history")) return help_history;
     if (std.mem.eql(u8, t, "firewall")) return help_firewall;
     if (std.mem.eql(u8, t, "jail")) return help_jail;
+    if (std.mem.eql(u8, t, "ignore")) return help_ignore;
     if (std.mem.eql(u8, t, "repair-source")) return help_repair_source;
     return help_top;
 }

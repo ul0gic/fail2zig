@@ -138,9 +138,11 @@ Command timeout. Default 5000. Expiry exits with class 3.
 Members of the
 .B fail2zig
 group may run the read-only commands through the 0660 socket. Mutations
-.RB ( ban ", " unban ", " reload ", " "history reset" ", " jail )
+.RB ( ban ", " unban ", " "ignore add" ", " "ignore remove" ", " reload ", " "history reset" ", " jail )
 require uid 0 or the daemon uid, verified with
 .BR SO_PEERCRED .
+The read-only commands include
+.BR "ignore list" .
 .TP
 .B status
 Daemon summary: version, protection state
@@ -364,6 +366,144 @@ A log-only jail rejects manual bans.
 .BI unban " ip --jail name [--scope host|net cidr]"
 Release a manual or automatic ban in one jail.
 .TP
+.BI "ignore add" " address|cidr --jail name [--unban]"
+Record a runtime exclusion for one jail. The address is an IPv4 or IPv6 host, or
+.IR address / prefix
+(IPv4 prefix 0\-32, IPv6 prefix 0\-128) of at most 64 bytes, and is stored in canonical form
+(host bits below the prefix cleared, RFC 5952 for IPv6). Hostnames are not accepted.
+.B \-\-jail
+is required and the jail must be configured, enabled or not. A jail with custom rules
+.RB ( rule_files )
+is refused with exit status 1 and the reason
+.BR "jail '<name>' uses rule_files; manage its exclusions through ignore_file" ;
+its exclusions stay in
+.B ignore_file
+plus
+.BR "fail2zig reload" .
+Flags may come before or after the
+address. Entries are stored in the state database, survive restart and reload, and are
+merged with the jail's configured
+.BR ignoreip .
+From the next event the daemon processes after the commit, a matching event creates no
+candidate and counts as an ignored detection. An event admitted before the commit may still
+finish its ban.
+.RS
+.PP
+An ignore entry does not lift a ban that already exists. When the jail has a ban inside the
+entry, the output states it, the deadline (or that it is permanent), that the ban stays, and
+the exact command that lifts it. A network ban wider than the entry is reported with its
+.B unban \-\-scope net
+command.
+.B \-\-unban
+also lifts that jail's bans inside the entry through the same path as
+.BR unban ,
+one result line per lifted ban, confirmed, not yet confirmed in the kernel, unknown or
+refused. It never lifts a wider network ban, never touches another jail, and lifts at most 256
+bans; with more inside the entry the whole command is refused and no entry is recorded.
+Adding an entry that already exists as a runtime entry changes nothing, and
+.B \-\-unban
+still lifts the bans. An entry already in the configuration is recorded as well and its source
+becomes
+.BR config+runtime .
+Output also names any wider configured entry that already covers the address, a prefix 0
+entry that covers every address of its family, and a disabled or paused jail.
+.PP
+Each jail holds at most 128 entries, configuration and runtime combined. An add that would
+exceed it is refused. A reload that would make configured plus runtime entries exceed 128 is
+rejected. A daemon start never refuses for that reason: every entry applies and further adds are
+refused until the count is 128 or less.
+.PP
+Table output is text on standard output. Plain output is tab-separated key and value lines (\fBkind\fR, \fBoutcome\fR, \fBenforced\fR, \fBgeneration\fR, \fBmutation_revision\fR,
+\fBjail\fR, \fBaddress\fR, \fBentry\fR, \fBsource\fR, \fBcovered_by\fR, \fBbans_total\fR, one
+\fBban\fR line per related ban and \fBreason\fR lines). JSON output is the daemon outcome object
+unchanged, with the additive keys
+.BR entry ,
+.BR source ,
+.BR covered_by ,
+.BR unban_requested ,
+.B bans_total
+and
+.BR bans .
+In JSON mode standard output holds one JSON document, and daemon outcomes, refusals included, are printed there.
+.PP
+Exit status is the worst of the entry step and every lift, ranked 5 over 4 over 1 over 0:
+0 when the entry is added or present and no lift was requested or every lift is confirmed;
+4 when a lift is applied but its kernel removal is not yet confirmed;
+5 when a lift or the durable commit could not be established;
+1 when the entry is refused (unknown jail, 128 bound, more than 256 bans with
+.BR \-\-unban )
+or a lift is refused; 2 for a usage error such as a missing
+.B \-\-jail
+or an invalid address or prefix, with nothing sent; 3 when the socket is unavailable.
+.RE
+.TP
+.BI "ignore remove" " address|cidr --jail name"
+Remove the jail's runtime entry with that canonical form. It never changes configuration
+entries and never touches bans. From the next event after the commit the address is detected
+again, with counting from zero, unless the configuration still covers it; in that case the
+output says the address remains ignored and names the covering configured entry
+(\fBstill_ignored_by\fR in plain and JSON output). An entry set only in the configuration is
+refused with the file to edit and
+.BR "fail2zig reload" ;
+an address with no runtime entry is refused. A jail that is not configured is accepted when
+it has stored runtime entries, so they can be cleaned up. A jail with custom rules
+.RB ( rule_files )
+is refused as for
+.BR "ignore add" . Exit status: 0 when removed; 1 for a
+configuration-only entry, an absent entry, a custom-rules jail or an unknown jail; 5 when the commit could not be
+established; 2 and 3 as for
+.BR "ignore add" .
+.TP
+.BI "ignore list" " [--jail name]"
+Read-only. One row per distinct jail and entry of the effective list, ordered by jail name,
+then IPv4 before IPv6, numeric address, prefix length. Columns are
+.BR JAIL ,
+.B ADDRESS
+and
+.BR SOURCE ,
+where the source is
+.BR config ,
+.B runtime
+or
+.BR config+runtime .
+Without
+.B \-\-jail
+every enabled jail is listed; with it, that jail whether enabled or not. A jail without
+entries prints no rows and exits 0; an unknown jail exits 1. Table output ends with a
+.B Total:
+line and notes for a custom-rule jail's
+.B ignore_file
+(its configured literals are listed with source
+.BR config ;
+the file's entries are not), for runtime entries stored for jails that are not
+configured, and for a jail above the 128 limit after a configuration change. Plain output is
+one tab-separated line per row without header or footer. JSON output carries
+.BR limit ,
+.BR redacted ,
+per-jail
+.B entries
+and an
+.B unconfigured
+array. Members of the
+.B fail2zig
+group may run it; for them every address and
+.B ignore_file
+is printed as
+.BR <redacted> ,
+as
+.B config
+does for address lists.
+.PP
+Both mutating subcommands return exit status 1 with
+.B mutation requires root or daemon uid (code 403)
+on standard error for a group member, and
+.B daemon does not support ignore commands
+(code 400) when the daemon predates them; upgrade and restart it. A mutation that
+raced a reload or other change is rejected with the daemon's reason and should be retried.
+When storage is not accepting changes the command is rejected until
+.B status
+shows storage healthy.
+.TP
 .B reload
 Propose the current configuration file as a new generation. Outcomes:
 .BR noop ", " applied ", " rejected " or " restart_required
@@ -371,10 +511,17 @@ Propose the current configuration file as a new generation. Outcomes:
 .BR reasons ).
 Live keys: per-jail
 .BR maxretry ", " bantime ", " bantime_kind ", " bantime_increment ,
+literal
+.B ignoreip
+entries (per jail and in
+.BR [defaults] ),
 global
 .BR log_level ,
 and the contents of a custom jail's
 .BR ignore_file .
+An
+.B ignoreip
+edit applies from the next event after the reload and never alters an existing ban.
 Live reload applies supported changes; restart-only settings require a daemon restart.
 .TP
 .BI history " [--jail name] [--limit 1..256] [--cursor token]"
@@ -680,6 +827,8 @@ fail2zig stats --output plain
 fail2zig list --sort --jail sshd
 fail2zig list --jail sshd --output json
 sudo fail2zig ban 192.0.2.10 --jail sshd --duration 3600
+sudo fail2zig ignore add 198.51.100.20 --jail sshd
+fail2zig ignore list --jail sshd
 sudo fail2zig reload
 fail2zig rule-test --file /var/log/auth.log --service sshd --tz-offset 0
 fail2zig completions bash > /etc/bash_completion.d/fail2zig

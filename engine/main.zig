@@ -71,7 +71,7 @@ pub const CliOptions = struct {
 
 pub const EntryMode = enum { daemon, operator, migrate, rule_test, repair_source };
 
-const operator_words = [_][]const u8{ "status", "jails", "list", "ban", "unban", "reload", "version", "help", "completions", "config", "history", "jail", "firewall", "stats" };
+const operator_words = [_][]const u8{ "status", "jails", "list", "ban", "unban", "reload", "version", "help", "completions", "config", "history", "jail", "firewall", "stats", "ignore" };
 const operator_globals = [_][]const u8{ "--socket", "--output", "--no-color", "--timeout" };
 
 pub fn classifyEntry(args: []const []const u8) EntryMode {

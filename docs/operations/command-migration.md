@@ -101,7 +101,10 @@ is required and must not substitute fabricated zero values.
 | `flushlogs` | `systemctl kill -s USR1 fail2zig` after rotating `global.log_target` | | |
 | `add <jail> <backend>`, `set <jail> addaction …`, `set <jail> action …` | not supported; jails are declared in the configuration file | | |
 | `get <jail> failregex`, `set <jail> addfailregex` | not supported; builtin services are compiled in, custom rules use the bounded native JSON grammar in a `rule_files` entry | | |
-| `set <jail> addignoreip` | not supported at runtime; edit `ignoreip` and run `fail2zig reload` (literal lists are live-reload), or use an `ignore_file` on a custom jail and reload | | |
+| `set <jail> addignoreip <ip>` | `fail2zig ignore add <ip> --jail <jail> [--unban]`; the entry survives restart and reload, unlike fail2ban's. An existing ban stays until its deadline unless `--unban` lifts it | 0 / 1 / 2 / 3 / 4 / 5 | `kind` `ignore_add`, `outcome`, `entry` `added\|present\|not_recorded`, `source`, `covered_by[]`, `unban_requested`, `bans_total`, `bans[]`, `reasons[]` |
+| `set <jail> delignoreip <ip>` | `fail2zig ignore remove <ip> --jail <jail>`; refuses an entry set in the configuration, which is edited in `ignoreip` and applied with `fail2zig reload` | 0 / 1 / 2 / 3 / 5 | `kind` `ignore_remove`, `outcome`, `entry` `removed\|config_only\|absent\|not_removed`, `source`, `still_ignored_by[]`, `reasons[]` |
+| `get <jail> ignoreip` | `fail2zig ignore list [--jail <jail>]`; fail2zig shows the SOURCE (`config`, `runtime` or `config+runtime`) of each entry | 0 / 1 / 2 / 3 | `schema_version` 1, `generation`, `redacted`, `limit`, `jails[]` of `jail`, `enabled`, `count`, `ignore_file`, `entries[]` of `address` and `source`, `unconfigured[]`; addresses are redacted for non-administrators |
+| `set <jail> addignoreip` / `delignoreip` on a custom-rule jail (`rule_files`) | not supported by `ignore add` or `ignore remove`, which refuse it naming `ignore_file`; edit the jail's `ignore_file` and run `fail2zig reload` | 1 | |
 | `set dbpurgeage`, `set dbmaxmatches` | not supported; retention is fixed by the state schema | | |
 
 ### Live reload versus restart
