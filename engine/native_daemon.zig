@@ -1768,7 +1768,9 @@ pub const Coordinator = struct {
             if (refreshed != 0) return ReloadOutcome.single(.partial, "allowlists refreshed but the policy generation was not committed: {s}", .{@errorName(err)});
             return err;
         };
+        const committed_revision = self.store.adminRevision();
         self.mutex.lock();
+        if (committed_revision) |revision| self.published_revision = revision else |_| {}
         for (transitions[0..count]) |change| if (self.findJail(change.jail)) |jail| {
             jail.policy = change.next;
             jail.rekeyed = !std.mem.eql(u8, &change.generation, &change.next_generation);
@@ -1786,6 +1788,16 @@ pub const Coordinator = struct {
             self.replaceIgnoreList(jail, list);
         };
         if (count != 0) self.gate.requestRebuild() catch {};
+        if (committed_revision) |_| {} else |err| {
+            outcome.kind = .partial;
+            if (outcome.reason_count < reload_mod.max_reasons) {
+                var reason: reload_mod.Reason = .{};
+                const written = std.fmt.bufPrint(&reason.bytes, "generation applied but the mutation revision was not read back: {s}; restart fail2zig before changing bans", .{@errorName(err)}) catch reason.bytes[0..0];
+                reason.len = @intCast(written.len);
+                outcome.reasons[outcome.reason_count] = reason;
+                outcome.reason_count += 1;
+            }
+        }
         return outcome;
     }
     fn hasAllowlistFiles(self: *Coordinator) bool {

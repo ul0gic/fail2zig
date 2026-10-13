@@ -69,8 +69,26 @@ Integer (1–1024). Maximum simultaneous WebSocket clients. Default: 16.
 String (absolute path). Durable SQLite database containing source positions,
 records, decisions, owners, effects and history. It is created or opened at
 startup with mode 0600. Corrupt or unsupported state is refused rather than
-silently reset. Default:
+silently reset. The file cannot grow past 256 MiB (65,536 pages of 4 KiB); a
+state file already past that size is refused at startup. When a commit fails
+because the file is full, the daemon pauses ingestion, retries after a delay that
+doubles up to 30 seconds and returns to healthy once recovery completes. Rules
+already in the kernel stay in place meanwhile, and
+.B fail2zig status
+shows the storage phase. The daemon runs no VACUUM, so the file does not shrink;
+rows removed by retention (see
+.BR history_retention ,
+in seconds, default 86400) free pages for reuse inside it. Watch the file size.
+Default:
 .IR /var/lib/fail2zig/state.bin .
+.TP
+.B history_retention
+Integer (seconds, 0 or more). How long application history is kept. Older
+history is removed while storage is healthy. Default: 86400.
+.TP
+.B history_max_matches
+Integer (0\(en1024). How many matches are kept for each subject in application
+history. Default: 10.
 .TP
 .B memory_ceiling_mb
 Integer. Total configured memory ceiling used to admit bounded native source,
@@ -492,12 +510,19 @@ upstream 2.0.7 target.
 .PP
 Run PortSentry with
 .B \-\-connect
-and retain one TCP_PORTS list containing ports verified unused on the protected
-host. Set HISTORY_FILE=/var/log/portsentry.log, RESOLVE_HOST=0, SCAN_TRIGGER=0,
-BLOCK_TCP=0 and BLOCK_UDP=0. Remove or comment every UDP_PORTS directive for
-this TCP-only recipe; do not set UDP_PORTS="", because PortSentry rejects an
-empty list. BLOCK_UDP=0 disables PortSentry's UDP response but does not stop
-UDP observations when UDP ports remain configured. These settings leave
+for TCP connect detection, or with
+.B \-\-stealth \-m pcap \-i
+.I interface
+for TCP SYN, FIN, NULL and XMAS scans and UDP.
+.B \-\-stealth
+runs PortSentry as root with pcap on the interface that owns the protected
+address. Retain one TCP_PORTS list containing ports verified unused on the
+protected host, and one UDP_PORTS list of verified unused ports when UDP
+detection is wanted. Set HISTORY_FILE=/var/log/portsentry.log, RESOLVE_HOST=0,
+SCAN_TRIGGER=0, BLOCK_TCP=0 and BLOCK_UDP=0. To observe TCP only, remove or
+comment every UDP_PORTS directive; do not set UDP_PORTS="", because PortSentry
+rejects an empty list. BLOCK_UDP=0 disables PortSentry's UDP response but does
+not stop UDP observations when UDP ports remain configured. These settings leave
 fail2zig as the only ban owner.
 .PP
 .nf
@@ -526,9 +551,11 @@ PortSentry appended after the committed offset and that the emptying removed wer
 never read.
 .PP
 Accepted events protect the source host across all protocols and ports. The
-live qualification covered IPv4 and IPv6 TCP-connect events on Debian 13
-through ban and expiry. UDP and stealth-mode deployment are unqualified,
-and stdout, syslog and journal envelopes are outside this integration.
+live qualification on Debian 13 covered IPv4 and IPv6 TCP-connect events
+and, in stealth mode, TCP SYN, FIN, NULL and XMAS scans and UDP, each through
+ban, blocking while banned and expiry. Legacy PortSentry 1.2 and other 2.x
+versions are unqualified, and stdout, syslog and journal envelopes are outside
+this integration.
 .PP
 Inspect a history file without starting the daemon:
 .PP

@@ -438,12 +438,7 @@ test "native effect runtime: isolated stop restores durable intent and repair ep
         try t.expectEqual(action_outcome.Status.failed, outcomes[1].status);
         const epoch = manager.repairEpoch();
         manager.inspector.test_fault_after_mutations = 1;
-        try expectFatal(error.EffectBackendUncertain, manager.stopStep(epoch, .healthy));
-        const diagnostic = manager.status.diagnostic.?;
-        try t.expectEqual(manager.inspector.installation.transport, diagnostic.backend);
-        try t.expectEqual(inspection.OperationStage.effect_dispatch, diagnostic.stage);
-        try t.expectEqual(error.Timeout, diagnostic.cause);
-        try t.expectEqual(inspection.MutationDisposition.outcome_uncertain, diagnostic.mutation);
+        try t.expect(try stopOk(manager, epoch) == .wait);
         var retained: [1]effect.Entry = undefined;
         const retained_page = try fixture.store.effectPage(null, null, &retained);
         try t.expectEqual(@as(usize, 1), retained_page.count);

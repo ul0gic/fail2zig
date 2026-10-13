@@ -156,6 +156,7 @@ fn printHelp(w: anytype) !void {
         \\COMMANDS:
         \\  status | jails | list | ban | unban | reload | version | help | completions
         \\  config | history | jail | firewall show | stats
+        \\  ignore add|remove|list ...                 manage per-jail exclusions
         \\  migrate inspect|snapshot|plan|validate|cutover|status|rollback ...
         \\  rule-test --file|--record|--journal ...   offline rule evaluation (no daemon needed)
         \\  repair-source --jail J --source PATH --token T --acknowledge-truncation   acknowledge a truncated file source (daemon stopped)

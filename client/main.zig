@@ -436,6 +436,10 @@ fn doIgnoreList(allocator: std.mem.Allocator, globals: args.Globals, stdout: any
             return .client_error;
         },
         .err => |e| {
+            if (e.code == 404 and std.mem.eql(u8, e.message, "unknown jail")) if (jail) |name| {
+                format.formatUnknownJail(stderr, name, globals.output, color) catch {};
+                return .daemon_error;
+            };
             const message = if (e.code == 400 and std.mem.eql(u8, e.message, "unknown query kind")) ignore_unsupported else e.message;
             format.formatError(stderr, e.code, message, globals.output, color) catch {};
             return .daemon_error;

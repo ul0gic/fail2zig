@@ -3679,6 +3679,21 @@ pub fn formatError(
     }
 }
 
+pub fn formatUnknownJail(
+    writer: anytype,
+    jail: []const u8,
+    fmt: OutputFormat,
+    color: Color,
+) !void {
+    var name_buffer: [diagnostic_max_bytes]u8 = undefined;
+    var message_buffer: [diagnostic_max_bytes + 32]u8 = undefined;
+    const message = try std.fmt.bufPrint(&message_buffer, "jail '{s}' is not configured", .{renderDiagnostic(&name_buffer, jail)});
+    if (fmt != .json) return formatError(writer, 404, message, fmt, color);
+    try writer.writeAll("{\"error\":{\"code\":404,\"message\":");
+    try std.json.encodeJsonString(message, .{}, writer);
+    try writer.writeAll("}}\n");
+}
+
 // Expose only the formatter internals exercised by the out-of-module component tests.
 pub const TestAccess = if (@import("builtin").is_test) struct {
     pub const statusForWidth = formatStatusForWidth;
