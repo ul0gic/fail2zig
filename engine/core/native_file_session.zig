@@ -149,8 +149,6 @@ pub const Session = struct {
     repair_count: usize = 0,
     pending_proofs: []?durable.Store.PendingSource,
     retained: std.ArrayList(Retained),
-    /// Capacity refusal holding the next record; the receipt is kept and ingestion
-    /// resumes when cleanup frees space. Reported as an unhealthy source meanwhile.
     blocked_cause: ?anyerror = null,
     retained_index: usize = 0,
     discovery_repair: repair.Repair,
@@ -428,7 +426,6 @@ pub const Session = struct {
         var index: usize = 0;
         while (index < self.sources.sources.items.len) {
             const source = &self.sources.sources.items[index];
-            // A source already in intervention keeps the discontinuity that put it there.
             const held = index < self.repair_count and self.repair_states[index].state.phase == .intervention and source.continuity_failure != null;
             const failure = source.continuity_failure;
             const reported = source.continuity_reported;
@@ -509,7 +506,6 @@ pub const Session = struct {
         }
         return result;
     }
-    /// Slices are borrowed from the session and valid until it is destroyed.
     pub const ContinuityReport = struct {
         jail: []const u8,
         source: []const u8,
@@ -517,7 +513,6 @@ pub const Session = struct {
         failure: files.ContinuityFailure,
     };
 
-    /// The first source held in intervention by a checkpoint discontinuity, if any.
     pub fn continuityFailure(self: *const Session) ?ContinuityReport {
         for (self.sources.sources.items[0..self.repair_count], self.repair_states[0..self.repair_count]) |source, state| {
             if (state.state.phase != .intervention) continue;
@@ -538,8 +533,6 @@ pub const Session = struct {
         return null;
     }
 
-    /// Like `continuityFailure`, but returns each source's discontinuity once; the mark
-    /// clears when that source records a new discontinuity or recovers.
     pub fn nextUnreportedContinuityFailure(self: *Session) ?ContinuityReport {
         for (self.sources.sources.items[0..self.repair_count], self.repair_states[0..self.repair_count]) |*source, state| {
             if (state.state.phase != .intervention or source.continuity_reported) continue;

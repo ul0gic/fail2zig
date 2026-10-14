@@ -13,9 +13,6 @@ const Entry = struct {
     original_index: usize,
 };
 
-/// Returns a newly allocated JSON array. The caller owns the returned bytes.
-/// Invalid JSON, missing or malformed sort keys, and an oversized result fail
-/// before any output is returned. Allocation failures remain OutOfMemory.
 pub fn sortPayload(allocator: std.mem.Allocator, payload_json: []const u8) ![]u8 {
     const max_payload: usize = shared.protocol.max_payload_size;
     if (payload_json.len > max_payload) return error.PayloadTooLarge;

@@ -102,8 +102,6 @@ pub fn Methods(comptime Store: type) type {
                     const installation = try self.readInstallation() orelse return error.InstallationRequired;
                     const exact = try effects.Scope.exact(scope);
                     if (!std.mem.eql(u8, &owner.key, &try exact.key(installation))) return error.InvalidEffect;
-                    // The owner-update trigger records this new generation/revision while
-                    // retaining the terminal lease and its original decision history.
                     var update = try self.statement("UPDATE effect_owners SET generation=?4,revision=?5 WHERE scope_key=?1 AND jail=?2 AND revision=?3 AND generation=?6 AND lease_kind=0 AND deadline_us IS NULL;");
                     defer update.deinit();
                     try update.blob(1, &owner.key);
@@ -269,12 +267,8 @@ pub fn Methods(comptime Store: type) type {
             generation: [32]u8,
             committed_us: i64,
             detail: []const u8,
-            // Admin revision the request was admitted at; it is part of a ban's decision.
             admission_revision: ?u64 = null,
         };
-        /// A ban's owner decision. Binding the admission revision makes a replay after the
-        /// request row was evicted a new decision instead of a revived retired one, while a
-        /// retry at the same revision stays idempotent.
         pub fn adminDecisionId(request_id: [32]u8, admission_revision: u64) [32]u8 {
             var revision: [8]u8 = undefined;
             std.mem.writeInt(u64, &revision, admission_revision, .little);

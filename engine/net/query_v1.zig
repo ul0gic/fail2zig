@@ -207,7 +207,6 @@ pub const FirewallSource = union(enum) {
     cache: FirewallReader,
 };
 
-/// Fixed-size worker publication; string values are static labels, never borrowed config.
 pub const Stats = struct {
     schema_version: u32 = 1,
     kind: []const u8 = "stats",
@@ -806,9 +805,6 @@ fn hasFirewallStructure(metadata: firewall_observation.Metadata) bool {
     return metadata.state == .owned and metadata.structure_proof == .exact_v1;
 }
 
-// exact_v1 is established by the inspector, not inferred from installation intent.
-// These fixed shapes are the scaffold that its complete readback validates.
-// Dynamic rules/elements remain in the bounded page with exact canonical scopes.
 fn writeFirewallStructure(out: anytype, metadata: firewall_observation.Metadata) !void {
     try out.objectField("structure");
     if (!hasFirewallStructure(metadata)) return out.write(null);

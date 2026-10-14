@@ -102,7 +102,6 @@ pub const Notifier = struct {
     }
 };
 
-/// Startup phases in the order construction reaches them.
 pub const Phase = enum(u8) { admission, schema, migration, maintenance, recovery, readiness };
 
 pub const ProgressTiming = struct {
@@ -110,27 +109,15 @@ pub const ProgressTiming = struct {
     cadence_usec: u64 = 10 * std.time.us_per_s,
 };
 
-/// Extends the systemd start deadline only while startup completes work.
-///
-/// Progress is a later phase, or a completed-work count above the current phase's
-/// high-water mark. A repeated or lower count (a retry, a wait, a component that
-/// falls back) and an earlier phase are not progress. Each extension is
-/// `extension_usec` minus the age of the progress it reports, so the outstanding
-/// deadline is the latest reported progress plus `extension_usec`: a stall times out
-/// once that runs out, and the unit's own TimeoutStartSec still applies first.
-/// The first report always sends, which gives the first extension before the
-/// initial deadline when it is made at the start of construction.
 pub const Progress = struct {
     notifier: ?*const Notifier,
     timing: ProgressTiming = .{},
     clock_context: ?*anyopaque = null,
-    /// Monotonic microseconds; null means the time is unknown and nothing is sent.
     clock: *const fn (?*anyopaque) ?u64 = monotonicClock,
     mutex: std.Thread.Mutex = .{},
     phase: ?Phase = null,
     high_water: u64 = 0,
     last_sent_usec: ?u64 = null,
-    /// When the latest progress not yet reported was observed.
     unsent_usec: ?u64 = null,
     phase_unsent: bool = false,
     status_buf: [max_status_bytes]u8 = undefined,
@@ -165,14 +152,12 @@ pub const Progress = struct {
         self.last_sent_usec = now;
     }
 
-    /// Stops further extensions; call before READY or a fatal exit.
     pub fn finish(self: *Progress) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.finished = true;
     }
 
-    /// Reports migration work through a hook that carries no systemd dependency.
     pub fn migrationHook(self: *Progress) Hook {
         return .{ .context = self, .report_fn = reportMigration };
     }
@@ -182,7 +167,6 @@ pub const Progress = struct {
         self.report(.migration, "migration", done, total);
     }
 
-    // Both buffers fit the longest message: a 64-byte label and two u64 counts.
     fn formatStatus(self: *Progress, label: []const u8, done: u64, total: u64) void {
         const safe = if (std.mem.indexOfScalar(u8, label, '\n') == null and label.len <= 64) label else "startup";
         const text = if (total == 0)
@@ -202,7 +186,6 @@ pub const Progress = struct {
     }
 };
 
-/// Type-erased progress callback for code that must not depend on the notifier.
 pub const Hook = struct {
     context: *anyopaque,
     report_fn: *const fn (*anyopaque, u64, u64) void,

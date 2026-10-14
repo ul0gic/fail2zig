@@ -8,10 +8,7 @@ const continuity = @import("continuity.zig");
 const Store = store_mod.Store;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-/// Repair rows whose outcome a replay returns, newest first.
 pub const retained_repairs: i64 = 256;
-/// Older rows keep only their token as a tombstone so an evicted token can never commit a
-/// second repair. Beyond this many tombstones every new repair is refused.
 pub const retained_tombstones: i64 = 4096;
 pub const max_token_bytes = 128;
 const max_path_rows = 64;
@@ -39,13 +36,11 @@ pub const Error = store_mod.Error || error{
     LossAlreadyRecorded,
 };
 
-/// Observed relation between the recorded checkpoint and the file at the source path.
 pub const Shape = enum { truncated, continuous, prefix_changed, replaced, missing };
 
 pub const Request = struct {
     jail: []const u8,
     path: []const u8,
-    /// Caller-chosen operation token; the same token and arguments replay the committed outcome.
     token: []const u8,
 };
 
@@ -54,7 +49,6 @@ pub const FileIdentity = struct { device: u64, inode: u64, size: u64, prefix_sha
 pub const RemovedIncarnation = struct {
     inode: u64,
     last_size: ?u64,
-    /// Only known when this call committed; a replay has the row, not the prior cursor.
     committed_offset: ?u64,
     current_inode: ?u64,
     current_offset: ?u64,
@@ -62,12 +56,10 @@ pub const RemovedIncarnation = struct {
 
 pub const Outcome = struct {
     replayed: bool,
-    /// Owned by the allocator passed to `repair`.
     source: []u8,
     generation: [32]u8,
     prior_checkpoint_revision: u64,
     prior_cursor_sha256: [32]u8,
-    /// Only known when this call committed; a replay has the row, not the prior cursor.
     prior_offset: ?u64,
     prior_incarnation: ?[16]u8,
     new_incarnation: [16]u8,
@@ -107,7 +99,6 @@ fn validRequest(request: Request) bool {
     return true;
 }
 
-// The file source identifier the daemon assigns to a discovered path.
 fn sourceId(buffer: []u8, jail: []const u8, path: []const u8, device: u64, inode: u64) Error![]const u8 {
     return std.fmt.bufPrint(buffer, "{s}:{s}:{d}:{d}", .{ jail, path, device, inode }) catch error.InvalidRepairRequest;
 }
@@ -128,16 +119,11 @@ const Plan = struct {
     }
 };
 
-/// Acknowledges a same-inode truncation of one stopped file source. The caller holds the
-/// state authority lock for the whole call and has opened `store` without creating it.
-/// Only the selected source cursor and its jail checkpoint revision change; receipts,
-/// owners, deadlines and consumer checkpoints are left exactly as they are.
 pub fn repair(store: *Store, allocator: std.mem.Allocator, request: Request, now_us: i64, hooks: Hooks, diagnostic: *Diagnostic) Error!Outcome {
     diagnostic.* = .{};
     if (!validRequest(request) or now_us < 0) return error.InvalidRepairRequest;
     const key = tokenKey(request.token);
     try requireMigratedSchema(store);
-    // A committed outcome is checked before any old-state precondition, which it has changed.
     if (try replay(store, allocator, request, key)) |prior| return prior;
 
     const fd = std.posix.open(request.path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true }, 0) catch |failure| {
@@ -289,11 +275,7 @@ fn observe(store: *Store, allocator: std.mem.Allocator, request: Request, file: 
 
 const Checkpoint = struct { generation: [32]u8, revision: u64 };
 
-// The jail checkpoint of a file source is the native processor's `F2NT` payload, whose
-// bytes 8..40 hold the configuration generation that every source receipt is bound to.
-// The repair binds this stored generation and its consumer manifest rather than one
-// recomputed from the configuration, which would need the daemon's resolver and consumer
-// plans; a configuration changed since the stop is reconciled by the next start.
+// Bytes 8..40 of the native processor's `F2NT` jail checkpoint hold the configuration generation every source receipt is bound to.
 fn readCheckpoint(store: *Store, jail: []const u8) Error!Checkpoint {
     var row = try store.statement("SELECT payload,revision FROM checkpoints WHERE jail=?1;");
     defer row.deinit();
@@ -323,8 +305,6 @@ fn requireNoPendingWork(store: *Store, request: Request, source: []const u8, gen
     if (!std.mem.eql(u8, &try fixed(32, &row, 0), &generation)) return error.StaleGeneration;
 }
 
-// Restat by path and descriptor. This detects, but cannot prevent, a producer writing or
-// replacing the file during the repair; the next start still verifies continuity.
 fn requireNamedFile(request: Request, file: std.fs.File) Error!std.posix.Stat {
     const held = std.posix.fstat(file.handle) catch return error.SourceChanged;
     const named = std.posix.fstatat(std.posix.AT.FDCWD, request.path, 0) catch return error.SourceChanged;
@@ -379,7 +359,6 @@ fn removedUnread(prior: files.Resume) bool {
     return prior.offset != size;
 }
 
-// The first recorded incarnation, by source order, whose inode is gone while the path holds another.
 fn observeRemoved(store: *Store, allocator: std.mem.Allocator, request: Request, file: std.fs.File) Error!?RemovedPlan {
     const stat = std.posix.fstat(file.handle) catch return error.SourceUnreadable;
     if (!std.posix.S.ISREG(stat.mode)) return error.SourceUnreadable;
@@ -618,7 +597,6 @@ fn bumpRevision(store: *Store, jail: []const u8, revision: u64) Error!void {
 }
 
 fn recordRepair(store: *Store, repair_row: RepairRow, now_us: i64) Error!i64 {
-    // Retention orders by this time, so it never moves backwards across repairs.
     const committed_us = blk: {
         var row = try store.statement("SELECT max(?1,coalesce(max(committed_us)+1,?1)) FROM source_repairs;");
         defer row.deinit();

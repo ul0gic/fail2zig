@@ -65,8 +65,6 @@ pub const Cache = struct {
         } };
     }
 
-    /// Copies a complete inspector result into the bounded retained sample. This
-    /// path allocates nothing and deliberately retains only the first 256 rows.
     pub fn capture(self: *Cache, snapshot: *const inspection.Snapshot, stamp: Stamp) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -112,7 +110,6 @@ pub const Cache = struct {
         self.metadata.attempt_stage = null;
     }
 
-    /// Records a failed attempt without discarding the last complete sample.
     pub fn fail(self: *Cache, attempt: AttemptFailure) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -126,8 +123,6 @@ pub const Cache = struct {
         self.metadata.attempt_stage = attempt.stage;
     }
 
-    /// Copies one bounded page while holding the cache mutex. The caller owns
-    /// `out`, which must be allocated before entry; no slice into Cache escapes.
     pub fn readPage(self: *Cache, request: PageRequest, out: *Page) error{ BadCursor, InvalidatedCursor }!void {
         if (request.limit == 0 or request.limit > max_limit) return error.BadCursor;
         const decoded: ?Cursor = if (request.cursor) |cursor| try decodeCursor(cursor) else null;

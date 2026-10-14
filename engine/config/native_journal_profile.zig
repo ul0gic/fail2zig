@@ -39,15 +39,12 @@ pub const Resolved = struct {
     }
 };
 
-// No retained descriptors. At most four descriptors and four max_path_bytes
-// stack buffers are live while walking; heap is at most eight path copies.
 pub fn discover(allocator: std.mem.Allocator) !Resolved {
     const root = try posix.open("/", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }, 0);
     defer posix.close(root);
     return discoverAt(allocator, root, 0, &catalog);
 }
 
-// Private seam: production provides only the fixed catalog and the real root.
 fn discoverAt(allocator: std.mem.Allocator, root: posix.fd_t, uid: posix.uid_t, entries: []const []const u8) !Resolved {
     if (entries.len > catalog.len) return error.InvalidJournalExecutables;
     var result = Resolved{ .allocator = allocator };
@@ -68,9 +65,7 @@ fn discoverAt(allocator: std.mem.Allocator, root: posix.fd_t, uid: posix.uid_t, 
     return result;
 }
 
-// Explicit profiles retain their historical leaf-only qualification and exact
-// configured spelling. O_PATH inspects special files without opening a device
-// or waiting for a FIFO writer; it does not read or execute the file.
+// O_PATH inspects special files without opening a device or waiting for a FIFO writer.
 pub fn qualifyExplicit(path: []const u8) !void {
     try validatePath(path);
     const fd = try posix.open(path, .{ .PATH = true, .CLOEXEC = true }, 0);
@@ -90,10 +85,8 @@ fn qualifyLeaf(stat: posix.Stat, uid: posix.uid_t) !void {
     if (!posix.S.ISREG(stat.mode) or stat.uid != uid or stat.mode & 0o022 != 0 or stat.mode & 0o111 == 0) return error.UnqualifiedJournalExecutable;
 }
 
-// The supplied root/uid are a private filesystem-test seam. Production always
-// starts at / and requires UID 0. Each component is opened relative to a verified
-// directory with NOFOLLOW; symlink contents are read from that exact O_PATH fd.
-// Thus neither lookup nor readlink can redirect through an unverified directory.
+// Each component is opened relative to a verified directory with NOFOLLOW; symlink contents are
+// read from that exact O_PATH fd, so neither lookup nor readlink can bypass a verified directory.
 fn walk(root: posix.fd_t, path: []const u8, output: []u8, uid: posix.uid_t) ![]const u8 {
     try validatePath(path);
     try qualifyDirectory(try posix.fstat(root), uid);
@@ -102,8 +95,6 @@ fn walk(root: posix.fd_t, path: []const u8, output: []u8, uid: posix.uid_t) ![]c
     var pending_len = path.len;
     var links: usize = 0;
     var steps: usize = 0;
-    // Bytes introduced as symlink targets must exist; an optional suffix
-    // beyond that boundary may be absent under a valid directory alias.
     var required_end: usize = 0;
     restart: while (true) {
         var current = try posix.openat(root, ".", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }, 0);
@@ -310,8 +301,6 @@ test "native: journal profile discovery optional paths roles ordering and alloca
     defer without_auth.deinit();
     try std.testing.expectEqualStrings("/bin/sshd-session", without_auth.executables()[0]);
     try std.testing.expect(!without_auth.has_auth_helper);
-    // An unsafe present candidate fails even after an earlier valid allocation;
-    // allocator and descriptor checks cover that partially populated cleanup.
     const unsafe = try tmp.dir.createFile("unsafe", .{ .mode = 0o644 });
     unsafe.close();
     try std.testing.expectError(error.UnqualifiedJournalExecutable, discoverAt(std.testing.allocator, tmp.dir.fd, uid, &.{ "/bin/sshd", "/unsafe", "/bin/sshd-session" }));

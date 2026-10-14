@@ -82,20 +82,13 @@ pub const RemovedVerdict = enum { drained, unread, unknown };
 
 pub const PendingLoss = struct { event: LossEvent, checkpoint_durable: bool };
 
-/// Why a committed checkpoint cannot resume. Every kind is reported as `error.ResumeLost`;
-/// the extent of unread data lost is unknown in each case.
 pub const Discontinuity = enum {
-    /// Same inode, observed size below the committed offset or the committed prefix length.
     truncated,
-    /// Same inode at or past the committed offset, but the committed prefix no longer matches.
     prefix_changed,
-    /// Path absent and the committed inode is not discoverable in its directory.
     missing,
-    /// Path names another inode and the committed inode is not discoverable in its directory.
     replaced,
 };
 
-/// Checkpoint and observed file metadata only; never file contents.
 pub const ContinuityFailure = struct {
     kind: Discontinuity,
     incarnation: [16]u8,
@@ -114,18 +107,14 @@ pub const ContinuityFailure = struct {
     }
 };
 
-/// Same inode, observed size below the committed offset or the committed prefix length.
 pub fn truncatedInPlace(committed: Resume, device: u64, inode: u64, size: u64) bool {
     return device == committed.device and inode == committed.inode and (size < committed.offset or size < committed.prefix_len);
 }
 
-/// SHA-256 of the first `length` bytes; `error.ResumeLost` when the file is shorter.
 pub fn prefixDigest(file: std.fs.File, length: u8) ![32]u8 {
     return FileSource.prefix(file, length);
 }
 
-/// A new incarnation at offset 0 of `file` that keeps the committed start, framing and
-/// codec binding, as an unpreserved shrink does at runtime.
 pub fn restartedIncarnation(file: std.fs.File, committed: Resume) !Resume {
     var next = try FileSource.newResume(file, 0, committed.framing, committed.start);
     next.codec_configuration_hash = committed.codec_configuration_hash;
@@ -267,9 +256,6 @@ pub const FileSource = struct {
         return .{ .size = std.math.cast(u64, stat.size), .device = @intCast(stat.dev), .inode = @intCast(stat.ino) };
     }
 
-    // Size and prefix are the only continuity evidence. A same-inode file truncated and
-    // regrown past the committed offset with an identical prefix is not detected; an
-    // empty file baselined with prefix_len 0 makes the prefix check vacuous.
     fn classify(committed: Resume, observed: Observed) Discontinuity {
         if (observed.device != committed.device or observed.inode != committed.inode) return .replaced;
         if (observed.size) |size| if (truncatedInPlace(committed, observed.device, observed.inode, size)) return .truncated;
@@ -621,7 +607,6 @@ pub const FileSource = struct {
         const f = self.file.?;
         var r = self.committed.?;
         const stat = try f.stat();
-        // The attached descriptor was admitted only with the committed device and inode.
         const observed = Observed{ .size = stat.size, .device = r.device, .inode = r.inode };
         const shrunk = stat.size < r.offset or stat.size < r.prefix_len;
         const fingerprint = if (shrunk) r.prefix_hash else self.read_prefix(f, r.prefix_len) catch |err| {

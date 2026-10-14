@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! DDL restated from GPL-2.0 upstream `fail2ban-1.1.1/fail2ban/server/database.py:114-160`.
-//! Addresses use only the RFC 5737 and RFC 3849 documentation ranges.
 const std = @import("std");
 const db = @import("fail2ban_db.zig");
 
@@ -23,6 +21,8 @@ pub const Options = struct {
     omit_sentinel: bool = false,
 };
 
+// DDL restated from GPL-2.0 upstream fail2ban-1.1.1/fail2ban/server/database.py:114-160; addresses
+// in this fixture use only the RFC 5737 and RFC 3849 documentation ranges.
 pub const ddl = [_]struct { table: []const u8, sql: [*:0]const u8 }{
     .{ .table = "fail2banDb", .sql = "CREATE TABLE IF NOT EXISTS fail2banDb(version INTEGER);" },
     .{ .table = "jails", .sql = "CREATE TABLE IF NOT EXISTS jails(name TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1);" ++

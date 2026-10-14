@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-// Direct internal imports for isolated component test modules. Not used by the product.
 pub const cli = struct {
     pub const repair_source = @import("cli/repair_source.zig");
     pub const rule_test = @import("cli/rule_test.zig");

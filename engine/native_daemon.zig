@@ -28,10 +28,7 @@ const filter_registry = @import("filters/registry.zig");
 const files = @import("core/durable_file_source.zig");
 const ignore_set = @import("core/native_ignore_set.zig");
 
-// Keep the released query byte-for-byte for existing explicit profiles: it is
-// included in persistent source identity. New automatic auth-helper layouts
-// get their own query; changing an existing profile still requires admission.
-// These static slices remain valid for the lifetime of every journal plan.
+// The released query is part of persistent source identity; changing an existing profile requires admission.
 const legacy_ssh_matches: []const []const u8 = &.{ "SYSLOG_IDENTIFIER=sshd", "SYSLOG_IDENTIFIER=sshd-session", "+", "_COMM=sshd", "_COMM=sshd-session" };
 const auth_ssh_matches: []const []const u8 = &.{ "SYSLOG_IDENTIFIER=sshd", "SYSLOG_IDENTIFIER=sshd-session", "SYSLOG_IDENTIFIER=sshd-auth", "+", "_COMM=sshd", "_COMM=sshd-session", "_COMM=sshd-auth" };
 const journal_sessions = @import("core/native_journal_session.zig");
@@ -109,8 +106,6 @@ const Source = union(enum) {
             .internal => |value| value,
         };
     }
-    /// Drains up to `ingest_burst` waiting records per wake so ingestion is not held
-    /// to one record per tick while effect and maintenance work lengthen the tick.
     const ingest_burst = 4;
     fn poll(self: Source) !usize {
         var admitted: usize = 0;
@@ -290,7 +285,6 @@ fn logInstallationConflict(cfg: *const config.Config, saved: effect.Installation
         "refusing to run unprotected"
     else
         "running DEGRADED as log-only per on_no_backend";
-    // Match preflight's selector-first precedence without changing admission policy.
     if (!std.mem.eql(u8, saved.selector(), cfg.global.firewall_namespace)) {
         const message = "firewall: saved namespace selector '{'}' conflicts with requested selector '{'}' (InstallationMismatch); restore the previous firewall_namespace with the existing state database; {s}";
         const args = .{ std.zig.fmtEscapes(saved.selector()), std.zig.fmtEscapes(cfg.global.firewall_namespace), disposition };
@@ -302,7 +296,6 @@ fn logInstallationConflict(cfg: *const config.Config, saved: effect.Installation
     }
 }
 
-// Paths are diagnostic context, never recovery instructions or unbounded log payloads.
 fn logStateOpenFailure(operation: []const u8, path: []const u8, failure: anyerror, detail: durable.OpenDiagnostic) void {
     const prefix = path[0..@min(path.len, 256)];
     std.log.warn("native: state {s} failed: {s}; stage={s}; posix_cause={s}; sqlite_code={?d}; path='{'}'{s}", .{
@@ -354,9 +347,6 @@ fn preflightBackend(a: std.mem.Allocator, cfg: *const config.Config, enforcing: 
     return .{ .selected = .{ .installation = candidate, .persisted = persisted != null } };
 }
 
-/// What the worker last learned from the kernel, published for status: the readback
-/// instant and what it showed, plus the selection counters. Knowledge is derived from
-/// the readback's age against the verification cadence, never from view readiness.
 const PublishedView = struct {
     readback_ns: ?u64 = null,
     readback_wall_us: ?i64 = null,
@@ -365,15 +355,11 @@ const PublishedView = struct {
     oldest_pending_us: ?i64 = null,
     overdue: u64 = 0,
     oldest_overdue_us: ?i64 = null,
-    /// Deletion-class entries past their deadline that the last readback still shows
-    /// installed: their rule keeps blocking traffic until the daemon removes it.
     overdue_blocking: u64 = 0,
     oldest_overdue_blocking_us: ?i64 = null,
     dump_interrupted: u64 = 0,
     verify_interval_ns: u64 = 0,
     wake_interval_ns: u64 = 0,
-    /// The manager's uncertainty is a transient readback or mutation signal, which does
-    /// not revoke what the last accepted readback showed.
     transient_uncertain: bool = false,
 };
 const Knowledge = enum { fresh, stale, none };
@@ -450,13 +436,9 @@ pub const Coordinator = struct {
     stop_mutex: std.Thread.Mutex = .{},
     wake: std.Thread.Condition = .{},
     stopping: bool = false,
-    /// The last effect slice ran out of budget with work remaining.
     effect_backlog: bool = false,
     last_view_report_ms: ?u64 = null,
     retire_jail: usize = 0,
-    /// Quiet-worker state: with a confirmed view, caught-up history, no maintenance
-    /// progress and no new commits, publication and maintenance run once per second
-    /// instead of every wake. Sources are still polled every wake.
     last_slow_tick_ms: ?u64 = null,
     last_committed_records: u64 = 0,
     history_caught_up: bool = false,
@@ -963,8 +945,6 @@ pub const Coordinator = struct {
     }
     fn withdrawRealizedEffects(self: *Coordinator) void {
         const manager = self.effects orelse return;
-        // Without healthy storage durable intent cannot be confirmed, so shutdown
-        // neither reconciles (a store write) nor withdraws (a dispatch).
         const phase = self.gate.snapshot().phase;
         if (phase != .healthy or !self.store_open or self.store.reopen_required) {
             const residual = manager.residualInstalled();
@@ -1009,9 +989,6 @@ pub const Coordinator = struct {
         defer self.stop_mutex.unlock();
         return self.stopping;
     }
-    /// One outer wake of effect reconciliation. True only when the view is
-    /// confirmed with nothing divergent; an exhausted budget requests an
-    /// immediate next wake instead of the idle sleep.
     fn effectSlice(self: *Coordinator, manager: *effect_runtime.Manager) !bool {
         var bindings: [max_jails]effect_runtime.Binding = undefined;
         self.effectBindings(&bindings);
@@ -1090,14 +1067,9 @@ pub const Coordinator = struct {
     fn observedWorker(self: *Coordinator) health.WorkerStatus {
         return self.worker_observation.read(observationMs(), observationWall());
     }
-    /// A stale or passed expiry authority is bookkeeping, published but not a fault;
-    /// what degrades protection is an expired rule the kernel still holds (`overBlocking`).
     fn observationSound(observation: health.WorkerStatus) bool {
         return !observation.stalled and !observation.clock_uncertain;
     }
-    /// An expired deletion-class rule that the last readback still shows installed keeps
-    /// blocking traffic past its deadline; that is a protection fault, unlike an element
-    /// the kernel already removed and the daemon has not yet booked.
     fn overBlocking(self: *const Coordinator) bool {
         return self.published_view.overdue_blocking != 0;
     }
@@ -1108,8 +1080,7 @@ pub const Coordinator = struct {
         const self: *Coordinator = @ptrCast(@alignCast(ctx.?));
         self.mutex.lock();
         defer self.mutex.unlock();
-        // Fence readers before COMMIT; retain the prior deadline until readback
-        // verifies the new epoch. Routine read-only turns keep their last evidence.
+        // Fence readers before COMMIT; retain the prior deadline until readback verifies the new epoch.
         self.worker_observation.publication(observationMs(), observationWall(), null, false);
     }
     fn resolverGeneration(server: ?std.net.Address) ![32]u8 {
@@ -1149,7 +1120,6 @@ pub const Coordinator = struct {
                 .file => try plan.include(try resource.fileCost(.{ .source_capacity = capacity, .spec_count = jail.logpath.len, .max_record_bytes = 2048, .max_decoded_bytes = 2048 })),
                 .journald => {
                     try plan.include(try resource.journalCost(.{ .max_record_bytes = 2048, .max_decoded_bytes = 2048, .batch_records = 1, .environment = environment }));
-                    // Owned plan paths plus bounded discovery/copy overlap.
                     try plan.include(.{ .live = .{ .bytes = 8 * (std.fs.max_path_bytes + @sizeOf([]const u8)), .allocations = 9 }, .workspace = .{ .bytes = 98304, .allocations = 16, .fds = 4 }, .workspace_kind = .configuration });
                 },
                 .internal => try plan.include(.{ .workspace = .{ .bytes = 16 * 1024, .allocations = 4 }, .workspace_kind = .source }),
@@ -1417,8 +1387,7 @@ pub const Coordinator = struct {
         }
         try self.store.finishMaintenanceValidation(&self.maintenance_validation);
         self.maintenance_validated = true;
-        // Committed on its own, before startup admission, so a later failed start keeps
-        // the mismatch streak and a recurring mismatch is still recognised.
+        // Committed before startup admission so a failed start keeps the mismatch streak.
         if (try self.store.reconcileLiveOwners()) |recount| {
             if (recount.prior_streak == 0)
                 std.log.warn("native storage: live-owner counter {d} did not match {d} live owners; recounted", .{ recount.stored, recount.counted })
@@ -1454,12 +1423,8 @@ pub const Coordinator = struct {
     fn reportStartup(self: *Coordinator, phase: sd_notify.Phase, label: []const u8, done: u64, total: u64) void {
         if (self.startup_progress) |progress| progress.report(phase, label, done, total);
     }
-    /// Completed startup work for the systemd deadline: verified readiness
-    /// components plus effect steps that loaded, committed or verified. Waits and
-    /// failed readbacks add nothing.
     fn reportReadinessProgress(self: *Coordinator, report: readiness.Report) void {
-        // Effect steps also count epoch-driven reloads, so sustained ingestion before
-        // READY could extend the start deadline forever. Cap the readiness phase.
+        // Effect steps count epoch-driven reloads; cap the readiness phase or ingestion could extend the deadline forever.
         const now = std.time.nanoTimestamp();
         const started = self.readiness_progress_started_ns orelse blk: {
             self.readiness_progress_started_ns = now;
@@ -1476,8 +1441,6 @@ pub const Coordinator = struct {
     fn admitStore(self: *Coordinator) !void {
         self.store.runtime_path = self.cfg.global.state_file;
         try self.store.configureRuntimeLimits();
-        // Resumes an interrupted schema-24 migration; the chain admits schema 24 only
-        // once it is complete.
         try self.store.enableLoadRepair(self.loadRepairOptions(), if (self.startup_progress) |progress| progress.migrationHook() else null);
         try self.store.enableReceipts(self.jails.len * max_sources_per_jail);
         try self.store.enableNativeTime();
@@ -2461,8 +2424,6 @@ pub const Coordinator = struct {
                 return self.rebuild_phase == .done;
             },
             .ownership => {
-                // Later ownership turns drain confirmed history into recidive records,
-                // advancing the maintenance revision; the sources step revalidates it.
                 if (!self.ownership_fenced) {
                     try self.store.finishMaintenanceValidation(&self.maintenance_validation);
                     self.ownership_fenced = true;
@@ -2527,8 +2488,6 @@ pub const Coordinator = struct {
             installation = selected;
         }
         const manager = try effect_runtime.Manager.create(self.allocator, &self.store, installation.?);
-        // Confirmed, unchanged views are re-read every 5 s (drift detection bound) instead
-        // of every 100 ms wake; storage changes and due deadlines still invalidate at once.
         manager.verify_interval_ns = verify_interval_ns;
         if (self.firewall_observation_cache) |cache| manager.attachObservationCache(cache);
         self.effects = manager;
@@ -2578,9 +2537,6 @@ pub const Coordinator = struct {
         if (self.dns) |value| value.destroy();
         self.dns = null;
     }
-    /// One 16-row page per 100 ms worker tick made populated-state recovery take
-    /// minutes. Pages stay separate bounded read transactions; the time bound keeps
-    /// health publication and stop handling responsive between worker turns.
     fn validateMaintenancePages(self: *Coordinator) !bool {
         var timer = std.time.Timer.start() catch return self.store.validateMaintenanceTurn(&self.maintenance_validation);
         while (!try self.store.validateMaintenanceTurn(&self.maintenance_validation)) {
@@ -2825,16 +2781,12 @@ pub const Coordinator = struct {
                 const verified = jail.session.?.verify() catch |failure| {
                     if (try self.startupSourceRefusal(jail, failure)) return;
                     try self.publishSource(jail);
-                    // Some admission failures bypass the source-repair cause. Retain
-                    // their child context without changing recovery classification.
                     if (jail.source_error == null and jail.session.? == .journal)
                         logJournalFailure(jail, failure, journalFailureDetail(jail, failure));
                     return failure;
                 };
                 if (!verified) return;
                 if (jail.session.? == .journal) {
-                    // A verified selection still needs a successful recovery poll.
-                    // Publish cause and child metadata from the same repair state.
                     try self.publishSource(jail);
                 } else {
                     self.mutex.lock();
@@ -3252,7 +3204,6 @@ pub const Coordinator = struct {
         };
     }
     fn logJournalFailure(jail: *Jail, failure: anyerror, diagnostic: ?journal_sessions.FailureDiagnostic) void {
-        // Worker-owned transition key; no raw subprocess output or unbounded history.
         const notice = diagnostic orelse journal_sessions.FailureDiagnostic{ .cause = failure, .exit_code = null, .signal = null, .stderr_present = false };
         if (std.meta.eql(jail.last_journal_notice, @as(?journal_sessions.FailureDiagnostic, notice))) return;
         jail.last_journal_notice = notice;
@@ -3267,8 +3218,6 @@ pub const Coordinator = struct {
         var next_expiry: ?i64 = null;
         var expiry_current = self.effects == null;
         if (self.effects) |manager| {
-            // The authority is the durable deadlines the view holds; it needs the view to
-            // be current with storage, not confirmed by the kernel.
             expiry_current = !self.store.reopen_required and manager.cached_epoch != null and manager.cached_epoch.? == self.store.effect_publication_epoch;
             if (expiry_current) for (manager.live[0..manager.count]) |entry| {
                 if (entry.status == .expired or entry.status == .absent or entry.status == .superseded) continue;
@@ -3402,8 +3351,7 @@ pub const Coordinator = struct {
                         std.log.err("native: jail={s} source={s} continuity failure: {s}", .{ jail.name, @tagName(jail.plan), @errorName(cause) });
                     };
                     std.log.err("native: startup recovery failed: {s}; refusing to start", .{@errorName(failure)});
-                    // Exit skips the main loop's periodic drain; a file log target
-                    // would otherwise lose the refusal cause.
+                    // Exit skips the main loop's periodic drain; a file log target would lose the refusal cause.
                     if (log_sink) |sink| sink.drain();
                     std.process.exit(1);
                 }
@@ -3435,7 +3383,6 @@ pub const Coordinator = struct {
         }
         var view_idle = self.effects == null;
         if (self.effects) |manager| {
-            // An effect backlog no longer holds back receipts, history or maintenance.
             view_idle = try self.effectSlice(manager);
             if (!view_idle and stopRequested(self)) return;
             self.reportViewProgress(manager);
@@ -3449,16 +3396,10 @@ pub const Coordinator = struct {
             self.last_slow_tick_ms = now_ms;
             if (self.effects) |manager| {
                 if (view_idle or manager.last_readback_ns != null) {
-                    // Under a backlog the epoch can move between the read and the publish;
-                    // the next slow tick retries instead of failing the turn.
                     self.publishOwners() catch |failure| if (failure != error.StaleEffect) return failure;
                     for (self.jails) |*jail| try self.publishJail(jail);
                 }
             } else for (self.jails) |*jail| try self.publishJail(jail);
-            // Consumed at most once per second, then until caught up within a bounded
-            // number of pages: the events are durable in their own settle commits, so the
-            // consumer checkpoint need not follow every tick. Between consumptions the page
-            // token may be behind the head, so it is dropped rather than validated stale.
             if (now_ms -| (self.last_history_ms orelse 0) >= quiet_interval_ms) {
                 self.last_history_ms = now_ms;
                 self.history_caught_up = false;
@@ -3538,7 +3479,6 @@ pub const Coordinator = struct {
         self.last_gate_report_ms = now_ms;
         self.gates = .{};
     }
-    /// At most one line per 10 s, and only while the counters move.
     fn reportViewProgress(self: *Coordinator, manager: *effect_runtime.Manager) void {
         const now_ms = monotonic(self);
         if (self.last_view_report_ms) |last| if (now_ms -| last < 10_000) return;
@@ -3548,12 +3488,6 @@ pub const Coordinator = struct {
         self.last_view_report_ms = now_ms;
         self.last_view_counters = c;
     }
-    /// One retry-subject retirement per turn, round-robin over jails, regardless of
-    /// effect backlog or source state: without it a capped jail never frees capacity
-    /// while its own blocked ingestion keeps the cleanup fence pinned.
-    /// One retirement batch per turn. Jails are visited round-robin, but a jail with
-    /// nothing to examine does not consume the turn: the next jail is tried, at most
-    /// once around, so an idle jail cannot halve another jail's cleanup service.
     fn retirementStep(self: *Coordinator) !void {
         var visited: usize = 0;
         while (visited < self.jails.len) : (visited += 1) {
@@ -3579,10 +3513,6 @@ pub const Coordinator = struct {
                 },
                 else => return failure,
             };
-            // The sweep restarts only when the batch reached the end of the eligible
-            // set; otherwise it advances past what it examined, so a run of pinned
-            // subjects is walked, not revisited, and subjects skipped while briefly
-            // pinned are reached again on the next sweep.
             jail.retire_after = if (batch.exhausted) null else batch.last;
             self.retire_examined += batch.examined;
             self.retire_pinned_state += batch.pinned_state;
@@ -3598,8 +3528,6 @@ pub const Coordinator = struct {
     const quiet_interval_ms: u64 = 1000;
     const verify_interval_ns: u64 = 5 * std.time.ns_per_s;
     const stop_history_pages: u16 = 256;
-    /// Consumption is deferred up to a second at runtime; a clean stop first catches the
-    /// confirmed-history consumer up so no reader finds a gap behind the head.
     fn drainHistoryForStop(self: *Coordinator) void {
         if (self.gate.snapshot().phase != .healthy or !self.store_open or self.store.reopen_required) return;
         var pages: u16 = 0;
@@ -3623,8 +3551,6 @@ pub const Coordinator = struct {
         const age_us = std.math.mul(i64, std.math.cast(i64, self.cfg.global.history_retention) orelse return error.InvalidApplicationHistoryQuery, 1_000_000) catch return error.InvalidApplicationHistoryQuery;
         const caught_up = if (self.history_page) |page| page.after_sequence == page.head_sequence and page.last_sequence == page.head_sequence else false;
         const effects_settled = if (self.effects) |manager| manager.status.ready and !manager.status.uncertain else true;
-        // A spent scope is already confirmed absent in the kernel by its own settled
-        // intent, so its removal does not wait for the whole view to settle.
         const effects_usable = if (self.effects) |manager| !manager.status.uncertain and !self.store.reopen_required else true;
         switch (try self.store.maintenanceStep(.{ .retention = .{ .age_us = age_us, .max_matches = self.cfg.global.history_max_matches }, .now_us = std.time.microTimestamp(), .history_caught_up = caught_up, .spent_scopes = effects_usable })) {
             .progress => |operation| {
@@ -3643,7 +3569,6 @@ pub const Coordinator = struct {
             },
             .idle => {},
         }
-        // Record cleanup still waits for a settled effect view.
         if (!effects_settled) {
             self.gates.unsettled += 1;
             return;
@@ -3866,13 +3791,9 @@ pub const Coordinator = struct {
             decisions +|= jail.summary.decisions;
             installed +|= self.confirmedCount(jail, now, sampled_ms) orelse 0;
         }
-        // A fatal backend cause degrades; an unconfirmed view does not, its knowledge does.
         if (self.published_effects) |effects| healthy = healthy and !(effects.uncertain and !self.published_view.transient_uncertain);
         if (self.backend_failure != null) healthy = false;
         const known = self.knowledge(sampled_ms);
-        // Precedence: a fault degrades; without any readback knowledge the state is
-        // unknown, even if the last readback showed an expired rule still installed;
-        // then stale knowledge or a confirmed over-blocking rule degrades.
         const protection: []const u8 = if (!healthy) "degraded" else if (self.published_effects == null) "log-only" else if (known.? == .none) "unknown" else if (known.? == .stale or self.overBlocking()) "degraded" else "active";
         const active_bans: ?u32 = if (known) |k| (if (k == .none) null else self.published_view.installed_live) else installed;
         const knowledge_cause: ?[]const u8 = if (known) |k| switch (k) {
@@ -3892,10 +3813,6 @@ pub const Coordinator = struct {
         try self.writeSources(writer, redact);
         try writer.writeByte('}');
     }
-    /// Knowledge of installed protection ages from the last accepted readback: fresh
-    /// within the verification cadence plus one wake, stale after, none when nothing
-    /// has been read since admission or a fatal backend cause stands. A ready view
-    /// without a recorded readback counts as fresh. Null without an enforcing backend.
     fn knowledge(self: *const Coordinator, now_ms: ?u64) ?Knowledge {
         const effects = self.published_effects orelse return null;
         const view = self.published_view;
@@ -3914,20 +3831,13 @@ pub const Coordinator = struct {
         const then = then_us orelse return null;
         return @intCast(@max(0, @divTrunc(now_us -| then, 1000)));
     }
-    /// Protection is active only while the worker is sound, storage is healthy and the
-    /// kernel knowledge is fresh; an unconfirmed view with fresh knowledge is a served
-    /// backlog, not degraded protection.
     fn enforcementActive(self: *const Coordinator, observation: health.WorkerStatus, now_ms: ?u64) bool {
         if (!observationSound(observation) or self.published_health.phase != .healthy or self.backend_failure != null or self.overBlocking()) return false;
         return (self.knowledge(now_ms) orelse return false) == .fresh;
     }
-    /// A confirmation flag published from a readback stands while that knowledge is
-    /// fresh or stale; it is withdrawn only when there is no knowledge at all.
     fn confirmationKnown(self: *const Coordinator, now_ms: ?u64) bool {
         return if (self.knowledge(now_ms)) |known| known != .none else false;
     }
-    /// A jail's confirmed count is what the last accepted readback showed, carried while
-    /// that knowledge is stale and absent (null) while there is none.
     fn confirmedCount(self: *const Coordinator, jail: Jail, now: i64, now_ms: ?u64) ?u32 {
         if (self.knowledge(now_ms)) |known| if (known == .none) return null;
         var count: u32 = 0;
@@ -4234,7 +4144,6 @@ pub const Coordinator = struct {
         }
         return .{ .more = true, .resume_after = after };
     }
-    // Optional telemetry must not turn its allocation failure into startup failure.
     fn initializeObservationCache(self: *Coordinator, admitted: bool, installation: effect.Installation) void {
         if (!admitted) {
             self.firewall_observation_unavailable = .memory_budget;
@@ -4263,7 +4172,6 @@ pub const Coordinator = struct {
         defer a.free(scope_storage);
         const requested_kind = query_v1.requestedKind(arena, body);
         if (requested_kind == .stats) {
-            // Copy only the fixed publication. No owner scans, store access or backend work.
             self.mutex.lock();
             var snapshot = self.published_stats;
             const generation = if (snapshot.available) self.stats_generation else self.published_generation;
@@ -4310,8 +4218,7 @@ pub const Coordinator = struct {
                 const cfg = self.live_cfg;
                 const jail_configs = try arena.alloc(query_v1.JailConfig, self.jails.len);
                 const jail_scopes = try arena.alloc(query_v1.JailScopes, self.jails.len);
-                // A single exact allocation avoids retaining geometrically grown arena
-                // blocks for per-jail scope arrays within the control scratch budget.
+                // One exact allocation avoids retaining geometrically grown arena blocks.
                 var counts: [max_jails]usize = undefined;
                 var total: usize = 0;
                 for (self.jails, 0..) |jail, i| {
@@ -4439,8 +4346,6 @@ pub fn run(a: std.mem.Allocator, cfg: *const config.Config, config_path: []const
         break :blk null;
     };
     defer if (notifier) |*value| value.deinit();
-    // Construction admits, migrates, validates and recovers the store before the
-    // worker starts; the start deadline must be extended from inside that work.
     var startup_progress = sd_notify.Progress{ .notifier = if (notifier) |*value| value else null };
     startup_progress.report(.admission, "admission", 0, 0);
     const coordinator = try Coordinator.create(a, cfg, config_path, &startup_progress);
@@ -4900,7 +4805,6 @@ test "native daemon recovery: ownership fences maintenance once per recovery gen
     try commitRecoveryRecord(&coordinator.store, "first");
     while (!try coordinator.store.validateMaintenanceTurn(&coordinator.maintenance_validation)) {}
     try testing.expect(try Coordinator.recoverTurn(.ownership, coordinator));
-    // Stands in for the confirmed-history drain committing a recidive record.
     try commitRecoveryRecord(&coordinator.store, "drained");
     try testing.expect(try Coordinator.recoverTurn(.ownership, coordinator));
     coordinator.gate.state.generation += 1;

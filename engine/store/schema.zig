@@ -21,18 +21,12 @@ const sd_notify = @import("../core/sd_notify.zig");
 
 pub fn Methods(comptime Store: type) type {
     return struct {
-        // Schema 24 is admitted only once its migration completed; an interrupted migration
-        // resumes through enableLoadRepair before the chain runs.
         pub fn chainSchema(self: *Store) Error!i64 {
             const schema = try self.integer("PRAGMA user_version;");
             if (schema == store.load_repair_schema and try self.loadRepairStatus() != .complete) return error.LoadRepairMigrationIncomplete;
             return schema;
         }
 
-        // Starts or resumes the schema-23 to 24 migration. Earlier schemas return unchanged
-        // so the chain can build them to 23 first; call again after enableMigrationState.
-        // `progress` receives the committed page count so a service manager can extend its
-        // start deadline while the migration advances.
         pub fn enableLoadRepair(self: *Store, options: store.load_repair.Options, progress: ?sd_notify.Hook) Error!void {
             var pages: u64 = 0;
             while (true) switch (try self.loadRepairStatus()) {
@@ -51,8 +45,6 @@ pub fn Methods(comptime Store: type) type {
                 var row = try self.statement("SELECT superseded_targets,backup_path FROM load_repair_migration WHERE id=1;");
                 defer row.deinit();
                 if (!try row.row()) return error.LoadRepairInvalidState;
-                // Superseded outcomes belonged to decisions already replaced before the upgrade;
-                // no action status surface reports them, so the count is disclosed here once.
                 std.log.info("native storage: schema 24 migration complete after {d} transactions; {d} unsettled action outcomes of replaced decisions marked superseded; pre-upgrade backup {s}", .{ pages, try row.signed(0), try row.bytes(1) });
             }
         }
@@ -401,9 +393,6 @@ pub fn Methods(comptime Store: type) type {
                 \\CREATE TRIGGER policy_summary_retired_delete AFTER DELETE ON retry_retired BEGIN UPDATE policy_summary_clock SET revision=revision+1 WHERE id=1; END;
                 \\PRAGMA user_version=17;
             );
-            // Both are lookup keys for bounded detail reclamation. This additive
-            // index change is safe for existing schema-17..23 databases and older
-            // binaries; no stored record or checkpoint format changes.
             try self.exec(
                 \\CREATE INDEX IF NOT EXISTS effect_owners_decision ON effect_owners(jail,decision_id);
                 \\CREATE INDEX IF NOT EXISTS confirmed_effect_events_decision ON confirmed_effect_events(jail,decision_id);
@@ -575,7 +564,6 @@ pub fn Methods(comptime Store: type) type {
             self.schema_version = @max(schema, 23);
         }
 
-        // The admin_requests table is rebuilt because its kind CHECK admits only values 1 to 10.
         pub fn enableRuntimeState(self: *Store, options: store.load_repair.Options, backup: bool) Error!void {
             const schema = try self.chainSchema();
             if (schema < store.load_repair_schema or schema > latest_schema) return error.UnsupportedSchema;

@@ -9,9 +9,8 @@ const types = @import("types.zig");
 
 pub const PatternDef = types.PatternDef;
 
-// PortSentry v2.0.7 writes history records into a 1024-byte C buffer, including
-// its newline and terminating NUL. Keeping the source limit here bounds every
-// delimiter scan even when the matcher is called outside the source processor.
+// PortSentry v2.0.7 writes history records into a 1024-byte C buffer including newline and NUL;
+// this limit bounds every delimiter scan.
 const max_history_bytes: usize = 1024 - 2;
 const timestamp_bytes: usize = 28;
 

@@ -7,12 +7,9 @@ const Store = store_mod.Store;
 const repair = store_mod.load_repair;
 const t = std.testing;
 
-// Production-built states (for example the load reproduction fixtures) are copied from
-// this directory when set: each `<name>/*.sqlite` becomes an additional shape. A shape
-// directory may hold the `config.toml` its state was built with, and the directory root
-// holds the `fail2zig-v0.4.4` release binary used for the rollback checks.
+// Directory of production-built states: each `<name>/*.sqlite` is an extra shape with an optional
+// `config.toml`, and its root holds the `fail2zig-v0.4.4` release binary for rollback checks.
 const fixtures_env = "F2Z_LOAD_REPAIR_FIXTURES";
-// Optional JSON-lines file receiving per-phase callback measurements.
 const measure_env = "F2Z_LOAD_REPAIR_MEASURE";
 const now_us: i64 = 1_767_225_600_000_000;
 const max_matches: u16 = 4;
@@ -31,9 +28,7 @@ extern fn sqlite3_column_text(statement: *anyopaque, column: c_int) ?[*:0]const 
 
 const Shape = struct {
     name: []const u8,
-    // Null builds the constructed schema-23 state in place.
     source: ?[]const u8,
-    // Small windows make the constructed state cross many page boundaries.
     window_rows: ?i64,
 };
 
@@ -88,14 +83,12 @@ fn options(shape: Shape, state_path: []const u8) repair.Options {
     return .{ .state_path = state_path, .now_us = now_us, .history_max_matches = max_matches, .hooks = .{ .window_rows = shape.window_rows } };
 }
 
-// The progress handler keeps a pointer to the store, so limits are configured in place.
 fn openState(store: *Store, path: []const u8) !void {
     store.* = try Store.openRuntime(t.allocator, path);
     errdefer store.close();
     try store.configureRuntimeLimits();
 }
 
-// Places a schema-23 state for `shape` at `path`.
 fn prepare(shape: Shape, path: []const u8) !void {
     if (shape.source) |source| {
         try std.fs.cwd().copyFile(source, std.fs.cwd(), path, .{});
@@ -112,10 +105,6 @@ fn exec(store: *Store, comptime format: []const u8, arguments: anytype) !void {
     try store.inspectExec(try std.fmt.bufPrintZ(&buffer, format, arguments));
 }
 
-// A schema-23 state covering every migrated relationship: reused scopes with obsolete
-// revisions/intents/observations, an intent above the observation bound, retired and
-// current action targets (one retired target still unsettled), live and absent owners,
-// joinable and legacy (NULL subject) details, and an activating migration run.
 fn construct(path: []const u8) !void {
     const scopes = 240;
     const cycles = 3;
@@ -312,7 +301,6 @@ const Measurement = struct {
     }
 };
 
-// Uninterrupted reference run on a fresh copy of the shape.
 fn reference(shape: Shape, space: *Workspace, name: []const u8) !Digest {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try space.path(&buffer, name);
@@ -354,7 +342,6 @@ test "load repair migration: stop at every page boundary resumes to the uninterr
         }
         try t.expect(commits > 20);
         try t.expectEqualSlices(u8, &expected, &try digest(path));
-        // The recorded backup is the untouched schema-23 state.
         var backup_buffer: [std.fs.max_path_bytes]u8 = undefined;
         try t.expectEqualSlices(u8, &original, &try digest(try repair.backupPath(&backup_buffer, path)));
     }
@@ -368,7 +355,6 @@ const Crash = struct {
     }
 };
 
-// Dies with the named transaction open, as a process crash would leave it.
 fn crashInside(shape: Shape, path: []const u8, phase: ?repair.Phase) !void {
     const child = try std.posix.fork();
     if (child == 0) {
@@ -409,8 +395,6 @@ test "load repair migration: a crash inside every swap, index build and final co
             try openState(&store, path);
             defer store.close();
             if (point == null) {
-                // The fence never committed, so the backup is unrecorded and is refused
-                // rather than adopted; the operator moves it aside.
                 try t.expectEqual(repair.Status.ready, try store.loadRepairStatus());
                 try t.expectError(error.LoadRepairBackupExists, store.stepLoadRepairMigration(options(shape, path)));
                 try std.fs.cwd().deleteFile(backup);
@@ -460,7 +444,6 @@ test "load repair migration: an injected failure mid-swap restores foreign key e
     try t.expectEqualSlices(u8, &expected, &try digest(path));
 }
 
-// A swap only frees pages, so the file-growing steps are the backup, a copy and a backfill.
 const FullPoint = enum { backup, events_copy, details };
 
 test "load repair migration: SQLITE_FULL during backup, copy and swap refuses and later resumes" {
@@ -487,7 +470,6 @@ test "load repair migration: SQLITE_FULL during backup, copy and swap refuses an
             },
             .events_copy, .details => {
                 try startAndStepUntil(&store, value, if (point == .events_copy) .events_copy else .details);
-                // Consume the free list so the page must grow the file, then cap it there.
                 const free = try store.inspectInteger("PRAGMA freelist_count;");
                 const page_size = try store.inspectInteger("PRAGMA page_size;");
                 try exec(&store, "CREATE TABLE filler(x); INSERT INTO filler VALUES(zeroblob({d}));", .{free * page_size});
@@ -516,7 +498,6 @@ test "load repair migration: a stale partial backup is replaced; a recorded back
     var backup_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const backup = try repair.backupPath(&backup_buffer, path);
     try prepare(shape, path);
-    // A backup interrupted before its rename leaves only the partial file.
     var partial_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const partial = try std.fmt.bufPrint(&partial_buffer, "{s}.partial", .{backup});
     try std.fs.cwd().writeFile(.{ .sub_path = partial, .data = "interrupted" });
@@ -587,7 +568,6 @@ test "load repair migration: summaries, candidates, markers and superseded targe
         try t.expectEqual(@as(i64, 1), try store.inspectInteger("SELECT (SELECT live FROM effect_owner_live)=(SELECT count(*) FROM effect_owners WHERE lease_kind<>0);"));
         try t.expectEqual(@as(i64, 0), try store.inspectInteger("SELECT count(*) FROM (SELECT intent_id FROM effect_observations GROUP BY intent_id HAVING count(*)>4);"));
     }
-    // A summary disagreeing with its details is refused before completion.
     var space = try Workspace.init();
     defer space.deinit();
     const shape = Shape{ .name = "constructed", .source = null, .window_rows = null };
@@ -639,8 +619,6 @@ test "load repair migration: the verify allowance interrupts one callback short 
 
 const OldRun = enum { refused, admitted };
 
-// Minimal configuration for fixtures built without a daemon: v0.4.4 refuses a schema-24
-// file while opening state, before any source or policy comparison.
 const generic_config =
     \\[global]
     \\native_ingestion = true
@@ -656,8 +634,7 @@ const generic_config =
     \\
 ;
 
-// Writes `template` with its state, socket and log target moved into `work`. Source paths
-// stay as recorded because v0.4.4 refuses a changed source configuration.
+// Source paths stay as recorded because v0.4.4 refuses a changed source configuration.
 fn writeConfig(work: []const u8, template: []const u8) ![]u8 {
     var output = std.ArrayList(u8).init(t.allocator);
     defer output.deinit();
@@ -683,8 +660,6 @@ fn fileContains(path: []const u8, needle: []const u8) !bool {
     return std.mem.indexOf(u8, text, needle) != null;
 }
 
-// Runs the release binary on `state` in a private rootless network namespace and classifies
-// the outcome from its log: an exit before admission, or admission without a startup failure.
 fn runOldBinary(binary: []const u8, work: []const u8, template: []const u8, state: []const u8) !OldRun {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const state_dir = try std.fmt.bufPrint(&buffer, "{s}/state", .{work});
@@ -721,7 +696,6 @@ fn runOldBinary(binary: []const u8, work: []const u8, template: []const u8, stat
             break;
         }
         if (try fileContains(log, "protection admission pending")) {
-            // Hold briefly so a failure right after admission is still observed.
             std.time.sleep(3 * std.time.ns_per_s);
             outcome = .admitted;
             break;
@@ -735,7 +709,6 @@ fn runOldBinary(binary: []const u8, work: []const u8, template: []const u8, stat
     const result = outcome orelse return error.OldBinaryTimeout;
     if (try fileContains(log, "startup failed")) {
         if (result == .admitted) return error.OldBinaryFailedAfterAdmission;
-        // Refusal must leave the installed file untouched.
         try t.expectEqualSlices(u8, &installed, &try fileSha256(target));
         return .refused;
     }
@@ -791,8 +764,6 @@ test "load repair migration: v0.4.4 refuses the migrated state and admits the re
             std.debug.print("v0.4.4 refusal without UnsupportedSchema for {s}:\n{s}\n", .{ shape.name, text });
             return error.TestUnexpectedResult;
         }
-        // Rollback restores the recorded backup under the release that wrote it. Fixtures
-        // built without a daemon carry a synthetic firewall selector and are not admissible.
         if (recorded == null) continue;
         var backup_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const backup = try repair.backupPath(&backup_buffer, path);
