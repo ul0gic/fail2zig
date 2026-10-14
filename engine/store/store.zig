@@ -217,6 +217,8 @@ pub const EffectInvalidation = struct {
     invalidate: *const fn (?*anyopaque) void,
 };
 pub const max_retention_page: u16 = 256;
+// Rowids one held-record pass scans; a transaction allows 1,000 progress callbacks of 1,000 VM steps (workProgress).
+pub const max_held_window: u16 = 8192;
 // Position of the rotating obsolete-row reclamation; in memory only, so a restart rescans.
 pub const ReclaimCursor = struct { phase: u2 = 0, cursor: i64 = 0, found: bool = false, rest: u8 = 0 };
 pub const TestHooks = if (builtin.is_test) struct {
@@ -224,6 +226,8 @@ pub const TestHooks = if (builtin.is_test) struct {
     retention_select_work: ?u32 = null,
     // Summary rows per candidate-generation sweep page instead of the measured window.
     retention_sweep_rows: ?i64 = null,
+    // Work budget left when the held-record pass starts, instead of the transaction's.
+    held_pass_work: ?u32 = null,
 } else struct {};
 pub const Store = struct {
     allocator: std.mem.Allocator,
@@ -255,6 +259,8 @@ pub const Store = struct {
     load_repair_migrated: bool = false,
     // Retention page size; an interrupted selection halves it for the next attempt.
     retention_page: u16 = max_retention_page,
+    held_cursor: i64 = 0,
+    held_window: u16 = max_held_window,
     reclaim: ReclaimCursor = .{},
     // Maintenance turns skipped after a full retry-detail scan found nothing to prune.
     retry_detail_rest: u8 = 0,

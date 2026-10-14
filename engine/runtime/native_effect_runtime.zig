@@ -1075,6 +1075,7 @@ pub const Manager = struct {
             if (entry.status != .pending) return .progress;
         }
         const dispatch_clock = try self.clock();
+        if (entry.desired == .finite and !entry.desired.live(dispatch_clock.prepared_us)) return .progress;
         const sent_ns = self.monotonic(self.monotonic_context);
         const prior_mutation_ns = self.last_mutation_ns;
         const prior_mutation_wall_us = self.last_mutation_wall_us;
@@ -1087,6 +1088,12 @@ pub const Manager = struct {
             self.inspector.applyFromBaseline(target, clock_sample, &self.inventory.?.snapshot)
         else
             self.inspector.applyExact(target, clock_sample)) catch |failure| {
+            if (failure == error.ExpiredIntent) {
+                self.markers[index] = null;
+                self.last_mutation_ns = prior_mutation_ns;
+                self.last_mutation_wall_us = prior_mutation_wall_us;
+                return .progress;
+            }
             self.recordFirewallDirect(.effect_dispatch, failure);
             if (!transientReadback(failure)) return error.EffectBackendUncertain;
             self.markers[index] = null;
@@ -1096,6 +1103,12 @@ pub const Manager = struct {
         };
         switch (result) {
             .uncertain => |failure| {
+                if (failure.cause == error.ExpiredIntent and failure.mutation == .not_started) {
+                    self.markers[index] = null;
+                    self.last_mutation_ns = prior_mutation_ns;
+                    self.last_mutation_wall_us = prior_mutation_wall_us;
+                    return .progress;
+                }
                 self.recordFirewallFailure(failure);
                 if (failure.mutation == .not_started) {
                     self.markers[index] = null;

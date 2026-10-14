@@ -1,6 +1,6 @@
 # Runtime architecture
 
-fail2zig 0.4.6 is one native executable containing the daemon, administration commands, rule
+fail2zig 0.4.7 is one native executable containing the daemon, administration commands, rule
 testing and migration tools. Zig application code statically embeds pinned upstream SQLite C.
 Runtime installation does not require Python, a SQLite service, the SQLite CLI or a shared SQLite
 library.
@@ -217,8 +217,10 @@ with each recovery attempt up to 30 s. A recovery attempt moves through storage,
 ownership and sources, and storage returns to healthy when the last step completes; a
 commit that is still refused pauses it again. Rules already in the kernel stay in place
 while storage is paused, and `fail2zig status` shows the storage phase. The daemon runs
-no VACUUM and does not enable `auto_vacuum`, so the file does not shrink. Rows removed by
-the retention and cleanup described above free pages for reuse inside the file, with
+no VACUUM and does not enable `auto_vacuum`, so the file does not shrink. Committed receipts are guarded in sequence order and deleted once nothing holds
+them; a receipt held by a live ban, an open retry window or an unsettled action is set aside
+and does not block the receipts behind it, and a bounded pass deletes it once released. Rows
+removed by that cleanup and by the retention described above free pages for reuse inside the file, with
 `history_retention` (seconds, default 86400) as the retention setting, and an operator
 should watch the state file size.
 

@@ -127,25 +127,27 @@ pub fn Methods(comptime Store: type) type {
             }
             return false;
         }
-        fn recordCleanupPinned(self: *Store, fence: CleanupFence, occurrence: []const u8, now: i64) Error!bool {
+        fn recordIsCursorAnchor(self: *Store, fence: CleanupFence, occurrence: []const u8) Error!bool {
             var anchor = try self.statement("SELECT occurrence FROM source_cursors WHERE jail=?1 AND source=?2;");
             defer anchor.deinit();
             try anchor.text(1, fence.jail);
             try anchor.text(2, fence.source);
             if (!try anchor.row() or self.api.column_type(anchor.ptr, 0) != 3) return error.InvalidMaintenanceState;
-            if (std.mem.eql(u8, try anchor.boundedBytes(0, 16384), occurrence)) return true;
+            return std.mem.eql(u8, try anchor.boundedBytes(0, 16384), occurrence);
+        }
+        fn recordCleanupPinned(self: *Store, jail: []const u8, source: []const u8, occurrence: []const u8, now: i64) Error!bool {
             var action = try self.statement("SELECT 1 FROM action_intents WHERE jail=?1 AND source=?2 AND occurrence=?3 LIMIT 1;");
             defer action.deinit();
-            try action.text(1, fence.jail);
-            try action.text(2, fence.source);
+            try action.text(1, jail);
+            try action.text(2, source);
             try action.text(3, occurrence);
             if (try action.row()) return true;
-            const policy = try self.readRetryPolicy(fence.jail);
-            const occurrence_key = retry.occurrenceKey(fence.source, occurrence);
+            const policy = try self.readRetryPolicy(jail);
+            const occurrence_key = retry.occurrenceKey(source, occurrence);
             var detections = try self.statement("SELECT family,subject FROM record_detections WHERE jail=?1 AND source=?2 AND occurrence=?3 AND kind=?4;");
             defer detections.deinit();
-            try detections.text(1, fence.jail);
-            try detections.text(2, fence.source);
+            try detections.text(1, jail);
+            try detections.text(2, source);
             try detections.text(3, occurrence);
             try detections.int(4, @intFromEnum(detection.Kind.candidate));
             var count: usize = 0;
@@ -155,12 +157,12 @@ pub fn Methods(comptime Store: type) type {
                 if (self.api.column_type(detections.ptr, 0) == 5 and self.api.column_type(detections.ptr, 1) == 5) continue;
                 const subject = try self.decodeRetrySubject(&detections, 0, 1);
                 if (try self.subjectEffectPinned(subject)) return true;
-                if (policy) |admission| if (try self.readRetryState(fence.jail, subject, admission.policy)) |state| {
+                if (policy) |admission| if (try self.readRetryState(jail, subject, admission.policy)) |state| {
                     for (state.attempts[0..state.count]) |attempt| if (@as(i128, attempt.at_us) >= @as(i128, now) - admission.policy.window_us and std.mem.eql(u8, &attempt.occurrence, &occurrence_key)) return true;
                 };
             }
             var decisions: [max_native_detections]retry.Decision = undefined;
-            const decision_count = try self.retryDecisions(fence.jail, fence.source, occurrence, &decisions);
+            const decision_count = try self.retryDecisions(jail, source, occurrence, &decisions);
             for (decisions[0..decision_count]) |decision| if (decision.lease.live(now) or try self.subjectEffectPinned(decision.subject)) return true;
             return false;
         }
@@ -228,13 +230,23 @@ pub fn Methods(comptime Store: type) type {
                 const id = try orderedIdentity(&row, fence);
                 const bytes = id.jail.len + id.source.len + id.occurrence.len + id.cursor.len + 64;
                 if (bytes > 1024 * 1024 - keys) break;
-                if (try self.recordCleanupPinned(fence, id.occurrence, now)) break;
+                if (try self.recordIsCursorAnchor(fence, id.occurrence)) break;
                 try self.insertReplayGuard(id, try row.optionalSigned(3), next.reject_below_sequence);
                 keys += bytes;
                 next.reject_below_sequence += 1;
             }
             if (next.reject_below_sequence == current.reject_below_sequence) {
+                var wrote = false;
+                const cursor = if (current.sweep_sequence + 1 >= current.reject_below_sequence) self.deleteReleasedHeldRecords(fence, now, &wrote) catch |failure| {
+                    if (failure != error.Interrupted or wrote) return failure;
+                    try self.yieldHeldPass();
+                    return null;
+                } else null;
                 try self.commitTransaction();
+                if (cursor) |value| {
+                    self.held_cursor = value;
+                    self.held_window = @min(store.max_held_window, self.held_window *| 2);
+                }
                 return null;
             }
             next.cleanup_revision = std.math.add(u64, current.cleanup_revision, 1) catch return error.StorageLimit;
@@ -244,16 +256,129 @@ pub fn Methods(comptime Store: type) type {
             try self.commitTransaction();
             return .{ .binding = effects.hashParts("fail2zig-cleanup-source-v1", &.{ fence.jail, fence.source, &fence.generation }), .state = next };
         }
-        fn countRecordChildren(self: *Store, fence: CleanupFence, occurrence: []const u8, comptime table: []const u8) Error!usize {
+        fn countRecordChildren(self: *Store, jail: []const u8, source: []const u8, occurrence: []const u8, comptime table: []const u8) Error!usize {
             var row = try self.statement("SELECT count(*) FROM " ++ table ++ " WHERE jail=?1 AND source=?2 AND occurrence=?3;");
             defer row.deinit();
-            try row.text(1, fence.jail);
-            try row.text(2, fence.source);
+            try row.text(1, jail);
+            try row.text(2, source);
             try row.text(3, occurrence);
             if (!try row.row()) return error.InvalidMaintenanceState;
             const count = try row.signed(0);
             if (count < 0 or count > max_native_detections) return error.InvalidRecord;
             return @intCast(count);
+        }
+        fn deleteRecordGroup(self: *Store, jail: []const u8, source: []const u8, occurrence_view: []const u8, budget: usize) Error!?usize {
+            var group_rows = 1 + try self.countRecordChildren(jail, source, occurrence_view, "record_detections") + try self.countRecordChildren(jail, source, occurrence_view, "retry_decisions");
+            // Escalation selections share their retry decision's lifetime and must remain visible to the physical row budget.
+            if (self.schema_version >= 18) group_rows += try self.countRecordChildren(jail, source, occurrence_view, "retry_decision_escalations");
+            if (group_rows > budget) return null;
+            var occurrence_buffer: [16384]u8 = undefined;
+            @memcpy(occurrence_buffer[0..occurrence_view.len], occurrence_view);
+            const occurrence = occurrence_buffer[0..occurrence_view.len];
+            var deleted: usize = 0;
+            if (self.schema_version >= 18) {
+                try self.fault(.before_cleanup_escalation_delete);
+                var remove = try self.statement("DELETE FROM retry_decision_escalations WHERE jail=?1 AND source=?2 AND occurrence=?3;");
+                defer remove.deinit();
+                try remove.text(1, jail);
+                try remove.text(2, source);
+                try remove.text(3, occurrence);
+                try remove.done();
+                const changed = self.api.changes(self.db);
+                if (changed < 0 or changed > budget - deleted) return error.InvalidMaintenanceState;
+                deleted += @intCast(changed);
+                try self.fault(.after_cleanup_escalation_delete);
+                try self.fault(.after_cleanup_delete);
+            }
+            inline for (.{ "record_detections", "retry_decisions", "records" }) |table| {
+                if (comptime std.mem.eql(u8, table, "retry_decisions")) try self.fault(.before_cleanup_retry_delete);
+                var remove = try self.statement("DELETE FROM " ++ table ++ " WHERE jail=?1 AND source=?2 AND occurrence=?3;");
+                defer remove.deinit();
+                try remove.text(1, jail);
+                try remove.text(2, source);
+                try remove.text(3, occurrence);
+                try remove.done();
+                const changed = self.api.changes(self.db);
+                if (changed < 0 or changed > budget - deleted) return error.InvalidMaintenanceState;
+                deleted += @intCast(changed);
+                if (comptime std.mem.eql(u8, table, "retry_decisions")) try self.fault(.after_cleanup_retry_delete);
+                try self.fault(.after_cleanup_delete);
+            }
+            if (deleted != group_rows) return error.InvalidMaintenanceState;
+            return deleted;
+        }
+        fn detachRecord(self: *Store, fence: CleanupFence, occurrence: []const u8) Error!void {
+            var row = try self.statement("UPDATE records SET source_generation=NULL,source_sequence=NULL WHERE jail=?1 AND source=?2 AND occurrence=?3;");
+            defer row.deinit();
+            try row.text(1, fence.jail);
+            try row.text(2, fence.source);
+            try row.text(3, occurrence);
+            try row.done();
+            if (self.api.changes(self.db) != 1) return error.InvalidMaintenanceState;
+        }
+        const min_held_window: u16 = 64;
+        fn yieldHeldPass(self: *Store) Error!void {
+            const prior_rollback = self.rollback_error_code;
+            self.rollback_error_code = null;
+            self.rollback();
+            const clean = !self.reopen_required and self.rollback_error_code == null and self.api.get_autocommit(self.db) != 0;
+            if (self.rollback_error_code == null) self.rollback_error_code = prior_rollback;
+            if (!clean) return error.Interrupted;
+            if (self.held_window <= min_held_window) return error.MaintenanceWorkExhausted;
+            self.held_window /= 2;
+        }
+        fn deleteReleasedHeldRecords(self: *Store, fence: CleanupFence, now: i64, wrote: *bool) Error!i64 {
+            if (builtin.is_test) if (self.test_hooks.held_pass_work) |work| {
+                self.work_remaining = work;
+            };
+            var position = self.held_cursor;
+            const limit = position +| self.held_window;
+            var deleted: usize = 0;
+            var keys: usize = 0;
+            var examined: usize = 0;
+            var exhausted = false;
+            while (examined < 64) : (examined += 1) {
+                // The unary plus keeps the planner on the rowid range, not the jail index and a sort (sqlite.org/optoverview.html, "Disabling index use").
+                var row = try self.statement("SELECT rowid,source,occurrence,raw_hash,cursor,receipt_us FROM records WHERE +jail=?1 AND source_sequence IS NULL AND rowid>?2 AND rowid<=?3 ORDER BY rowid LIMIT 1;");
+                defer row.deinit();
+                try row.text(1, fence.jail);
+                try row.int(2, position);
+                try row.int(3, limit);
+                if (!try row.row()) {
+                    exhausted = true;
+                    break;
+                }
+                if (self.api.column_type(row.ptr, 1) != 3 or self.api.column_type(row.ptr, 2) != 3 or self.api.column_type(row.ptr, 4) != 4) return error.InvalidMaintenanceState;
+                const rowid = try row.signed(0);
+                const source_view = try row.boundedBytes(1, Limits.source_bytes);
+                const occurrence = try row.boundedBytes(2, 16384);
+                const raw_hash = try Store.effectBlob(&row, 3, 32);
+                const cursor = try row.boundedBytes(4, Limits.cursor_bytes);
+                const receipt = try row.optionalSigned(5);
+                const bytes = fence.jail.len + source_view.len + occurrence.len + cursor.len + 64;
+                if (bytes > 1024 * 1024 - keys) break;
+                var source_buffer: [Limits.source_bytes]u8 = undefined;
+                @memcpy(source_buffer[0..source_view.len], source_view);
+                const source = source_buffer[0..source_view.len];
+                const guarded = blk: {
+                    self.checkReplayGuard(fence.jail, source, occurrence, raw_hash, cursor, null, receipt) catch |failure| switch (failure) {
+                        error.PrunedReplay => break :blk true,
+                        error.OccurrenceConflict => break :blk false,
+                        else => return failure,
+                    };
+                    break :blk false;
+                };
+                if (guarded and !try self.recordCleanupPinned(fence.jail, source, occurrence, now)) {
+                    wrote.* = true;
+                    deleted += try self.deleteRecordGroup(fence.jail, source, occurrence, 64 - deleted) orelse break;
+                    keys += bytes;
+                }
+                position = rowid;
+            }
+            if (deleted != 0) try self.finishCleanupClock(fence.clock, now);
+            if (!exhausted) return position;
+            if (limit >= try self.integer("SELECT coalesce(max(rowid),0) FROM records;")) return 0;
+            return limit;
         }
         pub fn cleanupDelete(self: *Store, fence: CleanupFence, token: CleanupToken) Error!CleanupProgress {
             try self.beginWrite();
@@ -265,10 +390,14 @@ pub fn Methods(comptime Store: type) type {
             var next = current;
             var deleted: usize = 0;
             var keys: usize = 0;
-            while (next.sweep_sequence + 1 < next.reject_below_sequence and deleted < 64) {
+            var steps: usize = 0;
+            while (next.sweep_sequence + 1 < next.reject_below_sequence and deleted < 64 and steps < 64) : (steps += 1) {
                 var row = try self.orderRecord(fence, next.sweep_sequence + 1);
                 defer row.deinit();
-                if (!try row.row()) return error.InvalidMaintenanceState;
+                if (!try row.row()) {
+                    next.sweep_sequence += 1;
+                    continue;
+                }
                 const id = try orderedIdentity(&row, fence);
                 const bytes = id.jail.len + id.source.len + id.occurrence.len + id.cursor.len + 64;
                 if (bytes > 1024 * 1024 - keys) break;
@@ -278,48 +407,17 @@ pub fn Methods(comptime Store: type) type {
                     guarded = true;
                 };
                 if (!guarded) return error.InvalidMaintenanceState;
-                if (try self.recordCleanupPinned(fence, id.occurrence, now)) break;
-                var group_rows = 1 + try self.countRecordChildren(fence, id.occurrence, "record_detections") + try self.countRecordChildren(fence, id.occurrence, "retry_decisions");
-                // Escalation selections share their retry decision's lifetime and must remain visible to the physical row budget.
-                if (self.schema_version >= 18) group_rows += try self.countRecordChildren(fence, id.occurrence, "retry_decision_escalations");
-                if (group_rows > 64 - deleted) break;
-                var occurrence_buffer: [16384]u8 = undefined;
-                @memcpy(occurrence_buffer[0..id.occurrence.len], id.occurrence);
-                const occurrence = occurrence_buffer[0..id.occurrence.len];
-                const deleted_before = deleted;
-                if (self.schema_version >= 18) {
-                    try self.fault(.before_cleanup_escalation_delete);
-                    var remove = try self.statement("DELETE FROM retry_decision_escalations WHERE jail=?1 AND source=?2 AND occurrence=?3;");
-                    defer remove.deinit();
-                    try remove.text(1, fence.jail);
-                    try remove.text(2, fence.source);
-                    try remove.text(3, occurrence);
-                    try remove.done();
-                    const changed = self.api.changes(self.db);
-                    if (changed < 0 or changed > 64 - deleted) return error.InvalidMaintenanceState;
-                    deleted += @intCast(changed);
-                    try self.fault(.after_cleanup_escalation_delete);
-                    try self.fault(.after_cleanup_delete);
+                if (try self.recordIsCursorAnchor(fence, id.occurrence)) break;
+                if (try self.recordCleanupPinned(fence.jail, fence.source, id.occurrence, now)) {
+                    try self.detachRecord(fence, id.occurrence);
+                    deleted += 1;
+                } else {
+                    deleted += try self.deleteRecordGroup(fence.jail, fence.source, id.occurrence, 64 - deleted) orelse break;
                 }
-                inline for (.{ "record_detections", "retry_decisions", "records" }) |table| {
-                    if (comptime std.mem.eql(u8, table, "retry_decisions")) try self.fault(.before_cleanup_retry_delete);
-                    var remove = try self.statement("DELETE FROM " ++ table ++ " WHERE jail=?1 AND source=?2 AND occurrence=?3;");
-                    defer remove.deinit();
-                    try remove.text(1, fence.jail);
-                    try remove.text(2, fence.source);
-                    try remove.text(3, occurrence);
-                    try remove.done();
-                    const changed = self.api.changes(self.db);
-                    if (changed < 0 or changed > 64 - deleted) return error.InvalidMaintenanceState;
-                    deleted += @intCast(changed);
-                    if (comptime std.mem.eql(u8, table, "retry_decisions")) try self.fault(.after_cleanup_retry_delete);
-                    try self.fault(.after_cleanup_delete);
-                }
-                if (deleted - deleted_before != group_rows) return error.InvalidMaintenanceState;
                 keys += bytes;
                 next.sweep_sequence += 1;
             }
-            if (deleted != 0) {
+            if (next.sweep_sequence != current.sweep_sequence) {
                 next.cleanup_revision = std.math.add(u64, current.cleanup_revision, 1) catch return error.StorageLimit;
                 try self.updateCleanupState(fence, current, next);
                 try self.finishCleanupClock(fence.clock, now);

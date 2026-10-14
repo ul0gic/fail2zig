@@ -377,6 +377,29 @@ const PublishedView = struct {
     transient_uncertain: bool = false,
 };
 const Knowledge = enum { fresh, stale, none };
+const MaintenanceGates = struct {
+    slow: u64 = 0,
+    due: u64 = 0,
+    turns: u64 = 0,
+    unhealthy_gate: u64 = 0,
+    step_progress: u64 = 0,
+    step_returned: u64 = 0,
+    step_wait: u64 = 0,
+    unsettled: u64 = 0,
+    no_session: u64 = 0,
+    unhealthy: u64 = 0,
+    candidate_receipt: u64 = 0,
+    consumer_busy: u64 = 0,
+    candidate_source: u64 = 0,
+    no_sources: u64 = 0,
+    history_missing: u64 = 0,
+    history_behind: u64 = 0,
+    walks: u64 = 0,
+    resumes: u64 = 0,
+    advances: u64 = 0,
+    advance_token: u64 = 0,
+    advance_null: u64 = 0,
+};
 pub const Coordinator = struct {
     allocator: std.mem.Allocator,
     cfg: *const config.Config,
@@ -446,6 +469,8 @@ pub const Coordinator = struct {
     retire_pinned_effect: u64 = 0,
     retire_refused: u64 = 0,
     last_view_counters: effect_runtime.Counters = .{},
+    gates: MaintenanceGates = .{},
+    last_gate_report_ms: ?u64 = null,
     thread: ?std.Thread = null,
     start_us: i64,
     last_notice: u64 = 0,
@@ -3477,13 +3502,16 @@ pub const Coordinator = struct {
             try self.publishSource(jail);
             if (admitted != 0) try self.publishJail(jail);
         }
+        if (slow_due) self.gates.slow += 1;
         if (slow_due and self.fairness.maintenanceDue(now_ms)) {
+            self.gates.due += 1;
             self.fairness.maintained(now_ms);
             self.maintenanceTurn() catch |failure| switch (failure) {
                 error.MaintenancePinned, error.StaleMaintenance => {},
                 else => return failure,
             };
         }
+        if (slow_due) self.reportMaintenanceGates(now_ms);
         if (slow_due) {
             if (try self.store.admissionClock()) |floor| {
                 self.mutex.lock();
@@ -3491,6 +3519,14 @@ pub const Coordinator = struct {
                 self.mutex.unlock();
             }
         }
+    }
+    fn reportMaintenanceGates(self: *Coordinator, now_ms: u64) void {
+        if (self.last_gate_report_ms) |last| if (now_ms -| last < 10_000) return;
+        const g = self.gates;
+        if (std.meta.eql(g, MaintenanceGates{})) return;
+        std.log.debug("native: maintenance gates: slow={d} due={d} turns={d} unhealthy_gate={d} step={d}/{d}/{d} unsettled={d} no_session={d} unhealthy={d} candidate_receipt={d} consumer_busy={d} candidate_source={d} no_sources={d} history_missing={d} history_behind={d} walks={d} resumes={d} advances={d} token={d} null={d}", .{ g.slow, g.due, g.turns, g.unhealthy_gate, g.step_progress, g.step_returned, g.step_wait, g.unsettled, g.no_session, g.unhealthy, g.candidate_receipt, g.consumer_busy, g.candidate_source, g.no_sources, g.history_missing, g.history_behind, g.walks, g.resumes, g.advances, g.advance_token, g.advance_null });
+        self.last_gate_report_ms = now_ms;
+        self.gates = .{};
     }
     /// At most one line per 10 s, and only while the counters move.
     fn reportViewProgress(self: *Coordinator, manager: *effect_runtime.Manager) void {
@@ -3567,7 +3603,11 @@ pub const Coordinator = struct {
     }
     const history_pages_per_turn: u8 = 4;
     fn maintenanceTurn(self: *Coordinator) !void {
-        if (self.gate.snapshot().phase != .healthy or self.jails.len == 0) return;
+        self.gates.turns += 1;
+        if (self.gate.snapshot().phase != .healthy or self.jails.len == 0) {
+            self.gates.unhealthy_gate += 1;
+            return;
+        }
         self.maintenance_progress = false;
         try self.retirementStep();
         const age_us = std.math.mul(i64, std.math.cast(i64, self.cfg.global.history_retention) orelse return error.InvalidApplicationHistoryQuery, 1_000_000) catch return error.InvalidApplicationHistoryQuery;
@@ -3578,42 +3618,88 @@ pub const Coordinator = struct {
         const effects_usable = if (self.effects) |manager| !manager.status.uncertain and !self.store.reopen_required else true;
         switch (try self.store.maintenanceStep(.{ .retention = .{ .age_us = age_us, .max_matches = self.cfg.global.history_max_matches }, .now_us = std.time.microTimestamp(), .history_caught_up = caught_up, .spent_scopes = effects_usable })) {
             .progress => |operation| {
-                if (operation == .history_rebuild or operation == .history_details or operation == .history_prefix) self.history_page = null;
                 self.maintenance_progress = true;
-                return;
+                self.gates.step_progress += 1;
+                if (operation == .history_rebuild or operation == .history_details or operation == .history_prefix) {
+                    self.history_page = null;
+                    self.gates.step_returned += 1;
+                    return;
+                }
             },
             .wait => {
                 self.maintenance_progress = true;
+                self.gates.step_wait += 1;
                 return;
             },
             .idle => {},
         }
         // Record cleanup still waits for a settled effect view.
-        if (!effects_settled) return;
+        if (!effects_settled) {
+            self.gates.unsettled += 1;
+            return;
+        }
+        if (self.effects != null) {
+            if (self.history_page == null and self.history_caught_up) _ = try self.consumeHistory();
+            const page = self.history_page orelse {
+                self.gates.history_missing += 1;
+                return;
+            };
+            if (page.after_sequence != page.head_sequence or page.last_sequence != page.head_sequence) {
+                self.gates.history_behind += 1;
+                return;
+            }
+        }
         const jail = &self.jails[self.maintenance_jail % self.jails.len];
         self.maintenance_jail = (self.maintenance_jail + 1) % self.jails.len;
-        const session = jail.session orelse return;
-        if (!session.healthy()) return;
+        const session = jail.session orelse {
+            self.gates.no_session += 1;
+            return;
+        };
+        if (!session.healthy()) {
+            self.gates.unhealthy += 1;
+            return;
+        }
         switch (session) {
-            .file => |value| if (value.pipe.candidate_receipt != null) return,
-            .journal => |value| if (value.pipe.candidate_receipt != null) return,
-            .internal => return,
+            .file => |value| if (value.pipe.candidate_receipt != null) {
+                self.gates.candidate_receipt += 1;
+                return;
+            },
+            .journal => |value| if (value.pipe.candidate_receipt != null) {
+                self.gates.candidate_receipt += 1;
+                return;
+            },
+            .internal => {
+                self.gates.no_session += 1;
+                return;
+            },
         }
         if (jail.consumer) |owner| {
-            if (owner.ignores.in_flight) return;
+            if (owner.ignores.in_flight) {
+                self.gates.consumer_busy += 1;
+                return;
+            }
             for (owner.registry.sources[0..owner.registry.count]) |source| {
-                if (source.busy or source.pending != null or source.waiting_occurrence != null or source.dns_stage != null) return;
+                if (source.busy or source.pending != null or source.waiting_occurrence != null or source.dns_stage != null) {
+                    self.gates.consumer_busy += 1;
+                    return;
+                }
             }
         }
         const source_count: usize = switch (session) {
             .file => |value| blk: {
-                if (value.candidate_source != null) return;
+                if (value.candidate_source != null) {
+                    self.gates.candidate_source += 1;
+                    return;
+                }
                 break :blk value.sources.sources.items.len;
             },
             .journal => 1,
             .internal => return,
         };
-        if (source_count == 0) return;
+        if (source_count == 0) {
+            self.gates.no_sources += 1;
+            return;
+        }
         const source_index = jail.maintenance_source % source_count;
         const source_id = switch (session) {
             .file => |value| value.sources.sources.items[source_index].source_id,
@@ -3625,10 +3711,7 @@ pub const Coordinator = struct {
             .journal => |value| value.processor.generation,
             .internal => return,
         };
-        if (self.effects != null) {
-            const page = self.history_page orelse return;
-            if (page.after_sequence != page.head_sequence or page.last_sequence != page.head_sequence) return;
-        }
+        self.gates.walks += 1;
         var manifest: ?@import("core/native_consumer.zig").Manifest = null;
         if (jail.consumer) |owner| manifest = try (try owner.registry.source(source_id)).manifest(generation);
         const fence = durable.Store.CleanupFence{
@@ -3645,10 +3728,15 @@ pub const Coordinator = struct {
         };
         jail.maintenance_source = (source_index + 1) % source_count;
         if (try self.store.cleanupResume(jail.name, source_id, generation)) |token| {
+            self.gates.resumes += 1;
             _ = try self.store.cleanupDelete(fence, token);
             self.maintenance_progress = true;
         } else if (try self.store.sourceMaintenance(jail.name, source_id, generation)) |state| {
-            if (try self.store.cleanupAdvance(fence, state, state.head_sequence) != null) self.maintenance_progress = true;
+            self.gates.advances += 1;
+            if (try self.store.cleanupAdvance(fence, state, state.head_sequence) != null) {
+                self.gates.advance_token += 1;
+                self.maintenance_progress = true;
+            } else self.gates.advance_null += 1;
         }
     }
     pub fn destroy(self: *Coordinator) void {
