@@ -23,6 +23,8 @@ pub const FailureContext = struct {
 };
 
 const MutationProgress = struct { requested: bool = false };
+pub const max_withdraw_messages: usize = 64;
+const withdraw_batch_bytes: usize = 8192;
 
 pub fn validateCanonicalScope(_: Transport, scope: CanonicalScope) Error!void {
     scope.validate() catch return error.UnsupportedScope;
@@ -36,6 +38,29 @@ fn subjectAddress(subject: canonical_scope.Subject) shared.IpAddress {
         .v4 => .{ .ipv4 = mem.readInt(u32, subject.address[0..4], .big) },
         .v6 => .{ .ipv6 = mem.readInt(u128, &subject.address, .big) },
     };
+}
+
+fn nftSetKey(address: shared.IpAddress, buf: *[16]u8) []const u8 {
+    switch (address) {
+        .ipv4 => |v| {
+            mem.writeInt(u32, buf[0..4], v, .big);
+            return buf[0..4];
+        },
+        .ipv6 => |v| {
+            mem.writeInt(u128, buf, v, .big);
+            return buf;
+        },
+    }
+}
+
+pub fn withdrawCost(scope: CanonicalScope) Error!usize {
+    if (hostScope(scope)) return 1;
+    return nft.scopeRulePartCount(scope) catch error.UnsupportedScope;
+}
+
+fn hostScope(scope: CanonicalScope) bool {
+    _ = legacyAddress(scope) catch return false;
+    return true;
 }
 
 fn legacyAddress(scope: CanonicalScope) Error!shared.IpAddress {
@@ -446,6 +471,122 @@ pub const Inspector = struct {
         }
         return .{ .verified = .{ .snapshot = after, .changed = true, .observed_start_wall_us = observation_start, .observed_wall_us = observation_end } };
     }
+    /// Removes the entries `baseline` shows, then takes one readback; callers keep a batch within
+    /// `max_withdraw_messages`, and a batch the kernel rejected whole is `error.Changed`, not started.
+    pub fn withdrawBatch(self: *Inspector, tokens: []const DispatchToken, clock: ClockSample, baseline: *const Snapshot) Error!EffectResult {
+        const transport = self.installation.transport;
+        if (tokens.len > max_withdraw_messages) return error.LimitExceeded;
+        for (tokens) |token| {
+            try (DurableInstallationIntent{ .installation = token.installation, .intent_id = token.effect_id, .revision = token.aggregate_revision }).validate(self.installation);
+            try validateRealizedScope(transport, token.scope);
+            if (token.operation != .ensure_absent) return error.UnsupportedScope;
+            _ = try deadlineUnits(token.operation, timingTransport(transport, token.scope), clock.wall_us);
+        }
+        if (!mem.eql(u8, &baseline.installation.id, &self.installation.id) or baseline.installation.transport != transport or baseline.state != .owned) return error.InvalidInstallation;
+        var elapsed = std.time.Timer.start() catch return error.SystemError;
+        var phase = std.time.Timer.start() catch return error.SystemError;
+        self.work_messages = 0;
+        self.live_bytes = 0;
+        var progress = MutationProgress{};
+        self.withdrawEntries(tokens, baseline, &phase, &progress) catch |err| return .{ .uncertain = self.failure(.effect_dispatch, err, progress) };
+        const observation_start = clockAt(clock, &elapsed) catch |err| return .{ .uncertain = self.failure(.effect_verify, err, progress) };
+        var after = self.inspect() catch |err| return .{ .uncertain = self.failure(.effect_verify, err, progress) };
+        const observation_end = clockAt(clock, &elapsed) catch |err| {
+            after.deinit();
+            return .{ .uncertain = self.failure(.effect_verify, err, progress) };
+        };
+        if (after.state != .owned) {
+            after.deinit();
+            return .{ .uncertain = self.failure(.effect_verify, error.Changed, progress) };
+        }
+        return .{ .verified = .{ .snapshot = after, .changed = progress.requested, .observed_start_wall_us = observation_start, .observed_wall_us = observation_end } };
+    }
+    fn withdrawEntries(self: *Inspector, tokens: []const DispatchToken, baseline: *const Snapshot, timer: *std.time.Timer, progress: *MutationProgress) Error!void {
+        var present: [max_withdraw_messages]DispatchToken = undefined;
+        var installed: [max_withdraw_messages]Entry = undefined;
+        var present_count: usize = 0;
+        for (tokens) |token| {
+            installed[present_count] = try findEntry(baseline.entries, token.scope, token.effect_id) orelse continue;
+            present[present_count] = token;
+            present_count += 1;
+        }
+        if (present_count == 0) return;
+        if (self.installation.transport != .nftables) {
+            for (present[0..present_count], installed[0..present_count]) |token, entry| try self.mutateExact(token, entry, 0, timer, progress);
+            return;
+        }
+        return self.withdrawNft(present[0..present_count], timer, progress);
+    }
+    fn withdrawNft(self: *Inspector, present: []const DispatchToken, timer: *std.time.Timer, progress: *MutationProgress) Error!void {
+        var name_buf: [28]u8 = undefined;
+        const name = self.installation.name(&name_buf);
+        var sock = nl.NetlinkSocket.init(linux.NETLINK.NETFILTER) catch |err| return netlinkError(err);
+        defer sock.close();
+        var host_count: usize = 0;
+        var scoped_count: usize = 0;
+        for (present) |token| {
+            if (hostScope(token.scope)) host_count += 1 else scoped_count += 1;
+        }
+        var handles: [max_withdraw_messages]u64 = undefined;
+        var handle_count: usize = 0;
+        if (scoped_count != 0) {
+            var request_buf: [256]u8 align(4) = undefined;
+            const request = nft.buildTablePayload(&request_buf, nl.NFPROTO.INET, name) catch |err| return netlinkError(err);
+            var rules = try dump(self, &sock, nft.NFT_MSG.GETRULE, nft.NFT_MSG.NEWRULE, request, timer, 0);
+            defer rules.deinit();
+            var per_token = [_]usize{0} ** max_withdraw_messages;
+            var collected: usize = 0;
+            for (rules.values.items) |payload| {
+                const attributes = try payloadAttrs(payload, &.{ 1, 2, 3, 4, 6, 7, 8 });
+                if (!mem.eql(u8, try attributes.text(1), name) or !mem.eql(u8, try attributes.text(2), "input") or attributes.values[7] == null) continue;
+                const metadata = try ScopedRuleMetadata.decode(try attributes.get(7));
+                const owner = for (present, 0..) |token, index| {
+                    if (mem.eql(u8, &metadata.effect_id, &token.effect_id) and !hostScope(token.scope)) break index;
+                } else continue;
+                if (!std.meta.eql(metadata.scope, present[owner].scope)) return error.ForeignState;
+                try validateScopedDropRule(name, attributes, metadata);
+                const handle = try attributes.number(u64, 3);
+                if (handle == 0) return error.UnknownState;
+                if (per_token[owner] == nft.max_scope_rule_parts) continue;
+                per_token[owner] += 1;
+                collected += 1;
+                if (collected <= handles.len) {
+                    handles[handle_count] = handle;
+                    handle_count += 1;
+                }
+            }
+            if (host_count + collected > max_withdraw_messages) return error.LimitExceeded;
+        }
+        var payloads: [max_withdraw_messages][128]u8 align(4) = undefined;
+        var batch_bytes: [withdraw_batch_bytes]u8 align(4) = undefined;
+        var related: [max_withdraw_messages + 2]u32 = undefined;
+        var batch = nl.Batch.init(&batch_bytes);
+        related[0] = sock.nextSeq();
+        batch.begin(related[0], sock.port_id, nl.NFNL.SUBSYS_NFTABLES) catch |err| return netlinkError(err);
+        var count: usize = 1;
+        for (present) |token| {
+            const address = legacyAddress(token.scope) catch continue;
+            var key_buf: [16]u8 = undefined;
+            const payload = nft.buildSetElemDelPayload(&payloads[count - 1], nl.NFPROTO.INET, name, if (address == .ipv4) "banned_ipv4" else "banned_ipv6", nftSetKey(address, &key_buf)) catch |err| return netlinkError(err);
+            related[count] = sock.nextSeq();
+            batch.add(nl.nfnlMsgType(nl.NFNL.SUBSYS_NFTABLES, nft.NFT_MSG.DELSETELEM), linux.NLM_F_REQUEST | linux.NLM_F_ACK, related[count], sock.port_id, payload) catch |err| return netlinkError(err);
+            count += 1;
+        }
+        for (handles[0..handle_count]) |handle| {
+            const payload = nft.buildRuleDeletePayload(&payloads[count - 1], name, "input", handle) catch |err| return netlinkError(err);
+            related[count] = sock.nextSeq();
+            batch.add(nl.nfnlMsgType(nl.NFNL.SUBSYS_NFTABLES, nft.NFT_MSG.DELRULE), linux.NLM_F_REQUEST | linux.NLM_F_ACK, related[count], sock.port_id, payload) catch |err| return netlinkError(err);
+            count += 1;
+        }
+        if (count == 1) return error.Changed;
+        related[count] = sock.nextSeq();
+        const bytes = batch.commit(related[count], sock.port_id, nl.NFNL.SUBSYS_NFTABLES) catch |err| return netlinkError(err);
+        const send_timeout = @min(try self.remainingMs(timer), 2000);
+        progress.requested = true;
+        nl.sendKernel(&sock, bytes, send_timeout) catch |err| return netlinkError(err);
+        nl.receiveAcknowledgments(&sock, related[1..count], related[0 .. count + 1], @min(try self.remainingMs(timer), 2000)) catch |err| return rejectedBatch(err, progress);
+        try self.afterMutation(1);
+    }
     fn failure(self: *const Inspector, stage: OperationStage, cause: Error, progress: MutationProgress) FailureContext {
         return .{
             .backend = self.installation.transport,
@@ -550,16 +691,7 @@ pub const Inspector = struct {
         defer sock.close();
         var key_buf: [16]u8 = undefined;
         const scoped_address = try legacyAddress(token.scope);
-        const key: []const u8 = switch (scoped_address) {
-            .ipv4 => |v| blk: {
-                mem.writeInt(u32, key_buf[0..4], v, .big);
-                break :blk key_buf[0..4];
-            },
-            .ipv6 => |v| blk: {
-                mem.writeInt(u128, &key_buf, v, .big);
-                break :blk &key_buf;
-            },
-        };
+        const key = nftSetKey(scoped_address, &key_buf);
         const set = if (scoped_address == .ipv4) "banned_ipv4" else "banned_ipv6";
         var payloads: [2][512]u8 align(4) = undefined;
         var batch_buf: [2048]u8 align(4) = undefined;

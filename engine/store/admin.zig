@@ -58,24 +58,8 @@ pub fn Methods(comptime Store: type) type {
             }
             if (std.mem.eql(u8, &change.generation, &change.next_generation)) return;
             try self.exec("PRAGMA defer_foreign_keys=ON;");
-            const rekeyed = [_][:0]const u8{
-                "UPDATE records SET source_generation=?3 WHERE jail=?1 AND source_generation=?2;",
-                "UPDATE checkpoints SET payload=substr(payload,1,8)||?3||substr(payload,41) WHERE jail=?1 AND substr(payload,1,4)=CAST('F2NT' AS BLOB) AND substr(payload,9,32)=?2;",
-                "UPDATE checkpoints SET payload=substr(payload,1,6)||?3||substr(payload,39) WHERE jail=?1 AND substr(payload,1,4)=CAST('F2JC' AS BLOB) AND substr(payload,7,32)=?2;",
-                "UPDATE source_maintenance SET generation=?3 WHERE jail=?1 AND generation=?2;",
-                "UPDATE replay_guards SET generation=?3 WHERE jail=?1 AND generation=?2;",
-                "UPDATE consumer_checkpoints SET generation=?3 WHERE jail=?1 AND generation=?2;",
-                "UPDATE consumer_manifests SET generation=?3 WHERE jail=?1 AND generation=?2;",
-                "UPDATE consumer_requirements SET generation=?3 WHERE jail=?1 AND generation=?2;",
-            };
-            for (rekeyed) |sql| {
-                var update = try self.statement(sql);
-                defer update.deinit();
-                try update.text(1, jail);
-                try update.blob(2, &change.generation);
-                try update.blob(3, &change.next_generation);
-                try update.done();
-            }
+            var discarded = Store.RekeyReport{ .retry_rows = 0, .pending_receipts = 0, .manifests = 0, .cursors = 0 };
+            try self.rekeyGenerationTablesTx(jail, change.generation, change.next_generation, &discarded);
             if (change.cursor_rebinding) |rebinding| {
                 var old_fragment: [256]u8 = undefined;
                 var new_fragment: [256]u8 = undefined;
@@ -273,7 +257,7 @@ pub fn Methods(comptime Store: type) type {
             return .{ .generation = try effectBlob(&row, 0, 32), .config_digest = try effectBlob(&row, 1, 32), .published = (try row.signed(2)) == 1, .committed_us = try row.signed(3) };
         }
 
-        pub const AdminKind = enum(u8) { group_enable = 1, group_disable, group_pause, group_resume, setting_batch, ban, unban, history_reset, migration_activate, migration_rollback };
+        pub const AdminKind = enum(u8) { group_enable = 1, group_disable, group_pause, group_resume, setting_batch, ban, unban, history_reset, migration_activate, migration_rollback, ignore_add, ignore_remove };
         pub const AdminOutcome = enum(u8) { applied = 1, rejected, absent, partial, uncertain };
         pub const admin_request_retention = 4096;
         pub const admin_request_max_age_us: i64 = 30 * 24 * 60 * 60 * 1_000_000;
@@ -334,6 +318,7 @@ pub fn Methods(comptime Store: type) type {
             try self.beginWrite();
             errdefer self.rollback();
             if (self.schema_version < 22) return error.AdminStorageRequired;
+            if (@intFromEnum(record.kind) >= @intFromEnum(AdminKind.ignore_add) and self.schema_version < @import("store.zig").latest_schema) return error.AdminStorageRequired;
             if (record.admission_revision) |value| if (value > std.math.maxInt(i64)) return error.InvalidAdminRequest;
             if (record.outcome != .rejected) try self.bumpAdminRevisionTx();
             const mutation_revision = try self.integer("SELECT mutation_revision FROM admin_revision WHERE id=1;");

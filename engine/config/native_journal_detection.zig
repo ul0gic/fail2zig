@@ -8,6 +8,7 @@ const origin = @import("../core/native_journal_origin.zig");
 const session = @import("../core/native_journal_session.zig");
 const processing = @import("../core/native_source_processor.zig");
 const transport = @import("../core/native_journal_transport.zig");
+const ignore_set = @import("../core/native_ignore_set.zig");
 pub const Settings = struct {
     machine_id: []const u8,
     executables: []const []const u8,
@@ -21,6 +22,7 @@ pub const Settings = struct {
 pub const Plan = struct {
     allocator: std.mem.Allocator,
     base: ?builtin.Detector,
+    ignore_cell: ?**ignore_set.EffectiveIgnore,
     qualified: ?journal.Detector,
     profile: origin.Profile,
     owned_executables: [][]const u8,
@@ -60,7 +62,19 @@ pub const Plan = struct {
         self.allocator = a;
         self.profile = profile;
         self.owned_executables = executables;
-        self.base = if (settings.custom) null else try builtin.Detector.init(a, .{ .filter = jail.filter, .body = .whole, .ignore = jail.ignoreip orelse cfg.defaults.ignoreip, .ignore_capacity = settings.ignore_capacity, .max_decoded_bytes = settings.max_decoded_bytes });
+        const literals = jail.ignoreip orelse cfg.defaults.ignoreip;
+        self.ignore_cell = null;
+        if (!settings.custom) {
+            const cell = try a.create(*ignore_set.EffectiveIgnore);
+            errdefer a.destroy(cell);
+            cell.* = try ignore_set.EffectiveIgnore.build(a, literals, &.{});
+            self.ignore_cell = cell;
+        }
+        errdefer if (self.ignore_cell) |cell| {
+            cell.*.deinit(a);
+            a.destroy(cell);
+        };
+        self.base = if (settings.custom) null else try builtin.Detector.init(a, .{ .filter = jail.filter, .body = .whole, .ignore = literals, .ignores = self.ignore_cell, .ignore_capacity = settings.ignore_capacity, .max_decoded_bytes = settings.max_decoded_bytes });
         errdefer if (self.base) |*value| value.deinit(a);
         self.qualified = if (self.base) |*value| try journal.Detector.init(value, profile) else null;
         self.processing = .{ .jail = jail.name, .parent_generation = parent, .timestamp = .journal, .window_us = window, .max_record_bytes = settings.max_record_bytes, .max_decoded_bytes = settings.max_decoded_bytes };
@@ -71,9 +85,18 @@ pub const Plan = struct {
     pub fn sessionOptions(self: *const Plan) session.Options {
         return .{ .processing = self.processing, .detection = if (self.qualified) |*value| value.consumer() else null, .journal = self.journal, .source_id = self.source_id };
     }
+    pub fn legacySessionOptions(self: *const Plan) session.Options {
+        var options = self.sessionOptions();
+        if (self.qualified) |*value| options.detection = value.legacyConsumer();
+        return options;
+    }
     pub fn destroy(self: *Plan) void {
         const a = self.allocator;
         if (self.base) |*value| value.deinit(a);
+        if (self.ignore_cell) |cell| {
+            cell.*.deinit(a);
+            a.destroy(cell);
+        }
         for (self.owned_executables) |path| a.free(path);
         a.free(self.owned_executables);
         a.destroy(self);

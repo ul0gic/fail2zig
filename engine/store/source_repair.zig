@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const store_mod = @import("store.zig");
 const files = @import("../core/durable_file_source.zig");
+const continuity = @import("continuity.zig");
 const Store = store_mod.Store;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -16,6 +17,8 @@ pub const max_token_bytes = 128;
 const max_path_rows = 64;
 const outcome_truncation_acknowledged: i64 = 1;
 const outcome_evicted: i64 = 2;
+const outcome_removed_incarnation_acknowledged: i64 = 3;
+const outcome_replaced_file_acknowledged: i64 = 4;
 
 pub const Error = store_mod.Error || error{
     InvalidRepairRequest,
@@ -33,6 +36,7 @@ pub const Error = store_mod.Error || error{
     RepairTokenMismatch,
     RepairTokenEvicted,
     RepairHistoryFull,
+    LossAlreadyRecorded,
 };
 
 /// Observed relation between the recorded checkpoint and the file at the source path.
@@ -47,6 +51,15 @@ pub const Request = struct {
 
 pub const FileIdentity = struct { device: u64, inode: u64, size: u64, prefix_sha256: [32]u8 };
 
+pub const RemovedIncarnation = struct {
+    inode: u64,
+    last_size: ?u64,
+    /// Only known when this call committed; a replay has the row, not the prior cursor.
+    committed_offset: ?u64,
+    current_inode: ?u64,
+    current_offset: ?u64,
+};
+
 pub const Outcome = struct {
     replayed: bool,
     /// Owned by the allocator passed to `repair`.
@@ -60,13 +73,17 @@ pub const Outcome = struct {
     new_incarnation: [16]u8,
     file: FileIdentity,
     committed_us: i64,
+    removed: ?RemovedIncarnation = null,
+    replaced_file: bool = false,
 
     pub fn deinit(self: Outcome, allocator: std.mem.Allocator) void {
         allocator.free(self.source);
     }
 };
 
-pub const Diagnostic = struct { shape: ?Shape = null };
+pub const RecordedLoss = struct { wall_us: i64, inode: u64, committed_offset: u64, observed_size: ?u64 };
+
+pub const Diagnostic = struct { shape: ?Shape = null, recorded: ?RecordedLoss = null };
 
 pub const Fault = enum { before_commit, after_commit };
 pub const Hooks = if (builtin.is_test) struct {
@@ -103,6 +120,7 @@ const Plan = struct {
     generation: [32]u8,
     revision: u64,
     size: u64,
+    replaced: bool = false,
 
     fn deinit(self: Plan, allocator: std.mem.Allocator) void {
         allocator.free(self.source);
@@ -129,14 +147,17 @@ pub fn repair(store: *Store, allocator: std.mem.Allocator, request: Request, now
     };
     const file = std.fs.File{ .handle = fd };
     defer file.close();
-    const plan = try observe(store, allocator, request, file, diagnostic);
+    const plan = observe(store, allocator, request, file, diagnostic) catch |err| switch (err) {
+        error.TokenUnknownStateMismatch, error.UnsupportedDiscontinuity => return alternative(store, allocator, request, key, file, now_us, hooks, diagnostic, err),
+        else => return err,
+    };
     defer plan.deinit(allocator);
     if (builtin.is_test) if (hooks.after_observe) |hook| hook(hooks.context);
     return commit(store, allocator, request, key, file, plan, now_us, hooks);
 }
 
 fn requireMigratedSchema(store: *Store) Error!void {
-    if (try store.integer("PRAGMA user_version;") != store_mod.load_repair_schema) return error.LoadRepairMigrationRequired;
+    if (try store.integer("PRAGMA user_version;") != store_mod.latest_schema) return error.LoadRepairMigrationRequired;
     switch (try store.loadRepairStatus()) {
         .complete => {},
         .incomplete => return error.LoadRepairMigrationIncomplete,
@@ -157,16 +178,19 @@ fn readRow(store: *Store, allocator: std.mem.Allocator, request: Request, key: [
     defer row.deinit();
     try row.blob(1, &key);
     if (!try row.row()) return null;
-    if (try row.signed(11) == outcome_evicted) return error.RepairTokenEvicted;
+    const outcome = try row.signed(11);
+    if (outcome == outcome_evicted) return error.RepairTokenEvicted;
     const device = try unsigned(try row.signed(5));
     const inode = try unsigned(try row.signed(6));
     var buffer: [store_mod.Limits.source_bytes + 128]u8 = undefined;
     const expected = try sourceId(&buffer, request.jail, request.path, device, inode);
-    if (!std.mem.eql(u8, try row.boundedBytes(0, 64), request.jail) or !std.mem.eql(u8, try row.boundedBytes(1, store_mod.Limits.source_bytes), expected))
-        return error.RepairTokenMismatch;
+    const stored = try row.boundedBytes(1, store_mod.Limits.source_bytes);
+    const same_path = request.jail.len + 1 + request.path.len + 1;
+    const named = if (outcome == outcome_replaced_file_acknowledged) stored.len > same_path and std.mem.eql(u8, stored[0..same_path], expected[0..same_path]) else std.mem.eql(u8, stored, expected);
+    if (!std.mem.eql(u8, try row.boundedBytes(0, 64), request.jail) or !named) return error.RepairTokenMismatch;
     return .{
         .replayed = true,
-        .source = try allocator.dupe(u8, expected),
+        .source = try allocator.dupe(u8, stored),
         .generation = try fixed(32, &row, 2),
         .prior_cursor_sha256 = try fixed(32, &row, 3),
         .prior_checkpoint_revision = try unsigned(try row.signed(4)),
@@ -175,6 +199,8 @@ fn readRow(store: *Store, allocator: std.mem.Allocator, request: Request, key: [
         .new_incarnation = try fixed(16, &row, 9),
         .file = .{ .device = device, .inode = inode, .size = try unsigned(try row.signed(7)), .prefix_sha256 = try fixed(32, &row, 8) },
         .committed_us = try row.signed(10),
+        .removed = if (outcome == outcome_removed_incarnation_acknowledged) .{ .inode = inode, .last_size = null, .committed_offset = null, .current_inode = null, .current_offset = null } else null,
+        .replaced_file = outcome == outcome_replaced_file_acknowledged,
     };
 }
 
@@ -280,33 +306,352 @@ fn readCheckpoint(store: *Store, jail: []const u8) Error!Checkpoint {
     return .{ .generation = payload[8..40].*, .revision = @intCast(revision) };
 }
 
-fn requireNoPendingWork(store: *Store, request: Request, plan: Plan) Error!void {
+fn requireNoPendingWork(store: *Store, request: Request, source: []const u8, generation: [32]u8) Error!void {
     {
         var row = try store.statement("SELECT 1 FROM pending_receipts WHERE jail=?1 AND source=?2;");
         defer row.deinit();
         try row.text(1, request.jail);
-        try row.text(2, plan.source);
+        try row.text(2, source);
         if (try row.row()) return error.PendingReceipt;
     }
     var row = try store.statement("SELECT generation,ready FROM consumer_manifests WHERE jail=?1 AND source=?2;");
     defer row.deinit();
     try row.text(1, request.jail);
-    try row.text(2, plan.source);
+    try row.text(2, source);
     if (!try row.row()) return;
     if (try row.signed(1) != 1) return error.ConsumerWorkPending;
-    if (!std.mem.eql(u8, &try fixed(32, &row, 0), &plan.generation)) return error.StaleGeneration;
+    if (!std.mem.eql(u8, &try fixed(32, &row, 0), &generation)) return error.StaleGeneration;
 }
 
 // Restat by path and descriptor. This detects, but cannot prevent, a producer writing or
 // replacing the file during the repair; the next start still verifies continuity.
-fn requireUnchangedFile(request: Request, file: std.fs.File, plan: Plan) Error!void {
+fn requireNamedFile(request: Request, file: std.fs.File) Error!std.posix.Stat {
     const held = std.posix.fstat(file.handle) catch return error.SourceChanged;
     const named = std.posix.fstatat(std.posix.AT.FDCWD, request.path, 0) catch return error.SourceChanged;
     if (held.dev != named.dev or held.ino != named.ino) return error.SourceChanged;
+    return held;
+}
+
+fn requireUnchangedFile(request: Request, file: std.fs.File, plan: Plan) Error!void {
+    const held = try requireNamedFile(request, file);
     if (@as(u64, @intCast(held.dev)) != plan.next.device or @as(u64, @intCast(held.ino)) != plan.next.inode) return error.SourceChanged;
     if (std.math.cast(u64, held.size) != plan.size) return error.SourceChanged;
     const digest = files.prefixDigest(file, plan.next.prefix_len) catch return error.SourceChanged;
     if (!std.mem.eql(u8, &digest, &plan.next.prefix_hash)) return error.SourceChanged;
+}
+
+const RemovedPlan = struct {
+    source: []u8,
+    prior_cursor: []u8,
+    prior: files.Resume,
+    current_device: u64,
+    current_inode: u64,
+    current_offset: ?u64,
+    current_incarnation: ?[16]u8,
+    generation: [32]u8,
+    revision: u64,
+
+    fn deinit(self: RemovedPlan, allocator: std.mem.Allocator) void {
+        allocator.free(self.source);
+        allocator.free(self.prior_cursor);
+    }
+};
+
+fn inodePresent(path: []const u8, device: u64, inode: u64) Error!bool {
+    var directory = std.fs.cwd().openDir(std.fs.path.dirname(path) orelse ".", .{ .iterate = true }) catch return error.SourceUnreadable;
+    defer directory.close();
+    var entries = directory.iterate();
+    var visited: usize = 0;
+    while (entries.next() catch return error.SourceUnreadable) |entry| {
+        visited += 1;
+        if (visited > files.discovery_entries_per_episode) return error.SourceUnreadable;
+        const stat = std.posix.fstatat(directory.fd, entry.name, 0) catch |failure| {
+            if (failure == error.FileNotFound) continue;
+            return error.SourceUnreadable;
+        };
+        if (std.posix.S.ISREG(stat.mode) and @as(u64, @intCast(stat.dev)) == device and @as(u64, @intCast(stat.ino)) == inode) return true;
+    }
+    return false;
+}
+
+fn removedUnread(prior: files.Resume) bool {
+    const size = prior.observed_size orelse return true;
+    return prior.offset != size;
+}
+
+// The first recorded incarnation, by source order, whose inode is gone while the path holds another.
+fn observeRemoved(store: *Store, allocator: std.mem.Allocator, request: Request, file: std.fs.File) Error!?RemovedPlan {
+    const stat = std.posix.fstat(file.handle) catch return error.SourceUnreadable;
+    if (!std.posix.S.ISREG(stat.mode)) return error.SourceUnreadable;
+    const device: u64 = @intCast(stat.dev);
+    const inode: u64 = @intCast(stat.ino);
+
+    try store.beginRead();
+    errdefer store.rollback();
+    var rows = try store.statement("SELECT source,cursor FROM source_cursors WHERE jail=?1 AND path=?2 ORDER BY source;");
+    defer rows.deinit();
+    try rows.text(1, request.jail);
+    try rows.text(2, request.path);
+    var count: usize = 0;
+    var selected: ?RemovedPlan = null;
+    errdefer if (selected) |value| value.deinit(allocator);
+    var current_offset: ?u64 = null;
+    var current_incarnation: ?[16]u8 = null;
+    while (try rows.row()) {
+        count += 1;
+        if (count > max_path_rows) return error.SourceAmbiguous;
+        const cursor = try rows.boundedBytes(1, store_mod.Limits.cursor_bytes);
+        const parsed = std.json.parseFromSlice(files.Resume, allocator, cursor, .{}) catch return error.InvalidRecord;
+        defer parsed.deinit();
+        const prior = parsed.value;
+        if (prior.version != 2 or prior.prefix_len > 64) return error.InvalidRecord;
+        if (prior.device == device and prior.inode == inode) {
+            current_offset = prior.offset;
+            current_incarnation = prior.incarnation;
+            continue;
+        }
+        if (selected != null or !removedUnread(prior)) continue;
+        if (try inodePresent(request.path, prior.device, prior.inode)) continue;
+        const source = try allocator.dupe(u8, try rows.boundedBytes(0, store_mod.Limits.source_bytes));
+        errdefer allocator.free(source);
+        const prior_cursor = try allocator.dupe(u8, cursor);
+        selected = .{ .source = source, .prior_cursor = prior_cursor, .prior = prior, .current_device = device, .current_inode = inode, .current_offset = null, .current_incarnation = null, .generation = undefined, .revision = undefined };
+    }
+    var plan = selected orelse {
+        try store.commitTransaction();
+        return null;
+    };
+    plan.current_offset = current_offset;
+    plan.current_incarnation = current_incarnation;
+    const checkpoint = try readCheckpoint(store, request.jail);
+    plan.generation = checkpoint.generation;
+    plan.revision = checkpoint.revision;
+    try store.commitTransaction();
+    selected = null;
+    return plan;
+}
+
+fn alternative(store: *Store, allocator: std.mem.Allocator, request: Request, key: [32]u8, file: std.fs.File, now_us: i64, hooks: Hooks, diagnostic: *Diagnostic, original: Error) Error!Outcome {
+    if (diagnostic.shape == .prefix_changed) return original;
+    if (diagnostic.shape == .continuous) {
+        const stat = std.posix.fstat(file.handle) catch return error.SourceUnreadable;
+        var buffer: [store_mod.Limits.source_bytes + 128]u8 = undefined;
+        const source = try sourceId(&buffer, request.jail, request.path, @intCast(stat.dev), @intCast(stat.ino));
+        var event: files.LossEvent = undefined;
+        if (try store.lossForIncarnation(request.jail, source, @intCast(stat.ino), &event)) {
+            diagnostic.recorded = .{ .wall_us = event.wall_us, .inode = event.inode, .committed_offset = event.committed_offset, .observed_size = event.observed_size };
+            return error.LossAlreadyRecorded;
+        }
+    }
+    if (try observeRemoved(store, allocator, request, file)) |removed| {
+        defer removed.deinit(allocator);
+        return commitRemoved(store, allocator, request, key, file, removed, now_us, hooks);
+    }
+    if (diagnostic.shape != .replaced) return original;
+    const replaced = (try observeReplaced(store, allocator, request, file)) orelse return original;
+    defer replaced.deinit(allocator);
+    return commit(store, allocator, request, key, file, replaced, now_us, hooks);
+}
+
+fn observeReplaced(store: *Store, allocator: std.mem.Allocator, request: Request, file: std.fs.File) Error!?Plan {
+    const stat = std.posix.fstat(file.handle) catch return error.SourceUnreadable;
+    if (!std.posix.S.ISREG(stat.mode)) return error.SourceUnreadable;
+    const size = std.math.cast(u64, stat.size) orelse return error.SourceUnreadable;
+
+    try store.beginRead();
+    errdefer store.rollback();
+    var rows = try store.statement("SELECT source,cursor FROM source_cursors WHERE jail=?1 AND path=?2 ORDER BY source;");
+    defer rows.deinit();
+    try rows.text(1, request.jail);
+    try rows.text(2, request.path);
+    var count: usize = 0;
+    var selected: ?Plan = null;
+    errdefer if (selected) |value| value.deinit(allocator);
+    while (try rows.row()) {
+        count += 1;
+        if (count > max_path_rows) return error.SourceAmbiguous;
+        const cursor = try rows.boundedBytes(1, store_mod.Limits.cursor_bytes);
+        const parsed = std.json.parseFromSlice(files.Resume, allocator, cursor, .{}) catch return error.InvalidRecord;
+        defer parsed.deinit();
+        const prior = parsed.value;
+        if (prior.version != 2 or prior.prefix_len > 64) return error.InvalidRecord;
+        if (selected != null or try inodePresent(request.path, prior.device, prior.inode)) continue;
+        const source = try allocator.dupe(u8, try rows.boundedBytes(0, store_mod.Limits.source_bytes));
+        errdefer allocator.free(source);
+        const prior_cursor = try allocator.dupe(u8, cursor);
+        errdefer allocator.free(prior_cursor);
+        selected = .{ .source = source, .prior_cursor = prior_cursor, .prior = prior, .next = files.restartedIncarnation(file, prior) catch return error.SourceUnreadable, .generation = undefined, .revision = undefined, .size = size, .replaced = true };
+    }
+    var plan = selected orelse {
+        try store.commitTransaction();
+        return null;
+    };
+    const checkpoint = try readCheckpoint(store, request.jail);
+    plan.generation = checkpoint.generation;
+    plan.revision = checkpoint.revision;
+    try store.commitTransaction();
+    selected = null;
+    return plan;
+}
+
+fn insertLossEvent(store: *Store, event: files.LossEvent) Error!void {
+    {
+        var row = try store.statement("INSERT INTO continuity_loss_events(jail,path,source,wall_us,reason,inode,committed_offset,observed_size) VALUES(?1,?2,?3,?4,?5,?6,?7,?8);");
+        defer row.deinit();
+        try row.text(1, event.jail);
+        try row.text(2, event.path);
+        try row.text(3, event.source_id);
+        try row.int(4, event.wall_us);
+        try row.int(5, @intFromEnum(event.reason));
+        try row.int(6, std.math.cast(i64, event.inode) orelse return error.StorageLimit);
+        try row.int(7, std.math.cast(i64, event.committed_offset) orelse return error.StorageLimit);
+        if (event.observed_size) |size| try row.int(8, std.math.cast(i64, size) orelse return error.StorageLimit) else try store.check(store.api.bind_null(row.ptr, 8));
+        try row.done();
+    }
+    {
+        var row = try store.statement("DELETE FROM continuity_loss_events WHERE jail=?1 AND path=?2 AND sequence NOT IN (SELECT sequence FROM continuity_loss_events WHERE jail=?1 AND path=?2 ORDER BY sequence DESC LIMIT ?3);");
+        defer row.deinit();
+        try row.text(1, event.jail);
+        try row.text(2, event.path);
+        try row.int(3, continuity.retained_events_per_source);
+        try row.done();
+    }
+}
+
+fn commitRemoved(store: *Store, allocator: std.mem.Allocator, request: Request, key: [32]u8, file: std.fs.File, plan: RemovedPlan, now_us: i64, hooks: Hooks) Error!Outcome {
+    var prior_cursor_sha256: [32]u8 = undefined;
+    Sha256.hash(plan.prior_cursor, &prior_cursor_sha256, .{});
+    const repair_size = plan.prior.observed_size orelse plan.prior.offset;
+
+    try store.beginWrite();
+    var committed = false;
+    errdefer if (!committed) store.rollback();
+    if (try readRow(store, allocator, request, key)) |prior| {
+        errdefer prior.deinit(allocator);
+        try store.commitTransaction();
+        committed = true;
+        return prior;
+    }
+    if (try store.integer("SELECT count(*) FROM source_repairs;") >= retained_repairs + retained_tombstones) return error.RepairHistoryFull;
+    const checkpoint = try readCheckpoint(store, request.jail);
+    if (checkpoint.revision != plan.revision) return error.StaleCheckpoint;
+    if (!std.mem.eql(u8, &checkpoint.generation, &plan.generation)) return error.StaleGeneration;
+    try requireNoPendingWork(store, request, plan.source, plan.generation);
+    const held = try requireNamedFile(request, file);
+    if (@as(u64, @intCast(held.dev)) != plan.current_device or @as(u64, @intCast(held.ino)) != plan.current_inode) return error.SourceChanged;
+    try insertLossEvent(store, .{
+        .sequence = 0,
+        .jail = request.jail,
+        .path = request.path,
+        .source_id = plan.source,
+        .wall_us = now_us,
+        .reason = .rotated_unread_removed,
+        .inode = plan.prior.inode,
+        .committed_offset = plan.prior.offset,
+        .observed_size = plan.prior.observed_size,
+    });
+    {
+        var row = try store.statement("DELETE FROM source_cursors WHERE jail=?1 AND source=?2 AND cursor=?3;");
+        defer row.deinit();
+        try row.text(1, request.jail);
+        try row.text(2, plan.source);
+        try row.blob(3, plan.prior_cursor);
+        try row.done();
+        if (store.api.changes(store.db) != 1) return error.StaleCheckpoint;
+    }
+    try bumpRevision(store, request.jail, plan.revision);
+    const committed_us = try recordRepair(store, .{
+        .key = key,
+        .jail = request.jail,
+        .source = plan.source,
+        .generation = plan.generation,
+        .prior_cursor_sha256 = prior_cursor_sha256,
+        .revision = plan.revision,
+        .device = std.math.cast(i64, plan.prior.device) orelse return error.StorageLimit,
+        .inode = std.math.cast(i64, plan.prior.inode) orelse return error.StorageLimit,
+        .size = std.math.cast(i64, repair_size) orelse return error.StorageLimit,
+        .prefix_sha256 = plan.prior.prefix_hash,
+        .incarnation = plan.current_incarnation orelse [_]u8{0} ** 16,
+        .outcome = outcome_removed_incarnation_acknowledged,
+    }, now_us);
+    if (builtin.is_test) if (hooks.fail_at == .before_commit) return error.InjectedFailure;
+    try store.commitTransaction();
+    committed = true;
+    if (builtin.is_test) if (hooks.fail_at == .after_commit) return error.InjectedFailure;
+    return .{
+        .replayed = false,
+        .source = try allocator.dupe(u8, plan.source),
+        .generation = plan.generation,
+        .prior_checkpoint_revision = plan.revision,
+        .prior_cursor_sha256 = prior_cursor_sha256,
+        .prior_offset = plan.prior.offset,
+        .prior_incarnation = plan.prior.incarnation,
+        .new_incarnation = plan.current_incarnation orelse [_]u8{0} ** 16,
+        .file = .{ .device = plan.prior.device, .inode = plan.prior.inode, .size = repair_size, .prefix_sha256 = plan.prior.prefix_hash },
+        .committed_us = committed_us,
+        .removed = .{ .inode = plan.prior.inode, .last_size = plan.prior.observed_size, .committed_offset = plan.prior.offset, .current_inode = plan.current_inode, .current_offset = plan.current_offset },
+    };
+}
+
+const RepairRow = struct {
+    key: [32]u8,
+    jail: []const u8,
+    source: []const u8,
+    generation: [32]u8,
+    prior_cursor_sha256: [32]u8,
+    revision: u64,
+    device: i64,
+    inode: i64,
+    size: i64,
+    prefix_sha256: [32]u8,
+    incarnation: [16]u8,
+    outcome: i64,
+};
+
+fn bumpRevision(store: *Store, jail: []const u8, revision: u64) Error!void {
+    var row = try store.statement("UPDATE checkpoints SET revision=revision+1 WHERE jail=?1 AND revision=?2;");
+    defer row.deinit();
+    try row.text(1, jail);
+    try row.int(2, @intCast(revision));
+    try row.done();
+    if (store.api.changes(store.db) != 1) return error.StaleCheckpoint;
+}
+
+fn recordRepair(store: *Store, repair_row: RepairRow, now_us: i64) Error!i64 {
+    // Retention orders by this time, so it never moves backwards across repairs.
+    const committed_us = blk: {
+        var row = try store.statement("SELECT max(?1,coalesce(max(committed_us)+1,?1)) FROM source_repairs;");
+        defer row.deinit();
+        try row.int(1, now_us);
+        if (!try row.row()) return error.DatabaseFailure;
+        break :blk try row.signed(0);
+    };
+    {
+        var row = try store.statement("INSERT INTO source_repairs VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13);");
+        defer row.deinit();
+        try row.blob(1, &repair_row.key);
+        try row.text(2, repair_row.jail);
+        try row.text(3, repair_row.source);
+        try row.blob(4, &repair_row.generation);
+        try row.blob(5, &repair_row.prior_cursor_sha256);
+        try row.int(6, @intCast(repair_row.revision));
+        try row.int(7, repair_row.device);
+        try row.int(8, repair_row.inode);
+        try row.int(9, repair_row.size);
+        try row.blob(10, &repair_row.prefix_sha256);
+        try row.blob(11, &repair_row.incarnation);
+        try row.int(12, repair_row.outcome);
+        try row.int(13, committed_us);
+        try row.done();
+    }
+    {
+        var row = try store.statement("UPDATE source_repairs SET outcome=?2,source='-' WHERE outcome<>?2 AND token NOT IN (SELECT token FROM source_repairs WHERE outcome<>?2 ORDER BY committed_us DESC,token DESC LIMIT ?1);");
+        defer row.deinit();
+        try row.int(1, retained_repairs);
+        try row.int(2, outcome_evicted);
+        try row.done();
+    }
+    return committed_us;
 }
 
 fn commit(store: *Store, allocator: std.mem.Allocator, request: Request, key: [32]u8, file: std.fs.File, plan: Plan, now_us: i64, hooks: Hooks) Error!Outcome {
@@ -329,8 +674,19 @@ fn commit(store: *Store, allocator: std.mem.Allocator, request: Request, key: [3
     const checkpoint = try readCheckpoint(store, request.jail);
     if (checkpoint.revision != plan.revision) return error.StaleCheckpoint;
     if (!std.mem.eql(u8, &checkpoint.generation, &plan.generation)) return error.StaleGeneration;
-    try requireNoPendingWork(store, request, plan);
+    try requireNoPendingWork(store, request, plan.source, plan.generation);
     try requireUnchangedFile(request, file, plan);
+    if (plan.replaced) try insertLossEvent(store, .{
+        .sequence = 0,
+        .jail = request.jail,
+        .path = request.path,
+        .source_id = plan.source,
+        .wall_us = now_us,
+        .reason = .replaced,
+        .inode = plan.prior.inode,
+        .committed_offset = plan.prior.offset,
+        .observed_size = plan.size,
+    });
     {
         var row = try store.statement("UPDATE source_cursors SET cursor=?3 WHERE jail=?1 AND source=?2 AND cursor=?4;");
         defer row.deinit();
@@ -341,50 +697,24 @@ fn commit(store: *Store, allocator: std.mem.Allocator, request: Request, key: [3
         try row.done();
         if (store.api.changes(store.db) != 1) return error.StaleCheckpoint;
     }
-    {
-        var row = try store.statement("UPDATE checkpoints SET revision=revision+1 WHERE jail=?1 AND revision=?2;");
-        defer row.deinit();
-        try row.text(1, request.jail);
-        try row.int(2, @intCast(plan.revision));
-        try row.done();
-        if (store.api.changes(store.db) != 1) return error.StaleCheckpoint;
-    }
-    // Retention orders by this time, so it never moves backwards across repairs.
-    const committed_us = blk: {
-        var row = try store.statement("SELECT max(?1,coalesce(max(committed_us)+1,?1)) FROM source_repairs;");
-        defer row.deinit();
-        try row.int(1, now_us);
-        if (!try row.row()) return error.DatabaseFailure;
-        break :blk try row.signed(0);
-    };
-    const size = std.math.cast(i64, plan.size) orelse return error.StorageLimit;
+    try bumpRevision(store, request.jail, plan.revision);
     const device = std.math.cast(i64, plan.next.device) orelse return error.StorageLimit;
     const inode = std.math.cast(i64, plan.next.inode) orelse return error.StorageLimit;
-    {
-        var row = try store.statement("INSERT INTO source_repairs VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13);");
-        defer row.deinit();
-        try row.blob(1, &key);
-        try row.text(2, request.jail);
-        try row.text(3, plan.source);
-        try row.blob(4, &plan.generation);
-        try row.blob(5, &prior_cursor_sha256);
-        try row.int(6, @intCast(plan.revision));
-        try row.int(7, device);
-        try row.int(8, inode);
-        try row.int(9, size);
-        try row.blob(10, &plan.next.prefix_hash);
-        try row.blob(11, &plan.next.incarnation);
-        try row.int(12, outcome_truncation_acknowledged);
-        try row.int(13, committed_us);
-        try row.done();
-    }
-    {
-        var row = try store.statement("UPDATE source_repairs SET outcome=?2,source='-' WHERE outcome<>?2 AND token NOT IN (SELECT token FROM source_repairs WHERE outcome<>?2 ORDER BY committed_us DESC,token DESC LIMIT ?1);");
-        defer row.deinit();
-        try row.int(1, retained_repairs);
-        try row.int(2, outcome_evicted);
-        try row.done();
-    }
+    const size = std.math.cast(i64, plan.size) orelse return error.StorageLimit;
+    const committed_us = try recordRepair(store, .{
+        .key = key,
+        .jail = request.jail,
+        .source = plan.source,
+        .generation = plan.generation,
+        .prior_cursor_sha256 = prior_cursor_sha256,
+        .revision = plan.revision,
+        .device = device,
+        .inode = inode,
+        .size = size,
+        .prefix_sha256 = plan.next.prefix_hash,
+        .incarnation = plan.next.incarnation,
+        .outcome = if (plan.replaced) outcome_replaced_file_acknowledged else outcome_truncation_acknowledged,
+    }, now_us);
     if (builtin.is_test) if (hooks.fail_at == .before_commit) return error.InjectedFailure;
     try store.commitTransaction();
     committed = true;
@@ -400,5 +730,6 @@ fn commit(store: *Store, allocator: std.mem.Allocator, request: Request, key: [3
         .new_incarnation = plan.next.incarnation,
         .file = .{ .device = plan.next.device, .inode = plan.next.inode, .size = plan.size, .prefix_sha256 = plan.next.prefix_hash },
         .committed_us = committed_us,
+        .replaced_file = plan.replaced,
     };
 }

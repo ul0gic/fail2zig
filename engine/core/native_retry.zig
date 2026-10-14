@@ -17,6 +17,8 @@ pub const Escalation = escalation_policy.Policy;
 pub const EscalationScope = escalation_policy.Scope;
 pub const EscalationHistoryInput = escalation_policy.HistoryInput;
 
+pub const HashForm = enum { identity, stored };
+
 pub const Policy = struct {
     maxretry: u16,
     window_us: i64,
@@ -51,6 +53,17 @@ pub const Policy = struct {
             .permanent => 2,
         };
         return bytes;
+    }
+    pub fn identity(self: Policy) Error![policy_bytes]u8 {
+        var bytes = try self.encode();
+        @memset(bytes[24..28], 0);
+        return bytes;
+    }
+    pub fn hashBytes(self: Policy, form: HashForm) Error![policy_bytes]u8 {
+        return switch (form) {
+            .identity => self.identity(),
+            .stored => self.encode(),
+        };
     }
     pub fn decode(bytes: []const u8) Error!Policy {
         if (bytes.len != policy_bytes or !std.mem.eql(u8, bytes[0..4], "F2RP") or

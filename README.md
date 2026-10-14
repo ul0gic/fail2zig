@@ -38,8 +38,8 @@ The installer creates a dedicated `fail2zig` service account, preserves existing
 configuration and installs the unit, man pages and example config. For a dry run,
 manual installation, source build or upgrade, see
 [installation and upgrades](docs/operations/installation.md). The latest release
-is recommended; **v0.4.0 is the minimum supported version**. Pre-v0.4.0
-installation and rollback are unsupported.
+is recommended; **v0.4.6 is the minimum supported upgrade source**. States last
+written by older releases are not an upgrade path; start them from a fresh state.
 
 ## Why fail2zig
 

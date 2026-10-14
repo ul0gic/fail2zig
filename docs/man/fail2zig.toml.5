@@ -1,4 +1,4 @@
-.TH FAIL2ZIG.TOML 5 "2026-09-28" "fail2zig 0.4.6" "File Formats"
+.TH FAIL2ZIG.TOML 5 "2026-10-13" "fail2zig 0.4.7" "File Formats"
 .
 .SH NAME
 fail2zig.toml \- fail2zig daemon configuration file
@@ -69,8 +69,26 @@ Integer (1–1024). Maximum simultaneous WebSocket clients. Default: 16.
 String (absolute path). Durable SQLite database containing source positions,
 records, decisions, owners, effects and history. It is created or opened at
 startup with mode 0600. Corrupt or unsupported state is refused rather than
-silently reset. Default:
+silently reset. The file cannot grow past 256 MiB (65,536 pages of 4 KiB); a
+state file already past that size is refused at startup. When a commit fails
+because the file is full, the daemon pauses ingestion, retries after a delay that
+doubles up to 30 seconds and returns to healthy once recovery completes. Rules
+already in the kernel stay in place meanwhile, and
+.B fail2zig status
+shows the storage phase. The daemon runs no VACUUM, so the file does not shrink;
+rows removed by retention (see
+.BR history_retention ,
+in seconds, default 86400) free pages for reuse inside it. Watch the file size.
+Default:
 .IR /var/lib/fail2zig/state.bin .
+.TP
+.B history_retention
+Integer (seconds, 0 or more). How long application history is kept. Older
+history is removed while storage is healthy. Default: 86400.
+.TP
+.B history_max_matches
+Integer (0\(en1024). How many matches are kept for each subject in application
+history. Default: 10.
 .TP
 .B memory_ceiling_mb
 Integer. Total configured memory ceiling used to admit bounded native source,
@@ -217,7 +235,9 @@ kernel verification. Default: true.
 .B ignoreip
 String array. CIDR ranges and exact IPs that are never banned. Example:
 .IR ["127.0.0.1/8", "::1", "10.0.0.0/8"] .
-Default: empty.
+Default: empty. An edit applies from the next event after
+.B fail2zig reload
+or a restart, and never alters an existing ban.
 .TP
 .B source
 String: auto, file, journald, or internal. Default: auto. Inherited by jails.
@@ -247,6 +267,8 @@ The effective paths and query are part of saved source identity. Changed SSH
 layouts or switching profile modes may cause RetryGenerationMismatch on restart;
 live source-generation migration is not supported. Restore the previous source
 configuration and executable layout to recover; do not delete the state database.
+Adding or enabling a jail is not such a change: the other jails keep their saved
+identity and the daemon starts on the existing state.
 .TP
 .B backend
 Deprecated source alias for fail2ban compatibility (systemd means journald).
@@ -373,7 +395,71 @@ for this jail.
 .B ignoreip
 Optional string array. Replaces (does not merge with)
 .B defaults.ignoreip
-for this jail.
+for this jail. An edit applies from the next event after
+.B fail2zig reload
+or a restart, and never alters an existing ban.
+.TP
+.B on_truncation
+String:
+.B \&"refuse"
+or
+.BR \&"restart" .
+Default when absent:
+.BR refuse .
+Accepted only in a
+.BI [jails. name ]
+section whose source resolves to file, where it applies to every
+.B logpath
+of the jail. It is rejected in
+.BR [defaults] ,
+so accepting loss is chosen for each source and never inherited, and in a jail
+whose source is journald or internal. The diagnostics are
+.BR InvalidTruncationPolicy ,
+.B TruncationPolicyNotFileSource
+and
+.BR TruncationPolicyNotAllowedInDefaults .
+.IP
+Three events are covered: a file truncated in place below its committed offset,
+a rotated-out file that was removed while it still held unread bytes, and a log
+replaced by a different file when its previous file exists nowhere in its
+directory (for example deleted and recreated by its writer). With
+.BR refuse ,
+the source is paused until
+.B fail2zig repair-source
+acknowledges the loss; the daemon still starts and the other jails enforce. A
+source whose path is absent stays paused and
+.B repair-source
+does not acknowledge it. With
+.BR restart ,
+the source resumes without pausing: at offset 0 of the same file after a
+truncation, at the current file's committed offset after a removed rotated
+file, or at offset 0 of the replacement after a replaced log. A rotated file that
+still exists in the directory is followed, never skipped. Each resumption records a
+durable continuity-loss event, shown by
+.B fail2zig status
+and the journal; the newest 256 events per source are kept. While the path is
+absent, a
+.B restart
+source reports health
+.B missing
+and retries on the transient schedule instead of pausing, then resumes when a file
+appears at the path.
+.IP
+Records appended after the committed offset and removed by the truncation, or left
+in a replaced file that is gone, were never read. The policy records that loss; it
+does not recover those records.
+.IP
+The key is not part of the detection generation, so changing it never causes
+RetryGenerationMismatch. A change is restart-only:
+.B fail2zig reload
+reports
+.B restart_required
+with the reason
+\fBjails.\fIname\fB.on_truncation\fR.
+.B fail2zig \-\-validate-config
+prints
+.BI on_truncation= value
+on the summary line of each file jail.
 .TP
 .B bantime_increment_enabled , bantime_increment_multiplier , bantime_increment_factor , bantime_increment_formula , bantime_increment_max_bantime , bantime_increment_jitter
 Per-jail values take precedence over
@@ -440,12 +526,19 @@ upstream 2.0.7 target.
 .PP
 Run PortSentry with
 .B \-\-connect
-and retain one TCP_PORTS list containing ports verified unused on the protected
-host. Set HISTORY_FILE=/var/log/portsentry.log, RESOLVE_HOST=0, SCAN_TRIGGER=0,
-BLOCK_TCP=0 and BLOCK_UDP=0. Remove or comment every UDP_PORTS directive for
-this TCP-only recipe; do not set UDP_PORTS="", because PortSentry rejects an
-empty list. BLOCK_UDP=0 disables PortSentry's UDP response but does not stop
-UDP observations when UDP ports remain configured. These settings leave
+for TCP connect detection, or with
+.B \-\-stealth \-m pcap \-i
+.I interface
+for TCP SYN, FIN, NULL and XMAS scans and UDP.
+.B \-\-stealth
+runs PortSentry as root with pcap on the interface that owns the protected
+address. Retain one TCP_PORTS list containing ports verified unused on the
+protected host, and one UDP_PORTS list of verified unused ports when UDP
+detection is wanted. Set HISTORY_FILE=/var/log/portsentry.log, RESOLVE_HOST=0,
+SCAN_TRIGGER=0, BLOCK_TCP=0 and BLOCK_UDP=0. To observe TCP only, remove or
+comment every UDP_PORTS directive; do not set UDP_PORTS="", because PortSentry
+rejects an empty list. BLOCK_UDP=0 disables PortSentry's UDP response but does
+not stop UDP observations when UDP ports remain configured. These settings leave
 fail2zig as the only ban owner.
 .PP
 .nf
@@ -457,12 +550,28 @@ timestamp  = "iso8601"
 logpath    = ["/var/log/portsentry.log"]
 maxretry   = 1
 enforce = true
+on_truncation = "restart"
 .fi
 .PP
+PortSentry 2.0.7 empties its history file at every process start, not only at
+reboot. Without
+.BR on_truncation ,
+the default
+.B refuse
+pauses the source after each PortSentry restart until
+.B fail2zig repair-source
+acknowledges it. With
+.BR restart ,
+the jail resumes at offset 0 and records a continuity-loss event; records that
+PortSentry appended after the committed offset and that the emptying removed were
+never read.
+.PP
 Accepted events protect the source host across all protocols and ports. The
-live qualification covered IPv4 and IPv6 TCP-connect events on Debian 13
-through ban and expiry. UDP and stealth-mode deployment are unqualified,
-and stdout, syslog and journal envelopes are outside this integration.
+live qualification on Debian 13 covered IPv4 and IPv6 TCP-connect events
+and, in stealth mode, TCP SYN, FIN, NULL and XMAS scans and UDP, each through
+ban, blocking while banned and expiry. Legacy PortSentry 1.2 and other 2.x
+versions are unqualified, and stdout, syslog and journal envelopes are outside
+this integration.
 .PP
 Inspect a history file without starting the daemon:
 .PP
@@ -481,3 +590,6 @@ Full reference:
 The fail2zig.toml format was introduced in fail2zig 0.1.0.
 Quoted native duration strings were added in fail2zig 0.4.0. Backend aliases
 and positioned configuration diagnostics from 0.3.0 remain supported.
+The
+.B on_truncation
+jail key was added in fail2zig 0.4.7.

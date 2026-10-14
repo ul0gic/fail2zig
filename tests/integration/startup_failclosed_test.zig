@@ -892,7 +892,7 @@ fn waitForFileText(dir: std.fs.Dir, name: []const u8, needle: []const u8, timeou
     return error.TestExpectedTextMissing;
 }
 
-test "integration: fatal startup recovery writes its cause to a file log target before exit" {
+test "integration: a refused source at startup is paused and the daemon stays up with its cause in a file log target" {
     const a = testing.allocator;
     var s = try Scenario.init(a);
     defer s.deinit();
@@ -909,17 +909,20 @@ test "integration: fatal startup recovery writes its cause to a file log target 
         std.time.sleep(2 * std.time.ns_per_s);
         try stopDaemon(&child);
     }
-    // Truncating below the committed offset loses continuity, which the worker
-    // refuses during startup recovery and exits from its own thread.
+    // Truncating below the committed offset loses continuity, which startup recovery pauses.
     try s.tmp.dir.writeFile(.{ .sub_path = "auth.log", .data = "" });
     try s.tmp.dir.writeFile(.{ .sub_path = "daemon.log", .data = "" });
-    var r = try s.run();
-    defer r.deinit(a);
-    try testing.expectEqual(@as(?u8, 1), r.exitCode());
+    {
+        var child = try spawnDaemon(&s, null);
+        errdefer terminateAndReap(&child);
+        try waitForFileText(s.tmp.dir, "daemon.log", "paused at startup: ResumeLost", watchdog_timeout_ms);
+        try waitForFileText(s.tmp.dir, "daemon.log", "native: ready", watchdog_timeout_ms);
+        try stopDaemon(&child);
+    }
     const logged = try s.tmp.dir.readFileAlloc(a, "daemon.log", max_output_bytes);
     defer a.free(logged);
-    try expectContains(logged, "native: startup recovery failed: ");
-    try expectContains(logged, "refusing to start");
+    try expectNotContains(logged, "native: startup recovery failed: ");
+    try expectNotContains(logged, "refusing to start");
 }
 
 const NotifyReceiver = struct {

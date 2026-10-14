@@ -71,7 +71,7 @@ pub const CliOptions = struct {
 
 pub const EntryMode = enum { daemon, operator, migrate, rule_test, repair_source };
 
-const operator_words = [_][]const u8{ "status", "jails", "list", "ban", "unban", "reload", "version", "help", "completions", "config", "history", "jail", "firewall", "stats" };
+const operator_words = [_][]const u8{ "status", "jails", "list", "ban", "unban", "reload", "version", "help", "completions", "config", "history", "jail", "firewall", "stats", "ignore" };
 const operator_globals = [_][]const u8{ "--socket", "--output", "--no-color", "--timeout" };
 
 pub fn classifyEntry(args: []const []const u8) EntryMode {
@@ -156,6 +156,7 @@ fn printHelp(w: anytype) !void {
         \\COMMANDS:
         \\  status | jails | list | ban | unban | reload | version | help | completions
         \\  config | history | jail | firewall show | stats
+        \\  ignore add|remove|list ...                 manage per-jail exclusions
         \\  migrate inspect|snapshot|plan|validate|cutover|status|rollback ...
         \\  rule-test --file|--record|--journal ...   offline rule evaluation (no daemon needed)
         \\  repair-source --jail J --source PATH --token T --acknowledge-truncation   acknowledge a truncated file source (daemon stopped)
@@ -333,9 +334,11 @@ fn printValidateSummary(w: anytype, cfg: *const config_mod.Config) !void {
     for (cfg.jails) |*j| {
         const r = config_mod.resolveJailFromConfig(j, cfg.defaults);
         try w.print(
-            "config: jail '{s}' enabled={} filter={s} source={s} banaction={s}\n",
+            "config: jail '{s}' enabled={} filter={s} source={s} banaction={s}",
             .{ j.name, j.enabled, j.filter, @tagName(j.source), @tagName(r.banaction) },
         );
+        if (j.source == .file or (j.source == .auto and j.on_truncation != null)) try w.print(" on_truncation={s}", .{@tagName(r.on_truncation)});
+        try w.writeByte('\n');
     }
     try w.print("config: OK ({d} jail(s) configured)\n", .{cfg.jails.len});
 }

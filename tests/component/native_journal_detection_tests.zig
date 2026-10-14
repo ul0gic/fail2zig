@@ -360,7 +360,6 @@ test "native detection: journal configuration preserves ignores and rejects unre
     defer second.destroy();
     const changed = second.sessionOptions().detection.?;
     try t.expectEqual(stored.Kind.candidate, (try changed.evaluate(failure, &valid_fields, admitted, changed.context)).kind);
-    try t.expect(!std.mem.eql(u8, &consumer.generation, &changed.generation));
     const Allocation = struct {
         fn run(a: std.mem.Allocator, input: *const config.Config, selected: projection.Settings) !void {
             const plan = try projection.Plan.create(a, input, 0, [_]u8{0} ** 32, selected);

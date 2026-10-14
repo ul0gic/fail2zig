@@ -14,8 +14,8 @@ const effect_history = @import("../core/native_effect_history.zig");
 const application_history = @import("../core/native_application_history.zig");
 const action_outcome = @import("../core/native_action_outcome.zig");
 // Newest schema the ordinary writers maintain. Schema 24 is reached only through the
-// load-repair migration and admitted once that migration has completed.
-pub const latest_schema: i64 = 24;
+// load-repair migration, schema 25 only from 24 through enableRuntimeState.
+pub const latest_schema: i64 = 25;
 pub const load_repair_schema: i64 = 24;
 pub const load_repair = @import("load_repair_migration.zig");
 pub const max_native_detections = 16;
@@ -51,7 +51,7 @@ const embedded_api: Api = blk: {
     }
     break :blk api;
 };
-pub const Error = application_history.Error || action_outcome.Error || retry.Error || consumers.Error || effects.Error || effect_history.Error || action_context.Error || error{ MaintenancePinned, StaleMaintenance, PrunedReplay, InvalidMaintenanceState, MaintenanceStorageRequired, ConsumerManifestRequired, ConsumerManifestMismatch, ConsumerManifestMissing, ConsumerManifestExists, ConsumerMigrationRequired, MissingRequiredConsumer, AmbiguousNativeDetection, AmbiguousRetryDecision, ConsumerStorageRequired, StaleConsumerCheckpoint, OpenFailed, UnsafePermissions, ForeignDatabase, UnsupportedSchema, DatabaseFailure, Busy, StorageFull, ReadOnly, StorageIo, CorruptDatabase, StorageLimit, Interrupted, AccessDenied, ReopenRequired, InvalidRecord, OccurrenceConflict, StaleCheckpoint, StaleSharedCheckpoint, InjectedFailure, OutOfMemory, ReceiptStorageRequired, InferenceStorageRequired, DetectionStorageRequired, ReceiptConflict, ReceiptRequired, ReceiptAlreadyCommitted, ReceiptLimit, RetryStorageRequired, RetryAdmissionRequired, RetryGenerationMismatch, RetryMigrationRequired, RetryCapacity, ReceiptClockReversed, HistoryResetStorageRequired, InvalidHistoryReset, StaleHistoryReset, AdminStorageRequired, MigrationStorageRequired, StaleAdminRevision, InvalidAdminRequest, AdminRequestCapacity, RetryPolicyInFlight, StalePolicyTransition, ConfigGenerationExists, ConfigGenerationMissing, MigrationRunExists, MigrationRunMissing, MigrationStepMissing, MigrationStepOpen, MigrationStepOrder, InvalidMigrationRow, InvalidMigrationState, MigrationJailUnknown, LoadRepairMigrationIncomplete, LoadRepairWritersPending, LoadRepairBackupExists, LoadRepairBackupInvalid, LoadRepairDiskSpace, LoadRepairVerificationFailed, LoadRepairInvalidState, ReserveBackpressure, MaintenanceWorkExhausted, LiveOwnerCounterInvalid };
+pub const Error = application_history.Error || action_outcome.Error || retry.Error || consumers.Error || effects.Error || effect_history.Error || action_context.Error || error{ MaintenancePinned, StaleMaintenance, PrunedReplay, InvalidMaintenanceState, MaintenanceStorageRequired, ConsumerManifestRequired, ConsumerManifestMismatch, ConsumerManifestMissing, ConsumerManifestExists, ConsumerMigrationRequired, MissingRequiredConsumer, AmbiguousNativeDetection, AmbiguousRetryDecision, ConsumerStorageRequired, StaleConsumerCheckpoint, OpenFailed, UnsafePermissions, ForeignDatabase, UnsupportedSchema, DatabaseFailure, Busy, StorageFull, ReadOnly, StorageIo, CorruptDatabase, StorageLimit, Interrupted, AccessDenied, ReopenRequired, InvalidRecord, OccurrenceConflict, StaleCheckpoint, StaleSharedCheckpoint, InjectedFailure, OutOfMemory, ReceiptStorageRequired, InferenceStorageRequired, DetectionStorageRequired, ReceiptConflict, ReceiptRequired, ReceiptAlreadyCommitted, ReceiptLimit, RetryStorageRequired, RetryAdmissionRequired, RetryGenerationMismatch, RetryMigrationRequired, RetryCapacity, ReceiptClockReversed, HistoryResetStorageRequired, InvalidHistoryReset, StaleHistoryReset, AdminStorageRequired, MigrationStorageRequired, StaleAdminRevision, InvalidAdminRequest, AdminRequestCapacity, RetryPolicyInFlight, StalePolicyTransition, ConfigGenerationExists, ConfigGenerationMissing, MigrationRunExists, MigrationRunMissing, MigrationStepMissing, MigrationStepOpen, MigrationStepOrder, InvalidMigrationRow, InvalidMigrationState, MigrationJailUnknown, LoadRepairMigrationIncomplete, LoadRepairWritersPending, LoadRepairBackupExists, LoadRepairBackupInvalid, LoadRepairDiskSpace, LoadRepairVerificationFailed, LoadRepairInvalidState, SchemaBackupExists, IgnoreCapacity, InvalidIgnoreEntry, ReserveBackpressure, MaintenanceWorkExhausted, LiveOwnerCounterInvalid };
 
 pub const OpenStage = enum {
     path_validation,
@@ -217,6 +217,8 @@ pub const EffectInvalidation = struct {
     invalidate: *const fn (?*anyopaque) void,
 };
 pub const max_retention_page: u16 = 256;
+// Rowids one held-record pass scans; a transaction allows 1,000 progress callbacks of 1,000 VM steps (workProgress).
+pub const max_held_window: u16 = 8192;
 // Position of the rotating obsolete-row reclamation; in memory only, so a restart rescans.
 pub const ReclaimCursor = struct { phase: u2 = 0, cursor: i64 = 0, found: bool = false, rest: u8 = 0 };
 pub const TestHooks = if (builtin.is_test) struct {
@@ -224,6 +226,8 @@ pub const TestHooks = if (builtin.is_test) struct {
     retention_select_work: ?u32 = null,
     // Summary rows per candidate-generation sweep page instead of the measured window.
     retention_sweep_rows: ?i64 = null,
+    // Work budget left when the held-record pass starts, instead of the transaction's.
+    held_pass_work: ?u32 = null,
 } else struct {};
 pub const Store = struct {
     allocator: std.mem.Allocator,
@@ -252,8 +256,11 @@ pub const Store = struct {
     runtime_path: ?[]const u8 = null,
     work_remaining: u32 = 1000,
     load_repair_backup_verified: bool = false,
+    load_repair_migrated: bool = false,
     // Retention page size; an interrupted selection halves it for the next attempt.
     retention_page: u16 = max_retention_page,
+    held_cursor: i64 = 0,
+    held_window: u16 = max_held_window,
     reclaim: ReclaimCursor = .{},
     // Maintenance turns skipped after a full retry-detail scan found nothing to prune.
     retry_detail_rest: u8 = 0,
@@ -555,7 +562,7 @@ pub const Store = struct {
                 return openFailure(diagnostic, .schema_inspection, failure, null, self.last_error_code);
             if (objects != 0) return openFailure(diagnostic, .schema_validation, error.ForeignDatabase, null, null);
         } else if (application != 0x46325a31) return openFailure(diagnostic, .schema_validation, error.ForeignDatabase, null, null);
-        if (schema < 0 or schema > load_repair_schema)
+        if (schema < 0 or schema > latest_schema)
             return openFailure(diagnostic, .schema_validation, error.UnsupportedSchema, null, null);
         // Schema 24 is only ever produced by the load-repair migration, whose progress row
         // arrives in the same commit as the version.
@@ -812,6 +819,10 @@ pub const Store = struct {
     pub usingnamespace @import("migration.zig").Methods(@This());
 
     pub usingnamespace @import("load_repair_migration.zig").Methods(@This());
+
+    pub usingnamespace @import("ignore_entries.zig").Methods(@This());
+
+    pub usingnamespace @import("continuity.zig").Methods(@This());
 
     pub fn inspectInteger(self: *Store, sql: [:0]const u8) Error!i64 {
         if (!@import("builtin").is_test) @compileError("inspectInteger is test-only");

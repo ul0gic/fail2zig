@@ -25,6 +25,8 @@ const sessions = @import("core/native_file_session.zig");
 const journal_projection = @import("config/native_journal_detection.zig");
 const journal_profile = @import("config/native_journal_profile.zig");
 const filter_registry = @import("filters/registry.zig");
+const files = @import("core/durable_file_source.zig");
+const ignore_set = @import("core/native_ignore_set.zig");
 
 // Keep the released query byte-for-byte for existing explicit profiles: it is
 // included in persistent source identity. New automatic auth-helper layouts
@@ -110,16 +112,19 @@ const Source = union(enum) {
     /// Drains up to `ingest_burst` waiting records per wake so ingestion is not held
     /// to one record per tick while effect and maintenance work lengthen the tick.
     const ingest_burst = 4;
-    fn poll(self: Source) !void {
+    fn poll(self: Source) !usize {
+        var admitted: usize = 0;
         var turns: usize = 0;
         while (turns < ingest_burst) : (turns += 1) {
             const delivered = switch (self) {
                 .file => |source| try source.pollTurn(1),
                 .journal => |source| try source.pollTurn(1),
-                .internal => return,
+                .internal => return 0,
             };
-            if (delivered == 0) return;
+            if (delivered == 0) break;
+            admitted += delivered;
         }
+        return admitted;
     }
     fn verify(self: Source) !bool {
         return switch (self) {
@@ -182,6 +187,7 @@ const Jail = struct {
     scratch_confirmed: []bool,
     confirmed: []bool,
     summary: durable.Store.RetrySummary = .{},
+    retry_revision: ?u64 = null,
     published_once: bool = false,
     revision: u64 = 0,
     healthy: bool = false,
@@ -194,6 +200,33 @@ const Jail = struct {
     rekeyed: bool = false,
     admin_paused: bool = false,
     admin_enabled: bool = true,
+    on_truncation: config.TruncationPolicy = .refuse,
+    ignore_runtime_only: u16 = 0,
+    source_status: []SourceStatus = &.{},
+    source_status_arena: ?std.heap.ArenaAllocator = null,
+    source_signature: SourceSignature = .{},
+};
+
+pub const SourceStatus = struct {
+    jail: []const u8,
+    kind: enum { file, journal },
+    path: ?[]const u8,
+    on_truncation: ?config.TruncationPolicy,
+    state: enum { paused, reading },
+    cause: ?[]const u8,
+    inode: ?u64,
+    committed_offset: ?u64,
+    observed_size: ?u64,
+    repair: ?[]const u8,
+    loss_events: u16,
+    last_loss: ?files.LossEvent,
+};
+
+const SourceSignature = struct {
+    sources: usize = 0,
+    causes: [max_sources_per_jail + 1]?anyerror = [_]?anyerror{null} ** (max_sources_per_jail + 1),
+    loss_sequence: u64 = 0,
+    built: bool = false,
 };
 
 fn destroyZone(a: std.mem.Allocator, zone: ?*timezone.Zone) void {
@@ -344,6 +377,29 @@ const PublishedView = struct {
     transient_uncertain: bool = false,
 };
 const Knowledge = enum { fresh, stale, none };
+const MaintenanceGates = struct {
+    slow: u64 = 0,
+    due: u64 = 0,
+    turns: u64 = 0,
+    unhealthy_gate: u64 = 0,
+    step_progress: u64 = 0,
+    step_returned: u64 = 0,
+    step_wait: u64 = 0,
+    unsettled: u64 = 0,
+    no_session: u64 = 0,
+    unhealthy: u64 = 0,
+    candidate_receipt: u64 = 0,
+    consumer_busy: u64 = 0,
+    candidate_source: u64 = 0,
+    no_sources: u64 = 0,
+    history_missing: u64 = 0,
+    history_behind: u64 = 0,
+    walks: u64 = 0,
+    resumes: u64 = 0,
+    advances: u64 = 0,
+    advance_token: u64 = 0,
+    advance_null: u64 = 0,
+};
 pub const Coordinator = struct {
     allocator: std.mem.Allocator,
     cfg: *const config.Config,
@@ -380,6 +436,7 @@ pub const Coordinator = struct {
     owner_scratch_confirmed: []bool = &.{},
     owner_confirmed: []bool = &.{},
     owner_count: usize = 0,
+    owner_read_epoch: ?u64 = null,
     timer: std.time.Timer,
     gate: health.Gate,
     published_health: health.Snapshot,
@@ -412,6 +469,8 @@ pub const Coordinator = struct {
     retire_pinned_effect: u64 = 0,
     retire_refused: u64 = 0,
     last_view_counters: effect_runtime.Counters = .{},
+    gates: MaintenanceGates = .{},
+    last_gate_report_ms: ?u64 = null,
     thread: ?std.Thread = null,
     start_us: i64,
     last_notice: u64 = 0,
@@ -524,10 +583,47 @@ pub const Coordinator = struct {
         abandoned: bool = false,
         run_id: ?[32]u8 = null,
         verify_seq: u64 = 0,
+        unban: bool = false,
+        ignore_entry: ?shared.types.IgnoreEntry = null,
+        ignore: ?*IgnoreWork = null,
         fn jailName(self: *const AdminRequest) []const u8 {
             return self.jail[0..self.jail_len];
         }
     };
+    const max_listed_bans = 256;
+    const max_lifted_bans = 256;
+    const max_wider_bans = 128;
+    const ignore_lift_budget_ms: u64 = 1000;
+    const ignore_lift_settle_ms: u64 = 2000;
+    const ignore_unban_wait_ms: u64 = 4000;
+    const IgnoreEntryState = enum { added, present, removed, config_only, absent, not_recorded, not_removed };
+    const IgnoreRelation = enum { inside_entry, contains_entry };
+    const IgnoreLift = enum { kept, pending, confirmed, incomplete, unknown, refused };
+    const IgnoreBan = struct {
+        canonical: inspection.CanonicalScope,
+        key: [32]u8,
+        deadline_us: ?i64,
+        confirmed: bool,
+        relation: IgnoreRelation,
+        lift: IgnoreLift = .kept,
+        reason: ?[]const u8 = null,
+    };
+    const IgnoreWork = struct {
+        entry_state: IgnoreEntryState = .not_recorded,
+        source: ?ignore_set.Source = null,
+        configured: [ignore_set.max_entries_per_part]shared.types.IgnoreEntry = undefined,
+        configured_count: usize = 0,
+        bans: [max_lifted_bans + max_wider_bans]IgnoreBan = undefined,
+        ban_count: usize = 0,
+        bans_total: usize = 0,
+        inside_total: usize = 0,
+        lifting: bool = false,
+        mutated: bool = false,
+    };
+    fn freeAdminRequest(self: *Coordinator, request: *AdminRequest) void {
+        if (request.ignore) |ignore_state| self.allocator.destroy(ignore_state);
+        self.allocator.destroy(request);
+    }
 
     pub const Staged = struct { view: AdminOutcomeView, owned: bool };
     fn enqueueAdminLocked(self: *Coordinator, request: *AdminRequest) ?Staged {
@@ -577,7 +673,7 @@ pub const Coordinator = struct {
         const abandoned = request.abandoned;
         self.reload_wake.broadcast();
         self.mutex.unlock();
-        if (abandoned) self.allocator.destroy(request);
+        if (abandoned) self.freeAdminRequest(request);
         std.log.info("native admin: kind={s} outcome={s}", .{ @tagName(outcome.kind), @tagName(outcome.outcome) });
     }
     fn adminDetail(self: *Coordinator, request: *AdminRequest, view: AdminOutcomeView, state: ?durable.Store.JailAdminState) AdminOutcomeView {
@@ -636,7 +732,17 @@ pub const Coordinator = struct {
     fn executeAdminInner(self: *Coordinator, request: *AdminRequest) !AdminOutcomeView {
         const kind = request.kind;
         const base = AdminOutcomeView{ .outcome = .applied, .kind = kind, .generation = self.published_generation };
-        try self.gate.admitMutation();
+        const ignore_kind = kind == .ignore_add or kind == .ignore_remove;
+        if (ignore_kind) {
+            const ignore_state = try self.allocator.create(IgnoreWork);
+            ignore_state.* = .{};
+            request.ignore = ignore_state;
+        }
+        self.gate.admitMutation() catch |failure| {
+            if (!ignore_kind) return failure;
+            const cause = if (self.gate.snapshot().last_failure) |last| @errorName(last.cause) else @errorName(failure);
+            return base.withOutcome(.rejected).withReason("storage is not accepting changes ({s}); retry when fail2zig status shows storage healthy", .{cause});
+        };
         switch (try self.store.admitAdminRequest(request.request_id, request.expected_revision)) {
             .replayed => |prior| return .{ .outcome = prior.outcome, .kind = prior.kind, .generation = self.published_generation, .mutation_revision = prior.mutation_revision },
             .fresh => {},
@@ -645,6 +751,8 @@ pub const Coordinator = struct {
         const now = std.time.microTimestamp();
         switch (kind) {
             .setting_batch => return self.adminDetail(request, (AdminOutcomeView{ .outcome = .rejected, .kind = kind }).withReason("runtime-only settings are not supported; edit the configuration and reload", .{}), null),
+            .ignore_add => return self.executeIgnoreAdd(request),
+            .ignore_remove => return self.executeIgnoreRemove(request),
             .group_enable, .group_disable, .group_pause, .group_resume => {
                 const jail = self.findJail(request.jailName()) orelse return self.adminDetail(request, (AdminOutcomeView{ .outcome = .absent, .kind = kind }).withReason("unknown jail", .{}), null);
                 var state = durable.Store.JailAdminState{ .jail = jail.name, .enabled = true, .paused = false, .generation = self.published_generation, .changed_us = @max(0, now), .request_id = request.request_id };
@@ -669,7 +777,7 @@ pub const Coordinator = struct {
                             var counter: [4]u8 = undefined;
                             std.mem.writeInt(u32, &counter, step, .little);
                             const transition = effect.hashParts("fail2zig-admin-disable-v1", &.{ &request.request_id, &counter });
-                            const released = try self.store.flushJailOwner(jail.name, try self.plannedGeneration(jail), transition, .{ .prepared_us = now, .context = self, .read = wallClockEffect });
+                            const released = try self.store.flushJailOwner(jail.name, try self.plannedGeneration(jail, .planned), transition, .{ .prepared_us = now, .context = self, .read = wallClockEffect });
                             if (released == null) break;
                             request.mutation_committed = true;
                             request.committed_count += 1;
@@ -698,7 +806,7 @@ pub const Coordinator = struct {
                 const canonical = try self.adminScope(request);
                 const scope = try effect.Scope.exact(canonical);
                 const key = try scope.key(manager.installation);
-                const generation = try self.plannedGeneration(jail);
+                const generation = try self.plannedGeneration(jail, .planned);
                 const current = try self.store.currentOwner(key, jail.name);
                 const clock = effect.Clock{ .prepared_us = now, .context = self, .read = wallClockEffect };
                 if (kind == .ban) {
@@ -748,7 +856,7 @@ pub const Coordinator = struct {
         var count: usize = 0;
         for (self.jails) |*jail| {
             if (count == generations.len) return error.AdminJailCapacity;
-            generations[count] = .{ .jail = jail.name, .generation = try self.plannedGeneration(jail) };
+            generations[count] = .{ .jail = jail.name, .generation = try self.plannedGeneration(jail, .planned) };
             count += 1;
         }
         const seq = try self.store.beginMigrationStep(run_id, .activate_owners, "", now);
@@ -920,6 +1028,7 @@ pub const Coordinator = struct {
         return std.time.microTimestamp();
     }
     fn settleAdmin(self: *Coordinator, request: *AdminRequest) void {
+        if (request.ignore) |ignore_state| if (ignore_state.lifting) return self.settleIgnoreLifts(request, ignore_state);
         const manager = self.effects orelse {
             const view = if (request.run_id != null) (AdminOutcomeView{ .outcome = .uncertain, .kind = request.kind, .destination = "uncertain" }).withReason("no enforcement backend to verify activation", .{}) else AdminOutcomeView{ .outcome = .applied, .kind = request.kind };
             if (request.run_id != null) self.finishMigrationVerify(request, view);
@@ -1009,8 +1118,8 @@ pub const Coordinator = struct {
         const canonical = try std.fmt.bufPrint(&bytes, "{}", .{selected});
         return effect.hashParts("fail2zig-native-resolver-udp-v1", &.{canonical});
     }
-    fn internalGeneration(jail: []const u8, policy: retry.Policy) ![32]u8 {
-        const base = try policy.encode();
+    fn internalGeneration(jail: []const u8, policy: retry.Policy, form: retry.HashForm) ![32]u8 {
+        const base = try policy.hashBytes(form);
         const escalation = try policy.escalationBytes();
         return effect.hashParts("fail2zig-native-recidive-source-v1", &.{ jail, &base, &escalation });
     }
@@ -1270,7 +1379,7 @@ pub const Coordinator = struct {
                     break :blk .{ .journal = try journal_projection.Plan.create(a, &selected_cfg, 0, parent_generation, .{ .machine_id = std.mem.trim(u8, machine, "\n"), .executables = executables, .ignore_capacity = 128, .custom = assets != null, .journal = .{ .batch_records = 1, .matches = matches } }) };
                 },
                 .auto => unreachable,
-                .internal => .{ .internal = try internalGeneration(selected.name, policy) },
+                .internal => .{ .internal = try internalGeneration(selected.name, policy, .identity) },
             };
             errdefer plan.deinit(a);
             const scratch = try a.alloc(durable.Store.ActiveDecision, per_jail);
@@ -1280,7 +1389,7 @@ pub const Coordinator = struct {
             const scratch_confirmed = try a.alloc(bool, per_jail);
             errdefer a.free(scratch_confirmed);
             const confirmed = try a.alloc(bool, per_jail);
-            self.jails[prepared] = .{ .name = selected.name, .plan = plan, .policy = policy, .scratch = scratch, .active = active, .zone = zone, .scratch_confirmed = scratch_confirmed, .confirmed = confirmed, .custom_plan = assets };
+            self.jails[prepared] = .{ .name = selected.name, .plan = plan, .policy = policy, .scratch = scratch, .active = active, .zone = zone, .scratch_confirmed = scratch_confirmed, .confirmed = confirmed, .custom_plan = assets, .on_truncation = config.resolveJailFromConfig(jail_cfg, cfg.defaults).on_truncation };
             if (assets != null) self.custom_jails += 1;
             prepared += 1;
         }
@@ -1391,7 +1500,11 @@ pub const Coordinator = struct {
         try self.store.enableAdminState();
         try self.store.enableMigrationState();
         try self.store.enableLoadRepair(self.loadRepairOptions(), if (self.startup_progress) |progress| progress.migrationHook() else null);
+        try self.store.enableRuntimeState(self.loadRepairOptions(), !self.store.load_repair_migrated);
         _ = try self.store.setRetentionPolicy(self.cfg.global.history_max_matches);
+        try self.rekeySavedGenerations();
+        try self.completeGenerationRekeys();
+        try self.rebuildIgnoreLists();
         try self.validateAdmission();
         if (!self.generation_admitted) {
             try self.admitConfigGeneration();
@@ -1407,6 +1520,84 @@ pub const Coordinator = struct {
         }
     }
 
+    fn rekeySavedGenerations(self: *Coordinator) !void {
+        var rekeyed_jails: u32 = 0;
+        var rekeyed_rows: u32 = 0;
+        for (self.jails) |*jail| {
+            if (jail.custom_plan != null) continue;
+            const live_policy = jail.policy;
+            if (try self.store.readRetryPolicy(jail.name)) |saved| jail.policy.max_subjects = saved.policy.max_subjects;
+            const legacy = self.plannedGeneration(jail, .legacy) catch |err| {
+                jail.policy = live_policy;
+                return err;
+            };
+            jail.policy = live_policy;
+            const planned = try self.plannedGeneration(jail, .planned);
+            const cursors: durable.Store.CursorRekey = switch (jail.plan) {
+                .file => |*plan| blk: {
+                    const processing = plan.sessionOptions().processing;
+                    break :blk .{ .file = .{
+                        .legacy = files.FileSource.framingBinding(processing.encoding, legacy, processing.max_record_bytes),
+                        .planned = files.FileSource.framingBinding(processing.encoding, planned, processing.max_record_bytes),
+                    } };
+                },
+                .journal => .journal,
+                .internal => .none,
+            };
+            const report = try self.store.rekeySavedGenerations(jail.name, legacy, planned, cursors);
+            const rows = @as(u64, report.retry_rows) + report.pending_receipts + report.manifests + report.cursors;
+            if (rows == 0) continue;
+            rekeyed_jails += 1;
+            rekeyed_rows +|= @intCast(@min(rows, std.math.maxInt(u32)));
+        }
+        if (rekeyed_jails != 0) std.log.info("native storage: saved detection generations rekeyed without the ignore list or the subject share: jails={d} rows={d}; no ban, deadline, checkpoint or retry subject changed", .{ rekeyed_jails, rekeyed_rows });
+    }
+    fn completeGenerationRekeys(self: *Coordinator) !void {
+        for (self.jails) |*jail| {
+            const repair = try self.store.completeGenerationRekey(jail.name);
+            if (repair.receipts == 0 and repair.retired == 0 and repair.cursors == 0 and repair.guards == 0) continue;
+            std.log.info("native storage: generation rekey completed: jail={} receipts={d} retired={d} cursors={d} guards={d}; left by an earlier policy reload; no ban, deadline, checkpoint position or record changed", .{ std.zig.fmtEscapes(jail.name), repair.receipts, repair.retired, repair.cursors, repair.guards });
+        }
+    }
+    fn ignoreCell(jail: *const Jail) ?**ignore_set.EffectiveIgnore {
+        return switch (jail.plan) {
+            .file => |plan| plan.ignore_cell,
+            .journal => |plan| plan.ignore_cell,
+            .internal => null,
+        };
+    }
+    fn effectiveIgnore(self: *Coordinator, cfg: *const config.Config, jail: *const Jail) !*ignore_set.EffectiveIgnore {
+        var runtime: [ignore_set.max_entries_per_part]shared.types.IgnoreEntry = undefined;
+        const count = try self.store.ignoreEntries(jail.name, &runtime);
+        const literals = if (findConfigJail(cfg, jail.name)) |jail_cfg| jail_cfg.ignoreip orelse cfg.defaults.ignoreip else &[_][]const u8{};
+        return ignore_set.EffectiveIgnore.build(self.allocator, literals, runtime[0..count]);
+    }
+    fn replaceIgnoreList(self: *Coordinator, jail: *Jail, next: *ignore_set.EffectiveIgnore) void {
+        const cell = ignoreCell(jail) orelse return next.deinit(self.allocator);
+        var runtime_only: u16 = 0;
+        for (next.entries) |item| runtime_only += @intFromBool(item.source == .runtime);
+        self.mutex.lock();
+        const previous = cell.*;
+        cell.* = next;
+        jail.ignore_runtime_only = runtime_only;
+        self.mutex.unlock();
+        previous.deinit(self.allocator);
+    }
+    fn rebuildIgnoreLists(self: *Coordinator) !void {
+        for (self.jails) |*jail| {
+            if (ignoreCell(jail) == null) continue;
+            const next = try self.effectiveIgnore(self.live_cfg, jail);
+            if (next.over_bound) std.log.warn("native: jail={} has {d} ignore entries ({d} configured, {d} runtime-only), above the {d}-entry limit; all apply; fail2zig ignore add is refused until the count is {d} or less", .{ std.zig.fmtEscapes(jail.name), next.entries.len, next.configured_count, next.entries.len - next.configured_count, ignore_set.distinct_bound, ignore_set.distinct_bound });
+            self.replaceIgnoreList(jail, next);
+        }
+        var stored: [256]durable.Store.IgnoreJailCount = undefined;
+        const stored_count = try self.store.ignoreEntryJails(&stored);
+        for (stored[0..stored_count]) |item| {
+            const name = item.jail[0..item.jail_len];
+            if (findConfigJail(self.live_cfg, name) != null) continue;
+            std.log.warn("native: {d} runtime ignore entries are stored for jail {}, which is not configured; they are not effective", .{ item.count, std.zig.fmtEscapes(name) });
+        }
+    }
     fn loadRepairOptions(self: *Coordinator) durable.load_repair.Options {
         return .{ .state_path = self.cfg.global.state_file, .now_us = std.time.microTimestamp(), .history_max_matches = self.cfg.global.history_max_matches };
     }
@@ -1429,7 +1620,7 @@ pub const Coordinator = struct {
         const now = std.time.microTimestamp();
         const generation = reload_mod.generationId(digest, now);
         var jails: [max_jails]durable.Store.ConfigGenerationJail = undefined;
-        for (self.jails, 0..) |*jail, i| jails[i] = .{ .jail = jail.name, .digest = try reload_mod.jailDigest(jail.name, jail.policy, try self.plannedGeneration(jail)), .allowlist_snapshot = if (jail.custom_plan) |assets| assets.initial_ignore.payload else "" };
+        for (self.jails, 0..) |*jail, i| jails[i] = .{ .jail = jail.name, .digest = try reload_mod.jailDigest(jail.name, jail.policy, try self.plannedGeneration(jail, .planned)), .allowlist_snapshot = if (jail.custom_plan) |assets| assets.initial_ignore.payload else "" };
         try self.store.recordConfigGeneration(.{ .generation = generation, .config_digest = digest, .config_path = self.config_path, .committed_us = now, .published = true, .mutation_revision = try self.store.adminRevision() }, jails[0..self.jails.len]);
         self.published_generation = generation;
         self.published_config_digest = digest;
@@ -1542,11 +1733,11 @@ pub const Coordinator = struct {
         var count: usize = 0;
         for (request.classification.policySlice()) |change| {
             const jail = self.findJail(change.jail) orelse return error.UnknownJail;
-            const current_generation = try self.plannedGeneration(jail);
+            const current_generation = try self.plannedGeneration(jail, .planned);
             const previous = jail.policy;
             const next_policy = change.next;
             jail.policy = next_policy;
-            const next_generation = self.plannedGeneration(jail) catch |err| {
+            const next_generation = self.plannedGeneration(jail, .planned) catch |err| {
                 jail.policy = previous;
                 return err;
             };
@@ -1566,7 +1757,7 @@ pub const Coordinator = struct {
             for (transitions[0..count]) |change| if (std.mem.eql(u8, change.jail, jail.name)) {
                 next = change.next;
             };
-            digests[i] = .{ .jail = jail.name, .digest = try reload_mod.jailDigest(jail.name, next, try self.plannedGeneration(jail)), .allowlist_snapshot = if (jail.custom_plan) |assets| assets.initial_ignore.payload else "" };
+            digests[i] = .{ .jail = jail.name, .digest = try reload_mod.jailDigest(jail.name, next, try self.plannedGeneration(jail, .planned)), .allowlist_snapshot = if (jail.custom_plan) |assets| assets.initial_ignore.payload else "" };
         }
         var outcome = ReloadOutcome{ .kind = .applied, .generation = generation };
         var refreshed: usize = 0;
@@ -1585,7 +1776,18 @@ pub const Coordinator = struct {
             };
             if (result == .applied) refreshed += 1;
         }
-        if (count == 0 and refreshed == 0) {
+        var next_lists: [max_jails]?*ignore_set.EffectiveIgnore = [_]?*ignore_set.EffectiveIgnore{null} ** max_jails;
+        defer for (next_lists) |pending| if (pending) |list| list.deinit(self.allocator);
+        var ignore_changes: usize = 0;
+        for (self.jails, 0..) |*jail, i| {
+            if (ignoreCell(jail) == null) continue;
+            for (request.classification.ignoreSlice()) |name| if (std.mem.eql(u8, name, jail.name)) {
+                next_lists[i] = try self.effectiveIgnore(request.proposed, jail);
+                ignore_changes += 1;
+                break;
+            };
+        }
+        if (count == 0 and refreshed == 0 and ignore_changes == 0) {
             outcome.kind = .noop;
             outcome.generation = self.published_generation;
             return outcome;
@@ -1597,18 +1799,36 @@ pub const Coordinator = struct {
             if (refreshed != 0) return ReloadOutcome.single(.partial, "allowlists refreshed but the policy generation was not committed: {s}", .{@errorName(err)});
             return err;
         };
+        const committed_revision = self.store.adminRevision();
         self.mutex.lock();
+        if (committed_revision) |revision| self.published_revision = revision else |_| {}
         for (transitions[0..count]) |change| if (self.findJail(change.jail)) |jail| {
             jail.policy = change.next;
             jail.rekeyed = !std.mem.eql(u8, &change.generation, &change.next_generation);
+            jail.retry_revision = null;
         };
+        if (count != 0) self.owner_read_epoch = null;
         if (request.classification.log_level) |level| log_level.set(std.meta.stringToEnum(std.log.Level, @tagName(level)) orelse .info);
         self.replaceLiveConfigLocked(request.arena, request.proposed);
         request.arena = null;
         self.published_generation = generation;
         self.published_config_digest = request.config_digest;
         self.mutex.unlock();
+        for (self.jails, 0..) |*jail, i| if (next_lists[i]) |list| {
+            next_lists[i] = null;
+            self.replaceIgnoreList(jail, list);
+        };
         if (count != 0) self.gate.requestRebuild() catch {};
+        if (committed_revision) |_| {} else |err| {
+            outcome.kind = .partial;
+            if (outcome.reason_count < reload_mod.max_reasons) {
+                var reason: reload_mod.Reason = .{};
+                const written = std.fmt.bufPrint(&reason.bytes, "generation applied but the mutation revision was not read back: {s}; restart fail2zig before changing bans", .{@errorName(err)}) catch reason.bytes[0..0];
+                reason.len = @intCast(written.len);
+                outcome.reasons[outcome.reason_count] = reason;
+                outcome.reason_count += 1;
+            }
+        }
         return outcome;
     }
     fn hasAllowlistFiles(self: *Coordinator) bool {
@@ -1627,7 +1847,9 @@ pub const Coordinator = struct {
     };
     fn classifyReloadLocked(self: *Coordinator, input: ReloadClassificationInput) ReloadClassificationSnapshot {
         const per_jail: u32 = @intCast(max_subjects_total / @max(1, self.jails.len));
-        return .{ .generation = self.published_generation, .classification = reload_mod.classify(self.live_cfg, input.proposed, per_jail) };
+        var counts: [max_jails]reload_mod.RuntimeCount = undefined;
+        for (self.jails, 0..) |jail, i| counts[i] = .{ .jail = jail.name, .runtime_only = jail.ignore_runtime_only };
+        return .{ .generation = self.published_generation, .classification = reload_mod.classifyWithRuntime(self.live_cfg, input.proposed, per_jail, counts[0..self.jails.len]) };
     }
     fn replaceLiveConfigLocked(self: *Coordinator, arena: ?*std.heap.ArenaAllocator, proposed: *const config.Config) void {
         if (self.live_arena) |old| {
@@ -1653,6 +1875,7 @@ pub const Coordinator = struct {
         prefix: ?u8 = null,
         duration_s: ?u64 = null,
         all: bool = false,
+        unban: ?bool = null,
         run_id: ?[]const u8 = null,
         expected_generation: []const u8,
         expected_mutation_revision: u64,
@@ -1665,10 +1888,11 @@ pub const Coordinator = struct {
         const body = parsed.value;
         if (body.schema_version != 1) return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "unsupported schema_version") } };
         const kind = std.meta.stringToEnum(durable.Store.AdminKind, body.kind) orelse return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "unknown admin kind") } };
+        if (body.unban != null and kind != .ignore_add) return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "unban is valid only with ignore_add") } };
         if (body.expected_generation.len != 64) return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "expected_generation must be 64 hex characters") } };
         const request = try self.allocator.create(AdminRequest);
         var destroy_on_exit = true;
-        defer if (destroy_on_exit) self.allocator.destroy(request);
+        defer if (destroy_on_exit) self.freeAdminRequest(request);
         request.* = .{ .request_id = frame.request_id, .kind = kind, .expected_generation = undefined, .expected_revision = body.expected_mutation_revision };
         _ = std.fmt.hexToBytes(&request.expected_generation, body.expected_generation) catch return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "expected_generation is not hex") } };
         if (body.jail) |jail| {
@@ -1680,6 +1904,7 @@ pub const Coordinator = struct {
         request.prefix = body.prefix;
         request.duration_s = body.duration_s;
         request.all = body.all;
+        request.unban = body.unban orelse false;
         if (body.run_id) |text| {
             if (text.len != 64) return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "run_id must be 64 hex characters") } };
             var run_id: [32]u8 = undefined;
@@ -1693,19 +1918,43 @@ pub const Coordinator = struct {
             else => true,
         };
         if (needs_jail and request.jail_len == 0) return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "jail is required") } };
-        if ((kind == .ban or kind == .unban or kind == .history_reset) and request.address == null) return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "address is required") } };
+        if ((kind == .ban or kind == .unban or kind == .history_reset or kind == .ignore_add or kind == .ignore_remove) and request.address == null) return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "address is required") } };
         if (request.prefix) |prefix| {
             const address = request.address orelse return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "address is required") } };
             const max: u8 = if (address == .ipv4) 32 else 128;
-            if (prefix == 0 or prefix > max) return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "invalid prefix") } };
+            const ignore_kind = kind == .ignore_add or kind == .ignore_remove;
+            if ((prefix == 0 and !ignore_kind) or prefix > max) return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "invalid prefix") } };
         }
-        const staged = self.stageAdmin(request, if (kind == .migration_activate or kind == .migration_rollback) 10_000 else 3000);
+        if (kind == .ignore_add or kind == .ignore_remove) {
+            var text: [shared.types.IgnoreEntry.max_text_bytes]u8 = undefined;
+            const printed = (if (request.prefix) |prefix|
+                std.fmt.bufPrint(&text, "{}/{d}", .{ request.address.?, prefix })
+            else
+                std.fmt.bufPrint(&text, "{}", .{request.address.?})) catch return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "invalid address") } };
+            request.ignore_entry = shared.types.IgnoreEntry.parse(printed) catch |failure| return .{ .err = .{ .code = 400, .message = try a.dupe(u8, if (failure == error.InvalidPrefix) "invalid prefix" else "invalid address") } };
+        }
+        const wait_ms: u64 = if (kind == .migration_activate or kind == .migration_rollback) 10_000 else if (request.unban) ignore_unban_wait_ms else 3000;
+        const staged = self.stageAdmin(request, wait_ms);
         destroy_on_exit = staged.owned;
         const view = staged.view;
         const w = out.writer(a);
         try w.print("{{\"schema_version\":1,\"kind\":\"{s}\",\"outcome\":\"{s}\",\"generation\":\"{s}\",\"mutation_revision\":{d},\"enforced\":{},\"reasons\":[", .{ @tagName(view.kind), @tagName(view.outcome), &std.fmt.bytesToHex(view.generation, .lower), view.mutation_revision, view.enforced });
-        if (view.reason.len != 0) try std.json.encodeJsonString(view.reason.slice(), .{}, w);
+        const ignore_state: ?*const IgnoreWork = if (staged.owned) request.ignore else null;
+        var wrote_reason = false;
+        if (view.reason.len != 0) {
+            try std.json.encodeJsonString(view.reason.slice(), .{}, w);
+            wrote_reason = true;
+        }
+        if (ignore_state) |value| if (request.unban) for (value.bans[0..value.ban_count]) |ban| if (ban.lift == .refused) {
+            var scope_buffer: [64]u8 = undefined;
+            var line_buffer: [240]u8 = undefined;
+            const line = std.fmt.bufPrint(&line_buffer, "{s}: {s}", .{ try formatListSubject(ban.canonical.subject, &scope_buffer), ban.reason orelse "not lifted" }) catch line_buffer[0..0];
+            if (wrote_reason) try w.writeByte(',');
+            try std.json.encodeJsonString(line, .{}, w);
+            wrote_reason = true;
+        };
         try w.writeAll("]");
+        if (kind == .ignore_add or kind == .ignore_remove) try writeIgnoreFields(w, request, ignore_state);
         if (kind == .migration_activate or kind == .migration_rollback) try w.print(",\"observed_protection\":{{\"destination\":\"{s}\",\"source\":\"unknown\"}}", .{view.destination orelse "unknown"});
         try w.writeAll("}");
         return switch (view.outcome) {
@@ -1715,6 +1964,386 @@ pub const Coordinator = struct {
             .partial => .{ .err = .{ .code = 507, .message = try out.toOwnedSlice(a) } },
             .uncertain => .{ .err = .{ .code = 508, .message = try out.toOwnedSlice(a) } },
         };
+    }
+    fn ignoreSourceText(source: ?ignore_set.Source) ?[]const u8 {
+        return switch (source orelse return null) {
+            .config => "config",
+            .runtime => "runtime",
+            .both => "config+runtime",
+        };
+    }
+    fn writeIgnoreEntries(w: anytype, entries: []const shared.types.IgnoreEntry) !void {
+        try w.writeAll("[");
+        for (entries, 0..) |item, i| {
+            if (i > 0) try w.writeByte(',');
+            var buffer: [64]u8 = undefined;
+            try std.json.encodeJsonString(item.canonical(&buffer), .{}, w);
+        }
+        try w.writeAll("]");
+    }
+    fn writeIgnoreFields(w: anytype, request: *const AdminRequest, ignore_state: ?*const IgnoreWork) !void {
+        const add = request.kind == .ignore_add;
+        var buffer: [64]u8 = undefined;
+        try w.writeAll(",\"jail\":");
+        try std.json.encodeJsonString(request.jailName(), .{}, w);
+        try w.writeAll(",\"address\":");
+        try std.json.encodeJsonString(request.ignore_entry.?.canonical(&buffer), .{}, w);
+        const state: IgnoreEntryState = if (ignore_state) |value| value.entry_state else .not_recorded;
+        const reported = if (!add and state == .not_recorded) IgnoreEntryState.not_removed else state;
+        try w.print(",\"entry\":\"{s}\",\"source\":", .{@tagName(reported)});
+        if (ignoreSourceText(if (ignore_state) |value| value.source else null)) |text| try std.json.encodeJsonString(text, .{}, w) else try w.writeAll("null");
+        try w.writeAll(if (add) ",\"covered_by\":" else ",\"still_ignored_by\":");
+        try writeIgnoreEntries(w, if (ignore_state) |value| value.configured[0..value.configured_count] else &.{});
+        if (!add) return;
+        try w.print(",\"unban_requested\":{},\"bans_total\":{d},\"bans\":[", .{ request.unban, if (ignore_state) |value| value.bans_total else 0 });
+        if (ignore_state) |value| for (value.bans[0..@min(value.ban_count, max_listed_bans)], 0..) |ban, i| {
+            var scope_buffer: [64]u8 = undefined;
+            if (i > 0) try w.writeByte(',');
+            try w.writeAll("{\"scope\":");
+            try std.json.encodeJsonString(try formatListSubject(ban.canonical.subject, &scope_buffer), .{}, w);
+            try w.writeAll(",\"deadline_us\":");
+            if (ban.deadline_us) |deadline| try w.print("{d}", .{deadline}) else try w.writeAll("null");
+            try w.print(",\"permanent\":{},\"confirmed\":{},\"relation\":\"{s}\",\"lift\":\"{s}\",\"lift_reason\":", .{ ban.deadline_us == null, ban.confirmed, @tagName(ban.relation), @tagName(ban.lift) });
+            if (ban.reason) |text| try std.json.encodeJsonString(text, .{}, w) else try w.writeAll("null");
+            try w.writeAll("}");
+        };
+        try w.writeAll("]");
+    }
+    fn ignoreRefusal(self: *Coordinator, request: *AdminRequest, outcome: durable.Store.AdminOutcome, comptime fmt: []const u8, args: anytype) AdminOutcomeView {
+        return self.adminDetail(request, (AdminOutcomeView{ .outcome = outcome, .kind = request.kind }).withReason(fmt, args), null);
+    }
+    fn ignoreUncertain(self: *Coordinator, request: *AdminRequest) AdminOutcomeView {
+        return self.ignoreRefusal(request, .uncertain, "the ignore entry may or may not have been recorded; run fail2zig ignore list --jail {s} to see the current list", .{request.jailName()});
+    }
+    fn recordConfiguredCover(ignore_state: *IgnoreWork, list: *const ignore_set.EffectiveIgnore, entry: shared.types.IgnoreEntry, include_equal: bool) void {
+        var found: [ignore_set.max_entries_per_part]*const ignore_set.Item = undefined;
+        const covering = list.covering(entry, &found);
+        for (found[0..covering], 0..) |item, slot| ignore_state.configured[slot] = item.entry;
+        ignore_state.configured_count = covering;
+        for (list.entries) |item| {
+            if (item.entry.order(entry) != .eq) continue;
+            ignore_state.source = item.source;
+            if (include_equal and item.source != .runtime and ignore_state.configured_count < ignore_state.configured.len) {
+                ignore_state.configured[ignore_state.configured_count] = item.entry;
+                ignore_state.configured_count += 1;
+            }
+        }
+        std.sort.pdq(shared.types.IgnoreEntry, ignore_state.configured[0..ignore_state.configured_count], {}, entryLess);
+    }
+    fn entryLess(_: void, a: shared.types.IgnoreEntry, b: shared.types.IgnoreEntry) bool {
+        return a.order(b) == .lt;
+    }
+    fn subjectEntry(subject: inspection.canonical_scope.Subject) shared.types.IgnoreEntry {
+        return .{ .family = switch (subject.family) {
+            .v4 => .v4,
+            .v6 => .v6,
+        }, .address = subject.address, .prefix = subject.prefix };
+    }
+    fn banRelation(entry: shared.types.IgnoreEntry, ban: shared.types.IgnoreEntry) ?IgnoreRelation {
+        if (entry.family != ban.family) return null;
+        if (ban.prefix >= entry.prefix) return if (entry.contains(ban.network())) .inside_entry else null;
+        return if (ban.contains(entry.network())) .contains_entry else null;
+    }
+    const RelatedBan = struct { order: shared.types.IgnoreEntry, index: u32, relation: IgnoreRelation };
+    fn relatedLess(_: void, a: RelatedBan, b: RelatedBan) bool {
+        return a.order.order(b.order) == .lt;
+    }
+    fn collectRelatedBans(self: *Coordinator, request: *AdminRequest, jail: *Jail) !void {
+        const ignore_state = request.ignore.?;
+        const entry = request.ignore_entry.?;
+        const enforces = self.jailEnforces(jail);
+        if (enforces) {
+            self.publishOwners() catch |failure| if (failure != error.StaleEffect) return failure;
+        } else try self.publishJail(jail);
+        const now = std.time.microTimestamp();
+        const found = try self.allocator.alloc(RelatedBan, if (enforces) self.owner_count else jail.summary.active);
+        defer self.allocator.free(found);
+        var count: usize = 0;
+        var inside: usize = 0;
+        if (enforces) {
+            for (self.owner_active[0..self.owner_count], 0..) |owner, i| {
+                if (!std.mem.eql(u8, owner.jail.slice(), jail.name) or !owner.lease.live(now)) continue;
+                const ban = subjectEntry(owner.scope.canonical.subject);
+                const relation = banRelation(entry, ban) orelse continue;
+                found[count] = .{ .order = ban, .index = @intCast(i), .relation = relation };
+                count += 1;
+                inside += @intFromBool(relation == .inside_entry);
+            }
+        } else for (jail.active[0..jail.summary.active], 0..) |decision, i| {
+            if (!decision.lease.live(now)) continue;
+            const ban = subjectEntry(decisionScope(decision.subject).subject);
+            const relation = banRelation(entry, ban) orelse continue;
+            found[count] = .{ .order = ban, .index = @intCast(i), .relation = relation };
+            count += 1;
+            inside += @intFromBool(relation == .inside_entry);
+        }
+        std.sort.pdq(RelatedBan, found[0..count], {}, relatedLess);
+        ignore_state.bans_total = count;
+        ignore_state.inside_total = inside;
+        ignore_state.ban_count = @min(count, if (request.unban) ignore_state.bans.len else max_listed_bans);
+        for (found[0..ignore_state.ban_count], ignore_state.bans[0..ignore_state.ban_count]) |item, *slot| {
+            if (enforces) {
+                const owner = self.owner_active[item.index];
+                slot.* = .{ .canonical = owner.scope.canonical, .key = owner.key, .deadline_us = leaseDeadline(owner.lease), .confirmed = self.owner_confirmed[item.index] and self.confirmationKnown(observationMs()), .relation = item.relation };
+            } else {
+                const decision = jail.active[item.index];
+                slot.* = .{ .canonical = decisionScope(decision.subject), .key = [_]u8{0} ** 32, .deadline_us = leaseDeadline(decision.lease), .confirmed = jail.confirmed[item.index] and self.confirmationKnown(observationMs()), .relation = item.relation };
+            }
+        }
+    }
+    fn leaseDeadline(lease: anytype) ?i64 {
+        return switch (lease) {
+            .finite => |value| value,
+            else => null,
+        };
+    }
+    fn decisionScope(subject: detection.Subject) inspection.CanonicalScope {
+        const address: shared.IpAddress = switch (subject) {
+            .v4 => |v| .{ .ipv4 = std.mem.readInt(u32, &v, .big) },
+            .v6 => |v| .{ .ipv6 = std.mem.readInt(u128, &v, .big) },
+        };
+        return .{ .subject = inspection.canonical_scope.Subject.host(address) };
+    }
+    fn liftIgnoredBans(self: *Coordinator, request: *AdminRequest, jail: ?*Jail) void {
+        const ignore_state = request.ignore.?;
+        const name = request.jailName();
+        const budget_end = monotonic(self) + ignore_lift_budget_ms;
+        for (ignore_state.bans[0..ignore_state.ban_count], 0..) |*ban, index| {
+            if (ban.relation == .contains_entry) {
+                ban.lift = .refused;
+                ban.reason = "network ban wider than the entry";
+                continue;
+            }
+            const manager_enforces = self.effects != null and jail != null and self.jailEnforces(jail.?);
+            if (!manager_enforces) {
+                ban.lift = .refused;
+                ban.reason = "jail is log-only; manual bans require an enforcing backend";
+                continue;
+            }
+            if (monotonic(self) >= budget_end) {
+                ban.lift = .refused;
+                ban.reason = "not attempted within the command's time limit; run the command again";
+                continue;
+            }
+            const current = self.store.currentOwner(ban.key, name) catch |failure| {
+                ban.lift = .unknown;
+                ban.reason = @errorName(failure);
+                continue;
+            } orelse {
+                ban.lift = .refused;
+                ban.reason = "no owner for this scope in the jail";
+                continue;
+            };
+            if (current.lease == .absent) {
+                ban.lift = .refused;
+                ban.reason = "owner already released";
+                continue;
+            }
+            var counter: [4]u8 = undefined;
+            std.mem.writeInt(u32, &counter, @intCast(index), .little);
+            const transition = effect.hashParts("fail2zig-ignore-unban-v1", &.{ &request.request_id, &counter });
+            const prepared = std.time.microTimestamp();
+            _ = self.store.transitionOwner(.{ .scope = ban.canonical, .jail = name, .current_generation = current.generation, .next_generation = current.generation, .expected_owner_revision = current.revision, .transition_id = transition, .mode = .release, .occurred_us = prepared }, .{ .prepared_us = prepared, .context = self, .read = wallClockEffect }) catch |failure| {
+                ban.reason = @errorName(failure);
+                ban.lift = switch (failure) {
+                    error.StaleEffect, error.EffectGenerationMismatch, error.EffectReconciliationRequired => .refused,
+                    else => .unknown,
+                };
+                continue;
+            };
+            ban.lift = .pending;
+            ignore_state.lifting = true;
+            ignore_state.mutated = true;
+            request.mutation_committed = true;
+        }
+    }
+    fn settleIgnoreLifts(self: *Coordinator, request: *AdminRequest, ignore_state: *IgnoreWork) void {
+        const manager = self.effects.?;
+        const readback = adminReadback(manager.status, manager.cached_epoch, self.store.effect_publication_epoch);
+        const now = std.time.microTimestamp();
+        var pending: usize = 0;
+        for (ignore_state.bans[0..ignore_state.ban_count]) |*ban| {
+            if (ban.lift != .pending) continue;
+            switch (readback) {
+                .uncertain => {
+                    ban.lift = .unknown;
+                    ban.reason = "effect outcome uncertain";
+                },
+                .pending => pending += 1,
+                .coherent => {
+                    var removed = true;
+                    for (manager.live[0..manager.count]) |live| if (std.mem.eql(u8, &live.scope_key, &ban.key)) {
+                        removed = live.status == .absent or live.status == .expired or !live.desired.live(now);
+                    };
+                    if (removed) ban.lift = .confirmed else pending += 1;
+                },
+            }
+        }
+        if (pending != 0 and monotonic(self) < request.deadline_ms) return;
+        for (ignore_state.bans[0..ignore_state.ban_count]) |*ban| if (ban.lift == .pending) {
+            ban.lift = .incomplete;
+            ban.reason = "kernel removal not confirmed within the deadline";
+        };
+        self.completeAdmin(request, self.finishIgnoreAdd(request));
+    }
+    fn finishIgnoreAdd(self: *Coordinator, request: *AdminRequest) AdminOutcomeView {
+        const ignore_state = request.ignore.?;
+        var reported: durable.Store.AdminOutcome = .applied;
+        var enforced = true;
+        for (ignore_state.bans[0..ignore_state.ban_count]) |ban| switch (ban.lift) {
+            .unknown => {
+                reported = .uncertain;
+                enforced = false;
+            },
+            .incomplete => {
+                if (reported != .uncertain) reported = .partial;
+                enforced = false;
+            },
+            .refused => if (reported == .applied) {
+                reported = .rejected;
+            },
+            .kept, .pending, .confirmed => {},
+        };
+        const recorded: durable.Store.AdminOutcome = if (reported == .rejected and ignore_state.mutated) .partial else reported;
+        var finished = self.adminDetail(request, (AdminOutcomeView{ .outcome = recorded, .kind = request.kind, .enforced = enforced }), null);
+        if (finished.outcome == recorded) finished.outcome = reported;
+        return finished;
+    }
+    fn executeIgnoreAdd(self: *Coordinator, request: *AdminRequest) !AdminOutcomeView {
+        const ignore_state = request.ignore.?;
+        const entry = request.ignore_entry.?;
+        const name = request.jailName();
+        const jail_cfg = findConfigJail(self.live_cfg, name) orelse return self.ignoreRefusal(request, .rejected, "jail '{s}' is not configured", .{name});
+        if (jail_cfg.rule_files.len != 0) return self.ignoreRefusal(request, .rejected, "jail '{s}' uses rule_files; manage its exclusions through ignore_file", .{name});
+        const jail = self.findJail(name);
+        if (jail) |value| if (ignoreCell(value) == null) return self.ignoreRefusal(request, .rejected, "jail '{s}' reads internal events and has no ignore list", .{name});
+        var runtime: [ignore_set.max_entries_per_part + 1]shared.types.IgnoreEntry = undefined;
+        const runtime_count = try self.store.ignoreEntries(name, runtime[0..ignore_set.max_entries_per_part]);
+        const literals = jail_cfg.ignoreip orelse self.live_cfg.defaults.ignoreip;
+        const before = try ignore_set.EffectiveIgnore.build(self.allocator, literals, runtime[0..runtime_count]);
+        defer before.deinit(self.allocator);
+        var existing: ?ignore_set.Source = null;
+        for (before.entries) |item| if (item.entry.order(entry) == .eq) {
+            existing = item.source;
+        };
+        const recorded = existing != null and existing.? != .config;
+        if (!recorded and before.entries.len + @intFromBool(existing == null) > ignore_set.distinct_bound)
+            return self.ignoreRefusal(request, .rejected, "jail {s} already has {d} ignore entries (configuration and runtime combined), the limit. Remove one with fail2zig ignore remove first.", .{ name, before.entries.len });
+        runtime[runtime_count] = entry;
+        const after = ignore_set.EffectiveIgnore.build(self.allocator, literals, runtime[0 .. runtime_count + @intFromBool(!recorded)]) catch |failure| switch (failure) {
+            error.IgnoreCapacityExceeded => return self.ignoreRefusal(request, .rejected, "jail {s} already has {d} ignore entries (configuration and runtime combined), the limit. Remove one with fail2zig ignore remove first.", .{ name, before.entries.len }),
+            else => return failure,
+        };
+        var installed = false;
+        defer if (!installed) after.deinit(self.allocator);
+        if (jail) |value| try self.collectRelatedBans(request, value);
+        var entry_text: [64]u8 = undefined;
+        const canonical = entry.canonical(&entry_text);
+        if (request.unban and ignore_state.inside_total > max_lifted_bans)
+            return self.ignoreRefusal(request, .rejected, "{s} covers {d} bans in {s}; --unban lifts at most {d} per command. Nothing changed. Add the entry without --unban, then lift bans with fail2zig unban.", .{ canonical, ignore_state.inside_total, name, max_lifted_bans });
+        ignore_state.entry_state = .present;
+        if (!recorded) {
+            const result = self.store.addIgnoreEntry(name, entry, std.time.microTimestamp()) catch |failure| {
+                if (failure == error.IgnoreCapacity)
+                    return self.ignoreRefusal(request, .rejected, "jail {s} already has {d} ignore entries (configuration and runtime combined), the limit. Remove one with fail2zig ignore remove first.", .{ name, before.entries.len });
+                std.log.err("native admin: ignore entry commit failed: {s}", .{@errorName(failure)});
+                return self.ignoreUncertain(request);
+            };
+            if (result == .added) {
+                ignore_state.entry_state = .added;
+                ignore_state.mutated = true;
+                request.mutation_committed = true;
+            }
+        }
+        recordConfiguredCover(ignore_state, after, entry, false);
+        if (jail) |value| {
+            self.replaceIgnoreList(value, after);
+            installed = true;
+        }
+        if (ignore_state.entry_state == .added) {
+            const lifting = if (request.unban) ignore_state.inside_total else 0;
+            if (lifting != 0)
+                std.log.info("native: jail={} ignore entry added: {} (runtime); unban requested for {d} {s}", .{ std.zig.fmtEscapes(name), std.zig.fmtEscapes(canonical), lifting, if (lifting == 1) "ban" else "bans" })
+            else
+                std.log.info("native: jail={} ignore entry added: {} (runtime); existing bans unchanged", .{ std.zig.fmtEscapes(name), std.zig.fmtEscapes(canonical) });
+        }
+        if (request.unban) self.liftIgnoredBans(request, jail);
+        if (ignore_state.lifting) {
+            request.expect_absent = true;
+            request.scope_key = [_]u8{0} ** 32;
+            request.phase = .awaiting;
+            request.deadline_ms = monotonic(self) + ignore_lift_settle_ms;
+            return .{ .outcome = .applied, .kind = request.kind, .generation = self.published_generation };
+        }
+        return self.finishIgnoreAdd(request);
+    }
+    fn executeIgnoreRemove(self: *Coordinator, request: *AdminRequest) !AdminOutcomeView {
+        const ignore_state = request.ignore.?;
+        const entry = request.ignore_entry.?;
+        const name = request.jailName();
+        ignore_state.entry_state = .not_removed;
+        const jail_cfg = findConfigJail(self.live_cfg, name);
+        if (jail_cfg == null) {
+            var stored: [128]durable.Store.IgnoreJailCount = undefined;
+            const stored_count = try self.store.ignoreEntryJails(&stored);
+            var known = false;
+            for (stored[0..stored_count]) |item| if (std.mem.eql(u8, item.jail[0..item.jail_len], name)) {
+                known = true;
+            };
+            if (!known) return self.ignoreRefusal(request, .rejected, "jail '{s}' is not configured", .{name});
+        }
+        const jail = self.findJail(name);
+        var runtime: [ignore_set.max_entries_per_part]shared.types.IgnoreEntry = undefined;
+        const runtime_count = try self.store.ignoreEntries(name, &runtime);
+        const literals: []const []const u8 = if (jail_cfg) |value| (if (value.rule_files.len != 0) &.{} else value.ignoreip orelse self.live_cfg.defaults.ignoreip) else &.{};
+        const before = try ignore_set.EffectiveIgnore.build(self.allocator, literals, runtime[0..runtime_count]);
+        defer before.deinit(self.allocator);
+        var entry_text: [64]u8 = undefined;
+        const canonical = entry.canonical(&entry_text);
+        var existing: ?ignore_set.Source = null;
+        for (before.entries) |item| if (item.entry.order(entry) == .eq) {
+            existing = item.source;
+        };
+        if (existing != null and existing.? == .config) {
+            ignore_state.entry_state = .config_only;
+            recordConfiguredCover(ignore_state, before, entry, true);
+            if (self.config_path.len != 0 and self.config_path.len <= 96)
+                return self.ignoreRefusal(request, .rejected, "{s} is set in the configuration file for jail {s} and cannot be removed at runtime. Edit ignoreip in {s} and run fail2zig reload.", .{ canonical, name, self.config_path });
+            return self.ignoreRefusal(request, .rejected, "{s} is set in the configuration file for jail {s} and cannot be removed at runtime. Edit ignoreip in the configuration file and run fail2zig reload.", .{ canonical, name });
+        }
+        if (existing == null) {
+            ignore_state.entry_state = .absent;
+            recordConfiguredCover(ignore_state, before, entry, false);
+            return self.ignoreRefusal(request, .absent, "jail {s} has no runtime ignore entry {s}.", .{ name, canonical });
+        }
+        var kept: [ignore_set.max_entries_per_part]shared.types.IgnoreEntry = undefined;
+        var kept_count: usize = 0;
+        for (runtime[0..runtime_count]) |item| if (item.order(entry) != .eq) {
+            kept[kept_count] = item;
+            kept_count += 1;
+        };
+        const after = try ignore_set.EffectiveIgnore.build(self.allocator, literals, kept[0..kept_count]);
+        var installed = false;
+        defer if (!installed) after.deinit(self.allocator);
+        const removed = self.store.removeIgnoreEntry(name, entry) catch |failure| {
+            std.log.err("native admin: ignore entry removal failed: {s}", .{@errorName(failure)});
+            return self.ignoreUncertain(request);
+        };
+        if (!removed) {
+            ignore_state.entry_state = .absent;
+            recordConfiguredCover(ignore_state, after, entry, false);
+            return self.ignoreRefusal(request, .absent, "jail {s} has no runtime ignore entry {s}.", .{ name, canonical });
+        }
+        ignore_state.entry_state = .removed;
+        ignore_state.mutated = true;
+        request.mutation_committed = true;
+        recordConfiguredCover(ignore_state, after, entry, true);
+        if (jail) |value| if (ignoreCell(value) != null) {
+            self.replaceIgnoreList(value, after);
+            installed = true;
+        };
+        std.log.info("native: jail={} ignore entry removed: {} (runtime); configuration still covers it: {s}", .{ std.zig.fmtEscapes(name), std.zig.fmtEscapes(canonical), if (ignore_state.configured_count != 0) "yes" else "no" });
+        return self.adminDetail(request, .{ .outcome = .applied, .kind = request.kind, .enforced = true }, null);
     }
     fn reloadResponse(self: *Coordinator, out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator) !shared.Response {
         var outcome = self.stageReload(2000);
@@ -1746,7 +2375,7 @@ pub const Coordinator = struct {
         var admissions: [max_jails]durable.Store.RuntimeAdmission = undefined;
         for (self.jails, 0..) |*jail, i| admissions[i] = .{
             .jail = jail.name,
-            .generation = try self.plannedGeneration(jail),
+            .generation = try self.plannedGeneration(jail, .planned),
             .policy = jail.policy,
             .custom = jail.custom_plan != null,
         };
@@ -1761,7 +2390,8 @@ pub const Coordinator = struct {
     fn preflightSource(_: []const u8, _: [32]u8, _: ?*anyopaque) anyerror!void {
         return error.ConsumerRuntimeNotReady;
     }
-    fn plannedGeneration(self: *Coordinator, jail: *Jail) ![32]u8 {
+    const GenerationMode = enum { planned, legacy };
+    fn plannedGeneration(self: *Coordinator, jail: *Jail, mode: GenerationMode) ![32]u8 {
         var registry = consumer_bridge.Registry.init([_]u8{0} ** 32);
         if (jail.custom_plan) |assets| {
             var settings = assets.settings;
@@ -1777,8 +2407,9 @@ pub const Coordinator = struct {
         var scratch: [2048]u8 = undefined;
         return switch (jail.plan) {
             .file => |*plan| blk: {
-                var options = plan.sessionOptions();
+                var options = if (mode == .legacy) plan.legacySessionOptions() else plan.sessionOptions();
                 options.retry = jail.policy;
+                options.retry_hash = if (mode == .legacy) .stored else .identity;
                 options.suppress_retry_enforcement = self.suppress_enforcement;
                 if (jail.custom_plan != null) {
                     options.staged_detection = registry.consumer();
@@ -1788,8 +2419,9 @@ pub const Coordinator = struct {
                 break :blk processor.generation;
             },
             .journal => |plan| blk: {
-                var options = plan.sessionOptions();
+                var options = if (mode == .legacy) plan.legacySessionOptions() else plan.sessionOptions();
                 options.retry = jail.policy;
+                options.retry_hash = if (mode == .legacy) .stored else .identity;
                 options.suppress_retry_enforcement = self.suppress_enforcement;
                 if (jail.custom_plan != null) {
                     options.staged_detection = registry.consumer();
@@ -1798,7 +2430,7 @@ pub const Coordinator = struct {
                 const processor = try journal_sessions.Session.prepareProcessor(self.allocator, options, &scratch, .{ .us = 0 });
                 break :blk processor.generation;
             },
-            .internal => |generation| generation,
+            .internal => |generation| if (mode == .legacy) try internalGeneration(jail.name, jail.policy, .stored) else generation,
         };
     }
     fn driver(self: *Coordinator) recovery.Driver {
@@ -2041,6 +2673,7 @@ pub const Coordinator = struct {
                     .file => |*plan| blk: {
                         var options = plan.sessionOptions();
                         options.retry = jail.policy;
+                        options.on_truncation = jail.on_truncation;
                         options.suppress_retry_enforcement = self.suppress_enforcement;
                         options.gate = &self.gate;
                         options.monotonic_clock = .{ .context = self, .read = monotonic };
@@ -2172,7 +2805,9 @@ pub const Coordinator = struct {
     }
     fn recoverOwnership(ctx: ?*anyopaque) !void {
         const self: *Coordinator = @ptrCast(@alignCast(ctx.?));
+        self.owner_read_epoch = null;
         for (self.jails) |*jail| {
+            jail.retry_revision = null;
             try self.publishJail(jail);
         }
     }
@@ -2188,7 +2823,8 @@ pub const Coordinator = struct {
                 }
                 const jail = &self.jails[self.verify_jail];
                 const verified = jail.session.?.verify() catch |failure| {
-                    self.publishSource(jail);
+                    if (try self.startupSourceRefusal(jail, failure)) return;
+                    try self.publishSource(jail);
                     // Some admission failures bypass the source-repair cause. Retain
                     // their child context without changing recovery classification.
                     if (jail.source_error == null and jail.session.? == .journal)
@@ -2199,7 +2835,7 @@ pub const Coordinator = struct {
                 if (jail.session.? == .journal) {
                     // A verified selection still needs a successful recovery poll.
                     // Publish cause and child metadata from the same repair state.
-                    self.publishSource(jail);
+                    try self.publishSource(jail);
                 } else {
                     self.mutex.lock();
                     jail.source_error = null;
@@ -2271,7 +2907,17 @@ pub const Coordinator = struct {
     }
     fn publishJail(self: *Coordinator, jail: *Jail) !void {
         const now = std.time.microTimestamp();
-        const summary = try self.store.retrySummary(jail.name, now, jail.scratch);
+        const retry_revision = try self.store.retryStateRevision();
+        var summary: durable.Store.RetrySummary = undefined;
+        if (jail.retry_revision == retry_revision) {
+            var live: usize = 0;
+            for (jail.active[0..jail.summary.active]) |decision| if (decision.lease.live(now)) {
+                jail.scratch[live] = decision;
+                live += 1;
+            };
+            summary = jail.summary;
+            summary.active = live;
+        } else summary = try self.store.retrySummary(jail.name, now, jail.scratch);
         for (jail.scratch[0..summary.active], 0..) |decision, i| jail.scratch_confirmed[i] = self.jailEnforces(jail) and if (self.effects) |manager| manager.confirmedSubject(decision.subject, now) else false;
         const confirmations = if (self.effects != null) try self.store.confirmedEffectEvents() else 0;
         const revision = try self.store.revision(jail.name);
@@ -2297,6 +2943,7 @@ pub const Coordinator = struct {
         @memcpy(jail.confirmed[0..summary.active], jail.scratch_confirmed[0..summary.active]);
         self.published_confirmations = confirmations;
         jail.summary = summary;
+        jail.retry_revision = retry_revision;
         jail.published_once = true;
         jail.revision = revision;
         jail.healthy = jail.session.?.healthy();
@@ -2304,11 +2951,7 @@ pub const Coordinator = struct {
     fn ownerConfirmed(self: *const Coordinator, owner: durable.Store.OperatorOwner, now: i64) bool {
         const manager = self.effects orelse return false;
         if (manager.cached_epoch == null or manager.cached_epoch.? != self.store.effect_publication_epoch) return false;
-        for (manager.live[0..manager.count], 0..) |entry, index| {
-            if (!std.meta.eql(entry.scope, owner.scope)) continue;
-            return entry.status == .applied and entry.desired.live(now) and owner.lease.live(now) and (manager.confirmed[index] or manager.status.ready);
-        }
-        return false;
+        return owner.lease.live(now) and manager.confirmedKey(owner.key, now);
     }
     fn publishOwners(self: *Coordinator) !void {
         const manager = self.effects orelse return;
@@ -2316,7 +2959,14 @@ pub const Coordinator = struct {
         const fatal = manager.status.uncertain and !(manager.status.cause != null and effect_runtime.transientCause(manager.status.cause.?));
         if (fatal or expected_epoch != self.store.effect_publication_epoch) return error.StaleEffect;
         const now = std.time.microTimestamp();
-        const count = try self.store.operatorOwners(now, self.owner_scratch);
+        var count: usize = 0;
+        const reread = self.owner_read_epoch != expected_epoch;
+        if (reread) {
+            count = try self.store.operatorOwners(now, self.owner_scratch);
+        } else for (self.owner_active[0..self.owner_count]) |owner| if (owner.lease.live(now)) {
+            self.owner_scratch[count] = owner;
+            count += 1;
+        };
         for (self.owner_scratch[0..count], 0..) |owner, i| self.owner_scratch_confirmed[i] = self.ownerConfirmed(owner, now);
         if (expected_epoch != self.store.effect_publication_epoch or manager.cached_epoch == null or manager.cached_epoch.? != expected_epoch) return error.StaleEffect;
         self.mutex.lock();
@@ -2324,8 +2974,9 @@ pub const Coordinator = struct {
         @memcpy(self.owner_active[0..count], self.owner_scratch[0..count]);
         @memcpy(self.owner_confirmed[0..count], self.owner_scratch_confirmed[0..count]);
         self.owner_count = count;
+        if (reread) self.owner_read_epoch = expected_epoch;
     }
-    fn publishSource(self: *Coordinator, jail: *Jail) void {
+    fn publishSource(self: *Coordinator, jail: *Jail) !void {
         const source = jail.session.?;
         const cause: ?anyerror = switch (source) {
             .file => |value| value.repairSnapshot().last_cause orelse value.blocked_cause,
@@ -2360,6 +3011,238 @@ pub const Coordinator = struct {
                 std.log.info("journal source for jail '{'}' recovered", .{std.zig.fmtEscapes(jail.name)});
             }
         }
+        try self.refreshSourceStatus(jail);
+    }
+    fn startupSourceRefusal(self: *Coordinator, jail: *Jail, failure: anyerror) !bool {
+        if (failure != error.SourceInterventionRequired) return false;
+        const source = jail.session.?;
+        if (source == .file) for (0..2 * source.file.sources.max_sources) |_| {
+            _ = source.file.nextUnreportedContinuityFailure() orelse break;
+        };
+        try self.publishSource(jail);
+        try self.logPausedAtStartup(jail);
+        self.verify_jail += 1;
+        return true;
+    }
+    const OptionalNumber = struct {
+        value: ?u64,
+        pub fn format(self: OptionalNumber, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+            if (self.value) |number| try writer.print("{d}", .{number}) else try writer.writeAll("unknown");
+        }
+    };
+    const ControlEscaped = struct {
+        text: []const u8,
+        pub fn format(self: ControlEscaped, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+            for (self.text) |byte| {
+                if (byte < 0x20 or byte == 0x7f) try writer.print("\\x{x:0>2}", .{byte}) else try writer.writeByte(byte);
+            }
+        }
+    };
+    fn logPausedAtStartup(self: *Coordinator, jail: *Jail) !void {
+        const tail_unrepairable = "; other jails enforce; no offline repair applies to this cause; see fail2zig status";
+        var logged = false;
+        if (jail.session.? == .file) {
+            const session = jail.session.?.file;
+            for (session.repair_states[0..@min(session.repair_count, session.sources.sources.items.len)], 0..) |*state, index| {
+                const facts = session.pausedSource(index) orelse continue;
+                logged = true;
+                const cause = @errorName(state.snapshot().last_cause orelse error.SourceInterventionRequired);
+                var detail_buffer: [192]u8 = undefined;
+                const detail = switch (facts.cause) {
+                    .resume_lost => try std.fmt.bufPrint(&detail_buffer, " (inode={d} committed_offset={d} size={})", .{ facts.inode, facts.committed_offset, OptionalNumber{ .value = facts.observed_size } }),
+                    .rotated_incarnation_lost => try std.fmt.bufPrint(&detail_buffer, " (removed inode={d} committed_offset={d} last_size={}; current inode={})", .{ facts.inode, facts.committed_offset, OptionalNumber{ .value = facts.observed_size }, OptionalNumber{ .value = facts.current_inode } }),
+                    .other => "",
+                };
+                const repair_line = if (facts.repair_token) |token| try repairCommand(self.allocator, jail.name, facts.path, token[0..facts.repair_token_len]) else null;
+                defer if (repair_line) |text| self.allocator.free(text);
+                if (repair_line != null and facts.path_absent)
+                    std.log.warn("native: jail={} source=file path={} paused at startup: {s}{s}; the file is absent; other jails enforce; once a file exists at the path, stop fail2zig and run: {}", .{ std.zig.fmtEscapes(jail.name), std.zig.fmtEscapes(facts.path), cause, detail, ControlEscaped{ .text = repair_line.? } })
+                else if (repair_line) |text|
+                    std.log.warn("native: jail={} source=file path={} paused at startup: {s}{s}; other jails enforce; to repair, stop fail2zig and run: {}", .{ std.zig.fmtEscapes(jail.name), std.zig.fmtEscapes(facts.path), cause, detail, ControlEscaped{ .text = text } })
+                else
+                    std.log.warn("native: jail={} source=file path={} paused at startup: {s}{s}" ++ tail_unrepairable, .{ std.zig.fmtEscapes(jail.name), std.zig.fmtEscapes(facts.path), cause, detail });
+            }
+        }
+        if (logged) return;
+        const snapshot = switch (jail.session.?) {
+            .file => |session| session.repairSnapshot(),
+            .journal => |session| session.repairSnapshot(),
+            .internal => return,
+        };
+        std.log.warn("native: jail={} source={s} paused at startup: {s}" ++ tail_unrepairable, .{ std.zig.fmtEscapes(jail.name), @tagName(jail.plan), @errorName(snapshot.last_cause orelse error.SourceInterventionRequired) });
+    }
+    fn sourceSignature(source: Source) SourceSignature {
+        var signature = SourceSignature{ .built = true };
+        switch (source) {
+            .file => |session| {
+                signature.sources = session.sources.sources.items.len;
+                for (session.repair_states[0..@min(session.repair_count, max_sources_per_jail)], 0..) |*state, index| {
+                    const snapshot = state.snapshot();
+                    if (snapshot.phase == .intervention) signature.causes[index] = snapshot.last_cause orelse error.SourceInterventionRequired;
+                }
+                const discovery = session.discovery_repair.snapshot();
+                if (discovery.phase == .intervention) signature.causes[max_sources_per_jail] = discovery.last_cause orelse error.SourceInterventionRequired;
+                if (session.recorded_loss) |loss| signature.loss_sequence = loss.sequence;
+            },
+            .journal => |session| {
+                const snapshot = session.repairSnapshot();
+                if (snapshot.phase == .intervention) signature.causes[max_sources_per_jail] = snapshot.last_cause orelse error.SourceInterventionRequired;
+            },
+            .internal => {},
+        }
+        return signature;
+    }
+    fn sameSignature(a: SourceSignature, b: SourceSignature) bool {
+        return a.built == b.built and a.sources == b.sources and a.loss_sequence == b.loss_sequence and std.mem.eql(?anyerror, &a.causes, &b.causes);
+    }
+    fn refreshSourceStatus(self: *Coordinator, jail: *Jail) !void {
+        const source = jail.session orelse return;
+        const signature = sourceSignature(source);
+        if (sameSignature(jail.source_signature, signature)) return self.refreshReadingOffsets(jail);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer arena.deinit();
+        const entries = try self.buildSourceStatus(jail, arena.allocator());
+        self.mutex.lock();
+        const previous = jail.source_status_arena;
+        jail.source_status = entries;
+        jail.source_status_arena = arena;
+        jail.source_signature = signature;
+        self.mutex.unlock();
+        if (previous) |old| {
+            var released = old;
+            released.deinit();
+        }
+    }
+    fn refreshReadingOffsets(self: *Coordinator, jail: *Jail) void {
+        if (jail.source_status.len == 0) return;
+        const session = switch (jail.session orelse return) {
+            .file => |value| value,
+            else => return,
+        };
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (jail.source_status) |*entry| {
+            if (entry.state != .reading) continue;
+            const path = entry.path orelse continue;
+            for (session.sources.sources.items) |source| {
+                if (!std.mem.eql(u8, source.path, path)) continue;
+                const saved = source.committed orelse break;
+                entry.inode = saved.inode;
+                entry.committed_offset = saved.offset;
+                entry.observed_size = saved.observed_size;
+                break;
+            }
+        }
+    }
+    fn buildSourceStatus(self: *Coordinator, jail: *Jail, arena: std.mem.Allocator) ![]SourceStatus {
+        var list = std.ArrayListUnmanaged(SourceStatus){};
+        switch (jail.session.?) {
+            .file => |session| {
+                var paused_seen = false;
+                const count = @min(session.repair_count, session.sources.sources.items.len);
+                for (session.sources.sources.items[0..count], session.repair_states[0..count], 0..) |source, *state, index| {
+                    const facts = session.pausedSource(index);
+                    var newest: files.LossEvent = undefined;
+                    const events = try self.store.continuitySummary(jail.name, source.path, &newest);
+                    if (facts == null and events == 0) continue;
+                    const path = try arena.dupe(u8, source.path);
+                    var entry = SourceStatus{ .jail = jail.name, .kind = .file, .path = path, .on_truncation = jail.on_truncation, .state = .reading, .cause = null, .inode = null, .committed_offset = null, .observed_size = null, .repair = null, .loss_events = events, .last_loss = null };
+                    if (events != 0) {
+                        newest.jail = jail.name;
+                        newest.path = path;
+                        newest.source_id = "";
+                        entry.last_loss = newest;
+                    }
+                    if (facts) |paused| {
+                        paused_seen = true;
+                        entry.state = .paused;
+                        entry.cause = @errorName(state.snapshot().last_cause orelse error.SourceInterventionRequired);
+                        entry.inode = paused.inode;
+                        entry.committed_offset = paused.committed_offset;
+                        entry.observed_size = paused.observed_size;
+                        if (paused.repair_token) |token| entry.repair = try repairCommand(arena, jail.name, source.path, token[0..paused.repair_token_len]);
+                    } else if (source.committed) |saved| {
+                        entry.inode = saved.inode;
+                        entry.committed_offset = saved.offset;
+                        entry.observed_size = saved.observed_size;
+                    }
+                    try list.append(arena, entry);
+                }
+                if (!paused_seen) {
+                    const snapshot = session.repairSnapshot();
+                    if (snapshot.phase == .intervention) try list.append(arena, pausedWithoutPath(jail, .file, snapshot.last_cause));
+                }
+            },
+            .journal => |session| {
+                const snapshot = session.repairSnapshot();
+                if (snapshot.phase == .intervention) try list.append(arena, pausedWithoutPath(jail, .journal, snapshot.last_cause));
+            },
+            .internal => {},
+        }
+        std.sort.pdq(SourceStatus, list.items, {}, sourceStatusLess);
+        return list.toOwnedSlice(arena);
+    }
+    fn pausedWithoutPath(jail: *const Jail, kind: @FieldType(SourceStatus, "kind"), cause: ?anyerror) SourceStatus {
+        return .{ .jail = jail.name, .kind = kind, .path = null, .on_truncation = if (kind == .file) jail.on_truncation else null, .state = .paused, .cause = @errorName(cause orelse error.SourceInterventionRequired), .inode = null, .committed_offset = null, .observed_size = null, .repair = null, .loss_events = 0, .last_loss = null };
+    }
+    fn sourceStatusLess(_: void, a: SourceStatus, b: SourceStatus) bool {
+        return std.mem.lessThan(u8, a.path orelse "", b.path orelse "");
+    }
+    const shell_safe = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:/@%+=,-";
+    fn writeShellArgument(writer: anytype, argument: []const u8) !void {
+        const bare = argument.len != 0 and for (argument) |byte| {
+            if (std.mem.indexOfScalar(u8, shell_safe, byte) == null) break false;
+        } else true;
+        if (bare) return writer.writeAll(argument);
+        try writer.writeByte('\'');
+        for (argument) |byte| {
+            if (byte == '\'') try writer.writeAll("'\\''") else try writer.writeByte(byte);
+        }
+        try writer.writeByte('\'');
+    }
+    fn repairCommand(allocator: std.mem.Allocator, jail: []const u8, path: []const u8, token: []const u8) ![]u8 {
+        var text = std.ArrayList(u8).init(allocator);
+        errdefer text.deinit();
+        const writer = text.writer();
+        try writer.writeAll("fail2zig repair-source --jail ");
+        try writeShellArgument(writer, jail);
+        try writer.writeAll(" --source ");
+        try writeShellArgument(writer, path);
+        try writer.writeAll(" --token ");
+        try writeShellArgument(writer, token);
+        try writer.writeAll(" --acknowledge-truncation");
+        return text.toOwnedSlice();
+    }
+    fn jailPaused(jail: *const Jail) bool {
+        for (jail.source_status) |entry| if (entry.state == .paused) return true;
+        return false;
+    }
+    fn writePausedStatus(self: *Coordinator, writer: anytype) !bool {
+        var paused: usize = 0;
+        var first: ?SourceStatus = null;
+        for (self.jails) |*jail| for (jail.source_status) |entry| if (entry.state == .paused) {
+            if (first == null) first = entry;
+            paused += 1;
+        };
+        const only = first orelse return false;
+        if (paused == 1) {
+            try writer.print("Enforcing; 1 source paused: {}", .{std.zig.fmtEscapes(only.jail)});
+            if (only.path) |path| try writer.print(" {}", .{std.zig.fmtEscapes(path)});
+            try writer.print(" ({s}); see fail2zig status", .{only.cause orelse "SourceInterventionRequired"});
+            return true;
+        }
+        try writer.print("Enforcing; {d} sources paused (", .{paused});
+        var listed: usize = 0;
+        var previous: []const u8 = "";
+        for (self.jails) |*jail| for (jail.source_status) |entry| if (entry.state == .paused) {
+            if (listed != 0 and std.mem.eql(u8, previous, entry.jail)) continue;
+            if (listed != 0) try writer.writeAll(", ");
+            try writer.print("{}", .{std.zig.fmtEscapes(entry.jail)});
+            previous = entry.jail;
+            listed += 1;
+        };
+        try writer.writeAll("); see fail2zig status");
+        return true;
     }
     fn journalFailureDetail(jail: *const Jail, failure: anyerror) ?journal_sessions.FailureDiagnostic {
         const source = jail.session orelse return null;
@@ -2470,7 +3353,14 @@ pub const Coordinator = struct {
             if (report.ready) {
                 self.notified_ready = true;
                 if (self.startup_progress) |progress| progress.finish();
-                if (self.notifier) |notifier| _ = notifier.ready() catch |err| std.log.warn("sd_notify READY failed: {s}", .{@errorName(err)});
+                if (self.notifier) |notifier| {
+                    var text_buffer: [4 * sd_notify.max_status_bytes]u8 = undefined;
+                    var stream = std.io.fixedBufferStream(&text_buffer);
+                    const paused = self.writePausedStatus(stream.writer()) catch |err| switch (err) {
+                        error.NoSpaceLeft => true,
+                    };
+                    _ = (if (paused) notifier.readyWithStatus(stream.getWritten()) else notifier.ready()) catch |err| std.log.warn("sd_notify READY failed: {s}", .{@errorName(err)});
+                }
                 std.log.info("native: ready; all readiness components verified", .{});
             } else self.reportReadinessProgress(report);
         }
@@ -2557,12 +3447,14 @@ pub const Coordinator = struct {
         self.last_committed_records = committed;
         if (slow_due) {
             self.last_slow_tick_ms = now_ms;
-            if (self.effects) |manager| if (view_idle or manager.last_readback_ns != null) {
-                // Under a backlog the epoch can move between the read and the publish;
-                // the next slow tick retries instead of failing the turn.
-                self.publishOwners() catch |failure| if (failure != error.StaleEffect) return failure;
-                for (self.jails) |*jail| try self.publishJail(jail);
-            };
+            if (self.effects) |manager| {
+                if (view_idle or manager.last_readback_ns != null) {
+                    // Under a backlog the epoch can move between the read and the publish;
+                    // the next slow tick retries instead of failing the turn.
+                    self.publishOwners() catch |failure| if (failure != error.StaleEffect) return failure;
+                    for (self.jails) |*jail| try self.publishJail(jail);
+                }
+            } else for (self.jails) |*jail| try self.publishJail(jail);
             // Consumed at most once per second, then until caught up within a bounded
             // number of pages: the events are durable in their own settle commits, so the
             // consumer checkpoint need not follow every tick. Between consumptions the page
@@ -2587,7 +3479,7 @@ pub const Coordinator = struct {
                     if (!std.mem.eql(u8, consumer.settings.jail, owner.settings.jail)) continue;
                     jail.session.?.resumeConsumer(owner.incarnation) catch |failure| {
                         if (failure == error.SourceRepairPending or failure == error.SourceInterventionRequired) {
-                            self.publishSource(jail);
+                            try self.publishSource(jail);
                             break;
                         }
                         if (failure != error.ConsumerPending and failure != error.ConsumerExpired and failure != error.EffectExpired and failure != error.ReserveBackpressure and failure != error.RetryCapacity) return failure;
@@ -2598,9 +3490,9 @@ pub const Coordinator = struct {
             }
         }
         for (self.jails) |*jail| {
-            jail.session.?.poll() catch |failure| {
+            const admitted = jail.session.?.poll() catch |failure| {
                 if (failure == error.SourceRepairPending or failure == error.SourceInterventionRequired) {
-                    self.publishSource(jail);
+                    try self.publishSource(jail);
                     continue;
                 }
                 if (failure == error.EffectExpired or failure == error.ConsumerExpired or failure == error.ConsumerPending or failure == error.ReserveBackpressure or failure == error.RetryCapacity) continue;
@@ -2617,16 +3509,19 @@ pub const Coordinator = struct {
                 }
                 continue;
             };
-            self.publishSource(jail);
-            try self.publishJail(jail);
+            try self.publishSource(jail);
+            if (admitted != 0) try self.publishJail(jail);
         }
+        if (slow_due) self.gates.slow += 1;
         if (slow_due and self.fairness.maintenanceDue(now_ms)) {
+            self.gates.due += 1;
             self.fairness.maintained(now_ms);
             self.maintenanceTurn() catch |failure| switch (failure) {
                 error.MaintenancePinned, error.StaleMaintenance => {},
                 else => return failure,
             };
         }
+        if (slow_due) self.reportMaintenanceGates(now_ms);
         if (slow_due) {
             if (try self.store.admissionClock()) |floor| {
                 self.mutex.lock();
@@ -2634,6 +3529,14 @@ pub const Coordinator = struct {
                 self.mutex.unlock();
             }
         }
+    }
+    fn reportMaintenanceGates(self: *Coordinator, now_ms: u64) void {
+        if (self.last_gate_report_ms) |last| if (now_ms -| last < 10_000) return;
+        const g = self.gates;
+        if (std.meta.eql(g, MaintenanceGates{})) return;
+        std.log.debug("native: maintenance gates: slow={d} due={d} turns={d} unhealthy_gate={d} step={d}/{d}/{d} unsettled={d} no_session={d} unhealthy={d} candidate_receipt={d} consumer_busy={d} candidate_source={d} no_sources={d} history_missing={d} history_behind={d} walks={d} resumes={d} advances={d} token={d} null={d}", .{ g.slow, g.due, g.turns, g.unhealthy_gate, g.step_progress, g.step_returned, g.step_wait, g.unsettled, g.no_session, g.unhealthy, g.candidate_receipt, g.consumer_busy, g.candidate_source, g.no_sources, g.history_missing, g.history_behind, g.walks, g.resumes, g.advances, g.advance_token, g.advance_null });
+        self.last_gate_report_ms = now_ms;
+        self.gates = .{};
     }
     /// At most one line per 10 s, and only while the counters move.
     fn reportViewProgress(self: *Coordinator, manager: *effect_runtime.Manager) void {
@@ -2710,7 +3613,11 @@ pub const Coordinator = struct {
     }
     const history_pages_per_turn: u8 = 4;
     fn maintenanceTurn(self: *Coordinator) !void {
-        if (self.gate.snapshot().phase != .healthy or self.jails.len == 0) return;
+        self.gates.turns += 1;
+        if (self.gate.snapshot().phase != .healthy or self.jails.len == 0) {
+            self.gates.unhealthy_gate += 1;
+            return;
+        }
         self.maintenance_progress = false;
         try self.retirementStep();
         const age_us = std.math.mul(i64, std.math.cast(i64, self.cfg.global.history_retention) orelse return error.InvalidApplicationHistoryQuery, 1_000_000) catch return error.InvalidApplicationHistoryQuery;
@@ -2721,42 +3628,88 @@ pub const Coordinator = struct {
         const effects_usable = if (self.effects) |manager| !manager.status.uncertain and !self.store.reopen_required else true;
         switch (try self.store.maintenanceStep(.{ .retention = .{ .age_us = age_us, .max_matches = self.cfg.global.history_max_matches }, .now_us = std.time.microTimestamp(), .history_caught_up = caught_up, .spent_scopes = effects_usable })) {
             .progress => |operation| {
-                if (operation == .history_rebuild or operation == .history_details or operation == .history_prefix) self.history_page = null;
                 self.maintenance_progress = true;
-                return;
+                self.gates.step_progress += 1;
+                if (operation == .history_rebuild or operation == .history_details or operation == .history_prefix) {
+                    self.history_page = null;
+                    self.gates.step_returned += 1;
+                    return;
+                }
             },
             .wait => {
                 self.maintenance_progress = true;
+                self.gates.step_wait += 1;
                 return;
             },
             .idle => {},
         }
         // Record cleanup still waits for a settled effect view.
-        if (!effects_settled) return;
+        if (!effects_settled) {
+            self.gates.unsettled += 1;
+            return;
+        }
+        if (self.effects != null) {
+            if (self.history_page == null and self.history_caught_up) _ = try self.consumeHistory();
+            const page = self.history_page orelse {
+                self.gates.history_missing += 1;
+                return;
+            };
+            if (page.after_sequence != page.head_sequence or page.last_sequence != page.head_sequence) {
+                self.gates.history_behind += 1;
+                return;
+            }
+        }
         const jail = &self.jails[self.maintenance_jail % self.jails.len];
         self.maintenance_jail = (self.maintenance_jail + 1) % self.jails.len;
-        const session = jail.session orelse return;
-        if (!session.healthy()) return;
+        const session = jail.session orelse {
+            self.gates.no_session += 1;
+            return;
+        };
+        if (!session.healthy()) {
+            self.gates.unhealthy += 1;
+            return;
+        }
         switch (session) {
-            .file => |value| if (value.pipe.candidate_receipt != null) return,
-            .journal => |value| if (value.pipe.candidate_receipt != null) return,
-            .internal => return,
+            .file => |value| if (value.pipe.candidate_receipt != null) {
+                self.gates.candidate_receipt += 1;
+                return;
+            },
+            .journal => |value| if (value.pipe.candidate_receipt != null) {
+                self.gates.candidate_receipt += 1;
+                return;
+            },
+            .internal => {
+                self.gates.no_session += 1;
+                return;
+            },
         }
         if (jail.consumer) |owner| {
-            if (owner.ignores.in_flight) return;
+            if (owner.ignores.in_flight) {
+                self.gates.consumer_busy += 1;
+                return;
+            }
             for (owner.registry.sources[0..owner.registry.count]) |source| {
-                if (source.busy or source.pending != null or source.waiting_occurrence != null or source.dns_stage != null) return;
+                if (source.busy or source.pending != null or source.waiting_occurrence != null or source.dns_stage != null) {
+                    self.gates.consumer_busy += 1;
+                    return;
+                }
             }
         }
         const source_count: usize = switch (session) {
             .file => |value| blk: {
-                if (value.candidate_source != null) return;
+                if (value.candidate_source != null) {
+                    self.gates.candidate_source += 1;
+                    return;
+                }
                 break :blk value.sources.sources.items.len;
             },
             .journal => 1,
             .internal => return,
         };
-        if (source_count == 0) return;
+        if (source_count == 0) {
+            self.gates.no_sources += 1;
+            return;
+        }
         const source_index = jail.maintenance_source % source_count;
         const source_id = switch (session) {
             .file => |value| value.sources.sources.items[source_index].source_id,
@@ -2768,10 +3721,7 @@ pub const Coordinator = struct {
             .journal => |value| value.processor.generation,
             .internal => return,
         };
-        if (self.effects != null) {
-            const page = self.history_page orelse return;
-            if (page.after_sequence != page.head_sequence or page.last_sequence != page.head_sequence) return;
-        }
+        self.gates.walks += 1;
         var manifest: ?@import("core/native_consumer.zig").Manifest = null;
         if (jail.consumer) |owner| manifest = try (try owner.registry.source(source_id)).manifest(generation);
         const fence = durable.Store.CleanupFence{
@@ -2788,10 +3738,15 @@ pub const Coordinator = struct {
         };
         jail.maintenance_source = (source_index + 1) % source_count;
         if (try self.store.cleanupResume(jail.name, source_id, generation)) |token| {
+            self.gates.resumes += 1;
             _ = try self.store.cleanupDelete(fence, token);
             self.maintenance_progress = true;
         } else if (try self.store.sourceMaintenance(jail.name, source_id, generation)) |state| {
-            if (try self.store.cleanupAdvance(fence, state, state.head_sequence) != null) self.maintenance_progress = true;
+            self.gates.advances += 1;
+            if (try self.store.cleanupAdvance(fence, state, state.head_sequence) != null) {
+                self.gates.advance_token += 1;
+                self.maintenance_progress = true;
+            } else self.gates.advance_null += 1;
         }
     }
     pub fn destroy(self: *Coordinator) void {
@@ -2814,6 +3769,7 @@ pub const Coordinator = struct {
             if (jail.custom_plan) |value| value.destroy();
             jail.plan.deinit(self.allocator);
             destroyZone(self.allocator, jail.zone);
+            if (jail.source_status_arena) |*arena| arena.deinit();
             self.allocator.free(jail.scratch);
             self.allocator.free(jail.active);
             self.allocator.free(jail.scratch_confirmed);
@@ -2832,6 +3788,63 @@ pub const Coordinator = struct {
     }
     fn status(ctx: ?*anyopaque, out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator) !void {
         const self: *Coordinator = @ptrCast(@alignCast(ctx.?));
+        try self.statusPayload(out, a, true);
+    }
+    const LossJson = struct { sequence: u64, wall_us: i64, reason: []const u8, inode: u64, committed_offset: u64, observed_size: ?u64 };
+    const SourceJson = struct {
+        jail: []const u8,
+        kind: []const u8,
+        path: ?[]const u8,
+        on_truncation: ?[]const u8,
+        state: []const u8,
+        cause: ?[]const u8,
+        inode: ?u64,
+        committed_offset: ?u64,
+        observed_size: ?u64,
+        repair: ?[]const u8,
+        loss_events: u16,
+        last_loss: ?LossJson,
+    };
+    const redacted_text = "<redacted>";
+    fn sourceStatusOrder(_: void, a: *const SourceStatus, b: *const SourceStatus) bool {
+        return switch (std.mem.order(u8, a.jail, b.jail)) {
+            .lt => true,
+            .gt => false,
+            .eq => std.mem.lessThan(u8, a.path orelse "", b.path orelse ""),
+        };
+    }
+    fn lossJson(event: files.LossEvent) LossJson {
+        return .{ .sequence = event.sequence, .wall_us = event.wall_us, .reason = @tagName(event.reason), .inode = event.inode, .committed_offset = event.committed_offset, .observed_size = event.observed_size };
+    }
+    fn writeSources(self: *const Coordinator, writer: anytype, redact: bool) !void {
+        var ordered: [max_jails * (max_sources_per_jail + 1)]*const SourceStatus = undefined;
+        var count: usize = 0;
+        for (self.jails) |*jail| for (jail.source_status) |*entry| {
+            ordered[count] = entry;
+            count += 1;
+        };
+        std.sort.pdq(*const SourceStatus, ordered[0..count], {}, sourceStatusOrder);
+        try writer.writeByte('[');
+        for (ordered[0..count], 0..) |entry, index| {
+            if (index != 0) try writer.writeByte(',');
+            try std.json.stringify(SourceJson{
+                .jail = entry.jail,
+                .kind = @tagName(entry.kind),
+                .path = if (entry.path != null and redact) redacted_text else entry.path,
+                .on_truncation = if (entry.on_truncation) |policy| @tagName(policy) else null,
+                .state = @tagName(entry.state),
+                .cause = entry.cause,
+                .inode = entry.inode,
+                .committed_offset = entry.committed_offset,
+                .observed_size = entry.observed_size,
+                .repair = if (entry.repair != null and redact) redacted_text else entry.repair,
+                .loss_events = entry.loss_events,
+                .last_loss = if (entry.last_loss) |event| lossJson(event) else null,
+            }, .{}, writer);
+        }
+        try writer.writeByte(']');
+    }
+    fn statusPayload(self: *Coordinator, out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, redact: bool) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
         const gate = self.published_health;
@@ -2842,10 +3855,14 @@ pub const Coordinator = struct {
         var decisions: u64 = 0;
         var installed: u32 = 0;
         var unhealthy_sources: u32 = 0;
+        var paused_sources: u32 = 0;
+        var unpaused_unhealthy: u32 = 0;
         const now = sampled_wall orelse self.start_us;
         for (self.jails) |jail| {
             healthy = healthy and jail.healthy;
             if (!jail.healthy) unhealthy_sources += 1;
+            if (!jail.healthy and !jailPaused(&jail)) unpaused_unhealthy += 1;
+            for (jail.source_status) |entry| paused_sources += @intFromBool(entry.state == .paused);
             decisions +|= jail.summary.decisions;
             installed +|= self.confirmedCount(jail, now, sampled_ms) orelse 0;
         }
@@ -2865,7 +3882,15 @@ pub const Coordinator = struct {
         } else null;
         const generation_hex = std.fmt.bytesToHex(self.published_generation, .lower);
         const effect_diagnostic = if (self.published_effects) |effects| effects.diagnostic else null;
-        try std.json.stringify(.{ .version = version, .runtime = "native", .generation = &generation_hex, .mutation_revision = self.published_revision, .state = protection, .protection = protection, .protection_cause = if (self.backend_failure) |failure| @as(?[]const u8, @errorName(failure)) else null, .active_bans = active_bans, .total_bans = self.published_confirmations, .knowledge = if (known) |k| @as(?[]const u8, @tagName(k)) else null, .confirmed_at_us = if (known != null and known.? != .none) self.published_view.readback_wall_us else null, .knowledge_age_ms = if (known != null and known.? != .none) self.knowledgeAgeMs(sampled_ms) else null, .pending_bans = if (known != null) @as(?u64, self.published_view.pending) else null, .oldest_pending_ms = if (known != null) ageMs(now, self.published_view.oldest_pending_us) else null, .overdue_removals = if (known != null) @as(?u64, self.published_view.overdue_blocking) else null, .oldest_overdue_ms = if (known != null) ageMs(now, self.published_view.oldest_overdue_blocking_us) else null, .overdue_bookkeeping = if (known != null) @as(?u64, self.published_view.overdue -| self.published_view.overdue_blocking) else null, .dump_interrupted = if (known != null) @as(?u64, self.published_view.dump_interrupted) else null, .storage = @tagName(gate.phase), .cause = if (gate.phase == .intervention and gate.last_failure != null) @errorName(gate.last_failure.?.cause) else if (observation.clock_uncertain) "ClockUncertain" else if (observation.stalled) "WorkerStalled" else if (known != null and known.? == .none and knowledge_cause != null) knowledge_cause.? else if (self.overBlocking()) "EffectRemovalOverdue" else if (knowledge_cause) |cause| cause else if (gate.last_failure) |failure| @errorName(failure.cause) else if (self.published_effects) |effects| if (effects.cause) |cause| @errorName(cause) else "none" else if (self.backend_failure) |failure| @errorName(failure) else "none", .sqlite_code = if (gate.last_failure) |failure| failure.diagnostics.sqlite_code else null, .next_retry_ms = gate.next_retry_ms, .committed_records = gate.committed_records, .decisions_total = decisions, .jails_active = self.jails.len, .unhealthy_sources = unhealthy_sources, .backend = self.published_backend, .effect_backend = if (effect_diagnostic) |detail| @as(?[]const u8, @tagName(detail.backend)) else null, .effect_stage = if (effect_diagnostic) |detail| @as(?[]const u8, @tagName(detail.stage)) else null, .effect_cause = if (effect_diagnostic) |detail| @as(?[]const u8, @errorName(detail.cause)) else null, .effect_mutation = if (effect_diagnostic) |detail| @as(?[]const u8, @tagName(detail.mutation)) else null, .effects_uncertain = observation.expiry_uncertain or (if (self.published_effects) |effects| effects.uncertain else false), .overdue_effects = if (self.published_effects) |effects| effects.overdue else 0, .worker_busy = observation.busy, .worker_stalled = observation.stalled, .worker_busy_age_ms = observation.busy_age_ms, .worker_heartbeat_age_ms = observation.heartbeat_age_ms, .clock_uncertain = observation.clock_uncertain, .expiry_overdue = observation.expiry_overdue, .expiry_uncertain = observation.expiry_uncertain, .next_committed_expiry_us = observation.next_committed_expiry_us, .uptime_seconds = if (observation.clock_uncertain) @as(?u64, null) else @as(u64, @intCast(@max(0, @divTrunc(now -| self.start_us, 1_000_000)))) }, .{ .emit_null_optional_fields = false }, out.writer(a));
+        const none_cause: []const u8 = if (paused_sources != 0 and unpaused_unhealthy == 0) "SourcePaused" else "none";
+        const payload_start = out.items.len;
+        try std.json.stringify(.{ .version = version, .runtime = "native", .generation = &generation_hex, .mutation_revision = self.published_revision, .state = protection, .protection = protection, .protection_cause = if (self.backend_failure) |failure| @as(?[]const u8, @errorName(failure)) else null, .active_bans = active_bans, .total_bans = self.published_confirmations, .knowledge = if (known) |k| @as(?[]const u8, @tagName(k)) else null, .confirmed_at_us = if (known != null and known.? != .none) self.published_view.readback_wall_us else null, .knowledge_age_ms = if (known != null and known.? != .none) self.knowledgeAgeMs(sampled_ms) else null, .pending_bans = if (known != null) @as(?u64, self.published_view.pending) else null, .oldest_pending_ms = if (known != null) ageMs(now, self.published_view.oldest_pending_us) else null, .overdue_removals = if (known != null) @as(?u64, self.published_view.overdue_blocking) else null, .oldest_overdue_ms = if (known != null) ageMs(now, self.published_view.oldest_overdue_blocking_us) else null, .overdue_bookkeeping = if (known != null) @as(?u64, self.published_view.overdue -| self.published_view.overdue_blocking) else null, .dump_interrupted = if (known != null) @as(?u64, self.published_view.dump_interrupted) else null, .storage = @tagName(gate.phase), .cause = if (gate.phase == .intervention and gate.last_failure != null) @errorName(gate.last_failure.?.cause) else if (observation.clock_uncertain) "ClockUncertain" else if (observation.stalled) "WorkerStalled" else if (known != null and known.? == .none and knowledge_cause != null) knowledge_cause.? else if (self.overBlocking()) "EffectRemovalOverdue" else if (knowledge_cause) |cause| cause else if (gate.last_failure) |failure| @errorName(failure.cause) else if (self.published_effects) |effects| if (effects.cause) |cause| @errorName(cause) else none_cause else if (self.backend_failure) |failure| @errorName(failure) else none_cause, .sqlite_code = if (gate.last_failure) |failure| failure.diagnostics.sqlite_code else null, .next_retry_ms = gate.next_retry_ms, .committed_records = gate.committed_records, .decisions_total = decisions, .jails_active = self.jails.len, .unhealthy_sources = unhealthy_sources, .backend = self.published_backend, .effect_backend = if (effect_diagnostic) |detail| @as(?[]const u8, @tagName(detail.backend)) else null, .effect_stage = if (effect_diagnostic) |detail| @as(?[]const u8, @tagName(detail.stage)) else null, .effect_cause = if (effect_diagnostic) |detail| @as(?[]const u8, @errorName(detail.cause)) else null, .effect_mutation = if (effect_diagnostic) |detail| @as(?[]const u8, @tagName(detail.mutation)) else null, .effects_uncertain = observation.expiry_uncertain or (if (self.published_effects) |effects| effects.uncertain else false), .overdue_effects = if (self.published_effects) |effects| effects.overdue else 0, .worker_busy = observation.busy, .worker_stalled = observation.stalled, .worker_busy_age_ms = observation.busy_age_ms, .worker_heartbeat_age_ms = observation.heartbeat_age_ms, .clock_uncertain = observation.clock_uncertain, .expiry_overdue = observation.expiry_overdue, .expiry_uncertain = observation.expiry_uncertain, .next_committed_expiry_us = observation.next_committed_expiry_us, .uptime_seconds = if (observation.clock_uncertain) @as(?u64, null) else @as(u64, @intCast(@max(0, @divTrunc(now -| self.start_us, 1_000_000)))) }, .{ .emit_null_optional_fields = false }, out.writer(a));
+        if (out.items.len == payload_start or out.items[out.items.len - 1] != '}') return error.InvalidStatusPayload;
+        out.items.len -= 1;
+        const writer = out.writer(a);
+        try writer.print(",\"paused_sources\":{d},\"sources\":", .{paused_sources});
+        try self.writeSources(writer, redact);
+        try writer.writeByte('}');
     }
     /// Knowledge of installed protection ages from the last accepted readback: fresh
     /// within the verification cadence plus one wake, stale after, none when nothing
@@ -2994,11 +4019,17 @@ pub const Coordinator = struct {
             .admin => .admin,
             .monitor => .monitor,
         });
+        if (cmd == .status) {
+            var output: std.ArrayListUnmanaged(u8) = .{};
+            defer output.deinit(a);
+            try self.statusPayload(&output, a, peer.class == .monitor);
+            return .{ .ok = .{ .payload = try output.toOwnedSlice(a) } };
+        }
         return command(ctx, cmd, a);
     }
     fn readinessInputs(self: *Coordinator, jails: *[max_jails]readiness.Jail) readiness.Inputs {
         const observation = self.observedWorker();
-        for (self.jails, 0..) |jail, i| jails[i] = .{ .healthy = jail.healthy, .source_error = jail.source_error != null, .enforce = self.jailEnforces(&jail) };
+        for (self.jails, 0..) |jail, i| jails[i] = .{ .healthy = jail.healthy, .source_error = jail.source_error != null, .enforce = self.jailEnforces(&jail), .source_paused = jailPaused(&jail) };
         return .{
             .config_loaded = self.generation_admitted,
             .storage_phase = self.published_health.phase,
@@ -3020,10 +4051,12 @@ pub const Coordinator = struct {
         const report = self.readinessReport();
         try readiness.writeJson(report, out.writer(a));
     }
+    const StatusQuery = struct { coordinator: *Coordinator, redact: bool };
     fn statusCallback(ctx: ?*anyopaque, a: std.mem.Allocator, out: *std.ArrayList(u8)) anyerror!void {
+        const query: *StatusQuery = @ptrCast(@alignCast(ctx.?));
         var unmanaged: std.ArrayListUnmanaged(u8) = .{};
         defer unmanaged.deinit(a);
-        try status(ctx, &unmanaged, a);
+        try query.coordinator.statusPayload(&unmanaged, a, query.redact);
         try out.appendSlice(unmanaged.items);
     }
     fn healthCallback(ctx: ?*anyopaque, a: std.mem.Allocator, out: *std.ArrayList(u8)) anyerror!void {
@@ -3031,6 +4064,152 @@ pub const Coordinator = struct {
         defer unmanaged.deinit(a);
         try healthView(ctx, &unmanaged, a);
         try out.appendSlice(unmanaged.items);
+    }
+    fn continuityRender(ctx: ?*anyopaque, arena: std.mem.Allocator, cursor: ?u64, limit: u16, redact: bool, out: *query_v1.JsonStream) anyerror!void {
+        const self: *Coordinator = @ptrCast(@alignCast(ctx.?));
+        const reader = if (self.history_reader) |*value| value else return error.HistoryUnavailable;
+        const events = try arena.alloc(files.LossEvent, limit);
+        const count = try reader.continuityEvents(null, cursor, events, arena);
+        try out.objectField("items");
+        try out.beginArray();
+        for (events[0..count]) |event| {
+            try out.beginObject();
+            try out.objectField("sequence");
+            try out.write(event.sequence);
+            try out.objectField("jail");
+            try out.write(event.jail);
+            try out.objectField("path");
+            try out.write(if (redact) redacted_text else event.path);
+            try out.objectField("wall_us");
+            try out.write(event.wall_us);
+            try out.objectField("reason");
+            try out.write(@tagName(event.reason));
+            try out.objectField("inode");
+            try out.write(event.inode);
+            try out.objectField("committed_offset");
+            try out.write(event.committed_offset);
+            try out.objectField("observed_size");
+            try out.write(event.observed_size);
+            try out.endObject();
+        }
+        try out.endArray();
+        try out.objectField("next_cursor");
+        if (count == limit and count != 0) {
+            var buffer: [20]u8 = undefined;
+            try out.write(try std.fmt.bufPrint(&buffer, "{d}", .{events[count - 1].sequence}));
+        } else try out.write(null);
+    }
+    fn writeIgnoreJail(out: *query_v1.JsonStream, name: []const u8, enabled: bool, ignore_file: ?[]const u8, items: []const ignore_set.Item, hostnames: []const []const u8, redact: bool) !void {
+        try out.beginObject();
+        try out.objectField("jail");
+        try out.write(name);
+        try out.objectField("enabled");
+        try out.write(enabled);
+        try out.objectField("count");
+        try out.write(items.len + hostnames.len);
+        try out.objectField("ignore_file");
+        try out.write(if (ignore_file != null and redact) @as(?[]const u8, redacted_text) else ignore_file);
+        try out.objectField("entries");
+        try out.beginArray();
+        for (items) |item| {
+            var buffer: [64]u8 = undefined;
+            try out.beginObject();
+            try out.objectField("address");
+            try out.write(if (redact) redacted_text else item.entry.canonical(&buffer));
+            try out.objectField("source");
+            try out.write(ignoreSourceText(item.source).?);
+            try out.endObject();
+        }
+        for (hostnames) |literal| {
+            try out.beginObject();
+            try out.objectField("address");
+            try out.write(if (redact) redacted_text else literal);
+            try out.objectField("source");
+            try out.write("config");
+            try out.endObject();
+        }
+        try out.endArray();
+        try out.endObject();
+    }
+    fn configuredIgnoreItems(arena: std.mem.Allocator, literals: []const []const u8, runtime: []const shared.types.IgnoreEntry, hostnames: *[]const []const u8) ![]const ignore_set.Item {
+        const parseable = try arena.alloc([]const u8, literals.len);
+        const names = try arena.alloc([]const u8, literals.len);
+        var parseable_count: usize = 0;
+        var name_count: usize = 0;
+        for (literals) |literal| {
+            if (shared.types.IgnoreEntry.parse(literal)) |_| {
+                parseable[parseable_count] = literal;
+                parseable_count += 1;
+            } else |_| {
+                names[name_count] = literal;
+                name_count += 1;
+            }
+        }
+        std.sort.pdq([]const u8, names[0..name_count], {}, hostnameLess);
+        hostnames.* = names[0..name_count];
+        const list = try ignore_set.EffectiveIgnore.build(arena, parseable[0..parseable_count], runtime);
+        return list.entries;
+    }
+    fn hostnameLess(_: void, a: []const u8, b: []const u8) bool {
+        return std.mem.lessThan(u8, a, b);
+    }
+    fn jailNameLess(self: *const Coordinator, a: usize, b: usize) bool {
+        return std.mem.lessThan(u8, self.jails[a].name, self.jails[b].name);
+    }
+    fn ignoreRender(ctx: ?*anyopaque, arena: std.mem.Allocator, jail_filter: ?[]const u8, redact: bool, out: *query_v1.JsonStream) anyerror!void {
+        const self: *Coordinator = @ptrCast(@alignCast(ctx.?));
+        const reader = if (self.history_reader) |*value| value else return error.HistoryUnavailable;
+        var stored: [128]durable.Store.IgnoreJailCount = undefined;
+        const stored_count = try reader.ignoreEntryJails(&stored);
+        var filtered: [ignore_set.max_entries_per_part]shared.types.IgnoreEntry = undefined;
+        var filtered_count: usize = 0;
+        if (jail_filter) |name| filtered_count = try reader.ignoreEntries(name, &filtered);
+        try out.objectField("limit");
+        try out.write(ignore_set.distinct_bound);
+        try out.objectField("jails");
+        try out.beginArray();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var order: [max_jails]usize = undefined;
+        var selected: usize = 0;
+        for (self.jails, 0..) |jail, index| {
+            if (jail_filter) |name| if (!std.mem.eql(u8, name, jail.name)) continue;
+            order[selected] = index;
+            selected += 1;
+        }
+        std.sort.pdq(usize, order[0..selected], @as(*const Coordinator, self), jailNameLess);
+        for (order[0..selected]) |index| {
+            const jail = &self.jails[index];
+            const jail_cfg = findConfigJail(self.live_cfg, jail.name);
+            var hostnames: []const []const u8 = &.{};
+            const items = if (ignoreCell(jail)) |cell| cell.*.entries else blk: {
+                const literals = if (jail_cfg) |value| value.ignoreip orelse self.live_cfg.defaults.ignoreip else &[_][]const u8{};
+                break :blk try configuredIgnoreItems(arena, literals, &.{}, &hostnames);
+            };
+            try writeIgnoreJail(out, jail.name, jail.admin_enabled, if (jail_cfg) |value| value.ignore_file else null, items, hostnames, redact);
+        }
+        if (jail_filter) |name| if (selected == 0) {
+            const jail_cfg = findConfigJail(self.live_cfg, name);
+            if (jail_cfg == null and filtered_count == 0) return error.UnknownJail;
+            var hostnames: []const []const u8 = &.{};
+            const literals = if (jail_cfg) |value| (if (value.rule_files.len != 0) &[_][]const u8{} else value.ignoreip orelse self.live_cfg.defaults.ignoreip) else &[_][]const u8{};
+            const items = try configuredIgnoreItems(arena, literals, filtered[0..filtered_count], &hostnames);
+            try writeIgnoreJail(out, name, false, if (jail_cfg) |value| value.ignore_file else null, items, hostnames, redact);
+        };
+        try out.endArray();
+        try out.objectField("unconfigured");
+        try out.beginArray();
+        if (jail_filter == null) for (stored[0..stored_count]) |item| {
+            const name = item.jail[0..item.jail_len];
+            if (findConfigJail(self.live_cfg, name) != null) continue;
+            try out.beginObject();
+            try out.objectField("jail");
+            try out.write(name);
+            try out.objectField("runtime_entries");
+            try out.write(item.count);
+            try out.endObject();
+        };
+        try out.endArray();
     }
     const history_scan_pages = 16;
     fn historyRead(ctx: ?*anyopaque, jail: ?[]const u8, after_sequence: u64, limit: u16, out: *std.ArrayList(query_v1.HistoryEvent)) anyerror!query_v1.HistoryRead {
@@ -3187,7 +4366,8 @@ pub const Coordinator = struct {
                 scopes_view = .{ .jails = jail_scopes };
             }
         }
-        const result = try query_v1.handle(a, body, peer_class, generation, .{ .status = .{ .ctx = self, .func = statusCallback }, .health = .{ .ctx = self, .func = healthCallback }, .config = config_view, .scopes = scopes_view, .history = .{ .ctx = self, .read = historyRead }, .firewall = firewall_source });
+        var status_query = StatusQuery{ .coordinator = self, .redact = peer_class == .monitor };
+        const result = try query_v1.handle(a, body, peer_class, generation, .{ .status = .{ .ctx = &status_query, .func = statusCallback }, .health = .{ .ctx = self, .func = healthCallback }, .config = config_view, .scopes = scopes_view, .history = .{ .ctx = self, .read = historyRead }, .firewall = firewall_source, .ignore = .{ .ctx = self, .render = ignoreRender }, .continuity = .{ .ctx = self, .render = continuityRender } });
         return switch (result) {
             .payload => |bytes| .{ .ok = .{ .payload = bytes } },
             .failure => |failure| .{ .err = .{ .code = failure.code, .message = try a.dupe(u8, failure.message) } },
@@ -3219,7 +4399,7 @@ pub const Coordinator = struct {
                         .finite_us => |value| @divTrunc(value, 1_000_000),
                         .permanent => null,
                     };
-                    try std.json.stringify(.{ .name = jail.name, .healthy = jail.healthy and self.published_health.phase == .healthy and observationSound(observation), .enabled = jail.admin_enabled, .paused = jail.admin_paused, .active_bans = self.confirmedCount(jail, sampled_wall orelse self.start_us, sampled_ms), .maxretry = jail.policy.maxretry, .findtime = @divTrunc(jail.policy.window_us, 1_000_000), .bantime = bantime, .bantime_permanent = jail.policy.duration == .permanent, .action = if (self.jailEnforces(&jail)) self.published_backend else "log-only", .enforce_configured = jail.policy.enforce, .enforcing = self.jailEnforces(&jail) and self.enforcementActive(observation, sampled_ms), .log_source = @tagName(jail.plan), .source_healthy = jail.healthy, .source = @tagName(jail.plan), .revision = jail.revision, .decisions = jail.summary.decisions, .cause = if (jail.source_error) |cause| @errorName(cause) else "none", .source_exit_code = if (jail.source_diagnostic) |detail| detail.exit_code else null, .source_signal = if (jail.source_diagnostic) |detail| detail.signal else null, .source_stderr_present = if (jail.source_diagnostic) |detail| @as(?bool, detail.stderr_present) else null }, .{}, w);
+                    try std.json.stringify(.{ .name = jail.name, .healthy = jail.healthy and self.published_health.phase == .healthy and observationSound(observation), .enabled = jail.admin_enabled, .paused = jail.admin_paused, .active_bans = self.confirmedCount(jail, sampled_wall orelse self.start_us, sampled_ms), .maxretry = jail.policy.maxretry, .findtime = @divTrunc(jail.policy.window_us, 1_000_000), .bantime = bantime, .bantime_permanent = jail.policy.duration == .permanent, .action = if (self.jailEnforces(&jail)) self.published_backend else "log-only", .enforce_configured = jail.policy.enforce, .enforcing = self.jailEnforces(&jail) and self.enforcementActive(observation, sampled_ms), .log_source = @tagName(jail.plan), .source_healthy = jail.healthy, .source_paused = jailPaused(&jail), .source = @tagName(jail.plan), .revision = jail.revision, .decisions = jail.summary.decisions, .cause = if (jail.source_error) |cause| @errorName(cause) else "none", .source_exit_code = if (jail.source_diagnostic) |detail| detail.exit_code else null, .source_signal = if (jail.source_diagnostic) |detail| detail.signal else null, .source_stderr_present = if (jail.source_diagnostic) |detail| @as(?bool, detail.stderr_present) else null }, .{}, w);
                 }
                 try w.writeAll("]");
             },

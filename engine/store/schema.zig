@@ -47,6 +47,7 @@ pub fn Methods(comptime Store: type) type {
             if (try self.loadRepairStatus() != .complete) return error.LoadRepairMigrationIncomplete;
             self.schema_version = store.load_repair_schema;
             if (pages != 0) {
+                self.load_repair_migrated = true;
                 var row = try self.statement("SELECT superseded_targets,backup_path FROM load_repair_migration WHERE id=1;");
                 defer row.deinit();
                 if (!try row.row()) return error.LoadRepairInvalidState;
@@ -572,6 +573,46 @@ pub fn Methods(comptime Store: type) type {
             try self.fault(.before_migration_schema_commit);
             try self.commitTransaction();
             self.schema_version = @max(schema, 23);
+        }
+
+        // The admin_requests table is rebuilt because its kind CHECK admits only values 1 to 10.
+        pub fn enableRuntimeState(self: *Store, options: store.load_repair.Options, backup: bool) Error!void {
+            const schema = try self.chainSchema();
+            if (schema < store.load_repair_schema or schema > latest_schema) return error.UnsupportedSchema;
+            if (schema == latest_schema) {
+                self.schema_version = latest_schema;
+                return;
+            }
+            var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const taken: ?store.load_repair.SchemaBackup = if (backup) try self.takeSchemaBackup(options, .pre25, &path_buffer) else null;
+            errdefer if (taken) |made| if (!self.reopen_required) std.fs.cwd().deleteFileZ(made.path) catch {};
+            const backup_path: []const u8 = if (taken) |made| made.path else blk: {
+                var row = try self.statement("SELECT backup_path FROM load_repair_migration WHERE id=1;");
+                defer row.deinit();
+                if (!try row.row()) return error.LoadRepairInvalidState;
+                const recorded = try row.boundedBytes(0, path_buffer.len);
+                @memcpy(path_buffer[0..recorded.len], recorded);
+                break :blk path_buffer[0..recorded.len];
+            };
+            try self.beginWrite();
+            errdefer self.rollback();
+            if (try self.integer("PRAGMA user_version;") != store.load_repair_schema) return error.UnsupportedSchema;
+            try self.exec(
+                \\CREATE TABLE ignore_entries(jail TEXT NOT NULL CHECK(typeof(jail)='text' AND length(jail) BETWEEN 1 AND 64),family INTEGER NOT NULL CHECK(family IN (4,6)),address BLOB NOT NULL CHECK(typeof(address)='blob' AND length(address)=16),prefix INTEGER NOT NULL CHECK(prefix BETWEEN 0 AND 128),added_us INTEGER NOT NULL CHECK(typeof(added_us)='integer'),PRIMARY KEY(jail,family,address,prefix)) WITHOUT ROWID;
+                \\CREATE TABLE continuity_loss_events(sequence INTEGER PRIMARY KEY AUTOINCREMENT,jail TEXT NOT NULL CHECK(length(jail) BETWEEN 1 AND 64),path TEXT NOT NULL CHECK(length(path) BETWEEN 1 AND 4096),source TEXT NOT NULL CHECK(length(source) BETWEEN 1 AND 4096),wall_us INTEGER NOT NULL,reason INTEGER NOT NULL CHECK(reason IN (1,2,3)),inode INTEGER NOT NULL,committed_offset INTEGER NOT NULL CHECK(committed_offset>=0),observed_size INTEGER CHECK(observed_size IS NULL OR observed_size>=0));
+                \\CREATE INDEX continuity_loss_events_source ON continuity_loss_events(jail,path,sequence);
+                \\CREATE TABLE admin_requests_v25(request_id BLOB NOT NULL PRIMARY KEY CHECK(typeof(request_id)='blob' AND length(request_id)=32),kind INTEGER NOT NULL CHECK(kind BETWEEN 1 AND 12),subject BLOB NOT NULL CHECK(typeof(subject)='blob' AND length(subject)<=4096),outcome INTEGER NOT NULL CHECK(outcome BETWEEN 1 AND 5),generation BLOB NOT NULL CHECK(typeof(generation)='blob' AND length(generation)=32),mutation_revision INTEGER NOT NULL CHECK(typeof(mutation_revision)='integer' AND mutation_revision>=0),committed_us INTEGER NOT NULL CHECK(typeof(committed_us)='integer' AND committed_us>=0),detail BLOB NOT NULL CHECK(typeof(detail)='blob' AND length(detail)<=4096),admission_revision INTEGER) WITHOUT ROWID;
+                \\INSERT INTO admin_requests_v25 SELECT request_id,kind,subject,outcome,generation,mutation_revision,committed_us,detail,admission_revision FROM admin_requests;
+                \\DROP TABLE admin_requests;
+                \\ALTER TABLE admin_requests_v25 RENAME TO admin_requests;
+                \\CREATE INDEX admin_requests_by_revision ON admin_requests(mutation_revision);
+                \\CREATE TRIGGER admin_request_revision_insert BEFORE INSERT ON admin_requests WHEN NOT (NEW.admission_revision IS NULL OR (typeof(NEW.admission_revision)='integer' AND NEW.admission_revision>=0)) BEGIN SELECT RAISE(ABORT,'invalid admission revision'); END;
+                \\CREATE TRIGGER admin_request_revision_update BEFORE UPDATE OF admission_revision ON admin_requests BEGIN SELECT RAISE(ABORT,'admission revision immutable'); END;
+                \\PRAGMA user_version=25;
+            );
+            try self.commitTransaction();
+            self.schema_version = latest_schema;
+            std.log.info("native storage: schema 25 migration complete: runtime ignore entries and continuity-loss events enabled; pre-upgrade backup {s}", .{backup_path});
         }
     };
 }

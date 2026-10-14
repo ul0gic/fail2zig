@@ -21,7 +21,7 @@ the unit and man pages, and refuses active state writers or a legacy binary stat
 file. It does not recursively change state ownership. To use a locally built
 binary, run `sudo scripts/install.sh --local-bin zig-out/bin` from the checkout.
 
-The v0.4.6 release provides one combined daemon/admin executable per target:
+The v0.4.7 release provides one combined daemon/admin executable per target:
 
 | Target | Qualification |
 |---|---|
@@ -38,11 +38,11 @@ requires `journalctl`; iptables and ipset backends require their host tools.
 
 If the installer is unsuitable, download only the needed executable and support
 files from the same release, then verify each against `SHA256SUMS` before use. For
-v0.4.6 on x86_64:
+v0.4.7 on x86_64:
 
 ```bash
 set -euo pipefail
-VERSION=v0.4.6
+VERSION=v0.4.7
 ARCH=x86_64-linux-musl
 BASE="https://github.com/ul0gic/fail2zig/releases/download/${VERSION}"
 for file in \
@@ -92,30 +92,61 @@ and the [runtime architecture](../architecture.md) for the full boundary.
 
 Stop the daemon and all other state writers before installation. Preserve the
 executable, configuration and a coherent backup of the native database with its
-WAL/SHM siblings. For upgrades within v0.4.x from before v0.4.3, an older binary
-cannot read newer checkpoint and marker data. Rollback within the supported line
-requires the matching backup and binary, not an executable swap.
+WAL/SHM siblings. An older binary cannot read newer checkpoint and marker data.
+Rollback requires the matching backup and binary, not an executable swap.
 
-The first start of a version with schema 24 upgrades v0.4.x (schema 23) state in
-place:
+The first start of this release upgrades a state last written by v0.4.6 (schema 24)
+to schema 25 in place. Schema 25 adds the storage for runtime ignore entries and
+continuity-loss events. States last written by releases before v0.4.6 are not a
+supported upgrade path; start from a fresh state.
 
-- Before its first change it writes a coherent copy to
-  `<state_file>.pre24-backup`. It needs free space of twice the database size plus
-  32 MiB, and refuses to start if that backup file already exists. Move an old
-  backup aside only when it is not the sole copy of earlier state.
+- Before its first change it writes a coherent copy of the database to a backup. It
+  needs free space of twice the database size plus 32 MiB, and refuses to start if
+  that backup file already exists. Move an old backup aside only when it is not the
+  sole copy of earlier state.
+- The backup is `<state_file>.pre25-backup`.
 - The upgrade commits in small resumable steps. An interrupted upgrade resumes on
-  the next start; older binaries refuse the partly or fully upgraded database.
-  While it runs, the daemon extends its systemd start deadline only as steps
-  commit. The log reports completion, the backup path and how many unsettled
-  outcomes of already-replaced ban decisions were closed as `superseded`.
-- To roll back, stop the daemon, restore the backup over the state file, remove
-  the upgraded database's `-wal`/`-shm` files and reinstall the previous binary.
+  the next start. While it runs, the daemon extends its systemd start deadline only
+  as steps commit. The log reports completion, the backup path and how many
+  unsettled outcomes of already-replaced ban decisions were closed as `superseded`.
+- The first start also rekeys, once, saved detection generations that hashed the
+  ignore list. No ban, deadline, checkpoint or retry subject changes, and the log
+  reports how many jails and rows were rekeyed.
 
-A file source truncated in place below its saved position is refused at startup
-instead of being re-read silently. Stop the daemon and acknowledge it with
-`fail2zig repair-source` (see `fail2zig(1)`); data removed by the truncation
-before it was read is lost, and the stop withdraws firewall rules until the next
-start reinstalls them.
+v0.4.6 and older binaries refuse a schema 25 database with their schema-version
+message, so an older binary cannot be started on upgraded state without
+restoring the backup.
+
+To roll back, stop the daemon, restore the backup the upgrade wrote over the state
+file, remove the upgraded database's `-wal`/`-shm` files and reinstall the binary
+that last wrote that state: v0.4.6 for `.pre25-backup`. If you copied the backup
+into place instead of moving it, move the backup file aside before the next
+upgrade, because an existing backup file refuses the start.
+
+A file source that cannot resume does not stop the daemon. This covers a file
+truncated in place below its saved position, a rotated-out file removed while it
+still held unread bytes, and a log replaced by a different file whose previous file is
+gone. The daemon pauses that source, restores bans for every
+jail, enforces every other enabled jail, sends `READY=1` and keeps running, so
+`systemctl is-active fail2zig` reports `active` and protection reports degraded
+with cause `SourcePaused`. `fail2zig status` and the startup journal line name the
+source and print the exact `fail2zig repair-source` command. Configuration,
+storage, firewall and schema refusals still stop the start. A rotated-out file that
+was read to its end before it was removed does not pause anything.
+
+The jail's `on_truncation` key chooses what happens next (see `fail2zig.toml(5)`):
+
+- `"refuse"`, the default, keeps the source paused. Stop the daemon, run the printed
+  `repair-source` command (see `fail2zig(1)`) and start the daemon. The stop
+  withdraws firewall rules until the next start reinstalls them.
+- `"restart"` resumes the source without pausing and records a durable
+  continuity-loss event, shown by `fail2zig status`. A replaced log resumes at offset
+  0 of the new file. While the log is absent the source reports `missing` and waits,
+  then resumes when the file appears.
+
+Under either setting, records written after the saved position and removed before
+they were read, or left in a replaced file that is gone, were never read and cannot be
+recovered.
 
 If storage is unhealthy when the daemon stops, it leaves installed firewall rules
 in place and logs how many remain; the next start reconciles them. A healthy stop

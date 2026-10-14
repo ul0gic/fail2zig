@@ -28,7 +28,7 @@ const bash_script =
     \\    local cur prev words cword
     \\    _init_completion || return
     \\
-    \\    local subcommands="status stats ban unban list jails reload version config history firewall jail repair-source completions help"
+    \\    local subcommands="status stats ban unban list jails reload version config history firewall jail ignore repair-source completions help"
     \\    local global_flags="--socket --output --no-color --timeout --help --version"
     \\
     \\    # Flag-value completion for the previous word.
@@ -86,6 +86,28 @@ const bash_script =
     \\            COMPREPLY=( $(compgen -W "--jail --scope $global_flags" -- "$cur") ) ;;
     \\        jail)
     \\            COMPREPLY=( $(compgen -W "enable disable pause resume" -- "$cur") ) ;;
+    \\        ignore)
+    \\            local sub=""
+    \\            local j=$((i + 1))
+    \\            while [ $j -lt $cword ]; do
+    \\                case "${words[j]}" in
+    \\                    --socket|--output|--timeout|--jail)
+    \\                        j=$((j + 2)) ;;
+    \\                    -*)
+    \\                        j=$((j + 1)) ;;
+    \\                    *)
+    \\                        sub="${words[j]}"
+    \\                        break ;;
+    \\                esac
+    \\            done
+    \\            case "$sub" in
+    \\                add)
+    \\                    COMPREPLY=( $(compgen -W "--jail --unban $global_flags" -- "$cur") ) ;;
+    \\                remove|list)
+    \\                    COMPREPLY=( $(compgen -W "--jail $global_flags" -- "$cur") ) ;;
+    \\                *)
+    \\                    COMPREPLY=( $(compgen -W "add remove list $global_flags" -- "$cur") ) ;;
+    \\            esac ;;
     \\        list)
     \\            COMPREPLY=( $(compgen -W "--jail --details --sort $global_flags" -- "$cur") ) ;;
     \\        completions)
@@ -123,7 +145,8 @@ const zsh_script =
     \\        'history:Page through confirmed ban history (or: history reset)'
     \\        'firewall:Inspect sampled fail2zig-owned kernel protection'
     \\        'jail:Enable, disable, pause or resume a jail'
-    \\        'repair-source:Acknowledge a truncated file source (daemon stopped)'
+    \\        'ignore:Manage per-jail exclusions (add, remove, list)'
+    \\        'repair-source:Acknowledge a truncated or replaced file source (daemon stopped)'
     \\        'completions:Generate shell completion script'
     \\        'help:Show help for a command'
     \\    )
@@ -166,6 +189,28 @@ const zsh_script =
     \\                    _arguments \
     \\                        '1:action:(enable disable pause resume)' \
     \\                        '2:jail name:' ;;
+    \\                ignore)
+    \\                    case $words[2] in
+    \\                        add)
+    \\                            _arguments \
+    \\                                '--jail[Target jail (required)]:jail name:' \
+    \\                                '--unban[Also lift the jail bans inside the entry]' \
+    \\                                $global_flags \
+    \\                                '2:address or cidr:' ;;
+    \\                        remove)
+    \\                            _arguments \
+    \\                                '--jail[Target jail (required)]:jail name:' \
+    \\                                $global_flags \
+    \\                                '2:address or cidr:' ;;
+    \\                        list)
+    \\                            _arguments \
+    \\                                '--jail[Show one jail]:jail name:' \
+    \\                                $global_flags ;;
+    \\                        *)
+    \\                            _arguments \
+    \\                                '1:action:(add remove list)' \
+    \\                                $global_flags ;;
+    \\                    esac ;;
     \\                list)
     \\                    _arguments \
     \\                        '--jail[Filter by jail]:jail name:' \
@@ -266,7 +311,8 @@ const fish_script =
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'history'      -d 'Page through confirmed ban history'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'firewall'     -d 'Inspect sampled fail2zig-owned kernel protection'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'jail'         -d 'Enable, disable, pause or resume a jail'
-    \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'repair-source' -d 'Acknowledge a truncated file source (daemon stopped)'
+    \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'ignore'       -d 'Manage per-jail exclusions (add, remove, list)'
+    \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'repair-source' -d 'Acknowledge a truncated or replaced file source (daemon stopped)'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'completions'  -d 'Generate completion script'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'help'         -d 'Show help'
     \\
@@ -288,8 +334,12 @@ const fish_script =
     \\complete -c fail2zig -f -n '__fail2zig_client_using_command history' -a 'reset' -d 'Reset an address ban history'
     \\complete -c fail2zig -n '__fail2zig_client_using_command history' -l all -d 'Reset history for all jails'
     \\complete -c fail2zig -n '__fail2zig_client_using_command list'  -l jail     -x -d 'Filter by jail'
-    \\complete -c fail2zig -n '__fail2zig_client_using_command list'  -l details -d 'Include ban counts in table output'
-    \\complete -c fail2zig -n '__fail2zig_client_using_command list'  -l sort -d 'Sort by numeric IP address, then jail name'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command list; and not __fail2zig_client_using_command ignore'  -l details -d 'Include ban counts in table output'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command list; and not __fail2zig_client_using_command ignore'  -l sort -d 'Sort by numeric IP address, then jail name'
+    \\complete -c fail2zig -f -n '__fail2zig_client_using_command ignore'
+    \\complete -c fail2zig -f -n '__fail2zig_client_using_command ignore; and not __fish_seen_subcommand_from add remove list' -a 'add remove list' -d 'Ignore subcommand'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command ignore; and __fish_seen_subcommand_from add remove list' -l jail -x -d 'Target jail'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command ignore; and __fish_seen_subcommand_from add' -l unban -d 'Also lift the jail bans inside the entry'
     \\complete -c fail2zig -n '__fail2zig_client_using_command status' -l details -d 'Include table detail'
     \\complete -c fail2zig -n '__fail2zig_client_using_command stats' -l details -d 'Include additional counters'
     \\complete -c fail2zig -n '__fail2zig_client_using_command jails'  -l details -d 'Include table detail'

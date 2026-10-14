@@ -78,11 +78,11 @@ pub const Processor = struct {
     retry_enforcement_suppressed: bool = false,
     paused: bool = false,
 
-    pub fn bindRetry(self: *Processor, value: retry.Policy, suppress_enforcement: bool) !void {
+    pub fn bindRetry(self: *Processor, value: retry.Policy, suppress_enforcement: bool, form: retry.HashForm) !void {
         if (self.in_flight or self.retry_policy != null) return error.ProcessorBusy;
         if (self.detector == null and self.journal_detector == null and self.staged_detector == null) return error.RetryDetectorRequired;
         if (value.window_us != self.options.window_us) return error.InvalidRetryPolicy;
-        const encoded = try value.encode();
+        const encoded = try value.hashBytes(form);
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update(if (value.escalation.enabled) "fail2zig-source-retry-v2\x00" else "fail2zig-source-retry-v1\x00");
         hash.update(&self.generation);

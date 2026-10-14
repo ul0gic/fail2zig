@@ -10,19 +10,31 @@ pub const Detector = struct {
     base: *const builtin.Detector,
     profile: origin.Profile,
     generation: [32]u8,
+    legacy_generation: [32]u8,
 
     pub fn init(base: *const builtin.Detector, profile: origin.Profile) !Detector {
         if (!std.mem.eql(u8, base.entry.name, "sshd") or base.body != .whole) return error.UnsupportedJournalDetector;
+        return .{
+            .base = base,
+            .profile = profile,
+            .generation = qualify(base.generation, profile),
+            .legacy_generation = qualify(base.legacy_generation, profile),
+        };
+    }
+    fn qualify(base_generation: [32]u8, profile: origin.Profile) [32]u8 {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("fail2zig-native-journal-detection-v1\x00");
-        hash.update(&base.generation);
+        hash.update(&base_generation);
         hash.update(&profile.generation);
         var generation: [32]u8 = undefined;
         hash.final(&generation);
-        return .{ .base = base, .profile = profile, .generation = generation };
+        return generation;
     }
     pub fn consumer(self: *const Detector) stored.JournalConsumer {
         return .{ .generation = self.generation, .context = self, .evaluate = consume };
+    }
+    pub fn legacyConsumer(self: *const Detector) stored.JournalConsumer {
+        return .{ .generation = self.legacy_generation, .context = self, .evaluate = consume };
     }
     fn consume(decoded: []const u8, fields: ?[]const records.JournalField, admitted: time.Result, context: ?*const anyopaque) !stored.Outcome {
         const self: *const Detector = @ptrCast(@alignCast(context.?));

@@ -13,7 +13,7 @@ pub const default_limit: u32 = 64;
 pub const max_jail_bytes: usize = 64;
 pub const max_cursor_bytes: usize = 128;
 
-pub const Kind = enum { status, config, health, scopes, history, firewall, stats };
+pub const Kind = enum { status, config, health, scopes, history, firewall, stats, ignore, continuity };
 pub const PeerClass = enum { admin, monitor };
 
 pub const Request = struct {
@@ -240,6 +240,18 @@ pub const Stats = struct {
     retirement_refused: ?u64 = null,
 };
 
+pub const JsonStream = std.json.WriteStream(BoundedSink.Writer, .{ .checked_to_fixed_depth = 256 });
+
+pub const IgnoreView = struct {
+    ctx: ?*anyopaque,
+    render: *const fn (ctx: ?*anyopaque, arena: std.mem.Allocator, jail: ?[]const u8, redact: bool, out: *JsonStream) anyerror!void,
+};
+
+pub const ContinuityView = struct {
+    ctx: ?*anyopaque,
+    render: *const fn (ctx: ?*anyopaque, arena: std.mem.Allocator, cursor: ?u64, limit: u16, redact: bool, out: *JsonStream) anyerror!void,
+};
+
 pub const Sources = struct {
     stats: ?Stats = null,
     status: ?Callback = null,
@@ -248,6 +260,8 @@ pub const Sources = struct {
     scopes: ?ScopesView = null,
     history: ?HistorySource = null,
     firewall: ?FirewallSource = null,
+    ignore: ?IgnoreView = null,
+    continuity: ?ContinuityView = null,
 };
 
 pub const Error = error{OutOfMemory};
@@ -266,6 +280,8 @@ pub fn handle(allocator: std.mem.Allocator, body: []const u8, peer_class: PeerCl
     if (version != .integer or version.integer != schema_version) return fail(400, "unsupported schema_version");
     const kind_text = parsed.kind orelse return fail(400, "kind is required");
     const kind = std.meta.stringToEnum(Kind, kind_text) orelse return fail(400, "unknown query kind");
+    if (kind == .ignore and sources.ignore == null) return fail(400, "unknown query kind");
+    if (kind == .continuity and sources.continuity == null) return fail(400, "unknown query kind");
     if (parsed.jail) |jail| {
         if (jail.len == 0 or jail.len > max_jail_bytes) return fail(400, "jail must be 1..64 bytes");
     }
@@ -276,6 +292,15 @@ pub fn handle(allocator: std.mem.Allocator, body: []const u8, peer_class: PeerCl
     }
     if (parsed.cursor) |cursor| {
         if (cursor.len == 0 or cursor.len > max_cursor_bytes) return fail(400, "cursor is malformed");
+    }
+    if (kind == .ignore and (parsed.limit != null or parsed.cursor != null)) return fail(400, "ignore query does not accept limit or cursor");
+    var continuity_cursor: ?u64 = null;
+    if (kind == .continuity) {
+        if (parsed.jail != null) return fail(400, "continuity query does not accept a jail filter");
+        if (parsed.cursor) |cursor| {
+            for (cursor) |byte| if (!std.ascii.isDigit(byte)) return fail(400, "cursor is malformed");
+            continuity_cursor = std.fmt.parseInt(u64, cursor, 10) catch return fail(400, "cursor is malformed");
+        }
     }
     if (kind == .stats and (parsed.jail != null or parsed.limit != null or parsed.cursor != null)) return fail(400, "stats query does not accept jail, limit or cursor");
     if (kind == .firewall and parsed.jail != null) return fail(400, "firewall query does not accept a jail filter");
@@ -294,6 +319,8 @@ pub fn handle(allocator: std.mem.Allocator, body: []const u8, peer_class: PeerCl
         .scopes => renderScopes(writer, sources.scopes, parsed.jail, parsed.cursor, limit, &generation_hex),
         .history => renderHistory(arena, writer, sources.history, parsed.jail, parsed.cursor, @intCast(limit), &generation_hex),
         .firewall => renderFirewall(allocator, writer, sources.firewall, parsed.cursor, @intCast(limit), &generation_hex),
+        .ignore => renderIgnore(arena, writer, sources.ignore, parsed.jail, peer_class, &generation_hex),
+        .continuity => renderContinuity(arena, writer, sources.continuity, continuity_cursor, @intCast(limit), peer_class, &generation_hex),
     };
     outcome catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -427,6 +454,40 @@ fn renderHealth(arena: std.mem.Allocator, writer: anytype, callback: ?Callback, 
     var value = try runCallback(arena, source);
     try stampEnvelope(arena, &value.object, generation_hex);
     std.json.stringify(value, .{}, writer) catch |err| return mapWrite(err);
+}
+
+fn renderIgnore(arena: std.mem.Allocator, writer: anytype, view: ?IgnoreView, jail_filter: ?[]const u8, peer_class: PeerClass, generation_hex: []const u8) RenderError!void {
+    const source = view orelse return error.SourceUnavailable;
+    const redact = peer_class == .monitor;
+    var out = std.json.writeStream(writer, .{});
+    openKindObject(&out, "ignore", redact, generation_hex) catch |err| return mapWrite(err);
+    source.render(source.ctx, arena, jail_filter, redact, &out) catch |err| return mapViewFailure(err);
+    out.endObject() catch |err| return mapWrite(err);
+}
+
+fn renderContinuity(arena: std.mem.Allocator, writer: anytype, view: ?ContinuityView, cursor: ?u64, limit: u16, peer_class: PeerClass, generation_hex: []const u8) RenderError!void {
+    const source = view orelse return error.SourceUnavailable;
+    const redact = peer_class == .monitor;
+    var out = std.json.writeStream(writer, .{});
+    openKindObject(&out, "continuity", redact, generation_hex) catch |err| return mapWrite(err);
+    source.render(source.ctx, arena, cursor, limit, redact, &out) catch |err| return mapViewFailure(err);
+    out.endObject() catch |err| return mapWrite(err);
+}
+
+fn openKindObject(out: anytype, kind: []const u8, redact: bool, generation_hex: []const u8) !void {
+    try out.beginObject();
+    try envelope(out, generation_hex);
+    try field(out, "kind", kind);
+    try field(out, "redacted", redact);
+}
+
+fn mapViewFailure(err: anyerror) RenderError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.ResponseTooLarge => error.ResponseTooLarge,
+        error.UnknownJail => error.UnknownJail,
+        else => error.SourceFailed,
+    };
 }
 
 fn stampEnvelope(arena: std.mem.Allocator, object: *std.json.ObjectMap, generation_hex: []const u8) RenderError!void {

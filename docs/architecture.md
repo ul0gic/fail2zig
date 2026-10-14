@@ -1,6 +1,6 @@
 # Runtime architecture
 
-fail2zig 0.4.6 is one native executable containing the daemon, administration commands, rule
+fail2zig 0.4.7 is one native executable containing the daemon, administration commands, rule
 testing and migration tools. Zig application code statically embeds pinned upstream SQLite C.
 Runtime installation does not require Python, a SQLite service, the SQLite CLI or a shared SQLite
 library.
@@ -44,8 +44,9 @@ commit together, and encoding warnings are rate-limited without printing raw pay
 This behavior is not present in releases through v0.4.2.
 
 The repair reads legacy processor checkpoints; older binaries cannot restore its
-extended checkpoints. Later state uses SQLite schema 24, upgraded from schema 23 in
-resumable steps after a coherent pre-upgrade backup. Reverting the binary alone is not a
+extended checkpoints. Later state uses SQLite schema 25, upgraded from a state last written
+by v0.4.6 (schema 24) in resumable steps after a coherent `.pre25-backup`; states last
+written by earlier releases are not an upgrade path. Reverting the binary alone is not a
 supported rollback; restore the matching backup with the previous binary.
 
 A file truncated in place below its saved position is refused rather than re-read. The
@@ -93,6 +94,13 @@ is re-read on a 5 s cadence or as soon as a ban deadline passes. That cadence is
 detection guarantee: external removal of a rule is noticed at the next complete
 readback, which pass work, retries and storage pauses can delay, and status reports
 the age of the last readback so the actual latency is visible.
+
+Idle cost was measured on `f2z-target` (Debian 13, one vCPU, 4 GiB, kernel
+6.12.111+deb13-amd64, nftables backend) with 2,000 installed bans. Over a 5 minute window
+of 301 one-second intervals the daemon used a mean of 2.61 % CPU, a median of 2.0 % and a
+maximum of 6.0 %, and its journal child processes a further 1.36 % mean. A clean
+`systemctl stop` at that size took 1 s and withdrew the rules in 32 batched turns. These
+are the figures measured on that host, not a guarantee for other hosts.
 
 A new ban is dispatched from the inventory (no separate pre-read on nftables; the tool
 transports keep theirs because their mutations are several invocations), marked in
@@ -199,6 +207,22 @@ The default configuration admits at most 64 enabled jails, eight file incarnatio
 4,096 live retry subjects across enabled jails. Native reservation checks cover configured memory
 and descriptor budgets. SQLite uses a separate bounded heap and page limit; required history and
 recovery anchors remain pinned.
+
+Startup sets `max_page_count` to 256 MiB divided by the page size, so the state file
+cannot grow past 256 MiB (65,536 pages of 4 KiB), and a state file already past that
+size is refused with `StorageLimit`. A commit that fails because the file is full
+(SQLite "database or disk is full", `StorageFull`) is a retryable storage failure.
+Ingestion pauses and the daemon retries after a delay that starts at 1 s and doubles
+with each recovery attempt up to 30 s. A recovery attempt moves through storage, state,
+ownership and sources, and storage returns to healthy when the last step completes; a
+commit that is still refused pauses it again. Rules already in the kernel stay in place
+while storage is paused, and `fail2zig status` shows the storage phase. The daemon runs
+no VACUUM and does not enable `auto_vacuum`, so the file does not shrink. Committed receipts are guarded in sequence order and deleted once nothing holds
+them; a receipt held by a live ban, an open retry window or an unsettled action is set aside
+and does not block the receipts behind it, and a bounded pass deletes it once released. Rows
+removed by that cleanup and by the retention described above free pages for reuse inside the file, with
+`history_retention` (seconds, default 86400) as the retention setting, and an operator
+should watch the state file size.
 
 The CLI inspection path uses an optional observation cache owned by the
 coordinator and borrowed by the effect manager. Existing complete readbacks publish

@@ -70,7 +70,7 @@ pub fn run(
         },
 
         .status => |options| {
-            if (options.details) return doRequest(allocator, parsed.globals, .{ .status = {} }, stdout, stderr, color, formatStatusDetailsCmd);
+            if (options.details) return doStatusDetails(allocator, parsed.globals, stdout, stderr, color);
             return doRequest(allocator, parsed.globals, .{ .status = {} }, stdout, stderr, color, formatStatusCmd);
         },
         .stats => |options| {
@@ -113,6 +113,7 @@ pub fn run(
             _ = parseIp(h.address, stderr) catch return .client_error;
             return doAdmin(allocator, parsed.globals, stdout, stderr, .{ .kind = "history_reset", .jail = h.jail, .address = h.address, .all = h.all });
         },
+        .ignore => |g| return doIgnore(allocator, parsed.globals, stdout, stderr, color, g),
         .remote_version => return doRequest(allocator, parsed.globals, .{ .version = {} }, stdout, stderr, color, formatVersionCmd),
         .ban => |b| {
             _ = parseIp(b.ip, stderr) catch return .client_error;
@@ -179,6 +180,91 @@ fn doQuery(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype,
     return doRequestWithHint(allocator, globals, .{ .query_v1 = body }, stdout, stderr, color, formatter, if (std.mem.eql(u8, kind, "stats")) "daemon does not support stats; upgrade and restart the fail2zig daemon" else null);
 }
 
+const max_continuity_pages: usize = 512;
+const continuity_page_limit: u32 = 256;
+const continuity_unsupported = "daemon does not support continuity events; upgrade and restart the fail2zig daemon";
+
+const ContinuityPage = struct {
+    items: []const format.LossEvent = &.{},
+    next_cursor: ?[]const u8 = null,
+};
+
+const ContinuityResult = struct { report: format.LossReport, exit: ExitCode };
+
+fn continuityUnavailable(arena: std.mem.Allocator, exit: ExitCode, message: []const u8) ContinuityResult {
+    return .{ .report = .{ .unavailable = arena.dupe(u8, message) catch "out of memory" }, .exit = exit };
+}
+
+fn doStatusDetails(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype, color: format.Color) ExitCode {
+    var diag: socket.DiagBuf = .{};
+    var client = socket.connect(allocator, globals.socket_path, globals.timeout_ms, &diag) catch {
+        stderr.print("error: {s}\n", .{diag.message()}) catch {};
+        return .connection_failed;
+    };
+    const resp = client.sendCommand(.{ .status = {} }) catch {
+        stderr.print("error: {s}\n", .{client.errorMessage()}) catch {};
+        client.close();
+        return .connection_failed;
+    };
+    client.close();
+    defer resp.deinit(allocator);
+    const payload = switch (resp) {
+        .ok => |ok| ok.payload,
+        .err => |e| {
+            format.formatError(stderr, e.code, e.message, globals.output, color) catch {};
+            return .daemon_error;
+        },
+    };
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const result = pageContinuity(allocator, arena.allocator(), globals);
+    format.formatStatusWithLoss(allocator, stdout, payload, globals.output, color, result.report) catch |e| {
+        if (e == error.BrokenPipe) return .success;
+        stderr.print("error: failed to format response: {s}\n", .{@errorName(e)}) catch {};
+        return .client_error;
+    };
+    return result.exit;
+}
+
+fn pageContinuity(allocator: std.mem.Allocator, arena: std.mem.Allocator, globals: args.Globals) ContinuityResult {
+    var events: std.ArrayListUnmanaged(format.LossEvent) = .empty;
+    var cursor: ?[]const u8 = null;
+    var pages: usize = 0;
+    while (pages < max_continuity_pages) : (pages += 1) {
+        var body_bytes: [shared.protocol.max_request_body]u8 = undefined;
+        var stream = std.io.fixedBufferStream(&body_bytes);
+        std.json.stringify(.{ .schema_version = @as(u32, 1), .kind = "continuity", .limit = continuity_page_limit, .cursor = cursor }, .{ .emit_null_optional_fields = false }, stream.writer()) catch
+            return continuityUnavailable(arena, .client_error, "could not encode the continuity request");
+        const body = shared.Command.Body.init(stream.getWritten()) catch
+            return continuityUnavailable(arena, .client_error, "could not encode the continuity request");
+
+        var diag: socket.DiagBuf = .{};
+        var client = socket.connect(allocator, globals.socket_path, globals.timeout_ms, &diag) catch
+            return continuityUnavailable(arena, .connection_failed, diag.message());
+        const resp = client.sendCommand(.{ .query_v1 = body }) catch {
+            const failed = continuityUnavailable(arena, .connection_failed, client.errorMessage());
+            client.close();
+            return failed;
+        };
+        client.close();
+        defer resp.deinit(allocator);
+
+        const payload = switch (resp) {
+            .ok => |ok| ok.payload,
+            .err => |e| {
+                const unsupported = e.code == 400 and std.mem.eql(u8, e.message, "unknown query kind");
+                return continuityUnavailable(arena, .daemon_error, if (unsupported) continuity_unsupported else e.message);
+            },
+        };
+        const page = std.json.parseFromSliceLeaky(ContinuityPage, arena, payload, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch
+            return continuityUnavailable(arena, .daemon_error, "malformed continuity response from daemon");
+        events.appendSlice(arena, page.items) catch return continuityUnavailable(arena, .client_error, "out of memory");
+        cursor = page.next_cursor orelse return .{ .report = .{ .events = events.items }, .exit = .success };
+    }
+    return continuityUnavailable(arena, .daemon_error, "continuity events exceed 512 pages");
+}
+
 fn doFirewallQuery(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype, color: format.Color, query: args.Command.FirewallArgs) ExitCode {
     var body_bytes: [shared.protocol.max_request_body]u8 = undefined;
     var stream = std.io.fixedBufferStream(&body_bytes);
@@ -215,6 +301,7 @@ pub const AdminSpec = struct {
     prefix: ?u8 = null,
     duration_s: ?u64 = null,
     all: bool = false,
+    unban: bool = false,
     run_id: ?[]const u8 = null,
 };
 
@@ -251,7 +338,7 @@ pub fn doAdmin(allocator: std.mem.Allocator, globals: args.Globals, stdout: anyt
     };
     var body_bytes: [shared.protocol.max_request_body]u8 = undefined;
     var stream = std.io.fixedBufferStream(&body_bytes);
-    std.json.stringify(.{ .schema_version = @as(u32, 1), .kind = spec.kind, .jail = spec.jail, .address = spec.address, .prefix = spec.prefix, .duration_s = spec.duration_s, .all = spec.all, .run_id = spec.run_id, .expected_generation = head.value.generation, .expected_mutation_revision = head.value.mutation_revision }, .{ .emit_null_optional_fields = false }, stream.writer()) catch return .client_error;
+    std.json.stringify(.{ .schema_version = @as(u32, 1), .kind = spec.kind, .jail = spec.jail, .address = spec.address, .prefix = spec.prefix, .duration_s = spec.duration_s, .all = spec.all, .unban = @as(?bool, if (spec.unban) true else null), .run_id = spec.run_id, .expected_generation = head.value.generation, .expected_mutation_revision = head.value.mutation_revision }, .{ .emit_null_optional_fields = false }, stream.writer()) catch return .client_error;
     const body = shared.Command.Body.init(stream.getWritten()) catch return .client_error;
     var request_id: [shared.protocol.request_id_bytes]u8 = undefined;
     std.crypto.random.bytes(&request_id);
@@ -260,6 +347,7 @@ pub fn doAdmin(allocator: std.mem.Allocator, globals: args.Globals, stdout: anyt
         return .connection_failed;
     };
     defer resp.deinit(allocator);
+    if (std.mem.startsWith(u8, spec.kind, "ignore_")) return finishIgnoreAdmin(allocator, globals, stdout, stderr, resp);
     const payload: []const u8 = switch (resp) {
         .ok => |o| o.payload,
         .err => |e| e.message,
@@ -267,6 +355,10 @@ pub fn doAdmin(allocator: std.mem.Allocator, globals: args.Globals, stdout: anyt
     writeAdminOutcome(allocator, stdout, payload, globals.output) catch |e| {
         if (e != error.BrokenPipe) stderr.print("error: failed to format response: {s}\n", .{@errorName(e)}) catch {};
     };
+    return adminExit(resp);
+}
+
+fn adminExit(resp: shared.Response) ExitCode {
     return switch (resp) {
         .ok => .success,
         .err => |e| switch (shared.Response.exitClassForCode(e.code)) {
@@ -275,6 +367,85 @@ pub fn doAdmin(allocator: std.mem.Allocator, globals: args.Globals, stdout: anyt
             else => .daemon_error,
         },
     };
+}
+
+const ignore_unsupported = "daemon does not support ignore commands; upgrade and restart the fail2zig daemon";
+
+fn finishIgnoreAdmin(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype, resp: shared.Response) ExitCode {
+    const payload: []const u8 = switch (resp) {
+        .ok => |o| o.payload,
+        .err => |e| if (std.mem.startsWith(u8, e.message, "{")) e.message else {
+            const message = if (e.code == 400 and std.mem.eql(u8, e.message, "unknown admin kind")) ignore_unsupported else e.message;
+            format.formatError(stderr, e.code, message, globals.output, .{ .enabled = false }) catch {};
+            return adminExit(resp);
+        },
+    };
+    format.formatIgnoreOutcome(allocator, stdout, payload, globals.output) catch |e| {
+        if (e != error.BrokenPipe) stderr.print("error: failed to format response: {s}\n", .{@errorName(e)}) catch {};
+    };
+    return adminExit(resp);
+}
+
+fn doIgnore(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype, color: format.Color, ignore: args.Command.IgnoreArgs) ExitCode {
+    if (ignore.jail) |name| _ = parseJailIdRequired(name, stderr) catch return .client_error;
+    if (ignore.action == .list) return doIgnoreList(allocator, globals, stdout, stderr, color, ignore.jail);
+    const jail = ignore.jail orelse {
+        stderr.writeAll("error: ignore requires --jail <name>\n") catch {};
+        return .client_error;
+    };
+    const address = ignore.address orelse {
+        stderr.writeAll("error: ignore requires an address\n") catch {};
+        return .client_error;
+    };
+    const entry = shared.types.IgnoreEntry.parse(address) catch {
+        stderr.writeAll("error: invalid address for ignore\n") catch {};
+        return .client_error;
+    };
+    var canonical_buffer: [shared.types.IgnoreEntry.max_text_bytes]u8 = undefined;
+    const canonical = entry.canonical(&canonical_buffer);
+    const slash = std.mem.indexOfScalar(u8, canonical, '/');
+    return doAdmin(allocator, globals, stdout, stderr, .{
+        .kind = if (ignore.action == .add) "ignore_add" else "ignore_remove",
+        .jail = jail,
+        .address = canonical[0 .. slash orelse canonical.len],
+        .prefix = if (slash != null) entry.prefix else null,
+        .unban = ignore.unban,
+    });
+}
+
+fn doIgnoreList(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype, color: format.Color, jail: ?[]const u8) ExitCode {
+    var body_bytes: [shared.protocol.max_request_body]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&body_bytes);
+    std.json.stringify(.{ .schema_version = @as(u32, 1), .kind = "ignore", .jail = jail }, .{ .emit_null_optional_fields = false }, stream.writer()) catch return .client_error;
+    const body = shared.Command.Body.init(stream.getWritten()) catch return .client_error;
+    var diag: socket.DiagBuf = .{};
+    var client = socket.connect(allocator, globals.socket_path, globals.timeout_ms, &diag) catch {
+        stderr.print("error: {s}\n", .{diag.message()}) catch {};
+        return .connection_failed;
+    };
+    defer client.close();
+    const resp = client.sendCommand(.{ .query_v1 = body }) catch {
+        stderr.print("error: {s}\n", .{client.errorMessage()}) catch {};
+        return .connection_failed;
+    };
+    defer resp.deinit(allocator);
+    switch (resp) {
+        .ok => |o| format.formatIgnoreList(allocator, stdout, o.payload, globals.output, color, jail) catch |e| {
+            if (e == error.BrokenPipe) return .success;
+            stderr.print("error: failed to format response: {s}\n", .{@errorName(e)}) catch {};
+            return .client_error;
+        },
+        .err => |e| {
+            if (e.code == 404 and std.mem.eql(u8, e.message, "unknown jail")) if (jail) |name| {
+                format.formatUnknownJail(stderr, name, globals.output, color) catch {};
+                return .daemon_error;
+            };
+            const message = if (e.code == 400 and std.mem.eql(u8, e.message, "unknown query kind")) ignore_unsupported else e.message;
+            format.formatError(stderr, e.code, message, globals.output, color) catch {};
+            return .daemon_error;
+        },
+    }
+    return .success;
 }
 
 const AdminOutcome = struct { schema_version: u32 = 0, kind: []const u8 = "", outcome: []const u8 = "", generation: []const u8 = "", mutation_revision: u64 = 0, enforced: bool = false, reasons: []const []const u8 = &.{} };
@@ -420,10 +591,6 @@ fn formatStatusCmd(
     color: format.Color,
 ) !void {
     return format.formatStatus(allocator, writer, payload, fmt, color);
-}
-
-fn formatStatusDetailsCmd(allocator: std.mem.Allocator, writer: anytype, payload: []const u8, fmt: format.OutputFormat, color: format.Color) !void {
-    return format.formatStatusDetailed(allocator, writer, payload, fmt, color);
 }
 
 fn formatListCmd(

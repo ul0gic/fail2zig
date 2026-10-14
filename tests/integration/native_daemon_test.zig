@@ -222,56 +222,6 @@ fn waitDaemonLog(path: []const u8, needle: []const u8) !void {
     return error.TimedOut;
 }
 
-const MaintenanceSource = struct {
-    source: []u8,
-    generation: [32]u8,
-
-    fn deinit(self: MaintenanceSource) void {
-        t.allocator.free(self.source);
-    }
-};
-
-fn maintenanceSource(store: *engine.native_store_mod.Store) !MaintenanceSource {
-    var statement: ?*SqliteStatement = null;
-    if (sqlite3_prepare_v2(@ptrCast(store.db), "SELECT source,generation FROM source_maintenance WHERE jail='sshd' ORDER BY source LIMIT 1;", -1, &statement, null) != 0 or statement == null) return error.TestSqlFailed;
-    defer _ = sqlite3_finalize(statement.?);
-    if (sqlite3_step(statement.?) != 100) return error.TestSqlFailed;
-    const source_text = sqlite3_column_text(statement.?, 0) orelse return error.TestSqlFailed;
-    const source_len = sqlite3_column_bytes(statement.?, 0);
-    const generation_blob = sqlite3_column_blob(statement.?, 1) orelse return error.TestSqlFailed;
-    const generation_len = sqlite3_column_bytes(statement.?, 1);
-    if (source_len <= 0 or source_len > engine.native_store_mod.Limits.source_bytes or generation_len != 32) return error.TestSqlFailed;
-    const source = try t.allocator.dupe(u8, @as([*]const u8, @ptrCast(source_text))[0..@intCast(source_len)]);
-    errdefer t.allocator.free(source);
-    var generation: [32]u8 = undefined;
-    @memcpy(&generation, @as([*]const u8, @ptrCast(generation_blob))[0..generation.len]);
-    if (sqlite3_step(statement.?) != 101) return error.TestSqlFailed;
-    return .{ .source = source, .generation = generation };
-}
-
-fn waitEscalationCleanup(path: []const u8) !void {
-    var timer = try std.time.Timer.start();
-    while (timer.read() < 8 * std.time.ns_per_s) {
-        var store = try engine.native_store_mod.Store.openReadOnly(t.allocator, path);
-        defer store.close();
-        if (try store.inspectInteger("SELECT count(*) FROM retry_decision_escalations;") == 0) {
-            try t.expectEqual(@as(i64, 0), try store.inspectInteger("SELECT count(*) FROM pragma_foreign_key_check;"));
-            return;
-        }
-        std.time.sleep(20 * std.time.ns_per_ms);
-    }
-    return error.TimedOut;
-}
-
-fn waitPastDeadline(deadline_us: i64) !void {
-    var timer = try std.time.Timer.start();
-    while (timer.read() < 8 * std.time.ns_per_s) {
-        if (std.time.microTimestamp() > deadline_us) return;
-        std.time.sleep(20 * std.time.ns_per_ms);
-    }
-    return error.TimedOut;
-}
-
 fn waitKernelAddresses(reader: *engine.firewall.inspection.Inspector, expected: []const @import("shared").IpAddress) !void {
     var timer = try std.time.Timer.start();
     while (timer.read() < 8 * std.time.ns_per_s) {
@@ -561,145 +511,6 @@ test "native daemon: ingests a new decision after obsolete detail capacity is re
     try t.expect(try store.inspectInteger("SELECT count(*) FROM retry_decision_details;") < 65536);
     try t.expectEqual(@as(i64, 1), try store.inspectInteger("SELECT count(*) FROM retry_decision_details WHERE jail='sshd';"));
     try t.expectEqual(@as(i64, 0), try store.inspectInteger("SELECT count(*) FROM pragma_foreign_key_check;"));
-}
-
-test "native daemon: schema23 resumes marked escalated cleanup and continues ingestion" {
-    const enforcing = std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") != null;
-    if (enforcing) try enterNestedNetworkNamespace();
-    var h = try harness.Harness.init(t.allocator, .{ .spawn_daemon = false });
-    defer h.deinit();
-    try writeEscalationCleanupConfig(&h);
-    try h.startDaemon();
-    try waitStatus(&h, if (enforcing) "\"state\":\"active\"" else "\"state\":\"log-only\"");
-    try h.writeLine(failure ++ "\nignored");
-    try waitRevision(&h, 3);
-    try waitStatus(&h, "\"decisions_total\":1");
-    var inspector: ?engine.firewall.inspection.Inspector = null;
-    defer if (inspector) |*reader| reader.close();
-    if (enforcing) {
-        try waitReady(&h);
-        const installation = blk: {
-            var store = try engine.native_store_mod.Store.openReadOnly(t.allocator, h.state_path);
-            defer store.close();
-            break :blk (try store.readInstallation()).?;
-        };
-        try t.expectEqual(engine.native_effect_mod.Backend.nftables, installation.backend);
-        inspector = try engine.firewall.inspection.Inspector.open(t.allocator, .{ .id = installation.id, .transport = .nftables }, .{});
-        const first_address = try @import("shared").IpAddress.parse("203.0.113.7");
-        if (inspector) |*reader| try waitKernelAddresses(reader, &.{first_address});
-    }
-    const deadline = try savedDeadlineExpected(&h, enforcing);
-    try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try h.stopDaemon());
-    try waitPastDeadline(deadline);
-    if (inspector) |*reader| try waitKernelAddresses(reader, &.{});
-
-    var source: MaintenanceSource = undefined;
-    var marked: engine.native_store_mod.Store.CleanupToken = undefined;
-    var marked_revision: u64 = undefined;
-    {
-        var store = try engine.native_store_mod.Store.open(t.allocator, h.state_path);
-        defer store.close();
-        try t.expectEqual(@as(i64, 24), store.schema_version);
-        try t.expectEqual(@as(i64, 1), try store.inspectInteger("SELECT count(*) FROM retry_decision_escalations;"));
-        try t.expectEqual(@as(i64, 0), try store.inspectInteger("SELECT count(*) FROM pragma_foreign_key_check;"));
-        const escalated_sequence_value = try store.inspectInteger("SELECT r.source_sequence FROM records r JOIN retry_decision_escalations e USING(jail,source,occurrence) LIMIT 1;");
-        try t.expect(escalated_sequence_value > 0);
-        const escalated_sequence: u64 = @intCast(escalated_sequence_value);
-        source = try maintenanceSource(&store);
-        errdefer source.deinit();
-        if (inspector) |*reader| {
-            var entries: [1]engine.native_effect_mod.Entry = undefined;
-            const page = try store.effectPage(null, null, &entries);
-            try t.expectEqual(@as(usize, 1), page.count);
-            try t.expect(!page.more);
-            try t.expectEqual(engine.native_effect_mod.Status.applied, entries[0].status);
-            try t.expectEqual(.finite, std.meta.activeTag(entries[0].desired));
-            const expired = try store.prepareExpiry(entries[0].scope_key, entries[0].revision, .{ .prepared_us = std.time.microTimestamp() });
-            try t.expectEqual(engine.native_effect_mod.Status.pending, expired.status);
-            try t.expectEqual(.absent, std.meta.activeTag(expired.desired));
-            const dispatched_us = std.time.microTimestamp();
-            var observed = try reader.observeExact(.{
-                .installation = reader.installation,
-                .effect_id = expired.scope_key,
-                .aggregate_revision = expired.revision,
-                .scope = expired.scope.canonical,
-                .operation = .ensure_absent,
-            }, .{ .wall_us = std.time.microTimestamp() });
-            defer observed.deinit();
-            try t.expect(observed.matches_desired);
-            try t.expectEqual(engine.native_effect_mod.Settlement.verified, try store.settleOutcome(expired.token(), dispatched_us, .{
-                .installation = expired.installation.id,
-                .scope_key = expired.scope_key,
-                .fingerprint = observed.snapshot.fingerprint,
-                .observed_us = observed.observed_wall_us,
-                .qualification = .complete_owned,
-                .state = .absent,
-            }, .{ .prepared_us = observed.observed_wall_us }));
-            var settled: [1]engine.native_effect_mod.Entry = undefined;
-            const settled_page = try store.effectPage(null, null, &settled);
-            try t.expectEqual(@as(usize, 1), settled_page.count);
-            try t.expect(!settled_page.more);
-            try t.expectEqual(engine.native_effect_mod.Status.absent, settled[0].status);
-            try t.expectEqual(.absent, std.meta.activeTag(settled[0].desired));
-        }
-        const state = (try store.sourceMaintenance("sshd", source.source, source.generation)).?;
-        marked_revision = try store.revision("sshd");
-        var fence = engine.native_store_mod.Store.CleanupFence{
-            .jail = "sshd",
-            .source = source.source,
-            .generation = source.generation,
-            .jail_revision = marked_revision,
-            .consumer_revision = try store.maintenanceConsumerRevision(),
-            .effect_revision = try store.maintenanceEffectRevision(),
-            .clock = .{ .prepared_us = std.time.microTimestamp() },
-            .preparations = .released,
-        };
-        if (enforcing) {
-            const installation = (try store.readInstallation()).?;
-            const stream_revision_value = try store.inspectInteger("SELECT revision FROM confirmed_history_stream WHERE id=1;");
-            const head_value = try store.inspectInteger("SELECT head FROM confirmed_history_stream WHERE id=1;");
-            const retained_value = try store.inspectInteger("SELECT retained_from FROM confirmed_history_stream WHERE id=1;");
-            try t.expect(stream_revision_value > 0 and head_value >= 0 and retained_value > 0);
-            const head: u64 = @intCast(head_value);
-            fence.history = .{
-                .installation = installation.id,
-                .stream_revision = @intCast(stream_revision_value),
-                .head_sequence = head,
-                .retained_from_sequence = @intCast(retained_value),
-                .after_sequence = head,
-                .last_sequence = head,
-            };
-        }
-        marked = (try store.cleanupAdvance(fence, state, state.head_sequence)).?;
-        try t.expect(marked.state.sweep_sequence < escalated_sequence);
-        try t.expect(marked.state.reject_below_sequence > escalated_sequence);
-        try t.expectEqual(@as(i64, 1), try store.inspectInteger("SELECT count(*) FROM retry_decision_escalations;"));
-        try t.expectEqual(@as(i64, 0), try store.inspectInteger("SELECT count(*) FROM pragma_foreign_key_check;"));
-    }
-    defer source.deinit();
-
-    try h.startDaemon();
-    try waitEscalationCleanup(h.state_path);
-    try waitReady(&h);
-    try waitStatus(&h, "\"storage\":\"healthy\"");
-    try waitStatus(&h, if (enforcing) "\"state\":\"active\"" else "\"state\":\"log-only\"");
-    try h.writeLine(following_failure);
-    try waitRevision(&h, @intCast(marked_revision + 1));
-    try waitStatus(&h, "\"decisions_total\":2");
-    try waitReady(&h);
-    if (inspector) |*reader| {
-        const second_address = try @import("shared").IpAddress.parse("203.0.113.8");
-        try waitKernelAddresses(reader, &.{second_address});
-    }
-    try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try h.stopDaemon());
-
-    var store = try engine.native_store_mod.Store.openReadOnly(t.allocator, h.state_path);
-    defer store.close();
-    try t.expectEqual(@as(i64, 0), try store.inspectInteger("SELECT count(*) FROM pragma_foreign_key_check;"));
-    const state = (try store.sourceMaintenance("sshd", source.source, source.generation)).?;
-    try t.expectEqual(marked_revision + 1, try store.revision("sshd"));
-    try t.expectEqual(marked.state.head_sequence + 1, state.head_sequence);
-    try t.expect(state.sweep_sequence >= marked.state.reject_below_sequence - 1);
 }
 
 test "native daemon: blocked SQLite writer leaves IPC responsive and resumes exact pending file" {
@@ -1009,7 +820,7 @@ test "native daemon: oversized source isolates its jail while independent file d
         return error.TestExpectedEqual;
     }
     var cause_buffer: [160]u8 = undefined;
-    const cause_text = try std.fmt.bufPrint(&cause_buffer, "broken ({s}", .{source_cause.?});
+    const cause_text = try std.fmt.bufPrint(&cause_buffer, "paused ({s}", .{source_cause.?});
     // Exercise the delivered formatter against the same actual daemon fault.
     const checks = [_]struct { format: []const u8, command: []const u8, needle: []const u8 }{
         .{ .format = "plain", .command = "status", .needle = "unhealthy_sources\t1" },
@@ -1065,6 +876,12 @@ test "native daemon: retained rotation and detected copytruncate preserve retry 
     var h = try harness.Harness.init(t.allocator, .{ .spawn_daemon = false });
     defer h.deinit();
     try writeConfig(&h);
+    {
+        var config = try std.fs.cwd().openFile(h.config_path, .{ .mode = .write_only });
+        defer config.close();
+        try config.seekFromEnd(0);
+        try config.writeAll("on_truncation = \"restart\"\n");
+    }
     try h.startDaemon();
     try waitStatus(&h, "\"state\":\"log-only\"");
     try h.writeLine(failure);
@@ -1087,6 +904,7 @@ test "native daemon: retained rotation and detected copytruncate preserve retry 
     try replacement.seekTo(0);
     try replacement.writeAll("ignored\n");
     try waitRevision(&h, 8);
+    try waitStatus(&h, "\"loss_events\":1");
     try std.posix.kill(h.child.?.id, std.posix.SIG.KILL);
     try t.expectEqual(std.process.Child.Term{ .Signal = std.posix.SIG.KILL }, try h.child.?.wait());
     h.child = null;

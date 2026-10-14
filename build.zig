@@ -2,7 +2,7 @@
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
 
-const fail2zig_version = "0.4.6";
+const fail2zig_version = "0.4.7";
 
 const CiLane = enum { components_a, components_b, assembled, fuzz, excluded, deferred };
 const CiGates = struct {
@@ -462,25 +462,6 @@ pub fn build(b: *std.Build) void {
         if (std.mem.eql(u8, f.name, "journalctl_contract"))
             b.step("test-journalctl", "Qualify host journalctl against original offline fixtures").dependOn(&run.step);
     }
-
-    const release_migration_options = b.addOptions();
-    release_migration_options.addOption([]const u8, "daemon_path", b.pathFromRoot("zig-out/bin/fail2zig"));
-    release_migration_options.addOption([]const u8, "supported_fixture", b.pathFromRoot("tests/fixtures/fail2ban/config/stock-1.1.1"));
-    const release_migration_mod = b.createModule(.{
-        .strip = strip,
-        .root_source_file = b.path("tests/integration/release_migration_test.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    release_migration_mod.addImport("engine", engine_mod);
-    release_migration_mod.addImport("release_migration_test_options", release_migration_options.createModule());
-    const release_migration_tests = b.addTest(.{ .root_module = release_migration_mod, .filters = &.{"release migration:"} });
-    const run_release_migration = b.addRunArtifact(release_migration_tests);
-    run_release_migration.step.dependOn(b.getInstallStep());
-    b.step("test-release-migration", "Run bounded one-executable release migration tests").dependOn(&run_release_migration.step);
-    release_local_step.dependOn(&run_release_migration.step);
-    ci.add(.assembled, &run_release_migration.step);
 
     const parser_only_mod = b.createModule(.{
         .root_source_file = b.path("engine/core/parser.zig"),

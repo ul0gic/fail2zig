@@ -1,4 +1,4 @@
-.TH FAIL2ZIG 1 "2026-09-28" "fail2zig 0.4.6" "User Commands"
+.TH FAIL2ZIG 1 "2026-10-13" "fail2zig 0.4.7" "User Commands"
 .
 .SH NAME
 fail2zig \- intrusion prevention daemon and its administration commands
@@ -52,7 +52,7 @@ unit of
 .BR Type=notify :
 it sends
 .B READY=1
-only after configuration, storage, every source and enforcing protection are admitted,
+only after configuration, storage, every source that can resume and enforcing protection are admitted,
 .B RELOADING=1
 then
 .B READY=1
@@ -71,6 +71,18 @@ and
 stop cleanly. No socket unit is shipped and
 .B LISTEN_FDS
 is not read.
+.PP
+A source that cannot resume does not hold back
+.BR READY=1 :
+the daemon pauses that source, restores bans for every jail, enforces every other
+enabled jail, sends
+.B READY=1
+and keeps running, so
+.B systemctl is-active fail2zig
+reports
+.BR active .
+Protection stays degraded while a source is paused; see STATUS and REPAIR-SOURCE.
+Configuration, storage, firewall and schema refusals still stop the start with exit 1.
 .
 .SH DAEMON OPTIONS
 .TP
@@ -126,9 +138,11 @@ Command timeout. Default 5000. Expiry exits with class 3.
 Members of the
 .B fail2zig
 group may run the read-only commands through the 0660 socket. Mutations
-.RB ( ban ", " unban ", " reload ", " "history reset" ", " jail )
+.RB ( ban ", " unban ", " "ignore add" ", " "ignore remove" ", " reload ", " "history reset" ", " jail )
 require uid 0 or the daemon uid, verified with
 .BR SO_PEERCRED .
+The read-only commands include
+.BR "ignore list" .
 .TP
 .B status
 Daemon summary: version, protection state
@@ -151,6 +165,131 @@ to include identifiers and additional counters; failures remain visible without 
 History counts retained confirmed effect events; maintenance can remove these rows,
 so this is not a lifetime ban count. The machine-readable key remains
 .BR total_bans .
+.RS
+.PP
+Paused sources. A file source that cannot resume (truncated in place below its
+committed offset, a rotated-out file removed with unread bytes, or a log replaced by a
+different file whose previous file is gone, under
+.BR "on_truncation = \(dqrefuse\(dq" )
+is paused, and the daemon keeps running. When paused sources are the only reason protection
+is degraded, the cause is
+.B SourcePaused
+instead of unknown. Table output adds one
+.B Paused:
+block per source with the jail, path and cause, then the exact
+.B repair-source
+command and the reminder that firewall rules for every jail are withdrawn while the
+daemon is stopped. The command is never truncated to the terminal width. When no
+offline repair applies to the cause, the block reads that and points to the daemon log.
+.PP
+Loss events. A source that resumed under
+.B on_truncation = \(dqrestart\(dq
+shows one
+.B Loss events:
+row with its retained event count and the latest event.
+.B --details
+adds a section listing every retained continuity-loss event, newest first, up to 256
+per source: jail, path, time, reason
+.RB ( truncated ,
+.B rotated_unread_removed
+or
+.BR replaced ),
+inode, committed offset and observed size. Records written after the committed offset
+and removed before they were read were never read; an event records that loss and does
+not recover the records.
+.PP
+New JSON keys, all additive. The existing keys, including
+.BR unhealthy_sources ,
+keep their meaning.
+.IP \(bu 2
+.B paused_sources
+\(em integer, the sources currently paused.
+.IP \(bu 2
+.B sources
+\(em array, always present, empty when none: every source that is paused or has at least one
+retained loss event, ordered by jail then path. Each element has
+.BR jail ,
+.B kind
+.RB ( file
+or
+.BR journal ),
+.B path
+(null for a journal),
+.B on_truncation
+.RB ( refuse ,
+.B restart
+or null),
+.B state
+.RB ( paused
+or
+.BR reading ),
+.B cause
+(null unless paused),
+.BR inode ,
+.BR committed_offset ,
+.B observed_size
+(integers or null),
+.B repair
+(the exact command, or null when no repair applies),
+.B loss_events
+(retained count, 0 to 256) and
+.B last_loss
+(null, or an object with
+.BR sequence ,
+.BR wall_us ,
+.BR reason ,
+.BR inode ,
+.B committed_offset
+and
+.BR observed_size ).
+.IP \(bu 2
+.B cause
+gains the value
+.BR SourcePaused .
+.IP \(bu 2
+.B loss_events
+\(em only with
+.BR --details :
+the client adds the array of every retained event, each with
+.BR sequence ,
+.BR jail ,
+.BR path ,
+.BR wall_us ,
+.BR reason ,
+.BR inode ,
+.B committed_offset
+and
+.BR observed_size .
+This is the one case where
+.B --details
+changes JSON output, and it adds a key without changing any other.
+.PP
+Plain output adds, after every existing key,
+.BR paused_sources ,
+one tab-separated
+.B source
+line per listed source (jail, kind, path or \-, state, cause or \-, on_truncation or \-,
+loss event count, latest loss wall_us or \-, latest loss committed offset or \-), one
+.B source_repair
+line (jail, path, command) for each source whose repair is non-null, and with
+.B --details
+one
+.B loss_event
+line per event. Callers who are not administrators see
+.B <redacted>
+for a source path and repair command.
+.PP
+If the events cannot be read after the status was read, table output prints
+.BR "Continuity loss events: unavailable (message)" ,
+plain output prints
+.BR loss_events_unavailable ,
+and JSON sets
+.B loss_events
+to null with
+.BR loss_events_unavailable .
+The exit status is 3 for a transport failure and 1 when the daemon does not support the
+query; upgrade and restart the daemon in that case.
+.RE
 .TP
 .BI stats " [--details] [--output table|plain|json]"
 Show one retained enforcement-manager worker snapshot. It reports snapshot age
@@ -177,6 +316,8 @@ independent per-jail kernel verification and does not promise zero pending bans.
 Unconfirmed does not mean installed rules are absent. Missing query fields remain
 unknown; action names do not determine mode. JSON includes the additive Boolean
 \fBenforce_configured\fR while preserving \fBenforcing\fR and \fBaction\fR.
+JSON also carries the additive Boolean \fBsource_paused\fR, true when any source of the jail is paused;
+\fBsource_healthy\fR and \fBcause\fR keep their meaning.
 Plain output retains its 11 columns and enforcing Boolean position; an unknown ban
 count is shown as \fB-\fR, while a known zero remains \fB0\fR. Table output shows state, source health, enforcement and bans; add
 .B --details
@@ -227,6 +368,144 @@ A log-only jail rejects manual bans.
 .BI unban " ip --jail name [--scope host|net cidr]"
 Release a manual or automatic ban in one jail.
 .TP
+.BI "ignore add" " address|cidr --jail name [--unban]"
+Record a runtime exclusion for one jail. The address is an IPv4 or IPv6 host, or
+.IR address / prefix
+(IPv4 prefix 0\-32, IPv6 prefix 0\-128) of at most 64 bytes, and is stored in canonical form
+(host bits below the prefix cleared, RFC 5952 for IPv6). Hostnames are not accepted.
+.B \-\-jail
+is required and the jail must be configured, enabled or not. A jail with custom rules
+.RB ( rule_files )
+is refused with exit status 1 and the reason
+.BR "jail '<name>' uses rule_files; manage its exclusions through ignore_file" ;
+its exclusions stay in
+.B ignore_file
+plus
+.BR "fail2zig reload" .
+Flags may come before or after the
+address. Entries are stored in the state database, survive restart and reload, and are
+merged with the jail's configured
+.BR ignoreip .
+From the next event the daemon processes after the commit, a matching event creates no
+candidate and counts as an ignored detection. An event admitted before the commit may still
+finish its ban.
+.RS
+.PP
+An ignore entry does not lift a ban that already exists. When the jail has a ban inside the
+entry, the output states it, the deadline (or that it is permanent), that the ban stays, and
+the exact command that lifts it. A network ban wider than the entry is reported with its
+.B unban \-\-scope net
+command.
+.B \-\-unban
+also lifts that jail's bans inside the entry through the same path as
+.BR unban ,
+one result line per lifted ban, confirmed, not yet confirmed in the kernel, unknown or
+refused. It never lifts a wider network ban, never touches another jail, and lifts at most 256
+bans; with more inside the entry the whole command is refused and no entry is recorded.
+Adding an entry that already exists as a runtime entry changes nothing, and
+.B \-\-unban
+still lifts the bans. An entry already in the configuration is recorded as well and its source
+becomes
+.BR config+runtime .
+Output also names any wider configured entry that already covers the address, a prefix 0
+entry that covers every address of its family, and a disabled or paused jail.
+.PP
+Each jail holds at most 128 entries, configuration and runtime combined. An add that would
+exceed it is refused. A reload that would make configured plus runtime entries exceed 128 is
+rejected. A daemon start never refuses for that reason: every entry applies and further adds are
+refused until the count is 128 or less.
+.PP
+Table output is text on standard output. Plain output is tab-separated key and value lines (\fBkind\fR, \fBoutcome\fR, \fBenforced\fR, \fBgeneration\fR, \fBmutation_revision\fR,
+\fBjail\fR, \fBaddress\fR, \fBentry\fR, \fBsource\fR, \fBcovered_by\fR, \fBbans_total\fR, one
+\fBban\fR line per related ban and \fBreason\fR lines). JSON output is the daemon outcome object
+unchanged, with the additive keys
+.BR entry ,
+.BR source ,
+.BR covered_by ,
+.BR unban_requested ,
+.B bans_total
+and
+.BR bans .
+In JSON mode standard output holds one JSON document, and daemon outcomes, refusals included, are printed there.
+.PP
+Exit status is the worst of the entry step and every lift, ranked 5 over 4 over 1 over 0:
+0 when the entry is added or present and no lift was requested or every lift is confirmed;
+4 when a lift is applied but its kernel removal is not yet confirmed;
+5 when a lift or the durable commit could not be established;
+1 when the entry is refused (unknown jail, 128 bound, more than 256 bans with
+.BR \-\-unban )
+or a lift is refused; 2 for a usage error such as a missing
+.B \-\-jail
+or an invalid address or prefix, with nothing sent; 3 when the socket is unavailable.
+.RE
+.TP
+.BI "ignore remove" " address|cidr --jail name"
+Remove the jail's runtime entry with that canonical form. It never changes configuration
+entries and never touches bans. From the next event after the commit the address is detected
+again, with counting from zero, unless the configuration still covers it; in that case the
+output says the address remains ignored and names the covering configured entry
+(\fBstill_ignored_by\fR in plain and JSON output). An entry set only in the configuration is
+refused with the file to edit and
+.BR "fail2zig reload" ;
+an address with no runtime entry is refused. A jail that is not configured is accepted when
+it has stored runtime entries, so they can be cleaned up. A jail with custom rules
+.RB ( rule_files )
+is refused as for
+.BR "ignore add" . Exit status: 0 when removed; 1 for a
+configuration-only entry, an absent entry, a custom-rules jail or an unknown jail; 5 when the commit could not be
+established; 2 and 3 as for
+.BR "ignore add" .
+.TP
+.BI "ignore list" " [--jail name]"
+Read-only. One row per distinct jail and entry of the effective list, ordered by jail name,
+then IPv4 before IPv6, numeric address, prefix length. Columns are
+.BR JAIL ,
+.B ADDRESS
+and
+.BR SOURCE ,
+where the source is
+.BR config ,
+.B runtime
+or
+.BR config+runtime .
+Without
+.B \-\-jail
+every enabled jail is listed; with it, that jail whether enabled or not. A jail without
+entries prints no rows and exits 0; an unknown jail exits 1. Table output ends with a
+.B Total:
+line and notes for a custom-rule jail's
+.B ignore_file
+(its configured literals are listed with source
+.BR config ;
+the file's entries are not), for runtime entries stored for jails that are not
+configured, and for a jail above the 128 limit after a configuration change. Plain output is
+one tab-separated line per row without header or footer. JSON output carries
+.BR limit ,
+.BR redacted ,
+per-jail
+.B entries
+and an
+.B unconfigured
+array. Members of the
+.B fail2zig
+group may run it; for them every address and
+.B ignore_file
+is printed as
+.BR <redacted> ,
+as
+.B config
+does for address lists.
+.PP
+Both mutating subcommands return exit status 1 with
+.B mutation requires root or daemon uid (code 403)
+on standard error for a group member, and
+.B daemon does not support ignore commands
+(code 400) when the daemon predates them; upgrade and restart it. A mutation that
+raced a reload or other change is rejected with the daemon's reason and should be retried.
+When storage is not accepting changes the command is rejected until
+.B status
+shows storage healthy.
+.TP
 .B reload
 Propose the current configuration file as a new generation. Outcomes:
 .BR noop ", " applied ", " rejected " or " restart_required
@@ -234,10 +513,17 @@ Propose the current configuration file as a new generation. Outcomes:
 .BR reasons ).
 Live keys: per-jail
 .BR maxretry ", " bantime ", " bantime_kind ", " bantime_increment ,
+literal
+.B ignoreip
+entries (per jail and in
+.BR [defaults] ),
 global
 .BR log_level ,
 and the contents of a custom jail's
 .BR ignore_file .
+An
+.B ignoreip
+edit applies from the next event after the reload and never alters an existing ban.
 Live reload applies supported changes; restart-only settings require a daemon restart.
 .TP
 .BI history " [--jail name] [--limit 1..256] [--cursor token]"
@@ -385,23 +671,45 @@ daemon exits 3. See
 .
 .SH REPAIR-SOURCE
 A file source truncated in place below its committed position (for example a
-PortSentry history file that the scanner empties on start) is refused at startup
-rather than silently re-read; the log names the jail and source. With the daemon
+PortSentry history file that the scanner empties on start), a rotated-out file
+removed while it still held unread bytes, or a log replaced by a different file whose
+previous file exists nowhere in its directory, is not silently re-read under the default
+.BR "on_truncation = \(dqrefuse\(dq" .
+The daemon starts with that source paused: the startup journal line and
+.B fail2zig status
+name the jail and source and print the exact command to run. With the daemon
 stopped,
 .B repair-source
-acknowledges that truncation for one configured file source and restarts it at
-offset 0 of the current file. It holds the state lock, never creates state, and
-refuses a replaced or rotated file, a pending receipt for that source, consumer
+acknowledges the loss for one configured file source. After a truncation in place it
+restarts the source at offset 0 of the current file. After a removed rotated file it
+records the loss of that file's unread bytes and resumes the current file at its
+committed offset, not at 0. After a replaced log it records the loss of the previous
+file's unread bytes and restarts the source at offset 0 of the file now at the path.
+It holds the state lock, never creates state, and
+refuses a source that is not truncated in place, not replaced with its previous file
+gone, and not missing a removed rotated incarnation (nothing to acknowledge: an absent
+path, a rewrite in place, or a previous file still in its directory), a pending receipt for that source, consumer
 state that is not ready, or a checkpoint changed since observation. Other sources,
 owners and ban deadlines are not changed.
 .PP
+If the source is not paused because
+.B on_truncation = \(dqrestart\(dq
+already recorded the loss, the command prints that event, performs no repair, does not
+reserve the token and exits 0.
+.PP
 The
 .I token
-(1\(en128 of A\(enZ a\(enz 0\(en9 . _ : \-) identifies the repair: repeating the
-same command replays the committed outcome without a second repair. The newest 256
+(1\(en128 of A\(enZ a\(enz 0\(en9 . _ : \-) identifies the repair. The daemon proposes one
+of the form
+.IR ack-<inode>-<committed_offset>-<detected_unix_seconds> ,
+so each incident has its own token and the printed command can be copied as it is.
+Repeating the same command replays the committed outcome without a second repair; a
+different token after a successful repair is refused, because the source is no longer
+truncated. The newest 256
 outcomes are retained; an older token stays reserved and is refused. Data written
 after the committed position and removed by the truncation was never read and cannot
-be recovered, and lines still in the file are read again. Stopping the daemon for the
+be recovered (for a removed rotated file or a replaced log, the records after the
+committed offset of the file that is gone), and lines still in the file are read again. Stopping the daemon for the
 repair withdraws its firewall rules for every jail until the next start reinstalls
 them from durable state. Exit 0 on success or replay, 1 on refusal, 2 on usage errors.
 .
@@ -469,15 +777,31 @@ Native destination migration must run as the service UID with the required
 capabilities and caller-owned private staging, with the destination daemon
 stopped. See docs/operations/command-migration.md and migration-continuity.md.
 .PP
-The first start of this version on v0.4.x state (schema 23) upgrades it to
-schema 24. Before its first change the daemon writes a coherent copy to
-.IR <state_file>.pre24-backup ,
-which needs free space of twice the database size plus 32 MiB, and refuses to start
-if that file already exists. The upgrade commits in small resumable steps: an
-interrupted upgrade resumes on the next start, and a partly upgraded database is
-refused by older binaries. Keep the backup until the upgraded daemon has been checked.
-Rollback means restoring that backup (removing the upgraded database's WAL/SHM files)
-together with the previous binary; an older binary cannot open schema 24 state.
+The first start of this version upgrades a state last written by v0.4.6 (schema 24)
+to schema 25, which adds the tables for runtime ignore entries and continuity-loss
+events. States last written by releases before v0.4.6 are not a supported upgrade
+path; start from a fresh state. Before its first change the daemon writes a coherent
+copy of the database to a backup, which needs free space of twice the database size plus 32 MiB, and refuses to start if that file already
+exists; move an old backup aside only when it is not the sole copy of earlier state.
+.IP \(bu 2
+The backup is
+.IR <state_file>.pre25-backup .
+.PP
+The upgrade commits in small resumable steps: an interrupted upgrade resumes on the
+next start. v0.4.6 and older binaries refuse schema 25 state with their
+.B UnsupportedSchema
+message, as they refuse a partly upgraded database. Keep the backup until the
+upgraded daemon has been checked. Rollback means stopping the daemon, restoring the
+backup the upgrade wrote over the state file, removing the upgraded database's
+WAL/SHM files, and reinstalling the binary that last wrote that state.
+.PP
+The first start on state whose saved detection generations hashed the ignore list
+or the per-jail subject share rekeys them once, before admission validation, and logs
+.BR "saved detection generations rekeyed without the ignore list or the subject share" .
+No ban, deadline, checkpoint or retry subject changes, and later starts write nothing.
+A configuration that still differs from saved state in another way keeps its existing
+.B RetryGenerationMismatch
+refusal.
 .
 .SH ENVIRONMENT
 .TP
@@ -509,6 +833,8 @@ fail2zig stats --output plain
 fail2zig list --sort --jail sshd
 fail2zig list --jail sshd --output json
 sudo fail2zig ban 192.0.2.10 --jail sshd --duration 3600
+sudo fail2zig ignore add 198.51.100.20 --jail sshd
+fail2zig ignore list --jail sshd
 sudo fail2zig reload
 fail2zig rule-test --file /var/log/auth.log --service sshd --tz-offset 0
 fail2zig completions bash > /etc/bash_completion.d/fail2zig
@@ -530,3 +856,5 @@ Report bugs at
 .SH HISTORY
 fail2zig 0.1.0 was the first public release, April 2026.
 fail2zig 0.3.0 was released September 2026.
+fail2zig 0.4.7 was released October 2026 with runtime ignore entries, a
+truncation policy per jail and the batched stop.

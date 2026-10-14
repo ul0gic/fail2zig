@@ -10,6 +10,7 @@ const effect_history = @import("../core/native_effect_history.zig");
 const action_context = @import("../core/native_action_context.zig");
 const action_outcome = @import("../core/native_action_outcome.zig");
 const store = @import("store.zig");
+const canonical_scope = @import("../firewall/scope.zig");
 const Error = store.Error;
 const Stmt = store.Stmt;
 const Limits = store.Limits;
@@ -434,6 +435,16 @@ pub fn Methods(comptime Store: type) type {
                     try escalation_insert.blob(3, &escalation);
                     try escalation_insert.done();
                 }
+            } else if (try self.readRetryPolicy(jail)) |saved| {
+                if (saved.policy.max_subjects != policy.max_subjects) {
+                    const encoded = try policy.encode();
+                    var update = try self.statement("UPDATE retry_policies SET policy=?3 WHERE jail=?1 AND generation=?2;");
+                    defer update.deinit();
+                    try update.text(1, jail);
+                    try update.blob(2, &generation);
+                    try update.blob(3, &encoded);
+                    try update.done();
+                }
             }
             try self.commitTransaction();
         }
@@ -531,8 +542,8 @@ pub fn Methods(comptime Store: type) type {
         }
 
         pub fn retryPoliciesEqual(left: retry.Policy, right: retry.Policy) Error!bool {
-            const left_base = try left.encode();
-            const right_base = try right.encode();
+            const left_base = try left.identity();
+            const right_base = try right.identity();
             if (!std.mem.eql(u8, &left_base, &right_base)) return false;
             const left_escalation = try left.escalation.encode();
             const right_escalation = try right.escalation.encode();
@@ -758,6 +769,280 @@ pub fn Methods(comptime Store: type) type {
                 summary.decisions = std.math.add(u64, summary.decisions, try self.retiredTotal(jail)) catch return error.InvalidRetryState;
             try self.commitTransaction();
             return summary;
+        }
+
+        pub fn retryStateRevision(self: *Store) Error!u64 {
+            try self.beginRead();
+            errdefer self.rollback();
+            const revision_value = try self.integer("SELECT revision FROM policy_summary_clock WHERE id=1;");
+            if (revision_value <= 0) return error.InvalidPolicySummary;
+            try self.commitTransaction();
+            return @intCast(revision_value);
+        }
+
+        pub const RekeyReport = struct { retry_rows: u32, pending_receipts: u32, manifests: u32, cursors: u32, guards: u32 = 0 };
+        pub const CursorRekey = union(enum) { none, file: struct { legacy: [32]u8, planned: [32]u8 }, journal };
+
+        // One-time startup rewrite of v0.4.6 rows; a single statement over a large records table needs more than the ordinary statement budget.
+        const rekey_work_callbacks: u32 = 100_000;
+        const OwnerHeld = struct { key: [32]u8, revision: u64, scope: [canonical_scope.encoded_bytes]u8, absent: bool };
+
+        fn cursorBindingFragment(buffer: []u8, binding: [32]u8) Error![]const u8 {
+            var stream = std.io.fixedBufferStream(buffer);
+            const w = stream.writer();
+            w.writeAll("\"codec_configuration_hash\":[") catch return error.InvalidRecord;
+            for (binding, 0..) |byte, i| {
+                if (i != 0) w.writeByte(',') catch return error.InvalidRecord;
+                w.print("{d}", .{byte}) catch return error.InvalidRecord;
+            }
+            w.writeByte(']') catch return error.InvalidRecord;
+            return stream.getWritten();
+        }
+
+        pub fn rekeySavedGenerations(self: *Store, jail: []const u8, legacy: [32]u8, planned: [32]u8, cursors: CursorRekey) Error!RekeyReport {
+            var report = RekeyReport{ .retry_rows = 0, .pending_receipts = 0, .manifests = 0, .cursors = 0 };
+            if (std.mem.eql(u8, &legacy, &planned)) return report;
+            if (jail.len == 0 or jail.len > 64 or std.mem.indexOfScalar(u8, jail, 0) != null) return error.InvalidRecord;
+            try self.beginAdmissionWrite();
+            errdefer self.rollback();
+            if (self.schema_version < 22) return error.AdminStorageRequired;
+            const prior_work = self.work_remaining;
+            if (self.runtime_limits) self.work_remaining = rekey_work_callbacks;
+            defer if (self.runtime_limits) {
+                self.work_remaining = prior_work;
+            };
+            var old_fragment: [256]u8 = undefined;
+            var new_fragment: [256]u8 = undefined;
+            const old_text = switch (cursors) {
+                .file => |binding| try cursorBindingFragment(&old_fragment, binding.legacy),
+                .none, .journal => "",
+            };
+            const new_text = switch (cursors) {
+                .file => |binding| try cursorBindingFragment(&new_fragment, binding.planned),
+                .none, .journal => "",
+            };
+            const bound = blk: {
+                {
+                    var row = try self.statement("SELECT 1 FROM retry_policies WHERE jail=?1 AND generation=?2;");
+                    defer row.deinit();
+                    try row.text(1, jail);
+                    try row.blob(2, &legacy);
+                    if (try row.row()) break :blk true;
+                }
+                switch (cursors) {
+                    .none => break :blk false,
+                    .file => {
+                        var row = try self.statement("SELECT 1 FROM source_cursors WHERE jail=?1 AND instr(CAST(cursor AS TEXT),?2)>0 LIMIT 1;");
+                        defer row.deinit();
+                        try row.text(1, jail);
+                        try row.text(2, old_text);
+                        break :blk try row.row();
+                    },
+                    .journal => {
+                        var row = try self.statement("SELECT 1 FROM source_cursors WHERE jail=?1 AND substr(CAST(cursor AS BLOB),1,4)=CAST('F2JC' AS BLOB) AND substr(CAST(cursor AS BLOB),7,32)=?2 LIMIT 1;");
+                        defer row.deinit();
+                        try row.text(1, jail);
+                        try row.blob(2, &legacy);
+                        break :blk try row.row();
+                    },
+                }
+            };
+            if (!bound) {
+                try self.commitTransaction();
+                return report;
+            }
+            try self.exec("PRAGMA defer_foreign_keys=ON;");
+            for ([_][:0]const u8{
+                "UPDATE retry_policies SET generation=?3 WHERE jail=?1 AND generation=?2;",
+                "UPDATE retry_escalation_policies SET generation=?3 WHERE jail=?1 AND generation=?2;",
+            }) |sql| report.retry_rows = std.math.add(u32, report.retry_rows, try self.rekeyRows(sql, jail, legacy, planned)) catch return error.StorageLimit;
+            try self.rekeyGenerationTablesTx(jail, legacy, planned, &report);
+            switch (cursors) {
+                .none => {},
+                .file => {
+                    var update = try self.statement("UPDATE source_cursors SET cursor=CAST(replace(CAST(cursor AS TEXT),?2,?3) AS BLOB) WHERE jail=?1 AND instr(CAST(cursor AS TEXT),?2)>0;");
+                    defer update.deinit();
+                    try update.text(1, jail);
+                    try update.text(2, old_text);
+                    try update.text(3, new_text);
+                    try update.done();
+                    report.cursors = std.math.add(u32, report.cursors, std.math.cast(u32, self.api.changes(self.db)) orelse return error.StorageLimit) catch return error.StorageLimit;
+                },
+                .journal => {},
+            }
+            const owners_changed = try self.rekeyOwnersTx(jail, legacy, planned);
+            try self.commitEffectTransaction(owners_changed);
+            return report;
+        }
+
+        const GenerationStatement = struct { sql: [:0]const u8, counted: enum { retry, pending, manifests, cursors, none } };
+        const generation_statements = [_]GenerationStatement{
+            .{ .sql = "UPDATE retry_retired SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .retry },
+            .{ .sql = "UPDATE pending_receipts SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .pending },
+            .{ .sql = "UPDATE consumer_manifests SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .manifests },
+            .{ .sql = "UPDATE records SET source_generation=?3 WHERE jail=?1 AND source_generation=?2;", .counted = .none },
+            .{ .sql = "UPDATE records SET receipt_generation=?3 WHERE jail=?1 AND receipt_generation=?2;", .counted = .none },
+            .{ .sql = "UPDATE checkpoints SET payload=CAST(substr(CAST(payload AS BLOB),1,8)||?3||substr(CAST(payload AS BLOB),41) AS BLOB) WHERE jail=?1 AND substr(CAST(payload AS BLOB),1,4)=CAST('F2NT' AS BLOB) AND substr(CAST(payload AS BLOB),9,32)=?2;", .counted = .none },
+            .{ .sql = "UPDATE checkpoints SET payload=CAST(substr(CAST(payload AS BLOB),1,6)||?3||substr(CAST(payload AS BLOB),39) AS BLOB) WHERE jail=?1 AND substr(CAST(payload AS BLOB),1,4)=CAST('F2JC' AS BLOB) AND substr(CAST(payload AS BLOB),7,32)=?2;", .counted = .none },
+            .{ .sql = "UPDATE source_maintenance SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .none },
+            .{ .sql = "UPDATE replay_guards SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .none },
+            .{ .sql = "UPDATE consumer_checkpoints SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .none },
+            .{ .sql = "UPDATE consumer_requirements SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .none },
+            .{ .sql = "UPDATE source_cursors SET cursor=CAST(substr(CAST(cursor AS BLOB),1,6)||?3||substr(CAST(cursor AS BLOB),39) AS BLOB) WHERE jail=?1 AND substr(CAST(cursor AS BLOB),1,4)=CAST('F2JC' AS BLOB) AND substr(CAST(cursor AS BLOB),7,32)=?2;", .counted = .cursors },
+        };
+
+        pub fn rekeyGenerationTablesTx(self: *Store, jail: []const u8, old: [32]u8, new: [32]u8, report: *RekeyReport) Error!void {
+            for (generation_statements) |entry| {
+                const rows = try self.rekeyRows(entry.sql, jail, old, new);
+                const total: *u32 = switch (entry.counted) {
+                    .retry => &report.retry_rows,
+                    .pending => &report.pending_receipts,
+                    .manifests => &report.manifests,
+                    .cursors => &report.cursors,
+                    .none => continue,
+                };
+                total.* = std.math.add(u32, total.*, rows) catch return error.StorageLimit;
+            }
+            report.guards = try self.restoreGuardKeys(jail, new);
+        }
+
+        fn restoreGuardKeys(self: *Store, jail: []const u8, generation: [32]u8) Error!u32 {
+            var guards = try self.statement("SELECT g.source,g.source_sequence,g.identity_key,r.occurrence,r.raw_hash,r.cursor,r.receipt_us,r.receipt_generation FROM replay_guards g JOIN source_maintenance m ON m.jail=g.jail AND m.source=g.source AND m.generation=g.generation JOIN records r ON r.jail=g.jail AND r.source=g.source AND r.source_generation=g.generation AND r.source_sequence=g.source_sequence WHERE g.jail=?1 AND g.generation=?2 AND g.source_sequence>m.sweep_sequence;");
+            defer guards.deinit();
+            try guards.text(1, jail);
+            try guards.blob(2, &generation);
+            var restored: u32 = 0;
+            while (try guards.row()) {
+                if (guards.store.api.column_type(guards.ptr, 3) != 3 or guards.store.api.column_type(guards.ptr, 5) != 4) return error.InvalidMaintenanceState;
+                if (try guards.optionalSigned(6) != null) {
+                    if (!std.mem.eql(u8, &try Store.effectBlob(&guards, 7, 32), &generation)) return error.InvalidMaintenanceState;
+                } else if (guards.store.api.column_type(guards.ptr, 7) != 5) return error.InvalidMaintenanceState;
+                const source = try guards.boundedBytes(0, Limits.source_bytes);
+                const sequence = try guards.signed(1);
+                const identity = store.ReceiptIdentity{ .jail = jail, .source = source, .generation = generation, .occurrence = try guards.boundedBytes(3, 16384), .raw_hash = try Store.effectBlob(&guards, 4, 32), .cursor = try guards.boundedBytes(5, Limits.cursor_bytes) };
+                try Store.validateReceiptIdentity(identity);
+                const identity_key = Store.identityGuardKey(identity);
+                if (std.mem.eql(u8, &try Store.effectBlob(&guards, 2, 32), &identity_key)) continue;
+                var update = try self.statement("UPDATE replay_guards SET identity_key=?5 WHERE jail=?1 AND source=?2 AND generation=?3 AND source_sequence=?4;");
+                defer update.deinit();
+                try update.text(1, jail);
+                try update.text(2, source);
+                try update.blob(3, &generation);
+                try update.int(4, sequence);
+                try update.blob(5, &identity_key);
+                try update.done();
+                if (self.api.changes(self.db) != 1) return error.InvalidMaintenanceState;
+                restored = std.math.add(u32, restored, 1) catch return error.StorageLimit;
+            }
+            return restored;
+        }
+
+        pub const GenerationRepair = struct { receipts: u32, retired: u32, cursors: u32, guards: u32 };
+
+        pub fn completeGenerationRekey(self: *Store, jail: []const u8) Error!GenerationRepair {
+            var repair = GenerationRepair{ .receipts = 0, .retired = 0, .cursors = 0, .guards = 0 };
+            if (jail.len == 0 or jail.len > 64 or std.mem.indexOfScalar(u8, jail, 0) != null) return error.InvalidRecord;
+            try self.beginAdmissionWrite();
+            errdefer self.rollback();
+            if (self.schema_version < 22) return error.AdminStorageRequired;
+            const prior_work = self.work_remaining;
+            if (self.runtime_limits) self.work_remaining = rekey_work_callbacks;
+            defer if (self.runtime_limits) {
+                self.work_remaining = prior_work;
+            };
+            const bound = (try self.readRetryPolicy(jail)) orelse {
+                try self.commitTransaction();
+                return repair;
+            };
+            {
+                var update = try self.statement("UPDATE records SET receipt_generation=?2 WHERE jail=?1 AND receipt_us IS NOT NULL AND (source_generation IS NULL OR source_generation=?2) AND receipt_generation IS NOT ?2;");
+                defer update.deinit();
+                try update.text(1, jail);
+                try update.blob(2, &bound.generation);
+                try update.done();
+                repair.receipts = std.math.cast(u32, self.api.changes(self.db)) orelse return error.StorageLimit;
+            }
+            {
+                var update = try self.statement("UPDATE retry_retired SET generation=?2 WHERE jail=?1 AND generation IS NOT ?2;");
+                defer update.deinit();
+                try update.text(1, jail);
+                try update.blob(2, &bound.generation);
+                try update.done();
+                repair.retired = std.math.cast(u32, self.api.changes(self.db)) orelse return error.StorageLimit;
+            }
+            {
+                var update = try self.statement("UPDATE source_cursors SET cursor=CAST(substr(CAST(cursor AS BLOB),1,6)||?2||substr(CAST(cursor AS BLOB),39) AS BLOB) WHERE jail=?1 AND substr(CAST(cursor AS BLOB),1,4)=CAST('F2JC' AS BLOB) AND substr(CAST(cursor AS BLOB),7,32) IS NOT ?2;");
+                defer update.deinit();
+                try update.text(1, jail);
+                try update.blob(2, &bound.generation);
+                try update.done();
+                repair.cursors = std.math.cast(u32, self.api.changes(self.db)) orelse return error.StorageLimit;
+            }
+            repair.guards = try self.restoreGuardKeys(jail, bound.generation);
+            try self.commitEffectTransaction(false);
+            return repair;
+        }
+
+        fn rekeyRows(self: *Store, sql: [:0]const u8, jail: []const u8, legacy: [32]u8, planned: [32]u8) Error!u32 {
+            var update = try self.statement(sql);
+            defer update.deinit();
+            try update.text(1, jail);
+            try update.blob(2, &legacy);
+            try update.blob(3, &planned);
+            try update.done();
+            return std.math.cast(u32, self.api.changes(self.db)) orelse error.StorageLimit;
+        }
+
+        fn rekeyOwnersTx(self: *Store, jail: []const u8, legacy: [32]u8, planned: [32]u8) Error!bool {
+            var held = std.ArrayListUnmanaged(OwnerHeld){};
+            defer held.deinit(self.allocator);
+            {
+                var owners = try self.statement("SELECT o.scope_key,o.revision,n.canonical_scope,o.lease_kind,o.deadline_us,EXISTS(SELECT 1 FROM effect_owner_revisions h WHERE h.scope_key=o.scope_key AND h.jail=o.jail AND h.revision=o.revision AND h.generation=o.generation AND h.decision_id=o.decision_id AND h.lease_kind=o.lease_kind AND h.deadline_us IS o.deadline_us AND h.decided_us=o.decided_us) FROM effect_owners o JOIN native_effects n USING(scope_key) WHERE o.jail=?1 AND o.generation=?2 ORDER BY o.scope_key;");
+                defer owners.deinit();
+                try owners.text(1, jail);
+                try owners.blob(2, &legacy);
+                while (try owners.row()) {
+                    if (held.items.len == effects.max_effects) return error.EffectCapacity;
+                    const owner_revision = try owners.signed(1);
+                    if (owner_revision <= 0 or owner_revision >= std.math.maxInt(i64) or try owners.signed(5) != 1) return error.InvalidEffect;
+                    const lease = try Store.effectLease(&owners, 3, 4);
+                    try held.append(self.allocator, .{ .key = try Store.effectBlob(&owners, 0, 32), .revision = @intCast(owner_revision), .scope = try Store.effectBlob(&owners, 2, canonical_scope.encoded_bytes), .absent = lease == .absent });
+                }
+            }
+            if (held.items.len == 0) return false;
+            const clock = effects.Clock{ .prepared_us = 0 };
+            const now = try self.effectClock(clock);
+            const count: i64 = @intCast(held.items.len);
+            var live_count: i64 = 0;
+            for (held.items) |owner| if (!owner.absent) {
+                live_count += 1;
+            };
+            try self.reserveEffectRows(.{ .revisions = count, .intents = live_count, .observations = live_count * store.load_repair.observations_per_intent });
+            if (try self.integer("SELECT count(*) FROM effect_owner_revisions;") + count > effects.max_owner_revisions) return error.EffectCapacity;
+            for (held.items) |owner| {
+                const scope = canonical_scope.Scope.decode(&owner.scope) catch return error.InvalidEffect;
+                if (owner.absent) {
+                    const installation = try self.readInstallation() orelse return error.InstallationRequired;
+                    const exact = try effects.Scope.exact(scope);
+                    if (!std.mem.eql(u8, &owner.key, &try exact.key(installation))) return error.InvalidEffect;
+                    var update = try self.statement("UPDATE effect_owners SET generation=?4,revision=?5 WHERE scope_key=?1 AND jail=?2 AND revision=?3 AND generation=?6 AND lease_kind=0 AND deadline_us IS NULL;");
+                    defer update.deinit();
+                    try update.blob(1, &owner.key);
+                    try update.text(2, jail);
+                    try update.int(3, @intCast(owner.revision));
+                    try update.blob(4, &planned);
+                    try update.int(5, @intCast(owner.revision + 1));
+                    try update.blob(6, &legacy);
+                    try update.done();
+                    if (self.api.changes(self.db) != 1) return error.StaleEffect;
+                    try self.advanceEffectSnapshot();
+                    continue;
+                }
+                const transition_id = effects.hashParts("fail2zig-generation-rekey-v1", &.{ &planned, &owner.key });
+                _ = try self.transitionOwnerReservedTx(.{ .scope = scope, .jail = jail, .current_generation = legacy, .next_generation = planned, .expected_owner_revision = owner.revision, .transition_id = transition_id, .mode = .retain, .occurred_us = now }, now, false);
+            }
+            _ = try self.commitEffectClock(clock);
+            return true;
         }
 
         pub fn retryPolicySummaryPage(self: *Store, query: application_history.PolicyQuery, output: []application_history.PolicySummary) Error!application_history.PolicyPage {

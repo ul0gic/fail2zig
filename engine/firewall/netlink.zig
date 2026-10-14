@@ -131,6 +131,7 @@ pub const Dump = struct {
     message_type: u16,
     port_id: u32,
     complete: bool = false,
+    generation: ?u16 = null,
     count: usize = 0,
     max_messages: usize = 65_536,
 
@@ -160,6 +161,14 @@ pub const Dump = struct {
             return null;
         }
         if (kind != self.message_type or (item.hdr.flags & 2) == 0) return error.NetlinkError;
+        if (item.payload.len < @sizeOf(nfgenmsg)) return error.TruncatedMessage;
+        // nfgenmsg.res_id, big-endian at payload bytes 2..4, is the base sequence; Linux 6.12 never sets NLM_F_DUMP_INTR on set-element dumps.
+        const generation = mem.readInt(u16, item.payload[2..4], .big);
+        if (self.generation) |first| {
+            if (first != generation) return error.DumpInterrupted;
+        } else {
+            self.generation = generation;
+        }
         return item.payload;
     }
 };

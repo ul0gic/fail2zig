@@ -438,12 +438,7 @@ test "native effect runtime: isolated stop restores durable intent and repair ep
         try t.expectEqual(action_outcome.Status.failed, outcomes[1].status);
         const epoch = manager.repairEpoch();
         manager.inspector.test_fault_after_mutations = 1;
-        try expectFatal(error.EffectBackendUncertain, manager.stopStep(epoch, .healthy));
-        const diagnostic = manager.status.diagnostic.?;
-        try t.expectEqual(manager.inspector.installation.transport, diagnostic.backend);
-        try t.expectEqual(inspection.OperationStage.effect_dispatch, diagnostic.stage);
-        try t.expectEqual(error.Timeout, diagnostic.cause);
-        try t.expectEqual(inspection.MutationDisposition.outcome_uncertain, diagnostic.mutation);
+        try t.expect(try stopOk(manager, epoch) == .wait);
         var retained: [1]effect.Entry = undefined;
         const retained_page = try fixture.store.effectPage(null, null, &retained);
         try t.expectEqual(@as(usize, 1), retained_page.count);
@@ -917,4 +912,43 @@ fn driftRemoveAll(fixture: *Fixture) !void {
     } else return error.RecoveryDidNotFinish;
     const epoch = stop_all.repairEpoch();
     while (try stopOk(stop_all, epoch) != .idle) {}
+}
+
+const ExpiryClock = struct {
+    survey_us: i64,
+    later_offset_us: i64,
+    reads: usize = 0,
+    fn read(context: ?*anyopaque) i64 {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        defer self.reads += 1;
+        return if (self.reads == 0) self.survey_us else std.time.microTimestamp() + self.later_offset_us;
+    }
+};
+
+test "native effect runtime: isolated owner expiring between survey and dispatch is routed to expiry, not refused" {
+    var fixture = try Fixture.init(try isolatedBackend());
+    defer fixture.deinit();
+    const deadline = std.time.microTimestamp() + 10_000_000;
+    _ = try fixture.owner("fixture", 1, .{ .finite = deadline });
+    const manager = try fixture.manager();
+    defer manager.destroy();
+    try ready(manager);
+    try t.expect(std.time.microTimestamp() < deadline - 2_000_000);
+    try t.expectEqual(@as(u64, 1), try fixture.store.confirmedEffectEvents());
+    manager.cursor = manager.count;
+    try driftRemove(manager);
+    var clock = ExpiryClock{ .survey_us = deadline - 1_000_000, .later_offset_us = 12_000_000 };
+    manager.wall_context = &clock;
+    manager.wall = ExpiryClock.read;
+    try t.expect(try stepOk(manager) == .progress);
+    try t.expect(!manager.status.uncertain);
+    try t.expect(manager.status.diagnostic == null);
+    for (0..1024) |_| {
+        if (try stepOk(manager) == .idle) break;
+    } else return error.RecoveryDidNotFinish;
+    try t.expect(!manager.confirmedSubject(subject, deadline + 1_000_000));
+    for (manager.live[0..manager.count]) |entry| try t.expect(!std.meta.eql(entry.scope, try effect.Scope.host(subject)) or entry.status != .applied);
+    try ready(manager);
+    try t.expect(manager.status.diagnostic == null);
+    try t.expectEqual(@as(u64, 1), try fixture.store.confirmedEffectEvents());
 }

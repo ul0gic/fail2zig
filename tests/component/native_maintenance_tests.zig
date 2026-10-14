@@ -964,14 +964,34 @@ test "native maintenance: held preparation pending action and stale fences block
     fence.consumer_revision += 1;
     try t.expectError(error.StaleMaintenance, f.store.cleanupAdvance(fence, state, 1));
     fence = try cleanupFence(&f.store, identity, &now);
-    try sql(&f.store, "INSERT INTO action_intents(jail,source,occurrence,payload) VALUES('receipt','file','original',X'00');");
-    try t.expectEqual(@as(?durable.Store.CleanupToken, null), try f.store.cleanupAdvance(fence, state, 1));
-    try sql(&f.store, "DELETE FROM action_intents;");
     next.occurrence = "pending";
     _ = try f.store.beginReceipt(next, .{ .us = 100 }, 2);
     try t.expectError(error.MaintenancePinned, f.store.cleanupAdvance(fence, state, 1));
     _ = try f.store.commitRecord(recordFor(next, 2));
     try t.expectError(error.StaleMaintenance, f.store.cleanupAdvance(fence, state, 1));
+    var anchor = identity;
+    anchor.occurrence = "anchor";
+    anchor.cursor = "anchor";
+    fence = try cleanupFence(&f.store, identity, &now);
+    try sql(&f.store, "INSERT INTO action_intents(jail,source,occurrence,payload) VALUES('receipt','file','original',X'00');");
+    const marked = (try f.store.cleanupAdvance(fence, (try f.store.sourceMaintenance(identity.jail, identity.source, generation)).?, 2)).?;
+    try t.expectEqual(@as(u64, 3), marked.state.reject_below_sequence);
+    _ = try validateCleanup(&f.store);
+    const progress = try f.store.cleanupDelete(fence, marked);
+    try t.expect(!progress.more);
+    try t.expectEqual(@as(u64, 2), progress.state.sweep_sequence);
+    try t.expectEqual(@as(?durable.Store.RecordSequence, null), try f.store.recordSequence(identity.jail, identity.source, identity.occurrence));
+    try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM records WHERE occurrence='original';"));
+    try t.expectError(error.PrunedReplay, f.store.committedReceipt(identity));
+    try t.expectError(error.PrunedReplay, f.store.committedReceipt(anchor));
+    _ = try validateCleanup(&f.store);
+    try t.expectEqual(@as(?durable.Store.CleanupToken, null), try f.store.cleanupAdvance(fence, (try f.store.sourceMaintenance(identity.jail, identity.source, generation)).?, 2));
+    try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM records WHERE occurrence='original';"));
+    try sql(&f.store, "DELETE FROM action_intents;");
+    try t.expectEqual(@as(?durable.Store.CleanupToken, null), try f.store.cleanupAdvance(fence, (try f.store.sourceMaintenance(identity.jail, identity.source, generation)).?, 2));
+    try t.expectError(error.PrunedReplay, f.store.committedReceipt(identity));
+    try t.expectEqual(@as(i64, 0), try f.store.inspectInteger("SELECT count(*) FROM records WHERE occurrence='original';"));
+    _ = try validateCleanup(&f.store);
 }
 
 test "native maintenance: retired retries preserve counters and original clocks on reactivation" {
@@ -1073,12 +1093,26 @@ test "native maintenance: inclusive retry window pins detail and retirement unti
     const candidate = (try f.store.retryRetirementCandidate(identity.jail, null)).?;
     var fence = try cleanupFence(&f.store, identity, &now);
     const head = (try f.store.sourceMaintenance(identity.jail, identity.source, generation)).?;
-    try t.expectEqual(@as(?durable.Store.CleanupToken, null), try f.store.cleanupAdvance(fence, head, 1));
+    const marked = (try f.store.cleanupAdvance(fence, head, 1)).?;
+    try t.expectEqual(@as(u64, 2), marked.state.reject_below_sequence);
+    _ = try validateCleanup(&f.store);
+    try t.expect(!try f.store.retireRetrySubject(fence, candidate));
+    const detached = try f.store.cleanupDelete(fence, marked);
+    try t.expect(!detached.more);
+    try t.expectEqual(@as(u64, 1), detached.state.sweep_sequence);
+    try t.expectEqual(@as(?durable.Store.RecordSequence, null), try f.store.recordSequence(identity.jail, identity.source, identity.occurrence));
+    try t.expect((try f.store.nativeDetection(identity.jail, identity.source, identity.occurrence)) != null);
+    try t.expectError(error.PrunedReplay, f.store.committedReceipt(identity));
+    _ = try validateCleanup(&f.store);
     try t.expect(!try f.store.retireRetrySubject(fence, candidate));
     now.now = 201;
     fence = try cleanupFence(&f.store, identity, &now);
-    _ = (try f.store.cleanupAdvance(fence, head, 1)).?;
     try t.expect(try f.store.retireRetrySubject(fence, candidate));
+    fence = try cleanupFence(&f.store, identity, &now);
+    try t.expectEqual(@as(?durable.Store.CleanupToken, null), try f.store.cleanupAdvance(fence, (try f.store.sourceMaintenance(identity.jail, identity.source, generation)).?, 1));
+    try t.expectEqual(@as(?native_detection.Outcome, null), try f.store.nativeDetection(identity.jail, identity.source, identity.occurrence));
+    try t.expectError(error.PrunedReplay, f.store.committedReceipt(identity));
+    _ = try validateCleanup(&f.store);
     var reversed = identity;
     reversed.occurrence = "reversed-processing";
     reversed.cursor = "later-position";
@@ -1115,9 +1149,21 @@ test "native maintenance: live physical effect and missing caught-up history pin
     try t.expectError(error.HistoryGap, f.store.cleanupAdvance(fence, head, 1));
     var events: [1]history.Event = undefined;
     fence.history = (try f.store.confirmedEffectPage(installation, 0, null, &events)).token;
-    try t.expectEqual(@as(?durable.Store.CleanupToken, null), try f.store.cleanupAdvance(fence, head, 1));
+    const marked = (try f.store.cleanupAdvance(fence, head, 1)).?;
+    try t.expectEqual(@as(u64, 2), marked.state.reject_below_sequence);
+    _ = try validateCleanup(&f.store);
+    const detached = try f.store.cleanupDelete(fence, marked);
+    try t.expect(!detached.more);
+    try t.expectEqual(@as(u64, 1), detached.state.sweep_sequence);
+    try t.expectEqual(@as(?durable.Store.RecordSequence, null), try f.store.recordSequence(identity.jail, identity.source, identity.occurrence));
+    try t.expect((try f.store.nativeDetection(identity.jail, identity.source, identity.occurrence)) != null);
+    try t.expectError(error.PrunedReplay, f.store.committedReceipt(identity));
+    _ = try validateCleanup(&f.store);
     try t.expect(!try f.store.retireRetrySubject(fence, (try f.store.retryRetirementCandidate(identity.jail, null)).?));
     try t.expectEqual(@as(u64, 0), try f.store.confirmedEffectEvents());
+    try t.expectEqual(@as(?durable.Store.CleanupToken, null), try f.store.cleanupAdvance(fence, (try f.store.sourceMaintenance(identity.jail, identity.source, generation)).?, 1));
+    try t.expect((try f.store.nativeDetection(identity.jail, identity.source, identity.occurrence)) != null);
+    _ = try validateCleanup(&f.store);
 }
 
 test "native maintenance: required source checkpoint is rechecked before mark and deletion" {
@@ -1402,4 +1448,142 @@ test "native maintenance: real SQLite page ceiling rolls back the entire guard p
     try t.expectEqual(@as(u8, 64), deleted.deleted_rows);
     try t.expect(!deleted.more);
     _ = try validateCleanup(&f.store);
+}
+
+fn heldRecordScenario(lease: native_retry.Duration, deleted_after_release: bool, exhausted_first: bool) !void {
+    const filler: u64 = if (exhausted_first) 400 else 0;
+    var f = try Fixture.init();
+    defer f.deinit();
+    try setupCleanup(&f);
+    if (exhausted_first) try f.store.configureRuntimeLimits();
+    try upgradeCleanupToLatest(&f);
+    const installation = try effect.Installation.init([_]u8{6} ** 16, .nftables, "cleanup-held-fixture");
+    try f.store.admitInstallation(installation, .{ .selector = installation.selector(), .disposition = .verified_absent });
+    var now = CleanupClock{ .now = 100 };
+    var history_owner = try history.Consumer.init(installation, effect.hashParts("fail2zig-native-confirmed-history-v1", &.{}));
+    const initial_history = try history_owner.prepareInitial();
+    try f.store.bootstrapConfirmedHistory(history_owner.manifest(), try initial_history.batch(now.value()), installation);
+    initial_history.publish();
+    initial_history.release();
+
+    const policy = native_retry.Policy{ .maxretry = 1, .window_us = 1_000, .duration = lease, .max_subjects = 8, .enforce = true };
+    try f.store.admitRetry(identity.jail, generation, policy);
+    const subject = native_detection.Subject{ .v4 = .{ 192, 0, 2, 91 } };
+    for (0..filler) |i| {
+        var id = identity;
+        id.source = "filler";
+        var occurrence: [16]u8 = undefined;
+        id.occurrence = try std.fmt.bufPrint(&occurrence, "filler-{d}", .{i});
+        id.cursor = id.occurrence;
+        try commitObservedRetryAt(&f.store, id, i, now.now, policy);
+    }
+    const names = [_][]const u8{ "first", "held", "third", "fourth", "fifth", "sixth", "seventh", "anchor" };
+    var ids: [names.len]durable.ReceiptIdentity = undefined;
+    for (&ids, names, 0..) |*id, name, i| {
+        id.* = identity;
+        id.occurrence = name;
+        id.cursor = name;
+        if (i == 1) {
+            try t.expectEqual(durable.CommitResult.committed, try f.store.commitRecord(try escalatedRecord(&f.store, &now, id.*, filler + i, subject, policy)));
+        } else {
+            try commitObservedRetryAt(&f.store, id.*, filler + i, now.now, policy);
+        }
+    }
+    var effect_rows: [effect.max_page]effect.Entry = undefined;
+    var effect_page = try f.store.effectPage(null, null, &effect_rows);
+    try t.expectEqual(@as(usize, 1), effect_page.count);
+    const applied = effect_rows[0];
+    try t.expectEqual(effect.Settlement.verified, try f.store.settleOutcome(applied.token(), now.now, effectObservation(applied, now.now), now.value()));
+    var events: [history.max_page]history.Event = undefined;
+    const history_page = try f.store.confirmedEffectPage(installation, 0, null, &events);
+    try t.expectEqual(@as(usize, 1), history_page.count);
+    const staged_history = try history_owner.prepare(history_page, events[0..history_page.count], now.now);
+    try f.store.commitConfirmedHistory(history_owner.manifest(), try staged_history.batch(now.value()), history_page.token);
+    staged_history.publish();
+    staged_history.release();
+    var caught_up = try f.store.confirmedEffectPage(installation, history_page.token.last_sequence, null, &events);
+    try t.expectEqual(@as(usize, 0), caught_up.count);
+
+    var fence = try cleanupFence(&f.store, identity, &now);
+    fence.history = caught_up.token;
+    const marked = (try f.store.cleanupAdvance(fence, (try f.store.sourceMaintenance(identity.jail, identity.source, generation)).?, 8)).?;
+    try t.expectEqual(@as(u64, 8), marked.state.reject_below_sequence);
+    _ = try validateCleanup(&f.store);
+    var progress = try f.store.cleanupDelete(fence, marked);
+    while (progress.more) {
+        const resumed = (try f.store.cleanupResume(identity.jail, identity.source, generation)).?;
+        fence = try cleanupFence(&f.store, identity, &now);
+        fence.history = caught_up.token;
+        progress = try f.store.cleanupDelete(fence, resumed);
+    }
+    try t.expectEqual(@as(u64, 7), progress.state.sweep_sequence);
+    for (ids, 0..) |id, i| if (i != 1 and i != 7) {
+        try t.expectError(error.PrunedReplay, f.store.committedReceipt(id));
+        try t.expectEqual(@as(?native_detection.Outcome, null), try f.store.nativeDetection(id.jail, id.source, id.occurrence));
+    };
+    try t.expectEqual(@as(i64, 2), try f.store.inspectInteger("SELECT count(*) FROM records WHERE source='file';"));
+    const held = ids[1];
+    try t.expect((try f.store.nativeDetection(held.jail, held.source, held.occurrence)) != null);
+    try t.expectEqual(@as(?durable.Store.RecordSequence, null), try f.store.recordSequence(held.jail, held.source, held.occurrence));
+    try t.expectError(error.PrunedReplay, f.store.committedReceipt(held));
+    try t.expect((try f.store.nativeDetection(held.jail, held.source, held.occurrence)) != null);
+    try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM retry_decisions WHERE occurrence='held';"));
+    try t.expect(try f.store.hasRecord(ids[7].jail, ids[7].source, ids[7].occurrence, ids[7].raw_hash, ids[7].cursor));
+    _ = try validateCleanup(&f.store);
+
+    fence = try cleanupFence(&f.store, identity, &now);
+    fence.history = caught_up.token;
+    try t.expectEqual(@as(?durable.Store.CleanupToken, null), try f.store.cleanupAdvance(fence, (try f.store.sourceMaintenance(identity.jail, identity.source, generation)).?, 8));
+    try t.expect((try f.store.nativeDetection(held.jail, held.source, held.occurrence)) != null);
+    try t.expectError(error.PrunedReplay, f.store.committedReceipt(held));
+    _ = try validateCleanup(&f.store);
+
+    now.now = 10_000;
+    effect_page = try f.store.effectPage(null, null, &effect_rows);
+    try t.expectEqual(@as(usize, 1), effect_page.count);
+    const removing = try f.store.setOwner(.{ .scope = try effect.Scope.host(subject), .jail = identity.jail, .generation = generation, .decision_id = [_]u8{9} ** 32, .expected_revision = effect_rows[0].revision, .lease = .absent, .decided_us = now.now }, now.value());
+    try t.expectEqual(effect.Lease.absent, removing.desired);
+    try t.expectEqual(effect.Settlement.verified, try f.store.settleOutcome(removing.token(), now.now, effectObservation(removing, now.now), now.value()));
+    caught_up = try f.store.confirmedEffectPage(installation, history_page.token.last_sequence, null, &events);
+    try t.expectEqual(@as(usize, 0), caught_up.count);
+
+    fence = try cleanupFence(&f.store, identity, &now);
+    fence.history = caught_up.token;
+    if (exhausted_first) {
+        f.store.test_hooks.held_pass_work = 0;
+        try t.expectEqual(@as(?durable.Store.CleanupToken, null), try f.store.cleanupAdvance(fence, (try f.store.sourceMaintenance(identity.jail, identity.source, generation)).?, 8));
+        f.store.test_hooks.held_pass_work = null;
+        try t.expectEqual(@as(usize, 4096), f.store.held_window);
+        try t.expect((try f.store.nativeDetection(held.jail, held.source, held.occurrence)) != null);
+        try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM records WHERE occurrence='held';"));
+        try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM retry_decisions;"));
+        try t.expectEqual(@as(i64, 0), try f.store.inspectInteger("SELECT count(*) FROM pragma_foreign_key_check;"));
+        _ = try validateCleanup(&f.store);
+    }
+    try t.expectEqual(@as(?durable.Store.CleanupToken, null), try f.store.cleanupAdvance(fence, (try f.store.sourceMaintenance(identity.jail, identity.source, generation)).?, 8));
+    try t.expectError(error.PrunedReplay, f.store.committedReceipt(held));
+    try t.expect(try f.store.hasRecord(ids[7].jail, ids[7].source, ids[7].occurrence, ids[7].raw_hash, ids[7].cursor));
+    if (exhausted_first) try t.expectEqual(@as(usize, 8192), f.store.held_window);
+    const remaining: i64 = if (deleted_after_release) 0 else 1;
+    try t.expectEqual(deleted_after_release, (try f.store.nativeDetection(held.jail, held.source, held.occurrence)) == null);
+    try t.expectEqual(remaining, try f.store.inspectInteger("SELECT count(*) FROM records WHERE occurrence='held';"));
+    try t.expectEqual(remaining, try f.store.inspectInteger("SELECT count(*) FROM retry_decisions;"));
+    try t.expectEqual(@as(i64, 0), try f.store.inspectInteger("SELECT count(*) FROM pragma_foreign_key_check;"));
+    _ = try validateCleanup(&f.store);
+    try reopen(&f);
+    try t.expectError(error.PrunedReplay, f.store.committedReceipt(held));
+    try t.expectEqual(deleted_after_release, (try f.store.nativeDetection(held.jail, held.source, held.occurrence)) == null);
+    _ = try validateCleanup(&f.store);
+}
+
+test "native maintenance: held record is detached and deleted once released" {
+    try heldRecordScenario(.{ .finite_us = 5_000 }, true, false);
+}
+
+test "native maintenance: permanent lease keeps a detached record" {
+    try heldRecordScenario(.permanent, false, false);
+}
+
+test "native maintenance: held pass yields on an exhausted work budget" {
+    try heldRecordScenario(.{ .finite_us = 5_000 }, true, true);
 }

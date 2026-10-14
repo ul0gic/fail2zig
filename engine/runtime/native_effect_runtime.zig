@@ -156,6 +156,7 @@ pub const Manager = struct {
     admitted: bool = false,
     repair_epoch: u64 = 1,
     stop_cursor: usize = 0,
+    stop_retries: u8 = 0,
     stopping: bool = false,
     observation_cache: ?*observation.Cache = null,
     readback_failures: u8 = 0,
@@ -286,6 +287,7 @@ pub const Manager = struct {
         self.status.ready = false;
         self.repair_epoch +|= 1;
         self.stop_cursor = 0;
+        self.stop_retries = 0;
         self.stopping = false;
     }
     pub fn beginRepair(self: *Manager, expected_epoch: u64) !u64 {
@@ -313,10 +315,13 @@ pub const Manager = struct {
     pub fn confirmedSubject(self: *const Manager, subject: @import("../core/native_detection_record.zig").Subject, now_us: i64) bool {
         if (self.status.uncertain and !(self.status.cause != null and transientCause(self.status.cause.?))) return false;
         const scope = effect.Scope.host(subject) catch return false;
-        for (self.live[0..self.count], 0..) |entry, index| if (std.meta.eql(entry.scope, scope)) {
-            return entry.status == .applied and entry.desired.live(now_us) and (self.confirmed[index] or self.status.ready);
-        };
-        return false;
+        const key = scope.key(self.installation) catch return false;
+        const index = self.findLive(key) orelse return false;
+        return self.live[index].status == .applied and self.live[index].desired.live(now_us) and (self.confirmed[index] or self.status.ready);
+    }
+    pub fn confirmedKey(self: *const Manager, key: [32]u8, now_us: i64) bool {
+        const index = self.findLive(key) orelse return false;
+        return self.live[index].status == .applied and self.live[index].desired.live(now_us) and (self.confirmed[index] or self.status.ready);
     }
     fn recordFirewallFailure(self: *Manager, context: firewall.FailureContext) void {
         self.status.cause = context.cause;
@@ -1070,6 +1075,7 @@ pub const Manager = struct {
             if (entry.status != .pending) return .progress;
         }
         const dispatch_clock = try self.clock();
+        if (entry.desired == .finite and !entry.desired.live(dispatch_clock.prepared_us)) return .progress;
         const sent_ns = self.monotonic(self.monotonic_context);
         const prior_mutation_ns = self.last_mutation_ns;
         const prior_mutation_wall_us = self.last_mutation_wall_us;
@@ -1082,6 +1088,12 @@ pub const Manager = struct {
             self.inspector.applyFromBaseline(target, clock_sample, &self.inventory.?.snapshot)
         else
             self.inspector.applyExact(target, clock_sample)) catch |failure| {
+            if (failure == error.ExpiredIntent) {
+                self.markers[index] = null;
+                self.last_mutation_ns = prior_mutation_ns;
+                self.last_mutation_wall_us = prior_mutation_wall_us;
+                return .progress;
+            }
             self.recordFirewallDirect(.effect_dispatch, failure);
             if (!transientReadback(failure)) return error.EffectBackendUncertain;
             self.markers[index] = null;
@@ -1091,6 +1103,12 @@ pub const Manager = struct {
         };
         switch (result) {
             .uncertain => |failure| {
+                if (failure.cause == error.ExpiredIntent and failure.mutation == .not_started) {
+                    self.markers[index] = null;
+                    self.last_mutation_ns = prior_mutation_ns;
+                    self.last_mutation_wall_us = prior_mutation_wall_us;
+                    return .progress;
+                }
                 self.recordFirewallFailure(failure);
                 if (failure.mutation == .not_started) {
                     self.markers[index] = null;
@@ -1194,21 +1212,28 @@ pub const Manager = struct {
     /// decides the phase; the parameter makes dispatch through an unhealthy gate
     /// impossible by construction.
     pub const StorageGate = enum { healthy, unhealthy };
-    /// Withdraws one realized entry per call. It dispatches only removals and writes
-    /// no storage. An unhealthy gate means durable intent may be unreadable or
-    /// unconfirmed, so it refuses before any dispatch; use `residualInstalled` then.
+    /// Withdraws one batch of realized entries per call, dispatching only removals and writing no storage.
+    /// An unhealthy gate refuses before any dispatch; use `residualInstalled` then.
     pub fn stopStep(self: *Manager, expected_repair_epoch: u64, gate: StorageGate) Step {
         return self.stopStepInner(expected_repair_epoch, gate) catch |failure| .{ .fatal = failure };
+    }
+    const max_stop_retries: u8 = 32;
+    fn stopFailure(self: *Manager, cause: anyerror, fatal: anyerror) !Step {
+        if (!transientCause(cause) or self.stop_retries >= max_stop_retries) return fatal;
+        self.stop_retries += 1;
+        self.dropInventory();
+        return .{ .wait = self.waitDue(null) };
     }
     fn stopStepInner(self: *Manager, expected_repair_epoch: u64, gate: StorageGate) !Step {
         if (gate != .healthy) return error.StorageUnhealthy;
         if (expected_repair_epoch == 0 or expected_repair_epoch != self.repair_epoch) return error.StaleRepairEpoch;
         if (self.store.reopen_required) return error.ReopenRequired;
-        self.dropInventory();
         if (!self.stopping) {
             if (!self.admitted or !self.status.ready or self.cached_epoch == null or self.cached_epoch.? != self.store.effect_publication_epoch) return error.EffectReconciliationRequired;
+            self.dropInventory();
             self.stopping = true;
             self.stop_cursor = 0;
+            self.stop_retries = 0;
             self.status.ready = false;
         }
         errdefer |failure| {
@@ -1217,29 +1242,59 @@ pub const Manager = struct {
         }
         const sampled = try self.clock();
         while (self.stop_cursor < self.count) {
-            const entry = self.live[self.stop_cursor];
-            if (entry.desired == .absent) {
-                self.stop_cursor += 1;
+            var tokens: [firewall.max_withdraw_messages]firewall.DispatchToken = undefined;
+            var batched: usize = 0;
+            var budget: usize = 0;
+            var next = self.stop_cursor;
+            while (next < self.count and batched < tokens.len) : (next += 1) {
+                const entry = self.live[next];
+                if (entry.desired == .absent) continue;
+                const cost = try firewall.withdrawCost(entry.scope.canonical);
+                if (batched != 0 and budget + cost > firewall.max_withdraw_messages) break;
+                tokens[batched] = self.token(entry, .absent);
+                batched += 1;
+                budget += cost;
+            }
+            if (batched == 0) {
+                self.stop_cursor = next;
                 continue;
             }
-            var result = self.inspector.applyExact(self.token(entry, .absent), .{ .wall_us = sampled.prepared_us }) catch |failure| {
+            if (self.inventory == null) {
+                const start_ns = self.monotonic(self.monotonic_context);
+                var snapshot = self.inspector.inspect() catch |failure| {
+                    self.recordFirewallDirect(.readback, failure);
+                    return self.stopFailure(failure, failure);
+                };
+                {
+                    errdefer snapshot.deinit();
+                    try self.validateAndCaptureObservation(&snapshot, .stop, sampled.prepared_us, .readback);
+                }
+                self.keepInventory(snapshot, sampled.prepared_us, (try self.clock()).prepared_us, start_ns);
+            }
+            const result = self.inspector.withdrawBatch(tokens[0..batched], .{ .wall_us = sampled.prepared_us }, &self.inventory.?.snapshot) catch |failure| {
                 self.recordFirewallDirect(.effect_dispatch, failure);
-                return propagateFirewall(Step, failure);
+                return self.stopFailure(failure, failure);
             };
-            defer result.deinit();
             switch (result) {
                 .uncertain => |failure| {
                     self.recordFirewallFailure(failure);
-                    return error.EffectBackendUncertain;
+                    return self.stopFailure(failure.cause, error.EffectBackendUncertain);
                 },
-                .verified => |*observed| try self.validateAndCaptureObservation(&observed.snapshot, .stop, observed.observed_wall_us, .effect_verify),
+                .verified => |verified| {
+                    var snapshot = verified.snapshot;
+                    {
+                        errdefer snapshot.deinit();
+                        try self.validateAndCaptureObservation(&snapshot, .stop, verified.observed_wall_us, .effect_verify);
+                    }
+                    self.keepInventory(snapshot, verified.observed_start_wall_us, verified.observed_wall_us, self.monotonic(self.monotonic_context));
+                },
             }
-            self.stop_cursor += 1;
+            self.stop_cursor = next;
             return .progress;
         }
         var final = self.inspector.inspect() catch |failure| {
             self.recordFirewallDirect(.readback, failure);
-            return propagateFirewall(Step, failure);
+            return self.stopFailure(failure, failure);
         };
         defer final.deinit();
         try self.validateAndCaptureObservation(&final, .stop, sampled.prepared_us, .readback);
@@ -1247,8 +1302,10 @@ pub const Manager = struct {
             self.recordObservationFailure(.readback, error.UnownedInstalledEffect);
             return error.UnownedInstalledEffect;
         }
+        self.dropInventory();
         self.stopping = false;
         self.stop_cursor = 0;
+        self.stop_retries = 0;
         self.admitted = false;
         self.cached_epoch = null;
         self.count = 0;

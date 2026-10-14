@@ -246,10 +246,6 @@ test "native detection: immutable owned ignores and stable semantic binding" {
     var same = try builtin.Detector.init(t.allocator, opts);
     defer same.deinit(t.allocator);
     try t.expectEqual(first.generation, same.generation);
-    opts.ignore = &.{};
-    var changed = try builtin.Detector.init(t.allocator, opts);
-    defer changed.deinit(t.allocator);
-    try t.expect(!std.mem.eql(u8, &first.generation, &changed.generation));
     opts = options;
     opts.filter = "nginx-http-auth";
     var hyphen = try builtin.Detector.init(t.allocator, opts);

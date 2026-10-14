@@ -89,6 +89,39 @@ pub const StatusPayload = struct {
     expiry_overdue: ?bool = null,
     expiry_uncertain: ?bool = null,
     next_committed_expiry_us: ?i64 = null,
+    paused_sources: ?u32 = null,
+    sources: ?[]const SourceEntry = null,
+};
+
+pub const LossEvent = struct {
+    sequence: ?u64 = null,
+    jail: ?[]const u8 = null,
+    path: ?[]const u8 = null,
+    wall_us: ?i64 = null,
+    reason: ?[]const u8 = null,
+    inode: ?u64 = null,
+    committed_offset: ?u64 = null,
+    observed_size: ?u64 = null,
+};
+
+pub const SourceEntry = struct {
+    jail: ?[]const u8 = null,
+    kind: ?[]const u8 = null,
+    path: ?[]const u8 = null,
+    on_truncation: ?[]const u8 = null,
+    state: ?[]const u8 = null,
+    cause: ?[]const u8 = null,
+    inode: ?u64 = null,
+    committed_offset: ?u64 = null,
+    observed_size: ?u64 = null,
+    repair: ?[]const u8 = null,
+    loss_events: ?u32 = null,
+    last_loss: ?LossEvent = null,
+};
+
+pub const LossReport = union(enum) {
+    events: []const LossEvent,
+    unavailable: []const u8,
 };
 
 pub const BanEntry = struct {
@@ -121,6 +154,7 @@ pub const JailEntry = struct {
     source_exit_code: ?u8 = null,
     source_signal: ?u32 = null,
     source_stderr_present: ?bool = null,
+    source_paused: ?bool = null,
 };
 
 pub const StatsPayload = struct {
@@ -187,15 +221,19 @@ pub fn formatStatus(
     fmt: OutputFormat,
     color: Color,
 ) !void {
-    try formatStatusWithDetails(allocator, writer, payload_json, fmt, color, false);
+    try formatStatusWithDetails(allocator, writer, payload_json, fmt, color, false, null);
 }
 
 pub fn formatStatusDetailed(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color) !void {
-    try formatStatusWithDetails(allocator, writer, payload_json, fmt, color, true);
+    try formatStatusWithDetails(allocator, writer, payload_json, fmt, color, true, null);
 }
 
-fn formatStatusWithDetails(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color, details: bool) !void {
-    try formatStatusForWidthDetailed(allocator, writer, payload_json, fmt, color, terminalColumns(), details);
+pub fn formatStatusWithLoss(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color, loss: LossReport) !void {
+    try formatStatusWithDetails(allocator, writer, payload_json, fmt, color, true, loss);
+}
+
+fn formatStatusWithDetails(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color, details: bool, loss: ?LossReport) !void {
+    try formatStatusReport(allocator, writer, payload_json, fmt, color, terminalColumns(), details, loss);
 }
 
 fn formatStatusForWidth(
@@ -218,8 +256,22 @@ fn formatStatusForWidthDetailed(
     columns: usize,
     details: bool,
 ) !void {
+    return formatStatusReport(allocator, writer, payload_json, fmt, color, columns, details, null);
+}
+
+fn formatStatusReport(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    payload_json: []const u8,
+    fmt: OutputFormat,
+    color: Color,
+    columns: usize,
+    details: bool,
+    loss: ?LossReport,
+) !void {
     switch (fmt) {
         .json => {
+            if (loss) |report| return writeStatusJsonWithLoss(writer, payload_json, report);
             try writer.writeAll(payload_json);
             if (payload_json.len == 0 or payload_json[payload_json.len - 1] != '\n') {
                 try writer.writeAll("\n");
@@ -239,11 +291,32 @@ fn formatStatusForWidthDetailed(
 
             if (fmt == .plain) {
                 try writeStatusPlain(writer, parsed.value);
+                if (loss) |report| try writeLossPlain(writer, report);
             } else {
                 try writeStatusTable(writer, parsed.value, color, columns, details);
+                if (loss) |report| try writeLossTable(writer, report, color, columns);
             }
         },
     }
+}
+
+fn writeStatusJsonWithLoss(writer: anytype, payload_json: []const u8, report: LossReport) !void {
+    const object = std.mem.trim(u8, payload_json, " \t\r\n");
+    if (object.len < 2 or object[0] != '{' or object[object.len - 1] != '}') return error.InvalidStatusPayload;
+    const members = std.mem.trim(u8, object[1 .. object.len - 1], " \t\r\n");
+    try writer.writeAll(object[0 .. object.len - 1]);
+    if (members.len != 0) try writer.writeByte(',');
+    switch (report) {
+        .events => |events| {
+            try writer.writeAll("\"loss_events\":");
+            try std.json.stringify(events, .{}, writer);
+        },
+        .unavailable => |message| {
+            try writer.writeAll("\"loss_events\":null,\"loss_events_unavailable\":");
+            try std.json.encodeJsonString(message, .{}, writer);
+        },
+    }
+    try writer.writeAll("}\n");
 }
 
 fn writeStatusPlain(writer: anytype, s: StatusPayload) !void {
@@ -287,6 +360,74 @@ fn writeStatusPlain(writer: anytype, s: StatusPayload) !void {
     if (s.expiry_overdue) |overdue| try writer.print("expiry_overdue\t{s}\n", .{boolValue(overdue)});
     if (s.expiry_uncertain) |uncertain| try writer.print("expiry_uncertain\t{s}\n", .{boolValue(uncertain)});
     if (s.next_committed_expiry_us) |deadline| try writer.print("next_committed_expiry_us\t{d}\n", .{deadline});
+    if (s.paused_sources) |count| try writer.print("paused_sources\t{d}\n", .{count});
+    for (s.sources orelse &.{}) |source| try writeSourcePlain(writer, source);
+}
+
+fn writeSourcePlain(writer: anytype, source: SourceEntry) !void {
+    try writer.writeAll("source\t");
+    try writeEscaped(writer, source.jail orelse "-");
+    try writer.writeByte('\t');
+    try writeEscaped(writer, source.kind orelse "-");
+    try writer.writeByte('\t');
+    try writeEscaped(writer, source.path orelse "-");
+    try writer.writeByte('\t');
+    try writeEscaped(writer, source.state orelse "-");
+    try writer.writeByte('\t');
+    try writeEscaped(writer, source.cause orelse "-");
+    try writer.writeByte('\t');
+    try writeEscaped(writer, source.on_truncation orelse "-");
+    try writer.print("\t{d}\t", .{source.loss_events orelse 0});
+    if (source.last_loss) |last| {
+        try writeOptInt(writer, last.wall_us, "-");
+        try writer.writeByte('\t');
+        try writeOptInt(writer, last.committed_offset, "-");
+    } else {
+        try writer.writeAll("-\t-");
+    }
+    try writer.writeByte('\n');
+    if (source.repair) |repair| {
+        try writer.writeAll("source_repair\t");
+        try writeEscaped(writer, source.jail orelse "-");
+        try writer.writeByte('\t');
+        try writeEscaped(writer, source.path orelse "-");
+        try writer.writeByte('\t');
+        try writeEscaped(writer, repair);
+        try writer.writeByte('\n');
+    }
+}
+
+fn writeOptInt(writer: anytype, value: anytype, absent: []const u8) !void {
+    if (value) |number| try writer.print("{d}", .{number}) else try writer.writeAll(absent);
+}
+
+fn writeLossPlain(writer: anytype, report: LossReport) !void {
+    switch (report) {
+        .unavailable => |message| {
+            try writer.writeAll("loss_events_unavailable\t");
+            try writeEscaped(writer, message);
+            try writer.writeByte('\n');
+        },
+        .events => |events| for (events) |event| {
+            try writer.writeAll("loss_event\t");
+            try writeOptInt(writer, event.sequence, "-");
+            try writer.writeByte('\t');
+            try writeEscaped(writer, event.jail orelse "-");
+            try writer.writeByte('\t');
+            try writeEscaped(writer, event.path orelse "-");
+            try writer.writeByte('\t');
+            try writeOptInt(writer, event.wall_us, "-");
+            try writer.writeByte('\t');
+            try writeEscaped(writer, event.reason orelse "-");
+            try writer.writeByte('\t');
+            try writeOptInt(writer, event.inode, "-");
+            try writer.writeByte('\t');
+            try writeOptInt(writer, event.committed_offset, "-");
+            try writer.writeByte('\t');
+            try writeOptInt(writer, event.observed_size, "unknown");
+            try writer.writeByte('\n');
+        },
+    }
 }
 
 fn writeStatusTable(writer: anytype, s: StatusPayload, color: Color, columns: usize, details: bool) !void {
@@ -336,6 +477,7 @@ fn writeStatusTable(writer: anytype, s: StatusPayload, color: Color, columns: us
         var source_buffer: [96]u8 = undefined;
         try rowLabel(writer, "Sources:", std.fmt.bufPrint(&source_buffer, "{d} unhealthy; inspect fail2zig jails", .{count}) catch "unhealthy; inspect fail2zig jails", width);
     };
+    try writeSourcesBoxed(writer, s, color, width);
     var summary_buffer: [160]u8 = undefined;
     if (formatEffects(&summary_buffer, s)) |value| try rowLabel(writer, "Effects:", value, width);
     if (s.effect_backend) |backend| try rowLabel(writer, "Effect:", renderDiagnostic(&diagnostic_buffer, backend), width);
@@ -385,6 +527,7 @@ fn writeStatusSummary(writer: anytype, s: StatusPayload, color: Color, columns: 
         var source: [96]u8 = undefined;
         try writeStatusNarrowRow(writer, "Sources: ", std.fmt.bufPrint(&source, "{d} unhealthy; inspect fail2zig jails", .{count}) catch "unhealthy", columns);
     };
+    try writeSourcesNarrow(writer, s, color, columns);
     var summary: [160]u8 = undefined;
     const effects_problem = formatEffects(&summary, s);
     if (effects_problem) |value| try writeStatusNarrowRow(writer, "Effects: ", value, columns);
@@ -440,6 +583,7 @@ fn writeStatusNarrow(writer: anytype, s: StatusPayload, color: Color, columns: u
         var source_buffer: [96]u8 = undefined;
         try writeStatusNarrowRow(writer, "Sources: ", std.fmt.bufPrint(&source_buffer, "{d} unhealthy", .{count}) catch "unhealthy", columns);
     };
+    try writeSourcesNarrow(writer, s, color, columns);
     var summary_buffer: [160]u8 = undefined;
     if (formatEffects(&summary_buffer, s)) |value| try writeStatusNarrowRow(writer, "Effects: ", value, columns);
     if (s.effect_backend) |backend| try writeStatusNarrowRow(writer, "Effect: ", renderDiagnostic(&diagnostic_buffer, backend), columns);
@@ -455,6 +599,269 @@ fn writeStatusNarrowRow(writer: anytype, label: []const u8, value: []const u8, c
     try writer.writeAll(label);
     try writeCell(writer, value, @max(@as(usize, 4), columns -| label.len));
     try writer.writeAll("\n");
+}
+
+const repair_steps = "stop fail2zig, then run:";
+const repair_none = "no offline repair applies to this cause; see the daemon log.";
+const repair_restart = "Then start fail2zig. While it is stopped, firewall rules for every jail are withdrawn.";
+
+fn isPaused(source: SourceEntry) bool {
+    const state = source.state orelse return false;
+    return std.mem.eql(u8, state, "paused");
+}
+
+fn hasLossEvents(source: SourceEntry) bool {
+    return (source.loss_events orelse 0) > 0;
+}
+
+fn sourceLocation(buffer: []u8, source: SourceEntry) []const u8 {
+    var jail_buffer: [diagnostic_max_bytes]u8 = undefined;
+    var place_buffer: [diagnostic_max_bytes]u8 = undefined;
+    const jail = renderDiagnostic(&jail_buffer, source.jail orelse "-");
+    const place = renderDiagnostic(&place_buffer, source.path orelse source.kind orelse "-");
+    return std.fmt.bufPrint(buffer, "{s} {s}", .{ jail, place }) catch jail;
+}
+
+fn pausedValue(buffer: []u8, source: SourceEntry) []const u8 {
+    var location_buffer: [2 * diagnostic_max_bytes + 1]u8 = undefined;
+    var cause_buffer: [diagnostic_max_bytes]u8 = undefined;
+    const location = sourceLocation(&location_buffer, source);
+    const cause = renderDiagnostic(&cause_buffer, source.cause orelse "unknown");
+    return std.fmt.bufPrint(buffer, "{s} ({s})", .{ location, cause }) catch "paused source";
+}
+
+fn utcWithZone(buffer: *[40]u8, wall_us: ?i64) []const u8 {
+    var time_buffer: [32]u8 = undefined;
+    const time = formatUtc(&time_buffer, wall_us);
+    if (time.len != 19) return std.fmt.bufPrint(buffer, "{s}", .{time}) catch "-";
+    return std.fmt.bufPrint(buffer, "{s} UTC", .{time}) catch "-";
+}
+
+fn lossValue(buffer: []u8, source: SourceEntry) []const u8 {
+    var location_buffer: [2 * diagnostic_max_bytes + 1]u8 = undefined;
+    const location = sourceLocation(&location_buffer, source);
+    const count = source.loss_events orelse 0;
+    const last = source.last_loss orelse return std.fmt.bufPrint(buffer, "{s}: {d}", .{ location, count }) catch "loss events";
+    var time_buffer: [40]u8 = undefined;
+    var reason_buffer: [diagnostic_max_bytes]u8 = undefined;
+    return std.fmt.bufPrint(buffer, "{s}: {d}; latest {s}, {s} at offset {d}", .{
+        location,
+        count,
+        utcWithZone(&time_buffer, last.wall_us),
+        renderDiagnostic(&reason_buffer, last.reason orelse "-"),
+        last.committed_offset orelse 0,
+    }) catch "loss events";
+}
+
+fn writeWrapped(writer: anytype, text: []const u8, first_indent: []const u8, rest_indent: []const u8, columns: usize) !void {
+    var rest = text;
+    var indent = first_indent;
+    while (true) {
+        try writer.writeAll(indent);
+        const room = @max(@as(usize, 8), columns -| indent.len);
+        if (rest.len <= room) {
+            try writer.writeAll(rest);
+            try writer.writeByte('\n');
+            return;
+        }
+        var cut = room;
+        while (cut > 0 and rest[cut] != ' ') cut -= 1;
+        if (cut == 0) cut = room;
+        try writer.writeAll(rest[0..cut]);
+        try writer.writeByte('\n');
+        rest = std.mem.trimLeft(u8, rest[cut..], " ");
+        indent = rest_indent;
+    }
+}
+
+fn writeSourcesNarrow(writer: anytype, s: StatusPayload, color: Color, columns: usize) !void {
+    for (s.sources orelse &.{}) |source| {
+        if (!isPaused(source)) continue;
+        var value_buffer: [512]u8 = undefined;
+        try writer.writeAll("Paused: ");
+        try color.on(writer, Color.yellow);
+        try writeCell(writer, pausedValue(&value_buffer, source), @max(@as(usize, 4), columns -| "Paused: ".len));
+        try color.off(writer);
+        try writer.writeByte('\n');
+        if (source.repair) |repair| {
+            try writer.print("  Repair: {s}\n    ", .{repair_steps});
+            try writeEscaped(writer, repair);
+            try writer.writeByte('\n');
+            try writeWrapped(writer, repair_restart, "  ", "    ", columns);
+        } else {
+            try writer.print("  Repair: {s}\n", .{repair_none});
+        }
+    }
+    for (s.sources orelse &.{}) |source| {
+        if (!hasLossEvents(source)) continue;
+        var value_buffer: [512]u8 = undefined;
+        try writeStatusNarrowRow(writer, "Loss events: ", lossValue(&value_buffer, source), columns);
+    }
+}
+
+fn writeSourcesBoxed(writer: anytype, s: StatusPayload, color: Color, width: usize) !void {
+    for (s.sources orelse &.{}) |source| {
+        if (!isPaused(source)) continue;
+        var value_buffer: [512]u8 = undefined;
+        try rowLabelStyled(writer, color, Color.yellow, "Paused:", pausedValue(&value_buffer, source), width, false);
+        if (source.repair) |repair| {
+            try rowLabel(writer, "  Repair:", repair_steps, width);
+            try rowLabelStyled(writer, .{ .enabled = false }, "", "", repair, width, true);
+            try rowLabel(writer, "", repair_restart, width);
+        } else {
+            try rowLabel(writer, "  Repair:", repair_none, width);
+        }
+    }
+    for (s.sources orelse &.{}) |source| {
+        if (!hasLossEvents(source)) continue;
+        var value_buffer: [512]u8 = undefined;
+        try rowLabel(writer, "Loss events:", lossValue(&value_buffer, source), width);
+    }
+}
+
+fn sourcesWidth(s: StatusPayload) usize {
+    var used: usize = 0;
+    for (s.sources orelse &.{}) |source| {
+        var value_buffer: [512]u8 = undefined;
+        if (isPaused(source)) {
+            used = @max(used, rowUsed(pausedValue(&value_buffer, source)));
+            if (source.repair) |repair| {
+                used = @max(used, rowUsed(repair_restart));
+                used = @max(used, 2 + label_col + escapedLen(repair));
+            } else {
+                used = @max(used, rowUsed(repair_none));
+            }
+        }
+        if (hasLossEvents(source)) used = @max(used, rowUsed(lossValue(&value_buffer, source)));
+    }
+    return used;
+}
+
+const loss_gap: usize = 2;
+
+fn lossColumn(header: []const u8, longest: usize) usize {
+    return @max(header.len, @min(longest, col_max)) + loss_gap;
+}
+
+fn numberCell(buffer: *[24]u8, value: ?u64, absent: []const u8) []const u8 {
+    const number = value orelse return absent;
+    return std.fmt.bufPrint(buffer, "{d}", .{number}) catch "-";
+}
+
+const LossRow = struct {
+    jail_buffer: [diagnostic_max_bytes]u8 = undefined,
+    path_buffer: [diagnostic_max_bytes]u8 = undefined,
+    time_buffer: [40]u8 = undefined,
+    reason_buffer: [diagnostic_max_bytes]u8 = undefined,
+    inode_buffer: [24]u8 = undefined,
+    offset_buffer: [24]u8 = undefined,
+    size_buffer: [24]u8 = undefined,
+    jail: []const u8 = "",
+    path: []const u8 = "",
+    time: []const u8 = "",
+    reason: []const u8 = "",
+    inode: []const u8 = "",
+    offset: []const u8 = "",
+    size: []const u8 = "",
+
+    fn fill(self: *LossRow, event: LossEvent) void {
+        self.jail = renderDiagnostic(&self.jail_buffer, event.jail orelse "-");
+        self.path = renderDiagnostic(&self.path_buffer, event.path orelse "-");
+        self.time = utcWithZone(&self.time_buffer, event.wall_us);
+        self.reason = renderDiagnostic(&self.reason_buffer, event.reason orelse "-");
+        self.inode = numberCell(&self.inode_buffer, event.inode, "-");
+        self.offset = numberCell(&self.offset_buffer, event.committed_offset, "-");
+        self.size = numberCell(&self.size_buffer, event.observed_size, "unknown");
+    }
+};
+
+const LossWidths = struct {
+    jail: usize = 0,
+    path: usize = 0,
+    time: usize = 0,
+    reason: usize = 0,
+    inode: usize = 0,
+    offset: usize = 0,
+    size: usize = 0,
+
+    fn widen(self: *LossWidths, row: LossRow) void {
+        self.jail = @max(self.jail, row.jail.len);
+        self.path = @max(self.path, row.path.len);
+        self.time = @max(self.time, row.time.len);
+        self.reason = @max(self.reason, row.reason.len);
+        self.inode = @max(self.inode, row.inode.len);
+        self.offset = @max(self.offset, row.offset.len);
+        self.size = @max(self.size, row.size.len);
+    }
+};
+
+fn writeLossTable(writer: anytype, report: LossReport, color: Color, columns: usize) !void {
+    try writer.writeByte('\n');
+    switch (report) {
+        .unavailable => |message| {
+            try writer.writeAll("Continuity loss events: unavailable (");
+            try writeEscaped(writer, message);
+            try writer.writeAll(")\n");
+        },
+        .events => |events| {
+            if (events.len == 0) return writer.writeAll("Continuity loss events: none\n");
+            try writer.writeAll("Continuity loss events (newest first)\n");
+            var widest: LossWidths = .{};
+            for (events) |event| {
+                var row: LossRow = .{};
+                row.fill(event);
+                widest.widen(row);
+            }
+            const jail_col = lossColumn("JAIL", widest.jail);
+            const path_col = lossColumn("PATH", widest.path);
+            const time_col = lossColumn("TIME", widest.time);
+            const reason_col = lossColumn("REASON", widest.reason);
+            const inode_col = lossColumn("INODE", widest.inode);
+            const offset_col = lossColumn("OFFSET", widest.offset);
+            const size_width = @max("SIZE".len, widest.size);
+            if (jail_col + path_col + time_col + reason_col + inode_col + offset_col + size_width > columns) {
+                try writeLossStacked(writer, events, columns);
+            } else {
+                try color.on(writer, Color.bold);
+                try padRightPrint(writer, "JAIL", jail_col);
+                try padRightPrint(writer, "PATH", path_col);
+                try padRightPrint(writer, "TIME", time_col);
+                try padRightPrint(writer, "REASON", reason_col);
+                try padRightPrint(writer, "INODE", inode_col);
+                try padRightPrint(writer, "OFFSET", offset_col);
+                try writer.writeAll("SIZE");
+                try color.off(writer);
+                try writer.writeByte('\n');
+                for (events) |event| {
+                    var row: LossRow = .{};
+                    row.fill(event);
+                    try writeCell(writer, row.jail, jail_col);
+                    try writeCell(writer, row.path, path_col);
+                    try writeCell(writer, row.time, time_col);
+                    try writeCell(writer, row.reason, reason_col);
+                    try writeCell(writer, row.inode, inode_col);
+                    try writeCell(writer, row.offset, offset_col);
+                    try writer.print("{s}\n", .{row.size});
+                }
+            }
+            try writer.print("Total: {d} events\n", .{events.len});
+        },
+    }
+}
+
+fn writeLossStacked(writer: anytype, events: []const LossEvent, columns: usize) !void {
+    for (events, 0..) |event, index| {
+        var row: LossRow = .{};
+        row.fill(event);
+        if (index > 0) try writer.writeByte('\n');
+        try writeStatusNarrowRow(writer, "JAIL:   ", row.jail, columns);
+        try writeStatusNarrowRow(writer, "PATH:   ", row.path, columns);
+        try writeStatusNarrowRow(writer, "TIME:   ", row.time, columns);
+        try writeStatusNarrowRow(writer, "REASON: ", row.reason, columns);
+        try writeStatusNarrowRow(writer, "INODE:  ", row.inode, columns);
+        try writeStatusNarrowRow(writer, "OFFSET: ", row.offset, columns);
+        try writeStatusNarrowRow(writer, "SIZE:   ", row.size, columns);
+    }
 }
 
 fn statusWidth(s: StatusPayload) usize {
@@ -498,6 +905,7 @@ fn statusWidth(s: StatusPayload) usize {
     if (formatWorker(&summary_buffer, s)) |value| used = @max(used, rowUsed(value));
     if (s.clock_uncertain == true) used = @max(used, rowUsed("uncertain"));
     if (formatExpiry(&summary_buffer, s)) |value| used = @max(used, rowUsed(value));
+    used = @max(used, sourcesWidth(s));
     return @max(44, used + 2);
 }
 
@@ -580,7 +988,7 @@ fn formatExpiry(buffer: []u8, s: StatusPayload) ?[]const u8 {
     return if (overdue) "overdue" else "view uncertain";
 }
 
-const diagnostic_max_bytes: usize = 96;
+pub const diagnostic_max_bytes: usize = 96;
 
 const DiagnosticUnit = struct {
     input_len: usize,
@@ -611,6 +1019,48 @@ fn isUnsafeUnicodeControl(codepoint: u21) bool {
         (codepoint >= 0x2066 and codepoint <= 0x2069);
 }
 
+fn emitUnit(out: []u8, input: []const u8, unit: DiagnosticUnit) void {
+    switch (unit.kind) {
+        .raw => @memcpy(out, input),
+        .slash => @memcpy(out, "\\\\"),
+        .newline => @memcpy(out, "\\n"),
+        .carriage_return => @memcpy(out, "\\r"),
+        .tab => @memcpy(out, "\\t"),
+        .hex => {
+            const hex = "0123456789ABCDEF";
+            for (input, 0..) |hex_byte, index| {
+                const offset = index * 4;
+                out[offset] = '\\';
+                out[offset + 1] = 'x';
+                out[offset + 2] = hex[hex_byte >> 4];
+                out[offset + 3] = hex[hex_byte & 0x0f];
+            }
+        },
+    }
+}
+
+fn escapedLen(input: []const u8) usize {
+    var index: usize = 0;
+    var total: usize = 0;
+    while (index < input.len) {
+        const unit = diagnosticUnit(input[index..]);
+        total += unit.output_len;
+        index += unit.input_len;
+    }
+    return total;
+}
+
+fn writeEscaped(writer: anytype, input: []const u8) !void {
+    var unit_buffer: [16]u8 = undefined;
+    var index: usize = 0;
+    while (index < input.len) {
+        const unit = diagnosticUnit(input[index..]);
+        emitUnit(unit_buffer[0..unit.output_len], input[index..][0..unit.input_len], unit);
+        try writer.writeAll(unit_buffer[0..unit.output_len]);
+        index += unit.input_len;
+    }
+}
+
 fn renderDiagnostic(buffer: []u8, input: []const u8) []const u8 {
     const capacity = @min(buffer.len, diagnostic_max_bytes);
     if (capacity == 0) return buffer[0..0];
@@ -629,23 +1079,7 @@ fn renderDiagnostic(buffer: []u8, input: []const u8) []const u8 {
     while (input_index < input.len) {
         const unit = diagnosticUnit(input[input_index..]);
         if (unit.output_len > limit - output_index) break;
-        switch (unit.kind) {
-            .raw => @memcpy(buffer[output_index..][0..unit.output_len], input[input_index..][0..unit.input_len]),
-            .slash => @memcpy(buffer[output_index..][0..2], "\\\\"),
-            .newline => @memcpy(buffer[output_index..][0..2], "\\n"),
-            .carriage_return => @memcpy(buffer[output_index..][0..2], "\\r"),
-            .tab => @memcpy(buffer[output_index..][0..2], "\\t"),
-            .hex => {
-                const hex = "0123456789ABCDEF";
-                for (input[input_index..][0..unit.input_len], 0..) |hex_byte, index| {
-                    const offset = output_index + index * 4;
-                    buffer[offset] = '\\';
-                    buffer[offset + 1] = 'x';
-                    buffer[offset + 2] = hex[hex_byte >> 4];
-                    buffer[offset + 3] = hex[hex_byte & 0x0f];
-                }
-            },
-        }
+        emitUnit(buffer[output_index..][0..unit.output_len], input[input_index..][0..unit.input_len], unit);
         output_index += unit.output_len;
         input_index += unit.input_len;
     }
@@ -663,13 +1097,20 @@ fn statusHeadingLen(version: ?[]const u8) usize {
 }
 
 fn rowLabel(writer: anytype, label: []const u8, value: []const u8, width: usize) !void {
+    return rowLabelStyled(writer, .{ .enabled = false }, "", label, value, width, false);
+}
+
+fn rowLabelStyled(writer: anytype, color: Color, style: []const u8, label: []const u8, value: []const u8, width: usize, comptime escape: bool) !void {
     try writer.writeAll("| ");
     try writer.writeAll(label);
     if (label.len < label_col) {
         try writeSpaces(writer, label_col - label.len);
     }
-    try writer.writeAll(value);
-    const used = 1 + 1 + @max(label.len, label_col) + value.len;
+    try color.on(writer, style);
+    if (escape) try writeEscaped(writer, value) else try writer.writeAll(value);
+    try color.off(writer);
+    const value_len = if (escape) escapedLen(value) else value.len;
+    const used = 1 + 1 + @max(label.len, label_col) + value_len;
     if (used < width - 1) {
         try writeSpaces(writer, width - 1 - used);
     }
@@ -1379,6 +1820,10 @@ fn formatJailHealth(buffer: []u8, jail: JailEntry) []const u8 {
         "unknown";
     var stream = std.io.fixedBufferStream(buffer[0..@min(buffer.len, diagnostic_max_bytes)]);
     const writer = stream.writer();
+    if (jail.source_paused == true) {
+        writer.print("paused ({s})", .{cause}) catch return "paused (unknown)";
+        return stream.getWritten();
+    }
     writer.print("broken ({s}", .{cause}) catch return "broken (unknown)";
     if (jail.source_exit_code) |code| writer.print("; exit={d}", .{code}) catch return "broken (unknown)";
     if (jail.source_signal) |signal| writer.print("; signal={d}", .{signal}) catch return "broken (unknown)";
@@ -1658,6 +2103,509 @@ pub fn formatReload(
             }
         },
     }
+}
+
+const IgnoreBan = struct {
+    scope: []const u8 = "",
+    deadline_us: ?i64 = null,
+    permanent: bool = false,
+    confirmed: bool = false,
+    relation: []const u8 = "",
+    lift: []const u8 = "",
+    lift_reason: ?[]const u8 = null,
+};
+
+const IgnoreOutcome = struct {
+    kind: []const u8 = "",
+    outcome: []const u8 = "",
+    generation: []const u8 = "",
+    mutation_revision: u64 = 0,
+    enforced: bool = false,
+    reasons: []const []const u8 = &.{},
+    jail: []const u8 = "",
+    address: []const u8 = "",
+    entry: []const u8 = "",
+    source: ?[]const u8 = null,
+    covered_by: []const []const u8 = &.{},
+    still_ignored_by: []const []const u8 = &.{},
+    unban_requested: bool = false,
+    bans_total: u32 = 0,
+    bans: []const IgnoreBan = &.{},
+};
+
+const IgnoreListEntry = struct {
+    address: []const u8 = "",
+    source: []const u8 = "",
+};
+
+const IgnoreListJail = struct {
+    jail: []const u8 = "",
+    count: u32 = 0,
+    ignore_file: ?[]const u8 = null,
+    entries: []const IgnoreListEntry = &.{},
+};
+
+const IgnoreUnconfigured = struct {
+    jail: []const u8 = "",
+    runtime_entries: u32 = 0,
+};
+
+const IgnoreListPayload = struct {
+    redacted: bool = false,
+    limit: u32 = 128,
+    jails: []const IgnoreListJail = &.{},
+    unconfigured: []const IgnoreUnconfigured = &.{},
+};
+
+const ignore_listed_bans_max: usize = 10;
+const ignore_ban_column_gap: usize = 4;
+const ignore_list_gap: usize = 2;
+
+pub fn escapeArgument(buffer: *[diagnostic_max_bytes]u8, argument: []const u8) []const u8 {
+    const argument_max_bytes: usize = 64;
+    var cut = @min(argument.len, argument_max_bytes);
+    while (cut > 0 and cut < argument.len and (argument[cut] & 0xC0) == 0x80) cut -= 1;
+    return renderDiagnostic(buffer, argument[0..cut]);
+}
+
+fn writeJsonDocument(writer: anytype, payload_json: []const u8) !void {
+    try writer.writeAll(payload_json);
+    if (payload_json.len == 0 or payload_json[payload_json.len - 1] != '\n') try writer.writeAll("\n");
+}
+
+fn printEscaped(writer: anytype, comptime template: []const u8, values: anytype) !void {
+    comptime var rest: []const u8 = template;
+    inline for (values) |value| {
+        const split = comptime std.mem.indexOf(u8, rest, "{}") orelse @compileError("template has fewer placeholders than values");
+        try writer.writeAll(rest[0..split]);
+        try writeEscaped(writer, value);
+        rest = rest[split + 2 ..];
+    }
+    try writer.writeAll(rest);
+}
+
+fn isShellBare(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or std.mem.indexOfScalar(u8, "._:/@%+=,-", byte) != null;
+}
+
+fn writeShellArg(writer: anytype, text: []const u8) !void {
+    var bare = text.len != 0;
+    for (text) |byte| bare = bare and isShellBare(byte);
+    if (bare) return writer.writeAll(text);
+    try writer.writeByte('\'');
+    var start: usize = 0;
+    for (text, 0..) |byte, index| {
+        if (byte != '\'' and byte != '\\') continue;
+        try writeEscaped(writer, text[start..index]);
+        try writer.writeAll(if (byte == '\'') "'\\''" else "\\");
+        start = index + 1;
+    }
+    try writeEscaped(writer, text[start..]);
+    try writer.writeByte('\'');
+}
+
+fn writeJoined(writer: anytype, values: []const []const u8) !void {
+    for (values, 0..) |value, index| {
+        if (index != 0) try writer.writeAll(", ");
+        try writeEscaped(writer, value);
+    }
+}
+
+fn networkBase(scope: []const u8) []const u8 {
+    return scope[0 .. std.mem.indexOfScalar(u8, scope, '/') orelse scope.len];
+}
+
+pub fn formatIgnoreOutcome(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat) !void {
+    switch (fmt) {
+        .json => try writeJsonDocument(writer, payload_json),
+        .plain, .table => {
+            const parsed = try std.json.parseFromSlice(IgnoreOutcome, allocator, payload_json, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+            defer parsed.deinit();
+            if (fmt == .plain) try writeIgnoreOutcomePlain(writer, parsed.value) else try writeIgnoreOutcomeTable(writer, parsed.value);
+        },
+    }
+}
+
+fn writeIgnoreOutcomePlain(writer: anytype, o: IgnoreOutcome) !void {
+    try writer.print("kind\t{s}\noutcome\t{s}\nenforced\t{}\ngeneration\t{s}\nmutation_revision\t{d}\n", .{ o.kind, o.outcome, o.enforced, o.generation, o.mutation_revision });
+    try printEscaped(writer, "jail\t{}\naddress\t{}\nentry\t{}\n", .{ o.jail, o.address, o.entry });
+    if (std.mem.eql(u8, o.kind, "ignore_remove")) {
+        for (o.still_ignored_by) |covering| try printEscaped(writer, "still_ignored_by\t{}\n", .{covering});
+    } else {
+        try printEscaped(writer, "source\t{}\n", .{o.source orelse "-"});
+        for (o.covered_by) |covering| try printEscaped(writer, "covered_by\t{}\n", .{covering});
+        try writer.print("bans_total\t{d}\n", .{o.bans_total});
+        for (o.bans) |ban| {
+            try printEscaped(writer, "ban\t{}\t", .{ban.scope});
+            if (ban.permanent) {
+                try writer.writeAll("permanent");
+            } else if (ban.deadline_us) |deadline| {
+                try writer.print("{d}", .{deadline});
+            } else {
+                try writer.writeAll("-");
+            }
+            try printEscaped(writer, "\t{}\t{}\t{}\n", .{ if (ban.confirmed) "confirmed" else "pending", ban.relation, ban.lift });
+        }
+    }
+    for (o.reasons) |reason| try printEscaped(writer, "reason\t{}\n", .{reason});
+}
+
+fn writeIgnoreOutcomeTable(writer: anytype, o: IgnoreOutcome) !void {
+    if (std.mem.eql(u8, o.kind, "ignore_remove")) return writeIgnoreRemoveTable(writer, o);
+    return writeIgnoreAddTable(writer, o);
+}
+
+fn isStaleReason(reason: []const u8) bool {
+    return std.mem.startsWith(u8, reason, "stale generation") or std.mem.eql(u8, reason, "StaleAdminRevision");
+}
+
+fn writeIgnoreReasons(writer: anytype, o: IgnoreOutcome) !void {
+    const refused = std.mem.eql(u8, o.outcome, "rejected") or std.mem.eql(u8, o.outcome, "absent");
+    var stale = false;
+    for (o.reasons) |reason| {
+        if (refused) try writer.writeAll("Refused: ");
+        try printEscaped(writer, "{}\n", .{reason});
+        stale = stale or isStaleReason(reason);
+    }
+    if (o.reasons.len == 0) {
+        if (refused) try writer.writeAll("Refused: no reason reported.\n") else try printEscaped(writer, "Outcome {}: no reason reported.\n", .{o.outcome});
+    }
+    if (stale) try writer.writeAll("Retry the command.\n");
+}
+
+fn writeIgnoreRemoveTable(writer: anytype, o: IgnoreOutcome) !void {
+    if (!std.mem.eql(u8, o.entry, "removed")) {
+        try writeIgnoreReasons(writer, o);
+        if (std.mem.eql(u8, o.entry, "absent") and o.still_ignored_by.len != 0) {
+            try printEscaped(writer, "The configuration covers {} in {} through ", .{ o.address, o.jail });
+            try writeJoined(writer, o.still_ignored_by);
+            try writer.writeAll("; edit ignoreip to change that.\n");
+        }
+        return;
+    }
+    try printEscaped(writer, "Removed runtime ignore entry {} from jail {}.\n", .{ o.address, o.jail });
+    if (o.still_ignored_by.len == 0) {
+        try printEscaped(writer, "New events from {} in {} are detected again.\n", .{ o.address, o.jail });
+        return;
+    }
+    try printEscaped(writer, "{} remains ignored in {}: the configuration ", .{ o.address, o.jail });
+    for (o.still_ignored_by) |covering| {
+        if (std.mem.eql(u8, covering, o.address)) {
+            try printEscaped(writer, "lists {}.\n", .{o.address});
+            return;
+        }
+    }
+    try writer.writeAll("covers it through ");
+    try writeJoined(writer, o.still_ignored_by);
+    try writer.writeAll(".\n");
+}
+
+fn writeBanDeadline(writer: anytype, ban: IgnoreBan, comptime timed_tail: []const u8) !void {
+    if (ban.permanent) return writer.writeAll(" permanently. The ban stays until it is lifted.\n");
+    var buffer: [32]u8 = undefined;
+    try writer.print(" until {s} UTC" ++ timed_tail, .{formatUtc(&buffer, ban.deadline_us)});
+}
+
+fn writeLiftHint(writer: anytype, o: IgnoreOutcome, comptime pronoun: []const u8) !void {
+    try writer.writeAll("To lift " ++ pronoun ++ " now: fail2zig ignore add ");
+    try writeShellArg(writer, o.address);
+    try writer.writeAll(" --jail ");
+    try writeShellArg(writer, o.jail);
+    try writer.writeAll(" --unban\n");
+}
+
+fn writeWiderBanLift(writer: anytype, o: IgnoreOutcome, ban: IgnoreBan) !void {
+    try writer.writeAll("fail2zig unban ");
+    try writeShellArg(writer, networkBase(ban.scope));
+    try writer.writeAll(" --jail ");
+    try writeShellArg(writer, o.jail);
+    try writer.writeAll(" --scope net ");
+    try writeShellArg(writer, ban.scope);
+    try writer.writeAll("\n");
+}
+
+fn isInsideEntry(ban: IgnoreBan) bool {
+    return std.mem.eql(u8, ban.relation, "inside_entry");
+}
+
+fn isKept(ban: IgnoreBan) bool {
+    return std.mem.eql(u8, ban.lift, "kept");
+}
+
+const LiftResult = enum { kept, confirmed, incomplete, unknown, refused };
+
+fn liftResult(ban: IgnoreBan) LiftResult {
+    return std.meta.stringToEnum(LiftResult, ban.lift) orelse .unknown;
+}
+
+fn writeIgnoreAddTable(writer: anytype, o: IgnoreOutcome) !void {
+    const added = std.mem.eql(u8, o.entry, "added");
+    if (!added and !std.mem.eql(u8, o.entry, "present")) return writeIgnoreReasons(writer, o);
+
+    if (!added) {
+        try printEscaped(writer, "{} is already a runtime ignore entry in jail {}. Nothing changed.\n", .{ o.address, o.jail });
+    } else {
+        try printEscaped(writer, "Added runtime ignore entry {} to jail {}.\n", .{ o.address, o.jail });
+        const also_configured = if (o.source) |source| std.mem.eql(u8, source, "config+runtime") else false;
+        if (also_configured) {
+            try printEscaped(writer, "The configuration also lists {} for {}; its source is now config+runtime.\n", .{ o.address, o.jail });
+        } else {
+            try printEscaped(writer, "New events from {} in {} will not lead to a ban.\n", .{ o.address, o.jail });
+        }
+    }
+
+    if (o.covered_by.len != 0) {
+        try printEscaped(writer, "The configuration already covers {} in {} through ", .{ o.address, o.jail });
+        try writeJoined(writer, o.covered_by);
+        try writer.writeAll(".\n");
+    }
+
+    if (o.unban_requested) try writeIgnoreLifts(writer, o) else try writeIgnoreKeptBans(writer, o);
+
+    if (std.mem.endsWith(u8, o.address, "/0")) {
+        const family = if (std.mem.indexOfScalar(u8, o.address, ':') != null) "IPv6" else "IPv4";
+        try writer.print("This entry covers every {s} address: jail ", .{family});
+        try writeEscaped(writer, o.jail);
+        try writer.print(" will not ban any {s} address from new events.\n", .{family});
+    }
+}
+
+fn writeIgnoreKeptBans(writer: anytype, o: IgnoreOutcome) !void {
+    var inside_kept: usize = 0;
+    var inside_total: usize = 0;
+    for (o.bans) |ban| {
+        if (!isInsideEntry(ban)) continue;
+        inside_total += 1;
+        if (isKept(ban)) inside_kept += 1;
+    }
+    const hidden_inside = @as(usize, o.bans_total) -| o.bans.len;
+
+    if (inside_kept == 1) {
+        for (o.bans) |ban| {
+            if (!isInsideEntry(ban) or !isKept(ban)) continue;
+            try printEscaped(writer, "{} ", .{ban.scope});
+            try writer.writeAll(if (ban.confirmed) "is banned" else "has a pending ban");
+            try printEscaped(writer, " in {}", .{o.jail});
+            try writeBanDeadline(writer, ban, ". The ban stays until then.\n");
+        }
+        try writeLiftHint(writer, o, "it");
+    } else if (inside_kept > 1) {
+        const listed = @min(inside_kept, ignore_listed_bans_max);
+        const total = inside_total + hidden_inside;
+        try writer.print("{d} bans in ", .{total});
+        try printEscaped(writer, "{} fall inside {}. They stay until their deadlines:\n", .{ o.jail, o.address });
+        var scope_width: usize = 0;
+        var seen: usize = 0;
+        for (o.bans) |ban| {
+            if (!isInsideEntry(ban) or !isKept(ban)) continue;
+            if (seen == listed) break;
+            seen += 1;
+            scope_width = @max(scope_width, escapedLen(ban.scope));
+        }
+        seen = 0;
+        for (o.bans) |ban| {
+            if (!isInsideEntry(ban) or !isKept(ban)) continue;
+            if (seen == listed) break;
+            seen += 1;
+            try writer.writeAll("  ");
+            try writeEscaped(writer, ban.scope);
+            try writeSpaces(writer, scope_width + ignore_ban_column_gap - escapedLen(ban.scope));
+            if (ban.permanent) {
+                try writer.writeAll(if (ban.confirmed) "permanent\n" else "pending, permanent\n");
+            } else {
+                var buffer: [32]u8 = undefined;
+                try writer.print("{s}until {s} UTC\n", .{ if (ban.confirmed) "" else "pending, ", formatUtc(&buffer, ban.deadline_us) });
+            }
+        }
+        if (total > listed) {
+            try writer.print("  and {d} more; see fail2zig list --jail ", .{total - listed});
+            try writeShellArg(writer, o.jail);
+            try writer.writeAll("\n");
+        }
+        try writeLiftHint(writer, o, "them");
+    }
+
+    for (o.bans) |ban| {
+        if (isInsideEntry(ban) or !isKept(ban)) continue;
+        try printEscaped(writer, "{} is inside the ", .{o.address});
+        try writer.writeAll(if (ban.confirmed) "network ban " else "pending network ban ");
+        try printEscaped(writer, "{} in {}", .{ ban.scope, o.jail });
+        try writeBanDeadline(writer, ban, ". The ban stays until then.\n");
+        try writer.writeAll("--unban does not lift a ban wider than the entry. To lift it: ");
+        try writeWiderBanLift(writer, o, ban);
+    }
+}
+
+fn writeIgnoreLifts(writer: anytype, o: IgnoreOutcome) !void {
+    if (o.bans_total == 0) {
+        try printEscaped(writer, "No ban in {} falls inside {}; nothing to lift.\n", .{ o.jail, o.address });
+        return;
+    }
+    var attempted: usize = 0;
+    var confirmed: usize = 0;
+    var incomplete: usize = 0;
+    var unknown: usize = 0;
+    var refused: usize = 0;
+    for (o.bans) |ban| {
+        const result = liftResult(ban);
+        if (result == .kept) continue;
+        attempted += 1;
+        const show = attempted <= ignore_listed_bans_max;
+        switch (result) {
+            .kept => {},
+            .confirmed => {
+                confirmed += 1;
+                if (show) try printEscaped(writer, "Lifted the ban on {} in {}; removal confirmed in the kernel.\n", .{ ban.scope, o.jail });
+            },
+            .incomplete => {
+                incomplete += 1;
+                if (show) {
+                    try printEscaped(writer, "Lifted the ban on {} in {}; kernel removal is not confirmed yet. Check fail2zig list --jail ", .{ ban.scope, o.jail });
+                    try writeShellArg(writer, o.jail);
+                    try writer.writeAll(".\n");
+                }
+            },
+            .unknown => {
+                unknown += 1;
+                if (show) {
+                    try printEscaped(writer, "The ban on {} in {} may or may not have been lifted; the outcome could not be established. Check fail2zig list --jail ", .{ ban.scope, o.jail });
+                    try writeShellArg(writer, o.jail);
+                    try writer.writeAll(" and fail2zig status.\n");
+                }
+            },
+            .refused => {
+                refused += 1;
+                if (show and !isInsideEntry(ban)) {
+                    try printEscaped(writer, "Not lifted: {} is a network ban wider than the entry. To lift it: ", .{ban.scope});
+                    try writeWiderBanLift(writer, o, ban);
+                } else if (show) {
+                    try printEscaped(writer, "Not lifted: {} in {}", .{ ban.scope, o.jail });
+                    if (ban.lift_reason) |reason| try printEscaped(writer, ": {}", .{reason});
+                    try writer.writeAll("\n");
+                }
+            },
+        }
+    }
+    if (attempted <= ignore_listed_bans_max) return;
+    try writer.print("Lifted {d} bans in ", .{attempted});
+    try printEscaped(writer, "{}:", .{o.jail});
+    var separator: []const u8 = " ";
+    const parts = [_]struct { count: usize, label: []const u8 }{
+        .{ .count = confirmed, .label = "confirmed" },
+        .{ .count = incomplete, .label = "not confirmed yet" },
+        .{ .count = unknown, .label = "unknown" },
+        .{ .count = refused, .label = "not lifted" },
+    };
+    for (parts) |part| {
+        if (part.count == 0) continue;
+        try writer.print("{s}{d} {s}", .{ separator, part.count, part.label });
+        separator = ", ";
+    }
+    try writer.writeAll(".\n");
+}
+
+pub fn formatIgnoreList(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color, jail_filter: ?[]const u8) !void {
+    return formatIgnoreListForWidth(allocator, writer, payload_json, fmt, color, jail_filter, terminalColumns());
+}
+
+fn formatIgnoreListForWidth(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color, jail_filter: ?[]const u8, columns: usize) !void {
+    switch (fmt) {
+        .json => try writeJsonDocument(writer, payload_json),
+        .plain, .table => {
+            const parsed = try std.json.parseFromSlice(IgnoreListPayload, allocator, payload_json, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+            defer parsed.deinit();
+            if (fmt == .plain) try writeIgnoreListPlain(writer, parsed.value) else try writeIgnoreListTable(writer, parsed.value, color, jail_filter, columns);
+        },
+    }
+}
+
+fn writeIgnoreListPlain(writer: anytype, p: IgnoreListPayload) !void {
+    for (p.jails) |jail| {
+        for (jail.entries) |entry| try printEscaped(writer, "{}\t{}\t{}\n", .{ jail.jail, entry.address, entry.source });
+    }
+}
+
+fn writeIgnoreCell(writer: anytype, text: []const u8, width: usize, gap: usize) !void {
+    var buffer: [diagnostic_max_bytes]u8 = undefined;
+    const shown = renderDiagnostic(&buffer, text);
+    const clipped = @min(shown.len, width);
+    try writeClipped(writer, shown, width);
+    try writeSpaces(writer, width - clipped + gap);
+}
+
+fn writeIgnoreListTable(writer: anytype, p: IgnoreListPayload, color: Color, jail_filter: ?[]const u8, columns: usize) !void {
+    var rows: usize = 0;
+    var jail_width: usize = "JAIL".len;
+    var address_width: usize = "ADDRESS".len;
+    var source_width: usize = "SOURCE".len;
+    for (p.jails) |jail| {
+        for (jail.entries) |entry| {
+            rows += 1;
+            jail_width = @max(jail_width, @min(escapedLen(jail.jail), col_max));
+            address_width = @max(address_width, @min(escapedLen(entry.address), col_max));
+            source_width = @max(source_width, @min(escapedLen(entry.source), col_max));
+        }
+    }
+
+    if (rows == 0) {
+        if (jail_filter) |name| try printEscaped(writer, "No ignore entries for jail {}.\n", .{name}) else try writer.writeAll("No ignore entries.\n");
+    } else if (jail_width + address_width + source_width + 2 * ignore_list_gap <= columns) {
+        try color.on(writer, Color.bold);
+        try writeIgnoreCell(writer, "JAIL", jail_width, ignore_list_gap);
+        try writeIgnoreCell(writer, "ADDRESS", address_width, ignore_list_gap);
+        try writer.writeAll("SOURCE");
+        try color.off(writer);
+        try writer.writeAll("\n");
+        for (p.jails) |jail| {
+            for (jail.entries) |entry| {
+                try writeIgnoreCell(writer, jail.jail, jail_width, ignore_list_gap);
+                try writeIgnoreCell(writer, entry.address, address_width, ignore_list_gap);
+                var buffer: [diagnostic_max_bytes]u8 = undefined;
+                try writeClipped(writer, renderDiagnostic(&buffer, entry.source), source_width);
+                try writer.writeAll("\n");
+            }
+        }
+    } else {
+        const value_width = @max(@as(usize, 4), columns -| "ADDRESS: ".len);
+        var first = true;
+        for (p.jails) |jail| {
+            for (jail.entries) |entry| {
+                if (!first) try writer.writeAll("\n");
+                first = false;
+                var buffer: [diagnostic_max_bytes]u8 = undefined;
+                try writer.writeAll("JAIL:    ");
+                try writeClipped(writer, renderDiagnostic(&buffer, jail.jail), value_width);
+                try writer.writeAll("\nADDRESS: ");
+                try writeClipped(writer, renderDiagnostic(&buffer, entry.address), value_width);
+                try writer.writeAll("\nSOURCE:  ");
+                try writeClipped(writer, renderDiagnostic(&buffer, entry.source), value_width);
+                try writer.writeAll("\n");
+            }
+        }
+    }
+    if (rows != 0) try writer.print("Total: {d} {s}\n", .{ rows, if (rows == 1) "entry" else "entries" });
+
+    for (p.jails) |jail| {
+        const file = jail.ignore_file orelse continue;
+        try printEscaped(writer, "Jail {} also reads exclusions from its ignore_file {}; they are not listed here.\n", .{ jail.jail, file });
+    }
+    if (p.unconfigured.len != 0) {
+        try writer.writeAll("Runtime entries are stored for jails that are not configured: ");
+        for (p.unconfigured, 0..) |stored, index| {
+            if (index != 0) try writer.writeAll(", ");
+            try printEscaped(writer, "{}", .{stored.jail});
+            try writer.print(" ({d})", .{stored.runtime_entries});
+        }
+        try writer.writeAll(". Remove them with fail2zig ignore remove <address> --jail ");
+        if (p.unconfigured.len == 1) try writeShellArg(writer, p.unconfigured[0].jail) else try writer.writeAll("<jail>");
+        try writer.writeAll(".\n");
+    }
+    for (p.jails) |jail| {
+        if (jail.count <= p.limit) continue;
+        try printEscaped(writer, "Jail {} has ", .{jail.jail});
+        try writer.print("{d} ignore entries, above the limit of {d}, after a configuration change. Adds are refused until it is at or below {d}.\n", .{ jail.count, p.limit, p.limit });
+    }
+    if (p.redacted) try writer.writeAll("Addresses are redacted unless the caller is an administrator.\n");
 }
 
 pub const ScopeView = struct {
@@ -2731,6 +3679,21 @@ pub fn formatError(
     }
 }
 
+pub fn formatUnknownJail(
+    writer: anytype,
+    jail: []const u8,
+    fmt: OutputFormat,
+    color: Color,
+) !void {
+    var name_buffer: [diagnostic_max_bytes]u8 = undefined;
+    var message_buffer: [diagnostic_max_bytes + 32]u8 = undefined;
+    const message = try std.fmt.bufPrint(&message_buffer, "jail '{s}' is not configured", .{renderDiagnostic(&name_buffer, jail)});
+    if (fmt != .json) return formatError(writer, 404, message, fmt, color);
+    try writer.writeAll("{\"error\":{\"code\":404,\"message\":");
+    try std.json.encodeJsonString(message, .{}, writer);
+    try writer.writeAll("}}\n");
+}
+
 // Expose only the formatter internals exercised by the out-of-module component tests.
 pub const TestAccess = if (@import("builtin").is_test) struct {
     pub const statusForWidth = formatStatusForWidth;
@@ -2748,4 +3711,5 @@ pub const TestAccess = if (@import("builtin").is_test) struct {
     pub const firewallForWidthDetailed = formatFirewallForWidthDetailed;
     pub const firewallStructureRules = writeFirewallStructureRules;
     pub const utc = formatUtc;
+    pub const ignoreListForWidth = formatIgnoreListForWidth;
 } else struct {};
