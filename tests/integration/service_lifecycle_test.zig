@@ -47,6 +47,8 @@ const ConfigOptions = struct {
     state_file: ?[]const u8 = null,
     extra: []const u8 = "",
     journal: bool = false,
+    second_log: ?[]const u8 = null,
+    second_extra: []const u8 = "",
 };
 
 fn writeConfig(h: *harness.Harness, p: *const Paths, opts: ConfigOptions) !void {
@@ -86,6 +88,17 @@ fn writeConfig(h: *harness.Harness, p: *const Paths, opts: ConfigOptions) !void 
             \\logpath = ["{s}"]
             \\
         , .{h.log_path});
+    }
+    if (opts.second_log) |second| {
+        try w.print(
+            \\[jails.sshd2]
+            \\filter = "sshd"
+            \\source = "file"
+            \\timestamp = "undated"
+            \\logpath = ["{s}"]
+            \\{s}
+            \\
+        , .{ second, opts.second_extra });
     }
 }
 
@@ -490,4 +503,171 @@ test "lifecycle: journal jail without journalctl is refused naming the transport
     defer fx.deinit(a);
     try writeConfig(&fx.h, &fx.p, .{ .journal = true });
     try expectRefusal(a, &fx, "journalctl");
+}
+
+const failed_password = "Failed password for root from 203.0.113.7 port 22 ssh2\n";
+
+fn sshdRecordCount(a: std.mem.Allocator, state_file: []const u8) !i64 {
+    var store = try @import("engine").native_store_mod.Store.openReadOnly(a, state_file);
+    defer store.close();
+    return store.inspectInteger("SELECT count(*) FROM records WHERE jail='sshd';");
+}
+
+fn seedOneRecord(a: std.mem.Allocator, fx: *Fixture) !void {
+    try writeConfig(&fx.h, &fx.p, .{});
+    try fx.h.writeLine(failed_password);
+    var d = try Daemon.spawn(a, &fx.h, fx.p.notify, false);
+    defer d.deinit();
+    var buf: [256]u8 = undefined;
+    try fx.h.waitForSocket(5_000);
+    try waitReadyAfterAdmission(&fx.h, fx.rx);
+    var timer = try std.time.Timer.start();
+    while (timer.read() < startup_timeout_ns) {
+        const count = sshdRecordCount(a, fx.p.state_file) catch 0;
+        if (count == 1) break;
+        std.time.sleep(25 * std.time.ns_per_ms);
+    } else return error.TimedOut;
+    try d.signal(posix.SIG.TERM);
+    try fx.rx.expectNext(&buf, "STOPPING=1\n", 5 * std.time.ns_per_s);
+    try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try d.waitBounded(10 * std.time.ns_per_s));
+    try t.expectEqual(@as(i64, 1), try sshdRecordCount(a, fx.p.state_file));
+}
+
+test "lifecycle: a jail added to the configuration starts on the existing state" {
+    const a = t.allocator;
+    var fx = try Fixture.init(a);
+    defer fx.deinit(a);
+    try seedOneRecord(a, &fx);
+
+    const second_log = try std.fmt.allocPrint(a, "{s}/second.log", .{fx.h.tmp_abs});
+    defer a.free(second_log);
+    (try std.fs.cwd().createFile(second_log, .{ .truncate = true })).close();
+    try writeConfig(&fx.h, &fx.p, .{ .second_log = second_log });
+
+    var d = try Daemon.spawn(a, &fx.h, fx.p.notify, false);
+    defer d.deinit();
+    var buf: [256]u8 = undefined;
+    try fx.h.waitForSocket(5_000);
+    try waitReadyAfterAdmission(&fx.h, fx.rx);
+    const jails = try fx.h.sendCommand(.{ .list_jails = {} });
+    defer a.free(jails);
+    try t.expect(std.mem.indexOf(u8, jails, "\"name\":\"sshd\"") != null);
+    try t.expect(std.mem.indexOf(u8, jails, "\"name\":\"sshd2\"") != null);
+    try t.expectEqual(@as(i64, 1), try sshdRecordCount(a, fx.p.state_file));
+
+    try d.signal(posix.SIG.TERM);
+    try fx.rx.expectNext(&buf, "STOPPING=1\n", 5 * std.time.ns_per_s);
+    try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try d.waitBounded(10 * std.time.ns_per_s));
+    try t.expectEqual(@as(i64, 1), try sshdRecordCount(a, fx.p.state_file));
+}
+
+test "lifecycle: a changed ban time on an existing jail is refused at start with the retry generation mismatch" {
+    const a = t.allocator;
+    var fx = try Fixture.init(a);
+    defer fx.deinit(a);
+    try seedOneRecord(a, &fx);
+    try writeConfig(&fx.h, &fx.p, .{ .bantime = 120 });
+    try expectRefusal(a, &fx, "RetryGenerationMismatch");
+    try t.expectEqual(@as(i64, 1), try sshdRecordCount(a, fx.p.state_file));
+}
+
+fn jailObject(json: []const u8, name: []const u8) ![]const u8 {
+    var key_buf: [64]u8 = undefined;
+    const key = try std.fmt.bufPrint(&key_buf, "{{\"name\":\"{s}\"", .{name});
+    const start = std.mem.indexOf(u8, json, key) orelse return error.MissingField;
+    const end = std.mem.indexOfScalarPos(u8, json, start, '}') orelse return error.MissingField;
+    return json[start .. end + 1];
+}
+
+fn jailDecisions(a: std.mem.Allocator, h: *harness.Harness, name: []const u8) !u32 {
+    const jails = try h.sendCommand(.{ .list_jails = {} });
+    defer a.free(jails);
+    return harness.parseJsonUintField(try jailObject(jails, name), "decisions") orelse error.MissingField;
+}
+
+fn waitDecisionsAbove(a: std.mem.Allocator, h: *harness.Harness, name: []const u8, floor: u32) !void {
+    var timer = try std.time.Timer.start();
+    while (timer.read() < startup_timeout_ns) {
+        if (try jailDecisions(a, h, name) > floor) return;
+        std.time.sleep(25 * std.time.ns_per_ms);
+    }
+    return error.TimedOut;
+}
+
+fn jailDetectionCount(a: std.mem.Allocator, state_file: []const u8, comptime jail: []const u8) !i64 {
+    var store = try @import("engine").native_store_mod.Store.openReadOnly(a, state_file);
+    defer store.close();
+    return store.inspectInteger("SELECT count(*) FROM record_detections WHERE pattern IS NOT NULL AND jail='" ++ jail ++ "';");
+}
+
+test "lifecycle: a restart-policy jail whose log is absent at start does not delay readiness or the other jail" {
+    const a = t.allocator;
+    var fx = try Fixture.init(a);
+    defer fx.deinit(a);
+    const second_log = try std.fmt.allocPrint(a, "{s}/second.log", .{fx.h.tmp_abs});
+    defer a.free(second_log);
+    const arrival_log = try std.fmt.allocPrint(a, "{s}/arrival.tmp", .{fx.h.tmp_abs});
+    defer a.free(arrival_log);
+    var buf: [256]u8 = undefined;
+
+    try writeConfig(&fx.h, &fx.p, .{ .maxretry = 1, .second_log = second_log });
+    try fx.h.writeLine("Failed password for root from 203.0.113.7 port 22 ssh2");
+    try std.fs.cwd().writeFile(.{ .sub_path = second_log, .data = "Failed password for root from 203.0.113.8 port 22 ssh2\n" });
+    {
+        var seed = try Daemon.spawn(a, &fx.h, fx.p.notify, false);
+        defer seed.deinit();
+        try fx.h.waitForSocket(5_000);
+        try waitReadyAfterAdmission(&fx.h, fx.rx);
+        var timer = try std.time.Timer.start();
+        while (timer.read() < startup_timeout_ns) {
+            const first = jailDetectionCount(a, fx.p.state_file, "sshd") catch 0;
+            const second = jailDetectionCount(a, fx.p.state_file, "sshd2") catch 0;
+            if (first == 1 and second == 1) break;
+            std.time.sleep(25 * std.time.ns_per_ms);
+        } else return error.TimedOut;
+        try seed.signal(posix.SIG.TERM);
+        try fx.rx.expectNext(&buf, "STOPPING=1\n", 5 * std.time.ns_per_s);
+        try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try seed.waitBounded(10 * std.time.ns_per_s));
+    }
+
+    try std.fs.cwd().deleteFile(second_log);
+    try writeConfig(&fx.h, &fx.p, .{ .maxretry = 1, .second_log = second_log, .second_extra = "on_truncation = \"restart\"" });
+    var d = try Daemon.spawn(a, &fx.h, fx.p.notify, false);
+    defer d.deinit();
+    try fx.h.waitForSocket(5_000);
+    try waitReadyAfterAdmission(&fx.h, fx.rx);
+
+    {
+        const jails = try fx.h.sendCommand(.{ .list_jails = {} });
+        defer a.free(jails);
+        const first = try jailObject(jails, "sshd");
+        try t.expect(std.mem.indexOf(u8, first, "\"healthy\":true") != null);
+        try t.expect(std.mem.indexOf(u8, first, "\"source_paused\":false") != null);
+        const second = try jailObject(jails, "sshd2");
+        try t.expect(std.mem.indexOf(u8, second, "\"source_paused\":false") != null);
+        try t.expect(std.mem.indexOf(u8, second, "\"cause\":\"none\"") != null);
+    }
+
+    const first_floor = try jailDecisions(a, &fx.h, "sshd");
+    try fx.h.writeLine("Failed password for root from 203.0.113.9 port 22 ssh2");
+    try waitDecisionsAbove(a, &fx.h, "sshd", first_floor);
+
+    const second_floor = try jailDecisions(a, &fx.h, "sshd2");
+    try std.fs.cwd().writeFile(.{ .sub_path = arrival_log, .data = "Failed password for root from 203.0.113.10 port 22 ssh2\n" });
+    try std.fs.cwd().rename(arrival_log, second_log);
+    try waitDecisionsAbove(a, &fx.h, "sshd2", second_floor);
+    try t.expectEqual(@as(i64, 2), try jailDetectionCount(a, fx.p.state_file, "sshd2"));
+    {
+        var store = try @import("engine").native_store_mod.Store.openReadOnly(a, fx.p.state_file);
+        defer store.close();
+        try t.expectEqual(@as(i64, 1), try store.inspectInteger("SELECT count(*) FROM continuity_loss_events WHERE reason=3;"));
+        try t.expectEqual(@as(i64, 1), try store.inspectInteger("SELECT count(*) FROM continuity_loss_events;"));
+    }
+    const jails = try fx.h.sendCommand(.{ .list_jails = {} });
+    defer a.free(jails);
+    try t.expect(std.mem.indexOf(u8, try jailObject(jails, "sshd2"), "\"source_paused\":false") != null);
+
+    try d.signal(posix.SIG.TERM);
+    try fx.rx.expectNext(&buf, "STOPPING=1\n", 5 * std.time.ns_per_s);
+    try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try d.waitBounded(10 * std.time.ns_per_s));
 }

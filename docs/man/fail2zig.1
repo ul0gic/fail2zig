@@ -168,7 +168,8 @@ so this is not a lifetime ban count. The machine-readable key remains
 .RS
 .PP
 Paused sources. A file source that cannot resume (truncated in place below its
-committed offset, or a rotated-out file removed with unread bytes, under
+committed offset, a rotated-out file removed with unread bytes, or a log replaced by a
+different file whose previous file is gone, under
 .BR "on_truncation = \(dqrefuse\(dq" )
 is paused, and the daemon keeps running. When paused sources are the only reason protection
 is degraded, the cause is
@@ -189,9 +190,10 @@ row with its retained event count and the latest event.
 .B --details
 adds a section listing every retained continuity-loss event, newest first, up to 256
 per source: jail, path, time, reason
-.RB ( truncated
+.RB ( truncated ,
+.B rotated_unread_removed
 or
-.BR rotated_unread_removed ),
+.BR replaced ),
 inode, committed offset and observed size. Records written after the committed offset
 and removed before they were read were never read; an event records that loss and does
 not recover the records.
@@ -669,8 +671,9 @@ daemon exits 3. See
 .
 .SH REPAIR-SOURCE
 A file source truncated in place below its committed position (for example a
-PortSentry history file that the scanner empties on start), or a rotated-out file
-removed while it still held unread bytes, is not silently re-read under the default
+PortSentry history file that the scanner empties on start), a rotated-out file
+removed while it still held unread bytes, or a log replaced by a different file whose
+previous file exists nowhere in its directory, is not silently re-read under the default
 .BR "on_truncation = \(dqrefuse\(dq" .
 The daemon starts with that source paused: the startup journal line and
 .B fail2zig status
@@ -680,9 +683,12 @@ stopped,
 acknowledges the loss for one configured file source. After a truncation in place it
 restarts the source at offset 0 of the current file. After a removed rotated file it
 records the loss of that file's unread bytes and resumes the current file at its
-committed offset, not at 0. It holds the state lock, never creates state, and
-refuses a source that is neither truncated in place nor missing a removed rotated
-incarnation (nothing to acknowledge), a pending receipt for that source, consumer
+committed offset, not at 0. After a replaced log it records the loss of the previous
+file's unread bytes and restarts the source at offset 0 of the file now at the path.
+It holds the state lock, never creates state, and
+refuses a source that is not truncated in place, not replaced with its previous file
+gone, and not missing a removed rotated incarnation (nothing to acknowledge: an absent
+path, a rewrite in place, or a previous file still in its directory), a pending receipt for that source, consumer
 state that is not ready, or a checkpoint changed since observation. Other sources,
 owners and ban deadlines are not changed.
 .PP
@@ -702,8 +708,8 @@ different token after a successful repair is refused, because the source is no l
 truncated. The newest 256
 outcomes are retained; an older token stays reserved and is refused. Data written
 after the committed position and removed by the truncation was never read and cannot
-be recovered (for a removed rotated file, the records after its committed offset), and lines
-still in the file are read again. Stopping the daemon for the
+be recovered (for a removed rotated file or a replaced log, the records after the
+committed offset of the file that is gone), and lines still in the file are read again. Stopping the daemon for the
 repair withdraws its firewall rules for every jail until the next start reinstalls
 them from durable state. Exit 0 on success or replay, 1 on refusal, 2 on usage errors.
 .
@@ -790,8 +796,8 @@ backup the upgrade wrote over the state file, removing the upgraded database's
 WAL/SHM files, and reinstalling the binary that last wrote that state.
 .PP
 The first start on state whose saved detection generations hashed the ignore list
-rekeys them once, before admission validation, and logs
-.BR "saved detection generations rekeyed without the ignore list" .
+or the per-jail subject share rekeys them once, before admission validation, and logs
+.BR "saved detection generations rekeyed without the ignore list or the subject share" .
 No ban, deadline, checkpoint or retry subject changes, and later starts write nothing.
 A configuration that still differs from saved state in another way keeps its existing
 .B RetryGenerationMismatch

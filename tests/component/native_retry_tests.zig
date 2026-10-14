@@ -629,3 +629,93 @@ test "native retry: failed pending record aging out cannot create a decision" {
 }
 
 pub const store_tests = @import("store/tests.zig");
+
+const share_generation = StoreFixture.generation;
+const share_policy = retry.Policy{ .maxretry = 3, .window_us = 10_000_000, .duration = .{ .finite_us = 60_000_000 }, .max_subjects = 2048, .enforce = true };
+
+const ShareFixture = struct {
+    tmp: t.TmpDir,
+    path: []u8,
+    store: durable.Store,
+    fn init() !ShareFixture {
+        var tmp = t.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const root = try tmp.dir.realpathAlloc(t.allocator, ".");
+        defer t.allocator.free(root);
+        const path = try std.fs.path.join(t.allocator, &.{ root, "share.sqlite" });
+        errdefer t.allocator.free(path);
+        var store = try durable.Store.open(t.allocator, path);
+        errdefer store.close();
+        try admitted(&store);
+        try enableLatestFromRetry(&store);
+        try store.enableApplicationHistory();
+        try store.enableEscalation();
+        return .{ .tmp = tmp, .path = path, .store = store };
+    }
+    fn deinit(self: *ShareFixture) void {
+        self.store.close();
+        t.allocator.free(self.path);
+        self.tmp.cleanup();
+    }
+    fn reopen(self: *ShareFixture) !void {
+        self.store.close();
+        self.store = try durable.Store.open(t.allocator, self.path);
+        try self.store.enableReceipts(2);
+    }
+};
+
+test "native retry: admission with a different subject share passes and refreshes the stored share" {
+    var f = try ShareFixture.init();
+    defer f.deinit();
+    var regrown = share_policy;
+    regrown.max_subjects = 1365;
+    try f.store.admitRetry("ssh", share_generation, share_policy);
+    try t.expectEqualDeep(share_policy, (try f.store.readRetryPolicy("ssh")).?.policy);
+
+    try f.store.validateRuntimeAdmissions(&.{.{ .jail = "ssh", .generation = share_generation, .policy = regrown }}, null);
+    try f.store.admitRetry("ssh", share_generation, regrown);
+
+    const saved = (try f.store.readRetryPolicy("ssh")).?;
+    try t.expectEqual(@as(u32, 1365), saved.policy.max_subjects);
+    try t.expectEqualDeep(regrown, saved.policy);
+    try t.expectEqualSlices(u8, &share_generation, &saved.generation);
+
+    try f.reopen();
+    try f.store.validateRuntimeAdmissions(&.{.{ .jail = "ssh", .generation = share_generation, .policy = regrown }}, null);
+    try t.expectEqualDeep(regrown, (try f.store.readRetryPolicy("ssh")).?.policy);
+}
+
+test "native retry: a changed ban time still refuses admission" {
+    var f = try ShareFixture.init();
+    defer f.deinit();
+    try f.store.admitRetry("ssh", share_generation, share_policy);
+    var longer = share_policy;
+    longer.duration = .{ .finite_us = 120_000_000 };
+    try t.expectError(error.RetryGenerationMismatch, f.store.validateRuntimeAdmissions(&.{.{ .jail = "ssh", .generation = share_generation, .policy = longer }}, null));
+    var longer_and_regrown = longer;
+    longer_and_regrown.max_subjects = 1365;
+    try t.expectError(error.RetryGenerationMismatch, f.store.validateRuntimeAdmissions(&.{.{ .jail = "ssh", .generation = share_generation, .policy = longer_and_regrown }}, null));
+    try t.expectError(error.RetryGenerationMismatch, f.store.admitRetry("ssh", share_generation, longer_and_regrown));
+    try t.expectEqualDeep(share_policy, (try f.store.readRetryPolicy("ssh")).?.policy);
+}
+
+test "native retry: policy identity ignores the subject share" {
+    var regrown = share_policy;
+    regrown.max_subjects = 1365;
+    const identity_before = try share_policy.identity();
+    const identity_after = try regrown.identity();
+    try t.expectEqualSlices(u8, &identity_before, &identity_after);
+    const encoded_before = try share_policy.encode();
+    const encoded_after = try regrown.encode();
+    try t.expect(!std.mem.eql(u8, &encoded_before, &encoded_after));
+    try t.expectEqualSlices(u8, &[_]u8{0} ** 4, identity_before[24..28]);
+
+    var stricter = share_policy;
+    stricter.maxretry = 2;
+    const identity_stricter = try stricter.identity();
+    try t.expect(!std.mem.eql(u8, &identity_before, &identity_stricter));
+    var longer = share_policy;
+    longer.duration = .{ .finite_us = 120_000_000 };
+    const identity_longer = try longer.identity();
+    try t.expect(!std.mem.eql(u8, &identity_before, &identity_longer));
+}

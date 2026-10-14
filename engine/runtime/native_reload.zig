@@ -222,7 +222,7 @@ pub fn jailDigest(name: []const u8, policy: retry.Policy, plan_generation: [32]u
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("fail2zig-config-generation-jail-v1\x00");
     hash.update(name);
-    hash.update(&try policy.encode());
+    hash.update(&try policy.identity());
     hash.update(&try policy.escalation.encode());
     hash.update(&plan_generation);
     var out: [32]u8 = undefined;

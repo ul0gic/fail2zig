@@ -171,7 +171,7 @@ fn refusal(stderr: anytype, options: Options, err: repair.Error, diagnostic: rep
     const reason: []const u8 = switch (err) {
         error.TokenUnknownStateMismatch => "token unknown; state no longer matches (repair may already be applied)",
         error.RepairTokenMismatch => "token was already used with a different jail or source; choose a new token",
-        error.UnsupportedDiscontinuity => "the source is neither truncated in place nor missing a removed rotated incarnation; nothing to acknowledge",
+        error.UnsupportedDiscontinuity => "the source is not truncated in place, not replaced with its previous file gone, and not missing a removed rotated incarnation; an absent path, a rewrite in place and a previous file still in its directory have nothing to acknowledge",
         error.PendingReceipt => "an admitted record of this source is still pending; start the daemon after the source is restored so it commits, then retry",
         error.ConsumerWorkPending => "consumer state for this source is not ready; nothing was changed",
         error.StaleGeneration => "the source's recorded generation disagrees with its checkpoint or consumer manifest; offline repair cannot resolve this and nothing was changed",
@@ -245,15 +245,24 @@ fn reportRemoved(stdout: anytype, options: Options, outcome: repair.Outcome, rem
 fn report(stdout: anytype, options: Options, outcome: repair.Outcome) !void {
     if (outcome.removed) |removed| return reportRemoved(stdout, options, outcome, removed);
     const hex = std.fmt.fmtSliceHexLower;
-    try stdout.print("repair-source: {s}\n", .{if (outcome.replayed) "already applied by this token (replayed; nothing changed now)" else "truncation acknowledged"});
+    try stdout.print("repair-source: {s}\n", .{if (outcome.replayed) "already applied by this token (replayed; nothing changed now)" else if (outcome.replaced_file) "replaced file acknowledged" else "truncation acknowledged"});
     try stdout.print("  jail={s} source={s}\n  path={s}\n", .{ options.jail, outcome.source, options.source });
     try stdout.print("  generation={s}\n  checkpoint_revision={d} -> {d}\n  prior_cursor_sha256={s}\n", .{ hex(&outcome.generation), outcome.prior_checkpoint_revision, outcome.prior_checkpoint_revision + 1, hex(&outcome.prior_cursor_sha256) });
     if (outcome.prior_incarnation) |incarnation| try stdout.print("  prior_incarnation={s} prior_offset={d}\n", .{ hex(&incarnation), outcome.prior_offset.? });
     try stdout.print("  new_incarnation={s} new_offset=0\n  file device={d} inode={d} size={d} prefix_sha256={s}\n", .{ hex(&outcome.new_incarnation), outcome.file.device, outcome.file.inode, outcome.file.size, hex(&outcome.file.prefix_sha256) });
-    try stdout.writeAll(
+    if (outcome.replaced_file) try stdout.writeAll(
+        \\Data written to the previous file after the committed offset was never read. That file
+        \\is gone, so its extent is unknown and it cannot be recovered. Reading restarts at
+        \\offset 0 of the file now at the path, so any lines already in it are read under the
+        \\new incarnation.
+        \\
+    ) else try stdout.writeAll(
         \\Data written after the committed offset and removed by the truncation was never read.
         \\Its extent is unknown and it cannot be recovered. Reading restarts at offset 0 of the
         \\current file, so any older lines still in it are read again under the new incarnation.
+        \\
+    );
+    try stdout.writeAll(
         \\While the daemon is stopped, protection for every jail may be absent: the stop can
         \\remove installed firewall rules. The next start reinstalls them from durable state
         \\before it reports READY; start fail2zig now.

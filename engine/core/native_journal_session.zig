@@ -58,6 +58,7 @@ pub const Options = struct {
     consumer_sources: ?@import("native_file_session.zig").ConsumerSources = null,
     retry: ?@import("native_retry.zig").Policy = null,
     suppress_retry_enforcement: bool = false,
+    retry_hash: @import("native_retry.zig").HashForm = .identity,
     journal: transport.Options = .{},
     source_id: []const u8 = "system-journal",
     gate: ?*health.Gate = null,
@@ -151,7 +152,7 @@ pub const Session = struct {
         var bound = options.processing;
         std.crypto.hash.sha2.Sha256.hash(specification, &bound.parent_generation, .{});
         var processor = if (options.staged_detection) |consumer| try native.Processor.initWithStaged(a, bound, scratch, now, consumer) else try native.Processor.initWithJournalDetection(a, bound, scratch, now, options.detection);
-        if (options.retry) |policy| try processor.bindRetry(policy, options.suppress_retry_enforcement);
+        if (options.retry) |policy| try processor.bindRetry(policy, options.suppress_retry_enforcement, options.retry_hash);
         return processor;
     }
 

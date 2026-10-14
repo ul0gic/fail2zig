@@ -124,8 +124,9 @@ into place instead of moving it, move the backup file aside before the next
 upgrade, because an existing backup file refuses the start.
 
 A file source that cannot resume does not stop the daemon. This covers a file
-truncated in place below its saved position and a rotated-out file removed while it
-still held unread bytes. The daemon pauses that source, restores bans for every
+truncated in place below its saved position, a rotated-out file removed while it
+still held unread bytes, and a log replaced by a different file whose previous file is
+gone. The daemon pauses that source, restores bans for every
 jail, enforces every other enabled jail, sends `READY=1` and keeps running, so
 `systemctl is-active fail2zig` reports `active` and protection reports degraded
 with cause `SourcePaused`. `fail2zig status` and the startup journal line name the
@@ -139,10 +140,13 @@ The jail's `on_truncation` key chooses what happens next (see `fail2zig.toml(5)`
   `repair-source` command (see `fail2zig(1)`) and start the daemon. The stop
   withdraws firewall rules until the next start reinstalls them.
 - `"restart"` resumes the source without pausing and records a durable
-  continuity-loss event, shown by `fail2zig status`.
+  continuity-loss event, shown by `fail2zig status`. A replaced log resumes at offset
+  0 of the new file. While the log is absent the source reports `missing` and waits,
+  then resumes when the file appears.
 
 Under either setting, records written after the saved position and removed before
-they were read were never read and cannot be recovered.
+they were read, or left in a replaced file that is gone, were never read and cannot be
+recovered.
 
 If storage is unhealthy when the daemon stops, it leaves installed firewall rules
 in place and logs how many remain; the next start reconciles them. A healthy stop

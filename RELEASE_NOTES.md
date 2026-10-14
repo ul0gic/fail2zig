@@ -21,10 +21,20 @@ a reload, and per-jail exclusions can be managed at runtime. It addresses #98,
   today's behavior) pauses the source until `fail2zig repair-source` acknowledges
   the loss, while the daemon keeps running and other jails enforce; `restart`
   resumes at the new start of the file and records a durable continuity-loss
-  event. `fail2zig status` lists paused sources and retained loss events.
+  event. `fail2zig status` lists paused sources and retained loss events. The
+  same policy and the same command also cover a log deleted and recreated by
+  its writer (PortSentry recreates its history file at every start): the
+  source resumes at the start of the new file and records a `replaced` loss
+  event; under `refuse` the printed `repair-source` command acknowledges it.
+  A log recreated while the daemon runs is read without loss, and the old,
+  unlinked file retires instead of counting against the source limit.
 - Apply literal `ignoreip` edits through `fail2zig reload` without a restart
-  refusal. Saved detection generations are rekeyed once at the first start so the
-  ignore list no longer forms part of their identity.
+  refusal, and start on the existing state after a jail is added or enabled.
+  The share of the subject budget each jail receives changes with the jail
+  count and was part of every jail's saved identity, so adding a jail was
+  refused with `RetryGenerationMismatch` until the state was recreated. Saved
+  detection generations are rekeyed once at the first start so neither the
+  ignore list nor that share forms part of their identity.
 - Add `fail2zig ignore add`, `ignore remove` and `ignore list`. Runtime entries
   are stored in the state database, survive restart and reload, and merge with
   the configured `ignoreip`. An existing ban stays until its deadline unless

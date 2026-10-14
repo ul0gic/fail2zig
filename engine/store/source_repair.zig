@@ -18,6 +18,7 @@ const max_path_rows = 64;
 const outcome_truncation_acknowledged: i64 = 1;
 const outcome_evicted: i64 = 2;
 const outcome_removed_incarnation_acknowledged: i64 = 3;
+const outcome_replaced_file_acknowledged: i64 = 4;
 
 pub const Error = store_mod.Error || error{
     InvalidRepairRequest,
@@ -73,6 +74,7 @@ pub const Outcome = struct {
     file: FileIdentity,
     committed_us: i64,
     removed: ?RemovedIncarnation = null,
+    replaced_file: bool = false,
 
     pub fn deinit(self: Outcome, allocator: std.mem.Allocator) void {
         allocator.free(self.source);
@@ -118,6 +120,7 @@ const Plan = struct {
     generation: [32]u8,
     revision: u64,
     size: u64,
+    replaced: bool = false,
 
     fn deinit(self: Plan, allocator: std.mem.Allocator) void {
         allocator.free(self.source);
@@ -181,11 +184,13 @@ fn readRow(store: *Store, allocator: std.mem.Allocator, request: Request, key: [
     const inode = try unsigned(try row.signed(6));
     var buffer: [store_mod.Limits.source_bytes + 128]u8 = undefined;
     const expected = try sourceId(&buffer, request.jail, request.path, device, inode);
-    if (!std.mem.eql(u8, try row.boundedBytes(0, 64), request.jail) or !std.mem.eql(u8, try row.boundedBytes(1, store_mod.Limits.source_bytes), expected))
-        return error.RepairTokenMismatch;
+    const stored = try row.boundedBytes(1, store_mod.Limits.source_bytes);
+    const same_path = request.jail.len + 1 + request.path.len + 1;
+    const named = if (outcome == outcome_replaced_file_acknowledged) stored.len > same_path and std.mem.eql(u8, stored[0..same_path], expected[0..same_path]) else std.mem.eql(u8, stored, expected);
+    if (!std.mem.eql(u8, try row.boundedBytes(0, 64), request.jail) or !named) return error.RepairTokenMismatch;
     return .{
         .replayed = true,
-        .source = try allocator.dupe(u8, expected),
+        .source = try allocator.dupe(u8, stored),
         .generation = try fixed(32, &row, 2),
         .prior_cursor_sha256 = try fixed(32, &row, 3),
         .prior_checkpoint_revision = try unsigned(try row.signed(4)),
@@ -195,6 +200,7 @@ fn readRow(store: *Store, allocator: std.mem.Allocator, request: Request, key: [
         .file = .{ .device = device, .inode = inode, .size = try unsigned(try row.signed(7)), .prefix_sha256 = try fixed(32, &row, 8) },
         .committed_us = try row.signed(10),
         .removed = if (outcome == outcome_removed_incarnation_acknowledged) .{ .inode = inode, .last_size = null, .committed_offset = null, .current_inode = null, .current_offset = null } else null,
+        .replaced_file = outcome == outcome_replaced_file_acknowledged,
     };
 }
 
@@ -437,9 +443,79 @@ fn alternative(store: *Store, allocator: std.mem.Allocator, request: Request, ke
             return error.LossAlreadyRecorded;
         }
     }
-    const plan = (try observeRemoved(store, allocator, request, file)) orelse return original;
-    defer plan.deinit(allocator);
-    return commitRemoved(store, allocator, request, key, file, plan, now_us, hooks);
+    if (try observeRemoved(store, allocator, request, file)) |removed| {
+        defer removed.deinit(allocator);
+        return commitRemoved(store, allocator, request, key, file, removed, now_us, hooks);
+    }
+    if (diagnostic.shape != .replaced) return original;
+    const replaced = (try observeReplaced(store, allocator, request, file)) orelse return original;
+    defer replaced.deinit(allocator);
+    return commit(store, allocator, request, key, file, replaced, now_us, hooks);
+}
+
+fn observeReplaced(store: *Store, allocator: std.mem.Allocator, request: Request, file: std.fs.File) Error!?Plan {
+    const stat = std.posix.fstat(file.handle) catch return error.SourceUnreadable;
+    if (!std.posix.S.ISREG(stat.mode)) return error.SourceUnreadable;
+    const size = std.math.cast(u64, stat.size) orelse return error.SourceUnreadable;
+
+    try store.beginRead();
+    errdefer store.rollback();
+    var rows = try store.statement("SELECT source,cursor FROM source_cursors WHERE jail=?1 AND path=?2 ORDER BY source;");
+    defer rows.deinit();
+    try rows.text(1, request.jail);
+    try rows.text(2, request.path);
+    var count: usize = 0;
+    var selected: ?Plan = null;
+    errdefer if (selected) |value| value.deinit(allocator);
+    while (try rows.row()) {
+        count += 1;
+        if (count > max_path_rows) return error.SourceAmbiguous;
+        const cursor = try rows.boundedBytes(1, store_mod.Limits.cursor_bytes);
+        const parsed = std.json.parseFromSlice(files.Resume, allocator, cursor, .{}) catch return error.InvalidRecord;
+        defer parsed.deinit();
+        const prior = parsed.value;
+        if (prior.version != 2 or prior.prefix_len > 64) return error.InvalidRecord;
+        if (selected != null or try inodePresent(request.path, prior.device, prior.inode)) continue;
+        const source = try allocator.dupe(u8, try rows.boundedBytes(0, store_mod.Limits.source_bytes));
+        errdefer allocator.free(source);
+        const prior_cursor = try allocator.dupe(u8, cursor);
+        errdefer allocator.free(prior_cursor);
+        selected = .{ .source = source, .prior_cursor = prior_cursor, .prior = prior, .next = files.restartedIncarnation(file, prior) catch return error.SourceUnreadable, .generation = undefined, .revision = undefined, .size = size, .replaced = true };
+    }
+    var plan = selected orelse {
+        try store.commitTransaction();
+        return null;
+    };
+    const checkpoint = try readCheckpoint(store, request.jail);
+    plan.generation = checkpoint.generation;
+    plan.revision = checkpoint.revision;
+    try store.commitTransaction();
+    selected = null;
+    return plan;
+}
+
+fn insertLossEvent(store: *Store, event: files.LossEvent) Error!void {
+    {
+        var row = try store.statement("INSERT INTO continuity_loss_events(jail,path,source,wall_us,reason,inode,committed_offset,observed_size) VALUES(?1,?2,?3,?4,?5,?6,?7,?8);");
+        defer row.deinit();
+        try row.text(1, event.jail);
+        try row.text(2, event.path);
+        try row.text(3, event.source_id);
+        try row.int(4, event.wall_us);
+        try row.int(5, @intFromEnum(event.reason));
+        try row.int(6, std.math.cast(i64, event.inode) orelse return error.StorageLimit);
+        try row.int(7, std.math.cast(i64, event.committed_offset) orelse return error.StorageLimit);
+        if (event.observed_size) |size| try row.int(8, std.math.cast(i64, size) orelse return error.StorageLimit) else try store.check(store.api.bind_null(row.ptr, 8));
+        try row.done();
+    }
+    {
+        var row = try store.statement("DELETE FROM continuity_loss_events WHERE jail=?1 AND path=?2 AND sequence NOT IN (SELECT sequence FROM continuity_loss_events WHERE jail=?1 AND path=?2 ORDER BY sequence DESC LIMIT ?3);");
+        defer row.deinit();
+        try row.text(1, event.jail);
+        try row.text(2, event.path);
+        try row.int(3, continuity.retained_events_per_source);
+        try row.done();
+    }
 }
 
 fn commitRemoved(store: *Store, allocator: std.mem.Allocator, request: Request, key: [32]u8, file: std.fs.File, plan: RemovedPlan, now_us: i64, hooks: Hooks) Error!Outcome {
@@ -463,27 +539,17 @@ fn commitRemoved(store: *Store, allocator: std.mem.Allocator, request: Request, 
     try requireNoPendingWork(store, request, plan.source, plan.generation);
     const held = try requireNamedFile(request, file);
     if (@as(u64, @intCast(held.dev)) != plan.current_device or @as(u64, @intCast(held.ino)) != plan.current_inode) return error.SourceChanged;
-    {
-        var row = try store.statement("INSERT INTO continuity_loss_events(jail,path,source,wall_us,reason,inode,committed_offset,observed_size) VALUES(?1,?2,?3,?4,?5,?6,?7,?8);");
-        defer row.deinit();
-        try row.text(1, request.jail);
-        try row.text(2, request.path);
-        try row.text(3, plan.source);
-        try row.int(4, now_us);
-        try row.int(5, @intFromEnum(files.LossReason.rotated_unread_removed));
-        try row.int(6, std.math.cast(i64, plan.prior.inode) orelse return error.StorageLimit);
-        try row.int(7, std.math.cast(i64, plan.prior.offset) orelse return error.StorageLimit);
-        if (plan.prior.observed_size) |size| try row.int(8, std.math.cast(i64, size) orelse return error.StorageLimit) else try store.check(store.api.bind_null(row.ptr, 8));
-        try row.done();
-    }
-    {
-        var row = try store.statement("DELETE FROM continuity_loss_events WHERE jail=?1 AND path=?2 AND sequence NOT IN (SELECT sequence FROM continuity_loss_events WHERE jail=?1 AND path=?2 ORDER BY sequence DESC LIMIT ?3);");
-        defer row.deinit();
-        try row.text(1, request.jail);
-        try row.text(2, request.path);
-        try row.int(3, continuity.retained_events_per_source);
-        try row.done();
-    }
+    try insertLossEvent(store, .{
+        .sequence = 0,
+        .jail = request.jail,
+        .path = request.path,
+        .source_id = plan.source,
+        .wall_us = now_us,
+        .reason = .rotated_unread_removed,
+        .inode = plan.prior.inode,
+        .committed_offset = plan.prior.offset,
+        .observed_size = plan.prior.observed_size,
+    });
     {
         var row = try store.statement("DELETE FROM source_cursors WHERE jail=?1 AND source=?2 AND cursor=?3;");
         defer row.deinit();
@@ -610,6 +676,17 @@ fn commit(store: *Store, allocator: std.mem.Allocator, request: Request, key: [3
     if (!std.mem.eql(u8, &checkpoint.generation, &plan.generation)) return error.StaleGeneration;
     try requireNoPendingWork(store, request, plan.source, plan.generation);
     try requireUnchangedFile(request, file, plan);
+    if (plan.replaced) try insertLossEvent(store, .{
+        .sequence = 0,
+        .jail = request.jail,
+        .path = request.path,
+        .source_id = plan.source,
+        .wall_us = now_us,
+        .reason = .replaced,
+        .inode = plan.prior.inode,
+        .committed_offset = plan.prior.offset,
+        .observed_size = plan.size,
+    });
     {
         var row = try store.statement("UPDATE source_cursors SET cursor=?3 WHERE jail=?1 AND source=?2 AND cursor=?4;");
         defer row.deinit();
@@ -636,7 +713,7 @@ fn commit(store: *Store, allocator: std.mem.Allocator, request: Request, key: [3
         .size = size,
         .prefix_sha256 = plan.next.prefix_hash,
         .incarnation = plan.next.incarnation,
-        .outcome = outcome_truncation_acknowledged,
+        .outcome = if (plan.replaced) outcome_replaced_file_acknowledged else outcome_truncation_acknowledged,
     }, now_us);
     if (builtin.is_test) if (hooks.fail_at == .before_commit) return error.InjectedFailure;
     try store.commitTransaction();
@@ -653,5 +730,6 @@ fn commit(store: *Store, allocator: std.mem.Allocator, request: Request, key: [3
         .new_incarnation = plan.next.incarnation,
         .file = .{ .device = plan.next.device, .inode = plan.next.inode, .size = plan.size, .prefix_sha256 = plan.next.prefix_hash },
         .committed_us = committed_us,
+        .replaced_file = plan.replaced,
     };
 }

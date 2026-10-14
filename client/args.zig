@@ -879,7 +879,7 @@ pub const help_top =
     \\    firewall show       Inspect sampled fail2zig-owned kernel protection
     \\    history reset <ip>  Reset an address's ban history in one jail or all jails
     \\    jail <action> <n>   enable, disable, pause or resume a jail
-    \\    repair-source       Acknowledge a truncated file source (daemon stopped)
+    \\    repair-source       Acknowledge a truncated or replaced file source (daemon stopped)
     \\    completions <sh>    Emit shell-completion script (bash|zsh|fish)
     \\    help [command]      Show help for a command
     \\
@@ -1045,7 +1045,7 @@ pub const help_jail =
 ;
 
 pub const help_repair_source =
-    \\fail2zig repair-source — acknowledge an in-place truncated file source
+    \\fail2zig repair-source — acknowledge a truncated or replaced file source
     \\
     \\USAGE:
     \\    fail2zig repair-source --jail <name> --source <absolute path> --token <token>
@@ -1053,10 +1053,12 @@ pub const help_repair_source =
     \\
     \\Runs locally against the state file named by the config, only while the daemon is
     \\stopped; it refuses when the state is locked or absent and never creates state.
-    \\It accepts only a same-inode truncation of a recorded source with no pending
-    \\receipt, and restarts that source at offset 0 of the current file.
+    \\It accepts a same-inode truncation, or a log replaced by a different file whose
+    \\previous file is gone, of a recorded source with no pending receipt, and restarts
+    \\that source at offset 0 of the current file.
     \\
-    \\Data removed by the truncation before it was read is lost; its extent is unknown.
+    \\Data removed by the truncation or left in the previous file before it was read is
+    \\lost; its extent is unknown.
     \\Protection for every jail may be absent while the daemon is stopped; the next
     \\start reinstalls it before reporting READY.
     \\

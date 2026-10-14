@@ -8,6 +8,7 @@ const loss_files = @import("engine_test").core.durable_file_source;
 const journal = @import("engine_test").core.native_journal_session;
 const transport = @import("engine_test").core.native_journal_transport;
 const repair = @import("engine_test").core.source_repair;
+const store_repair = @import("engine_test").store.source_repair;
 const records = @import("engine_test").core.source_record;
 const time = @import("engine_test").core.native_time;
 const health = @import("engine_test").core.storage_health;
@@ -1280,4 +1281,228 @@ test "native session repair: pure generation source binding bounds and allocatio
     };
     try t.checkAllAllocationFailures(t.allocator, Oom.check, .{ file_options, journal_options });
     try t.expectEqual(@as(usize, 0), mock.calls);
+}
+
+const Committed = struct { inode: u64, offset: u64 };
+
+fn enableRuntime(f: *Fixture) !void {
+    try f.store.enableLoadRepair(.{ .state_path = f.database, .now_us = 1_000_000, .history_max_matches = 10 }, null);
+    try f.store.enableJournalDetection();
+    try f.store.enableRetry();
+    try f.store.enableConsumers();
+    try f.store.enableTimeProvenance();
+    try f.store.enableConsumerManifests();
+    try f.store.enableConfirmedHistory();
+    try f.store.enableMaintenance();
+    try f.store.enableCleanup();
+    try f.store.enableRetryLeases();
+    try f.store.enableApplicationHistory();
+    try f.store.enableEscalation();
+    try f.store.enableCanonicalEffects();
+    try f.store.enableHistoryResets();
+    try f.store.enableActionTargets();
+    try f.store.enableAdminState();
+    try f.store.enableMigrationState();
+    try f.store.enableLoadRepair(.{ .state_path = f.database, .now_us = 1_000_000, .history_max_matches = 10 }, null);
+    try f.store.enableRuntimeState(.{ .state_path = f.database, .now_us = 1_000_000, .history_max_matches = 10 }, true);
+}
+
+fn drain(session: *files.Session) !usize {
+    var total: usize = 0;
+    for (0..64) |_| total += try session.pollTurn(1);
+    return total;
+}
+
+fn commitLines(f: *Fixture, clock: *Clock, lines: usize) !Committed {
+    const session = try files.Session.createDeferred(t.allocator, &f.store, clock.fileOptions(), &.{.{ .pattern = f.path }});
+    defer session.destroy();
+    try admitFile(session);
+    try t.expectEqual(lines, try drain(session));
+    const committed = session.sources.sources.items[0].committed.?;
+    return .{ .inode = committed.inode, .offset = committed.offset };
+}
+
+fn replaceLog(f: *Fixture, data: []const u8) !void {
+    try f.tmp.dir.writeFile(.{ .sub_path = "replacement.tmp", .data = data });
+    try f.tmp.dir.deleteFile("active.log");
+    try f.tmp.dir.rename("replacement.tmp", "active.log");
+}
+
+fn lossCount(f: *Fixture) !i64 {
+    return f.store.inspectInteger("SELECT count(*) FROM continuity_loss_events;");
+}
+
+fn replacedCount(f: *Fixture, inode: u64, offset: u64) !i64 {
+    const sql = try std.fmt.allocPrintZ(t.allocator, "SELECT count(*) FROM continuity_loss_events WHERE reason={d} AND inode={d} AND committed_offset={d};", .{ @intFromEnum(loss_files.LossReason.replaced), inode, offset });
+    defer t.allocator.free(sql);
+    return f.store.inspectInteger(sql);
+}
+
+test "native session repair: restart policy resumes a replaced file at offset zero and records a replaced loss" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try enableRuntime(&f);
+    try f.tmp.dir.writeFile(.{ .sub_path = "active.log", .data = "first\nsecond\nthird\n" });
+    var clock = Clock{};
+    const old = try commitLines(&f, &clock, 3);
+    const fresh = "fresh one\nfresh two\n";
+    try replaceLog(&f, fresh);
+    const new_inode = (try f.tmp.dir.statFile("active.log")).inode;
+    try t.expect(new_inode != old.inode);
+    var options = clock.fileOptions();
+    options.on_truncation = .restart;
+    const session = try files.Session.createDeferred(t.allocator, &f.store, options, &.{.{ .pattern = f.path }});
+    defer session.destroy();
+    try admitFile(session);
+    try t.expectEqual(@as(usize, 2), try drain(session));
+    const source = &session.sources.sources.items[0];
+    try t.expectEqual(new_inode, source.committed.?.inode);
+    try t.expectEqual(@as(u64, fresh.len), source.committed.?.offset);
+    try t.expectEqual(records.Health.healthy, source.health);
+    try t.expectEqual(repair.Phase.healthy, session.repairSnapshot().phase);
+    try t.expectEqual(@as(i64, 1), try lossCount(&f));
+    try t.expectEqual(@as(i64, 1), try replacedCount(&f, old.inode, old.offset));
+    const loss = session.policyLossEvent().?;
+    try t.expectEqual(loss_files.LossReason.replaced, loss.reason);
+    try t.expectEqual(old.inode, loss.inode);
+    try t.expectEqual(old.offset, loss.committed_offset);
+    try t.expectEqual(@as(?u64, fresh.len), loss.observed_size);
+}
+
+test "native session repair: refuse policy pauses a replaced file and repair-source acknowledges it" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try enableRuntime(&f);
+    try f.tmp.dir.writeFile(.{ .sub_path = "active.log", .data = "first\nsecond\nthird\n" });
+    var clock = Clock{};
+    const old = try commitLines(&f, &clock, 3);
+    const fresh = "fresh one\nfresh two\n";
+    try replaceLog(&f, fresh);
+    {
+        const paused = try files.Session.createDeferred(t.allocator, &f.store, clock.fileOptions(), &.{.{ .pattern = f.path }});
+        defer paused.destroy();
+        try t.expectError(error.SourceInterventionRequired, admitFile(paused));
+        try t.expectEqual(repair.Phase.intervention, paused.repairSnapshot().phase);
+        try t.expectEqual(@as(?anyerror, error.ResumeLost), paused.repairSnapshot().last_cause);
+        try t.expect(paused.pausedSource(0).?.cause == .resume_lost);
+        try t.expectEqual(records.Health.resume_lost, paused.sources.sources.items[0].health);
+        try t.expect(paused.policyLossEvent() == null);
+    }
+    try t.expectEqual(@as(i64, 0), try lossCount(&f));
+    var diagnostic: store_repair.Diagnostic = .{};
+    const outcome = try store_repair.repair(&f.store, t.allocator, .{ .jail = "fixture", .path = f.path, .token = "replaced-1" }, 1_800_000_000_000_000, .{}, &diagnostic);
+    outcome.deinit(t.allocator);
+    try t.expectEqual(@as(i64, 1), try lossCount(&f));
+    try t.expectEqual(@as(i64, 1), try replacedCount(&f, old.inode, old.offset));
+    const resumed = try files.Session.createDeferred(t.allocator, &f.store, clock.fileOptions(), &.{.{ .pattern = f.path }});
+    defer resumed.destroy();
+    try admitFile(resumed);
+    try t.expectEqual(@as(usize, 2), try drain(resumed));
+    try t.expectEqual(@as(u64, fresh.len), resumed.sources.sources.items[0].committed.?.offset);
+    try t.expectEqual(repair.Phase.healthy, resumed.repairSnapshot().phase);
+    try t.expectEqual(@as(i64, 1), try lossCount(&f));
+}
+
+test "native session repair: restart policy waits for an absent path and resumes when the file appears" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try enableRuntime(&f);
+    try f.tmp.dir.writeFile(.{ .sub_path = "active.log", .data = "first\nsecond\nthird\n" });
+    var clock = Clock{};
+    const old = try commitLines(&f, &clock, 3);
+    const arrived = "arrived\n";
+    try f.tmp.dir.writeFile(.{ .sub_path = "spare.tmp", .data = arrived });
+    try f.tmp.dir.deleteFile("active.log");
+    var options = clock.fileOptions();
+    options.on_truncation = .restart;
+    const session = try files.Session.createDeferred(t.allocator, &f.store, options, &.{.{ .pattern = f.path }});
+    defer session.destroy();
+    try admitFile(session);
+    try t.expectEqual(@as(usize, 0), try drain(session));
+    try t.expectEqual(repair.Phase.healthy, session.repairSnapshot().phase);
+    try t.expectEqual(@as(u8, 0), session.repairSnapshot().attempts);
+    try t.expect(session.pausedSource(0) == null);
+    try t.expectEqual(records.Health.missing, session.sources.sources.items[0].health);
+    try t.expect(session.policyLossEvent() == null);
+    try t.expectEqual(@as(i64, 0), try lossCount(&f));
+    try f.tmp.dir.rename("spare.tmp", "active.log");
+    const delivered = try drain(session);
+    try t.expectEqual(@as(usize, 1), delivered);
+    try t.expectEqual(@as(u64, arrived.len), session.sources.sources.items[0].committed.?.offset);
+    try t.expectEqual(repair.Phase.healthy, session.repairSnapshot().phase);
+    try t.expectEqual(@as(i64, 1), try lossCount(&f));
+    try t.expectEqual(@as(i64, 1), try replacedCount(&f, old.inode, old.offset));
+    try t.expectEqual(loss_files.LossReason.replaced, session.policyLossEvent().?.reason);
+}
+
+test "native session repair: a rotated incarnation still present is followed, not skipped" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try enableRuntime(&f);
+    try f.tmp.dir.writeFile(.{ .sub_path = "active.log", .data = "first\nsecond\nthird\n" });
+    var clock = Clock{};
+    const old = try commitLines(&f, &clock, 3);
+    const tail = "tail\n";
+    try f.append(tail);
+    try f.tmp.dir.rename("active.log", "active.log.1");
+    try f.tmp.dir.writeFile(.{ .sub_path = "active.log", .data = "new file line\n" });
+    const new_inode = (try f.tmp.dir.statFile("active.log")).inode;
+    try t.expect(new_inode != old.inode);
+    var options = clock.fileOptions();
+    options.on_truncation = .restart;
+    const session = try files.Session.createDeferred(t.allocator, &f.store, options, &.{.{ .pattern = f.path }});
+    defer session.destroy();
+    try admitFile(session);
+    try t.expectEqual(@as(usize, 1), try fileDelivery(session));
+    var followed = false;
+    for (session.sources.sources.items) |source| {
+        const committed = source.committed orelse continue;
+        if (committed.inode == old.inode) {
+            followed = true;
+            try t.expectEqual(old.offset + tail.len, committed.offset);
+        } else try t.expectEqual(@as(u64, 0), committed.offset);
+    }
+    try t.expect(followed);
+    try t.expectEqual(@as(usize, 1), try drain(session));
+    try t.expectEqual(@as(i64, 0), try lossCount(&f));
+    try t.expect(session.policyLossEvent() == null);
+    try t.expectEqual(repair.Phase.healthy, session.repairSnapshot().phase);
+}
+
+fn expectReplacedWhileRunning(policy: @TypeOf(@as(files.Options, undefined).on_truncation)) !void {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try enableRuntime(&f);
+    try f.tmp.dir.writeFile(.{ .sub_path = "active.log", .data = "first\nsecond\nthird\n" });
+    var clock = Clock{};
+    var options = clock.fileOptions();
+    options.on_truncation = policy;
+    const session = try files.Session.createDeferred(t.allocator, &f.store, options, &.{.{ .pattern = f.path }});
+    defer session.destroy();
+    try admitFile(session);
+    try t.expectEqual(@as(usize, 3), try drain(session));
+    const fresh = "fresh one\nfresh two\n";
+    try replaceLog(&f, fresh);
+    var delivered: usize = 0;
+    for (0..64) |_| {
+        clock.ms += 1000;
+        delivered += session.pollTurn(1) catch |err| switch (err) {
+            error.SourceRepairPending => 0,
+            else => return err,
+        };
+    }
+    try t.expectEqual(@as(usize, 2), delivered);
+    try t.expectEqual(@as(i64, 0), try lossCount(&f));
+    try t.expect(session.policyLossEvent() == null);
+    try t.expectEqual(repair.Phase.healthy, session.repairSnapshot().phase);
+    try t.expectEqual(records.Health.healthy, session.sources.health);
+    for (session.sources.sources.items, 0..) |_, index| try t.expect(session.pausedSource(index) == null);
+}
+
+test "native session repair: a file deleted and recreated while the session runs is read without a loss under refuse" {
+    try expectReplacedWhileRunning(.refuse);
+}
+
+test "native session repair: a file deleted and recreated while the session runs is read without a loss under restart" {
+    try expectReplacedWhileRunning(.restart);
 }

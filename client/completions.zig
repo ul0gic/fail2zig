@@ -146,7 +146,7 @@ const zsh_script =
     \\        'firewall:Inspect sampled fail2zig-owned kernel protection'
     \\        'jail:Enable, disable, pause or resume a jail'
     \\        'ignore:Manage per-jail exclusions (add, remove, list)'
-    \\        'repair-source:Acknowledge a truncated file source (daemon stopped)'
+    \\        'repair-source:Acknowledge a truncated or replaced file source (daemon stopped)'
     \\        'completions:Generate shell completion script'
     \\        'help:Show help for a command'
     \\    )
@@ -312,7 +312,7 @@ const fish_script =
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'firewall'     -d 'Inspect sampled fail2zig-owned kernel protection'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'jail'         -d 'Enable, disable, pause or resume a jail'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'ignore'       -d 'Manage per-jail exclusions (add, remove, list)'
-    \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'repair-source' -d 'Acknowledge a truncated file source (daemon stopped)'
+    \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'repair-source' -d 'Acknowledge a truncated or replaced file source (daemon stopped)'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'completions'  -d 'Generate completion script'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'help'         -d 'Show help'
     \\

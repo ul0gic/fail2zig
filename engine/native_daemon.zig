@@ -1118,8 +1118,8 @@ pub const Coordinator = struct {
         const canonical = try std.fmt.bufPrint(&bytes, "{}", .{selected});
         return effect.hashParts("fail2zig-native-resolver-udp-v1", &.{canonical});
     }
-    fn internalGeneration(jail: []const u8, policy: retry.Policy) ![32]u8 {
-        const base = try policy.encode();
+    fn internalGeneration(jail: []const u8, policy: retry.Policy, form: retry.HashForm) ![32]u8 {
+        const base = try policy.hashBytes(form);
         const escalation = try policy.escalationBytes();
         return effect.hashParts("fail2zig-native-recidive-source-v1", &.{ jail, &base, &escalation });
     }
@@ -1379,7 +1379,7 @@ pub const Coordinator = struct {
                     break :blk .{ .journal = try journal_projection.Plan.create(a, &selected_cfg, 0, parent_generation, .{ .machine_id = std.mem.trim(u8, machine, "\n"), .executables = executables, .ignore_capacity = 128, .custom = assets != null, .journal = .{ .batch_records = 1, .matches = matches } }) };
                 },
                 .auto => unreachable,
-                .internal => .{ .internal = try internalGeneration(selected.name, policy) },
+                .internal => .{ .internal = try internalGeneration(selected.name, policy, .identity) },
             };
             errdefer plan.deinit(a);
             const scratch = try a.alloc(durable.Store.ActiveDecision, per_jail);
@@ -1525,7 +1525,13 @@ pub const Coordinator = struct {
         var rekeyed_rows: u32 = 0;
         for (self.jails) |*jail| {
             if (jail.custom_plan != null) continue;
-            const legacy = try self.plannedGeneration(jail, .legacy);
+            const live_policy = jail.policy;
+            if (try self.store.readRetryPolicy(jail.name)) |saved| jail.policy.max_subjects = saved.policy.max_subjects;
+            const legacy = self.plannedGeneration(jail, .legacy) catch |err| {
+                jail.policy = live_policy;
+                return err;
+            };
+            jail.policy = live_policy;
             const planned = try self.plannedGeneration(jail, .planned);
             const cursors: durable.Store.CursorRekey = switch (jail.plan) {
                 .file => |*plan| blk: {
@@ -1544,7 +1550,7 @@ pub const Coordinator = struct {
             rekeyed_jails += 1;
             rekeyed_rows +|= @intCast(@min(rows, std.math.maxInt(u32)));
         }
-        if (rekeyed_jails != 0) std.log.info("native storage: saved detection generations rekeyed without the ignore list: jails={d} rows={d}; no ban, deadline, checkpoint or retry subject changed", .{ rekeyed_jails, rekeyed_rows });
+        if (rekeyed_jails != 0) std.log.info("native storage: saved detection generations rekeyed without the ignore list or the subject share: jails={d} rows={d}; no ban, deadline, checkpoint or retry subject changed", .{ rekeyed_jails, rekeyed_rows });
     }
     fn completeGenerationRekeys(self: *Coordinator) !void {
         for (self.jails) |*jail| {
@@ -2403,6 +2409,7 @@ pub const Coordinator = struct {
             .file => |*plan| blk: {
                 var options = if (mode == .legacy) plan.legacySessionOptions() else plan.sessionOptions();
                 options.retry = jail.policy;
+                options.retry_hash = if (mode == .legacy) .stored else .identity;
                 options.suppress_retry_enforcement = self.suppress_enforcement;
                 if (jail.custom_plan != null) {
                     options.staged_detection = registry.consumer();
@@ -2414,6 +2421,7 @@ pub const Coordinator = struct {
             .journal => |plan| blk: {
                 var options = if (mode == .legacy) plan.legacySessionOptions() else plan.sessionOptions();
                 options.retry = jail.policy;
+                options.retry_hash = if (mode == .legacy) .stored else .identity;
                 options.suppress_retry_enforcement = self.suppress_enforcement;
                 if (jail.custom_plan != null) {
                     options.staged_detection = registry.consumer();
@@ -2422,7 +2430,7 @@ pub const Coordinator = struct {
                 const processor = try journal_sessions.Session.prepareProcessor(self.allocator, options, &scratch, .{ .us = 0 });
                 break :blk processor.generation;
             },
-            .internal => |generation| generation,
+            .internal => |generation| if (mode == .legacy) try internalGeneration(jail.name, jail.policy, .stored) else generation,
         };
     }
     fn driver(self: *Coordinator) recovery.Driver {
@@ -3047,7 +3055,9 @@ pub const Coordinator = struct {
                 };
                 const repair_line = if (facts.repair_token) |token| try repairCommand(self.allocator, jail.name, facts.path, token[0..facts.repair_token_len]) else null;
                 defer if (repair_line) |text| self.allocator.free(text);
-                if (repair_line) |text|
+                if (repair_line != null and facts.path_absent)
+                    std.log.warn("native: jail={} source=file path={} paused at startup: {s}{s}; the file is absent; other jails enforce; once a file exists at the path, stop fail2zig and run: {}", .{ std.zig.fmtEscapes(jail.name), std.zig.fmtEscapes(facts.path), cause, detail, ControlEscaped{ .text = repair_line.? } })
+                else if (repair_line) |text|
                     std.log.warn("native: jail={} source=file path={} paused at startup: {s}{s}; other jails enforce; to repair, stop fail2zig and run: {}", .{ std.zig.fmtEscapes(jail.name), std.zig.fmtEscapes(facts.path), cause, detail, ControlEscaped{ .text = text } })
                 else
                     std.log.warn("native: jail={} source=file path={} paused at startup: {s}{s}" ++ tail_unrepairable, .{ std.zig.fmtEscapes(jail.name), std.zig.fmtEscapes(facts.path), cause, detail });

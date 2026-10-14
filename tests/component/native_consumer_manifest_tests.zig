@@ -515,8 +515,11 @@ test "native consumer manifest: all-jail generation preflight refuses before fre
     try f.store.validateRuntimeAdmissions(&compatible, null);
     try f.store.validateRuntimeAdmissions(&.{.{ .jail = "retained", .generation = retained, .policy = startup_policy }}, null);
     try t.expectError(error.UnconfiguredStateOwner, f.store.validateRuntimeAdmissions(bindings[0..1], null));
+    var regrown_policy = startup_policy;
+    regrown_policy.max_subjects = 4;
+    try f.store.validateRuntimeAdmissions(&.{.{ .jail = "retained", .generation = retained, .policy = regrown_policy }}, null);
     var changed_policy = startup_policy;
-    changed_policy.max_subjects = 4;
+    changed_policy.maxretry = 3;
     try t.expectError(error.RetryGenerationMismatch, f.store.validateRuntimeAdmissions(&.{.{ .jail = "retained", .generation = retained, .policy = changed_policy }}, null));
 }
 

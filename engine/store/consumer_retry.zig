@@ -435,6 +435,16 @@ pub fn Methods(comptime Store: type) type {
                     try escalation_insert.blob(3, &escalation);
                     try escalation_insert.done();
                 }
+            } else if (try self.readRetryPolicy(jail)) |saved| {
+                if (saved.policy.max_subjects != policy.max_subjects) {
+                    const encoded = try policy.encode();
+                    var update = try self.statement("UPDATE retry_policies SET policy=?3 WHERE jail=?1 AND generation=?2;");
+                    defer update.deinit();
+                    try update.text(1, jail);
+                    try update.blob(2, &generation);
+                    try update.blob(3, &encoded);
+                    try update.done();
+                }
             }
             try self.commitTransaction();
         }
@@ -532,8 +542,8 @@ pub fn Methods(comptime Store: type) type {
         }
 
         pub fn retryPoliciesEqual(left: retry.Policy, right: retry.Policy) Error!bool {
-            const left_base = try left.encode();
-            const right_base = try right.encode();
+            const left_base = try left.identity();
+            const right_base = try right.identity();
             if (!std.mem.eql(u8, &left_base, &right_base)) return false;
             const left_escalation = try left.escalation.encode();
             const right_escalation = try right.escalation.encode();

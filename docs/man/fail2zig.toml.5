@@ -267,6 +267,8 @@ The effective paths and query are part of saved source identity. Changed SSH
 layouts or switching profile modes may cause RetryGenerationMismatch on restart;
 live source-generation migration is not supported. Restore the previous source
 configuration and executable layout to recover; do not delete the state database.
+Adding or enabling a jail is not such a change: the other jails keep their saved
+identity and the daemon starts on the existing state.
 .TP
 .B backend
 Deprecated source alias for fail2ban compatibility (systemd means journald).
@@ -417,21 +419,35 @@ whose source is journald or internal. The diagnostics are
 and
 .BR TruncationPolicyNotAllowedInDefaults .
 .IP
-Two events are covered: a file truncated in place below its committed offset,
-and a rotated-out file that was removed while it still held unread bytes. With
+Three events are covered: a file truncated in place below its committed offset,
+a rotated-out file that was removed while it still held unread bytes, and a log
+replaced by a different file when its previous file exists nowhere in its
+directory (for example deleted and recreated by its writer). With
 .BR refuse ,
 the source is paused until
 .B fail2zig repair-source
-acknowledges the loss; the daemon still starts and the other jails enforce. With
+acknowledges the loss; the daemon still starts and the other jails enforce. A
+source whose path is absent stays paused and
+.B repair-source
+does not acknowledge it. With
 .BR restart ,
 the source resumes without pausing: at offset 0 of the same file after a
-truncation, or at the current file's committed offset after a removed rotated
-file. Each resumption records a durable continuity-loss event, shown by
+truncation, at the current file's committed offset after a removed rotated
+file, or at offset 0 of the replacement after a replaced log. A rotated file that
+still exists in the directory is followed, never skipped. Each resumption records a
+durable continuity-loss event, shown by
 .B fail2zig status
-and the journal; the newest 256 events per source are kept.
+and the journal; the newest 256 events per source are kept. While the path is
+absent, a
+.B restart
+source reports health
+.B missing
+and retries on the transient schedule instead of pausing, then resumes when a file
+appears at the path.
 .IP
-Records appended after the committed offset and removed by the truncation were
-never read. The policy records that loss; it does not recover those records.
+Records appended after the committed offset and removed by the truncation, or left
+in a replaced file that is gone, were never read. The policy records that loss; it
+does not recover those records.
 .IP
 The key is not part of the detection generation, so changing it never causes
 RetryGenerationMismatch. A change is restart-only:

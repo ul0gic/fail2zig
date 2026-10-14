@@ -64,7 +64,7 @@ pub const Resume = struct {
     observed_size: ?u64 = null,
 };
 
-pub const LossReason = enum(u8) { truncated = 1, rotated_unread_removed = 2 };
+pub const LossReason = enum(u8) { truncated = 1, rotated_unread_removed = 2, replaced = 3 };
 
 pub const LossEvent = struct {
     sequence: u64,
@@ -167,6 +167,9 @@ pub const FileSource = struct {
     continuity_reported: bool = false,
     policy: config.TruncationPolicy = .refuse,
     jail: []const u8 = "",
+    siblings: ?*const std.ArrayList(FileSource) = null,
+    awaiting_path: bool = false,
+    awaiting_checked_s: i64 = 0,
     pending_loss: ?PendingLoss = null,
     detected_s: i64 = 0,
     read_prefix: *const fn (std.fs.File, u8) anyerror![32]u8 = prefix,
@@ -291,10 +294,10 @@ pub const FileSource = struct {
         return error.ResumeLost;
     }
 
-    fn restartInPlace(self: *FileSource, file: std.fs.File, observed: Observed) !void {
+    fn restartOn(self: *FileSource, file: std.fs.File, observed: Observed, reason: LossReason) !void {
         const r = self.committed.?;
         const next = restartedIncarnation(file, r) catch |err| {
-            if (err == error.ResumeLost) return self.continuityLost(.truncated, observed);
+            if (err == error.ResumeLost) return self.continuityLost(if (reason == .replaced) .replaced else .truncated, observed);
             return err;
         };
         if (self.pending_loss == null) {
@@ -307,7 +310,7 @@ pub const FileSource = struct {
                     .path = self.path,
                     .source_id = self.source_id,
                     .wall_us = now_us,
-                    .reason = .truncated,
+                    .reason = reason,
                     .inode = r.inode,
                     .committed_offset = r.offset,
                     .observed_size = observed.size,
@@ -321,8 +324,37 @@ pub const FileSource = struct {
 
     fn lostOrRestarted(self: *FileSource, file: std.fs.File, r: Resume, observed: Observed) !void {
         const kind = classify(r, observed);
-        if (self.policy == .restart and kind == .truncated) return self.restartInPlace(file, observed);
+        if (self.policy == .restart and kind == .truncated) return self.restartOn(file, observed, .truncated);
         return self.continuityLost(kind, observed);
+    }
+
+    fn absent(self: *FileSource) error{ResumeLost}!?std.fs.File {
+        if (self.policy != .restart) return self.continuityLost(.missing, null);
+        self.awaiting_path = true;
+        self.awaiting_checked_s = std.time.timestamp();
+        return null;
+    }
+
+    fn claimedBySibling(self: *const FileSource, observed: Observed) bool {
+        const siblings = self.siblings orelse return false;
+        for (siblings.items) |*other| {
+            if (other == self) continue;
+            const saved = other.committed orelse continue;
+            if (saved.device == observed.device and saved.inode == observed.inode) return true;
+        }
+        return false;
+    }
+
+    fn restartOnReplacement(self: *FileSource) !std.fs.File {
+        const f = try openRegularAt(std.fs.cwd(), self.path);
+        errdefer f.close();
+        const stat = try std.posix.fstat(f.handle);
+        const committed = self.committed.?;
+        if (stat.dev == committed.device and stat.ino == committed.inode) return f;
+        const observed = observe(stat);
+        if (self.claimedBySibling(observed)) return self.continuityLost(.replaced, observed);
+        try self.restartOn(f, observed, .replaced);
+        return f;
     }
 
     pub fn takePendingLoss(self: *FileSource) ?PendingLoss {
@@ -337,6 +369,7 @@ pub const FileSource = struct {
             else => return err,
         };
         const expected = self.committed orelse return direct;
+        if (direct == null and self.awaiting_path and self.resume_search == null and std.time.timestamp() == self.awaiting_checked_s) return null;
         var replacement: ?Observed = null;
         if (direct) |f| {
             const stat = std.posix.fstat(f.handle) catch |err| {
@@ -352,7 +385,7 @@ pub const FileSource = struct {
         }
         if (self.resume_search == null) {
             var parent = std.fs.cwd().openDir(std.fs.path.dirname(self.path) orelse ".", .{ .iterate = true }) catch |err| {
-                if (err == error.FileNotFound) return self.continuityLost(.missing, null);
+                if (err == error.FileNotFound) return self.absent();
                 return err;
             };
             self.resume_search = .{ .directory = parent, .iterator = parent.iterate() };
@@ -363,7 +396,9 @@ pub const FileSource = struct {
         for (0..discovery_entries_per_turn) |_| {
             const entry = (try search.iterator.next()) orelse {
                 self.clearResumeSearch();
-                return self.continuityLost(if (replacement == null) .missing else .replaced, replacement);
+                const seen = replacement orelse return self.absent();
+                if (self.policy == .restart) return try self.restartOnReplacement();
+                return self.continuityLost(.replaced, seen);
             };
             if (search.visited >= discovery_entries_per_episode) return error.DiscoveryEntryLimit;
             search.visited += 1;
@@ -439,6 +474,7 @@ pub const FileSource = struct {
             self.committed.?.codec_configuration_hash = self.codec_configuration_hash;
         }
         self.file = f;
+        self.awaiting_path = false;
         self.health = .healthy;
         self.continuity_failure = null;
         self.continuity_reported = false;
@@ -544,6 +580,30 @@ pub const FileSource = struct {
         return stat.dev != r.device or stat.ino != r.inode;
     }
 
+    pub fn markUnlinkedAndDrained(self: *FileSource) !bool {
+        const f = self.file orelse return false;
+        const r = self.committed orelse return false;
+        if (!self.baseline_committed or self.pending_loss != null) return false;
+        const held = try std.posix.fstat(f.handle);
+        if (held.nlink != 0 or @as(u64, @intCast(held.size)) != r.offset) return false;
+        const named = std.posix.fstatat(std.posix.AT.FDCWD, self.path, 0) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        const observed = observe(named);
+        self.continuity_failure = .{
+            .kind = .replaced,
+            .incarnation = r.incarnation,
+            .committed_offset = r.offset,
+            .committed_device = r.device,
+            .committed_inode = r.inode,
+            .observed_size = observed.size,
+            .observed_device = observed.device,
+            .observed_inode = observed.inode,
+        };
+        return true;
+    }
+
     pub fn poll(self: *FileSource, callback: records.AckCallback, userdata: ?*anyopaque) !bool {
         while (true) return self.pollTurn(callback, userdata, false) catch |err| {
             if (err == error.SourceRepairPending) continue;
@@ -556,6 +616,7 @@ pub const FileSource = struct {
         self.continuity_failure = null;
         self.continuity_reported = false;
         if (!try self.attachTurn()) return false;
+        if (self.pending_loss != null) return false;
         try self.finishEofCheck();
         const f = self.file.?;
         var r = self.committed.?;
@@ -570,7 +631,7 @@ pub const FileSource = struct {
         };
         if (shrunk or !std.mem.eql(u8, &fingerprint, &r.prefix_hash)) {
             if (self.policy == .restart and classify(r, observed) == .truncated) {
-                try self.restartInPlace(f, observed);
+                try self.restartOn(f, observed, .truncated);
                 self.health = .healthy;
                 return false;
             }
@@ -1123,6 +1184,7 @@ pub const FileSet = struct {
         errdefer source.deinit();
         source.policy = self.policy;
         source.jail = self.jail;
+        source.siblings = &self.sources;
         if (self.initialize_source) |initialize| try initialize(&source, self.initialize_userdata);
         try self.sources.append(source);
     }
@@ -1210,12 +1272,16 @@ pub const FileSet = struct {
         defer self.allocator.free(id);
         var found = false;
         for (self.sources.items) |*source| {
-            if (std.mem.eql(u8, source.source_id, id)) {
+            if (std.mem.eql(u8, source.source_id, id) or (source.awaiting_path and std.mem.eql(u8, source.path, path))) {
                 found = true;
                 break;
             }
             if (source.committed) |known| {
                 if (known.device == stat.dev and known.inode == stat.ino) {
+                    if (std.mem.eql(u8, source.path, path)) {
+                        found = true;
+                        break;
+                    }
                     const current = std.posix.fstatat(std.fs.cwd().fd, source.path, 0) catch |err| {
                         if (err == error.FileNotFound or err == error.NotDir) {
                             found = true;
@@ -1242,6 +1308,7 @@ pub const FileSet = struct {
         errdefer source.deinit();
         source.policy = self.policy;
         source.jail = self.jail;
+        source.siblings = &self.sources;
         if (checkpoint == null) source.framing = self.framing;
         for (self.sources.items) |previous| {
             if (std.mem.eql(u8, previous.path, path) and previous.in_operation) source.in_operation = true;
