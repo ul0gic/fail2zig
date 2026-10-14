@@ -268,9 +268,7 @@ pub fn Methods(comptime Store: type) type {
                 var counter: [8]u8 = undefined;
                 std.mem.writeInt(u64, &counter, item.seq, .little);
                 const decision_id = effects.hashParts("fail2zig-migration-owner-v1", &.{ &run_id, &counter });
-                // A sequence is activated at most once. After its owner was released or
-                // replaced, re-running activation must not reinstate the retired decision, so
-                // only a still-current owner counts as replayed.
+                // Re-running activation after the owner was released or replaced must not reinstate the retired decision.
                 if (ledger and !try self.recordMigrationActivationTx(run_id, item.seq, now)) {
                     if (try self.migrationOwnerCurrentTx(try (try effects.Scope.exact(scope)).key(installation), item.jail[0..item.jail_len], decision_id)) activated += 1;
                     continue;
@@ -323,7 +321,6 @@ pub fn Methods(comptime Store: type) type {
             return activated;
         }
 
-        // False when the sequence was already activated.
         fn recordMigrationActivationTx(self: *Store, run_id: [32]u8, seq: u64, now: i64) Error!bool {
             var insert = try self.statement("INSERT INTO migration_activations VALUES(?1,?2,?3) ON CONFLICT(run_id,seq) DO NOTHING;");
             defer insert.deinit();
@@ -523,8 +520,6 @@ pub fn Methods(comptime Store: type) type {
             return std.mem.eql(u8, &decision, &original) or std.mem.eql(u8, &decision, &extension);
         }
 
-        /// Rollback releases decisions belonging to this run, not every owner of
-        /// a staged scope. Replacements and other jails can keep that scope live.
         pub fn migrationOwnersRemaining(self: *Store, run_id: [32]u8) Error!usize {
             if (self.schema_version < 23) return error.MigrationStorageRequired;
             const installation = try self.readInstallation() orelse return error.InstallationRequired;

@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-//! Schema reference: GPL-2.0 upstream `fail2ban-1.1.1/fail2ban/server/database.py:114-160`.
-//! The DDL is restated as a structural expectation and is not copied into product output.
 const std = @import("std");
 
 pub const Db = opaque {};
 pub const Statement = opaque {};
 pub const Backup = opaque {};
-// SQLite accepts the unaligned SQLITE_TRANSIENT (-1) sentinel as well as callbacks.
 const Destructor = ?*align(1) const fn (?*anyopaque) callconv(.c) void;
 
 pub const Api = struct {
@@ -59,6 +56,8 @@ pub const open_flags = struct {
     pub const uri: c_int = 0x40;
     pub const exrescode: c_int = 0x02000000;
 };
+// Column expectations restated from GPL-2.0 upstream fail2ban-1.1.1/fail2ban/server/database.py:114-160;
+// never copied into product output.
 const column_type = struct {
     const integer: c_int = 1;
     const text: c_int = 3;
@@ -203,6 +202,7 @@ pub const Stmt = struct {
     pub fn bindText(self: Stmt, index: c_int, text: []const u8) Error!void {
         const len = std.math.cast(c_int, text.len) orelse return error.InvalidRow;
         // SQLite copies the bytes before returning; this sentinel is never called.
+        // SQLITE_TRANSIENT is the all-ones pointer; SQLite accepts it unaligned, like a callback.
         const transient: Destructor = @ptrFromInt(std.math.maxInt(usize));
         const code = api.bind_text(self.stmt, index, text.ptr, len, transient);
         if (code != rc.ok) return sqliteError(code);

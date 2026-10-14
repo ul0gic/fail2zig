@@ -118,9 +118,6 @@ const NotifyReceiver = struct {
         posix.close(self.fd);
     }
 
-    /// Returns the next state notification. Progress datagrams (start-deadline
-    /// extensions and status text) are discarded: the cases here assert when the
-    /// daemon claims READY, reloads or stops, not how it reports progress meanwhile.
     fn next(self: NotifyReceiver, buf: []u8, timeout_ns: u64) !?[]const u8 {
         var timer = try std.time.Timer.start();
         while (true) {

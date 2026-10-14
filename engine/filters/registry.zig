@@ -45,7 +45,6 @@ pub fn get(name: []const u8) ?[]const PatternDef {
     return null;
 }
 
-/// Timestamped history files need not have a syslog host/daemon envelope.
 pub fn requiresWholeRecord(name: []const u8) bool {
     for (entries) |entry| {
         if (namesEqual(entry.name, name)) return entry.whole_record;

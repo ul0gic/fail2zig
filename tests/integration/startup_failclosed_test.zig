@@ -595,8 +595,6 @@ test "integration: state admission identifies foreign and unsupported databases 
         const address = try std.net.Address.parseIp4("127.0.0.1", s.metrics_port);
         var holder = try address.listen(.{ .reuse_address = true });
         defer holder.deinit();
-        // Obtain a real daemon-created database, then alter only the SQLite
-        // header field under test while no daemon or database handle is open.
         var initial = try s.run();
         defer initial.deinit(a);
         try expectFailClosed(&initial);
@@ -632,7 +630,6 @@ test "integration: fail-closed helper: trace detector matches Zig frame lines an
     try testing.expect(!hasErrorReturnTrace("0x in nothing"));
 }
 
-// Journal startup cases use isolated log-only state; no host firewall mutation.
 fn writeJournalProfileConfig(s: *Scenario, source: []const u8, profile: []const u8) !void {
     var file = try std.fs.cwd().createFile(s.config_path, .{ .mode = 0o600 });
     defer file.close();
@@ -655,8 +652,6 @@ fn writeJournalProfileConfig(s: *Scenario, source: []const u8, profile: []const 
 
 fn requireJournalProfileHost() !void {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    // These are metadata fixtures, not SSH emitters; no detection claim follows
-    // from admitting them. Fail rather than silently skipping an unsafe fixture.
     for ([_][]const u8{ "/usr/bin/true", "/usr/bin/false", "/usr/bin/journalctl" }) |path| {
         var file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
             error.FileNotFound => return error.SkipZigTest,
@@ -672,8 +667,6 @@ fn requireJournalProfileHost() !void {
 
 test "integration: journal profile BUG-051 omitted auto and explicit sources pass source admission" {
     try requireJournalProfileHost();
-    // This connected case needs an installed SSH daemon; resolver unit fixtures
-    // cover absence independently. Genuine traffic is a separate isolated gate.
     std.fs.accessAbsolute("/usr/sbin/sshd", .{}) catch return error.SkipZigTest;
     const a = testing.allocator;
     for ([_][]const u8{ "", "source = \"journald\"" }) |source| {
@@ -757,8 +750,6 @@ test "integration: journal profile refuses unsafe file and directory origins" {
     const setting = try std.fmt.allocPrint(a, "journal_executables = [\"{s}/origin\"]", .{s.root});
     defer a.free(setting);
     try writeJournalProfileConfig(&s, "source = \"journald\"", setting);
-    // Under a non-root runner, file UID alone also makes these unsafe. This
-    // proves refusal, not independent coverage of every mode predicate.
     for ([_]posix.mode_t{ 0o777, 0o644 }) |mode| {
         var file = try s.tmp.dir.createFile("origin", .{});
         try file.chmod(mode);
@@ -788,8 +779,6 @@ test "integration: journal profile changed ordering refuses while retaining data
     const a = testing.allocator;
     var s = try Scenario.init(a);
     defer s.deinit();
-    // An occupied HTTP port terminates startup after source/state admission,
-    // without ingesting the host journal or leaving a daemon behind.
     const addr = try std.net.Address.parseIp4("127.0.0.1", s.metrics_port);
     var holder = try addr.listen(.{ .reuse_address = true });
     defer holder.deinit();
@@ -817,10 +806,8 @@ test "integration: journal profile changed ordering refuses while retaining data
     defer a.free(after);
     try testing.expect(before.len >= 100);
     try testing.expectEqual(before.len, after.len);
-    // Store.open commits its application_id pragma before runtime admission.
-    // SQLite may advance its two 4-byte header change counters (offsets 24/92;
-    // vendor/sqlite/sqlite3.c pager_write_changecounter). Compare every other
-    // byte, including all data pages, and require each counter pair to agree.
+    // Header change counters (offsets 24/92, vendor/sqlite/sqlite3.c pager_write_changecounter) may advance;
+    // compare every other byte and require each counter pair to agree.
     try testing.expectEqualSlices(u8, before[24..28], before[92..96]);
     try testing.expectEqualSlices(u8, after[24..28], after[92..96]);
     try testing.expectEqualSlices(u8, before[0..24], after[0..24]);
@@ -835,7 +822,6 @@ test "integration: journal profile changed ordering refuses while retaining data
     try expectNotContains(restored.stderr, "RetryGenerationMismatch");
 }
 
-// Log-only, HTTP-off daemon with a file log target; no host firewall mutation.
 fn writeFileLogConfig(s: *Scenario) !void {
     var file = try std.fs.cwd().createFile(s.config_path, .{ .truncate = true, .mode = 0o640 });
     defer file.close();
@@ -905,11 +891,9 @@ test "integration: a refused source at startup is paused and the daemon stays up
         defer log.close();
         try log.seekFromEnd(0);
         for (1..4) |i| try log.writer().print("sshd[123]: Failed password for root from 203.0.113.{d} port 22 ssh2\n", .{i});
-        // The worker commits the source position within a few 100 ms wakes.
         std.time.sleep(2 * std.time.ns_per_s);
         try stopDaemon(&child);
     }
-    // Truncating below the committed offset loses continuity, which startup recovery pauses.
     try s.tmp.dir.writeFile(.{ .sub_path = "auth.log", .data = "" });
     try s.tmp.dir.writeFile(.{ .sub_path = "daemon.log", .data = "" });
     {
@@ -936,7 +920,6 @@ const NotifyReceiver = struct {
         return .{ .fd = fd };
     }
 
-    /// Next datagram, or null when none arrives within `timeout_ms`.
     fn recv(self: NotifyReceiver, buf: []u8, timeout_ms: i32) !?[]const u8 {
         var fds = [_]posix.pollfd{.{ .fd = self.fd, .events = posix.POLL.IN, .revents = 0 }};
         if (try posix.poll(&fds, timeout_ms) == 0) return null;
@@ -986,8 +969,6 @@ test "integration: startup notify extends the deadline through construction and 
         while (try rx.recv(&buf, 0)) |message| try messages.append(try a.dupe(u8, message));
     }
 
-    // The first message is sent before construction starts, so it precedes any
-    // initial start deadline.
     try testing.expect(try extensionUsec(messages.items[0]) != null);
     try expectContains(messages.items[0], "STATUS=admission 0\n");
     const phases = [_][]const u8{ "STATUS=admission", "STATUS=schema", "STATUS=maintenance validation", "STATUS=recovery" };

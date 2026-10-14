@@ -308,8 +308,6 @@ test "native resource budget: exact aggregate scope projection and real query fi
     const scope = @import("engine_test").firewall.scope;
     const shared = @import("shared");
     const jail_count = 64;
-    // Conservative aggregate bound: all owner slots plus all detection slots,
-    // even though mixed jail configurations cannot fill both simultaneously.
     const row_count = effect.max_owners + 4096;
     var measured = QueryPeakAllocator{};
     {
@@ -324,7 +322,6 @@ test "native resource budget: exact aggregate scope projection and real query fi
         try t.expectEqual(query.Kind.scopes, query.requestedKind(arena, &body).?);
         _ = try arena.alloc(query.JailConfig, jail_count);
         const jails = try arena.alloc(query.JailScopes, jail_count);
-        // Match queryResponse's single exact owner, separate from its arena.
         const rows = try a.alloc(query.ScopeItem, row_count);
         defer a.free(rows);
         var ports: [scope.max_port_ranges]scope.PortRange = undefined;
@@ -341,7 +338,6 @@ test "native resource budget: exact aggregate scope projection and real query fi
             .decision_id = [_]u8{0xff} ** 32,
             .confirmed = true,
         };
-        // Maximum escaped name width is conservative for the JSON producer.
         const name = [_]u8{1} ** query.max_jail_bytes;
         for (jails, 0..) |*jail, index| {
             const start = index * row_count / jail_count;
@@ -352,9 +348,8 @@ test "native resource budget: exact aggregate scope projection and real query fi
         const result = try query.handle(a, &body, .monitor, [_]u8{0xff} ** 32, .{ .scopes = .{ .jails = jails } });
         defer result.deinit(a);
         try t.expect(result == .payload);
-        // Reserve three full response ceilings beyond the measured projection:
-        // more than ArrayList's <1.5x growth plus toOwnedSlice's 1x overlap,
-        // with the remainder covering the small valid request parser workspace.
+        // Reserve three response ceilings beyond the projection: ArrayList growth under 1.5x plus toOwnedSlice's
+        // 1x overlap, with the remainder for the request parser workspace.
         try t.expect(projection_bytes + 3 * query.max_response_bytes <= 8 * budget.mib);
         try t.expect(measured.peak <= 8 * budget.mib);
         const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, result.payload, .{});

@@ -222,9 +222,6 @@ test "migration store: rollback deltas name released, expired and native owners 
 }
 
 test "migration store: re-activation never reinstates a released and replaced migration decision" {
-    // Failure: activation only compared with the current owner, so after the migration owner
-    // was released and a later native decision ended, re-running it revived the retired
-    // migration decision (A -> B -> A).
     var f = try Fixture.init();
     defer f.deinit();
     try f.store.enableLoadRepair(.{ .state_path = f.path, .now_us = 4_000_000, .history_max_matches = 10 }, null);

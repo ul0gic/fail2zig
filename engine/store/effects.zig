@@ -128,8 +128,6 @@ pub fn Methods(comptime Store: type) type {
             if (self.api.changes(self.db) != 1) return error.EffectCapacity;
         }
 
-        /// Rows a non-terminal writer adds itself; the terminal reserve for every live owner
-        /// afterwards is added by `reserveEffectRows`.
         pub const ReserveCost = struct {
             owners: i64 = 0,
             effects: i64 = 0,
@@ -138,14 +136,10 @@ pub fn Methods(comptime Store: type) type {
             observations: i64 = 0,
             targets: i64 = 0,
             live_owners: i64 = 0,
-            /// Confirmation markers this writer deletes; their owners become unconfirmed again.
             retired_markers: i64 = 0,
         };
         const observations_per_intent = store.load_repair.observations_per_intent;
 
-        /// Admission keeps room for every live owner to expire or be released and for every
-        /// unconfirmed live owner to confirm, so terminal work never meets a cap. A refusal is
-        /// retryable backpressure: the caller keeps its receipt and nothing is evicted.
         pub fn reserveEffectRows(self: *Store, own: ReserveCost) Error!void {
             if (self.schema_version < store.load_repair_schema) return;
             const live = try self.integer("SELECT live FROM effect_owner_live WHERE id=1;");
@@ -167,20 +161,14 @@ pub fn Methods(comptime Store: type) type {
             }
         }
 
-        /// `prior_streak` counts the consecutive earlier startups that also found a mismatch;
-        /// a nonzero value means a writer keeps bypassing the counter triggers.
         pub const LiveOwnerRecount = struct { stored: i64, counted: i64, prior_streak: i64 = 0 };
         const max_mismatch_streak = 1_000_000;
-        // Trigger text as created by the load-repair migration; any other text is refused.
         const live_owner_triggers = [_]struct { name: []const u8, sql: []const u8 }{
             .{ .name = "effect_owner_live_insert", .sql = "CREATE TRIGGER effect_owner_live_insert AFTER INSERT ON effect_owners WHEN NEW.lease_kind<>0 BEGIN UPDATE effect_owner_live SET live=live+1 WHERE id=1; END" },
             .{ .name = "effect_owner_live_update", .sql = "CREATE TRIGGER effect_owner_live_update AFTER UPDATE OF lease_kind ON effect_owners WHEN (OLD.lease_kind<>0)<>(NEW.lease_kind<>0) BEGIN UPDATE effect_owner_live SET live=live+CASE WHEN NEW.lease_kind<>0 THEN 1 ELSE -1 END WHERE id=1; END" },
             .{ .name = "effect_owner_live_delete", .sql = "CREATE TRIGGER effect_owner_live_delete AFTER DELETE ON effect_owners WHEN OLD.lease_kind<>0 BEGIN UPDATE effect_owner_live SET live=live-1 WHERE id=1; END" },
         };
 
-        /// The live-owner counter is derived data: startup recounts it before any reserve
-        /// check and repairs a mismatch. Missing or altered triggers, a missing counter row or
-        /// an owner without its current revision are refused instead.
         pub fn reconcileLiveOwners(self: *Store) Error!?LiveOwnerRecount {
             try self.beginAdmissionWrite();
             errdefer self.rollback();
@@ -205,8 +193,6 @@ pub fn Methods(comptime Store: type) type {
                 try self.commitTransaction();
                 return null;
             }
-            // The streak is committed with the repair so a mismatch that returns on the next
-            // startup is recognised as recurring rather than logged as a fresh one-off.
             var repair = try self.statement("UPDATE effect_owner_live SET live=?1,mismatch_streak=?2 WHERE id=1;");
             defer repair.deinit();
             try repair.int(1, counted);
@@ -217,9 +203,6 @@ pub fn Methods(comptime Store: type) type {
             return .{ .stored = stored, .counted = counted, .prior_streak = streak };
         }
 
-        // A decision that stops being its owner's current live decision gives up its
-        // confirmation marker; when it is replaced, its unsettled outcomes become terminal
-        // `superseded` because the runtime only ever drives the current decision.
         fn retireOwnerDecisionTx(self: *Store, key: effects.Hash, jail: []const u8, replaced: ?effects.Hash, now: i64) Error!void {
             if (self.schema_version < store.load_repair_schema) return;
             var marker = try self.statement("DELETE FROM confirmation_markers WHERE scope_key=?1 AND jail=?2;");
@@ -448,8 +431,6 @@ pub fn Methods(comptime Store: type) type {
         pub fn setOwnerTx(self: *Store, change: effects.OwnerChange, now: i64) Error!effects.Entry {
             return self.setOwnerReservedTx(change, now, 0);
         }
-        /// `targets` are the action-target rows the caller adds for this decision in the same
-        /// transaction; they join the reserve check made before any row is written.
         pub fn setOwnerReservedTx(self: *Store, change: effects.OwnerChange, now: i64, targets: i64) Error!effects.Entry {
             const jail = detection.Name.init(change.jail) catch return error.InvalidEffect;
             if (change.expected_revision >= std.math.maxInt(i64) or change.decided_us > now or (change.lease == .finite and change.lease.finite <= change.decided_us)) return error.InvalidEffect;
@@ -475,8 +456,6 @@ pub fn Methods(comptime Store: type) type {
             if (owner_revision != change.expected_revision) return error.StaleEffect;
             const was_live = if (replaced) |owner| owner.lease != .absent else false;
             const is_live = change.lease != .absent;
-            // Replacing a confirmed live decision retires its marker, so the new decision
-            // needs its own confirmation reserve even though the live count is unchanged.
             const retired_markers: i64 = if (replaced != null and self.schema_version >= store.load_repair_schema) blk: {
                 var marker = try self.statement("SELECT count(*) FROM confirmation_markers WHERE scope_key=?1 AND jail=?2;");
                 defer marker.deinit();
@@ -554,8 +533,6 @@ pub fn Methods(comptime Store: type) type {
         pub fn transitionOwnerTx(self: *Store, change: effects.OwnerTransition, now: i64) Error!OwnerTransitionTx {
             return self.transitionOwnerReservedTx(change, now, true);
         }
-        /// `reserve` false means the caller already reserved this retain transition, as a
-        /// reload does once for all of a jail's owners.
         pub fn transitionOwnerReservedTx(self: *Store, change: effects.OwnerTransition, now: i64, reserve: bool) Error!OwnerTransitionTx {
             change.scope.validate() catch return error.InvalidEffect;
             _ = detection.Name.init(change.jail) catch return error.InvalidEffect;
@@ -583,8 +560,6 @@ pub fn Methods(comptime Store: type) type {
             if (!std.mem.eql(u8, &owner.generation, &change.current_generation)) return error.EffectGenerationMismatch;
             if (owner.lease == .absent) return error.StaleEffect;
             switch (change.mode) {
-                // A retained decision stays live and keeps its marker; release is terminal and
-                // draws on the reserve the admission kept for it.
                 .retain => if (reserve) try self.reserveEffectRows(.{ .revisions = 1, .intents = 1, .observations = observations_per_intent }),
                 .release => try self.retireOwnerDecisionTx(key, change.jail, null, now),
             }
@@ -649,10 +624,6 @@ pub fn Methods(comptime Store: type) type {
             if (entry.revision != token.revision or !std.mem.eql(u8, &entry.intent_id, &token.intent_id)) return error.StaleEffect;
             return entry;
         }
-        /// Marks the intent and the current decisions' action targets dispatched at
-        /// `dispatch_us` inside the caller's transaction. Nothing commits this on its own:
-        /// the outcome commit carries the dispatch time with its observation, so an attempt
-        /// whose outcome is never observed leaves the durable intent `pending`.
         fn markDispatchedTx(self: *Store, token: effects.Token, dispatch_us: i64) Error!void {
             var row = try self.statement("UPDATE effect_intents SET status=2,dispatch_us=?2,observed_us=NULL,fingerprint=NULL WHERE intent_id=?1 AND status=1;");
             defer row.deinit();
@@ -662,8 +633,6 @@ pub fn Methods(comptime Store: type) type {
             if (self.api.changes(self.db) != 1) return error.StaleEffect;
             try self.markActionTargetsTx(token.scope_key, dispatch_us);
         }
-        /// The current decisions' pending or uncertain action targets move with the
-        /// intent's attempt, so one settlement can settle them all.
         fn markActionTargetsTx(self: *Store, scope_key: effects.Hash, dispatch_us: i64) Error!void {
             if (self.schema_version < 21) return;
             var targets = try self.statement("UPDATE action_targets SET status=2,dispatch_us=?2,settled_us=NULL WHERE scope_key=?1 AND status IN(1,5) AND action_id IN (SELECT decision_id FROM effect_owners WHERE scope_key=?1);");
@@ -672,8 +641,6 @@ pub fn Methods(comptime Store: type) type {
             try targets.int(2, dispatch_us);
             try targets.done();
         }
-        /// Test-only. Commits the durable `dispatched` intent state that earlier releases
-        /// wrote before every mutation, so recovery cases can start from such rows.
         pub fn dispatchedForTest(self: *Store, token: effects.Token, dispatch_us: i64, clock: effects.Clock) Error!void {
             if (!builtin.is_test) @compileError("dispatchedForTest is test-only");
             try self.beginWrite();
@@ -691,10 +658,6 @@ pub fn Methods(comptime Store: type) type {
             try self.commitEffectTransaction(true);
         }
         const SettledIntent = struct { entry: effects.Entry, status: effects.Status, settlement: effects.Settlement };
-        /// One intent's settlement from an observation, inside the caller's transaction.
-        /// A `pending` intent records `dispatch_us` here. A row an earlier release left
-        /// `dispatched`, or a settled row being re-verified, keeps its stored dispatch time
-        /// and the argument is ignored; ordering is always checked against the recorded value.
         fn settleTx(self: *Store, token: effects.Token, dispatch_us: i64, observation: effects.Observation, clock: effects.Clock) Error!SettledIntent {
             const entry = try self.checkedEffectToken(token);
             switch (entry.status) {
@@ -755,8 +718,6 @@ pub fn Methods(comptime Store: type) type {
                 }
             }
             if (self.schema_version >= store.load_repair_schema) {
-                // Re-settlement of one intent keeps only its newest observations, bounding
-                // the per-transition cost the admission reserve counts.
                 var trim = try self.statement("DELETE FROM effect_observations WHERE intent_id=?1 AND rowid NOT IN (SELECT rowid FROM effect_observations INDEXED BY effect_observations_intent WHERE intent_id=?1 ORDER BY observed_us DESC,rowid DESC LIMIT ?2);");
                 defer trim.deinit();
                 try trim.blob(1, &token.intent_id);
@@ -770,8 +731,6 @@ pub fn Methods(comptime Store: type) type {
             try row.int(3, observation.observed_us);
             try row.blob(4, &observation.fingerprint);
             try row.done();
-            // Targets an earlier release left unsettled on an already settled scope join
-            // this settlement the way a dispatch would take them, so its outcome settles them.
             if (entry.status != .pending) try self.markActionTargetsTx(token.scope_key, dispatch_time);
             if (status == .applied and self.schema_version >= store.load_repair_schema) {
                 var owners: [effects.max_page]effects.Owner = undefined;
@@ -829,12 +788,9 @@ pub fn Methods(comptime Store: type) type {
                     }
                 };
             }
-            // The confirmation proof above is what lets the enforcement targets settle.
             if (status == .applied) _ = try self.settleActionTargetsTx(token.scope_key, now);
             return .{ .entry = entry, .status = status, .settlement = if (expired) .expired else if (matches) .verified else .retry_same_intent };
         }
-        /// Settles one intent from a readback in a single commit: dispatch time, observation
-        /// receipt, intent status, owner confirmation and the action targets' settlement.
         pub fn settleOutcome(self: *Store, token: effects.Token, dispatch_us: i64, observation: effects.Observation, clock: effects.Clock) Error!effects.Settlement {
             if (observation.qualification != .complete_owned or !std.mem.eql(u8, &observation.installation, &token.installation) or !std.mem.eql(u8, &observation.scope_key, &token.scope_key)) return error.IncompleteEffectObservation;
             try self.beginWrite();
@@ -847,12 +803,6 @@ pub fn Methods(comptime Store: type) type {
             try self.commitEffectTransaction(true);
             return settled.settlement;
         }
-        /// Settles up to `max_expiry_batch` prepared removals (desired `absent`) that one
-        /// readback at `observed_us` proved absent, in one commit. A prepared removal has no
-        /// dispatch of its own, so the readback time is recorded as its dispatch time. Every
-        /// token keeps its identity, status and ordering checks and its receipt; one stale
-        /// token fails the batch and the rollback leaves all of them unsettled. Returns the
-        /// number settled.
         pub fn settleExpired(self: *Store, tokens: []const effects.Token, fingerprint: effects.Hash, observed_us: i64, clock: effects.Clock) Error!usize {
             if (tokens.len == 0 or tokens.len > max_expiry_batch) return error.InvalidEffect;
             try self.beginWrite();
@@ -868,10 +818,6 @@ pub fn Methods(comptime Store: type) type {
             try self.commitEffectTransaction(true);
             return tokens.len;
         }
-        /// Records one owner decision's confirmation once. The marker, not the event row, is
-        /// the deduplication key, so pruning the event never lets the same decision count or
-        /// append again. An event without a marker (a decision confirmed before, retired and
-        /// reinstated) gains only the marker.
         fn confirmOwnerTx(self: *Store, token: effects.Token, owner: effects.Owner, observed_us: i64) Error!void {
             const jail = owner.jail.slice();
             const event_id = effects.hashParts("fail2zig-native-confirmed-owner-v1", &.{ &token.installation, &token.scope_key, jail, &owner.decision_id });
@@ -956,10 +902,6 @@ pub fn Methods(comptime Store: type) type {
             try self.commitEffectTransaction(prepared.expired != 0);
             return prepared.entry;
         }
-        /// Prepares up to `max_expiry_batch` expired scopes in one commit. Every scope keeps
-        /// its own token/revision, owner-retirement and capacity checks; one stale item fails
-        /// the batch and the rollback leaves all of them unprepared. Returns how many scopes
-        /// had an expired owner.
         pub fn prepareExpiries(self: *Store, items: []const ExpiryItem, clock: effects.Clock) Error!usize {
             if (items.len == 0 or items.len > max_expiry_batch) return error.InvalidEffect;
             try self.beginWrite();

@@ -109,9 +109,7 @@ pub fn canonicalizeLegacyScope(scope: Scope) Error!CanonicalScope {
     return result;
 }
 
-/// The largest inventory any `Limits` admits.
 pub const max_inventory_entries: usize = 65_536;
-/// Readings of one nftables inventory before an interrupted dump is reported.
 const max_dump_attempts: usize = 3;
 pub const Limits = struct {
     max_entries: usize = max_inventory_entries,
@@ -130,8 +128,6 @@ pub const Entry = struct {
     remaining_ms: ?u64 = null,
     deadline_us: ?i64 = null,
     effect_id: ?[32]u8 = null,
-    /// A validated owned scoped group with parts missing, repeated or dated
-    /// differently: still ours, never a match, so the entry is re-dispatched.
     partial: bool = false,
 };
 
@@ -207,7 +203,6 @@ pub const Snapshot = struct {
     state: enum { absent, owned },
     entries: []Entry,
     fingerprint: [32]u8,
-    // Only a complete, stable inspector readback establishes this scaffold proof.
     structure_proof: StructureProof = .unverified,
     observed_start_ns: u64,
     observed_end_ns: u64,
@@ -215,7 +210,6 @@ pub const Snapshot = struct {
         self.allocator.free(self.entries);
         self.* = undefined;
     }
-    /// Position of the entry for exactly `scope`, if installed.
     pub fn find(self: *const Snapshot, scope: CanonicalScope) Error!?usize {
         return entryIndex(self.entries, scope);
     }
@@ -258,7 +252,6 @@ pub const DispatchToken = struct {
     operation: EffectOperation,
 };
 pub const EffectResult = union(enum) {
-    /// `snapshot` was read within [observed_start_wall_us, observed_wall_us].
     verified: struct { snapshot: Snapshot, changed: bool, observed_start_wall_us: i64, observed_wall_us: i64 },
     uncertain: FailureContext,
     pub fn deinit(self: *EffectResult) void {
@@ -292,13 +285,10 @@ pub const Inspector = struct {
     work_messages: usize = 0,
     retained_bytes: usize = 0,
     live_bytes: usize = 0,
-    /// nftables dumps the kernel flagged as interrupted, including those retried at once.
     dump_interruptions: u64 = 0,
     test_fault_after_mutations: if (@import("builtin").is_test) ?usize else void = if (@import("builtin").is_test) null else {},
     test_fault_readback: if (@import("builtin").is_test) ?Error else void = if (@import("builtin").is_test) null else {},
-    /// Runs between the two passes of a tool-transport inventory read only.
     test_between_reads: if (@import("builtin").is_test) ?*const fn (*Inspector) void else void = if (@import("builtin").is_test) null else {},
-    /// Inventory reads started, one per `inspect` call, including those inside `applyExact`.
     test_inspections: if (@import("builtin").is_test) usize else void = if (@import("builtin").is_test) 0 else {},
 
     pub fn open(allocator: mem.Allocator, installation: Installation, limits: Limits) Error!Inspector {
@@ -398,8 +388,6 @@ pub const Inspector = struct {
         return effectMatches(token.operation, self.installation.transport, try findEntry(snapshot.entries, token.scope, token.effect_id), wall_start_us, wall_end_us);
     }
 
-    /// Reads the inventory and applies from it. Tool transports use this path: a stale
-    /// `existed` there would produce a duplicate insert, not a rejected batch.
     pub fn applyExact(self: *Inspector, token: DispatchToken, clock: ClockSample) Error!EffectResult {
         try (DurableInstallationIntent{ .installation = token.installation, .intent_id = token.effect_id, .revision = token.aggregate_revision }).validate(self.installation);
         try validateRealizedScope(self.installation.transport, token.scope);
@@ -407,25 +395,14 @@ pub const Inspector = struct {
         var elapsed = std.time.Timer.start() catch return error.SystemError;
         var baseline = try self.inspect();
         defer baseline.deinit();
-        // The pre-read is held across the mutation and its readback, so it stays charged.
         const held = self.retained_bytes;
         self.retained_bytes = held + baseline.entries.len * @sizeOf(Entry);
         defer self.retained_bytes = held;
         var result = try self.applyFromBaseline(token, .{ .wall_us = try clockAt(clock, &elapsed) }, &baseline);
-        // A no-op was judged from the pre-read, which this call observed from its start.
         if (result == .verified and !result.verified.changed) result.verified.observed_start_wall_us = clock.wall_us;
         return result;
     }
 
-    /// The single mutate-and-verify path. `baseline` is the caller's accepted readback of
-    /// this installation: it decides whether the entry exists and whether the desired
-    /// state already holds. The caller keeps ownership of `baseline` and, when it holds
-    /// it across calls, has charged it to `retained_bytes` itself. A no-op returns
-    /// `changed = false` with a copy of `baseline` that the caller owns, observed over
-    /// this call's window. Otherwise the kernel is mutated and exactly one readback is
-    /// returned, judged for the target scope only; any other difference from the
-    /// baseline is kernel expiry or foreign change, which the next readback classifies.
-    /// A batch the kernel rejected whole is `error.Changed` with `mutation = .not_started`.
     pub fn applyFromBaseline(self: *Inspector, token: DispatchToken, clock: ClockSample, baseline: *const Snapshot) Error!EffectResult {
         try (DurableInstallationIntent{ .installation = token.installation, .intent_id = token.effect_id, .revision = token.aggregate_revision }).validate(self.installation);
         const transport = self.installation.transport;
@@ -471,8 +448,6 @@ pub const Inspector = struct {
         }
         return .{ .verified = .{ .snapshot = after, .changed = true, .observed_start_wall_us = observation_start, .observed_wall_us = observation_end } };
     }
-    /// Removes the entries `baseline` shows, then takes one readback; callers keep a batch within
-    /// `max_withdraw_messages`, and a batch the kernel rejected whole is `error.Changed`, not started.
     pub fn withdrawBatch(self: *Inspector, tokens: []const DispatchToken, clock: ClockSample, baseline: *const Snapshot) Error!EffectResult {
         const transport = self.installation.transport;
         if (tokens.len > max_withdraw_messages) return error.LimitExceeded;
@@ -623,12 +598,6 @@ pub const Inspector = struct {
             if (token.operation == .ensure_absent) try self.mutateCommand(&.{ binary, "-w", "1", "-D", name, "-s", address, "-j", "DROP" }, timer, &count, progress) else try self.mutateCommand(&.{ binary, "-w", "1", "-I", name, "1", "-s", address, "-j", "DROP" }, timer, &count, progress);
         }
     }
-    /// Converges one scoped effect's fixed-argv rules from whatever validated owned state
-    /// the chain holds: every missing part of the wanted metadata is inserted first, then
-    /// every rule of the effect with other metadata, and every repeated part, is deleted,
-    /// so protection never lapses across a renewal. Each invocation is bounded by the
-    /// call's timer; a failure after the first one is an uncertain outcome whose readback
-    /// shows the partial entry for the next dispatch.
     fn mutateFixedScoped(self: *Inspector, token: DispatchToken, name: []const u8, timer: *std.time.Timer, progress: *MutationProgress) Error!void {
         const v6 = token.scope.subject.family == .v6;
         const binary = if (v6) self.ip6tables_path else self.iptables_path;
@@ -662,8 +631,6 @@ pub const Inspector = struct {
         var comment_buf: [scoped_comment_bytes]u8 = undefined;
         try self.mutateCommand(try buildFixedScopedArgv(&argv, &subject_buf, &port_buf, &comment_buf, binary, chain, metadata, operation), timer, mutations, progress);
     }
-    /// The effect's rules as `iptables -S` lists them now, validated exactly as the
-    /// readback validates them, so a stale baseline can only add or remove work here.
     fn listFixedScoped(self: *Inspector, token: DispatchToken, name: []const u8, binary: []const u8, v6: bool, timer: *std.time.Timer) Error!FixedScopedVariants {
         const result = try self.run(&.{ binary, "-w", "1", "-S" }, timer);
         defer result.deinit(self.allocator);
@@ -720,11 +687,6 @@ pub const Inspector = struct {
         nl.receiveAcknowledgments(&sock, related[1..count], related[0 .. count + 1], @min(try self.remainingMs(timer), 2000)) catch |err| return rejectedBatch(err, progress);
     }
 
-    /// Converges one scoped effect in a single atomic batch: every validated owned rule
-    /// carrying the effect id is deleted, whatever its part or deadline, and all wanted
-    /// parts are added. The batch acknowledges at most 64 messages, so the handles
-    /// deleted per dispatch are bounded to one group's worth; any beyond that stay a
-    /// partial entry in the readback and the next dispatch removes them.
     fn mutateScopedNft(self: *Inspector, token: DispatchToken, name: []const u8, timer: *std.time.Timer, progress: *MutationProgress) Error!void {
         const part_count = nft.scopeRulePartCount(token.scope) catch |err| return scopeBuildError(err);
         if (part_count > nft.max_scope_rule_parts) return error.LimitExceeded;
@@ -775,7 +737,6 @@ pub const Inspector = struct {
                 count += 1;
             }
         }
-        // Nothing to delete and nothing to add: the baseline's `existed` was stale.
         if (count == 1) return error.Changed;
         related[count] = sock.nextSeq();
         const bytes = batch.commit(related[count], sock.port_id, nl.NFNL.SUBSYS_NFTABLES) catch |err| return netlinkError(err);
@@ -855,7 +816,6 @@ pub const Inspector = struct {
             self.test_inspections += 1;
             if (self.test_fault_readback) |fault| return fault;
         }
-        // Bytes of a snapshot the caller still holds stay charged against the limit.
         const held = self.retained_bytes;
         defer self.retained_bytes = held;
         var timer = std.time.Timer.start() catch return error.SystemError;
@@ -875,10 +835,7 @@ pub const Inspector = struct {
         second.snapshot.observed_start_ns = first.snapshot.observed_start_ns;
         return second.snapshot;
     }
-    /// The kernel serves each nftables dump at one generation and flags a dump whose
-    /// generation moved, so a single pass is a coherent picture of the owned objects.
-    /// An interrupted dump is re-read at once within the same time budget; each retry
-    /// discards the interrupted messages, so it starts a fresh work count.
+    // The kernel flags a dump whose generation moved; an interrupted dump is re-read at once and each retry restarts the work count.
     fn readCoherent(self: *Inspector, timer: *std.time.Timer) Error!Snapshot {
         var attempt: usize = 1;
         while (true) : (attempt += 1) {
@@ -1004,10 +961,7 @@ fn timingTransport(transport: Transport, scope: CanonicalScope) Transport {
 fn entryScope(entry: Entry) CanonicalScope {
     return entry.scope orelse .{ .subject = canonical_scope.Subject.host(entry.address) };
 }
-/// Snapshot entries are ordered by `entryLess` with no repeated scope, as
-/// `Builder.finish` enforces, so an exact scope occupies at most one position.
 fn entryIndex(entries: []const Entry, scope: CanonicalScope) Error!?usize {
-    // A scope that cannot be encoded is invalid and so equals no installed entry.
     const key = scope.encode() catch return null;
     var low: usize = 0;
     var high = entries.len;
@@ -1027,11 +981,7 @@ fn findEntry(entries: []const Entry, scope: CanonicalScope, effect_id: [32]u8) E
     if (entry.scope != null and (entry.effect_id == null or !mem.eql(u8, &entry.effect_id.?, &effect_id))) return error.ForeignState;
     return entry;
 }
-/// Kernel set-element timeouts equal the ban deadline, so the kernel removes an element
-/// on schedule without any mutation by us. Two sorted readbacks describe the same owned
-/// state when every entry matches, except that an element whose remaining timeout could
-/// have elapsed within `window_ns` may be missing from the later one. Any other added,
-/// missing or altered entry is a change and must not be accepted as ownership proof.
+// Kernel set-element timeouts equal the ban deadline, so an element whose remaining timeout fits in `window_ns` may expire between readbacks.
 fn sameEntries(before: []const Entry, after: []const Entry, except: ?CanonicalScope, window_ns: u64, transport: Transport) bool {
     var i: usize = 0;
     var j: usize = 0;
@@ -1067,7 +1017,7 @@ fn expiredWithin(entry: Entry, window_ns: u64, transport: Transport) bool {
     const remaining_us = std.math.mul(u64, remaining, 1000) catch return false;
     return remaining_us <= window_ns / std.time.ns_per_us +| 1 +| timeoutToleranceUs(transport);
 }
-/// ipset reports whole seconds and nftables reports milliseconds at jiffy granularity.
+// ipset reports whole seconds and nftables reports milliseconds at jiffy granularity.
 fn timeoutToleranceUs(transport: Transport) u64 {
     return if (transport == .ipset) 1_000_000 else 10_000;
 }
@@ -1119,7 +1069,6 @@ const Builder = struct {
         }
         self.entries.appendAssumeCapacity(e);
     }
-    /// Tables, chains, sets, rules and markers only; entries are compared separately.
     fn structureDigest(self: *const Builder) [32]u8 {
         var structure = self.topology;
         structure.update(&.{@intFromBool(self.present)});
@@ -1289,10 +1238,6 @@ fn fixedScopedMetadata(tokens: Tokens, chain: []const u8, v6: bool) Error!?Scope
     return metadata;
 }
 
-/// The rules of one effect id, each already validated as our exact scoped drop for its
-/// own metadata. Parts that disagree on the deadline or repeat are our own interrupted
-/// mutation, so the group is reported partial rather than failing the readback; a
-/// scope that differs within one effect id is not ours to repair.
 const ScopedGroup = struct { metadata: ScopedRuleMetadata, parts: u32 = 0, partial: bool = false };
 
 fn collectScopedGroup(groups: *std.ArrayList(ScopedGroup), metadata: ScopedRuleMetadata, limits: Limits) Error!void {
@@ -1328,9 +1273,6 @@ fn finishScopedGroups(builder: *Builder, groups: []const ScopedGroup) Error!void
     }
 }
 
-/// Rules of one scoped effect as `iptables -S` lists them, counted per metadata variant
-/// and part. Bounded so the recovery work of one dispatch is finite; rules beyond the
-/// bound remain a partial entry in the readback and wait for the next dispatch.
 const FixedScopedVariants = struct {
     const max_variants = 8;
     const Variant = struct { deadline_us: ?i64, counts: [nft.max_scope_rule_parts]u16 = @splat(0) };
@@ -1586,8 +1528,7 @@ fn netlinkError(err: nl.Error) Error {
         else => error.UnknownState,
     };
 }
-/// The kernel applies a batch whole or rejects it whole, so an element or rule the
-/// baseline misjudged rejects the batch with nothing applied: a non-mutation.
+// The kernel applies a batch whole or rejects it whole, so a misjudged baseline is a non-mutation.
 fn rejectedBatch(err: nl.Error, progress: *MutationProgress) Error {
     switch (err) {
         error.AlreadyExists, error.NotFound => {
@@ -1675,9 +1616,6 @@ fn equalAttributes(a: []const u8, b: []const u8, depth: usize, optional_zero_att
     }
     return false;
 }
-/// A rule carrying our metadata is ours only when its expression is the exact scoped
-/// drop for that metadata. The same check gates readback and recovery deletion, so
-/// recovery never deletes a rule the readback would not have accepted as ours.
 fn validateScopedDropRule(table: []const u8, attributes: AttrMap, metadata: ScopedRuleMetadata) Error!void {
     const part_count = nft.scopeRulePartCount(metadata.scope) catch |err| return scopeBuildError(err);
     if (part_count != metadata.count) return error.ForeignState;

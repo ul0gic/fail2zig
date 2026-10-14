@@ -374,8 +374,6 @@ pub const ValidationConstraint = enum {
     builtin_filter,
 };
 
-/// Allocation-free semantic validation context. Configuration values are never
-/// retained here; the only copied input is a bounded jail identifier.
 pub const ValidationDiagnostic = struct {
     section: ValidationSection = .none,
     key: ValidationKey = .none,
@@ -390,9 +388,6 @@ pub const ValidationDiagnostic = struct {
         return self.jail_buf[0..self.jail_len];
     }
 
-    /// Render bounded context without inventing source coordinates. Field and
-    /// constraint come first so a short caller buffer remains actionable.
-    /// Truncation is always visible and an escaped jail byte is never split.
     pub fn render(self: *const ValidationDiagnostic, out: []u8) []const u8 {
         var rendered = ValidationRenderBuffer{ .out = out };
         switch (self.section) {
@@ -654,7 +649,6 @@ pub fn validateDiag(cfg: *const Config, out: *ValidationDiagnostic) ValidationEr
         if (j.enabled and j.rule_files.len != 0) _ = @import("../core/native_detection_record.zig").Name.init(j.filter) catch
             return validationFailure(out, .jail, .filter, .valid_rule_filter, j.name, error.InvalidNativeRules);
         if (j.enabled and j.rule_files.len == 0 and filter_registry.matcherForFilter(j.filter) == null) {
-            // The filter value is not needed to identify the setting or repair.
             return validationFailure(out, .jail, .filter, .builtin_filter, j.name, error.UnknownFilter);
         }
         if ((j.bantime_kind orelse .finite) == .finite) if (j.bantime) |b| if (b == 0 or b > max_ban_duration)

@@ -8,14 +8,10 @@ const latest_schema = store_mod.latest_schema;
 pub const target_schema = store_mod.load_repair_schema;
 const source_schema: i64 = 23;
 
-// Callback allowance for the one unpageable completion check (unfiltered foreign_key_check
-// plus quick_check). Used only by the final migration transaction; every mutating page
-// stays under the ordinary 1,000-callback guard. Sized as the measured worst 1.42 callbacks
-// per page x the 65,536-page state cap x 1.25.
+// Callback allowance for the final transaction's unpageable foreign_key_check and quick_check.
+// Measured worst 1.42 callbacks per page x the 65,536-page state cap x 1.25.
 pub const migration_verify: u32 = 116_400;
-// Observations kept per intent; older ones are dropped while the table is rebuilt.
 pub const observations_per_intent: i64 = 4;
-// Space kept free beyond the backup and the rebuild overlap for WAL and temporary B-trees.
 const disk_reserve_bytes: u64 = 32 * 1024 * 1024;
 
 pub const BackupKind = enum {
@@ -83,7 +79,6 @@ pub const Options = struct {
 };
 
 pub const Step = struct {
-    // Phase that ran; null for the fence transaction that creates the progress row.
     phase: ?Phase,
     next: Phase,
     callbacks: u32,
@@ -119,9 +114,7 @@ const Statvfs = extern struct {
 };
 extern fn fstatvfs(fd: c_int, buffer: *Statvfs) c_int;
 
-// All new structures are created empty in the fence transaction; existing-row work follows
-// in bounded pages. Added detail columns carry no CHECK: ADD COLUMN ... CHECK rescans every
-// existing row, so triggers enforce the same rules for inserted and updated rows instead.
+// ADD COLUMN ... CHECK rescans every existing row, so triggers enforce the same rules instead.
 const fence_ddl =
     \\CREATE TABLE load_repair_migration(id INTEGER PRIMARY KEY CHECK(id=1),phase INTEGER NOT NULL CHECK(phase BETWEEN 1 AND 99),cursor INTEGER NOT NULL CHECK(typeof(cursor)='integer' AND cursor>=0),started_us INTEGER NOT NULL CHECK(typeof(started_us)='integer'),completed_us INTEGER CHECK(completed_us IS NULL OR typeof(completed_us)='integer'),backup_path TEXT NOT NULL CHECK(typeof(backup_path)='text' AND length(backup_path) BETWEEN 1 AND 4096),backup_sha256 BLOB NOT NULL CHECK(typeof(backup_sha256)='blob' AND length(backup_sha256)=32),backup_pages INTEGER NOT NULL CHECK(typeof(backup_pages)='integer' AND backup_pages>0),backup_user_version INTEGER NOT NULL CHECK(backup_user_version=23),backup_quick_check TEXT NOT NULL CHECK(backup_quick_check='ok'),superseded_targets INTEGER NOT NULL CHECK(typeof(superseded_targets)='integer' AND superseded_targets>=0),CHECK((phase=99)=(completed_us IS NOT NULL)));
     \\CREATE TABLE retention_policy(id INTEGER PRIMARY KEY CHECK(id=1),generation INTEGER NOT NULL CHECK(typeof(generation)='integer' AND generation>0),max_matches INTEGER NOT NULL CHECK(typeof(max_matches)='integer' AND max_matches BETWEEN 0 AND 1024),state INTEGER NOT NULL CHECK(state IN(1,2)),sweep_cursor INTEGER NOT NULL CHECK(typeof(sweep_cursor)='integer' AND sweep_cursor>=0));
@@ -151,13 +144,8 @@ const fence_ddl =
     \\CREATE TRIGGER admin_request_revision_update BEFORE UPDATE OF admission_revision ON admin_requests BEGIN SELECT RAISE(ABORT,'admission revision immutable'); END;
 ;
 
-// A retired decision's settled targets are no longer read by anyone; unsettled ones keep
-// their intents, revisions and observations until the runtime disposes of them.
 const sql_targets_reclaim = "DELETE FROM action_targets WHERE rowid IN (SELECT a.rowid FROM action_targets a WHERE a.rowid>?1 AND a.rowid<=?2 AND a.status NOT IN(1,2,5) AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.jail=a.jail AND o.decision_id=a.action_id));";
 const sql_targets_count = "SELECT count(*) FROM action_targets WHERE rowid>?1 AND rowid<=?2;";
-// The runtime only processes the current owner's decision, so an unsettled target of any
-// other decision was already abandoned. It becomes terminal `superseded` (7), settled at the
-// migration start so resumed runs write identical rows.
 const orphaned_target = "a.status IN(1,2,5) AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=a.scope_key AND o.jail=a.jail AND o.decision_id=a.action_id)";
 const sql_targets_orphans = "SELECT count(*) FROM action_targets a WHERE a.rowid>?1 AND a.rowid<=?2 AND " ++ orphaned_target ++ ";";
 const sql_targets_copy = "INSERT INTO action_targets_v24 SELECT action_id,kind,scope_key,jail,required,restored,CASE WHEN orphaned THEN 7 ELSE status END,intent_us,dispatch_us,CASE WHEN orphaned THEN coalesce(settled_us,max(coalesce(dispatch_us,intent_us),(SELECT started_us FROM load_repair_migration WHERE id=1))) ELSE settled_us END,metadata FROM (SELECT a.*,a.rowid AS source_row," ++ orphaned_target ++ " AS orphaned FROM action_targets a WHERE a.rowid>?1 AND a.rowid<=?2) ORDER BY source_row;";
@@ -170,13 +158,10 @@ const sql_events_count = "SELECT count(*) FROM confirmed_effect_events WHERE row
 const sql_events_copy = "INSERT INTO confirmed_effect_events_v24(event_id,scope_key,jail,decision_id,confirmed_us,canonical_scope) SELECT e.event_id,e.scope_key,e.jail,e.decision_id,e.confirmed_us,n.canonical_scope FROM confirmed_effect_events e JOIN native_effects n ON n.scope_key=e.scope_key WHERE e.rowid>?1 AND e.rowid<=?2 ORDER BY e.rowid;";
 const sql_markers = "INSERT INTO confirmation_markers(scope_key,jail,decision_id,event_id) SELECT o.scope_key,o.jail,o.decision_id,e.event_id FROM effect_owners o JOIN confirmed_effect_events e ON e.scope_key=o.scope_key AND e.jail=o.jail AND e.decision_id=o.decision_id WHERE o.rowid>?1 AND o.rowid<=?2 AND o.lease_kind<>0;";
 const sql_details_count = "SELECT count(*) FROM confirmed_event_details WHERE rowid>?1 AND rowid<=?2;";
-// Legacy details without a joinable retry detail keep a NULL subject and stay age-only.
 const sql_details = "UPDATE confirmed_event_details SET family=x.family,subject=x.subject,sequence=x.sequence,confirmed_us=x.confirmed_us,evidence_bytes=x.evidence_bytes FROM (SELECT d.rowid AS rid,r.family AS family,r.subject AS subject,s.sequence AS sequence,e.confirmed_us AS confirmed_us,CASE WHEN d.evidence IS NULL THEN NULL ELSE length(CAST(d.evidence AS BLOB)) END AS evidence_bytes FROM confirmed_event_details d JOIN confirmed_effect_events e ON e.event_id=d.event_id JOIN confirmed_history_sequence s ON s.event_id=d.event_id LEFT JOIN retry_decision_details r ON r.jail=e.jail AND r.effect_decision_id=e.decision_id WHERE d.rowid>?1 AND d.rowid<=?2) AS x WHERE confirmed_event_details.rowid=x.rid;";
 const sql_summaries = "INSERT INTO retained_subject_summaries(family,subject,detail_count,evidence_bytes,earliest_sequence,earliest_evidence_sequence,evaluated_generation,candidate_sequence) SELECT family,subject,count(*),coalesce(sum(evidence_bytes),0),min(sequence),min(CASE WHEN evidence_bytes IS NOT NULL THEN sequence END),0,NULL FROM confirmed_event_details WHERE rowid>?1 AND rowid<=?2 AND family IS NOT NULL GROUP BY family,subject ON CONFLICT(family,subject) DO UPDATE SET detail_count=detail_count+excluded.detail_count,evidence_bytes=evidence_bytes+excluded.evidence_bytes,earliest_sequence=min(earliest_sequence,excluded.earliest_sequence),earliest_evidence_sequence=CASE WHEN earliest_evidence_sequence IS NULL THEN excluded.earliest_evidence_sequence WHEN excluded.earliest_evidence_sequence IS NULL THEN earliest_evidence_sequence ELSE min(earliest_evidence_sequence,excluded.earliest_evidence_sequence) END;";
 const retained_evidence_limit = "16384";
 const sql_candidates = "UPDATE retained_subject_summaries SET candidate_sequence=CASE WHEN detail_count>?3 THEN earliest_sequence WHEN evidence_bytes>" ++ retained_evidence_limit ++ " THEN earliest_evidence_sequence END,evaluated_generation=?4 WHERE rowid>?1 AND rowid<=?2;";
-// Recomputes each maintained summary from the detail indexes independently of the
-// accumulation above; any returned row is a mismatch.
 const sql_validate = "SELECT 1 FROM retained_subject_summaries s WHERE s.rowid>?1 AND s.rowid<=?2 AND (s.detail_count IS NOT (SELECT count(*) FROM confirmed_event_details d INDEXED BY confirmed_details_subject WHERE d.family=s.family AND d.subject=s.subject) OR s.evidence_bytes IS NOT (SELECT coalesce(sum(d.evidence_bytes),0) FROM confirmed_event_details d INDEXED BY confirmed_details_subject WHERE d.family=s.family AND d.subject=s.subject) OR s.earliest_sequence IS NOT (SELECT min(d.sequence) FROM confirmed_event_details d INDEXED BY confirmed_details_subject WHERE d.family=s.family AND d.subject=s.subject) OR s.earliest_evidence_sequence IS NOT (SELECT min(d.sequence) FROM confirmed_event_details d INDEXED BY confirmed_details_evidence WHERE d.family=s.family AND d.subject=s.subject AND d.evidence_bytes IS NOT NULL) OR s.candidate_sequence IS NOT (CASE WHEN s.detail_count>?3 THEN s.earliest_sequence WHEN s.evidence_bytes>" ++ retained_evidence_limit ++ " THEN s.earliest_evidence_sequence END) OR s.evaluated_generation<>?4) LIMIT 1;";
 
 const detail_provenance = "typeof(NEW.sequence)='integer' AND NEW.sequence>0 AND typeof(NEW.confirmed_us)='integer' AND ((NEW.family IS NULL AND NEW.subject IS NULL) OR (NEW.family IN(4,6) AND typeof(NEW.subject)='blob' AND length(NEW.subject)=CASE NEW.family WHEN 4 THEN 4 ELSE 16 END)) AND NEW.evidence_bytes IS (CASE WHEN NEW.evidence IS NULL THEN NULL ELSE length(CAST(NEW.evidence AS BLOB)) END)";
@@ -189,8 +174,6 @@ const detail_columns_ddl =
 ++ "CREATE TRIGGER confirmed_detail_provenance_insert BEFORE INSERT ON confirmed_event_details WHEN NOT (" ++ detail_provenance ++ ") BEGIN SELECT RAISE(ABORT,'invalid retained detail provenance'); END;" ++
     "CREATE TRIGGER confirmed_detail_provenance_update BEFORE UPDATE OF family,subject,sequence,confirmed_us,evidence_bytes,evidence ON confirmed_event_details WHEN OLD.sequence IS NOT NULL OR NOT (" ++ detail_provenance ++ ") BEGIN SELECT RAISE(ABORT,'retained detail provenance is immutable'); END;";
 
-// Partial indexes over still-NULL columns: each build scans once but inserts nothing, so
-// the later backfill pages maintain them incrementally.
 const detail_index_ddl = [_][:0]const u8{
     "CREATE UNIQUE INDEX confirmed_details_sequence ON confirmed_event_details(sequence) WHERE sequence IS NOT NULL;",
     "CREATE INDEX confirmed_details_age ON confirmed_event_details(confirmed_us,sequence) WHERE confirmed_us IS NOT NULL;",
@@ -198,7 +181,6 @@ const detail_index_ddl = [_][:0]const u8{
     "CREATE INDEX confirmed_details_evidence ON confirmed_event_details(family,subject,sequence) WHERE family IS NOT NULL AND evidence_bytes IS NOT NULL;",
 };
 
-// Runs after the old parent is dropped; the append trigger was dropped with it.
 const events_swap_ddl =
     \\ALTER TABLE confirmed_effect_events_v24 RENAME TO confirmed_effect_events;
     \\CREATE TRIGGER confirmed_history_append AFTER INSERT ON confirmed_effect_events BEGIN SELECT CASE WHEN (SELECT count(*) FROM confirmed_history_stream WHERE id=1)!=1 THEN RAISE(ABORT,'missing confirmed history stream') END; UPDATE confirmed_history_stream SET head=head+1,revision=revision+1 WHERE id=1; INSERT INTO confirmed_history_sequence SELECT head,NEW.event_id FROM confirmed_history_stream WHERE id=1; END;
@@ -216,7 +198,6 @@ fn table(name: []const u8) SchemaObject {
     return obj("table", name, name);
 }
 
-// The complete schema-24 object set. Completion refuses any missing or additional object.
 const expected_objects = blk: {
     @setEvalBranchQuota(20_000);
     break :blk [_]SchemaObject{
@@ -390,8 +371,6 @@ pub fn Methods(comptime Store: type) type {
             return .{ .phase = phase, .cursor = cursor };
         }
 
-        // Normal writers do not maintain schema-24 invariants until `latest_schema` is 24,
-        // so a migrated file is refused even when its migration completed.
         pub fn requireLoadRepairAdmission(self: *Store) Error!void {
             switch (try self.loadRepairStatus()) {
                 .earlier_schema, .ready => {},
@@ -400,8 +379,6 @@ pub fn Methods(comptime Store: type) type {
             }
         }
 
-        // Runs every remaining page. Callers hold the state authority lock and call this
-        // before startup admission; a failure leaves a resumable, version-fenced state.
         pub fn completeLoadRepairMigration(self: *Store, options: Options) Error!void {
             while (true) {
                 switch (try self.loadRepairStatus()) {
@@ -411,7 +388,6 @@ pub fn Methods(comptime Store: type) type {
             }
         }
 
-        // One committed transaction of the migration.
         pub fn stepLoadRepairMigration(self: *Store, options: Options) Error!Step {
             if (options.state_path.len == 0 or options.history_max_matches > 1024) return error.InvalidRecord;
             switch (try self.loadRepairStatus()) {
@@ -424,8 +400,6 @@ pub fn Methods(comptime Store: type) type {
             const progress = try self.loadRepairProgress();
             return switch (progress.phase) {
                 .live_counter => self.loadRepairPage(options, progress, "INSERT INTO effect_owner_live(id,live) SELECT 1,count(*) FROM effect_owners WHERE lease_kind<>0;" ++
-                    // Activation commits a run's whole staged set in one transaction, so every
-                    // staged sequence of an activating or complete run has been processed.
                     "INSERT INTO migration_activations SELECT s.run_id,s.seq,r.updated_us FROM migration_staged_owners s JOIN migration_runs r ON r.run_id=s.run_id WHERE r.state IN(6,7);"),
                 .detail_columns => self.loadRepairPage(options, progress, detail_columns_ddl),
                 .detail_sequence_index, .detail_age_index, .detail_subject_index, .detail_evidence_index => self.loadRepairPage(options, progress, detail_index_ddl[@intFromEnum(progress.phase) - @intFromEnum(Phase.detail_sequence_index)]),
@@ -467,7 +441,6 @@ pub fn Methods(comptime Store: type) type {
                 try row.int(1, options.history_max_matches);
                 try row.done();
             }
-            // The version fence: from this commit on, v0.4.4 and earlier refuse the file.
             try self.exec("PRAGMA user_version=24;");
             return self.commitLoadRepair(options, null, .live_counter, budget);
         }
@@ -488,8 +461,6 @@ pub fn Methods(comptime Store: type) type {
             const pages = try self.integer("PRAGMA page_count;");
             if (page_size <= 0 or pages <= 0) return error.DatabaseFailure;
             const database_bytes = std.math.mul(u64, @intCast(page_size), @intCast(pages)) catch return error.StorageLimit;
-            // Backup copy plus rebuild overlap: the duplicated tables and new indexes are
-            // bounded by the existing database size.
             try requireFreeSpace(options.state_path, database_bytes *| 2 +| disk_reserve_bytes);
             const copied = try self.copyBackup(options, final_path, partial_path, pages, kind.target() - 1);
             return .{ .path = final_path, .sha256 = copied.sha256, .pages = pages };
@@ -651,16 +622,14 @@ pub fn Methods(comptime Store: type) type {
             return count.signed(0);
         }
 
-        // Every source row of the window must be copied; a missing join partner is corruption.
         fn windowCopy(self: *Store, count_sql: [:0]const u8, sql: [:0]const u8, low: i64, high: i64) Error!void {
             const expected = try self.windowCount(count_sql, low, high);
             try self.windowExec(sql, low, high, null);
             if (self.api.changes(self.db) != expected) return error.LoadRepairVerificationFailed;
         }
 
-        // The events table is a foreign-key parent, so its rebuild follows SQLite's
-        // documented procedure: enforcement off outside the transaction, a checked swap,
-        // then enforcement restored and read back before any later statement.
+        // The events table is a foreign-key parent: enforcement off outside the transaction, a checked swap,
+        // then enforcement restored and read back, per SQLite's documented rebuild procedure.
         fn swapLoadRepairEvents(self: *Store, options: Options, progress: Progress) Error!Step {
             try self.exec("PRAGMA foreign_keys=OFF;");
             if (try self.integer("PRAGMA foreign_keys;") != 0) {
@@ -745,7 +714,6 @@ pub fn Methods(comptime Store: type) type {
             return step;
         }
 
-        // v0.4.3 state never had this index; v0.4.4 added it at schema 23 without a version bump.
         pub fn ensureLoadRepairPrerequisites(self: *Store) Error!bool {
             const absent = try self.integer("SELECT count(*)=0 FROM sqlite_schema WHERE type='index' AND name='effect_owners_decision';") == 1;
             if (absent) try self.exec("CREATE INDEX IF NOT EXISTS effect_owners_decision ON effect_owners(jail,decision_id);");

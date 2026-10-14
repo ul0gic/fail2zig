@@ -1193,7 +1193,6 @@ test "native firewall: scoped snapshot requires exact scope effect identity and 
     try std.testing.expect(!try reader.matchesSnapshot(&snapshot, token, 100, 102));
 }
 
-/// The linear lookup that sorted search replaced, kept as the equivalence oracle.
 fn linearFind(entries: []const inspection.Entry, scope: inspection.CanonicalScope, effect_id: [32]u8) inspection.Error!?inspection.Entry {
     for (entries) |entry| {
         if (!std.meta.eql(inspection.TestAccess.entryScope(entry), scope)) continue;
@@ -1222,7 +1221,6 @@ test "native firewall: sorted scope lookup matches the linear lookup it replaced
     const network_id = [_]u8{0xa2} ** 32;
     var builder = access.builderInit(t.allocator, installation, .{});
     defer access.builderDeinit(&builder);
-    // Address-only entries sit beside a scoped entry for a legacy entry's address.
     for ([_][]const u8{ "203.0.113.200", "192.0.2.9", "10.0.0.1", "2001:db8::7" }) |text| {
         try access.builderAdd(&builder, .{ .address = try shared.IpAddress.parse(text), .remaining_ms = 60_000 });
     }
@@ -1259,7 +1257,6 @@ test "native firewall: sorted scope lookup matches the linear lookup it replaced
             try t.expectEqual(value, try actual);
         } else |cause| try t.expectError(cause, actual);
     }
-    // A repeated canonical scope never forms a snapshot, so a lookup has one answer.
     var repeated = access.builderInit(t.allocator, installation, .{});
     defer access.builderDeinit(&repeated);
     try access.builderAdd(&repeated, .{ .address = try shared.IpAddress.parse("192.0.2.9") });

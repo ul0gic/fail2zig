@@ -269,7 +269,6 @@ pub fn Methods(comptime Store: type) type {
         }
         fn deleteRecordGroup(self: *Store, jail: []const u8, source: []const u8, occurrence_view: []const u8, budget: usize) Error!?usize {
             var group_rows = 1 + try self.countRecordChildren(jail, source, occurrence_view, "record_detections") + try self.countRecordChildren(jail, source, occurrence_view, "retry_decisions");
-            // Escalation selections share their retry decision's lifetime and must remain visible to the physical row budget.
             if (self.schema_version >= 18) group_rows += try self.countRecordChildren(jail, source, occurrence_view, "retry_decision_escalations");
             if (group_rows > budget) return null;
             var occurrence_buffer: [16384]u8 = undefined;
@@ -442,8 +441,6 @@ pub fn Methods(comptime Store: type) type {
             if (decisions < 0) return error.InvalidRetryState;
             return .{ .subject = try self.decodeRetrySubject(&row, 0, 1), .last_processed_us = try row.signed(2), .decisions = @intCast(decisions) };
         }
-        /// Like `retryRetirementCandidate`, but skips subjects that cannot retire yet: a
-        /// live lease, or an attempt inside the retry window. Bounded by one row read.
         pub fn retirableSubject(self: *Store, jail: []const u8, after: ?detection.Subject, now_us: i64, window_us: i64) Error!?RetryRetirementCandidate {
             if (self.schema_version < 16) return self.retryRetirementCandidate(jail, after);
             _ = try self.maintenanceRevision();
@@ -462,9 +459,6 @@ pub fn Methods(comptime Store: type) type {
             if (decisions < 0) return error.InvalidRetryState;
             return .{ .subject = try self.decodeRetrySubject(&row, 0, 1), .last_processed_us = try row.signed(2), .decisions = @intCast(decisions) };
         }
-        /// Retirement touches only retry state, so it needs the revision and policy
-        /// fence but not the receipt, manifest or history conditions of record cleanup;
-        /// those would pin retirement for as long as ingestion is blocked.
         fn checkRetirementFence(self: *Store, fence: CleanupFence) Error!i64 {
             _ = try self.maintenanceRevision();
             try Store.maintenanceKey(fence.jail, "@retired");
@@ -526,19 +520,8 @@ pub fn Methods(comptime Store: type) type {
             return true;
         }
         pub const max_retirement_batch = Store.attribution_batch;
-        /// Candidates examined per retirement slot before a batch gives up on pinned subjects.
         const retirement_examinations_per_slot: usize = 4;
-        /// One retirement commit: candidates examined, subjects retired, and candidates
-        /// skipped because a logical lease or count still pins them (`pinned_state`) or a
-        /// live effect does (`pinned_effect`). `last` is the last examined subject.
-        /// `exhausted` says the batch reached the end of the eligible set rather than a
-        /// cap, so the caller restarts its sweep instead of advancing past `last`.
         pub const RetirementBatch = struct { examined: usize = 0, retired: usize = 0, pinned_state: usize = 0, pinned_effect: usize = 0, last: ?detection.Subject = null, exhausted: bool = false };
-        /// Retires up to `max` retirable subjects after `after` in one commit. `max` bounds
-        /// the subjects retired; examinations are bounded separately so pinned candidates
-        /// do not consume the batch. The fence is checked once; each subject keeps its own
-        /// prune, pin and state checks. The batch is all-or-nothing: a rollback leaves every
-        /// subject in `retry_states`.
         pub fn retireRetrySubjects(self: *Store, fence: CleanupFence, after: ?detection.Subject, now_us: i64, window_us: i64, max: usize) Error!RetirementBatch {
             if (max == 0 or max > max_retirement_batch) return error.InvalidRetryState;
             try self.beginWrite();
@@ -826,8 +809,6 @@ pub fn Methods(comptime Store: type) type {
             if (output.len == 0 or output.len > effect_history.max_page) return error.InvalidHistoryPage;
             var token = try self.historyHead(installation, after);
             if (expected_revision) |wanted_revision| if (wanted_revision != token.stream_revision) return error.StaleHistoryPage;
-            // From schema 24 an event carries its own scope provenance, so a pruned spent scope
-            // never hides retained history.
             var row = try self.statement(if (self.schema_version >= store.load_repair_schema)
                 "SELECT s.sequence,e.event_id,e.scope_key,e.canonical_scope,e.jail,e.decision_id,e.confirmed_us,EXISTS(SELECT 1 FROM confirmed_event_details d WHERE d.event_id=e.event_id) FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;"
             else if (self.schema_version >= 19)
@@ -1060,8 +1041,6 @@ pub fn Methods(comptime Store: type) type {
             if (!try row.row()) return error.StaleActionTarget;
             const status = std.meta.intToEnum(action_outcome.Status, try row.signed(0)) catch return error.InvalidActionTarget;
             if (try row.row()) return error.InvalidActionTarget;
-            // Dispatch and confirmation can already have been recorded with the intent's
-            // own commits; a later mark never regresses that state.
             if (status == .dispatched or status == .confirmed) {
                 try self.commitTransaction();
                 return;
@@ -1079,10 +1058,6 @@ pub fn Methods(comptime Store: type) type {
             try self.commitTransaction();
         }
 
-        /// Confirms every dispatched target of the scope's live decisions inside the caller's
-        /// transaction. An enforcement target needs its confirmation proof (marker or retained
-        /// event), which the settlement writes first. Returns the rows settled; none on a
-        /// schema without action targets.
         pub fn settleActionTargetsTx(self: *Store, scope_key: effects.Hash, now: i64) Error!usize {
             if (self.schema_version < 21) return 0;
             var update = try self.statement(if (self.schema_version >= store.load_repair_schema)
@@ -1117,7 +1092,6 @@ pub fn Methods(comptime Store: type) type {
             }
             if (target.status != .dispatched) return error.StaleActionTarget;
             if (kind == .enforcement and settlement == .confirmed) {
-                // The marker proves confirmation after its event was pruned from history.
                 var proof = try self.statement(if (self.schema_version >= store.load_repair_schema)
                     "SELECT (SELECT count(*) FROM confirmation_markers WHERE scope_key=?1 AND jail=?2 AND decision_id=?3)+(SELECT count(*) FROM confirmed_effect_events WHERE scope_key=?1 AND jail=?2 AND decision_id=?3)>0;"
                 else
@@ -1272,14 +1246,8 @@ pub fn Methods(comptime Store: type) type {
             }
         };
 
-        // Details are copied into confirmed_event_details at confirmation. Keep the
-        // original while a current owner or retained event can still consume it.
-        // One transaction removes at most 32 rows and 2 MiB of stored fields.
         pub fn pruneRetryDecisionDetailsTx(self: *Store) Error!usize {
-            // A fully retained 65,536-row table takes more than the ordinary
-            // statement budget to prove that no row is eligible. The table cap and
-            // indexed decision lookups bound this scan; keep the larger allowance
-            // local to this operation.
+            // Proving that no row of a fully retained 65,536-row table is eligible exceeds the ordinary statement budget.
             const prior_work = self.work_remaining;
             if (self.runtime_limits) self.work_remaining = 5000;
             defer {
@@ -1332,13 +1300,9 @@ pub fn Methods(comptime Store: type) type {
         pub const RetentionPolicy = struct { generation: i64, max_matches: i64, published: bool, sweep_cursor: i64 };
         pub const RetentionOutcome = enum { idle, rebuilt, published, details, prefix, yielded };
         const retained_evidence_limit = "16384";
-        // Measured schema-24 transaction units (repair phase 0): summaries per candidate sweep,
-        // age-eligible rows before the sequence-index path, and stream events per prefix page.
         const sweep_rows: i64 = 1024;
         const age_path_threshold: i64 = 4096;
         const prefix_page: usize = 64;
-        /// Consumed history is pruned before its age from 90% of the event cap on, so a
-        /// confirmation never fails because history is full.
         pub const history_overload_events: i64 = 58_982;
         const overload_notice_us: i64 = 60 * 1_000_000;
 
@@ -1351,9 +1315,6 @@ pub fn Methods(comptime Store: type) type {
             return result;
         }
 
-        /// Starts a complete candidate generation for a changed detail limit. Deletion waits
-        /// until every retained subject has been evaluated under it; a later change supersedes
-        /// an unfinished build and restarts it. Returns whether a generation started.
         pub fn setRetentionPolicy(self: *Store, max_matches: u16) Error!bool {
             if (max_matches > 1024) return error.InvalidApplicationHistoryQuery;
             try self.beginWrite();
@@ -1375,9 +1336,6 @@ pub fn Methods(comptime Store: type) type {
             return true;
         }
 
-        /// Adds a detail inserted in the caller's transaction to its retained subject summary.
-        /// The candidate is evaluated under the current policy, including while a generation
-        /// is still being built, so concurrent arrivals never need a second pass.
         pub fn retainDetailTx(self: *Store, family: i64, subject: []const u8, bytes: ?i64, sequence: i64) Error!void {
             const policy = try self.readRetentionPolicy();
             var row = try self.statement("INSERT INTO retained_subject_summaries(family,subject,detail_count,evidence_bytes,earliest_sequence,earliest_evidence_sequence,evaluated_generation,candidate_sequence) VALUES(?1,?2,1,coalesce(?3,0),?4,CASE WHEN ?3 IS NOT NULL THEN ?4 END,?5,NULL) ON CONFLICT(family,subject) DO UPDATE SET detail_count=detail_count+1,evidence_bytes=evidence_bytes+excluded.evidence_bytes,earliest_sequence=min(earliest_sequence,excluded.earliest_sequence),earliest_evidence_sequence=coalesce(earliest_evidence_sequence,excluded.earliest_evidence_sequence);");
@@ -1409,7 +1367,6 @@ pub fn Methods(comptime Store: type) type {
             subject_len: usize = 0,
             bytes: ?i64,
 
-            // Columns: sequence, event_id, family, subject, evidence_bytes.
             fn read(row: *Stmt) Error!RetainedDetail {
                 var detail = RetainedDetail{ .sequence = try row.signed(0), .event_id = try Store.effectBlob(row, 1, 32), .family = try row.optionalSigned(2), .bytes = try row.optionalSigned(4) };
                 if (detail.family != null) {
@@ -1422,8 +1379,6 @@ pub fn Methods(comptime Store: type) type {
             }
         };
 
-        /// Every detail deletion goes through here so the retained summary, its earliest
-        /// sequences and its candidate change in the same transaction.
         fn deleteRetainedDetailTx(self: *Store, detail: RetainedDetail, policy: RetentionPolicy) Error!void {
             {
                 var remove = try self.statement("DELETE FROM confirmed_event_details WHERE event_id=?1 AND sequence=?2;");
@@ -1456,7 +1411,6 @@ pub fn Methods(comptime Store: type) type {
             try self.updateCandidateTx(family, subject, policy);
         }
 
-        // History beyond the consumer checkpoint has not been read and is never deleted.
         fn historyFence(self: *Store) Error!?i64 {
             var row = try self.statement("SELECT payload FROM consumer_checkpoints WHERE kind=5 AND jail='@history' AND source='confirmed-effects' AND rule='checkpoint';");
             defer row.deinit();
@@ -1468,9 +1422,6 @@ pub fn Methods(comptime Store: type) type {
             return std.math.cast(i64, saved.last_sequence) orelse error.InvalidHistoryCheckpoint;
         }
 
-        // One page of the exact retention order: every detail at or below the fence that is
-        // age-eligible or its subject's over-limit candidate, ascending by sequence. Age rows
-        // are taken only below the earliest competing candidate, which is deleted next.
         fn deleteDetailPage(self: *Store, policy: RetentionPolicy, fence: i64, cutoff: i64, page: usize, wrote: *bool) Error!usize {
             const age_count = blk: {
                 var row = try self.statement("SELECT count(*) FROM (SELECT 1 FROM confirmed_event_details INDEXED BY confirmed_details_age WHERE confirmed_us<=?1 LIMIT ?2);");
@@ -1539,9 +1490,6 @@ pub fn Methods(comptime Store: type) type {
             return deleted;
         }
 
-        // Frees the consumed stream prefix. A live owner no longer pins it: its marker keeps
-        // deduplication. Unsettled outcomes of the event's decision and pending intents on its
-        // scope still stop the page.
         fn prunePrefixPage(self: *Store, policy: RetentionPolicy, fence: i64, cutoff: i64, now_us: i64) Error!usize {
             var events = try self.integer("SELECT count(*) FROM confirmed_effect_events;");
             var pruned: usize = 0;
@@ -1631,10 +1579,6 @@ pub fn Methods(comptime Store: type) type {
             return if (done) .published else .rebuilt;
         }
 
-        /// One bounded retention transaction. A changed detail limit first builds a complete
-        /// candidate generation; then details are deleted in the exact shipped order, and only
-        /// when none are due is the consumed stream prefix freed. The selection, writes and
-        /// COMMIT share the ordinary work guard.
         pub fn historyRetentionStep(self: *Store, policy: HistoryRetention, now_us: i64) Error!RetentionOutcome {
             try policy.validate();
             try self.beginWrite();
@@ -1671,9 +1615,6 @@ pub fn Methods(comptime Store: type) type {
             if (outcome == .details) self.retention_page = @min(store.max_retention_page, self.retention_page *| 2);
             return outcome;
         }
-        // The named pre-write interruption: a selection that exhausted the guard before any
-        // write retries with half the page, but only after a verified clean rollback. Any
-        // other interruption, or one at the smallest page, stays a storage failure.
         fn yieldRetention(self: *Store) Error!RetentionOutcome {
             const prior_rollback = self.rollback_error_code;
             self.rollback_error_code = null;
@@ -1690,10 +1631,6 @@ pub fn Methods(comptime Store: type) type {
         }
 
         const reclaim_window: i64 = 1024;
-        // Obsolete lifecycle rows: settled outcomes of decisions no owner holds any more,
-        // intents that are neither current nor pending (with their observations), and
-        // owner revisions other than the current one. Anything an unsettled outcome still
-        // references is kept.
         const obsolete_intent = "i.intent_id IS NOT n.intent_id AND i.status NOT IN(1,2) AND NOT EXISTS(SELECT 1 FROM action_targets a WHERE a.action_id=i.decision_id AND a.scope_key=i.scope_key AND a.status IN(1,2,5))";
         const reclaim_phases = [_]struct { max_sql: [:0]const u8, statements: []const [:0]const u8 }{
             .{ .max_sql = "SELECT coalesce(max(rowid),0) FROM action_targets;", .statements = &.{"DELETE FROM action_targets WHERE rowid IN (SELECT a.rowid FROM action_targets a WHERE a.rowid>?1 AND a.rowid<=?2 AND a.status NOT IN(1,2,5) AND NOT EXISTS(SELECT 1 FROM effect_owners o INDEXED BY effect_owners_decision WHERE o.jail=a.jail AND o.decision_id=a.action_id));"} },
@@ -1705,8 +1642,6 @@ pub fn Methods(comptime Store: type) type {
         };
 
         pub const ReclaimOutcome = enum { deleted, scanned, idle };
-        /// One rowid window of obsolete-row reclamation, rotating over outcomes, intents and
-        /// revisions. `idle` only after a complete rotation found nothing to delete.
         pub fn reclaimObsoleteOne(self: *Store) Error!ReclaimOutcome {
             if (self.schema_version < store.load_repair_schema) return .idle;
             if (self.reclaim.rest != 0) {
@@ -1739,7 +1674,6 @@ pub fn Methods(comptime Store: type) type {
                     next.found = false;
                 }
             } else next.cursor = high;
-            // A rotation that found nothing rests before rescanning unchanged tables.
             if (idle) next.rest = 63;
             try self.commitTransaction();
             self.reclaim = next;
@@ -1749,15 +1683,9 @@ pub fn Methods(comptime Store: type) type {
         pub const MaintenanceRequest = struct {
             retention: HistoryRetention,
             now_us: i64,
-            // The history consumer has read the whole stream.
             history_caught_up: bool,
-            // Effects are ready with no expiry backlog; spent scopes wait otherwise so an
-            // expiry wave is not slowed by their deletion.
             spent_scopes: bool,
         };
-        /// One bounded maintenance transaction in priority order: history retention, retry
-        /// details, spent scopes, obsolete rows. Errors are storage failures for the caller's
-        /// gate; `wait` asks for the next wake with a smaller unit.
         pub fn maintenanceStep(self: *Store, request: MaintenanceRequest) Error!health.MaintenanceOutcome {
             const outcome = try self.maintenanceStepInner(request);
             self.maintenance_operation = null;
@@ -1783,11 +1711,9 @@ pub fn Methods(comptime Store: type) type {
             self.maintenance_operation = .spent_scopes;
             if (request.spent_scopes and try self.pruneSpentEffects(max_prune_batch)) return .{ .progress = .spent_scopes };
             self.maintenance_operation = .obsolete_rows;
-            // A window that only scanned leaves the rest of this turn to other maintenance.
             if (try self.reclaimObsoleteOne() == .deleted) return .{ .progress = .obsolete_rows };
             return .idle;
         }
-        /// A scope whose current owner still has an unsettled action outcome, if any.
         pub fn unsettledActionScope(self: *Store) Error!?effects.Hash {
             if (self.schema_version < 21) return null;
             var row = try self.statement("SELECT a.scope_key FROM action_targets a JOIN effect_owners o ON o.scope_key=a.scope_key AND o.decision_id=a.action_id WHERE a.status IN(1,2,5) LIMIT 1;");
@@ -1795,21 +1721,10 @@ pub fn Methods(comptime Store: type) type {
             if (!try row.row()) return null;
             return try Store.effectBlob(&row, 0, 32);
         }
-        /// Removes one bounded step of a spent enforcement scope. A scope is spent when its
-        /// desired lease and current intent are absent, no owner holds a lease, no retained
-        /// confirmed event references it and no intent or action target is unsettled.
-        /// Without this, scopes accumulate for the life of the database until the fixed
-        /// effect capacities refuse new decisions. Child rows go in chunks; the final step
-        /// removes owners, the current intent and the scope row together and invalidates
-        /// the published effect view.
         pub fn pruneSpentEffectOne(self: *Store) Error!bool {
             return self.pruneSpentEffects(1);
         }
         pub const max_prune_batch = Store.attribution_batch;
-        /// Removes up to `max_scopes` spent scopes in one commit within the 256-row budget.
-        /// Each scope's spent predicate is evaluated inside the transaction and its final
-        /// delete happens only once its child rows are gone; a scope cut short by the budget
-        /// stays a candidate for the next call, as before.
         pub fn pruneSpentEffects(self: *Store, max_scopes: usize) Error!bool {
             if (self.schema_version < 13) return false;
             if (max_scopes == 0 or max_scopes > max_prune_batch) return error.InvalidEffect;
@@ -1832,8 +1747,6 @@ pub fn Methods(comptime Store: type) type {
         }
         const PruneOutcome = enum { none, removed, budget };
         fn pruneSpentScopeTx(self: *Store, deleted: *i64) Error!PruneOutcome {
-            // From schema 24 a spent scope no longer waits for history: events carry their own
-            // provenance and markers are retired with the owner's lease.
             var candidate = try self.statement(if (self.schema_version >= store.load_repair_schema)
                 "SELECT n.scope_key,n.intent_id FROM native_effects n INDEXED BY native_effects_spent JOIN effect_intents i ON i.intent_id=n.intent_id WHERE n.lease_kind=0 AND i.status=4 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=n.scope_key AND o.lease_kind<>0) AND NOT EXISTS(SELECT 1 FROM action_targets a INDEXED BY action_targets_unsettled WHERE a.scope_key=n.scope_key AND a.status IN(1,2,5)) AND NOT EXISTS(SELECT 1 FROM effect_intents p INDEXED BY effect_intents_pending WHERE p.scope_key=n.scope_key AND p.status IN(1,2)) AND NOT EXISTS(SELECT 1 FROM confirmation_markers m WHERE m.scope_key=n.scope_key) ORDER BY n.scope_key LIMIT 1;"
             else if (self.schema_version >= 21)
@@ -1853,8 +1766,6 @@ pub fn Methods(comptime Store: type) type {
                 "DELETE FROM effect_owner_revisions WHERE rowid IN (SELECT h.rowid FROM effect_owner_revisions h WHERE h.scope_key=?1 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=h.scope_key AND o.jail=h.jail AND o.revision=h.revision) LIMIT 256);",
                 "DELETE FROM action_targets WHERE rowid IN (SELECT rowid FROM action_targets WHERE scope_key=?1 LIMIT 256);",
             };
-            // Chunks of one scope share the transaction while the row budget lasts, so a
-            // typical spent scope costs no commit of its own.
             while (true) {
                 var pass: i64 = 0;
                 for (chunks, 0..) |sql, index| {

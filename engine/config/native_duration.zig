@@ -3,7 +3,7 @@
 
 const std = @import("std");
 
-/// Fixed seconds, matching the compatibility importer; months/years are not calendar intervals.
+// Fixed seconds, matching the compatibility importer; months and years are not calendar intervals.
 pub fn parse(text: []const u8) error{InvalidValue}!u64 {
     var pos: usize = 0;
     var total: u64 = 0;

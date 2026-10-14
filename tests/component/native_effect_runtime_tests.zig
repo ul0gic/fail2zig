@@ -273,7 +273,6 @@ test "native effect runtime: isolated new ban is enforced before pending expiry 
     const backend = try isolatedBackend();
     var fixture = try Fixture.init(backend);
     defer fixture.deinit();
-    // Fixed-argv backends reconcile each entry through subprocesses.
     const bans: usize = if (backend == .nftables) 30 else 8;
     const expiring = std.time.microTimestamp() + 12_000_000;
     for (1..bans + 1) |index| try hostOwner(&fixture, @intCast(index), expiring);
@@ -682,7 +681,6 @@ fn scopeOwner(fixture: *Fixture, jail: []const u8, index: u8, decision: u8, leas
     const host = @import("engine_test").core.native_detection_record.Subject{ .v4 = .{ 198, 51, 100, index } };
     return fixture.store.setOwner(.{ .scope = try effect.Scope.host(host), .jail = jail, .generation = [_]u8{3} ** 32, .decision_id = [_]u8{decision} ** 32, .expected_revision = 0, .lease = lease, .decided_us = now }, .{ .prepared_us = now });
 }
-/// Loads the stored view without a backend; the admission probe is covered elsewhere.
 fn loadView(fixture: *Fixture, manager: *runtime.Manager) !void {
     manager.admitted = true;
     while (manager.cached_epoch == null or manager.cached_epoch.? != fixture.store.effect_publication_epoch) {
@@ -778,7 +776,6 @@ test "native effect runtime: a failed expiry commit keeps the view only when it 
         try t.expect(!manager.status.ready);
         try t.expect(manager.status.uncertain);
         if (case.committed) {
-            // The commit may have landed: no expiry authority survives it.
             try t.expect(manager.cached_epoch == null);
             manager.outage_attempted[0] = false;
             try manager.expireDuringOutage();
@@ -800,7 +797,6 @@ test "native effect runtime: stop through an unhealthy storage gate neither disp
     const manager = try fixture.manager();
     defer manager.destroy();
     try loadView(&fixture, manager);
-    // A coherent ready view would otherwise let stop withdraw at once.
     manager.status.ready = true;
     manager.inspector.test_fault_after_mutations = 0;
     manager.inspector.test_fault_readback = error.Timeout;
@@ -873,13 +869,11 @@ test "native effect runtime: isolated populated restart settles in wakes proport
     const effects: usize = 200;
     const deadline = std.time.microTimestamp() + 600_000_000;
     try populated(&fixture, effects, deadline);
-    // Stored effects are applied but the kernel set is empty, as after a reboot.
     try driftRemoveAll(&fixture);
     const manager = try fixture.manager();
     defer manager.destroy();
-    // Only the step budget ends a slice here, so the bound counts work rather than
-    // this host's speed: a page per 64 rows, then per effect one full readback, a
-    // mismatch settlement, the dispatch and its verification.
+    // Bound counts work per slice, not host speed: a page per 64 rows, then per effect a full readback,
+    // a mismatch settlement, the dispatch and its verification.
     const limits = runtime.SliceLimits{ .max_steps = 32, .max_ns = std.math.maxInt(u64) };
     const bound = (4 * effects + effects / effect.max_page + 3) / limits.max_steps + 2;
     var wakes: usize = 0;
@@ -893,13 +887,10 @@ test "native effect runtime: isolated populated restart settles in wakes proport
     }
     try t.expect(manager.status.ready);
     try t.expectEqual(effects, manager.status.confirmed);
-    // Each dispatch reads before and after its mutation; otherwise only admission
-    // and a few pass readbacks read the whole set, never one per effect.
     try t.expect(manager.inspector.test_inspections <= 2 * effects + 8);
     var snapshot = try manager.inspector.inspect();
     defer snapshot.deinit();
     try t.expectEqual(effects, snapshot.entries.len);
-    // iptables rules carry no kernel timeout.
     if (manager.installation.backend != .iptables) for (snapshot.entries) |entry| try t.expect(entry.remaining_ms != null);
 }
 fn driftRemoveAll(fixture: *Fixture) !void {

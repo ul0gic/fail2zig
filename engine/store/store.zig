@@ -13,8 +13,6 @@ const effects = @import("../core/native_effect.zig");
 const effect_history = @import("../core/native_effect_history.zig");
 const application_history = @import("../core/native_application_history.zig");
 const action_outcome = @import("../core/native_action_outcome.zig");
-// Newest schema the ordinary writers maintain. Schema 24 is reached only through the
-// load-repair migration, schema 25 only from 24 through enableRuntimeState.
 pub const latest_schema: i64 = 25;
 pub const load_repair_schema: i64 = 24;
 pub const load_repair = @import("load_repair_migration.zig");
@@ -217,16 +215,12 @@ pub const EffectInvalidation = struct {
     invalidate: *const fn (?*anyopaque) void,
 };
 pub const max_retention_page: u16 = 256;
-// Rowids one held-record pass scans; a transaction allows 1,000 progress callbacks of 1,000 VM steps (workProgress).
+// A transaction allows 1,000 progress callbacks of 1,000 VM steps (workProgress).
 pub const max_held_window: u16 = 8192;
-// Position of the rotating obsolete-row reclamation; in memory only, so a restart rescans.
 pub const ReclaimCursor = struct { phase: u2 = 0, cursor: i64 = 0, found: bool = false, rest: u8 = 0 };
 pub const TestHooks = if (builtin.is_test) struct {
-    // Work budget left when the retention selection starts, instead of the transaction's.
     retention_select_work: ?u32 = null,
-    // Summary rows per candidate-generation sweep page instead of the measured window.
     retention_sweep_rows: ?i64 = null,
-    // Work budget left when the held-record pass starts, instead of the transaction's.
     held_pass_work: ?u32 = null,
 } else struct {};
 pub const Store = struct {
@@ -238,9 +232,6 @@ pub const Store = struct {
     consumer_clock_floor_us: ?i64 = null,
     effect_publication_epoch: u64 = 0,
     effect_invalidation: ?EffectInvalidation = null,
-    /// Scope changed by each recent epoch, so the runtime can fold a single-scope
-    /// commit into its view instead of rebuilding it. A transaction that touched more
-    /// than one scope, or none it noted, publishes an unattributed epoch.
     attributed_changes: [attribution_ring]AttributedChange = [_]AttributedChange{.{}} ** attribution_ring,
     noted_keys: [attribution_batch]effects.Hash = undefined,
     noted_count: u8 = 0,
@@ -257,14 +248,11 @@ pub const Store = struct {
     work_remaining: u32 = 1000,
     load_repair_backup_verified: bool = false,
     load_repair_migrated: bool = false,
-    // Retention page size; an interrupted selection halves it for the next attempt.
     retention_page: u16 = max_retention_page,
     held_cursor: i64 = 0,
     held_window: u16 = max_held_window,
     reclaim: ReclaimCursor = .{},
-    // Maintenance turns skipped after a full retry-detail scan found nothing to prune.
     retry_detail_rest: u8 = 0,
-    // Operation of an unfinished maintenance step, kept when it fails for the gate's cause.
     maintenance_operation: ?@import("../core/storage_health.zig").MaintenanceOperation = null,
     history_overload_notice_us: ?i64 = null,
     test_hooks: TestHooks = .{},
@@ -390,8 +378,6 @@ pub const Store = struct {
         self.noted_ambiguous = false;
     }
     pub const attribution_ring = 256;
-    /// Scopes one commit may change and still be folded into the view incrementally;
-    /// equals the largest maintenance batch so an ordinary batch never forces a rebuild.
     pub const attribution_batch = 8;
     pub const AttributedChange = struct {
         epoch: u64 = 0,
@@ -401,7 +387,6 @@ pub const Store = struct {
             return self.keys[0..self.count];
         }
     };
-    /// Called by every writer that changes one scope's published effect state.
     pub fn noteEffectChange(self: *Store, key: effects.Hash) void {
         for (self.noted_keys[0..self.noted_count]) |noted| if (std.mem.eql(u8, &noted, &key)) return;
         if (self.noted_count == attribution_batch) {
@@ -411,7 +396,6 @@ pub const Store = struct {
         self.noted_keys[self.noted_count] = key;
         self.noted_count += 1;
     }
-    /// The scopes changed by `epoch`, or null when it is unknown or unattributed.
     pub fn attributedChange(self: *const Store, epoch: u64) ?*const AttributedChange {
         if (epoch == 0) return null;
         const slot = &self.attributed_changes[@intCast(epoch % attribution_ring)];
@@ -423,7 +407,6 @@ pub const Store = struct {
         return openImpl(allocator, path, .plain, &ignored, .{});
     }
 
-    /// Like `open`, but a missing state file is an error rather than a new database.
     pub fn openExisting(allocator: std.mem.Allocator, path: []const u8) Error!Store {
         var ignored = OpenDiagnostic{};
         return openImpl(allocator, path, .existing, &ignored, .{});
@@ -564,8 +547,6 @@ pub const Store = struct {
         } else if (application != 0x46325a31) return openFailure(diagnostic, .schema_validation, error.ForeignDatabase, null, null);
         if (schema < 0 or schema > latest_schema)
             return openFailure(diagnostic, .schema_validation, error.UnsupportedSchema, null, null);
-        // Schema 24 is only ever produced by the load-repair migration, whose progress row
-        // arrives in the same commit as the version.
         if (schema == load_repair_schema) {
             const migration_rows = self.integer("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='load_repair_migration';") catch |failure|
                 return openFailure(diagnostic, .schema_inspection, failure, null, self.last_error_code);
