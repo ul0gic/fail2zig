@@ -5,6 +5,7 @@ const detection = @import("native_detection_record.zig");
 const lease_policy = @import("native_lease.zig");
 const escalation_policy = @import("native_escalation.zig");
 pub const max_attempts = 128;
+pub const max_pool_subjects: u32 = 65_536;
 pub const attempt_bytes = 40;
 pub const policy_bytes = 32;
 pub const escalation_bytes = escalation_policy.encoded_bytes;
@@ -29,7 +30,7 @@ pub const Policy = struct {
 
     pub fn validate(self: Policy) Error!void {
         if (self.maxretry == 0 or self.maxretry > max_attempts or self.window_us <= 0 or
-            self.max_subjects == 0 or self.max_subjects > 65536)
+            self.max_subjects == 0 or self.max_subjects > max_pool_subjects)
             return error.InvalidRetryPolicy;
         self.duration.validate() catch return error.InvalidRetryPolicy;
         self.escalation.validate() catch return error.InvalidRetryPolicy;

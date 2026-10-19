@@ -44,11 +44,11 @@ fn v4(last: u8) query.ScopeFields {
 }
 
 fn item(last: u8, confirmed: bool) query.ScopeItem {
-    return .{ .scope = v4(last), .lease = .finite, .deadline_us = 1_700_000_000_000_000 + @as(i64, last), .decision_id = [_]u8{last} ** 32, .confirmed = confirmed };
+    return .{ .scope = v4(last), .lease = .finite, .deadline_us = 1_700_000_000_000_000 + @as(i64, last), .decision_id = [_]u8{last} ** 32, .confirmed = confirmed, .key = query.ItemKey.init(&[_]u8{ 4, 192, 0, 2, last }) };
 }
 
 const sshd_items = [_]query.ScopeItem{ item(1, true), item(2, true), item(3, false) };
-const v6_item = query.ScopeItem{ .scope = .{ .family = .v6, .address = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 11 ++ [_]u8{1}, .prefix = 128, .protocols = .{ .values = .{ .tcp, .all, .all, .all, .all }, .len = 1 }, .port_ranges = .{ .values = [_]query.PortRange{.{ .first = 22, .last = 22 }} ++ [_]query.PortRange{.{ .first = 0, .last = 0 }} ** (canonical_scope.max_port_ranges - 1), .len = 1 }, .protocol = "tcp", .port = 22, .direction = "input", .target = "drop" }, .lease = .permanent, .deadline_us = null, .decision_id = null, .confirmed = true };
+const v6_item = query.ScopeItem{ .scope = .{ .family = .v6, .address = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 11 ++ [_]u8{1}, .prefix = 128, .protocols = .{ .values = .{ .tcp, .all, .all, .all, .all }, .len = 1 }, .port_ranges = .{ .values = [_]query.PortRange{.{ .first = 22, .last = 22 }} ++ [_]query.PortRange{.{ .first = 0, .last = 0 }} ** (canonical_scope.max_port_ranges - 1), .len = 1 }, .protocol = "tcp", .port = 22, .direction = "input", .target = "drop" }, .lease = .permanent, .deadline_us = null, .decision_id = null, .confirmed = true, .key = query.ItemKey.init(&([_]u8{6} ++ [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 11 ++ [_]u8{1})) };
 const nginx_items = [_]query.ScopeItem{v6_item};
 const scopes_view = query.ScopesView{ .jails = &.{
     .{ .name = "sshd", .items = &sshd_items },
@@ -748,9 +748,11 @@ test "native query: BUG-061 failure after partial serialization releases output"
 
 test "native query: cursor encoding is opaque base64url and strict on decode" {
     var buffer: [query.max_cursor_bytes]u8 = undefined;
-    const encoded = (query.Cursor{ .scopes = .{ .jail = 7, .item = 42 } }).encode(&buffer);
+    const key = query.ItemKey.init(&[_]u8{ 4, 192, 0, 2, 42 });
+    const encoded = (query.Cursor{ .keyset = .{ .jail = 7, .key = key } }).encode(&buffer);
     for (encoded) |c| try t.expect(std.ascii.isAlphanumeric(c) or c == '-' or c == '_');
-    try t.expectEqual(query.Cursor{ .scopes = .{ .jail = 7, .item = 42 } }, try query.Cursor.decode(encoded));
+    try t.expectEqual(query.Cursor{ .keyset = .{ .jail = 7, .key = key } }, try query.Cursor.decode(encoded));
+    try t.expectError(error.BadCursor, query.Cursor.decode("czo3OjQy"));
     const history = (query.Cursor{ .history = .{ .after_sequence = std.math.maxInt(u64) } }).encode(&buffer);
     try t.expectEqual(query.Cursor{ .history = .{ .after_sequence = std.math.maxInt(u64) } }, try query.Cursor.decode(history));
     try t.expectError(error.BadCursor, query.Cursor.decode(""));

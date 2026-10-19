@@ -155,6 +155,7 @@ pub const JailEntry = struct {
     source_signal: ?u32 = null,
     source_stderr_present: ?bool = null,
     source_paused: ?bool = null,
+    source_missing: ?bool = null,
 };
 
 pub const StatsPayload = struct {
@@ -1672,7 +1673,7 @@ fn writeJailsTable(writer: anytype, jails: []const JailEntry, color: Color, colu
         try writeCell(writer, protectionStr(j), protection_col);
         try color.off(writer);
         try writeCell(writer, if (j.log_source) |source| renderDiagnostic(&source_buffer, source) else "-", source_col);
-        if (j.source_healthy) |h| try color.on(writer, if (h) Color.green else Color.yellow);
+        if (j.source_healthy) |h| try color.on(writer, if (h and j.source_missing != true) Color.green else Color.yellow);
         var health_buffer: [diagnostic_max_bytes]u8 = undefined;
         try writeCell(writer, formatJailHealth(&health_buffer, j), health_col);
         try color.off(writer);
@@ -1713,7 +1714,7 @@ fn writeJailsSummary(writer: anytype, jails: []const JailEntry, color: Color, co
         try writeCell(writer, stateStr(j), state_col);
         try color.off(writer);
         try writeCell(writer, if (j.log_source) |value| renderDiagnostic(&source, value) else "-", source_col);
-        if (j.source_healthy) |value| try color.on(writer, if (value) Color.green else Color.yellow);
+        if (j.source_healthy) |value| try color.on(writer, if (value and j.source_missing != true) Color.green else Color.yellow);
         try writeCell(writer, formatJailHealth(&health, j), health_col);
         try color.off(writer);
         try writeCell(writer, modeStr(j), mode_col);
@@ -1812,7 +1813,7 @@ fn protectionStr(j: JailEntry) []const u8 {
 
 fn formatJailHealth(buffer: []u8, jail: JailEntry) []const u8 {
     const healthy = jail.source_healthy orelse return "unknown";
-    if (healthy) return "ok";
+    if (healthy) return if (jail.source_missing == true) "missing (FileNotFound)" else "ok";
     var cause_buffer: [40]u8 = undefined;
     const cause = if (jail.cause) |value|
         if (std.mem.eql(u8, value, "none")) "unknown" else renderDiagnostic(&cause_buffer, value)
@@ -1822,6 +1823,10 @@ fn formatJailHealth(buffer: []u8, jail: JailEntry) []const u8 {
     const writer = stream.writer();
     if (jail.source_paused == true) {
         writer.print("paused ({s})", .{cause}) catch return "paused (unknown)";
+        return stream.getWritten();
+    }
+    if (std.mem.eql(u8, cause, "RetryCapacity") or std.mem.eql(u8, cause, "ReserveBackpressure")) {
+        writer.print("waiting ({s})", .{cause}) catch return "waiting (unknown)";
         return stream.getWritten();
     }
     writer.print("broken ({s}", .{cause}) catch return "broken (unknown)";

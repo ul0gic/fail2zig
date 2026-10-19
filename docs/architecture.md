@@ -191,20 +191,25 @@ keeps at most four observations. Active and permanent bans are kept.
 
 Admission reserves room for every live ban to expire, be released or be confirmed, so terminal
 transitions never meet a row limit. A request that would break that reserve, or that would
-exceed a jail's retry-subject capacity (4,096 divided by the number of enabled jails), is
-refused as retryable backpressure: the source keeps its receipt, nothing is evicted, the
+exceed the daemon-wide retry-subject capacity, is refused as retryable backpressure: the source keeps its receipt, nothing is evicted, the
 jail reports its source unhealthy with the cause (`ReserveBackpressure` or
 `RetryCapacity`) in `status` and `jails`, and ingestion resumes once expiry or retirement
-frees space. Retry subjects whose lease and retry window have both lapsed are retired one
-per maintenance turn regardless of load. At 58,982 confirmed
+frees space. Retry capacity is three bounds on the shared `retry_states` rows: at most 131,072
+rows in total, at most 65,536 rows without a live ban (tracked subjects and bans whose lease
+has expired), and at most 65,536 rows with a live ban. A new subject is refused once the row
+total is reached, whether or not it would ban at once; an existing row is never refused by the
+total. Rows only leave through retirement, so a lapsed ban keeps counting as tracked until it
+is retired. Retry subjects whose lease and retry window have both lapsed are retired one
+per maintenance turn regardless of load. At 235,929 confirmed
 events, consumed history older than every consumer's checkpoint may be pruned before its retention
 age, with a warning; history still pinned by a consumer or unsettled work is never removed.
 Retry decision details are reclaimed separately once no current owner, retained
 confirmed event or unsettled action needs them. Cleanup is bounded by rows and
-stored bytes; the 65,536-row admission limit still applies to retained details.
+stored bytes; the 262,144-row admission limit still applies to retained details.
 
 The default configuration admits at most 64 enabled jails, eight file incarnations per jail and
-4,096 live retry subjects across enabled jails. Native reservation checks cover configured memory
+one shared pool of 65,536 tracked retry subjects and up to 65,536 live bans across all enabled jails;
+a banned subject does not consume tracking capacity. Native reservation checks cover configured memory
 and descriptor budgets. SQLite uses a separate bounded heap and page limit; required history and
 recovery anchors remain pinned.
 

@@ -10,6 +10,8 @@ pub const Start = enum { head, tail };
 pub const discovery_entries_per_turn: usize = 256;
 pub const discovery_entries_per_episode: usize = 65_536;
 pub const discovery_max_depth: usize = 16;
+// Filebeat's inactive-close default: .project/references/beats/filebeat/input/filestream/config.go:180
+const unlinked_retire_ms: u64 = 5 * std.time.ms_per_min;
 pub const DiscoveryStatus = enum { pending, complete };
 pub const Framing = enum {
     bytes,
@@ -79,6 +81,7 @@ pub const LossEvent = struct {
 };
 
 pub const RemovedVerdict = enum { drained, unread, unknown };
+const NamedPath = enum { present, absent, absent_reported };
 
 pub const PendingLoss = struct { event: LossEvent, checkpoint_durable: bool };
 
@@ -159,6 +162,9 @@ pub const FileSource = struct {
     siblings: ?*const std.ArrayList(FileSource) = null,
     awaiting_path: bool = false,
     awaiting_checked_s: i64 = 0,
+    named_path: NamedPath = .present,
+    named_checked_s: i64 = 0,
+    unlinked_idle: ?struct { size: u64, since_ms: u64 } = null,
     pending_loss: ?PendingLoss = null,
     detected_s: i64 = 0,
     read_prefix: *const fn (std.fs.File, u8) anyerror![32]u8 = prefix,
@@ -461,6 +467,7 @@ pub const FileSource = struct {
         }
         self.file = f;
         self.awaiting_path = false;
+        self.named_checked_s = 0;
         self.health = .healthy;
         self.continuity_failure = null;
         self.continuity_reported = false;
@@ -509,6 +516,17 @@ pub const FileSource = struct {
             try self.lostOrRestarted(file, r, observed);
         self.health = .healthy;
         return true;
+    }
+
+    fn checkNamedPath(self: *FileSource) void {
+        const now = std.time.timestamp();
+        if (self.named_checked_s == now) return;
+        self.named_checked_s = now;
+        _ = std.posix.fstatat(std.posix.AT.FDCWD, self.path, 0) catch |err| {
+            if ((err == error.FileNotFound or err == error.NotDir) and self.named_path == .present) self.named_path = .absent;
+            return;
+        };
+        self.named_path = .present;
     }
 
     pub fn verifyExistingContinuity(self: *FileSource) !void {
@@ -566,16 +584,32 @@ pub const FileSource = struct {
         return stat.dev != r.device or stat.ino != r.inode;
     }
 
-    pub fn markUnlinkedAndDrained(self: *FileSource) !bool {
+    pub fn markUnlinkedAndDrained(self: *FileSource, now_ms: u64) !bool {
         const f = self.file orelse return false;
         const r = self.committed orelse return false;
         if (!self.baseline_committed or self.pending_loss != null) return false;
         const held = try std.posix.fstat(f.handle);
-        if (held.nlink != 0 or @as(u64, @intCast(held.size)) != r.offset) return false;
+        if (held.nlink != 0 or @as(u64, @intCast(held.size)) != r.offset) {
+            self.unlinked_idle = null;
+            return false;
+        }
         const named = std.posix.fstatat(std.posix.AT.FDCWD, self.path, 0) catch |err| switch (err) {
-            error.FileNotFound => return false,
+            error.FileNotFound => {
+                const idle = self.unlinked_idle orelse return self.startUnlinkedIdle(r.offset, now_ms);
+                if (idle.size != r.offset) return self.startUnlinkedIdle(r.offset, now_ms);
+                if (now_ms -| idle.since_ms < unlinked_retire_ms) return false;
+                self.continuity_failure = .{
+                    .kind = .missing,
+                    .incarnation = r.incarnation,
+                    .committed_offset = r.offset,
+                    .committed_device = r.device,
+                    .committed_inode = r.inode,
+                };
+                return true;
+            },
             else => return err,
         };
+        self.unlinked_idle = null;
         const observed = observe(named);
         self.continuity_failure = .{
             .kind = .replaced,
@@ -590,6 +624,11 @@ pub const FileSource = struct {
         return true;
     }
 
+    fn startUnlinkedIdle(self: *FileSource, size: u64, now_ms: u64) bool {
+        self.unlinked_idle = .{ .size = size, .since_ms = now_ms };
+        return false;
+    }
+
     pub fn poll(self: *FileSource, callback: records.AckCallback, userdata: ?*anyopaque) !bool {
         while (true) return self.pollTurn(callback, userdata, false) catch |err| {
             if (err == error.SourceRepairPending) continue;
@@ -602,6 +641,7 @@ pub const FileSource = struct {
         self.continuity_failure = null;
         self.continuity_reported = false;
         if (!try self.attachTurn()) return false;
+        self.checkNamedPath();
         if (self.pending_loss != null) return false;
         try self.finishEofCheck();
         const f = self.file.?;
@@ -1247,6 +1287,7 @@ pub const FileSet = struct {
 
     fn admitDiscovered(self: *FileSet, path: []const u8, start: Start) !void {
         const f = openRegularAt(std.fs.cwd(), path) catch |err| {
+            if (err == error.FileNotFound or err == error.NotDir) return;
             self.health = if (err == error.AccessDenied) .permission_denied else .read_failed;
             return err;
         };

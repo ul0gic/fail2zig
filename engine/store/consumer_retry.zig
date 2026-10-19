@@ -742,7 +742,6 @@ pub fn Methods(comptime Store: type) type {
             try self.beginRead();
             errdefer self.rollback();
             const admission = (try self.readRetryPolicy(jail)) orelse return error.RetryAdmissionRequired;
-            if (output.len < admission.policy.max_subjects) return error.RetryCapacity;
             const floor = try self.readRetryClock();
             if (floor) |value| if (now_us < value) return error.ReceiptClockReversed;
             var row = try self.statement(if (self.schema_version >= 16)
@@ -754,13 +753,13 @@ pub fn Methods(comptime Store: type) type {
             var summary = RetrySummary{};
             while (try row.row()) {
                 summary.subjects += 1;
-                if (summary.subjects > admission.policy.max_subjects) return error.RetryCapacity;
                 const stored = try self.decodeRetryState(&row, admission.policy);
                 if (stored.last_processed_us > (floor orelse return error.InvalidRetryState)) return error.InvalidRetryState;
                 const state = (try retry.prune(admission.policy, stored, now_us)).state;
                 const subject = try self.decodeRetrySubject(&row, 5, 6);
                 summary.decisions = std.math.add(u64, summary.decisions, state.decisions) catch return error.InvalidRetryState;
                 if (state.lease.live(now_us)) {
+                    if (summary.active == output.len) return error.RetryCapacity;
                     output[summary.active] = .{ .subject = subject, .lease = state.lease, .ordinal = state.decisions };
                     summary.active += 1;
                 }
@@ -1115,7 +1114,7 @@ pub fn Methods(comptime Store: type) type {
             var count: usize = 0;
             while (try row.row()) {
                 count += 1;
-                if (count > policy.max_subjects) return error.RetryCapacity;
+                if (count > @as(usize, policy.max_subjects) + retry.max_pool_subjects) return error.RetryCapacity;
                 const state = try self.decodeRetryState(&row, policy);
                 if (state.last_processed_us > (floor orelse return error.InvalidRetryState)) return error.InvalidRetryState;
                 _ = try self.decodeRetrySubject(&row, 5, 6);
@@ -1317,6 +1316,22 @@ pub fn Methods(comptime Store: type) type {
             return .{ .prior_confirmed = count, .latest_confirmed_us = latest };
         }
 
+        fn retryPoolFull(self: *Store, now_us: i64, new_row: bool, banning: bool, tracking_limit: u32) Error!bool {
+            const total = try self.integer("SELECT count(*) FROM retry_states;");
+            if (new_row and total >= @as(i64, tracking_limit) + retry.max_pool_subjects) return true;
+            const limit: i64 = if (banning) retry.max_pool_subjects else tracking_limit;
+            if (total < limit) return false;
+            var row = try self.statement(if (self.schema_version >= 16)
+                "SELECT count(*) FROM retry_states WHERE lease_kind=2 OR (lease_kind=1 AND deadline_us>?1);"
+            else
+                "SELECT count(*) FROM retry_states WHERE expiry_us>?1;");
+            defer row.deinit();
+            try row.int(1, now_us);
+            if (!try row.row()) return error.DatabaseFailure;
+            const banned = try row.signed(0);
+            return (if (banning) banned else total - banned) >= limit;
+        }
+
         pub fn commitRetry(self: *Store, record: Record, admission: retry.Admission) Error!void {
             if (admission.processing_us) |now| {
                 if (try self.readRetryClock()) |floor| if (now < floor) return error.ReceiptClockReversed;
@@ -1334,15 +1349,11 @@ pub fn Methods(comptime Store: type) type {
             const subject = detected.subject orelse return error.InvalidRecord;
             const previous = try self.readRetryState(record.jail, subject, admission.policy);
             const retired = try self.readRetired(record.jail, subject);
-            if (previous == null or retired != null) {
-                var count = try self.statement("SELECT count(*) FROM retry_states WHERE jail=?1;");
-                defer count.deinit();
-                try count.text(1, record.jail);
-                if (!try count.row()) return error.DatabaseFailure;
-                if (try count.signed(0) >= admission.policy.max_subjects) return error.RetryCapacity;
-            }
             const current_attempt = retry.Attempt{ .at_us = outcome.eligible.timestamp.us, .occurrence = retry.occurrenceKey(record.source, record.occurrence) };
             var next = try retry.advanceWithEvidence(admission.policy, previous, subject, current_attempt, now, record.retry_evidence);
+            const new_row = previous == null or retired != null;
+            const newly_banned = next.decision != null and !(if (previous) |prior| prior.lease.live(now) else false);
+            if ((new_row or newly_banned) and try self.retryPoolFull(now, new_row, newly_banned, admission.policy.max_subjects)) return error.RetryCapacity;
             var escalation_selection: ?EscalationSelection = null;
             if (next.decision != null and admission.policy.escalation.enabled) {
                 if (self.schema_version < 18) return error.RetryStorageRequired;

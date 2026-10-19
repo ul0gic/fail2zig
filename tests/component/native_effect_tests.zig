@@ -638,10 +638,10 @@ test "native effects: optional target saturation refuses without evicting existi
     try enableSchema19(&f.store);
     try f.store.enableHistoryResets();
     try f.store.enableActionTargets();
-    try sql(&f.store,
-        \\WITH RECURSIVE c(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM c WHERE x<65536)
+    try sql(&f.store, std.fmt.comptimePrint(
+        \\WITH RECURSIVE c(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM c WHERE x<{d})
         \\INSERT INTO action_targets SELECT CAST(printf('%032x',x) AS BLOB),CASE WHEN x%2=0 THEN 1 ELSE 2 END,zeroblob(32),'capacity',CASE WHEN x%2=0 THEN 1 ELSE 0 END,0,1,100,NULL,NULL,NULL FROM c;
-    );
+    , .{action_outcome.max_rows}));
     var clock = TestClock{};
     try t.expectError(error.ActionTargetCapacity, f.store.prepareActionTargets(.{ .action_id = [_]u8{0xee} ** 32, .scope_key = [_]u8{0xdd} ** 32, .jail = "capacity" }, clock.value()));
 }
@@ -1125,7 +1125,7 @@ test "native effects: full confirmation ledger permits existing dedup but refuse
     var clock = TestClock{};
     const entry = try f.store.setOwner(try change("one", 1, .permanent), clock.value());
     _ = try f.store.settleOutcome(entry.token(), clock.now, observation(entry, 100, .permanent), clock.value());
-    try sql(&f.store, "WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n<65535) INSERT INTO confirmed_effect_events SELECT CAST(printf('%032d',n) AS BLOB),(SELECT scope_key FROM native_effects LIMIT 1),'filler-'||n,zeroblob(32),100 FROM numbers;");
+    try sql(&f.store, std.fmt.comptimePrint("WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n<{d}) INSERT INTO confirmed_effect_events SELECT CAST(printf('%032d',n) AS BLOB),(SELECT scope_key FROM native_effects LIMIT 1),'filler-'||n,zeroblob(32),100 FROM numbers;", .{effects.max_confirmed_events - 1}));
     try t.expectEqual(@as(u64, effects.max_confirmed_events), try f.store.confirmedEffectEvents());
     _ = try f.store.settleOutcome(entry.token(), 100, observation(entry, 100, .permanent), clock.value());
     clock.now = 110;

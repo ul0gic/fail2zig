@@ -78,14 +78,13 @@ pub fn run(
             return doQuery(allocator, parsed.globals, stdout, stderr, color, "stats", null, null, null, format.formatStats);
         },
         .list => |l| {
-            const jail: ?shared.JailId = parseJailId(l.jail, stderr) catch return .client_error;
-            const cmd = shared.Command{ .list = .{ .jail = jail } };
+            _ = parseJailId(l.jail, stderr) catch return .client_error;
             if (l.sort) {
-                if (l.details) return doRequest(allocator, parsed.globals, cmd, stdout, stderr, color, formatSortedListDetailsCmd);
-                return doRequest(allocator, parsed.globals, cmd, stdout, stderr, color, formatSortedListCmd);
+                if (l.details) return doList(allocator, parsed.globals, l.jail, stdout, stderr, color, formatSortedListDetailsCmd);
+                return doList(allocator, parsed.globals, l.jail, stdout, stderr, color, formatSortedListCmd);
             }
-            if (l.details) return doRequest(allocator, parsed.globals, cmd, stdout, stderr, color, formatListDetailsCmd);
-            return doRequest(allocator, parsed.globals, cmd, stdout, stderr, color, formatListCmd);
+            if (l.details) return doList(allocator, parsed.globals, l.jail, stdout, stderr, color, formatListDetailsCmd);
+            return doList(allocator, parsed.globals, l.jail, stdout, stderr, color, formatListCmd);
         },
         .jails => |options| {
             if (options.details) return doRequest(allocator, parsed.globals, .{ .list_jails = {} }, stdout, stderr, color, formatJailsDetailsCmd);
@@ -263,6 +262,137 @@ fn pageContinuity(allocator: std.mem.Allocator, arena: std.mem.Allocator, global
         cursor = page.next_cursor orelse return .{ .report = .{ .events = events.items }, .exit = .success };
     }
     return continuityUnavailable(arena, .daemon_error, "continuity events exceed 512 pages");
+}
+
+const max_list_pages: usize = 512;
+const list_page_limit: u32 = 256;
+const max_list_payload_bytes: usize = 64 * 1024 * 1024;
+
+const ListScopeView = struct {
+    address: ?[]const u8 = null,
+    prefix: ?u8 = null,
+    subject_kind: ?[]const u8 = null,
+};
+
+const ListScopeItem = struct {
+    jail: ?[]const u8 = null,
+    scope: ?ListScopeView = null,
+    lease: ?[]const u8 = null,
+    deadline_us: ?i64 = null,
+    confirmed: ?bool = null,
+    ban_count: ?u32 = null,
+};
+
+const ListScopePage = struct {
+    generation: ?[]const u8 = null,
+    items: []const ListScopeItem = &.{},
+    next_cursor: ?[]const u8 = null,
+};
+
+fn doList(allocator: std.mem.Allocator, globals: args.Globals, jail: ?[]const u8, stdout: anytype, stderr: anytype, color: format.Color, comptime formatter: anytype) ExitCode {
+    var page_arena = std.heap.ArenaAllocator.init(allocator);
+    defer page_arena.deinit();
+    var payload: std.ArrayListUnmanaged(u8) = .empty;
+    defer payload.deinit(allocator);
+    payload.append(allocator, '[') catch return walkOutOfMemory(stderr);
+    var cursor_buffer: [128]u8 = undefined;
+    var generation_buffer: [64]u8 = undefined;
+    var generation_len: usize = 0;
+    var cursor: ?[]const u8 = null;
+    var first_entry = true;
+    const now_us = std.time.microTimestamp();
+    var pages: usize = 0;
+    while (pages < max_list_pages) : (pages += 1) {
+        _ = page_arena.reset(.retain_capacity);
+        const arena = page_arena.allocator();
+        var body_bytes: [shared.protocol.max_request_body]u8 = undefined;
+        var stream = std.io.fixedBufferStream(&body_bytes);
+        std.json.stringify(.{ .schema_version = @as(u32, 1), .kind = "scopes", .jail = jail, .limit = list_page_limit, .cursor = cursor }, .{ .emit_null_optional_fields = false }, stream.writer()) catch return .client_error;
+        const body = shared.Command.Body.init(stream.getWritten()) catch return .client_error;
+
+        var diag: socket.DiagBuf = .{};
+        var client = socket.connect(allocator, globals.socket_path, globals.timeout_ms, &diag) catch {
+            stderr.print("error: {s}\n", .{diag.message()}) catch {};
+            return .connection_failed;
+        };
+        const resp = client.sendCommand(.{ .query_v1 = body }) catch {
+            stderr.print("error: {s}\n", .{client.errorMessage()}) catch {};
+            client.close();
+            return .connection_failed;
+        };
+        client.close();
+        defer resp.deinit(allocator);
+        const page_payload = switch (resp) {
+            .ok => |ok| ok.payload,
+            .err => |e| {
+                if (pages == 0) {
+                    format.formatError(stderr, e.code, e.message, globals.output, color) catch {};
+                } else {
+                    stderr.print("error: list stopped at page {d}: {s} (code {d}){s}\n", .{ pages + 1, e.message, e.code, if (e.code == 409) "; the ban set changed during the walk, rerun the command" else "" }) catch {};
+                }
+                return .daemon_error;
+            },
+        };
+        const page = std.json.parseFromSliceLeaky(ListScopePage, arena, page_payload, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch {
+            stderr.print("error: malformed scopes response from daemon at page {d}\n", .{pages + 1}) catch {};
+            return .daemon_error;
+        };
+        const page_generation = page.generation orelse "";
+        if (pages == 0) {
+            if (page_generation.len > generation_buffer.len) {
+                stderr.writeAll("error: daemon returned an oversized generation\n") catch {};
+                return .daemon_error;
+            }
+            @memcpy(generation_buffer[0..page_generation.len], page_generation);
+            generation_len = page_generation.len;
+        } else if (!std.mem.eql(u8, generation_buffer[0..generation_len], page_generation)) {
+            stderr.print("error: list stopped at page {d}: the daemon generation changed during the walk (restart or configuration change), rerun the command\n", .{pages + 1}) catch {};
+            return .daemon_error;
+        }
+        const writer = payload.writer(allocator);
+        for (page.items) |item| {
+            const scope = item.scope orelse continue;
+            const address = scope.address orelse continue;
+            const permanent = if (item.lease) |lease| std.mem.eql(u8, lease, "permanent") else false;
+            if (!permanent) if (item.deadline_us) |deadline| if (deadline <= now_us) continue;
+            var subject_buffer: [64]u8 = undefined;
+            const network = if (scope.subject_kind) |kind| std.mem.eql(u8, kind, "network") else false;
+            const subject = (if (network)
+                std.fmt.bufPrint(&subject_buffer, "{s}/{d}", .{ address, scope.prefix orelse 0 })
+            else
+                std.fmt.bufPrint(&subject_buffer, "{s}", .{address})) catch continue;
+            const expiry_us: ?i64 = if (permanent) null else item.deadline_us;
+            if (!first_entry) writer.writeByte(',') catch return walkOutOfMemory(stderr);
+            first_entry = false;
+            std.json.stringify(.{ .ip = subject, .jail = item.jail, .expiry_us = expiry_us, .ban_expiry = if (expiry_us) |value| @divFloor(value, 1_000_000) else null, .permanent = permanent, .ban_count = item.ban_count, .enforced = item.confirmed, .confirmed = item.confirmed }, .{}, writer) catch return walkOutOfMemory(stderr);
+            if (payload.items.len > max_list_payload_bytes) {
+                stderr.writeAll("error: list exceeds its 64 MiB client bound; page the bans with the scopes command and --cursor\n") catch {};
+                return .client_error;
+            }
+        }
+        const next = page.next_cursor orelse {
+            payload.append(allocator, ']') catch return walkOutOfMemory(stderr);
+            formatter(allocator, stdout, payload.items, globals.output, color) catch |e| {
+                if (e == error.BrokenPipe) return .success;
+                stderr.print("error: failed to format response: {s}\n", .{@errorName(e)}) catch {};
+                return .client_error;
+            };
+            return .success;
+        };
+        if (next.len > cursor_buffer.len) {
+            stderr.print("error: list stopped at page {d}: daemon returned an oversized cursor\n", .{pages + 1}) catch {};
+            return .daemon_error;
+        }
+        @memcpy(cursor_buffer[0..next.len], next);
+        cursor = cursor_buffer[0..next.len];
+    }
+    stderr.print("error: list exceeds {d} pages; page the bans with the scopes command and --cursor\n", .{max_list_pages}) catch {};
+    return .client_error;
+}
+
+fn walkOutOfMemory(stderr: anytype) ExitCode {
+    stderr.writeAll("error: out of memory while collecting bans\n") catch {};
+    return .client_error;
 }
 
 fn doFirewallQuery(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype, color: format.Color, query: args.Command.FirewallArgs) ExitCode {

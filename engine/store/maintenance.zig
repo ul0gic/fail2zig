@@ -1303,7 +1303,7 @@ pub fn Methods(comptime Store: type) type {
         const sweep_rows: i64 = 1024;
         const age_path_threshold: i64 = 4096;
         const prefix_page: usize = 64;
-        pub const history_overload_events: i64 = 58_982;
+        pub const history_overload_events: i64 = @divTrunc(effects.max_confirmed_events * 9, 10);
         const overload_notice_us: i64 = 60 * 1_000_000;
 
         fn readRetentionPolicy(self: *Store) Error!RetentionPolicy {

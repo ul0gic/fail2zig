@@ -146,6 +146,10 @@ pub const Pipeline = struct {
         self.ready = true;
     }
 
+    pub fn commitBlocked(cause: anyerror) bool {
+        return cause == error.ReserveBackpressure or cause == error.RetryCapacity;
+    }
+
     pub fn sourceLocalIntervention(cause: anyerror) bool {
         return cause == error.PrunedReplay or cause == error.OutsideTimezoneCoverage;
     }

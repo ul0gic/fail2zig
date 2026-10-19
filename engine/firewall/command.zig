@@ -24,8 +24,10 @@ pub fn run(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: u
 
 pub const BoundedError = backend.BackendError || error{ Timeout, OutputLimit, SpawnFailed };
 
+pub const max_stdout_bytes: usize = 8 * 1024 * 1024;
+
 pub fn runBounded(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: u64, max_stdout: usize, max_stderr: usize) BoundedError!Result {
-    if (max_stdout > 1024 * 1024 or max_stderr > 4096) return error.OutputLimit;
+    if (max_stdout > max_stdout_bytes or max_stderr > 4096) return error.OutputLimit;
     var child = std.process.Child.init(argv, allocator);
     child.stdin_behavior = .Close;
     child.stdout_behavior = .Pipe;

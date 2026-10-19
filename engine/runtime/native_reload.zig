@@ -129,11 +129,11 @@ fn runtimeOnly(counts: []const RuntimeCount, jail: []const u8) u16 {
     return 0;
 }
 
-pub fn classify(current: *const config.Config, proposed: *const config.Config, per_jail_subjects: u32) Classification {
-    return classifyWithRuntime(current, proposed, per_jail_subjects, &.{});
+pub fn classify(current: *const config.Config, proposed: *const config.Config, max_subjects: u32) Classification {
+    return classifyWithRuntime(current, proposed, max_subjects, &.{});
 }
 
-pub fn classifyWithRuntime(current: *const config.Config, proposed: *const config.Config, per_jail_subjects: u32, runtime_counts: []const RuntimeCount) Classification {
+pub fn classifyWithRuntime(current: *const config.Config, proposed: *const config.Config, max_subjects: u32, runtime_counts: []const RuntimeCount) Classification {
     var out: Classification = .{};
     globalsEqual(&current.global, &proposed.global, &out);
     if (current.jails.len != proposed.jails.len) out.restart("jails: set size {d} -> {d}", .{ current.jails.len, proposed.jails.len });
@@ -181,7 +181,7 @@ pub fn classifyWithRuntime(current: *const config.Config, proposed: *const confi
             out.restart("jails.{s}: retry policy is bound to the internal source generation", .{jail.name});
             continue;
         }
-        const policy = retry_config.fromJail(next, proposed.defaults, per_jail_subjects) catch |err| {
+        const policy = retry_config.fromJail(next, proposed.defaults, max_subjects) catch |err| {
             out.reject("jails.{s}: {s}", .{ jail.name, @errorName(err) });
             continue;
         };

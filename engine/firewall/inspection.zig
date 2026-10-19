@@ -109,16 +109,17 @@ pub fn canonicalizeLegacyScope(scope: Scope) Error!CanonicalScope {
     return result;
 }
 
-pub const max_inventory_entries: usize = 65_536;
+pub const max_inventory_entries: usize = 131_072;
+const max_inventory_bytes: usize = 64 * 1024 * 1024;
 const max_dump_attempts: usize = 3;
 pub const Limits = struct {
     max_entries: usize = max_inventory_entries,
-    max_bytes: usize = 16 * 1024 * 1024,
-    max_messages: usize = 65_536,
+    max_bytes: usize = max_inventory_bytes,
+    max_messages: usize = max_inventory_entries,
     timeout_ms: u64 = 5000,
     pub fn validate(self: Limits) Error!void {
         if (self.max_entries == 0 or self.max_entries > max_inventory_entries or self.max_bytes == 0 or
-            self.max_bytes > 16 * 1024 * 1024 or self.max_messages == 0 or self.max_messages > 65_536 or
+            self.max_bytes > max_inventory_bytes or self.max_messages == 0 or self.max_messages > max_inventory_entries or
             self.timeout_ms == 0 or self.timeout_ms > 5000) return error.LimitExceeded;
     }
 };
@@ -775,7 +776,7 @@ pub const Inspector = struct {
             if (self.installation.transport == .ipset) {
                 var set_buf: [31]u8 = undefined;
                 const set = try setName(name, index == 1, &set_buf);
-                try self.mutateCommand(&.{ self.ipset_path, "create", set, "hash:ip", "family", if (index == 0) "inet" else "inet6", "timeout", "0", "maxelem", "65536" }, timer, &mutations, progress);
+                try self.mutateCommand(&.{ self.ipset_path, "create", set, "hash:ip", "family", if (index == 0) "inet" else "inet6", "timeout", "0", "maxelem", "131072" }, timer, &mutations, progress);
                 try self.mutateCommand(&.{ binary, "-w", "1", "-I", name, "1", "-m", "set", "--match-set", set, "src", "-j", "DROP" }, timer, &mutations, progress);
             }
             try self.mutateCommand(&.{ binary, "-w", "1", "-I", "INPUT", "1", "-m", "comment", "--comment", marker, "-j", name }, timer, &mutations, progress);
@@ -889,7 +890,7 @@ pub const Inspector = struct {
         if (reserved >= self.limits.max_bytes) return error.LimitExceeded;
         const allowance = (self.limits.max_bytes - reserved) / 4;
         if (progress) |value| value.requested = true;
-        const result = command.runBounded(self.allocator, argv, @min(remaining, 2000), @min(allowance, 1024 * 1024), @min(allowance, 4096)) catch |err| return switch (err) {
+        const result = command.runBounded(self.allocator, argv, @min(remaining, 2000), @min(allowance, command.max_stdout_bytes), @min(allowance, 4096)) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.PermissionDenied => error.PermissionDenied,
             error.Timeout => error.Timeout,

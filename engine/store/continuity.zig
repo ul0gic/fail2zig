@@ -44,7 +44,7 @@ fn readEvent(row: *Stmt, jail: []const u8, path: []const u8, source_id: []const 
 
 pub fn Methods(comptime Store: type) type {
     return struct {
-        pub const CheckpointReset = struct { jail: []const u8, source_id: []const u8, cursor_json: []const u8 };
+        pub const CheckpointReset = struct { jail: []const u8, source_id: []const u8, cursor_json: []const u8, discard_pending: bool = false };
 
         pub fn recordContinuityLoss(self: *Store, event: files.LossEvent, reset: ?CheckpointReset) Error!u64 {
             if (!validJail(event.jail) or !validText(event.path) or !validText(event.source_id)) return error.InvalidRecord;
@@ -81,7 +81,14 @@ pub fn Methods(comptime Store: type) type {
                 try prune.done();
             }
             if (reset) |value| {
-                {
+                if (value.discard_pending) {
+                    var discard = try self.statement("DELETE FROM pending_receipts WHERE jail=?1 AND source=?2;");
+                    defer discard.deinit();
+                    try discard.text(1, value.jail);
+                    try discard.text(2, value.source_id);
+                    try discard.done();
+                    if (self.api.changes(self.db) != 1) return error.ReceiptRequired;
+                } else {
                     var pending = try self.statement("SELECT 1 FROM pending_receipts WHERE jail=?1 AND source=?2;");
                     defer pending.deinit();
                     try pending.text(1, value.jail);

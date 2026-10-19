@@ -145,6 +145,7 @@ pub fn Methods(comptime Store: type) type {
             const live = try self.integer("SELECT live FROM effect_owner_live WHERE id=1;");
             if (live < 0) return error.LiveOwnerCounterInvalid;
             const live_after = live + own.live_owners;
+            if (live_after > effects.max_live_owners) return error.ReserveBackpressure;
             const unsettled_after = @max(0, live_after - (try self.integer("SELECT count(*) FROM confirmation_markers;") - own.retired_markers));
             const limits = [_]struct { sql: [:0]const u8, own: i64, reserve: i64, cap: i64 }{
                 .{ .sql = "SELECT count(*) FROM effect_owners;", .own = own.owners, .reserve = 0, .cap = effects.max_owners },

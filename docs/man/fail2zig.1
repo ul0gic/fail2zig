@@ -318,6 +318,8 @@ unknown; action names do not determine mode. JSON includes the additive Boolean
 \fBenforce_configured\fR while preserving \fBenforcing\fR and \fBaction\fR.
 JSON also carries the additive Boolean \fBsource_paused\fR, true when any source of the jail is paused;
 \fBsource_healthy\fR and \fBcause\fR keep their meaning.
+The additive Boolean \fBsource_missing\fR is true while a source waits for its log file to appear
+under \fBon_truncation = "restart"\fR; the source stays healthy and table output shows \fBmissing (FileNotFound)\fR.
 Plain output retains its 11 columns and enforcing Boolean position; an unknown ban
 count is shown as \fB-\fR, while a known zero remains \fB0\fR. Table output shows state, source health, enforcement and bans; add
 .B --details
@@ -796,7 +798,7 @@ backup the upgrade wrote over the state file, removing the upgraded database's
 WAL/SHM files, and reinstalling the binary that last wrote that state.
 .PP
 The first start on state whose saved detection generations hashed the ignore list
-or the per-jail subject share rekeys them once, before admission validation, and logs
+or the per-jail subject share (since replaced by one shared capacity) rekeys them once, before admission validation, and logs
 .BR "saved detection generations rekeyed without the ignore list or the subject share" .
 No ban, deadline, checkpoint or retry subject changes, and later starts write nothing.
 A configuration that still differs from saved state in another way keeps its existing

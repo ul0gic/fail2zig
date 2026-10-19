@@ -116,7 +116,8 @@ test "native resource budget: authoritative consumer and effect envelopes includ
     const effects = try budget.effectCost(.{ .entries = 2, .bytes = 32 });
     try t.expect(effects.workspace.bytes > 16 * budget.mib);
     try t.expectEqual(@as(usize, 7), effects.workspace.fds);
-    try t.expectEqual(effects.live.bytes, effects.restore_overlap.bytes);
+    try t.expectEqual(@as(usize, 0), effects.restore_overlap.bytes);
+    try t.expectEqual(@import("engine_test").runtime.native_effect_runtime.live_bytes, effects.live.bytes);
 }
 test "native resource budget: active leases refuse exhaustion without evicting protected owners" {
     var plan = budget.Plan{};
@@ -302,13 +303,14 @@ const QueryPeakAllocator = struct {
     }
 };
 
-test "native resource budget: exact aggregate scope projection and real query fit control scratch without in-place growth" {
+test "native resource budget: exact paged scope projection and real query fit control scratch without in-place growth" {
     const query = @import("engine_test").net.query_v1;
     const effect = @import("engine_test").core.native_effect;
     const scope = @import("engine_test").firewall.scope;
     const shared = @import("shared");
     const jail_count = 64;
-    const row_count = effect.max_owners + 4096;
+    const row_count: usize = query.max_items_per_page;
+    const total_rows: usize = effect.max_live_owners;
     var measured = QueryPeakAllocator{};
     {
         const a = measured.allocator();
@@ -331,18 +333,24 @@ test "native resource budget: exact aggregate scope projection and real query fi
             .protocols = try scope.Protocols.list(&.{ .tcp, .udp }),
             .ports = try scope.Ports.list(&ports),
         });
-        for (rows) |*row| row.* = .{
-            .scope = projected,
-            .lease = .finite,
-            .deadline_us = std.math.maxInt(i64),
-            .decision_id = [_]u8{0xff} ** 32,
-            .confirmed = true,
-        };
+        for (rows, 0..) |*row, index| {
+            var owner_key = [_]u8{0} ** 32;
+            std.mem.writeInt(u32, owner_key[28..32], @intCast(index), .big);
+            row.* = .{
+                .scope = projected,
+                .lease = .finite,
+                .deadline_us = std.math.maxInt(i64),
+                .decision_id = [_]u8{0xff} ** 32,
+                .confirmed = true,
+                .key = query.ItemKey.init(&owner_key),
+            };
+        }
         const name = [_]u8{1} ** query.max_jail_bytes;
         for (jails, 0..) |*jail, index| {
-            const start = index * row_count / jail_count;
-            const end = (index + 1) * row_count / jail_count;
-            jail.* = .{ .name = &name, .items = rows[start..end] };
+            jail.* = if (index == 0)
+                .{ .name = &name, .items = rows, .count = total_rows }
+            else
+                .{ .name = &name, .items = &.{}, .count = total_rows, .offset = total_rows };
         }
         const projection_bytes = measured.live;
         const result = try query.handle(a, &body, .monitor, [_]u8{0xff} ** 32, .{ .scopes = .{ .jails = jails } });
@@ -355,7 +363,7 @@ test "native resource budget: exact aggregate scope projection and real query fi
         const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, result.payload, .{});
         defer parsed.deinit();
         try t.expectEqual(@as(usize, 256), parsed.value.object.get("items").?.array.items.len);
-        std.debug.print("exact scope projection rows={d} bytes={d}, query peak={d}, response={d}, control scratch={d}\n", .{ row_count, projection_bytes, measured.peak, result.payload.len, 8 * budget.mib });
+        std.debug.print("exact paged scope projection rows={d} bytes={d}, query peak={d}, response={d}, control scratch={d}\n", .{ row_count, projection_bytes, measured.peak, result.payload.len, 8 * budget.mib });
     }
     try t.expectEqual(@as(usize, 0), measured.live);
 }

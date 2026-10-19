@@ -323,6 +323,10 @@ pub const Session = struct {
     pub fn repairSnapshot(self: *const Session) repair.Snapshot {
         return self.source_repair.snapshot();
     }
+    pub fn blockedCause(self: *const Session) ?anyerror {
+        const cause = self.last_error orelse return null;
+        return if (pipeline.Pipeline.commitBlocked(cause)) cause else null;
+    }
     pub fn failureDiagnostic(self: *const Session) ?FailureDiagnostic {
         return self.failure_diagnostic;
     }

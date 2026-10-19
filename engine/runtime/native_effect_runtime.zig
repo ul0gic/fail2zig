@@ -87,7 +87,8 @@ fn expiryClass(transport: firewall.Transport, scope: effect.Scope) ExpiryClass {
     const host = scope.canonical.subject.kind == .host and scope.canonical.protocols.isAll() and scope.canonical.ports.isAll();
     return if (host and transport != .iptables) .kernel_expiring else .deletion;
 }
-pub const reserved_bytes = @sizeOf(Manager) + effect.max_effects * (2 * @sizeOf(effect.Entry) + @sizeOf(bool) + 2 * (@sizeOf(?Marker) + 2 * @sizeOf(bool) + @sizeOf(?i64))) + (firewall.Limits{}).max_bytes;
+pub const live_bytes = @sizeOf(Manager) + effect.max_effects * (2 * @sizeOf(effect.Entry) + @sizeOf(bool) + 2 * (@sizeOf(?Marker) + 2 * @sizeOf(bool) + @sizeOf(?i64)));
+pub const reserved_bytes = live_bytes + (firewall.Limits{}).max_bytes;
 pub const Manager = struct {
     allocator: std.mem.Allocator,
     store: *durable.Store,

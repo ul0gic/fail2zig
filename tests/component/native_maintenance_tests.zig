@@ -6,10 +6,12 @@ const durable = @import("engine_test").core.record_store;
 const consumer = @import("engine_test").core.native_consumer;
 const history = @import("engine_test").core.native_effect_history;
 const effect = @import("engine_test").core.native_effect;
+const history_cap = @import("engine_test").core.native_application_history;
 const native_detection = @import("engine_test").core.native_detection_record;
 const native_retry = @import("engine_test").core.native_retry;
 const time_policy = @import("engine_test").core.source_time_policy;
 const generation = [_]u8{9} ** 32;
+const reclaim_batch: i64 = 32;
 fn clock(_: ?*anyopaque) i64 {
     return 100;
 }
@@ -606,17 +608,19 @@ test "native maintenance: decision at detail capacity atomically reclaims obsole
     var now = CleanupClock{ .now = 100 };
     const subject = native_detection.Subject{ .v4 = .{ 192, 0, 2, 91 } };
     const record = try escalatedRecord(&f.store, &now, identity, 0, subject, policy);
-    try sql(&f.store, "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<65536) INSERT INTO retry_decision_details SELECT 'unused','file',CAST(x AS TEXT),4,X'C0000201',x,100,NULL,NULL FROM n;");
-    try t.expectEqual(@as(i64, 65536), try f.store.inspectInteger("SELECT count(*) FROM retry_decision_details;"));
+    const capacity: i64 = @intCast(history_cap.max_details);
+    const reclaimed_with_decision = capacity - reclaim_batch + 1;
+    try sql(&f.store, std.fmt.comptimePrint("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<{d}) INSERT INTO retry_decision_details SELECT 'unused','file',CAST(x AS TEXT),4,X'C0000201',x,100,NULL,NULL FROM n;", .{history_cap.max_details}));
+    try t.expectEqual(capacity, try f.store.inspectInteger("SELECT count(*) FROM retry_decision_details;"));
     f.store.fail_at = .after_retry_detail_prune;
     try t.expectError(error.InjectedFailure, f.store.commitRecord(record));
     f.store.fail_at = null;
-    try t.expectEqual(@as(i64, 65536), try f.store.inspectInteger("SELECT count(*) FROM retry_decision_details;"));
+    try t.expectEqual(capacity, try f.store.inspectInteger("SELECT count(*) FROM retry_decision_details;"));
     try t.expectEqual(durable.CommitResult.committed, try f.store.commitRecord(record));
-    try t.expectEqual(@as(i64, 65505), try f.store.inspectInteger("SELECT count(*) FROM retry_decision_details;"));
+    try t.expectEqual(reclaimed_with_decision, try f.store.inspectInteger("SELECT count(*) FROM retry_decision_details;"));
     try t.expectEqual(@as(i64, 0), try f.store.inspectInteger("SELECT count(*) FROM pragma_foreign_key_check;"));
     try reopen(&f);
-    try t.expectEqual(@as(i64, 65505), try f.store.inspectInteger("SELECT count(*) FROM retry_decision_details;"));
+    try t.expectEqual(reclaimed_with_decision, try f.store.inspectInteger("SELECT count(*) FROM retry_decision_details;"));
     try t.expectEqual(@as(i64, 1), try f.store.inspectInteger("SELECT count(*) FROM retry_decision_details WHERE jail='receipt';"));
 }
 

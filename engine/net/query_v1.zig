@@ -163,18 +163,67 @@ pub fn projectScope(scope: canonical_scope.Scope) ScopeProjectionError!ScopeFiel
     };
 }
 
+pub const ItemKey = struct {
+    len: u8 = 0,
+    bytes: [33]u8 = [_]u8{0} ** 33,
+
+    pub fn init(source: []const u8) ItemKey {
+        var result = ItemKey{ .len = @intCast(source.len) };
+        @memcpy(result.bytes[0..source.len], source);
+        return result;
+    }
+    pub fn slice(self: *const ItemKey) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
 pub const ScopeItem = struct {
     scope: ScopeFields,
     lease: LeaseKind,
     deadline_us: ?i64,
     decision_id: ?[32]u8,
     confirmed: bool,
+    ban_count: ?u64 = null,
+    key: ItemKey = .{},
 };
 
 pub const JailScopes = struct {
     name: []const u8,
     items: []const ScopeItem,
+    count: ?usize = null,
+    offset: usize = 0,
+
+    fn total(self: JailScopes) usize {
+        return self.count orelse self.items.len;
+    }
+    fn at(self: JailScopes, index: usize) ScopeItem {
+        return self.items[index - self.offset];
+    }
 };
+
+pub const ScopesWindow = struct { jail: ?[]const u8, cursor_jail: ?u32, cursor_key: ItemKey = .{}, limit: u32 };
+
+pub fn scopesWindow(arena: std.mem.Allocator, body: []const u8) ?ScopesWindow {
+    if (body.len > shared.protocol.max_request_body) return null;
+    const parsed = std.json.parseFromSliceLeaky(Request, arena, body, .{ .ignore_unknown_fields = false }) catch return null;
+    var limit: u32 = default_limit;
+    if (parsed.limit) |value| {
+        if (value != .integer or value.integer < 1 or value.integer > max_items_per_page) return null;
+        limit = @intCast(value.integer);
+    }
+    var window = ScopesWindow{ .jail = parsed.jail, .cursor_jail = null, .limit = limit };
+    if (parsed.cursor) |text| {
+        const cursor = Cursor.decode(text) catch return window;
+        switch (cursor) {
+            .keyset => |keyset| {
+                window.cursor_jail = keyset.jail;
+                window.cursor_key = keyset.key;
+            },
+            .history => {},
+        }
+    }
+    return window;
+}
 
 pub const ScopesView = struct {
     jails: []const JailScopes,
@@ -352,13 +401,13 @@ pub fn handle(allocator: std.mem.Allocator, body: []const u8, peer_class: PeerCl
 }
 
 pub const Cursor = union(enum) {
-    scopes: struct { jail: u32, item: u32 },
+    keyset: struct { jail: u32, key: ItemKey },
     history: struct { after_sequence: u64 },
 
     pub fn encode(self: Cursor, buffer: *[max_cursor_bytes]u8) []const u8 {
-        var raw: [64]u8 = undefined;
+        var raw: [96]u8 = undefined;
         const text = switch (self) {
-            .scopes => |s| std.fmt.bufPrint(&raw, "s:{d}:{d}", .{ s.jail, s.item }) catch return "",
+            .keyset => |k| std.fmt.bufPrint(&raw, "k:{d}:{s}", .{ k.jail, std.fmt.fmtSliceHexLower(k.key.slice()) }) catch return "",
             .history => |h| std.fmt.bufPrint(&raw, "h:{d}", .{h.after_sequence}) catch return "",
         };
         return std.base64.url_safe_no_pad.Encoder.encode(buffer, text);
@@ -373,12 +422,15 @@ pub const Cursor = union(enum) {
         const decoded = raw[0..len];
         if (decoded.len < 3 or decoded[1] != ':') return error.BadCursor;
         switch (decoded[0]) {
-            's' => {
+            'k' => {
                 const rest = decoded[2..];
                 const split = std.mem.indexOfScalar(u8, rest, ':') orelse return error.BadCursor;
                 const jail = std.fmt.parseInt(u32, rest[0..split], 10) catch return error.BadCursor;
-                const item = std.fmt.parseInt(u32, rest[split + 1 ..], 10) catch return error.BadCursor;
-                return .{ .scopes = .{ .jail = jail, .item = item } };
+                const hex = rest[split + 1 ..];
+                if (hex.len % 2 != 0 or hex.len / 2 > 33) return error.BadCursor;
+                var key = ItemKey{ .len = @intCast(hex.len / 2) };
+                _ = std.fmt.hexToBytes(key.bytes[0..key.len], hex) catch return error.BadCursor;
+                return .{ .keyset = .{ .jail = jail, .key = key } };
             },
             'h' => {
                 const after = std.fmt.parseInt(u64, decoded[2..], 10) catch return error.BadCursor;
@@ -584,12 +636,18 @@ fn renderScopes(writer: anytype, view: ?ScopesView, jail_filter: ?[]const u8, cu
     var item_index: u32 = 0;
     if (cursor_text) |text| {
         const cursor = try Cursor.decode(text);
-        if (cursor != .scopes) return error.BadCursor;
-        if (cursor.scopes.jail < first_jail or cursor.scopes.jail >= last_jail) return error.BadCursor;
-        if (cursor.scopes.item > scopes.jails[cursor.scopes.jail].items.len) return error.BadCursor;
-        jail_index = cursor.scopes.jail;
-        item_index = cursor.scopes.item;
+        switch (cursor) {
+            .keyset => |keyset| {
+                if (keyset.jail < first_jail or keyset.jail >= last_jail) return error.InvalidatedCursor;
+                const resumed = scopes.jails[keyset.jail];
+                if (resumed.offset > resumed.total()) return error.InvalidatedCursor;
+                jail_index = keyset.jail;
+                item_index = @intCast(resumed.offset);
+            },
+            .history => return error.BadCursor,
+        }
     }
+    var last_key: ?ItemKey = null;
 
     var out = std.json.writeStream(writer, .{});
     out.beginObject() catch |err| return mapWrite(err);
@@ -599,24 +657,28 @@ fn renderScopes(writer: anytype, view: ?ScopesView, jail_filter: ?[]const u8, cu
     var emitted: u32 = 0;
     while (jail_index < last_jail and emitted < limit) {
         const jail = scopes.jails[jail_index];
-        while (item_index < jail.items.len and emitted < limit) : (item_index += 1) {
-            writeScopeItem(&out, jail.name, jail.items[item_index]) catch |err| return mapWrite(err);
+        while (item_index < jail.total() and emitted < limit) : (item_index += 1) {
+            const item = jail.at(item_index);
+            writeScopeItem(&out, jail.name, item) catch |err| return mapWrite(err);
+            if (item.key.len == 0) return error.SourceFailed;
+            last_key = item.key;
             emitted += 1;
         }
-        if (item_index >= jail.items.len) {
+        if (item_index >= jail.total()) {
             jail_index += 1;
             item_index = 0;
         }
     }
     out.endArray() catch |err| return mapWrite(err);
-    while (jail_index < last_jail and item_index >= scopes.jails[jail_index].items.len) {
+    while (jail_index < last_jail and item_index >= scopes.jails[jail_index].total()) {
         jail_index += 1;
         item_index = 0;
     }
     out.objectField("next_cursor") catch |err| return mapWrite(err);
     if (jail_index < last_jail) {
         var buffer: [max_cursor_bytes]u8 = undefined;
-        const next = (Cursor{ .scopes = .{ .jail = jail_index, .item = item_index } }).encode(&buffer);
+        const key = if (item_index == 0) ItemKey{} else last_key orelse return error.SourceFailed;
+        const next = (Cursor{ .keyset = .{ .jail = jail_index, .key = key } }).encode(&buffer);
         out.write(next) catch |err| return mapWrite(err);
     } else {
         out.write(null) catch |err| return mapWrite(err);
@@ -645,6 +707,7 @@ fn writeScopeItem(out: anytype, jail: []const u8, item: ScopeItem) !void {
         try out.write(&hex);
     } else try out.write(null);
     try field(out, "confirmed", item.confirmed);
+    if (item.ban_count) |count| try field(out, "ban_count", count);
     try out.endObject();
 }
 

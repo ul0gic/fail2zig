@@ -397,16 +397,19 @@ test "native session repair: missing initial file is retried without premature b
     var clock = Clock{};
     const session = try files.Session.createDeferred(t.allocator, &f.store, clock.fileOptions(), &.{.{ .pattern = f.path }});
     defer session.destroy();
-    try t.expectError(error.SourceRepairPending, admitFile(session));
-    try t.expectEqual(@as(u64, 0), try f.store.revision("fixture"));
-    try t.expectEqual(@as(?u64, 1000), session.repairSnapshot().next_retry_ms);
-    try f.tmp.dir.writeFile(.{ .sub_path = "active.log", .data = "arrived during cooldown\n" });
-    try t.expectError(error.SourceRepairPending, session.admissionTurn());
-    clock.ms = 1000;
     try admitFile(session);
-    try t.expectEqual(repair.Phase.polling, session.repairSnapshot().phase);
+    try t.expect(session.awaitingPath());
+    try t.expectEqual(repair.Phase.healthy, session.repairSnapshot().phase);
     try t.expectEqual(@as(u64, 0), try f.store.revision("fixture"));
-    try t.expectEqual(@as(usize, 1), try fileDelivery(session));
+    try f.tmp.dir.writeFile(.{ .sub_path = "active.log", .data = "arrived while absent\nsecond line\n" });
+    var delivered: usize = 0;
+    for (0..64) |_| {
+        clock.ms += 1000;
+        delivered += try session.pollTurn(1);
+        if (!session.awaitingPath() and delivered >= 2) break;
+    }
+    try t.expectEqual(@as(usize, 2), delivered);
+    try t.expect(!session.awaitingPath());
     try t.expectEqual(repair.Phase.healthy, session.repairSnapshot().phase);
 }
 

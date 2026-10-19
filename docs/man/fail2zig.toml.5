@@ -96,6 +96,14 @@ detection, retry and administration plans. Startup refuses configurations whose
 required bounded plan does not fit. Durable receipts, enforcement intent and
 active ownership are not evicted to meet the ceiling. Minimum: 16. Default: 64.
 .TP
+.B native_memory_ceiling_mb
+Integer. Memory ceiling, in MiB, that startup admits the native plan against: sources,
+retry state, the 65,536-ban live capacity, effect ownership and firewall readback.
+The plan for 65,536 live bans is charged about 337 MiB with two enforcing jails and
+about 438 MiB with sixteen, so a ceiling below the plan makes startup refuse with
+.BR NativeMemoryAdmission .
+Minimum: 1. Default: 512.
+.TP
 .B metrics_enabled
 Boolean. When
 .IR false ,
@@ -201,6 +209,15 @@ Minimum: 1. Default: 600.
 Integer. Number of failures within
 .B findtime
 required to trigger a ban. Minimum: 1. Default: 5.
+The daemon holds at most 65,536 live bans across all enabled jails, in one shared pool,
+and tracks up to 65,536 further subjects that have not yet reached
+.BR maxretry ,
+including subjects whose ban has expired and that retirement has not yet removed.
+A subject that is banned stops counting against tracking capacity. Together the two
+pools never exceed 131,072 stored subjects: once that many exist, a new subject is
+refused, whether or not it would be banned at once. When a limit is reached, new
+failures are refused as retryable backpressure until a ban expires or a tracked
+subject is retired.
 .TP
 .B banaction
 Deprecated compatibility input. Use
