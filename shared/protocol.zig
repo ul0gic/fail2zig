@@ -23,6 +23,7 @@ pub const CommandId = enum(u8) {
     query_v1 = 7,
     admin_v1 = 8,
     reload_v1 = 9,
+    diag_v1 = 10,
 };
 
 pub const Command = union(CommandId) {
@@ -36,6 +37,7 @@ pub const Command = union(CommandId) {
     query_v1: Body,
     admin_v1: Request,
     reload_v1: Request,
+    diag_v1: Body,
 
     pub const Body = struct {
         len: u32 = 0,
@@ -129,7 +131,7 @@ pub fn deserializeCommand(reader: anytype) DeserializeError!Command {
 fn commandBodySize(cmd: Command) u32 {
     const body: u32 = switch (cmd) {
         .status, .list_jails, .reload, .version => 0,
-        .query_v1 => |q| 4 + q.len,
+        .query_v1, .diag_v1 => |q| 4 + q.len,
         .admin_v1, .reload_v1 => |r| request_id_bytes + 4 + r.body.len,
         .ban => |b| ipSize(b.ip) + jailIdSize(b.jail) + optDurationSize(b.duration),
         .unban => |u| ipSize(u.ip) + optJailIdSize(u.jail),
@@ -142,7 +144,7 @@ fn writeCommandBody(cmd: Command, writer: anytype) @TypeOf(writer).Error!void {
     try writer.writeByte(@intFromEnum(std.meta.activeTag(cmd)));
     switch (cmd) {
         .status, .list_jails, .reload, .version => {},
-        .query_v1 => |q| {
+        .query_v1, .diag_v1 => |q| {
             try writer.writeInt(u32, q.len, .little);
             try writer.writeAll(q.slice());
         },
@@ -175,6 +177,7 @@ fn readCommandBody(reader: anytype) DeserializeError!Command {
         .query_v1 => .{ .query_v1 = try readBody(reader) },
         .admin_v1 => .{ .admin_v1 = try readRequest(reader) },
         .reload_v1 => .{ .reload_v1 = try readRequest(reader) },
+        .diag_v1 => .{ .diag_v1 = try readBody(reader) },
         .ban => blk: {
             const ip = try readIp(reader);
             const jail = try readJailId(reader);

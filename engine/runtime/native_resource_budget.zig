@@ -253,7 +253,7 @@ pub fn effectCost(environment: Environment) Error!Component {
 }
 pub fn publicationCost(subjects: usize, coordinator_capacity: usize) Error!Cost {
     if (subjects > retry.max_pool_subjects) return error.InvalidResourceLimit;
-    return .{ .bytes = try add(coordinator_capacity, try mul(subjects, 3 * (@sizeOf(store.Store.ActiveDecision) + @sizeOf(bool)))), .allocations = 4 * 128 };
+    return .{ .bytes = try add(coordinator_capacity, try mul(subjects, 3 * (@sizeOf(store.Store.ActiveDecision) + @sizeOf(bool) + @sizeOf(?[32]u8)))), .allocations = 4 * 128 };
 }
 pub fn controlCost(metrics: bool, response_capacity: usize) Error!Component {
     if (response_capacity == 0 or response_capacity > 2 * shared.protocol.max_payload_size) return error.InvalidResourceLimit;

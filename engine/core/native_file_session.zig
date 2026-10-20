@@ -29,6 +29,7 @@ pub const Options = struct {
     max_sources: usize,
     gate: ?*storage_health.Gate = null,
     monotonic_clock: ?storage_health.Clock = null,
+    wall_clock: files.WallClock = .{},
     clock_context: ?*anyopaque = null,
     clock: ?*const fn (?*anyopaque) anyerror!time.Timestamp = null,
 };
@@ -243,6 +244,7 @@ pub const Session = struct {
         errdefer self.sources.deinit();
         self.sources.max_sources = options.max_sources;
         self.sources.policy = options.on_truncation;
+        self.sources.wall_clock = options.wall_clock;
         self.sources.initialize_source = bindFile;
         self.sources.initialize_userdata = self;
         for (specs) |spec| try self.sources.add(spec.pattern, spec.start);
@@ -700,7 +702,7 @@ pub const Session = struct {
             .jail = self.pipe.jail,
             .path = source.path,
             .source_id = source.source_id,
-            .wall_us = std.time.microTimestamp(),
+            .wall_us = self.sources.wall_clock.us(),
             .reason = .rotated_unread_removed,
             .inode = failure.committed_inode,
             .committed_offset = failure.committed_offset,
@@ -1096,11 +1098,11 @@ pub const Session = struct {
         return error.PendingSourceMissing;
     }
     fn logNotices(self: *Session) void {
-        if (self.processor.encodingNotice(self.notices.read() / std.time.ns_per_ms)) |count| std.log.scoped(.source_text).warn(
+        if (self.processor.encodingNotice(self.nowMs())) |count| std.log.scoped(.source_text).warn(
             "jail {s}: encoding damage in {d} committed records; invalid text replaced for matching, records exceeding decoded bounds excluded",
             .{ self.pipe.jail, count },
         );
-        if (self.processor.timeNotice(self.notices.read() / std.time.ns_per_ms)) |notice| std.log.scoped(.source_time).warn(
+        if (self.processor.timeNotice(self.nowMs())) |notice| std.log.scoped(.source_time).warn(
             "jail {s}: rejected source records: missing timestamp={d}, malformed text/timestamp={d}, future timestamp={d}; records excluded from detection evidence",
             .{ self.pipe.jail, notice.missing_since_notice, notice.malformed_since_notice, notice.future_since_notice },
         );

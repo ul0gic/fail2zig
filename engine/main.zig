@@ -10,6 +10,7 @@ const cli = @import("cli");
 
 const log_level = @import("core/log_level.zig");
 pub const std_options: std.Options = .{ .log_level = .debug, .logFn = configuredLog };
+pub const panic = if (build_options.diag) std.debug.FullPanic(@import("core/diag_events.zig").panic) else std.debug.FullPanic(std.debug.defaultPanic);
 
 fn configuredLog(comptime level: std.log.Level, comptime scope: @Type(.enum_literal), comptime format: []const u8, args: anytype) void {
     if (!log_level.enabled(level)) return;
@@ -69,9 +70,9 @@ pub const CliOptions = struct {
     foreground: bool = true,
 };
 
-pub const EntryMode = enum { daemon, operator, migrate, rule_test, repair_source };
+pub const EntryMode = enum { daemon, operator, migrate, rule_test, repair_source, support_bundle };
 
-const operator_words = [_][]const u8{ "status", "jails", "list", "ban", "unban", "reload", "version", "help", "completions", "config", "history", "jail", "firewall", "stats", "ignore" };
+const operator_words = [_][]const u8{ "status", "jails", "list", "ban", "unban", "reload", "version", "help", "completions", "config", "history", "jail", "firewall", "stats", "ignore", "diag" };
 const operator_globals = [_][]const u8{ "--socket", "--output", "--no-color", "--timeout" };
 
 pub fn classifyEntry(args: []const []const u8) EntryMode {
@@ -80,6 +81,7 @@ pub fn classifyEntry(args: []const []const u8) EntryMode {
     if (std.mem.eql(u8, first, "migrate")) return .migrate;
     if (std.mem.eql(u8, first, "rule-test")) return .rule_test;
     if (std.mem.eql(u8, first, "repair-source")) return .repair_source;
+    if (std.mem.eql(u8, first, "support-bundle")) return .support_bundle;
     for (operator_words) |w| if (std.mem.eql(u8, first, w)) return .operator;
     for (operator_globals) |g| {
         if (std.mem.eql(u8, first, g)) return .operator;
@@ -160,6 +162,7 @@ fn printHelp(w: anytype) !void {
         \\  migrate inspect|snapshot|plan|validate|cutover|status|rollback ...
         \\  rule-test --file|--record|--journal ...   offline rule evaluation (no daemon needed)
         \\  repair-source --jail J --source PATH --token T --acknowledge-truncation   acknowledge a truncated file source (daemon stopped)
+        \\  support-bundle [--out PATH|-] [--include-addresses]   write a redacted diagnostic bundle for a bug report
         \\  Globals: --socket <path> --output table|json|plain --no-color --timeout <ms>
         \\  `fail2zig help <command>` documents each command; `fail2zig version` shows client and daemon versions.
         \\
@@ -219,6 +222,7 @@ pub fn main() !void {
         .migrate => std.process.exit(@import("cli/migrate.zig").run(heap, rest[1..], version, std.io.getStdOut().writer(), std.io.getStdErr().writer()).code()),
         .rule_test => std.process.exit(@import("cli/rule_test.zig").run(heap, rest[1..], std.io.getStdOut().writer(), std.io.getStdErr().writer()).code()),
         .repair_source => std.process.exit(@import("cli/repair_source.zig").run(heap, rest[1..], std.io.getStdOut().writer(), std.io.getStdErr().writer()).code()),
+        .support_bundle => std.process.exit(@import("cli/support_bundle.zig").run(heap, rest[1..], version, std.io.getStdOut().writer(), std.io.getStdErr().writer()).code()),
         .daemon => {},
     }
 

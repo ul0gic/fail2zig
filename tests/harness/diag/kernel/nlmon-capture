@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Usage (root, in the daemon's network namespace): nlmon-capture SECONDS OUT.pcap  — netlink traffic of that namespace.
+set -uo pipefail
+export PATH="$PATH:/usr/sbin:/sbin"
+SECS="$1"; OUT="$2"; IF="f2znl$$"
+modprobe nlmon 2>/dev/null
+if ! ip link add "$IF" type nlmon 2>"$OUT.err"; then
+  echo "nlmon-capture: unavailable: $(head -c 200 "$OUT.err")" >&2
+  exit 3
+fi
+trap 'ip link del "$IF" 2>/dev/null' EXIT
+ip link set "$IF" up
+# Snap length 256 keeps the netlink headers and bounds the file; -Z root because tcpdump drops to its own user.
+timeout --signal INT "$SECS" tcpdump -i "$IF" -s 256 -U -Z root -w "$OUT" 2>>"$OUT.err"
+if [ ! -s "$OUT" ]; then
+  echo "nlmon-capture: tcpdump wrote nothing: $(tail -c 200 "$OUT.err")" >&2
+  exit 1
+fi
+packets=$(tcpdump -Z root -r "$OUT" 2>/dev/null | grep -c -v '^[[:space:]]')
+bytes=$(stat -c %s "$OUT")
+rm -f "$OUT.err"
+echo "nlmon-capture: $packets packets, $bytes bytes in $SECS s"

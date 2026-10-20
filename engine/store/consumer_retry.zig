@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
+const build_options = @import("build_options");
+const diag_mod = @import("../core/diag.zig");
 const consumers = @import("../core/native_consumer.zig");
 const detection = @import("../core/native_detection_record.zig");
 const retry = @import("../core/native_retry.zig");
@@ -1318,6 +1320,7 @@ pub fn Methods(comptime Store: type) type {
 
         fn retryPoolFull(self: *Store, now_us: i64, new_row: bool, banning: bool, tracking_limit: u32) Error!bool {
             const total = try self.integer("SELECT count(*) FROM retry_states;");
+            if (comptime build_options.diag) diag_mod.limit(.retry_rows, std.math.lossyCast(u64, total), @as(u64, tracking_limit) + retry.max_pool_subjects);
             if (new_row and total >= @as(i64, tracking_limit) + retry.max_pool_subjects) return true;
             const limit: i64 = if (banning) retry.max_pool_subjects else tracking_limit;
             if (total < limit) return false;
@@ -1329,6 +1332,7 @@ pub fn Methods(comptime Store: type) type {
             try row.int(1, now_us);
             if (!try row.row()) return error.DatabaseFailure;
             const banned = try row.signed(0);
+            if (comptime build_options.diag) diag_mod.limit(.banned_subjects, std.math.lossyCast(u64, banned), retry.max_pool_subjects);
             return (if (banning) banned else total - banned) >= limit;
         }
 

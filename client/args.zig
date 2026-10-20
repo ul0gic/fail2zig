@@ -52,6 +52,7 @@ pub const Command = union(enum) {
     jail_admin: JailAdminArgs,
     history_reset: HistoryResetArgs,
     ignore: IgnoreArgs,
+    diag_clock: DiagClockArgs,
 
     pub const ScopeKind = enum { host, net };
     pub const ScopeArgs = struct {
@@ -99,6 +100,13 @@ pub const Command = union(enum) {
     };
 
     pub const DetailArgs = struct { details: bool = false };
+
+    pub const DiagClockAction = enum { show, rate, advance };
+    pub const DiagClockArgs = union(DiagClockAction) {
+        show: void,
+        rate: u32,
+        advance: u64,
+    };
 
     pub const HistoryArgs = struct {
         jail: ?[]const u8 = null,
@@ -260,6 +268,9 @@ pub fn parse(argv: []const []const u8, diag: *ParseDiag) Error!Parsed {
     if (std.mem.eql(u8, cmd_str, "ignore")) {
         return parseIgnore(rest, &globals, diag);
     }
+    if (std.mem.eql(u8, cmd_str, "diag")) {
+        return parseDiagClock(rest, &globals, diag);
+    }
     if (std.mem.eql(u8, cmd_str, "list")) {
         return parseList(rest, &globals, diag);
     }
@@ -406,6 +417,69 @@ fn parseUnban(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Err
         return error.MissingArgument;
     }
     return Parsed{ .globals = globals.*, .command = .{ .unban = args } };
+}
+
+const diag_clock_usage = "diag clock show | diag clock rate <0..1000> | diag clock advance <seconds>";
+const max_diag_rate: u32 = 1000;
+const max_diag_advance_s: u64 = 366 * std.time.s_per_day;
+
+fn parseDiagClock(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Error!Parsed {
+    var echo: [format.diagnostic_max_bytes]u8 = undefined;
+    var words: [3][]const u8 = undefined;
+    var count: usize = 0;
+    var k: usize = 0;
+    while (k < rest.len) : (k += 1) {
+        const a = rest[k];
+        if (try takeTrailingGlobal(a, rest, &k, globals, diag)) continue;
+        if (std.mem.startsWith(u8, a, "--")) {
+            diag.set("unknown flag for 'diag': {s}", .{format.escapeArgument(&echo, a)});
+            return error.UnknownFlag;
+        }
+        if (count == words.len) {
+            diag.set("too many arguments for 'diag' (usage: {s})", .{diag_clock_usage});
+            return error.TooManyArguments;
+        }
+        words[count] = a;
+        count += 1;
+    }
+    if (count < 2 or !std.mem.eql(u8, words[0], "clock")) {
+        diag.set("command 'diag' requires a clock subcommand (usage: {s})", .{diag_clock_usage});
+        return error.MissingArgument;
+    }
+    const action = std.meta.stringToEnum(Command.DiagClockAction, words[1]) orelse {
+        diag.set("unknown diag clock subcommand '{s}' (expected: show, rate, advance)", .{format.escapeArgument(&echo, words[1])});
+        return error.InvalidValue;
+    };
+    const args: Command.DiagClockArgs = switch (action) {
+        .show => blk: {
+            if (count != 2) {
+                diag.set("command 'diag clock show' takes no arguments", .{});
+                return error.TooManyArguments;
+            }
+            break :blk .show;
+        },
+        .rate, .advance => blk: {
+            if (count != 3) {
+                diag.set("command 'diag clock {s}' requires one value (usage: {s})", .{ @tagName(action), diag_clock_usage });
+                return error.MissingArgument;
+            }
+            if (action == .rate) {
+                const value: ?u32 = std.fmt.parseInt(u32, words[2], 10) catch null;
+                if (value == null or value.? > max_diag_rate) {
+                    diag.set("invalid rate '{s}' (expected integer 0..1000)", .{format.escapeArgument(&echo, words[2])});
+                    return error.InvalidValue;
+                }
+                break :blk .{ .rate = value.? };
+            }
+            const seconds: ?u64 = std.fmt.parseInt(u64, words[2], 10) catch null;
+            if (seconds == null or seconds.? == 0 or seconds.? > max_diag_advance_s) {
+                diag.set("invalid advance '{s}' (expected positive integer seconds up to 366 days)", .{format.escapeArgument(&echo, words[2])});
+                return error.InvalidValue;
+            }
+            break :blk .{ .advance = seconds.? };
+        },
+    };
+    return Parsed{ .globals = globals.*, .command = .{ .diag_clock = args } };
 }
 
 fn parseIgnore(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Error!Parsed {
@@ -880,6 +954,7 @@ pub const help_top =
     \\    history reset <ip>  Reset an address's ban history in one jail or all jails
     \\    jail <action> <n>   enable, disable, pause or resume a jail
     \\    repair-source       Acknowledge a truncated or replaced file source (daemon stopped)
+    \\    support-bundle      Write a redacted diagnostic bundle for a bug report
     \\    completions <sh>    Emit shell-completion script (bash|zsh|fish)
     \\    help [command]      Show help for a command
     \\
@@ -1118,6 +1193,30 @@ pub const help_completions =
     \\
 ;
 
+pub const help_support_bundle =
+    \\fail2zig support-bundle — write a redacted diagnostic bundle for a bug report
+    \\
+    \\USAGE:
+    \\    fail2zig support-bundle [--out <path>|-] [--config <path>] [--socket <path>]
+    \\                            [--log-lines <n>] [--timeout <ms>] [--include-addresses]
+    \\
+    \\Collects versions, daemon status, jails, stats, continuity loss events, the
+    \\effective configuration with its file and loaded SHA-256, state file page and
+    \\per-table sizes, kernel readback counts, memory, host basics, and the last <n>
+    \\(default 200, at most 2000) warnings and errors from the daemon log into one JSON
+    \\file. Run it as the daemon's user; sections it cannot read record their error.
+    \\
+    \\Addresses become v4-<hash> or v6-<hash>, stable within one bundle only; loopback
+    \\and unspecified addresses are kept. --include-addresses keeps every address.
+    \\Paths other than configured log paths become <path>.
+    \\
+    \\The default output is ./fail2zig-support-<UTC time>.json, created mode 0600 and
+    \\never overwritten; '-' writes to stdout. Exit 0 when every section was collected,
+    \\4 when the bundle was written with sections that record an error, 1 when nothing
+    \\was written.
+    \\
+;
+
 pub fn helpFor(topic: ?[]const u8) []const u8 {
     const t = topic orelse return help_top;
     if (std.mem.eql(u8, t, "ban")) return help_ban;
@@ -1132,6 +1231,7 @@ pub fn helpFor(topic: ?[]const u8) []const u8 {
     if (std.mem.eql(u8, t, "jail")) return help_jail;
     if (std.mem.eql(u8, t, "ignore")) return help_ignore;
     if (std.mem.eql(u8, t, "repair-source")) return help_repair_source;
+    if (std.mem.eql(u8, t, "support-bundle")) return help_support_bundle;
     return help_top;
 }
 

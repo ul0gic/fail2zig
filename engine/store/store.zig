@@ -2,6 +2,8 @@
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
+const diag_mod = @import("../core/diag.zig");
 const native_time = @import("../core/native_time.zig");
 const time_policy = @import("../core/source_time_policy.zig");
 const native_record = @import("../core/native_time_record.zig");
@@ -236,6 +238,8 @@ pub const Store = struct {
     noted_keys: [attribution_batch]effects.Hash = undefined,
     noted_count: u8 = 0,
     noted_ambiguous: bool = false,
+    observation_rows: ?i64 = null,
+    event_rows: ?i64 = null,
     reopen_required: bool = false,
     startup_admission: bool = false,
     startup_operation: bool = false,
@@ -258,6 +262,7 @@ pub const Store = struct {
     test_hooks: TestHooks = .{},
     escalation_jitter_context: ?*anyopaque = null,
     escalation_jitter: *const fn (?*anyopaque, u64) u64 = systemEscalationJitter,
+    diag_changes: if (build_options.diag) i64 else void = if (build_options.diag) 0 else {},
 
     fn systemEscalationJitter(_: ?*anyopaque, maximum_seconds: u64) u64 {
         return std.crypto.random.uintAtMost(u64, maximum_seconds);
@@ -273,7 +278,7 @@ pub const Store = struct {
         try self.exec("PRAGMA cache_size=-2048; PRAGMA wal_autocheckpoint=0;");
         const page_size = try self.integer("PRAGMA page_size;");
         if (page_size <= 0) return error.DatabaseFailure;
-        const pages = @divTrunc(@as(i64, 256 * 1024 * 1024), page_size);
+        const pages = @divTrunc(@as(i64, 1024 * 1024 * 1024), page_size);
         if (try self.integer("PRAGMA page_count;") > pages) return error.StorageLimit;
         var sql: [80]u8 = undefined;
         const maximum = std.fmt.bufPrintZ(&sql, "PRAGMA max_page_count={d};", .{pages}) catch return error.StorageLimit;
@@ -289,6 +294,8 @@ pub const Store = struct {
         return 0;
     }
     pub fn maintainWal(self: *Store, database_path: []const u8) Error!void {
+        const diag_span = if (comptime build_options.diag) diag_mod.enter(.wal) else {};
+        defer if (comptime build_options.diag) diag_mod.leave(diag_span);
         try self.usable();
         if (self.api.get_autocommit(self.db) == 0) return error.DatabaseFailure;
         if (database_path.len == 0 or std.mem.indexOfScalar(u8, database_path, 0) != null) return error.OpenFailed;
@@ -300,6 +307,7 @@ pub const Store = struct {
             error.NameTooLong => return error.StorageLimit,
             else => return error.StorageIo,
         };
+        if (comptime build_options.diag) diag_mod.gauge(.wal_bytes, stat.size);
         if (stat.size < 16 * 1024 * 1024) return;
         self.work_remaining = 1000;
         var row = try self.statement("PRAGMA wal_checkpoint(TRUNCATE);");
@@ -316,6 +324,9 @@ pub const Store = struct {
         if (self.startup_admission) return error.DatabaseFailure;
         if (self.runtime_path) |path| try self.maintainWal(path);
         try self.exec("BEGIN IMMEDIATE;");
+        if (comptime build_options.diag) self.diagMarkChanges();
+        self.observation_rows = null;
+        self.event_rows = null;
         self.noted_count = 0;
         self.noted_ambiguous = false;
     }
@@ -327,6 +338,7 @@ pub const Store = struct {
     pub fn finishStartupAdmission(self: *Store) Error!void {
         if (!self.startup_admission or self.startup_operation) return error.DatabaseFailure;
         try self.exec("COMMIT;");
+        if (comptime build_options.diag) self.diagCommitted();
         self.startup_admission = false;
     }
     pub fn abortStartupAdmission(self: *Store) void {
@@ -342,6 +354,8 @@ pub const Store = struct {
         try self.usable();
         if (!self.startupAdmissionActive()) return error.DatabaseFailure;
         self.work_remaining = 1000;
+        self.observation_rows = null;
+        self.event_rows = null;
         try self.exec("SAVEPOINT native_startup_operation;");
         self.startup_operation = true;
         self.noted_count = 0;
@@ -356,7 +370,13 @@ pub const Store = struct {
         try self.exec("BEGIN;");
     }
     pub fn commitTransaction(self: *Store) Error!void {
-        if (!self.startup_admission) return self.exec("COMMIT;");
+        const diag_span = if (comptime build_options.diag) diag_mod.enter(.commit) else {};
+        defer if (comptime build_options.diag) diag_mod.leave(diag_span);
+        if (!self.startup_admission) {
+            try self.exec("COMMIT;");
+            if (comptime build_options.diag) self.diagCommitted();
+            return;
+        }
         if (!self.startup_operation or self.api.get_autocommit(self.db) != 0) return error.DatabaseFailure;
         try self.exec("RELEASE native_startup_operation;");
         self.startup_operation = false;
@@ -805,6 +825,10 @@ pub const Store = struct {
 
     pub usingnamespace @import("continuity.zig").Methods(@This());
 
+    pub usingnamespace @import("footprint.zig").Methods(@This());
+
+    pub usingnamespace @import("diag_checks.zig").Methods(@This());
+
     pub fn inspectInteger(self: *Store, sql: [:0]const u8) Error!i64 {
         if (!@import("builtin").is_test) @compileError("inspectInteger is test-only");
         return self.integer(sql);
@@ -1174,6 +1198,8 @@ pub const Store = struct {
     }
     pub fn rollback(self: *Store) void {
         self.work_remaining = 1000;
+        self.observation_rows = null;
+        self.event_rows = null;
         if (self.api.get_autocommit(self.db) != 0) {
             if (self.startup_admission) self.reopen_required = true;
             self.startup_operation = false;
@@ -1693,6 +1719,7 @@ pub const Stmt = struct {
     pub fn deinit(self: *Stmt) void {
         _ = self.store.api.finalize(self.ptr);
     }
+    // SQLITE_STATIC (null destructor): bound bytes must outlive every step; never bind a returning helper's by-value parameters.
     pub fn text(self: *Stmt, index: c_int, value: []const u8) Error!void {
         if (value.len > std.math.maxInt(c_int)) return error.InvalidRecord;
         try self.store.check(self.store.api.bind_text(self.ptr, index, value.ptr, @intCast(value.len), null));
@@ -1719,6 +1746,13 @@ pub const Stmt = struct {
             100 => true,
             101 => false,
             else => blk: {
+                if (rc == 9) {
+                    const sql_of = @extern(*const fn (*Statement) callconv(.c) ?[*:0]const u8, .{ .name = "sqlite3_sql" });
+                    if (sql_of(self.ptr)) |sql_text| {
+                        const sql = std.mem.span(sql_text);
+                        std.log.warn("storage: work budget exhausted by: {s}", .{sql[0..@min(sql.len, 200)]});
+                    }
+                }
                 try self.store.check(rc);
                 break :blk error.DatabaseFailure;
             },

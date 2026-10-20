@@ -166,7 +166,8 @@ pub fn Methods(comptime Store: type) type {
             for (decisions[0..decision_count]) |decision| if (decision.lease.live(now) or try self.subjectEffectPinned(decision.subject)) return true;
             return false;
         }
-        fn orderRecord(self: *Store, fence: CleanupFence, sequence: u64) Error!Stmt {
+        // Binds fence.generation SQLITE_STATIC: the fence must outlive the returned statement.
+        fn orderRecord(self: *Store, fence: *const CleanupFence, sequence: u64) Error!Stmt {
             var row = try self.statement("SELECT occurrence,raw_hash,cursor,receipt_us,receipt_generation FROM records WHERE jail=?1 AND source=?2 AND source_generation=?3 AND source_sequence=?4 AND source_sequence IS NOT NULL;");
             errdefer row.deinit();
             try row.text(1, fence.jail);
@@ -224,7 +225,7 @@ pub fn Methods(comptime Store: type) type {
             var keys: usize = 0;
             var count: usize = 0;
             while (next.reject_below_sequence <= cutoff_sequence and count < 64) : (count += 1) {
-                var row = try self.orderRecord(fence, next.reject_below_sequence);
+                var row = try self.orderRecord(&fence, next.reject_below_sequence);
                 defer row.deinit();
                 if (!try row.row()) return error.InvalidMaintenanceState;
                 const id = try orderedIdentity(&row, fence);
@@ -391,7 +392,7 @@ pub fn Methods(comptime Store: type) type {
             var keys: usize = 0;
             var steps: usize = 0;
             while (next.sweep_sequence + 1 < next.reject_below_sequence and deleted < 64 and steps < 64) : (steps += 1) {
-                var row = try self.orderRecord(fence, next.sweep_sequence + 1);
+                var row = try self.orderRecord(&fence, next.sweep_sequence + 1);
                 defer row.deinit();
                 if (!try row.row()) {
                     next.sweep_sequence += 1;
@@ -708,7 +709,7 @@ pub fn Methods(comptime Store: type) type {
                         if (stored_sequence <= 0 or stored_sequence != (if (same) next.sequence + 1 else first) or stored_sequence > end) return error.InvalidMaintenanceState;
                         sequence = @intCast(stored_sequence);
                         const fence = CleanupFence{ .jail = jail, .source = source, .generation = generation, .jail_revision = 0, .consumer_revision = 0, .effect_revision = 0, .clock = .{ .prepared_us = 0 } };
-                        var detail = try self.orderRecord(fence, sequence);
+                        var detail = try self.orderRecord(&fence, sequence);
                         defer detail.deinit();
                         if (try detail.row()) {
                             if (sequence <= state.sweep_sequence) return error.InvalidMaintenanceState;

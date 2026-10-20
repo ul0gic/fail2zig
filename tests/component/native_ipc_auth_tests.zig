@@ -260,10 +260,10 @@ test "native ipc auth: peer class is uid-only; gid is never authority" {
 
 test "native ipc auth: raw tag classes match the frozen command table" {
     const read_only = [_]u8{ 0, 3, 4, 6, 7 };
-    const mutation = [_]u8{ 1, 2, 5, 8, 9 };
+    const mutation = [_]u8{ 1, 2, 5, 8, 9, 10 };
     for (read_only) |t| try testing.expectEqual(auth.CommandClass.read_only, auth.classifyTag(t));
     for (mutation) |t| try testing.expectEqual(auth.CommandClass.mutation, auth.classifyTag(t));
-    var t: u16 = 10;
+    var t: u16 = 11;
     while (t <= 255) : (t += 1) try testing.expectEqual(auth.CommandClass.unknown, auth.classifyTag(@intCast(t)));
 }
 

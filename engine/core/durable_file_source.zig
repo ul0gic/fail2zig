@@ -6,6 +6,21 @@ const records = @import("source_record.zig");
 const native_text = @import("source_text.zig");
 const config = @import("../config/native.zig");
 const Allocator = std.mem.Allocator;
+
+pub const WallClock = struct {
+    context: ?*anyopaque = null,
+    read: *const fn (?*anyopaque) i64 = systemWallUs,
+
+    pub fn us(self: WallClock) i64 {
+        return self.read(self.context);
+    }
+    fn seconds(self: WallClock) i64 {
+        return @divFloor(self.us(), std.time.us_per_s);
+    }
+};
+fn systemWallUs(_: ?*anyopaque) i64 {
+    return std.time.microTimestamp();
+}
 pub const Start = enum { head, tail };
 pub const discovery_entries_per_turn: usize = 256;
 pub const discovery_entries_per_episode: usize = 65_536;
@@ -167,6 +182,7 @@ pub const FileSource = struct {
     unlinked_idle: ?struct { size: u64, since_ms: u64 } = null,
     pending_loss: ?PendingLoss = null,
     detected_s: i64 = 0,
+    wall_clock: WallClock = .{},
     read_prefix: *const fn (std.fs.File, u8) anyerror![32]u8 = prefix,
 
     pub fn framingBinding(encoding: native_text.Encoding, configuration_hash: [32]u8, max_bytes: usize) [32]u8 {
@@ -281,7 +297,7 @@ pub const FileSource = struct {
             .observed_inode = if (observed) |value| value.inode else null,
         };
         self.continuity_reported = false;
-        self.detected_s = std.time.timestamp();
+        self.detected_s = self.wall_clock.seconds();
         self.health = .resume_lost;
         return error.ResumeLost;
     }
@@ -293,7 +309,7 @@ pub const FileSource = struct {
             return err;
         };
         if (self.pending_loss == null) {
-            const now_us = std.time.microTimestamp();
+            const now_us = self.wall_clock.us();
             self.detected_s = @divFloor(now_us, std.time.us_per_s);
             self.pending_loss = .{
                 .event = .{
@@ -323,7 +339,7 @@ pub const FileSource = struct {
     fn absent(self: *FileSource) error{ResumeLost}!?std.fs.File {
         if (self.policy != .restart) return self.continuityLost(.missing, null);
         self.awaiting_path = true;
-        self.awaiting_checked_s = std.time.timestamp();
+        self.awaiting_checked_s = self.wall_clock.seconds();
         return null;
     }
 
@@ -361,7 +377,7 @@ pub const FileSource = struct {
             else => return err,
         };
         const expected = self.committed orelse return direct;
-        if (direct == null and self.awaiting_path and self.resume_search == null and std.time.timestamp() == self.awaiting_checked_s) return null;
+        if (direct == null and self.awaiting_path and self.resume_search == null and self.wall_clock.seconds() == self.awaiting_checked_s) return null;
         var replacement: ?Observed = null;
         if (direct) |f| {
             const stat = std.posix.fstat(f.handle) catch |err| {
@@ -519,7 +535,7 @@ pub const FileSource = struct {
     }
 
     fn checkNamedPath(self: *FileSource) void {
-        const now = std.time.timestamp();
+        const now = self.wall_clock.seconds();
         if (self.named_checked_s == now) return;
         self.named_checked_s = now;
         _ = std.posix.fstatat(std.posix.AT.FDCWD, self.path, 0) catch |err| {
@@ -1174,6 +1190,7 @@ pub const FileSet = struct {
     framing: Framing = .bytes,
     policy: config.TruncationPolicy = .refuse,
     health: records.Health = .waiting,
+    wall_clock: WallClock = .{},
     restore: ?RestoreCallback = null,
     restore_userdata: ?*anyopaque = null,
     initialize_source: ?*const fn (*FileSource, ?*anyopaque) anyerror!void = null,
@@ -1210,6 +1227,7 @@ pub const FileSet = struct {
         source.policy = self.policy;
         source.jail = self.jail;
         source.siblings = &self.sources;
+        source.wall_clock = self.wall_clock;
         if (self.initialize_source) |initialize| try initialize(&source, self.initialize_userdata);
         try self.sources.append(source);
     }
@@ -1335,6 +1353,7 @@ pub const FileSet = struct {
         source.policy = self.policy;
         source.jail = self.jail;
         source.siblings = &self.sources;
+        source.wall_clock = self.wall_clock;
         if (checkpoint == null) source.framing = self.framing;
         for (self.sources.items) |previous| {
             if (std.mem.eql(u8, previous.path, path) and previous.in_operation) source.in_operation = true;

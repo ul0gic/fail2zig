@@ -54,6 +54,7 @@ pub const StatusPayload = struct {
     uptime_seconds: ?u64 = null,
     memory_bytes_used: ?u64 = null,
     memory_bytes_limit: ?u64 = null,
+    memory_admission_bytes: ?u64 = null,
     active_bans: ?u32 = null,
     total_bans: ?u64 = null,
     knowledge: ?[]const u8 = null,
@@ -362,6 +363,7 @@ fn writeStatusPlain(writer: anytype, s: StatusPayload) !void {
     if (s.expiry_uncertain) |uncertain| try writer.print("expiry_uncertain\t{s}\n", .{boolValue(uncertain)});
     if (s.next_committed_expiry_us) |deadline| try writer.print("next_committed_expiry_us\t{d}\n", .{deadline});
     if (s.paused_sources) |count| try writer.print("paused_sources\t{d}\n", .{count});
+    if (s.memory_admission_bytes) |m| try writer.print("memory_admission_bytes\t{d}\n", .{m});
     for (s.sources orelse &.{}) |source| try writeSourcePlain(writer, source);
 }
 
@@ -449,6 +451,7 @@ fn writeStatusTable(writer: anytype, s: StatusPayload, color: Color, columns: us
 
     try rowLabel(writer, "Uptime:", formatUptime(s.uptime_seconds), width);
     try rowLabel(writer, "Memory:", formatMemory(s.memory_bytes_used, s.memory_bytes_limit), width);
+    if (s.memory_admission_bytes != null) try rowLabel(writer, "Memory plan:", formatMemory(s.memory_admission_bytes, null), width);
     try rowLabel(writer, "Parse rate:", formatRate(s.parse_rate), width);
     try rowLabel(writer, "Active bans:", formatOptU32(s.active_bans), width);
     try rowLabel(writer, "History:", formatHistoryCount(s.total_bans), width);
@@ -569,6 +572,7 @@ fn writeStatusNarrow(writer: anytype, s: StatusPayload, color: Color, columns: u
     if (s.generation) |generation| try writeStatusNarrowRow(writer, "Generation: ", renderDiagnostic(&diagnostic_buffer, generation), columns);
     try writeStatusNarrowRow(writer, "Uptime: ", formatUptime(s.uptime_seconds), columns);
     try writeStatusNarrowRow(writer, "Memory: ", formatMemory(s.memory_bytes_used, s.memory_bytes_limit), columns);
+    if (s.memory_admission_bytes != null) try writeStatusNarrowRow(writer, "Memory plan: ", formatMemory(s.memory_admission_bytes, null), columns);
     try writeStatusNarrowRow(writer, "Parse rate: ", formatRate(s.parse_rate), columns);
     if (s.storage) |storage| try writeStatusNarrowRow(writer, "Storage: ", renderDiagnostic(&diagnostic_buffer, storage), columns);
     if (statusCause(s)) |cause| try writeStatusNarrowRow(writer, "Cause: ", renderDiagnostic(&diagnostic_buffer, cause), columns);
@@ -869,6 +873,7 @@ fn statusWidth(s: StatusPayload) usize {
     var used: usize = statusHeadingLen(s.version);
     used = @max(used, rowUsed(formatUptime(s.uptime_seconds)));
     used = @max(used, rowUsed(formatMemory(s.memory_bytes_used, s.memory_bytes_limit)));
+    used = @max(used, rowUsed(formatMemory(s.memory_admission_bytes, null)));
     used = @max(used, rowUsed(formatRate(s.parse_rate)));
     used = @max(used, rowUsed(formatOptU32(s.active_bans)));
     used = @max(used, rowUsed(formatHistoryCount(s.total_bans)));

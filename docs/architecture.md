@@ -213,8 +213,8 @@ a banned subject does not consume tracking capacity. Native reservation checks c
 and descriptor budgets. SQLite uses a separate bounded heap and page limit; required history and
 recovery anchors remain pinned.
 
-Startup sets `max_page_count` to 256 MiB divided by the page size, so the state file
-cannot grow past 256 MiB (65,536 pages of 4 KiB), and a state file already past that
+Startup sets `max_page_count` to 1 GiB divided by the page size, so the state file
+cannot grow past 1 GiB (262,144 pages of 4 KiB), and a state file already past that
 size is refused with `StorageLimit`. A commit that fails because the file is full
 (SQLite "database or disk is full", `StorageFull`) is a retryable storage failure.
 Ingestion pauses and the daemon retries after a delay that starts at 1 s and doubles

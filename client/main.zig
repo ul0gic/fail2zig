@@ -113,6 +113,7 @@ pub fn run(
             return doAdmin(allocator, parsed.globals, stdout, stderr, .{ .kind = "history_reset", .jail = h.jail, .address = h.address, .all = h.all });
         },
         .ignore => |g| return doIgnore(allocator, parsed.globals, stdout, stderr, color, g),
+        .diag_clock => |d| return doDiagClock(allocator, parsed.globals, stdout, stderr, color, d),
         .remote_version => return doRequest(allocator, parsed.globals, .{ .version = {} }, stdout, stderr, color, formatVersionCmd),
         .ban => |b| {
             _ = parseIp(b.ip, stderr) catch return .client_error;
@@ -795,6 +796,46 @@ fn formatUnbanCmd(
     color: format.Color,
 ) !void {
     return format.formatUnban(allocator, writer, payload, fmt, color);
+}
+
+fn doDiagClock(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype, color: format.Color, request: args.Command.DiagClockArgs) ExitCode {
+    var body_bytes: [128]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&body_bytes);
+    const written = switch (request) {
+        .show => std.json.stringify(.{ .op = "show" }, .{}, stream.writer()),
+        .rate => |value| std.json.stringify(.{ .op = "rate", .rate = value }, .{}, stream.writer()),
+        .advance => |seconds| std.json.stringify(.{ .op = "advance", .us = seconds * std.time.us_per_s }, .{}, stream.writer()),
+    };
+    written catch return .client_error;
+    const body = shared.Command.Body.init(stream.getWritten()) catch return .client_error;
+    return doRequest(allocator, globals, .{ .diag_v1 = body }, stdout, stderr, color, formatDiagClockCmd);
+}
+
+const DiagClockPayload = struct {
+    mode: enum { real, accelerated, step },
+    rate: u32,
+    wall_us: i64,
+    monotonic_ns: u64,
+    real_wall_us: i64,
+    regressions: u64,
+};
+
+fn formatDiagClockCmd(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    payload: []const u8,
+    fmt: format.OutputFormat,
+    _: format.Color,
+) !void {
+    const parsed = try std.json.parseFromSlice(DiagClockPayload, allocator, payload, .{});
+    defer parsed.deinit();
+    const clock = parsed.value;
+    switch (fmt) {
+        .json => try std.json.stringify(clock, .{}, writer),
+        .plain => try writer.print("mode\t{s}\nrate\t{d}\nwall_us\t{d}\nreal_wall_us\t{d}\nmonotonic_ns\t{d}\nregressions\t{d}", .{ @tagName(clock.mode), clock.rate, clock.wall_us, clock.real_wall_us, clock.monotonic_ns, clock.regressions }),
+        .table => try writer.print("Mode:          {s}\nRate:          {d}\nVirtual wall:  {d} us\nReal wall:     {d} us\nMonotonic:     {d} ns\nRegressions:   {d}", .{ @tagName(clock.mode), clock.rate, clock.wall_us, clock.real_wall_us, clock.monotonic_ns, clock.regressions }),
+    }
+    try writer.writeByte('\n');
 }
 
 fn formatVersionCmd(

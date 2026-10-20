@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Check: after an in-place upgrade on v047-wall-2040, the daemon is up with 2,040 bans intact and bans 50 new sources past the old wall.
+set -u
+OUT="$F2Z_OUT"; K="$F2Z_HARNESS/kernel"; WALL=2040; MORE=50
+read -r -a NS <<< "${F2Z_NS_EXEC:-}"
+result() { echo "$1" | tee "$OUT/result.txt"; exit 0; }
+[ "$F2Z_MODE" = target-upgrade ] || result "fail: needs --mode upgrade on the target (mode is $F2Z_MODE)"
+[ "$F2Z_SCENARIO" = v047-wall-2040 ] || result "fail: needs scenario v047-wall-2040 (scenario is $F2Z_SCENARIO)"
+status() { "$F2Z_BIN" --socket "$F2Z_SOCK" --timeout 5000 --output json status 2>/dev/null | tr -d '\n'; }
+field() { sed -n "s/.*\"$1\":\"\{0,1\}\([^\",}]*\).*/\1/p"; }
+kernel_elements() { "${NS[@]}" "$K/nft-count" | awk '{n+=$3} END{print n+0}'; }
+deadline=$((SECONDS + F2Z_SECONDS))
+st=$(status)
+echo "$st" > "$OUT/status-start.json"
+version=$(echo "$st" | field version); active=$(echo "$st" | field active_bans); storage=$(echo "$st" | field storage)
+ready_s=$(awk -v a="$F2Z_STARTED_AT" -v b="$F2Z_READY_AT" 'BEGIN{printf "%.1f", b-a}')
+kernel=$(kernel_elements)
+echo "start: version=$version active=$active kernel=$kernel storage=$storage ready_after=${ready_s}s" | tee "$OUT/check.log"
+[ "${active:-0}" -ge "$WALL" ] || result "fail: $active active bans after the upgrade, expected at least $WALL (version $version)"
+[ "${kernel:-0}" -ge "$WALL" ] || result "fail: $kernel kernel elements after the upgrade, expected at least $WALL"
+"$F2Z_HARNESS/gen/lines" portsentry "$MORE" 10 --start "$WALL" >> "$F2Z_PORTSENTRY_LOG"
+want=$((active + MORE))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  now=$(status | field active_bans)
+  echo "t=${SECONDS}s active=$now" >> "$OUT/check.log"
+  [ "${now:-0}" -ge "$want" ] && break
+  sleep 2
+done
+st=$(status); echo "$st" > "$OUT/status-end.json"
+now=$(echo "$st" | field active_bans); storage=$(echo "$st" | field storage); kernel_end=$(kernel_elements)
+summary="version $version ready after ${ready_s} s; active $active -> $now (want $want); kernel $kernel -> $kernel_end; storage $storage"
+if [ "${now:-0}" -ge "$want" ] && [ "${kernel_end:-0}" -ge "$want" ] && [ "$storage" = healthy ]; then
+  result "pass: $summary"
+fi
+result "fail: $summary"

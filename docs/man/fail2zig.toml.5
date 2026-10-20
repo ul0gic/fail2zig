@@ -69,7 +69,7 @@ Integer (1–1024). Maximum simultaneous WebSocket clients. Default: 16.
 String (absolute path). Durable SQLite database containing source positions,
 records, decisions, owners, effects and history. It is created or opened at
 startup with mode 0600. Corrupt or unsupported state is refused rather than
-silently reset. The file cannot grow past 256 MiB (65,536 pages of 4 KiB); a
+silently reset. The file cannot grow past 1 GiB (262,144 pages of 4 KiB); a
 state file already past that size is refused at startup. When a commit fails
 because the file is full, the daemon pauses ingestion, retries after a delay that
 doubles up to 30 seconds and returns to healthy once recovery completes. Rules

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
 
-const fail2zig_version = "0.4.7";
+const fail2zig_version = "0.4.8-dev";
 
 const CiLane = enum { components_a, components_b, assembled, fuzz, excluded, deferred };
 const CiGates = struct {
@@ -22,10 +22,43 @@ const CiGates = struct {
     }
 };
 
+fn releaseSignal(b: *std.Build, strip: bool) ?[]const u8 {
+    if (strip) return "-Dstrip=true";
+    if (b.graph.env_map.get("RELEASE_TAG") != null) return "RELEASE_TAG is set";
+    if (b.graph.env_map.get("GITHUB_REF_TYPE")) |ref_type| if (std.mem.eql(u8, ref_type, "tag")) return "GITHUB_REF_TYPE=tag";
+    return null;
+}
+
+const NoDiagCheck = struct {
+    const markers = [_][]const u8{ "DIAGNOSTIC BUILD", "f2z_diag_", fail2zig_version ++ "+diag" };
+
+    step: std.Build.Step,
+    binary: []const u8,
+
+    fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+        _ = options;
+        const self: *NoDiagCheck = @fieldParentPtr("step", step);
+        const b = step.owner;
+        const path = if (std.fs.path.isAbsolute(self.binary)) self.binary else b.pathFromRoot(self.binary);
+        const bytes = std.fs.cwd().readFileAlloc(b.allocator, path, 1 << 30) catch |err| return step.fail("cannot read {s}: {s}", .{ path, @errorName(err) });
+        for (markers) |marker| if (std.mem.indexOf(u8, bytes, marker) != null) return step.fail("{s} is a diagnostic build: contains '{s}'", .{ path, marker });
+    }
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const strip = b.option(bool, "strip", "Strip debug information from the executable") orelse false;
+    const diag = b.option(bool, "diag", "Build the internal diagnostic instrumentation; never shipped") orelse false;
+    if (diag) if (releaseSignal(b, strip)) |signal| {
+        std.debug.print("error: -Ddiag=true is refused for a release build ({s})\n", .{signal});
+        std.process.exit(1);
+    };
+    const tracy = b.option(bool, "tracy", "Profile the diagnostic build with the Tracy client; requires -Ddiag=true") orelse false;
+    if (tracy and !diag) {
+        std.debug.print("error: -Dtracy=true requires -Ddiag=true\n", .{});
+        std.process.exit(1);
+    }
 
     const sqlite = b.addStaticLibrary(.{
         .name = "sqlite3",
@@ -33,11 +66,13 @@ pub fn build(b: *std.Build) void {
     });
     sqlite.root_module.addCSourceFile(.{
         .file = b.path("vendor/sqlite/sqlite3.c"),
-        .flags = &.{"-DSQLITE_OMIT_LOAD_EXTENSION=1"},
+        .flags = if (diag) &.{ "-DSQLITE_OMIT_LOAD_EXTENSION=1", "-DSQLITE_ENABLE_DBSTAT_VTAB=1", "-Dfsync=f2z_diag_fsync" } else &.{ "-DSQLITE_OMIT_LOAD_EXTENSION=1", "-DSQLITE_ENABLE_DBSTAT_VTAB=1" },
     });
 
     const build_options = b.addOptions();
-    build_options.addOption([]const u8, "version", fail2zig_version);
+    build_options.addOption([]const u8, "version", if (diag) fail2zig_version ++ "+diag" else fail2zig_version);
+    build_options.addOption(bool, "diag", diag);
+    build_options.addOption(bool, "tracy", tracy);
     const enable_bench = b.option(
         bool,
         "bench",
@@ -75,6 +110,19 @@ pub fn build(b: *std.Build) void {
     engine_mod.addImport("build_options", build_options_mod);
     engine_mod.addImport("cli", client_mod);
     engine_mod.linkLibrary(sqlite);
+    if (tracy) if (b.lazyDependency("tracy", .{})) |tracy_dep| {
+        const tracy_client = b.addStaticLibrary(.{
+            .name = "tracy",
+            .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true }),
+        });
+        tracy_client.root_module.addCSourceFile(.{
+            .file = tracy_dep.path("public/TracyClient.cpp"),
+            // Zig's C UBSan trap fires (ud1) in Tracy's queue dequeue switch, TracyProfiler.cpp:2569, and freezes the daemon.
+            .flags = &.{ "-fno-sanitize=undefined", "-DTRACY_ENABLE", "-DTRACY_TIMER_FALLBACK", "-DTRACY_NO_BROADCAST", "-DTRACY_ONLY_LOCALHOST", "-DTRACY_DELAYED_INIT", "-DTRACY_MANUAL_LIFETIME" },
+        });
+        engine_mod.link_libcpp = true;
+        engine_mod.linkLibrary(tracy_client);
+    };
 
     const engine_exe = b.addExecutable(.{
         .name = "fail2zig",
@@ -94,6 +142,13 @@ pub fn build(b: *std.Build) void {
     });
     const install_release_lifecycle = b.addInstallArtifact(release_lifecycle_exe, .{});
     b.step("test-release-lifecycle", "Build the test-only privileged release lifecycle helper").dependOn(&install_release_lifecycle.step);
+
+    const no_diag = b.allocator.create(NoDiagCheck) catch @panic("OOM");
+    no_diag.* = .{
+        .step = std.Build.Step.init(.{ .id = .custom, .name = "check-no-diag", .owner = b, .makeFn = NoDiagCheck.make }),
+        .binary = b.option([]const u8, "check-binary", "Executable for check-no-diag (default: the installed fail2zig)") orelse b.getInstallPath(.bin, "fail2zig"),
+    };
+    b.step("check-no-diag", "Fail if an executable carries diagnostic build markers").dependOn(&no_diag.step);
 
     const run_engine = b.addRunArtifact(engine_exe);
     run_engine.step.dependOn(b.getInstallStep());

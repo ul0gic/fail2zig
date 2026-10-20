@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
+const build_options = @import("build_options");
+const diag_mod = @import("../core/diag.zig");
 const files = @import("../core/durable_file_source.zig");
 const store = @import("store.zig");
 const Error = store.Error;
@@ -104,6 +106,7 @@ pub fn Methods(comptime Store: type) type {
                 if (self.api.changes(self.db) != 1) return error.StaleCheckpoint;
             }
             try self.commitTransaction();
+            if (comptime build_options.diag) diag_mod.event(.continuity_loss, .{ .subject = event.jail, .cause = @tagName(event.reason), .value = event.committed_offset });
             return sequence;
         }
 

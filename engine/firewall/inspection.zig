@@ -3,6 +3,8 @@
 
 const std = @import("std");
 const shared = @import("shared");
+const build_options = @import("build_options");
+const diag_mod = @import("../core/diag.zig");
 const nl = @import("netlink.zig");
 const nft = @import("nftables.zig");
 const command = @import("command.zig");
@@ -25,6 +27,13 @@ pub const FailureContext = struct {
 const MutationProgress = struct { requested: bool = false };
 pub const max_withdraw_messages: usize = 64;
 const withdraw_batch_bytes: usize = 8192;
+pub const max_install_messages: usize = 1024;
+const install_batch_bytes: usize = 512 * 1024;
+
+pub fn batchable(scope: CanonicalScope) bool {
+    return hostScope(scope);
+}
+pub const InstallOutcome = struct { result: EffectResult, consumed: usize };
 
 pub fn validateCanonicalScope(_: Transport, scope: CanonicalScope) Error!void {
     scope.validate() catch return error.UnsupportedScope;
@@ -287,6 +296,7 @@ pub const Inspector = struct {
     retained_bytes: usize = 0,
     live_bytes: usize = 0,
     dump_interruptions: u64 = 0,
+    clock_rate: if (build_options.diag) u32 else void = if (build_options.diag) 1 else {},
     test_fault_after_mutations: if (@import("builtin").is_test) ?usize else void = if (@import("builtin").is_test) null else {},
     test_fault_readback: if (@import("builtin").is_test) ?Error else void = if (@import("builtin").is_test) null else {},
     test_between_reads: if (@import("builtin").is_test) ?*const fn (*Inspector) void else void = if (@import("builtin").is_test) null else {},
@@ -372,8 +382,8 @@ pub const Inspector = struct {
         var snapshot = try self.inspect();
         errdefer snapshot.deinit();
         if (snapshot.state != .owned) return error.InvalidInstallation;
-        const end = try clockAt(clock, &elapsed);
-        return .{ .snapshot = snapshot, .matches_desired = effectMatches(token.operation, self.installation.transport, try findEntry(snapshot.entries, token.scope, token.effect_id), clock.wall_us, end), .observed_wall_us = end };
+        const end = try self.clockAt(clock, &elapsed);
+        return .{ .snapshot = snapshot, .matches_desired = self.kernelMatches(token.operation, try findEntry(snapshot.entries, token.scope, token.effect_id), clock.wall_us, end), .observed_wall_us = end };
     }
 
     pub fn matchesSnapshot(self: *const Inspector, snapshot: *const Snapshot, token: DispatchToken, wall_start_us: i64, wall_end_us: i64) Error!bool {
@@ -382,24 +392,24 @@ pub const Inspector = struct {
         if (!mem.eql(u8, &snapshot.installation.id, &self.installation.id) or snapshot.installation.transport != self.installation.transport or snapshot.state != .owned) return error.InvalidInstallation;
         if (wall_start_us < 0 or wall_end_us < wall_start_us) return error.UnsupportedDeadline;
         const wall_duration: u64 = @intCast(wall_end_us - wall_start_us);
-        if (wall_duration > self.limits.timeout_ms * 1000 or snapshot.observed_end_ns < snapshot.observed_start_ns or
+        if (wall_duration > self.fromKernelUs(self.limits.timeout_ms * 1000) or snapshot.observed_end_ns < snapshot.observed_start_ns or
             snapshot.observed_end_ns > self.limits.timeout_ms * std.time.ns_per_ms) return error.Incomplete;
         if (wall_duration < (snapshot.observed_end_ns - snapshot.observed_start_ns) / std.time.ns_per_us) return error.Incomplete;
         if (snapshot.entries.len > self.limits.max_entries or snapshot.entries.len > self.limits.max_bytes / @sizeOf(Entry)) return error.LimitExceeded;
-        return effectMatches(token.operation, self.installation.transport, try findEntry(snapshot.entries, token.scope, token.effect_id), wall_start_us, wall_end_us);
+        return self.kernelMatches(token.operation, try findEntry(snapshot.entries, token.scope, token.effect_id), wall_start_us, wall_end_us);
     }
 
     pub fn applyExact(self: *Inspector, token: DispatchToken, clock: ClockSample) Error!EffectResult {
         try (DurableInstallationIntent{ .installation = token.installation, .intent_id = token.effect_id, .revision = token.aggregate_revision }).validate(self.installation);
         try validateRealizedScope(self.installation.transport, token.scope);
-        _ = try deadlineUnits(token.operation, timingTransport(self.installation.transport, token.scope), clock.wall_us);
+        _ = try self.kernelUnits(token.operation, timingTransport(self.installation.transport, token.scope), clock.wall_us);
         var elapsed = std.time.Timer.start() catch return error.SystemError;
         var baseline = try self.inspect();
         defer baseline.deinit();
         const held = self.retained_bytes;
         self.retained_bytes = held + baseline.entries.len * @sizeOf(Entry);
         defer self.retained_bytes = held;
-        var result = try self.applyFromBaseline(token, .{ .wall_us = try clockAt(clock, &elapsed) }, &baseline);
+        var result = try self.applyFromBaseline(token, .{ .wall_us = try self.clockAt(clock, &elapsed) }, &baseline);
         if (result == .verified and !result.verified.changed) result.verified.observed_start_wall_us = clock.wall_us;
         return result;
     }
@@ -408,7 +418,7 @@ pub const Inspector = struct {
         try (DurableInstallationIntent{ .installation = token.installation, .intent_id = token.effect_id, .revision = token.aggregate_revision }).validate(self.installation);
         const transport = self.installation.transport;
         try validateRealizedScope(transport, token.scope);
-        _ = try deadlineUnits(token.operation, timingTransport(transport, token.scope), clock.wall_us);
+        _ = try self.kernelUnits(token.operation, timingTransport(transport, token.scope), clock.wall_us);
         if (!mem.eql(u8, &baseline.installation.id, &self.installation.id) or baseline.installation.transport != transport or baseline.state != .owned) return error.InvalidInstallation;
         var elapsed = std.time.Timer.start() catch return error.SystemError;
         const existing = try findEntry(baseline.entries, token.scope, token.effect_id);
@@ -423,19 +433,19 @@ pub const Inspector = struct {
                 (transport == .iptables or (lease == .permanent and entry.remaining_ms == null)) else false,
         };
         if (noop) {
-            const end = try clockAt(clock, &elapsed);
-            _ = try deadlineUnits(token.operation, timingTransport(transport, token.scope), end);
+            const end = try self.clockAt(clock, &elapsed);
+            _ = try self.kernelUnits(token.operation, timingTransport(transport, token.scope), end);
             return .{ .verified = .{ .snapshot = try copySnapshot(self.allocator, baseline), .changed = false, .observed_start_wall_us = clock.wall_us, .observed_wall_us = end } };
         }
-        const units = try deadlineUnits(token.operation, timingTransport(transport, token.scope), try clockAt(clock, &elapsed));
+        const units = try self.kernelUnits(token.operation, timingTransport(transport, token.scope), try self.clockAt(clock, &elapsed));
         var phase = std.time.Timer.start() catch return error.SystemError;
         self.work_messages = 0;
         self.live_bytes = 0;
         var progress = MutationProgress{};
         self.mutateExact(token, existing, units, &phase, &progress) catch |err| return .{ .uncertain = self.failure(.effect_dispatch, err, progress) };
-        const observation_start = clockAt(clock, &elapsed) catch |err| return .{ .uncertain = self.failure(.effect_verify, err, progress) };
+        const observation_start = self.clockAt(clock, &elapsed) catch |err| return .{ .uncertain = self.failure(.effect_verify, err, progress) };
         var after = self.inspect() catch |err| return .{ .uncertain = self.failure(.effect_verify, err, progress) };
-        const observation_end = clockAt(clock, &elapsed) catch |err| {
+        const observation_end = self.clockAt(clock, &elapsed) catch |err| {
             after.deinit();
             return .{ .uncertain = self.failure(.effect_verify, err, progress) };
         };
@@ -443,7 +453,7 @@ pub const Inspector = struct {
             after.deinit();
             return .{ .uncertain = self.failure(.effect_verify, err, progress) };
         };
-        if (after.state != .owned or !effectMatches(token.operation, transport, after_entry, observation_start, observation_end)) {
+        if (after.state != .owned or !self.kernelMatches(token.operation, after_entry, observation_start, observation_end)) {
             after.deinit();
             return .{ .uncertain = self.failure(.effect_verify, error.Changed, progress) };
         }
@@ -456,7 +466,7 @@ pub const Inspector = struct {
             try (DurableInstallationIntent{ .installation = token.installation, .intent_id = token.effect_id, .revision = token.aggregate_revision }).validate(self.installation);
             try validateRealizedScope(transport, token.scope);
             if (token.operation != .ensure_absent) return error.UnsupportedScope;
-            _ = try deadlineUnits(token.operation, timingTransport(transport, token.scope), clock.wall_us);
+            _ = try self.kernelUnits(token.operation, timingTransport(transport, token.scope), clock.wall_us);
         }
         if (!mem.eql(u8, &baseline.installation.id, &self.installation.id) or baseline.installation.transport != transport or baseline.state != .owned) return error.InvalidInstallation;
         var elapsed = std.time.Timer.start() catch return error.SystemError;
@@ -465,9 +475,9 @@ pub const Inspector = struct {
         self.live_bytes = 0;
         var progress = MutationProgress{};
         self.withdrawEntries(tokens, baseline, &phase, &progress) catch |err| return .{ .uncertain = self.failure(.effect_dispatch, err, progress) };
-        const observation_start = clockAt(clock, &elapsed) catch |err| return .{ .uncertain = self.failure(.effect_verify, err, progress) };
+        const observation_start = self.clockAt(clock, &elapsed) catch |err| return .{ .uncertain = self.failure(.effect_verify, err, progress) };
         var after = self.inspect() catch |err| return .{ .uncertain = self.failure(.effect_verify, err, progress) };
-        const observation_end = clockAt(clock, &elapsed) catch |err| {
+        const observation_end = self.clockAt(clock, &elapsed) catch |err| {
             after.deinit();
             return .{ .uncertain = self.failure(.effect_verify, err, progress) };
         };
@@ -562,6 +572,89 @@ pub const Inspector = struct {
         nl.sendKernel(&sock, bytes, send_timeout) catch |err| return netlinkError(err);
         nl.receiveAcknowledgments(&sock, related[1..count], related[0 .. count + 1], @min(try self.remainingMs(timer), 2000)) catch |err| return rejectedBatch(err, progress);
         try self.afterMutation(1);
+    }
+    pub fn installBatch(self: *Inspector, tokens: []const DispatchToken, clock: ClockSample, baseline: *const Snapshot) Error!InstallOutcome {
+        const transport = self.installation.transport;
+        if (transport != .nftables) return error.UnsupportedScope;
+        if (tokens.len == 0 or tokens.len > max_install_messages) return error.LimitExceeded;
+        for (tokens) |token| {
+            try (DurableInstallationIntent{ .installation = token.installation, .intent_id = token.effect_id, .revision = token.aggregate_revision }).validate(self.installation);
+            try validateRealizedScope(transport, token.scope);
+            if (token.operation != .ensure_present) return error.UnsupportedScope;
+            _ = try legacyAddress(token.scope);
+            _ = try self.kernelUnits(token.operation, timingTransport(transport, token.scope), clock.wall_us);
+        }
+        if (!mem.eql(u8, &baseline.installation.id, &self.installation.id) or baseline.installation.transport != transport or baseline.state != .owned) return error.InvalidInstallation;
+        var elapsed = std.time.Timer.start() catch return error.SystemError;
+        var phase = std.time.Timer.start() catch return error.SystemError;
+        self.work_messages = 0;
+        self.live_bytes = 0;
+        var progress = MutationProgress{};
+        const consumed = self.installNft(tokens, clock, baseline, &elapsed, &phase, &progress) catch |err| return .{ .result = .{ .uncertain = self.failure(.effect_dispatch, err, progress) }, .consumed = tokens.len };
+        const observation_start = self.clockAt(clock, &elapsed) catch |err| return .{ .result = .{ .uncertain = self.failure(.effect_verify, err, progress) }, .consumed = consumed };
+        var after = self.inspect() catch |err| return .{ .result = .{ .uncertain = self.failure(.effect_verify, err, progress) }, .consumed = consumed };
+        errdefer after.deinit();
+        const observation_end = self.clockAt(clock, &elapsed) catch |err| return .{ .result = .{ .uncertain = self.failure(.effect_verify, err, progress) }, .consumed = consumed };
+        if (after.state != .owned) return .{ .result = .{ .uncertain = self.failure(.effect_verify, error.Changed, progress) }, .consumed = consumed };
+        for (tokens[0..consumed]) |token| {
+            const entry = findEntry(after.entries, token.scope, token.effect_id) catch |err| return .{ .result = .{ .uncertain = self.failure(.effect_verify, err, progress) }, .consumed = consumed };
+            if (!self.kernelMatches(token.operation, entry, observation_start, observation_end)) return .{ .result = .{ .uncertain = self.failure(.effect_verify, error.Changed, progress) }, .consumed = consumed };
+        }
+        return .{ .result = .{ .verified = .{ .snapshot = after, .changed = true, .observed_start_wall_us = observation_start, .observed_wall_us = observation_end } }, .consumed = consumed };
+    }
+    // Every element carries a timeout, so a present element is always replaced: delete then add, as the single path does.
+    fn installNft(self: *Inspector, tokens: []const DispatchToken, clock: ClockSample, baseline: *const Snapshot, elapsed: *std.time.Timer, timer: *std.time.Timer, progress: *MutationProgress) Error!usize {
+        var name_buf: [28]u8 = undefined;
+        const name = self.installation.name(&name_buf);
+        var sock = nl.NetlinkSocket.init(linux.NETLINK.NETFILTER) catch |err| return netlinkError(err);
+        defer sock.close();
+        sock.setSendBuffer(install_batch_bytes * 2) catch |err| return netlinkError(err);
+        const batch_bytes = self.allocator.alignedAlloc(u8, 4, install_batch_bytes) catch return error.OutOfMemory;
+        defer self.allocator.free(batch_bytes);
+        const related = self.allocator.alloc(u32, 2 * max_install_messages + 2) catch return error.OutOfMemory;
+        defer self.allocator.free(related);
+        var payload_buf: [512]u8 align(4) = undefined;
+        var batch = nl.Batch.init(batch_bytes);
+        related[0] = sock.nextSeq();
+        batch.begin(related[0], sock.port_id, nl.NFNL.SUBSYS_NFTABLES) catch |err| return netlinkError(err);
+        const now = try self.clockAt(clock, elapsed);
+        var count: usize = 1;
+        var consumed: usize = 0;
+        var last_header: usize = 0;
+        for (tokens) |token| {
+            const address = try legacyAddress(token.scope);
+            const existed = (try findEntry(baseline.entries, token.scope, token.effect_id)) != null;
+            const units = try self.kernelUnits(token.operation, timingTransport(.nftables, token.scope), now);
+            var key_buf: [16]u8 = undefined;
+            const key = nftSetKey(address, &key_buf);
+            const set = if (address == .ipv4) "banned_ipv4" else "banned_ipv6";
+            const messages: usize = if (existed) 2 else 1;
+            if (batch.builder.offset + messages * payload_buf.len > batch_bytes.len) break;
+            if (existed) {
+                const payload = nft.buildSetElemDelPayload(&payload_buf, nl.NFPROTO.INET, name, set, key) catch |err| return netlinkError(err);
+                related[count] = sock.nextSeq();
+                batch.add(nl.nfnlMsgType(nl.NFNL.SUBSYS_NFTABLES, nft.NFT_MSG.DELSETELEM), linux.NLM_F_REQUEST, related[count], sock.port_id, payload) catch |err| return netlinkError(err);
+                count += 1;
+            }
+            const payload = nft.buildSetElemAddPayload(&payload_buf, nl.NFPROTO.INET, name, set, key, units) catch |err| return netlinkError(err);
+            related[count] = sock.nextSeq();
+            last_header = batch.builder.offset;
+            batch.add(nl.nfnlMsgType(nl.NFNL.SUBSYS_NFTABLES, nft.NFT_MSG.NEWSETELEM), linux.NLM_F_REQUEST | linux.NLM_F_CREATE | linux.NLM_F_EXCL, related[count], sock.port_id, payload) catch |err| return netlinkError(err);
+            count += 1;
+            consumed += 1;
+        }
+        if (consumed == 0) return error.LimitExceeded;
+        // Only the last message asks for an ack: the kernel reports failed messages in order regardless, so that one ack proves the batch committed.
+        const last: *linux.nlmsghdr = @alignCast(@ptrCast(&batch_bytes[last_header]));
+        last.flags |= linux.NLM_F_ACK;
+        related[count] = sock.nextSeq();
+        const bytes = batch.commit(related[count], sock.port_id, nl.NFNL.SUBSYS_NFTABLES) catch |err| return netlinkError(err);
+        const send_timeout = @min(try self.remainingMs(timer), 2000);
+        progress.requested = true;
+        nl.sendKernel(&sock, bytes, send_timeout) catch |err| return netlinkError(err);
+        nl.receiveAcknowledgments(&sock, related[count - 1 .. count], related[0 .. count + 1], @min(try self.remainingMs(timer), 2000)) catch |err| return rejectedBatch(err, progress);
+        try self.afterMutation(1);
+        return consumed;
     }
     fn failure(self: *const Inspector, stage: OperationStage, cause: Error, progress: MutationProgress) FailureContext {
         return .{
@@ -812,7 +905,42 @@ pub const Inspector = struct {
         nl.receiveAcknowledgments(&sock, related[1..7], &related, @min(try self.remainingMs(timer), 2000)) catch |err| return netlinkError(err);
     }
 
+    fn clockAt(self: *const Inspector, clock: ClockSample, timer: *std.time.Timer) Error!i64 {
+        const elapsed = std.math.cast(i64, self.fromKernelUs(timer.read() / std.time.ns_per_us)) orelse return error.UnsupportedDeadline;
+        return std.math.add(i64, clock.wall_us, elapsed) catch error.UnsupportedDeadline;
+    }
+    fn kernelUnits(self: *const Inspector, operation: EffectOperation, transport: Transport, now_us: i64) Error!u64 {
+        return deadlineUnits(self.kernelOperation(operation, now_us), transport, now_us);
+    }
+    fn kernelMatches(self: *const Inspector, operation: EffectOperation, entry: ?Entry, start_us: i64, end_us: i64) bool {
+        const transport = self.installation.transport;
+        if (comptime build_options.diag) if (entry) |present| if (present.scope == null and end_us >= start_us) {
+            const kernel_end = start_us + @as(i64, @intCast(self.toKernelUs(@intCast(end_us - start_us))));
+            return effectMatches(self.kernelOperation(operation, start_us), transport, entry, start_us, kernel_end);
+        };
+        return effectMatches(operation, transport, entry, start_us, end_us);
+    }
+    // Kernel timeouts count real time: a virtual span from `anchor_us` becomes the real span that ends at the same instant.
+    fn kernelOperation(self: *const Inspector, operation: EffectOperation, anchor_us: i64) EffectOperation {
+        if (comptime !build_options.diag) return operation;
+        if (operation != .ensure_present or operation.ensure_present == .permanent) return operation;
+        const deadline = operation.ensure_present.finite_deadline_us;
+        if (deadline <= anchor_us) return operation;
+        return .{ .ensure_present = .{ .finite_deadline_us = anchor_us + @as(i64, @intCast(self.toKernelUs(@intCast(deadline - anchor_us)))) } };
+    }
+    fn toKernelUs(self: *const Inspector, virtual_us: u64) u64 {
+        if (comptime !build_options.diag) return virtual_us;
+        if (self.clock_rate <= 1) return virtual_us;
+        return virtual_us / self.clock_rate + @intFromBool(virtual_us % self.clock_rate != 0);
+    }
+    fn fromKernelUs(self: *const Inspector, kernel_us: u64) u64 {
+        if (comptime !build_options.diag) return kernel_us;
+        return if (self.clock_rate <= 1) kernel_us else kernel_us *| self.clock_rate;
+    }
+
     pub fn inspect(self: *Inspector) Error!Snapshot {
+        const diag_span = if (comptime build_options.diag) diag_mod.enter(.dump) else {};
+        defer if (comptime build_options.diag) diag_mod.leave(diag_span);
         if (comptime @import("builtin").is_test) {
             self.test_inspections += 1;
             if (self.test_fault_readback) |fault| return fault;
@@ -938,10 +1066,6 @@ fn scanSavedTables(output: []const u8) Error!void {
     if (in_table) return error.Incomplete;
 }
 
-fn clockAt(clock: ClockSample, timer: *std.time.Timer) Error!i64 {
-    const elapsed = std.math.cast(i64, timer.read() / std.time.ns_per_us) orelse return error.UnsupportedDeadline;
-    return std.math.add(i64, clock.wall_us, elapsed) catch error.UnsupportedDeadline;
-}
 fn deadlineUnits(operation: EffectOperation, transport: Transport, now_us: i64) Error!u64 {
     if (now_us < 0) return error.UnsupportedDeadline;
     if (operation != .ensure_present or operation.ensure_present == .permanent) return 0;
@@ -962,14 +1086,62 @@ fn timingTransport(transport: Transport, scope: CanonicalScope) Transport {
 fn entryScope(entry: Entry) CanonicalScope {
     return entry.scope orelse .{ .subject = canonical_scope.Subject.host(entry.address) };
 }
+// Orders scopes exactly as `canonical_scope.Scope.encode` bytes compare, without validating or encoding;
+// bytes 0..32 of that encoding are this header and the port ranges follow it.
+fn scopeHeader(scope: CanonicalScope) [32]u8 {
+    var bytes = [_]u8{0} ** 32;
+    bytes[0] = canonical_scope.encoded_version;
+    bytes[1] = @intFromEnum(scope.subject.family);
+    bytes[2] = @intFromEnum(scope.subject.kind);
+    bytes[3] = scope.subject.prefix;
+    bytes[4] = scope.protocols.mask;
+    bytes[5] = scope.ports.len;
+    bytes[6] = scope.ports.endpoint_units;
+    bytes[7] = @intFromEnum(scope.topology.match);
+    bytes[8] = @intFromEnum(scope.topology.hook);
+    bytes[9] = @intFromEnum(scope.topology.plane);
+    bytes[10] = @intFromEnum(scope.topology.path);
+    bytes[11] = @intFromEnum(scope.topology.interface);
+    bytes[12] = @intFromEnum(scope.topology.attachment);
+    bytes[13] = @intFromEnum(scope.verdict);
+    bytes[14] = @intFromEnum(scope.target);
+    @memcpy(bytes[16..32], &scope.subject.address);
+    return bytes;
+}
+fn scopeOrder(a: CanonicalScope, b: CanonicalScope) std.math.Order {
+    const header = mem.order(u8, &scopeHeader(a), &scopeHeader(b));
+    if (header != .eq) return header;
+    for (a.ports.slice(), b.ports.slice()) |left, right| {
+        if (left.first != right.first) return std.math.order(left.first, right.first);
+        if (left.last != right.last) return std.math.order(left.last, right.last);
+    }
+    return .eq;
+}
+fn hostOrder(a: shared.IpAddress, b: shared.IpAddress) std.math.Order {
+    return switch (a) {
+        .ipv4 => |left| switch (b) {
+            .ipv4 => |right| std.math.order(left, right),
+            .ipv6 => .lt,
+        },
+        .ipv6 => |left| switch (b) {
+            .ipv4 => .gt,
+            .ipv6 => |right| std.math.order(left, right),
+        },
+    };
+}
+fn entryOrder(entry: Entry, scope: CanonicalScope, host: ?shared.IpAddress) std.math.Order {
+    if (entry.scope == null) if (host) |address| return hostOrder(entry.address, address);
+    return scopeOrder(entryScope(entry), scope);
+}
 fn entryIndex(entries: []const Entry, scope: CanonicalScope) Error!?usize {
-    const key = scope.encode() catch return null;
+    _ = scope.encode() catch return null;
+    const address = subjectAddress(scope.subject);
+    const host: ?shared.IpAddress = if (std.meta.eql(scope, CanonicalScope{ .subject = canonical_scope.Subject.host(address) })) address else null;
     var low: usize = 0;
     var high = entries.len;
     while (low < high) {
         const middle = low + (high - low) / 2;
-        const probe = entryScope(entries[middle]).encode() catch return error.UnknownState;
-        switch (mem.order(u8, &probe, &key)) {
+        switch (entryOrder(entries[middle], scope, host)) {
             .lt => low = middle + 1,
             .gt => high = middle,
             .eq => return if (std.meta.eql(entryScope(entries[middle]), scope)) middle else null,
@@ -1019,8 +1191,10 @@ fn expiredWithin(entry: Entry, window_ns: u64, transport: Transport) bool {
     return remaining_us <= window_ns / std.time.ns_per_us +| 1 +| timeoutToleranceUs(transport);
 }
 // ipset reports whole seconds and nftables reports milliseconds at jiffy granularity.
+// Kernel timeouts are set from the daemon's clock a few ms before the kernel stamps them and are rounded to jiffies (up to 20 ms at HZ=100); a second covers both without admitting a foreign deadline.
 fn timeoutToleranceUs(transport: Transport) u64 {
-    return if (transport == .ipset) 1_000_000 else 10_000;
+    _ = transport;
+    return 1_000_000;
 }
 fn effectMatches(operation: EffectOperation, transport: Transport, entry: ?Entry, start_us: i64, end_us: i64) bool {
     if (operation == .ensure_absent) return entry == null;
@@ -1080,7 +1254,8 @@ const Builder = struct {
     fn finish(self: *Builder, start: u64, end: u64) Error!Snapshot {
         mem.sort(Entry, self.entries.items, {}, entryLess);
         for (self.entries.items, 0..) |e, index| {
-            if (index > 0 and !entryLess({}, self.entries.items[index - 1], e)) return error.UnknownState;
+            // nftables walks a hash set while the kernel may still be resizing it after a burst of inserts, and such a walk can yield a set element twice; that is an unstable read to repeat, not a foreign state.
+            if (index > 0 and !entryLess({}, self.entries.items[index - 1], e)) return if (e.scope == null and self.entries.items[index - 1].scope == null) error.DumpInterrupted else error.UnknownState;
             const scope_bytes = entryScope(e).encode() catch return error.UnknownState;
             self.topology.update(&scope_bytes);
             self.topology.update(&.{ @intFromBool(e.remaining_ms != null), @intFromBool(e.deadline_us != null), @intFromBool(e.effect_id != null), @intFromBool(e.partial) });
@@ -1094,9 +1269,8 @@ const Builder = struct {
     }
 };
 fn entryLess(_: void, a: Entry, b: Entry) bool {
-    const left = entryScope(a).encode() catch return false;
-    const right = entryScope(b).encode() catch return false;
-    return mem.order(u8, &left, &right) == .lt;
+    if (a.scope == null and b.scope == null) return hostOrder(a.address, b.address) == .lt;
+    return scopeOrder(entryScope(a), entryScope(b)) == .lt;
 }
 
 const Tokens = struct {
@@ -1571,6 +1745,7 @@ fn dump(self: *Inspector, sock: *nl.NetlinkSocket, request_type: u16, response_t
         var messages = nl.StrictMessages{ .bytes = bytes };
         while (messages.next() catch |err| return netlinkError(err)) |item| {
             try self.chargeMessages(1);
+            if (comptime build_options.diag) diag_mod.count(.dump_messages, 1);
             if (state.accept(item) catch |err| return netlinkError(err)) |payload| {
                 const cost = std.math.add(usize, payload.len, 2 * @sizeOf([]u8)) catch return error.LimitExceeded;
                 const used = std.math.add(usize, records.bytes, reserved + self.retained_bytes) catch return error.LimitExceeded;
@@ -1761,6 +1936,7 @@ fn readNft(self: *Inspector, builder: *Builder, timer: *std.time.Timer) Error!vo
                     if (try e.number(u64, 4) != 0) remaining = try e.number(u64, 5);
                 } else if (e.values[5] != null) return error.UnknownState;
                 const address: shared.IpAddress = if (index == 0) .{ .ipv4 = mem.readInt(u32, bytes[0..4], .big) } else .{ .ipv6 = mem.readInt(u128, bytes[0..16], .big) };
+                if (comptime build_options.diag) diag_mod.count(.dump_elements, 1);
                 try builder.add(.{ .address = address, .remaining_ms = remaining });
             }
         }

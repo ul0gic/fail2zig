@@ -30,6 +30,14 @@ fail2zig \- intrusion prevention daemon and its administration commands
 \fB\-\-acknowledge\-truncation\fR
 [\fB\-\-config\fR \fIpath\fR]
 .br
+.B fail2zig support-bundle
+[\fB\-\-out\fR \fIpath\fR|\fB\-\fR]
+[\fB\-\-config\fR \fIpath\fR]
+[\fB\-\-socket\fR \fIpath\fR]
+[\fB\-\-log\-lines\fR \fIn\fR]
+[\fB\-\-timeout\fR \fIms\fR]
+[\fB\-\-include\-addresses\fR]
+.br
 .B fail2zig
 \fB\-\-version\fR | \fB\-\-help\fR
 .
@@ -165,6 +173,16 @@ to include identifiers and additional counters; failures remain visible without 
 History counts retained confirmed effect events; maintenance can remove these rows,
 so this is not a lifetime ban count. The machine-readable key remains
 .BR total_bans .
+.B memory_admission_bytes
+is the memory the daemon planned and admitted at start against
+.BR native_memory_ceiling_mb ;
+it is fixed for the life of the process and is not the resident size.
+Plain output prints it after
+.BR paused_sources ,
+and
+.B --details
+shows it as
+.BR "Memory plan:" .
 .RS
 .PP
 Paused sources. A file source that cannot resume (truncated in place below its
@@ -714,6 +732,69 @@ be recovered (for a removed rotated file or a replaced log, the records after th
 committed offset of the file that is gone), and lines still in the file are read again. Stopping the daemon for the
 repair withdraws its firewall rules for every jail until the next start reinstalls
 them from durable state. Exit 0 on success or replay, 1 on refusal, 2 on usage errors.
+.
+.SH SUPPORT-BUNDLE
+.B support-bundle
+writes one JSON file to attach to a bug report. Run it as the daemon's user:
+it reads the configuration, opens the state file read-only and asks the daemon over
+its socket. A section it cannot collect records
+.B {\(dqerror\(dq: ...}
+and the bundle is still written, so it also works while the daemon is stopped.
+.PP
+Contents: the client version, target and build mode; the daemon version,
+.BR status ,
+.B jails
+and
+.B stats
+payloads; every retained continuity loss event; the effective configuration from the
+daemon, the SHA-256 of the configuration file and the digest, generation and commit time
+the daemon last loaded, with whether they match; the state schema, page size, page count,
+freelist pages, and each table's row count and bytes (indexes counted with their table);
+the kernel firewall observation without its elements, and the sampled element count per
+address family; the configured memory and descriptor ceilings with the daemon process's
+.BR VmRSS ,
+.BR VmHWM ,
+.B VmSize
+and thread count; the kernel release, machine, CPU count, total and available memory and
+.BR "nft \-\-version" ;
+and the last
+.I n
+warning and error lines of the daemon log (default 200, at most 2000; 0 skips it). The log
+is the
+.B log_target
+file, or the
+.B fail2zig.service
+journal at priority warning and above when
+.B log_target
+is
+.BR stderr .
+.PP
+Redaction applies to every string in the bundle. Each IPv4 or IPv6 address, with an
+optional
+.BI / prefix
+or IPv4
+.BI : port
+suffix, becomes
+.BI v4\- hash
+or
+.BI v6\- hash
+(the first 48 bits of an HMAC-SHA-256 under a key drawn for this bundle and never
+written), so one address keeps one label inside a bundle and cannot be matched across bundles. Loopback and
+unspecified addresses are kept.
+.B \-\-include\-addresses
+keeps every address. Any path other than a configured
+.B logpath
+or one of its expansions becomes
+.BR <path> .
+The bundle carries no ban list.
+.PP
+The default output is
+.IR ./fail2zig\-support\-YYYYMMDDTHHMMSSZ.json ,
+created mode 0600 and never overwritten; the path is printed on stdout.
+.B \-\-out \-
+writes the bundle to stdout. Each incomplete section is named on stderr. Exit 0 when
+every section was collected, 4 when the bundle was written with sections that record an
+error, 1 when nothing was written, 2 on usage errors.
 .
 .SH EXIT STATUS
 Every command returns one of the frozen classes.

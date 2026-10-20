@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# One isolated check on a named scenario, with its evidence kept under .project/diag-runs/. See README.md.
+set -uo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$HERE/../../.." && pwd)
+ENV_FILE="$ROOT/.devops/.env"
+PVE="$ROOT/.devops/proxmox/pve.py"
+TARGET=ul0gic@172.16.150.253
+SSH_OPTS=(-i "$HOME/.ssh/id_ed25519_p33ker" -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -o BatchMode=yes -o ConnectTimeout=10)
+
+usage() {
+  cat >&2 <<'EOF'
+usage: diag-run --scenario NAME --binary PATH --sha256 HEX --check NAME [--minutes N] [--mode upgrade|candidate]
+                [--rig] [--nlmon] [--label TEXT] [--out DIR]
+EOF
+  exit 2
+}
+
+SCENARIO=""; BINARY=""; SHA=""; CHECK=""; MINUTES=5; MODE=candidate; RIG=0; NLMON=0; LABEL=""; RUN=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --scenario) SCENARIO="${2:-}"; shift 2 ;;
+    --binary) BINARY="${2:-}"; shift 2 ;;
+    --sha256) SHA="${2:-}"; shift 2 ;;
+    --check) CHECK="${2:-}"; shift 2 ;;
+    --minutes) MINUTES="${2:-}"; shift 2 ;;
+    --mode) MODE="${2:-}"; shift 2 ;;
+    --rig) RIG=1; shift ;;
+    --nlmon) NLMON=1; shift ;;
+    --label) LABEL="${2:-}"; shift 2 ;;
+    --out) RUN="${2:-}"; shift 2 ;;
+    *) usage ;;
+  esac
+done
+[ -n "$SCENARIO" ] && [ -n "$BINARY" ] && [ -n "$CHECK" ] || usage
+[[ "$SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "diag-run: --sha256 must be 64 lowercase hex digits" >&2; exit 2; }
+[[ "$MINUTES" =~ ^[0-9]+$ ]] && [ "$MINUTES" -ge 1 ] && [ "$MINUTES" -le 10 ] || { echo "diag-run: --minutes is 1..10" >&2; exit 2; }
+[[ "$CHECK" =~ ^[a-z0-9-]+$ ]] && [ -x "$HERE/checks/$CHECK" ] || { echo "diag-run: no check $HERE/checks/$CHECK" >&2; exit 2; }
+[[ "$MODE" =~ ^(upgrade|candidate)$ ]] || usage
+[[ "$LABEL" =~ ^[a-z0-9-]*$ ]] || { echo "diag-run: --label is lowercase letters, digits and hyphens" >&2; exit 2; }
+if [ "$RIG" = 1 ]; then
+  [ "$SCENARIO" = empty ] || [ -d "$SCENARIO" ] || { echo "diag-run: a rig scenario is 'empty' or a directory holding fail2zig.sqlite" >&2; exit 2; }
+else
+  [[ "$SCENARIO" =~ ^[a-z][a-z0-9_-]*$ ]] || { echo "diag-run: target scenario names are Proxmox snapshot names" >&2; exit 2; }
+fi
+BINARY=$(realpath "$BINARY")
+actual=$(sha256sum "$BINARY" | cut -d' ' -f1)
+[ "$actual" = "$SHA" ] || { echo "diag-run: SHA-256 mismatch: $BINARY is $actual" >&2; exit 2; }
+VERSION=$("$BINARY" --version 2>&1 | head -n1)
+DIAG=no; [[ "$VERSION" == *+diag* ]] && DIAG=yes
+SECS=$((MINUTES * 60))
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+SCEN_NAME=$([ -d "$SCENARIO" ] && basename "$SCENARIO" || echo "$SCENARIO")
+RUN_ID="$STAMP-$([ "$RIG" = 1 ] && echo rig-)$SCEN_NAME-$CHECK${LABEL:+-$LABEL}"
+RUN=${RUN:-$ROOT/.project/diag-runs/$RUN_ID}
+mkdir -p "$RUN"; chmod 700 "$RUN"
+exec > >(tee -a "$RUN/diag-run.log") 2>&1
+say() { echo "diag-run: $*"; }
+say "run $RUN_ID: $VERSION (diag $DIAG), sha256 $SHA, check $CHECK for $MINUTES min"
+
+DSN=""
+if [ "$DIAG" = yes ]; then
+  DSN=$(sed -n 's/^GLITCHTIP_DSN=//p' "$ENV_FILE")
+  [ -n "$DSN" ] || say "no GLITCHTIP_DSN in .devops/.env; anomalies stay local"
+fi
+
+WINDOW_START=""; WINDOW_END=""; PREP="not reached"; FINAL="not reached"; GRAFANA="not applicable"; CLOCK=""
+
+summary() {
+  local result where
+  result=$(head -n1 "$RUN/check/result.txt" 2>/dev/null || echo "none: the check wrote no result")
+  where=$([ "$RIG" = 1 ] && echo "rootless rig on the dev host" || echo "f2z-target, mode $MODE")
+  {
+    echo "# diag run $RUN_ID"
+    echo
+    echo "Result: $result"
+    echo
+    echo "| Field | Value |"
+    echo "|---|---|"
+    echo "| Scenario | \`$SCENARIO\` on $where |"
+    echo "| Check | \`$CHECK\`, $MINUTES min$([ "$NLMON" = 1 ] && echo ", nlmon capture on") |"
+    echo "| Binary | \`$BINARY\` |"
+    echo "| SHA-256 | \`$SHA\` |"
+    echo "| Version | $VERSION (diag build: $DIAG) |"
+    echo "| Window (UTC) | ${WINDOW_START:+$(date -u -d @"${WINDOW_START%???}" +%FT%TZ)} – ${WINDOW_END:+$(date -u -d @"${WINDOW_END%???}" +%FT%TZ)} |"
+    echo "| Preparation | $PREP |"
+    echo "| Target clock offset | ${CLOCK:-not measured} |"
+    echo "| Afterwards | $FINAL |"
+    echo "| Grafana | $GRAFANA |"
+    echo
+    echo "Files: $(cd "$RUN" && find . -type f ! -name summary.md | sed 's|^\./||' | sort | tr '\n' ' ')"
+  } > "$RUN/summary.md"
+  say "summary: $RUN/summary.md"
+  say "result: $result"
+}
+
+if [ "$RIG" = 1 ]; then
+  WORK="$ROOT/.zig-cache/diag-rig/$RUN_ID"
+  SOCKDIR="${XDG_RUNTIME_DIR:-/tmp}/f2zd/$(printf %s "$RUN" | sha256sum | cut -c1-10)"
+  rm -rf "$SOCKDIR"; mkdir -p "$WORK" "$SOCKDIR"; chmod 700 "$WORK" "$SOCKDIR"
+  BRIDGE=""
+  if [ -n "$DSN" ]; then
+    socat "UNIX-LISTEN:$SOCKDIR/dsn.sock,fork,mode=600" "TCP:$(echo "$DSN" | sed -E 's#^https?://[^@/]+@([^/]+)/.*#\1#')" &
+    BRIDGE=$!
+  fi
+  PREP="rig work $WORK, socket dir $SOCKDIR, scenario $SCENARIO"
+  WINDOW_START=$(date +%s%3N)
+  F2Z_DSN="$DSN" unshare --user --map-root-user --net bash "$HERE/lib/rig-session.sh" \
+    "$BINARY" "$WORK" "$SOCKDIR" "$SCENARIO" "$CHECK" "$SECS" "$NLMON" "$RUN"
+  WINDOW_END=$(date +%s%3N)
+  [ -n "$BRIDGE" ] && kill "$BRIDGE" 2>/dev/null
+  rm -rf "$SOCKDIR"
+  FINAL="rig namespace gone with its processes; state kept in $WORK"
+  summary
+  exit 0
+fi
+
+exec 9>"$ROOT/.zig-cache/diag-run-target.lock"
+flock -n 9 || { say "another diag-run on this host holds the target"; exit 3; }
+remote() { ssh "${SSH_OPTS[@]}" "$TARGET" "$@"; }
+wait_ssh() {
+  for _ in $(seq 1 36); do remote true 2>/dev/null && return 0; sleep 5; done
+  return 1
+}
+if "$PVE" status | grep -q ': running'; then
+  if ! remote true; then say "target is running but SSH fails; refusing to roll it back"; exit 3; fi
+  if remote 'test -e /run/f2z-diag-run.lock'; then
+    say "target lock held by $(remote 'cat /run/f2z-diag-run.lock/owner 2>/dev/null')"
+    exit 3
+  fi
+fi
+
+offset_ms() {
+  local a t b
+  a=$(date +%s%3N); t=$(remote 'date +%s%3N'); b=$(date +%s%3N)
+  echo $(( t - (a + b) / 2 ))
+}
+# A memory snapshot resumes with the wall clock it was saved with; step it (systemd-timesyncd on the target) before anything starts.
+sync_clock() {
+  local before after
+  before=$(offset_ms)
+  remote 'sudo -n systemctl restart systemd-timesyncd'
+  for _ in $(seq 1 30); do
+    after=$(offset_ms)
+    [ "${after#-}" -lt 1000 ] && break
+    sleep 2
+  done
+  CLOCK="$CLOCK$1: $before ms after rollback, $after ms after the time-sync step. "
+  say "target clock offset on $1: $before ms, then $after ms"
+  [ "${after#-}" -lt 1000 ] || { say "target clock is still $after ms off after 60 s; refusing to run"; return 1; }
+}
+
+restore() {
+  local st
+  trap - EXIT INT TERM
+  say "restoring baseline"
+  if "$PVE" rollback baseline && { "$PVE" status | grep -q ': running' || "$PVE" start; } && wait_ssh && sync_clock baseline; then
+    for _ in $(seq 1 60); do
+      st=$(remote 'systemctl is-active fail2zig; sudo -n fail2zig --output json status 2>/dev/null | head -c 200' 2>/dev/null)
+      [[ "$st" == active*'"state":"active"'* ]] && break
+      sleep 2
+    done
+    FINAL="rolled back to baseline; $(echo "$st" | head -n1) fail2zig, $(echo "$st" | sed -n 's/.*"version":"\([^"]*\)".*/version \1/p')"
+  else
+    FINAL="RESTORE FAILED: the target is not confirmed on baseline"
+  fi
+  say "$FINAL"
+  summary
+}
+trap restore EXIT
+trap 'exit 130' INT TERM
+
+say "rolling back to $SCENARIO"
+"$PVE" rollback "$SCENARIO" || exit 4
+"$PVE" status | grep -q ': running' || "$PVE" start || exit 4
+wait_ssh || { say "target SSH did not come back"; exit 4; }
+remote "sudo -n mkdir /run/f2z-diag-run.lock && echo $RUN_ID | sudo -n tee /run/f2z-diag-run.lock/owner >/dev/null" || { say "could not take the target lock"; exit 3; }
+sync_clock "$SCENARIO" || exit 4
+STAGE=/var/tmp/f2z-diag/$RUN_ID
+tar -C "$HERE" -c lib checks gen kernel | remote "sudo -n install -d -m 0700 $STAGE && sudo -n tar -m -C $STAGE -x"
+remote "sudo -n tee $STAGE/fail2zig >/dev/null && sudo -n chmod 0755 $STAGE/fail2zig" < "$BINARY" || exit 4
+PREP=$(printf '%s\n' "$DSN" | remote "sudo -n bash $STAGE/lib/target.sh prepare $MODE $STAGE $SCENARIO $SECS $NLMON 2>&1" | tee "$RUN/prepare.log" | grep -E 'ready after|restart took' | tr '\n' ' ')
+if ! grep -q 'ready after' "$RUN/prepare.log"; then
+  PREP="failed: $(tail -n 5 "$RUN/prepare.log" | tr '\n' ' ')"
+  exit 4
+fi
+say "running check $CHECK for $MINUTES min"
+WINDOW_START=$(date +%s%3N)
+remote "sudo -n bash -c 'set -a; . $STAGE/check.env; set +a; exec timeout $((SECS + 120)) $STAGE/checks/$CHECK'" > "$RUN/check.console" 2>&1
+WINDOW_END=$(date +%s%3N)
+remote "sudo -n bash $STAGE/lib/target.sh collect $STAGE" >> "$RUN/prepare.log" 2>&1
+remote "sudo -n tar -C $STAGE -c out check" | tar -C "$RUN" -x
+mv "$RUN"/out/* "$RUN"/ && rmdir "$RUN/out"
+GRAFANA=$("$HERE/lib/grafana-save.py" "$ENV_FILE" $((WINDOW_START - 60000)) $((WINDOW_END + 60000)) "$RUN/grafana" 2>&1 | tail -n1)

@@ -25,7 +25,7 @@ pub const request_id_len: usize = 32;
 pub fn classifyTag(tag: u8) CommandClass {
     return switch (tag) {
         0, 3, 4, 6, 7 => .read_only,
-        1, 2, 5, 8, 9 => .mutation,
+        1, 2, 5, 8, 9, 10 => .mutation,
         else => .unknown,
     };
 }
@@ -167,7 +167,7 @@ test "ipc_auth: peer class from uid only" {
 test "ipc_auth: tag classes cover 0-9 and reject the rest" {
     for ([_]u8{ 0, 3, 4, 6, 7 }) |t| try testing.expectEqual(CommandClass.read_only, classifyTag(t));
     for ([_]u8{ 1, 2, 5, 8, 9 }) |t| try testing.expectEqual(CommandClass.mutation, classifyTag(t));
-    try testing.expectEqual(CommandClass.unknown, classifyTag(10));
+    try testing.expectEqual(CommandClass.unknown, classifyTag(11));
     try testing.expectEqual(CommandClass.unknown, classifyTag(0xFF));
 }
 

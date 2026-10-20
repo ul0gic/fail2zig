@@ -652,7 +652,7 @@ pub const Session = struct {
         return self.nowMs();
     }
     fn reportNotices(self: *Session) void {
-        if (self.processor.timeNotice(self.notices.read() / std.time.ns_per_ms)) |notice| std.log.scoped(.source_time).warn("jail {s}: rejected journal timestamps: missing={d}, malformed={d}, future={d}", .{ self.pipe.jail, notice.missing_since_notice, notice.malformed_since_notice, notice.future_since_notice });
+        if (self.processor.timeNotice(self.nowMs())) |notice| std.log.scoped(.source_time).warn("jail {s}: rejected journal timestamps: missing={d}, malformed={d}, future={d}", .{ self.pipe.jail, notice.missing_since_notice, notice.malformed_since_notice, notice.future_since_notice });
     }
     fn pollAdmitted(self: *Session, budget: usize, committing: *bool) !usize {
         if (budget == 0 or budget > self.options.journal.batch_records) return error.InvalidPollBudget;

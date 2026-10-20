@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Usage: rig-many N CHECK --binary PATH --sha256 HEX [--minutes M] [--scenario empty|DIR]  — N rootless rigs at once.
+set -uo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$HERE/../../.." && pwd)
+N="${1:-}"; CHECK="${2:-}"
+[[ "$N" =~ ^[0-9]+$ ]] && [ "$N" -ge 1 ] && [ "$N" -le 32 ] && [ -n "$CHECK" ] || { sed -n 2p "$0" >&2; exit 2; }
+shift 2
+SCENARIO=empty; ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --scenario) SCENARIO="${2:-}"; shift 2 ;;
+    --binary|--sha256|--minutes) ARGS+=("$1" "${2:-}"); shift 2 ;;
+    *) sed -n 2p "$0" >&2; exit 2 ;;
+  esac
+done
+GROUP="$ROOT/.project/diag-runs/$(date -u +%Y%m%dT%H%M%SZ)-rig-many$N-$CHECK"
+mkdir -p "$GROUP"
+pids=()
+for i in $(seq 1 "$N"); do
+  "$HERE/diag-run" --rig --scenario "$SCENARIO" --check "$CHECK" "${ARGS[@]}" --label "r$i" --out "$GROUP/r$i" > "$GROUP/r$i.console" 2>&1 &
+  pids+=($!)
+done
+failed=0
+for i in $(seq 1 "$N"); do
+  wait "${pids[$((i - 1))]}" || failed=$((failed + 1))
+  result=$(head -n1 "$GROUP/r$i/check/result.txt" 2>/dev/null || echo "none: no result")
+  [[ "$result" == fail* || "$result" == none* ]] && failed=$((failed + 1))
+  echo "r$i: $result" | tee -a "$GROUP/results.txt"
+done
+echo "rig-many: $N rigs, $failed failures; $GROUP"
+[ "$failed" -eq 0 ]

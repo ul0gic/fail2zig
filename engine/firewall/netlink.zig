@@ -178,6 +178,7 @@ fn safeErrno(code: i32) Error {
     return errnoToError(code);
 }
 
+pub const max_related = 4096;
 pub const Acknowledgments = struct {
     required: []const u32,
     related: []const u32,
@@ -186,7 +187,7 @@ pub const Acknowledgments = struct {
     count: usize = 0,
 
     pub fn init(required: []const u32, related: []const u32, port_id: u32) Error!Acknowledgments {
-        if (required.len == 0 or required.len > 64 or related.len > 66) return error.InvalidArgument;
+        if (required.len == 0 or required.len > 64 or related.len > max_related) return error.InvalidArgument;
         for (required, 0..) |seq, index| {
             if (mem.indexOfScalar(u32, related, seq) == null or mem.indexOfScalar(u32, required[0..index], seq) != null) return error.InvalidArgument;
         }
@@ -398,6 +399,13 @@ pub const NetlinkSocket = struct {
         };
         if (n == 0) return error.TruncatedMessage;
         return buf[0..n];
+    }
+
+    pub fn setSendBuffer(self: *NetlinkSocket, bytes: u32) Error!void {
+        const value = mem.asBytes(&bytes);
+        posix.setsockopt(self.fd, posix.SOL.SOCKET, linux.SO.SNDBUFFORCE, value) catch {
+            posix.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.SNDBUF, value) catch return error.SocketFailed;
+        };
     }
 
     pub fn setRecvTimeout(self: *NetlinkSocket, ms: u64) Error!void {

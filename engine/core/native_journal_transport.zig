@@ -2,6 +2,8 @@
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
 const records = @import("source_record.zig");
+const build_options = @import("build_options");
+const diag_mod = @import("diag.zig");
 pub const max_line_bytes = 64 * 1024;
 pub const max_cursor_bytes = 512;
 pub const parse_bytes = 512 * 1024;
@@ -108,6 +110,7 @@ pub fn execute(a: std.mem.Allocator, args: []const []const u8, output: []u8, dia
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
     try child.spawn();
+    if (comptime build_options.diag) diag_mod.count(.spawns, 1);
     var reaped = false;
     defer {
         if (!reaped) {
