@@ -27,9 +27,17 @@ pub const BoundedError = backend.BackendError || error{ Timeout, OutputLimit, Sp
 pub const max_stdout_bytes: usize = 8 * 1024 * 1024;
 
 pub fn runBounded(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: u64, max_stdout: usize, max_stderr: usize) BoundedError!Result {
+    return runChild(allocator, argv, null, timeout_ms, max_stdout, max_stderr);
+}
+
+pub fn runBoundedInput(allocator: std.mem.Allocator, argv: []const []const u8, input: []const u8, timeout_ms: u64, max_stdout: usize, max_stderr: usize) BoundedError!Result {
+    return runChild(allocator, argv, input, timeout_ms, max_stdout, max_stderr);
+}
+
+fn runChild(allocator: std.mem.Allocator, argv: []const []const u8, input: ?[]const u8, timeout_ms: u64, max_stdout: usize, max_stderr: usize) BoundedError!Result {
     if (max_stdout > max_stdout_bytes or max_stderr > 4096) return error.OutputLimit;
     var child = std.process.Child.init(argv, allocator);
-    child.stdin_behavior = .Close;
+    child.stdin_behavior = if (input == null) .Close else .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
     child.spawn() catch |err| return switch (err) {
@@ -43,6 +51,7 @@ pub fn runBounded(allocator: std.mem.Allocator, argv: []const []const u8, timeou
             std.posix.kill(child.id, std.posix.SIG.KILL) catch {};
             _ = std.posix.waitpid(child.id, 0);
         }
+        if (child.stdin) |f| f.close();
         if (child.stdout) |f| f.close();
         if (child.stderr) |f| f.close();
         if (child.err_pipe) |fd| std.posix.close(fd);
@@ -54,10 +63,27 @@ pub fn runBounded(allocator: std.mem.Allocator, argv: []const []const u8, timeou
         const flags = std.posix.fcntl(file.handle, std.posix.F.GETFL, 0) catch return error.SystemError;
         _ = std.posix.fcntl(file.handle, std.posix.F.SETFL, flags | @as(u32, @bitCast(std.posix.O{ .NONBLOCK = true }))) catch return error.SystemError;
     }
+    var pending: []const u8 = input orelse &.{};
+    if (child.stdin) |stdin| {
+        const flags = std.posix.fcntl(stdin.handle, std.posix.F.GETFL, 0) catch return error.SystemError;
+        _ = std.posix.fcntl(stdin.handle, std.posix.F.SETFL, flags | @as(u32, @bitCast(std.posix.O{ .NONBLOCK = true }))) catch return error.SystemError;
+    }
     var timer = std.time.Timer.start() catch return error.SystemError;
     var status: ?u32 = null;
     var eof = [_]bool{ false, false };
     while (true) {
+        if (child.stdin) |stdin| {
+            const written = std.posix.write(stdin.handle, pending) catch |err| switch (err) {
+                error.WouldBlock => 0,
+                error.BrokenPipe => pending.len,
+                else => return error.SystemError,
+            };
+            pending = pending[written..];
+            if (pending.len == 0) {
+                stdin.close();
+                child.stdin = null;
+            }
+        }
         for (files, 0..) |file, i| {
             if (eof[i]) continue;
             var chunk: [4096]u8 = undefined;
@@ -87,6 +113,7 @@ pub fn runBounded(allocator: std.mem.Allocator, argv: []const []const u8, timeou
         var pollers = [_]std.posix.pollfd{
             .{ .fd = if (eof[0]) -1 else files[0].handle, .events = std.posix.POLL.IN, .revents = 0 },
             .{ .fd = if (eof[1]) -1 else files[1].handle, .events = std.posix.POLL.IN, .revents = 0 },
+            .{ .fd = if (child.stdin) |stdin| stdin.handle else -1, .events = std.posix.POLL.OUT, .revents = 0 },
         };
         _ = std.posix.poll(&pollers, 10) catch return error.SystemError;
     }

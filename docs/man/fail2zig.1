@@ -76,7 +76,11 @@ after rotation;
 .B SIGTERM
 and
 .B SIGINT
-stop cleanly. No socket unit is shipped and
+stop cleanly. A stop leaves the daemon's realized firewall rules in the kernel, where
+they keep their timeouts; the next start reconciles them with durable state. To stop with
+an empty table, run
+.B fail2zig firewall withdraw
+first. No socket unit is shipped and
 .B LISTEN_FDS
 is not read.
 .PP
@@ -196,7 +200,7 @@ instead of unknown. Table output adds one
 .B Paused:
 block per source with the jail, path and cause, then the exact
 .B repair-source
-command and the reminder that firewall rules for every jail are withdrawn while the
+command and the reminder that firewall rules for every jail stay in place while the
 daemon is stopped. The command is never truncated to the terminal width. When no
 offline repair applies to the cause, the block reads that and points to the daemon log.
 .PP
@@ -376,6 +380,32 @@ observation_complete. next_cursor pages only the retained sample; use the same l
 A replaced observation, daemon restart or 60-second cursor lifetime requires
 restarting pagination without a cursor. No jail filter or forced refresh is provided.
 Timeouts are sampled values; unexpected entries do not imply desired or confirmed bans.
+.TP
+.B firewall withdraw
+Remove every firewall rule the running daemon realized, in batches with a kernel
+readback after each, and hold enforcement off until the next start. Owners and ban
+deadlines are kept; new decisions are still recorded but not installed;
+.B reload
+does not lift the hold. While held,
+.B status
+reports protection
+.B degraded
+with cause
+.BR FirewallWithdrawn ,
+.B jails
+reports no jail enforcing, and the daemon logs a warning every hour. A restart
+reinstalls every live ban. The outcome is
+.B applied
+with the number of rules removed (0 when enforcement is already withdrawn),
+.B partial
+with the count removed and the cause when the turn bound, a stop request or a
+transient readback failure interrupts it (run the command again),
+.B uncertain
+when a kernel failure leaves the remainder unknown, or
+.B rejected
+when nothing was removed. It works while storage is unhealthy and changes no
+stored state, so it has no request replay or audit record. Because a stop leaves
+rules in place, run it before stopping the daemon to leave an empty table.
 .TP
 .BI ban " ip --jail name [--duration seconds] [--scope host|net cidr]"
 Manual ban. Exactly one
@@ -730,8 +760,8 @@ outcomes are retained; an older token stays reserved and is refused. Data writte
 after the committed position and removed by the truncation was never read and cannot
 be recovered (for a removed rotated file or a replaced log, the records after the
 committed offset of the file that is gone), and lines still in the file are read again. Stopping the daemon for the
-repair withdraws its firewall rules for every jail until the next start reinstalls
-them from durable state. Exit 0 on success or replay, 1 on refusal, 2 on usage errors.
+repair leaves its firewall rules for every jail in place; the next start reconciles
+them with durable state. Exit 0 on success or replay, 1 on refusal, 2 on usage errors.
 .
 .SH SUPPORT-BUNDLE
 .B support-bundle

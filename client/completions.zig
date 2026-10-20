@@ -79,7 +79,7 @@ const bash_script =
     \\        history)
     \\            COMPREPLY=( $(compgen -W "reset --jail --limit --cursor --all $global_flags" -- "$cur") ) ;;
     \\        firewall)
-    \\            COMPREPLY=( $(compgen -W "show --limit --cursor --details $global_flags" -- "$cur") ) ;;
+    \\            COMPREPLY=( $(compgen -W "show --limit --cursor --details withdraw $global_flags" -- "$cur") ) ;;
     \\        ban)
     \\            COMPREPLY=( $(compgen -W "--jail --duration --scope $global_flags" -- "$cur") ) ;;
     \\        unban)
@@ -230,7 +230,7 @@ const zsh_script =
     \\                        $global_flags ;;
     \\                firewall)
     \\                    _arguments \
-    \\                        '1:action:(show)' \
+    \\                        '1:action:(show withdraw)' \
     \\                        '--limit[Sample entries per page (1..256)]:limit:' \
     \\                        '--cursor[Continue the same retained observation]:cursor:' \
     \\                        '--details[Include verified owned structures, entry placement and identifiers]' \
@@ -349,6 +349,7 @@ const fish_script =
     \\complete -c fail2zig -n '__fail2zig_client_using_command history' -l limit  -x -d 'Events per page (1..256)'
     \\complete -c fail2zig -n '__fail2zig_client_using_command history' -l cursor -x -d 'Continue from next_cursor'
     \\complete -c fail2zig -f -n '__fail2zig_client_using_command firewall' -a 'show' -d 'Show retained firewall observation'
+    \\complete -c fail2zig -f -n '__fail2zig_client_using_command firewall' -a 'withdraw' -d 'Remove kernel rules and hold enforcement off until restart'
     \\complete -c fail2zig -n '__fail2zig_client_using_command firewall' -l limit  -x -d 'Sample entries per page (1..256)'
     \\complete -c fail2zig -n '__fail2zig_client_using_command firewall' -l cursor -x -d 'Continue the same retained observation'
     \\complete -c fail2zig -n '__fail2zig_client_using_command firewall' -l details -d 'Include verified owned structures, entry placement and identifiers'
@@ -408,7 +409,7 @@ test "completions: zsh covers all subcommands in command list" {
     try testing.expect(std.mem.indexOf(u8, s, "(enable disable pause resume)") != null);
     try testing.expect(std.mem.indexOf(u8, s, "jail:") != null);
     try testing.expect(std.mem.indexOf(u8, s, "scope:(host net)") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "1:action:(show)") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "1:action:(show withdraw)") != null);
 }
 
 test "completions: fish uses complete -c syntax" {

@@ -608,7 +608,7 @@ fn writeStatusNarrowRow(writer: anytype, label: []const u8, value: []const u8, c
 
 const repair_steps = "stop fail2zig, then run:";
 const repair_none = "no offline repair applies to this cause; see the daemon log.";
-const repair_restart = "Then start fail2zig. While it is stopped, firewall rules for every jail are withdrawn.";
+const repair_restart = "Then start fail2zig. While it is stopped, firewall rules for every jail stay in place.";
 
 fn isPaused(source: SourceEntry) bool {
     const state = source.state orelse return false;

@@ -255,7 +255,7 @@ pub fn Methods(comptime Store: type) type {
             return .{ .generation = try effectBlob(&row, 0, 32), .config_digest = try effectBlob(&row, 1, 32), .published = (try row.signed(2)) == 1, .committed_us = try row.signed(3) };
         }
 
-        pub const AdminKind = enum(u8) { group_enable = 1, group_disable, group_pause, group_resume, setting_batch, ban, unban, history_reset, migration_activate, migration_rollback, ignore_add, ignore_remove };
+        pub const AdminKind = enum(u8) { group_enable = 1, group_disable, group_pause, group_resume, setting_batch, ban, unban, history_reset, migration_activate, migration_rollback, ignore_add, ignore_remove, firewall_withdraw };
         pub const AdminOutcome = enum(u8) { applied = 1, rejected, absent, partial, uncertain };
         pub const admin_request_retention = 4096;
         pub const admin_request_max_age_us: i64 = 30 * 24 * 60 * 60 * 1_000_000;

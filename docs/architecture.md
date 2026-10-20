@@ -130,10 +130,15 @@ drained up to four records per wake. Maintenance runs on a 250 ms cadence under 
 With `synchronous=FULL` every commit is an `fsync`, which bounds sustained throughput
 by the storage's sync latency; no throughput figure is promised.
 
-A healthy stop withdraws the daemon's realized rules and keeps owners and deadlines for the next
-start. When storage is unhealthy at stop, durable intent cannot be confirmed, so the daemon neither
-writes nor dispatches: installed rules stay in place, the log reports how many, and the next start
-reconciles them. Restart reinstalls live bans with their original deadlines before READY.
+A stop leaves the daemon's realized rules in the kernel, where they keep their timeouts, and keeps
+owners and deadlines; the log reports how many rules stayed. The next start reconciles what it
+finds, so a restart with the rules present keeps protection throughout and only reinstalls what is
+missing before READY. The stop-time history drain is bounded to two seconds; the next start resumes
+it. Withdrawal is an explicit operator act: `fail2zig firewall withdraw` removes every realized rule
+in batches with a readback after each, while the daemon runs and whatever the storage health, and
+holds enforcement off in memory until the next start. Owners and deadlines stay, `status` reports
+protection degraded with cause `FirewallWithdrawn`, reload does not lift the hold, and a restart
+reinstalls live bans.
 
 Firewall effects are limited to the daemon's current network namespace. The daemon does not enter
 another namespace, and custom namespace selectors or service overrides that move it between

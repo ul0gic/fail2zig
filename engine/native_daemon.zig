@@ -200,6 +200,7 @@ const Jail = struct {
     summary: durable.Store.RetrySummary = .{},
     retry_revision: ?u64 = null,
     published_once: bool = false,
+    next_expiry_us: ?i64 = null,
     published_mark: ?EffectMark = null,
     revision: u64 = 0,
     healthy: bool = false,
@@ -503,6 +504,7 @@ pub const Coordinator = struct {
     admin_request: ?*AdminRequest = null,
     reload_wake: std.Thread.Condition = .{},
     published_revision: u64 = 0,
+    withdrawn_warned_ms: ?u64 = null,
     notifier: ?*const sd_notify.Notifier = null,
     notified_ready: bool = false,
     startup_progress: ?*sd_notify.Progress = null,
@@ -742,6 +744,7 @@ pub const Coordinator = struct {
     fn executeAdminInner(self: *Coordinator, request: *AdminRequest) !AdminOutcomeView {
         const kind = request.kind;
         const base = AdminOutcomeView{ .outcome = .applied, .kind = kind, .generation = self.published_generation };
+        if (kind == .firewall_withdraw) return self.withdrawFirewall(request);
         const ignore_kind = kind == .ignore_add or kind == .ignore_remove;
         if (ignore_kind) {
             const ignore_state = try self.allocator.create(IgnoreWork);
@@ -837,6 +840,7 @@ pub const Coordinator = struct {
             },
             .migration_activate => return self.activateMigration(request, base, now),
             .migration_rollback => return self.rollbackMigration(request, base, now),
+            .firewall_withdraw => unreachable,
             .history_reset => {
                 const address = request.address orelse return error.AdminAddressRequired;
                 const subject: detection.Subject = switch (address) {
@@ -971,45 +975,83 @@ pub const Coordinator = struct {
             std.log.err("native migration: verify outcome {s} could not be recorded: {s}", .{ @tagName(outcome), @errorName(err) });
         };
     }
-    fn withdrawRealizedEffects(self: *Coordinator) void {
+    fn leaveRealizedEffects(self: *Coordinator) void {
         const manager = self.effects orelse return;
         const phase = self.gate.snapshot().phase;
+        const residual = manager.residualInstalled();
         if (phase != .healthy or !self.store_open or self.store.reopen_required) {
-            const residual = manager.residualInstalled();
             if (residual.installed) |count| {
                 std.log.warn("native: stop with storage {s} left {d} realized rules in place; restart reconciles them", .{ @tagName(phase), count });
             } else std.log.warn("native: stop with storage {s} left realized rules in place; inventory unreadable: {s}", .{ @tagName(phase), @errorName(residual.cause.?) });
             return;
         }
-        var bindings: [max_jails]effect_runtime.Binding = undefined;
-        self.effectBindings(&bindings);
-        var settle: usize = 0;
-        while (settle < 64) : (settle += 1) {
-            if (manager.status.ready and manager.cached_epoch != null and manager.cached_epoch.? == self.store.effect_publication_epoch) break;
-            switch (manager.runSlice(bindings[0..self.jails.len], .{}, null).outcome) {
-                .fatal => |err| {
-                    std.log.warn("native: stop left realized rules in place: reconciliation {s}; restart reconciles them", .{@errorName(err)});
-                    return;
-                },
-                .progress, .wait, .idle, .stop => {},
+        if (residual.installed) |count| {
+            std.log.info("native: stop left {d} realized rules in place; the next start reconciles them", .{count});
+        } else std.log.warn("native: stop left realized rules in place; inventory unreadable: {s}; the next start reconciles them", .{@errorName(residual.cause.?)});
+    }
+    fn withdrawFirewall(self: *Coordinator, request: *AdminRequest) AdminOutcomeView {
+        const base = AdminOutcomeView{ .outcome = .applied, .kind = request.kind, .generation = self.published_generation, .mutation_revision = self.published_revision };
+        const manager = self.effects orelse return base.withOutcome(.rejected).withReason("log-only: no enforcement backend holds rules", .{});
+        if (manager.withdrawn and !manager.stopping) {
+            std.log.info("native: firewall withdraw removed 0 realized rules; enforcement already withdrawn until the next start", .{});
+            return base.withReason("0 rules removed; enforcement already withdrawn until the next start", .{});
+        }
+        const before = manager.residualInstalled();
+        const installed = before.installed orelse return base.withOutcome(.rejected).withReason("firewall readback failed: {s}; no rules removed", .{@errorName(before.cause.?)});
+        const healthy = self.gate.snapshot().phase == .healthy and self.store_open and !self.store.reopen_required;
+        if (healthy and !manager.stopping) {
+            var bindings: [max_jails]effect_runtime.Binding = undefined;
+            self.effectBindings(&bindings);
+            var settle: usize = 0;
+            while (settle < 64) : (settle += 1) {
+                if (manager.status.ready and manager.cached_epoch != null and manager.cached_epoch.? == self.store.effect_publication_epoch) break;
+                switch (manager.runSlice(bindings[0..self.jails.len], .{}, null).outcome) {
+                    .fatal => |err| return base.withOutcome(.rejected).withReason("firewall reconciliation failed: {s}; no rules removed", .{@errorName(err)}),
+                    .progress, .wait, .idle, .stop => {},
+                }
             }
         }
         const epoch = manager.repair_epoch;
+        var cause: ?anyerror = error.WithdrawalBoundReached;
         var turns: usize = 0;
         while (turns <= effect.max_effects) : (turns += 1) {
-            switch (manager.stopStep(epoch, .healthy)) {
+            if (stopRequested(self)) {
+                cause = error.StopRequested;
+                break;
+            }
+            switch (manager.withdrawStep(epoch)) {
                 .idle => {
-                    std.log.info("native: stop withdrew realized rules in {d} turns; owners and deadlines retained", .{turns});
-                    return;
+                    cause = null;
+                    break;
                 },
                 .fatal => |err| {
-                    std.log.warn("native: stop left realized rules in place after {d} turns: {s}; restart reconciles them", .{ turns, @errorName(err) });
-                    return;
+                    cause = err;
+                    break;
                 },
                 .progress, .wait, .stop => {},
             }
         }
-        std.log.warn("native: stop withdrawal exceeded its bound; restart reconciles the remainder", .{});
+        if (manager.withdrawn) self.withdrawn_warned_ms = monotonic(self);
+        const failure = cause orelse {
+            std.log.info("native: firewall withdraw removed {d} realized rules in {d} turns; enforcement withdrawn until the next start; owners and deadlines retained", .{ installed, turns });
+            return base.withReason("{d} rules removed; enforcement withdrawn until the next start", .{installed});
+        };
+        if (!manager.withdrawn) return base.withOutcome(.rejected).withReason("{s}; no rules removed", .{@errorName(failure)});
+        const after = manager.residualInstalled();
+        const remaining = after.installed orelse {
+            std.log.warn("native: firewall withdraw stopped by {s}; remaining rules unreadable: {s}; enforcement withdrawn until the next start", .{ @errorName(failure), @errorName(after.cause.?) });
+            return base.withOutcome(.uncertain).withReason("{s}; remaining rules unreadable: {s}", .{ @errorName(failure), @errorName(after.cause.?) });
+        };
+        const outcome: durable.Store.AdminOutcome = if (failure == error.WithdrawalBoundReached or failure == error.StopRequested or effect_runtime.transientCause(failure)) .partial else .uncertain;
+        std.log.warn("native: firewall withdraw removed {d} of {d} realized rules: {s}; enforcement withdrawn until the next start", .{ installed -| remaining, installed, @errorName(failure) });
+        return base.withOutcome(outcome).withReason("{d} of {d} rules removed: {s}; run firewall withdraw again", .{ installed -| remaining, installed, @errorName(failure) });
+    }
+    const withdrawn_warn_interval_ms: u64 = 60 * 60 * 1000;
+    fn warnWithdrawn(self: *Coordinator, manager: *effect_runtime.Manager) void {
+        const now = monotonic(self);
+        if (self.withdrawn_warned_ms) |last| if (now -| last < withdrawn_warn_interval_ms) return;
+        self.withdrawn_warned_ms = now;
+        std.log.warn("native: enforcement withdrawn by firewall withdraw; {d} realized rules in the kernel; restart fail2zig to reinstall live bans", .{manager.installed_live});
     }
     fn stopRequested(ctx: ?*anyopaque) bool {
         const self: *Coordinator = @ptrCast(@alignCast(ctx.?));
@@ -1022,6 +1064,7 @@ pub const Coordinator = struct {
         self.effectBindings(&bindings);
         const slice = manager.runSlice(bindings[0..self.jails.len], .{}, .{ .context = self, .requested = stopRequested });
         self.effect_backlog = slice.outcome == .progress;
+        if (manager.withdrawn) self.warnWithdrawn(manager);
         return switch (slice.outcome) {
             .idle => true,
             .fatal => |failure| failure,
@@ -1911,7 +1954,7 @@ pub const Coordinator = struct {
         if ((kind == .migration_activate or kind == .migration_rollback) and request.run_id == null) return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "run_id is required") } };
         const needs_jail = switch (kind) {
             .history_reset => !body.all,
-            .setting_batch, .migration_activate, .migration_rollback => false,
+            .setting_batch, .migration_activate, .migration_rollback, .firewall_withdraw => false,
             else => true,
         };
         if (needs_jail and request.jail_len == 0) return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "jail is required") } };
@@ -1930,7 +1973,7 @@ pub const Coordinator = struct {
                 std.fmt.bufPrint(&text, "{}", .{request.address.?})) catch return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "invalid address") } };
             request.ignore_entry = shared.types.IgnoreEntry.parse(printed) catch |failure| return .{ .err = .{ .code = 400, .message = try a.dupe(u8, if (failure == error.InvalidPrefix) "invalid prefix" else "invalid address") } };
         }
-        const wait_ms: u64 = if (kind == .migration_activate or kind == .migration_rollback) 10_000 else if (request.unban) ignore_unban_wait_ms else 3000;
+        const wait_ms: u64 = if (kind == .migration_activate or kind == .migration_rollback or kind == .firewall_withdraw) 10_000 else if (request.unban) ignore_unban_wait_ms else 3000;
         const staged = self.stageAdmin(request, wait_ms);
         destroy_on_exit = staged.owned;
         const view = staged.view;
@@ -2917,7 +2960,8 @@ pub const Coordinator = struct {
         const retry_revision = try self.store.retryStateRevision();
         const revision = try self.store.revision(jail.name);
         const mark = self.effectMark(self.jailEnforces(jail));
-        if (jail.published_once and jail.retry_revision == retry_revision and std.meta.eql(jail.published_mark, mark) and jail.healthy == jail.session.?.healthy()) {
+        const expired = if (jail.next_expiry_us) |deadline| now >= deadline else false;
+        if (jail.published_once and !expired and jail.retry_revision == retry_revision and std.meta.eql(jail.published_mark, mark) and jail.healthy == jail.session.?.healthy()) {
             if (jail.revision != revision) {
                 self.mutex.lock();
                 defer self.mutex.unlock();
@@ -2974,6 +3018,10 @@ pub const Coordinator = struct {
         @memcpy(active, self.decision_scratch[0..summary.active]);
         @memcpy(confirmed, self.decision_scratch_confirmed[0..summary.active]);
         @memcpy(keys, self.decision_scratch_keys[0..keys.len]);
+        var next_expiry: ?i64 = null;
+        for (active) |decision| if (decision.lease == .finite) {
+            next_expiry = if (next_expiry) |prior| @min(prior, decision.lease.finite) else decision.lease.finite;
+        };
         self.mutex.lock();
         defer self.mutex.unlock();
         self.allocator.free(jail.active);
@@ -2986,6 +3034,7 @@ pub const Coordinator = struct {
         jail.summary = summary;
         jail.retry_revision = retry_revision;
         jail.published_once = true;
+        jail.next_expiry_us = next_expiry;
         jail.published_mark = mark;
         jail.revision = revision;
         jail.healthy = jail.session.?.healthy();
@@ -3025,6 +3074,12 @@ pub const Coordinator = struct {
         const diag_span = if (comptime build_options.diag) diag_mod.enter(.owners) else {};
         defer if (comptime build_options.diag) diag_mod.leave(diag_span);
         const manager = self.effects orelse return;
+        if (manager.withdrawn) {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            @memset(self.owner_confirmed[0..self.owner_count], false);
+            return;
+        }
         const expected_epoch = manager.cached_epoch orelse return error.StaleEffect;
         const fatal = manager.status.uncertain and !(manager.status.cause != null and effect_runtime.transientCause(manager.status.cause.?));
         if (fatal or expected_epoch != self.store.effect_publication_epoch) return error.StaleEffect;
@@ -3453,7 +3508,7 @@ pub const Coordinator = struct {
             self.stop_mutex.lock();
             if (self.stopping) {
                 self.stop_mutex.unlock();
-                self.withdrawRealizedEffects();
+                self.leaveRealizedEffects();
                 return;
             }
             self.stop_mutex.unlock();
@@ -3500,7 +3555,7 @@ pub const Coordinator = struct {
             self.stop_mutex.unlock();
             if (stopped) {
                 self.drainHistoryForStop();
-                self.withdrawRealizedEffects();
+                self.leaveRealizedEffects();
                 return;
             }
         }
@@ -3672,17 +3727,22 @@ pub const Coordinator = struct {
     const quiet_interval_ms: u64 = 1000;
     const maintenance_idle_ms: u64 = 30 * quiet_interval_ms;
     const verify_interval_ns: u64 = 5 * std.time.ns_per_s;
-    const stop_history_pages: u16 = 256;
+    const stop_history_budget_ns: u64 = 2 * std.time.ns_per_s;
     fn drainHistoryForStop(self: *Coordinator) void {
         if (self.gate.snapshot().phase != .healthy or !self.store_open or self.store.reopen_required) return;
-        var pages: u16 = 0;
-        while (pages < stop_history_pages) : (pages += 1) {
+        var timer = std.time.Timer.start() catch |failure| {
+            std.log.warn("native: stop left the history consumer behind the head: {s}; the next start resumes it", .{@errorName(failure)});
+            return;
+        };
+        var pages: usize = 0;
+        while (timer.read() < stop_history_budget_ns) : (pages += 1) {
             const caught_up = self.consumeHistory() catch |failure| {
                 std.log.warn("native: stop left the history consumer behind the head: {s}; the next start resumes it", .{@errorName(failure)});
                 return;
             };
             if (caught_up) return;
         }
+        std.log.warn("native: stop left the history consumer behind the head after {d} pages in {d} ms; the next start resumes it", .{ pages, timer.read() / std.time.ns_per_ms });
     }
     const history_pages_per_turn: u8 = 4;
     fn maintenanceMark(self: *Coordinator) !MaintenanceMark {
@@ -3961,7 +4021,8 @@ pub const Coordinator = struct {
         if (self.published_effects) |effects| healthy = healthy and !(effects.uncertain and !self.published_view.transient_uncertain);
         if (self.backend_failure != null) healthy = false;
         const known = self.knowledge(effect_ms);
-        const protection: []const u8 = if (!healthy) "degraded" else if (self.published_effects == null) "log-only" else if (known.? == .none) "unknown" else if (known.? == .stale or self.overBlocking()) "degraded" else "active";
+        const withdrawn = if (self.published_effects) |effects| effects.withdrawn else false;
+        const protection: []const u8 = if (!healthy or withdrawn) "degraded" else if (self.published_effects == null) "log-only" else if (known.? == .none) "unknown" else if (known.? == .stale or self.overBlocking()) "degraded" else "active";
         const active_bans: ?u32 = if (known) |k| (if (k == .none) null else self.published_view.installed_live) else installed;
         const knowledge_cause: ?[]const u8 = if (known) |k| switch (k) {
             .stale => "ReadbackStale",
@@ -3972,7 +4033,7 @@ pub const Coordinator = struct {
         const effect_diagnostic = if (self.published_effects) |effects| effects.diagnostic else null;
         const none_cause: []const u8 = if (paused_sources != 0 and unpaused_unhealthy == 0) "SourcePaused" else blocked_source orelse "none";
         const payload_start = out.items.len;
-        try std.json.stringify(.{ .version = version, .runtime = "native", .generation = &generation_hex, .mutation_revision = self.published_revision, .state = protection, .protection = protection, .protection_cause = if (self.backend_failure) |failure| @as(?[]const u8, @errorName(failure)) else null, .active_bans = active_bans, .total_bans = self.published_confirmations, .knowledge = if (known) |k| @as(?[]const u8, @tagName(k)) else null, .confirmed_at_us = if (known != null and known.? != .none) self.published_view.readback_wall_us else null, .knowledge_age_ms = if (known != null and known.? != .none) self.knowledgeAgeMs(effect_ms) else null, .pending_bans = if (known != null) @as(?u64, self.published_view.pending) else null, .oldest_pending_ms = if (known != null) ageMs(now, self.published_view.oldest_pending_us) else null, .overdue_removals = if (known != null) @as(?u64, self.published_view.overdue_blocking) else null, .oldest_overdue_ms = if (known != null) ageMs(now, self.published_view.oldest_overdue_blocking_us) else null, .overdue_bookkeeping = if (known != null) @as(?u64, self.published_view.overdue -| self.published_view.overdue_blocking) else null, .dump_interrupted = if (known != null) @as(?u64, self.published_view.dump_interrupted) else null, .storage = @tagName(gate.phase), .cause = if (gate.phase == .intervention and gate.last_failure != null) @errorName(gate.last_failure.?.cause) else if (observation.clock_uncertain) "ClockUncertain" else if (observation.stalled) "WorkerStalled" else if (known != null and known.? == .none and knowledge_cause != null) knowledge_cause.? else if (self.overBlocking()) "EffectRemovalOverdue" else if (knowledge_cause) |cause| cause else if (gate.last_failure) |failure| @errorName(failure.cause) else if (self.published_effects) |effects| if (effects.cause) |cause| @errorName(cause) else none_cause else if (self.backend_failure) |failure| @errorName(failure) else none_cause, .sqlite_code = if (gate.last_failure) |failure| failure.diagnostics.sqlite_code else null, .next_retry_ms = gate.next_retry_ms, .committed_records = gate.committed_records, .decisions_total = decisions, .jails_active = self.jails.len, .unhealthy_sources = unhealthy_sources, .backend = self.published_backend, .effect_backend = if (effect_diagnostic) |detail| @as(?[]const u8, @tagName(detail.backend)) else null, .effect_stage = if (effect_diagnostic) |detail| @as(?[]const u8, @tagName(detail.stage)) else null, .effect_cause = if (effect_diagnostic) |detail| @as(?[]const u8, @errorName(detail.cause)) else null, .effect_mutation = if (effect_diagnostic) |detail| @as(?[]const u8, @tagName(detail.mutation)) else null, .effects_uncertain = observation.expiry_uncertain or (if (self.published_effects) |effects| effects.uncertain else false), .overdue_effects = if (self.published_effects) |effects| effects.overdue else 0, .worker_busy = observation.busy, .worker_stalled = observation.stalled, .worker_busy_age_ms = observation.busy_age_ms, .worker_heartbeat_age_ms = observation.heartbeat_age_ms, .clock_uncertain = observation.clock_uncertain, .expiry_overdue = observation.expiry_overdue, .expiry_uncertain = observation.expiry_uncertain, .next_committed_expiry_us = observation.next_committed_expiry_us, .memory_admission_bytes = self.resources.limit_bytes, .uptime_seconds = if (observation.clock_uncertain) @as(?u64, null) else @as(u64, @intCast(@max(0, @divTrunc(now -| self.start_us, 1_000_000)))) }, .{ .emit_null_optional_fields = false }, out.writer(a));
+        try std.json.stringify(.{ .version = version, .runtime = "native", .generation = &generation_hex, .mutation_revision = self.published_revision, .state = protection, .protection = protection, .protection_cause = if (self.backend_failure) |failure| @as(?[]const u8, @errorName(failure)) else null, .active_bans = active_bans, .total_bans = self.published_confirmations, .knowledge = if (known) |k| @as(?[]const u8, @tagName(k)) else null, .confirmed_at_us = if (known != null and known.? != .none) self.published_view.readback_wall_us else null, .knowledge_age_ms = if (known != null and known.? != .none) self.knowledgeAgeMs(effect_ms) else null, .pending_bans = if (known != null) @as(?u64, self.published_view.pending) else null, .oldest_pending_ms = if (known != null) ageMs(now, self.published_view.oldest_pending_us) else null, .overdue_removals = if (known != null) @as(?u64, self.published_view.overdue_blocking) else null, .oldest_overdue_ms = if (known != null) ageMs(now, self.published_view.oldest_overdue_blocking_us) else null, .overdue_bookkeeping = if (known != null) @as(?u64, self.published_view.overdue -| self.published_view.overdue_blocking) else null, .dump_interrupted = if (known != null) @as(?u64, self.published_view.dump_interrupted) else null, .storage = @tagName(gate.phase), .cause = if (gate.phase == .intervention and gate.last_failure != null) @errorName(gate.last_failure.?.cause) else if (observation.clock_uncertain) "ClockUncertain" else if (observation.stalled) "WorkerStalled" else if (withdrawn) "FirewallWithdrawn" else if (known != null and known.? == .none and knowledge_cause != null) knowledge_cause.? else if (self.overBlocking()) "EffectRemovalOverdue" else if (knowledge_cause) |cause| cause else if (gate.last_failure) |failure| @errorName(failure.cause) else if (self.published_effects) |effects| if (effects.cause) |cause| @errorName(cause) else none_cause else if (self.backend_failure) |failure| @errorName(failure) else none_cause, .sqlite_code = if (gate.last_failure) |failure| failure.diagnostics.sqlite_code else null, .next_retry_ms = gate.next_retry_ms, .committed_records = gate.committed_records, .decisions_total = decisions, .jails_active = self.jails.len, .unhealthy_sources = unhealthy_sources, .backend = self.published_backend, .effect_backend = if (effect_diagnostic) |detail| @as(?[]const u8, @tagName(detail.backend)) else null, .effect_stage = if (effect_diagnostic) |detail| @as(?[]const u8, @tagName(detail.stage)) else null, .effect_cause = if (effect_diagnostic) |detail| @as(?[]const u8, @errorName(detail.cause)) else null, .effect_mutation = if (effect_diagnostic) |detail| @as(?[]const u8, @tagName(detail.mutation)) else null, .effects_uncertain = observation.expiry_uncertain or (if (self.published_effects) |effects| effects.uncertain else false), .overdue_effects = if (self.published_effects) |effects| effects.overdue else 0, .worker_busy = observation.busy, .worker_stalled = observation.stalled, .worker_busy_age_ms = observation.busy_age_ms, .worker_heartbeat_age_ms = observation.heartbeat_age_ms, .clock_uncertain = observation.clock_uncertain, .expiry_overdue = observation.expiry_overdue, .expiry_uncertain = observation.expiry_uncertain, .next_committed_expiry_us = observation.next_committed_expiry_us, .memory_admission_bytes = self.resources.limit_bytes, .uptime_seconds = if (observation.clock_uncertain) @as(?u64, null) else @as(u64, @intCast(@max(0, @divTrunc(now -| self.start_us, 1_000_000)))) }, .{ .emit_null_optional_fields = false }, out.writer(a));
         if (out.items.len == payload_start or out.items[out.items.len - 1] != '}') return error.InvalidStatusPayload;
         out.items.len -= 1;
         const writer = out.writer(a);
@@ -4000,6 +4061,7 @@ pub const Coordinator = struct {
     }
     fn enforcementActive(self: *const Coordinator, observation: health.WorkerStatus, now_ms: ?u64) bool {
         if (!observationSound(observation) or self.published_health.phase != .healthy or self.backend_failure != null or self.overBlocking()) return false;
+        if (self.published_effects) |effects| if (effects.withdrawn) return false;
         return (self.knowledge(now_ms) orelse return false) == .fresh;
     }
     fn confirmationKnown(self: *const Coordinator, now_ms: ?u64) bool {

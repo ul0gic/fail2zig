@@ -49,6 +49,7 @@ pub const Command = union(enum) {
     config: void,
     history: HistoryArgs,
     firewall: FirewallArgs,
+    firewall_withdraw: void,
     jail_admin: JailAdminArgs,
     history_reset: HistoryResetArgs,
     ignore: IgnoreArgs,
@@ -744,8 +745,12 @@ fn parseHistory(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) E
 }
 
 fn parseFirewall(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Error!Parsed {
+    if (rest.len > 0 and std.mem.eql(u8, rest[0], "withdraw")) {
+        try expectNoPositional(rest[1..], "firewall withdraw", diag, globals);
+        return Parsed{ .globals = globals.*, .command = .firewall_withdraw };
+    }
     if (rest.len == 0 or !std.mem.eql(u8, rest[0], "show")) {
-        diag.set("command 'firewall' requires 'show' (usage: firewall show [--details] [--limit <n>] [--cursor <token>])", .{});
+        diag.set("command 'firewall' requires 'show' or 'withdraw' (usage: firewall show [--details] [--limit <n>] [--cursor <token>] | firewall withdraw)", .{});
         return error.MissingArgument;
     }
 
@@ -951,6 +956,7 @@ pub const help_top =
     \\    config              Show the daemon's effective configuration
     \\    history             Page through confirmed ban history
     \\    firewall show       Inspect sampled fail2zig-owned kernel protection
+    \\    firewall withdraw   Remove fail2zig's kernel rules and hold enforcement off until restart
     \\    history reset <ip>  Reset an address's ban history in one jail or all jails
     \\    jail <action> <n>   enable, disable, pause or resume a jail
     \\    repair-source       Acknowledge a truncated or replaced file source (daemon stopped)
@@ -1090,9 +1096,11 @@ pub const help_history =
 
 pub const help_firewall =
     \\fail2zig firewall show — inspect fail2zig-owned kernel protection
+    \\fail2zig firewall withdraw — remove fail2zig's kernel rules until the next start
     \\
     \\USAGE:
     \\    fail2zig firewall show [--limit <n>] [--cursor <token>] [--details]
+    \\    fail2zig firewall withdraw
     \\
     \\FLAGS:
     \\    --limit <n>         Sample entries per page, 1..256 (default: daemon default)
@@ -1102,6 +1110,10 @@ pub const help_firewall =
     \\This reads the daemon's latest retained observation. It does not refresh, repair,
     \\or enumerate firewall state owned by other applications. Structural detail appears
     \\only when the retained owned readback has exact verification.
+    \\
+    \\withdraw removes every rule the daemon realized and holds enforcement off until the
+    \\next start; owners and deadlines are kept, and a restart reinstalls live bans. Stopping
+    \\the daemon leaves rules in place, so run withdraw first to stop with an empty table.
     \\
 ;
 

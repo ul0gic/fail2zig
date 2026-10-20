@@ -12,6 +12,8 @@ pub const completions = @import("completions.zig");
 const list_order = @import("list_order.zig");
 
 pub const client_version = build_options.version;
+// Above the daemon's 10 s wait for a withdrawal outcome, so the answer arrives before the socket times out.
+const firewall_withdraw_timeout_ms: u64 = 15_000;
 
 pub const ExitCode = enum(u8) {
     success = 0,
@@ -106,6 +108,11 @@ pub fn run(
                 .@"resume" => "group_resume",
             };
             return doAdmin(allocator, parsed.globals, stdout, stderr, .{ .kind = kind, .jail = j.name });
+        },
+        .firewall_withdraw => {
+            var globals = parsed.globals;
+            globals.timeout_ms = @max(globals.timeout_ms, firewall_withdraw_timeout_ms);
+            return doAdmin(allocator, globals, stdout, stderr, .{ .kind = "firewall_withdraw" });
         },
         .history_reset => |h| {
             if (h.jail) |jail_str| _ = parseJailIdRequired(jail_str, stderr) catch return .client_error;

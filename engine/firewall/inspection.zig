@@ -289,6 +289,8 @@ pub const Inspector = struct {
     limits: Limits,
     iptables_path: []const u8 = "/usr/sbin/iptables",
     ip6tables_path: []const u8 = "/usr/sbin/ip6tables",
+    iptables_restore_path: []const u8 = "/usr/sbin/iptables-restore",
+    ip6tables_restore_path: []const u8 = "/usr/sbin/ip6tables-restore",
     ipset_path: []const u8 = "/usr/sbin/ipset",
     iptables_legacy_save_path: []const u8 = "/usr/sbin/iptables-legacy-save",
     ip6tables_legacy_save_path: []const u8 = "/usr/sbin/ip6tables-legacy-save",
@@ -575,7 +577,6 @@ pub const Inspector = struct {
     }
     pub fn installBatch(self: *Inspector, tokens: []const DispatchToken, clock: ClockSample, baseline: *const Snapshot) Error!InstallOutcome {
         const transport = self.installation.transport;
-        if (transport != .nftables) return error.UnsupportedScope;
         if (tokens.len == 0 or tokens.len > max_install_messages) return error.LimitExceeded;
         for (tokens) |token| {
             try (DurableInstallationIntent{ .installation = token.installation, .intent_id = token.effect_id, .revision = token.aggregate_revision }).validate(self.installation);
@@ -590,7 +591,12 @@ pub const Inspector = struct {
         self.work_messages = 0;
         self.live_bytes = 0;
         var progress = MutationProgress{};
-        const consumed = self.installNft(tokens, clock, baseline, &elapsed, &phase, &progress) catch |err| return .{ .result = .{ .uncertain = self.failure(.effect_dispatch, err, progress) }, .consumed = tokens.len };
+        const installed = switch (transport) {
+            .nftables => self.installNft(tokens, clock, baseline, &elapsed, &phase, &progress),
+            .ipset => self.installIpset(tokens, clock, &elapsed, &phase, &progress),
+            .iptables => self.installIptables(tokens, baseline, &phase, &progress),
+        };
+        const consumed = installed catch |err| return .{ .result = .{ .uncertain = self.failure(.effect_dispatch, err, progress) }, .consumed = tokens.len };
         const observation_start = self.clockAt(clock, &elapsed) catch |err| return .{ .result = .{ .uncertain = self.failure(.effect_verify, err, progress) }, .consumed = consumed };
         var after = self.inspect() catch |err| return .{ .result = .{ .uncertain = self.failure(.effect_verify, err, progress) }, .consumed = consumed };
         errdefer after.deinit();
@@ -655,6 +661,55 @@ pub const Inspector = struct {
         nl.receiveAcknowledgments(&sock, related[count - 1 .. count], related[0 .. count + 1], @min(try self.remainingMs(timer), 2000)) catch |err| return rejectedBatch(err, progress);
         try self.afterMutation(1);
         return consumed;
+    }
+    const restore_line_bytes: usize = 128;
+    // iptables-nft sends one netlink batch per COMMIT; on 1.8.11 a 768-rule COMMIT failed with "Message too long" and 512 passed.
+    const iptables_rules_per_commit: usize = 256;
+    fn installIpset(self: *Inspector, tokens: []const DispatchToken, clock: ClockSample, elapsed: *std.time.Timer, timer: *std.time.Timer, progress: *MutationProgress) Error!usize {
+        var name_buf: [28]u8 = undefined;
+        const name = self.installation.name(&name_buf);
+        const input = self.allocator.alloc(u8, tokens.len * restore_line_bytes) catch return error.OutOfMemory;
+        defer self.allocator.free(input);
+        var stream = std.io.fixedBufferStream(input);
+        const now = try self.clockAt(clock, elapsed);
+        for (tokens) |token| {
+            const address = try legacyAddress(token.scope);
+            var set_buf: [31]u8 = undefined;
+            const set = try setName(name, address == .ipv6, &set_buf);
+            const units = try self.kernelUnits(token.operation, timingTransport(.ipset, token.scope), now);
+            stream.writer().print("add {s} {} timeout {d} -exist\n", .{ set, address, units }) catch return error.LimitExceeded;
+        }
+        try self.restore(&.{ self.ipset_path, "restore" }, stream.getWritten(), timer, progress);
+        return tokens.len;
+    }
+    fn installIptables(self: *Inspector, tokens: []const DispatchToken, baseline: *const Snapshot, timer: *std.time.Timer, progress: *MutationProgress) Error!usize {
+        var name_buf: [28]u8 = undefined;
+        const name = self.installation.name(&name_buf);
+        const input = self.allocator.alloc(u8, tokens.len * restore_line_bytes + restore_line_bytes) catch return error.OutOfMemory;
+        defer self.allocator.free(input);
+        for ([_]bool{ false, true }) |v6| {
+            var stream = std.io.fixedBufferStream(input);
+            const writer = stream.writer();
+            var rules: usize = 0;
+            for (tokens) |token| {
+                const address = try legacyAddress(token.scope);
+                if ((address == .ipv6) != v6) continue;
+                if (try findEntry(baseline.entries, token.scope, token.effect_id) != null) continue;
+                if (rules % iptables_rules_per_commit == 0) writer.writeAll(if (rules == 0) "*filter\n" else "COMMIT\n*filter\n") catch return error.LimitExceeded;
+                writer.print("-I {s} 1 -s {} -j DROP\n", .{ name, address }) catch return error.LimitExceeded;
+                rules += 1;
+            }
+            if (rules == 0) continue;
+            writer.writeAll("COMMIT\n") catch return error.LimitExceeded;
+            try self.restore(&.{ if (v6) self.ip6tables_restore_path else self.iptables_restore_path, "--wait=1", "--noflush" }, stream.getWritten(), timer, progress);
+        }
+        return tokens.len;
+    }
+    fn restore(self: *Inspector, argv: []const []const u8, input: []const u8, timer: *std.time.Timer, progress: *MutationProgress) Error!void {
+        const result = try self.runTool(argv, input, timer, progress);
+        defer result.deinit(self.allocator);
+        if (result.stdout.len != 0) return error.UnknownState;
+        try self.afterMutation(1);
     }
     fn failure(self: *const Inspector, stage: OperationStage, cause: Error, progress: MutationProgress) FailureContext {
         return .{
@@ -1011,6 +1066,9 @@ pub const Inspector = struct {
         return self.runTracked(argv, timer, null);
     }
     fn runTracked(self: *Inspector, argv: []const []const u8, timer: *std.time.Timer, progress: ?*MutationProgress) Error!command.Result {
+        return self.runTool(argv, null, timer, progress);
+    }
+    fn runTool(self: *Inspector, argv: []const []const u8, input: ?[]const u8, timer: *std.time.Timer, progress: ?*MutationProgress) Error!command.Result {
         try self.checkTime(timer);
         std.fs.accessAbsolute(argv[0], .{}) catch return error.ToolUnavailable;
         const remaining = try self.remainingMs(timer);
@@ -1018,7 +1076,10 @@ pub const Inspector = struct {
         if (reserved >= self.limits.max_bytes) return error.LimitExceeded;
         const allowance = (self.limits.max_bytes - reserved) / 4;
         if (progress) |value| value.requested = true;
-        const result = command.runBounded(self.allocator, argv, @min(remaining, 2000), @min(allowance, command.max_stdout_bytes), @min(allowance, 4096)) catch |err| return switch (err) {
+        const result = (if (input) |bytes|
+            command.runBoundedInput(self.allocator, argv, bytes, @min(remaining, 2000), @min(allowance, command.max_stdout_bytes), @min(allowance, 4096))
+        else
+            command.runBounded(self.allocator, argv, @min(remaining, 2000), @min(allowance, command.max_stdout_bytes), @min(allowance, 4096))) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.PermissionDenied => error.PermissionDenied,
             error.Timeout => error.Timeout,

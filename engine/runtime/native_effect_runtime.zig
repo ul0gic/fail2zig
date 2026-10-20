@@ -22,6 +22,7 @@ pub const Health = struct {
     uncertain: bool = false,
     overdue: usize = 0,
     confirmed: usize = 0,
+    withdrawn: bool = false,
     cause: ?anyerror = null,
     diagnostic: ?EffectDiagnostic = null,
 };
@@ -126,6 +127,7 @@ pub const Manager = struct {
     stop_cursor: usize = 0,
     stop_retries: u8 = 0,
     stopping: bool = false,
+    withdrawn: bool = false,
     observation_cache: ?*observation.Cache = null,
     readback_failures: u8 = 0,
     readback_wait: u16 = 0,
@@ -694,6 +696,7 @@ pub const Manager = struct {
             self.status.uncertain = true;
             self.status.cause = failure;
         }
+        if (self.withdrawn) return self.withdrawnReadback();
         if (self.store.effect_publication_epoch == std.math.maxInt(u64)) return error.EffectCapacity;
         const sampled = try self.clock();
         if (self.readback_wait != 0) {
@@ -921,7 +924,6 @@ pub const Manager = struct {
         return .idle;
     }
     fn installPending(self: *Manager, bindings: []const Binding, sampled: effect.Clock) !?Step {
-        if (self.inspector.installation.transport != .nftables) return null;
         var tokens: [firewall.max_install_messages]firewall.DispatchToken = undefined;
         var indices: [firewall.max_install_messages]usize = undefined;
         var stale: [firewall.max_install_messages]usize = undefined;
@@ -1227,7 +1229,20 @@ pub const Manager = struct {
     }
     pub const StorageGate = enum { healthy, unhealthy };
     pub fn stopStep(self: *Manager, expected_repair_epoch: u64, gate: StorageGate) Step {
-        return self.stopStepInner(expected_repair_epoch, gate) catch |failure| .{ .fatal = failure };
+        if (gate != .healthy) return .{ .fatal = error.StorageUnhealthy };
+        return self.stopStepInner(expected_repair_epoch, true) catch |failure| .{ .fatal = failure };
+    }
+    pub fn withdrawStep(self: *Manager, expected_repair_epoch: u64) Step {
+        const result = self.stopStepInner(expected_repair_epoch, false) catch |failure| Step{ .fatal = failure };
+        if (self.stopping or result == .idle) {
+            self.withdrawn = true;
+            self.status.ready = false;
+            self.status.withdrawn = true;
+            self.last_readback_ns = null;
+            @memset(self.confirmed[0..self.count], false);
+            self.view_revision +%= 1;
+        }
+        return result;
     }
     const max_stop_retries: u8 = 32;
     fn stopFailure(self: *Manager, cause: anyerror, fatal: anyerror) !Step {
@@ -1236,12 +1251,11 @@ pub const Manager = struct {
         self.dropInventory();
         return .{ .wait = self.waitDue() };
     }
-    fn stopStepInner(self: *Manager, expected_repair_epoch: u64, gate: StorageGate) !Step {
-        if (gate != .healthy) return error.StorageUnhealthy;
+    fn stopStepInner(self: *Manager, expected_repair_epoch: u64, require_ready: bool) !Step {
         if (expected_repair_epoch == 0 or expected_repair_epoch != self.repair_epoch) return error.StaleRepairEpoch;
         if (self.store.reopen_required) return error.ReopenRequired;
         if (!self.stopping) {
-            if (!self.admitted or !self.status.ready or self.cached_epoch == null or self.cached_epoch.? != self.store.effect_publication_epoch) return error.EffectReconciliationRequired;
+            if (!self.admitted or (require_ready and !self.status.ready) or self.cached_epoch == null or self.cached_epoch.? != self.store.effect_publication_epoch) return error.EffectReconciliationRequired;
             self.dropInventory();
             self.stopping = true;
             self.stop_cursor = 0;
@@ -1323,6 +1337,32 @@ pub const Manager = struct {
         self.count = 0;
         self.view_revision +%= 1;
         self.status = .{};
+        return .idle;
+    }
+    fn withdrawnReadback(self: *Manager) !Step {
+        const start_ns = self.monotonic(self.monotonic_context);
+        if (self.last_readback_ns) |last| if (start_ns) |now| if (now -| last < self.verify_interval_ns) return .idle;
+        const sampled = try self.clock();
+        var snapshot = self.inspector.inspect() catch |failure| {
+            self.recordFirewallDirect(.readback, failure);
+            if (transientReadback(failure)) return self.deferReadback();
+            return propagateFirewall(Step, failure);
+        };
+        defer snapshot.deinit();
+        if (snapshot.state != .owned) return error.InstallationMismatch;
+        self.captureObservation(&snapshot, .readback, sampled.prepared_us, .not_checked);
+        self.readback_failures = 0;
+        self.counters.full_readbacks += 1;
+        self.last_readback_ns = start_ns;
+        self.last_readback_wall_us = (try self.clock()).prepared_us;
+        self.installed_live = std.math.cast(u32, snapshot.entries.len) orelse return error.LimitExceeded;
+        self.status.ready = false;
+        self.status.withdrawn = true;
+        if (self.status.diagnostic) |diagnostic| if (transientReadback(diagnostic.cause)) {
+            self.status.diagnostic = null;
+            self.status.cause = null;
+            self.status.uncertain = false;
+        };
         return .idle;
     }
     pub const Residual = struct {
