@@ -215,8 +215,9 @@ stored bytes; the 262,144-row admission limit still applies to retained details.
 The default configuration admits at most 64 enabled jails, eight file incarnations per jail and
 one shared pool of 65,536 tracked retry subjects and up to 65,536 live bans across all enabled jails;
 a banned subject does not consume tracking capacity. Native reservation checks cover configured memory
-and descriptor budgets. SQLite uses a separate bounded heap and page limit; required history and
-recovery anchors remain pinned.
+and descriptor budgets. SQLite uses a separate bounded heap (64 MiB, counted in the admission
+figure) with a 32 MiB page cache inside it and a page limit; required history and recovery anchors
+remain pinned.
 
 Startup sets `max_page_count` to 1 GiB divided by the page size, so the state file
 cannot grow past 1 GiB (262,144 pages of 4 KiB), and a state file already past that

@@ -275,7 +275,7 @@ pub const Store = struct {
     }
     pub fn configureRuntimeLimits(self: *Store) Error!void {
         configureHeapLimit();
-        try self.exec("PRAGMA cache_size=-2048; PRAGMA wal_autocheckpoint=0;");
+        try self.exec("PRAGMA cache_size=-32768; PRAGMA wal_autocheckpoint=0;");
         const page_size = try self.integer("PRAGMA page_size;");
         if (page_size <= 0) return error.DatabaseFailure;
         const pages = @divTrunc(@as(i64, 1024 * 1024 * 1024), page_size);
