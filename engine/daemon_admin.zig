@@ -239,6 +239,7 @@ pub fn Methods(comptime Coordinator: type) type {
                         const lease = try duration.lease(now);
                         noteIgnoredTarget(request, jail);
                         _ = try self.store.setOwnerFromCanonical(.{ .scope = canonical, .jail = jail.name, .generation = generation, .decision_id = durable.Store.adminDecisionId(request.request_id, request.expected_revision), .expected_revision = if (current) |owner| owner.revision else 0, .lease = lease, .decided_us = now, .origin = .manual }, clock);
+                        jail.manual_bans +|= 1;
                         request.expect_absent = false;
                     } else {
                         if (origin) |held| if (held.origin == .config) return self.adminDetail(request, (AdminOutcomeView{ .outcome = .rejected, .kind = kind }).withReason("{s}", .{ban_origin.refused_config_text}), null);

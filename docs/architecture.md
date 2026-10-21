@@ -110,8 +110,9 @@ persisted schema or CLI duration syntax.
 ## Enforcement
 
 A policy decision is not reported as installed protection. fail2zig persists typed effect intent,
-dispatches it outside the record transaction and then inspects the selected backend. Confirmation
-requires exact owned-kernel readback. Uncertain outcomes remain visible and are reconciled without
+dispatches it outside the record transaction and confirms it from the backend. On nftables the
+confirmation is the kernel's acknowledgement of the atomic batch; on ipset and iptables it is an
+exact owned-kernel readback. Uncertain outcomes remain visible and are reconciled without
 claiming success.
 
 Multiple jails can own the same protected subject. Removing or expiring one owner does not release
@@ -129,33 +130,46 @@ another origin. Each takeover is one owner revision and one history event. The o
 state, not firewall structure: the kernel still holds one set per jail. States upgraded
 from v0.4.7 give every existing ban origin `detection`.
 
-The enforcement view follows storage incrementally: a commit that changes one scope is
-folded into the view in place, and only an unattributed change (for example a migration
-activation) rebuilds it from storage. The kernel is read back as one coherent
-observation per step: on nftables a single netlink pass whose coherence is the kernel's
-own interrupted-dump flag (an interrupted dump is retried), on iptables and ipset the
-two-pass agreement over tool output. The most recent readback is the inventory; a
-readback that started after the daemon's last own mutation and shows every desired
-entry confirms the set, and no second readback is taken to prove it. A confirmed view
-is re-read on a 5 s cadence or as soon as a ban deadline passes. That cadence is not a
-detection guarantee: external removal of a rule is noticed at the next complete
-readback, which pass work, retries and storage pauses can delay, and status reports
-the age of the last readback so the actual latency is visible. A live ban whose element a
-complete readback finds missing, for example after `nft flush set`, is dispatched again.
+The enforcement view follows storage incrementally: a commit that changes up to 64 scopes
+(one ingest frame) is folded into the view in place, and only an unattributed change (for
+example a migration activation) rebuilds it from storage. On nftables the kernel inventory
+is a shadow: the last complete readback, kept current by the acknowledgements of the
+daemon's own batches, by the kernel's own change events (the daemon subscribes to the
+nf_tables notification group and reads every element added or removed in its table), and
+by the daemon's own expiry schedule, since the kernel removes expired elements silently.
+The daemon's own echo events are recognised by the port id of the socket that sent the
+batch and skipped. The whole table is read back as one audit every 60 s, and at once after
+the event socket overflows, after a gap in the kernel's generation ids, after an event the
+daemon cannot decode, and at admission, reload, jail retirement and withdrawal; an
+interrupted dump is retried. On iptables and ipset the inventory is the two-pass agreement
+over tool output, re-read on a 5 s cadence or as soon as a ban deadline passes. A foreign
+removal of a live ban's element, for example after `nft flush set`, is seen in the event
+stream and the ban is dispatched again within the next effect slice; a foreign element
+added to the owned set is reported as an unowned entry. Status reports the age of the
+last audit and whether the event stream is healthy, so the actual detection latency is
+visible.
 
 Idle cost was measured on `f2z-target` (Debian 13, one vCPU, 4 GiB, kernel
 6.12.111+deb13-amd64, nftables backend) with 2,000 installed bans. Over a 5 minute window
 of 301 one-second intervals the daemon used a mean of 2.61 % CPU, a median of 2.0 % and a
 maximum of 6.0 %, and its journal child processes a further 1.36 % mean. A clean
-`systemctl stop` at that size took 1 s and withdrew the rules in 32 batched turns. These
-are the figures measured on that host, not a guarantee for other hosts.
+`systemctl stop` at that size took 1 s and withdrew the rules in 32 batched turns. On the
+same host with 65,536 installed bans, a cold restart (every element reinstalled) reached
+readiness in 373 s and idled at 12 % of one core over 3 minutes, against 371 s and 21 %
+before installs were confirmed by acknowledgement and drift by events; with 20,000 bans the
+daemon spent 3.5 % of one core over 2 minutes, 2.1 s of it per audit. Ingest through one
+file source went from 5 to 79 records per second with bans enforced as they were decided.
+These are the figures measured on that host, not a guarantee for other hosts.
 
 A new ban is dispatched from the inventory (no separate pre-read on nftables; the tool
-transports keep theirs because their mutations are several invocations), marked in
-memory as sent, and settled by the readback that returns with the mutation. Pending host
-bans are installed together, up to 1,024 in one dispatch on every backend, checked by the
-one readback that follows and settled in one commit. A mutation
-whose acknowledgment times out is settled by the next readback that postdates the send;
+transports keep theirs because their mutations are several invocations) and marked in
+memory as sent. On nftables pending host bans are installed together, up to 64 in one
+atomic batch, and settled in one commit from the kernel's acknowledgement of the batch
+end, which the kernel sends only after the whole batch committed; no readback is taken to
+prove an acknowledged install. On ipset and iptables pending host bans are installed
+together, up to 1,024 in one dispatch, checked by the one readback that follows and
+settled in one commit. A mutation whose acknowledgment times out is settled by the next
+readback that postdates the send;
 a kernel-rejected nftables batch is a non-mutation retried from a fresh readback.
 Transient readback and mutation signals (an interrupted dump, a two-pass disagreement,
 a timeout) retry with bounded backoff and never pause ingestion. A scoped rule group
@@ -223,11 +237,14 @@ configuration no longer names retires it the same way before validating owners, 
 of refusing with `UnconfiguredStateOwner`.
 
 Status separates what the daemon knows from what is installed. `active_bans` is what
-the last complete readback showed; `knowledge` is `fresh` within the verification
-cadence plus one wake, `stale` after it, and `none` before the first readback or under
-a fatal backend cause, with `confirmed_at_us` and `knowledge_age_ms` alongside. A stale
-readback keeps the last count and reports protection as `degraded`; no knowledge
-reports the count as absent and protection as `unknown`, never as zero.
+the kernel inventory holds: on nftables the shadow kept by acknowledgements and events,
+on the tool transports the last complete readback. `knowledge` is `fresh` while the last
+audit is within the verification cadence plus one wake (60 s on nftables with events, 5 s
+otherwise) and, on nftables, while the event stream is healthy; `stale` after an overflow
+or a missed audit; and `none` before the first readback or under a fatal backend cause,
+with `confirmed_at_us` and `knowledge_age_ms` alongside. Stale knowledge keeps the last
+count and reports protection as `degraded`; no knowledge reports the count as absent and
+protection as `unknown`, never as zero.
 `pending_bans`, `overdue_removals`, `overdue_bookkeeping` and their oldest ages describe
 work not yet confirmed; a served backlog does not degrade protection. Expiry is split by
 what the kernel holds: an expired rule the last readback still shows installed

@@ -392,7 +392,7 @@ pub const Store = struct {
         self.noted_ambiguous = false;
     }
     pub const attribution_ring = 256;
-    pub const attribution_batch = 8;
+    pub const attribution_batch = @import("group_commit.zig").max_batch_records;
     pub const AttributedChange = struct {
         epoch: u64 = 0,
         count: u8 = 0,

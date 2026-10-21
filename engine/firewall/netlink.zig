@@ -31,6 +31,7 @@ pub const Error = error{
     BufferTooSmall,
     InvalidBatchState,
     DumpInterrupted,
+    EventsOverflowed,
 };
 
 pub const StrictMessages = struct {
@@ -90,6 +91,31 @@ pub fn recvKernel(sock: *NetlinkSocket, scratch: []u8) Error![]const u8 {
         else => return error.RecvFailed,
     }
     try validateKernelEnvelope(sender, msg.namelen, msg.flags, rc, scratch.len);
+    return scratch[0..rc];
+}
+
+pub fn recvEvents(sock: *NetlinkSocket, scratch: []u8) Error!?[]const u8 {
+    var sender: linux.sockaddr.nl = .{ .pid = 0, .groups = 0 };
+    var iov = posix.iovec{ .base = scratch.ptr, .len = scratch.len };
+    var msg: linux.msghdr = .{
+        .name = @ptrCast(&sender),
+        .namelen = @sizeOf(linux.sockaddr.nl),
+        .iov = @ptrCast(&iov),
+        .iovlen = 1,
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    const rc = linux.recvmsg(sock.fd, &msg, linux.MSG.DONTWAIT);
+    switch (linux.E.init(rc)) {
+        .SUCCESS => {},
+        .AGAIN => return null,
+        .NOBUFS => return error.EventsOverflowed,
+        else => return error.RecvFailed,
+    }
+    const expected_groups = @as(u32, 1) << @intCast(sock.group - 1);
+    if (msg.namelen != @sizeOf(linux.sockaddr.nl) or sender.family != posix.AF.NETLINK or sender.pid != 0 or sender.groups != expected_groups) return error.RecvFailed;
+    if ((msg.flags & (linux.MSG.TRUNC | linux.MSG.CTRUNC)) != 0 or rc == 0 or rc > scratch.len) return error.TruncatedMessage;
     return scratch[0..rc];
 }
 
@@ -226,10 +252,16 @@ pub fn errnoToError(errno: i32) Error {
     };
 }
 
+// linux/netlink.h: SOL_NETLINK option joining one multicast group by number.
+const NETLINK_ADD_MEMBERSHIP: u32 = 1;
+// 4 MiB holds about forty 1,024-element install batches of events between the worker's 100 ms drains.
+pub const event_receive_bytes: u32 = 4 << 20;
+
 pub const NetlinkSocket = struct {
     fd: posix.socket_t,
     seq: u32 = 1,
     port_id: u32 = 0,
+    group: u32 = 0,
 
     pub fn init(protocol: u32) Error!NetlinkSocket {
         const flags = posix.SOCK.RAW | posix.SOCK.CLOEXEC;
@@ -255,6 +287,22 @@ pub const NetlinkSocket = struct {
         };
 
         return .{ .fd = fd, .port_id = sa.pid };
+    }
+
+    pub fn initEvents(group: u32) Error!NetlinkSocket {
+        if (group == 0 or group > 32) return error.InvalidArgument;
+        var sock = try init(linux.NETLINK.NETFILTER);
+        errdefer sock.close();
+        posix.setsockopt(sock.fd, linux.SOL.NETLINK, NETLINK_ADD_MEMBERSHIP, mem.asBytes(&group)) catch |err| return switch (err) {
+            error.PermissionDenied => error.PermissionDenied,
+            else => error.SocketFailed,
+        };
+        const bytes: u32 = event_receive_bytes;
+        posix.setsockopt(sock.fd, posix.SOL.SOCKET, linux.SO.RCVBUFFORCE, mem.asBytes(&bytes)) catch {
+            posix.setsockopt(sock.fd, posix.SOL.SOCKET, posix.SO.RCVBUF, mem.asBytes(&bytes)) catch return error.SocketFailed;
+        };
+        sock.group = group;
+        return sock;
     }
 
     pub fn close(self: *NetlinkSocket) void {
@@ -447,6 +495,7 @@ pub fn parseNlmsgerr(payload: []const u8) Error!i32 {
 pub const NFNL = struct {
     pub const SUBSYS_NFTABLES: u16 = 10;
     pub const SUBSYS_IPSET: u16 = 6;
+    pub const GRP_NFTABLES: u32 = 7;
 };
 
 pub fn nfnlMsgType(subsys: u16, msg: u16) u16 {
@@ -517,9 +566,10 @@ pub const Batch = struct {
             .res_id = mem.nativeToBig(u16, subsys),
         };
         const payload = mem.asBytes(&ng);
+        // The kernel queues the END ack only after the commit succeeded (Linux 6.12 nfnetlink.c); it is the proof the batch committed.
         try self.builder.append(
             NFNL_MSG_BATCH_END,
-            linux.NLM_F_REQUEST,
+            linux.NLM_F_REQUEST | linux.NLM_F_ACK,
             seq,
             pid,
             payload,

@@ -69,7 +69,14 @@ pub const NFTA_LIST_ELEM: u16 = 1;
 
 pub const NFTA_SET_ELEM = struct {
     pub const KEY: u16 = 1;
+    pub const FLAGS: u16 = 3;
     pub const TIMEOUT: u16 = 4;
+    pub const EXPIRATION: u16 = 5;
+};
+
+pub const NFTA_GEN = struct {
+    pub const ID: u16 = 1;
+    pub const PROC_PID: u16 = 2;
 };
 
 pub const NFTA_DATA_VALUE: u16 = 1;
@@ -717,6 +724,86 @@ pub const ProbeResult = enum {
 
 const PROBE_RECV_TIMEOUT_MS: u64 = 2000;
 
+pub const ElementEvent = struct {
+    removed: bool,
+    family: u8,
+    table: []const u8,
+    set: []const u8,
+    elements: []const u8,
+    pid: u32,
+    generation: u16,
+};
+pub const GenerationEvent = struct { id: u32, pid: u32 };
+pub const Event = union(enum) { elements: ElementEvent, generation: GenerationEvent, other: u16 };
+
+pub fn decodeEvent(item: netlink.MessageIterator.View) netlink.Error!Event {
+    const kind = @intFromEnum(item.hdr.type);
+    if (kind >> 8 != netlink.NFNL.SUBSYS_NFTABLES) return .{ .other = kind };
+    if (item.payload.len < @sizeOf(netlink.nfgenmsg)) return error.TruncatedMessage;
+    const message: u16 = kind & 0xff;
+    switch (message) {
+        NFT_MSG.NEWSETELEM, NFT_MSG.DELSETELEM => {
+            var table: ?[]const u8 = null;
+            var set: ?[]const u8 = null;
+            var elements: []const u8 = &.{};
+            var attrs = netlink.Attributes{ .bytes = item.payload[@sizeOf(netlink.nfgenmsg)..] };
+            while (try attrs.next()) |attr| switch (attr.kind) {
+                NFTA_SET_ELEM_LIST.TABLE => table = attributeText(attr.value),
+                NFTA_SET_ELEM_LIST.SET => set = attributeText(attr.value),
+                NFTA_SET_ELEM_LIST.ELEMENTS => elements = attr.value,
+                else => {},
+            };
+            return .{ .elements = .{
+                .removed = message == NFT_MSG.DELSETELEM,
+                .family = item.payload[0],
+                .table = table orelse return error.TruncatedMessage,
+                .set = set orelse return error.TruncatedMessage,
+                .elements = elements,
+                .pid = item.hdr.pid,
+                .generation = mem.readInt(u16, item.payload[2..4], .big),
+            } };
+        },
+        NFT_MSG.NEWGEN => return .{ .generation = .{ .id = try generationId(item.payload), .pid = item.hdr.pid } },
+        else => return .{ .other = kind },
+    }
+}
+
+fn attributeText(value: []const u8) []const u8 {
+    return if (value.len > 0 and value[value.len - 1] == 0) value[0 .. value.len - 1] else value;
+}
+
+fn generationId(payload: []const u8) netlink.Error!u32 {
+    if (payload.len < @sizeOf(netlink.nfgenmsg)) return error.TruncatedMessage;
+    var attrs = netlink.Attributes{ .bytes = payload[@sizeOf(netlink.nfgenmsg)..] };
+    while (try attrs.next()) |attr| if (attr.kind == NFTA_GEN.ID) {
+        if (attr.value.len != 4) return error.TruncatedMessage;
+        return mem.readInt(u32, attr.value[0..4], .big);
+    };
+    return error.NetlinkError;
+}
+
+pub fn queryGeneration(sock: *netlink.NetlinkSocket, timeout_ms: u64) netlink.Error!u32 {
+    var msg_buf: [64]u8 = undefined;
+    var builder = netlink.MessageBuilder.init(&msg_buf);
+    const seq = sock.nextSeq();
+    const ng: netlink.nfgenmsg = .{ .nfgen_family = netlink.NFPROTO.UNSPEC };
+    try builder.append(netlink.nfnlMsgType(netlink.NFNL.SUBSYS_NFTABLES, NFT_MSG.GETGEN), linux.NLM_F_REQUEST, seq, sock.port_id, std.mem.asBytes(&ng));
+    try netlink.sendKernel(sock, builder.bytes(), timeout_ms);
+    try sock.setRecvTimeout(timeout_ms);
+    var bytes: [1024]u8 = undefined;
+    var messages = netlink.StrictMessages{ .bytes = try netlink.recvKernel(sock, &bytes) };
+    while (try messages.next()) |item| {
+        if (item.hdr.seq != seq) continue;
+        if (@intFromEnum(item.hdr.type) == 2) {
+            const code = try netlink.parseNlmsgerr(item.payload);
+            return if (code == 0) error.NetlinkError else netlink.errnoToError(code);
+        }
+        if (@intFromEnum(item.hdr.type) != netlink.nfnlMsgType(netlink.NFNL.SUBSYS_NFTABLES, NFT_MSG.NEWGEN)) return error.NetlinkError;
+        return generationId(item.payload);
+    }
+    return error.NetlinkError;
+}
+
 pub fn probeReason() ProbeResult {
     var sock = netlink.NetlinkSocket.init(linux.NETLINK.NETFILTER) catch |err| {
         return probeReasonFromInitError(err);
@@ -1192,6 +1279,7 @@ fn mapNetlinkErr(err: netlink.Error) backend.BackendError {
         error.InvalidBatchState,
         error.SocketFailed,
         error.SendFailed,
+        error.EventsOverflowed,
         error.RecvFailed,
         error.NetlinkError,
         error.InvalidArgument,

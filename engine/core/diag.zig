@@ -7,11 +7,11 @@ const tracy = @import("tracy.zig");
 
 pub const banner = "DIAGNOSTIC BUILD — not for production";
 
-pub const Section = enum { journal, file, dump, compare, expiry, commit, wal, publish, fsync, readback, dispatch, reload, select, owners, history, maintenance };
-pub const Counter = enum { wakes, spawns, dump_messages, dump_elements, readbacks, journal_records, file_records, ingest_full_bursts, write_commits, commit_rows, consistency_checks, consistency_skipped };
+pub const Section = enum { journal, file, dump, compare, expiry, commit, wal, publish, fsync, readback, dispatch, reload, select, owners, history, maintenance, events };
+pub const Counter = enum { wakes, spawns, dump_messages, dump_elements, readbacks, journal_records, file_records, ingest_full_bursts, write_commits, commit_rows, consistency_checks, consistency_skipped, events_received, events_applied, events_dropped, acknowledged_batches };
 pub const Gauge = enum { readback_late_ms, wal_bytes, rss_bytes, startup_ready_ms, ingest_backlog_bytes, commit_rows_last };
 pub const Limit = enum { live_bans, banned_subjects, retry_rows, effect_owners, effects, owner_revisions, intents, observations, action_targets, confirmed_events, event_details, pending_receipts, state_pages, sqlite_heap, kernel_elements, memory_plan, fds };
-pub const Event = enum { commit_refused, source_paused, readback_stale, readback_deferred, storage_failed, continuity_loss, slow_startup, headroom_low, consistency_mismatch };
+pub const Event = enum { commit_refused, source_paused, readback_stale, readback_deferred, storage_failed, continuity_loss, slow_startup, headroom_low, consistency_mismatch, events_overflowed };
 pub const EventDetail = struct {
     subject: []const u8 = "",
     cause: []const u8 = "",

@@ -6,7 +6,7 @@ const shared = @import("shared");
 const build_options = @import("build_options");
 const diag_mod = @import("../core/diag.zig");
 const nl = @import("netlink.zig");
-const nft = @import("nftables.zig");
+pub const nft = @import("nftables.zig");
 const command = @import("command.zig");
 const linux = std.os.linux;
 const mem = std.mem;
@@ -14,7 +14,7 @@ const mem = std.mem;
 pub const Transport = enum { nftables, iptables, ipset };
 pub const canonical_scope = @import("scope.zig");
 pub const CanonicalScope = canonical_scope.Scope;
-pub const Error = error{ UnknownState, ForeignState, Incomplete, Changed, DumpInterrupted, LimitExceeded, UnsupportedScope, ExpiredIntent, UnsupportedDeadline, InvalidInstallation, ToolUnavailable, PermissionDenied, Timeout, OutOfMemory, SystemError };
+pub const Error = error{ UnknownState, ForeignState, Incomplete, Changed, DumpInterrupted, EventsLost, LimitExceeded, UnsupportedScope, ExpiredIntent, UnsupportedDeadline, InvalidInstallation, ToolUnavailable, PermissionDenied, Timeout, OutOfMemory, SystemError };
 pub const OperationStage = enum { admission_probe, admission_dispatch, admission_verify, readback, effect_dispatch, effect_verify };
 pub const MutationDisposition = enum { not_started, outcome_uncertain };
 pub const FailureContext = struct {
@@ -33,7 +33,7 @@ const install_batch_bytes: usize = 512 * 1024;
 pub fn batchable(scope: CanonicalScope) bool {
     return hostScope(scope);
 }
-pub const InstallOutcome = struct { result: EffectResult, consumed: usize };
+pub const InstallOutcome = struct { result: InstallResult, consumed: usize };
 
 pub fn validateCanonicalScope(_: Transport, scope: CanonicalScope) Error!void {
     scope.validate() catch return error.UnsupportedScope;
@@ -72,7 +72,7 @@ fn hostScope(scope: CanonicalScope) bool {
     return true;
 }
 
-fn legacyAddress(scope: CanonicalScope) Error!shared.IpAddress {
+pub fn legacyAddress(scope: CanonicalScope) Error!shared.IpAddress {
     scope.validate() catch return error.UnsupportedScope;
     if (scope.subject.kind != .host or !scope.protocols.isAll() or !scope.ports.isAll()) return error.UnsupportedScope;
     return subjectAddress(scope.subject);
@@ -212,12 +212,13 @@ pub const Snapshot = struct {
     installation: Installation,
     state: enum { absent, owned },
     entries: []Entry,
+    capacity: usize = 0,
     fingerprint: [32]u8,
     structure_proof: StructureProof = .unverified,
     observed_start_ns: u64,
     observed_end_ns: u64,
     pub fn deinit(self: *Snapshot) void {
-        self.allocator.free(self.entries);
+        self.allocator.free(self.entries.ptr[0..@max(self.capacity, self.entries.len)]);
         self.* = undefined;
     }
     pub fn find(self: *const Snapshot, scope: CanonicalScope) Error!?usize {
@@ -227,7 +228,39 @@ pub const Snapshot = struct {
         if (offset > self.entries.len) return error.Incomplete;
         return self.entries[offset..@min(self.entries.len, offset + @min(@as(usize, 64), self.entries.len - offset))];
     }
+    pub fn upsertHost(self: *Snapshot, entry: Entry) Error!bool {
+        if (entry.scope != null) return error.UnsupportedScope;
+        if (try entryIndex(self.entries, entryScope(entry))) |index| {
+            self.entries[index] = entry;
+            return false;
+        }
+        const len = self.entries.len;
+        const held = @max(self.capacity, len);
+        if (len == held) {
+            const wanted = held + held / 2 + 8;
+            const grown = self.allocator.realloc(self.entries.ptr[0..held], wanted) catch return error.OutOfMemory;
+            self.entries = grown[0..len];
+            self.capacity = wanted;
+        }
+        const room = self.entries.ptr[0 .. len + 1];
+        var index = len;
+        while (index > 0 and entryLess({}, entry, room[index - 1])) : (index -= 1) room[index] = room[index - 1];
+        room[index] = entry;
+        self.entries = room;
+        return true;
+    }
+    pub fn removeHost(self: *Snapshot, entry: Entry) Error!bool {
+        if (entry.scope != null) return error.UnsupportedScope;
+        const index = try entryIndex(self.entries, entryScope(entry)) orelse return false;
+        mem.copyForwards(Entry, self.entries[index .. self.entries.len - 1], self.entries[index + 1 ..]);
+        self.capacity = @max(self.capacity, self.entries.len);
+        self.entries = self.entries.ptr[0 .. self.entries.len - 1];
+        return true;
+    }
 };
+
+pub const EventDelta = struct { added: u32 = 0, replaced: u32 = 0, removed: u32 = 0, missing: u32 = 0 };
+pub const EventSink = struct { context: *anyopaque, apply: *const fn (*anyopaque, nft.Event) Error!void };
 
 pub const DurableInstallationIntent = struct {
     installation: Installation,
@@ -272,6 +305,18 @@ pub const EffectResult = union(enum) {
         self.* = undefined;
     }
 };
+pub const InstallResult = union(enum) {
+    verified: struct { snapshot: Snapshot, changed: bool, observed_start_wall_us: i64, observed_wall_us: i64 },
+    acknowledged: struct { sent_wall_us: i64, acked_wall_us: i64, port_id: u32 },
+    uncertain: FailureContext,
+    pub fn deinit(self: *InstallResult) void {
+        switch (self.*) {
+            .verified => |*v| v.snapshot.deinit(),
+            .acknowledged, .uncertain => {},
+        }
+        self.* = undefined;
+    }
+};
 
 pub const ExactObservation = struct {
     snapshot: Snapshot,
@@ -298,6 +343,9 @@ pub const Inspector = struct {
     retained_bytes: usize = 0,
     live_bytes: usize = 0,
     dump_interruptions: u64 = 0,
+    events: ?nl.NetlinkSocket = null,
+    install: ?nl.NetlinkSocket = null,
+    last_install_port: u32 = 0,
     clock_rate: if (build_options.diag) u32 else void = if (build_options.diag) 1 else {},
     test_fault_after_mutations: if (@import("builtin").is_test) ?usize else void = if (@import("builtin").is_test) null else {},
     test_between_reads: if (@import("builtin").is_test) ?*const fn (*Inspector) void else void = if (@import("builtin").is_test) null else {},
@@ -307,7 +355,73 @@ pub const Inspector = struct {
         try limits.validate();
         return .{ .allocator = allocator, .installation = installation, .limits = limits };
     }
-    pub fn close(_: *Inspector) void {}
+    pub fn close(self: *Inspector) void {
+        self.unsubscribe();
+        self.dropInstallSocket();
+    }
+    fn installSocket(self: *Inspector) nl.Error!*nl.NetlinkSocket {
+        if (self.install == null) {
+            var sock = try nl.NetlinkSocket.init(linux.NETLINK.NETFILTER);
+            errdefer sock.close();
+            try sock.setSendBuffer(install_batch_bytes * 2);
+            self.install = sock;
+        }
+        self.last_install_port = self.install.?.port_id;
+        return &self.install.?;
+    }
+    fn dropInstallSocket(self: *Inspector) void {
+        if (self.install) |*sock| sock.close();
+        self.install = null;
+    }
+    pub fn subscribe(self: *Inspector) Error!void {
+        if (self.installation.transport != .nftables or self.events != null) return;
+        self.events = nl.NetlinkSocket.initEvents(nl.NFNL.GRP_NFTABLES) catch |err| return netlinkError(err);
+    }
+    pub fn unsubscribe(self: *Inspector) void {
+        if (self.events) |*sock| sock.close();
+        self.events = null;
+    }
+    pub fn subscribed(self: *const Inspector) bool {
+        return self.events != null;
+    }
+    pub fn drainEvents(self: *Inspector, sink: EventSink, max_datagrams: usize) Error!usize {
+        const sock = &(self.events orelse return 0);
+        var bytes: [16384]u8 = undefined;
+        var datagrams: usize = 0;
+        while (datagrams < max_datagrams) : (datagrams += 1) {
+            const data = (nl.recvEvents(sock, &bytes) catch |err| return switch (err) {
+                error.EventsOverflowed => error.EventsLost,
+                else => netlinkError(err),
+            }) orelse break;
+            var messages = nl.StrictMessages{ .bytes = data };
+            while (messages.next() catch return error.Incomplete) |item| {
+                const event = nft.decodeEvent(item) catch |err| return netlinkError(err);
+                try sink.apply(sink.context, event);
+            }
+        }
+        return datagrams;
+    }
+    pub fn applyEvent(self: *Inspector, snapshot: *Snapshot, event: nft.ElementEvent, offset_ms: i64) Error!?EventDelta {
+        var name_buf: [28]u8 = undefined;
+        if (!mem.eql(u8, event.table, self.installation.name(&name_buf))) return null;
+        const index: usize = if (mem.eql(u8, event.set, "banned_ipv4")) 0 else if (mem.eql(u8, event.set, "banned_ipv6")) 1 else return error.ForeignState;
+        const capacity = self.limits.max_bytes / @sizeOf(Entry);
+        var delta = EventDelta{};
+        var items = nl.Attributes{ .bytes = event.elements };
+        while (items.next() catch return error.Incomplete) |item| {
+            if (item.kind != 1 or (item.flags & 0x4000) != 0) return error.UnknownState;
+            var entry = try decodeSetElement(item.value, index);
+            if (entry.remaining_ms) |remaining| entry.remaining_ms = @intCast(@max(0, @as(i64, @intCast(remaining)) + offset_ms));
+            if (event.removed) {
+                if (try snapshot.removeHost(entry)) delta.removed += 1 else delta.missing += 1;
+            } else {
+                if (snapshot.entries.len >= capacity) return error.LimitExceeded;
+                if (try snapshot.upsertHost(entry)) delta.added += 1 else delta.replaced += 1;
+            }
+        }
+        self.retained_bytes = snapshot.entries.len * @sizeOf(Entry);
+        return delta;
+    }
 
     pub fn admitInstallation(self: *Inspector, intent: DurableInstallationIntent) Error!AdmissionResult {
         try intent.validate(self.installation);
@@ -570,7 +684,7 @@ pub const Inspector = struct {
         const send_timeout = @min(try self.remainingMs(timer), 2000);
         progress.requested = true;
         nl.sendKernel(&sock, bytes, send_timeout) catch |err| return netlinkError(err);
-        nl.receiveAcknowledgments(&sock, related[1..count], related[0 .. count + 1], @min(try self.remainingMs(timer), 2000)) catch |err| return rejectedBatch(err, progress);
+        nl.receiveAcknowledgments(&sock, related[count .. count + 1], related[0 .. count + 1], @min(try self.remainingMs(timer), 2000)) catch |err| return rejectedBatch(err, progress);
         try self.afterMutation(1);
     }
     pub fn installBatch(self: *Inspector, tokens: []const DispatchToken, clock: ClockSample, baseline: *const Snapshot) Error!InstallOutcome {
@@ -589,6 +703,7 @@ pub const Inspector = struct {
         self.work_messages = 0;
         self.live_bytes = 0;
         var progress = MutationProgress{};
+        const sent_wall_us = self.clockAt(clock, &elapsed) catch |err| return .{ .result = .{ .uncertain = self.failure(.effect_dispatch, err, progress) }, .consumed = tokens.len };
         const installed = switch (transport) {
             .nftables => self.installNft(tokens, clock, baseline, &elapsed, &phase, &progress),
             .ipset => self.installIpset(tokens, clock, &elapsed, &phase, &progress),
@@ -596,6 +711,7 @@ pub const Inspector = struct {
         };
         const consumed = installed catch |err| return .{ .result = .{ .uncertain = self.failure(.effect_dispatch, err, progress) }, .consumed = tokens.len };
         const observation_start = self.clockAt(clock, &elapsed) catch |err| return .{ .result = .{ .uncertain = self.failure(.effect_verify, err, progress) }, .consumed = consumed };
+        if (transport == .nftables) return .{ .result = .{ .acknowledged = .{ .sent_wall_us = sent_wall_us, .acked_wall_us = observation_start, .port_id = self.last_install_port } }, .consumed = consumed };
         var after = self.inspect() catch |err| return .{ .result = .{ .uncertain = self.failure(.effect_verify, err, progress) }, .consumed = consumed };
         errdefer after.deinit();
         const observation_end = self.clockAt(clock, &elapsed) catch |err| return .{ .result = .{ .uncertain = self.failure(.effect_verify, err, progress) }, .consumed = consumed };
@@ -610,9 +726,7 @@ pub const Inspector = struct {
     fn installNft(self: *Inspector, tokens: []const DispatchToken, clock: ClockSample, baseline: *const Snapshot, elapsed: *std.time.Timer, timer: *std.time.Timer, progress: *MutationProgress) Error!usize {
         var name_buf: [28]u8 = undefined;
         const name = self.installation.name(&name_buf);
-        var sock = nl.NetlinkSocket.init(linux.NETLINK.NETFILTER) catch |err| return netlinkError(err);
-        defer sock.close();
-        sock.setSendBuffer(install_batch_bytes * 2) catch |err| return netlinkError(err);
+        const sock = self.installSocket() catch |err| return netlinkError(err);
         const batch_bytes = self.allocator.alignedAlloc(u8, 4, install_batch_bytes) catch return error.OutOfMemory;
         defer self.allocator.free(batch_bytes);
         const related = self.allocator.alloc(u32, 2 * max_install_messages + 2) catch return error.OutOfMemory;
@@ -624,7 +738,6 @@ pub const Inspector = struct {
         const now = try self.clockAt(clock, elapsed);
         var count: usize = 1;
         var consumed: usize = 0;
-        var last_header: usize = 0;
         for (tokens) |token| {
             const address = try legacyAddress(token.scope);
             const existed = (try findEntry(baseline.entries, token.scope, token.effect_id)) != null;
@@ -642,21 +755,23 @@ pub const Inspector = struct {
             }
             const payload = nft.buildSetElemAddPayload(&payload_buf, nl.NFPROTO.INET, name, set, key, units) catch |err| return netlinkError(err);
             related[count] = sock.nextSeq();
-            last_header = batch.builder.offset;
             batch.add(nl.nfnlMsgType(nl.NFNL.SUBSYS_NFTABLES, nft.NFT_MSG.NEWSETELEM), linux.NLM_F_REQUEST | linux.NLM_F_CREATE | linux.NLM_F_EXCL, related[count], sock.port_id, payload) catch |err| return netlinkError(err);
             count += 1;
             consumed += 1;
         }
         if (consumed == 0) return error.LimitExceeded;
-        // Only the last message asks for an ack: the kernel reports failed messages in order regardless, so that one ack proves the batch committed.
-        const last: *linux.nlmsghdr = @alignCast(@ptrCast(&batch_bytes[last_header]));
-        last.flags |= linux.NLM_F_ACK;
         related[count] = sock.nextSeq();
         const bytes = batch.commit(related[count], sock.port_id, nl.NFNL.SUBSYS_NFTABLES) catch |err| return netlinkError(err);
         const send_timeout = @min(try self.remainingMs(timer), 2000);
         progress.requested = true;
-        nl.sendKernel(&sock, bytes, send_timeout) catch |err| return netlinkError(err);
-        nl.receiveAcknowledgments(&sock, related[count - 1 .. count], related[0 .. count + 1], @min(try self.remainingMs(timer), 2000)) catch |err| return rejectedBatch(err, progress);
+        nl.sendKernel(sock, bytes, send_timeout) catch |err| {
+            self.dropInstallSocket();
+            return netlinkError(err);
+        };
+        nl.receiveAcknowledgments(sock, related[count .. count + 1], related[0 .. count + 1], @min(try self.remainingMs(timer), 2000)) catch |err| {
+            self.dropInstallSocket();
+            return rejectedBatch(err, progress);
+        };
         try self.afterMutation(1);
         return consumed;
     }
@@ -831,7 +946,7 @@ pub const Inspector = struct {
         const send_timeout = @min(try self.remainingMs(timer), 2000);
         progress.requested = true;
         nl.sendKernel(&sock, bytes, send_timeout) catch |err| return netlinkError(err);
-        nl.receiveAcknowledgments(&sock, related[1..count], related[0 .. count + 1], @min(try self.remainingMs(timer), 2000)) catch |err| return rejectedBatch(err, progress);
+        nl.receiveAcknowledgments(&sock, related[count .. count + 1], related[0 .. count + 1], @min(try self.remainingMs(timer), 2000)) catch |err| return rejectedBatch(err, progress);
     }
 
     fn mutateScopedNft(self: *Inspector, token: DispatchToken, name: []const u8, timer: *std.time.Timer, progress: *MutationProgress) Error!void {
@@ -890,7 +1005,7 @@ pub const Inspector = struct {
         const send_timeout = @min(try self.remainingMs(timer), 2000);
         progress.requested = true;
         nl.sendKernel(&sock, bytes, send_timeout) catch |err| return netlinkError(err);
-        nl.receiveAcknowledgments(&sock, related[1..count], related[0 .. count + 1], @min(try self.remainingMs(timer), 2000)) catch |err| return rejectedBatch(err, progress);
+        nl.receiveAcknowledgments(&sock, related[count .. count + 1], related[0 .. count + 1], @min(try self.remainingMs(timer), 2000)) catch |err| return rejectedBatch(err, progress);
     }
 
     fn afterMutation(self: *Inspector, count: usize) Error!void {
@@ -955,7 +1070,7 @@ pub const Inspector = struct {
         const send_timeout = @min(try self.remainingMs(timer), 2000);
         progress.requested = true;
         nl.sendKernel(&sock, bytes, send_timeout) catch |err| return netlinkError(err);
-        nl.receiveAcknowledgments(&sock, related[1..7], &related, @min(try self.remainingMs(timer), 2000)) catch |err| return netlinkError(err);
+        nl.receiveAcknowledgments(&sock, related[7..8], &related, @min(try self.remainingMs(timer), 2000)) catch |err| return netlinkError(err);
     }
 
     fn clockAt(self: *const Inspector, clock: ClockSample, timer: *std.time.Timer) Error!i64 {
@@ -981,7 +1096,7 @@ pub const Inspector = struct {
         if (deadline <= anchor_us) return operation;
         return .{ .ensure_present = .{ .finite_deadline_us = anchor_us + @as(i64, @intCast(self.toKernelUs(@intCast(deadline - anchor_us)))) } };
     }
-    fn toKernelUs(self: *const Inspector, virtual_us: u64) u64 {
+    pub fn toKernelUs(self: *const Inspector, virtual_us: u64) u64 {
         if (comptime !build_options.diag) return virtual_us;
         if (self.clock_rate <= 1) return virtual_us;
         return virtual_us / self.clock_rate + @intFromBool(virtual_us % self.clock_rate != 0);
@@ -1535,6 +1650,7 @@ fn copySnapshot(allocator: mem.Allocator, source: *const Snapshot) Error!Snapsho
     var copy = source.*;
     copy.allocator = allocator;
     copy.entries = try allocator.dupe(Entry, source.entries);
+    copy.capacity = copy.entries.len;
     return copy;
 }
 
@@ -1754,6 +1870,7 @@ fn netlinkError(err: nl.Error) Error {
         error.Timeout => error.Timeout,
         error.TruncatedMessage => error.Incomplete,
         error.BufferTooSmall => error.LimitExceeded,
+        error.EventsOverflowed => error.Changed,
         error.DumpInterrupted => error.DumpInterrupted,
         else => error.UnknownState,
     };
@@ -1871,6 +1988,20 @@ fn equalExpressions(a: []const u8, b: []const u8) Error!bool {
     return (actual.next() catch return error.Incomplete) == null;
 }
 
+pub fn decodeSetElement(value: []const u8, family_index: usize) Error!Entry {
+    const e = try AttrMap.parse(value, &.{ 1, 3, 4, 5, 8 });
+    if (e.values[3] != null and try e.number(u32, 3) != 0) return error.ForeignState;
+    const key = try AttrMap.parse(try e.get(1), &.{1});
+    const bytes = try key.get(1);
+    if (bytes.len != (if (family_index == 0) @as(usize, 4) else 16)) return error.UnknownState;
+    var remaining: ?u64 = null;
+    if (e.values[4] != null) {
+        if (try e.number(u64, 4) != 0) remaining = try e.number(u64, 5);
+    } else if (e.values[5] != null) return error.UnknownState;
+    const address: shared.IpAddress = if (family_index == 0) .{ .ipv4 = mem.readInt(u32, bytes[0..4], .big) } else .{ .ipv6 = mem.readInt(u128, bytes[0..16], .big) };
+    return .{ .address = address, .remaining_ms = remaining };
+}
+
 fn readNft(self: *Inspector, builder: *Builder, timer: *std.time.Timer) Error!void {
     var sock = nl.NetlinkSocket.init(linux.NETLINK.NETFILTER) catch |err| return netlinkError(err);
     defer sock.close();
@@ -1981,18 +2112,8 @@ fn readNft(self: *Inspector, builder: *Builder, timer: *std.time.Timer) Error!vo
             var items = nl.Attributes{ .bytes = try a.get(3) };
             while (items.next() catch return error.Incomplete) |item| {
                 if (item.kind != 1 or (item.flags & 0x4000) != 0) return error.UnknownState;
-                const e = try AttrMap.parse(item.value, &.{ 1, 3, 4, 5, 8 });
-                if (e.values[3] != null and try e.number(u32, 3) != 0) return error.ForeignState;
-                const key = try AttrMap.parse(try e.get(1), &.{1});
-                const bytes = try key.get(1);
-                if (bytes.len != (if (index == 0) @as(usize, 4) else 16)) return error.UnknownState;
-                var remaining: ?u64 = null;
-                if (e.values[4] != null) {
-                    if (try e.number(u64, 4) != 0) remaining = try e.number(u64, 5);
-                } else if (e.values[5] != null) return error.UnknownState;
-                const address: shared.IpAddress = if (index == 0) .{ .ipv4 = mem.readInt(u32, bytes[0..4], .big) } else .{ .ipv6 = mem.readInt(u128, bytes[0..16], .big) };
                 if (comptime build_options.diag) diag_mod.count(.dump_elements, 1);
-                try builder.add(.{ .address = address, .remaining_ms = remaining });
+                try builder.add(try decodeSetElement(item.value, index));
             }
         }
     }

@@ -201,6 +201,8 @@ pub const Jail = struct {
     retiring: bool = false,
     failures_carried: u64 = 0,
     ignored_carried: u64 = 0,
+    manual_bans: u64 = 0,
+    config_bans: u64 = 0,
     reservation: ?resource.Token = null,
 };
 
@@ -373,6 +375,8 @@ const PublishedView = struct {
     verify_interval_ns: u64 = 0,
     wake_interval_ns: u64 = 0,
     transient_uncertain: bool = false,
+    events_subscribed: bool = false,
+    events_healthy: bool = false,
 };
 const Knowledge = enum { fresh, stale, none };
 const MaintenanceGates = struct {
@@ -1189,7 +1193,8 @@ pub const Coordinator = struct {
         return null;
     }
     fn queueWithdrawal(self: *Coordinator, name: []const u8, generation: ?[32]u8, bans_lifted: u32) !void {
-        const selected = generation orelse return logJailRemoved(name, bans_lifted);
+        logJailRemoved(name, bans_lifted);
+        const selected = generation orelse return;
         var pending = PendingWithdrawal{ .name = [_]u8{0} ** 64, .name_len = @intCast(name.len), .generation = selected, .bans_lifted = bans_lifted };
         @memcpy(pending.name[0..name.len], name);
         try self.pending_withdrawals.append(self.allocator, pending);
@@ -1209,7 +1214,6 @@ pub const Coordinator = struct {
                     continue;
                 },
             };
-            logJailRemoved(pending.jailName(), pending.bans_lifted);
             _ = self.pending_withdrawals.orderedRemove(index);
         }
     }
@@ -1564,6 +1568,12 @@ pub const Coordinator = struct {
         manager.last_wall_us = self.clock.wallUs();
         if (comptime build_options.diag) manager.setClockRate(self.clock.rate());
         manager.verify_interval_ns = verify_interval_ns;
+        if (manager.inspector.installation.transport == .nftables) {
+            if (manager.inspector.subscribe()) {
+                manager.events_subscribed = true;
+                manager.verify_interval_ns = audit_interval_ns;
+            } else |failure| std.log.warn("firewall nftables: kernel event subscription unavailable ({s}); verifying every {d} s instead", .{ @errorName(failure), verify_interval_ns / std.time.ns_per_s });
+        }
         if (self.firewall_observation_cache) |cache| manager.attachObservationCache(cache);
         self.effects = manager;
     }
@@ -2438,6 +2448,8 @@ pub const Coordinator = struct {
                 .verify_interval_ns = manager.verify_interval_ns,
                 .wake_interval_ns = manager.wake_interval_ns,
                 .transient_uncertain = manager.status.uncertain and manager.status.cause != null and effect_runtime.transientCause(manager.status.cause.?),
+                .events_subscribed = manager.events_subscribed,
+                .events_healthy = manager.events_healthy,
             };
             self.published_stats = .{
                 .available = true,
@@ -2451,6 +2463,9 @@ pub const Coordinator = struct {
                 .overdue_bookkeeping = manager.counters.overdue_bookkeeping,
                 .accepted_readbacks = manager.counters.full_readbacks,
                 .dump_interruptions = manager.counters.dump_interrupted,
+                .acknowledged_batches = manager.counters.acknowledged_batches,
+                .events_applied = manager.counters.events_applied,
+                .events_dropped = manager.counters.events_dropped,
                 .view_rebuilds = manager.counters.rebuilds_completed,
                 .view_restarts = manager.counters.rebuild_restarts,
                 .incremental_updates = manager.counters.incremental_updates,
@@ -2735,6 +2750,7 @@ pub const Coordinator = struct {
                 return failure;
             };
             jail.banlist_pending = false;
+            jail.config_bans +|= change.added;
             if (change.added != 0 or change.lifted != 0 or change.expired != 0)
                 std.log.info("native: jail={} banip applied: {d} added, {d} lifted, {d} unchanged, {d} expired", .{ std.zig.fmtEscapes(jail.name), change.added, change.lifted, change.unchanged, change.expired });
         }
@@ -2811,6 +2827,7 @@ pub const Coordinator = struct {
     pub const quiet_interval_ms: u64 = 1000;
     const maintenance_idle_ms: u64 = 30 * quiet_interval_ms;
     const verify_interval_ns: u64 = 5 * std.time.ns_per_s;
+    const audit_interval_ns: u64 = 60 * std.time.ns_per_s;
     const stop_history_budget_ns: u64 = 2 * std.time.ns_per_s;
     fn drainHistoryForStop(self: *Coordinator) void {
         if (self.gate.snapshot().phase != .healthy or !self.store_open or self.store.reopen_required) return;
@@ -3038,6 +3055,7 @@ pub const Coordinator = struct {
         const view = self.published_view;
         if (effects.uncertain and !view.transient_uncertain) return .none;
         const readback = view.readback_ns orelse return if (effects.ready) .fresh else .none;
+        if (view.events_subscribed and !view.events_healthy) return .stale;
         const now = now_ms orelse return .stale;
         const age_ns = (now *| std.time.ns_per_ms) -| readback;
         return if (age_ns <= view.verify_interval_ns +| view.wake_interval_ns) .fresh else .stale;

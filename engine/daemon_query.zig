@@ -51,6 +51,7 @@ pub fn Methods(comptime Coordinator: type) type {
                 const processor = sessionProcessor(&jail);
                 self.metrics_state.jailSetFailuresCounted(jail.name, jail.failures_carried +| if (processor) |value| value.failures_counted else 0);
                 self.metrics_state.jailSetIgnoredDetections(jail.name, jail.ignored_carried +| if (processor) |value| value.ignored_detections else 0);
+                self.metrics_state.jailSetBansTotal(jail.name, jail.summary.decisions +| jail.manual_bans +| jail.config_bans);
             }
             const footprint = try self.store.stateFileFootprint();
             self.metrics_state.setStateFile(footprint.bytes, footprint.pages);

@@ -193,10 +193,13 @@ the same keys are fields of the line's JSON object.
 Daemon summary: version, protection state
 .RB ( active ", " log-only ", " unknown ", " mixed " or " "DEGRADED (cause)" ),
 backend, active bans, retained history confirmations, storage phase, generation and worker/clock flags.
-Active bans are what the last complete kernel readback showed. The
+Active bans are what the kernel inventory holds: on nftables the last audit kept current
+by the kernel's acknowledgements and change events, on ipset and iptables the last
+complete readback. The
 .B knowledge
-field reports whether that readback is fresh (within the verification cadence), stale
-or absent, with its wall time and age; a stale readback keeps the last count and
+field reports whether that inventory is fresh (the last audit within the verification
+cadence and, on nftables, the event stream healthy), stale or absent, with its wall time
+and age; stale knowledge keeps the last count and
 reports degraded protection, and no readback reports the count as absent rather than
 zero. Pending bans, overdue removals and their oldest ages describe work the daemon
 has not yet confirmed; a served backlog alone does not degrade protection.
