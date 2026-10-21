@@ -158,10 +158,13 @@ fn printHelp(w: anytype) !void {
         \\COMMANDS:
         \\  status | jails | list | ban | unban | reload | version | help | completions
         \\  config | history | jail | firewall show | stats
-        \\  ignore add|remove|list ...                 manage per-jail exclusions
+        \\  ban ... [--force]                          ban; --force overrides the guard for this host, loopback and your SSH peer
+        \\  list ... [--origin detection|manual|config] list live bans and expired banip entries by origin
+        \\  ignore add|remove|list ...                 manage per-jail exclusions; ignore add --for D sets an expiry
         \\  migrate inspect|snapshot|plan|validate|cutover|status|rollback ...
         \\  rule-test --file|--record|--journal ...   offline rule evaluation (no daemon needed)
-        \\  repair-source --jail J --source PATH --token T --acknowledge-truncation   acknowledge a truncated file source (daemon stopped)
+        \\  repair-source --jail J --source PATH --token T --acknowledge-truncation   acknowledge a truncated file source
+        \\                                             (through the running daemon; offline when it is stopped)
         \\  support-bundle [--out PATH|-] [--include-addresses]   write a redacted diagnostic bundle for a bug report
         \\  Globals: --socket <path> --output table|json|plain --no-color --timeout <ms>
         \\  `fail2zig help <command>` documents each command; `fail2zig version` shows client and daemon versions.
@@ -369,8 +372,10 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config, config_path
         value.drain();
         value.deinit();
     };
-    if (!std.mem.eql(u8, cfg.global.log_target, "stderr")) {
-        sink = log_target.Sink.init(heap, .{ .file = cfg.global.log_target }) catch |err| {
+    const to_stderr = std.mem.eql(u8, cfg.global.log_target, "stderr");
+    if (!to_stderr or cfg.global.log_format == .json) {
+        const target: log_target.Target = if (to_stderr) .stderr else .{ .file = cfg.global.log_target };
+        sink = log_target.Sink.init(heap, target, cfg.global.log_format) catch |err| {
             std.log.err("log target '{s}' unusable: {s}; refusing to start", .{ cfg.global.log_target, @errorName(err) });
             std.process.exit(shared.ExitClass.rejected.code());
         };

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
+const duration = @import("duration.zig");
 
 pub const Timestamp = i64;
 pub const Duration = u64;
@@ -223,6 +224,35 @@ pub const IgnoreEntry = struct {
     fn prefixMask(comptime T: type, prefix: u8) T {
         if (prefix == 0) return 0;
         return ~@as(T, 0) << @intCast(@bitSizeOf(T) - prefix);
+    }
+};
+
+pub const Origin = enum(u8) {
+    detection = 1,
+    manual = 2,
+    config = 3,
+};
+
+pub const TimedEntry = struct {
+    entry: IgnoreEntry,
+    duration_s: ?u64,
+
+    pub const max_duration_s: u64 = 100 * 366 * 86_400;
+
+    pub fn parse(text: []const u8, default_duration_s: ?u64) error{ InvalidAddress, InvalidPrefix, InvalidDuration }!TimedEntry {
+        const address = addressText(text);
+        const entry = try IgnoreEntry.parse(address);
+        const rest = std.mem.trim(u8, text[address.len..], &std.ascii.whitespace);
+        if (rest.len == 0) return .{ .entry = entry, .duration_s = default_duration_s };
+        if (std.mem.indexOfAny(u8, rest, &std.ascii.whitespace) != null) return error.InvalidDuration;
+        const parsed = duration.parse(rest, false) catch return error.InvalidDuration;
+        const seconds = parsed.nativeSeconds() catch return error.InvalidDuration;
+        if (seconds < 1 or seconds > max_duration_s) return error.InvalidDuration;
+        return .{ .entry = entry, .duration_s = seconds };
+    }
+
+    pub fn addressText(text: []const u8) []const u8 {
+        return text[0 .. std.mem.indexOfAny(u8, text, &std.ascii.whitespace) orelse text.len];
     }
 };
 

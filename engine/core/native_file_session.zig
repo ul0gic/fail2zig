@@ -954,13 +954,15 @@ pub const Session = struct {
         session: *Session,
         pending: ?durable.ReceiptIdentity,
         committing: bool = false,
-        fn run(record: records.Record, context: ?*anyopaque) !void {
+        fn run(batch: []const records.Record, acknowledged: *usize, context: ?*anyopaque) !void {
             const self: *Acknowledgment = @ptrCast(@alignCast(context.?));
+            acknowledged.* = 0;
+            const record = batch[0];
             if (self.pending) |expected| {
                 if (record.kind != .data or !std.mem.eql(u8, record.source, expected.source) or !std.mem.eql(u8, record.occurrence, expected.occurrence) or !std.mem.eql(u8, record.cursor, expected.cursor) or !std.mem.eql(u8, &record.raw_hash, &expected.raw_hash)) return error.PendingRecordMismatch;
             }
             self.committing = true;
-            pipeline.Pipeline.acknowledge(record, &self.session.pipe) catch |err| {
+            pipeline.Pipeline.acknowledgeBatch(batch, acknowledged, &self.session.pipe) catch |err| {
                 if (self.session.pipe.candidate_receipt != null) self.session.candidate_source = record.source;
                 return err;
             };
@@ -1013,7 +1015,7 @@ pub const Session = struct {
         return error.PendingSourceMissing;
     }
     fn pollFile(self: *Session, source: *files.FileSource, state: *repair.Repair, acknowledgment: *Acknowledgment, preserve_checkpoint: bool) !bool {
-        return source.pollTurn(Acknowledgment.run, acknowledgment, preserve_checkpoint) catch |err| {
+        return 0 != source.pollBatchTurn(Acknowledgment.run, acknowledgment, preserve_checkpoint) catch |err| {
             if (acknowledgment.committing) {
                 if (pipeline.Pipeline.sourceLocalIntervention(err)) return self.sourceFailure(state, err);
                 self.last_failure_domain = if (repair.classify(err) == .pending) .pending else .storage;

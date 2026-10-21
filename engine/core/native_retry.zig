@@ -17,6 +17,7 @@ pub const Lease = lease_policy.Lease;
 pub const Escalation = escalation_policy.Policy;
 pub const EscalationScope = escalation_policy.Scope;
 pub const EscalationHistoryInput = escalation_policy.HistoryInput;
+pub const EscalationDecay = escalation_policy.EscalationDecay;
 
 pub const HashForm = enum { identity, stored };
 
@@ -98,6 +99,7 @@ pub const Admission = struct {
     policy: Policy,
     processing_us: ?i64 = null,
     suppress_enforcement: bool = false,
+    decay: EscalationDecay = .{},
 
     pub fn enforces(self: Admission) bool {
         return self.policy.enforce and !self.suppress_enforcement;

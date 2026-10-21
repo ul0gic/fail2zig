@@ -6,6 +6,7 @@ const config = @import("../config/native.zig");
 const retry_config = @import("../config/native_retry_policy.zig");
 const retry = @import("../core/native_retry.zig");
 const ignore_set = @import("../core/native_ignore_set.zig");
+const banip = @import("../config/native_banip.zig");
 const shared = @import("shared");
 
 pub const max_reasons = 32;
@@ -29,6 +30,20 @@ pub const PolicyChange = struct {
     next: retry.Policy,
 };
 
+pub const JailDelta = struct {
+    added: [max_jails][]const u8 = undefined,
+    added_count: u8 = 0,
+    removed: [max_jails][]const u8 = undefined,
+    removed_count: u8 = 0,
+
+    pub fn addedSlice(self: *const JailDelta) []const []const u8 {
+        return self.added[0..self.added_count];
+    }
+    pub fn removedSlice(self: *const JailDelta) []const []const u8 {
+        return self.removed[0..self.removed_count];
+    }
+};
+
 pub const Classification = struct {
     kind: Kind = .noop,
     log_level: ?config.LogLevel = null,
@@ -36,6 +51,11 @@ pub const Classification = struct {
     policy_count: u8 = 0,
     ignore_jails: [max_jails][]const u8 = undefined,
     ignore_count: u8 = 0,
+    jails: JailDelta = .{},
+    banip_jails: [max_jails][]const u8 = undefined,
+    banip_count: u8 = 0,
+    decay_jails: [max_jails][]const u8 = undefined,
+    decay_count: u8 = 0,
     reasons: [max_reasons]Reason = undefined,
     reason_count: u8 = 0,
 
@@ -69,6 +89,22 @@ pub const Classification = struct {
     }
     pub fn policySlice(self: *const Classification) []const PolicyChange {
         return self.policies[0..self.policy_count];
+    }
+    pub fn banipSlice(self: *const Classification) []const []const u8 {
+        return self.banip_jails[0..self.banip_count];
+    }
+    pub fn decaySlice(self: *const Classification) []const []const u8 {
+        return self.decay_jails[0..self.decay_count];
+    }
+    fn listJail(self: *Classification, list: [][]const u8, count: *u8, jail: []const u8, comptime what: []const u8) void {
+        for (list[0..count.*]) |listed| if (std.mem.eql(u8, listed, jail)) return;
+        if (count.* == list.len) {
+            self.reject("jails: too many " ++ what ++ " changes", .{});
+            return;
+        }
+        list[count.*] = jail;
+        count.* += 1;
+        self.live();
     }
 };
 
@@ -111,7 +147,7 @@ fn distinctConfigured(literals: []const []const u8) usize {
     var seen: [ignore_set.max_entries_per_part]shared.types.IgnoreEntry = undefined;
     var count: usize = 0;
     for (literals) |literal| {
-        const entry = shared.types.IgnoreEntry.parse(literal) catch continue;
+        const entry = (shared.types.TimedEntry.parse(literal, null) catch continue).entry;
         var duplicate = false;
         for (seen[0..count]) |prior| {
             if (prior.order(entry) == .eq) duplicate = true;
@@ -130,17 +166,24 @@ fn runtimeOnly(counts: []const RuntimeCount, jail: []const u8) u16 {
 }
 
 pub fn classify(current: *const config.Config, proposed: *const config.Config, max_subjects: u32) Classification {
-    return classifyWithRuntime(current, proposed, max_subjects, &.{});
+    return classifyWithRuntime(current, proposed, max_subjects, &.{}, null);
 }
 
-pub fn classifyWithRuntime(current: *const config.Config, proposed: *const config.Config, max_subjects: u32, runtime_counts: []const RuntimeCount) Classification {
+pub fn classifyWithRuntime(current: *const config.Config, proposed: *const config.Config, max_subjects: u32, runtime_counts: []const RuntimeCount, conflict: ?banip.BanListConflict) Classification {
     var out: Classification = .{};
     globalsEqual(&current.global, &proposed.global, &out);
-    if (current.jails.len != proposed.jails.len) out.restart("jails: set size {d} -> {d}", .{ current.jails.len, proposed.jails.len });
-    for (proposed.jails) |*jail| if (findJail(current, jail.name) == null) out.restart("jails.{s}: added", .{jail.name});
+    if (conflict) |found| out.reject("jails.{s}.banip: {s} is also in ignoreip", .{ found.jail, found.address[0..found.address_len] });
+    for (proposed.jails) |*jail| {
+        if (findJail(current, jail.name) != null) continue;
+        _ = retry_config.fromJail(jail, proposed.defaults, max_subjects) catch |err| {
+            out.reject("jails.{s}: {s}", .{ jail.name, @errorName(err) });
+            continue;
+        };
+        out.listJail(&out.jails.added, &out.jails.added_count, jail.name, "added jail");
+    }
     for (current.jails) |*jail| {
         const next = findJail(proposed, jail.name) orelse {
-            out.restart("jails.{s}: removed", .{jail.name});
+            out.listJail(&out.jails.removed, &out.jails.removed_count, jail.name, "removed jail");
             continue;
         };
         inline for (.{ "enabled", "logpath", "source", "filter", "timestamp", "timezone_offset_minutes", "timezone", "timezone_ambiguity", "journal_executables", "journal_executables_explicit", "rule_files", "ignore_file", "on_truncation", "compatibility_pending" }) |name| {
@@ -157,17 +200,19 @@ pub fn classifyWithRuntime(current: *const config.Config, proposed: *const confi
                 const runtime = runtimeOnly(runtime_counts, jail.name);
                 if (configured + runtime > ignore_set.distinct_bound) {
                     out.reject("jails.{s}.ignoreip: {d} configured and {d} runtime-only entries exceed the {d}-entry limit; remove runtime entries with fail2zig ignore remove or shorten ignoreip", .{ jail.name, configured, runtime, ignore_set.distinct_bound });
-                } else if (out.ignore_count == out.ignore_jails.len) {
-                    out.reject("jails: too many ignoreip changes", .{});
                 } else {
-                    out.ignore_jails[out.ignore_count] = jail.name;
-                    out.ignore_count += 1;
-                    out.live();
+                    out.listJail(&out.ignore_jails, &out.ignore_count, jail.name, "ignoreip");
                 }
             }
         }
         const before = config.resolveJailFromConfig(jail, current.defaults);
         const after = config.resolveJailFromConfig(next, proposed.defaults);
+        if (before.ignoreself != after.ignoreself or !std.meta.eql(before.ignoretime_s, after.ignoretime_s))
+            out.listJail(&out.ignore_jails, &out.ignore_count, jail.name, "ignoreip");
+        if (!sliceEqual([]const u8, before.banip, after.banip))
+            out.listJail(&out.banip_jails, &out.banip_count, jail.name, "banip");
+        if (before.bantime_increment_decay != after.bantime_increment_decay)
+            out.listJail(&out.decay_jails, &out.decay_count, jail.name, "bantime_increment_decay");
         if (before.banaction != after.banaction) out.restart("jails.{s}.banaction", .{jail.name});
         if (before.findtime != after.findtime) out.restart("jails.{s}.findtime: bound to the source plan window", .{jail.name});
         const policy_changed = before.maxretry != after.maxretry or before.bantime != after.bantime or before.bantime_kind != after.bantime_kind or !std.meta.eql(before.bantime_increment, after.bantime_increment);
@@ -196,6 +241,9 @@ pub fn classifyWithRuntime(current: *const config.Config, proposed: *const confi
     if (out.kind == .restart_required or out.kind == .rejected) {
         out.policy_count = 0;
         out.ignore_count = 0;
+        out.jails = .{};
+        out.banip_count = 0;
+        out.decay_count = 0;
     }
     return out;
 }

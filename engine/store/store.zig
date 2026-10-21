@@ -14,7 +14,7 @@ const effects = @import("../core/native_effect.zig");
 const effect_history = @import("../core/native_effect_history.zig");
 const application_history = @import("../core/native_application_history.zig");
 const action_outcome = @import("../core/native_action_outcome.zig");
-pub const latest_schema: i64 = 25;
+pub const latest_schema: i64 = 26;
 pub const load_repair_schema: i64 = 24;
 pub const load_repair = @import("load_repair_migration.zig");
 pub const max_native_detections = 16;
@@ -255,6 +255,7 @@ pub const Store = struct {
     history_overload_notice_us: ?i64 = null,
     escalation_jitter_context: ?*anyopaque = null,
     escalation_jitter: *const fn (?*anyopaque, u64) u64 = systemEscalationJitter,
+    retry_evictions: @import("consumer_retry.zig").Evictions = .{},
     diag_changes: if (build_options.diag) i64 else void = if (build_options.diag) 0 else {},
 
     fn systemEscalationJitter(_: ?*anyopaque, maximum_seconds: u64) u64 {
@@ -782,6 +783,18 @@ pub const Store = struct {
 
     pub usingnamespace @import("footprint.zig").Methods(@This());
 
+    pub usingnamespace @import("ban_origins.zig").Methods(@This());
+
+    pub usingnamespace @import("retry_release.zig").Methods(@This());
+
+    pub usingnamespace @import("group_commit.zig").Methods(@This());
+
+    pub usingnamespace @import("source_repair.zig").Methods(@This());
+
+    pub usingnamespace @import("jail_lifecycle.zig").Methods(@This());
+
+    pub usingnamespace @import("config_deadlines.zig").Methods(@This());
+
     pub usingnamespace @import("diag_checks.zig").Methods(@This());
 
     pub fn inspectInteger(self: *Store, sql: [:0]const u8) Error!i64 {
@@ -1092,11 +1105,19 @@ pub const Store = struct {
         }
     }
 
+    pub const ReceiptStep = struct { time: native_time.Timestamp, reserved: bool };
     pub fn beginReceipt(self: *Store, identity: ReceiptIdentity, proposed: native_time.Timestamp, expected_revision: u64) Error!native_time.Timestamp {
-        try Store.validateReceiptIdentity(identity);
-        const maximum = self.receipt_limit orelse return error.ReceiptStorageRequired;
         try self.beginWrite();
         errdefer self.rollback();
+        const step = try self.reserveReceiptStep(identity, proposed, expected_revision);
+        if (step.reserved) try self.fault(.before_receipt_commit);
+        try self.commitTransaction();
+        if (step.reserved) try self.fault(.after_receipt_commit);
+        return step.time;
+    }
+    pub fn reserveReceiptStep(self: *Store, identity: ReceiptIdentity, proposed: native_time.Timestamp, expected_revision: u64) Error!ReceiptStep {
+        try Store.validateReceiptIdentity(identity);
+        const maximum = self.receipt_limit orelse return error.ReceiptStorageRequired;
         const schema = try self.integer("PRAGMA user_version;");
         if (schema < 3 or schema > latest_schema) return error.UnsupportedSchema;
         self.schema_version = schema;
@@ -1105,10 +1126,7 @@ pub const Store = struct {
         if (expected_revision >= std.math.maxInt(i64) or try self.revision(identity.jail) != expected_revision) return error.StaleCheckpoint;
         try self.validateReceiptGeneration(identity.jail, identity.generation);
         if (try self.hasRecord(identity.jail, identity.source, identity.occurrence, identity.raw_hash, identity.cursor)) return error.ReceiptAlreadyCommitted;
-        if (try self.pendingReceipt(identity)) |saved| {
-            try self.commitTransaction();
-            return saved;
-        }
+        if (try self.pendingReceipt(identity)) |saved| return .{ .time = saved, .reserved = false };
         if (try self.pendingReceiptCount() >= maximum) return error.ReceiptLimit;
         {
             var row = try self.statement("INSERT INTO pending_receipts VALUES(?1,?2,?3,?4,?5,?6,?7);");
@@ -1129,10 +1147,7 @@ pub const Store = struct {
             try clock.done();
         }
         self.schema_version = schema;
-        try self.fault(.before_receipt_commit);
-        try self.commitTransaction();
-        try self.fault(.after_receipt_commit);
-        return proposed;
+        return .{ .time = proposed, .reserved = true };
     }
 
     pub fn close(self: *Store) void {
@@ -1214,9 +1229,22 @@ pub const Store = struct {
         if (record.native_detection) |*value| return @as(*const [1]detection.Outcome, @ptrCast(value));
         return &.{};
     }
+    pub const RecordStep = struct { result: CommitResult, effect_changed: bool };
     pub fn commitRecord(self: *Store, record: Record) Error!CommitResult {
         try self.usable();
-        const detections = try recordDetections(&record);
+        const detections = try validateRecord(&record);
+        try self.beginWrite();
+        errdefer self.rollback();
+        const step = try self.commitRecordStep(&record, detections);
+        if (step.result == .already_committed) {
+            try self.commitTransaction();
+            return .already_committed;
+        }
+        try self.commitEffectTransaction(step.effect_changed);
+        return .committed;
+    }
+    pub fn validateRecord(record: *const Record) Error![]const detection.Outcome {
+        const detections = try recordDetections(record);
         if (record.jail.len == 0 or record.source.len == 0 or record.occurrence.len == 0 or record.cursor.len == 0 or
             record.jail.len > 4096 or record.source.len > Limits.source_bytes or record.occurrence.len > 16384 or record.cursor.len > Limits.cursor_bytes or
             record.checkpoint.len > Limits.checkpoint_bytes or record.disposition.len > 64) return error.InvalidRecord;
@@ -1230,12 +1258,13 @@ pub const Store = struct {
             if (shared.payload) |payload| if (payload.len > Limits.shared_bytes) return error.InvalidRecord;
         }
         if (record.consumers) |batch| try batch.validate();
-        try self.beginWrite();
-        errdefer self.rollback();
+        return detections;
+    }
+    pub fn commitRecordStep(self: *Store, record: *const Record, detections: []const detection.Outcome) Error!RecordStep {
         const schema = try self.integer("PRAGMA user_version;");
         if (schema < 2 or schema > latest_schema) return error.UnsupportedSchema;
         self.schema_version = schema;
-        const source_generation = if (schema >= 14) try recordGeneration(&record) else null;
+        const source_generation = if (schema >= 14) try recordGeneration(record) else null;
         try self.checkReplayGuard(record.jail, record.source, record.occurrence, record.raw_hash, record.cursor, source_generation, if (record.receipt) |value| value.time.us else null);
         if (schema >= 9) {
             const registered = try self.readRetryPolicy(record.jail);
@@ -1308,8 +1337,7 @@ pub const Store = struct {
                     const supplied = source_generation orelse return error.OccurrenceConflict;
                     if (!std.mem.eql(u8, &supplied, &ordered.generation)) return error.OccurrenceConflict;
                 };
-                try self.commitTransaction();
-                return .already_committed;
+                return .{ .result = .already_committed, .effect_changed = false };
             }
         }
         {
@@ -1380,7 +1408,7 @@ pub const Store = struct {
             }
             try stmt.done();
         }
-        if (source_generation) |value| _ = try self.advanceSourceSequence(&record, value);
+        if (source_generation) |value| _ = try self.advanceSourceSequence(record, value);
         try self.fault(.after_record);
         if (native_values) |values| {
             var row = try self.statement(if (schema >= 5)
@@ -1445,9 +1473,9 @@ pub const Store = struct {
         }
         if (record.native_retry) |admission| {
             if (!record.retry_suspended) {
-                if (detections.len == 0) try self.commitRetry(record, admission);
+                if (detections.len == 0) try self.commitRetry(record.*, admission);
                 for (detections) |value| {
-                    var scalar = record;
+                    var scalar = record.*;
                     scalar.native_detection = value;
                     scalar.native_detections = null;
                     try self.commitRetry(scalar, admission);
@@ -1509,9 +1537,7 @@ pub const Store = struct {
             const count = try self.retryDecisions(record.jail, record.source, record.occurrence, &decisions);
             for (decisions[0..count]) |decision| if (decision.enforce and !decision.lease.live(now)) return error.EffectExpired;
         }
-        const effect_changed = if (record.native_retry != null) try self.hasEnforcingDecision(record) else false;
-        try self.commitEffectTransaction(effect_changed);
-        return .committed;
+        return .{ .result = .committed, .effect_changed = if (record.native_retry != null) try self.hasEnforcingDecision(record.*) else false };
     }
     fn hasEnforcingDecision(self: *Store, record: Record) Error!bool {
         var row = try self.statement("SELECT EXISTS(SELECT 1 FROM retry_decisions WHERE jail=?1 AND source=?2 AND occurrence=?3 AND enforce=1);");

@@ -5,7 +5,11 @@ const linux_dupfd_cloexec = 1030;
 const records = @import("source_record.zig");
 const native_text = @import("source_text.zig");
 const config = @import("../config/native.zig");
+const group_commit = @import("../store/group_commit.zig");
+const cursor_bytes = @import("../store/store.zig").Limits.cursor_bytes;
 const Allocator = std.mem.Allocator;
+
+pub const BatchAckCallback = *const fn ([]const records.Record, *usize, ?*anyopaque) anyerror!void;
 
 pub const WallClock = struct {
     context: ?*anyopaque = null,
@@ -650,6 +654,90 @@ pub const FileSource = struct {
             if (err == error.SourceRepairPending) continue;
             return err;
         };
+    }
+
+    const Mark = struct { committed: ?Resume, baseline_committed: bool, in_operation: bool, pending_eof_check: bool };
+    fn mark(self: *const FileSource) Mark {
+        return .{ .committed = self.committed, .baseline_committed = self.baseline_committed, .in_operation = self.in_operation, .pending_eof_check = self.pending_eof_check };
+    }
+    fn rewind(self: *FileSource, to: Mark) void {
+        self.committed = to.committed;
+        self.baseline_committed = to.baseline_committed;
+        self.in_operation = to.in_operation;
+        self.pending_eof_check = to.pending_eof_check;
+    }
+    const BatchCollector = struct {
+        source: *FileSource,
+        allocator: Allocator,
+        items: [group_commit.max_batch_records]records.Record = undefined,
+        marks: [group_commit.max_batch_records]Mark = undefined,
+        count: usize = 0,
+        bytes: usize = 0,
+        budget: usize,
+
+        fn collect(record: records.Record, context: ?*anyopaque) !void {
+            const self: *BatchCollector = @ptrCast(@alignCast(context.?));
+            var needed = record.occurrence.len + record.cursor.len + record.message.len;
+            if (record.predecoded) |decoded| needed += decoded.text.len + decoded.codec.len + decoded.disposition.len + (if (decoded.diagnostic) |value| value.len else 0) + decoded.codec_context_json.len + decoded.profile_hash.len + decoded.config_generation.len;
+            if (self.bytes + needed > self.budget) return error.BatchFull;
+            self.bytes += needed;
+            var owned = record;
+            owned.occurrence = try self.allocator.dupe(u8, record.occurrence);
+            owned.cursor = try self.allocator.dupe(u8, record.cursor);
+            owned.message = try self.allocator.dupe(u8, record.message);
+            if (record.predecoded) |decoded| {
+                var copy = decoded;
+                copy.text = try self.allocator.dupe(u8, decoded.text);
+                copy.codec = try self.allocator.dupe(u8, decoded.codec);
+                copy.disposition = try self.allocator.dupe(u8, decoded.disposition);
+                copy.diagnostic = if (decoded.diagnostic) |value| try self.allocator.dupe(u8, value) else null;
+                copy.codec_context_json = try self.allocator.dupe(u8, decoded.codec_context_json);
+                copy.profile_hash = try self.allocator.dupe(u8, decoded.profile_hash);
+                copy.config_generation = try self.allocator.dupe(u8, decoded.config_generation);
+                owned.predecoded = copy;
+            }
+            self.items[self.count] = owned;
+            if (record.kind == .checkpoint) {
+                self.marks[self.count] = self.source.mark();
+                self.marks[self.count].baseline_committed = true;
+            }
+            self.count += 1;
+        }
+    };
+
+    pub fn pollBatch(self: *FileSource, callback: BatchAckCallback, userdata: ?*anyopaque) !usize {
+        while (true) return self.pollBatchTurn(callback, userdata, false) catch |err| {
+            if (err == error.SourceRepairPending) continue;
+            return err;
+        };
+    }
+    pub fn pollBatchTurn(self: *FileSource, callback: BatchAckCallback, userdata: ?*anyopaque, preserve_checkpoint: bool) !usize {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        // Fits the admitted source workspace (native_resource_budget.zig:196) beside one pollTurn's own line and cursor.
+        var collector = BatchCollector{ .source = self, .allocator = arena.allocator(), .budget = 3 * self.max_record_bytes + cursor_bytes };
+        const start = self.mark();
+        const read_failure: ?anyerror = while (collector.count + 2 <= collector.items.len) {
+            const delivered = self.pollTurn(BatchCollector.collect, &collector, preserve_checkpoint) catch |err| {
+                if (err != error.BatchFull or collector.count == 0) break err;
+                self.health = .healthy;
+                break null;
+            };
+            if (!delivered) break null;
+            collector.marks[collector.count - 1] = self.mark();
+        } else null;
+        if (collector.count == 0) return read_failure orelse 0;
+        var acknowledged: usize = 0;
+        const delivery = callback(collector.items[0..collector.count], &acknowledged, userdata);
+        if (acknowledged < collector.count) self.rewind(if (acknowledged == 0) start else collector.marks[acknowledged - 1]);
+        delivery catch |err| {
+            self.health = .commit_failed;
+            return err;
+        };
+        if (acknowledged >= collector.count) if (read_failure) |err| return err;
+        var data: usize = 0;
+        for (collector.items[0..@min(acknowledged, collector.count)]) |record| data += @intFromBool(record.kind == .data);
+        return data;
     }
     pub fn pollTurn(self: *FileSource, callback: records.AckCallback, userdata: ?*anyopaque, preserve_checkpoint: bool) !bool {
         if (self.committed) |saved_resume| if (saved_resume.codec_configuration_hash != null and self.frame_callback == null and self.native_encoding == null) return error.FramingProfileMismatch;

@@ -255,7 +255,7 @@ pub fn Methods(comptime Store: type) type {
             return .{ .generation = try effectBlob(&row, 0, 32), .config_digest = try effectBlob(&row, 1, 32), .published = (try row.signed(2)) == 1, .committed_us = try row.signed(3) };
         }
 
-        pub const AdminKind = enum(u8) { group_enable = 1, group_disable, group_pause, group_resume, setting_batch, ban, unban, history_reset, migration_activate, migration_rollback, ignore_add, ignore_remove, firewall_withdraw };
+        pub const AdminKind = enum(u8) { group_enable = 1, group_disable, group_pause, group_resume, setting_batch, ban, unban, history_reset, migration_activate, migration_rollback, ignore_add, ignore_remove, repair_source, firewall_withdraw };
         pub const AdminOutcome = enum(u8) { applied = 1, rejected, absent, partial, uncertain };
         pub const admin_request_retention = 4096;
         pub const admin_request_max_age_us: i64 = 30 * 24 * 60 * 60 * 1_000_000;
@@ -377,7 +377,7 @@ pub fn Methods(comptime Store: type) type {
         pub fn currentOwner(self: *Store, key: effects.Hash, jail: []const u8) Error!?effects.Owner {
             try self.beginRead();
             errdefer self.rollback();
-            var row = try self.statement("SELECT generation,decision_id,revision,lease_kind,deadline_us,decided_us FROM effect_owners WHERE scope_key=?1 AND jail=?2;");
+            var row = try self.statement(self.originSql("SELECT generation,decision_id,revision,lease_kind,deadline_us,decided_us,", "origin", " FROM effect_owners WHERE scope_key=?1 AND jail=?2;"));
             defer row.deinit();
             try row.blob(1, &key);
             try row.text(2, jail);
@@ -387,7 +387,7 @@ pub fn Methods(comptime Store: type) type {
             }
             const effect_revision = try row.signed(2);
             if (effect_revision <= 0) return error.InvalidEffect;
-            const owner = effects.Owner{ .jail = detection.Name.init(jail) catch return error.InvalidEffect, .generation = try effectBlob(&row, 0, 32), .decision_id = try effectBlob(&row, 1, 32), .revision = @intCast(effect_revision), .lease = try effectLease(&row, 3, 4), .decided_us = try row.signed(5) };
+            const owner = effects.Owner{ .jail = detection.Name.init(jail) catch return error.InvalidEffect, .generation = try effectBlob(&row, 0, 32), .decision_id = try effectBlob(&row, 1, 32), .revision = @intCast(effect_revision), .lease = try effectLease(&row, 3, 4), .decided_us = try row.signed(5), .origin = try Store.storedOrigin(&row, 6) };
             try self.commitTransaction();
             return owner;
         }

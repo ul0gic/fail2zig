@@ -9,6 +9,7 @@ pub const args = @import("args.zig");
 pub const socket = @import("socket.zig");
 pub const format = @import("format.zig");
 pub const completions = @import("completions.zig");
+const guard = @import("guard.zig");
 const list_order = @import("list_order.zig");
 
 pub const client_version = build_options.version;
@@ -82,11 +83,11 @@ pub fn run(
         .list => |l| {
             _ = parseJailId(l.jail, stderr) catch return .client_error;
             if (l.sort) {
-                if (l.details) return doList(allocator, parsed.globals, l.jail, stdout, stderr, color, formatSortedListDetailsCmd);
-                return doList(allocator, parsed.globals, l.jail, stdout, stderr, color, formatSortedListCmd);
+                if (l.details) return doList(allocator, parsed.globals, l.jail, l.origin, stdout, stderr, color, formatSortedListDetailsCmd);
+                return doList(allocator, parsed.globals, l.jail, l.origin, stdout, stderr, color, formatSortedListCmd);
             }
-            if (l.details) return doList(allocator, parsed.globals, l.jail, stdout, stderr, color, formatListDetailsCmd);
-            return doList(allocator, parsed.globals, l.jail, stdout, stderr, color, formatListCmd);
+            if (l.details) return doList(allocator, parsed.globals, l.jail, l.origin, stdout, stderr, color, formatListDetailsCmd);
+            return doList(allocator, parsed.globals, l.jail, l.origin, stdout, stderr, color, formatListCmd);
         },
         .jails => |options| {
             if (options.details) return doRequest(allocator, parsed.globals, .{ .list_jails = {} }, stdout, stderr, color, formatJailsDetailsCmd);
@@ -130,6 +131,10 @@ pub fn run(
             };
             _ = parseJailIdRequired(jail_str, stderr) catch return .client_error;
             const scope = scopeSpec(b.ip, b.scope, stderr) catch return .client_error;
+            if (!b.force) {
+                const target_text = if (b.scope) |requested| requested.cidr orelse b.ip else b.ip;
+                if (refuseProtectedBan(allocator, target_text, stderr)) |refused| return refused;
+            }
             return doAdmin(allocator, parsed.globals, stdout, stderr, .{ .kind = "ban", .jail = jail_str, .address = scope.address, .prefix = scope.prefix, .duration_s = b.duration_s });
         },
         .unban => |u| {
@@ -175,6 +180,33 @@ fn scopeSpec(ip: []const u8, scope: ?args.Command.ScopeArgs, stderr: anytype) !S
                 return error.InvalidScope;
             }
             return .{ .address = base, .prefix = prefix };
+        },
+    }
+}
+
+fn refuseProtectedBan(allocator: std.mem.Allocator, target_text: []const u8, stderr: anytype) ?ExitCode {
+    const target = shared.types.IgnoreEntry.parse(target_text) catch {
+        stderr.print("error: invalid ban target '{s}'\n", .{target_text}) catch {};
+        return .client_error;
+    };
+    var self = shared.self_addresses.read(allocator) catch |err| switch (err) {
+        error.KernelUnavailable => shared.self_addresses.SelfAddresses{ .addresses = &.{}, .count = 0, .truncated = false },
+        error.OutOfMemory => {
+            stderr.writeAll("error: out of memory while reading this host's addresses\n") catch {};
+            return .client_error;
+        },
+    };
+    defer self.deinit(allocator);
+    switch (guard.check(target, self, std.posix.getenv("SSH_CONNECTION"))) {
+        .allowed => return null,
+        .protected => |protected| {
+            const reason = switch (protected.reason) {
+                .loopback => "loopback address",
+                .host_address => "this host's address",
+                .ssh_peer => "your SSH peer address",
+            };
+            stderr.print("error: refusing to ban {s}: {s} {}; use --force to override\n", .{ target_text, reason, protected.matched }) catch {};
+            return .daemon_error;
         },
     }
 }
@@ -289,6 +321,8 @@ const ListScopeItem = struct {
     deadline_us: ?i64 = null,
     confirmed: ?bool = null,
     ban_count: ?u32 = null,
+    origin: ?[]const u8 = null,
+    expired: ?bool = null,
 };
 
 const ListScopePage = struct {
@@ -297,7 +331,7 @@ const ListScopePage = struct {
     next_cursor: ?[]const u8 = null,
 };
 
-fn doList(allocator: std.mem.Allocator, globals: args.Globals, jail: ?[]const u8, stdout: anytype, stderr: anytype, color: format.Color, comptime formatter: anytype) ExitCode {
+fn doList(allocator: std.mem.Allocator, globals: args.Globals, jail: ?[]const u8, origin_filter: ?shared.types.Origin, stdout: anytype, stderr: anytype, color: format.Color, comptime formatter: anytype) ExitCode {
     var page_arena = std.heap.ArenaAllocator.init(allocator);
     defer page_arena.deinit();
     var payload: std.ArrayListUnmanaged(u8) = .empty;
@@ -361,8 +395,13 @@ fn doList(allocator: std.mem.Allocator, globals: args.Globals, jail: ?[]const u8
         for (page.items) |item| {
             const scope = item.scope orelse continue;
             const address = scope.address orelse continue;
+            if (origin_filter) |wanted| {
+                const origin = item.origin orelse continue;
+                if (!std.mem.eql(u8, origin, @tagName(wanted))) continue;
+            }
+            const expired = item.expired orelse false;
             const permanent = if (item.lease) |lease| std.mem.eql(u8, lease, "permanent") else false;
-            if (!permanent) if (item.deadline_us) |deadline| if (deadline <= now_us) continue;
+            if (!permanent and !expired) if (item.deadline_us) |deadline| if (deadline <= now_us) continue;
             var subject_buffer: [64]u8 = undefined;
             const network = if (scope.subject_kind) |kind| std.mem.eql(u8, kind, "network") else false;
             const subject = (if (network)
@@ -372,7 +411,7 @@ fn doList(allocator: std.mem.Allocator, globals: args.Globals, jail: ?[]const u8
             const expiry_us: ?i64 = if (permanent) null else item.deadline_us;
             if (!first_entry) writer.writeByte(',') catch return walkOutOfMemory(stderr);
             first_entry = false;
-            std.json.stringify(.{ .ip = subject, .jail = item.jail, .expiry_us = expiry_us, .ban_expiry = if (expiry_us) |value| @divFloor(value, 1_000_000) else null, .permanent = permanent, .ban_count = item.ban_count, .enforced = item.confirmed, .confirmed = item.confirmed }, .{}, writer) catch return walkOutOfMemory(stderr);
+            std.json.stringify(.{ .ip = subject, .jail = item.jail, .origin = item.origin, .expired = expired, .expiry_us = expiry_us, .ban_expiry = if (expiry_us) |value| @divFloor(value, 1_000_000) else null, .permanent = permanent, .ban_count = item.ban_count, .enforced = item.confirmed, .confirmed = item.confirmed }, .{}, writer) catch return walkOutOfMemory(stderr);
             if (payload.items.len > max_list_payload_bytes) {
                 stderr.writeAll("error: list exceeds its 64 MiB client bound; page the bans with the scopes command and --cursor\n") catch {};
                 return .client_error;
@@ -547,6 +586,7 @@ fn doIgnore(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype
         .jail = jail,
         .address = canonical[0 .. slash orelse canonical.len],
         .prefix = if (slash != null) entry.prefix else null,
+        .duration_s = if (ignore.action == .add) ignore.for_s else null,
         .unban = ignore.unban,
     });
 }
@@ -586,7 +626,7 @@ fn doIgnoreList(allocator: std.mem.Allocator, globals: args.Globals, stdout: any
     return .success;
 }
 
-const AdminOutcome = struct { schema_version: u32 = 0, kind: []const u8 = "", outcome: []const u8 = "", generation: []const u8 = "", mutation_revision: u64 = 0, enforced: bool = false, reasons: []const []const u8 = &.{} };
+const AdminOutcome = struct { schema_version: u32 = 0, kind: []const u8 = "", outcome: []const u8 = "", generation: []const u8 = "", mutation_revision: u64 = 0, enforced: bool = false, reasons: []const []const u8 = &.{}, warning: ?[]const u8 = null };
 
 fn writeAdminOutcome(allocator: std.mem.Allocator, writer: anytype, payload: []const u8, fmt: format.OutputFormat) !void {
     if (fmt == .json) {
@@ -601,6 +641,9 @@ fn writeAdminOutcome(allocator: std.mem.Allocator, writer: anytype, payload: []c
     defer parsed.deinit();
     try writer.print("kind\t{s}\noutcome\t{s}\nenforced\t{}\ngeneration\t{s}\nmutation_revision\t{d}\n", .{ parsed.value.kind, parsed.value.outcome, parsed.value.enforced, parsed.value.generation, parsed.value.mutation_revision });
     for (parsed.value.reasons) |reason| try writer.print("reason\t{s}\n", .{reason});
+    if (parsed.value.warning) |warning| {
+        if (fmt == .plain) try writer.print("warning\t{s}\n", .{warning}) else try writer.print("warning: {s}\n", .{warning});
+    }
 }
 
 fn doReload(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype) ExitCode {

@@ -4,6 +4,7 @@ const std = @import("std");
 const effects = @import("native_effect.zig");
 const detection = @import("native_detection_record.zig");
 const state = @import("native_consumer.zig");
+const Origin = @import("shared").types.Origin;
 pub const version: u16 = 1;
 pub const max_page: usize = 64;
 pub const checkpoint_bytes: usize = 112;
@@ -20,6 +21,7 @@ pub const Event = struct {
     decision_id: [32]u8,
     confirmed_us: i64,
     native_retry: bool = false,
+    origin: Origin = .detection,
 
     pub fn validate(self: *const Event) Error!void {
         if (self.sequence == 0 or self.sequence > max_number or self.jail.len == 0 or self.jail.len > 64) return error.InvalidHistoryEvent;

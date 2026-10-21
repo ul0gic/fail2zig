@@ -3,6 +3,7 @@
 const std = @import("std");
 const records = @import("source_record.zig");
 const durable = @import("record_store.zig");
+const group_commit = @import("../store/group_commit.zig");
 const health = @import("storage_health.zig");
 const time = @import("native_time.zig");
 
@@ -59,10 +60,15 @@ pub const Pipeline = struct {
     candidate_receipt: ?CandidateReceipt = null,
 
     pub fn admit(self: *Pipeline) !void {
+        try self.admitClock(false);
+    }
+
+    fn admitClock(self: *Pipeline, in_transaction: bool) !void {
         if (self.gate) |gate| try gate.admit(self.recovery_generation);
         if (!self.ready) return error.RestoreRequired;
         if (self.store.schema_version >= 7) if (self.receipts) |admission| {
-            const floor = self.store.admissionClock() catch |failure| {
+            const read = if (in_transaction) self.store.readAdmissionClock(self.store.schema_version) else self.store.admissionClock();
+            const floor = read catch |failure| {
                 self.failed(failure);
                 return failure;
             };
@@ -159,41 +165,105 @@ pub const Pipeline = struct {
         try self.admit();
         self.beginDiagnostics();
         self.acknowledgeAdmitted(record) catch |failure| {
-            if (self.gate != null and failure != error.ConsumerExpired and failure != error.ConsumerPending and failure != error.EffectExpired and failure != error.ReserveBackpressure and failure != error.RetryCapacity and !sourceLocalIntervention(failure)) self.ready = false;
+            if (self.gate != null and !retainsAdmission(failure)) self.ready = false;
             return failure;
         };
     }
 
-    fn acknowledgeAdmitted(self: *Pipeline, record: records.Record) !void {
-        const exists = self.store.hasRecord(self.jail, record.source, record.occurrence, record.raw_hash, record.cursor) catch |failure| {
+    fn retainsAdmission(cause: anyerror) bool {
+        return cause == error.ConsumerExpired or cause == error.ConsumerPending or cause == error.EffectExpired or cause == error.ReserveBackpressure or cause == error.RetryCapacity or sourceLocalIntervention(cause);
+    }
+
+    pub fn acknowledgeBatch(batch: []const records.Record, acknowledged: *usize, context: ?*anyopaque) anyerror!void {
+        const self: *Pipeline = @ptrCast(@alignCast(context orelse return error.MissingPipeline));
+        acknowledged.* = 0;
+        if (batch.len == 0) return;
+        try self.admit();
+        self.beginDiagnostics();
+        self.acknowledgeFrame(batch, acknowledged) catch |failure| {
+            if (self.gate != null and !retainsAdmission(failure)) self.ready = false;
+            return failure;
+        };
+    }
+
+    fn acknowledgeFrame(self: *Pipeline, batch: []const records.Record, acknowledged: *usize) !void {
+        if (batch.len > group_commit.max_batch_records) return error.InvalidRecord;
+        var frame = self.store.beginBatch() catch |failure| {
             self.failed(failure);
             return failure;
         };
-        if (exists) {
-            if (self.receipts) |admission| if (record.kind == .data) {
-                const saved = self.store.committedReceipt(self.receiptIdentity(record, admission)) catch |failure| {
-                    self.failed(failure);
-                    return failure;
-                };
-                if (saved == null) {
-                    self.failed(error.RestoreRequired);
-                    return error.RestoreRequired;
-                }
-            };
-            const revision = self.store.revision(self.jail) catch |failure| {
-                self.failed(failure);
-                return failure;
-            };
-            if (revision != self.revision) {
+        var staged: usize = 0;
+        const refusal: ?anyerror = for (batch) |record| {
+            self.stageInFrame(&frame, record) catch |cause| break cause;
+            staged += 1;
+        } else null;
+        if (staged == 0 or frame.broken) {
+            self.store.rollback();
+            if (staged != 0) {
                 self.ready = false;
                 self.failed(error.RestoreRequired);
                 return error.RestoreRequired;
             }
-            if (self.receipts) |admission| if (self.candidate_receipt) |candidate| {
-                if (std.mem.eql(u8, &candidate.identity, &receiptKey(self.receiptIdentity(record, admission)))) self.candidate_receipt = null;
-            };
+            if (refusal) |cause| return cause;
             return;
         }
+        self.store.commitBatch(&frame) catch {
+            self.ready = false;
+            self.failed(error.RestoreRequired);
+            return error.RestoreRequired;
+        };
+        acknowledged.* = staged;
+        if (self.gate) |gate| for (0..frame.records) |_| gate.committed();
+        if (refusal) |cause| return cause;
+    }
+
+    fn stageInFrame(self: *Pipeline, frame: *group_commit.Frame, record: records.Record) !void {
+        if (try self.alreadyAdmitted(record)) return;
+        self.store.openBatchRecord(frame) catch |failure| {
+            self.failed(failure);
+            return failure;
+        };
+        errdefer self.store.dropBatchRecord(frame);
+        var observed = record;
+        var receipt: ?durable.Receipt = null;
+        if (self.receipts) |admission| if (record.kind == .data) {
+            const identity = self.receiptIdentity(record, admission);
+            const key = receiptKey(identity);
+            if (self.candidate_receipt) |candidate| {
+                if (!std.mem.eql(u8, &candidate.identity, &key)) return error.ReceiptRetryRequired;
+            } else self.candidate_receipt = .{ .identity = key, .time = try admission.clock(admission.clock_context) };
+            const reserved = self.store.reserveReceiptStep(identity, self.candidate_receipt.?.time, self.revision) catch |failure| {
+                const cause = if (failure == error.ReceiptAlreadyCommitted) error.ConcurrentWriter else failure;
+                self.failed(cause);
+                return cause;
+            };
+            observed.receipt_time = reserved.time;
+            receipt = .{ .time = reserved.time, .generation = admission.generation };
+            try self.admitClock(true);
+        };
+        const prepared = self.processor.prepare(observed, self.processor.context) catch |failure| {
+            if (failure == error.ReceiptClockReversed) if (observed.receipt_time) |saved| self.receiptClockFailed(saved.us);
+            return failure;
+        };
+        defer prepared.release(prepared.context);
+        try self.admitClock(true);
+        const result = self.store.closeBatchRecord(frame, self.storeRecord(record, prepared, receipt)) catch |err| {
+            if (err == error.StaleCheckpoint or err == error.StaleSharedCheckpoint or err == error.StaleConsumerCheckpoint) self.ready = false;
+            self.failed(err);
+            return err;
+        };
+        if (result == .already_committed) {
+            self.ready = false;
+            self.failed(error.ConcurrentWriter);
+            return error.ConcurrentWriter;
+        }
+        self.candidate_receipt = null;
+        self.revision += 1;
+        prepared.publish(prepared.context);
+    }
+
+    fn acknowledgeAdmitted(self: *Pipeline, record: records.Record) !void {
+        if (try self.alreadyAdmitted(record)) return;
         var observed = record;
         var receipt: ?durable.Receipt = null;
         if (self.receipts) |admission| if (record.kind == .data) {
@@ -218,7 +288,23 @@ pub const Pipeline = struct {
         };
         defer prepared.release(prepared.context);
         try self.admit();
-        const result = self.store.commitRecord(.{
+        const result = self.store.commitRecord(self.storeRecord(record, prepared, receipt)) catch |err| {
+            if (err == error.StaleCheckpoint or err == error.StaleSharedCheckpoint or err == error.StaleConsumerCheckpoint) self.ready = false;
+            self.failed(err);
+            return err;
+        };
+        if (result == .already_committed) {
+            self.ready = false;
+            self.failed(error.ConcurrentWriter);
+            return error.ConcurrentWriter;
+        }
+        self.revision += 1;
+        prepared.publish(prepared.context);
+        if (self.gate) |gate| gate.committed();
+    }
+
+    fn storeRecord(self: *const Pipeline, record: records.Record, prepared: Prepared, receipt: ?durable.Receipt) durable.Record {
+        return .{
             .jail = self.jail,
             .source = record.source,
             .source_path = record.source_path,
@@ -243,19 +329,38 @@ pub const Pipeline = struct {
             .shared_state = prepared.shared_state,
             .consumers = prepared.consumers,
             .consumer_manifest = prepared.consumer_manifest,
-        }) catch |err| {
-            if (err == error.StaleCheckpoint or err == error.StaleSharedCheckpoint or err == error.StaleConsumerCheckpoint) self.ready = false;
-            self.failed(err);
-            return err;
         };
-        if (result == .already_committed) {
+    }
+
+    fn alreadyAdmitted(self: *Pipeline, record: records.Record) !bool {
+        const exists = self.store.hasRecord(self.jail, record.source, record.occurrence, record.raw_hash, record.cursor) catch |failure| {
+            self.failed(failure);
+            return failure;
+        };
+        if (!exists) return false;
+        if (self.receipts) |admission| if (record.kind == .data) {
+            const saved = self.store.committedReceipt(self.receiptIdentity(record, admission)) catch |failure| {
+                self.failed(failure);
+                return failure;
+            };
+            if (saved == null) {
+                self.failed(error.RestoreRequired);
+                return error.RestoreRequired;
+            }
+        };
+        const revision = self.store.revision(self.jail) catch |failure| {
+            self.failed(failure);
+            return failure;
+        };
+        if (revision != self.revision) {
             self.ready = false;
-            self.failed(error.ConcurrentWriter);
-            return error.ConcurrentWriter;
+            self.failed(error.RestoreRequired);
+            return error.RestoreRequired;
         }
-        self.revision += 1;
-        prepared.publish(prepared.context);
-        if (self.gate) |gate| gate.committed();
+        if (self.receipts) |admission| if (self.candidate_receipt) |candidate| {
+            if (std.mem.eql(u8, &candidate.identity, &receiptKey(self.receiptIdentity(record, admission)))) self.candidate_receipt = null;
+        };
+        return true;
     }
 
     fn receiptIdentity(self: *const Pipeline, record: records.Record, admission: ReceiptAdmission) durable.ReceiptIdentity {

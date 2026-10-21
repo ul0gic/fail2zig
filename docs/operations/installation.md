@@ -95,31 +95,28 @@ executable, configuration and a coherent backup of the native database with its
 WAL/SHM siblings. An older binary cannot read newer checkpoint and marker data.
 Rollback requires the matching backup and binary, not an executable swap.
 
-The first start of this release upgrades a state last written by v0.4.6 (schema 24)
-to schema 25 in place. Schema 25 adds the storage for runtime ignore entries and
-continuity-loss events. States last written by releases before v0.4.6 are not a
-supported upgrade path; start from a fresh state.
+v0.4.7 is the minimum supported upgrade source. The first start of this release
+upgrades a state last written by v0.4.7 (schema 25) to schema 26 in place. Schema 26
+adds ban origins, ignore-entry deadlines and timed configuration entries. States last
+written by v0.4.6 or earlier are not a supported upgrade path; upgrade them through
+v0.4.7 first, or start from a fresh state.
 
 - Before its first change it writes a coherent copy of the database to a backup. It
   needs free space of twice the database size plus 32 MiB, and refuses to start if
   that backup file already exists. Move an old backup aside only when it is not the
   sole copy of earlier state.
-- The backup is `<state_file>.pre25-backup`.
-- The upgrade commits in small resumable steps. An interrupted upgrade resumes on
-  the next start. While it runs, the daemon extends its systemd start deadline only
-  as steps commit. The log reports completion, the backup path and how many
-  unsettled outcomes of already-replaced ban decisions were closed as `superseded`.
-- The first start also rekeys, once, saved detection generations that hashed the
-  ignore list. No ban, deadline, checkpoint or retry subject changes, and the log
-  reports how many jails and rows were rekeyed.
+- The backup is `<state_file>.pre26-backup`.
+- The upgrade commits in one transaction, so an interrupted upgrade leaves the
+  state at schema 25. Every existing ban gets origin `detection`. The log reports
+  completion and the backup path.
 
-v0.4.6 and older binaries refuse a schema 25 database with their schema-version
+v0.4.7 and older binaries refuse a schema 26 database with their schema-version
 message, so an older binary cannot be started on upgraded state without
 restoring the backup.
 
 To roll back, stop the daemon, restore the backup the upgrade wrote over the state
 file, remove the upgraded database's `-wal`/`-shm` files and reinstall the binary
-that last wrote that state: v0.4.6 for `.pre25-backup`. If you copied the backup
+that last wrote that state: v0.4.7 for `.pre26-backup`. If you copied the backup
 into place instead of moving it, move the backup file aside before the next
 upgrade, because an existing backup file refuses the start.
 

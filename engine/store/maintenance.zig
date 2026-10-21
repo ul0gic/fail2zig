@@ -807,13 +807,13 @@ pub fn Methods(comptime Store: type) type {
             var token = try self.historyHead(installation, after);
             if (expected_revision) |wanted_revision| if (wanted_revision != token.stream_revision) return error.StaleHistoryPage;
             var row = try self.statement(if (self.schema_version >= store.load_repair_schema)
-                "SELECT s.sequence,e.event_id,e.scope_key,e.canonical_scope,e.jail,e.decision_id,e.confirmed_us,EXISTS(SELECT 1 FROM confirmed_event_details d WHERE d.event_id=e.event_id) FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;"
+                self.originSql("SELECT s.sequence,e.event_id,e.scope_key,e.canonical_scope,e.jail,e.decision_id,e.confirmed_us,", "e.origin", ",EXISTS(SELECT 1 FROM confirmed_event_details d WHERE d.event_id=e.event_id) FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;")
             else if (self.schema_version >= 19)
-                "SELECT s.sequence,e.event_id,e.scope_key,n.canonical_scope,e.jail,e.decision_id,e.confirmed_us,EXISTS(SELECT 1 FROM confirmed_event_details d WHERE d.event_id=e.event_id) FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;"
+                self.originSql("SELECT s.sequence,e.event_id,e.scope_key,n.canonical_scope,e.jail,e.decision_id,e.confirmed_us,", "e.origin", ",EXISTS(SELECT 1 FROM confirmed_event_details d WHERE d.event_id=e.event_id) FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;")
             else if (self.schema_version >= 17)
-                "SELECT s.sequence,e.event_id,e.scope_key,n.scope,e.jail,e.decision_id,e.confirmed_us,EXISTS(SELECT 1 FROM confirmed_event_details d WHERE d.event_id=e.event_id) FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;"
+                self.originSql("SELECT s.sequence,e.event_id,e.scope_key,n.scope,e.jail,e.decision_id,e.confirmed_us,", "e.origin", ",EXISTS(SELECT 1 FROM confirmed_event_details d WHERE d.event_id=e.event_id) FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;")
             else
-                "SELECT s.sequence,e.event_id,e.scope_key,n.scope,e.jail,e.decision_id,e.confirmed_us FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;");
+                self.originSql("SELECT s.sequence,e.event_id,e.scope_key,n.scope,e.jail,e.decision_id,e.confirmed_us,", "e.origin", " FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;"));
             defer row.deinit();
             try row.int(1, @intCast(after));
             try row.int(2, @intCast(output.len));
@@ -822,11 +822,11 @@ pub fn Methods(comptime Store: type) type {
                 const sequence = try row.signed(0);
                 if (sequence <= 0 or sequence != after + count + 1 or sequence > token.head_sequence) return error.HistoryGap;
                 const native_retry = if (self.schema_version >= 17) blk: {
-                    const value = try row.signed(7);
+                    const value = try row.signed(8);
                     if (value < 0 or value > 1) return error.InvalidHistoryEvent;
                     break :blk value == 1;
                 } else false;
-                const event = effect_history.Event{ .sequence = @intCast(sequence), .event_id = try Store.effectBlob(&row, 1, 32), .installation = installation, .scope_key = try Store.effectBlob(&row, 2, 32), .scope = try self.decodeStoredScope(&row, 3), .jail = detection.Name.init(try row.boundedBytes(4, 64)) catch return error.InvalidHistoryEvent, .decision_id = try Store.effectBlob(&row, 5, 32), .confirmed_us = try row.signed(6), .native_retry = native_retry };
+                const event = effect_history.Event{ .sequence = @intCast(sequence), .event_id = try Store.effectBlob(&row, 1, 32), .installation = installation, .scope_key = try Store.effectBlob(&row, 2, 32), .scope = try self.decodeStoredScope(&row, 3), .jail = detection.Name.init(try row.boundedBytes(4, 64)) catch return error.InvalidHistoryEvent, .decision_id = try Store.effectBlob(&row, 5, 32), .confirmed_us = try row.signed(6), .native_retry = native_retry, .origin = std.meta.intToEnum(effects.Origin, try row.signed(7)) catch return error.InvalidHistoryEvent };
                 try event.validate();
                 output[count] = event;
                 count += 1;

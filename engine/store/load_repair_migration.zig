@@ -5,6 +5,7 @@ const store_mod = @import("store.zig");
 const Error = store_mod.Error;
 const latest_schema = store_mod.latest_schema;
 pub const target_schema = store_mod.load_repair_schema;
+pub const runtime_schema: i64 = 25;
 const source_schema: i64 = 23;
 
 // Callback allowance for the final transaction's unpageable foreign_key_check and quick_check.
@@ -16,18 +17,21 @@ const disk_reserve_bytes: u64 = 32 * 1024 * 1024;
 pub const BackupKind = enum {
     pre24,
     pre25,
+    pre26,
 
     fn suffix(self: BackupKind) []const u8 {
         return switch (self) {
             .pre24 => ".pre24-backup",
             .pre25 => ".pre25-backup",
+            .pre26 => ".pre26-backup",
         };
     }
 
     fn target(self: BackupKind) i64 {
         return switch (self) {
             .pre24 => target_schema,
-            .pre25 => latest_schema,
+            .pre25 => runtime_schema,
+            .pre26 => latest_schema,
         };
     }
 };
@@ -346,7 +350,7 @@ pub fn Methods(comptime Store: type) type {
                 if (try self.integer("SELECT count(*) FROM sqlite_schema WHERE name='load_repair_migration';") != 0) return error.LoadRepairInvalidState;
                 return .ready;
             }
-            if (schema != target_schema and schema != latest_schema) return error.UnsupportedSchema;
+            if (schema < target_schema or schema > latest_schema) return error.UnsupportedSchema;
             const progress = try self.loadRepairProgress();
             return if (progress.phase == .complete) .complete else .incomplete;
         }
@@ -444,7 +448,7 @@ pub fn Methods(comptime Store: type) type {
                 std.log.warn("native storage: schema {d} migration refused: backup {s} already exists; keep it if it is the only copy of earlier state, otherwise move it aside and restart", .{ kind.target(), final_path });
                 return switch (kind) {
                     .pre24 => error.LoadRepairBackupExists,
-                    .pre25 => error.SchemaBackupExists,
+                    .pre25, .pre26 => error.SchemaBackupExists,
                 };
             } else |failure| if (failure != error.FileNotFound) return error.StorageIo;
             const page_size = try self.integer("PRAGMA page_size;");

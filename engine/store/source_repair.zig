@@ -72,6 +72,20 @@ pub const Outcome = struct {
     }
 };
 
+pub const Headline = struct {
+    pub const truncation = "truncation acknowledged";
+    pub const replaced_file = "replaced file acknowledged";
+    pub const removed = "removed rotated incarnation acknowledged";
+    pub const replayed = "already applied by this token (replayed; nothing changed now)";
+    pub const loss_recorded = "nothing to repair; on_truncation = \"restart\" already recorded this loss";
+};
+
+pub fn headline(outcome: Outcome) []const u8 {
+    if (outcome.replayed) return Headline.replayed;
+    if (outcome.removed != null) return Headline.removed;
+    return if (outcome.replaced_file) Headline.replaced_file else Headline.truncation;
+}
+
 pub const RecordedLoss = struct { wall_us: i64, inode: u64, committed_offset: u64, observed_size: ?u64 };
 
 pub const Diagnostic = struct { shape: ?Shape = null, recorded: ?RecordedLoss = null };
@@ -131,6 +145,14 @@ pub fn repair(store: *Store, allocator: std.mem.Allocator, request: Request, now
     };
     defer plan.deinit(allocator);
     return commit(store, allocator, request, key, file, plan, now_us);
+}
+
+pub fn Methods(comptime Self: type) type {
+    return struct {
+        pub fn repairSourceOnline(self: *Self, request: Request, now_us: i64, diagnostic: *Diagnostic) Error!Outcome {
+            return repair(self, self.allocator, request, now_us, diagnostic);
+        }
+    };
 }
 
 fn requireMigratedSchema(store: *Store) Error!void {

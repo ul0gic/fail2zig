@@ -20,10 +20,54 @@ const latest_schema = store.latest_schema;
 const Record = store.Record;
 const EscalationSelection = store.EscalationSelection;
 const max_native_detections = store.max_native_detections;
+const eviction_warn_interval_us: i64 = 60 * 1_000_000;
+
+pub const Evictions = struct {
+    slots: [max_jail_slots]Slot = [_]Slot{.{}} ** max_jail_slots,
+    used: u8 = 0,
+
+    const max_jail_slots = 64;
+    const Slot = struct { jail: detection.Name = .{ .len = 0 }, total: u64 = 0, unreported: u64 = 0, warned_us: ?i64 = null };
+
+    fn find(self: *const Evictions, jail: []const u8) ?usize {
+        for (self.slots[0..self.used], 0..) |*slot, i| if (std.mem.eql(u8, slot.jail.slice(), jail)) return i;
+        return null;
+    }
+
+    pub fn count(self: *const Evictions, jail: []const u8) u64 {
+        return if (self.find(jail)) |i| self.slots[i].total else 0;
+    }
+
+    fn note(self: *Evictions, jail: []const u8, now_us: i64) error{InvalidRecord}!void {
+        const index = self.find(jail) orelse blk: {
+            const name = detection.Name.init(jail) catch return error.InvalidRecord;
+            var chosen: usize = self.used;
+            if (self.used == max_jail_slots) {
+                chosen = 0;
+                for (self.slots, 0..) |slot, i| {
+                    const oldest = self.slots[chosen].warned_us orelse std.math.minInt(i64);
+                    if ((slot.warned_us orelse std.math.minInt(i64)) < oldest) chosen = i;
+                }
+            } else self.used += 1;
+            self.slots[chosen] = .{ .jail = name };
+            break :blk chosen;
+        };
+        const slot = &self.slots[index];
+        slot.total +|= 1;
+        slot.unreported +|= 1;
+        if (slot.warned_us) |last| if (now_us - last < eviction_warn_interval_us) return;
+        std.log.warn("native: jail={} tracking pool full: evicted {d} idle subjects in the last 60 s", .{ std.zig.fmtEscapes(jail), slot.unreported });
+        slot.unreported = 0;
+        slot.warned_us = now_us;
+    }
+};
 
 pub fn Methods(comptime Store: type) type {
     return struct {
         const SourceMaintenance = Store.SourceMaintenance;
+        pub const EvictionReport = struct { evicted: ?detection.Subject, last_processed_us: i64 };
+        pub const PoolOccupancy = struct { tracked: u32, banned: u32, tracking_limit: u32, ban_limit: u32 };
+        const PoolPressure = enum { none, tracking, banned };
         pub const ManifestMode = enum { first_use, @"resume" };
         pub const ManifestStatus = enum { first_use, ready };
         pub const ManifestSnapshot = struct {
@@ -1301,29 +1345,74 @@ pub fn Methods(comptime Store: type) type {
             return .{ .changed = true, .lease = prolonged.lease, .effect = next };
         }
 
-        fn readEscalationHistory(self: *Store, jail: []const u8, subject: detection.Subject, scope: retry.EscalationScope) Error!retry.EscalationHistoryInput {
+        fn readEscalationHistory(self: *Store, jail: []const u8, subject: detection.Subject, scope: retry.EscalationScope, decay: retry.EscalationDecay, now_us: i64, policy: retry.Policy) Error!retry.EscalationHistoryInput {
+            if (decay.window_us < 0) return error.InvalidEscalationInput;
+            const history = history: {
+                var row = try self.statement(switch (scope) {
+                    .per_jail => "SELECT confirmed_count,latest_confirmed_us FROM confirmed_policy_summaries WHERE jail=?1 AND family=?2 AND subject=?3;",
+                    .overall => "SELECT coalesce(sum(confirmed_count),0),max(latest_confirmed_us) FROM confirmed_policy_summaries WHERE ?1 IS NOT NULL AND family=?2 AND subject=?3;",
+                });
+                defer row.deinit();
+                try row.text(1, jail);
+                try bindSubject(&row, &subject);
+                if (!try row.row()) return .{};
+                const signed_count = try row.signed(0);
+                if (signed_count < 0) return error.InvalidRetryState;
+                const count: u64 = @intCast(signed_count);
+                const latest = try row.optionalSigned(1);
+                if ((count == 0) != (latest == null) or try row.row()) return error.InvalidRetryState;
+                break :history retry.EscalationHistoryInput{ .prior_confirmed = count, .latest_confirmed_us = latest };
+            };
+            if (decay.window_us == 0 or history.prior_confirmed == 0) return history;
+            const ban_end = try self.lastBanEnd(jail, subject, scope, now_us, history, policy) orelse return history;
+            if (@as(i128, ban_end) >= @as(i128, now_us) - decay.window_us) return history;
+            var forget = try self.statement(switch (scope) {
+                .per_jail => "DELETE FROM confirmed_policy_summaries WHERE jail=?1 AND family=?2 AND subject=?3;",
+                .overall => "DELETE FROM confirmed_policy_summaries WHERE ?1 IS NOT NULL AND family=?2 AND subject=?3;",
+            });
+            defer forget.deinit();
+            try forget.text(1, jail);
+            try bindSubject(&forget, &subject);
+            try forget.done();
+            return .{};
+        }
+
+        fn lastBanEnd(self: *Store, jail: []const u8, subject: detection.Subject, scope: retry.EscalationScope, now_us: i64, history: retry.EscalationHistoryInput, policy: retry.Policy) Error!?i64 {
             var row = try self.statement(switch (scope) {
-                .per_jail => "SELECT confirmed_count,latest_confirmed_us FROM confirmed_policy_summaries WHERE jail=?1 AND family=?2 AND subject=?3;",
-                .overall => "SELECT coalesce(sum(confirmed_count),0),max(latest_confirmed_us) FROM confirmed_policy_summaries WHERE ?1 IS NOT NULL AND family=?2 AND subject=?3;",
+                .per_jail => "SELECT max(permanent),max(deadline_us) FROM (SELECT lease_kind=2 AS permanent,deadline_us FROM retry_states WHERE jail=?1 AND family=?2 AND subject=?3 UNION ALL SELECT lease_kind=2,deadline_us FROM retry_decisions WHERE jail=?1 AND family=?2 AND subject=?3);",
+                .overall => "SELECT max(permanent),max(deadline_us) FROM (SELECT lease_kind=2 AS permanent,deadline_us FROM retry_states WHERE ?1 IS NOT NULL AND family=?2 AND subject=?3 UNION ALL SELECT lease_kind=2,deadline_us FROM retry_decisions WHERE ?1 IS NOT NULL AND family=?2 AND subject=?3);",
             });
             defer row.deinit();
             try row.text(1, jail);
             try bindSubject(&row, &subject);
-            if (!try row.row()) return .{};
-            const signed_count = try row.signed(0);
-            if (signed_count < 0) return error.InvalidRetryState;
-            const count: u64 = @intCast(signed_count);
-            const latest = try row.optionalSigned(1);
-            if ((count == 0) != (latest == null) or try row.row()) return error.InvalidRetryState;
-            return .{ .prior_confirmed = count, .latest_confirmed_us = latest };
+            if (!try row.row()) return error.DatabaseFailure;
+            if ((try row.optionalSigned(0) orelse 0) == 1) return null;
+            if (try row.optionalSigned(1)) |deadline| return if (deadline > now_us) null else deadline;
+            const confirmed_us = history.latest_confirmed_us orelse return error.InvalidRetryState;
+            const last_term = policy.escalation.duration(policy.duration, history.prior_confirmed - 1, 0) catch |err| switch (err) {
+                error.InvalidEscalationPolicy => return null,
+                else => return err,
+            };
+            return switch (last_term) {
+                .finite_us => |term_us| std.math.add(i64, confirmed_us, term_us) catch null,
+                .permanent => null,
+            };
         }
 
-        fn retryPoolFull(self: *Store, now_us: i64, new_row: bool, banning: bool, tracking_limit: u32) Error!bool {
+        fn retryPoolPressure(self: *Store, now_us: i64, new_row: bool, banning: bool, tracking_limit: u32) Error!PoolPressure {
             const total = try self.integer("SELECT count(*) FROM retry_states;");
             if (comptime build_options.diag) diag_mod.limit(.retry_rows, std.math.lossyCast(u64, total), @as(u64, tracking_limit) + retry.max_pool_subjects);
-            if (new_row and total >= @as(i64, tracking_limit) + retry.max_pool_subjects) return true;
+            const total_full = new_row and total >= @as(i64, tracking_limit) + retry.max_pool_subjects;
             const limit: i64 = if (banning) retry.max_pool_subjects else tracking_limit;
-            if (total < limit) return false;
+            if (!total_full and total < limit) return .none;
+            const banned = try self.liveRetryLeases(now_us);
+            if (comptime build_options.diag) diag_mod.limit(.banned_subjects, std.math.lossyCast(u64, banned), retry.max_pool_subjects);
+            if (banning and banned >= retry.max_pool_subjects) return .banned;
+            if (total_full or (!banning and total - banned >= limit)) return .tracking;
+            return .none;
+        }
+
+        fn liveRetryLeases(self: *Store, now_us: i64) Error!i64 {
             var row = try self.statement(if (self.schema_version >= 16)
                 "SELECT count(*) FROM retry_states WHERE lease_kind=2 OR (lease_kind=1 AND deadline_us>?1);"
             else
@@ -1331,9 +1420,67 @@ pub fn Methods(comptime Store: type) type {
             defer row.deinit();
             try row.int(1, now_us);
             if (!try row.row()) return error.DatabaseFailure;
-            const banned = try row.signed(0);
-            if (comptime build_options.diag) diag_mod.limit(.banned_subjects, std.math.lossyCast(u64, banned), retry.max_pool_subjects);
-            return (if (banning) banned else total - banned) >= limit;
+            return row.signed(0);
+        }
+
+        pub fn evictIdleSubject(self: *Store, jail: []const u8, now_us: i64) Error!EvictionReport {
+            if (self.schema_version < 16) return .{ .evicted = null, .last_processed_us = 0 };
+            const installation = try self.readInstallation();
+            var candidates = try self.statement("SELECT jail,family,subject,last_processed_us,decisions FROM retry_states WHERE lease_kind=0 OR (lease_kind=1 AND deadline_us<=?1) ORDER BY last_processed_us,jail,family,subject LIMIT 16;");
+            defer candidates.deinit();
+            try candidates.int(1, now_us);
+            while (try candidates.row()) {
+                const subject = try self.decodeRetrySubject(&candidates, 1, 2);
+                if (installation) |owner| {
+                    if (try self.readEffect(try (try effects.Scope.host(subject)).key(owner), owner)) |entry|
+                        if (entry.desired != .absent or entry.status != .absent) continue;
+                }
+                const victim_jail = detection.Name.init(try candidates.boundedBytes(0, 64)) catch return error.InvalidRetryState;
+                const last_processed_us = try candidates.signed(3);
+                const signed_decisions = try candidates.signed(4);
+                if (signed_decisions < 0) return error.InvalidRetryState;
+                const decisions: u64 = @intCast(signed_decisions);
+                if (decisions > 0) {
+                    const victim_policy = try self.readRetryPolicy(victim_jail.slice()) orelse return error.InvalidRetryState;
+                    try self.changeRetiredTotal(victim_jail.slice(), decisions, true);
+                    var saved = try self.statement("INSERT INTO retry_retired VALUES(?1,?2,?3,?4,?5,?6);");
+                    defer saved.deinit();
+                    try saved.text(1, victim_jail.slice());
+                    try bindSubject(&saved, &subject);
+                    try saved.blob(4, &victim_policy.generation);
+                    try saved.int(5, last_processed_us);
+                    try saved.int(6, signed_decisions);
+                    try saved.done();
+                }
+                var remove = try self.statement("DELETE FROM retry_states WHERE jail=?1 AND family=?2 AND subject=?3;");
+                defer remove.deinit();
+                try remove.text(1, victim_jail.slice());
+                try bindSubject(&remove, &subject);
+                try remove.done();
+                if (self.api.changes(self.db) != 1) return error.InvalidRetryState;
+                try self.retry_evictions.note(jail, now_us);
+                return .{ .evicted = subject, .last_processed_us = last_processed_us };
+            }
+            return .{ .evicted = null, .last_processed_us = 0 };
+        }
+
+        pub fn retryPoolOccupancy(self: *Store, now_us: i64) Error!PoolOccupancy {
+            try self.beginRead();
+            errdefer self.rollback();
+            const total = try self.integer("SELECT count(*) FROM retry_states;");
+            const banned = try self.liveRetryLeases(now_us);
+            if (total < 0 or banned < 0 or banned > total) return error.InvalidRetryState;
+            try self.commitTransaction();
+            return .{
+                .tracked = std.math.cast(u32, total - banned) orelse return error.StorageLimit,
+                .banned = std.math.cast(u32, banned) orelse return error.StorageLimit,
+                .tracking_limit = retry.max_pool_subjects,
+                .ban_limit = retry.max_pool_subjects,
+            };
+        }
+
+        pub fn evictionCount(self: *Store, jail: []const u8) u64 {
+            return self.retry_evictions.count(jail);
         }
 
         pub fn commitRetry(self: *Store, record: Record, admission: retry.Admission) Error!void {
@@ -1357,11 +1504,15 @@ pub fn Methods(comptime Store: type) type {
             var next = try retry.advanceWithEvidence(admission.policy, previous, subject, current_attempt, now, record.retry_evidence);
             const new_row = previous == null or retired != null;
             const newly_banned = next.decision != null and !(if (previous) |prior| prior.lease.live(now) else false);
-            if ((new_row or newly_banned) and try self.retryPoolFull(now, new_row, newly_banned, admission.policy.max_subjects)) return error.RetryCapacity;
+            if (new_row or newly_banned) switch (try self.retryPoolPressure(now, new_row, newly_banned, admission.policy.max_subjects)) {
+                .none => {},
+                .banned => return error.RetryCapacity,
+                .tracking => if ((try self.evictIdleSubject(record.jail, now)).evicted == null) return error.RetryCapacity,
+            };
             var escalation_selection: ?EscalationSelection = null;
             if (next.decision != null and admission.policy.escalation.enabled) {
                 if (self.schema_version < 18) return error.RetryStorageRequired;
-                const history = try self.readEscalationHistory(record.jail, subject, admission.policy.escalation.scope);
+                const history = try self.readEscalationHistory(record.jail, subject, admission.policy.escalation.scope, admission.decay, now, admission.policy);
                 var sampled_seconds: u64 = 0;
                 if (history.prior_confirmed > 0 and admission.policy.escalation.jitter_us > 0) {
                     const maximum: u64 = @intCast(@divExact(admission.policy.escalation.jitter_us, 1_000_000));
@@ -1390,7 +1541,7 @@ pub fn Methods(comptime Store: type) type {
             var prepared_context: ?action_context.Context = null;
             if (next.decision) |decision| {
                 const confirmed_history_count: ?u64 = if (self.schema_version >= 18)
-                    (try self.readEscalationHistory(record.jail, subject, .per_jail)).prior_confirmed
+                    (try self.readEscalationHistory(record.jail, subject, .per_jail, .{}, now, admission.policy)).prior_confirmed
                 else
                     null;
                 prepared_context = try action_context.fromRetry(

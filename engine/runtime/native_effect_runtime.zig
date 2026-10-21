@@ -522,7 +522,7 @@ pub const Manager = struct {
                 if (!std.mem.eql(u8, binding.jail, owner.jail.slice())) continue;
                 if (!std.mem.eql(u8, &binding.generation, &owner.generation)) return error.EffectGenerationMismatch;
                 break;
-            } else return error.UnconfiguredStateOwner;
+            } else if (owner.lease == .absent) continue else return error.UnconfiguredStateOwner;
             if (owner.lease == .finite) deadline = if (deadline) |prior| @min(prior, owner.lease.finite) else owner.lease.finite;
         }
         return deadline;
@@ -1237,6 +1237,86 @@ pub const Manager = struct {
             self.view_revision +%= 1;
         }
         return result;
+    }
+    pub fn retireJail(self: *Manager, jail: []const u8, generation: [32]u8) Step {
+        return self.retireJailInner(jail, generation) catch |failure| .{ .fatal = failure };
+    }
+    fn retireJailInner(self: *Manager, jail: []const u8, generation: [32]u8) !Step {
+        errdefer |failure| {
+            self.dropInventory();
+            self.status.ready = false;
+            self.status.uncertain = true;
+            self.status.cause = failure;
+        }
+        if (self.withdrawn) return .idle;
+        if (self.stopping or !self.admitted or self.cached_epoch == null or self.cached_epoch.? != self.store.effect_publication_epoch) return .progress;
+        if (self.readback_wait != 0) return .{ .wait = self.waitDue() };
+        const sampled = try self.clock();
+        if (!self.inventoryCurrent()) return self.readback(sampled);
+        var tokens: [firewall.max_withdraw_messages]firewall.DispatchToken = undefined;
+        var batched: usize = 0;
+        var budget: usize = 0;
+        var in_flight = false;
+        {
+            var owners: [effect.max_page]effect.Owner = undefined;
+            try self.store.beginRead();
+            errdefer self.store.rollback();
+            for (self.live[0..self.count], 0..) |entry, index| {
+                if (entry.desired != .absent) continue;
+                if (!try presentIn(&self.inventory.?, entry)) continue;
+                const owner_count = try self.store.readOwners(entry.scope_key, &owners);
+                for (owners[0..owner_count]) |owner| {
+                    if (std.mem.eql(u8, owner.jail.slice(), jail) and std.mem.eql(u8, &owner.generation, &generation)) break;
+                } else continue;
+                if (entry.status == .dispatched or self.markers[index] != null) {
+                    in_flight = true;
+                    continue;
+                }
+                const cost = try firewall.withdrawCost(entry.scope.canonical);
+                if (batched != 0 and budget + cost > firewall.max_withdraw_messages) break;
+                tokens[batched] = self.token(entry, .absent);
+                batched += 1;
+                budget += cost;
+                if (batched == tokens.len) break;
+            }
+            try self.store.commitTransaction();
+        }
+        if (batched == 0) return if (in_flight) .progress else .idle;
+        self.status.ready = false;
+        const sent_ns = self.monotonic(self.monotonic_context);
+        const prior_mutation_ns = self.last_mutation_ns;
+        const prior_mutation_wall_us = self.last_mutation_wall_us;
+        self.last_mutation_ns = sent_ns;
+        self.last_mutation_wall_us = sampled.prepared_us;
+        const result = self.inspector.withdrawBatch(tokens[0..batched], .{ .wall_us = sampled.prepared_us }, &self.inventory.?.snapshot) catch |failure| {
+            self.recordFirewallDirect(.effect_dispatch, failure);
+            self.last_mutation_ns = prior_mutation_ns;
+            self.last_mutation_wall_us = prior_mutation_wall_us;
+            if (!transientReadback(failure)) return error.EffectBackendUncertain;
+            return self.deferReadback();
+        };
+        switch (result) {
+            .uncertain => |failure| {
+                self.recordFirewallFailure(failure);
+                if (failure.mutation == .not_started) {
+                    self.last_mutation_ns = prior_mutation_ns;
+                    self.last_mutation_wall_us = prior_mutation_wall_us;
+                }
+                if (!transientReadback(failure.cause)) return error.EffectBackendUncertain;
+                return self.deferReadback();
+            },
+            .verified => |verified| {
+                var snapshot = verified.snapshot;
+                const after_ns = self.monotonic(self.monotonic_context);
+                {
+                    errdefer snapshot.deinit();
+                    try self.validateAndCaptureObservation(&snapshot, .effect, verified.observed_wall_us, .effect_verify);
+                }
+                self.keepInventory(snapshot, verified.observed_start_wall_us, verified.observed_wall_us, after_ns);
+                if (!try self.evaluateInventory()) return self.deferReadback();
+                return .progress;
+            },
+        }
     }
     const max_stop_retries: u8 = 32;
     fn stopFailure(self: *Manager, cause: anyerror, fatal: anyerror) !Step {

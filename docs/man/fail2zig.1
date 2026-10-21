@@ -1,4 +1,4 @@
-.TH FAIL2ZIG 1 "2026-10-13" "fail2zig 0.4.7" "User Commands"
+.TH FAIL2ZIG 1 "2026-10-21" "fail2zig 0.4.8" "User Commands"
 .
 .SH NAME
 fail2zig \- intrusion prevention daemon and its administration commands
@@ -155,6 +155,39 @@ require uid 0 or the daemon uid, verified with
 .BR SO_PEERCRED .
 The read-only commands include
 .BR "ignore list" .
+.PP
+Every mutation request, including the online form of
+.BR repair-source ,
+writes exactly one
+.B info
+line with scope
+.B audit
+to the daemon log once its outcome is known, for example:
+.PP
+.nf
+audit: command=ban target=203.0.113.4 jail=sshd uid=0 outcome=applied
+.fi
+.PP
+.B command
+is the client verb
+.RB ( ban ", " unban ", " "ignore add" ", " "ignore remove" ", " reload ,
+.BR "jail pause" ", " "jail resume" ", " "jail enable" ", " "jail disable" ,
+.BR "history reset" " or " repair-source ),
+.B target
+is the address, jail or path, or
+.B \-
+when there is none (as for
+.BR reload ),
+.B uid
+is the caller's uid from the socket credentials, and
+.B outcome
+is the daemon's outcome
+.RB ( applied ", " rejected ", " absent ", " partial ", " uncertain ", " noop
+or
+.BR restart_required ).
+With
+.B log_format = \(dqjson\(dq
+the same keys are fields of the line's JSON object.
 .TP
 .B status
 Daemon summary: version, protection state
@@ -178,9 +211,10 @@ History counts retained confirmed effect events; maintenance can remove these ro
 so this is not a lifetime ban count. The machine-readable key remains
 .BR total_bans .
 .B memory_admission_bytes
-is the memory the daemon planned and admitted at start against
+is the memory the daemon planned and admitted against
 .BR native_memory_ceiling_mb ;
-it is fixed for the life of the process and is not the resident size.
+it grows when a reload adds a jail and shrinks when a reload removes one,
+and it is not the resident size.
 Plain output prints it after
 .BR paused_sources ,
 and
@@ -188,6 +222,30 @@ and
 shows it as
 .BR "Memory plan:" .
 .RS
+.PP
+State file and tracking pool. Table output adds the lines
+.PP
+.nf
+State file: <bytes> (<pages> pages of <max_pages>)
+Tracking pool: <tracked> of <tracking_limit> tracked, <banned> of <ban_limit> banned
+.fi
+.PP
+and JSON adds
+.BR state_file_bytes ,
+.BR state_file_pages ,
+.BR state_file_max_pages ,
+.BR pool_tracked ,
+.BR pool_banned ,
+.B pool_tracking_limit
+and
+.BR pool_ban_limit .
+The state file cannot grow past 1 GiB; see
+.B state_file
+in
+.BR fail2zig.toml (5).
+The tracking pool counts subjects below
+.B maxretry
+and expired bans not yet retired; the banned count is the subjects with a live ban.
 .PP
 Paused sources. A file source that cannot resume (truncated in place below its
 committed offset, a rotated-out file removed with unread bytes, or a log replaced by a
@@ -348,11 +406,60 @@ count is shown as \fB-\fR, while a known zero remains \fB0\fR. Table output show
 for thresholds and effective action. When the detailed table does not fit the
 terminal width, all detail fields are shown in stacked rows per jail.
 .TP
-.BI list " [--jail name] [--details] [--sort]"
+.BI list " [--jail name] [--origin detection|manual|config] [--details] [--sort]"
 Active bans, optionally for one jail. Table output distinguishes
 confirmed and pending intent, permanent leases and unknown expiry; narrow terminals
 use stacked rows. Existing plain columns and JSON fields retain their meaning.
 The --details flag adds ban counts to the table view.
+.IP
+Every ban has one origin:
+.B detection
+(a filter matched),
+.B manual
+.RB ( ban )
+or
+.B config
+.RB ( banip ).
+Table output shows it in the
+.B ORIGIN
+column after
+.BR JAIL ,
+and each JSON item carries
+.B origin
+and
+.B expired
+.RB ( false
+for every live ban). After the live bans, each timed
+.B banip
+entry whose period has run out is listed once as an item with
+.B expired
+set to
+.BR true ,
+.B origin
+.BR config ,
+.B ip
+the entry's canonical address,
+.BR jail ,
+.B expiry_us
+and
+.B ban_expiry
+the stored deadline,
+.B permanent
+false,
+.B ban_count
+0, and
+.B enforced
+and
+.B confirmed
+false; the table shows
+.B expired
+under
+.BR "TIME LEFT" .
+.B \-\-origin
+keeps only the bans of that origin, filtered by the client in every output format;
+.B \-\-origin config
+includes the expired entries.
+.IP
 .B --sort
 sorts returned rows client-side in every output format: IPv4 before IPv6, numeric
 address ascending, prefix length ascending, host before an explicit equal-width
@@ -380,6 +487,11 @@ observation_complete. next_cursor pages only the retained sample; use the same l
 A replaced observation, daemon restart or 60-second cursor lifetime requires
 restarting pagination without a cursor. No jail filter or forced refresh is provided.
 Timeouts are sampled values; unexpected entries do not imply desired or confirmed bans.
+Each entry carries the origin of the ban that owns it (table column
+.BR ORIGIN ,
+JSON
+.BR origin ),
+which is null for an element the daemon does not own.
 .TP
 .B firewall withdraw
 Remove every firewall rule the running daemon realized, in batches with a kernel
@@ -407,18 +519,93 @@ when nothing was removed. It works while storage is unhealthy and changes no
 stored state, so it has no request replay or audit record. Because a stop leaves
 rules in place, run it before stopping the daemon to leave an empty table.
 .TP
-.BI ban " ip --jail name [--duration seconds] [--scope host|net cidr]"
+.BI ban " ip --jail name [--duration seconds] [--scope host|net cidr] [--force]"
 Manual ban. Exactly one
 .B \-\-jail
 is required.
 .B \-\-scope net
 bans a network and needs a backend with set support (nftables or ipset).
-A log-only jail rejects manual bans.
+A log-only jail rejects manual bans. The ban has origin
+.BR manual .
+A
+.B ban
+of an address that holds a detection ban extends it to the requested duration and
+marks it
+.BR manual .
+A
+.B ban
+of an address that holds a config ban is refused with exit status 1 and
+.BR "banned by config: edit banip"
+(JSON
+.BR reasons[0] );
+edit
+.B banip
+in the configuration and reload instead.
+.IP
+Lockout guard. Before it contacts the daemon,
+.B ban
+refuses a target that is a protected address or a
+.B \-\-scope net
+network containing one. The protected addresses are loopback (127.0.0.0/8 and ::1),
+every IPv4 and IPv6 address of the host's interfaces, and the caller's SSH client
+address, the first field of
+.BR SSH_CONNECTION .
+The refusal exits with status 1, opens no socket and names the matched address:
+.PP
+.nf
+.RS
+error: refusing to ban 127.0.0.1: loopback address 127.0.0.1; use --force to override
+.RE
+.fi
+.IP
+The reason reads
+.BR "loopback address" ,
+.B this host's address
+or
+.BR "your SSH peer address" .
+When the interface addresses cannot be read, the guard still protects loopback and
+the SSH client address.
+.B \-\-force
+skips the guard; the daemon's own authorization is unchanged, so the guard is a
+convenience against a typing mistake or a faulty script, not a security boundary.
+.B \-\-force
+on any command other than
+.B ban
+is a usage error (exit status 2).
+.IP
+A
+.B ban
+of an address on the jail's ignore list (configured
+.BR ignoreip ,
+a runtime entry or a
+.B self
+address) is applied as before and exits 0, with a warning that names the ignore
+source as
+.B ignore list
+shows it:
+.PP
+.nf
+.RS
+warning: 192.0.2.10 is on the ignore list (config)
+.RE
+.fi
+.IP
+JSON output carries the same text in the
+.B warning
+field.
 .TP
 .BI unban " ip --jail name [--scope host|net cidr]"
-Release a manual or automatic ban in one jail.
+Release a manual or detection ban in one jail. A config ban is refused with exit status
+1 and
+.BR "banned by config: edit banip" .
+After an unban the address's failure count starts from zero, so
+.B maxretry
+new failures inside
+.B findtime
+ban it again. Its escalation count is kept: that next ban is escalated as the next
+offence, not treated as a first one.
 .TP
-.BI "ignore add" " address|cidr --jail name [--unban]"
+.BI "ignore add" " address|cidr --jail name [--for duration] [--unban]"
 Record a runtime exclusion for one jail. The address is an IPv4 or IPv6 host, or
 .IR address / prefix
 (IPv4 prefix 0\-32, IPv6 prefix 0\-128) of at most 64 bytes, and is stored in canonical form
@@ -459,6 +646,38 @@ becomes
 .BR config+runtime .
 Output also names any wider configured entry that already covers the address, a prefix 0
 entry that covers every address of its family, and a disabled or paused jail.
+.PP
+.B \-\-for
+gives the entry a life, in the duration syntax of
+.BR fail2zig.toml (5),
+for example
+.B \-\-for 2m
+or
+.BR "\-\-for 1h30m" .
+The deadline is stored, survives a restart, and JSON output adds
+.BR expires_us .
+At the deadline the daemon deletes the entry, and from the next event the address is
+detected again. Without
+.BR \-\-for ,
+the entry takes the jail's
+.B ignoretime
+when it is set and is permanent otherwise. Adding an existing entry with a later deadline,
+or without one, extends it; a permanent entry is never shortened by
+.BR \-\-for .
+A value that is not a duration, is 0 or is not finite exits with status 2:
+.PP
+.nf
+.RS
+invalid \-\-for value '<text>' (expected a duration such as 2m or 1h30m)
+.RE
+.fi
+.PP
+.B \-\-for
+on an address configured only in
+.B ignoreip
+exits with status 2 and
+.BR "\-\-for applies to runtime entries only; <address> is configured in ignoreip" ;
+give the configured entry a duration in the file instead.
 .PP
 Each jail holds at most 128 entries, configuration and runtime combined. An add that would
 exceed it is refused. A reload that would make configured plus runtime entries exceed 128 is
@@ -510,14 +729,40 @@ established; 2 and 3 as for
 Read-only. One row per distinct jail and entry of the effective list, ordered by jail name,
 then IPv4 before IPv6, numeric address, prefix length. Columns are
 .BR JAIL ,
-.B ADDRESS
+.BR ADDRESS ,
+.B SOURCE
 and
-.BR SOURCE ,
+.BR EXPIRES ,
 where the source is
 .BR config ,
-.B runtime
+.BR runtime ,
+.B config+runtime
 or
-.BR config+runtime .
+.B self
+(a host address added by
+.BR ignoreself ).
+A
+.B self
+entry never merges with another source: an address that is both a host address and
+listed shows twice.
+.B EXPIRES
+is
+.B \-
+for a permanent entry, the time left (for example
+.BR "in 1m 58s" )
+for a timed one, or
+.BR expired .
+A configured entry and a runtime entry for one address show as
+.B config+runtime
+only when both are permanent. An expired runtime entry is deleted and no longer listed;
+an expired configured entry stays listed as
+.B expired
+until it is removed from the file. JSON entries add
+.B expires_us
+(null when permanent),
+.B remaining_s
+(null when permanent, 0 once expired) and
+.BR expired .
 Without
 .B \-\-jail
 every enabled jail is listed; with it, that jail whether enabled or not. A jail without
@@ -563,9 +808,16 @@ Propose the current configuration file as a new generation. Outcomes:
 .BR reasons ).
 Live keys: per-jail
 .BR maxretry ", " bantime ", " bantime_kind ", " bantime_increment ,
+.BR bantime_increment_decay ,
 literal
 .B ignoreip
-entries (per jail and in
+and
+.B banip
+entries and their durations,
+.B ignoreself
+and
+.B ignoretime
+(per jail and in
 .BR [defaults] ),
 global
 .BR log_level ,
@@ -573,13 +825,42 @@ and the contents of a custom jail's
 .BR ignore_file .
 An
 .B ignoreip
-edit applies from the next event after the reload and never alters an existing ban.
+edit applies from the next event after the reload and never alters an existing ban; a
+.B banip
+edit bans or lifts at once. The reload reads the host's addresses again for
+.BR ignoreself .
+.B log_format
+is restart-only.
 Live reload applies supported changes; restart-only settings require a daemon restart.
+.IP
+Adding or removing a jail is a live change. An added enabled jail starts in the same
+reload. A removed jail is withdrawn last, after every other change has committed: its
+bans are lifted, its set and elements are removed from the kernel, its retry and source
+state is deleted, and its history is kept, so
+.B history \-\-jail
+.I name
+still shows its bans. The daemon logs one line per removed jail:
+.PP
+.nf
+.RS
+native: jail=<name> removed: <n> bans lifted
+.RE
+.fi
+.IP
+A start whose configuration no longer names a jail that holds state retires that jail the
+same way. If any jail of the proposed configuration fails validation, the whole reload is
+.B rejected
+with a reason naming that jail, and every running jail is unchanged.
 .TP
 .BI history " [--jail name] [--limit 1..256] [--cursor token]"
 Page through confirmed ban history;
 .B next_cursor
-continues a listing.
+continues a listing. Each event carries the origin of its ban
+.RB ( detection ", " manual " or " config ;
+JSON
+.BR origin ),
+and every origin change is kept as an event. Events written before 0.4.8 show
+.BR detection .
 .TP
 .BI "history reset " "ip (--jail name | --all)"
 Reset the durable history for one address.
@@ -727,15 +1008,25 @@ previous file exists nowhere in its directory, is not silently re-read under the
 .BR "on_truncation = \(dqrefuse\(dq" .
 The daemon starts with that source paused: the startup journal line and
 .B fail2zig status
-name the jail and source and print the exact command to run. With the daemon
-stopped,
+name the jail and source and print the exact command to run.
 .B repair-source
-acknowledges the loss for one configured file source. After a truncation in place it
+acknowledges the loss for one configured file source.
+.PP
+The command first tries the daemon's administration socket. When the daemon answers, it
+performs the repair inside its running worker, with the same token, the same refusals and
+the same durable outcome as the offline form; the source leaves
+.B paused
+and resumes, and every jail's firewall rules stay installed throughout. The online form is
+a mutation, so it needs uid 0 or the daemon uid, and it writes an audit line. When the
+socket is absent or refuses the connection, the command runs the offline form on the
+stopped daemon's state. Both forms print the same text and use the same exit status.
+.PP
+The repair works the same way in both forms. After a truncation in place it
 restarts the source at offset 0 of the current file. After a removed rotated file it
 records the loss of that file's unread bytes and resumes the current file at its
 committed offset, not at 0. After a replaced log it records the loss of the previous
 file's unread bytes and restarts the source at offset 0 of the file now at the path.
-It holds the state lock, never creates state, and
+The offline form holds the state lock. The repair never creates state, and
 refuses a source that is not truncated in place, not replaced with its previous file
 gone, and not missing a removed rotated incarnation (nothing to acknowledge: an absent
 path, a rewrite in place, or a previous file still in its directory), a pending receipt for that source, consumer
@@ -759,9 +1050,10 @@ truncated. The newest 256
 outcomes are retained; an older token stays reserved and is refused. Data written
 after the committed position and removed by the truncation was never read and cannot
 be recovered (for a removed rotated file or a replaced log, the records after the
-committed offset of the file that is gone), and lines still in the file are read again. Stopping the daemon for the
-repair leaves its firewall rules for every jail in place; the next start reconciles
-them with durable state. Exit 0 on success or replay, 1 on refusal, 2 on usage errors.
+committed offset of the file that is gone), and lines still in the file are read again. A
+daemon stopped for the offline form leaves its firewall rules for every jail in place;
+the next start reconciles them with durable state. Exit 0 on success or replay, 1 on
+refusal, 2 on usage errors.
 .
 .SH SUPPORT-BUNDLE
 .B support-bundle
@@ -825,6 +1117,46 @@ created mode 0600 and never overwritten; the path is printed on stdout.
 writes the bundle to stdout. Each incomplete section is named on stderr. Exit 0 when
 every section was collected, 4 when the bundle was written with sections that record an
 error, 1 when nothing was written, 2 on usage errors.
+.
+.SH METRICS
+The HTTP listener's
+.I /metrics
+page (see
+.B metrics_enabled
+in
+.BR fail2zig.toml (5))
+adds these series to the existing ones, which keep their names. Per enabled jail, with
+the label
+.BI jail=\(dq name \(dq :
+.TP
+.B fail2zig_jail_bans_active
+Gauge: live bans.
+.TP
+.B fail2zig_jail_bans_total
+Counter: bans.
+.TP
+.B fail2zig_jail_failures_counted_total
+Counter: failures counted toward a ban.
+.TP
+.B fail2zig_jail_ignored_detections_total
+Counter: detections skipped because the address is on the ignore list.
+.TP
+.B fail2zig_jail_source_state
+Gauge: 0 ok, 1 paused, 2 missing, 3 blocked.
+.TP
+.B fail2zig_jail_pool_evictions_total
+Counter: idle subjects evicted from the tracking pool since the daemon started.
+.PP
+Daemon-wide gauges:
+.BR fail2zig_state_file_bytes ,
+.BR fail2zig_state_file_pages ,
+.BR fail2zig_pool_tracked ,
+.BR fail2zig_pool_banned ,
+.B fail2zig_pool_tracking_limit
+and
+.BR fail2zig_pool_ban_limit .
+A jail's series appear when it starts or is added by a reload and stop when it is
+removed.
 .
 .SH EXIT STATUS
 Every command returns one of the frozen classes.
@@ -890,21 +1222,24 @@ Native destination migration must run as the service UID with the required
 capabilities and caller-owned private staging, with the destination daemon
 stopped. See docs/operations/command-migration.md and migration-continuity.md.
 .PP
-The first start of this version upgrades a state last written by v0.4.6 (schema 24)
-to schema 25, which adds the tables for runtime ignore entries and continuity-loss
-events. States last written by releases before v0.4.6 are not a supported upgrade
-path; start from a fresh state. Before its first change the daemon writes a coherent
-copy of the database to a backup, which needs free space of twice the database size plus 32 MiB, and refuses to start if that file already
-exists; move an old backup aside only when it is not the sole copy of earlier state.
+v0.4.7 is the minimum supported upgrade source. The first start of this version
+upgrades a state last written by v0.4.7 (schema 25) to schema 26, which adds ban
+origins, ignore-entry deadlines and the table of timed configuration entries; every
+existing ban gets origin
+.BR detection .
+States last written by v0.4.6 or earlier are not a supported upgrade path; upgrade
+them through v0.4.7 first, or start from a fresh state. Before its change the daemon
+writes a coherent copy of the database to a backup, which needs free space of twice
+the database size plus 32 MiB, and refuses to start if that file already exists; move
+an old backup aside only when it is not the sole copy of earlier state.
 .IP \(bu 2
 The backup is
-.IR <state_file>.pre25-backup .
+.IR <state_file>.pre26-backup .
 .PP
-The upgrade commits in small resumable steps: an interrupted upgrade resumes on the
-next start. v0.4.6 and older binaries refuse schema 25 state with their
+The upgrade commits in one transaction, so an interrupted upgrade leaves the state at
+schema 25. v0.4.7 and older binaries refuse schema 26 state with their
 .B UnsupportedSchema
-message, as they refuse a partly upgraded database. Keep the backup until the
-upgraded daemon has been checked. Rollback means stopping the daemon, restoring the
+message. Keep the backup until the upgraded daemon has been checked. Rollback means stopping the daemon, restoring the
 backup the upgrade wrote over the state file, removing the upgraded database's
 WAL/SHM files, and reinstalling the binary that last wrote that state.
 .PP
@@ -935,6 +1270,12 @@ when that backend is selected.
 is invoked at
 .I /usr/bin/journalctl
 only.
+.TP
+.B SSH_CONNECTION
+Read by
+.B ban
+only: its first field is the caller's SSH client address, which the lockout guard
+protects.
 .PP
 No other variables are read by the daemon or the administration commands.
 .
@@ -946,7 +1287,9 @@ fail2zig stats --output plain
 fail2zig list --sort --jail sshd
 fail2zig list --jail sshd --output json
 sudo fail2zig ban 192.0.2.10 --jail sshd --duration 3600
+fail2zig list --origin config --output json
 sudo fail2zig ignore add 198.51.100.20 --jail sshd
+sudo fail2zig ignore add 198.51.100.21 --jail sshd --for 2h
 fail2zig ignore list --jail sshd
 sudo fail2zig reload
 fail2zig rule-test --file /var/log/auth.log --service sshd --tz-offset 0

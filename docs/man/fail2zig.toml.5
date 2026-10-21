@@ -1,4 +1,4 @@
-.TH FAIL2ZIG.TOML 5 "2026-10-13" "fail2zig 0.4.7" "File Formats"
+.TH FAIL2ZIG.TOML 5 "2026-10-21" "fail2zig 0.4.8" "File Formats"
 .
 .SH NAME
 fail2zig.toml \- fail2zig daemon configuration file
@@ -14,7 +14,7 @@ intrusion prevention daemon. The file uses a strict subset of the TOML format.
 .PP
 Unknown keys are rejected with line and column context. Unknown sections are
 rejected. Values are strictly typed, with integer seconds or quoted strings
-accepted for the four duration keys described below.
+accepted for the duration keys listed under DURATION SYNTAX.
 .PP
 The file is divided into three section types:
 .IP \(bu 2
@@ -43,6 +43,32 @@ String. One of
 .BR err .
 Default:
 .IR info .
+.TP
+.B log_format
+String.
+.B text
+or
+.BR json .
+Default:
+.IR text .
+With
+.BR json ,
+every daemon log line is one JSON object on a line of its own with the fields
+.B ts
+(RFC 3339, UTC, milliseconds),
+.BR level ,
+.B scope
+and
+.BR msg ,
+plus the keys of an audit line as fields. A line cut at the length limit is still a
+valid object and carries
+.BR \(dqtruncated\(dq:true .
+Any other value is refused with the hint
+.BR "expected text or json" .
+A change is restart-only:
+.B fail2zig reload
+reports
+.BR restart_required .
 .TP
 .B pid_file
 String (absolute path). Deprecated compatibility key; an explicit setting logs
@@ -214,10 +240,22 @@ and tracks up to 65,536 further subjects that have not yet reached
 .BR maxretry ,
 including subjects whose ban has expired and that retirement has not yet removed.
 A subject that is banned stops counting against tracking capacity. Together the two
-pools never exceed 131,072 stored subjects: once that many exist, a new subject is
-refused, whether or not it would be banned at once. When a limit is reached, new
-failures are refused as retryable backpressure until a ban expires or a tracked
-subject is retired.
+pools never exceed 131,072 stored subjects.
+.IP
+When the tracking pool is full and a new subject must be tracked, the daemon evicts the
+idle tracked subject with the oldest last activity in the same commit and tracks the new
+one. An idle subject has no live ban; a subject whose ban has
+expired and that retirement has not yet removed counts as idle. A subject with a live ban
+is never evicted. Each eviction adds one to the jail's
+.B fail2zig_jail_pool_evictions_total
+counter, and the daemon logs at most one warning per jail every 60 seconds:
+.BI "native: jail=" name " tracking pool full: evicted " n " idle subjects in the last 60 s" .
+When no idle subject can be evicted, or when 65,536 bans are live and a failure would ban
+another subject, the failure is refused as retryable backpressure
+.RB ( RetryCapacity )
+until a ban expires or a subject is retired.
+.B fail2zig status
+shows the occupancy of both pools against their limits.
 .TP
 .B banaction
 Deprecated compatibility input. Use
@@ -251,10 +289,138 @@ kernel verification. Default: true.
 .TP
 .B ignoreip
 String array. CIDR ranges and exact IPs that are never banned. Example:
-.IR ["127.0.0.1/8", "::1", "10.0.0.0/8"] .
-Default: empty. An edit applies from the next event after
+.IR "[\(dq127.0.0.1/8\(dq, \(dq::1\(dq, \(dq10.0.0.0/8\(dq]" .
+Default: empty. An entry is an address or CIDR, permanent while listed, or an address or
+CIDR followed by whitespace and a duration, for example
+.IR "\(dq203.0.113.9 1d\(dq" ,
+which excludes the address for that long under the rule in TIMED ENTRIES. An entry
+without a duration takes
+.B ignoretime
+when it is set. An expired entry stays in the file and excludes nothing, and
+.B fail2zig ignore list
+shows it as
+.BR expired .
+A host name entry never carries a duration. An entry whose duration is not valid is
+refused with
+.BI "jails." name ".ignoreip: invalid duration in '" text '
+(the whole entry; a
+.B [defaults]
+entry has no jail prefix). On a jail with
+.BR rule_files ,
+an entry with a duration is refused with
+.BI "jails." name ".ignoreip: '" text "': a duration is not supported with rule_files" .
+An edit applies from the next event after
 .B fail2zig reload
-or a restart, and never alters an existing ban.
+or a restart, and never alters an existing ban. An address may not be in both
+.B ignoreip
+and
+.B banip
+of one jail; see
+.BR banip .
+.TP
+.B banip
+String array. Addresses and CIDR ranges the jail bans while they are listed. An entry is
+.I \(dqaddress-or-CIDR\(dq
+(permanent while listed) or
+.I \(dqaddress-or-CIDR duration\(dq
+(timed, for example
+.IR "\(dq198.51.100.0/24 1d\(dq" ;
+the duration uses the syntax of
+.BR bantime ,
+is finite and at least 1s, and runs under the rule in TIMED ENTRIES). Host names are not
+accepted. A jail list replaces the
+.B [defaults]
+list, as for
+.BR ignoreip .
+Default: empty.
+.IP
+At start and at every
+.B fail2zig reload
+each entry is a live ban with origin
+.B config
+in that jail, permanent for a permanent entry and ending at the stored deadline for a timed
+one. An entry takes over an existing ban of the same address in the jail, whatever its
+origin, and replaces its expiry with its own, even when the ban it replaces would have lasted
+longer. Removing an entry and reloading lifts its ban at once; a later detection bans the
+address normally. When a timed entry runs out, its ban is lifted, the entry stays in the
+file and does nothing, and
+.B fail2zig list
+shows it as
+.BR expired .
+While a config ban is live, a detection of the address is receipted and changes nothing,
+and
+.B fail2zig ban
+or
+.B fail2zig unban
+of it is refused with
+.BR "banned by config: edit banip" .
+A reload that changes only
+.B banip
+is applied live.
+.IP
+A jail holds at most 1,024 effective entries; more is refused with
+.BI "jails." name ".banip: more than 1024 entries" .
+An entry that is not an address or CIDR is refused with
+.BI "jails." name ".banip: invalid entry '" text ' ,
+and one whose duration is not valid with
+.BI "jails." name ".banip: invalid duration in '" text ' .
+An address in both the effective
+.B ignoreip
+and the effective
+.B banip
+of one jail, as equal entries or one containing the other and with or without a duration,
+is a configuration error: the daemon refuses to start, and
+.B fail2zig reload
+reports
+.B rejected
+with a reason naming the jail and the address.
+.TP
+.B ignoreself
+Boolean. Adds every IPv4 and IPv6 address of the host's interfaces, loopback included, to
+the jail's effective ignore list, where
+.B fail2zig ignore list
+shows them with source
+.BR self .
+The daemon reads the addresses from the kernel at start and at every
+.BR "fail2zig reload" ;
+an address assigned after that counts as
+.B self
+from the next reload. If the kernel cannot be read, the daemon logs a warning and the jail
+has no
+.B self
+entries until the next reload. These entries do not count against the 128-entry ignore
+limit. A change is applied live by
+.BR "fail2zig reload" .
+Default:
+.IR true .
+.TP
+.B ignoretime
+Integer seconds or a quoted duration. The default life of an exclusion that carries no
+duration of its own: an
+.B ignoreip
+entry written without a duration, and
+.B fail2zig ignore add
+without
+.BR \-\-for .
+Unset or 0 means permanent, the default. A jail value overrides
+.BR [defaults] ,
+and 0 in a jail restores permanent under a
+.B [defaults]
+value. A duration written on the entry, or
+.BR \-\-for ,
+wins. A configured entry's period follows TIMED ENTRIES, so changing
+.B ignoretime
+starts a fresh period for every entry that takes it. A runtime entry added without
+.B \-\-for
+expires
+.B ignoretime
+after the add and is then deleted. A value above 3162240000 seconds (100 \(mu 366 days) is
+refused as an invalid duration. A jail with
+.B rule_files
+whose resolved value is not 0 is refused with
+.BI "jails." name ".ignoretime: a default ignore duration is not supported with rule_files" .
+A change is applied live by
+.BR "fail2zig reload" .
 .TP
 .B source
 String: auto, file, journald, or internal. Default: auto. Inherited by jails.
@@ -321,14 +487,33 @@ Minimum: 1. Default: 604800 (7 days).
 .B bantime_increment_jitter
 Integer seconds or a quoted duration. Maximum escalation jitter; zero disables
 jitter. Must not exceed bantime_increment_max_bantime. Default: 0.
+.TP
+.B bantime_increment_decay
+Integer seconds or a quoted duration. When a subject's last ban ended more than this long
+ago, its escalation count resets to zero and its next ban gets the base
+.BR bantime .
+The time is measured from the end of the ban, not its start, so a count never decays
+during a live ban, and a permanent ban never ends. The reset is complete, never a step
+down. 0 disables decay. A change is applied live by
+.B fail2zig reload
+and is not part of the detection generation. Default: 2592000 (30 days).
 .
 .SH DURATION SYNTAX
-.B bantime,
-.B findtime,
-.B bantime_increment_max_bantime
+.BR bantime ,
+.BR findtime ,
+.BR bantime_increment_max_bantime ,
+.BR bantime_increment_jitter ,
+.B bantime_increment_decay
 and
-.B bantime_increment_jitter
-accept integer seconds or quoted duration strings, in defaults and jail overrides.
+.B ignoretime
+accept integer seconds or quoted duration strings, in defaults and jail overrides. The
+duration part of a
+.B banip
+or
+.B ignoreip
+entry uses the same terms inside the entry's string, written as one word such as
+.BR 1h30m ;
+a third word makes the entry invalid.
 Each term is a nonnegative decimal integer immediately followed by
 .BR s , m , mm , min , h , d , w , mo " or " y .
 The units m, mm and min all mean minutes; mo means 2,629,800 seconds and y means
@@ -339,8 +524,38 @@ Terms may be concatenated or separated by whitespace, for example "1h30m" or
 overflow are rejected. A bare value such as 24h is not valid TOML.
 Converted values retain the existing field limits and zero rules; "0s" is
 valid for jitter but not finite bantime, findtime or the escalation cap.
+0 disables
+.B bantime_increment_decay
+and makes
+.B ignoretime
+permanent. An entry's duration must be finite, at least 1s and at most
+3162240000 seconds.
 Only bantime accepts "permanent". CLI duration and timeout arguments retain
-their existing integer syntax.
+their existing integer syntax, except
+.B fail2zig ignore add \-\-for
+which takes this syntax.
+.
+.SH TIMED ENTRIES
+A
+.B banip
+or
+.B ignoreip
+entry written with a duration, and an
+.B ignoreip
+entry that takes
+.BR ignoretime ,
+is timed. Its period starts when the daemon first applies the entry, at start or at a
+reload, and the start and the deadline are stored in the state file. The period runs out
+once: a reload or a restart does not restart it. Changing the entry's duration, or the
+.B ignoretime
+an entry takes, starts a fresh period, as does removing the entry, reloading, and adding
+it back. When the period runs out the entry stays in the file and does nothing, and
+.B fail2zig list
+or
+.B fail2zig ignore list
+shows it as
+.B expired
+until it is removed from the file. A reload that changes only a duration is applied live.
 .
 .SH JAIL SECTIONS
 Each
@@ -416,6 +631,16 @@ for this jail. An edit applies from the next event after
 .B fail2zig reload
 or a restart, and never alters an existing ban.
 .TP
+.B banip
+Optional string array. Replaces (does not merge with)
+.B defaults.banip
+for this jail.
+.TP
+.BR ignoreself ", " ignoretime
+Optional. Override the
+.B [defaults]
+values for this jail.
+.TP
 .B on_truncation
 String:
 .B \&"refuse"
@@ -478,7 +703,7 @@ prints
 .BI on_truncation= value
 on the summary line of each file jail.
 .TP
-.B bantime_increment_enabled , bantime_increment_multiplier , bantime_increment_factor , bantime_increment_formula , bantime_increment_max_bantime , bantime_increment_jitter
+.B bantime_increment_enabled , bantime_increment_multiplier , bantime_increment_factor , bantime_increment_formula , bantime_increment_max_bantime , bantime_increment_jitter , bantime_increment_decay
 Per-jail values take precedence over
 .B [defaults]
 values; jails without an explicit setting inherit from defaults.
@@ -531,6 +756,31 @@ journal_executables = ["/usr/sbin/sshd", "/usr/lib/openssh/sshd-session"]
 maxretry = 3
 bantime  = 3600
 .fi
+.
+.SS Configuration bans and timed exclusions
+.nf
+[defaults]
+ignoretime = "1d"
+
+[jails.sshd]
+enabled  = true
+filter   = "sshd"
+source   = "journald"
+banip    = ["203.0.113.4", "198.51.100.0/24 7d"]
+ignoreip = ["192.0.2.10", "192.0.2.20 2h"]
+.fi
+.PP
+203.0.113.4 is banned for as long as it is listed. 198.51.100.0/24 is banned for seven
+days from the first start or reload that applies it, then shows as
+.B expired
+in
+.BR "fail2zig list" .
+192.0.2.10 takes
+.B ignoretime
+and is excluded for one day; 192.0.2.20 is excluded for two hours. Every host address is
+also excluded, because
+.B ignoreself
+defaults to true.
 .
 .SS PortSentry v2.0.7 history file (v0.4.3)
 This v0.4.3 integration targets the upstream PortSentry v2.0.7 history
@@ -610,3 +860,16 @@ and positioned configuration diagnostics from 0.3.0 remain supported.
 The
 .B on_truncation
 jail key was added in fail2zig 0.4.7.
+The
+.BR banip ,
+.BR ignoreself ,
+.B ignoretime
+and
+.B bantime_increment_decay
+keys, timed
+.B banip
+and
+.B ignoreip
+entries, and the global
+.B log_format
+key were added in fail2zig 0.4.8.

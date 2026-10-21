@@ -185,6 +185,8 @@ pub const ScopeItem = struct {
     confirmed: bool,
     ban_count: ?u64 = null,
     key: ItemKey = .{},
+    origin: ?shared.types.Origin = null,
+    expired: bool = false,
 };
 
 pub const JailScopes = struct {
@@ -237,6 +239,7 @@ pub const HistoryEvent = struct {
     confirmed_us: i64,
     scope: ScopeFields,
     native_retry: bool,
+    origin: shared.types.Origin,
 };
 
 pub const HistoryRead = struct { more: bool, resume_after: u64 };
@@ -250,6 +253,8 @@ pub const FirewallUnavailableReason = enum { no_manager, memory_budget, allocati
 pub const FirewallReader = struct {
     ctx: ?*anyopaque,
     read: *const fn (ctx: ?*anyopaque, request: firewall_observation.PageRequest, out: *firewall_observation.Page) anyerror!void,
+    origin_ctx: ?*anyopaque = null,
+    origin: ?*const fn (ctx: ?*anyopaque, scope: canonical_scope.Scope) ?shared.types.Origin = null,
 };
 pub const FirewallSource = union(enum) {
     unavailable: FirewallUnavailableReason,
@@ -708,6 +713,9 @@ fn writeScopeItem(out: anytype, jail: []const u8, item: ScopeItem) !void {
     } else try out.write(null);
     try field(out, "confirmed", item.confirmed);
     if (item.ban_count) |count| try field(out, "ban_count", count);
+    try out.objectField("origin");
+    if (item.origin) |origin| try out.write(@tagName(origin)) else try out.write(null);
+    try field(out, "expired", item.expired);
     try out.endObject();
 }
 
@@ -764,7 +772,7 @@ fn renderFirewall(allocator: std.mem.Allocator, writer: anytype, source: ?Firewa
                 error.OutOfMemory => error.OutOfMemory,
                 else => error.SourceFailed,
             };
-            return writeFirewallPage(writer, generation_hex, page, now_ms);
+            return writeFirewallPage(writer, generation_hex, page, now_ms, reader);
         },
     }
 }
@@ -790,7 +798,7 @@ fn writeUnavailableFirewall(writer: anytype, generation_hex: []const u8, reason:
     out.endObject() catch |err| return mapWrite(err);
 }
 
-fn writeFirewallPage(writer: anytype, generation_hex: []const u8, page: *const firewall_observation.Page, now_ms: ?u64) RenderError!void {
+fn writeFirewallPage(writer: anytype, generation_hex: []const u8, page: *const firewall_observation.Page, now_ms: ?u64, reader: FirewallReader) RenderError!void {
     const metadata = page.metadata;
     const available = metadata.state != .unavailable;
     var out = std.json.writeStream(writer, .{});
@@ -833,7 +841,7 @@ fn writeFirewallPage(writer: anytype, generation_hex: []const u8, page: *const f
     writeFirewallStructure(&out, metadata) catch |err| return mapWrite(err);
     out.objectField("items") catch |err| return mapWrite(err);
     out.beginArray() catch |err| return mapWrite(err);
-    for (page.entries[0..page.count]) |entry| writeFirewallItem(&out, entry, metadata) catch |err| return switch (err) {
+    for (page.entries[0..page.count]) |entry| writeFirewallItem(&out, entry, metadata, reader) catch |err| return switch (err) {
         error.InvalidScope => error.SourceFailed,
         else => mapWrite(err),
     };
@@ -985,9 +993,10 @@ fn optionalInteger(out: anytype, name: []const u8, value: anytype) !void {
     if (value) |number| try out.write(number) else try out.write(null);
 }
 
-fn writeFirewallItem(out: anytype, entry: inspection.Entry, metadata: firewall_observation.Metadata) !void {
+fn writeFirewallItem(out: anytype, entry: inspection.Entry, metadata: firewall_observation.Metadata, reader: FirewallReader) !void {
     const canonical = entry.scope orelse canonical_scope.Scope{ .subject = canonical_scope.Subject.host(entry.address) };
     const scope = try projectScope(canonical);
+    const origin = if (reader.origin) |lookup| lookup(reader.origin_ctx, canonical) else null;
     try out.beginObject();
     try out.objectField("scope");
     try writeScope(out, scope);
@@ -999,6 +1008,8 @@ fn writeFirewallItem(out: anytype, entry: inspection.Entry, metadata: firewall_o
     try optionalInteger(out, "remaining_ms_at_observation", entry.remaining_ms);
     try optionalInteger(out, "deadline_us", entry.deadline_us);
     try writeFirewallPlacement(out, entry, metadata);
+    try out.objectField("origin");
+    if (origin) |value| try out.write(@tagName(value)) else try out.write(null);
     try out.endObject();
 }
 
@@ -1052,5 +1063,6 @@ fn writeHistoryEvent(out: anytype, event: HistoryEvent) !void {
     try out.objectField("scope");
     try writeScope(out, event.scope);
     try field(out, "native_retry", event.native_retry);
+    try field(out, "origin", @tagName(event.origin));
     try out.endObject();
 }

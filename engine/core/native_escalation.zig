@@ -89,4 +89,5 @@ pub const Policy = struct {
     }
 };
 
+pub const EscalationDecay = struct { window_us: i64 = 0 };
 pub const HistoryInput = struct { prior_confirmed: u64 = 0, latest_confirmed_us: ?i64 = null };

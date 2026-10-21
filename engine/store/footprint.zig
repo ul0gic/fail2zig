@@ -16,6 +16,8 @@ pub const Footprint = struct {
     tables: []const TableFootprint,
 };
 
+pub const StateFileFootprint = struct { bytes: u64, pages: u64, max_pages: u64, page_size: u32 };
+
 fn unsigned(value: i64) Error!u64 {
     return std.math.cast(u64, value) orelse error.DatabaseFailure;
 }
@@ -28,6 +30,16 @@ fn plainIdentifier(name: []const u8) bool {
 
 pub fn Methods(comptime Store: type) type {
     return struct {
+        pub fn stateFileFootprint(self: *Store) Error!StateFileFootprint {
+            try self.beginRead();
+            errdefer self.rollback();
+            const page_size = std.math.cast(u32, try self.integer("PRAGMA page_size;")) orelse return error.DatabaseFailure;
+            const pages = try unsigned(try self.integer("PRAGMA page_count;"));
+            const max_pages = try unsigned(try self.integer("PRAGMA max_page_count;"));
+            try self.commitTransaction();
+            const bytes = std.math.mul(u64, pages, page_size) catch return error.DatabaseFailure;
+            return .{ .bytes = bytes, .pages = pages, .max_pages = max_pages, .page_size = page_size };
+        }
         pub fn footprint(self: *Store, arena: std.mem.Allocator) Error!Footprint {
             try self.beginRead();
             errdefer self.rollback();

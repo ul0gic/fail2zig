@@ -66,6 +66,7 @@ pub const Command = union(enum) {
         jail: ?[]const u8 = null,
         duration_s: ?u64 = null,
         scope: ?ScopeArgs = null,
+        force: bool = false,
     };
 
     pub const UnbanArgs = struct {
@@ -92,12 +93,14 @@ pub const Command = union(enum) {
         address: ?[]const u8 = null,
         jail: ?[]const u8 = null,
         unban: bool = false,
+        for_s: ?u64 = null,
     };
 
     pub const ListArgs = struct {
         jail: ?[]const u8 = null,
         details: bool = false,
         sort: bool = false,
+        origin: ?shared.types.Origin = null,
     };
 
     pub const DetailArgs = struct { details: bool = false };
@@ -354,6 +357,10 @@ fn parseBan(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Error
             args.scope = try parseScope(rest, &k, diag);
             continue;
         }
+        if (std.mem.eql(u8, a, "--force")) {
+            args.force = true;
+            continue;
+        }
         if (std.mem.startsWith(u8, a, "--")) {
             diag.set("unknown flag for 'ban': {s}", .{a});
             return error.UnknownFlag;
@@ -367,7 +374,7 @@ fn parseBan(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Error
         return error.TooManyArguments;
     }
     if (!have_ip) {
-        diag.set("command 'ban' requires an IP address (usage: ban <ip> --jail <name> [--duration <s>] [--scope host|net <cidr>])", .{});
+        diag.set("command 'ban' requires an IP address (usage: ban <ip> --jail <name> [--duration <s>] [--scope host|net <cidr>] [--force])", .{});
         return error.MissingArgument;
     }
     if (args.jail == null) {
@@ -521,6 +528,18 @@ fn parseIgnore(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Er
             out.unban = true;
             continue;
         }
+        if (chosen == .add and std.mem.eql(u8, a, "--for")) {
+            k += 1;
+            if (k >= rest.len) {
+                diag.set("flag --for requires a value (a duration such as 2m or 1h30m)", .{});
+                return error.MissingValue;
+            }
+            out.for_s = parseForSeconds(rest[k]) orelse {
+                diag.set("invalid --for value '{s}' (expected a duration such as 2m or 1h30m)", .{format.escapeArgument(&echo, rest[k])});
+                return error.InvalidValue;
+            };
+            continue;
+        }
         if (std.mem.startsWith(u8, a, "--")) {
             diag.set("unknown flag for 'ignore {s}': {s}", .{ name, format.escapeArgument(&echo, a) });
             return error.UnknownFlag;
@@ -539,7 +558,7 @@ fn parseIgnore(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Er
     if (chosen == .list) return Parsed{ .globals = globals.*, .command = .{ .ignore = out } };
 
     const address = out.address orelse {
-        const usage = if (chosen == .add) "ignore add <address|cidr> --jail <name> [--unban]" else "ignore remove <address|cidr> --jail <name>";
+        const usage = if (chosen == .add) "ignore add <address|cidr> --jail <name> [--unban] [--for <duration>]" else "ignore remove <address|cidr> --jail <name>";
         diag.set("command 'ignore {s}' requires an address (usage: {s})", .{ name, usage });
         return error.MissingArgument;
     };
@@ -555,6 +574,14 @@ fn parseIgnore(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Er
         return error.InvalidValue;
     };
     return Parsed{ .globals = globals.*, .command = .{ .ignore = out } };
+}
+
+fn parseForSeconds(text: []const u8) ?u64 {
+    const parsed = shared.duration.parse(text, false) catch return null;
+    if (parsed != .finite) return null;
+    const seconds = parsed.nativeSeconds() catch return null;
+    if (seconds == 0 or seconds > shared.types.TimedEntry.max_duration_s) return null;
+    return seconds;
 }
 
 fn parseScope(rest: []const []const u8, idx: *usize, diag: *ParseDiag) Error!Command.ScopeArgs {
@@ -677,6 +704,19 @@ fn parseList(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Erro
         }
         if (std.mem.eql(u8, a, "--sort")) {
             args.sort = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--origin")) {
+            k += 1;
+            if (k >= rest.len) {
+                diag.set("flag --origin requires a value: detection, manual or config", .{});
+                return error.MissingValue;
+            }
+            args.origin = std.meta.stringToEnum(shared.types.Origin, rest[k]) orelse {
+                var echo: [format.diagnostic_max_bytes]u8 = undefined;
+                diag.set("invalid --origin value '{s}' (expected: detection, manual, config)", .{format.escapeArgument(&echo, rest[k])});
+                return error.InvalidValue;
+            };
             continue;
         }
         if (std.mem.startsWith(u8, a, "--")) {
@@ -991,7 +1031,7 @@ pub const help_ban =
     \\fail2zig ban — manually ban an IP address
     \\
     \\USAGE:
-    \\    fail2zig ban <ip> --jail <name> [--duration <seconds>] [--scope host|net <cidr>]
+    \\    fail2zig ban <ip> --jail <name> [--duration <seconds>] [--scope host|net <cidr>] [--force]
     \\
     \\ARGS:
     \\    <ip>                IPv4 or IPv6 address (e.g. 192.0.2.10, 2001:db8::1)
@@ -1001,6 +1041,13 @@ pub const help_ban =
     \\    --duration <s>      Ban duration in seconds (uses jail default if omitted)
     \\    --scope host        Ban the single address (default)
     \\    --scope net <cidr>  Ban the given network instead of the host
+    \\    --force             Ban even a loopback address, an address of this host,
+    \\                        or your SSH peer address
+    \\
+    \\Without --force, ban refuses a target that is or contains a loopback address,
+    \\an address of this host, or the client address of the SSH session it runs in.
+    \\Banning an address on the jail's ignore list is applied with a warning.
+    \\A ban set by the jail's banip list cannot be changed here: edit banip.
     \\
 ;
 
@@ -1024,10 +1071,12 @@ pub const help_list =
     \\fail2zig list — list active bans
     \\
     \\USAGE:
-    \\    fail2zig list [--jail <name>] [--details] [--sort]
+    \\    fail2zig list [--jail <name>] [--origin detection|manual|config] [--details] [--sort]
     \\
     \\FLAGS:
     \\    --jail <name>       Filter by jail
+    \\    --origin <origin>   Show only bans of one origin: detection, manual or config;
+    \\                        config also shows timed banip entries that have expired
     \\    --details           Include ban counts in table output
     \\    --sort              Sort by numeric IP address, then jail name
     \\    IPv4 sorts before IPv6; networks sort by address and prefix length.
@@ -1138,16 +1187,18 @@ pub const help_repair_source =
     \\    fail2zig repair-source --jail <name> --source <absolute path> --token <token>
     \\                           --acknowledge-truncation [--config <path>]
     \\
-    \\Runs locally against the state file named by the config, only while the daemon is
-    \\stopped; it refuses when the state is locked or absent and never creates state.
+    \\When the daemon is running, the repair is sent to it over its socket and applied
+    \\while every jail stays protected. When the daemon is stopped, it runs locally
+    \\against the state file named by the config; it refuses when the state is locked
+    \\or absent and never creates state.
     \\It accepts a same-inode truncation, or a log replaced by a different file whose
     \\previous file is gone, of a recorded source with no pending receipt, and restarts
     \\that source at offset 0 of the current file.
     \\
     \\Data removed by the truncation or left in the previous file before it was read is
     \\lost; its extent is unknown.
-    \\Protection for every jail may be absent while the daemon is stopped; the next
-    \\start reinstalls it before reporting READY.
+    \\When run locally, protection for every jail may be absent while the daemon is
+    \\stopped; the next start reinstalls it before reporting READY.
     \\
     \\Repeating the command with the same token and arguments reports the committed
     \\outcome. The newest 256 outcomes are retained; an older token stays reserved and
@@ -1162,7 +1213,7 @@ pub const help_ignore =
     \\fail2zig ignore — manage per-jail exclusions at runtime
     \\
     \\USAGE:
-    \\    fail2zig ignore add <address|cidr> --jail <name> [--unban]
+    \\    fail2zig ignore add <address|cidr> --jail <name> [--unban] [--for <duration>]
     \\    fail2zig ignore remove <address|cidr> --jail <name>
     \\    fail2zig ignore list [--jail <name>]
     \\
@@ -1174,11 +1225,15 @@ pub const help_ignore =
     \\    --jail <name>       Jail whose list is changed (required for add and remove);
     \\                        for list, show one jail instead of every enabled jail
     \\    --unban             add only: also lift that jail's bans inside the entry
+    \\    --for <duration>    add only: remove the entry after this long, in the
+    \\                        configuration's duration syntax (e.g. 2m, 1h30m, 90)
     \\
     \\Entries added here are stored in the state database and survive restart and
-    \\reload. They are merged with the jail's configured ignoreip; SOURCE shows
-    \\config, runtime or config+runtime. Entries set in the configuration file are
-    \\changed there, not here.
+    \\reload. They are merged with the jail's configured ignoreip and, when
+    \\ignoreself is on, this host's own addresses; SOURCE shows config, runtime,
+    \\config+runtime or self. EXPIRES shows when a timed entry runs out: an expired
+    \\runtime entry is removed, an expired configured entry stays listed as expired.
+    \\Entries set in the configuration file are changed there, not here.
     \\
     \\An ignore entry stops future bans from detection. It does not lift a ban that
     \\already exists: add tells you when the address is banned, until when, and how

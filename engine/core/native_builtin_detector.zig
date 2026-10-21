@@ -65,7 +65,7 @@ pub const Detector = struct {
         if (options.ignores == null) {
             const cell = try allocator.create(*ignore_set.EffectiveIgnore);
             errdefer allocator.destroy(cell);
-            cell.* = try ignore_set.EffectiveIgnore.build(allocator, options.ignore, &.{});
+            cell.* = try ignore_set.EffectiveIgnore.build(allocator, options.ignore, &.{}, &.{}, &.{}, 0);
             owned_cell = cell;
         }
         return .{

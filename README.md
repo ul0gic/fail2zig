@@ -38,8 +38,9 @@ The installer creates a dedicated `fail2zig` service account, preserves existing
 configuration and installs the unit, man pages and example config. For a dry run,
 manual installation, source build or upgrade, see
 [installation and upgrades](docs/operations/installation.md). The latest release
-is recommended; **v0.4.6 is the minimum supported upgrade source**. States last
-written by older releases are not an upgrade path; start them from a fresh state.
+is recommended; **v0.4.7 is the minimum supported upgrade source**. States last
+written by older releases are not an upgrade path; upgrade them through v0.4.7 first,
+or start them from a fresh state.
 
 ## Why fail2zig
 
@@ -86,7 +87,18 @@ maxretry = 5
 enabled = true
 filter = "sshd"
 source = "journald"
+banip = ["203.0.113.4", "198.51.100.0/24 7d"]
+ignoreip = ["192.0.2.20 2h"]
 ```
+
+`banip` bans listed addresses and networks from the configuration with origin
+`config`, and `ignoreip` excludes addresses from detection. Either entry may carry a
+duration after the address; its period starts when the entry is first applied, is
+stored in the state file, and runs out once, across reloads and restarts. `ignoretime`
+gives undated exclusions a default life. `ignoreself` (on by default) excludes the
+host's own addresses, re-read at start and at every reload.
+`bantime_increment_decay` (default 30 days) resets a returning offender's escalation
+after a long quiet, and `log_format = "json"` writes one JSON object per log line.
 
 `firewall = "auto"` selects a usable backend on first installation and retains
 the recorded backend thereafter. Changing the backend or its network namespace
@@ -101,6 +113,10 @@ intent. `jails` reports that configured mode separately from observed protection
 `active` means the daemon's existing protection criteria are met, not an independent
 per-jail kernel verification. The older `banaction` setting remains accepted as a
 deprecated compatibility input.
+
+Every ban shows its origin, `detection`, `manual` or `config`, in `list`, `history`
+and `firewall show`; `list --origin manual` shows one origin only. `reload` adds and
+removes jails live: a removed jail's bans are lifted at once and its history is kept.
 
 `list --sort` orders returned rows by numeric IP address (IPv4 before IPv6), then
 prefix length, host before an explicit equal-width network, jail name and original
@@ -119,13 +135,17 @@ sudo fail2zig stats                        # retained enforcement-manager snapsh
 sudo fail2zig jails --details              # per-jail state and diagnostic detail
 sudo fail2zig list --sort                  # active bans in numeric address order
 sudo fail2zig firewall show --details      # last sampled owned firewall state
+sudo fail2zig list --origin config         # bans that come from banip
+sudo fail2zig ignore add 192.0.2.30 --jail sshd --for 2h   # exclusion that lapses
 sudo fail2zig rule-test --file /var/log/auth.log --service sshd --output table
 ```
 
 `firewall show` is a bounded, read-only snapshot from the daemon's last complete
 readback; it does not refresh the kernel on demand or prove end-to-end packet
 reachability. Check its observation age and latest attempt when diagnosing
-protection. A degraded or intervention state needs investigation of the reported
+protection. `ban` refuses loopback, the host's addresses and your SSH client address
+unless you add `--force`. `repair-source` acknowledges a lost log while the daemon
+keeps running, and runs offline when the daemon is stopped. A degraded or intervention state needs investigation of the reported
 cause; deleting state or blindly repeating an uncertain mutation is not a recovery
 step. See the [CLI manual](docs/man/fail2zig.1),
 [command migration guide](docs/operations/command-migration.md) and
@@ -154,9 +174,9 @@ and matching behavior. Native custom rules are bounded; arbitrary runtime regexe
 and shell-script ban actions are not supported.
 
 PortSentry support targets **v2.0.7 history files**, with qualified IPv4 and IPv6
-TCP-connect operation on Debian 13. PortSentry acts as the sensor; leave its own
-response actions disabled so fail2zig owns enforcement. PortSentry 1.2, UDP and
-stealth-mode deployments are outside that qualification. Follow the
+TCP-connect operation on Debian 13, and in stealth mode TCP SYN, FIN, NULL and XMAS
+scans and UDP. PortSentry acts as the sensor; leave its own response actions disabled
+so fail2zig owns enforcement. PortSentry 1.2 is outside that qualification. Follow the
 [PortSentry setup guide](https://fail2zig.com/docs/guides/portsentry/) before
 enabling a jail.
 
@@ -180,7 +200,7 @@ boundaries.
 
 - [Installation and upgrades](docs/operations/installation.md)
 - [Configuration reference](docs/man/fail2zig.toml.5) and [CLI manual](docs/man/fail2zig.1)
-- [Runtime architecture](docs/architecture.md) and [operations guides](docs/operations/)
+- [Runtime architecture](docs/architecture.md), [threat model](docs/security/threat-model.md) and [operations guides](docs/operations/)
 - [Online documentation](https://fail2zig.com/docs/) and [test layout](tests/README.md)
 - [Contributing](CONTRIBUTING.md), [issues](https://github.com/ul0gic/fail2zig/issues) and [discussions](https://github.com/ul0gic/fail2zig/discussions)
 

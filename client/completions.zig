@@ -46,6 +46,11 @@ const bash_script =
     \\        --scope)
     \\            COMPREPLY=( $(compgen -W "host net" -- "$cur") )
     \\            return 0 ;;
+    \\        --origin)
+    \\            COMPREPLY=( $(compgen -W "detection manual config" -- "$cur") )
+    \\            return 0 ;;
+    \\        --for)
+    \\            return 0 ;;
     \\    esac
     \\
     \\    # Find the primary command (first non-flag after program name).
@@ -79,7 +84,7 @@ const bash_script =
     \\        firewall)
     \\            COMPREPLY=( $(compgen -W "show --limit --cursor --details withdraw $global_flags" -- "$cur") ) ;;
     \\        ban)
-    \\            COMPREPLY=( $(compgen -W "--jail --duration --scope $global_flags" -- "$cur") ) ;;
+    \\            COMPREPLY=( $(compgen -W "--jail --duration --scope --force $global_flags" -- "$cur") ) ;;
     \\        unban)
     \\            COMPREPLY=( $(compgen -W "--jail --scope $global_flags" -- "$cur") ) ;;
     \\        jail)
@@ -100,14 +105,14 @@ const bash_script =
     \\            done
     \\            case "$sub" in
     \\                add)
-    \\                    COMPREPLY=( $(compgen -W "--jail --unban $global_flags" -- "$cur") ) ;;
+    \\                    COMPREPLY=( $(compgen -W "--jail --unban --for $global_flags" -- "$cur") ) ;;
     \\                remove|list)
     \\                    COMPREPLY=( $(compgen -W "--jail $global_flags" -- "$cur") ) ;;
     \\                *)
     \\                    COMPREPLY=( $(compgen -W "add remove list $global_flags" -- "$cur") ) ;;
     \\            esac ;;
     \\        list)
-    \\            COMPREPLY=( $(compgen -W "--jail --details --sort $global_flags" -- "$cur") ) ;;
+    \\            COMPREPLY=( $(compgen -W "--jail --origin --details --sort $global_flags" -- "$cur") ) ;;
     \\        completions)
     \\            COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ) ;;
     \\        help)
@@ -176,6 +181,7 @@ const zsh_script =
     \\                        '--jail[Target jail (required)]:jail name:' \
     \\                        '--duration[Ban duration in seconds]:seconds:' \
     \\                        '--scope[Scope: host, or net <cidr>]:scope:(host net)' \
+    \\                        '--force[Ban even a loopback, host or SSH peer address]' \
     \\                        $global_flags \
     \\                        '1:ip address:' ;;
     \\                unban)
@@ -194,6 +200,7 @@ const zsh_script =
     \\                            _arguments \
     \\                                '--jail[Target jail (required)]:jail name:' \
     \\                                '--unban[Also lift the jail bans inside the entry]' \
+    \\                                '--for[Remove the entry after this duration, e.g. 2m or 1h30m]:duration:' \
     \\                                $global_flags \
     \\                                '2:address or cidr:' ;;
     \\                        remove)
@@ -213,6 +220,7 @@ const zsh_script =
     \\                list)
     \\                    _arguments \
     \\                        '--jail[Filter by jail]:jail name:' \
+    \\                        '--origin[Show only bans of one origin]:origin:(detection manual config)' \
     \\                        '--details[Include ban counts in table output]' \
     \\                        '--sort[Sort by numeric IP address, then jail name]' \
     \\                        $global_flags ;;
@@ -328,18 +336,21 @@ const fish_script =
     \\complete -c fail2zig -n '__fail2zig_client_using_command ban'   -l jail     -x -d 'Target jail'
     \\complete -c fail2zig -n '__fail2zig_client_using_command ban'   -l duration -x -d 'Ban duration (seconds)'
     \\complete -c fail2zig -n '__fail2zig_client_using_command ban'   -l scope    -x -a 'host net' -d 'Scope: host, or net <cidr>'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command ban'   -l force    -d 'Ban even a loopback, host or SSH peer address'
     \\complete -c fail2zig -n '__fail2zig_client_using_command unban' -l jail     -x -d 'Target jail'
     \\complete -c fail2zig -n '__fail2zig_client_using_command unban' -l scope    -x -a 'host net' -d 'Scope: host, or net <cidr>'
     \\complete -c fail2zig -f -n '__fail2zig_client_using_command jail' -a 'enable disable pause resume'
     \\complete -c fail2zig -f -n '__fail2zig_client_using_command history' -a 'reset' -d 'Reset an address ban history'
     \\complete -c fail2zig -n '__fail2zig_client_using_command history' -l all -d 'Reset history for all jails'
     \\complete -c fail2zig -n '__fail2zig_client_using_command list'  -l jail     -x -d 'Filter by jail'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command list; and not __fail2zig_client_using_command ignore'  -l origin -x -a 'detection manual config' -d 'Show only bans of one origin'
     \\complete -c fail2zig -n '__fail2zig_client_using_command list; and not __fail2zig_client_using_command ignore'  -l details -d 'Include ban counts in table output'
     \\complete -c fail2zig -n '__fail2zig_client_using_command list; and not __fail2zig_client_using_command ignore'  -l sort -d 'Sort by numeric IP address, then jail name'
     \\complete -c fail2zig -f -n '__fail2zig_client_using_command ignore'
     \\complete -c fail2zig -f -n '__fail2zig_client_using_command ignore; and not __fish_seen_subcommand_from add remove list' -a 'add remove list' -d 'Ignore subcommand'
     \\complete -c fail2zig -n '__fail2zig_client_using_command ignore; and __fish_seen_subcommand_from add remove list' -l jail -x -d 'Target jail'
     \\complete -c fail2zig -n '__fail2zig_client_using_command ignore; and __fish_seen_subcommand_from add' -l unban -d 'Also lift the jail bans inside the entry'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command ignore; and __fish_seen_subcommand_from add' -l for -x -d 'Remove the entry after this duration (e.g. 2m, 1h30m)'
     \\complete -c fail2zig -n '__fail2zig_client_using_command status' -l details -d 'Include table detail'
     \\complete -c fail2zig -n '__fail2zig_client_using_command stats' -l details -d 'Include additional counters'
     \\complete -c fail2zig -n '__fail2zig_client_using_command jails'  -l details -d 'Include table detail'
