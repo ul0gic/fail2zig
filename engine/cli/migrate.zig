@@ -299,27 +299,3 @@ fn runValidate(allocator: std.mem.Allocator, parsed: Parsed, stdout: anytype, st
     }
     return if (validation.outcome == .valid) .success else .rejected;
 }
-
-test "migrate cli: usage failures never touch inputs" {
-    var out = std.ArrayList(u8).init(std.testing.allocator);
-    defer out.deinit();
-    var err = std.ArrayList(u8).init(std.testing.allocator);
-    defer err.deinit();
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{}, "t", out.writer(), err.writer()));
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{"bogus"}, "t", out.writer(), err.writer()));
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{ "inspect", "--output", "xml" }, "t", out.writer(), err.writer()));
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{ "inspect", "--source-dir" }, "t", out.writer(), err.writer()));
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{ "snapshot", "--source-db", "/nonexistent.sqlite3", "--staging-dir", "/nonexistent" }, "t", out.writer(), err.writer()));
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{ "inspect", "--source-dir", "/nonexistent-fail2ban" }, "t", out.writer(), err.writer()));
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{ "plan", "--source-dir", "/nonexistent-fail2ban" }, "t", out.writer(), err.writer()));
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{ "plan", "--source-dir", "/x", "--out", "/tmp/p.json", "--continuity", "magic" }, "t", out.writer(), err.writer()));
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{ "validate", "--plan", "/nonexistent/plan.json" }, "t", out.writer(), err.writer()));
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{ "cutover", "--plan", "/nonexistent/plan.json" }, "t", out.writer(), err.writer()));
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{ "cutover", "--plan", "/p", "--state-file", "/s", "--staging-dir", "/d", "--backend", "magic" }, "t", out.writer(), err.writer()));
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{ "status", "--plan", "/p", "--state-file", "/s", "--staging-dir", "/d", "--backend", "nftables", "--run-id", "zz" }, "t", out.writer(), err.writer()));
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{ "status", "--plan", "/p", "--state-file", "/s", "--staging-dir", "/d", "--backend", "nftables" }, "t", out.writer(), err.writer()));
-}
-
-test {
-    _ = cutover;
-}

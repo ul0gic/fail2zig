@@ -53,7 +53,3 @@ pub fn main() !void {
     }
     try std.json.stringify(responses.items, .{}, std.io.getStdOut().writer());
 }
-
-test {
-    std.testing.refAllDecls(policy);
-}

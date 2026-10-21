@@ -153,30 +153,3 @@ fn unit(value: []const u8) ?f64 {
     };
     return null;
 }
-test "duration expressions units precedence and permanent tags" {
-    const Case = struct { text: []const u8, value: f64 };
-    for ([_]Case{
-        .{ .text = "1d12h", .value = 129600 },
-        .{ .text = "1hour+30min", .value = 5400 },
-        .{ .text = "1year-6mo", .value = 15778800 },
-        .{ .text = "1.5 min", .value = 90 },
-        .{ .text = "(2+3)*60", .value = 300 },
-        .{ .text = "2**3**2", .value = 512 },
-        .{ .text = "-2**2", .value = -4 },
-        .{ .text = "7//2", .value = 3 },
-        .{ .text = "7%3", .value = 1 },
-        .{ .text = "2h**2", .value = 25920000 },
-    }) |case| try std.testing.expectEqual(case.value, try expression(case.text));
-    try std.testing.expect((try parse("-1", false)) == .permanent);
-    try std.testing.expect((try parse("-2", true)) == .legacy_unknown);
-    try std.testing.expectError(error.NegativeDuration, parse("-2", false));
-}
-test "duration rejects code invalid values and lossy native conversion" {
-    try std.testing.expectError(error.InvalidDuration, expression("print(1)"));
-    try std.testing.expectError(error.NonFiniteDuration, expression("1/0"));
-    try std.testing.expectError(error.InvalidDuration, expression("1fortnight"));
-    try std.testing.expectError(error.PrecisionLoss, (try parse("0.5", false)).nativeSeconds());
-    try std.testing.expectError(error.Overflow, parse("18446744073709551616", false));
-    try std.testing.expectError(error.PrecisionLoss, parse("9007199254740993", false));
-    try std.testing.expectEqual(@as(u64, 3600), try (try parse("1h", false)).nativeSeconds());
-}

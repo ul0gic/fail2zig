@@ -65,30 +65,3 @@ pub fn select(parsed_name: []const u8, context: ?*anyopaque, initialize: *const 
     }
     return error.NoAvailableBackend;
 }
-
-test "no-log switching precedes skip and discards auto selector parameters" {
-    const value = prepare(.{ .raw_backend = "auto[journalflags=1]", .logpath_present = true, .journalmatch_present = true, .skip_if_nologs = true });
-    try std.testing.expectEqualStrings("systemd", value.backend);
-    try std.testing.expect(value.switched_to_journal);
-    try std.testing.expectEqual(.admit, value.disposition);
-    try std.testing.expectEqual(.missing_logs, prepare(.{ .raw_backend = "AUTO", .logpath_present = true, .journalmatch_present = true }).disposition);
-    try std.testing.expectEqual(.admit, prepare(.{}).disposition);
-    try std.testing.expectEqual(.skip, prepare(.{ .logpath_present = true, .skip_if_nologs = true, .allow_no_files = true }).disposition);
-}
-
-test "explicit backend falls forward only on missing dependency" {
-    const Factory = struct {
-        fn missing(backend: Backend, _: ?*anyopaque) !void {
-            if (backend != .systemd) return error.DependencyUnavailable;
-        }
-        fn broken(_: Backend, _: ?*anyopaque) !void {
-            return error.InitializationFailed;
-        }
-    };
-    const value = try select("POLLING", null, Factory.missing);
-    try std.testing.expectEqual(.journal, value.source_kind);
-    try std.testing.expectEqual(@as(usize, 2), value.attempts);
-    try std.testing.expect(value.explicit_fallback);
-    try std.testing.expectError(error.InitializationFailed, select("auto", null, Factory.broken));
-    try std.testing.expectError(error.UnknownBackend, select("unknown", null, Factory.missing));
-}

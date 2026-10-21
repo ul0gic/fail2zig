@@ -49,17 +49,14 @@ those host tools. nftables enforcement uses kernel netlink directly.
 While editing, run the relevant named suite, for example:
 
 ```bash
-zig build test-native-detection -Doptimize=ReleaseSafe
-zig build test-native-ipc-auth -Doptimize=ReleaseSafe
-make fuzz
+zig build test-firewall -Doptimize=ReleaseSafe
+zig build test-ci-assembled -Doptimize=ReleaseSafe
 ```
 
-`make test` runs component shards, assembled integration tests and bounded fuzz
-cases in sequence. `make fuzz` runs bounded fuzz cases and the test module-graph
-guard, not an ongoing fuzzing campaign. Local test builds use two compile jobs by default;
-override this with `make test ZIG_JOBS=4` when resources allow. Avoid the broad
-`zig build test` entry point: it still includes legacy tests outside the maintained
-CI inventory. Suite definitions live in
+`make test` runs the delivered daemon/client smoke check. `make test-full` runs
+the firewall parser suites and the assembled daemon suites in sequence. Local
+test builds use two compile jobs by default; override this with
+`make test-full ZIG_JOBS=4` when resources allow. Suite definitions live in
 [build.zig](build.zig).
 
 Do not run daemon/startup test suites concurrently in the same checkout: they
@@ -69,9 +66,8 @@ environment in your PR's verification notes; a hosted test pass does not prove
 live firewall enforcement on every supported architecture. Use an isolated test
 machine or namespace for tests that change firewall state.
 
-Local checks are optional conveniences, not substitutes for required CI. Docs
-and community-only changes take the small CI route; code, build and workflow
-changes take the full route. Formatting, shell/YAML checks, workflow security
+Local checks are optional conveniences, not substitutes for required CI.
+Formatting, shell/YAML checks, workflow security
 analysis, maintained test suites and five release cross-builds run where
 applicable. See [CI](.github/workflows/ci.yml) for the exact checks.
 

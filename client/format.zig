@@ -238,17 +238,6 @@ fn formatStatusWithDetails(allocator: std.mem.Allocator, writer: anytype, payloa
     try formatStatusReport(allocator, writer, payload_json, fmt, color, terminalColumns(), details, loss);
 }
 
-fn formatStatusForWidth(
-    allocator: std.mem.Allocator,
-    writer: anytype,
-    payload_json: []const u8,
-    fmt: OutputFormat,
-    color: Color,
-    columns: usize,
-) !void {
-    return formatStatusForWidthDetailed(allocator, writer, payload_json, fmt, color, columns, true);
-}
-
 fn formatStatusForWidthDetailed(
     allocator: std.mem.Allocator,
     writer: anytype,
@@ -1215,10 +1204,6 @@ pub fn formatStatsDetailed(allocator: std.mem.Allocator, writer: anytype, payloa
     try formatStatsWithDetails(allocator, writer, payload_json, fmt, color, terminalColumns(), true);
 }
 
-fn formatStatsForWidth(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color, columns: usize, details: bool) !void {
-    try formatStatsWithDetails(allocator, writer, payload_json, fmt, color, columns, details);
-}
-
 fn formatStatsWithDetails(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color, columns: usize, details: bool) !void {
     if (fmt == .json) {
         try writer.writeAll(payload_json);
@@ -1352,17 +1337,6 @@ pub fn formatListDetailed(allocator: std.mem.Allocator, writer: anytype, payload
 
 fn formatListWithDetails(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color, details: bool) !void {
     try formatListForWidthDetailed(allocator, writer, payload_json, fmt, color, terminalColumns(), details);
-}
-
-fn formatListForWidth(
-    allocator: std.mem.Allocator,
-    writer: anytype,
-    payload_json: []const u8,
-    fmt: OutputFormat,
-    color: Color,
-    columns: usize,
-) !void {
-    return formatListForWidthDetailed(allocator, writer, payload_json, fmt, color, columns, true);
 }
 
 fn formatListForWidthDetailed(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color, columns: usize, details: bool) !void {
@@ -1550,17 +1524,6 @@ pub fn formatJailsDetailed(allocator: std.mem.Allocator, writer: anytype, payloa
 
 fn formatJailsWithDetails(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color, details: bool) !void {
     try formatJailsForWidthDetailed(allocator, writer, payload_json, fmt, color, terminalColumns(), details);
-}
-
-fn formatJailsForWidth(
-    allocator: std.mem.Allocator,
-    writer: anytype,
-    payload_json: []const u8,
-    fmt: OutputFormat,
-    color: Color,
-    columns: usize,
-) !void {
-    return formatJailsForWidthDetailed(allocator, writer, payload_json, fmt, color, columns, true);
 }
 
 fn formatJailsForWidthDetailed(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color, columns: usize, details: bool) !void {
@@ -3162,17 +3125,6 @@ fn writeHistoryTable(writer: anytype, p: HistoryPayload, color: Color) !void {
     try writePageFooter(writer, p.generation, p.next_cursor);
 }
 
-fn formatFirewallForWidth(
-    allocator: std.mem.Allocator,
-    writer: anytype,
-    payload_json: []const u8,
-    fmt: OutputFormat,
-    color: Color,
-    columns: usize,
-) !void {
-    return formatFirewallForWidthDetailed(allocator, writer, payload_json, fmt, color, columns, true);
-}
-
 fn formatFirewallForWidthDetailed(
     allocator: std.mem.Allocator,
     writer: anytype,
@@ -3703,23 +3655,3 @@ pub fn formatUnknownJail(
     try std.json.encodeJsonString(message, .{}, writer);
     try writer.writeAll("}}\n");
 }
-
-// Expose only the formatter internals exercised by the out-of-module component tests.
-pub const TestAccess = if (@import("builtin").is_test) struct {
-    pub const statusForWidth = formatStatusForWidth;
-    pub const statusForWidthDetailed = formatStatusForWidthDetailed;
-    pub const statsForWidth = formatStatsForWidth;
-    pub const diagnosticMaxBytes = diagnostic_max_bytes;
-    pub const unsafeUnicodeControl = isUnsafeUnicodeControl;
-    pub const diagnostic = renderDiagnostic;
-    pub const listForWidth = formatListForWidth;
-    pub const expiryRemaining = remainingFromExpiry;
-    pub const remaining = formatRemaining;
-    pub const jailsForWidth = formatJailsForWidth;
-    pub const jailsForWidthDetailed = formatJailsForWidthDetailed;
-    pub const firewallForWidth = formatFirewallForWidth;
-    pub const firewallForWidthDetailed = formatFirewallForWidthDetailed;
-    pub const firewallStructureRules = writeFirewallStructureRules;
-    pub const utc = formatUtc;
-    pub const ignoreListForWidth = formatIgnoreListForWidth;
-} else struct {};

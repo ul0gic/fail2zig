@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
-const builtin = @import("builtin");
 const build_options = @import("build_options");
 const diag_mod = @import("../core/diag.zig");
 const native_time = @import("../core/native_time.zig");
@@ -220,11 +219,6 @@ pub const max_retention_page: u16 = 256;
 // A transaction allows 1,000 progress callbacks of 1,000 VM steps (workProgress).
 pub const max_held_window: u16 = 8192;
 pub const ReclaimCursor = struct { phase: u2 = 0, cursor: i64 = 0, found: bool = false, rest: u8 = 0 };
-pub const TestHooks = if (builtin.is_test) struct {
-    retention_select_work: ?u32 = null,
-    retention_sweep_rows: ?i64 = null,
-    held_pass_work: ?u32 = null,
-} else struct {};
 pub const Store = struct {
     allocator: std.mem.Allocator,
     api: Api,
@@ -259,7 +253,6 @@ pub const Store = struct {
     retry_detail_rest: u8 = 0,
     maintenance_operation: ?@import("../core/storage_health.zig").MaintenanceOperation = null,
     history_overload_notice_us: ?i64 = null,
-    test_hooks: TestHooks = .{},
     escalation_jitter_context: ?*anyopaque = null,
     escalation_jitter: *const fn (?*anyopaque, u64) u64 = systemEscalationJitter,
     diag_changes: if (build_options.diag) i64 else void = if (build_options.diag) 0 else {},
@@ -424,31 +417,31 @@ pub const Store = struct {
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) Error!Store {
         var ignored = OpenDiagnostic{};
-        return openImpl(allocator, path, .plain, &ignored, .{});
+        return openImpl(allocator, path, .plain, &ignored);
     }
 
     pub fn openExisting(allocator: std.mem.Allocator, path: []const u8) Error!Store {
         var ignored = OpenDiagnostic{};
-        return openImpl(allocator, path, .existing, &ignored, .{});
+        return openImpl(allocator, path, .existing, &ignored);
     }
 
     pub fn openDetailed(allocator: std.mem.Allocator, path: []const u8, diagnostic: *OpenDiagnostic) Error!Store {
-        return openImpl(allocator, path, .plain, diagnostic, .{});
+        return openImpl(allocator, path, .plain, diagnostic);
     }
 
     pub fn openRuntime(allocator: std.mem.Allocator, path: []const u8) Error!Store {
         var ignored = OpenDiagnostic{};
-        return openImpl(allocator, path, .runtime, &ignored, .{});
+        return openImpl(allocator, path, .runtime, &ignored);
     }
     pub fn openRuntimeDetailed(allocator: std.mem.Allocator, path: []const u8, diagnostic: *OpenDiagnostic) Error!Store {
-        return openImpl(allocator, path, .runtime, diagnostic, .{});
+        return openImpl(allocator, path, .runtime, diagnostic);
     }
     pub fn openReadOnly(allocator: std.mem.Allocator, path: []const u8) Error!Store {
         var ignored = OpenDiagnostic{};
-        return openImpl(allocator, path, .readonly, &ignored, .{});
+        return openImpl(allocator, path, .readonly, &ignored);
     }
     pub fn openReadOnlyDetailed(allocator: std.mem.Allocator, path: []const u8, diagnostic: *OpenDiagnostic) Error!Store {
-        return openImpl(allocator, path, .readonly, diagnostic, .{});
+        return openImpl(allocator, path, .readonly, diagnostic);
     }
 
     pub const InstallationSnapshot = struct {
@@ -462,7 +455,7 @@ pub const Store = struct {
     }
 
     pub fn installationSnapshotDetailed(allocator: std.mem.Allocator, path: []const u8, diagnostic: *OpenDiagnostic) Error!InstallationSnapshot {
-        var store = try openImpl(allocator, path, .preflight, diagnostic, .{});
+        var store = try openImpl(allocator, path, .preflight, diagnostic);
         defer store.close();
         store.last_error_code = null;
         const installation = if (store.schema_version >= 11)
@@ -476,14 +469,7 @@ pub const Store = struct {
     }
 
     const OpenMode = enum { plain, runtime, readonly, preflight, existing };
-    pub const TestAccess = if (builtin.is_test) struct {
-        pub const openImpl = Store.openImpl;
-    } else struct {};
-    const OpenHooks = struct {
-        context: ?*anyopaque = null,
-        before_identity_recheck: ?*const fn (?*anyopaque) void = null,
-    };
-    fn openImpl(allocator: std.mem.Allocator, path: []const u8, open_mode: OpenMode, diagnostic: *OpenDiagnostic, hooks: OpenHooks) Error!Store {
+    fn openImpl(allocator: std.mem.Allocator, path: []const u8, open_mode: OpenMode, diagnostic: *OpenDiagnostic) Error!Store {
         diagnostic.* = .{};
         const runtime = open_mode == .runtime;
         if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null)
@@ -526,7 +512,6 @@ pub const Store = struct {
         self.last_error_code = null;
         self.check(db_config(self.db, 1006, @as(c_int, 1), @as(?*c_int, null))) catch |failure|
             return openFailure(diagnostic, .connection_setup, failure, null, self.last_error_code);
-        if (builtin.is_test) if (hooks.before_identity_recheck) |hook| hook(hooks.context);
         const selected = std.posix.fstatat(std.posix.AT.FDCWD, path, std.posix.AT.SYMLINK_NOFOLLOW) catch |failure|
             return openFailure(diagnostic, .file_identity_recheck, error.OpenFailed, openPosixCause(failure), null);
         if (selected.dev != stat.dev or selected.ino != stat.ino or selected.uid != stat.uid or selected.mode != stat.mode)
@@ -783,36 +768,6 @@ pub const Store = struct {
         if (receipt_us) |wanted| if (original_receipt == null or original_receipt.? != wanted) return error.OccurrenceConflict;
         return error.PrunedReplay;
     }
-    pub fn fixtureReplayGuard(self: *Store, jail: []const u8, source: []const u8, occurrence: []const u8) Error!void {
-        if (!builtin.is_test) @compileError("fixtureReplayGuard is test-only");
-        try self.beginWrite();
-        errdefer self.rollback();
-        const position = try self.recordSequence(jail, source, occurrence) orelse return error.InvalidMaintenanceState;
-        var row = try self.statement("SELECT raw_hash,cursor,receipt_us,receipt_generation FROM records WHERE jail=?1 AND source=?2 AND occurrence=?3;");
-        defer row.deinit();
-        try row.text(1, jail);
-        try row.text(2, source);
-        try row.text(3, occurrence);
-        if (!try row.row()) return error.InvalidMaintenanceState;
-        const identity = ReceiptIdentity{ .jail = jail, .source = source, .occurrence = occurrence, .raw_hash = try Store.effectBlob(&row, 0, 32), .cursor = try row.boundedBytes(1, Limits.cursor_bytes), .generation = position.generation };
-        const receipt = try row.optionalSigned(2);
-        if (receipt != null and !std.mem.eql(u8, &try Store.effectBlob(&row, 3, 32), &position.generation)) return error.InvalidMaintenanceState;
-        const occurrence_key = occurrenceGuardKey(occurrence);
-        const identity_key = identityGuardKey(identity);
-        var insert = try self.statement("INSERT INTO replay_guards VALUES(?1,?2,?3,?4,?5,?6,?7);");
-        defer insert.deinit();
-        try insert.text(1, jail);
-        try insert.text(2, source);
-        try insert.blob(3, &position.generation);
-        try insert.blob(4, &occurrence_key);
-        try insert.blob(5, &identity_key);
-        if (receipt) |value| try insert.int(6, value);
-        try insert.int(7, @intCast(position.sequence));
-        try insert.done();
-        try self.fault(.after_replay_guard);
-        try self.commitTransaction();
-    }
-
     pub const CursorRebinding = struct { old: [32]u8, new: [32]u8 };
     pub const PolicyTransition = struct { jail: []const u8, generation: [32]u8, next_generation: [32]u8, expected: retry.Policy, next: retry.Policy, cursor_rebinding: ?CursorRebinding = null };
     pub usingnamespace @import("admin.zig").Methods(@This());
@@ -1784,9 +1739,3 @@ pub const Stmt = struct {
         return ptr[0..@intCast(length)];
     }
 };
-
-pub const testing = if (builtin.is_test) struct {
-    pub const sqlite_error = sqliteError;
-    pub const embedded = embedded_api;
-    pub const db = Db;
-} else struct {};

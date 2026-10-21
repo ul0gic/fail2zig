@@ -300,9 +300,7 @@ pub const Inspector = struct {
     dump_interruptions: u64 = 0,
     clock_rate: if (build_options.diag) u32 else void = if (build_options.diag) 1 else {},
     test_fault_after_mutations: if (@import("builtin").is_test) ?usize else void = if (@import("builtin").is_test) null else {},
-    test_fault_readback: if (@import("builtin").is_test) ?Error else void = if (@import("builtin").is_test) null else {},
     test_between_reads: if (@import("builtin").is_test) ?*const fn (*Inspector) void else void = if (@import("builtin").is_test) null else {},
-    test_inspections: if (@import("builtin").is_test) usize else void = if (@import("builtin").is_test) 0 else {},
 
     pub fn open(allocator: mem.Allocator, installation: Installation, limits: Limits) Error!Inspector {
         try installation.validate();
@@ -996,10 +994,6 @@ pub const Inspector = struct {
     pub fn inspect(self: *Inspector) Error!Snapshot {
         const diag_span = if (comptime build_options.diag) diag_mod.enter(.dump) else {};
         defer if (comptime build_options.diag) diag_mod.leave(diag_span);
-        if (comptime @import("builtin").is_test) {
-            self.test_inspections += 1;
-            if (self.test_fault_readback) |fault| return fault;
-        }
         const held = self.retained_bytes;
         defer self.retained_bytes = held;
         var timer = std.time.Timer.start() catch return error.SystemError;
@@ -2007,7 +2001,6 @@ fn readNft(self: *Inspector, builder: *Builder, timer: *std.time.Timer) Error!vo
 
 const Self = @This();
 pub const TestAccess = if (@import("builtin").is_test) struct {
-    pub const Builder = Self.Builder;
     pub const builderInit = Self.Builder.init;
     pub const builderDeinit = Self.Builder.deinit;
     pub const builderAdd = Self.Builder.add;
@@ -2020,8 +2013,6 @@ pub const TestAccess = if (@import("builtin").is_test) struct {
     pub const deadlineUnits = Self.deadlineUnits;
     pub const effectMatches = Self.effectMatches;
     pub const scanSavedTables = Self.scanSavedTables;
-    pub const entryLess = Self.entryLess;
-    pub const sameEntries = Self.sameEntries;
     pub const entryScope = Self.entryScope;
     pub const findEntry = Self.findEntry;
 } else struct {};

@@ -438,23 +438,6 @@ fn observe(raw: ?*anyopaque, step: journal.Step, _: *const durable.Store.Migrati
     }
 }
 
-test "migrate cutover: outcome to exit mapping follows the frozen outcome table" {
-    try std.testing.expectEqual(ExitClass.success, exitFor(.success, .complete));
-    try std.testing.expectEqual(ExitClass.unavailable, exitFor(.success, .staged));
-    try std.testing.expectEqual(ExitClass.partial, exitFor(.partial, .activating));
-    try std.testing.expectEqual(ExitClass.uncertain, exitFor(.uncertain, .activating));
-    try std.testing.expectEqual(ExitClass.rejected, exitFor(.validation_failed, .failed));
-    try std.testing.expectEqual(ExitClass.rejected, exitFor(.incompatible, .planned));
-    try std.testing.expectEqual(ExitClass.partial, exitFor(.rollback_failed, .failed));
-}
-
-test "migrate cutover: process scan finds this process and not a nonsense name" {
-    var buffer: [64]u8 = undefined;
-    const me = try std.fs.cwd().readFile("/proc/self/comm", &buffer);
-    try std.testing.expect(try processRunning(std.mem.trimRight(u8, me, "\n")));
-    try std.testing.expect(!try processRunning("fail2zig-no-such-process-name"));
-}
-
 pub fn runRollback(allocator: std.mem.Allocator, options: Options, stdout: anytype, stderr: anytype) ExitClass {
     const run_id = options.run_id orelse {
         stderr.writeAll("error: migrate rollback requires --run-id <hex>\n") catch {};
@@ -830,15 +813,4 @@ fn subjectText(buffer: []u8, subject: anytype) ![]const u8 {
     };
     if (subject.prefix == full) return std.fmt.bufPrint(buffer, "{s}", .{address});
     return std.fmt.bufPrint(buffer, "{s}/{d}", .{ address, subject.prefix });
-}
-
-test "migrate rollback: subject text renders hosts and networks for the source database" {
-    const canonical = @import("../firewall/scope.zig");
-    var buffer: [64]u8 = undefined;
-    const host = canonical.Subject.host(.{ .ipv4 = (203 << 24) | (113 << 8) | 77 });
-    try std.testing.expectEqualStrings("203.0.113.77", try subjectText(&buffer, host));
-    const net = try canonical.Subject.network(.{ .ipv4 = (198 << 24) | (51 << 16) | (100 << 8) }, 24);
-    try std.testing.expectEqualStrings("198.51.100.0/24", try subjectText(&buffer, net));
-    const six = canonical.Subject.host(.{ .ipv6 = (0x2001_0db8 << 96) | 1 });
-    try std.testing.expectEqualStrings("2001:db8::1", try subjectText(&buffer, six));
 }

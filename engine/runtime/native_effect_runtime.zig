@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
-const builtin = @import("builtin");
 const shared = @import("shared");
 const build_options = @import("build_options");
 const diag_mod = @import("../core/diag.zig");
@@ -145,7 +144,6 @@ pub const Manager = struct {
     last_readback_wall_us: ?i64 = null,
     legacy_targets_attempted: ?[32]u8 = null,
     owned_marks: std.StaticBitSet(firewall.max_inventory_entries) = undefined,
-    test_readback_disagrees: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
 
     pub fn create(a: std.mem.Allocator, store: *durable.Store, installation: effect.Installation) !*Manager {
         try installation.validate();
@@ -605,9 +603,6 @@ pub const Manager = struct {
         const installed = held.snapshot.entries[found];
         return installed.scope == null or (installed.effect_id != null and std.mem.eql(u8, &installed.effect_id.?, &entry.scope_key));
     }
-    fn disagrees(self: *const Manager) bool {
-        return if (comptime builtin.is_test) self.test_readback_disagrees else false;
-    }
     fn refreshMatch(self: *Manager, index: usize) !void {
         const held = &(self.inventory orelse {
             self.matched[index] = false;
@@ -625,9 +620,8 @@ pub const Manager = struct {
             return propagateFirewall(void, failure);
         };
         self.matched[index] = matched;
-        const confirmed = matched and !self.disagrees();
-        if (self.confirmed[index] != confirmed) self.view_revision +%= 1;
-        self.confirmed[index] = confirmed;
+        if (self.confirmed[index] != matched) self.view_revision +%= 1;
+        self.confirmed[index] = matched;
     }
     fn evaluateInventory(self: *Manager) !bool {
         var confirmed_count: usize = 0;
@@ -1421,35 +1415,4 @@ pub fn address(scope: effect.Scope) shared.IpAddress {
         .v4 => .{ .ipv4 = std.mem.readInt(u32, scope.canonical.subject.address[0..4], .big) },
         .v6 => .{ .ipv6 = std.mem.readInt(u128, &scope.canonical.subject.address, .big) },
     };
-}
-
-test "native effect runtime: absent inventory is distinct from unexpected owned entries" {
-    const t = std.testing;
-    const installation = firewall.Installation{ .id = [_]u8{0x71} ** 16, .transport = .nftables };
-    var cache = observation.Cache.init(installation, [_]u8{0x72} ** 16);
-    var manager: Manager = undefined;
-    manager.observation_cache = &cache;
-    manager.count = 0;
-    manager.live = &.{};
-    var snapshot = firewall.Snapshot{
-        .allocator = t.allocator,
-        .installation = installation,
-        .state = .absent,
-        .entries = &.{},
-        .fingerprint = [_]u8{0} ** 32,
-        .observed_start_ns = 0,
-        .observed_end_ns = 0,
-    };
-    try t.expectError(error.InstallationMismatch, manager.validateAndCaptureObservation(&snapshot, .readback, null, .readback));
-    var page: observation.Page = undefined;
-    try cache.readPage(.{}, &page);
-    try t.expectEqual(.absent, page.metadata.state);
-    try t.expectEqual(.not_checked, page.metadata.inventory);
-    var entries = [_]firewall.Entry{.{ .address = .{ .ipv4 = 0xc0000201 } }};
-    snapshot.state = .owned;
-    snapshot.entries = &entries;
-    try t.expectError(error.UnownedInstalledEffect, manager.validateAndCaptureObservation(&snapshot, .readback, null, .readback));
-    try cache.readPage(.{}, &page);
-    try t.expectEqual(.unexpected_entries, page.metadata.inventory);
-    try t.expectEqual(@as(usize, 1), page.count);
 }

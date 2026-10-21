@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local trusted-trigger CI: format, plain/diag/Debug builds with the no-diag scan, a Debug rig startup and the short steps, in parallel.
+# Local trusted-trigger CI: format, plain/diag/Debug builds with the no-diag scan, a Debug rig startup and the firewall suites in parallel, then the assembled daemon lane alone.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
@@ -29,9 +29,7 @@ mkdir -p "$OUT" "$PREFIX"
 RESULTS=$OUT/results.txt
 : > "$RESULTS"
 
-STEPS=(test-native-session-repair test-native-source test-native-reload test-native-retry
-       test-native-maintenance test-native-cli test-client-format test-native-query
-       test-native-ipc-auth test-native-effect-runtime)
+STEPS=(test-firewall)
 
 record() {
   local name=$1 start=$2 code=$3
@@ -85,6 +83,9 @@ if [ "$TESTS" = 1 ]; then
   done
 fi
 wait
+if [ "$TESTS" = 1 ]; then
+  job test-ci-assembled zig build test-ci-assembled -Doptimize=ReleaseSafe -j2 --summary all
+fi
 
 sort "$RESULTS"
 failed=$(grep -cv '=0 ' "$RESULTS")

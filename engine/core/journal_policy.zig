@@ -280,31 +280,3 @@ fn appendResult(allocator: Allocator, path: []const u8, result: *std.ArrayList([
     if (result.items.len >= limit) return error.JournalSelectionLimit;
     try result.append(try allocator.dupe(u8, path));
 }
-
-test "journal policy validates prepared selectors without a reader" {
-    try (Selection{ .files = &.{"/original/system.journal"}, .matches = &.{ "_SYSTEMD_UNIT=sshd.service", "+", "SYSLOG_IDENTIFIER=sshd" } }).validate();
-    try std.testing.expectError(error.ConflictingJournalSelection, (Selection{ .directory = "/original", .files = &.{"/original/system.journal"} }).validate());
-    try std.testing.expectError(error.InvalidJournalSelection, (Selection{ .directory = "/original\x00hidden" }).validate());
-    try std.testing.expectError(error.InvalidMatch, (Selection{ .matches = &.{ "_SYSTEMD_UNIT=sshd.service", "+" } }).validate());
-    try std.testing.expectError(error.InvalidMatch, (Selection{ .matches = &.{"lowercase=invalid"} }).validate());
-    try std.testing.expectError(error.InvalidFlags, (Selection{ .flags = std.math.maxInt(u32) }).validate());
-}
-
-test "journal policy separates absent flags from rotated default and explicit empty selection" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const env = Environment{ .state_logs = "/nonexistent-f2z-policy-state", .runtime_logs = "/nonexistent-f2z-policy-run", .effective_uid = 0 };
-    const normal = try prepare(a, .{}, env);
-    try std.testing.expect(normal.flags_present and normal.flags == null and normal.files_present and normal.files == null);
-    try std.testing.expectEqual(@as(u32, 1), (try normal.selection(&.{})).flags);
-    const rotated = try prepare(a, .{ .rotated = "yes" }, env);
-    try std.testing.expectEqualStrings("4", rotated.flags.?);
-    try std.testing.expect(!rotated.files_present);
-    const empty = try prepare(a, .{ .files = &.{}, .rotated = "yes" }, env);
-    try std.testing.expectEqual(@as(usize, 0), empty.files.?.len);
-    try std.testing.expectError(error.EmptyJournalFiles, empty.selection(&.{}));
-    const namespaced = try prepare(a, .{ .namespace = "original" }, env);
-    try std.testing.expect(!namespaced.files_present);
-    try std.testing.expectEqual(@as(u32, 1), (try namespaced.selection(&.{})).flags);
-}

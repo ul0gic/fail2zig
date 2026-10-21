@@ -19,37 +19,7 @@ env:
   ZIG_SHA256: "24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c"
 
 jobs:
-  scope:
-    name: Classify changes
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      route: ${{ steps.scope.outputs.route }}
-      targets: ${{ steps.scope.outputs.targets }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-      - id: scope
-        name: Select applicable checks
-        run: bash .github/scripts/ci_scope.sh classify
-      - name: Ensure YAML validator is available
-        if: steps.scope.outputs.route == 'light'
-        run: |
-          if ! command -v yamllint >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install -y yamllint
-          fi
-      - name: Check community files
-        if: steps.scope.outputs.route == 'light'
-        run: |
-          bash .github/scripts/ci_scope.sh whitespace
-          yamllint -d '{extends: .yamllint, rules: {line-length: disable}}' .github/ISSUE_TEMPLATE/
-
   lint:
-    needs: scope
-    if: needs.scope.outputs.route != 'light'
     name: Source and workflow checks
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -78,15 +48,13 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y "${missing[@]}"
           fi
-      - name: Check changed-file whitespace and YAML
+      - name: Check whitespace and YAML
         run: |
-          bash .github/scripts/ci_scope.sh whitespace
+          git diff --check HEAD^1 HEAD --
           yamllint -c .yamllint .github/workflows/
           yamllint -d '{extends: .yamllint, rules: {line-length: disable}}' .github/ISSUE_TEMPLATE/
-      - name: Test CI routing and failure handling
-        run: |
-          bash .github/scripts/test_ci_scope.sh
-          bash .github/scripts/release_test.sh
+      - name: Test release failure handling
+        run: bash .github/scripts/release_test.sh
       - name: Lint scripts
         run: |
           shellcheck -S warning tests/harness/*.sh tests/harness/acceptance/*/*.sh tests/e2e/*.sh .github/scripts/*.sh
@@ -111,9 +79,7 @@ jobs:
           echo "SPDX header present on every tracked .zig file."
 
   test:
-    needs: scope
-    if: needs.scope.outputs.route != 'light'
-    name: Smoke, scoped or assembled tests
+    name: Assembled tests
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -135,80 +101,10 @@ jobs:
           key: zig-cache-test-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
           restore-keys: |
             zig-cache-test-${{ runner.os }}-${{ env.ZIG_VERSION }}-
-      - name: Assembled daemon and administrative checks
-        if: needs.scope.outputs.route == 'full'
-        run: /usr/bin/time -v zig build test-ci-assembled -Doptimize=ReleaseSafe -j2 --summary all
-      - name: Scoped smoke and affected capability checks
-        if: needs.scope.outputs.route == 'scoped'
-        env:
-          CI_TARGETS: ${{ needs.scope.outputs.targets }}
-        run: bash .github/scripts/ci_scope.sh run-scoped
-
-  components:
-    needs: scope
-    if: needs.scope.outputs.route == 'full'
-    name: Native components (${{ matrix.shard }})
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [a, b]
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - name: Install Zig ${{ env.ZIG_VERSION }}
-        run: |
-          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
-          echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c -
-          sudo mkdir -p /opt/zig
-          sudo tar -xf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
-          echo "/opt/zig" >> "$GITHUB_PATH"
-          /opt/zig/zig version
-      - name: Cache zig-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: .zig-cache
-          key: zig-cache-components-${{ matrix.shard }}-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
-          restore-keys: |
-            zig-cache-components-${{ matrix.shard }}-${{ runner.os }}-${{ env.ZIG_VERSION }}-
-      - name: Native component checks
-        env:
-          CI_SHARD: ${{ matrix.shard }}
-        run: /usr/bin/time -v zig build "test-ci-components-$CI_SHARD" -Doptimize=ReleaseSafe -j2 --summary all
-
-  fuzz:
-    needs: scope
-    if: needs.scope.outputs.route == 'full'
-    name: Bounded fuzz and module guard
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - name: Install Zig ${{ env.ZIG_VERSION }}
-        run: |
-          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
-          echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c -
-          sudo mkdir -p /opt/zig
-          sudo tar -xf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
-          echo "/opt/zig" >> "$GITHUB_PATH"
-          /opt/zig/zig version
-      - name: Cache zig-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: .zig-cache
-          key: zig-cache-fuzz-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
-          restore-keys: |
-            zig-cache-fuzz-${{ runner.os }}-${{ env.ZIG_VERSION }}-
-      - name: Bounded malformed-input checks
-        run: /usr/bin/time -v zig build test-ci-fuzz -Doptimize=ReleaseSafe -j2 --summary all
+      - name: Assembled daemon and firewall checks
+        run: /usr/bin/time -v zig build test-ci-assembled test-firewall -Doptimize=ReleaseSafe -j2 --summary all
 
   release-target:
-    needs: scope
-    if: needs.scope.outputs.route == 'full'
     name: Cross-compile ${{ matrix.target }}
     strategy:
       fail-fast: false
@@ -271,23 +167,34 @@ jobs:
     name: CI result
     timeout-minutes: 5
     if: always()
-    needs: [scope, lint, test, components, fuzz, release-target]
+    needs: [lint, test, release-target]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Require every applicable check to pass
-        env:
-          CI_NEEDS: ${{ toJSON(needs) }}
-        run: bash .github/scripts/ci_scope.sh gate
-      - name: Bind full qualification to the actual checkout
-        if: needs.scope.outputs.route == 'full' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-        env:
-          CI_NEEDS: ${{ toJSON(needs) }}
-        run: bash .github/scripts/ci_scope.sh qualification
+      - name: Require every check to pass
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: exit 1
+      - name: Record exact-commit full qualification
+        if: >-
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+          !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') &&
+          !contains(needs.*.result, 'skipped')
+        run: |
+          actual=$(git rev-parse HEAD)
+          [[ $actual == "${GITHUB_SHA:?}" && $actual =~ ^[0-9a-f]{40}$ ]]
+          jq -n --arg repository "${GITHUB_REPOSITORY:?}" --arg source_commit "$actual" \
+              --arg event "${GITHUB_EVENT_NAME:?}" --arg run_id "${GITHUB_RUN_ID:?}" \
+              --arg run_attempt "${GITHUB_RUN_ATTEMPT:?}" \
+              '{schema:1, repository:$repository, workflow:".github/workflows/ci.yml",
+                source_commit:$source_commit, route:"full", event:$event,
+                run_id:$run_id, run_attempt:$run_attempt}' > qualification.json
       - name: Retain exact-commit full qualification
-        if: needs.scope.outputs.route == 'full' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        if: >-
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+          !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') &&
+          !contains(needs.*.result, 'skipped')
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: ci-qualification

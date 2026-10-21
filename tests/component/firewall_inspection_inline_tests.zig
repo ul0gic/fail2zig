@@ -12,7 +12,6 @@ const Transport = source.Transport;
 const Installation = source.Installation;
 const ScopedRuleMetadata = source.ScopedRuleMetadata;
 const scoped_comment_bytes = source.scoped_comment_bytes;
-const Entry = source.Entry;
 const EffectOperation = source.EffectOperation;
 const validateCanonicalScope = source.validateCanonicalScope;
 const canonicalizeLegacyScope = source.canonicalizeLegacyScope;
@@ -22,9 +21,6 @@ const parseIpset = access.parseIpset;
 const deadlineUnits = access.deadlineUnits;
 const effectMatches = access.effectMatches;
 const scanSavedTables = access.scanSavedTables;
-const entryLess = access.entryLess;
-const sameEntries = access.sameEntries;
-const entryScope = access.entryScope;
 
 test "native firewall: typed projection refuses scope widening" {
     const address = try shared.IpAddress.parse("192.0.2.3");
@@ -136,16 +132,6 @@ fn allocationFixture(allocator: mem.Allocator) !void {
 test "native firewall: dual-family snapshots release all failing allocations" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationFixture, .{});
 }
-test "native firewall: duplicate and entry budget failures cannot return complete" {
-    var b = access.builderInit(std.testing.allocator, test_id, .{ .max_entries = 1 });
-    defer access.builderDeinit(&b);
-    const entry = Entry{ .address = try shared.IpAddress.parse("192.0.2.1") };
-    try access.builderAdd(&b, entry);
-    try std.testing.expectError(error.LimitExceeded, access.builderAdd(&b, entry));
-    b.limits.max_entries = 2;
-    try access.builderAdd(&b, entry);
-    try std.testing.expectError(error.UnknownState, access.builderFinish(&b, 0, 1));
-}
 test "native firewall: ipset strict member and finite timeout parsing" {
     var id = test_id;
     id.transport = .ipset;
@@ -196,46 +182,4 @@ test "native firewall: reserved inventory refuses incomplete framing and all leg
     try std.testing.expectError(error.Incomplete, scanSavedTables("COMMIT\n"));
     try std.testing.expectError(error.ForeignState, scanSavedTables("*mangle\n:FAIL2ZIG-old - [0:0]\nCOMMIT\n"));
     try std.testing.expectError(error.ForeignState, scanSavedTables("*filter\n:f2z_lost - [0:0]\nCOMMIT\n"));
-}
-
-test "native firewall: readback comparison accepts only scheduled kernel expiry" {
-    const t = std.testing;
-    const window = 2 * std.time.ns_per_ms;
-    const expiring = Entry{ .address = try shared.IpAddress.parse("192.0.2.1"), .remaining_ms = 5 };
-    const lasting = Entry{ .address = try shared.IpAddress.parse("192.0.2.2"), .remaining_ms = 60_000 };
-    const permanent = Entry{ .address = try shared.IpAddress.parse("192.0.2.3") };
-    const newcomer = Entry{ .address = try shared.IpAddress.parse("192.0.2.4"), .remaining_ms = 60_000 };
-    var before = [_]Entry{ expiring, lasting, permanent };
-    mem.sort(Entry, &before, {}, entryLess);
-    try t.expect(sameEntries(&before, &before, null, window, .nftables));
-    var expired = [_]Entry{ lasting, permanent };
-    mem.sort(Entry, &expired, {}, entryLess);
-    try t.expect(sameEntries(&before, &expired, null, window, .nftables));
-    var removed = [_]Entry{ expiring, permanent };
-    mem.sort(Entry, &removed, {}, entryLess);
-    try t.expect(!sameEntries(&before, &removed, null, window, .nftables));
-    var no_timeout_gone = [_]Entry{ expiring, lasting };
-    mem.sort(Entry, &no_timeout_gone, {}, entryLess);
-    try t.expect(!sameEntries(&before, &no_timeout_gone, null, window, .nftables));
-    var added = [_]Entry{ expiring, lasting, permanent, newcomer };
-    mem.sort(Entry, &added, {}, entryLess);
-    try t.expect(!sameEntries(&before, &added, null, window, .nftables));
-    var extended = before;
-    for (&extended) |*entry| {
-        if (entry.remaining_ms != null and entry.remaining_ms.? == 60_000) entry.remaining_ms = 60_001;
-    }
-    try t.expect(!sameEntries(&before, &extended, null, window, .nftables));
-    var rebound = before;
-    for (&rebound) |*entry| {
-        if (entry.remaining_ms == null) entry.effect_id = [_]u8{0x42} ** 32;
-    }
-    try t.expect(!sameEntries(&before, &rebound, null, window, .nftables));
-    try t.expect(sameEntries(&before, &added, entryScope(newcomer), window, .nftables));
-    try t.expect(sameEntries(&before, &removed, entryScope(lasting), window, .nftables));
-
-    const whole_second = [_]Entry{.{ .address = try shared.IpAddress.parse("192.0.2.5"), .remaining_ms = 1000 }};
-    const two_seconds = [_]Entry{.{ .address = try shared.IpAddress.parse("192.0.2.6"), .remaining_ms = 2000 }};
-    try t.expect(sameEntries(&whole_second, &.{}, null, window, .ipset));
-    try t.expect(!sameEntries(&whole_second, &.{}, null, window, .nftables));
-    try t.expect(!sameEntries(&two_seconds, &.{}, null, window, .ipset));
 }

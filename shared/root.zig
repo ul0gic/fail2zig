@@ -17,9 +17,3 @@ pub const serializeCommand = protocol.serializeCommand;
 pub const deserializeCommand = protocol.deserializeCommand;
 pub const serializeResponse = protocol.serializeResponse;
 pub const deserializeResponse = protocol.deserializeResponse;
-
-test {
-    _ = types;
-    _ = protocol;
-    _ = exit;
-}

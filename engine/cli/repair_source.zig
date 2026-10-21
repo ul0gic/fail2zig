@@ -148,7 +148,7 @@ pub fn execute(allocator: std.mem.Allocator, options: Options, now_us: i64, stdo
     }
 
     var diagnostic: repair.Diagnostic = .{};
-    const outcome = repair.repair(&store, allocator, .{ .jail = options.jail, .path = options.source, .token = options.token }, now_us, .{}, &diagnostic) catch |err| {
+    const outcome = repair.repair(&store, allocator, .{ .jail = options.jail, .path = options.source, .token = options.token }, now_us, &diagnostic) catch |err| {
         if (err == error.LossAlreadyRecorded) {
             reportRecorded(stdout, options, diagnostic.recorded.?) catch return .rejected;
             return .success;

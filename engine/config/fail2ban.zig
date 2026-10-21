@@ -2,7 +2,6 @@
 // Copyright (c) 2026 fail2zig maintainers
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 pub const Error = error{
     FileNotFound,
@@ -1323,9 +1322,3 @@ fn normalizeInteger(arena: std.mem.Allocator, raw: []const u8) Error!?[]const u8
     }
     return try out.toOwnedSlice(arena);
 }
-
-// Keep direct access to existing internal contracts in test builds only.
-pub const test_access = if (builtin.is_test) struct {
-    pub const merge_into = mergeInto;
-    pub const expand_tags = expandTags;
-} else struct {};

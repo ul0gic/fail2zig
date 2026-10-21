@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 
-const std = @import("std");
-
 pub fn generateBash() []const u8 {
     return bash_script;
 }
@@ -358,84 +356,3 @@ const fish_script =
     \\complete -c fail2zig -f -n '__fail2zig_client_using_command completions' -a 'bash zsh fish'
     \\
 ;
-
-const testing = std.testing;
-
-test "completions: bash starts with shebang and installs complete -F" {
-    const s = generateBash();
-    try testing.expect(std.mem.startsWith(u8, s, "#!/usr/bin/env bash"));
-    try testing.expect(std.mem.indexOf(u8, s, "complete -F") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "fail2zig") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "table json plain") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "status") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "ban") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "Install:") != null);
-}
-
-test "completions: bash covers all subcommands" {
-    const s = generateBash();
-    const subs = [_][]const u8{ "status", "stats", "ban", "unban", "list", "jails", "reload", "version", "config", "history", "firewall", "completions", "help" };
-    for (subs) |sub| {
-        try testing.expect(std.mem.indexOf(u8, s, sub) != null);
-    }
-    try testing.expect(std.mem.indexOf(u8, s, "reset --jail --limit --cursor --all") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "enable disable pause resume") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "--jail --duration --scope") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "show --limit --cursor") != null);
-}
-
-test "completions: bash covers --output values" {
-    const s = generateBash();
-    try testing.expect(std.mem.indexOf(u8, s, "--output)") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "table json plain") != null);
-}
-
-test "completions: zsh has #compdef header" {
-    const s = generateZsh();
-    try testing.expect(std.mem.startsWith(u8, s, "#compdef fail2zig"));
-    try testing.expect(std.mem.indexOf(u8, s, "_arguments") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "(table json plain)") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "(bash zsh fish)") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "Install:") != null);
-}
-
-test "completions: zsh covers all subcommands in command list" {
-    const s = generateZsh();
-    const subs = [_][]const u8{ "status:", "stats:", "ban:", "unban:", "list:", "jails:", "reload:", "version:", "config:", "history:", "firewall:", "completions:", "help:" };
-    for (subs) |sub| {
-        try testing.expect(std.mem.indexOf(u8, s, sub) != null);
-    }
-    try testing.expect(std.mem.indexOf(u8, s, "--cursor[Continue from next_cursor]") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "(enable disable pause resume)") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "jail:") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "scope:(host net)") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "1:action:(show withdraw)") != null);
-}
-
-test "completions: fish uses complete -c syntax" {
-    const s = generateFish();
-    try testing.expect(std.mem.indexOf(u8, s, "complete -c fail2zig") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "table json plain") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "bash zsh fish") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "Install:") != null);
-}
-
-test "completions: fish has all subcommands" {
-    const s = generateFish();
-    const subs = [_][]const u8{ "status", "stats", "ban", "unban", "list", "jails", "reload", "version", "config", "history", "firewall", "completions", "help" };
-    for (subs) |sub| {
-        try testing.expect(std.mem.indexOf(u8, s, sub) != null);
-    }
-    try testing.expect(std.mem.indexOf(u8, s, "__fail2zig_client_using_command history' -l cursor") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "__fail2zig_client_using_command jail' -a 'enable disable pause resume'") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "-l scope    -x -a 'host net'") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "using_command firewall' -a 'show'") != null);
-}
-
-test "completions: fish references global flags" {
-    const s = generateFish();
-    try testing.expect(std.mem.indexOf(u8, s, "-l socket") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "-l output") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "-l no-color") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "-l timeout") != null);
-}

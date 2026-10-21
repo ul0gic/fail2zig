@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
-const builtin = @import("builtin");
 const consumers = @import("../core/native_consumer.zig");
 const detection = @import("../core/native_detection_record.zig");
 const retry = @import("../core/native_retry.zig");
@@ -328,9 +327,6 @@ pub fn Methods(comptime Store: type) type {
             self.held_window /= 2;
         }
         fn deleteReleasedHeldRecords(self: *Store, fence: CleanupFence, now: i64, wrote: *bool) Error!i64 {
-            if (builtin.is_test) if (self.test_hooks.held_pass_work) |work| {
-                self.work_remaining = work;
-            };
             var position = self.held_cursor;
             const limit = position +| self.held_window;
             var deleted: usize = 0;
@@ -1555,9 +1551,8 @@ pub fn Methods(comptime Store: type) type {
         }
 
         fn sweepCandidatesTx(self: *Store, policy: RetentionPolicy) Error!RetentionOutcome {
-            const rows = if (builtin.is_test) self.test_hooks.retention_sweep_rows orelse sweep_rows else sweep_rows;
             const maximum = try self.integer("SELECT coalesce(max(rowid),0) FROM retained_subject_summaries;");
-            const high = std.math.add(i64, policy.sweep_cursor, rows) catch return error.StorageLimit;
+            const high = std.math.add(i64, policy.sweep_cursor, sweep_rows) catch return error.StorageLimit;
             if (policy.sweep_cursor < maximum) {
                 var sweep = try self.statement("UPDATE retained_subject_summaries SET candidate_sequence=CASE WHEN detail_count>?3 THEN earliest_sequence WHEN evidence_bytes>" ++ retained_evidence_limit ++ " THEN earliest_evidence_sequence END,evaluated_generation=?4 WHERE rowid>?1 AND rowid<=?2;");
                 defer sweep.deinit();
@@ -1603,9 +1598,6 @@ pub fn Methods(comptime Store: type) type {
             }
             const cutoff = std.math.sub(i64, now_us, policy.age_us) catch std.math.minInt(i64);
             var wrote = false;
-            if (builtin.is_test) if (self.test_hooks.retention_select_work) |work| {
-                self.work_remaining = work;
-            };
             const deleted = self.deleteDetailPage(current, fence, cutoff, self.retention_page, &wrote) catch |failure| {
                 if (failure != error.Interrupted or wrote) return failure;
                 return self.yieldRetention();

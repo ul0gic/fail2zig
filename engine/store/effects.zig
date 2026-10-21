@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
-const builtin = @import("builtin");
 const effects = @import("../core/native_effect.zig");
 const detection = @import("../core/native_detection_record.zig");
 const retry = @import("../core/native_retry.zig");
@@ -688,22 +687,6 @@ pub fn Methods(comptime Store: type) type {
             try targets.blob(1, &scope_key);
             try targets.int(2, dispatch_us);
             try targets.done();
-        }
-        pub fn dispatchedForTest(self: *Store, token: effects.Token, dispatch_us: i64, clock: effects.Clock) Error!void {
-            if (!builtin.is_test) @compileError("dispatchedForTest is test-only");
-            try self.beginWrite();
-            errdefer self.rollback();
-            const entry = try self.checkedEffectToken(token);
-            if (entry.status == .dispatched) return error.EffectReconciliationRequired;
-            if (entry.status != .pending) return error.StaleEffect;
-            const now = try self.effectClock(clock);
-            if (entry.desired == .finite and !entry.desired.live(now)) return error.EffectExpired;
-            try self.markDispatchedTx(token, dispatch_us);
-            try self.advanceEffectSnapshot();
-            self.noteEffectChange(token.scope_key);
-            const final = try self.commitEffectClock(clock);
-            if (entry.desired == .finite and !entry.desired.live(final)) return error.EffectExpired;
-            try self.commitEffectTransaction(true);
         }
         const SettledIntent = struct { entry: effects.Entry, status: effects.Status, settlement: effects.Settlement };
         fn settleTx(self: *Store, token: effects.Token, dispatch_us: i64, observation: effects.Observation, clock: effects.Clock) Error!SettledIntent {

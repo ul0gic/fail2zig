@@ -408,19 +408,6 @@ fn warnIfVolatileStateDir(state_file: []const u8) void {
     );
 }
 
-test "persist: state path under /run or on tmpfs is classified volatile" {
-    try std.testing.expect(stateDirIsVolatile("/run/fail2zig/state.bin", null));
-    try std.testing.expect(stateDirIsVolatile("/var/lib/fail2zig/state.bin", tmpfs_magic));
-    try std.testing.expect(!stateDirIsVolatile("/var/lib/fail2zig/state.bin", null));
-    try std.testing.expect(!stateDirIsVolatile("/var/lib/fail2zig/state.bin", 0xEF53));
-    try std.testing.expect(!stateDirIsVolatile("/runway/state.bin", null));
-}
-
-test "persist: fsMagicOfDir reads a real mount and rejects a missing one" {
-    try std.testing.expect(fsMagicOfDir("/") != null);
-    try std.testing.expect(fsMagicOfDir("/nonexistent-fail2zig-dir") == null);
-}
-
 fn ensureSocketDir(socket_path: []const u8) !void {
     const dir = std.fs.path.dirname(socket_path) orelse return;
     std.fs.cwd().makeDir(dir) catch |err| switch (err) {

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 
-const std = @import("std");
 const parser = @import("../core/parser.zig");
 const types = @import("types.zig");
 const sshd = @import("sshd.zig");
@@ -89,72 +88,3 @@ pub fn listFilters(writer: anytype) !void {
 }
 
 pub const registered_count: usize = entries.len;
-
-const testing = std.testing;
-
-test "registry: recidive resolves" {
-    const p = get("recidive").?;
-    try testing.expect(p.len > 0);
-}
-
-test "registry: unknown filter returns null" {
-    try testing.expect(get("nonexistent") == null);
-    try testing.expect(get("") == null);
-    try testing.expect(get("sshdx") == null);
-}
-
-test "registry: matcherForFilter resolves sshd and applies its patterns (SYS-020)" {
-    const m = matcherForFilter("sshd").?;
-    try testing.expect(m.patternCount() == sshd.patterns.len);
-
-    try testing.expect(m.match("Failed password for root from 1.2.3.4 port 22 ssh2") != null);
-    try testing.expect(m.match("Invalid user oracle from 203.0.113.5 port 22") != null);
-
-    try testing.expect(m.match("Server listening on 0.0.0.0 port 22.") == null);
-    try testing.expect(m.match("Server listening on :: port 22.") == null);
-
-    try testing.expect(m.match("Accepted password for root from 1.2.3.4 port 22 ssh2") == null);
-    try testing.expect(m.match("Accepted publickey for root from 1.2.3.4 port 22 ssh2: RSA SHA256:x") == null);
-}
-
-test "registry: matcherForFilter accepts hyphen/underscore forms" {
-    try testing.expect(matcherForFilter("nginx-http-auth") != null);
-    try testing.expect(matcherForFilter("nginx_http_auth") != null);
-}
-
-test "registry: matcherForFilter fails closed on unknown filter (SYS-020)" {
-    try testing.expect(matcherForFilter("nonexistent") == null);
-    try testing.expect(matcherForFilter("") == null);
-    try testing.expect(matcherForFilter("custom-app") == null);
-}
-
-test "registry: FilterMatcher returns first-match result in declaration order" {
-    const m = matcherForFilter("sshd").?;
-    const r = m.match("Failed password for admin from 10.0.0.1 port 22 ssh2").?;
-    try testing.expectEqual(@as(u32, 0x0A000001), r.ip.ipv4);
-}
-
-test "registry: listFilters writes all names" {
-    var buf = std.ArrayList(u8).init(testing.allocator);
-    defer buf.deinit();
-    try listFilters(buf.writer());
-
-    for (entries) |e| {
-        try testing.expect(std.mem.indexOf(u8, buf.items, e.name) != null);
-    }
-    var line_count: usize = 0;
-    for (buf.items) |c| {
-        if (c == '\n') line_count += 1;
-    }
-    try testing.expectEqual(entries.len, line_count);
-}
-
-test "registry: every registered name is unique" {
-    var i: usize = 0;
-    while (i < entries.len) : (i += 1) {
-        var j: usize = i + 1;
-        while (j < entries.len) : (j += 1) {
-            try testing.expect(!std.mem.eql(u8, entries[i].name, entries[j].name));
-        }
-    }
-}

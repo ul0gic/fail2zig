@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
-const builtin = @import("builtin");
 const store_mod = @import("store.zig");
 const files = @import("../core/durable_file_source.zig");
 const continuity = @import("continuity.zig");
@@ -77,13 +76,6 @@ pub const RecordedLoss = struct { wall_us: i64, inode: u64, committed_offset: u6
 
 pub const Diagnostic = struct { shape: ?Shape = null, recorded: ?RecordedLoss = null };
 
-pub const Fault = enum { before_commit, after_commit };
-pub const Hooks = if (builtin.is_test) struct {
-    context: ?*anyopaque = null,
-    after_observe: ?*const fn (?*anyopaque) void = null,
-    fail_at: ?Fault = null,
-} else struct {};
-
 pub fn tokenKey(token: []const u8) [32]u8 {
     var hash = Sha256.init(.{});
     hash.update("fail2zig-source-repair-token-v1\x00");
@@ -119,7 +111,7 @@ const Plan = struct {
     }
 };
 
-pub fn repair(store: *Store, allocator: std.mem.Allocator, request: Request, now_us: i64, hooks: Hooks, diagnostic: *Diagnostic) Error!Outcome {
+pub fn repair(store: *Store, allocator: std.mem.Allocator, request: Request, now_us: i64, diagnostic: *Diagnostic) Error!Outcome {
     diagnostic.* = .{};
     if (!validRequest(request) or now_us < 0) return error.InvalidRepairRequest;
     const key = tokenKey(request.token);
@@ -134,12 +126,11 @@ pub fn repair(store: *Store, allocator: std.mem.Allocator, request: Request, now
     const file = std.fs.File{ .handle = fd };
     defer file.close();
     const plan = observe(store, allocator, request, file, diagnostic) catch |err| switch (err) {
-        error.TokenUnknownStateMismatch, error.UnsupportedDiscontinuity => return alternative(store, allocator, request, key, file, now_us, hooks, diagnostic, err),
+        error.TokenUnknownStateMismatch, error.UnsupportedDiscontinuity => return alternative(store, allocator, request, key, file, now_us, diagnostic, err),
         else => return err,
     };
     defer plan.deinit(allocator);
-    if (builtin.is_test) if (hooks.after_observe) |hook| hook(hooks.context);
-    return commit(store, allocator, request, key, file, plan, now_us, hooks);
+    return commit(store, allocator, request, key, file, plan, now_us);
 }
 
 fn requireMigratedSchema(store: *Store) Error!void {
@@ -410,7 +401,7 @@ fn observeRemoved(store: *Store, allocator: std.mem.Allocator, request: Request,
     return plan;
 }
 
-fn alternative(store: *Store, allocator: std.mem.Allocator, request: Request, key: [32]u8, file: std.fs.File, now_us: i64, hooks: Hooks, diagnostic: *Diagnostic, original: Error) Error!Outcome {
+fn alternative(store: *Store, allocator: std.mem.Allocator, request: Request, key: [32]u8, file: std.fs.File, now_us: i64, diagnostic: *Diagnostic, original: Error) Error!Outcome {
     if (diagnostic.shape == .prefix_changed) return original;
     if (diagnostic.shape == .continuous) {
         const stat = std.posix.fstat(file.handle) catch return error.SourceUnreadable;
@@ -424,12 +415,12 @@ fn alternative(store: *Store, allocator: std.mem.Allocator, request: Request, ke
     }
     if (try observeRemoved(store, allocator, request, file)) |removed| {
         defer removed.deinit(allocator);
-        return commitRemoved(store, allocator, request, key, file, removed, now_us, hooks);
+        return commitRemoved(store, allocator, request, key, file, removed, now_us);
     }
     if (diagnostic.shape != .replaced) return original;
     const replaced = (try observeReplaced(store, allocator, request, file)) orelse return original;
     defer replaced.deinit(allocator);
-    return commit(store, allocator, request, key, file, replaced, now_us, hooks);
+    return commit(store, allocator, request, key, file, replaced, now_us);
 }
 
 fn observeReplaced(store: *Store, allocator: std.mem.Allocator, request: Request, file: std.fs.File) Error!?Plan {
@@ -497,7 +488,7 @@ fn insertLossEvent(store: *Store, event: files.LossEvent) Error!void {
     }
 }
 
-fn commitRemoved(store: *Store, allocator: std.mem.Allocator, request: Request, key: [32]u8, file: std.fs.File, plan: RemovedPlan, now_us: i64, hooks: Hooks) Error!Outcome {
+fn commitRemoved(store: *Store, allocator: std.mem.Allocator, request: Request, key: [32]u8, file: std.fs.File, plan: RemovedPlan, now_us: i64) Error!Outcome {
     var prior_cursor_sha256: [32]u8 = undefined;
     Sha256.hash(plan.prior_cursor, &prior_cursor_sha256, .{});
     const repair_size = plan.prior.observed_size orelse plan.prior.offset;
@@ -553,10 +544,8 @@ fn commitRemoved(store: *Store, allocator: std.mem.Allocator, request: Request, 
         .incarnation = plan.current_incarnation orelse [_]u8{0} ** 16,
         .outcome = outcome_removed_incarnation_acknowledged,
     }, now_us);
-    if (builtin.is_test) if (hooks.fail_at == .before_commit) return error.InjectedFailure;
     try store.commitTransaction();
     committed = true;
-    if (builtin.is_test) if (hooks.fail_at == .after_commit) return error.InjectedFailure;
     return .{
         .replayed = false,
         .source = try allocator.dupe(u8, plan.source),
@@ -632,7 +621,7 @@ fn recordRepair(store: *Store, repair_row: RepairRow, now_us: i64) Error!i64 {
     return committed_us;
 }
 
-fn commit(store: *Store, allocator: std.mem.Allocator, request: Request, key: [32]u8, file: std.fs.File, plan: Plan, now_us: i64, hooks: Hooks) Error!Outcome {
+fn commit(store: *Store, allocator: std.mem.Allocator, request: Request, key: [32]u8, file: std.fs.File, plan: Plan, now_us: i64) Error!Outcome {
     const next_cursor = std.json.stringifyAlloc(allocator, plan.next, .{}) catch return error.OutOfMemory;
     defer allocator.free(next_cursor);
     if (next_cursor.len > store_mod.Limits.cursor_bytes) return error.StorageLimit;
@@ -693,10 +682,8 @@ fn commit(store: *Store, allocator: std.mem.Allocator, request: Request, key: [3
         .incarnation = plan.next.incarnation,
         .outcome = if (plan.replaced) outcome_replaced_file_acknowledged else outcome_truncation_acknowledged,
     }, now_us);
-    if (builtin.is_test) if (hooks.fail_at == .before_commit) return error.InjectedFailure;
     try store.commitTransaction();
     committed = true;
-    if (builtin.is_test) if (hooks.fail_at == .after_commit) return error.InjectedFailure;
     return .{
         .replayed = false,
         .source = try allocator.dupe(u8, plan.source),

@@ -84,8 +84,7 @@ active).
 
 This driver stops and replaces the target's baseline service temporarily.
 Use a separately authorized disposable VM or booted container. Do not run it
-against the published lab service; use the isolated `service_user.sh` harness
-for checks beside that service.
+against the published lab service.
 
 ```bash
 tests/e2e/run-remote.sh user@disposable-systemd-host -- --hold-seconds 30
