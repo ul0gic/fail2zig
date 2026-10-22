@@ -56,8 +56,9 @@ pub const Detector = struct {
         const cidrs = try allocator.alloc(Cidr, options.ignore.len);
         defer allocator.free(cidrs);
         for (options.ignore, cidrs) |spec, *cidr| {
-            if (spec.len == 0 or spec.len > 64) return error.InvalidStaticIgnore;
-            cidr.* = Cidr.parse(spec) catch return error.InvalidStaticIgnore;
+            const address = shared.types.TimedEntry.addressText(spec);
+            if (address.len == 0 or address.len > 64) return error.InvalidStaticIgnore;
+            cidr.* = Cidr.parse(address) catch return error.InvalidStaticIgnore;
         }
         const encoded = try std.json.stringifyAlloc(allocator, cidrs, .{});
         defer allocator.free(encoded);
@@ -65,7 +66,7 @@ pub const Detector = struct {
         if (options.ignores == null) {
             const cell = try allocator.create(*ignore_set.EffectiveIgnore);
             errdefer allocator.destroy(cell);
-            cell.* = try ignore_set.EffectiveIgnore.build(allocator, options.ignore, &.{});
+            cell.* = try ignore_set.EffectiveIgnore.build(allocator, options.ignore, &.{}, &.{}, &.{}, 0);
             owned_cell = cell;
         }
         return .{

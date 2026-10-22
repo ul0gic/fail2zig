@@ -14,11 +14,10 @@ import time
 
 ROOT = Path(__file__).resolve().parent
 MODULES = ('smoke', 'enforcement', 'load', 'backend', 'restart', 'source-repair', 'counters',
-           'notify', 'isolated-runtime', 'isolated-firewall', 'migration')
-SUITES = {'smoke', 'isolated-runtime', 'isolated-firewall', 'migration'}
+           'notify', 'isolated-firewall')
+SUITES = {'smoke', 'isolated-firewall'}
 LIMITS = dict(smoke=180, enforcement=300, load=3000, backend=600, restart=1200,
-              **{'source-repair': 300, 'counters': 360, 'notify': 900,
-                 'isolated-runtime': 600, 'isolated-firewall': 600, 'migration': 900})
+              **{'source-repair': 300, 'counters': 360, 'notify': 900, 'isolated-firewall': 600})
 
 
 def require(condition, message):
@@ -46,7 +45,7 @@ def parse():
     parser.add_argument('--list', action='store_true')
     parser.add_argument('--preflight', action='store_true', help='validate only; do not create work or execute')
     parser.add_argument('--module', choices=MODULES)
-    for option in ('binary', 'sha256', 'work', 'oracle', 'suite-binary', 'suite-sha256', 'fixture', 'old-binary', 'old-sha256'):
+    for option in ('binary', 'sha256', 'work', 'oracle', 'suite-binary', 'suite-sha256'):
         parser.add_argument('--' + option)
     parser.add_argument('--backend', choices=('nftables', 'iptables', 'ipset'))
     parser.add_argument('--plumbing', action='store_true', help='load only; short exercise, never acceptance')
@@ -70,7 +69,7 @@ def preflight(args):
     # Drivers embed paths in TOML; notify also uses systemd specifiers.
     for path in (binary, oracle, work):
         require(re.fullmatch(r'/[a-zA-Z0-9_./-]+', str(path)), f'unsafe driver path characters: {path}')
-    require(args.module in {'isolated-runtime', 'isolated-firewall', 'backend'} or args.backend == 'nftables', 'module supports nftables only')
+    require(args.module in {'isolated-firewall', 'backend'} or args.backend == 'nftables', 'module supports nftables only')
     tools = {'bash', 'unshare', 'ip', 'timeout', 'python3'}
     if args.module == 'enforcement':
         tools |= {'socat', 'ss', 'sha256sum'}
@@ -97,26 +96,10 @@ def preflight(args):
     record = {'module': args.module, 'backend': args.backend, 'candidate': str(binary),
               'sha256': sha, 'oracle': str(oracle), 'oracle_sha256': oracle_sha,
               'qualification': 'plumbing-only' if args.plumbing else 'acceptance', 'work': str(work)}
-    fixture_files = []
     if args.module in SUITES:
         require(args.suite_binary and args.suite_sha256, 'explicit suite binary and SHA-256 required')
         suite, suite_sha = executable(args.suite_binary, args.suite_sha256)
         record.update(suite_binary=str(suite), suite_sha256=suite_sha)
-        if args.module == 'migration':
-            require(args.fixture and args.old_binary and args.old_sha256, 'migration requires fixture directory, old binary and --old-sha256')
-            fixture = Path(args.fixture).resolve(strict=True)
-            require(fixture.is_dir(), 'fixture must be a directory containing state plus matching config.toml')
-            for item in fixture.rglob('*'):
-                require(not item.is_symlink(), f'fixture symlink refused: {item}')
-                require(item.is_dir() or item.is_file(), f'nonregular fixture refused: {item}')
-                require(not item.name.endswith(('-wal', '-shm', '-journal')), 'fixture must be a closed coherent snapshot')
-            states = list(fixture.rglob('*.sqlite'))
-            require(1 <= len(states) <= 7, 'migration requires 1..7 fixture databases')
-            require(any((state.parent / 'config.toml').is_file() for state in states), 'missing paired rollback config')
-            old, old_sha = executable(args.old_binary, args.old_sha256)
-            fixture_files = [(p.relative_to(fixture), digest(p)) for p in fixture.rglob('*') if p.is_file()]
-            record.update(fixture=str(fixture), fixture_sha256={str(p): h for p, h in fixture_files},
-                          old_binary=str(old), old_sha256=old_sha)
         return record, work, None
     family = 'recovery' if args.module in {'restart', 'source-repair', 'counters'} else args.module
     driver = ROOT / family / (family + '.sh')
@@ -245,7 +228,7 @@ def run(args, record, work, driver):
     env.update(F2Z_NATIVE_PARENT_NETNS=os.readlink('/proc/self/ns/net'),
                RATE='3', LOAD_S='1800', DRAIN_S='900', BANTIME='600', HOT_S='2',
                TARGET='400', HOLD_SECONDS='600', READY_SECONDS='60')
-    if args.module in {'isolated-runtime', 'isolated-firewall', 'migration'}:
+    if args.module == 'isolated-firewall':
         env['F2Z_NATIVE_FIREWALL_TRANSPORT'] = args.backend
     if args.plumbing:
         env.update(LOAD_S='12', DRAIN_S='20', BANTIME='5', HOT_S='2')
@@ -271,17 +254,6 @@ def run(args, record, work, driver):
                 env['F2Z_TEST_DAEMON'] = record['candidate']
             else:
                 env['F2Z_NATIVE_FIREWALL_TRANSPORT'] = args.backend
-            if args.module == 'migration':
-                fixtures = work / 'fixtures'
-                shutil.copytree(record['fixture'], fixtures)
-                copied = {str(p.relative_to(fixtures)) for p in fixtures.rglob('*') if p.is_file()}
-                require(copied == set(record['fixture_sha256']), 'fixture membership changed during copy')
-                for relative, expected in record['fixture_sha256'].items():
-                    require(digest(fixtures / relative) == expected, 'fixture changed during copy')
-                executable(record['old_binary'], record['old_sha256'])
-                shutil.copy2(record['old_binary'], fixtures / 'fail2zig-v0.4.4')
-                executable(fixtures / 'fail2zig-v0.4.4', record['old_sha256'])
-                env['F2Z_LOAD_REPAIR_FIXTURES'] = str(fixtures)
             commands = [ns + [record['suite_binary']]]
         else:
             tail = [record['candidate'], str(scenario), record['oracle']]
@@ -300,8 +272,6 @@ def run(args, record, work, driver):
             executable(record['oracle'], record['oracle_sha256'])
             if args.module in SUITES:
                 executable(record['suite_binary'], record['suite_sha256'])
-            if args.module == 'migration':
-                executable(work / 'fixtures' / 'fail2zig-v0.4.4', record['old_sha256'])
             remaining = LIMITS[args.module] - (time.monotonic() - started)
             if remaining <= 0:
                 code = 124

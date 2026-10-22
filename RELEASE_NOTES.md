@@ -1,3 +1,179 @@
+# fail2zig v0.4.8
+
+Version 0.4.8 is the capacity, log-lifecycle and parity release, built on the
+report of a production install whose PortSentry jail stalled at 2,048 bans
+(#117, #118, #107). All jails now share one pool of 65,536 tracked addresses and
+up to 65,536 live bans; a cold restart with 65,536 installed bans reaches
+readiness in about six minutes on the lab host, a healthy stop takes one second
+because installed rules stay in the kernel, and idle cost at that size is 12 % of
+one core. It adds the configured ban list and ban origins asked for in #103, a
+guard against banning your own host or SSH session, `repair-source` without a
+stop, jail add and remove on `reload`, expiring ignore entries, per-jail
+metrics, an audit line per change, JSON logs and `support-bundle`.
+
+## Changes
+
+- Share one tracking pool across all jails. 0.4.7 split a 4,096-entry pool
+  evenly between jails and a banned address held its entry for its whole
+  bantime, so a jail with `maxretry = 1` and `bantime = 1w` filled its share at
+  2,048 bans, could no longer commit, and paused with `PendingRecordMismatch`
+  when its log was rotated. The pool is now 65,536 tracked addresses and 65,536
+  live bans daemon-wide, a live ban holds no tracking entry, a jail that does
+  reach a limit shows `waiting (RetryCapacity)` in `jails` and resumes as room
+  frees, and a rotation under `on_truncation = "restart"` no longer pauses the
+  jail (#117).
+- Tell a missing log apart from a truncated one. A log that is absent at start
+  or deleted while the daemon runs shows `missing (FileNotFound)` in `jails`
+  (JSON `source_missing`), with one warning in the daemon log; the source stays
+  healthy, protection is not degraded, and reading resumes when the file
+  appears. A deleted log that was read to its end is released after five quiet
+  minutes with nothing lost. Truncation and replacement stay continuity-loss
+  events under `on_truncation` (#118, #107).
+- Add `banip`, in `[defaults]` and per jail: addresses and CIDRs the jail bans
+  while they are listed, applied at start and on `reload`, lifted when removed.
+  Every ban now carries one origin, `detection`, `manual` or `config`, shown by
+  `list` (with `--origin` to filter), `history` and `firewall show`. `ban` on a
+  detection ban extends it and marks it `manual`; `ban` and `unban` on a config
+  ban are refused with `banned by config: edit banip` (#103).
+- Give `banip` and `ignoreip` entries an optional duration
+  (`"198.51.100.0/24 1d"`). The period starts when the entry is first applied
+  and runs once; a reload or restart does not restart it; changing the duration
+  or re-adding the entry starts a fresh one; an expired configured entry stays
+  in the file, does nothing and is listed as `expired`. Runtime entries expire
+  with `ignore add --for <duration>`, and `ignoretime` (`[defaults]` and per
+  jail, unset or `0` permanent) sets the default life of an entry without a
+  duration of its own (#103).
+- Add `ignoreself` (default `true`): the host's own IPv4 and IPv6 addresses,
+  loopback included, join every jail's effective ignore list with source
+  `self`, read at start and at every reload. `ban` refuses, before it contacts
+  the daemon, a loopback address, an address of this host or your SSH client
+  address, or a `--scope net` network containing one, and names the address;
+  `--force` overrides the guard.
+- Count failures from zero after a manual `unban`, as fail2ban does. The
+  address is banned again at `maxretry`; its escalation memory is kept.
+- Run `repair-source` through the daemon's socket while it is running, with the
+  same token, refusals and durable outcome as the offline form, so
+  acknowledging a loss under `on_truncation = "refuse"` no longer withdraws any
+  jail's rules. The offline form stays for a daemon that cannot start.
+- Add and remove jails on `reload`. An added enabled jail starts in the same
+  reload; a removed jail's bans are lifted and its elements removed last, after
+  every other change has committed, one daemon log line names it and the count,
+  and its history is kept. One invalid jail rejects the whole reload with a
+  message naming it and leaves every running jail unchanged.
+- Make room in a full tracking pool by retiring the oldest idle tracked address
+  in the same commit; live bans are never evicted. Escalation history resets to
+  the base `bantime` when the last ban ended more than `bantime_increment_decay`
+  ago (default 30 days, measured from the ban's end, `0` disables).
+- Commit admitted records in groups with one fsync, acknowledged only after the
+  fsync returns, and install pending bans in batches on nftables, ipset and
+  iptables. Ingest through one file source went from 5 to 79 records per second
+  on the lab host with bans enforced inside the burst, and `kill -9` mid-burst
+  lost or re-read no acknowledged record.
+- Confirm nftables installs by the kernel's acknowledgement of each batch and
+  detect drift from nf_tables change events, with a full audit of the owned set
+  every 60 seconds instead of a readback after every mutation. At 65,536
+  installed bans idle cost fell from 21 % to 12 % of one core; with 20,000 bans
+  the daemon spends 3.5 % of one core, 2.1 s of it per audit. A foreign element
+  in the owned set degrades protection and keeps auditing until the set is
+  clean, then recovers.
+- Leave installed rules in place at a healthy stop; every element carries its
+  kernel timeout, so a stop at 65,536 bans takes about one second instead of
+  being killed by the unit's timeout, and a restart reinstalls live bans in
+  batches (readiness in 373 s at 65,536 bans on the lab host, hours before).
+  `fail2zig firewall withdraw` removes every realized rule and holds
+  enforcement off until the next start; `status` then reports
+  `DEGRADED (FirewallWithdrawn)`.
+- Raise the state-file ceiling from 256 MiB to 1 GiB and raise the SQLite page
+  cache to 32 MiB; `status` shows the file's size and page use against the
+  ceiling and the tracking pool against its limits.
+- Expose per-jail metrics (`fail2zig_jail_bans_active`,
+  `fail2zig_jail_bans_total`, `fail2zig_jail_failures_counted_total`,
+  `fail2zig_jail_ignored_detections_total`, `fail2zig_jail_source_state`,
+  `fail2zig_jail_pool_evictions_total`) and daemon-wide
+  `fail2zig_state_file_bytes` and `fail2zig_state_file_pages`. Write one audit
+  line per `ban`, `unban`, `ignore add`, `ignore remove`, `reload`, `jail
+  pause`, `history reset` and online `repair-source`, with the target, the
+  peer UID and the outcome. Add `log_format = "json"` (restart-only) for one
+  JSON object per daemon log line.
+- Add `fail2zig support-bundle`: one redacted JSON file for a bug report with
+  versions, status, jails, stats, loss events, the effective configuration and
+  its SHA-256, state-file page and per-table sizes, kernel readback counts,
+  memory, host basics and the last warnings and errors from the daemon log;
+  addresses are hashed unless `--include-addresses` is given.
+- Give every command a help page (`fail2zig help <command>` or
+  `<command> --help`, the offline tools included); `help <typo>` and
+  `fail2zig <typo>` exit 2 with a suggestion; the daemon's `--help` and the
+  client's `help` list the same commands. `ban --duration` accepts the
+  configuration's duration syntax as well as seconds. `jails` help documents
+  the source-health words.
+- Print admin refusals that are not outcome objects on standard error; an
+  `ignore add --unban` lifts the ban from `list` at once and reports a disabled
+  or paused jail; `support-bundle` runs as root and reports journalctl's own
+  reason when the journal cannot be read.
+- Add `docs/security/threat-model.md`: assets, trust boundaries, each threat
+  with its severity, control and the invariant or decision record behind it.
+
+## Upgrade and compatibility
+
+The first start upgrades a state last written by v0.4.7 (schema 25) to schema
+26, which adds ban origins (every existing ban gets `detection`), ignore-entry
+deadlines and the table of timed configuration entries, after writing
+`<state_file>.pre26-backup`; the backup needs free space of twice the database
+size plus 32 MiB and the daemon refuses to start if that file already exists.
+The upgrade is one transaction and its schema steps do not scan populated
+tables, so its cost does not grow with the state; it was proven on a 65,536-ban
+state. v0.4.7 is the only supported upgrade source: states last written by
+v0.4.6 or earlier are not an upgrade path and go through v0.4.7 first. v0.4.7
+and older binaries refuse schema 26 with `UnsupportedSchema`; rollback restores
+the backup with the v0.4.7 binary. The first start also rekeys saved detection
+generations once, since the per-jail subject share no longer exists, and logs
+that it did.
+
+The default `native_memory_ceiling_mb` is now 512 (the plan for 65,536 live bans
+is about 337 MiB with two enforcing jails); a configuration that sets 256
+explicitly must raise it or the daemon refuses with `NativeMemoryAdmission`. A
+healthy stop now leaves installed rules in the kernel; run `firewall withdraw`
+before stopping when the table must be empty. Ban deadlines, source
+checkpoints, SQLite WAL/FULL durability and firewall ownership are unchanged;
+nftables, iptables and ipset remain supported. Existing plain columns and JSON
+keys keep their meaning; `list`, `history` and `firewall show` add `origin`,
+`ignore list` adds `expires`, `jails` adds `source_missing`, and `status` adds
+the state-file and tracking-pool fields.
+
+## Known limitations
+
+- `status` does not yet list a missing log file; `jails` and the
+  `fail2zig_jail_source_state` metric do.
+- The state file never shrinks; freed pages are reused inside it, and a file
+  past 1 GiB is refused at start.
+- The per-ban footprint did not shrink in this release (about 6 to 7 KiB of
+  state per live ban); 65,536 live bans plus a day of history fit under the
+  ceiling with headroom.
+- The full-pool eviction path was not exercised end to end at the gate; the
+  65,536-address fill ran past its time budget. The mechanism is proven on the
+  component rig only.
+- Large curated lists are not a job for bans (each ban is tracked, owned and
+  audited); a native list loader is under design in discussion #120.
+- Drift detection by events is nftables-only; ipset and iptables keep their
+  readback cadence.
+
+## Verification scope
+
+One campaign on `f2z-target` (Debian 13, kernel 6.12, nftables, PortSentry
+2.0.7; 8 vCPU and 16 GiB for the large-state runs) covered: the schema 26
+upgrade of a 2,040-ban and a 65,536-ban v0.4.7 state; a 65,536-ban cold restart,
+idle and stop; a 60-second PortSentry burst against the pre-change binary with
+`kill -9` mid-burst; readback at 20,000 elements; the retry behaviors (re-ban
+after unban, decay); `banip`, origins and timed entries; `ignoreself` and the
+lockout guard over SSH; online `repair-source`; jail add and remove on reload
+with kernel readback; `nft flush set` recovery; a rejected reload; the metrics,
+audit lines and JSON log format; and the missing, truncated and replaced log
+cases. The firewall and daemon suites ran on the development host. Cross-builds
+for the other targets do not imply live-kernel qualification there.
+
+The five static Linux targets remain x86_64, aarch64, ARMv7 hard float, MIPS32r2
+big endian and MIPS32r2 little endian. Verify downloads against `SHA256SUMS`.
+
 # fail2zig v0.4.7
 
 Version 0.4.7 is a stabilization release built on the reports from a production

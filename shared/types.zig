@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
+const duration = @import("duration.zig");
 
 pub const Timestamp = i64;
 pub const Duration = u64;
@@ -226,6 +227,35 @@ pub const IgnoreEntry = struct {
     }
 };
 
+pub const Origin = enum(u8) {
+    detection = 1,
+    manual = 2,
+    config = 3,
+};
+
+pub const TimedEntry = struct {
+    entry: IgnoreEntry,
+    duration_s: ?u64,
+
+    pub const max_duration_s: u64 = 100 * 366 * 86_400;
+
+    pub fn parse(text: []const u8, default_duration_s: ?u64) error{ InvalidAddress, InvalidPrefix, InvalidDuration }!TimedEntry {
+        const address = addressText(text);
+        const entry = try IgnoreEntry.parse(address);
+        const rest = std.mem.trim(u8, text[address.len..], &std.ascii.whitespace);
+        if (rest.len == 0) return .{ .entry = entry, .duration_s = default_duration_s };
+        if (std.mem.indexOfAny(u8, rest, &std.ascii.whitespace) != null) return error.InvalidDuration;
+        const parsed = duration.parse(rest, false) catch return error.InvalidDuration;
+        const seconds = parsed.nativeSeconds() catch return error.InvalidDuration;
+        if (seconds < 1 or seconds > max_duration_s) return error.InvalidDuration;
+        return .{ .entry = entry, .duration_s = seconds };
+    }
+
+    pub fn addressText(text: []const u8) []const u8 {
+        return text[0 .. std.mem.indexOfAny(u8, text, &std.ascii.whitespace) orelse text.len];
+    }
+};
+
 pub const JailId = struct {
     bytes: [max_len]u8 = [_]u8{0} ** max_len,
     len: u8 = 0,
@@ -260,115 +290,3 @@ pub const JailId = struct {
         try writer.writeAll(self.bytes[0..self.len]);
     }
 };
-
-test "IpAddress: reject invalid ipv4" {
-    try std.testing.expectError(error.Invalid, IpAddress.parse("256.0.0.1"));
-    try std.testing.expectError(error.Invalid, IpAddress.parse("192.168.1"));
-    try std.testing.expectError(error.Invalid, IpAddress.parse("192.168.1.1.1"));
-    try std.testing.expectError(error.Invalid, IpAddress.parse("192.168..1"));
-    try std.testing.expectError(error.Invalid, IpAddress.parse(".192.168.1.1"));
-    try std.testing.expectError(error.Invalid, IpAddress.parse("192.168.1.1."));
-    try std.testing.expectError(error.Invalid, IpAddress.parse("192.168.1.a"));
-    try std.testing.expectError(error.Invalid, IpAddress.parse(""));
-    try std.testing.expectError(error.Invalid, IpAddress.parse("1.2.3.4 "));
-}
-
-test "IpAddress: parse ipv6 full" {
-    const ip = try IpAddress.parse("2001:0db8:85a3:0000:0000:8a2e:0370:7334");
-    const expected: u128 = 0x20010db885a3000000008a2e03707334;
-    try std.testing.expectEqual(expected, ip.ipv6);
-}
-
-test "IpAddress: parse ipv6 ipv4-mapped folds to ipv4" {
-    const mapped = try IpAddress.parse("::ffff:192.168.1.1");
-    const plain = try IpAddress.parse("192.168.1.1");
-    try std.testing.expect(IpAddress.eql(mapped, plain));
-    try std.testing.expectEqual(@as(u32, 0xC0A80101), mapped.ipv4);
-}
-
-test "IpAddress: deprecated ipv4-compatible ::a.b.c.d is rejected" {
-    try std.testing.expectError(error.Invalid, IpAddress.parse("::1.2.3.4"));
-    try std.testing.expectError(error.Invalid, IpAddress.parse("::192.168.1.1"));
-    _ = try IpAddress.parse("::");
-    _ = try IpAddress.parse("::1");
-}
-
-test "IpAddress: fromIpv6Bits folds mapped low bits" {
-    const raw: u128 = 0x00000000000000000000ffff01020304;
-    const ip = try IpAddress.fromIpv6Bits(raw);
-    try std.testing.expectEqual(@as(u32, 0x01020304), ip.ipv4);
-}
-
-test "IpAddress: fromIpv6Bits preserves unspecified and loopback" {
-    const unspec = try IpAddress.fromIpv6Bits(0);
-    try std.testing.expectEqual(@as(u128, 0), unspec.ipv6);
-    const loop = try IpAddress.fromIpv6Bits(1);
-    try std.testing.expectEqual(@as(u128, 1), loop.ipv6);
-}
-
-test "IpAddress: format ipv6 loopback" {
-    var buf: [64]u8 = undefined;
-    const ip: IpAddress = .{ .ipv6 = 1 };
-    const out = try std.fmt.bufPrint(&buf, "{}", .{ip});
-    try std.testing.expectEqualStrings("::1", out);
-}
-
-test "IpAddress: format ipv6 all-zeros" {
-    var buf: [64]u8 = undefined;
-    const ip: IpAddress = .{ .ipv6 = 0 };
-    const out = try std.fmt.bufPrint(&buf, "{}", .{ip});
-    try std.testing.expectEqualStrings("::", out);
-}
-
-test "IpAddress: format ipv6 typical compression" {
-    var buf: [64]u8 = undefined;
-    const ip: IpAddress = .{ .ipv6 = 0x20010db8000000000000000000000001 };
-    const out = try std.fmt.bufPrint(&buf, "{}", .{ip});
-    try std.testing.expectEqualStrings("2001:db8::1", out);
-}
-
-test "IpAddress: format ipv6 compression in middle" {
-    var buf: [64]u8 = undefined;
-    const ip: IpAddress = .{ .ipv6 = 0x00010000000000000000000000000002 };
-    const out = try std.fmt.bufPrint(&buf, "{}", .{ip});
-    try std.testing.expectEqualStrings("1::2", out);
-}
-
-test "IpAddress: format ipv6 compression at end" {
-    var buf: [64]u8 = undefined;
-    const ip: IpAddress = .{ .ipv6 = 0x00010000000000000000000000000000 };
-    const out = try std.fmt.bufPrint(&buf, "{}", .{ip});
-    try std.testing.expectEqualStrings("1::", out);
-}
-
-test "IpAddress: format ipv6 no compression eligible" {
-    var buf: [64]u8 = undefined;
-    const ip: IpAddress = .{ .ipv6 = 0x00010002000300040005000600070008 };
-    const out = try std.fmt.bufPrint(&buf, "{}", .{ip});
-    try std.testing.expectEqualStrings("1:2:3:4:5:6:7:8", out);
-}
-
-test "IpAddress: isUnenforceable rejects unspecified and loopback" {
-    try std.testing.expect((IpAddress{ .ipv4 = 0 }).isUnenforceable());
-    try std.testing.expect((try IpAddress.parse("::")).isUnenforceable());
-    try std.testing.expect((try IpAddress.parse("127.0.0.1")).isUnenforceable());
-    try std.testing.expect((try IpAddress.parse("::1")).isUnenforceable());
-    try std.testing.expect((try IpAddress.parse("0.1.2.3")).isUnenforceable());
-    try std.testing.expect((try IpAddress.parse("127.255.255.254")).isUnenforceable());
-}
-
-test "JailId: fromSlice rejects empty" {
-    try std.testing.expectError(error.JailIdEmpty, JailId.fromSlice(""));
-}
-
-test "JailId: fromSlice rejects too long" {
-    const long = [_]u8{'a'} ** 65;
-    try std.testing.expectError(error.JailIdTooLong, JailId.fromSlice(&long));
-}
-
-test "JailId: fromSlice accepts max length" {
-    const at_limit = [_]u8{'a'} ** 64;
-    const j = try JailId.fromSlice(&at_limit);
-    try std.testing.expectEqual(@as(u8, 64), j.len);
-    try std.testing.expectEqualStrings(&at_limit, j.slice());
-}

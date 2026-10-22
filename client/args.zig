@@ -49,9 +49,11 @@ pub const Command = union(enum) {
     config: void,
     history: HistoryArgs,
     firewall: FirewallArgs,
+    firewall_withdraw: void,
     jail_admin: JailAdminArgs,
     history_reset: HistoryResetArgs,
     ignore: IgnoreArgs,
+    diag_clock: DiagClockArgs,
 
     pub const ScopeKind = enum { host, net };
     pub const ScopeArgs = struct {
@@ -64,6 +66,7 @@ pub const Command = union(enum) {
         jail: ?[]const u8 = null,
         duration_s: ?u64 = null,
         scope: ?ScopeArgs = null,
+        force: bool = false,
     };
 
     pub const UnbanArgs = struct {
@@ -90,15 +93,24 @@ pub const Command = union(enum) {
         address: ?[]const u8 = null,
         jail: ?[]const u8 = null,
         unban: bool = false,
+        for_s: ?u64 = null,
     };
 
     pub const ListArgs = struct {
         jail: ?[]const u8 = null,
         details: bool = false,
         sort: bool = false,
+        origin: ?shared.types.Origin = null,
     };
 
     pub const DetailArgs = struct { details: bool = false };
+
+    pub const DiagClockAction = enum { show, rate, advance };
+    pub const DiagClockArgs = union(DiagClockAction) {
+        show: void,
+        rate: u32,
+        advance: u64,
+    };
 
     pub const HistoryArgs = struct {
         jail: ?[]const u8 = null,
@@ -216,6 +228,10 @@ pub fn parse(argv: []const []const u8, diag: *ParseDiag) Error!Parsed {
     i += 1;
     const rest = argv[i..];
 
+    for (rest) |a| if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+        return Parsed{ .globals = globals, .command = .{ .help = cmd_str } };
+    };
+
     if (std.mem.eql(u8, cmd_str, "status")) {
         return parseDetailsOnly(rest, "status", &globals, diag, .status);
     }
@@ -259,6 +275,9 @@ pub fn parse(argv: []const []const u8, diag: *ParseDiag) Error!Parsed {
     }
     if (std.mem.eql(u8, cmd_str, "ignore")) {
         return parseIgnore(rest, &globals, diag);
+    }
+    if (std.mem.eql(u8, cmd_str, "diag")) {
+        return parseDiagClock(rest, &globals, diag);
     }
     if (std.mem.eql(u8, cmd_str, "list")) {
         return parseList(rest, &globals, diag);
@@ -329,17 +348,21 @@ fn parseBan(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Error
         if (std.mem.eql(u8, a, "--duration")) {
             k += 1;
             if (k >= rest.len) {
-                diag.set("flag --duration requires a value (seconds)", .{});
+                diag.set("flag --duration requires a value (seconds, or a duration such as 2m or 1h30m)", .{});
                 return error.MissingValue;
             }
-            args.duration_s = std.fmt.parseInt(u64, rest[k], 10) catch {
-                diag.set("invalid --duration value '{s}' (expected positive integer seconds)", .{rest[k]});
+            args.duration_s = parseForSeconds(rest[k]) orelse {
+                diag.set("invalid --duration value '{s}' (expected seconds, or a duration such as 2m or 1h30m)", .{rest[k]});
                 return error.InvalidValue;
             };
             continue;
         }
         if (std.mem.eql(u8, a, "--scope")) {
             args.scope = try parseScope(rest, &k, diag);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--force")) {
+            args.force = true;
             continue;
         }
         if (std.mem.startsWith(u8, a, "--")) {
@@ -355,7 +378,7 @@ fn parseBan(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Error
         return error.TooManyArguments;
     }
     if (!have_ip) {
-        diag.set("command 'ban' requires an IP address (usage: ban <ip> --jail <name> [--duration <s>] [--scope host|net <cidr>])", .{});
+        diag.set("command 'ban' requires an IP address (usage: ban <ip> --jail <name> [--duration <s>] [--scope host|net <cidr>] [--force])", .{});
         return error.MissingArgument;
     }
     if (args.jail == null) {
@@ -408,6 +431,69 @@ fn parseUnban(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Err
     return Parsed{ .globals = globals.*, .command = .{ .unban = args } };
 }
 
+const diag_clock_usage = "diag clock show | diag clock rate <0..1000> | diag clock advance <seconds>";
+const max_diag_rate: u32 = 1000;
+const max_diag_advance_s: u64 = 366 * std.time.s_per_day;
+
+fn parseDiagClock(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Error!Parsed {
+    var echo: [format.diagnostic_max_bytes]u8 = undefined;
+    var words: [3][]const u8 = undefined;
+    var count: usize = 0;
+    var k: usize = 0;
+    while (k < rest.len) : (k += 1) {
+        const a = rest[k];
+        if (try takeTrailingGlobal(a, rest, &k, globals, diag)) continue;
+        if (std.mem.startsWith(u8, a, "--")) {
+            diag.set("unknown flag for 'diag': {s}", .{format.escapeArgument(&echo, a)});
+            return error.UnknownFlag;
+        }
+        if (count == words.len) {
+            diag.set("too many arguments for 'diag' (usage: {s})", .{diag_clock_usage});
+            return error.TooManyArguments;
+        }
+        words[count] = a;
+        count += 1;
+    }
+    if (count < 2 or !std.mem.eql(u8, words[0], "clock")) {
+        diag.set("command 'diag' requires a clock subcommand (usage: {s})", .{diag_clock_usage});
+        return error.MissingArgument;
+    }
+    const action = std.meta.stringToEnum(Command.DiagClockAction, words[1]) orelse {
+        diag.set("unknown diag clock subcommand '{s}' (expected: show, rate, advance)", .{format.escapeArgument(&echo, words[1])});
+        return error.InvalidValue;
+    };
+    const args: Command.DiagClockArgs = switch (action) {
+        .show => blk: {
+            if (count != 2) {
+                diag.set("command 'diag clock show' takes no arguments", .{});
+                return error.TooManyArguments;
+            }
+            break :blk .show;
+        },
+        .rate, .advance => blk: {
+            if (count != 3) {
+                diag.set("command 'diag clock {s}' requires one value (usage: {s})", .{ @tagName(action), diag_clock_usage });
+                return error.MissingArgument;
+            }
+            if (action == .rate) {
+                const value: ?u32 = std.fmt.parseInt(u32, words[2], 10) catch null;
+                if (value == null or value.? > max_diag_rate) {
+                    diag.set("invalid rate '{s}' (expected integer 0..1000)", .{format.escapeArgument(&echo, words[2])});
+                    return error.InvalidValue;
+                }
+                break :blk .{ .rate = value.? };
+            }
+            const seconds: ?u64 = std.fmt.parseInt(u64, words[2], 10) catch null;
+            if (seconds == null or seconds.? == 0 or seconds.? > max_diag_advance_s) {
+                diag.set("invalid advance '{s}' (expected positive integer seconds up to 366 days)", .{format.escapeArgument(&echo, words[2])});
+                return error.InvalidValue;
+            }
+            break :blk .{ .advance = seconds.? };
+        },
+    };
+    return Parsed{ .globals = globals.*, .command = .{ .diag_clock = args } };
+}
+
 fn parseIgnore(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Error!Parsed {
     var echo: [format.diagnostic_max_bytes]u8 = undefined;
     var action: ?Command.IgnoreAction = null;
@@ -446,6 +532,18 @@ fn parseIgnore(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Er
             out.unban = true;
             continue;
         }
+        if (chosen == .add and std.mem.eql(u8, a, "--for")) {
+            k += 1;
+            if (k >= rest.len) {
+                diag.set("flag --for requires a value (a duration such as 2m or 1h30m)", .{});
+                return error.MissingValue;
+            }
+            out.for_s = parseForSeconds(rest[k]) orelse {
+                diag.set("invalid --for value '{s}' (expected a duration such as 2m or 1h30m)", .{format.escapeArgument(&echo, rest[k])});
+                return error.InvalidValue;
+            };
+            continue;
+        }
         if (std.mem.startsWith(u8, a, "--")) {
             diag.set("unknown flag for 'ignore {s}': {s}", .{ name, format.escapeArgument(&echo, a) });
             return error.UnknownFlag;
@@ -464,7 +562,7 @@ fn parseIgnore(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Er
     if (chosen == .list) return Parsed{ .globals = globals.*, .command = .{ .ignore = out } };
 
     const address = out.address orelse {
-        const usage = if (chosen == .add) "ignore add <address|cidr> --jail <name> [--unban]" else "ignore remove <address|cidr> --jail <name>";
+        const usage = if (chosen == .add) "ignore add <address|cidr> --jail <name> [--unban] [--for <duration>]" else "ignore remove <address|cidr> --jail <name>";
         diag.set("command 'ignore {s}' requires an address (usage: {s})", .{ name, usage });
         return error.MissingArgument;
     };
@@ -480,6 +578,14 @@ fn parseIgnore(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Er
         return error.InvalidValue;
     };
     return Parsed{ .globals = globals.*, .command = .{ .ignore = out } };
+}
+
+fn parseForSeconds(text: []const u8) ?u64 {
+    const parsed = shared.duration.parse(text, false) catch return null;
+    if (parsed != .finite) return null;
+    const seconds = parsed.nativeSeconds() catch return null;
+    if (seconds == 0 or seconds > shared.types.TimedEntry.max_duration_s) return null;
+    return seconds;
 }
 
 fn parseScope(rest: []const []const u8, idx: *usize, diag: *ParseDiag) Error!Command.ScopeArgs {
@@ -604,6 +710,19 @@ fn parseList(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Erro
             args.sort = true;
             continue;
         }
+        if (std.mem.eql(u8, a, "--origin")) {
+            k += 1;
+            if (k >= rest.len) {
+                diag.set("flag --origin requires a value: detection, manual or config", .{});
+                return error.MissingValue;
+            }
+            args.origin = std.meta.stringToEnum(shared.types.Origin, rest[k]) orelse {
+                var echo: [format.diagnostic_max_bytes]u8 = undefined;
+                diag.set("invalid --origin value '{s}' (expected: detection, manual, config)", .{format.escapeArgument(&echo, rest[k])});
+                return error.InvalidValue;
+            };
+            continue;
+        }
         if (std.mem.startsWith(u8, a, "--")) {
             diag.set("unknown flag for 'list': {s}", .{a});
             return error.UnknownFlag;
@@ -670,8 +789,12 @@ fn parseHistory(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) E
 }
 
 fn parseFirewall(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Error!Parsed {
+    if (rest.len > 0 and std.mem.eql(u8, rest[0], "withdraw")) {
+        try expectNoPositional(rest[1..], "firewall withdraw", diag, globals);
+        return Parsed{ .globals = globals.*, .command = .firewall_withdraw };
+    }
     if (rest.len == 0 or !std.mem.eql(u8, rest[0], "show")) {
-        diag.set("command 'firewall' requires 'show' (usage: firewall show [--details] [--limit <n>] [--cursor <token>])", .{});
+        diag.set("command 'firewall' requires 'show' or 'withdraw' (usage: firewall show [--details] [--limit <n>] [--cursor <token>] | firewall withdraw)", .{});
         return error.MissingArgument;
     }
 
@@ -811,6 +934,10 @@ pub const known_commands = [_][]const u8{
     "ignore",
     "completions",
     "help",
+    "migrate",
+    "rule-test",
+    "repair-source",
+    "support-bundle",
 };
 
 pub fn closestCommand(input: []const u8) ?[]const u8 {
@@ -867,21 +994,27 @@ pub const help_top =
     \\COMMANDS:
     \\    status              Show protection-first daemon status (--details for identifiers/metrics)
     \\    stats               Show the retained enforcement statistics snapshot
-    \\    ban <ip>            Manually ban an IP
-    \\    unban <ip>          Manually unban an IP
+    \\    jails               List configured jails with source health (--details for thresholds)
+    \\    list                List active bans (--jail, --origin filters; --details for counts)
+    \\    ban <ip>            Manually ban an address or, with --scope net, a network
+    \\    unban <ip>          Manually unban an address or network
     \\    ignore <sub>        Manage per-jail exclusions: add, remove, list
-    \\    list                List active bans (--jail filter; --details for counts)
-    \\    jails               List configured jails (--details for thresholds)
-    \\    reload              Apply supported changes live; restart-only settings require restart
-    \\    version             Show client and daemon version
-    \\    config              Show the daemon's effective configuration
     \\    history             Page through confirmed ban history
-    \\    firewall show       Inspect sampled fail2zig-owned kernel protection
     \\    history reset <ip>  Reset an address's ban history in one jail or all jails
+    \\    firewall show       Inspect sampled fail2zig-owned kernel protection
+    \\    firewall withdraw   Remove fail2zig's kernel rules and hold enforcement off until restart
     \\    jail <action> <n>   enable, disable, pause or resume a jail
-    \\    repair-source       Acknowledge a truncated or replaced file source (daemon stopped)
+    \\    reload              Apply supported configuration changes live
+    \\    config              Show the daemon's effective configuration
+    \\    version             Show client and daemon versions
     \\    completions <sh>    Emit shell-completion script (bash|zsh|fish)
-    \\    help [command]      Show help for a command
+    \\    help [command]      Show help for a command; <command> --help does the same
+    \\
+    \\OFFLINE TOOLS (no daemon needed):
+    \\    rule-test           Evaluate a log, one line or the journal against a rule
+    \\    migrate <sub>       Inspect, plan and carry out a fail2ban migration
+    \\    repair-source       Acknowledge a truncated or replaced file source
+    \\    support-bundle      Write a redacted diagnostic bundle for a bug report
     \\
     \\GLOBAL FLAGS:
     \\    --socket <path>     Unix socket path (default: /run/fail2zig/fail2zig.sock)
@@ -893,16 +1026,140 @@ pub const help_top =
     \\
     \\EXAMPLES:
     \\    fail2zig status
-    \\    fail2zig stats
-    \\    fail2zig ban 192.0.2.10 --jail sshd --duration 3600
-    \\    fail2zig ban 192.0.2.10 --jail sshd --scope net 192.0.2.0/24
-    \\    fail2zig ignore add 198.51.100.20 --jail sshd
-    \\    fail2zig ignore list --jail sshd
-    \\    fail2zig jail pause sshd
+    \\    fail2zig jails --details
     \\    fail2zig list --jail sshd --output json
+    \\    fail2zig list --origin config
+    \\    fail2zig ban 192.0.2.10 --jail sshd --duration 1h
+    \\    fail2zig ban 192.0.2.10 --jail sshd --scope net 192.0.2.0/24
+    \\    fail2zig unban 192.0.2.10 --jail sshd
+    \\    fail2zig ignore add 198.51.100.20 --jail sshd --for 2h
+    \\    fail2zig ignore list --jail sshd
     \\    fail2zig history --jail sshd --limit 50
+    \\    fail2zig jail pause sshd
     \\    fail2zig firewall show --limit 50
+    \\    fail2zig rule-test --file /var/log/auth.log --service sshd --output table
     \\    fail2zig completions bash > /etc/bash_completion.d/fail2zig
+    \\
+;
+
+pub const help_status =
+    \\fail2zig status — show protection, storage and source health
+    \\
+    \\USAGE:
+    \\    fail2zig status [--details]
+    \\
+    \\FLAGS:
+    \\    --details           Add uptime, memory and memory plan, parse rate, generation
+    \\                        and the tracking pool to the summary rows
+    \\
+    \\ROWS:
+    \\    Protection          active, log-only, mixed, unknown or DEGRADED (cause)
+    \\    Active bans         What the kernel inventory holds right now
+    \\    History             Retained confirmed events (maintenance trims them)
+    \\    Knowledge           fresh, stale or absent, with the age of the last readback
+    \\    Pending             Bans and removals the daemon has not yet confirmed
+    \\    Storage / Cause     Storage phase and the diagnosed cause when not healthy
+    \\    Sources             Count of unhealthy sources; run jails for the per-jail view
+    \\    Paused / Repair     Each paused file source and the exact repair command
+    \\    State file          Size and page use against the configured ceiling
+    \\
+    \\Protection is DEGRADED while any source is paused, storage is recovering or the
+    \\kernel readback is stale; the Cause row says which. A missing log file does not
+    \\degrade protection: jails shows it as missing (FileNotFound).
+    \\
+    \\--output json carries every field; --output plain prints one key per line.
+    \\Exit 0 is reported state, not healthy protection: read the Protection row.
+    \\
+;
+
+pub const help_reload =
+    \\fail2zig reload — apply the configuration file to the running daemon
+    \\
+    \\USAGE:
+    \\    fail2zig reload
+    \\
+    \\The daemon reads its configuration file again and reports one outcome:
+    \\    noop                Nothing changed
+    \\    applied             Every change is live
+    \\    rejected            A jail failed validation (the message names it);
+    \\                        every running jail is unchanged
+    \\    restart_required    Only restart-only keys changed; reasons lists them
+    \\
+    \\Live keys: maxretry, bantime, bantime_kind, bantime_increment and its decay,
+    \\ignoreip, banip and their durations, ignoreself, ignoretime, log_level and a
+    \\custom jail's ignore_file. Adding an enabled jail starts it in the same reload;
+    \\removing a jail lifts its bans and keeps its history. log_format is restart-only;
+    \\the reasons list names every restart-only key that changed.
+    \\
+    \\An ignoreip edit applies from the next event and never alters an existing ban;
+    \\a banip edit bans or lifts at once.
+    \\
+;
+
+pub const help_version =
+    \\fail2zig version — show the client and daemon versions
+    \\
+    \\USAGE:
+    \\    fail2zig version
+    \\
+    \\Prints the client version, then asks the running daemon for its own; the two
+    \\differ until a restart after an upgrade. Exit 3 when the daemon is unreachable.
+    \\fail2zig --version prints the client version without contacting the daemon.
+    \\
+;
+
+pub const help_migrate =
+    \\fail2zig migrate — move from fail2ban in journaled, resumable steps
+    \\
+    \\USAGE:
+    \\    fail2zig migrate inspect --source-dir <dir> [--output json|table]
+    \\    fail2zig migrate snapshot --source-db <file> --staging-dir <dir> [--output json|table]
+    \\    fail2zig migrate plan --source-dir <dir> [--source-db <file> --staging-dir <dir>] --out <plan.json>
+    \\                          [--continuity lossless|reset-replay] [--replay-window <seconds>]
+    \\                          [--runtime-socket <path>] [--output json|table]
+    \\    fail2zig migrate validate --plan <plan.json> [--source-dir <dir>] [--snapshot <file>] [--output json|table]
+    \\    fail2zig migrate cutover --plan <plan.json> --state-file <db> --staging-dir <dir>
+    \\                             --backend nftables|ipset|iptables [--socket <path>] [--run-id <hex>] [--output json|table]
+    \\    fail2zig migrate status --plan <plan.json> --state-file <db> --staging-dir <dir> --run-id <hex> [--output json|table]
+    \\    fail2zig migrate rollback --plan <plan.json> --state-file <db> --staging-dir <dir> --backend <b> --run-id <hex>
+    \\                              [--source-verified] [--socket <path>] [--output json|table]
+    \\
+    \\inspect, snapshot, plan and validate are read-only preparation. cutover stages
+    \\the destination with the daemon stopped and activates it through the daemon; it
+    \\is journaled, prints the --run-id command to resume when the socket is
+    \\unreachable, and a rerun classifies the journal instead of replaying it. status
+    \\reports a run. rollback reverses an activated run in two journaled phases.
+    \\The staging directory must be private (0700) and non-volatile.
+    \\See docs/operations/command-migration.md for the full procedure.
+    \\
+;
+
+pub const help_rule_test =
+    \\fail2zig rule-test — evaluate log input against one rule, offline
+    \\
+    \\USAGE:
+    \\    fail2zig rule-test (--file <path> | --record "<line>" | --journal [<match>...])
+    \\                       (--service <name> | --rule-file <path>)
+    \\                       [--config <path>] [--jail <name>]
+    \\                       [--timestamp iso8601|syslog|epoch_seconds|common_log|undated]
+    \\                       [--time-zone <id>] [--tz-offset <minutes>] [--year <yyyy>]
+    \\                       [--encoding utf8|ascii|latin1|utf16le|utf16be|utf32le|utf32be]
+    \\                       [--identity raw|dns --dns-server <ip:port>] [--ignore <cidr>]...
+    \\                       [--max-lines <n>] [--limit <n>] [--output json|table] [--print-lines]
+    \\                       [--now <epoch-seconds>] [--window <seconds>]
+    \\
+    \\Uses the daemon's own decoder, time admission and detectors against exactly one
+    \\input and one rule: a compiled service (--service) or a native rule file
+    \\(--rule-file). It opens no state, no firewall and no socket. --config with
+    \\--jail takes the timestamp, time zone and ignore settings from a configuration.
+    \\Samples report match, miss, ignore or reject with the reason, identity and
+    \\event time; --print-lines includes the raw lines. Exit 0 when the input was
+    \\processed (even with zero matches), 1 when the rule, configuration or input was
+    \\refused, 2 on usage errors.
+    \\
+    \\EXAMPLES:
+    \\    fail2zig rule-test --file /var/log/auth.log --service sshd --output table
+    \\    fail2zig rule-test --record "Failed password for root from 192.0.2.10 port 22 ssh2" --service sshd
     \\
 ;
 
@@ -910,16 +1167,24 @@ pub const help_ban =
     \\fail2zig ban — manually ban an IP address
     \\
     \\USAGE:
-    \\    fail2zig ban <ip> --jail <name> [--duration <seconds>] [--scope host|net <cidr>]
+    \\    fail2zig ban <ip> --jail <name> [--duration <duration>] [--scope host|net <cidr>] [--force]
     \\
     \\ARGS:
     \\    <ip>                IPv4 or IPv6 address (e.g. 192.0.2.10, 2001:db8::1)
     \\
     \\FLAGS:
     \\    --jail <name>       Target jail (required)
-    \\    --duration <s>      Ban duration in seconds (uses jail default if omitted)
+    \\    --duration <d>      Ban length: seconds, or a duration such as 2m or 1h30m
+    \\                        (the jail's bantime if omitted)
     \\    --scope host        Ban the single address (default)
     \\    --scope net <cidr>  Ban the given network instead of the host
+    \\    --force             Ban even a loopback address, an address of this host,
+    \\                        or your SSH peer address
+    \\
+    \\Without --force, ban refuses a target that is or contains a loopback address,
+    \\an address of this host, or the client address of the SSH session it runs in.
+    \\Banning an address on the jail's ignore list is applied with a warning.
+    \\A ban set by the jail's banip list cannot be changed here: edit banip.
     \\
 ;
 
@@ -943,10 +1208,12 @@ pub const help_list =
     \\fail2zig list — list active bans
     \\
     \\USAGE:
-    \\    fail2zig list [--jail <name>] [--details] [--sort]
+    \\    fail2zig list [--jail <name>] [--origin detection|manual|config] [--details] [--sort]
     \\
     \\FLAGS:
     \\    --jail <name>       Filter by jail
+    \\    --origin <origin>   Show only bans of one origin: detection, manual or config;
+    \\                        config also shows timed banip entries that have expired
     \\    --details           Include ban counts in table output
     \\    --sort              Sort by numeric IP address, then jail name
     \\    IPv4 sorts before IPv6; networks sort by address and prefix length.
@@ -978,6 +1245,17 @@ pub const help_jails =
     \\Unconfirmed does not mean installed rules are absent. Unknown means no value
     \\was supplied. Plain output preserves the enforcing boolean and uses - for
     \\an unknown active-ban count; a known zero remains 0.
+    \\
+    \\SOURCE HEALTH (HEALTH with --details) is the state of the jail's log source:
+    \\    ok                      Reading normally
+    \\    missing (FileNotFound)  The log file is absent; reading resumes when it
+    \\                            appears, and protection is not affected
+    \\    waiting (<cause>)       The jail waits for room (RetryCapacity or
+    \\                            ReserveBackpressure); nothing is lost and it
+    \\                            continues as room frees up
+    \\    paused (<cause>)        The source stopped until repaired; status prints
+    \\                            the repair command
+    \\    broken (<cause>)        The source cannot be read; the cause names why
     \\
 ;
 
@@ -1015,9 +1293,11 @@ pub const help_history =
 
 pub const help_firewall =
     \\fail2zig firewall show — inspect fail2zig-owned kernel protection
+    \\fail2zig firewall withdraw — remove fail2zig's kernel rules until the next start
     \\
     \\USAGE:
     \\    fail2zig firewall show [--limit <n>] [--cursor <token>] [--details]
+    \\    fail2zig firewall withdraw
     \\
     \\FLAGS:
     \\    --limit <n>         Sample entries per page, 1..256 (default: daemon default)
@@ -1027,6 +1307,10 @@ pub const help_firewall =
     \\This reads the daemon's latest retained observation. It does not refresh, repair,
     \\or enumerate firewall state owned by other applications. Structural detail appears
     \\only when the retained owned readback has exact verification.
+    \\
+    \\withdraw removes every rule the daemon realized and holds enforcement off until the
+    \\next start; owners and deadlines are kept, and a restart reinstalls live bans. Stopping
+    \\the daemon leaves rules in place, so run withdraw first to stop with an empty table.
     \\
 ;
 
@@ -1051,16 +1335,18 @@ pub const help_repair_source =
     \\    fail2zig repair-source --jail <name> --source <absolute path> --token <token>
     \\                           --acknowledge-truncation [--config <path>]
     \\
-    \\Runs locally against the state file named by the config, only while the daemon is
-    \\stopped; it refuses when the state is locked or absent and never creates state.
+    \\When the daemon is running, the repair is sent to it over its socket and applied
+    \\while every jail stays protected. When the daemon is stopped, it runs locally
+    \\against the state file named by the config; it refuses when the state is locked
+    \\or absent and never creates state.
     \\It accepts a same-inode truncation, or a log replaced by a different file whose
     \\previous file is gone, of a recorded source with no pending receipt, and restarts
     \\that source at offset 0 of the current file.
     \\
     \\Data removed by the truncation or left in the previous file before it was read is
     \\lost; its extent is unknown.
-    \\Protection for every jail may be absent while the daemon is stopped; the next
-    \\start reinstalls it before reporting READY.
+    \\When run locally, protection for every jail may be absent while the daemon is
+    \\stopped; the next start reinstalls it before reporting READY.
     \\
     \\Repeating the command with the same token and arguments reports the committed
     \\outcome. The newest 256 outcomes are retained; an older token stays reserved and
@@ -1075,7 +1361,7 @@ pub const help_ignore =
     \\fail2zig ignore — manage per-jail exclusions at runtime
     \\
     \\USAGE:
-    \\    fail2zig ignore add <address|cidr> --jail <name> [--unban]
+    \\    fail2zig ignore add <address|cidr> --jail <name> [--unban] [--for <duration>]
     \\    fail2zig ignore remove <address|cidr> --jail <name>
     \\    fail2zig ignore list [--jail <name>]
     \\
@@ -1087,11 +1373,15 @@ pub const help_ignore =
     \\    --jail <name>       Jail whose list is changed (required for add and remove);
     \\                        for list, show one jail instead of every enabled jail
     \\    --unban             add only: also lift that jail's bans inside the entry
+    \\    --for <duration>    add only: remove the entry after this long, in the
+    \\                        configuration's duration syntax (e.g. 2m, 1h30m, 90)
     \\
     \\Entries added here are stored in the state database and survive restart and
-    \\reload. They are merged with the jail's configured ignoreip; SOURCE shows
-    \\config, runtime or config+runtime. Entries set in the configuration file are
-    \\changed there, not here.
+    \\reload. They are merged with the jail's configured ignoreip and, when
+    \\ignoreself is on, this host's own addresses; SOURCE shows config, runtime,
+    \\config+runtime or self. EXPIRES shows when a timed entry runs out: an expired
+    \\runtime entry is removed, an expired configured entry stays listed as expired.
+    \\Entries set in the configuration file are changed there, not here.
     \\
     \\An ignore entry stops future bans from detection. It does not lift a ban that
     \\already exists: add tells you when the address is banned, until when, and how
@@ -1118,8 +1408,37 @@ pub const help_completions =
     \\
 ;
 
-pub fn helpFor(topic: ?[]const u8) []const u8 {
-    const t = topic orelse return help_top;
+pub const help_support_bundle =
+    \\fail2zig support-bundle — write a redacted diagnostic bundle for a bug report
+    \\
+    \\USAGE:
+    \\    fail2zig support-bundle [--out <path>|-] [--config <path>] [--socket <path>]
+    \\                            [--log-lines <n>] [--timeout <ms>] [--include-addresses]
+    \\
+    \\Collects versions, daemon status, jails, stats, continuity loss events, the
+    \\effective configuration with its file and loaded SHA-256, state file page and
+    \\per-table sizes, kernel readback counts, memory, host basics, and the last <n>
+    \\(default 200, at most 2000) warnings and errors from the daemon log into one JSON
+    \\file. Run it as the daemon's user; sections it cannot read record their error.
+    \\
+    \\Addresses become v4-<hash> or v6-<hash>, stable within one bundle only; loopback
+    \\and unspecified addresses are kept. --include-addresses keeps every address.
+    \\Paths other than configured log paths become <path>.
+    \\
+    \\The default output is ./fail2zig-support-<UTC time>.json, created mode 0600 and
+    \\never overwritten; '-' writes to stdout. Exit 0 when every section was collected,
+    \\4 when the bundle was written with sections that record an error, 1 when nothing
+    \\was written.
+    \\
+;
+
+pub fn helpFor(t: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, t, "help")) return help_top;
+    if (std.mem.eql(u8, t, "status")) return help_status;
+    if (std.mem.eql(u8, t, "reload")) return help_reload;
+    if (std.mem.eql(u8, t, "version")) return help_version;
+    if (std.mem.eql(u8, t, "migrate")) return help_migrate;
+    if (std.mem.eql(u8, t, "rule-test")) return help_rule_test;
     if (std.mem.eql(u8, t, "ban")) return help_ban;
     if (std.mem.eql(u8, t, "unban")) return help_unban;
     if (std.mem.eql(u8, t, "list")) return help_list;
@@ -1132,182 +1451,6 @@ pub fn helpFor(topic: ?[]const u8) []const u8 {
     if (std.mem.eql(u8, t, "jail")) return help_jail;
     if (std.mem.eql(u8, t, "ignore")) return help_ignore;
     if (std.mem.eql(u8, t, "repair-source")) return help_repair_source;
-    return help_top;
-}
-
-fn parseOk(argv: []const []const u8) !Parsed {
-    var diag: ParseDiag = .{};
-    return parse(argv, &diag);
-}
-
-test "args: details is limited to table presentation commands" {
-    const status = try parseOk(&.{ "status", "--details", "--output", "json" });
-    try std.testing.expect(status.command.status.details);
-    try std.testing.expectEqual(OutputFormat.json, status.globals.output);
-    const jails = try parseOk(&.{ "jails", "--details" });
-    try std.testing.expect(jails.command.jails.details);
-    const list = try parseOk(&.{ "list", "--details", "--sort" });
-    try std.testing.expect(list.command.list.details);
-    try std.testing.expect(list.command.list.sort);
-    const stats = try parseOk(&.{ "--output", "plain", "stats", "--details", "--no-color" });
-    try std.testing.expect(stats.command.stats.details);
-    try std.testing.expectEqual(OutputFormat.plain, stats.globals.output);
-    try std.testing.expect(!stats.globals.color);
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.UnknownFlag, parse(&.{ "history", "--details" }, &diag));
-}
-
-test "args: --socket missing value" {
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.MissingValue, parse(&.{"--socket"}, &diag));
-    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "--socket") != null);
-}
-
-test "args: ban and unban require --jail" {
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.MissingArgument, parse(&.{ "ban", "1.2.3.4" }, &diag));
-    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "requires --jail") != null);
-    try std.testing.expectError(error.MissingArgument, parse(&.{ "unban", "1.2.3.4" }, &diag));
-    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "requires --jail") != null);
-}
-
-test "args: --scope host and net on ban and unban" {
-    const host = try parseOk(&.{ "ban", "1.2.3.4", "--jail", "sshd", "--scope", "host" });
-    try std.testing.expectEqual(Command.ScopeKind.host, host.command.ban.scope.?.kind);
-    try std.testing.expect(host.command.ban.scope.?.cidr == null);
-    const net = try parseOk(&.{ "unban", "1.2.3.4", "--scope", "net", "192.0.2.0/24", "--jail", "sshd", "--output", "json" });
-    try std.testing.expectEqual(Command.ScopeKind.net, net.command.unban.scope.?.kind);
-    try std.testing.expectEqualStrings("192.0.2.0/24", net.command.unban.scope.?.cidr.?);
-    try std.testing.expectEqualStrings("sshd", net.command.unban.jail.?);
-    try std.testing.expectEqual(OutputFormat.json, net.globals.output);
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.MissingValue, parse(&.{ "ban", "1.2.3.4", "--jail", "sshd", "--scope" }, &diag));
-    try std.testing.expectError(error.MissingValue, parse(&.{ "ban", "1.2.3.4", "--jail", "sshd", "--scope", "net" }, &diag));
-    try std.testing.expectError(error.MissingValue, parse(&.{ "ban", "1.2.3.4", "--scope", "net", "--jail", "sshd" }, &diag));
-    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "CIDR") != null);
-    try std.testing.expectError(error.InvalidValue, parse(&.{ "unban", "1.2.3.4", "--jail", "sshd", "--scope", "port" }, &diag));
-}
-
-test "args: jail admin actions" {
-    inline for (.{ "enable", "disable", "pause", "resume" }) |action| {
-        const p = try parseOk(&.{ "jail", action, "sshd" });
-        try std.testing.expect(p.command == .jail_admin);
-        try std.testing.expectEqual(std.meta.stringToEnum(Command.JailAction, action).?, p.command.jail_admin.action);
-        try std.testing.expectEqualStrings("sshd", p.command.jail_admin.name);
-    }
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.MissingArgument, parse(&.{"jail"}, &diag));
-    try std.testing.expectError(error.MissingArgument, parse(&.{ "jail", "pause" }, &diag));
-    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "jail pause") != null);
-    try std.testing.expectError(error.InvalidValue, parse(&.{ "jail", "delete", "sshd" }, &diag));
-    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "list --jail <name>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "ban <ip> --jail <name>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "unban <ip> --jail <name>") != null);
-    try std.testing.expectError(error.TooManyArguments, parse(&.{ "jail", "enable", "sshd", "nginx" }, &diag));
-    try std.testing.expectError(error.UnknownFlag, parse(&.{ "jail", "enable", "sshd", "--force" }, &diag));
-}
-
-test "args: history reset takes an address and exactly one of --jail or --all" {
-    const one = try parseOk(&.{ "history", "reset", "192.0.2.10", "--jail", "sshd" });
-    try std.testing.expect(one.command == .history_reset);
-    try std.testing.expectEqualStrings("192.0.2.10", one.command.history_reset.address);
-    try std.testing.expectEqualStrings("sshd", one.command.history_reset.jail.?);
-    try std.testing.expect(!one.command.history_reset.all);
-    const all = try parseOk(&.{ "history", "reset", "--all", "2001:db8::1", "--no-color" });
-    try std.testing.expectEqualStrings("2001:db8::1", all.command.history_reset.address);
-    try std.testing.expect(all.command.history_reset.all);
-    try std.testing.expect(all.command.history_reset.jail == null);
-    try std.testing.expect(!all.globals.color);
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.MissingArgument, parse(&.{ "history", "reset" }, &diag));
-    try std.testing.expectError(error.MissingArgument, parse(&.{ "history", "reset", "--all" }, &diag));
-    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "IP address") != null);
-    try std.testing.expectError(error.MissingArgument, parse(&.{ "history", "reset", "192.0.2.10" }, &diag));
-    try std.testing.expectError(error.MissingArgument, parse(&.{ "history", "reset", "192.0.2.10", "--jail", "sshd", "--all" }, &diag));
-    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "exactly one") != null);
-    try std.testing.expectError(error.TooManyArguments, parse(&.{ "history", "reset", "192.0.2.10", "192.0.2.11", "--all" }, &diag));
-    try std.testing.expectError(error.UnknownFlag, parse(&.{ "history", "reset", "--limit", "5" }, &diag));
-    const paging = try parseOk(&.{ "history", "--jail", "sshd" });
-    try std.testing.expect(paging.command == .history);
-}
-
-test "args: ban with jail and duration" {
-    const p = try parseOk(&.{ "ban", "1.2.3.4", "--duration", "3600", "--jail", "sshd" });
-    try std.testing.expectEqualStrings("sshd", p.command.ban.jail.?);
-    try std.testing.expectEqual(@as(u64, 3600), p.command.ban.duration_s.?);
-}
-
-test "args: ban rejects extra positional" {
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.TooManyArguments, parse(&.{ "ban", "1.2.3.4", "5.6.7.8", "--jail", "sshd" }, &diag));
-}
-
-test "args: completions requires shell" {
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.MissingArgument, parse(&.{"completions"}, &diag));
-}
-
-test "args: unknown command with no close match" {
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.UnknownCommand, parse(&.{"xyzzy"}, &diag));
-    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "xyzzy") != null);
-}
-
-test "args: unknown flag on subcommand" {
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.UnknownFlag, parse(&.{ "ban", "1.2.3.4", "--jail", "sshd", "--frobnicate" }, &diag));
-}
-
-test "args: status rejects extra positional" {
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.TooManyArguments, parse(&.{ "status", "oops" }, &diag));
-}
-
-test "args: --timeout rejects non-integer" {
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.InvalidValue, parse(&.{ "--timeout", "soon", "status" }, &diag));
-}
-
-test "args: config command takes no arguments" {
-    const p = try parseOk(&.{"config"});
-    try std.testing.expect(p.command == .config);
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.TooManyArguments, parse(&.{ "config", "sshd" }, &diag));
-}
-
-test "args: history defaults and flags" {
-    const p = try parseOk(&.{"history"});
-    try std.testing.expect(p.command == .history);
-    try std.testing.expect(p.command.history.jail == null);
-    try std.testing.expect(p.command.history.limit == null);
-    try std.testing.expect(p.command.history.cursor == null);
-    const q = try parseOk(&.{ "history", "--jail", "sshd", "--limit", "256", "--cursor", "aDoy", "--output", "json" });
-    try std.testing.expectEqualStrings("sshd", q.command.history.jail.?);
-    try std.testing.expectEqual(@as(u32, 256), q.command.history.limit.?);
-    try std.testing.expectEqualStrings("aDoy", q.command.history.cursor.?);
-    try std.testing.expectEqual(OutputFormat.json, q.globals.output);
-}
-
-test "args: history rejects bad limits, empty cursor and positionals" {
-    var diag: ParseDiag = .{};
-    try std.testing.expectError(error.InvalidValue, parse(&.{ "history", "--limit", "0" }, &diag));
-    try std.testing.expectError(error.InvalidValue, parse(&.{ "history", "--limit", "257" }, &diag));
-    try std.testing.expectError(error.InvalidValue, parse(&.{ "history", "--limit", "ten" }, &diag));
-    try std.testing.expectError(error.MissingValue, parse(&.{ "history", "--cursor" }, &diag));
-    try std.testing.expectError(error.InvalidValue, parse(&.{ "history", "--cursor", "" }, &diag));
-    try std.testing.expectError(error.TooManyArguments, parse(&.{ "history", "sshd" }, &diag));
-    try std.testing.expectError(error.UnknownFlag, parse(&.{ "history", "--since", "1h" }, &diag));
-}
-
-test "args: firewall show defaults and paging flags" {
-    const defaults = try parseOk(&.{ "firewall", "show" });
-    try std.testing.expect(defaults.command == .firewall);
-    try std.testing.expect(defaults.command.firewall.limit == null);
-    try std.testing.expect(defaults.command.firewall.cursor == null);
-
-    const page = try parseOk(&.{ "firewall", "show", "--limit", "256", "--cursor", "fw-token", "--details", "--output", "plain" });
-    try std.testing.expectEqual(@as(u32, 256), page.command.firewall.limit.?);
-    try std.testing.expectEqualStrings("fw-token", page.command.firewall.cursor.?);
-    try std.testing.expect(page.command.firewall.details);
-    try std.testing.expectEqual(OutputFormat.plain, page.globals.output);
+    if (std.mem.eql(u8, t, "support-bundle")) return help_support_bundle;
+    return null;
 }

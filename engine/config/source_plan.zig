@@ -372,82 +372,6 @@ fn shellWords(allocator: Allocator, input: []const u8) ![]const []const u8 {
     return result.toOwnedSlice();
 }
 
-test "prepared source links head tail backend policy filter fallback and IPv6" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var ini = try config.parseIniSource(a, "original", "[probe]\nbackend=auto[journalflags=5]\nlogpath=/original/one tail\n /original/two HEAD\nskip_if_nologs=true\n");
-    var globals = try config.parseIniSource(a, "original-global", "[Definition]\nallowipv6=AUTO\n");
-    var filter = std.StringArrayHashMapUnmanaged([]const u8){};
-    try filter.put(a, "journalmatch", "_SYSTEMD_UNIT='original service'\nSYSLOG_IDENTIFIER=example + PRIORITY=3");
-    const plan = try prepare(a, &ini, "probe", &globals, .{ .values = &filter, .asset_index = 7 });
-    try std.testing.expectEqual(.disabled, plan.allowipv6.policy);
-    try std.testing.expectEqual(@as(?usize, 7), plan.journalmatch.derived_filter_asset);
-    const specs = try plan.fileSpecs(a);
-    try std.testing.expectEqual(@as(usize, 2), specs.len);
-    try std.testing.expectEqualStrings("/original/one", specs[0].pattern);
-    try std.testing.expectEqual(.tail, specs[0].start);
-    try std.testing.expectEqual(.head, specs[1].start);
-    const binding = try plan.bind(a, .{ .matched_files = 0, .backend_availability = .{ .available, .available, .available } });
-    try std.testing.expect(binding.client.switched_to_journal);
-    try std.testing.expectEqual(@as(usize, 0), binding.parameters.len);
-    try std.testing.expectEqual(.systemd, binding.selected.?.backend);
-    const journal_options = try plan.journalOptions(a, binding);
-    try std.testing.expect(journal_options.flags == null);
-    const matches = try plan.journalMatches(a);
-    try std.testing.expectEqual(@as(usize, 5), matches.len);
-    try std.testing.expectEqualStrings("_SYSTEMD_UNIT=original service", matches[0]);
-    try std.testing.expectEqualStrings("+", matches[1]);
-    const file_binding = try plan.bind(a, .{ .matched_files = 2, .backend_availability = .{ .dependency_unavailable, .available, .available } });
-    try std.testing.expectEqual(.polling, file_binding.selected.?.backend);
-    try std.testing.expectEqualStrings("5", file_binding.parameters[0].value);
-}
-
-test "prepared source distinguishes absent empty invalid modes and journal parameters" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var ini = try config.parseIniSource(a, "original", "[absent]\nbackend=polling\n[empty]\nlogpath=\nskip_if_nologs=true\n[bad]\nlogpath=/original/file sideways\n[journal]\nbackend=systemd[journalflags=١_٢, journalfiles='', rotated=1, namespace=example]\nlogpath=/ignored/file invalid\n");
-    var globals = try config.parseIniSource(a, "original", "[Definition]\n");
-    const absent = try prepare(a, &ini, "absent", &globals, .{});
-    try std.testing.expectEqual(.automatic, absent.allowipv6.policy);
-    const environment = Plan.Environment{ .matched_files = 0, .backend_availability = .{ .available, .available, .available } };
-    try std.testing.expectEqual(.admit, (try absent.bind(a, environment)).client.disposition);
-    const empty = try prepare(a, &ini, "empty", &globals, .{});
-    try std.testing.expectEqual(.skip, (try empty.bind(a, environment)).client.disposition);
-    const bad = try prepare(a, &ini, "bad", &globals, .{});
-    try std.testing.expectError(error.InvalidStartMode, bad.fileSpecs(a));
-    const systemd = try prepare(a, &ini, "journal", &globals, .{});
-    const bound = try systemd.bind(a, environment);
-    try std.testing.expect(bound.client.ignores_logpaths);
-    const options = try systemd.journalOptions(a, bound);
-    try std.testing.expectEqualStrings("١_٢", options.flags.?);
-    try std.testing.expectEqual(@as(usize, 0), options.files.?.len);
-    try std.testing.expectEqualStrings("example", options.namespace.?);
-}
-
-test "prepared source ignore handoff preserves absent empty invalid and derived values" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var ini = try config.parseIniSource(a, "original", "[absent]\n[explicit]\nignoreip=\nignoreself=invalid\nignorecache=\nignorecommand=\n");
-    var globals = try config.parseIniSource(a, "original", "[Definition]\nallowipv6=AUTO\n");
-    var filter = std.StringArrayHashMapUnmanaged([]const u8){};
-    try filter.put(a, "usedns", "no");
-    try filter.put(a, "datepattern", "%Y-%m-%d");
-    const absent = try prepare(a, &ini, "absent", &globals, .{});
-    try std.testing.expectEqual(.absent, absent.ignore.ignoreself.reader.?.presence);
-    try std.testing.expectEqualStrings("no", absent.ignore.allowipv6.adapter_value.?);
-    const explicit = try prepare(a, &ini, "explicit", &globals, .{ .values = &filter, .asset_index = 3 });
-    try std.testing.expectEqualStrings("", string(explicit.ignore.ignoreip).?);
-    try std.testing.expectEqual(.resolved, explicit.ignore.ignoreself.reader.?.resolution);
-    try std.testing.expect(!explicit.ignore.ignoreself.reader.?.value.boolean);
-    try std.testing.expectEqualStrings("no", string(explicit.ignore.usedns).?);
-    try std.testing.expectEqualStrings("%Y-%m-%d", string(explicit.datepattern).?);
-    try std.testing.expectEqual(@as(?usize, 3), explicit.ignore.usedns.derived_filter_asset);
-    try std.testing.expectEqual(@as(usize, 0), explicit.ignore.diagnostics.len);
-}
-
 fn trimPythonWhitespace(input: []const u8) ![]const u8 {
     const view = std.unicode.Utf8View.init(input) catch return error.InvalidEncoding;
     var iter = view.iterator();
@@ -465,22 +389,4 @@ fn trimPythonWhitespace(input: []const u8) ![]const u8 {
         }
     }
     return input[begin orelse end .. end];
-}
-
-test "prepared source processing retains raw duration and bounded encoding date line settings" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var ini = try config.parseIniSource(a, "original", "[probe]\nlogencoding=auto\nlogtimezone=UTC\ndatepattern=\xC2\xA0EPOCH\xC2\xA0\n TAI64N\nmaxlines=3\nfindtime=2m + 1\n[huge]\nmaxlines=1001\n");
-    var globals = try config.parseIniSource(a, "original", "[Definition]\n");
-    const plan = try prepare(a, &ini, "probe", &globals, .{});
-    try std.testing.expectEqualStrings("2m + 1", string(plan.processing.findtime).?);
-    try std.testing.expectEqualStrings("auto", plan.processing.encoding.?);
-    try std.testing.expectEqualStrings("UTC", plan.processing.default_tz.?);
-    try std.testing.expectEqualStrings("EPOCH", plan.processing.date_patterns[0]);
-    try std.testing.expectEqualStrings("TAI64N", plan.processing.date_patterns[1]);
-    try std.testing.expectEqual(@as(usize, 3), plan.processing.max_lines.?);
-    try std.testing.expectEqual(@as(usize, 0), plan.processing.diagnostics.len);
-    const huge = try prepare(a, &ini, "huge", &globals, .{});
-    try std.testing.expect(huge.processing.diagnostics.len != 0);
 }

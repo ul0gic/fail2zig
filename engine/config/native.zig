@@ -5,6 +5,7 @@ const std = @import("std");
 const shared = @import("shared");
 const native_duration = @import("native_duration.zig");
 const filter_registry = @import("../filters/registry.zig");
+const native_banip = @import("native_banip.zig");
 pub const max_config_bytes: usize = 16 * 1024 * 1024;
 pub const max_supported_retry = @import("../core/state.zig").max_attempts_per_ip;
 pub const max_ban_duration: u64 = std.math.maxInt(u64) / 1000;
@@ -66,6 +67,8 @@ pub const Diagnostic = struct {
 
 pub const LogLevel = enum { debug, info, warn, err };
 
+pub const LogFormat = enum { text, json };
+
 pub const BanAction = enum { nftables, iptables, ipset, @"log-only" };
 
 pub const LogSource = enum { auto, file, journald, internal };
@@ -101,12 +104,13 @@ pub const GlobalConfig = struct {
     compatibility_manifest: []const u8 = "",
     compatibility_pending: bool = false,
     log_level: LogLevel = .info,
+    log_format: LogFormat = .text,
     log_target: []const u8 = "stderr",
     pid_file: []const u8 = "/run/fail2zig/fail2zig.pid",
     socket_path: []const u8 = "/run/fail2zig/fail2zig.sock",
     state_file: []const u8 = "/var/lib/fail2zig/state.bin",
     memory_ceiling_mb: u32 = 64,
-    native_memory_ceiling_mb: u32 = 256,
+    native_memory_ceiling_mb: u32 = 512,
     native_fd_ceiling: u32 = 2048,
     metrics_enabled: bool = true,
     metrics_bind: []const u8 = "127.0.0.1",
@@ -131,6 +135,10 @@ pub const JailDefaults = struct {
     maxretry: u32 = 5,
     banaction: BanAction = .nftables,
     ignoreip: []const []const u8 = &.{},
+    banip: []const []const u8 = &.{},
+    ignoreself: bool = true,
+    bantime_increment_decay: shared.Duration = 30 * 86_400,
+    ignoretime: ?shared.Duration = null,
     bantime_increment: BanTimeIncrement = .{},
     source: LogSource = .auto,
 };
@@ -156,6 +164,10 @@ pub const JailConfig = struct {
     bantime_kind: ?BantimeKind = null,
     banaction: ?BanAction = null,
     ignoreip: ?[]const []const u8 = null,
+    banip: ?[]const []const u8 = null,
+    ignoreself: ?bool = null,
+    bantime_increment_decay: ?shared.Duration = null,
+    ignoretime: ?shared.Duration = null,
     bantime_increment: BanTimeIncrement = .{},
     bantime_increment_explicit: bool = false,
     bantime_increment_fields: u8 = 0,
@@ -189,6 +201,10 @@ pub const ResolvedJailConfig = struct {
     banaction: BanAction,
     bantime_increment: BanTimeIncrement,
     on_truncation: TruncationPolicy,
+    banip: []const []const u8,
+    ignoreself: bool,
+    bantime_increment_decay: shared.Duration,
+    ignoretime_s: ?u64,
 };
 
 pub fn resolveJail(cfg: *const Config, jail_name: []const u8) ?ResolvedJailConfig {
@@ -223,7 +239,16 @@ pub fn resolveJailFromConfig(j: *const JailConfig, defaults: JailDefaults) Resol
         .banaction = j.effectiveBanaction(defaults),
         .bantime_increment = increment,
         .on_truncation = j.on_truncation orelse .refuse,
+        .banip = j.banip orelse defaults.banip,
+        .ignoreself = j.ignoreself orelse defaults.ignoreself,
+        .bantime_increment_decay = j.bantime_increment_decay orelse defaults.bantime_increment_decay,
+        .ignoretime_s = resolvedIgnoretime(j, defaults),
     };
+}
+
+fn resolvedIgnoretime(j: *const JailConfig, defaults: JailDefaults) ?u64 {
+    const seconds = j.ignoretime orelse defaults.ignoretime orelse return null;
+    return if (seconds == 0) null else seconds;
 }
 
 pub const Config = struct {
@@ -302,6 +327,11 @@ pub const ValidationError = error{
     EmptyJailName,
     InvalidJailName,
     DuplicateJailName,
+    InvalidIgnoretime,
+    InvalidBanip,
+    InvalidEntryDuration,
+    BanListConflict,
+    BanListLimit,
 };
 
 pub const ValidationSection = enum {
@@ -340,6 +370,9 @@ pub const ValidationKey = enum {
     name,
     compatibility_manifest,
     filter,
+    banip,
+    ignoreip,
+    ignoretime,
 };
 
 pub const ValidationConstraint = enum {
@@ -372,6 +405,13 @@ pub const ValidationConstraint = enum {
     admitted_compatibility,
     valid_rule_filter,
     builtin_filter,
+    ignoretime_invalid,
+    ignoretime_rule_files,
+    banip_invalid,
+    entry_duration_invalid,
+    entry_duration_rule_files,
+    banip_conflict,
+    banip_limit,
 };
 
 pub const ValidationDiagnostic = struct {
@@ -381,8 +421,16 @@ pub const ValidationDiagnostic = struct {
     jail_len: u8 = 0,
     jail_truncated: bool = false,
     jail_buf: [max_jail_bytes]u8 = [_]u8{0} ** max_jail_bytes,
+    entry_len: u16 = 0,
+    entry_truncated: bool = false,
+    entry_buf: [max_entry_bytes]u8 = [_]u8{0} ** max_entry_bytes,
 
     pub const max_jail_bytes: usize = shared.JailId.max_len;
+    pub const max_entry_bytes: usize = 256;
+
+    pub fn entry(self: *const ValidationDiagnostic) []const u8 {
+        return self.entry_buf[0..self.entry_len];
+    }
 
     pub fn jail(self: *const ValidationDiagnostic) []const u8 {
         return self.jail_buf[0..self.jail_len];
@@ -390,6 +438,13 @@ pub const ValidationDiagnostic = struct {
 
     pub fn render(self: *const ValidationDiagnostic, out: []u8) []const u8 {
         var rendered = ValidationRenderBuffer{ .out = out };
+        switch (self.constraint) {
+            .ignoretime_invalid, .ignoretime_rule_files, .banip_invalid, .entry_duration_invalid, .entry_duration_rule_files, .banip_conflict, .banip_limit => {
+                self.renderEntry(&rendered);
+                return rendered.slice();
+            },
+            else => {},
+        }
         switch (self.section) {
             .global => rendered.appendLiteral("[global]."),
             .defaults => rendered.appendLiteral("[defaults]."),
@@ -405,6 +460,48 @@ pub const ValidationDiagnostic = struct {
             rendered.appendLiteral("'");
         }
         return rendered.slice();
+    }
+
+    fn renderEntry(self: *const ValidationDiagnostic, rendered: *ValidationRenderBuffer) void {
+        if (self.section == .jail) {
+            rendered.appendLiteral("jails.");
+            for (self.jail()) |byte| rendered.appendEscapedByte(byte);
+            if (self.jail_truncated) rendered.appendLiteral("...");
+            rendered.appendLiteral(".");
+        }
+        rendered.appendLiteral(validationKeyName(self.key));
+        rendered.appendLiteral(": ");
+        if (self.constraint == .banip_conflict) {
+            for (self.entry()) |byte| rendered.appendEscapedByte(byte);
+            rendered.appendLiteral(" ");
+            rendered.appendLiteral(validationConstraintText(self.constraint));
+            return;
+        }
+        if (self.constraint == .entry_duration_rule_files) {
+            self.renderQuotedEntry(rendered);
+            rendered.appendLiteral(": ");
+            rendered.appendLiteral(validationConstraintText(self.constraint));
+            return;
+        }
+        rendered.appendLiteral(validationConstraintText(self.constraint));
+        if (self.constraint == .banip_invalid or self.constraint == .entry_duration_invalid) {
+            rendered.appendLiteral(" ");
+            self.renderQuotedEntry(rendered);
+        }
+    }
+
+    fn renderQuotedEntry(self: *const ValidationDiagnostic, rendered: *ValidationRenderBuffer) void {
+        rendered.appendLiteral("'");
+        for (self.entry()) |byte| rendered.appendEscapedByte(byte);
+        if (self.entry_truncated) rendered.appendLiteral("...");
+        rendered.appendLiteral("'");
+    }
+
+    fn setEntry(self: *ValidationDiagnostic, text: []const u8) void {
+        const len = @min(text.len, max_entry_bytes);
+        @memcpy(self.entry_buf[0..len], text[0..len]);
+        self.entry_len = @intCast(len);
+        self.entry_truncated = text.len > len;
     }
 
     fn setJail(self: *ValidationDiagnostic, name: []const u8) void {
@@ -517,6 +614,13 @@ fn validationConstraintText(constraint: ValidationConstraint) []const u8 {
         .admitted_compatibility => "requires admitted compatibility settings",
         .valid_rule_filter => "must identify a valid rule filter",
         .builtin_filter => "must identify a built-in filter",
+        .ignoretime_invalid => "invalid duration",
+        .ignoretime_rule_files => "a default ignore duration is not supported with rule_files",
+        .banip_invalid => "invalid entry",
+        .entry_duration_invalid => "invalid duration in",
+        .entry_duration_rule_files => "a duration is not supported with rule_files",
+        .banip_conflict => "is also in ignoreip",
+        .banip_limit => std.fmt.comptimePrint("more than {d} entries", .{native_banip.max_banip_entries}),
     };
 }
 
@@ -613,6 +717,9 @@ pub fn validateDiag(cfg: *const Config, out: *ValidationDiagnostic) ValidationEr
         std.log.warn("config: defaults.maxretry must be between 1 and 128", .{});
         return validationFailure(out, .defaults, .maxretry, .between_one_and_max_retry, null, error.InvalidMaxretry);
     }
+    if (cfg.defaults.ignoretime) |seconds| if (seconds > shared.types.TimedEntry.max_duration_s)
+        return validationFailure(out, .defaults, .ignoretime, .ignoretime_invalid, null, error.InvalidIgnoretime);
+    try validateEntryLists(out, .defaults, null, cfg.defaults.banip, cfg.defaults.ignoreip);
 
     const sock_dir = std.fs.path.dirname(cfg.global.socket_path) orelse "/";
     if (sock_dir.len > 0) {
@@ -657,6 +764,17 @@ pub fn validateDiag(cfg: *const Config, out: *ValidationDiagnostic) ValidationEr
             return validationFailure(out, .jail, .findtime, .greater_than_zero, j.name, error.InvalidFindtime);
         if (j.maxretry) |m| if (m == 0 or m > max_supported_retry)
             return validationFailure(out, .jail, .maxretry, .between_one_and_max_retry, j.name, error.InvalidMaxretry);
+        if (j.ignoretime) |seconds| if (seconds > shared.types.TimedEntry.max_duration_s)
+            return validationFailure(out, .jail, .ignoretime, .ignoretime_invalid, j.name, error.InvalidIgnoretime);
+        try validateEntryLists(out, .jail, j.name, j.banip orelse &.{}, j.ignoreip orelse &.{});
+        if (j.rule_files.len != 0) {
+            if (resolvedIgnoretime(&j, cfg.defaults) != null)
+                return validationFailure(out, .jail, .ignoretime, .ignoretime_rule_files, j.name, error.InvalidIgnoretime);
+            for (j.ignoreip orelse cfg.defaults.ignoreip) |literal| if (std.mem.indexOfAny(u8, literal, &std.ascii.whitespace) != null)
+                return entryFailure(out, .jail, .ignoreip, .entry_duration_rule_files, j.name, literal, error.InvalidEntryDuration);
+        }
+        if ((j.banip orelse cfg.defaults.banip).len > native_banip.max_banip_entries)
+            return validationFailure(out, .jail, .banip, .banip_limit, j.name, error.BanListLimit);
 
         for (j.logpath) |lp| {
             std.fs.cwd().access(lp, .{}) catch {
@@ -682,6 +800,44 @@ pub fn validateDiag(cfg: *const Config, out: *ValidationDiagnostic) ValidationEr
             std.log.warn("config: jail '{s}' has no filter declared", .{j.name});
         }
     }
+    var conflict: native_banip.BanListConflict = undefined;
+    if (native_banip.findConflict(cfg, &conflict))
+        return entryFailure(out, .jail, .banip, .banip_conflict, conflict.jail, conflict.address[0..conflict.address_len], error.BanListConflict);
+}
+
+fn validateEntryLists(
+    out: *ValidationDiagnostic,
+    section: ValidationSection,
+    jail: ?[]const u8,
+    banip: []const []const u8,
+    ignoreip: []const []const u8,
+) ValidationError!void {
+    for (banip) |literal| {
+        if (std.mem.indexOfAny(u8, literal, &std.ascii.whitespace) != null) {
+            _ = shared.types.TimedEntry.parse(literal, null) catch
+                return entryFailure(out, section, .banip, .entry_duration_invalid, jail, literal, error.InvalidEntryDuration);
+        } else {
+            _ = shared.types.IgnoreEntry.parse(literal) catch
+                return entryFailure(out, section, .banip, .banip_invalid, jail, literal, error.InvalidBanip);
+        }
+    }
+    for (ignoreip) |literal| if (std.mem.indexOfAny(u8, literal, &std.ascii.whitespace) != null) {
+        _ = shared.types.TimedEntry.parse(literal, null) catch
+            return entryFailure(out, section, .ignoreip, .entry_duration_invalid, jail, literal, error.InvalidEntryDuration);
+    };
+}
+
+fn entryFailure(
+    out: *ValidationDiagnostic,
+    section: ValidationSection,
+    key: ValidationKey,
+    constraint: ValidationConstraint,
+    jail: ?[]const u8,
+    literal: []const u8,
+    err: ValidationError,
+) ValidationError {
+    out.setEntry(literal);
+    return validationFailure(out, section, key, constraint, jail, err);
 }
 
 fn validationFailure(
@@ -1154,6 +1310,11 @@ const Parser = struct {
         } else if (std.mem.eql(u8, key, "log_level")) {
             const s = try asString(v);
             self.global.log_level = try parseLogLevel(s);
+        } else if (std.mem.eql(u8, key, "log_format")) {
+            self.global.log_format = std.meta.stringToEnum(LogFormat, try asString(v)) orelse {
+                self.hint = "expected text or json";
+                return error.InvalidValue;
+            };
         } else if (std.mem.eql(u8, key, "log_target")) {
             const s = try asString(v);
             if (!std.mem.eql(u8, s, "stderr") and (!std.fs.path.isAbsolute(s) or s.len >= std.fs.max_path_bytes or std.mem.indexOfScalar(u8, s, 0) != null)) return error.InvalidValue;
@@ -1246,6 +1407,14 @@ const Parser = struct {
             return error.TruncationPolicyNotAllowedInDefaults;
         } else if (std.mem.eql(u8, key, "ignoreip")) {
             self.defaults.ignoreip = try asStringArray(v);
+        } else if (std.mem.eql(u8, key, "banip")) {
+            self.defaults.banip = try asStringArray(v);
+        } else if (std.mem.eql(u8, key, "ignoreself")) {
+            self.defaults.ignoreself = try asBool(v);
+        } else if (std.mem.eql(u8, key, "bantime_increment_decay")) {
+            self.defaults.bantime_increment_decay = try self.hintedDuration(v);
+        } else if (std.mem.eql(u8, key, "ignoretime")) {
+            self.defaults.ignoretime = try self.hintedDuration(v);
         } else if (std.mem.eql(u8, key, "source")) {
             if (self.defaults_source_origin == .backend) return error.InvalidValue;
             self.defaults.source = try parseLogSource(try asString(v));
@@ -1351,6 +1520,14 @@ const Parser = struct {
             self.jail_truncation_key.items[idx] = .{ .pos = self.key_pos, .section = self.cur_section };
         } else if (std.mem.eql(u8, key, "ignoreip")) {
             j.ignoreip = try asStringArray(v);
+        } else if (std.mem.eql(u8, key, "banip")) {
+            j.banip = try asStringArray(v);
+        } else if (std.mem.eql(u8, key, "ignoreself")) {
+            j.ignoreself = try asBool(v);
+        } else if (std.mem.eql(u8, key, "bantime_increment_decay")) {
+            j.bantime_increment_decay = try self.hintedDuration(v);
+        } else if (std.mem.eql(u8, key, "ignoretime")) {
+            j.ignoretime = try self.hintedDuration(v);
         } else if (std.mem.eql(u8, key, "bantime_increment_enabled")) {
             j.bantime_increment.enabled = try asBool(v);
             j.bantime_increment_explicit = true;
@@ -1390,6 +1567,13 @@ const Parser = struct {
             j.bantime_increment_explicit = true;
             j.bantime_increment_fields |= 64;
         } else return error.UnknownKey;
+    }
+
+    fn hintedDuration(self: *Parser, v: Value) Error!shared.Duration {
+        return asDuration(v, max_ban_duration) catch |failure| {
+            self.hint = "invalid duration";
+            return failure;
+        };
     }
 
     fn findOrCreateJail(self: *Parser, name: []const u8) Error!usize {

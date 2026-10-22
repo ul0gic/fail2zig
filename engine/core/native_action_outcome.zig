@@ -5,7 +5,7 @@ const detection = @import("native_detection_record.zig");
 
 pub const max_metadata_bytes: usize = 512;
 pub const max_targets_per_action: usize = 2;
-pub const max_rows: usize = 65_536;
+pub const max_rows: usize = 262_144;
 pub const Error = error{ InvalidActionTarget, ActionTargetStorageRequired, ActionTargetCapacity, StaleActionTarget, ActionTargetProofRequired };
 
 pub const Kind = enum(u8) { enforcement = 1, notification = 2 };

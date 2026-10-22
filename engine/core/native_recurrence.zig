@@ -16,6 +16,7 @@ pub const Binding = struct {
     generation: [32]u8,
     policy: retry.Policy,
     suppress_enforcement: bool = false,
+    decay: retry.EscalationDecay = .{},
 };
 
 pub fn consume(store: *durable.Store, binding: Binding, event: history.Event, now: i64, clock: effects.Clock) !bool {
@@ -61,7 +62,7 @@ pub fn consume(store: *durable.Store, binding: Binding, event: history.Event, no
             .pattern_index = 0,
             .subject = subject,
         },
-        .native_retry = .{ .generation = binding.generation, .policy = binding.policy, .processing_us = now, .suppress_enforcement = binding.suppress_enforcement },
+        .native_retry = .{ .generation = binding.generation, .policy = binding.policy, .processing_us = now, .suppress_enforcement = binding.suppress_enforcement, .decay = binding.decay },
         .effects_clock = if (binding.policy.enforce and !binding.suppress_enforcement) clock else null,
         .expected_revision = revision,
         .disposition = "time-eligible-event",

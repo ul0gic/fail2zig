@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Usage (root, in the daemon's network namespace): nft-count  — prints "table set elements" per fail2zig set.
+set -euo pipefail
+export PATH="$PATH:/usr/sbin:/sbin"
+nft -j list ruleset | python3 -I -c '
+import json, sys
+for item in json.load(sys.stdin)["nftables"]:
+    s = item.get("set")
+    if s and s["table"].startswith("f2z_"):
+        print(s["table"], s["name"], len(s.get("elem", [])))
+'

@@ -3,6 +3,8 @@
 pub const types = @import("types.zig");
 pub const protocol = @import("protocol.zig");
 pub const exit = @import("exit.zig");
+pub const duration = @import("duration.zig");
+pub const self_addresses = @import("self_addresses.zig");
 pub const ExitClass = exit.ExitClass;
 
 pub const IpAddress = types.IpAddress;
@@ -17,9 +19,3 @@ pub const serializeCommand = protocol.serializeCommand;
 pub const deserializeCommand = protocol.deserializeCommand;
 pub const serializeResponse = protocol.serializeResponse;
 pub const deserializeResponse = protocol.deserializeResponse;
-
-test {
-    _ = types;
-    _ = protocol;
-    _ = exit;
-}

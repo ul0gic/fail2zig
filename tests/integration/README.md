@@ -1,14 +1,12 @@
 # Integration tests
 
-These tests exercise fail2zig's daemon behavior end-to-end. Some test the
-module-level save/load contract (no daemon spawn needed); others spawn the
+These tests exercise fail2zig's daemon behavior end-to-end. They spawn the
 real `zig-out/bin/fail2zig` binary and verify operator-visible flows.
 
 ## Scope
 
 This directory holds assembled CLI, IPC and daemon tests. `build.zig` is the
-current source of truth for each test's CI lane, binary dependency and release
-local membership. Integration files are listed in `integration_files`. Tests that need
+current source of truth for each test's step and release local membership. Integration files are listed in `integration_files`. Tests that need
 root privileges, namespaces or a firewall use explicit skip conditions.
 
 ## Build
@@ -24,20 +22,18 @@ Its behavior is exercised by the actual daemon cases using it.
 
 ## Wiring into `build.zig`
 
-Most files are listed in the `integration_files` array in `build.zig`; the
+Every file is listed in the `integration_files` array in `build.zig`; the
 loop creates the module, adds the `shared` and `engine` imports, links libc,
-and registers the selected maintained or deferred test lane. Retired tracker/command-handler round trips were removed; the native daemon
+makes the run depend on the installed daemon and adds it to `test-ci-assembled`. Retired tracker/command-handler round trips were removed; the native daemon
 suite checks the delivered CLI against current handlers:
 
 ```zig
 .{ .name = "native_daemon", .path = "tests/integration/native_daemon_test.zig",
-   .needs_daemon_binary = true, .ci = .assembled, .release_local = true },
+   .release_local = true },
 ```
 
-To add a file, append one row. `needs_daemon_binary = true` makes the run
-depend on `b.getInstallStep()`, so `zig-out/bin/fail2zig` is built before the
-test spawns it; set it for every file that starts the daemon as a subprocess
-(`native_daemon`, `startup_failclosed`, `config_diag`, `no_backend`).
+To add a file, append one row. Every run depends on `b.getInstallStep()`, so
+`zig-out/bin/fail2zig` is built before the test spawns it.
 Keep changes to this registration table synchronized with the affected integration file.
 
 `no_backend_test.zig` (SYS-014 / ADR-007 / ENH-006) is the inverse of the

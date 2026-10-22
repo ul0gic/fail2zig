@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
-const builtin = @import("builtin");
 const effects = @import("../core/native_effect.zig");
 const detection = @import("../core/native_detection_record.zig");
 const retry = @import("../core/native_retry.zig");
@@ -11,6 +10,7 @@ const store = @import("store.zig");
 const Error = store.Error;
 const Stmt = store.Stmt;
 const latest_schema = store.latest_schema;
+pub const origin_schema: i64 = 26;
 
 pub fn Methods(comptime Store: type) type {
     return struct {
@@ -75,6 +75,12 @@ pub fn Methods(comptime Store: type) type {
                 2 => if (deadline == null) .permanent else error.InvalidEffect,
                 else => error.InvalidEffect,
             };
+        }
+        pub fn originSql(self: *Store, comptime head: [:0]const u8, comptime column: [:0]const u8, comptime tail: [:0]const u8) [:0]const u8 {
+            return if (self.schema_version >= origin_schema) head ++ column ++ tail else head ++ "1" ++ tail;
+        }
+        pub fn storedOrigin(row: *Stmt, column: c_int) Error!effects.Origin {
+            return std.meta.intToEnum(effects.Origin, try row.signed(column)) catch error.InvalidEffect;
         }
         pub fn bindEffectLease(row: *Stmt, index: c_int, lease: effects.Lease) Error!void {
             try row.int(index, @intFromEnum(lease));
@@ -145,6 +151,7 @@ pub fn Methods(comptime Store: type) type {
             const live = try self.integer("SELECT live FROM effect_owner_live WHERE id=1;");
             if (live < 0) return error.LiveOwnerCounterInvalid;
             const live_after = live + own.live_owners;
+            if (live_after > effects.max_live_owners) return error.ReserveBackpressure;
             const unsettled_after = @max(0, live_after - (try self.integer("SELECT count(*) FROM confirmation_markers;") - own.retired_markers));
             const limits = [_]struct { sql: [:0]const u8, own: i64, reserve: i64, cap: i64 }{
                 .{ .sql = "SELECT count(*) FROM effect_owners;", .own = own.owners, .reserve = 0, .cap = effects.max_owners },
@@ -169,7 +176,29 @@ pub fn Methods(comptime Store: type) type {
             .{ .name = "effect_owner_live_delete", .sql = "CREATE TRIGGER effect_owner_live_delete AFTER DELETE ON effect_owners WHEN OLD.lease_kind<>0 BEGIN UPDATE effect_owner_live SET live=live-1 WHERE id=1; END" },
         };
 
+        // Windows of owners, one operation each, keep the per-row revision lookup inside the work budget at any ban count.
+        const owner_scan_rows: i64 = 8192;
+        fn ownersWithoutRevisions(self: *Store) Error!i64 {
+            const last = try self.integer("SELECT coalesce(max(rowid),0) FROM effect_owners;");
+            var missing: i64 = 0;
+            var after: i64 = 0;
+            while (after < last) {
+                const until = after + owner_scan_rows;
+                try self.beginRead();
+                errdefer self.rollback();
+                var row = try self.statement("SELECT count(*) FROM effect_owners o WHERE o.rowid>?1 AND o.rowid<=?2 AND NOT EXISTS(SELECT 1 FROM effect_owner_revisions h WHERE h.scope_key=o.scope_key AND h.jail=o.jail AND h.revision=o.revision AND h.decision_id=o.decision_id AND h.lease_kind=o.lease_kind);");
+                defer row.deinit();
+                try row.int(1, after);
+                try row.int(2, until);
+                if (!try row.row()) return error.InvalidEffect;
+                missing += try row.signed(0);
+                try self.commitTransaction();
+                after = until;
+            }
+            return missing;
+        }
         pub fn reconcileLiveOwners(self: *Store) Error!?LiveOwnerRecount {
+            if (self.schema_version >= store.load_repair_schema and try self.ownersWithoutRevisions() != 0) return error.InvalidEffect;
             try self.beginAdmissionWrite();
             errdefer self.rollback();
             if (self.schema_version < store.load_repair_schema) {
@@ -183,7 +212,6 @@ pub fn Methods(comptime Store: type) type {
                 if (!try row.row() or !std.mem.eql(u8, try row.bytes(0), trigger.sql) or try row.row()) return error.LiveOwnerCounterInvalid;
             }
             if (try self.integer("SELECT count(*) FROM effect_owner_live;") != 1) return error.LiveOwnerCounterInvalid;
-            if (try self.integer("SELECT count(*) FROM effect_owners o WHERE NOT EXISTS(SELECT 1 FROM effect_owner_revisions h WHERE h.scope_key=o.scope_key AND h.jail=o.jail AND h.revision=o.revision AND h.decision_id=o.decision_id AND h.lease_kind=o.lease_kind);") != 0) return error.InvalidEffect;
             const stored = try self.integer("SELECT live FROM effect_owner_live WHERE id=1;");
             const streak = try self.integer("SELECT mismatch_streak FROM effect_owner_live WHERE id=1;");
             if (streak < 0) return error.LiveOwnerCounterInvalid;
@@ -306,7 +334,7 @@ pub fn Methods(comptime Store: type) type {
             return .{ .revision = @intCast(effect_revision), .count = count, .more = more };
         }
         pub fn readOwners(self: *Store, key: effects.Hash, output: []effects.Owner) Error!usize {
-            var row = try self.statement("SELECT o.jail,o.generation,o.decision_id,o.revision,o.lease_kind,o.deadline_us,o.decided_us,EXISTS(SELECT 1 FROM effect_owner_revisions h WHERE h.scope_key=o.scope_key AND h.jail=o.jail AND h.revision=o.revision AND h.generation=o.generation AND h.decision_id=o.decision_id AND h.lease_kind=o.lease_kind AND h.deadline_us IS o.deadline_us AND h.decided_us=o.decided_us) FROM effect_owners o WHERE o.scope_key=?1 ORDER BY o.jail LIMIT 65;");
+            var row = try self.statement(self.originSql("SELECT o.jail,o.generation,o.decision_id,o.revision,o.lease_kind,o.deadline_us,o.decided_us,EXISTS(SELECT 1 FROM effect_owner_revisions h WHERE h.scope_key=o.scope_key AND h.jail=o.jail AND h.revision=o.revision AND h.generation=o.generation AND h.decision_id=o.decision_id AND h.lease_kind=o.lease_kind AND h.deadline_us IS o.deadline_us AND h.decided_us=o.decided_us),", "o.origin", " FROM effect_owners o WHERE o.scope_key=?1 ORDER BY o.jail LIMIT 65;"));
             defer row.deinit();
             try row.blob(1, &key);
             var count: usize = 0;
@@ -318,7 +346,7 @@ pub fn Methods(comptime Store: type) type {
                 const lease = try effectLease(&row, 4, 5);
                 const decided = try row.signed(6);
                 if (lease == .finite and lease.finite <= decided) return error.InvalidEffect;
-                output[count] = .{ .jail = detection.Name.init(try row.boundedBytes(0, 64)) catch return error.InvalidEffect, .generation = try effectBlob(&row, 1, 32), .decision_id = try effectBlob(&row, 2, 32), .revision = @intCast(effect_revision), .lease = lease, .decided_us = decided };
+                output[count] = .{ .jail = detection.Name.init(try row.boundedBytes(0, 64)) catch return error.InvalidEffect, .generation = try effectBlob(&row, 1, 32), .decision_id = try effectBlob(&row, 2, 32), .revision = @intCast(effect_revision), .lease = lease, .decided_us = decided, .origin = try storedOrigin(&row, 8) };
                 count += 1;
             }
             return count;
@@ -342,27 +370,55 @@ pub fn Methods(comptime Store: type) type {
             lease: effects.Lease,
             decision_id: effects.Hash,
             ordinal: u64,
+            origin: effects.Origin,
         };
+        // One page per read transaction keeps every page inside the work budget; the storage worker is the only writer, so the pages see one state.
+        pub const owner_page_rows: usize = 4096;
         pub fn operatorOwners(self: *Store, now_us: i64, output: []OperatorOwner) Error!usize {
             if (output.len == 0 or output.len > effects.max_owners) return error.EffectCapacity;
+            var count: usize = 0;
+            var after: ?OperatorOwner = null;
+            while (true) {
+                const remaining = output.len - count;
+                if (remaining == 0) {
+                    var probe: [1]OperatorOwner = undefined;
+                    if (try self.operatorOwnerPage(now_us, &probe, after) != 0) return error.EffectCapacity;
+                    return count;
+                }
+                const want = @min(owner_page_rows, remaining);
+                const got = try self.operatorOwnerPage(now_us, output[count..][0..want], after);
+                count += got;
+                if (got < want) return count;
+                after = output[count - 1];
+            }
+        }
+        fn operatorOwnerPage(self: *Store, now_us: i64, output: []OperatorOwner, after: ?OperatorOwner) Error!usize {
             try self.beginRead();
             errdefer self.rollback();
             const installation = try self.readInstallation() orelse return error.InstallationRequired;
             if (self.schema_version < 19) return error.EffectStorageRequired;
             const floor = try self.readAdmissionClock(self.schema_version);
             if (floor) |value| if (now_us < value.us) return error.EffectClockReversed;
-            var row = try self.statement(
+            var row = try self.statement(self.originSql(
                 "SELECT o.scope_key,n.canonical_scope,o.jail,o.decision_id,o.lease_kind,o.deadline_us,o.decided_us,d.ordinal," ++
-                    "EXISTS(SELECT 1 FROM effect_owner_revisions h WHERE h.scope_key=o.scope_key AND h.jail=o.jail AND h.revision=o.revision AND h.generation=o.generation AND h.decision_id=o.decision_id AND h.lease_kind=o.lease_kind AND h.deadline_us IS o.deadline_us AND h.decided_us=o.decided_us) " ++
-                    "FROM effect_owners o JOIN native_effects n USING(scope_key) LEFT JOIN retry_decision_details d ON d.jail=o.jail AND d.effect_decision_id=o.decision_id " ++
-                    "WHERE o.lease_kind=2 OR (o.lease_kind=1 AND o.deadline_us>?1) ORDER BY o.jail,o.scope_key LIMIT ?2;",
-            );
+                    "EXISTS(SELECT 1 FROM effect_owner_revisions h WHERE h.scope_key=o.scope_key AND h.jail=o.jail AND h.revision=o.revision AND h.generation=o.generation AND h.decision_id=o.decision_id AND h.lease_kind=o.lease_kind AND h.deadline_us IS o.deadline_us AND h.decided_us=o.decided_us),",
+                "o.origin",
+                " FROM effect_owners o JOIN native_effects n USING(scope_key) LEFT JOIN retry_decision_details d ON d.jail=o.jail AND d.effect_decision_id=o.decision_id " ++
+                    "WHERE (o.lease_kind=2 OR (o.lease_kind=1 AND o.deadline_us>?1)) AND (?3 IS NULL OR o.jail>?3 OR (o.jail=?3 AND o.scope_key>?4)) ORDER BY o.jail,o.scope_key LIMIT ?2;",
+            ));
             defer row.deinit();
             try row.int(1, now_us);
-            try row.int(2, @intCast(output.len + 1));
+            try row.int(2, @intCast(output.len));
+            if (after) |last| {
+                try row.text(3, last.jail.slice());
+                try row.blob(4, &last.key);
+            } else {
+                try self.check(self.api.bind_null(row.ptr, 3));
+                try self.check(self.api.bind_null(row.ptr, 4));
+            }
             var count: usize = 0;
             while (try row.row()) {
-                if (count == output.len) return error.EffectCapacity;
+                if (count == output.len) return error.InvalidEffect;
                 const key = try effectBlob(&row, 0, 32);
                 const scope = try self.decodeStoredScope(&row, 1);
                 if (!std.mem.eql(u8, &key, &try scope.key(installation))) return error.InvalidEffect;
@@ -379,6 +435,7 @@ pub fn Methods(comptime Store: type) type {
                     .lease = lease,
                     .decision_id = try effectBlob(&row, 3, 32),
                     .ordinal = if (stored_ordinal) |ordinal| @intCast(ordinal) else 1,
+                    .origin = try storedOrigin(&row, 9),
                 };
                 count += 1;
             }
@@ -448,8 +505,9 @@ pub fn Methods(comptime Store: type) type {
                 owner_revision = owner.revision;
                 if (!std.mem.eql(u8, &owner.generation, &change.generation)) return error.EffectGenerationMismatch;
                 if (std.mem.eql(u8, &owner.decision_id, &change.decision_id)) {
-                    if (!effects.Lease.eql(owner.lease, change.lease) or owner.decided_us != change.decided_us) return error.InvalidEffect;
-                    return previous orelse error.InvalidEffect;
+                    const replay = effects.Lease.eql(owner.lease, change.lease) and owner.decided_us == change.decided_us and owner.origin == change.origin;
+                    if (replay) return previous orelse error.InvalidEffect;
+                    if (change.origin != .config or owner.origin != .config) return error.InvalidEffect;
                 }
                 replaced = owner;
             };
@@ -496,7 +554,10 @@ pub fn Methods(comptime Store: type) type {
             }
             if (replaced) |owner| try self.retireOwnerDecisionTx(key, change.jail, owner.decision_id, now);
             {
-                var owner = try self.statement("INSERT INTO effect_owners VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(scope_key,jail) DO UPDATE SET decision_id=excluded.decision_id,revision=excluded.revision,lease_kind=excluded.lease_kind,deadline_us=excluded.deadline_us,decided_us=excluded.decided_us;");
+                var owner = try self.statement(if (self.schema_version >= origin_schema)
+                    "INSERT INTO effect_owners(scope_key,jail,generation,decision_id,revision,lease_kind,deadline_us,decided_us,origin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(scope_key,jail) DO UPDATE SET decision_id=excluded.decision_id,revision=excluded.revision,lease_kind=excluded.lease_kind,deadline_us=excluded.deadline_us,decided_us=excluded.decided_us,origin=excluded.origin;"
+                else
+                    "INSERT INTO effect_owners(scope_key,jail,generation,decision_id,revision,lease_kind,deadline_us,decided_us) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(scope_key,jail) DO UPDATE SET decision_id=excluded.decision_id,revision=excluded.revision,lease_kind=excluded.lease_kind,deadline_us=excluded.deadline_us,decided_us=excluded.decided_us;");
                 defer owner.deinit();
                 try owner.blob(1, &key);
                 try owner.text(2, change.jail);
@@ -505,6 +566,9 @@ pub fn Methods(comptime Store: type) type {
                 try owner.int(5, @intCast(owner_revision + 1));
                 try bindEffectLease(&owner, 6, change.lease);
                 try owner.int(8, change.decided_us);
+                if (self.schema_version >= origin_schema) {
+                    try owner.int(9, @intFromEnum(change.origin));
+                } else if (change.origin != .detection) return error.EffectStorageRequired;
                 try owner.done();
             }
             try self.fault(.after_effect_owner);
@@ -641,22 +705,6 @@ pub fn Methods(comptime Store: type) type {
             try targets.int(2, dispatch_us);
             try targets.done();
         }
-        pub fn dispatchedForTest(self: *Store, token: effects.Token, dispatch_us: i64, clock: effects.Clock) Error!void {
-            if (!builtin.is_test) @compileError("dispatchedForTest is test-only");
-            try self.beginWrite();
-            errdefer self.rollback();
-            const entry = try self.checkedEffectToken(token);
-            if (entry.status == .dispatched) return error.EffectReconciliationRequired;
-            if (entry.status != .pending) return error.StaleEffect;
-            const now = try self.effectClock(clock);
-            if (entry.desired == .finite and !entry.desired.live(now)) return error.EffectExpired;
-            try self.markDispatchedTx(token, dispatch_us);
-            try self.advanceEffectSnapshot();
-            self.noteEffectChange(token.scope_key);
-            const final = try self.commitEffectClock(clock);
-            if (entry.desired == .finite and !entry.desired.live(final)) return error.EffectExpired;
-            try self.commitEffectTransaction(true);
-        }
         const SettledIntent = struct { entry: effects.Entry, status: effects.Status, settlement: effects.Settlement };
         fn settleTx(self: *Store, token: effects.Token, dispatch_us: i64, observation: effects.Observation, clock: effects.Clock) Error!SettledIntent {
             const entry = try self.checkedEffectToken(token);
@@ -701,7 +749,7 @@ pub fn Methods(comptime Store: type) type {
                 defer prior.deinit();
                 try prior.blob(1, &observation_id);
                 if (!try prior.row()) {
-                    if (try self.integer("SELECT count(*) FROM effect_observations;") >= effects.max_observations) return error.EffectCapacity;
+                    if (try self.observationRows() >= effects.max_observations) return error.EffectCapacity;
                     var receipt = try self.statement("INSERT INTO effect_observations VALUES(?1,?2,?3,?4,?5,?6,?7,?8);");
                     defer receipt.deinit();
                     try receipt.blob(1, &observation_id);
@@ -715,6 +763,7 @@ pub fn Methods(comptime Store: type) type {
                     };
                     try receipt.int(8, @intFromEnum(status));
                     try receipt.done();
+                    self.observation_rows.? += 1;
                 }
             }
             if (self.schema_version >= store.load_repair_schema) {
@@ -752,7 +801,7 @@ pub fn Methods(comptime Store: type) type {
                         if (!std.mem.eql(u8, &event_id, &try effectBlob(&existing, 0, 32))) return error.InvalidEffect;
                         continue;
                     }
-                    if (try self.integer("SELECT count(*) FROM confirmed_effect_events;") >= effects.max_confirmed_events) return error.EffectCapacity;
+                    if (try self.eventRows() >= effects.max_confirmed_events) return error.EffectCapacity;
                     var event = try self.statement("INSERT INTO confirmed_effect_events VALUES(?1,?2,?3,?4,?5) ON CONFLICT(scope_key,jail,decision_id) DO NOTHING;");
                     defer event.deinit();
                     try event.blob(1, &event_id);
@@ -761,6 +810,7 @@ pub fn Methods(comptime Store: type) type {
                     try event.blob(4, &owner.decision_id);
                     try event.int(5, observation.observed_us);
                     try event.done();
+                    self.event_rows.? += 1;
                     if (self.schema_version >= 17) {
                         var detail_inserted = false;
                         var detail = try self.statement("INSERT INTO confirmed_event_details(event_id,source,occurrence,decided_us,ordinal,evidence) SELECT ?1,source,occurrence,decided_us,ordinal,evidence FROM retry_decision_details WHERE jail=?2 AND effect_decision_id=?3;");
@@ -818,6 +868,31 @@ pub fn Methods(comptime Store: type) type {
             try self.commitEffectTransaction(true);
             return tokens.len;
         }
+        pub const max_install_batch = 1024;
+        pub const InstallItem = struct { token: effects.Token, state: ?effects.Lease };
+        pub fn settleInstalled(self: *Store, items: []const InstallItem, dispatch_us: i64, fingerprint: effects.Hash, observed_us: i64, clock: effects.Clock) Error!usize {
+            if (items.len == 0 or items.len > max_install_batch) return error.InvalidEffect;
+            try self.beginWrite();
+            errdefer self.rollback();
+            for (items) |item| {
+                const observation = effects.Observation{ .installation = item.token.installation, .scope_key = item.token.scope_key, .fingerprint = fingerprint, .observed_us = observed_us, .qualification = .complete_owned, .state = item.state };
+                _ = try self.settleTx(item.token, dispatch_us, observation, clock);
+            }
+            try self.advanceEffectSnapshot();
+            try self.fault(.before_effect_receipt_commit);
+            _ = try self.commitEffectClock(clock);
+            try self.commitEffectTransaction(true);
+            return items.len;
+        }
+        // Capacity guards count a table once per transaction; inserts in the same transaction are added in memory.
+        fn observationRows(self: *Store) Error!i64 {
+            if (self.observation_rows == null) self.observation_rows = try self.integer("SELECT count(*) FROM effect_observations;");
+            return self.observation_rows.?;
+        }
+        fn eventRows(self: *Store) Error!i64 {
+            if (self.event_rows == null) self.event_rows = try self.integer("SELECT count(*) FROM confirmed_effect_events;");
+            return self.event_rows.?;
+        }
         fn confirmOwnerTx(self: *Store, token: effects.Token, owner: effects.Owner, observed_us: i64) Error!void {
             const jail = owner.jail.slice();
             const event_id = effects.hashParts("fail2zig-native-confirmed-owner-v1", &.{ &token.installation, &token.scope_key, jail, &owner.decision_id });
@@ -839,17 +914,22 @@ pub fn Methods(comptime Store: type) type {
             const already_confirmed = try retained.row();
             if (already_confirmed and !std.mem.eql(u8, &event_id, &try effectBlob(&retained, 0, 32))) return error.InvalidEffect;
             if (!already_confirmed) {
-                if (try self.integer("SELECT count(*) FROM confirmed_effect_events;") >= effects.max_confirmed_events) return error.EffectCapacity;
+                if (try self.eventRows() >= effects.max_confirmed_events) return error.EffectCapacity;
                 {
-                    var event = try self.statement("INSERT INTO confirmed_effect_events(event_id,scope_key,jail,decision_id,confirmed_us,canonical_scope) SELECT ?1,scope_key,?3,?4,?5,canonical_scope FROM native_effects WHERE scope_key=?2;");
+                    var event = try self.statement(if (self.schema_version >= origin_schema)
+                        "INSERT INTO confirmed_effect_events(event_id,scope_key,jail,decision_id,confirmed_us,canonical_scope,origin) SELECT ?1,scope_key,?3,?4,?5,canonical_scope,?6 FROM native_effects WHERE scope_key=?2;"
+                    else
+                        "INSERT INTO confirmed_effect_events(event_id,scope_key,jail,decision_id,confirmed_us,canonical_scope) SELECT ?1,scope_key,?3,?4,?5,canonical_scope FROM native_effects WHERE scope_key=?2;");
                     defer event.deinit();
                     try event.blob(1, &event_id);
                     try event.blob(2, &token.scope_key);
                     try event.text(3, jail);
                     try event.blob(4, &owner.decision_id);
                     try event.int(5, observed_us);
+                    if (self.schema_version >= origin_schema) try event.int(6, @intFromEnum(owner.origin));
                     try event.done();
                     if (self.api.changes(self.db) != 1) return error.InvalidEffect;
+                    self.event_rows.? += 1;
                 }
                 var sequence: i64 = undefined;
                 {
@@ -953,7 +1033,7 @@ pub fn Methods(comptime Store: type) type {
         }
         pub fn ownerRevision(self: *Store, key: effects.Hash, jail: []const u8, owner_revision: u64) Error!?effects.Owner {
             if (owner_revision == 0 or owner_revision > std.math.maxInt(i64)) return error.InvalidEffect;
-            var row = try self.statement("SELECT generation,decision_id,lease_kind,deadline_us,decided_us FROM effect_owner_revisions WHERE scope_key=?1 AND jail=?2 AND revision=?3;");
+            var row = try self.statement(self.originSql("SELECT generation,decision_id,lease_kind,deadline_us,decided_us,", "origin", " FROM effect_owner_revisions WHERE scope_key=?1 AND jail=?2 AND revision=?3;"));
             defer row.deinit();
             try row.blob(1, &key);
             try row.text(2, jail);
@@ -962,7 +1042,7 @@ pub fn Methods(comptime Store: type) type {
             const lease = try effectLease(&row, 2, 3);
             const decided = try row.signed(4);
             if (lease == .finite and lease.finite <= decided) return error.InvalidEffect;
-            return .{ .jail = detection.Name.init(jail) catch return error.InvalidEffect, .generation = try effectBlob(&row, 0, 32), .decision_id = try effectBlob(&row, 1, 32), .revision = owner_revision, .lease = lease, .decided_us = decided };
+            return .{ .jail = detection.Name.init(jail) catch return error.InvalidEffect, .generation = try effectBlob(&row, 0, 32), .decision_id = try effectBlob(&row, 1, 32), .revision = owner_revision, .lease = lease, .decided_us = decided, .origin = try storedOrigin(&row, 5) };
         }
     };
 }

@@ -13,16 +13,11 @@ and the IPC socket under a short path (the scripts use `$XDG_RUNTIME_DIR`).
 |------|---------|
 | `rig.sh` | Starts the daemon with two file jails (`portsentry`, maxretry 1; idle `sshd`), appends distinct scan records at a fixed rate, samples `status` JSON and daemon CPU once per second, and stops when storage leaves `healthy` or the generator has settled. |
 | `restart.sh` | Restarts the daemon on the preserved state directory in a fresh namespace (no scaffold, like a reboot) and records time to readiness. |
-| `measure.c` | Vendored-SQLite probe. `measure <state>` reports VM steps, full-scan steps and plans for each per-tick and maintenance query against the daemon's 1,000,000-step per-transaction budget (optional third argument: setup SQL or `@file`, applied read-write to a copy). `measure synth <copy> S D M E J` adds S subjects × D decisions (last M with details, evidence E bytes, J jails) of synthetic confirmed history. `measure retention <copy> max_matches [first] [page]` compares the shipped retention candidate with windowed variants (`SKIP_UNBOUNDED=1` skips the unbounded forms). `measure exec-measure <copy> "SQL"` runs one statement under the step counter, for example index creation. |
+| `fixture.zig` (`zig build build-load-fixture`) | State generator through the production Store APIs. The shapes `churn`, `hot`, `pinned`, `reuse` and `oracle-cases` build a state from nothing. `attach <state-dir> jail=NAME count=N [bantime_s=S seed=N sync=off]` appends N live bans with distinct 198.18.0.0/15 addresses to an existing daemon state (`fail2zig.sqlite` in `state-dir`) under that jail's own generation, policy and pipeline checkpoint, so the daemon starts on it as its own: the fast way to a 20k or 65k state for restart and readback measurements (about 60 bans/s at 20k live, 16 ms per ban with the product's 2 MB page cache). Run it with the daemon stopped, as the state's owner, on a directory that is not group- or world-writable. Every shape also takes `profile=1` (per-statement SQLite VM steps and full-scan steps on stderr, both connections), `audit=skip` (no end-of-run audit, which scans every table and takes minutes at 65k) and `cache_kib=N` (a harness-only `PRAGMA cache_size` for measuring the page-cache lever); the manifest's `stats.ban_loop_ms` times the ban loop alone. `attach` numbers its occurrences after the records already present for its source, so it can run repeatedly on one state. |
 
 ```bash
-gcc -O1 -DSQLITE_OMIT_LOAD_EXTENSION=1 -I vendor/sqlite -o .zig-cache/load-repro/measure \
-  tests/harness/load_repro/measure.c vendor/sqlite/sqlite3.c -lpthread -lm
 W=$PWD/.zig-cache/load-repro/run260
 unshare --user --map-root-user --net bash tests/harness/load_repro/rig.sh zig-out/bin/fail2zig "$W" 260 2 600
-.zig-cache/load-repro/measure "$W/state/fail2zig.sqlite"
-cp "$W"/state/fail2zig.sqlite* .zig-cache/load-repro/synth/ && .zig-cache/load-repro/measure synth .zig-cache/load-repro/synth/fail2zig.sqlite 100 1024 1024 0 2 \
-  && SKIP_UNBOUNDED=1 .zig-cache/load-repro/measure retention .zig-cache/load-repro/synth/fail2zig.sqlite 1024 1 29
 unshare --user --map-root-user --net bash tests/harness/load_repro/restart.sh zig-out/bin/fail2zig "$W"
 ```
 

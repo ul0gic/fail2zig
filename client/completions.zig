@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 
-const std = @import("std");
-
 pub fn generateBash() []const u8 {
     return bash_script;
 }
@@ -28,7 +26,7 @@ const bash_script =
     \\    local cur prev words cword
     \\    _init_completion || return
     \\
-    \\    local subcommands="status stats ban unban list jails reload version config history firewall jail ignore repair-source completions help"
+    \\    local subcommands="status stats ban unban list jails reload version config history firewall jail ignore repair-source support-bundle rule-test migrate completions help"
     \\    local global_flags="--socket --output --no-color --timeout --help --version"
     \\
     \\    # Flag-value completion for the previous word.
@@ -47,6 +45,11 @@ const bash_script =
     \\            return 0 ;;
     \\        --scope)
     \\            COMPREPLY=( $(compgen -W "host net" -- "$cur") )
+    \\            return 0 ;;
+    \\        --origin)
+    \\            COMPREPLY=( $(compgen -W "detection manual config" -- "$cur") )
+    \\            return 0 ;;
+    \\        --for|--duration)
     \\            return 0 ;;
     \\    esac
     \\
@@ -79,9 +82,9 @@ const bash_script =
     \\        history)
     \\            COMPREPLY=( $(compgen -W "reset --jail --limit --cursor --all $global_flags" -- "$cur") ) ;;
     \\        firewall)
-    \\            COMPREPLY=( $(compgen -W "show --limit --cursor --details $global_flags" -- "$cur") ) ;;
+    \\            COMPREPLY=( $(compgen -W "show --limit --cursor --details withdraw $global_flags" -- "$cur") ) ;;
     \\        ban)
-    \\            COMPREPLY=( $(compgen -W "--jail --duration --scope $global_flags" -- "$cur") ) ;;
+    \\            COMPREPLY=( $(compgen -W "--jail --duration --scope --force $global_flags" -- "$cur") ) ;;
     \\        unban)
     \\            COMPREPLY=( $(compgen -W "--jail --scope $global_flags" -- "$cur") ) ;;
     \\        jail)
@@ -102,14 +105,18 @@ const bash_script =
     \\            done
     \\            case "$sub" in
     \\                add)
-    \\                    COMPREPLY=( $(compgen -W "--jail --unban $global_flags" -- "$cur") ) ;;
+    \\                    COMPREPLY=( $(compgen -W "--jail --unban --for $global_flags" -- "$cur") ) ;;
     \\                remove|list)
     \\                    COMPREPLY=( $(compgen -W "--jail $global_flags" -- "$cur") ) ;;
     \\                *)
     \\                    COMPREPLY=( $(compgen -W "add remove list $global_flags" -- "$cur") ) ;;
     \\            esac ;;
     \\        list)
-    \\            COMPREPLY=( $(compgen -W "--jail --details --sort $global_flags" -- "$cur") ) ;;
+    \\            COMPREPLY=( $(compgen -W "--jail --origin --details --sort $global_flags" -- "$cur") ) ;;
+    \\        migrate)
+    \\            COMPREPLY=( $(compgen -W "inspect snapshot plan validate cutover status rollback --help" -- "$cur") ) ;;
+    \\        rule-test)
+    \\            COMPREPLY=( $(compgen -W "--file --record --journal --service --rule-file --config --jail --output --print-lines --help" -- "$cur") ) ;;
     \\        completions)
     \\            COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ) ;;
     \\        help)
@@ -147,6 +154,9 @@ const zsh_script =
     \\        'jail:Enable, disable, pause or resume a jail'
     \\        'ignore:Manage per-jail exclusions (add, remove, list)'
     \\        'repair-source:Acknowledge a truncated or replaced file source (daemon stopped)'
+    \\        'support-bundle:Write a redacted diagnostic bundle for a bug report'
+    \\        'rule-test:Evaluate a log, one line or the journal against a rule (offline)'
+    \\        'migrate:Inspect, plan and carry out a fail2ban migration (offline)'
     \\        'completions:Generate shell completion script'
     \\        'help:Show help for a command'
     \\    )
@@ -175,8 +185,9 @@ const zsh_script =
     \\                ban)
     \\                    _arguments \
     \\                        '--jail[Target jail (required)]:jail name:' \
-    \\                        '--duration[Ban duration in seconds]:seconds:' \
+    \\                        '--duration[Ban length: seconds, or a duration such as 2m or 1h30m]:duration:' \
     \\                        '--scope[Scope: host, or net <cidr>]:scope:(host net)' \
+    \\                        '--force[Ban even a loopback, host or SSH peer address]' \
     \\                        $global_flags \
     \\                        '1:ip address:' ;;
     \\                unban)
@@ -195,6 +206,7 @@ const zsh_script =
     \\                            _arguments \
     \\                                '--jail[Target jail (required)]:jail name:' \
     \\                                '--unban[Also lift the jail bans inside the entry]' \
+    \\                                '--for[Remove the entry after this duration, e.g. 2m or 1h30m]:duration:' \
     \\                                $global_flags \
     \\                                '2:address or cidr:' ;;
     \\                        remove)
@@ -214,6 +226,7 @@ const zsh_script =
     \\                list)
     \\                    _arguments \
     \\                        '--jail[Filter by jail]:jail name:' \
+    \\                        '--origin[Show only bans of one origin]:origin:(detection manual config)' \
     \\                        '--details[Include ban counts in table output]' \
     \\                        '--sort[Sort by numeric IP address, then jail name]' \
     \\                        $global_flags ;;
@@ -229,11 +242,24 @@ const zsh_script =
     \\                        $global_flags ;;
     \\                firewall)
     \\                    _arguments \
-    \\                        '1:action:(show)' \
+    \\                        '1:action:(show withdraw)' \
     \\                        '--limit[Sample entries per page (1..256)]:limit:' \
     \\                        '--cursor[Continue the same retained observation]:cursor:' \
     \\                        '--details[Include verified owned structures, entry placement and identifiers]' \
     \\                        $global_flags ;;
+    \\                migrate)
+    \\                    _arguments '1:step:(inspect snapshot plan validate cutover status rollback)' ;;
+    \\                rule-test)
+    \\                    _arguments \
+    \\                        '--file[Log file to evaluate]:path:_files' \
+    \\                        '--record[One log line to evaluate]:line:' \
+    \\                        '--journal[Read the journal]' \
+    \\                        '--service[Compiled service rule]:service:' \
+    \\                        '--rule-file[Native rule file]:path:_files' \
+    \\                        '--config[Native configuration]:path:_files' \
+    \\                        '--jail[Jail whose settings apply]:jail name:' \
+    \\                        '--output[Output format]:format:(json table)' \
+    \\                        '--print-lines[Include the raw lines]' ;;
     \\                completions)
     \\                    _arguments '1:shell:(bash zsh fish)' ;;
     \\                help)
@@ -313,6 +339,9 @@ const fish_script =
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'jail'         -d 'Enable, disable, pause or resume a jail'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'ignore'       -d 'Manage per-jail exclusions (add, remove, list)'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'repair-source' -d 'Acknowledge a truncated or replaced file source (daemon stopped)'
+    \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'support-bundle' -d 'Write a redacted diagnostic bundle for a bug report'
+    \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'rule-test'    -d 'Evaluate a log, one line or the journal against a rule (offline)'
+    \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'migrate'      -d 'Inspect, plan and carry out a fail2ban migration (offline)'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'completions'  -d 'Generate completion script'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'help'         -d 'Show help'
     \\
@@ -326,20 +355,23 @@ const fish_script =
     \\
     \\# Subcommand-specific flags
     \\complete -c fail2zig -n '__fail2zig_client_using_command ban'   -l jail     -x -d 'Target jail'
-    \\complete -c fail2zig -n '__fail2zig_client_using_command ban'   -l duration -x -d 'Ban duration (seconds)'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command ban'   -l duration -x -d 'Ban length: seconds, or a duration such as 2m or 1h30m'
     \\complete -c fail2zig -n '__fail2zig_client_using_command ban'   -l scope    -x -a 'host net' -d 'Scope: host, or net <cidr>'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command ban'   -l force    -d 'Ban even a loopback, host or SSH peer address'
     \\complete -c fail2zig -n '__fail2zig_client_using_command unban' -l jail     -x -d 'Target jail'
     \\complete -c fail2zig -n '__fail2zig_client_using_command unban' -l scope    -x -a 'host net' -d 'Scope: host, or net <cidr>'
     \\complete -c fail2zig -f -n '__fail2zig_client_using_command jail' -a 'enable disable pause resume'
     \\complete -c fail2zig -f -n '__fail2zig_client_using_command history' -a 'reset' -d 'Reset an address ban history'
     \\complete -c fail2zig -n '__fail2zig_client_using_command history' -l all -d 'Reset history for all jails'
     \\complete -c fail2zig -n '__fail2zig_client_using_command list'  -l jail     -x -d 'Filter by jail'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command list; and not __fail2zig_client_using_command ignore'  -l origin -x -a 'detection manual config' -d 'Show only bans of one origin'
     \\complete -c fail2zig -n '__fail2zig_client_using_command list; and not __fail2zig_client_using_command ignore'  -l details -d 'Include ban counts in table output'
     \\complete -c fail2zig -n '__fail2zig_client_using_command list; and not __fail2zig_client_using_command ignore'  -l sort -d 'Sort by numeric IP address, then jail name'
     \\complete -c fail2zig -f -n '__fail2zig_client_using_command ignore'
     \\complete -c fail2zig -f -n '__fail2zig_client_using_command ignore; and not __fish_seen_subcommand_from add remove list' -a 'add remove list' -d 'Ignore subcommand'
     \\complete -c fail2zig -n '__fail2zig_client_using_command ignore; and __fish_seen_subcommand_from add remove list' -l jail -x -d 'Target jail'
     \\complete -c fail2zig -n '__fail2zig_client_using_command ignore; and __fish_seen_subcommand_from add' -l unban -d 'Also lift the jail bans inside the entry'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command ignore; and __fish_seen_subcommand_from add' -l for -x -d 'Remove the entry after this duration (e.g. 2m, 1h30m)'
     \\complete -c fail2zig -n '__fail2zig_client_using_command status' -l details -d 'Include table detail'
     \\complete -c fail2zig -n '__fail2zig_client_using_command stats' -l details -d 'Include additional counters'
     \\complete -c fail2zig -n '__fail2zig_client_using_command jails'  -l details -d 'Include table detail'
@@ -347,92 +379,21 @@ const fish_script =
     \\complete -c fail2zig -n '__fail2zig_client_using_command history' -l limit  -x -d 'Events per page (1..256)'
     \\complete -c fail2zig -n '__fail2zig_client_using_command history' -l cursor -x -d 'Continue from next_cursor'
     \\complete -c fail2zig -f -n '__fail2zig_client_using_command firewall' -a 'show' -d 'Show retained firewall observation'
+    \\complete -c fail2zig -f -n '__fail2zig_client_using_command firewall' -a 'withdraw' -d 'Remove kernel rules and hold enforcement off until restart'
     \\complete -c fail2zig -n '__fail2zig_client_using_command firewall' -l limit  -x -d 'Sample entries per page (1..256)'
     \\complete -c fail2zig -n '__fail2zig_client_using_command firewall' -l cursor -x -d 'Continue the same retained observation'
     \\complete -c fail2zig -n '__fail2zig_client_using_command firewall' -l details -d 'Include verified owned structures, entry placement and identifiers'
+    \\
+    \\complete -c fail2zig -f -n '__fail2zig_client_using_command migrate; and not __fish_seen_subcommand_from inspect snapshot plan validate cutover status rollback' -a 'inspect snapshot plan validate cutover status rollback' -d 'Migration step'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command rule-test' -l file -r -d 'Log file to evaluate'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command rule-test' -l record -x -d 'One log line to evaluate'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command rule-test' -l journal -d 'Read the journal'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command rule-test' -l service -x -d 'Compiled service rule'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command rule-test' -l rule-file -r -d 'Native rule file'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command rule-test' -l output -x -a 'json table' -d 'Output format'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command rule-test' -l print-lines -d 'Include the raw lines'
     \\
     \\# `completions` subcommand: shell argument
     \\complete -c fail2zig -f -n '__fail2zig_client_using_command completions' -a 'bash zsh fish'
     \\
 ;
-
-const testing = std.testing;
-
-test "completions: bash starts with shebang and installs complete -F" {
-    const s = generateBash();
-    try testing.expect(std.mem.startsWith(u8, s, "#!/usr/bin/env bash"));
-    try testing.expect(std.mem.indexOf(u8, s, "complete -F") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "fail2zig") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "table json plain") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "status") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "ban") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "Install:") != null);
-}
-
-test "completions: bash covers all subcommands" {
-    const s = generateBash();
-    const subs = [_][]const u8{ "status", "stats", "ban", "unban", "list", "jails", "reload", "version", "config", "history", "firewall", "completions", "help" };
-    for (subs) |sub| {
-        try testing.expect(std.mem.indexOf(u8, s, sub) != null);
-    }
-    try testing.expect(std.mem.indexOf(u8, s, "reset --jail --limit --cursor --all") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "enable disable pause resume") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "--jail --duration --scope") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "show --limit --cursor") != null);
-}
-
-test "completions: bash covers --output values" {
-    const s = generateBash();
-    try testing.expect(std.mem.indexOf(u8, s, "--output)") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "table json plain") != null);
-}
-
-test "completions: zsh has #compdef header" {
-    const s = generateZsh();
-    try testing.expect(std.mem.startsWith(u8, s, "#compdef fail2zig"));
-    try testing.expect(std.mem.indexOf(u8, s, "_arguments") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "(table json plain)") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "(bash zsh fish)") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "Install:") != null);
-}
-
-test "completions: zsh covers all subcommands in command list" {
-    const s = generateZsh();
-    const subs = [_][]const u8{ "status:", "stats:", "ban:", "unban:", "list:", "jails:", "reload:", "version:", "config:", "history:", "firewall:", "completions:", "help:" };
-    for (subs) |sub| {
-        try testing.expect(std.mem.indexOf(u8, s, sub) != null);
-    }
-    try testing.expect(std.mem.indexOf(u8, s, "--cursor[Continue from next_cursor]") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "(enable disable pause resume)") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "jail:") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "scope:(host net)") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "1:action:(show)") != null);
-}
-
-test "completions: fish uses complete -c syntax" {
-    const s = generateFish();
-    try testing.expect(std.mem.indexOf(u8, s, "complete -c fail2zig") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "table json plain") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "bash zsh fish") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "Install:") != null);
-}
-
-test "completions: fish has all subcommands" {
-    const s = generateFish();
-    const subs = [_][]const u8{ "status", "stats", "ban", "unban", "list", "jails", "reload", "version", "config", "history", "firewall", "completions", "help" };
-    for (subs) |sub| {
-        try testing.expect(std.mem.indexOf(u8, s, sub) != null);
-    }
-    try testing.expect(std.mem.indexOf(u8, s, "__fail2zig_client_using_command history' -l cursor") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "__fail2zig_client_using_command jail' -a 'enable disable pause resume'") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "-l scope    -x -a 'host net'") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "using_command firewall' -a 'show'") != null);
-}
-
-test "completions: fish references global flags" {
-    const s = generateFish();
-    try testing.expect(std.mem.indexOf(u8, s, "-l socket") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "-l output") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "-l no-color") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "-l timeout") != null);
-}

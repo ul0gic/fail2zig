@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Usage (root): sshd-journal COUNT RATE [START] [PER_ADDRESS]  — sends sshd failures to the journal via the lab emitter.
+set -euo pipefail
+COUNT="$1"; RATE="$2"; START="${3:-0}"; PER="${4:-3}"
+EMITTER=${F2Z_SSHD_EMITTER:-/usr/local/libexec/f2z-diag/sshd-emitter}
+HERE=$(cd "$(dirname "$0")" && pwd)
+# The sshd jail accepts only _TRANSPORT=syslog, _UID=0 and an _EXE in journal_executables, so the
+# sender is a root copy of logger at a listed path; `logger --journald` and systemd-cat fail that check.
+if [ ! -x "$EMITTER" ]; then
+  install -d -m 0755 "$(dirname "$EMITTER")"
+  install -o root -g root -m 0755 "$(command -v logger)" "$EMITTER"
+fi
+# journald reads _EXE from the sender's /proc entry on arrival; keep the sender alive 5 s past the last line.
+{ "$HERE/lines" sshd "$COUNT" "$RATE" --start "$START" --per-address "$PER"; sleep 5; } \
+  | "$EMITTER" --tag sshd --priority auth.info --socket-errors=on

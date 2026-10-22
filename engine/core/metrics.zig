@@ -68,6 +68,10 @@ pub const PerJail = struct {
     unbans_total: Counter = .{},
     active_bans: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     parse_errors: Counter = .{},
+    failures_counted: Counter = .{},
+    ignored_detections: Counter = .{},
+    pool_evictions: Counter = .{},
+    source_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 
     pub fn name(self: *const PerJail) []const u8 {
         return self.name_buf[0..self.name_len];
@@ -83,10 +87,26 @@ pub const PerJailSnapshot = struct {
     unbans_total: u64,
     active_bans: u32,
     parse_errors: u64,
+    failures_counted: u64,
+    ignored_detections: u64,
+    pool_evictions: u64,
+    source_state: u8,
 
     pub fn name(self: *const PerJailSnapshot) []const u8 {
         return self.name_buf[0..self.name_len];
     }
+};
+
+pub const NativeHealth = struct {
+    storage_healthy: bool = false,
+    committed_records: u64 = 0,
+    worker_stalled: bool = false,
+    worker_busy: bool = false,
+    worker_heartbeat_age_ms: u64 = 0,
+    worker_busy_age_ms: u64 = 0,
+    clock_uncertain: bool = false,
+    expiry_overdue: bool = false,
+    expiry_uncertain: bool = false,
 };
 
 pub const Snapshot = struct {
@@ -97,6 +117,13 @@ pub const Snapshot = struct {
     active_bans: u32 = 0,
     parse_errors: u64 = 0,
     memory_bytes_used: u64 = 0,
+    state_file_bytes: u64 = 0,
+    state_file_pages: u64 = 0,
+    pool_tracked: u32 = 0,
+    pool_banned: u32 = 0,
+    pool_tracking_limit: u32 = 0,
+    pool_ban_limit: u32 = 0,
+    native: NativeHealth = .{},
     jails: [max_jails]PerJailSnapshot = undefined,
     jails_len: usize = 0,
 
@@ -113,6 +140,10 @@ pub const Metrics = struct {
     active_bans: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     parse_errors: Counter = .{},
     memory_bytes_used: Counter = .{},
+    state_file_bytes: Counter = .{},
+    state_file_pages: Counter = .{},
+    pool_tracked: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    pool_banned: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     jails: [max_jails]PerJail = [_]PerJail{.{}} ** max_jails,
     jails_len: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
@@ -156,6 +187,16 @@ pub const Metrics = struct {
 
     pub fn setBansTotal(self: *Metrics, count: u64) void {
         self.bans_total.store(count);
+    }
+
+    pub fn setStateFile(self: *Metrics, bytes: u64, pages: u64) void {
+        self.state_file_bytes.store(bytes);
+        self.state_file_pages.store(pages);
+    }
+
+    pub fn setPoolOccupancy(self: *Metrics, tracked: u32, banned: u32) void {
+        self.pool_tracked.store(tracked, counter_order);
+        self.pool_banned.store(banned, counter_order);
     }
 
     pub fn registerJail(self: *Metrics, name: []const u8) ?usize {
@@ -235,6 +276,30 @@ pub const Metrics = struct {
         }
     }
 
+    pub fn jailSetFailuresCounted(self: *Metrics, jail: []const u8, count: u64) void {
+        if (self.jailIndex(jail)) |i| {
+            self.jails[i].failures_counted.store(count);
+        }
+    }
+
+    pub fn jailSetIgnoredDetections(self: *Metrics, jail: []const u8, count: u64) void {
+        if (self.jailIndex(jail)) |i| {
+            self.jails[i].ignored_detections.store(count);
+        }
+    }
+
+    pub fn jailSetPoolEvictions(self: *Metrics, jail: []const u8, count: u64) void {
+        if (self.jailIndex(jail)) |i| {
+            self.jails[i].pool_evictions.store(count);
+        }
+    }
+
+    pub fn jailSetSourceState(self: *Metrics, jail: []const u8, state: u8) void {
+        if (self.jailIndex(jail)) |i| {
+            self.jails[i].source_state.store(state, counter_order);
+        }
+    }
+
     pub fn snapshot(self: *Metrics) Snapshot {
         var s = Snapshot{};
         s.lines_parsed = self.lines_parsed.load();
@@ -244,6 +309,10 @@ pub const Metrics = struct {
         s.active_bans = self.active_bans.load(counter_order);
         s.parse_errors = self.parse_errors.load();
         s.memory_bytes_used = self.memory_bytes_used.load();
+        s.state_file_bytes = self.state_file_bytes.load();
+        s.state_file_pages = self.state_file_pages.load();
+        s.pool_tracked = self.pool_tracked.load(counter_order);
+        s.pool_banned = self.pool_banned.load(counter_order);
 
         const live = self.jails_len.load(.acquire);
         s.jails_len = live;
@@ -257,8 +326,78 @@ pub const Metrics = struct {
                 .unbans_total = slot.unbans_total.load(),
                 .active_bans = slot.active_bans.load(counter_order),
                 .parse_errors = slot.parse_errors.load(),
+                .failures_counted = slot.failures_counted.load(),
+                .ignored_detections = slot.ignored_detections.load(),
+                .pool_evictions = slot.pool_evictions.load(),
+                .source_state = slot.source_state.load(counter_order),
             };
         }
         return s;
     }
 };
+
+const Kind = enum { gauge, counter };
+
+fn family(writer: anytype, name: []const u8, kind: Kind, help: []const u8) !void {
+    try writer.print("# HELP {s} {s}\n# TYPE {s} {s}\n", .{ name, help, name, @tagName(kind) });
+}
+
+fn sample(writer: anytype, name: []const u8, kind: Kind, help: []const u8, value: u64) !void {
+    try family(writer, name, kind, help);
+    try writer.print("{s} {d}\n", .{ name, value });
+}
+
+fn writeLabelValue(writer: anytype, value: []const u8) !void {
+    for (value) |c| switch (c) {
+        '\\' => try writer.writeAll("\\\\"),
+        '"' => try writer.writeAll("\\\""),
+        '\n' => try writer.writeAll("\\n"),
+        else => try writer.writeByte(c),
+    };
+}
+
+const JailSeries = struct {
+    name: []const u8,
+    kind: Kind,
+    help: []const u8,
+    field: std.meta.FieldEnum(PerJailSnapshot),
+};
+
+const jail_series = [_]JailSeries{
+    .{ .name = "fail2zig_jail_bans_active", .kind = .gauge, .help = "Live bans owned by the jail", .field = .active_bans },
+    .{ .name = "fail2zig_jail_bans_total", .kind = .counter, .help = "Bans the jail has issued", .field = .bans_total },
+    .{ .name = "fail2zig_jail_failures_counted_total", .kind = .counter, .help = "Failures counted toward a ban", .field = .failures_counted },
+    .{ .name = "fail2zig_jail_ignored_detections_total", .kind = .counter, .help = "Detections dropped by the ignore list", .field = .ignored_detections },
+    .{ .name = "fail2zig_jail_source_state", .kind = .gauge, .help = "Log source state: 0 ok, 1 paused, 2 missing, 3 blocked", .field = .source_state },
+    .{ .name = "fail2zig_jail_pool_evictions_total", .kind = .counter, .help = "Idle subjects evicted from the shared pool", .field = .pool_evictions },
+};
+
+pub fn renderPrometheus(snapshot: *const Snapshot, writer: anytype) !void {
+    const n = snapshot.native;
+    try sample(writer, "fail2zig_up", .gauge, "1 when the daemon is running", 1);
+    try sample(writer, "fail2zig_native_storage_healthy", .gauge, "1 when storage is healthy", @intFromBool(n.storage_healthy));
+    try sample(writer, "fail2zig_native_committed_records", .gauge, "Records committed by the storage worker", n.committed_records);
+    try sample(writer, "fail2zig_native_worker_stalled", .gauge, "1 when the storage worker is stalled", @intFromBool(n.worker_stalled));
+    try sample(writer, "fail2zig_native_worker_busy", .gauge, "1 when the storage worker is busy", @intFromBool(n.worker_busy));
+    try sample(writer, "fail2zig_native_worker_heartbeat_age_ms", .gauge, "Milliseconds since the storage worker heartbeat", n.worker_heartbeat_age_ms);
+    try sample(writer, "fail2zig_native_worker_busy_age_ms", .gauge, "Milliseconds the storage worker has been busy", n.worker_busy_age_ms);
+    try sample(writer, "fail2zig_native_clock_uncertain", .gauge, "1 when the wall clock is uncertain", @intFromBool(n.clock_uncertain));
+    try sample(writer, "fail2zig_native_expiry_overdue", .gauge, "1 when a ban expiry is overdue", @intFromBool(n.expiry_overdue));
+    try sample(writer, "fail2zig_native_expiry_uncertain", .gauge, "1 when ban expiry is uncertain", @intFromBool(n.expiry_uncertain));
+    try sample(writer, "fail2zig_state_file_bytes", .gauge, "State file size in bytes", snapshot.state_file_bytes);
+    try sample(writer, "fail2zig_state_file_pages", .gauge, "State file size in pages", snapshot.state_file_pages);
+    try sample(writer, "fail2zig_pool_tracked", .gauge, "Subjects tracked without a live ban", snapshot.pool_tracked);
+    try sample(writer, "fail2zig_pool_banned", .gauge, "Subjects with a live ban", snapshot.pool_banned);
+    try sample(writer, "fail2zig_pool_tracking_limit", .gauge, "Tracking pool bound", snapshot.pool_tracking_limit);
+    try sample(writer, "fail2zig_pool_ban_limit", .gauge, "Ban pool bound", snapshot.pool_ban_limit);
+
+    const jails = snapshot.perJail();
+    inline for (jail_series) |series| {
+        try family(writer, series.name, series.kind, series.help);
+        for (jails) |*jail| {
+            try writer.print("{s}{{jail=\"", .{series.name});
+            try writeLabelValue(writer, jail.name());
+            try writer.print("\"}} {d}\n", .{@field(jail, @tagName(series.field))});
+        }
+    }
+}

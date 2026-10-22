@@ -4,13 +4,15 @@ const std = @import("std");
 const detection = @import("native_detection_record.zig");
 const canonical_scope = @import("../firewall/scope.zig");
 const native_lease = @import("native_lease.zig");
+pub const Origin = @import("shared").types.Origin;
 pub const Hash = [32]u8;
-pub const max_effects = 4096;
-pub const max_owners = 16384;
-pub const max_intents = 65536;
-pub const max_owner_revisions = 65536;
-pub const max_confirmed_events = 65536;
-pub const max_observations = 262144;
+pub const max_effects = 65536;
+pub const max_owners = 131072;
+pub const max_live_owners = 65536;
+pub const max_intents = 1048576;
+pub const max_owner_revisions = 1048576;
+pub const max_confirmed_events = 262144;
+pub const max_observations = 4194304;
 pub const max_page = 64;
 pub const Error = error{ InvalidEffect, EffectScopeNotRealized, EffectStorageRequired, InstallationRequired, InstallationMismatch, NamespaceAdmissionRequired, EffectCapacity, StaleEffect, EffectGenerationMismatch, EffectReconciliationRequired, EffectExpired, EffectClockReversed, IncompleteEffectObservation };
 pub const Backend = enum(u8) { nftables = 1, iptables = 2, ipset = 3 };
@@ -143,6 +145,7 @@ pub const Owner = struct {
     revision: u64,
     lease: Lease,
     decided_us: i64,
+    origin: Origin,
 };
 pub const OwnerChange = struct {
     scope: Scope,
@@ -152,6 +155,7 @@ pub const OwnerChange = struct {
     expected_revision: u64,
     lease: Lease,
     decided_us: i64,
+    origin: Origin = .detection,
 };
 pub const CanonicalOwnerChange = struct {
     scope: canonical_scope.Scope,
@@ -161,6 +165,7 @@ pub const CanonicalOwnerChange = struct {
     expected_revision: u64,
     lease: Lease,
     decided_us: i64,
+    origin: Origin = .detection,
 
     pub fn legacy(self: CanonicalOwnerChange) Error!OwnerChange {
         return .{
@@ -171,6 +176,7 @@ pub const CanonicalOwnerChange = struct {
             .expected_revision = self.expected_revision,
             .lease = self.lease,
             .decided_us = self.decided_us,
+            .origin = self.origin,
         };
     }
     pub fn exact(self: CanonicalOwnerChange) Error!OwnerChange {
@@ -182,6 +188,7 @@ pub const CanonicalOwnerChange = struct {
             .expected_revision = self.expected_revision,
             .lease = self.lease,
             .decided_us = self.decided_us,
+            .origin = self.origin,
         };
     }
 };

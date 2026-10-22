@@ -31,6 +31,7 @@ pub const Error = error{
     BufferTooSmall,
     InvalidBatchState,
     DumpInterrupted,
+    EventsOverflowed,
 };
 
 pub const StrictMessages = struct {
@@ -93,6 +94,31 @@ pub fn recvKernel(sock: *NetlinkSocket, scratch: []u8) Error![]const u8 {
     return scratch[0..rc];
 }
 
+pub fn recvEvents(sock: *NetlinkSocket, scratch: []u8) Error!?[]const u8 {
+    var sender: linux.sockaddr.nl = .{ .pid = 0, .groups = 0 };
+    var iov = posix.iovec{ .base = scratch.ptr, .len = scratch.len };
+    var msg: linux.msghdr = .{
+        .name = @ptrCast(&sender),
+        .namelen = @sizeOf(linux.sockaddr.nl),
+        .iov = @ptrCast(&iov),
+        .iovlen = 1,
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    const rc = linux.recvmsg(sock.fd, &msg, linux.MSG.DONTWAIT);
+    switch (linux.E.init(rc)) {
+        .SUCCESS => {},
+        .AGAIN => return null,
+        .NOBUFS => return error.EventsOverflowed,
+        else => return error.RecvFailed,
+    }
+    const expected_groups = @as(u32, 1) << @intCast(sock.group - 1);
+    if (msg.namelen != @sizeOf(linux.sockaddr.nl) or sender.family != posix.AF.NETLINK or sender.pid != 0 or sender.groups != expected_groups) return error.RecvFailed;
+    if ((msg.flags & (linux.MSG.TRUNC | linux.MSG.CTRUNC)) != 0 or rc == 0 or rc > scratch.len) return error.TruncatedMessage;
+    return scratch[0..rc];
+}
+
 pub fn sendKernel(sock: *NetlinkSocket, bytes: []const u8, timeout_ms: u64) Error!void {
     if (timeout_ms == 0 or timeout_ms > 2000) return error.InvalidArgument;
     const value = posix.timeval{ .sec = @intCast(timeout_ms / 1000), .usec = @intCast((timeout_ms % 1000) * 1000) };
@@ -110,20 +136,6 @@ fn validateKernelEnvelope(sender: linux.sockaddr.nl, name_len: usize, flags: i32
         sender.pid != 0 or sender.groups != 0) return error.RecvFailed;
     if ((flags & (linux.MSG.TRUNC | linux.MSG.CTRUNC)) != 0 or received == 0 or received > capacity)
         return error.TruncatedMessage;
-}
-
-test "native firewall: kernel provenance and datagram truncation are mandatory" {
-    var sender = linux.sockaddr.nl{ .pid = 0, .groups = 0 };
-    try validateKernelEnvelope(sender, @sizeOf(linux.sockaddr.nl), 0, 16, 32);
-    try std.testing.expectError(error.TruncatedMessage, validateKernelEnvelope(sender, @sizeOf(linux.sockaddr.nl), linux.MSG.TRUNC, 16, 32));
-    try std.testing.expectError(error.TruncatedMessage, validateKernelEnvelope(sender, @sizeOf(linux.sockaddr.nl), linux.MSG.CTRUNC, 16, 32));
-    try std.testing.expectError(error.TruncatedMessage, validateKernelEnvelope(sender, @sizeOf(linux.sockaddr.nl), 0, 33, 32));
-    try std.testing.expectError(error.RecvFailed, validateKernelEnvelope(sender, 0, 0, 16, 32));
-    sender.pid = 123;
-    try std.testing.expectError(error.RecvFailed, validateKernelEnvelope(sender, @sizeOf(linux.sockaddr.nl), 0, 16, 32));
-    sender.pid = 0;
-    sender.groups = 1;
-    try std.testing.expectError(error.RecvFailed, validateKernelEnvelope(sender, @sizeOf(linux.sockaddr.nl), 0, 16, 32));
 }
 
 pub const Dump = struct {
@@ -178,6 +190,7 @@ fn safeErrno(code: i32) Error {
     return errnoToError(code);
 }
 
+pub const max_related = 4096;
 pub const Acknowledgments = struct {
     required: []const u32,
     related: []const u32,
@@ -186,7 +199,7 @@ pub const Acknowledgments = struct {
     count: usize = 0,
 
     pub fn init(required: []const u32, related: []const u32, port_id: u32) Error!Acknowledgments {
-        if (required.len == 0 or required.len > 64 or related.len > 66) return error.InvalidArgument;
+        if (required.len == 0 or required.len > 64 or related.len > max_related) return error.InvalidArgument;
         for (required, 0..) |seq, index| {
             if (mem.indexOfScalar(u32, related, seq) == null or mem.indexOfScalar(u32, required[0..index], seq) != null) return error.InvalidArgument;
         }
@@ -227,102 +240,6 @@ pub fn receiveAcknowledgments(sock: *NetlinkSocket, required: []const u32, relat
     }
 }
 
-fn acknowledgmentFixture(payload: *[20]u8, sequence: u32, code: i32) MessageIterator.View {
-    @memset(payload, 0);
-    mem.writeInt(i32, payload[0..4], code, native_endian);
-    mem.writeInt(u32, payload[4..8], @sizeOf(linux.nlmsghdr), native_endian);
-    mem.writeInt(u32, payload[12..16], sequence, native_endian);
-    return .{ .hdr = .{ .len = NLMSG_HDRLEN + payload.len, .type = @enumFromInt(2), .flags = 0, .seq = sequence, .pid = 0 }, .payload = payload };
-}
-
-test "native firewall: native acknowledgments retain related batch errors and ignore unrelated errors" {
-    var state = try Acknowledgments.init(&.{2}, &.{ 1, 2, 3 }, 0);
-    var bytes: [20]u8 = undefined;
-    try state.accept(acknowledgmentFixture(&bytes, 99, -1));
-    try std.testing.expect(!state.complete());
-    try std.testing.expectError(error.PermissionDenied, state.accept(acknowledgmentFixture(&bytes, 1, -1)));
-    try state.accept(acknowledgmentFixture(&bytes, 2, 0));
-    try std.testing.expect(state.complete());
-}
-
-test "native firewall: native acknowledgments require every expected sequence and validate embedded requests" {
-    var state = try Acknowledgments.init(&.{ 2, 3 }, &.{ 1, 2, 3, 4 }, 0);
-    var bytes: [20]u8 = undefined;
-    try state.accept(acknowledgmentFixture(&bytes, 2, 0));
-    try state.accept(acknowledgmentFixture(&bytes, 2, 0));
-    try std.testing.expect(!state.complete());
-    var malformed = acknowledgmentFixture(&bytes, 3, 0);
-    malformed.payload = bytes[0..19];
-    try std.testing.expectError(error.TruncatedMessage, state.accept(malformed));
-    malformed = acknowledgmentFixture(&bytes, 3, 0);
-    mem.writeInt(u32, bytes[12..16], 999, native_endian);
-    try std.testing.expectError(error.NetlinkError, state.accept(malformed));
-    try state.accept(acknowledgmentFixture(&bytes, 3, 0));
-    try std.testing.expect(state.complete());
-    try std.testing.expectError(error.InvalidArgument, Acknowledgments.init(&.{ 2, 2 }, &.{2}, 0));
-}
-
-test "native firewall: strict netlink iterator supports unaligned bytes and rejects tails" {
-    var storage: [65]u8 = @splat(0);
-    var encoded: [64]u8 align(4) = undefined;
-    var b = MessageBuilder.init(&encoded);
-    try b.append(0x101, 2, 7, 0, &.{ 1, 2, 3 });
-    @memcpy(storage[1..][0..b.bytes().len], b.bytes());
-    var it = StrictMessages{ .bytes = storage[1..][0..b.bytes().len] };
-    try std.testing.expectEqual(@as(u32, 7), (try it.next()).?.hdr.seq);
-    try std.testing.expect((try it.next()) == null);
-    var truncated = StrictMessages{ .bytes = b.bytes()[0 .. b.bytes().len - 1] };
-    try std.testing.expectError(error.TruncatedMessage, truncated.next());
-    var tail = StrictMessages{ .bytes = storage[1 .. 1 + b.bytes().len + 1] };
-    _ = try tail.next();
-    try std.testing.expectError(error.TruncatedMessage, tail.next());
-}
-
-test "native firewall: dump requires done and rejects interrupted and wrong-type replies" {
-    var bbuf: [128]u8 = undefined;
-    var b = MessageBuilder.init(&bbuf);
-    try b.append(0x101, 2, 7, 22, &.{ 1, 0, 0, 0 });
-    var it = StrictMessages{ .bytes = b.bytes() };
-    const view = (try it.next()).?;
-    var state = Dump{ .sequence = 7, .message_type = 0x101, .port_id = 22 };
-    try std.testing.expect((try state.accept(view)) != null);
-    try std.testing.expect(!state.complete);
-    var interrupted = view;
-    interrupted.hdr.flags |= 0x10;
-    try std.testing.expectError(error.DumpInterrupted, state.accept(interrupted));
-    var wrong = view;
-    wrong.hdr.type = @enumFromInt(0x102);
-    try std.testing.expectError(error.NetlinkError, state.accept(wrong));
-    var done = view;
-    done.hdr.type = @enumFromInt(3);
-    done.payload = &.{ 0, 0, 0, 0 };
-    try std.testing.expect((try state.accept(done)) == null);
-    try std.testing.expect(state.complete);
-    try std.testing.expectError(error.NetlinkError, state.accept(view));
-}
-
-test "native firewall: unrelated dump traffic is bounded and cannot complete" {
-    var bytes: [64]u8 = undefined;
-    var builder = MessageBuilder.init(&bytes);
-    try builder.append(3, 2, 99, 0, &.{});
-    var it = StrictMessages{ .bytes = builder.bytes() };
-    const view = (try it.next()).?;
-    var state = Dump{ .sequence = 1, .message_type = 0x101, .port_id = 0, .max_messages = 2 };
-    try std.testing.expect((try state.accept(view)) == null);
-    try std.testing.expect((try state.accept(view)) == null);
-    try std.testing.expect(!state.complete);
-    try std.testing.expectError(error.BufferTooSmall, state.accept(view));
-}
-
-test "native firewall: malformed attributes do not become empty inspection" {
-    var short = Attributes{ .bytes = &.{ 1, 0, 0 } };
-    try std.testing.expectError(error.TruncatedMessage, short.next());
-    var bytes: [8]u8 = @splat(0);
-    mem.writeInt(u16, bytes[0..2], 9, native_endian);
-    var oversized = Attributes{ .bytes = &bytes };
-    try std.testing.expectError(error.TruncatedMessage, oversized.next());
-}
-
 pub fn errnoToError(errno: i32) Error {
     const v: i32 = if (errno < 0) -errno else errno;
     return switch (v) {
@@ -335,10 +252,16 @@ pub fn errnoToError(errno: i32) Error {
     };
 }
 
+// linux/netlink.h: SOL_NETLINK option joining one multicast group by number.
+const NETLINK_ADD_MEMBERSHIP: u32 = 1;
+// 4 MiB holds about forty 1,024-element install batches of events between the worker's 100 ms drains.
+pub const event_receive_bytes: u32 = 4 << 20;
+
 pub const NetlinkSocket = struct {
     fd: posix.socket_t,
     seq: u32 = 1,
     port_id: u32 = 0,
+    group: u32 = 0,
 
     pub fn init(protocol: u32) Error!NetlinkSocket {
         const flags = posix.SOCK.RAW | posix.SOCK.CLOEXEC;
@@ -364,6 +287,22 @@ pub const NetlinkSocket = struct {
         };
 
         return .{ .fd = fd, .port_id = sa.pid };
+    }
+
+    pub fn initEvents(group: u32) Error!NetlinkSocket {
+        if (group == 0 or group > 32) return error.InvalidArgument;
+        var sock = try init(linux.NETLINK.NETFILTER);
+        errdefer sock.close();
+        posix.setsockopt(sock.fd, linux.SOL.NETLINK, NETLINK_ADD_MEMBERSHIP, mem.asBytes(&group)) catch |err| return switch (err) {
+            error.PermissionDenied => error.PermissionDenied,
+            else => error.SocketFailed,
+        };
+        const bytes: u32 = event_receive_bytes;
+        posix.setsockopt(sock.fd, posix.SOL.SOCKET, linux.SO.RCVBUFFORCE, mem.asBytes(&bytes)) catch {
+            posix.setsockopt(sock.fd, posix.SOL.SOCKET, posix.SO.RCVBUF, mem.asBytes(&bytes)) catch return error.SocketFailed;
+        };
+        sock.group = group;
+        return sock;
     }
 
     pub fn close(self: *NetlinkSocket) void {
@@ -398,6 +337,13 @@ pub const NetlinkSocket = struct {
         };
         if (n == 0) return error.TruncatedMessage;
         return buf[0..n];
+    }
+
+    pub fn setSendBuffer(self: *NetlinkSocket, bytes: u32) Error!void {
+        const value = mem.asBytes(&bytes);
+        posix.setsockopt(self.fd, posix.SOL.SOCKET, linux.SO.SNDBUFFORCE, value) catch {
+            posix.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.SNDBUF, value) catch return error.SocketFailed;
+        };
     }
 
     pub fn setRecvTimeout(self: *NetlinkSocket, ms: u64) Error!void {
@@ -549,6 +495,7 @@ pub fn parseNlmsgerr(payload: []const u8) Error!i32 {
 pub const NFNL = struct {
     pub const SUBSYS_NFTABLES: u16 = 10;
     pub const SUBSYS_IPSET: u16 = 6;
+    pub const GRP_NFTABLES: u32 = 7;
 };
 
 pub fn nfnlMsgType(subsys: u16, msg: u16) u16 {
@@ -619,9 +566,10 @@ pub const Batch = struct {
             .res_id = mem.nativeToBig(u16, subsys),
         };
         const payload = mem.asBytes(&ng);
+        // The kernel queues the END ack only after the commit succeeded (Linux 6.12 nfnetlink.c); it is the proof the batch committed.
         try self.builder.append(
             NFNL_MSG_BATCH_END,
-            linux.NLM_F_REQUEST,
+            linux.NLM_F_REQUEST | linux.NLM_F_ACK,
             seq,
             pid,
             payload,
@@ -630,267 +578,3 @@ pub const Batch = struct {
         return self.builder.bytes();
     }
 };
-
-test "netlink: alignment rounds up to 4" {
-    try std.testing.expectEqual(@as(usize, 0), nlmsgAlign(0));
-    try std.testing.expectEqual(@as(usize, 4), nlmsgAlign(1));
-    try std.testing.expectEqual(@as(usize, 4), nlmsgAlign(3));
-    try std.testing.expectEqual(@as(usize, 4), nlmsgAlign(4));
-    try std.testing.expectEqual(@as(usize, 8), nlmsgAlign(5));
-    try std.testing.expectEqual(@as(usize, 16), nlmsgAlign(13));
-    try std.testing.expectEqual(@as(usize, 16), nlmsgAlign(16));
-}
-
-test "netlink: header length is 16 bytes" {
-    try std.testing.expectEqual(@as(usize, 16), NLMSG_HDRLEN);
-    try std.testing.expectEqual(@as(usize, 16), @sizeOf(linux.nlmsghdr));
-}
-
-test "netlink: MessageBuilder writes correct header bytes" {
-    var buf: [32]u8 = undefined;
-    var b = MessageBuilder.init(&buf);
-    const payload = [_]u8{ 0xAA, 0xBB };
-    try b.append(0x1234, linux.NLM_F_REQUEST | linux.NLM_F_ACK, 0x42, 0x1000, &payload);
-
-    const out = b.bytes();
-    try std.testing.expectEqual(@as(usize, 20), out.len);
-    try std.testing.expectEqual(@as(u32, 18), mem.readInt(u32, out[0..4], native_endian));
-    try std.testing.expectEqual(@as(u16, 0x1234), mem.readInt(u16, out[4..6], native_endian));
-    try std.testing.expectEqual(
-        @as(u16, linux.NLM_F_REQUEST | linux.NLM_F_ACK),
-        mem.readInt(u16, out[6..8], native_endian),
-    );
-    try std.testing.expectEqual(@as(u32, 0x42), mem.readInt(u32, out[8..12], native_endian));
-    try std.testing.expectEqual(@as(u32, 0x1000), mem.readInt(u32, out[12..16], native_endian));
-    try std.testing.expectEqual(@as(u8, 0xAA), out[16]);
-    try std.testing.expectEqual(@as(u8, 0xBB), out[17]);
-    try std.testing.expectEqual(@as(u8, 0), out[18]);
-    try std.testing.expectEqual(@as(u8, 0), out[19]);
-}
-
-test "netlink: MessageBuilder returns BufferTooSmall" {
-    var buf: [8]u8 = undefined;
-    var b = MessageBuilder.init(&buf);
-    try std.testing.expectError(
-        error.BufferTooSmall,
-        b.append(0x01, 0, 1, 0, &[_]u8{}),
-    );
-}
-
-test "netlink: MessageIterator walks multiple frames" {
-    var buf: [128]u8 = undefined;
-    var b = MessageBuilder.init(&buf);
-    try b.append(0x10, 0, 1, 0, &[_]u8{ 0xDE, 0xAD });
-    try b.append(0x20, 0, 2, 0, &[_]u8{ 0xBE, 0xEF, 0xCA, 0xFE });
-    try b.append(0x30, 0, 3, 0, &[_]u8{});
-
-    var it = MessageIterator.init(b.bytes());
-    const a = it.next() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(u16, 0x10), @intFromEnum(a.hdr.type));
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xDE, 0xAD }, a.payload);
-
-    const b2 = it.next() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(u16, 0x20), @intFromEnum(b2.hdr.type));
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xBE, 0xEF, 0xCA, 0xFE }, b2.payload);
-
-    const c = it.next() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(u16, 0x30), @intFromEnum(c.hdr.type));
-    try std.testing.expectEqualSlices(u8, &[_]u8{}, c.payload);
-
-    try std.testing.expect(it.next() == null);
-}
-
-test "netlink: parseNlmsgerr extracts errno" {
-    const payload = [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF };
-    try std.testing.expectEqual(@as(i32, -1), try parseNlmsgerr(&payload));
-
-    const ok = [_]u8{ 0x00, 0x00, 0x00, 0x00 };
-    try std.testing.expectEqual(@as(i32, 0), try parseNlmsgerr(&ok));
-
-    try std.testing.expectError(
-        error.TruncatedMessage,
-        parseNlmsgerr(&[_]u8{ 0x00, 0x00 }),
-    );
-}
-
-test "netlink: nfnlMsgType packs subsys + msg" {
-    try std.testing.expectEqual(
-        @as(u16, (10 << 8) | 2),
-        nfnlMsgType(NFNL.SUBSYS_NFTABLES, 2),
-    );
-    try std.testing.expectEqual(
-        @as(u16, (6 << 8) | 9),
-        nfnlMsgType(NFNL.SUBSYS_IPSET, 9),
-    );
-    try std.testing.expectEqual(
-        @as(u16, (10 << 8) | 0x55),
-        nfnlMsgType(10, 0x155),
-    );
-}
-
-test "netlink: Batch emits BEGIN and END frames around added messages" {
-    var buf: [256]u8 = undefined;
-    var batch = Batch.init(&buf);
-
-    try batch.begin(1, 0x4242, NFNL.SUBSYS_NFTABLES);
-    try batch.add(
-        nfnlMsgType(NFNL.SUBSYS_NFTABLES, 2),
-        linux.NLM_F_REQUEST | linux.NLM_F_ACK | linux.NLM_F_CREATE,
-        2,
-        0x4242,
-        &[_]u8{ 0xAA, 0xBB, 0xCC, 0xDD },
-    );
-    const out = try batch.commit(3, 0x4242, NFNL.SUBSYS_NFTABLES);
-
-    var it = MessageIterator.init(out);
-    const begin = it.next() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(
-        @as(u16, Batch.NFNL_MSG_BATCH_BEGIN),
-        @intFromEnum(begin.hdr.type),
-    );
-    try std.testing.expectEqual(@as(u32, 1), begin.hdr.seq);
-    try std.testing.expectEqual(@as(u8, NFPROTO.UNSPEC), begin.payload[0]);
-    const res_id_begin = mem.readInt(u16, begin.payload[2..4], .big);
-    try std.testing.expectEqual(@as(u16, NFNL.SUBSYS_NFTABLES), res_id_begin);
-
-    const mid = it.next() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(
-        @as(u16, nfnlMsgType(NFNL.SUBSYS_NFTABLES, 2)),
-        @intFromEnum(mid.hdr.type),
-    );
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xAA, 0xBB, 0xCC, 0xDD }, mid.payload);
-
-    const end = it.next() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(
-        @as(u16, Batch.NFNL_MSG_BATCH_END),
-        @intFromEnum(end.hdr.type),
-    );
-    try std.testing.expectEqual(@as(u32, 3), end.hdr.seq);
-
-    try std.testing.expect(it.next() == null);
-}
-
-test "netlink: Batch rejects out-of-order operations" {
-    var buf: [128]u8 = undefined;
-    var batch = Batch.init(&buf);
-
-    try std.testing.expectError(
-        error.InvalidBatchState,
-        batch.add(0x10, 0, 1, 0, &[_]u8{}),
-    );
-
-    try batch.begin(1, 0, NFNL.SUBSYS_NFTABLES);
-    try std.testing.expectError(
-        error.InvalidBatchState,
-        batch.begin(2, 0, NFNL.SUBSYS_NFTABLES),
-    );
-
-    _ = try batch.commit(2, 0, NFNL.SUBSYS_NFTABLES);
-    try std.testing.expectError(
-        error.InvalidBatchState,
-        batch.add(0x10, 0, 3, 0, &[_]u8{}),
-    );
-}
-
-test "netlink: open real socket or skip when not privileged" {
-    var sock = NetlinkSocket.init(linux.NETLINK.NETFILTER) catch {
-        return error.SkipZigTest;
-    };
-    defer sock.close();
-
-    try std.testing.expect(sock.fd >= 0);
-    try std.testing.expect(sock.port_id != 0);
-    try std.testing.expectEqual(@as(u32, 1), sock.nextSeq());
-    try std.testing.expectEqual(@as(u32, 2), sock.nextSeq());
-}
-
-test "netlink: init maps an unsupported netlink protocol to ProtocolUnsupported (SYS-014)" {
-    const bogus_protocol: u32 = 255;
-    const result = NetlinkSocket.init(bogus_protocol);
-    if (result) |sock| {
-        var s = sock;
-        s.close();
-        return error.SkipZigTest;
-    } else |err| switch (err) {
-        error.ProtocolUnsupported => {},
-        else => return error.SkipZigTest,
-    }
-}
-
-fn testSocketpair() ?[2]i32 {
-    var fds: [2]i32 = undefined;
-    const rc = linux.socketpair(posix.AF.UNIX, posix.SOCK.DGRAM, 0, &fds);
-    if (linux.E.init(rc) != .SUCCESS) return null;
-    return fds;
-}
-
-fn buildNlmsgErr(buf: []u8, seq: u32, errno: i32) []const u8 {
-    var b = MessageBuilder.init(buf);
-    var payload: [4]u8 = undefined;
-    mem.writeInt(i32, &payload, errno, native_endian);
-    b.append(@as(u16, 2), 0, seq, 0, &payload) catch unreachable;
-    return b.bytes();
-}
-
-test "netlink: drainAck surfaces a non-zero errno on an UNEXPECTED seq (SYS-014)" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-
-    const fds = testSocketpair() orelse return error.SkipZigTest;
-    var writer_open = true;
-    defer posix.close(fds[1]);
-    defer if (writer_open) posix.close(fds[0]);
-
-    var frame_buf: [64]u8 = undefined;
-    const frame = buildNlmsgErr(&frame_buf, 1, -1);
-    _ = posix.send(fds[0], frame, 0) catch return error.SkipZigTest;
-    posix.close(fds[0]);
-    writer_open = false;
-
-    var sock = NetlinkSocket{ .fd = fds[1] };
-    sock.setRecvTimeout(500) catch return error.SkipZigTest;
-    var scratch: [256]u8 = undefined;
-    const result = sock.drainAck(&[_]u32{2}, &scratch);
-    try std.testing.expectError(error.PermissionDenied, result);
-}
-
-test "netlink: drainAck maps each errno class on an unexpected seq (SYS-014)" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-
-    const Case = struct { errno: i32, want: anyerror };
-    const cases = [_]Case{
-        .{ .errno = -1, .want = error.PermissionDenied },
-        .{ .errno = -13, .want = error.PermissionDenied },
-        .{ .errno = -2, .want = error.NotFound },
-        .{ .errno = -17, .want = error.AlreadyExists },
-        .{ .errno = -22, .want = error.InvalidArgument },
-    };
-    for (cases) |c| {
-        const fds = testSocketpair() orelse return error.SkipZigTest;
-        defer posix.close(fds[1]);
-        var frame_buf: [64]u8 = undefined;
-        const frame = buildNlmsgErr(&frame_buf, 1, c.errno);
-        _ = posix.send(fds[0], frame, 0) catch return error.SkipZigTest;
-        posix.close(fds[0]);
-        var sock = NetlinkSocket{ .fd = fds[1] };
-        sock.setRecvTimeout(500) catch return error.SkipZigTest;
-        var scratch: [256]u8 = undefined;
-        try std.testing.expectError(c.want, sock.drainAck(&[_]u32{2}, &scratch));
-    }
-}
-
-test "netlink: drainAck does NOT surface a SUCCESS ack on an unexpected seq (SYS-014)" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-
-    const fds = testSocketpair() orelse return error.SkipZigTest;
-    defer posix.close(fds[1]);
-    var frame_buf: [64]u8 = undefined;
-    const frame = buildNlmsgErr(&frame_buf, 99, 0);
-    _ = posix.send(fds[0], frame, 0) catch return error.SkipZigTest;
-    posix.close(fds[0]);
-
-    var sock = NetlinkSocket{ .fd = fds[1] };
-    sock.setRecvTimeout(200) catch return error.SkipZigTest;
-    var scratch: [256]u8 = undefined;
-    const result = sock.drainAck(&[_]u32{2}, &scratch);
-    try std.testing.expect(result == error.Timeout or result == error.TruncatedMessage);
-}

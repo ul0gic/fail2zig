@@ -21,7 +21,7 @@ the unit and man pages, and refuses active state writers or a legacy binary stat
 file. It does not recursively change state ownership. To use a locally built
 binary, run `sudo scripts/install.sh --local-bin zig-out/bin` from the checkout.
 
-The v0.4.7 release provides one combined daemon/admin executable per target:
+The v0.4.8 release provides one combined daemon/admin executable per target:
 
 | Target | Qualification |
 |---|---|
@@ -38,11 +38,11 @@ requires `journalctl`; iptables and ipset backends require their host tools.
 
 If the installer is unsuitable, download only the needed executable and support
 files from the same release, then verify each against `SHA256SUMS` before use. For
-v0.4.7 on x86_64:
+v0.4.8 on x86_64:
 
 ```bash
 set -euo pipefail
-VERSION=v0.4.7
+VERSION=v0.4.8
 ARCH=x86_64-linux-musl
 BASE="https://github.com/ul0gic/fail2zig/releases/download/${VERSION}"
 for file in \
@@ -88,6 +88,23 @@ ipset backend's iptables extension and also grants raw socket authority. Keep th
 optional HTTP listener bound to loopback. See [SECURITY.md](../../SECURITY.md)
 and the [runtime architecture](../architecture.md) for the full boundary.
 
+## A second installation in the same network namespace
+
+The daemon owns one nftables table named after its installation. A clean stop leaves that
+table and its rules in place so the next start reconciles them; after `fail2zig firewall
+withdraw` the table stays with empty sets. A second installation started in the same
+namespace with a different state directory finds a table carrying the reserved name that
+its own state does not own and refuses with `ForeignState`, which is the ownership check
+working. Before starting a second installation, or after moving a state directory, remove
+the previous installation's table once its daemon is stopped and withdrawn:
+
+```bash
+sudo nft list tables | grep ' f2z_'
+sudo nft delete table inet f2z_<hash>
+```
+
+An in-place upgrade on the same state directory is unaffected.
+
 ## Upgrading existing state
 
 Stop the daemon and all other state writers before installation. Preserve the
@@ -95,31 +112,28 @@ executable, configuration and a coherent backup of the native database with its
 WAL/SHM siblings. An older binary cannot read newer checkpoint and marker data.
 Rollback requires the matching backup and binary, not an executable swap.
 
-The first start of this release upgrades a state last written by v0.4.6 (schema 24)
-to schema 25 in place. Schema 25 adds the storage for runtime ignore entries and
-continuity-loss events. States last written by releases before v0.4.6 are not a
-supported upgrade path; start from a fresh state.
+v0.4.7 is the minimum supported upgrade source. The first start of this release
+upgrades a state last written by v0.4.7 (schema 25) to schema 26 in place. Schema 26
+adds ban origins, ignore-entry deadlines and timed configuration entries. States last
+written by v0.4.6 or earlier are not a supported upgrade path; upgrade them through
+v0.4.7 first, or start from a fresh state.
 
 - Before its first change it writes a coherent copy of the database to a backup. It
   needs free space of twice the database size plus 32 MiB, and refuses to start if
   that backup file already exists. Move an old backup aside only when it is not the
   sole copy of earlier state.
-- The backup is `<state_file>.pre25-backup`.
-- The upgrade commits in small resumable steps. An interrupted upgrade resumes on
-  the next start. While it runs, the daemon extends its systemd start deadline only
-  as steps commit. The log reports completion, the backup path and how many
-  unsettled outcomes of already-replaced ban decisions were closed as `superseded`.
-- The first start also rekeys, once, saved detection generations that hashed the
-  ignore list. No ban, deadline, checkpoint or retry subject changes, and the log
-  reports how many jails and rows were rekeyed.
+- The backup is `<state_file>.pre26-backup`.
+- The upgrade commits in one transaction, so an interrupted upgrade leaves the
+  state at schema 25. Every existing ban gets origin `detection`. The log reports
+  completion and the backup path.
 
-v0.4.6 and older binaries refuse a schema 25 database with their schema-version
+v0.4.7 and older binaries refuse a schema 26 database with their schema-version
 message, so an older binary cannot be started on upgraded state without
 restoring the backup.
 
 To roll back, stop the daemon, restore the backup the upgrade wrote over the state
 file, remove the upgraded database's `-wal`/`-shm` files and reinstall the binary
-that last wrote that state: v0.4.6 for `.pre25-backup`. If you copied the backup
+that last wrote that state: v0.4.7 for `.pre26-backup`. If you copied the backup
 into place instead of moving it, move the backup file aside before the next
 upgrade, because an existing backup file refuses the start.
 

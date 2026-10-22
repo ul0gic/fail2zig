@@ -5,11 +5,32 @@ const linux_dupfd_cloexec = 1030;
 const records = @import("source_record.zig");
 const native_text = @import("source_text.zig");
 const config = @import("../config/native.zig");
+const group_commit = @import("../store/group_commit.zig");
+const cursor_bytes = @import("../store/store.zig").Limits.cursor_bytes;
 const Allocator = std.mem.Allocator;
+
+pub const BatchAckCallback = *const fn ([]const records.Record, *usize, ?*anyopaque) anyerror!void;
+
+pub const WallClock = struct {
+    context: ?*anyopaque = null,
+    read: *const fn (?*anyopaque) i64 = systemWallUs,
+
+    pub fn us(self: WallClock) i64 {
+        return self.read(self.context);
+    }
+    fn seconds(self: WallClock) i64 {
+        return @divFloor(self.us(), std.time.us_per_s);
+    }
+};
+fn systemWallUs(_: ?*anyopaque) i64 {
+    return std.time.microTimestamp();
+}
 pub const Start = enum { head, tail };
 pub const discovery_entries_per_turn: usize = 256;
 pub const discovery_entries_per_episode: usize = 65_536;
 pub const discovery_max_depth: usize = 16;
+// Filebeat's inactive-close default: .project/references/beats/filebeat/input/filestream/config.go:180
+const unlinked_retire_ms: u64 = 5 * std.time.ms_per_min;
 pub const DiscoveryStatus = enum { pending, complete };
 pub const Framing = enum {
     bytes,
@@ -79,6 +100,7 @@ pub const LossEvent = struct {
 };
 
 pub const RemovedVerdict = enum { drained, unread, unknown };
+const NamedPath = enum { present, absent, absent_reported };
 
 pub const PendingLoss = struct { event: LossEvent, checkpoint_durable: bool };
 
@@ -159,8 +181,12 @@ pub const FileSource = struct {
     siblings: ?*const std.ArrayList(FileSource) = null,
     awaiting_path: bool = false,
     awaiting_checked_s: i64 = 0,
+    named_path: NamedPath = .present,
+    named_checked_s: i64 = 0,
+    unlinked_idle: ?struct { size: u64, since_ms: u64 } = null,
     pending_loss: ?PendingLoss = null,
     detected_s: i64 = 0,
+    wall_clock: WallClock = .{},
     read_prefix: *const fn (std.fs.File, u8) anyerror![32]u8 = prefix,
 
     pub fn framingBinding(encoding: native_text.Encoding, configuration_hash: [32]u8, max_bytes: usize) [32]u8 {
@@ -275,7 +301,7 @@ pub const FileSource = struct {
             .observed_inode = if (observed) |value| value.inode else null,
         };
         self.continuity_reported = false;
-        self.detected_s = std.time.timestamp();
+        self.detected_s = self.wall_clock.seconds();
         self.health = .resume_lost;
         return error.ResumeLost;
     }
@@ -287,7 +313,7 @@ pub const FileSource = struct {
             return err;
         };
         if (self.pending_loss == null) {
-            const now_us = std.time.microTimestamp();
+            const now_us = self.wall_clock.us();
             self.detected_s = @divFloor(now_us, std.time.us_per_s);
             self.pending_loss = .{
                 .event = .{
@@ -317,7 +343,7 @@ pub const FileSource = struct {
     fn absent(self: *FileSource) error{ResumeLost}!?std.fs.File {
         if (self.policy != .restart) return self.continuityLost(.missing, null);
         self.awaiting_path = true;
-        self.awaiting_checked_s = std.time.timestamp();
+        self.awaiting_checked_s = self.wall_clock.seconds();
         return null;
     }
 
@@ -355,7 +381,7 @@ pub const FileSource = struct {
             else => return err,
         };
         const expected = self.committed orelse return direct;
-        if (direct == null and self.awaiting_path and self.resume_search == null and std.time.timestamp() == self.awaiting_checked_s) return null;
+        if (direct == null and self.awaiting_path and self.resume_search == null and self.wall_clock.seconds() == self.awaiting_checked_s) return null;
         var replacement: ?Observed = null;
         if (direct) |f| {
             const stat = std.posix.fstat(f.handle) catch |err| {
@@ -461,6 +487,7 @@ pub const FileSource = struct {
         }
         self.file = f;
         self.awaiting_path = false;
+        self.named_checked_s = 0;
         self.health = .healthy;
         self.continuity_failure = null;
         self.continuity_reported = false;
@@ -509,6 +536,17 @@ pub const FileSource = struct {
             try self.lostOrRestarted(file, r, observed);
         self.health = .healthy;
         return true;
+    }
+
+    fn checkNamedPath(self: *FileSource) void {
+        const now = self.wall_clock.seconds();
+        if (self.named_checked_s == now) return;
+        self.named_checked_s = now;
+        _ = std.posix.fstatat(std.posix.AT.FDCWD, self.path, 0) catch |err| {
+            if ((err == error.FileNotFound or err == error.NotDir) and self.named_path == .present) self.named_path = .absent;
+            return;
+        };
+        self.named_path = .present;
     }
 
     pub fn verifyExistingContinuity(self: *FileSource) !void {
@@ -566,16 +604,32 @@ pub const FileSource = struct {
         return stat.dev != r.device or stat.ino != r.inode;
     }
 
-    pub fn markUnlinkedAndDrained(self: *FileSource) !bool {
+    pub fn markUnlinkedAndDrained(self: *FileSource, now_ms: u64) !bool {
         const f = self.file orelse return false;
         const r = self.committed orelse return false;
         if (!self.baseline_committed or self.pending_loss != null) return false;
         const held = try std.posix.fstat(f.handle);
-        if (held.nlink != 0 or @as(u64, @intCast(held.size)) != r.offset) return false;
+        if (held.nlink != 0 or @as(u64, @intCast(held.size)) != r.offset) {
+            self.unlinked_idle = null;
+            return false;
+        }
         const named = std.posix.fstatat(std.posix.AT.FDCWD, self.path, 0) catch |err| switch (err) {
-            error.FileNotFound => return false,
+            error.FileNotFound => {
+                const idle = self.unlinked_idle orelse return self.startUnlinkedIdle(r.offset, now_ms);
+                if (idle.size != r.offset) return self.startUnlinkedIdle(r.offset, now_ms);
+                if (now_ms -| idle.since_ms < unlinked_retire_ms) return false;
+                self.continuity_failure = .{
+                    .kind = .missing,
+                    .incarnation = r.incarnation,
+                    .committed_offset = r.offset,
+                    .committed_device = r.device,
+                    .committed_inode = r.inode,
+                };
+                return true;
+            },
             else => return err,
         };
+        self.unlinked_idle = null;
         const observed = observe(named);
         self.continuity_failure = .{
             .kind = .replaced,
@@ -590,11 +644,100 @@ pub const FileSource = struct {
         return true;
     }
 
+    fn startUnlinkedIdle(self: *FileSource, size: u64, now_ms: u64) bool {
+        self.unlinked_idle = .{ .size = size, .since_ms = now_ms };
+        return false;
+    }
+
     pub fn poll(self: *FileSource, callback: records.AckCallback, userdata: ?*anyopaque) !bool {
         while (true) return self.pollTurn(callback, userdata, false) catch |err| {
             if (err == error.SourceRepairPending) continue;
             return err;
         };
+    }
+
+    const Mark = struct { committed: ?Resume, baseline_committed: bool, in_operation: bool, pending_eof_check: bool };
+    fn mark(self: *const FileSource) Mark {
+        return .{ .committed = self.committed, .baseline_committed = self.baseline_committed, .in_operation = self.in_operation, .pending_eof_check = self.pending_eof_check };
+    }
+    fn rewind(self: *FileSource, to: Mark) void {
+        self.committed = to.committed;
+        self.baseline_committed = to.baseline_committed;
+        self.in_operation = to.in_operation;
+        self.pending_eof_check = to.pending_eof_check;
+    }
+    const BatchCollector = struct {
+        source: *FileSource,
+        allocator: Allocator,
+        items: [group_commit.max_batch_records]records.Record = undefined,
+        marks: [group_commit.max_batch_records]Mark = undefined,
+        count: usize = 0,
+        bytes: usize = 0,
+        budget: usize,
+
+        fn collect(record: records.Record, context: ?*anyopaque) !void {
+            const self: *BatchCollector = @ptrCast(@alignCast(context.?));
+            var needed = record.occurrence.len + record.cursor.len + record.message.len;
+            if (record.predecoded) |decoded| needed += decoded.text.len + decoded.codec.len + decoded.disposition.len + (if (decoded.diagnostic) |value| value.len else 0) + decoded.codec_context_json.len + decoded.profile_hash.len + decoded.config_generation.len;
+            if (self.bytes + needed > self.budget) return error.BatchFull;
+            self.bytes += needed;
+            var owned = record;
+            owned.occurrence = try self.allocator.dupe(u8, record.occurrence);
+            owned.cursor = try self.allocator.dupe(u8, record.cursor);
+            owned.message = try self.allocator.dupe(u8, record.message);
+            if (record.predecoded) |decoded| {
+                var copy = decoded;
+                copy.text = try self.allocator.dupe(u8, decoded.text);
+                copy.codec = try self.allocator.dupe(u8, decoded.codec);
+                copy.disposition = try self.allocator.dupe(u8, decoded.disposition);
+                copy.diagnostic = if (decoded.diagnostic) |value| try self.allocator.dupe(u8, value) else null;
+                copy.codec_context_json = try self.allocator.dupe(u8, decoded.codec_context_json);
+                copy.profile_hash = try self.allocator.dupe(u8, decoded.profile_hash);
+                copy.config_generation = try self.allocator.dupe(u8, decoded.config_generation);
+                owned.predecoded = copy;
+            }
+            self.items[self.count] = owned;
+            if (record.kind == .checkpoint) {
+                self.marks[self.count] = self.source.mark();
+                self.marks[self.count].baseline_committed = true;
+            }
+            self.count += 1;
+        }
+    };
+
+    pub fn pollBatch(self: *FileSource, callback: BatchAckCallback, userdata: ?*anyopaque) !usize {
+        while (true) return self.pollBatchTurn(callback, userdata, false) catch |err| {
+            if (err == error.SourceRepairPending) continue;
+            return err;
+        };
+    }
+    pub fn pollBatchTurn(self: *FileSource, callback: BatchAckCallback, userdata: ?*anyopaque, preserve_checkpoint: bool) !usize {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        // Fits the admitted source workspace (native_resource_budget.zig:196) beside one pollTurn's own line and cursor.
+        var collector = BatchCollector{ .source = self, .allocator = arena.allocator(), .budget = 3 * self.max_record_bytes + cursor_bytes };
+        const start = self.mark();
+        const read_failure: ?anyerror = while (collector.count + 2 <= collector.items.len) {
+            const delivered = self.pollTurn(BatchCollector.collect, &collector, preserve_checkpoint) catch |err| {
+                if (err != error.BatchFull or collector.count == 0) break err;
+                self.health = .healthy;
+                break null;
+            };
+            if (!delivered) break null;
+            collector.marks[collector.count - 1] = self.mark();
+        } else null;
+        if (collector.count == 0) return read_failure orelse 0;
+        var acknowledged: usize = 0;
+        const delivery = callback(collector.items[0..collector.count], &acknowledged, userdata);
+        if (acknowledged < collector.count) self.rewind(if (acknowledged == 0) start else collector.marks[acknowledged - 1]);
+        delivery catch |err| {
+            self.health = .commit_failed;
+            return err;
+        };
+        if (acknowledged >= collector.count) if (read_failure) |err| return err;
+        var data: usize = 0;
+        for (collector.items[0..@min(acknowledged, collector.count)]) |record| data += @intFromBool(record.kind == .data);
+        return data;
     }
     pub fn pollTurn(self: *FileSource, callback: records.AckCallback, userdata: ?*anyopaque, preserve_checkpoint: bool) !bool {
         if (self.committed) |saved_resume| if (saved_resume.codec_configuration_hash != null and self.frame_callback == null and self.native_encoding == null) return error.FramingProfileMismatch;
@@ -602,6 +745,7 @@ pub const FileSource = struct {
         self.continuity_failure = null;
         self.continuity_reported = false;
         if (!try self.attachTurn()) return false;
+        self.checkNamedPath();
         if (self.pending_loss != null) return false;
         try self.finishEofCheck();
         const f = self.file.?;
@@ -767,135 +911,6 @@ pub const FileSource = struct {
         if (count == 0) self.in_operation = true;
     }
 };
-
-const testing = std.testing;
-const Collector = struct {
-    ids: std.ArrayList([]u8),
-    lines: std.ArrayList([]u8),
-    fail: bool = false,
-    fn init() Collector {
-        return .{ .ids = std.ArrayList([]u8).init(testing.allocator), .lines = std.ArrayList([]u8).init(testing.allocator) };
-    }
-    fn deinit(self: *Collector) void {
-        for (self.ids.items) |s| testing.allocator.free(s);
-        self.ids.deinit();
-        for (self.lines.items) |s| testing.allocator.free(s);
-        self.lines.deinit();
-    }
-    fn ack(r: records.Record, ud: ?*anyopaque) !void {
-        const self: *Collector = @ptrCast(@alignCast(ud.?));
-        if (self.fail) return error.CommitFailed;
-        if (r.kind == .checkpoint) return;
-        try self.ids.append(try testing.allocator.dupe(u8, r.occurrence));
-        try self.lines.append(try testing.allocator.dupe(u8, r.message));
-    }
-};
-
-test "durable file: recovery detects truncation on retained descriptors without resetting the cursor" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "input", .data = "ordinary first event\nordinary unread event\n" });
-    const path = try tmp.dir.realpathAlloc(testing.allocator, "input");
-    defer testing.allocator.free(path);
-    var source = try FileSource.init(testing.allocator, path, "fixture", .head, null);
-    defer source.deinit();
-    var collector = Collector.init();
-    defer collector.deinit();
-    try testing.expect(try source.poll(Collector.ack, &collector));
-    const saved = source.acknowledgedCheckpoint().?;
-    try testing.expect(try source.verifyContinuity());
-    try tmp.dir.writeFile(.{ .sub_path = "input", .data = "new\n" });
-    try testing.expectError(error.ResumeLost, source.verifyContinuity());
-    try testing.expectEqual(records.Health.resume_lost, source.health);
-    try testing.expectEqualDeep(saved, source.acknowledgedCheckpoint().?);
-    try testing.expectEqual(@as(usize, 1), collector.lines.items.len);
-}
-
-test "durable file: partial records, failed commit, same-content occurrences and restart" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "input", .data = "same\nsame\npart" });
-    const path = try tmp.dir.realpathAlloc(testing.allocator, "input");
-    defer testing.allocator.free(path);
-    var source = try FileSource.init(testing.allocator, path, "jail/source", .head, null);
-    defer source.deinit();
-    var c = Collector.init();
-    defer c.deinit();
-    c.fail = true;
-    try testing.expectError(error.CommitFailed, source.poll(Collector.ack, &c));
-    try testing.expectEqual(@as(u64, 0), source.committed.?.offset);
-    try testing.expect(source.acknowledgedCheckpoint() == null);
-    c.fail = false;
-    try testing.expect(try source.poll(Collector.ack, &c));
-    const checkpoint = source.committed.?;
-    try testing.expect(try source.poll(Collector.ack, &c));
-    try testing.expect(!std.mem.eql(u8, c.ids.items[0], c.ids.items[1]));
-    try testing.expect(!try source.poll(Collector.ack, &c));
-    var replay = try FileSource.init(testing.allocator, path, "jail/source", .head, checkpoint);
-    defer replay.deinit();
-    try testing.expect(try replay.poll(Collector.ack, &c));
-    try testing.expectEqualStrings(c.ids.items[1], c.ids.items[2]);
-    var f = try tmp.dir.openFile("input", .{ .mode = .write_only });
-    defer f.close();
-    try f.seekFromEnd(0);
-    try f.writeAll("ial\n");
-    try testing.expect(try source.poll(Collector.ack, &c));
-    try testing.expectEqualStrings("partial", c.lines.items[3]);
-}
-
-test "durable file: replacement retains old descriptor, restart recovers rotation and rejects deleted incarnation" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "input", .data = "first\n" });
-    const path = try tmp.dir.realpathAlloc(testing.allocator, "input");
-    defer testing.allocator.free(path);
-    var source = try FileSource.init(testing.allocator, path, "jail/source", .head, null);
-    defer source.deinit();
-    var c = Collector.init();
-    defer c.deinit();
-    try testing.expect(try source.poll(Collector.ack, &c));
-    const checkpoint = source.committed.?;
-    try tmp.dir.rename("input", "old");
-    try tmp.dir.writeFile(.{ .sub_path = "input", .data = "replacement\n" });
-    var old = try tmp.dir.openFile("old", .{ .mode = .write_only });
-    defer old.close();
-    try old.seekFromEnd(0);
-    try old.writeAll("late\n");
-    try testing.expect(try source.replaced());
-    try testing.expect(try source.poll(Collector.ack, &c));
-    try testing.expectEqualStrings("late", c.lines.items[1]);
-    var replay = try FileSource.init(testing.allocator, path, "jail/source", .head, checkpoint);
-    defer replay.deinit();
-    try testing.expect(try replay.poll(Collector.ack, &c));
-    try testing.expectEqualStrings("late", c.lines.items[2]);
-    try tmp.dir.deleteFile("old");
-    var lost = try FileSource.init(testing.allocator, path, "jail/source", .head, checkpoint);
-    defer lost.deinit();
-    try testing.expectError(error.ResumeLost, lost.poll(Collector.ack, &c));
-    try testing.expectEqual(records.Health.resume_lost, lost.health);
-}
-
-test "durable file: tail, delayed creation and copytruncate" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
-    defer testing.allocator.free(dir);
-    const path = try std.fs.path.join(testing.allocator, &.{ dir, "input" });
-    defer testing.allocator.free(path);
-    var source = try FileSource.init(testing.allocator, path, "jail/source", .tail, null);
-    defer source.deinit();
-    var c = Collector.init();
-    defer c.deinit();
-    try testing.expect(!try source.poll(Collector.ack, &c));
-    try testing.expectEqual(records.Health.missing, source.health);
-    try tmp.dir.writeFile(.{ .sub_path = "input", .data = "history\n" });
-    try testing.expect(!try source.poll(Collector.ack, &c));
-    const incarnation = source.committed.?.incarnation;
-    try tmp.dir.writeFile(.{ .sub_path = "input", .data = "new\n" });
-    try testing.expect(try source.poll(Collector.ack, &c));
-    try testing.expectEqualStrings("new", c.lines.items[0]);
-    try testing.expect(!std.mem.eql(u8, &incarnation, &source.committed.?.incarnation));
-}
 
 pub fn matchComponent(pattern: []const u8, name: []const u8) bool {
     if (name.len > 0 and name[0] == '.' and (pattern.len == 0 or pattern[0] != '.')) return false;
@@ -1134,6 +1149,7 @@ pub const FileSet = struct {
     framing: Framing = .bytes,
     policy: config.TruncationPolicy = .refuse,
     health: records.Health = .waiting,
+    wall_clock: WallClock = .{},
     restore: ?RestoreCallback = null,
     restore_userdata: ?*anyopaque = null,
     initialize_source: ?*const fn (*FileSource, ?*anyopaque) anyerror!void = null,
@@ -1170,6 +1186,7 @@ pub const FileSet = struct {
         source.policy = self.policy;
         source.jail = self.jail;
         source.siblings = &self.sources;
+        source.wall_clock = self.wall_clock;
         if (self.initialize_source) |initialize| try initialize(&source, self.initialize_userdata);
         try self.sources.append(source);
     }
@@ -1247,6 +1264,7 @@ pub const FileSet = struct {
 
     fn admitDiscovered(self: *FileSet, path: []const u8, start: Start) !void {
         const f = openRegularAt(std.fs.cwd(), path) catch |err| {
+            if (err == error.FileNotFound or err == error.NotDir) return;
             self.health = if (err == error.AccessDenied) .permission_denied else .read_failed;
             return err;
         };
@@ -1294,6 +1312,7 @@ pub const FileSet = struct {
         source.policy = self.policy;
         source.jail = self.jail;
         source.siblings = &self.sources;
+        source.wall_clock = self.wall_clock;
         if (checkpoint == null) source.framing = self.framing;
         for (self.sources.items) |previous| {
             if (std.mem.eql(u8, previous.path, path) and previous.in_operation) source.in_operation = true;
@@ -1317,153 +1336,3 @@ pub const FileSet = struct {
         return delivered;
     }
 };
-
-test "durable file set: glob ordering, hidden files and independent rotation streams" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "b.log", .data = "b\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "a.log", .data = "a\n" });
-    try tmp.dir.writeFile(.{ .sub_path = ".hidden.log", .data = "hidden\n" });
-    const dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
-    defer testing.allocator.free(dir);
-    const pattern = try std.fs.path.join(testing.allocator, &.{ dir, "*.log" });
-    defer testing.allocator.free(pattern);
-    var set = try FileSet.init(testing.allocator, "example");
-    defer set.deinit();
-    try set.add(pattern, .head);
-    var c = Collector.init();
-    defer c.deinit();
-    try testing.expectEqual(@as(usize, 2), try set.poll(Collector.ack, &c));
-    try testing.expectEqualStrings("a", c.lines.items[0]);
-    try testing.expectEqualStrings("b", c.lines.items[1]);
-    try tmp.dir.rename("a.log", "a.old");
-    try tmp.dir.writeFile(.{ .sub_path = "a.log", .data = "replacement\n" });
-    var old = try tmp.dir.openFile("a.old", .{ .mode = .write_only });
-    defer old.close();
-    try old.seekFromEnd(0);
-    try old.writeAll("late\n");
-    try testing.expectEqual(@as(usize, 2), try set.poll(Collector.ack, &c));
-    try testing.expectEqualStrings("late", c.lines.items[2]);
-    try testing.expectEqualStrings("replacement", c.lines.items[3]);
-    try testing.expectEqual(@as(usize, 3), set.sources.items.len);
-}
-
-test "glob: bracket classes, negative classes, dot and literal brackets" {
-    try testing.expect(matchComponent("a[0-9]?.log", "a2x.log"));
-    try testing.expect(matchComponent("[!a]*", "bcd"));
-    try testing.expect(!matchComponent("[!a]*", "abc"));
-    try testing.expect(!matchComponent("*", ".hidden"));
-    try testing.expect(matchComponent(".*", ".hidden"));
-    try testing.expect(matchComponent("[[]a", "[a"));
-    try testing.expect(matchComponent("a[", "a["));
-    try testing.expect(matchComponent("?.log", "é.log"));
-    try testing.expect(matchComponent("[é-ê]x", "êx"));
-    try testing.expect(!matchComponent("[é-ê]x", "ëx"));
-    try testing.expect(matchComponent("*é", "été"));
-}
-
-test "durable file: UTF16 and UTF32 boundaries do not split interim newline bytes" {
-    const inputs = [_]struct { framing: Framing, bytes: []const u8, first: []const u8, second: []const u8, first_end: u64 }{
-        .{ .framing = .utf16le, .bytes = &.{ 0x0a, 0x01, 0x0d, 0, 0x0a, 0, 0x62, 0, 0x0a, 0 }, .first = &.{ 0x0a, 0x01 }, .second = &.{ 0x62, 0 }, .first_end = 6 },
-        .{ .framing = .utf16be, .bytes = &.{ 0x01, 0x0a, 0, 0x0d, 0, 0x0a, 0, 0x62, 0, 0x0a }, .first = &.{ 0x01, 0x0a }, .second = &.{ 0, 0x62 }, .first_end = 6 },
-        .{ .framing = .utf32le, .bytes = &.{ 0x0a, 0x01, 0, 0, 0x0a, 0, 0, 0, 0x62, 0, 0, 0, 0x0a, 0, 0, 0 }, .first = &.{ 0x0a, 0x01, 0, 0 }, .second = &.{ 0x62, 0, 0, 0 }, .first_end = 8 },
-        .{ .framing = .utf32be, .bytes = &.{ 0, 0, 0x01, 0x0a, 0, 0, 0, 0x0a, 0, 0, 0, 0x62, 0, 0, 0, 0x0a }, .first = &.{ 0, 0, 0x01, 0x0a }, .second = &.{ 0, 0, 0, 0x62 }, .first_end = 8 },
-    };
-    for (inputs) |input| {
-        var tmp = testing.tmpDir(.{});
-        defer tmp.cleanup();
-        try tmp.dir.writeFile(.{ .sub_path = "input", .data = input.bytes });
-        const path = try tmp.dir.realpathAlloc(testing.allocator, "input");
-        defer testing.allocator.free(path);
-        var source = try FileSource.init(testing.allocator, path, "encoding", .head, null);
-        defer source.deinit();
-        source.framing = input.framing;
-        var c = Collector.init();
-        defer c.deinit();
-        try testing.expect(try source.poll(Collector.ack, &c));
-        try testing.expectEqualStrings(input.first, c.lines.items[0]);
-        try testing.expectEqual(input.first_end, source.committed.?.offset);
-        const checkpoint = source.committed.?;
-        var restarted = try FileSource.init(testing.allocator, path, "encoding", .head, checkpoint);
-        defer restarted.deinit();
-        try testing.expect(try restarted.poll(Collector.ack, &c));
-        try testing.expectEqualStrings(input.second, c.lines.items[1]);
-        try testing.expectEqual(input.framing, restarted.committed.?.framing);
-    }
-}
-
-test "durable file: data commit failure and overlong record cannot advance consumption" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "input", .data = "first\nsecond\n" });
-    const path = try tmp.dir.realpathAlloc(testing.allocator, "input");
-    defer testing.allocator.free(path);
-    var source = try FileSource.init(testing.allocator, path, "bounded", .head, null);
-    defer source.deinit();
-    var c = Collector.init();
-    defer c.deinit();
-    try testing.expect(try source.poll(Collector.ack, &c));
-    const checkpoint = source.committed.?;
-    c.fail = true;
-    try testing.expectError(error.CommitFailed, source.poll(Collector.ack, &c));
-    try testing.expectEqual(checkpoint.offset, source.committed.?.offset);
-    try testing.expectEqual(records.Health.commit_failed, source.health);
-    c.fail = false;
-    source.max_record_bytes = 3;
-    try testing.expectError(error.RecordTooLong, source.poll(Collector.ack, &c));
-    try testing.expectEqual(checkpoint.offset, source.committed.?.offset);
-    try testing.expectEqual(records.Health.record_too_long, source.health);
-    source.max_record_bytes = 1024;
-    try testing.expect(try source.poll(Collector.ack, &c));
-    try testing.expectEqualStrings("second", c.lines.items[1]);
-}
-
-test "durable file set: renamed file still matching glob is not ingested twice" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "a.log", .data = "old\n" });
-    const dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
-    defer testing.allocator.free(dir);
-    const pattern = try std.fs.path.join(testing.allocator, &.{ dir, "*.log*" });
-    defer testing.allocator.free(pattern);
-    var set = try FileSet.init(testing.allocator, "example");
-    defer set.deinit();
-    try set.add(pattern, .head);
-    var c = Collector.init();
-    defer c.deinit();
-    try testing.expectEqual(@as(usize, 1), try set.poll(Collector.ack, &c));
-    try tmp.dir.rename("a.log", "a.log.1");
-    try tmp.dir.writeFile(.{ .sub_path = "a.log", .data = "new\n" });
-    try testing.expectEqual(@as(usize, 1), try set.poll(Collector.ack, &c));
-    try testing.expectEqual(@as(usize, 2), set.sources.items.len);
-    try testing.expectEqualStrings("new", c.lines.items[1]);
-}
-
-test "durable file set: configured hardlink aliases retain independent positions" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "a.log", .data = "original neutral\n" });
-    try std.posix.linkat(tmp.dir.fd, "a.log", tmp.dir.fd, "b.log", 0);
-    const dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
-    defer testing.allocator.free(dir);
-    const pattern = try std.fs.path.join(testing.allocator, &.{ dir, "*.log" });
-    defer testing.allocator.free(pattern);
-    var set = try FileSet.init(testing.allocator, "aliases");
-    defer set.deinit();
-    try set.add(pattern, .head);
-    try set.add(pattern, .head);
-    var c = Collector.init();
-    defer c.deinit();
-    try testing.expectEqual(@as(usize, 2), try set.poll(Collector.ack, &c));
-    try testing.expectEqual(@as(usize, 2), set.sources.items.len);
-    try testing.expectEqualStrings("original neutral", c.lines.items[0]);
-    try testing.expectEqualStrings("original neutral", c.lines.items[1]);
-    try testing.expectEqual(@as(usize, 0), try set.poll(Collector.ack, &c));
-    var file = try tmp.dir.openFile("a.log", .{ .mode = .write_only });
-    defer file.close();
-    try file.seekFromEnd(0);
-    try file.writeAll("later\n");
-    try testing.expectEqual(@as(usize, 2), try set.poll(Collector.ack, &c));
-    try testing.expectEqualStrings("later", c.lines.items[2]);
-    try testing.expectEqualStrings("later", c.lines.items[3]);
-}

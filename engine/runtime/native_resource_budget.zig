@@ -10,6 +10,7 @@ const repair = @import("../core/source_repair.zig");
 const consumer = @import("../core/native_consumer.zig");
 const runtime = @import("native_consumer_runtime.zig");
 const effect = @import("../core/native_effect.zig");
+const retry = @import("../core/native_retry.zig");
 const effect_runtime = @import("native_effect_runtime.zig");
 const inspection = @import("../firewall/inspection.zig");
 const timezone = @import("../core/native_timezone.zig");
@@ -19,8 +20,8 @@ const http = @import("../net/http.zig");
 const shared = @import("shared");
 pub const mib = 1024 * 1024;
 pub const sqlite_heap_bytes = 64 * mib;
-pub const sqlite_page_bytes = 256 * mib;
-pub const sqlite_advisory_cache_bytes = 2 * mib;
+pub const sqlite_page_bytes = 1024 * mib;
+pub const sqlite_advisory_cache_bytes = 32 * mib;
 pub const wal_trigger_bytes = 16 * mib;
 pub const allocation_allowance = 64;
 pub const max_reservations = 512;
@@ -244,15 +245,15 @@ pub fn storeWorkspace() Component {
 }
 pub fn effectCost(environment: Environment) Error!Component {
     const limits = inspection.Limits{};
-    const live = Cost{ .bytes = @sizeOf(effect_runtime.Manager) + effect.max_effects * (2 * @sizeOf(effect.Entry) + @sizeOf(bool)), .allocations = 4 };
+    const live = Cost{ .bytes = effect_runtime.live_bytes, .allocations = 4 };
     const vector = try mul(try mul(try add(limits.max_messages, 8), 3), @sizeOf([]u8));
     const spawn = try environment.spawnCost(64, 8192);
     const work = try spawn.plus(.{ .bytes = try add(limits.max_bytes, vector), .allocations = try add(limits.max_messages, 64) });
-    return .{ .live = live, .restore_overlap = live, .workspace = work, .workspace_kind = .effect };
+    return .{ .live = live, .workspace = work, .workspace_kind = .effect };
 }
 pub fn publicationCost(subjects: usize, coordinator_capacity: usize) Error!Cost {
-    if (subjects > 4096) return error.InvalidResourceLimit;
-    return .{ .bytes = try add(coordinator_capacity, try mul(subjects, 2 * (@sizeOf(store.Store.ActiveDecision) + @sizeOf(bool)))), .allocations = 4 * 128 };
+    if (subjects > retry.max_pool_subjects) return error.InvalidResourceLimit;
+    return .{ .bytes = try add(coordinator_capacity, try mul(subjects, 3 * (@sizeOf(store.Store.ActiveDecision) + @sizeOf(bool) + @sizeOf(?[32]u8)))), .allocations = 4 * 128 };
 }
 pub fn controlCost(metrics: bool, response_capacity: usize) Error!Component {
     if (response_capacity == 0 or response_capacity > 2 * shared.protocol.max_payload_size) return error.InvalidResourceLimit;

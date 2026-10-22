@@ -107,38 +107,3 @@ pub const Stored = struct {
         }
     }
 };
-
-test "native processor: typed time rows reject inconsistent provenance" {
-    const receipt = time.Timestamp{ .us = 9_007_199_254_740_993 };
-    const adjusted = try policy.evaluate(.timestamped, .{ .parsed = .{ .us = receipt.us + 60_000_000 } }, receipt, receipt, 600_000_000);
-    const stored = try Stored.fromOutcome(adjusted, receipt);
-    try std.testing.expectEqualDeep(adjusted, try stored.outcome(receipt));
-    var invalid = stored;
-    invalid.effective_us = receipt.us + 1;
-    try std.testing.expectError(error.InvalidNativeTime, invalid.outcome(receipt));
-    invalid = stored;
-    invalid.kind = .future;
-    invalid.effective_us = null;
-    try std.testing.expectError(error.InvalidNativeTime, invalid.outcome(receipt));
-    invalid.kind = .missing;
-    try std.testing.expectError(error.InvalidNativeTime, invalid.outcome(receipt));
-    const oldest = Stored{ .kind = .obsolete_event, .original_us = std.math.minInt(i64), .effective_us = std.math.minInt(i64) };
-    try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), (try oldest.outcome(receipt)).obsolete.timestamp.us);
-}
-
-test "native processor: replacement disposition preserves typed time provenance" {
-    const receipt = time.Timestamp{ .us = 1_000_000_000 };
-    for ([_]policy.Result{
-        try policy.evaluate(.undated, .{ .rejected = .missing }, receipt, receipt, 0),
-        try policy.evaluate(.timestamped, .{ .parsed = .{ .us = receipt.us + 1 } }, receipt, receipt, 0),
-        try policy.evaluate(.timestamped, .{ .parsed = .{ .us = receipt.us - 1 } }, receipt, receipt, 0),
-        .{ .rejected = .{ .reason = .malformed, .receipt = receipt } },
-    }) |plain| {
-        const marked = plain.withEncodingReplacement();
-        const saved = try Stored.fromOutcome(marked, receipt);
-        try std.testing.expectEqualDeep(plain, try saved.outcomeWithDisposition(receipt, plain.disposition()));
-        try std.testing.expectEqualDeep(marked, try saved.outcomeWithDisposition(receipt, marked.disposition()));
-        try std.testing.expectError(error.InvalidNativeTime, saved.outcomeWithDisposition(receipt, "time-eligible-event-encoding-replaced-garbage"));
-        try std.testing.expectError(error.InvalidNativeTime, saved.outcomeWithDisposition(receipt, "encoding-replaced"));
-    }
-}

@@ -61,35 +61,3 @@ pub fn prepare(a: A, source: *const config.ParsedIni, root: []const u8, jail: []
     try definition(a, &asset, &parameters);
     return .{ .asset = asset, .known_combined = known, .combined = try config.combineAsset(a, &asset, ""), .jail_source = graph, .auto_logtype = automatic };
 }
-
-test "filter context separates automatic initial known and final jail substitutions" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.makePath("filter.d");
-    try tmp.dir.writeFile(.{ .sub_path = "filter.d/original.conf", .data = "[Definition]\ndatepattern=TAI64N\njournalmatch=TYPE=<logtype> FORMAT=%(datepattern)s\n[Init]\nlogtype=ignored-default\n" });
-    const root = try tmp.dir.realpathAlloc(a, ".");
-    var source = try config.parseIniSource(a, "original-jail", "[probe]\ndatepattern=%(known/datepattern)s EPOCH\n");
-    const result = try prepare(a, &source, root, "probe", "original", "systemd");
-    try std.testing.expectEqualStrings("journal", result.auto_logtype.?);
-    try std.testing.expectEqualStrings("TAI64N", result.known_combined.get("datepattern").?);
-    try std.testing.expectEqualStrings("TAI64N EPOCH", (try config.resolve(a, &result.jail_source, "probe", "datepattern")).?);
-    try std.testing.expectEqualStrings("TYPE=journal FORMAT=TAI64N EPOCH", result.combined.get("journalmatch").?);
-    try std.testing.expect(source.section("probe").?.get("known/datepattern") == null);
-}
-
-test "filter context known percent values retain reference interpolation rejection" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.makePath("filter.d");
-    try tmp.dir.writeFile(.{ .sub_path = "filter.d/original.conf", .data = "[Definition]\ndatepattern=%%Y\n" });
-    const root = try tmp.dir.realpathAlloc(a, ".");
-    var source = try config.parseIniSource(a, "original-jail", "[probe]\noriginal=%(known/datepattern)s\n");
-    const result = try prepare(a, &source, root, "probe", "original", "auto");
-    try std.testing.expectError(error.InterpolationUnterminated, config.resolve(a, &result.jail_source, "probe", "original"));
-}

@@ -29,6 +29,7 @@ pub const Options = struct {
     max_sources: usize,
     gate: ?*storage_health.Gate = null,
     monotonic_clock: ?storage_health.Clock = null,
+    wall_clock: files.WallClock = .{},
     clock_context: ?*anyopaque = null,
     clock: ?*const fn (?*anyopaque) anyerror!time.Timestamp = null,
 };
@@ -150,6 +151,7 @@ pub const Session = struct {
     pending_proofs: []?durable.Store.PendingSource,
     retained: std.ArrayList(Retained),
     blocked_cause: ?anyerror = null,
+    awaiting_discovery: bool = false,
     retained_index: usize = 0,
     discovery_repair: repair.Repair,
     scheduler_clock: ?storage_health.Clock,
@@ -242,6 +244,7 @@ pub const Session = struct {
         errdefer self.sources.deinit();
         self.sources.max_sources = options.max_sources;
         self.sources.policy = options.on_truncation;
+        self.sources.wall_clock = options.wall_clock;
         self.sources.initialize_source = bindFile;
         self.sources.initialize_userdata = self;
         for (specs) |spec| try self.sources.add(spec.pattern, spec.start);
@@ -445,7 +448,7 @@ pub const Session = struct {
                 return err;
             };
             if (!continuous) return error.ResumeLost;
-            if (source.pending_loss != null) try self.settleLoss(index, try self.hasPendingReceipt(source));
+            if (source.pending_loss != null) _ = try self.settleLoss(index, try self.hasPendingReceipt(source));
             index += 1;
         }
         try self.pipe.store.visitPendingReceipts(restorePending, self);
@@ -485,6 +488,11 @@ pub const Session = struct {
     pub fn sourceRepairSnapshot(self: *const Session, index: usize) !repair.Snapshot {
         if (index >= self.repair_count) return error.InvalidSource;
         return self.repair_states[index].snapshot();
+    }
+    pub fn awaitingPath(self: *const Session) bool {
+        if (self.awaiting_discovery) return true;
+        for (self.sources.sources.items) |source| if (source.awaiting_path or source.named_path != .present or source.health == .missing) return true;
+        return false;
     }
     pub fn repairSnapshot(self: *const Session) repair.Snapshot {
         var result = self.discovery_repair.snapshot();
@@ -563,7 +571,7 @@ pub const Session = struct {
     fn sourceFailure(self: *Session, state: *repair.Repair, cause: anyerror) anyerror {
         const domain = state.failed(cause, self.nowMs()) catch |failure| return failure;
         self.last_failure_domain = domain;
-        self.blocked_cause = if (cause == error.ReserveBackpressure or cause == error.RetryCapacity) cause else null;
+        self.blocked_cause = if (pipeline.Pipeline.commitBlocked(cause)) cause else null;
         self.sources.health = switch (cause) {
             error.SourceRepairPending, error.ReserveBackpressure, error.RetryCapacity => .waiting,
             error.FileNotFound => .missing,
@@ -635,32 +643,58 @@ pub const Session = struct {
         copy.source_id = text[event.path.len..];
         self.recorded_loss = copy;
     }
-    fn settleLoss(self: *Session, index: usize, receipt_in_flight: bool) !void {
+    fn settleLoss(self: *Session, index: usize, receipt_in_flight: bool) !bool {
         const source = &self.sources.sources.items[index];
-        const loss = source.pending_loss orelse return;
-        if (receipt_in_flight) return self.sourceFailure(&self.repair_states[index], error.ResumeLost);
+        const loss = source.pending_loss orelse return false;
+        const state = &self.repair_states[index];
+        var stored: ?durable.Store.PendingSource = null;
+        defer if (stored) |saved| saved.deinit(self.allocator);
+        if (receipt_in_flight) {
+            if (source.policy != .restart or !self.pendingDiscardable()) return self.sourceFailure(state, error.ResumeLost);
+            stored = self.pipe.store.readPendingSource(self.allocator, self.pipe.jail, source.source_id) catch |err| return self.storageFailure(err);
+            if (stored) |saved| {
+                const committed = self.pipe.store.committedReceipt(saved.identity) catch |err| return self.storageFailure(err);
+                if (committed != null or !loss.checkpoint_durable) return self.sourceFailure(state, error.ResumeLost);
+            }
+        }
         const cursor = if (loss.checkpoint_durable) try std.json.stringifyAlloc(self.allocator, source.committed.?, .{}) else null;
         defer if (cursor) |bytes| self.allocator.free(bytes);
-        const reset: ?durable.Store.CheckpointReset = if (cursor) |bytes| .{ .jail = self.pipe.jail, .source_id = source.source_id, .cursor_json = bytes } else null;
+        const reset: ?durable.Store.CheckpointReset = if (cursor) |bytes| .{ .jail = self.pipe.jail, .source_id = source.source_id, .cursor_json = bytes, .discard_pending = stored != null } else null;
         var event = loss.event;
         event.sequence = self.pipe.store.recordContinuityLoss(event, reset) catch |err| return self.lossFailure(index, err);
         _ = source.takePendingLoss();
         try self.rememberLoss(event);
+        if (receipt_in_flight) self.dropPendingState(index);
+        const dropped = if (receipt_in_flight) " (the uncommitted record read past that offset was dropped)" else "";
         if (event.reason == .replaced) {
-            std.log.warn("native: jail={} source=file path={} continuity loss recorded: the log was replaced and its previous file (inode={d} committed_offset={d}) is gone; the new file (size={}) is read from offset 0 under on_truncation=restart; records appended after offset {d} in the previous file were never read", .{
-                std.zig.fmtEscapes(self.pipe.jail), std.zig.fmtEscapes(source.path), event.inode, event.committed_offset, SizeText{ .size = event.observed_size }, event.committed_offset,
+            std.log.warn("native: jail={} source=file path={} continuity loss recorded: the log was replaced and its previous file (inode={d} committed_offset={d}) is gone; the new file (size={}) is read from offset 0 under on_truncation=restart; records appended after offset {d} in the previous file were never read{s}", .{
+                std.zig.fmtEscapes(self.pipe.jail), std.zig.fmtEscapes(source.path), event.inode, event.committed_offset, SizeText{ .size = event.observed_size }, event.committed_offset, dropped,
             });
-            return;
+            return receipt_in_flight;
         }
-        std.log.warn("native: jail={} source=file path={} continuity loss recorded: truncated in place (inode={d} committed_offset={d} size={}) under on_truncation=restart; reading restarts at offset 0; records appended after offset {d} and removed by the truncation were never read", .{
-            std.zig.fmtEscapes(self.pipe.jail), std.zig.fmtEscapes(source.path), event.inode, event.committed_offset, SizeText{ .size = event.observed_size }, event.committed_offset,
+        std.log.warn("native: jail={} source=file path={} continuity loss recorded: truncated in place (inode={d} committed_offset={d} size={}) under on_truncation=restart; reading restarts at offset 0; records appended after offset {d} and removed by the truncation were never read{s}", .{
+            std.zig.fmtEscapes(self.pipe.jail), std.zig.fmtEscapes(source.path), event.inode, event.committed_offset, SizeText{ .size = event.observed_size }, event.committed_offset, dropped,
         });
+        return receipt_in_flight;
+    }
+    fn pendingDiscardable(self: *const Session) bool {
+        return self.processor.staged_detector == null or self.blocked_cause != null;
+    }
+    fn dropPendingState(self: *Session, index: usize) void {
+        const source_id = self.sources.sources.items[index].source_id;
+        if (self.pending_proofs[index]) |proof| proof.deinit(self.allocator);
+        self.pending_proofs[index] = null;
+        if (self.candidate_source) |candidate| if (std.mem.eql(u8, candidate, source_id)) {
+            self.candidate_source = null;
+            self.pipe.candidate_receipt = null;
+        };
+        self.repair_states[index].discardPending();
     }
     fn resolveRemoved(self: *Session, index: usize, verdict: files.RemovedVerdict) !void {
         const source = &self.sources.sources.items[index];
         const failure = source.continuity_failure.?;
         const saved = source.committed.?;
-        const current = self.sources.sources.items[self.sources.removedSuccessor(index).?].committed.?;
+        const successor = self.sources.removedSuccessor(index);
         const unread = verdict != .drained;
         if (unread and self.sources.policy == .refuse) return error.RotatedIncarnationLost;
         var event = files.LossEvent{
@@ -668,7 +702,7 @@ pub const Session = struct {
             .jail = self.pipe.jail,
             .path = source.path,
             .source_id = source.source_id,
-            .wall_us = std.time.microTimestamp(),
+            .wall_us = self.sources.wall_clock.us(),
             .reason = .rotated_unread_removed,
             .inode = failure.committed_inode,
             .committed_offset = failure.committed_offset,
@@ -677,19 +711,26 @@ pub const Session = struct {
         if (unread) event.sequence = self.pipe.store.recordContinuityLoss(event, null) catch |err| return self.lossFailure(index, err);
         self.pipe.store.retireSourceCheckpoint(self.pipe.jail, source.source_id) catch |err| return self.storageFailure(err);
         if (unread) {
+            const current = self.sources.sources.items[successor.?].committed.?;
             try self.rememberLoss(event);
             std.log.warn("native: jail={} source=file path={} continuity loss recorded: rotated incarnation inode={d} was removed with unread bytes (committed_offset={d} last_size={}) under on_truncation=restart; current inode={d} resumes at offset {d}", .{
                 std.zig.fmtEscapes(self.pipe.jail), std.zig.fmtEscapes(source.path), event.inode, event.committed_offset, SizeText{ .size = event.observed_size }, current.inode, current.offset,
             });
-        } else std.log.info("native: jail={} source=file path={} retired rotated incarnation inode={d}: read to its end and removed; current inode={d} resumes at offset {d}", .{
-            std.zig.fmtEscapes(self.pipe.jail), std.zig.fmtEscapes(source.path), failure.committed_inode, current.inode, current.offset,
+        } else if (successor) |position| {
+            const current = self.sources.sources.items[position].committed.?;
+            std.log.info("native: jail={} source=file path={} retired rotated incarnation inode={d}: read to its end and removed; current inode={d} resumes at offset {d}", .{
+                std.zig.fmtEscapes(self.pipe.jail), std.zig.fmtEscapes(source.path), failure.committed_inode, current.inode, current.offset,
+            });
+        } else std.log.info("native: jail={} source=file path={} released removed file inode={d}: read to its end, so nothing was lost; no file has appeared at the path; reading resumes when the path reappears", .{
+            std.zig.fmtEscapes(self.pipe.jail), std.zig.fmtEscapes(source.path), failure.committed_inode,
         });
         self.dropSource(index);
+        if (successor == null) self.awaiting_discovery = self.sources.sources.items.len == 0;
     }
     fn retireUnlinked(self: *Session, index: usize) !bool {
         const source = &self.sources.sources.items[index];
-        if (!try source.markUnlinkedAndDrained()) return false;
-        const verdict = self.sources.removedVerdict(index);
+        if (!try source.markUnlinkedAndDrained(self.nowMs())) return false;
+        const verdict = if (source.continuity_failure.?.kind == .missing) .drained else self.sources.removedVerdict(index);
         if (verdict == .drained and !try self.hasPendingReceipt(source)) {
             try self.resolveRemoved(index, .drained);
             return true;
@@ -770,7 +811,7 @@ pub const Session = struct {
         }
         const pending = self.pipe.store.readPendingSource(self.allocator, self.pipe.jail, source.source_id) catch |err| return self.storageFailure(err);
         defer if (pending) |saved| saved.deinit(self.allocator);
-        const binding = self.bindPending(index, pending) catch |err| return if (self.last_failure_domain == .storage) err else self.sourceFailure(state, err);
+        var binding = self.bindPending(index, pending) catch |err| return if (self.last_failure_domain == .storage) err else self.sourceFailure(state, err);
         if (token != null) token = try state.begin(self.nowMs(), true);
         if (source.file == null) if (self.retainedSource(source.source_id)) |previous| if (previous.descriptor) |descriptor| {
             source.attachRetained(descriptor) catch |err| return self.sourceFailure(state, err);
@@ -787,8 +828,13 @@ pub const Session = struct {
         if (!continuous) {
             if (pending != null or !source.awaiting_path) return self.sourceFailure(state, error.FileNotFound);
         } else {
-            if (pending) |saved| source.verifyPending(.{ .source = saved.identity.source, .occurrence = saved.identity.occurrence, .cursor = saved.identity.cursor, .raw_hash = saved.identity.raw_hash }) catch |err| return self.sourceFailure(state, if (source.pending_loss != null) error.ResumeLost else err);
-            try self.settleLoss(index, false);
+            if (pending) |saved| source.verifyPending(.{ .source = saved.identity.source, .occurrence = saved.identity.occurrence, .cursor = saved.identity.cursor, .raw_hash = saved.identity.raw_hash }) catch |err| {
+                if (source.pending_loss == null or source.policy != .restart) return self.sourceFailure(state, if (source.pending_loss != null) error.ResumeLost else err);
+            };
+            if (try self.settleLoss(index, pending != null)) {
+                binding = state.binding;
+                if (token != null) token = try state.begin(self.nowMs(), true);
+            }
         }
         if (token) |value| if (state.state.phase == .verifying) state.continuityVerified(value, binding) catch |err| return self.sourceFailure(state, err);
     }
@@ -900,7 +946,7 @@ pub const Session = struct {
         };
         try self.initializeRepairs();
         if (result != .complete) return false;
-        if (self.sources.sources.items.len == 0) return self.sourceFailure(state, error.FileNotFound);
+        self.awaiting_discovery = self.sources.sources.items.len == 0;
         if (token) |value| try state.continuityVerified(value, state.binding);
         return true;
     }
@@ -908,13 +954,15 @@ pub const Session = struct {
         session: *Session,
         pending: ?durable.ReceiptIdentity,
         committing: bool = false,
-        fn run(record: records.Record, context: ?*anyopaque) !void {
+        fn run(batch: []const records.Record, acknowledged: *usize, context: ?*anyopaque) !void {
             const self: *Acknowledgment = @ptrCast(@alignCast(context.?));
+            acknowledged.* = 0;
+            const record = batch[0];
             if (self.pending) |expected| {
                 if (record.kind != .data or !std.mem.eql(u8, record.source, expected.source) or !std.mem.eql(u8, record.occurrence, expected.occurrence) or !std.mem.eql(u8, record.cursor, expected.cursor) or !std.mem.eql(u8, &record.raw_hash, &expected.raw_hash)) return error.PendingRecordMismatch;
             }
             self.committing = true;
-            pipeline.Pipeline.acknowledge(record, &self.session.pipe) catch |err| {
+            pipeline.Pipeline.acknowledgeBatch(batch, acknowledged, &self.session.pipe) catch |err| {
                 if (self.session.pipe.candidate_receipt != null) self.session.candidate_source = record.source;
                 return err;
             };
@@ -939,7 +987,7 @@ pub const Session = struct {
         }
         self.discover_next = true;
         const count = self.sources.sources.items.len;
-        if (count == 0) return error.SourceRepairPending;
+        if (count == 0) return 0;
         var index = self.next_source % count;
         if (self.candidate_source) |candidate| {
             var found = false;
@@ -967,10 +1015,11 @@ pub const Session = struct {
         return error.PendingSourceMissing;
     }
     fn pollFile(self: *Session, source: *files.FileSource, state: *repair.Repair, acknowledgment: *Acknowledgment, preserve_checkpoint: bool) !bool {
-        return source.pollTurn(Acknowledgment.run, acknowledgment, preserve_checkpoint) catch |err| {
+        return 0 != source.pollBatchTurn(Acknowledgment.run, acknowledgment, preserve_checkpoint) catch |err| {
             if (acknowledgment.committing) {
                 if (pipeline.Pipeline.sourceLocalIntervention(err)) return self.sourceFailure(state, err);
                 self.last_failure_domain = if (repair.classify(err) == .pending) .pending else .storage;
+                self.blocked_cause = if (pipeline.Pipeline.commitBlocked(err)) err else null;
                 return err;
             }
             return self.sourceFailure(state, err);
@@ -987,13 +1036,21 @@ pub const Session = struct {
         const pending = self.pipe.store.readPendingSource(self.allocator, self.pipe.jail, source.source_id) catch |err| return self.storageFailure(err);
         defer if (pending) |saved| saved.deinit(self.allocator);
         _ = self.bindPending(index, pending) catch |err| return if (self.last_failure_domain == .storage) err else self.sourceFailure(state, err);
-        const receipt_in_flight = pending != null or if (self.candidate_source) |candidate| std.mem.eql(u8, candidate, source.source_id) else false;
-        try self.settleLoss(index, receipt_in_flight);
-        var acknowledgment = Acknowledgment{ .session = self, .pending = if (pending) |saved| saved.identity else null };
-        var delivered = try self.pollFile(source, state, &acknowledgment, source.policy == .refuse or pending != null or self.candidate_source != null or state.state.phase == .polling);
+        var receipt_in_flight = pending != null or if (self.candidate_source) |candidate| std.mem.eql(u8, candidate, source.source_id) else false;
+        var expected = if (pending) |saved| saved.identity else null;
+        if (try self.settleLoss(index, receipt_in_flight)) {
+            receipt_in_flight = false;
+            expected = null;
+        }
+        var acknowledgment = Acknowledgment{ .session = self, .pending = expected };
+        var delivered = try self.pollFile(source, state, &acknowledgment, source.policy == .refuse or expected != null or self.candidate_source != null or state.state.phase == .polling);
         if (source.pending_loss != null) {
-            try self.settleLoss(index, receipt_in_flight);
+            if (try self.settleLoss(index, receipt_in_flight)) acknowledgment.pending = null;
             delivered = try self.pollFile(source, state, &acknowledgment, state.state.phase == .polling);
+        }
+        if (source.named_path == .absent) {
+            source.named_path = .absent_reported;
+            std.log.warn("native: jail={} source=file path={} log path is absent (rotated or removed); reading continues from the held file and resumes when the path reappears", .{ std.zig.fmtEscapes(self.pipe.jail), std.zig.fmtEscapes(source.path) });
         }
         if (!delivered and source.health == .healthy and state.state.phase == .healthy) {
             if (self.retireUnlinked(index) catch |err| return self.sourceFailure(state, err)) return 0;
@@ -1043,11 +1100,11 @@ pub const Session = struct {
         return error.PendingSourceMissing;
     }
     fn logNotices(self: *Session) void {
-        if (self.processor.encodingNotice(self.notices.read() / std.time.ns_per_ms)) |count| std.log.scoped(.source_text).warn(
+        if (self.processor.encodingNotice(self.nowMs())) |count| std.log.scoped(.source_text).warn(
             "jail {s}: encoding damage in {d} committed records; invalid text replaced for matching, records exceeding decoded bounds excluded",
             .{ self.pipe.jail, count },
         );
-        if (self.processor.timeNotice(self.notices.read() / std.time.ns_per_ms)) |notice| std.log.scoped(.source_time).warn(
+        if (self.processor.timeNotice(self.nowMs())) |notice| std.log.scoped(.source_time).warn(
             "jail {s}: rejected source records: missing timestamp={d}, malformed text/timestamp={d}, future timestamp={d}; records excluded from detection evidence",
             .{ self.pipe.jail, notice.missing_since_notice, notice.malformed_since_notice, notice.future_since_notice },
         );

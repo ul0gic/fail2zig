@@ -75,7 +75,7 @@ pub const Plan = struct {
         if (!settings.custom) {
             const cell = try allocator.create(*ignore_set.EffectiveIgnore);
             errdefer allocator.destroy(cell);
-            cell.* = try ignore_set.EffectiveIgnore.build(allocator, literals, &.{});
+            cell.* = try ignore_set.EffectiveIgnore.build(allocator, literals, &.{}, &.{}, &.{}, 0);
             ignore_cell = cell;
         }
         errdefer if (ignore_cell) |cell| {

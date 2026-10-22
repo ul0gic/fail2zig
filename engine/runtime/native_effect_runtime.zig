@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
-const builtin = @import("builtin");
 const shared = @import("shared");
+const build_options = @import("build_options");
+const diag_mod = @import("../core/diag.zig");
 const durable = @import("../core/record_store.zig");
 const effect = @import("../core/native_effect.zig");
 const firewall = @import("../firewall/inspection.zig");
@@ -20,6 +21,7 @@ pub const Health = struct {
     uncertain: bool = false,
     overdue: usize = 0,
     confirmed: usize = 0,
+    withdrawn: bool = false,
     cause: ?anyerror = null,
     diagnostic: ?EffectDiagnostic = null,
 };
@@ -33,6 +35,8 @@ pub fn transientCause(cause: anyerror) bool {
     return transientReadback(cause);
 }
 const max_readback_wait_turns: u16 = 255;
+// An audit starts this long before the knowledge window closes, so a dump at the ceiling finishes while knowledge is still fresh.
+const audit_lead_ns: u64 = 5 * std.time.ns_per_s;
 fn systemWall(_: ?*anyopaque) i64 {
     return std.time.microTimestamp();
 }
@@ -62,6 +66,10 @@ pub const Counters = struct {
     rebuild_restarts: u64 = 0,
     incremental_updates: u64 = 0,
     full_readbacks: u64 = 0,
+    acknowledged_batches: u64 = 0,
+    redispatched: u64 = 0,
+    events_applied: u64 = 0,
+    events_dropped: u64 = 0,
     expiry_batches: u64 = 0,
     expiries_prepared: u64 = 0,
     overdue_expiries: u64 = 0,
@@ -73,6 +81,7 @@ pub const Counters = struct {
     oldest_overdue_blocking_us: ?i64 = null,
     overdue_bookkeeping: u64 = 0,
     dump_interrupted: u64 = 0,
+    install_batches: u64 = 0,
 };
 pub const Slice = struct {
     outcome: Step,
@@ -87,7 +96,8 @@ fn expiryClass(transport: firewall.Transport, scope: effect.Scope) ExpiryClass {
     const host = scope.canonical.subject.kind == .host and scope.canonical.protocols.isAll() and scope.canonical.ports.isAll();
     return if (host and transport != .iptables) .kernel_expiring else .deletion;
 }
-pub const reserved_bytes = @sizeOf(Manager) + effect.max_effects * (2 * @sizeOf(effect.Entry) + @sizeOf(bool) + 2 * (@sizeOf(?Marker) + 2 * @sizeOf(bool) + @sizeOf(?i64))) + (firewall.Limits{}).max_bytes;
+pub const live_bytes = @sizeOf(Manager) + effect.max_effects * (2 * @sizeOf(effect.Entry) + @sizeOf(bool) + 2 * (@sizeOf(?Marker) + 2 * @sizeOf(bool) + @sizeOf(?i64)));
+pub const reserved_bytes = live_bytes + (firewall.Limits{}).max_bytes;
 pub const Manager = struct {
     allocator: std.mem.Allocator,
     store: *durable.Store,
@@ -122,6 +132,7 @@ pub const Manager = struct {
     stop_cursor: usize = 0,
     stop_retries: u8 = 0,
     stopping: bool = false,
+    withdrawn: bool = false,
     observation_cache: ?*observation.Cache = null,
     readback_failures: u8 = 0,
     readback_wait: u16 = 0,
@@ -135,10 +146,16 @@ pub const Manager = struct {
     last_mutation_wall_us: ?i64 = null,
     installed_live: u32 = 0,
     last_readback_ns: ?u64 = null,
+    events_subscribed: bool = false,
+    events_healthy: bool = false,
+    events_dirty: bool = false,
+    last_generation: ?u32 = null,
+    own_ports: [64]u32 = [_]u32{0} ** 64,
+    own_port_cursor: u8 = 0,
+    view_revision: u64 = 0,
     last_readback_wall_us: ?i64 = null,
     legacy_targets_attempted: ?[32]u8 = null,
     owned_marks: std.StaticBitSet(firewall.max_inventory_entries) = undefined,
-    test_readback_disagrees: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
 
     pub fn create(a: std.mem.Allocator, store: *durable.Store, installation: effect.Installation) !*Manager {
         try installation.validate();
@@ -220,6 +237,7 @@ pub const Manager = struct {
         @memset(self.confirmed[0..self.count], false);
         @memset(self.matched[0..self.count], false);
         self.legacy_targets_attempted = null;
+        self.view_revision +%= 1;
     }
     pub fn storageReopened(self: *Manager) void {
         self.forgetKernel();
@@ -281,15 +299,15 @@ pub const Manager = struct {
             .mutation = .not_started,
         });
     }
-    fn observationWall() ?i64 {
-        const now = std.time.microTimestamp();
+    fn observationWall(self: *Manager) ?i64 {
+        const now = self.wall(self.wall_context);
         return if (now < 0) null else now;
     }
     fn recordObservationFailure(self: *Manager, stage: firewall.OperationStage, cause: anyerror) void {
         const cache = self.observation_cache orelse return;
         cache.fail(.{
             .monotonic_ms = observation.monotonicMs(),
-            .wall_us = observationWall(),
+            .wall_us = self.observationWall(),
             .cause = cause,
             .stage = stage,
         });
@@ -313,11 +331,19 @@ pub const Manager = struct {
     }
     fn deferReadback(self: *Manager) Step {
         self.dropInventory();
+        self.events_healthy = false;
         self.status.ready = false;
+        self.backOff();
+        return .{ .wait = self.waitDue() };
+    }
+    fn backOff(self: *Manager) void {
         self.readback_failures +|= 1;
+        if (comptime build_options.diag) diag_mod.event(.readback_deferred, .{ .value = self.readback_failures });
         const shift: u4 = @intCast(@min(self.readback_failures - 1, 8));
         self.readback_wait = @min((@as(u16, 1) << shift) - 1, max_readback_wait_turns);
-        return .{ .wait = self.waitDue(null) };
+    }
+    pub fn setClockRate(self: *Manager, rate: u32) void {
+        self.inspector.clock_rate = rate;
     }
     fn clock(self: *Manager) !effect.Clock {
         const now = self.wall(self.wall_context);
@@ -352,7 +378,7 @@ pub const Manager = struct {
         defer result.deinit();
         switch (result) {
             .installed => |installed| {
-                self.captureObservation(&installed.snapshot, .admission, observationWall(), .not_checked);
+                self.captureObservation(&installed.snapshot, .admission, self.observationWall(), .not_checked);
                 if (installed.created) std.log.info("{s}: scaffold installed and verified (selector={s})", .{ @tagName(saved.backend), saved.selector() });
                 self.admitted = true;
             },
@@ -402,6 +428,7 @@ pub const Manager = struct {
         std.mem.swap([]?i64, &self.owner_deadline_us, &self.staged_owner_deadline_us);
         self.count = self.staged_count;
         self.cached_epoch = self.staged_epoch;
+        self.view_revision +%= 1;
         self.staged_revision = null;
         self.cursor = self.count;
         self.legacy_targets_attempted = null;
@@ -447,6 +474,7 @@ pub const Manager = struct {
     fn replaceAt(self: *Manager, index: usize, entry: effect.Entry, owner_deadline: ?i64) !void {
         const previous = self.live[index];
         self.live[index] = entry;
+        self.view_revision +%= 1;
         self.outage_attempted[index] = false;
         self.owner_deadline_us[index] = owner_deadline;
         if (!std.mem.eql(u8, &previous.intent_id, &entry.intent_id)) {
@@ -464,6 +492,7 @@ pub const Manager = struct {
         std.mem.copyBackwards(bool, self.matched[at + 1 .. n + 1], self.matched[at..n]);
         std.mem.copyBackwards(?i64, self.owner_deadline_us[at + 1 .. n + 1], self.owner_deadline_us[at..n]);
         self.live[at] = entry;
+        self.view_revision +%= 1;
         self.outage_attempted[at] = false;
         self.markers[at] = null;
         self.confirmed[at] = false;
@@ -481,6 +510,7 @@ pub const Manager = struct {
         std.mem.copyForwards(bool, self.matched[index .. n - 1], self.matched[index + 1 .. n]);
         std.mem.copyForwards(?i64, self.owner_deadline_us[index .. n - 1], self.owner_deadline_us[index + 1 .. n]);
         self.count -= 1;
+        self.view_revision +%= 1;
     }
     fn findLive(self: *const Manager, key: [32]u8) ?usize {
         const at = self.insertionPoint(key);
@@ -498,13 +528,17 @@ pub const Manager = struct {
     fn validateOwners(self: *Manager, bindings: []const Binding, entry: effect.Entry) !?i64 {
         var owners: [effect.max_page]effect.Owner = undefined;
         const count = try self.store.effectOwners(entry.scope_key, entry.revision, &owners);
+        return self.ownerDeadline(bindings, owners[0..count]);
+    }
+    fn ownerDeadline(self: *Manager, bindings: []const Binding, owners: []const effect.Owner) !?i64 {
+        _ = self;
         var deadline: ?i64 = null;
-        for (owners[0..count]) |owner| {
+        for (owners) |owner| {
             for (bindings) |binding| {
                 if (!std.mem.eql(u8, binding.jail, owner.jail.slice())) continue;
                 if (!std.mem.eql(u8, &binding.generation, &owner.generation)) return error.EffectGenerationMismatch;
                 break;
-            } else return error.UnconfiguredStateOwner;
+            } else if (owner.lease == .absent) continue else return error.UnconfiguredStateOwner;
             if (owner.lease == .finite) deadline = if (deadline) |prior| @min(prior, owner.lease.finite) else owner.lease.finite;
         }
         return deadline;
@@ -576,6 +610,7 @@ pub const Manager = struct {
     }
     fn inventoryCurrent(self: *const Manager) bool {
         const held = self.inventory orelse return false;
+        if (self.events_subscribed) return self.events_healthy;
         const sent_wall = self.last_mutation_wall_us orelse return true;
         if (held.start_ns) |start| if (self.last_mutation_ns) |sent| return start > sent;
         return held.start_us > sent_wall;
@@ -584,9 +619,6 @@ pub const Manager = struct {
         const found = try held.snapshot.find(entry.scope.canonical) orelse return false;
         const installed = held.snapshot.entries[found];
         return installed.scope == null or (installed.effect_id != null and std.mem.eql(u8, &installed.effect_id.?, &entry.scope_key));
-    }
-    fn disagrees(self: *const Manager) bool {
-        return if (comptime builtin.is_test) self.test_readback_disagrees else false;
     }
     fn refreshMatch(self: *Manager, index: usize) !void {
         const held = &(self.inventory orelse {
@@ -605,9 +637,10 @@ pub const Manager = struct {
             return propagateFirewall(void, failure);
         };
         self.matched[index] = matched;
-        self.confirmed[index] = matched and !self.disagrees();
+        if (self.confirmed[index] != matched) self.view_revision +%= 1;
+        self.confirmed[index] = matched;
     }
-    fn evaluateInventory(self: *Manager) !bool {
+    fn recount(self: *Manager) !bool {
         var confirmed_count: usize = 0;
         var installed: u32 = 0;
         for (self.live[0..self.count], 0..) |entry, index| {
@@ -619,35 +652,44 @@ pub const Manager = struct {
                 if (installed_entry.scope == null or (installed_entry.effect_id != null and std.mem.eql(u8, &installed_entry.effect_id.?, &entry.scope_key))) installed += 1;
             };
         }
+        if (self.inventory == null) return false;
+        self.installed_live = installed;
+        self.status.confirmed = confirmed_count;
+        return true;
+    }
+    fn evaluateInventory(self: *Manager) !bool {
+        if (!try self.recount()) return false;
         const held = &(self.inventory orelse return false);
         self.readback_failures = 0;
         self.counters.full_readbacks += 1;
         self.counters.dump_interrupted = self.inspector.dump_interruptions;
         self.last_readback_ns = held.start_ns;
         self.last_readback_wall_us = held.end_us;
-        self.installed_live = installed;
-        self.status.confirmed = confirmed_count;
-        if (self.status.diagnostic) |diagnostic| if (transientReadback(diagnostic.cause)) {
+        self.events_healthy = self.events_subscribed;
+        self.last_generation = null;
+        if (self.status.diagnostic) |diagnostic| if (transientReadback(diagnostic.cause) or diagnostic.cause == error.UnownedInstalledEffect) {
+            if (diagnostic.cause == error.UnownedInstalledEffect) std.log.info("native: the kernel set holds only owned elements again; protection restored", .{});
             self.status.diagnostic = null;
             self.status.cause = null;
             self.status.uncertain = false;
         };
         return true;
     }
-    fn waitDue(self: *Manager, now_ns: ?u64) u64 {
-        const base = now_ns orelse self.monotonic(self.monotonic_context) orelse 0;
+    fn waitDue(self: *Manager) u64 {
+        const base = self.monotonic(self.monotonic_context) orelse 0;
         return base +| self.wake_interval_ns *| self.readback_wait;
     }
     pub fn step(self: *Manager, bindings: []const Binding) Step {
         return self.stepInner(bindings) catch |failure| .{ .fatal = failure };
     }
     pub fn runSlice(self: *Manager, bindings: []const Binding, limits: SliceLimits, stop: ?StopSignal) Slice {
-        const start = self.monotonic(self.monotonic_context);
+        const start = systemMonotonic(null);
         var slice = Slice{ .outcome = .progress };
+        self.drainEvents();
         if (self.readback_wait != 0) {
             self.readback_wait -= 1;
             self.status.ready = false;
-            slice.outcome = .{ .wait = self.waitDue(start) };
+            slice.outcome = .{ .wait = self.waitDue() };
             return slice;
         }
         while (slice.steps < limits.max_steps) {
@@ -655,9 +697,9 @@ pub const Manager = struct {
                 slice.outcome = .stop;
                 break;
             };
-            const before = self.monotonic(self.monotonic_context);
+            const before = systemMonotonic(null);
             slice.outcome = self.step(bindings);
-            const after = self.monotonic(self.monotonic_context);
+            const after = systemMonotonic(null);
             slice.steps += 1;
             if (before != null and after != null) slice.longest_step_ns = @max(slice.longest_step_ns, after.? -| before.?);
             // Without a monotonic reading the time budget cannot be enforced, so the slice ends after this step.
@@ -669,16 +711,18 @@ pub const Manager = struct {
     }
     fn stepInner(self: *Manager, bindings: []const Binding) !Step {
         errdefer |failure| {
+            if (!transientReadback(failure)) std.log.warn("native: effect runtime stopped at cursor {d} of {d}: {s}", .{ self.cursor, self.count, @errorName(failure) });
             self.dropInventory();
             self.status.ready = false;
             self.status.uncertain = true;
             self.status.cause = failure;
         }
+        if (self.withdrawn) return self.withdrawnReadback();
         if (self.store.effect_publication_epoch == std.math.maxInt(u64)) return error.EffectCapacity;
         const sampled = try self.clock();
         if (self.readback_wait != 0) {
             self.status.ready = false;
-            return .{ .wait = self.waitDue(null) };
+            return .{ .wait = self.waitDue() };
         }
         if (!self.admitted) {
             self.admit() catch |failure| {
@@ -694,29 +738,63 @@ pub const Manager = struct {
             _ = try self.refreshTurn(bindings);
             return .progress;
         }
+        const audit_interval = if (self.events_subscribed) self.verify_interval_ns -| audit_lead_ns else self.verify_interval_ns;
         if (self.status.ready and self.readback_wait == 0 and self.verify_interval_ns != 0) {
             const due = if (self.next_deadline_us) |deadline| deadline <= sampled.prepared_us else false;
-            if (!due) if (self.last_verified_ns) |last| if (self.monotonic(self.monotonic_context)) |now| if (now -| last < self.verify_interval_ns) return .idle;
+            if (!due) if (self.last_verified_ns) |last| if (self.monotonic(self.monotonic_context)) |now| if (now -| last < audit_interval) return .idle;
         }
+        if (self.events_subscribed and self.inventory != null and self.verify_interval_ns != 0) if (self.last_readback_ns) |last| if (self.monotonic(self.monotonic_context)) |now| {
+            if (now -| last >= audit_interval) return self.readback(sampled);
+        };
         if (self.cursor < self.count) return self.act(bindings, sampled);
         if (self.status.ready or !self.inventoryCurrent()) return self.readback(sampled);
         return self.select(bindings, sampled);
     }
     fn readback(self: *Manager, sampled: effect.Clock) !Step {
+        const diag_span = if (comptime build_options.diag) diag_mod.enter(.readback) else {};
+        defer if (comptime build_options.diag) diag_mod.leave(diag_span);
         const start_ns = self.monotonic(self.monotonic_context);
+        if (comptime build_options.diag) diag_mod.readback(start_ns, self.last_verified_ns, self.verify_interval_ns, self.wake_interval_ns);
+        self.discardEvents();
         var snapshot = self.inspector.inspect() catch |failure| {
             self.recordFirewallDirect(.readback, failure);
             if (transientReadback(failure)) return self.deferReadback();
             return propagateFirewall(Step, failure);
         };
+        if (comptime build_options.diag) diag_mod.limit(.kernel_elements, snapshot.entries.len, firewall.max_inventory_entries);
         {
+            const diag_compare = if (comptime build_options.diag) diag_mod.enter(.compare) else {};
+            defer if (comptime build_options.diag) diag_mod.leave(diag_compare);
             errdefer snapshot.deinit();
-            try self.validateAndCaptureObservation(&snapshot, .readback, sampled.prepared_us, .readback);
+            self.validateAndCaptureObservation(&snapshot, .readback, sampled.prepared_us, .readback) catch |failure| {
+                if (failure != error.UnownedInstalledEffect) return failure;
+                return self.unownedElementSeen(&snapshot, failure);
+            };
         }
         self.keepInventory(snapshot, sampled.prepared_us, (try self.clock()).prepared_us, start_ns);
-        if (!try self.evaluateInventory()) return self.deferReadback();
+        const evaluated = evaluated_blk: {
+            const diag_compare = if (comptime build_options.diag) diag_mod.enterContinued(.compare) else {};
+            defer if (comptime build_options.diag) diag_mod.leave(diag_compare);
+            break :evaluated_blk try self.evaluateInventory();
+        };
+        if (!evaluated) return self.deferReadback();
+        if (self.counters.redispatched != 0) {
+            std.log.info("native: {d} applied effects were missing from the kernel since the last audit and were dispatched again", .{self.counters.redispatched});
+            self.counters.redispatched = 0;
+        }
         self.status.ready = false;
         return .progress;
+    }
+    fn unownedElementSeen(self: *Manager, snapshot: *firewall.Snapshot, failure: anyerror) Step {
+        snapshot.deinit();
+        if (self.readback_failures == 0) std.log.warn("native: an element the daemon does not own is in its kernel set; protection degraded until an audit finds the set clean", .{});
+        self.dropInventory();
+        self.events_healthy = false;
+        self.status.ready = false;
+        self.status.uncertain = true;
+        self.status.cause = failure;
+        self.backOff();
+        return .{ .wait = self.waitDue() };
     }
     fn expiryDue(self: *const Manager, index: usize, entry: effect.Entry, now_us: i64) bool {
         if (entry.status == .dispatched or self.markers[index] != null) return false;
@@ -728,7 +806,10 @@ pub const Manager = struct {
         const index = self.cursor;
         const entry = self.live[index];
         self.cursor = self.count;
-        if (entry.status == .superseded) return error.InvalidEffect;
+        if (entry.status == .superseded) {
+            std.log.warn("native: superseded effect at view index {d} reached the act step", .{index});
+            return error.InvalidEffect;
+        }
         if (self.markers[index] != null or entry.status == .dispatched) return self.readback(sampled);
         if (self.expiryDue(index, entry, sampled.prepared_us)) {
             errdefer self.cursor = index;
@@ -739,6 +820,8 @@ pub const Manager = struct {
     }
     const expiry_share: u8 = 4;
     fn select(self: *Manager, bindings: []const Binding, sampled: effect.Clock) !Step {
+        const diag_span = if (comptime build_options.diag) diag_mod.enter(.select) else {};
+        defer if (comptime build_options.diag) diag_mod.leave(diag_span);
         const held = &self.inventory.?;
         const now_us = sampled.prepared_us;
         var marker_pick: ?usize = null;
@@ -763,7 +846,10 @@ pub const Manager = struct {
         var all_confirmed = true;
         const transport = self.inspector.installation.transport;
         for (self.live[0..self.count], 0..) |entry, index| {
-            if (entry.status == .superseded) return error.InvalidEffect;
+            if (entry.status == .superseded) {
+                std.log.warn("native: superseded effect at view index {d} reached the select step", .{index});
+                return error.InvalidEffect;
+            }
             if (self.markers[index] != null) {
                 if (marker_pick == null) marker_pick = index;
                 all_confirmed = false;
@@ -868,6 +954,7 @@ pub const Manager = struct {
         if (live_pick) |index| {
             self.live_selections +|= 1;
             self.status.ready = false;
+            if (live_pending > 1) if (try self.installPending(bindings, sampled)) |outcome| return outcome;
             self.cursor = index;
             return .progress;
         }
@@ -877,13 +964,169 @@ pub const Manager = struct {
         }
         if (try self.settleLegacyTargets(bindings)) |outcome| return outcome;
         if (!all_confirmed) {
-            self.dropInventory();
-            return .{ .wait = self.waitDue(null) };
+            if (!self.events_subscribed) self.dropInventory();
+            return .{ .wait = self.waitDue() };
         }
+        if (comptime build_options.diag) self.store.diagKernelCheck(held.snapshot.entries.len, held.start_us, held.end_us);
         self.status = .{ .ready = true, .confirmed = self.status.confirmed };
         self.last_verified_ns = self.monotonic(self.monotonic_context);
         self.cursor = self.count;
         return .idle;
+    }
+    fn installPending(self: *Manager, bindings: []const Binding, sampled: effect.Clock) !?Step {
+        var tokens: [firewall.max_install_messages]firewall.DispatchToken = undefined;
+        var indices: [firewall.max_install_messages]usize = undefined;
+        var stale: [firewall.max_install_messages]usize = undefined;
+        var n: usize = 0;
+        var stale_count: usize = 0;
+        for (self.live[0..self.count], 0..) |entry, index| {
+            if (n == tokens.len) break;
+            if (self.markers[index] != null or entry.status == .dispatched or entry.status == .superseded or entry.desired == .absent) continue;
+            if (entry.status != .pending and self.matched[index]) continue;
+            if (self.expiryDue(index, entry, sampled.prepared_us)) continue;
+            if (entry.desired == .finite and !entry.desired.live(sampled.prepared_us)) continue;
+            if (!firewall.batchable(entry.scope.canonical)) continue;
+            if (entry.status != .pending) {
+                stale[stale_count] = index;
+                stale_count += 1;
+            }
+            indices[n] = index;
+            n += 1;
+        }
+        if (n < 2) return null;
+        if (stale_count != 0) {
+            const held = &self.inventory.?;
+            self.counters.redispatched += stale_count;
+            const dispatched = if (self.events_subscribed) sampled.prepared_us else held.start_us;
+            const observed = if (self.events_subscribed) sampled.prepared_us else held.end_us;
+            try self.settleBatch(bindings, stale[0..stale_count], dispatched, observed, .mismatch, held.snapshot.fingerprint);
+            if (self.cached_epoch == null) return .progress;
+        }
+        const dispatch_clock = try self.clock();
+        var pending: usize = 0;
+        for (indices[0..n]) |index| {
+            const entry = self.live[index];
+            if (entry.status != .pending) continue;
+            if (entry.desired == .finite and !entry.desired.live(dispatch_clock.prepared_us)) continue;
+            tokens[pending] = self.token(entry, entry.desired);
+            indices[pending] = index;
+            pending += 1;
+        }
+        if (pending == 0) return .progress;
+        n = pending;
+        const diag_span = if (comptime build_options.diag) diag_mod.enter(.dispatch) else {};
+        defer if (comptime build_options.diag) diag_mod.leave(diag_span);
+        const sent_ns = self.monotonic(self.monotonic_context);
+        const prior_mutation_ns = self.last_mutation_ns;
+        const prior_mutation_wall_us = self.last_mutation_wall_us;
+        for (indices[0..n]) |index| self.markers[index] = .{ .sent_ns = sent_ns, .sent_wall_us = dispatch_clock.prepared_us };
+        self.last_mutation_ns = sent_ns;
+        self.last_mutation_wall_us = dispatch_clock.prepared_us;
+        const outcome = self.inspector.installBatch(tokens[0..n], .{ .wall_us = dispatch_clock.prepared_us }, &self.inventory.?.snapshot) catch |failure| {
+            self.recordFirewallDirect(.effect_dispatch, failure);
+            if (!transientReadback(failure)) {
+                std.log.warn("native: batch install of {d} effects refused: {s}", .{ n, @errorName(failure) });
+                return error.EffectBackendUncertain;
+            }
+            for (indices[0..n]) |index| self.markers[index] = null;
+            self.last_mutation_ns = prior_mutation_ns;
+            self.last_mutation_wall_us = prior_mutation_wall_us;
+            return self.deferReadback();
+        };
+        const consumed = outcome.consumed;
+        for (indices[consumed..n]) |index| self.markers[index] = null;
+        switch (outcome.result) {
+            .uncertain => |failure| {
+                self.recordFirewallFailure(failure);
+                if (failure.mutation == .not_started) {
+                    for (indices[0..consumed]) |index| self.markers[index] = null;
+                    self.last_mutation_ns = prior_mutation_ns;
+                    self.last_mutation_wall_us = prior_mutation_wall_us;
+                }
+                if (!transientReadback(failure.cause)) {
+                    std.log.warn("native: batch install of {d} effects uncertain at {s}: {s}", .{ consumed, @tagName(failure.stage), @errorName(failure.cause) });
+                    return error.EffectBackendUncertain;
+                }
+                return self.deferReadback();
+            },
+            .acknowledged => |acked| {
+                for (indices[0..consumed]) |index| self.markers[index] = null;
+                self.rememberOwnPort(acked.port_id);
+                self.applyAcknowledged(indices[0..consumed]) catch |failure| {
+                    std.log.warn("native: acknowledged batch of {d} effects could not enter the view: {s}", .{ consumed, @errorName(failure) });
+                    return failure;
+                };
+                self.settleBatch(bindings, indices[0..consumed], dispatch_clock.prepared_us, acked.acked_wall_us, .desired, self.tokenFingerprint(indices[0..consumed])) catch |failure| {
+                    std.log.warn("native: acknowledged batch of {d} effects could not be settled: {s}", .{ consumed, @errorName(failure) });
+                    return failure;
+                };
+                self.refreshSettled(bindings, indices[0..consumed]) catch |failure| {
+                    std.log.warn("native: settled batch of {d} effects could not be re-read: {s}", .{ consumed, @errorName(failure) });
+                    return failure;
+                };
+                for (indices[0..consumed]) |index| if (self.live[index].status == .applied and self.confirmed[index]) {
+                    self.status.confirmed += 1;
+                };
+                self.counters.install_batches += 1;
+                self.counters.acknowledged_batches += 1;
+                if (comptime build_options.diag) diag_mod.count(.acknowledged_batches, 1);
+                return .progress;
+            },
+            .verified => |verified| {
+                var snapshot = verified.snapshot;
+                const after_ns = self.monotonic(self.monotonic_context);
+                for (indices[0..consumed]) |index| self.markers[index] = null;
+                {
+                    errdefer snapshot.deinit();
+                    try self.validateAndCaptureObservation(&snapshot, .effect, verified.observed_wall_us, .effect_verify);
+                }
+                self.keepInventory(snapshot, verified.observed_start_wall_us, verified.observed_wall_us, after_ns);
+                try self.settleBatch(bindings, indices[0..consumed], dispatch_clock.prepared_us, verified.observed_wall_us, .desired, verified.snapshot.fingerprint);
+                self.counters.install_batches += 1;
+                if (!try self.evaluateInventory()) return self.deferReadback();
+                return .progress;
+            },
+        }
+    }
+    const BatchState = enum { desired, mismatch };
+    fn settleBatch(self: *Manager, bindings: []const Binding, indices: []const usize, dispatch_us: i64, observed_us: i64, state: BatchState, fingerprint: effect.Hash) !void {
+        var items: [firewall.max_install_messages]durable.Store.InstallItem = undefined;
+        for (indices, 0..) |index, k| {
+            const entry = self.live[index];
+            items[k] = .{ .token = entry.token(), .state = if (state == .desired) entry.desired else null };
+        }
+        const pre = self.store.effect_publication_epoch;
+        {
+            errdefer self.writeFailed(pre);
+            _ = try self.store.settleInstalled(items[0..indices.len], dispatch_us, fingerprint, observed_us, try self.clock());
+        }
+        try self.attributeBatch(bindings, indices, pre);
+    }
+    fn attributeBatch(self: *Manager, bindings: []const Binding, indices: []const usize, pre: u64) !void {
+        const post = self.store.effect_publication_epoch;
+        const current = self.cached_epoch != null and self.cached_epoch.? == pre;
+        self.cached_epoch = null;
+        if (post == std.math.maxInt(u64)) return;
+        if (post == pre) {
+            std.log.warn("native: settlement of {d} effects changed no row at epoch {d}", .{ indices.len, pre });
+            return error.InvalidEffect;
+        }
+        if (!current or post < pre or post - pre != 1 or self.staged_revision != null) return;
+        try self.store.beginRead();
+        errdefer self.store.rollback();
+        const installation = try self.store.readInstallation() orelse return error.InstallationRequired;
+        for (indices) |index| {
+            const entry = try self.store.readEffect(self.live[index].scope_key, installation) orelse break;
+            var owners: [effect.max_page]effect.Owner = undefined;
+            const count = try self.store.readOwners(entry.scope_key, &owners);
+            const owner_deadline = try self.ownerDeadline(bindings, owners[0..count]);
+            try self.replaceAt(index, entry, owner_deadline);
+        } else {
+            try self.store.commitTransaction();
+            if (self.store.effect_publication_epoch == post) self.cached_epoch = post;
+            return;
+        }
+        try self.store.commitTransaction();
     }
     fn settleMarker(self: *Manager, bindings: []const Binding, index: usize) !Step {
         const marker = self.markers[index].?;
@@ -913,16 +1156,145 @@ pub const Manager = struct {
         return .progress;
     }
     fn settleExpiredBatch(self: *Manager, tokens: []const effect.Token) !Step {
+        const diag_span = if (comptime build_options.diag) diag_mod.enter(.expiry) else {};
+        defer if (comptime build_options.diag) diag_mod.leave(diag_span);
         const held = &self.inventory.?;
         const pre = self.store.effect_publication_epoch;
         {
             errdefer self.writeFailed(pre);
             _ = try self.store.settleExpired(tokens, held.snapshot.fingerprint, held.end_us, try self.clock());
         }
-        if (self.store.effect_publication_epoch == pre) return error.InvalidEffect;
+        if (self.store.effect_publication_epoch == pre) {
+            std.log.warn("native: expiry settlement of {d} effects changed no row at epoch {d}", .{ tokens.len, pre });
+            return error.InvalidEffect;
+        }
+        if (self.events_subscribed) try self.forgetExpired(tokens);
         return .progress;
     }
+    fn forgetExpired(self: *Manager, tokens: []const effect.Token) !void {
+        const held = &self.inventory.?;
+        for (self.live[0..self.count]) |entry| {
+            if (entry.scope.canonical.subject.kind != .host) continue;
+            for (tokens) |expired| if (std.mem.eql(u8, &expired.scope_key, &entry.scope_key)) {
+                const host = firewall.legacyAddress(entry.scope.canonical) catch continue;
+                _ = try held.snapshot.removeHost(.{ .address = host });
+                break;
+            };
+        }
+        self.inspector.retained_bytes = held.snapshot.entries.len * @sizeOf(firewall.Entry);
+        _ = try self.recount();
+    }
+    fn applyAcknowledged(self: *Manager, indices: []const usize) !void {
+        const held = &self.inventory.?;
+        for (indices) |index| {
+            const entry = self.live[index];
+            const host = firewall.legacyAddress(entry.scope.canonical) catch return error.InvalidEffect;
+            const remaining: ?u64 = switch (entry.desired) {
+                .finite => |until| if (until > held.end_us) self.inspector.toKernelUs(@intCast(until - held.end_us)) / 1000 else 0,
+                .permanent => null,
+                .absent => return error.InvalidEffect,
+            };
+            if (try held.snapshot.upsertHost(.{ .address = host, .remaining_ms = remaining }) and entry.desired.live(held.end_us)) self.installed_live += 1;
+            if (!self.confirmed[index] or !self.matched[index]) self.view_revision +%= 1;
+            self.matched[index] = true;
+            self.confirmed[index] = true;
+        }
+        self.inspector.retained_bytes = held.snapshot.entries.len * @sizeOf(firewall.Entry);
+    }
+    fn refreshSettled(self: *Manager, bindings: []const Binding, indices: []const usize) !void {
+        var stale = false;
+        for (indices) |index| stale = stale or self.live[index].status == .pending;
+        if (!stale) return;
+        try self.store.beginRead();
+        errdefer self.store.rollback();
+        const installation = try self.store.readInstallation() orelse return error.InstallationRequired;
+        for (indices) |index| {
+            if (self.live[index].status != .pending) continue;
+            const entry = try self.store.readEffect(self.live[index].scope_key, installation) orelse continue;
+            var owners: [effect.max_page]effect.Owner = undefined;
+            const count = try self.store.readOwners(entry.scope_key, &owners);
+            try self.replaceAt(index, entry, try self.ownerDeadline(bindings, owners[0..count]));
+        }
+        try self.store.commitTransaction();
+    }
+    fn tokenFingerprint(self: *Manager, indices: []const usize) effect.Hash {
+        var digest = std.crypto.hash.sha2.Sha256.init(.{});
+        digest.update(&self.installation.id);
+        for (indices) |index| digest.update(&self.live[index].scope_key);
+        var out: effect.Hash = undefined;
+        digest.final(&out);
+        return out;
+    }
+    fn drainEvents(self: *Manager) void {
+        if (!self.events_subscribed or self.inventory == null or !self.admitted) return;
+        const diag_span = if (comptime build_options.diag) diag_mod.enter(.events) else {};
+        defer if (comptime build_options.diag) diag_mod.leave(diag_span);
+        self.events_dirty = false;
+        _ = self.inspector.drainEvents(.{ .context = self, .apply = applyKernelEvent }, 256) catch |failure| {
+            if (failure == error.EventsLost) {
+                self.counters.events_dropped += 1;
+                if (comptime build_options.diag) diag_mod.count(.events_dropped, 1);
+                if (comptime build_options.diag) diag_mod.event(.events_overflowed, .{ .value = self.counters.events_dropped });
+            }
+            self.loseEvents();
+            return;
+        };
+        if (!self.events_dirty) return;
+        const held = &self.inventory.?;
+        self.validateInventory(&held.snapshot) catch {
+            self.loseEvents();
+            return;
+        };
+        _ = self.recount() catch {
+            self.loseEvents();
+            return;
+        };
+        self.status.ready = false;
+        self.last_verified_ns = null;
+        self.cursor = self.count;
+    }
+    fn discardEvents(self: *Manager) void {
+        if (!self.events_subscribed) return;
+        _ = self.inspector.drainEvents(.{ .context = self, .apply = ignoreKernelEvent }, 4096) catch {};
+        self.last_generation = null;
+    }
+    fn rememberOwnPort(self: *Manager, port_id: u32) void {
+        if (port_id == 0 or self.ownPort(port_id)) return;
+        self.own_ports[self.own_port_cursor] = port_id;
+        self.own_port_cursor = (self.own_port_cursor + 1) % @as(u8, self.own_ports.len);
+    }
+    fn ownPort(self: *const Manager, port_id: u32) bool {
+        return port_id != 0 and std.mem.indexOfScalar(u32, &self.own_ports, port_id) != null;
+    }
+    fn loseEvents(self: *Manager) void {
+        self.events_healthy = false;
+        self.status.ready = false;
+    }
+    fn ignoreKernelEvent(_: *anyopaque, _: firewall.nft.Event) firewall.Error!void {}
+    fn applyKernelEvent(ctx: *anyopaque, event: firewall.nft.Event) firewall.Error!void {
+        const self: *Manager = @ptrCast(@alignCast(ctx));
+        if (comptime build_options.diag) diag_mod.count(.events_received, 1);
+        switch (event) {
+            .generation => |generation| {
+                if (self.last_generation) |last| if (generation.id != last +% 1) self.loseEvents();
+                self.last_generation = generation.id;
+            },
+            .elements => |elements| {
+                if (self.ownPort(elements.pid)) return;
+                const held = &(self.inventory orelse return);
+                const offset_ms = @divTrunc(self.wall(self.wall_context) - held.end_us, 1000);
+                const delta = try self.inspector.applyEvent(&held.snapshot, elements, offset_ms) orelse return;
+                const applied = delta.added + delta.replaced + delta.removed;
+                self.counters.events_applied += applied;
+                if (comptime build_options.diag) diag_mod.count(.events_applied, applied);
+                if (delta.added != 0 or delta.removed != 0) self.events_dirty = true;
+            },
+            .other => {},
+        }
+    }
     fn dispatch(self: *Manager, bindings: []const Binding, index: usize, sampled: effect.Clock) !Step {
+        const diag_span = if (comptime build_options.diag) diag_mod.enter(.dispatch) else {};
+        defer if (comptime build_options.diag) diag_mod.leave(diag_span);
         self.status.ready = false;
         var entry = self.live[index];
         if (entry.status != .pending) {
@@ -1015,6 +1387,8 @@ pub const Manager = struct {
         }
     }
     fn expire(self: *Manager, bindings: []const Binding, index: usize, sampled: effect.Clock) !Step {
+        const diag_span = if (comptime build_options.diag) diag_mod.enter(.expiry) else {};
+        defer if (comptime build_options.diag) diag_mod.leave(diag_span);
         self.status.ready = false;
         const entry = self.live[index];
         const pre = self.store.effect_publication_epoch;
@@ -1036,7 +1410,7 @@ pub const Manager = struct {
             self.counters.expiries_prepared += 1;
             return switch (try self.attributeCommit(bindings, index, pre)) {
                 .changed => .progress,
-                .unchanged => .{ .wait = self.waitDue(null) },
+                .unchanged => .{ .wait = self.waitDue() },
             };
         }
         const expired = blk: {
@@ -1045,7 +1419,7 @@ pub const Manager = struct {
         };
         self.counters.expiry_batches += 1;
         self.counters.expiries_prepared += count;
-        if (expired == 0 or self.store.effect_publication_epoch == pre) return .{ .wait = self.waitDue(null) };
+        if (expired == 0 or self.store.effect_publication_epoch == pre) return .{ .wait = self.waitDue() };
         return .progress;
     }
     fn settle(self: *Manager, bindings: []const Binding, index: usize, entry: effect.Entry, dispatch_us: i64, observed: effect.Observation) !void {
@@ -1054,25 +1428,120 @@ pub const Manager = struct {
             errdefer self.writeFailed(pre);
             _ = try self.store.settleOutcome(entry.token(), dispatch_us, observed, try self.clock());
         }
-        if (try self.attributeCommit(bindings, index, pre) == .unchanged) return error.InvalidEffect;
+        if (try self.attributeCommit(bindings, index, pre) == .unchanged) {
+            std.log.warn("native: settlement of view index {d} changed no row at epoch {d}", .{ index, pre });
+            return error.InvalidEffect;
+        }
     }
     pub const StorageGate = enum { healthy, unhealthy };
     pub fn stopStep(self: *Manager, expected_repair_epoch: u64, gate: StorageGate) Step {
-        return self.stopStepInner(expected_repair_epoch, gate) catch |failure| .{ .fatal = failure };
+        if (gate != .healthy) return .{ .fatal = error.StorageUnhealthy };
+        return self.stopStepInner(expected_repair_epoch, true) catch |failure| .{ .fatal = failure };
+    }
+    pub fn withdrawStep(self: *Manager, expected_repair_epoch: u64) Step {
+        const result = self.stopStepInner(expected_repair_epoch, false) catch |failure| Step{ .fatal = failure };
+        if (self.stopping or result == .idle) {
+            self.withdrawn = true;
+            self.status.ready = false;
+            self.status.withdrawn = true;
+            self.last_readback_ns = null;
+            @memset(self.confirmed[0..self.count], false);
+            self.view_revision +%= 1;
+        }
+        return result;
+    }
+    pub fn retireJail(self: *Manager, jail: []const u8, generation: [32]u8) Step {
+        return self.retireJailInner(jail, generation) catch |failure| .{ .fatal = failure };
+    }
+    fn retireJailInner(self: *Manager, jail: []const u8, generation: [32]u8) !Step {
+        errdefer |failure| {
+            self.dropInventory();
+            self.status.ready = false;
+            self.status.uncertain = true;
+            self.status.cause = failure;
+        }
+        if (self.withdrawn) return .idle;
+        if (self.stopping or !self.admitted or self.cached_epoch == null or self.cached_epoch.? != self.store.effect_publication_epoch) return .progress;
+        if (self.readback_wait != 0) return .{ .wait = self.waitDue() };
+        const sampled = try self.clock();
+        if (!self.inventoryCurrent()) return self.readback(sampled);
+        var tokens: [firewall.max_withdraw_messages]firewall.DispatchToken = undefined;
+        var batched: usize = 0;
+        var budget: usize = 0;
+        var in_flight = false;
+        {
+            var owners: [effect.max_page]effect.Owner = undefined;
+            try self.store.beginRead();
+            errdefer self.store.rollback();
+            for (self.live[0..self.count], 0..) |entry, index| {
+                if (entry.desired != .absent) continue;
+                if (!try presentIn(&self.inventory.?, entry)) continue;
+                const owner_count = try self.store.readOwners(entry.scope_key, &owners);
+                for (owners[0..owner_count]) |owner| {
+                    if (std.mem.eql(u8, owner.jail.slice(), jail) and std.mem.eql(u8, &owner.generation, &generation)) break;
+                } else continue;
+                if (entry.status == .dispatched or self.markers[index] != null) {
+                    in_flight = true;
+                    continue;
+                }
+                const cost = try firewall.withdrawCost(entry.scope.canonical);
+                if (batched != 0 and budget + cost > firewall.max_withdraw_messages) break;
+                tokens[batched] = self.token(entry, .absent);
+                batched += 1;
+                budget += cost;
+                if (batched == tokens.len) break;
+            }
+            try self.store.commitTransaction();
+        }
+        if (batched == 0) return if (in_flight and !self.events_subscribed) .progress else .idle;
+        self.status.ready = false;
+        const sent_ns = self.monotonic(self.monotonic_context);
+        const prior_mutation_ns = self.last_mutation_ns;
+        const prior_mutation_wall_us = self.last_mutation_wall_us;
+        self.last_mutation_ns = sent_ns;
+        self.last_mutation_wall_us = sampled.prepared_us;
+        const result = self.inspector.withdrawBatch(tokens[0..batched], .{ .wall_us = sampled.prepared_us }, &self.inventory.?.snapshot) catch |failure| {
+            self.recordFirewallDirect(.effect_dispatch, failure);
+            self.last_mutation_ns = prior_mutation_ns;
+            self.last_mutation_wall_us = prior_mutation_wall_us;
+            if (!transientReadback(failure)) return error.EffectBackendUncertain;
+            return self.deferReadback();
+        };
+        switch (result) {
+            .uncertain => |failure| {
+                self.recordFirewallFailure(failure);
+                if (failure.mutation == .not_started) {
+                    self.last_mutation_ns = prior_mutation_ns;
+                    self.last_mutation_wall_us = prior_mutation_wall_us;
+                }
+                if (!transientReadback(failure.cause)) return error.EffectBackendUncertain;
+                return self.deferReadback();
+            },
+            .verified => |verified| {
+                var snapshot = verified.snapshot;
+                const after_ns = self.monotonic(self.monotonic_context);
+                {
+                    errdefer snapshot.deinit();
+                    try self.validateAndCaptureObservation(&snapshot, .effect, verified.observed_wall_us, .effect_verify);
+                }
+                self.keepInventory(snapshot, verified.observed_start_wall_us, verified.observed_wall_us, after_ns);
+                if (!try self.evaluateInventory()) return self.deferReadback();
+                return .progress;
+            },
+        }
     }
     const max_stop_retries: u8 = 32;
     fn stopFailure(self: *Manager, cause: anyerror, fatal: anyerror) !Step {
         if (!transientCause(cause) or self.stop_retries >= max_stop_retries) return fatal;
         self.stop_retries += 1;
         self.dropInventory();
-        return .{ .wait = self.waitDue(null) };
+        return .{ .wait = self.waitDue() };
     }
-    fn stopStepInner(self: *Manager, expected_repair_epoch: u64, gate: StorageGate) !Step {
-        if (gate != .healthy) return error.StorageUnhealthy;
+    fn stopStepInner(self: *Manager, expected_repair_epoch: u64, require_ready: bool) !Step {
         if (expected_repair_epoch == 0 or expected_repair_epoch != self.repair_epoch) return error.StaleRepairEpoch;
         if (self.store.reopen_required) return error.ReopenRequired;
         if (!self.stopping) {
-            if (!self.admitted or !self.status.ready or self.cached_epoch == null or self.cached_epoch.? != self.store.effect_publication_epoch) return error.EffectReconciliationRequired;
+            if (!self.admitted or (require_ready and !self.status.ready) or self.cached_epoch == null or self.cached_epoch.? != self.store.effect_publication_epoch) return error.EffectReconciliationRequired;
             self.dropInventory();
             self.stopping = true;
             self.stop_cursor = 0;
@@ -1152,7 +1621,34 @@ pub const Manager = struct {
         self.admitted = false;
         self.cached_epoch = null;
         self.count = 0;
+        self.view_revision +%= 1;
         self.status = .{};
+        return .idle;
+    }
+    fn withdrawnReadback(self: *Manager) !Step {
+        const start_ns = self.monotonic(self.monotonic_context);
+        if (self.last_readback_ns) |last| if (start_ns) |now| if (now -| last < self.verify_interval_ns) return .idle;
+        const sampled = try self.clock();
+        var snapshot = self.inspector.inspect() catch |failure| {
+            self.recordFirewallDirect(.readback, failure);
+            if (transientReadback(failure)) return self.deferReadback();
+            return propagateFirewall(Step, failure);
+        };
+        defer snapshot.deinit();
+        if (snapshot.state != .owned) return error.InstallationMismatch;
+        self.captureObservation(&snapshot, .readback, sampled.prepared_us, .not_checked);
+        self.readback_failures = 0;
+        self.counters.full_readbacks += 1;
+        self.last_readback_ns = start_ns;
+        self.last_readback_wall_us = (try self.clock()).prepared_us;
+        self.installed_live = std.math.cast(u32, snapshot.entries.len) orelse return error.LimitExceeded;
+        self.status.ready = false;
+        self.status.withdrawn = true;
+        if (self.status.diagnostic) |diagnostic| if (transientReadback(diagnostic.cause)) {
+            self.status.diagnostic = null;
+            self.status.cause = null;
+            self.status.uncertain = false;
+        };
         return .idle;
     }
     pub const Residual = struct {
@@ -1169,7 +1665,6 @@ pub const Manager = struct {
         return .{ .installed = snapshot.entries.len };
     }
     pub fn expireDuringOutage(self: *Manager) !void {
-        self.dropInventory();
         self.status.ready = false;
         errdefer |failure| {
             self.status.uncertain = true;
@@ -1185,6 +1680,7 @@ pub const Manager = struct {
             if (entry.desired != .finite or entry.desired.live(clock_sample.prepared_us) or self.outage_attempted[i]) continue;
             self.outage_attempted[i] = true;
             self.status.uncertain = true;
+            self.dropInventory();
             var result = self.inspector.applyExact(self.token(entry, .absent), .{ .wall_us = clock_sample.prepared_us }) catch |failure| {
                 self.recordFirewallDirect(.effect_dispatch, failure);
                 return propagateFirewall(void, failure);
@@ -1211,35 +1707,4 @@ pub fn address(scope: effect.Scope) shared.IpAddress {
         .v4 => .{ .ipv4 = std.mem.readInt(u32, scope.canonical.subject.address[0..4], .big) },
         .v6 => .{ .ipv6 = std.mem.readInt(u128, &scope.canonical.subject.address, .big) },
     };
-}
-
-test "native effect runtime: absent inventory is distinct from unexpected owned entries" {
-    const t = std.testing;
-    const installation = firewall.Installation{ .id = [_]u8{0x71} ** 16, .transport = .nftables };
-    var cache = observation.Cache.init(installation, [_]u8{0x72} ** 16);
-    var manager: Manager = undefined;
-    manager.observation_cache = &cache;
-    manager.count = 0;
-    manager.live = &.{};
-    var snapshot = firewall.Snapshot{
-        .allocator = t.allocator,
-        .installation = installation,
-        .state = .absent,
-        .entries = &.{},
-        .fingerprint = [_]u8{0} ** 32,
-        .observed_start_ns = 0,
-        .observed_end_ns = 0,
-    };
-    try t.expectError(error.InstallationMismatch, manager.validateAndCaptureObservation(&snapshot, .readback, null, .readback));
-    var page: observation.Page = undefined;
-    try cache.readPage(.{}, &page);
-    try t.expectEqual(.absent, page.metadata.state);
-    try t.expectEqual(.not_checked, page.metadata.inventory);
-    var entries = [_]firewall.Entry{.{ .address = .{ .ipv4 = 0xc0000201 } }};
-    snapshot.state = .owned;
-    snapshot.entries = &entries;
-    try t.expectError(error.UnownedInstalledEffect, manager.validateAndCaptureObservation(&snapshot, .readback, null, .readback));
-    try cache.readPage(.{}, &page);
-    try t.expectEqual(.unexpected_entries, page.metadata.inventory);
-    try t.expectEqual(@as(usize, 1), page.count);
 }

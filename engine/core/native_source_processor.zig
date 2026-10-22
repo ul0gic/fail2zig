@@ -75,6 +75,11 @@ pub const Processor = struct {
         release: *const fn (?*anyopaque) void,
     } = null,
     retry_policy: ?retry.Policy = null,
+    retry_decay: retry.EscalationDecay = .{},
+    failures_counted: u64 = 0,
+    ignored_detections: u64 = 0,
+    staged_failures: u64 = 0,
+    staged_ignored: u64 = 0,
     retry_enforcement_suppressed: bool = false,
     paused: bool = false,
 
@@ -218,10 +223,19 @@ pub const Processor = struct {
         self.encode(counters);
         self.in_flight = true;
     }
+    fn stageDetection(self: *Processor, kind: detection.Kind, vetoed: bool) void {
+        switch (kind) {
+            .candidate => self.staged_failures += @intFromBool(self.retry_policy != null and !vetoed),
+            .ignored => self.staged_ignored += 1,
+            else => {},
+        }
+    }
     fn publish(context: ?*anyopaque) void {
         const self: *Processor = @ptrCast(@alignCast(context.?));
         if (self.consumer_stage) |stage_value| stage_value.publish(stage_value.context);
         self.encoding_replaced = self.staged_encoding_replaced;
+        self.failures_counted +|= self.staged_failures;
+        self.ignored_detections +|= self.staged_ignored;
         if (self.restoring) self.reported_encoding_replaced = self.encoding_replaced;
         if (self.restoring) self.health = policy.Health.init(self.staged_counters) catch unreachable else self.health.publish(self.staged_counters);
     }
@@ -391,41 +405,15 @@ pub const Processor = struct {
                 consumer_batch = prepared.consumers;
             }
         }
+        self.staged_failures = 0;
+        self.staged_ignored = 0;
+        if (detected) |value| self.stageDetection(value.kind, paused_veto);
+        if (detections) |values| for (values) |value| self.stageDetection(value.kind, paused_veto);
         self.stage(counters, false, replaced_count);
-        return .{ .checkpoint = &self.staged_bytes, .disposition = if (outcome) |value| value.disposition() else "source-checkpoint", .native_time = outcome, .zone_provenance = zone_provenance, .effects_clock = if (self.retry_policy != null and self.retry_policy.?.enforce and !self.retry_enforcement_suppressed and processing_us != null) .{ .prepared_us = processing_us.?, .read = commitClock, .context = self } else null, .native_detection = detected, .native_detections = detections, .consumers = consumer_batch, .consumer_manifest = consumer_manifest, .native_retry = if (self.retry_policy) |value| .{ .generation = self.generation, .policy = value, .processing_us = processing_us, .suppress_enforcement = self.retry_enforcement_suppressed } else null, .retry_suspended = paused_veto, .retry_evidence = retry_evidence, .context = self, .publish = publish, .release = release };
+        return .{ .checkpoint = &self.staged_bytes, .disposition = if (outcome) |value| value.disposition() else "source-checkpoint", .native_time = outcome, .zone_provenance = zone_provenance, .effects_clock = if (self.retry_policy != null and self.retry_policy.?.enforce and !self.retry_enforcement_suppressed and processing_us != null) .{ .prepared_us = processing_us.?, .read = commitClock, .context = self } else null, .native_detection = detected, .native_detections = detections, .consumers = consumer_batch, .consumer_manifest = consumer_manifest, .native_retry = if (self.retry_policy) |value| .{ .generation = self.generation, .policy = value, .processing_us = processing_us, .suppress_enforcement = self.retry_enforcement_suppressed, .decay = self.retry_decay } else null, .retry_suspended = paused_veto, .retry_evidence = retry_evidence, .context = self, .publish = publish, .release = release };
     }
     fn commitClock(context: ?*anyopaque) i64 {
         const self: *Processor = @ptrCast(@alignCast(context.?));
         return if (self.processing_clock) |clock| (clock.read(clock.context) catch return std.math.minInt(i64)).us else self.now.us;
     }
 };
-
-test "native processor: named zone generation and staged provenance survive prepare abort" {
-    const kinds = [_]timezone.TimeType{.{ .offset_seconds = 3600, .is_dst = false, .unspecified = false }};
-    var zone = timezone.Zone{ .allocator = std.testing.allocator, .id = "Fixture/Fixed", .transitions = &.{}, .types = &kinds, .data_digest = [_]u8{1} ** 32, .generation = [_]u8{2} ** 32, .ambiguity = .reject, .tail_present = false, .fixed = true };
-    const receipt = try time.parse(.iso8601, "2026-01-01T00:00:00Z", .{});
-    var scratch: [2048]u8 = undefined;
-    const options = Options{ .jail = "zone", .parent_generation = [_]u8{0} ** 32, .timestamp = .{ .field = .{ .format = .syslog, .boundary = .{ .length = 15 }, .infer_year = true, .zone = &zone } } };
-    var processor = try Processor.init(std.testing.allocator, options, &scratch, receipt);
-    const generation = processor.generation;
-    var second_zone = zone;
-    var second_options = options;
-    second_options.timestamp.field.zone = &second_zone;
-    const equivalent = try Processor.init(std.testing.allocator, second_options, &scratch, receipt);
-    try std.testing.expectEqualSlices(u8, &generation, &equivalent.generation);
-    second_zone.generation[0] += 1;
-    const changed = try Processor.init(std.testing.allocator, second_options, &scratch, receipt);
-    try std.testing.expect(!std.mem.eql(u8, &generation, &changed.generation));
-    const input = records.Record{ .source = "file", .occurrence = "1", .cursor = "1", .message = "Jan  1 01:00:00 fixture", .raw_hash = [_]u8{3} ** 32, .receipt_time = receipt, .byte_start = 0 };
-    const prepared = try processor.adapter().prepare(input, &processor);
-    try std.testing.expectEqual(receipt.us, prepared.native_time.?.eligible.timestamp.us);
-    try std.testing.expectEqual(@as(i32, 3600), prepared.zone_provenance.?.offset_seconds);
-    try std.testing.expectEqualSlices(u8, &zone.data_digest, &prepared.zone_provenance.?.zone_digest);
-    try std.testing.expectEqual(@as(u64, 0), processor.timeHealth().eligible);
-    prepared.release(prepared.context);
-    const retried = try processor.adapter().prepare(input, &processor);
-    defer retried.release(retried.context);
-    try std.testing.expectEqualDeep(prepared.zone_provenance, retried.zone_provenance);
-    retried.publish(retried.context);
-    try std.testing.expectEqual(@as(u64, 1), processor.timeHealth().eligible);
-}

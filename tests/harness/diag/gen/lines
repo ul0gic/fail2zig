@@ -1,0 +1,50 @@
+#!/usr/bin/env -S python3 -I
+# Usage: lines portsentry|sshd COUNT RATE [--start N] [--per-address K]  (writes paced lines to stdout)
+import argparse
+import os
+import sys
+import time
+
+# 198.18.0.0/15 is the RFC 2544 benchmarking range: generated bans never block real traffic.
+ADDRESSES = 2 * 256 * 250
+
+
+def address(n):
+    a, b = divmod(n, 250)
+    return f"198.{18 + a // 256}.{a % 256}.{b + 1}"
+
+
+def portsentry(n, ip):
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + f".{int(time.time() * 1000) % 1000:03d}+0000"
+    return (f"{ts} Scan from: [{ip}] ({ip}) protocol: [TCP] port: [23] type: [Connect] IP opts: [unknown] "
+            "ignored: [false] triggered: [true] noblock: [true] blocked: [false]\n")
+
+
+def sshd(n, ip):
+    return f"Failed password for root from {ip} port {40000 + n % 20000} ssh2\n"
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("format", choices=["portsentry", "sshd"])
+    p.add_argument("count", type=int)
+    p.add_argument("rate", type=float)
+    p.add_argument("--start", type=int, default=0)
+    p.add_argument("--per-address", type=int, default=1)
+    a = p.parse_args()
+    if a.count < 1 or a.rate <= 0 or a.start < 0 or a.per_address < 1:
+        sys.exit("lines: count, rate and per-address must be positive, start non-negative")
+    if a.start + (a.count + a.per_address - 1) // a.per_address > ADDRESSES:
+        sys.exit(f"lines: start + addresses exceeds the {ADDRESSES} addresses of 198.18.0.0/15")
+    render = portsentry if a.format == "portsentry" else sshd
+    t0 = time.monotonic()
+    for i in range(a.count):
+        delay = t0 + i / a.rate - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        n = a.start + i // a.per_address
+        os.write(1, render(i, address(n)).encode())
+
+
+if __name__ == "__main__":
+    main()

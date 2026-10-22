@@ -7,7 +7,7 @@ const retry = @import("native_retry.zig");
 
 pub const version: u16 = 1;
 pub const max_page: usize = 64;
-pub const max_details: usize = 65_536;
+pub const max_details: usize = 262_144;
 pub const Error = error{ InvalidApplicationHistoryQuery, InvalidApplicationHistoryRow, InvalidPolicySummary, StalePolicySummary };
 
 pub const TimeRange = struct {

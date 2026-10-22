@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
-const builtin = @import("builtin");
 const consumers = @import("../core/native_consumer.zig");
 const detection = @import("../core/native_detection_record.zig");
 const retry = @import("../core/native_retry.zig");
@@ -166,7 +165,8 @@ pub fn Methods(comptime Store: type) type {
             for (decisions[0..decision_count]) |decision| if (decision.lease.live(now) or try self.subjectEffectPinned(decision.subject)) return true;
             return false;
         }
-        fn orderRecord(self: *Store, fence: CleanupFence, sequence: u64) Error!Stmt {
+        // Binds fence.generation SQLITE_STATIC: the fence must outlive the returned statement.
+        fn orderRecord(self: *Store, fence: *const CleanupFence, sequence: u64) Error!Stmt {
             var row = try self.statement("SELECT occurrence,raw_hash,cursor,receipt_us,receipt_generation FROM records WHERE jail=?1 AND source=?2 AND source_generation=?3 AND source_sequence=?4 AND source_sequence IS NOT NULL;");
             errdefer row.deinit();
             try row.text(1, fence.jail);
@@ -224,7 +224,7 @@ pub fn Methods(comptime Store: type) type {
             var keys: usize = 0;
             var count: usize = 0;
             while (next.reject_below_sequence <= cutoff_sequence and count < 64) : (count += 1) {
-                var row = try self.orderRecord(fence, next.reject_below_sequence);
+                var row = try self.orderRecord(&fence, next.reject_below_sequence);
                 defer row.deinit();
                 if (!try row.row()) return error.InvalidMaintenanceState;
                 const id = try orderedIdentity(&row, fence);
@@ -327,9 +327,6 @@ pub fn Methods(comptime Store: type) type {
             self.held_window /= 2;
         }
         fn deleteReleasedHeldRecords(self: *Store, fence: CleanupFence, now: i64, wrote: *bool) Error!i64 {
-            if (builtin.is_test) if (self.test_hooks.held_pass_work) |work| {
-                self.work_remaining = work;
-            };
             var position = self.held_cursor;
             const limit = position +| self.held_window;
             var deleted: usize = 0;
@@ -391,7 +388,7 @@ pub fn Methods(comptime Store: type) type {
             var keys: usize = 0;
             var steps: usize = 0;
             while (next.sweep_sequence + 1 < next.reject_below_sequence and deleted < 64 and steps < 64) : (steps += 1) {
-                var row = try self.orderRecord(fence, next.sweep_sequence + 1);
+                var row = try self.orderRecord(&fence, next.sweep_sequence + 1);
                 defer row.deinit();
                 if (!try row.row()) {
                     next.sweep_sequence += 1;
@@ -708,7 +705,7 @@ pub fn Methods(comptime Store: type) type {
                         if (stored_sequence <= 0 or stored_sequence != (if (same) next.sequence + 1 else first) or stored_sequence > end) return error.InvalidMaintenanceState;
                         sequence = @intCast(stored_sequence);
                         const fence = CleanupFence{ .jail = jail, .source = source, .generation = generation, .jail_revision = 0, .consumer_revision = 0, .effect_revision = 0, .clock = .{ .prepared_us = 0 } };
-                        var detail = try self.orderRecord(fence, sequence);
+                        var detail = try self.orderRecord(&fence, sequence);
                         defer detail.deinit();
                         if (try detail.row()) {
                             if (sequence <= state.sweep_sequence) return error.InvalidMaintenanceState;
@@ -810,13 +807,13 @@ pub fn Methods(comptime Store: type) type {
             var token = try self.historyHead(installation, after);
             if (expected_revision) |wanted_revision| if (wanted_revision != token.stream_revision) return error.StaleHistoryPage;
             var row = try self.statement(if (self.schema_version >= store.load_repair_schema)
-                "SELECT s.sequence,e.event_id,e.scope_key,e.canonical_scope,e.jail,e.decision_id,e.confirmed_us,EXISTS(SELECT 1 FROM confirmed_event_details d WHERE d.event_id=e.event_id) FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;"
+                self.originSql("SELECT s.sequence,e.event_id,e.scope_key,e.canonical_scope,e.jail,e.decision_id,e.confirmed_us,", "e.origin", ",EXISTS(SELECT 1 FROM confirmed_event_details d WHERE d.event_id=e.event_id) FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;")
             else if (self.schema_version >= 19)
-                "SELECT s.sequence,e.event_id,e.scope_key,n.canonical_scope,e.jail,e.decision_id,e.confirmed_us,EXISTS(SELECT 1 FROM confirmed_event_details d WHERE d.event_id=e.event_id) FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;"
+                self.originSql("SELECT s.sequence,e.event_id,e.scope_key,n.canonical_scope,e.jail,e.decision_id,e.confirmed_us,", "e.origin", ",EXISTS(SELECT 1 FROM confirmed_event_details d WHERE d.event_id=e.event_id) FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;")
             else if (self.schema_version >= 17)
-                "SELECT s.sequence,e.event_id,e.scope_key,n.scope,e.jail,e.decision_id,e.confirmed_us,EXISTS(SELECT 1 FROM confirmed_event_details d WHERE d.event_id=e.event_id) FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;"
+                self.originSql("SELECT s.sequence,e.event_id,e.scope_key,n.scope,e.jail,e.decision_id,e.confirmed_us,", "e.origin", ",EXISTS(SELECT 1 FROM confirmed_event_details d WHERE d.event_id=e.event_id) FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;")
             else
-                "SELECT s.sequence,e.event_id,e.scope_key,n.scope,e.jail,e.decision_id,e.confirmed_us FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;");
+                self.originSql("SELECT s.sequence,e.event_id,e.scope_key,n.scope,e.jail,e.decision_id,e.confirmed_us,", "e.origin", " FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;"));
             defer row.deinit();
             try row.int(1, @intCast(after));
             try row.int(2, @intCast(output.len));
@@ -825,11 +822,11 @@ pub fn Methods(comptime Store: type) type {
                 const sequence = try row.signed(0);
                 if (sequence <= 0 or sequence != after + count + 1 or sequence > token.head_sequence) return error.HistoryGap;
                 const native_retry = if (self.schema_version >= 17) blk: {
-                    const value = try row.signed(7);
+                    const value = try row.signed(8);
                     if (value < 0 or value > 1) return error.InvalidHistoryEvent;
                     break :blk value == 1;
                 } else false;
-                const event = effect_history.Event{ .sequence = @intCast(sequence), .event_id = try Store.effectBlob(&row, 1, 32), .installation = installation, .scope_key = try Store.effectBlob(&row, 2, 32), .scope = try self.decodeStoredScope(&row, 3), .jail = detection.Name.init(try row.boundedBytes(4, 64)) catch return error.InvalidHistoryEvent, .decision_id = try Store.effectBlob(&row, 5, 32), .confirmed_us = try row.signed(6), .native_retry = native_retry };
+                const event = effect_history.Event{ .sequence = @intCast(sequence), .event_id = try Store.effectBlob(&row, 1, 32), .installation = installation, .scope_key = try Store.effectBlob(&row, 2, 32), .scope = try self.decodeStoredScope(&row, 3), .jail = detection.Name.init(try row.boundedBytes(4, 64)) catch return error.InvalidHistoryEvent, .decision_id = try Store.effectBlob(&row, 5, 32), .confirmed_us = try row.signed(6), .native_retry = native_retry, .origin = std.meta.intToEnum(effects.Origin, try row.signed(7)) catch return error.InvalidHistoryEvent };
                 try event.validate();
                 output[count] = event;
                 count += 1;
@@ -1303,7 +1300,7 @@ pub fn Methods(comptime Store: type) type {
         const sweep_rows: i64 = 1024;
         const age_path_threshold: i64 = 4096;
         const prefix_page: usize = 64;
-        pub const history_overload_events: i64 = 58_982;
+        pub const history_overload_events: i64 = @divTrunc(effects.max_confirmed_events * 9, 10);
         const overload_notice_us: i64 = 60 * 1_000_000;
 
         fn readRetentionPolicy(self: *Store) Error!RetentionPolicy {
@@ -1554,9 +1551,8 @@ pub fn Methods(comptime Store: type) type {
         }
 
         fn sweepCandidatesTx(self: *Store, policy: RetentionPolicy) Error!RetentionOutcome {
-            const rows = if (builtin.is_test) self.test_hooks.retention_sweep_rows orelse sweep_rows else sweep_rows;
             const maximum = try self.integer("SELECT coalesce(max(rowid),0) FROM retained_subject_summaries;");
-            const high = std.math.add(i64, policy.sweep_cursor, rows) catch return error.StorageLimit;
+            const high = std.math.add(i64, policy.sweep_cursor, sweep_rows) catch return error.StorageLimit;
             if (policy.sweep_cursor < maximum) {
                 var sweep = try self.statement("UPDATE retained_subject_summaries SET candidate_sequence=CASE WHEN detail_count>?3 THEN earliest_sequence WHEN evidence_bytes>" ++ retained_evidence_limit ++ " THEN earliest_evidence_sequence END,evaluated_generation=?4 WHERE rowid>?1 AND rowid<=?2;");
                 defer sweep.deinit();
@@ -1602,9 +1598,6 @@ pub fn Methods(comptime Store: type) type {
             }
             const cutoff = std.math.sub(i64, now_us, policy.age_us) catch std.math.minInt(i64);
             var wrote = false;
-            if (builtin.is_test) if (self.test_hooks.retention_select_work) |work| {
-                self.work_remaining = work;
-            };
             const deleted = self.deleteDetailPage(current, fence, cutoff, self.retention_page, &wrote) catch |failure| {
                 if (failure != error.Interrupted or wrote) return failure;
                 return self.yieldRetention();

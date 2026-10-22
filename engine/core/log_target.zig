@@ -4,6 +4,8 @@
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
+const LogFormat = @import("../config/native.zig").LogFormat;
+const logger = @import("logger.zig");
 
 pub const max_line_bytes: usize = 4096;
 pub const ring_capacity: usize = 256;
@@ -35,6 +37,7 @@ pub const Stats = struct {
 pub const Sink = struct {
     allocator: std.mem.Allocator,
     target: Target,
+    format: LogFormat,
     fd: posix.fd_t,
     owns_fd: bool,
     mutex: std.Thread.Mutex = .{},
@@ -47,7 +50,7 @@ pub const Sink = struct {
     degraded: bool = false,
     fallback_noticed: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator, target: Target) (OpenError || std.mem.Allocator.Error)!Sink {
+    pub fn init(allocator: std.mem.Allocator, target: Target, format: LogFormat) (OpenError || std.mem.Allocator.Error)!Sink {
         const ring = try allocator.alloc(u8, ring_capacity * max_line_bytes);
         errdefer allocator.free(ring);
         const fd: posix.fd_t = switch (target) {
@@ -57,6 +60,7 @@ pub const Sink = struct {
         return .{
             .allocator = allocator,
             .target = target,
+            .format = format,
             .fd = fd,
             .owns_fd = target == .file,
             .ring = ring,
@@ -190,10 +194,156 @@ pub fn logFn(
         std.log.defaultLog(level, scope, format, args);
         return;
     };
-    const prefix = if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
     var buf: [max_line_bytes]u8 = undefined;
-    const line = formatLine(&buf, level.asText() ++ prefix ++ format ++ "\n", args);
+    const line = switch (sink.format) {
+        .text => formatLine(&buf, level.asText() ++ (if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ") ++ format ++ "\n", args),
+        .json => jsonLine(&buf, @tagName(level), @tagName(scope), format, args),
+    };
     _ = sink.push(line);
+}
+
+fn carriesFields(comptime Args: type) bool {
+    const info = @typeInfo(Args);
+    if (info != .@"struct" or !info.@"struct".is_tuple or info.@"struct".fields.len != 1) return false;
+    const Arg = info.@"struct".fields[0].type;
+    return @typeInfo(Arg) == .@"struct" and @hasDecl(Arg, "logFields");
+}
+
+const hex = "0123456789abcdef";
+
+const json_close = "\",\"truncated\":true}\n";
+
+const JsonLine = struct {
+    buf: *[max_line_bytes]u8,
+    len: usize = 0,
+    truncated: bool = false,
+
+    const limit = max_line_bytes - json_close.len;
+
+    fn room(self: *const JsonLine) usize {
+        return if (self.len >= limit) 0 else limit - self.len;
+    }
+
+    fn raw(self: *JsonLine, bytes: []const u8) bool {
+        if (self.truncated or bytes.len > self.room()) {
+            self.truncated = true;
+            return false;
+        }
+        @memcpy(self.buf[self.len..][0..bytes.len], bytes);
+        self.len += bytes.len;
+        return true;
+    }
+
+    fn reserved(self: *JsonLine, bytes: []const u8) void {
+        @memcpy(self.buf[self.len..][0..bytes.len], bytes);
+        self.len += bytes.len;
+    }
+
+    fn stringBody(self: *JsonLine, s: []const u8) void {
+        var i: usize = 0;
+        while (i < s.len) {
+            var unit: [6]u8 = undefined;
+            var unit_len: usize = 1;
+            var advance: usize = 1;
+            const c = s[i];
+            switch (c) {
+                '"', '\\' => {
+                    unit[0] = '\\';
+                    unit[1] = c;
+                    unit_len = 2;
+                },
+                '\n' => {
+                    @memcpy(unit[0..2], "\\n");
+                    unit_len = 2;
+                },
+                '\r' => {
+                    @memcpy(unit[0..2], "\\r");
+                    unit_len = 2;
+                },
+                '\t' => {
+                    @memcpy(unit[0..2], "\\t");
+                    unit_len = 2;
+                },
+                0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f, 0x7f => {
+                    unit = .{ '\\', 'u', '0', '0', hex[c >> 4], hex[c & 0x0f] };
+                    unit_len = 6;
+                },
+                0x20...0x21, 0x23...0x5b, 0x5d...0x7e => unit[0] = c,
+                0x80...0xff => {
+                    const width = std.unicode.utf8ByteSequenceLength(c) catch 0;
+                    if (width != 0 and i + width <= s.len and std.unicode.utf8ValidateSlice(s[i..][0..width])) {
+                        @memcpy(unit[0..width], s[i..][0..width]);
+                        unit_len = width;
+                        advance = width;
+                    } else {
+                        @memcpy(unit[0..6], "\\ufffd");
+                        unit_len = 6;
+                    }
+                },
+            }
+            if (!self.raw(unit[0..unit_len])) return;
+            i += advance;
+        }
+    }
+
+    fn field(self: *JsonLine, f: logger.Field) void {
+        var head: [128]u8 = undefined;
+        const text = switch (f.value) {
+            .string => std.fmt.bufPrint(&head, ",\"{s}\":\"", .{f.key}),
+            .int => |value| std.fmt.bufPrint(&head, ",\"{s}\":{d}", .{ f.key, value }),
+            .uint => |value| std.fmt.bufPrint(&head, ",\"{s}\":{d}", .{ f.key, value }),
+            .boolean => |value| std.fmt.bufPrint(&head, ",\"{s}\":{}", .{ f.key, value }),
+            .float => |value| std.fmt.bufPrint(&head, ",\"{s}\":{d}", .{ f.key, value }),
+        } catch {
+            self.truncated = true;
+            return;
+        };
+        if (!self.raw(text)) return;
+        switch (f.value) {
+            .string => |value| {
+                self.stringBody(value);
+                self.reserved("\"");
+            },
+            else => {},
+        }
+    }
+};
+
+fn jsonLine(buf: *[max_line_bytes]u8, comptime level: []const u8, comptime scope: []const u8, comptime format: []const u8, args: anytype) []const u8 {
+    var msg_buf: [max_line_bytes]u8 = undefined;
+    var msg_stream = std.io.fixedBufferStream(&msg_buf);
+    const msg_cut = if (msg_stream.writer().print(format, args)) false else |_| true;
+
+    var line = JsonLine{ .buf = buf };
+    var ts_buf: [32]u8 = undefined;
+    _ = line.raw("{\"ts\":\"");
+    _ = line.raw(rfc3339Millis(&ts_buf, std.time.milliTimestamp()));
+    _ = line.raw("\",\"level\":\"" ++ level ++ "\",\"scope\":\"" ++ scope ++ "\",\"msg\":\"");
+    line.stringBody(msg_stream.getWritten());
+    line.reserved("\"");
+    if (comptime carriesFields(@TypeOf(args))) {
+        for (args[0].logFields()) |f| line.field(f);
+    }
+    if (line.truncated or msg_cut) line.reserved(json_close[1 .. json_close.len - 2]);
+    line.reserved("}\n");
+    return buf[0..line.len];
+}
+
+fn rfc3339Millis(buf: *[32]u8, epoch_ms: i64) []const u8 {
+    const ms: u64 = @intCast(@max(epoch_ms, 0));
+    const es = std.time.epoch.EpochSeconds{ .secs = ms / 1000 };
+    const ymd = es.getEpochDay().calculateYearDay();
+    const month_day = ymd.calculateMonthDay();
+    const time = es.getDaySeconds();
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
+        ymd.year,
+        month_day.month.numeric(),
+        month_day.day_index + 1,
+        time.getHoursIntoDay(),
+        time.getMinutesIntoHour(),
+        time.getSecondsIntoMinute(),
+        ms % 1000,
+    }) catch buf[0..0];
 }
 
 fn formatLine(buf: *[max_line_bytes]u8, comptime format: []const u8, args: anytype) []const u8 {

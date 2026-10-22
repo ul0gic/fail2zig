@@ -67,7 +67,7 @@ pub const Plan = struct {
         if (!settings.custom) {
             const cell = try a.create(*ignore_set.EffectiveIgnore);
             errdefer a.destroy(cell);
-            cell.* = try ignore_set.EffectiveIgnore.build(a, literals, &.{});
+            cell.* = try ignore_set.EffectiveIgnore.build(a, literals, &.{}, &.{}, &.{}, 0);
             self.ignore_cell = cell;
         }
         errdefer if (self.ignore_cell) |cell| {

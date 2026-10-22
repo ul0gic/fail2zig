@@ -8,10 +8,9 @@ code; a candidate never changes them to pass. Run artifacts go under
 | File | Purpose |
 |---|---|
 | `fixture.zig` | Builds valid current-schema state through production Store APIs with a controlled clock; writes a manifest and checks integrity, foreign keys and application invariants |
-| `oracle.c` | Independent retention oracle: complete ascending deletion vector under the shipped predicate at a fixed cutoff/fence, plus the non-resetting measurement wrapper and its negative controls |
 | `kernel_oracle.c` | Reads nftables set elements over raw netlink without product code |
 | `campaign.sh` | Runs a daemon workload in a rootless namespace with kernel and TCP oracles and positive controls |
-| `rig.sh`, `restart.sh`, `measure.c` | Original reproduction rig; reused, not modified |
+| `rig.sh`, `restart.sh` | Original reproduction rig; reused, not modified |
 
 ## Constraints
 

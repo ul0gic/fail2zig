@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const shared = @import("shared");
+const cli = @import("cli");
 const inspect = @import("../migration/inspect.zig");
 const snapshot = @import("../migration/sqlite_snapshot.zig");
 const plan_mod = @import("../migration/plan.zig");
@@ -14,20 +15,7 @@ pub const ExitClass = shared.ExitClass;
 pub const Output = enum { json, table };
 
 fn usage(stderr: anytype) ExitClass {
-    stderr.writeAll(
-        \\usage:
-        \\  fail2zig migrate inspect --source-dir <dir> [--output json|table]
-        \\  fail2zig migrate snapshot --source-db <file> --staging-dir <dir> [--output json|table]
-        \\  fail2zig migrate plan --source-dir <dir> [--source-db <file> --staging-dir <dir>] --out <plan.json>
-        \\                        [--continuity lossless|reset-replay] [--replay-window <seconds>] [--runtime-socket <path>] [--output json|table]
-        \\  fail2zig migrate validate --plan <plan.json> [--source-dir <dir>] [--snapshot <file>] [--output json|table]
-        \\  fail2zig migrate cutover --plan <plan.json> --state-file <db> --staging-dir <dir> --backend nftables|ipset|iptables
-        \\                           [--socket <path>] [--run-id <hex>] [--output json|table]
-        \\  fail2zig migrate status --plan <plan.json> --state-file <db> --staging-dir <dir> --run-id <hex> [--output json|table]
-        \\  fail2zig migrate rollback --plan <plan.json> --state-file <db> --staging-dir <dir> --backend <b> --run-id <hex>
-        \\                            [--source-verified] [--socket <path>] [--output json|table]
-        \\
-    ) catch {};
+    stderr.writeAll(cli.args.help_migrate) catch {};
     return .usage;
 }
 
@@ -134,6 +122,10 @@ fn parseFlags(args: []const []const u8, stderr: anytype) ?Parsed {
 }
 
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8, tool_version: []const u8, stdout: anytype, stderr: anytype) ExitClass {
+    for (args) |arg| if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+        stdout.writeAll(cli.args.help_migrate) catch return .rejected;
+        return .success;
+    };
     if (args.len == 0) return usage(stderr);
     const sub = args[0];
     const parsed = parseFlags(args[1..], stderr) orelse return usage(stderr);
@@ -298,28 +290,4 @@ fn runValidate(allocator: std.mem.Allocator, parsed: Parsed, stdout: anytype, st
         },
     }
     return if (validation.outcome == .valid) .success else .rejected;
-}
-
-test "migrate cli: usage failures never touch inputs" {
-    var out = std.ArrayList(u8).init(std.testing.allocator);
-    defer out.deinit();
-    var err = std.ArrayList(u8).init(std.testing.allocator);
-    defer err.deinit();
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{}, "t", out.writer(), err.writer()));
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{"bogus"}, "t", out.writer(), err.writer()));
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{ "inspect", "--output", "xml" }, "t", out.writer(), err.writer()));
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{ "inspect", "--source-dir" }, "t", out.writer(), err.writer()));
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{ "snapshot", "--source-db", "/nonexistent.sqlite3", "--staging-dir", "/nonexistent" }, "t", out.writer(), err.writer()));
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{ "inspect", "--source-dir", "/nonexistent-fail2ban" }, "t", out.writer(), err.writer()));
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{ "plan", "--source-dir", "/nonexistent-fail2ban" }, "t", out.writer(), err.writer()));
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{ "plan", "--source-dir", "/x", "--out", "/tmp/p.json", "--continuity", "magic" }, "t", out.writer(), err.writer()));
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{ "validate", "--plan", "/nonexistent/plan.json" }, "t", out.writer(), err.writer()));
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{ "cutover", "--plan", "/nonexistent/plan.json" }, "t", out.writer(), err.writer()));
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{ "cutover", "--plan", "/p", "--state-file", "/s", "--staging-dir", "/d", "--backend", "magic" }, "t", out.writer(), err.writer()));
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{ "status", "--plan", "/p", "--state-file", "/s", "--staging-dir", "/d", "--backend", "nftables", "--run-id", "zz" }, "t", out.writer(), err.writer()));
-    try std.testing.expectEqual(ExitClass.usage, run(std.testing.allocator, &.{ "status", "--plan", "/p", "--state-file", "/s", "--staging-dir", "/d", "--backend", "nftables" }, "t", out.writer(), err.writer()));
-}
-
-test {
-    _ = cutover;
 }

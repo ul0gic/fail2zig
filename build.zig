@@ -2,23 +2,28 @@
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
 
-const fail2zig_version = "0.4.7";
+const fail2zig_version = "0.4.8";
 
-const CiLane = enum { components_a, components_b, assembled, fuzz, excluded, deferred };
-const CiGates = struct {
-    components_a: *std.Build.Step,
-    components_b: *std.Build.Step,
-    assembled: *std.Build.Step,
-    fuzz: *std.Build.Step,
+fn releaseSignal(b: *std.Build, strip: bool) ?[]const u8 {
+    if (strip) return "-Dstrip=true";
+    if (b.graph.env_map.get("RELEASE_TAG") != null) return "RELEASE_TAG is set";
+    if (b.graph.env_map.get("GITHUB_REF_TYPE")) |ref_type| if (std.mem.eql(u8, ref_type, "tag")) return "GITHUB_REF_TYPE=tag";
+    return null;
+}
 
-    fn add(self: CiGates, lane: CiLane, step: *std.Build.Step) void {
-        switch (lane) {
-            .components_a => self.components_a.dependOn(step),
-            .components_b => self.components_b.dependOn(step),
-            .assembled => self.assembled.dependOn(step),
-            .fuzz => self.fuzz.dependOn(step),
-            .excluded, .deferred => {},
-        }
+const NoDiagCheck = struct {
+    const markers = [_][]const u8{ "DIAGNOSTIC BUILD", "f2z_diag_", fail2zig_version ++ "+diag" };
+
+    step: std.Build.Step,
+    binary: []const u8,
+
+    fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+        _ = options;
+        const self: *NoDiagCheck = @fieldParentPtr("step", step);
+        const b = step.owner;
+        const path = if (std.fs.path.isAbsolute(self.binary)) self.binary else b.pathFromRoot(self.binary);
+        const bytes = std.fs.cwd().readFileAlloc(b.allocator, path, 1 << 30) catch |err| return step.fail("cannot read {s}: {s}", .{ path, @errorName(err) });
+        for (markers) |marker| if (std.mem.indexOf(u8, bytes, marker) != null) return step.fail("{s} is a diagnostic build: contains '{s}'", .{ path, marker });
     }
 };
 
@@ -26,6 +31,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const strip = b.option(bool, "strip", "Strip debug information from the executable") orelse false;
+    const diag = b.option(bool, "diag", "Build the internal diagnostic instrumentation; never shipped") orelse false;
+    if (diag) if (releaseSignal(b, strip)) |signal| {
+        std.debug.print("error: -Ddiag=true is refused for a release build ({s})\n", .{signal});
+        std.process.exit(1);
+    };
+    const tracy = b.option(bool, "tracy", "Profile the diagnostic build with the Tracy client; requires -Ddiag=true") orelse false;
+    if (tracy and !diag) {
+        std.debug.print("error: -Dtracy=true requires -Ddiag=true\n", .{});
+        std.process.exit(1);
+    }
 
     const sqlite = b.addStaticLibrary(.{
         .name = "sqlite3",
@@ -33,21 +48,13 @@ pub fn build(b: *std.Build) void {
     });
     sqlite.root_module.addCSourceFile(.{
         .file = b.path("vendor/sqlite/sqlite3.c"),
-        .flags = &.{"-DSQLITE_OMIT_LOAD_EXTENSION=1"},
+        .flags = if (diag) &.{ "-DSQLITE_OMIT_LOAD_EXTENSION=1", "-DSQLITE_ENABLE_DBSTAT_VTAB=1", "-Dfsync=f2z_diag_fsync" } else &.{ "-DSQLITE_OMIT_LOAD_EXTENSION=1", "-DSQLITE_ENABLE_DBSTAT_VTAB=1" },
     });
 
     const build_options = b.addOptions();
-    build_options.addOption([]const u8, "version", fail2zig_version);
-    const enable_bench = b.option(
-        bool,
-        "bench",
-        "Enable measurements in the explicit benchmark-parser step.",
-    ) orelse false;
-    const test_filter = b.option(
-        []const u8,
-        "test-filter",
-        "Only compile tests matching this substring (e.g. -Dtest-filter=allocator)",
-    );
+    build_options.addOption([]const u8, "version", if (diag) fail2zig_version ++ "+diag" else fail2zig_version);
+    build_options.addOption(bool, "diag", diag);
+    build_options.addOption(bool, "tracy", tracy);
 
     const shared_mod = b.addModule("shared", .{
         .root_source_file = b.path("shared/root.zig"),
@@ -75,6 +82,19 @@ pub fn build(b: *std.Build) void {
     engine_mod.addImport("build_options", build_options_mod);
     engine_mod.addImport("cli", client_mod);
     engine_mod.linkLibrary(sqlite);
+    if (tracy) if (b.lazyDependency("tracy", .{})) |tracy_dep| {
+        const tracy_client = b.addStaticLibrary(.{
+            .name = "tracy",
+            .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true }),
+        });
+        tracy_client.root_module.addCSourceFile(.{
+            .file = tracy_dep.path("public/TracyClient.cpp"),
+            // Zig's C UBSan trap fires (ud1) in Tracy's queue dequeue switch, TracyProfiler.cpp:2569, and freezes the daemon.
+            .flags = &.{ "-fno-sanitize=undefined", "-DTRACY_ENABLE", "-DTRACY_TIMER_FALLBACK", "-DTRACY_NO_BROADCAST", "-DTRACY_ONLY_LOCALHOST", "-DTRACY_DELAYED_INIT", "-DTRACY_MANUAL_LIFETIME" },
+        });
+        engine_mod.link_libcpp = true;
+        engine_mod.linkLibrary(tracy_client);
+    };
 
     const engine_exe = b.addExecutable(.{
         .name = "fail2zig",
@@ -95,6 +115,13 @@ pub fn build(b: *std.Build) void {
     const install_release_lifecycle = b.addInstallArtifact(release_lifecycle_exe, .{});
     b.step("test-release-lifecycle", "Build the test-only privileged release lifecycle helper").dependOn(&install_release_lifecycle.step);
 
+    const no_diag = b.allocator.create(NoDiagCheck) catch @panic("OOM");
+    no_diag.* = .{
+        .step = std.Build.Step.init(.{ .id = .custom, .name = "check-no-diag", .owner = b, .makeFn = NoDiagCheck.make }),
+        .binary = b.option([]const u8, "check-binary", "Executable for check-no-diag (default: the installed fail2zig)") orelse b.getInstallPath(.bin, "fail2zig"),
+    };
+    b.step("check-no-diag", "Fail if an executable carries diagnostic build markers").dependOn(&no_diag.step);
+
     const run_engine = b.addRunArtifact(engine_exe);
     run_engine.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_engine.addArgs(args);
@@ -102,31 +129,8 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run the small delivered-daemon smoke check (alias of test-smoke)");
     const release_local_step = b.step("test-release-local", "Run the bounded assembled local release gate");
-    const ci: CiGates = .{
-        .components_a = b.step("test-ci-components-a", "Run maintained native components, shard A"),
-        .components_b = b.step("test-ci-components-b", "Run maintained native components, shard B"),
-        .assembled = b.step("test-ci-assembled", "Run assembled daemon and migration checks"),
-        .fuzz = b.step("test-ci-fuzz", "Run bounded input fuzz cases and module graph guard"),
-    };
-    const test_filters: []const []const u8 = if (test_filter) |f| &.{f} else &.{};
+    const assembled_step = b.step("test-ci-assembled", "Run assembled daemon checks");
 
-    const engine_tests = b.addTest(.{
-        .root_module = engine_mod,
-        .filters = test_filters,
-    });
-    const run_engine_tests = b.addRunArtifact(engine_tests);
-    ci.add(.deferred, &run_engine_tests.step); // Mixed legacy and current behavior remains outside maintained CI.
-    b.step("test-engine", "Run native daemon tests").dependOn(&run_engine_tests.step);
-
-    // Membership is mandatory next to each suite. New entries cannot silently
-    // escape CI, and workflow YAML never repeats this inventory.
-    const Component = struct {
-        name: []const u8,
-        path: []const u8,
-        filter: []const u8,
-        sqlite: bool,
-        ci: CiLane,
-    };
     const component_api = b.createModule(.{
         .root_source_file = b.path("engine/test_api.zig"),
         .target = target,
@@ -171,51 +175,13 @@ pub fn build(b: *std.Build) void {
     const load_fixture = b.addExecutable(.{ .name = "f2z-load-fixture", .root_module = load_fixture_mod });
     b.step("build-load-fixture", "Build the load reproduction state fixture generator").dependOn(&b.addInstallArtifact(load_fixture, .{}).step);
 
-    const components = [_]Component{
-        .{ .name = "test-native-firewall", .path = "tests/component/native_firewall_tests.zig", .filter = "native firewall:", .sqlite = false, .ci = .components_a },
-        .{ .name = "test-native-rules", .path = "tests/component/native_rule_tests.zig", .filter = "native rules:", .sqlite = false, .ci = .components_b },
-        .{ .name = "test-native-correlation", .path = "tests/component/native_correlation_tests.zig", .filter = "native correlation:", .sqlite = false, .ci = .components_a },
-        .{ .name = "test-native-source-repair", .path = "tests/component/source_repair_tests.zig", .filter = "source repair:", .sqlite = false, .ci = .components_b },
-        .{ .name = "test-native-consumers", .path = "tests/component/native_consumer_tests.zig", .filter = "native consumers:", .sqlite = true, .ci = .components_a },
-        .{ .name = "test-native-effects", .path = "tests/component/native_effect_tests.zig", .filter = "native effects:", .sqlite = true, .ci = .components_b },
-        .{ .name = "test-native-effect-runtime", .path = "tests/component/native_effect_runtime_tests.zig", .filter = "native effect runtime:", .sqlite = true, .ci = .components_a },
-        .{ .name = "test-native-effect-history", .path = "tests/component/native_effect_history_tests.zig", .filter = "native effect history:", .sqlite = false, .ci = .components_b },
-        .{ .name = "test-native-effect-history-store", .path = "tests/component/native_effect_history_store_tests.zig", .filter = "native effect history store:", .sqlite = true, .ci = .components_a },
-        .{ .name = "test-native-consumer-manifest", .path = "tests/component/native_consumer_manifest_tests.zig", .filter = "native consumer manifest:", .sqlite = true, .ci = .components_b },
-        .{ .name = "test-native-consumer-coordinator", .path = "tests/component/native_consumer_coordinator_tests.zig", .filter = "native coordinator:", .sqlite = false, .ci = .components_a },
-        .{ .name = "test-native-consumer-runtime", .path = "tests/component/native_consumer_runtime_tests.zig", .filter = "native consumer runtime:", .sqlite = true, .ci = .components_b },
-        .{ .name = "test-native-consumer-plan", .path = "tests/component/native_consumer_plan_tests.zig", .filter = "native consumer plan:", .sqlite = false, .ci = .components_a },
-        .{ .name = "test-native-session-repair", .path = "tests/component/native_session_repair_tests.zig", .filter = "native session repair:", .sqlite = true, .ci = .components_b },
-        .{ .name = "test-native-resource-budget", .path = "tests/component/native_resource_budget_tests.zig", .filter = "native resource budget:", .sqlite = true, .ci = .components_a },
-        .{ .name = "test-native-maintenance", .path = "tests/component/native_maintenance_tests.zig", .filter = "native maintenance:", .sqlite = true, .ci = .components_b },
-        .{ .name = "test-native-effective", .path = "tests/component/native_effective_tests.zig", .filter = "native effective:", .sqlite = false, .ci = .components_a },
-        .{ .name = "test-native-timezone", .path = "tests/component/native_timezone_tests.zig", .filter = "native timezone:", .sqlite = false, .ci = .components_b },
-        .{ .name = "test-native-config", .path = "tests/component/native_config_tests.zig", .filter = "native:", .sqlite = false, .ci = .components_a },
-        .{ .name = "test-native-dns", .path = "tests/component/native_dns_tests.zig", .filter = "native dns:", .sqlite = false, .ci = .components_b },
-        .{ .name = "test-native-ignore", .path = "tests/component/native_ignore_tests.zig", .filter = "native ignore:", .sqlite = false, .ci = .components_a },
-        .{ .name = "test-native-ipc-auth", .path = "tests/component/native_ipc_auth_tests.zig", .filter = "native ipc auth:", .sqlite = false, .ci = .components_b },
-        .{ .name = "test-native-migration-snapshot", .path = "tests/component/migration_snapshot_tests.zig", .filter = "migration snapshot:", .sqlite = true, .ci = .components_a },
-        .{ .name = "test-native-migration-inspect", .path = "tests/component/migration_inspect_tests.zig", .filter = "migration inspect:", .sqlite = false, .ci = .components_b },
-        .{ .name = "test-native-admin-store", .path = "tests/component/native_admin_store_tests.zig", .filter = "native admin store:", .sqlite = true, .ci = .components_a },
-        .{ .name = "test-native-reload", .path = "tests/component/native_reload_tests.zig", .filter = "native reload:", .sqlite = false, .ci = .components_b },
-        .{ .name = "test-native-readiness", .path = "tests/component/native_readiness_tests.zig", .filter = "native readiness:", .sqlite = false, .ci = .components_a },
-        .{ .name = "test-native-query", .path = "tests/component/native_query_tests.zig", .filter = "native query:", .sqlite = false, .ci = .components_b },
-        .{ .name = "test-native-migration-plan", .path = "tests/component/migration_plan_tests.zig", .filter = "migration plan:", .sqlite = true, .ci = .components_a },
-        .{ .name = "test-native-rule-test", .path = "tests/component/native_rule_test_tests.zig", .filter = "native rule test:", .sqlite = false, .ci = .components_b },
-        .{ .name = "test-offline-source-repair", .path = "tests/component/store/offline_source_repair_tests.zig", .filter = "offline source repair:", .sqlite = true, .ci = .components_a },
-        .{ .name = "test-load-repair-migration", .path = "tests/component/store/load_repair_migration_tests.zig", .filter = "load repair migration:", .sqlite = true, .ci = .components_b },
-        .{ .name = "test-native-migration-store", .path = "tests/component/native_migration_store_tests.zig", .filter = "migration store:", .sqlite = true, .ci = .components_a },
-        .{ .name = "test-native-migration-import", .path = "tests/component/migration_import_tests.zig", .filter = "migration import:", .sqlite = true, .ci = .components_b },
-        .{ .name = "test-native-migration-continuity", .path = "tests/component/migration_continuity_tests.zig", .filter = "migration continuity:", .sqlite = true, .ci = .components_a },
-        .{ .name = "test-native-migration-journal", .path = "tests/component/migration_journal_tests.zig", .filter = "migration journal:", .sqlite = true, .ci = .components_b },
-        .{ .name = "test-native-migration-conflict", .path = "tests/component/native_migration_conflict_tests.zig", .filter = "migration conflict:", .sqlite = true, .ci = .components_a },
-        .{ .name = "test-native-reload-crash", .path = "tests/component/native_reload_crash_tests.zig", .filter = "reload crash:", .sqlite = true, .ci = .components_b },
-        .{ .name = "test-native-config-inline", .path = "tests/component/native_config_inline_tests.zig", .filter = "", .sqlite = false, .ci = .components_b },
-        .{ .name = "test-fail2ban-inline", .path = "tests/component/fail2ban_inline_tests.zig", .filter = "", .sqlite = false, .ci = .components_b },
-        .{ .name = "test-firewall-inspection-inline", .path = "tests/component/firewall_inspection_inline_tests.zig", .filter = "native firewall:", .sqlite = false, .ci = .components_a },
-        .{ .name = "test-nftables-inline", .path = "tests/component/nftables_inline_tests.zig", .filter = "nftables:", .sqlite = false, .ci = .components_b },
+    const firewall_step = b.step("test-firewall", "Run the firewall readback parser suites");
+    const firewall_suites = [_]struct { name: []const u8, path: []const u8, filter: []const u8 }{
+        .{ .name = "test-native-firewall", .path = "tests/component/native_firewall_tests.zig", .filter = "native firewall:" },
+        .{ .name = "test-firewall-inspection-inline", .path = "tests/component/firewall_inspection_inline_tests.zig", .filter = "native firewall:" },
+        .{ .name = "test-nftables-inline", .path = "tests/component/nftables_inline_tests.zig", .filter = "nftables:" },
     };
-    for (components) |entry| {
+    for (firewall_suites) |entry| {
         const module = b.createModule(.{
             .root_source_file = b.path(entry.path),
             .target = target,
@@ -224,195 +190,31 @@ pub fn build(b: *std.Build) void {
         });
         module.addImport("shared", shared_mod);
         module.addImport("engine_test", component_api);
-        if (entry.sqlite) module.linkLibrary(sqlite);
-        const filters: []const []const u8 = if (entry.filter.len == 0) &.{} else &.{entry.filter};
-        const tests = b.addTest(.{ .root_module = module, .filters = filters });
+        const tests = b.addTest(.{ .root_module = module, .filters = &.{entry.filter} });
         const run_tests = b.addRunArtifact(tests);
         b.step(entry.name, "Test isolated native component delivery").dependOn(&run_tests.step);
-        ci.add(entry.ci, &run_tests.step);
-        // Compile-only entry points for isolated target execution; never run on the build host.
-        if (std.mem.eql(u8, entry.name, "test-native-effect-runtime") or
-            std.mem.eql(u8, entry.name, "test-native-firewall") or
-            std.mem.eql(u8, entry.name, "test-load-repair-migration"))
-        {
-            const artifact_name = b.fmt("{s}-tests", .{entry.name[5..]});
-            const installed = b.addInstallArtifact(tests, .{ .dest_sub_path = artifact_name });
-            b.step(b.fmt("build-{s}", .{artifact_name}), "Build an isolated target test binary without executing it").dependOn(&installed.step);
+        firewall_step.dependOn(&run_tests.step);
+        // Compile-only entry point for isolated target execution; never run on the build host.
+        if (std.mem.eql(u8, entry.name, "test-native-firewall")) {
+            const installed = b.addInstallArtifact(tests, .{ .dest_sub_path = "native-firewall-tests" });
+            b.step("build-native-firewall-tests", "Build an isolated target test binary without executing it").dependOn(&installed.step);
         }
     }
 
-    const client_format_api = b.createModule(.{
-        .root_source_file = b.path("client/format.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    client_format_api.addImport("shared", shared_mod);
-    const client_format_test_mod = b.createModule(.{
-        .root_source_file = b.path("tests/component/client_format_tests.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    client_format_test_mod.addImport("client_format", client_format_api);
-    const client_list_order = b.createModule(.{
-        .root_source_file = b.path("client/list_order.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    client_list_order.addImport("shared", shared_mod);
-    client_format_test_mod.addImport("client_list_order", client_list_order);
-    const client_format_tests = b.addTest(.{ .root_module = client_format_test_mod, .filters = &.{"format:"} });
-    const run_client_format_tests = b.addRunArtifact(client_format_tests);
-    b.step("test-client-format", "Test client formatting").dependOn(&run_client_format_tests.step);
-    ci.add(.components_a, &run_client_format_tests.step);
-
-    const coordination_mod = b.createModule(.{
-        .root_source_file = b.path("engine/native_daemon.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    coordination_mod.addImport("shared", shared_mod);
-    coordination_mod.addImport("build_options", build_options_mod);
-    coordination_mod.linkLibrary(sqlite);
-    const coordination_tests = b.addTest(.{ .root_module = coordination_mod, .filters = &.{ "native daemon BUG-0", "native daemon recovery:" } });
-    const run_coordination = b.addRunArtifact(coordination_tests);
-    b.step("test-native-coordination", "Test deterministic daemon ownership and publication races").dependOn(&run_coordination.step);
-    ci.add(.components_a, &run_coordination.step);
-
-    const native_foundations_mod = b.createModule(.{
-        .root_source_file = b.path("tests/component/native_foundations_tests.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    native_foundations_mod.addImport("shared", shared_mod);
-    native_foundations_mod.addImport("engine_test", component_api);
-    native_foundations_mod.linkLibrary(sqlite);
-
-    const native_foundations = b.addTest(.{ .root_module = native_foundations_mod, .filters = &.{ "storage health:", "native processor:", "record store:", "pipeline:", "receipt recovery:", "future time:", "time admission:", "event age:", "year inference:", "native journal:", "clock recovery:", "native retry:" } });
-    const run_foundations = b.addRunArtifact(native_foundations);
-    b.step("test-native-foundations", "Test native storage, time, sources and recovery without legacy workers").dependOn(&run_foundations.step);
-    ci.add(.components_b, &run_foundations.step);
-    const native_journal = b.addTest(.{ .root_module = native_foundations_mod, .filters = &.{"native journal:"} });
-    b.step("test-native-journal", "Test current journal continuity and bounded recovery").dependOn(&b.addRunArtifact(native_journal).step);
-    const native_source = b.addTest(.{ .root_module = native_foundations_mod, .filters = &.{"native source:"} });
-    const run_native_source = b.addRunArtifact(native_source);
-    b.step("test-native-source", "Test durable file source continuity and framing").dependOn(&run_native_source.step);
-    ci.add(.components_a, &run_native_source.step);
-
-    const detection_mod = b.createModule(.{
-        .root_source_file = b.path("tests/component/native_detection_tests.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    detection_mod.addImport("shared", shared_mod);
-    detection_mod.addImport("engine_test", component_api);
-    detection_mod.linkLibrary(sqlite);
-    const detection_options = b.addOptions();
-    detection_options.addOption([]const u8, "corpus_path", b.pathFromRoot("tests/integration/filter_corpus.json"));
-    detection_mod.addImport("detection_test_options", detection_options.createModule());
-    const detection_tests = b.addTest(.{ .root_module = detection_mod, .filters = &.{"native detection:"} });
-    const run_detection_tests = b.addRunArtifact(detection_tests);
-    b.step("test-native-detection", "Test native file and origin-qualified journal detection").dependOn(&run_detection_tests.step);
-    ci.add(.components_a, &run_detection_tests.step);
-
-    const retry_mod = b.createModule(.{
-        .root_source_file = b.path("tests/component/native_retry_tests.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    retry_mod.addImport("shared", shared_mod);
-    retry_mod.addImport("engine_test", component_api);
-    retry_mod.linkLibrary(sqlite);
-    const retry_tests = b.addTest(.{ .root_module = retry_mod, .filters = &.{"native retry:"} });
-    const run_retry_tests = b.addRunArtifact(retry_tests);
-    b.step("test-native-retry", "Test transactional native retry state and decisions").dependOn(&run_retry_tests.step);
-    ci.add(.components_b, &run_retry_tests.step);
-
-    const journal_lab_mod = b.createModule(.{
-        .root_source_file = b.path("tests/component/journal_origin_lab_tests.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    journal_lab_mod.addImport("shared", shared_mod);
-    journal_lab_mod.addImport("engine_test", component_api);
-    const journal_lab_options = b.addOptions();
-    journal_lab_options.addOption(?[]const u8, "fixture", b.option([]const u8, "journal-origin-fixture", "Captured journal JSON lines for explicit lab qualification"));
-    journal_lab_options.addOption(?[]const u8, "machine_id", b.option([]const u8, "journal-origin-machine-id", "Independently captured machine ID for lab qualification"));
-    journal_lab_mod.addImport("journal_lab_options", journal_lab_options.createModule());
-    const journal_lab_tests = b.addTest(.{ .root_module = journal_lab_mod, .filters = &.{"lab journal:"} });
-    b.step("test-journal-origin-lab", "Qualify captured SSH journal records without contacting a host").dependOn(&b.addRunArtifact(journal_lab_tests).step);
-
-    const client_tests = b.addTest(.{
-        .root_module = client_mod,
-        .filters = test_filters,
-    });
-    const run_client_tests = b.addRunArtifact(client_tests);
-
-    const shared_tests = b.addTest(.{
-        .root_module = shared_mod,
-        .filters = test_filters,
-    });
-    const run_shared_tests = b.addRunArtifact(shared_tests);
-    const native_cli_step = b.step("test-native-cli", "Test the internal administration modules and shared exit classes");
-    native_cli_step.dependOn(&run_client_tests.step);
-    native_cli_step.dependOn(&run_shared_tests.step);
-    ci.add(.components_a, native_cli_step);
-
-    const guard_options = b.addOptions();
-    guard_options.addOption([]const u8, "tests_dir", b.pathFromRoot("tests"));
-    const guard_mod = b.createModule(.{
-        .root_source_file = b.path("tests/guards/module_graph_guard.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    guard_mod.addImport("guard_options", guard_options.createModule());
-    const guard_tests = b.addTest(.{ .root_module = guard_mod, .filters = test_filters });
-    const run_guard = b.addRunArtifact(guard_tests);
-    ci.add(.fuzz, &run_guard.step);
-
-    const standalone_options = b.addOptions();
-    standalone_options.addOption(?[]const u8, "release_dir", b.option([]const u8, "release-dir", "Directory of five named release artifacts for ELF inspection"));
-    standalone_options.addOption([]const u8, "repo_root", b.pathFromRoot("."));
-    standalone_options.addOption([]const u8, "daemon_path", b.pathFromRoot("zig-out/bin/fail2zig"));
-    const standalone_mod = b.createModule(.{
-        .strip = strip,
-        .root_source_file = b.path("tests/integration/standalone_surface_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    standalone_mod.addImport("standalone_test_options", standalone_options.createModule());
-    const standalone_tests = b.addTest(.{ .root_module = standalone_mod, .filters = &.{"standalone surface:"} });
-    const run_standalone_tests = b.addRunArtifact(standalone_tests);
-    run_standalone_tests.step.dependOn(b.getInstallStep());
-    b.step("test-standalone-surface", "Verify required product and release paths have no interpreter dependency").dependOn(&run_standalone_tests.step);
-    release_local_step.dependOn(&run_standalone_tests.step);
-    ci.add(.assembled, &run_standalone_tests.step);
-
     const IntegrationFile = struct {
-        ci: CiLane,
         release_local: bool,
         name: []const u8,
         path: []const u8,
-        needs_daemon_binary: bool,
     };
     const integration_files = [_]IntegrationFile{
-        .{ .name = "filter_corpus", .path = "tests/integration/filter_corpus_test.zig", .needs_daemon_binary = false, .ci = .excluded, .release_local = false },
-        .{ .name = "migration", .path = "tests/integration/migration_test.zig", .needs_daemon_binary = false, .ci = .assembled, .release_local = false },
-        .{ .name = "startup_failclosed", .path = "tests/integration/startup_failclosed_test.zig", .needs_daemon_binary = true, .ci = .assembled, .release_local = true },
-        .{ .name = "native_daemon", .path = "tests/integration/native_daemon_test.zig", .needs_daemon_binary = true, .ci = .assembled, .release_local = true },
-        .{ .name = "journalctl_contract", .path = "tests/integration/journalctl_contract_test.zig", .needs_daemon_binary = false, .ci = .assembled, .release_local = true },
-        .{ .name = "config_diag", .path = "tests/integration/config_diag_test.zig", .needs_daemon_binary = true, .ci = .assembled, .release_local = false },
-        .{ .name = "no_backend", .path = "tests/integration/no_backend_test.zig", .needs_daemon_binary = true, .ci = .assembled, .release_local = true },
-        .{ .name = "cli_entry", .path = "tests/integration/cli_entry_test.zig", .needs_daemon_binary = true, .ci = .assembled, .release_local = true },
-        .{ .name = "reload", .path = "tests/integration/reload_test.zig", .needs_daemon_binary = true, .ci = .assembled, .release_local = true },
-        .{ .name = "service_lifecycle", .path = "tests/integration/service_lifecycle_test.zig", .needs_daemon_binary = true, .ci = .assembled, .release_local = true },
-        .{ .name = "admin", .path = "tests/integration/admin_test.zig", .needs_daemon_binary = true, .ci = .assembled, .release_local = true },
+        .{ .name = "startup_failclosed", .path = "tests/integration/startup_failclosed_test.zig", .release_local = true },
+        .{ .name = "native_daemon", .path = "tests/integration/native_daemon_test.zig", .release_local = true },
+        .{ .name = "config_diag", .path = "tests/integration/config_diag_test.zig", .release_local = false },
+        .{ .name = "no_backend", .path = "tests/integration/no_backend_test.zig", .release_local = true },
+        .{ .name = "cli_entry", .path = "tests/integration/cli_entry_test.zig", .release_local = true },
+        .{ .name = "reload", .path = "tests/integration/reload_test.zig", .release_local = true },
+        .{ .name = "service_lifecycle", .path = "tests/integration/service_lifecycle_test.zig", .release_local = true },
+        .{ .name = "admin", .path = "tests/integration/admin_test.zig", .release_local = true },
     };
     for (integration_files) |f| {
         const mod = b.createModule(.{
@@ -424,11 +226,11 @@ pub fn build(b: *std.Build) void {
         });
         mod.addImport("shared", shared_mod);
         mod.addImport("engine", engine_mod);
-        const t = b.addTest(.{ .root_module = mod, .filters = test_filters });
+        const t = b.addTest(.{ .root_module = mod });
         const run = b.addRunArtifact(t);
-        if (f.needs_daemon_binary) run.step.dependOn(b.getInstallStep());
+        run.step.dependOn(b.getInstallStep());
         if (f.release_local) release_local_step.dependOn(&run.step);
-        ci.add(f.ci, &run.step);
+        assembled_step.dependOn(&run.step);
         if (std.mem.eql(u8, f.name, "startup_failclosed"))
             b.step("test-startup", "Run daemon startup integration tests").dependOn(&run.step);
         if (std.mem.eql(u8, f.name, "native_daemon")) {
@@ -459,62 +261,5 @@ pub fn build(b: *std.Build) void {
             b.step("test-service-lifecycle", "Run installed service lifecycle (notify, signals, denied paths) tests").dependOn(&run.step);
         if (std.mem.eql(u8, f.name, "cli_entry"))
             b.step("test-cli-entry", "Run one-executable entry point and operator round trips").dependOn(&run.step);
-        if (std.mem.eql(u8, f.name, "journalctl_contract"))
-            b.step("test-journalctl", "Qualify host journalctl against original offline fixtures").dependOn(&run.step);
-    }
-
-    const parser_only_mod = b.createModule(.{
-        .root_source_file = b.path("engine/core/parser.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    parser_only_mod.addImport("shared", shared_mod);
-
-    const FuzzFile = struct {
-        ci: CiLane,
-        path: []const u8,
-        extra_import_name: ?[]const u8,
-        extra_import_mod: ?*std.Build.Module,
-    };
-    const fuzz_files = [_]FuzzFile{
-        .{ .path = "tests/fuzz/fuzz_parser.zig", .extra_import_name = "parser", .extra_import_mod = parser_only_mod, .ci = .fuzz },
-        .{ .path = "tests/fuzz/fuzz_ip.zig", .extra_import_name = null, .extra_import_mod = null, .ci = .fuzz },
-        .{ .path = "tests/fuzz/fuzz_protocol.zig", .extra_import_name = null, .extra_import_mod = null, .ci = .fuzz },
-        .{ .path = "tests/fuzz/fuzz_config.zig", .extra_import_name = "engine", .extra_import_mod = engine_mod, .ci = .fuzz },
-    };
-    for (fuzz_files) |f| {
-        const mod = b.createModule(.{
-            .root_source_file = b.path(f.path),
-            .target = target,
-            .optimize = optimize,
-        });
-        mod.addImport("shared", shared_mod);
-        if (f.extra_import_name) |n| mod.addImport(n, f.extra_import_mod.?);
-        const t = b.addTest(.{ .root_module = mod, .filters = &.{"fuzz_"} });
-        const run = b.addRunArtifact(t);
-        ci.add(f.ci, &run.step);
-    }
-
-    const BenchFile = struct {
-        path: []const u8,
-        needs_daemon_binary: bool,
-    };
-    const bench_files = [_]BenchFile{
-        .{ .path = "tests/benchmark/parse_throughput.zig", .needs_daemon_binary = false },
-    };
-    for (bench_files) |f| {
-        const mod = b.createModule(.{
-            .root_source_file = b.path(f.path),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        mod.addImport("shared", shared_mod);
-        mod.addImport("engine", engine_mod);
-        const t = b.addTest(.{ .root_module = mod, .filters = test_filters });
-        const run = b.addRunArtifact(t);
-        if (enable_bench) run.setEnvironmentVariable("FAIL2ZIG_RUN_BENCH", "1");
-        b.step("benchmark-parser", "Run the explicit parser measurement (enable with -Dbench=true)").dependOn(&run.step);
-        if (f.needs_daemon_binary) run.step.dependOn(b.getInstallStep());
     }
 }

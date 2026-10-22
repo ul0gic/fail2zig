@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
-const builtin = @import("builtin");
+const build_options = @import("build_options");
+const diag_mod = @import("../core/diag.zig");
 const native_time = @import("../core/native_time.zig");
 const time_policy = @import("../core/source_time_policy.zig");
 const native_record = @import("../core/native_time_record.zig");
@@ -13,7 +14,7 @@ const effects = @import("../core/native_effect.zig");
 const effect_history = @import("../core/native_effect_history.zig");
 const application_history = @import("../core/native_application_history.zig");
 const action_outcome = @import("../core/native_action_outcome.zig");
-pub const latest_schema: i64 = 25;
+pub const latest_schema: i64 = 26;
 pub const load_repair_schema: i64 = 24;
 pub const load_repair = @import("load_repair_migration.zig");
 pub const max_native_detections = 16;
@@ -218,11 +219,6 @@ pub const max_retention_page: u16 = 256;
 // A transaction allows 1,000 progress callbacks of 1,000 VM steps (workProgress).
 pub const max_held_window: u16 = 8192;
 pub const ReclaimCursor = struct { phase: u2 = 0, cursor: i64 = 0, found: bool = false, rest: u8 = 0 };
-pub const TestHooks = if (builtin.is_test) struct {
-    retention_select_work: ?u32 = null,
-    retention_sweep_rows: ?i64 = null,
-    held_pass_work: ?u32 = null,
-} else struct {};
 pub const Store = struct {
     allocator: std.mem.Allocator,
     api: Api,
@@ -236,6 +232,8 @@ pub const Store = struct {
     noted_keys: [attribution_batch]effects.Hash = undefined,
     noted_count: u8 = 0,
     noted_ambiguous: bool = false,
+    observation_rows: ?i64 = null,
+    event_rows: ?i64 = null,
     reopen_required: bool = false,
     startup_admission: bool = false,
     startup_operation: bool = false,
@@ -255,9 +253,10 @@ pub const Store = struct {
     retry_detail_rest: u8 = 0,
     maintenance_operation: ?@import("../core/storage_health.zig").MaintenanceOperation = null,
     history_overload_notice_us: ?i64 = null,
-    test_hooks: TestHooks = .{},
     escalation_jitter_context: ?*anyopaque = null,
     escalation_jitter: *const fn (?*anyopaque, u64) u64 = systemEscalationJitter,
+    retry_evictions: @import("consumer_retry.zig").Evictions = .{},
+    diag_changes: if (build_options.diag) i64 else void = if (build_options.diag) 0 else {},
 
     fn systemEscalationJitter(_: ?*anyopaque, maximum_seconds: u64) u64 {
         return std.crypto.random.uintAtMost(u64, maximum_seconds);
@@ -270,10 +269,10 @@ pub const Store = struct {
     }
     pub fn configureRuntimeLimits(self: *Store) Error!void {
         configureHeapLimit();
-        try self.exec("PRAGMA cache_size=-2048; PRAGMA wal_autocheckpoint=0;");
+        try self.exec("PRAGMA cache_size=-32768; PRAGMA wal_autocheckpoint=0;");
         const page_size = try self.integer("PRAGMA page_size;");
         if (page_size <= 0) return error.DatabaseFailure;
-        const pages = @divTrunc(@as(i64, 256 * 1024 * 1024), page_size);
+        const pages = @divTrunc(@as(i64, 1024 * 1024 * 1024), page_size);
         if (try self.integer("PRAGMA page_count;") > pages) return error.StorageLimit;
         var sql: [80]u8 = undefined;
         const maximum = std.fmt.bufPrintZ(&sql, "PRAGMA max_page_count={d};", .{pages}) catch return error.StorageLimit;
@@ -289,6 +288,8 @@ pub const Store = struct {
         return 0;
     }
     pub fn maintainWal(self: *Store, database_path: []const u8) Error!void {
+        const diag_span = if (comptime build_options.diag) diag_mod.enter(.wal) else {};
+        defer if (comptime build_options.diag) diag_mod.leave(diag_span);
         try self.usable();
         if (self.api.get_autocommit(self.db) == 0) return error.DatabaseFailure;
         if (database_path.len == 0 or std.mem.indexOfScalar(u8, database_path, 0) != null) return error.OpenFailed;
@@ -300,6 +301,7 @@ pub const Store = struct {
             error.NameTooLong => return error.StorageLimit,
             else => return error.StorageIo,
         };
+        if (comptime build_options.diag) diag_mod.gauge(.wal_bytes, stat.size);
         if (stat.size < 16 * 1024 * 1024) return;
         self.work_remaining = 1000;
         var row = try self.statement("PRAGMA wal_checkpoint(TRUNCATE);");
@@ -316,6 +318,9 @@ pub const Store = struct {
         if (self.startup_admission) return error.DatabaseFailure;
         if (self.runtime_path) |path| try self.maintainWal(path);
         try self.exec("BEGIN IMMEDIATE;");
+        if (comptime build_options.diag) self.diagMarkChanges();
+        self.observation_rows = null;
+        self.event_rows = null;
         self.noted_count = 0;
         self.noted_ambiguous = false;
     }
@@ -327,6 +332,7 @@ pub const Store = struct {
     pub fn finishStartupAdmission(self: *Store) Error!void {
         if (!self.startup_admission or self.startup_operation) return error.DatabaseFailure;
         try self.exec("COMMIT;");
+        if (comptime build_options.diag) self.diagCommitted();
         self.startup_admission = false;
     }
     pub fn abortStartupAdmission(self: *Store) void {
@@ -342,6 +348,8 @@ pub const Store = struct {
         try self.usable();
         if (!self.startupAdmissionActive()) return error.DatabaseFailure;
         self.work_remaining = 1000;
+        self.observation_rows = null;
+        self.event_rows = null;
         try self.exec("SAVEPOINT native_startup_operation;");
         self.startup_operation = true;
         self.noted_count = 0;
@@ -356,7 +364,13 @@ pub const Store = struct {
         try self.exec("BEGIN;");
     }
     pub fn commitTransaction(self: *Store) Error!void {
-        if (!self.startup_admission) return self.exec("COMMIT;");
+        const diag_span = if (comptime build_options.diag) diag_mod.enter(.commit) else {};
+        defer if (comptime build_options.diag) diag_mod.leave(diag_span);
+        if (!self.startup_admission) {
+            try self.exec("COMMIT;");
+            if (comptime build_options.diag) self.diagCommitted();
+            return;
+        }
         if (!self.startup_operation or self.api.get_autocommit(self.db) != 0) return error.DatabaseFailure;
         try self.exec("RELEASE native_startup_operation;");
         self.startup_operation = false;
@@ -378,7 +392,7 @@ pub const Store = struct {
         self.noted_ambiguous = false;
     }
     pub const attribution_ring = 256;
-    pub const attribution_batch = 8;
+    pub const attribution_batch = @import("group_commit.zig").max_batch_records;
     pub const AttributedChange = struct {
         epoch: u64 = 0,
         count: u8 = 0,
@@ -404,31 +418,31 @@ pub const Store = struct {
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) Error!Store {
         var ignored = OpenDiagnostic{};
-        return openImpl(allocator, path, .plain, &ignored, .{});
+        return openImpl(allocator, path, .plain, &ignored);
     }
 
     pub fn openExisting(allocator: std.mem.Allocator, path: []const u8) Error!Store {
         var ignored = OpenDiagnostic{};
-        return openImpl(allocator, path, .existing, &ignored, .{});
+        return openImpl(allocator, path, .existing, &ignored);
     }
 
     pub fn openDetailed(allocator: std.mem.Allocator, path: []const u8, diagnostic: *OpenDiagnostic) Error!Store {
-        return openImpl(allocator, path, .plain, diagnostic, .{});
+        return openImpl(allocator, path, .plain, diagnostic);
     }
 
     pub fn openRuntime(allocator: std.mem.Allocator, path: []const u8) Error!Store {
         var ignored = OpenDiagnostic{};
-        return openImpl(allocator, path, .runtime, &ignored, .{});
+        return openImpl(allocator, path, .runtime, &ignored);
     }
     pub fn openRuntimeDetailed(allocator: std.mem.Allocator, path: []const u8, diagnostic: *OpenDiagnostic) Error!Store {
-        return openImpl(allocator, path, .runtime, diagnostic, .{});
+        return openImpl(allocator, path, .runtime, diagnostic);
     }
     pub fn openReadOnly(allocator: std.mem.Allocator, path: []const u8) Error!Store {
         var ignored = OpenDiagnostic{};
-        return openImpl(allocator, path, .readonly, &ignored, .{});
+        return openImpl(allocator, path, .readonly, &ignored);
     }
     pub fn openReadOnlyDetailed(allocator: std.mem.Allocator, path: []const u8, diagnostic: *OpenDiagnostic) Error!Store {
-        return openImpl(allocator, path, .readonly, diagnostic, .{});
+        return openImpl(allocator, path, .readonly, diagnostic);
     }
 
     pub const InstallationSnapshot = struct {
@@ -442,7 +456,7 @@ pub const Store = struct {
     }
 
     pub fn installationSnapshotDetailed(allocator: std.mem.Allocator, path: []const u8, diagnostic: *OpenDiagnostic) Error!InstallationSnapshot {
-        var store = try openImpl(allocator, path, .preflight, diagnostic, .{});
+        var store = try openImpl(allocator, path, .preflight, diagnostic);
         defer store.close();
         store.last_error_code = null;
         const installation = if (store.schema_version >= 11)
@@ -456,14 +470,7 @@ pub const Store = struct {
     }
 
     const OpenMode = enum { plain, runtime, readonly, preflight, existing };
-    pub const TestAccess = if (builtin.is_test) struct {
-        pub const openImpl = Store.openImpl;
-    } else struct {};
-    const OpenHooks = struct {
-        context: ?*anyopaque = null,
-        before_identity_recheck: ?*const fn (?*anyopaque) void = null,
-    };
-    fn openImpl(allocator: std.mem.Allocator, path: []const u8, open_mode: OpenMode, diagnostic: *OpenDiagnostic, hooks: OpenHooks) Error!Store {
+    fn openImpl(allocator: std.mem.Allocator, path: []const u8, open_mode: OpenMode, diagnostic: *OpenDiagnostic) Error!Store {
         diagnostic.* = .{};
         const runtime = open_mode == .runtime;
         if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null)
@@ -473,7 +480,9 @@ pub const Store = struct {
         defer parent.close();
         const parent_stat = std.posix.fstat(parent.fd) catch |failure|
             return openFailure(diagnostic, .parent_stat, error.OpenFailed, openPosixCause(failure), null);
-        if (parent_stat.uid != std.os.linux.geteuid() or parent_stat.mode & 0o022 != 0)
+        const reader_uid = std.os.linux.geteuid();
+        const root_reader = open_mode == .readonly and reader_uid == 0;
+        if ((parent_stat.uid != reader_uid and !root_reader) or parent_stat.mode & 0o022 != 0)
             return openFailure(diagnostic, .parent_permissions, error.UnsafePermissions, null, null);
         const stat = std.posix.fstatat(std.posix.AT.FDCWD, path, std.posix.AT.SYMLINK_NOFOLLOW) catch |failure| blk: {
             if (failure != error.FileNotFound or open_mode == .readonly or open_mode == .preflight or open_mode == .existing)
@@ -486,7 +495,7 @@ pub const Store = struct {
         };
         if (!std.posix.S.ISREG(stat.mode))
             return openFailure(diagnostic, .file_type, error.UnsafePermissions, null, null);
-        if (stat.mode & 0o077 != 0 or stat.uid != std.os.linux.geteuid())
+        if (stat.mode & 0o077 != 0 or (stat.uid != reader_uid and !root_reader))
             return openFailure(diagnostic, .file_permissions, error.UnsafePermissions, null, null);
         const api = embedded_api;
         const filename = allocator.dupeZ(u8, path) catch
@@ -506,7 +515,6 @@ pub const Store = struct {
         self.last_error_code = null;
         self.check(db_config(self.db, 1006, @as(c_int, 1), @as(?*c_int, null))) catch |failure|
             return openFailure(diagnostic, .connection_setup, failure, null, self.last_error_code);
-        if (builtin.is_test) if (hooks.before_identity_recheck) |hook| hook(hooks.context);
         const selected = std.posix.fstatat(std.posix.AT.FDCWD, path, std.posix.AT.SYMLINK_NOFOLLOW) catch |failure|
             return openFailure(diagnostic, .file_identity_recheck, error.OpenFailed, openPosixCause(failure), null);
         if (selected.dev != stat.dev or selected.ino != stat.ino or selected.uid != stat.uid or selected.mode != stat.mode)
@@ -763,36 +771,6 @@ pub const Store = struct {
         if (receipt_us) |wanted| if (original_receipt == null or original_receipt.? != wanted) return error.OccurrenceConflict;
         return error.PrunedReplay;
     }
-    pub fn fixtureReplayGuard(self: *Store, jail: []const u8, source: []const u8, occurrence: []const u8) Error!void {
-        if (!builtin.is_test) @compileError("fixtureReplayGuard is test-only");
-        try self.beginWrite();
-        errdefer self.rollback();
-        const position = try self.recordSequence(jail, source, occurrence) orelse return error.InvalidMaintenanceState;
-        var row = try self.statement("SELECT raw_hash,cursor,receipt_us,receipt_generation FROM records WHERE jail=?1 AND source=?2 AND occurrence=?3;");
-        defer row.deinit();
-        try row.text(1, jail);
-        try row.text(2, source);
-        try row.text(3, occurrence);
-        if (!try row.row()) return error.InvalidMaintenanceState;
-        const identity = ReceiptIdentity{ .jail = jail, .source = source, .occurrence = occurrence, .raw_hash = try Store.effectBlob(&row, 0, 32), .cursor = try row.boundedBytes(1, Limits.cursor_bytes), .generation = position.generation };
-        const receipt = try row.optionalSigned(2);
-        if (receipt != null and !std.mem.eql(u8, &try Store.effectBlob(&row, 3, 32), &position.generation)) return error.InvalidMaintenanceState;
-        const occurrence_key = occurrenceGuardKey(occurrence);
-        const identity_key = identityGuardKey(identity);
-        var insert = try self.statement("INSERT INTO replay_guards VALUES(?1,?2,?3,?4,?5,?6,?7);");
-        defer insert.deinit();
-        try insert.text(1, jail);
-        try insert.text(2, source);
-        try insert.blob(3, &position.generation);
-        try insert.blob(4, &occurrence_key);
-        try insert.blob(5, &identity_key);
-        if (receipt) |value| try insert.int(6, value);
-        try insert.int(7, @intCast(position.sequence));
-        try insert.done();
-        try self.fault(.after_replay_guard);
-        try self.commitTransaction();
-    }
-
     pub const CursorRebinding = struct { old: [32]u8, new: [32]u8 };
     pub const PolicyTransition = struct { jail: []const u8, generation: [32]u8, next_generation: [32]u8, expected: retry.Policy, next: retry.Policy, cursor_rebinding: ?CursorRebinding = null };
     pub usingnamespace @import("admin.zig").Methods(@This());
@@ -804,6 +782,22 @@ pub const Store = struct {
     pub usingnamespace @import("ignore_entries.zig").Methods(@This());
 
     pub usingnamespace @import("continuity.zig").Methods(@This());
+
+    pub usingnamespace @import("footprint.zig").Methods(@This());
+
+    pub usingnamespace @import("ban_origins.zig").Methods(@This());
+
+    pub usingnamespace @import("retry_release.zig").Methods(@This());
+
+    pub usingnamespace @import("group_commit.zig").Methods(@This());
+
+    pub usingnamespace @import("source_repair.zig").Methods(@This());
+
+    pub usingnamespace @import("jail_lifecycle.zig").Methods(@This());
+
+    pub usingnamespace @import("config_deadlines.zig").Methods(@This());
+
+    pub usingnamespace @import("diag_checks.zig").Methods(@This());
 
     pub fn inspectInteger(self: *Store, sql: [:0]const u8) Error!i64 {
         if (!@import("builtin").is_test) @compileError("inspectInteger is test-only");
@@ -1113,11 +1107,19 @@ pub const Store = struct {
         }
     }
 
+    pub const ReceiptStep = struct { time: native_time.Timestamp, reserved: bool };
     pub fn beginReceipt(self: *Store, identity: ReceiptIdentity, proposed: native_time.Timestamp, expected_revision: u64) Error!native_time.Timestamp {
-        try Store.validateReceiptIdentity(identity);
-        const maximum = self.receipt_limit orelse return error.ReceiptStorageRequired;
         try self.beginWrite();
         errdefer self.rollback();
+        const step = try self.reserveReceiptStep(identity, proposed, expected_revision);
+        if (step.reserved) try self.fault(.before_receipt_commit);
+        try self.commitTransaction();
+        if (step.reserved) try self.fault(.after_receipt_commit);
+        return step.time;
+    }
+    pub fn reserveReceiptStep(self: *Store, identity: ReceiptIdentity, proposed: native_time.Timestamp, expected_revision: u64) Error!ReceiptStep {
+        try Store.validateReceiptIdentity(identity);
+        const maximum = self.receipt_limit orelse return error.ReceiptStorageRequired;
         const schema = try self.integer("PRAGMA user_version;");
         if (schema < 3 or schema > latest_schema) return error.UnsupportedSchema;
         self.schema_version = schema;
@@ -1126,10 +1128,7 @@ pub const Store = struct {
         if (expected_revision >= std.math.maxInt(i64) or try self.revision(identity.jail) != expected_revision) return error.StaleCheckpoint;
         try self.validateReceiptGeneration(identity.jail, identity.generation);
         if (try self.hasRecord(identity.jail, identity.source, identity.occurrence, identity.raw_hash, identity.cursor)) return error.ReceiptAlreadyCommitted;
-        if (try self.pendingReceipt(identity)) |saved| {
-            try self.commitTransaction();
-            return saved;
-        }
+        if (try self.pendingReceipt(identity)) |saved| return .{ .time = saved, .reserved = false };
         if (try self.pendingReceiptCount() >= maximum) return error.ReceiptLimit;
         {
             var row = try self.statement("INSERT INTO pending_receipts VALUES(?1,?2,?3,?4,?5,?6,?7);");
@@ -1150,10 +1149,7 @@ pub const Store = struct {
             try clock.done();
         }
         self.schema_version = schema;
-        try self.fault(.before_receipt_commit);
-        try self.commitTransaction();
-        try self.fault(.after_receipt_commit);
-        return proposed;
+        return .{ .time = proposed, .reserved = true };
     }
 
     pub fn close(self: *Store) void {
@@ -1174,6 +1170,8 @@ pub const Store = struct {
     }
     pub fn rollback(self: *Store) void {
         self.work_remaining = 1000;
+        self.observation_rows = null;
+        self.event_rows = null;
         if (self.api.get_autocommit(self.db) != 0) {
             if (self.startup_admission) self.reopen_required = true;
             self.startup_operation = false;
@@ -1233,9 +1231,22 @@ pub const Store = struct {
         if (record.native_detection) |*value| return @as(*const [1]detection.Outcome, @ptrCast(value));
         return &.{};
     }
+    pub const RecordStep = struct { result: CommitResult, effect_changed: bool };
     pub fn commitRecord(self: *Store, record: Record) Error!CommitResult {
         try self.usable();
-        const detections = try recordDetections(&record);
+        const detections = try validateRecord(&record);
+        try self.beginWrite();
+        errdefer self.rollback();
+        const step = try self.commitRecordStep(&record, detections);
+        if (step.result == .already_committed) {
+            try self.commitTransaction();
+            return .already_committed;
+        }
+        try self.commitEffectTransaction(step.effect_changed);
+        return .committed;
+    }
+    pub fn validateRecord(record: *const Record) Error![]const detection.Outcome {
+        const detections = try recordDetections(record);
         if (record.jail.len == 0 or record.source.len == 0 or record.occurrence.len == 0 or record.cursor.len == 0 or
             record.jail.len > 4096 or record.source.len > Limits.source_bytes or record.occurrence.len > 16384 or record.cursor.len > Limits.cursor_bytes or
             record.checkpoint.len > Limits.checkpoint_bytes or record.disposition.len > 64) return error.InvalidRecord;
@@ -1249,12 +1260,13 @@ pub const Store = struct {
             if (shared.payload) |payload| if (payload.len > Limits.shared_bytes) return error.InvalidRecord;
         }
         if (record.consumers) |batch| try batch.validate();
-        try self.beginWrite();
-        errdefer self.rollback();
+        return detections;
+    }
+    pub fn commitRecordStep(self: *Store, record: *const Record, detections: []const detection.Outcome) Error!RecordStep {
         const schema = try self.integer("PRAGMA user_version;");
         if (schema < 2 or schema > latest_schema) return error.UnsupportedSchema;
         self.schema_version = schema;
-        const source_generation = if (schema >= 14) try recordGeneration(&record) else null;
+        const source_generation = if (schema >= 14) try recordGeneration(record) else null;
         try self.checkReplayGuard(record.jail, record.source, record.occurrence, record.raw_hash, record.cursor, source_generation, if (record.receipt) |value| value.time.us else null);
         if (schema >= 9) {
             const registered = try self.readRetryPolicy(record.jail);
@@ -1327,8 +1339,7 @@ pub const Store = struct {
                     const supplied = source_generation orelse return error.OccurrenceConflict;
                     if (!std.mem.eql(u8, &supplied, &ordered.generation)) return error.OccurrenceConflict;
                 };
-                try self.commitTransaction();
-                return .already_committed;
+                return .{ .result = .already_committed, .effect_changed = false };
             }
         }
         {
@@ -1399,7 +1410,7 @@ pub const Store = struct {
             }
             try stmt.done();
         }
-        if (source_generation) |value| _ = try self.advanceSourceSequence(&record, value);
+        if (source_generation) |value| _ = try self.advanceSourceSequence(record, value);
         try self.fault(.after_record);
         if (native_values) |values| {
             var row = try self.statement(if (schema >= 5)
@@ -1464,9 +1475,9 @@ pub const Store = struct {
         }
         if (record.native_retry) |admission| {
             if (!record.retry_suspended) {
-                if (detections.len == 0) try self.commitRetry(record, admission);
+                if (detections.len == 0) try self.commitRetry(record.*, admission);
                 for (detections) |value| {
-                    var scalar = record;
+                    var scalar = record.*;
                     scalar.native_detection = value;
                     scalar.native_detections = null;
                     try self.commitRetry(scalar, admission);
@@ -1528,9 +1539,7 @@ pub const Store = struct {
             const count = try self.retryDecisions(record.jail, record.source, record.occurrence, &decisions);
             for (decisions[0..count]) |decision| if (decision.enforce and !decision.lease.live(now)) return error.EffectExpired;
         }
-        const effect_changed = if (record.native_retry != null) try self.hasEnforcingDecision(record) else false;
-        try self.commitEffectTransaction(effect_changed);
-        return .committed;
+        return .{ .result = .committed, .effect_changed = if (record.native_retry != null) try self.hasEnforcingDecision(record.*) else false };
     }
     fn hasEnforcingDecision(self: *Store, record: Record) Error!bool {
         var row = try self.statement("SELECT EXISTS(SELECT 1 FROM retry_decisions WHERE jail=?1 AND source=?2 AND occurrence=?3 AND enforce=1);");
@@ -1693,6 +1702,7 @@ pub const Stmt = struct {
     pub fn deinit(self: *Stmt) void {
         _ = self.store.api.finalize(self.ptr);
     }
+    // SQLITE_STATIC (null destructor): bound bytes must outlive every step; never bind a returning helper's by-value parameters.
     pub fn text(self: *Stmt, index: c_int, value: []const u8) Error!void {
         if (value.len > std.math.maxInt(c_int)) return error.InvalidRecord;
         try self.store.check(self.store.api.bind_text(self.ptr, index, value.ptr, @intCast(value.len), null));
@@ -1719,6 +1729,13 @@ pub const Stmt = struct {
             100 => true,
             101 => false,
             else => blk: {
+                if (rc == 9) {
+                    const sql_of = @extern(*const fn (*Statement) callconv(.c) ?[*:0]const u8, .{ .name = "sqlite3_sql" });
+                    if (sql_of(self.ptr)) |sql_text| {
+                        const sql = std.mem.span(sql_text);
+                        std.log.warn("storage: work budget exhausted by: {s}", .{sql[0..@min(sql.len, 200)]});
+                    }
+                }
                 try self.store.check(rc);
                 break :blk error.DatabaseFailure;
             },
@@ -1750,9 +1767,3 @@ pub const Stmt = struct {
         return ptr[0..@intCast(length)];
     }
 };
-
-pub const testing = if (builtin.is_test) struct {
-    pub const sqlite_error = sqliteError;
-    pub const embedded = embedded_api;
-    pub const db = Db;
-} else struct {};

@@ -216,9 +216,13 @@ cp -a /var/lib/fail2zig "$BACKUP/state"
 state_metadata "$BACKUP/state" > "$BACKUP/state.metadata"
 verify_state_copy /var/lib/fail2zig
 mv -T /var/lib/fail2zig "$BACKUP/original-state"
-nft list table inet fail2zig >/dev/null
-nft delete table inet fail2zig
-if nft list table inet fail2zig >/dev/null 2>&1; then
+baseline_table="$(nft list tables | awk '$1 == "table" && $2 == "inet" && $3 ~ /^f2z_[0-9a-f]{24}$/ { print $3 }')"
+[ "$(printf '%s\n' "$baseline_table" | grep -c .)" -eq 1 ] || {
+    echo 'release-gate: expected exactly one owned baseline nftables table' >&2
+    exit 1
+}
+nft delete table inet "$baseline_table"
+if nft list table inet "$baseline_table" >/dev/null 2>&1; then
     echo 'release-gate: baseline nftables scaffold remained after exact delete' >&2
     exit 1
 fi
@@ -238,7 +242,7 @@ awk -v profile="$PROFILE" '
         print "journal_executables = [\"/usr/sbin/sshd\", \"/usr/lib/openssh/sshd-session\"]"
         next
     }
-    section == "sshd" && /^(timestamp|logpath)[[:space:]]*=/ { next }
+    section == "sshd" && /^(timestamp|logpath|journal_executables)[[:space:]]*=/ { next }
     section == "nginx" && /^enabled[[:space:]]*=/ { print "enabled = false"; next }
     { print }
 ' /etc/fail2zig/fail2zig.toml.example > "$UPGRADE_CONFIG"

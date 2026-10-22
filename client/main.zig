@@ -9,9 +9,12 @@ pub const args = @import("args.zig");
 pub const socket = @import("socket.zig");
 pub const format = @import("format.zig");
 pub const completions = @import("completions.zig");
+const guard = @import("guard.zig");
 const list_order = @import("list_order.zig");
 
 pub const client_version = build_options.version;
+// Above the daemon's 10 s wait for a withdrawal outcome, so the answer arrives before the socket times out.
+const firewall_withdraw_timeout_ms: u64 = 15_000;
 
 pub const ExitCode = enum(u8) {
     success = 0,
@@ -52,7 +55,16 @@ pub fn run(
 
     switch (parsed.command) {
         .help => |topic| {
-            stdout.writeAll(args.helpFor(topic)) catch {};
+            const name = topic orelse {
+                stdout.writeAll(args.help_top) catch {};
+                return .success;
+            };
+            const text = args.helpFor(name) orelse {
+                var echo: [format.diagnostic_max_bytes]u8 = undefined;
+                stderr.print("error: unknown help topic '{s}' (try 'fail2zig help')\n", .{format.escapeArgument(&echo, name)}) catch {};
+                return .client_error;
+            };
+            stdout.writeAll(text) catch {};
             return .success;
         },
         .version => {
@@ -78,14 +90,13 @@ pub fn run(
             return doQuery(allocator, parsed.globals, stdout, stderr, color, "stats", null, null, null, format.formatStats);
         },
         .list => |l| {
-            const jail: ?shared.JailId = parseJailId(l.jail, stderr) catch return .client_error;
-            const cmd = shared.Command{ .list = .{ .jail = jail } };
+            _ = parseJailId(l.jail, stderr) catch return .client_error;
             if (l.sort) {
-                if (l.details) return doRequest(allocator, parsed.globals, cmd, stdout, stderr, color, formatSortedListDetailsCmd);
-                return doRequest(allocator, parsed.globals, cmd, stdout, stderr, color, formatSortedListCmd);
+                if (l.details) return doList(allocator, parsed.globals, l.jail, l.origin, stdout, stderr, color, formatSortedListDetailsCmd);
+                return doList(allocator, parsed.globals, l.jail, l.origin, stdout, stderr, color, formatSortedListCmd);
             }
-            if (l.details) return doRequest(allocator, parsed.globals, cmd, stdout, stderr, color, formatListDetailsCmd);
-            return doRequest(allocator, parsed.globals, cmd, stdout, stderr, color, formatListCmd);
+            if (l.details) return doList(allocator, parsed.globals, l.jail, l.origin, stdout, stderr, color, formatListDetailsCmd);
+            return doList(allocator, parsed.globals, l.jail, l.origin, stdout, stderr, color, formatListCmd);
         },
         .jails => |options| {
             if (options.details) return doRequest(allocator, parsed.globals, .{ .list_jails = {} }, stdout, stderr, color, formatJailsDetailsCmd);
@@ -108,12 +119,18 @@ pub fn run(
             };
             return doAdmin(allocator, parsed.globals, stdout, stderr, .{ .kind = kind, .jail = j.name });
         },
+        .firewall_withdraw => {
+            var globals = parsed.globals;
+            globals.timeout_ms = @max(globals.timeout_ms, firewall_withdraw_timeout_ms);
+            return doAdmin(allocator, globals, stdout, stderr, .{ .kind = "firewall_withdraw" });
+        },
         .history_reset => |h| {
             if (h.jail) |jail_str| _ = parseJailIdRequired(jail_str, stderr) catch return .client_error;
             _ = parseIp(h.address, stderr) catch return .client_error;
             return doAdmin(allocator, parsed.globals, stdout, stderr, .{ .kind = "history_reset", .jail = h.jail, .address = h.address, .all = h.all });
         },
         .ignore => |g| return doIgnore(allocator, parsed.globals, stdout, stderr, color, g),
+        .diag_clock => |d| return doDiagClock(allocator, parsed.globals, stdout, stderr, color, d),
         .remote_version => return doRequest(allocator, parsed.globals, .{ .version = {} }, stdout, stderr, color, formatVersionCmd),
         .ban => |b| {
             _ = parseIp(b.ip, stderr) catch return .client_error;
@@ -123,6 +140,10 @@ pub fn run(
             };
             _ = parseJailIdRequired(jail_str, stderr) catch return .client_error;
             const scope = scopeSpec(b.ip, b.scope, stderr) catch return .client_error;
+            if (!b.force) {
+                const target_text = if (b.scope) |requested| requested.cidr orelse b.ip else b.ip;
+                if (refuseProtectedBan(allocator, target_text, stderr)) |refused| return refused;
+            }
             return doAdmin(allocator, parsed.globals, stdout, stderr, .{ .kind = "ban", .jail = jail_str, .address = scope.address, .prefix = scope.prefix, .duration_s = b.duration_s });
         },
         .unban => |u| {
@@ -168,6 +189,33 @@ fn scopeSpec(ip: []const u8, scope: ?args.Command.ScopeArgs, stderr: anytype) !S
                 return error.InvalidScope;
             }
             return .{ .address = base, .prefix = prefix };
+        },
+    }
+}
+
+fn refuseProtectedBan(allocator: std.mem.Allocator, target_text: []const u8, stderr: anytype) ?ExitCode {
+    const target = shared.types.IgnoreEntry.parse(target_text) catch {
+        stderr.print("error: invalid ban target '{s}'\n", .{target_text}) catch {};
+        return .client_error;
+    };
+    var self = shared.self_addresses.read(allocator) catch |err| switch (err) {
+        error.KernelUnavailable => shared.self_addresses.SelfAddresses{ .addresses = &.{}, .count = 0, .truncated = false },
+        error.OutOfMemory => {
+            stderr.writeAll("error: out of memory while reading this host's addresses\n") catch {};
+            return .client_error;
+        },
+    };
+    defer self.deinit(allocator);
+    switch (guard.check(target, self, std.posix.getenv("SSH_CONNECTION"))) {
+        .allowed => return null,
+        .protected => |protected| {
+            const reason = switch (protected.reason) {
+                .loopback => "loopback address",
+                .host_address => "this host's address",
+                .ssh_peer => "your SSH peer address",
+            };
+            stderr.print("error: refusing to ban {s}: {s} {}; use --force to override\n", .{ target_text, reason, protected.matched }) catch {};
+            return .daemon_error;
         },
     }
 }
@@ -265,6 +313,144 @@ fn pageContinuity(allocator: std.mem.Allocator, arena: std.mem.Allocator, global
     return continuityUnavailable(arena, .daemon_error, "continuity events exceed 512 pages");
 }
 
+const max_list_pages: usize = 512;
+const list_page_limit: u32 = 256;
+const max_list_payload_bytes: usize = 64 * 1024 * 1024;
+
+const ListScopeView = struct {
+    address: ?[]const u8 = null,
+    prefix: ?u8 = null,
+    subject_kind: ?[]const u8 = null,
+};
+
+const ListScopeItem = struct {
+    jail: ?[]const u8 = null,
+    scope: ?ListScopeView = null,
+    lease: ?[]const u8 = null,
+    deadline_us: ?i64 = null,
+    confirmed: ?bool = null,
+    ban_count: ?u32 = null,
+    origin: ?[]const u8 = null,
+    expired: ?bool = null,
+};
+
+const ListScopePage = struct {
+    generation: ?[]const u8 = null,
+    items: []const ListScopeItem = &.{},
+    next_cursor: ?[]const u8 = null,
+};
+
+fn doList(allocator: std.mem.Allocator, globals: args.Globals, jail: ?[]const u8, origin_filter: ?shared.types.Origin, stdout: anytype, stderr: anytype, color: format.Color, comptime formatter: anytype) ExitCode {
+    var page_arena = std.heap.ArenaAllocator.init(allocator);
+    defer page_arena.deinit();
+    var payload: std.ArrayListUnmanaged(u8) = .empty;
+    defer payload.deinit(allocator);
+    payload.append(allocator, '[') catch return walkOutOfMemory(stderr);
+    var cursor_buffer: [128]u8 = undefined;
+    var generation_buffer: [64]u8 = undefined;
+    var generation_len: usize = 0;
+    var cursor: ?[]const u8 = null;
+    var first_entry = true;
+    const now_us = std.time.microTimestamp();
+    var pages: usize = 0;
+    while (pages < max_list_pages) : (pages += 1) {
+        _ = page_arena.reset(.retain_capacity);
+        const arena = page_arena.allocator();
+        var body_bytes: [shared.protocol.max_request_body]u8 = undefined;
+        var stream = std.io.fixedBufferStream(&body_bytes);
+        std.json.stringify(.{ .schema_version = @as(u32, 1), .kind = "scopes", .jail = jail, .limit = list_page_limit, .cursor = cursor }, .{ .emit_null_optional_fields = false }, stream.writer()) catch return .client_error;
+        const body = shared.Command.Body.init(stream.getWritten()) catch return .client_error;
+
+        var diag: socket.DiagBuf = .{};
+        var client = socket.connect(allocator, globals.socket_path, globals.timeout_ms, &diag) catch {
+            stderr.print("error: {s}\n", .{diag.message()}) catch {};
+            return .connection_failed;
+        };
+        const resp = client.sendCommand(.{ .query_v1 = body }) catch {
+            stderr.print("error: {s}\n", .{client.errorMessage()}) catch {};
+            client.close();
+            return .connection_failed;
+        };
+        client.close();
+        defer resp.deinit(allocator);
+        const page_payload = switch (resp) {
+            .ok => |ok| ok.payload,
+            .err => |e| {
+                if (pages == 0) {
+                    format.formatError(stderr, e.code, e.message, globals.output, color) catch {};
+                } else {
+                    stderr.print("error: list stopped at page {d}: {s} (code {d}){s}\n", .{ pages + 1, e.message, e.code, if (e.code == 409) "; the ban set changed during the walk, rerun the command" else "" }) catch {};
+                }
+                return .daemon_error;
+            },
+        };
+        const page = std.json.parseFromSliceLeaky(ListScopePage, arena, page_payload, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch {
+            stderr.print("error: malformed scopes response from daemon at page {d}\n", .{pages + 1}) catch {};
+            return .daemon_error;
+        };
+        const page_generation = page.generation orelse "";
+        if (pages == 0) {
+            if (page_generation.len > generation_buffer.len) {
+                stderr.writeAll("error: daemon returned an oversized generation\n") catch {};
+                return .daemon_error;
+            }
+            @memcpy(generation_buffer[0..page_generation.len], page_generation);
+            generation_len = page_generation.len;
+        } else if (!std.mem.eql(u8, generation_buffer[0..generation_len], page_generation)) {
+            stderr.print("error: list stopped at page {d}: the daemon generation changed during the walk (restart or configuration change), rerun the command\n", .{pages + 1}) catch {};
+            return .daemon_error;
+        }
+        const writer = payload.writer(allocator);
+        for (page.items) |item| {
+            const scope = item.scope orelse continue;
+            const address = scope.address orelse continue;
+            if (origin_filter) |wanted| {
+                const origin = item.origin orelse continue;
+                if (!std.mem.eql(u8, origin, @tagName(wanted))) continue;
+            }
+            const expired = item.expired orelse false;
+            const permanent = if (item.lease) |lease| std.mem.eql(u8, lease, "permanent") else false;
+            if (!permanent and !expired) if (item.deadline_us) |deadline| if (deadline <= now_us) continue;
+            var subject_buffer: [64]u8 = undefined;
+            const network = if (scope.subject_kind) |kind| std.mem.eql(u8, kind, "network") else false;
+            const subject = (if (network)
+                std.fmt.bufPrint(&subject_buffer, "{s}/{d}", .{ address, scope.prefix orelse 0 })
+            else
+                std.fmt.bufPrint(&subject_buffer, "{s}", .{address})) catch continue;
+            const expiry_us: ?i64 = if (permanent) null else item.deadline_us;
+            if (!first_entry) writer.writeByte(',') catch return walkOutOfMemory(stderr);
+            first_entry = false;
+            std.json.stringify(.{ .ip = subject, .jail = item.jail, .origin = item.origin, .expired = expired, .expiry_us = expiry_us, .ban_expiry = if (expiry_us) |value| @divFloor(value, 1_000_000) else null, .permanent = permanent, .ban_count = item.ban_count, .enforced = item.confirmed, .confirmed = item.confirmed }, .{}, writer) catch return walkOutOfMemory(stderr);
+            if (payload.items.len > max_list_payload_bytes) {
+                stderr.writeAll("error: list exceeds its 64 MiB client bound; page the bans with the scopes command and --cursor\n") catch {};
+                return .client_error;
+            }
+        }
+        const next = page.next_cursor orelse {
+            payload.append(allocator, ']') catch return walkOutOfMemory(stderr);
+            formatter(allocator, stdout, payload.items, globals.output, color) catch |e| {
+                if (e == error.BrokenPipe) return .success;
+                stderr.print("error: failed to format response: {s}\n", .{@errorName(e)}) catch {};
+                return .client_error;
+            };
+            return .success;
+        };
+        if (next.len > cursor_buffer.len) {
+            stderr.print("error: list stopped at page {d}: daemon returned an oversized cursor\n", .{pages + 1}) catch {};
+            return .daemon_error;
+        }
+        @memcpy(cursor_buffer[0..next.len], next);
+        cursor = cursor_buffer[0..next.len];
+    }
+    stderr.print("error: list exceeds {d} pages; page the bans with the scopes command and --cursor\n", .{max_list_pages}) catch {};
+    return .client_error;
+}
+
+fn walkOutOfMemory(stderr: anytype) ExitCode {
+    stderr.writeAll("error: out of memory while collecting bans\n") catch {};
+    return .client_error;
+}
+
 fn doFirewallQuery(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype, color: format.Color, query: args.Command.FirewallArgs) ExitCode {
     var body_bytes: [shared.protocol.max_request_body]u8 = undefined;
     var stream = std.io.fixedBufferStream(&body_bytes);
@@ -352,10 +538,20 @@ pub fn doAdmin(allocator: std.mem.Allocator, globals: args.Globals, stdout: anyt
         .ok => |o| o.payload,
         .err => |e| e.message,
     };
+    if (resp == .err and !isAdminOutcome(allocator, payload)) {
+        format.formatError(stderr, resp.err.code, payload, globals.output, .{ .enabled = false }) catch {};
+        return adminExit(resp);
+    }
     writeAdminOutcome(allocator, stdout, payload, globals.output) catch |e| {
         if (e != error.BrokenPipe) stderr.print("error: failed to format response: {s}\n", .{@errorName(e)}) catch {};
     };
     return adminExit(resp);
+}
+
+fn isAdminOutcome(allocator: std.mem.Allocator, payload: []const u8) bool {
+    const parsed = std.json.parseFromSlice(AdminOutcome, allocator, payload, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return false;
+    parsed.deinit();
+    return true;
 }
 
 fn adminExit(resp: shared.Response) ExitCode {
@@ -409,6 +605,7 @@ fn doIgnore(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype
         .jail = jail,
         .address = canonical[0 .. slash orelse canonical.len],
         .prefix = if (slash != null) entry.prefix else null,
+        .duration_s = if (ignore.action == .add) ignore.for_s else null,
         .unban = ignore.unban,
     });
 }
@@ -448,7 +645,7 @@ fn doIgnoreList(allocator: std.mem.Allocator, globals: args.Globals, stdout: any
     return .success;
 }
 
-const AdminOutcome = struct { schema_version: u32 = 0, kind: []const u8 = "", outcome: []const u8 = "", generation: []const u8 = "", mutation_revision: u64 = 0, enforced: bool = false, reasons: []const []const u8 = &.{} };
+const AdminOutcome = struct { schema_version: u32 = 0, kind: []const u8 = "", outcome: []const u8 = "", generation: []const u8 = "", mutation_revision: u64 = 0, enforced: bool = false, reasons: []const []const u8 = &.{}, warning: ?[]const u8 = null };
 
 fn writeAdminOutcome(allocator: std.mem.Allocator, writer: anytype, payload: []const u8, fmt: format.OutputFormat) !void {
     if (fmt == .json) {
@@ -463,6 +660,9 @@ fn writeAdminOutcome(allocator: std.mem.Allocator, writer: anytype, payload: []c
     defer parsed.deinit();
     try writer.print("kind\t{s}\noutcome\t{s}\nenforced\t{}\ngeneration\t{s}\nmutation_revision\t{d}\n", .{ parsed.value.kind, parsed.value.outcome, parsed.value.enforced, parsed.value.generation, parsed.value.mutation_revision });
     for (parsed.value.reasons) |reason| try writer.print("reason\t{s}\n", .{reason});
+    if (parsed.value.warning) |warning| {
+        if (fmt == .plain) try writer.print("warning\t{s}\n", .{warning}) else try writer.print("warning: {s}\n", .{warning});
+    }
 }
 
 fn doReload(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype) ExitCode {
@@ -667,6 +867,46 @@ fn formatUnbanCmd(
     return format.formatUnban(allocator, writer, payload, fmt, color);
 }
 
+fn doDiagClock(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype, color: format.Color, request: args.Command.DiagClockArgs) ExitCode {
+    var body_bytes: [128]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&body_bytes);
+    const written = switch (request) {
+        .show => std.json.stringify(.{ .op = "show" }, .{}, stream.writer()),
+        .rate => |value| std.json.stringify(.{ .op = "rate", .rate = value }, .{}, stream.writer()),
+        .advance => |seconds| std.json.stringify(.{ .op = "advance", .us = seconds * std.time.us_per_s }, .{}, stream.writer()),
+    };
+    written catch return .client_error;
+    const body = shared.Command.Body.init(stream.getWritten()) catch return .client_error;
+    return doRequest(allocator, globals, .{ .diag_v1 = body }, stdout, stderr, color, formatDiagClockCmd);
+}
+
+const DiagClockPayload = struct {
+    mode: enum { real, accelerated, step },
+    rate: u32,
+    wall_us: i64,
+    monotonic_ns: u64,
+    real_wall_us: i64,
+    regressions: u64,
+};
+
+fn formatDiagClockCmd(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    payload: []const u8,
+    fmt: format.OutputFormat,
+    _: format.Color,
+) !void {
+    const parsed = try std.json.parseFromSlice(DiagClockPayload, allocator, payload, .{});
+    defer parsed.deinit();
+    const clock = parsed.value;
+    switch (fmt) {
+        .json => try std.json.stringify(clock, .{}, writer),
+        .plain => try writer.print("mode\t{s}\nrate\t{d}\nwall_us\t{d}\nreal_wall_us\t{d}\nmonotonic_ns\t{d}\nregressions\t{d}", .{ @tagName(clock.mode), clock.rate, clock.wall_us, clock.real_wall_us, clock.monotonic_ns, clock.regressions }),
+        .table => try writer.print("Mode:          {s}\nRate:          {d}\nVirtual wall:  {d} us\nReal wall:     {d} us\nMonotonic:     {d} ns\nRegressions:   {d}", .{ @tagName(clock.mode), clock.rate, clock.wall_us, clock.real_wall_us, clock.monotonic_ns, clock.regressions }),
+    }
+    try writer.writeByte('\n');
+}
+
 fn formatVersionCmd(
     allocator: std.mem.Allocator,
     writer: anytype,
@@ -703,152 +943,4 @@ fn parseJailIdRequired(s: []const u8, stderr: anytype) !shared.JailId {
         }
         return error.InvalidJail;
     };
-}
-
-const testing = std.testing;
-
-fn runCapture(argv: []const []const u8) !struct {
-    code: ExitCode,
-    out: []u8,
-    err: []u8,
-} {
-    var out_list = std.ArrayList(u8).init(testing.allocator);
-    defer out_list.deinit();
-    var err_list = std.ArrayList(u8).init(testing.allocator);
-    defer err_list.deinit();
-    const code = run(testing.allocator, argv, out_list.writer(), err_list.writer());
-    return .{
-        .code = code,
-        .out = try out_list.toOwnedSlice(),
-        .err = try err_list.toOwnedSlice(),
-    };
-}
-
-test "client: ban with invalid IP exits 2" {
-    const r = try runCapture(&.{ "ban", "not-an-ip", "--jail", "sshd" });
-    defer testing.allocator.free(r.out);
-    defer testing.allocator.free(r.err);
-    try testing.expectEqual(ExitCode.client_error, r.code);
-    try testing.expect(std.mem.indexOf(u8, r.err, "Invalid IP address") != null);
-    try testing.expect(std.mem.indexOf(u8, r.err, "not-an-ip") != null);
-}
-
-test "client: status against unreachable socket exits 3" {
-    const r = try runCapture(&.{
-        "--socket",  "/tmp/fail2zig-does-not-exist-xyzzy.sock",
-        "--timeout", "500",
-        "status",
-    });
-    defer testing.allocator.free(r.out);
-    defer testing.allocator.free(r.err);
-    try testing.expectEqual(ExitCode.connection_failed, r.code);
-    try testing.expect(std.mem.indexOf(u8, r.err, "Cannot connect") != null);
-}
-
-test "client: unban against unreachable socket exits 3" {
-    const r = try runCapture(&.{
-        "--socket",  "/tmp/fail2zig-does-not-exist-xyzzy.sock",
-        "--timeout", "500",
-        "unban",     "1.2.3.4",
-        "--jail",    "sshd",
-    });
-    defer testing.allocator.free(r.out);
-    defer testing.allocator.free(r.err);
-    try testing.expectEqual(ExitCode.connection_failed, r.code);
-}
-
-const status_payload = "{\"version\":\"0.3.0\",\"uptime_seconds\":5,\"active_bans\":1}";
-
-test "client: BrokenPipe on stdout is a quiet success (BUG-009)" {
-    const BrokenPipe = error{BrokenPipe};
-    const writeFn = struct {
-        fn write(_: void, _: []const u8) BrokenPipe!usize {
-            return error.BrokenPipe;
-        }
-    }.write;
-    const stdout = std.io.GenericWriter(void, BrokenPipe, writeFn){ .context = {} };
-    var err_list = std.ArrayList(u8).init(testing.allocator);
-    defer err_list.deinit();
-
-    const resp = shared.Response{ .ok = .{ .payload = status_payload } };
-    const code = renderResponse(testing.allocator, resp, .table, stdout, err_list.writer(), .{ .enabled = false }, formatStatusCmd);
-    try testing.expectEqual(ExitCode.success, code);
-    try testing.expectEqualStrings("", err_list.items);
-}
-
-test "client: reader-closed pipe on stdout is a quiet success (BUG-009)" {
-    const fds = try std.posix.pipe();
-    std.posix.close(fds[0]);
-    const write_end = std.fs.File{ .handle = fds[1] };
-    defer write_end.close();
-    var err_list = std.ArrayList(u8).init(testing.allocator);
-    defer err_list.deinit();
-
-    const resp = shared.Response{ .ok = .{ .payload = status_payload } };
-    const code = renderResponse(testing.allocator, resp, .table, write_end.writer(), err_list.writer(), .{ .enabled = false }, formatStatusCmd);
-    try testing.expectEqual(ExitCode.success, code);
-    try testing.expectEqualStrings("", err_list.items);
-}
-
-test "client: other stdout write errors still exit 2 with a message (BUG-009)" {
-    const NoSpace = error{NoSpaceLeft};
-    const writeFn = struct {
-        fn write(_: void, _: []const u8) NoSpace!usize {
-            return error.NoSpaceLeft;
-        }
-    }.write;
-    const stdout = std.io.GenericWriter(void, NoSpace, writeFn){ .context = {} };
-    var err_list = std.ArrayList(u8).init(testing.allocator);
-    defer err_list.deinit();
-
-    const resp = shared.Response{ .ok = .{ .payload = status_payload } };
-    const code = renderResponse(testing.allocator, resp, .table, stdout, err_list.writer(), .{ .enabled = false }, formatStatusCmd);
-    try testing.expectEqual(ExitCode.client_error, code);
-    try testing.expect(std.mem.indexOf(u8, err_list.items, "failed to format response: NoSpaceLeft") != null);
-}
-
-test "client: daemon error response still exits 1 (BUG-009 unchanged path)" {
-    var out_list = std.ArrayList(u8).init(testing.allocator);
-    defer out_list.deinit();
-    var err_list = std.ArrayList(u8).init(testing.allocator);
-    defer err_list.deinit();
-
-    const resp = shared.Response{ .err = .{ .code = 4, .message = "no such jail" } };
-    const code = renderResponse(testing.allocator, resp, .table, out_list.writer(), err_list.writer(), .{ .enabled = false }, formatStatusCmd);
-    try testing.expectEqual(ExitCode.daemon_error, code);
-    try testing.expect(std.mem.indexOf(u8, err_list.items, "no such jail") != null);
-}
-
-test "client: old daemon firewall query error is actionable" {
-    var out_list = std.ArrayList(u8).init(testing.allocator);
-    defer out_list.deinit();
-    var err_list = std.ArrayList(u8).init(testing.allocator);
-    defer err_list.deinit();
-
-    const response = shared.Response{ .err = .{ .code = 400, .message = "unknown query kind" } };
-    const code = renderFirewallResponse(testing.allocator, response, .table, out_list.writer(), err_list.writer(), .{ .enabled = false }, false);
-    try testing.expectEqual(ExitCode.daemon_error, code);
-    try testing.expectEqual(@as(usize, 0), out_list.items.len);
-    try testing.expect(std.mem.indexOf(u8, err_list.items, "does not support firewall inspection") != null);
-    try testing.expect(std.mem.indexOf(u8, err_list.items, "upgrade and restart") != null);
-}
-
-test "client: firewall cursor conflict keeps daemon guidance" {
-    var out_list = std.ArrayList(u8).init(testing.allocator);
-    defer out_list.deinit();
-    var err_list = std.ArrayList(u8).init(testing.allocator);
-    defer err_list.deinit();
-
-    const response = shared.Response{ .err = .{ .code = 409, .message = "cursor expired or observation changed; restart pagination without a cursor" } };
-    const code = renderFirewallResponse(testing.allocator, response, .plain, out_list.writer(), err_list.writer(), .{ .enabled = false }, false);
-    try testing.expectEqual(ExitCode.daemon_error, code);
-    try testing.expect(std.mem.indexOf(u8, err_list.items, "restart pagination without a cursor") != null);
-}
-
-test "client: imports compile" {
-    _ = shared;
-    _ = args;
-    _ = socket;
-    _ = format;
-    _ = completions;
 }

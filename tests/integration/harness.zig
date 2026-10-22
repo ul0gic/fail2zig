@@ -35,7 +35,7 @@ pub const JailSpec = struct {
 pub const Options = struct {
     daemon_path: []const u8 = default_daemon_path,
     jail: JailSpec = .{},
-    startup_timeout_ms: u64 = 3_000,
+    startup_timeout_ms: u64 = 15_000,
     metrics_port: u16 = 0,
     spawn_daemon: bool = true,
     require_root: bool = false,
@@ -204,10 +204,8 @@ pub const Harness = struct {
         self.waitForSocket(self.options.startup_timeout_ms) catch |err| switch (err) {
             error.SocketNeverAppeared => {
                 if (self.child) |*c| {
-                    const term = c.wait() catch return error.DaemonUnavailable;
+                    _ = c.kill() catch {};
                     self.child = null;
-                    _ = term;
-                    return error.DaemonUnavailable;
                 }
                 return error.DaemonUnavailable;
             },

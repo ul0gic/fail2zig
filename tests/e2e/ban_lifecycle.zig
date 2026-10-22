@@ -465,6 +465,7 @@ fn writeConfig(path: []const u8, work: []const u8, auth_log: []const u8, daemon_
         \\firewall_namespace = "/proc/{d}/ns/net"
         \\[defaults]
         \\enforce = true
+        \\ignoreself = false
         \\maxretry = 3
         \\findtime = 60
         \\bantime = 30
@@ -498,11 +499,11 @@ fn dumpDaemonLog(a: std.mem.Allocator, path: []const u8) void {
 const Profile = enum { deep, representative, overlap };
 
 fn runOverlapLifecycle(client: Client, daemon: *Daemon) !void {
-    try client.discard(&.{ "ban", "192.0.2.42", "--jail", "sshd", "--duration", "20" });
-    try client.discard(&.{ "ban", "192.0.2.42", "--jail", "other", "--duration", "40" });
-    try client.discard(&.{ "ban", "192.0.2.42", "--jail", "other", "--duration", "40" });
+    try client.discard(&.{ "ban", "192.0.2.42", "--jail", "sshd", "--duration", "20", "--force" });
+    try client.discard(&.{ "ban", "192.0.2.42", "--jail", "other", "--duration", "40", "--force" });
+    try client.discard(&.{ "ban", "192.0.2.42", "--jail", "other", "--duration", "40", "--force" });
     try client.waitListCount(&.{"list"}, 2);
-    try client.waitInteger(&.{"status"}, "active_bans", 2);
+    try client.waitInteger(&.{"status"}, "active_bans", 1);
     std.Thread.sleep(21 * std.time.ns_per_s);
     try require(!(try tcpConnects("192.0.2.42", "127.0.0.1", test_port)), "short expiry preserves longer overlapping ownership");
     try client.waitListCount(&.{"list"}, 1);
@@ -588,7 +589,7 @@ fn runLifecycle(a: std.mem.Allocator, executable: []const u8, backend: []const u
         return;
     }
 
-    try client.discard(&.{ "ban", "192.0.2.42", "--jail", "sshd", "--duration", "8" });
+    try client.discard(&.{ "ban", "192.0.2.42", "--jail", "sshd", "--duration", "8", "--force" });
     try require(!(try tcpConnects("192.0.2.42", "127.0.0.1", test_port)), "explicit-duration manual ban blocks IPv4 TCP");
     pass("explicit-duration manual ban blocks TCP");
     try client.waitListCount(&.{"list"}, 1);
@@ -599,7 +600,7 @@ fn runLifecycle(a: std.mem.Allocator, executable: []const u8, backend: []const u
     try client.waitString(&.{"status"}, "protection", "active");
 
     const default_ban_started_us = std.time.microTimestamp();
-    try client.discard(&.{ "ban", "192.0.2.42", "--jail", "sshd" });
+    try client.discard(&.{ "ban", "192.0.2.42", "--jail", "sshd", "--force" });
     try client.waitListCount(&.{ "list", "--jail", "sshd" }, 1);
     {
         var listing = try client.call(&.{ "list", "--jail", "sshd" });
@@ -627,7 +628,7 @@ fn runLifecycle(a: std.mem.Allocator, executable: []const u8, backend: []const u
     try runOverlapLifecycle(client, &daemon);
 
     try require(try tcpConnects("2001:db8::42", "::1", test_port), "baseline IPv6 TCP connectivity");
-    try client.discard(&.{ "ban", "2001:db8::42", "--jail", "sshd", "--duration", "8" });
+    try client.discard(&.{ "ban", "2001:db8::42", "--jail", "sshd", "--duration", "8", "--force" });
     try require(!(try tcpConnects("2001:db8::42", "::1", test_port)), "manual ban blocks IPv6 TCP");
     try client.waitListCount(&.{ "list", "--jail", "sshd" }, 1);
     try waitConnectivity("2001:db8::42", "::1", true, 15_000);

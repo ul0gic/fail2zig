@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
-const builtin = @import("builtin");
 const store_mod = @import("store.zig");
 const Error = store_mod.Error;
 const latest_schema = store_mod.latest_schema;
 pub const target_schema = store_mod.load_repair_schema;
+pub const runtime_schema: i64 = 25;
 const source_schema: i64 = 23;
 
 // Callback allowance for the final transaction's unpageable foreign_key_check and quick_check.
@@ -17,18 +17,21 @@ const disk_reserve_bytes: u64 = 32 * 1024 * 1024;
 pub const BackupKind = enum {
     pre24,
     pre25,
+    pre26,
 
     fn suffix(self: BackupKind) []const u8 {
         return switch (self) {
             .pre24 => ".pre24-backup",
             .pre25 => ".pre25-backup",
+            .pre26 => ".pre26-backup",
         };
     }
 
     fn target(self: BackupKind) i64 {
         return switch (self) {
             .pre24 => target_schema,
-            .pre25 => latest_schema,
+            .pre25 => runtime_schema,
+            .pre26 => latest_schema,
         };
     }
 };
@@ -63,19 +66,10 @@ pub const Phase = enum(u8) {
 
 pub const Status = enum { earlier_schema, ready, incomplete, complete };
 
-pub const Hooks = if (builtin.is_test) struct {
-    context: ?*anyopaque = null,
-    before_commit: ?*const fn (?*anyopaque, ?Phase) void = null,
-    backup_max_page_count: ?i64 = null,
-    window_rows: ?i64 = null,
-    verify_allowance: ?u32 = null,
-} else struct {};
-
 pub const Options = struct {
     state_path: []const u8,
     now_us: i64,
     history_max_matches: u16,
-    hooks: Hooks = .{},
 };
 
 pub const Step = struct {
@@ -356,7 +350,7 @@ pub fn Methods(comptime Store: type) type {
                 if (try self.integer("SELECT count(*) FROM sqlite_schema WHERE name='load_repair_migration';") != 0) return error.LoadRepairInvalidState;
                 return .ready;
             }
-            if (schema != target_schema and schema != latest_schema) return error.UnsupportedSchema;
+            if (schema < target_schema or schema > latest_schema) return error.UnsupportedSchema;
             const progress = try self.loadRepairProgress();
             return if (progress.phase == .complete) .complete else .incomplete;
         }
@@ -399,18 +393,18 @@ pub fn Methods(comptime Store: type) type {
             try self.verifyLoadRepairBackup();
             const progress = try self.loadRepairProgress();
             return switch (progress.phase) {
-                .live_counter => self.loadRepairPage(options, progress, "INSERT INTO effect_owner_live(id,live) SELECT 1,count(*) FROM effect_owners WHERE lease_kind<>0;" ++
+                .live_counter => self.loadRepairPage(progress, "INSERT INTO effect_owner_live(id,live) SELECT 1,count(*) FROM effect_owners WHERE lease_kind<>0;" ++
                     "INSERT INTO migration_activations SELECT s.run_id,s.seq,r.updated_us FROM migration_staged_owners s JOIN migration_runs r ON r.run_id=s.run_id WHERE r.state IN(6,7);"),
-                .detail_columns => self.loadRepairPage(options, progress, detail_columns_ddl),
-                .detail_sequence_index, .detail_age_index, .detail_subject_index, .detail_evidence_index => self.loadRepairPage(options, progress, detail_index_ddl[@intFromEnum(progress.phase) - @intFromEnum(Phase.detail_sequence_index)]),
-                .targets_swap => self.loadRepairPage(options, progress, "DROP TABLE action_targets; ALTER TABLE action_targets_v24 RENAME TO action_targets;"),
-                .observations_swap => self.loadRepairPage(options, progress, "DROP TABLE effect_observations; ALTER TABLE effect_observations_v24 RENAME TO effect_observations;"),
-                .spent_index => self.loadRepairPage(options, progress, "CREATE INDEX native_effects_spent ON native_effects(scope_key) WHERE lease_kind=0;"),
-                .pending_intent_index => self.loadRepairPage(options, progress, "CREATE INDEX effect_intents_pending ON effect_intents(scope_key) WHERE status IN(1,2);"),
-                .events_swap => self.swapLoadRepairEvents(options, progress),
+                .detail_columns => self.loadRepairPage(progress, detail_columns_ddl),
+                .detail_sequence_index, .detail_age_index, .detail_subject_index, .detail_evidence_index => self.loadRepairPage(progress, detail_index_ddl[@intFromEnum(progress.phase) - @intFromEnum(Phase.detail_sequence_index)]),
+                .targets_swap => self.loadRepairPage(progress, "DROP TABLE action_targets; ALTER TABLE action_targets_v24 RENAME TO action_targets;"),
+                .observations_swap => self.loadRepairPage(progress, "DROP TABLE effect_observations; ALTER TABLE effect_observations_v24 RENAME TO effect_observations;"),
+                .spent_index => self.loadRepairPage(progress, "CREATE INDEX native_effects_spent ON native_effects(scope_key) WHERE lease_kind=0;"),
+                .pending_intent_index => self.loadRepairPage(progress, "CREATE INDEX effect_intents_pending ON effect_intents(scope_key) WHERE status IN(1,2);"),
+                .events_swap => self.swapLoadRepairEvents(progress),
                 .verify => self.verifyLoadRepair(options, progress),
                 .complete => error.LoadRepairInvalidState,
-                else => self.loadRepairWindow(options, progress),
+                else => self.loadRepairWindow(progress),
             };
         }
 
@@ -442,7 +436,7 @@ pub fn Methods(comptime Store: type) type {
                 try row.done();
             }
             try self.exec("PRAGMA user_version=24;");
-            return self.commitLoadRepair(options, null, .live_counter, budget);
+            return self.commitLoadRepair(null, .live_counter, budget);
         }
 
         pub fn takeSchemaBackup(self: *Store, options: Options, kind: BackupKind, path_buffer: []u8) Error!SchemaBackup {
@@ -454,7 +448,7 @@ pub fn Methods(comptime Store: type) type {
                 std.log.warn("native storage: schema {d} migration refused: backup {s} already exists; keep it if it is the only copy of earlier state, otherwise move it aside and restart", .{ kind.target(), final_path });
                 return switch (kind) {
                     .pre24 => error.LoadRepairBackupExists,
-                    .pre25 => error.SchemaBackupExists,
+                    .pre25, .pre26 => error.SchemaBackupExists,
                 };
             } else |failure| if (failure != error.FileNotFound) return error.StorageIo;
             const page_size = try self.integer("PRAGMA page_size;");
@@ -462,13 +456,13 @@ pub fn Methods(comptime Store: type) type {
             if (page_size <= 0 or pages <= 0) return error.DatabaseFailure;
             const database_bytes = std.math.mul(u64, @intCast(page_size), @intCast(pages)) catch return error.StorageLimit;
             try requireFreeSpace(options.state_path, database_bytes *| 2 +| disk_reserve_bytes);
-            const copied = try self.copyBackup(options, final_path, partial_path, pages, kind.target() - 1);
+            const copied = try self.copyBackup(final_path, partial_path, pages, kind.target() - 1);
             return .{ .path = final_path, .sha256 = copied.sha256, .pages = pages };
         }
 
         const BackupIdentity = struct { sha256: [32]u8 };
 
-        fn copyBackup(self: *Store, options: Options, final_path: [:0]const u8, partial_path: [:0]const u8, pages: i64, schema: i64) Error!BackupIdentity {
+        fn copyBackup(self: *Store, final_path: [:0]const u8, partial_path: [:0]const u8, pages: i64, schema: i64) Error!BackupIdentity {
             std.fs.cwd().deleteFileZ(partial_path) catch |failure| if (failure != error.FileNotFound) return error.StorageIo;
             const created = std.posix.openZ(partial_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, 0o600) catch return error.StorageIo;
             std.posix.close(created);
@@ -479,11 +473,6 @@ pub fn Methods(comptime Store: type) type {
                 const destination = handle orelse return error.OpenFailed;
                 defer _ = sqlite3_close_v2(destination);
                 if (opened != 0) return store_mod.sqliteError(opened);
-                if (builtin.is_test) if (options.hooks.backup_max_page_count) |maximum| {
-                    var sql: [64]u8 = undefined;
-                    const pragma = std.fmt.bufPrintZ(&sql, "PRAGMA max_page_count={d};", .{maximum}) catch return error.StorageLimit;
-                    if (sqlite3_exec(destination, pragma, null, null, null) != 0) return error.DatabaseFailure;
-                };
                 const backup = sqlite3_backup_init(destination, "main", @ptrCast(self.db), "main") orelse return store_mod.sqliteError(sqlite3_errcode(destination));
                 var rc: c_int = 0;
                 while (rc == 0) rc = sqlite3_backup_step(backup, 1024);
@@ -523,18 +512,18 @@ pub fn Methods(comptime Store: type) type {
             self.load_repair_backup_verified = true;
         }
 
-        fn loadRepairPage(self: *Store, options: Options, progress: Progress, sql: [:0]const u8) Error!Step {
+        fn loadRepairPage(self: *Store, progress: Progress, sql: [:0]const u8) Error!Step {
             try self.beginWrite();
             errdefer self.rollback();
             const budget = self.work_remaining;
             try self.exec(sql);
             const next: Phase = @enumFromInt(@intFromEnum(progress.phase) + 1);
             try self.advanceLoadRepair(progress, next, 0);
-            return self.commitLoadRepair(options, progress.phase, next, budget);
+            return self.commitLoadRepair(progress.phase, next, budget);
         }
 
-        fn window(options: Options, phase: Phase) ?Window {
-            const measured: Window = switch (phase) {
+        fn window(phase: Phase) ?Window {
+            return switch (phase) {
                 .targets_reclaim, .targets_copy => .{ .rows = 1024, .max_sql = "SELECT coalesce(max(rowid),0) FROM action_targets;" },
                 .observations_copy => .{ .rows = 1024, .max_sql = "SELECT coalesce(max(rowid),0) FROM effect_observations;" },
                 .intents_reclaim => .{ .rows = 1024, .max_sql = "SELECT coalesce(max(rowid),0) FROM effect_intents;" },
@@ -544,14 +533,12 @@ pub fn Methods(comptime Store: type) type {
                 .details => .{ .rows = 256, .max_sql = "SELECT coalesce(max(rowid),0) FROM confirmed_event_details;" },
                 .candidates => .{ .rows = 1024, .max_sql = "SELECT coalesce(max(rowid),0) FROM retained_subject_summaries;" },
                 .validate => .{ .rows = 64, .max_sql = "SELECT coalesce(max(rowid),0) FROM retained_subject_summaries;" },
-                else => return null,
+                else => null,
             };
-            if (builtin.is_test) if (options.hooks.window_rows) |rows| return .{ .rows = rows, .max_sql = measured.max_sql };
-            return measured;
         }
 
-        fn loadRepairWindow(self: *Store, options: Options, progress: Progress) Error!Step {
-            const shape = window(options, progress.phase) orelse return error.LoadRepairInvalidState;
+        fn loadRepairWindow(self: *Store, progress: Progress) Error!Step {
+            const shape = window(progress.phase) orelse return error.LoadRepairInvalidState;
             try self.beginWrite();
             errdefer self.rollback();
             const budget = self.work_remaining;
@@ -598,7 +585,7 @@ pub fn Methods(comptime Store: type) type {
             const done = high >= maximum;
             const next: Phase = if (done) @enumFromInt(@intFromEnum(progress.phase) + 1) else progress.phase;
             try self.advanceLoadRepair(progress, next, if (done) 0 else high);
-            return self.commitLoadRepair(options, progress.phase, next, budget);
+            return self.commitLoadRepair(progress.phase, next, budget);
         }
 
         fn windowExec(self: *Store, sql: [:0]const u8, low: i64, high: i64, extra: ?struct { i64, ?i64 }) Error!void {
@@ -630,13 +617,13 @@ pub fn Methods(comptime Store: type) type {
 
         // The events table is a foreign-key parent: enforcement off outside the transaction, a checked swap,
         // then enforcement restored and read back, per SQLite's documented rebuild procedure.
-        fn swapLoadRepairEvents(self: *Store, options: Options, progress: Progress) Error!Step {
+        fn swapLoadRepairEvents(self: *Store, progress: Progress) Error!Step {
             try self.exec("PRAGMA foreign_keys=OFF;");
             if (try self.integer("PRAGMA foreign_keys;") != 0) {
                 try self.restoreForeignKeys();
                 return error.DatabaseFailure;
             }
-            const result = self.swapLoadRepairEventsTx(options, progress);
+            const result = self.swapLoadRepairEventsTx(progress);
             const restored = self.restoreForeignKeys();
             const step = result catch |failure| {
                 restored catch {};
@@ -646,7 +633,7 @@ pub fn Methods(comptime Store: type) type {
             return step;
         }
 
-        fn swapLoadRepairEventsTx(self: *Store, options: Options, progress: Progress) Error!Step {
+        fn swapLoadRepairEventsTx(self: *Store, progress: Progress) Error!Step {
             try self.beginWrite();
             errdefer self.rollback();
             const budget = self.work_remaining;
@@ -660,7 +647,7 @@ pub fn Methods(comptime Store: type) type {
                 if (try check.row()) return error.LoadRepairVerificationFailed;
             }
             try self.advanceLoadRepair(progress, .markers, 0);
-            return self.commitLoadRepair(options, progress.phase, .markers, budget);
+            return self.commitLoadRepair(progress.phase, .markers, budget);
         }
 
         fn restoreForeignKeys(self: *Store) Error!void {
@@ -677,7 +664,7 @@ pub fn Methods(comptime Store: type) type {
         fn verifyLoadRepair(self: *Store, options: Options, progress: Progress) Error!Step {
             try self.beginWrite();
             errdefer self.rollback();
-            self.work_remaining = if (builtin.is_test) options.hooks.verify_allowance orelse migration_verify else migration_verify;
+            self.work_remaining = migration_verify;
             const budget = self.work_remaining;
             for ([_][:0]const u8{
                 "SELECT count(*)=0 FROM confirmed_event_details WHERE sequence IS NULL OR confirmed_us IS NULL;",
@@ -709,7 +696,7 @@ pub fn Methods(comptime Store: type) type {
                 try row.done();
                 if (self.api.changes(self.db) != 1) return error.LoadRepairInvalidState;
             }
-            const step = try self.commitLoadRepair(options, progress.phase, .complete, budget);
+            const step = try self.commitLoadRepair(progress.phase, .complete, budget);
             if (created_index) std.log.info("native storage: schema 23 database lacked index effect_owners_decision (created by v0.4.4); created it before schema 24 verification", .{});
             return step;
         }
@@ -748,8 +735,7 @@ pub fn Methods(comptime Store: type) type {
             if (self.api.changes(self.db) != 1) return error.LoadRepairInvalidState;
         }
 
-        fn commitLoadRepair(self: *Store, options: Options, phase: ?Phase, next: Phase, budget: u32) Error!Step {
-            if (builtin.is_test) if (options.hooks.before_commit) |hook| hook(options.hooks.context, phase);
+        fn commitLoadRepair(self: *Store, phase: ?Phase, next: Phase, budget: u32) Error!Step {
             try self.commitTransaction();
             return .{ .phase = phase, .next = next, .callbacks = if (self.runtime_limits) budget - self.work_remaining else 0 };
         }

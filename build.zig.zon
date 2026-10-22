@@ -1,12 +1,18 @@
 .{
     .name = .fail2zig,
-    .version = "0.4.7",
+    .version = "0.4.8",
 
     .fingerprint = 0x49f30c63af277658,
 
     .minimum_zig_version = "0.14.1",
 
-    .dependencies = .{},
+    .dependencies = .{
+        .tracy = .{
+            .url = "https://github.com/wolfpld/tracy/archive/refs/tags/v0.14.1.tar.gz",
+            .hash = "N-V-__8AAAZPdAGoNF3-tqKYHjTOa5QQ02rEWNvkDr-Vpl0C",
+            .lazy = true,
+        },
+    },
 
     .paths = .{
         "build.zig",

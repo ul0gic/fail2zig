@@ -567,12 +567,14 @@ pub fn Methods(comptime Store: type) type {
         pub fn enableRuntimeState(self: *Store, options: store.load_repair.Options, backup: bool) Error!void {
             const schema = try self.chainSchema();
             if (schema < store.load_repair_schema or schema > latest_schema) return error.UnsupportedSchema;
-            if (schema == latest_schema) {
-                self.schema_version = latest_schema;
-                return;
-            }
+            if (schema != store.load_repair_schema) return self.enableParityState(options, null);
             var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-            const taken: ?store.load_repair.SchemaBackup = if (backup) try self.takeSchemaBackup(options, .pre25, &path_buffer) else null;
+            const backup_path = try enableRuntimeTables(self, options, backup, &path_buffer);
+            try self.enableParityState(options, backup_path);
+        }
+
+        fn enableRuntimeTables(self: *Store, options: store.load_repair.Options, backup: bool, path_buffer: []u8) Error![]const u8 {
+            const taken: ?store.load_repair.SchemaBackup = if (backup) try self.takeSchemaBackup(options, .pre25, path_buffer) else null;
             errdefer if (taken) |made| if (!self.reopen_required) std.fs.cwd().deleteFileZ(made.path) catch {};
             const backup_path: []const u8 = if (taken) |made| made.path else blk: {
                 var row = try self.statement("SELECT backup_path FROM load_repair_migration WHERE id=1;");
@@ -599,8 +601,51 @@ pub fn Methods(comptime Store: type) type {
                 \\PRAGMA user_version=25;
             );
             try self.commitTransaction();
-            self.schema_version = latest_schema;
+            self.schema_version = store.load_repair.runtime_schema;
             std.log.info("native storage: schema 25 migration complete: runtime ignore entries and continuity-loss events enabled; pre-upgrade backup {s}", .{backup_path});
+            return backup_path;
+        }
+
+        pub fn enableParityState(self: *Store, options: store.load_repair.Options, covering_backup: ?[]const u8) Error!void {
+            const schema = try self.chainSchema();
+            if (schema < store.load_repair.runtime_schema or schema > latest_schema) return error.UnsupportedSchema;
+            if (schema == latest_schema) {
+                self.schema_version = latest_schema;
+                return;
+            }
+            var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            var taken_path: ?[:0]const u8 = null;
+            const backup_path: []const u8 = covering_backup orelse blk: {
+                const made = try self.takeSchemaBackup(options, .pre26, &path_buffer);
+                taken_path = made.path;
+                break :blk made.path;
+            };
+            errdefer if (taken_path) |path| if (!self.reopen_required) std.fs.cwd().deleteFileZ(path) catch {};
+            try self.beginWrite();
+            errdefer self.rollback();
+            if (try self.integer("PRAGMA user_version;") != store.load_repair.runtime_schema) return error.UnsupportedSchema;
+            try self.exec(
+                \\ALTER TABLE effect_owners ADD COLUMN origin INTEGER NOT NULL DEFAULT 1;
+                \\ALTER TABLE effect_owner_revisions ADD COLUMN origin INTEGER NOT NULL DEFAULT 1;
+                \\ALTER TABLE confirmed_effect_events ADD COLUMN origin INTEGER NOT NULL DEFAULT 1;
+                \\DROP TRIGGER effect_owner_insert;
+                \\DROP TRIGGER effect_owner_update;
+                \\CREATE TRIGGER effect_owner_insert AFTER INSERT ON effect_owners BEGIN INSERT INTO effect_owner_revisions(scope_key,jail,generation,decision_id,revision,lease_kind,deadline_us,decided_us,origin) VALUES(NEW.scope_key,NEW.jail,NEW.generation,NEW.decision_id,NEW.revision,NEW.lease_kind,NEW.deadline_us,NEW.decided_us,NEW.origin); END;
+                \\CREATE TRIGGER effect_owner_update AFTER UPDATE ON effect_owners BEGIN INSERT INTO effect_owner_revisions(scope_key,jail,generation,decision_id,revision,lease_kind,deadline_us,decided_us,origin) VALUES(NEW.scope_key,NEW.jail,NEW.generation,NEW.decision_id,NEW.revision,NEW.lease_kind,NEW.deadline_us,NEW.decided_us,NEW.origin); END;
+                \\ALTER TABLE ignore_entries ADD COLUMN expires_us INTEGER;
+                \\CREATE TABLE config_timed_entries(list INTEGER NOT NULL CHECK(list IN (1,2)),jail TEXT NOT NULL CHECK(typeof(jail)='text' AND length(jail) BETWEEN 1 AND 64),address TEXT NOT NULL CHECK(typeof(address)='text' AND length(address) BETWEEN 1 AND 64),duration_s INTEGER NOT NULL CHECK(duration_s BETWEEN 1 AND 3162240000),first_applied_us INTEGER NOT NULL CHECK(first_applied_us>0),expires_us INTEGER NOT NULL CHECK(expires_us>first_applied_us),PRIMARY KEY(list,jail,address,duration_s)) WITHOUT ROWID;
+                \\CREATE TABLE admin_requests_v26(request_id BLOB NOT NULL PRIMARY KEY CHECK(typeof(request_id)='blob' AND length(request_id)=32),kind INTEGER NOT NULL CHECK(kind BETWEEN 1 AND 13),subject BLOB NOT NULL CHECK(typeof(subject)='blob' AND length(subject)<=4096),outcome INTEGER NOT NULL CHECK(outcome BETWEEN 1 AND 5),generation BLOB NOT NULL CHECK(typeof(generation)='blob' AND length(generation)=32),mutation_revision INTEGER NOT NULL CHECK(typeof(mutation_revision)='integer' AND mutation_revision>=0),committed_us INTEGER NOT NULL CHECK(typeof(committed_us)='integer' AND committed_us>=0),detail BLOB NOT NULL CHECK(typeof(detail)='blob' AND length(detail)<=4096),admission_revision INTEGER) WITHOUT ROWID;
+                \\INSERT INTO admin_requests_v26 SELECT request_id,kind,subject,outcome,generation,mutation_revision,committed_us,detail,admission_revision FROM admin_requests;
+                \\DROP TABLE admin_requests;
+                \\ALTER TABLE admin_requests_v26 RENAME TO admin_requests;
+                \\CREATE INDEX admin_requests_by_revision ON admin_requests(mutation_revision);
+                \\CREATE TRIGGER admin_request_revision_insert BEFORE INSERT ON admin_requests WHEN NOT (NEW.admission_revision IS NULL OR (typeof(NEW.admission_revision)='integer' AND NEW.admission_revision>=0)) BEGIN SELECT RAISE(ABORT,'invalid admission revision'); END;
+                \\CREATE TRIGGER admin_request_revision_update BEFORE UPDATE OF admission_revision ON admin_requests BEGIN SELECT RAISE(ABORT,'admission revision immutable'); END;
+                \\PRAGMA user_version=26;
+            );
+            try self.commitTransaction();
+            self.schema_version = latest_schema;
+            std.log.info("native storage: schema 26 migration complete: ban origins, ignore entry deadlines and timed configuration entries enabled; pre-upgrade backup {s}", .{backup_path});
         }
     };
 }

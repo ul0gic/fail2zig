@@ -114,6 +114,11 @@ pub const Repair = struct {
         self.binding.receipt_us = null;
     }
 
+    pub fn discardPending(self: *Repair) void {
+        self.binding.pending_digest = null;
+        self.binding.receipt_us = null;
+    }
+
     pub fn snapshot(self: *const Repair) Snapshot {
         return self.state;
     }

@@ -12,7 +12,9 @@ const time_policy = engine.core.source_time_policy;
 
 const usage =
     \\usage: f2z-load-fixture <churn|hot|pinned|reuse|oracle-cases> <out-dir> [key=value...]
-    \\keys: seed count interval_ms bantime_s gap_ms evidence jails churn retention_s max_matches retention=shipped|skip sync=full|off
+    \\       f2z-load-fixture attach <state-dir> jail=NAME count=N [bantime_s=S seed=N evidence=N sync=full|off]
+    \\keys: seed count interval_ms bantime_s gap_ms evidence jails churn retention_s max_matches retention=shipped|skip sync=full|off profile=1 (per-statement SQLite VM steps on stderr) audit=full|skip (skip the final-state audit)
+    \\attach appends count bans to the daemon state fail2zig.sqlite in state-dir, under the named jail's own generation and policy
     \\
 ;
 const second_us: i64 = 1_000_000;
@@ -26,9 +28,84 @@ fn historyPolicyGeneration() [32]u8 {
 }
 const key_tables = [_][]const u8{ "native_effects", "effect_owners", "effect_owner_revisions", "effect_intents", "effect_observations", "action_targets", "confirmed_effect_events", "confirmed_event_details", "confirmed_history_sequence", "retry_decision_details", "retry_decisions", "retry_states", "records" };
 
-const Shape = enum { churn, hot, pinned, reuse, @"oracle-cases" };
+const Shape = enum { churn, hot, pinned, reuse, @"oracle-cases", attach };
 const RetentionMode = enum { shipped, skip };
 const SyncMode = enum { full, off };
+const AuditMode = enum { full, skip };
+
+// SQLITE_TRACE_PROFILE: the callback receives the finished statement and a pointer to its elapsed nanoseconds.
+const sqlite_trace_profile: c_uint = 0x02;
+const sqlite3_trace_v2 = @extern(*const fn (*anyopaque, c_uint, ?*const fn (c_uint, ?*anyopaque, ?*anyopaque, ?*anyopaque) callconv(.c) c_int, ?*anyopaque) callconv(.c) c_int, .{ .name = "sqlite3_trace_v2" });
+const sqlite3_sql = @extern(*const fn (?*anyopaque) callconv(.c) ?[*:0]const u8, .{ .name = "sqlite3_sql" });
+const sqlite3_stmt_status = @extern(*const fn (?*anyopaque, c_int, c_int) callconv(.c) c_int, .{ .name = "sqlite3_stmt_status" });
+const sqlite_stmtstatus_fullscan_step: c_int = 1;
+const sqlite_stmtstatus_vm_step: c_int = 4;
+
+const Profile = struct {
+    const Stat = struct { ns: u64 = 0, calls: u64 = 0, steps: u64 = 0, fullscan: u64 = 0 };
+    var allocator: std.mem.Allocator = undefined;
+    var map: ?std.StringHashMap(Stat) = null;
+    var total_ns: u64 = 0;
+    var dropped: u64 = 0;
+
+    fn install(db: *anyopaque, alloc: std.mem.Allocator) void {
+        if (map == null) {
+            allocator = alloc;
+            map = std.StringHashMap(Stat).init(alloc);
+        }
+        _ = sqlite3_trace_v2(db, sqlite_trace_profile, callback, null);
+    }
+    fn callback(kind: c_uint, _: ?*anyopaque, statement: ?*anyopaque, elapsed: ?*anyopaque) callconv(.c) c_int {
+        if (kind != sqlite_trace_profile or statement == null or elapsed == null) return 0;
+        const ns: u64 = @intCast(@max(0, @as(*const i64, @ptrCast(@alignCast(elapsed.?))).*));
+        total_ns += ns;
+        const text = sqlite3_sql(statement) orelse return 0;
+        const m = &(map orelse return 0);
+        const entry = m.getOrPut(std.mem.span(text)) catch {
+            dropped += 1;
+            return 0;
+        };
+        if (!entry.found_existing) {
+            entry.key_ptr.* = allocator.dupe(u8, std.mem.span(text)) catch {
+                _ = m.remove(std.mem.span(text));
+                dropped += 1;
+                return 0;
+            };
+            entry.value_ptr.* = .{};
+        }
+        entry.value_ptr.ns += ns;
+        entry.value_ptr.calls += 1;
+        entry.value_ptr.steps += @intCast(@max(0, sqlite3_stmt_status(statement, sqlite_stmtstatus_vm_step, 1)));
+        entry.value_ptr.fullscan += @intCast(@max(0, sqlite3_stmt_status(statement, sqlite_stmtstatus_fullscan_step, 1)));
+        return 0;
+    }
+    fn report(writer: anytype, bans: u64) !void {
+        const m = &(map orelse return);
+        const Row = struct { sql: []const u8, stat: Stat };
+        var rows = std.ArrayList(Row).init(allocator);
+        defer rows.deinit();
+        var it = m.iterator();
+        var steps_total: u64 = 0;
+        while (it.next()) |kv| {
+            try rows.append(.{ .sql = kv.key_ptr.*, .stat = kv.value_ptr.* });
+            steps_total += kv.value_ptr.steps;
+        }
+        std.mem.sort(Row, rows.items, {}, struct {
+            fn less(_: void, a: Row, b: Row) bool {
+                return a.stat.steps > b.stat.steps;
+            }
+        }.less);
+        try writer.print("sqlite profile: {d} statements, {d} VM steps total ({d} per ban over {d} bans), {d:.1} ms total at millisecond resolution, {d} dropped\n", .{ rows.items.len, steps_total, if (bans == 0) 0 else steps_total / bans, bans, @as(f64, @floatFromInt(total_ns)) / 1e6, dropped });
+        for (rows.items[0..@min(rows.items.len, 40)]) |row| {
+            const share = @as(f64, @floatFromInt(row.stat.steps)) * 100 / @as(f64, @floatFromInt(@max(steps_total, 1)));
+            try writer.print("{d:6.1}% {d:12} steps {d:8} calls {d:10} steps/call {d:9} fullscan {d:8.1} ms  {s}\n", .{ share, row.stat.steps, row.stat.calls, row.stat.steps / @max(row.stat.calls, 1), row.stat.fullscan, @as(f64, @floatFromInt(row.stat.ns)) / 1e6, row.sql[0..@min(row.sql.len, 160)] });
+        }
+        var keys = m.keyIterator();
+        while (keys.next()) |key| allocator.free(key.*);
+        m.deinit();
+        map = null;
+    }
+};
 
 const Options = struct {
     seed: u64 = 1,
@@ -43,6 +120,10 @@ const Options = struct {
     max_matches: u16 = 10,
     retention: RetentionMode = .shipped,
     sync: SyncMode = .full,
+    jail: []const u8 = "portsentry",
+    profile: bool = false,
+    audit: AuditMode = .full,
+    cache_kib: u64 = 0,
 
     fn defaults(shape: Shape) Options {
         return switch (shape) {
@@ -51,18 +132,33 @@ const Options = struct {
             .pinned => .{ .churn = 150, .interval_ms = 1000, .bantime_s = 60 },
             .reuse => .{ .count = 300, .bantime_s = 600, .gap_ms = 100_000 },
             .@"oracle-cases" => .{ .bantime_s = 10 },
+            .attach => .{ .count = 65_536, .bantime_s = 86_400 * 7 },
         };
     }
     fn set(self: *Options, key: []const u8, value: []const u8) !void {
+        if (std.mem.eql(u8, key, "jail")) {
+            if (value.len == 0 or value.len > 64) return error.InvalidOption;
+            self.jail = value;
+            return;
+        }
         if (std.mem.eql(u8, key, "retention")) {
             self.retention = std.meta.stringToEnum(RetentionMode, value) orelse return error.InvalidOption;
+            return;
+        }
+        if (std.mem.eql(u8, key, "profile")) {
+            if (!std.mem.eql(u8, value, "1")) return error.InvalidOption;
+            self.profile = true;
+            return;
+        }
+        if (std.mem.eql(u8, key, "audit")) {
+            self.audit = std.meta.stringToEnum(AuditMode, value) orelse return error.InvalidOption;
             return;
         }
         if (std.mem.eql(u8, key, "sync")) {
             self.sync = std.meta.stringToEnum(SyncMode, value) orelse return error.InvalidOption;
             return;
         }
-        inline for (.{ "seed", "count", "interval_ms", "bantime_s", "gap_ms", "evidence", "jails", "churn", "retention_s", "max_matches" }) |name| {
+        inline for (.{ "seed", "count", "interval_ms", "bantime_s", "gap_ms", "evidence", "jails", "churn", "retention_s", "max_matches", "cache_kib" }) |name| {
             if (std.mem.eql(u8, key, name)) {
                 @field(self, name) = try std.fmt.parseInt(@TypeOf(@field(self, name)), value, 10);
                 return;
@@ -106,6 +202,7 @@ const Stats = struct {
     retry_details_pruned: u64 = 0,
     spent_scopes_pruned: u64 = 0,
     max_active_leases: usize = 0,
+    ban_loop_ms: u64 = 0,
 };
 
 // Heap-owned: the store's progress handler and the effect clock keep pointers into it.
@@ -128,6 +225,7 @@ const Gen = struct {
     refusal: ?Refusal = null,
     maintenance: bool,
     evidence_buffer: [retry.max_evidence_text_bytes]u8 = undefined,
+    checkpoint: ?[]const u8 = null,
 
     fn create(allocator: std.mem.Allocator, dir: []const u8, name: []const u8, options: Options, maintenance: bool) !*Gen {
         const path = try std.fmt.allocPrint(allocator, "{s}/{s}.sqlite", .{ dir, name });
@@ -139,6 +237,15 @@ const Gen = struct {
         const installation = try effects.Installation.init(id_hash[0..16].*, .nftables, "load-fixture");
         const self = try allocator.create(Gen);
         self.* = .{ .allocator = allocator, .path = path, .options = options, .installation = installation, .consumer = try history.Consumer.init(installation, historyPolicyGeneration()), .jails = std.ArrayList(Jail).init(allocator), .leases = std.ArrayList(Lease).init(allocator), .phases = std.ArrayList(Phase).init(allocator), .maintenance = maintenance };
+        return self;
+    }
+    fn attach(allocator: std.mem.Allocator, dir: []const u8, options: Options) !*Gen {
+        const path = try std.fmt.allocPrint(allocator, "{s}/fail2zig.sqlite", .{dir});
+        errdefer allocator.free(path);
+        try std.fs.cwd().access(path, .{});
+        const placeholder = try effects.Installation.init([_]u8{1} ** 16, .nftables, "attach");
+        const self = try allocator.create(Gen);
+        self.* = .{ .allocator = allocator, .path = path, .options = options, .installation = placeholder, .consumer = try history.Consumer.init(placeholder, historyPolicyGeneration()), .jails = std.ArrayList(Jail).init(allocator), .leases = std.ArrayList(Lease).init(allocator), .phases = std.ArrayList(Phase).init(allocator), .maintenance = false };
         return self;
     }
     fn destroy(self: *Gen) void {
@@ -169,10 +276,16 @@ const Gen = struct {
     fn openStore(self: *Gen) !void {
         self.store = try self.stored("Store.openRuntime", durable.Store.openRuntime(self.allocator, self.path));
         self.store_open = true;
+        if (self.options.profile) Profile.install(@ptrCast(self.store.db), self.allocator);
         self.store.runtime_path = self.path;
         try self.stored("Store.configureRuntimeLimits", self.store.configureRuntimeLimits());
         // Durability of intermediate commits only; row contents and VM work are unchanged.
         if (self.options.sync == .off) try self.stored("Store.exec", self.store.exec("PRAGMA synchronous=OFF;"));
+        if (self.options.cache_kib != 0) {
+            var pragma_buffer: [64]u8 = undefined;
+            const pragma = try std.fmt.bufPrintZ(&pragma_buffer, "PRAGMA cache_size=-{d};", .{self.options.cache_kib});
+            try self.stored("Store.exec", self.store.exec(pragma));
+        }
         try self.stored("Store.enableReceipts", self.store.enableReceipts(64));
         try self.stored("Store.enableNativeTime", self.store.enableNativeTime());
         try self.stored("Store.enableDetection", self.store.enableDetection());
@@ -252,7 +365,7 @@ const Gen = struct {
             .effects_clock = self.clock.value(),
             .expected_revision = revision,
             .disposition = outcome.disposition(),
-            .checkpoint = "load-fixture",
+            .checkpoint = self.checkpoint orelse "load-fixture",
         }));
         self.stats.bans += 1;
         const key = try (try effects.Scope.host(subject)).key(self.installation);
@@ -431,6 +544,54 @@ fn runPinned(gen: *Gen) !void {
     try gen.turn();
     try gen.phase("after-retention-age");
 }
+fn runAttach(gen: *Gen) !void {
+    try gen.openStore();
+    gen.installation = try gen.stored("Store.readInstallation", gen.store.readInstallation()) orelse return error.FixtureMissingInstallation;
+    gen.consumer = try history.Consumer.init(gen.installation, historyPolicyGeneration());
+    var generation: [32]u8 = undefined;
+    var policy: retry.Policy = undefined;
+    {
+        var row = try gen.store.statement("SELECT generation,policy FROM retry_policies WHERE jail=?1;");
+        defer row.deinit();
+        try row.text(1, gen.options.jail);
+        if (!try row.row()) return error.FixtureUnknownJail;
+        generation = (try row.boundedBytes(0, 32))[0..32].*;
+        policy = try retry.Policy.decode(try row.boundedBytes(1, 4096));
+    }
+    const owned = try gen.allocator.dupe(u8, gen.options.jail);
+    gen.jails.append(.{ .name = owned, .generation = generation, .policy = policy }) catch |failure| {
+        gen.allocator.free(owned);
+        return failure;
+    };
+    {
+        var existing = try gen.store.statement("SELECT count(*) FROM records WHERE jail=?1 AND source=?2;");
+        defer existing.deinit();
+        try existing.text(1, owned);
+        try existing.text(2, source_name);
+        if (!try existing.row()) return error.FixtureMissingInstallation;
+        gen.records = @intCast(try existing.signed(0));
+    }
+    // The jail's pipeline restores from the latest record's checkpoint, so every appended record carries the one the daemon wrote.
+    const checkpoint = try gen.stored("Store.checkpoint", gen.store.checkpoint(gen.allocator, gen.options.jail)) orelse return error.FixtureMissingCheckpoint;
+    defer gen.allocator.free(checkpoint);
+    gen.checkpoint = checkpoint;
+    gen.clock.now = std.time.microTimestamp();
+    const loop_started_ms = std.time.milliTimestamp();
+    while (gen.cycle < gen.options.count) {
+        gen.cycle += 1;
+        gen.clock.advanceMs(1);
+        try gen.ban(0, churnSubject(gen.options.seed, gen.cycle), gen.options.evidence);
+        if (gen.cycle % 4096 == 0) try gen.phase("progress");
+    }
+    gen.stats.ban_loop_ms = @intCast(@max(0, std.time.milliTimestamp() - loop_started_ms));
+    // The daemon resumes every source cursor of the jail as a file position; the fixture's source has none.
+    var cursor = try gen.store.statement("DELETE FROM source_cursors WHERE jail=?1 AND source=?2;");
+    defer cursor.deinit();
+    try cursor.text(1, owned);
+    try cursor.text(2, source_name);
+    try cursor.done();
+    try gen.phase("final");
+}
 fn runReuse(gen: *Gen) !void {
     try gen.setup();
     const jail = try gen.addJail("reuse", gen.finite());
@@ -586,6 +747,7 @@ fn writeHex(ws: anytype, bytes: []const u8) !void {
 
 fn writeState(ws: anytype, gen: *Gen, label: []const u8, path: []const u8) !void {
     var store = try durable.Store.openReadOnly(gen.allocator, path);
+    if (gen.options.profile) Profile.install(@ptrCast(store.db), gen.allocator);
     defer store.close();
     try ws.beginObject();
     try ws.objectField("label");
@@ -682,8 +844,9 @@ fn writeState(ws: anytype, gen: *Gen, label: []const u8, path: []const u8) !void
     try writeQuery(ws, &store, "spent_scopes", "SELECT count(*) FROM native_effects WHERE lease_kind=0;");
     try writeQuery(ws, &store, "spent_scopes_referenced_by_history", "SELECT count(*) FROM native_effects n WHERE n.lease_kind=0 AND EXISTS(SELECT 1 FROM confirmed_effect_events e WHERE e.scope_key=n.scope_key);");
     try writeQuery(ws, &store, "obsolete_owner_revisions", "SELECT count(*) FROM effect_owner_revisions h WHERE NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=h.scope_key AND o.jail=h.jail AND o.revision=h.revision);");
-    try writeQuery(ws, &store, "obsolete_intents", "SELECT count(*) FROM effect_intents i WHERE NOT EXISTS(SELECT 1 FROM native_effects n WHERE n.intent_id=i.intent_id);");
-    try writeQuery(ws, &store, "obsolete_observations", "SELECT count(*) FROM effect_observations o WHERE NOT EXISTS(SELECT 1 FROM native_effects n WHERE n.intent_id=o.intent_id);");
+    // native_effects has no index on intent_id; NOT IN materializes the referenced ids once instead of scanning per row.
+    try writeQuery(ws, &store, "obsolete_intents", "SELECT count(*) FROM effect_intents WHERE intent_id NOT IN (SELECT intent_id FROM native_effects WHERE intent_id IS NOT NULL);");
+    try writeQuery(ws, &store, "obsolete_observations", "SELECT count(*) FROM effect_observations WHERE intent_id NOT IN (SELECT intent_id FROM native_effects WHERE intent_id IS NOT NULL);");
     try writeQuery(ws, &store, "action_targets_without_retained_event", "SELECT count(*) FROM action_targets a WHERE NOT EXISTS(SELECT 1 FROM confirmed_effect_events e WHERE e.scope_key=a.scope_key AND e.jail=a.jail AND e.decision_id=a.action_id);");
     try writeQuery(ws, &store, "unsettled_intents", "SELECT count(*) FROM effect_intents WHERE status IN(1,2);");
     try writeQuery(ws, &store, "unsettled_action_targets", "SELECT count(*) FROM action_targets WHERE status IN(1,2,5);");
@@ -822,9 +985,11 @@ pub fn main() !u8 {
     };
     _ = std.c.umask(0o077);
     const dir = argv[2];
-    try std.fs.cwd().makePath(dir);
-    try std.posix.fchmodat(std.posix.AT.FDCWD, dir, 0o700, 0);
-    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/manifest.json", .{dir});
+    if (shape != .attach) {
+        try std.fs.cwd().makePath(dir);
+        try std.posix.fchmodat(std.posix.AT.FDCWD, dir, 0o700, 0);
+    }
+    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, if (shape == .attach) "fixture-attach.json" else "manifest.json" });
     defer allocator.free(manifest_path);
     if (std.fs.cwd().access(manifest_path, .{})) |_| {
         try stderr.print("refusing to overwrite {s}\n", .{manifest_path});
@@ -892,18 +1057,19 @@ pub fn main() !u8 {
             for (snapshots.items) |item| try writeState(&ws, gen, item.label, item.path);
             try ws.endArray();
             try ws.objectField("state");
-            try writeState(&ws, gen, "final", gen.path);
+            if (options.audit == .full) try writeState(&ws, gen, "final", gen.path) else try ws.write(null);
             try ws.endObject();
         }
         try ws.endArray();
     } else {
-        const gen = try Gen.create(allocator, dir, @tagName(shape), options, true);
+        const gen = if (shape == .attach) try Gen.attach(allocator, dir, options) else try Gen.create(allocator, dir, @tagName(shape), options, true);
         defer gen.destroy();
         const outcome = switch (shape) {
             .churn => runCase(gen, runChurn, .{gen}),
             .hot => runCase(gen, runHot, .{gen}),
             .pinned => runCase(gen, runPinned, .{gen}),
             .reuse => runCase(gen, runReuse, .{gen}),
+            .attach => runCase(gen, runAttach, .{gen}),
             .@"oracle-cases" => unreachable,
         };
         if (outcome.harness_failure != null) failed = true;
@@ -911,13 +1077,14 @@ pub fn main() !u8 {
         try ws.write(outcome.harness_failure);
         try writeGen(&ws, gen);
         try ws.objectField("state");
-        try writeState(&ws, gen, "final", gen.path);
+        if (options.audit == .full) try writeState(&ws, gen, "final", gen.path) else try ws.write(null);
     }
     try ws.objectField("runtime_ms");
     try ws.write(timer.read() / std.time.ns_per_ms);
     try ws.endObject();
     try output.append('\n');
     try std.fs.cwd().writeFile(.{ .sub_path = manifest_path, .data = output.items, .flags = .{ .mode = 0o600, .exclusive = true } });
+    if (options.profile) try Profile.report(stderr, options.count);
     if (failed) {
         try stderr.writeAll("fixture harness failure; see manifest harness_failure and first_refusal\n");
         return 1;

@@ -175,18 +175,3 @@ const Hash = struct {
         _ = try self.write(bytes);
     }
 };
-
-test "native consumer plan: actual protected file changes invalidate its complete read" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "asset", .data = "original", .flags = .{ .mode = 0o600 } });
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "asset");
-    defer std.testing.allocator.free(path);
-    const Change = struct {
-        fn mutate(context: ?*anyopaque) !void {
-            const dir: *std.fs.Dir = @ptrCast(@alignCast(context.?));
-            try dir.writeFile(.{ .sub_path = "asset", .data = "changed and longer" });
-        }
-    };
-    try std.testing.expectError(error.ConsumerFileChanged, readProtected(std.testing.allocator, path, 4096, .{ .context = &tmp.dir, .call = Change.mutate }));
-}

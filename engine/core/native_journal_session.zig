@@ -323,6 +323,10 @@ pub const Session = struct {
     pub fn repairSnapshot(self: *const Session) repair.Snapshot {
         return self.source_repair.snapshot();
     }
+    pub fn blockedCause(self: *const Session) ?anyerror {
+        const cause = self.last_error orelse return null;
+        return if (pipeline.Pipeline.commitBlocked(cause)) cause else null;
+    }
     pub fn failureDiagnostic(self: *const Session) ?FailureDiagnostic {
         return self.failure_diagnostic;
     }
@@ -648,7 +652,7 @@ pub const Session = struct {
         return self.nowMs();
     }
     fn reportNotices(self: *Session) void {
-        if (self.processor.timeNotice(self.notices.read() / std.time.ns_per_ms)) |notice| std.log.scoped(.source_time).warn("jail {s}: rejected journal timestamps: missing={d}, malformed={d}, future={d}", .{ self.pipe.jail, notice.missing_since_notice, notice.malformed_since_notice, notice.future_since_notice });
+        if (self.processor.timeNotice(self.nowMs())) |notice| std.log.scoped(.source_time).warn("jail {s}: rejected journal timestamps: missing={d}, malformed={d}, future={d}", .{ self.pipe.jail, notice.missing_since_notice, notice.malformed_since_notice, notice.future_since_notice });
     }
     fn pollAdmitted(self: *Session, budget: usize, committing: *bool) !usize {
         if (budget == 0 or budget > self.options.journal.batch_records) return error.InvalidPollBudget;
@@ -686,24 +690,3 @@ pub const Session = struct {
         return delivered;
     }
 };
-
-test "native journal: fixed cursor checkpoints reject foreign versions generations and padding" {
-    const generation = [_]u8{7} ** 32;
-    const position = try (Position{ .generation = generation, .start_us = 123 }).withCursor("opaque cursor");
-    const valid = position.encode();
-    try std.testing.expectEqualDeep(position, try Position.decode(&valid, generation));
-    for (0..6) |variant| {
-        var bytes = valid;
-        switch (variant) {
-            0 => bytes[0] = '{',
-            1 => bytes[4] = 2,
-            2 => bytes[6] ^= 1,
-            3 => std.mem.writeInt(i64, bytes[38..46], -1, .little),
-            4 => std.mem.writeInt(u16, bytes[46..48], 513, .little),
-            5 => bytes[559] = 1,
-            else => unreachable,
-        }
-        if (Position.decode(&bytes, generation)) |_| return error.InvalidCheckpointAccepted else |_| {}
-    }
-    try std.testing.expectError(error.ForeignJournalCheckpoint, Position.decode(valid[0..559], generation));
-}

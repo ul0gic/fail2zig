@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const shared = @import("shared");
+const cli = @import("cli");
 const posix = std.posix;
 
 const registry = @import("../filters/registry.zig");
@@ -128,6 +129,10 @@ pub const Error = error{
 pub const max_ignore_flags: usize = 64;
 
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8, stdout: anytype, stderr: anytype) ExitClass {
+    for (args) |arg| if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+        stdout.writeAll(cli.args.help_rule_test) catch return .rejected;
+        return .success;
+    };
     var ignore_buf: [max_ignore_flags][]const u8 = undefined;
     const options = parseArgs(args, &ignore_buf, stderr) orelse return usage(stderr);
     var report = evaluate(allocator, options) catch |err| {
@@ -143,19 +148,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8, stdout: anyty
 }
 
 fn usage(stderr: anytype) ExitClass {
-    stderr.writeAll(
-        \\usage:
-        \\  fail2zig rule-test (--file <path> | --record "<line>" | --journal [<match>...])
-        \\                     (--service <name> | --rule-file <path>)
-        \\                     [--config <path>] [--jail <name>]
-        \\                     [--timestamp iso8601|syslog|epoch_seconds|common_log|undated]
-        \\                     [--time-zone <id>] [--tz-offset <minutes>] [--year <yyyy>]
-        \\                     [--encoding utf8|ascii|latin1|utf16le|utf16be|utf32le|utf32be]
-        \\                     [--identity raw|dns --dns-server <ip:port>] [--ignore <cidr>]...
-        \\                     [--max-lines <n>] [--limit <n>] [--output json|table] [--print-lines]
-        \\                     [--now <epoch-seconds>] [--window <seconds>]
-        \\
-    ) catch {};
+    stderr.writeAll(cli.args.help_rule_test) catch {};
     return .usage;
 }
 

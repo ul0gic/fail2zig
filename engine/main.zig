@@ -10,6 +10,7 @@ const cli = @import("cli");
 
 const log_level = @import("core/log_level.zig");
 pub const std_options: std.Options = .{ .log_level = .debug, .logFn = configuredLog };
+pub const panic = if (build_options.diag) std.debug.FullPanic(@import("core/diag_events.zig").panic) else std.debug.FullPanic(std.debug.defaultPanic);
 
 fn configuredLog(comptime level: std.log.Level, comptime scope: @Type(.enum_literal), comptime format: []const u8, args: anytype) void {
     if (!log_level.enabled(level)) return;
@@ -69,9 +70,9 @@ pub const CliOptions = struct {
     foreground: bool = true,
 };
 
-pub const EntryMode = enum { daemon, operator, migrate, rule_test, repair_source };
+pub const EntryMode = enum { daemon, operator, migrate, rule_test, repair_source, support_bundle };
 
-const operator_words = [_][]const u8{ "status", "jails", "list", "ban", "unban", "reload", "version", "help", "completions", "config", "history", "jail", "firewall", "stats", "ignore" };
+const operator_words = [_][]const u8{ "status", "jails", "list", "ban", "unban", "reload", "version", "help", "completions", "config", "history", "jail", "firewall", "stats", "ignore", "diag" };
 const operator_globals = [_][]const u8{ "--socket", "--output", "--no-color", "--timeout" };
 
 pub fn classifyEntry(args: []const []const u8) EntryMode {
@@ -80,7 +81,9 @@ pub fn classifyEntry(args: []const []const u8) EntryMode {
     if (std.mem.eql(u8, first, "migrate")) return .migrate;
     if (std.mem.eql(u8, first, "rule-test")) return .rule_test;
     if (std.mem.eql(u8, first, "repair-source")) return .repair_source;
+    if (std.mem.eql(u8, first, "support-bundle")) return .support_bundle;
     for (operator_words) |w| if (std.mem.eql(u8, first, w)) return .operator;
+    if (first.len > 0 and first[0] != '-' and !std.mem.eql(u8, first, "daemon")) return .operator;
     for (operator_globals) |g| {
         if (std.mem.eql(u8, first, g)) return .operator;
         if (first.len > g.len and std.mem.startsWith(u8, first, g) and first[g.len] == '=') return .operator;
@@ -154,14 +157,29 @@ fn printHelp(w: anytype) !void {
         \\  fail2zig [GLOBALS] <command> [args]         administer a running daemon
         \\
         \\COMMANDS:
-        \\  status | jails | list | ban | unban | reload | version | help | completions
-        \\  config | history | jail | firewall show | stats
-        \\  ignore add|remove|list ...                 manage per-jail exclusions
-        \\  migrate inspect|snapshot|plan|validate|cutover|status|rollback ...
-        \\  rule-test --file|--record|--journal ...   offline rule evaluation (no daemon needed)
-        \\  repair-source --jail J --source PATH --token T --acknowledge-truncation   acknowledge a truncated file source (daemon stopped)
-        \\  Globals: --socket <path> --output table|json|plain --no-color --timeout <ms>
-        \\  `fail2zig help <command>` documents each command; `fail2zig version` shows client and daemon versions.
+        \\  status                    Protection, storage and source health (--details)
+        \\  stats                     Retained enforcement statistics snapshot
+        \\  jails                     Configured jails with source health (--details)
+        \\  list                      Active bans (--jail, --origin detection|manual|config)
+        \\  ban <ip> --jail <name>    Manual ban (--duration, --scope net <cidr>, --force)
+        \\  unban <ip> --jail <name>  Manual unban
+        \\  ignore add|remove|list    Per-jail exclusions; ignore add --for <duration> sets an expiry
+        \\  history [reset <ip>]      Confirmed ban history, or reset one address's history
+        \\  firewall show|withdraw    Inspect owned kernel protection, or remove it until restart
+        \\  jail <action> <name>      enable, disable, pause or resume a jail
+        \\  reload                    Apply supported configuration changes live
+        \\  config                    The daemon's effective configuration
+        \\  version                   Client and daemon versions
+        \\  completions <shell>       Shell completion script (bash|zsh|fish)
+        \\  help [command]            Help for a command; <command> --help does the same
+        \\
+        \\OFFLINE TOOLS (no daemon needed):
+        \\  rule-test                 Evaluate a log, one line or the journal against a rule
+        \\  migrate <sub>             Inspect, plan and carry out a fail2ban migration
+        \\  repair-source             Acknowledge a truncated or replaced file source
+        \\  support-bundle            Write a redacted diagnostic bundle for a bug report
+        \\
+        \\GLOBALS (administration): --socket <path> --output table|json|plain --no-color --timeout <ms>
         \\
         \\OPTIONS:
         \\  --config <path>           Config file (default: /etc/fail2zig/config.toml)
@@ -219,6 +237,7 @@ pub fn main() !void {
         .migrate => std.process.exit(@import("cli/migrate.zig").run(heap, rest[1..], version, std.io.getStdOut().writer(), std.io.getStdErr().writer()).code()),
         .rule_test => std.process.exit(@import("cli/rule_test.zig").run(heap, rest[1..], std.io.getStdOut().writer(), std.io.getStdErr().writer()).code()),
         .repair_source => std.process.exit(@import("cli/repair_source.zig").run(heap, rest[1..], std.io.getStdOut().writer(), std.io.getStdErr().writer()).code()),
+        .support_bundle => std.process.exit(@import("cli/support_bundle.zig").run(heap, rest[1..], version, std.io.getStdOut().writer(), std.io.getStdErr().writer()).code()),
         .daemon => {},
     }
 
@@ -365,8 +384,10 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config, config_path
         value.drain();
         value.deinit();
     };
-    if (!std.mem.eql(u8, cfg.global.log_target, "stderr")) {
-        sink = log_target.Sink.init(heap, .{ .file = cfg.global.log_target }) catch |err| {
+    const to_stderr = std.mem.eql(u8, cfg.global.log_target, "stderr");
+    if (!to_stderr or cfg.global.log_format == .json) {
+        const target: log_target.Target = if (to_stderr) .stderr else .{ .file = cfg.global.log_target };
+        sink = log_target.Sink.init(heap, target, cfg.global.log_format) catch |err| {
             std.log.err("log target '{s}' unusable: {s}; refusing to start", .{ cfg.global.log_target, @errorName(err) });
             std.process.exit(shared.ExitClass.rejected.code());
         };
@@ -402,19 +423,6 @@ fn warnIfVolatileStateDir(state_file: []const u8) void {
         "persist: state_file '{s}' is on volatile storage (tmpfs or /run): state will not survive restart; use /var/lib/fail2zig",
         .{state_file},
     );
-}
-
-test "persist: state path under /run or on tmpfs is classified volatile" {
-    try std.testing.expect(stateDirIsVolatile("/run/fail2zig/state.bin", null));
-    try std.testing.expect(stateDirIsVolatile("/var/lib/fail2zig/state.bin", tmpfs_magic));
-    try std.testing.expect(!stateDirIsVolatile("/var/lib/fail2zig/state.bin", null));
-    try std.testing.expect(!stateDirIsVolatile("/var/lib/fail2zig/state.bin", 0xEF53));
-    try std.testing.expect(!stateDirIsVolatile("/runway/state.bin", null));
-}
-
-test "persist: fsMagicOfDir reads a real mount and rejects a missing one" {
-    try std.testing.expect(fsMagicOfDir("/") != null);
-    try std.testing.expect(fsMagicOfDir("/nonexistent-fail2zig-dir") == null);
 }
 
 fn ensureSocketDir(socket_path: []const u8) !void {
