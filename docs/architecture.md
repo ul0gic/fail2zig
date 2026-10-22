@@ -155,7 +155,7 @@ Idle cost was measured on `f2z-target` (Debian 13, one vCPU, 4 GiB, kernel
 of 301 one-second intervals the daemon used a mean of 2.61 % CPU, a median of 2.0 % and a
 maximum of 6.0 %, and its journal child processes a further 1.36 % mean. A clean
 `systemctl stop` at that size took 1 s and withdrew the rules in 32 batched turns. On the
-same host with 65,536 installed bans, a cold restart (every element reinstalled) reached
+same VM, resized to 8 vCPU and 16 GiB, with 65,536 installed bans, a cold restart (every element reinstalled) reached
 readiness in 373 s and idled at 12 % of one core over 3 minutes, against 371 s and 21 %
 before installs were confirmed by acknowledgement and drift by events; with 20,000 bans the
 daemon spent 3.5 % of one core over 2 minutes, 2.1 s of it per audit. Ingest through one
