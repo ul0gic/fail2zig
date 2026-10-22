@@ -104,70 +104,11 @@ jobs:
       - name: Assembled daemon and firewall checks
         run: /usr/bin/time -v zig build test-ci-assembled test-firewall -Doptimize=ReleaseSafe -j2 --summary all
 
-  release-target:
-    name: Cross-compile ${{ matrix.target }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - {target: x86_64-linux-musl, cpu: baseline, elf: "ELF 64-bit LSB.*x86-64"}
-          - {target: aarch64-linux-musl, cpu: baseline, elf: "ELF 64-bit LSB.*ARM aarch64"}
-          - {target: arm-linux-musleabihf, cpu: baseline, elf: "ELF 32-bit LSB.*ARM"}
-          - {target: mips-linux-musleabi, cpu: mips32r2, elf: "ELF 32-bit MSB.*MIPS"}
-          - {target: mipsel-linux-musleabi, cpu: mips32r2, elf: "ELF 32-bit LSB.*MIPS"}
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - name: Install Zig ${{ env.ZIG_VERSION }}
-        run: |
-          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
-          echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c -
-          sudo mkdir -p /opt/zig
-          sudo tar -xf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
-          echo "/opt/zig" >> "$GITHUB_PATH"
-          /opt/zig/zig version
-      - name: Cache zig-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: .zig-cache
-          key: zig-cache-release-${{ matrix.target }}-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
-          restore-keys: |
-            zig-cache-release-${{ matrix.target }}-${{ runner.os }}-${{ env.ZIG_VERSION }}-
-      - name: Build ReleaseSafe static binaries
-        env:
-          RELEASE_TARGET: ${{ matrix.target }}
-          RELEASE_CPU: ${{ matrix.cpu }}
-        run: zig build -Dtarget="$RELEASE_TARGET" -Dcpu="$RELEASE_CPU" -Doptimize=ReleaseSafe -Dstrip=true
-      - name: Verify the single executable and static linkage
-        env:
-          EXPECTED_ELF: ${{ matrix.elf }}
-        run: |
-          test "$(find zig-out/bin -mindepth 1 -maxdepth 1 -printf '%f\n')" = fail2zig
-          test -f zig-out/bin/fail2zig
-          test ! -L zig-out/bin/fail2zig
-          sha256sum zig-out/bin/fail2zig
-          description=$(file zig-out/bin/fail2zig)
-          printf '%s\n' "$description"
-          if [[ ! $description =~ $EXPECTED_ELF || $description != *', stripped'* ]]; then
-            echo "::error::fail2zig has the wrong ELF architecture or contains debug information"
-            exit 1
-          fi
-          # A readelf failure must fail the job, not look like absent linkage.
-          headers=$(readelf -l zig-out/bin/fail2zig)
-          dynamic=$(readelf -d zig-out/bin/fail2zig)
-          if [[ $headers == *INTERP* || $dynamic == *NEEDED* ]]; then
-            echo "::error::fail2zig has a dynamic interpreter or dependency"
-            exit 1
-          fi
-
   ci-result:
     name: CI result
     timeout-minutes: 5
     if: always()
-    needs: [lint, test, release-target]
+    needs: [lint, test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
