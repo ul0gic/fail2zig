@@ -63,23 +63,7 @@ fn parseArgs(args: []const []const u8, stderr: anytype) ?Options {
     return .{ .config = config, .jail = jail.?, .source = source.?, .token = token.? };
 }
 
-const usage_text =
-    \\usage:
-    \\  fail2zig repair-source --jail <name> --source <absolute path> --token <token>
-    \\                         --acknowledge-truncation [--config <path>]
-    \\
-    \\Runs through the daemon's admin socket while the daemon is running, and on the
-    \\state file directly while it is stopped. Acknowledges that a configured file source
-    \\was truncated in place, restarting it at offset 0 of the current file, or that a
-    \\rotated-out incarnation was removed with unread bytes, resuming the current file at
-    \\its committed offset. <token>
-    \\(1-128 of A-Z a-z 0-9 . _ : -) identifies this repair; repeating the same command
-    \\replays the committed outcome. The newest 256 outcomes are kept; older tokens stay
-    \\reserved and are refused. The repair binds the source generation recorded in the
-    \\state, not one recomputed from the configuration; offline, a configuration changed
-    \\since the stop is applied by the next start.
-    \\
-;
+const usage_text = cli.args.help_repair_source;
 
 fn usage(stderr: anytype) ExitClass {
     stderr.writeAll(usage_text) catch {};

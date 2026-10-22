@@ -522,10 +522,14 @@ when nothing was removed. It works while storage is unhealthy and changes no
 stored state, so it has no request replay or audit record. Because a stop leaves
 rules in place, run it before stopping the daemon to leave an empty table.
 .TP
-.BI ban " ip --jail name [--duration seconds] [--scope host|net cidr] [--force]"
+.BI ban " ip --jail name [--duration seconds|duration] [--scope host|net cidr] [--force]"
 Manual ban. Exactly one
 .B \-\-jail
 is required.
+.B \-\-duration
+takes seconds or the configuration's duration syntax (2m, 1h30m); without it the
+ban runs for the jail's
+.BR bantime .
 .B \-\-scope net
 bans a network and needs a backend with set support (nftables or ipset).
 A log-only jail rejects manual bans. The ban has origin
@@ -906,7 +910,10 @@ separate client and daemon fields.
 Shell completion script on stdout.
 .TP
 .BI help " [command]"
-General or per-command help.
+General or per-command help;
+.I command
+.B \-\-help
+prints the same page. An unknown topic exits 2.
 .
 .SH RULE-TEST
 .B fail2zig rule-test

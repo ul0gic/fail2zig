@@ -228,6 +228,10 @@ pub fn parse(argv: []const []const u8, diag: *ParseDiag) Error!Parsed {
     i += 1;
     const rest = argv[i..];
 
+    for (rest) |a| if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+        return Parsed{ .globals = globals, .command = .{ .help = cmd_str } };
+    };
+
     if (std.mem.eql(u8, cmd_str, "status")) {
         return parseDetailsOnly(rest, "status", &globals, diag, .status);
     }
@@ -344,11 +348,11 @@ fn parseBan(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Error
         if (std.mem.eql(u8, a, "--duration")) {
             k += 1;
             if (k >= rest.len) {
-                diag.set("flag --duration requires a value (seconds)", .{});
+                diag.set("flag --duration requires a value (seconds, or a duration such as 2m or 1h30m)", .{});
                 return error.MissingValue;
             }
-            args.duration_s = std.fmt.parseInt(u64, rest[k], 10) catch {
-                diag.set("invalid --duration value '{s}' (expected positive integer seconds)", .{rest[k]});
+            args.duration_s = parseForSeconds(rest[k]) orelse {
+                diag.set("invalid --duration value '{s}' (expected seconds, or a duration such as 2m or 1h30m)", .{rest[k]});
                 return error.InvalidValue;
             };
             continue;
@@ -930,6 +934,10 @@ pub const known_commands = [_][]const u8{
     "ignore",
     "completions",
     "help",
+    "migrate",
+    "rule-test",
+    "repair-source",
+    "support-bundle",
 };
 
 pub fn closestCommand(input: []const u8) ?[]const u8 {
@@ -986,23 +994,27 @@ pub const help_top =
     \\COMMANDS:
     \\    status              Show protection-first daemon status (--details for identifiers/metrics)
     \\    stats               Show the retained enforcement statistics snapshot
-    \\    ban <ip>            Manually ban an IP
-    \\    unban <ip>          Manually unban an IP
+    \\    jails               List configured jails with source health (--details for thresholds)
+    \\    list                List active bans (--jail, --origin filters; --details for counts)
+    \\    ban <ip>            Manually ban an address or, with --scope net, a network
+    \\    unban <ip>          Manually unban an address or network
     \\    ignore <sub>        Manage per-jail exclusions: add, remove, list
-    \\    list                List active bans (--jail filter; --details for counts)
-    \\    jails               List configured jails (--details for thresholds)
-    \\    reload              Apply supported changes live; restart-only settings require restart
-    \\    version             Show client and daemon version
-    \\    config              Show the daemon's effective configuration
     \\    history             Page through confirmed ban history
+    \\    history reset <ip>  Reset an address's ban history in one jail or all jails
     \\    firewall show       Inspect sampled fail2zig-owned kernel protection
     \\    firewall withdraw   Remove fail2zig's kernel rules and hold enforcement off until restart
-    \\    history reset <ip>  Reset an address's ban history in one jail or all jails
     \\    jail <action> <n>   enable, disable, pause or resume a jail
-    \\    repair-source       Acknowledge a truncated or replaced file source (daemon stopped)
-    \\    support-bundle      Write a redacted diagnostic bundle for a bug report
+    \\    reload              Apply supported configuration changes live
+    \\    config              Show the daemon's effective configuration
+    \\    version             Show client and daemon versions
     \\    completions <sh>    Emit shell-completion script (bash|zsh|fish)
-    \\    help [command]      Show help for a command
+    \\    help [command]      Show help for a command; <command> --help does the same
+    \\
+    \\OFFLINE TOOLS (no daemon needed):
+    \\    rule-test           Evaluate a log, one line or the journal against a rule
+    \\    migrate <sub>       Inspect, plan and carry out a fail2ban migration
+    \\    repair-source       Acknowledge a truncated or replaced file source
+    \\    support-bundle      Write a redacted diagnostic bundle for a bug report
     \\
     \\GLOBAL FLAGS:
     \\    --socket <path>     Unix socket path (default: /run/fail2zig/fail2zig.sock)
@@ -1014,16 +1026,140 @@ pub const help_top =
     \\
     \\EXAMPLES:
     \\    fail2zig status
-    \\    fail2zig stats
-    \\    fail2zig ban 192.0.2.10 --jail sshd --duration 3600
-    \\    fail2zig ban 192.0.2.10 --jail sshd --scope net 192.0.2.0/24
-    \\    fail2zig ignore add 198.51.100.20 --jail sshd
-    \\    fail2zig ignore list --jail sshd
-    \\    fail2zig jail pause sshd
+    \\    fail2zig jails --details
     \\    fail2zig list --jail sshd --output json
+    \\    fail2zig list --origin config
+    \\    fail2zig ban 192.0.2.10 --jail sshd --duration 1h
+    \\    fail2zig ban 192.0.2.10 --jail sshd --scope net 192.0.2.0/24
+    \\    fail2zig unban 192.0.2.10 --jail sshd
+    \\    fail2zig ignore add 198.51.100.20 --jail sshd --for 2h
+    \\    fail2zig ignore list --jail sshd
     \\    fail2zig history --jail sshd --limit 50
+    \\    fail2zig jail pause sshd
     \\    fail2zig firewall show --limit 50
+    \\    fail2zig rule-test --file /var/log/auth.log --service sshd --output table
     \\    fail2zig completions bash > /etc/bash_completion.d/fail2zig
+    \\
+;
+
+pub const help_status =
+    \\fail2zig status — show protection, storage and source health
+    \\
+    \\USAGE:
+    \\    fail2zig status [--details]
+    \\
+    \\FLAGS:
+    \\    --details           Add uptime, memory and memory plan, parse rate, generation
+    \\                        and the tracking pool to the summary rows
+    \\
+    \\ROWS:
+    \\    Protection          active, log-only, mixed, unknown or DEGRADED (cause)
+    \\    Active bans         What the kernel inventory holds right now
+    \\    History             Retained confirmed events (maintenance trims them)
+    \\    Knowledge           fresh, stale or absent, with the age of the last readback
+    \\    Pending             Bans and removals the daemon has not yet confirmed
+    \\    Storage / Cause     Storage phase and the diagnosed cause when not healthy
+    \\    Sources             Count of unhealthy sources; run jails for the per-jail view
+    \\    Paused / Repair     Each paused file source and the exact repair command
+    \\    State file          Size and page use against the configured ceiling
+    \\
+    \\Protection is DEGRADED while any source is paused, storage is recovering or the
+    \\kernel readback is stale; the Cause row says which. A missing log file does not
+    \\degrade protection: jails shows it as missing (FileNotFound).
+    \\
+    \\--output json carries every field; --output plain prints one key per line.
+    \\Exit 0 is reported state, not healthy protection: read the Protection row.
+    \\
+;
+
+pub const help_reload =
+    \\fail2zig reload — apply the configuration file to the running daemon
+    \\
+    \\USAGE:
+    \\    fail2zig reload
+    \\
+    \\The daemon reads its configuration file again and reports one outcome:
+    \\    noop                Nothing changed
+    \\    applied             Every change is live
+    \\    rejected            A jail failed validation (the message names it);
+    \\                        every running jail is unchanged
+    \\    restart_required    Only restart-only keys changed; reasons lists them
+    \\
+    \\Live keys: maxretry, bantime, bantime_kind, bantime_increment and its decay,
+    \\ignoreip, banip and their durations, ignoreself, ignoretime, log_level and a
+    \\custom jail's ignore_file. Adding an enabled jail starts it in the same reload;
+    \\removing a jail lifts its bans and keeps its history. log_format is restart-only;
+    \\the reasons list names every restart-only key that changed.
+    \\
+    \\An ignoreip edit applies from the next event and never alters an existing ban;
+    \\a banip edit bans or lifts at once.
+    \\
+;
+
+pub const help_version =
+    \\fail2zig version — show the client and daemon versions
+    \\
+    \\USAGE:
+    \\    fail2zig version
+    \\
+    \\Prints the client version, then asks the running daemon for its own; the two
+    \\differ until a restart after an upgrade. Exit 3 when the daemon is unreachable.
+    \\fail2zig --version prints the client version without contacting the daemon.
+    \\
+;
+
+pub const help_migrate =
+    \\fail2zig migrate — move from fail2ban in journaled, resumable steps
+    \\
+    \\USAGE:
+    \\    fail2zig migrate inspect --source-dir <dir> [--output json|table]
+    \\    fail2zig migrate snapshot --source-db <file> --staging-dir <dir> [--output json|table]
+    \\    fail2zig migrate plan --source-dir <dir> [--source-db <file> --staging-dir <dir>] --out <plan.json>
+    \\                          [--continuity lossless|reset-replay] [--replay-window <seconds>]
+    \\                          [--runtime-socket <path>] [--output json|table]
+    \\    fail2zig migrate validate --plan <plan.json> [--source-dir <dir>] [--snapshot <file>] [--output json|table]
+    \\    fail2zig migrate cutover --plan <plan.json> --state-file <db> --staging-dir <dir>
+    \\                             --backend nftables|ipset|iptables [--socket <path>] [--run-id <hex>] [--output json|table]
+    \\    fail2zig migrate status --plan <plan.json> --state-file <db> --staging-dir <dir> --run-id <hex> [--output json|table]
+    \\    fail2zig migrate rollback --plan <plan.json> --state-file <db> --staging-dir <dir> --backend <b> --run-id <hex>
+    \\                              [--source-verified] [--socket <path>] [--output json|table]
+    \\
+    \\inspect, snapshot, plan and validate are read-only preparation. cutover stages
+    \\the destination with the daemon stopped and activates it through the daemon; it
+    \\is journaled, prints the --run-id command to resume when the socket is
+    \\unreachable, and a rerun classifies the journal instead of replaying it. status
+    \\reports a run. rollback reverses an activated run in two journaled phases.
+    \\The staging directory must be private (0700) and non-volatile.
+    \\See docs/operations/command-migration.md for the full procedure.
+    \\
+;
+
+pub const help_rule_test =
+    \\fail2zig rule-test — evaluate log input against one rule, offline
+    \\
+    \\USAGE:
+    \\    fail2zig rule-test (--file <path> | --record "<line>" | --journal [<match>...])
+    \\                       (--service <name> | --rule-file <path>)
+    \\                       [--config <path>] [--jail <name>]
+    \\                       [--timestamp iso8601|syslog|epoch_seconds|common_log|undated]
+    \\                       [--time-zone <id>] [--tz-offset <minutes>] [--year <yyyy>]
+    \\                       [--encoding utf8|ascii|latin1|utf16le|utf16be|utf32le|utf32be]
+    \\                       [--identity raw|dns --dns-server <ip:port>] [--ignore <cidr>]...
+    \\                       [--max-lines <n>] [--limit <n>] [--output json|table] [--print-lines]
+    \\                       [--now <epoch-seconds>] [--window <seconds>]
+    \\
+    \\Uses the daemon's own decoder, time admission and detectors against exactly one
+    \\input and one rule: a compiled service (--service) or a native rule file
+    \\(--rule-file). It opens no state, no firewall and no socket. --config with
+    \\--jail takes the timestamp, time zone and ignore settings from a configuration.
+    \\Samples report match, miss, ignore or reject with the reason, identity and
+    \\event time; --print-lines includes the raw lines. Exit 0 when the input was
+    \\processed (even with zero matches), 1 when the rule, configuration or input was
+    \\refused, 2 on usage errors.
+    \\
+    \\EXAMPLES:
+    \\    fail2zig rule-test --file /var/log/auth.log --service sshd --output table
+    \\    fail2zig rule-test --record "Failed password for root from 192.0.2.10 port 22 ssh2" --service sshd
     \\
 ;
 
@@ -1031,14 +1167,15 @@ pub const help_ban =
     \\fail2zig ban — manually ban an IP address
     \\
     \\USAGE:
-    \\    fail2zig ban <ip> --jail <name> [--duration <seconds>] [--scope host|net <cidr>] [--force]
+    \\    fail2zig ban <ip> --jail <name> [--duration <duration>] [--scope host|net <cidr>] [--force]
     \\
     \\ARGS:
     \\    <ip>                IPv4 or IPv6 address (e.g. 192.0.2.10, 2001:db8::1)
     \\
     \\FLAGS:
     \\    --jail <name>       Target jail (required)
-    \\    --duration <s>      Ban duration in seconds (uses jail default if omitted)
+    \\    --duration <d>      Ban length: seconds, or a duration such as 2m or 1h30m
+    \\                        (the jail's bantime if omitted)
     \\    --scope host        Ban the single address (default)
     \\    --scope net <cidr>  Ban the given network instead of the host
     \\    --force             Ban even a loopback address, an address of this host,
@@ -1108,6 +1245,17 @@ pub const help_jails =
     \\Unconfirmed does not mean installed rules are absent. Unknown means no value
     \\was supplied. Plain output preserves the enforcing boolean and uses - for
     \\an unknown active-ban count; a known zero remains 0.
+    \\
+    \\SOURCE HEALTH (HEALTH with --details) is the state of the jail's log source:
+    \\    ok                      Reading normally
+    \\    missing (FileNotFound)  The log file is absent; reading resumes when it
+    \\                            appears, and protection is not affected
+    \\    waiting (<cause>)       The jail waits for room (RetryCapacity or
+    \\                            ReserveBackpressure); nothing is lost and it
+    \\                            continues as room frees up
+    \\    paused (<cause>)        The source stopped until repaired; status prints
+    \\                            the repair command
+    \\    broken (<cause>)        The source cannot be read; the cause names why
     \\
 ;
 
@@ -1284,8 +1432,13 @@ pub const help_support_bundle =
     \\
 ;
 
-pub fn helpFor(topic: ?[]const u8) []const u8 {
-    const t = topic orelse return help_top;
+pub fn helpFor(t: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, t, "help")) return help_top;
+    if (std.mem.eql(u8, t, "status")) return help_status;
+    if (std.mem.eql(u8, t, "reload")) return help_reload;
+    if (std.mem.eql(u8, t, "version")) return help_version;
+    if (std.mem.eql(u8, t, "migrate")) return help_migrate;
+    if (std.mem.eql(u8, t, "rule-test")) return help_rule_test;
     if (std.mem.eql(u8, t, "ban")) return help_ban;
     if (std.mem.eql(u8, t, "unban")) return help_unban;
     if (std.mem.eql(u8, t, "list")) return help_list;
@@ -1299,5 +1452,5 @@ pub fn helpFor(topic: ?[]const u8) []const u8 {
     if (std.mem.eql(u8, t, "ignore")) return help_ignore;
     if (std.mem.eql(u8, t, "repair-source")) return help_repair_source;
     if (std.mem.eql(u8, t, "support-bundle")) return help_support_bundle;
-    return help_top;
+    return null;
 }

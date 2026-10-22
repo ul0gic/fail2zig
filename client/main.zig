@@ -55,7 +55,16 @@ pub fn run(
 
     switch (parsed.command) {
         .help => |topic| {
-            stdout.writeAll(args.helpFor(topic)) catch {};
+            const name = topic orelse {
+                stdout.writeAll(args.help_top) catch {};
+                return .success;
+            };
+            const text = args.helpFor(name) orelse {
+                var echo: [format.diagnostic_max_bytes]u8 = undefined;
+                stderr.print("error: unknown help topic '{s}' (try 'fail2zig help')\n", .{format.escapeArgument(&echo, name)}) catch {};
+                return .client_error;
+            };
+            stdout.writeAll(text) catch {};
             return .success;
         },
         .version => {

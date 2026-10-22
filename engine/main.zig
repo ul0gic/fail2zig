@@ -83,6 +83,7 @@ pub fn classifyEntry(args: []const []const u8) EntryMode {
     if (std.mem.eql(u8, first, "repair-source")) return .repair_source;
     if (std.mem.eql(u8, first, "support-bundle")) return .support_bundle;
     for (operator_words) |w| if (std.mem.eql(u8, first, w)) return .operator;
+    if (first.len > 0 and first[0] != '-' and !std.mem.eql(u8, first, "daemon")) return .operator;
     for (operator_globals) |g| {
         if (std.mem.eql(u8, first, g)) return .operator;
         if (first.len > g.len and std.mem.startsWith(u8, first, g) and first[g.len] == '=') return .operator;
@@ -156,18 +157,29 @@ fn printHelp(w: anytype) !void {
         \\  fail2zig [GLOBALS] <command> [args]         administer a running daemon
         \\
         \\COMMANDS:
-        \\  status | jails | list | ban | unban | reload | version | help | completions
-        \\  config | history | jail | firewall show | stats
-        \\  ban ... [--force]                          ban; --force overrides the guard for this host, loopback and your SSH peer
-        \\  list ... [--origin detection|manual|config] list live bans and expired banip entries by origin
-        \\  ignore add|remove|list ...                 manage per-jail exclusions; ignore add --for D sets an expiry
-        \\  migrate inspect|snapshot|plan|validate|cutover|status|rollback ...
-        \\  rule-test --file|--record|--journal ...   offline rule evaluation (no daemon needed)
-        \\  repair-source --jail J --source PATH --token T --acknowledge-truncation   acknowledge a truncated file source
-        \\                                             (through the running daemon; offline when it is stopped)
-        \\  support-bundle [--out PATH|-] [--include-addresses]   write a redacted diagnostic bundle for a bug report
-        \\  Globals: --socket <path> --output table|json|plain --no-color --timeout <ms>
-        \\  `fail2zig help <command>` documents each command; `fail2zig version` shows client and daemon versions.
+        \\  status                    Protection, storage and source health (--details)
+        \\  stats                     Retained enforcement statistics snapshot
+        \\  jails                     Configured jails with source health (--details)
+        \\  list                      Active bans (--jail, --origin detection|manual|config)
+        \\  ban <ip> --jail <name>    Manual ban (--duration, --scope net <cidr>, --force)
+        \\  unban <ip> --jail <name>  Manual unban
+        \\  ignore add|remove|list    Per-jail exclusions; ignore add --for <duration> sets an expiry
+        \\  history [reset <ip>]      Confirmed ban history, or reset one address's history
+        \\  firewall show|withdraw    Inspect owned kernel protection, or remove it until restart
+        \\  jail <action> <name>      enable, disable, pause or resume a jail
+        \\  reload                    Apply supported configuration changes live
+        \\  config                    The daemon's effective configuration
+        \\  version                   Client and daemon versions
+        \\  completions <shell>       Shell completion script (bash|zsh|fish)
+        \\  help [command]            Help for a command; <command> --help does the same
+        \\
+        \\OFFLINE TOOLS (no daemon needed):
+        \\  rule-test                 Evaluate a log, one line or the journal against a rule
+        \\  migrate <sub>             Inspect, plan and carry out a fail2ban migration
+        \\  repair-source             Acknowledge a truncated or replaced file source
+        \\  support-bundle            Write a redacted diagnostic bundle for a bug report
+        \\
+        \\GLOBALS (administration): --socket <path> --output table|json|plain --no-color --timeout <ms>
         \\
         \\OPTIONS:
         \\  --config <path>           Config file (default: /etc/fail2zig/config.toml)

@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const shared = @import("shared");
+const cli = @import("cli");
 const inspect = @import("../migration/inspect.zig");
 const snapshot = @import("../migration/sqlite_snapshot.zig");
 const plan_mod = @import("../migration/plan.zig");
@@ -14,20 +15,7 @@ pub const ExitClass = shared.ExitClass;
 pub const Output = enum { json, table };
 
 fn usage(stderr: anytype) ExitClass {
-    stderr.writeAll(
-        \\usage:
-        \\  fail2zig migrate inspect --source-dir <dir> [--output json|table]
-        \\  fail2zig migrate snapshot --source-db <file> --staging-dir <dir> [--output json|table]
-        \\  fail2zig migrate plan --source-dir <dir> [--source-db <file> --staging-dir <dir>] --out <plan.json>
-        \\                        [--continuity lossless|reset-replay] [--replay-window <seconds>] [--runtime-socket <path>] [--output json|table]
-        \\  fail2zig migrate validate --plan <plan.json> [--source-dir <dir>] [--snapshot <file>] [--output json|table]
-        \\  fail2zig migrate cutover --plan <plan.json> --state-file <db> --staging-dir <dir> --backend nftables|ipset|iptables
-        \\                           [--socket <path>] [--run-id <hex>] [--output json|table]
-        \\  fail2zig migrate status --plan <plan.json> --state-file <db> --staging-dir <dir> --run-id <hex> [--output json|table]
-        \\  fail2zig migrate rollback --plan <plan.json> --state-file <db> --staging-dir <dir> --backend <b> --run-id <hex>
-        \\                            [--source-verified] [--socket <path>] [--output json|table]
-        \\
-    ) catch {};
+    stderr.writeAll(cli.args.help_migrate) catch {};
     return .usage;
 }
 
@@ -134,6 +122,10 @@ fn parseFlags(args: []const []const u8, stderr: anytype) ?Parsed {
 }
 
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8, tool_version: []const u8, stdout: anytype, stderr: anytype) ExitClass {
+    for (args) |arg| if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+        stdout.writeAll(cli.args.help_migrate) catch return .rejected;
+        return .success;
+    };
     if (args.len == 0) return usage(stderr);
     const sub = args[0];
     const parsed = parseFlags(args[1..], stderr) orelse return usage(stderr);

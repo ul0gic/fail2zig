@@ -26,7 +26,7 @@ const bash_script =
     \\    local cur prev words cword
     \\    _init_completion || return
     \\
-    \\    local subcommands="status stats ban unban list jails reload version config history firewall jail ignore repair-source support-bundle completions help"
+    \\    local subcommands="status stats ban unban list jails reload version config history firewall jail ignore repair-source support-bundle rule-test migrate completions help"
     \\    local global_flags="--socket --output --no-color --timeout --help --version"
     \\
     \\    # Flag-value completion for the previous word.
@@ -49,7 +49,7 @@ const bash_script =
     \\        --origin)
     \\            COMPREPLY=( $(compgen -W "detection manual config" -- "$cur") )
     \\            return 0 ;;
-    \\        --for)
+    \\        --for|--duration)
     \\            return 0 ;;
     \\    esac
     \\
@@ -113,6 +113,10 @@ const bash_script =
     \\            esac ;;
     \\        list)
     \\            COMPREPLY=( $(compgen -W "--jail --origin --details --sort $global_flags" -- "$cur") ) ;;
+    \\        migrate)
+    \\            COMPREPLY=( $(compgen -W "inspect snapshot plan validate cutover status rollback --help" -- "$cur") ) ;;
+    \\        rule-test)
+    \\            COMPREPLY=( $(compgen -W "--file --record --journal --service --rule-file --config --jail --output --print-lines --help" -- "$cur") ) ;;
     \\        completions)
     \\            COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ) ;;
     \\        help)
@@ -151,6 +155,8 @@ const zsh_script =
     \\        'ignore:Manage per-jail exclusions (add, remove, list)'
     \\        'repair-source:Acknowledge a truncated or replaced file source (daemon stopped)'
     \\        'support-bundle:Write a redacted diagnostic bundle for a bug report'
+    \\        'rule-test:Evaluate a log, one line or the journal against a rule (offline)'
+    \\        'migrate:Inspect, plan and carry out a fail2ban migration (offline)'
     \\        'completions:Generate shell completion script'
     \\        'help:Show help for a command'
     \\    )
@@ -179,7 +185,7 @@ const zsh_script =
     \\                ban)
     \\                    _arguments \
     \\                        '--jail[Target jail (required)]:jail name:' \
-    \\                        '--duration[Ban duration in seconds]:seconds:' \
+    \\                        '--duration[Ban length: seconds, or a duration such as 2m or 1h30m]:duration:' \
     \\                        '--scope[Scope: host, or net <cidr>]:scope:(host net)' \
     \\                        '--force[Ban even a loopback, host or SSH peer address]' \
     \\                        $global_flags \
@@ -241,6 +247,19 @@ const zsh_script =
     \\                        '--cursor[Continue the same retained observation]:cursor:' \
     \\                        '--details[Include verified owned structures, entry placement and identifiers]' \
     \\                        $global_flags ;;
+    \\                migrate)
+    \\                    _arguments '1:step:(inspect snapshot plan validate cutover status rollback)' ;;
+    \\                rule-test)
+    \\                    _arguments \
+    \\                        '--file[Log file to evaluate]:path:_files' \
+    \\                        '--record[One log line to evaluate]:line:' \
+    \\                        '--journal[Read the journal]' \
+    \\                        '--service[Compiled service rule]:service:' \
+    \\                        '--rule-file[Native rule file]:path:_files' \
+    \\                        '--config[Native configuration]:path:_files' \
+    \\                        '--jail[Jail whose settings apply]:jail name:' \
+    \\                        '--output[Output format]:format:(json table)' \
+    \\                        '--print-lines[Include the raw lines]' ;;
     \\                completions)
     \\                    _arguments '1:shell:(bash zsh fish)' ;;
     \\                help)
@@ -321,6 +340,8 @@ const fish_script =
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'ignore'       -d 'Manage per-jail exclusions (add, remove, list)'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'repair-source' -d 'Acknowledge a truncated or replaced file source (daemon stopped)'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'support-bundle' -d 'Write a redacted diagnostic bundle for a bug report'
+    \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'rule-test'    -d 'Evaluate a log, one line or the journal against a rule (offline)'
+    \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'migrate'      -d 'Inspect, plan and carry out a fail2ban migration (offline)'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'completions'  -d 'Generate completion script'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'help'         -d 'Show help'
     \\
@@ -334,7 +355,7 @@ const fish_script =
     \\
     \\# Subcommand-specific flags
     \\complete -c fail2zig -n '__fail2zig_client_using_command ban'   -l jail     -x -d 'Target jail'
-    \\complete -c fail2zig -n '__fail2zig_client_using_command ban'   -l duration -x -d 'Ban duration (seconds)'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command ban'   -l duration -x -d 'Ban length: seconds, or a duration such as 2m or 1h30m'
     \\complete -c fail2zig -n '__fail2zig_client_using_command ban'   -l scope    -x -a 'host net' -d 'Scope: host, or net <cidr>'
     \\complete -c fail2zig -n '__fail2zig_client_using_command ban'   -l force    -d 'Ban even a loopback, host or SSH peer address'
     \\complete -c fail2zig -n '__fail2zig_client_using_command unban' -l jail     -x -d 'Target jail'
@@ -362,6 +383,15 @@ const fish_script =
     \\complete -c fail2zig -n '__fail2zig_client_using_command firewall' -l limit  -x -d 'Sample entries per page (1..256)'
     \\complete -c fail2zig -n '__fail2zig_client_using_command firewall' -l cursor -x -d 'Continue the same retained observation'
     \\complete -c fail2zig -n '__fail2zig_client_using_command firewall' -l details -d 'Include verified owned structures, entry placement and identifiers'
+    \\
+    \\complete -c fail2zig -f -n '__fail2zig_client_using_command migrate; and not __fish_seen_subcommand_from inspect snapshot plan validate cutover status rollback' -a 'inspect snapshot plan validate cutover status rollback' -d 'Migration step'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command rule-test' -l file -r -d 'Log file to evaluate'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command rule-test' -l record -x -d 'One log line to evaluate'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command rule-test' -l journal -d 'Read the journal'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command rule-test' -l service -x -d 'Compiled service rule'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command rule-test' -l rule-file -r -d 'Native rule file'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command rule-test' -l output -x -a 'json table' -d 'Output format'
+    \\complete -c fail2zig -n '__fail2zig_client_using_command rule-test' -l print-lines -d 'Include the raw lines'
     \\
     \\# `completions` subcommand: shell argument
     \\complete -c fail2zig -f -n '__fail2zig_client_using_command completions' -a 'bash zsh fish'
