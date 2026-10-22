@@ -7,12 +7,12 @@ per table, kernel readback counts, memory and the recent warnings and errors.
 
 ## Produce a bundle
 
-Run it as the account the daemon runs as (`fail2zig` with the shipped unit). The state
-file is opened read-only and only by its owner, so running as another user records an
-error in the `state` section instead of the sizes.
+Run it as root. The state file is opened read-only by its owner or by root, and the
+`log` section reads the unit's journal, which the daemon's own account cannot; any other
+account records an error in those sections instead of their contents.
 
 ```bash
-sudo -u fail2zig fail2zig support-bundle --out - > fail2zig-support.json
+sudo fail2zig support-bundle --out - > fail2zig-support.json
 ```
 
 With `--out -` the bundle goes to stdout and your shell writes the file, so the output

@@ -2148,6 +2148,8 @@ const IgnoreOutcome = struct {
     still_ignored_by: []const []const u8 = &.{},
     unban_requested: bool = false,
     bans_total: u32 = 0,
+    jail_enabled: ?bool = null,
+    jail_paused: ?bool = null,
     bans: []const IgnoreBan = &.{},
 };
 
@@ -2367,6 +2369,8 @@ fn writeIgnoreAddTable(writer: anytype, o: IgnoreOutcome) !void {
         try printEscaped(writer, "{} is already a runtime ignore entry in jail {}. Nothing changed.\n", .{ o.address, o.jail });
     } else {
         try printEscaped(writer, "Added runtime ignore entry {} to jail {}.\n", .{ o.address, o.jail });
+        if (o.jail_enabled == false) try printEscaped(writer, "Jail {} is disabled; the entry applies when it is enabled.\n", .{o.jail});
+        if (o.jail_paused == true) try printEscaped(writer, "Jail {} is paused; the entry applies when it resumes.\n", .{o.jail});
         const also_configured = if (o.source) |source| std.mem.eql(u8, source, "config+runtime") else false;
         if (also_configured) {
             try printEscaped(writer, "The configuration also lists {} for {}; its source is now config+runtime.\n", .{ o.address, o.jail });

@@ -455,7 +455,11 @@ fn logSection(bundle: *Bundle, loaded: ?config_mod.Config, limit: u16) !Value {
             .argv = &.{ config_mod.journalctl_path, "--unit=fail2zig.service", "--priority=warning", lines_arg, "--output=short-iso", "--no-pager", "--quiet" },
             .max_output_bytes = @as(usize, max_log_lines) * max_log_line_bytes * 2,
         }) catch |err| return bundle.failed("log", @errorName(err));
-        if (result.term != .Exited or result.term.Exited != 0) return bundle.failed("log", "journalctl did not exit cleanly");
+        if (result.term != .Exited or result.term.Exited != 0) {
+            const reason = std.mem.trim(u8, result.stderr, &std.ascii.whitespace);
+            const first = reason[0 .. std.mem.indexOfScalar(u8, reason, '\n') orelse reason.len];
+            return bundle.failed("log", if (first.len == 0) "journalctl did not exit cleanly" else try std.fmt.allocPrint(arena, "journalctl: {s}", .{first}));
+        }
         try object.put("lines", try keepLast(arena, result.stdout, limit, false, false));
         return .{ .object = object };
     }

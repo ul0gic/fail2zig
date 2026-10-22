@@ -127,7 +127,8 @@ permanent or ending at the entry's stored deadline. `ban` takes over a detection
 receipted and counted and changes no owner. `ban` and `unban` of a `config` ban are
 refused. With one origin per ban, an unban is never hidden behind a second, longer ban of
 another origin. Each takeover is one owner revision and one history event. The origin is
-state, not firewall structure: the kernel still holds one set per jail. States upgraded
+state, not firewall structure: the kernel holds one set per address family, shared by every
+jail. States upgraded
 from v0.4.7 give every existing ban origin `detection`.
 
 The enforcement view follows storage incrementally: a commit that changes up to 64 scopes
@@ -231,7 +232,7 @@ is built by the same per-jail construction as at start. A removed jail's owners 
 released in one transaction, one owner revision each; its retry admission, consumer
 manifests, checkpoints and timed entries are deleted; its confirmed history and retired
 rows are kept, so `history` still shows its bans. Its elements are then withdrawn from
-the kernel and its set deleted once readback shows it empty, and the daemon logs
+the shared kernel sets, which stay in place, and the daemon logs
 `native: jail=<name> removed: <n> bans lifted`. A start that finds state for a jail the
 configuration no longer names retires it the same way before validating owners, instead
 of refusing with `UnconfiguredStateOwner`.

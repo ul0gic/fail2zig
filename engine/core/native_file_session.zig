@@ -491,7 +491,7 @@ pub const Session = struct {
     }
     pub fn awaitingPath(self: *const Session) bool {
         if (self.awaiting_discovery) return true;
-        for (self.sources.sources.items) |source| if (source.awaiting_path or source.named_path != .present) return true;
+        for (self.sources.sources.items) |source| if (source.awaiting_path or source.named_path != .present or source.health == .missing) return true;
         return false;
     }
     pub fn repairSnapshot(self: *const Session) repair.Snapshot {

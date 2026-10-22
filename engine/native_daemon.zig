@@ -643,6 +643,8 @@ pub const Coordinator = struct {
         lifting: bool = false,
         mutated: bool = false,
         expires_us: ?i64 = null,
+        jail_enabled: bool = true,
+        jail_paused: bool = false,
     };
 
     pub fn bindDecay(jail: *Jail) void {

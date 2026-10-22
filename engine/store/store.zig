@@ -480,7 +480,9 @@ pub const Store = struct {
         defer parent.close();
         const parent_stat = std.posix.fstat(parent.fd) catch |failure|
             return openFailure(diagnostic, .parent_stat, error.OpenFailed, openPosixCause(failure), null);
-        if (parent_stat.uid != std.os.linux.geteuid() or parent_stat.mode & 0o022 != 0)
+        const reader_uid = std.os.linux.geteuid();
+        const root_reader = open_mode == .readonly and reader_uid == 0;
+        if ((parent_stat.uid != reader_uid and !root_reader) or parent_stat.mode & 0o022 != 0)
             return openFailure(diagnostic, .parent_permissions, error.UnsafePermissions, null, null);
         const stat = std.posix.fstatat(std.posix.AT.FDCWD, path, std.posix.AT.SYMLINK_NOFOLLOW) catch |failure| blk: {
             if (failure != error.FileNotFound or open_mode == .readonly or open_mode == .preflight or open_mode == .existing)
@@ -493,7 +495,7 @@ pub const Store = struct {
         };
         if (!std.posix.S.ISREG(stat.mode))
             return openFailure(diagnostic, .file_type, error.UnsafePermissions, null, null);
-        if (stat.mode & 0o077 != 0 or stat.uid != std.os.linux.geteuid())
+        if (stat.mode & 0o077 != 0 or (stat.uid != reader_uid and !root_reader))
             return openFailure(diagnostic, .file_permissions, error.UnsafePermissions, null, null);
         const api = embedded_api;
         const filename = allocator.dupeZ(u8, path) catch

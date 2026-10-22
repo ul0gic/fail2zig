@@ -88,6 +88,23 @@ ipset backend's iptables extension and also grants raw socket authority. Keep th
 optional HTTP listener bound to loopback. See [SECURITY.md](../../SECURITY.md)
 and the [runtime architecture](../architecture.md) for the full boundary.
 
+## A second installation in the same network namespace
+
+The daemon owns one nftables table named after its installation. A clean stop leaves that
+table and its rules in place so the next start reconciles them; after `fail2zig firewall
+withdraw` the table stays with empty sets. A second installation started in the same
+namespace with a different state directory finds a table carrying the reserved name that
+its own state does not own and refuses with `ForeignState`, which is the ownership check
+working. Before starting a second installation, or after moving a state directory, remove
+the previous installation's table once its daemon is stopped and withdrawn:
+
+```bash
+sudo nft list tables | grep ' f2z_'
+sudo nft delete table inet f2z_<hash>
+```
+
+An in-place upgrade on the same state directory is unaffected.
+
 ## Upgrading existing state
 
 Stop the daemon and all other state writers before installation. Preserve the

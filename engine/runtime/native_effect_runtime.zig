@@ -333,11 +333,14 @@ pub const Manager = struct {
         self.dropInventory();
         self.events_healthy = false;
         self.status.ready = false;
+        self.backOff();
+        return .{ .wait = self.waitDue() };
+    }
+    fn backOff(self: *Manager) void {
         self.readback_failures +|= 1;
         if (comptime build_options.diag) diag_mod.event(.readback_deferred, .{ .value = self.readback_failures });
         const shift: u4 = @intCast(@min(self.readback_failures - 1, 8));
         self.readback_wait = @min((@as(u16, 1) << shift) - 1, max_readback_wait_turns);
-        return .{ .wait = self.waitDue() };
     }
     pub fn setClockRate(self: *Manager, rate: u32) void {
         self.inspector.clock_rate = rate;
@@ -664,7 +667,8 @@ pub const Manager = struct {
         self.last_readback_wall_us = held.end_us;
         self.events_healthy = self.events_subscribed;
         self.last_generation = null;
-        if (self.status.diagnostic) |diagnostic| if (transientReadback(diagnostic.cause)) {
+        if (self.status.diagnostic) |diagnostic| if (transientReadback(diagnostic.cause) or diagnostic.cause == error.UnownedInstalledEffect) {
+            if (diagnostic.cause == error.UnownedInstalledEffect) std.log.info("native: the kernel set holds only owned elements again; protection restored", .{});
             self.status.diagnostic = null;
             self.status.cause = null;
             self.status.uncertain = false;
@@ -762,7 +766,10 @@ pub const Manager = struct {
             const diag_compare = if (comptime build_options.diag) diag_mod.enter(.compare) else {};
             defer if (comptime build_options.diag) diag_mod.leave(diag_compare);
             errdefer snapshot.deinit();
-            try self.validateAndCaptureObservation(&snapshot, .readback, sampled.prepared_us, .readback);
+            self.validateAndCaptureObservation(&snapshot, .readback, sampled.prepared_us, .readback) catch |failure| {
+                if (failure != error.UnownedInstalledEffect) return failure;
+                return self.unownedElementSeen(&snapshot, failure);
+            };
         }
         self.keepInventory(snapshot, sampled.prepared_us, (try self.clock()).prepared_us, start_ns);
         const evaluated = evaluated_blk: {
@@ -777,6 +784,17 @@ pub const Manager = struct {
         }
         self.status.ready = false;
         return .progress;
+    }
+    fn unownedElementSeen(self: *Manager, snapshot: *firewall.Snapshot, failure: anyerror) Step {
+        snapshot.deinit();
+        if (self.readback_failures == 0) std.log.warn("native: an element the daemon does not own is in its kernel set; protection degraded until an audit finds the set clean", .{});
+        self.dropInventory();
+        self.events_healthy = false;
+        self.status.ready = false;
+        self.status.uncertain = true;
+        self.status.cause = failure;
+        self.backOff();
+        return .{ .wait = self.waitDue() };
     }
     fn expiryDue(self: *const Manager, index: usize, entry: effect.Entry, now_us: i64) bool {
         if (entry.status == .dispatched or self.markers[index] != null) return false;

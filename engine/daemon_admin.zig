@@ -700,6 +700,7 @@ pub fn Methods(comptime Coordinator: type) type {
             try writeIgnoreEntries(w, if (ignore_state) |value| value.configured[0..value.configured_count] else &.{});
             if (!add) return;
             if (request.duration_s != null) if (ignore_state) |value| if (value.expires_us) |deadline| try w.print(",\"expires_us\":{d}", .{deadline});
+            if (ignore_state) |value| try w.print(",\"jail_enabled\":{},\"jail_paused\":{}", .{ value.jail_enabled, value.jail_paused });
             try w.print(",\"unban_requested\":{},\"bans_total\":{d},\"bans\":[", .{ request.unban, if (ignore_state) |value| value.bans_total else 0 });
             if (ignore_state) |value| for (value.bans[0..@min(value.ban_count, max_listed_bans)], 0..) |ban, i| {
                 var scope_buffer: [64]u8 = undefined;
@@ -756,6 +757,8 @@ pub fn Methods(comptime Coordinator: type) type {
         pub fn collectRelatedBans(self: *Coordinator, request: *AdminRequest, jail: *Jail) !void {
             const ignore_state = request.ignore.?;
             const entry = request.ignore_entry.?;
+            ignore_state.jail_enabled = jail.admin_enabled;
+            ignore_state.jail_paused = jail.admin_paused;
             const enforces = self.jailEnforces(jail);
             if (enforces) {
                 self.publishOwners() catch |failure| if (failure != error.StaleEffect) return failure;
@@ -888,6 +891,9 @@ pub fn Methods(comptime Coordinator: type) type {
             for (ignore_state.bans[0..ignore_state.ban_count]) |*ban| if (ban.lift == .pending) {
                 ban.lift = .incomplete;
                 ban.reason = "kernel removal not confirmed within the deadline";
+            };
+            if (ignore_state.lifting) self.publishOwners() catch |failure| if (failure != error.StaleEffect) {
+                std.log.warn("native: owner view not republished after ignore lifts: {s}", .{@errorName(failure)});
             };
             self.completeAdmin(request, self.finishIgnoreAdd(request));
         }

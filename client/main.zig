@@ -529,10 +529,20 @@ pub fn doAdmin(allocator: std.mem.Allocator, globals: args.Globals, stdout: anyt
         .ok => |o| o.payload,
         .err => |e| e.message,
     };
+    if (resp == .err and !isAdminOutcome(allocator, payload)) {
+        format.formatError(stderr, resp.err.code, payload, globals.output, .{ .enabled = false }) catch {};
+        return adminExit(resp);
+    }
     writeAdminOutcome(allocator, stdout, payload, globals.output) catch |e| {
         if (e != error.BrokenPipe) stderr.print("error: failed to format response: {s}\n", .{@errorName(e)}) catch {};
     };
     return adminExit(resp);
+}
+
+fn isAdminOutcome(allocator: std.mem.Allocator, payload: []const u8) bool {
+    const parsed = std.json.parseFromSlice(AdminOutcome, allocator, payload, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return false;
+    parsed.deinit();
+    return true;
 }
 
 fn adminExit(resp: shared.Response) ExitCode {

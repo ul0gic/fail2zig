@@ -694,11 +694,15 @@ unchanged, with the additive keys
 .BR entry ,
 .BR source ,
 .BR covered_by ,
+.BR jail_enabled ,
+.BR jail_paused ,
 .BR unban_requested ,
 .B bans_total
 and
 .BR bans .
-In JSON mode standard output holds one JSON document, and daemon outcomes, refusals included, are printed there.
+In JSON mode standard output holds one JSON document, and daemon outcomes, refusals included, are printed there;
+a refusal that is not an outcome object (a request the IPC layer rejects before the handler, such as a monitor
+peer's mutation) is printed as an error object on standard error with the same exit class.
 .PP
 Exit status is the worst of the entry step and every lift, ranked 5 over 4 over 1 over 0:
 0 when the entry is added or present and no lift was requested or every lift is confirmed;
@@ -838,7 +842,7 @@ Live reload applies supported changes; restart-only settings require a daemon re
 .IP
 Adding or removing a jail is a live change. An added enabled jail starts in the same
 reload. A removed jail is withdrawn last, after every other change has committed: its
-bans are lifted, its set and elements are removed from the kernel, its retry and source
+bans are lifted, its elements are removed from the shared kernel sets, its retry and source
 state is deleted, and its history is kept, so
 .B history \-\-jail
 .I name
