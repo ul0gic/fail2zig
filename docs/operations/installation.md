@@ -1,9 +1,9 @@
 # Installation and upgrades
 
 The [latest release](https://github.com/ul0gic/fail2zig/releases/latest) is the
-recommended installation. v0.4.0 is the minimum supported release; pre-v0.4.0
-installation and rollback are unsupported. The shipped installer does not start or
-restart the service. Review configuration and state before enabling protection.
+recommended installation. v0.4.7 is the minimum supported upgrade source; states last
+written by older releases upgrade through v0.4.7 first (see Upgrades below). The shipped
+installer does not start or restart the service. Review configuration and state before enabling protection.
 
 ## Installer
 
@@ -170,8 +170,8 @@ The installer changes ownership only for the default native SQLite state path
 and refuses custom paths, active writers and legacy binary state. Follow the
 [state upgrade boundary](migration-continuity.md#upgrading-fail2zig-state) before
 replacing an installation; never delete state to bypass a refusal. Released
-v0.3.0 binary state has no automatic converter, and pre-v0.4.0 releases are
-unsupported for installation or rollback.
+v0.3.0 binary state has no automatic converter, and releases before v0.4.7 are not
+an upgrade source: upgrade them through v0.4.7 first, or start from a fresh state.
 
 ## Build from source
 
