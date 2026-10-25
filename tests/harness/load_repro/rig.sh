@@ -35,6 +35,19 @@ timestamp = "iso8601"
 logpath = ["$LOG"]
 maxretry = 1
 EOF
+# attach needs a daemon-written checkpoint per jail, so each extra jail ingests one line before the run.
+for j in $(seq 2 "${JAILS:-1}"); do
+  : > "$WORK/portsentry-$j.log"
+  cat >> "$WORK/config.toml" <<EOF
+[jails.portsentry-$j]
+enabled = true
+filter = "portsentry"
+source = "file"
+timestamp = "iso8601"
+logpath = ["$WORK/portsentry-$j.log"]
+maxretry = 1
+EOF
+done
 ip link set lo up
 echo "rig: starting daemon $BIN" | tee -a "$WORK/rig.log"
 "$BIN" --config "$WORK/config.toml" > "$WORK/daemon.stdout" 2>&1 &
@@ -48,6 +61,21 @@ for i in $(seq 1 300); do
 done
 T1=$(date +%s.%N)
 echo "rig: ready after $(awk -v a="$T0" -v b="$T1" 'BEGIN{printf "%.2f", b-a}') s" | tee -a "$WORK/rig.log"
+if [ "${JAILS:-1}" -gt 1 ]; then
+  for j in $(seq 2 "$JAILS"); do
+    ts=$(date -u +%Y-%m-%dT%H:%M:%S.%3N+0000)
+    echo "$ts Scan from: [198.18.$j.251] (198.18.$j.251) protocol: [TCP] port: [23] type: [Connect] IP opts: [unknown] ignored: [false] triggered: [true] noblock: [true] blocked: [false]" >> "$WORK/portsentry-$j.log"
+  done
+  want=$(( $(wc -l < "$LOG") + JAILS - 1 ))
+  seeded=0
+  for i in $(seq 1 300); do
+    active=$("$BIN" --socket "$SOCK" --timeout 5000 --output json status 2>/dev/null | tr -d '\n' | sed -n 's/.*"active_bans":\([0-9]*\).*/\1/p')
+    [ "$active" = "$want" ] && seeded=1 && break
+    sleep 0.1
+  done
+  if [ "$seeded" != 1 ]; then echo "rig: extra jails not seeded (active_bans=$active, want $want)" | tee -a "$WORK/rig.log"; kill -TERM "$DPID" 2>/dev/null; exit 2; fi
+  echo "rig: seeded $((JAILS - 1)) extra jails, active_bans=$active" | tee -a "$WORK/rig.log"
+fi
 CLK=$(getconf CLK_TCK)
 cpu_ticks() { awk '{print $14+$15}' /proc/$DPID/stat 2>/dev/null || echo 0; }
 sample() {

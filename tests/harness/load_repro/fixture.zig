@@ -12,9 +12,10 @@ const time_policy = engine.core.source_time_policy;
 
 const usage =
     \\usage: f2z-load-fixture <churn|hot|pinned|reuse|oracle-cases> <out-dir> [key=value...]
-    \\       f2z-load-fixture attach <state-dir> jail=NAME count=N [bantime_s=S seed=N evidence=N sync=full|off]
+    \\       f2z-load-fixture attach <state-dir> jail=NAME[,NAME...] count=N [address_start=N normalize=1|0 seed=N evidence=N sync=full|off]
     \\keys: seed count interval_ms bantime_s gap_ms evidence jails churn retention_s max_matches retention=shipped|skip sync=full|off profile=1 (per-statement SQLite VM steps on stderr) audit=full|skip (skip the final-state audit)
-    \\attach appends count bans to the daemon state fail2zig.sqlite in state-dir, under the named jail's own generation and policy
+    \\attach appends count bans to the daemon state fail2zig.sqlite in state-dir, round-robin over up to 16 existing jails under each jail's own generation and policy (bantime_s is ignored),
+    \\with addresses 198.19.0.0/16 from address_start (address_start + count <= 65536); normalize=1 runs the history consumer and retention to the head, normalize=0 leaves the backlog declared
     \\
 ;
 const second_us: i64 = 1_000_000;
@@ -22,6 +23,14 @@ const second_us: i64 = 1_000_000;
 const epoch_us: i64 = 1_767_225_600 * second_us;
 const source_name = "fixture";
 const max_maintenance_steps = 100_000;
+const max_attach_jails = 16;
+// 198.19.0.0/16, disjoint from the rig generator's 198.18.x lines.
+const attach_addresses = 1 << 16;
+// Receipt, effect and maintenance floors reject only a smaller value, so 1 µs keeps receipts distinct and monotonic.
+const attach_step_us: i64 = 1;
+const attach_sample_bans = 1024;
+const batch_records = durable.Store.attribution_batch;
+const Timestamp = @FieldType(durable.Receipt, "time");
 // The daemon binds its history consumer to this constant policy generation.
 fn historyPolicyGeneration() [32]u8 {
     return effects.hashParts("fail2zig-native-confirmed-history-v1", &.{});
@@ -40,6 +49,9 @@ const sqlite3_sql = @extern(*const fn (?*anyopaque) callconv(.c) ?[*:0]const u8,
 const sqlite3_stmt_status = @extern(*const fn (?*anyopaque, c_int, c_int) callconv(.c) c_int, .{ .name = "sqlite3_stmt_status" });
 const sqlite_stmtstatus_fullscan_step: c_int = 1;
 const sqlite_stmtstatus_vm_step: c_int = 4;
+const sqlite3_db_status64 = @extern(*const fn (*anyopaque, c_int, *i64, *i64, c_int) callconv(.c) c_int, .{ .name = "sqlite3_db_status64" });
+const sqlite_dbstatus_cache_hit: c_int = 7;
+const sqlite_dbstatus_cache_miss: c_int = 8;
 
 const Profile = struct {
     const Stat = struct { ns: u64 = 0, calls: u64 = 0, steps: u64 = 0, fullscan: u64 = 0 };
@@ -79,6 +91,18 @@ const Profile = struct {
         entry.value_ptr.fullscan += @intCast(@max(0, sqlite3_stmt_status(statement, sqlite_stmtstatus_fullscan_step, 1)));
         return 0;
     }
+    fn printRow(writer: anytype, sql: []const u8, stat: Stat, total: u64) !void {
+        const share = @as(f64, @floatFromInt(stat.ns)) * 100 / @as(f64, @floatFromInt(@max(total, 1)));
+        try writer.print("{d:6.1}% {d:8.1} ms {d:8} calls {d:12} steps {d:10} steps/call {d:9} fullscan  {s}\n", .{ share, @as(f64, @floatFromInt(stat.ns)) / 1e6, stat.calls, stat.steps, stat.steps / @max(stat.calls, 1), stat.fullscan, sql[0..@min(sql.len, 160)] });
+    }
+    fn capacityCount(sql: []const u8) bool {
+        const prefix = "SELECT count(*) FROM ";
+        if (!std.mem.startsWith(u8, sql, prefix) or !std.mem.endsWith(u8, sql, ";")) return false;
+        const table = sql[prefix.len .. sql.len - 1];
+        if (table.len == 0) return false;
+        for (table) |c| if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
+        return true;
+    }
     fn report(writer: anytype, bans: u64) !void {
         const m = &(map orelse return);
         const Row = struct { sql: []const u8, stat: Stat };
@@ -92,18 +116,66 @@ const Profile = struct {
         }
         std.mem.sort(Row, rows.items, {}, struct {
             fn less(_: void, a: Row, b: Row) bool {
-                return a.stat.steps > b.stat.steps;
+                return a.stat.ns > b.stat.ns;
             }
         }.less);
-        try writer.print("sqlite profile: {d} statements, {d} VM steps total ({d} per ban over {d} bans), {d:.1} ms total at millisecond resolution, {d} dropped\n", .{ rows.items.len, steps_total, if (bans == 0) 0 else steps_total / bans, bans, @as(f64, @floatFromInt(total_ns)) / 1e6, dropped });
-        for (rows.items[0..@min(rows.items.len, 40)]) |row| {
-            const share = @as(f64, @floatFromInt(row.stat.steps)) * 100 / @as(f64, @floatFromInt(@max(steps_total, 1)));
-            try writer.print("{d:6.1}% {d:12} steps {d:8} calls {d:10} steps/call {d:9} fullscan {d:8.1} ms  {s}\n", .{ share, row.stat.steps, row.stat.calls, row.stat.steps / @max(row.stat.calls, 1), row.stat.fullscan, @as(f64, @floatFromInt(row.stat.ns)) / 1e6, row.sql[0..@min(row.sql.len, 160)] });
-        }
+        try writer.print("sqlite profile: {d} statements, {d} VM steps total ({d} per ban over {d} bans), {d:.1} ms total at millisecond resolution, {d} dropped; ranked by elapsed time\n", .{ rows.items.len, steps_total, if (bans == 0) 0 else steps_total / bans, bans, @as(f64, @floatFromInt(total_ns)) / 1e6, dropped });
+        for (rows.items[0..@min(rows.items.len, 40)]) |row| try printRow(writer, row.sql, row.stat, total_ns);
+        try writer.writeAll("capacity counts:\n");
+        for (rows.items) |row| if (capacityCount(row.sql)) try printRow(writer, row.sql, row.stat, total_ns);
         var keys = m.keyIterator();
         while (keys.next()) |key| allocator.free(key.*);
         m.deinit();
         map = null;
+    }
+};
+
+// Times the Store's statement lifecycle; the trace profile sees only execution, never preparation.
+const SqliteApi = struct {
+    const Api = @FieldType(durable.Store, "api");
+    const Stat = struct { calls: u64 = 0, ns: u64 = 0 };
+    var original: Api = undefined;
+    var totals: struct { prepare: Stat = .{}, step: Stat = .{}, finalize: Stat = .{}, exec: Stat = .{} } = .{};
+    var timer: std.time.Timer = undefined;
+    var installed = false;
+
+    fn install(api: *Api) !void {
+        if (!installed) {
+            timer = try std.time.Timer.start();
+            original = api.*;
+            installed = true;
+        }
+        api.prepare = timedPrepare;
+        api.step = timedStep;
+        api.finalize = timedFinalize;
+        api.exec = timedExec;
+    }
+    fn Arg(comptime field: []const u8, comptime index: usize) type {
+        return @typeInfo(@typeInfo(@FieldType(Api, field)).pointer.child).@"fn".params[index].type.?;
+    }
+    fn note(stat: *Stat, started: u64) void {
+        stat.calls += 1;
+        stat.ns += timer.read() - started;
+    }
+    fn timedPrepare(db: Arg("prepare", 0), sql: Arg("prepare", 1), bytes: Arg("prepare", 2), statement: Arg("prepare", 3), tail: Arg("prepare", 4)) callconv(.c) c_int {
+        const started = timer.read();
+        defer note(&totals.prepare, started);
+        return original.prepare(db, sql, bytes, statement, tail);
+    }
+    fn timedStep(statement: Arg("step", 0)) callconv(.c) c_int {
+        const started = timer.read();
+        defer note(&totals.step, started);
+        return original.step(statement);
+    }
+    fn timedFinalize(statement: Arg("finalize", 0)) callconv(.c) c_int {
+        const started = timer.read();
+        defer note(&totals.finalize, started);
+        return original.finalize(statement);
+    }
+    fn timedExec(db: Arg("exec", 0), sql: Arg("exec", 1), callback: Arg("exec", 2), context: Arg("exec", 3), message: Arg("exec", 4)) callconv(.c) c_int {
+        const started = timer.read();
+        defer note(&totals.exec, started);
+        return original.exec(db, sql, callback, context, message);
     }
 };
 
@@ -124,6 +196,8 @@ const Options = struct {
     profile: bool = false,
     audit: AuditMode = .full,
     cache_kib: u64 = 0,
+    normalize: bool = true,
+    address_start: u32 = 0,
 
     fn defaults(shape: Shape) Options {
         return switch (shape) {
@@ -137,8 +211,21 @@ const Options = struct {
     }
     fn set(self: *Options, key: []const u8, value: []const u8) !void {
         if (std.mem.eql(u8, key, "jail")) {
-            if (value.len == 0 or value.len > 64) return error.InvalidOption;
+            var seen: [max_attach_jails][]const u8 = undefined;
+            var count: usize = 0;
+            var names = std.mem.splitScalar(u8, value, ',');
+            while (names.next()) |name| {
+                if (name.len == 0 or name.len > 64 or count == max_attach_jails) return error.InvalidOption;
+                for (seen[0..count]) |prior| if (std.mem.eql(u8, prior, name)) return error.InvalidOption;
+                seen[count] = name;
+                count += 1;
+            }
             self.jail = value;
+            return;
+        }
+        if (std.mem.eql(u8, key, "normalize")) {
+            if (value.len != 1 or (value[0] != '0' and value[0] != '1')) return error.InvalidOption;
+            self.normalize = value[0] == '1';
             return;
         }
         if (std.mem.eql(u8, key, "retention")) {
@@ -158,7 +245,7 @@ const Options = struct {
             self.sync = std.meta.stringToEnum(SyncMode, value) orelse return error.InvalidOption;
             return;
         }
-        inline for (.{ "seed", "count", "interval_ms", "bantime_s", "gap_ms", "evidence", "jails", "churn", "retention_s", "max_matches", "cache_kib" }) |name| {
+        inline for (.{ "seed", "count", "interval_ms", "bantime_s", "gap_ms", "evidence", "jails", "churn", "retention_s", "max_matches", "cache_kib", "address_start" }) |name| {
             if (std.mem.eql(u8, key, name)) {
                 @field(self, name) = try std.fmt.parseInt(@TypeOf(@field(self, name)), value, 10);
                 return;
@@ -166,7 +253,8 @@ const Options = struct {
         }
         return error.InvalidOption;
     }
-    fn validate(self: Options) !void {
+    fn validate(self: Options, shape: Shape) !void {
+        if (shape == .attach and self.address_start + self.count > attach_addresses) return error.InvalidOption;
         if (self.bantime_s == 0 or self.bantime_s > 86_400 * 365 or self.interval_ms == 0 or self.jails == 0 or self.jails > 16 or
             self.evidence > retry.max_evidence_text_bytes or self.retention_s < 0 or self.retention_s > 86_400 * 3650 or
             self.max_matches > 1024 or self.count > 1_000_000 or self.churn > 100_000 or self.gap_ms > 86_400_000) return error.InvalidOption;
@@ -187,7 +275,19 @@ const Clock = struct {
     }
 };
 
-const Jail = struct { name: []const u8, generation: [32]u8, policy: retry.Policy };
+const Jail = struct { name: []const u8, generation: [32]u8, policy: retry.Policy, checkpoint: ?[]u8 = null, records: u64 = 0, appended: u64 = 0 };
+const Chunk = struct { cycle: u64, elapsed_ns: u64, cache_hits: i64, cache_misses: i64 };
+const Timings = struct { open: u64 = 0, restore: u64 = 0, base_catchup: u64 = 0, append: u64 = 0, final_normalize: u64 = 0, close: u64 = 0, audit: u64 = 0 };
+const Schedule = struct { receipt_floor_us: ?i64 = null, admission_floor_us: ?i64 = null, start_us: i64 = 0, end_us: i64 = 0, wall_end_us: i64 = 0, step_us: i64 = attach_step_us, future_dated: bool = false };
+const HistoryProgress = struct { restored_sequence: u64 = 0, base_backlog: u64 = 0, head: u64 = 0, checkpoint: u64 = 0, backlog: u64 = 0 };
+const AttachReport = struct {
+    schedule: Schedule = .{},
+    history: HistoryProgress = .{},
+    timings: Timings = .{},
+    base_live_native_effects: i64 = 0,
+    base_live_effect_owners: i64 = 0,
+    chunks: std.ArrayListUnmanaged(Chunk) = .{},
+};
 const Lease = struct { key: effects.Hash, deadline: i64 };
 const Refusal = struct { cycle: u64, operation: []const u8, error_name: []const u8 };
 const StoreFailure = struct { operation: []const u8, failure: anyerror };
@@ -225,7 +325,7 @@ const Gen = struct {
     refusal: ?Refusal = null,
     maintenance: bool,
     evidence_buffer: [retry.max_evidence_text_bytes]u8 = undefined,
-    checkpoint: ?[]const u8 = null,
+    report: AttachReport = .{},
 
     fn create(allocator: std.mem.Allocator, dir: []const u8, name: []const u8, options: Options, maintenance: bool) !*Gen {
         const path = try std.fmt.allocPrint(allocator, "{s}/{s}.sqlite", .{ dir, name });
@@ -245,13 +345,17 @@ const Gen = struct {
         try std.fs.cwd().access(path, .{});
         const placeholder = try effects.Installation.init([_]u8{1} ** 16, .nftables, "attach");
         const self = try allocator.create(Gen);
-        self.* = .{ .allocator = allocator, .path = path, .options = options, .installation = placeholder, .consumer = try history.Consumer.init(placeholder, historyPolicyGeneration()), .jails = std.ArrayList(Jail).init(allocator), .leases = std.ArrayList(Lease).init(allocator), .phases = std.ArrayList(Phase).init(allocator), .maintenance = false };
+        self.* = .{ .allocator = allocator, .path = path, .options = options, .installation = placeholder, .consumer = try history.Consumer.init(placeholder, historyPolicyGeneration()), .jails = std.ArrayList(Jail).init(allocator), .leases = std.ArrayList(Lease).init(allocator), .phases = std.ArrayList(Phase).init(allocator), .maintenance = options.normalize };
         return self;
     }
     fn destroy(self: *Gen) void {
         self.closeStore();
-        for (self.jails.items) |jail| self.allocator.free(jail.name);
+        for (self.jails.items) |jail| {
+            self.allocator.free(jail.name);
+            if (jail.checkpoint) |checkpoint| self.allocator.free(checkpoint);
+        }
         self.jails.deinit();
+        self.report.chunks.deinit(self.allocator);
         self.leases.deinit();
         self.phases.deinit();
         self.allocator.free(self.path);
@@ -276,7 +380,10 @@ const Gen = struct {
     fn openStore(self: *Gen) !void {
         self.store = try self.stored("Store.openRuntime", durable.Store.openRuntime(self.allocator, self.path));
         self.store_open = true;
-        if (self.options.profile) Profile.install(@ptrCast(self.store.db), self.allocator);
+        if (self.options.profile) {
+            Profile.install(@ptrCast(self.store.db), self.allocator);
+            try SqliteApi.install(&self.store.api);
+        }
         self.store.runtime_path = self.path;
         try self.stored("Store.configureRuntimeLimits", self.store.configureRuntimeLimits());
         // Durability of intermediate commits only; row contents and VM work are unchanged.
@@ -328,9 +435,9 @@ const Gen = struct {
     fn finite(self: *Gen) retry.Duration {
         return .{ .finite_us = @as(i64, @intCast(self.options.bantime_s)) * second_us };
     }
-    fn evidenceText(self: *Gen, length: usize) ?[]const u8 {
+    fn evidenceText(self: *Gen, record: u64, length: usize) ?[]const u8 {
         if (length == 0) return null;
-        const prefix = std.fmt.bufPrint(&self.evidence_buffer, "fixture evidence seed={d} record={d} ", .{ self.options.seed, self.records }) catch self.evidence_buffer[0..0];
+        const prefix = std.fmt.bufPrint(&self.evidence_buffer, "fixture evidence seed={d} record={d} ", .{ self.options.seed, record }) catch self.evidence_buffer[0..0];
         @memset(self.evidence_buffer[prefix.len..], 'x');
         return self.evidence_buffer[0..length];
     }
@@ -350,23 +457,7 @@ const Gen = struct {
         const identity = durable.ReceiptIdentity{ .jail = jail.name, .source = source_name, .occurrence = occurrence, .cursor = occurrence, .raw_hash = raw_hash, .generation = jail.generation };
         const revision = try self.stored("Store.revision", self.store.revision(jail.name));
         const receipt = try self.stored("Store.beginReceipt", self.store.beginReceipt(identity, .{ .us = self.clock.now }, revision));
-        const outcome = try time_policy.evaluate(.timestamped, .{ .parsed = receipt }, receipt, receipt, 1_000);
-        _ = try self.stored("Store.commitRecord", self.store.commitRecord(.{
-            .jail = jail.name,
-            .source = source_name,
-            .occurrence = occurrence,
-            .cursor = occurrence,
-            .raw_hash = raw_hash,
-            .receipt = .{ .time = receipt, .generation = jail.generation },
-            .native_time_outcome = outcome,
-            .native_detection = .{ .kind = .candidate, .generation = jail.generation, .filter = try detection.Name.init("fixture"), .pattern = try detection.Name.init("failure"), .pattern_index = 0, .subject = subject },
-            .native_retry = .{ .generation = jail.generation, .policy = jail.policy, .processing_us = @max(self.clock.now, receipt.us) },
-            .retry_evidence = .{ .text = self.evidenceText(evidence_bytes) },
-            .effects_clock = self.clock.value(),
-            .expected_revision = revision,
-            .disposition = outcome.disposition(),
-            .checkpoint = self.checkpoint orelse "load-fixture",
-        }));
+        _ = try self.stored("Store.commitRecord", self.store.commitRecord(try self.detectionRecord(jail, identity, receipt, subject, self.records, evidence_bytes, revision)));
         self.stats.bans += 1;
         const key = try (try effects.Scope.host(subject)).key(self.installation);
         const entry = try self.stored("Store.readEffect", self.store.readEffect(key, self.installation)) orelse return error.FixtureMissingEffect;
@@ -380,6 +471,109 @@ const Gen = struct {
             try self.leases.append(.{ .key = key, .deadline = entry.desired.finite });
             self.stats.max_active_leases = @max(self.stats.max_active_leases, self.leases.items.len);
         }
+    }
+    fn detectionRecord(self: *Gen, jail: Jail, identity: durable.ReceiptIdentity, receipt: Timestamp, subject: detection.Subject, record: u64, evidence_bytes: usize, revision: u64) !durable.Record {
+        const outcome = try time_policy.evaluate(.timestamped, .{ .parsed = receipt }, receipt, receipt, 1_000);
+        return .{
+            .jail = jail.name,
+            .source = source_name,
+            .occurrence = identity.occurrence,
+            .cursor = identity.cursor,
+            .raw_hash = identity.raw_hash,
+            .receipt = .{ .time = receipt, .generation = jail.generation },
+            .native_time_outcome = outcome,
+            .native_detection = .{ .kind = .candidate, .generation = jail.generation, .filter = try detection.Name.init("fixture"), .pattern = try detection.Name.init("failure"), .pattern_index = 0, .subject = subject },
+            .native_retry = .{ .generation = jail.generation, .policy = jail.policy, .processing_us = @max(self.clock.now, receipt.us) },
+            .retry_evidence = .{ .text = self.evidenceText(record, evidence_bytes) },
+            .effects_clock = self.clock.value(),
+            .expected_revision = revision,
+            .disposition = outcome.disposition(),
+            .checkpoint = jail.checkpoint orelse "load-fixture",
+        };
+    }
+    // One record of a group-commit frame, in the pipeline's stageInFrame order.
+    fn stageBan(self: *Gen, frame: anytype, jail_index: usize, subject: detection.Subject) !effects.Hash {
+        const key = try (try effects.Scope.host(subject)).key(self.installation);
+        const jail = &self.jails.items[jail_index];
+        self.cycle += 1;
+        jail.records += 1;
+        errdefer jail.records -= 1;
+        var occurrence_buffer: [32]u8 = undefined;
+        const occurrence = try std.fmt.bufPrint(&occurrence_buffer, "fx-{d}", .{jail.records});
+        var raw_hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(occurrence, &raw_hash, .{});
+        const identity = durable.ReceiptIdentity{ .jail = jail.name, .source = source_name, .occurrence = occurrence, .cursor = occurrence, .raw_hash = raw_hash, .generation = jail.generation };
+        self.clock.now += attach_step_us;
+        try self.stored("Store.openBatchRecord", self.store.openBatchRecord(frame));
+        errdefer self.store.dropBatchRecord(frame);
+        const revision = try self.stored("Store.revision", self.store.revision(jail.name));
+        const reserved = try self.stored("Store.reserveReceiptStep", self.store.reserveReceiptStep(identity, .{ .us = self.clock.now }, revision));
+        const result = try self.stored("Store.closeBatchRecord", self.store.closeBatchRecord(frame, try self.detectionRecord(jail.*, identity, reserved.time, subject, jail.records, self.options.evidence, revision)));
+        if (result == .already_committed) return error.FixtureRecordAlreadyCommitted;
+        jail.appended += 1;
+        self.stats.bans += 1;
+        return key;
+    }
+    // A refusal inside a frame keeps the records staged before it, as the pipeline does.
+    fn appendChunk(self: *Gen, size: usize) !void {
+        var frame = try self.stored("Store.beginBatch", self.store.beginBatch());
+        var keys: [batch_records]effects.Hash = undefined;
+        var jail_indices: [batch_records]usize = undefined;
+        var staged: usize = 0;
+        const refusal: ?anyerror = for (0..size) |_| {
+            const jail_index: usize = @intCast(self.cycle % self.jails.items.len);
+            keys[staged] = self.stageBan(&frame, jail_index, attachSubject(self.options.address_start + self.cycle)) catch |cause| break cause;
+            jail_indices[staged] = jail_index;
+            staged += 1;
+        } else null;
+        if (staged == 0 or frame.broken) {
+            self.store.rollback();
+            if (staged != 0) return error.FixtureBatchBroken;
+            if (refusal) |cause| return cause;
+            return;
+        }
+        try self.stored("Store.commitBatch", self.store.commitBatch(&frame));
+        try self.settleChunk(keys[0..staged], jail_indices[0..staged]);
+        if (refusal) |cause| return cause;
+    }
+    // One readback per chunk: a single fingerprint and observation time, as the daemon's batched settlement.
+    fn settleChunk(self: *Gen, keys: []const effects.Hash, jail_indices: []const usize) !void {
+        var items: [batch_records]durable.Store.InstallItem = undefined;
+        var count: usize = 0;
+        var sampled: usize = 0;
+        for (keys, 0..) |key, i| {
+            const entry = try self.stored("Store.readEffect", self.store.readEffect(key, self.installation)) orelse return error.FixtureMissingEffect;
+            if (entry.status != .pending) {
+                self.stats.kept_existing += 1;
+                continue;
+            }
+            items[count] = .{ .token = entry.token(), .state = entry.desired };
+            count += 1;
+            sampled = i;
+        }
+        if (count == 0) return;
+        self.clock.now += attach_step_us;
+        var cycle_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &cycle_bytes, self.cycle, .little);
+        const fingerprint = effects.hashParts("fail2zig-load-fixture-readback-v1", &.{&cycle_bytes});
+        _ = try self.stored("Store.settleInstalled", self.store.settleInstalled(items[0..count], self.clock.now, fingerprint, self.clock.now, self.clock.value()));
+        try self.expectConfirmedTargets(keys[sampled], self.jails.items[jail_indices[sampled]].name);
+    }
+    fn expectConfirmedTargets(self: *Gen, key: effects.Hash, jail: []const u8) !void {
+        var owners: [effects.max_page]effects.Owner = undefined;
+        const count = try self.stored("Store.readOwners", self.store.readOwners(key, &owners));
+        for (owners[0..count]) |owner| {
+            if (!std.mem.eql(u8, owner.jail.slice(), jail)) continue;
+            var targets: [action.max_targets_per_action]action.Target = undefined;
+            const found = try self.stored("Store.actionTargets", self.store.actionTargets(owner.decision_id, &targets));
+            for ([_]action.Kind{ .enforcement, .notification }) |kind| {
+                for (targets[0..found]) |target| {
+                    if (target.kind == kind and target.status == .confirmed) break;
+                } else return error.FixtureUnconfirmedActionTarget;
+            }
+            return;
+        }
+        return error.FixtureMissingOwner;
     }
     fn settleActionTargets(self: *Gen, key: effects.Hash, jail: []const u8) !void {
         var owners: [effects.max_page]effects.Owner = undefined;
@@ -457,11 +651,100 @@ const Gen = struct {
         try self.consume(null);
         if (self.maintenance) try self.maintain();
     }
+    // The daemon's restoreHistory sequence; a base without a saved consumer is not a daemon state.
+    fn restoreHistory(self: *Gen) !void {
+        const manifest = self.consumer.manifest();
+        var saved = try self.stored("Store.consumerManifestSnapshot", self.store.consumerManifestSnapshot(self.allocator, manifest));
+        defer saved.deinit(self.allocator);
+        if (saved.status != .ready or saved.count != 1) return error.FixtureMissingHistoryConsumer;
+        const row = saved.states[0];
+        if (row.format_version != history.version or row.valid_until_us != null) return error.FixtureInvalidHistoryCheckpoint;
+        const stage = try self.consumer.prepareRestore(row.revision, row.payload orelse return error.FixtureMissingHistoryConsumer);
+        defer stage.release();
+        var probe: [1]history.Event = undefined;
+        _ = try self.stored("Store.confirmedEffectPage", self.store.confirmedEffectPage(self.installation, self.consumer.staged.last_sequence, null, &probe));
+        try self.stored("Store.validateConsumerManifestSnapshot", self.store.validateConsumerManifestSnapshot(manifest, &saved));
+        stage.publish();
+        self.report.history.restored_sequence = self.consumer.live.last_sequence;
+    }
+    fn addAttachJail(self: *Gen, name: []const u8) !void {
+        var generation: [32]u8 = undefined;
+        var policy: retry.Policy = undefined;
+        {
+            var row = try self.store.statement("SELECT generation,policy FROM retry_policies WHERE jail=?1;");
+            defer row.deinit();
+            try row.text(1, name);
+            if (!try row.row()) return error.FixtureUnknownJail;
+            generation = (try row.boundedBytes(0, 32))[0..32].*;
+            policy = try retry.Policy.decode(try row.boundedBytes(1, 4096));
+        }
+        const owned = try self.allocator.dupe(u8, name);
+        self.jails.append(.{ .name = owned, .generation = generation, .policy = policy }) catch |failure| {
+            self.allocator.free(owned);
+            return failure;
+        };
+        const jail = &self.jails.items[self.jails.items.len - 1];
+        {
+            var existing = try self.store.statement("SELECT count(*) FROM records WHERE jail=?1 AND source=?2;");
+            defer existing.deinit();
+            try existing.text(1, name);
+            try existing.text(2, source_name);
+            if (!try existing.row()) return error.FixtureMissingInstallation;
+            jail.records = @intCast(try existing.signed(0));
+        }
+        // The jail's pipeline restores from the latest record's checkpoint, so every appended record carries the one the daemon wrote.
+        jail.checkpoint = try self.stored("Store.checkpoint", self.store.checkpoint(self.allocator, name)) orelse return error.FixtureMissingCheckpoint;
+    }
+    // Starts at or above every persisted floor and never lowers one; a floor past wall time is reported, not repaired.
+    fn scheduleClock(self: *Gen) !void {
+        const schedule = &self.report.schedule;
+        const wall = std.time.microTimestamp();
+        if (try self.stored("Store.receiptClock", self.store.receiptClock())) |floor| schedule.receipt_floor_us = floor.us;
+        if (try self.stored("Store.admissionClock", self.store.admissionClock())) |floor| schedule.admission_floor_us = floor.us;
+        const floor = @max(schedule.receipt_floor_us orelse wall, schedule.admission_floor_us orelse wall);
+        schedule.future_dated = floor > wall;
+        schedule.start_us = @max(wall, floor);
+        self.clock.now = schedule.start_us;
+    }
+    fn appendBans(self: *Gen) !void {
+        var sample = try std.time.Timer.start();
+        _ = try self.cacheSample();
+        while (self.cycle < self.options.count) {
+            self.syncClock();
+            try self.appendChunk(@intCast(@min(batch_records, self.options.count - self.cycle)));
+            if (self.options.normalize) try self.turn();
+            if (self.cycle % attach_sample_bans == 0 or self.cycle == self.options.count) try self.sampleChunk(&sample);
+            if (self.cycle % 4096 == 0) try self.phase("progress");
+        }
+    }
+    fn recordEnd(self: *Gen) !void {
+        const report = &self.report;
+        report.history.head = std.math.cast(u64, try self.store.integer("SELECT head FROM confirmed_history_stream WHERE id=1;")) orelse return error.FixtureUnexpectedValue;
+        report.history.checkpoint = self.consumer.live.last_sequence;
+        report.history.backlog = report.history.head -| report.history.checkpoint;
+        report.schedule.end_us = self.clock.now;
+        report.schedule.wall_end_us = std.time.microTimestamp();
+    }
+    fn syncClock(self: *Gen) void {
+        self.clock.now = @max(self.clock.now, std.time.microTimestamp());
+    }
+    fn cacheSample(self: *Gen) !struct { hits: i64, misses: i64 } {
+        var hits: i64 = 0;
+        var misses: i64 = 0;
+        var highwater: i64 = 0;
+        if (sqlite3_db_status64(@ptrCast(self.store.db), sqlite_dbstatus_cache_hit, &hits, &highwater, 1) != 0) return error.FixtureCacheStatus;
+        if (sqlite3_db_status64(@ptrCast(self.store.db), sqlite_dbstatus_cache_miss, &misses, &highwater, 1) != 0) return error.FixtureCacheStatus;
+        return .{ .hits = hits, .misses = misses };
+    }
+    fn sampleChunk(self: *Gen, timer: *std.time.Timer) !void {
+        const cache = try self.cacheSample();
+        try self.report.chunks.append(self.allocator, .{ .cycle = self.cycle, .elapsed_ns = timer.lap(), .cache_hits = cache.hits, .cache_misses = cache.misses });
+    }
     fn phase(self: *Gen, label: []const u8) !void {
         var item = Phase{ .label = label, .cycle = self.cycle, .clock_us = self.clock.now, .counts = undefined, .retained_from = 0, .head = 0 };
         for (key_tables, 0..) |table, i| {
             var buffer: [96]u8 = undefined;
-            item.counts[i] = try self.store.integer(try std.fmt.bufPrintZ(&buffer, "SELECT count(*) FROM {s};", .{table}));
+            item.counts[i] = try self.store.integer(try std.fmt.bufPrintZ(&buffer, "SELECT count(*) AS n FROM {s};", .{table}));
         }
         item.retained_from = try self.store.integer("SELECT retained_from FROM confirmed_history_stream WHERE id=1;");
         item.head = try self.store.integer("SELECT head FROM confirmed_history_stream WHERE id=1;");
@@ -490,6 +773,9 @@ fn churnSubject(seed: u64, index: u64) detection.Subject {
     var bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &bytes, base + offset, .big);
     return .{ .v4 = bytes };
+}
+fn attachSubject(index: u64) detection.Subject {
+    return .{ .v4 = .{ 198, 19, @intCast(index >> 8 & 0xff), @intCast(index & 0xff) } };
 }
 fn host(a: u8, b: u8, c: u8, d: u8) detection.Subject {
     return .{ .v4 = .{ a, b, c, d } };
@@ -545,51 +831,46 @@ fn runPinned(gen: *Gen) !void {
     try gen.phase("after-retention-age");
 }
 fn runAttach(gen: *Gen) !void {
+    const report = &gen.report;
+    var timer = try std.time.Timer.start();
     try gen.openStore();
     gen.installation = try gen.stored("Store.readInstallation", gen.store.readInstallation()) orelse return error.FixtureMissingInstallation;
     gen.consumer = try history.Consumer.init(gen.installation, historyPolicyGeneration());
-    var generation: [32]u8 = undefined;
-    var policy: retry.Policy = undefined;
-    {
-        var row = try gen.store.statement("SELECT generation,policy FROM retry_policies WHERE jail=?1;");
-        defer row.deinit();
-        try row.text(1, gen.options.jail);
-        if (!try row.row()) return error.FixtureUnknownJail;
-        generation = (try row.boundedBytes(0, 32))[0..32].*;
-        policy = try retry.Policy.decode(try row.boundedBytes(1, 4096));
+    report.timings.open = timer.lap();
+    try gen.restoreHistory();
+    report.timings.restore = timer.lap();
+    var names = std.mem.splitScalar(u8, gen.options.jail, ',');
+    while (names.next()) |name| try gen.addAttachJail(name);
+    try gen.scheduleClock();
+    report.base_live_native_effects = try gen.store.integer("SELECT count(*) FROM native_effects WHERE lease_kind<>0;");
+    report.base_live_effect_owners = try gen.store.integer("SELECT count(*) FROM effect_owners WHERE lease_kind<>0;");
+    report.timings.open += timer.lap();
+    if (gen.options.normalize) {
+        try gen.consume(null);
+        report.history.base_backlog = gen.consumer.live.last_sequence - report.history.restored_sequence;
     }
-    const owned = try gen.allocator.dupe(u8, gen.options.jail);
-    gen.jails.append(.{ .name = owned, .generation = generation, .policy = policy }) catch |failure| {
-        gen.allocator.free(owned);
+    report.timings.base_catchup = timer.lap();
+    gen.appendBans() catch |failure| {
+        report.timings.append = timer.lap();
+        try gen.recordEnd();
         return failure;
     };
-    {
-        var existing = try gen.store.statement("SELECT count(*) FROM records WHERE jail=?1 AND source=?2;");
-        defer existing.deinit();
-        try existing.text(1, owned);
-        try existing.text(2, source_name);
-        if (!try existing.row()) return error.FixtureMissingInstallation;
-        gen.records = @intCast(try existing.signed(0));
+    report.timings.append = timer.lap();
+    gen.stats.ban_loop_ms = report.timings.append / std.time.ns_per_ms;
+    if (gen.options.normalize) {
+        gen.syncClock();
+        try gen.turn();
     }
-    // The jail's pipeline restores from the latest record's checkpoint, so every appended record carries the one the daemon wrote.
-    const checkpoint = try gen.stored("Store.checkpoint", gen.store.checkpoint(gen.allocator, gen.options.jail)) orelse return error.FixtureMissingCheckpoint;
-    defer gen.allocator.free(checkpoint);
-    gen.checkpoint = checkpoint;
-    gen.clock.now = std.time.microTimestamp();
-    const loop_started_ms = std.time.milliTimestamp();
-    while (gen.cycle < gen.options.count) {
-        gen.cycle += 1;
-        gen.clock.advanceMs(1);
-        try gen.ban(0, churnSubject(gen.options.seed, gen.cycle), gen.options.evidence);
-        if (gen.cycle % 4096 == 0) try gen.phase("progress");
-    }
-    gen.stats.ban_loop_ms = @intCast(@max(0, std.time.milliTimestamp() - loop_started_ms));
     // The daemon resumes every source cursor of the jail as a file position; the fixture's source has none.
-    var cursor = try gen.store.statement("DELETE FROM source_cursors WHERE jail=?1 AND source=?2;");
-    defer cursor.deinit();
-    try cursor.text(1, owned);
-    try cursor.text(2, source_name);
-    try cursor.done();
+    for (gen.jails.items) |jail| {
+        var cursor = try gen.store.statement("DELETE FROM source_cursors WHERE jail=?1 AND source=?2;");
+        defer cursor.deinit();
+        try cursor.text(1, jail.name);
+        try cursor.text(2, source_name);
+        try cursor.done();
+    }
+    report.timings.final_normalize = timer.lap();
+    try gen.recordEnd();
     try gen.phase("final");
 }
 fn runReuse(gen: *Gen) !void {
@@ -941,7 +1222,7 @@ fn fileSha256(path: []const u8, out: *[64]u8) !void {
 
 const Outcome = struct { harness_failure: ?[]const u8 = null };
 
-fn runCase(gen: *Gen, body: anytype, args: anytype) Outcome {
+fn runCase(gen: *Gen, body: anytype, args: anytype) !Outcome {
     var outcome = Outcome{};
     @call(.auto, body, args) catch |failure| {
         const from_store = if (gen.store_failure) |recorded| recorded.failure == failure else false;
@@ -949,8 +1230,114 @@ fn runCase(gen: *Gen, body: anytype, args: anytype) Outcome {
             gen.refusal = .{ .cycle = gen.cycle, .operation = gen.store_failure.?.operation, .error_name = @errorName(failure) };
         } else outcome.harness_failure = @errorName(failure);
     };
+    var timer = try std.time.Timer.start();
     gen.closeStore();
+    gen.report.timings.close = timer.read();
     return outcome;
+}
+
+const Publication = struct {
+    claimed: bool,
+    failures: std.BoundedArray([]const u8, 16) = .{},
+    fn ok(self: *const Publication) bool {
+        return self.claimed and self.failures.len == 0;
+    }
+};
+fn checkPublication(gen: *Gen, harness_failure: ?[]const u8) !Publication {
+    var result = Publication{ .claimed = gen.options.normalize };
+    if (!result.claimed) return result;
+    if (harness_failure != null) try result.failures.append("harness_failure");
+    if (gen.refusal != null) try result.failures.append("first_refusal");
+    if (gen.report.schedule.future_dated) try result.failures.append("clock_future_dated");
+    if (gen.stats.kept_existing != 0) try result.failures.append("kept_existing");
+    if (harness_failure != null) return result;
+    var store = try durable.Store.openReadOnly(gen.allocator, gen.path);
+    defer store.close();
+    const count: i64 = @intCast(gen.options.count);
+    if (try store.integer("SELECT head FROM confirmed_history_stream WHERE id=1;") != gen.consumer.live.last_sequence) try result.failures.append("history_head_not_at_checkpoint");
+    if (try store.integer("SELECT count(*) FROM pending_receipts;") != 0) try result.failures.append("pending_receipts");
+    // Spent-scope pruning removes only scopes and owners whose lease is spent, and attach runs no expiry, so live rows change only by the appended bans.
+    if (try store.integer("SELECT count(*) FROM native_effects WHERE lease_kind<>0;") - gen.report.base_live_native_effects != count) try result.failures.append("live_native_effects_delta");
+    if (try store.integer("SELECT count(*) FROM effect_owners WHERE lease_kind<>0;") - gen.report.base_live_effect_owners != count) try result.failures.append("live_effect_owners_delta");
+    if (try store.integer("SELECT count(*) FROM action_targets WHERE status<>3;") != 0) try result.failures.append("unconfirmed_action_targets");
+    return result;
+}
+
+fn writeAttach(ws: anytype, gen: *Gen, publication: *const Publication) !void {
+    const report = &gen.report;
+    try ws.objectField("attach");
+    try ws.beginObject();
+    try ws.objectField("attempted");
+    try ws.write(gen.cycle);
+    try ws.objectField("committed");
+    try ws.write(gen.stats.bans);
+    try ws.objectField("batch_records");
+    try ws.write(batch_records);
+    try ws.objectField("jails");
+    try ws.beginArray();
+    for (gen.jails.items) |jail| {
+        try ws.beginObject();
+        try ws.objectField("name");
+        try ws.write(jail.name);
+        try ws.objectField("generation");
+        try writeHex(ws, &jail.generation);
+        try ws.objectField("policy");
+        try ws.write(jail.policy);
+        try ws.objectField("records_after");
+        try ws.write(jail.records);
+        try ws.objectField("appended");
+        try ws.write(jail.appended);
+        try ws.endObject();
+    }
+    try ws.endArray();
+    try ws.objectField("addresses");
+    try ws.beginObject();
+    try ws.objectField("first");
+    try writeAddress(ws, gen.options.address_start);
+    try ws.objectField("last");
+    if (gen.stats.bans == 0) try ws.write(null) else try writeAddress(ws, gen.options.address_start + gen.stats.bans - 1);
+    try ws.endObject();
+    try ws.objectField("clock");
+    try ws.write(report.schedule);
+    try ws.objectField("history");
+    try ws.beginObject();
+    try ws.objectField("normalize");
+    try ws.write(gen.options.normalize);
+    try ws.objectField("restored_sequence");
+    try ws.write(report.history.restored_sequence);
+    try ws.objectField("base_backlog");
+    try ws.write(report.history.base_backlog);
+    try ws.objectField("head");
+    try ws.write(report.history.head);
+    try ws.objectField("checkpoint");
+    try ws.write(report.history.checkpoint);
+    try ws.objectField("backlog");
+    try ws.write(report.history.backlog);
+    try ws.endObject();
+    try ws.objectField("base_counts");
+    try ws.beginObject();
+    try ws.objectField("live_native_effects");
+    try ws.write(report.base_live_native_effects);
+    try ws.objectField("live_effect_owners");
+    try ws.write(report.base_live_effect_owners);
+    try ws.endObject();
+    try ws.objectField("chunks");
+    try ws.write(report.chunks.items);
+    try ws.objectField("publication");
+    try ws.beginObject();
+    try ws.objectField("claimed");
+    try ws.write(publication.claimed);
+    try ws.objectField("ok");
+    try ws.write(publication.ok());
+    try ws.objectField("failures");
+    try ws.write(publication.failures.constSlice());
+    try ws.endObject();
+    try ws.endObject();
+}
+fn writeAddress(ws: anytype, index: u64) !void {
+    var buffer: [16]u8 = undefined;
+    const subject = attachSubject(index);
+    try ws.write(try std.fmt.bufPrint(&buffer, "{d}.{d}.{d}.{d}", .{ subject.v4[0], subject.v4[1], subject.v4[2], subject.v4[3] }));
 }
 
 pub fn main() !u8 {
@@ -979,7 +1366,7 @@ pub fn main() !u8 {
             return 2;
         };
     }
-    options.validate() catch {
+    options.validate(shape) catch {
         try stderr.writeAll("option out of range\n");
         return 2;
     };
@@ -1016,7 +1403,11 @@ pub fn main() !u8 {
     try ws.objectField("options");
     try ws.write(options);
     try ws.objectField("construction");
-    try ws.write(if (shape == .@"oracle-cases")
+    try ws.write(if (shape == .attach and options.normalize)
+        "attach: production Store APIs in group-commit frames with batched settlement; history consumer restored, run with retention after every frame and left at the head; recurrence not processed (fresh distinct subjects)"
+    else if (shape == .attach)
+        "attach: production Store APIs in group-commit frames with batched settlement; history consumer restored but not run, so the appended backlog is declared in attach.history.backlog; recurrence not processed"
+    else if (shape == .@"oracle-cases")
         "production Store APIs; retention maintenance not run during construction"
     else if (options.retention == .skip)
         "diagnostic: production Store APIs with the shipped retention step skipped; not an untouched daemon baseline"
@@ -1038,7 +1429,7 @@ pub fn main() !u8 {
                 for (snapshots.items) |item| allocator.free(item.path);
                 snapshots.deinit();
             }
-            const outcome = runCase(gen, struct {
+            const outcome = try runCase(gen, struct {
                 fn body(g: *Gen, d: []const u8, s: *std.ArrayList(Snapshot), c: OracleCase) !void {
                     try g.setup();
                     try c.build(g, d, s);
@@ -1065,19 +1456,34 @@ pub fn main() !u8 {
         const gen = if (shape == .attach) try Gen.attach(allocator, dir, options) else try Gen.create(allocator, dir, @tagName(shape), options, true);
         defer gen.destroy();
         const outcome = switch (shape) {
-            .churn => runCase(gen, runChurn, .{gen}),
-            .hot => runCase(gen, runHot, .{gen}),
-            .pinned => runCase(gen, runPinned, .{gen}),
-            .reuse => runCase(gen, runReuse, .{gen}),
-            .attach => runCase(gen, runAttach, .{gen}),
+            .churn => try runCase(gen, runChurn, .{gen}),
+            .hot => try runCase(gen, runHot, .{gen}),
+            .pinned => try runCase(gen, runPinned, .{gen}),
+            .reuse => try runCase(gen, runReuse, .{gen}),
+            .attach => try runCase(gen, runAttach, .{gen}),
             .@"oracle-cases" => unreachable,
         };
         if (outcome.harness_failure != null) failed = true;
         try ws.objectField("harness_failure");
         try ws.write(outcome.harness_failure);
         try writeGen(&ws, gen);
+        if (shape == .attach) {
+            const publication = try checkPublication(gen, outcome.harness_failure);
+            try writeAttach(&ws, gen, &publication);
+            if (gen.refusal != null or (publication.claimed and !publication.ok())) failed = true;
+        }
+        var audit_timer = try std.time.Timer.start();
         try ws.objectField("state");
         if (options.audit == .full) try writeState(&ws, gen, "final", gen.path) else try ws.write(null);
+        gen.report.timings.audit = audit_timer.read();
+        if (shape == .attach) {
+            try ws.objectField("timing_ns");
+            try ws.write(gen.report.timings);
+        }
+    }
+    if (options.profile) {
+        try ws.objectField("sqlite_api");
+        try ws.write(SqliteApi.totals);
     }
     try ws.objectField("runtime_ms");
     try ws.write(timer.read() / std.time.ns_per_ms);
@@ -1086,7 +1492,7 @@ pub fn main() !u8 {
     try std.fs.cwd().writeFile(.{ .sub_path = manifest_path, .data = output.items, .flags = .{ .mode = 0o600, .exclusive = true } });
     if (options.profile) try Profile.report(stderr, options.count);
     if (failed) {
-        try stderr.writeAll("fixture harness failure; see manifest harness_failure and first_refusal\n");
+        try stderr.writeAll("fixture failure; see manifest harness_failure, first_refusal and attach.publication\n");
         return 1;
     }
     return 0;
