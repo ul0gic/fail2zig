@@ -153,18 +153,18 @@ pub fn Methods(comptime Store: type) type {
             const live_after = live + own.live_owners;
             if (live_after > effects.max_live_owners) return error.ReserveBackpressure;
             const unsettled_after = @max(0, live_after - (try self.integer("SELECT count(*) FROM confirmation_markers;") - own.retired_markers));
-            const limits = [_]struct { sql: [:0]const u8, own: i64, reserve: i64, cap: i64 }{
-                .{ .sql = "SELECT count(*) FROM effect_owners;", .own = own.owners, .reserve = 0, .cap = effects.max_owners },
-                .{ .sql = "SELECT count(*) FROM native_effects;", .own = own.effects, .reserve = 0, .cap = effects.max_effects },
-                .{ .sql = "SELECT count(*) FROM effect_owner_revisions;", .own = own.revisions, .reserve = live_after, .cap = effects.max_owner_revisions },
-                .{ .sql = "SELECT count(*) FROM effect_intents;", .own = own.intents, .reserve = live_after, .cap = effects.max_intents },
-                .{ .sql = "SELECT count(*) FROM effect_observations;", .own = own.observations, .reserve = live_after * observations_per_intent, .cap = effects.max_observations },
-                .{ .sql = "SELECT count(*) FROM action_targets;", .own = own.targets, .reserve = 0, .cap = action_outcome.max_rows },
-                .{ .sql = "SELECT count(*) FROM confirmed_effect_events;", .own = 0, .reserve = unsettled_after, .cap = effects.max_confirmed_events },
-                .{ .sql = "SELECT count(*) FROM confirmed_event_details;", .own = 0, .reserve = unsettled_after, .cap = application_history.max_details },
+            const limits = [_]struct { table: store.TalliedTable, own: i64, reserve: i64, cap: i64 }{
+                .{ .table = .effect_owners, .own = own.owners, .reserve = 0, .cap = effects.max_owners },
+                .{ .table = .native_effects, .own = own.effects, .reserve = 0, .cap = effects.max_effects },
+                .{ .table = .effect_owner_revisions, .own = own.revisions, .reserve = live_after, .cap = effects.max_owner_revisions },
+                .{ .table = .effect_intents, .own = own.intents, .reserve = live_after, .cap = effects.max_intents },
+                .{ .table = .effect_observations, .own = own.observations, .reserve = live_after * observations_per_intent, .cap = effects.max_observations },
+                .{ .table = .action_targets, .own = own.targets, .reserve = 0, .cap = action_outcome.max_rows },
+                .{ .table = .confirmed_effect_events, .own = 0, .reserve = unsettled_after, .cap = effects.max_confirmed_events },
+                .{ .table = .confirmed_event_details, .own = 0, .reserve = unsettled_after, .cap = application_history.max_details },
             };
             for (limits) |limit| {
-                if (try self.integer(limit.sql) + limit.own + limit.reserve > limit.cap) return error.ReserveBackpressure;
+                if (try self.tableRows(limit.table) + limit.own + limit.reserve > limit.cap) return error.ReserveBackpressure;
             }
         }
 
@@ -455,7 +455,7 @@ pub fn Methods(comptime Store: type) type {
                 },
             };
             const id = effects.intentId(installation.id, key, decision_id, effect_revision, lease);
-            if (try self.integer("SELECT count(*) FROM effect_intents;") >= effects.max_intents) return error.EffectCapacity;
+            if (try self.tableRows(.effect_intents) >= effects.max_intents) return error.EffectCapacity;
             {
                 var old = try self.statement("UPDATE effect_intents SET status=CASE WHEN lease_kind=1 AND deadline_us<=?2 THEN 6 ELSE 5 END WHERE scope_key=?1 AND status=1;");
                 defer old.deinit();
@@ -471,6 +471,7 @@ pub fn Methods(comptime Store: type) type {
                 try bindEffectLease(&intent, 5, lease);
                 try intent.int(7, now);
                 try intent.done();
+                self.insertedRows(.effect_intents, 1);
                 var aggregate = try self.statement("UPDATE native_effects SET revision=?2,lease_kind=?3,deadline_us=?4,intent_id=?5 WHERE scope_key=?1;");
                 defer aggregate.deinit();
                 try aggregate.blob(1, &key);
@@ -532,14 +533,14 @@ pub fn Methods(comptime Store: type) type {
                 .live_owners = @as(i64, @intFromBool(is_live)) - @intFromBool(was_live),
                 .retired_markers = retired_markers,
             });
-            if (try self.integer("SELECT count(*) FROM effect_owner_revisions;") >= effects.max_owner_revisions) return error.EffectCapacity;
+            if (try self.tableRows(.effect_owner_revisions) >= effects.max_owner_revisions) return error.EffectCapacity;
             if (owner_revision == 0) {
-                if (count == effects.max_page or try self.integer("SELECT count(*) FROM effect_owners;") >= effects.max_owners) return error.EffectCapacity;
+                if (count == effects.max_page or try self.tableRows(.effect_owners) >= effects.max_owners) return error.EffectCapacity;
             }
             const effect_revision = if (previous) |entry| std.math.add(u64, entry.revision, 1) catch return error.EffectCapacity else 1;
             if (effect_revision > std.math.maxInt(i64)) return error.EffectCapacity;
             if (previous == null) {
-                if (try self.integer("SELECT count(*) FROM native_effects;") >= effects.max_effects) return error.EffectCapacity;
+                if (try self.tableRows(.native_effects) >= effects.max_effects) return error.EffectCapacity;
                 const legacy_wire = change.scope.encode() catch [_]u8{0} ** effects.Scope.encoded_bytes;
                 const canonical_wire = try change.scope.encodeCanonical();
                 var row = try self.statement(if (self.schema_version >= 19)
@@ -551,6 +552,7 @@ pub fn Methods(comptime Store: type) type {
                 try row.blob(2, &legacy_wire);
                 if (self.schema_version >= 19) try row.blob(3, &canonical_wire);
                 try row.done();
+                self.insertedRows(.native_effects, 1);
             }
             if (replaced) |owner| try self.retireOwnerDecisionTx(key, change.jail, owner.decision_id, now);
             {
@@ -570,6 +572,9 @@ pub fn Methods(comptime Store: type) type {
                     try owner.int(9, @intFromEnum(change.origin));
                 } else if (change.origin != .detection) return error.EffectStorageRequired;
                 try owner.done();
+                if (replaced == null) self.insertedRows(.effect_owners, 1);
+                // The effect_owner_insert and effect_owner_update triggers each add one revision row.
+                self.insertedRows(.effect_owner_revisions, 1);
             }
             try self.fault(.after_effect_owner);
             return self.replaceEffectIntent(installation, change.scope, key, effect_revision, change.decision_id, now);
@@ -627,7 +632,7 @@ pub fn Methods(comptime Store: type) type {
                 .retain => if (reserve) try self.reserveEffectRows(.{ .revisions = 1, .intents = 1, .observations = observations_per_intent }),
                 .release => try self.retireOwnerDecisionTx(key, change.jail, null, now),
             }
-            if (try self.integer("SELECT count(*) FROM effect_owner_revisions;") >= effects.max_owner_revisions) return error.EffectCapacity;
+            if (try self.tableRows(.effect_owner_revisions) >= effects.max_owner_revisions) return error.EffectCapacity;
             const effect_revision = std.math.add(u64, prior.revision, 1) catch return error.EffectCapacity;
             if (effect_revision > std.math.maxInt(i64)) return error.EffectCapacity;
             {
@@ -641,6 +646,7 @@ pub fn Methods(comptime Store: type) type {
                 try bindEffectLease(&update, 6, if (change.mode == .release) .absent else owner.lease);
                 try update.done();
                 if (self.api.changes(self.db) != 1) return error.StaleEffect;
+                self.insertedRows(.effect_owner_revisions, 1);
             }
             try self.fault(.after_effect_owner);
             return .{ .entry = try self.replaceEffectIntent(installation, scope, key, effect_revision, change.transition_id, now), .changed = true };
@@ -749,7 +755,7 @@ pub fn Methods(comptime Store: type) type {
                 defer prior.deinit();
                 try prior.blob(1, &observation_id);
                 if (!try prior.row()) {
-                    if (try self.observationRows() >= effects.max_observations) return error.EffectCapacity;
+                    if (try self.tableRows(.effect_observations) >= effects.max_observations) return error.EffectCapacity;
                     var receipt = try self.statement("INSERT INTO effect_observations VALUES(?1,?2,?3,?4,?5,?6,?7,?8);");
                     defer receipt.deinit();
                     try receipt.blob(1, &observation_id);
@@ -763,7 +769,7 @@ pub fn Methods(comptime Store: type) type {
                     };
                     try receipt.int(8, @intFromEnum(status));
                     try receipt.done();
-                    self.observation_rows.? += 1;
+                    self.insertedRows(.effect_observations, 1);
                 }
             }
             if (self.schema_version >= store.load_repair_schema) {
@@ -772,6 +778,7 @@ pub fn Methods(comptime Store: type) type {
                 try trim.blob(1, &token.intent_id);
                 try trim.int(2, observations_per_intent);
                 try trim.done();
+                self.removedRows(.effect_observations, self.api.changes(self.db));
             }
             var row = try self.statement("UPDATE effect_intents SET status=?2,observed_us=?3,fingerprint=?4 WHERE intent_id=?1;");
             defer row.deinit();
@@ -801,7 +808,7 @@ pub fn Methods(comptime Store: type) type {
                         if (!std.mem.eql(u8, &event_id, &try effectBlob(&existing, 0, 32))) return error.InvalidEffect;
                         continue;
                     }
-                    if (try self.eventRows() >= effects.max_confirmed_events) return error.EffectCapacity;
+                    if (try self.tableRows(.confirmed_effect_events) >= effects.max_confirmed_events) return error.EffectCapacity;
                     var event = try self.statement("INSERT INTO confirmed_effect_events VALUES(?1,?2,?3,?4,?5) ON CONFLICT(scope_key,jail,decision_id) DO NOTHING;");
                     defer event.deinit();
                     try event.blob(1, &event_id);
@@ -810,7 +817,7 @@ pub fn Methods(comptime Store: type) type {
                     try event.blob(4, &owner.decision_id);
                     try event.int(5, observation.observed_us);
                     try event.done();
-                    self.event_rows.? += 1;
+                    self.insertedRows(.confirmed_effect_events, self.api.changes(self.db));
                     if (self.schema_version >= 17) {
                         var detail_inserted = false;
                         var detail = try self.statement("INSERT INTO confirmed_event_details(event_id,source,occurrence,decided_us,ordinal,evidence) SELECT ?1,source,occurrence,decided_us,ordinal,evidence FROM retry_decision_details WHERE jail=?2 AND effect_decision_id=?3;");
@@ -821,6 +828,7 @@ pub fn Methods(comptime Store: type) type {
                         try detail.done();
                         if (self.api.changes(self.db) > 1) return error.InvalidApplicationHistoryRow;
                         detail_inserted = self.api.changes(self.db) == 1;
+                        self.insertedRows(.confirmed_event_details, self.api.changes(self.db));
                         if (self.schema_version >= 18 and detail_inserted) {
                             var summary = try self.statement("INSERT INTO confirmed_policy_summaries(jail,family,subject,confirmed_count,latest_confirmed_us) SELECT jail,family,subject,1,?3 FROM retry_decision_details WHERE jail=?1 AND effect_decision_id=?2 ON CONFLICT(jail,family,subject) DO UPDATE SET confirmed_count=confirmed_count+1,latest_confirmed_us=max(latest_confirmed_us,excluded.latest_confirmed_us);");
                             defer summary.deinit();
@@ -884,15 +892,6 @@ pub fn Methods(comptime Store: type) type {
             try self.commitEffectTransaction(true);
             return items.len;
         }
-        // Capacity guards count a table once per transaction; inserts in the same transaction are added in memory.
-        fn observationRows(self: *Store) Error!i64 {
-            if (self.observation_rows == null) self.observation_rows = try self.integer("SELECT count(*) FROM effect_observations;");
-            return self.observation_rows.?;
-        }
-        fn eventRows(self: *Store) Error!i64 {
-            if (self.event_rows == null) self.event_rows = try self.integer("SELECT count(*) FROM confirmed_effect_events;");
-            return self.event_rows.?;
-        }
         fn confirmOwnerTx(self: *Store, token: effects.Token, owner: effects.Owner, observed_us: i64) Error!void {
             const jail = owner.jail.slice();
             const event_id = effects.hashParts("fail2zig-native-confirmed-owner-v1", &.{ &token.installation, &token.scope_key, jail, &owner.decision_id });
@@ -914,7 +913,7 @@ pub fn Methods(comptime Store: type) type {
             const already_confirmed = try retained.row();
             if (already_confirmed and !std.mem.eql(u8, &event_id, &try effectBlob(&retained, 0, 32))) return error.InvalidEffect;
             if (!already_confirmed) {
-                if (try self.eventRows() >= effects.max_confirmed_events) return error.EffectCapacity;
+                if (try self.tableRows(.confirmed_effect_events) >= effects.max_confirmed_events) return error.EffectCapacity;
                 {
                     var event = try self.statement(if (self.schema_version >= origin_schema)
                         "INSERT INTO confirmed_effect_events(event_id,scope_key,jail,decision_id,confirmed_us,canonical_scope,origin) SELECT ?1,scope_key,?3,?4,?5,canonical_scope,?6 FROM native_effects WHERE scope_key=?2;"
@@ -929,7 +928,7 @@ pub fn Methods(comptime Store: type) type {
                     if (self.schema_version >= origin_schema) try event.int(6, @intFromEnum(owner.origin));
                     try event.done();
                     if (self.api.changes(self.db) != 1) return error.InvalidEffect;
-                    self.event_rows.? += 1;
+                    self.insertedRows(.confirmed_effect_events, 1);
                 }
                 var sequence: i64 = undefined;
                 {
@@ -952,6 +951,7 @@ pub fn Methods(comptime Store: type) type {
                     const family = try detail.signed(0);
                     const bytes = try detail.optionalSigned(2);
                     if (try detail.row()) return error.InvalidApplicationHistoryRow;
+                    self.insertedRows(.confirmed_event_details, 1);
                     try self.retainDetailTx(family, subject[0..stored.len], bytes, sequence);
                     var summary = try self.statement("INSERT INTO confirmed_policy_summaries(jail,family,subject,confirmed_count,latest_confirmed_us) SELECT jail,family,subject,1,?3 FROM retry_decision_details WHERE jail=?1 AND effect_decision_id=?2 ON CONFLICT(jail,family,subject) DO UPDATE SET confirmed_count=confirmed_count+1,latest_confirmed_us=max(latest_confirmed_us,excluded.latest_confirmed_us);");
                     defer summary.deinit();
@@ -1008,7 +1008,7 @@ pub fn Methods(comptime Store: type) type {
             for (owners[0..count]) |owner| if (owner.lease == .finite and !owner.lease.live(now)) {
                 expiring_count += 1;
             };
-            if (try self.integer("SELECT count(*) FROM effect_owner_revisions;") > effects.max_owner_revisions - expiring_count) return error.EffectCapacity;
+            if (try self.tableRows(.effect_owner_revisions) > effects.max_owner_revisions - expiring_count) return error.EffectCapacity;
             for (owners[0..count]) |owner| if (owner.lease == .finite and !owner.lease.live(now)) {
                 if (owner.revision == std.math.maxInt(i64)) return error.EffectCapacity;
                 try self.retireOwnerDecisionTx(key, owner.jail.slice(), null, now);
@@ -1017,6 +1017,7 @@ pub fn Methods(comptime Store: type) type {
                 try row.blob(1, &key);
                 try row.text(2, owner.jail.slice());
                 try row.done();
+                self.insertedRows(.effect_owner_revisions, self.api.changes(self.db));
                 expired += 1;
             };
             var entry = prior;

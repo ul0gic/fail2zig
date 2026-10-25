@@ -580,6 +580,7 @@ pub fn Methods(comptime Store: type) type {
             try remove.text(1, fence.jail);
             try Store.bindSubject(&remove, &candidate.subject);
             try remove.done();
+            self.deletedRows(.retry_states);
             if (self.api.changes(self.db) != 1) return error.StaleMaintenance;
             return .retired;
         }
@@ -987,7 +988,7 @@ pub fn Methods(comptime Store: type) type {
                 }
                 return;
             }
-            if (try self.integer("SELECT count(*) FROM action_targets;") > action_outcome.max_rows - action_outcome.max_targets_per_action) return error.ActionTargetCapacity;
+            if (try self.tableRows(.action_targets) > action_outcome.max_rows - action_outcome.max_targets_per_action) return error.ActionTargetCapacity;
             for ([_]action_outcome.Kind{ .enforcement, .notification }) |kind| {
                 const suppressed = kind == .notification and intent.restored;
                 var insert = try self.statement("INSERT INTO action_targets VALUES(?1,?2,?3,?4,?5,?6,?7,?8,NULL,?9,?10);");
@@ -1003,6 +1004,7 @@ pub fn Methods(comptime Store: type) type {
                 if (suppressed) try insert.int(9, now);
                 if (intent.metadata) |metadata| try insert.text(10, metadata);
                 try insert.done();
+                self.insertedRows(.action_targets, 1);
             }
             try self.fault(.after_action_target_intent);
         }
@@ -1273,6 +1275,7 @@ pub fn Methods(comptime Store: type) type {
                 }
             }
             if (count == 0) return 0;
+            self.deletedRows(.retry_decision_details);
             var remove = try self.statement("DELETE FROM retry_decision_details WHERE rowid=?1;");
             defer remove.deinit();
             for (ids[0..count]) |id| {
@@ -1383,6 +1386,7 @@ pub fn Methods(comptime Store: type) type {
                 try remove.blob(1, &detail.event_id);
                 try remove.int(2, detail.sequence);
                 try remove.done();
+                self.deletedRows(.confirmed_event_details);
                 if (self.api.changes(self.db) != 1) return error.HistoryGap;
             }
             try self.fault(.after_history_detail_delete);
@@ -1527,6 +1531,7 @@ pub fn Methods(comptime Store: type) type {
                 defer event.deinit();
                 try event.blob(1, &event_id);
                 try event.done();
+                self.deletedRows(.confirmed_effect_events);
                 if (self.api.changes(self.db) != 1) return error.HistoryGap;
                 try self.fault(.after_history_event_delete);
                 var stream = try self.statement("UPDATE confirmed_history_stream SET retained_from=?1,revision=revision+1 WHERE id=1 AND retained_from=?2;");
@@ -1625,13 +1630,13 @@ pub fn Methods(comptime Store: type) type {
 
         const reclaim_window: i64 = 1024;
         const obsolete_intent = "i.intent_id IS NOT n.intent_id AND i.status NOT IN(1,2) AND NOT EXISTS(SELECT 1 FROM action_targets a WHERE a.action_id=i.decision_id AND a.scope_key=i.scope_key AND a.status IN(1,2,5))";
-        const reclaim_phases = [_]struct { max_sql: [:0]const u8, statements: []const [:0]const u8 }{
-            .{ .max_sql = "SELECT coalesce(max(rowid),0) FROM action_targets;", .statements = &.{"DELETE FROM action_targets WHERE rowid IN (SELECT a.rowid FROM action_targets a WHERE a.rowid>?1 AND a.rowid<=?2 AND a.status NOT IN(1,2,5) AND NOT EXISTS(SELECT 1 FROM effect_owners o INDEXED BY effect_owners_decision WHERE o.jail=a.jail AND o.decision_id=a.action_id));"} },
-            .{ .max_sql = "SELECT coalesce(max(rowid),0) FROM effect_intents;", .statements = &.{
+        const reclaim_phases = [_]struct { max_sql: [:0]const u8, tables: []const store.TalliedTable, statements: []const [:0]const u8 }{
+            .{ .max_sql = "SELECT coalesce(max(rowid),0) FROM action_targets;", .tables = &.{.action_targets}, .statements = &.{"DELETE FROM action_targets WHERE rowid IN (SELECT a.rowid FROM action_targets a WHERE a.rowid>?1 AND a.rowid<=?2 AND a.status NOT IN(1,2,5) AND NOT EXISTS(SELECT 1 FROM effect_owners o INDEXED BY effect_owners_decision WHERE o.jail=a.jail AND o.decision_id=a.action_id));"} },
+            .{ .max_sql = "SELECT coalesce(max(rowid),0) FROM effect_intents;", .tables = &.{ .effect_observations, .effect_intents }, .statements = &.{
                 "DELETE FROM effect_observations WHERE intent_id IN (SELECT i.intent_id FROM effect_intents i JOIN native_effects n ON n.scope_key=i.scope_key WHERE i.rowid>?1 AND i.rowid<=?2 AND " ++ obsolete_intent ++ ");",
                 "DELETE FROM effect_intents WHERE rowid IN (SELECT i.rowid FROM effect_intents i JOIN native_effects n ON n.scope_key=i.scope_key WHERE i.rowid>?1 AND i.rowid<=?2 AND " ++ obsolete_intent ++ ");",
             } },
-            .{ .max_sql = "SELECT coalesce(max(rowid),0) FROM effect_owner_revisions;", .statements = &.{"DELETE FROM effect_owner_revisions WHERE rowid IN (SELECT h.rowid FROM effect_owner_revisions h WHERE h.rowid>?1 AND h.rowid<=?2 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=h.scope_key AND o.jail=h.jail AND o.revision=h.revision) AND NOT EXISTS(SELECT 1 FROM action_targets a WHERE a.action_id=h.decision_id AND a.scope_key=h.scope_key AND a.status IN(1,2,5)));"} },
+            .{ .max_sql = "SELECT coalesce(max(rowid),0) FROM effect_owner_revisions;", .tables = &.{.effect_owner_revisions}, .statements = &.{"DELETE FROM effect_owner_revisions WHERE rowid IN (SELECT h.rowid FROM effect_owner_revisions h WHERE h.rowid>?1 AND h.rowid<=?2 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=h.scope_key AND o.jail=h.jail AND o.revision=h.revision) AND NOT EXISTS(SELECT 1 FROM action_targets a WHERE a.action_id=h.decision_id AND a.scope_key=h.scope_key AND a.status IN(1,2,5)));"} },
         };
 
         pub const ReclaimOutcome = enum { deleted, scanned, idle };
@@ -1648,6 +1653,7 @@ pub fn Methods(comptime Store: type) type {
             const phase = reclaim_phases[next.phase];
             const maximum = try self.integer(phase.max_sql);
             const high = std.math.add(i64, next.cursor, reclaim_window) catch return error.StorageLimit;
+            for (phase.tables) |table| self.deletedRows(table);
             if (next.cursor < maximum) for (phase.statements) |sql| {
                 var row = try self.statement(sql);
                 defer row.deinit();
@@ -1759,6 +1765,7 @@ pub fn Methods(comptime Store: type) type {
                 "DELETE FROM effect_owner_revisions WHERE rowid IN (SELECT h.rowid FROM effect_owner_revisions h WHERE h.scope_key=?1 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=h.scope_key AND o.jail=h.jail AND o.revision=h.revision) LIMIT 256);",
                 "DELETE FROM action_targets WHERE rowid IN (SELECT rowid FROM action_targets WHERE scope_key=?1 LIMIT 256);",
             };
+            for ([_]store.TalliedTable{ .effect_observations, .effect_intents, .effect_owner_revisions, .action_targets, .effect_owners, .native_effects }) |table| self.deletedRows(table);
             while (true) {
                 var pass: i64 = 0;
                 for (chunks, 0..) |sql, index| {

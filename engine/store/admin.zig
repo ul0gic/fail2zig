@@ -95,7 +95,7 @@ pub fn Methods(comptime Store: type) type {
                 live_count += 1;
             };
             try self.reserveEffectRows(.{ .revisions = count, .intents = live_count, .observations = live_count * @import("store.zig").load_repair.observations_per_intent });
-            if (try self.integer("SELECT count(*) FROM effect_owner_revisions;") + count > effects.max_owner_revisions) return error.EffectCapacity;
+            if (try self.tableRows(.effect_owner_revisions) + count > effects.max_owner_revisions) return error.EffectCapacity;
             for (held.items) |owner| {
                 const scope = canonical_scope.Scope.decode(&owner.scope) catch return error.InvalidEffect;
                 if (owner.absent) {
@@ -112,6 +112,7 @@ pub fn Methods(comptime Store: type) type {
                     try update.blob(6, &change.generation);
                     try update.done();
                     if (self.api.changes(self.db) != 1) return error.StalePolicyTransition;
+                    self.insertedRows(.effect_owner_revisions, 1);
                     try self.advanceEffectSnapshot();
                     continue;
                 }

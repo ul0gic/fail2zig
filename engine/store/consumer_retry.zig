@@ -1063,7 +1063,7 @@ pub fn Methods(comptime Store: type) type {
                 live_count += 1;
             };
             try self.reserveEffectRows(.{ .revisions = count, .intents = live_count, .observations = live_count * store.load_repair.observations_per_intent });
-            if (try self.integer("SELECT count(*) FROM effect_owner_revisions;") + count > effects.max_owner_revisions) return error.EffectCapacity;
+            if (try self.tableRows(.effect_owner_revisions) + count > effects.max_owner_revisions) return error.EffectCapacity;
             for (held.items) |owner| {
                 const scope = canonical_scope.Scope.decode(&owner.scope) catch return error.InvalidEffect;
                 if (owner.absent) {
@@ -1080,6 +1080,7 @@ pub fn Methods(comptime Store: type) type {
                     try update.blob(6, &legacy);
                     try update.done();
                     if (self.api.changes(self.db) != 1) return error.StaleEffect;
+                    self.insertedRows(.effect_owner_revisions, 1);
                     try self.advanceEffectSnapshot();
                     continue;
                 }
@@ -1325,7 +1326,7 @@ pub fn Methods(comptime Store: type) type {
             }
             try self.fault(.after_retry_decision);
             try self.reserveEffectRows(.{ .revisions = 1, .intents = 1, .observations = store.load_repair.observations_per_intent });
-            if (existing.revision >= std.math.maxInt(i64) or entry.revision >= std.math.maxInt(i64) or try self.integer("SELECT count(*) FROM effect_owner_revisions;") >= effects.max_owner_revisions) return error.EffectCapacity;
+            if (existing.revision >= std.math.maxInt(i64) or entry.revision >= std.math.maxInt(i64) or try self.tableRows(.effect_owner_revisions) >= effects.max_owner_revisions) return error.EffectCapacity;
             {
                 var update = try self.statement("UPDATE effect_owners SET revision=?4,lease_kind=?5,deadline_us=?6 WHERE scope_key=?1 AND jail=?2 AND revision=?3;");
                 defer update.deinit();
@@ -1336,6 +1337,7 @@ pub fn Methods(comptime Store: type) type {
                 try Store.bindEffectLease(&update, 5, prolonged.lease);
                 try update.done();
                 if (self.api.changes(self.db) != 1) return error.StaleEffect;
+                self.insertedRows(.effect_owner_revisions, 1);
             }
             try self.fault(.after_effect_owner);
             const next = try self.replaceEffectIntent(installation, scope, key, entry.revision + 1, decision_id, now);
@@ -1400,7 +1402,7 @@ pub fn Methods(comptime Store: type) type {
         }
 
         fn retryPoolPressure(self: *Store, now_us: i64, new_row: bool, banning: bool, tracking_limit: u32) Error!PoolPressure {
-            const total = try self.integer("SELECT count(*) FROM retry_states;");
+            const total = try self.tableRows(.retry_states);
             if (comptime build_options.diag) diag_mod.limit(.retry_rows, std.math.lossyCast(u64, total), @as(u64, tracking_limit) + retry.max_pool_subjects);
             const total_full = new_row and total >= @as(i64, tracking_limit) + retry.max_pool_subjects;
             const limit: i64 = if (banning) retry.max_pool_subjects else tracking_limit;
@@ -1457,6 +1459,7 @@ pub fn Methods(comptime Store: type) type {
                 try remove.text(1, victim_jail.slice());
                 try bindSubject(&remove, &subject);
                 try remove.done();
+                self.deletedRows(.retry_states);
                 if (self.api.changes(self.db) != 1) return error.InvalidRetryState;
                 try self.retry_evictions.note(jail, now_us);
                 return .{ .evicted = subject, .last_processed_us = last_processed_us };
@@ -1584,6 +1587,7 @@ pub fn Methods(comptime Store: type) type {
                 try row.blob(7, next.state.encodeAttempts(&bytes));
             }
             try row.done();
+            if (new_row) self.insertedRows(.retry_states, 1);
             try self.fault(.after_retry_state);
             if (next.decision) |decision| {
                 var effect_identity: ?effects.Hash = null;
@@ -1651,7 +1655,7 @@ pub fn Methods(comptime Store: type) type {
                     }
                 }
                 if (self.schema_version >= 17) {
-                    if (try self.integer("SELECT count(*) FROM retry_decision_details;") >= application_history.max_details) {
+                    if (try self.tableRows(.retry_decision_details) >= application_history.max_details) {
                         if (try self.pruneRetryDecisionDetailsTx() == 0) return error.HistoryCapacity;
                     }
                     var detail = try self.statement("INSERT INTO retry_decision_details(jail,family,subject,source,occurrence,ordinal,decided_us,effect_decision_id,evidence) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9);");
@@ -1665,6 +1669,7 @@ pub fn Methods(comptime Store: type) type {
                     if (effect_identity) |identity| try detail.blob(8, &identity);
                     if (record.retry_evidence.text) |evidence| try detail.text(9, evidence);
                     try detail.done();
+                    self.insertedRows(.retry_decision_details, 1);
                 }
             }
         }

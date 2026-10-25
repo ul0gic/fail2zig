@@ -44,6 +44,7 @@ pub fn Methods(comptime Store: type) type {
                 if (entry.desired == .absent) outcome.bans_lifted = std.math.add(u32, outcome.bans_lifted, 1) catch return error.EffectCapacity;
             }
             for (retirement_deletes) |sql| try self.deleteJailRows(sql, jail);
+            self.deletedRows(.retry_states);
             var manifests_removed: c_int = 0;
             for (manifest_deletes, 0..) |sql, index| {
                 try self.deleteJailRows(sql, jail);
