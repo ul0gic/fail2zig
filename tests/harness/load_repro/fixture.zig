@@ -375,7 +375,7 @@ const Gen = struct {
         self.store_open = false;
     }
 
-    // Mirrors the daemon's runtime open and admission sequence, including the
+    // Mirrors the daemon's runtime open and schema ladder, including the
     // per-transaction work guard, so construction hits the same refusals.
     fn openStore(self: *Gen) !void {
         self.store = try self.stored("Store.openRuntime", durable.Store.openRuntime(self.allocator, self.path));
@@ -416,6 +416,11 @@ const Gen = struct {
     }
     fn setup(self: *Gen) !void {
         try self.openStore();
+        const load_repair: durable.load_repair.Options = .{ .state_path = self.path, .now_us = self.clock.now, .history_max_matches = self.options.max_matches };
+        try self.stored("Store.enableLoadRepair", self.store.enableLoadRepair(load_repair, null));
+        try self.stored("Store.enableRuntimeState", self.store.enableRuntimeState(load_repair, !self.store.load_repair_migrated));
+        _ = try self.stored("Store.setRetentionPolicy", self.store.setRetentionPolicy(self.options.max_matches));
+        if (try self.store.integer("PRAGMA user_version;") != durable.latest_schema) return error.FixtureSchemaIncomplete;
         try self.stored("Store.admitInstallation", self.store.admitInstallation(self.installation, .{ .selector = self.installation.selector(), .disposition = .verified_absent }));
         const initial = try self.consumer.prepareInitial();
         defer initial.release();
@@ -1465,14 +1470,14 @@ pub fn main() !u8 {
             .attach => try runCase(gen, runAttach, .{gen}),
             .@"oracle-cases" => unreachable,
         };
-        if (outcome.harness_failure != null) failed = true;
+        if (gen.refusal != null or outcome.harness_failure != null) failed = true;
         try ws.objectField("harness_failure");
         try ws.write(outcome.harness_failure);
         try writeGen(&ws, gen);
         if (shape == .attach) {
             const publication = try checkPublication(gen, outcome.harness_failure);
             try writeAttach(&ws, gen, &publication);
-            if (gen.refusal != null or (publication.claimed and !publication.ok())) failed = true;
+            if (publication.claimed and !publication.ok()) failed = true;
         }
         var audit_timer = try std.time.Timer.start();
         try ws.objectField("state");
