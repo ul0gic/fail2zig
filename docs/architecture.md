@@ -181,14 +181,18 @@ ingest; each ban's outcome is one commit that records the dispatch time, the
 observation, the confirmation and the action-target settlement together.
 
 Expiry follows the entry's kernel representation. nftables set elements and ipset
-entries carry the deadline as a kernel timeout, so the daemon prepares up to eight due
-entries per commit and settles up to eight per commit from a readback that shows them
+entries carry the deadline as a kernel timeout, so the daemon prepares up to 64 due
+entries per commit and settles up to 64 per commit from a readback that shows them
 absent. Scoped rules on every backend and iptables host rules carry no timeout and are
-deleted explicitly. Live dispatches keep at least every other selection; expiry work is
-served at parity while its backlog exceeds the live backlog, otherwise once per four
-live dispatches, and continuously when nothing live is pending; overdue removals
-precede bookkeeping. Retry-subject retirement and spent-scope pruning each handle up to
-eight subjects or scopes per commit. A quiet worker (confirmed view, caught-up history,
+deleted explicitly. Live dispatches alternate with completed expiry batches while the
+expiry backlog exceeds the live backlog, otherwise one expiry batch follows four live
+dispatches; expiry runs continuously when nothing live is pending. Preparing a batch
+and obtaining its absence readback retain that batch's turn until settlement. Explicit removals
+precede bookkeeping; ready settlements and readbacks needed to settle prepared removals
+precede preparation of more expiries. All these phases count toward the expiry backlog.
+Retry-subject retirement handles up to eight subjects per commit. Spent-scope pruning
+examines up to 64 scopes from a resumable key cursor per commit and halves that batch
+after a clean rollback on work-budget interruption. A quiet worker (confirmed view, caught-up history,
 no maintenance progress, no new commits) publishes owners and runs maintenance once per
 second; sources are still polled every 100 ms, and a source with waiting records gets up
 to four poll turns per wake, each turn of a file source being one group commit. Maintenance runs on a 250 ms cadence under load.
@@ -282,7 +286,13 @@ its owners no longer hold a lease, the kernel entry is confirmed absent and no f
 action outcome is unsettled. Confirmed history keeps its own copy of the scope and ban decision, so
 it stays readable after the scope is removed and ages out on its own retention. Obsolete owner
 revisions, intents and observations of a still-active scope are reclaimed the same way; each intent
-keeps at most four observations. Active and permanent bans are kept.
+keeps at most four observations. Settled firewall targets left by a pruned or replaced decision
+are reclaimed by the obsolete-row pass, which gets a turn after each pruning or partial scanning step. Active and
+permanent bans are kept.
+
+If an owner expires before its action outcomes settle, verified effect reconciliation
+marks those unresolved outcomes superseded. This also repairs existing absent effects;
+it preserves confirmed history and does not record an expired decision as a confirmed ban.
 
 Admission reserves room for every live ban to expire, be released or be confirmed, so terminal
 transitions never meet a row limit. A request that would break that reserve, or that would

@@ -846,7 +846,7 @@ pub fn Methods(comptime Store: type) type {
                     }
                 };
             }
-            if (status == .applied) _ = try self.settleActionTargetsTx(token.scope_key, now);
+            if (status == .applied or status == .absent) _ = try self.settleActionTargetsTx(token.scope_key, now);
             return .{ .entry = entry, .status = status, .settlement = if (expired) .expired else if (matches) .verified else .retry_same_intent };
         }
         pub fn settleOutcome(self: *Store, token: effects.Token, dispatch_us: i64, observation: effects.Observation, clock: effects.Clock) Error!effects.Settlement {

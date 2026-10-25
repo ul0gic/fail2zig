@@ -7,9 +7,9 @@ const tracy = @import("tracy.zig");
 
 pub const banner = "DIAGNOSTIC BUILD — not for production";
 
-pub const Section = enum { journal, file, dump, compare, expiry, commit, wal, publish, fsync, readback, dispatch, reload, select, owners, history, maintenance, events };
-pub const Counter = enum { wakes, spawns, dump_messages, dump_elements, readbacks, journal_records, file_records, ingest_full_bursts, write_commits, commit_rows, consistency_checks, consistency_skipped, events_received, events_applied, events_dropped, acknowledged_batches, statement_prepares, statement_cache_bypasses };
-pub const Gauge = enum { readback_late_ms, wal_bytes, rss_bytes, startup_ready_ms, ingest_backlog_bytes, commit_rows_last };
+pub const Section = enum { journal, file, dump, compare, expiry, commit, wal, publish, fsync, readback, dispatch, reload, select, owners, history, maintenance, events, spent_prune, obsolete_reclaim };
+pub const Counter = enum { wakes, spawns, dump_messages, dump_elements, readbacks, journal_records, file_records, ingest_full_bursts, write_commits, commit_rows, consistency_checks, consistency_skipped, events_received, events_applied, events_dropped, acknowledged_batches, statement_prepares, statement_cache_bypasses, prune_yields, reclaim_pages, reclaim_passes, expiries_prepared, expiries_settled, expiry_prepare_selected, expiry_remove_selected, expiry_settle_selected, expiry_readback_selected };
+pub const Gauge = enum { readback_late_ms, wal_bytes, rss_bytes, startup_ready_ms, ingest_backlog_bytes, commit_rows_last, prune_batch, expiry_due, expiry_removal_pending, expiry_settle_ready, expiry_readback_blocked, live_pending };
 pub const Limit = enum { live_bans, banned_subjects, retry_rows, effect_owners, effects, owner_revisions, intents, observations, action_targets, confirmed_events, event_details, pending_receipts, state_pages, sqlite_heap, kernel_elements, memory_plan, fds };
 pub const Event = enum { commit_refused, source_paused, readback_stale, readback_deferred, storage_failed, continuity_loss, slow_startup, headroom_low, consistency_mismatch, events_overflowed };
 pub const EventDetail = struct {

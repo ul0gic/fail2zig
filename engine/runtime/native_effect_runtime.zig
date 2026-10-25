@@ -837,6 +837,7 @@ pub const Manager = struct {
         var due_count: u64 = 0;
         var settle_tokens: [durable.Store.max_expiry_batch]effect.Token = undefined;
         var settle_count: usize = 0;
+        var settle_ready: u64 = 0;
         var settle_blocked: u64 = 0;
         var oldest_overdue_us: ?i64 = null;
         var blocking: u64 = 0;
@@ -892,6 +893,7 @@ pub const Manager = struct {
                         settle_tokens[settle_count] = entry.token();
                         settle_count += 1;
                     }
+                    settle_ready += 1;
                     continue;
                 }
                 // A kernel-expiring element read before its removal was prepared may still be timing out; only a later readback can call it drift.
@@ -936,30 +938,46 @@ pub const Manager = struct {
         self.counters.overdue_blocking = blocking;
         self.counters.oldest_overdue_blocking_us = oldest_blocking_us;
         self.counters.overdue_bookkeeping = bookkeeping;
+        if (comptime build_options.diag) {
+            diag_mod.gauge(.expiry_due, due_count);
+            diag_mod.gauge(.expiry_removal_pending, removal_pending);
+            diag_mod.gauge(.expiry_settle_ready, settle_ready);
+            diag_mod.gauge(.expiry_readback_blocked, settle_blocked);
+            diag_mod.gauge(.live_pending, live_pending);
+        }
         if (marker_pick) |index| return self.settleMarker(bindings, index);
         if (legacy_pick) |index| return self.settleLegacy(bindings, index);
-        const expiry_backlog = removal_pending + due_count + settle_count;
-        const expiry_work = removal_pick != null or due_pick != null or settle_count != 0;
+        const expiry_backlog = removal_pending + due_count + settle_ready + settle_blocked;
+        const expiry_work = expiry_backlog != 0;
         const share: u8 = if (expiry_backlog > live_pending) 1 else expiry_share;
         if (live_pick == null) self.live_selections = 0;
         if (expiry_work and (live_pick == null or self.live_selections >= share)) {
-            self.live_selections = 0;
             self.status.ready = false;
-            if (removal_pick orelse due_pick) |index| {
+            if (removal_pick) |index| {
+                self.live_selections = 0;
+                if (comptime build_options.diag) diag_mod.count(.expiry_remove_selected, 1);
                 self.cursor = index;
                 return .progress;
             }
-            return self.settleExpiredBatch(settle_tokens[0..settle_count]);
+            if (settle_count != 0) {
+                self.live_selections = 0;
+                if (comptime build_options.diag) diag_mod.count(.expiry_settle_selected, 1);
+                return self.settleExpiredBatch(settle_tokens[0..settle_count]);
+            }
+            if (settle_blocked != 0) {
+                if (comptime build_options.diag) diag_mod.count(.expiry_readback_selected, 1);
+                return self.readback(sampled);
+            }
+            // Preparation and its absence readback share one expiry turn with the settlement that completes the batch.
+            if (comptime build_options.diag) diag_mod.count(.expiry_prepare_selected, 1);
+            self.cursor = due_pick.?;
+            return .progress;
         }
         if (live_pick) |index| {
             self.live_selections +|= 1;
             self.status.ready = false;
             if (live_pending > 1) if (try self.installPending(bindings, sampled)) |outcome| return outcome;
             self.cursor = index;
-            return .progress;
-        }
-        if (settle_blocked != 0) {
-            self.dropInventory();
             return .progress;
         }
         if (try self.settleLegacyTargets(bindings)) |outcome| return outcome;
@@ -1149,7 +1167,7 @@ pub const Manager = struct {
         if (self.legacy_targets_attempted) |prior| if (std.mem.eql(u8, &prior, &key)) return null;
         const index = self.findLive(key) orelse return null;
         const entry = self.live[index];
-        if (entry.status != .applied or !self.matched[index]) return null;
+        if ((entry.status != .applied and entry.status != .absent) or !self.matched[index]) return null;
         self.legacy_targets_attempted = key;
         const held = &self.inventory.?;
         try self.settle(bindings, index, entry, held.start_us, .{ .installation = entry.installation.id, .scope_key = entry.scope_key, .fingerprint = held.snapshot.fingerprint, .observed_us = held.end_us, .qualification = .complete_owned, .state = entry.desired });
@@ -1169,6 +1187,7 @@ pub const Manager = struct {
             return error.InvalidEffect;
         }
         if (self.events_subscribed) try self.forgetExpired(tokens);
+        if (comptime build_options.diag) diag_mod.count(.expiries_settled, tokens.len);
         return .progress;
     }
     fn forgetExpired(self: *Manager, tokens: []const effect.Token) !void {
@@ -1402,12 +1421,14 @@ pub const Manager = struct {
             count += 1;
         }
         if (count == 1) {
-            {
+            const prepared = blk: {
                 errdefer self.writeFailed(pre);
-                _ = try self.store.prepareExpiry(entry.scope_key, entry.revision, sampled);
-            }
+                break :blk try self.store.prepareExpiry(entry.scope_key, entry.revision, sampled);
+            };
+            if (prepared.desired != .absent) self.live_selections = 0;
             self.counters.expiry_batches += 1;
             self.counters.expiries_prepared += 1;
+            if (comptime build_options.diag) diag_mod.count(.expiries_prepared, 1);
             return switch (try self.attributeCommit(bindings, index, pre)) {
                 .changed => .progress,
                 .unchanged => .{ .wait = self.waitDue() },
@@ -1419,7 +1440,11 @@ pub const Manager = struct {
         };
         self.counters.expiry_batches += 1;
         self.counters.expiries_prepared += count;
-        if (expired == 0 or self.store.effect_publication_epoch == pre) return .{ .wait = self.waitDue() };
+        if (comptime build_options.diag) diag_mod.count(.expiries_prepared, expired);
+        if (expired == 0 or self.store.effect_publication_epoch == pre) {
+            self.live_selections = 0;
+            return .{ .wait = self.waitDue() };
+        }
         return .progress;
     }
     fn settle(self: *Manager, bindings: []const Binding, index: usize, entry: effect.Entry, dispatch_us: i64, observed: effect.Observation) !void {

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
+const build_options = @import("build_options");
+const diag_mod = @import("../core/diag.zig");
 const consumers = @import("../core/native_consumer.zig");
 const detection = @import("../core/native_detection_record.zig");
 const retry = @import("../core/native_retry.zig");
@@ -1059,6 +1061,15 @@ pub fn Methods(comptime Store: type) type {
 
         pub fn settleActionTargetsTx(self: *Store, scope_key: effects.Hash, now: i64) Error!usize {
             if (self.schema_version < 21) return 0;
+            var retired: usize = 0;
+            if (self.schema_version >= store.load_repair_schema) {
+                var retire = try self.statement("UPDATE action_targets SET status=7,settled_us=max(coalesce(dispatch_us,intent_us),?2) WHERE rowid IN (SELECT a.rowid FROM effect_owners o CROSS JOIN action_targets a ON a.action_id=o.decision_id AND a.scope_key=o.scope_key AND a.jail=o.jail WHERE o.scope_key=?1 AND o.lease_kind=0 AND a.status IN(1,2,5));");
+                defer retire.deinit();
+                try retire.blob(1, &scope_key);
+                try retire.int(2, now);
+                try retire.done();
+                retired = @intCast(@max(0, self.api.changes(self.db)));
+            }
             var update = try self.statement(if (self.schema_version >= store.load_repair_schema)
                 "UPDATE action_targets SET status=3,settled_us=?2 WHERE scope_key=?1 AND status=2 AND action_id IN (SELECT decision_id FROM effect_owners WHERE scope_key=?1 AND lease_kind<>0) AND (kind<>1 OR EXISTS(SELECT 1 FROM confirmation_markers m WHERE m.scope_key=action_targets.scope_key AND m.jail=action_targets.jail AND m.decision_id=action_targets.action_id) OR EXISTS(SELECT 1 FROM confirmed_effect_events e WHERE e.scope_key=action_targets.scope_key AND e.jail=action_targets.jail AND e.decision_id=action_targets.action_id));"
             else
@@ -1067,7 +1078,7 @@ pub fn Methods(comptime Store: type) type {
             try update.blob(1, &scope_key);
             try update.int(2, now);
             try update.done();
-            return @intCast(@max(0, self.api.changes(self.db)));
+            return retired + @as(usize, @intCast(@max(0, self.api.changes(self.db))));
         }
         pub fn settleActionTarget(self: *Store, action_id: [32]u8, kind: action_outcome.Kind, settlement: action_outcome.Settlement, clock: effects.Clock) Error!void {
             try self.beginWrite();
@@ -1630,17 +1641,19 @@ pub fn Methods(comptime Store: type) type {
 
         const reclaim_window: i64 = 1024;
         const obsolete_intent = "i.intent_id IS NOT n.intent_id AND i.status NOT IN(1,2) AND NOT EXISTS(SELECT 1 FROM action_targets a WHERE a.action_id=i.decision_id AND a.scope_key=i.scope_key AND a.status IN(1,2,5))";
-        const reclaim_phases = [_]struct { max_sql: [:0]const u8, tables: []const store.TalliedTable, statements: []const [:0]const u8 }{
-            .{ .max_sql = "SELECT coalesce(max(rowid),0) FROM action_targets;", .tables = &.{.action_targets}, .statements = &.{"DELETE FROM action_targets WHERE rowid IN (SELECT a.rowid FROM action_targets a WHERE a.rowid>?1 AND a.rowid<=?2 AND a.status NOT IN(1,2,5) AND NOT EXISTS(SELECT 1 FROM effect_owners o INDEXED BY effect_owners_decision WHERE o.jail=a.jail AND o.decision_id=a.action_id));"} },
-            .{ .max_sql = "SELECT coalesce(max(rowid),0) FROM effect_intents;", .tables = &.{ .effect_observations, .effect_intents }, .statements = &.{
+        const reclaim_phases = [_]struct { max_sql: [:0]const u8, seek_sql: [:0]const u8, tables: []const store.TalliedTable, statements: []const [:0]const u8 }{
+            .{ .max_sql = "SELECT coalesce(max(rowid),0) FROM action_targets;", .seek_sql = "SELECT rowid FROM action_targets WHERE rowid>?1 ORDER BY rowid LIMIT 1 OFFSET ?2;", .tables = &.{.action_targets}, .statements = &.{"DELETE FROM action_targets WHERE rowid IN (SELECT a.rowid FROM action_targets a WHERE a.rowid>?1 AND a.rowid<=?2 AND a.status NOT IN(1,2,5) AND NOT EXISTS(SELECT 1 FROM effect_owners o INDEXED BY effect_owners_decision WHERE o.jail=a.jail AND o.decision_id=a.action_id));"} },
+            .{ .max_sql = "SELECT coalesce(max(rowid),0) FROM effect_intents;", .seek_sql = "SELECT rowid FROM effect_intents WHERE rowid>?1 ORDER BY rowid LIMIT 1 OFFSET ?2;", .tables = &.{ .effect_observations, .effect_intents }, .statements = &.{
                 "DELETE FROM effect_observations WHERE intent_id IN (SELECT i.intent_id FROM effect_intents i JOIN native_effects n ON n.scope_key=i.scope_key WHERE i.rowid>?1 AND i.rowid<=?2 AND " ++ obsolete_intent ++ ");",
                 "DELETE FROM effect_intents WHERE rowid IN (SELECT i.rowid FROM effect_intents i JOIN native_effects n ON n.scope_key=i.scope_key WHERE i.rowid>?1 AND i.rowid<=?2 AND " ++ obsolete_intent ++ ");",
             } },
-            .{ .max_sql = "SELECT coalesce(max(rowid),0) FROM effect_owner_revisions;", .tables = &.{.effect_owner_revisions}, .statements = &.{"DELETE FROM effect_owner_revisions WHERE rowid IN (SELECT h.rowid FROM effect_owner_revisions h WHERE h.rowid>?1 AND h.rowid<=?2 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=h.scope_key AND o.jail=h.jail AND o.revision=h.revision) AND NOT EXISTS(SELECT 1 FROM action_targets a WHERE a.action_id=h.decision_id AND a.scope_key=h.scope_key AND a.status IN(1,2,5)));"} },
+            .{ .max_sql = "SELECT coalesce(max(rowid),0) FROM effect_owner_revisions;", .seek_sql = "SELECT rowid FROM effect_owner_revisions WHERE rowid>?1 ORDER BY rowid LIMIT 1 OFFSET ?2;", .tables = &.{.effect_owner_revisions}, .statements = &.{"DELETE FROM effect_owner_revisions WHERE rowid IN (SELECT h.rowid FROM effect_owner_revisions h WHERE h.rowid>?1 AND h.rowid<=?2 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=h.scope_key AND o.jail=h.jail AND o.revision=h.revision) AND NOT EXISTS(SELECT 1 FROM action_targets a WHERE a.action_id=h.decision_id AND a.scope_key=h.scope_key AND a.status IN(1,2,5)));"} },
         };
 
         pub const ReclaimOutcome = enum { deleted, scanned, idle };
         pub fn reclaimObsoleteOne(self: *Store) Error!ReclaimOutcome {
+            const diag_span = if (comptime build_options.diag) diag_mod.enter(.obsolete_reclaim) else {};
+            defer if (comptime build_options.diag) diag_mod.leave(diag_span);
             if (self.schema_version < store.load_repair_schema) return .idle;
             if (self.reclaim.rest != 0) {
                 self.reclaim.rest -= 1;
@@ -1652,7 +1665,13 @@ pub fn Methods(comptime Store: type) type {
             var deleted = false;
             const phase = reclaim_phases[next.phase];
             const maximum = try self.integer(phase.max_sql);
-            const high = std.math.add(i64, next.cursor, reclaim_window) catch return error.StorageLimit;
+            const high = blk: {
+                var seek = try self.statement(phase.seek_sql);
+                defer seek.deinit();
+                try seek.int(1, next.cursor);
+                try seek.int(2, reclaim_window - 1);
+                break :blk if (try seek.row()) try seek.signed(0) else maximum;
+            };
             for (phase.tables) |table| self.deletedRows(table);
             if (next.cursor < maximum) for (phase.statements) |sql| {
                 var row = try self.statement(sql);
@@ -1675,6 +1694,10 @@ pub fn Methods(comptime Store: type) type {
             } else next.cursor = high;
             if (idle) next.rest = 63;
             try self.commitTransaction();
+            if (comptime build_options.diag) {
+                diag_mod.count(.reclaim_pages, 1);
+                if (high >= maximum and next.phase == 0) diag_mod.count(.reclaim_passes, 1);
+            }
             self.reclaim = next;
             return if (deleted) .deleted else if (idle) .idle else .scanned;
         }
@@ -1707,11 +1730,32 @@ pub fn Methods(comptime Store: type) type {
             } else if (try self.pruneRetryDecisionDetailsOne()) {
                 return .{ .progress = .retry_details };
             } else self.retry_detail_rest = 63;
+            const serviced = self.reclaim_turn;
+            self.reclaim_turn = false;
+            if (serviced) if (try self.reclaimStep()) |outcome| return outcome;
             self.maintenance_operation = .spent_scopes;
-            if (request.spent_scopes and try self.pruneSpentEffects(max_prune_batch)) return .{ .progress = .spent_scopes };
-            self.maintenance_operation = .obsolete_rows;
-            if (try self.reclaimObsoleteOne() == .deleted) return .{ .progress = .obsolete_rows };
+            if (request.spent_scopes) switch (try self.pruneSpentEffects(self.prune_batch)) {
+                .idle => {},
+                .yielded => return .{ .wait = .spent_scopes },
+                .scanned => {
+                    self.reclaim_turn = true;
+                    return .{ .wait = .spent_scopes };
+                },
+                .pruned => {
+                    self.reclaim_turn = true;
+                    return .{ .progress = .spent_scopes };
+                },
+            };
+            if (!serviced) if (try self.reclaimStep()) |outcome| return outcome;
             return .idle;
+        }
+        fn reclaimStep(self: *Store) Error!?health.MaintenanceOutcome {
+            self.maintenance_operation = .obsolete_rows;
+            return switch (try self.reclaimObsoleteOne()) {
+                .deleted => .{ .progress = .obsolete_rows },
+                .scanned => .{ .wait = .obsolete_rows },
+                .idle => null,
+            };
         }
         pub fn unsettledActionScope(self: *Store) Error!?effects.Hash {
             if (self.schema_version < 21) return null;
@@ -1720,42 +1764,74 @@ pub fn Methods(comptime Store: type) type {
             if (!try row.row()) return null;
             return try Store.effectBlob(&row, 0, 32);
         }
-        pub fn pruneSpentEffectOne(self: *Store) Error!bool {
+        pub const PruneResult = enum { idle, pruned, scanned, yielded };
+        pub fn pruneSpentEffectOne(self: *Store) Error!PruneResult {
             return self.pruneSpentEffects(1);
         }
         pub const max_prune_batch = Store.attribution_batch;
-        pub fn pruneSpentEffects(self: *Store, max_scopes: usize) Error!bool {
-            if (self.schema_version < 13) return false;
+        pub fn pruneSpentEffects(self: *Store, max_scopes: usize) Error!PruneResult {
+            const diag_span = if (comptime build_options.diag) diag_mod.enter(.spent_prune) else {};
+            defer if (comptime build_options.diag) diag_mod.leave(diag_span);
+            if (self.schema_version < 13) return .idle;
             if (max_scopes == 0 or max_scopes > max_prune_batch) return error.InvalidEffect;
             try self.beginWrite();
             errdefer self.rollback();
             var deleted: i64 = 0;
             var scopes: usize = 0;
+            var after = self.prune_after;
             while (scopes < max_scopes) {
-                const outcome = try self.pruneSpentScopeTx(&deleted);
+                const outcome = self.pruneSpentScopeTx(&deleted, &after) catch |failure| {
+                    if (failure != error.Interrupted) return failure;
+                    return self.yieldPrune(max_scopes);
+                };
                 if (outcome == .none) break;
                 scopes += 1;
                 if (outcome == .budget) break;
             }
-            if (scopes == 0) {
+            if (deleted == 0) {
                 try self.commitTransaction();
-                return false;
-            }
-            try self.commitEffectTransaction(true);
-            return true;
+            } else try self.commitEffectTransaction(true);
+            self.prune_after = after;
+            self.prune_batch = @min(max_prune_batch, self.prune_batch *| 2);
+            if (comptime build_options.diag) diag_mod.gauge(.prune_batch, self.prune_batch);
+            return if (deleted != 0) .pruned else if (after != null) .scanned else .idle;
         }
-        const PruneOutcome = enum { none, removed, budget };
-        fn pruneSpentScopeTx(self: *Store, deleted: *i64) Error!PruneOutcome {
+        fn yieldPrune(self: *Store, max_scopes: usize) Error!PruneResult {
+            const prior_rollback = self.rollback_error_code;
+            self.rollback_error_code = null;
+            self.rollback();
+            const clean = !self.reopen_required and self.rollback_error_code == null and self.api.get_autocommit(self.db) != 0;
+            if (self.rollback_error_code == null) self.rollback_error_code = prior_rollback;
+            if (!clean) return error.Interrupted;
+            if (max_scopes <= 1) return error.MaintenanceWorkExhausted;
+            self.prune_batch = @intCast(max_scopes / 2);
+            if (comptime build_options.diag) {
+                diag_mod.count(.prune_yields, 1);
+                diag_mod.gauge(.prune_batch, self.prune_batch);
+            }
+            return .yielded;
+        }
+        const PruneOutcome = enum { none, skipped, removed, budget };
+        fn pruneSpentScopeTx(self: *Store, deleted: *i64, after: *?effects.Hash) Error!PruneOutcome {
+            // Eligibility stays outside WHERE so LIMIT bounds the search even when every spent scope is still pending.
             var candidate = try self.statement(if (self.schema_version >= store.load_repair_schema)
-                "SELECT n.scope_key,n.intent_id FROM native_effects n INDEXED BY native_effects_spent JOIN effect_intents i ON i.intent_id=n.intent_id WHERE n.lease_kind=0 AND i.status=4 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=n.scope_key AND o.lease_kind<>0) AND NOT EXISTS(SELECT 1 FROM action_targets a INDEXED BY action_targets_unsettled WHERE a.scope_key=n.scope_key AND a.status IN(1,2,5)) AND NOT EXISTS(SELECT 1 FROM effect_intents p INDEXED BY effect_intents_pending WHERE p.scope_key=n.scope_key AND p.status IN(1,2)) AND NOT EXISTS(SELECT 1 FROM confirmation_markers m WHERE m.scope_key=n.scope_key) ORDER BY n.scope_key LIMIT 1;"
+                "SELECT n.scope_key,n.intent_id,i.status=4 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=n.scope_key AND o.lease_kind<>0) AND NOT EXISTS(SELECT 1 FROM action_targets a INDEXED BY action_targets_unsettled WHERE a.scope_key=n.scope_key AND a.status IN(1,2,5)) AND NOT EXISTS(SELECT 1 FROM effect_intents p INDEXED BY effect_intents_pending WHERE p.scope_key=n.scope_key AND p.status IN(1,2)) AND NOT EXISTS(SELECT 1 FROM confirmation_markers m WHERE m.scope_key=n.scope_key) FROM native_effects n INDEXED BY native_effects_spent JOIN effect_intents i ON i.intent_id=n.intent_id WHERE n.lease_kind=0 AND n.scope_key>?1 ORDER BY n.scope_key LIMIT 1;"
             else if (self.schema_version >= 21)
-                "SELECT n.scope_key,n.intent_id FROM native_effects n JOIN effect_intents i ON i.intent_id=n.intent_id WHERE n.lease_kind=0 AND i.status=4 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=n.scope_key AND o.lease_kind<>0) AND NOT EXISTS(SELECT 1 FROM confirmed_effect_events e WHERE e.scope_key=n.scope_key) AND NOT EXISTS(SELECT 1 FROM action_targets a WHERE a.scope_key=n.scope_key AND a.status IN(1,2,5)) AND NOT EXISTS(SELECT 1 FROM effect_intents p WHERE p.scope_key=n.scope_key AND p.status IN(1,2)) ORDER BY n.scope_key LIMIT 1;"
+                "SELECT n.scope_key,n.intent_id,i.status=4 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=n.scope_key AND o.lease_kind<>0) AND NOT EXISTS(SELECT 1 FROM confirmed_effect_events e WHERE e.scope_key=n.scope_key) AND NOT EXISTS(SELECT 1 FROM action_targets a WHERE a.scope_key=n.scope_key AND a.status IN(1,2,5)) AND NOT EXISTS(SELECT 1 FROM effect_intents p WHERE p.scope_key=n.scope_key AND p.status IN(1,2)) FROM native_effects n JOIN effect_intents i ON i.intent_id=n.intent_id WHERE n.lease_kind=0 AND n.scope_key>?1 ORDER BY n.scope_key LIMIT 1;"
             else
-                "SELECT n.scope_key,n.intent_id FROM native_effects n JOIN effect_intents i ON i.intent_id=n.intent_id WHERE n.lease_kind=0 AND i.status=4 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=n.scope_key AND o.lease_kind<>0) AND NOT EXISTS(SELECT 1 FROM confirmed_effect_events e WHERE e.scope_key=n.scope_key) AND NOT EXISTS(SELECT 1 FROM effect_intents p WHERE p.scope_key=n.scope_key AND p.status IN(1,2)) ORDER BY n.scope_key LIMIT 1;");
+                "SELECT n.scope_key,n.intent_id,i.status=4 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=n.scope_key AND o.lease_kind<>0) AND NOT EXISTS(SELECT 1 FROM confirmed_effect_events e WHERE e.scope_key=n.scope_key) AND NOT EXISTS(SELECT 1 FROM effect_intents p WHERE p.scope_key=n.scope_key AND p.status IN(1,2)) FROM native_effects n JOIN effect_intents i ON i.intent_id=n.intent_id WHERE n.lease_kind=0 AND n.scope_key>?1 ORDER BY n.scope_key LIMIT 1;");
             defer candidate.deinit();
-            if (!try candidate.row()) return .none;
+            try candidate.blob(1, if (after.*) |*key| key else &.{});
+            if (!try candidate.row()) {
+                after.* = null;
+                return .none;
+            }
             const scope_key = try Store.effectBlob(&candidate, 0, 32);
             const current = try Store.effectBlob(&candidate, 1, 32);
+            if (try candidate.signed(2) == 0) {
+                after.* = scope_key;
+                return .skipped;
+            }
             const chunks = [_][:0]const u8{
                 if (self.schema_version >= store.load_repair_schema)
                     "DELETE FROM effect_observations WHERE rowid IN (SELECT o.rowid FROM effect_intents i JOIN effect_observations o INDEXED BY effect_observations_intent ON o.intent_id=i.intent_id WHERE i.scope_key=?1 LIMIT 256);"
@@ -1763,7 +1839,7 @@ pub fn Methods(comptime Store: type) type {
                     "DELETE FROM effect_observations WHERE rowid IN (SELECT o.rowid FROM effect_intents i JOIN effect_observations o ON o.intent_id=i.intent_id WHERE i.scope_key=?1 LIMIT 256);",
                 "DELETE FROM effect_intents WHERE rowid IN (SELECT rowid FROM effect_intents WHERE scope_key=?1 AND intent_id<>?2 LIMIT 256);",
                 "DELETE FROM effect_owner_revisions WHERE rowid IN (SELECT h.rowid FROM effect_owner_revisions h WHERE h.scope_key=?1 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=h.scope_key AND o.jail=h.jail AND o.revision=h.revision) LIMIT 256);",
-                "DELETE FROM action_targets WHERE rowid IN (SELECT rowid FROM action_targets WHERE scope_key=?1 LIMIT 256);",
+                "DELETE FROM action_targets WHERE rowid IN (SELECT a.rowid FROM effect_owners o CROSS JOIN action_targets a ON a.action_id=o.decision_id AND a.scope_key=o.scope_key AND a.jail=o.jail WHERE o.scope_key=?1 LIMIT 256);",
             };
             for ([_]store.TalliedTable{ .effect_observations, .effect_intents, .effect_owner_revisions, .action_targets, .effect_owners, .native_effects }) |table| self.deletedRows(table);
             while (true) {
@@ -1797,6 +1873,7 @@ pub fn Methods(comptime Store: type) type {
             deleted.* += 1;
             try self.advanceEffectSnapshot();
             self.noteEffectChange(scope_key);
+            after.* = scope_key;
             return if (deleted.* >= 256) .budget else .removed;
         }
         pub fn canonicalHistoryManifest(manifest: consumers.Manifest) bool {

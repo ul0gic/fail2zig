@@ -25,10 +25,15 @@ Arguments for `rig.sh`: binary, work directory, number of distinct source
 addresses, records per second, ban time in seconds. `SETTLE_SECONDS` sets
 how long sampling continues after the generator finishes. `JAILS=n` runs n
 enforcing `portsentry` jails: after readiness, `portsentry-2` to `portsentry-n`
-(maxretry 1) each get one line from 198.18.j.251 on their own log, outside the
+(maxretry 1) each get one line from 192.0.2.j on their own log, outside the
 generator's addresses, and the rig waits until each holds its ban, so every jail
 has a daemon-written checkpoint; the generator feeds only `portsentry`.
 Unset, the rig has today's two jails.
+
+The Python feeder uses monotonic absolute pacing and reports its achieved rate.
+It accepts up to 131,072 distinct addresses. Startup failure, unhealthy storage,
+feeder failure and incomplete ingestion return nonzero; the rig stops its own
+child processes on exit.
 
 ## Appending bans with `attach`
 
@@ -49,8 +54,8 @@ writes `fixture-attach.json` beside the state and refuses to overwrite one.
 | Recurrence | Not processed: every subject is fresh |
 | Clock | Starts at the larger of wall time and the persisted receipt and admission floors, advances 1 µs per record and re-syncs to wall time at each frame; a floor above wall time sets `attach.clock.future_dated` and is never lowered |
 | Jails | `jail=` takes up to 16 distinct existing jails; bans go round-robin under each jail's own generation, decoded policy (`bantime_s` is ignored) and pipeline checkpoint, and occurrences number after the records already present for the fixture source, so `attach` can run repeatedly on one state |
-| Addresses | Sequential in 198.19.0.0/16 from `address_start=` (default 0; `address_start + count` at most 65,536), disjoint from the rig's 198.18.x lines |
-| Timing | `timing_ns` for open, restore, base_catchup, append, final_normalize, close and audit; `attach.chunks` samples elapsed time and page-cache hits and misses every 1,024 bans and at the end |
+| Addresses | Sequential in 198.19.0.0/16 from `address_start=` (default 0; `address_start + count` at most 65,536), disjoint from the rig's first 65,536 generated addresses. The rig can generate 131,072 distinct addresses in 198.18.0.0/15; its second half overlaps the fixture range |
+| Timing | `build_mode` records the generator's optimization mode; `timing_ns` covers open, restore, base_catchup, append, final_normalize, close and audit; `attach.chunks` samples elapsed time and page-cache hits and misses every 1,024 bans and at the end |
 | Publication | With `normalize=1`, `attach.publication.failures` names every failed check: refusal, harness failure, future-dated clock, `kept_existing`, history head not at the consumer checkpoint, pending receipts, live (`lease_kind<>0`) `native_effects` or `effect_owners` growth other than `count` (spent-scope pruning removes only spent rows), any action target not confirmed. Any failure, a refusal or a harness failure exits 1 |
 
 ### Measured build times

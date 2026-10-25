@@ -1,8 +1,21 @@
 #!/usr/bin/env bash
 # Load reproduction rig: drives distinct PortSentry-style bans through a real nftables netlink backend in a rootless network namespace.
-set -u
+set -uo pipefail
 umask 077
 BIN="$1"; WORK="$2"; TARGET="$3"; RATE="$4"; BANTIME="${5:-600}"
+DPID=""; GPID=""
+cleanup() {
+  if [ -n "$GPID" ]; then kill "$GPID" 2>/dev/null || true; wait "$GPID" 2>/dev/null || true; fi
+  if [ -n "$DPID" ]; then
+    kill -TERM "$DPID" 2>/dev/null || true
+    for i in $(seq 1 100); do kill -0 "$DPID" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "$DPID" 2>/dev/null; then kill -KILL "$DPID" 2>/dev/null || true; result=1; fi
+    wait "$DPID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 SOCKDIR="${XDG_RUNTIME_DIR:-/tmp}/b75/$(basename "$WORK")"; rm -rf "$SOCKDIR"; mkdir -p "$WORK/state" "$SOCKDIR"; chmod 700 "$WORK/state"
 SOCK="$SOCKDIR/f.sock"
 LOG="$WORK/portsentry.log"; OTHER="$WORK/other.log"
@@ -54,17 +67,19 @@ echo "rig: starting daemon $BIN" | tee -a "$WORK/rig.log"
 DPID=$!
 echo "$DPID" > "$WORK/daemon.pid"
 T0=$(date +%s.%N)
+ready=0
 for i in $(seq 1 300); do
-  [ -S "$SOCK" ] && grep -q "native: ready" "$WORK/daemon.log" 2>/dev/null && break
+  if [ -S "$SOCK" ] && grep -q "native: ready" "$WORK/daemon.log" 2>/dev/null; then ready=1; break; fi
   if ! kill -0 "$DPID" 2>/dev/null; then echo "rig: daemon died during startup" | tee -a "$WORK/rig.log"; cat "$WORK/daemon.stdout"; exit 2; fi
   sleep 0.1
 done
+if [ "$ready" != 1 ]; then echo "rig: startup did not reach ready" | tee -a "$WORK/rig.log"; exit 2; fi
 T1=$(date +%s.%N)
 echo "rig: ready after $(awk -v a="$T0" -v b="$T1" 'BEGIN{printf "%.2f", b-a}') s" | tee -a "$WORK/rig.log"
 if [ "${JAILS:-1}" -gt 1 ]; then
   for j in $(seq 2 "$JAILS"); do
     ts=$(date -u +%Y-%m-%dT%H:%M:%S.%3N+0000)
-    echo "$ts Scan from: [198.18.$j.251] (198.18.$j.251) protocol: [TCP] port: [23] type: [Connect] IP opts: [unknown] ignored: [false] triggered: [true] noblock: [true] blocked: [false]" >> "$WORK/portsentry-$j.log"
+    echo "$ts Scan from: [192.0.2.$j] (192.0.2.$j) protocol: [TCP] port: [23] type: [Connect] IP opts: [unknown] ignored: [false] triggered: [true] noblock: [true] blocked: [false]" >> "$WORK/portsentry-$j.log"
   done
   want=$(( $(wc -l < "$LOG") + JAILS - 1 ))
   seeded=0
@@ -85,23 +100,12 @@ sample() {
   echo "$now $cpu $st" >> "$WORK/samples.log"
   echo "$st"
 }
-# generator in background: distinct IPs 198.18.A.B
-(
-  n=0
-  interval=$(awk -v r="$RATE" 'BEGIN{printf "%.4f", 1/r}')
-  while [ $n -lt $TARGET ]; do
-    a=$(( (n / 250) % 256 )); b=$(( n % 250 + 1 ))
-    ts=$(date -u +%Y-%m-%dT%H:%M:%S.%3N+0000)
-    echo "$ts Scan from: [198.18.$a.$b] (198.18.$a.$b) protocol: [TCP] port: [23] type: [Connect] IP opts: [unknown] ignored: [false] triggered: [true] noblock: [true] blocked: [false]" >> "$LOG"
-    n=$((n+1))
-    sleep "$interval"
-  done
-  echo "rig: generator done ($n lines)" >> "$WORK/rig.log"
-) &
+python3 "$(dirname "$0")/feed.py" "$LOG" "$TARGET" "$RATE" >> "$WORK/rig.log" 2>&1 &
 GPID=$!
 # sampler: 1 Hz until storage leaves healthy or generator done + settle window
 last_cpu=$(cpu_ticks); last_t=$(date +%s.%N)
 settle=0
+result=0
 while true; do
   st=$(sample)
   now=$(date +%s.%N); cpu=$(cpu_ticks)
@@ -118,25 +122,35 @@ while true; do
   if [ "$storage" != "healthy" ] && [ -n "$storage" ]; then
     echo "rig: storage left healthy: $storage cause=$cause" | tee -a "$WORK/rig.log"
     kill $GPID 2>/dev/null
+    result=1
     break
   fi
   if ! kill -0 $GPID 2>/dev/null; then
     settle=$((settle+1))
     [ $settle -ge ${SETTLE_SECONDS:-30} ] && break
   fi
-  if ! kill -0 "$DPID" 2>/dev/null; then echo "rig: daemon exited" | tee -a "$WORK/rig.log"; break; fi
+  if ! kill -0 "$DPID" 2>/dev/null; then echo "rig: daemon exited" | tee -a "$WORK/rig.log"; result=1; break; fi
   sleep 1
 done
+if [ "$result" != 0 ]; then kill "$GPID" 2>/dev/null || true; fi
+if ! wait "$GPID"; then echo "rig: generator failed" | tee -a "$WORK/rig.log"; result=1; fi
+GPID=""
+expected=$((TARGET + ${JAILS:-1} - 1))
+if [ "$storage" != healthy ] || [ -z "$total" ] || [ "${total:-0}" -lt "$expected" ]; then
+  echo "rig: incomplete: storage=$storage total=$total expected=$expected" | tee -a "$WORK/rig.log"
+  result=1
+fi
 echo "rig: final status:" | tee -a "$WORK/rig.log"
 "$BIN" --socket "$SOCK" --timeout 5000 status --details 2>&1 | tee -a "$WORK/rig.log"
 "$BIN" --socket "$SOCK" --timeout 5000 jails --details 2>&1 | tee -a "$WORK/rig.log"
 echo "rig: daemon log tail:" | tee -a "$WORK/rig.log"
 grep -v "would-ban" "$WORK/daemon.log" | tail -n 25 | tee -a "$WORK/rig.log"
-if [ "${KEEP_RUNNING:-0}" = "1" ]; then
+if [ "${KEEP_RUNNING:-0}" = "1" ] && [ "$result" = 0 ]; then
   echo "rig: leaving daemon running pid $DPID" | tee -a "$WORK/rig.log"
   wait $DPID
 else
-  kill -TERM "$DPID" 2>/dev/null
-  for i in $(seq 1 100); do kill -0 "$DPID" 2>/dev/null || break; sleep 0.1; done
+  cleanup
+  DPID=""
   echo "rig: daemon stopped" | tee -a "$WORK/rig.log"
 fi
+exit "$result"

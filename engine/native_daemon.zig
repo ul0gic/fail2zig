@@ -2885,10 +2885,10 @@ pub const Coordinator = struct {
                     return;
                 }
             },
-            .wait => {
+            .wait => |operation| {
                 self.maintenance_progress = true;
                 self.gates.step_wait += 1;
-                return;
+                if (operation != .obsolete_rows and operation != .spent_scopes) return;
             },
             .idle => record_idle = !step_idle,
         }

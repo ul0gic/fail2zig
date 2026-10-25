@@ -24,7 +24,7 @@ const epoch_us: i64 = 1_767_225_600 * second_us;
 const source_name = "fixture";
 const max_maintenance_steps = 100_000;
 const max_attach_jails = 16;
-// 198.19.0.0/16, disjoint from the rig generator's 198.18.x lines.
+// 198.19.0.0/16; the rig's first 65,536 generated addresses occupy 198.18.0.0/16.
 const attach_addresses = 1 << 16;
 // Receipt, effect and maintenance floors reject only a smaller value, so 1 µs keeps receipts distinct and monotonic.
 const attach_step_us: i64 = 1;
@@ -300,7 +300,7 @@ const Stats = struct {
     retention_deleted: u64 = 0,
     retention_calls: u64 = 0,
     retry_details_pruned: u64 = 0,
-    spent_scopes_pruned: u64 = 0,
+    spent_scope_batches: u64 = 0,
     max_active_leases: usize = 0,
     ban_loop_ms: u64 = 0,
 };
@@ -532,7 +532,17 @@ const Gen = struct {
             if (refusal) |cause| return cause;
             return;
         }
-        try self.stored("Store.commitBatch", self.store.commitBatch(&frame));
+        {
+            errdefer self.store.rollback();
+            for (self.jails.items) |jail| {
+                var cursor = try self.store.statement("DELETE FROM source_cursors WHERE jail=?1 AND source=?2;");
+                defer cursor.deinit();
+                try cursor.text(1, jail.name);
+                try cursor.text(2, source_name);
+                try cursor.done();
+            }
+            try self.stored("Store.commitBatch", self.store.commitBatch(&frame));
+        }
         try self.settleChunk(keys[0..staged], jail_indices[0..staged]);
         if (refusal) |cause| return cause;
     }
@@ -624,26 +634,24 @@ const Gen = struct {
         }
         return error.FixtureUnboundedHistory;
     }
-    // The daemon's maintenance order: one retention step, else one retry-detail
-    // prune, else one spent-scope prune; repeated here until nothing remains.
     fn maintain(self: *Gen) !void {
         for (0..max_maintenance_steps) |_| {
-            if (self.options.retention == .shipped) {
-                self.stats.retention_calls += 1;
-                if (try self.stored("Store.cleanupConfirmedHistoryOne", self.store.cleanupConfirmedHistoryOne(.{ .age_us = self.options.retention_s * second_us, .max_matches = self.options.max_matches }, self.clock.now))) {
-                    self.stats.retention_deleted += 1;
-                    continue;
-                }
+            if (self.options.retention == .shipped) self.stats.retention_calls += 1;
+            switch (try self.stored("Store.maintenanceStep", self.store.maintenanceStep(.{
+                .retention = .{ .age_us = self.options.retention_s * second_us, .max_matches = self.options.max_matches },
+                .now_us = self.clock.now,
+                .history_caught_up = self.options.retention == .shipped,
+                .spent_scopes = true,
+            }))) {
+                .progress => |operation| switch (operation) {
+                    .history_rebuild, .history_details, .history_prefix => self.stats.retention_deleted += 1,
+                    .retry_details => self.stats.retry_details_pruned += 1,
+                    .spent_scopes => self.stats.spent_scope_batches += 1,
+                    .obsolete_rows => {},
+                },
+                .wait => {},
+                .idle => return,
             }
-            if (try self.stored("Store.pruneRetryDecisionDetailsOne", self.store.pruneRetryDecisionDetailsOne())) {
-                self.stats.retry_details_pruned += 1;
-                continue;
-            }
-            if (try self.stored("Store.pruneSpentEffectOne", self.store.pruneSpentEffectOne())) {
-                self.stats.spent_scopes_pruned += 1;
-                continue;
-            }
-            return;
         }
         return error.FixtureUnboundedMaintenance;
     }
@@ -860,14 +868,6 @@ fn runAttach(gen: *Gen) !void {
     if (gen.options.normalize) {
         gen.syncClock();
         try gen.turn();
-    }
-    // The daemon resumes every source cursor of the jail as a file position; the fixture's source has none.
-    for (gen.jails.items) |jail| {
-        var cursor = try gen.store.statement("DELETE FROM source_cursors WHERE jail=?1 AND source=?2;");
-        defer cursor.deinit();
-        try cursor.text(1, jail.name);
-        try cursor.text(2, source_name);
-        try cursor.done();
     }
     report.timings.final_normalize = timer.lap();
     try gen.recordEnd();
@@ -1398,6 +1398,8 @@ pub fn main() !u8 {
     try ws.write("tests/harness/load_repro/fixture.zig");
     try ws.objectField("generator_sha256");
     try ws.write(exe_hash[0..]);
+    try ws.objectField("build_mode");
+    try ws.write(@tagName(@import("builtin").mode));
     try ws.objectField("arguments");
     try ws.write(argv[1..]);
     try ws.objectField("options");
