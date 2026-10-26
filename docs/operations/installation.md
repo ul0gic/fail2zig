@@ -99,15 +99,26 @@ administrator can write there from a shell. `PrivateTmp` still provides writable
 private temporary directories. Its inherited
 `StateDirectory=fail2zig` also makes systemd create `/var/lib/fail2zig` before the
 daemon starts. That directory appearing does not mean the daemon ignored the
-configured path.
+configured path. The daemon reads `state_file` and `socket_path` only from the
+configuration, and the administrative commands use the configured `socket_path`
+when `--socket` is not given. Granting the service write access to a directory is
+the administrator's decision: neither the daemon nor the installer edits the unit.
+When the grant is missing, startup names the directory and points to this section,
+and the installer prints the complete override for your configuration.
+A directory under `/run` is granted with `RuntimeDirectory=<name below /run>`, because
+`/run` is emptied at boot and systemd creates the directory at every start, as it does
+for `/run/fail2zig`; any other directory is granted with `ReadWritePaths=` and must
+exist before the service starts.
 
 This example relocates native SQLite state to `/srv/fail2zig-state/state.bin`,
 keeping the shipped socket path. It assumes the installed service runs as
 `fail2zig:fail2zig`; inspect `sudo systemctl cat fail2zig.service` and
 `sudo systemctl show fail2zig.service -p User -p Group -p ExecStart` first, and
-adapt the exact owner/group if your installation differs. The automatic
-installer deliberately refuses custom `state_file` paths: use the manual
-installation/upgrade procedure after relocation, with all state writers stopped.
+adapt the exact owner/group if your installation differs. The installer accepts
+a custom `state_file` and `socket_path`: it reads them from the configuration with
+the new executable, applies its usual ownership and safety checks to that state
+path, and, when the unit does not yet grant the directories, ends with a "Before
+starting" notice giving the override below. It never writes the override itself.
 
 1. Stop the service and every other daemon, migration or repair process that can
    write this state. Keep them stopped until the configuration and unit agree.
@@ -295,8 +306,8 @@ If storage is unhealthy when the daemon stops, it leaves installed firewall rule
 in place and logs how many remain; the next start reconciles them. A healthy stop
 withdraws its rules while keeping owners and deadlines.
 
-The installer changes ownership only for the default native SQLite state path
-and refuses custom paths, active writers and legacy binary state. Follow the
+The installer changes ownership only for the configured native SQLite state path
+and refuses active writers, unsafe state directories and legacy binary state. Follow the
 [state upgrade boundary](migration-continuity.md#upgrading-fail2zig-state) before
 replacing an installation; never delete state to bypass a refusal. Released
 v0.3.0 binary state has no automatic converter, and releases before v0.4.7 are not

@@ -264,7 +264,11 @@ check_stopped() {
 
 check_state() {
   local path owner mode
-  for path in /var /var/lib "$STATE_DIR"; do
+  local ancestors=() acc="" part
+  local IFS=/
+  for part in ${STATE_DIR#/}; do acc="$acc/$part"; ancestors+=("$acc"); done
+  unset IFS
+  for path in "${ancestors[@]}"; do
     [ ! -L "$path" ] || die "refusing symlink state parent: $path"
     [ -e "$path" ] || continue
     [ -d "$path" ] || die "state parent is not a directory: $path"
@@ -293,14 +297,21 @@ check_state() {
 }
 
 SERVICE_UID="$(id -u "$SYSTEM_USER" 2>/dev/null || :)"
+SOCKET_PATH=/run/fail2zig/fail2zig.sock
 if [ -f "$CONFIG_DIR/config.toml" ]; then
   [ ! -L "$CONFIG_DIR/config.toml" ] || die "refusing symlink configuration"
-  # Conservative recognition, not a second TOML parser: unusual spelling needs
-  # explicit operator review, as do all custom state paths.
-  awk '
-    /^[[:space:]]*#/ { next }
-    /state_file/ && $0 !~ /^[[:space:]]*state_file[[:space:]]*=[[:space:]]*"\/var\/lib\/fail2zig\/state.bin"[[:space:]]*(#.*)?$/ { exit 1 }
-  ' "$CONFIG_DIR/config.toml" || die "custom/unrecognized state_file: stop all writers, back up state, and explicitly chown only its verified parent/database/-wal/-shm to fail2zig:$SYSTEM_GROUP; use a matching systemd ReadWritePaths override. Automatic custom-path upgrades are refused."
+  effective="$("$DAEMON_STAGED" --config "$CONFIG_DIR/config.toml" --test-config 2>/dev/null)" ||
+    die "configuration does not validate with this release; run: ${DAEMON_STAGED} --config ${CONFIG_DIR}/config.toml --test-config"
+  STATE_FILE="$(printf '%s\n' "$effective" | sed -n 's/^config: state_file=//p')"
+  SOCKET_PATH="$(printf '%s\n' "$effective" | sed -n 's/^config: socket_path=//p')"
+  for path in "$STATE_FILE" "$SOCKET_PATH"; do
+    [[ "$path" =~ ^/[a-zA-Z0-9_./-]+$ ]] && [[ "$path/" != */./* ]] && [[ "$path/" != */../* ]] ||
+      die "state_file and socket_path must be absolute and contain only letters, digits, /, _, . or - (got: ${path})"
+  done
+  STATE_DIR="${STATE_FILE%/*}"
+  [ -n "$STATE_DIR" ] || die "state_file must not be directly under /"
+  state_parent="${STATE_DIR%/*}"
+  [ -d "${state_parent:-/}" ] || die "create the parent of the custom state directory first: ${state_parent}"
 fi
 if [ "$DRY_RUN" -ne 1 ]; then check_stopped; fi
 check_state
@@ -398,6 +409,47 @@ else
   log "systemctl not found — skipping daemon-reload"
 fi
 
+GRANT_NOTICE=""
+socket_dir="${SOCKET_PATH%/*}"
+if command -v systemctl >/dev/null 2>&1 && { [ "$STATE_DIR" != /var/lib/fail2zig ] || [ "$socket_dir" != /run/fail2zig ]; }; then
+  writable="$(systemctl show fail2zig.service -p ReadWritePaths --value 2>/dev/null || :)"
+  runtime="$(systemctl show fail2zig.service -p RuntimeDirectory --value 2>/dev/null || :)"
+  needs_grant=0
+  for dir in "$STATE_DIR" "$socket_dir"; do
+    case "$dir" in /var/lib/fail2zig|/run/fail2zig) continue ;; esac
+    covered=0
+    case "$dir" in
+      /run/*)
+        for entry in $runtime; do [ "/run/$entry" = "$dir" ] && covered=1; done
+        [ "$covered" = 1 ] || needs_grant=1 ;;
+      *)
+        for entry in $writable; do
+          entry="${entry#-}"; entry="${entry#+}"
+          case "$dir/" in "${entry%/}/"*) covered=1 ;; esac
+        done
+        [ "$covered" = 1 ] || needs_grant=1 ;;
+    esac
+  done
+  if [ "$needs_grant" = 1 ]; then
+    lines=()
+    if [ "$STATE_DIR" != /var/lib/fail2zig ]; then
+      writable_dirs="$STATE_DIR"
+      case "$socket_dir" in /run/*) ;; *) writable_dirs="$writable_dirs $socket_dir" ;; esac
+      lines+=("ReadWritePaths=" "ReadWritePaths=$writable_dirs /run/fail2zig" "StateDirectory=")
+    else
+      case "$socket_dir" in /run/*) ;; *) lines+=("ReadWritePaths=$socket_dir") ;; esac
+    fi
+    case "$socket_dir" in /run/fail2zig) ;; /run/*) lines+=("RuntimeDirectory=${socket_dir#/run/}") ;; esac
+    GRANT_NOTICE="Before starting: the service unit does not yet let fail2zig write its configured directories.
+Add this override with 'sudo systemctl edit fail2zig.service':
+  [Service]"
+    for line in "${lines[@]}"; do GRANT_NOTICE="${GRANT_NOTICE}
+  ${line}"; done
+    GRANT_NOTICE="${GRANT_NOTICE}
+See \"Custom state directory under systemd\" in docs/operations/installation.md."
+  fi
+fi
+
 
 cat <<SUMMARY
 
@@ -414,7 +466,7 @@ fail2zig installed successfully.
 The service runs as fail2zig:${SYSTEM_GROUP}. No service was started or enabled.
 For future upgrades: stop fail2zig and every foreground writer, back up the complete
 native SQLite state, run this installer, then start after reviewing configuration.
-Only default native SQLite paths receive automatic ownership changes.
+The configured native SQLite state file and its directory receive ownership changes.
 
 Next steps (review the config before starting the daemon):
 
@@ -430,3 +482,4 @@ Verify the daemon sees your jails:
 Documentation: https://github.com/${REPO}
 ----------------------------------------------------------------------
 SUMMARY
+[ -z "$GRANT_NOTICE" ] || printf '\n%s\n' "$GRANT_NOTICE"

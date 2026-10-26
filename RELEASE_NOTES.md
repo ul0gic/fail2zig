@@ -1,9 +1,9 @@
 # fail2zig v0.4.9
 
 Version 0.4.9 is a hardening release. It shows the stored matched line for each
-ban in `history` and `list` (#123), documents running with a custom state path
-under the shipped service unit (#124), and lets configurations with more than ten
-jails start under that unit. It also carries corrections across storage
+ban in `history` and `list` (#123), takes every path from the configuration in
+the daemon, the administrative commands and the installer (#124), and lets
+configurations with more than ten jails start under the shipped service unit. It also carries corrections across storage
 maintenance, reload, jail removal, the admin socket and monitoring, found in a
 full review of the daemon, with no change to how bans are detected, enforced or
 stored.
@@ -14,9 +14,16 @@ stored.
   retained matched line for each event, wrapped onto continuation rows in the
   terminal and complete in JSON (#123). `history_max_matches` (default 10, global
   and per jail) sets how many lines are kept per address; 0 keeps none.
-- Run with a custom state path. The installation guide gives the procedure for a
-  `state_file` outside `/var/lib/fail2zig` under the shipped unit's sandbox,
-  keeping the service hardening (#124).
+- Use the paths in your configuration everywhere (#124). Administrative commands
+  and `migrate` use the configured `socket_path` when `--socket` is not given. A
+  start refused because the service cannot write a configured directory now names
+  the directory and the unit override that grants it, instead of a bare
+  `ReadOnlyFileSystem`. The installer accepts a custom `state_file` and
+  `socket_path`, applies its ownership and safety checks to the configured state,
+  and when the unit does not yet grant those directories it prints the exact unit
+  override to add before you start. The shipped unit stays sandboxed with
+  `ProtectSystem=strict`; granting a directory is the administrator's override,
+  and no fail2zig tool edits the unit.
 - Start with many jails. The daemon raises its open-file soft limit to the hard
   limit the service grants, up to `native_fd_ceiling`, before it checks its
   startup plan. Under the shipped unit, 0.4.8 refused more than ten jails with

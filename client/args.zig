@@ -128,6 +128,7 @@ pub const Command = union(enum) {
 
 pub const Globals = struct {
     socket_path: []const u8 = default_socket_path,
+    socket_set: bool = false,
     output: OutputFormat = .table,
     color: bool = true,
     timeout_ms: u64 = default_timeout_ms,
@@ -187,6 +188,7 @@ pub fn parse(argv: []const []const u8, diag: *ParseDiag) Error!Parsed {
                 return error.MissingValue;
             }
             globals.socket_path = argv[i];
+            globals.socket_set = true;
             continue;
         }
         if (std.mem.eql(u8, a, "--output")) {
@@ -890,6 +892,7 @@ fn takeTrailingGlobal(
             return error.MissingValue;
         }
         globals.socket_path = rest[idx.*];
+        globals.socket_set = true;
         return true;
     }
     if (std.mem.eql(u8, a, "--output")) {
@@ -1022,7 +1025,8 @@ pub const help_top =
     \\    support-bundle      Write a redacted diagnostic bundle for a bug report
     \\
     \\GLOBAL FLAGS:
-    \\    --socket <path>     Unix socket path (default: /run/fail2zig/fail2zig.sock)
+    \\    --socket <path>     Unix socket path (default: socket_path in
+    \\                        /etc/fail2zig/config.toml, else /run/fail2zig/fail2zig.sock)
     \\    --output <fmt>      Output format: table (default), json, plain
     \\    --no-color          Disable ANSI color output
     \\    --timeout <ms>      Command timeout (default: 5000)

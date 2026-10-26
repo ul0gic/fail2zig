@@ -81,7 +81,11 @@ systemctl show fail2zig.service --property=MainPID --value
 .B socket_path
 String (absolute path). Unix domain socket for
 .BR fail2zig (1)
-administration commands.
+administration commands, which read it from
+.I /etc/fail2zig/config.toml
+when
+.B \-\-socket
+is not given.
 Default:
 .IR /run/fail2zig/fail2zig.sock .
 Mode 0660; group
@@ -94,7 +98,9 @@ Integer (1–1024). Maximum simultaneous WebSocket clients. Default: 16.
 .B state_file
 String (absolute path). Durable SQLite database containing source positions,
 records, decisions, owners, effects and history. It is created or opened at
-startup with mode 0600. Corrupt or unsupported state is refused rather than
+startup with mode 0600. Under the shipped systemd unit a directory other than
+.I /var/lib/fail2zig
+needs a ReadWritePaths override; see the installation guide. Corrupt or unsupported state is refused rather than
 silently reset. The file cannot grow past 1 GiB (262,144 pages of 4 KiB); a
 state file already past that size is refused at startup. When a commit fails
 because the file is full, the daemon pauses ingestion, retries after a delay that

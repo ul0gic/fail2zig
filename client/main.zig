@@ -34,23 +34,27 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, raw_argv);
     const argv: []const []const u8 = if (raw_argv.len > 0) raw_argv[1..] else raw_argv;
 
-    const code = run(allocator, argv, std.io.getStdOut().writer(), std.io.getStdErr().writer());
+    const code = run(allocator, argv, null, std.io.getStdOut().writer(), std.io.getStdErr().writer());
     std.process.exit(@intFromEnum(code));
 }
 
 pub fn run(
     allocator: std.mem.Allocator,
     argv: []const []const u8,
+    configured_socket: ?[]const u8,
     stdout: anytype,
     stderr: anytype,
 ) ExitCode {
     var diag: args.ParseDiag = .{};
-    const parsed = args.parse(argv, &diag) catch {
+    var parsed = args.parse(argv, &diag) catch {
         stderr.print("error: {s}\n", .{diag.message()}) catch {};
         stderr.writeAll("try 'fail2zig --help' for usage\n") catch {};
         return .client_error;
     };
 
+    if (!parsed.globals.socket_set) if (configured_socket) |path| {
+        parsed.globals.socket_path = path;
+    };
     const color = format.Color{ .enabled = format.shouldColor(parsed.globals.color) };
 
     switch (parsed.command) {

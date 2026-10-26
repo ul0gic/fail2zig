@@ -268,6 +268,12 @@ const SourceSignature = struct {
     built: bool = false,
 };
 
+pub const WritablePath = enum { state, socket };
+pub fn logSandboxHint(err: anyerror, path: []const u8, kind: WritablePath) void {
+    if (err != error.ReadOnlyFileSystem and err != error.AccessDenied) return;
+    const dir = std.fs.path.dirname(path) orelse "/";
+    std.log.err("native: the service cannot write the {s} directory '{'}'; the shipped systemd unit allows writes only to directories it grants (ProtectSystem=strict); add the unit override from the installation guide, \"Custom state directory under systemd\" (the installer prints it for your configuration)", .{ @tagName(kind), std.zig.fmtEscapes(dir[0..@min(dir.len, 256)]) });
+}
 fn destroyZone(a: std.mem.Allocator, zone: ?*timezone.Zone) void {
     if (zone) |value| {
         value.deinit();
@@ -914,6 +920,7 @@ pub const Coordinator = struct {
         if (requested_enforcing) namespace_lock = try lockFirewallNamespace(cfg);
         var authority_lock = path_guard.lockStateIfPresent(cfg.global.state_file) catch |err| {
             std.log.err("native: state authority admission failed: {s}; path='{'}'{s}", .{ @errorName(err), std.zig.fmtEscapes(cfg.global.state_file[0..@min(cfg.global.state_file.len, 256)]), if (cfg.global.state_file.len > 256) " [path truncated]" else "" });
+            logSandboxHint(err, cfg.global.state_file, .state);
             return err;
         };
         errdefer if (authority_lock) |file| file.close();
@@ -1021,6 +1028,7 @@ pub const Coordinator = struct {
         }
         if (self.authority_lock == null) self.authority_lock = path_guard.lockAbsentState(cfg.global.state_file) catch |err| {
             std.log.err("native: state authority admission failed: {s}; path='{'}'{s}", .{ @errorName(err), std.zig.fmtEscapes(cfg.global.state_file[0..@min(cfg.global.state_file.len, 256)]), if (cfg.global.state_file.len > 256) " [path truncated]" else "" });
+            logSandboxHint(err, cfg.global.state_file, .state);
             return err;
         };
         try self.verifyStateIdentity();

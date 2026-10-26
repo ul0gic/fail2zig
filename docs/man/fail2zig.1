@@ -133,7 +133,11 @@ Print usage and exit.
 .SH GLOBAL FLAGS (ADMINISTRATION)
 .TP
 .BI \-\-socket " path"
-Unix socket. Default:
+Unix socket. Default: the
+.B socket_path
+set in
+.IR /etc/fail2zig/config.toml ,
+else
 .IR /run/fail2zig/fail2zig.sock .
 .TP
 .BI \-\-output " format"
