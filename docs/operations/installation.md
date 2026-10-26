@@ -21,7 +21,7 @@ the unit and man pages, and refuses active state writers or a legacy binary stat
 file. It does not recursively change state ownership. To use a locally built
 binary, run `sudo scripts/install.sh --local-bin zig-out/bin` from the checkout.
 
-The v0.4.8 release provides one combined daemon/admin executable per target:
+The v0.4.9 release provides one combined daemon/admin executable per target:
 
 | Target | Qualification |
 |---|---|
@@ -38,11 +38,11 @@ requires `journalctl`; iptables and ipset backends require their host tools.
 
 If the installer is unsuitable, download only the needed executable and support
 files from the same release, then verify each against `SHA256SUMS` before use. For
-v0.4.8 on x86_64:
+v0.4.9 on x86_64:
 
 ```bash
 set -euo pipefail
-VERSION=v0.4.8
+VERSION=v0.4.9
 ARCH=x86_64-linux-musl
 BASE="https://github.com/ul0gic/fail2zig/releases/download/${VERSION}"
 for file in \
@@ -237,29 +237,34 @@ WAL/SHM siblings. An older binary cannot read newer checkpoint and marker data.
 Rollback requires the matching backup and binary, not an executable swap.
 
 v0.4.7 is the minimum supported upgrade source. The first start of this release
-upgrades a state last written by v0.4.7 (schema 25) to schema 26 in place. Schema 26
-adds ban origins, ignore-entry deadlines and timed configuration entries. States last
-written by v0.4.6 or earlier are not a supported upgrade path; upgrade them through
-v0.4.7 first, or start from a fresh state.
+upgrades a state last written by v0.4.8 (schema 26) to schema 28 in place. A state
+last written by v0.4.7 (schema 25) first takes the v0.4.8 step to schema 26, then
+the same step to 28. Schema 28 adds the records that let a removed or disabled
+jail's state be cleaned in bounded steps. States last written by v0.4.6 or earlier
+are not a supported upgrade path; upgrade them through v0.4.7 first, or start from a
+fresh state.
 
-- Before its first change it writes a coherent copy of the database to a backup. It
+- Before each change it writes a coherent copy of the database to a backup. It
   needs free space of twice the database size plus 32 MiB, and refuses to start if
   that backup file already exists. Move an old backup aside only when it is not the
   sole copy of earlier state.
-- The backup is `<state_file>.pre26-backup`.
-- The upgrade commits in one transaction, so an interrupted upgrade leaves the
-  state at schema 25. Every existing ban gets origin `detection`. The log reports
+- The backup before the schema 28 step is `<state_file>.pre27-backup`; a v0.4.7
+  state also gets `<state_file>.pre26-backup` before its schema 26 step.
+- Each step commits in one transaction, so an interrupted upgrade leaves the state
+  at the schema it last committed. The schema 28 step adds columns with defaults and
+  new tables only, so its cost does not grow with the state. The log reports
   completion and the backup path.
 
-v0.4.7 and older binaries refuse a schema 26 database with their schema-version
+v0.4.8 and older binaries refuse a schema 28 database with their schema-version
 message, so an older binary cannot be started on upgraded state without
 restoring the backup.
 
 To roll back, stop the daemon, restore the backup the upgrade wrote over the state
 file, remove the upgraded database's `-wal`/`-shm` files and reinstall the binary
-that last wrote that state: v0.4.7 for `.pre26-backup`. If you copied the backup
-into place instead of moving it, move the backup file aside before the next
-upgrade, because an existing backup file refuses the start.
+that last wrote that state: v0.4.8 for `.pre27-backup`, v0.4.7 for
+`.pre26-backup`. If you copied the backup into place instead of moving it, move the
+backup file aside before the next upgrade, because an existing backup file refuses
+the start.
 
 A file source that cannot resume does not stop the daemon. This covers a file
 truncated in place below its saved position, a rotated-out file removed while it

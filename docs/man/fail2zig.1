@@ -1320,21 +1320,22 @@ capabilities and caller-owned private staging, with the destination daemon
 stopped. See docs/operations/command-migration.md and migration-continuity.md.
 .PP
 v0.4.7 is the minimum supported upgrade source. The first start of this version
-upgrades a state last written by v0.4.7 (schema 25) to schema 26, which adds ban
-origins, ignore-entry deadlines and the table of timed configuration entries; every
-existing ban gets origin
-.BR detection .
+upgrades a state last written by v0.4.8 (schema 26) to schema 28, which adds the
+records that let a removed or disabled jail's state be cleaned in bounded steps. A
+state last written by v0.4.7 (schema 25) first takes the v0.4.8 step to schema 26.
 States last written by v0.4.6 or earlier are not a supported upgrade path; upgrade
-them through v0.4.7 first, or start from a fresh state. Before its change the daemon
+them through v0.4.7 first, or start from a fresh state. Before each change the daemon
 writes a coherent copy of the database to a backup, which needs free space of twice
 the database size plus 32 MiB, and refuses to start if that file already exists; move
 an old backup aside only when it is not the sole copy of earlier state.
 .IP \(bu 2
-The backup is
+The backup before the schema 28 step is
+.IR <state_file>.pre27-backup ;
+a v0.4.7 state also gets
 .IR <state_file>.pre26-backup .
 .PP
-The upgrade commits in one transaction, so an interrupted upgrade leaves the state at
-schema 25. v0.4.7 and older binaries refuse schema 26 state with their
+Each step commits in one transaction, so an interrupted upgrade leaves the state at
+the schema it last committed. v0.4.8 and older binaries refuse schema 28 state with their
 .B UnsupportedSchema
 message. Keep the backup until the upgraded daemon has been checked. Rollback means stopping the daemon, restoring the
 backup the upgrade wrote over the state file, removing the upgraded database's
