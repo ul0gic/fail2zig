@@ -505,6 +505,14 @@ test "native daemon: ingests a new decision after obsolete detail capacity is re
     try waitReady(&h);
     try h.writeLine(failure);
     try waitStatus(&h, "\"decisions_total\":1");
+    var timer = try std.time.Timer.start();
+    const reclaimed = while (timer.read() < 30 * std.time.ns_per_s) {
+        var probe = try engine.native_store_mod.Store.openReadOnly(t.allocator, h.state_path);
+        defer probe.close();
+        if (try probe.inspectInteger("SELECT count(*) FROM retry_decision_details;") < 65536) break true;
+        std.time.sleep(100 * std.time.ns_per_ms);
+    } else false;
+    try t.expect(reclaimed);
     try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try h.stopDaemon());
     var store = try engine.native_store_mod.Store.openReadOnly(t.allocator, h.state_path);
     defer store.close();
