@@ -14,9 +14,14 @@ const effects = @import("../core/native_effect.zig");
 const effect_history = @import("../core/native_effect_history.zig");
 const application_history = @import("../core/native_application_history.zig");
 const action_outcome = @import("../core/native_action_outcome.zig");
-pub const latest_schema: i64 = 26;
+pub const latest_schema: i64 = 28;
 pub const load_repair_schema: i64 = 24;
 pub const load_repair = @import("load_repair_migration.zig");
+pub const SchemaReadyOptions = struct {
+    maximum_pending: usize,
+    migration: load_repair.Options,
+    progress: ?@import("../core/sd_notify.zig").Hook = null,
+};
 pub const max_native_detections = 16;
 const Db = opaque {};
 const Statement = opaque {};
@@ -50,7 +55,7 @@ const embedded_api: Api = blk: {
     }
     break :blk api;
 };
-pub const Error = application_history.Error || action_outcome.Error || retry.Error || consumers.Error || effects.Error || effect_history.Error || action_context.Error || error{ MaintenancePinned, StaleMaintenance, PrunedReplay, InvalidMaintenanceState, MaintenanceStorageRequired, ConsumerManifestRequired, ConsumerManifestMismatch, ConsumerManifestMissing, ConsumerManifestExists, ConsumerMigrationRequired, MissingRequiredConsumer, AmbiguousNativeDetection, AmbiguousRetryDecision, ConsumerStorageRequired, StaleConsumerCheckpoint, OpenFailed, UnsafePermissions, ForeignDatabase, UnsupportedSchema, DatabaseFailure, Busy, StorageFull, ReadOnly, StorageIo, CorruptDatabase, StorageLimit, Interrupted, AccessDenied, ReopenRequired, InvalidRecord, OccurrenceConflict, StaleCheckpoint, StaleSharedCheckpoint, InjectedFailure, OutOfMemory, ReceiptStorageRequired, InferenceStorageRequired, DetectionStorageRequired, ReceiptConflict, ReceiptRequired, ReceiptAlreadyCommitted, ReceiptLimit, RetryStorageRequired, RetryAdmissionRequired, RetryGenerationMismatch, RetryMigrationRequired, RetryCapacity, ReceiptClockReversed, HistoryResetStorageRequired, InvalidHistoryReset, StaleHistoryReset, AdminStorageRequired, MigrationStorageRequired, StaleAdminRevision, InvalidAdminRequest, AdminRequestCapacity, RetryPolicyInFlight, StalePolicyTransition, ConfigGenerationExists, ConfigGenerationMissing, MigrationRunExists, MigrationRunMissing, MigrationStepMissing, MigrationStepOpen, MigrationStepOrder, InvalidMigrationRow, InvalidMigrationState, MigrationJailUnknown, LoadRepairMigrationIncomplete, LoadRepairWritersPending, LoadRepairBackupExists, LoadRepairBackupInvalid, LoadRepairDiskSpace, LoadRepairVerificationFailed, LoadRepairInvalidState, SchemaBackupExists, IgnoreCapacity, InvalidIgnoreEntry, ReserveBackpressure, MaintenanceWorkExhausted, LiveOwnerCounterInvalid };
+pub const Error = application_history.Error || action_outcome.Error || retry.Error || consumers.Error || effects.Error || effect_history.Error || action_context.Error || error{ MaintenancePinned, StaleMaintenance, PrunedReplay, InvalidMaintenanceState, MaintenanceStorageRequired, ConsumerManifestRequired, ConsumerManifestMismatch, ConsumerManifestMissing, ConsumerManifestExists, ConsumerMigrationRequired, MissingRequiredConsumer, AmbiguousNativeDetection, AmbiguousRetryDecision, ConsumerStorageRequired, StaleConsumerCheckpoint, OpenFailed, UnsafePermissions, ForeignDatabase, UnsupportedSchema, DatabaseFailure, Busy, StorageFull, ReadOnly, StorageIo, CorruptDatabase, StorageLimit, Interrupted, AccessDenied, ReopenRequired, InvalidRecord, OccurrenceConflict, StaleCheckpoint, StaleSharedCheckpoint, InjectedFailure, OutOfMemory, ReceiptStorageRequired, InferenceStorageRequired, DetectionStorageRequired, ReceiptConflict, ReceiptRequired, ReceiptAlreadyCommitted, ReceiptLimit, RetryStorageRequired, RetryAdmissionRequired, RetryGenerationMismatch, RetryMigrationRequired, RetryCapacity, RetryEligibilityPending, ReceiptClockReversed, HistoryResetStorageRequired, InvalidHistoryReset, StaleHistoryReset, AdminStorageRequired, MigrationStorageRequired, StaleAdminRevision, InvalidAdminRequest, AdminRequestCapacity, RetryPolicyInFlight, StalePolicyTransition, ConfigGenerationExists, ConfigGenerationMissing, MigrationRunExists, MigrationRunMissing, MigrationStepMissing, MigrationStepOpen, MigrationStepOrder, InvalidMigrationRow, InvalidMigrationState, MigrationJailUnknown, LoadRepairMigrationIncomplete, LoadRepairWritersPending, LoadRepairBackupExists, LoadRepairBackupInvalid, LoadRepairDiskSpace, LoadRepairVerificationFailed, LoadRepairInvalidState, SchemaBackupExists, IgnoreCapacity, InvalidIgnoreEntry, ReserveBackpressure, MaintenanceWorkExhausted, LiveOwnerCounterInvalid, CustomLegacyProofRequired, CustomLegacyIdentityMismatch };
 
 pub const OpenStage = enum {
     path_validation,
@@ -214,11 +219,27 @@ pub const EscalationSelection = struct {
 pub const EffectInvalidation = struct {
     context: ?*anyopaque,
     invalidate: *const fn (?*anyopaque) void,
+    retirement_pending: ?*const fn (?*anyopaque, effects.Hash, []const effects.Owner, effects.Lease) void = null,
 };
 pub const max_retention_page: u16 = 256;
 // A transaction allows 1,000 progress callbacks of 1,000 VM steps (workProgress).
 pub const max_held_window: u16 = 8192;
 pub const ReclaimCursor = struct { phase: u2 = 0, cursor: i64 = 0, found: bool = false, rest: u8 = 0 };
+const statement_cache_slots = 512;
+const CachedStatement = struct { hash: u64 = 0, stmt: ?*Statement = null, in_use: bool = false };
+pub const RowTallies = struct {
+    effect_observations: ?i64 = null,
+    confirmed_effect_events: ?i64 = null,
+    effect_owners: ?i64 = null,
+    native_effects: ?i64 = null,
+    effect_owner_revisions: ?i64 = null,
+    effect_intents: ?i64 = null,
+    action_targets: ?i64 = null,
+    confirmed_event_details: ?i64 = null,
+    retry_states: ?i64 = null,
+    retry_decision_details: ?i64 = null,
+};
+pub const TalliedTable = std.meta.FieldEnum(RowTallies);
 pub const Store = struct {
     allocator: std.mem.Allocator,
     api: Api,
@@ -228,15 +249,15 @@ pub const Store = struct {
     consumer_clock_floor_us: ?i64 = null,
     effect_publication_epoch: u64 = 0,
     effect_invalidation: ?EffectInvalidation = null,
-    attributed_changes: [attribution_ring]AttributedChange = [_]AttributedChange{.{}} ** attribution_ring,
+    attributed_changes: *[attribution_ring]AttributedChange,
     noted_keys: [attribution_batch]effects.Hash = undefined,
     noted_count: u8 = 0,
     noted_ambiguous: bool = false,
-    observation_rows: ?i64 = null,
-    event_rows: ?i64 = null,
+    row_tallies: RowTallies = .{},
     reopen_required: bool = false,
     startup_admission: bool = false,
     startup_operation: bool = false,
+    startup_rebind_effects_changed: bool = false,
     fail_at: ?CommitStage = null,
     rekeyed_owners: bool = false,
     schema_version: i64 = 2,
@@ -247,16 +268,25 @@ pub const Store = struct {
     load_repair_backup_verified: bool = false,
     load_repair_migrated: bool = false,
     retention_page: u16 = max_retention_page,
+    retention_aux_turn: u2 = 0,
+    history_retention_rest: bool = false,
     held_cursor: i64 = 0,
     held_window: u16 = max_held_window,
     reclaim: ReclaimCursor = .{},
+    reclaim_turn: bool = false,
+    prune_batch: u8 = attribution_batch,
+    prune_after: ?effects.Hash = null,
     retry_detail_rest: u8 = 0,
     maintenance_operation: ?@import("../core/storage_health.zig").MaintenanceOperation = null,
     history_overload_notice_us: ?i64 = null,
     escalation_jitter_context: ?*anyopaque = null,
     escalation_jitter: *const fn (?*anyopaque, u64) u64 = systemEscalationJitter,
     retry_evictions: @import("consumer_retry.zig").Evictions = .{},
+    retry_projection_initialized: bool = false,
+    retry_admission_target_hint: ?i64 = null,
+    retry_admission_work_left: u16 = 256,
     diag_changes: if (build_options.diag) i64 else void = if (build_options.diag) 0 else {},
+    statement_cache: ?*[statement_cache_slots]CachedStatement = null,
 
     fn systemEscalationJitter(_: ?*anyopaque, maximum_seconds: u64) u64 {
         return std.crypto.random.uintAtMost(u64, maximum_seconds);
@@ -277,6 +307,11 @@ pub const Store = struct {
         var sql: [80]u8 = undefined;
         const maximum = std.fmt.bufPrintZ(&sql, "PRAGMA max_page_count={d};", .{pages}) catch return error.StorageLimit;
         if (try self.integer(maximum) != pages) return error.StorageLimit;
+        if (self.statement_cache == null) {
+            const cache = try self.allocator.create([statement_cache_slots]CachedStatement);
+            @memset(cache, .{});
+            self.statement_cache = cache;
+        }
         self.runtime_limits = true;
         const progress = @extern(*const fn (*Db, c_int, ?*const fn (?*anyopaque) callconv(.c) c_int, ?*anyopaque) callconv(.c) void, .{ .name = "sqlite3_progress_handler" });
         progress(self.db, 1000, workProgress, self);
@@ -318,9 +353,9 @@ pub const Store = struct {
         if (self.startup_admission) return error.DatabaseFailure;
         if (self.runtime_path) |path| try self.maintainWal(path);
         try self.exec("BEGIN IMMEDIATE;");
+        self.retry_admission_work_left = 256;
         if (comptime build_options.diag) self.diagMarkChanges();
-        self.observation_rows = null;
-        self.event_rows = null;
+        self.row_tallies = .{};
         self.noted_count = 0;
         self.noted_ambiguous = false;
     }
@@ -328,14 +363,28 @@ pub const Store = struct {
     pub fn beginStartupAdmission(self: *Store) Error!void {
         try self.beginWrite();
         self.startup_admission = true;
+        self.startup_rebind_effects_changed = false;
     }
     pub fn finishStartupAdmission(self: *Store) Error!void {
         if (!self.startup_admission or self.startup_operation) return error.DatabaseFailure;
-        try self.exec("COMMIT;");
+        self.exec("COMMIT;") catch |failure| {
+            if (self.startup_rebind_effects_changed) self.reopen_required = true;
+            self.startup_rebind_effects_changed = false;
+            return failure;
+        };
         if (comptime build_options.diag) self.diagCommitted();
         self.startup_admission = false;
+        const changed = self.startup_rebind_effects_changed;
+        self.startup_rebind_effects_changed = false;
+        if (changed) {
+            if (self.effect_invalidation) |hook| hook.invalidate(hook.context);
+            self.effect_publication_epoch +|= 1;
+            const epoch = self.effect_publication_epoch;
+            self.attributed_changes[@intCast(epoch % attribution_ring)] = .{ .epoch = epoch, .count = 0 };
+        }
     }
     pub fn abortStartupAdmission(self: *Store) void {
+        self.startup_rebind_effects_changed = false;
         if (!self.startup_admission) return;
         self.startup_admission = false;
         self.startup_operation = false;
@@ -348,8 +397,8 @@ pub const Store = struct {
         try self.usable();
         if (!self.startupAdmissionActive()) return error.DatabaseFailure;
         self.work_remaining = 1000;
-        self.observation_rows = null;
-        self.event_rows = null;
+        self.retry_admission_work_left = 256;
+        self.row_tallies = .{};
         try self.exec("SAVEPOINT native_startup_operation;");
         self.startup_operation = true;
         self.noted_count = 0;
@@ -366,6 +415,7 @@ pub const Store = struct {
     pub fn commitTransaction(self: *Store) Error!void {
         const diag_span = if (comptime build_options.diag) diag_mod.enter(.commit) else {};
         defer if (comptime build_options.diag) diag_mod.leave(diag_span);
+        self.row_tallies = .{};
         if (!self.startup_admission) {
             try self.exec("COMMIT;");
             if (comptime build_options.diag) self.diagCommitted();
@@ -379,6 +429,7 @@ pub const Store = struct {
     // Invalidate before durable publication; a failed COMMIT stays conservatively
     // uncertain until the caller republishes a verified view. Never restore here.
     pub fn commitEffectTransaction(self: *Store, changed: bool) Error!void {
+        if (comptime build_options.diag) self.diagRecountTallies();
         if (changed) if (self.effect_invalidation) |hook| hook.invalidate(hook.context);
         try self.commitTransaction();
         if (changed) {
@@ -390,6 +441,56 @@ pub const Store = struct {
         }
         self.noted_count = 0;
         self.noted_ambiguous = false;
+    }
+    fn diagRecountTallies(self: *Store) void {
+        const diag_span = diag_mod.enter(.tally_check);
+        defer diag_mod.leave(diag_span);
+        const saved_work = self.work_remaining;
+        const saved_error = self.last_error_code;
+        defer {
+            self.work_remaining = saved_work;
+            self.last_error_code = saved_error;
+        }
+        inline for (comptime std.enums.values(TalliedTable)) |table| if (@field(self.row_tallies, @tagName(table))) |tallied| {
+            self.work_remaining = 1000;
+            if (self.integer("SELECT count(*) FROM " ++ @tagName(table) ++ ";")) |counted| {
+                diag_mod.count(.consistency_checks, 1);
+                if (counted != tallied) diag_mod.event(.consistency_mismatch, .{ .subject = @tagName(table), .cause = "row_tally", .value = @abs(counted - tallied) });
+            } else |_| diag_mod.count(.consistency_skipped, 1);
+        };
+    }
+    // Capacity guards count a table once per transaction; inserts and trims adjust it in memory, any other delete forgets it.
+    pub fn tableRows(self: *Store, table: TalliedTable) Error!i64 {
+        switch (table) {
+            inline else => |known| {
+                const tally = &@field(self.row_tallies, @tagName(known));
+                if (tally.* == null) {
+                    const diag_span = if (comptime build_options.diag) diag_mod.enter(.capacity_count) else {};
+                    defer if (comptime build_options.diag) diag_mod.leave(diag_span);
+                    tally.* = try self.integer("SELECT count(*) FROM " ++ @tagName(known) ++ ";");
+                }
+                return tally.*.?;
+            },
+        }
+    }
+    pub fn insertedRows(self: *Store, table: TalliedTable, rows: i64) void {
+        switch (table) {
+            inline else => |known| if (@field(self.row_tallies, @tagName(known))) |*tally| {
+                tally.* += rows;
+            },
+        }
+    }
+    pub fn removedRows(self: *Store, table: TalliedTable, rows: i64) void {
+        switch (table) {
+            inline else => |known| if (@field(self.row_tallies, @tagName(known))) |*tally| {
+                tally.* -= rows;
+            },
+        }
+    }
+    pub fn deletedRows(self: *Store, table: TalliedTable) void {
+        switch (table) {
+            inline else => |known| @field(self.row_tallies, @tagName(known)) = null,
+        }
     }
     pub const attribution_ring = 256;
     pub const attribution_batch = @import("group_commit.zig").max_batch_records;
@@ -509,8 +610,17 @@ pub const Store = struct {
             const failure = if (opened != 0) sqliteError(opened) else error.OpenFailed;
             return openFailure(diagnostic, .sqlite_open, failure, null, if (opened != 0) opened else null);
         }
-        var self = Store{ .allocator = allocator, .api = api, .db = db.? };
-        errdefer _ = self.api.close(self.db);
+        const ring = allocator.create([attribution_ring]AttributedChange) catch {
+            _ = api.close(db.?);
+            return openFailure(diagnostic, .connection_setup, error.OutOfMemory, null, null);
+        };
+        @memset(ring, .{});
+        var self = Store{ .allocator = allocator, .api = api, .db = db.?, .attributed_changes = ring };
+        errdefer {
+            self.releaseStatementCache();
+            _ = self.api.close(self.db);
+            allocator.destroy(ring);
+        }
         const db_config = @extern(*const fn (*Db, c_int, ...) callconv(.c) c_int, .{ .name = "sqlite3_db_config" });
         self.last_error_code = null;
         self.check(db_config(self.db, 1006, @as(c_int, 1), @as(?*c_int, null))) catch |failure|
@@ -560,7 +670,7 @@ pub const Store = struct {
                 return openFailure(diagnostic, .schema_inspection, failure, null, self.last_error_code);
             if (migration_rows != 1) return openFailure(diagnostic, .schema_validation, error.UnsupportedSchema, null, null);
         }
-        self.schema_version = if (open_mode == .preflight) schema else @max(schema, 2);
+        self.schema_version = if (open_mode == .preflight or (runtime and schema == 0)) schema else @max(schema, 2);
         if (open_mode == .readonly or open_mode == .preflight) {
             if (application == 0 and open_mode == .readonly)
                 return openFailure(diagnostic, .schema_validation, error.ForeignDatabase, null, null);
@@ -596,27 +706,29 @@ pub const Store = struct {
                 return openFailure(diagnostic, .schema_setup, failure, null, self.last_error_code);
             if (synchronous != 2) return openFailure(diagnostic, .schema_setup, error.DatabaseFailure, null, null);
         }
-        self.beginWrite() catch |failure|
-            return openFailure(diagnostic, .schema_setup, failure, null, self.last_error_code);
-        self.exec(
-            \\CREATE TABLE IF NOT EXISTS records(jail TEXT NOT NULL,source TEXT NOT NULL,occurrence TEXT NOT NULL,raw_hash BLOB NOT NULL CHECK(length(raw_hash)=32),cursor BLOB NOT NULL,event_time BLOB CHECK(event_time IS NULL OR length(event_time)=8),timestamp_us TEXT,disposition TEXT NOT NULL,PRIMARY KEY(jail,source,occurrence));
-            \\CREATE TABLE IF NOT EXISTS source_cursors(jail TEXT NOT NULL,source TEXT NOT NULL,cursor BLOB NOT NULL,occurrence TEXT NOT NULL,path TEXT,PRIMARY KEY(jail,source));
-            \\CREATE TABLE IF NOT EXISTS checkpoints(jail TEXT PRIMARY KEY NOT NULL,payload BLOB NOT NULL,revision INTEGER NOT NULL CHECK(revision>0));
-            \\CREATE TABLE IF NOT EXISTS shared_checkpoints(name TEXT PRIMARY KEY NOT NULL,payload BLOB NOT NULL,revision INTEGER NOT NULL CHECK(revision>0));
-            \\CREATE TABLE IF NOT EXISTS action_intents(jail TEXT NOT NULL,source TEXT NOT NULL,occurrence TEXT NOT NULL,payload BLOB NOT NULL,status TEXT NOT NULL DEFAULT 'pending',PRIMARY KEY(jail,source,occurrence),FOREIGN KEY(jail,source,occurrence) REFERENCES records(jail,source,occurrence));
-            \\PRAGMA application_id=1177705009;
-        ) catch |err| {
-            self.rollback();
-            return openFailure(diagnostic, .schema_setup, err, null, self.last_error_code);
-        };
-        if (schema < 2) self.exec("PRAGMA user_version=2;") catch |err| {
-            self.rollback();
-            return openFailure(diagnostic, .schema_setup, err, null, self.last_error_code);
-        };
-        self.commitTransaction() catch |err| {
-            self.rollback();
-            return openFailure(diagnostic, .schema_setup, err, null, self.last_error_code);
-        };
+        if (!runtime or (schema != 0 and schema < load_repair.runtime_schema)) {
+            self.beginWrite() catch |failure|
+                return openFailure(diagnostic, .schema_setup, failure, null, self.last_error_code);
+            self.exec(
+                \\CREATE TABLE IF NOT EXISTS records(jail TEXT NOT NULL,source TEXT NOT NULL,occurrence TEXT NOT NULL,raw_hash BLOB NOT NULL CHECK(length(raw_hash)=32),cursor BLOB NOT NULL,event_time BLOB CHECK(event_time IS NULL OR length(event_time)=8),timestamp_us TEXT,disposition TEXT NOT NULL,PRIMARY KEY(jail,source,occurrence));
+                \\CREATE TABLE IF NOT EXISTS source_cursors(jail TEXT NOT NULL,source TEXT NOT NULL,cursor BLOB NOT NULL,occurrence TEXT NOT NULL,path TEXT,PRIMARY KEY(jail,source));
+                \\CREATE TABLE IF NOT EXISTS checkpoints(jail TEXT PRIMARY KEY NOT NULL,payload BLOB NOT NULL,revision INTEGER NOT NULL CHECK(revision>0));
+                \\CREATE TABLE IF NOT EXISTS shared_checkpoints(name TEXT PRIMARY KEY NOT NULL,payload BLOB NOT NULL,revision INTEGER NOT NULL CHECK(revision>0));
+                \\CREATE TABLE IF NOT EXISTS action_intents(jail TEXT NOT NULL,source TEXT NOT NULL,occurrence TEXT NOT NULL,payload BLOB NOT NULL,status TEXT NOT NULL DEFAULT 'pending',PRIMARY KEY(jail,source,occurrence),FOREIGN KEY(jail,source,occurrence) REFERENCES records(jail,source,occurrence));
+                \\PRAGMA application_id=1177705009;
+            ) catch |err| {
+                self.rollback();
+                return openFailure(diagnostic, .schema_setup, err, null, self.last_error_code);
+            };
+            if (schema < 2) self.exec("PRAGMA user_version=2;") catch |err| {
+                self.rollback();
+                return openFailure(diagnostic, .schema_setup, err, null, self.last_error_code);
+            };
+            self.commitTransaction() catch |err| {
+                self.rollback();
+                return openFailure(diagnostic, .schema_setup, err, null, self.last_error_code);
+            };
+        }
         self.last_error_code = null;
         self.check(db_config(self.db, 1006, @as(c_int, 0), @as(?*c_int, null))) catch |failure|
             return openFailure(diagnostic, .connection_setup, failure, null, self.last_error_code);
@@ -813,6 +925,10 @@ pub const Store = struct {
     pub usingnamespace @import("effects.zig").Methods(@This());
 
     pub usingnamespace @import("consumer_retry.zig").Methods(@This());
+
+    pub usingnamespace @import("retry_projection.zig").Methods(@This());
+
+    pub usingnamespace @import("custom_rebind.zig").Methods(@This());
 
     pub fn receiptClock(self: *Store) Error!?native_time.Timestamp {
         try self.beginRead();
@@ -1153,8 +1269,18 @@ pub const Store = struct {
     }
 
     pub fn close(self: *Store) void {
+        self.releaseStatementCache();
         _ = self.api.close(self.db);
+        self.allocator.destroy(self.attributed_changes);
         self.* = undefined;
+    }
+    fn releaseStatementCache(self: *Store) void {
+        const cache = self.statement_cache orelse return;
+        for (cache) |slot| if (slot.stmt) |cached| {
+            _ = self.api.finalize(cached);
+        };
+        self.allocator.destroy(cache);
+        self.statement_cache = null;
     }
     pub fn check(self: *Store, rc: c_int) Error!void {
         if (rc == 0) return;
@@ -1170,8 +1296,7 @@ pub const Store = struct {
     }
     pub fn rollback(self: *Store) void {
         self.work_remaining = 1000;
-        self.observation_rows = null;
-        self.event_rows = null;
+        self.row_tallies = .{};
         if (self.api.get_autocommit(self.db) != 0) {
             if (self.startup_admission) self.reopen_required = true;
             self.startup_operation = false;
@@ -1205,9 +1330,46 @@ pub const Store = struct {
     pub fn statement(self: *Store, sql: [:0]const u8) Error!Stmt {
         try self.usable();
         if (self.runtime_limits and self.api.get_autocommit(self.db) != 0) self.work_remaining = 1000;
+        if (!self.runtime_limits) return self.prepare(sql);
+        const cache = self.statement_cache orelse return self.prepare(sql);
+        const hash = std.hash.Wyhash.hash(0, sql);
+        var index: usize = @intCast(hash % statement_cache_slots);
+        const free = for (0..statement_cache_slots) |_| {
+            const slot = &cache[index];
+            const cached = slot.stmt orelse break index;
+            // Compared by text: runtime-formatted SQL can reuse one buffer address for different statements.
+            if (slot.hash == hash and preparedTextEql(cached, sql)) {
+                if (slot.in_use) {
+                    if (comptime build_options.diag) diag_mod.count(.statement_cache_bypasses, 1);
+                    return self.prepare(sql);
+                }
+                slot.in_use = true;
+                return .{ .store = self, .ptr = cached, .slot = slot };
+            }
+            index = (index + 1) % statement_cache_slots;
+        } else {
+            if (comptime build_options.diag) diag_mod.count(.statement_cache_bypasses, 1);
+            return self.prepare(sql);
+        };
+        var stmt = try self.prepare(sql);
+        if (!preparedTextEql(stmt.ptr, sql)) {
+            if (comptime build_options.diag) diag_mod.count(.statement_cache_bypasses, 1);
+            return stmt;
+        }
+        cache[free] = .{ .hash = hash, .stmt = stmt.ptr, .in_use = true };
+        stmt.slot = &cache[free];
+        return stmt;
+    }
+    fn prepare(self: *Store, sql: [:0]const u8) Error!Stmt {
         var ptr: ?*Statement = null;
+        if (comptime build_options.diag) diag_mod.count(.statement_prepares, 1);
         try self.check(self.api.prepare(self.db, sql, -1, &ptr, null));
         return .{ .store = self, .ptr = ptr orelse return error.DatabaseFailure };
+    }
+    fn preparedTextEql(prepared: *Statement, sql: []const u8) bool {
+        const sql_of = @extern(*const fn (*Statement) callconv(.c) ?[*:0]const u8, .{ .name = "sqlite3_sql" });
+        const text = sql_of(prepared) orelse return false;
+        return std.mem.eql(u8, std.mem.span(text), sql);
     }
     pub fn integer(self: *Store, sql: [:0]const u8) Error!i64 {
         var stmt = try self.statement(sql);
@@ -1368,11 +1530,7 @@ pub const Store = struct {
             if (current_revision != shared.expected_revision or (shared.payload != null and current_revision >= std.math.maxInt(i64))) return error.StaleSharedCheckpoint;
         }
         if (schema >= 12) {
-            const registered = try self.manifestExists(record.jail, record.source);
-            if (registered != (record.consumer_manifest != null)) return error.ConsumerManifestRequired;
             if (record.consumer_manifest) |manifest| {
-                if (!std.mem.eql(u8, manifest.jail, record.jail) or !std.mem.eql(u8, manifest.source, record.source)) return error.ConsumerManifestMismatch;
-                if (record.receipt) |receipt| if (!std.mem.eql(u8, &receipt.generation, &manifest.source_generation)) return error.ConsumerManifestMismatch;
                 if (record.receipt == null and detections.len != 0) return error.ReceiptRequired;
                 const batch = record.consumers orelse return error.ConsumerManifestRequired;
                 try self.checkManifestBatch(manifest, batch, true, false);
@@ -1699,8 +1857,17 @@ pub const Store = struct {
 pub const Stmt = struct {
     store: *Store,
     ptr: *Statement,
+    slot: ?*CachedStatement = null,
     pub fn deinit(self: *Stmt) void {
-        _ = self.store.api.finalize(self.ptr);
+        const slot = self.slot orelse {
+            _ = self.store.api.finalize(self.ptr);
+            return;
+        };
+        const resetStatement = @extern(*const fn (*Statement) callconv(.c) c_int, .{ .name = "sqlite3_reset" });
+        const clearBindings = @extern(*const fn (*Statement) callconv(.c) c_int, .{ .name = "sqlite3_clear_bindings" });
+        _ = resetStatement(self.ptr);
+        _ = clearBindings(self.ptr);
+        slot.in_use = false;
     }
     // SQLITE_STATIC (null destructor): bound bytes must outlive every step; never bind a returning helper's by-value parameters.
     pub fn text(self: *Stmt, index: c_int, value: []const u8) Error!void {

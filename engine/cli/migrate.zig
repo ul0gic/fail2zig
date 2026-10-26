@@ -31,7 +31,7 @@ const Parsed = struct {
     output: Output = .json,
     state_file: ?[]const u8 = null,
     backend: ?import_mod.Backend = null,
-    socket_path: []const u8 = "/run/fail2zig/fail2zig.sock",
+    socket_path: ?[]const u8 = null,
     run_id: ?[32]u8 = null,
     source_verified: bool = false,
     runtime_socket: ?[]const u8 = null,
@@ -121,7 +121,7 @@ fn parseFlags(args: []const []const u8, stderr: anytype) ?Parsed {
     return out;
 }
 
-pub fn run(allocator: std.mem.Allocator, args: []const []const u8, tool_version: []const u8, stdout: anytype, stderr: anytype) ExitClass {
+pub fn run(allocator: std.mem.Allocator, args: []const []const u8, tool_version: []const u8, configured_socket: ?[]const u8, stdout: anytype, stderr: anytype) ExitClass {
     for (args) |arg| if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
         stdout.writeAll(cli.args.help_migrate) catch return .rejected;
         return .success;
@@ -134,7 +134,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8, tool_version:
     if (std.mem.eql(u8, sub, "plan")) return runPlan(allocator, parsed, tool_version, stdout, stderr);
     if (std.mem.eql(u8, sub, "validate")) return runValidate(allocator, parsed, stdout, stderr);
     if (std.mem.eql(u8, sub, "cutover") or std.mem.eql(u8, sub, "status") or std.mem.eql(u8, sub, "rollback")) {
-        const options = cutoverOptions(parsed, stderr) orelse return .usage;
+        const options = cutoverOptions(parsed, configured_socket, stderr) orelse return .usage;
         if (std.mem.eql(u8, sub, "cutover")) return cutover.runCutover(allocator, options, stdout, stderr);
         if (std.mem.eql(u8, sub, "status")) return cutover.runStatus(allocator, options, stdout, stderr);
         return cutover.runRollback(allocator, options, stdout, stderr);
@@ -204,7 +204,7 @@ fn runSnapshot(allocator: std.mem.Allocator, parsed: Parsed, stdout: anytype, st
     return .success;
 }
 
-fn cutoverOptions(parsed: Parsed, stderr: anytype) ?cutover.Options {
+fn cutoverOptions(parsed: Parsed, configured_socket: ?[]const u8, stderr: anytype) ?cutover.Options {
     const plan_path = parsed.plan orelse {
         stderr.writeAll("error: --plan <plan.json> is required\n") catch {};
         return null;
@@ -221,7 +221,7 @@ fn cutoverOptions(parsed: Parsed, stderr: anytype) ?cutover.Options {
         stderr.writeAll("error: --backend nftables|ipset|iptables is required\n") catch {};
         return null;
     };
-    return .{ .plan_path = plan_path, .state_file = state_file, .staging_dir = staging_dir, .backend = backend, .socket_path = parsed.socket_path, .run_id = parsed.run_id, .output = if (parsed.output == .json) .json else .table, .source_verified = parsed.source_verified };
+    return .{ .plan_path = plan_path, .state_file = state_file, .staging_dir = staging_dir, .backend = backend, .socket_path = parsed.socket_path orelse configured_socket orelse cli.socket.default_socket_path, .run_id = parsed.run_id, .output = if (parsed.output == .json) .json else .table, .source_verified = parsed.source_verified };
 }
 
 fn runPlan(allocator: std.mem.Allocator, parsed: Parsed, tool_version: []const u8, stdout: anytype, stderr: anytype) ExitClass {

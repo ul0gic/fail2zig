@@ -111,6 +111,7 @@ pub const DeserializeError = error{
     JailIdEmpty,
     JailIdTooLong,
     OutOfMemory,
+    WouldBlock,
     ReadFailed,
     RequestBodyTooLarge,
     InvalidRequestId,
@@ -390,6 +391,7 @@ fn mapReadErr(err: anyerror) DeserializeError {
     return switch (err) {
         error.EndOfStream => error.EndOfStream,
         error.OutOfMemory => error.OutOfMemory,
+        error.WouldBlock => error.WouldBlock,
         error.JailIdEmpty => error.JailIdEmpty,
         error.JailIdTooLong => error.JailIdTooLong,
         error.InvalidOptionalMarker => error.InvalidOptionalMarker,

@@ -85,7 +85,7 @@ pub const Pipeline = struct {
     }
 
     fn failed(self: *Pipeline, cause: anyerror) void {
-        if (cause == error.ConsumerExpired or cause == error.ConsumerPending or cause == error.EffectExpired or cause == error.ReserveBackpressure or cause == error.RetryCapacity) return;
+        if (cause == error.ConsumerExpired or cause == error.ConsumerPending or cause == error.EffectExpired or cause == error.ReserveBackpressure or cause == error.RetryCapacity or cause == error.RetryEligibilityPending) return;
         if (cause == error.EffectClockReversed) {
             const floor = self.store.admissionClock() catch {
                 self.ready = false;
@@ -117,6 +117,16 @@ pub const Pipeline = struct {
                 .reopen_required = self.store.reopen_required,
             });
         }
+    }
+
+    fn prepareFailed(self: *Pipeline, cause: anyerror, receipt: ?time.Timestamp) void {
+        if (cause == error.ReceiptClockReversed) if (receipt) |saved| {
+            self.receiptClockFailed(saved.us);
+            return;
+        };
+        self.failed(cause);
+        // A processor receipt conflict has no source-repair owner; Store conflicts keep their existing policy.
+        if (cause == error.ReceiptConflict) if (self.gate) |gate| gate.failed(cause, .{});
     }
 
     fn beginDiagnostics(self: *Pipeline) void {
@@ -153,7 +163,7 @@ pub const Pipeline = struct {
     }
 
     pub fn commitBlocked(cause: anyerror) bool {
-        return cause == error.ReserveBackpressure or cause == error.RetryCapacity;
+        return cause == error.ReserveBackpressure or cause == error.RetryCapacity or cause == error.RetryEligibilityPending;
     }
 
     pub fn sourceLocalIntervention(cause: anyerror) bool {
@@ -171,7 +181,7 @@ pub const Pipeline = struct {
     }
 
     fn retainsAdmission(cause: anyerror) bool {
-        return cause == error.ConsumerExpired or cause == error.ConsumerPending or cause == error.EffectExpired or cause == error.ReserveBackpressure or cause == error.RetryCapacity or sourceLocalIntervention(cause);
+        return cause == error.ConsumerExpired or cause == error.ConsumerPending or cause == error.EffectExpired or cause == error.ReserveBackpressure or cause == error.RetryCapacity or cause == error.RetryEligibilityPending or sourceLocalIntervention(cause);
     }
 
     pub fn acknowledgeBatch(batch: []const records.Record, acknowledged: *usize, context: ?*anyopaque) anyerror!void {
@@ -242,7 +252,7 @@ pub const Pipeline = struct {
             try self.admitClock(true);
         };
         const prepared = self.processor.prepare(observed, self.processor.context) catch |failure| {
-            if (failure == error.ReceiptClockReversed) if (observed.receipt_time) |saved| self.receiptClockFailed(saved.us);
+            self.prepareFailed(failure, observed.receipt_time);
             return failure;
         };
         defer prepared.release(prepared.context);
@@ -283,7 +293,7 @@ pub const Pipeline = struct {
             try self.admit();
         };
         const prepared = self.processor.prepare(observed, self.processor.context) catch |failure| {
-            if (failure == error.ReceiptClockReversed) if (observed.receipt_time) |saved| self.receiptClockFailed(saved.us);
+            self.prepareFailed(failure, observed.receipt_time);
             return failure;
         };
         defer prepared.release(prepared.context);

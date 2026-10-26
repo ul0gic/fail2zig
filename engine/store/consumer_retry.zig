@@ -4,6 +4,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const diag_mod = @import("../core/diag.zig");
 const consumers = @import("../core/native_consumer.zig");
+const dns = @import("../core/native_dns.zig");
 const detection = @import("../core/native_detection_record.zig");
 const retry = @import("../core/native_retry.zig");
 const effects = @import("../core/native_effect.zig");
@@ -105,10 +106,105 @@ pub fn Methods(comptime Store: type) type {
             if (current_revision < 0) return error.InvalidConsumer;
             return @intCast(current_revision);
         }
-        fn bumpConsumerRevision(self: *Store) Error!void {
+        pub fn bumpConsumerRevision(self: *Store) Error!void {
             if (try self.consumerRevision() == std.math.maxInt(i64)) return error.ConsumerCapacity;
             try self.exec("UPDATE consumer_revision SET revision=revision+1 WHERE id=1;");
             if (self.api.changes(self.db) != 1) return error.InvalidConsumer;
+        }
+        pub const DnsRetirement = struct {
+            key: consumers.Key,
+            expected_revision: u64,
+            expected_expiry_us: i64,
+            payload_sha256: [32]u8,
+            expected_consumer_revision: u64,
+        };
+        pub const DnsRetirementCommit = enum { durable, startup_staged };
+        pub const DnsRetired = struct { consumer_revision: u64, commit: DnsRetirementCommit };
+        pub const DnsRetirementOutcome = union(enum) { retired: DnsRetired, stale, pinned };
+
+        pub fn retireDnsResult(self: *Store, proof: DnsRetirement, clock: consumers.Batch) Error!DnsRetirementOutcome {
+            try proof.key.validate();
+            if (proof.key.kind != .dns or !std.mem.eql(u8, proof.key.jail, "@shared") or
+                !(std.mem.eql(u8, proof.key.rule, "v4") or std.mem.eql(u8, proof.key.rule, "v6") or std.mem.eql(u8, proof.key.rule, "both")) or
+                proof.key.source.len > 253 or proof.expected_revision == 0 or proof.expected_revision > std.math.maxInt(i64) or
+                clock.deltas.len != 0 or clock.dependencies.len != 0) return error.InvalidConsumer;
+            const name = dns.Name.init(proof.key.source) catch return error.InvalidConsumer;
+            if (!std.mem.eql(u8, name.slice(), proof.key.source)) return error.InvalidConsumer;
+            const staged = self.startupAdmissionActive();
+            try self.beginAdmissionWrite();
+            var committed = false;
+            defer if (!committed) self.rollback();
+            try self.requireManifestSchema();
+            if (try self.consumerRevision() != proof.expected_consumer_revision) return .stale;
+            const now = try self.checkConsumerTime(clock);
+            if (now < proof.expected_expiry_us) return .stale;
+            var source_buffer: [260]u8 = undefined;
+            const source = std.fmt.bufPrint(&source_buffer, "{s}:{s}", .{ proof.key.rule, proof.key.source }) catch return error.InvalidConsumer;
+            const required = [_]consumers.Requirement{.{ .key = proof.key, .format_version = dns.version }};
+            const manifest = consumers.Manifest{ .jail = "@shared", .source = source, .source_generation = proof.key.generation, .required = &required };
+            const status = self.checkManifest(manifest) catch |failure| {
+                if (failure == error.ConsumerManifestMissing) return .stale;
+                return failure;
+            };
+            if (status != .ready) return error.MissingRequiredConsumer;
+            {
+                var row = try self.statement("SELECT format,revision,valid_until_us,payload FROM consumer_checkpoints WHERE kind=?1 AND jail=?2 AND source=?3 AND rule=?4 AND generation=?5;");
+                defer row.deinit();
+                try bindConsumerKey(&row, &proof.key);
+                if (!try row.row()) return .stale;
+                if (try row.signed(0) != dns.version or self.api.column_type(row.ptr, 3) != 4) return error.InvalidConsumer;
+                const saved_revision = try row.signed(1);
+                const expiry = try row.optionalSigned(2) orelse return error.InvalidConsumer;
+                if (saved_revision <= 0) return error.InvalidConsumer;
+                if (saved_revision != proof.expected_revision or expiry != proof.expected_expiry_us) return .stale;
+                const payload = try row.boundedBytes(3, dns.cache_entry_bytes);
+                if (payload.len != dns.cache_entry_bytes) return error.InvalidConsumer;
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+                if (!std.mem.eql(u8, &digest, &proof.payload_sha256)) return .stale;
+            }
+            {
+                var pin = try self.statement("SELECT 1 FROM consumer_requirements INDEXED BY consumer_requirement_identity WHERE kind=?1 AND jail=?2 AND source=?3 AND rule=?4 AND generation=?5 AND NOT(manifest_jail=?6 AND manifest_source=?7) LIMIT 1;");
+                defer pin.deinit();
+                try bindConsumerKey(&pin, &proof.key);
+                try pin.text(6, manifest.jail);
+                try pin.text(7, manifest.source);
+                if (try pin.row()) return .pinned;
+            }
+            {
+                var remove = try self.statement("DELETE FROM consumer_requirements WHERE kind=?1 AND jail=?2 AND source=?3 AND rule=?4 AND generation=?5 AND manifest_jail=?6 AND manifest_source=?7;");
+                defer remove.deinit();
+                try bindConsumerKey(&remove, &proof.key);
+                try remove.text(6, manifest.jail);
+                try remove.text(7, manifest.source);
+                try remove.done();
+                if (self.api.changes(self.db) != 1) return .stale;
+            }
+            {
+                var remove = try self.statement("DELETE FROM consumer_manifests WHERE jail=?1 AND source=?2 AND generation=?3;");
+                defer remove.deinit();
+                try remove.text(1, manifest.jail);
+                try remove.text(2, manifest.source);
+                try remove.blob(3, &manifest.source_generation);
+                try remove.done();
+                if (self.api.changes(self.db) != 1) return .stale;
+            }
+            {
+                var remove = try self.statement("DELETE FROM consumer_checkpoints WHERE kind=?1 AND jail=?2 AND source=?3 AND rule=?4 AND generation=?5 AND revision=?6 AND valid_until_us=?7;");
+                defer remove.deinit();
+                try bindConsumerKey(&remove, &proof.key);
+                try remove.int(6, @intCast(proof.expected_revision));
+                try remove.int(7, proof.expected_expiry_us);
+                try remove.done();
+                if (self.api.changes(self.db) != 1) return .stale;
+            }
+            try self.bumpConsumerRevision();
+            const next_revision = try self.consumerRevision();
+            try self.fault(.before_consumer_input_commit);
+            try self.commitConsumerClock(clock);
+            try self.commitTransaction();
+            committed = true;
+            return .{ .retired = .{ .consumer_revision = next_revision, .commit = if (staged) .startup_staged else .durable } };
         }
         pub fn consumerManifestKeysPage(self: *Store, allocator: std.mem.Allocator, jail: []const u8, after_source: ?[]const u8, expected_revision: ?u64, output: []ManifestKey) Error!ManifestPage {
             if (output.len == 0 or output.len > consumers.max_dependencies or jail.len == 0 or jail.len > 64 or std.mem.indexOfScalar(u8, jail, 0) != null) return error.InvalidConsumer;
@@ -203,6 +299,166 @@ pub fn Methods(comptime Store: type) type {
             const expiry = try row.optionalSigned(4);
             if (dnsAuthority(requirement.key) and (requirement.format_version != 1 or try row.signed(1) != 1 or expiry != null or
                 !std.mem.eql(u8, try row.boundedBytes(5, 32), &requirement.key.generation))) return error.InvalidConsumer;
+        }
+        // Retire one complete manifest dependency group; never copy checkpoint payloads.
+        pub fn retireJailManifestTx(self: *Store, jail: []const u8) Error!u16 {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const allocator = arena.allocator();
+            var generation: [32]u8 = undefined;
+            const source = blk: {
+                var row = try self.statement("SELECT source,generation FROM consumer_manifests WHERE jail=?1 ORDER BY source LIMIT 1;");
+                defer row.deinit();
+                try row.text(1, jail);
+                if (!try row.row()) return 0;
+                if (self.api.column_type(row.ptr, 0) != 3) return error.InvalidConsumer;
+                generation = try consumerHash(&row, 1);
+                break :blk try allocator.dupe(u8, try row.boundedBytes(0, 16384));
+            };
+            return self.retireManifestGroupTx(jail, source, generation);
+        }
+        fn retireManifestGroupTx(self: *Store, jail: []const u8, source: []const u8, generation: [32]u8) Error!u16 {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const allocator = arena.allocator();
+            var required: [consumers.max_dependencies]consumers.Requirement = undefined;
+            var count: usize = 0;
+            {
+                var rows = try self.statement("SELECT kind,jail,source,rule,generation,format FROM consumer_requirements WHERE manifest_jail=?1 AND manifest_source=?2 ORDER BY kind,jail,source,rule,generation LIMIT 17;");
+                defer rows.deinit();
+                try rows.text(1, jail);
+                try rows.text(2, source);
+                while (try rows.row()) {
+                    if (count == required.len) return error.ConsumerCapacity;
+                    inline for (.{ 0, 5 }) |column| if (self.api.column_type(rows.ptr, column) != 1) return error.InvalidConsumer;
+                    inline for (.{ 1, 2, 3 }) |column| if (self.api.column_type(rows.ptr, column) != 3) return error.InvalidConsumer;
+                    const kind = std.meta.intToEnum(consumers.Kind, try rows.signed(0)) catch return error.InvalidConsumer;
+                    const format = try rows.signed(5);
+                    if (format <= 0 or format > std.math.maxInt(u16)) return error.InvalidConsumer;
+                    required[count] = .{ .key = .{
+                        .kind = kind,
+                        .jail = try allocator.dupe(u8, try rows.boundedBytes(1, 64)),
+                        .source = try allocator.dupe(u8, try rows.boundedBytes(2, 16384)),
+                        .rule = try allocator.dupe(u8, try rows.boundedBytes(3, 64)),
+                        .generation = try consumerHash(&rows, 4),
+                    }, .format_version = @intCast(format) };
+                    count += 1;
+                }
+            }
+            const manifest: consumers.Manifest = .{ .jail = jail, .source = source, .source_generation = generation, .required = required[0..count] };
+            _ = try self.checkManifest(manifest);
+            var deleted: u16 = 0;
+            for (required[0..count]) |*requirement| {
+                var row = try self.statement("DELETE FROM consumer_requirements WHERE kind=?1 AND jail=?2 AND source=?3 AND rule=?4 AND generation=?5 AND manifest_jail=?6 AND manifest_source=?7 AND format=?8;");
+                defer row.deinit();
+                try bindConsumerKey(&row, &requirement.key);
+                try row.text(6, jail);
+                try row.text(7, source);
+                try row.int(8, requirement.format_version);
+                try row.done();
+                if (self.api.changes(self.db) != 1) return error.InvalidConsumer;
+                deleted += 1;
+            }
+            {
+                var row = try self.statement("DELETE FROM consumer_manifests WHERE jail=?1 AND source=?2;");
+                defer row.deinit();
+                try row.text(1, jail);
+                try row.text(2, source);
+                try row.done();
+                if (self.api.changes(self.db) != 1) return error.InvalidConsumer;
+                deleted += 1;
+            }
+            for (required[0..count]) |*requirement| {
+                var row = try self.statement("DELETE FROM consumer_checkpoints WHERE kind=?1 AND jail=?2 AND source=?3 AND rule=?4 AND generation=?5 AND format=?6 AND NOT EXISTS(SELECT 1 FROM consumer_requirements INDEXED BY consumer_requirement_identity WHERE kind=?1 AND jail=?2 AND source=?3 AND rule=?4 AND generation=?5 AND format=?6);");
+                defer row.deinit();
+                try bindConsumerKey(&row, &requirement.key);
+                try row.int(6, requirement.format_version);
+                try row.done();
+                deleted += @intCast(self.api.changes(self.db));
+            }
+            try self.bumpConsumerRevision();
+            return deleted;
+        }
+        pub const UnusedSharedDnsPage = enum { progressed, done, pinned };
+        const SharedDnsManifestKey = struct { source: [260]u8, len: usize, generation: [32]u8 };
+        fn firstSharedDnsManifest(self: *Store, after: ?[]const u8) Error!?SharedDnsManifestKey {
+            var row = try self.statement(if (after == null)
+                "SELECT source,generation FROM consumer_manifests WHERE jail='@shared' ORDER BY source LIMIT 1;"
+            else
+                "SELECT source,generation FROM consumer_manifests WHERE jail='@shared' AND source>?1 ORDER BY source LIMIT 1;");
+            defer row.deinit();
+            if (after) |key| try row.text(1, key);
+            if (!try row.row()) return null;
+            if (self.api.column_type(row.ptr, 0) != 3) return error.InvalidConsumer;
+            const source = try row.boundedBytes(0, 260);
+            var key: SharedDnsManifestKey = .{ .source = undefined, .len = source.len, .generation = try consumerHash(&row, 1) };
+            @memcpy(key.source[0..source.len], source);
+            return key;
+        }
+        pub fn retireUnusedSharedDnsPage(self: *Store) Error!UnusedSharedDnsPage {
+            try self.beginWrite();
+            errdefer self.rollback();
+            try self.requireManifestSchema();
+            var key = try self.firstSharedDnsManifest(null) orelse {
+                var pin = try self.statement("SELECT 1 FROM consumer_requirements INDEXED BY consumer_requirement_identity WHERE kind=3 AND jail='@shared' LIMIT 1;");
+                defer pin.deinit();
+                if (try pin.row()) {
+                    try self.commitTransaction();
+                    return .pinned;
+                }
+                var orphan = try self.statement("SELECT 1 FROM consumer_checkpoints WHERE kind=3 AND jail='@shared' LIMIT 1;");
+                defer orphan.deinit();
+                if (try orphan.row()) return error.ConsumerManifestMismatch;
+                try self.commitTransaction();
+                return .done;
+            };
+            if (std.mem.eql(u8, key.source[0..key.len], "@resolver"))
+                key = try self.firstSharedDnsManifest("@resolver") orelse key;
+            const source = key.source[0..key.len];
+            const authority = std.mem.eql(u8, source, "@resolver");
+            var name: dns.Name = undefined;
+            var family: dns.Family = undefined;
+            const consumer_key: consumers.Key = if (authority)
+                .{ .kind = .dns, .jail = "@shared", .source = "@resolver", .rule = "authority", .generation = key.generation }
+            else blk: {
+                const colon = std.mem.indexOfScalar(u8, source, ':') orelse return error.InvalidConsumer;
+                family = std.meta.stringToEnum(dns.Family, source[0..colon]) orelse return error.InvalidConsumer;
+                name = dns.Name.init(source[colon + 1 ..]) catch return error.InvalidConsumer;
+                if (!std.mem.eql(u8, name.slice(), source[colon + 1 ..])) return error.InvalidConsumer;
+                break :blk .{ .kind = .dns, .jail = "@shared", .source = name.slice(), .rule = @tagName(family), .generation = key.generation };
+            };
+            const required = [_]consumers.Requirement{.{ .key = consumer_key, .format_version = if (authority) 1 else dns.version }};
+            const manifest: consumers.Manifest = .{ .jail = "@shared", .source = source, .source_generation = key.generation, .required = &required };
+            const status = try self.checkManifest(manifest);
+            try self.checkRequiredState(required[0], status == .first_use);
+            if (!authority) {
+                var row = try self.statement("SELECT revision,valid_until_us,payload FROM consumer_checkpoints WHERE kind=?1 AND jail=?2 AND source=?3 AND rule=?4 AND generation=?5;");
+                defer row.deinit();
+                try bindConsumerKey(&row, &consumer_key);
+                if (try row.row()) {
+                    const revision = try row.signed(0);
+                    const expiry = try row.optionalSigned(1) orelse return error.InvalidConsumer;
+                    const payload = try row.boundedBytes(2, dns.cache_entry_bytes);
+                    const decoded = dns.decodeCheckpoint(payload) catch return error.InvalidConsumer;
+                    if (revision <= 0 or decoded.revision != @as(u64, @intCast(revision)) or decoded.result.valid_until_us != expiry or
+                        decoded.result.request.family != family or !std.mem.eql(u8, decoded.result.request.name.slice(), name.slice()) or
+                        !std.mem.eql(u8, &decoded.result.request.generation, &key.generation)) return error.InvalidConsumer;
+                }
+            }
+            {
+                var pin = try self.statement("SELECT 1 FROM consumer_requirements INDEXED BY consumer_requirement_identity WHERE kind=?1 AND jail=?2 AND source=?3 AND rule=?4 AND generation=?5 AND NOT(manifest_jail=?6 AND manifest_source=?7) LIMIT 1;");
+                defer pin.deinit();
+                try bindConsumerKey(&pin, &consumer_key);
+                try pin.text(6, manifest.jail);
+                try pin.text(7, manifest.source);
+                if (try pin.row()) {
+                    try self.commitTransaction();
+                    return .pinned;
+                }
+            }
+            _ = try self.retireManifestGroupTx(manifest.jail, manifest.source, manifest.source_generation);
+            try self.commitTransaction();
+            return .progressed;
         }
         pub fn admitManifestTx(self: *Store, manifest: consumers.Manifest) Error!void {
             const digest = try manifest.digest();
@@ -360,10 +616,15 @@ pub fn Methods(comptime Store: type) type {
             try self.consumerInput(manifest, batch, true);
         }
         fn consumerInput(self: *Store, manifest: consumers.Manifest, batch: consumers.Batch, initialize: bool) Error!void {
+            try self.beginAdmissionWrite();
+            errdefer self.rollback();
+            try self.applyConsumerInputTx(manifest, batch, initialize);
+            try self.commitTransaction();
+        }
+        pub fn applyConsumerInputTx(self: *Store, manifest: consumers.Manifest, batch: consumers.Batch, initialize: bool) Error!void {
+            if (self.api.get_autocommit(self.db) != 0) return error.InvalidConsumer;
             try batch.validate();
             _ = try manifest.digest();
-            if (initialize) try self.beginAdmissionWrite() else try self.beginWrite();
-            errdefer self.rollback();
             try self.requireManifestSchema();
             if (initialize) try self.admitManifestTx(manifest);
             try self.checkManifestBatch(manifest, batch, initialize, false);
@@ -371,7 +632,6 @@ pub fn Methods(comptime Store: type) type {
             try self.readyManifest(manifest);
             try self.fault(.before_consumer_input_commit);
             try self.commitConsumerClock(batch);
-            try self.commitTransaction();
         }
 
         pub const ConsumerSnapshot = struct {
@@ -464,6 +724,7 @@ pub fn Methods(comptime Store: type) type {
             _ = try policy.encode();
             try self.beginAdmissionWrite();
             errdefer self.rollback();
+            try self.admitRetryProjectionJailTx(jail);
             if (!try self.checkRetryAdmission(jail, generation, policy)) {
                 const encoded = try policy.encode();
                 var insert = try self.statement("INSERT INTO retry_policies VALUES(?1,?2,?3);");
@@ -783,39 +1044,6 @@ pub fn Methods(comptime Store: type) type {
         }
 
         pub const ActiveDecision = struct { subject: detection.Subject, lease: retry.Lease, ordinal: u64 };
-        pub const RetrySummary = struct { subjects: usize = 0, active: usize = 0, decisions: u64 = 0 };
-        pub fn retrySummary(self: *Store, jail: []const u8, now_us: i64, output: []ActiveDecision) Error!RetrySummary {
-            try self.beginRead();
-            errdefer self.rollback();
-            const admission = (try self.readRetryPolicy(jail)) orelse return error.RetryAdmissionRequired;
-            const floor = try self.readRetryClock();
-            if (floor) |value| if (now_us < value) return error.ReceiptClockReversed;
-            var row = try self.statement(if (self.schema_version >= 16)
-                "SELECT last_processed_us,lease_kind,deadline_us,decisions,attempts,family,subject FROM retry_states WHERE jail=?1 ORDER BY family,subject;"
-            else
-                "SELECT last_processed_us,CASE WHEN expiry_us IS NULL THEN 0 ELSE 1 END,expiry_us,decisions,attempts,family,subject FROM retry_states WHERE jail=?1 ORDER BY family,subject;");
-            defer row.deinit();
-            try row.text(1, jail);
-            var summary = RetrySummary{};
-            while (try row.row()) {
-                summary.subjects += 1;
-                const stored = try self.decodeRetryState(&row, admission.policy);
-                if (stored.last_processed_us > (floor orelse return error.InvalidRetryState)) return error.InvalidRetryState;
-                const state = (try retry.prune(admission.policy, stored, now_us)).state;
-                const subject = try self.decodeRetrySubject(&row, 5, 6);
-                summary.decisions = std.math.add(u64, summary.decisions, state.decisions) catch return error.InvalidRetryState;
-                if (state.lease.live(now_us)) {
-                    if (summary.active == output.len) return error.RetryCapacity;
-                    output[summary.active] = .{ .subject = subject, .lease = state.lease, .ordinal = state.decisions };
-                    summary.active += 1;
-                }
-            }
-            if (self.schema_version >= 15)
-                summary.decisions = std.math.add(u64, summary.decisions, try self.retiredTotal(jail)) catch return error.InvalidRetryState;
-            try self.commitTransaction();
-            return summary;
-        }
-
         pub fn retryStateRevision(self: *Store) Error!u64 {
             try self.beginRead();
             errdefer self.rollback();
@@ -830,7 +1058,7 @@ pub fn Methods(comptime Store: type) type {
 
         // One-time startup rewrite of v0.4.6 rows; a single statement over a large records table needs more than the ordinary statement budget.
         const rekey_work_callbacks: u32 = 100_000;
-        const OwnerHeld = struct { key: [32]u8, revision: u64, scope: [canonical_scope.encoded_bytes]u8, absent: bool };
+        pub const OwnerHeld = struct { key: [32]u8, revision: u64, scope: [canonical_scope.encoded_bytes]u8, absent: bool };
 
         fn cursorBindingFragment(buffer: []u8, binding: [32]u8) Error![]const u8 {
             var stream = std.io.fixedBufferStream(buffer);
@@ -915,7 +1143,7 @@ pub fn Methods(comptime Store: type) type {
                 },
                 .journal => {},
             }
-            const owners_changed = try self.rekeyOwnersTx(jail, legacy, planned);
+            const owners_changed = try self.rekeyOwnersTx(jail, legacy, planned, null, error.StaleEffect);
             try self.commitEffectTransaction(owners_changed);
             return report;
         }
@@ -924,7 +1152,6 @@ pub fn Methods(comptime Store: type) type {
         const generation_statements = [_]GenerationStatement{
             .{ .sql = "UPDATE retry_retired SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .retry },
             .{ .sql = "UPDATE pending_receipts SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .pending },
-            .{ .sql = "UPDATE consumer_manifests SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .manifests },
             .{ .sql = "UPDATE records SET source_generation=?3 WHERE jail=?1 AND source_generation=?2;", .counted = .none },
             .{ .sql = "UPDATE records SET receipt_generation=?3 WHERE jail=?1 AND receipt_generation=?2;", .counted = .none },
             .{ .sql = "UPDATE checkpoints SET payload=CAST(substr(CAST(payload AS BLOB),1,8)||?3||substr(CAST(payload AS BLOB),41) AS BLOB) WHERE jail=?1 AND substr(CAST(payload AS BLOB),1,4)=CAST('F2NT' AS BLOB) AND substr(CAST(payload AS BLOB),9,32)=?2;", .counted = .none },
@@ -937,6 +1164,7 @@ pub fn Methods(comptime Store: type) type {
         };
 
         pub fn rekeyGenerationTablesTx(self: *Store, jail: []const u8, old: [32]u8, new: [32]u8, report: *RekeyReport) Error!void {
+            report.manifests = std.math.add(u32, report.manifests, try self.rekeyConsumerManifestsTx(jail, old, new)) catch return error.StorageLimit;
             for (generation_statements) |entry| {
                 const rows = try self.rekeyRows(entry.sql, jail, old, new);
                 const total: *u32 = switch (entry.counted) {
@@ -1038,7 +1266,8 @@ pub fn Methods(comptime Store: type) type {
             return std.math.cast(u32, self.api.changes(self.db)) orelse error.StorageLimit;
         }
 
-        fn rekeyOwnersTx(self: *Store, jail: []const u8, legacy: [32]u8, planned: [32]u8) Error!bool {
+        // A supplied time is reload's caller sample; null keeps startup's nonempty-only clock sample and commit.
+        pub fn rekeyOwnersTx(self: *Store, jail: []const u8, legacy: [32]u8, planned: [32]u8, now_us: ?i64, stale_failure: error{ StaleEffect, StalePolicyTransition }) Error!bool {
             var held = std.ArrayListUnmanaged(OwnerHeld){};
             defer held.deinit(self.allocator);
             {
@@ -1054,40 +1283,54 @@ pub fn Methods(comptime Store: type) type {
                     try held.append(self.allocator, .{ .key = try Store.effectBlob(&owners, 0, 32), .revision = @intCast(owner_revision), .scope = try Store.effectBlob(&owners, 2, canonical_scope.encoded_bytes), .absent = lease == .absent });
                 }
             }
-            if (held.items.len == 0) return false;
+            if (held.items.len == 0 and now_us == null) return false;
             const clock = effects.Clock{ .prepared_us = 0 };
-            const now = try self.effectClock(clock);
+            const now = now_us orelse try self.effectClock(clock);
             const count: i64 = @intCast(held.items.len);
             var live_count: i64 = 0;
             for (held.items) |owner| if (!owner.absent) {
                 live_count += 1;
             };
             try self.reserveEffectRows(.{ .revisions = count, .intents = live_count, .observations = live_count * store.load_repair.observations_per_intent });
-            if (try self.integer("SELECT count(*) FROM effect_owner_revisions;") + count > effects.max_owner_revisions) return error.EffectCapacity;
-            for (held.items) |owner| {
-                const scope = canonical_scope.Scope.decode(&owner.scope) catch return error.InvalidEffect;
-                if (owner.absent) {
-                    const installation = try self.readInstallation() orelse return error.InstallationRequired;
-                    const exact = try effects.Scope.exact(scope);
-                    if (!std.mem.eql(u8, &owner.key, &try exact.key(installation))) return error.InvalidEffect;
-                    var update = try self.statement("UPDATE effect_owners SET generation=?4,revision=?5 WHERE scope_key=?1 AND jail=?2 AND revision=?3 AND generation=?6 AND lease_kind=0 AND deadline_us IS NULL;");
-                    defer update.deinit();
-                    try update.blob(1, &owner.key);
-                    try update.text(2, jail);
-                    try update.int(3, @intCast(owner.revision));
-                    try update.blob(4, &planned);
-                    try update.int(5, @intCast(owner.revision + 1));
-                    try update.blob(6, &legacy);
-                    try update.done();
-                    if (self.api.changes(self.db) != 1) return error.StaleEffect;
-                    try self.advanceEffectSnapshot();
-                    continue;
-                }
-                const transition_id = effects.hashParts("fail2zig-generation-rekey-v1", &.{ &planned, &owner.key });
-                _ = try self.transitionOwnerReservedTx(.{ .scope = scope, .jail = jail, .current_generation = legacy, .next_generation = planned, .expected_owner_revision = owner.revision, .transition_id = transition_id, .mode = .retain, .occurred_us = now }, now, false);
+            if (try self.tableRows(.effect_owner_revisions) + count > effects.max_owner_revisions) return error.EffectCapacity;
+            for (held.items) |owner| try self.rekeyOwnerHeldTx(owner, jail, legacy, planned, now, stale_failure);
+            if (now_us == null) _ = try self.commitEffectClock(clock);
+            return held.items.len != 0;
+        }
+
+        pub fn readRekeyOwnerRowTx(self: *Store, rowid: i64, jail: []const u8, legacy: [32]u8) Error!?OwnerHeld {
+            var row = try self.statement("SELECT o.scope_key,o.revision,n.canonical_scope,o.lease_kind,o.deadline_us,EXISTS(SELECT 1 FROM effect_owner_revisions h WHERE h.scope_key=o.scope_key AND h.jail=o.jail AND h.revision=o.revision AND h.generation=o.generation AND h.decision_id=o.decision_id AND h.lease_kind=o.lease_kind AND h.deadline_us IS o.deadline_us AND h.decided_us=o.decided_us) FROM effect_owners o LEFT JOIN native_effects n USING(scope_key) WHERE o.rowid=?1 AND o.jail=?2 AND o.generation=?3;");
+            defer row.deinit();
+            try row.int(1, rowid);
+            try row.text(2, jail);
+            try row.blob(3, &legacy);
+            if (!try row.row()) return null;
+            const revision = try row.signed(1);
+            if (revision <= 0 or revision >= std.math.maxInt(i64) or try row.signed(5) != 1) return error.InvalidEffect;
+            return .{ .key = try Store.effectBlob(&row, 0, 32), .revision = @intCast(revision), .scope = try Store.effectBlob(&row, 2, canonical_scope.encoded_bytes), .absent = try Store.effectLease(&row, 3, 4) == .absent };
+        }
+        pub fn rekeyOwnerHeldTx(self: *Store, owner: OwnerHeld, jail: []const u8, legacy: [32]u8, planned: [32]u8, now: i64, stale_failure: error{ StaleEffect, StalePolicyTransition }) Error!void {
+            const scope = canonical_scope.Scope.decode(&owner.scope) catch return error.InvalidEffect;
+            if (owner.absent) {
+                const installation = try self.readInstallation() orelse return error.InstallationRequired;
+                const exact = try effects.Scope.exact(scope);
+                if (!std.mem.eql(u8, &owner.key, &try exact.key(installation))) return error.InvalidEffect;
+                var update = try self.statement("UPDATE effect_owners SET generation=?4,revision=?5 WHERE scope_key=?1 AND jail=?2 AND revision=?3 AND generation=?6 AND lease_kind=0 AND deadline_us IS NULL;");
+                defer update.deinit();
+                try update.blob(1, &owner.key);
+                try update.text(2, jail);
+                try update.int(3, @intCast(owner.revision));
+                try update.blob(4, &planned);
+                try update.int(5, @intCast(owner.revision + 1));
+                try update.blob(6, &legacy);
+                try update.done();
+                if (self.api.changes(self.db) != 1) return stale_failure;
+                self.insertedRows(.effect_owner_revisions, 1);
+                try self.advanceEffectSnapshot();
+                return;
             }
-            _ = try self.commitEffectClock(clock);
-            return true;
+            const transition_id = effects.hashParts("fail2zig-generation-rekey-v1", &.{ &planned, &owner.key });
+            _ = try self.transitionOwnerReservedTx(.{ .scope = scope, .jail = jail, .current_generation = legacy, .next_generation = planned, .expected_owner_revision = owner.revision, .transition_id = transition_id, .mode = .retain, .occurred_us = now }, now, false);
         }
 
         pub fn retryPolicySummaryPage(self: *Store, query: application_history.PolicyQuery, output: []application_history.PolicySummary) Error!application_history.PolicyPage {
@@ -1258,6 +1501,7 @@ pub fn Methods(comptime Store: type) type {
             if (change.ordinal == 0 or change.ordinal > std.math.maxInt(i64) or change.requested == .absent) return error.InvalidRetryState;
             try self.beginWrite();
             errdefer self.rollback();
+            try self.requireRetryProjectionMutationTx();
             try self.effectSchema();
             if (self.schema_version < 16) return error.RetryStorageRequired;
             const now = try self.effectClock(clock);
@@ -1312,6 +1556,8 @@ pub fn Methods(comptime Store: type) type {
                 try state.done();
                 if (self.api.changes(self.db) != 1) return error.InvalidRetryState;
             }
+            try self.syncRetryProjectionRowTx(change.jail, &change.subject);
+            try self.changeRetryJailSummaryTx(change.jail, 0, 0);
             try self.fault(.after_retry_state);
             {
                 var decision = try self.statement("UPDATE retry_decisions SET lease_kind=?5,deadline_us=?6 WHERE jail=?1 AND family=?2 AND subject=?3 AND ordinal=?4;");
@@ -1325,7 +1571,7 @@ pub fn Methods(comptime Store: type) type {
             }
             try self.fault(.after_retry_decision);
             try self.reserveEffectRows(.{ .revisions = 1, .intents = 1, .observations = store.load_repair.observations_per_intent });
-            if (existing.revision >= std.math.maxInt(i64) or entry.revision >= std.math.maxInt(i64) or try self.integer("SELECT count(*) FROM effect_owner_revisions;") >= effects.max_owner_revisions) return error.EffectCapacity;
+            if (existing.revision >= std.math.maxInt(i64) or entry.revision >= std.math.maxInt(i64) or try self.tableRows(.effect_owner_revisions) >= effects.max_owner_revisions) return error.EffectCapacity;
             {
                 var update = try self.statement("UPDATE effect_owners SET revision=?4,lease_kind=?5,deadline_us=?6 WHERE scope_key=?1 AND jail=?2 AND revision=?3;");
                 defer update.deinit();
@@ -1336,6 +1582,7 @@ pub fn Methods(comptime Store: type) type {
                 try Store.bindEffectLease(&update, 5, prolonged.lease);
                 try update.done();
                 if (self.api.changes(self.db) != 1) return error.StaleEffect;
+                self.insertedRows(.effect_owner_revisions, 1);
             }
             try self.fault(.after_effect_owner);
             const next = try self.replaceEffectIntent(installation, scope, key, entry.revision + 1, decision_id, now);
@@ -1400,44 +1647,38 @@ pub fn Methods(comptime Store: type) type {
         }
 
         fn retryPoolPressure(self: *Store, now_us: i64, new_row: bool, banning: bool, tracking_limit: u32) Error!PoolPressure {
-            const total = try self.integer("SELECT count(*) FROM retry_states;");
+            const total = try self.tableRows(.retry_states);
             if (comptime build_options.diag) diag_mod.limit(.retry_rows, std.math.lossyCast(u64, total), @as(u64, tracking_limit) + retry.max_pool_subjects);
             const total_full = new_row and total >= @as(i64, tracking_limit) + retry.max_pool_subjects;
             const limit: i64 = if (banning) retry.max_pool_subjects else tracking_limit;
             if (!total_full and total < limit) return .none;
-            const banned = try self.liveRetryLeases(now_us);
+            try self.requireRetryAdmissionTimeTx(now_us);
+            const banned = (try self.retryAdmissionCountsTx()).live;
             if (comptime build_options.diag) diag_mod.limit(.banned_subjects, std.math.lossyCast(u64, banned), retry.max_pool_subjects);
             if (banning and banned >= retry.max_pool_subjects) return .banned;
             if (total_full or (!banning and total - banned >= limit)) return .tracking;
             return .none;
         }
 
-        fn liveRetryLeases(self: *Store, now_us: i64) Error!i64 {
-            var row = try self.statement(if (self.schema_version >= 16)
-                "SELECT count(*) FROM retry_states WHERE lease_kind=2 OR (lease_kind=1 AND deadline_us>?1);"
-            else
-                "SELECT count(*) FROM retry_states WHERE expiry_us>?1;");
-            defer row.deinit();
-            try row.int(1, now_us);
-            if (!try row.row()) return error.DatabaseFailure;
-            return row.signed(0);
-        }
-
         pub fn evictIdleSubject(self: *Store, jail: []const u8, now_us: i64) Error!EvictionReport {
             if (self.schema_version < 16) return .{ .evicted = null, .last_processed_us = 0 };
             const installation = try self.readInstallation();
-            var candidates = try self.statement("SELECT jail,family,subject,last_processed_us,decisions FROM retry_states WHERE lease_kind=0 OR (lease_kind=1 AND deadline_us<=?1) ORDER BY last_processed_us,jail,family,subject LIMIT 16;");
-            defer candidates.deinit();
-            try candidates.int(1, now_us);
-            while (try candidates.row()) {
-                const subject = try self.decodeRetrySubject(&candidates, 1, 2);
+            var candidates: [16]Store.RetryAdmissionVictim = undefined;
+            const count = try self.retryAdmissionVictimsTx(now_us, &candidates);
+            for (candidates[0..count]) |candidate| {
+                const subject = candidate.subject;
                 if (installation) |owner| {
                     if (try self.readEffect(try (try effects.Scope.host(subject)).key(owner), owner)) |entry|
                         if (entry.desired != .absent or entry.status != .absent) continue;
                 }
-                const victim_jail = detection.Name.init(try candidates.boundedBytes(0, 64)) catch return error.InvalidRetryState;
-                const last_processed_us = try candidates.signed(3);
-                const signed_decisions = try candidates.signed(4);
+                const victim_jail = candidate.jail;
+                const last_processed_us = candidate.last_processed_us;
+                var state = try self.statement("SELECT last_processed_us,decisions FROM retry_states WHERE jail=?1 AND family=?2 AND subject=?3;");
+                defer state.deinit();
+                try state.text(1, victim_jail.slice());
+                try bindSubject(&state, &subject);
+                if (!try state.row() or try state.signed(0) != last_processed_us) return error.InvalidRetryState;
+                const signed_decisions = try state.signed(1);
                 if (signed_decisions < 0) return error.InvalidRetryState;
                 const decisions: u64 = @intCast(signed_decisions);
                 if (decisions > 0) {
@@ -1457,26 +1698,14 @@ pub fn Methods(comptime Store: type) type {
                 try remove.text(1, victim_jail.slice());
                 try bindSubject(&remove, &subject);
                 try remove.done();
+                self.deletedRows(.retry_states);
                 if (self.api.changes(self.db) != 1) return error.InvalidRetryState;
+                try self.removeRetryProjectionRowTx(victim_jail.slice(), &subject);
+                try self.changeRetryJailSummaryTx(victim_jail.slice(), 0, 0);
                 try self.retry_evictions.note(jail, now_us);
                 return .{ .evicted = subject, .last_processed_us = last_processed_us };
             }
             return .{ .evicted = null, .last_processed_us = 0 };
-        }
-
-        pub fn retryPoolOccupancy(self: *Store, now_us: i64) Error!PoolOccupancy {
-            try self.beginRead();
-            errdefer self.rollback();
-            const total = try self.integer("SELECT count(*) FROM retry_states;");
-            const banned = try self.liveRetryLeases(now_us);
-            if (total < 0 or banned < 0 or banned > total) return error.InvalidRetryState;
-            try self.commitTransaction();
-            return .{
-                .tracked = std.math.cast(u32, total - banned) orelse return error.StorageLimit,
-                .banned = std.math.cast(u32, banned) orelse return error.StorageLimit,
-                .tracking_limit = retry.max_pool_subjects,
-                .ban_limit = retry.max_pool_subjects,
-            };
         }
 
         pub fn evictionCount(self: *Store, jail: []const u8) u64 {
@@ -1484,6 +1713,7 @@ pub fn Methods(comptime Store: type) type {
         }
 
         pub fn commitRetry(self: *Store, record: Record, admission: retry.Admission) Error!void {
+            try self.requireRetryProjectionMutationTx();
             if (admission.processing_us) |now| {
                 if (try self.readRetryClock()) |floor| if (now < floor) return error.ReceiptClockReversed;
                 var clock = try self.statement("UPDATE retry_clock SET floor_us=CASE WHEN floor_us IS NULL OR floor_us<?1 THEN ?1 ELSE floor_us END WHERE id=1;");
@@ -1584,6 +1814,9 @@ pub fn Methods(comptime Store: type) type {
                 try row.blob(7, next.state.encodeAttempts(&bytes));
             }
             try row.done();
+            if (new_row) self.insertedRows(.retry_states, 1);
+            try self.syncRetryProjectionRowTx(record.jail, &subject);
+            try self.changeRetryJailSummaryTx(record.jail, if (previous) |prior| prior.decisions else 0, next.state.decisions);
             try self.fault(.after_retry_state);
             if (next.decision) |decision| {
                 var effect_identity: ?effects.Hash = null;
@@ -1651,7 +1884,7 @@ pub fn Methods(comptime Store: type) type {
                     }
                 }
                 if (self.schema_version >= 17) {
-                    if (try self.integer("SELECT count(*) FROM retry_decision_details;") >= application_history.max_details) {
+                    if (try self.tableRows(.retry_decision_details) >= application_history.max_details) {
                         if (try self.pruneRetryDecisionDetailsTx() == 0) return error.HistoryCapacity;
                     }
                     var detail = try self.statement("INSERT INTO retry_decision_details(jail,family,subject,source,occurrence,ordinal,decided_us,effect_decision_id,evidence) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9);");
@@ -1663,8 +1896,11 @@ pub fn Methods(comptime Store: type) type {
                     try detail.int(6, @intCast(decision.ordinal));
                     try detail.int(7, decision.decided_us);
                     if (effect_identity) |identity| try detail.blob(8, &identity);
-                    if (record.retry_evidence.text) |evidence| try detail.text(9, evidence);
+                    if (self.schema_version < 27 or try self.effectiveHistoryLimitTx(record.jail) != 0) {
+                        if (record.retry_evidence.text) |evidence| try detail.text(9, evidence);
+                    }
                     try detail.done();
+                    self.insertedRows(.retry_decision_details, 1);
                 }
             }
         }

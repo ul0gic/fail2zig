@@ -12,14 +12,9 @@ const build_options = @import("build_options");
 const diag_mod = @import("core/diag.zig");
 const reload_mod = @import("runtime/native_reload.zig");
 const log_level = @import("core/log_level.zig");
-const readiness = @import("core/readiness.zig");
 const audit = @import("core/audit.zig");
 const daemon = @import("native_daemon.zig");
 const max_jails = daemon.max_jails;
-fn notifyReloadReady(report: readiness.Report, notifier: anytype) void {
-    if (!report.ready) return;
-    _ = notifier.ready() catch |err| std.log.warn("sd_notify READY failed after reload: {s}", .{@errorName(err)});
-}
 
 pub fn Methods(comptime Coordinator: type) type {
     return struct {
@@ -76,7 +71,7 @@ pub fn Methods(comptime Coordinator: type) type {
             }, .generation = current_generation, .reasons = classification.reasons, .reason_count = classification.reason_count };
             if (classification.kind != .live and !(classification.kind == .noop and self.hasAllowlistFiles())) return out;
             const request = self.allocator.create(ReloadRequest) catch return ReloadOutcome.single(.rejected, "out of memory", .{});
-            request.* = .{ .classification = classification, .config_digest = digest, .proposed = proposed, .arena = arena };
+            request.* = .{ .config_digest = digest, .proposed = proposed, .arena = arena };
             keep_arena = true;
             self.mutex.lock();
             if (self.reload_request != null) {
@@ -120,20 +115,49 @@ pub fn Methods(comptime Coordinator: type) type {
             if (abandoned) self.freeRequest(request);
             std.log.info("native reload: outcome={s}", .{@tagName(outcome.kind)});
         }
+        pub fn notifyReloadReady(self: *Coordinator) void {
+            if (!self.reload_ready_pending or !self.readinessReport().ready) return;
+            self.reload_ready_pending = false;
+            if (self.notifier) |notifier| _ = notifier.ready() catch |err| std.log.warn("sd_notify READY failed after reload: {s}", .{@errorName(err)});
+        }
         pub fn namedIn(names: []const []const u8, name: []const u8) bool {
             for (names) |value| if (std.mem.eql(u8, value, name)) return true;
             return false;
         }
         pub fn applyReloadInner(self: *Coordinator, request: *ReloadRequest) !ReloadOutcome {
             try self.gate.admitMutation();
-            if (self.notifier) |notifier| _ = notifier.reloading() catch {};
-            defer if (self.notifier) |notifier| {
-                notifyReloadReady(self.readinessReport(), notifier);
-            };
+            if (self.notifier) |notifier| {
+                _ = notifier.reloading() catch {};
+                self.reload_ready_pending = true;
+            }
+            defer self.notifyReloadReady();
             const now = self.clock.wallUs();
             const generation = reload_mod.generationId(request.config_digest, now);
-            const classification = &request.classification;
             const proposed = request.proposed;
+            const classified = self.inspectPublicationLocked(ReloadClassificationInput{ .proposed = proposed }, classifyReloadLocked);
+            const classification = &classified.classification;
+            if (classification.kind != .live and !(classification.kind == .noop and self.hasAllowlistFiles())) return .{
+                .kind = switch (classification.kind) {
+                    .noop => .noop,
+                    .live => unreachable,
+                    .restart_required => .restart_required,
+                    .rejected => .rejected,
+                },
+                .generation = classified.generation,
+                .reasons = classification.reasons,
+                .reason_count = classification.reason_count,
+            };
+            // Refuse reuse before constructing any proposed runtime or changing durable state.
+            for (proposed.jails) |jail_cfg| if (jail_cfg.enabled) {
+                const runtime_retiring = if (self.findJail(jail_cfg.name)) |jail| jail.retiring else false;
+                var withdrawing = false;
+                for (self.pending_withdrawals.items) |pending| if (std.mem.eql(u8, pending.jailName(), jail_cfg.name)) {
+                    withdrawing = true;
+                    break;
+                };
+                if (runtime_retiring or withdrawing or try self.store.jailRetirement(jail_cfg.name) != null)
+                    return ReloadOutcome.single(.rejected, "jails.{s}: retirement in progress; retry after completion", .{jail_cfg.name});
+            };
             const removed = classification.jails.removedSlice();
             var reservations: [max_jails]?resource.Token = [_]?resource.Token{null} ** max_jails;
             var reserved: usize = 0;
@@ -173,27 +197,29 @@ pub fn Methods(comptime Coordinator: type) type {
                 count += 1;
             }
             var outcome = ReloadOutcome{ .kind = .applied, .generation = generation };
+            var custom_policies: [max_jails]?Coordinator.PreparedCustomPolicy = [_]?Coordinator.PreparedCustomPolicy{null} ** max_jails;
+            defer for (&custom_policies) |*value| if (value.*) |*prepared| prepared.deinit(self);
+            var custom_updates: [max_jails]durable.Store.ConfigConsumerUpdate = undefined;
+            var custom_count: usize = 0;
             var refreshed: usize = 0;
-            for (self.jails) |*jail| {
-                const consumer = jail.consumer orelse continue;
-                const path = self.ignoreFilePath(jail.name) orelse continue;
-                const result = consumer.refreshAllowlist(path, now) catch |err| {
-                    if (outcome.reason_count < reload_mod.max_reasons) {
-                        var reason: reload_mod.Reason = .{};
-                        const written = std.fmt.bufPrint(&reason.bytes, "jails.{s}: allowlist retained: {s}", .{ jail.name, @errorName(err) }) catch reason.bytes[0..0];
-                        reason.len = @intCast(written.len);
-                        outcome.reasons[outcome.reason_count] = reason;
-                        outcome.reason_count += 1;
+            for (self.jails, 0..) |*jail, i| {
+                if (jail.retiring or namedIn(removed, jail.name)) continue;
+                custom_policies[i] = try self.prepareCustomPolicy(jail, proposed, now, false);
+                if (custom_policies[i]) |*prepared| {
+                    refreshed += 1;
+                    if (prepared.policy.update()) |update| {
+                        custom_updates[custom_count] = update;
+                        custom_count += 1;
                     }
-                    continue;
-                };
-                if (result == .applied) refreshed += 1;
+                }
             }
             var fresh_self = self.readSelfAddresses();
             defer if (fresh_self) |*list| list.deinit(self.allocator);
             const fresh_own: []const shared.IpAddress = if (fresh_self) |list| list.addresses else &.{};
             var next_lists: [max_jails]?*ignore_set.EffectiveIgnore = [_]?*ignore_set.EffectiveIgnore{null} ** max_jails;
             defer for (next_lists) |pending| if (pending) |list| list.deinit(self.allocator);
+            var next_deadlines: [max_jails]?Coordinator.PreparedIgnoreDeadlines = [_]?Coordinator.PreparedIgnoreDeadlines{null} ** max_jails;
+            defer for (next_deadlines) |pending| if (pending) |deadlines| deadlines.deinit(self.allocator);
             var ignore_changes: usize = 0;
             for (self.jails, 0..) |*jail, i| {
                 if (jail.retiring or namedIn(removed, jail.name)) continue;
@@ -201,12 +227,13 @@ pub fn Methods(comptime Coordinator: type) type {
                 const jail_cfg = findConfigJail(proposed, jail.name);
                 const own = if (jail_cfg) |value| config.resolveJailFromConfig(value, proposed.defaults).ignoreself else false;
                 if (!changed and !own) continue;
-                if (ignoreCell(jail) == null) {
-                    if (changed) try self.applyIgnoreDeadlines(proposed, jail.name, now);
-                    continue;
-                }
-                next_lists[i] = try self.effectiveIgnore(proposed, jail.name, fresh_own, if (changed) .apply else .read, now);
                 ignore_changes += @intFromBool(changed);
+                if (ignoreCell(jail) == null) continue;
+                if (changed) next_deadlines[i] = try self.previewIgnoreDeadlines(proposed, jail.name, now);
+                next_lists[i] = if (next_deadlines[i]) |deadlines|
+                    try self.effectiveIgnoreWithDeadlines(proposed, jail.name, fresh_own, deadlines.literals, now)
+                else
+                    try self.effectiveIgnore(proposed, jail.name, fresh_own, .read, now);
             }
             var decays: [max_jails]retry.EscalationDecay = undefined;
             for (classification.decaySlice(), 0..) |name, i| {
@@ -228,13 +255,12 @@ pub fn Methods(comptime Coordinator: type) type {
                 reservations[created] = null;
                 created += 1;
                 const jail = &self.jail_storage[base + created - 1];
+                next_deadlines[base + created - 1] = try self.previewIgnoreDeadlines(proposed, jail.name, now);
                 if (ignoreCell(jail) != null) {
-                    next_lists[base + created - 1] = try self.effectiveIgnore(proposed, jail.name, fresh_own, .apply, now);
-                } else try self.applyIgnoreDeadlines(proposed, jail.name, now);
+                    next_lists[base + created - 1] = try self.effectiveIgnoreWithDeadlines(proposed, jail.name, fresh_own, next_deadlines[base + created - 1].?.literals, now);
+                }
             }
-            var retiring: usize = 0;
-            for (removed) |name| retiring += @intFromBool(self.findJail(name) != null);
-            const changes = count + refreshed + ignore_changes + classification.banipSlice().len + classification.decaySlice().len + created + retiring;
+            const changes = count + refreshed + ignore_changes + classification.banipSlice().len + classification.decaySlice().len + classification.jails.added_count + removed.len + @intFromBool(classification.retention_changed);
             if (changes == 0) {
                 outcome.kind = .noop;
                 outcome.generation = self.published_generation;
@@ -244,20 +270,38 @@ pub fn Methods(comptime Coordinator: type) type {
             for (self.jail_storage[0 .. base + created], 0..) |*jail, i| {
                 if (i < base and (jail.retiring or namedIn(removed, jail.name))) continue;
                 var next = jail.policy;
+                var next_generation = try self.plannedGeneration(jail, .planned);
                 for (transitions[0..count]) |change| if (std.mem.eql(u8, change.jail, jail.name)) {
                     next = change.next;
+                    next_generation = change.next_generation;
                 };
-                const allowlist = if (jail.consumer) |consumer| consumer.ignores.live.payload else if (jail.custom_plan) |assets| assets.initial_ignore.payload else "";
-                digests[digest_count] = .{ .jail = jail.name, .digest = try reload_mod.jailDigest(jail.name, next, try self.plannedGeneration(jail, .planned)), .allowlist_snapshot = allowlist };
+                const allowlist = if (custom_policies[i]) |prepared| prepared.policy.next.payload else if (jail.consumer) |consumer| consumer.ignores.live.payload else if (jail.custom_plan) |assets| assets.initial_ignore.payload else "";
+                digests[digest_count] = .{ .jail = jail.name, .digest = try reload_mod.jailDigest(jail.name, next, next_generation), .allowlist_snapshot = allowlist };
                 digest_count += 1;
             }
-            if (self.live_arena_backs_jails) try self.retained_arenas.ensureUnusedCapacity(self.allocator, 1);
-            self.store.commitReloadGeneration(transitions[0..count], .{ .generation = generation, .config_digest = request.config_digest, .config_path = self.config_path, .committed_us = now, .published = true, .mutation_revision = 0 }, digests[0..digest_count], .{ .prepared_us = now, .context = self, .read = wallClockEffect }) catch |err| {
-                if (refreshed != 0) return ReloadOutcome.single(.partial, "allowlists refreshed but the policy generation was not committed: {s}", .{@errorName(err)});
-                return err;
+            var ignore_updates: [max_jails]durable.Store.ConfigIgnoreUpdate = undefined;
+            var ignore_count: usize = 0;
+            for (self.jail_storage[0 .. base + created], 0..) |*jail, i| if (next_deadlines[i]) |deadlines| {
+                ignore_updates[ignore_count] = deadlines.update(jail.name);
+                ignore_count += 1;
             };
+            var retention_rows: [config.max_configured_jails]durable.Store.JailRetentionLimit = undefined;
+            const retention = try Coordinator.retentionUpdate(proposed, &retention_rows);
+            var admitted_names: [max_jails][]const u8 = undefined;
+            for (self.jail_storage[base..][0..created], 0..) |jail, i| admitted_names[i] = jail.name;
+            var retired_names: [max_jails][]const u8 = undefined;
+            var retired_count: usize = 0;
+            for (removed) |name| if (self.findJail(name)) |jail| {
+                if (jail.retiring) continue;
+                retired_names[retired_count] = jail.name;
+                retired_count += 1;
+            };
+            try self.store.commitReloadGeneration(transitions[0..count], .{ .generation = generation, .config_digest = request.config_digest, .config_path = self.config_path, .committed_us = now, .published = true, .mutation_revision = 0 }, digests[0..digest_count], ignore_updates[0..ignore_count], custom_updates[0..custom_count], admitted_names[0..created], retired_names[0..retired_count], retention, .{ .prepared_us = now, .context = self, .read = wallClockEffect });
             const committed_revision = self.store.adminRevision();
+            if (classification.retention_changed or removed.len != 0 or classification.jails.added_count != 0) self.maintenance_idle = null;
+            if (count != 0 or created != 0) self.gate.requestRebuild() catch |err| std.log.warn("native reload: source rebuild not started: {s}; it starts with the next recovery", .{@errorName(err)});
             self.mutex.lock();
+            for (&custom_policies) |*value| if (value.*) |*prepared| prepared.policy.publish();
             if (committed_revision) |revision| self.published_revision = revision else |_| {}
             for (transitions[0..count]) |change| if (self.findJail(change.jail)) |jail| {
                 jail.policy = change.next;
@@ -266,17 +310,24 @@ pub fn Methods(comptime Coordinator: type) type {
             };
             if (count != 0) self.owner_read_epoch = null;
             if (classification.log_level) |level| log_level.set(std.meta.stringToEnum(std.log.Level, @tagName(level)) orelse .info);
-            self.replaceLiveConfigLocked(request.arena, proposed, created != 0);
+            const old_arena = self.replaceLiveConfigLocked(request.arena, proposed);
+            // Classification still borrows old configuration names until this turn returns.
+            defer if (old_arena) |arena| {
+                arena.deinit();
+                self.allocator.destroy(arena);
+            };
             request.arena = null;
             self.jails = self.jail_storage[0 .. base + created];
             for (removed) |name| if (self.findJail(name)) |jail| {
                 jail.retiring = true;
             };
+            self.refreshRetirementHook();
             if (fresh_self) |list| {
                 if (self.self_addresses) |*old| old.deinit(self.allocator);
                 self.self_addresses = list;
                 fresh_self = null;
             }
+            self.published_health = self.gate.snapshot();
             self.published_generation = generation;
             self.published_config_digest = request.config_digest;
             self.mutex.unlock();
@@ -291,7 +342,6 @@ pub fn Methods(comptime Coordinator: type) type {
                 next_lists[i] = null;
                 self.replaceIgnoreList(jail, list);
             };
-            if (count != 0 or created != 0) self.gate.requestRebuild() catch |err| std.log.warn("native reload: source rebuild not started: {s}; it starts with the next recovery", .{@errorName(err)});
             if (committed_revision) |_| {} else |err| {
                 outcome.kind = .partial;
                 if (outcome.reason_count < reload_mod.max_reasons) {
@@ -325,18 +375,11 @@ pub fn Methods(comptime Coordinator: type) type {
             const conflict: ?native_banip.BanListConflict = if (native_banip.findConflict(input.proposed, &found)) found else null;
             return .{ .generation = self.published_generation, .classification = reload_mod.classifyWithRuntime(self.live_cfg, input.proposed, retry.max_pool_subjects, counts[0..self.jails.len], conflict) };
         }
-        pub fn replaceLiveConfigLocked(self: *Coordinator, arena: ?*std.heap.ArenaAllocator, proposed: *const config.Config, backs_jails: bool) void {
-            if (self.live_arena) |old| {
-                if (self.live_arena_backs_jails) {
-                    self.retained_arenas.appendAssumeCapacity(old);
-                } else {
-                    old.deinit();
-                    self.allocator.destroy(old);
-                }
-            }
+        pub fn replaceLiveConfigLocked(self: *Coordinator, arena: ?*std.heap.ArenaAllocator, proposed: *const config.Config) ?*std.heap.ArenaAllocator {
+            const old = self.live_arena;
             self.live_arena = arena;
-            self.live_arena_backs_jails = backs_jails;
             self.live_cfg = proposed;
+            return old;
         }
         pub fn ignoreFilePath(self: *Coordinator, name: []const u8) ?[]const u8 {
             for (self.live_cfg.jails) |*jail| if (std.mem.eql(u8, jail.name, name)) return jail.ignore_file;

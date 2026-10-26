@@ -91,6 +91,20 @@ pub fn classifyEntry(args: []const []const u8) EntryMode {
     return .daemon;
 }
 
+fn configuredSocket(arena: std.mem.Allocator, args: []const []const u8, stderr: anytype) ?[]const u8 {
+    for (args) |a| if (std.mem.eql(u8, a, "--socket")) return null;
+    const path = (CliOptions{}).config_path;
+    log_level.set(.err);
+    const cfg = config_mod.Config.loadFile(arena, path) catch |err| switch (err) {
+        error.FileNotFound, error.AccessDenied => return null,
+        else => {
+            stderr.print("warning: config {s}: {s}; using the default socket (pass --socket)\n", .{ path, @errorName(err) }) catch {};
+            return null;
+        },
+    };
+    return cfg.global.socket_path;
+}
+
 pub fn exitClassForClient(code: cli.ExitCode) shared.ExitClass {
     return switch (code) {
         .success => .success,
@@ -231,10 +245,14 @@ pub fn main() !void {
     const rest: []const []const u8 = if (argv.len > 0) argv[1..] else argv;
     switch (classifyEntry(rest)) {
         .operator => {
-            const code = cli.run(heap, rest, std.io.getStdOut().writer(), std.io.getStdErr().writer());
+            var arena = std.heap.ArenaAllocator.init(heap);
+            const code = cli.run(heap, rest, configuredSocket(arena.allocator(), rest, std.io.getStdErr().writer()), std.io.getStdOut().writer(), std.io.getStdErr().writer());
             std.process.exit(exitClassForClient(code).code());
         },
-        .migrate => std.process.exit(@import("cli/migrate.zig").run(heap, rest[1..], version, std.io.getStdOut().writer(), std.io.getStdErr().writer()).code()),
+        .migrate => {
+            var arena = std.heap.ArenaAllocator.init(heap);
+            std.process.exit(@import("cli/migrate.zig").run(heap, rest[1..], version, configuredSocket(arena.allocator(), rest, std.io.getStdErr().writer()), std.io.getStdOut().writer(), std.io.getStdErr().writer()).code());
+        },
         .rule_test => std.process.exit(@import("cli/rule_test.zig").run(heap, rest[1..], std.io.getStdOut().writer(), std.io.getStdErr().writer()).code()),
         .repair_source => std.process.exit(@import("cli/repair_source.zig").run(heap, rest[1..], std.io.getStdOut().writer(), std.io.getStdErr().writer()).code()),
         .support_bundle => std.process.exit(@import("cli/support_bundle.zig").run(heap, rest[1..], version, std.io.getStdOut().writer(), std.io.getStdErr().writer()).code()),
@@ -293,6 +311,7 @@ pub fn main() !void {
         ensureSocketDir(cfg.global.socket_path) catch |err| {
             const stderr = std.io.getStdErr().writer();
             try stderr.print("config: cannot prepare socket directory: {s}\n", .{@errorName(err)});
+            @import("native_daemon.zig").logSandboxHint(err, cfg.global.socket_path, .socket);
             std.process.exit(shared.ExitClass.rejected.code());
         };
     }
@@ -350,6 +369,8 @@ fn printConfigLoadError(
 fn printValidateSummary(w: anytype, cfg: *const config_mod.Config) !void {
     if (cfg.global.firewall != .auto) try w.print("config: firewall={s}\n", .{@tagName(cfg.global.firewall)});
     try w.print("config: on_no_backend={s}\n", .{@tagName(cfg.global.on_no_backend)});
+    try w.print("config: state_file={s}\n", .{cfg.global.state_file});
+    try w.print("config: socket_path={s}\n", .{cfg.global.socket_path});
     for (cfg.jails) |*j| {
         const r = config_mod.resolveJailFromConfig(j, cfg.defaults);
         try w.print(

@@ -107,7 +107,7 @@ pub const IpcServer = struct {
     started: bool = false,
     self_uid: u32 = 0,
     detached: bool = false,
-    serving: bool = true,
+    serving: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     frame_deadline_ms: u64 = default_frame_deadline_ms,
     drain_deadline_ms: u64 = default_drain_deadline_ms,
     idle_deadline_ms: u64 = default_idle_deadline_ms,
@@ -259,7 +259,7 @@ pub const IpcServer = struct {
     }
 
     pub fn isServing(self: *const IpcServer) bool {
-        return self.serving;
+        return self.serving.load(.acquire);
     }
 
     pub fn activeClients(self: *const IpcServer) usize {
@@ -353,13 +353,13 @@ pub const IpcServer = struct {
 
     fn verifyServing(self: *IpcServer) bool {
         auth.verifySocketPath(self.socket_path, self.self_uid) catch |err| {
-            if (self.serving) std.log.warn("ipc: socket path '{s}' no longer trustworthy ({s}); refusing new connections", .{ self.socket_path, @errorName(err) });
-            self.serving = false;
+            if (self.isServing()) std.log.warn("ipc: socket path '{s}' no longer trustworthy ({s}); refusing new connections", .{ self.socket_path, @errorName(err) });
+            self.serving.store(false, .release);
             return false;
         };
-        if (!self.serving) {
+        if (!self.isServing()) {
             std.log.info("ipc: socket path '{s}' verified again; accepting connections", .{self.socket_path});
-            self.serving = true;
+            self.serving.store(true, .release);
         }
         return true;
     }
@@ -581,11 +581,14 @@ pub const IpcServer = struct {
             std.log.warn("ipc: response of {d} bytes exceeds bound {d}; replacing with error", .{ size, max_response_bytes });
             return self.queueErr(cli, 500, "response too large");
         }
-        const buf = try self.allocator.alloc(u8, size);
-        errdefer self.allocator.free(buf);
-        var stream = std.io.fixedBufferStream(buf);
-        try protocol.serializeResponse(resp, stream.writer());
-        std.debug.assert(stream.getWritten().len == size);
+        const buf = serialized: {
+            const bytes = try self.allocator.alloc(u8, size);
+            errdefer self.allocator.free(bytes);
+            var stream = std.io.fixedBufferStream(bytes);
+            try protocol.serializeResponse(resp, stream.writer());
+            std.debug.assert(stream.getWritten().len == size);
+            break :serialized bytes;
+        };
 
         cli.pending = buf;
         cli.sent = 0;

@@ -336,15 +336,15 @@ fn readbackSection(bundle: *Bundle, stats: Reply) !Value {
             .v6 => v6 += 1,
             .unknown => {},
         };
+        cursor = nextCursor(arena, page) catch {
+            try object.put("observation", try bundle.failed("kernel_readback.observation", "malformed firewall cursor"));
+            return .{ .object = object };
+        };
         if (pages == 0) {
             observation = page;
             _ = observation.object.orderedRemove("items");
             _ = observation.object.orderedRemove("next_cursor");
         }
-        cursor = nextCursor(arena, page) catch {
-            try object.put("observation", try bundle.failed("kernel_readback.observation", "malformed firewall cursor"));
-            return .{ .object = object };
-        };
         if (cursor == null) {
             try object.put("observation", observation);
             var counts = ObjectMap.init(arena);

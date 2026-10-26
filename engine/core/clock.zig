@@ -7,6 +7,7 @@ const native_time = @import("native_time.zig");
 pub const Clock = if (build_options.diag) VirtualClock else SystemClock;
 
 pub const SystemClock = struct {
+    mutex: std.Thread.Mutex = .{},
     timer: std.time.Timer,
 
     pub fn init() error{TimerUnsupported}!SystemClock {
@@ -19,10 +20,12 @@ pub const SystemClock = struct {
         return std.time.timestamp();
     }
     pub inline fn monotonicNs(self: *SystemClock) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.timer.read();
     }
     pub inline fn monotonicMs(self: *SystemClock) u64 {
-        return self.timer.read() / std.time.ns_per_ms;
+        return self.monotonicNs() / std.time.ns_per_ms;
     }
     pub inline fn rate(_: *SystemClock) u32 {
         return 1;

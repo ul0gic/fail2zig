@@ -72,53 +72,7 @@ pub fn Methods(comptime Store: type) type {
                 try update.text(3, new_text);
                 try update.done();
             }
-            const canonical_scope = @import("../firewall/scope.zig");
-            const Held = struct { key: [32]u8, revision: u64, scope: [canonical_scope.encoded_bytes]u8, absent: bool };
-            var held = std.ArrayListUnmanaged(Held){};
-            defer held.deinit(self.allocator);
-            {
-                var owners = try self.statement("SELECT o.scope_key,o.revision,n.canonical_scope,o.lease_kind,o.deadline_us,EXISTS(SELECT 1 FROM effect_owner_revisions h WHERE h.scope_key=o.scope_key AND h.jail=o.jail AND h.revision=o.revision AND h.generation=o.generation AND h.decision_id=o.decision_id AND h.lease_kind=o.lease_kind AND h.deadline_us IS o.deadline_us AND h.decided_us=o.decided_us) FROM effect_owners o JOIN native_effects n USING(scope_key) WHERE o.jail=?1 AND o.generation=?2 ORDER BY o.scope_key;");
-                defer owners.deinit();
-                try owners.text(1, jail);
-                try owners.blob(2, &change.generation);
-                while (try owners.row()) {
-                    if (held.items.len == effects.max_effects) return error.EffectCapacity;
-                    const owner_revision = try owners.signed(1);
-                    if (owner_revision <= 0 or owner_revision >= std.math.maxInt(i64) or try owners.signed(5) != 1) return error.InvalidEffect;
-                    const lease = try effectLease(&owners, 3, 4);
-                    try held.append(self.allocator, .{ .key = try effectBlob(&owners, 0, 32), .revision = @intCast(owner_revision), .scope = try effectBlob(&owners, 2, canonical_scope.encoded_bytes), .absent = lease == .absent });
-                }
-            }
-            const count: i64 = @intCast(held.items.len);
-            var live_count: i64 = 0;
-            for (held.items) |owner| if (!owner.absent) {
-                live_count += 1;
-            };
-            try self.reserveEffectRows(.{ .revisions = count, .intents = live_count, .observations = live_count * @import("store.zig").load_repair.observations_per_intent });
-            if (try self.integer("SELECT count(*) FROM effect_owner_revisions;") + count > effects.max_owner_revisions) return error.EffectCapacity;
-            for (held.items) |owner| {
-                const scope = canonical_scope.Scope.decode(&owner.scope) catch return error.InvalidEffect;
-                if (owner.absent) {
-                    const installation = try self.readInstallation() orelse return error.InstallationRequired;
-                    const exact = try effects.Scope.exact(scope);
-                    if (!std.mem.eql(u8, &owner.key, &try exact.key(installation))) return error.InvalidEffect;
-                    var update = try self.statement("UPDATE effect_owners SET generation=?4,revision=?5 WHERE scope_key=?1 AND jail=?2 AND revision=?3 AND generation=?6 AND lease_kind=0 AND deadline_us IS NULL;");
-                    defer update.deinit();
-                    try update.blob(1, &owner.key);
-                    try update.text(2, jail);
-                    try update.int(3, @intCast(owner.revision));
-                    try update.blob(4, &change.next_generation);
-                    try update.int(5, @intCast(owner.revision + 1));
-                    try update.blob(6, &change.generation);
-                    try update.done();
-                    if (self.api.changes(self.db) != 1) return error.StalePolicyTransition;
-                    try self.advanceEffectSnapshot();
-                    continue;
-                }
-                const transition_id = effects.hashParts("fail2zig-generation-rekey-v1", &.{ &change.next_generation, &owner.key });
-                _ = try self.transitionOwnerReservedTx(.{ .scope = scope, .jail = jail, .current_generation = change.generation, .next_generation = change.next_generation, .expected_owner_revision = owner.revision, .transition_id = transition_id, .mode = .retain, .occurred_us = now_us }, now_us, false);
-            }
-            if (held.items.len != 0) self.rekeyed_owners = true;
+            if (try self.rekeyOwnersTx(jail, change.generation, change.next_generation, now_us, error.StalePolicyTransition)) self.rekeyed_owners = true;
             var stale = try self.statement("SELECT 1 FROM effect_owners WHERE jail=?1 AND generation!=?2 LIMIT 1;");
             defer stale.deinit();
             try stale.text(1, jail);
@@ -126,14 +80,40 @@ pub fn Methods(comptime Store: type) type {
             if (try stale.row()) return error.StalePolicyTransition;
         }
 
-        pub fn commitReloadGeneration(self: *Store, transitions: []const PolicyTransition, record: ConfigGenerationRecord, jails: []const ConfigGenerationJail, clock: effects.Clock) Error!void {
-            if (transitions.len > 64) return error.InvalidAdminRequest;
+        pub const ConfigIgnoreUpdate = struct {
+            jail: []const u8,
+            entries: []const @import("shared").types.TimedEntry,
+            deadlines: []?i64,
+        };
+
+        pub const ConfigConsumerUpdate = struct { manifest: consumers.Manifest, batch: consumers.Batch };
+
+        pub fn commitReloadGeneration(self: *Store, transitions: []const PolicyTransition, record: ConfigGenerationRecord, jails: []const ConfigGenerationJail, ignores: []const ConfigIgnoreUpdate, custom: []const ConfigConsumerUpdate, admitted_jails: []const []const u8, retired_jails: []const []const u8, retention: Store.RetentionUpdate, clock: effects.Clock) Error!void {
+            if (transitions.len > 64 or ignores.len > 64 or custom.len > 64 or admitted_jails.len > 64 or retired_jails.len > 64) return error.InvalidAdminRequest;
+            for (admitted_jails, 0..) |name, i| {
+                _ = detection.Name.init(name) catch return error.InvalidAdminRequest;
+                for (admitted_jails[0..i]) |prior| if (std.mem.eql(u8, prior, name)) return error.InvalidAdminRequest;
+            }
+            for (retired_jails, 0..) |name, i| {
+                _ = detection.Name.init(name) catch return error.InvalidAdminRequest;
+                for (retired_jails[0..i]) |prior| if (std.mem.eql(u8, prior, name)) return error.InvalidAdminRequest;
+            }
+            for (custom, 0..) |update, i| {
+                if (update.batch.deltas.len != 1) return error.InvalidAdminRequest;
+                const delta = update.batch.deltas[0];
+                if (delta.key.kind != .ignore or !std.mem.eql(u8, delta.key.jail, update.manifest.jail) or !std.mem.eql(u8, delta.key.source, "@shared") or !std.mem.eql(u8, delta.key.rule, "allowlist") or delta.expected_revision == 0) return error.InvalidAdminRequest;
+                for (custom[0..i]) |previous| if (std.mem.eql(u8, previous.manifest.jail, update.manifest.jail)) return error.InvalidAdminRequest;
+            }
             try self.beginWrite();
             errdefer self.rollback();
             if (self.schema_version < 22) return error.AdminStorageRequired;
+            for (retired_jails) |name| try self.beginJailRetirementTx(name, false);
+            for (admitted_jails) |name| try self.admitRetryProjectionJailTx(name);
             self.rekeyed_owners = false;
             const now = try self.effectClock(clock);
+            for (custom) |update| try self.applyConsumerInputTx(update.manifest, update.batch, false);
             for (transitions) |change| try self.transitionJailGenerationTx(change, now);
+            for (ignores) |change| try self.applyConfigDeadlines(.ignoreip, change.jail, change.entries, record.committed_us, change.deadlines);
             if (self.rekeyed_owners) _ = try self.commitEffectClock(clock);
             try self.bumpAdminRevisionTx();
             const mutation_revision = try self.integer("SELECT mutation_revision FROM admin_revision WHERE id=1;");
@@ -142,6 +122,7 @@ pub fn Methods(comptime Store: type) type {
             pinned.published = true;
             try self.exec("UPDATE config_generations SET published=0 WHERE published=1;");
             try self.recordConfigGenerationTx(pinned, jails);
+            _ = try self.applyRetentionPolicyTx(retention);
             try self.fault(.before_config_generation_commit);
             try self.commitEffectTransaction(self.rekeyed_owners);
             self.rekeyed_owners = false;
@@ -182,11 +163,12 @@ pub fn Methods(comptime Store: type) type {
             allowlist_snapshot: []const u8,
         };
 
-        pub fn recordConfigGeneration(self: *Store, record: ConfigGenerationRecord, jails: []const ConfigGenerationJail) Error!void {
-            try self.beginWrite();
+        pub fn recordConfigGeneration(self: *Store, record: ConfigGenerationRecord, jails: []const ConfigGenerationJail, retention: Store.RetentionUpdate) Error!void {
+            try self.beginAdmissionWrite();
             errdefer self.rollback();
             if (self.schema_version < 22) return error.AdminStorageRequired;
             try self.recordConfigGenerationTx(record, jails);
+            _ = try self.applyRetentionPolicyTx(retention);
             try self.fault(.before_config_generation_commit);
             try self.commitTransaction();
         }
@@ -276,6 +258,7 @@ pub fn Methods(comptime Store: type) type {
         }
         pub const AdminReplay = struct { kind: AdminKind, outcome: AdminOutcome, mutation_revision: u64 };
         pub const AdminAdmission = union(enum) { fresh, replayed: AdminReplay };
+        const unpinned_admin_request = "NOT (kind=2 AND outcome IN(4,5) AND EXISTS(SELECT 1 FROM jail_admin_states s WHERE s.jail=CAST(admin_requests.subject AS TEXT) AND s.enabled=0 AND s.request_id=admin_requests.request_id AND EXISTS(SELECT 1 FROM config_generation_jails c WHERE c.generation=?2 AND c.jail=s.jail)))";
         pub const JailAdminState = struct {
             jail: []const u8,
             enabled: bool,
@@ -348,20 +331,58 @@ pub fn Methods(comptime Store: type) type {
                 try upsert.done();
             }
             {
-                var age = try self.statement("DELETE FROM admin_requests WHERE committed_us<?1;");
+                var age = try self.statement("DELETE FROM admin_requests WHERE committed_us<?1 AND " ++ unpinned_admin_request ++ ";");
                 defer age.deinit();
                 try age.int(1, record.committed_us -| admin_request_max_age_us);
+                try age.blob(2, &record.generation);
                 try age.done();
             }
             {
-                var overflow = try self.statement("DELETE FROM admin_requests WHERE request_id IN (SELECT request_id FROM admin_requests ORDER BY mutation_revision ASC, committed_us ASC LIMIT max(0,(SELECT count(*) FROM admin_requests)-?1));");
+                var overflow = try self.statement("DELETE FROM admin_requests WHERE request_id IN (SELECT request_id FROM admin_requests WHERE " ++ unpinned_admin_request ++ " ORDER BY mutation_revision ASC, committed_us ASC LIMIT max(0,(SELECT count(*) FROM admin_requests)-?1));");
                 defer overflow.deinit();
                 try overflow.int(1, admin_request_retention);
+                try overflow.blob(2, &record.generation);
                 try overflow.done();
             }
             try self.fault(.after_admin_request);
             try self.commitTransaction();
             return @intCast(mutation_revision);
+        }
+
+        pub fn updateJailDisableOutcome(self: *Store, jail: []const u8, request_id: effects.Hash, expected: AdminOutcome, next: AdminOutcome, detail: []const u8, effect_epoch: u64, committed_us: i64) Error!?u64 {
+            if ((expected != .partial and expected != .uncertain) or (next != .partial and next != .uncertain and next != .applied) or detail.len > 4096 or committed_us < 0) return error.InvalidAdminRequest;
+            if (expected == next) return null;
+            try self.beginWrite();
+            errdefer self.rollback();
+            if (self.schema_version < 22) return error.AdminStorageRequired;
+            if (next == .applied and effect_epoch != self.effect_publication_epoch) return error.StaleEffect;
+            {
+                var row = try self.statement("SELECT a.outcome FROM admin_requests a JOIN jail_admin_states s ON s.jail=?1 WHERE a.request_id=?2 AND a.kind=2 AND a.subject=CAST(?1 AS BLOB) AND s.enabled=0 AND s.request_id=a.request_id;");
+                defer row.deinit();
+                try row.text(1, jail);
+                try row.blob(2, &request_id);
+                if (!try row.row() or try row.signed(0) != @intFromEnum(expected)) {
+                    try self.commitTransaction();
+                    return null;
+                }
+            }
+            try self.bumpAdminRevisionTx();
+            const revision = try self.integer("SELECT mutation_revision FROM admin_revision WHERE id=1;");
+            if (revision < 0) return error.DatabaseFailure;
+            var update = try self.statement("UPDATE admin_requests SET outcome=?3,mutation_revision=?4,committed_us=?5,detail=?6 WHERE request_id=?1 AND kind=2 AND subject=CAST(?2 AS BLOB) AND outcome=?7;");
+            defer update.deinit();
+            try update.blob(1, &request_id);
+            try update.text(2, jail);
+            try update.int(3, @intFromEnum(next));
+            try update.int(4, revision);
+            try update.int(5, committed_us);
+            try update.blob(6, detail);
+            try update.int(7, @intFromEnum(expected));
+            try update.done();
+            if (self.api.changes(self.db) != 1) return error.StaleAdminRevision;
+            try self.fault(.after_admin_request);
+            try self.commitTransaction();
+            return @intCast(revision);
         }
 
         pub fn jailAdminState(self: *Store, jail: []const u8, output: *JailAdminState) Error!bool {

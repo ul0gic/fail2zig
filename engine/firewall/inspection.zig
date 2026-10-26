@@ -140,6 +140,13 @@ pub const Entry = struct {
     effect_id: ?[32]u8 = null,
     partial: bool = false,
 };
+pub const HostBatchEntry = struct {
+    entry: Entry,
+    original: usize,
+    fn less(_: void, a: @This(), b: @This()) bool {
+        return entryLess({}, a.entry, b.entry);
+    }
+};
 
 pub const scoped_rule_metadata_bytes: usize = 140;
 pub const scoped_comment_prefix = "f2zs:";
@@ -248,6 +255,58 @@ pub const Snapshot = struct {
         room[index] = entry;
         self.entries = room;
         return true;
+    }
+    pub fn upsertHosts(self: *Snapshot, batch: []HostBatchEntry, added: []bool) Error!void {
+        if (batch.len > max_install_messages or added.len != batch.len) return error.LimitExceeded;
+        for (batch, 0..) |candidate, index| {
+            if (candidate.entry.scope != null or candidate.original != index) return error.UnsupportedScope;
+            added[index] = false;
+        }
+        mem.sortUnstable(HostBatchEntry, batch, {}, HostBatchEntry.less);
+        if (batch.len > 1) {
+            for (batch[1..], 1..) |candidate, index| {
+                if (!entryLess({}, batch[index - 1].entry, candidate.entry)) return error.UnsupportedScope;
+            }
+        }
+
+        const len = self.entries.len;
+        var existing: usize = 0;
+        var additions: usize = 0;
+        for (batch) |candidate| {
+            while (existing < len and entryLess({}, self.entries[existing], candidate.entry)) existing += 1;
+            if (existing == len or entryLess({}, candidate.entry, self.entries[existing])) {
+                added[candidate.original] = true;
+                additions += 1;
+            } else if (!std.meta.eql(entryScope(self.entries[existing]), entryScope(candidate.entry))) {
+                return error.UnknownState;
+            }
+        }
+
+        const required = len + additions;
+        const held = @max(self.capacity, len);
+        if (required > held) {
+            const wanted = @max(required, held + held / 2 + 8);
+            const grown = self.allocator.realloc(self.entries.ptr[0..held], wanted) catch return error.OutOfMemory;
+            self.entries = grown[0..len];
+            self.capacity = wanted;
+        }
+        const room = self.entries.ptr[0..required];
+        var old = len;
+        var incoming = batch.len;
+        var write = required;
+        while (incoming > 0) {
+            if (old > 0 and entryLess({}, batch[incoming - 1].entry, room[old - 1])) {
+                write -= 1;
+                old -= 1;
+                room[write] = room[old];
+            } else {
+                write -= 1;
+                incoming -= 1;
+                room[write] = batch[incoming].entry;
+                if (old > 0 and !entryLess({}, room[old - 1], batch[incoming].entry)) old -= 1;
+            }
+        }
+        self.entries = room;
     }
     pub fn removeHost(self: *Snapshot, entry: Entry) Error!bool {
         if (entry.scope != null) return error.UnsupportedScope;
@@ -713,13 +772,15 @@ pub const Inspector = struct {
         const observation_start = self.clockAt(clock, &elapsed) catch |err| return .{ .result = .{ .uncertain = self.failure(.effect_verify, err, progress) }, .consumed = consumed };
         if (transport == .nftables) return .{ .result = .{ .acknowledged = .{ .sent_wall_us = sent_wall_us, .acked_wall_us = observation_start, .port_id = self.last_install_port } }, .consumed = consumed };
         var after = self.inspect() catch |err| return .{ .result = .{ .uncertain = self.failure(.effect_verify, err, progress) }, .consumed = consumed };
-        errdefer after.deinit();
+        var transferred = false;
+        defer if (!transferred) after.deinit();
         const observation_end = self.clockAt(clock, &elapsed) catch |err| return .{ .result = .{ .uncertain = self.failure(.effect_verify, err, progress) }, .consumed = consumed };
         if (after.state != .owned) return .{ .result = .{ .uncertain = self.failure(.effect_verify, error.Changed, progress) }, .consumed = consumed };
         for (tokens[0..consumed]) |token| {
             const entry = findEntry(after.entries, token.scope, token.effect_id) catch |err| return .{ .result = .{ .uncertain = self.failure(.effect_verify, err, progress) }, .consumed = consumed };
             if (!self.kernelMatches(token.operation, entry, observation_start, observation_end)) return .{ .result = .{ .uncertain = self.failure(.effect_verify, error.Changed, progress) }, .consumed = consumed };
         }
+        transferred = true;
         return .{ .result = .{ .verified = .{ .snapshot = after, .changed = true, .observed_start_wall_us = observation_start, .observed_wall_us = observation_end } }, .consumed = consumed };
     }
     // Every element carries a timeout, so a present element is always replaced: delete then add, as the single path does.

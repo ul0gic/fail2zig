@@ -16,12 +16,20 @@ pub const max_cursor_bytes: usize = 128;
 pub const Kind = enum { status, config, health, scopes, history, firewall, stats, ignore, continuity };
 pub const PeerClass = enum { admin, monitor };
 
+pub fn requiresAdmin(kind: Kind) bool {
+    return switch (kind) {
+        .scopes, .history, .firewall => true,
+        else => false,
+    };
+}
+
 pub const Request = struct {
     schema_version: ?std.json.Value = null,
     kind: ?[]const u8 = null,
     jail: ?[]const u8 = null,
     cursor: ?[]const u8 = null,
     limit: ?std.json.Value = null,
+    details: ?bool = null,
 };
 
 pub const Failure = struct { code: u16, message: []const u8 };
@@ -40,6 +48,7 @@ pub const Result = union(enum) {
 
 pub const Callback = struct {
     ctx: ?*anyopaque,
+    stamped: bool = false,
     func: *const fn (ctx: ?*anyopaque, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) anyerror!void,
 };
 
@@ -55,6 +64,8 @@ pub const JailConfig = struct {
     bantime_permanent: bool,
     banaction: []const u8,
     ignoreip: []const []const u8,
+    history_max_matches: u16,
+    history_max_matches_inherited: bool,
 };
 
 pub const GlobalConfig = struct {
@@ -67,6 +78,7 @@ pub const GlobalConfig = struct {
     state_file: []const u8,
     dns_server: ?[]const u8,
     timezone_root: ?[]const u8,
+    history_max_matches: u16,
 };
 
 pub const ConfigView = struct {
@@ -187,6 +199,7 @@ pub const ScopeItem = struct {
     key: ItemKey = .{},
     origin: ?shared.types.Origin = null,
     expired: bool = false,
+    match: ?[]const u8 = null,
 };
 
 pub const JailScopes = struct {
@@ -203,7 +216,7 @@ pub const JailScopes = struct {
     }
 };
 
-pub const ScopesWindow = struct { jail: ?[]const u8, cursor_jail: ?u32, cursor_key: ItemKey = .{}, limit: u32 };
+pub const ScopesWindow = struct { jail: ?[]const u8, cursor_jail: ?u32, cursor_key: ItemKey = .{}, limit: u32, details: bool = false };
 
 pub fn scopesWindow(arena: std.mem.Allocator, body: []const u8) ?ScopesWindow {
     if (body.len > shared.protocol.max_request_body) return null;
@@ -213,7 +226,7 @@ pub fn scopesWindow(arena: std.mem.Allocator, body: []const u8) ?ScopesWindow {
         if (value != .integer or value.integer < 1 or value.integer > max_items_per_page) return null;
         limit = @intCast(value.integer);
     }
-    var window = ScopesWindow{ .jail = parsed.jail, .cursor_jail = null, .limit = limit };
+    var window = ScopesWindow{ .jail = parsed.jail, .cursor_jail = null, .limit = limit, .details = parsed.details orelse false };
     if (parsed.cursor) |text| {
         const cursor = Cursor.decode(text) catch return window;
         switch (cursor) {
@@ -240,6 +253,7 @@ pub const HistoryEvent = struct {
     scope: ScopeFields,
     native_retry: bool,
     origin: shared.types.Origin,
+    match: ?[]const u8 = null,
 };
 
 pub const HistoryRead = struct { more: bool, resume_after: u64 };
@@ -336,6 +350,8 @@ pub fn handle(allocator: std.mem.Allocator, body: []const u8, peer_class: PeerCl
     if (version != .integer or version.integer != schema_version) return fail(400, "unsupported schema_version");
     const kind_text = parsed.kind orelse return fail(400, "kind is required");
     const kind = std.meta.stringToEnum(Kind, kind_text) orelse return fail(400, "unknown query kind");
+    if (peer_class == .monitor and requiresAdmin(kind)) return fail(403, "administrator required for ban, history and firewall details");
+    if (parsed.details != null and kind != .scopes and kind != .history) return fail(400, "details is only accepted for scopes and history");
     if (kind == .ignore and sources.ignore == null) return fail(400, "unknown query kind");
     if (kind == .continuity and sources.continuity == null) return fail(400, "unknown query kind");
     if (parsed.jail) |jail| {
@@ -369,11 +385,11 @@ pub fn handle(allocator: std.mem.Allocator, body: []const u8, peer_class: PeerCl
 
     const outcome: RenderError!void = switch (kind) {
         .stats => renderStats(writer, sources.stats, &generation_hex),
-        .status => renderPassthrough(arena, writer, sources.status, &generation_hex),
-        .health => renderHealth(arena, writer, sources.health, &generation_hex),
+        .status => renderPassthrough(arena, allocator, writer, sources.status, &generation_hex),
+        .health => renderHealth(arena, allocator, writer, sources.health, &generation_hex),
         .config => renderConfig(writer, sources.config, peer_class, &generation_hex),
-        .scopes => renderScopes(writer, sources.scopes, parsed.jail, parsed.cursor, limit, &generation_hex),
-        .history => renderHistory(arena, writer, sources.history, parsed.jail, parsed.cursor, @intCast(limit), &generation_hex),
+        .scopes => renderScopes(writer, sources.scopes, parsed.jail, parsed.cursor, limit, parsed.details orelse false, &generation_hex),
+        .history => renderHistory(arena, writer, sources.history, parsed.jail, parsed.cursor, @intCast(limit), parsed.details orelse false, &generation_hex),
         .firewall => renderFirewall(allocator, writer, sources.firewall, parsed.cursor, @intCast(limit), &generation_hex),
         .ignore => renderIgnore(arena, writer, sources.ignore, parsed.jail, peer_class, &generation_hex),
         .continuity => renderContinuity(arena, writer, sources.continuity, continuity_cursor, @intCast(limit), peer_class, &generation_hex),
@@ -449,6 +465,12 @@ pub const Cursor = union(enum) {
     }
 };
 
+pub fn requestedDetails(arena: std.mem.Allocator, body: []const u8) bool {
+    if (body.len > shared.protocol.max_request_body) return false;
+    const parsed = std.json.parseFromSliceLeaky(Request, arena, body, .{ .ignore_unknown_fields = false }) catch return false;
+    return parsed.details orelse false;
+}
+
 pub fn requestedKind(arena: std.mem.Allocator, body: []const u8) ?Kind {
     if (body.len > shared.protocol.max_request_body) return null;
     const parsed = std.json.parseFromSliceLeaky(Request, arena, body, .{ .ignore_unknown_fields = false }) catch return null;
@@ -463,13 +485,14 @@ fn fail(code: u16, message: []const u8) Result {
 
 const RenderError = error{ OutOfMemory, ResponseTooLarge, SourceUnavailable, UnknownJail, BadCursor, InvalidatedCursor, SourceFailed };
 
-const BoundedSink = struct {
+pub const BoundedSink = struct {
     list: *std.ArrayList(u8),
     const WriteError = error{ OutOfMemory, ResponseTooLarge };
     const Writer = std.io.GenericWriter(*BoundedSink, WriteError, write);
     fn write(self: *BoundedSink, bytes: []const u8) WriteError!usize {
         if (self.list.items.len + bytes.len > max_response_bytes) return error.ResponseTooLarge;
-        try self.list.appendSlice(bytes);
+        if (self.list.capacity < max_response_bytes) try self.list.ensureTotalCapacityPrecise(max_response_bytes);
+        self.list.appendSliceAssumeCapacity(bytes);
         return bytes.len;
     }
     fn writer(self: *BoundedSink) Writer {
@@ -477,14 +500,16 @@ const BoundedSink = struct {
     }
 };
 
-fn runCallback(arena: std.mem.Allocator, callback: Callback) RenderError!std.json.Value {
-    var raw = std.ArrayList(u8).init(arena);
-    callback.func(callback.ctx, arena, &raw) catch |err| return switch (err) {
+fn runCallback(arena: std.mem.Allocator, allocator: std.mem.Allocator, callback: Callback) RenderError!std.json.Value {
+    var raw = std.ArrayList(u8).init(allocator);
+    defer raw.deinit();
+    callback.func(callback.ctx, allocator, &raw) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
+        error.ResponseTooLarge, error.SnapshotLimit => error.ResponseTooLarge,
         else => error.SourceFailed,
     };
     if (raw.items.len > max_response_bytes) return error.ResponseTooLarge;
-    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, raw.items, .{}) catch |err| return switch (err) {
+    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, raw.items, .{ .allocate = .alloc_always }) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.SourceFailed,
     };
@@ -498,19 +523,30 @@ fn renderStats(writer: anytype, source: ?Stats, generation_hex: []const u8) Rend
     std.json.stringify(snapshot, .{}, writer) catch |err| return mapWrite(err);
 }
 
-fn renderPassthrough(arena: std.mem.Allocator, writer: anytype, callback: ?Callback, generation_hex: []const u8) RenderError!void {
+fn renderPassthrough(arena: std.mem.Allocator, allocator: std.mem.Allocator, writer: anytype, callback: ?Callback, generation_hex: []const u8) RenderError!void {
     const source = callback orelse return error.SourceUnavailable;
-    var value = try runCallback(arena, source);
+    if (source.stamped) {
+        var raw = std.ArrayList(u8).init(allocator);
+        defer raw.deinit();
+        source.func(source.ctx, allocator, &raw) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.ResponseTooLarge, error.SnapshotLimit => error.ResponseTooLarge,
+            else => error.SourceFailed,
+        };
+        writer.writeAll(raw.items) catch |err| return mapWrite(err);
+        return;
+    }
+    var value = try runCallback(arena, allocator, source);
     try stampEnvelope(arena, &value.object, generation_hex);
     std.json.stringify(value, .{}, writer) catch |err| return mapWrite(err);
 }
 
-fn renderHealth(arena: std.mem.Allocator, writer: anytype, callback: ?Callback, generation_hex: []const u8) RenderError!void {
+fn renderHealth(arena: std.mem.Allocator, allocator: std.mem.Allocator, writer: anytype, callback: ?Callback, generation_hex: []const u8) RenderError!void {
     const source = callback orelse {
         std.json.stringify(.{ .schema_version = schema_version, .generation = generation_hex, .ready = null, .components = null }, .{}, writer) catch |err| return mapWrite(err);
         return;
     };
-    var value = try runCallback(arena, source);
+    var value = try runCallback(arena, allocator, source);
     try stampEnvelope(arena, &value.object, generation_hex);
     std.json.stringify(value, .{}, writer) catch |err| return mapWrite(err);
 }
@@ -545,6 +581,8 @@ fn mapViewFailure(err: anyerror) RenderError {
         error.OutOfMemory => error.OutOfMemory,
         error.ResponseTooLarge => error.ResponseTooLarge,
         error.UnknownJail => error.UnknownJail,
+        error.InvalidatedCursor => error.InvalidatedCursor,
+        error.HistoryUnavailable => error.SourceUnavailable,
         else => error.SourceFailed,
     };
 }
@@ -586,6 +624,8 @@ fn renderConfig(writer: anytype, view: ?ConfigView, peer_class: PeerClass, gener
         field(&out, "bantime_permanent", jail.bantime_permanent) catch |err| return mapWrite(err);
         field(&out, "banaction", jail.banaction) catch |err| return mapWrite(err);
         stringList(&out, "ignoreip", jail.ignoreip, redact) catch |err| return mapWrite(err);
+        field(&out, "history_max_matches", jail.history_max_matches) catch |err| return mapWrite(err);
+        field(&out, "history_max_matches_inherited", jail.history_max_matches_inherited) catch |err| return mapWrite(err);
         out.endObject() catch |err| return mapWrite(err);
     }
     out.endArray() catch |err| return mapWrite(err);
@@ -593,6 +633,7 @@ fn renderConfig(writer: anytype, view: ?ConfigView, peer_class: PeerClass, gener
     out.beginObject() catch |err| return mapWrite(err);
     const g = config.global;
     field(&out, "log_level", g.log_level) catch |err| return mapWrite(err);
+    field(&out, "history_max_matches", g.history_max_matches) catch |err| return mapWrite(err);
     field(&out, "firewall", g.firewall) catch |err| return mapWrite(err);
     field(&out, "metrics_enabled", g.metrics_enabled) catch |err| return mapWrite(err);
     field(&out, "metrics_bind", g.metrics_bind) catch |err| return mapWrite(err);
@@ -631,7 +672,7 @@ fn stringList(out: anytype, name: []const u8, values: []const []const u8, redact
     try out.endArray();
 }
 
-fn renderScopes(writer: anytype, view: ?ScopesView, jail_filter: ?[]const u8, cursor_text: ?[]const u8, limit: u32, generation_hex: []const u8) RenderError!void {
+fn renderScopes(writer: anytype, view: ?ScopesView, jail_filter: ?[]const u8, cursor_text: ?[]const u8, limit: u32, details: bool, generation_hex: []const u8) RenderError!void {
     const scopes = view orelse return error.SourceUnavailable;
     var first_jail: u32 = 0;
     var last_jail: u32 = @intCast(scopes.jails.len);
@@ -667,7 +708,7 @@ fn renderScopes(writer: anytype, view: ?ScopesView, jail_filter: ?[]const u8, cu
         const jail = scopes.jails[jail_index];
         while (item_index < jail.total() and emitted < limit) : (item_index += 1) {
             const item = jail.at(item_index);
-            writeScopeItem(&out, jail.name, item) catch |err| return mapWrite(err);
+            writeScopeItem(&out, jail.name, item, details) catch |err| return mapWrite(err);
             if (item.key.len == 0) return error.SourceFailed;
             last_key = item.key;
             emitted += 1;
@@ -701,7 +742,7 @@ fn findJail(scopes: ScopesView, name: []const u8) ?u32 {
     return null;
 }
 
-fn writeScopeItem(out: anytype, jail: []const u8, item: ScopeItem) !void {
+fn writeScopeItem(out: anytype, jail: []const u8, item: ScopeItem, details: bool) !void {
     try out.beginObject();
     try field(out, "jail", jail);
     try out.objectField("scope");
@@ -719,6 +760,7 @@ fn writeScopeItem(out: anytype, jail: []const u8, item: ScopeItem) !void {
     try out.objectField("origin");
     if (item.origin) |origin| try out.write(@tagName(origin)) else try out.write(null);
     try field(out, "expired", item.expired);
+    if (details) try writeMatches(out, item.match);
     try out.endObject();
 }
 
@@ -1016,7 +1058,7 @@ fn writeFirewallItem(out: anytype, entry: inspection.Entry, metadata: firewall_o
     try out.endObject();
 }
 
-fn renderHistory(arena: std.mem.Allocator, writer: anytype, source: ?HistorySource, jail_filter: ?[]const u8, cursor_text: ?[]const u8, limit: u16, generation_hex: []const u8) RenderError!void {
+fn renderHistory(arena: std.mem.Allocator, writer: anytype, source: ?HistorySource, jail_filter: ?[]const u8, cursor_text: ?[]const u8, limit: u16, details: bool, generation_hex: []const u8) RenderError!void {
     const history = source orelse return error.SourceUnavailable;
     var after_sequence: u64 = 0;
     if (cursor_text) |text| {
@@ -1028,6 +1070,8 @@ fn renderHistory(arena: std.mem.Allocator, writer: anytype, source: ?HistorySour
     events.ensureTotalCapacity(limit) catch return error.OutOfMemory;
     const scanned = history.read(history.ctx, jail_filter, after_sequence, limit, &events) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
+        error.InvalidatedCursor => error.InvalidatedCursor,
+        error.HistoryUnavailable => error.SourceUnavailable,
         else => error.SourceFailed,
     };
     if (scanned.more and scanned.resume_after <= after_sequence) return error.SourceFailed;
@@ -1040,7 +1084,7 @@ fn renderHistory(arena: std.mem.Allocator, writer: anytype, source: ?HistorySour
     out.beginArray() catch |err| return mapWrite(err);
     for (items) |event| {
         if (event.sequence > scanned.resume_after) return error.SourceFailed;
-        writeHistoryEvent(&out, event) catch |err| return mapWrite(err);
+        writeHistoryEvent(&out, event, details) catch |err| return mapWrite(err);
     }
     out.endArray() catch |err| return mapWrite(err);
     out.objectField("next_cursor") catch |err| return mapWrite(err);
@@ -1054,7 +1098,7 @@ fn renderHistory(arena: std.mem.Allocator, writer: anytype, source: ?HistorySour
     out.endObject() catch |err| return mapWrite(err);
 }
 
-fn writeHistoryEvent(out: anytype, event: HistoryEvent) !void {
+fn writeHistoryEvent(out: anytype, event: HistoryEvent, details: bool) !void {
     try out.beginObject();
     try field(out, "sequence", event.sequence);
     const event_hex = std.fmt.bytesToHex(event.event_id, .lower);
@@ -1067,5 +1111,30 @@ fn writeHistoryEvent(out: anytype, event: HistoryEvent) !void {
     try writeScope(out, event.scope);
     try field(out, "native_retry", event.native_retry);
     try field(out, "origin", @tagName(event.origin));
+    if (details) try writeMatches(out, event.match);
     try out.endObject();
 }
+
+fn writeMatches(out: anytype, match: ?[]const u8) !void {
+    try out.objectField("matches");
+    try out.beginArray();
+    if (match) |line| try out.write(line);
+    try out.endArray();
+}
+
+pub const ByteSink = struct {
+    out: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    limit: usize,
+    pub const WriteError = error{ OutOfMemory, ResponseTooLarge };
+    pub const Writer = std.io.GenericWriter(*ByteSink, WriteError, write);
+    fn write(self: *ByteSink, bytes: []const u8) WriteError!usize {
+        if (self.out.items.len > self.limit or bytes.len > self.limit - self.out.items.len) return error.ResponseTooLarge;
+        if (self.out.capacity < self.limit) try self.out.ensureTotalCapacityPrecise(self.allocator, self.limit);
+        self.out.appendSliceAssumeCapacity(bytes);
+        return bytes.len;
+    }
+    pub fn writer(self: *ByteSink) Writer {
+        return .{ .context = self };
+    }
+};

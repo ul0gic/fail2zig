@@ -133,7 +133,11 @@ Print usage and exit.
 .SH GLOBAL FLAGS (ADMINISTRATION)
 .TP
 .BI \-\-socket " path"
-Unix socket. Default:
+Unix socket. Default: the
+.B socket_path
+set in
+.IR /etc/fail2zig/config.toml ,
+else
 .IR /run/fail2zig/fail2zig.sock .
 .TP
 .BI \-\-output " format"
@@ -149,7 +153,9 @@ Command timeout. Default 5000. Expiry exits with class 3.
 .SH COMMANDS
 Members of the
 .B fail2zig
-group may run the read-only commands through the 0660 socket. Mutations
+group may read aggregate monitoring and redacted configuration through the 0660 socket.
+Ban lists, confirmed history and firewall inventory require uid 0 or the daemon uid.
+Mutations
 .RB ( ban ", " unban ", " "ignore add" ", " "ignore remove" ", " reload ", " "history reset" ", " jail )
 require uid 0 or the daemon uid, verified with
 .BR SO_PEERCRED .
@@ -265,6 +271,15 @@ command and the reminder that firewall rules for every jail stay in place while 
 daemon is stopped. The command is never truncated to the terminal width. When no
 offline repair applies to the cause, the block reads that and points to the daemon log.
 .PP
+Missing sources. A configured file path or glob with no discovered file is shown as
+a yellow
+.B Missing:
+row with its jail and configured path or pattern. This is an availability notice,
+not a paused source or repair instruction; the row clears when discovery finds a
+matching file. Newer daemon responses add
+.B missing_sources
+to JSON and plain output; older responses leave this count unknown.
+.PP
 Loss events. A source that resumed under
 .B on_truncation = \(dqrestart\(dq
 shows one
@@ -288,9 +303,13 @@ keep their meaning.
 .B paused_sources
 \(em integer, the sources currently paused.
 .IP \(bu 2
+.B missing_sources
+\(em optional integer, the configured file paths or patterns currently missing; absent
+when the daemon response predates this field.
+.IP \(bu 2
 .B sources
 \(em array, always present, empty when none: every source that is paused or has at least one
-retained loss event, ordered by jail then path. Each element has
+retained loss event, plus configured missing file paths or patterns, ordered by jail then path. Each element has
 .BR jail ,
 .B kind
 .RB ( file
@@ -303,7 +322,8 @@ or
 .B restart
 or null),
 .B state
-.RB ( paused
+.RB ( missing ,
+.BR paused
 or
 .BR reading ),
 .B cause
@@ -349,6 +369,9 @@ changes JSON output, and it adds a key without changing any other.
 .PP
 Plain output adds, after every existing key,
 .BR paused_sources ,
+the optional
+.B missing_sources
+count when the daemon provides it,
 one tab-separated
 .B source
 line per listed source (jail, kind, path or \-, state, cause or \-, on_truncation or \-,
@@ -386,6 +409,15 @@ SQLite, scan bans, or request a firewall readback. Use
 for protection and health; stats is not a current health assertion. JSON and plain
 output include the complete schema regardless of
 .BR --details .
+.PP
+Retry pool counts describe the last completed worker sample. The status fields
+.B pool_sample_available
+and
+.B pool_sample_pending
+show whether a sample exists and whether catch-up is pending;
+.B pool_sample_as_of_us
+is its processing-clock timestamp in microseconds. Before the first sample,
+counts are unknown. A pending sample retains the last completed counts.
 .TP
 .B jails
 One row per configured jail: enabled, paused, health, active bans, thresholds,
@@ -413,7 +445,19 @@ terminal width, all detail fields are shown in stacked rows per jail.
 Active bans, optionally for one jail. Table output distinguishes
 confirmed and pending intent, permanent leases and unknown expiry; narrow terminals
 use stacked rows. Existing plain columns and JSON fields retain their meaning.
-The --details flag adds ban counts to the table view.
+The --details flag adds ban counts to the table view and the retained matched
+line of each current live owner decision. JSON adds a
+.B matches
+array containing the complete retained line or an empty array when unavailable.
+Table details escape controls and wrap the complete retained line across
+continuation rows at the terminal width. Plain details keep their escaped,
+96-byte truncated display; an ellipsis marks truncation.
+Log-only decisions, unconfirmed decisions without their own event, expired
+configured entries, pruned text and zero retention policy have no matched line.
+Shared scopes use the exact owning jail and current decision, without fallback.
+Ordinary output is unchanged. The detailed list walk uses 64-item pages and the
+same total row and 64 MiB client bounds. Sorted output retains its existing
+1 MiB payload bound.
 .IP
 Every ban has one origin:
 .B detection
@@ -483,7 +527,7 @@ the retained observation, plus the location of each sampled entry. This normaliz
 owned view is not a raw ruleset dump. Structures retained after a failed check are
 stale observations, not current-state claims. Structural metadata from older
 daemons may be unavailable. JSON adds nullable structure and per-item placement;
---details does not change plain or JSON output for any command.
+--details does not change firewall plain or JSON output.
 At most 256 entries are sampled from a complete readback. The default page size is
 64. JSON reports observed_total, sample_count and sample_truncated separately from
 observation_complete. next_cursor pages only the retained sample; use the same limit.
@@ -737,7 +781,10 @@ established; 2 and 3 as for
 .BR "ignore add" .
 .TP
 .BI "ignore list" " [--jail name]"
-Read-only. One row per distinct jail and entry of the effective list, ordered by jail name,
+Read-only. Builtin jails show their effective list. Custom-rule jails show only
+configured literals and any self entries in their published custom policy;
+ignore_file values are omitted. One row per distinct jail and displayed entry,
+ordered by jail name,
 then IPv4 before IPv6, numeric address, prefix length. Columns are
 .BR JAIL ,
 .BR ADDRESS ,
@@ -783,7 +830,12 @@ line and notes for a custom-rule jail's
 .B ignore_file
 (its configured literals are listed with source
 .BR config ;
-the file's entries are not), for runtime entries stored for jails that are not
+the file's entries are not). This custom projection is not the complete exclusion
+policy. A disabled custom jail queried explicitly shows its configured literals,
+without runtime or invented self entries. A removed custom jail has no current
+configured-prefix view; an explicit query shows only actual stored runtime rows,
+or reports an unknown jail when none remain. Other notes cover runtime entries
+stored for jails that are not
 configured, and for a jail above the 128 limit after a configuration change. Plain output is
 one tab-separated line per row without header or footer. JSON output carries
 .BR limit ,
@@ -792,7 +844,13 @@ per-jail
 .B entries
 and an
 .B unconfigured
-array. Members of the
+array. The top-level limit remains the builtin 128-entry limit. A custom jail
+adds its own
+.B limit
+of 1024, which covers the combined custom policy, including omitted file/self
+values. Displayed counts are not remaining admission slots. Custom entries do
+not acquire builtin timed or runtime provenance; rule_files jails reject those
+mutations and timed settings. Members of the
 .B fail2zig
 group may run it; for them every address and
 .B ignore_file
@@ -863,7 +921,7 @@ same way. If any jail of the proposed configuration fails validation, the whole 
 .B rejected
 with a reason naming that jail, and every running jail is unchanged.
 .TP
-.BI history " [--jail name] [--limit 1..256] [--cursor token]"
+.BI history " [--jail name] [--limit 1..256] [--cursor token] [--details]"
 Page through confirmed ban history;
 .B next_cursor
 continues a listing. Each event carries the origin of its ban
@@ -872,6 +930,17 @@ JSON
 .BR origin ),
 and every origin change is kept as an event. Events written before 0.4.8 show
 .BR detection .
+With --details, include the stored matched line of each confirmed event.
+JSON adds a zero-or-one-element
+.B matches
+array with the complete retained line. Table and plain output escape untrusted
+controls. Table details wrap the complete retained line across continuation
+rows at the terminal width. Plain details truncate display to 96 bytes.
+Missing, pruned or zero-policy evidence is absent; confirmation facts remain.
+Detail queries require administrator access through the local socket and are
+not exposed by HTTP. The default page is 64 events. Explicit larger pages remain
+subject to the complete 1 MiB response limit; reduce --limit after a 413 response.
+Without --details, existing fields and output are unchanged.
 .TP
 .BI "history reset " "ip (--jail name | --all)"
 Reset the durable history for one address.
@@ -885,6 +954,24 @@ to inspect jail bans,
 to add one, and
 .B unban ip --jail name
 to release one.
+.PP
+Disable releases owners in bounded worker turns. Small operations wait up to two
+seconds for coherent kernel confirmation. A partial or uncertain result continues
+automatically while the jail remains disabled, including after restart; inspect
+.B jails
+and
+.B status
+instead of repeatedly issuing disable. Jail JSON includes
+.BR disable_cleanup_pending ,
+which describes current cleanup independently of a historical request outcome.
+An old applied request is not rewritten when remaining cleanup is discovered.
+Shared scopes remain installed when another jail still owns them.
+.PP
+Enable cancels remaining disable work; already committed releases remain released.
+Pause and resume do not enable a disabled jail. Automatic detection and configured
+ban entries cannot create owners while disabled. A manual ban requires enabling
+the jail first; migration activation refuses disabled destination jails atomically.
+Unban remains available. Removing a jail transfers remaining cleanup to retirement.
 .TP
 .B config
 The effective configuration and its generation. Paths and address lists are
@@ -1237,21 +1324,22 @@ capabilities and caller-owned private staging, with the destination daemon
 stopped. See docs/operations/command-migration.md and migration-continuity.md.
 .PP
 v0.4.7 is the minimum supported upgrade source. The first start of this version
-upgrades a state last written by v0.4.7 (schema 25) to schema 26, which adds ban
-origins, ignore-entry deadlines and the table of timed configuration entries; every
-existing ban gets origin
-.BR detection .
+upgrades a state last written by v0.4.8 (schema 26) to schema 28, which adds the
+records that let a removed or disabled jail's state be cleaned in bounded steps. A
+state last written by v0.4.7 (schema 25) first takes the v0.4.8 step to schema 26.
 States last written by v0.4.6 or earlier are not a supported upgrade path; upgrade
-them through v0.4.7 first, or start from a fresh state. Before its change the daemon
+them through v0.4.7 first, or start from a fresh state. Before each change the daemon
 writes a coherent copy of the database to a backup, which needs free space of twice
 the database size plus 32 MiB, and refuses to start if that file already exists; move
 an old backup aside only when it is not the sole copy of earlier state.
 .IP \(bu 2
-The backup is
+The backup before the schema 28 step is
+.IR <state_file>.pre27-backup ;
+a v0.4.7 state also gets
 .IR <state_file>.pre26-backup .
 .PP
-The upgrade commits in one transaction, so an interrupted upgrade leaves the state at
-schema 25. v0.4.7 and older binaries refuse schema 26 state with their
+Each step commits in one transaction, so an interrupted upgrade leaves the state at
+the schema it last committed. v0.4.8 and older binaries refuse schema 28 state with their
 .B UnsupportedSchema
 message. Keep the backup until the upgraded daemon has been checked. Rollback means stopping the daemon, restoring the
 backup the upgrade wrote over the state file, removing the upgraded database's

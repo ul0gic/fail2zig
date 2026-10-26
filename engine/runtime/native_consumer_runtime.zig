@@ -68,6 +68,9 @@ pub const DnsRuntime = struct {
     failed: bool = false,
     restore_scan: Scan = .{},
     validation: Scan = .{},
+    retire_cursor: usize = 0,
+    retire_examined: usize = 0,
+    retire_next_expiry: ?i64 = null,
     reserved_bytes: usize,
 
     pub fn allocationPlan(options: DnsOptions) !AllocationPlan {
@@ -151,6 +154,88 @@ pub const DnsRuntime = struct {
             return;
         };
     }
+    const RetirementProgress = struct {
+        examined: u8 = 0,
+        retired: bool = false,
+        cycle_complete: bool = false,
+        blocked: bool = false,
+        consumer_revision: ?u64 = null,
+    };
+    fn retireResult(self: *DnsRuntime, entry: dns.CacheEntry, digest: [32]u8, revision: u64, now_us: i64) !?durable.Store.DnsRetired {
+        if (self.store.startupAdmissionActive() and (self.restored or self.count != 0)) return error.ConsumerTransactionActive;
+        const request = entry.result.request;
+        const outcome = try self.store.retireDnsResult(.{
+            .key = bridge.dnsKey(request.name.slice(), request.family, request.generation),
+            .expected_revision = entry.revision,
+            .expected_expiry_us = entry.result.valid_until_us,
+            .payload_sha256 = digest,
+            .expected_consumer_revision = revision,
+        }, .{ .prepared_us = now_us, .clock_context = self, .clock = commitClock });
+        return switch (outcome) {
+            .retired => |retired| blk: {
+                // A released startup savepoint belongs only to this unpublished restore.
+                if (retired.commit == .startup_staged and
+                    (self.restored or self.count != 0 or !self.store.startupAdmissionActive())) return error.ConsumerTransactionActive;
+                break :blk retired;
+            },
+            .stale => error.StaleConsumerCheckpoint,
+            .pinned => null,
+        };
+    }
+    fn retireExpiredTurn(self: *DnsRuntime, now_us: i64) !RetirementProgress {
+        try self.idleForRestore();
+        if (self.store.startupAdmissionActive() and (self.restored or self.count != 0)) return error.ConsumerTransactionActive;
+        var progress = RetirementProgress{};
+        while (progress.examined < 16 and self.retire_examined < self.cache.entries.len) {
+            const index = self.retire_cursor;
+            self.retire_cursor = (self.retire_cursor + 1) % self.cache.entries.len;
+            self.retire_examined += 1;
+            progress.examined += 1;
+            const bytes = self.cache.entries[index] orelse continue;
+            const entry = try dns.decodeCheckpoint(&bytes);
+            if (!std.mem.eql(u8, &entry.result.request.generation, &self.options.generation)) return error.DnsGenerationMismatch;
+            if (now_us < entry.result.completed_us) return error.DnsClockReversed;
+            if (now_us < entry.result.valid_until_us) {
+                self.retire_next_expiry = if (self.retire_next_expiry) |prior| @min(prior, entry.result.valid_until_us) else entry.result.valid_until_us;
+                continue;
+            }
+            if (self.active) |active| if (self.slots[active].owner.pendingRequest()) |pending| {
+                if (sameRequest(entry.result.request, pending.request)) {
+                    progress.blocked = true;
+                    continue;
+                }
+            };
+            if (self.completion) |completion| if (sameRequest(entry.result.request, completion.request)) {
+                progress.blocked = true;
+                continue;
+            };
+            var stage = (try self.cache.prepareRetire(index, now_us)) orelse continue;
+            defer stage.release();
+            const retired = (try self.retireResult(stage.entry, stage.payload_sha256, try self.store.consumerRevision(), now_us)) orelse {
+                progress.blocked = true;
+                continue;
+            };
+            stage.publish();
+            if (!self.restored) {
+                if (self.restore_scan.count == 0) return error.InvalidConsumer;
+                self.restore_scan.count -= 1;
+                self.restore_scan.revision = retired.consumer_revision;
+            }
+            self.retire_examined = 0;
+            self.retire_next_expiry = null;
+            progress.retired = true;
+            progress.consumer_revision = retired.consumer_revision;
+            return progress;
+        }
+        if (self.retire_examined == self.cache.entries.len) {
+            // Entries seen live early in a long scan may have expired by its end.
+            const expired_during_scan = if (self.retire_next_expiry) |expiry| expiry <= now_us else false;
+            self.retire_examined = 0;
+            self.retire_next_expiry = null;
+            progress.cycle_complete = !expired_during_scan;
+        }
+        return progress;
+    }
     fn authorityManifest(self: *DnsRuntime, requirements: *[1]state.Requirement) state.Manifest {
         requirements[0] = .{ .key = bridge.resolverKey(self.options.generation), .format_version = 1 };
         return .{ .jail = "@shared", .source = "@resolver", .source_generation = self.options.generation, .required = requirements };
@@ -232,7 +317,6 @@ pub const DnsRuntime = struct {
                 try self.store.validateConsumerManifestSnapshot(manifest, &saved);
                 scan.authority = true;
             } else {
-                if (scan.count == self.options.capacity) return error.DnsCacheLimit;
                 const request = try requestFromSource(key.source, key.generation);
                 requirements[0] = .{ .key = bridge.dnsKey(request.name.slice(), request.family, request.generation), .format_version = dns.version };
                 const manifest = state.Manifest{ .jail = "@shared", .source = key.source, .source_generation = key.generation, .required = &requirements };
@@ -243,16 +327,33 @@ pub const DnsRuntime = struct {
                 const row = saved.states[0];
                 const bytes = row.payload orelse return error.MissingRequiredConsumer;
                 if (row.format_version != dns.version or row.revision == 0 or row.valid_until_us == null) return error.InvalidDnsCheckpoint;
+                const entry = try dns.decodeCheckpoint(bytes);
+                if (entry.revision != row.revision or entry.result.valid_until_us != row.valid_until_us.? or !sameRequest(entry.result.request, request)) return error.InvalidDnsCheckpoint;
                 if (restoring) {
-                    var stage = try self.cache.prepareRestore(bytes);
+                    const now_us = try self.now();
+                    if (now_us < entry.result.completed_us) return error.DnsClockReversed;
+                    if (now_us >= entry.result.valid_until_us) {
+                        var digest: [32]u8 = undefined;
+                        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+                        if (try self.retireResult(entry, digest, page.revision, now_us)) |retired| {
+                            try scan.advance(key.source);
+                            scan.revision = retired.consumer_revision;
+                            return false;
+                        }
+                    }
+                    if (scan.count == self.options.capacity) {
+                        const progress = try self.retireExpiredTurn(now_us);
+                        if (!progress.cycle_complete or progress.retired) return false;
+                        return error.DnsCacheLimit;
+                    }
+                    var stage = try self.cache.prepareRestore(entry);
                     defer stage.release();
-                    if (stage.entry.revision != row.revision or stage.entry.result.valid_until_us != row.valid_until_us.? or !sameRequest(stage.entry.result.request, request)) return error.InvalidDnsCheckpoint;
                     try self.store.validateConsumerManifestSnapshot(manifest, &saved);
                     stage.publish();
                 } else {
                     if (try self.cache.revision(request) != row.revision) return error.StaleConsumerCheckpoint;
                     var found = false;
-                    for (self.cache.entries) |entry| if (entry) |value| if (std.mem.eql(u8, &value, bytes)) {
+                    for (self.cache.entries) |cached| if (cached) |value| if (std.mem.eql(u8, &value, bytes)) {
                         found = true;
                         break;
                     };
@@ -289,6 +390,8 @@ pub const DnsRuntime = struct {
                 if (slot.owner.pendingRequest()) |pending| {
                     try client.begin(pending.request, now_ms);
                     self.active = index;
+                    self.retire_examined = 0;
+                    self.retire_next_expiry = null;
                     return .{ .kind = .waiting, .source = slot.owner };
                 }
             }
@@ -312,7 +415,12 @@ pub const DnsRuntime = struct {
             if (result.answer.kind != .positive or pending.purpose != .subject) return self.unknown(slot, now_ms);
             try slot.owner.provideImmediate(result, now_ms, now_us);
         } else {
-            const stage = try slot.owner.prepareDnsResult(result, now_ms, now_us);
+            const stage = slot.owner.prepareDnsResult(result, now_ms, now_us) catch |failure| {
+                if (failure != error.DnsCacheLimit) return failure;
+                const progress = try self.retireExpiredTurn(now_us);
+                if (progress.cycle_complete and !progress.retired) return error.DnsCacheLimit;
+                return .{ .kind = .waiting, .source = slot.owner };
+            };
             defer stage.state.release(stage.state.context);
             if (stage.bootstrap) try self.store.bootstrapConsumerManifest(stage.manifest, stage.state.consumers) else try self.store.commitConsumerInput(stage.manifest, stage.state.consumers);
             stage.state.publish(stage.state.context);
@@ -418,23 +526,54 @@ pub const JailRuntime = struct {
         const allocator = self.allocator;
         allocator.destroy(self);
     }
-    pub const AllowlistRefresh = enum { unchanged, applied };
-    pub fn refreshAllowlist(self: *JailRuntime, path: []const u8, now_us: i64) !AllowlistRefresh {
-        if (self.count == 0) return error.ConsumerRuntimeNotReady;
-        const next = try ignore.Snapshot.fromFile(self.allocator, self.ignores.live.options, path);
+    pub const PreparedPolicy = struct {
+        owner: *JailRuntime,
+        next: *ignore.Snapshot,
+        stage: ?bridge.StateStage,
+        published: bool = false,
+
+        pub fn update(self: *const PreparedPolicy) ?durable.Store.ConfigConsumerUpdate {
+            const stage = self.stage orelse return null;
+            return .{ .manifest = stage.manifest, .batch = stage.state.consumers };
+        }
+        pub fn publish(self: *PreparedPolicy) void {
+            if (self.published) return;
+            if (self.stage) |stage| {
+                stage.state.publish(stage.state.context);
+            } else {
+                const previous = self.owner.ignores.live;
+                self.owner.ignores.live = self.next;
+                previous.destroy();
+            }
+            self.published = true;
+        }
+        pub fn deinit(self: *PreparedPolicy) void {
+            if (self.stage) |stage| stage.state.release(stage.state.context) else if (!self.published) self.next.destroy();
+        }
+    };
+    // Consumes next on success, unchanged, and failure; publication follows the caller's commit.
+    pub fn preparePolicy(self: *JailRuntime, next: *ignore.Snapshot, now_us: i64) !?PreparedPolicy {
         if (std.mem.eql(u8, next.payload, self.ignores.live.payload)) {
             next.destroy();
-            return .unchanged;
+            return null;
+        }
+        {
+            errdefer next.destroy();
+            var settings = self.settings;
+            settings.ignore_generation = next.generation;
+            const generation = try bridge.generationFromPolicy(settings, self.options.programs, next, if (self.dns_runtime.authority_ready) self.dns_runtime.options.generation else null);
+            if (!std.mem.eql(u8, &generation, &self.registry.generation)) return error.IgnoreGenerationMismatch;
+        }
+        if (self.count == 0) {
+            if (self.ignores.revision != 0 or self.ignores.in_flight) {
+                next.destroy();
+                return error.ConsumerStateNotReady;
+            }
+            return .{ .owner = self, .next = next, .stage = null };
         }
         const source = self.sources[0];
-        const stage = source.coordinator.prepareAllowlistRefresh(next, source.generation, now_us) catch |err| {
-            next.destroy();
-            return err;
-        };
-        defer stage.state.release(stage.state.context);
-        try self.store.commitConsumerInput(stage.manifest, stage.state.consumers);
-        stage.state.publish(stage.state.context);
-        return .applied;
+        const stage = try source.coordinator.prepareAllowlistRefresh(next, source.generation, now_us);
+        return .{ .owner = self, .next = next, .stage = stage };
     }
     pub fn stagedConsumer(self: *JailRuntime) detection.StagedConsumer {
         return self.registry.consumer();

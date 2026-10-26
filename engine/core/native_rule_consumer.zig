@@ -106,6 +106,17 @@ pub const Consumer = struct {
         self.in_flight = true;
         return .{ .owner = self, .checkpoint = &self.bytes, .outcome = null };
     }
+    pub fn rebindCheckpoint(program: *const rules.Program, jail: []const u8, source: []const u8, old_parent: [32]u8, new_parent: [32]u8, hostname_enabled: bool, saved: []const u8, out: *[checkpoint_bytes]u8) !void {
+        var previous = try Consumer.init(program, jail, source, old_parent, hostname_enabled);
+        const restored = try previous.prepareRestore(saved);
+        defer restored.release();
+        var next = try Consumer.init(program, jail, source, new_parent, hostname_enabled);
+        next.encode(previous.staged);
+        if (program.metadata().correlation) |settings| {
+            try correlation.Session.rebindCheckpoint(previous.binding, next.binding, settings.ttl_seconds, program.metadata().subject_kind == .hostname, saved[header_bytes..], next.bytes[header_bytes..][0..correlation.checkpoint_bytes]);
+        }
+        out.* = next.bytes;
+    }
     fn encode(self: *Consumer, counters: Counters) void {
         @memset(&self.bytes, 0);
         @memcpy(self.bytes[0..4], "F2NR");

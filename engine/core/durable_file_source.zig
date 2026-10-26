@@ -32,6 +32,7 @@ pub const discovery_max_depth: usize = 16;
 // Filebeat's inactive-close default: .project/references/beats/filebeat/input/filestream/config.go:180
 const unlinked_retire_ms: u64 = 5 * std.time.ms_per_min;
 pub const DiscoveryStatus = enum { pending, complete };
+pub const Presence = enum { unknown, present, missing, failed };
 pub const Framing = enum {
     bytes,
     utf16le,
@@ -152,6 +153,17 @@ fn openRegularAt(directory: std.fs.Dir, path: []const u8) !std.fs.File {
 }
 
 pub const FileSource = struct {
+    pub fn rebindCursor(allocator: Allocator, saved: []const u8, old_binding: [32]u8, new_binding: [32]u8) ![]u8 {
+        const parsed = try std.json.parseFromSlice(Resume, allocator, saved, .{});
+        defer parsed.deinit();
+        var position = parsed.value;
+        if (position.version != 2 or position.prefix_len > 64) return error.InvalidResume;
+        const binding = position.codec_configuration_hash orelse return error.FramingProfileMismatch;
+        if (!std.mem.eql(u8, &binding, &old_binding)) return error.FramingProfileMismatch;
+        if (position.offset % position.framing.width() != 0) return error.MisalignedOffset;
+        position.codec_configuration_hash = new_binding;
+        return std.json.stringifyAlloc(allocator, position, .{});
+    }
     const ResumeSearch = struct {
         directory: std.fs.Dir,
         iterator: std.fs.Dir.Iterator,
@@ -1140,7 +1152,7 @@ pub const Discovery = struct {
 pub const RestoreCallback = *const fn (source_id: []const u8, userdata: ?*anyopaque) anyerror!?Resume;
 
 pub const FileSet = struct {
-    const Spec = struct { pattern: []u8, start: Start };
+    const Spec = struct { pattern: []u8, start: Start, presence: Presence = .unknown };
     allocator: Allocator,
     jail: []u8,
     specs: std.ArrayList(Spec),
@@ -1158,6 +1170,8 @@ pub const FileSet = struct {
     discovery_spec: usize = 0,
     discovery_path: usize = 0,
     discovery_visited: usize = 0,
+    discovery_matched: bool = false,
+    presence_revision: u64 = 0,
 
     pub fn init(allocator: Allocator, jail: []const u8) !FileSet {
         return .{ .allocator = allocator, .jail = try allocator.dupe(u8, jail), .specs = std.ArrayList(Spec).init(allocator), .sources = std.ArrayList(FileSource).init(allocator) };
@@ -1177,6 +1191,21 @@ pub const FileSet = struct {
         const owned = try self.allocator.dupe(u8, pattern);
         errdefer self.allocator.free(owned);
         try self.specs.append(.{ .pattern = owned, .start = start });
+    }
+    pub fn configuredCount(self: *const FileSet) usize {
+        return self.specs.items.len;
+    }
+    // Pattern bytes belong to this FileSet and remain valid until its deinit.
+    pub fn configuredStatus(self: *const FileSet, index: usize) ?struct { pattern: []const u8, presence: Presence } {
+        if (index >= self.specs.items.len) return null;
+        const spec = self.specs.items[index];
+        return .{ .pattern = spec.pattern, .presence = spec.presence };
+    }
+    fn setPresence(self: *FileSet, index: usize, presence: Presence) void {
+        const spec = &self.specs.items[index];
+        if (spec.presence == presence) return;
+        spec.presence = presence;
+        self.presence_revision +%= 1;
     }
     pub fn addResume(self: *FileSet, path: []const u8, source_id: []const u8, checkpoint: Resume) !void {
         for (self.sources.items) |source| if (std.mem.eql(u8, source.source_id, source_id)) return error.DuplicateSource;
@@ -1227,10 +1256,12 @@ pub const FileSet = struct {
         self.discovery_spec = 0;
         self.discovery_path = 0;
         self.discovery_visited = 0;
+        self.discovery_matched = false;
     }
 
     pub fn discoverTurn(self: *FileSet) !DiscoveryStatus {
         errdefer |err| {
+            self.setPresence(self.discovery_spec, .failed);
             self.health = if (err == error.AccessDenied) .permission_denied else .read_failed;
             self.cancelDiscovery();
         }
@@ -1241,6 +1272,7 @@ pub const FileSet = struct {
         }
         const spec = self.specs.items[self.discovery_spec];
         if (self.discovery == null) {
+            self.discovery_matched = false;
             self.discovery = try Discovery.init(self.allocator, spec.pattern, self.max_sources);
             self.discovery.?.max_entries = discovery_entries_per_episode - self.discovery_visited;
             self.discovery_path = 0;
@@ -1251,10 +1283,12 @@ pub const FileSet = struct {
             return .pending;
         }
         if (self.discovery_path < discovery.paths.items.len) {
-            try self.admitDiscovered(discovery.paths.items[self.discovery_path], spec.start);
+            const matched = try self.admitDiscovered(discovery.paths.items[self.discovery_path], spec.start);
+            self.discovery_matched = self.discovery_matched or matched;
             self.discovery_path += 1;
             return .pending;
         }
+        self.setPresence(self.discovery_spec, if (self.discovery_matched) .present else .missing);
         self.discovery_visited += discovery.visited;
         discovery.deinit();
         self.discovery = null;
@@ -1262,9 +1296,9 @@ pub const FileSet = struct {
         return .pending;
     }
 
-    fn admitDiscovered(self: *FileSet, path: []const u8, start: Start) !void {
+    fn admitDiscovered(self: *FileSet, path: []const u8, start: Start) !bool {
         const f = openRegularAt(std.fs.cwd(), path) catch |err| {
-            if (err == error.FileNotFound or err == error.NotDir) return;
+            if (err == error.FileNotFound or err == error.NotDir) return false;
             self.health = if (err == error.AccessDenied) .permission_denied else .read_failed;
             return err;
         };
@@ -1300,7 +1334,7 @@ pub const FileSet = struct {
                 }
             }
         }
-        if (found) return;
+        if (found) return true;
         if (self.sources.items.len >= self.max_sources) {
             self.health = .read_failed;
             return error.SourceLimit;
@@ -1323,6 +1357,7 @@ pub const FileSet = struct {
         const observed = source.committed.?;
         if (observed.device != stat.dev or observed.inode != stat.ino) return error.SourceChanged;
         self.sources.appendAssumeCapacity(source);
+        return true;
     }
     pub fn poll(self: *FileSet, callback: records.AckCallback, userdata: ?*anyopaque) !usize {
         try self.discover();

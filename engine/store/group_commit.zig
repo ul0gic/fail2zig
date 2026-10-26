@@ -40,8 +40,7 @@ pub fn Methods(comptime Store: type) type {
         pub fn dropBatchRecord(self: *Store, frame: *Frame) void {
             const saved = frame.open orelse return;
             frame.open = null;
-            self.observation_rows = null;
-            self.event_rows = null;
+            self.row_tallies = .{};
             self.noted_count = saved.noted_count;
             self.noted_ambiguous = saved.noted_ambiguous;
             self.exec("ROLLBACK TO batch_record;") catch {

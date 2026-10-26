@@ -21,7 +21,7 @@ the unit and man pages, and refuses active state writers or a legacy binary stat
 file. It does not recursively change state ownership. To use a locally built
 binary, run `sudo scripts/install.sh --local-bin zig-out/bin` from the checkout.
 
-The v0.4.8 release provides one combined daemon/admin executable per target:
+The v0.4.9 release provides one combined daemon/admin executable per target:
 
 | Target | Qualification |
 |---|---|
@@ -38,11 +38,11 @@ requires `journalctl`; iptables and ipset backends require their host tools.
 
 If the installer is unsuitable, download only the needed executable and support
 files from the same release, then verify each against `SHA256SUMS` before use. For
-v0.4.8 on x86_64:
+v0.4.9 on x86_64:
 
 ```bash
 set -euo pipefail
-VERSION=v0.4.8
+VERSION=v0.4.9
 ARCH=x86_64-linux-musl
 BASE="https://github.com/ul0gic/fail2zig/releases/download/${VERSION}"
 for file in \
@@ -88,6 +88,141 @@ ipset backend's iptables extension and also grants raw socket authority. Keep th
 optional HTTP listener bound to loopback. See [SECURITY.md](../../SECURITY.md)
 and the [runtime architecture](../architecture.md) for the full boundary.
 
+## Custom state directory under systemd
+
+Changing `[global] state_file` changes the database path the daemon opens. It does
+not change the service's filesystem access. The shipped unit uses
+`ProtectSystem=strict`, with explicit `ReadWritePaths` entries for
+`/var/lib/fail2zig` and `/run/fail2zig`. A custom persistent parent outside its
+writable exceptions can therefore fail with `ReadOnlyFileSystem` even when an
+administrator can write there from a shell. `PrivateTmp` still provides writable
+private temporary directories. Its inherited
+`StateDirectory=fail2zig` also makes systemd create `/var/lib/fail2zig` before the
+daemon starts. That directory appearing does not mean the daemon ignored the
+configured path. The daemon reads `state_file` and `socket_path` only from the
+configuration, and the administrative commands use the configured `socket_path`
+when `--socket` is not given. Granting the service write access to a directory is
+the administrator's decision: neither the daemon nor the installer edits the unit.
+When the grant is missing, startup names the directory and points to this section,
+and the installer prints the complete override for your configuration.
+A directory under `/run` is granted with `RuntimeDirectory=<name below /run>`, because
+`/run` is emptied at boot and systemd creates the directory at every start, as it does
+for `/run/fail2zig`; any other directory is granted with `ReadWritePaths=` and must
+exist before the service starts.
+
+This example relocates native SQLite state to `/srv/fail2zig-state/state.bin`,
+keeping the shipped socket path. It assumes the installed service runs as
+`fail2zig:fail2zig`; inspect `sudo systemctl cat fail2zig.service` and
+`sudo systemctl show fail2zig.service -p User -p Group -p ExecStart` first, and
+adapt the exact owner/group if your installation differs. The installer accepts
+a custom `state_file` and `socket_path`: it reads them from the configuration with
+the new executable, applies its usual ownership and safety checks to that state
+path, and, when the unit does not yet grant the directories, ends with a "Before
+starting" notice giving the override below. It never writes the override itself.
+
+1. Stop the service and every other daemon, migration or repair process that can
+   write this state. Keep them stopped until the configuration and unit agree.
+   Preserve the executable and configuration for rollback. A normal stop leaves
+   installed firewall rules in place; do not delete state or withdraw protection
+   merely to relocate the database.
+
+   ```bash
+   sudo systemctl stop fail2zig.service
+   sudo systemctl is-active fail2zig.service   # must report inactive
+   ```
+
+2. Select a dedicated real directory outside locations hidden by the unit
+   (`ProtectHome=yes` and `PrivateTmp=yes` still apply). Its ancestors must permit
+   traversal by the service and must not be writable by untrusted users. For this
+   example, inspect `/srv` and verify it is a real root-owned directory without
+   group/world write permission. The following commands must create a new,
+   previously unused parent, not reuse a symlink or shared directory:
+
+   ```bash
+   sudo bash -eu -o pipefail <<'ROOT'
+   test ! -e /srv/fail2zig-state
+   test ! -L /srv/fail2zig-state
+   install -d -o fail2zig -g fail2zig -m 0750 /srv/fail2zig-state
+   ROOT
+   ```
+
+   The parent must exist before service startup. `ReadWritePaths` grants namespace
+   access; it does not create the directory, change ownership or override a
+   read-only underlying mount. The daemon requires its own UID to own the parent
+   and database, a parent without group/world write permission, and private
+   database files. A root shell's successful write is not a service access check.
+
+3. For an existing installation, first verify the old native database and every
+   existing `-wal`/`-shm` sibling: regular files, one link each, no symlinks, and
+   only the expected root or service UID as owner. Reject unexpected objects
+   before copying or changing ownership. With every writer still stopped, copy
+   the entire set to a private backup and to the new parent. The block below is
+   for the default old path; substitute the actual old path if it differs. For a
+   fresh installation omit this block and let the daemon create the database.
+
+   ```bash
+   sudo bash -eu -o pipefail <<'ROOT'
+   umask 077
+   test -f /var/lib/fail2zig/state.bin
+   backup=$(mktemp -d /var/backups/fail2zig-state.XXXXXXXX)
+   for suffix in '' -wal -shm; do
+       old="/var/lib/fail2zig/state.bin${suffix}"
+       if test -e "$old"; then
+           cp -p -- "$old" "$backup/"
+           cp -p -- "$old" /srv/fail2zig-state/
+           chown fail2zig:fail2zig "/srv/fail2zig-state/state.bin${suffix}"
+           chmod 0600 "/srv/fail2zig-state/state.bin${suffix}"
+       fi
+   done
+   printf 'Stopped-state backup: %s\n' "$backup"
+   ROOT
+   ```
+
+   Never copy only the database while a writer is active, drop sidecars to make
+   a copy start, or recursively chown/chmod a shared tree. Keep the old set and
+   backup untouched until continuity is checked; do not run daemons against both
+   copies. Preserve any older upgrade backups with their matching binary.
+
+4. Set `state_file = "/srv/fail2zig-state/state.bin"` in `[global]` of the config
+   used by `ExecStart`. Run `sudo systemctl edit fail2zig.service` and add this
+   drop-in:
+
+   ```ini
+   [Service]
+   ReadWritePaths=
+   ReadWritePaths=/srv/fail2zig-state /run/fail2zig
+   StateDirectory=
+   ```
+
+   The empty assignments clear the inherited lists. The new list contains
+   only those two explicit `ReadWritePaths` entries;
+   `RuntimeDirectory=fail2zig` remains in effect. Clearing `StateDirectory` stops
+   systemd creating the unused default parent; it does not remove an existing
+   directory or its rollback state. Keep `ProtectSystem=strict` and the remaining
+   hardening. If you configured another writable output such as `log_target`,
+   account for that exact destination separately rather than granting `/srv`,
+   `/var` or `/` wholesale.
+
+5. Reload the unit, inspect the effective settings, validate the config and start:
+
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl cat fail2zig.service
+   sudo systemctl show fail2zig.service -p User -p Group -p ReadWritePaths -p StateDirectory
+   sudo fail2zig --validate-config --config /etc/fail2zig/config.toml
+   sudo systemctl start fail2zig.service
+   sudo fail2zig status
+   sudo fail2zig list
+   sudo fail2zig history
+   ```
+
+   Confirm the expected saved bans, deadlines, history and source continuity, then
+   check them again after a controlled restart. Configuration validation alone
+   does not exercise the service's mount namespace or its ability to create
+   SQLite sidecars. If startup still fails, inspect the effective unit, the
+   configured parent and mount, and the service journal before changing access.
+   Default installations need no drop-in.
+
 ## A second installation in the same network namespace
 
 The daemon owns one nftables table named after its installation. A clean stop leaves that
@@ -113,29 +248,34 @@ WAL/SHM siblings. An older binary cannot read newer checkpoint and marker data.
 Rollback requires the matching backup and binary, not an executable swap.
 
 v0.4.7 is the minimum supported upgrade source. The first start of this release
-upgrades a state last written by v0.4.7 (schema 25) to schema 26 in place. Schema 26
-adds ban origins, ignore-entry deadlines and timed configuration entries. States last
-written by v0.4.6 or earlier are not a supported upgrade path; upgrade them through
-v0.4.7 first, or start from a fresh state.
+upgrades a state last written by v0.4.8 (schema 26) to schema 28 in place. A state
+last written by v0.4.7 (schema 25) first takes the v0.4.8 step to schema 26, then
+the same step to 28. Schema 28 adds the records that let a removed or disabled
+jail's state be cleaned in bounded steps. States last written by v0.4.6 or earlier
+are not a supported upgrade path; upgrade them through v0.4.7 first, or start from a
+fresh state.
 
-- Before its first change it writes a coherent copy of the database to a backup. It
+- Before each change it writes a coherent copy of the database to a backup. It
   needs free space of twice the database size plus 32 MiB, and refuses to start if
   that backup file already exists. Move an old backup aside only when it is not the
   sole copy of earlier state.
-- The backup is `<state_file>.pre26-backup`.
-- The upgrade commits in one transaction, so an interrupted upgrade leaves the
-  state at schema 25. Every existing ban gets origin `detection`. The log reports
+- The backup before the schema 28 step is `<state_file>.pre27-backup`; a v0.4.7
+  state also gets `<state_file>.pre26-backup` before its schema 26 step.
+- Each step commits in one transaction, so an interrupted upgrade leaves the state
+  at the schema it last committed. The schema 28 step adds columns with defaults and
+  new tables only, so its cost does not grow with the state. The log reports
   completion and the backup path.
 
-v0.4.7 and older binaries refuse a schema 26 database with their schema-version
+v0.4.8 and older binaries refuse a schema 28 database with their schema-version
 message, so an older binary cannot be started on upgraded state without
 restoring the backup.
 
 To roll back, stop the daemon, restore the backup the upgrade wrote over the state
 file, remove the upgraded database's `-wal`/`-shm` files and reinstall the binary
-that last wrote that state: v0.4.7 for `.pre26-backup`. If you copied the backup
-into place instead of moving it, move the backup file aside before the next
-upgrade, because an existing backup file refuses the start.
+that last wrote that state: v0.4.8 for `.pre27-backup`, v0.4.7 for
+`.pre26-backup`. If you copied the backup into place instead of moving it, move the
+backup file aside before the next upgrade, because an existing backup file refuses
+the start.
 
 A file source that cannot resume does not stop the daemon. This covers a file
 truncated in place below its saved position, a rotated-out file removed while it
@@ -166,8 +306,8 @@ If storage is unhealthy when the daemon stops, it leaves installed firewall rule
 in place and logs how many remain; the next start reconciles them. A healthy stop
 withdraws its rules while keeping owners and deadlines.
 
-The installer changes ownership only for the default native SQLite state path
-and refuses custom paths, active writers and legacy binary state. Follow the
+The installer changes ownership only for the configured native SQLite state path
+and refuses active writers, unsafe state directories and legacy binary state. Follow the
 [state upgrade boundary](migration-continuity.md#upgrading-fail2zig-state) before
 replacing an installation; never delete state to bypass a refusal. Released
 v0.3.0 binary state has no automatic converter, and releases before v0.4.7 are not

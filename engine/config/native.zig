@@ -111,7 +111,7 @@ pub const GlobalConfig = struct {
     state_file: []const u8 = "/var/lib/fail2zig/state.bin",
     memory_ceiling_mb: u32 = 64,
     native_memory_ceiling_mb: u32 = 512,
-    native_fd_ceiling: u32 = 2048,
+    native_fd_ceiling: u32 = 8192,
     metrics_enabled: bool = true,
     metrics_bind: []const u8 = "127.0.0.1",
     metrics_port: u16 = 9100,
@@ -127,6 +127,7 @@ pub const GlobalConfig = struct {
 };
 
 pub const websocket_hard_max_clients: u32 = 1024;
+pub const max_configured_jails: usize = 256;
 
 pub const JailDefaults = struct {
     bantime: shared.Duration = 600,
@@ -159,6 +160,7 @@ pub const JailConfig = struct {
     source: LogSource = .auto,
     filter: []const u8 = "",
     maxretry: ?u32 = null,
+    history_max_matches: ?u16 = null,
     findtime: ?shared.Duration = null,
     bantime: ?shared.Duration = null,
     bantime_kind: ?BantimeKind = null,
@@ -195,6 +197,7 @@ pub const ResolvedJailConfig = struct {
     name: []const u8,
     enabled: bool,
     maxretry: u32,
+    history_max_matches: ?u16,
     findtime: shared.Duration,
     bantime: shared.Duration,
     bantime_kind: BantimeKind,
@@ -233,6 +236,7 @@ pub fn resolveJailFromConfig(j: *const JailConfig, defaults: JailDefaults) Resol
         .name = j.name,
         .enabled = j.enabled,
         .maxretry = j.effectiveMaxretry(defaults),
+        .history_max_matches = j.history_max_matches,
         .findtime = j.effectiveFindtime(defaults),
         .bantime = j.effectiveBantime(defaults),
         .bantime_kind = j.effectiveBantimeKind(defaults),
@@ -898,7 +902,7 @@ const Parser = struct {
     const TOP_GLOBAL: []const u8 = "global";
     const TOP_DEFAULTS: []const u8 = "defaults";
     const TOP_JAILS: []const u8 = "jails";
-    const MAX_JAILS: usize = 256;
+    const MAX_JAILS: usize = max_configured_jails;
 
     fn init(arena: std.mem.Allocator, src: []const u8) Parser {
         return .{
@@ -1479,6 +1483,10 @@ const Parser = struct {
             j.compatibility_pending = try asBool(v);
         } else if (std.mem.eql(u8, key, "enabled")) {
             j.enabled = try asBool(v);
+        } else if (std.mem.eql(u8, key, "history_max_matches")) {
+            const n = try asInt(v);
+            if (n < 0 or n > 1024) return error.InvalidValue;
+            j.history_max_matches = @intCast(n);
         } else if (std.mem.eql(u8, key, "filter")) {
             j.filter = try asString(v);
         } else if (std.mem.eql(u8, key, "logpath")) {

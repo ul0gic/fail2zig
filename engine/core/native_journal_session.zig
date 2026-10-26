@@ -51,6 +51,11 @@ const Position = struct {
         return result;
     }
 };
+pub fn rebindCheckpoint(saved: []const u8, old_generation: [32]u8, new_generation: [32]u8) ![checkpoint_bytes]u8 {
+    var position = try Position.decode(saved, old_generation);
+    position.generation = new_generation;
+    return position.encode();
+}
 pub const Options = struct {
     processing: native.Options,
     detection: ?@import("native_detection_record.zig").JournalConsumer = null,

@@ -47,6 +47,7 @@ pub const JailDelta = struct {
 pub const Classification = struct {
     kind: Kind = .noop,
     log_level: ?config.LogLevel = null,
+    retention_changed: bool = false,
     policies: [64]PolicyChange = undefined,
     policy_count: u8 = 0,
     ignore_jails: [max_jails][]const u8 = undefined,
@@ -110,13 +111,17 @@ pub const Classification = struct {
 
 fn globalsEqual(a: *const config.GlobalConfig, b: *const config.GlobalConfig, out: *Classification) void {
     inline for (std.meta.fields(config.GlobalConfig)) |field| {
-        if (comptime std.mem.eql(u8, field.name, "log_level")) continue;
+        if (comptime std.mem.eql(u8, field.name, "log_level") or std.mem.eql(u8, field.name, "history_max_matches")) continue;
         const left = @field(a, field.name);
         const right = @field(b, field.name);
         if (!valuesEqual(field.type, left, right)) out.restart("global.{s}", .{field.name});
     }
     if (a.log_level != b.log_level) {
         out.log_level = b.log_level;
+        out.live();
+    }
+    if (a.history_max_matches != b.history_max_matches) {
+        out.retention_changed = true;
         out.live();
     }
 }
@@ -186,13 +191,21 @@ pub fn classifyWithRuntime(current: *const config.Config, proposed: *const confi
             out.listJail(&out.jails.removed, &out.jails.removed_count, jail.name, "removed jail");
             continue;
         };
-        inline for (.{ "enabled", "logpath", "source", "filter", "timestamp", "timezone_offset_minutes", "timezone", "timezone_ambiguity", "journal_executables", "journal_executables_explicit", "rule_files", "ignore_file", "on_truncation", "compatibility_pending" }) |name| {
+        if (jail.history_max_matches != next.history_max_matches) {
+            out.retention_changed = true;
+            out.live();
+        }
+        inline for (.{ "enabled", "logpath", "source", "filter", "timestamp", "timezone_offset_minutes", "timezone", "timezone_ambiguity", "journal_executables", "journal_executables_explicit", "rule_files", "on_truncation", "compatibility_pending" }) |name| {
             const T = @TypeOf(@field(jail, name));
             if (!valuesEqual(T, @field(jail, name), @field(next, name))) out.restart("jails.{s}.{s}", .{ jail.name, name });
         }
         if (jail.rule_files.len != 0) {
-            if (!valuesEqual(@TypeOf(jail.ignoreip), jail.ignoreip, next.ignoreip)) out.restart("jails.{s}.ignoreip", .{jail.name});
+            const before_literals = jail.ignoreip orelse current.defaults.ignoreip;
+            const after_literals = next.ignoreip orelse proposed.defaults.ignoreip;
+            if (!sliceEqual([]const u8, before_literals, after_literals) or !valuesEqual(@TypeOf(jail.ignore_file), jail.ignore_file, next.ignore_file))
+                out.listJail(&out.ignore_jails, &out.ignore_count, jail.name, "ignoreip");
         } else {
+            if (!valuesEqual(@TypeOf(jail.ignore_file), jail.ignore_file, next.ignore_file)) out.restart("jails.{s}.ignore_file", .{jail.name});
             const before_literals = jail.ignoreip orelse current.defaults.ignoreip;
             const after_literals = next.ignoreip orelse proposed.defaults.ignoreip;
             if (!sliceEqual([]const u8, before_literals, after_literals)) {

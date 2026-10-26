@@ -2,7 +2,7 @@
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
 
-const fail2zig_version = "0.4.9-dev";
+const fail2zig_version = "0.4.9";
 
 fn releaseSignal(b: *std.Build, strip: bool) ?[]const u8 {
     if (strip) return "-Dstrip=true";
@@ -30,6 +30,7 @@ const NoDiagCheck = struct {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const integration_filter = b.option([]const u8, "test-filter", "Run only integration tests whose names contain this text");
     const strip = b.option(bool, "strip", "Strip debug information from the executable") orelse false;
     const diag = b.option(bool, "diag", "Build the internal diagnostic instrumentation; never shipped") orelse false;
     if (diag) if (releaseSignal(b, strip)) |signal| {
@@ -226,7 +227,7 @@ pub fn build(b: *std.Build) void {
         });
         mod.addImport("shared", shared_mod);
         mod.addImport("engine", engine_mod);
-        const t = b.addTest(.{ .root_module = mod });
+        const t = b.addTest(.{ .root_module = mod, .filters = if (integration_filter) |value| &.{value} else &.{} });
         const run = b.addRunArtifact(t);
         run.step.dependOn(b.getInstallStep());
         if (f.release_local) release_local_step.dependOn(&run.step);

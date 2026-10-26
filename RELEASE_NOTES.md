@@ -1,3 +1,76 @@
+# fail2zig v0.4.9
+
+Version 0.4.9 is a hardening release. It shows the stored matched line for each
+ban in `history` and `list` (#123), takes every path from the configuration in
+the daemon, the administrative commands and the installer (#124), and lets
+configurations with more than ten jails start under the shipped service unit. It also carries corrections across storage
+maintenance, reload, jail removal, the admin socket and monitoring, found in a
+full review of the daemon, with no change to how bans are detected, enforced or
+stored.
+
+## Changes
+
+- Show what triggered a ban. `history --details` and `list --details` show the
+  retained matched line for each event, wrapped onto continuation rows in the
+  terminal and complete in JSON (#123). `history_max_matches` (default 10, global
+  and per jail) sets how many lines are kept per address; 0 keeps none.
+- Use the paths in your configuration everywhere (#124). Administrative commands
+  and `migrate` use the configured `socket_path` when `--socket` is not given. A
+  start refused because the service cannot write a configured directory now names
+  the directory and the unit override that grants it, instead of a bare
+  `ReadOnlyFileSystem`. The installer accepts a custom `state_file` and
+  `socket_path`, applies its ownership and safety checks to the configured state,
+  and when the unit does not yet grant those directories it prints the exact unit
+  override to add before you start. The shipped unit stays sandboxed with
+  `ProtectSystem=strict`; granting a directory is the administrator's override,
+  and no fail2zig tool edits the unit.
+- Start with many jails. The daemon raises its open-file soft limit to the hard
+  limit the service grants, up to `native_fd_ceiling`, before it checks its
+  startup plan. Under the shipped unit, 0.4.8 refused more than ten jails with
+  `NativeFdAdmission`; the `native_fd_ceiling` default is now 8192, enough
+  descriptors for 64 jails.
+- Remove and disable large jails safely. Disabling or removing a jail releases
+  its bans in bounded steps that resume after a restart, so a jail holding tens
+  of thousands of bans no longer stops startup or reports done early.
+- Take the SSH client address only from the connection's own field. An address
+  inside a user name or other client-supplied text no longer selects who is
+  banned.
+- Keep ban details for administrators. `/api/bans` on the HTTP listener now
+  returns 403, and ban lists, history and firewall inventory over the socket
+  require uid 0 or the daemon's uid; `fail2zig` group members keep aggregate
+  status and metrics.
+- Show missing log sources in `status` (`Missing:` row, JSON
+  `missing_sources`).
+- Free DNS cache space when results expire, including across restarts, for
+  custom rules that resolve host names.
+
+## Upgrade and compatibility
+
+The first start upgrades a state last written by v0.4.8 (schema 26) to schema
+28 after writing `<state_file>.pre27-backup`; a v0.4.7 state takes the v0.4.8
+step first. The schema 28 step adds columns with defaults and new tables only,
+so its cost does not grow with the state. v0.4.7 remains the minimum supported
+upgrade source. v0.4.8 and older binaries refuse schema 28 with
+`UnsupportedSchema`; rollback restores the backup with the v0.4.8 binary.
+
+Monitoring that read `/api/bans`, or group members who listed bans through the
+socket, must use `fail2zig list` as root. Configurations that set
+`native_fd_ceiling` keep their value.
+
+## Known limitations
+
+- Above about twenty jails the default `native_memory_ceiling_mb` (512) refuses
+  startup with `NativeMemoryAdmission`; raise it for larger configurations.
+- A file write refused near the database's size cap can be reported as
+  `RestoreRequired` instead of `StorageFull`.
+
+## Verification scope
+
+The full local suite passed. On the Debian 13 lab host, a v0.4.8 state with
+sixteen jails and 5,000 bans upgraded under the shipped unit with no override,
+started, enforced a new ban, showed its matched line, removed it and restarted
+with every ban in the kernel.
+
 # fail2zig v0.4.8
 
 Version 0.4.8 is the capacity, log-lifecycle and parity release, built on the

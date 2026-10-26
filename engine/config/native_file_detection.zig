@@ -41,6 +41,12 @@ pub const Plan = struct {
         if (self.detection) |*value| options.detection = value.legacyConsumer();
         return options;
     }
+    pub fn customSessionOptions(self: *const Plan, parent: [32]u8) !session.Options {
+        if (self.detection != null) return error.InvalidConsumer;
+        var options = self.sessionOptions();
+        options.processing.parent_generation = fileGeneration(parent, null);
+        return options;
+    }
 
     pub fn init(allocator: std.mem.Allocator, cfg: *const config.Config, jail_index: usize, parent_generation: [32]u8, settings: Settings) !Plan {
         if (jail_index >= cfg.jails.len) return error.UnknownJail;
@@ -107,7 +113,13 @@ pub const Plan = struct {
         defer allocator.free(scratch);
         _ = try processing.Processor.init(allocator, options, scratch, .{ .us = 0 });
         const specs = try allocator.alloc(session.Spec, jail.logpath.len);
-        for (specs, jail.logpath) |*spec, path| spec.* = .{ .pattern = path, .start = settings.start };
+        errdefer allocator.free(specs);
+        var copied: usize = 0;
+        errdefer for (specs[0..copied]) |spec| allocator.free(spec.pattern);
+        for (specs, jail.logpath) |*spec, path| {
+            spec.* = .{ .pattern = try allocator.dupe(u8, path), .start = settings.start };
+            copied += 1;
+        }
         return .{ .processing = options, .detection = detection, .ignore_cell = ignore_cell, .legacy_generation = legacy_generation, .specs = specs, .max_sources = settings.max_sources };
     }
 
@@ -127,6 +139,7 @@ pub const Plan = struct {
             cell.*.deinit(allocator);
             allocator.destroy(cell);
         }
+        for (self.specs) |spec| allocator.free(spec.pattern);
         allocator.free(self.specs);
         self.* = undefined;
     }

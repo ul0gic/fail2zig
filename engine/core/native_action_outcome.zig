@@ -9,7 +9,7 @@ pub const max_rows: usize = 262_144;
 pub const Error = error{ InvalidActionTarget, ActionTargetStorageRequired, ActionTargetCapacity, StaleActionTarget, ActionTargetProofRequired };
 
 pub const Kind = enum(u8) { enforcement = 1, notification = 2 };
-// `superseded`: the decision was replaced before its outcome settled; terminal.
+// `superseded`: the decision was replaced or retired before its outcome settled; terminal.
 pub const Status = enum(u8) { pending = 1, dispatched, confirmed, failed, uncertain, suppressed_restored, superseded };
 pub const Settlement = enum { confirmed, failed, uncertain };
 

@@ -1,6 +1,6 @@
 .{
     .name = .fail2zig,
-    .version = "0.4.9-dev",
+    .version = "0.4.9",
 
     .fingerprint = 0x49f30c63af277658,
 

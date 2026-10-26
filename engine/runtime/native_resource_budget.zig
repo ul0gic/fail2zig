@@ -71,6 +71,14 @@ pub const FdContext = struct {
         if (configured == 0 or unavailable >= self.soft_limit or unavailable >= configured) return error.NativeFdAdmission;
         return @min(self.soft_limit, configured) - unavailable;
     }
+    pub fn raiseSoftLimit(configured: usize) !void {
+        if (configured == 0) return error.InvalidResourceLimit;
+        var limits = try std.posix.getrlimit(.NOFILE);
+        const wanted = @min(limits.max, @as(std.posix.rlim_t, @intCast(configured)));
+        if (limits.cur >= wanted) return;
+        limits.cur = wanted;
+        try std.posix.setrlimit(.NOFILE, limits);
+    }
     pub fn observe(configured: usize, headroom: usize) !FdContext {
         if (configured == 0) return error.InvalidResourceLimit;
         const limits = try std.posix.getrlimit(.NOFILE);
@@ -253,7 +261,7 @@ pub fn effectCost(environment: Environment) Error!Component {
 }
 pub fn publicationCost(subjects: usize, coordinator_capacity: usize) Error!Cost {
     if (subjects > retry.max_pool_subjects) return error.InvalidResourceLimit;
-    return .{ .bytes = try add(coordinator_capacity, try mul(subjects, 3 * (@sizeOf(store.Store.ActiveDecision) + @sizeOf(bool) + @sizeOf(?[32]u8)))), .allocations = 4 * 128 };
+    return .{ .bytes = try add(coordinator_capacity, try mul(subjects, 3 * @sizeOf(store.Store.ActiveDecision))), .allocations = 4 * 128 };
 }
 pub fn controlCost(metrics: bool, response_capacity: usize) Error!Component {
     if (response_capacity == 0 or response_capacity > 2 * shared.protocol.max_payload_size) return error.InvalidResourceLimit;

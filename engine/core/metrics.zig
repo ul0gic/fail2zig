@@ -119,6 +119,9 @@ pub const Snapshot = struct {
     memory_bytes_used: u64 = 0,
     state_file_bytes: u64 = 0,
     state_file_pages: u64 = 0,
+    pool_sample_available: bool = false,
+    pool_sample_pending: bool = true,
+    pool_sample_as_of_us: ?i64 = null,
     pool_tracked: u32 = 0,
     pool_banned: u32 = 0,
     pool_tracking_limit: u32 = 0,
@@ -142,6 +145,9 @@ pub const Metrics = struct {
     memory_bytes_used: Counter = .{},
     state_file_bytes: Counter = .{},
     state_file_pages: Counter = .{},
+    pool_sample_available: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    pool_sample_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+    pool_sample_as_of_us: Counter = .{},
     pool_tracked: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     pool_banned: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
@@ -192,6 +198,12 @@ pub const Metrics = struct {
     pub fn setStateFile(self: *Metrics, bytes: u64, pages: u64) void {
         self.state_file_bytes.store(bytes);
         self.state_file_pages.store(pages);
+    }
+
+    pub fn setPoolSample(self: *Metrics, available: bool, pending: bool, as_of_us: ?i64) void {
+        self.pool_sample_as_of_us.store(@bitCast(as_of_us orelse @as(i64, 0)));
+        self.pool_sample_available.store(available, counter_order);
+        self.pool_sample_pending.store(pending, counter_order);
     }
 
     pub fn setPoolOccupancy(self: *Metrics, tracked: u32, banned: u32) void {
@@ -311,6 +323,9 @@ pub const Metrics = struct {
         s.memory_bytes_used = self.memory_bytes_used.load();
         s.state_file_bytes = self.state_file_bytes.load();
         s.state_file_pages = self.state_file_pages.load();
+        s.pool_sample_available = self.pool_sample_available.load(counter_order);
+        s.pool_sample_pending = self.pool_sample_pending.load(counter_order);
+        s.pool_sample_as_of_us = if (s.pool_sample_available) @as(i64, @bitCast(self.pool_sample_as_of_us.load())) else null;
         s.pool_tracked = self.pool_tracked.load(counter_order);
         s.pool_banned = self.pool_banned.load(counter_order);
 
@@ -386,10 +401,21 @@ pub fn renderPrometheus(snapshot: *const Snapshot, writer: anytype) !void {
     try sample(writer, "fail2zig_native_expiry_uncertain", .gauge, "1 when ban expiry is uncertain", @intFromBool(n.expiry_uncertain));
     try sample(writer, "fail2zig_state_file_bytes", .gauge, "State file size in bytes", snapshot.state_file_bytes);
     try sample(writer, "fail2zig_state_file_pages", .gauge, "State file size in pages", snapshot.state_file_pages);
-    try sample(writer, "fail2zig_pool_tracked", .gauge, "Subjects tracked without a live ban", snapshot.pool_tracked);
-    try sample(writer, "fail2zig_pool_banned", .gauge, "Subjects with a live ban", snapshot.pool_banned);
-    try sample(writer, "fail2zig_pool_tracking_limit", .gauge, "Tracking pool bound", snapshot.pool_tracking_limit);
-    try sample(writer, "fail2zig_pool_ban_limit", .gauge, "Ban pool bound", snapshot.pool_ban_limit);
+    try sample(writer, "fail2zig_pool_sample_available", .gauge, "1 when a completed retry pool sample is available", @intFromBool(snapshot.pool_sample_available));
+    try sample(writer, "fail2zig_pool_sample_pending", .gauge, "1 while retry pool sampling awaits catch-up", @intFromBool(snapshot.pool_sample_pending));
+    if (snapshot.pool_sample_available) {
+        try sample(writer, "fail2zig_pool_tracked", .gauge, "Tracked subjects in the last completed sample; retained while pending", snapshot.pool_tracked);
+        try sample(writer, "fail2zig_pool_banned", .gauge, "Banned subjects in the last completed sample; retained while pending", snapshot.pool_banned);
+        if (snapshot.pool_sample_as_of_us) |as_of| {
+            try family(writer, "fail2zig_pool_sample_as_of_seconds", .gauge, "Processing-clock time of the completed retry pool sample");
+            const magnitude = @abs(as_of);
+            try writer.print("fail2zig_pool_sample_as_of_seconds {s}{d}.{d:0>6}\n", .{ if (as_of < 0) "-" else "", magnitude / std.time.us_per_s, magnitude % std.time.us_per_s });
+        }
+    }
+    if (snapshot.pool_sample_available) {
+        try sample(writer, "fail2zig_pool_tracking_limit", .gauge, "Tracking pool bound", snapshot.pool_tracking_limit);
+        try sample(writer, "fail2zig_pool_ban_limit", .gauge, "Ban pool bound", snapshot.pool_ban_limit);
+    }
 
     const jails = snapshot.perJail();
     inline for (jail_series) |series| {
