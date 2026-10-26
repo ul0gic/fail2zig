@@ -13,6 +13,8 @@ const time_policy = engine.core.source_time_policy;
 const usage =
     \\usage: f2z-load-fixture <churn|hot|pinned|reuse|oracle-cases> <out-dir> [key=value...]
     \\       f2z-load-fixture attach <state-dir> jail=NAME[,NAME...] count=N [address_start=N normalize=1|0 seed=N evidence=N sync=full|off]
+    \\       f2z-load-fixture pool-contract <out-dir> [resource=1]
+    \\       f2z-load-fixture history-attach <state-dir> jail=NAME [rounds=1..64]
     \\keys: seed count interval_ms bantime_s gap_ms evidence jails churn retention_s max_matches retention=shipped|skip sync=full|off profile=1 (per-statement SQLite VM steps on stderr) audit=full|skip (skip the final-state audit)
     \\attach appends count bans to the daemon state fail2zig.sqlite in state-dir, round-robin over up to 16 existing jails under each jail's own generation and policy (bantime_s is ignored),
     \\with addresses 198.19.0.0/16 from address_start (address_start + count <= 65536); normalize=1 runs the history consumer and retention to the head, normalize=0 leaves the backlog declared
@@ -393,32 +395,43 @@ const Gen = struct {
             const pragma = try std.fmt.bufPrintZ(&pragma_buffer, "PRAGMA cache_size=-{d};", .{self.options.cache_kib});
             try self.stored("Store.exec", self.store.exec(pragma));
         }
-        try self.stored("Store.enableReceipts", self.store.enableReceipts(64));
-        try self.stored("Store.enableNativeTime", self.store.enableNativeTime());
-        try self.stored("Store.enableDetection", self.store.enableDetection());
-        try self.stored("Store.enableClockRecovery", self.store.enableClockRecovery());
-        try self.stored("Store.enableJournalDetection", self.store.enableJournalDetection());
-        try self.stored("Store.enableRetry", self.store.enableRetry());
-        try self.stored("Store.enableConsumers", self.store.enableConsumers());
-        try self.stored("Store.enableTimeProvenance", self.store.enableTimeProvenance());
-        try self.stored("Store.enableConsumerManifests", self.store.enableConsumerManifests());
-        try self.stored("Store.enableConfirmedHistory", self.store.enableConfirmedHistory());
-        try self.stored("Store.enableMaintenance", self.store.enableMaintenance());
-        try self.stored("Store.enableCleanup", self.store.enableCleanup());
-        try self.stored("Store.enableRetryLeases", self.store.enableRetryLeases());
-        try self.stored("Store.enableApplicationHistory", self.store.enableApplicationHistory());
-        try self.stored("Store.enableEscalation", self.store.enableEscalation());
-        try self.stored("Store.enableCanonicalEffects", self.store.enableCanonicalEffects());
-        try self.stored("Store.enableHistoryResets", self.store.enableHistoryResets());
-        try self.stored("Store.enableActionTargets", self.store.enableActionTargets());
-        try self.stored("Store.enableAdminState", self.store.enableAdminState());
-        try self.stored("Store.enableMigrationState", self.store.enableMigrationState());
+        try self.stored("Store.prepareCurrentSchema", self.store.prepareCurrentSchema(.{
+            .maximum_pending = 64,
+            .migration = .{ .state_path = self.path, .now_us = self.clock.now, .history_max_matches = self.options.max_matches },
+        }));
+        if (try self.store.readRetryClock()) |floor| self.clock.now = @max(self.clock.now, floor);
+        try self.prepareRetryView();
+    }
+    fn prepareRetryView(self: *Gen) !void {
+        var owned: [64]detection.Name = undefined;
+        var names: [64][]const u8 = undefined;
+        var count: usize = 0;
+        {
+            var rows = try self.store.statement("SELECT jail FROM retry_policies ORDER BY jail LIMIT 65;");
+            defer rows.deinit();
+            while (try rows.row()) {
+                if (count == names.len) return error.FixtureUnexpectedValue;
+                owned[count] = try detection.Name.init(try rows.boundedBytes(0, 64));
+                names[count] = owned[count].slice();
+                count += 1;
+            }
+        }
+        // Fresh shapes admit their first jail before runtime owner validation.
+        if (count == 0) return;
+        try self.stored("Store.validateRuntimeOwnerNames", self.store.validateRuntimeOwnerNames(names[0..count]));
+        var validation = durable.Store.MaintenanceValidation{};
+        while (!try self.stored("Store.validateMaintenanceTurn", self.store.validateMaintenanceTurn(&validation))) {}
+        try self.stored("Store.finishMaintenanceValidation", self.store.finishMaintenanceValidation(&validation));
+        try self.stored("Store.prepareRetryAdmissionView", self.store.prepareRetryAdmissionView(names[0..count], self.clock.now));
+        while (try self.stored("Store.retryAdmissionStep", self.store.retryAdmissionStep(256)) == .progressed) {}
+    }
+    fn prepareRetryTime(self: *Gen, now: i64) !void {
+        while ((try self.stored("Store.retryPoolOccupancy", self.store.retryPoolOccupancy(now))) == null) {
+            while (try self.stored("Store.retryAdmissionStep", self.store.retryAdmissionStep(256)) == .progressed) {}
+        }
     }
     fn setup(self: *Gen) !void {
         try self.openStore();
-        const load_repair: durable.load_repair.Options = .{ .state_path = self.path, .now_us = self.clock.now, .history_max_matches = self.options.max_matches };
-        try self.stored("Store.enableLoadRepair", self.store.enableLoadRepair(load_repair, null));
-        try self.stored("Store.enableRuntimeState", self.store.enableRuntimeState(load_repair, !self.store.load_repair_migrated));
         _ = try self.stored("Store.setRetentionPolicy", self.store.setRetentionPolicy(self.options.max_matches));
         if (try self.store.integer("PRAGMA user_version;") != durable.latest_schema) return error.FixtureSchemaIncomplete;
         try self.stored("Store.admitInstallation", self.store.admitInstallation(self.installation, .{ .selector = self.installation.selector(), .disposition = .verified_absent }));
@@ -435,6 +448,7 @@ const Gen = struct {
         const jail = Jail{ .name = owned, .generation = effects.hashParts("fail2zig-load-fixture-jail-v1", &.{ name, &seed_bytes }), .policy = .{ .maxretry = 1, .window_us = 60 * second_us, .duration = duration, .max_subjects = 65536, .enforce = true } };
         try self.stored("Store.admitRetry", self.store.admitRetry(jail.name, jail.generation, jail.policy));
         try self.jails.append(jail);
+        if (!self.store.retry_projection_initialized) try self.prepareRetryView();
         return self.jails.items.len - 1;
     }
     fn finite(self: *Gen) retry.Duration {
@@ -453,6 +467,7 @@ const Gen = struct {
     // One detection through receipt and record commit, then the effect runtime's
     // dispatch, verified settlement and action-target reconciliation.
     fn ban(self: *Gen, jail_index: usize, subject: detection.Subject, evidence_bytes: usize) !void {
+        try self.prepareRetryTime(self.clock.now);
         const jail = self.jails.items[jail_index];
         self.records += 1;
         var occurrence_buffer: [32]u8 = undefined;
@@ -462,7 +477,17 @@ const Gen = struct {
         const identity = durable.ReceiptIdentity{ .jail = jail.name, .source = source_name, .occurrence = occurrence, .cursor = occurrence, .raw_hash = raw_hash, .generation = jail.generation };
         const revision = try self.stored("Store.revision", self.store.revision(jail.name));
         const receipt = try self.stored("Store.beginReceipt", self.store.beginReceipt(identity, .{ .us = self.clock.now }, revision));
-        _ = try self.stored("Store.commitRecord", self.store.commitRecord(try self.detectionRecord(jail, identity, receipt, subject, self.records, evidence_bytes, revision)));
+        const record = try self.detectionRecord(jail, identity, receipt, subject, self.records, evidence_bytes, revision);
+        while (true) {
+            _ = self.store.commitRecord(record) catch |failure| {
+                if (failure == error.RetryEligibilityPending) {
+                    try self.prepareRetryTime(self.clock.now);
+                    continue;
+                }
+                return self.stored("Store.commitRecord", @as(durable.Error!void, failure));
+            };
+            break;
+        }
         self.stats.bans += 1;
         const key = try (try effects.Scope.host(subject)).key(self.installation);
         const entry = try self.stored("Store.readEffect", self.store.readEffect(key, self.installation)) orelse return error.FixtureMissingEffect;
@@ -521,6 +546,7 @@ const Gen = struct {
     }
     // A refusal inside a frame keeps the records staged before it, as the pipeline does.
     fn appendChunk(self: *Gen, size: usize) !void {
+        try self.prepareRetryTime(self.clock.now);
         var frame = try self.stored("Store.beginBatch", self.store.beginBatch());
         var keys: [batch_records]effects.Hash = undefined;
         var jail_indices: [batch_records]usize = undefined;
@@ -531,9 +557,16 @@ const Gen = struct {
             jail_indices[staged] = jail_index;
             staged += 1;
         } else null;
+        const pending = if (refusal) |failure| failure == error.RetryEligibilityPending else false;
+        if (pending) self.cycle -= 1;
         if (staged == 0 or frame.broken) {
             self.store.rollback();
             if (staged != 0) return error.FixtureBatchBroken;
+            if (pending) {
+                try self.prepareRetryTime(self.clock.now);
+                self.store_failure = null;
+                return;
+            }
             if (refusal) |cause| return cause;
             return;
         }
@@ -549,7 +582,10 @@ const Gen = struct {
             try self.stored("Store.commitBatch", self.store.commitBatch(&frame));
         }
         try self.settleChunk(keys[0..staged], jail_indices[0..staged]);
-        if (refusal) |cause| return cause;
+        if (pending) {
+            try self.prepareRetryTime(self.clock.now);
+            self.store_failure = null;
+        } else if (refusal) |cause| return cause;
     }
     // One readback per chunk: a single fingerprint and observation time, as the daemon's batched settlement.
     fn settleChunk(self: *Gen, keys: []const effects.Hash, jail_indices: []const usize) !void {
@@ -1345,6 +1381,1051 @@ fn writeAddress(ws: anytype, index: u64) !void {
     try ws.write(try std.fmt.bufPrint(&buffer, "{d}.{d}.{d}.{d}", .{ subject.v4[0], subject.v4[1], subject.v4[2], subject.v4[3] }));
 }
 
+// Standalone Store observations; the verifier, not this producer, decides acceptance.
+const PoolLog = struct {
+    file: std.fs.File,
+    timer: std.time.Timer,
+    overall_peak: i64 = 0,
+    const memoryUsed = @extern(*const fn () callconv(.c) i64, .{ .name = "sqlite3_memory_used" });
+    const memoryHighwater = @extern(*const fn (c_int) callconv(.c) i64, .{ .name = "sqlite3_memory_highwater" });
+    const hardHeap = @extern(*const fn (i64) callconv(.c) i64, .{ .name = "sqlite3_hard_heap_limit64" });
+    const columnCount = @extern(*const fn (?*anyopaque) callconv(.c) c_int, .{ .name = "sqlite3_column_count" });
+
+    fn emit(self: *PoolLog, value: anytype) !void {
+        try std.json.stringify(value, .{}, self.file.writer());
+        try self.file.writeAll("\n");
+        try self.file.sync();
+    }
+    fn memory(self: *PoolLog, gen: ?*Gen, label: []const u8) !void {
+        const peak = memoryHighwater(1);
+        self.overall_peak = @max(self.overall_peak, peak);
+        var values = [_]i64{0} ** 5;
+        if (gen) |g| {
+            for ([_]c_int{ 1, 2, 3, 7, 8 }, &values) |op, *value| {
+                var unused: i64 = 0;
+                if (sqlite3_db_status64(@ptrCast(g.store.db), op, value, &unused, 0) != 0) return error.FixtureCacheStatus;
+            }
+        }
+        try self.emit(.{ .event = "memory", .label = label, .elapsed_ns = self.timer.read(), .sqlite_current = memoryUsed(), .phase_highwater = peak, .overall_highwater = self.overall_peak, .hard_limit = hardHeap(-1), .cache_bytes = values[0], .schema_bytes = values[1], .statement_bytes = values[2], .cache_hits = values[3], .cache_misses = values[4] });
+    }
+    fn api(self: *PoolLog, gen: *Gen, operation: []const u8, outcome: []const u8, serial: ?u64) !void {
+        try self.emit(.{ .event = "api", .database = gen.path, .operation = operation, .outcome = outcome, .serial = serial, .clock_us = gen.clock.now, .autocommit = gen.store.api.get_autocommit(gen.store.db), .inline_work_left = gen.store.retry_admission_work_left, .target_hint = gen.store.retry_admission_target_hint, .reopen_required = gen.store.reopen_required, .rollback_error_code = gen.store.rollback_error_code });
+    }
+};
+
+const PoolInput = struct {
+    jail: usize,
+    serial: u64,
+    subject: detection.Subject,
+    occurrence: [32]u8 = undefined,
+    len: usize = 0,
+    raw_hash: [32]u8 = undefined,
+    receipt: ?Timestamp = null,
+    revision: u64 = 0,
+    operation: []const u8 = "input",
+
+    fn init(jail: usize, serial: u64, subject: detection.Subject) !PoolInput {
+        var input = PoolInput{ .jail = jail, .serial = serial, .subject = subject };
+        const text = try std.fmt.bufPrint(&input.occurrence, "pool-{d}", .{serial});
+        input.len = text.len;
+        std.crypto.hash.sha2.Sha256.hash(text, &input.raw_hash, .{});
+        return input;
+    }
+    fn identity(self: *const PoolInput, gen: *Gen) durable.ReceiptIdentity {
+        const jail = gen.jails.items[self.jail];
+        return .{ .jail = jail.name, .source = source_name, .occurrence = self.occurrence[0..self.len], .cursor = self.occurrence[0..self.len], .raw_hash = self.raw_hash, .generation = jail.generation };
+    }
+    fn reserve(self: *PoolInput, gen: *Gen) !void {
+        self.operation = "revision";
+        self.revision = try gen.store.revision(gen.jails.items[self.jail].name);
+        self.operation = "beginReceipt";
+        self.receipt = try gen.store.beginReceipt(self.identity(gen), .{ .us = gen.clock.now }, self.revision);
+    }
+    fn record(self: *const PoolInput, gen: *Gen) !durable.Record {
+        return gen.detectionRecord(gen.jails.items[self.jail], self.identity(gen), self.receipt orelse return error.FixtureUnexpectedValue, self.subject, self.serial, gen.options.evidence, self.revision);
+    }
+    fn commit(self: *PoolInput, gen: *Gen) !durable.CommitResult {
+        if (self.receipt == null) try self.reserve(gen);
+        self.operation = "constructRecord";
+        const value = try self.record(gen);
+        self.operation = "commitRecord";
+        return gen.store.commitRecord(value);
+    }
+    fn stage(self: *PoolInput, gen: *Gen, frame: anytype) !durable.CommitResult {
+        self.operation = "openBatchRecord";
+        try gen.store.openBatchRecord(frame);
+        errdefer gen.store.dropBatchRecord(frame);
+        self.revision = try gen.store.revision(gen.jails.items[self.jail].name);
+        self.operation = "reserveReceiptStep";
+        const step_result = try gen.store.reserveReceiptStep(self.identity(gen), .{ .us = gen.clock.now }, self.revision);
+        self.receipt = step_result.time;
+        self.operation = "constructRecord";
+        const value = try self.record(gen);
+        self.operation = "closeBatchRecord";
+        return gen.store.closeBatchRecord(frame, value);
+    }
+};
+
+fn poolJail(gen: *Gen, name: []const u8, policy: retry.Policy) !usize {
+    const owned = try gen.allocator.dupe(u8, name);
+    errdefer gen.allocator.free(owned);
+    var seed: [8]u8 = undefined;
+    std.mem.writeInt(u64, &seed, gen.options.seed, .little);
+    const jail = Jail{ .name = owned, .generation = effects.hashParts("fail2zig-load-fixture-jail-v1", &.{ name, &seed }), .policy = policy };
+    try gen.store.admitRetry(jail.name, jail.generation, jail.policy);
+    try gen.jails.append(jail);
+    return gen.jails.items.len - 1;
+}
+fn poolPrepare(gen: *Gen) !void {
+    var names: [64][]const u8 = undefined;
+    for (gen.jails.items, 0..) |jail, i| names[i] = jail.name;
+    try gen.store.validateRuntimeOwnerNames(names[0..gen.jails.items.len]);
+    var validation = durable.Store.MaintenanceValidation{};
+    while (!try gen.store.validateMaintenanceTurn(&validation)) {}
+    try gen.store.finishMaintenanceValidation(&validation);
+    try gen.store.prepareRetryAdmissionView(names[0..gen.jails.items.len], gen.clock.now);
+    while (try gen.store.retryAdmissionStep(256) == .progressed) {}
+}
+fn poolNew(allocator: std.mem.Allocator, dir: []const u8, name: []const u8) !*Gen {
+    const gen = try Gen.create(allocator, dir, name, .{ .evidence = 198, .normalize = false }, false);
+    errdefer gen.destroy();
+    try gen.setup();
+    return gen;
+}
+fn poolPolicy(maxretry: u16, limit: u32, permanent: bool, enforce: bool) retry.Policy {
+    return .{ .maxretry = maxretry, .window_us = 3600 * second_us, .duration = if (permanent) .permanent else .{ .finite_us = 60 * second_us }, .max_subjects = limit, .enforce = enforce };
+}
+fn poolSubject(index: u64, ipv6: bool) detection.Subject {
+    if (!ipv6) return host(198, 19, @truncate(index >> 8), @truncate(index));
+    var address = [_]u8{0} ** 16;
+    address[0..4].* = .{ 0x20, 0x01, 0x0d, 0xb8 };
+    std.mem.writeInt(u64, address[8..16], index, .big);
+    return .{ .v6 = address };
+}
+fn poolCommitObserved(log: *PoolLog, gen: *Gen, input: *PoolInput) !void {
+    const result = input.commit(gen) catch |failure| {
+        try log.api(gen, input.operation, @errorName(failure), input.serial);
+        return;
+    };
+    try log.api(gen, "commitRecord", @tagName(result), input.serial);
+}
+fn poolStageObserved(log: *PoolLog, gen: *Gen, frame: anytype, input: *PoolInput) !void {
+    const result = input.stage(gen, frame) catch |failure| {
+        try log.api(gen, input.operation, @errorName(failure), input.serial);
+        return;
+    };
+    try log.api(gen, "closeBatchRecord", @tagName(result), input.serial);
+}
+fn poolHashRow(hash: *std.crypto.hash.sha2.Sha256, row: *durable.Stmt) !void {
+    const columns = PoolLog.columnCount(@ptrCast(row.ptr));
+    for (0..@as(usize, @intCast(columns))) |i| {
+        const column: c_int = @intCast(i);
+        const kind = row.store.api.column_type(row.ptr, column);
+        hash.update(&.{@intCast(kind)});
+        var size: [8]u8 = undefined;
+        if (kind == 1) {
+            std.mem.writeInt(i64, &size, try row.signed(column), .little);
+            hash.update(&size);
+        } else if (kind == 3 or kind == 4) {
+            const bytes = try row.bytes(column);
+            std.mem.writeInt(u64, &size, bytes.len, .little);
+            hash.update(&size);
+            hash.update(bytes);
+        } else if (kind != 5) return error.FixtureUnexpectedValue;
+    }
+    hash.update(&.{0xff});
+}
+fn poolHash(store: *durable.Store, sql: [:0]const u8) ![64]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var row = try store.statement(sql);
+    defer row.deinit();
+    while (try row.row()) try poolHashRow(&hash, &row);
+    return std.fmt.bytesToHex(hash.finalResult(), .lower);
+}
+fn poolViewHash(store: *durable.Store) ![64]u8 {
+    const Cursor = struct { jail: i64, family: i64, subject: [16]u8, len: usize };
+    var cursor: ?Cursor = null;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    while (true) {
+        const previous = cursor;
+        var row = try store.statement(if (previous != null) "SELECT * FROM temp.retry_admission_rows WHERE (jail_id,family,subject)>(?1,?2,?3) ORDER BY jail_id,family,subject LIMIT 256;" else "SELECT * FROM temp.retry_admission_rows ORDER BY jail_id,family,subject LIMIT 256;");
+        defer row.deinit();
+        if (previous) |*last| {
+            try row.int(1, last.jail);
+            try row.int(2, last.family);
+            try row.blob(3, last.subject[0..last.len]);
+        }
+        var count: usize = 0;
+        while (try row.row()) {
+            try poolHashRow(&hash, &row);
+            const subject = try row.boundedBytes(2, 16);
+            var next = Cursor{ .jail = try row.signed(0), .family = try row.signed(1), .subject = undefined, .len = subject.len };
+            @memcpy(next.subject[0..subject.len], subject);
+            cursor = next;
+            count += 1;
+        }
+        if (count == 0) break;
+    }
+    return std.fmt.bytesToHex(hash.finalResult(), .lower);
+}
+fn poolProbeHeader(writer: anytype, value: anytype) !void {
+    var buffer: [2048]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buffer);
+    try std.json.stringify(value, .{}, stream.writer());
+    const bytes = stream.getWritten();
+    try writer.writeAll(bytes[0 .. bytes.len - 1]);
+}
+// Preserve SELECT * column order and SQLite type tags used by poolHashRow.
+fn poolTypedRow(writer: anytype, row: *durable.Stmt) !void {
+    if (!try row.row()) return writer.writeAll("null");
+    try poolTypedColumns(writer, row);
+}
+fn poolTypedColumns(writer: anytype, row: *durable.Stmt) !void {
+    try writer.writeByte('[');
+    const columns: usize = @intCast(PoolLog.columnCount(@ptrCast(row.ptr)));
+    for (0..columns) |i| {
+        if (i != 0) try writer.writeByte(',');
+        const column: c_int = @intCast(i);
+        const kind = row.store.api.column_type(row.ptr, column);
+        try writer.print("[{d},", .{kind});
+        switch (kind) {
+            1 => try std.json.stringify(try row.signed(column), .{}, writer),
+            3 => try std.json.stringify(try row.bytes(column), .{}, writer),
+            4 => try writer.print("\"{}\"", .{std.fmt.fmtSliceHexLower(try row.bytes(column))}),
+            5 => try writer.writeAll("null"),
+            else => return error.FixtureUnexpectedValue,
+        }
+        try writer.writeByte(']');
+    }
+    try writer.writeByte(']');
+}
+fn poolTypedRows(writer: anytype, row: *durable.Stmt) !void {
+    try writer.writeByte('[');
+    var separator = false;
+    while (try row.row()) {
+        if (separator) try writer.writeByte(',');
+        try poolTypedColumns(writer, row);
+        separator = true;
+    }
+    try writer.writeByte(']');
+}
+fn poolProbe(log: *PoolLog, gen: *Gen, label: []const u8, input: *const PoolInput, include_subject: bool) !void {
+    const jail = gen.jails.items[input.jail].name;
+    const family: u8 = if (input.subject == .v4) 4 else 6;
+    const bytes: []const u8 = switch (input.subject) {
+        .v4 => |*value| value[0..],
+        .v6 => |*value| value[0..],
+    };
+    var encoded: [32]u8 = undefined;
+    const subject = try std.fmt.bufPrint(&encoded, "{}", .{std.fmt.fmtSliceHexLower(bytes)});
+    var buffered = std.io.bufferedWriter(log.file.writer());
+    const writer = buffered.writer();
+    if (include_subject) {
+        try poolProbeHeader(writer, .{ .event = "probe", .label = label, .jail = jail, .family = family, .subject_hex = subject });
+        inline for (.{
+            .{ "working", "SELECT * FROM retry_states WHERE jail=?1 AND family=?2 AND subject=?3;", 3 },
+            .{ "projected", "SELECT * FROM temp.retry_admission_rows WHERE jail_id=(SELECT jail_id FROM temp.retry_publication_jails WHERE jail=?1) AND family=?2 AND subject=?3;", 3 },
+            .{ "retired", "SELECT * FROM retry_retired WHERE jail=?1 AND family=?2 AND subject=?3;", 3 },
+            .{ "retired_total", "SELECT * FROM retry_retired_totals WHERE jail=?1;", 1 },
+        }) |entry| {
+            try writer.writeAll(",\"" ++ entry[0] ++ "\":");
+            var row = try gen.store.statement(entry[1]);
+            defer row.deinit();
+            try row.text(1, jail);
+            if (entry[2] == 3) {
+                try row.int(2, family);
+                try row.blob(3, bytes);
+            }
+            try poolTypedRow(writer, &row);
+        }
+        try writer.writeAll("}\n");
+    }
+    try poolProbeHeader(writer, .{ .event = "input_probe", .label = label, .jail = jail, .serial = input.serial });
+    inline for (.{
+        .{ "record", "SELECT * FROM records WHERE jail=?1 AND source=?2 AND occurrence=?3;", 3 },
+        .{ "pending_receipt", "SELECT * FROM pending_receipts WHERE jail=?1 AND source=?2;", 2 },
+        .{ "checkpoint", "SELECT * FROM checkpoints WHERE jail=?1;", 1 },
+        .{ "source_cursor", "SELECT * FROM source_cursors WHERE jail=?1 AND source=?2;", 2 },
+    }) |entry| {
+        try writer.writeAll(",\"" ++ entry[0] ++ "\":");
+        var row = try gen.store.statement(entry[1]);
+        defer row.deinit();
+        try row.text(1, jail);
+        if (entry[2] >= 2) try row.text(2, source_name);
+        if (entry[2] == 3) try row.text(3, input.occurrence[0..input.len]);
+        try poolTypedRow(writer, &row);
+    }
+    inline for (.{
+        .{ "decisions", "SELECT * FROM retry_decisions WHERE jail=?1 AND source=?2 AND occurrence=?3 ORDER BY family,subject;" },
+        .{ "details", "SELECT * FROM retry_decision_details WHERE jail=?1 AND source=?2 AND occurrence=?3 ORDER BY family,subject;" },
+    }) |entry| {
+        try writer.writeAll(",\"" ++ entry[0] ++ "\":");
+        var row = try gen.store.statement(entry[1]);
+        defer row.deinit();
+        try row.text(1, jail);
+        try row.text(2, source_name);
+        try row.text(3, input.occurrence[0..input.len]);
+        try poolTypedRows(writer, &row);
+    }
+    try writer.writeAll("}\n");
+    try buffered.flush();
+    try log.file.sync();
+}
+fn poolOwnerProbe(log: *PoolLog, gen: *Gen, label: []const u8, subject: detection.Subject) !void {
+    const jail = gen.jails.items[0].name;
+    const scope = try effects.Scope.host(subject);
+    const key = try scope.key(gen.installation);
+    const entry = try gen.store.readEffect(key, gen.installation);
+    var owners: [effects.max_page]effects.Owner = undefined;
+    const count = try gen.store.readOwners(key, &owners);
+    var lease: ?[]const u8 = null;
+    var revision: ?u64 = null;
+    for (owners[0..count]) |owner| if (std.mem.eql(u8, owner.jail.slice(), jail)) {
+        lease = @tagName(owner.lease);
+        revision = owner.revision;
+    };
+    const bytes: []const u8 = switch (subject) {
+        .v4 => |*value| value[0..],
+        .v6 => |*value| value[0..],
+    };
+    var encoded: [32]u8 = undefined;
+    const text = try std.fmt.bufPrint(&encoded, "{}", .{std.fmt.fmtSliceHexLower(bytes)});
+    try log.emit(.{ .event = "owner_probe", .label = label, .jail = jail, .family = if (subject == .v4) @as(u8, 4) else 6, .subject_hex = text, .desired = if (entry) |value| @as(?[]const u8, @tagName(value.desired)) else null, .status = if (entry) |value| @as(?[]const u8, @tagName(value.status)) else null, .owner_lease = lease, .owner_revision = revision });
+}
+fn poolProbes(log: *PoolLog, gen: *Gen, label: []const u8) !void {
+    if (std.mem.endsWith(u8, gen.path, "/pool-order.sqlite")) {
+        for (0..17) |i| {
+            const subject = poolSubject(i + 1, i % 2 == 1 or i == 16);
+            const input = try PoolInput.init(63 - i / 2, i + 1, subject);
+            try poolProbe(log, gen, label, &input, true);
+            if (i < 16 and std.mem.eql(u8, label, "all-sixteen-pinned")) try poolOwnerProbe(log, gen, label, subject);
+        }
+        const held = try PoolInput.init(54, 1000, poolSubject(200, false));
+        try poolProbe(log, gen, label, &held, true);
+    } else if (std.mem.endsWith(u8, gen.path, "/pool-fault.sqlite")) {
+        for (0..4) |i| {
+            const input = try PoolInput.init(if (i == 1) 1 else 0, i + 1, poolSubject(if (i == 3) 1 else i + 1, i == 1 or i == 2));
+            try poolProbe(log, gen, label, &input, i != 3);
+        }
+    } else if (std.mem.endsWith(u8, gen.path, "/pool-time.sqlite")) {
+        for ([_]u64{ 1, 257, 258, 1000 }) |serial| {
+            const input = try PoolInput.init(if (serial == 1000) 2 else if (serial == 258) 1 else 0, serial, poolSubject(serial, true));
+            try poolProbe(log, gen, label, &input, true);
+        }
+    } else if (std.mem.endsWith(u8, gen.path, "/pool-resource.sqlite")) {
+        for (0..64) |i| {
+            const original = try PoolInput.init(31, 32 * (i + 1), poolSubject(32 * (i + 1), true));
+            try poolProbe(log, gen, label, &original, true);
+            const staged = try PoolInput.init(i % 32, 200000 + i, poolSubject(200000 + i, true));
+            try poolProbe(log, gen, label, &staged, true);
+            if (i < 32) {
+                const prefix = try PoolInput.init(i % 32, 300000 + i, poolSubject(300000 + i, true));
+                try poolProbe(log, gen, label, &prefix, true);
+            }
+        }
+        const failed = try PoolInput.init(0, 400000, poolSubject(400000, true));
+        try poolProbe(log, gen, label, &failed, true);
+    }
+}
+fn poolFacts(log: *PoolLog, gen: *Gen, label: []const u8, full: bool) !void {
+    try log.memory(gen, label);
+    const total = try gen.store.integer("SELECT count(*) FROM retry_states;");
+    const records = try gen.store.integer("SELECT count(*) FROM records;");
+    const pending = try gen.store.integer("SELECT count(*) FROM pending_receipts;");
+    var meta = try gen.store.statement("SELECT total,live,as_of_us,target_us,ready FROM temp.retry_admission_meta WHERE id=1;");
+    const present = try meta.row();
+    const total_view = if (present) try meta.signed(0) else null;
+    const live_view = if (present) try meta.signed(1) else null;
+    const as_of = if (present) try meta.signed(2) else null;
+    const target = if (present) try meta.optionalSigned(3) else null;
+    const ready = if (present) try meta.signed(4) else null;
+    meta.deinit();
+    try log.emit(.{ .event = "facts", .label = label, .database = gen.path, .clock_us = gen.clock.now, .rows = total, .records = records, .pending_receipts = pending, .view_total = total_view, .view_live = live_view, .as_of_us = as_of, .target_us = target, .ready = ready, .retry_floor = try gen.store.readRetryClock(), .receipt_floor = try gen.store.readReceiptClock(), .autocommit = gen.store.api.get_autocommit(gen.store.db) });
+    if (!full) return;
+    try log.emit(.{ .event = "settings", .label = label, .main_pages = try gen.store.integer("PRAGMA main.page_count;"), .temp_pages = try gen.store.integer("PRAGMA temp.page_count;"), .page_size = try gen.store.integer("PRAGMA page_size;"), .cache_size = try gen.store.integer("PRAGMA cache_size;"), .temp_store = try gen.store.integer("PRAGMA temp_store;"), .synchronous = try gen.store.integer("PRAGMA synchronous;") });
+    const row_digest = try poolViewHash(&gen.store);
+    const dictionary_digest = try poolHash(&gen.store, "SELECT * FROM temp.retry_publication_jails ORDER BY jail_id;");
+    const meta_digest = try poolHash(&gen.store, "SELECT * FROM temp.retry_admission_meta ORDER BY id;");
+    try log.emit(.{ .event = "view_fingerprints", .label = label, .rows = row_digest[0..], .dictionary = dictionary_digest[0..], .meta = meta_digest[0..] });
+    {
+        var pages = try gen.store.statement("SELECT name,count(*),sum(pgsize),sum(payload),sum(unused) FROM dbstat('temp') GROUP BY name ORDER BY name;");
+        defer pages.deinit();
+        while (try pages.row()) try log.emit(.{ .event = "temp_object", .label = label, .name = try pages.bytes(0), .pages = try pages.signed(1), .bytes = try pages.signed(2), .payload_bytes = try pages.signed(3), .unused_bytes = try pages.signed(4) });
+    }
+    var reader: ?durable.Store = null;
+    if (gen.store.api.get_autocommit(gen.store.db) != 0) reader = try durable.Store.openReadOnly(gen.allocator, gen.path);
+    defer if (reader) |*value| value.close();
+    const oracle = if (reader) |*value| value else &gen.store;
+    inline for (.{
+        .{ "retry_states", "SELECT * FROM retry_states ORDER BY jail,family,subject;" },
+        .{ "retry_retired", "SELECT * FROM retry_retired ORDER BY jail,family,subject;" },
+        .{ "retry_retired_totals", "SELECT * FROM retry_retired_totals ORDER BY jail;" },
+        .{ "records", "SELECT * FROM records ORDER BY jail,source,occurrence;" },
+        .{ "pending_receipts", "SELECT * FROM pending_receipts ORDER BY jail,source;" },
+        .{ "checkpoints", "SELECT * FROM checkpoints ORDER BY jail;" },
+        .{ "source_cursors", "SELECT * FROM source_cursors ORDER BY jail,source;" },
+        .{ "retry_decisions", "SELECT * FROM retry_decisions ORDER BY jail,source,occurrence,ordinal;" },
+        .{ "retry_decision_details", "SELECT * FROM retry_decision_details ORDER BY jail,source,occurrence;" },
+    }) |entry| {
+        const digest = try poolHash(oracle, entry[1]);
+        try log.emit(.{ .event = "main_fingerprint", .label = label, .table = entry[0], .sha256 = digest[0..] });
+    }
+    for (gen.jails.items) |jail| {
+        var sum: u128 = try oracle.retiredTotal(jail.name);
+        var working = try oracle.statement("SELECT decisions FROM retry_states WHERE jail=?1;");
+        try working.text(1, jail.name);
+        while (try working.row()) {
+            const value = try working.signed(0);
+            if (value < 0) return error.FixtureUnexpectedValue;
+            sum += @as(u64, @intCast(value));
+        }
+        working.deinit();
+        if (gen.store.api.get_autocommit(gen.store.db) != 0 and ready == 1) {
+            const summary = try gen.store.retryJailSummary(jail.name);
+            try log.emit(.{ .event = "summary", .label = label, .jail = jail.name, .main_u128 = sum, .provider_u64 = summary.decisions, .revision = summary.revision });
+        } else {
+            var buffered = std.io.bufferedWriter(log.file.writer());
+            const writer = buffered.writer();
+            try poolProbeHeader(writer, .{ .event = "summary_staged", .label = label, .jail = jail.name, .main_u128 = sum });
+            try writer.writeAll(",\"projected\":");
+            var row = try gen.store.statement("SELECT * FROM temp.retry_publication_jails WHERE jail=?1;");
+            defer row.deinit();
+            try row.text(1, jail.name);
+            try poolTypedRow(writer, &row);
+            try writer.writeAll("}\n");
+            try buffered.flush();
+            try log.file.sync();
+        }
+    }
+    try poolProbes(log, gen, label);
+    var buffer: [128]u8 = undefined;
+    try log.memory(gen, try std.fmt.bufPrint(&buffer, "{s}-oracle-overhead", .{label}));
+}
+fn poolVictims(log: *PoolLog, gen: *Gen, label: []const u8) !void {
+    try gen.store.beginWrite();
+    errdefer gen.store.rollback();
+    var victims: [16]durable.Store.RetryAdmissionVictim = undefined;
+    const count = try gen.store.retryAdmissionVictimsTx(gen.clock.now, &victims);
+    for (victims[0..count], 0..) |victim, i| {
+        var bytes: [16]u8 = undefined;
+        const length: usize = switch (victim.subject) {
+            .v4 => |value| blk: {
+                bytes[0..4].* = value;
+                break :blk 4;
+            },
+            .v6 => |value| blk: {
+                bytes = value;
+                break :blk 16;
+            },
+        };
+        var encoded: [32]u8 = undefined;
+        const subject = try std.fmt.bufPrint(&encoded, "{}", .{std.fmt.fmtSliceHexLower(bytes[0..length])});
+        try log.emit(.{ .event = "victim", .label = label, .index = i, .jail = victim.jail.slice(), .last_processed_us = victim.last_processed_us, .family = if (victim.subject == .v4) @as(u8, 4) else 6, .subject_hex = subject });
+    }
+    gen.store.rollback();
+    var rows = try gen.store.statement("SELECT jail,family,subject,last_processed_us FROM retry_states WHERE lease_kind=0 OR (lease_kind=1 AND deadline_us<=?1) ORDER BY last_processed_us,jail,family,subject LIMIT 16;");
+    defer rows.deinit();
+    try rows.int(1, gen.clock.now);
+    var i: usize = 0;
+    while (try rows.row()) : (i += 1) {
+        var encoded: [32]u8 = undefined;
+        const text = try std.fmt.bufPrint(&encoded, "{}", .{std.fmt.fmtSliceHexLower(try rows.bytes(2))});
+        try log.emit(.{ .event = "main_victim", .label = label, .index = i, .jail = try rows.bytes(0), .family = try rows.signed(1), .subject_hex = text, .last_processed_us = try rows.signed(3) });
+    }
+}
+fn poolOwner(gen: *Gen, subject: detection.Subject, release: bool, serial: u64) !effects.Entry {
+    const jail = gen.jails.items[0];
+    const scope = try effects.Scope.host(subject);
+    const key = try scope.key(gen.installation);
+    var owners: [effects.max_page]effects.Owner = undefined;
+    const count = try gen.store.readOwners(key, &owners);
+    var revision: u64 = 0;
+    for (owners[0..count]) |owner| if (std.mem.eql(u8, owner.jail.slice(), jail.name)) {
+        revision = owner.revision;
+    };
+    var identity: [8]u8 = undefined;
+    std.mem.writeInt(u64, &identity, serial, .little);
+    return gen.store.setOwner(.{ .scope = scope, .jail = jail.name, .generation = jail.generation, .decision_id = effects.hashParts("pool-owner", &.{&identity}), .expected_revision = revision, .lease = if (release) .absent else .permanent, .decided_us = gen.clock.now, .origin = .manual }, gen.clock.value());
+}
+fn poolOrder(log: *PoolLog, allocator: std.mem.Allocator, dir: []const u8) !void {
+    const gen = try poolNew(allocator, dir, "pool-order");
+    defer gen.destroy();
+    for (0..64) |i| {
+        var name = [_]u8{'x'} ** 64;
+        _ = try std.fmt.bufPrint(name[0..8], "pool-{d:0>2}-", .{63 - i});
+        _ = try poolJail(gen, &name, poolPolicy(2, 17, false, false));
+    }
+    try poolPrepare(gen);
+    var subjects: [17]detection.Subject = undefined;
+    for (&subjects, 0..) |*subject, i| {
+        subject.* = poolSubject(i + 1, i % 2 == 1 or i == 16);
+        var input = try PoolInput.init(63 - i / 2, i + 1, subject.*);
+        _ = try input.commit(gen);
+    }
+    try poolFacts(log, gen, "seventeen", true);
+    try poolVictims(log, gen, "equal-time");
+    for (subjects[0..7], 0..) |subject, i| _ = try poolOwner(gen, subject, false, i + 1);
+    try poolFacts(log, gen, "prefix-probe-before", true);
+    try gen.store.beginWrite();
+    const eviction = gen.store.evictIdleSubject(gen.jails.items[0].name, gen.clock.now) catch |failure| {
+        gen.store.rollback();
+        return failure;
+    };
+    try log.emit(.{ .event = "prefix_pin_eviction", .report = eviction });
+    try poolFacts(log, gen, "prefix-probe-staged", true);
+    gen.store.rollback();
+    try poolFacts(log, gen, "prefix-probe-rolled-back", true);
+    for (subjects[7..16], 7..) |subject, i| _ = try poolOwner(gen, subject, false, i + 1);
+    var held = try PoolInput.init(54, 1000, poolSubject(200, false));
+    try held.reserve(gen);
+    try poolCommitObserved(log, gen, &held);
+    try poolFacts(log, gen, "all-sixteen-pinned", true);
+    const entry = try poolOwner(gen, subjects[7], true, 1001);
+    try log.emit(.{ .event = "released-owner", .status = @tagName(entry.status), .lease = @tagName(entry.desired) });
+    try log.memory(gen, "release-pending");
+    try poolOwnerProbe(log, gen, "release-pending", subjects[7]);
+    try log.memory(gen, "release-pending-oracle-overhead");
+    _ = try gen.store.settleOutcome(entry.token(), gen.clock.now, gen.observation(entry), gen.clock.value());
+    try log.memory(gen, "release-settled");
+    try poolOwnerProbe(log, gen, "release-settled", subjects[7]);
+    try log.memory(gen, "release-settled-oracle-overhead");
+    try poolCommitObserved(log, gen, &held);
+    try poolFacts(log, gen, "held-retry", true);
+    gen.closeStore();
+    try gen.openStore();
+    try poolFacts(log, gen, "order-reopened", true);
+}
+fn poolFault(log: *PoolLog, allocator: std.mem.Allocator, dir: []const u8) !void {
+    const gen = try poolNew(allocator, dir, "pool-fault");
+    defer gen.destroy();
+    _ = try poolJail(gen, "prefix", poolPolicy(1, 65536, false, false));
+    _ = try poolJail(gen, "fault", poolPolicy(1, 65536, false, false));
+    try poolPrepare(gen);
+    var prefix = try PoolInput.init(0, 1, poolSubject(1, false));
+    var held = try PoolInput.init(1, 2, poolSubject(2, true));
+    try held.reserve(gen);
+    try poolFacts(log, gen, "outside-receipt", true);
+    var frame = try gen.store.beginBatch();
+    _ = try prefix.stage(gen, &frame);
+    gen.store.fail_at = .after_retry_state;
+    try poolStageObserved(log, gen, &frame, &held);
+    gen.store.fail_at = null;
+    try poolFacts(log, gen, "fault-prefix-staged", true);
+    try gen.store.commitBatch(&frame);
+    try poolFacts(log, gen, "fault-prefix-committed", true);
+    try poolCommitObserved(log, gen, &held);
+    try poolFacts(log, gen, "fault-held-retry", true);
+    var outer = try PoolInput.init(0, 3, poolSubject(3, true));
+    frame = try gen.store.beginBatch();
+    _ = try outer.stage(gen, &frame);
+    try poolFacts(log, gen, "outer-staged", true);
+    gen.store.rollback();
+    try poolFacts(log, gen, "outer-rollback", true);
+    gen.clock.now += 3601 * second_us;
+    const candidate = try gen.store.retryRetirementCandidate(gen.jails.items[0].name, null);
+    if (candidate) |value| {
+        const fence = durable.Store.CleanupFence{ .jail = gen.jails.items[0].name, .source = source_name, .generation = gen.jails.items[0].generation, .jail_revision = try gen.store.revision(gen.jails.items[0].name), .consumer_revision = try gen.store.consumerRevision(), .effect_revision = try gen.store.maintenanceEffectRevision(), .clock = gen.clock.value() };
+        gen.store.fail_at = .after_retry_retire;
+        if (gen.store.retireRetrySubject(fence, value)) |retired| {
+            try log.emit(.{ .event = "retire-result", .retired = retired });
+        } else |failure| try log.api(gen, "retireRetrySubject", @errorName(failure), null);
+        gen.store.fail_at = null;
+        try poolFacts(log, gen, "retire-rollback", true);
+        const retired = try gen.store.retireRetrySubject(fence, value);
+        try log.emit(.{ .event = "retire-retry", .retired = retired });
+        try poolFacts(log, gen, "retire-success", true);
+        var resurrect = try PoolInput.init(0, 4, prefix.subject);
+        try poolCommitObserved(log, gen, &resurrect);
+    }
+    try poolFacts(log, gen, "retire-resurrect", true);
+    gen.closeStore();
+    try gen.openStore();
+    try poolFacts(log, gen, "fault-reopened", true);
+}
+fn poolSample(log: *PoolLog, gen: *Gen, label: []const u8, now: i64) !void {
+    const sample = gen.store.retryPoolOccupancy(now) catch |failure| {
+        try log.api(gen, "retryPoolOccupancy", @errorName(failure), null);
+        return;
+    };
+    try log.emit(.{ .event = "sample", .label = label, .requested_us = now, .value = sample });
+}
+fn poolTime(log: *PoolLog, allocator: std.mem.Allocator, dir: []const u8) !void {
+    const gen = try poolNew(allocator, dir, "pool-time");
+    defer gen.destroy();
+    _ = try poolJail(gen, "finite", poolPolicy(1, 65536, false, false));
+    _ = try poolJail(gen, "permanent", poolPolicy(1, 65536, true, false));
+    _ = try poolJail(gen, "tracking", poolPolicy(2, 1, false, false));
+    try poolPrepare(gen);
+    for (0..258) |i| {
+        var input = try PoolInput.init(if (i == 257) 1 else 0, i + 1, poolSubject(i + 1, true));
+        _ = try input.commit(gen);
+    }
+    const deadline = gen.clock.now + 60 * second_us;
+    try poolSample(log, gen, "deadline-minus-one", deadline - 1);
+    try poolFacts(log, gen, "before-time-crossing", true);
+    gen.clock.now = deadline;
+    var input = try PoolInput.init(2, 1000, poolSubject(1000, true));
+    var frame = try gen.store.beginBatch();
+    try poolStageObserved(log, gen, &frame, &input);
+    try poolFacts(log, gen, "time-first-pending", true);
+    try poolStageObserved(log, gen, &frame, &input);
+    try poolFacts(log, gen, "time-second-pending", true);
+    gen.store.rollback();
+    try poolFacts(log, gen, "time-frame-rollback", true);
+    var turns: usize = 0;
+    while (turns < 8) : (turns += 1) {
+        const progress = try gen.store.retryAdmissionStep(256);
+        try log.api(gen, "retryAdmissionStep", @tagName(progress), null);
+        try poolSample(log, gen, "catchup", deadline);
+        if (progress == .ready) break;
+    }
+    try poolFacts(log, gen, "time-ready", true);
+    input.receipt = null;
+    try poolCommitObserved(log, gen, &input);
+    try poolSample(log, gen, "deadline-equality", deadline);
+    try poolSample(log, gen, "deadline-plus-one", deadline + 1);
+    try poolSample(log, gen, "old-time-request", deadline - 1);
+    gen.closeStore();
+    try gen.openStore();
+    try poolFacts(log, gen, "time-reopened", true);
+}
+fn poolWarmMain(gen: *Gen) !void {
+    inline for (.{
+        "SELECT rowid,raw_hash FROM records WHERE rowid>?1 ORDER BY rowid LIMIT 256;",
+        "SELECT rowid,evidence FROM retry_decision_details WHERE rowid>?1 ORDER BY rowid LIMIT 256;",
+    }) |sql| {
+        var after: i64 = 0;
+        while (true) {
+            const previous = after;
+            var row = try gen.store.statement(sql);
+            defer row.deinit();
+            try row.int(1, previous);
+            var count: usize = 0;
+            while (try row.row()) {
+                after = try row.signed(0);
+                _ = try row.bytes(1);
+                count += 1;
+            }
+            if (count == 0) break;
+        }
+    }
+}
+fn poolStageControl(log: *PoolLog, gen: *Gen, label: []const u8, point: []const u8) !void {
+    try log.emit(.{ .event = "stage_control", .label = label, .point = point, .runtime_limits = gen.store.runtime_limits, .work_remaining = gen.store.work_remaining, .inline_work_left = gen.store.retry_admission_work_left, .row_tallies = gen.store.row_tallies, .autocommit = gen.store.api.get_autocommit(gen.store.db), .reopen_required = gen.store.reopen_required, .rollback_error_code = gen.store.rollback_error_code });
+}
+fn poolStageKeyProbe(log: *PoolLog, gen: *Gen, label: []const u8, input: *const PoolInput) !void {
+    const jail = gen.jails.items[input.jail].name;
+    const family: u8 = if (input.subject == .v4) 4 else 6;
+    const bytes: []const u8 = switch (input.subject) {
+        .v4 => |*value| value[0..],
+        .v6 => |*value| value[0..],
+    };
+    var encoded: [32]u8 = undefined;
+    const subject = try std.fmt.bufPrint(&encoded, "{}", .{std.fmt.fmtSliceHexLower(bytes)});
+    var buffered = std.io.bufferedWriter(log.file.writer());
+    const writer = buffered.writer();
+    try poolProbeHeader(writer, .{ .event = "probe", .label = label, .jail = jail, .family = family, .subject_hex = subject });
+    inline for (.{
+        .{ "working", "SELECT * FROM retry_states WHERE jail=?1 AND family=?2 AND subject=?3;", 3 },
+        .{ "projected", "SELECT * FROM temp.retry_admission_rows WHERE jail_id=(SELECT jail_id FROM temp.retry_publication_jails WHERE jail=?1) AND family=?2 AND subject=?3;", 3 },
+        .{ "retired", "SELECT * FROM retry_retired WHERE jail=?1 AND family=?2 AND subject=?3;", 3 },
+        .{ "retired_total", "SELECT * FROM retry_retired_totals WHERE jail=?1;", 1 },
+    }) |entry| {
+        try writer.writeAll(",\"" ++ entry[0] ++ "\":");
+        var row = try gen.store.statement(entry[1]);
+        defer row.deinit();
+        try row.text(1, jail);
+        if (entry[2] == 3) {
+            try row.int(2, family);
+            try row.blob(3, bytes);
+        }
+        try poolTypedRow(writer, &row);
+    }
+    try writer.writeAll("}\n");
+    try buffered.flush();
+    try log.file.sync();
+}
+fn poolStageProjection(log: *PoolLog, gen: *Gen, label: []const u8) !void {
+    var buffered = std.io.bufferedWriter(log.file.writer());
+    const writer = buffered.writer();
+    try poolProbeHeader(writer, .{ .event = "stage_projection", .label = label });
+    try writer.writeAll(",\"meta\":");
+    {
+        var row = try gen.store.statement("SELECT * FROM temp.retry_admission_meta WHERE id=1;");
+        defer row.deinit();
+        try poolTypedRow(writer, &row);
+    }
+    try writer.writeAll(",\"dictionary\":");
+    {
+        var row = try gen.store.statement("SELECT * FROM temp.retry_publication_jails ORDER BY jail_id LIMIT 64;");
+        defer row.deinit();
+        try poolTypedRows(writer, &row);
+    }
+    try writer.writeAll("}\n");
+    try buffered.flush();
+    try log.file.sync();
+}
+const PoolStage = enum { frame64, failed_record };
+fn poolStageFacts(log: *PoolLog, gen: *Gen, stage: PoolStage) !void {
+    const label = if (stage == .frame64) "resource-frame64" else "resource-failed-record";
+    try log.memory(gen, label);
+    try poolStageControl(log, gen, label, "before_observer");
+    const total = try gen.store.integer("SELECT count(*) FROM retry_states;");
+    const records = try gen.store.integer("SELECT count(*) FROM records;");
+    const pending = try gen.store.integer("SELECT count(*) FROM pending_receipts;");
+    var meta = try gen.store.statement("SELECT total,live,as_of_us,target_us,ready FROM temp.retry_admission_meta WHERE id=1;");
+    const present = try meta.row();
+    const total_view = if (present) try meta.signed(0) else null;
+    const live_view = if (present) try meta.signed(1) else null;
+    const as_of = if (present) try meta.signed(2) else null;
+    const target = if (present) try meta.optionalSigned(3) else null;
+    const ready = if (present) try meta.signed(4) else null;
+    meta.deinit();
+    try log.emit(.{ .event = "facts", .label = label, .database = gen.path, .clock_us = gen.clock.now, .rows = total, .records = records, .pending_receipts = pending, .view_total = total_view, .view_live = live_view, .as_of_us = as_of, .target_us = target, .ready = ready, .retry_floor = try gen.store.readRetryClock(), .receipt_floor = try gen.store.readReceiptClock(), .autocommit = gen.store.api.get_autocommit(gen.store.db) });
+    try log.emit(.{ .event = "settings", .label = label, .main_pages = try gen.store.integer("PRAGMA main.page_count;"), .temp_pages = try gen.store.integer("PRAGMA temp.page_count;"), .page_size = try gen.store.integer("PRAGMA page_size;"), .cache_size = try gen.store.integer("PRAGMA cache_size;"), .temp_store = try gen.store.integer("PRAGMA temp_store;"), .synchronous = try gen.store.integer("PRAGMA synchronous;") });
+    try poolStageProjection(log, gen, label);
+    const old_count: usize = if (stage == .frame64) 65 else 33;
+    for (0..old_count) |i| {
+        const original = try PoolInput.init(31, 32 * (i + 1), poolSubject(32 * (i + 1), true));
+        try poolStageKeyProbe(log, gen, label, &original);
+    }
+    const new_count: usize = if (stage == .frame64) 64 else 32;
+    const first_serial: u64 = if (stage == .frame64) 200000 else 300000;
+    for (0..new_count) |i| {
+        const input = try PoolInput.init(i % 32, first_serial + i, poolSubject(first_serial + i, true));
+        try poolStageKeyProbe(log, gen, label, &input);
+        try poolProbe(log, gen, label, &input, false);
+    }
+    if (stage == .failed_record) {
+        const failed = try PoolInput.init(0, 400000, poolSubject(400000, true));
+        try poolStageKeyProbe(log, gen, label, &failed);
+        try poolProbe(log, gen, label, &failed, false);
+    }
+    try poolStageControl(log, gen, label, "after_observer");
+    var buffer: [128]u8 = undefined;
+    try log.memory(gen, try std.fmt.bufPrint(&buffer, "{s}-oracle-overhead", .{label}));
+}
+fn poolResource(log: *PoolLog, allocator: std.mem.Allocator, dir: []const u8) !void {
+    const gen = try poolNew(allocator, dir, "pool-resource");
+    defer gen.destroy();
+    for (0..64) |i| {
+        var name = [_]u8{'x'} ** 64;
+        _ = try std.fmt.bufPrint(name[0..8], "pool-{d:0>2}-", .{63 - i});
+        _ = try poolJail(gen, &name, poolPolicy(if (i < 32) 2 else 1, 65536, false, i >= 32));
+    }
+    try poolPrepare(gen);
+    try log.memory(gen, "resource-setup");
+    for (0..2048) |chunk| {
+        var frame = try gen.store.beginBatch();
+        errdefer gen.store.rollback();
+        for (0..64) |offset| {
+            const serial = chunk * 64 + offset;
+            const jail = (if (serial < 65536) @as(usize, 0) else 32) + serial % 32;
+            var input = try PoolInput.init(jail, serial + 1, poolSubject(serial + 1, true));
+            _ = input.stage(gen, &frame) catch |failure| {
+                try log.api(gen, input.operation, @errorName(failure), input.serial);
+                try log.memory(gen, "resource-refusal");
+                return failure;
+            };
+        }
+        try gen.store.commitBatch(&frame);
+        if (chunk % 256 == 255) try log.memory(gen, "resource-progress");
+    }
+    try poolFacts(log, gen, "resource-full", true);
+    try log.memory(gen, "resource-oracle-overhead");
+    try poolWarmMain(gen);
+    try log.memory(gen, "resource-after-main-reads");
+    var frame = try gen.store.beginBatch();
+    for (0..64) |i| {
+        var input = try PoolInput.init(i % 32, 200000 + i, poolSubject(200000 + i, true));
+        _ = input.stage(gen, &frame) catch |failure| {
+            try log.api(gen, input.operation, @errorName(failure), input.serial);
+            try log.memory(gen, "resource-refusal");
+            return failure;
+        };
+    }
+    try poolStageFacts(log, gen, .frame64);
+    gen.store.rollback();
+    try poolFacts(log, gen, "resource-outer-rollback", true);
+    frame = try gen.store.beginBatch();
+    for (0..32) |i| {
+        var input = try PoolInput.init(i % 32, 300000 + i, poolSubject(300000 + i, true));
+        _ = input.stage(gen, &frame) catch |failure| {
+            try log.api(gen, input.operation, @errorName(failure), input.serial);
+            try log.memory(gen, "resource-refusal");
+            return failure;
+        };
+    }
+    var failed = try PoolInput.init(0, 400000, poolSubject(400000, true));
+    gen.store.fail_at = .after_retry_state;
+    try poolStageObserved(log, gen, &frame, &failed);
+    gen.store.fail_at = null;
+    try poolStageFacts(log, gen, .failed_record);
+    gen.store.rollback();
+    try poolFacts(log, gen, "resource-failed-outer-rollback", true);
+    gen.closeStore();
+    try log.memory(null, "resource-closed");
+    try gen.openStore();
+    try poolFacts(log, gen, "resource-reopened", true);
+}
+fn runPoolContract(allocator: std.mem.Allocator, dir: []const u8, options: []const []const u8) !u8 {
+    const resource = options.len == 1 and std.mem.eql(u8, options[0], "resource=1");
+    if (options.len != 0 and !resource) return error.InvalidOption;
+    _ = std.c.umask(0o077);
+    try std.fs.cwd().makePath(dir);
+    try std.posix.fchmodat(std.posix.AT.FDCWD, dir, 0o700, 0);
+    const path = try std.fmt.allocPrint(allocator, "{s}/pool-contract.jsonl", .{dir});
+    defer allocator.free(path);
+    const file = try std.fs.cwd().createFile(path, .{ .exclusive = true, .mode = 0o600 });
+    defer file.close();
+    var log = PoolLog{ .file = file, .timer = try std.time.Timer.start() };
+    const exe = try std.fs.selfExePathAlloc(allocator);
+    defer allocator.free(exe);
+    var exe_hash: [64]u8 = undefined;
+    try fileSha256(exe, &exe_hash);
+    try log.emit(.{ .event = "start", .schema_version = 1, .mode = "pool-contract", .resource = resource, .binary_sha256 = exe_hash[0..], .build_mode = @tagName(@import("builtin").mode), .claim = "standalone production Store APIs; independent verifier required; no daemon/kernel/source-ACK/upgrade claim" });
+    const result = if (resource) poolResource(&log, allocator, dir) else blk: {
+        poolOrder(&log, allocator, dir) catch |failure| break :blk @as(anyerror!void, failure);
+        poolFault(&log, allocator, dir) catch |failure| break :blk @as(anyerror!void, failure);
+        break :blk poolTime(&log, allocator, dir);
+    };
+    result catch |failure| {
+        try log.emit(.{ .event = "stopped", .failure = @errorName(failure), .elapsed_ns = log.timer.read(), .sqlite_current = PoolLog.memoryUsed(), .sqlite_highwater = PoolLog.memoryHighwater(0), .hard_limit = PoolLog.hardHeap(-1) });
+        return 1;
+    };
+    try log.memory(null, "closed");
+    try log.emit(.{ .event = "complete", .elapsed_ns = log.timer.read(), .acceptance_claimed = false });
+    return 0;
+}
+
+const HistoryAttach = struct {
+    gen: *Gen,
+    log: *PoolLog,
+    rounds: u8,
+    completed_rounds: u8 = 0,
+    records: u64 = 0,
+    round: u8 = 0,
+    chunk: usize = 0,
+    const Floors = struct { receipt_us: ?i64, retry_us: ?i64, effect_us: ?i64, admission_us: ?i64 };
+
+    fn deadline(self: *HistoryAttach) !void {
+        if (self.log.timer.read() >= 1800 * std.time.ns_per_s) return error.FixturePreparationDeadline;
+    }
+    fn floors(self: *HistoryAttach) !Floors {
+        const receipt = try self.gen.store.readReceiptClock();
+        const admission = try self.gen.store.readAdmissionClock(self.gen.store.schema_version);
+        var row = try self.gen.store.statement("SELECT floor_us FROM effect_clock WHERE singleton=1;");
+        defer row.deinit();
+        if (!try row.row()) return error.FixtureUnexpectedValue;
+        return .{ .receipt_us = if (receipt) |value| value.us else null, .retry_us = try self.gen.store.readRetryClock(), .effect_us = try row.optionalSigned(0), .admission_us = if (admission) |value| value.us else null };
+    }
+    fn progress(self: *HistoryAttach, label: []const u8) !void {
+        const gen = self.gen;
+        var stream = try gen.store.statement("SELECT revision,head,retained_from FROM confirmed_history_stream WHERE id=1;");
+        defer stream.deinit();
+        if (!try stream.row()) return error.FixtureUnexpectedValue;
+        try self.log.emit(.{ .event = "history_progress", .label = label, .round = self.round, .chunk = self.chunk, .requested_rounds = self.rounds, .completed_rounds = self.completed_rounds, .committed_fixture_records = self.records, .stream_revision = try stream.signed(0), .head = try stream.signed(1), .retained_from = try stream.signed(2), .saved_checkpoint = gen.consumer.live.last_sequence, .saved_checkpoint_revision = gen.consumer.revision, .backlog = @as(u64, @intCast(try stream.signed(1))) -| gen.consumer.live.last_sequence, .pending_receipts = try gen.store.integer("SELECT count(*) FROM pending_receipts;"), .clock_us = gen.clock.now, .wall_us = std.time.microTimestamp(), .floors = try self.floors(), .elapsed_ns = self.log.timer.read(), .autocommit = gen.store.api.get_autocommit(gen.store.db), .inline_work_left = gen.store.retry_admission_work_left, .target_hint = gen.store.retry_admission_target_hint, .reopen_required = gen.store.reopen_required, .rollback_error_code = gen.store.rollback_error_code });
+    }
+    fn facts(self: *HistoryAttach, label: []const u8) !void {
+        const gen = self.gen;
+        try self.log.memory(gen, label);
+        try self.progress(label);
+        var counts: [key_tables.len]i64 = undefined;
+        inline for (key_tables, 0..) |table, i| counts[i] = try gen.store.integer("SELECT count(*) FROM " ++ table ++ ";");
+        const cursors = try poolHash(&gen.store, "SELECT * FROM source_cursors WHERE source<>'fixture' ORDER BY jail,source;");
+        const checkpoints = try poolHash(&gen.store, "SELECT jail,payload FROM checkpoints ORDER BY jail;");
+        var retention = try gen.store.statement("SELECT generation,max_matches,state,sweep_cursor,retry_evidence_sweep_cursor,history_subject_sweep_cursor FROM retention_policy WHERE id=1;");
+        defer retention.deinit();
+        if (!try retention.row()) return error.FixtureUnexpectedValue;
+        const wall = std.time.microTimestamp();
+        const observed_floors = try self.floors();
+        try self.log.emit(.{ .event = "history_facts", .label = label, .round = self.round, .completed_rounds = self.completed_rounds, .table_names = key_tables, .counts = counts, .record_detections = try gen.store.integer("SELECT count(*) FROM record_detections;"), .original_source_cursors_sha256 = cursors[0..], .checkpoint_payloads_sha256 = checkpoints[0..], .retention_generation = try retention.signed(0), .retention_max_matches = try retention.signed(1), .retention_state = try retention.signed(2), .retention_sweep = try retention.signed(3), .retry_evidence_sweep = try retention.optionalSigned(4), .history_subject_sweep = try retention.optionalSigned(5), .main_pages = try gen.store.integer("PRAGMA page_count;"), .free_pages = try gen.store.integer("PRAGMA freelist_count;"), .page_size = try gen.store.integer("PRAGMA page_size;"), .cache_size = try gen.store.integer("PRAGMA cache_size;"), .synchronous = try gen.store.integer("PRAGMA synchronous;"), .clock_us = gen.clock.now, .wall_us = wall, .floors = observed_floors, .future_dated = gen.clock.now > wall or (observed_floors.admission_us orelse gen.clock.now) > wall });
+        var buffer: [128]u8 = undefined;
+        try self.log.memory(gen, try std.fmt.bufPrint(&buffer, "{s}-oracle-overhead", .{label}));
+    }
+    fn stage(self: *HistoryAttach, frame: anytype, serial: u64, first: usize, keys: []effects.Hash) !void {
+        const gen = self.gen;
+        const jail = gen.jails.items[0];
+        var occurrence_buffer: [32]u8 = undefined;
+        const occurrence = try std.fmt.bufPrint(&occurrence_buffer, "fx-{d}", .{serial});
+        var raw_hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(occurrence, &raw_hash, .{});
+        const identity = durable.ReceiptIdentity{ .jail = jail.name, .source = source_name, .occurrence = occurrence, .cursor = occurrence, .raw_hash = raw_hash, .generation = jail.generation };
+        var outcomes: [16]detection.Outcome = undefined;
+        for (&outcomes, keys, 0..) |*outcome, *key, i| {
+            const subject = attachSubject(@intCast(first + i));
+            key.* = try (try effects.Scope.host(subject)).key(gen.installation);
+            outcome.* = .{ .kind = .candidate, .generation = jail.generation, .filter = try detection.Name.init("fixture"), .pattern = try detection.Name.init("failure"), .pattern_index = @intCast(i), .subject = subject };
+        }
+        gen.clock.now += attach_step_us;
+        try gen.stored("Store.openBatchRecord", gen.store.openBatchRecord(frame));
+        errdefer gen.store.dropBatchRecord(frame);
+        const revision = try gen.stored("Store.revision", gen.store.revision(jail.name));
+        const reserved = try gen.stored("Store.reserveReceiptStep", gen.store.reserveReceiptStep(identity, .{ .us = gen.clock.now }, revision));
+        var record = try gen.detectionRecord(jail, identity, reserved.time, outcomes[0].subject.?, serial, 198, revision);
+        record.native_detection = null;
+        record.native_detections = &outcomes;
+        const result = try gen.stored("Store.closeBatchRecord", gen.store.closeBatchRecord(frame, record));
+        if (result == .already_committed) return error.FixtureRecordAlreadyCommitted;
+    }
+    fn append(self: *HistoryAttach, first: usize) !void {
+        const gen = self.gen;
+        try self.deadline();
+        try gen.prepareRetryTime(gen.clock.now);
+        var keys: [64]effects.Hash = undefined;
+        {
+            var frame = try gen.stored("Store.beginBatch", gen.store.beginBatch());
+            errdefer gen.store.rollback();
+            for (0..4) |i| try self.stage(&frame, self.records + @as(u64, @intCast(i)) + 1, first + i * 16, keys[i * 16 ..][0..16]);
+            var cursor = try gen.store.statement("DELETE FROM source_cursors WHERE jail=?1 AND source=?2;");
+            defer cursor.deinit();
+            try cursor.text(1, gen.jails.items[0].name);
+            try cursor.text(2, source_name);
+            try cursor.done();
+            try gen.stored("Store.commitBatch", gen.store.commitBatch(&frame));
+        }
+        self.records += 4;
+        gen.cycle = self.records;
+        const indices = [_]usize{0} ** 64;
+        try gen.settleChunk(&keys, &indices);
+        try self.log.memory(gen, "history-chunk");
+        try self.progress("chunk");
+        try self.log.memory(gen, "history-chunk-oracle-overhead");
+    }
+    fn expire(self: *HistoryAttach) !void {
+        const gen = self.gen;
+        gen.clock.now += second_us;
+        for (0..64) |chunk| {
+            try self.deadline();
+            var items: [64]durable.Store.ExpiryItem = undefined;
+            for (&items, 0..) |*item, i| {
+                const key = try (try effects.Scope.host(attachSubject(@intCast(chunk * 64 + i)))).key(gen.installation);
+                const entry = try gen.stored("Store.readEffect", gen.store.readEffect(key, gen.installation)) orelse return error.FixtureMissingEffect;
+                item.* = .{ .key = key, .revision = entry.revision };
+            }
+            const prepared = try gen.stored("Store.prepareExpiries", gen.store.prepareExpiries(&items, gen.clock.value()));
+            var tokens: [64]effects.Token = undefined;
+            for (items, &tokens) |item, *token| {
+                const entry = try gen.stored("Store.readEffect", gen.store.readEffect(item.key, gen.installation)) orelse return error.FixtureMissingEffect;
+                if (entry.desired != .absent) return error.FixtureExpiryNotAbsent;
+                token.* = entry.token();
+            }
+            var identity: [16]u8 = undefined;
+            std.mem.writeInt(i64, identity[0..8], gen.clock.now, .little);
+            std.mem.writeInt(u64, identity[8..16], chunk, .little);
+            const fingerprint = effects.hashParts("fail2zig-history-fixture-expiry-v1", &.{&identity});
+            const settled = try gen.stored("Store.settleExpired", gen.store.settleExpired(&tokens, fingerprint, gen.clock.now, gen.clock.value()));
+            try self.log.emit(.{ .event = "history_expiry", .round = self.round, .chunk = chunk + 1, .prepared = prepared, .settled = settled, .clock_us = gen.clock.now, .elapsed_ns = self.log.timer.read() });
+        }
+    }
+    fn reclaim(self: *HistoryAttach) !void {
+        const gen = self.gen;
+        try self.log.memory(gen, "before-reclaim");
+        for (0..8192) |turn| {
+            try self.deadline();
+            const rested = gen.store.reclaim.rest != 0;
+            const outcome = try gen.stored("Store.reclaimObsoleteOne", gen.store.reclaimObsoleteOne());
+            if (turn % 64 == 0 or (outcome == .idle and !rested)) try self.log.emit(.{ .event = "history_reclaim", .round = self.round, .turn = turn + 1, .outcome = @tagName(outcome), .rested = rested, .elapsed_ns = self.log.timer.read() });
+            if (outcome == .idle and !rested) return;
+        }
+        return error.FixtureUnboundedMaintenance;
+    }
+    fn run(self: *HistoryAttach) !void {
+        const gen = self.gen;
+        try gen.openStore();
+        gen.installation = try gen.stored("Store.readInstallation", gen.store.readInstallation()) orelse return error.FixtureMissingInstallation;
+        gen.consumer = try history.Consumer.init(gen.installation, historyPolicyGeneration());
+        try gen.restoreHistory();
+        try gen.addAttachJail(gen.options.jail);
+        try gen.scheduleClock();
+        const jail = gen.jails.items[0];
+        if (jail.policy.maxretry != 1 or !jail.policy.enforce or jail.policy.duration != .finite_us or jail.policy.duration.finite_us != second_us or jail.policy.escalation.enabled or jail.policy.max_subjects < 4096) return error.FixtureHistoryPolicyMismatch;
+        {
+            var policy = try gen.store.statement("SELECT p.max_matches,l.max_matches FROM retention_policy p LEFT JOIN history_jail_limits l ON l.jail=?1 WHERE p.id=1;");
+            defer policy.deinit();
+            try policy.text(1, jail.name);
+            if (!try policy.row()) return error.FixtureUnexpectedValue;
+            const global = try policy.signed(0);
+            if (@min(global, (try policy.optionalSigned(1)) orelse global) != 64) return error.FixtureHistoryPolicyMismatch;
+        }
+        if (gen.consumer.live.last_sequence != 0 or gen.consumer.live.total_confirmed != 0 or try gen.store.integer("SELECT head FROM confirmed_history_stream WHERE id=1;") != 0 or try gen.store.integer("SELECT count(*) FROM confirmed_effect_events;") != 0 or try gen.store.integer("SELECT count(*) FROM confirmed_event_details;") != 0 or try gen.store.integer("SELECT count(*) FROM retry_states;") != 0 or try gen.store.integer("SELECT count(*) FROM native_effects;") != 0 or try gen.store.integer("SELECT count(*) FROM pending_receipts;") != 0 or jail.records != 0) return error.FixtureHistoryBaseNotEmpty;
+        const installation = std.fmt.bytesToHex(gen.installation.id, .lower);
+        const generation = std.fmt.bytesToHex(jail.generation, .lower);
+        try self.log.emit(.{ .event = "history_base", .schema = try gen.store.integer("PRAGMA user_version;"), .jail = jail.name, .installation_hex = installation[0..], .generation_hex = generation[0..], .maxretry = jail.policy.maxretry, .window_us = jail.policy.window_us, .duration_us = jail.policy.duration.finite_us, .max_subjects = jail.policy.max_subjects, .enforce = jail.policy.enforce, .history_limit = 64, .schedule = gen.report.schedule, .checkpoint = gen.consumer.live.last_sequence });
+        try self.facts("base");
+        for (0..self.rounds) |round| {
+            self.round = @intCast(round + 1);
+            for (0..64) |chunk| {
+                self.chunk = chunk + 1;
+                try self.append(chunk * 64);
+            }
+            try self.expire();
+            self.completed_rounds += 1;
+            if (self.completed_rounds % 16 == 0) try self.reclaim();
+            try self.facts("round");
+        }
+        try self.facts("final");
+        const wall = std.time.microTimestamp();
+        const observed_floors = try self.floors();
+        try self.log.emit(.{ .event = "complete", .requested_rounds = self.rounds, .completed_rounds = self.completed_rounds, .committed_fixture_records = self.records, .ceiling_requested = self.rounds == 64, .qualification_only = self.rounds < 64, .clock_us = gen.clock.now, .wall_us = wall, .floors = observed_floors, .daemon_startable_clock = gen.clock.now <= wall and (observed_floors.admission_us orelse gen.clock.now) <= wall, .elapsed_ns = self.log.timer.read(), .acceptance_claimed = false });
+    }
+};
+
+fn runHistoryAttach(allocator: std.mem.Allocator, dir: []const u8, arguments: []const []const u8) !u8 {
+    var jail: ?[]const u8 = null;
+    var rounds: u8 = 64;
+    var seen_rounds = false;
+    for (arguments) |argument| {
+        const split = std.mem.indexOfScalar(u8, argument, '=') orelse return error.InvalidOption;
+        const key = argument[0..split];
+        const value = argument[split + 1 ..];
+        if (std.mem.eql(u8, key, "jail") and jail == null) {
+            _ = try detection.Name.init(value);
+            jail = value;
+        } else if (std.mem.eql(u8, key, "rounds") and !seen_rounds) {
+            rounds = try std.fmt.parseInt(u8, value, 10);
+            if (rounds == 0 or rounds > 64) return error.InvalidOption;
+            seen_rounds = true;
+        } else return error.InvalidOption;
+    }
+    const name = jail orelse return error.InvalidOption;
+    _ = std.c.umask(0o077);
+    const path = try std.fmt.allocPrint(allocator, "{s}/history-attach.jsonl", .{dir});
+    defer allocator.free(path);
+    const file = try std.fs.cwd().createFile(path, .{ .exclusive = true, .mode = 0o600 });
+    defer file.close();
+    var log = PoolLog{ .file = file, .timer = try std.time.Timer.start() };
+    const exe = try std.fs.selfExePathAlloc(allocator);
+    defer allocator.free(exe);
+    var binary: [64]u8 = undefined;
+    try fileSha256(exe, &binary);
+    try log.emit(.{ .event = "start", .schema_version = 1, .mode = "history-attach", .binary_sha256 = binary[0..], .build_mode = @tagName(@import("builtin").mode), .jail = name, .requested_rounds = rounds, .subjects = 4096, .outcomes_per_record = 16, .records_per_frame = 4, .decisions_per_chunk = 64, .evidence_bytes = 198, .deadline_seconds = 1800, .claim = "supplied production Store input and complete-owned observations; genuine saved history backlog; no parser/kernel/source-ACK/acceptance claim" });
+    const gen = try Gen.attach(allocator, dir, .{ .jail = name, .normalize = false, .max_matches = 64, .evidence = 198 });
+    defer gen.destroy();
+    var run = HistoryAttach{ .gen = gen, .log = &log, .rounds = rounds };
+    const result = blk: {
+        var reader = durable.Store.openReadOnly(allocator, gen.path) catch |failure| break :blk @as(anyerror!void, failure);
+        const version = reader.integer("PRAGMA user_version;") catch |failure| {
+            reader.close();
+            break :blk @as(anyerror!void, failure);
+        };
+        reader.close();
+        if (version != durable.latest_schema) break :blk @as(anyerror!void, error.FixtureSchemaIncomplete);
+        break :blk run.run();
+    };
+    result catch |failure| {
+        if (gen.store_open) {
+            try log.api(gen, if (gen.store_failure) |stored| stored.operation else "history-attach", @errorName(failure), run.records);
+            if (!gen.store.reopen_required and gen.store.api.get_autocommit(gen.store.db) != 0) run.facts("failure") catch |observer| {
+                try log.emit(.{ .event = "observer_failure", .failure = @errorName(observer) });
+            };
+        }
+        try log.emit(.{ .event = "stopped", .failure = @errorName(failure), .round = run.round, .chunk = run.chunk, .completed_rounds = run.completed_rounds, .committed_fixture_records = run.records, .elapsed_ns = log.timer.read(), .sqlite_current = PoolLog.memoryUsed(), .sqlite_highwater = PoolLog.memoryHighwater(0), .acceptance_claimed = false });
+        return 1;
+    };
+    return 0;
+}
+
 pub fn main() !u8 {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -1356,6 +2437,8 @@ pub fn main() !u8 {
         try stderr.writeAll(usage);
         return 2;
     }
+    if (std.mem.eql(u8, argv[1], "pool-contract")) return runPoolContract(allocator, argv[2], argv[3..]);
+    if (std.mem.eql(u8, argv[1], "history-attach")) return runHistoryAttach(allocator, argv[2], argv[3..]);
     const shape = std.meta.stringToEnum(Shape, argv[1]) orelse {
         try stderr.writeAll(usage);
         return 2;

@@ -156,12 +156,7 @@ pub fn Methods(comptime Self: type) type {
 }
 
 fn requireMigratedSchema(store: *Store) Error!void {
-    if (try store.integer("PRAGMA user_version;") != store_mod.latest_schema) return error.LoadRepairMigrationRequired;
-    switch (try store.loadRepairStatus()) {
-        .complete => {},
-        .incomplete => return error.LoadRepairMigrationIncomplete,
-        .earlier_schema, .ready => return error.LoadRepairMigrationRequired,
-    }
+    store.requireCurrentSchemaReady() catch |failure| return if (failure == error.UnsupportedSchema) error.LoadRepairMigrationRequired else failure;
 }
 
 fn replay(store: *Store, allocator: std.mem.Allocator, request: Request, key: [32]u8) Error!?Outcome {
@@ -566,11 +561,13 @@ fn commitRemoved(store: *Store, allocator: std.mem.Allocator, request: Request, 
         .incarnation = plan.current_incarnation orelse [_]u8{0} ** 16,
         .outcome = outcome_removed_incarnation_acknowledged,
     }, now_us);
+    const source = try allocator.dupe(u8, plan.source);
+    errdefer allocator.free(source);
     try store.commitTransaction();
     committed = true;
     return .{
         .replayed = false,
-        .source = try allocator.dupe(u8, plan.source),
+        .source = source,
         .generation = plan.generation,
         .prior_checkpoint_revision = plan.revision,
         .prior_cursor_sha256 = prior_cursor_sha256,
@@ -704,11 +701,13 @@ fn commit(store: *Store, allocator: std.mem.Allocator, request: Request, key: [3
         .incarnation = plan.next.incarnation,
         .outcome = if (plan.replaced) outcome_replaced_file_acknowledged else outcome_truncation_acknowledged,
     }, now_us);
+    const source = try allocator.dupe(u8, plan.source);
+    errdefer allocator.free(source);
     try store.commitTransaction();
     committed = true;
     return .{
         .replayed = false,
-        .source = try allocator.dupe(u8, plan.source),
+        .source = source,
         .generation = plan.generation,
         .prior_checkpoint_revision = plan.revision,
         .prior_cursor_sha256 = prior_cursor_sha256,

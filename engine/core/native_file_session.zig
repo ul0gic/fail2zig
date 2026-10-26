@@ -491,6 +491,7 @@ pub const Session = struct {
     }
     pub fn awaitingPath(self: *const Session) bool {
         if (self.awaiting_discovery) return true;
+        for (0..self.sources.configuredCount()) |i| if (self.sources.configuredStatus(i).?.presence == .missing) return true;
         for (self.sources.sources.items) |source| if (source.awaiting_path or source.named_path != .present or source.health == .missing) return true;
         return false;
     }
@@ -573,7 +574,7 @@ pub const Session = struct {
         self.last_failure_domain = domain;
         self.blocked_cause = if (pipeline.Pipeline.commitBlocked(cause)) cause else null;
         self.sources.health = switch (cause) {
-            error.SourceRepairPending, error.ReserveBackpressure, error.RetryCapacity => .waiting,
+            error.SourceRepairPending, error.ReserveBackpressure, error.RetryCapacity, error.RetryEligibilityPending => .waiting,
             error.FileNotFound => .missing,
             error.AccessDenied => .permission_denied,
             error.ResumeLost, error.RotatedIncarnationLost, error.PendingRecordMismatch, error.PendingRecordUnavailable => .resume_lost,
@@ -1007,9 +1008,15 @@ pub const Session = struct {
         self.last_failure_domain = null;
         if (self.candidate_source) |candidate| if (!std.mem.eql(u8, candidate, source_id)) return error.PendingRecordMismatch;
         for (self.sources.sources.items, 0..) |source, index| if (std.mem.eql(u8, source.source_id, source_id)) {
-            const pending = (try self.pipe.store.readPendingSource(self.allocator, self.pipe.jail, source_id)) orelse return error.PendingRecordUnavailable;
-            defer pending.deinit(self.allocator);
-            if (!std.mem.eql(u8, &pending.identity.generation, &self.processor.generation)) return error.SourceGenerationMismatch;
+            const pending = try self.pipe.store.readPendingSource(self.allocator, self.pipe.jail, source_id);
+            defer if (pending) |saved| saved.deinit(self.allocator);
+            if (pending) |saved| {
+                if (!std.mem.eql(u8, &saved.identity.generation, &self.processor.generation)) return error.SourceGenerationMismatch;
+            } else {
+                // Failed batch records retain their receipt key after their savepoint rolls back.
+                const held_source = self.candidate_source orelse return error.PendingRecordUnavailable;
+                if (!std.mem.eql(u8, held_source, source_id) or self.pipe.candidate_receipt == null) return error.PendingRecordUnavailable;
+            }
             return self.pollSourceTurn(index);
         };
         return error.PendingSourceMissing;
@@ -1020,6 +1027,10 @@ pub const Session = struct {
                 if (pipeline.Pipeline.sourceLocalIntervention(err)) return self.sourceFailure(state, err);
                 self.last_failure_domain = if (repair.classify(err) == .pending) .pending else .storage;
                 self.blocked_cause = if (pipeline.Pipeline.commitBlocked(err)) err else null;
+                if (err == error.RetryEligibilityPending) {
+                    source.health = .waiting;
+                    self.sources.health = .waiting;
+                }
                 return err;
             }
             return self.sourceFailure(state, err);

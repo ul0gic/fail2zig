@@ -114,6 +114,7 @@ pub const Command = union(enum) {
 
     pub const HistoryArgs = struct {
         jail: ?[]const u8 = null,
+        details: bool = false,
         limit: ?u32 = null,
         cursor: ?[]const u8 = null,
     };
@@ -742,6 +743,10 @@ fn parseHistory(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) E
     while (k < rest.len) : (k += 1) {
         const a = rest[k];
         if (try takeTrailingGlobal(a, rest, &k, globals, diag)) continue;
+        if (std.mem.eql(u8, a, "--details")) {
+            args.details = true;
+            continue;
+        }
         if (std.mem.eql(u8, a, "--jail")) {
             k += 1;
             if (k >= rest.len) {
@@ -995,7 +1000,7 @@ pub const help_top =
     \\    status              Show protection-first daemon status (--details for identifiers/metrics)
     \\    stats               Show the retained enforcement statistics snapshot
     \\    jails               List configured jails with source health (--details for thresholds)
-    \\    list                List active bans (--jail, --origin filters; --details for counts)
+    \\    list                List active bans (--jail, --origin filters; --details for counts and matched lines)
     \\    ban <ip>            Manually ban an address or, with --scope net, a network
     \\    unban <ip>          Manually unban an address or network
     \\    ignore <sub>        Manage per-jail exclusions: add, remove, list
@@ -1214,11 +1219,11 @@ pub const help_list =
     \\    --jail <name>       Filter by jail
     \\    --origin <origin>   Show only bans of one origin: detection, manual or config;
     \\                        config also shows timed banip entries that have expired
-    \\    --details           Include ban counts in table output
+    \\    --details           Include ban counts and retained matched lines
     \\    --sort              Sort by numeric IP address, then jail name
     \\    IPv4 sorts before IPv6; networks sort by address and prefix length.
     \\    Without --sort, the daemon's existing order is preserved.
-    \\    Plain output keeps four columns; expiry 0 means permanent or unknown.
+    \\    Plain output keeps four columns without --details; expiry 0 means permanent or unknown.
     \\    Use JSON for explicit expiry fields.
     \\
 ;
@@ -1277,9 +1282,10 @@ pub const help_history =
     \\fail2zig history — page through confirmed ban history
     \\
     \\USAGE:
-    \\    fail2zig history [--jail <name>] [--limit <n>] [--cursor <token>]
+    \\    fail2zig history [--jail <name>] [--limit <n>] [--cursor <token>] [--details]
     \\
     \\FLAGS:
+    \\    --details           Include retained matched lines (complete in JSON)
     \\    --jail <name>       Only events from this jail
     \\    --limit <n>         Events per page, 1..256 (default: daemon default)
     \\    --cursor <token>    Continue from the next_cursor of a previous page

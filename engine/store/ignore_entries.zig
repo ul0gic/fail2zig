@@ -118,6 +118,14 @@ pub fn Methods(comptime Store: type) type {
             if (!validJail(jail)) return error.InvalidIgnoreEntry;
             try self.beginRead();
             errdefer self.rollback();
+            const count = try self.ignoreEntriesTx(jail, out);
+            try self.commitTransaction();
+            return count;
+        }
+
+        pub fn ignoreEntriesTx(self: *Store, jail: []const u8, out: []RuntimeIgnoreEntry) Error!usize {
+            if (!validJail(jail)) return error.InvalidIgnoreEntry;
+            if (self.api.get_autocommit(self.db) != 0) return error.DatabaseFailure;
             if (self.schema_version < store.latest_schema) return error.UnsupportedSchema;
             var count: usize = 0;
             {
@@ -136,7 +144,6 @@ pub fn Methods(comptime Store: type) type {
                     count += 1;
                 }
             }
-            try self.commitTransaction();
             return count;
         }
 
@@ -172,6 +179,13 @@ pub fn Methods(comptime Store: type) type {
         pub fn ignoreEntryJails(self: *Store, out: []IgnoreJailCount) Error!usize {
             try self.beginRead();
             errdefer self.rollback();
+            const count = try self.ignoreEntryJailsTx(out);
+            try self.commitTransaction();
+            return count;
+        }
+
+        pub fn ignoreEntryJailsTx(self: *Store, out: []IgnoreJailCount) Error!usize {
+            if (self.api.get_autocommit(self.db) != 0) return error.DatabaseFailure;
             if (self.schema_version < store.latest_schema) return error.UnsupportedSchema;
             var count: usize = 0;
             {
@@ -187,7 +201,6 @@ pub fn Methods(comptime Store: type) type {
                     count += 1;
                 }
             }
-            try self.commitTransaction();
             return count;
         }
     };

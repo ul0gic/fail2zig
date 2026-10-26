@@ -91,9 +91,14 @@ pub const StatusPayload = struct {
     expiry_uncertain: ?bool = null,
     next_committed_expiry_us: ?i64 = null,
     paused_sources: ?u32 = null,
+    // Absent on older daemon responses; null means the count is unknown.
+    missing_sources: ?u32 = null,
     state_file_bytes: ?u64 = null,
     state_file_pages: ?u64 = null,
     state_file_max_pages: ?u64 = null,
+    pool_sample_available: ?bool = null,
+    pool_sample_pending: ?bool = null,
+    pool_sample_as_of_us: ?i64 = null,
     pool_tracked: ?u32 = null,
     pool_banned: ?u32 = null,
     pool_tracking_limit: ?u32 = null,
@@ -143,6 +148,7 @@ pub const BanEntry = struct {
     enforced: ?bool = null,
     confirmed: ?bool = null,
     origin: ?[]const u8 = null,
+    matches: ?[]const []const u8 = null,
     expired: ?bool = null,
 };
 
@@ -361,6 +367,10 @@ fn writeStatusPlain(writer: anytype, s: StatusPayload) !void {
     if (s.expiry_uncertain) |uncertain| try writer.print("expiry_uncertain\t{s}\n", .{boolValue(uncertain)});
     if (s.next_committed_expiry_us) |deadline| try writer.print("next_committed_expiry_us\t{d}\n", .{deadline});
     if (s.paused_sources) |count| try writer.print("paused_sources\t{d}\n", .{count});
+    if (s.missing_sources) |count| try writer.print("missing_sources\t{d}\n", .{count});
+    if (s.pool_sample_available) |available| try writer.print("pool_sample_available\t{s}\n", .{boolValue(available)});
+    if (s.pool_sample_pending) |pending| try writer.print("pool_sample_pending\t{s}\n", .{boolValue(pending)});
+    if (s.pool_sample_as_of_us) |as_of| try writer.print("pool_sample_as_of_us\t{d}\n", .{as_of});
     if (s.memory_admission_bytes) |m| try writer.print("memory_admission_bytes\t{d}\n", .{m});
     var footprint_buffer: [96]u8 = undefined;
     if (formatStateFile(&footprint_buffer, s)) |value| try writer.print("state_file\t{s}\n", .{value});
@@ -622,6 +632,11 @@ fn isPaused(source: SourceEntry) bool {
     return std.mem.eql(u8, state, "paused");
 }
 
+fn isMissing(source: SourceEntry) bool {
+    const state = source.state orelse return false;
+    return std.mem.eql(u8, state, "missing");
+}
+
 fn hasLossEvents(source: SourceEntry) bool {
     return (source.loss_events orelse 0) > 0;
 }
@@ -640,6 +655,10 @@ fn pausedValue(buffer: []u8, source: SourceEntry) []const u8 {
     const location = sourceLocation(&location_buffer, source);
     const cause = renderDiagnostic(&cause_buffer, source.cause orelse "unknown");
     return std.fmt.bufPrint(buffer, "{s} ({s})", .{ location, cause }) catch "paused source";
+}
+
+fn missingValue(buffer: []u8, source: SourceEntry) []const u8 {
+    return sourceLocation(buffer, source);
 }
 
 fn utcWithZone(buffer: *[40]u8, wall_us: ?i64) []const u8 {
@@ -688,6 +707,15 @@ fn writeWrapped(writer: anytype, text: []const u8, first_indent: []const u8, res
 
 fn writeSourcesNarrow(writer: anytype, s: StatusPayload, color: Color, columns: usize) !void {
     for (s.sources orelse &.{}) |source| {
+        if (!isMissing(source)) continue;
+        var value_buffer: [512]u8 = undefined;
+        try writer.writeAll("Missing: ");
+        try color.on(writer, Color.yellow);
+        try writeCell(writer, missingValue(&value_buffer, source), @max(@as(usize, 4), columns -| "Missing: ".len));
+        try color.off(writer);
+        try writer.writeByte('\n');
+    }
+    for (s.sources orelse &.{}) |source| {
         if (!isPaused(source)) continue;
         var value_buffer: [512]u8 = undefined;
         try writer.writeAll("Paused: ");
@@ -713,6 +741,11 @@ fn writeSourcesNarrow(writer: anytype, s: StatusPayload, color: Color, columns: 
 
 fn writeSourcesBoxed(writer: anytype, s: StatusPayload, color: Color, width: usize) !void {
     for (s.sources orelse &.{}) |source| {
+        if (!isMissing(source)) continue;
+        var value_buffer: [512]u8 = undefined;
+        try rowLabelStyled(writer, color, Color.yellow, "Missing:", missingValue(&value_buffer, source), width, false);
+    }
+    for (s.sources orelse &.{}) |source| {
         if (!isPaused(source)) continue;
         var value_buffer: [512]u8 = undefined;
         try rowLabelStyled(writer, color, Color.yellow, "Paused:", pausedValue(&value_buffer, source), width, false);
@@ -735,6 +768,7 @@ fn sourcesWidth(s: StatusPayload) usize {
     var used: usize = 0;
     for (s.sources orelse &.{}) |source| {
         var value_buffer: [512]u8 = undefined;
+        if (isMissing(source)) used = @max(used, rowUsed(missingValue(&value_buffer, source)));
         if (isPaused(source)) {
             used = @max(used, rowUsed(pausedValue(&value_buffer, source)));
             if (source.repair) |repair| {
@@ -934,11 +968,12 @@ fn formatStateFile(buffer: []u8, s: StatusPayload) ?[]const u8 {
 }
 
 fn formatTrackingPool(buffer: []u8, s: StatusPayload) ?[]const u8 {
+    if (s.pool_sample_available == false) return std.fmt.bufPrint(buffer, "unknown (sample pending)", .{}) catch null;
     const tracked = s.pool_tracked orelse return null;
     const banned = s.pool_banned orelse return null;
     const tracking_limit = s.pool_tracking_limit orelse return null;
     const ban_limit = s.pool_ban_limit orelse return null;
-    return std.fmt.bufPrint(buffer, "{d} of {d} tracked, {d} of {d} banned", .{ tracked, tracking_limit, banned, ban_limit }) catch null;
+    return std.fmt.bufPrint(buffer, "{d} of {d} tracked, {d} of {d} banned{s}", .{ tracked, tracking_limit, banned, ban_limit, if (s.pool_sample_pending == true) " (sample pending)" else "" }) catch null;
 }
 
 fn rowUsed(value: []const u8) usize {
@@ -1398,7 +1433,7 @@ fn formatListForWidthDetailed(allocator: std.mem.Allocator, writer: anytype, pay
 
             const now = std.time.timestamp();
             if (fmt == .plain) {
-                try writeListPlain(writer, parsed.value, now);
+                try writeListPlain(writer, parsed.value, now, details);
             } else {
                 try writeListTable(writer, parsed.value, color, now, columns, details);
             }
@@ -1411,16 +1446,21 @@ fn remainingFromExpiry(ban_expiry: ?i64, now: i64) ?i64 {
     return std.math.sub(i64, exp, now) catch if (exp < now) std.math.minInt(i64) else std.math.maxInt(i64);
 }
 
-fn writeListPlain(writer: anytype, entries: []const BanEntry, now: i64) !void {
+fn writeListPlain(writer: anytype, entries: []const BanEntry, now: i64, details: bool) !void {
     for (entries) |e| {
         var ip_buffer: [diagnostic_max_bytes]u8 = undefined;
         var jail_buffer: [diagnostic_max_bytes]u8 = undefined;
-        try writer.print("{s}\t{s}\t{d}\t{d}\n", .{
+        try writer.print("{s}\t{s}\t{d}\t{d}", .{
             if (e.ip) |ip| renderDiagnostic(&ip_buffer, ip) else "-",
             if (e.jail) |jail| renderDiagnostic(&jail_buffer, jail) else "-",
             remainingFromExpiry(e.ban_expiry, now) orelse 0,
             e.ban_count orelse 0,
         });
+        if (details) {
+            var matched: [diagnostic_max_bytes]u8 = undefined;
+            try writer.print("\t{s}", .{matchedText(&matched, e.matches)});
+        }
+        try writer.writeAll("\n");
     }
 }
 
@@ -1445,12 +1485,12 @@ fn writeListTable(writer: anytype, entries: []const BanEntry, color: Color, now:
     const count_col = colWidth("BAN COUNT", count_w);
     const confirmation_col = colWidth("CONFIRMATION", confirmation_w);
     const full_width = ip_col + jail_col + origin_col + time_col + confirmation_col + if (details) count_col else 0;
-    if (full_width <= columns) return writeListColumns(writer, entries, color, now, ip_col, jail_col, origin_col, time_col, confirmation_col, count_col, details);
-    if (columns >= 76) return writeListColumns(writer, entries, color, now, 25, 16, 10, 12, 13, 0, false);
-    try writeListStacked(writer, entries, color, now, columns);
+    if (full_width <= columns) return writeListColumns(writer, entries, color, now, ip_col, jail_col, origin_col, time_col, confirmation_col, count_col, details, columns, details);
+    if (columns >= 76) return writeListColumns(writer, entries, color, now, 25, 16, 10, 12, 13, 0, false, columns, details);
+    try writeListStacked(writer, entries, color, now, columns, details);
 }
 
-fn writeListColumns(writer: anytype, entries: []const BanEntry, color: Color, now: i64, ip_col: usize, jail_col: usize, origin_col: usize, time_col: usize, confirmation_col: usize, count_col: usize, include_count: bool) !void {
+fn writeListColumns(writer: anytype, entries: []const BanEntry, color: Color, now: i64, ip_col: usize, jail_col: usize, origin_col: usize, time_col: usize, confirmation_col: usize, count_col: usize, include_count: bool, columns: usize, details: bool) !void {
     try color.on(writer, Color.bold);
     try padRightPrint(writer, "IP ADDRESS", ip_col);
     try padRightPrint(writer, "JAIL", jail_col);
@@ -1482,12 +1522,13 @@ fn writeListColumns(writer: anytype, entries: []const BanEntry, color: Color, no
         try color.off(writer);
         if (include_count) try writeCell(writer, formatOptU32Local(e.ban_count), count_col);
         try writer.writeAll("\n");
+        if (details) try writeMatchedLine(writer, e.matches, columns);
     }
 
     try writer.print("Total: {d} active bans\n", .{entries.len});
 }
 
-fn writeListStacked(writer: anytype, entries: []const BanEntry, color: Color, now: i64, columns: usize) !void {
+fn writeListStacked(writer: anytype, entries: []const BanEntry, color: Color, now: i64, columns: usize, details: bool) !void {
     const value_width = @max(@as(usize, 4), columns -| "CONFIRMATION: ".len);
     for (entries, 0..) |e, index| {
         var ip_buffer: [diagnostic_max_bytes]u8 = undefined;
@@ -1507,8 +1548,63 @@ fn writeListStacked(writer: anytype, entries: []const BanEntry, color: Color, no
         try writer.writeAll("\nCONFIRMATION: ");
         try writeCell(writer, confirmationText(e), value_width);
         try writer.writeAll("\n");
+        if (details) try writeMatchedLine(writer, e.matches, columns);
     }
     try writer.print("Total: {d} active bans\n", .{entries.len});
+}
+
+fn matchedText(buffer: []u8, matches: ?[]const []const u8) []const u8 {
+    if (matches) |lines| if (lines.len != 0) return renderDiagnostic(buffer, lines[0]);
+    return if (buffer.len != 0) "-" else "";
+}
+
+fn writeMatchedChunk(writer: anytype, chunk: []const u8, width: usize, continuation: []const u8, column: *usize) !void {
+    if (chunk.len > width - column.*) {
+        try writer.writeAll("\n");
+        try writer.writeAll(continuation);
+        column.* = continuation.len;
+    }
+    try writer.writeAll(chunk);
+    column.* += chunk.len;
+}
+
+fn writeMatchedLine(writer: anytype, matches: ?[]const []const u8, columns: usize) !void {
+    var buffered = std.io.BufferedWriter(256, @TypeOf(writer)){ .unbuffered_writer = writer };
+    const out = buffered.writer();
+    const label = "  Matched: ";
+    const wide = columns >= label.len + 4;
+    const width = @max(columns, 4);
+    const continuation: []const u8 = if (wide) "  " else "";
+    if (wide) {
+        try out.writeAll(label);
+    } else {
+        try out.writeAll(if (columns >= 2) "M:\n" else "M\n");
+    }
+    var column: usize = if (wide) label.len else 0;
+    if (matches) |lines| if (lines.len != 0) {
+        const line = lines[0];
+        var unit_buffer: [16]u8 = undefined;
+        var index: usize = 0;
+        while (index < line.len) {
+            const unit = diagnosticUnit(line[index..]);
+            emitUnit(unit_buffer[0..unit.output_len], line[index..][0..unit.input_len], unit);
+            if (unit.kind == .hex and unit.input_len > 1) {
+                // Keep each byte escape intact even when the escaped codepoint wraps.
+                var offset: usize = 0;
+                while (offset < unit.output_len) : (offset += 4) {
+                    try writeMatchedChunk(out, unit_buffer[offset..][0..4], width, continuation, &column);
+                }
+            } else {
+                try writeMatchedChunk(out, unit_buffer[0..unit.output_len], width, continuation, &column);
+            }
+            index += unit.input_len;
+        }
+        try out.writeAll("\n");
+        try buffered.flush();
+        return;
+    };
+    try out.writeAll("-\n");
+    try buffered.flush();
 }
 
 fn banExpiryText(entry: BanEntry, now: i64) []const u8 {
@@ -2164,6 +2260,7 @@ const IgnoreListEntry = struct {
 const IgnoreListJail = struct {
     jail: []const u8 = "",
     count: u32 = 0,
+    limit: ?u32 = null,
     ignore_file: ?[]const u8 = null,
     entries: []const IgnoreListEntry = &.{},
 };
@@ -2642,9 +2739,10 @@ fn writeIgnoreListTable(writer: anytype, p: IgnoreListPayload, color: Color, jai
         try writer.writeAll(".\n");
     }
     for (p.jails) |jail| {
-        if (jail.count <= p.limit) continue;
+        const limit = jail.limit orelse p.limit;
+        if (jail.count <= limit) continue;
         try printEscaped(writer, "Jail {} has ", .{jail.jail});
-        try writer.print("{d} ignore entries, above the limit of {d}, after a configuration change. Adds are refused until it is at or below {d}.\n", .{ jail.count, p.limit, p.limit });
+        try writer.print("{d} ignore entries, above the limit of {d}, after a configuration change. Adds are refused until it is at or below {d}.\n", .{ jail.count, limit, limit });
     }
     if (p.redacted) try writer.writeAll("Addresses are redacted unless the caller is an administrator.\n");
 }
@@ -2725,6 +2823,7 @@ pub const HistoryEntry = struct {
     scope: ?ScopeView = null,
     native_retry: ?bool = null,
     origin: ?[]const u8 = null,
+    matches: ?[]const []const u8 = null,
 };
 
 pub const HistoryPayload = struct {
@@ -2815,6 +2914,10 @@ pub fn formatScopes(allocator: std.mem.Allocator, writer: anytype, payload_json:
 
 pub fn formatHistory(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color) !void {
     return formatQuery(HistoryPayload, "history", writeHistoryPlain, writeHistoryTable, allocator, writer, payload_json, fmt, color);
+}
+
+pub fn formatHistoryDetailed(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color) !void {
+    return formatQuery(HistoryPayload, "history", writeHistoryPlainDetailed, writeHistoryTableDetailed, allocator, writer, payload_json, fmt, color);
 }
 
 pub fn formatFirewall(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color) !void {
@@ -3131,6 +3234,14 @@ fn writePageFooter(writer: anytype, generation: ?[]const u8, next_cursor: ?[]con
 }
 
 fn writeHistoryPlain(writer: anytype, p: HistoryPayload) !void {
+    return writeHistoryPlainWithDetails(writer, p, false);
+}
+
+fn writeHistoryPlainDetailed(writer: anytype, p: HistoryPayload) !void {
+    return writeHistoryPlainWithDetails(writer, p, true);
+}
+
+fn writeHistoryPlainWithDetails(writer: anytype, p: HistoryPayload, details: bool) !void {
     try plainOpt(writer, "generation", p.generation);
     for (p.items orelse &.{}, 0..) |it, i| {
         var key: [64]u8 = undefined;
@@ -3143,11 +3254,23 @@ fn writeHistoryPlain(writer: anytype, p: HistoryPayload) !void {
         try plainBool(writer, try itemKey(&key, i, "native_retry"), it.native_retry);
         try plainOpt(writer, try itemKey(&key, i, "decision_id"), it.decision_id_hex);
         try plainOpt(writer, try itemKey(&key, i, "event_id"), it.event_id_hex);
+        if (details) {
+            var matched: [diagnostic_max_bytes]u8 = undefined;
+            try plainOpt(writer, try itemKey(&key, i, "matches"), matchedText(&matched, it.matches));
+        }
     }
     try plainOpt(writer, "next_cursor", p.next_cursor);
 }
 
 fn writeHistoryTable(writer: anytype, p: HistoryPayload, color: Color) !void {
+    return writeHistoryTableWithDetails(writer, p, color, false);
+}
+
+fn writeHistoryTableDetailed(writer: anytype, p: HistoryPayload, color: Color) !void {
+    return writeHistoryTableWithDetails(writer, p, color, true);
+}
+
+fn writeHistoryTableWithDetails(writer: anytype, p: HistoryPayload, color: Color, details: bool) !void {
     const items = p.items orelse &.{};
     if (items.len == 0) {
         try writer.writeAll("No confirmed history.\n");
@@ -3193,6 +3316,7 @@ fn writeHistoryTable(writer: anytype, p: HistoryPayload, color: Color) !void {
             try padRightPrint(writer, boolStr(it.native_retry), 7);
             try padRightPrint(writer, shortHex(it.decision_id_hex), 13);
             try writer.writeAll("\n");
+            if (details) try writeMatchedLine(writer, it.matches, terminalColumns());
         }
         try writer.print("Total: {d} events\n", .{items.len});
     }

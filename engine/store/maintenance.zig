@@ -269,9 +269,13 @@ pub fn Methods(comptime Store: type) type {
             if (count < 0 or count > max_native_detections) return error.InvalidRecord;
             return @intCast(count);
         }
+        fn recordGroupRows(self: *Store, jail: []const u8, source: []const u8, occurrence: []const u8) Error!usize {
+            var rows = 1 + try self.countRecordChildren(jail, source, occurrence, "record_detections") + try self.countRecordChildren(jail, source, occurrence, "retry_decisions");
+            if (self.schema_version >= 18) rows += try self.countRecordChildren(jail, source, occurrence, "retry_decision_escalations");
+            return rows;
+        }
         fn deleteRecordGroup(self: *Store, jail: []const u8, source: []const u8, occurrence_view: []const u8, budget: usize) Error!?usize {
-            var group_rows = 1 + try self.countRecordChildren(jail, source, occurrence_view, "record_detections") + try self.countRecordChildren(jail, source, occurrence_view, "retry_decisions");
-            if (self.schema_version >= 18) group_rows += try self.countRecordChildren(jail, source, occurrence_view, "retry_decision_escalations");
+            const group_rows = try self.recordGroupRows(jail, source, occurrence_view);
             if (group_rows > budget) return null;
             var occurrence_buffer: [16384]u8 = undefined;
             @memcpy(occurrence_buffer[0..occurrence_view.len], occurrence_view);
@@ -307,6 +311,123 @@ pub fn Methods(comptime Store: type) type {
             }
             if (deleted != group_rows) return error.InvalidMaintenanceState;
             return deleted;
+        }
+        pub const RetiredRecordProgress = struct { examined: u16 = 0, deleted_rows: u16 = 0, done: bool = false };
+        pub fn retireRecordGroupsTx(self: *Store, intent: Store.JailRetirementIntent, max_rows: u8, clock: effects.Clock) Error!RetiredRecordProgress {
+            if (self.api.get_autocommit(self.db) != 0) return error.DatabaseFailure;
+            if (max_rows == 0 or max_rows > 64) return error.InvalidEffect;
+            const jail = intent.jail.slice();
+            const current_intent = try self.jailRetirement(jail) orelse return error.StaleEffect;
+            if (current_intent.keep_ignore_deadlines != intent.keep_ignore_deadlines) return error.StaleEffect;
+            _ = try self.maintenanceRevision();
+            const now = try self.cleanupClock(clock);
+            var source_buffer: [Limits.source_bytes]u8 = undefined;
+            var occurrence_buffer: [16384]u8 = undefined;
+            var cursor_buffer: [Limits.cursor_bytes]u8 = undefined;
+            const Guard = struct { generation: effects.Hash, identity: effects.Hash, receipt: ?i64, sequence: u64 };
+            var progress: RetiredRecordProgress = .{};
+            var keys: usize = 0;
+            while (progress.examined < max_rows and progress.deleted_rows < max_rows) {
+                var found = false;
+                var attached = false;
+                var id: ReceiptIdentity = undefined;
+                var receipt: ?i64 = undefined;
+                var sequence: u64 = undefined;
+                var guard: ?Guard = null;
+                var fence: CleanupFence = undefined;
+                for ([_][:0]const u8{
+                    "SELECT occurrence,raw_hash,cursor,receipt_us,receipt_generation,source,source_generation,source_sequence FROM records INDEXED BY records_source_order WHERE jail=?1 AND source_sequence IS NOT NULL ORDER BY source,source_generation,source_sequence LIMIT 1;",
+                    "SELECT occurrence,raw_hash,cursor,receipt_us,receipt_generation,source,source_generation,source_sequence FROM records WHERE jail=?1 ORDER BY source,occurrence LIMIT 1;",
+                }, 0..) |sql, selector| {
+                    var row = try self.statement(sql);
+                    defer row.deinit();
+                    try row.text(1, jail);
+                    if (!try row.row()) continue;
+                    attached = selector == 0;
+                    if (self.api.column_type(row.ptr, 0) != 3 or self.api.column_type(row.ptr, 5) != 3) return error.InvalidMaintenanceState;
+                    const source_view = try row.boundedBytes(5, Limits.source_bytes);
+                    const occurrence_view = try row.boundedBytes(0, occurrence_buffer.len);
+                    @memcpy(source_buffer[0..source_view.len], source_view);
+                    @memcpy(occurrence_buffer[0..occurrence_view.len], occurrence_view);
+                    const source = source_buffer[0..source_view.len];
+                    const occurrence = occurrence_buffer[0..occurrence_view.len];
+                    const occurrence_key = Store.occurrenceGuardKey(occurrence);
+                    {
+                        var saved = try self.statement("SELECT generation,identity_key,receipt_us,source_sequence FROM replay_guards WHERE jail=?1 AND source=?2 AND occurrence_key=?3;");
+                        defer saved.deinit();
+                        try saved.text(1, jail);
+                        try saved.text(2, source);
+                        try saved.blob(3, &occurrence_key);
+                        if (try saved.row()) {
+                            const saved_sequence = try saved.signed(3);
+                            if (saved_sequence <= 0) return error.InvalidMaintenanceState;
+                            guard = .{ .generation = try Store.effectBlob(&saved, 0, 32), .identity = try Store.effectBlob(&saved, 1, 32), .receipt = try saved.optionalSigned(2), .sequence = @intCast(saved_sequence) };
+                        }
+                    }
+                    const generation = if (attached) try Store.effectBlob(&row, 6, 32) else blk: {
+                        if (self.api.column_type(row.ptr, 6) != 5 or self.api.column_type(row.ptr, 7) != 5) return error.InvalidMaintenanceState;
+                        break :blk (guard orelse return error.ConsumerMigrationRequired).generation;
+                    };
+                    if (attached) {
+                        const saved_sequence = try row.signed(7);
+                        if (saved_sequence <= 0) return error.InvalidMaintenanceState;
+                        sequence = @intCast(saved_sequence);
+                    } else sequence = guard.?.sequence;
+                    fence = .{ .jail = jail, .source = source, .generation = generation, .jail_revision = 0, .consumer_revision = 0, .effect_revision = 0, .clock = clock };
+                    id = try orderedIdentity(&row, fence);
+                    @memcpy(cursor_buffer[0..id.cursor.len], id.cursor);
+                    id.occurrence = occurrence;
+                    id.cursor = cursor_buffer[0..id.cursor.len];
+                    receipt = try row.optionalSigned(3);
+                    found = true;
+                    break;
+                }
+                if (!found) {
+                    progress.done = true;
+                    break;
+                }
+                progress.examined += 1;
+                const state = try self.sourceMaintenance(jail, id.source, id.generation) orelse return error.InvalidMaintenanceState;
+                if (attached) {
+                    if (sequence != state.sweep_sequence + 1 or sequence > state.head_sequence or sequence > state.reject_below_sequence) return error.InvalidMaintenanceState;
+                } else if (sequence > state.sweep_sequence or sequence >= state.reject_below_sequence) return error.InvalidMaintenanceState;
+                if (sequence < state.reject_below_sequence) {
+                    const saved = guard orelse return error.InvalidMaintenanceState;
+                    const identity_key = Store.identityGuardKey(id);
+                    if (saved.sequence != sequence or !std.mem.eql(u8, &saved.generation, &id.generation) or
+                        !std.mem.eql(u8, &saved.identity, &identity_key) or saved.receipt != receipt) return error.OccurrenceConflict;
+                } else if (guard != null) return error.InvalidMaintenanceState;
+                {
+                    var action = try self.statement("SELECT 1 FROM action_intents WHERE jail=?1 AND source=?2 AND occurrence=?3 LIMIT 1;");
+                    defer action.deinit();
+                    try action.text(1, jail);
+                    try action.text(2, id.source);
+                    try action.text(3, id.occurrence);
+                    if (try action.row()) return error.MaintenancePinned;
+                }
+                const group_rows = try self.recordGroupRows(jail, id.source, id.occurrence);
+                const bytes = jail.len + id.source.len + id.occurrence.len + id.cursor.len + 64;
+                if (bytes > 1024 * 1024 - keys or (progress.deleted_rows != 0 and group_rows > max_rows - progress.deleted_rows)) break;
+                if (attached and sequence == state.reject_below_sequence) {
+                    try self.insertReplayGuard(id, receipt, sequence);
+                    try self.fault(.after_replay_guard);
+                }
+                progress.deleted_rows += @intCast(try self.deleteRecordGroup(jail, id.source, id.occurrence, group_rows) orelse return error.InvalidMaintenanceState);
+                if (attached) {
+                    var next = state;
+                    next.sweep_sequence = sequence;
+                    next.reject_below_sequence = @max(state.reject_below_sequence, sequence + 1);
+                    next.cleanup_revision = std.math.add(u64, state.cleanup_revision, 1) catch return error.StorageLimit;
+                    try self.updateCleanupState(fence, state, next);
+                    try self.fault(.after_cleanup_mark);
+                }
+                keys += bytes;
+            }
+            if (progress.deleted_rows != 0) {
+                try self.finishCleanupClock(clock, now);
+                try self.fault(.before_cleanup_commit);
+            }
+            return progress;
         }
         fn detachRecord(self: *Store, fence: CleanupFence, occurrence: []const u8) Error!void {
             var row = try self.statement("UPDATE records SET source_generation=NULL,source_sequence=NULL WHERE jail=?1 AND source=?2 AND occurrence=?3;");
@@ -424,39 +545,36 @@ pub fn Methods(comptime Store: type) type {
             try self.commitTransaction();
             return .{ .deleted_rows = @intCast(deleted), .more = next.sweep_sequence + 1 < next.reject_below_sequence, .state = next };
         }
-        pub const RetryRetirementCandidate = struct { subject: detection.Subject, last_processed_us: i64, decisions: u64 };
+        pub const RetryRetirementCandidate = struct { subject: detection.Subject, last_processed_us: i64, decisions: u64, lease: retry.Lease };
         pub fn retryRetirementCandidate(self: *Store, jail: []const u8, after: ?detection.Subject) Error!?RetryRetirementCandidate {
             _ = try self.maintenanceRevision();
             try Store.maintenanceKey(jail, "@retired");
-            var row = try self.statement(if (after == null)
-                "SELECT family,subject,last_processed_us,decisions FROM retry_states WHERE jail=?1 ORDER BY family,subject LIMIT 1;"
+            // Eligibility stays outside WHERE so every returned raw PK successor spends an examination.
+            var row = try self.statement(if (self.schema_version >= 16)
+                (if (after == null)
+                    "SELECT family,subject,last_processed_us,decisions,lease_kind,deadline_us FROM retry_states WHERE jail=?1 ORDER BY family,subject LIMIT 1;"
+                else
+                    "SELECT family,subject,last_processed_us,decisions,lease_kind,deadline_us FROM retry_states WHERE jail=?1 AND (family,subject)>(?2,?3) ORDER BY family,subject LIMIT 1;")
             else
-                "SELECT family,subject,last_processed_us,decisions FROM retry_states WHERE jail=?1 AND (family,subject)>(?2,?3) ORDER BY family,subject LIMIT 1;");
+                (if (after == null)
+                    "SELECT family,subject,last_processed_us,decisions,CASE WHEN expiry_us IS NULL THEN 0 ELSE 1 END,expiry_us FROM retry_states WHERE jail=?1 ORDER BY family,subject LIMIT 1;"
+                else
+                    "SELECT family,subject,last_processed_us,decisions,CASE WHEN expiry_us IS NULL THEN 0 ELSE 1 END,expiry_us FROM retry_states WHERE jail=?1 AND (family,subject)>(?2,?3) ORDER BY family,subject LIMIT 1;"));
             defer row.deinit();
             try row.text(1, jail);
             if (after) |*subject| try Store.bindSubject(&row, subject);
             if (!try row.row()) return null;
             const decisions = try row.signed(3);
             if (decisions < 0) return error.InvalidRetryState;
-            return .{ .subject = try self.decodeRetrySubject(&row, 0, 1), .last_processed_us = try row.signed(2), .decisions = @intCast(decisions) };
-        }
-        pub fn retirableSubject(self: *Store, jail: []const u8, after: ?detection.Subject, now_us: i64, window_us: i64) Error!?RetryRetirementCandidate {
-            if (self.schema_version < 16) return self.retryRetirementCandidate(jail, after);
-            _ = try self.maintenanceRevision();
-            try Store.maintenanceKey(jail, "@retired");
-            var row = try self.statement(if (after == null)
-                "SELECT family,subject,last_processed_us,decisions FROM retry_states WHERE jail=?1 AND (lease_kind=0 OR deadline_us<=?4) AND last_processed_us<?5 ORDER BY family,subject LIMIT 1;"
-            else
-                "SELECT family,subject,last_processed_us,decisions FROM retry_states WHERE jail=?1 AND (family,subject)>(?2,?3) AND (lease_kind=0 OR deadline_us<=?4) AND last_processed_us<?5 ORDER BY family,subject LIMIT 1;");
-            defer row.deinit();
-            try row.text(1, jail);
-            if (after) |*subject| try Store.bindSubject(&row, subject);
-            try row.int(4, now_us);
-            try row.int(5, now_us -| window_us);
-            if (!try row.row()) return null;
-            const decisions = try row.signed(3);
-            if (decisions < 0) return error.InvalidRetryState;
-            return .{ .subject = try self.decodeRetrySubject(&row, 0, 1), .last_processed_us = try row.signed(2), .decisions = @intCast(decisions) };
+            const kind = try row.signed(4);
+            const deadline = try row.optionalSigned(5);
+            const lease: retry.Lease = switch (kind) {
+                0 => if (deadline == null) .absent else return error.InvalidRetryState,
+                1 => .{ .finite = deadline orelse return error.InvalidRetryState },
+                2 => if (deadline == null) .permanent else return error.InvalidRetryState,
+                else => return error.InvalidRetryState,
+            };
+            return .{ .subject = try self.decodeRetrySubject(&row, 0, 1), .last_processed_us = try row.signed(2), .decisions = @intCast(decisions), .lease = lease };
         }
         fn checkRetirementFence(self: *Store, fence: CleanupFence) Error!i64 {
             _ = try self.maintenanceRevision();
@@ -520,9 +638,41 @@ pub fn Methods(comptime Store: type) type {
         }
         pub const max_retirement_batch = Store.attribution_batch;
         const retirement_examinations_per_slot: usize = 4;
-        pub const RetirementBatch = struct { examined: usize = 0, retired: usize = 0, pinned_state: usize = 0, pinned_effect: usize = 0, last: ?detection.Subject = null, exhausted: bool = false };
+        pub const RetirementBatch = struct {
+            examined: usize = 0,
+            retired: usize = 0,
+            pinned_state: usize = 0,
+            pinned_effect: usize = 0,
+            last: ?detection.Subject = null,
+            exhausted: bool = false,
+            next_check_us: ?i64 = null,
+            retry_revision: u64 = 0,
+            effect_revision: u64 = 0,
+            yielded: bool = false,
+        };
         pub fn retireRetrySubjects(self: *Store, fence: CleanupFence, after: ?detection.Subject, now_us: i64, window_us: i64, max: usize) Error!RetirementBatch {
             if (max == 0 or max > max_retirement_batch) return error.InvalidRetryState;
+            const prior_rollback = self.rollback_error_code;
+            self.rollback_error_code = null;
+            const batch = self.retireRetrySubjectsTx(fence, after, now_us, window_us, max) catch |failure| {
+                // The transaction helper has already rolled back before an interruption can yield.
+                const clean = !self.reopen_required and self.rollback_error_code == null and self.api.get_autocommit(self.db) != 0;
+                if (self.rollback_error_code == null) self.rollback_error_code = prior_rollback;
+                if (failure != error.Interrupted or !clean) return failure;
+                if (max <= 1) return error.MaintenanceWorkExhausted;
+                return .{ .yielded = true };
+            };
+            if (self.rollback_error_code == null) self.rollback_error_code = prior_rollback;
+            return batch;
+        }
+        fn retirementNextCheck(candidate: RetryRetirementCandidate, window_us: i64) ?i64 {
+            if (candidate.lease == .permanent) return null;
+            // Strict age eligibility needs the first microsecond after the complete retained window.
+            var next = @as(i128, candidate.last_processed_us) + @as(i128, window_us) + 1;
+            if (candidate.lease == .finite) next = @max(next, @as(i128, candidate.lease.finite));
+            return std.math.cast(i64, next);
+        }
+        fn retireRetrySubjectsTx(self: *Store, fence: CleanupFence, after: ?detection.Subject, now_us: i64, window_us: i64, max: usize) Error!RetirementBatch {
             try self.beginWrite();
             errdefer self.rollback();
             const now = try self.checkRetirementFence(fence);
@@ -530,24 +680,33 @@ pub fn Methods(comptime Store: type) type {
             var batch = RetirementBatch{};
             var cursor = after;
             while (batch.retired < max and batch.examined < max * retirement_examinations_per_slot) {
-                const candidate = (try self.retirableSubject(fence.jail, cursor, now_us, window_us)) orelse {
+                const candidate = (try self.retryRetirementCandidate(fence.jail, cursor)) orelse {
                     batch.exhausted = true;
                     break;
                 };
                 cursor = candidate.subject;
                 batch.last = candidate.subject;
                 batch.examined += 1;
-                switch (try self.retireOneTx(fence, admission.policy, candidate, now)) {
+                const outcome = if (candidate.last_processed_us >= now_us -| window_us or candidate.lease.live(now_us))
+                    Retirement.pinned_state
+                else
+                    try self.retireOneTx(fence, admission.policy, candidate, now);
+                switch (outcome) {
                     .retired => batch.retired += 1,
-                    .pinned_state => batch.pinned_state += 1,
+                    .pinned_state => {
+                        batch.pinned_state += 1;
+                        if (retirementNextCheck(candidate, window_us)) |next| {
+                            batch.next_check_us = if (batch.next_check_us) |prior| @min(prior, next) else next;
+                        }
+                    },
                     .pinned_effect => batch.pinned_effect += 1,
                 }
             }
-            if (batch.retired == 0) {
-                try self.commitTransaction();
-                return batch;
-            }
-            try self.finishRetirementTx(fence, now);
+            if (batch.retired != 0) try self.finishRetirementTx(fence, now);
+            const retry_revision = try self.integer("SELECT revision FROM policy_summary_clock WHERE id=1;");
+            if (retry_revision <= 0) return error.InvalidPolicySummary;
+            batch.retry_revision = @intCast(retry_revision);
+            batch.effect_revision = try self.maintenanceEffectRevision();
             try self.commitTransaction();
             return batch;
         }
@@ -562,6 +721,7 @@ pub fn Methods(comptime Store: type) type {
         }
         const Retirement = enum { retired, pinned_state, pinned_effect };
         fn retireOneTx(self: *Store, fence: CleanupFence, policy: retry.Policy, candidate: RetryRetirementCandidate, now: i64) Error!Retirement {
+            try self.requireRetryProjectionMutationTx();
             if (try self.readRetired(fence.jail, candidate.subject) != null) return error.StaleMaintenance;
             const state = try self.readRetryState(fence.jail, candidate.subject, policy) orelse return error.StaleMaintenance;
             if (state.last_processed_us != candidate.last_processed_us or state.decisions != candidate.decisions) return error.StaleMaintenance;
@@ -584,6 +744,8 @@ pub fn Methods(comptime Store: type) type {
             try remove.done();
             self.deletedRows(.retry_states);
             if (self.api.changes(self.db) != 1) return error.StaleMaintenance;
+            try self.removeRetryProjectionRowTx(fence.jail, &candidate.subject);
+            try self.changeRetryJailSummaryTx(fence.jail, 0, 0);
             return .retired;
         }
 
@@ -805,7 +967,7 @@ pub fn Methods(comptime Store: type) type {
             try token.validate();
             return token;
         }
-        fn confirmedEffectPageTx(self: *Store, installation: effects.Installation, after: u64, expected_revision: ?u64, output: []effect_history.Event) Error!effect_history.Page {
+        pub fn confirmedEffectPageTx(self: *Store, installation: effects.Installation, after: u64, expected_revision: ?u64, output: []effect_history.Event) Error!effect_history.Page {
             if (output.len == 0 or output.len > effect_history.max_page) return error.InvalidHistoryPage;
             var token = try self.historyHead(installation, after);
             if (expected_revision) |wanted_revision| if (wanted_revision != token.stream_revision) return error.StaleHistoryPage;
@@ -846,6 +1008,85 @@ pub fn Methods(comptime Store: type) type {
             const page = try self.confirmedEffectPageTx(installation, after_sequence, expected_revision, output);
             try self.commitTransaction();
             return page;
+        }
+
+        // The caller owns the read transaction and all returned line allocations.
+        pub fn retainedMatchesForEventsTx(self: *Store, allocator: std.mem.Allocator, installation: effects.Installation, events: []const effect_history.Event, output: []?[]u8) Error!void {
+            if (output.len > effect_history.max_page) return error.InvalidApplicationHistoryQuery;
+            @memset(output, null);
+            if (events.len != output.len or events.len > effect_history.max_page or self.api.get_autocommit(self.db) != 0 or self.schema_version < store.load_repair_schema) return error.InvalidApplicationHistoryQuery;
+            installation.validate() catch return error.InvalidApplicationHistoryQuery;
+            errdefer clearRetainedMatches(allocator, output);
+            for (events, output) |*event, *line| {
+                try event.validate();
+                if (!std.meta.eql(event.installation, installation)) return error.InvalidApplicationHistoryQuery;
+                line.* = try self.retainedEventMatchTx(allocator, installation, event.scope_key, event.scope, event.jail.slice(), event.decision_id, event.confirmed_us);
+            }
+        }
+
+        pub fn retainedMatchesForOwnersTx(self: *Store, allocator: std.mem.Allocator, installation: effects.Installation, now_us: i64, owners: []const Store.OperatorOwner, output: []?[]u8) Error!void {
+            if (output.len > effect_history.max_page) return error.InvalidApplicationHistoryQuery;
+            @memset(output, null);
+            if (owners.len != output.len or owners.len > effects.max_page or self.api.get_autocommit(self.db) != 0 or self.schema_version < store.load_repair_schema) return error.InvalidApplicationHistoryQuery;
+            installation.validate() catch return error.InvalidApplicationHistoryQuery;
+            errdefer clearRetainedMatches(allocator, output);
+            for (owners, output) |*owner, *line| {
+                const key = try owner.scope.key(installation);
+                if (owner.jail.len == 0 or owner.jail.len > owner.jail.bytes.len) return error.InvalidApplicationHistoryQuery;
+                const jail = detection.Name.init(owner.jail.slice()) catch return error.InvalidApplicationHistoryQuery;
+                if (!std.mem.eql(u8, &key, &owner.key) or !std.meta.eql(jail, owner.jail)) return error.InvalidApplicationHistoryQuery;
+                var current = try self.statement("SELECT o.decision_id,o.lease_kind,o.deadline_us,n.canonical_scope FROM effect_owners o JOIN native_effects n USING(scope_key) WHERE o.scope_key=?1 AND o.jail=?2;");
+                defer current.deinit();
+                try current.blob(1, &owner.key);
+                try current.text(2, owner.jail.slice());
+                if (!try current.row()) continue;
+                const scope = try self.decodeStoredScope(&current, 3);
+                const stored_key = try scope.key(installation);
+                if (!std.mem.eql(u8, &stored_key, &owner.key)) return error.InvalidApplicationHistoryRow;
+                const decision_id = try Store.effectBlob(&current, 0, 32);
+                const lease = try Store.effectLease(&current, 1, 2);
+                if (!std.mem.eql(u8, &decision_id, &owner.decision_id) or !lease.live(now_us) or !std.meta.eql(lease, owner.lease)) continue;
+                line.* = try self.retainedEventMatchTx(allocator, installation, owner.key, owner.scope, owner.jail.slice(), owner.decision_id, null);
+            }
+        }
+
+        fn clearRetainedMatches(allocator: std.mem.Allocator, output: []?[]u8) void {
+            for (output) |*line| {
+                if (line.*) |value| allocator.free(value);
+                line.* = null;
+            }
+        }
+
+        fn retainedEventMatchTx(self: *Store, allocator: std.mem.Allocator, installation: effects.Installation, key: effects.Hash, scope: effects.Scope, jail: []const u8, decision_id: effects.Hash, confirmed_us: ?i64) Error!?[]u8 {
+            var row = try self.statement("SELECT e.event_id,e.scope_key,e.canonical_scope,e.jail,e.decision_id,e.confirmed_us,d.event_id,d.evidence FROM confirmed_effect_events e LEFT JOIN confirmed_event_details d ON d.event_id=e.event_id WHERE e.scope_key=?1 AND e.jail=?2 AND e.decision_id=?3;");
+            defer row.deinit();
+            try row.blob(1, &key);
+            try row.text(2, jail);
+            try row.blob(3, &decision_id);
+            if (!try row.row()) return null;
+            const stored_scope = try self.decodeStoredScope(&row, 2);
+            const stored_key = try stored_scope.key(installation);
+            const expected_scope = try scope.encodeCanonical();
+            const actual_scope = try stored_scope.encodeCanonical();
+            const event_id = effects.hashParts("fail2zig-native-confirmed-owner-v1", &.{ &installation.id, &key, jail, &decision_id });
+            if (!std.mem.eql(u8, &stored_key, &key) or !std.mem.eql(u8, &expected_scope, &actual_scope) or
+                !std.mem.eql(u8, &event_id, &try Store.effectBlob(&row, 0, 32)) or
+                !std.mem.eql(u8, &key, &try Store.effectBlob(&row, 1, 32)) or
+                !std.mem.eql(u8, &decision_id, &try Store.effectBlob(&row, 4, 32))) return error.InvalidApplicationHistoryRow;
+            if (self.api.column_type(row.ptr, 3) != 3 or !std.mem.eql(u8, jail, try row.boundedBytes(3, 64))) return error.InvalidApplicationHistoryRow;
+            const stored_us = try row.signed(5);
+            if (confirmed_us) |expected| if (stored_us != expected) return error.InvalidApplicationHistoryRow;
+            if (self.api.column_type(row.ptr, 6) == 5) {
+                if (self.api.column_type(row.ptr, 7) != 5) return error.InvalidApplicationHistoryRow;
+                return null;
+            }
+            if (!std.mem.eql(u8, &event_id, &try Store.effectBlob(&row, 6, 32))) return error.InvalidApplicationHistoryRow;
+            if (self.api.column_type(row.ptr, 7) == 5) return null;
+            if (self.api.column_type(row.ptr, 7) != 3) return error.InvalidApplicationHistoryRow;
+            const evidence = try row.boundedBytes(7, retry.max_evidence_text_bytes);
+            if (evidence.len == 0 or !std.unicode.utf8ValidateSlice(evidence)) return error.InvalidApplicationHistoryRow;
+            if (try self.effectiveHistoryLimitTx(jail) == 0) return null;
+            return allocator.dupe(u8, evidence) catch error.OutOfMemory;
         }
 
         pub fn historyEventEligible(self: *Store, event: effect_history.Event) Error!bool {
@@ -1169,6 +1410,16 @@ pub fn Methods(comptime Store: type) type {
                     const decided = try row.signed(9);
                     const ordinal = try row.signed(10);
                     if (source.len == 0 or occurrence.len == 0 or decided > confirmed.confirmed_us or ordinal <= 0) return error.InvalidApplicationHistoryRow;
+                    if (self.schema_version >= 27 and try self.effectiveHistoryLimitTx(confirmed.jail.slice()) == 0) {
+                        if (self.api.column_type(row.ptr, 11) != 5) {
+                            if (self.api.column_type(row.ptr, 11) != 3) return error.InvalidApplicationHistoryRow;
+                            const evidence = try row.boundedBytes(11, retry.max_evidence_text_bytes);
+                            if (evidence.len == 0 or !std.unicode.utf8ValidateSlice(evidence)) return error.InvalidApplicationHistoryRow;
+                        }
+                        count += 1;
+                        last = @intCast(sequence);
+                        continue;
+                    }
                     const source_copy = allocator.dupe(u8, source) catch return error.OutOfMemory;
                     errdefer allocator.free(source_copy);
                     const occurrence_copy = allocator.dupe(u8, occurrence) catch return error.OutOfMemory;
@@ -1308,25 +1559,93 @@ pub fn Methods(comptime Store: type) type {
             return deleted != 0;
         }
 
-        pub const RetentionPolicy = struct { generation: i64, max_matches: i64, published: bool, sweep_cursor: i64 };
+        pub const JailRetentionLimit = struct { jail: []const u8, max_matches: ?u16 };
+        pub const RetentionUpdate = struct { global_max_matches: u16, jails: []const JailRetentionLimit };
+        pub const RetentionPolicy = struct { generation: i64, max_matches: i64, published: bool, sweep_cursor: i64, retry_cursor: ?i64 = null, subject_cursor: ?i64 = null };
         pub const RetentionOutcome = enum { idle, rebuilt, published, details, prefix, yielded };
         const retained_evidence_limit = "16384";
-        const sweep_rows: i64 = 1024;
         const age_path_threshold: i64 = 4096;
         const prefix_page: usize = 64;
         pub const history_overload_events: i64 = @divTrunc(effects.max_confirmed_events * 9, 10);
         const overload_notice_us: i64 = 60 * 1_000_000;
 
         fn readRetentionPolicy(self: *Store) Error!RetentionPolicy {
-            var row = try self.statement("SELECT generation,max_matches,state,sweep_cursor FROM retention_policy WHERE id=1;");
+            var row = try self.statement(if (self.schema_version >= 27)
+                "SELECT generation,max_matches,state,sweep_cursor,retry_evidence_sweep_cursor,history_subject_sweep_cursor FROM retention_policy WHERE id=1;"
+            else
+                "SELECT generation,max_matches,state,sweep_cursor,NULL,NULL FROM retention_policy WHERE id=1;");
             defer row.deinit();
             if (!try row.row()) return error.InvalidApplicationHistoryRow;
-            const result = RetentionPolicy{ .generation = try row.signed(0), .max_matches = try row.signed(1), .published = try row.signed(2) == 2, .sweep_cursor = try row.signed(3) };
-            if (result.generation <= 0 or result.max_matches < 0 or result.max_matches > 1024 or result.sweep_cursor < 0) return error.InvalidApplicationHistoryRow;
+            const state = try row.signed(2);
+            const result = RetentionPolicy{ .generation = try row.signed(0), .max_matches = try row.signed(1), .published = state == 2, .sweep_cursor = try row.signed(3), .retry_cursor = try row.optionalSigned(4), .subject_cursor = try row.optionalSigned(5) };
+            if (result.generation <= 0 or result.max_matches < 0 or result.max_matches > 1024 or result.sweep_cursor < 0 or (state != 1 and state != 2) or (result.retry_cursor orelse 0) < 0 or (result.subject_cursor orelse 0) < 0) return error.InvalidApplicationHistoryRow;
             return result;
         }
 
+        pub fn effectiveHistoryLimitTx(self: *Store, jail: []const u8) Error!u16 {
+            _ = detection.Name.init(jail) catch return error.InvalidApplicationHistoryQuery;
+            const policy = try self.readRetentionPolicy();
+            if (self.schema_version < 27) return @intCast(policy.max_matches);
+            var row = try self.statement("SELECT max_matches FROM history_jail_limits WHERE jail=?1;");
+            defer row.deinit();
+            try row.text(1, jail);
+            const override = if (try row.row()) try row.optionalSigned(0) else null;
+            if (override) |value| if (value < 0 or value > 1024) return error.InvalidApplicationHistoryRow;
+            return @intCast(@min(policy.max_matches, override orelse policy.max_matches));
+        }
+
+        pub fn applyRetentionPolicyTx(self: *Store, update: RetentionUpdate) Error!bool {
+            if (self.api.get_autocommit(self.db) != 0 or self.schema_version < 27) return error.MaintenanceStorageRequired;
+            if (update.global_max_matches > 1024 or update.jails.len > 256) return error.InvalidApplicationHistoryQuery;
+            for (update.jails, 0..) |item, i| {
+                _ = detection.Name.init(item.jail) catch return error.InvalidApplicationHistoryQuery;
+                if (item.max_matches) |value| if (value > 1024) return error.InvalidApplicationHistoryQuery;
+                for (update.jails[0..i]) |previous| if (std.mem.eql(u8, item.jail, previous.jail)) return error.InvalidApplicationHistoryQuery;
+            }
+            var count: usize = 0;
+            var equal = true;
+            {
+                var row = try self.statement("SELECT jail,max_matches FROM history_jail_limits ORDER BY jail LIMIT 257;");
+                defer row.deinit();
+                while (try row.row()) {
+                    if (count == 256) return error.InvalidApplicationHistoryRow;
+                    if (self.api.column_type(row.ptr, 0) != 3) return error.InvalidApplicationHistoryRow;
+                    const name = detection.Name.init(try row.boundedBytes(0, 64)) catch return error.InvalidApplicationHistoryRow;
+                    const value = try row.optionalSigned(1);
+                    if (value) |limit| if (limit < 0 or limit > 1024) return error.InvalidApplicationHistoryRow;
+                    var found = false;
+                    for (update.jails) |item| if (std.mem.eql(u8, name.slice(), item.jail)) {
+                        found = true;
+                        if (value != if (item.max_matches) |limit| @as(?i64, limit) else null) equal = false;
+                        break;
+                    };
+                    equal = equal and found;
+                    count += 1;
+                }
+            }
+            const current = try self.readRetentionPolicy();
+            if (equal and count == update.jails.len and current.max_matches == update.global_max_matches) return false;
+            try self.exec("DELETE FROM history_jail_limits;");
+            for (update.jails) |item| {
+                var row = try self.statement("INSERT INTO history_jail_limits(jail,max_matches) VALUES(?1,?2);");
+                defer row.deinit();
+                try row.text(1, item.jail);
+                if (item.max_matches) |value| try row.int(2, value) else try self.check(self.api.bind_null(row.ptr, 2));
+                try row.done();
+            }
+            try self.advanceRetentionGenerationTx(update.global_max_matches, current.generation);
+            return true;
+        }
+
+        pub fn setRetentionPolicies(self: *Store, update: RetentionUpdate) Error!bool {
+            try self.beginAdmissionWrite();
+            errdefer self.rollback();
+            const changed = try self.applyRetentionPolicyTx(update);
+            try self.commitTransaction();
+            return changed;
+        }
         pub fn setRetentionPolicy(self: *Store, max_matches: u16) Error!bool {
+            if (self.schema_version >= 27) return self.setRetentionPolicies(.{ .global_max_matches = max_matches, .jails = &.{} });
             if (max_matches > 1024) return error.InvalidApplicationHistoryQuery;
             try self.beginWrite();
             errdefer self.rollback();
@@ -1335,21 +1654,40 @@ pub fn Methods(comptime Store: type) type {
             try self.commitTransaction();
             return started;
         }
+        fn advanceRetentionGenerationTx(self: *Store, max_matches: i64, generation: i64) Error!void {
+            var row = try self.statement(if (self.schema_version >= 27)
+                "UPDATE retention_policy SET generation=generation+1,max_matches=?1,state=1,sweep_cursor=0,retry_evidence_sweep_cursor=0 WHERE id=1 AND generation=?2 AND generation<9223372036854775807;"
+            else
+                "UPDATE retention_policy SET generation=generation+1,max_matches=?1,state=1,sweep_cursor=0 WHERE id=1 AND generation=?2 AND generation<9223372036854775807;");
+            defer row.deinit();
+            try row.int(1, max_matches);
+            try row.int(2, generation);
+            try row.done();
+            if (self.api.changes(self.db) != 1) return error.StorageLimit;
+        }
         fn beginRetentionGenerationTx(self: *Store, max_matches: i64) Error!bool {
             const current = try self.readRetentionPolicy();
             if (current.max_matches == max_matches) return false;
-            var row = try self.statement("UPDATE retention_policy SET generation=generation+1,max_matches=?1,state=1,sweep_cursor=0 WHERE id=1 AND generation=?2 AND generation<9223372036854775807;");
-            defer row.deinit();
-            try row.int(1, max_matches);
-            try row.int(2, current.generation);
-            try row.done();
-            if (self.api.changes(self.db) != 1) return error.StorageLimit;
+            try self.advanceRetentionGenerationTx(max_matches, current.generation);
             return true;
         }
 
         pub fn retainDetailTx(self: *Store, family: i64, subject: []const u8, bytes: ?i64, sequence: i64) Error!void {
+            try self.accountRetainedDetailTx(family, subject, bytes, sequence, true);
+        }
+        pub fn retainDetailDeferredTx(self: *Store, family: i64, subject: []const u8, bytes: ?i64, sequence: i64) Error!void {
+            try self.accountRetainedDetailTx(family, subject, bytes, sequence, false);
+        }
+        pub fn refreshRetainedSubjectTx(self: *Store, subject: detection.Subject) Error!void {
             const policy = try self.readRetentionPolicy();
-            var row = try self.statement("INSERT INTO retained_subject_summaries(family,subject,detail_count,evidence_bytes,earliest_sequence,earliest_evidence_sequence,evaluated_generation,candidate_sequence) VALUES(?1,?2,1,coalesce(?3,0),?4,CASE WHEN ?3 IS NOT NULL THEN ?4 END,?5,NULL) ON CONFLICT(family,subject) DO UPDATE SET detail_count=detail_count+1,evidence_bytes=evidence_bytes+excluded.evidence_bytes,earliest_sequence=min(earliest_sequence,excluded.earliest_sequence),earliest_evidence_sequence=coalesce(earliest_evidence_sequence,excluded.earliest_evidence_sequence);");
+            switch (subject) {
+                .v4 => |value| try self.updateCandidateTx(4, &value, policy),
+                .v6 => |value| try self.updateCandidateTx(6, &value, policy),
+            }
+        }
+        fn accountRetainedDetailTx(self: *Store, family: i64, subject: []const u8, bytes: ?i64, sequence: i64, local: bool) Error!void {
+            const policy = try self.readRetentionPolicy();
+            var row = try self.statement("INSERT INTO retained_subject_summaries(family,subject,detail_count,evidence_bytes,earliest_sequence,earliest_evidence_sequence,evaluated_generation,candidate_sequence) VALUES(?1,?2,1,coalesce(?3,0),?4,CASE WHEN ?3 IS NOT NULL THEN ?4 END,?5,NULL) ON CONFLICT(family,subject) DO UPDATE SET detail_count=detail_count+1,evidence_bytes=evidence_bytes+excluded.evidence_bytes,earliest_sequence=min(earliest_sequence,excluded.earliest_sequence),earliest_evidence_sequence=CASE WHEN earliest_evidence_sequence IS NULL THEN excluded.earliest_evidence_sequence WHEN excluded.earliest_evidence_sequence IS NULL THEN earliest_evidence_sequence ELSE min(earliest_evidence_sequence,excluded.earliest_evidence_sequence) END;");
             defer row.deinit();
             try row.int(1, family);
             try row.blob(2, subject);
@@ -1357,9 +1695,9 @@ pub fn Methods(comptime Store: type) type {
             try row.int(4, sequence);
             try row.int(5, policy.generation);
             try row.done();
-            try self.updateCandidateTx(family, subject, policy);
+            if (local) try self.updateCandidateTx(family, subject, policy) else try self.updateGlobalCandidateTx(family, subject, policy);
         }
-        fn updateCandidateTx(self: *Store, family: i64, subject: []const u8, policy: RetentionPolicy) Error!void {
+        fn updateGlobalCandidateTx(self: *Store, family: i64, subject: []const u8, policy: RetentionPolicy) Error!void {
             var row = try self.statement("UPDATE retained_subject_summaries SET candidate_sequence=CASE WHEN detail_count>?3 THEN earliest_sequence WHEN evidence_bytes>" ++ retained_evidence_limit ++ " THEN earliest_evidence_sequence END,evaluated_generation=?4 WHERE family=?1 AND subject=?2;");
             defer row.deinit();
             try row.int(1, family);
@@ -1368,6 +1706,53 @@ pub fn Methods(comptime Store: type) type {
             try row.int(4, policy.generation);
             try row.done();
             if (self.api.changes(self.db) != 1) return error.InvalidApplicationHistoryRow;
+        }
+
+        // A local quota is evaluated only after the aggregate window fits the global cap.
+        fn localVictimsTx(self: *Store, family: i64, subject: []const u8, policy: RetentionPolicy, total: i64, output: []i64) Error!usize {
+            if (self.schema_version < 27) return 0;
+            if (total <= 0 or total > policy.max_matches) return error.InvalidApplicationHistoryRow;
+            var row = try self.statement("SELECT sequence,ordinal,max_matches FROM (SELECT d.sequence,row_number() OVER(PARTITION BY e.jail ORDER BY d.sequence DESC) AS ordinal,l.max_matches FROM (SELECT sequence,event_id FROM confirmed_event_details INDEXED BY confirmed_details_subject WHERE family=?1 AND subject=?2 ORDER BY sequence LIMIT ?3) d JOIN confirmed_effect_events e ON e.event_id=d.event_id LEFT JOIN history_jail_limits l ON l.jail=e.jail) ORDER BY sequence;");
+            defer row.deinit();
+            try row.int(1, family);
+            try row.blob(2, subject);
+            try row.int(3, total + 1);
+            var examined: i64 = 0;
+            var count: usize = 0;
+            while (try row.row()) {
+                examined += 1;
+                if (examined > total) return error.InvalidApplicationHistoryRow;
+                const override = try row.optionalSigned(2);
+                if (override) |value| if (value < 0 or value > 1024) return error.InvalidApplicationHistoryRow;
+                if (try row.signed(1) <= @min(policy.max_matches, override orelse policy.max_matches)) continue;
+                if (count == output.len) return error.InvalidApplicationHistoryRow;
+                output[count] = try row.signed(0);
+                if (output[count] <= 0 or (count > 0 and output[count] <= output[count - 1])) return error.InvalidApplicationHistoryRow;
+                count += 1;
+            }
+            if (examined != total) return error.InvalidApplicationHistoryRow;
+            return count;
+        }
+        fn updateCandidateTx(self: *Store, family: i64, subject: []const u8, policy: RetentionPolicy) Error!void {
+            try self.updateGlobalCandidateTx(family, subject, policy);
+            var summary = try self.statement("SELECT detail_count,candidate_sequence FROM retained_subject_summaries WHERE family=?1 AND subject=?2;");
+            defer summary.deinit();
+            try summary.int(1, family);
+            try summary.blob(2, subject);
+            if (!try summary.row()) return error.InvalidApplicationHistoryRow;
+            const count = try summary.signed(0);
+            if (count <= 0 or count > policy.max_matches or try summary.optionalSigned(1) != null) return;
+            var victims: [1024]i64 = undefined;
+            if (try self.localVictimsTx(family, subject, policy, count, &victims) == 0) return;
+            try self.setLocalCandidateTx(family, subject, victims[0]);
+        }
+        fn setLocalCandidateTx(self: *Store, family: i64, subject: []const u8, sequence: i64) Error!void {
+            var row = try self.statement("UPDATE retained_subject_summaries SET candidate_sequence=?3 WHERE family=?1 AND subject=?2 AND candidate_sequence IS NULL;");
+            defer row.deinit();
+            try row.int(1, family);
+            try row.blob(2, subject);
+            try row.int(3, sequence);
+            try row.done();
         }
 
         const RetainedDetail = struct {
@@ -1384,7 +1769,9 @@ pub fn Methods(comptime Store: type) type {
                     const subject = try row.boundedBytes(3, detail.subject.len);
                     @memcpy(detail.subject[0..subject.len], subject);
                     detail.subject_len = subject.len;
+                    if ((detail.family != 4 and detail.family != 6) or subject.len != (if (detail.family == 4) @as(usize, 4) else 16)) return error.InvalidApplicationHistoryRow;
                 }
+                if ((detail.bytes orelse 0) < 0 or (detail.bytes orelse 0) > retry.max_evidence_text_bytes) return error.InvalidApplicationHistoryRow;
                 if (detail.sequence <= 0) return error.InvalidApplicationHistoryRow;
                 return detail;
             }
@@ -1420,7 +1807,7 @@ pub fn Methods(comptime Store: type) type {
                 try decrement.done();
                 if (self.api.changes(self.db) != 1) return error.InvalidApplicationHistoryRow;
             }
-            try self.updateCandidateTx(family, subject, policy);
+            try self.updateGlobalCandidateTx(family, subject, policy);
         }
 
         fn historyFence(self: *Store) Error!?i64 {
@@ -1434,85 +1821,148 @@ pub fn Methods(comptime Store: type) type {
             return std.math.cast(i64, saved.last_sequence) orelse error.InvalidHistoryCheckpoint;
         }
 
-        fn deleteDetailPage(self: *Store, policy: RetentionPolicy, fence: i64, cutoff: i64, page: usize, wrote: *bool) Error!usize {
-            const age_count = blk: {
-                var row = try self.statement("SELECT count(*) FROM (SELECT 1 FROM confirmed_event_details INDEXED BY confirmed_details_age WHERE confirmed_us<=?1 LIMIT ?2);");
+        fn reserveSubjectWindowTx(self: *Store, detail: RetainedDetail, touched: []const RetainedDetail, policy: RetentionPolicy, budget: *usize) Error!bool {
+            const family = detail.family orelse return true;
+            for (touched) |previous| if (previous.family == family and std.mem.eql(u8, previous.subject[0..previous.subject_len], detail.subject[0..detail.subject_len])) return true;
+            var row = try self.statement("SELECT detail_count FROM retained_subject_summaries WHERE family=?1 AND subject=?2;");
+            defer row.deinit();
+            try row.int(1, family);
+            try row.blob(2, detail.subject[0..detail.subject_len]);
+            if (!try row.row()) return error.InvalidApplicationHistoryRow;
+            const count = try row.signed(0);
+            if (count <= 0) return error.InvalidApplicationHistoryRow;
+            const cost: usize = @intCast(@min(count, policy.max_matches));
+            if (cost > budget.*) return false;
+            budget.* -= cost;
+            return true;
+        }
+        fn refreshDetailsTx(self: *Store, rows: []const RetainedDetail, policy: RetentionPolicy) Error!void {
+            for (rows, 0..) |detail, i| {
+                const family = detail.family orelse continue;
+                var seen = false;
+                for (rows[0..i]) |previous| if (previous.family == family and std.mem.eql(u8, previous.subject[0..previous.subject_len], detail.subject[0..detail.subject_len])) {
+                    seen = true;
+                    break;
+                };
+                if (seen) continue;
+                var row = try self.statement("SELECT 1 FROM retained_subject_summaries WHERE family=?1 AND subject=?2;");
+                defer row.deinit();
+                try row.int(1, family);
+                try row.blob(2, detail.subject[0..detail.subject_len]);
+                if (try row.row()) try self.updateCandidateTx(family, detail.subject[0..detail.subject_len], policy);
+            }
+        }
+        fn detailAtSequenceTx(self: *Store, sequence: i64) Error!RetainedDetail {
+            var row = try self.statement("SELECT sequence,event_id,family,subject,evidence_bytes FROM confirmed_event_details INDEXED BY confirmed_details_sequence WHERE sequence=?1;");
+            defer row.deinit();
+            try row.int(1, sequence);
+            if (!try row.row()) return error.InvalidApplicationHistoryRow;
+            const detail = try RetainedDetail.read(&row);
+            if (try row.row()) return error.InvalidApplicationHistoryRow;
+            return detail;
+        }
+        fn deleteDetailPage(self: *Store, policy: RetentionPolicy, fence: i64, cutoff: i64, page: usize) Error!usize {
+            const competing: ?i64 = blk: {
+                var row = try self.statement("SELECT min(candidate_sequence) FROM retained_subject_summaries INDEXED BY retained_subject_candidates WHERE candidate_sequence IS NOT NULL;");
+                defer row.deinit();
+                if (!try row.row()) return error.DatabaseFailure;
+                const value = try row.optionalSigned(0) orelse break :blk null;
+                break :blk if (value <= fence) value else null;
+            };
+            const limit = if (competing) |value| value - 1 else fence;
+            var rows: [store.max_retention_page]RetainedDetail = undefined;
+            var count: usize = 0;
+            if (limit > 0) {
+                const age_count = blk: {
+                    var row = try self.statement("SELECT count(*) FROM (SELECT 1 FROM confirmed_event_details INDEXED BY confirmed_details_age WHERE confirmed_us<=?1 LIMIT ?2);");
+                    defer row.deinit();
+                    try row.int(1, cutoff);
+                    try row.int(2, age_path_threshold);
+                    if (!try row.row()) return error.DatabaseFailure;
+                    break :blk try row.signed(0);
+                };
+                var row = try self.statement(if (age_count >= age_path_threshold)
+                    "SELECT sequence,event_id,family,subject,evidence_bytes FROM confirmed_event_details INDEXED BY confirmed_details_sequence WHERE sequence<=?2 AND confirmed_us<=?1 ORDER BY sequence LIMIT ?3;"
+                else
+                    "SELECT sequence,event_id,family,subject,evidence_bytes FROM confirmed_event_details INDEXED BY confirmed_details_age WHERE confirmed_us<=?1 AND sequence<=?2 ORDER BY sequence LIMIT ?3;");
                 defer row.deinit();
                 try row.int(1, cutoff);
-                try row.int(2, age_path_threshold);
-                if (!try row.row()) return error.DatabaseFailure;
-                break :blk try row.signed(0);
-            };
-            const age_sql: [:0]const u8 = if (age_count >= age_path_threshold)
-                "SELECT sequence,event_id,family,subject,evidence_bytes FROM confirmed_event_details INDEXED BY confirmed_details_sequence WHERE sequence<=?2 AND confirmed_us<=?1 ORDER BY sequence LIMIT ?3;"
-            else
-                "SELECT sequence,event_id,family,subject,evidence_bytes FROM confirmed_event_details INDEXED BY confirmed_details_age WHERE confirmed_us<=?1 AND sequence<=?2 ORDER BY sequence LIMIT ?3;";
-            var rows: [store.max_retention_page]RetainedDetail = undefined;
-            var deleted: usize = 0;
-            while (deleted < page) {
-                const competing: ?i64 = blk: {
-                    var row = try self.statement("SELECT min(candidate_sequence) FROM retained_subject_summaries INDEXED BY retained_subject_candidates WHERE candidate_sequence IS NOT NULL;");
-                    defer row.deinit();
-                    if (!try row.row()) return error.DatabaseFailure;
-                    const value = try row.optionalSigned(0) orelse break :blk null;
-                    break :blk if (value <= fence) value else null;
-                };
-                const limit = if (competing) |value| value - 1 else fence;
-                if (limit > 0) {
-                    var count: usize = 0;
-                    {
-                        var row = try self.statement(age_sql);
-                        defer row.deinit();
-                        try row.int(1, cutoff);
-                        try row.int(2, limit);
-                        try row.int(3, @intCast(page - deleted));
-                        while (try row.row()) {
-                            if (count == rows.len) return error.InvalidApplicationHistoryRow;
-                            rows[count] = try RetainedDetail.read(&row);
-                            if (count > 0 and rows[count].sequence <= rows[count - 1].sequence) return error.InvalidApplicationHistoryRow;
-                            count += 1;
-                        }
-                    }
-                    for (rows[0..count]) |detail| {
-                        wrote.* = true;
-                        try self.deleteRetainedDetailTx(detail, policy);
-                    }
-                    deleted += count;
-                    if (deleted >= page) break;
+                try row.int(2, limit);
+                try row.int(3, @intCast(page));
+                while (try row.row()) {
+                    if (count == rows.len) return error.InvalidApplicationHistoryRow;
+                    rows[count] = try RetainedDetail.read(&row);
+                    count += 1;
                 }
-                const sequence = competing orelse break;
-                const candidate = blk: {
-                    var valid = try self.statement("SELECT count(*) FROM retained_subject_summaries s JOIN confirmed_event_details d INDEXED BY confirmed_details_sequence ON d.sequence=?1 WHERE s.family=d.family AND s.subject=d.subject AND s.candidate_sequence=?1 AND ((s.detail_count>?2 AND s.earliest_sequence=?1) OR (s.evidence_bytes>" ++ retained_evidence_limit ++ " AND s.earliest_evidence_sequence=?1));");
-                    defer valid.deinit();
-                    try valid.int(1, sequence);
-                    try valid.int(2, policy.max_matches);
-                    if (!try valid.row() or try valid.signed(0) != 1) return error.InvalidApplicationHistoryRow;
-                    var row = try self.statement("SELECT sequence,event_id,family,subject,evidence_bytes FROM confirmed_event_details INDEXED BY confirmed_details_sequence WHERE sequence=?1;");
-                    defer row.deinit();
-                    try row.int(1, sequence);
-                    if (!try row.row()) return error.InvalidApplicationHistoryRow;
-                    const detail = try RetainedDetail.read(&row);
-                    if (try row.row()) return error.InvalidApplicationHistoryRow;
-                    break :blk detail;
-                };
-                wrote.* = true;
-                try self.deleteRetainedDetailTx(candidate, policy);
-                deleted += 1;
             }
-            return deleted;
+            if (count != 0) {
+                var accepted: usize = 0;
+                var budget: usize = 1024;
+                for (rows[0..count]) |detail| {
+                    if (!try self.reserveSubjectWindowTx(detail, rows[0..accepted], policy, &budget)) break;
+                    try self.deleteRetainedDetailTx(detail, policy);
+                    accepted += 1;
+                }
+                try self.refreshDetailsTx(rows[0..accepted], policy);
+                return accepted;
+            }
+            const sequence = competing orelse return 0;
+            const candidate = try self.detailAtSequenceTx(sequence);
+            const family = candidate.family orelse return error.InvalidApplicationHistoryRow;
+            const subject = candidate.subject[0..candidate.subject_len];
+            var total: i64 = undefined;
+            var bytes: i64 = undefined;
+            {
+                var row = try self.statement("SELECT detail_count,evidence_bytes,candidate_sequence,earliest_sequence,earliest_evidence_sequence FROM retained_subject_summaries WHERE family=?1 AND subject=?2;");
+                defer row.deinit();
+                try row.int(1, family);
+                try row.blob(2, subject);
+                if (!try row.row() or try row.optionalSigned(2) != sequence) return error.InvalidApplicationHistoryRow;
+                total = try row.signed(0);
+                bytes = try row.signed(1);
+                if (total > policy.max_matches and try row.signed(3) != sequence) return error.InvalidApplicationHistoryRow;
+                if (total <= policy.max_matches and bytes > 16384 and try row.optionalSigned(4) != sequence) return error.InvalidApplicationHistoryRow;
+            }
+            if (total <= policy.max_matches and bytes <= 16384) {
+                var victims: [1024]i64 = undefined;
+                const n = try self.localVictimsTx(family, subject, policy, total, &victims);
+                if (n == 0 or victims[0] != sequence) return error.InvalidApplicationHistoryRow;
+                while (count < n and count < page and victims[count] <= fence) : (count += 1) {
+                    try self.deleteRetainedDetailTx(try self.detailAtSequenceTx(victims[count]), policy);
+                }
+                if (count < n) try self.setLocalCandidateTx(family, subject, victims[count]);
+                return count;
+            }
+            var next: ?i64 = sequence;
+            while (count < page) {
+                const selected = next orelse break;
+                if (selected > fence) break;
+                try self.deleteRetainedDetailTx(try self.detailAtSequenceTx(selected), policy);
+                count += 1;
+                var row = try self.statement("SELECT candidate_sequence FROM retained_subject_summaries WHERE family=?1 AND subject=?2;");
+                defer row.deinit();
+                try row.int(1, family);
+                try row.blob(2, subject);
+                next = if (try row.row()) try row.optionalSigned(0) else null;
+            }
+            try self.refreshDetailsTx(&.{candidate}, policy);
+            return count;
         }
 
         fn prunePrefixPage(self: *Store, policy: RetentionPolicy, fence: i64, cutoff: i64, now_us: i64) Error!usize {
             var events = try self.integer("SELECT count(*) FROM confirmed_effect_events;");
             var pruned: usize = 0;
             var overloaded = false;
-            while (pruned < prefix_page) {
+            var touched: [prefix_page]RetainedDetail = undefined;
+            var touched_count: usize = 0;
+            var budget: usize = 1024;
+            while (pruned < @min(prefix_page, self.retention_page)) {
                 const retained_from = blk: {
                     var stream = try self.statement("SELECT retained_from,head FROM confirmed_history_stream WHERE id=1;");
                     defer stream.deinit();
                     if (!try stream.row()) return error.HistoryGap;
                     const from = try stream.signed(0);
-                    if (from > try stream.signed(1) or from > fence) return self.prefixPruned(pruned, overloaded, events, now_us);
+                    if (from > try stream.signed(1) or from > fence) return self.finishPrefixTx(policy, touched[0..touched_count], pruned, overloaded, events, now_us);
                     break :blk from;
                 };
                 const over = events >= history_overload_events;
@@ -1529,7 +1979,10 @@ pub fn Methods(comptime Store: type) type {
                     if (try detail.row()) {
                         const retained = try RetainedDetail.read(&detail);
                         if (retained.sequence != retained_from) return error.HistoryGap;
+                        if (!try self.reserveSubjectWindowTx(retained, touched[0..touched_count], policy, &budget)) break;
                         try self.deleteRetainedDetailTx(retained, policy);
+                        touched[touched_count] = retained;
+                        touched_count += 1;
                     }
                 }
                 var sequence = try self.statement("DELETE FROM confirmed_history_sequence WHERE sequence=?1 AND event_id=?2;");
@@ -1555,6 +2008,10 @@ pub fn Methods(comptime Store: type) type {
                 events -= 1;
                 overloaded = overloaded or over;
             }
+            return self.finishPrefixTx(policy, touched[0..touched_count], pruned, overloaded, events, now_us);
+        }
+        fn finishPrefixTx(self: *Store, policy: RetentionPolicy, touched: []const RetainedDetail, pruned: usize, overloaded: bool, events: i64, now_us: i64) Error!usize {
+            try self.refreshDetailsTx(touched, policy);
             return self.prefixPruned(pruned, overloaded, events, now_us);
         }
         fn prefixPruned(self: *Store, pruned: usize, overloaded: bool, events: i64, now_us: i64) Error!usize {
@@ -1567,18 +2024,37 @@ pub fn Methods(comptime Store: type) type {
         }
 
         fn sweepCandidatesTx(self: *Store, policy: RetentionPolicy) Error!RetentionOutcome {
-            const maximum = try self.integer("SELECT coalesce(max(rowid),0) FROM retained_subject_summaries;");
-            const high = std.math.add(i64, policy.sweep_cursor, sweep_rows) catch return error.StorageLimit;
-            if (policy.sweep_cursor < maximum) {
-                var sweep = try self.statement("UPDATE retained_subject_summaries SET candidate_sequence=CASE WHEN detail_count>?3 THEN earliest_sequence WHEN evidence_bytes>" ++ retained_evidence_limit ++ " THEN earliest_evidence_sequence END,evaluated_generation=?4 WHERE rowid>?1 AND rowid<=?2;");
-                defer sweep.deinit();
-                try sweep.int(1, policy.sweep_cursor);
-                try sweep.int(2, high);
-                try sweep.int(3, policy.max_matches);
-                try sweep.int(4, policy.generation);
-                try sweep.done();
+            const Summary = struct { rowid: i64, family: i64, subject: [16]u8, len: usize, cost: usize };
+            var summaries: [64]Summary = undefined;
+            var count: usize = 0;
+            const quantum = @min(summaries.len, self.retention_page);
+            {
+                var row = try self.statement("SELECT rowid,family,subject,detail_count,evidence_bytes FROM retained_subject_summaries WHERE rowid>?1 ORDER BY rowid LIMIT ?2;");
+                defer row.deinit();
+                try row.int(1, policy.sweep_cursor);
+                try row.int(2, @intCast(quantum));
+                while (try row.row()) {
+                    if (count == summaries.len) return error.InvalidApplicationHistoryRow;
+                    const total = try row.signed(3);
+                    const bytes = try row.signed(4);
+                    if (total <= 0 or bytes < 0) return error.InvalidApplicationHistoryRow;
+                    const stored = try row.boundedBytes(2, 16);
+                    summaries[count] = .{ .rowid = try row.signed(0), .family = try row.signed(1), .subject = undefined, .len = stored.len, .cost = if (total <= policy.max_matches and bytes <= 16384) @intCast(total) else 0 };
+                    @memcpy(summaries[count].subject[0..stored.len], stored);
+                    count += 1;
+                }
             }
-            const done = high >= maximum;
+            var high = policy.sweep_cursor;
+            var budget: usize = 1024;
+            var processed: usize = 0;
+            for (summaries[0..count]) |summary| {
+                if (summary.cost > budget) break;
+                budget -= summary.cost;
+                try self.updateCandidateTx(summary.family, summary.subject[0..summary.len], policy);
+                high = summary.rowid;
+                processed += 1;
+            }
+            const done = processed == count and count < quantum;
             var advance = try self.statement(if (done)
                 "UPDATE retention_policy SET state=2,sweep_cursor=0 WHERE id=1 AND generation=?2 AND state=1 AND ?1>=0;"
             else
@@ -1591,38 +2067,208 @@ pub fn Methods(comptime Store: type) type {
             return if (done) .published else .rebuilt;
         }
 
+        pub fn clearConfirmedRetryEvidenceTx(self: *Store, jail: []const u8, decision_id: effects.Hash) Error!void {
+            var row = try self.statement("UPDATE retry_decision_details SET evidence=NULL WHERE effect_decision_id=?1 AND jail=?2 AND evidence IS NOT NULL;");
+            defer row.deinit();
+            try row.blob(1, &decision_id);
+            try row.text(2, jail);
+            try row.done();
+        }
+        fn advanceEvidenceCursorTx(self: *Store, subject: bool, next: ?i64) Error!void {
+            var row = try self.statement(if (subject)
+                "UPDATE retention_policy SET history_subject_sweep_cursor=?1 WHERE id=1;"
+            else
+                "UPDATE retention_policy SET retry_evidence_sweep_cursor=?1 WHERE id=1;");
+            defer row.deinit();
+            if (next) |value| try row.int(1, value) else try self.check(self.api.bind_null(row.ptr, 1));
+            try row.done();
+            if (self.api.changes(self.db) != 1) return error.InvalidApplicationHistoryRow;
+        }
+        fn sweepRetryEvidenceTx(self: *Store, cursor: i64, quantum: usize) Error!void {
+            var ids: [32]i64 = undefined;
+            var count: usize = 0;
+            {
+                var row = try self.statement("SELECT rowid FROM retry_decision_details WHERE rowid>?1 ORDER BY rowid LIMIT ?2;");
+                defer row.deinit();
+                try row.int(1, cursor);
+                try row.int(2, @intCast(quantum));
+                while (try row.row()) {
+                    if (count == ids.len) return error.InvalidApplicationHistoryRow;
+                    ids[count] = try row.signed(0);
+                    count += 1;
+                }
+            }
+            for (ids[0..count]) |id| {
+                var clear = false;
+                {
+                    var row = try self.statement("SELECT d.jail,d.evidence,EXISTS(SELECT 1 FROM confirmed_effect_events e INDEXED BY confirmed_effect_events_decision WHERE e.jail=d.jail AND e.decision_id=d.effect_decision_id),EXISTS(SELECT 1 FROM effect_owners o INDEXED BY effect_owners_decision JOIN confirmation_markers m ON m.scope_key=o.scope_key AND m.jail=o.jail AND m.decision_id=o.decision_id WHERE o.jail=d.jail AND o.decision_id=d.effect_decision_id) FROM retry_decision_details d WHERE d.rowid=?1;");
+                    defer row.deinit();
+                    try row.int(1, id);
+                    if (!try row.row()) return error.InvalidApplicationHistoryRow;
+                    const jail = detection.Name.init(try row.boundedBytes(0, 64)) catch return error.InvalidApplicationHistoryRow;
+                    if (self.api.column_type(row.ptr, 1) != 5) {
+                        if (self.api.column_type(row.ptr, 1) != 3) return error.InvalidApplicationHistoryRow;
+                        const evidence = try row.boundedBytes(1, retry.max_evidence_text_bytes);
+                        if (evidence.len == 0 or !std.unicode.utf8ValidateSlice(evidence)) return error.InvalidApplicationHistoryRow;
+                        clear = try self.effectiveHistoryLimitTx(jail.slice()) == 0 or try row.signed(2) != 0 or try row.signed(3) != 0;
+                    }
+                }
+                if (clear) {
+                    var row = try self.statement("UPDATE retry_decision_details SET evidence=NULL WHERE rowid=?1;");
+                    defer row.deinit();
+                    try row.int(1, id);
+                    try row.done();
+                    if (self.api.changes(self.db) != 1) return error.InvalidApplicationHistoryRow;
+                }
+            }
+            try self.advanceEvidenceCursorTx(false, if (count == quantum) ids[count - 1] else null);
+        }
+        fn completeLegacySubjectTx(self: *Store, sequence: i64, policy: RetentionPolicy, fence: ?i64) Error!?RetainedDetail {
+            var source: []u8 = undefined;
+            var occurrence: []u8 = undefined;
+            var evidence: ?[]u8 = null;
+            var detail: RetainedDetail = undefined;
+            var decided: i64 = undefined;
+            var ordinal: i64 = undefined;
+            var confirmed: i64 = undefined;
+            var recovered_family: i64 = undefined;
+            var recovered_subject: [16]u8 = undefined;
+            var recovered_len: usize = undefined;
+            {
+                var row = try self.statement("SELECT d.sequence,d.event_id,d.family,d.subject,d.evidence_bytes,d.source,d.occurrence,d.decided_us,d.ordinal,d.evidence,d.confirmed_us,e.canonical_scope,e.scope_key,e.jail,e.confirmed_us FROM confirmed_event_details d INDEXED BY confirmed_details_sequence JOIN confirmed_effect_events e ON e.event_id=d.event_id JOIN confirmed_history_sequence h ON h.sequence=d.sequence AND h.event_id=d.event_id WHERE d.sequence=?1;");
+                defer row.deinit();
+                try row.int(1, sequence);
+                if (!try row.row()) return error.InvalidApplicationHistoryRow;
+                detail = try RetainedDetail.read(&row);
+                if (detail.family != null) return null;
+                if (self.api.column_type(row.ptr, 3) != 5) return error.InvalidApplicationHistoryRow;
+                const jail = detection.Name.init(try row.boundedBytes(13, 64)) catch return error.InvalidApplicationHistoryRow;
+                const installation = try self.readInstallation() orelse return error.InstallationRequired;
+                const scope = try self.decodeStoredScope(&row, 11);
+                const host = effects.Scope.fromCanonical(scope.canonical) catch return error.InvalidApplicationHistoryRow;
+                if (!std.mem.eql(u8, &try host.key(installation), &try Store.effectBlob(&row, 12, 32))) return error.InvalidApplicationHistoryRow;
+                if (try self.effectiveHistoryLimitTx(jail.slice()) == 0 and sequence <= (fence orelse -1)) {
+                    try self.deleteRetainedDetailTx(detail, policy);
+                    return null;
+                }
+                recovered_family = @intFromEnum(host.canonical.subject.family);
+                recovered_len = if (recovered_family == 4) 4 else 16;
+                recovered_subject = host.canonical.subject.address;
+                decided = try row.signed(7);
+                ordinal = try row.signed(8);
+                confirmed = try row.signed(10);
+                if (ordinal <= 0 or decided > confirmed or confirmed != try row.signed(14)) return error.InvalidApplicationHistoryRow;
+                if (self.api.column_type(row.ptr, 5) != 3 or self.api.column_type(row.ptr, 6) != 3) return error.InvalidApplicationHistoryRow;
+                const stored_source = try row.boundedBytes(5, Limits.source_bytes);
+                const stored_occurrence = try row.boundedBytes(6, Limits.source_bytes);
+                if (stored_source.len == 0 or stored_occurrence.len == 0) return error.InvalidApplicationHistoryRow;
+                source = self.allocator.dupe(u8, stored_source) catch return error.OutOfMemory;
+                errdefer self.allocator.free(source);
+                occurrence = self.allocator.dupe(u8, stored_occurrence) catch return error.OutOfMemory;
+                errdefer self.allocator.free(occurrence);
+                if (self.api.column_type(row.ptr, 9) != 5) {
+                    if (self.api.column_type(row.ptr, 9) != 3) return error.InvalidApplicationHistoryRow;
+                    const stored_evidence = try row.boundedBytes(9, retry.max_evidence_text_bytes);
+                    if (stored_evidence.len == 0 or !std.unicode.utf8ValidateSlice(stored_evidence) or detail.bytes != @as(i64, @intCast(stored_evidence.len))) return error.InvalidApplicationHistoryRow;
+                    evidence = self.allocator.dupe(u8, stored_evidence) catch return error.OutOfMemory;
+                } else if (detail.bytes != null) return error.InvalidApplicationHistoryRow;
+            }
+            defer self.allocator.free(source);
+            defer self.allocator.free(occurrence);
+            defer if (evidence) |value| self.allocator.free(value);
+            try self.deleteRetainedDetailTx(detail, policy);
+            {
+                var row = try self.statement("INSERT INTO confirmed_event_details(event_id,source,occurrence,decided_us,ordinal,evidence,family,subject,sequence,confirmed_us,evidence_bytes) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11);");
+                defer row.deinit();
+                try row.blob(1, &detail.event_id);
+                try row.text(2, source);
+                try row.text(3, occurrence);
+                try row.int(4, decided);
+                try row.int(5, ordinal);
+                if (evidence) |value| try row.text(6, value);
+                try row.int(7, recovered_family);
+                try row.blob(8, recovered_subject[0..recovered_len]);
+                try row.int(9, sequence);
+                try row.int(10, confirmed);
+                if (detail.bytes) |value| try row.int(11, value);
+                try row.done();
+                self.insertedRows(.confirmed_event_details, 1);
+            }
+            try self.accountRetainedDetailTx(recovered_family, recovered_subject[0..recovered_len], detail.bytes, sequence, false);
+            detail.family = recovered_family;
+            detail.subject = recovered_subject;
+            detail.subject_len = recovered_len;
+            return detail;
+        }
+        fn sweepLegacySubjectsTx(self: *Store, cursor: i64, quantum: usize, policy: RetentionPolicy, fence: ?i64) Error!void {
+            var ids: [32]i64 = undefined;
+            var count: usize = 0;
+            {
+                var row = try self.statement("SELECT sequence FROM confirmed_event_details INDEXED BY confirmed_details_sequence WHERE sequence>?1 ORDER BY sequence LIMIT ?2;");
+                defer row.deinit();
+                try row.int(1, cursor);
+                try row.int(2, @intCast(quantum));
+                while (try row.row()) {
+                    if (count == ids.len) return error.InvalidApplicationHistoryRow;
+                    ids[count] = try row.signed(0);
+                    count += 1;
+                }
+            }
+            var repaired: [32]RetainedDetail = undefined;
+            var repaired_count: usize = 0;
+            for (ids[0..count]) |id| if (try self.completeLegacySubjectTx(id, policy, fence)) |detail| {
+                repaired[repaired_count] = detail;
+                repaired_count += 1;
+            };
+            try self.refreshDetailsTx(repaired[0..repaired_count], policy);
+            try self.advanceEvidenceCursorTx(true, if (count == quantum) ids[count - 1] else null);
+        }
+
+        fn hasRetentionCandidateTx(self: *Store) Error!bool {
+            var row = try self.statement("SELECT 1 FROM retained_subject_summaries INDEXED BY retained_subject_candidates WHERE candidate_sequence IS NOT NULL LIMIT 1;");
+            defer row.deinit();
+            return row.row();
+        }
         pub fn historyRetentionStep(self: *Store, policy: HistoryRetention, now_us: i64) Error!RetentionOutcome {
             try policy.validate();
             try self.beginWrite();
             errdefer self.rollback();
+            const outcome = self.historyRetentionTx(policy, now_us) catch |failure| {
+                if (failure != error.Interrupted) return failure;
+                // All mutations are owned by this transaction; publish nothing after a work-limit rollback.
+                return self.yieldRetention();
+            };
+            try self.fault(.before_history_retention_commit);
+            try self.commitTransaction();
+            self.retention_aux_turn = if (self.retention_aux_turn == 2) 0 else self.retention_aux_turn + 1;
+            if (outcome != .idle and outcome != .yielded) self.retention_page = @min(store.max_retention_page, self.retention_page *| 2);
+            return outcome;
+        }
+        fn historyRetentionTx(self: *Store, policy: HistoryRetention, now_us: i64) Error!RetentionOutcome {
             const schema = try self.integer("PRAGMA user_version;");
             if (schema < store.load_repair_schema) return error.MaintenanceStorageRequired;
             if (schema > latest_schema) return error.UnsupportedSchema;
-            const fence = try self.historyFence() orelse {
-                try self.commitTransaction();
-                return .idle;
-            };
             var current = try self.readRetentionPolicy();
             if (current.max_matches != policy.max_matches) {
                 _ = try self.beginRetentionGenerationTx(policy.max_matches);
                 current = try self.readRetentionPolicy();
             }
-            if (!current.published) {
-                const outcome = try self.sweepCandidatesTx(current);
-                try self.commitTransaction();
-                return outcome;
-            }
-            const cutoff = std.math.sub(i64, now_us, policy.age_us) catch std.math.minInt(i64);
-            var wrote = false;
-            const deleted = self.deleteDetailPage(current, fence, cutoff, self.retention_page, &wrote) catch |failure| {
-                if (failure != error.Interrupted or wrote) return failure;
-                return self.yieldRetention();
+            const fence = try self.historyFence();
+            const quantum = @min(@as(usize, 32), self.retention_page);
+            if (self.retention_aux_turn == 0) if (current.subject_cursor) |cursor| {
+                try self.sweepLegacySubjectsTx(cursor, quantum, current, fence);
+                return .rebuilt;
             };
-            const outcome: RetentionOutcome = if (deleted != 0) .details else if (try self.prunePrefixPage(current, fence, cutoff, now_us) != 0) .prefix else .idle;
-            try self.fault(.before_history_retention_commit);
-            try self.commitTransaction();
-            if (outcome == .details) self.retention_page = @min(store.max_retention_page, self.retention_page *| 2);
-            return outcome;
+            if (self.retention_aux_turn == 1) if (current.retry_cursor) |cursor| {
+                try self.sweepRetryEvidenceTx(cursor, quantum);
+                return .rebuilt;
+            };
+            if (!current.published) return self.sweepCandidatesTx(current);
+            const consumed = fence orelse return if (current.subject_cursor != null or current.retry_cursor != null or try self.hasRetentionCandidateTx()) .yielded else .idle;
+            const cutoff = std.math.sub(i64, now_us, policy.age_us) catch std.math.minInt(i64);
+            if (try self.deleteDetailPage(current, consumed, cutoff, self.retention_page) != 0) return .details;
+            if (try self.prunePrefixPage(current, consumed, cutoff, now_us) != 0) return .prefix;
+            return if (current.subject_cursor != null or current.retry_cursor != null or try self.hasRetentionCandidateTx()) .yielded else .idle;
         }
         fn yieldRetention(self: *Store) Error!RetentionOutcome {
             const prior_rollback = self.rollback_error_code;
@@ -1651,6 +2297,29 @@ pub fn Methods(comptime Store: type) type {
         };
 
         pub const ReclaimOutcome = enum { deleted, scanned, idle };
+        const ReclaimPage = struct { high: i64, maximum: i64, deleted: bool };
+        fn reclaimPageTx(self: *Store, phase_index: u2, cursor: i64, window: i64) Error!ReclaimPage {
+            const phase = reclaim_phases[phase_index];
+            const maximum = try self.integer(phase.max_sql);
+            const high = blk: {
+                var seek = try self.statement(phase.seek_sql);
+                defer seek.deinit();
+                try seek.int(1, cursor);
+                try seek.int(2, window - 1);
+                break :blk if (try seek.row()) try seek.signed(0) else maximum;
+            };
+            for (phase.tables) |table| self.deletedRows(table);
+            var deleted = false;
+            if (cursor < maximum) for (phase.statements) |sql| {
+                var row = try self.statement(sql);
+                defer row.deinit();
+                try row.int(1, cursor);
+                try row.int(2, high);
+                try row.done();
+                if (self.api.changes(self.db) != 0) deleted = true;
+            };
+            return .{ .high = high, .maximum = maximum, .deleted = deleted };
+        }
         pub fn reclaimObsoleteOne(self: *Store) Error!ReclaimOutcome {
             const diag_span = if (comptime build_options.diag) diag_mod.enter(.obsolete_reclaim) else {};
             defer if (comptime build_options.diag) diag_mod.leave(diag_span);
@@ -1662,28 +2331,10 @@ pub fn Methods(comptime Store: type) type {
             try self.beginWrite();
             errdefer self.rollback();
             var next = self.reclaim;
-            var deleted = false;
-            const phase = reclaim_phases[next.phase];
-            const maximum = try self.integer(phase.max_sql);
-            const high = blk: {
-                var seek = try self.statement(phase.seek_sql);
-                defer seek.deinit();
-                try seek.int(1, next.cursor);
-                try seek.int(2, reclaim_window - 1);
-                break :blk if (try seek.row()) try seek.signed(0) else maximum;
-            };
-            for (phase.tables) |table| self.deletedRows(table);
-            if (next.cursor < maximum) for (phase.statements) |sql| {
-                var row = try self.statement(sql);
-                defer row.deinit();
-                try row.int(1, next.cursor);
-                try row.int(2, high);
-                try row.done();
-                if (self.api.changes(self.db) != 0) deleted = true;
-            };
-            next.found = next.found or deleted;
+            const page = try self.reclaimPageTx(next.phase, next.cursor, reclaim_window);
+            next.found = next.found or page.deleted;
             var idle = false;
-            if (high >= maximum) {
+            if (page.high >= page.maximum) {
                 next.cursor = 0;
                 next.phase += 1;
                 if (next.phase == reclaim_phases.len) {
@@ -1691,15 +2342,48 @@ pub fn Methods(comptime Store: type) type {
                     idle = !next.found;
                     next.found = false;
                 }
-            } else next.cursor = high;
+            } else next.cursor = page.high;
             if (idle) next.rest = 63;
             try self.commitTransaction();
             if (comptime build_options.diag) {
                 diag_mod.count(.reclaim_pages, 1);
-                if (high >= maximum and next.phase == 0) diag_mod.count(.reclaim_passes, 1);
+                if (page.high >= page.maximum and next.phase == 0) diag_mod.count(.reclaim_passes, 1);
             }
             self.reclaim = next;
-            return if (deleted) .deleted else if (idle) .idle else .scanned;
+            return if (page.deleted) .deleted else if (idle) .idle else .scanned;
+        }
+
+        fn reclaimCustomCompatibilityAttempt(self: *Store, cursor: store.ReclaimCursor, window: u16) Error!ReclaimPage {
+            errdefer self.rollback();
+            try self.beginAdmissionWrite();
+            const page = try self.reclaimPageTx(cursor.phase, cursor.cursor, window);
+            try self.commitTransaction();
+            return page;
+        }
+
+        // Borrows the startup admission through one operation savepoint per page.
+        // The caller owns the transient intent/revision cursor; normal maintenance state is untouched.
+        pub fn reclaimCustomCompatibilityPage(self: *Store, cursor: *store.ReclaimCursor, window: *u16) Error!void {
+            if (!self.startupAdmissionActive()) return error.DatabaseFailure;
+            if (cursor.phase < 1 or cursor.phase > 2 or window.* == 0 or window.* > reclaim_window) return error.InvalidMaintenanceState;
+            while (true) {
+                const prior_rollback = self.rollback_error_code;
+                self.rollback_error_code = null;
+                const page = self.reclaimCustomCompatibilityAttempt(cursor.*, window.*) catch |failure| {
+                    const clean = self.rollback_error_code == null and self.startupAdmissionActive();
+                    if (self.rollback_error_code == null) self.rollback_error_code = prior_rollback;
+                    if (failure != error.Interrupted or !clean) return failure;
+                    if (window.* == 1) return error.MaintenanceWorkExhausted;
+                    window.* /= 2;
+                    continue;
+                };
+                self.rollback_error_code = prior_rollback;
+                if (page.high >= page.maximum) {
+                    cursor.cursor = 0;
+                    cursor.phase += 1;
+                } else cursor.cursor = page.high;
+                return;
+            }
         }
 
         pub const MaintenanceRequest = struct {
@@ -1714,9 +2398,13 @@ pub fn Methods(comptime Store: type) type {
             return outcome;
         }
         fn maintenanceStepInner(self: *Store, request: MaintenanceRequest) Error!health.MaintenanceOutcome {
-            if (request.history_caught_up) {
+            const history_pending = self.history_retention_rest;
+            if (request.history_caught_up) self.history_retention_rest = false;
+            if (request.history_caught_up and !history_pending) {
                 self.maintenance_operation = .history_details;
-                switch (try self.historyRetentionStep(request.retention, request.now_us)) {
+                const result = try self.historyRetentionStep(request.retention, request.now_us);
+                self.history_retention_rest = result != .idle;
+                switch (result) {
                     .idle => {},
                     .yielded => return .{ .wait = .history_details },
                     .rebuilt, .published => return .{ .progress = .history_rebuild },
@@ -1747,7 +2435,7 @@ pub fn Methods(comptime Store: type) type {
                 },
             };
             if (!serviced) if (try self.reclaimStep()) |outcome| return outcome;
-            return .idle;
+            return if (history_pending) .{ .wait = .history_details } else .idle;
         }
         fn reclaimStep(self: *Store) Error!?health.MaintenanceOutcome {
             self.maintenance_operation = .obsolete_rows;
@@ -1904,10 +2592,43 @@ pub fn Methods(comptime Store: type) type {
             try self.commitConsumerClock(batch);
             try self.commitTransaction();
         }
+        pub const max_history_commit_pages = 4;
+        pub const HistoryCommit = struct { batch: consumers.Batch, token: effect_history.PageToken };
+
         pub fn commitConfirmedHistory(self: *Store, manifest: consumers.Manifest, batch: consumers.Batch, token: effect_history.PageToken) Error!void {
-            const next = try checkHistoryBatch(manifest, batch, token.installation);
+            if (!try self.commitConfirmedHistoryGroup(manifest, &.{.{ .batch = batch, .token = token }})) return error.MaintenanceWorkExhausted;
+        }
+
+        pub fn commitConfirmedHistoryGroup(self: *Store, manifest: consumers.Manifest, pages: []const HistoryCommit) Error!bool {
+            if (pages.len == 0 or pages.len > max_history_commit_pages) return error.InvalidHistoryTransition;
             try self.beginWrite();
             errdefer self.rollback();
+            self.commitHistoryPagesTx(manifest, pages) catch |failure| {
+                if (failure != error.Interrupted) return failure;
+                const prior_rollback = self.rollback_error_code;
+                self.rollback_error_code = null;
+                self.rollback();
+                const clean = !self.reopen_required and self.rollback_error_code == null and self.api.get_autocommit(self.db) != 0;
+                if (self.rollback_error_code == null) self.rollback_error_code = prior_rollback;
+                if (!clean) return error.Interrupted;
+                if (pages.len == 1) return error.MaintenanceWorkExhausted;
+                if (comptime build_options.diag) diag_mod.count(.history_yields, 1);
+                return false;
+            };
+            if (comptime build_options.diag) {
+                diag_mod.count(.history_groups, 1);
+                diag_mod.count(.history_pages, pages.len);
+            }
+            return true;
+        }
+
+        fn commitHistoryPagesTx(self: *Store, manifest: consumers.Manifest, pages: []const HistoryCommit) Error!void {
+            for (pages) |page| try self.commitConfirmedHistoryTx(manifest, page.batch, page.token);
+            try self.commitTransaction();
+        }
+
+        fn commitConfirmedHistoryTx(self: *Store, manifest: consumers.Manifest, batch: consumers.Batch, token: effect_history.PageToken) Error!void {
+            const next = try checkHistoryBatch(manifest, batch, token.installation);
             try self.validateConfirmedEffectPageTx(token);
             try self.checkManifestBatch(manifest, batch, false, true);
             if (token.last_sequence == token.after_sequence) return error.HistoryCaughtUp;
@@ -1926,7 +2647,6 @@ pub fn Methods(comptime Store: type) type {
             try self.writeConsumerBatch(batch);
             try self.fault(.before_consumer_input_commit);
             try self.commitConsumerClock(batch);
-            try self.commitTransaction();
         }
     };
 }

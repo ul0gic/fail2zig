@@ -200,21 +200,38 @@ pub const Processor = struct {
     }
 
     fn encode(self: *Processor, counters: policy.Counters) void {
-        @memcpy(self.staged_bytes[0..4], "F2NT");
-        std.mem.writeInt(u16, self.staged_bytes[4..6], checkpoint_version, .little);
-        @memset(self.staged_bytes[6..8], 0);
-        @memcpy(self.staged_bytes[8..40], &self.generation);
-        inline for (counter_fields, 0..) |field, i| std.mem.writeInt(u64, self.staged_bytes[40 + i * 8 ..][0..8], @field(counters, field), .little);
-        std.mem.writeInt(u64, self.staged_bytes[96..104], self.staged_encoding_replaced, .little);
+        encodeCounters(self.generation, counters, self.staged_encoding_replaced, &self.staged_bytes);
     }
     fn decode(self: *const Processor, bytes: []const u8) !policy.Counters {
+        return decodeCounters(self.generation, bytes);
+    }
+    fn encodeCounters(generation: [32]u8, counters: policy.Counters, replaced: u64, out: *[checkpoint_bytes]u8) void {
+        @memcpy(out[0..4], "F2NT");
+        std.mem.writeInt(u16, out[4..6], checkpoint_version, .little);
+        @memset(out[6..8], 0);
+        @memcpy(out[8..40], &generation);
+        inline for (counter_fields, 0..) |field, i| std.mem.writeInt(u64, out[40 + i * 8 ..][0..8], @field(counters, field), .little);
+        std.mem.writeInt(u64, out[96..104], replaced, .little);
+    }
+    fn decodeCounters(generation: [32]u8, bytes: []const u8) !policy.Counters {
         if ((bytes.len != checkpoint_bytes and bytes.len != legacy_checkpoint_bytes) or !std.mem.eql(u8, bytes[0..4], "F2NT")) return error.ForeignSourceCheckpoint;
         if (std.mem.readInt(u16, bytes[4..6], .little) != checkpoint_version or bytes[6] != 0 or bytes[7] != 0) return error.UnsupportedSourceCheckpoint;
-        if (!std.mem.eql(u8, bytes[8..40], &self.generation)) return error.SourceGenerationMismatch;
+        if (!std.mem.eql(u8, bytes[8..40], &generation)) return error.SourceGenerationMismatch;
         var counters = policy.Counters{};
         inline for (counter_fields, 0..) |field, i| @field(counters, field) = std.mem.readInt(u64, bytes[40 + i * 8 ..][0..8], .little);
         try counters.validate();
         return counters;
+    }
+    fn decodeReplacements(bytes: []const u8, counters: policy.Counters) !u64 {
+        const replaced = if (bytes.len == checkpoint_bytes) std.mem.readInt(u64, bytes[96..104], .little) else 0;
+        const total = counters.eligible + counters.obsolete + counters.missing + counters.malformed + counters.future;
+        if (replaced > total) return error.InvalidTimeCounters;
+        return replaced;
+    }
+    pub fn rebindCheckpoint(old_generation: [32]u8, new_generation: [32]u8, saved: []const u8, out: *[checkpoint_bytes]u8) !void {
+        const counters = try decodeCounters(old_generation, saved);
+        const replaced = try decodeReplacements(saved, counters);
+        encodeCounters(new_generation, counters, replaced, out);
     }
     fn stage(self: *Processor, counters: policy.Counters, restoring: bool, replaced: u64) void {
         self.staged_encoding_replaced = replaced;
@@ -249,9 +266,7 @@ pub const Processor = struct {
         const self: *Processor = @ptrCast(@alignCast(context.?));
         if (self.in_flight) return error.ProcessorBusy;
         const counters = if (saved) |bytes| try self.decode(bytes) else policy.Counters{};
-        const replaced = if (saved) |bytes| if (bytes.len == checkpoint_bytes) std.mem.readInt(u64, bytes[96..104], .little) else 0 else 0;
-        const total = counters.eligible + counters.obsolete + counters.missing + counters.malformed + counters.future;
-        if (replaced > total) return error.InvalidTimeCounters;
+        const replaced = if (saved) |bytes| try decodeReplacements(bytes, counters) else 0;
         self.stage(counters, true, replaced);
         return .{ .context = self, .publish = publish, .release = release };
     }
@@ -321,18 +336,29 @@ pub const Processor = struct {
             const offset = record.byte_start orelse 0;
             if (record.byte_start == null and self.options.timestamp != .journal) return error.MissingSourceOffset;
             var encoding_replaced = false;
-            var decoding_limit = false;
-            const decoded = if (self.options.timestamp == .journal)
-                try text.decode(self.options.encoding, record.message, self.scratch, offset, self.options.bom)
-            else blk: {
+            var decoding_rejected = false;
+            const decoded = if (self.options.timestamp == .journal) blk: {
+                const value = text.decode(self.options.encoding, record.message, self.scratch, offset, self.options.bom) catch |failure| switch (failure) {
+                    error.InvalidEncoding, error.IncompleteEncoding, error.OutputTooSmall => {
+                        decoding_rejected = true;
+                        break :blk "";
+                    },
+                    else => return failure,
+                };
+                if (std.mem.indexOfAny(u8, value, "\x00\r\n") != null) {
+                    decoding_rejected = true;
+                    break :blk "";
+                }
+                break :blk value;
+            } else blk: {
                 const value = try text.decodeFile(self.options.encoding, record.message, self.scratch, offset, self.options.bom);
                 // Overflow produces no matchable prefix; the complete raw record still receives a disposition.
-                decoding_limit = value.exceeded;
+                decoding_rejected = value.exceeded;
                 encoding_replaced = value.replaced;
                 break :blk value.text;
             };
             var inferred_year: ?u16 = null;
-            const input: policy.Input = if (decoding_limit) .{ .rejected = .malformed } else switch (self.options.timestamp) {
+            const input: policy.Input = if (decoding_rejected) .{ .rejected = .malformed } else switch (self.options.timestamp) {
                 .field => |field| blk: {
                     const parsed = try fieldInput(field, decoded, receipt);
                     inferred_year = parsed.inferred_year;
@@ -350,7 +376,7 @@ pub const Processor = struct {
                 now.us = try selected(record, now.us, consumer.context);
             };
             processing_us = now.us;
-            outcome = if (decoding_limit) .{ .rejected = .{ .reason = .malformed, .receipt = receipt } } else try policy.evaluate(if (self.options.timestamp == .undated) .undated else .timestamped, input, receipt, now, self.options.window_us);
+            outcome = if (decoding_rejected) .{ .rejected = .{ .reason = .malformed, .receipt = receipt } } else try policy.evaluate(if (self.options.timestamp == .undated) .undated else .timestamped, input, receipt, now, self.options.window_us);
             if (encoding_replaced) {
                 outcome = outcome.?.withEncodingReplacement();
                 replaced_count = std.math.add(u64, replaced_count, 1) catch return error.TimeCounterLimit;

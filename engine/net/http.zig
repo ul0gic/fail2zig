@@ -47,17 +47,6 @@ pub const StatusSource = struct {
     ) anyerror!void = defaultWriteStatus,
 };
 
-pub const BansSource = struct {
-    ctx: ?*anyopaque = null,
-    write: *const fn (
-        ctx: ?*anyopaque,
-        out: *std.ArrayListUnmanaged(u8),
-        a: std.mem.Allocator,
-    ) anyerror!void = defaultWriteBans,
-};
-
-pub const max_bans_in_snapshot: usize = 200;
-
 fn defaultWriteMetrics(
     ctx: ?*anyopaque,
     out: *std.ArrayListUnmanaged(u8),
@@ -78,18 +67,6 @@ fn defaultWriteStatus(
     try out.appendSlice(a, "{\"status\":\"ok\"}");
 }
 
-fn defaultWriteBans(
-    ctx: ?*anyopaque,
-    out: *std.ArrayListUnmanaged(u8),
-    a: std.mem.Allocator,
-) anyerror!void {
-    _ = ctx;
-    try out.appendSlice(
-        a,
-        "{\"set_name\":\"fail2zig_bans\",\"family\":\"inet\",\"table\":\"fail2zig\",\"count\":0,\"elements\":[]}",
-    );
-}
-
 const ClientReg = struct {
     server: *HttpServer,
     fd: posix.fd_t,
@@ -108,7 +85,6 @@ pub const HttpServer = struct {
     metrics_source: MetricsSource = .{},
     status_source: StatusSource = .{},
     health_source: StatusSource = .{},
-    bans_source: BansSource = .{},
     ws_server: ?*ws_mod.WsServer = null,
     clients: [max_clients]?*ClientReg = [_]?*ClientReg{null} ** max_clients,
     accept_bucket_epoch_s: i64 = 0,
@@ -188,10 +164,6 @@ pub const HttpServer = struct {
     }
     pub fn setStatusSource(self: *HttpServer, s: StatusSource) void {
         self.status_source = s;
-    }
-
-    pub fn setBansSource(self: *HttpServer, s: BansSource) void {
-        self.bans_source = s;
     }
 
     pub fn setWsServer(self: *HttpServer, server: ?*ws_mod.WsServer) void {
@@ -372,7 +344,7 @@ pub const HttpServer = struct {
             try self.respondHealth(cli.fd);
             return .close;
         } else if (std.mem.eql(u8, path, "/api/bans")) {
-            try self.respondBans(cli.fd);
+            try writeSimpleResponse(cli.fd, 403, "Forbidden", "text/plain", "ban details require administrator access through the local socket\n");
             return .close;
         } else if (std.mem.eql(u8, path, "/events")) {
             return self.tryWsUpgrade(cli, hdr_end_idx);
@@ -440,7 +412,13 @@ pub const HttpServer = struct {
     fn respondMetrics(self: *HttpServer, fd: posix.fd_t) !void {
         var body: std.ArrayListUnmanaged(u8) = .{};
         defer body.deinit(self.allocator);
-        try self.metrics_source.write(self.metrics_source.ctx, &body, self.allocator);
+        self.metrics_source.write(self.metrics_source.ctx, &body, self.allocator) catch |failure| switch (failure) {
+            error.ResponseTooLarge, error.SnapshotLimit => {
+                try writeSimpleResponse(fd, 500, "Internal Server Error", "text/plain", "metrics body too large\n");
+                return;
+            },
+            else => return failure,
+        };
         if (body.items.len > max_response_bytes) {
             try writeSimpleResponse(fd, 500, "Internal Server Error", "text/plain", "metrics body too large\n");
             return;
@@ -451,7 +429,13 @@ pub const HttpServer = struct {
     fn respondStatus(self: *HttpServer, fd: posix.fd_t) !void {
         var body: std.ArrayListUnmanaged(u8) = .{};
         defer body.deinit(self.allocator);
-        try self.status_source.write(self.status_source.ctx, &body, self.allocator);
+        self.status_source.write(self.status_source.ctx, &body, self.allocator) catch |failure| switch (failure) {
+            error.ResponseTooLarge, error.SnapshotLimit => {
+                try writeSimpleResponse(fd, 500, "Internal Server Error", "text/plain", "status body too large\n");
+                return;
+            },
+            else => return failure,
+        };
         if (body.items.len > max_response_bytes) {
             try writeSimpleResponse(fd, 500, "Internal Server Error", "text/plain", "status body too large\n");
             return;
@@ -462,7 +446,13 @@ pub const HttpServer = struct {
     fn respondHealth(self: *HttpServer, fd: posix.fd_t) !void {
         var body: std.ArrayListUnmanaged(u8) = .{};
         defer body.deinit(self.allocator);
-        try self.health_source.write(self.health_source.ctx, &body, self.allocator);
+        self.health_source.write(self.health_source.ctx, &body, self.allocator) catch |failure| switch (failure) {
+            error.ResponseTooLarge, error.SnapshotLimit => {
+                try writeSimpleResponse(fd, 500, "Internal Server Error", "text/plain", "health body too large\n");
+                return;
+            },
+            else => return failure,
+        };
         if (body.items.len > max_response_bytes) {
             try writeSimpleResponse(fd, 500, "Internal Server Error", "text/plain", "health body too large\n");
             return;
@@ -472,17 +462,6 @@ pub const HttpServer = struct {
         } else {
             try writeResponse(fd, 503, "Service Unavailable", "application/json", body.items);
         }
-    }
-
-    fn respondBans(self: *HttpServer, fd: posix.fd_t) !void {
-        var body: std.ArrayListUnmanaged(u8) = .{};
-        defer body.deinit(self.allocator);
-        try self.bans_source.write(self.bans_source.ctx, &body, self.allocator);
-        if (body.items.len > max_response_bytes) {
-            try writeSimpleResponse(fd, 500, "Internal Server Error", "text/plain", "bans body too large\n");
-            return;
-        }
-        try writeResponse(fd, 200, "OK", "application/json", body.items);
     }
 
     fn closeClient(self: *HttpServer, cli: *ClientReg) void {

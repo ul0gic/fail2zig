@@ -141,6 +141,13 @@ pub const Session = struct {
         self.in_flight = true;
         return .{ .owner = self, .checkpoint = &self.bytes, .outcome = null };
     }
+    pub fn rebindCheckpoint(old_binding: [32]u8, new_binding: [32]u8, ttl_seconds: u64, hostname_enabled: bool, saved: []const u8, out: *[checkpoint_bytes]u8) !void {
+        const previous = try Session.init(old_binding, ttl_seconds, hostname_enabled);
+        const state = try previous.decode(saved);
+        var next = try Session.init(new_binding, ttl_seconds, hostname_enabled);
+        try next.encode(state);
+        out.* = next.bytes;
+    }
     pub fn prepareSnapshot(self: *Session) !Prepared {
         if (self.in_flight) return error.ConsumerBusy;
         try self.encode(self.live);

@@ -448,6 +448,19 @@ pub const Cache = struct {
             self.owner.in_flight = false;
         }
     };
+    pub const RetireStage = struct {
+        owner: *Cache,
+        index: usize,
+        entry: CacheEntry,
+        payload_sha256: [32]u8,
+
+        pub fn publish(self: *const RetireStage) void {
+            self.owner.entries[self.index] = null;
+        }
+        pub fn release(self: *const RetireStage) void {
+            self.owner.in_flight = false;
+        }
+    };
     pub fn init(allocator: std.mem.Allocator, generation: [32]u8, capacity: usize) !Cache {
         if (capacity == 0 or capacity > 1024 or capacity * @sizeOf(?[cache_entry_bytes]u8) > 1024 * 1024) return error.DnsCacheLimit;
         const entries = try allocator.alloc(?[cache_entry_bytes]u8, capacity);
@@ -473,7 +486,7 @@ pub const Cache = struct {
         try request.name.validate();
         if (!std.mem.eql(u8, &request.generation, &self.generation)) return error.DnsGenerationMismatch;
         const index = self.indexOf(request) orelse return null;
-        const entry = try decodeEntry(&self.entries[index].?);
+        const entry = try decodeCheckpoint(&self.entries[index].?);
         if (now_us < entry.result.completed_us) return error.DnsClockReversed;
         if (now_us >= entry.result.valid_until_us) return null;
         return entry;
@@ -504,9 +517,21 @@ pub const Cache = struct {
         self.in_flight = true;
         return stage;
     }
-    pub fn prepareRestore(self: *Cache, bytes: []const u8) !Stage {
+    pub fn prepareRetire(self: *Cache, index: usize, now_us: i64) !?RetireStage {
         if (self.in_flight) return error.DnsCacheBusy;
-        const entry = try decodeEntry(bytes);
+        if (index >= self.entries.len) return error.InvalidDnsCheckpoint;
+        const bytes = &(self.entries[index] orelse return null);
+        const entry = try decodeCheckpoint(bytes);
+        if (!std.mem.eql(u8, &entry.result.request.generation, &self.generation)) return error.DnsGenerationMismatch;
+        if (now_us < entry.result.completed_us) return error.DnsClockReversed;
+        if (now_us < entry.result.valid_until_us) return null;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        self.in_flight = true;
+        return .{ .owner = self, .index = index, .entry = entry, .payload_sha256 = digest };
+    }
+    pub fn prepareRestore(self: *Cache, entry: CacheEntry) !Stage {
+        if (self.in_flight) return error.DnsCacheBusy;
         if (!std.mem.eql(u8, &entry.result.request.generation, &self.generation)) return error.DnsGenerationMismatch;
         if (self.indexOf(entry.result.request) != null) return error.DuplicateDnsCheckpoint;
         var index: ?usize = null;
@@ -515,7 +540,7 @@ pub const Cache = struct {
             break;
         };
         var stage = Stage{ .owner = self, .index = index orelse return error.DnsCacheLimit, .expected_revision = 0, .entry = entry, .bytes = undefined };
-        @memcpy(&stage.bytes, bytes);
+        try encodeEntry(entry, &stage.bytes);
         self.in_flight = true;
         return stage;
     }
@@ -570,7 +595,7 @@ fn encodeEntry(entry: CacheEntry, bytes: *[cache_entry_bytes]u8) !void {
     std.mem.writeInt(u64, bytes[584..592], entry.revision, .little);
     std.mem.writeInt(u32, bytes[592..596], entry.result.answer.ttl_seconds, .little);
 }
-fn decodeEntry(bytes: []const u8) !CacheEntry {
+pub fn decodeCheckpoint(bytes: []const u8) !CacheEntry {
     if (bytes.len != cache_entry_bytes or !std.mem.eql(u8, bytes[0..4], "F2ND")) return error.InvalidDnsCheckpoint;
     if (std.mem.readInt(u16, bytes[4..6], .little) != version) return error.UnsupportedDnsCheckpoint;
     const family: Family = switch (bytes[6]) {

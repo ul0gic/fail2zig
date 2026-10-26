@@ -8,7 +8,7 @@ const bridge = @import("../core/native_consumer_coordinator.zig");
 const detection = @import("../core/native_detection_record.zig");
 const consumer = @import("../core/native_consumer.zig");
 
-pub const version: u16 = 2;
+pub const version: u16 = 3;
 pub const max_rule_bytes = 4096;
 pub const Prepared = struct {
     allocator: std.mem.Allocator,
@@ -51,20 +51,17 @@ pub const Prepared = struct {
         errdefer a.free(self.jail_name);
         errdefer for (self.owned_programs[0..self.count]) |program| program.destroy();
         var hash = Hash.init();
-        try hash.part("fail2zig-native-consumer-plan-v2");
+        try hash.part("fail2zig-native-consumer-plan-v3");
         try hash.part(&resolver_generation);
         try std.json.stringify(.{
             .jail_name = jail.name,
             .filter = jail.filter,
             .resolved_source = source,
-            .effective_ignoreip = literals,
         }, .{}, hash.writer());
         var hostname_rules: usize = 0;
         for (jail.rule_files) |path| {
             const bytes = try readProtected(a, path, max_rule_bytes, null);
             defer a.free(bytes);
-            try hash.part(path);
-            try hash.part(bytes);
             const program = try rules.Program.create(a, bytes, .{});
             errdefer program.destroy();
             const spec = program.metadata();
@@ -78,12 +75,35 @@ pub const Prepared = struct {
             self.count += 1;
         }
         self.programs = self.program_views[0..self.count];
-        const file_text = if (jail.ignore_file) |path| try readProtected(a, path, ignore.max_file_bytes, null) else null;
+        self.parent_generation = hash.state.finalResult();
+        self.ignore_options = .{ .parent_generation = self.parent_generation, .resolver_generation = resolver_generation, .family = .both };
+        const snapshot = try buildIgnore(a, self.ignore_options, literals, jail.ignore_file);
+        errdefer snapshot.destroy();
+        var hostname_count = hostname_rules;
+        for (snapshot.entries) |entry| if (entry == .hostname) {
+            hostname_count += 1;
+        };
+        if (hostname_count != 0 and std.mem.allEqual(u8, &resolver_generation, 0)) return error.HostnameResolutionRequired;
+        if (hostname_count > consumer.max_dependencies - 2) return error.ConsumerCapacity;
+        self.initial_ignore = snapshot;
+        self.settings = .{ .jail = self.jail_name, .logical_source = self.logical_source, .filter = filter, .parent_generation = self.parent_generation, .ignore_generation = snapshot.generation, .family = .both, .journal = source == .journald };
+        self.reserved_bytes = @sizeOf(Prepared) + self.jail_name.len + self.count * @sizeOf(rules.Program) + @sizeOf(ignore.Snapshot) + snapshot.entries.len * @sizeOf(ignore.Entry) + snapshot.payload.len;
+        self.preparation_bytes = try reservationBytes(self.count);
+        return self;
+    }
+
+    pub fn legacySemanticGeneration(self: *const Prepared, old_parent: [32]u8, initial: *const ignore.Snapshot, settings: bridge.Settings, resolver: ?[32]u8) ![32]u8 {
+        var prior = settings;
+        prior.parent_generation = old_parent;
+        prior.ignore_generation = initial.generation;
+        if (!std.mem.eql(u8, &old_parent, &initial.options.parent_generation)) return error.IgnoreGenerationMismatch;
+        return bridge.legacyGenerationFromPolicy(prior, self.programs, initial, resolver);
+    }
+
+    pub fn buildIgnore(a: std.mem.Allocator, options: ignore.Options, literals: []const []const u8, path: ?[]const u8) !*ignore.Snapshot {
+        if (literals.len > ignore.max_entries) return error.IgnoreLimit;
+        const file_text = if (path) |value| try readProtected(a, value, ignore.max_file_bytes, null) else null;
         defer if (file_text) |bytes| a.free(bytes);
-        if (file_text) |bytes| {
-            try hash.part(jail.ignore_file.?);
-            try hash.part(bytes);
-        }
         var values: [ignore.max_entries][]const u8 = undefined;
         @memcpy(values[0..literals.len], literals);
         var value_count = literals.len;
@@ -100,21 +120,7 @@ pub const Prepared = struct {
                 value_count += 1;
             }
         }
-        self.parent_generation = hash.state.finalResult();
-        self.ignore_options = .{ .parent_generation = self.parent_generation, .resolver_generation = resolver_generation, .family = .both };
-        const snapshot = try ignore.Snapshot.create(a, self.ignore_options, values[0..value_count]);
-        errdefer snapshot.destroy();
-        var hostname_count = hostname_rules;
-        for (snapshot.entries) |entry| if (entry == .hostname) {
-            hostname_count += 1;
-        };
-        if (hostname_count != 0 and std.mem.allEqual(u8, &resolver_generation, 0)) return error.HostnameResolutionRequired;
-        if (hostname_count > consumer.max_dependencies - 2) return error.ConsumerCapacity;
-        self.initial_ignore = snapshot;
-        self.settings = .{ .jail = self.jail_name, .logical_source = self.logical_source, .filter = filter, .parent_generation = self.parent_generation, .ignore_generation = snapshot.generation, .family = .both, .journal = source == .journald };
-        self.reserved_bytes = @sizeOf(Prepared) + self.jail_name.len + self.count * @sizeOf(rules.Program) + @sizeOf(ignore.Snapshot) + snapshot.entries.len * @sizeOf(ignore.Entry) + snapshot.payload.len;
-        self.preparation_bytes = try reservationBytes(self.count);
-        return self;
+        return ignore.Snapshot.create(a, options, values[0..value_count]);
     }
 
     pub fn destroy(self: *Prepared) void {

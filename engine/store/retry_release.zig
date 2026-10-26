@@ -9,6 +9,7 @@ pub fn Methods(comptime Store: type) type {
         pub fn releaseRetryDecision(self: *Store, jail: []const u8, subject: detection.Subject, now_us: i64) Error!bool {
             try self.beginWrite();
             errdefer self.rollback();
+            try self.requireRetryProjectionMutationTx();
             if (self.schema_version < 16) return error.RetryStorageRequired;
             const releasable = blk: {
                 var row = try self.statement("SELECT lease_kind,deadline_us,length(attempts) FROM retry_states WHERE jail=?1 AND family=?2 AND subject=?3;");
@@ -32,6 +33,8 @@ pub fn Methods(comptime Store: type) type {
                 try Store.bindSubject(&update, &subject);
                 try update.done();
                 if (self.api.changes(self.db) != 1) return error.InvalidRetryState;
+                try self.syncRetryProjectionRowTx(jail, &subject);
+                try self.changeRetryJailSummaryTx(jail, 0, 0);
             }
             try self.commitTransaction();
             return releasable;

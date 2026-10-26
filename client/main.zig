@@ -86,27 +86,28 @@ pub fn run(
             return doRequest(allocator, parsed.globals, .{ .status = {} }, stdout, stderr, color, formatStatusCmd);
         },
         .stats => |options| {
-            if (options.details) return doQuery(allocator, parsed.globals, stdout, stderr, color, "stats", null, null, null, format.formatStatsDetailed);
-            return doQuery(allocator, parsed.globals, stdout, stderr, color, "stats", null, null, null, format.formatStats);
+            if (options.details) return doQuery(allocator, parsed.globals, stdout, stderr, color, "stats", null, null, null, false, format.formatStatsDetailed);
+            return doQuery(allocator, parsed.globals, stdout, stderr, color, "stats", null, null, null, false, format.formatStats);
         },
         .list => |l| {
             _ = parseJailId(l.jail, stderr) catch return .client_error;
             if (l.sort) {
-                if (l.details) return doList(allocator, parsed.globals, l.jail, l.origin, stdout, stderr, color, formatSortedListDetailsCmd);
-                return doList(allocator, parsed.globals, l.jail, l.origin, stdout, stderr, color, formatSortedListCmd);
+                if (l.details) return doList(allocator, parsed.globals, l.jail, l.origin, l.details, stdout, stderr, color, formatSortedListDetailsCmd);
+                return doList(allocator, parsed.globals, l.jail, l.origin, l.details, stdout, stderr, color, formatSortedListCmd);
             }
-            if (l.details) return doList(allocator, parsed.globals, l.jail, l.origin, stdout, stderr, color, formatListDetailsCmd);
-            return doList(allocator, parsed.globals, l.jail, l.origin, stdout, stderr, color, formatListCmd);
+            if (l.details) return doList(allocator, parsed.globals, l.jail, l.origin, l.details, stdout, stderr, color, formatListDetailsCmd);
+            return doList(allocator, parsed.globals, l.jail, l.origin, l.details, stdout, stderr, color, formatListCmd);
         },
         .jails => |options| {
             if (options.details) return doRequest(allocator, parsed.globals, .{ .list_jails = {} }, stdout, stderr, color, formatJailsDetailsCmd);
             return doRequest(allocator, parsed.globals, .{ .list_jails = {} }, stdout, stderr, color, formatJailsCmd);
         },
         .reload => return doReload(allocator, parsed.globals, stdout, stderr),
-        .config => return doQuery(allocator, parsed.globals, stdout, stderr, color, "config", null, null, null, format.formatConfig),
+        .config => return doQuery(allocator, parsed.globals, stdout, stderr, color, "config", null, null, null, false, format.formatConfig),
         .history => |q| {
             if (q.jail) |jail_str| _ = parseJailIdRequired(jail_str, stderr) catch return .client_error;
-            return doQuery(allocator, parsed.globals, stdout, stderr, color, "history", q.jail, q.limit, q.cursor, format.formatHistory);
+            if (q.details) return doQuery(allocator, parsed.globals, stdout, stderr, color, "history", q.jail, q.limit, q.cursor, true, format.formatHistoryDetailed);
+            return doQuery(allocator, parsed.globals, stdout, stderr, color, "history", q.jail, q.limit, q.cursor, false, format.formatHistory);
         },
         .firewall => |q| return doFirewallQuery(allocator, parsed.globals, stdout, stderr, color, q),
         .jail_admin => |j| {
@@ -220,10 +221,10 @@ fn refuseProtectedBan(allocator: std.mem.Allocator, target_text: []const u8, std
     }
 }
 
-fn doQuery(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype, color: format.Color, kind: []const u8, jail: ?[]const u8, limit: ?u32, cursor: ?[]const u8, comptime formatter: anytype) ExitCode {
+fn doQuery(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype, color: format.Color, kind: []const u8, jail: ?[]const u8, limit: ?u32, cursor: ?[]const u8, details: bool, comptime formatter: anytype) ExitCode {
     var body_bytes: [shared.protocol.max_request_body]u8 = undefined;
     var stream = std.io.fixedBufferStream(&body_bytes);
-    std.json.stringify(.{ .schema_version = @as(u32, 1), .kind = kind, .jail = jail, .limit = limit, .cursor = cursor }, .{ .emit_null_optional_fields = false }, stream.writer()) catch return .client_error;
+    std.json.stringify(.{ .schema_version = @as(u32, 1), .kind = kind, .jail = jail, .limit = limit, .cursor = cursor, .details = @as(?bool, if (details) true else null) }, .{ .emit_null_optional_fields = false }, stream.writer()) catch return .client_error;
     const body = shared.Command.Body.init(stream.getWritten()) catch return .client_error;
     return doRequestWithHint(allocator, globals, .{ .query_v1 = body }, stdout, stderr, color, formatter, if (std.mem.eql(u8, kind, "stats")) "daemon does not support stats; upgrade and restart the fail2zig daemon" else null);
 }
@@ -332,6 +333,7 @@ const ListScopeItem = struct {
     ban_count: ?u32 = null,
     origin: ?[]const u8 = null,
     expired: ?bool = null,
+    matches: ?[]const []const u8 = null,
 };
 
 const ListScopePage = struct {
@@ -340,7 +342,7 @@ const ListScopePage = struct {
     next_cursor: ?[]const u8 = null,
 };
 
-fn doList(allocator: std.mem.Allocator, globals: args.Globals, jail: ?[]const u8, origin_filter: ?shared.types.Origin, stdout: anytype, stderr: anytype, color: format.Color, comptime formatter: anytype) ExitCode {
+fn doList(allocator: std.mem.Allocator, globals: args.Globals, jail: ?[]const u8, origin_filter: ?shared.types.Origin, details: bool, stdout: anytype, stderr: anytype, color: format.Color, comptime formatter: anytype) ExitCode {
     var page_arena = std.heap.ArenaAllocator.init(allocator);
     defer page_arena.deinit();
     var payload: std.ArrayListUnmanaged(u8) = .empty;
@@ -352,13 +354,15 @@ fn doList(allocator: std.mem.Allocator, globals: args.Globals, jail: ?[]const u8
     var cursor: ?[]const u8 = null;
     var first_entry = true;
     const now_us = std.time.microTimestamp();
+    const page_limit = if (details) @as(u32, 64) else list_page_limit;
+    const page_bound = max_list_pages * (list_page_limit / page_limit);
     var pages: usize = 0;
-    while (pages < max_list_pages) : (pages += 1) {
+    while (pages < page_bound) : (pages += 1) {
         _ = page_arena.reset(.retain_capacity);
         const arena = page_arena.allocator();
         var body_bytes: [shared.protocol.max_request_body]u8 = undefined;
         var stream = std.io.fixedBufferStream(&body_bytes);
-        std.json.stringify(.{ .schema_version = @as(u32, 1), .kind = "scopes", .jail = jail, .limit = list_page_limit, .cursor = cursor }, .{ .emit_null_optional_fields = false }, stream.writer()) catch return .client_error;
+        std.json.stringify(.{ .schema_version = @as(u32, 1), .kind = "scopes", .jail = jail, .limit = page_limit, .cursor = cursor, .details = @as(?bool, if (details) true else null) }, .{ .emit_null_optional_fields = false }, stream.writer()) catch return .client_error;
         const body = shared.Command.Body.init(stream.getWritten()) catch return .client_error;
 
         var diag: socket.DiagBuf = .{};
@@ -420,7 +424,18 @@ fn doList(allocator: std.mem.Allocator, globals: args.Globals, jail: ?[]const u8
             const expiry_us: ?i64 = if (permanent) null else item.deadline_us;
             if (!first_entry) writer.writeByte(',') catch return walkOutOfMemory(stderr);
             first_entry = false;
-            std.json.stringify(.{ .ip = subject, .jail = item.jail, .origin = item.origin, .expired = expired, .expiry_us = expiry_us, .ban_expiry = if (expiry_us) |value| @divFloor(value, 1_000_000) else null, .permanent = permanent, .ban_count = item.ban_count, .enforced = item.confirmed, .confirmed = item.confirmed }, .{}, writer) catch return walkOutOfMemory(stderr);
+            const entry = .{ .ip = subject, .jail = item.jail, .origin = item.origin, .expired = expired, .expiry_us = expiry_us, .ban_expiry = if (expiry_us) |value| @divFloor(value, 1_000_000) else null, .permanent = permanent, .ban_count = item.ban_count, .enforced = item.confirmed, .confirmed = item.confirmed };
+            if (details) {
+                var json = std.json.writeStream(writer, .{});
+                json.beginObject() catch return walkOutOfMemory(stderr);
+                inline for (std.meta.fields(@TypeOf(entry))) |field| {
+                    json.objectField(field.name) catch return walkOutOfMemory(stderr);
+                    json.write(@field(entry, field.name)) catch return walkOutOfMemory(stderr);
+                }
+                json.objectField("matches") catch return walkOutOfMemory(stderr);
+                json.write(item.matches orelse &.{}) catch return walkOutOfMemory(stderr);
+                json.endObject() catch return walkOutOfMemory(stderr);
+            } else std.json.stringify(entry, .{}, writer) catch return walkOutOfMemory(stderr);
             if (payload.items.len > max_list_payload_bytes) {
                 stderr.writeAll("error: list exceeds its 64 MiB client bound; page the bans with the scopes command and --cursor\n") catch {};
                 return .client_error;
@@ -442,7 +457,7 @@ fn doList(allocator: std.mem.Allocator, globals: args.Globals, jail: ?[]const u8
         @memcpy(cursor_buffer[0..next.len], next);
         cursor = cursor_buffer[0..next.len];
     }
-    stderr.print("error: list exceeds {d} pages; page the bans with the scopes command and --cursor\n", .{max_list_pages}) catch {};
+    stderr.print("error: list exceeds {d} pages; page the bans with the scopes command and --cursor\n", .{page_bound}) catch {};
     return .client_error;
 }
 

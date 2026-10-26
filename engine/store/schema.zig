@@ -18,9 +18,106 @@ const effect_history = @import("../core/native_effect_history.zig");
 const application_history = @import("../core/native_application_history.zig");
 const action_outcome = @import("../core/native_action_outcome.zig");
 const sd_notify = @import("../core/sd_notify.zig");
+const current_schema = @import("current_schema.zig");
 
 pub fn Methods(comptime Store: type) type {
     return struct {
+        pub fn prepareCurrentSchema(self: *Store, options: store.SchemaReadyOptions) Error!void {
+            if (options.maximum_pending == 0 or options.maximum_pending > Limits.pending_receipts) return error.ReceiptLimit;
+            if (options.migration.state_path.len == 0 or options.migration.history_max_matches > 1024) return error.InvalidRecord;
+            const schema = try self.integer("PRAGMA user_version;");
+            if (schema < 0 or schema > latest_schema) return error.UnsupportedSchema;
+            if (schema == 0) {
+                try self.createCurrentSchema(options.migration.history_max_matches);
+            } else if (schema == 25 or schema == 26 or schema == 27) {
+                if (schema == 27) {
+                    const rows = try self.integer("SELECT count(*) FROM load_repair_migration;");
+                    if (rows != 0 and (rows != 1 or (try self.loadRepairProgress()).phase != .complete)) return error.LoadRepairMigrationIncomplete;
+                } else if (try self.loadRepairStatus() != .complete) return error.LoadRepairMigrationIncomplete;
+                if (try self.integer("SELECT count(*) FROM pending_receipts;") > options.maximum_pending) return error.ReceiptLimit;
+                _ = try self.readReceiptClock();
+                if (schema == 25) try self.enableParityState(options.migration, null);
+                try self.enableCurrentState(options.migration);
+            } else if (schema != latest_schema) {
+                try self.enableLoadRepair(options.migration, options.progress);
+                try self.enableReceipts(options.maximum_pending);
+                try self.enableNativeTime();
+                try self.enableDetection();
+                try self.enableClockRecovery();
+                try self.enableJournalDetection();
+                try self.enableRetry();
+                try self.enableConsumers();
+                try self.enableTimeProvenance();
+                try self.enableConsumerManifests();
+                try self.enableConfirmedHistory();
+                try self.enableMaintenance();
+                try self.enableCleanup();
+                try self.enableRetryLeases();
+                try self.enableApplicationHistory();
+                try self.enableEscalation();
+                try self.enableCanonicalEffects();
+                try self.enableHistoryResets();
+                try self.enableActionTargets();
+                try self.enableAdminState();
+                try self.enableMigrationState();
+                try self.enableLoadRepair(options.migration, options.progress);
+                try self.enableRuntimeState(options.migration, !self.load_repair_migrated);
+                try self.enableCurrentState(options.migration);
+            }
+            try self.requireCurrentSchemaReady();
+            if (schema != 25 and schema != 26 and schema != 27) {
+                if (try self.integer("SELECT count(*) FROM pending_receipts;") > options.maximum_pending) return error.ReceiptLimit;
+                _ = try self.readReceiptClock();
+            }
+            self.schema_version = latest_schema;
+            self.receipt_limit = options.maximum_pending;
+        }
+
+        pub fn requireCurrentSchemaReady(self: *Store) Error!void {
+            if (try self.integer("PRAGMA user_version;") != latest_schema) return error.UnsupportedSchema;
+            const rows = try self.integer("SELECT count(*) FROM load_repair_migration;");
+            if (rows == 0) return;
+            if (rows != 1) return error.LoadRepairInvalidState;
+            if ((try self.loadRepairProgress()).phase != .complete) return error.LoadRepairMigrationIncomplete;
+        }
+
+        fn createCurrentSchema(self: *Store, history_max_matches: u16) Error!void {
+            try self.beginWrite();
+            errdefer self.rollback();
+            if (try self.integer("PRAGMA user_version;") != 0 or try self.integer("PRAGMA application_id;") != 0 or
+                try self.integer("SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%';") != 0) return error.ForeignDatabase;
+            try self.exec(current_schema.ddl);
+            try self.exec(current_schema.seeds);
+            {
+                var seed = try self.statement(current_schema.retention_seed);
+                defer seed.deinit();
+                try seed.int(1, history_max_matches);
+                try seed.done();
+            }
+            try self.exec("PRAGMA application_id=1177705009; PRAGMA user_version=28;");
+            try self.fault(.before_migration_schema_commit);
+            try self.commitTransaction();
+            self.schema_version = latest_schema;
+        }
+
+        fn enableCurrentState(self: *Store, options: store.load_repair.Options) Error!void {
+            const entry_schema = try self.integer("PRAGMA user_version;");
+            if (entry_schema != 26 and entry_schema != 27) return error.UnsupportedSchema;
+            var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const backup = try self.takeSchemaBackup(options, if (entry_schema == 26) .pre27 else .pre28, &path_buffer);
+            errdefer if (!self.reopen_required) std.fs.cwd().deleteFileZ(backup.path) catch {};
+            try self.beginWrite();
+            errdefer self.rollback();
+            if (try self.integer("PRAGMA user_version;") != entry_schema) return error.UnsupportedSchema;
+            if (entry_schema == 26) try self.exec(current_schema.upgrade_ddl);
+            try self.exec(current_schema.jail_retirements_ddl);
+            try self.exec("PRAGMA user_version=28;");
+            try self.fault(.before_migration_schema_commit);
+            try self.commitTransaction();
+            self.schema_version = latest_schema;
+            std.log.info("native storage: schema {d}->28 migration complete: bounded jail retirement enabled; verified schema-{d} backup {s}", .{ entry_schema, entry_schema, backup.path });
+        }
+
         pub fn chainSchema(self: *Store) Error!i64 {
             const schema = try self.integer("PRAGMA user_version;");
             if (schema == store.load_repair_schema and try self.loadRepairStatus() != .complete) return error.LoadRepairMigrationIncomplete;
@@ -609,8 +706,8 @@ pub fn Methods(comptime Store: type) type {
         pub fn enableParityState(self: *Store, options: store.load_repair.Options, covering_backup: ?[]const u8) Error!void {
             const schema = try self.chainSchema();
             if (schema < store.load_repair.runtime_schema or schema > latest_schema) return error.UnsupportedSchema;
-            if (schema == latest_schema) {
-                self.schema_version = latest_schema;
+            if (schema >= 26) {
+                self.schema_version = schema;
                 return;
             }
             var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -644,7 +741,7 @@ pub fn Methods(comptime Store: type) type {
                 \\PRAGMA user_version=26;
             );
             try self.commitTransaction();
-            self.schema_version = latest_schema;
+            self.schema_version = 26;
             std.log.info("native storage: schema 26 migration complete: ban origins, ignore entry deadlines and timed configuration entries enabled; pre-upgrade backup {s}", .{backup_path});
         }
     };

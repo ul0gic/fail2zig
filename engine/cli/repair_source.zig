@@ -171,7 +171,7 @@ fn refusal(stderr: anytype, options: Options, err: repair.Error, diagnostic: rep
         error.SourceUnreadable => "the source file cannot be read",
         error.UnsupportedCheckpoint => "the jail checkpoint is not a file source checkpoint",
         error.InvalidRepairRequest => "invalid jail, source path (must be absolute) or token",
-        error.LoadRepairMigrationRequired => "state is not at schema 26; start this release once so it migrates the state, then retry",
+        error.LoadRepairMigrationRequired => "state is not at the current schema; start this release once so it migrates the state, then retry",
         error.LoadRepairMigrationIncomplete => "the schema 24 migration is incomplete; start this release so it finishes, then retry",
         else => "storage failure; nothing was changed",
     };

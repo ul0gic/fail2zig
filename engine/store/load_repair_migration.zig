@@ -18,12 +18,16 @@ pub const BackupKind = enum {
     pre24,
     pre25,
     pre26,
+    pre27,
+    pre28,
 
     fn suffix(self: BackupKind) []const u8 {
         return switch (self) {
             .pre24 => ".pre24-backup",
             .pre25 => ".pre25-backup",
             .pre26 => ".pre26-backup",
+            .pre27 => ".pre27-backup",
+            .pre28 => ".pre28-backup",
         };
     }
 
@@ -31,7 +35,9 @@ pub const BackupKind = enum {
         return switch (self) {
             .pre24 => target_schema,
             .pre25 => runtime_schema,
-            .pre26 => latest_schema,
+            .pre26 => 26,
+            .pre27 => 27,
+            .pre28 => 28,
         };
     }
 };
@@ -448,7 +454,7 @@ pub fn Methods(comptime Store: type) type {
                 std.log.warn("native storage: schema {d} migration refused: backup {s} already exists; keep it if it is the only copy of earlier state, otherwise move it aside and restart", .{ kind.target(), final_path });
                 return switch (kind) {
                     .pre24 => error.LoadRepairBackupExists,
-                    .pre25, .pre26 => error.SchemaBackupExists,
+                    .pre25, .pre26, .pre27, .pre28 => error.SchemaBackupExists,
                 };
             } else |failure| if (failure != error.FileNotFound) return error.StorageIo;
             const page_size = try self.integer("PRAGMA page_size;");

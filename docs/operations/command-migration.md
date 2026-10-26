@@ -19,8 +19,9 @@ plainly rather than papered over.
 | Offline rule evaluation | `fail2zig rule-test …` |
 | Migration preparation, cutover and rollback | `fail2zig migrate …` |
 
-There is no `fail2zig-client`. Read-only monitoring works for members of the `fail2zig`
-group through the 0660 socket; mutations require uid 0 or the daemon uid, verified with
+There is no `fail2zig-client`. Aggregate monitoring and redacted configuration work for
+members of the `fail2zig` group through the 0660 socket. Ban lists, confirmed history,
+firewall inventory and mutations require uid 0 or the daemon uid, verified with
 `SO_PEERCRED`. The daemon sends `READY=1` only after configuration, storage, every source and
 enforcing protection are admitted, `RELOADING=1` then `READY=1` around a live reload, and
 `STOPPING=1` on exit. `ExecReload` is `SIGHUP`; `SIGUSR1` reopens `log_target` after rotation.
@@ -85,7 +86,7 @@ is required and must not substitute fabricated zero values.
 | `set <jail> banip <ip>` without a jail | not supported; exactly one `--jail` is required | 2 | |
 | `reload` / `reload <jail>` | `fail2zig reload` (whole configuration generation) | 0 / 1 / 3 | `schema_version` 1, `outcome` `noop\|applied\|rejected\|restart_required`, `generation`, `reasons[]` |
 | `set <jail> maxretry\|bantime\|findtime …` | not supported at runtime by design; edit the file, then `fail2zig reload` | | |
-| `start <jail>` / `stop <jail>` | `fail2zig jail enable <jail>` / `fail2zig jail disable <jail>` | 0 / 1 | `kind` `group_enable\|group_disable`, `outcome`, `mutation_revision` |
+| `start <jail>` / `stop <jail>` | `fail2zig jail enable <jail>` / `fail2zig jail disable <jail>` | 0 / 1 / 4 / 5 | `kind` `group_enable\|group_disable`, `outcome`, `mutation_revision` |
 | (no equivalent) | `fail2zig jail pause <jail>` / `fail2zig jail resume <jail>` | 0 / 1 | `kind` `group_pause\|group_resume` |
 | (no equivalent) | `fail2zig firewall show [--limit 1..256] [--cursor <token>] [--details]` | 0 / 3 | retained fail2zig-owned observation with bounded `items[]`, optional `structure`, per-item `placement` and `next_cursor` |
 | `get <jail> ...` history queries | `fail2zig history [--jail <jail>] [--limit 1..256] [--cursor <token>]` | 0 / 3 | `schema_version` 1, `generation`, `items[]`, `next_cursor` |
@@ -107,6 +108,23 @@ is required and must not substitute fabricated zero values.
 | `set <jail> addignoreip` / `delignoreip` on a custom-rule jail (`rule_files`) | not supported by `ignore add` or `ignore remove`, which refuse it naming `ignore_file`; edit the jail's `ignore_file` and run `fail2zig reload` | 1 | |
 | `set dbpurgeage`, `set dbmaxmatches` | not supported; retention is fixed by the state schema | | |
 
+### Jail disable completion
+
+Disable commits its disabled state before releasing owners in bounded worker turns.
+Small operations can still return `applied` within the existing two-second wait,
+after current kernel readback agrees. A `partial` or `uncertain` result continues
+automatically while disabled, including after restart; no repeated disable commands
+are required. Inspect `jails` and `status`. Jail JSON's `disable_cleanup_pending`
+reports current cleanup independently of historical request outcomes, which are
+preserved even when an older disable left owners behind. Shared scopes remain
+installed for other jails. Same-ID replay does not restart the operation.
+
+Enable cancels remaining releases and keeps prior releases committed. Pause/resume
+cannot enable a disabled jail. Automatic detection and configured bans cannot
+recreate its owners while disabled; pending configured entries remain pending. Manual ban
+requires enable first; migration activation targeting a disabled jail refuses
+atomically. Unban remains available. Removal transfers remaining work to retirement.
+
 ### Live reload versus restart
 
 `fail2zig reload` (or `SIGHUP`) builds the whole proposed generation before publishing it.
@@ -125,8 +143,10 @@ boundary above or the numeric CLI `--duration`, `--timeout` and migration window
 
 ### Monitoring endpoints
 
-With `metrics_enabled = true` the HTTP listener serves `/metrics` (Prometheus), `/api/status`,
-`/api/bans` and `/api/health`. `/api/health` returns the readiness report
+With `metrics_enabled = true` the HTTP listener serves `/metrics` (Prometheus), `/api/status`
+and `/api/health`. `/api/bans` returns HTTP 403: ban details require an administrator
+using the local socket. Socket monitors likewise receive 403 for ban, history and
+firewall details. `/api/health` returns the readiness report
 (`{"schema_version":1,"ready":…,"components":{config,storage,sources,clock,enforcement,admin},"cause":…}`)
 as HTTP 200 when `ready` is true and HTTP 503 (same body) while any component withholds
 readiness, so probes can key on the status line. The versioned `health` query kind carries the

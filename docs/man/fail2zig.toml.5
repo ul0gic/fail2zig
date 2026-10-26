@@ -107,14 +107,39 @@ rows removed by retention (see
 in seconds, default 86400) free pages for reuse inside it. Watch the file size.
 Default:
 .IR /var/lib/fail2zig/state.bin .
+.IP
+With the shipped systemd unit, changing this path also requires a matching
+service drop-in: keep
+.BR ProtectSystem=strict ,
+reset
+.B ReadWritePaths=
+then grant only the dedicated custom parent and
+.IR /run/fail2zig ,
+and clear
+.B StateDirectory=
+to stop systemd creating the unused default directory. The custom parent must
+already exist, belong to the service UID and not be group/world writable;
+database files must be private and owned by that UID. Shell writability does
+not establish access inside the service. Stop all writers and preserve the
+SQLite database and existing WAL/SHM siblings together before relocation.
+Automatic installer upgrades refuse custom paths. See the complete procedure:
+.UR https://github.com/ul0gic/fail2zig/blob/main/docs/operations/installation.md#custom-state-directory-under-systemd
+Custom state directory under systemd
+.UE .
 .TP
 .B history_retention
 Integer (seconds, 0 or more). How long application history is kept. Older
 history is removed while storage is healthy. Default: 86400.
 .TP
 .B history_max_matches
-Integer (0\(en1024). How many matches are kept for each subject in application
-history. Default: 10.
+Integer (0\(en1024). Total retained matches per address across all jails.
+Default: 10. A jail override can narrow its share but cannot raise this total.
+An accepted
+.B fail2zig reload
+applies changes without resetting retry state or source positions.
+Zero hides matched lines immediately; bounded cleanup removes stored detail
+after existing history-consumer dependencies permit it. Decisions and confirmed
+event identities remain available. Raising the limit cannot recover deleted lines.
 .TP
 .B memory_ceiling_mb
 Integer. Total configured memory ceiling used to admit bounded native source,
@@ -129,6 +154,16 @@ The plan for 65,536 live bans is charged about 337 MiB with two enforcing jails 
 about 438 MiB with sixteen, so a ceiling below the plan makes startup refuse with
 .BR NativeMemoryAdmission .
 Minimum: 1. Default: 512.
+.TP
+.B native_fd_ceiling
+Integer. Most file descriptors the native plan may use. At start the daemon raises
+its soft
+.B RLIMIT_NOFILE
+to this value, never past the hard limit, then admits the plan against the lower of
+the two; each file jail is charged for eight sources, so a plan that does not fit
+makes startup refuse with
+.BR NativeFdAdmission .
+Minimum: 1. Default: 8192, enough for 64 file jails.
 .TP
 .B metrics_enabled
 Boolean. When
@@ -558,6 +593,15 @@ shows it as
 until it is removed from the file. A reload that changes only a duration is applied live.
 .
 .SH JAIL SECTIONS
+.PP
+The jail-only key
+.B history_max_matches
+is an optional integer from 0 to 1024. Omission inherits the global value;
+.B [defaults]
+does not define it. Its effective value is capped by the global total.
+For example, global 10 and jail 2 retain at most two matches for that jail and
+at most ten for the address across all jails. Removing a jail removes its override;
+its retained history then uses the global value. Accepted changes apply on reload.
 Each
 .BI [jails. name ]
 section defines one jail. The name must be ASCII alphanumeric, hyphens, or
@@ -566,6 +610,10 @@ underscores.
 .B enabled
 Boolean. When false, the jail is parsed but not started. Default:
 .IR true .
+On restart, disabling a previously used jail retires its retry and source state
+and releases its firewall ownership. Confirmed history, saved runtime ignore
+entries and configured ignore deadlines remain. Re-enabling starts fresh retry
+and source state; it does not restore the retired bans or retry window.
 .TP
 .B filter
 String. Built-in filter name, or the bounded detection label for a jail with

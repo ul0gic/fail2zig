@@ -297,9 +297,10 @@ fn retryable(cause: anyerror) bool {
         error.EffectBackendUncertain,
         error.StaleEffect,
         error.EffectReconciliationRequired,
-        // Source-scoped backpressure that expiry and retirement clear; never latches intervention.
+        // Source-scoped backpressure remains retryable; never latches intervention.
         error.ReserveBackpressure,
         error.RetryCapacity,
+        error.RetryEligibilityPending,
         => true,
         else => false,
     };

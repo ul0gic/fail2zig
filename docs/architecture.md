@@ -232,14 +232,23 @@ the running generation is untouched. It then applies policy transitions, ignore 
 (including `ignoreself`, `ignoretime` and duration changes, rebuilt with a freshly read
 self list), escalation decay, `banip` lists and added jails, commits the generation, and
 removes jails last, so a failed reload never has to recreate a removed jail. An added jail
-is built by the same per-jail construction as at start. A removed jail's owners are
-released in one transaction, one owner revision each; its retry admission, consumer
-manifests, checkpoints and timed entries are deleted; its confirmed history and retired
-rows are kept, so `history` still shows its bans. Its elements are then withdrawn from
-the shared kernel sets, which stay in place, and the daemon logs
+is built by the same per-jail construction as at start. A removed jail is fenced from
+new work by a durable retirement intent. Bounded Store transactions release its owners,
+one revision each, and retire its retry admission, private consumer state, timed entries
+and operational record groups. Confirmed history, replay guards, source-order headers
+and saved runtime ignores survive. Elements with no remaining owner are withdrawn from
+the shared kernel sets, which stay in place. Retirement finishes only after verified
+kernel absence and completion of the Store cleanup; the daemon then logs
 `native: jail=<name> removed: <n> bans lifted`. A start that finds state for a jail the
 configuration no longer names retires it the same way before validating owners, instead
 of refusing with `UnconfiguredStateOwner`.
+
+A configured jail with `enabled = false` is also retired at startup. It keeps
+confirmed history, runtime ignore entries and configured ignore deadlines; its
+retry/source state and firewall ownership follow the same bounded retirement lifecycle
+as a removed jail. An interrupted retirement resumes before fresh admission, even if
+the jail was re-enabled meanwhile. Re-enabling admits fresh operational state after
+retirement completes.
 
 Status separates what the daemon knows from what is installed. `active_bans` is what
 the kernel inventory holds: on nftables the shadow kept by acknowledgements and events,

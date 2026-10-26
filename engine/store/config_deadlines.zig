@@ -41,6 +41,11 @@ fn bindKey(row: *Stmt, list: ConfigList, jail: []const u8, address: []const u8, 
     try row.int(4, @intCast(duration_s));
 }
 
+fn expiry(now_us: i64, seconds: u64) Error!i64 {
+    const span = std.math.mul(i64, @intCast(seconds), std.time.us_per_s) catch return error.InvalidRecord;
+    return std.math.add(i64, now_us, span) catch error.InvalidRecord;
+}
+
 fn listed(entries: []const types.TimedEntry, address: []const u8, duration_s: i64) bool {
     const parsed = types.IgnoreEntry.parse(address) catch return false;
     var buffer: [types.IgnoreEntry.max_text_bytes]u8 = undefined;
@@ -77,8 +82,7 @@ pub fn Methods(comptime Store: type) type {
                         continue;
                     }
                 }
-                const span = std.math.mul(i64, @intCast(seconds), std.time.us_per_s) catch return error.InvalidRecord;
-                const expires_us = std.math.add(i64, now_us, span) catch return error.InvalidRecord;
+                const expires_us = try expiry(now_us, seconds);
                 {
                     var insert = try self.statement("INSERT INTO config_timed_entries(list,jail,address,duration_s,first_applied_us,expires_us) VALUES(?1,?2,?3,?4,?5,?6);");
                     defer insert.deinit();
@@ -139,6 +143,16 @@ pub fn Methods(comptime Store: type) type {
                 out[index] = if (try existing.row()) try existing.signed(0) else null;
             }
             if (own) try self.commitTransaction();
+        }
+
+        pub fn previewConfigDeadlines(self: *Store, list: ConfigList, jail: []const u8, entries: []const types.TimedEntry, now_us: i64, out: []?i64) Error!void {
+            if (now_us <= 0) return error.InvalidRecord;
+            try self.configEntryDeadlines(list, jail, entries, out);
+            for (entries, 0..) |item, index| {
+                if (out[index] == null) if (item.duration_s) |seconds| {
+                    out[index] = try expiry(now_us, seconds);
+                };
+            }
         }
     };
 }

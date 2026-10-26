@@ -577,6 +577,42 @@ test "admin: BUG-040 nftables network ban list and unban preserve CIDR" {
     try waitNftKernel(a, "192.0.2.0/24", false, 5000);
 }
 
+fn waitOverlapJailBans(h: *harness.Harness, sshd: u32, secondary: u32) !void {
+    var timer = try std.time.Timer.start();
+    while (timer.read() < 5 * std.time.ns_per_s) {
+        const listed = try admin(t.allocator, h, &.{"jails"});
+        defer listed.deinit(t.allocator);
+        try t.expectEqual(@as(u8, 0), listed.code);
+        const parsed = try parseValue(t.allocator, listed.stdout);
+        defer parsed.deinit();
+        try t.expectEqual(@as(usize, 2), parsed.value.array.items.len);
+        var first = false;
+        var second = false;
+        for (parsed.value.array.items) |item| {
+            const name = item.object.get("name").?.string;
+            const count = item.object.get("active_bans") orelse continue;
+            if (count != .integer) continue;
+            if (std.mem.eql(u8, name, "sshd")) first = count.integer == @as(i64, sshd);
+            if (std.mem.eql(u8, name, "secondary")) second = count.integer == @as(i64, secondary);
+        }
+        if (first and second) return;
+        std.time.sleep(50 * std.time.ns_per_ms);
+    }
+    return error.TimedOut;
+}
+
+fn expectKernelHostRules(a: std.mem.Allocator, address: []const u8, expected: usize) !void {
+    const rules = try run(a, &.{ "iptables", "-S" });
+    defer rules.deinit(a);
+    try t.expectEqual(@as(u8, 0), rules.code);
+    var lines = std.mem.splitScalar(u8, rules.stdout, '\n');
+    var count: usize = 0;
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "-A ") and std.mem.indexOf(u8, line, address) != null) count += 1;
+    }
+    try t.expectEqual(expected, count);
+}
+
 test "admin: BUG-038 operator owner view covers dedup overlap restart unban and expiry" {
     if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") == null) return error.SkipZigTest;
     const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
@@ -606,6 +642,8 @@ test "admin: BUG-038 operator owner view covers dedup overlap restart unban and 
         try t.expect(item.get("confirmed").?.bool);
     }
     try waitActiveBans(&h, 1, 5000);
+    try waitOverlapJailBans(&h, 1, 0);
+    try expectKernelHostRules(a, "203.0.113.7", 1);
 
     const replaced = try admin(a, &h, &.{ "ban", "203.0.113.7", "--jail", "sshd", "--duration", "300" });
     defer replaced.deinit(a);
@@ -613,6 +651,8 @@ test "admin: BUG-038 operator owner view covers dedup overlap restart unban and 
     const deduplicated = try waitListCount(&h, 1, 5000);
     a.free(deduplicated);
     try waitActiveBans(&h, 1, 5000);
+    try waitOverlapJailBans(&h, 1, 0);
+    try expectKernelHostRules(a, "203.0.113.7", 1);
 
     const overlap = try admin(a, &h, &.{ "ban", "203.0.113.7", "--jail", "secondary", "--duration", "240" });
     defer overlap.deinit(a);
@@ -623,7 +663,9 @@ test "admin: BUG-038 operator owner view covers dedup overlap restart unban and 
     defer before_document.deinit();
     const sshd_expiry = try ownerExpiry(before_document.value.array.items, "sshd");
     const secondary_expiry = try ownerExpiry(before_document.value.array.items, "secondary");
-    try waitActiveBans(&h, 2, 5000);
+    try waitActiveBans(&h, 1, 5000);
+    try waitOverlapJailBans(&h, 1, 1);
+    try expectKernelHostRules(a, "203.0.113.7", 1);
 
     try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try h.stopDaemon());
     try h.startDaemon();
@@ -637,20 +679,47 @@ test "admin: BUG-038 operator owner view covers dedup overlap restart unban and 
         try t.expectEqual(sshd_expiry, try ownerExpiry(document.value.array.items, "sshd"));
         try t.expectEqual(secondary_expiry, try ownerExpiry(document.value.array.items, "secondary"));
     }
-    try waitActiveBans(&h, 2, 5000);
+    try waitActiveBans(&h, 1, 5000);
+    try waitOverlapJailBans(&h, 1, 1);
+    try expectKernelHostRules(a, "203.0.113.7", 1);
 
     const release_first = try admin(a, &h, &.{ "unban", "203.0.113.7", "--jail", "sshd" });
     defer release_first.deinit(a);
-    try t.expectEqual(@as(u8, 0), release_first.code);
+    try t.expectEqual(@as(u8, 4), release_first.code);
+    const released = try parseValue(a, release_first.stdout);
+    defer released.deinit();
+    try t.expectEqualStrings("unban", released.value.object.get("kind").?.string);
+    try t.expectEqualStrings("partial", released.value.object.get("outcome").?.string);
+    try t.expect(!released.value.object.get("enforced").?.bool);
     const retained = try waitListCount(&h, 1, 5000);
     defer a.free(retained);
     {
         const document = try parseValue(a, retained);
         defer document.deinit();
         try t.expectEqualStrings("secondary", document.value.array.items[0].object.get("jail").?.string);
+        try t.expectEqual(secondary_expiry, try ownerExpiry(document.value.array.items, "secondary"));
+        try t.expect(document.value.array.items[0].object.get("confirmed").?.bool);
     }
     try t.expect(try kernelHas(a, "203.0.113.7"));
     try waitActiveBans(&h, 1, 5000);
+    try waitOverlapJailBans(&h, 0, 1);
+    try expectKernelHostRules(a, "203.0.113.7", 1);
+    {
+        const engine = @import("engine");
+        var probe = try engine.native_store_mod.Store.open(a, h.state_path);
+        defer probe.close();
+        try t.expectEqual(@as(i64, 0), try probe.inspectInteger("SELECT count(*) FROM effect_owners WHERE jail='sshd' AND lease_kind!=0;"));
+        try t.expectEqual(@as(i64, 1), try probe.inspectInteger("SELECT count(*) FROM effect_owners WHERE jail='secondary' AND lease_kind!=0;"));
+        try t.expectEqual(secondary_expiry, try probe.inspectInteger("SELECT deadline_us FROM effect_owners WHERE jail='secondary' AND lease_kind!=0;"));
+        try t.expectEqual(@as(i64, 1), try probe.inspectInteger("SELECT count(*) FROM native_effects WHERE lease_kind!=0;"));
+        var query_buffer: [512]u8 = undefined;
+        const query = try std.fmt.bufPrintZ(
+            &query_buffer,
+            "SELECT count(*) FROM admin_requests WHERE kind=7 AND outcome=4 AND subject=CAST('sshd' AS BLOB) AND mutation_revision={d};",
+            .{released.value.object.get("mutation_revision").?.integer},
+        );
+        try t.expectEqual(@as(i64, 1), try probe.inspectInteger(query));
+    }
 
     const release_final = try admin(a, &h, &.{ "unban", "203.0.113.7", "--jail", "secondary" });
     defer release_final.deinit(a);
@@ -659,6 +728,8 @@ test "admin: BUG-038 operator owner view covers dedup overlap restart unban and 
     a.free(empty);
     try waitKernel(a, "203.0.113.7", false, 5000);
     try waitActiveBans(&h, 0, 5000);
+    try waitOverlapJailBans(&h, 0, 0);
+    try expectKernelHostRules(a, "203.0.113.7", 0);
 
     const expiring = try admin(a, &h, &.{ "ban", "192.0.2.38", "--jail", "sshd", "--duration", "4" });
     defer expiring.deinit(a);
@@ -666,13 +737,24 @@ test "admin: BUG-038 operator owner view covers dedup overlap restart unban and 
     const live = try waitListCount(&h, 1, 5000);
     a.free(live);
     try waitKernel(a, "192.0.2.38", true, 5000);
+    try waitActiveBans(&h, 1, 5000);
+    try waitOverlapJailBans(&h, 1, 0);
+    try expectKernelHostRules(a, "192.0.2.38", 1);
     const expired = try waitListCount(&h, 0, 10_000);
     a.free(expired);
     try waitKernel(a, "192.0.2.38", false, 5000);
     try waitActiveBans(&h, 0, 5000);
+    try waitOverlapJailBans(&h, 0, 0);
+    try expectKernelHostRules(a, "192.0.2.38", 0);
 }
 
-test "admin: BUG-033 a failure after one committed release is partial and replay-fenced" {
+fn expectRemainingDisableOwners(probe: *@import("engine").native_store_mod.Store, keys: [2][32]u8, first: anytype, second: @TypeOf(first)) !void {
+    try t.expectEqual(@as(i64, 2), try probe.inspectInteger("SELECT count(*) FROM effect_owners WHERE jail='sshd' AND lease_kind!=0;"));
+    try t.expect(std.meta.eql(first, (try probe.currentOwner(keys[0], "sshd")) orelse return error.MissingOwner));
+    try t.expect(std.meta.eql(second, (try probe.currentOwner(keys[1], "sshd")) orelse return error.MissingOwner));
+}
+
+test "admin: a failure after one committed release page is partial and replay-fenced" {
     if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") == null) return error.SkipZigTest;
     const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
     var namespace_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -683,61 +765,223 @@ test "admin: BUG-033 a failure after one committed release is partial and replay
     const a = t.allocator;
     var h = try harness.Harness.init(a, .{ .spawn_daemon = false });
     defer h.deinit();
-    try writeEnforcingConfig(&h, 600);
+    try writeEnforcingConfig(&h, 3600);
     try h.startDaemon();
     defer _ = h.stopDaemon() catch {};
-    try waitStatus(&h, "\"state\":\"active\"");
+    try waitReady(&h, 10_000);
 
-    const first = try admin(a, &h, &.{ "ban", "192.0.2.30", "--jail", "sshd", "--duration", "300" });
-    defer first.deinit(a);
-    try t.expectEqual(@as(u8, 0), first.code);
-    const second = try admin(a, &h, &.{ "ban", "192.0.2.31", "--jail", "sshd", "--duration", "300" });
-    defer second.deinit(a);
-    try t.expectEqual(@as(u8, 0), second.code);
-    try waitKernel(a, "192.0.2.30", true, 5000);
-    try waitKernel(a, "192.0.2.31", true, 5000);
-
+    // The final key fails after 64 committed releases and one attempted update in the next page.
+    for (1..67) |host| {
+        var address_buffer: [32]u8 = undefined;
+        const address = try std.fmt.bufPrint(&address_buffer, "192.0.2.{d}", .{host});
+        const banned = try admin(a, &h, &.{ "ban", address, "--jail", "sshd", "--duration", "3600" });
+        defer banned.deinit(a);
+        try t.expectEqual(@as(u8, 0), banned.code);
+    }
     const status = try h.queryStatus();
     defer a.free(status);
     const generation = try generationFromStatus(status);
-    try t.expectEqual(@as(?u32, 2), harness.parseJsonUintField(status, "mutation_revision"));
+    try t.expectEqual(@as(?u32, 66), harness.parseJsonUintField(status, "mutation_revision"));
     var body_buffer: [512]u8 = undefined;
-    const body = try std.fmt.bufPrint(&body_buffer, "{{\"schema_version\":1,\"kind\":\"group_disable\",\"jail\":\"sshd\",\"expected_generation\":\"{s}\",\"expected_mutation_revision\":2}}", .{generation});
+    const body = try std.fmt.bufPrint(&body_buffer, "{{\"schema_version\":1,\"kind\":\"group_disable\",\"jail\":\"sshd\",\"expected_generation\":\"{s}\",\"expected_mutation_revision\":66}}", .{generation});
     const request_id = [_]u8{33} ** 32;
 
     const engine = @import("engine");
     var probe = try engine.native_store_mod.Store.open(a, h.state_path);
     defer probe.close();
-    try t.expectEqual(@as(i64, 2), try probe.inspectInteger("SELECT count(*) FROM effect_owners WHERE jail='sshd' AND lease_kind!=0;"));
-    try probe.inspectExec(
-        "CREATE TRIGGER bug033_second_release BEFORE UPDATE OF lease_kind ON effect_owners " ++
-            "WHEN OLD.lease_kind!=0 AND NEW.lease_kind=0 AND " ++
-            "(SELECT count(*) FROM effect_owners WHERE jail=OLD.jail AND lease_kind=0)>0 " ++
-            "BEGIN SELECT RAISE(FAIL,'BUG-033 injected second release failure'); END;",
+    try t.expectEqual(@as(i64, 66), try probe.inspectInteger("SELECT count(*) FROM effect_owners WHERE jail='sshd' AND lease_kind!=0;"));
+    try t.expectEqual(@as(i64, 0), try probe.inspectInteger("SELECT count(*) FROM effect_owners WHERE jail='sshd' AND lease_kind=0;"));
+    var remaining_keys: [2][32]u8 = undefined;
+    {
+        var keys = try probe.statement("SELECT scope_key FROM effect_owners WHERE jail='sshd' ORDER BY scope_key DESC LIMIT 2;");
+        defer keys.deinit();
+        for (&remaining_keys) |*key| {
+            try t.expect(try keys.row());
+            const bytes = try keys.boundedBytes(0, 32);
+            try t.expectEqual(@as(usize, 32), bytes.len);
+            @memcpy(key, bytes);
+        }
+        try t.expect(!try keys.row());
+    }
+    const remaining_first = (try probe.currentOwner(remaining_keys[0], "sshd")) orelse return error.MissingOwner;
+    const remaining_second = (try probe.currentOwner(remaining_keys[1], "sshd")) orelse return error.MissingOwner;
+    const maximum_key = std.fmt.bytesToHex(remaining_keys[0], .lower);
+    var trigger_buffer: [512]u8 = undefined;
+    const trigger = try std.fmt.bufPrintZ(
+        &trigger_buffer,
+        "CREATE TRIGGER bug033_second_page BEFORE UPDATE OF lease_kind ON effect_owners " ++
+            "WHEN OLD.jail='sshd' AND OLD.lease_kind!=0 AND NEW.lease_kind=0 AND OLD.scope_key=x'{s}' " ++
+            "BEGIN SELECT RAISE(FAIL,'injected final-key failure after 65 attempted releases'); END;",
+        .{maximum_key},
     );
+    try probe.inspectExec(trigger);
+    var trigger_installed = true;
+    defer if (trigger_installed) probe.inspectExec("DROP TRIGGER bug033_second_page;") catch {};
     const partial = try sendAdminFrame(a, &h, request_id, body);
     defer partial.deinit(a);
-    try probe.inspectExec("DROP TRIGGER bug033_second_release;");
     try t.expectEqual(@as(u16, 507), partial.code);
     try t.expect(std.mem.indexOf(u8, partial.body, "\"outcome\":\"partial\"") != null);
-    try t.expect(std.mem.indexOf(u8, partial.body, "1 owner release") != null);
-    try t.expectEqual(@as(i64, 1), try probe.inspectInteger("SELECT count(*) FROM effect_owners WHERE jail='sshd' AND lease_kind=0;"));
-    try t.expectEqual(@as(i64, 1), try probe.inspectInteger("SELECT count(*) FROM effect_owners WHERE jail='sshd' AND lease_kind!=0;"));
-    try t.expectEqual(@as(i64, 1), try probe.inspectInteger("SELECT count(*) FROM admin_requests WHERE request_id=x'2121212121212121212121212121212121212121212121212121212121212121' AND outcome=4 AND mutation_revision=3;"));
+    try expectRemainingDisableOwners(&probe, remaining_keys, remaining_first, remaining_second);
+    try t.expectEqual(@as(i64, 64), 66 - try probe.inspectInteger("SELECT count(*) FROM effect_owners WHERE jail='sshd' AND lease_kind!=0;"));
+    try t.expectEqual(@as(i64, 1), try probe.inspectInteger("SELECT count(*) FROM admin_requests WHERE request_id=x'2121212121212121212121212121212121212121212121212121212121212121' AND outcome=4 AND mutation_revision=67 AND admission_revision=66;"));
     try t.expectEqual(@as(i64, 1), try probe.inspectInteger("SELECT count(*) FROM jail_admin_states WHERE jail='sshd' AND enabled=0 AND paused=1 AND request_id=x'2121212121212121212121212121212121212121212121212121212121212121';"));
 
     const replayed = try sendAdminFrame(a, &h, request_id, body);
     defer replayed.deinit(a);
     try t.expectEqual(@as(u16, 507), replayed.code);
     try t.expect(std.mem.indexOf(u8, replayed.body, "\"outcome\":\"partial\"") != null);
-    try t.expect(std.mem.indexOf(u8, replayed.body, "\"mutation_revision\":3") != null);
-    try t.expectEqual(@as(i64, 1), try probe.inspectInteger("SELECT count(*) FROM effect_owners WHERE jail='sshd' AND lease_kind=0;"));
-    const after = try h.queryStatus();
-    defer a.free(after);
-    try t.expectEqual(@as(?u32, 3), harness.parseJsonUintField(after, "mutation_revision"));
+    try t.expect(std.mem.indexOf(u8, replayed.body, "\"mutation_revision\":67") != null);
+    try expectRemainingDisableOwners(&probe, remaining_keys, remaining_first, remaining_second);
+    try t.expectEqual(@as(i64, 67), try probe.inspectInteger("SELECT mutation_revision FROM admin_revision WHERE id=1;"));
+
+    try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try h.stopDaemon());
+    try h.startDaemon();
+    const restarted = try sendAdminFrame(a, &h, request_id, body);
+    defer restarted.deinit(a);
+    try t.expectEqual(@as(u16, 507), restarted.code);
+    try t.expect(std.mem.indexOf(u8, restarted.body, "\"mutation_revision\":67") != null);
+    try expectRemainingDisableOwners(&probe, remaining_keys, remaining_first, remaining_second);
+    try probe.inspectExec("DROP TRIGGER bug033_second_page;");
+    trigger_installed = false;
+
+    var timer = try std.time.Timer.start();
+    var completed = false;
+    while (timer.read() < 15 * std.time.ns_per_s) {
+        const resumed = try sendAdminFrame(a, &h, request_id, body);
+        defer resumed.deinit(a);
+        if (resumed.code == 200) {
+            try t.expect(std.mem.indexOf(u8, resumed.body, "\"outcome\":\"applied\"") != null);
+            try t.expect(std.mem.indexOf(u8, resumed.body, "\"mutation_revision\":68") != null);
+            completed = true;
+            break;
+        }
+        try t.expectEqual(@as(u16, 507), resumed.code);
+        std.time.sleep(50 * std.time.ns_per_ms);
+    }
+    try t.expect(completed);
+    try t.expectEqual(@as(i64, 0), try probe.inspectInteger("SELECT count(*) FROM effect_owners WHERE jail='sshd' AND lease_kind!=0;"));
+    try t.expectEqual(@as(i64, 1), try probe.inspectInteger("SELECT count(*) FROM admin_requests WHERE request_id=x'2121212121212121212121212121212121212121212121212121212121212121' AND outcome=1 AND mutation_revision=68 AND admission_revision=66;"));
+    const rules = try run(a, &.{ "iptables", "-S" });
+    defer rules.deinit(a);
+    try t.expectEqual(@as(u8, 0), rules.code);
+    for (1..67) |host| {
+        var address_buffer: [32]u8 = undefined;
+        const address = try std.fmt.bufPrint(&address_buffer, "192.0.2.{d}", .{host});
+        try t.expect(std.mem.indexOf(u8, rules.stdout, address) == null);
+    }
 }
 
-test "admin: BUG-035 group disable settles only after coherent kernel readback" {
+fn savedAdminSourceCursor(a: std.mem.Allocator, probe: *@import("engine").native_store_mod.Store) ![]u8 {
+    var row = try probe.statement("SELECT cursor FROM source_cursors WHERE jail='sshd' ORDER BY source;");
+    defer row.deinit();
+    try t.expect(try row.row());
+    const cursor = try a.dupe(u8, try row.boundedBytes(0, 16 * 1024));
+    errdefer a.free(cursor);
+    try t.expect(!try row.row());
+    return cursor;
+}
+
+test "admin: disabled resume consumes input without decisions and defers configured bans through reload and restart" {
+    if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") == null) return error.SkipZigTest;
+    const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
+    var namespace_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const current = try std.fs.readLinkAbsolute("/proc/self/ns/net", &namespace_buffer);
+    try t.expect(!std.mem.eql(u8, prior, current));
+    if (linux.E.init(linux.unshare(linux.CLONE.NEWNET)) != .SUCCESS) return error.IsolationFailed;
+    const a = t.allocator;
+    var h = try harness.Harness.init(a, .{ .spawn_daemon = false });
+    defer h.deinit();
+    try writeEnforcingConfig(&h, 3600);
+    try h.startDaemon();
+    defer _ = h.stopDaemon() catch {};
+    try waitReady(&h, 10_000);
+    try h.writeLine(failure);
+    try h.writeLine(failure);
+    try waitKernel(a, "203.0.113.7", true, 8000);
+    const initial = try h.queryStatus();
+    defer a.free(initial);
+    const generation = try generationFromStatus(initial);
+    const revision = harness.parseJsonUintField(initial, "mutation_revision") orelse return error.MissingField;
+    var body_buffer: [512]u8 = undefined;
+    const body = try std.fmt.bufPrint(&body_buffer, "{{\"schema_version\":1,\"kind\":\"group_disable\",\"jail\":\"sshd\",\"expected_generation\":\"{s}\",\"expected_mutation_revision\":{d}}}", .{ generation, revision });
+    const request_id = [_]u8{159} ** 32;
+    const disabled = try sendAdminFrame(a, &h, request_id, body);
+    defer disabled.deinit(a);
+    try t.expectEqual(@as(u16, 200), disabled.code);
+    try t.expect(std.mem.indexOf(u8, disabled.body, "\"outcome\":\"applied\"") != null);
+    try waitKernel(a, "203.0.113.7", false, 5000);
+    const engine = @import("engine");
+    var probe = try engine.native_store_mod.Store.open(a, h.state_path);
+    defer probe.close();
+    const disable_revision = try probe.inspectInteger("SELECT mutation_revision FROM admin_requests WHERE request_id=x'9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f';");
+    const resumed = try admin(a, &h, &.{ "jail", "resume", "sshd" });
+    defer resumed.deinit(a);
+    try t.expectEqual(@as(u8, 0), resumed.code);
+    try t.expectEqual(@as(i64, 1), try probe.inspectInteger("SELECT count(*) FROM jail_admin_states WHERE jail='sshd' AND enabled=0 AND paused=0 AND request_id=x'9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f';"));
+    const manual_status = try h.queryStatus();
+    defer a.free(manual_status);
+    var manual_buffer: [512]u8 = undefined;
+    const manual_body = try std.fmt.bufPrint(&manual_buffer, "{{\"schema_version\":1,\"kind\":\"ban\",\"jail\":\"sshd\",\"address\":\"198.51.100.158\",\"duration_s\":3600,\"expected_generation\":\"{s}\",\"expected_mutation_revision\":{d}}}", .{ try generationFromStatus(manual_status), harness.parseJsonUintField(manual_status, "mutation_revision") orelse return error.MissingField });
+    const manual = try sendAdminFrame(a, &h, [_]u8{158} ** 32, manual_body);
+    defer manual.deinit(a);
+    try t.expectEqual(@as(u16, 409), manual.code);
+    try t.expect(std.mem.indexOf(u8, manual.body, "\"outcome\":\"rejected\"") != null);
+    try t.expect(std.mem.indexOf(u8, manual.body, "jail is disabled; enable it before adding a ban") != null);
+    try t.expect(!try kernelHas(a, "198.51.100.158"));
+
+    for (0..3) |phase| {
+        if (phase == 1) {
+            var config_file = try std.fs.cwd().openFile(h.config_path, .{ .mode = .write_only });
+            defer config_file.close();
+            try config_file.seekFromEnd(0);
+            try config_file.writeAll("banip = [\"198.51.100.159\"]\n");
+            const reloaded = try admin(a, &h, &.{"reload"});
+            defer reloaded.deinit(a);
+            try t.expectEqual(@as(u8, 0), reloaded.code);
+            try t.expect(std.mem.indexOf(u8, reloaded.stdout, "\"outcome\":\"applied\"") != null);
+        } else if (phase == 2) {
+            try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try h.stopDaemon());
+            try h.startDaemon();
+            try waitReady(&h, 15_000);
+        }
+        const before = try h.queryStatus();
+        defer a.free(before);
+        const committed = harness.parseJsonUintField(before, "committed_records") orelse return error.MissingField;
+        const decisions = harness.parseJsonUintField(before, "decisions_total") orelse return error.MissingField;
+        const cursor_before = try savedAdminSourceCursor(a, &probe);
+        defer a.free(cursor_before);
+        try h.writeLine("Failed password for root from 203.0.113.159 port 22 ssh2");
+        try h.writeLine("Failed password for root from 203.0.113.159 port 22 ssh2");
+        try waitRecords(&h, committed + 2);
+        try t.expectEqual(@as(i64, 1), try probe.inspectInteger("SELECT count(*) FROM source_cursors c JOIN records r USING(jail,source,occurrence) WHERE c.jail='sshd' AND r.receipt_us IS NOT NULL;"));
+        const cursor_after = try savedAdminSourceCursor(a, &probe);
+        defer a.free(cursor_after);
+        try t.expect(!std.mem.eql(u8, cursor_before, cursor_after));
+        const after = try h.queryStatus();
+        defer a.free(after);
+        try t.expectEqual(decisions, harness.parseJsonUintField(after, "decisions_total") orelse return error.MissingField);
+        try t.expectEqual(@as(i64, 0), try probe.inspectInteger("SELECT count(*) FROM effect_owners WHERE jail='sshd' AND lease_kind!=0;"));
+        try t.expectEqual(@as(i64, 1), try probe.inspectInteger("SELECT count(*) FROM jail_admin_states WHERE jail='sshd' AND enabled=0 AND paused=0 AND request_id=x'9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f';"));
+        const replay = try sendAdminFrame(a, &h, request_id, body);
+        defer replay.deinit(a);
+        try t.expectEqual(@as(u16, 200), replay.code);
+        try t.expect(std.mem.indexOf(u8, replay.body, "\"outcome\":\"applied\"") != null);
+        try t.expectEqual(disable_revision, try probe.inspectInteger("SELECT mutation_revision FROM admin_requests WHERE request_id=x'9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f';"));
+        try t.expect(!try kernelHas(a, "203.0.113.159"));
+        try t.expect(!try kernelHas(a, "198.51.100.159"));
+    }
+    const enabled = try admin(a, &h, &.{ "jail", "enable", "sshd" });
+    defer enabled.deinit(a);
+    try t.expectEqual(@as(u8, 0), enabled.code);
+    try waitKernel(a, "198.51.100.159", true, 8000);
+    try t.expect(!try kernelHas(a, "203.0.113.159"));
+    try h.writeLine("Failed password for root from 203.0.113.160 port 22 ssh2");
+    try h.writeLine("Failed password for root from 203.0.113.160 port 22 ssh2");
+    try waitKernel(a, "203.0.113.160", true, 8000);
+    try t.expect(!try kernelHas(a, "203.0.113.159"));
+}
+
+test "admin: post-removal settlement failure stays uncertain and reconciles after restart" {
     if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") == null) return error.SkipZigTest;
     const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
     var namespace_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -781,21 +1025,126 @@ test "admin: BUG-035 group disable settles only after coherent kernel readback" 
     const engine = @import("engine");
     var probe = try engine.native_store_mod.Store.open(a, h.state_path);
     defer probe.close();
+    var scope_key: [32]u8 = undefined;
+    {
+        var row = try probe.statement("SELECT scope_key FROM effect_owners WHERE jail='sshd' AND lease_kind!=0;");
+        defer row.deinit();
+        try t.expect(try row.row());
+        const key = try row.boundedBytes(0, 32);
+        try t.expectEqual(@as(usize, 32), key.len);
+        @memcpy(&scope_key, key);
+        try t.expect(!try row.row());
+    }
+    const scope_hex = std.fmt.bytesToHex(scope_key, .lower);
+    var pending_buffer: [1024]u8 = undefined;
+    const pending_query = try std.fmt.bufPrintZ(
+        &pending_buffer,
+        "SELECT count(*) FROM native_effects e JOIN effect_intents i ON i.intent_id=e.intent_id " ++
+            "WHERE e.scope_key=x'{s}' AND e.lease_kind=0 AND i.lease_kind=0 AND i.status=1 " ++
+            "AND i.dispatch_us IS NULL AND i.observed_us IS NULL AND i.fingerprint IS NULL " ++
+            "AND NOT EXISTS(SELECT 1 FROM effect_observations o WHERE o.intent_id=i.intent_id);",
+        .{scope_hex},
+    );
     try probe.inspectExec(
-        "CREATE TRIGGER bug035_readback_failure BEFORE UPDATE OF status ON effect_intents " ++
+        "CREATE TRIGGER bug035_settlement_failure BEFORE UPDATE OF status ON effect_intents " ++
             "WHEN OLD.status=1 AND NEW.status=2 AND NEW.lease_kind=0 " ++
-            "BEGIN SELECT RAISE(FAIL,'BUG-035 injected readback failure'); END;",
+            "BEGIN SELECT RAISE(FAIL,'injected post-removal settlement failure'); END;",
     );
     var trigger_installed = true;
-    defer if (trigger_installed) probe.inspectExec("DROP TRIGGER bug035_readback_failure;") catch {};
-    const uncertain = try sendAdminFrame(a, &h, [_]u8{35} ** 32, body);
+    defer if (trigger_installed) probe.inspectExec("DROP TRIGGER bug035_settlement_failure;") catch {};
+    const request_id = [_]u8{35} ** 32;
+    const uncertain = try sendAdminFrame(a, &h, request_id, body);
     defer uncertain.deinit(a);
-    try probe.inspectExec("DROP TRIGGER bug035_readback_failure;");
-    trigger_installed = false;
     try t.expectEqual(@as(u16, 508), uncertain.code);
     try t.expect(std.mem.indexOf(u8, uncertain.body, "\"outcome\":\"uncertain\"") != null);
     try t.expect(std.mem.indexOf(u8, uncertain.body, "effect outcome uncertain") != null);
-    try t.expect(try kernelHas(a, "192.0.2.36"));
+    try t.expect(!try kernelHas(a, "192.0.2.36"));
+    // The inspector removed and read back the rule; only its SQLite settlement rolled back.
+    try t.expectEqual(@as(i64, 1), try probe.inspectInteger(pending_query));
+    try t.expectEqual(@as(i64, 0), try probe.inspectInteger("SELECT count(*) FROM effect_owners WHERE jail='sshd' AND lease_kind!=0;"));
+    try t.expectEqual(@as(i64, 1), try probe.inspectInteger("SELECT count(*) FROM jail_admin_states WHERE jail='sshd' AND enabled=0 AND paused=1 AND request_id=x'2323232323232323232323232323232323232323232323232323232323232323';"));
+    var outcome_buffer: [512]u8 = undefined;
+    const uncertain_query = try std.fmt.bufPrintZ(
+        &outcome_buffer,
+        "SELECT count(*) FROM admin_requests WHERE request_id=x'2323232323232323232323232323232323232323232323232323232323232323' " ++
+            "AND kind=2 AND outcome=5 AND admission_revision={d};",
+        .{revision},
+    );
+    try t.expectEqual(@as(i64, 1), try probe.inspectInteger(uncertain_query));
+    const uncertain_revision = try probe.inspectInteger("SELECT mutation_revision FROM admin_requests WHERE request_id=x'2323232323232323232323232323232323232323232323232323232323232323';");
+    const uncertain_view = try parseValue(a, uncertain.body);
+    defer uncertain_view.deinit();
+    try t.expectEqual(uncertain_revision, uncertain_view.value.object.get("mutation_revision").?.integer);
+    const replayed = try sendAdminFrame(a, &h, request_id, body);
+    defer replayed.deinit(a);
+    try t.expectEqual(@as(u16, 508), replayed.code);
+    try t.expect(std.mem.indexOf(u8, replayed.body, "\"outcome\":\"uncertain\"") != null);
+    const replay_view = try parseValue(a, replayed.body);
+    defer replay_view.deinit();
+    try t.expectEqual(uncertain_revision, replay_view.value.object.get("mutation_revision").?.integer);
+    try t.expectEqual(@as(i64, 1), try probe.inspectInteger(pending_query));
+    try t.expectEqual(uncertain_revision, try probe.inspectInteger("SELECT mutation_revision FROM admin_requests WHERE request_id=x'2323232323232323232323232323232323232323232323232323232323232323';"));
+
+    try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try h.stopDaemon());
+    try t.expectEqual(@as(i64, 1), try probe.inspectInteger(pending_query));
+    try t.expectEqual(@as(i64, 1), try probe.inspectInteger(uncertain_query));
+    try probe.inspectExec("DROP TRIGGER bug035_settlement_failure;");
+    trigger_installed = false;
+    try h.startDaemon();
+    try waitReady(&h, 15_000);
+    var timer = try std.time.Timer.start();
+    var completed = false;
+    while (timer.read() < 15 * std.time.ns_per_s) {
+        const resumed = try sendAdminFrame(a, &h, request_id, body);
+        defer resumed.deinit(a);
+        if (resumed.code == 200) {
+            try t.expect(std.mem.indexOf(u8, resumed.body, "\"outcome\":\"applied\"") != null);
+            completed = true;
+            break;
+        }
+        try t.expect(resumed.code == 507 or resumed.code == 508);
+        std.time.sleep(50 * std.time.ns_per_ms);
+    }
+    try t.expect(completed);
+    try t.expect(!try kernelHas(a, "192.0.2.36"));
+    try waitActiveBans(&h, 0, 5000);
+    const empty = try waitListCount(&h, 0, 5000);
+    a.free(empty);
+    try t.expectEqual(@as(i64, 0), try probe.inspectInteger("SELECT count(*) FROM effect_owners WHERE jail='sshd' AND lease_kind!=0;"));
+    var unsettled_buffer: [512]u8 = undefined;
+    const unsettled_query = try std.fmt.bufPrintZ(&unsettled_buffer, "SELECT count(*) FROM effect_intents WHERE scope_key=x'{s}' AND status IN(1,2);", .{scope_hex});
+    try t.expectEqual(@as(i64, 0), try probe.inspectInteger(unsettled_query));
+    var current_buffer: [512]u8 = undefined;
+    const current_query = try std.fmt.bufPrintZ(&current_buffer, "SELECT count(*) FROM native_effects e JOIN effect_intents i ON i.intent_id=e.intent_id " ++
+        "WHERE e.scope_key=x'{s}' AND (e.lease_kind!=0 OR i.lease_kind!=0 OR i.status!=4 OR i.dispatch_us IS NULL OR i.observed_us IS NULL OR i.fingerprint IS NULL);", .{scope_hex});
+    try t.expectEqual(@as(i64, 0), try probe.inspectInteger(current_query));
+    var targets_buffer: [512]u8 = undefined;
+    const targets_query = try std.fmt.bufPrintZ(&targets_buffer, "SELECT count(*) FROM action_targets WHERE scope_key=x'{s}' AND status IN(1,2,5);", .{scope_hex});
+    try t.expectEqual(@as(i64, 0), try probe.inspectInteger(targets_query));
+    const final_query = try std.fmt.bufPrintZ(&outcome_buffer, "SELECT count(*) FROM admin_requests WHERE request_id=x'2323232323232323232323232323232323232323232323232323232323232323' " ++
+        "AND kind=2 AND outcome=1 AND admission_revision={d};", .{revision});
+    try t.expectEqual(@as(i64, 1), try probe.inspectInteger(final_query));
+    try t.expectEqual(@as(i64, 1), try probe.inspectInteger("SELECT count(*) FROM jail_admin_states WHERE jail='sshd' AND enabled=0 AND paused=1 AND request_id=x'2323232323232323232323232323232323232323232323232323232323232323';"));
+    const final_revision = try probe.inspectInteger("SELECT mutation_revision FROM admin_requests WHERE request_id=x'2323232323232323232323232323232323232323232323232323232323232323';");
+    try t.expect(final_revision > uncertain_revision);
+    const final_replay = try sendAdminFrame(a, &h, request_id, body);
+    defer final_replay.deinit(a);
+    try t.expectEqual(@as(u16, 200), final_replay.code);
+    try t.expect(std.mem.indexOf(u8, final_replay.body, "\"outcome\":\"applied\"") != null);
+    const final_view = try parseValue(a, final_replay.body);
+    defer final_view.deinit();
+    try t.expectEqual(final_revision, final_view.value.object.get("mutation_revision").?.integer);
+    try t.expectEqual(final_revision, try probe.inspectInteger("SELECT mutation_revision FROM admin_requests WHERE request_id=x'2323232323232323232323232323232323232323232323232323232323232323';"));
+    const jails = try admin(a, &h, &.{"jails"});
+    defer jails.deinit(a);
+    try t.expectEqual(@as(u8, 0), jails.code);
+    const document = try parseValue(a, jails.stdout);
+    defer document.deinit();
+    try t.expectEqual(@as(usize, 1), document.value.array.items.len);
+    const jail = document.value.array.items[0].object;
+    try t.expect(!jail.get("enabled").?.bool);
+    try t.expect(jail.get("paused").?.bool);
+    try t.expect(!jail.get("disable_cleanup_pending").?.bool);
 }
 
 test "admin: enforcing manual ban, unban and disable settle only by kernel readback; reload re-key keeps the rule" {

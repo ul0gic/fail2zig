@@ -23,13 +23,13 @@ For an existing **native SQLite** installation using `/var/lib/fail2zig/state.bi
    and `history` for the expected protection and continuity. The installer never starts or
    restarts services. Keep rollback backups until the new installation has been checked.
 
-Custom `state_file` paths are refused by the automatic installer. Handle them manually with
-all writers stopped: verify a dedicated real parent directory, regular single-link database
-and existing WAL/SHM files; reject symlinks and unexpected owners. Change ownership of only those
-exact objects to `fail2zig:<service-group>`, keep the parent non-group/world-writable and files
-private, and grant that parent through a matching systemd `ReadWritePaths` override. Do not
-recursively chown `/var`, a shared directory, log trees or arbitrary configuration paths.
-The native database and its parent must belong to the UID that will run the daemon.
+Custom `state_file` paths are refused by the automatic installer. Follow the
+[custom state directory procedure](installation.md#custom-state-directory-under-systemd)
+for the stopped SQLite backup/copy, exact ownership and narrow systemd drop-in.
+The native database and its dedicated real parent must belong to the service UID;
+changing TOML or proving shell writability does not change the unit's filesystem
+namespace. Clearing the inherited `StateDirectory` prevents systemd recreating an
+unused default directory without deleting existing rollback state.
 
 For **released v0.3.0 binary state**, installation deliberately refuses to reinterpret the file
 as SQLite. Pre-v0.4.0 releases are unsupported and no longer distributed; do not install or

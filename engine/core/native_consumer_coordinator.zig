@@ -43,6 +43,12 @@ fn generationFromInitial(settings: Settings, programs: []const *const rules.Prog
     return generationFromPolicy(settings, programs, initial, if (cache) |owner| owner.generation else null);
 }
 pub fn generationFromPolicy(settings: Settings, programs: []const *const rules.Program, initial: *const ignore.Snapshot, resolver_generation: ?[32]u8) ![32]u8 {
+    return policyGeneration(settings, programs, initial, resolver_generation, false);
+}
+pub fn legacyGenerationFromPolicy(settings: Settings, programs: []const *const rules.Program, initial: *const ignore.Snapshot, resolver_generation: ?[32]u8) ![32]u8 {
+    return policyGeneration(settings, programs, initial, resolver_generation, true);
+}
+fn policyGeneration(settings: Settings, programs: []const *const rules.Program, initial: *const ignore.Snapshot, resolver_generation: ?[32]u8, legacy: bool) ![32]u8 {
     if (programs.len == 0 or programs.len > max_rules) return error.ConsumerCapacity;
     if (settings.filter.len == 0 or settings.filter.len > 64) return error.InvalidConsumer;
     try (state.Key{ .kind = .rule, .jail = settings.jail, .source = settings.logical_source, .rule = settings.filter.slice(), .generation = settings.parent_generation }).validate();
@@ -51,10 +57,15 @@ pub fn generationFromPolicy(settings: Settings, programs: []const *const rules.P
     if (initial.options.family != settings.family or std.mem.allEqual(u8, &settings.ignore_generation, 0) or
         !std.mem.eql(u8, &initial.generation, &settings.ignore_generation)) return error.IgnoreGenerationMismatch;
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("fail2zig-native-coordinator-v1\x00");
+    hash.update(if (legacy) "fail2zig-native-coordinator-v1\x00" else "fail2zig-native-coordinator-v2\x00");
     hash.update(&settings.parent_generation);
-    hash.update(&settings.ignore_generation);
-    hash.update(&initial.options.parent_generation);
+    if (legacy) {
+        hash.update(&settings.ignore_generation);
+        hash.update(&initial.options.parent_generation);
+    } else {
+        if (!std.mem.eql(u8, &initial.options.parent_generation, &settings.parent_generation)) return error.IgnoreGenerationMismatch;
+        hash.update(&.{@intFromBool(initial.options.self_required)});
+    }
     hash.update(&initial.options.resolver_generation);
     hash.update(&.{ @intFromEnum(settings.family), @intFromBool(settings.journal) });
     if (settings.journal_origin) |profile| hash.update(&profile.generation);
@@ -472,6 +483,8 @@ pub const Coordinator = struct {
         return .{ .manifest = .{ .jail = "@shared", .source = source, .source_generation = result.request.generation, .required = &self.dns_requirement }, .state = self.stateStage(), .bootstrap = self.dns_stage.?.expected_revision == 0 };
     }
     pub fn prepareAllowlistRefresh(self: *Coordinator, next: *ignore.Snapshot, source_generation: [32]u8, now_us: i64) !StateStage {
+        var transferred = false;
+        errdefer if (!transferred) next.destroy();
         if (!self.ready) return error.ConsumerStateNotReady;
         if (!std.mem.eql(u8, &next.options.parent_generation, &self.ignores.live.options.parent_generation) or !std.mem.eql(u8, &next.options.resolver_generation, &self.ignores.live.options.resolver_generation)) return error.IgnoreGenerationMismatch;
         try self.begin(now_us);
@@ -481,6 +494,7 @@ pub const Coordinator = struct {
         for (self.owners, 0..) |_, i| try self.dependency(.{ .key = self.ruleKey(i), .expected_revision = self.revisions[i] });
         try self.authorityRead();
         self.ignore_stage = try self.ignores.prepare(next);
+        transferred = true;
         try self.delta(.{ .key = self.ignoreKey(), .format_version = ignore.version, .expected_revision = self.ignores.revision, .payload = next.payload });
         try self.batch().validate();
         return .{ .manifest = try self.manifest(source_generation), .state = self.stateStage(), .bootstrap = false };

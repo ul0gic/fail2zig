@@ -20,10 +20,13 @@ project-authored Zig or relicensed as project-authored AGPL code.
 statically. No source generator, configure script, Tcl, Python, installed SQLite library
 or SQLite service is required. The command-line shell and extension header are omitted.
 
-The only SQLite feature override is `SQLITE_OMIT_LOAD_EXTENSION=1`, which removes dynamic
-extension loading. Default thread safety, mutexes and integrity features remain enabled.
-Connection setup requires WAL, FULL synchronous commits, foreign keys and untrusted schema.
-Upstream [compile options](https://sqlite.org/compile.html) document the build settings.
+The build defines `SQLITE_OMIT_LOAD_EXTENSION=1`, which removes dynamic extension loading,
+and `SQLITE_ENABLE_DBSTAT_VTAB=1`, which enables SQLite's `dbstat` virtual table. Both flags
+are present in the diagnostic and release C flag sets in `build.zig`. The shipped support
+bundle uses `dbstat` through `Store.footprint` to report table and index footprint details.
+Default thread safety, mutexes and integrity features remain enabled. Connection setup
+requires WAL, FULL synchronous commits, foreign keys and untrusted schema. Upstream
+[compile options](https://sqlite.org/compile.html) document the build settings.
 
 When updating, verify the archive against the upstream published hash, update these hashes
 and the embedded-version test, and rerun transaction/restart/upgrade tests on supported

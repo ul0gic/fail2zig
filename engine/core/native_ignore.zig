@@ -4,7 +4,7 @@ const std = @import("std");
 const dns = @import("native_dns.zig");
 const Ip = @import("shared").IpAddress;
 const Cidr = @import("state.zig").Cidr;
-pub const version: u16 = 1;
+pub const version: u16 = 2;
 pub const max_entries = 1024;
 pub const max_hostnames = 16;
 pub const max_file_bytes = 64 * 1024;
@@ -55,13 +55,16 @@ pub const Snapshot = struct {
         return build(allocator, options, entries);
     }
     fn build(allocator: std.mem.Allocator, options: Options, entries: []Entry) !*Snapshot {
+        return buildVersion(allocator, options, entries, version);
+    }
+    fn buildVersion(allocator: std.mem.Allocator, options: Options, entries: []Entry, format_version: u16) !*Snapshot {
         const owner = try allocator.create(Snapshot);
         errdefer allocator.destroy(owner);
         var bytes = std.ArrayList(u8).init(allocator);
         errdefer bytes.deinit();
         var header = [_]u8{0} ** 80;
         @memcpy(header[0..4], "F2NI");
-        std.mem.writeInt(u16, header[4..6], version, .little);
+        std.mem.writeInt(u16, header[4..6], format_version, .little);
         header[6] = @intFromBool(options.self_required);
         header[7] = switch (options.family) {
             .v4 => 4,
@@ -126,9 +129,15 @@ pub const Snapshot = struct {
         return fromText(allocator, options, bytes);
     }
     pub fn restore(allocator: std.mem.Allocator, expected: Options, bytes: []const u8) !*Snapshot {
+        return restoreVersion(allocator, expected, bytes, version);
+    }
+    pub fn restoreLegacy(allocator: std.mem.Allocator, expected: Options, bytes: []const u8) !*Snapshot {
+        return restoreVersion(allocator, expected, bytes, 1);
+    }
+    fn restoreVersion(allocator: std.mem.Allocator, expected: Options, bytes: []const u8, format_version: u16) !*Snapshot {
         if (expected.self_required and !expected.self_ready) return error.SelfStateUnavailable;
         if (bytes.len < 80 or bytes.len > max_checkpoint_bytes or !std.mem.eql(u8, bytes[0..4], "F2NI")) return error.InvalidIgnoreCheckpoint;
-        if (std.mem.readInt(u16, bytes[4..6], .little) != version or bytes[6] > 1 or !std.mem.allEqual(u8, bytes[74..80], 0)) return error.UnsupportedIgnoreCheckpoint;
+        if (std.mem.readInt(u16, bytes[4..6], .little) != format_version or bytes[6] > 1 or !std.mem.allEqual(u8, bytes[74..80], 0)) return error.UnsupportedIgnoreCheckpoint;
         const family: dns.Family = switch (bytes[7]) {
             4 => .v4,
             6 => .v6,
@@ -165,7 +174,7 @@ pub const Snapshot = struct {
         }
         if (expected.self_required and self_count != expected.self_addresses.len) return error.IgnoreSelfGenerationMismatch;
         if (at != bytes.len) return error.InvalidIgnoreCheckpoint;
-        return build(allocator, expected, entries);
+        return buildVersion(allocator, expected, entries, format_version);
     }
     pub fn check(self: *const Snapshot, ip: Ip, cache: ?*const dns.Cache, now_us: i64) !Decision {
         try validateIp(ip);

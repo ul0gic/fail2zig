@@ -40,6 +40,8 @@ pub const Sink = struct {
     format: LogFormat,
     fd: posix.fd_t,
     owns_fd: bool,
+    // Lock descriptor writes before queue/stat updates; producers take only mutex.
+    write_mutex: std.Thread.Mutex = .{},
     mutex: std.Thread.Mutex = .{},
     ring: []u8,
     lens: [ring_capacity]u16 = [_]u16{0} ** ring_capacity,
@@ -68,7 +70,9 @@ pub const Sink = struct {
     }
 
     pub fn deinit(self: *Sink) void {
+        self.write_mutex.lock();
         if (self.owns_fd and self.fd != -1) posix.close(self.fd);
+        self.write_mutex.unlock();
         self.allocator.free(self.ring);
         self.* = undefined;
     }
@@ -79,8 +83,8 @@ pub const Sink = struct {
             .file => |p| p,
         };
         const fresh = try openLogFile(path);
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
         if (self.owns_fd and self.fd != -1) posix.close(self.fd);
         self.fd = fresh;
         self.owns_fd = true;
@@ -129,6 +133,8 @@ pub const Sink = struct {
     }
 
     fn writeLine(self: *Sink, line: []const u8) void {
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
         var written: usize = 0;
         while (written < line.len) {
             const n = posix.write(self.fd, line[written..]) catch |err| {
@@ -149,6 +155,7 @@ pub const Sink = struct {
         }
     }
 
+    // Called with write_mutex held, including the descriptor check and fallback write.
     fn noteFailure(self: *Sink, err: anyerror) void {
         const notice_due = blk: {
             self.mutex.lock();

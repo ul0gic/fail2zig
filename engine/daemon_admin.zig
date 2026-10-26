@@ -106,6 +106,7 @@ pub fn Methods(comptime Coordinator: type) type {
             out.generation = self.published_generation;
             const now = self.clock.wallUs();
             const revision = self.store.finishAdminRequest(.{ .request_id = request.request_id, .kind = request.kind, .subject = request.jailName(), .outcome = view.outcome, .generation = self.published_generation, .committed_us = @max(0, now), .detail = view.reason.slice(), .admission_revision = request.expected_revision }, state) catch |err| {
+                self.recoverAdminStorageIfNeeded(err);
                 std.log.err("native admin: outcome {s} could not be recorded: {s}", .{ @tagName(view.outcome), @errorName(err) });
                 return (out.withOutcome(.uncertain)).withReason("{s} outcome not recorded: {s}; inspect before retrying", .{ @tagName(view.outcome), @errorName(err) });
             };
@@ -114,6 +115,10 @@ pub fn Methods(comptime Coordinator: type) type {
             self.mutex.unlock();
             out.mutation_revision = revision;
             return out;
+        }
+        fn recoverAdminStorageIfNeeded(self: *Coordinator, failure: anyerror) void {
+            if (!self.store.reopen_required and self.store.rollback_error_code == null and self.store.api.get_autocommit(self.store.db) != 0) return;
+            self.gate.failed(failure, .{ .sqlite_code = self.store.last_error_code, .rollback_code = self.store.rollback_error_code, .reopen_required = true });
         }
         pub fn adminScope(self: *Coordinator, request: *AdminRequest) !@import("firewall/scope.zig").Scope {
             const address = request.address orelse return error.AdminAddressRequired;
@@ -128,13 +133,13 @@ pub fn Methods(comptime Coordinator: type) type {
         pub fn executeAdmin(self: *Coordinator, request: *AdminRequest) void {
             const outcome = self.executeAdminInner(request) catch |err| blk: {
                 if (request.mutation_committed) {
+                    if (request.kind == .group_disable) break :blk disableAcceptedView(self, request, err);
                     const failed = switch (request.kind) {
-                        .group_disable => (AdminOutcomeView{ .outcome = .partial, .kind = request.kind, .generation = self.published_generation }).withReason("{d} owner releases committed before {s}; inspect state before retrying", .{ request.committed_count, @errorName(err) }),
                         .migration_activate => (AdminOutcomeView{ .outcome = .partial, .kind = request.kind, .generation = self.published_generation }).withReason("migration owner activation committed before {s}; inspect state before retrying", .{@errorName(err)}),
                         else => (AdminOutcomeView{ .outcome = .partial, .kind = request.kind, .generation = self.published_generation }).withReason("mutation committed before {s}; inspect state before retrying", .{@errorName(err)}),
                     };
                     if (request.pending_state) |state| if (self.findJail(state.jail)) |jail| {
-                        setJailPaused(jail, state.paused);
+                        setJailPaused(jail, !state.enabled or state.paused);
                         self.mutex.lock();
                         jail.admin_paused = state.paused;
                         jail.admin_enabled = state.enabled;
@@ -151,6 +156,17 @@ pub fn Methods(comptime Coordinator: type) type {
             const kind = request.kind;
             const base = AdminOutcomeView{ .outcome = .applied, .kind = kind, .generation = self.published_generation };
             if (kind == .firewall_withdraw) return self.withdrawFirewall(request);
+            if (kind == .group_disable) {
+                if (!self.store_open or self.store.reopen_required) return base.withOutcome(.uncertain).withReason("storage is unavailable; recorded disable outcome cannot be read; inspect status before retrying", .{});
+                const admitted = self.store.admitAdminRequest(request.request_id, request.expected_revision) catch |failure| switch (failure) {
+                    error.StaleAdminRevision, error.InvalidAdminRequest => return failure,
+                    else => return base.withOutcome(.uncertain).withReason("disable outcome could not be read: {s}; inspect status before retrying", .{@errorName(failure)}),
+                };
+                switch (admitted) {
+                    .replayed => |prior| return disableReplayView(self, prior),
+                    .fresh => {},
+                }
+            }
             const ignore_kind = kind == .ignore_add or kind == .ignore_remove;
             if (ignore_kind) {
                 const ignore_state = try self.allocator.create(IgnoreWork);
@@ -162,11 +178,11 @@ pub fn Methods(comptime Coordinator: type) type {
                 const cause = if (self.gate.snapshot().last_failure) |last| @errorName(last.cause) else @errorName(failure);
                 return base.withOutcome(.rejected).withReason("storage is not accepting changes ({s}); retry when fail2zig status shows storage healthy", .{cause});
             };
-            switch (try self.store.admitAdminRequest(request.request_id, request.expected_revision)) {
+            switch (if (kind == .group_disable) @as(durable.Store.AdminAdmission, .fresh) else try self.store.admitAdminRequest(request.request_id, request.expected_revision)) {
                 .replayed => |prior| return .{ .outcome = prior.outcome, .kind = prior.kind, .generation = self.published_generation, .mutation_revision = prior.mutation_revision },
                 .fresh => {},
             }
-            if (!std.mem.eql(u8, &request.expected_generation, &self.published_generation)) return self.adminDetail(request, base.withReason("stale generation; reload happened", .{}), null).withOutcome(.rejected);
+            if (!std.mem.eql(u8, &request.expected_generation, &self.published_generation)) return self.adminDetail(request, base.withOutcome(.rejected).withReason("stale generation; reload happened", .{}), null);
             const now = self.clock.wallUs();
             switch (kind) {
                 .setting_batch => return self.adminDetail(request, (AdminOutcomeView{ .outcome = .rejected, .kind = kind }).withReason("runtime-only settings are not supported; edit the configuration and reload", .{}), null),
@@ -175,11 +191,13 @@ pub fn Methods(comptime Coordinator: type) type {
                 .ignore_remove => return self.executeIgnoreRemove(request),
                 .group_enable, .group_disable, .group_pause, .group_resume => {
                     const jail = self.findJail(request.jailName()) orelse return self.adminDetail(request, (AdminOutcomeView{ .outcome = .absent, .kind = kind }).withReason("unknown jail", .{}), null);
+                    if (jail.retiring and (kind == .group_enable or kind == .group_resume)) return self.adminDetail(request, base.withOutcome(.rejected).withReason("jail retirement in progress; retry after completion", .{}), null);
                     var state = durable.Store.JailAdminState{ .jail = jail.name, .enabled = true, .paused = false, .generation = self.published_generation, .changed_us = @max(0, now), .request_id = request.request_id };
                     var existing: durable.Store.JailAdminState = undefined;
                     if (try self.store.jailAdminState(jail.name, &existing)) {
                         state.enabled = existing.enabled;
                         state.paused = existing.paused;
+                        if (!existing.enabled and (kind == .group_pause or kind == .group_resume)) state.request_id = existing.request_id;
                     }
                     switch (kind) {
                         .group_pause => state.paused = true,
@@ -191,37 +209,43 @@ pub fn Methods(comptime Coordinator: type) type {
                         .group_disable => {
                             state.enabled = false;
                             state.paused = true;
-                            request.pending_state = state;
-                            var step: u32 = 0;
-                            while (step < 4096) : (step += 1) {
-                                var counter: [4]u8 = undefined;
-                                std.mem.writeInt(u32, &counter, step, .little);
-                                const transition = effect.hashParts("fail2zig-admin-disable-v1", &.{ &request.request_id, &counter });
-                                const released = try self.store.flushJailOwner(jail.name, try self.plannedGeneration(jail, .planned), transition, .{ .prepared_us = now, .context = self, .read = wallClockEffect });
-                                if (released == null) break;
-                                request.mutation_committed = true;
-                                request.committed_count += 1;
-                            }
+                            const partial = base.withOutcome(.partial).withReason("jail disabled; owner releases continue automatically, including after restart; enabling cancels remaining releases", .{});
+                            const revision = self.store.finishAdminRequest(.{ .request_id = request.request_id, .kind = kind, .subject = jail.name, .outcome = .partial, .generation = self.published_generation, .committed_us = @max(0, now), .detail = partial.reason.slice(), .admission_revision = request.expected_revision }, state) catch |failure| {
+                                self.recoverAdminStorageIfNeeded(failure);
+                                return base.withOutcome(.uncertain).withReason("disable acceptance not confirmed: {s}; inspect status and replay the same request", .{@errorName(failure)});
+                            };
+                            request.mutation_committed = true;
+                            request.disable_revision = revision;
+                            jail.disable_progress = .{ .request_id = request.request_id };
+                            setJailPaused(jail, true);
+                            const deadline_ms = monotonic(self) + 2000;
+                            self.mutex.lock();
+                            self.published_revision = revision;
+                            jail.admin_enabled = false;
+                            jail.admin_paused = true;
+                            jail.disable_cleanup_pending = true;
+                            request.phase = .awaiting;
+                            request.deadline_ms = deadline_ms;
+                            self.mutex.unlock();
+                            return partial;
                         },
                         else => unreachable,
                     }
-                    setJailPaused(jail, state.paused);
+                    const view = self.adminDetail(request, base, state);
+                    if (view.outcome != .applied) return view;
+                    setJailPaused(jail, !state.enabled or state.paused);
+                    if (state.enabled) jail.disable_progress = null;
                     self.mutex.lock();
                     jail.admin_paused = state.paused;
                     jail.admin_enabled = state.enabled;
+                    if (state.enabled) jail.disable_cleanup_pending = false;
                     self.mutex.unlock();
-                    if (kind == .group_disable and self.effects != null) {
-                        request.pending_state = state;
-                        request.phase = .awaiting;
-                        request.deadline_ms = monotonic(self) + 2000;
-                        request.expect_absent = true;
-                        request.scope_key = [_]u8{0} ** 32;
-                        return base;
-                    }
-                    return self.adminDetail(request, base, state);
+                    return view;
                 },
                 .ban, .unban => {
                     const jail = self.findJail(request.jailName()) orelse return self.adminDetail(request, (AdminOutcomeView{ .outcome = .absent, .kind = kind }).withReason("unknown jail", .{}), null);
+                    if (kind == .ban and jail.retiring) return self.adminDetail(request, base.withOutcome(.rejected).withReason("jail retirement in progress; retry after completion", .{}), null);
+                    if (kind == .ban and !jail.admin_enabled) return self.adminDetail(request, base.withOutcome(.rejected).withReason("jail is disabled; enable it before adding a ban", .{}), null);
                     const manager = self.effects orelse return self.adminDetail(request, (AdminOutcomeView{ .outcome = .rejected, .kind = kind }).withReason("jail is log-only; manual bans require an enforcing backend", .{}), null);
                     const canonical = try self.adminScope(request);
                     const scope = try effect.Scope.exact(canonical);
@@ -272,6 +296,7 @@ pub fn Methods(comptime Coordinator: type) type {
         pub fn executeRepairSource(self: *Coordinator, request: *AdminRequest, base: AdminOutcomeView, now: i64) !AdminOutcomeView {
             const name = request.jailName();
             const jail = self.findJail(name) orelse return self.adminDetail(request, (AdminOutcomeView{ .outcome = .absent, .kind = request.kind }).withReason("unknown jail", .{}), null);
+            if (jail.retiring) return self.adminDetail(request, base.withOutcome(.rejected).withReason("jail retirement in progress; retry after completion", .{}), null);
             var diagnostic: source_repair.Diagnostic = .{};
             const outcome = self.store.repairSourceOnline(.{ .jail = name, .path = request.repair_path[0..request.repair_path_len], .token = request.repair_token[0..request.repair_token_len] }, now, &diagnostic) catch |failure| {
                 request.repair_shape = diagnostic.shape;
@@ -319,6 +344,7 @@ pub fn Methods(comptime Coordinator: type) type {
             var generations: [64]durable.Store.JailGeneration = undefined;
             var count: usize = 0;
             for (self.jails) |*jail| {
+                if (jail.retiring or !jail.admin_enabled) continue;
                 if (count == generations.len) return error.AdminJailCapacity;
                 generations[count] = .{ .jail = jail.name, .generation = try self.plannedGeneration(jail, .planned) };
                 count += 1;
@@ -327,6 +353,7 @@ pub fn Methods(comptime Coordinator: type) type {
             const clock = effect.Clock{ .prepared_us = now, .context = self, .read = wallClockEffect };
             const activated = self.store.activateStagedOwners(run_id, generations[0..count], clock) catch |err| {
                 try self.store.finishMigrationStep(run_id, seq, .operational_failure, @errorName(err), null, self.clock.wallUs());
+                if (err == error.MigrationJailUnknown) return self.adminDetail(request, base.withOutcome(.rejected).withReason("destination jail is disabled or unconfigured; enable/configure it before activation", .{}), null);
                 return self.adminDetail(request, (AdminOutcomeView{ .outcome = .rejected, .kind = request.kind }).withReason("activation failed: {s}", .{@errorName(err)}), null);
             };
             request.mutation_committed = true;
@@ -369,12 +396,7 @@ pub fn Methods(comptime Coordinator: type) type {
             defer self.allocator.free(keys);
             const report = self.store.migrationActivatedKeys(run_id, now, keys) catch |err| return (view.withOutcome(.uncertain)).withReason("activated owners unreadable: {s}", .{@errorName(err)});
             var applied: usize = 0;
-            for (keys[0..report.found]) |key| {
-                for (manager.live[0..manager.count]) |entry| if (std.mem.eql(u8, &entry.scope_key, &key) and entry.status == .applied and entry.desired.live(now)) {
-                    applied += 1;
-                    break;
-                };
-            }
+            for (keys[0..report.found]) |key| applied += @intFromBool(manager.appliedKey(key, now));
             if (manager.status.uncertain) {
                 view.destination = "uncertain";
                 return (view.withOutcome(.uncertain)).withReason("effect outcome uncertain: {s}", .{if (manager.status.cause) |cause| @errorName(cause) else "unknown"});
@@ -383,12 +405,7 @@ pub fn Methods(comptime Coordinator: type) type {
                 const remaining = self.store.migrationOwnersRemaining(run_id) catch |err| return (view.withOutcome(.uncertain)).withReason("migration owners unreadable: {s}", .{@errorName(err)});
                 const staged_count = self.store.migrationStagedKeys(run_id, keys) catch |err| return (view.withOutcome(.uncertain)).withReason("staged scopes unreadable: {s}", .{@errorName(err)});
                 var realized: usize = 0;
-                for (keys[0..staged_count]) |key| {
-                    for (manager.live[0..manager.count]) |entry| if (std.mem.eql(u8, &entry.scope_key, &key) and entry.status == .applied and entry.desired.live(now)) {
-                        realized += 1;
-                        break;
-                    };
-                }
+                for (keys[0..staged_count]) |key| realized += @intFromBool(manager.appliedKey(key, now));
                 const coherent = manager.status.ready and manager.cached_epoch != null and manager.cached_epoch.? == self.store.effect_publication_epoch;
                 if (coherent and remaining == 0) {
                     view.outcome = .applied;
@@ -482,7 +499,119 @@ pub fn Methods(comptime Coordinator: type) type {
             std.log.warn("native: firewall withdraw removed {d} of {d} realized rules: {s}; enforcement withdrawn until the next start", .{ installed -| remaining, installed, @errorName(failure) });
             return base.withOutcome(outcome).withReason("{d} of {d} rules removed: {s}; run firewall withdraw again", .{ installed -| remaining, installed, @errorName(failure) });
         }
+        fn disableReplayView(self: *Coordinator, prior: durable.Store.AdminReplay) AdminOutcomeView {
+            const view = AdminOutcomeView{ .outcome = prior.outcome, .kind = prior.kind, .generation = self.published_generation, .mutation_revision = prior.mutation_revision };
+            if (prior.kind == .group_disable and (prior.outcome == .partial or prior.outcome == .uncertain)) return view.withReason("jail disable continues automatically while disabled, including after restart; inspect jail/status; enabling cancels remaining releases", .{});
+            return view;
+        }
+        fn disableAcceptedView(self: *Coordinator, request: *AdminRequest, cause: ?anyerror) AdminOutcomeView {
+            const view = AdminOutcomeView{ .outcome = .partial, .kind = .group_disable, .generation = self.published_generation, .mutation_revision = request.disable_revision };
+            if (cause) |failure| return view.withReason("disable accepted; cleanup is waiting on {s} and resumes automatically after recovery; enabling cancels remaining releases", .{@errorName(failure)});
+            return view.withReason("jail disabled; owner releases continue automatically, including after restart; inspect jail/status; enabling cancels remaining releases", .{});
+        }
+        fn syncDisableOutcome(self: *Coordinator, jail: *Jail, next: durable.Store.AdminOutcome, detail: []const u8) !void {
+            const progress = &jail.disable_progress.?;
+            switch (try self.store.admitAdminRequest(progress.request_id, self.published_revision)) {
+                .fresh => return,
+                .replayed => |prior| {
+                    // Legacy applied rows remain historical; current cleanup is a separate published fact.
+                    if (prior.kind != .group_disable or (prior.outcome != .partial and prior.outcome != .uncertain)) return;
+                    if (try self.store.updateJailDisableOutcome(jail.name, progress.request_id, prior.outcome, next, detail, self.store.effect_publication_epoch, @max(0, self.clock.wallUs()))) |revision| {
+                        self.mutex.lock();
+                        self.published_revision = revision;
+                        self.mutex.unlock();
+                    }
+                },
+            }
+        }
+        pub fn advanceDisabledJails(self: *Coordinator) !void {
+            for (0..self.jails.len) |_| {
+                const index = self.disable_next_jail % self.jails.len;
+                self.disable_next_jail = (index + 1) % self.jails.len;
+                const jail = &self.jails[index];
+                if (jail.retiring or jail.admin_enabled) continue;
+                const progress = if (jail.disable_progress) |*value| value else continue;
+                if (progress.phase == .complete) continue;
+                if (progress.phase == .releasing) {
+                    const now = self.clock.wallUs();
+                    const page = self.store.releaseDisabledJailPage(jail.name, progress.request_id, progress.after, .{ .prepared_us = now, .context = self, .read = wallClockEffect }) catch |failure| {
+                        progress.cause = failure;
+                        if (failure == error.EffectReconciliationRequired) return;
+                        self.gate.failed(failure, .{ .sqlite_code = self.store.last_error_code, .rollback_code = self.store.rollback_error_code, .reopen_required = self.store.reopen_required });
+                        return failure;
+                    };
+                    progress.after = page.after;
+                    progress.cause = null;
+                    if (page.done) progress.phase = .verifying;
+                    self.effect_backlog = true;
+                }
+                const readback: AdminReadback = if (self.effects) |manager|
+                    adminReadback(manager.status, manager.cached_epoch, self.store.effect_publication_epoch)
+                else if ((try self.store.readInstallation()) == null)
+                    .coherent
+                else
+                    .uncertain;
+                if (readback == .uncertain) {
+                    progress.cause = if (self.effects) |manager| manager.status.cause orelse error.EffectBackendUncertain else error.EffectBackendUncertain;
+                    try syncDisableOutcome(self, jail, .uncertain, "effect outcome uncertain; disabled cleanup continues after recovery");
+                } else if (progress.phase == .verifying and readback == .coherent) {
+                    try syncDisableOutcome(self, jail, .applied, "all jail owners released; current kernel readback coherent");
+                    progress.phase = .complete;
+                    progress.cause = null;
+                    self.mutex.lock();
+                    jail.disable_cleanup_pending = false;
+                    self.mutex.unlock();
+                } else try syncDisableOutcome(self, jail, .partial, "jail disabled; owner releases and kernel confirmation continue automatically");
+                return;
+            }
+        }
+        fn settleJailDisable(self: *Coordinator, request: *AdminRequest) void {
+            const jail = self.findJail(request.jailName());
+            const active = if (jail) |value| blk: {
+                if (value.admin_enabled or value.retiring) break :blk false;
+                const progress = value.disable_progress orelse break :blk false;
+                break :blk std.mem.eql(u8, &progress.request_id, &request.request_id);
+            } else false;
+            const cause: ?anyerror = if (active) jail.?.disable_progress.?.cause else null;
+            var view = disableAcceptedView(self, request, cause);
+            if (!self.store_open or self.store.reopen_required) {
+                self.completeAdmin(request, (view.withOutcome(.uncertain)).withReason("disable accepted; storage is unavailable for outcome readback; cleanup resumes after recovery", .{}));
+                return;
+            }
+            const admitted = self.store.admitAdminRequest(request.request_id, request.expected_revision) catch |failure| {
+                self.completeAdmin(request, (view.withOutcome(.uncertain)).withReason("disable accepted; recorded outcome temporarily unreadable: {s}; inspect status before retrying", .{@errorName(failure)}));
+                return;
+            };
+            switch (admitted) {
+                .fresh => {},
+                .replayed => |prior| {
+                    view.outcome = prior.outcome;
+                    view.mutation_revision = prior.mutation_revision;
+                    if (prior.outcome == .applied) {
+                        self.completeAdmin(request, view.withReason("all jail owners released; current kernel readback coherent", .{}));
+                        return;
+                    }
+                },
+            }
+            if (!active) {
+                self.completeAdmin(request, view.withReason("disable continuation superseded by enable, replacement disable or jail removal; committed releases are retained", .{}));
+                return;
+            }
+            if (self.effects) |manager| if (manager.status.uncertain) {
+                view = (view.withOutcome(.uncertain)).withReason("effect outcome uncertain: {s}; disabled cleanup continues after recovery", .{if (manager.status.cause) |failure| @errorName(failure) else "unknown"});
+                syncDisableOutcome(self, jail.?, .uncertain, view.reason.slice()) catch |failure| {
+                    self.completeAdmin(request, view.withReason("effect outcome uncertain; uncertainty could not be recorded: {s}; inspect status", .{@errorName(failure)}));
+                    return;
+                };
+                view.mutation_revision = self.published_revision;
+                self.completeAdmin(request, view);
+                return;
+            };
+            if (view.outcome != .uncertain and (cause == null or cause.? == error.EffectReconciliationRequired) and monotonic(self) < request.deadline_ms) return;
+            self.completeAdmin(request, view);
+        }
         pub fn settleAdmin(self: *Coordinator, request: *AdminRequest) void {
+            if (request.kind == .group_disable and request.mutation_committed) return settleJailDisable(self, request);
             if (request.ignore) |ignore_state| if (ignore_state.lifting) return self.settleIgnoreLifts(request, ignore_state);
             const manager = self.effects orelse {
                 const view = if (request.run_id != null) (AdminOutcomeView{ .outcome = .uncertain, .kind = request.kind, .destination = "uncertain" }).withReason("no enforcement backend to verify activation", .{}) else AdminOutcomeView{ .outcome = .applied, .kind = request.kind };
@@ -636,6 +765,7 @@ pub fn Methods(comptime Coordinator: type) type {
                 request.ignore_entry = shared.types.IgnoreEntry.parse(printed) catch |failure| return .{ .err = .{ .code = 400, .message = try a.dupe(u8, if (failure == error.InvalidPrefix) "invalid prefix" else "invalid address") } };
             }
             const wait_ms: u64 = if (kind == .migration_activate or kind == .migration_rollback or kind == .firewall_withdraw) 10_000 else if (request.unban) ignore_unban_wait_ms else 3000;
+            const response_entry = request.ignore_entry;
             const staged = self.stageAdmin(request, wait_ms);
             destroy_on_exit = staged.owned;
             const view = staged.view;
@@ -648,7 +778,7 @@ pub fn Methods(comptime Coordinator: type) type {
                 try std.json.encodeJsonString(view.reason.slice(), .{}, w);
                 wrote_reason = true;
             }
-            if (ignore_state) |value| if (request.unban) for (value.bans[0..value.ban_count]) |ban| if (ban.lift == .refused) {
+            if (ignore_state) |value| if (body.unban orelse false) for (value.bans[0..value.ban_count]) |ban| if (ban.lift == .refused) {
                 var scope_buffer: [64]u8 = undefined;
                 var line_buffer: [240]u8 = undefined;
                 const line = std.fmt.bufPrint(&line_buffer, "{s}: {s}", .{ try formatListSubject(ban.canonical.subject, &scope_buffer), ban.reason orelse "not lifted" }) catch line_buffer[0..0];
@@ -665,7 +795,7 @@ pub fn Methods(comptime Coordinator: type) type {
                 if (request.repair_shape) |shape| try w.print(",\"shape\":\"{s}\"", .{@tagName(shape)});
                 if (view.outcome == .applied) if (request.resumed_offset) |offset| try w.print(",\"resumed_offset\":{d}", .{offset});
             }
-            if (kind == .ignore_add or kind == .ignore_remove) try writeIgnoreFields(w, request, ignore_state);
+            if (kind == .ignore_add or kind == .ignore_remove) try writeIgnoreFields(w, kind, body, response_entry.?, ignore_state);
             if (kind == .migration_activate or kind == .migration_rollback) try w.print(",\"observed_protection\":{{\"destination\":\"{s}\",\"source\":\"unknown\"}}", .{view.destination orelse "unknown"});
             try w.writeAll("}");
             return switch (view.outcome) {
@@ -685,13 +815,13 @@ pub fn Methods(comptime Coordinator: type) type {
             }
             try w.writeAll("]");
         }
-        pub fn writeIgnoreFields(w: anytype, request: *const AdminRequest, ignore_state: ?*const IgnoreWork) !void {
-            const add = request.kind == .ignore_add;
+        pub fn writeIgnoreFields(w: anytype, kind: durable.Store.AdminKind, body: AdminBody, entry: shared.types.IgnoreEntry, ignore_state: ?*const IgnoreWork) !void {
+            const add = kind == .ignore_add;
             var buffer: [64]u8 = undefined;
             try w.writeAll(",\"jail\":");
-            try std.json.encodeJsonString(request.jailName(), .{}, w);
+            try std.json.encodeJsonString(body.jail orelse "", .{}, w);
             try w.writeAll(",\"address\":");
-            try std.json.encodeJsonString(request.ignore_entry.?.canonical(&buffer), .{}, w);
+            try std.json.encodeJsonString(entry.canonical(&buffer), .{}, w);
             const state: IgnoreEntryState = if (ignore_state) |value| value.entry_state else .not_recorded;
             const reported = if (!add and state == .not_recorded) IgnoreEntryState.not_removed else state;
             try w.print(",\"entry\":\"{s}\",\"source\":", .{@tagName(reported)});
@@ -699,9 +829,9 @@ pub fn Methods(comptime Coordinator: type) type {
             try w.writeAll(if (add) ",\"covered_by\":" else ",\"still_ignored_by\":");
             try writeIgnoreEntries(w, if (ignore_state) |value| value.configured[0..value.configured_count] else &.{});
             if (!add) return;
-            if (request.duration_s != null) if (ignore_state) |value| if (value.expires_us) |deadline| try w.print(",\"expires_us\":{d}", .{deadline});
+            if (body.duration_s != null) if (ignore_state) |value| if (value.expires_us) |deadline| try w.print(",\"expires_us\":{d}", .{deadline});
             if (ignore_state) |value| try w.print(",\"jail_enabled\":{},\"jail_paused\":{}", .{ value.jail_enabled, value.jail_paused });
-            try w.print(",\"unban_requested\":{},\"bans_total\":{d},\"bans\":[", .{ request.unban, if (ignore_state) |value| value.bans_total else 0 });
+            try w.print(",\"unban_requested\":{},\"bans_total\":{d},\"bans\":[", .{ body.unban orelse false, if (ignore_state) |value| value.bans_total else 0 });
             if (ignore_state) |value| for (value.bans[0..@min(value.ban_count, max_listed_bans)], 0..) |ban, i| {
                 var scope_buffer: [64]u8 = undefined;
                 if (i > 0) try w.writeByte(',');
@@ -762,22 +892,27 @@ pub fn Methods(comptime Coordinator: type) type {
             const enforces = self.jailEnforces(jail);
             if (enforces) {
                 self.publishOwners() catch |failure| if (failure != error.StaleEffect) return failure;
-            } else try self.publishJail(jail);
+                if (self.owner_publication_pending) return error.EffectReconciliationRequired;
+            } else {
+                try self.publishJail(jail);
+                if (jail.retry_revision == null) return error.RetryEligibilityPending;
+            }
             const now = self.clock.wallUs();
-            const found = try self.allocator.alloc(RelatedBan, if (enforces) self.owner_count else jail.summary.active);
+            const range = jail.owner_range;
+            const found = try self.allocator.alloc(RelatedBan, if (enforces) range.len else jail.active.len);
             defer self.allocator.free(found);
             var count: usize = 0;
             var inside: usize = 0;
             if (enforces) {
-                for (self.owner_active[0..self.owner_count], 0..) |owner, i| {
-                    if (!std.mem.eql(u8, owner.jail.slice(), jail.name) or !owner.lease.live(now)) continue;
+                for (self.owner_active[range.start..][0..range.len], range.start..) |owner, i| {
+                    if (!owner.lease.live(now)) continue;
                     const ban = subjectEntry(owner.scope.canonical.subject);
                     const relation = banRelation(entry, ban) orelse continue;
                     found[count] = .{ .order = ban, .index = @intCast(i), .relation = relation };
                     count += 1;
                     inside += @intFromBool(relation == .inside_entry);
                 }
-            } else for (jail.active[0..jail.summary.active], 0..) |decision, i| {
+            } else for (jail.active[0..jail.active.len], 0..) |decision, i| {
                 if (!decision.lease.live(now)) continue;
                 const ban = subjectEntry(decisionScope(decision.subject).subject);
                 const relation = banRelation(entry, ban) orelse continue;
@@ -795,7 +930,7 @@ pub fn Methods(comptime Coordinator: type) type {
                     slot.* = .{ .canonical = owner.scope.canonical, .key = owner.key, .deadline_us = leaseDeadline(owner.lease), .confirmed = self.owner_confirmed[item.index] and self.confirmationKnown(monotonic(self)), .relation = item.relation };
                 } else {
                     const decision = jail.active[item.index];
-                    slot.* = .{ .canonical = decisionScope(decision.subject), .key = [_]u8{0} ** 32, .deadline_us = leaseDeadline(decision.lease), .confirmed = jail.confirmed[item.index] and self.confirmationKnown(monotonic(self)), .relation = item.relation };
+                    slot.* = .{ .canonical = decisionScope(decision.subject), .key = [_]u8{0} ** 32, .deadline_us = leaseDeadline(decision.lease), .confirmed = false, .relation = item.relation };
                 }
             }
         }
