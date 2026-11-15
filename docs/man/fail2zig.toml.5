@@ -93,7 +93,8 @@ Mode 0660; group
 if that group exists.
 .TP
 .B websocket_max_clients
-Integer (1–1024). Maximum simultaneous WebSocket clients. Default: 16.
+Integer (1–1024). Accepted and range-checked, with no effect: this release
+serves no WebSocket stream. Default: 16.
 .TP
 .B state_file
 String (absolute path). Durable SQLite database containing source positions,
@@ -128,7 +129,8 @@ already exist, belong to the service UID and not be group/world writable;
 database files must be private and owned by that UID. Shell writability does
 not establish access inside the service. Stop all writers and preserve the
 SQLite database and existing WAL/SHM siblings together before relocation.
-Automatic installer upgrades refuse custom paths. See the complete procedure:
+The installer applies its checks to the configured path and prints the unit
+override it needs. See the complete procedure:
 .UR https://github.com/ul0gic/fail2zig/blob/main/docs/operations/installation.md#custom-state-directory-under-systemd
 Custom state directory under systemd
 .UE .
@@ -148,10 +150,10 @@ after existing history-consumer dependencies permit it. Decisions and confirmed
 event identities remain available. Raising the limit cannot recover deleted lines.
 .TP
 .B memory_ceiling_mb
-Integer. Total configured memory ceiling used to admit bounded native source,
-detection, retry and administration plans. Startup refuses configurations whose
-required bounded plan does not fit. Durable receipts, enforcement intent and
-active ownership are not evicted to meet the ceiling. Minimum: 16. Default: 64.
+Integer. Accepted and range-checked; no admission or runtime check reads it. The
+ceiling that startup enforces is
+.BR native_memory_ceiling_mb .
+Minimum: 16. Default: 64.
 .TP
 .B native_memory_ceiling_mb
 Integer. Memory ceiling, in MiB, that startup admits the native plan against: sources,
@@ -174,7 +176,7 @@ Minimum: 1. Default: 8192, enough for 64 file jails.
 .B metrics_enabled
 Boolean. When
 .IR false ,
-no HTTP or WebSocket listener is bound; the daemon logs
+no HTTP listener is bound; the daemon logs
 .I "http: disabled by config"
 and the startup banner shows
 .IR http=off .
@@ -194,10 +196,14 @@ Integer (1\(en65535). Port for the HTTP server. Default:
 .IR 9100 .
 The server exposes
 .IR /metrics ,
-.IR /api/status ,
+.I /api/status
 and
-.IR /events
-(WebSocket). 0 is rejected; it does not disable the endpoint. Use
+.IR /api/health .
+.I /api/bans
+returns 403 and
+.I /events
+returns 400, because this release serves no WebSocket stream.
+0 is rejected; it does not disable the endpoint. Use
 .BR "metrics_enabled = false" .
 .TP
 .B firewall

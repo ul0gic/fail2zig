@@ -21,6 +21,12 @@ the unit and man pages, and refuses active state writers or a legacy binary stat
 file. It does not recursively change state ownership. To use a locally built
 binary, run `sudo scripts/install.sh --local-bin zig-out/bin` from the checkout.
 
+On an existing installation the installer also sets `config.toml` to owner
+`root`, the service group and mode 0640, removes a retired
+`fail2zig-client` executable from the install prefix, and refuses to continue
+when a `fail2zig` account already exists with a login shell or a home directory
+other than `/nonexistent`.
+
 The v0.4.9 release provides one combined daemon/admin executable per target:
 
 | Target | Qualification |
@@ -290,9 +296,11 @@ was read to its end before it was removed does not pause anything.
 
 The jail's `on_truncation` key chooses what happens next (see `fail2zig.toml(5)`):
 
-- `"refuse"`, the default, keeps the source paused. Stop the daemon, run the printed
-  `repair-source` command (see `fail2zig(1)`) and start the daemon. The stop
-  withdraws firewall rules until the next start reinstalls them.
+- `"refuse"`, the default, keeps the source paused. Run the printed
+  `repair-source` command (see `fail2zig(1)`). It works while the daemon is
+  running and withdraws no jail's rules; the offline form is for a daemon that
+  cannot start. `status` still introduces the command with `stop fail2zig, then
+  run:`; stopping is optional.
 - `"restart"` resumes the source without pausing and records a durable
   continuity-loss event, shown by `fail2zig status`. A replaced log resumes at offset
   0 of the new file. While the log is absent the source reports `missing` and waits,
@@ -304,7 +312,8 @@ recovered.
 
 If storage is unhealthy when the daemon stops, it leaves installed firewall rules
 in place and logs how many remain; the next start reconciles them. A healthy stop
-withdraws its rules while keeping owners and deadlines.
+also leaves installed rules in the kernel with their timeouts; run
+`fail2zig firewall withdraw` first when the table must be empty.
 
 The installer changes ownership only for the configured native SQLite state path
 and refuses active writers, unsafe state directories and legacy binary state. Follow the

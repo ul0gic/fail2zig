@@ -16,14 +16,16 @@ For an existing **native SQLite** installation using `/var/lib/fail2zig/state.bi
    a coherent offline backup of the database and any WAL/SHM siblings. Keep all writers stopped
    throughout installation; a process check alone cannot prevent a later writer from starting.
 2. Run the installer. It creates the non-login `fail2zig` account, preserves operator config,
-   checks the default parent/files and refuses an active writer. Only `/var/lib/fail2zig`,
-   `state.bin`, `state.bin-wal` and `state.bin-shm` receive automatic state ownership changes.
+   checks the configured `state_file` and its parent and refuses an active writer. Only that
+   parent directory, the state file and its `-wal` and `-shm` siblings receive automatic state
+   ownership changes.
    It neither converts database contents nor resets original finite expiry/history.
 3. Review and validate configuration, then explicitly start fail2zig. Check `status`, `list`
    and `history` for the expected protection and continuity. The installer never starts or
    restarts services. Keep rollback backups until the new installation has been checked.
 
-Custom `state_file` paths are refused by the automatic installer. Follow the
+The installer accepts a custom `state_file` and applies its checks to that path, but it does
+not edit the unit. Follow the
 [custom state directory procedure](installation.md#custom-state-directory-under-systemd)
 for the stopped SQLite backup/copy, exact ownership and narrow systemd drop-in.
 The native database and its dedicated real parent must belong to the service UID;
@@ -83,9 +85,9 @@ For every selected file-backed group and each of its log paths:
 |---|---|---|
 | `logs` row present, first-line digest matches, `lastfilepos` ≤ size | `resume_at_offset` | `resume_at_offset` |
 | file grew past `lastfilepos` | `resume_at_offset` (unread tail is read on start) | same |
-| no `logs` row, digest unrecorded or unrecognised, first line without terminator | `blocked` | `replay_window` (or `start_at_tail` without a window) |
-| digest mismatch (rotation or replacement), offset beyond size (truncation) | `blocked` | `replay_window` / `start_at_tail` |
-| file missing or unreadable | `blocked` | `replay_window` / `start_at_tail` |
+| no `logs` row, digest unrecorded or unrecognised, first line without terminator | `blocked` | `replay_window`; without a window the plan records a `replay-window-missing` blocker |
+| digest mismatch (rotation or replacement), offset beyond size (truncation) | `blocked` | `replay_window` |
+| file missing or unreadable | `blocked` | `replay_window` |
 
 The first-line digest is computed exactly as fail2ban 1.1.1 does: over the
 first line including its terminator, only when a terminator is present. The
@@ -105,7 +107,7 @@ fail2ban stores no journal cursor. fail2zig never derives one from a timestamp.
   (`journal-cursor-unavailable`).
 - `reset_replay` with a window: the daemon tails the journal at cutover and
   replays the last `replay_window_s` seconds through `journalctl --since`.
-- `reset_replay` without a window: tail only (`start_at_tail`).
+- `reset_replay` without a window: the planner records a `replay-window-missing` blocker.
 
 ## Replay window and duplicates
 

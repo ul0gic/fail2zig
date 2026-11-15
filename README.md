@@ -156,8 +156,12 @@ compatibility report:
 
 ```bash
 sudo fail2zig --import-config /etc/fail2ban \
-  --import-output /etc/fail2zig/config.toml
+  --import-output /tmp/fail2zig-review.toml
+sudo fail2zig --validate-config --config /tmp/fail2zig-review.toml
 ```
+
+Write the projection to a review path: `--import-output` replaces an existing
+file without a backup.
 
 The [migration guide](https://fail2zig.com/docs/guides/migration-from-fail2ban/)
 covers the inspect, snapshot, plan, validate, cutover and rollback workflow.
@@ -198,9 +202,11 @@ boundaries.
 
 ## Documentation and contributing
 
-- [Installation and upgrades](docs/operations/installation.md)
-- [Configuration reference](docs/man/fail2zig.toml.5) and [CLI manual](docs/man/fail2zig.1)
+- [Documentation index](docs/README.md): guides, reference and architecture
+- [Installation and upgrades](docs/operations/installation.md) and the [upgrade guide](docs/guides/upgrading.md)
+- [Configuration reference](docs/reference/config.md) and [command reference](docs/reference/cli-fail2zig-client.md); the manuals are [fail2zig.toml(5)](docs/man/fail2zig.toml.5) and [fail2zig(1)](docs/man/fail2zig.1)
 - [Runtime architecture](docs/architecture.md), [threat model](docs/security/threat-model.md) and [operations guides](docs/operations/)
+- [Changelog](CHANGELOG.md) and [release notes](RELEASE_NOTES.md)
 - [Online documentation](https://fail2zig.com/docs/) and [test layout](tests/README.md)
 - [Contributing](CONTRIBUTING.md), [issues](https://github.com/ul0gic/fail2zig/issues) and [discussions](https://github.com/ul0gic/fail2zig/discussions)
 

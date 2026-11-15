@@ -56,8 +56,9 @@ commit together, and encoding warnings are rate-limited without printing raw pay
 This behavior is not present in releases through v0.4.2.
 
 The repair reads legacy processor checkpoints; older binaries cannot restore its
-extended checkpoints. Later state uses SQLite schema 26, upgraded in one transaction from a
-state last written by v0.4.7 (schema 25) after a coherent `.pre26-backup`; v0.4.7 is the
+extended checkpoints. Current state uses SQLite schema 28: a state last written by v0.4.8
+(schema 26) upgrades in one transaction after a coherent `.pre27-backup`, and one last
+written by v0.4.7 (schema 25) first takes the schema 26 step after `.pre26-backup`; v0.4.7 is the
 minimum supported upgrade source, and states last written by earlier releases upgrade
 through v0.4.7 first. Reverting the binary alone is not a
 supported rollback; restore the matching backup with the previous binary.
