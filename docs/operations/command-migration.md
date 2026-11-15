@@ -31,7 +31,7 @@ The shipped service runs as the non-login `fail2zig` account. Its group can be s
 `FAIL2ZIG_GROUP` during installation. `CAP_NET_ADMIN` supplies firewall access and
 `CAP_DAC_READ_SEARCH` supplies protected log/journal reads. `CAP_NET_RAW` supports the
 ipset backend’s iptables extension and grants raw IP socket authority. HTTP remains in the same process;
-`metrics_enabled = false` disables HTTP/WebSocket while socket monitoring stays available.
+`metrics_enabled = false` removes the HTTP listener while socket monitoring stays available.
 
 ## Exit classes
 
@@ -80,7 +80,7 @@ is required and must not substitute fabricated zero values.
 | `status <jail>` | `fail2zig jails [--details]` (all jails) or `fail2zig list --jail <jail> [--details]` (bans) | 0 / 3 | `jails`: array of `name`, `enabled`, `paused`, `healthy`, `active_bans`, `maxretry`, `findtime`, `bantime`, `action`, `enforce_configured`, `enforcing`, `source`, `revision` |
 | `get <jail> banip` / `banned` | `fail2zig list [--jail <jail>] [--details] [--sort]` | 0 / 3 | array of active bans; `--sort` orders rows numerically by IP, IPv4 before IPv6, then prefix, host/network form and jail name; without it order is unchanged |
 | (no equivalent) | `fail2zig stats [--details] [--output table\|plain\|json]` | 0 / 3 | query-v1 `kind: "stats"`; one retained worker snapshot with explicit nullable fields, separate snapshot/readback ages and daemon-start counters |
-| `set <jail> banip <ip>` | `fail2zig ban <ip> --jail <jail> [--duration <s>] [--scope host\|net <cidr>]` | 0 / 1 / 4 / 5 | `schema_version` 1, `kind` `ban`, `outcome` `applied\|rejected\|…`, `generation`, `mutation_revision`, `enforced`, `reasons[]` |
+| `set <jail> banip <ip>` | `fail2zig ban <ip> --jail <jail> [--duration <seconds or duration>] [--scope host\|net <cidr>]` | 0 / 1 / 4 / 5 | `schema_version` 1, `kind` `ban`, `outcome` `applied\|rejected\|…`, `generation`, `mutation_revision`, `enforced`, `reasons[]` |
 | `set <jail> unbanip <ip>` | `fail2zig unban <ip> --jail <jail> [--scope host\|net <cidr>]` | 0 / 1 / 4 / 5 | `kind` `unban`, otherwise as `ban` |
 | `unban --all` | not supported; loop `fail2zig list --output json` and `unban` per address and jail | | |
 | `set <jail> banip <ip>` without a jail | not supported; exactly one `--jail` is required | 2 | |
@@ -106,7 +106,7 @@ is required and must not substitute fabricated zero values.
 | `set <jail> delignoreip <ip>` | `fail2zig ignore remove <ip> --jail <jail>`; refuses an entry set in the configuration, which is edited in `ignoreip` and applied with `fail2zig reload` | 0 / 1 / 2 / 3 / 5 | `kind` `ignore_remove`, `outcome`, `entry` `removed\|config_only\|absent\|not_removed`, `source`, `still_ignored_by[]`, `reasons[]` |
 | `get <jail> ignoreip` | `fail2zig ignore list [--jail <jail>]`; fail2zig shows the SOURCE (`config`, `runtime` or `config+runtime`) of each entry | 0 / 1 / 2 / 3 | `schema_version` 1, `generation`, `redacted`, `limit`, `jails[]` of `jail`, `enabled`, `count`, `ignore_file`, `entries[]` of `address` and `source`, `unconfigured[]`; addresses are redacted for non-administrators |
 | `set <jail> addignoreip` / `delignoreip` on a custom-rule jail (`rule_files`) | not supported by `ignore add` or `ignore remove`, which refuse it naming `ignore_file`; edit the jail's `ignore_file` and run `fail2zig reload` | 1 | |
-| `set dbpurgeage`, `set dbmaxmatches` | not supported; retention is fixed by the state schema | | |
+| `set dbpurgeage`, `set dbmaxmatches` | no runtime command; set `history_retention` (restart) and `history_max_matches` (applies on `reload`) in the configuration | | |
 
 ### Jail disable completion
 
@@ -128,18 +128,27 @@ atomically. Unban remains available. Removal transfers remaining work to retirem
 ### Live reload versus restart
 
 `fail2zig reload` (or `SIGHUP`) builds the whole proposed generation before publishing it.
-Live keys: per-jail `maxretry`, `bantime`, `bantime_kind`, `bantime_increment`, literal
-`ignoreip` entries (per jail and in `[defaults]`), the global `log_level`, and the contents of
-a custom jail's `ignore_file`. An `ignoreip` edit applies from the next event and never alters
-an existing ban. Everything else is restart-only and reported as `outcome: "restart_required"`
-with the offending keys in `reasons`: `findtime`, `on_truncation` (reason `jails.<name>.on_truncation`),
-source and plan keys (`logpath`, `source`, `filter`, `timestamp`, timezone keys,
-`journal_executables`, `rule_files`), and policy edits on a disabled jail. An invalid proposal
+Live keys: per-jail `maxretry`, `bantime`, the `bantime_increment_*` keys including
+`bantime_increment_decay`, `ignoreip`, `ignoreself`, `ignoretime`, `banip` and
+`history_max_matches`; the global `log_level` and `history_max_matches`; adding or removing a
+jail; and the contents of a custom jail's `ignore_file`. An `ignoreip` edit applies from the
+next event and never alters an existing ban. Everything else is restart-only and reported as
+`outcome: "restart_required"` with the offending keys in `reasons`: every other `[global]`
+key, jail `enabled`, `enforce`/`banaction`, `findtime`, `on_truncation` (reason
+`jails.<name>.on_truncation`), source and plan keys (`logpath`, `source`, `filter`,
+`timestamp`, timezone keys, `journal_executables`, `rule_files`), and policy edits on a
+disabled or `internal`-source jail. An invalid proposal
 is `rejected` and the running generation is untouched.
 
 Native `bantime`, `findtime`, `bantime_increment_max_bantime` and `bantime_increment_jitter`
 accept integer seconds or quoted durations such as `"1h30m"`. This does not change the reload
-boundary above or the numeric CLI `--duration`, `--timeout` and migration window arguments.
+boundary above. On the command line `ban --duration` and `ignore add --for` accept seconds or
+a duration such as `2m` or `1h30m`; `--timeout` and migration window arguments are integers.
+
+fail2zig commands with no fail2ban equivalent: `fail2zig firewall withdraw` removes every
+installed rule and holds enforcement off until the next start, `ban --force` overrides the
+guard against banning this host or your own SSH session, and `ignore add --for <duration>`
+records an exclusion that expires by itself.
 
 ### Monitoring endpoints
 
@@ -210,7 +219,8 @@ The cutover is journaled and resumable:
 systemctl stop fail2ban
 fail2zig migrate cutover --plan plan.json --state-file /var/lib/fail2zig/state.bin \
                          --staging-dir <dir> --backend nftables|ipset|iptables [--socket <path>]
-fail2zig migrate status  --plan plan.json --state-file <db> --staging-dir <dir> --run-id <hex>
+fail2zig migrate status  --plan plan.json --state-file <db> --staging-dir <dir> \
+                         --backend nftables|ipset|iptables --run-id <hex>
 ```
 
 Staging happens offline with the daemon stopped; activation and kernel verification run
