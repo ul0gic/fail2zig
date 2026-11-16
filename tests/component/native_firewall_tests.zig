@@ -216,6 +216,12 @@ test "kernel: native firewall: isolated admission creates both families and pres
     defer foreign_before.deinit(std.testing.allocator);
     var created = try reader.admitInstallation(intentFor(&reader));
     defer created.deinit();
+    if (created == .uncertain) {
+        const detail = created.uncertain;
+        std.debug.print("native firewall admission: backend={s} stage={s} cause={s} mutation={s}\n", .{
+            @tagName(detail.backend), @tagName(detail.stage), @errorName(detail.cause), @tagName(detail.mutation),
+        });
+    }
     try std.testing.expect(created == .installed);
     try std.testing.expect(created.installed.created);
     try std.testing.expectEqual(.owned, created.installed.snapshot.state);

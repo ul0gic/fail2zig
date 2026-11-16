@@ -9,24 +9,29 @@ set -euo pipefail
 for tool in nft iptables ip6tables iptables-save ip6tables-save ipset unshare timeout; do command -v "$tool" >/dev/null; done
 parent=$(readlink /proc/self/ns/net)
 mkdir -p kernel-results
+{ uname -a; dpkg-query -W nftables iptables ipset; } > kernel-results/environment.log
 run_suite() {
     local name=$1 binary=$2 backend=$3 skips=$4 log
     log="kernel-results/$name.log"
-    timeout --signal=TERM --kill-after=10s 240s sudo -n env -i \
+    if ! timeout --signal=TERM --kill-after=10s 240s sudo -n env -i \
         PATH=/usr/sbin:/usr/bin:/sbin:/bin \
         F2Z_NATIVE_PARENT_NETNS="$parent" F2Z_NATIVE_DAEMON_ENFORCEMENT=1 \
         F2Z_NATIVE_FIREWALL_TRANSPORT="$backend" \
-        unshare --net -- "$PWD/zig-out/bin/$binary" 2>&1 | tee "$log"
+        unshare --net -- "$PWD/zig-out/bin/$binary" 2>&1 | tee "$log"; then
+        return 1
+    fi
     if [[ $skips == 0 ]]; then
-        ! grep -q 'SKIP' "$log"
-        grep -Eq 'All [1-9][0-9]* tests passed\.' "$log"
+        if grep -q 'SKIP' "$log"; then return 1; fi
+        grep -Eq 'All [1-9][0-9]* tests passed\.' "$log" || return 1
     else
-        test "$(grep -c 'SKIP' "$log")" = "$skips"
-        grep -Eq "[1-9][0-9]* passed; $skips skipped; 0 failed\\." "$log"
+        test "$(grep -c 'SKIP' "$log")" = "$skips" || return 1
+        grep -Eq "[1-9][0-9]* passed; $skips skipped; 0 failed\\." "$log" || return 1
     fi
 }
-run_suite admin admin-tests nftables 0
-run_suite daemon native-daemon-tests nftables 0
-run_suite firewall-nftables native-firewall-tests nftables 2
-run_suite firewall-iptables native-firewall-tests iptables 2
-run_suite firewall-ipset native-firewall-tests ipset 1
+status=0
+run_suite admin admin-tests nftables 0 || status=1
+run_suite daemon native-daemon-tests nftables 0 || status=1
+run_suite firewall-nftables native-firewall-tests nftables 2 || status=1
+run_suite firewall-iptables native-firewall-tests iptables 2 || status=1
+run_suite firewall-ipset native-firewall-tests ipset 1 || status=1
+exit "$status"
