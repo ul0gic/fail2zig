@@ -6,6 +6,8 @@ const effects = @import("../core/native_effect.zig");
 const consumers = @import("../core/native_consumer.zig");
 const detection = @import("../core/native_detection_record.zig");
 const Error = @import("store.zig").Error;
+const unreferenced_config_generations_kept = 8;
+const config_generation_prune_page = 32;
 
 pub fn Methods(comptime Store: type) type {
     return struct {
@@ -201,6 +203,7 @@ pub fn Methods(comptime Store: type) type {
                 try insert.blob(4, jail.allowlist_snapshot);
                 try insert.done();
             }
+            try self.exec(std.fmt.comptimePrint("DELETE FROM config_generations WHERE generation IN (SELECT generation FROM config_generations g WHERE g.published=0 AND NOT EXISTS(SELECT 1 FROM jail_admin_states s WHERE s.generation=g.generation) ORDER BY g.committed_us DESC,g.generation DESC LIMIT {d} OFFSET {d});", .{ config_generation_prune_page, unreferenced_config_generations_kept }));
         }
 
         pub fn publishConfigGeneration(self: *Store, generation: [32]u8) Error!void {

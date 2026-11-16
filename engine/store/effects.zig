@@ -16,6 +16,7 @@ pub const origin_schema: i64 = 26;
 
 pub fn Methods(comptime Store: type) type {
     return struct {
+        pub usingnamespace @import("memory_caps.zig").Methods(Store);
         pub fn enableEffects(self: *Store) Error!void {
             try self.beginWrite();
             errdefer self.rollback();
@@ -705,7 +706,10 @@ pub fn Methods(comptime Store: type) type {
             if (owner.lease == .absent) return error.StaleEffect;
             switch (change.mode) {
                 .retain => if (reserve) try self.reserveEffectRows(.{ .revisions = 1, .intents = 1, .observations = observations_per_intent }),
-                .release => try self.retireOwnerDecisionTx(key, change.jail, null, now),
+                .release => {
+                    try self.retireOwnerDecisionTx(key, change.jail, null, now);
+                    try self.closeRetryDecisionsTx(change.jail, change.scope, now);
+                },
             }
             if (try self.tableRows(.effect_owner_revisions) >= effects.max_owner_revisions) return error.EffectCapacity;
             const effect_revision = std.math.add(u64, prior.revision, 1) catch return error.EffectCapacity;
@@ -944,13 +948,14 @@ pub fn Methods(comptime Store: type) type {
                         detail_inserted = self.api.changes(self.db) == 1;
                         self.insertedRows(.confirmed_event_details, self.api.changes(self.db));
                         if (self.schema_version >= 18 and detail_inserted) {
-                            var summary = try self.statement("INSERT INTO confirmed_policy_summaries(jail,family,subject,confirmed_count,latest_confirmed_us) SELECT jail,family,subject,1,?3 FROM retry_decision_details WHERE jail=?1 AND effect_decision_id=?2 ON CONFLICT(jail,family,subject) DO UPDATE SET confirmed_count=confirmed_count+1,latest_confirmed_us=max(latest_confirmed_us,excluded.latest_confirmed_us);");
+                            var summary = try self.statement("INSERT OR REPLACE INTO confirmed_policy_summaries(jail,family,subject,confirmed_count,latest_confirmed_us) SELECT d.jail,d.family,d.subject,coalesce(s.confirmed_count,0)+1,max(coalesce(s.latest_confirmed_us,?3),?3) FROM retry_decision_details d LEFT JOIN confirmed_policy_summaries s ON s.jail=d.jail AND s.family=d.family AND s.subject=d.subject WHERE d.jail=?1 AND d.effect_decision_id=?2;");
                             defer summary.deinit();
                             try summary.text(1, owner.jail.slice());
                             try summary.blob(2, &owner.decision_id);
                             try summary.int(3, observation.observed_us);
                             try summary.done();
                             if (self.api.changes(self.db) != 1) return error.InvalidRetryState;
+                            _ = try self.evictMemoryRows(.summaries, observation.observed_us);
                         }
                     }
                     if (self.schema_version >= 13) {
@@ -1123,13 +1128,14 @@ pub fn Methods(comptime Store: type) type {
                         try self.retainDetailDeferredTx(family, subject[0..stored.len], bytes, sequence);
                     }
                 }
-                var summary = try self.statement("INSERT INTO confirmed_policy_summaries(jail,family,subject,confirmed_count,latest_confirmed_us) SELECT jail,family,subject,1,?3 FROM retry_decision_details WHERE jail=?1 AND effect_decision_id=?2 ON CONFLICT(jail,family,subject) DO UPDATE SET confirmed_count=confirmed_count+1,latest_confirmed_us=max(latest_confirmed_us,excluded.latest_confirmed_us);");
+                var summary = try self.statement("INSERT OR REPLACE INTO confirmed_policy_summaries(jail,family,subject,confirmed_count,latest_confirmed_us) SELECT d.jail,d.family,d.subject,coalesce(s.confirmed_count,0)+1,max(coalesce(s.latest_confirmed_us,?3),?3) FROM retry_decision_details d LEFT JOIN confirmed_policy_summaries s ON s.jail=d.jail AND s.family=d.family AND s.subject=d.subject WHERE d.jail=?1 AND d.effect_decision_id=?2;");
                 defer summary.deinit();
                 try summary.text(1, jail);
                 try summary.blob(2, &owner.decision_id);
                 try summary.int(3, observed_us);
                 try summary.done();
                 if (self.api.changes(self.db) > 1) return error.InvalidRetryState;
+                if (self.api.changes(self.db) == 1) _ = try self.evictMemoryRows(.summaries, observed_us);
             }
             var marker = try self.statement("INSERT INTO confirmation_markers VALUES(?1,?2,?3,?4);");
             defer marker.deinit();

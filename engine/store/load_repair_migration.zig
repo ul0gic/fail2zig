@@ -20,6 +20,7 @@ pub const BackupKind = enum {
     pre26,
     pre27,
     pre28,
+    pre29,
 
     fn suffix(self: BackupKind) []const u8 {
         return switch (self) {
@@ -28,6 +29,7 @@ pub const BackupKind = enum {
             .pre26 => ".pre26-backup",
             .pre27 => ".pre27-backup",
             .pre28 => ".pre28-backup",
+            .pre29 => ".pre29-backup",
         };
     }
 
@@ -38,11 +40,13 @@ pub const BackupKind = enum {
             .pre26 => 26,
             .pre27 => 27,
             .pre28 => 28,
+            .pre29 => 29,
         };
     }
 };
 
 pub const SchemaBackup = struct { path: [:0]const u8, sha256: [32]u8, pages: i64 };
+pub const PreparedBackup = struct { path: [:0]const u8, partial_path: [:0]const u8, sha256: [32]u8, pages: i64 };
 
 pub const Phase = enum(u8) {
     live_counter = 1,
@@ -447,14 +451,21 @@ pub fn Methods(comptime Store: type) type {
 
         pub fn takeSchemaBackup(self: *Store, options: Options, kind: BackupKind, path_buffer: []u8) Error!SchemaBackup {
             var partial_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const prepared = try self.prepareSchemaBackup(options, kind, path_buffer, &partial_buffer);
+            errdefer std.fs.cwd().deleteFileZ(prepared.partial_path) catch {};
+            try publishSchemaBackup(prepared);
+            return .{ .path = prepared.path, .sha256 = prepared.sha256, .pages = prepared.pages };
+        }
+
+        pub fn prepareSchemaBackup(self: *Store, options: Options, kind: BackupKind, path_buffer: []u8, partial_buffer: []u8) Error!PreparedBackup {
             const final_path = std.fmt.bufPrintZ(path_buffer, "{s}{s}", .{ options.state_path, kind.suffix() }) catch return error.StorageLimit;
-            const partial_path = std.fmt.bufPrintZ(&partial_buffer, "{s}{s}.partial", .{ options.state_path, kind.suffix() }) catch return error.StorageLimit;
+            const partial_path = std.fmt.bufPrintZ(partial_buffer, "{s}{s}.partial", .{ options.state_path, kind.suffix() }) catch return error.StorageLimit;
             // An unrecorded backup may predate writes by another binary; never adopt it.
             if (std.fs.cwd().access(final_path, .{})) |_| {
                 std.log.warn("native storage: schema {d} migration refused: backup {s} already exists; keep it if it is the only copy of earlier state, otherwise move it aside and restart", .{ kind.target(), final_path });
                 return switch (kind) {
                     .pre24 => error.LoadRepairBackupExists,
-                    .pre25, .pre26, .pre27, .pre28 => error.SchemaBackupExists,
+                    .pre25, .pre26, .pre27, .pre28, .pre29 => error.SchemaBackupExists,
                 };
             } else |failure| if (failure != error.FileNotFound) return error.StorageIo;
             const page_size = try self.integer("PRAGMA page_size;");
@@ -462,13 +473,12 @@ pub fn Methods(comptime Store: type) type {
             if (page_size <= 0 or pages <= 0) return error.DatabaseFailure;
             const database_bytes = std.math.mul(u64, @intCast(page_size), @intCast(pages)) catch return error.StorageLimit;
             try requireFreeSpace(options.state_path, database_bytes *| 2 +| disk_reserve_bytes);
-            const copied = try self.copyBackup(final_path, partial_path, pages, kind.target() - 1);
-            return .{ .path = final_path, .sha256 = copied.sha256, .pages = pages };
+            try self.copyBackup(partial_path, pages, kind.target() - 1);
+            errdefer std.fs.cwd().deleteFileZ(partial_path) catch {};
+            return .{ .path = final_path, .partial_path = partial_path, .sha256 = try fileSha256(partial_path), .pages = pages };
         }
 
-        const BackupIdentity = struct { sha256: [32]u8 };
-
-        fn copyBackup(self: *Store, final_path: [:0]const u8, partial_path: [:0]const u8, pages: i64, schema: i64) Error!BackupIdentity {
+        fn copyBackup(self: *Store, partial_path: [:0]const u8, pages: i64, schema: i64) Error!void {
             std.fs.cwd().deleteFileZ(partial_path) catch |failure| if (failure != error.FileNotFound) return error.StorageIo;
             const created = std.posix.openZ(partial_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, 0o600) catch return error.StorageIo;
             std.posix.close(created);
@@ -492,9 +502,6 @@ pub fn Methods(comptime Store: type) type {
             }
             try syncPath(partial_path, false);
             try verifyBackupFile(partial_path, pages, schema);
-            std.posix.renameZ(partial_path, final_path) catch return error.StorageIo;
-            try syncPath(std.fs.path.dirname(final_path) orelse ".", true);
-            return .{ .sha256 = try fileSha256(final_path) };
         }
 
         fn verifyLoadRepairBackup(self: *Store) Error!void {
@@ -746,6 +753,11 @@ pub fn Methods(comptime Store: type) type {
             return .{ .phase = phase, .next = next, .callbacks = if (self.runtime_limits) budget - self.work_remaining else 0 };
         }
     };
+}
+
+pub fn publishSchemaBackup(prepared: PreparedBackup) Error!void {
+    std.posix.renameZ(prepared.partial_path, prepared.path) catch return error.StorageIo;
+    try syncPath(std.fs.path.dirname(prepared.path) orelse ".", true);
 }
 
 fn requireFreeSpace(state_path: []const u8, required: u64) Error!void {

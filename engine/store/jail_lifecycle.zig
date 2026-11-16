@@ -209,7 +209,7 @@ pub fn Methods(comptime Store: type) type {
                         if (phase == .retry_states) try self.removeRetryProjectionRowTx(jail, &child.subject);
                     }
                     if (count != 0 and phase != .policy_summaries) {
-                        if (phase == .retry_states) self.deletedRows(.retry_states) else try self.changeRetiredTotal(jail, decisions, false);
+                        if (phase == .retry_states) self.deletedRows(.retry_states);
                         try self.changeRetryJailSummaryTx(jail, decisions, 0);
                     }
                     if (count < max_rows) page.next.phase = switch (phase) {
@@ -357,7 +357,6 @@ pub fn Methods(comptime Store: type) type {
                 if (try row.row()) return error.StaleEffect;
             }
             var page: JailRetirementPage = .{ .next = .{ .phase = .done }, .done = true };
-            if (try self.retiredTotal(jail) != 0) return error.InvalidRetryState;
             inline for (.{ "DELETE FROM retry_retired_totals WHERE jail=?1;", "DELETE FROM retry_escalation_policies WHERE jail=?1;", "DELETE FROM retry_policies WHERE jail=?1;", "DELETE FROM checkpoints WHERE jail=?1;" }) |sql| {
                 try self.deleteRetirementParent(sql, jail);
                 page.deleted_rows += @intCast(self.api.changes(self.db));

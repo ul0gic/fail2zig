@@ -11,6 +11,7 @@ pub const Frame = struct {
     broken: bool = false,
     cause: ?Error = null,
     open: ?struct { noted_count: u8, noted_ambiguous: bool } = null,
+    previous: ?store.Store.SourceRange = null,
 };
 
 pub fn Methods(comptime Store: type) type {
@@ -31,6 +32,7 @@ pub fn Methods(comptime Store: type) type {
             const detections = try Store.validateRecord(&record);
             const step = try self.commitRecordStep(&record, detections);
             if (step.result == .already_committed) return .already_committed;
+            if (frame.previous == null) frame.previous = try self.previousRange(&record);
             try self.exec("RELEASE batch_record;");
             frame.open = null;
             frame.records += 1;
@@ -58,6 +60,7 @@ pub fn Methods(comptime Store: type) type {
         pub fn commitBatch(self: *Store, frame: *Frame) Error!void {
             errdefer self.rollback();
             if (frame.broken or frame.open != null) return error.DatabaseFailure;
+            if (frame.previous) |range| try self.releasePreviousRecords(range);
             try self.commitEffectTransaction(frame.effect_changed);
         }
     };

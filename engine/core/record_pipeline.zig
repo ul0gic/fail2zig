@@ -187,7 +187,7 @@ pub const Pipeline = struct {
     }
 
     pub fn sourceLocalIntervention(cause: anyerror) bool {
-        return cause == error.PrunedReplay or cause == error.OutsideTimezoneCoverage;
+        return cause == error.OutsideTimezoneCoverage;
     }
 
     pub fn acknowledge(record: records.Record, context: ?*anyopaque) anyerror!void {
@@ -365,7 +365,7 @@ pub const Pipeline = struct {
     }
 
     fn alreadyAdmitted(self: *Pipeline, record: records.Record) !bool {
-        const exists = self.store.hasRecord(self.jail, record.source, record.occurrence, record.raw_hash, record.cursor) catch |failure| {
+        const exists = self.store.hasRecord(self.jail, record.source, record.occurrence, record.raw_hash) catch |failure| {
             self.failed(failure);
             return failure;
         };

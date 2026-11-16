@@ -133,7 +133,7 @@ pub fn Methods(comptime Store: type) type {
             expected_consumer_revision: u64,
             checkpoints: []const CustomCheckpointRebind,
         };
-        pub const CustomIdentityPhase = enum { records, pending_receipts, source_cursors, checkpoint, retry_retired, source_maintenance, replay_guards, owners, policies, orphan_check, done };
+        pub const CustomIdentityPhase = enum { records, pending_receipts, source_cursors, checkpoint, source_maintenance, owners, policies, orphan_check, done };
         pub const CustomIdentityCursor = struct {
             phase: CustomIdentityPhase = .records,
             after_rowid: ?i64 = null,
@@ -308,7 +308,6 @@ pub fn Methods(comptime Store: type) type {
                 "SELECT 1 FROM pending_receipts WHERE jail=?1 LIMIT 1;",
                 "SELECT 1 FROM source_cursors WHERE jail=?1 LIMIT 1;",
                 "SELECT 1 FROM source_maintenance WHERE jail=?1 LIMIT 1;",
-                "SELECT 1 FROM replay_guards WHERE jail=?1 LIMIT 1;",
                 "SELECT 1 FROM consumer_manifests WHERE jail=?1 LIMIT 1;",
                 "SELECT 1 FROM action_intents WHERE jail=?1 LIMIT 1;",
                 "SELECT 1 FROM retry_states WHERE jail=?1 LIMIT 1;",
@@ -487,9 +486,7 @@ pub fn Methods(comptime Store: type) type {
                 .records => if (after != null) "SELECT rowid,jail FROM records WHERE rowid>?1 ORDER BY rowid LIMIT 1;" else "SELECT rowid,jail FROM records ORDER BY rowid LIMIT 1;",
                 .pending_receipts => if (after != null) "SELECT rowid,jail FROM pending_receipts WHERE rowid>?1 ORDER BY rowid LIMIT 1;" else "SELECT rowid,jail FROM pending_receipts ORDER BY rowid LIMIT 1;",
                 .source_cursors => if (after != null) "SELECT rowid,jail FROM source_cursors WHERE rowid>?1 ORDER BY rowid LIMIT 1;" else "SELECT rowid,jail FROM source_cursors ORDER BY rowid LIMIT 1;",
-                .retry_retired => if (after != null) "SELECT rowid,jail FROM retry_retired WHERE rowid>?1 ORDER BY rowid LIMIT 1;" else "SELECT rowid,jail FROM retry_retired ORDER BY rowid LIMIT 1;",
                 .source_maintenance => if (after != null) "SELECT rowid,jail FROM source_maintenance WHERE rowid>?1 ORDER BY rowid LIMIT 1;" else "SELECT rowid,jail FROM source_maintenance ORDER BY rowid LIMIT 1;",
-                .replay_guards => if (after != null) "SELECT rowid,jail FROM replay_guards WHERE rowid>?1 ORDER BY rowid LIMIT 1;" else "SELECT rowid,jail FROM replay_guards ORDER BY rowid LIMIT 1;",
                 .owners => if (after != null) "SELECT rowid,jail FROM effect_owners WHERE rowid>?1 ORDER BY rowid LIMIT 1;" else "SELECT rowid,jail FROM effect_owners ORDER BY rowid LIMIT 1;",
                 .orphan_check => if (after != null) "SELECT rowid,jail FROM consumer_checkpoints WHERE rowid>?1 ORDER BY rowid LIMIT 1;" else "SELECT rowid,jail FROM consumer_checkpoints ORDER BY rowid LIMIT 1;",
                 else => return error.InvalidConsumer,
@@ -596,66 +593,14 @@ pub fn Methods(comptime Store: type) type {
             if (self.api.changes(self.db) != 1) return error.StaleCheckpoint;
             return true;
         }
-        fn customGenerationRowTx(self: *Store, target: *const CustomRebindTarget, rowid: i64, maintenance: bool) Error!bool {
-            var row = try self.statement(if (maintenance)
-                "UPDATE source_maintenance SET generation=?3 WHERE rowid=?1 AND generation=?2;"
-            else
-                "UPDATE retry_retired SET generation=?3 WHERE rowid=?1 AND generation=?2;");
+        fn customGenerationRowTx(self: *Store, target: *const CustomRebindTarget, rowid: i64) Error!bool {
+            var row = try self.statement("UPDATE source_maintenance SET generation=?3 WHERE rowid=?1 AND generation=?2;");
             defer row.deinit();
             try row.int(1, rowid);
             try row.blob(2, &target.old_generation);
             try row.blob(3, &target.new_generation);
             try row.done();
             return self.api.changes(self.db) == 1;
-        }
-        fn customGuardTx(self: *Store, target: *const CustomRebindTarget, rowid: i64) Error!bool {
-            var source: []u8 = undefined;
-            var sequence: i64 = undefined;
-            var occurrence_key: [32]u8 = undefined;
-            var identity_key: [32]u8 = undefined;
-            var receipt_us: ?i64 = undefined;
-            {
-                var row = try self.statement("SELECT generation,source,source_sequence,occurrence_key,identity_key,receipt_us FROM replay_guards WHERE rowid=?1;");
-                defer row.deinit();
-                try row.int(1, rowid);
-                if (!try row.row()) return error.InvalidMaintenanceState;
-                if (!same(try Store.effectBlob(&row, 0, 32), target.old_generation)) return false;
-                if (self.api.column_type(row.ptr, 1) != 3) return error.InvalidMaintenanceState;
-                source = try self.allocator.dupe(u8, try row.boundedBytes(1, store.Limits.source_bytes));
-                errdefer self.allocator.free(source);
-                sequence = try row.signed(2);
-                occurrence_key = try Store.effectBlob(&row, 3, 32);
-                identity_key = try Store.effectBlob(&row, 4, 32);
-                receipt_us = try row.optionalSigned(5);
-                if (source.len == 0 or sequence <= 0) return error.InvalidMaintenanceState;
-            }
-            defer self.allocator.free(source);
-            const maintenance = try self.sourceMaintenance(target.jail.slice(), source, target.new_generation) orelse return error.InvalidMaintenanceState;
-            if (sequence > @as(i64, @intCast(maintenance.sweep_sequence))) {
-                var row = try self.statement("SELECT occurrence,raw_hash,cursor,receipt_us,receipt_generation FROM records INDEXED BY records_source_order WHERE jail=?1 AND source=?2 AND source_generation=?3 AND source_sequence=?4;");
-                defer row.deinit();
-                try row.text(1, target.jail.slice());
-                try row.text(2, source);
-                try row.blob(3, &target.new_generation);
-                try row.int(4, sequence);
-                if (!try row.row() or self.api.column_type(row.ptr, 0) != 3 or self.api.column_type(row.ptr, 2) != 4 or try row.optionalSigned(3) != receipt_us) return error.InvalidMaintenanceState;
-                if (receipt_us != null) {
-                    if (!same(try Store.effectBlob(&row, 4, 32), target.new_generation)) return error.InvalidMaintenanceState;
-                } else if (self.api.column_type(row.ptr, 4) != 5) return error.InvalidMaintenanceState;
-                const identity = store.ReceiptIdentity{ .jail = target.jail.slice(), .source = source, .generation = target.new_generation, .occurrence = try row.boundedBytes(0, 16384), .raw_hash = try Store.effectBlob(&row, 1, 32), .cursor = try row.boundedBytes(2, store.Limits.cursor_bytes) };
-                try Store.validateReceiptIdentity(identity);
-                if (!same(Store.occurrenceGuardKey(identity.occurrence), occurrence_key)) return error.InvalidMaintenanceState;
-                identity_key = Store.identityGuardKey(identity);
-            }
-            var row = try self.statement("UPDATE replay_guards SET generation=?3,identity_key=?4 WHERE rowid=?1 AND generation=?2;");
-            defer row.deinit();
-            try row.int(1, rowid);
-            try row.blob(2, &target.old_generation);
-            try row.blob(3, &target.new_generation);
-            try row.blob(4, &identity_key);
-            try row.done();
-            if (self.api.changes(self.db) != 1) return error.InvalidMaintenanceState;
-            return true;
         }
         fn customPoliciesTx(self: *Store, target: *const CustomRebindTarget) Error!bool {
             var changed = false;
@@ -750,7 +695,7 @@ pub fn Methods(comptime Store: type) type {
             } else if (cursor.phase == .checkpoint or cursor.phase == .policies) {
                 const changed = if (cursor.phase == .checkpoint) try self.customJailCheckpointTx(target) else try self.customPoliciesTx(target);
                 if (changed) next.changed = std.math.add(u64, next.changed, 1) catch return error.ConsumerCapacity;
-                next.phase = if (cursor.phase == .checkpoint) .retry_retired else .orphan_check;
+                next.phase = if (cursor.phase == .checkpoint) .source_maintenance else .orphan_check;
                 next.after_rowid = null;
             } else if (cursor.phase != .done) {
                 var examined: u8 = 0;
@@ -760,9 +705,7 @@ pub fn Methods(comptime Store: type) type {
                             .records => .pending_receipts,
                             .pending_receipts => .source_cursors,
                             .source_cursors => .checkpoint,
-                            .retry_retired => .source_maintenance,
-                            .source_maintenance => .replay_guards,
-                            .replay_guards => .owners,
+                            .source_maintenance => .owners,
                             .orphan_check => .done,
                             else => return error.InvalidConsumer,
                         };
@@ -776,9 +719,7 @@ pub fn Methods(comptime Store: type) type {
                         .records => try self.customRecordTx(target, raw.rowid, false),
                         .pending_receipts => try self.customRecordTx(target, raw.rowid, true),
                         .source_cursors => try self.customSourceCursorTx(target, raw.rowid),
-                        .retry_retired => try self.customGenerationRowTx(target, raw.rowid, false),
-                        .source_maintenance => try self.customGenerationRowTx(target, raw.rowid, true),
-                        .replay_guards => try self.customGuardTx(target, raw.rowid),
+                        .source_maintenance => try self.customGenerationRowTx(target, raw.rowid),
                         .orphan_check => blk: {
                             try self.customOrphanTx(target, raw.rowid);
                             break :blk false;

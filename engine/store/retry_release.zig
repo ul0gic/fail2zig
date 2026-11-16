@@ -1,11 +1,26 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+const canonical_scope = @import("../firewall/scope.zig");
 const detection = @import("../core/native_detection_record.zig");
 const store = @import("store.zig");
 const Error = store.Error;
 
 pub fn Methods(comptime Store: type) type {
     return struct {
+        pub fn closeRetryDecisionsTx(self: *Store, jail: []const u8, scope: canonical_scope.Scope, now_us: i64) Error!void {
+            if (self.schema_version < 16) return;
+            if (scope.subject.kind != .host or !scope.protocols.isAll() or !scope.ports.isAll()) return;
+            const subject: detection.Subject = switch (scope.subject.family) {
+                .v4 => .{ .v4 = scope.subject.address[0..4].* },
+                .v6 => .{ .v6 = scope.subject.address },
+            };
+            var close = try self.statement("UPDATE retry_decisions SET lease_kind=1,deadline_us=max(?4,decided_us+1) WHERE jail=?1 AND family=?2 AND subject=?3 AND (lease_kind=2 OR deadline_us>?4);");
+            defer close.deinit();
+            try close.text(1, jail);
+            try Store.bindSubject(&close, &subject);
+            try close.int(4, now_us);
+            try close.done();
+        }
         pub fn releaseRetryDecision(self: *Store, jail: []const u8, subject: detection.Subject, now_us: i64) Error!bool {
             try self.beginWrite();
             errdefer self.rollback();
