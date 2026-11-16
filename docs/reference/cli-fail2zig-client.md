@@ -239,6 +239,10 @@ days. `ban` and `unban` both take `--scope`: `--scope host` is the default, and
 `--scope net <cidr>` requires nftables or ipset and refuses a prefix length of 0. Unsupported scope is rejected. A manual ban on a
 log-only jail is rejected rather than recorded as installed. Removing one jail's
 owner does not remove protection still owned by another jail.
+Once that owner's release and coherent kernel state are confirmed, `unban`
+returns `applied` (exit 0), including when another jail keeps the scope banned;
+the response names that remaining protection. Releasing the final owner requires
+confirmation that the scope is absent from the kernel.
 
 A manual ban has origin `manual`. `ban` on an address that holds a detection ban
 extends it to the requested duration and marks it `manual`. `ban` or `unban` on

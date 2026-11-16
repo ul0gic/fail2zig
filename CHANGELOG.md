@@ -13,7 +13,7 @@ rolling back to them is unsupported. To move between releases, follow the
 Each group heading ends with its type in braces: `{feat}`, `{perf}`, `{fix}` or
 `{sec}`. The website uses it to colour the group.
 
-## 0.4.10 — unreleased
+## 0.4.10 — 2026-11-16
 
 **A state file that stays bounded and a source that resumes by itself**
 
@@ -30,6 +30,7 @@ while instead of stopping protection. How bans are detected and enforced is unch
   admitted no new bans until the daemon was restarted.
 - `jails` **`jails` agrees with `status` after a restart.** Both read the same clock, so
   `jails` no longer shows protection as unconfirmed while `status` shows it active.
+  ([#128](https://github.com/ul0gic/fail2zig/issues/128))
 - `status` **The real storage cause.** A storage failure in the middle of a batch of
   records is reported as `StorageFull`, `Busy`, `StorageIo` or `ReadOnly`, not as
   `RestoreRequired`. When a jail is unhealthy, `Cause:` names that jail's source error
@@ -37,6 +38,26 @@ while instead of stopping protection. How bans are detected and enforced is unch
 - `storage` **The state file stops growing with log volume.** The table that kept one row
   for every log line read is gone. A record is kept only while something needs it, and
   the transaction that admits a source's next records deletes the ones before them.
+- `enforcement` **Firewall evidence is settled only from a fresh reading.** Settling a
+  pending removal from an older cached firewall reading could store evidence dated
+  before the action it settles, and every later start refused with `InvalidEffect`. The
+  daemon takes a new reading first and the store rejects such a write.
+- `enforcement` **Each jail's ban ends at its own time.** When two jails ban the same
+  address, the shorter ban's bookkeeping ends at its own deadline while the longer ban
+  stays in the firewall.
+- `reload` **A removed jail can return with changed settings.** Adding a jail back with a
+  different `maxretry` or `bantime` while another jail still bans the same address no
+  longer stops enforcement work, and removing a jail deletes its source bookkeeping.
+- `unban` **A shared unban reports `applied`.** `unban --jail` on a ban that another jail
+  also holds returns `applied` once that jail's hold is released, while the other
+  jail's ban stays in the firewall; it returned `partial` (exit 4) before.
+- `sources` **An undated log starts at its end.** A log whose lines carry no timestamp,
+  with no saved position, is read from its end when first found, so old lines are not
+  counted as new; a file that appears later under the same pattern is read from its
+  beginning.
+- `configuration` **Quoted jail names.** `[jails."my jail"]` and `[jails.'my jail']` name
+  the jail by the text between the quotes; a double-quoted name with a backslash is
+  refused.
 - `docs` **Example escalation doubles.** `deploy/fail2zig.toml.example` sets
   `bantime_increment_factor = 2` with multiplier 1, so repeat bans double up to the
   one-week cap; before, every repeat ban was a constant two hours.
@@ -58,6 +79,10 @@ while instead of stopping protection. How bans are detected and enforced is unch
   consumed history and memory first, counts and logs it, starts on a full file and
   resumes intake by itself. SQLite's own limit is 64 MiB higher. [Read the resource
   boundaries](docs/architecture.md#resource-boundaries)
+- `recovery` **`repair-effect-evidence`.** An offline command that checks a stopped state
+  for firewall evidence dated before its action and, with `--apply`, returns those
+  actions to pending after writing a private backup. [Read the upgrade
+  guide](docs/guides/upgrading.md)
 - `escalation` **Capped per-address memory.** Escalation memory and retired retry rows
   hold at most 65,536 rows each. At the cap the least recently written address without
   a live ban is forgotten and logged; a ban never waits for a memory row.

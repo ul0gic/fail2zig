@@ -176,7 +176,10 @@ pub const Session = struct {
 
     pub fn prepareProcessor(allocator: std.mem.Allocator, options: Options, specs: []const Spec, scratch: []u8, now: time.Timestamp) !processing.Processor {
         try validateOptions(options, specs);
-        const configuration = try std.json.stringifyAlloc(allocator, .{ .parent = options.processing.parent_generation, .sources = specs, .maximum_sources = options.max_sources }, .{});
+        const identity = try allocator.alloc(Spec, specs.len);
+        defer allocator.free(identity);
+        for (identity, specs) |*entry, spec| entry.* = .{ .pattern = spec.pattern, .start = .head };
+        const configuration = try std.json.stringifyAlloc(allocator, .{ .parent = options.processing.parent_generation, .sources = identity, .maximum_sources = options.max_sources }, .{});
         defer allocator.free(configuration);
         var bound = options.processing;
         std.crypto.hash.sha2.Sha256.hash(configuration, &bound.parent_generation, .{});

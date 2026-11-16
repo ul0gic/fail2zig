@@ -644,9 +644,18 @@ pub fn Methods(comptime Coordinator: type) type {
                     };
                     const now = self.clock.wallUs();
                     if (request.expect_absent) {
-                        if (found == null or found.?.status == .absent or found.?.status == .expired or !found.?.desired.live(now)) {
+                        const owner = self.store.currentOwner(request.scope_key, request.jailName()) catch |failure| {
+                            self.recoverAdminStorageIfNeeded(failure);
+                            view = (view.withOutcome(.uncertain)).withReason("owner release could not be verified: {s}", .{@errorName(failure)});
+                            self.completeAdmin(request, self.adminDetail(request, view, request.pending_state));
+                            return;
+                        };
+                        if (owner == null or owner.?.lease == .absent) {
                             view.outcome = .applied;
                             settled = true;
+                            if (found) |entry| if (entry.desired.live(now)) {
+                                view = view.withReason("jail owner released; another jail still bans this scope", .{});
+                            };
                         }
                     } else if (found) |entry| if (entry.status == .applied and entry.desired.live(now)) {
                         view.outcome = .applied;

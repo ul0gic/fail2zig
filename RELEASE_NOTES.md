@@ -40,6 +40,30 @@ detected and enforced is unchanged.
   consumed history, evidence and escalation memory first, and counts and logs
   what it gave up. It starts on a file at capacity. SQLite's own limit is 16,384
   pages higher, so the file can reach 1 GiB plus 64 MiB on disk.
+- Settle firewall evidence only from a fresh reading. Settling a pending removal
+  from an older cached firewall reading could store evidence dated before the
+  action it settles, and every later start then refused with `InvalidEffect`.
+  The daemon now takes a new reading first and the store rejects such a write.
+  `fail2zig repair-effect-evidence` checks a stopped state for that exact damage
+  and, with `--apply`, returns those actions to pending after writing a private
+  backup; the [upgrade guide](docs/guides/upgrading.md) has the steps.
+- End each jail's ban at its own time. When two jails ban the same address, the
+  shorter ban's bookkeeping ends at its own deadline while the longer ban stays
+  in the firewall.
+- Accept a removed jail added again with changed settings. Adding a jail back
+  with a different `maxretry` or `bantime` while another jail still bans the same
+  address no longer stops enforcement work. Removing a jail also deletes its
+  source bookkeeping.
+- Report a shared unban as applied. `unban --jail` on a ban that another jail
+  also holds returns `applied` once that jail's hold is released, while the
+  other jail's ban stays in the firewall. It returned `partial` (exit 4) before.
+- Start an undated log at its end. A log whose lines carry no timestamp, with no
+  saved position, is read from its end when the daemon first finds it, so old
+  lines are not counted as new. A file that appears later under the same pattern
+  is read from its beginning.
+- Read quoted jail names. `[jails."my jail"]` and `[jails.'my jail']` name the
+  jail by the text between the quotes; a double-quoted name that contains a
+  backslash is refused.
 - Correct the example configuration and the manual. The example's escalation
   now doubles each repeat ban (`bantime_increment_factor = 2`); `migrate status`
   shows its required `--backend`; `repair-source` documents exits 3 and 5 of its
@@ -84,6 +108,23 @@ should alert on `fail2zig_state_file_used_pages` instead. Scripts that run `ban`
   moves a source position backwards. No supported path does this.
 - A start killed between the backup rename and the schema commit needs the
   operator step above.
+- In one lab run under sustained traffic with 750 live bans, log records stayed
+  flat while used pages rose 14% (3,988 to 4,534), in ban history and its detail
+  rows. Whether `history_retention` bounds that growth has not been established;
+  the page budget applies either way.
+
+## Verification scope
+
+The full local suite passed. On the Debian 13 lab host, a v0.4.8 state with
+sixteen jails and 5,000 bans was upgraded to v0.4.9 and then to this release
+under the shipped unit: it started, enforced a new ban, showed its matched line,
+removed it from both jails and restarted with every ban in the kernel. In
+separate rootless runs on the same host, a full state held its bans at the
+capacity line and resumed intake by itself, a 320 MiB v0.4.9 state upgraded and
+recovered from a kill during the backup copy, and a jail removal interrupted by
+a stop completed at the next start with 750 bans. Not run: a kill between the
+backup rename and the schema commit, a host reboot, and a start on a full
+filesystem.
 
 # fail2zig v0.4.9
 

@@ -672,6 +672,10 @@ field.
 Release a manual or detection ban in one jail. A config ban is refused with exit status
 1 and
 .BR "banned by config: edit banip" .
+After the owner's release and coherent kernel state are confirmed, the command
+returns applied (exit status 0), even if another jail still bans the scope;
+the response reports that remaining protection. Releasing the final owner requires
+kernel confirmation that the scope is absent.
 After an unban the address's failure count starts from zero, so
 .B maxretry
 new failures inside

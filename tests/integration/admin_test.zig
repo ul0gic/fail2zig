@@ -449,6 +449,7 @@ fn writeOverlapConfig(h: *harness.Harness, bantime: u32) !void {
         \\timestamp = "undated"
         \\logpath = ["{s}"]
         \\maxretry = 100
+        \\bantime = "permanent"
         \\
     , .{ h.state_path, h.socket_path, linux.getpid(), bantime, h.log_path, h.log_path });
 }
@@ -613,7 +614,7 @@ fn expectKernelHostRules(a: std.mem.Allocator, address: []const u8, expected: us
     try t.expectEqual(expected, count);
 }
 
-test "admin: BUG-038 operator owner view covers dedup overlap restart unban and expiry" {
+test "admin: shared-owner unban preserves finite and permanent protection" {
     if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") == null) return error.SkipZigTest;
     const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
     var namespace_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -683,13 +684,15 @@ test "admin: BUG-038 operator owner view covers dedup overlap restart unban and 
     try waitOverlapJailBans(&h, 1, 1);
     try expectKernelHostRules(a, "203.0.113.7", 1);
 
+    var release_timer = try std.time.Timer.start();
     const release_first = try admin(a, &h, &.{ "unban", "203.0.113.7", "--jail", "sshd" });
     defer release_first.deinit(a);
-    try t.expectEqual(@as(u8, 4), release_first.code);
+    std.debug.print("shared-owner unban: finite-owner release completed in {d} ms\n", .{release_timer.read() / std.time.ns_per_ms});
+    try t.expectEqual(@as(u8, 0), release_first.code);
     const released = try parseValue(a, release_first.stdout);
     defer released.deinit();
     try t.expectEqualStrings("unban", released.value.object.get("kind").?.string);
-    try t.expectEqualStrings("partial", released.value.object.get("outcome").?.string);
+    try t.expectEqualStrings("applied", released.value.object.get("outcome").?.string);
     try t.expect(!released.value.object.get("enforced").?.bool);
     const retained = try waitListCount(&h, 1, 5000);
     defer a.free(retained);
@@ -715,7 +718,7 @@ test "admin: BUG-038 operator owner view covers dedup overlap restart unban and 
         var query_buffer: [512]u8 = undefined;
         const query = try std.fmt.bufPrintZ(
             &query_buffer,
-            "SELECT count(*) FROM admin_requests WHERE kind=7 AND outcome=4 AND subject=CAST('sshd' AS BLOB) AND mutation_revision={d};",
+            "SELECT count(*) FROM admin_requests WHERE kind=7 AND outcome=1 AND subject=CAST('sshd' AS BLOB) AND mutation_revision={d};",
             .{released.value.object.get("mutation_revision").?.integer},
         );
         try t.expectEqual(@as(i64, 1), try probe.inspectInteger(query));
@@ -730,6 +733,73 @@ test "admin: BUG-038 operator owner view covers dedup overlap restart unban and 
     try waitActiveBans(&h, 0, 5000);
     try waitOverlapJailBans(&h, 0, 0);
     try expectKernelHostRules(a, "203.0.113.7", 0);
+
+    const permanent = try admin(a, &h, &.{ "ban", "192.0.2.39", "--jail", "secondary" });
+    defer permanent.deinit(a);
+    try t.expectEqual(@as(u8, 0), permanent.code);
+    const short = try admin(a, &h, &.{ "ban", "192.0.2.39", "--jail", "sshd", "--duration", "300" });
+    defer short.deinit(a);
+    try t.expectEqual(@as(u8, 0), short.code);
+    try waitOverlapJailBans(&h, 1, 1);
+    const release_shared = try admin(a, &h, &.{ "unban", "192.0.2.39", "--jail", "sshd" });
+    defer release_shared.deinit(a);
+    try t.expectEqual(@as(u8, 0), release_shared.code);
+    const shared_result = try parseValue(a, release_shared.stdout);
+    defer shared_result.deinit();
+    try t.expectEqualStrings("applied", shared_result.value.object.get("outcome").?.string);
+    try t.expect(!shared_result.value.object.get("enforced").?.bool);
+    const permanent_list = try waitListCount(&h, 1, 5000);
+    defer a.free(permanent_list);
+    const permanent_doc = try parseValue(a, permanent_list);
+    defer permanent_doc.deinit();
+    const retained_permanent = permanent_doc.value.array.items[0].object;
+    try t.expectEqualStrings("secondary", retained_permanent.get("jail").?.string);
+    try t.expect(retained_permanent.get("expiry_us").? == .null);
+    try t.expect(retained_permanent.get("confirmed").?.bool);
+    try waitOverlapJailBans(&h, 0, 1);
+    try expectKernelHostRules(a, "192.0.2.39", 1);
+
+    const again = try admin(a, &h, &.{ "ban", "192.0.2.39", "--jail", "sshd", "--duration", "300" });
+    defer again.deinit(a);
+    try t.expectEqual(@as(u8, 0), again.code);
+    {
+        const engine = @import("engine");
+        var probe = try engine.native_store_mod.Store.open(a, h.state_path);
+        defer probe.close();
+        try probe.inspectExec(
+            "CREATE TRIGGER shared_unban_settlement_failure BEFORE UPDATE OF status ON effect_intents " ++
+                "WHEN OLD.status=1 AND NEW.status=2 AND NEW.lease_kind=2 " ++
+                "BEGIN SELECT RAISE(FAIL,'injected settlement failure'); END;",
+        );
+        var installed = true;
+        defer if (installed) probe.inspectExec("DROP TRIGGER shared_unban_settlement_failure;") catch {};
+        const unconfirmed = try admin(a, &h, &.{ "unban", "192.0.2.39", "--jail", "sshd" });
+        defer unconfirmed.deinit(a);
+        try t.expectEqual(@as(u8, 5), unconfirmed.code);
+        const unconfirmed_doc = try parseValue(a, unconfirmed.stdout);
+        defer unconfirmed_doc.deinit();
+        try t.expectEqualStrings("uncertain", unconfirmed_doc.value.object.get("outcome").?.string);
+        try t.expect(!unconfirmed_doc.value.object.get("enforced").?.bool);
+        try t.expectEqual(@as(i64, 0), try probe.inspectInteger("SELECT count(*) FROM effect_owners WHERE jail='sshd' AND lease_kind!=0;"));
+        try t.expectEqual(@as(i64, 1), try probe.inspectInteger("SELECT count(*) FROM effect_owners WHERE jail='secondary' AND lease_kind=2 AND deadline_us IS NULL;"));
+        try expectKernelHostRules(a, "192.0.2.39", 1);
+        try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try h.stopDaemon());
+        try probe.inspectExec("DROP TRIGGER shared_unban_settlement_failure;");
+        installed = false;
+    }
+    try h.startDaemon();
+    try waitReady(&h, 15_000);
+    try waitOverlapJailBans(&h, 0, 1);
+    try expectKernelHostRules(a, "192.0.2.39", 1);
+    const release_permanent = try admin(a, &h, &.{ "unban", "192.0.2.39", "--jail", "secondary" });
+    defer release_permanent.deinit(a);
+    try t.expectEqual(@as(u8, 0), release_permanent.code);
+    const permanent_release = try parseValue(a, release_permanent.stdout);
+    defer permanent_release.deinit();
+    try t.expectEqualStrings("applied", permanent_release.value.object.get("outcome").?.string);
+    try waitKernel(a, "192.0.2.39", false, 5000);
+    try waitOverlapJailBans(&h, 0, 0);
+    try expectKernelHostRules(a, "192.0.2.39", 0);
 
     const expiring = try admin(a, &h, &.{ "ban", "192.0.2.38", "--jail", "sshd", "--duration", "4" });
     defer expiring.deinit(a);
