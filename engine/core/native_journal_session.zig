@@ -84,7 +84,6 @@ pub const RecoverySnapshot = struct {
     jail: []u8,
     source: []u8,
     pending_proof: ?durable.Store.PendingSource,
-    candidate_receipt: @FieldType(pipeline.Pipeline, "candidate_receipt"),
     source_repair: repair.Repair,
     source_health: records.Health,
     last_error: ?anyerror,
@@ -257,7 +256,7 @@ pub const Session = struct {
         errdefer a.free(source);
         const pending = if (self.pending_proof) |saved| try @import("native_file_session.zig").clonePending(a, saved) else null;
         const expected_durable = self.baseline_committed or self.expected_durable;
-        out.* = .{ .allocator = a, .generation = self.processor.generation, .jail = jail, .source = source, .pending_proof = pending, .candidate_receipt = self.pipe.candidate_receipt, .source_repair = self.source_repair, .source_health = self.source_health, .last_error = self.last_error, .failure_diagnostic = self.failure_diagnostic, .notices = self.notices, .expected_durable = expected_durable, .initial_proposal = self.recoveryProposal(), .initial_tail_attempted = self.initial_tail_attempted };
+        out.* = .{ .allocator = a, .generation = self.processor.generation, .jail = jail, .source = source, .pending_proof = pending, .source_repair = self.source_repair, .source_health = self.source_health, .last_error = self.last_error, .failure_diagnostic = self.failure_diagnostic, .notices = self.notices, .expected_durable = expected_durable, .initial_proposal = self.recoveryProposal(), .initial_tail_attempted = self.initial_tail_attempted };
         return out;
     }
     fn recoveryProposal(self: *const Session) ?Position {
@@ -269,7 +268,6 @@ pub const Session = struct {
         if (!std.mem.eql(u8, &self.processor.generation, &snapshot.generation) or !std.mem.eql(u8, self.options.processing.jail, snapshot.jail) or !std.mem.eql(u8, self.options.source_id, snapshot.source)) return error.SourceGenerationMismatch;
         const pending = if (snapshot.pending_proof) |saved| try @import("native_file_session.zig").clonePending(self.allocator, saved) else null;
         self.pending_proof = pending;
-        self.pipe.candidate_receipt = snapshot.candidate_receipt;
         self.source_repair = snapshot.source_repair;
         self.source_health = snapshot.source_health;
         self.last_error = snapshot.last_error;
@@ -278,21 +276,6 @@ pub const Session = struct {
         self.expected_durable = snapshot.expected_durable;
         self.initial_proposal = snapshot.initial_proposal;
         self.initial_tail_attempted = snapshot.initial_tail_attempted;
-    }
-    pub fn copyRepairStateFrom(self: *Session, old: *const Session) !void {
-        if (self.admission_phase != .positions or self.baseline_committed or self.restore_after != null or self.pending_proof != null) return error.RecoveryOutOfOrder;
-        if (!std.mem.eql(u8, &self.processor.generation, &old.processor.generation) or !std.mem.eql(u8, self.options.source_id, old.options.source_id)) return error.SourceGenerationMismatch;
-        const proof = if (old.pending_proof) |saved| try @import("native_file_session.zig").clonePending(self.allocator, saved) else null;
-        self.pending_proof = proof;
-        self.pipe.candidate_receipt = old.pipe.candidate_receipt;
-        self.source_repair = old.source_repair;
-        self.source_health = old.source_health;
-        self.last_error = old.last_error;
-        self.failure_diagnostic = old.failure_diagnostic;
-        self.notices = old.notices;
-        self.expected_durable = old.baseline_committed or old.expected_durable;
-        self.initial_proposal = old.recoveryProposal();
-        self.initial_tail_attempted = old.initial_tail_attempted;
     }
     fn checkStartClock(self: *Session) !void {
         const clock = self.pipe.receipts.?;
@@ -418,8 +401,12 @@ pub const Session = struct {
         }
         try self.checkStartClock();
     }
+    fn parked(self: *Session) error{RestoreRequired} {
+        self.pipe.park();
+        return error.RestoreRequired;
+    }
     fn checkCandidate(candidate: records.Record, identity: durable.ReceiptIdentity) !void {
-        if (candidate.kind != .data or !std.mem.eql(u8, candidate.source, identity.source) or !std.mem.eql(u8, candidate.occurrence, identity.occurrence) or !std.mem.eql(u8, candidate.cursor, identity.cursor) or !std.mem.eql(u8, &candidate.raw_hash, &identity.raw_hash)) return error.PendingRecordMismatch;
+        if (candidate.kind != .data or !identity.sameRecord(.{ .jail = identity.jail, .source = candidate.source, .occurrence = candidate.occurrence, .cursor = candidate.cursor, .raw_hash = candidate.raw_hash, .generation = identity.generation })) return error.PendingRecordMismatch;
     }
     fn verifyTurn(self: *Session) !void {
         try self.sourceIoAdmission();
@@ -504,11 +491,11 @@ pub const Session = struct {
     }
     pub fn resumeConsumerSource(self: *Session, source_id: []const u8) !usize {
         try self.pipe.admit();
-        if (self.admission_phase != .ready) return error.RestoreRequired;
-        if (!std.mem.eql(u8, source_id, self.options.source_id)) return error.ForeignJournalSource;
-        const pending = (try self.pipe.store.readPendingSource(self.allocator, self.pipe.jail, source_id)) orelse return error.PendingRecordUnavailable;
+        if (self.admission_phase != .ready) return self.parked();
+        if (!std.mem.eql(u8, source_id, self.options.source_id)) return self.parked();
+        const pending = (try self.pipe.store.readPendingSource(self.allocator, self.pipe.jail, source_id)) orelse return self.parked();
         defer pending.deinit(self.allocator);
-        if (!std.mem.eql(u8, &pending.identity.generation, &self.processor.generation)) return error.SourceGenerationMismatch;
+        if (!std.mem.eql(u8, &pending.identity.generation, &self.processor.generation)) return self.parked();
         self.empty_poll_at_ms = null;
         return self.pollTurn(1);
     }
@@ -624,7 +611,7 @@ pub const Session = struct {
         var cursor: [checkpoint_bytes]u8 = undefined;
         var occurrence: [518]u8 = undefined;
         const candidate = self.record(entry, &next, &cursor, &occurrence);
-        if (!std.mem.eql(u8, candidate.occurrence, identity.occurrence) or !std.mem.eql(u8, candidate.cursor, identity.cursor) or !std.mem.eql(u8, &candidate.raw_hash, &identity.raw_hash)) return error.PendingRecordMismatch;
+        try checkCandidate(candidate, identity);
     }
     pub fn poll(self: *Session, budget: usize) !usize {
         defer self.reportNotices();

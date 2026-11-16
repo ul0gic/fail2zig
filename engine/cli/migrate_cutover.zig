@@ -79,6 +79,10 @@ pub fn runCutover(allocator: std.mem.Allocator, options: Options, stdout: anytyp
         return .usage;
     };
     defer store.close();
+    store.configurePageLimit() catch |err| {
+        stderr.print("migrate cutover: state {s}: {s}\n", .{ options.state_file, @errorName(err) }) catch {};
+        return .usage;
+    };
     if (store.schema_version < durable.latest_schema) {
         stderr.writeAll("migrate cutover: the destination state has not been initialised by the daemon; start fail2zig once, stop it, then rerun\n") catch {};
         return .rejected;
@@ -461,6 +465,10 @@ pub fn runRollback(allocator: std.mem.Allocator, options: Options, stdout: anyty
         return .usage;
     };
     defer store.close();
+    store.configurePageLimit() catch |err| {
+        stderr.print("migrate rollback: state {s}: {s}\n", .{ options.state_file, @errorName(err) }) catch {};
+        return .usage;
+    };
     const identity = identityFor(&loaded, options.staging_dir) catch return .usage;
     var log = journal.Journal.open(allocator, &store, run_id, identity) catch |err| {
         stderr.print("migrate rollback: run {s}: {s}\n", .{ &std.fmt.bytesToHex(run_id, .lower), @errorName(err) }) catch {};

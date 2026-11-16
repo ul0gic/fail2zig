@@ -1082,6 +1082,19 @@ const Parser = struct {
     fn parseSectionHeader(self: *Parser) Error![]const u8 {
         if (self.peek() != '[') return error.UnexpectedToken;
         self.advance();
+        self.skipSpaceTabs();
+        const jails_prefix = "jails.";
+        const rest = self.src[self.pos..];
+        if (rest.len > jails_prefix.len and std.mem.startsWith(u8, rest, jails_prefix) and
+            (rest[jails_prefix.len] == '"' or rest[jails_prefix.len] == '\''))
+        {
+            for (0..jails_prefix.len) |_| self.advance();
+            const jail_name = try self.parseQuotedJailName();
+            self.skipSpaceTabs();
+            if (self.eof() or self.peek() != ']') return error.UnexpectedToken;
+            self.advance();
+            return try std.fmt.allocPrint(self.arena, jails_prefix ++ "{s}", .{jail_name});
+        }
         const start = self.pos;
         while (!self.eof() and self.peek() != ']' and self.peek() != '\n') self.advance();
         if (self.eof() or self.peek() != ']') return error.UnexpectedToken;
@@ -1090,6 +1103,26 @@ const Parser = struct {
         const trimmed = std.mem.trim(u8, name, " \t");
         if (trimmed.len == 0) return error.UnexpectedToken;
         return trimmed;
+    }
+
+    fn parseQuotedJailName(self: *Parser) Error![]const u8 {
+        self.value_pos = self.here();
+        const quote = self.peek();
+        self.advance();
+        const start = self.pos;
+        while (true) {
+            if (self.eof() or self.peek() == '\n') return error.UnterminatedString;
+            const c = self.peek();
+            if (c == quote) break;
+            if (c == '\\' and quote == '"') {
+                self.hint = "escape sequences are not supported in a quoted jail name; use a literal-quoted name";
+                return error.InvalidEscape;
+            }
+            self.advance();
+        }
+        const name = self.src[start..self.pos];
+        self.advance();
+        return name;
     }
 
     fn parseBareKey(self: *Parser) Error![]const u8 {

@@ -28,6 +28,7 @@ pub const StagedConsumer = struct {
     prepare_checkpoint: *const fn (@import("source_record.zig").Record, i64, u64, ?*anyopaque) anyerror!StagedState,
     manifest: *const fn ([]const u8, [32]u8, ?*anyopaque) anyerror!@import("native_consumer.zig").Manifest,
     processing_time: ?*const fn (@import("source_record.zig").Record, i64, ?*anyopaque) anyerror!i64 = null,
+    void_hold: ?*const fn ([]const u8, ?*anyopaque) void = null,
 };
 const policy = @import("source_time_policy.zig");
 pub const version: u16 = 1;

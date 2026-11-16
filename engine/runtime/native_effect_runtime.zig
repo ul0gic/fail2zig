@@ -587,11 +587,12 @@ pub const Manager = struct {
         _ = self;
         var deadline: ?i64 = null;
         for (owners) |owner| {
+            if (owner.lease == .absent) continue;
             for (bindings) |binding| {
                 if (!std.mem.eql(u8, binding.jail, owner.jail.slice())) continue;
                 if (!std.mem.eql(u8, &binding.generation, &owner.generation)) return error.EffectGenerationMismatch;
                 break;
-            } else if (owner.lease == .absent) continue else return error.UnconfiguredStateOwner;
+            } else return error.UnconfiguredStateOwner;
             if (owner.lease == .finite) deadline = if (deadline) |prior| @min(prior, owner.lease.finite) else owner.lease.finite;
         }
         return deadline;
@@ -656,6 +657,7 @@ pub const Manager = struct {
         self.inventory = null;
         self.inventory = .{ .snapshot = snapshot, .start_us = start_us, .end_us = end_us, .start_ns = start_ns };
         self.inspector.retained_bytes = snapshot.entries.len * @sizeOf(firewall.Entry);
+        self.legacy_targets_attempted = null;
     }
     fn dropInventory(self: *Manager) void {
         self.inventory_discontinuity +|= 1;
@@ -931,10 +933,16 @@ pub const Manager = struct {
         self.backOff();
         return .{ .wait = self.waitDue() };
     }
+    fn expiryDeadline(self: *const Manager, index: usize, entry: effect.Entry) ?i64 {
+        const owner = self.owner_deadline_us[index];
+        return switch (entry.desired) {
+            .finite => |deadline| if (owner) |at| @min(at, deadline) else deadline,
+            .absent, .permanent => owner,
+        };
+    }
     fn expiryDue(self: *const Manager, index: usize, entry: effect.Entry, now_us: i64) bool {
         if (entry.status == .dispatched or self.markers[index] != null) return false;
-        if (entry.desired == .finite) return !entry.desired.live(now_us);
-        if (entry.desired == .permanent) if (self.owner_deadline_us[index]) |deadline| return deadline <= now_us;
+        if (self.expiryDeadline(index, entry)) |deadline| return deadline <= now_us;
         return false;
     }
     fn act(self: *Manager, bindings: []const Binding, sampled: effect.Clock) !Step {
@@ -1000,16 +1008,15 @@ pub const Manager = struct {
                 all_confirmed = false;
                 continue;
             }
-            if (entry.desired == .finite and entry.status != .expired and entry.status != .absent) next_deadline = if (next_deadline) |prior| @min(prior, entry.desired.finite) else entry.desired.finite;
-            if (entry.desired == .permanent) if (self.owner_deadline_us[index]) |deadline| {
+            if (self.expiryDeadline(index, entry)) |deadline| {
                 next_deadline = if (next_deadline) |prior| @min(prior, deadline) else deadline;
-            };
+            }
             const matched = self.matched[index];
             if (self.expiryDue(index, entry, now_us)) {
                 due_count += 1;
-                const deadline = if (entry.desired == .finite) entry.desired.finite else self.owner_deadline_us[index].?;
+                const deadline = self.expiryDeadline(index, entry).?;
                 oldest_overdue_us = if (oldest_overdue_us) |prior| @min(prior, deadline) else deadline;
-                if (expiryClass(transport, entry.scope) == .deletion and try presentIn(held, entry)) {
+                if (!entry.desired.live(now_us) and expiryClass(transport, entry.scope) == .deletion and try presentIn(held, entry)) {
                     blocking += 1;
                     oldest_blocking_us = if (oldest_blocking_us) |prior| @min(prior, deadline) else deadline;
                 } else bookkeeping += 1;
@@ -1096,7 +1103,7 @@ pub const Manager = struct {
             diag_mod.gauge(.live_pending, live_pending);
         }
         if (marker_pick) |index| return self.settleMarker(bindings, index);
-        if (legacy_pick) |index| return self.settleLegacy(bindings, index);
+        if (legacy_pick) |index| return self.settleLegacy(bindings, index, sampled);
         const expiry_backlog = removal_pending + due_count + settle_ready + settle_blocked;
         const expiry_work = expiry_backlog != 0;
         const share: u8 = if (expiry_backlog > live_pending) 1 else expiry_share;
@@ -1130,7 +1137,7 @@ pub const Manager = struct {
             self.cursor = index;
             return .progress;
         }
-        if (try self.settleLegacyTargets(bindings)) |outcome| return outcome;
+        if (try self.settleLegacyTargets(bindings, sampled)) |outcome| return outcome;
         if (!all_confirmed) {
             if (!self.events_subscribed) self.dropInventory();
             return .{ .wait = self.waitDue() };
@@ -1288,27 +1295,70 @@ pub const Manager = struct {
         try self.settle(bindings, index, entry, marker.sent_wall_us, .{ .installation = entry.installation.id, .scope_key = entry.scope_key, .fingerprint = held.snapshot.fingerprint, .observed_us = held.end_us, .qualification = .complete_owned, .state = entry.desired });
         return .progress;
     }
-    fn settleLegacy(self: *Manager, bindings: []const Binding, index: usize) !Step {
-        const held = &self.inventory.?;
+    fn settleLegacy(self: *Manager, bindings: []const Binding, index: usize, sampled: effect.Clock) !Step {
         const entry = self.live[index];
+        if (try self.settlementReadback(entry, sampled)) |outcome| return outcome;
+        const held = &self.inventory.?;
         try self.settle(bindings, index, entry, held.start_us, .{ .installation = entry.installation.id, .scope_key = entry.scope_key, .fingerprint = held.snapshot.fingerprint, .observed_us = held.end_us, .qualification = .complete_owned, .state = if (self.matched[index]) entry.desired else null });
         return .progress;
     }
-    fn settleLegacyTargets(self: *Manager, bindings: []const Binding) !?Step {
+    fn settlementReadback(self: *Manager, entry: effect.Entry, sampled: effect.Clock) !?Step {
+        const held = &(self.inventory orelse return self.deferReadback());
+        const proof = blk: {
+            try self.store.beginRead();
+            errdefer self.store.rollback();
+            var row = try self.store.statement("SELECT dispatch_us,observed_us,fingerprint FROM effect_intents WHERE intent_id=?1;");
+            defer row.deinit();
+            try row.blob(1, &entry.intent_id);
+            if (!try row.row()) return error.InvalidEffect;
+            const dispatched = try row.optionalSigned(0);
+            const observed = try row.optionalSigned(1);
+            if (entry.status != .pending and dispatched == null) return error.InvalidEffect;
+            if ((entry.status == .applied or entry.status == .absent or entry.status == .expired) and observed == null) return error.InvalidEffect;
+            const start_floor = @max(entry.intent_us, dispatched orelse entry.intent_us);
+            var next_us = start_floor;
+            var current = held.start_us >= start_floor;
+            if (observed) |previous| {
+                const fingerprint = try durable.Store.effectBlob(&row, 2, 32);
+                const conflict = held.end_us == previous and !std.mem.eql(u8, &held.snapshot.fingerprint, &fingerprint);
+                current = current and held.end_us >= previous and !conflict;
+                next_us = @max(next_us, if (conflict) std.math.add(i64, previous, 1) catch return error.InvalidEffect else previous);
+            }
+            if (!current) _ = try self.store.effectClock(sampled);
+            try self.store.commitTransaction();
+            break :blk .{ .current = current, .next_us = next_us };
+        };
+        if (proof.current) return null;
+        self.status.ready = false;
+        if (sampled.prepared_us < proof.next_us) {
+            self.readback_wait = @max(self.readback_wait, 1);
+            return .{ .wait = self.waitDue() };
+        }
+        return try self.readback(sampled);
+    }
+    fn settleLegacyTargets(self: *Manager, bindings: []const Binding, sampled: effect.Clock) !?Step {
         if (self.store.schema_version < 21) return null;
         const key = try self.store.unsettledActionScope() orelse return null;
         if (self.legacy_targets_attempted) |prior| if (std.mem.eql(u8, &prior, &key)) return null;
         const index = self.findLive(key) orelse return null;
         const entry = self.live[index];
         if ((entry.status != .applied and entry.status != .absent) or !self.matched[index]) return null;
-        self.legacy_targets_attempted = key;
+        if (try self.settlementReadback(entry, sampled)) |outcome| return outcome;
         const held = &self.inventory.?;
         try self.settle(bindings, index, entry, held.start_us, .{ .installation = entry.installation.id, .scope_key = entry.scope_key, .fingerprint = held.snapshot.fingerprint, .observed_us = held.end_us, .qualification = .complete_owned, .state = entry.desired });
+        self.legacy_targets_attempted = key;
         return .progress;
     }
     fn settleExpiredBatch(self: *Manager, tokens: []const effect.Token) !Step {
         const diag_span = if (comptime build_options.diag) diag_mod.enter(.expiry) else {};
         defer if (comptime build_options.diag) diag_mod.leave(diag_span);
+        const sampled = try self.clock();
+        for (tokens) |token_value| {
+            const index = self.findLive(token_value.scope_key) orelse return error.StaleEffect;
+            const entry = self.live[index];
+            if (!std.meta.eql(entry.token(), token_value)) return error.StaleEffect;
+            if (try self.settlementReadback(entry, sampled)) |outcome| return outcome;
+        }
         const held = &self.inventory.?;
         const pre = self.store.effect_publication_epoch;
         {
@@ -1459,6 +1509,7 @@ pub const Manager = struct {
         self.status.ready = false;
         var entry = self.live[index];
         if (entry.status != .pending) {
+            if (try self.settlementReadback(entry, sampled)) |outcome| return outcome;
             const held = &(self.inventory orelse return self.readback(sampled));
             try self.settle(bindings, index, entry, held.start_us, .{ .installation = entry.installation.id, .scope_key = entry.scope_key, .fingerprint = held.snapshot.fingerprint, .observed_us = held.end_us, .qualification = .complete_owned, .state = null });
             if (self.cached_epoch == null) return .progress;
@@ -1585,7 +1636,7 @@ pub const Manager = struct {
         var count: usize = 1;
         for (self.live[0..self.count], 0..) |other, i| {
             if (count == items.len) break;
-            if (i == index or other.status == .dispatched or self.markers[i] != null or other.desired != .finite or other.desired.live(sampled.prepared_us)) continue;
+            if (i == index or !self.expiryDue(i, other, sampled.prepared_us)) continue;
             items[count] = .{ .key = other.scope_key, .revision = other.revision };
             count += 1;
         }
@@ -1686,20 +1737,10 @@ pub const Manager = struct {
             try self.refreshMatch(scope.index);
             if (self.inventory == null) return self.deferReadback();
             const absent = self.matched[scope.index];
+            if (entry.status == .dispatched or (absent and (entry.status != .absent or self.markers[scope.index] != null))) {
+                if (try self.settlementReadback(entry, try self.clock())) |outcome| return outcome;
+            }
             if (entry.status == .dispatched) {
-                // A snapshot older than dispatch cannot settle that issued operation.
-                try self.store.beginRead();
-                errdefer self.store.rollback();
-                var row = try self.store.statement("SELECT dispatch_us FROM effect_intents WHERE intent_id=?1;");
-                defer row.deinit();
-                try row.blob(1, &entry.intent_id);
-                if (!try row.row()) return error.InvalidEffect;
-                const dispatched = try row.optionalSigned(0) orelse return error.InvalidEffect;
-                try self.store.commitTransaction();
-                if (self.inventory.?.end_us < dispatched) {
-                    self.dropInventory();
-                    return .progress;
-                }
                 if (!absent) {
                     const held = self.inventory.?;
                     const pre = self.store.effect_publication_epoch;

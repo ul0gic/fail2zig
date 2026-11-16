@@ -147,6 +147,7 @@ pub fn Methods(comptime Coordinator: type) type {
                     };
                     break :blk self.adminDetail(request, failed, request.pending_state);
                 }
+                if (err == error.StorageCapacity) break :blk (AdminOutcomeView{ .outcome = .rejected, .kind = request.kind, .generation = self.published_generation }).withReason("state file at capacity (StorageCapacity); nothing was recorded; retry when fail2zig status shows intake open", .{});
                 break :blk (AdminOutcomeView{ .outcome = .rejected, .kind = request.kind, .generation = self.published_generation }).withReason("{s}", .{@errorName(err)});
             };
             if (request.phase == .awaiting) return;
@@ -643,9 +644,18 @@ pub fn Methods(comptime Coordinator: type) type {
                     };
                     const now = self.clock.wallUs();
                     if (request.expect_absent) {
-                        if (found == null or found.?.status == .absent or found.?.status == .expired or !found.?.desired.live(now)) {
+                        const owner = self.store.currentOwner(request.scope_key, request.jailName()) catch |failure| {
+                            self.recoverAdminStorageIfNeeded(failure);
+                            view = (view.withOutcome(.uncertain)).withReason("owner release could not be verified: {s}", .{@errorName(failure)});
+                            self.completeAdmin(request, self.adminDetail(request, view, request.pending_state));
+                            return;
+                        };
+                        if (owner == null or owner.?.lease == .absent) {
                             view.outcome = .applied;
                             settled = true;
+                            if (found) |entry| if (entry.desired.live(now)) {
+                                view = view.withReason("jail owner released; another jail still bans this scope", .{});
+                            };
                         }
                     } else if (found) |entry| if (entry.status == .applied and entry.desired.live(now)) {
                         view.outcome = .applied;
@@ -1105,6 +1115,8 @@ pub fn Methods(comptime Coordinator: type) type {
             const result = self.store.addIgnoreEntry(name, entry, now, expires_us) catch |failure| {
                 if (failure == error.IgnoreCapacity)
                     return self.ignoreRefusal(request, .rejected, "jail {s} already has {d} ignore entries (configuration and runtime combined), the limit. Remove one with fail2zig ignore remove first.", .{ name, before.entries.len });
+                if (failure == error.StorageCapacity)
+                    return self.ignoreRefusal(request, .rejected, "state file at capacity (StorageCapacity); the entry for jail {s} was not added. Retry when fail2zig status shows intake open.", .{name});
                 std.log.err("native admin: ignore entry commit failed: {s}", .{@errorName(failure)});
                 return self.ignoreUncertain(request);
             };

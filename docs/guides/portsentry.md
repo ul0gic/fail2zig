@@ -137,10 +137,11 @@ observation alone does not prove packet enforcement.
 
 A scan sensor with `maxretry = 1` bans every host that touches a sensor port, so
 on a public address this jail's ban count follows internet scan traffic. Every ban is
-stored with its decision, owner and up to `history_max_matches` matched lines,
-and the state file is capped at 1 GiB. Watch `State file:` in `fail2zig status`
-or the `fail2zig_state_file_bytes` metric. To store less per ban, lower the
-jail's share of matched lines:
+stored with its decision, owner and up to `history_max_matches` matched lines.
+New bans wait once the state file's used pages reach a capacity of 262,144 pages
+(1 GiB); bans already installed stay enforced and intake resumes when room returns.
+Watch `Used pages:` in `fail2zig status` or the `fail2zig_state_file_used_pages`
+metric. To store less per ban, lower the jail's share of matched lines:
 
 ```toml
 [jails.portsentry]

@@ -27,7 +27,7 @@ On an existing installation the installer also sets `config.toml` to owner
 when a `fail2zig` account already exists with a login shell or a home directory
 other than `/nonexistent`.
 
-The v0.4.9 release provides one combined daemon/admin executable per target:
+The v0.4.10 release provides one combined daemon/admin executable per target:
 
 | Target | Qualification |
 |---|---|
@@ -44,11 +44,11 @@ requires `journalctl`; iptables and ipset backends require their host tools.
 
 If the installer is unsuitable, download only the needed executable and support
 files from the same release, then verify each against `SHA256SUMS` before use. For
-v0.4.9 on x86_64:
+v0.4.10 on x86_64:
 
 ```bash
 set -euo pipefail
-VERSION=v0.4.9
+VERSION=v0.4.10
 ARCH=x86_64-linux-musl
 BASE="https://github.com/ul0gic/fail2zig/releases/download/${VERSION}"
 for file in \
@@ -254,32 +254,36 @@ WAL/SHM siblings. An older binary cannot read newer checkpoint and marker data.
 Rollback requires the matching backup and binary, not an executable swap.
 
 v0.4.7 is the minimum supported upgrade source. The first start of this release
-upgrades a state last written by v0.4.8 (schema 26) to schema 28 in place. A state
-last written by v0.4.7 (schema 25) first takes the v0.4.8 step to schema 26, then
-the same step to 28. Schema 28 adds the records that let a removed or disabled
-jail's state be cleaned in bounded steps. States last written by v0.4.6 or earlier
-are not a supported upgrade path; upgrade them through v0.4.7 first, or start from a
-fresh state.
+upgrades a state last written by v0.4.9 (schema 28) to schema 29 in place. A state
+last written by v0.4.8 (schema 26) first takes the step to schema 28, and one
+written by v0.4.7 (schema 25) the steps to 26 and 28. Schema 29 drops the table
+that kept one row for every log line read and adds the counters the state-file
+page budget reads. States last written by v0.4.6 or earlier are not a supported
+upgrade path; upgrade them through v0.4.7 first, or start from a fresh state.
 
-- Before each change it writes a coherent copy of the database to a backup. It
-  needs free space of twice the database size plus 32 MiB, and refuses to start if
-  that backup file already exists. Move an old backup aside only when it is not the
-  sole copy of earlier state.
-- The backup before the schema 28 step is `<state_file>.pre27-backup`; a v0.4.7
-  state also gets `<state_file>.pre26-backup` before its schema 26 step.
+- Before each change it writes a coherent, verified copy of the database to a
+  backup. It needs free space of twice the database size plus 32 MiB, and refuses
+  to start if that backup file already exists. Move an old backup aside only when
+  it is not the sole copy of earlier state.
+- The backup before the schema 29 step is `<state_file>.pre29-backup`; a v0.4.8
+  state also gets `<state_file>.pre27-backup`, and a v0.4.7 state
+  `<state_file>.pre26-backup` as well.
 - Each step commits in one transaction, so an interrupted upgrade leaves the state
-  at the schema it last committed. The schema 28 step adds columns with defaults and
-  new tables only, so its cost does not grow with the state. The log reports
-  completion and the backup path.
+  at the schema it last committed. The schema 29 step copies the whole file for its
+  backup, so its time grows with the state. A start killed during that copy copies
+  again at the next start; a start killed after the backup's rename and before the
+  commit needs the step in the
+  [upgrade guide](../guides/upgrading.md#if-the-start-was-killed-between-the-rename-and-the-commit).
+  The log reports completion and the backup path.
 
-v0.4.8 and older binaries refuse a schema 28 database with their schema-version
+v0.4.9 and older binaries refuse a schema 29 database with their schema-version
 message, so an older binary cannot be started on upgraded state without
 restoring the backup.
 
 To roll back, stop the daemon, restore the backup the upgrade wrote over the state
 file, remove the upgraded database's `-wal`/`-shm` files and reinstall the binary
-that last wrote that state: v0.4.8 for `.pre27-backup`, v0.4.7 for
-`.pre26-backup`. If you copied the backup into place instead of moving it, move the
+that last wrote that state: v0.4.9 for `.pre29-backup`, v0.4.8 for
+`.pre27-backup`, v0.4.7 for `.pre26-backup`. If you copied the backup into place instead of moving it, move the
 backup file aside before the next upgrade, because an existing backup file refuses
 the start.
 

@@ -9,6 +9,7 @@ const retry = @import("../core/native_retry.zig");
 const action_outcome = @import("../core/native_action_outcome.zig");
 const application_history = @import("../core/native_application_history.zig");
 const store = @import("store.zig");
+const budget = @import("budget.zig");
 const Error = store.Error;
 const Stmt = store.Stmt;
 const latest_schema = store.latest_schema;
@@ -16,6 +17,7 @@ pub const origin_schema: i64 = 26;
 
 pub fn Methods(comptime Store: type) type {
     return struct {
+        pub usingnamespace @import("memory_caps.zig").Methods(Store);
         pub fn enableEffects(self: *Store) Error!void {
             try self.beginWrite();
             errdefer self.rollback();
@@ -177,6 +179,25 @@ pub fn Methods(comptime Store: type) type {
             .{ .name = "effect_owner_live_update", .sql = "CREATE TRIGGER effect_owner_live_update AFTER UPDATE OF lease_kind ON effect_owners WHEN (OLD.lease_kind<>0)<>(NEW.lease_kind<>0) BEGIN UPDATE effect_owner_live SET live=live+CASE WHEN NEW.lease_kind<>0 THEN 1 ELSE -1 END WHERE id=1; END" },
             .{ .name = "effect_owner_live_delete", .sql = "CREATE TRIGGER effect_owner_live_delete AFTER DELETE ON effect_owners WHEN OLD.lease_kind<>0 BEGIN UPDATE effect_owner_live SET live=live-1 WHERE id=1; END" },
         };
+        const owed_work_triggers = [_]struct { name: []const u8, table: []const u8, sql: []const u8 }{
+            .{ .name = "effect_owed_marker_insert", .table = "confirmation_markers", .sql = "CREATE TRIGGER effect_owed_marker_insert AFTER INSERT ON confirmation_markers BEGIN UPDATE effect_owed_work SET markers=markers+1 WHERE id=1; END" },
+            .{ .name = "effect_owed_marker_delete", .table = "confirmation_markers", .sql = "CREATE TRIGGER effect_owed_marker_delete AFTER DELETE ON confirmation_markers BEGIN UPDATE effect_owed_work SET markers=markers-1 WHERE id=1; END" },
+            .{ .name = "effect_owed_intent_insert", .table = "effect_intents", .sql = "CREATE TRIGGER effect_owed_intent_insert AFTER INSERT ON effect_intents WHEN NEW.status IN(1,2) BEGIN UPDATE effect_owed_work SET unsettled_intents=unsettled_intents+1 WHERE id=1; END" },
+            .{ .name = "effect_owed_intent_update", .table = "effect_intents", .sql = "CREATE TRIGGER effect_owed_intent_update AFTER UPDATE OF status ON effect_intents WHEN (OLD.status IN(1,2))<>(NEW.status IN(1,2)) BEGIN UPDATE effect_owed_work SET unsettled_intents=unsettled_intents+CASE WHEN NEW.status IN(1,2) THEN 1 ELSE -1 END WHERE id=1; END" },
+            .{ .name = "effect_owed_intent_delete", .table = "effect_intents", .sql = "CREATE TRIGGER effect_owed_intent_delete AFTER DELETE ON effect_intents WHEN OLD.status IN(1,2) BEGIN UPDATE effect_owed_work SET unsettled_intents=unsettled_intents-1 WHERE id=1; END" },
+        };
+        fn reconcileOwedWork(self: *Store) Error!void {
+            for (owed_work_triggers) |trigger| {
+                var row = try self.statement("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?1 AND tbl_name=?2;");
+                defer row.deinit();
+                try row.text(1, trigger.name);
+                try row.text(2, trigger.table);
+                if (!try row.row() or !std.mem.eql(u8, try row.bytes(0), trigger.sql) or try row.row()) return error.LiveOwnerCounterInvalid;
+            }
+            if (try self.integer("SELECT count(*) FROM effect_owed_work;") != 1) return error.LiveOwnerCounterInvalid;
+            try self.exec("UPDATE effect_owed_work SET markers=(SELECT count(*) FROM confirmation_markers),unsettled_intents=(SELECT count(*) FROM effect_intents WHERE status IN(1,2)),reconciled=1 WHERE id=1;");
+            if (self.api.changes(self.db) != 1) return error.LiveOwnerCounterInvalid;
+        }
 
         // Windows of owners, one operation each, keep the per-row revision lookup inside the work budget at any ban count.
         const owner_scan_rows: i64 = 8192;
@@ -214,6 +235,7 @@ pub fn Methods(comptime Store: type) type {
                 if (!try row.row() or !std.mem.eql(u8, try row.bytes(0), trigger.sql) or try row.row()) return error.LiveOwnerCounterInvalid;
             }
             if (try self.integer("SELECT count(*) FROM effect_owner_live;") != 1) return error.LiveOwnerCounterInvalid;
+            if (self.schema_version >= budget.owed_work_schema) try self.reconcileOwedWork();
             const stored = try self.integer("SELECT live FROM effect_owner_live WHERE id=1;");
             const streak = try self.integer("SELECT mismatch_streak FROM effect_owner_live WHERE id=1;");
             if (streak < 0) return error.LiveOwnerCounterInvalid;
@@ -249,7 +271,7 @@ pub fn Methods(comptime Store: type) type {
             try targets.int(4, now);
             try targets.done();
         }
-        fn decodeEffect(self: *Store, row: *Stmt, installation: effects.Installation) Error!effects.Entry {
+        pub fn decodeEffect(self: *Store, row: *Stmt, installation: effects.Installation) Error!effects.Entry {
             const scope_key = try effectBlob(row, 0, 32);
             const scope = try self.decodeStoredScope(row, 1);
             if (!std.mem.eql(u8, &scope_key, &try scope.key(installation))) return error.InvalidEffect;
@@ -579,7 +601,12 @@ pub fn Methods(comptime Store: type) type {
             var replaced: ?effects.Owner = null;
             for (owners[0..count]) |owner| if (std.mem.eql(u8, owner.jail.slice(), jail.slice())) {
                 owner_revision = owner.revision;
-                if (!std.mem.eql(u8, &owner.generation, &change.generation)) return error.EffectGenerationMismatch;
+                if (!std.mem.eql(u8, &owner.generation, &change.generation)) {
+                    if (owner.lease != .absent or change.lease == .absent) return error.EffectGenerationMismatch;
+                    const admission = try self.readRetryPolicy(change.jail) orelse return error.EffectGenerationMismatch;
+                    if (!std.mem.eql(u8, &admission.generation, &change.generation)) return error.EffectGenerationMismatch;
+                    if (self.schema_version >= 28 and try self.jailRetirement(change.jail) != null) return error.EffectGenerationMismatch;
+                }
                 if (std.mem.eql(u8, &owner.decision_id, &change.decision_id)) {
                     const replay = effects.Lease.eql(owner.lease, change.lease) and owner.decided_us == change.decided_us and owner.origin == change.origin;
                     if (replay) return previous orelse error.InvalidEffect;
@@ -632,9 +659,9 @@ pub fn Methods(comptime Store: type) type {
             if (replaced) |owner| try self.retireOwnerDecisionTx(key, change.jail, owner.decision_id, now);
             {
                 var owner = try self.statement(if (self.schema_version >= origin_schema)
-                    "INSERT INTO effect_owners(scope_key,jail,generation,decision_id,revision,lease_kind,deadline_us,decided_us,origin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(scope_key,jail) DO UPDATE SET decision_id=excluded.decision_id,revision=excluded.revision,lease_kind=excluded.lease_kind,deadline_us=excluded.deadline_us,decided_us=excluded.decided_us,origin=excluded.origin;"
+                    "INSERT INTO effect_owners(scope_key,jail,generation,decision_id,revision,lease_kind,deadline_us,decided_us,origin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(scope_key,jail) DO UPDATE SET generation=excluded.generation,decision_id=excluded.decision_id,revision=excluded.revision,lease_kind=excluded.lease_kind,deadline_us=excluded.deadline_us,decided_us=excluded.decided_us,origin=excluded.origin;"
                 else
-                    "INSERT INTO effect_owners(scope_key,jail,generation,decision_id,revision,lease_kind,deadline_us,decided_us) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(scope_key,jail) DO UPDATE SET decision_id=excluded.decision_id,revision=excluded.revision,lease_kind=excluded.lease_kind,deadline_us=excluded.deadline_us,decided_us=excluded.decided_us;");
+                    "INSERT INTO effect_owners(scope_key,jail,generation,decision_id,revision,lease_kind,deadline_us,decided_us) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(scope_key,jail) DO UPDATE SET generation=excluded.generation,decision_id=excluded.decision_id,revision=excluded.revision,lease_kind=excluded.lease_kind,deadline_us=excluded.deadline_us,decided_us=excluded.decided_us;");
                 defer owner.deinit();
                 try owner.blob(1, &key);
                 try owner.text(2, change.jail);
@@ -655,7 +682,7 @@ pub fn Methods(comptime Store: type) type {
             return self.replaceEffectIntent(installation, change.scope, key, effect_revision, change.decision_id, now);
         }
         pub fn setOwner(self: *Store, change: effects.OwnerChange, clock: effects.Clock) Error!effects.Entry {
-            try self.beginWrite();
+            try self.beginIntakeWrite(budget.ban_pages);
             errdefer self.rollback();
             try self.effectSchema();
             const now = try self.effectClock(clock);
@@ -705,7 +732,10 @@ pub fn Methods(comptime Store: type) type {
             if (owner.lease == .absent) return error.StaleEffect;
             switch (change.mode) {
                 .retain => if (reserve) try self.reserveEffectRows(.{ .revisions = 1, .intents = 1, .observations = observations_per_intent }),
-                .release => try self.retireOwnerDecisionTx(key, change.jail, null, now),
+                .release => {
+                    try self.retireOwnerDecisionTx(key, change.jail, null, now);
+                    try self.closeRetryDecisionsTx(change.jail, change.scope, now);
+                },
             }
             if (try self.tableRows(.effect_owner_revisions) >= effects.max_owner_revisions) return error.EffectCapacity;
             const effect_revision = std.math.add(u64, prior.revision, 1) catch return error.EffectCapacity;
@@ -813,10 +843,23 @@ pub fn Methods(comptime Store: type) type {
             try targets.done();
         }
         const SettledIntent = struct { entry: effects.Entry, status: effects.Status, settlement: effects.Settlement };
+        pub fn effectObservationId(intent_id: effects.Hash, dispatch_us: i64, observed_us: i64, fingerprint: effects.Hash, state: ?effects.Lease, status: effects.Status) effects.Hash {
+            var stamps: [16]u8 = undefined;
+            std.mem.writeInt(i64, stamps[0..8], dispatch_us, .little);
+            std.mem.writeInt(i64, stamps[8..16], observed_us, .little);
+            var observed_state: [10]u8 = [_]u8{0} ** 10;
+            observed_state[0] = if (state) |lease| @intFromEnum(lease) else 3;
+            if (state) |lease| if (lease == .finite) {
+                std.mem.writeInt(i64, observed_state[1..9], lease.finite, .little);
+            };
+            observed_state[9] = @intFromEnum(status);
+            return effects.hashParts("fail2zig-native-effect-observation-v1", &.{ &intent_id, &stamps, &fingerprint, &observed_state });
+        }
         fn settleTx(self: *Store, token: effects.Token, dispatch_us: i64, observation: effects.Observation, clock: effects.Clock) Error!SettledIntent {
             const entry = try self.checkedEffectToken(token);
             switch (entry.status) {
                 .pending => {
+                    if (dispatch_us < entry.intent_us) return error.InvalidEffect;
                     try self.markDispatchedTx(token, dispatch_us);
                     try self.fault(.before_effect_dispatch_commit);
                 },
@@ -841,16 +884,7 @@ pub fn Methods(comptime Store: type) type {
             const matches = if (observation.state) |state| effects.Lease.eql(entry.desired, state) else false;
             const status: effects.Status = if (expired) .expired else if (!matches) .pending else if (entry.desired == .absent) .absent else .applied;
             if (previous_observed != null and observation.observed_us == previous_observed.? and status != entry.status) return error.StaleEffect;
-            var stamps: [16]u8 = undefined;
-            std.mem.writeInt(i64, stamps[0..8], dispatch_time, .little);
-            std.mem.writeInt(i64, stamps[8..16], observation.observed_us, .little);
-            var observed_state: [10]u8 = [_]u8{0} ** 10;
-            observed_state[0] = if (observation.state) |state| @intFromEnum(state) else 3;
-            if (observation.state) |state| if (state == .finite) {
-                std.mem.writeInt(i64, observed_state[1..9], state.finite, .little);
-            };
-            observed_state[9] = @intFromEnum(status);
-            const observation_id = effects.hashParts("fail2zig-native-effect-observation-v1", &.{ &token.intent_id, &stamps, &observation.fingerprint, &observed_state });
+            const observation_id = effectObservationId(token.intent_id, dispatch_time, observation.observed_us, observation.fingerprint, observation.state, status);
             {
                 var prior = try self.statement("SELECT 1 FROM effect_observations WHERE observation_id=?1;");
                 defer prior.deinit();
@@ -864,7 +898,7 @@ pub fn Methods(comptime Store: type) type {
                     try receipt.int(3, dispatch_time);
                     try receipt.int(4, observation.observed_us);
                     try receipt.blob(5, &observation.fingerprint);
-                    try receipt.int(6, observed_state[0]);
+                    try receipt.int(6, if (observation.state) |state| @intFromEnum(state) else 3);
                     if (observation.state) |state| if (state == .finite) {
                         try receipt.int(7, state.finite);
                     };
@@ -944,13 +978,14 @@ pub fn Methods(comptime Store: type) type {
                         detail_inserted = self.api.changes(self.db) == 1;
                         self.insertedRows(.confirmed_event_details, self.api.changes(self.db));
                         if (self.schema_version >= 18 and detail_inserted) {
-                            var summary = try self.statement("INSERT INTO confirmed_policy_summaries(jail,family,subject,confirmed_count,latest_confirmed_us) SELECT jail,family,subject,1,?3 FROM retry_decision_details WHERE jail=?1 AND effect_decision_id=?2 ON CONFLICT(jail,family,subject) DO UPDATE SET confirmed_count=confirmed_count+1,latest_confirmed_us=max(latest_confirmed_us,excluded.latest_confirmed_us);");
+                            var summary = try self.statement("INSERT OR REPLACE INTO confirmed_policy_summaries(jail,family,subject,confirmed_count,latest_confirmed_us) SELECT d.jail,d.family,d.subject,coalesce(s.confirmed_count,0)+1,max(coalesce(s.latest_confirmed_us,?3),?3) FROM retry_decision_details d LEFT JOIN confirmed_policy_summaries s ON s.jail=d.jail AND s.family=d.family AND s.subject=d.subject WHERE d.jail=?1 AND d.effect_decision_id=?2;");
                             defer summary.deinit();
                             try summary.text(1, owner.jail.slice());
                             try summary.blob(2, &owner.decision_id);
                             try summary.int(3, observation.observed_us);
                             try summary.done();
                             if (self.api.changes(self.db) != 1) return error.InvalidRetryState;
+                            _ = try self.evictMemoryRows(.summaries, observation.observed_us);
                         }
                     }
                     if (self.schema_version >= 13) {
@@ -1123,13 +1158,14 @@ pub fn Methods(comptime Store: type) type {
                         try self.retainDetailDeferredTx(family, subject[0..stored.len], bytes, sequence);
                     }
                 }
-                var summary = try self.statement("INSERT INTO confirmed_policy_summaries(jail,family,subject,confirmed_count,latest_confirmed_us) SELECT jail,family,subject,1,?3 FROM retry_decision_details WHERE jail=?1 AND effect_decision_id=?2 ON CONFLICT(jail,family,subject) DO UPDATE SET confirmed_count=confirmed_count+1,latest_confirmed_us=max(latest_confirmed_us,excluded.latest_confirmed_us);");
+                var summary = try self.statement("INSERT OR REPLACE INTO confirmed_policy_summaries(jail,family,subject,confirmed_count,latest_confirmed_us) SELECT d.jail,d.family,d.subject,coalesce(s.confirmed_count,0)+1,max(coalesce(s.latest_confirmed_us,?3),?3) FROM retry_decision_details d LEFT JOIN confirmed_policy_summaries s ON s.jail=d.jail AND s.family=d.family AND s.subject=d.subject WHERE d.jail=?1 AND d.effect_decision_id=?2;");
                 defer summary.deinit();
                 try summary.text(1, jail);
                 try summary.blob(2, &owner.decision_id);
                 try summary.int(3, observed_us);
                 try summary.done();
                 if (self.api.changes(self.db) > 1) return error.InvalidRetryState;
+                if (self.api.changes(self.db) == 1) _ = try self.evictMemoryRows(.summaries, observed_us);
             }
             var marker = try self.statement("INSERT INTO confirmation_markers VALUES(?1,?2,?3,?4);");
             defer marker.deinit();

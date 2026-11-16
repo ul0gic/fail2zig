@@ -945,6 +945,7 @@ pub const known_commands = [_][]const u8{
     "migrate",
     "rule-test",
     "repair-source",
+    "repair-effect-evidence",
     "support-bundle",
 };
 
@@ -1022,6 +1023,7 @@ pub const help_top =
     \\    rule-test           Evaluate a log, one line or the journal against a rule
     \\    migrate <sub>       Inspect, plan and carry out a fail2ban migration
     \\    repair-source       Acknowledge a truncated or replaced file source
+    \\    repair-effect-evidence Inspect or repair invalid absence evidence offline
     \\    support-bundle      Write a redacted diagnostic bundle for a bug report
     \\
     \\GLOBAL FLAGS:
@@ -1129,7 +1131,8 @@ pub const help_migrate =
     \\    fail2zig migrate validate --plan <plan.json> [--source-dir <dir>] [--snapshot <file>] [--output json|table]
     \\    fail2zig migrate cutover --plan <plan.json> --state-file <db> --staging-dir <dir>
     \\                             --backend nftables|ipset|iptables [--socket <path>] [--run-id <hex>] [--output json|table]
-    \\    fail2zig migrate status --plan <plan.json> --state-file <db> --staging-dir <dir> --run-id <hex> [--output json|table]
+    \\    fail2zig migrate status --plan <plan.json> --state-file <db> --staging-dir <dir>
+    \\                            --backend nftables|ipset|iptables --run-id <hex> [--output json|table]
     \\    fail2zig migrate rollback --plan <plan.json> --state-file <db> --staging-dir <dir> --backend <b> --run-id <hex>
     \\                              [--source-verified] [--socket <path>] [--output json|table]
     \\
@@ -1259,9 +1262,11 @@ pub const help_jails =
     \\    ok                      Reading normally
     \\    missing (FileNotFound)  The log file is absent; reading resumes when it
     \\                            appears, and protection is not affected
-    \\    waiting (<cause>)       The jail waits for room (RetryCapacity or
-    \\                            ReserveBackpressure); nothing is lost and it
-    \\                            continues as room frees up
+    \\    waiting (<cause>)       The jail waits for room (RetryCapacity,
+    \\                            ReserveBackpressure, RetryEligibilityPending, or
+    \\                            StorageCapacity when the state file is at its
+    \\                            capacity); nothing is lost and it continues as
+    \\                            room frees up
     \\    paused (<cause>)        The source stopped until repaired; status prints
     \\                            the repair command
     \\    broken (<cause>)        The source cannot be read; the cause names why
@@ -1335,6 +1340,31 @@ pub const help_jail =
     \\
     \\Manage bans with 'fail2zig list --jail <name>', 'fail2zig ban <ip> --jail <name>',
     \\or 'fail2zig unban <ip> --jail <name>'.
+    \\
+;
+
+pub const help_repair_effect_evidence =
+    \\fail2zig repair-effect-evidence — inspect or repair invalid absence evidence
+    \\
+    \\Usage:
+    \\    fail2zig repair-effect-evidence [--config <path>] [--check | --apply]
+    \\
+    \\Stop the daemon and run as its state-file owner. Check mode is the default and
+    \\does not modify effect evidence. The configured state must already use the
+    \\current schema; this command does not upgrade or create state.
+    \\
+    \\Apply accepts only an absence settlement whose dispatch and observation times
+    \\are equal and earlier than its intent, with matching observation receipts and
+    \\valid owner facts. Other damage is refused. Before any repair, a private,
+    \\verified backup is written beside the state file and its path and hash printed.
+    \\The backup requires twice the state size plus 32 MiB free, like schema backups.
+    \\
+    \\The invalid evidence is revoked in bounded transactions; affected intents become
+    \\pending. Owner facts, bans, source checkpoints, receipts and history are kept.
+    \\Start the daemon to obtain fresh kernel evidence and verify protection. This
+    \\command does not touch the firewall. Preserve the backup; it contains the
+    \\pre-repair state, including its invalid evidence. Interrupted repair can be
+    \\repeated; remaining eligible intents are repaired and completed ones skipped.
     \\
 ;
 
@@ -1429,7 +1459,7 @@ pub const help_support_bundle =
     \\effective configuration with its file and loaded SHA-256, state file page and
     \\per-table sizes, kernel readback counts, memory, host basics, and the last <n>
     \\(default 200, at most 2000) warnings and errors from the daemon log into one JSON
-    \\file. Run it as the daemon's user; sections it cannot read record their error.
+    \\file. Run it as root; sections it cannot read record their error.
     \\
     \\Addresses become v4-<hash> or v6-<hash>, stable within one bundle only; loopback
     \\and unspecified addresses are kept. --include-addresses keeps every address.
@@ -1461,6 +1491,7 @@ pub fn helpFor(t: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, t, "jail")) return help_jail;
     if (std.mem.eql(u8, t, "ignore")) return help_ignore;
     if (std.mem.eql(u8, t, "repair-source")) return help_repair_source;
+    if (std.mem.eql(u8, t, "repair-effect-evidence")) return help_repair_effect_evidence;
     if (std.mem.eql(u8, t, "support-bundle")) return help_support_bundle;
     return null;
 }

@@ -1053,7 +1053,7 @@ pub fn Methods(comptime Store: type) type {
             return @intCast(revision_value);
         }
 
-        pub const RekeyReport = struct { retry_rows: u32, pending_receipts: u32, manifests: u32, cursors: u32, guards: u32 = 0 };
+        pub const RekeyReport = struct { retry_rows: u32, pending_receipts: u32, manifests: u32, cursors: u32 };
         pub const CursorRekey = union(enum) { none, file: struct { legacy: [32]u8, planned: [32]u8 }, journal };
 
         // One-time startup rewrite of v0.4.6 rows; a single statement over a large records table needs more than the ordinary statement budget.
@@ -1148,16 +1148,14 @@ pub fn Methods(comptime Store: type) type {
             return report;
         }
 
-        const GenerationStatement = struct { sql: [:0]const u8, counted: enum { retry, pending, manifests, cursors, none } };
+        const GenerationStatement = struct { sql: [:0]const u8, counted: enum { pending, manifests, cursors, none } };
         const generation_statements = [_]GenerationStatement{
-            .{ .sql = "UPDATE retry_retired SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .retry },
             .{ .sql = "UPDATE pending_receipts SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .pending },
             .{ .sql = "UPDATE records SET source_generation=?3 WHERE jail=?1 AND source_generation=?2;", .counted = .none },
             .{ .sql = "UPDATE records SET receipt_generation=?3 WHERE jail=?1 AND receipt_generation=?2;", .counted = .none },
             .{ .sql = "UPDATE checkpoints SET payload=CAST(substr(CAST(payload AS BLOB),1,8)||?3||substr(CAST(payload AS BLOB),41) AS BLOB) WHERE jail=?1 AND substr(CAST(payload AS BLOB),1,4)=CAST('F2NT' AS BLOB) AND substr(CAST(payload AS BLOB),9,32)=?2;", .counted = .none },
             .{ .sql = "UPDATE checkpoints SET payload=CAST(substr(CAST(payload AS BLOB),1,6)||?3||substr(CAST(payload AS BLOB),39) AS BLOB) WHERE jail=?1 AND substr(CAST(payload AS BLOB),1,4)=CAST('F2JC' AS BLOB) AND substr(CAST(payload AS BLOB),7,32)=?2;", .counted = .none },
             .{ .sql = "UPDATE source_maintenance SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .none },
-            .{ .sql = "UPDATE replay_guards SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .none },
             .{ .sql = "UPDATE consumer_checkpoints SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .none },
             .{ .sql = "UPDATE consumer_requirements SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .none },
             .{ .sql = "UPDATE source_cursors SET cursor=CAST(substr(CAST(cursor AS BLOB),1,6)||?3||substr(CAST(cursor AS BLOB),39) AS BLOB) WHERE jail=?1 AND substr(CAST(cursor AS BLOB),1,4)=CAST('F2JC' AS BLOB) AND substr(CAST(cursor AS BLOB),7,32)=?2;", .counted = .cursors },
@@ -1168,7 +1166,6 @@ pub fn Methods(comptime Store: type) type {
             for (generation_statements) |entry| {
                 const rows = try self.rekeyRows(entry.sql, jail, old, new);
                 const total: *u32 = switch (entry.counted) {
-                    .retry => &report.retry_rows,
                     .pending => &report.pending_receipts,
                     .manifests => &report.manifests,
                     .cursors => &report.cursors,
@@ -1176,44 +1173,12 @@ pub fn Methods(comptime Store: type) type {
                 };
                 total.* = std.math.add(u32, total.*, rows) catch return error.StorageLimit;
             }
-            report.guards = try self.restoreGuardKeys(jail, new);
         }
 
-        fn restoreGuardKeys(self: *Store, jail: []const u8, generation: [32]u8) Error!u32 {
-            var guards = try self.statement("SELECT g.source,g.source_sequence,g.identity_key,r.occurrence,r.raw_hash,r.cursor,r.receipt_us,r.receipt_generation FROM replay_guards g JOIN source_maintenance m ON m.jail=g.jail AND m.source=g.source AND m.generation=g.generation JOIN records r ON r.jail=g.jail AND r.source=g.source AND r.source_generation=g.generation AND r.source_sequence=g.source_sequence WHERE g.jail=?1 AND g.generation=?2 AND g.source_sequence>m.sweep_sequence;");
-            defer guards.deinit();
-            try guards.text(1, jail);
-            try guards.blob(2, &generation);
-            var restored: u32 = 0;
-            while (try guards.row()) {
-                if (guards.store.api.column_type(guards.ptr, 3) != 3 or guards.store.api.column_type(guards.ptr, 5) != 4) return error.InvalidMaintenanceState;
-                if (try guards.optionalSigned(6) != null) {
-                    if (!std.mem.eql(u8, &try Store.effectBlob(&guards, 7, 32), &generation)) return error.InvalidMaintenanceState;
-                } else if (guards.store.api.column_type(guards.ptr, 7) != 5) return error.InvalidMaintenanceState;
-                const source = try guards.boundedBytes(0, Limits.source_bytes);
-                const sequence = try guards.signed(1);
-                const identity = store.ReceiptIdentity{ .jail = jail, .source = source, .generation = generation, .occurrence = try guards.boundedBytes(3, 16384), .raw_hash = try Store.effectBlob(&guards, 4, 32), .cursor = try guards.boundedBytes(5, Limits.cursor_bytes) };
-                try Store.validateReceiptIdentity(identity);
-                const identity_key = Store.identityGuardKey(identity);
-                if (std.mem.eql(u8, &try Store.effectBlob(&guards, 2, 32), &identity_key)) continue;
-                var update = try self.statement("UPDATE replay_guards SET identity_key=?5 WHERE jail=?1 AND source=?2 AND generation=?3 AND source_sequence=?4;");
-                defer update.deinit();
-                try update.text(1, jail);
-                try update.text(2, source);
-                try update.blob(3, &generation);
-                try update.int(4, sequence);
-                try update.blob(5, &identity_key);
-                try update.done();
-                if (self.api.changes(self.db) != 1) return error.InvalidMaintenanceState;
-                restored = std.math.add(u32, restored, 1) catch return error.StorageLimit;
-            }
-            return restored;
-        }
-
-        pub const GenerationRepair = struct { receipts: u32, retired: u32, cursors: u32, guards: u32 };
+        pub const GenerationRepair = struct { receipts: u32, cursors: u32 };
 
         pub fn completeGenerationRekey(self: *Store, jail: []const u8) Error!GenerationRepair {
-            var repair = GenerationRepair{ .receipts = 0, .retired = 0, .cursors = 0, .guards = 0 };
+            var repair = GenerationRepair{ .receipts = 0, .cursors = 0 };
             if (jail.len == 0 or jail.len > 64 or std.mem.indexOfScalar(u8, jail, 0) != null) return error.InvalidRecord;
             try self.beginAdmissionWrite();
             errdefer self.rollback();
@@ -1236,14 +1201,6 @@ pub fn Methods(comptime Store: type) type {
                 repair.receipts = std.math.cast(u32, self.api.changes(self.db)) orelse return error.StorageLimit;
             }
             {
-                var update = try self.statement("UPDATE retry_retired SET generation=?2 WHERE jail=?1 AND generation IS NOT ?2;");
-                defer update.deinit();
-                try update.text(1, jail);
-                try update.blob(2, &bound.generation);
-                try update.done();
-                repair.retired = std.math.cast(u32, self.api.changes(self.db)) orelse return error.StorageLimit;
-            }
-            {
                 var update = try self.statement("UPDATE source_cursors SET cursor=CAST(substr(CAST(cursor AS BLOB),1,6)||?2||substr(CAST(cursor AS BLOB),39) AS BLOB) WHERE jail=?1 AND substr(CAST(cursor AS BLOB),1,4)=CAST('F2JC' AS BLOB) AND substr(CAST(cursor AS BLOB),7,32) IS NOT ?2;");
                 defer update.deinit();
                 try update.text(1, jail);
@@ -1251,7 +1208,6 @@ pub fn Methods(comptime Store: type) type {
                 try update.done();
                 repair.cursors = std.math.cast(u32, self.api.changes(self.db)) orelse return error.StorageLimit;
             }
-            repair.guards = try self.restoreGuardKeys(jail, bound.generation);
             try self.commitEffectTransaction(false);
             return repair;
         }
@@ -1692,6 +1648,7 @@ pub fn Methods(comptime Store: type) type {
                     try saved.int(5, last_processed_us);
                     try saved.int(6, signed_decisions);
                     try saved.done();
+                    _ = try self.evictMemoryRows(.retired, now_us);
                 }
                 var remove = try self.statement("DELETE FROM retry_states WHERE jail=?1 AND family=?2 AND subject=?3;");
                 defer remove.deinit();

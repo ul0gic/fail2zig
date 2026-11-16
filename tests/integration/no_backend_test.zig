@@ -711,6 +711,7 @@ test "integration: log-only backend fallback preserves retry generation across s
         const first = try LiveDaemon.start(a, s.config_path, &env);
         defer first.destroy(a);
         try first.waitForSocket(s.socket_path, startup_timeout_ms);
+        try testing.expect(first.waitForStderr("native: ready", log_wait_ms));
         std.time.sleep(settle_ms * std.time.ns_per_ms);
         for (attacker_lines) |line| try s.appendLogLine(line);
         try testing.expect(first.waitForStderr("would-ban: jail='sshd' ip=192.0.2.42", log_wait_ms));

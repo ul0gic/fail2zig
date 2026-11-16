@@ -26,8 +26,9 @@ File records are committed in groups. The records that one poll turn of one file
 yields, up to 64, are written in one write transaction (`BEGIN IMMEDIATE`, one savepoint
 per record, one `COMMIT`) with one `fsync`. The batch is also bounded by the source's
 workspace: about 24 records of the maximum 2,048-byte line, or 63 typical lines. Each
-record still gets its receipt, replay guard and retry step inside that transaction, and
-the source is acknowledged for those records only after the `COMMIT` returns, so a
+record still gets its receipt and retry step inside that transaction, the same
+transaction deletes the records of that source's previous frame that nothing still
+needs, and the source is acknowledged for those records only after the `COMMIT` returns, so a
 `kill -9` at any point never loses or re-reads an acknowledged record. There is no
 latency floor: a lone record commits in its own turn without waiting for company. A
 refused record is rolled back to its own savepoint, alone; the records before it commit,
@@ -236,8 +237,8 @@ removes jails last, so a failed reload never has to recreate a removed jail. An 
 is built by the same per-jail construction as at start. A removed jail is fenced from
 new work by a durable retirement intent. Bounded Store transactions release its owners,
 one revision each, and retire its retry admission, private consumer state, timed entries
-and operational record groups. Confirmed history, replay guards, source-order headers
-and saved runtime ignores survive. Elements with no remaining owner are withdrawn from
+and operational record groups. Confirmed history, source-order headers and saved
+runtime ignores survive. Elements with no remaining owner are withdrawn from
 the shared kernel sets, which stay in place. Retirement finishes only after verified
 kernel absence and completion of the Store cleanup; the daemon then logs
 `native: jail=<name> removed: <n> bans lifted`. A start that finds state for a jail the
@@ -343,26 +344,82 @@ and descriptor budgets. SQLite uses a separate bounded heap (64 MiB, counted in 
 figure) with a 32 MiB page cache inside it and a page limit; required history and recovery anchors
 remain pinned.
 
-Startup sets `max_page_count` to 1 GiB divided by the page size, so the state file
-cannot grow past 1 GiB (262,144 pages of 4 KiB), and a state file already past that
-size is refused with `StorageLimit`. A settled ban is kept small so 65,536 live bans and
-a day of history fit with headroom: once an intent is applied or expired only its latest
-observation is kept, and the bounded maintenance walk clears the evidence text of retry
-decisions and confirmed events whose ban ended more than `history_retention` ago. The
-target is at most 4 KiB of state file per live ban. `status` and `/metrics` report the
-file's bytes and pages. A commit that fails because the file is full
-(SQLite "database or disk is full", `StorageFull`) is a retryable storage failure.
-Ingestion pauses and the daemon retries after a delay that starts at 1 s and doubles
-with each recovery attempt up to 30 s. A recovery attempt moves through storage, state,
-ownership and sources, and storage returns to healthy when the last step completes; a
-commit that is still refused pauses it again. Rules already in the kernel stay in place
-while storage is paused, and `fail2zig status` shows the storage phase. The daemon runs
-no VACUUM and does not enable `auto_vacuum`, so the file does not shrink. Committed receipts are guarded in sequence order and deleted once nothing holds
-them; a receipt held by a live ban, an open retry window or an unsettled action is set aside
-and does not block the receipts behind it, and a bounded pass deletes it once released. Rows
-removed by that cleanup and by the retention described above free pages for reuse inside the file, with
-`history_retention` (seconds, default 86400) as the retention setting, and an operator
-should watch the state file size.
+The state file has two page limits. The capacity is 262,144 used pages (1 GiB of
+4 KiB pages), where used pages are the file's pages minus the free pages SQLite keeps
+for reuse. SQLite's own limit, `max_page_count`, is 16,384 pages above it, 278,528
+pages, so the file can reach 1 GiB plus 64 MiB on disk, besides its WAL. Startup refuses
+a file already past SQLite's limit with `StorageLimit`; a file at or past the capacity
+starts. The daemon runs no VACUUM and does not enable `auto_vacuum`, so the file does
+not shrink; rows removed by cleanup free pages for reuse inside it. `status` and
+`/metrics` report the file's bytes, its allocated pages and its used pages.
+
+Every write is admitted by its class. New work is intake: a record frame, the start
+of a recidive history event, a manual ban, a `banip` addition, a new reload, `ignore
+add` and migration activation. Intake is admitted only while used pages, plus the
+pages already owed to work admitted earlier, plus a fixed bound for the operation fit
+in the capacity. Owed pages are counted for live bans, bans not yet confirmed in the
+kernel and unsettled actions, from counters the state file keeps. Work already
+promised (settlement, expiry, unban, the outcome of an admin command, an accepted
+reload, the history checkpoint, startup) and work that frees space (deletes,
+eviction, shedding) are not refused at the capacity; they are bounded by SQLite's
+limit.
+
+When intake reaches the capacity, sources wait with the cause `StorageCapacity` and
+keep their position without pausing. A manual ban, `ignore add` and a new reload are
+rejected with that cause, and `banip` applies its removals and keeps its additions
+pending. The daemon stays ready: rules already in the kernel stay enforced, expiry and
+unban are recorded, and cleanup keeps running. While used plus owed pages exceed the
+capacity, the daemon gives up consumed material in this order: spent bookkeeping,
+the detail rows of retry decisions and confirmed events, consumed history events, and
+per-address escalation memory. It never gives up live bans, counted attempts, pending
+work, checkpoints, confirmed events a consumer has not read, or recidive records above
+the history checkpoint. Rows given up are counted by kind and logged. Intake reopens
+by itself once used plus owed pages fall 1,024 pages below the capacity. A daemon
+started on a file at the capacity starts with intake waiting.
+
+The page budget does not cover the filesystem. When the filesystem itself is full,
+SQLite reports `StorageFull`, a retryable storage failure: ingestion pauses and the
+daemon retries after a delay that starts at 1 s and doubles with each recovery attempt
+up to 30 s. A recovery attempt moves through storage, state, ownership and sources,
+and storage returns to healthy when the last step completes; a commit that is still
+refused pauses it again. Rules already in the kernel stay in place while storage is
+paused, and `fail2zig status` shows the storage phase and its cause. A start on a full
+filesystem refuses.
+
+A record stays in the state file only while something needs it: it is the latest
+record of its source, it triggered a decision whose ban is live or not yet settled, an
+action intent names it, or it is a recidive record the history consumer has not yet
+checkpointed. The transaction that admits a source's next frame deletes the rest of
+that source's previous frame, and a periodic pass of at most 256 record groups per
+turn deletes what time releases. A settled ban is kept small: once an intent is
+applied or expired only its latest observation is kept, and the bounded maintenance
+walk clears the evidence text of retry decisions and confirmed events whose ban ended
+more than `history_retention` ago (seconds, default 86400).
+
+Per-address memory is capped. The retired retry rows (`retry_retired`) and the
+escalation summaries (`confirmed_policy_summaries`) hold at most 65,536 rows each. A
+write above the cap forgets the least recently written address that has no live ban
+and no surviving decision; admission never waits for a memory row. Evictions are
+counted and logged at most once a minute per table. An evicted address that returns is
+treated as a first offender, also with `bantime_increment_decay = 0`, which disables
+forgetting by time only.
+
+Known limits of these boundaries:
+
+- Intake waits before the file is physically full, by the owed pages plus the
+  operation's bound, and reopens only 1,024 pages below the capacity.
+- Under page pressure, history, evidence and escalation memory can be given up
+  earlier than `history_retention` and the memory caps would otherwise keep them.
+- A full filesystem, the WAL and SQLite's temporary files are outside the page
+  budget.
+- The daemon keeps no table of lines already read; the committed source checkpoint
+  is the only protection against reading a line twice. A line presented again
+  after its record was deleted, for example after a manual edit of the state or a
+  defect that moves a source position backwards, counts again.
+- The first start of 0.4.10 on an older state copies the whole file once for a
+  backup, needs free disk of twice the file plus 32 MiB, and after the upgrade the
+  only way back to 0.4.9 is that backup; see the
+  [upgrade guide](guides/upgrading.md).
 
 The CLI inspection path uses an optional observation cache owned by the
 coordinator and borrowed by the effect manager. Existing complete readbacks publish

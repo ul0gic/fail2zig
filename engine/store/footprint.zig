@@ -2,6 +2,7 @@
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
 const store = @import("store.zig");
+const budget = @import("budget.zig");
 const Error = store.Error;
 
 pub const max_tables = 256;
@@ -16,7 +17,7 @@ pub const Footprint = struct {
     tables: []const TableFootprint,
 };
 
-pub const StateFileFootprint = struct { bytes: u64, pages: u64, max_pages: u64, page_size: u32 };
+pub const StateFileFootprint = struct { bytes: u64, pages: u64, used_pages: u64, max_pages: u64, page_size: u32, capacity_pages: u64, owed_pages: ?u64 };
 
 fn unsigned(value: i64) Error!u64 {
     return std.math.cast(u64, value) orelse error.DatabaseFailure;
@@ -30,15 +31,21 @@ fn plainIdentifier(name: []const u8) bool {
 
 pub fn Methods(comptime Store: type) type {
     return struct {
+        pub fn usedPages(self: *Store) Error!u64 {
+            const pages = try unsigned(try self.integer("PRAGMA page_count;"));
+            return std.math.sub(u64, pages, try unsigned(try self.integer("PRAGMA freelist_count;"))) catch error.DatabaseFailure;
+        }
         pub fn stateFileFootprint(self: *Store) Error!StateFileFootprint {
             try self.beginRead();
             errdefer self.rollback();
             const page_size = std.math.cast(u32, try self.integer("PRAGMA page_size;")) orelse return error.DatabaseFailure;
             const pages = try unsigned(try self.integer("PRAGMA page_count;"));
+            const used_pages = try self.usedPages();
             const max_pages = try unsigned(try self.integer("PRAGMA max_page_count;"));
+            const owed_pages = if (self.schema_version >= budget.owed_work_schema) try self.owedPages() else null;
             try self.commitTransaction();
             const bytes = std.math.mul(u64, pages, page_size) catch return error.DatabaseFailure;
-            return .{ .bytes = bytes, .pages = pages, .max_pages = max_pages, .page_size = page_size };
+            return .{ .bytes = bytes, .pages = pages, .used_pages = used_pages, .max_pages = max_pages, .page_size = page_size, .capacity_pages = budget.capacity_pages, .owed_pages = owed_pages };
         }
         pub fn footprint(self: *Store, arena: std.mem.Allocator) Error!Footprint {
             try self.beginRead();

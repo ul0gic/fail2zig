@@ -38,6 +38,9 @@ pub fn Methods(comptime Store: type) type {
                 _ = try self.readReceiptClock();
                 if (schema == 25) try self.enableParityState(options.migration, null);
                 try self.enableCurrentState(options.migration);
+                try self.enableOwedWork(options.migration);
+            } else if (schema == 28) {
+                try self.enableOwedWork(options.migration);
             } else if (schema != latest_schema) {
                 try self.enableLoadRepair(options.migration, options.progress);
                 try self.enableReceipts(options.maximum_pending);
@@ -63,6 +66,7 @@ pub fn Methods(comptime Store: type) type {
                 try self.enableLoadRepair(options.migration, options.progress);
                 try self.enableRuntimeState(options.migration, !self.load_repair_migrated);
                 try self.enableCurrentState(options.migration);
+                try self.enableOwedWork(options.migration);
             }
             try self.requireCurrentSchemaReady();
             if (schema != 25 and schema != 26 and schema != 27) {
@@ -94,7 +98,7 @@ pub fn Methods(comptime Store: type) type {
                 try seed.int(1, history_max_matches);
                 try seed.done();
             }
-            try self.exec("PRAGMA application_id=1177705009; PRAGMA user_version=28;");
+            try self.exec("PRAGMA application_id=1177705009; PRAGMA user_version=29;");
             try self.fault(.before_migration_schema_commit);
             try self.commitTransaction();
             self.schema_version = latest_schema;
@@ -114,8 +118,28 @@ pub fn Methods(comptime Store: type) type {
             try self.exec("PRAGMA user_version=28;");
             try self.fault(.before_migration_schema_commit);
             try self.commitTransaction();
-            self.schema_version = latest_schema;
+            self.schema_version = 28;
             std.log.info("native storage: schema {d}->28 migration complete: bounded jail retirement enabled; verified schema-{d} backup {s}", .{ entry_schema, entry_schema, backup.path });
+        }
+
+        fn enableOwedWork(self: *Store, options: store.load_repair.Options) Error!void {
+            if (try self.integer("PRAGMA user_version;") != 28) return error.UnsupportedSchema;
+            var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            var partial_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const backup = try self.prepareSchemaBackup(options, .pre29, &path_buffer, &partial_buffer);
+            errdefer {
+                std.fs.cwd().deleteFileZ(backup.partial_path) catch {};
+                if (!self.reopen_required) std.fs.cwd().deleteFileZ(backup.path) catch {};
+            }
+            try self.beginWrite();
+            errdefer self.rollback();
+            if (try self.integer("PRAGMA user_version;") != 28) return error.UnsupportedSchema;
+            try self.exec(current_schema.owed_work_upgrade_ddl);
+            try self.fault(.before_migration_schema_commit);
+            try store.load_repair.publishSchemaBackup(backup);
+            try self.commitTransaction();
+            self.schema_version = latest_schema;
+            std.log.info("native storage: schema 28->29 migration complete: replay guards removed; owed-work counters await reconciliation; verified schema-28 backup {s}", .{backup.path});
         }
 
         pub fn chainSchema(self: *Store) Error!i64 {

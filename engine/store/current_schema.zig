@@ -59,7 +59,6 @@ pub const ddl =
     \\CHECK(((kind<=3 OR kind>=7) AND pattern IS NULL AND pattern_index IS NULL AND family IS NULL AND subject IS NULL) OR (kind BETWEEN 4 AND 6 AND pattern IS NOT NULL AND pattern_index IS NOT NULL AND family IS NOT NULL AND subject IS NOT NULL)),
     \\PRIMARY KEY(jail,source,occurrence,ordinal),FOREIGN KEY(jail,source,occurrence) REFERENCES records(jail,source,occurrence));
     \\CREATE TABLE records(jail TEXT NOT NULL,source TEXT NOT NULL,occurrence TEXT NOT NULL,raw_hash BLOB NOT NULL CHECK(length(raw_hash)=32),cursor BLOB NOT NULL,event_time BLOB CHECK(event_time IS NULL OR length(event_time)=8),timestamp_us TEXT,disposition TEXT NOT NULL,receipt_us INTEGER CHECK(receipt_us IS NULL OR typeof(receipt_us)='integer'),receipt_generation BLOB CHECK((receipt_generation IS NULL AND receipt_us IS NULL) OR (receipt_generation IS NOT NULL AND length(receipt_generation)=32 AND receipt_us IS NOT NULL)),native_time_kind INTEGER CHECK(native_time_kind IS NULL OR (typeof(native_time_kind)='integer' AND native_time_kind BETWEEN 1 AND 11 AND receipt_us IS NOT NULL)),original_us INTEGER CHECK(original_us IS NULL OR (typeof(original_us)='integer' AND native_time_kind IS NOT NULL)),effective_us INTEGER CHECK(effective_us IS NULL OR (typeof(effective_us)='integer' AND native_time_kind BETWEEN 1 AND 6)),inferred_year INTEGER CHECK(inferred_year IS NULL OR (typeof(inferred_year)='integer' AND inferred_year BETWEEN 1 AND 9999 AND original_us IS NOT NULL AND native_time_kind IN (1,3,4,6,11))),zone_digest BLOB CHECK(zone_digest IS NULL OR (typeof(zone_digest)='blob' AND length(zone_digest)=32 AND native_time_kind IS NOT NULL)),zone_offset_seconds INTEGER CHECK(zone_offset_seconds IS NULL OR (typeof(zone_offset_seconds)='integer' AND zone_offset_seconds BETWEEN -2147483647 AND 2147483647)),zone_ambiguity INTEGER CHECK(zone_ambiguity IS NULL OR (typeof(zone_ambiguity)='integer' AND zone_ambiguity BETWEEN 0 AND 2)),zone_fold INTEGER CHECK(zone_fold IS NULL OR (typeof(zone_fold)='integer' AND zone_fold BETWEEN 0 AND 1)),source_generation BLOB,source_sequence INTEGER,PRIMARY KEY(jail,source,occurrence));
-    \\CREATE TABLE replay_guards(jail TEXT NOT NULL,source TEXT NOT NULL,generation BLOB NOT NULL CHECK(typeof(generation)='blob' AND length(generation)=32),occurrence_key BLOB NOT NULL CHECK(typeof(occurrence_key)='blob' AND length(occurrence_key)=32),identity_key BLOB NOT NULL CHECK(typeof(identity_key)='blob' AND length(identity_key)=32),receipt_us INTEGER CHECK(receipt_us IS NULL OR typeof(receipt_us)='integer'),source_sequence INTEGER NOT NULL CHECK(typeof(source_sequence)='integer' AND source_sequence>0),PRIMARY KEY(jail,source,generation,occurrence_key),UNIQUE(jail,source,occurrence_key),UNIQUE(jail,source,generation,source_sequence),FOREIGN KEY(jail,source,generation) REFERENCES source_maintenance(jail,source,generation));
     \\CREATE TABLE retained_subject_summaries(family INTEGER NOT NULL CHECK(family IN(4,6)),subject BLOB NOT NULL CHECK(typeof(subject)='blob' AND length(subject)=CASE family WHEN 4 THEN 4 ELSE 16 END),detail_count INTEGER NOT NULL CHECK(typeof(detail_count)='integer' AND detail_count>0),evidence_bytes INTEGER NOT NULL CHECK(typeof(evidence_bytes)='integer' AND evidence_bytes>=0),earliest_sequence INTEGER NOT NULL CHECK(typeof(earliest_sequence)='integer' AND earliest_sequence>0),earliest_evidence_sequence INTEGER CHECK(earliest_evidence_sequence IS NULL OR earliest_evidence_sequence>=earliest_sequence),evaluated_generation INTEGER NOT NULL CHECK(typeof(evaluated_generation)='integer' AND evaluated_generation>=0),candidate_sequence INTEGER CHECK(candidate_sequence IS NULL OR candidate_sequence>=earliest_sequence),PRIMARY KEY(family,subject));
     \\CREATE TABLE retention_policy(id INTEGER PRIMARY KEY CHECK(id=1),generation INTEGER NOT NULL CHECK(typeof(generation)='integer' AND generation>0),max_matches INTEGER NOT NULL CHECK(typeof(max_matches)='integer' AND max_matches BETWEEN 0 AND 1024),state INTEGER NOT NULL CHECK(state IN(1,2)),sweep_cursor INTEGER NOT NULL CHECK(typeof(sweep_cursor)='integer' AND sweep_cursor>=0),retry_evidence_sweep_cursor INTEGER DEFAULT 0,history_subject_sweep_cursor INTEGER DEFAULT 0);
     \\CREATE TABLE retry_clock(id INTEGER PRIMARY KEY CHECK(id=1),floor_us INTEGER CHECK(floor_us IS NULL OR typeof(floor_us)='integer'));
@@ -121,7 +120,7 @@ pub const ddl =
     \\CREATE TRIGGER records_source_order_insert BEFORE INSERT ON records WHEN NOT ((NEW.source_generation IS NULL AND NEW.source_sequence IS NULL) OR (typeof(NEW.source_generation)='blob' AND length(NEW.source_generation)=32 AND typeof(NEW.source_sequence)='integer' AND NEW.source_sequence>0)) BEGIN SELECT RAISE(ABORT,'invalid source order'); END;
     \\CREATE TRIGGER records_source_order_update BEFORE UPDATE OF source_generation,source_sequence ON records WHEN NOT ((NEW.source_generation IS NULL AND NEW.source_sequence IS NULL) OR (typeof(NEW.source_generation)='blob' AND length(NEW.source_generation)=32 AND typeof(NEW.source_sequence)='integer' AND NEW.source_sequence>0)) BEGIN SELECT RAISE(ABORT,'invalid source order'); END;
     \\CREATE TRIGGER zone_provenance_update BEFORE UPDATE OF zone_digest,zone_offset_seconds,zone_ambiguity,zone_fold ON records WHEN NOT ((NEW.zone_digest IS NULL AND NEW.zone_offset_seconds IS NULL AND NEW.zone_ambiguity IS NULL AND NEW.zone_fold IS NULL) OR (NEW.zone_digest IS NOT NULL AND NEW.zone_offset_seconds IS NOT NULL AND NEW.zone_ambiguity IS NOT NULL AND NEW.zone_fold IS NOT NULL)) BEGIN SELECT RAISE(ABORT,'incomplete zone provenance'); END;
-++ jail_limits_ddl ++ jail_retirements_ddl;
+++ jail_limits_ddl ++ jail_retirements_ddl ++ owed_work_ddl;
 
 pub const seeds =
     \\INSERT INTO receipt_clock VALUES(1,NULL);
@@ -134,6 +133,7 @@ pub const seeds =
     \\INSERT INTO policy_summary_clock VALUES(1,1);
     \\INSERT INTO admin_revision VALUES(1,0);
     \\INSERT INTO effect_owner_live VALUES(1,0,0);
+    \\INSERT INTO effect_owed_work VALUES(1,0,0,1);
 ;
 
 pub const retention_seed = "INSERT INTO retention_policy(id,generation,max_matches,state,sweep_cursor,retry_evidence_sweep_cursor,history_subject_sweep_cursor) VALUES(1,1,?1,2,0,0,0);";
@@ -147,3 +147,17 @@ pub const upgrade_ddl = jail_limits_ddl ++
 pub const jail_retirements_ddl =
     \\CREATE TABLE jail_retirements(jail TEXT NOT NULL PRIMARY KEY CHECK(typeof(jail)='text' AND length(CAST(jail AS BLOB)) BETWEEN 1 AND 64 AND instr(jail,char(0))=0),keep_ignore_deadlines INTEGER NOT NULL CHECK(typeof(keep_ignore_deadlines)='integer' AND keep_ignore_deadlines IN(0,1))) WITHOUT ROWID;
 ;
+
+// Counts may be negative until reconciled: the upgrade starts them at zero over populated tables.
+pub const owed_work_ddl =
+    \\CREATE TABLE effect_owed_work(id INTEGER PRIMARY KEY CHECK(id=1),markers INTEGER NOT NULL CHECK(typeof(markers)='integer'),unsettled_intents INTEGER NOT NULL CHECK(typeof(unsettled_intents)='integer'),reconciled INTEGER NOT NULL CHECK(reconciled IN(0,1)));
+    \\CREATE TRIGGER effect_owed_marker_insert AFTER INSERT ON confirmation_markers BEGIN UPDATE effect_owed_work SET markers=markers+1 WHERE id=1; END;
+    \\CREATE TRIGGER effect_owed_marker_delete AFTER DELETE ON confirmation_markers BEGIN UPDATE effect_owed_work SET markers=markers-1 WHERE id=1; END;
+    \\CREATE TRIGGER effect_owed_intent_insert AFTER INSERT ON effect_intents WHEN NEW.status IN(1,2) BEGIN UPDATE effect_owed_work SET unsettled_intents=unsettled_intents+1 WHERE id=1; END;
+    \\CREATE TRIGGER effect_owed_intent_update AFTER UPDATE OF status ON effect_intents WHEN (OLD.status IN(1,2))<>(NEW.status IN(1,2)) BEGIN UPDATE effect_owed_work SET unsettled_intents=unsettled_intents+CASE WHEN NEW.status IN(1,2) THEN 1 ELSE -1 END WHERE id=1; END;
+    \\CREATE TRIGGER effect_owed_intent_delete AFTER DELETE ON effect_intents WHEN OLD.status IN(1,2) BEGIN UPDATE effect_owed_work SET unsettled_intents=unsettled_intents-1 WHERE id=1; END;
+;
+
+pub const owed_work_upgrade_ddl = "DROP TABLE replay_guards;" ++ owed_work_ddl ++
+    "INSERT INTO effect_owed_work VALUES(1,0,0,0);" ++
+    "PRAGMA user_version=29;";

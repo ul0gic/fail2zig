@@ -4,7 +4,7 @@ description: 'The HTTP endpoints, every Prometheus metric, the health and status
 sidebar_position: 5
 category: Reference
 audience: operator
-last_verified: 2026-11-15
+last_verified: 2026-11-16
 ---
 
 fail2zig exposes two read interfaces for monitoring. The HTTP listener serves
@@ -81,7 +81,7 @@ for presence before reading a value.
 | Group              | Fields                                                                                                                                         |
 | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
 | Identity           | `version`, `runtime` (`"native"`), `generation` (64 hex digits), `mutation_revision`, `schema_version` (`1`).                                   |
-| Protection         | `state` and `protection` (the same value: `active`, `degraded`, `log-only` or `unknown`), `cause` (`"none"` when clear), `protection_cause`.    |
+| Protection         | `state` and `protection` (the same value: `active`, `degraded`, `log-only` or `unknown`), `cause` (`"none"` when clear; an unhealthy, unpaused source's error when nothing else explains it), `protection_cause`. |
 | Bans               | `active_bans` (omitted when kernel knowledge is `none`), `total_bans`, `decisions_total`.                                                       |
 | Firewall knowledge | `knowledge` (`fresh`, `stale` or `none`), `confirmed_at_us`, `knowledge_age_ms`, `pending_bans`, `oldest_pending_ms`, `overdue_removals`, `oldest_overdue_ms`, `overdue_bookkeeping`, `dump_interrupted`. |
 | Storage            | `storage` (the phase, `healthy` in normal operation), `sqlite_code`, `next_retry_ms`, `committed_records`.                                      |
@@ -89,12 +89,14 @@ for presence before reading a value.
 | Backend            | `backend`, `effect_backend`, `effect_stage`, `effect_cause`, `effect_mutation`, `effects_uncertain`, `overdue_effects`.                         |
 | Worker and clock   | `worker_busy`, `worker_stalled`, `worker_busy_age_ms`, `worker_heartbeat_age_ms`, `clock_uncertain`, `expiry_overdue`, `expiry_uncertain`, `next_committed_expiry_us`. |
 | Resources          | `memory_admission_bytes`, `uptime_seconds` (omitted while the clock is uncertain).                                                             |
-| State file         | `state_file_bytes`, `state_file_pages`, `state_file_max_pages`.                                                                                |
+| State file         | `state_file_bytes`, `state_file_pages` (allocated), `state_file_max_pages`, `state_file_used_pages` (allocated minus SQLite's free pages).       |
 | Tracking pool      | `pool_sample_available`, `pool_sample_pending`, `pool_sample_as_of_us`; with a sample, `pool_tracked`, `pool_banned`, `pool_tracking_limit`, `pool_ban_limit`. |
 
 Each entry of `sources` describes one log source: `jail`, `kind`, `state`,
 `loss_events`, and when they apply `path`, `on_truncation`, `cause`, `inode`,
-`committed_offset`, `observed_size`, `repair` and `last_loss`. The
+`committed_offset`, `observed_size`, `repair` and `last_loss`. `state` is `reading`,
+`paused`, `missing`, `waiting` or `broken`; a `waiting` or `broken` entry has no
+`path` and names the jail's source error in `cause`. The
 [log file lifecycle](../guides/log-lifecycle.md) explains the states.
 
 Fields ending in `_us` are microseconds since the Unix epoch; fields ending in
@@ -122,7 +124,8 @@ These carry no labels and are all gauges.
 | `fail2zig_native_expiry_overdue`          | `1` when a ban expiry is overdue.                             |
 | `fail2zig_native_expiry_uncertain`        | `1` when expiry state is uncertain.                           |
 | `fail2zig_state_file_bytes`               | Size of the state file in bytes.                              |
-| `fail2zig_state_file_pages`               | Size of the state file in pages; the ceiling is 262,144.      |
+| `fail2zig_state_file_pages`               | Size of the state file in pages; SQLite's limit is 278,528.   |
+| `fail2zig_state_file_used_pages`          | Pages in use: the file's pages minus SQLite's free pages. New work waits near 262,144. |
 | `fail2zig_pool_sample_available`          | `1` when a tracking-pool sample has been published.           |
 | `fail2zig_pool_sample_pending`            | `1` while a new sample is being taken.                        |
 | `fail2zig_pool_sample_as_of_seconds`      | Time of the sample, in seconds since the Unix epoch.          |
@@ -155,12 +158,13 @@ added by a reload and stop when it is removed.
 fail2zig_native_storage_healthy == 0
 fail2zig_native_worker_stalled == 1
 fail2zig_jail_source_state == 1
-fail2zig_state_file_pages > 235929
+fail2zig_state_file_used_pages > 235929
 fail2zig_pool_banned / fail2zig_pool_ban_limit > 0.9
 ```
 
-The page threshold is 90 % of the 262,144-page ceiling. A state file at the
-ceiling pauses ingestion while installed rules stay in the kernel; see
+The page threshold is 90 % of the 262,144-page capacity. Near the capacity new
+work waits with `StorageCapacity` while installed rules stay in the kernel and
+expiry, unban and cleanup continue; see
 [state and resource limits](config.md#state_file).
 
 ## JSON from the administrative commands

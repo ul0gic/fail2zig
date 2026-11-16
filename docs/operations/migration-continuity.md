@@ -73,9 +73,32 @@ its SQLite database, so no migration can read them:
 - in-window failure counters (`findtime` accumulation per address),
 - multiline correlation state.
 
-The boundary output lists these under `not_transferable`. A migration that
-reports `lossless` is lossless for the *log position* only; failures already
+The boundary output lists these under `not_transferable`. Failures already
 counted but not yet banned at cutover restart from zero in fail2zig.
+
+fail2ban's log positions are not carried over either. Cutover imports bans and
+ban history; it writes no source position into the native state. The continuity
+decisions below decide whether cutover may proceed and how its outcome is
+labelled. They do not set where the daemon starts reading.
+
+## Where the daemon starts reading after cutover
+
+The migrated state holds no position for any source, so every source starts as a
+new one:
+
+- A file source in a jail with a timestamp format reads its current file from
+  offset 0. A line older than the jail's `findtime` is read and does not count. A
+  newer line counts, including a line fail2ban already counted before cutover.
+  A file source in a jail with `timestamp = "undated"` starts at the end of its
+  current file and counts only lines written after it starts.
+- A journal source starts at the time its session starts and reads nothing
+  written before it. The plan's `replay_window_s` is not applied.
+
+From then on the daemon's own committed source checkpoint is the only record of
+what has been read: a record, its receipt and the source position commit in one
+transaction, and a restart resumes after the last committed record. The daemon
+keeps no separate table of lines already seen, so nothing suppresses a line that
+fail2ban counted and fail2zig reads again.
 
 ## Per-file decisions
 
@@ -84,7 +107,7 @@ For every selected file-backed group and each of its log paths:
 | Condition | `lossless` | `reset_replay` |
 |---|---|---|
 | `logs` row present, first-line digest matches, `lastfilepos` ≤ size | `resume_at_offset` | `resume_at_offset` |
-| file grew past `lastfilepos` | `resume_at_offset` (unread tail is read on start) | same |
+| file grew past `lastfilepos` | `resume_at_offset` | same |
 | no `logs` row, digest unrecorded or unrecognised, first line without terminator | `blocked` | `replay_window`; without a window the plan records a `replay-window-missing` blocker |
 | digest mismatch (rotation or replacement), offset beyond size (truncation) | `blocked` | `replay_window` |
 | file missing or unreadable | `blocked` | `replay_window` |
@@ -95,9 +118,9 @@ first line including its terminator, only when a terminator is present. The
 Python 3 records a 40-hex SHA-1 there (its MD5 availability probe fails on
 every Python 3 and falls back to SHA-1), while Python 2 era rows carry a 32-hex
 MD5. fail2zig selects the algorithm from the recorded length; any other length is
-`first-line-digest-unrecognised` and treated like an unrecorded digest. A resumable
-file yields a native checkpoint (device, inode, offset, prefix length, prefix
-hash) that the daemon verifies again before reading.
+`first-line-digest-unrecognised` and treated like an unrecorded digest. For a
+`resume_at_offset` file the boundary output shows the checkpoint it computed
+(device, inode, offset, prefix length, prefix hash); cutover does not store it.
 
 ## Journal groups
 
@@ -105,18 +128,18 @@ fail2ban stores no journal cursor. fail2zig never derives one from a timestamp.
 
 - `lossless`: every journal-backed selected group is `blocked`
   (`journal-cursor-unavailable`).
-- `reset_replay` with a window: the daemon tails the journal at cutover and
-  replays the last `replay_window_s` seconds through `journalctl --since`.
+- `reset_replay` with a window: the group is `replay_window` and the outcome is
+  `non_lossless`.
 - `reset_replay` without a window: the planner records a `replay-window-missing` blocker.
 
-## Replay window and duplicates
+## Replay window
 
-With `reset_replay`, `replay.from_us = cutover_us − replay_window_s × 10⁶`.
-Lines in `[from_us, cutover_us]` are read again. A line fail2ban already
-counted may therefore be counted again by fail2zig, and an address fail2ban
-already banned may be re-banned; imported active bans are reconciled by the
-ban importer, and the daemon's replay guards suppress exact duplicate records
-within one source. This is why the outcome is reported as `non_lossless`.
+With `reset_replay`, the boundary records `replay.from_us = cutover_us −
+replay_window_s × 10⁶` and cutover prints that continuity is not lossless. The
+window is a required acknowledgement in the plan; neither cutover nor the daemon
+reads the journal or a file from `from_us`. Imported active bans are reconciled
+by the ban importer; a line read again after cutover can still count toward a
+new ban.
 
 ## Outcome
 
@@ -124,7 +147,8 @@ within one source. This is why the outcome is reported as `non_lossless`.
 - `non_lossless`: at least one `replay_window` or `start_at_tail` decision.
 - `blocked`: at least one `blocked` decision; activation must not proceed.
 
-Exact operator wording for a non-lossless boundary: *"Continuity is not
-lossless: log positions are reset for the listed sources and the last N seconds
-are replayed; in-window failure counters and pending records are not carried
-over."*
+For a non-lossless boundary, cutover prints:
+
+```text
+migrate cutover: continuity is not lossless; the accepted replay window applies (see docs/operations/migration-continuity.md)
+```

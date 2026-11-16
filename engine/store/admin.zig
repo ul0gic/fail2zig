@@ -6,6 +6,9 @@ const effects = @import("../core/native_effect.zig");
 const consumers = @import("../core/native_consumer.zig");
 const detection = @import("../core/native_detection_record.zig");
 const Error = @import("store.zig").Error;
+const budget = @import("budget.zig");
+const unreferenced_config_generations_kept = 8;
+const config_generation_prune_page = 32;
 
 pub fn Methods(comptime Store: type) type {
     return struct {
@@ -104,7 +107,7 @@ pub fn Methods(comptime Store: type) type {
                 if (delta.key.kind != .ignore or !std.mem.eql(u8, delta.key.jail, update.manifest.jail) or !std.mem.eql(u8, delta.key.source, "@shared") or !std.mem.eql(u8, delta.key.rule, "allowlist") or delta.expected_revision == 0) return error.InvalidAdminRequest;
                 for (custom[0..i]) |previous| if (std.mem.eql(u8, previous.manifest.jail, update.manifest.jail)) return error.InvalidAdminRequest;
             }
-            try self.beginWrite();
+            try self.beginIntakeWrite(budget.reload_pages);
             errdefer self.rollback();
             if (self.schema_version < 22) return error.AdminStorageRequired;
             for (retired_jails) |name| try self.beginJailRetirementTx(name, false);
@@ -201,6 +204,7 @@ pub fn Methods(comptime Store: type) type {
                 try insert.blob(4, jail.allowlist_snapshot);
                 try insert.done();
             }
+            try self.exec(std.fmt.comptimePrint("DELETE FROM config_generations WHERE generation IN (SELECT generation FROM config_generations g WHERE g.published=0 AND NOT EXISTS(SELECT 1 FROM jail_admin_states s WHERE s.generation=g.generation) ORDER BY g.committed_us DESC,g.generation DESC LIMIT {d} OFFSET {d});", .{ config_generation_prune_page, unreferenced_config_generations_kept }));
         }
 
         pub fn publishConfigGeneration(self: *Store, generation: [32]u8) Error!void {
@@ -218,7 +222,7 @@ pub fn Methods(comptime Store: type) type {
         }
 
         pub fn discardUnpublishedConfigGeneration(self: *Store, generation: [32]u8) Error!void {
-            try self.beginWrite();
+            try self.beginClassWrite(.reclamation);
             errdefer self.rollback();
             if (self.schema_version < 22) return error.AdminStorageRequired;
             var delete = try self.statement("DELETE FROM config_generations WHERE generation=?1 AND published=0;");

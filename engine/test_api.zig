@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+pub const native_effect_runtime = @import("runtime/native_effect_runtime.zig");
 pub const core = struct {
     pub const durable_file_source = @import("core/durable_file_source.zig");
     pub const journal_policy = @import("core/journal_policy.zig");

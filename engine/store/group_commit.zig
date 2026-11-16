@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 const store = @import("store.zig");
+const budget = @import("budget.zig");
 const Error = store.Error;
 
 pub const max_batch_records = 64;
@@ -9,13 +10,15 @@ pub const Frame = struct {
     records: u16 = 0,
     effect_changed: bool = false,
     broken: bool = false,
+    cause: ?Error = null,
     open: ?struct { noted_count: u8, noted_ambiguous: bool } = null,
+    previous: ?store.Store.SourceRange = null,
 };
 
 pub fn Methods(comptime Store: type) type {
     return struct {
         pub fn beginBatch(self: *Store) Error!Frame {
-            try self.beginWrite();
+            try self.beginIntakeWrite(budget.record_pages);
             return .{};
         }
 
@@ -30,6 +33,8 @@ pub fn Methods(comptime Store: type) type {
             const detections = try Store.validateRecord(&record);
             const step = try self.commitRecordStep(&record, detections);
             if (step.result == .already_committed) return .already_committed;
+            try self.assertIntake();
+            if (frame.previous == null) frame.previous = try self.previousRange(&record);
             try self.exec("RELEASE batch_record;");
             frame.open = null;
             frame.records += 1;
@@ -43,18 +48,21 @@ pub fn Methods(comptime Store: type) type {
             self.row_tallies = .{};
             self.noted_count = saved.noted_count;
             self.noted_ambiguous = saved.noted_ambiguous;
-            self.exec("ROLLBACK TO batch_record;") catch {
+            self.exec("ROLLBACK TO batch_record;") catch |failure| {
                 frame.broken = true;
+                frame.cause = failure;
                 return;
             };
-            self.exec("RELEASE batch_record;") catch {
+            self.exec("RELEASE batch_record;") catch |failure| {
                 frame.broken = true;
+                frame.cause = failure;
             };
         }
 
         pub fn commitBatch(self: *Store, frame: *Frame) Error!void {
             errdefer self.rollback();
             if (frame.broken or frame.open != null) return error.DatabaseFailure;
+            if (frame.previous) |range| try self.releasePreviousRecords(range);
             try self.commitEffectTransaction(frame.effect_changed);
         }
     };

@@ -2,8 +2,6 @@
 
 log_level = "info"
 
-pid_file = "/run/fail2zig/fail2zig.pid"
-
 socket_path = "/run/fail2zig/fail2zig.sock"
 
 state_file = "/var/lib/fail2zig/state.bin"
@@ -40,7 +38,8 @@ maxretry = 3
 bantime  = "1h"
 
 bantime_increment_enabled    = true
-bantime_increment_multiplier = 2
+bantime_increment_multiplier = 1
+bantime_increment_factor     = 2
 bantime_increment_formula    = "exponential"
 bantime_increment_max_bantime = "1w"
 

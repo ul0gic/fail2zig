@@ -293,7 +293,7 @@ pub const Coordinator = struct {
         var number: [8]u8 = undefined;
         std.mem.writeInt(i64, &number, receipt.us, .little);
         hash.update(&number);
-        for ([_][]const u8{ record.source, record.occurrence, record.cursor }) |value| {
+        for ([_][]const u8{ record.source, record.occurrence }) |value| {
             std.mem.writeInt(u64, &number, value.len, .little);
             hash.update(&number);
             hash.update(value);
@@ -462,6 +462,13 @@ pub const Coordinator = struct {
     pub fn pendingRequest(self: *const Coordinator) ?Pending {
         return self.pending;
     }
+    pub fn voidHold(self: *Coordinator) void {
+        self.waiting_occurrence = null;
+        self.pending = null;
+        self.immediate = null;
+        self.reservation_turn = null;
+        self.processing_reserved = false;
+    }
     pub fn cancelRequest(self: *Coordinator, request_id: u64) !void {
         if (self.busy) return error.ConsumerBusy;
         if (self.pending == null or self.pending.?.request.id != request_id) return error.DnsRequestMismatch;
@@ -559,7 +566,11 @@ pub const Registry = struct {
         return error.ConsumerSourceUnbound;
     }
     pub fn consumer(self: *Registry) detection.StagedConsumer {
-        return .{ .generation = self.generation, .context = self, .prepare = prepare, .prepare_checkpoint = checkpoint, .manifest = manifest, .processing_time = processingTime };
+        return .{ .generation = self.generation, .context = self, .prepare = prepare, .prepare_checkpoint = checkpoint, .manifest = manifest, .processing_time = processingTime, .void_hold = voidHold };
+    }
+    fn voidHold(incarnation: []const u8, context: ?*anyopaque) void {
+        const self: *Registry = @ptrCast(@alignCast(context.?));
+        for (self.sources[0..self.count]) |owner| if (std.mem.eql(u8, owner.incarnation, incarnation)) owner.voidHold();
     }
     fn prepare(input: detection.StagedInput, context: ?*anyopaque) anyerror!detection.StagedPrepared {
         const self: *Registry = @ptrCast(@alignCast(context.?));

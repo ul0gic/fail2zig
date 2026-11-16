@@ -263,7 +263,6 @@ pub const Gate = struct {
             self.state.has_been_healthy = true;
             self.state.first_failure = null;
             self.state.last_failure = null;
-            self.state.retry_delay_ms = 1000;
             self.state.receipt_clock_floor_us = null;
         }
         self.notice(at);
@@ -273,10 +272,11 @@ pub const Gate = struct {
         const at = self.now() catch return;
         self.state.last_commit_ms = at;
         self.state.committed_records +|= 1;
+        self.state.retry_delay_ms = 1000;
     }
 };
 
-fn retryable(cause: anyerror) bool {
+pub fn retryable(cause: anyerror) bool {
     return switch (cause) {
         error.Busy,
         error.StorageFull,
@@ -301,6 +301,7 @@ fn retryable(cause: anyerror) bool {
         error.ReserveBackpressure,
         error.RetryCapacity,
         error.RetryEligibilityPending,
+        error.StorageCapacity,
         => true,
         else => false,
     };

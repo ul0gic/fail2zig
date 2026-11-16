@@ -4,7 +4,7 @@ description: Native TOML settings, durations, timed entries, sources, storage, e
 sidebar_position: 1
 category: Reference
 audience: operator
-last_verified: 2026-10-22
+last_verified: 2026-11-16
 ---
 
 <span id="a-complete-worked-example"></span>
@@ -23,8 +23,12 @@ The parser accepts a strict TOML subset: `[global]`, `[defaults]` and
 invalid values are rejected. Use section headers, not dotted keys on the left.
 Comments begin with `#`; strings must be quoted and accept only the escapes `\"`,
 `\\`, `\n` and `\t`. Arrays hold strings only, may span lines and may contain
-comments. Name jails with ASCII letters, digits, hyphens or underscores, at most
-64 bytes.
+comments. A jail's name is the header text after `jails.` up to `]`, with
+surrounding spaces trimmed. A name written as a quoted key, `[jails."my jail"]` or
+`[jails.'my jail']`, is the text between the quotes; a double-quoted name may not
+contain a backslash. Validation accepts any name
+of 1 to 64 bytes and checks no character set; names of ASCII letters, digits,
+hyphens and underscores are the ones that need no quoting in commands.
 
 | Limit                         | Value                                   |
 | ----------------------------- | --------------------------------------- |
@@ -122,10 +126,17 @@ no extra flag. Under the shipped systemd unit a custom `socket_path` or
 The database and its parent must belong to the daemon UID. The historical
 `.bin` extension does not make it the legacy binary format. Native startup
 refuses corrupt, incompatible or inaccessible required state instead of starting
-empty. The file cannot grow past 1 GiB; a file already past that size is refused
-at startup. When a commit finds the file full, ingestion pauses and retries while
-rules already in the kernel stay enforced. The file never shrinks; rows removed by
-retention free pages for reuse inside it, and `status` shows the size and page use.
+empty. New work (log records, manual bans, `banip` additions, `ignore add`, a new
+reload) is admitted only while the file's used pages, plus the pages owed to work
+already admitted, fit in 262,144 pages (1 GiB). At that line sources wait with
+`StorageCapacity`, the manual commands are rejected with it, and expiry, unban and
+cleanup keep writing; intake resumes by itself when room returns. SQLite's own limit
+is 16,384 pages higher, so the file can reach 1 GiB plus 64 MiB; a file past that is
+refused at startup. A full filesystem pauses ingestion with `StorageFull` and
+retries while rules already in the kernel stay enforced. The file never shrinks;
+rows removed by cleanup and retention free pages for reuse inside it, and `status`
+shows allocated and used pages. There is no setting for the capacity; see the
+[resource boundaries](../architecture.md#resource-boundaries).
 A configuration that sets `native_memory_ceiling_mb = 256` explicitly must raise
 it or the daemon refuses with `NativeMemoryAdmission`. Above about twenty jails
 the default of 512 refuses startup the same way; raise it for larger
@@ -312,7 +323,7 @@ protection; unknown built-in filters without native rule files fail validation.
 | ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | <span id="enabled"></span>`enabled`             | `true`; disabled jails are not started.                                                                                       |
 | <span id="filter"></span>`filter`               | Built-in service name, or the service name for a custom rule-file jail. Built-ins accept hyphen/underscore forms.             |
-| <span id="logpath"></span>`logpath`             | Array of file paths, default empty. Write absolute paths that the service can read.                                           |
+| <span id="logpath"></span>`logpath`             | Array of file paths, default empty. Write absolute paths that the service can read: unlike `rule_files`, `journal_executables` and `ignore_file`, entries are not checked for being absolute. |
 | `source`                                        | Inherits defaults. Prefer explicit source selection for reviewed configurations.                                              |
 | `maxretry`, `findtime`, `bantime`, `enforce`    | Override the corresponding default. `banaction` remains a deprecated compatibility input.                                     |
 | `ignoreip`, `banip`                             | Each replaces, rather than appends to, the defaults list. Repeat loopback entries when overriding `ignoreip`.                 |

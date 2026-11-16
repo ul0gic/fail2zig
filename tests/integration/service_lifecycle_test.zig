@@ -337,13 +337,13 @@ test "lifecycle: malformed file records permit READY and retained-state restart"
     try writeConfig(&fx.h, &fx.p, .{ .log_target = fx.p.log_target, .maxretry = 1 });
     const valid = "Failed password for root from 203.0.113.7 port 22 ssh2\n";
     const input = "Failed password for r\xffoot from 203.0.113.7 port 22 ssh2\nnonmatching \xff request\n" ++ valid ++ valid;
-    try fx.h.writeLine(input);
     var buf: [256]u8 = undefined;
-    for (0..2) |_| {
+    for (0..2) |round| {
         var daemon = try Daemon.spawn(a, &fx.h, fx.p.notify, false);
         defer daemon.deinit();
         try fx.h.waitForSocket(5_000);
         try waitReadyAfterAdmission(&fx.h, fx.rx);
+        if (round == 0) try fx.h.writeLine(input);
         var timer = try std.time.Timer.start();
         var decided = false;
         while (timer.read() < startup_timeout_ns) {
@@ -608,13 +608,18 @@ test "lifecycle: a restart-policy jail whose log is absent at start does not del
     var buf: [256]u8 = undefined;
 
     try writeConfig(&fx.h, &fx.p, .{ .maxretry = 1, .second_log = second_log });
-    try fx.h.writeLine("Failed password for root from 203.0.113.7 port 22 ssh2");
-    try std.fs.cwd().writeFile(.{ .sub_path = second_log, .data = "Failed password for root from 203.0.113.8 port 22 ssh2\n" });
+    try std.fs.cwd().writeFile(.{ .sub_path = second_log, .data = "" });
     {
         var seed = try Daemon.spawn(a, &fx.h, fx.p.notify, false);
         defer seed.deinit();
         try fx.h.waitForSocket(5_000);
         try waitReadyAfterAdmission(&fx.h, fx.rx);
+        try fx.h.writeLine("Failed password for root from 203.0.113.7 port 22 ssh2");
+        {
+            var second_file = try std.fs.cwd().openFile(second_log, .{ .mode = .write_only });
+            defer second_file.close();
+            try second_file.writeAll("Failed password for root from 203.0.113.8 port 22 ssh2\n");
+        }
         var timer = try std.time.Timer.start();
         while (timer.read() < startup_timeout_ns) {
             const first = jailDetectionCount(a, fx.p.state_file, "sshd") catch 0;

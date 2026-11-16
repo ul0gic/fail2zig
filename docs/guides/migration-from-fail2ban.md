@@ -4,7 +4,7 @@ description: Inspect supported configuration, transfer schema-4 SQLite state and
 sidebar_position: 2
 category: Getting Started
 audience: operator
-last_verified: 2026-10-22
+last_verified: 2026-11-16
 ---
 
 fail2ban configuration inspection and state migration are separate operations.
@@ -219,17 +219,19 @@ the outage window, and a rename failure after the original has been moved aside.
 
 ## Continuity and replay
 
-“Lossless” describes admitted file positions, not every piece of fail2ban state.
-A file resumes only when its recorded position and identity checks admit it.
-Missing records, replacement, truncation or unreadability can block lossless
-activation. The native daemon verifies the resulting device/inode/offset checkpoint
-again before reading.
+The continuity check decides whether cutover may proceed; it does not carry
+fail2ban's log positions into fail2zig. With `lossless`, a file whose recorded
+position and identity checks fail, and every journal group, blocks activation.
+Cutover writes no source position, so after cutover each timestamped file source
+reads its current file from the start, each undated file source starts at the end
+of its current file, and each journal source starts at the time its session
+starts. A timestamped line older than the jail's `findtime` does not count; a
+newer one counts, including a failure fail2ban already counted.
 
-Journal sources have no transferable cursor. With reset/replay, records inside
-the declared replay window may be counted again, including failures fail2ban
-already counted. Imported active bans are reconciled and exact duplicate guards
-apply within one native source, but this does not make the transition lossless.
-The planner requires a replay window for reset/replay plans.
+With reset/replay the planner requires a replay window, and cutover reports the
+outcome as not lossless. The window is an acknowledgement; neither cutover nor
+the daemon reads from its start. Imported active bans are reconciled by the
+importer. Nothing suppresses a line fail2ban counted and fail2zig reads again.
 
 Review the [continuity contract](../operations/migration-continuity.md)
 for per-file decisions and duplicate boundaries.

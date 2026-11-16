@@ -14,7 +14,8 @@ const effects = @import("../core/native_effect.zig");
 const effect_history = @import("../core/native_effect_history.zig");
 const application_history = @import("../core/native_application_history.zig");
 const action_outcome = @import("../core/native_action_outcome.zig");
-pub const latest_schema: i64 = 28;
+const budget = @import("budget.zig");
+pub const latest_schema: i64 = 29;
 pub const load_repair_schema: i64 = 24;
 pub const load_repair = @import("load_repair_migration.zig");
 pub const SchemaReadyOptions = struct {
@@ -55,7 +56,7 @@ const embedded_api: Api = blk: {
     }
     break :blk api;
 };
-pub const Error = application_history.Error || action_outcome.Error || retry.Error || consumers.Error || effects.Error || effect_history.Error || action_context.Error || error{ MaintenancePinned, StaleMaintenance, PrunedReplay, InvalidMaintenanceState, MaintenanceStorageRequired, ConsumerManifestRequired, ConsumerManifestMismatch, ConsumerManifestMissing, ConsumerManifestExists, ConsumerMigrationRequired, MissingRequiredConsumer, AmbiguousNativeDetection, AmbiguousRetryDecision, ConsumerStorageRequired, StaleConsumerCheckpoint, OpenFailed, UnsafePermissions, ForeignDatabase, UnsupportedSchema, DatabaseFailure, Busy, StorageFull, ReadOnly, StorageIo, CorruptDatabase, StorageLimit, Interrupted, AccessDenied, ReopenRequired, InvalidRecord, OccurrenceConflict, StaleCheckpoint, StaleSharedCheckpoint, InjectedFailure, OutOfMemory, ReceiptStorageRequired, InferenceStorageRequired, DetectionStorageRequired, ReceiptConflict, ReceiptRequired, ReceiptAlreadyCommitted, ReceiptLimit, RetryStorageRequired, RetryAdmissionRequired, RetryGenerationMismatch, RetryMigrationRequired, RetryCapacity, RetryEligibilityPending, ReceiptClockReversed, HistoryResetStorageRequired, InvalidHistoryReset, StaleHistoryReset, AdminStorageRequired, MigrationStorageRequired, StaleAdminRevision, InvalidAdminRequest, AdminRequestCapacity, RetryPolicyInFlight, StalePolicyTransition, ConfigGenerationExists, ConfigGenerationMissing, MigrationRunExists, MigrationRunMissing, MigrationStepMissing, MigrationStepOpen, MigrationStepOrder, InvalidMigrationRow, InvalidMigrationState, MigrationJailUnknown, LoadRepairMigrationIncomplete, LoadRepairWritersPending, LoadRepairBackupExists, LoadRepairBackupInvalid, LoadRepairDiskSpace, LoadRepairVerificationFailed, LoadRepairInvalidState, SchemaBackupExists, IgnoreCapacity, InvalidIgnoreEntry, ReserveBackpressure, MaintenanceWorkExhausted, LiveOwnerCounterInvalid, CustomLegacyProofRequired, CustomLegacyIdentityMismatch };
+pub const Error = application_history.Error || action_outcome.Error || retry.Error || consumers.Error || effects.Error || effect_history.Error || action_context.Error || error{ MaintenancePinned, StaleMaintenance, InvalidMaintenanceState, MaintenanceStorageRequired, ConsumerManifestRequired, ConsumerManifestMismatch, ConsumerManifestMissing, ConsumerManifestExists, ConsumerMigrationRequired, MissingRequiredConsumer, AmbiguousNativeDetection, AmbiguousRetryDecision, ConsumerStorageRequired, StaleConsumerCheckpoint, OpenFailed, UnsafePermissions, ForeignDatabase, UnsupportedSchema, DatabaseFailure, Busy, StorageFull, ReadOnly, StorageIo, CorruptDatabase, StorageLimit, Interrupted, AccessDenied, ReopenRequired, InvalidRecord, OccurrenceConflict, StaleCheckpoint, StaleSharedCheckpoint, InjectedFailure, OutOfMemory, ReceiptStorageRequired, InferenceStorageRequired, DetectionStorageRequired, ReceiptConflict, ReceiptRequired, ReceiptAlreadyCommitted, ReceiptLimit, RetryStorageRequired, RetryAdmissionRequired, RetryGenerationMismatch, RetryMigrationRequired, RetryCapacity, RetryEligibilityPending, ReceiptClockReversed, HistoryResetStorageRequired, InvalidHistoryReset, StaleHistoryReset, AdminStorageRequired, MigrationStorageRequired, StaleAdminRevision, InvalidAdminRequest, AdminRequestCapacity, RetryPolicyInFlight, StalePolicyTransition, ConfigGenerationExists, ConfigGenerationMissing, MigrationRunExists, MigrationRunMissing, MigrationStepMissing, MigrationStepOpen, MigrationStepOrder, InvalidMigrationRow, InvalidMigrationState, MigrationJailUnknown, LoadRepairMigrationIncomplete, LoadRepairWritersPending, LoadRepairBackupExists, LoadRepairBackupInvalid, LoadRepairDiskSpace, LoadRepairVerificationFailed, LoadRepairInvalidState, SchemaBackupExists, IgnoreCapacity, InvalidIgnoreEntry, ReserveBackpressure, MaintenanceWorkExhausted, LiveOwnerCounterInvalid, CustomLegacyProofRequired, CustomLegacyIdentityMismatch, StorageCapacity };
 
 pub const OpenStage = enum {
     path_validation,
@@ -151,7 +152,7 @@ pub fn sqliteError(rc: c_int) Error {
         else => error.DatabaseFailure,
     };
 }
-pub const CommitStage = enum { during_load_repair_events_swap, after_retry_detail_prune, before_admin_schema_commit, before_migration_schema_commit, after_admin_request, after_migration_step_intent, after_migration_step_outcome, before_migration_activation_commit, before_policy_transition_commit, before_config_generation_commit, before_config_generation_publish, before_action_target_schema_commit, after_action_target_intent, before_action_target_dispatch_commit, before_action_target_settlement_commit, before_history_reset_schema_commit, after_history_reset, before_canonical_effect_schema_commit, after_history_detail_delete, after_history_event_delete, before_history_retention_commit, before_escalation_schema_commit, before_application_history_schema_commit, before_cleanup_schema_commit, before_retry_lease_schema_commit, after_cleanup_mark, before_cleanup_escalation_delete, after_cleanup_escalation_delete, before_cleanup_retry_delete, after_cleanup_retry_delete, after_cleanup_delete, before_cleanup_commit, after_retry_retire, before_maintenance_schema_commit, after_source_sequence, after_replay_guard, after_record, after_checkpoint, after_shared_checkpoint, before_commit, before_receipt_commit, after_receipt_commit, after_receipt_delete, before_receipt_schema_commit, before_native_time_schema_commit, before_inference_schema_commit, before_detection_schema_commit, after_detection, before_clock_schema_commit, before_journal_detection_schema_commit, before_retry_schema_commit, after_retry_state, after_retry_decision, before_consumer_schema_commit, after_consumer_delta, before_effect_schema_commit, after_effect_owner, after_effect_intent, before_effect_dispatch_commit, before_effect_receipt_commit, before_manifest_schema_commit, before_manifest_commit, after_manifest_ready, before_consumer_input_commit };
+pub const CommitStage = enum { during_load_repair_events_swap, after_retry_detail_prune, before_admin_schema_commit, before_migration_schema_commit, after_admin_request, after_migration_step_intent, after_migration_step_outcome, before_migration_activation_commit, before_policy_transition_commit, before_config_generation_commit, before_config_generation_publish, before_action_target_schema_commit, after_action_target_intent, before_action_target_dispatch_commit, before_action_target_settlement_commit, before_history_reset_schema_commit, after_history_reset, before_canonical_effect_schema_commit, after_history_detail_delete, after_history_event_delete, before_history_retention_commit, before_escalation_schema_commit, before_application_history_schema_commit, before_cleanup_schema_commit, before_retry_lease_schema_commit, after_cleanup_mark, before_cleanup_escalation_delete, after_cleanup_escalation_delete, before_cleanup_retry_delete, after_cleanup_retry_delete, after_cleanup_delete, before_cleanup_commit, after_retry_retire, before_maintenance_schema_commit, after_source_sequence, after_record, after_checkpoint, after_shared_checkpoint, before_commit, before_receipt_commit, after_receipt_commit, after_receipt_delete, before_receipt_schema_commit, before_native_time_schema_commit, before_inference_schema_commit, before_detection_schema_commit, after_detection, before_clock_schema_commit, before_journal_detection_schema_commit, before_retry_schema_commit, after_retry_state, after_retry_decision, before_consumer_schema_commit, after_consumer_delta, before_effect_schema_commit, after_effect_owner, after_effect_intent, before_effect_dispatch_commit, before_effect_receipt_commit, before_manifest_schema_commit, before_manifest_commit, after_manifest_ready, before_consumer_input_commit };
 pub const Limits = struct {
     pub const pending_receipts = 4096;
     pub const checkpoint_bytes = 16 * 1024 * 1024;
@@ -167,6 +168,12 @@ pub const ReceiptIdentity = struct {
     cursor: []const u8,
     raw_hash: [32]u8,
     generation: [32]u8,
+
+    pub fn sameRecord(self: ReceiptIdentity, other: ReceiptIdentity) bool {
+        return std.mem.eql(u8, self.jail, other.jail) and std.mem.eql(u8, self.source, other.source) and
+            std.mem.eql(u8, self.occurrence, other.occurrence) and std.mem.eql(u8, &self.raw_hash, &other.raw_hash) and
+            std.mem.eql(u8, &self.generation, &other.generation);
+    }
 };
 pub const Receipt = struct { time: native_time.Timestamp, generation: [32]u8 };
 pub const HistoryResetScope = union(enum) { jail: []const u8, overall };
@@ -222,8 +229,6 @@ pub const EffectInvalidation = struct {
     retirement_pending: ?*const fn (?*anyopaque, effects.Hash, []const effects.Owner, effects.Lease) void = null,
 };
 pub const max_retention_page: u16 = 256;
-// A transaction allows 1,000 progress callbacks of 1,000 VM steps (workProgress).
-pub const max_held_window: u16 = 8192;
 pub const ReclaimCursor = struct { phase: u2 = 0, cursor: i64 = 0, found: bool = false, rest: u8 = 0 };
 const statement_cache_slots = 512;
 const CachedStatement = struct { hash: u64 = 0, stmt: ?*Statement = null, in_use: bool = false };
@@ -263,6 +268,8 @@ pub const Store = struct {
     schema_version: i64 = 2,
     receipt_limit: ?usize = null,
     runtime_limits: bool = false,
+    admission: budget.Class = .obligation,
+    intake_closed: bool = false,
     runtime_path: ?[]const u8 = null,
     work_remaining: u32 = 1000,
     load_repair_backup_verified: bool = false,
@@ -270,8 +277,13 @@ pub const Store = struct {
     retention_page: u16 = max_retention_page,
     retention_aux_turn: u2 = 0,
     history_retention_rest: bool = false,
-    held_cursor: i64 = 0,
-    held_window: u16 = max_held_window,
+    cleanup_cursor: i64 = 0,
+    cleanup_cycle_deleted: bool = false,
+    retired_cursor: i64 = 0,
+    retired_cycle_deleted: bool = false,
+    retired_sweep_done: bool = false,
+    source_header_cursor: i64 = 0,
+    source_header_sweep_done: bool = false,
     reclaim: ReclaimCursor = .{},
     reclaim_turn: bool = false,
     prune_batch: u8 = attribution_batch,
@@ -282,6 +294,7 @@ pub const Store = struct {
     escalation_jitter_context: ?*anyopaque = null,
     escalation_jitter: *const fn (?*anyopaque, u64) u64 = systemEscalationJitter,
     retry_evictions: @import("consumer_retry.zig").Evictions = .{},
+    memory_evictions: @import("memory_caps.zig").Evictions = .{},
     retry_projection_initialized: bool = false,
     retry_admission_target_hint: ?i64 = null,
     retry_admission_work_left: u16 = 256,
@@ -297,16 +310,16 @@ pub const Store = struct {
         const prior = hard_limit(-1);
         _ = hard_limit(if (prior > 0) @min(prior, 64 * 1024 * 1024) else 64 * 1024 * 1024);
     }
+    pub fn configurePageLimit(self: *Store) Error!void {
+        if (try self.integer("PRAGMA page_count;") > budget.limit_pages) return error.StorageLimit;
+        var sql: [80]u8 = undefined;
+        const maximum = std.fmt.bufPrintZ(&sql, "PRAGMA max_page_count={d};", .{budget.limit_pages}) catch return error.StorageLimit;
+        if (try self.integer(maximum) != budget.limit_pages) return error.StorageLimit;
+    }
     pub fn configureRuntimeLimits(self: *Store) Error!void {
         configureHeapLimit();
         try self.exec("PRAGMA cache_size=-32768; PRAGMA wal_autocheckpoint=0;");
-        const page_size = try self.integer("PRAGMA page_size;");
-        if (page_size <= 0) return error.DatabaseFailure;
-        const pages = @divTrunc(@as(i64, 1024 * 1024 * 1024), page_size);
-        if (try self.integer("PRAGMA page_count;") > pages) return error.StorageLimit;
-        var sql: [80]u8 = undefined;
-        const maximum = std.fmt.bufPrintZ(&sql, "PRAGMA max_page_count={d};", .{pages}) catch return error.StorageLimit;
-        if (try self.integer(maximum) != pages) return error.StorageLimit;
+        try self.configurePageLimit();
         if (self.statement_cache == null) {
             const cache = try self.allocator.create([statement_cache_slots]CachedStatement);
             @memset(cache, .{});
@@ -349,10 +362,21 @@ pub const Store = struct {
     }
 
     pub fn beginWrite(self: *Store) Error!void {
+        return self.beginClassWrite(.obligation);
+    }
+    pub fn beginIntakeWrite(self: *Store, pages: u64) Error!void {
+        try self.beginClassWrite(.intake);
+        self.admitIntake(pages) catch |failure| {
+            self.rollback();
+            return failure;
+        };
+    }
+    pub fn beginClassWrite(self: *Store, class: budget.Class) Error!void {
         try self.usable();
         if (self.startup_admission) return error.DatabaseFailure;
         if (self.runtime_path) |path| try self.maintainWal(path);
         try self.exec("BEGIN IMMEDIATE;");
+        self.admission = class;
         self.retry_admission_work_left = 256;
         if (comptime build_options.diag) self.diagMarkChanges();
         self.row_tallies = .{};
@@ -416,7 +440,9 @@ pub const Store = struct {
         const diag_span = if (comptime build_options.diag) diag_mod.enter(.commit) else {};
         defer if (comptime build_options.diag) diag_mod.leave(diag_span);
         self.row_tallies = .{};
+        defer self.admission = .obligation;
         if (!self.startup_admission) {
+            try self.assertIntake();
             try self.exec("COMMIT;");
             if (comptime build_options.diag) self.diagCommitted();
             return;
@@ -746,6 +772,7 @@ pub const Store = struct {
         sweep_sequence: u64,
     };
     pub const RecordSequence = struct { generation: [32]u8, sequence: u64 };
+    pub const SourceRange = struct { jail: []const u8, source: []const u8, generation: [32]u8, cutoff: u64 };
     pub fn maintenanceKey(jail: []const u8, source: []const u8) Error!void {
         if (jail.len == 0 or jail.len > 4096 or source.len == 0 or source.len > Limits.source_bytes or
             std.mem.indexOfScalar(u8, jail, 0) != null or std.mem.indexOfScalar(u8, source, 0) != null) return error.InvalidRecord;
@@ -795,11 +822,17 @@ pub const Store = struct {
         };
         return result;
     }
+    pub fn previousRange(self: *Store, record: *const Record) Error!?SourceRange {
+        if (self.schema_version < 15) return null;
+        const generation = try recordGeneration(record) orelse return null;
+        const state = try self.sourceMaintenance(record.jail, record.source, generation) orelse return error.InvalidMaintenanceState;
+        return .{ .jail = record.jail, .source = record.source, .generation = generation, .cutoff = state.head_sequence - 1 };
+    }
     fn advanceSourceSequence(self: *Store, record: *const Record, generation: [32]u8) Error!u64 {
         if (self.schema_version >= 15) _ = try self.maintenanceRevision();
         const old = try self.sourceMaintenance(record.jail, record.source, generation);
         if (old == null) {
-            var retained = try self.statement("SELECT 1 FROM records WHERE jail=?1 AND source=?2 AND source_generation=?3 AND source_sequence IS NOT NULL UNION ALL SELECT 1 FROM replay_guards WHERE jail=?1 AND source=?2 AND generation=?3 LIMIT 1;");
+            var retained = try self.statement("SELECT 1 FROM records WHERE jail=?1 AND source=?2 AND source_generation=?3 AND source_sequence IS NOT NULL LIMIT 1;");
             defer retained.deinit();
             try retained.text(1, record.jail);
             try retained.text(2, record.source);
@@ -808,23 +841,12 @@ pub const Store = struct {
         }
         const prior: u64 = if (old) |value| value.head_sequence else 0;
         if (old != null) {
-            var maximum: u64 = 0;
-            for ([_][:0]const u8{
-                "SELECT source_sequence FROM records WHERE jail=?1 AND source=?2 AND source_generation=?3 AND source_sequence IS NOT NULL ORDER BY source_sequence DESC LIMIT 1;",
-                "SELECT source_sequence FROM replay_guards WHERE jail=?1 AND source=?2 AND generation=?3 ORDER BY source_sequence DESC LIMIT 1;",
-            }) |query| {
-                var retained = try self.statement(query);
-                defer retained.deinit();
-                try retained.text(1, record.jail);
-                try retained.text(2, record.source);
-                try retained.blob(3, &generation);
-                if (try retained.row()) {
-                    const sequence = try retained.signed(0);
-                    if (sequence <= 0) return error.InvalidMaintenanceState;
-                    maximum = @max(maximum, @as(u64, @intCast(sequence)));
-                }
-            }
-            if (maximum != prior) return error.InvalidMaintenanceState;
+            var retained = try self.statement("SELECT source_sequence FROM records WHERE jail=?1 AND source=?2 AND source_generation=?3 AND source_sequence IS NOT NULL ORDER BY source_sequence DESC LIMIT 1;");
+            defer retained.deinit();
+            try retained.text(1, record.jail);
+            try retained.text(2, record.source);
+            try retained.blob(3, &generation);
+            if (try retained.row() and try retained.signed(0) != prior) return error.InvalidMaintenanceState;
         }
         if (prior >= std.math.maxInt(i64) - 1) return error.StorageLimit;
         const next = prior + 1;
@@ -849,40 +871,6 @@ pub const Store = struct {
         try self.fault(.after_source_sequence);
         return next;
     }
-    pub fn occurrenceGuardKey(occurrence: []const u8) [32]u8 {
-        return effects.hashParts("fail2zig-replay-occurrence-v1", &.{occurrence});
-    }
-    pub fn identityGuardKey(identity: ReceiptIdentity) [32]u8 {
-        return effects.hashParts("fail2zig-replay-identity-v1", &.{ identity.jail, identity.source, &identity.generation, identity.occurrence, &identity.raw_hash, identity.cursor });
-    }
-    pub fn checkReplayGuard(self: *Store, jail: []const u8, source: []const u8, occurrence: []const u8, raw_hash: [32]u8, cursor: []const u8, supplied_generation: ?[32]u8, receipt_us: ?i64) Error!void {
-        if (self.schema_version < 14) {
-            const schema = try self.integer("PRAGMA user_version;");
-            if (schema > latest_schema) return error.UnsupportedSchema;
-            if (schema < 14) return;
-            self.schema_version = schema;
-        }
-        try maintenanceKey(jail, source);
-        if (occurrence.len == 0 or occurrence.len > 16384 or cursor.len == 0 or cursor.len > Limits.cursor_bytes) return error.InvalidRecord;
-        const occurrence_key = occurrenceGuardKey(occurrence);
-        var row = try self.statement("SELECT generation,identity_key,receipt_us,source_sequence FROM replay_guards WHERE jail=?1 AND source=?2 AND occurrence_key=?3;");
-        defer row.deinit();
-        try row.text(1, jail);
-        try row.text(2, source);
-        try row.blob(3, &occurrence_key);
-        if (!try row.row()) return;
-        const generation = try Store.effectBlob(&row, 0, 32);
-        const saved_identity = try Store.effectBlob(&row, 1, 32);
-        const original_receipt = try row.optionalSigned(2);
-        const sequence = try row.signed(3);
-        const state = try self.sourceMaintenance(jail, source, generation) orelse return error.InvalidMaintenanceState;
-        if (sequence <= 0 or sequence > state.head_sequence) return error.InvalidMaintenanceState;
-        const expected_identity = identityGuardKey(.{ .jail = jail, .source = source, .occurrence = occurrence, .raw_hash = raw_hash, .cursor = cursor, .generation = generation });
-        if (!std.mem.eql(u8, &expected_identity, &saved_identity)) return error.OccurrenceConflict;
-        if (supplied_generation) |wanted| if (!std.mem.eql(u8, &wanted, &generation)) return error.OccurrenceConflict;
-        if (receipt_us) |wanted| if (original_receipt == null or original_receipt.? != wanted) return error.OccurrenceConflict;
-        return error.PrunedReplay;
-    }
     pub const CursorRebinding = struct { old: [32]u8, new: [32]u8 };
     pub const PolicyTransition = struct { jail: []const u8, generation: [32]u8, next_generation: [32]u8, expected: retry.Policy, next: retry.Policy, cursor_rebinding: ?CursorRebinding = null };
     pub usingnamespace @import("admin.zig").Methods(@This());
@@ -897,6 +885,8 @@ pub const Store = struct {
 
     pub usingnamespace @import("footprint.zig").Methods(@This());
 
+    pub usingnamespace budget.Methods(@This());
+
     pub usingnamespace @import("ban_origins.zig").Methods(@This());
 
     pub usingnamespace @import("retry_release.zig").Methods(@This());
@@ -904,6 +894,8 @@ pub const Store = struct {
     pub usingnamespace @import("group_commit.zig").Methods(@This());
 
     pub usingnamespace @import("source_repair.zig").Methods(@This());
+
+    pub usingnamespace @import("effect_repair.zig").Methods(@This());
 
     pub usingnamespace @import("jail_lifecycle.zig").Methods(@This());
 
@@ -1128,10 +1120,10 @@ pub const Store = struct {
         try row.text(1, identity.jail);
         try row.text(2, identity.source);
         if (!try row.row()) return null;
-        if (!std.mem.eql(u8, try row.boundedBytes(0, 32), &identity.generation) or
-            !std.mem.eql(u8, try row.boundedBytes(1, 16384), identity.occurrence) or
-            !std.mem.eql(u8, try row.boundedBytes(2, 32), &identity.raw_hash) or
-            !std.mem.eql(u8, try row.boundedBytes(3, Limits.cursor_bytes), identity.cursor)) return error.ReceiptConflict;
+        const generation = try hashColumn(&row, 0) orelse return error.ReceiptConflict;
+        const raw_hash = try hashColumn(&row, 2) orelse return error.ReceiptConflict;
+        const saved = ReceiptIdentity{ .jail = identity.jail, .source = identity.source, .occurrence = try row.boundedBytes(1, 16384), .cursor = try row.boundedBytes(3, Limits.cursor_bytes), .raw_hash = raw_hash, .generation = generation };
+        if (!identity.sameRecord(saved)) return error.ReceiptConflict;
         return .{ .us = try row.signed(4) };
     }
 
@@ -1143,16 +1135,16 @@ pub const Store = struct {
     pub fn committedReceipt(self: *Store, identity: ReceiptIdentity) Error!?native_time.Timestamp {
         try Store.validateReceiptIdentity(identity);
         if (self.schema_version < 3) return error.ReceiptStorageRequired;
-        try self.checkReplayGuard(identity.jail, identity.source, identity.occurrence, identity.raw_hash, identity.cursor, identity.generation, null);
         var row = try self.statement("SELECT raw_hash,cursor,receipt_generation,receipt_us FROM records WHERE jail=?1 AND source=?2 AND occurrence=?3;");
         defer row.deinit();
         try row.text(1, identity.jail);
         try row.text(2, identity.source);
         try row.text(3, identity.occurrence);
         if (!try row.row()) return null;
-        if (!std.mem.eql(u8, try row.boundedBytes(0, 32), &identity.raw_hash) or
-            !std.mem.eql(u8, try row.boundedBytes(1, Limits.cursor_bytes), identity.cursor) or
-            !std.mem.eql(u8, try row.boundedBytes(2, 32), &identity.generation)) return error.ReceiptConflict;
+        const raw_hash = try hashColumn(&row, 0) orelse return error.ReceiptConflict;
+        const generation = try hashColumn(&row, 2) orelse return error.ReceiptConflict;
+        const saved = ReceiptIdentity{ .jail = identity.jail, .source = identity.source, .occurrence = identity.occurrence, .cursor = try row.boundedBytes(1, Limits.cursor_bytes), .raw_hash = raw_hash, .generation = generation };
+        if (!identity.sameRecord(saved)) return error.ReceiptConflict;
         return .{ .us = try row.signed(3) };
     }
 
@@ -1239,11 +1231,10 @@ pub const Store = struct {
         const schema = try self.integer("PRAGMA user_version;");
         if (schema < 3 or schema > latest_schema) return error.UnsupportedSchema;
         self.schema_version = schema;
-        try self.checkReplayGuard(identity.jail, identity.source, identity.occurrence, identity.raw_hash, identity.cursor, identity.generation, null);
         if (schema >= 7) _ = try self.readReceiptClock();
         if (expected_revision >= std.math.maxInt(i64) or try self.revision(identity.jail) != expected_revision) return error.StaleCheckpoint;
         try self.validateReceiptGeneration(identity.jail, identity.generation);
-        if (try self.hasRecord(identity.jail, identity.source, identity.occurrence, identity.raw_hash, identity.cursor)) return error.ReceiptAlreadyCommitted;
+        if (try self.hasRecord(identity.jail, identity.source, identity.occurrence, identity.raw_hash)) return error.ReceiptAlreadyCommitted;
         if (try self.pendingReceipt(identity)) |saved| return .{ .time = saved, .reserved = false };
         if (try self.pendingReceiptCount() >= maximum) return error.ReceiptLimit;
         {
@@ -1297,6 +1288,7 @@ pub const Store = struct {
     pub fn rollback(self: *Store) void {
         self.work_remaining = 1000;
         self.row_tallies = .{};
+        self.admission = .obligation;
         if (self.api.get_autocommit(self.db) != 0) {
             if (self.startup_admission) self.reopen_required = true;
             self.startup_operation = false;
@@ -1397,13 +1389,14 @@ pub const Store = struct {
     pub fn commitRecord(self: *Store, record: Record) Error!CommitResult {
         try self.usable();
         const detections = try validateRecord(&record);
-        try self.beginWrite();
+        try self.beginIntakeWrite(budget.record_pages);
         errdefer self.rollback();
         const step = try self.commitRecordStep(&record, detections);
         if (step.result == .already_committed) {
             try self.commitTransaction();
             return .already_committed;
         }
+        if (try self.previousRange(&record)) |range| try self.releasePreviousRecords(range);
         try self.commitEffectTransaction(step.effect_changed);
         return .committed;
     }
@@ -1429,7 +1422,6 @@ pub const Store = struct {
         if (schema < 2 or schema > latest_schema) return error.UnsupportedSchema;
         self.schema_version = schema;
         const source_generation = if (schema >= 14) try recordGeneration(record) else null;
-        try self.checkReplayGuard(record.jail, record.source, record.occurrence, record.raw_hash, record.cursor, source_generation, if (record.receipt) |value| value.time.us else null);
         if (schema >= 9) {
             const registered = try self.readRetryPolicy(record.jail);
             if ((registered != null) != (record.native_retry != null)) return error.RetryAdmissionRequired;
@@ -1489,13 +1481,13 @@ pub const Store = struct {
             }
         }
         {
-            var prior = try self.statement("SELECT raw_hash,cursor FROM records WHERE jail=?1 AND source=?2 AND occurrence=?3;");
+            var prior = try self.statement("SELECT raw_hash FROM records WHERE jail=?1 AND source=?2 AND occurrence=?3;");
             defer prior.deinit();
             try prior.text(1, record.jail);
             try prior.text(2, record.source);
             try prior.text(3, record.occurrence);
             if (try prior.row()) {
-                if (!std.mem.eql(u8, try prior.boundedBytes(0, 32), &record.raw_hash) or !std.mem.eql(u8, try prior.boundedBytes(1, Limits.cursor_bytes), record.cursor)) return error.OccurrenceConflict;
+                if (!std.mem.eql(u8, try prior.boundedBytes(0, 32), &record.raw_hash)) return error.OccurrenceConflict;
                 if (schema >= 11 and !std.meta.eql(try self.readTimeProvenance(record.jail, record.source, record.occurrence), record.zone_provenance)) return error.OccurrenceConflict;
                 if (schema >= 14) if (try self.recordSequence(record.jail, record.source, record.occurrence)) |ordered| {
                     const supplied = source_generation orelse return error.OccurrenceConflict;
@@ -1842,18 +1834,21 @@ pub const Store = struct {
         return .{ .identity = identity, .receipt_us = try row.signed(6) };
     }
 
-    pub fn hasRecord(self: *Store, jail: []const u8, source: []const u8, occurrence: []const u8, raw_hash: [32]u8, cursor: []const u8) Error!bool {
-        try self.checkReplayGuard(jail, source, occurrence, raw_hash, cursor, null, null);
-        var stmt = try self.statement("SELECT raw_hash,cursor FROM records WHERE jail=?1 AND source=?2 AND occurrence=?3;");
+    pub fn hasRecord(self: *Store, jail: []const u8, source: []const u8, occurrence: []const u8, raw_hash: [32]u8) Error!bool {
+        var stmt = try self.statement("SELECT raw_hash FROM records WHERE jail=?1 AND source=?2 AND occurrence=?3;");
         defer stmt.deinit();
         try stmt.text(1, jail);
         try stmt.text(2, source);
         try stmt.text(3, occurrence);
         if (!try stmt.row()) return false;
-        if (!std.mem.eql(u8, try stmt.boundedBytes(0, 32), &raw_hash) or !std.mem.eql(u8, try stmt.boundedBytes(1, Limits.cursor_bytes), cursor)) return error.OccurrenceConflict;
+        if (!std.mem.eql(u8, try stmt.boundedBytes(0, 32), &raw_hash)) return error.OccurrenceConflict;
         return true;
     }
 };
+fn hashColumn(row: *Stmt, column: c_int) Error!?[32]u8 {
+    const value = try row.boundedBytes(column, 32);
+    return if (value.len == 32) value[0..32].* else null;
+}
 pub const Stmt = struct {
     store: *Store,
     ptr: *Statement,

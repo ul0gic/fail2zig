@@ -102,16 +102,24 @@ records, decisions, owners, effects and history. It is created or opened at
 startup with mode 0600. Under the shipped systemd unit a directory other than
 .I /var/lib/fail2zig
 needs a ReadWritePaths override; see the installation guide. Corrupt or unsupported state is refused rather than
-silently reset. The file cannot grow past 1 GiB (262,144 pages of 4 KiB); a
-state file already past that size is refused at startup. When a commit fails
-because the file is full, the daemon pauses ingestion, retries after a delay that
-doubles up to 30 seconds and returns to healthy once recovery completes. Rules
-already in the kernel stay in place meanwhile, and
-.B fail2zig status
-shows the storage phase. The daemon runs no VACUUM, so the file does not shrink;
-rows removed by retention (see
+silently reset. New work is admitted only while the file's used pages, plus the
+pages owed to work already admitted, fit in a capacity of 262,144 pages (1 GiB of
+4 KiB pages). At the capacity, sources wait with the cause
+.B StorageCapacity
+without pausing, and a manual ban,
+.B ignore add
+and a new reload are rejected with that cause; expiry, unban and cleanup keep
+writing, rules already in the kernel stay in place, and intake resumes by itself
+when room returns. SQLite's own limit is 16,384 pages higher (278,528 pages), so the
+file can reach 1 GiB plus 64 MiB on disk; a state file past that limit is refused at
+startup. When the filesystem itself is full, the daemon pauses ingestion with
+.BR StorageFull ,
+retries after a delay that doubles up to 30 seconds and returns to healthy once
+recovery completes. The daemon runs no VACUUM, so the file does not shrink;
+rows removed by cleanup and retention (see
 .BR history_retention ,
-in seconds, default 86400) free pages for reuse inside it. Watch the file size.
+in seconds, default 86400) free pages for reuse inside it. Watch the used pages in
+.BR "fail2zig status" .
 Default:
 .IR /var/lib/fail2zig/state.bin .
 .IP
@@ -616,8 +624,13 @@ at most ten for the address across all jails. Removing a jail removes its overri
 its retained history then uses the global value. Accepted changes apply on reload.
 Each
 .BI [jails. name ]
-section defines one jail. The name must be ASCII alphanumeric, hyphens, or
-underscores.
+section defines one jail. The name is the header text after
+.B jails.
+up to the closing bracket, with surrounding spaces trimmed. A name written as a
+quoted key, \fB[jails."my jail"]\fR or \fB[jails.'my jail']\fR, is the text between
+the quotes; a double-quoted name may not contain a backslash. Validation accepts
+any name of 1 to 64 bytes and checks no character set; names of ASCII letters, digits, hyphens and underscores are the ones that need no
+quoting in commands.
 .TP
 .B enabled
 Boolean. When false, the jail is parsed but not started. Default:
@@ -651,8 +664,14 @@ than deleting state. Use
 to evaluate one rule without starting the daemon.
 .TP
 .B logpath
-String array. Absolute paths to log files. Missing files are warned about but
-are not fatal — they may appear after the daemon starts.
+String array of log file paths. Write absolute paths: unlike
+.BR rule_files ,
+.B journal_executables
+and
+.BR ignore_file ,
+entries are not checked for being absolute; validation rejects only an empty entry,
+one at or above the system path limit, or one containing a NUL byte. Missing files are
+warned about but are not fatal — they may appear after the daemon starts.
 .TP
 .B source
 Overrides defaults.source. Journald and internal jails do not need logpath.

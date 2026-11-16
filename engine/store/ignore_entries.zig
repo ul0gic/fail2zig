@@ -3,6 +3,7 @@
 const std = @import("std");
 const types = @import("shared").types;
 const store = @import("store.zig");
+const budget = @import("budget.zig");
 const Error = store.Error;
 const Stmt = store.Stmt;
 
@@ -48,7 +49,7 @@ pub fn Methods(comptime Store: type) type {
         pub fn addIgnoreEntry(self: *Store, jail: []const u8, entry: types.IgnoreEntry, now_us: i64, expires_us: ?i64) Error!enum { added, present, extended } {
             if (!validJail(jail) or !canonicalNetwork(entry)) return error.InvalidIgnoreEntry;
             if (expires_us) |deadline| if (deadline <= now_us or deadline <= 0) return error.InvalidIgnoreEntry;
-            try self.beginWrite();
+            try self.beginIntakeWrite(budget.ignore_pages);
             errdefer self.rollback();
             if (self.schema_version < store.latest_schema) return error.UnsupportedSchema;
             const stored: ??i64 = stored: {
@@ -100,7 +101,7 @@ pub fn Methods(comptime Store: type) type {
 
         pub fn removeIgnoreEntry(self: *Store, jail: []const u8, entry: types.IgnoreEntry) Error!bool {
             if (!validJail(jail) or !canonicalNetwork(entry)) return error.InvalidIgnoreEntry;
-            try self.beginWrite();
+            try self.beginClassWrite(.reclamation);
             errdefer self.rollback();
             if (self.schema_version < store.latest_schema) return error.UnsupportedSchema;
             {
@@ -148,7 +149,7 @@ pub fn Methods(comptime Store: type) type {
         }
 
         pub fn expireIgnoreEntries(self: *Store, now_us: i64, out: []IgnoreJailCount) Error!usize {
-            try self.beginWrite();
+            try self.beginClassWrite(.reclamation);
             errdefer self.rollback();
             if (self.schema_version < store.latest_schema) return error.UnsupportedSchema;
             var count: usize = 0;

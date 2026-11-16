@@ -254,7 +254,7 @@ pub fn Methods(comptime Store: type) type {
             var members = try self.statement("SELECT 1 FROM temp.retry_admission_rows WHERE jail_id=?1 LIMIT 1;");
             defer members.deinit();
             try members.int(1, id);
-            if (try members.row() or (try self.projectionSummaryTx(jail)).decisions != 0) return error.InvalidRetryState;
+            if (try members.row()) return error.InvalidRetryState;
             var row = try self.statement("DELETE FROM temp.retry_publication_jails WHERE jail_id=?1;");
             defer row.deinit();
             try row.int(1, id);
