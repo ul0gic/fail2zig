@@ -4,6 +4,7 @@ const std = @import("std");
 const mem = std.mem;
 const shared = @import("shared");
 const source = @import("engine_test").firewall.inspection;
+const nft = @import("engine_test").firewall.nftables;
 const access = source.TestAccess;
 const canonical_scope = source.canonical_scope;
 const CanonicalScope = source.CanonicalScope;
@@ -159,6 +160,48 @@ test "native firewall: attribute duplicate unknown and length bounds" {
     try std.testing.expectError(error.UnknownState, access.attrMapParse(&bytes, &.{1}));
     try std.testing.expectError(error.UnknownState, access.attrMapParse(bytes[0..8], &.{2}));
     try std.testing.expectError(error.Incomplete, access.attrMapParse(bytes[0..7], &.{1}));
+}
+
+test "native firewall: nft set readback accepts optional kernel type and count metadata" {
+    var bytes: [512]u8 align(4) = undefined;
+    const base = try nft.buildSetPayload(&bytes, 1, test_name, "banned_ipv4", 1, 7, 4, 0);
+    _ = try access.nftSetAttrs(base);
+
+    const typed = try nft.TestAccess.appendNulString(&bytes, base.len, 19, "nft_rhash");
+    _ = try access.nftSetAttrs(bytes[0..typed]);
+    const both = try nft.TestAccess.appendU32BigEndian(&bytes, typed, 20, 2);
+    const decoded = try access.nftSetAttrs(bytes[0..both]);
+    try std.testing.expectEqualStrings("nft_rhash\x00", decoded.values[19].?);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 2 }, decoded.values[20].?);
+
+    const counted = try nft.TestAccess.appendU32BigEndian(&bytes, base.len, 20 | 0x4000, 2);
+    _ = try access.nftSetAttrs(bytes[0..counted]);
+}
+
+test "native firewall: nft set readback refuses malformed and unknown metadata" {
+    var bytes: [512]u8 align(4) = undefined;
+    const base = try nft.buildSetPayload(&bytes, 1, test_name, "banned_ipv4", 1, 7, 4, 0);
+    var nested: [4]u8 = undefined;
+    mem.writeInt(u16, nested[0..2], 4, @import("builtin").cpu.arch.endian());
+    mem.writeInt(u16, nested[2..4], 1, @import("builtin").cpu.arch.endian());
+    const malformed = [_]struct { kind: u16, value: []const u8 }{
+        .{ .kind = 19, .value = "nft_rhash" },
+        .{ .kind = 19, .value = "nft\x00rhash\x00" },
+        .{ .kind = 19 | 0x4000, .value = "nft_rhash\x00" },
+        .{ .kind = 20, .value = &.{ 0, 0, 2 } },
+        .{ .kind = 20, .value = &.{ 0, 0, 0, 0, 0, 0, 0, 2 } },
+        .{ .kind = 20 | 0x8000, .value = &nested },
+        .{ .kind = 21, .value = &.{ 0, 0, 0, 2 } },
+    };
+    for (malformed) |attribute| {
+        const end = try nft.TestAccess.appendAttribute(&bytes, base.len, attribute.kind, attribute.value);
+        try std.testing.expectError(error.UnknownState, access.nftSetAttrs(bytes[0..end]));
+    }
+
+    const first = try nft.TestAccess.appendNulString(&bytes, base.len, 19, "nft_rhash");
+    const duplicate = try nft.TestAccess.appendNulString(&bytes, first, 19, "nft_rhash");
+    try std.testing.expectError(error.UnknownState, access.nftSetAttrs(bytes[0..duplicate]));
+    try std.testing.expectError(error.Incomplete, access.nftSetAttrs(bytes[0 .. first - 1]));
 }
 
 test "native firewall: original deadline quantization and finite verification reject widening" {
