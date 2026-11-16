@@ -73,7 +73,8 @@ error.
 | `broken (cause)`  | The source failed; the cause in parentheses names why.                         |
 
 `status` adds `Sources: N unhealthy`, one `Paused:` block per paused source with
-its `Repair:` command, a `Missing:` row per configured path with no file, and a
+its `Repair:` command, a `Waiting:` or `Broken:` row with the cause for a jail whose
+source is unhealthy but not paused, a `Missing:` row per configured path with no file, and a
 `Loss events:` row for every source that resumed
 under `restart`. `--details` lists each retained event, newest first, up to 256
 per source. In JSON, `paused_sources` counts the paused sources and `sources[]`

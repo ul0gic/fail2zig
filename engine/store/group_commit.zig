@@ -9,6 +9,7 @@ pub const Frame = struct {
     records: u16 = 0,
     effect_changed: bool = false,
     broken: bool = false,
+    cause: ?Error = null,
     open: ?struct { noted_count: u8, noted_ambiguous: bool } = null,
 };
 
@@ -43,12 +44,14 @@ pub fn Methods(comptime Store: type) type {
             self.row_tallies = .{};
             self.noted_count = saved.noted_count;
             self.noted_ambiguous = saved.noted_ambiguous;
-            self.exec("ROLLBACK TO batch_record;") catch {
+            self.exec("ROLLBACK TO batch_record;") catch |failure| {
                 frame.broken = true;
+                frame.cause = failure;
                 return;
             };
-            self.exec("RELEASE batch_record;") catch {
+            self.exec("RELEASE batch_record;") catch |failure| {
                 frame.broken = true;
+                frame.cause = failure;
             };
         }
 

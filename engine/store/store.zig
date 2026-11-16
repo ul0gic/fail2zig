@@ -167,6 +167,12 @@ pub const ReceiptIdentity = struct {
     cursor: []const u8,
     raw_hash: [32]u8,
     generation: [32]u8,
+
+    pub fn sameRecord(self: ReceiptIdentity, other: ReceiptIdentity) bool {
+        return std.mem.eql(u8, self.jail, other.jail) and std.mem.eql(u8, self.source, other.source) and
+            std.mem.eql(u8, self.occurrence, other.occurrence) and std.mem.eql(u8, &self.raw_hash, &other.raw_hash) and
+            std.mem.eql(u8, &self.generation, &other.generation);
+    }
 };
 pub const Receipt = struct { time: native_time.Timestamp, generation: [32]u8 };
 pub const HistoryResetScope = union(enum) { jail: []const u8, overall };
@@ -1128,10 +1134,10 @@ pub const Store = struct {
         try row.text(1, identity.jail);
         try row.text(2, identity.source);
         if (!try row.row()) return null;
-        if (!std.mem.eql(u8, try row.boundedBytes(0, 32), &identity.generation) or
-            !std.mem.eql(u8, try row.boundedBytes(1, 16384), identity.occurrence) or
-            !std.mem.eql(u8, try row.boundedBytes(2, 32), &identity.raw_hash) or
-            !std.mem.eql(u8, try row.boundedBytes(3, Limits.cursor_bytes), identity.cursor)) return error.ReceiptConflict;
+        const generation = try hashColumn(&row, 0) orelse return error.ReceiptConflict;
+        const raw_hash = try hashColumn(&row, 2) orelse return error.ReceiptConflict;
+        const saved = ReceiptIdentity{ .jail = identity.jail, .source = identity.source, .occurrence = try row.boundedBytes(1, 16384), .cursor = try row.boundedBytes(3, Limits.cursor_bytes), .raw_hash = raw_hash, .generation = generation };
+        if (!identity.sameRecord(saved)) return error.ReceiptConflict;
         return .{ .us = try row.signed(4) };
     }
 
@@ -1150,9 +1156,10 @@ pub const Store = struct {
         try row.text(2, identity.source);
         try row.text(3, identity.occurrence);
         if (!try row.row()) return null;
-        if (!std.mem.eql(u8, try row.boundedBytes(0, 32), &identity.raw_hash) or
-            !std.mem.eql(u8, try row.boundedBytes(1, Limits.cursor_bytes), identity.cursor) or
-            !std.mem.eql(u8, try row.boundedBytes(2, 32), &identity.generation)) return error.ReceiptConflict;
+        const raw_hash = try hashColumn(&row, 0) orelse return error.ReceiptConflict;
+        const generation = try hashColumn(&row, 2) orelse return error.ReceiptConflict;
+        const saved = ReceiptIdentity{ .jail = identity.jail, .source = identity.source, .occurrence = identity.occurrence, .cursor = try row.boundedBytes(1, Limits.cursor_bytes), .raw_hash = raw_hash, .generation = generation };
+        if (!identity.sameRecord(saved)) return error.ReceiptConflict;
         return .{ .us = try row.signed(3) };
     }
 
@@ -1489,13 +1496,13 @@ pub const Store = struct {
             }
         }
         {
-            var prior = try self.statement("SELECT raw_hash,cursor FROM records WHERE jail=?1 AND source=?2 AND occurrence=?3;");
+            var prior = try self.statement("SELECT raw_hash FROM records WHERE jail=?1 AND source=?2 AND occurrence=?3;");
             defer prior.deinit();
             try prior.text(1, record.jail);
             try prior.text(2, record.source);
             try prior.text(3, record.occurrence);
             if (try prior.row()) {
-                if (!std.mem.eql(u8, try prior.boundedBytes(0, 32), &record.raw_hash) or !std.mem.eql(u8, try prior.boundedBytes(1, Limits.cursor_bytes), record.cursor)) return error.OccurrenceConflict;
+                if (!std.mem.eql(u8, try prior.boundedBytes(0, 32), &record.raw_hash)) return error.OccurrenceConflict;
                 if (schema >= 11 and !std.meta.eql(try self.readTimeProvenance(record.jail, record.source, record.occurrence), record.zone_provenance)) return error.OccurrenceConflict;
                 if (schema >= 14) if (try self.recordSequence(record.jail, record.source, record.occurrence)) |ordered| {
                     const supplied = source_generation orelse return error.OccurrenceConflict;
@@ -1844,16 +1851,20 @@ pub const Store = struct {
 
     pub fn hasRecord(self: *Store, jail: []const u8, source: []const u8, occurrence: []const u8, raw_hash: [32]u8, cursor: []const u8) Error!bool {
         try self.checkReplayGuard(jail, source, occurrence, raw_hash, cursor, null, null);
-        var stmt = try self.statement("SELECT raw_hash,cursor FROM records WHERE jail=?1 AND source=?2 AND occurrence=?3;");
+        var stmt = try self.statement("SELECT raw_hash FROM records WHERE jail=?1 AND source=?2 AND occurrence=?3;");
         defer stmt.deinit();
         try stmt.text(1, jail);
         try stmt.text(2, source);
         try stmt.text(3, occurrence);
         if (!try stmt.row()) return false;
-        if (!std.mem.eql(u8, try stmt.boundedBytes(0, 32), &raw_hash) or !std.mem.eql(u8, try stmt.boundedBytes(1, Limits.cursor_bytes), cursor)) return error.OccurrenceConflict;
+        if (!std.mem.eql(u8, try stmt.boundedBytes(0, 32), &raw_hash)) return error.OccurrenceConflict;
         return true;
     }
 };
+fn hashColumn(row: *Stmt, column: c_int) Error!?[32]u8 {
+    const value = try row.boundedBytes(column, 32);
+    return if (value.len == 32) value[0..32].* else null;
+}
 pub const Stmt = struct {
     store: *Store,
     ptr: *Statement,

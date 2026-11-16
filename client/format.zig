@@ -96,6 +96,7 @@ pub const StatusPayload = struct {
     state_file_bytes: ?u64 = null,
     state_file_pages: ?u64 = null,
     state_file_max_pages: ?u64 = null,
+    state_file_used_pages: ?u64 = null,
     pool_sample_available: ?bool = null,
     pool_sample_pending: ?bool = null,
     pool_sample_as_of_us: ?i64 = null,
@@ -374,6 +375,7 @@ fn writeStatusPlain(writer: anytype, s: StatusPayload) !void {
     if (s.memory_admission_bytes) |m| try writer.print("memory_admission_bytes\t{d}\n", .{m});
     var footprint_buffer: [96]u8 = undefined;
     if (formatStateFile(&footprint_buffer, s)) |value| try writer.print("state_file\t{s}\n", .{value});
+    if (s.state_file_used_pages) |pages| try writer.print("state_file_used_pages\t{d}\n", .{pages});
     if (formatTrackingPool(&footprint_buffer, s)) |value| try writer.print("tracking_pool\t{s}\n", .{value});
     for (s.sources orelse &.{}) |source| try writeSourcePlain(writer, source);
 }
@@ -503,6 +505,7 @@ fn writeStatusTable(writer: anytype, s: StatusPayload, color: Color, columns: us
     if (s.clock_uncertain == true) try rowLabel(writer, "Clock:", "uncertain", width);
     if (formatExpiry(&summary_buffer, s)) |value| try rowLabel(writer, "Expiry:", value, width);
     if (formatStateFile(&summary_buffer, s)) |value| try rowLabel(writer, "State file:", value, width);
+    if (formatUsedPages(&summary_buffer, s)) |value| try rowLabel(writer, "Used pages:", value, width);
     if (formatTrackingPool(&summary_buffer, s)) |value| try rowLabel(writer, tracking_pool_label, value, width);
 
     try drawBotLine(writer, width);
@@ -558,6 +561,7 @@ fn writeStatusSummary(writer: anytype, s: StatusPayload, color: Color, columns: 
     if (s.clock_uncertain == true) try writeStatusNarrowRow(writer, "Clock: ", "uncertain", columns);
     if (formatExpiry(&summary, s)) |value| try writeStatusNarrowRow(writer, "Expiry: ", value, columns);
     if (formatStateFile(&summary, s)) |value| try writeStatusNarrowRow(writer, "State file: ", value, columns);
+    if (formatUsedPages(&summary, s)) |value| try writeStatusNarrowRow(writer, "Used pages: ", value, columns);
     if (formatTrackingPool(&summary, s)) |value| try writeStatusNarrowRow(writer, tracking_pool_label, value, columns);
 }
 
@@ -614,6 +618,7 @@ fn writeStatusNarrow(writer: anytype, s: StatusPayload, color: Color, columns: u
     if (s.clock_uncertain == true) try writeStatusNarrowRow(writer, "Clock: ", "uncertain", columns);
     if (formatExpiry(&summary_buffer, s)) |value| try writeStatusNarrowRow(writer, "Expiry: ", value, columns);
     if (formatStateFile(&summary_buffer, s)) |value| try writeStatusNarrowRow(writer, "State file: ", value, columns);
+    if (formatUsedPages(&summary_buffer, s)) |value| try writeStatusNarrowRow(writer, "Used pages: ", value, columns);
     if (formatTrackingPool(&summary_buffer, s)) |value| try writeStatusNarrowRow(writer, tracking_pool_label, value, columns);
 }
 
@@ -630,6 +635,13 @@ const repair_restart = "Then start fail2zig. While it is stopped, firewall rules
 fn isPaused(source: SourceEntry) bool {
     const state = source.state orelse return false;
     return std.mem.eql(u8, state, "paused");
+}
+
+fn stuckLabel(source: SourceEntry) ?[]const u8 {
+    const state = source.state orelse return null;
+    if (std.mem.eql(u8, state, "waiting")) return "Waiting:";
+    if (std.mem.eql(u8, state, "broken")) return "Broken:";
+    return null;
 }
 
 fn isMissing(source: SourceEntry) bool {
@@ -733,6 +745,15 @@ fn writeSourcesNarrow(writer: anytype, s: StatusPayload, color: Color, columns: 
         }
     }
     for (s.sources orelse &.{}) |source| {
+        const label = stuckLabel(source) orelse continue;
+        var value_buffer: [512]u8 = undefined;
+        try writer.print("{s} ", .{label});
+        try color.on(writer, Color.yellow);
+        try writeCell(writer, pausedValue(&value_buffer, source), @max(@as(usize, 4), columns -| (label.len + 1)));
+        try color.off(writer);
+        try writer.writeByte('\n');
+    }
+    for (s.sources orelse &.{}) |source| {
         if (!hasLossEvents(source)) continue;
         var value_buffer: [512]u8 = undefined;
         try writeStatusNarrowRow(writer, "Loss events: ", lossValue(&value_buffer, source), columns);
@@ -758,6 +779,11 @@ fn writeSourcesBoxed(writer: anytype, s: StatusPayload, color: Color, width: usi
         }
     }
     for (s.sources orelse &.{}) |source| {
+        const label = stuckLabel(source) orelse continue;
+        var value_buffer: [512]u8 = undefined;
+        try rowLabelStyled(writer, color, Color.yellow, label, pausedValue(&value_buffer, source), width, false);
+    }
+    for (s.sources orelse &.{}) |source| {
         if (!hasLossEvents(source)) continue;
         var value_buffer: [512]u8 = undefined;
         try rowLabel(writer, "Loss events:", lossValue(&value_buffer, source), width);
@@ -769,6 +795,7 @@ fn sourcesWidth(s: StatusPayload) usize {
     for (s.sources orelse &.{}) |source| {
         var value_buffer: [512]u8 = undefined;
         if (isMissing(source)) used = @max(used, rowUsed(missingValue(&value_buffer, source)));
+        if (stuckLabel(source) != null) used = @max(used, rowUsed(pausedValue(&value_buffer, source)));
         if (isPaused(source)) {
             used = @max(used, rowUsed(pausedValue(&value_buffer, source)));
             if (source.repair) |repair| {
@@ -953,6 +980,7 @@ fn statusWidth(s: StatusPayload) usize {
     if (s.clock_uncertain == true) used = @max(used, rowUsed("uncertain"));
     if (formatExpiry(&summary_buffer, s)) |value| used = @max(used, rowUsed(value));
     if (formatStateFile(&summary_buffer, s)) |value| used = @max(used, rowUsed(value));
+    if (formatUsedPages(&summary_buffer, s)) |value| used = @max(used, rowUsed(value));
     if (formatTrackingPool(&summary_buffer, s)) |value| used = @max(used, rowUsed(value) + tracking_pool_label.len - label_col);
     used = @max(used, sourcesWidth(s));
     return @max(44, used + 2);
@@ -965,6 +993,12 @@ fn formatStateFile(buffer: []u8, s: StatusPayload) ?[]const u8 {
     const pages = s.state_file_pages orelse return null;
     const max_pages = s.state_file_max_pages orelse return null;
     return std.fmt.bufPrint(buffer, "{d} ({d} pages of {d})", .{ bytes, pages, max_pages }) catch null;
+}
+
+fn formatUsedPages(buffer: []u8, s: StatusPayload) ?[]const u8 {
+    const used = s.state_file_used_pages orelse return null;
+    const pages = s.state_file_pages orelse return null;
+    return std.fmt.bufPrint(buffer, "{d} of {d} allocated", .{ used, pages }) catch null;
 }
 
 fn formatTrackingPool(buffer: []u8, s: StatusPayload) ?[]const u8 {

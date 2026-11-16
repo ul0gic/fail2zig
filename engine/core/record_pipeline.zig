@@ -65,7 +65,10 @@ pub const Pipeline = struct {
 
     fn admitClock(self: *Pipeline, in_transaction: bool) !void {
         if (self.gate) |gate| try gate.admit(self.recovery_generation);
-        if (!self.ready) return error.RestoreRequired;
+        if (!self.ready) {
+            self.park();
+            return error.RestoreRequired;
+        }
         if (self.store.schema_version >= 7) if (self.receipts) |admission| {
             const read = if (in_transaction) self.store.readAdmissionClock(self.store.schema_version) else self.store.admissionClock();
             const floor = read catch |failure| {
@@ -77,6 +80,23 @@ pub const Pipeline = struct {
                 return error.ReceiptClockReversed;
             };
         };
+    }
+
+    pub fn park(self: *Pipeline) void {
+        self.ready = false;
+        if (self.gate) |gate| if (gate.snapshot().phase == .healthy) gate.failed(error.RestoreRequired, .{});
+    }
+
+    fn frameFailed(self: *Pipeline, cause: anyerror) anyerror {
+        self.candidate_receipt = null;
+        self.ready = false;
+        if (health.retryable(cause)) {
+            self.failed(cause);
+            return cause;
+        }
+        std.log.err("native: jail={} record frame rolled back: {s}; recovering as RestoreRequired", .{ std.zig.fmtEscapes(self.jail), @errorName(cause) });
+        self.failed(error.RestoreRequired);
+        return error.RestoreRequired;
     }
 
     pub fn receiptClockFailed(self: *Pipeline, floor_us: i64) void {
@@ -175,7 +195,7 @@ pub const Pipeline = struct {
         try self.admit();
         self.beginDiagnostics();
         self.acknowledgeAdmitted(record) catch |failure| {
-            if (self.gate != null and !retainsAdmission(failure)) self.ready = false;
+            if (self.gate != null and !retainsAdmission(failure)) self.park();
             return failure;
         };
     }
@@ -191,7 +211,7 @@ pub const Pipeline = struct {
         try self.admit();
         self.beginDiagnostics();
         self.acknowledgeFrame(batch, acknowledged) catch |failure| {
-            if (self.gate != null and !retainsAdmission(failure)) self.ready = false;
+            if (self.gate != null and !retainsAdmission(failure)) self.park();
             return failure;
         };
     }
@@ -207,21 +227,17 @@ pub const Pipeline = struct {
             self.stageInFrame(&frame, record) catch |cause| break cause;
             staged += 1;
         } else null;
-        if (staged == 0 or frame.broken) {
+        if (staged == 0) {
             self.store.rollback();
-            if (staged != 0) {
-                self.ready = false;
-                self.failed(error.RestoreRequired);
-                return error.RestoreRequired;
-            }
             if (refusal) |cause| return cause;
             return;
         }
-        self.store.commitBatch(&frame) catch {
-            self.ready = false;
-            self.failed(error.RestoreRequired);
-            return error.RestoreRequired;
-        };
+        if (frame.cause) |broken| {
+            self.store.rollback();
+            const first = refusal orelse broken;
+            return self.frameFailed(if (retainsAdmission(first)) broken else first);
+        }
+        self.store.commitBatch(&frame) catch |failure| return self.frameFailed(failure);
         acknowledged.* = staged;
         if (self.gate) |gate| for (0..frame.records) |_| gate.committed();
         if (refusal) |cause| return cause;
@@ -240,7 +256,10 @@ pub const Pipeline = struct {
             const identity = self.receiptIdentity(record, admission);
             const key = receiptKey(identity);
             if (self.candidate_receipt) |candidate| {
-                if (!std.mem.eql(u8, &candidate.identity, &key)) return error.ReceiptRetryRequired;
+                if (!std.mem.eql(u8, &candidate.identity, &key)) {
+                    self.park();
+                    return error.RestoreRequired;
+                }
             } else self.candidate_receipt = .{ .identity = key, .time = try admission.clock(admission.clock_context) };
             const reserved = self.store.reserveReceiptStep(identity, self.candidate_receipt.?.time, self.revision) catch |failure| {
                 const cause = if (failure == error.ReceiptAlreadyCommitted) error.ConcurrentWriter else failure;
@@ -280,7 +299,10 @@ pub const Pipeline = struct {
             const identity = self.receiptIdentity(record, admission);
             const key = receiptKey(identity);
             if (self.candidate_receipt) |candidate| {
-                if (!std.mem.eql(u8, &candidate.identity, &key)) return error.ReceiptRetryRequired;
+                if (!std.mem.eql(u8, &candidate.identity, &key)) {
+                    self.park();
+                    return error.RestoreRequired;
+                }
             } else self.candidate_receipt = .{ .identity = key, .time = try admission.clock(admission.clock_context) };
             const saved = self.store.beginReceipt(identity, self.candidate_receipt.?.time, self.revision) catch |failure| {
                 const cause = if (failure == error.ReceiptAlreadyCommitted) error.ConcurrentWriter else failure;
@@ -380,7 +402,7 @@ pub const Pipeline = struct {
     fn receiptKey(identity: durable.ReceiptIdentity) [32]u8 {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("fail2zig-receipt-candidate-v1\x00");
-        for ([_][]const u8{ identity.jail, identity.source, identity.occurrence, identity.cursor, &identity.raw_hash, &identity.generation }) |part| {
+        for ([_][]const u8{ identity.jail, identity.source, identity.occurrence, &identity.raw_hash, &identity.generation }) |part| {
             var length: [8]u8 = undefined;
             std.mem.writeInt(u64, &length, part.len, .little);
             hash.update(&length);

@@ -81,7 +81,7 @@ for presence before reading a value.
 | Group              | Fields                                                                                                                                         |
 | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
 | Identity           | `version`, `runtime` (`"native"`), `generation` (64 hex digits), `mutation_revision`, `schema_version` (`1`).                                   |
-| Protection         | `state` and `protection` (the same value: `active`, `degraded`, `log-only` or `unknown`), `cause` (`"none"` when clear), `protection_cause`.    |
+| Protection         | `state` and `protection` (the same value: `active`, `degraded`, `log-only` or `unknown`), `cause` (`"none"` when clear; an unhealthy, unpaused source's error when nothing else explains it), `protection_cause`. |
 | Bans               | `active_bans` (omitted when kernel knowledge is `none`), `total_bans`, `decisions_total`.                                                       |
 | Firewall knowledge | `knowledge` (`fresh`, `stale` or `none`), `confirmed_at_us`, `knowledge_age_ms`, `pending_bans`, `oldest_pending_ms`, `overdue_removals`, `oldest_overdue_ms`, `overdue_bookkeeping`, `dump_interrupted`. |
 | Storage            | `storage` (the phase, `healthy` in normal operation), `sqlite_code`, `next_retry_ms`, `committed_records`.                                      |
@@ -89,12 +89,14 @@ for presence before reading a value.
 | Backend            | `backend`, `effect_backend`, `effect_stage`, `effect_cause`, `effect_mutation`, `effects_uncertain`, `overdue_effects`.                         |
 | Worker and clock   | `worker_busy`, `worker_stalled`, `worker_busy_age_ms`, `worker_heartbeat_age_ms`, `clock_uncertain`, `expiry_overdue`, `expiry_uncertain`, `next_committed_expiry_us`. |
 | Resources          | `memory_admission_bytes`, `uptime_seconds` (omitted while the clock is uncertain).                                                             |
-| State file         | `state_file_bytes`, `state_file_pages`, `state_file_max_pages`.                                                                                |
+| State file         | `state_file_bytes`, `state_file_pages` (allocated), `state_file_max_pages`, `state_file_used_pages` (allocated minus SQLite's free pages).       |
 | Tracking pool      | `pool_sample_available`, `pool_sample_pending`, `pool_sample_as_of_us`; with a sample, `pool_tracked`, `pool_banned`, `pool_tracking_limit`, `pool_ban_limit`. |
 
 Each entry of `sources` describes one log source: `jail`, `kind`, `state`,
 `loss_events`, and when they apply `path`, `on_truncation`, `cause`, `inode`,
-`committed_offset`, `observed_size`, `repair` and `last_loss`. The
+`committed_offset`, `observed_size`, `repair` and `last_loss`. `state` is `reading`,
+`paused`, `missing`, `waiting` or `broken`; a `waiting` or `broken` entry has no
+`path` and names the jail's source error in `cause`. The
 [log file lifecycle](../guides/log-lifecycle.md) explains the states.
 
 Fields ending in `_us` are microseconds since the Unix epoch; fields ending in
@@ -123,6 +125,7 @@ These carry no labels and are all gauges.
 | `fail2zig_native_expiry_uncertain`        | `1` when expiry state is uncertain.                           |
 | `fail2zig_state_file_bytes`               | Size of the state file in bytes.                              |
 | `fail2zig_state_file_pages`               | Size of the state file in pages; the ceiling is 262,144.      |
+| `fail2zig_state_file_used_pages`          | Pages in use: the file's pages minus SQLite's free pages.     |
 | `fail2zig_pool_sample_available`          | `1` when a tracking-pool sample has been published.           |
 | `fail2zig_pool_sample_pending`            | `1` while a new sample is being taken.                        |
 | `fail2zig_pool_sample_as_of_seconds`      | Time of the sample, in seconds since the Unix epoch.          |

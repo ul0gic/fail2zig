@@ -248,7 +248,7 @@ pub const SourceStatus = struct {
     kind: enum { file, journal },
     path: ?[]const u8,
     on_truncation: ?config.TruncationPolicy,
-    state: enum { paused, reading, missing },
+    state: enum { paused, reading, missing, waiting, broken },
     cause: ?[]const u8,
     inode: ?u64,
     committed_offset: ?u64,
@@ -265,6 +265,7 @@ const SourceSignature = struct {
     presence_known: bool = true,
     causes: [max_sources_per_jail + 1]?anyerror = [_]?anyerror{null} ** (max_sources_per_jail + 1),
     loss_sequence: u64 = 0,
+    stuck: ?anyerror = null,
     built: bool = false,
 };
 
@@ -2399,7 +2400,7 @@ pub const Coordinator = struct {
         }
         const footprint = try self.store.stateFileFootprint();
         const confirmations = try self.confirmedEvents();
-        self.metrics_state.setStateFile(footprint.bytes, footprint.pages);
+        self.metrics_state.setStateFile(footprint.bytes, footprint.pages, footprint.used_pages);
         self.mutex.lock();
         if (sample) |value| self.published_pool.sample = value;
         self.published_pool.pending = sample == null;
@@ -2800,15 +2801,16 @@ pub const Coordinator = struct {
         return signature;
     }
     fn sameSignature(a: SourceSignature, b: SourceSignature) bool {
-        return a.built == b.built and a.sources == b.sources and a.configured == b.configured and a.presence_revision == b.presence_revision and a.presence_known == b.presence_known and a.loss_sequence == b.loss_sequence and std.mem.eql(?anyerror, &a.causes, &b.causes);
+        return a.built == b.built and a.sources == b.sources and a.configured == b.configured and a.presence_revision == b.presence_revision and a.presence_known == b.presence_known and a.loss_sequence == b.loss_sequence and a.stuck == b.stuck and std.mem.eql(?anyerror, &a.causes, &b.causes);
     }
     fn refreshSourceStatus(self: *Coordinator, jail: *Jail) !void {
         const source = jail.session orelse return;
-        const signature = sourceSignature(source);
+        var signature = sourceSignature(source);
+        if (!jail.healthy and source != .internal and std.mem.allEqual(?anyerror, &signature.causes, null)) signature.stuck = jail.source_error;
         if (sameSignature(jail.source_signature, signature)) return self.refreshReadingOffsets(jail);
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
-        const entries = try self.buildSourceStatus(jail, arena.allocator());
+        const entries = try self.buildSourceStatus(jail, arena.allocator(), signature.stuck);
         self.mutex.lock();
         const previous = jail.source_status_arena;
         jail.source_status = entries;
@@ -2841,7 +2843,7 @@ pub const Coordinator = struct {
             }
         }
     }
-    fn buildSourceStatus(self: *Coordinator, jail: *Jail, arena: std.mem.Allocator) ![]SourceStatus {
+    fn buildSourceStatus(self: *Coordinator, jail: *Jail, arena: std.mem.Allocator, stuck: ?anyerror) ![]SourceStatus {
         var list = std.ArrayListUnmanaged(SourceStatus){};
         switch (jail.session.?) {
             .file => |session| {
@@ -2897,11 +2899,18 @@ pub const Coordinator = struct {
             },
             .internal => {},
         }
+        if (stuck) |cause| for (list.items) |entry| {
+            if (entry.state == .paused) break;
+        } else try list.append(arena, stuckWithoutPath(jail, cause));
         std.sort.pdq(SourceStatus, list.items, {}, sourceStatusLess);
         return list.toOwnedSlice(arena);
     }
     fn pausedWithoutPath(jail: *const Jail, kind: @FieldType(SourceStatus, "kind"), cause: ?anyerror) SourceStatus {
         return .{ .jail = jail.name, .kind = kind, .path = null, .on_truncation = if (kind == .file) jail.on_truncation else null, .state = .paused, .cause = @errorName(cause orelse error.SourceInterventionRequired), .inode = null, .committed_offset = null, .observed_size = null, .repair = null, .loss_events = 0, .last_loss = null };
+    }
+    fn stuckWithoutPath(jail: *const Jail, cause: anyerror) SourceStatus {
+        const kind: @FieldType(SourceStatus, "kind") = if (jail.plan == .journal) .journal else .file;
+        return .{ .jail = jail.name, .kind = kind, .path = null, .on_truncation = if (kind == .file) jail.on_truncation else null, .state = if (pipeline.Pipeline.commitBlocked(cause)) .waiting else .broken, .cause = @errorName(cause), .inode = null, .committed_offset = null, .observed_size = null, .repair = null, .loss_events = 0, .last_loss = null };
     }
     fn sourceStatusLess(_: void, a: SourceStatus, b: SourceStatus) bool {
         return std.mem.lessThan(u8, a.path orelse "", b.path orelse "");
@@ -3277,7 +3286,8 @@ pub const Coordinator = struct {
                 self.mutex.unlock();
                 if (changed) {
                     if (comptime build_options.diag) diag_mod.event(.source_paused, .{ .subject = jail.name, .cause = @errorName(failure) });
-                    if (jail.session.? == .journal) logJournalFailure(jail, failure, diagnostic) else std.log.err("native jail {s}: {s}; source paused pending repair", .{ jail.name, @errorName(failure) });
+                    if (jail.session.? == .journal) logJournalFailure(jail, failure, diagnostic) else std.log.err("native jail {s}: {s}; source stuck, retried on every poll; see fail2zig status", .{ jail.name, @errorName(failure) });
+                    try self.refreshSourceStatus(jail);
                 }
                 continue;
             };
@@ -3849,15 +3859,15 @@ pub const Coordinator = struct {
             self.mutex.lock();
             defer self.mutex.unlock();
             const wall = self.observationWall();
-            const ms = observationMs();
-            const observation = self.worker_observation.read(ms, wall);
+            const observation = self.worker_observation.read(observationMs(), wall);
+            const effect_ms = monotonic(self);
             for (self.jails, 0..) |jail, i| rows[i] = .{
                 .name = try detection.Name.init(jail.name),
                 .healthy = jail.healthy and self.published_health.phase == .healthy and observationSound(observation),
                 .enabled = jail.admin_enabled,
                 .paused = jail.admin_paused,
                 .disable_cleanup_pending = jail.disable_cleanup_pending,
-                .active_bans = self.confirmedCount(jail, wall orelse self.start_us, ms),
+                .active_bans = self.confirmedCount(jail, wall orelse self.start_us, effect_ms),
                 .maxretry = jail.policy.maxretry,
                 .findtime = @divTrunc(jail.policy.window_us, 1_000_000),
                 .bantime = switch (jail.policy.duration) {
@@ -3866,7 +3876,7 @@ pub const Coordinator = struct {
                 },
                 .action = if (self.jailEnforces(&jail)) self.published_backend else "log-only",
                 .enforce_configured = jail.policy.enforce,
-                .enforcing = self.jailEnforces(&jail) and self.enforcementActive(observation, ms),
+                .enforcing = self.jailEnforces(&jail) and self.enforcementActive(observation, effect_ms),
                 .source = std.meta.activeTag(jail.plan),
                 .source_healthy = jail.healthy,
                 .source_paused = jailPaused(&jail),

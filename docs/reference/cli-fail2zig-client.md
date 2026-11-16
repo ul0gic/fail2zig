@@ -79,13 +79,16 @@ Check protection knowledge age, pending bans and overdue removals. A stale or
 degraded status is not confirmation of current kernel protection.
 
 `status` table output adds `State file: <bytes> (<pages> pages of <max_pages>)`
-against the 1 GiB ceiling and `Tracking pool: <tracked> of <limit> tracked,
+against the 1 GiB ceiling, `Used pages: <used_pages> of <pages> allocated` (pages
+in use, excluding the free pages the file keeps for reuse) and `Tracking pool: <tracked> of <limit> tracked,
 <banned> of <limit> banned` against the shared pool of 65,536 tracked addresses
 and 65,536 live bans. A paused file source appears as a `Paused:` block with the
 jail, path, cause and the exact `repair-source` command; a source that resumed
 under `on_truncation = "restart"` shows a `Loss events:` row, and `--details`
-lists each retained event. JSON adds `state_file_bytes`, `state_file_pages`,
-`state_file_max_pages`, `pool_tracked`, `pool_banned`, `pool_tracking_limit`,
+lists each retained event. A source that is unhealthy but not paused appears as a
+`Waiting:` or `Broken:` row with the jail, source kind and cause, and `Cause:`
+names that error instead of `unknown`. JSON adds `state_file_bytes`, `state_file_pages`,
+`state_file_max_pages`, `state_file_used_pages`, `pool_tracked`, `pool_banned`, `pool_tracking_limit`,
 `pool_ban_limit`, `paused_sources` and a `sources` array. Use
 `status --output json`; there is no `--json` flag.
 

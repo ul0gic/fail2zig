@@ -350,7 +350,7 @@ a day of history fit with headroom: once an intent is applied or expired only it
 observation is kept, and the bounded maintenance walk clears the evidence text of retry
 decisions and confirmed events whose ban ended more than `history_retention` ago. The
 target is at most 4 KiB of state file per live ban. `status` and `/metrics` report the
-file's bytes and pages. A commit that fails because the file is full
+file's bytes, its allocated pages and its used pages (allocated minus SQLite's free pages). A commit that fails because the file is full
 (SQLite "database or disk is full", `StorageFull`) is a retryable storage failure.
 Ingestion pauses and the daemon retries after a delay that starts at 1 s and doubles
 with each recovery attempt up to 30 s. A recovery attempt moves through storage, state,

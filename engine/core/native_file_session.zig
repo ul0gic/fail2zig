@@ -81,7 +81,6 @@ pub const PausedSource = struct {
 };
 
 pub const RecoveryReservation = struct { bytes: usize, allocations: usize, descriptors: usize };
-const CandidateReceipt = @FieldType(pipeline.Pipeline, "candidate_receipt");
 pub const RecoverySnapshot = struct {
     allocator: std.mem.Allocator,
     generation: [32]u8,
@@ -90,8 +89,6 @@ pub const RecoverySnapshot = struct {
     entries: std.ArrayList(Retained),
     discovery_repair: repair.Repair,
     notices: std.time.Timer,
-    candidate_receipt: CandidateReceipt,
-    candidate_index: ?usize = null,
 
     pub fn reservation(max_sources: usize) !RecoveryReservation {
         if (max_sources == 0 or max_sources > durable.Limits.pending_receipts) return error.InvalidSourceLimit;
@@ -284,7 +281,7 @@ pub const Session = struct {
         const a = self.allocator;
         const out = try a.create(RecoverySnapshot);
         errdefer a.destroy(out);
-        out.* = .{ .allocator = a, .generation = self.processor.generation, .jail = try a.dupe(u8, self.pipe.jail), .max_sources = self.sources.max_sources, .entries = std.ArrayList(Retained).init(a), .discovery_repair = self.discovery_repair, .notices = self.notices, .candidate_receipt = self.pipe.candidate_receipt };
+        out.* = .{ .allocator = a, .generation = self.processor.generation, .jail = try a.dupe(u8, self.pipe.jail), .max_sources = self.sources.max_sources, .entries = std.ArrayList(Retained).init(a), .discovery_repair = self.discovery_repair, .notices = self.notices };
         errdefer {
             for (out.entries.items) |entry| entry.deinit(a);
             out.entries.deinit();
@@ -331,14 +328,6 @@ pub const Session = struct {
             if (out.entries.items.len == self.sources.max_sources) return error.SourceLimit;
             out.entries.appendAssumeCapacity(try cloneRetained(a, entry));
         }
-        if (out.candidate_receipt != null) {
-            const source = self.candidate_source orelse return error.PendingSourceMissing;
-            for (out.entries.items, 0..) |entry, index| if (std.mem.eql(u8, entry.source, source)) {
-                out.candidate_index = index;
-                break;
-            };
-            if (out.candidate_index == null) return error.PendingSourceMissing;
-        }
         return out;
     }
 
@@ -346,8 +335,6 @@ pub const Session = struct {
         if (self.processor.in_flight or self.admission_phase != .positions or self.sources.sources.items.len != 0 or self.retained.items.len != 0) return error.RecoveryOutOfOrder;
         if (self.sources.max_sources != snapshot.max_sources or !std.mem.eql(u8, &self.processor.generation, &snapshot.generation) or !std.mem.eql(u8, self.pipe.jail, snapshot.jail)) return error.SourceGenerationMismatch;
         if (snapshot.entries.items.len > self.sources.max_sources) return error.SourceLimit;
-        if ((snapshot.candidate_receipt == null) != (snapshot.candidate_index == null)) return error.PendingRecordMismatch;
-        if (snapshot.candidate_index) |index| if (index >= snapshot.entries.items.len) return error.PendingSourceMissing;
         var staged = std.ArrayList(Retained).init(self.allocator);
         errdefer {
             for (staged.items) |entry| entry.deinit(self.allocator);
@@ -357,8 +344,6 @@ pub const Session = struct {
         for (snapshot.entries.items) |entry| staged.appendAssumeCapacity(try cloneRetained(self.allocator, entry));
         self.retained.deinit();
         self.retained = staged;
-        self.candidate_source = if (snapshot.candidate_index) |index| self.retained.items[index].source else null;
-        self.pipe.candidate_receipt = snapshot.candidate_receipt;
         self.discovery_repair = snapshot.discovery_repair;
         self.notices = snapshot.notices;
     }
@@ -685,11 +670,24 @@ pub const Session = struct {
         const source_id = self.sources.sources.items[index].source_id;
         if (self.pending_proofs[index]) |proof| proof.deinit(self.allocator);
         self.pending_proofs[index] = null;
-        if (self.candidate_source) |candidate| if (std.mem.eql(u8, candidate, source_id)) {
-            self.candidate_source = null;
-            self.pipe.candidate_receipt = null;
-        };
+        self.voidCandidate(source_id);
         self.repair_states[index].discardPending();
+    }
+    fn voidCandidate(self: *Session, source_id: []const u8) void {
+        const held = self.candidate_source orelse return;
+        if (!std.mem.eql(u8, held, source_id)) return;
+        if (self.processor.staged_detector) |consumer| if (consumer.void_hold) |release| release(held, consumer.context);
+        self.candidate_source = null;
+        self.pipe.candidate_receipt = null;
+    }
+    fn followCandidate(self: *Session, source_id: []const u8) void {
+        if (self.pipe.candidate_receipt != null) {
+            self.candidate_source = source_id;
+        } else if (self.candidate_source) |held| self.voidCandidate(held);
+    }
+    fn parked(self: *Session) error{RestoreRequired} {
+        self.pipe.park();
+        return error.RestoreRequired;
     }
     fn resolveRemoved(self: *Session, index: usize, verdict: files.RemovedVerdict) !void {
         const source = &self.sources.sources.items[index];
@@ -740,6 +738,7 @@ pub const Session = struct {
         return false;
     }
     fn dropSource(self: *Session, index: usize) void {
+        self.voidCandidate(self.sources.sources.items[index].source_id);
         var removed = self.sources.sources.orderedRemove(index);
         removed.deinit();
         if (index >= self.repair_count) return;
@@ -829,7 +828,7 @@ pub const Session = struct {
         if (!continuous) {
             if (pending != null or !source.awaiting_path) return self.sourceFailure(state, error.FileNotFound);
         } else {
-            if (pending) |saved| source.verifyPending(.{ .source = saved.identity.source, .occurrence = saved.identity.occurrence, .cursor = saved.identity.cursor, .raw_hash = saved.identity.raw_hash }) catch |err| {
+            if (pending) |saved| source.verifyPending(saved.identity) catch |err| {
                 if (source.pending_loss == null or source.policy != .restart) return self.sourceFailure(state, if (source.pending_loss != null) error.ResumeLost else err);
             };
             if (try self.settleLoss(index, pending != null)) {
@@ -960,14 +959,14 @@ pub const Session = struct {
             acknowledged.* = 0;
             const record = batch[0];
             if (self.pending) |expected| {
-                if (record.kind != .data or !std.mem.eql(u8, record.source, expected.source) or !std.mem.eql(u8, record.occurrence, expected.occurrence) or !std.mem.eql(u8, record.cursor, expected.cursor) or !std.mem.eql(u8, &record.raw_hash, &expected.raw_hash)) return error.PendingRecordMismatch;
+                if (record.kind != .data or !expected.sameRecord(.{ .jail = self.session.pipe.jail, .source = record.source, .occurrence = record.occurrence, .cursor = record.cursor, .raw_hash = record.raw_hash, .generation = self.session.processor.generation })) return error.PendingRecordMismatch;
             }
             self.committing = true;
             pipeline.Pipeline.acknowledgeBatch(batch, acknowledged, &self.session.pipe) catch |err| {
-                if (self.session.pipe.candidate_receipt != null) self.session.candidate_source = record.source;
+                self.session.followCandidate(record.source);
                 return err;
             };
-            if (self.session.pipe.candidate_receipt == null) self.session.candidate_source = null;
+            self.session.followCandidate(record.source);
             self.committing = false;
             self.pending = null;
         }
@@ -1004,22 +1003,22 @@ pub const Session = struct {
     }
     pub fn resumeConsumerSource(self: *Session, source_id: []const u8) !usize {
         try self.pipe.admit();
-        if (self.admission_phase != .ready) return error.RestoreRequired;
+        if (self.admission_phase != .ready) return self.parked();
         self.last_failure_domain = null;
-        if (self.candidate_source) |candidate| if (!std.mem.eql(u8, candidate, source_id)) return error.PendingRecordMismatch;
+        if (self.candidate_source) |candidate| if (!std.mem.eql(u8, candidate, source_id)) return self.parked();
         for (self.sources.sources.items, 0..) |source, index| if (std.mem.eql(u8, source.source_id, source_id)) {
             const pending = try self.pipe.store.readPendingSource(self.allocator, self.pipe.jail, source_id);
             defer if (pending) |saved| saved.deinit(self.allocator);
             if (pending) |saved| {
-                if (!std.mem.eql(u8, &saved.identity.generation, &self.processor.generation)) return error.SourceGenerationMismatch;
+                if (!std.mem.eql(u8, &saved.identity.generation, &self.processor.generation)) return self.parked();
             } else {
                 // Failed batch records retain their receipt key after their savepoint rolls back.
-                const held_source = self.candidate_source orelse return error.PendingRecordUnavailable;
-                if (!std.mem.eql(u8, held_source, source_id) or self.pipe.candidate_receipt == null) return error.PendingRecordUnavailable;
+                const held_source = self.candidate_source orelse return self.parked();
+                if (!std.mem.eql(u8, held_source, source_id) or self.pipe.candidate_receipt == null) return self.parked();
             }
             return self.pollSourceTurn(index);
         };
-        return error.PendingSourceMissing;
+        return self.parked();
     }
     fn pollFile(self: *Session, source: *files.FileSource, state: *repair.Repair, acknowledgment: *Acknowledgment, preserve_checkpoint: bool) !bool {
         return 0 != source.pollBatchTurn(Acknowledgment.run, acknowledgment, preserve_checkpoint) catch |err| {
@@ -1088,8 +1087,7 @@ pub const Session = struct {
         fn verify(record: records.Record, context: ?*anyopaque) !void {
             const self: *PendingProbe = @ptrCast(@alignCast(context.?));
             const saved = self.identity;
-            if (record.kind != .data or !std.mem.eql(u8, record.source, saved.source) or !std.mem.eql(u8, record.occurrence, saved.occurrence) or
-                !std.mem.eql(u8, record.cursor, saved.cursor) or !std.mem.eql(u8, &record.raw_hash, &saved.raw_hash)) return error.PendingRecordMismatch;
+            if (record.kind != .data or !saved.sameRecord(.{ .jail = saved.jail, .source = record.source, .occurrence = record.occurrence, .cursor = record.cursor, .raw_hash = record.raw_hash, .generation = saved.generation })) return error.PendingRecordMismatch;
             return error.PendingRecordVerified;
         }
     };

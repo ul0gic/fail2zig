@@ -7,6 +7,7 @@ const native_text = @import("source_text.zig");
 const config = @import("../config/native.zig");
 const group_commit = @import("../store/group_commit.zig");
 const cursor_bytes = @import("../store/store.zig").Limits.cursor_bytes;
+const ReceiptIdentity = @import("../store/store.zig").ReceiptIdentity;
 const Allocator = std.mem.Allocator;
 
 pub const BatchAckCallback = *const fn ([]const records.Record, *usize, ?*anyopaque) anyerror!void;
@@ -566,14 +567,7 @@ pub const FileSource = struct {
         if (!try self.verifyContinuityTurn()) return error.ResumeLost;
     }
 
-    pub const PendingIdentity = struct {
-        source: []const u8,
-        occurrence: []const u8,
-        cursor: []const u8,
-        raw_hash: [32]u8,
-    };
-
-    pub fn verifyPending(self: *FileSource, expected: PendingIdentity) !void {
+    pub fn verifyPending(self: *FileSource, expected: ReceiptIdentity) !void {
         try self.verifyExistingContinuity();
         const saved = self.committed;
         const baseline = self.baseline_committed;
@@ -587,11 +581,8 @@ pub const FileSource = struct {
         }
         const Probe = struct {
             fn verify(record: records.Record, context: ?*anyopaque) !void {
-                const identity: *const PendingIdentity = @ptrCast(@alignCast(context.?));
-                if (record.kind != .data or !std.mem.eql(u8, record.source, identity.source) or
-                    !std.mem.eql(u8, record.occurrence, identity.occurrence) or
-                    !std.mem.eql(u8, record.cursor, identity.cursor) or
-                    !std.mem.eql(u8, &record.raw_hash, &identity.raw_hash)) return error.PendingRecordMismatch;
+                const identity: *const ReceiptIdentity = @ptrCast(@alignCast(context.?));
+                if (record.kind != .data or !identity.sameRecord(.{ .jail = identity.jail, .source = record.source, .occurrence = record.occurrence, .cursor = record.cursor, .raw_hash = record.raw_hash, .generation = identity.generation })) return error.PendingRecordMismatch;
                 return error.PendingRecordVerified;
             }
         };

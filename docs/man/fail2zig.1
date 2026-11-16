@@ -236,6 +236,7 @@ State file and tracking pool. Table output adds the lines
 .PP
 .nf
 State file: <bytes> (<pages> pages of <max_pages>)
+Used pages: <used_pages> of <pages> allocated
 Tracking pool: <tracked> of <tracking_limit> tracked, <banned> of <ban_limit> banned
 .fi
 .PP
@@ -243,11 +244,14 @@ and JSON adds
 .BR state_file_bytes ,
 .BR state_file_pages ,
 .BR state_file_max_pages ,
+.BR state_file_used_pages ,
 .BR pool_tracked ,
 .BR pool_banned ,
 .B pool_tracking_limit
 and
 .BR pool_ban_limit .
+Allocated pages are the file's size; used pages exclude the free pages SQLite keeps
+for reuse, since the file never shrinks.
 The state file cannot grow past 1 GiB; see
 .B state_file
 in
@@ -263,7 +267,20 @@ different file whose previous file is gone, under
 is paused, and the daemon keeps running. When paused sources are the only reason protection
 is degraded, the cause is
 .B SourcePaused
-instead of unknown. Table output adds one
+instead of unknown. When a source is unhealthy without being paused, the cause is that
+source's own error, and table output adds a
+.B Waiting:
+row (for a commit held back, such as
+.BR RetryCapacity )
+or a
+.B Broken:
+row (any other error) with the jail, source kind and cause; the
+.B sources
+array carries it with state
+.B waiting
+or
+.BR broken .
+Table output adds one
 .B Paused:
 block per source with the jail, path and cause, then the exact
 .B repair-source
