@@ -301,6 +301,7 @@ pub fn retryable(cause: anyerror) bool {
         error.ReserveBackpressure,
         error.RetryCapacity,
         error.RetryEligibilityPending,
+        error.StorageCapacity,
         => true,
         else => false,
     };

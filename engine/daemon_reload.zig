@@ -105,7 +105,10 @@ pub fn Methods(comptime Coordinator: type) type {
         pub fn applyReload(self: *Coordinator, request: *ReloadRequest) void {
             const diag_span = if (comptime build_options.diag) diag_mod.enter(.reload) else {};
             defer if (comptime build_options.diag) diag_mod.leave(diag_span);
-            const outcome = self.applyReloadInner(request) catch |err| ReloadOutcome.single(.rejected, "reload failed before publication: {s}; current generation retained", .{@errorName(err)});
+            const outcome = self.applyReloadInner(request) catch |err| if (err == error.StorageCapacity)
+                ReloadOutcome.single(.rejected, "state file at capacity (StorageCapacity); new generation not admitted; current generation retained; retry when fail2zig status shows intake open", .{})
+            else
+                ReloadOutcome.single(.rejected, "reload failed before publication: {s}; current generation retained", .{@errorName(err)});
             self.mutex.lock();
             request.outcome = outcome;
             request.done = true;

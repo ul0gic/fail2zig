@@ -8,6 +8,7 @@ const detection = @import("../core/native_detection_record.zig");
 const ban_origin = @import("../core/ban_origin.zig");
 const canonical_scope = @import("../firewall/scope.zig");
 const origin_schema = @import("effects.zig").origin_schema;
+const budget = @import("budget.zig");
 const Error = store.Error;
 
 pub const Origin = shared.types.Origin;
@@ -18,6 +19,7 @@ pub const BanListChange = struct {
     lifted: u32 = 0,
     unchanged: u32 = 0,
     expired: u32 = 0,
+    pending: u32 = 0,
 };
 
 pub const OwnerOrigin = struct {
@@ -109,6 +111,13 @@ pub fn Methods(comptime Store: type) type {
                     change.unchanged += 1;
                     continue;
                 }
+                self.admitIntake(budget.ban_pages) catch |failure| switch (failure) {
+                    error.StorageCapacity => {
+                        change.pending += 1;
+                        continue;
+                    },
+                    else => return failure,
+                };
                 _ = try self.setOwnerTx(.{
                     .scope = scope,
                     .jail = jail,

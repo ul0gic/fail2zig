@@ -257,7 +257,7 @@ pub const FileSource = struct {
         if (checkpoint) |r| if (r.version != 2 or r.prefix_len > 64) return error.InvalidResume;
         const owned_path = try allocator.dupe(u8, path);
         errdefer allocator.free(owned_path);
-        return .{ .allocator = allocator, .path = owned_path, .source_id = try allocator.dupe(u8, source_id), .start = if (checkpoint) |r| r.start else start, .in_operation = start == .tail, .committed = checkpoint, .baseline_committed = checkpoint != null, .framing = if (checkpoint) |r| r.framing else .bytes };
+        return .{ .allocator = allocator, .path = owned_path, .source_id = try allocator.dupe(u8, source_id), .start = if (checkpoint) |r| r.start else start, .in_operation = checkpoint == null and start == .tail, .committed = checkpoint, .baseline_committed = checkpoint != null, .framing = if (checkpoint) |r| r.framing else .bytes };
     }
 
     pub fn acknowledgedCheckpoint(self: *const FileSource) ?Resume {
@@ -1143,7 +1143,7 @@ pub const Discovery = struct {
 pub const RestoreCallback = *const fn (source_id: []const u8, userdata: ?*anyopaque) anyerror!?Resume;
 
 pub const FileSet = struct {
-    const Spec = struct { pattern: []u8, start: Start, presence: Presence = .unknown };
+    const Spec = struct { pattern: []u8, start: Start, presence: Presence = .unknown, discovered: bool = false };
     allocator: Allocator,
     jail: []u8,
     specs: std.ArrayList(Spec),
@@ -1274,12 +1274,13 @@ pub const FileSet = struct {
             return .pending;
         }
         if (self.discovery_path < discovery.paths.items.len) {
-            const matched = try self.admitDiscovered(discovery.paths.items[self.discovery_path], spec.start);
+            const matched = try self.admitDiscovered(discovery.paths.items[self.discovery_path], if (spec.discovered) .head else spec.start);
             self.discovery_matched = self.discovery_matched or matched;
             self.discovery_path += 1;
             return .pending;
         }
         self.setPresence(self.discovery_spec, if (self.discovery_matched) .present else .missing);
+        self.specs.items[self.discovery_spec].discovered = true;
         self.discovery_visited += discovery.visited;
         discovery.deinit();
         self.discovery = null;

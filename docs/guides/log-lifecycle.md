@@ -68,7 +68,7 @@ error.
 | ----------------- | ------------------------------------------------------------------------------ |
 | `ok`              | Reading at the committed offset.                                               |
 | `missing (cause)` | No file at the path; healthy, resumes when one appears. JSON `source_missing`. |
-| `waiting (cause)` | Waiting for room, for example `RetryCapacity` when the tracking pool is full.  |
+| `waiting (cause)` | Waiting for room, for example `RetryCapacity` when the tracking pool is full or `StorageCapacity` when the state file is at its page capacity; resumes by itself. |
 | `paused (cause)`  | A continuity loss under `refuse`; `repair-source` acknowledges it.             |
 | `broken (cause)`  | The source failed; the cause in parentheses names why.                         |
 

@@ -147,6 +147,7 @@ pub fn Methods(comptime Coordinator: type) type {
                     };
                     break :blk self.adminDetail(request, failed, request.pending_state);
                 }
+                if (err == error.StorageCapacity) break :blk (AdminOutcomeView{ .outcome = .rejected, .kind = request.kind, .generation = self.published_generation }).withReason("state file at capacity (StorageCapacity); nothing was recorded; retry when fail2zig status shows intake open", .{});
                 break :blk (AdminOutcomeView{ .outcome = .rejected, .kind = request.kind, .generation = self.published_generation }).withReason("{s}", .{@errorName(err)});
             };
             if (request.phase == .awaiting) return;
@@ -1105,6 +1106,8 @@ pub fn Methods(comptime Coordinator: type) type {
             const result = self.store.addIgnoreEntry(name, entry, now, expires_us) catch |failure| {
                 if (failure == error.IgnoreCapacity)
                     return self.ignoreRefusal(request, .rejected, "jail {s} already has {d} ignore entries (configuration and runtime combined), the limit. Remove one with fail2zig ignore remove first.", .{ name, before.entries.len });
+                if (failure == error.StorageCapacity)
+                    return self.ignoreRefusal(request, .rejected, "state file at capacity (StorageCapacity); the entry for jail {s} was not added. Retry when fail2zig status shows intake open.", .{name});
                 std.log.err("native admin: ignore entry commit failed: {s}", .{@errorName(failure)});
                 return self.ignoreUncertain(request);
             };

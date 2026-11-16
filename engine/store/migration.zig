@@ -3,6 +3,7 @@
 const std = @import("std");
 const effects = @import("../core/native_effect.zig");
 const Error = @import("store.zig").Error;
+const budget = @import("budget.zig");
 
 pub fn Methods(comptime Store: type) type {
     return struct {
@@ -220,7 +221,7 @@ pub fn Methods(comptime Store: type) type {
 
         pub const JailGeneration = struct { jail: []const u8, generation: [32]u8 };
         pub fn activateStagedOwners(self: *Store, run_id: [32]u8, generations: []const JailGeneration, clock: effects.Clock) Error!u64 {
-            try self.beginWrite();
+            try self.beginClassWrite(.intake);
             errdefer self.rollback();
             if (self.schema_version < 23) return error.MigrationStorageRequired;
             try self.effectSchema();
@@ -257,6 +258,7 @@ pub fn Methods(comptime Store: type) type {
                     try held.append(self.allocator, item);
                 }
             }
+            try self.admitIntake(budget.activationPages(held.items.len));
             const canonical_scope = @import("../firewall/scope.zig");
             const installation = try self.readInstallation() orelse return error.InstallationRequired;
             var activated: u64 = 0;

@@ -252,7 +252,9 @@ and
 .BR pool_ban_limit .
 Allocated pages are the file's size; used pages exclude the free pages SQLite keeps
 for reuse, since the file never shrinks.
-The state file cannot grow past 1 GiB; see
+.I max_pages
+is SQLite's limit, 278,528 pages. New work waits when used pages, plus the pages owed
+to work already admitted, reach the capacity of 262,144 pages; see
 .B state_file
 in
 .BR fail2zig.toml (5).
@@ -1093,7 +1095,13 @@ journaled: an unreachable socket exits 3 and prints the exact
 .B \-\-run\-id
 command to resume, and a rerun classifies the journal instead of replaying.
 .B status
-reports a run.
+(\fB\-\-plan \-\-state\-file \-\-staging\-dir \-\-backend nftables|ipset|iptables \-\-run\-id\fR) reports a run from its journal and the state file. Like
+.B cutover
+and
+.BR rollback ,
+it refuses without
+.B \-\-backend
+and exits 2.
 .PP
 .B rollback
 (\fB\-\-plan \-\-state\-file \-\-staging\-dir \-\-backend \-\-run\-id\fR
@@ -1171,7 +1179,11 @@ be recovered (for a removed rotated file or a replaced log, the records after th
 committed offset of the file that is gone), and lines still in the file are read again. A
 daemon stopped for the offline form leaves its firewall rules for every jail in place;
 the next start reconciles them with durable state. Exit 0 on success or replay, 1 on
-refusal, 2 on usage errors.
+refusal, 2 on usage errors. The online form adds two: 3 when the socket answers but the
+daemon cannot be asked (permission denied, a timeout, or a status request that fails),
+and nothing was changed; 5 when the repair request was sent and no readable answer came
+back, so the outcome is unknown. After exit 5, repeat the same command: the token replays
+a committed repair and performs no second one.
 .
 .SH SUPPORT-BUNDLE
 .B support-bundle
@@ -1268,6 +1280,8 @@ Counter: idle subjects evicted from the tracking pool since the daemon started.
 Daemon-wide gauges:
 .BR fail2zig_state_file_bytes ,
 .BR fail2zig_state_file_pages ,
+.B fail2zig_state_file_used_pages
+(allocated pages minus SQLite's free pages),
 .BR fail2zig_pool_tracked ,
 .BR fail2zig_pool_banned ,
 .B fail2zig_pool_tracking_limit
@@ -1341,22 +1355,38 @@ capabilities and caller-owned private staging, with the destination daemon
 stopped. See docs/operations/command-migration.md and migration-continuity.md.
 .PP
 v0.4.7 is the minimum supported upgrade source. The first start of this version
-upgrades a state last written by v0.4.8 (schema 26) to schema 28, which adds the
-records that let a removed or disabled jail's state be cleaned in bounded steps. A
-state last written by v0.4.7 (schema 25) first takes the v0.4.8 step to schema 26.
-States last written by v0.4.6 or earlier are not a supported upgrade path; upgrade
-them through v0.4.7 first, or start from a fresh state. Before each change the daemon
-writes a coherent copy of the database to a backup, which needs free space of twice
+upgrades a state last written by v0.4.9 (schema 28) to schema 29, which drops the
+table that kept one row for every log line read and adds the counters the state-file
+page budget reads. A state last written by v0.4.8 (schema 26) first takes the step to
+schema 28, and one written by v0.4.7 (schema 25) the steps to 26 and 28. States last
+written by v0.4.6 or earlier are not a supported upgrade path; upgrade them through
+v0.4.7 first, or start from a fresh state. Before each step the daemon writes a
+coherent, verified copy of the database to a backup, which needs free space of twice
 the database size plus 32 MiB, and refuses to start if that file already exists; move
 an old backup aside only when it is not the sole copy of earlier state.
 .IP \(bu 2
-The backup before the schema 28 step is
-.IR <state_file>.pre27-backup ;
-a v0.4.7 state also gets
-.IR <state_file>.pre26-backup .
+The backup before the schema 29 step is
+.IR <state_file>.pre29-backup ,
+copied first as
+.I <state_file>.pre29-backup.partial
+and renamed just before the step commits. A start killed during the copy deletes the
+partial file and copies again.
+.IP \(bu 2
+A v0.4.8 state also gets
+.IR <state_file>.pre27-backup ,
+and a v0.4.7 state
+.I <state_file>.pre26-backup
+as well.
 .PP
 Each step commits in one transaction, so an interrupted upgrade leaves the state at
-the schema it last committed. v0.4.8 and older binaries refuse schema 28 state with their
+the schema it last committed. A start killed after the rename and before the commit
+leaves a schema 28 state beside a complete
+.IR .pre29-backup ;
+the next start refuses with
+.BR SchemaBackupExists .
+Stop the service, move that backup aside under another name without deleting it,
+and start again; the daemon then writes a new backup and completes the step.
+v0.4.9 and older binaries refuse schema 29 state with their
 .B UnsupportedSchema
 message. Keep the backup until the upgraded daemon has been checked. Rollback means stopping the daemon, restoring the
 backup the upgrade wrote over the state file, removing the upgraded database's

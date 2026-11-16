@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 const store = @import("store.zig");
+const budget = @import("budget.zig");
 const Error = store.Error;
 
 pub const max_batch_records = 64;
@@ -17,7 +18,7 @@ pub const Frame = struct {
 pub fn Methods(comptime Store: type) type {
     return struct {
         pub fn beginBatch(self: *Store) Error!Frame {
-            try self.beginWrite();
+            try self.beginIntakeWrite(budget.record_pages);
             return .{};
         }
 
@@ -32,6 +33,7 @@ pub fn Methods(comptime Store: type) type {
             const detections = try Store.validateRecord(&record);
             const step = try self.commitRecordStep(&record, detections);
             if (step.result == .already_committed) return .already_committed;
+            try self.assertIntake();
             if (frame.previous == null) frame.previous = try self.previousRange(&record);
             try self.exec("RELEASE batch_record;");
             frame.open = null;

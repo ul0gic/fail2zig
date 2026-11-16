@@ -4,7 +4,7 @@ description: 'Status, ban origins, matched lines, runtime exclusions, firewall o
 sidebar_position: 4
 category: Reference
 audience: operator
-last_verified: 2026-10-22
+last_verified: 2026-11-16
 ---
 
 Administration uses the same `fail2zig` executable as the daemon. The separate
@@ -78,9 +78,10 @@ states. Inspect storage and enforcement causes when the daemon is degraded.
 Check protection knowledge age, pending bans and overdue removals. A stale or
 degraded status is not confirmation of current kernel protection.
 
-`status` table output adds `State file: <bytes> (<pages> pages of <max_pages>)`
-against the 1 GiB ceiling, `Used pages: <used_pages> of <pages> allocated` (pages
-in use, excluding the free pages the file keeps for reuse) and `Tracking pool: <tracked> of <limit> tracked,
+`status` table output adds `State file: <bytes> (<pages> pages of <max_pages>)`,
+where `<max_pages>` is SQLite's limit of 278,528 pages, `Used pages: <used_pages> of
+<pages> allocated` (pages in use, excluding the free pages the file keeps for reuse;
+new work waits when these, plus the pages owed to admitted work, reach 262,144) and `Tracking pool: <tracked> of <limit> tracked,
 <banned> of <limit> banned` against the shared pool of 65,536 tracked addresses
 and 65,536 live bans. A paused file source appears as a `Paused:` block with the
 jail, path, cause and the exact `repair-source` command; a source that resumed
@@ -100,10 +101,32 @@ notice, not a paused source, and the row clears when a matching file appears.
 `waiting (<cause>)`, `paused (<cause>)` or `broken (<cause>)`. `missing` is a
 healthy state: the log is absent and reading resumes when it appears. `waiting
 (RetryCapacity)` means the jail is waiting for room in the tracking pool and
-resumes as room frees. In `jails`, MODE is configured enforcement and PROTECTION
+resumes as room frees. `waiting (StorageCapacity)` means the state file has reached
+its page capacity: the source keeps its position without pausing, rules stay
+enforced, and reading resumes by itself when room returns. In `jails`, MODE is configured enforcement and PROTECTION
 is observed protection. A plain-output ban count of `-` is unknown; `0` means
 known empty. See the [log file lifecycle](../guides/log-lifecycle.md) for the
 source states.
+
+`Storage:` in `status` is the storage phase: `starting`, `healthy`, `paused`,
+`recovering` or `intervention`. While storage is paused, `Cause:` names the failure
+and `SQLite code:` shows SQLite's primary result code when there is one. These
+causes pause ingestion and retry, after a delay that starts at 1 s and doubles up to
+30 s and returns to 1 s when a record commits; rules already in the kernel stay in
+place:
+
+| Cause             | Meaning                                                                                       |
+| ----------------- | --------------------------------------------------------------------------------------------- |
+| `StorageFull`     | SQLite reported the database or disk full (code 13).                                          |
+| `Busy`            | The database was busy or locked (codes 5 and 6).                                              |
+| `StorageIo`       | A disk I/O error (code 10).                                                                   |
+| `ReadOnly`        | The database could not be written (code 8).                                                   |
+| `RestoreRequired` | A source could not continue while storage was healthy, or a batch of records failed with a cause that is not retryable (the daemon logs that cause by name). Recovery rebuilds the sources from committed state. |
+
+A storage failure in the middle of a batch of records is reported with its own
+cause when it is one of the four above. A source that stops for one of these causes
+resumes after recovery without a restart. A cause that is not retryable outside a
+record batch moves storage to `intervention`, which does not retry.
 
 `--details` expands table output for `status`, `jails`, `stats` and
 `firewall show`. For `stats` and `firewall show` plain and JSON output is

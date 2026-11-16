@@ -97,6 +97,11 @@ pub const StatusPayload = struct {
     state_file_pages: ?u64 = null,
     state_file_max_pages: ?u64 = null,
     state_file_used_pages: ?u64 = null,
+    state_file_capacity_pages: ?u64 = null,
+    state_file_owed_pages: ?u64 = null,
+    intake: ?[]const u8 = null,
+    intake_cause: ?[]const u8 = null,
+    waiting_sources: ?u32 = null,
     pool_sample_available: ?bool = null,
     pool_sample_pending: ?bool = null,
     pool_sample_as_of_us: ?i64 = null,
@@ -376,6 +381,11 @@ fn writeStatusPlain(writer: anytype, s: StatusPayload) !void {
     var footprint_buffer: [96]u8 = undefined;
     if (formatStateFile(&footprint_buffer, s)) |value| try writer.print("state_file\t{s}\n", .{value});
     if (s.state_file_used_pages) |pages| try writer.print("state_file_used_pages\t{d}\n", .{pages});
+    if (s.state_file_capacity_pages) |pages| try writer.print("state_file_capacity_pages\t{d}\n", .{pages});
+    if (s.state_file_owed_pages) |pages| try writer.print("state_file_owed_pages\t{d}\n", .{pages});
+    if (s.intake) |value| try writer.print("intake\t{s}\n", .{renderDiagnostic(&footprint_buffer, value)});
+    if (s.intake_cause) |value| try writer.print("intake_cause\t{s}\n", .{renderDiagnostic(&footprint_buffer, value)});
+    if (s.waiting_sources) |count| try writer.print("waiting_sources\t{d}\n", .{count});
     if (formatTrackingPool(&footprint_buffer, s)) |value| try writer.print("tracking_pool\t{s}\n", .{value});
     for (s.sources orelse &.{}) |source| try writeSourcePlain(writer, source);
 }
@@ -506,6 +516,8 @@ fn writeStatusTable(writer: anytype, s: StatusPayload, color: Color, columns: us
     if (formatExpiry(&summary_buffer, s)) |value| try rowLabel(writer, "Expiry:", value, width);
     if (formatStateFile(&summary_buffer, s)) |value| try rowLabel(writer, "State file:", value, width);
     if (formatUsedPages(&summary_buffer, s)) |value| try rowLabel(writer, "Used pages:", value, width);
+    if (formatCapacity(&summary_buffer, s)) |value| try rowLabel(writer, "Capacity:", value, width);
+    if (formatIntake(&summary_buffer, s)) |value| try rowLabel(writer, "Intake:", value, width);
     if (formatTrackingPool(&summary_buffer, s)) |value| try rowLabel(writer, tracking_pool_label, value, width);
 
     try drawBotLine(writer, width);
@@ -562,6 +574,8 @@ fn writeStatusSummary(writer: anytype, s: StatusPayload, color: Color, columns: 
     if (formatExpiry(&summary, s)) |value| try writeStatusNarrowRow(writer, "Expiry: ", value, columns);
     if (formatStateFile(&summary, s)) |value| try writeStatusNarrowRow(writer, "State file: ", value, columns);
     if (formatUsedPages(&summary, s)) |value| try writeStatusNarrowRow(writer, "Used pages: ", value, columns);
+    if (formatCapacity(&summary, s)) |value| try writeStatusNarrowRow(writer, "Capacity: ", value, columns);
+    if (formatIntake(&summary, s)) |value| try writeStatusNarrowRow(writer, "Intake: ", value, columns);
     if (formatTrackingPool(&summary, s)) |value| try writeStatusNarrowRow(writer, tracking_pool_label, value, columns);
 }
 
@@ -619,6 +633,8 @@ fn writeStatusNarrow(writer: anytype, s: StatusPayload, color: Color, columns: u
     if (formatExpiry(&summary_buffer, s)) |value| try writeStatusNarrowRow(writer, "Expiry: ", value, columns);
     if (formatStateFile(&summary_buffer, s)) |value| try writeStatusNarrowRow(writer, "State file: ", value, columns);
     if (formatUsedPages(&summary_buffer, s)) |value| try writeStatusNarrowRow(writer, "Used pages: ", value, columns);
+    if (formatCapacity(&summary_buffer, s)) |value| try writeStatusNarrowRow(writer, "Capacity: ", value, columns);
+    if (formatIntake(&summary_buffer, s)) |value| try writeStatusNarrowRow(writer, "Intake: ", value, columns);
     if (formatTrackingPool(&summary_buffer, s)) |value| try writeStatusNarrowRow(writer, tracking_pool_label, value, columns);
 }
 
@@ -628,9 +644,9 @@ fn writeStatusNarrowRow(writer: anytype, label: []const u8, value: []const u8, c
     try writer.writeAll("\n");
 }
 
-const repair_steps = "stop fail2zig, then run:";
+const repair_steps = "run:";
 const repair_none = "no offline repair applies to this cause; see the daemon log.";
-const repair_restart = "Then start fail2zig. While it is stopped, firewall rules for every jail stay in place.";
+const repair_restart = "It applies through the running daemon; no stop or restart is needed.";
 
 fn isPaused(source: SourceEntry) bool {
     const state = source.state orelse return false;
@@ -981,6 +997,8 @@ fn statusWidth(s: StatusPayload) usize {
     if (formatExpiry(&summary_buffer, s)) |value| used = @max(used, rowUsed(value));
     if (formatStateFile(&summary_buffer, s)) |value| used = @max(used, rowUsed(value));
     if (formatUsedPages(&summary_buffer, s)) |value| used = @max(used, rowUsed(value));
+    if (formatCapacity(&summary_buffer, s)) |value| used = @max(used, rowUsed(value));
+    if (formatIntake(&summary_buffer, s)) |value| used = @max(used, rowUsed(value));
     if (formatTrackingPool(&summary_buffer, s)) |value| used = @max(used, rowUsed(value) + tracking_pool_label.len - label_col);
     used = @max(used, sourcesWidth(s));
     return @max(44, used + 2);
@@ -999,6 +1017,24 @@ fn formatUsedPages(buffer: []u8, s: StatusPayload) ?[]const u8 {
     const used = s.state_file_used_pages orelse return null;
     const pages = s.state_file_pages orelse return null;
     return std.fmt.bufPrint(buffer, "{d} of {d} allocated", .{ used, pages }) catch null;
+}
+
+fn formatCapacity(buffer: []u8, s: StatusPayload) ?[]const u8 {
+    const used = s.state_file_used_pages orelse return null;
+    const capacity = s.state_file_capacity_pages orelse return null;
+    if (s.state_file_owed_pages) |owed| return std.fmt.bufPrint(buffer, "{d} used + {d} owed of {d} pages", .{ used, owed, capacity }) catch null;
+    return std.fmt.bufPrint(buffer, "{d} used + unknown owed of {d} pages", .{ used, capacity }) catch null;
+}
+
+fn formatIntake(buffer: []u8, s: StatusPayload) ?[]const u8 {
+    const intake = s.intake orelse return null;
+    var cause_buffer: [40]u8 = undefined;
+    const state = renderDiagnostic(&cause_buffer, intake);
+    if (s.intake_cause) |cause| {
+        var detail_buffer: [40]u8 = undefined;
+        return std.fmt.bufPrint(buffer, "{s} ({s}), {d} sources waiting", .{ state, renderDiagnostic(&detail_buffer, cause), s.waiting_sources orelse 0 }) catch null;
+    }
+    return std.fmt.bufPrint(buffer, "{s}", .{state}) catch null;
 }
 
 fn formatTrackingPool(buffer: []u8, s: StatusPayload) ?[]const u8 {
@@ -1968,7 +2004,7 @@ fn formatJailHealth(buffer: []u8, jail: JailEntry) []const u8 {
         writer.print("paused ({s})", .{cause}) catch return "paused (unknown)";
         return stream.getWritten();
     }
-    if (std.mem.eql(u8, cause, "RetryCapacity") or std.mem.eql(u8, cause, "ReserveBackpressure")) {
+    if (std.mem.eql(u8, cause, "RetryCapacity") or std.mem.eql(u8, cause, "ReserveBackpressure") or std.mem.eql(u8, cause, "RetryEligibilityPending") or std.mem.eql(u8, cause, "StorageCapacity")) {
         writer.print("waiting ({s})", .{cause}) catch return "waiting (unknown)";
         return stream.getWritten();
     }

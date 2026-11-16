@@ -129,6 +129,10 @@ pub fn execute(allocator: std.mem.Allocator, options: Options, now_us: i64, stdo
         return .rejected;
     };
     defer store.close();
+    store.configurePageLimit() catch |err| {
+        stderr.print("repair-source: open state {s}: {s}\n", .{ state_path, @errorName(err) }) catch {};
+        return .rejected;
+    };
     if (!sameFile(authority, state_path)) {
         stderr.print("repair-source: state {s} was replaced while locked; nothing was changed\n", .{state_path}) catch {};
         return .rejected;

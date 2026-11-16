@@ -1129,7 +1129,8 @@ pub const help_migrate =
     \\    fail2zig migrate validate --plan <plan.json> [--source-dir <dir>] [--snapshot <file>] [--output json|table]
     \\    fail2zig migrate cutover --plan <plan.json> --state-file <db> --staging-dir <dir>
     \\                             --backend nftables|ipset|iptables [--socket <path>] [--run-id <hex>] [--output json|table]
-    \\    fail2zig migrate status --plan <plan.json> --state-file <db> --staging-dir <dir> --run-id <hex> [--output json|table]
+    \\    fail2zig migrate status --plan <plan.json> --state-file <db> --staging-dir <dir>
+    \\                            --backend nftables|ipset|iptables --run-id <hex> [--output json|table]
     \\    fail2zig migrate rollback --plan <plan.json> --state-file <db> --staging-dir <dir> --backend <b> --run-id <hex>
     \\                              [--source-verified] [--socket <path>] [--output json|table]
     \\
@@ -1259,9 +1260,11 @@ pub const help_jails =
     \\    ok                      Reading normally
     \\    missing (FileNotFound)  The log file is absent; reading resumes when it
     \\                            appears, and protection is not affected
-    \\    waiting (<cause>)       The jail waits for room (RetryCapacity or
-    \\                            ReserveBackpressure); nothing is lost and it
-    \\                            continues as room frees up
+    \\    waiting (<cause>)       The jail waits for room (RetryCapacity,
+    \\                            ReserveBackpressure, RetryEligibilityPending, or
+    \\                            StorageCapacity when the state file is at its
+    \\                            capacity); nothing is lost and it continues as
+    \\                            room frees up
     \\    paused (<cause>)        The source stopped until repaired; status prints
     \\                            the repair command
     \\    broken (<cause>)        The source cannot be read; the cause names why
@@ -1429,7 +1432,7 @@ pub const help_support_bundle =
     \\effective configuration with its file and loaded SHA-256, state file page and
     \\per-table sizes, kernel readback counts, memory, host basics, and the last <n>
     \\(default 200, at most 2000) warnings and errors from the daemon log into one JSON
-    \\file. Run it as the daemon's user; sections it cannot read record their error.
+    \\file. Run it as root; sections it cannot read record their error.
     \\
     \\Addresses become v4-<hash> or v6-<hash>, stable within one bundle only; loopback
     \\and unspecified addresses are kept. --include-addresses keeps every address.

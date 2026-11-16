@@ -352,59 +352,6 @@ pub const Session = struct {
         for (self.retained.items) |*value| if (std.mem.eql(u8, value.source, source)) return value;
         return null;
     }
-    fn addRetained(self: *Session, source: []const u8, path: []const u8, state: repair.Repair, source_health: records.Health, in_operation: bool, expected_durable: bool, incarnation: ?[16]u8, pending: ?durable.Store.PendingSource, continuity: ?files.ContinuityFailure, continuity_reported: bool) !void {
-        if (self.retained.items.len >= self.sources.max_sources) return error.SourceLimit;
-        const source_copy = try self.allocator.dupe(u8, source);
-        errdefer self.allocator.free(source_copy);
-        const path_copy = try self.allocator.dupe(u8, path);
-        errdefer self.allocator.free(path_copy);
-        const proof = if (pending) |value| try clonePending(self.allocator, value) else null;
-        errdefer if (proof) |value| value.deinit(self.allocator);
-        try self.retained.append(.{ .source = source_copy, .path = path_copy, .state = state, .health = source_health, .in_operation = in_operation, .expected_durable = expected_durable, .incarnation = incarnation, .pending = proof, .continuity = continuity, .continuity_reported = continuity_reported });
-    }
-    pub fn copyRepairStateFrom(self: *Session, old: *const Session) !void {
-        if (old.repair_count != old.sources.sources.items.len) return error.RestoreRequired;
-        if (self.admission_phase != .positions or self.sources.sources.items.len != 0 or self.retained.items.len != 0) return error.RecoveryOutOfOrder;
-        if (!std.mem.eql(u8, &self.processor.generation, &old.processor.generation)) return error.SourceGenerationMismatch;
-        errdefer {
-            for (self.retained.items) |value| value.deinit(self.allocator);
-            self.retained.clearRetainingCapacity();
-        }
-        for (old.sources.sources.items, 0..) |source, index| {
-            try self.addRetained(source.source_id, source.path, old.repair_states[index], source.health, source.in_operation, source.baseline_committed, if (source.committed) |saved| saved.incarnation else null, old.pending_proofs[index], source.continuity_failure, source.continuity_reported);
-        }
-        for (old.retained.items) |value| if (self.retainedSource(value.source) == null) {
-            try self.addRetained(value.source, value.path, value.state, value.health, value.in_operation, value.expected_durable, value.incarnation, value.pending, value.continuity, value.continuity_reported);
-        };
-        if (old.pipe.candidate_receipt != null) {
-            const source = old.candidate_source orelse return error.PendingSourceMissing;
-            self.candidate_source = (self.retainedSource(source) orelse return error.PendingSourceMissing).source;
-        }
-        self.pipe.candidate_receipt = old.pipe.candidate_receipt;
-        self.discovery_repair = old.discovery_repair;
-        self.notices = old.notices;
-    }
-    pub fn retainSourcesFrom(self: *Session, old: *const Session) !void {
-        if (self.admission_phase != .positions or self.sources.sources.items.len != 0) return error.RecoveryOutOfOrder;
-        if (!std.mem.eql(u8, &self.processor.generation, &old.processor.generation)) return error.SourceGenerationMismatch;
-        for (self.retained.items) |*value| {
-            if (value.descriptor != null) return error.RecoveryOutOfOrder;
-            var descriptor: ?std.fs.File = null;
-            var proposal: ?files.Resume = null;
-            for (old.sources.sources.items) |source| if (std.mem.eql(u8, source.source_id, value.source)) {
-                descriptor = source.file;
-                if (!source.baseline_committed) proposal = source.committed;
-                break;
-            };
-            if (descriptor == null or proposal == null) for (old.retained.items) |previous| if (std.mem.eql(u8, previous.source, value.source)) {
-                if (descriptor == null) descriptor = previous.descriptor;
-                if (!value.expected_durable and proposal == null) proposal = previous.proposal;
-                break;
-            };
-            if (descriptor) |file| value.descriptor = .{ .handle = @intCast(try std.posix.fcntl(file.handle, linux_dupfd_cloexec, 3)) };
-            value.proposal = proposal;
-        }
-    }
     pub fn verifyRecoverySources(self: *Session) !void {
         if (self.pipe.gate) |gate| {
             const status = gate.snapshot();
@@ -559,7 +506,7 @@ pub const Session = struct {
         self.last_failure_domain = domain;
         self.blocked_cause = if (pipeline.Pipeline.commitBlocked(cause)) cause else null;
         self.sources.health = switch (cause) {
-            error.SourceRepairPending, error.ReserveBackpressure, error.RetryCapacity, error.RetryEligibilityPending => .waiting,
+            error.SourceRepairPending, error.ReserveBackpressure, error.RetryCapacity, error.RetryEligibilityPending, error.StorageCapacity => .waiting,
             error.FileNotFound => .missing,
             error.AccessDenied => .permission_denied,
             error.ResumeLost, error.RotatedIncarnationLost, error.PendingRecordMismatch, error.PendingRecordUnavailable => .resume_lost,

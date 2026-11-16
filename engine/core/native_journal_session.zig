@@ -277,21 +277,6 @@ pub const Session = struct {
         self.initial_proposal = snapshot.initial_proposal;
         self.initial_tail_attempted = snapshot.initial_tail_attempted;
     }
-    pub fn copyRepairStateFrom(self: *Session, old: *const Session) !void {
-        if (self.admission_phase != .positions or self.baseline_committed or self.restore_after != null or self.pending_proof != null) return error.RecoveryOutOfOrder;
-        if (!std.mem.eql(u8, &self.processor.generation, &old.processor.generation) or !std.mem.eql(u8, self.options.source_id, old.options.source_id)) return error.SourceGenerationMismatch;
-        const proof = if (old.pending_proof) |saved| try @import("native_file_session.zig").clonePending(self.allocator, saved) else null;
-        self.pending_proof = proof;
-        self.pipe.candidate_receipt = old.pipe.candidate_receipt;
-        self.source_repair = old.source_repair;
-        self.source_health = old.source_health;
-        self.last_error = old.last_error;
-        self.failure_diagnostic = old.failure_diagnostic;
-        self.notices = old.notices;
-        self.expected_durable = old.baseline_committed or old.expected_durable;
-        self.initial_proposal = old.recoveryProposal();
-        self.initial_tail_attempted = old.initial_tail_attempted;
-    }
     fn checkStartClock(self: *Session) !void {
         const clock = self.pipe.receipts.?;
         if ((try clock.clock(clock.clock_context)).us < self.position.start_us) {

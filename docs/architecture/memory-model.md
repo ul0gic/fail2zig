@@ -58,9 +58,15 @@ flowchart LR
   E --> F[Dispatch and kernel readback]
 ```
 
-The state file may grow to 1 GiB; a file already past that size is refused at
-start. It never shrinks: rows removed by retention free pages for reuse inside it.
-`status` shows the size and page use against the ceiling.
+New work is admitted only while the state file's used pages, plus the pages
+owed to work already admitted, fit in 262,144 pages (1 GiB). At that line intake
+waits while settlement, expiry, unban and cleanup keep writing. SQLite's own limit
+is 16,384 pages higher, so the file can reach 1 GiB plus 64 MiB; a file past that
+is refused at start. It never shrinks: rows removed by cleanup and retention free
+pages for reuse inside it. Records are kept only while something needs them, and
+the two per-address memory tables are capped at 65,536 rows each. `status` shows
+allocated and used pages. The
+[resource boundaries](../architecture.md#resource-boundaries) give the details.
 
 Source acknowledgement and in-memory publication follow the relevant commit.
 Original event and receipt times survive retries and restart, so retry does not
@@ -70,8 +76,10 @@ invent a fresh observation window or extend an existing deadline.
 
 When required storage fails, affected ingestion pauses and health becomes degraded.
 Existing protection is retained; the administrative surface remains available to
-report the cause. Capacity pressure must not silently discard unresolved effects
-or active owners.
+report the cause. When the state file reaches its page capacity, sources wait with
+`StorageCapacity` instead; consumed history and memory can be given up early, and
+the daemon counts and logs what it gave up. Capacity pressure never discards live
+bans, pending work, unresolved effects or active owners.
 
 Corrupt or incompatible state is refused at startup. Do not delete the database
 or its sidecars to suppress a failure. Repair access or restore coherent state,

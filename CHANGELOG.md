@@ -13,6 +13,72 @@ rolling back to them is unsupported. To move between releases, follow the
 Each group heading ends with its type in braces: `{feat}`, `{perf}`, `{fix}` or
 `{sec}`. The website uses it to colour the group.
 
+## 0.4.10 — unreleased
+
+**A state file that stays bounded and a source that resumes by itself**
+
+A storage release. A log source picks up again by itself after a wait or a storage
+failure, `jails`, `status` and the storage cause tell the truth, the state file no
+longer grows with every log line read, and a full state file costs new bans for a
+while instead of stopping protection. How bans are detected and enforced is unchanged.
+
+### Fixed {fix}
+
+- `sources` **A source resumes without a restart.** After an ordinary wait or a storage
+  failure on a log that kept growing, the source reads on from where it stopped, keeps
+  the time it first received the line and counts the line once. In 0.4.9 the jail
+  admitted no new bans until the daemon was restarted.
+- `jails` **`jails` agrees with `status` after a restart.** Both read the same clock, so
+  `jails` no longer shows protection as unconfirmed while `status` shows it active.
+- `status` **The real storage cause.** A storage failure in the middle of a batch of
+  records is reported as `StorageFull`, `Busy`, `StorageIo` or `ReadOnly`, not as
+  `RestoreRequired`. When a jail is unhealthy, `Cause:` names that jail's source error
+  instead of `unknown`, and the source appears as a `Waiting:` or `Broken:` row.
+- `storage` **The state file stops growing with log volume.** The table that kept one row
+  for every log line read is gone. A record is kept only while something needs it, and
+  the transaction that admits a source's next records deletes the ones before them.
+- `docs` **Example escalation doubles.** `deploy/fail2zig.toml.example` sets
+  `bantime_increment_factor = 2` with multiplier 1, so repeat bans double up to the
+  one-week cap; before, every repeat ban was a constant two hours.
+- `docs` **Documentation follows the code.** `migrate status` lists its required
+  `--backend`, `repair-source` lists exits 3 and 5 of its online form, the jail-name
+  and `logpath` rules state what validation accepts, and the migration continuity page
+  states that cutover carries no log position.
+
+### Added {feat}
+
+- `status` **Used pages.** `status` adds `Used pages: <used> of <pages> allocated`, JSON
+  adds `state_file_used_pages` and `/metrics` adds `fail2zig_state_file_used_pages`:
+  the pages in use, without the free pages the file keeps for reuse.
+- `storage` **A page budget for the state file.** New work waits once used pages, plus
+  the pages owed to bans and actions already admitted, reach 262,144 pages (1 GiB).
+  Sources show `waiting (StorageCapacity)` without pausing; a manual `ban`, `ignore add`
+  and a new `reload` are rejected with that cause; expiry, unban and cleanup keep
+  writing and installed rules stay enforced. Under pressure the daemon gives up
+  consumed history and memory first, counts and logs it, starts on a full file and
+  resumes intake by itself. SQLite's own limit is 64 MiB higher. [Read the resource
+  boundaries](docs/architecture.md#resource-boundaries)
+- `escalation` **Capped per-address memory.** Escalation memory and retired retry rows
+  hold at most 65,536 rows each. At the cap the least recently written address without
+  a live ban is forgotten and logged; a ban never waits for a memory row.
+  `bantime_increment_decay = 0` still disables forgetting by time.
+
+**Schema 29 upgrade** On first start, a v0.4.9 state (schema 28) upgrades to schema 29
+after `<state_file>.pre29-backup` is written; v0.4.8 and v0.4.7 states take their
+earlier steps first. The step copies the whole state once for the backup, needs free
+disk of twice the file plus 32 MiB, and drops the per-line table, so a state 0.4.9
+filled recovers its pages. A start killed during the copy heals by itself; a start
+killed between the backup's rename and the commit needs the operator step in the
+[upgrade guide](docs/guides/upgrading.md). v0.4.9 and older refuse schema 29 with
+`UnsupportedSchema`; rollback restores the backup with the v0.4.9 binary.
+
+**Known limits** New work waits before the file is physically full. Under page
+pressure, history and escalation memory can be given up before `history_retention`
+would remove them. A full filesystem is outside the page budget: the daemon pauses
+with `StorageFull` and recovers when space returns, but does not start on a full
+filesystem. With the per-line table gone, a line counts twice if a defect or a manual
+edit moves a source position backwards.
+
 ## 0.4.9 — 2026-10-26
 
 **Matched lines in history, configured paths and many-jail startup**
@@ -137,8 +203,8 @@ stop leaves installed rules in the kernel.
   `fail2zig_state_file_bytes` and `fail2zig_state_file_pages`.
 - `logging` **Audit lines, JSON logs and help everywhere.** One audit line per mutation
   with target, caller UID and outcome. `log_format = "json"` writes one JSON object per
-  daemon log line. Every command has `help <command>` or `--help`; a typo exits 2 with a
-  suggestion. Refusals that are not outcome objects go to standard error.
+  daemon log line. Every command has `help <command>` or `--help`; a mistyped command
+  exits 2 with a suggestion. Refusals that are not outcome objects go to standard error.
 - `security` **Threat model published with the source.** `docs/security/threat-model.md`
   records assets, trust boundaries and each threat with its control. [See the site
   threat model](docs/security/threat-model.md)

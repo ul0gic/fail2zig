@@ -9,6 +9,7 @@ const retry = @import("../core/native_retry.zig");
 const action_outcome = @import("../core/native_action_outcome.zig");
 const application_history = @import("../core/native_application_history.zig");
 const store = @import("store.zig");
+const budget = @import("budget.zig");
 const Error = store.Error;
 const Stmt = store.Stmt;
 const latest_schema = store.latest_schema;
@@ -178,6 +179,25 @@ pub fn Methods(comptime Store: type) type {
             .{ .name = "effect_owner_live_update", .sql = "CREATE TRIGGER effect_owner_live_update AFTER UPDATE OF lease_kind ON effect_owners WHEN (OLD.lease_kind<>0)<>(NEW.lease_kind<>0) BEGIN UPDATE effect_owner_live SET live=live+CASE WHEN NEW.lease_kind<>0 THEN 1 ELSE -1 END WHERE id=1; END" },
             .{ .name = "effect_owner_live_delete", .sql = "CREATE TRIGGER effect_owner_live_delete AFTER DELETE ON effect_owners WHEN OLD.lease_kind<>0 BEGIN UPDATE effect_owner_live SET live=live-1 WHERE id=1; END" },
         };
+        const owed_work_triggers = [_]struct { name: []const u8, table: []const u8, sql: []const u8 }{
+            .{ .name = "effect_owed_marker_insert", .table = "confirmation_markers", .sql = "CREATE TRIGGER effect_owed_marker_insert AFTER INSERT ON confirmation_markers BEGIN UPDATE effect_owed_work SET markers=markers+1 WHERE id=1; END" },
+            .{ .name = "effect_owed_marker_delete", .table = "confirmation_markers", .sql = "CREATE TRIGGER effect_owed_marker_delete AFTER DELETE ON confirmation_markers BEGIN UPDATE effect_owed_work SET markers=markers-1 WHERE id=1; END" },
+            .{ .name = "effect_owed_intent_insert", .table = "effect_intents", .sql = "CREATE TRIGGER effect_owed_intent_insert AFTER INSERT ON effect_intents WHEN NEW.status IN(1,2) BEGIN UPDATE effect_owed_work SET unsettled_intents=unsettled_intents+1 WHERE id=1; END" },
+            .{ .name = "effect_owed_intent_update", .table = "effect_intents", .sql = "CREATE TRIGGER effect_owed_intent_update AFTER UPDATE OF status ON effect_intents WHEN (OLD.status IN(1,2))<>(NEW.status IN(1,2)) BEGIN UPDATE effect_owed_work SET unsettled_intents=unsettled_intents+CASE WHEN NEW.status IN(1,2) THEN 1 ELSE -1 END WHERE id=1; END" },
+            .{ .name = "effect_owed_intent_delete", .table = "effect_intents", .sql = "CREATE TRIGGER effect_owed_intent_delete AFTER DELETE ON effect_intents WHEN OLD.status IN(1,2) BEGIN UPDATE effect_owed_work SET unsettled_intents=unsettled_intents-1 WHERE id=1; END" },
+        };
+        fn reconcileOwedWork(self: *Store) Error!void {
+            for (owed_work_triggers) |trigger| {
+                var row = try self.statement("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?1 AND tbl_name=?2;");
+                defer row.deinit();
+                try row.text(1, trigger.name);
+                try row.text(2, trigger.table);
+                if (!try row.row() or !std.mem.eql(u8, try row.bytes(0), trigger.sql) or try row.row()) return error.LiveOwnerCounterInvalid;
+            }
+            if (try self.integer("SELECT count(*) FROM effect_owed_work;") != 1) return error.LiveOwnerCounterInvalid;
+            try self.exec("UPDATE effect_owed_work SET markers=(SELECT count(*) FROM confirmation_markers),unsettled_intents=(SELECT count(*) FROM effect_intents WHERE status IN(1,2)),reconciled=1 WHERE id=1;");
+            if (self.api.changes(self.db) != 1) return error.LiveOwnerCounterInvalid;
+        }
 
         // Windows of owners, one operation each, keep the per-row revision lookup inside the work budget at any ban count.
         const owner_scan_rows: i64 = 8192;
@@ -215,6 +235,7 @@ pub fn Methods(comptime Store: type) type {
                 if (!try row.row() or !std.mem.eql(u8, try row.bytes(0), trigger.sql) or try row.row()) return error.LiveOwnerCounterInvalid;
             }
             if (try self.integer("SELECT count(*) FROM effect_owner_live;") != 1) return error.LiveOwnerCounterInvalid;
+            if (self.schema_version >= budget.owed_work_schema) try self.reconcileOwedWork();
             const stored = try self.integer("SELECT live FROM effect_owner_live WHERE id=1;");
             const streak = try self.integer("SELECT mismatch_streak FROM effect_owner_live WHERE id=1;");
             if (streak < 0) return error.LiveOwnerCounterInvalid;
@@ -656,7 +677,7 @@ pub fn Methods(comptime Store: type) type {
             return self.replaceEffectIntent(installation, change.scope, key, effect_revision, change.decision_id, now);
         }
         pub fn setOwner(self: *Store, change: effects.OwnerChange, clock: effects.Clock) Error!effects.Entry {
-            try self.beginWrite();
+            try self.beginIntakeWrite(budget.ban_pages);
             errdefer self.rollback();
             try self.effectSchema();
             const now = try self.effectClock(clock);

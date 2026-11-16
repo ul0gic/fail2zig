@@ -4,7 +4,7 @@ description: 'The HTTP endpoints, every Prometheus metric, the health and status
 sidebar_position: 5
 category: Reference
 audience: operator
-last_verified: 2026-11-15
+last_verified: 2026-11-16
 ---
 
 fail2zig exposes two read interfaces for monitoring. The HTTP listener serves
@@ -124,8 +124,8 @@ These carry no labels and are all gauges.
 | `fail2zig_native_expiry_overdue`          | `1` when a ban expiry is overdue.                             |
 | `fail2zig_native_expiry_uncertain`        | `1` when expiry state is uncertain.                           |
 | `fail2zig_state_file_bytes`               | Size of the state file in bytes.                              |
-| `fail2zig_state_file_pages`               | Size of the state file in pages; the ceiling is 262,144.      |
-| `fail2zig_state_file_used_pages`          | Pages in use: the file's pages minus SQLite's free pages.     |
+| `fail2zig_state_file_pages`               | Size of the state file in pages; SQLite's limit is 278,528.   |
+| `fail2zig_state_file_used_pages`          | Pages in use: the file's pages minus SQLite's free pages. New work waits near 262,144. |
 | `fail2zig_pool_sample_available`          | `1` when a tracking-pool sample has been published.           |
 | `fail2zig_pool_sample_pending`            | `1` while a new sample is being taken.                        |
 | `fail2zig_pool_sample_as_of_seconds`      | Time of the sample, in seconds since the Unix epoch.          |
@@ -158,12 +158,13 @@ added by a reload and stop when it is removed.
 fail2zig_native_storage_healthy == 0
 fail2zig_native_worker_stalled == 1
 fail2zig_jail_source_state == 1
-fail2zig_state_file_pages > 235929
+fail2zig_state_file_used_pages > 235929
 fail2zig_pool_banned / fail2zig_pool_ban_limit > 0.9
 ```
 
-The page threshold is 90 % of the 262,144-page ceiling. A state file at the
-ceiling pauses ingestion while installed rules stay in the kernel; see
+The page threshold is 90 % of the 262,144-page capacity. Near the capacity new
+work waits with `StorageCapacity` while installed rules stay in the kernel and
+expiry, unban and cleanup continue; see
 [state and resource limits](config.md#state_file).
 
 ## JSON from the administrative commands

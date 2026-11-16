@@ -1,3 +1,90 @@
+# fail2zig v0.4.10
+
+Version 0.4.10 is a storage release. A log source resumes by itself after a wait
+or a storage failure, `jails` and `status` agree and name the real cause, and the
+state file no longer grows with every log line read. When the state file does
+reach its capacity, new bans wait while installed bans stay enforced, expiry,
+unban and cleanup keep working, and intake resumes by itself. How bans are
+detected and enforced is unchanged.
+
+## Changes
+
+- Resume a source without a restart. After an ordinary wait, or a storage
+  failure on a log that kept growing, the source reads on from where it stopped,
+  keeps the time it first received the line and counts it once. In 0.4.9 the jail
+  admitted no new bans until the daemon was restarted.
+- Make `jails` agree with `status` after a restart. Both read the same clock.
+- Report the real storage cause. A failure in the middle of a batch of records is
+  reported as `StorageFull`, `Busy`, `StorageIo` or `ReadOnly` rather than
+  `RestoreRequired`. An unhealthy jail's source error replaces `Cause: unknown`,
+  and the source appears as a `Waiting:` or `Broken:` row in `status` and in its
+  `sources` JSON array.
+- Show used pages. `status` adds `Used pages: <used> of <pages> allocated`, JSON
+  adds `state_file_used_pages`, and `/metrics` adds
+  `fail2zig_state_file_used_pages`.
+- Stop growing with log volume. The table that kept one row for every log line
+  read is removed. A record is kept only while something needs it: the latest
+  record of its source, the trigger of a live or unsettled ban, a record with a
+  pending action, or a recidive record not yet consumed. Each admitted batch
+  deletes the records before it, and a bounded pass deletes what time releases.
+- Cap per-address memory. Escalation memory and retired retry rows hold at most
+  65,536 rows each; at the cap the least recently written address without a live
+  ban is forgotten and the eviction is logged. A ban never waits for a memory row.
+  `bantime_increment_decay = 0` disables forgetting by time only.
+- Budget the state file's pages. New work (log records, a manual `ban`, `banip`
+  additions, `ignore add`, a new `reload`, migration activation) is admitted only
+  while used pages plus the pages owed to admitted work fit in 262,144 pages
+  (1 GiB). At that line sources show `waiting (StorageCapacity)` without pausing
+  and the manual commands are rejected with `StorageCapacity`; `banip` applies its
+  removals and keeps its additions pending. Under pressure the daemon gives up
+  consumed history, evidence and escalation memory first, and counts and logs
+  what it gave up. It starts on a file at capacity. SQLite's own limit is 16,384
+  pages higher, so the file can reach 1 GiB plus 64 MiB on disk.
+- Correct the example configuration and the manual. The example's escalation
+  now doubles each repeat ban (`bantime_increment_factor = 2`); `migrate status`
+  shows its required `--backend`; `repair-source` documents exits 3 and 5 of its
+  online form; the jail-name and `logpath` rules state what validation accepts;
+  the migration continuity page states that cutover carries no log position.
+
+## Upgrade and compatibility
+
+The first start upgrades a state last written by v0.4.9 (schema 28) to schema
+29 after writing `<state_file>.pre29-backup`; v0.4.8 and v0.4.7 states take
+their earlier steps in the same start. The step copies, verifies and hashes the
+whole state once, so the first start takes longer on a large file, and it needs
+free disk of twice the file plus 32 MiB. It then drops the per-line table in the
+schema transaction, so a state that 0.4.9 filled recovers those pages at once.
+
+A start killed while the backup is being copied heals at the next start. A start
+killed after the backup is renamed and before the step commits leaves a schema 28
+state that the next start refuses with `SchemaBackupExists`; move the backup aside
+without deleting it and start again, as the
+[upgrade guide](docs/guides/upgrading.md) describes.
+
+v0.4.9 and older refuse schema 29 with `UnsupportedSchema`. After the upgrade
+the only way back to v0.4.9 is the `.pre29-backup` with the v0.4.9 binary;
+everything written after it is lost. v0.4.7 remains the minimum supported
+upgrade source.
+
+`state_file_max_pages` and the `State file:` line now report SQLite's limit of
+278,528 pages. Monitoring that compared `fail2zig_state_file_pages` with 262,144
+should alert on `fail2zig_state_file_used_pages` instead. Scripts that run `ban`,
+`ignore add` or `reload` should treat a `StorageCapacity` rejection as temporary.
+
+## Known limitations
+
+- New work waits before the file is physically full, by the pages owed to
+  admitted work, and reopens 1,024 pages below the line.
+- Under page pressure, history, evidence and escalation memory can be given up
+  earlier than `history_retention` and the memory caps would keep them.
+- A full filesystem, the WAL and temporary files are outside the page budget.
+  The running daemon pauses with `StorageFull` and recovers when space returns;
+  a start on a full filesystem still refuses.
+- With the per-line table gone, a line counts twice if a defect or a manual edit
+  moves a source position backwards. No supported path does this.
+- A start killed between the backup rename and the schema commit needs the
+  operator step above.
+
 # fail2zig v0.4.9
 
 Version 0.4.9 is a hardening release. It shows the stored matched line for each
@@ -174,8 +261,8 @@ metrics, an audit line per change, JSON logs and `support-bundle`.
   memory, host basics and the last warnings and errors from the daemon log;
   addresses are hashed unless `--include-addresses` is given.
 - Give every command a help page (`fail2zig help <command>` or
-  `<command> --help`, the offline tools included); `help <typo>` and
-  `fail2zig <typo>` exit 2 with a suggestion; the daemon's `--help` and the
+  `<command> --help`, the offline tools included); `fail2zig <typo>` exits 2
+  with a suggestion, and `help <typo>` exits 2 and points to `fail2zig help`; the daemon's `--help` and the
   client's `help` list the same commands. `ban --duration` accepts the
   configuration's duration syntax as well as seconds. `jails` help documents
   the source-health words.

@@ -2193,13 +2193,74 @@ pub fn Methods(comptime Store: type) type {
             now_us: i64,
             history_caught_up: bool,
             spent_scopes: bool,
+            shed: ?*ShedCounts = null,
         };
+        pub const ShedCounts = struct { spent_pages: u64 = 0, detail_rows: u64 = 0, consumed_events: u64 = 0, memory_rows: u64 = 0 };
         pub fn maintenanceStep(self: *Store, request: MaintenanceRequest) Error!health.MaintenanceOutcome {
             const outcome = try self.maintenanceStepInner(request);
             self.maintenance_operation = null;
             return outcome;
         }
+        pub fn shedStep(self: *Store, now_us: i64, spent_scopes: bool, counts: *ShedCounts) Error!?health.MaintenanceOutcome {
+            self.maintenance_operation = .spent_scopes;
+            if (spent_scopes) switch (try self.pruneSpentEffects(self.prune_batch)) {
+                .idle => {},
+                .yielded, .scanned => return .{ .wait = .spent_scopes },
+                .pruned => {
+                    counts.spent_pages +|= 1;
+                    return .{ .progress = .spent_scopes };
+                },
+            };
+            self.maintenance_operation = .obsolete_rows;
+            switch (try self.reclaimObsoleteOne()) {
+                .idle => {},
+                .scanned => return .{ .wait = .obsolete_rows },
+                .deleted => {
+                    counts.spent_pages +|= 1;
+                    return .{ .progress = .obsolete_rows };
+                },
+            }
+            if (self.schema_version >= store.load_repair_schema) {
+                self.maintenance_operation = .history_details;
+                const details = try self.shedHistoryPage(.details, now_us) orelse return .{ .wait = .history_details };
+                if (details != 0) {
+                    counts.detail_rows +|= details;
+                    return .{ .progress = .history_details };
+                }
+                self.maintenance_operation = .history_prefix;
+                const consumed = try self.shedHistoryPage(.prefix, now_us) orelse return .{ .wait = .history_prefix };
+                if (consumed != 0) {
+                    counts.consumed_events +|= consumed;
+                    return .{ .progress = .history_prefix };
+                }
+            }
+            self.maintenance_operation = .obsolete_rows;
+            try self.beginClassWrite(.reclamation);
+            errdefer self.rollback();
+            const evicted = @as(u64, try self.evictMemoryRows(.retired, now_us)) + try self.evictMemoryRows(.summaries, now_us);
+            try self.commitTransaction();
+            if (evicted == 0) return null;
+            counts.memory_rows +|= evicted;
+            return .{ .progress = .obsolete_rows };
+        }
+        fn shedHistoryPage(self: *Store, kind: enum { details, prefix }, now_us: i64) Error!?usize {
+            try self.beginClassWrite(.reclamation);
+            errdefer self.rollback();
+            const current = try self.readRetentionPolicy();
+            const fence = if (current.published) try self.historyFence() else null;
+            const rows = if (fence) |consumed| (switch (kind) {
+                .details => self.deleteDetailPage(current, consumed, now_us, self.retention_page),
+                .prefix => self.prunePrefixPage(current, consumed, now_us, now_us),
+            }) catch |failure| {
+                if (failure != error.Interrupted) return failure;
+                _ = try self.yieldRetention();
+                return null;
+            } else 0;
+            try self.commitTransaction();
+            return rows;
+        }
         fn maintenanceStepInner(self: *Store, request: MaintenanceRequest) Error!health.MaintenanceOutcome {
+            if (request.shed) |counts| if (self.intake_closed) if (try self.shedStep(request.now_us, request.spent_scopes, counts)) |outcome| return outcome;
             const history_pending = self.history_retention_rest;
             if (request.history_caught_up) self.history_retention_rest = false;
             if (request.history_caught_up and !history_pending) {

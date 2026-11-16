@@ -105,7 +105,7 @@ pub const Pipeline = struct {
     }
 
     fn failed(self: *Pipeline, cause: anyerror) void {
-        if (cause == error.ConsumerExpired or cause == error.ConsumerPending or cause == error.EffectExpired or cause == error.ReserveBackpressure or cause == error.RetryCapacity or cause == error.RetryEligibilityPending) return;
+        if (cause == error.ConsumerExpired or cause == error.ConsumerPending or cause == error.EffectExpired or cause == error.ReserveBackpressure or cause == error.RetryCapacity or cause == error.RetryEligibilityPending or cause == error.StorageCapacity) return;
         if (cause == error.EffectClockReversed) {
             const floor = self.store.admissionClock() catch {
                 self.ready = false;
@@ -183,7 +183,7 @@ pub const Pipeline = struct {
     }
 
     pub fn commitBlocked(cause: anyerror) bool {
-        return cause == error.ReserveBackpressure or cause == error.RetryCapacity or cause == error.RetryEligibilityPending;
+        return cause == error.ReserveBackpressure or cause == error.RetryCapacity or cause == error.RetryEligibilityPending or cause == error.StorageCapacity;
     }
 
     pub fn sourceLocalIntervention(cause: anyerror) bool {
@@ -201,7 +201,7 @@ pub const Pipeline = struct {
     }
 
     fn retainsAdmission(cause: anyerror) bool {
-        return cause == error.ConsumerExpired or cause == error.ConsumerPending or cause == error.EffectExpired or cause == error.ReserveBackpressure or cause == error.RetryCapacity or cause == error.RetryEligibilityPending or sourceLocalIntervention(cause);
+        return cause == error.ConsumerExpired or cause == error.ConsumerPending or cause == error.EffectExpired or cause == error.ReserveBackpressure or cause == error.RetryCapacity or cause == error.RetryEligibilityPending or cause == error.StorageCapacity or sourceLocalIntervention(cause);
     }
 
     pub fn acknowledgeBatch(batch: []const records.Record, acknowledged: *usize, context: ?*anyopaque) anyerror!void {

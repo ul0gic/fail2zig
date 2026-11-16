@@ -14,6 +14,7 @@ const effects = @import("../core/native_effect.zig");
 const effect_history = @import("../core/native_effect_history.zig");
 const application_history = @import("../core/native_application_history.zig");
 const action_outcome = @import("../core/native_action_outcome.zig");
+const budget = @import("budget.zig");
 pub const latest_schema: i64 = 29;
 pub const load_repair_schema: i64 = 24;
 pub const load_repair = @import("load_repair_migration.zig");
@@ -55,7 +56,7 @@ const embedded_api: Api = blk: {
     }
     break :blk api;
 };
-pub const Error = application_history.Error || action_outcome.Error || retry.Error || consumers.Error || effects.Error || effect_history.Error || action_context.Error || error{ MaintenancePinned, StaleMaintenance, InvalidMaintenanceState, MaintenanceStorageRequired, ConsumerManifestRequired, ConsumerManifestMismatch, ConsumerManifestMissing, ConsumerManifestExists, ConsumerMigrationRequired, MissingRequiredConsumer, AmbiguousNativeDetection, AmbiguousRetryDecision, ConsumerStorageRequired, StaleConsumerCheckpoint, OpenFailed, UnsafePermissions, ForeignDatabase, UnsupportedSchema, DatabaseFailure, Busy, StorageFull, ReadOnly, StorageIo, CorruptDatabase, StorageLimit, Interrupted, AccessDenied, ReopenRequired, InvalidRecord, OccurrenceConflict, StaleCheckpoint, StaleSharedCheckpoint, InjectedFailure, OutOfMemory, ReceiptStorageRequired, InferenceStorageRequired, DetectionStorageRequired, ReceiptConflict, ReceiptRequired, ReceiptAlreadyCommitted, ReceiptLimit, RetryStorageRequired, RetryAdmissionRequired, RetryGenerationMismatch, RetryMigrationRequired, RetryCapacity, RetryEligibilityPending, ReceiptClockReversed, HistoryResetStorageRequired, InvalidHistoryReset, StaleHistoryReset, AdminStorageRequired, MigrationStorageRequired, StaleAdminRevision, InvalidAdminRequest, AdminRequestCapacity, RetryPolicyInFlight, StalePolicyTransition, ConfigGenerationExists, ConfigGenerationMissing, MigrationRunExists, MigrationRunMissing, MigrationStepMissing, MigrationStepOpen, MigrationStepOrder, InvalidMigrationRow, InvalidMigrationState, MigrationJailUnknown, LoadRepairMigrationIncomplete, LoadRepairWritersPending, LoadRepairBackupExists, LoadRepairBackupInvalid, LoadRepairDiskSpace, LoadRepairVerificationFailed, LoadRepairInvalidState, SchemaBackupExists, IgnoreCapacity, InvalidIgnoreEntry, ReserveBackpressure, MaintenanceWorkExhausted, LiveOwnerCounterInvalid, CustomLegacyProofRequired, CustomLegacyIdentityMismatch };
+pub const Error = application_history.Error || action_outcome.Error || retry.Error || consumers.Error || effects.Error || effect_history.Error || action_context.Error || error{ MaintenancePinned, StaleMaintenance, InvalidMaintenanceState, MaintenanceStorageRequired, ConsumerManifestRequired, ConsumerManifestMismatch, ConsumerManifestMissing, ConsumerManifestExists, ConsumerMigrationRequired, MissingRequiredConsumer, AmbiguousNativeDetection, AmbiguousRetryDecision, ConsumerStorageRequired, StaleConsumerCheckpoint, OpenFailed, UnsafePermissions, ForeignDatabase, UnsupportedSchema, DatabaseFailure, Busy, StorageFull, ReadOnly, StorageIo, CorruptDatabase, StorageLimit, Interrupted, AccessDenied, ReopenRequired, InvalidRecord, OccurrenceConflict, StaleCheckpoint, StaleSharedCheckpoint, InjectedFailure, OutOfMemory, ReceiptStorageRequired, InferenceStorageRequired, DetectionStorageRequired, ReceiptConflict, ReceiptRequired, ReceiptAlreadyCommitted, ReceiptLimit, RetryStorageRequired, RetryAdmissionRequired, RetryGenerationMismatch, RetryMigrationRequired, RetryCapacity, RetryEligibilityPending, ReceiptClockReversed, HistoryResetStorageRequired, InvalidHistoryReset, StaleHistoryReset, AdminStorageRequired, MigrationStorageRequired, StaleAdminRevision, InvalidAdminRequest, AdminRequestCapacity, RetryPolicyInFlight, StalePolicyTransition, ConfigGenerationExists, ConfigGenerationMissing, MigrationRunExists, MigrationRunMissing, MigrationStepMissing, MigrationStepOpen, MigrationStepOrder, InvalidMigrationRow, InvalidMigrationState, MigrationJailUnknown, LoadRepairMigrationIncomplete, LoadRepairWritersPending, LoadRepairBackupExists, LoadRepairBackupInvalid, LoadRepairDiskSpace, LoadRepairVerificationFailed, LoadRepairInvalidState, SchemaBackupExists, IgnoreCapacity, InvalidIgnoreEntry, ReserveBackpressure, MaintenanceWorkExhausted, LiveOwnerCounterInvalid, CustomLegacyProofRequired, CustomLegacyIdentityMismatch, StorageCapacity };
 
 pub const OpenStage = enum {
     path_validation,
@@ -267,6 +268,8 @@ pub const Store = struct {
     schema_version: i64 = 2,
     receipt_limit: ?usize = null,
     runtime_limits: bool = false,
+    admission: budget.Class = .obligation,
+    intake_closed: bool = false,
     runtime_path: ?[]const u8 = null,
     work_remaining: u32 = 1000,
     load_repair_backup_verified: bool = false,
@@ -305,16 +308,16 @@ pub const Store = struct {
         const prior = hard_limit(-1);
         _ = hard_limit(if (prior > 0) @min(prior, 64 * 1024 * 1024) else 64 * 1024 * 1024);
     }
+    pub fn configurePageLimit(self: *Store) Error!void {
+        if (try self.integer("PRAGMA page_count;") > budget.limit_pages) return error.StorageLimit;
+        var sql: [80]u8 = undefined;
+        const maximum = std.fmt.bufPrintZ(&sql, "PRAGMA max_page_count={d};", .{budget.limit_pages}) catch return error.StorageLimit;
+        if (try self.integer(maximum) != budget.limit_pages) return error.StorageLimit;
+    }
     pub fn configureRuntimeLimits(self: *Store) Error!void {
         configureHeapLimit();
         try self.exec("PRAGMA cache_size=-32768; PRAGMA wal_autocheckpoint=0;");
-        const page_size = try self.integer("PRAGMA page_size;");
-        if (page_size <= 0) return error.DatabaseFailure;
-        const pages = @divTrunc(@as(i64, 1024 * 1024 * 1024), page_size);
-        if (try self.integer("PRAGMA page_count;") > pages) return error.StorageLimit;
-        var sql: [80]u8 = undefined;
-        const maximum = std.fmt.bufPrintZ(&sql, "PRAGMA max_page_count={d};", .{pages}) catch return error.StorageLimit;
-        if (try self.integer(maximum) != pages) return error.StorageLimit;
+        try self.configurePageLimit();
         if (self.statement_cache == null) {
             const cache = try self.allocator.create([statement_cache_slots]CachedStatement);
             @memset(cache, .{});
@@ -357,10 +360,21 @@ pub const Store = struct {
     }
 
     pub fn beginWrite(self: *Store) Error!void {
+        return self.beginClassWrite(.obligation);
+    }
+    pub fn beginIntakeWrite(self: *Store, pages: u64) Error!void {
+        try self.beginClassWrite(.intake);
+        self.admitIntake(pages) catch |failure| {
+            self.rollback();
+            return failure;
+        };
+    }
+    pub fn beginClassWrite(self: *Store, class: budget.Class) Error!void {
         try self.usable();
         if (self.startup_admission) return error.DatabaseFailure;
         if (self.runtime_path) |path| try self.maintainWal(path);
         try self.exec("BEGIN IMMEDIATE;");
+        self.admission = class;
         self.retry_admission_work_left = 256;
         if (comptime build_options.diag) self.diagMarkChanges();
         self.row_tallies = .{};
@@ -424,7 +438,9 @@ pub const Store = struct {
         const diag_span = if (comptime build_options.diag) diag_mod.enter(.commit) else {};
         defer if (comptime build_options.diag) diag_mod.leave(diag_span);
         self.row_tallies = .{};
+        defer self.admission = .obligation;
         if (!self.startup_admission) {
+            try self.assertIntake();
             try self.exec("COMMIT;");
             if (comptime build_options.diag) self.diagCommitted();
             return;
@@ -867,6 +883,8 @@ pub const Store = struct {
 
     pub usingnamespace @import("footprint.zig").Methods(@This());
 
+    pub usingnamespace budget.Methods(@This());
+
     pub usingnamespace @import("ban_origins.zig").Methods(@This());
 
     pub usingnamespace @import("retry_release.zig").Methods(@This());
@@ -1266,6 +1284,7 @@ pub const Store = struct {
     pub fn rollback(self: *Store) void {
         self.work_remaining = 1000;
         self.row_tallies = .{};
+        self.admission = .obligation;
         if (self.api.get_autocommit(self.db) != 0) {
             if (self.startup_admission) self.reopen_required = true;
             self.startup_operation = false;
@@ -1366,7 +1385,7 @@ pub const Store = struct {
     pub fn commitRecord(self: *Store, record: Record) Error!CommitResult {
         try self.usable();
         const detections = try validateRecord(&record);
-        try self.beginWrite();
+        try self.beginIntakeWrite(budget.record_pages);
         errdefer self.rollback();
         const step = try self.commitRecordStep(&record, detections);
         if (step.result == .already_committed) {
