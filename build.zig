@@ -176,6 +176,18 @@ pub fn build(b: *std.Build) void {
     const load_fixture = b.addExecutable(.{ .name = "f2z-load-fixture", .root_module = load_fixture_mod });
     b.step("build-load-fixture", "Build the load reproduction state fixture generator").dependOn(&b.addInstallArtifact(load_fixture, .{}).step);
 
+    const recovery_fixture_mod = b.createModule(.{
+        .root_source_file = b.path("tests/harness/effect_recovery/fixture.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    recovery_fixture_mod.addImport("shared", shared_mod);
+    recovery_fixture_mod.addImport("engine_test", component_api);
+    recovery_fixture_mod.linkLibrary(sqlite);
+    const recovery_fixture = b.addExecutable(.{ .name = "f2z-effect-recovery-fixture", .root_module = recovery_fixture_mod });
+    b.step("build-effect-recovery-fixture", "Build the isolated effect recovery verification fixture").dependOn(&b.addInstallArtifact(recovery_fixture, .{}).step);
+
     const firewall_step = b.step("test-firewall", "Run the firewall readback parser suites");
     const firewall_suites = [_]struct { name: []const u8, path: []const u8, filter: []const u8 }{
         .{ .name = "test-native-firewall", .path = "tests/component/native_firewall_tests.zig", .filter = "native firewall:" },

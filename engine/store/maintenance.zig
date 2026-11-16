@@ -246,12 +246,92 @@ pub fn Methods(comptime Store: type) type {
             try remove.done();
             return .{ .deleted = std.math.cast(usize, self.api.changes(self.db)) orelse return error.DatabaseFailure, .next = last };
         }
+        fn maintenanceHeadersHeld(self: *Store, jail: []const u8, retiring: bool) Error!bool {
+            inline for (.{ "records", "source_cursors", "pending_receipts", "consumer_manifests" }) |table| {
+                var row = try self.statement("SELECT 1 FROM " ++ table ++ " WHERE jail=?1 LIMIT 1;");
+                defer row.deinit();
+                try row.text(1, jail);
+                if (try row.row()) return true;
+            }
+            {
+                var row = try self.statement("SELECT 1 FROM consumer_requirements WHERE manifest_jail=?1 LIMIT 1;");
+                defer row.deinit();
+                try row.text(1, jail);
+                if (try row.row()) return true;
+            }
+            if (!retiring) {
+                inline for (.{ "checkpoints", "retry_policies", "jail_retirements" }) |table| {
+                    var row = try self.statement("SELECT 1 FROM " ++ table ++ " WHERE jail=?1 LIMIT 1;");
+                    defer row.deinit();
+                    try row.text(1, jail);
+                    if (try row.row()) return true;
+                }
+            }
+            return false;
+        }
+        pub fn retireMaintenanceHeadersTx(self: *Store, jail: []const u8, max_rows: u8, clock: effects.Clock) Error!u16 {
+            if (max_rows == 0 or max_rows > 64 or self.api.get_autocommit(self.db) != 0) return error.InvalidMaintenanceState;
+            if (try self.maintenanceHeadersHeld(jail, true)) return error.MaintenancePinned;
+            var deleted: u16 = 0;
+            while (deleted < max_rows) : (deleted += 1) {
+                const id = blk: {
+                    var row = try self.statement("SELECT rowid FROM source_maintenance WHERE jail=?1 ORDER BY source,generation LIMIT 1;");
+                    defer row.deinit();
+                    try row.text(1, jail);
+                    if (!try row.row()) break;
+                    break :blk try row.signed(0);
+                };
+                var remove = try self.statement("DELETE FROM source_maintenance WHERE rowid=?1 AND jail=?2;");
+                defer remove.deinit();
+                try remove.int(1, id);
+                try remove.text(2, jail);
+                try remove.done();
+                if (self.api.changes(self.db) != 1) return error.InvalidMaintenanceState;
+            }
+            if (deleted != 0) try self.finishCleanupClock(clock, clock.prepared_us);
+            return deleted;
+        }
+        fn orphanHeaderStep(self: *Store) Error!RetiredStep {
+            var position = self.source_header_cursor;
+            var deleted: usize = 0;
+            var jail_buffer: [4096]u8 = undefined;
+            const configured = try self.latestConfigGeneration();
+            for (0..8) |_| {
+                if (self.work_remaining < cleanup_work_reserve) break;
+                const jail = blk: {
+                    var row = try self.statement("SELECT rowid,jail FROM source_maintenance WHERE rowid>?1 ORDER BY rowid LIMIT 1;");
+                    defer row.deinit();
+                    try row.int(1, position);
+                    if (!try row.row()) return .{ .deleted = deleted, .next = null };
+                    position = try row.signed(0);
+                    if (self.api.column_type(row.ptr, 1) != 3) return error.InvalidMaintenanceState;
+                    break :blk try copyColumn(&row, 1, &jail_buffer);
+                };
+                if (try self.maintenanceHeadersHeld(jail, false)) continue;
+                if (configured) |*head| {
+                    var row = try self.statement("SELECT 1 FROM config_generation_jails WHERE generation=?1 AND jail=?2;");
+                    defer row.deinit();
+                    try row.blob(1, &head.generation);
+                    try row.text(2, jail);
+                    if (try row.row()) continue;
+                }
+                var remove = try self.statement("DELETE FROM source_maintenance WHERE rowid=?1;");
+                defer remove.deinit();
+                try remove.int(1, position);
+                try remove.done();
+                if (self.api.changes(self.db) != 1) return error.InvalidMaintenanceState;
+                deleted += 1;
+            }
+            return .{ .deleted = deleted, .next = position };
+        }
         pub fn cleanupRecords(self: *Store, clock: effects.Clock) Error!RecordCleanup {
             if (self.schema_version < 15) return .idle;
             try self.beginWrite();
             errdefer self.rollback();
             const now = try self.cleanupClock(clock);
             _ = try self.maintenanceRevision();
+            const headers: ?RetiredStep = if (self.schema_version < 28 or self.source_header_sweep_done) null else try self.orphanHeaderStep();
+            const headers_deleted = if (headers) |step| step.deleted else 0;
             const retention = Retention{ .now = now, .history = try self.committedHistorySequence(), .installation = try self.readInstallation() };
             var position = self.cleanup_cursor;
             var deleted: usize = 0;
@@ -293,10 +373,13 @@ pub fn Methods(comptime Store: type) type {
             }
             const retired: ?RetiredStep = if (self.retired_sweep_done or self.work_remaining < cleanup_work_reserve) null else try self.zeroRetiredStep();
             const retired_deleted = if (retired) |step| step.deleted else 0;
-            if (deleted != 0 or retired_deleted != 0) try self.finishCleanupClock(clock, now);
+            if (deleted != 0 or retired_deleted != 0 or headers_deleted != 0) try self.finishCleanupClock(clock, now);
             try self.fault(.before_cleanup_commit);
             try self.commitTransaction();
             self.cleanup_cursor = if (wrapped) 0 else position;
+            if (headers) |step| {
+                if (step.next) |last| self.source_header_cursor = last else self.source_header_sweep_done = true;
+            }
             if (retired) |step| {
                 if (step.next) |last| {
                     self.retired_cursor = last;
@@ -311,9 +394,10 @@ pub fn Methods(comptime Store: type) type {
                 diag_mod.count(.record_cleanup_groups, deleted);
                 diag_mod.count(.retired_zero_rows, retired_deleted);
             }
-            const cycle_deleted = self.cleanup_cycle_deleted or deleted != 0 or retired_deleted != 0;
+            const cycle_deleted = self.cleanup_cycle_deleted or deleted != 0 or retired_deleted != 0 or headers_deleted != 0;
             self.cleanup_cycle_deleted = cycle_deleted and !wrapped;
-            if (deleted != 0 or retired_deleted != 0) return .deleted;
+            if (deleted != 0 or retired_deleted != 0 or headers_deleted != 0) return .deleted;
+            if (headers != null and !self.source_header_sweep_done) return .scanned;
             return if (wrapped and !cycle_deleted) .idle else .scanned;
         }
         fn countRecordChildren(self: *Store, jail: []const u8, source: []const u8, occurrence: []const u8, comptime table: []const u8) Error!usize {

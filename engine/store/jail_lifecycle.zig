@@ -9,7 +9,7 @@ const Error = store.Error;
 pub fn Methods(comptime Store: type) type {
     return struct {
         pub const JailRetirementIntent = struct { jail: detection.Name, keep_ignore_deadlines: bool };
-        pub const JailRetirementPhase = enum { owners, retry_states, retry_retired, policy_summaries, source_cursors, pending_receipts, manifests, timed_entries, record_groups, finish, done };
+        pub const JailRetirementPhase = enum { owners, retry_states, retry_retired, policy_summaries, source_cursors, pending_receipts, manifests, timed_entries, record_groups, maintenance_headers, finish, done };
         pub const JailRetirementCursor = struct { phase: JailRetirementPhase = .owners, owner_after: ?effects.Hash = null, timed_list: u8 = 1 };
         pub const JailRetirementFinishProof = struct {
             intent: JailRetirementIntent,
@@ -300,7 +300,14 @@ pub fn Methods(comptime Store: type) type {
                     const progress = try self.retireRecordGroupsTx(intent, max_rows, clock);
                     page.examined = progress.examined;
                     page.deleted_rows = progress.deleted_rows;
-                    if (progress.done) page.next.phase = .finish;
+                    if (progress.done) page.next.phase = .maintenance_headers;
+                    break;
+                },
+                .maintenance_headers => {
+                    const deleted = try self.retireMaintenanceHeadersTx(jail, max_rows, clock);
+                    page.examined = deleted;
+                    page.deleted_rows = deleted;
+                    if (deleted < max_rows) page.next.phase = .finish;
                     break;
                 },
                 .finish => {
@@ -336,7 +343,7 @@ pub fn Methods(comptime Store: type) type {
                     if (verified.observed_us > now) return error.InvalidEffect;
                 },
             }
-            inline for (.{ "retry_states", "retry_retired", "confirmed_policy_summaries", "source_cursors", "pending_receipts", "consumer_manifests", "records" }) |table| {
+            inline for (.{ "retry_states", "retry_retired", "confirmed_policy_summaries", "source_cursors", "pending_receipts", "consumer_manifests", "records", "source_maintenance" }) |table| {
                 var row = try self.statement("SELECT 1 FROM " ++ table ++ " WHERE jail=?1 LIMIT 1;");
                 defer row.deinit();
                 try row.text(1, jail);
@@ -367,6 +374,8 @@ pub fn Methods(comptime Store: type) type {
             page.deleted_rows += 1;
             _ = try self.commitEffectClock(clock);
             try self.commitEffectTransaction(false);
+            self.source_header_cursor = 0;
+            self.source_header_sweep_done = false;
             return page;
         }
         fn deleteRetirementParent(self: *Store, sql: [:0]const u8, jail: []const u8) Error!void {

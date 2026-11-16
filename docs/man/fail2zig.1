@@ -30,6 +30,10 @@ fail2zig \- intrusion prevention daemon and its administration commands
 \fB\-\-acknowledge\-truncation\fR
 [\fB\-\-config\fR \fIpath\fR]
 .br
+.B fail2zig repair-effect-evidence
+[\fB\-\-config\fR \fIpath\fR]
+[\fB\-\-check\fR | \fB\-\-apply\fR]
+.br
 .B fail2zig support-bundle
 [\fB\-\-out\fR \fIpath\fR|\fB\-\fR]
 [\fB\-\-config\fR \fIpath\fR]
@@ -1125,6 +1129,42 @@ process, it releases the migrated scopes from the daemon: exit 0 with state
 partial (4), uncertain (5) or refused (1) releases leave the step open; an unreachable
 daemon exits 3. See
 .IR docs/operations/command-migration.md .
+.
+.SH REPAIR-EFFECT-EVIDENCE
+Stop the daemon and run as the state-file owner. The default
+.B --check
+reports eligible current effect scopes without changing effect evidence.
+The configured state must already use the current schema; the command never
+creates or upgrades state and never contacts the firewall.
+.PP
+.B --apply
+accepts only an absence intent whose dispatch and observation timestamps are
+equal and earlier than its creation, with matching observation receipts and
+valid owners aggregating to absence. Other invalid effect state is refused.
+Before repair it creates and verifies a complete private SQLite backup beside
+the state, including committed WAL content, with mode 0600. Its unique name is
+.IR <state_file>.effect-evidence-<random>.backup ;
+the path and SHA-256 are printed. Existing backups are never overwritten.
+Free space must be twice the allocated database size plus 32 MiB.
+.PP
+Bounded transactions return only eligible intents to pending and revoke their
+invalid observation receipts. Owner facts, bans, source checkpoints, receipts
+and confirmed history are preserved. Start the daemon and check
+.B status
+and
+.B jails
+for confirmed protection; the daemon must obtain genuine kernel evidence.
+.PP
+Keep the backup: it contains the original invalid evidence and restoring it
+restores that refusal. An interrupted apply may be repeated; completed batches
+are skipped. A subsequent copy replaces a leftover
+.IR <state_file>.effect-evidence-backup.partial .
+Healthy state is a successful no-op and needs no backup.
+.PP
+A running writer, unsupported schema, changed state-file identity, insufficient
+backup space or unrecognized invalid effect state is refused with exit 1.
+Invalid arguments exit 2; completed check or apply exits 0. Preserve refused
+state and backups for diagnosis. This is not a general database salvage tool.
 .
 .SH REPAIR-SOURCE
 A file source truncated in place below its committed position (for example a

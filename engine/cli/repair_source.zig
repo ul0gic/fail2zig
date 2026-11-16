@@ -120,7 +120,7 @@ pub fn execute(allocator: std.mem.Allocator, options: Options, now_us: i64, stdo
     };
     // Released only after the store closes below.
     defer authority.close();
-    if (!sameFile(authority, state_path)) {
+    if (!native_paths.stateMatchesAuthority(authority, state_path)) {
         stderr.print("repair-source: state {s} was replaced while locked; nothing was changed\n", .{state_path}) catch {};
         return .rejected;
     }
@@ -133,7 +133,7 @@ pub fn execute(allocator: std.mem.Allocator, options: Options, now_us: i64, stdo
         stderr.print("repair-source: open state {s}: {s}\n", .{ state_path, @errorName(err) }) catch {};
         return .rejected;
     };
-    if (!sameFile(authority, state_path)) {
+    if (!native_paths.stateMatchesAuthority(authority, state_path)) {
         stderr.print("repair-source: state {s} was replaced while locked; nothing was changed\n", .{state_path}) catch {};
         return .rejected;
     }
@@ -150,12 +150,6 @@ pub fn execute(allocator: std.mem.Allocator, options: Options, now_us: i64, stdo
     defer outcome.deinit(allocator);
     report(stdout, options, outcome) catch return .rejected;
     return .success;
-}
-
-fn sameFile(authority: std.fs.File, path: []const u8) bool {
-    const held = std.posix.fstat(authority.handle) catch return false;
-    const named = std.posix.fstatat(std.posix.AT.FDCWD, path, std.posix.AT.SYMLINK_NOFOLLOW) catch return false;
-    return held.dev == named.dev and held.ino == named.ino;
 }
 
 fn refusal(stderr: anytype, options: Options, err: repair.Error, diagnostic: repair.Diagnostic) void {

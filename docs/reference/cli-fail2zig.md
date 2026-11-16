@@ -207,6 +207,50 @@ delete native state to bypass a refusal.
 
 See the [log file lifecycle](../guides/log-lifecycle.md#repair-source).
 
+## Effect evidence repair
+
+```text
+fail2zig repair-effect-evidence [--config <path>] [--check | --apply]
+```
+
+Stop the daemon and run as the state-file owner. Check mode is the default. It
+reports how many current effect scopes were examined and how many have the
+recognized malformed absence evidence. It does not change effect evidence, create
+state or contact the firewall. The state must already use the current schema;
+this command does not perform an upgrade.
+
+Apply accepts only a current absence intent whose dispatch and observation times
+are equal and earlier than its creation, whose observation receipts agree, and
+whose validated owners aggregate to absence. Other invalid effect state is
+refused. `InvalidEffect` alone does not establish eligibility.
+
+Before repairing anything, apply writes and verifies a complete SQLite backup,
+including committed WAL contents, beside the state file. The name is
+`<state_file>.effect-evidence-<random>.backup`, permissions are `0600`, and the
+command prints its path and SHA-256. Existing backups are never overwritten.
+The existing conservative backup policy requires twice the allocated database
+size plus 32 MiB of free space. A healthy state needs no backup and apply does
+nothing to it.
+
+Repair runs in bounded transactions. It removes only the invalid observation
+receipts and returns their current intents to pending, clearing their invalid
+evidence. Owner facts, bans, source checkpoints, receipts and confirmed history
+are preserved. Start the daemon afterward and check `status` and `jails` for
+confirmed protection; the daemon must obtain genuine kernel evidence.
+
+Keep the backup until recovery has been checked. It preserves the pre-repair
+state, including the malformed evidence, so restoring it restores that refusal
+too. An interrupted copy leaves a disposable `.effect-evidence-backup.partial`;
+a subsequent apply replaces it. An interrupted repair can be repeated: committed
+batches remain pending and the remaining eligible intents are repaired. Each
+attempt that changes state preserves its own pre-repair backup.
+
+A running writer, unsupported schema, changed state-file identity, insufficient
+backup space or unrecognized invalid effect state causes refusal (exit 1).
+Preserve the state and any backup for diagnosis. Invalid command arguments exit
+2; a completed check or apply exits 0. This is a targeted evidence repair, not a
+general database validator or salvage command.
+
 ## Support bundle
 
 ```text

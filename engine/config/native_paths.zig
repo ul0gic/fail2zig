@@ -117,6 +117,12 @@ fn validateAndLockState(file: std.fs.File) !std.fs.File {
     return file;
 }
 
+pub fn stateMatchesAuthority(authority: std.fs.File, path: []const u8) bool {
+    const held = std.posix.fstat(authority.handle) catch return false;
+    const named = std.posix.fstatat(std.posix.AT.FDCWD, path, std.posix.AT.SYMLINK_NOFOLLOW) catch return false;
+    return held.dev == named.dev and held.ino == named.ino;
+}
+
 pub fn lockStateIfPresent(path: []const u8) !?std.fs.File {
     try validateStateParent(path);
     const fd = openState(path, .existing) catch |err| switch (err) {

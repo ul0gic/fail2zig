@@ -271,7 +271,7 @@ pub fn Methods(comptime Store: type) type {
             try targets.int(4, now);
             try targets.done();
         }
-        fn decodeEffect(self: *Store, row: *Stmt, installation: effects.Installation) Error!effects.Entry {
+        pub fn decodeEffect(self: *Store, row: *Stmt, installation: effects.Installation) Error!effects.Entry {
             const scope_key = try effectBlob(row, 0, 32);
             const scope = try self.decodeStoredScope(row, 1);
             if (!std.mem.eql(u8, &scope_key, &try scope.key(installation))) return error.InvalidEffect;
@@ -601,7 +601,12 @@ pub fn Methods(comptime Store: type) type {
             var replaced: ?effects.Owner = null;
             for (owners[0..count]) |owner| if (std.mem.eql(u8, owner.jail.slice(), jail.slice())) {
                 owner_revision = owner.revision;
-                if (!std.mem.eql(u8, &owner.generation, &change.generation)) return error.EffectGenerationMismatch;
+                if (!std.mem.eql(u8, &owner.generation, &change.generation)) {
+                    if (owner.lease != .absent or change.lease == .absent) return error.EffectGenerationMismatch;
+                    const admission = try self.readRetryPolicy(change.jail) orelse return error.EffectGenerationMismatch;
+                    if (!std.mem.eql(u8, &admission.generation, &change.generation)) return error.EffectGenerationMismatch;
+                    if (self.schema_version >= 28 and try self.jailRetirement(change.jail) != null) return error.EffectGenerationMismatch;
+                }
                 if (std.mem.eql(u8, &owner.decision_id, &change.decision_id)) {
                     const replay = effects.Lease.eql(owner.lease, change.lease) and owner.decided_us == change.decided_us and owner.origin == change.origin;
                     if (replay) return previous orelse error.InvalidEffect;
@@ -654,9 +659,9 @@ pub fn Methods(comptime Store: type) type {
             if (replaced) |owner| try self.retireOwnerDecisionTx(key, change.jail, owner.decision_id, now);
             {
                 var owner = try self.statement(if (self.schema_version >= origin_schema)
-                    "INSERT INTO effect_owners(scope_key,jail,generation,decision_id,revision,lease_kind,deadline_us,decided_us,origin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(scope_key,jail) DO UPDATE SET decision_id=excluded.decision_id,revision=excluded.revision,lease_kind=excluded.lease_kind,deadline_us=excluded.deadline_us,decided_us=excluded.decided_us,origin=excluded.origin;"
+                    "INSERT INTO effect_owners(scope_key,jail,generation,decision_id,revision,lease_kind,deadline_us,decided_us,origin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(scope_key,jail) DO UPDATE SET generation=excluded.generation,decision_id=excluded.decision_id,revision=excluded.revision,lease_kind=excluded.lease_kind,deadline_us=excluded.deadline_us,decided_us=excluded.decided_us,origin=excluded.origin;"
                 else
-                    "INSERT INTO effect_owners(scope_key,jail,generation,decision_id,revision,lease_kind,deadline_us,decided_us) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(scope_key,jail) DO UPDATE SET decision_id=excluded.decision_id,revision=excluded.revision,lease_kind=excluded.lease_kind,deadline_us=excluded.deadline_us,decided_us=excluded.decided_us;");
+                    "INSERT INTO effect_owners(scope_key,jail,generation,decision_id,revision,lease_kind,deadline_us,decided_us) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(scope_key,jail) DO UPDATE SET generation=excluded.generation,decision_id=excluded.decision_id,revision=excluded.revision,lease_kind=excluded.lease_kind,deadline_us=excluded.deadline_us,decided_us=excluded.decided_us;");
                 defer owner.deinit();
                 try owner.blob(1, &key);
                 try owner.text(2, change.jail);
@@ -838,10 +843,23 @@ pub fn Methods(comptime Store: type) type {
             try targets.done();
         }
         const SettledIntent = struct { entry: effects.Entry, status: effects.Status, settlement: effects.Settlement };
+        pub fn effectObservationId(intent_id: effects.Hash, dispatch_us: i64, observed_us: i64, fingerprint: effects.Hash, state: ?effects.Lease, status: effects.Status) effects.Hash {
+            var stamps: [16]u8 = undefined;
+            std.mem.writeInt(i64, stamps[0..8], dispatch_us, .little);
+            std.mem.writeInt(i64, stamps[8..16], observed_us, .little);
+            var observed_state: [10]u8 = [_]u8{0} ** 10;
+            observed_state[0] = if (state) |lease| @intFromEnum(lease) else 3;
+            if (state) |lease| if (lease == .finite) {
+                std.mem.writeInt(i64, observed_state[1..9], lease.finite, .little);
+            };
+            observed_state[9] = @intFromEnum(status);
+            return effects.hashParts("fail2zig-native-effect-observation-v1", &.{ &intent_id, &stamps, &fingerprint, &observed_state });
+        }
         fn settleTx(self: *Store, token: effects.Token, dispatch_us: i64, observation: effects.Observation, clock: effects.Clock) Error!SettledIntent {
             const entry = try self.checkedEffectToken(token);
             switch (entry.status) {
                 .pending => {
+                    if (dispatch_us < entry.intent_us) return error.InvalidEffect;
                     try self.markDispatchedTx(token, dispatch_us);
                     try self.fault(.before_effect_dispatch_commit);
                 },
@@ -866,16 +884,7 @@ pub fn Methods(comptime Store: type) type {
             const matches = if (observation.state) |state| effects.Lease.eql(entry.desired, state) else false;
             const status: effects.Status = if (expired) .expired else if (!matches) .pending else if (entry.desired == .absent) .absent else .applied;
             if (previous_observed != null and observation.observed_us == previous_observed.? and status != entry.status) return error.StaleEffect;
-            var stamps: [16]u8 = undefined;
-            std.mem.writeInt(i64, stamps[0..8], dispatch_time, .little);
-            std.mem.writeInt(i64, stamps[8..16], observation.observed_us, .little);
-            var observed_state: [10]u8 = [_]u8{0} ** 10;
-            observed_state[0] = if (observation.state) |state| @intFromEnum(state) else 3;
-            if (observation.state) |state| if (state == .finite) {
-                std.mem.writeInt(i64, observed_state[1..9], state.finite, .little);
-            };
-            observed_state[9] = @intFromEnum(status);
-            const observation_id = effects.hashParts("fail2zig-native-effect-observation-v1", &.{ &token.intent_id, &stamps, &observation.fingerprint, &observed_state });
+            const observation_id = effectObservationId(token.intent_id, dispatch_time, observation.observed_us, observation.fingerprint, observation.state, status);
             {
                 var prior = try self.statement("SELECT 1 FROM effect_observations WHERE observation_id=?1;");
                 defer prior.deinit();
@@ -889,7 +898,7 @@ pub fn Methods(comptime Store: type) type {
                     try receipt.int(3, dispatch_time);
                     try receipt.int(4, observation.observed_us);
                     try receipt.blob(5, &observation.fingerprint);
-                    try receipt.int(6, observed_state[0]);
+                    try receipt.int(6, if (observation.state) |state| @intFromEnum(state) else 3);
                     if (observation.state) |state| if (state == .finite) {
                         try receipt.int(7, state.finite);
                     };

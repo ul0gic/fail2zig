@@ -99,6 +99,44 @@ the daemon room to write a new one:
 
 Use your own `state_file` path in place of `/var/lib/fail2zig/state.bin`.
 
+## If startup refuses invalid effect evidence
+
+The daemon continues to refuse invalid effect state. A specific absence-settlement
+defect can leave dispatch and observation timestamps earlier than the intent they
+claim to settle. Updating the executable prevents new instances, but cannot make
+those existing timestamps valid.
+
+For that exact signature, stop the service and inspect the state as its owner:
+
+```bash
+sudo systemctl stop fail2zig
+sudo -u fail2zig fail2zig repair-effect-evidence --config /etc/fail2zig/config.toml --check
+```
+
+The state must already have completed its schema upgrade. A successful check
+reports the eligible count; it does not change effect evidence. If eligible
+intents are reported, apply the repair:
+
+```bash
+sudo -u fail2zig fail2zig repair-effect-evidence --config /etc/fail2zig/config.toml --apply
+sudo systemctl start fail2zig
+sudo fail2zig status
+sudo fail2zig jails
+```
+
+Use your actual service user and config path. Apply first creates a private,
+verified backup beside the state file and prints its path and hash; it requires
+twice the database size plus 32 MiB free. It returns only recognized malformed
+absence intents to pending and preserves the owner, ban, source-progress and
+history facts. Normal startup then obtains fresh firewall evidence. Check that
+protection is confirmed before considering recovery complete.
+
+Keep the backup: it contains the pre-repair state, including the invalid evidence.
+If the command refuses an unrecognized state, preserve it for diagnosis; this
+procedure does not repair arbitrary `InvalidEffect` failures. See the
+[command reference](../reference/cli-fail2zig.md#effect-evidence-repair) for
+interrupted runs, backups and refusal meanings.
+
 ## Settings to review
 
 Coming from v0.4.9:

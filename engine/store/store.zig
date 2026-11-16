@@ -282,6 +282,8 @@ pub const Store = struct {
     retired_cursor: i64 = 0,
     retired_cycle_deleted: bool = false,
     retired_sweep_done: bool = false,
+    source_header_cursor: i64 = 0,
+    source_header_sweep_done: bool = false,
     reclaim: ReclaimCursor = .{},
     reclaim_turn: bool = false,
     prune_batch: u8 = attribution_batch,
@@ -892,6 +894,8 @@ pub const Store = struct {
     pub usingnamespace @import("group_commit.zig").Methods(@This());
 
     pub usingnamespace @import("source_repair.zig").Methods(@This());
+
+    pub usingnamespace @import("effect_repair.zig").Methods(@This());
 
     pub usingnamespace @import("jail_lifecycle.zig").Methods(@This());
 

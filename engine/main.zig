@@ -70,7 +70,7 @@ pub const CliOptions = struct {
     foreground: bool = true,
 };
 
-pub const EntryMode = enum { daemon, operator, migrate, rule_test, repair_source, support_bundle };
+pub const EntryMode = enum { daemon, operator, migrate, rule_test, repair_source, repair_effect_evidence, support_bundle };
 
 const operator_words = [_][]const u8{ "status", "jails", "list", "ban", "unban", "reload", "version", "help", "completions", "config", "history", "jail", "firewall", "stats", "ignore", "diag" };
 const operator_globals = [_][]const u8{ "--socket", "--output", "--no-color", "--timeout" };
@@ -81,6 +81,7 @@ pub fn classifyEntry(args: []const []const u8) EntryMode {
     if (std.mem.eql(u8, first, "migrate")) return .migrate;
     if (std.mem.eql(u8, first, "rule-test")) return .rule_test;
     if (std.mem.eql(u8, first, "repair-source")) return .repair_source;
+    if (std.mem.eql(u8, first, "repair-effect-evidence")) return .repair_effect_evidence;
     if (std.mem.eql(u8, first, "support-bundle")) return .support_bundle;
     for (operator_words) |w| if (std.mem.eql(u8, first, w)) return .operator;
     if (first.len > 0 and first[0] != '-' and !std.mem.eql(u8, first, "daemon")) return .operator;
@@ -191,6 +192,7 @@ fn printHelp(w: anytype) !void {
         \\  rule-test                 Evaluate a log, one line or the journal against a rule
         \\  migrate <sub>             Inspect, plan and carry out a fail2ban migration
         \\  repair-source             Acknowledge a truncated or replaced file source
+        \\  repair-effect-evidence    Inspect or repair invalid absence evidence offline
         \\  support-bundle            Write a redacted diagnostic bundle for a bug report
         \\
         \\GLOBALS (administration): --socket <path> --output table|json|plain --no-color --timeout <ms>
@@ -255,6 +257,7 @@ pub fn main() !void {
         },
         .rule_test => std.process.exit(@import("cli/rule_test.zig").run(heap, rest[1..], std.io.getStdOut().writer(), std.io.getStdErr().writer()).code()),
         .repair_source => std.process.exit(@import("cli/repair_source.zig").run(heap, rest[1..], std.io.getStdOut().writer(), std.io.getStdErr().writer()).code()),
+        .repair_effect_evidence => std.process.exit(@import("cli/repair_effect_evidence.zig").run(heap, rest[1..], std.io.getStdOut().writer(), std.io.getStdErr().writer()).code()),
         .support_bundle => std.process.exit(@import("cli/support_bundle.zig").run(heap, rest[1..], version, std.io.getStdOut().writer(), std.io.getStdErr().writer()).code()),
         .daemon => {},
     }

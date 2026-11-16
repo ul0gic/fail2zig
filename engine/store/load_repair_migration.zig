@@ -478,6 +478,28 @@ pub fn Methods(comptime Store: type) type {
             return .{ .path = final_path, .partial_path = partial_path, .sha256 = try fileSha256(partial_path), .pages = pages };
         }
 
+        pub fn takeEffectEvidenceBackup(self: *Store, state_path: []const u8, path_buffer: []u8, partial_buffer: []u8) Error!SchemaBackup {
+            if (self.schema_version != latest_schema or self.api.get_autocommit(self.db) == 0) return error.UnsupportedSchema;
+            var nonce: [16]u8 = undefined;
+            std.crypto.random.bytes(&nonce);
+            const path = std.fmt.bufPrintZ(path_buffer, "{s}.effect-evidence-{s}.backup", .{ state_path, std.fmt.fmtSliceHexLower(&nonce) }) catch return error.StorageLimit;
+            const partial = std.fmt.bufPrintZ(partial_buffer, "{s}.effect-evidence-backup.partial", .{state_path}) catch return error.StorageLimit;
+            const pages = try self.integer("PRAGMA page_count;");
+            const page_size = try self.integer("PRAGMA page_size;");
+            if (pages <= 0 or page_size <= 0) return error.DatabaseFailure;
+            const bytes = std.math.mul(u64, @intCast(pages), @intCast(page_size)) catch return error.StorageLimit;
+            std.fs.cwd().deleteFileZ(partial) catch |failure| if (failure != error.FileNotFound) return error.StorageIo;
+            try requireFreeSpace(state_path, bytes *| 2 +| disk_reserve_bytes);
+            try self.copyBackup(partial, pages, self.schema_version);
+            errdefer std.fs.cwd().deleteFileZ(partial) catch {};
+            const hash = try fileSha256(partial);
+            std.posix.linkZ(partial, path) catch return error.StorageIo;
+            try syncPath(std.fs.path.dirname(path) orelse ".", true);
+            std.posix.unlinkZ(partial) catch return error.StorageIo;
+            try syncPath(std.fs.path.dirname(path) orelse ".", true);
+            return .{ .path = path, .sha256 = hash, .pages = pages };
+        }
+
         fn copyBackup(self: *Store, partial_path: [:0]const u8, pages: i64, schema: i64) Error!void {
             std.fs.cwd().deleteFileZ(partial_path) catch |failure| if (failure != error.FileNotFound) return error.StorageIo;
             const created = std.posix.openZ(partial_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, 0o600) catch return error.StorageIo;

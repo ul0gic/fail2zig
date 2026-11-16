@@ -26,7 +26,7 @@ const bash_script =
     \\    local cur prev words cword
     \\    _init_completion || return
     \\
-    \\    local subcommands="status stats ban unban list jails reload version config history firewall jail ignore repair-source support-bundle rule-test migrate completions help"
+    \\    local subcommands="status stats ban unban list jails reload version config history firewall jail ignore repair-source repair-effect-evidence support-bundle rule-test migrate completions help"
     \\    local global_flags="--socket --output --no-color --timeout --help --version"
     \\
     \\    # Flag-value completion for the previous word.
@@ -154,6 +154,7 @@ const zsh_script =
     \\        'jail:Enable, disable, pause or resume a jail'
     \\        'ignore:Manage per-jail exclusions (add, remove, list)'
     \\        'repair-source:Acknowledge a truncated or replaced file source (daemon stopped)'
+    \\        'repair-effect-evidence:Inspect or repair invalid absence evidence offline'
     \\        'support-bundle:Write a redacted diagnostic bundle for a bug report'
     \\        'rule-test:Evaluate a log, one line or the journal against a rule (offline)'
     \\        'migrate:Inspect, plan and carry out a fail2ban migration (offline)'
@@ -339,6 +340,7 @@ const fish_script =
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'jail'         -d 'Enable, disable, pause or resume a jail'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'ignore'       -d 'Manage per-jail exclusions (add, remove, list)'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'repair-source' -d 'Acknowledge a truncated or replaced file source (daemon stopped)'
+    \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'repair-effect-evidence' -d 'Inspect or repair invalid absence evidence offline'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'support-bundle' -d 'Write a redacted diagnostic bundle for a bug report'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'rule-test'    -d 'Evaluate a log, one line or the journal against a rule (offline)'
     \\complete -c fail2zig -f -n '__fail2zig_client_needs_command' -a 'migrate'      -d 'Inspect, plan and carry out a fail2ban migration (offline)'
