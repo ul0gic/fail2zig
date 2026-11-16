@@ -328,26 +328,29 @@ fn formatPortSentryTimestamp(buffer: []u8, timestamp_us: i64) ![]const u8 {
     });
 }
 
-fn expectPortSentryState(path: []const u8, cursor_offset: u64, original_us: i64, nonmatches: []const []const u8) !void {
+fn expectPortSentryNonmatchCount(store: *engine.native_store_mod.Store, line: []const u8, expected: i64) !void {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(line);
+    hash.update("\n");
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    const query = try std.fmt.allocPrintZ(t.allocator, "SELECT count(*) FROM records r JOIN record_detections d USING(jail,source,occurrence) WHERE r.jail='portsentry' AND r.disposition='time-eligible-event' AND d.kind=3 AND r.raw_hash=x'{s}';", .{std.fmt.fmtSliceHexLower(&digest)});
+    defer t.allocator.free(query);
+    try t.expectEqual(expected, try store.inspectInteger(query));
+}
+
+fn expectPortSentryState(path: []const u8, cursor_offset: u64, original_us: i64, retained: []const []const u8, released: []const []const u8) !void {
     var store = try engine.native_store_mod.Store.openReadOnly(t.allocator, path);
     defer store.close();
-    try t.expectEqual(@as(i64, 4), try store.inspectInteger("SELECT count(*) FROM records WHERE jail='portsentry' AND disposition='time-eligible-event';"));
+    try t.expectEqual(@as(i64, 2), try store.inspectInteger("SELECT count(*) FROM records WHERE jail='portsentry' AND disposition='time-eligible-event';"));
     try t.expectEqual(@as(i64, 1), try store.inspectInteger("SELECT count(*) FROM record_detections WHERE jail='portsentry' AND filter='portsentry' AND kind=6 AND family=4 AND subject=x'C0000202';"));
-    try t.expectEqual(@as(i64, 3), try store.inspectInteger("SELECT count(*) FROM record_detections WHERE jail='portsentry' AND filter='portsentry' AND kind=3;"));
+    try t.expectEqual(@as(i64, 1), try store.inspectInteger("SELECT count(*) FROM record_detections WHERE jail='portsentry' AND filter='portsentry' AND kind=3;"));
     try t.expectEqual(@as(i64, 1), try store.inspectInteger("SELECT count(*) FROM retry_decisions WHERE jail='portsentry' AND family=4 AND subject=x'C0000202' AND enforce=0;"));
     const event_query = try std.fmt.allocPrintZ(t.allocator, "SELECT count(*) FROM records r JOIN record_detections d USING(jail,source,occurrence) WHERE r.jail='portsentry' AND d.kind=6 AND r.original_us={d} AND r.effective_us={d} AND r.receipt_us>r.original_us;", .{ original_us, original_us });
     defer t.allocator.free(event_query);
     try t.expectEqual(@as(i64, 1), try store.inspectInteger(event_query));
-    for (nonmatches) |line| {
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update(line);
-        hash.update("\n");
-        var digest: [32]u8 = undefined;
-        hash.final(&digest);
-        const query = try std.fmt.allocPrintZ(t.allocator, "SELECT count(*) FROM records r JOIN record_detections d USING(jail,source,occurrence) WHERE r.jail='portsentry' AND r.disposition='time-eligible-event' AND d.kind=3 AND r.raw_hash=x'{s}';", .{std.fmt.fmtSliceHexLower(&digest)});
-        defer t.allocator.free(query);
-        try t.expectEqual(@as(i64, 1), try store.inspectInteger(query));
-    }
+    for (retained) |line| try expectPortSentryNonmatchCount(&store, line, 1);
+    for (released) |line| try expectPortSentryNonmatchCount(&store, line, 0);
     try t.expectEqual(@as(usize, 0), try store.pendingReceiptCount());
 
     var cursor: ?*SqliteStatement = null;
@@ -447,7 +450,7 @@ test "native daemon: portsentry 2.x history file preserves whole record time and
     try waitRevision(&h, 5);
     try waitStatus(&h, "\"decisions_total\":1");
     try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try h.stopDaemon());
-    try expectPortSentryState(h.state_path, history.len, positive_us, &.{ ignored, prethreshold, nonmatch });
+    try expectPortSentryState(h.state_path, history.len, positive_us, &.{nonmatch}, &.{ ignored, prethreshold });
 }
 
 test "native daemon: file retry history and original decision deadline survive graceful and killed restarts" {
@@ -572,6 +575,7 @@ test "native daemon: invalid escalation refuses before state access and changed 
     defer t.allocator.free(supported);
     try std.fs.cwd().writeFile(.{ .sub_path = h.config_path, .data = supported });
     try h.startDaemon();
+    try waitReady(&h);
     try h.writeLine(failure);
     try waitRevision(&h, 2);
     _ = try h.stopDaemon();
@@ -739,9 +743,10 @@ test "native daemon: malformed shared source advances durably and stays ready ac
             \\
         , .{ name, if (std.mem.eql(u8, name, "good")) good_path else h.log_path });
     }
+    try h.startDaemon();
+    try waitReady(&h);
     try h.writeLine(damaged_prefix ++ failure);
     try good.writeAll(failure ++ "\n");
-    try h.startDaemon();
     try waitStatus(&h, "\"decisions_total\":3");
     try waitMalformedCursors(h.state_path, false);
     try waitReady(&h);
@@ -932,6 +937,7 @@ test "native daemon: killed writer pause and downtime rotation retain unacknowle
     defer h.deinit();
     try writeConfig(&h);
     try h.startDaemon();
+    try waitReady(&h);
     try h.writeLine(failure);
     try h.writeLine(failure);
     try waitRevision(&h, 3);

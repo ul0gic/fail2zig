@@ -656,6 +656,7 @@ pub const Manager = struct {
         self.inventory = null;
         self.inventory = .{ .snapshot = snapshot, .start_us = start_us, .end_us = end_us, .start_ns = start_ns };
         self.inspector.retained_bytes = snapshot.entries.len * @sizeOf(firewall.Entry);
+        self.legacy_targets_attempted = null;
     }
     fn dropInventory(self: *Manager) void {
         self.inventory_discontinuity +|= 1;
@@ -931,10 +932,16 @@ pub const Manager = struct {
         self.backOff();
         return .{ .wait = self.waitDue() };
     }
+    fn expiryDeadline(self: *const Manager, index: usize, entry: effect.Entry) ?i64 {
+        const owner = self.owner_deadline_us[index];
+        return switch (entry.desired) {
+            .finite => |deadline| if (owner) |at| @min(at, deadline) else deadline,
+            .absent, .permanent => owner,
+        };
+    }
     fn expiryDue(self: *const Manager, index: usize, entry: effect.Entry, now_us: i64) bool {
         if (entry.status == .dispatched or self.markers[index] != null) return false;
-        if (entry.desired == .finite) return !entry.desired.live(now_us);
-        if (entry.desired == .permanent) if (self.owner_deadline_us[index]) |deadline| return deadline <= now_us;
+        if (self.expiryDeadline(index, entry)) |deadline| return deadline <= now_us;
         return false;
     }
     fn act(self: *Manager, bindings: []const Binding, sampled: effect.Clock) !Step {
@@ -1000,16 +1007,15 @@ pub const Manager = struct {
                 all_confirmed = false;
                 continue;
             }
-            if (entry.desired == .finite and entry.status != .expired and entry.status != .absent) next_deadline = if (next_deadline) |prior| @min(prior, entry.desired.finite) else entry.desired.finite;
-            if (entry.desired == .permanent) if (self.owner_deadline_us[index]) |deadline| {
+            if (self.expiryDeadline(index, entry)) |deadline| {
                 next_deadline = if (next_deadline) |prior| @min(prior, deadline) else deadline;
-            };
+            }
             const matched = self.matched[index];
             if (self.expiryDue(index, entry, now_us)) {
                 due_count += 1;
-                const deadline = if (entry.desired == .finite) entry.desired.finite else self.owner_deadline_us[index].?;
+                const deadline = self.expiryDeadline(index, entry).?;
                 oldest_overdue_us = if (oldest_overdue_us) |prior| @min(prior, deadline) else deadline;
-                if (expiryClass(transport, entry.scope) == .deletion and try presentIn(held, entry)) {
+                if (!entry.desired.live(now_us) and expiryClass(transport, entry.scope) == .deletion and try presentIn(held, entry)) {
                     blocking += 1;
                     oldest_blocking_us = if (oldest_blocking_us) |prior| @min(prior, deadline) else deadline;
                 } else bookkeeping += 1;
@@ -1130,7 +1136,7 @@ pub const Manager = struct {
             self.cursor = index;
             return .progress;
         }
-        if (try self.settleLegacyTargets(bindings)) |outcome| return outcome;
+        if (try self.settleLegacyTargets(bindings, sampled)) |outcome| return outcome;
         if (!all_confirmed) {
             if (!self.events_subscribed) self.dropInventory();
             return .{ .wait = self.waitDue() };
@@ -1294,16 +1300,32 @@ pub const Manager = struct {
         try self.settle(bindings, index, entry, held.start_us, .{ .installation = entry.installation.id, .scope_key = entry.scope_key, .fingerprint = held.snapshot.fingerprint, .observed_us = held.end_us, .qualification = .complete_owned, .state = if (self.matched[index]) entry.desired else null });
         return .progress;
     }
-    fn settleLegacyTargets(self: *Manager, bindings: []const Binding) !?Step {
+    fn settleLegacyTargets(self: *Manager, bindings: []const Binding, sampled: effect.Clock) !?Step {
         if (self.store.schema_version < 21) return null;
         const key = try self.store.unsettledActionScope() orelse return null;
         if (self.legacy_targets_attempted) |prior| if (std.mem.eql(u8, &prior, &key)) return null;
         const index = self.findLive(key) orelse return null;
         const entry = self.live[index];
         if ((entry.status != .applied and entry.status != .absent) or !self.matched[index]) return null;
-        self.legacy_targets_attempted = key;
         const held = &self.inventory.?;
+        const fresh = blk: {
+            try self.store.beginRead();
+            errdefer self.store.rollback();
+            var row = try self.store.statement("SELECT dispatch_us,observed_us,fingerprint FROM effect_intents WHERE intent_id=?1;");
+            defer row.deinit();
+            try row.blob(1, &entry.intent_id);
+            if (!try row.row()) return error.InvalidEffect;
+            const dispatched = try row.optionalSigned(0) orelse return error.InvalidEffect;
+            const observed = try row.optionalSigned(1) orelse return error.InvalidEffect;
+            const fingerprint = try durable.Store.effectBlob(&row, 2, 32);
+            const current = held.start_us >= dispatched and held.end_us >= observed and
+                (held.end_us != observed or std.mem.eql(u8, &held.snapshot.fingerprint, &fingerprint));
+            try self.store.commitTransaction();
+            break :blk current;
+        };
+        if (!fresh) return try self.readback(sampled);
         try self.settle(bindings, index, entry, held.start_us, .{ .installation = entry.installation.id, .scope_key = entry.scope_key, .fingerprint = held.snapshot.fingerprint, .observed_us = held.end_us, .qualification = .complete_owned, .state = entry.desired });
+        self.legacy_targets_attempted = key;
         return .progress;
     }
     fn settleExpiredBatch(self: *Manager, tokens: []const effect.Token) !Step {
@@ -1585,7 +1607,7 @@ pub const Manager = struct {
         var count: usize = 1;
         for (self.live[0..self.count], 0..) |other, i| {
             if (count == items.len) break;
-            if (i == index or other.status == .dispatched or self.markers[i] != null or other.desired != .finite or other.desired.live(sampled.prepared_us)) continue;
+            if (i == index or !self.expiryDue(i, other, sampled.prepared_us)) continue;
             items[count] = .{ .key = other.scope_key, .revision = other.revision };
             count += 1;
         }
