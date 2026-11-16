@@ -1,0 +1,27 @@
+name: Scheduled security checks
+
+on:
+  schedule:
+    - cron: "31 8 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  workflows:
+    name: Workflow security analysis
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Check current Actions security advisories
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/workflow-lint.sh security

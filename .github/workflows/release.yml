@@ -4,30 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing draft release tag (vMAJOR.MINOR.PATCH)
+        description: Release tag to create or resume (vMAJOR.MINOR.PATCH)
         required: true
         type: string
       source_commit:
-        description: Approved full lowercase source commit SHA
+        description: Full merged source commit SHA
         required: true
         type: string
-      binary_sha256:
-        description: Lab-approved SHA-256 of the x86_64 release executable
+      ci_run_id:
+        description: Successful full PR CI run ID (or explicit main qualification)
         required: true
         type: string
-      manifest_sha256:
-        description: Approved SHA-256 of the draft SHA256SUMS (all 13 payloads)
-        required: true
-        type: string
-      lab_scope:
-        description: Hash-bound lab qualification scope and limitations
-        required: true
-        type: string
-      verify_only:
-        description: Build, compare and attest without publishing the draft
-        required: true
-        default: true
-        type: boolean
 
 permissions:
   contents: read
@@ -36,129 +23,135 @@ concurrency:
   group: release-${{ inputs.release_tag }}
   cancel-in-progress: false
 
+defaults:
+  run:
+    shell: bash
+
 env:
   RELEASE_TAG: ${{ inputs.release_tag }}
   SOURCE_COMMIT: ${{ inputs.source_commit }}
-  BINARY_SHA256: ${{ inputs.binary_sha256 }}
-  MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
-  LAB_SCOPE: ${{ inputs.lab_scope }}
-  ZIG_VERSION: "0.14.1"
-  ZIG_SHA256: "24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c"
+  CI_RUN_ID: ${{ inputs.ci_run_id }}
 
 jobs:
   qualify:
-    name: Qualify exact source and release authority
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    name: Qualify merged source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     permissions:
-      # GitHub exposes draft releases only to tokens with push access.
-      contents: write
+      contents: read
       actions: read
+    outputs:
+      binary_sha256: ${{ steps.qualify.outputs.binary_sha256 }}
+      source_tree: ${{ steps.qualify.outputs.source_tree }}
+      ci_attempt: ${{ steps.qualify.outputs.ci_attempt }}
+      qualification_sha256: ${{ steps.qualify.outputs.qualification_sha256 }}
     steps:
-      - name: Require the trusted main workflow
-        run: test "$GITHUB_REF" = refs/heads/main
+      - name: Require the trusted workflow
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_REPOSITORY" = ul0gic/fail2zig
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-          path: control
-      - name: Validate fixed release inputs
-        run: bash control/.github/scripts/release.sh inputs
+          fetch-depth: 0
+      - name: Validate release inputs and source ancestry
+        run: |
+          bash .github/scripts/release.sh inputs
+          git merge-base --is-ancestor "$SOURCE_COMMIT" HEAD
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           ref: ${{ inputs.source_commit }}
           path: source
-      - name: Verify source, live tag, and successful full CI
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          checked_out="$(git -C source rev-parse HEAD)"
-          bash control/.github/scripts/release.sh identity "$checked_out" "$SOURCE_COMMIT"
-          bash control/.github/scripts/release.sh tag
-          source_version="$(sed -n 's/^ *\.version = "\([^"]*\)".*/\1/p' source/build.zig.zon)"
-          test "$source_version" = "${RELEASE_TAG#v}"
-          test -f source/RELEASE_NOTES.md
-          bash control/.github/scripts/release.sh qualify
-          draft="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
-          test "$draft" = true
-      - name: Require configured publication approval
-        if: ${{ !inputs.verify_only }}
+      - name: Verify PR evidence, source and publication gate
+        id: qualify
         env:
           GH_TOKEN: ${{ github.token }}
           PUBLICATION_ENABLED: ${{ vars.RELEASE_PUBLICATION_ENABLED }}
-        run: bash control/.github/scripts/release.sh publication-guard
-      - name: Record approved candidate and lab scope
         run: |
-          {
-            printf '## Approved release candidate\n\n'
-            printf 'Source: `%s`\n\nBinary SHA-256: `%s`\n\nManifest SHA-256: `%s`\n\n' \
-              "$SOURCE_COMMIT" "$BINARY_SHA256" "$MANIFEST_SHA256"
-            printf 'Maintainer-supplied lab scope (not performed by this workflow):\n\n'
-            printf '%s\n' "$LAB_SCOPE"
-          } >> "$GITHUB_STEP_SUMMARY"
+          bash .github/scripts/release.sh identity "$(git -C source rev-parse HEAD)" "$SOURCE_COMMIT"
+          version=$(sed -n 's/^ *\.version = "\([^"]*\)".*/\1/p' source/build.zig.zon)
+          test "$version" = "${RELEASE_TAG#v}"
+          test -s source/RELEASE_NOTES.md
+          bash .github/scripts/release.sh tag optional
+          bash .github/scripts/release.sh publication-guard
+          bash .github/scripts/release.sh qualify qualification
+          test "$(git -C source rev-parse 'HEAD^{tree}')" = "$(jq -r '.tree.sha' qualification/source.json)"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: release-qualification-${{ github.run_attempt }}
+          path: qualification/
+          if-no-files-found: ignore
+          retention-days: 90
 
   build:
-    name: Build release (${{ matrix.target }})
+    name: Build (${{ matrix.target }})
     needs: qualify
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
-    permissions:
-      contents: read
     strategy:
       fail-fast: false
-      max-parallel: 2
       matrix:
         include:
-          - {target: x86_64-linux-musl, cpu: baseline}
-          - {target: aarch64-linux-musl, cpu: baseline}
-          - {target: arm-linux-musleabihf, cpu: baseline}
-          - {target: mips-linux-musleabi, cpu: mips32r2}
-          - {target: mipsel-linux-musleabi, cpu: mips32r2}
+          - target: x86_64-linux-musl
+            cpu: baseline
+          - target: aarch64-linux-musl
+            cpu: baseline
+          - target: arm-linux-musleabihf
+            cpu: baseline
+          - target: mips-linux-musleabi
+            cpu: mips32r2
+          - target: mipsel-linux-musleabi
+            cpu: mips32r2
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           ref: ${{ inputs.source_commit }}
-      - name: Install pinned Zig
-        run: |
-          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
-          echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c -
-          sudo mkdir -p /opt/zig
-          sudo tar -xf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
-          echo /opt/zig >> "$GITHUB_PATH"
-      - name: Build the one release executable
+          path: source
+      - uses: ./.github/actions/setup-zig
+        id: zig
+        with:
+          directory: source
+          target: ${{ matrix.target }}
+      - name: Build release executable
+        working-directory: source
         env:
-          RELEASE_TARGET: ${{ matrix.target }}
-          RELEASE_CPU: ${{ matrix.cpu }}
+          F2Z_ZIG: ${{ steps.zig.outputs.executable }}
+          TARGET: ${{ matrix.target }}
+          CPU: ${{ matrix.cpu }}
+          TESTED_SHA256: ${{ needs.qualify.outputs.binary_sha256 }}
         run: |
-          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
-          zig build -Dtarget="$RELEASE_TARGET" -Dcpu="$RELEASE_CPU" -Doptimize=ReleaseSafe -Dstrip=true
-          test "$(find zig-out/bin -mindepth 1 -maxdepth 1 -printf '%f\n')" = fail2zig
-          test -f zig-out/bin/fail2zig
-          test ! -L zig-out/bin/fail2zig
-          mkdir package
-          cp zig-out/bin/fail2zig "package/fail2zig-$RELEASE_TAG-$RELEASE_TARGET"
+          "$F2Z_ZIG" build -Dtarget="$TARGET" -Dcpu="$CPU" -Doptimize=ReleaseSafe -Dstrip=true -j2
+          test "$(find zig-out/bin -maxdepth 1 -type f | wc -l)" = 1
+          if [ "$TARGET" = x86_64-linux-musl ]; then
+            printf '%s  zig-out/bin/fail2zig\n' "$TESTED_SHA256" | sha256sum --check --strict
+          fi
+          mkdir "$GITHUB_WORKSPACE/payload"
+          cp zig-out/bin/fail2zig "$GITHUB_WORKSPACE/payload/fail2zig-$RELEASE_TAG-$TARGET"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: release-binary-${{ matrix.target }}
-          path: package/*
+          path: payload/
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 90
+          overwrite: true
 
-  verify:
-    name: Compare independently built package to approved bytes
+  package:
+    name: Assemble and hash release
     needs: [qualify, build]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      # The approved assets remain a draft until the publication job.
-      contents: write
-      actions: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      BINARY_SHA256: ${{ needs.qualify.outputs.binary_sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-          path: control
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
@@ -167,77 +160,50 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           pattern: release-binary-*
-          merge-multiple: true
           path: package
-      - name: Download approved draft assets
-        env:
-          GH_TOKEN: ${{ github.token }}
+          merge-multiple: true
+      - name: Verify package and record hashes
+        id: package
         run: |
-          mkdir approved
-          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir approved
-      - name: Assemble all fixed source payloads and compare approval
-        run: |
-          test "$(git -C source rev-parse HEAD)" = "$SOURCE_COMMIT"
-          bash control/.github/scripts/release.sh assemble source package
-          bash control/.github/scripts/release.sh compare package approved
-          bash control/.github/scripts/release.sh elf "$PWD/package"
-      - name: Recheck live tag after comparison
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          bash control/.github/scripts/release.sh tag
+          bash .github/scripts/release.sh assemble source package
+          bash .github/scripts/release.sh elf "$PWD/package"
+          {
+            printf '## Release candidate %s\n\n' "$RELEASE_TAG"
+            printf 'Source: %s\n\nTested x86_64 SHA-256: %s\n\n' "$SOURCE_COMMIT" "$BINARY_SHA256"
+            printf 'SHA256SUMS SHA-256: %s\n\n' "$(sha256sum package/SHA256SUMS | cut -d ' ' -f 1)"
+            printf 'PR qualification: %s/%s/actions/runs/%s\n\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$CI_RUN_ID"
+            printf '```text\n'; cat package/SHA256SUMS; printf '```\n'
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        id: upload
         with:
-          name: verified-release-package
-          path: package/*
+          name: verified-release-package-${{ github.run_attempt }}
+          path: package/
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 90
+    outputs:
+      manifest_sha256: ${{ steps.package.outputs.manifest_sha256 }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
 
   attest:
-    name: Attest the verified runner package
-    needs: verify
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    name: Attest verified assets
+    needs: [qualify, package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     permissions:
       contents: read
-      actions: read
       id-token: write
       attestations: write
+    env:
+      BINARY_SHA256: ${{ needs.qualify.outputs.binary_sha256 }}
+      MANIFEST_SHA256: ${{ needs.package.outputs.manifest_sha256 }}
+      SOURCE_TREE: ${{ needs.qualify.outputs.source_tree }}
+      QUALIFICATION_SHA256: ${{ needs.qualify.outputs.qualification_sha256 }}
+      CI_ATTEMPT: ${{ needs.qualify.outputs.ci_attempt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-          path: control
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
-        with:
-          name: verified-release-package
-          path: package
-      - name: Describe actual build inputs, separately from the workflow commit
-        env:
-          VERIFY_ONLY: ${{ inputs.verify_only }}
-        run: |
-          bash control/.github/scripts/release.sh provenance predicate.json
-      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
-        with:
-          subject-path: package/*
-          predicate-type: https://slsa.dev/provenance/v1
-          predicate-path: predicate.json
-
-  publish:
-    name: Approve publication and verify downloaded release
-    if: ${{ !inputs.verify_only }}
-    needs: [qualify, verify, attest]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    environment: release
-    permissions:
-      contents: write
-      actions: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-          path: control
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
@@ -245,28 +211,47 @@ jobs:
           path: source
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
-          name: verified-release-package
+          artifact-ids: ${{ needs.package.outputs.artifact_id }}
           path: package
-      - name: Recheck approval, tag, and draft immediately before publication
+          merge-multiple: true
+      - name: Bind provenance to the actual source, toolchain and qualification
+        run: |
+          bash .github/scripts/release.sh package package true
+          bash .github/scripts/release.sh provenance source predicate.json
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: package/*
+          predicate-type: https://slsa.dev/provenance/v1
+          predicate-path: predicate.json
+
+  publish:
+    name: Approve and publish verified assets
+    needs: [qualify, package, attest]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: release
+    permissions:
+      contents: write
+      actions: read
+    env:
+      BINARY_SHA256: ${{ needs.qualify.outputs.binary_sha256 }}
+      MANIFEST_SHA256: ${{ needs.package.outputs.manifest_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source_commit }}
+          path: source
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact_id }}
+          path: package
+          merge-multiple: true
+      - name: Publish unchanged assets and verify the public download
         env:
           GH_TOKEN: ${{ github.token }}
           PUBLICATION_ENABLED: ${{ vars.RELEASE_PUBLICATION_ENABLED }}
-        run: |
-          bash control/.github/scripts/release.sh publication-guard
-          draft="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
-          test "$draft" = true
-          mkdir approved
-          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir approved
-          bash control/.github/scripts/release.sh compare package approved
-          bash control/.github/scripts/release.sh tag
-          # Draft bytes already equal every attested runner payload. Do not replace assets.
-          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-            --title "fail2zig $RELEASE_TAG" --notes-file source/RELEASE_NOTES.md --draft=false --latest
-      - name: Re-download and compare all published bytes
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir published
-          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir published
-          bash control/.github/scripts/release.sh compare package published
-          bash control/.github/scripts/release.sh tag
+        run: bash .github/scripts/release.sh publish package source

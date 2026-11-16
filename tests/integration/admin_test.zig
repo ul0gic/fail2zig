@@ -548,7 +548,7 @@ fn ownerExpiry(items: []const std.json.Value, jail: []const u8) !i64 {
     return error.MissingOwner;
 }
 
-test "admin: BUG-040 nftables network ban list and unban preserve CIDR" {
+test "kernel: admin: BUG-040 nftables network ban list and unban preserve CIDR" {
     if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") == null) return error.SkipZigTest;
     const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
     var namespace_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -614,7 +614,7 @@ fn expectKernelHostRules(a: std.mem.Allocator, address: []const u8, expected: us
     try t.expectEqual(expected, count);
 }
 
-test "admin: shared-owner unban preserves finite and permanent protection" {
+test "kernel: admin: shared-owner unban preserves finite and permanent protection" {
     if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") == null) return error.SkipZigTest;
     const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
     var namespace_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -824,7 +824,7 @@ fn expectRemainingDisableOwners(probe: *@import("engine").native_store_mod.Store
     try t.expect(std.meta.eql(second, (try probe.currentOwner(keys[1], "sshd")) orelse return error.MissingOwner));
 }
 
-test "admin: a failure after one committed release page is partial and replay-fenced" {
+test "kernel: admin: a failure after one committed release page is partial and replay-fenced" {
     if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") == null) return error.SkipZigTest;
     const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
     var namespace_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -951,7 +951,7 @@ fn savedAdminSourceCursor(a: std.mem.Allocator, probe: *@import("engine").native
     return cursor;
 }
 
-test "admin: disabled resume consumes input without decisions and defers configured bans through reload and restart" {
+test "kernel: admin: disabled resume consumes input without decisions and defers configured bans through reload and restart" {
     if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") == null) return error.SkipZigTest;
     const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
     var namespace_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -1051,7 +1051,7 @@ test "admin: disabled resume consumes input without decisions and defers configu
     try t.expect(!try kernelHas(a, "203.0.113.159"));
 }
 
-test "admin: post-removal settlement failure stays uncertain and reconciles after restart" {
+test "kernel: admin: post-removal settlement failure stays uncertain and reconciles after restart" {
     if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") == null) return error.SkipZigTest;
     const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
     var namespace_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -1217,7 +1217,7 @@ test "admin: post-removal settlement failure stays uncertain and reconciles afte
     try t.expect(!jail.get("disable_cleanup_pending").?.bool);
 }
 
-test "admin: enforcing manual ban, unban and disable settle only by kernel readback; reload re-key keeps the rule" {
+test "kernel: admin: enforcing manual ban, unban and disable settle only by kernel readback; reload re-key keeps the rule" {
     if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") == null) return error.SkipZigTest;
     const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
     var buffer: [std.fs.max_path_bytes]u8 = undefined;

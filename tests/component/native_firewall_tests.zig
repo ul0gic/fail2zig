@@ -9,7 +9,7 @@ const nl = @import("engine_test").firewall.netlink;
 const command = @import("engine_test").firewall.command;
 const linux = std.os.linux;
 
-test "native firewall: isolated kernel complete empty and owned dual-family readback" {
+test "kernel: native firewall: isolated kernel complete empty and owned dual-family readback" {
     const transport = try isolatedTransport();
     var reader = try inspection.Inspector.open(std.testing.allocator, .{ .id = [_]u8{0x31} ** 16, .transport = transport }, .{});
     defer reader.close();
@@ -207,7 +207,7 @@ fn expectAdmissionRefused(reader: *inspection.Inspector) !void {
     }
 }
 
-test "native firewall: isolated admission creates both families and preserves owned restart" {
+test "kernel: native firewall: isolated admission creates both families and preserves owned restart" {
     const transport = try isolatedTransport();
     var reader = try admissionReader(transport);
     defer reader.close();
@@ -242,7 +242,7 @@ test "native firewall: isolated admission creates both families and preserves ow
     try std.testing.expectEqualSlices(u8, foreign_before.stdout, foreign_after.stdout);
 }
 
-test "native firewall: isolated admission never adopts unmarked partial objects" {
+test "kernel: native firewall: isolated admission never adopts unmarked partial objects" {
     const transport = try isolatedTransport();
     var reader = try admissionReader(transport);
     defer reader.close();
@@ -265,7 +265,7 @@ test "native firewall: isolated admission never adopts unmarked partial objects"
     try std.testing.expectEqualSlices(u8, before, after);
 }
 
-test "native firewall: isolated admission refuses known-owned incomplete scaffolds without cleanup" {
+test "kernel: native firewall: isolated admission refuses known-owned incomplete scaffolds without cleanup" {
     const transport = try isolatedTransport();
     var reader = try admissionReader(transport);
     defer reader.close();
@@ -286,7 +286,7 @@ test "native firewall: isolated admission refuses known-owned incomplete scaffol
     try std.testing.expectEqualSlices(u8, before, after);
 }
 
-test "native firewall: isolated admission interruption stays uncertain until complete inspection" {
+test "kernel: native firewall: isolated admission interruption stays uncertain until complete inspection" {
     const selected = try isolatedTransport();
     const steps: usize = switch (selected) {
         .nftables => 1,
@@ -331,7 +331,7 @@ test "native firewall: invalid admission token and unavailable tool fail before 
     try std.testing.expectError(error.ToolUnavailable, reader.admitInstallation(intent));
 }
 
-test "native firewall: isolated denied admission leaves kernel unchanged" {
+test "kernel: native firewall: isolated denied admission leaves kernel unchanged" {
     const transport = try isolatedTransport();
     var reader = try admissionReader(transport);
     defer reader.close();
@@ -483,7 +483,7 @@ test "native firewall: exact intent rejects invalid scope expired deadline and o
     token.aggregate_revision = 0;
     try std.testing.expectError(error.InvalidInstallation, reader.applyExact(token, .{ .wall_us = 100 }));
 }
-test "native firewall: isolated exact permanent dual-family duplicate release foreign preservation" {
+test "kernel: native firewall: isolated exact permanent dual-family duplicate release foreign preservation" {
     const transport = try isolatedTransport();
     var reader = try admissionReader(transport);
     var admitted = try reader.admitInstallation(intentFor(&reader));
@@ -518,7 +518,7 @@ test "native firewall: isolated exact permanent dual-family duplicate release fo
     defer foreign_after.deinit(std.testing.allocator);
     try std.testing.expectEqualSlices(u8, foreign_before.stdout, foreign_after.stdout);
 }
-test "native firewall: isolated exact uncertain acknowledged mutation reconciles same scope" {
+test "kernel: native firewall: isolated exact uncertain acknowledged mutation reconciles same scope" {
     const transport = try isolatedTransport();
     var reader = try admissionReader(transport);
     var admitted = try reader.admitInstallation(intentFor(&reader));
@@ -538,7 +538,7 @@ test "native firewall: isolated exact uncertain acknowledged mutation reconciles
     try std.testing.expect(!recovered.verified.changed);
     try std.testing.expectEqual(@as(usize, 1), recovered.verified.snapshot.entries.len);
 }
-test "native firewall: isolated finite retry retains original deadline and expires" {
+test "kernel: native firewall: isolated finite retry retains original deadline and expires" {
     const transport = try isolatedTransport();
     var reader = try admissionReader(transport);
     var admitted = try reader.admitInstallation(intentFor(&reader));
@@ -591,7 +591,7 @@ const BetweenReads = struct {
     }
 };
 
-test "native firewall: isolated readback accepts kernel expiry between passes and refuses early removal" {
+test "kernel: native firewall: isolated readback accepts kernel expiry between passes and refuses early removal" {
     const transport = try isolatedTransport();
     if (transport == .iptables) return error.SkipZigTest;
     if (transport == .nftables) return error.SkipZigTest;
@@ -618,7 +618,7 @@ test "native firewall: isolated readback accepts kernel expiry between passes an
     try std.testing.expect(!BetweenReads.failed);
 }
 
-test "native firewall: isolated fresh authority inspects selected transport without unrelated tools" {
+test "kernel: native firewall: isolated fresh authority inspects selected transport without unrelated tools" {
     _ = try isolatedTransport();
     var reader = try admissionReader(.nftables);
     try reader.inspectReservedNamespace();
@@ -810,7 +810,7 @@ fn packetPeerChild(control: std.posix.fd_t, ready: std.posix.fd_t) !void {
         if (kind == .tcp) std.Thread.sleep(300 * std.time.ns_per_ms);
     }
 }
-test "native firewall: isolated benign namespace peer packets verify IPv4 IPv6 exact drop and release" {
+test "kernel: native firewall: isolated benign namespace peer packets verify IPv4 IPv6 exact drop and release" {
     const transport = try isolatedTransport();
     var reader = try admissionReader(transport);
     var admitted = try reader.admitInstallation(intentFor(&reader));
@@ -836,7 +836,7 @@ test "native firewall: isolated benign namespace peer packets verify IPv4 IPv6 e
     try peer.exchange(true, 18, true);
 }
 
-test "native firewall: isolated nftables realizes the frozen scoped packet cells and recovers uncertainty" {
+test "kernel: native firewall: isolated nftables realizes the frozen scoped packet cells and recovers uncertainty" {
     if (try isolatedTransport() != .nftables) return error.SkipZigTest;
     var reader = try admissionReader(.nftables);
     defer reader.close();
@@ -942,7 +942,7 @@ test "native firewall: isolated nftables realizes the frozen scoped packet cells
     try peer.exchangeTcp(true, 443, 53, true);
 }
 
-test "native firewall: isolated fixed argv realizes the frozen scoped packet cells and exposes partial writes" {
+test "kernel: native firewall: isolated fixed argv realizes the frozen scoped packet cells and exposes partial writes" {
     const transport = try isolatedTransport();
     if (transport == .nftables) return error.SkipZigTest;
     var reader = try admissionReader(transport);
@@ -1077,7 +1077,7 @@ fn failedEffectAllocation(allocator: std.mem.Allocator, stable: *inspection.Insp
     if (result == .uncertain) return result.uncertain.cause;
     try std.testing.expectEqual(@as(usize, 1), result.verified.snapshot.entries.len);
 }
-test "native firewall: isolated exact allocation failure preserves recoverable owned scaffold" {
+test "kernel: native firewall: isolated exact allocation failure preserves recoverable owned scaffold" {
     const transport = try isolatedTransport();
     var reader = try admissionReader(transport);
     var admitted = try reader.admitInstallation(intentFor(&reader));
@@ -1088,7 +1088,7 @@ test "native firewall: isolated exact allocation failure preserves recoverable o
     try std.testing.expectEqual(@as(usize, 1), recovered.verified.snapshot.entries.len);
 }
 
-test "native firewall: isolated read-only exact observation reconciles missing and expired desired state" {
+test "kernel: native firewall: isolated read-only exact observation reconciles missing and expired desired state" {
     const transport = try isolatedTransport();
     var reader = try admissionReader(transport);
     var admitted = try reader.admitInstallation(intentFor(&reader));
