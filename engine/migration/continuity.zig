@@ -380,7 +380,10 @@ pub fn writeBoundaryJson(boundary: *const Boundary, writer: anytype) !void {
         try jsonString(writer, f.reason);
         try writer.writeAll(",\"checkpoint\":");
         if (f.checkpoint) |r| {
-            try writer.print("{{\"device\":{d},\"inode\":{d},\"offset\":{d},\"prefix_len\":{d},\"prefix_hash\":\"{s}\",\"incarnation\":\"{s}\"}}", .{ r.device, r.inode, r.offset, r.prefix_len, std.fmt.fmtSliceHexLower(&r.prefix_hash), std.fmt.fmtSliceHexLower(&r.incarnation) });
+            try writer.print(
+                "{{\"device\":{d},\"inode\":{d},\"offset\":{d},\"prefix_len\":{d},\"prefix_hash\":\"{s}\",\"incarnation\":\"{s}\"}}",
+                .{ r.device, r.inode, r.offset, r.prefix_len, std.fmt.fmtSliceHexLower(&r.prefix_hash), std.fmt.fmtSliceHexLower(&r.incarnation) },
+            );
         } else try writer.writeAll("null");
         try writer.writeByte('}');
     }

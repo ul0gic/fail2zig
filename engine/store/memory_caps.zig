@@ -30,7 +30,10 @@ pub const Evictions = struct {
         self.total[index] +|= evicted;
         self.unreported[index] +|= evicted;
         if (self.warned_us[index]) |last| if (now_us - last < warn_interval_us) return;
-        std.log.warn("native: {s} reached its cap of {d} rows: evicted {d} idle addresses in the last 60 s, {d} since start", .{ tableName(table), memory_row_cap, self.unreported[index], self.total[index] });
+        std.log.warn(
+            "native: {s} reached its cap of {d} rows: evicted {d} idle addresses in the last 60 s, {d} since start",
+            .{ tableName(table), memory_row_cap, self.unreported[index], self.total[index] },
+        );
         self.unreported[index] = 0;
         self.warned_us[index] = now_us;
     }

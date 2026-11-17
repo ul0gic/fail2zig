@@ -190,7 +190,14 @@ pub fn prepare(allocator: Allocator, source_ini: *const config.ParsedIni, jail_n
     const logpath = try read(allocator, ini, jail_name, "logpath", .string, .null_value, .{});
     const ipv6_option = try read(allocator, globals, "Definition", "allowipv6", .string, .{ .string = "auto" }, .{});
     const ipv6_text = string(ipv6_option);
-    var ipv6: IPv6 = .{ .option = ipv6_option, .policy = if (ipv6_text) |value| if (std.mem.eql(u8, value, "auto")) .automatic else if (std.ascii.eqlIgnoreCase(value, "1") or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "on") or std.ascii.eqlIgnoreCase(value, "yes")) .enabled else .disabled else .invalid };
+    var ipv6: IPv6 = .{
+        .option = ipv6_option,
+        .policy = if (ipv6_text) |value| if (std.mem.eql(
+            u8,
+            value,
+            "auto",
+        )) .automatic else if (std.ascii.eqlIgnoreCase(value, "1") or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "on") or std.ascii.eqlIgnoreCase(value, "yes")) .enabled else .disabled else .invalid,
+    };
     ipv6.adapter_value = ipv6.adapterValue();
     var ignore = IgnorePlan{
         .jail = jail_name,

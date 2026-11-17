@@ -31,7 +31,14 @@ pub fn Methods(comptime Store: type) type {
             const head = try row.signed(1);
             const floor = try row.signed(2);
             if (stream_revision <= 0 or head < 0 or floor <= 0) return error.InvalidHistoryPage;
-            const token = effect_history.PageToken{ .installation = installation.id, .stream_revision = @intCast(stream_revision), .head_sequence = @intCast(head), .retained_from_sequence = @intCast(floor), .after_sequence = after, .last_sequence = after };
+            const token = effect_history.PageToken{
+                .installation = installation.id,
+                .stream_revision = @intCast(stream_revision),
+                .head_sequence = @intCast(head),
+                .retained_from_sequence = @intCast(floor),
+                .after_sequence = after,
+                .last_sequence = after,
+            };
             try token.validate();
             return token;
         }
@@ -40,11 +47,23 @@ pub fn Methods(comptime Store: type) type {
             var token = try self.historyHead(installation, after);
             if (expected_revision) |wanted_revision| if (wanted_revision != token.stream_revision) return error.StaleHistoryPage;
             var row = try self.statement(if (self.schema_version >= store.load_repair_schema)
-                self.originSql("SELECT s.sequence,e.event_id,e.scope_key,e.canonical_scope,e.jail,e.decision_id,e.confirmed_us,", "e.origin", ",EXISTS(SELECT 1 FROM confirmed_event_details d WHERE d.event_id=e.event_id) FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;")
+                self.originSql(
+                    "SELECT s.sequence,e.event_id,e.scope_key,e.canonical_scope,e.jail,e.decision_id,e.confirmed_us,",
+                    "e.origin",
+                    ",EXISTS(SELECT 1 FROM confirmed_event_details d WHERE d.event_id=e.event_id) FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;",
+                )
             else if (self.schema_version >= 19)
-                self.originSql("SELECT s.sequence,e.event_id,e.scope_key,n.canonical_scope,e.jail,e.decision_id,e.confirmed_us,", "e.origin", ",EXISTS(SELECT 1 FROM confirmed_event_details d WHERE d.event_id=e.event_id) FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;")
+                self.originSql(
+                    "SELECT s.sequence,e.event_id,e.scope_key,n.canonical_scope,e.jail,e.decision_id,e.confirmed_us,",
+                    "e.origin",
+                    ",EXISTS(SELECT 1 FROM confirmed_event_details d WHERE d.event_id=e.event_id) FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;",
+                )
             else if (self.schema_version >= 17)
-                self.originSql("SELECT s.sequence,e.event_id,e.scope_key,n.scope,e.jail,e.decision_id,e.confirmed_us,", "e.origin", ",EXISTS(SELECT 1 FROM confirmed_event_details d WHERE d.event_id=e.event_id) FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;")
+                self.originSql(
+                    "SELECT s.sequence,e.event_id,e.scope_key,n.scope,e.jail,e.decision_id,e.confirmed_us,",
+                    "e.origin",
+                    ",EXISTS(SELECT 1 FROM confirmed_event_details d WHERE d.event_id=e.event_id) FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;",
+                )
             else
                 self.originSql("SELECT s.sequence,e.event_id,e.scope_key,n.scope,e.jail,e.decision_id,e.confirmed_us,", "e.origin", " FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key WHERE s.sequence>?1 ORDER BY s.sequence LIMIT ?2;"));
             defer row.deinit();
@@ -59,7 +78,18 @@ pub fn Methods(comptime Store: type) type {
                     if (value < 0 or value > 1) return error.InvalidHistoryEvent;
                     break :blk value == 1;
                 } else false;
-                const event = effect_history.Event{ .sequence = @intCast(sequence), .event_id = try Store.effectBlob(&row, 1, 32), .installation = installation, .scope_key = try Store.effectBlob(&row, 2, 32), .scope = try self.decodeStoredScope(&row, 3), .jail = detection.Name.init(try row.boundedBytes(4, 64)) catch return error.InvalidHistoryEvent, .decision_id = try Store.effectBlob(&row, 5, 32), .confirmed_us = try row.signed(6), .native_retry = native_retry, .origin = std.meta.intToEnum(effects.Origin, try row.signed(7)) catch return error.InvalidHistoryEvent };
+                const event = effect_history.Event{
+                    .sequence = @intCast(sequence),
+                    .event_id = try Store.effectBlob(&row, 1, 32),
+                    .installation = installation,
+                    .scope_key = try Store.effectBlob(&row, 2, 32),
+                    .scope = try self.decodeStoredScope(&row, 3),
+                    .jail = detection.Name.init(try row.boundedBytes(4, 64)) catch return error.InvalidHistoryEvent,
+                    .decision_id = try Store.effectBlob(&row, 5, 32),
+                    .confirmed_us = try row.signed(6),
+                    .native_retry = native_retry,
+                    .origin = std.meta.intToEnum(effects.Origin, try row.signed(7)) catch return error.InvalidHistoryEvent,
+                };
                 try event.validate();
                 output[count] = event;
                 count += 1;
@@ -283,7 +313,11 @@ pub fn Methods(comptime Store: type) type {
             const delta = batch.deltas[0];
             if (!consumers.Key.eql(delta.key, manifest.required[0].key) or delta.format_version != effect_history.version or delta.valid_until_us != null) return error.InvalidHistoryTransition;
             const history_checkpoint = try effect_history.Checkpoint.decode(delta.payload);
-            if (!std.mem.eql(u8, &history_checkpoint.generation, &manifest.source_generation) or !std.mem.eql(u8, &history_checkpoint.installation, &installation)) return error.HistoryGenerationMismatch;
+            if (!std.mem.eql(
+                u8,
+                &history_checkpoint.generation,
+                &manifest.source_generation,
+            ) or !std.mem.eql(u8, &history_checkpoint.installation, &installation)) return error.HistoryGenerationMismatch;
             return history_checkpoint;
         }
         pub fn bootstrapConfirmedHistory(self: *Store, manifest: consumers.Manifest, batch: consumers.Batch, installation: effects.Installation) Error!void {

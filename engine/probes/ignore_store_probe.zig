@@ -31,7 +31,14 @@ const Proposal = struct {
     fn release(_: ?*anyopaque) void {}
     fn prepare(_: records.Record, context: ?*anyopaque) !pipeline.Prepared {
         const self: *Proposal = @ptrCast(@alignCast(context.?));
-        return .{ .checkpoint = self.request.checkpoint, .disposition = "original-ignore-observation", .shared_state = .{ .name = self.request.shared_name, .expected_revision = self.request.shared_revision, .payload = self.request.shared_payload }, .context = self, .publish = publish, .release = release };
+        return .{
+            .checkpoint = self.request.checkpoint,
+            .disposition = "original-ignore-observation",
+            .shared_state = .{ .name = self.request.shared_name, .expected_revision = self.request.shared_revision, .payload = self.request.shared_payload },
+            .context = self,
+            .publish = publish,
+            .release = release,
+        };
     }
 };
 pub fn main() !void {

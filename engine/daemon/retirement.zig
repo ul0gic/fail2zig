@@ -86,7 +86,12 @@ pub fn Methods(comptime Coordinator: type) type {
                 deleted_rows +|= page.deleted_rows;
                 self.startup_retirement_progress +|= 1;
                 var label: [96]u8 = undefined;
-                self.reportStartup(.maintenance, std.fmt.bufPrint(&label, "jail retirement: {d} releases, {d} deleted", .{ owners_released, deleted_rows }) catch "jail retirement", self.startup_retirement_progress, 0);
+                self.reportStartup(
+                    .maintenance,
+                    std.fmt.bufPrint(&label, "jail retirement: {d} releases, {d} deleted", .{ owners_released, deleted_rows }) catch "jail retirement",
+                    self.startup_retirement_progress,
+                    0,
+                );
                 if (page.reconcile) |request| {
                     try self.ensureRetirementEffects();
                     while (true) {
@@ -109,7 +114,10 @@ pub fn Methods(comptime Coordinator: type) type {
                     }
                 }
             }
-            std.log.info("native: jail={} retirement completed this start: {d} owner releases, {d} bans lifted, {d} operational rows deleted", .{ std.zig.fmtEscapes(intent.jail.slice()), owners_released, bans_lifted, deleted_rows });
+            std.log.info(
+                "native: jail={} retirement completed this start: {d} owner releases, {d} bans lifted, {d} operational rows deleted",
+                .{ std.zig.fmtEscapes(intent.jail.slice()), owners_released, bans_lifted, deleted_rows },
+            );
             if (self.findJail(intent.jail.slice())) |jail| if (jail.retiring) {
                 const index = (@intFromPtr(jail) - @intFromPtr(self.jails.ptr)) / @sizeOf(Jail);
                 try self.removeJail(index);

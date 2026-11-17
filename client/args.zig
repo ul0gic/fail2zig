@@ -577,7 +577,10 @@ fn parseIgnore(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Er
     }
     _ = shared.types.IgnoreEntry.parse(address) catch |err| {
         switch (err) {
-            error.InvalidAddress => diag.set("invalid address '{s}' for 'ignore {s}': expected an IPv4 or IPv6 address or CIDR such as 192.0.2.10 or 2001:db8::/32", .{ format.escapeArgument(&echo, address), name }),
+            error.InvalidAddress => diag.set(
+                "invalid address '{s}' for 'ignore {s}': expected an IPv4 or IPv6 address or CIDR such as 192.0.2.10 or 2001:db8::/32",
+                .{ format.escapeArgument(&echo, address), name },
+            ),
             error.InvalidPrefix => diag.set("invalid prefix in '{s}': IPv4 prefixes are 0-32, IPv6 prefixes are 0-128", .{format.escapeArgument(&echo, address)}),
         }
         return error.InvalidValue;
@@ -626,7 +629,10 @@ fn parseJailAdmin(rest: []const []const u8, globals: *Globals, diag: *ParseDiag)
         }
         if (action == null) {
             action = std.meta.stringToEnum(Command.JailAction, a) orelse {
-                diag.set("invalid jail action '{s}' (expected: enable, disable, pause, resume); use 'list --jail <name>', 'ban <ip> --jail <name>', or 'unban <ip> --jail <name>' to manage bans", .{a});
+                diag.set(
+                    "invalid jail action '{s}' (expected: enable, disable, pause, resume); use 'list --jail <name>', 'ban <ip> --jail <name>', or 'unban <ip> --jail <name>' to manage bans",
+                    .{a},
+                );
                 return error.InvalidValue;
             };
             continue;

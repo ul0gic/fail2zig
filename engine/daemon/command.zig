@@ -110,7 +110,12 @@ pub fn Methods(comptime Coordinator: type) type {
 
         fn readinessInputs(self: *Coordinator, jails: *[max_jails]readiness.Jail) readiness.Inputs {
             const observation = self.observedWorker();
-            for (self.jails, 0..) |jail, i| jails[i] = .{ .healthy = jail.healthy or capacityWaiting(&jail), .source_error = if (jail.source_error) |cause| !pipeline.Pipeline.commitBlocked(cause) else false, .enforce = self.jailEnforces(&jail), .source_paused = jailPaused(&jail) };
+            for (self.jails, 0..) |jail, i| jails[i] = .{
+                .healthy = jail.healthy or capacityWaiting(&jail),
+                .source_error = if (jail.source_error) |cause| !pipeline.Pipeline.commitBlocked(cause) else false,
+                .enforce = self.jailEnforces(&jail),
+                .source_paused = jailPaused(&jail),
+            };
             return .{
                 .config_loaded = self.generation_admitted,
                 .storage_phase = self.published_health.phase,
@@ -190,7 +195,36 @@ pub fn Methods(comptime Coordinator: type) type {
             w.writeByte('[') catch |failure| return if (failure == error.ResponseTooLarge) error.SnapshotLimit else failure;
             for (rows[0..count], 0..) |row, i| {
                 if (i != 0) try w.writeByte(',');
-                std.json.stringify(.{ .name = row.name.slice(), .healthy = row.healthy, .enabled = row.enabled, .paused = row.paused, .disable_cleanup_pending = row.disable_cleanup_pending, .active_bans = row.active_bans, .maxretry = row.maxretry, .findtime = row.findtime, .bantime = row.bantime, .bantime_permanent = row.bantime == null, .action = row.action, .enforce_configured = row.enforce_configured, .enforcing = row.enforcing, .log_source = @tagName(row.source), .source_healthy = row.source_healthy, .source_paused = row.source_paused, .source_missing = row.source_missing, .source = @tagName(row.source), .revision = row.revision, .decisions = row.decisions, .cause = if (row.cause) |cause| @errorName(cause) else "none", .source_exit_code = if (row.diagnostic) |detail| detail.exit_code else null, .source_signal = if (row.diagnostic) |detail| detail.signal else null, .source_stderr_present = if (row.diagnostic) |detail| @as(?bool, detail.stderr_present) else null }, .{}, w) catch |failure| return if (failure == error.ResponseTooLarge) error.SnapshotLimit else failure;
+                std.json.stringify(
+                    .{
+                        .name = row.name.slice(),
+                        .healthy = row.healthy,
+                        .enabled = row.enabled,
+                        .paused = row.paused,
+                        .disable_cleanup_pending = row.disable_cleanup_pending,
+                        .active_bans = row.active_bans,
+                        .maxretry = row.maxretry,
+                        .findtime = row.findtime,
+                        .bantime = row.bantime,
+                        .bantime_permanent = row.bantime == null,
+                        .action = row.action,
+                        .enforce_configured = row.enforce_configured,
+                        .enforcing = row.enforcing,
+                        .log_source = @tagName(row.source),
+                        .source_healthy = row.source_healthy,
+                        .source_paused = row.source_paused,
+                        .source_missing = row.source_missing,
+                        .source = @tagName(row.source),
+                        .revision = row.revision,
+                        .decisions = row.decisions,
+                        .cause = if (row.cause) |cause| @errorName(cause) else "none",
+                        .source_exit_code = if (row.diagnostic) |detail| detail.exit_code else null,
+                        .source_signal = if (row.diagnostic) |detail| detail.signal else null,
+                        .source_stderr_present = if (row.diagnostic) |detail| @as(?bool, detail.stderr_present) else null,
+                    },
+                    .{},
+                    w,
+                ) catch |failure| return if (failure == error.ResponseTooLarge) error.SnapshotLimit else failure;
             }
             try w.writeByte(']');
         }
@@ -208,7 +242,10 @@ pub fn Methods(comptime Coordinator: type) type {
                 .reload => return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "legacy reload is retired; use reload_v1") } },
                 .reload_v1, .admin_v1 => return error.MutationHandlerNotInstalled,
                 .query_v1 => |body| return self.queryResponse(a, body.slice(), .monitor),
-                .diag_v1 => |body| if (comptime build_options.diag) return self.diagResponse(a, body.slice()) else return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "diag commands need a diag build") } },
+                .diag_v1 => |body| if (comptime build_options.diag) return self.diagResponse(a, body.slice()) else return .{ .err = .{
+                    .code = 400,
+                    .message = try a.dupe(u8, "diag commands need a diag build"),
+                } },
             }
             return .{ .ok = .{ .payload = try output.toOwnedSlice(a) } };
         }

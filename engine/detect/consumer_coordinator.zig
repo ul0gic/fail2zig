@@ -153,11 +153,24 @@ pub const Coordinator = struct {
             const expected = try rule.Consumer.init(owner.program, settings.jail, incarnation, settings.parent_generation, cache != null);
             if (!std.mem.eql(u8, &expected.binding, &owner.binding) or owner.in_flight) return error.RuleGenerationMismatch;
         }
-        return .{ .settings = settings, .incarnation = incarnation, .generation = try generationFromInitial(settings, programs[0..owners.len], initial, cache), .owners = owners, .ignores = ignores, .cache = cache };
+        return .{
+            .settings = settings,
+            .incarnation = incarnation,
+            .generation = try generationFromInitial(settings, programs[0..owners.len], initial, cache),
+            .owners = owners,
+            .ignores = ignores,
+            .cache = cache,
+        };
     }
     fn ruleKey(self: *const Coordinator, index: usize) state.Key {
         const owner = self.owners[index];
-        return .{ .kind = if (owner.contexts != null) .correlation else .rule, .jail = self.settings.jail, .source = self.incarnation, .rule = owner.program.metadata().id, .generation = owner.binding };
+        return .{
+            .kind = if (owner.contexts != null) .correlation else .rule,
+            .jail = self.settings.jail,
+            .source = self.incarnation,
+            .rule = owner.program.metadata().id,
+            .generation = owner.binding,
+        };
     }
     fn ignoreKey(self: *const Coordinator) state.Key {
         return .{ .kind = .ignore, .jail = self.settings.jail, .source = "@shared", .rule = "allowlist", .generation = self.ignores.live.options.parent_generation };
@@ -190,7 +203,15 @@ pub const Coordinator = struct {
         self.active_turn = null;
     }
     fn batch(self: *Coordinator) state.Batch {
-        return .{ .deltas = self.deltas[0..self.delta_count], .dependencies = self.dependencies[0..self.dependency_count], .prepared_us = self.prepared_us, .commit_before_us = self.deadline, .clock_context = self, .clock = checkedClock, .admission = admission };
+        return .{
+            .deltas = self.deltas[0..self.delta_count],
+            .dependencies = self.dependencies[0..self.dependency_count],
+            .prepared_us = self.prepared_us,
+            .commit_before_us = self.deadline,
+            .clock_context = self,
+            .clock = checkedClock,
+            .admission = admission,
+        };
     }
     fn checkedClock(context: ?*anyopaque) i64 {
         const self: *Coordinator = @ptrCast(@alignCast(context.?));
@@ -341,7 +362,10 @@ pub const Coordinator = struct {
             try self.authorityRead();
             var rejected = false;
             for (self.owners, 0..) |owner, i| {
-                const stage = try owner.prepare(.{ .source = self.settings.logical_source, .record = input.decoded }, .{ .occurrence = occurrence, .event_us = input.time.eligible.timestamp.us, .receipt_us = input.record.receipt_time.?.us, .processing_us = input.processing_us });
+                const stage = try owner.prepare(
+                    .{ .source = self.settings.logical_source, .record = input.decoded },
+                    .{ .occurrence = occurrence, .event_us = input.time.eligible.timestamp.us, .receipt_us = input.record.receipt_time.?.us, .processing_us = input.processing_us },
+                );
                 self.stages[i] = stage;
                 if (stage.valid_until_us) |deadline| self.deadline = if (self.deadline) |prior| @min(prior, deadline) else deadline;
                 try self.delta(.{ .key = self.ruleKey(i), .format_version = rule.version, .expected_revision = self.revisions[i], .payload = stage.checkpoint });
@@ -405,7 +429,14 @@ pub const Coordinator = struct {
         self.outcome_count += 1;
     }
     fn addressOutcome(self: *const Coordinator, subject: detection.Subject, kind: detection.Kind, index: usize) detection.Outcome {
-        return .{ .kind = kind, .subject = subject, .generation = self.generation, .filter = self.settings.filter, .pattern = detection.Name.init(self.owners[index].program.metadata().id) catch self.settings.filter, .pattern_index = @intCast(index) };
+        return .{
+            .kind = kind,
+            .subject = subject,
+            .generation = self.generation,
+            .filter = self.settings.filter,
+            .pattern = detection.Name.init(self.owners[index].program.metadata().id) catch self.settings.filter,
+            .pattern_index = @intCast(index),
+        };
     }
     fn needDns(self: *Coordinator, request: dns.Request, purpose: @FieldType(Pending, "purpose"), occurrence: [32]u8) error{ ConsumerPending, DnsRequestOverflow } {
         self.waiting_occurrence = occurrence;
@@ -420,7 +451,11 @@ pub const Coordinator = struct {
     }
     fn dnsRead(self: *Coordinator, request: dns.Request, revision: u64, expiry: i64) !void {
         const probe = dnsKey(request.name.slice(), request.family, request.generation);
-        for (self.dependencies[0..self.dependency_count]) |prior| if (state.Key.eql(prior.key, probe)) return self.dependency(.{ .key = prior.key, .expected_revision = revision, .valid_until_us = expiry });
+        for (self.dependencies[0..self.dependency_count]) |prior| if (state.Key.eql(prior.key, probe)) return self.dependency(.{
+            .key = prior.key,
+            .expected_revision = revision,
+            .valid_until_us = expiry,
+        });
         if (self.name_count == self.names.len) return error.ConsumerCapacity;
         self.names[self.name_count] = request.name;
         const key = dnsKey(self.names[self.name_count].slice(), request.family, request.generation);
@@ -486,14 +521,28 @@ pub const Coordinator = struct {
         const key = dnsKey(self.dns_name.slice(), result.request.family, result.request.generation);
         self.dns_requirement[0] = .{ .key = key, .format_version = dns.version };
         const source = try std.fmt.bufPrint(&self.dns_manifest_source, "{s}:{s}", .{ @tagName(result.request.family), self.dns_name.slice() });
-        try self.delta(.{ .key = key, .format_version = dns.version, .expected_revision = self.dns_stage.?.expected_revision, .payload = self.dns_stage.?.checkpoint(), .valid_until_us = result.valid_until_us });
-        return .{ .manifest = .{ .jail = "@shared", .source = source, .source_generation = result.request.generation, .required = &self.dns_requirement }, .state = self.stateStage(), .bootstrap = self.dns_stage.?.expected_revision == 0 };
+        try self.delta(.{
+            .key = key,
+            .format_version = dns.version,
+            .expected_revision = self.dns_stage.?.expected_revision,
+            .payload = self.dns_stage.?.checkpoint(),
+            .valid_until_us = result.valid_until_us,
+        });
+        return .{
+            .manifest = .{ .jail = "@shared", .source = source, .source_generation = result.request.generation, .required = &self.dns_requirement },
+            .state = self.stateStage(),
+            .bootstrap = self.dns_stage.?.expected_revision == 0,
+        };
     }
     pub fn prepareAllowlistRefresh(self: *Coordinator, next: *ignore.Snapshot, source_generation: [32]u8, now_us: i64) !StateStage {
         var transferred = false;
         errdefer if (!transferred) next.destroy();
         if (!self.ready) return error.ConsumerStateNotReady;
-        if (!std.mem.eql(u8, &next.options.parent_generation, &self.ignores.live.options.parent_generation) or !std.mem.eql(u8, &next.options.resolver_generation, &self.ignores.live.options.resolver_generation)) return error.IgnoreGenerationMismatch;
+        if (!std.mem.eql(u8, &next.options.parent_generation, &self.ignores.live.options.parent_generation) or !std.mem.eql(
+            u8,
+            &next.options.resolver_generation,
+            &self.ignores.live.options.resolver_generation,
+        )) return error.IgnoreGenerationMismatch;
         try self.begin(now_us);
         errdefer release(self);
         self.mode = .allowlist;
@@ -566,7 +615,15 @@ pub const Registry = struct {
         return error.ConsumerSourceUnbound;
     }
     pub fn consumer(self: *Registry) detection.StagedConsumer {
-        return .{ .generation = self.generation, .context = self, .prepare = prepare, .prepare_checkpoint = checkpoint, .manifest = manifest, .processing_time = processingTime, .void_hold = voidHold };
+        return .{
+            .generation = self.generation,
+            .context = self,
+            .prepare = prepare,
+            .prepare_checkpoint = checkpoint,
+            .manifest = manifest,
+            .processing_time = processingTime,
+            .void_hold = voidHold,
+        };
     }
     fn voidHold(incarnation: []const u8, context: ?*anyopaque) void {
         const self: *Registry = @ptrCast(@alignCast(context.?));

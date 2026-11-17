@@ -226,7 +226,10 @@ pub fn Methods(comptime Store: type) type {
             if (!self.startupAdmissionActive()) return error.InvalidConsumer;
             if (target.jail.len == 0 or target.jail.len > target.jail.bytes.len) return error.InvalidConsumer;
             _ = detection.Name.init(target.jail.slice()) catch return error.InvalidConsumer;
-            if (same(target.old_parent, target.new_parent) or same(target.old_generation, target.new_generation) or target.source_count == 0 or target.source_count > 4096 or revision > std.math.maxInt(i64) or target.expected_checkpoint_revision > std.math.maxInt(i64) or target.old_ignore_revision == 0 or target.old_ignore_revision > std.math.maxInt(i64)) return error.InvalidConsumer;
+            if (same(target.old_parent, target.new_parent) or same(
+                target.old_generation,
+                target.new_generation,
+            ) or target.source_count == 0 or target.source_count > 4096 or revision > std.math.maxInt(i64) or target.expected_checkpoint_revision > std.math.maxInt(i64) or target.old_ignore_revision == 0 or target.old_ignore_revision > std.math.maxInt(i64)) return error.InvalidConsumer;
             try self.beginAdmissionWrite();
             errdefer self.rollback();
             if (try self.consumerRevision() != revision) return error.StaleConsumerCheckpoint;
@@ -254,14 +257,20 @@ pub fn Methods(comptime Store: type) type {
         fn customChangeShape(change: *const CustomCheckpointRebind) Error!void {
             try change.old_key.validate();
             try change.new_key.validate();
-            if (change.old_key.kind != change.new_key.kind or !std.mem.eql(u8, change.old_key.jail, change.new_key.jail) or !std.mem.eql(u8, change.old_key.source, change.new_key.source) or !std.mem.eql(u8, change.old_key.rule, change.new_key.rule) or same(change.old_key.generation, change.new_key.generation) or change.old_format == 0 or change.new_format == 0 or change.revision == 0 or change.revision > std.math.maxInt(i64) or change.new_payload.len > consumers.max_payload) return error.InvalidConsumer;
+            if (change.old_key.kind != change.new_key.kind or !std.mem.eql(u8, change.old_key.jail, change.new_key.jail) or !std.mem.eql(u8, change.old_key.source, change.new_key.source) or !std.mem.eql(u8, change.old_key.rule, change.new_key.rule) or same(
+                change.old_key.generation,
+                change.new_key.generation,
+            ) or change.old_format == 0 or change.new_format == 0 or change.revision == 0 or change.revision > std.math.maxInt(i64) or change.new_payload.len > consumers.max_payload) return error.InvalidConsumer;
         }
         fn customCheckOldTx(self: *Store, change: *const CustomCheckpointRebind) Error!void {
             var row = try self.statement("SELECT format,revision,valid_until_us,payload FROM consumer_checkpoints WHERE kind=?1 AND jail=?2 AND source=?3 AND rule=?4 AND generation=?5;");
             defer row.deinit();
             try Store.bindConsumerKey(&row, &change.old_key);
             if (!try row.row()) return error.StaleConsumerCheckpoint;
-            if (try row.signed(0) != change.old_format or try row.signed(1) != change.revision or try row.optionalSigned(2) != change.valid_until_us or self.api.column_type(row.ptr, 3) != 4) return error.StaleConsumerCheckpoint;
+            if (try row.signed(0) != change.old_format or try row.signed(1) != change.revision or try row.optionalSigned(2) != change.valid_until_us or self.api.column_type(
+                row.ptr,
+                3,
+            ) != 4) return error.StaleConsumerCheckpoint;
             if (!same(hash(try row.boundedBytes(3, consumers.max_payload)), change.old_payload_sha256)) return error.StaleConsumerCheckpoint;
         }
         fn customInsertTx(self: *Store, change: *const CustomCheckpointRebind) Error!void {
@@ -298,7 +307,10 @@ pub fn Methods(comptime Store: type) type {
             if (!self.startupAdmissionActive()) return error.InvalidConsumer;
             if (target.jail.len == 0 or target.jail.len > target.jail.bytes.len) return error.InvalidConsumer;
             _ = detection.Name.init(target.jail.slice()) catch return error.InvalidConsumer;
-            if (target.source_count != 0 or target.old_ignore_revision != 0 or target.expected_checkpoint_revision != 0 or same(target.old_parent, target.new_parent) or same(target.old_generation, target.new_generation) or target.expected_consumer_revision > std.math.maxInt(i64)) return error.InvalidConsumer;
+            if (target.source_count != 0 or target.old_ignore_revision != 0 or target.expected_checkpoint_revision != 0 or same(target.old_parent, target.new_parent) or same(
+                target.old_generation,
+                target.new_generation,
+            ) or target.expected_consumer_revision > std.math.maxInt(i64)) return error.InvalidConsumer;
             if (target.evidence == null) return error.CustomLegacyProofRequired;
             try self.beginAdmissionWrite();
             errdefer self.rollback();
@@ -373,7 +385,10 @@ pub fn Methods(comptime Store: type) type {
             try self.customStartup(target, target.expected_consumer_revision);
             errdefer self.rollback();
             try customChangeShape(&change);
-            if (!consumers.Key.eql(change.old_key, customIgnoreKey(target, true)) or !consumers.Key.eql(change.new_key, customIgnoreKey(target, false)) or change.revision != target.old_ignore_revision or !same(change.old_payload_sha256, target.old_ignore_sha256) or change.valid_until_us != null or change.old_format != 1 or change.new_format != 2) return error.ConsumerManifestMismatch;
+            if (!consumers.Key.eql(change.old_key, customIgnoreKey(target, true)) or !consumers.Key.eql(change.new_key, customIgnoreKey(target, false)) or change.revision != target.old_ignore_revision or !same(
+                change.old_payload_sha256,
+                target.old_ignore_sha256,
+            ) or change.valid_until_us != null or change.old_format != 1 or change.new_format != 2) return error.ConsumerManifestMismatch;
             try self.customCheckpointFenceTx(target);
             try self.customEvidenceFenceTx(target);
             try self.customCheckOldTx(&change);
@@ -392,13 +407,24 @@ pub fn Methods(comptime Store: type) type {
             const new = source.new_manifest;
             _ = try old.digest();
             const digest = try new.digest();
-            if (source.status != .ready or source.checkpoints.len == 0 or source.checkpoints.len > 8 or !std.mem.eql(u8, old.jail, target.jail.slice()) or !std.mem.eql(u8, new.jail, old.jail) or !std.mem.eql(u8, old.source, new.source) or !same(old.source_generation, target.old_generation) or !same(new.source_generation, target.new_generation) or old.required.len != new.required.len) return error.ConsumerManifestMismatch;
+            if (source.status != .ready or source.checkpoints.len == 0 or source.checkpoints.len > 8 or !std.mem.eql(u8, old.jail, target.jail.slice()) or !std.mem.eql(u8, new.jail, old.jail) or !std.mem.eql(u8, old.source, new.source) or !same(
+                old.source_generation,
+                target.old_generation,
+            ) or !same(new.source_generation, target.new_generation) or old.required.len != new.required.len) return error.ConsumerManifestMismatch;
             var bytes: usize = 0;
             for (source.checkpoints, 0..) |*change, i| {
                 try customChangeShape(change);
-                if ((change.old_key.kind != .rule and change.old_key.kind != .correlation) or !std.mem.eql(u8, change.old_key.jail, old.jail) or !std.mem.eql(u8, change.old_key.source, old.source)) return error.ConsumerManifestMismatch;
+                if ((change.old_key.kind != .rule and change.old_key.kind != .correlation) or !std.mem.eql(u8, change.old_key.jail, old.jail) or !std.mem.eql(
+                    u8,
+                    change.old_key.source,
+                    old.source,
+                )) return error.ConsumerManifestMismatch;
                 for (source.checkpoints[0..i]) |previous| if (consumers.Key.eql(previous.old_key, change.old_key) or consumers.Key.eql(previous.new_key, change.new_key)) return error.InvalidConsumer;
-                bytes = std.math.add(usize, bytes, change.new_payload.len + change.old_key.source.len + change.new_key.source.len + change.old_key.rule.len + change.new_key.rule.len + change.old_key.jail.len + change.new_key.jail.len) catch return error.ConsumerCapacity;
+                bytes = std.math.add(
+                    usize,
+                    bytes,
+                    change.new_payload.len + change.old_key.source.len + change.new_key.source.len + change.old_key.rule.len + change.new_key.rule.len + change.old_key.jail.len + change.new_key.jail.len,
+                ) catch return error.ConsumerCapacity;
                 if (bytes > consumers.max_prepared_bytes) return error.ConsumerCapacity;
             }
             var shared_ignore: usize = 0;
@@ -419,15 +445,25 @@ pub fn Methods(comptime Store: type) type {
                     };
                     if (!found) return error.ConsumerManifestMismatch;
                 } else if (required.key.kind == .dns) {
-                    if (!std.mem.eql(u8, required.key.jail, "@shared") or !std.mem.eql(u8, required.key.source, "@resolver") or !std.mem.eql(u8, required.key.rule, "authority") or required.format_version != 1) return error.ConsumerManifestMismatch;
+                    if (!std.mem.eql(u8, required.key.jail, "@shared") or !std.mem.eql(
+                        u8,
+                        required.key.source,
+                        "@resolver",
+                    ) or !std.mem.eql(u8, required.key.rule, "authority") or required.format_version != 1) return error.ConsumerManifestMismatch;
                     authorities += 1;
                 } else return error.ConsumerManifestMismatch;
-                for (new.required) |item| if (consumers.Key.eql(item.key, replacement.key) and item.format_version == replacement.format_version) break else continue else return error.ConsumerManifestMismatch;
+                for (new.required) |item| if (consumers.Key.eql(
+                    item.key,
+                    replacement.key,
+                ) and item.format_version == replacement.format_version) break else continue else return error.ConsumerManifestMismatch;
             }
             if (shared_ignore != 1 or authorities > 1) return error.ConsumerManifestMismatch;
             for (source.checkpoints) |change| {
                 if (change.old_format != 1 or change.new_format != 1) return error.ConsumerManifestMismatch;
-                for (old.required) |required| if (consumers.Key.eql(required.key, change.old_key) and required.format_version == change.old_format) break else continue else return error.ConsumerManifestMismatch;
+                for (old.required) |required| if (consumers.Key.eql(
+                    required.key,
+                    change.old_key,
+                ) and required.format_version == change.old_format) break else continue else return error.ConsumerManifestMismatch;
             }
             if (try self.checkManifest(old) != source.status) return error.StaleConsumerCheckpoint;
             for (old.required) |required| try self.checkRequiredState(required, false);
@@ -639,7 +675,13 @@ pub fn Methods(comptime Store: type) type {
                 const rule = try row.boundedBytes(2, rule_buffer.len);
                 @memcpy(source_buffer[0..source.len], source);
                 @memcpy(rule_buffer[0..rule.len], rule);
-                key = .{ .kind = std.meta.intToEnum(consumers.Kind, try row.signed(0)) catch return error.InvalidConsumer, .jail = target.jail.slice(), .source = source_buffer[0..source.len], .rule = rule_buffer[0..rule.len], .generation = try Store.effectBlob(&row, 3, 32) };
+                key = .{
+                    .kind = std.meta.intToEnum(consumers.Kind, try row.signed(0)) catch return error.InvalidConsumer,
+                    .jail = target.jail.slice(),
+                    .source = source_buffer[0..source.len],
+                    .rule = rule_buffer[0..rule.len],
+                    .generation = try Store.effectBlob(&row, 3, 32),
+                };
                 format = try row.signed(4);
                 try key.validate();
             }
@@ -651,7 +693,10 @@ pub fn Methods(comptime Store: type) type {
             var count: usize = 0;
             while (try row.row()) {
                 count += 1;
-                if (count > 4096 or !std.mem.eql(u8, try row.boundedBytes(0, 64), target.jail.slice()) or try row.signed(2) != format or !same(try Store.effectBlob(&row, 3, 32), target.new_generation) or try row.signed(4) != 1) return error.ConsumerManifestMismatch;
+                if (count > 4096 or !std.mem.eql(u8, try row.boundedBytes(0, 64), target.jail.slice()) or try row.signed(2) != format or !same(
+                    try Store.effectBlob(&row, 3, 32),
+                    target.new_generation,
+                ) or try row.signed(4) != 1) return error.ConsumerManifestMismatch;
                 if ((key.kind == .rule or key.kind == .correlation) and !std.mem.eql(u8, try row.boundedBytes(1, store.Limits.source_bytes), key.source)) return error.ConsumerManifestMismatch;
             }
             if (count == 0) return error.ConsumerManifestMismatch;

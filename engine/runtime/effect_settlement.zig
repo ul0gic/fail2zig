@@ -58,14 +58,40 @@ pub fn Methods(comptime Manager: type) type {
             if (!self.matched[index]) return .progress;
             const held = &self.inventory.?;
             const entry = self.live[index];
-            try self.settle(bindings, index, entry, marker.sent_wall_us, .{ .installation = entry.installation.id, .scope_key = entry.scope_key, .fingerprint = held.snapshot.fingerprint, .observed_us = held.end_us, .qualification = .complete_owned, .state = entry.desired });
+            try self.settle(
+                bindings,
+                index,
+                entry,
+                marker.sent_wall_us,
+                .{
+                    .installation = entry.installation.id,
+                    .scope_key = entry.scope_key,
+                    .fingerprint = held.snapshot.fingerprint,
+                    .observed_us = held.end_us,
+                    .qualification = .complete_owned,
+                    .state = entry.desired,
+                },
+            );
             return .progress;
         }
         pub fn settleLegacy(self: *Manager, bindings: []const Binding, index: usize, sampled: effect.Clock) !Step {
             const entry = self.live[index];
             if (try self.settlementReadback(entry, sampled)) |outcome| return outcome;
             const held = &self.inventory.?;
-            try self.settle(bindings, index, entry, held.start_us, .{ .installation = entry.installation.id, .scope_key = entry.scope_key, .fingerprint = held.snapshot.fingerprint, .observed_us = held.end_us, .qualification = .complete_owned, .state = if (self.matched[index]) entry.desired else null });
+            try self.settle(
+                bindings,
+                index,
+                entry,
+                held.start_us,
+                .{
+                    .installation = entry.installation.id,
+                    .scope_key = entry.scope_key,
+                    .fingerprint = held.snapshot.fingerprint,
+                    .observed_us = held.end_us,
+                    .qualification = .complete_owned,
+                    .state = if (self.matched[index]) entry.desired else null,
+                },
+            );
             return .progress;
         }
         pub fn settlementReadback(self: *Manager, entry: effect.Entry, sampled: effect.Clock) !?Step {
@@ -111,7 +137,20 @@ pub fn Methods(comptime Manager: type) type {
             if ((entry.status != .applied and entry.status != .absent) or !self.matched[index]) return null;
             if (try self.settlementReadback(entry, sampled)) |outcome| return outcome;
             const held = &self.inventory.?;
-            try self.settle(bindings, index, entry, held.start_us, .{ .installation = entry.installation.id, .scope_key = entry.scope_key, .fingerprint = held.snapshot.fingerprint, .observed_us = held.end_us, .qualification = .complete_owned, .state = entry.desired });
+            try self.settle(
+                bindings,
+                index,
+                entry,
+                held.start_us,
+                .{
+                    .installation = entry.installation.id,
+                    .scope_key = entry.scope_key,
+                    .fingerprint = held.snapshot.fingerprint,
+                    .observed_us = held.end_us,
+                    .qualification = .complete_owned,
+                    .state = entry.desired,
+                },
+            );
             self.legacy_targets_attempted = key;
             return .progress;
         }

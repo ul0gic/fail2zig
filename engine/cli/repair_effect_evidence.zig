@@ -24,7 +24,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8, stdout: anyty
         return .usage;
     };
     execute(allocator, options, stdout) catch |failure| {
-        stderr.print("repair-effect-evidence: refused: {s}; stop the daemon and preserve the state and any repair backup; only recognized absence evidence can be repaired\n", .{@errorName(failure)}) catch {};
+        stderr.print(
+            "repair-effect-evidence: refused: {s}; stop the daemon and preserve the state and any repair backup; only recognized absence evidence can be repaired\n",
+            .{@errorName(failure)},
+        ) catch {};
         return .rejected;
     };
     return .success;

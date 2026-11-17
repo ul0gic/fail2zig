@@ -147,7 +147,10 @@ pub fn Methods(comptime Store: type) type {
                     const scope = try self.decodeStoredScope(&row, 0);
                     const revision = try row.signed(2);
                     if (revision <= 0) return error.InvalidEffect;
-                    try stale.append(self.allocator, .{ .owner = .{ .scope = scope.canonical, .generation = try Store.effectBlob(&row, 3, 32), .revision = @intCast(revision) }, .decision_id = decision_id });
+                    try stale.append(
+                        self.allocator,
+                        .{ .owner = .{ .scope = scope.canonical, .generation = try Store.effectBlob(&row, 3, 32), .revision = @intCast(revision) }, .decision_id = decision_id },
+                    );
                 }
             }
             for (stale.items) |item| {

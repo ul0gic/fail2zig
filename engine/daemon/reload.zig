@@ -53,7 +53,11 @@ pub fn Methods(comptime Coordinator: type) type {
             config.Config.checkConfigPerms(stat.mode, stat.gid) catch |err| return ReloadOutcome.single(.rejected, "config: {s}", .{@errorName(err)});
             const bytes = file.readToEndAlloc(arena.allocator(), 16 * 1024 * 1024) catch |err| return ReloadOutcome.single(.rejected, "config: read: {s}", .{@errorName(err)});
             const proposed = arena.allocator().create(config.Config) catch return ReloadOutcome.single(.rejected, "out of memory", .{});
-            proposed.* = config.Config.parseDiag(arena.allocator(), bytes, &diag) catch |err| return ReloadOutcome.single(.rejected, "config: {s}:{d}:{d}: {s}", .{ self.config_path, diag.line, diag.col, @errorName(err) });
+            proposed.* = config.Config.parseDiag(arena.allocator(), bytes, &diag) catch |err| return ReloadOutcome.single(
+                .rejected,
+                "config: {s}:{d}:{d}: {s}",
+                .{ self.config_path, diag.line, diag.col, @errorName(err) },
+            );
             var validation_diag: config.ValidationDiagnostic = .{};
             config.validateDiag(proposed, &validation_diag) catch |err| {
                 var out = ReloadOutcome.single(.rejected, "config: validation failed: {s}", .{@errorName(err)});
@@ -193,11 +197,21 @@ pub fn Methods(comptime Coordinator: type) type {
                 const rebinding: ?durable.Store.CursorRebinding = switch (jail.plan) {
                     .file => |*plan| blk: {
                         const processing = plan.sessionOptions().processing;
-                        break :blk .{ .old = @import("../source/durable_file_source.zig").FileSource.framingBinding(processing.encoding, current_generation, processing.max_record_bytes), .new = @import("../source/durable_file_source.zig").FileSource.framingBinding(processing.encoding, next_generation, processing.max_record_bytes) };
+                        break :blk .{
+                            .old = @import("../source/durable_file_source.zig").FileSource.framingBinding(processing.encoding, current_generation, processing.max_record_bytes),
+                            .new = @import("../source/durable_file_source.zig").FileSource.framingBinding(processing.encoding, next_generation, processing.max_record_bytes),
+                        };
                     },
                     else => null,
                 };
-                transitions[count] = .{ .jail = jail.name, .generation = current_generation, .next_generation = next_generation, .expected = previous, .next = next_policy, .cursor_rebinding = rebinding };
+                transitions[count] = .{
+                    .jail = jail.name,
+                    .generation = current_generation,
+                    .next_generation = next_generation,
+                    .expected = previous,
+                    .next = next_policy,
+                    .cursor_rebinding = rebinding,
+                };
                 count += 1;
             }
             var outcome = ReloadOutcome{ .kind = .applied, .generation = generation };
@@ -300,7 +314,17 @@ pub fn Methods(comptime Coordinator: type) type {
                 retired_names[retired_count] = jail.name;
                 retired_count += 1;
             };
-            try self.store.commitReloadGeneration(transitions[0..count], .{ .generation = generation, .config_digest = request.config_digest, .config_path = self.config_path, .committed_us = now, .published = true, .mutation_revision = 0 }, digests[0..digest_count], ignore_updates[0..ignore_count], custom_updates[0..custom_count], admitted_names[0..created], retired_names[0..retired_count], retention, .{ .prepared_us = now, .context = self, .read = wallClockEffect });
+            try self.store.commitReloadGeneration(
+                transitions[0..count],
+                .{ .generation = generation, .config_digest = request.config_digest, .config_path = self.config_path, .committed_us = now, .published = true, .mutation_revision = 0 },
+                digests[0..digest_count],
+                ignore_updates[0..ignore_count],
+                custom_updates[0..custom_count],
+                admitted_names[0..created],
+                retired_names[0..retired_count],
+                retention,
+                .{ .prepared_us = now, .context = self, .read = wallClockEffect },
+            );
             const committed_revision = self.store.adminRevision();
             if (classification.retention_changed or removed.len != 0 or classification.jails.added_count != 0) self.maintenance_idle = null;
             if (count != 0 or created != 0) self.gate.requestRebuild() catch |err| std.log.warn("native reload: source rebuild not started: {s}; it starts with the next recovery", .{@errorName(err)});
@@ -350,7 +374,11 @@ pub fn Methods(comptime Coordinator: type) type {
                 outcome.kind = .partial;
                 if (outcome.reason_count < reload_mod.max_reasons) {
                     var reason: reload_mod.Reason = .{};
-                    const written = std.fmt.bufPrint(&reason.bytes, "generation applied but the mutation revision was not read back: {s}; restart fail2zig before changing bans", .{@errorName(err)}) catch reason.bytes[0..0];
+                    const written = std.fmt.bufPrint(
+                        &reason.bytes,
+                        "generation applied but the mutation revision was not read back: {s}; restart fail2zig before changing bans",
+                        .{@errorName(err)},
+                    ) catch reason.bytes[0..0];
                     reason.len = @intCast(written.len);
                     outcome.reasons[outcome.reason_count] = reason;
                     outcome.reason_count += 1;
@@ -377,7 +405,10 @@ pub fn Methods(comptime Coordinator: type) type {
             for (self.jails, 0..) |jail, i| counts[i] = .{ .jail = jail.name, .runtime_only = jail.ignore_runtime_only };
             var found: native_banip.BanListConflict = undefined;
             const conflict: ?native_banip.BanListConflict = if (native_banip.findConflict(input.proposed, &found)) found else null;
-            return .{ .generation = self.published_generation, .classification = reload_mod.classifyWithRuntime(self.live_cfg, input.proposed, retry.max_pool_subjects, counts[0..self.jails.len], conflict) };
+            return .{
+                .generation = self.published_generation,
+                .classification = reload_mod.classifyWithRuntime(self.live_cfg, input.proposed, retry.max_pool_subjects, counts[0..self.jails.len], conflict),
+            };
         }
         pub fn replaceLiveConfigLocked(self: *Coordinator, arena: ?*std.heap.ArenaAllocator, proposed: *const config.Config) ?*std.heap.ArenaAllocator {
             const old = self.live_arena;

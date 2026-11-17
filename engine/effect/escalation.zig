@@ -64,7 +64,10 @@ pub const Policy = struct {
             .finite_us => |value| value,
             .permanent => return error.InvalidEscalationPolicy,
         };
-        if (base_us <= 0 or @mod(base_us, lease.micros_per_second) != 0 or sampled_jitter_us < 0 or sampled_jitter_us > self.jitter_us or @mod(sampled_jitter_us, lease.micros_per_second) != 0) return error.InvalidEscalationInput;
+        if (base_us <= 0 or @mod(base_us, lease.micros_per_second) != 0 or sampled_jitter_us < 0 or sampled_jitter_us > self.jitter_us or @mod(
+            sampled_jitter_us,
+            lease.micros_per_second,
+        ) != 0) return error.InvalidEscalationInput;
         if (prior_confirmed == 0) {
             if (sampled_jitter_us != 0) return error.InvalidEscalationInput;
             return .{ .finite_us = base_us };

@@ -183,7 +183,13 @@ pub const Session = struct {
         defer allocator.free(configuration);
         var bound = options.processing;
         std.crypto.hash.sha2.Sha256.hash(configuration, &bound.parent_generation, .{});
-        var processor = if (options.staged_detection) |consumer| try processing.Processor.initWithStaged(allocator, bound, scratch, now, consumer) else try processing.Processor.initWithDetection(allocator, bound, scratch, now, options.detection);
+        var processor = if (options.staged_detection) |consumer| try processing.Processor.initWithStaged(allocator, bound, scratch, now, consumer) else try processing.Processor.initWithDetection(
+            allocator,
+            bound,
+            scratch,
+            now,
+            options.detection,
+        );
         if (options.retry) |policy| try processor.bindRetry(policy, options.suppress_retry_enforcement, options.retry_hash);
         return processor;
     }
@@ -284,7 +290,15 @@ pub const Session = struct {
         const a = self.allocator;
         const out = try a.create(RecoverySnapshot);
         errdefer a.destroy(out);
-        out.* = .{ .allocator = a, .generation = self.processor.generation, .jail = try a.dupe(u8, self.pipe.jail), .max_sources = self.sources.max_sources, .entries = std.ArrayList(Retained).init(a), .discovery_repair = self.discovery_repair, .notices = self.notices };
+        out.* = .{
+            .allocator = a,
+            .generation = self.processor.generation,
+            .jail = try a.dupe(u8, self.pipe.jail),
+            .max_sources = self.sources.max_sources,
+            .entries = std.ArrayList(Retained).init(a),
+            .discovery_repair = self.discovery_repair,
+            .notices = self.notices,
+        };
         errdefer {
             for (out.entries.items) |entry| entry.deinit(a);
             out.entries.deinit();
@@ -302,7 +316,10 @@ pub const Session = struct {
                 const observed = source.committed orelse return error.MissingFileCheckpoint;
                 if (!std.mem.eql(u8, &expected, &observed.incarnation)) return error.ResumeLost;
             };
-            const state = if (initialized) self.repair_states[index] else if (previous) |entry| entry.state else try repair.Repair.init(try repair.Binding.init(self.processor.generation, source.source_id), self.discovery_repair.last_now_ms);
+            const state = if (initialized) self.repair_states[index] else if (previous) |entry| entry.state else try repair.Repair.init(
+                try repair.Binding.init(self.processor.generation, source.source_id),
+                self.discovery_repair.last_now_ms,
+            );
             const pending = if (initialized) self.pending_proofs[index] else if (previous) |entry| entry.pending else null;
             const original = Retained{
                 .source = source.source_id,
@@ -336,7 +353,11 @@ pub const Session = struct {
 
     pub fn importRecovery(self: *Session, snapshot: *const RecoverySnapshot) !void {
         if (self.processor.in_flight or self.admission_phase != .positions or self.sources.sources.items.len != 0 or self.retained.items.len != 0) return error.RecoveryOutOfOrder;
-        if (self.sources.max_sources != snapshot.max_sources or !std.mem.eql(u8, &self.processor.generation, &snapshot.generation) or !std.mem.eql(u8, self.pipe.jail, snapshot.jail)) return error.SourceGenerationMismatch;
+        if (self.sources.max_sources != snapshot.max_sources or !std.mem.eql(
+            u8,
+            &self.processor.generation,
+            &snapshot.generation,
+        ) or !std.mem.eql(u8, self.pipe.jail, snapshot.jail)) return error.SourceGenerationMismatch;
         if (snapshot.entries.items.len > self.sources.max_sources) return error.SourceLimit;
         var staged = std.ArrayList(Retained).init(self.allocator);
         errdefer {
@@ -477,7 +498,10 @@ pub const Session = struct {
     fn storageFailure(self: *Session, cause: anyerror) anyerror {
         self.last_failure_domain = .storage;
         self.pipe.ready = false;
-        if (self.pipe.gate) |gate| gate.failed(cause, .{ .sqlite_code = self.pipe.store.last_error_code, .rollback_code = self.pipe.store.rollback_error_code, .reopen_required = self.pipe.store.reopen_required });
+        if (self.pipe.gate) |gate| gate.failed(
+            cause,
+            .{ .sqlite_code = self.pipe.store.last_error_code, .rollback_code = self.pipe.store.rollback_error_code, .reopen_required = self.pipe.store.reopen_required },
+        );
         return cause;
     }
     fn sourceFailure(self: *Session, state: *repair.Repair, cause: anyerror) anyerror {
@@ -882,7 +906,14 @@ pub const Session = struct {
             acknowledged.* = 0;
             const record = batch[0];
             if (self.pending) |expected| {
-                if (record.kind != .data or !expected.sameRecord(.{ .jail = self.session.pipe.jail, .source = record.source, .occurrence = record.occurrence, .cursor = record.cursor, .raw_hash = record.raw_hash, .generation = self.session.processor.generation })) return error.PendingRecordMismatch;
+                if (record.kind != .data or !expected.sameRecord(.{
+                    .jail = self.session.pipe.jail,
+                    .source = record.source,
+                    .occurrence = record.occurrence,
+                    .cursor = record.cursor,
+                    .raw_hash = record.raw_hash,
+                    .generation = self.session.processor.generation,
+                })) return error.PendingRecordMismatch;
             }
             self.committing = true;
             pipeline.Pipeline.acknowledgeBatch(batch, acknowledged, &self.session.pipe) catch |err| {
@@ -983,7 +1014,10 @@ pub const Session = struct {
         }
         if (source.named_path == .absent) {
             source.named_path = .absent_reported;
-            std.log.warn("native: jail={} source=file path={} log path is absent (rotated or removed); reading continues from the held file and resumes when the path reappears", .{ std.zig.fmtEscapes(self.pipe.jail), std.zig.fmtEscapes(source.path) });
+            std.log.warn(
+                "native: jail={} source=file path={} log path is absent (rotated or removed); reading continues from the held file and resumes when the path reappears",
+                .{ std.zig.fmtEscapes(self.pipe.jail), std.zig.fmtEscapes(source.path) },
+            );
         }
         if (!delivered and source.health == .healthy and state.state.phase == .healthy) {
             if (self.retireUnlinked(index) catch |err| return self.sourceFailure(state, err)) return 0;
@@ -1010,7 +1044,14 @@ pub const Session = struct {
         fn verify(record: records.Record, context: ?*anyopaque) !void {
             const self: *PendingProbe = @ptrCast(@alignCast(context.?));
             const saved = self.identity;
-            if (record.kind != .data or !saved.sameRecord(.{ .jail = saved.jail, .source = record.source, .occurrence = record.occurrence, .cursor = record.cursor, .raw_hash = record.raw_hash, .generation = saved.generation })) return error.PendingRecordMismatch;
+            if (record.kind != .data or !saved.sameRecord(.{
+                .jail = saved.jail,
+                .source = record.source,
+                .occurrence = record.occurrence,
+                .cursor = record.cursor,
+                .raw_hash = record.raw_hash,
+                .generation = saved.generation,
+            })) return error.PendingRecordMismatch;
             return error.PendingRecordVerified;
         }
     };

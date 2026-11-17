@@ -16,7 +16,24 @@ const mem = std.mem;
 pub const Transport = enum { nftables, iptables, ipset };
 pub const canonical_scope = @import("scope.zig");
 pub const CanonicalScope = canonical_scope.Scope;
-pub const Error = error{ UnknownState, ForeignState, Incomplete, Changed, DumpInterrupted, EventsLost, LimitExceeded, UnsupportedScope, ExpiredIntent, UnsupportedDeadline, InvalidInstallation, ToolUnavailable, PermissionDenied, Timeout, OutOfMemory, SystemError };
+pub const Error = error{
+    UnknownState,
+    ForeignState,
+    Incomplete,
+    Changed,
+    DumpInterrupted,
+    EventsLost,
+    LimitExceeded,
+    UnsupportedScope,
+    ExpiredIntent,
+    UnsupportedDeadline,
+    InvalidInstallation,
+    ToolUnavailable,
+    PermissionDenied,
+    Timeout,
+    OutOfMemory,
+    SystemError,
+};
 pub const OperationStage = enum { admission_probe, admission_dispatch, admission_verify, readback, effect_dispatch, effect_verify };
 pub const MutationDisposition = enum { not_started, outcome_uncertain };
 pub const FailureContext = struct {
@@ -561,13 +578,21 @@ pub const Inspector = struct {
         errdefer snapshot.deinit();
         if (snapshot.state != .owned) return error.InvalidInstallation;
         const end = try self.clockAt(clock, &elapsed);
-        return .{ .snapshot = snapshot, .matches_desired = self.kernelMatches(token.operation, try findEntry(snapshot.entries, token.scope, token.effect_id), clock.wall_us, end), .observed_wall_us = end };
+        return .{
+            .snapshot = snapshot,
+            .matches_desired = self.kernelMatches(token.operation, try findEntry(snapshot.entries, token.scope, token.effect_id), clock.wall_us, end),
+            .observed_wall_us = end,
+        };
     }
 
     pub fn matchesSnapshot(self: *const Inspector, snapshot: *const Snapshot, token: DispatchToken, wall_start_us: i64, wall_end_us: i64) Error!bool {
         try (DurableInstallationIntent{ .installation = token.installation, .intent_id = token.effect_id, .revision = token.aggregate_revision }).validate(self.installation);
         try validateRealizedScope(self.installation.transport, token.scope);
-        if (!mem.eql(u8, &snapshot.installation.id, &self.installation.id) or snapshot.installation.transport != self.installation.transport or snapshot.state != .owned) return error.InvalidInstallation;
+        if (!mem.eql(
+            u8,
+            &snapshot.installation.id,
+            &self.installation.id,
+        ) or snapshot.installation.transport != self.installation.transport or snapshot.state != .owned) return error.InvalidInstallation;
         if (wall_start_us < 0 or wall_end_us < wall_start_us) return error.UnsupportedDeadline;
         const wall_duration: u64 = @intCast(wall_end_us - wall_start_us);
         if (wall_duration > self.fromKernelUs(self.limits.timeout_ms * 1000) or snapshot.observed_end_ns < snapshot.observed_start_ns or
@@ -731,9 +756,21 @@ pub const Inspector = struct {
         for (present) |token| {
             const address = legacyAddress(token.scope) catch continue;
             var key_buf: [16]u8 = undefined;
-            const payload = nft.buildSetElemDelPayload(&payloads[count - 1], nl.NFPROTO.INET, name, if (address == .ipv4) "banned_ipv4" else "banned_ipv6", nftSetKey(address, &key_buf)) catch |err| return netlinkError(err);
+            const payload = nft.buildSetElemDelPayload(
+                &payloads[count - 1],
+                nl.NFPROTO.INET,
+                name,
+                if (address == .ipv4) "banned_ipv4" else "banned_ipv6",
+                nftSetKey(address, &key_buf),
+            ) catch |err| return netlinkError(err);
             related[count] = sock.nextSeq();
-            batch.add(nl.nfnlMsgType(nl.NFNL.SUBSYS_NFTABLES, nft.NFT_MSG.DELSETELEM), linux.NLM_F_REQUEST | linux.NLM_F_ACK, related[count], sock.port_id, payload) catch |err| return netlinkError(err);
+            batch.add(
+                nl.nfnlMsgType(nl.NFNL.SUBSYS_NFTABLES, nft.NFT_MSG.DELSETELEM),
+                linux.NLM_F_REQUEST | linux.NLM_F_ACK,
+                related[count],
+                sock.port_id,
+                payload,
+            ) catch |err| return netlinkError(err);
             count += 1;
         }
         for (handles[0..handle_count]) |handle| {
@@ -775,7 +812,10 @@ pub const Inspector = struct {
         };
         const consumed = installed catch |err| return .{ .result = .{ .uncertain = self.failure(.effect_dispatch, err, progress) }, .consumed = tokens.len };
         const observation_start = self.clockAt(clock, &elapsed) catch |err| return .{ .result = .{ .uncertain = self.failure(.effect_verify, err, progress) }, .consumed = consumed };
-        if (transport == .nftables) return .{ .result = .{ .acknowledged = .{ .sent_wall_us = sent_wall_us, .acked_wall_us = observation_start, .port_id = self.last_install_port } }, .consumed = consumed };
+        if (transport == .nftables) return .{
+            .result = .{ .acknowledged = .{ .sent_wall_us = sent_wall_us, .acked_wall_us = observation_start, .port_id = self.last_install_port } },
+            .consumed = consumed,
+        };
         var after = self.inspect() catch |err| return .{ .result = .{ .uncertain = self.failure(.effect_verify, err, progress) }, .consumed = consumed };
         var transferred = false;
         defer if (!transferred) after.deinit();
@@ -783,7 +823,10 @@ pub const Inspector = struct {
         if (after.state != .owned) return .{ .result = .{ .uncertain = self.failure(.effect_verify, error.Changed, progress) }, .consumed = consumed };
         for (tokens[0..consumed]) |token| {
             const entry = findEntry(after.entries, token.scope, token.effect_id) catch |err| return .{ .result = .{ .uncertain = self.failure(.effect_verify, err, progress) }, .consumed = consumed };
-            if (!self.kernelMatches(token.operation, entry, observation_start, observation_end)) return .{ .result = .{ .uncertain = self.failure(.effect_verify, error.Changed, progress) }, .consumed = consumed };
+            if (!self.kernelMatches(token.operation, entry, observation_start, observation_end)) return .{
+                .result = .{ .uncertain = self.failure(.effect_verify, error.Changed, progress) },
+                .consumed = consumed,
+            };
         }
         transferred = true;
         return .{ .result = .{ .verified = .{ .snapshot = after, .changed = true, .observed_start_wall_us = observation_start, .observed_wall_us = observation_end } }, .consumed = consumed };
@@ -821,7 +864,13 @@ pub const Inspector = struct {
             }
             const payload = nft.buildSetElemAddPayload(&payload_buf, nl.NFPROTO.INET, name, set, key, units) catch |err| return netlinkError(err);
             related[count] = sock.nextSeq();
-            batch.add(nl.nfnlMsgType(nl.NFNL.SUBSYS_NFTABLES, nft.NFT_MSG.NEWSETELEM), linux.NLM_F_REQUEST | linux.NLM_F_CREATE | linux.NLM_F_EXCL, related[count], sock.port_id, payload) catch |err| return netlinkError(err);
+            batch.add(
+                nl.nfnlMsgType(nl.NFNL.SUBSYS_NFTABLES, nft.NFT_MSG.NEWSETELEM),
+                linux.NLM_F_REQUEST | linux.NLM_F_CREATE | linux.NLM_F_EXCL,
+                related[count],
+                sock.port_id,
+                payload,
+            ) catch |err| return netlinkError(err);
             count += 1;
             consumed += 1;
         }
@@ -924,7 +973,12 @@ pub const Inspector = struct {
             }
         } else {
             const binary = if (scoped_address == .ipv4) self.iptables_path else self.ip6tables_path;
-            if (token.operation == .ensure_absent) try self.mutateCommand(&.{ binary, "-w", "1", "-D", name, "-s", address, "-j", "DROP" }, timer, &count, progress) else try self.mutateCommand(&.{ binary, "-w", "1", "-I", name, "1", "-s", address, "-j", "DROP" }, timer, &count, progress);
+            if (token.operation == .ensure_absent) try self.mutateCommand(&.{ binary, "-w", "1", "-D", name, "-s", address, "-j", "DROP" }, timer, &count, progress) else try self.mutateCommand(
+                &.{ binary, "-w", "1", "-I", name, "1", "-s", address, "-j", "DROP" },
+                timer,
+                &count,
+                progress,
+            );
         }
     }
     fn mutateFixedScoped(self: *Inspector, token: DispatchToken, name: []const u8, timer: *std.time.Timer, progress: *MutationProgress) Error!void {
@@ -1000,13 +1054,25 @@ pub const Inspector = struct {
             const payload = nft.buildSetElemDelPayload(&payloads[0], nl.NFPROTO.INET, name, set, key) catch |err| return netlinkError(err);
             related[count] = sock.nextSeq();
             count += 1;
-            batch.add(nl.nfnlMsgType(nl.NFNL.SUBSYS_NFTABLES, nft.NFT_MSG.DELSETELEM), linux.NLM_F_REQUEST | linux.NLM_F_ACK, related[count - 1], sock.port_id, payload) catch |err| return netlinkError(err);
+            batch.add(
+                nl.nfnlMsgType(nl.NFNL.SUBSYS_NFTABLES, nft.NFT_MSG.DELSETELEM),
+                linux.NLM_F_REQUEST | linux.NLM_F_ACK,
+                related[count - 1],
+                sock.port_id,
+                payload,
+            ) catch |err| return netlinkError(err);
         }
         if (token.operation == .ensure_present) {
             const payload = nft.buildSetElemAddPayload(&payloads[1], nl.NFPROTO.INET, name, set, key, timeout_ms) catch |err| return netlinkError(err);
             related[count] = sock.nextSeq();
             count += 1;
-            batch.add(nl.nfnlMsgType(nl.NFNL.SUBSYS_NFTABLES, nft.NFT_MSG.NEWSETELEM), linux.NLM_F_REQUEST | linux.NLM_F_ACK | linux.NLM_F_CREATE | linux.NLM_F_EXCL, related[count - 1], sock.port_id, payload) catch |err| return netlinkError(err);
+            batch.add(
+                nl.nfnlMsgType(nl.NFNL.SUBSYS_NFTABLES, nft.NFT_MSG.NEWSETELEM),
+                linux.NLM_F_REQUEST | linux.NLM_F_ACK | linux.NLM_F_CREATE | linux.NLM_F_EXCL,
+                related[count - 1],
+                sock.port_id,
+                payload,
+            ) catch |err| return netlinkError(err);
         }
         related[count] = sock.nextSeq();
         const bytes = batch.commit(related[count], sock.port_id, nl.NFNL.SUBSYS_NFTABLES) catch |err| return netlinkError(err);
@@ -1063,7 +1129,13 @@ pub const Inspector = struct {
                 const payload = nft.buildScopedDropRulePayload(&payloads[handle_count + part], name, "input", token.scope, part, &userdata) catch |err| return scopeBuildError(err);
                 related[count] = sock.nextSeq();
                 // Why: 0x800 is NLM_F_APPEND (include/uapi/linux/netlink.h), which adds each rule at the end of the chain.
-                batch.add(nl.nfnlMsgType(nl.NFNL.SUBSYS_NFTABLES, nft.NFT_MSG.NEWRULE), linux.NLM_F_REQUEST | linux.NLM_F_ACK | linux.NLM_F_CREATE | linux.NLM_F_EXCL | 0x800, related[count], sock.port_id, payload) catch |err| return netlinkError(err);
+                batch.add(
+                    nl.nfnlMsgType(nl.NFNL.SUBSYS_NFTABLES, nft.NFT_MSG.NEWRULE),
+                    linux.NLM_F_REQUEST | linux.NLM_F_ACK | linux.NLM_F_CREATE | linux.NLM_F_EXCL | 0x800,
+                    related[count],
+                    sock.port_id,
+                    payload,
+                ) catch |err| return netlinkError(err);
                 count += 1;
             }
         }
@@ -1107,7 +1179,12 @@ pub const Inspector = struct {
                 var set_buf: [31]u8 = undefined;
                 const set = try setName(name, index == 1, &set_buf);
                 // Why: maxelem equals max_inventory_entries, the most entries a readback accepts.
-                try self.mutateCommand(&.{ self.ipset_path, "create", set, "hash:ip", "family", if (index == 0) "inet" else "inet6", "timeout", "0", "maxelem", "131072" }, timer, &mutations, progress);
+                try self.mutateCommand(
+                    &.{ self.ipset_path, "create", set, "hash:ip", "family", if (index == 0) "inet" else "inet6", "timeout", "0", "maxelem", "131072" },
+                    timer,
+                    &mutations,
+                    progress,
+                );
                 try self.mutateCommand(&.{ binary, "-w", "1", "-I", name, "1", "-m", "set", "--match-set", set, "src", "-j", "DROP" }, timer, &mutations, progress);
             }
             try self.mutateCommand(&.{ binary, "-w", "1", "-I", "INPUT", "1", "-m", "comment", "--comment", marker, "-j", name }, timer, &mutations, progress);
@@ -1134,7 +1211,13 @@ pub const Inspector = struct {
         const kinds = [_]u16{ nft.NFT_MSG.NEWTABLE, nft.NFT_MSG.NEWSET, nft.NFT_MSG.NEWSET, nft.NFT_MSG.NEWCHAIN, nft.NFT_MSG.NEWRULE, nft.NFT_MSG.NEWRULE };
         for (data, kinds, 1..) |payload, kind, index| {
             related[index] = sock.nextSeq();
-            batch.add(nl.nfnlMsgType(nl.NFNL.SUBSYS_NFTABLES, kind), linux.NLM_F_REQUEST | linux.NLM_F_ACK | linux.NLM_F_CREATE | linux.NLM_F_EXCL, related[index], sock.port_id, payload) catch |err| return netlinkError(err);
+            batch.add(
+                nl.nfnlMsgType(nl.NFNL.SUBSYS_NFTABLES, kind),
+                linux.NLM_F_REQUEST | linux.NLM_F_ACK | linux.NLM_F_CREATE | linux.NLM_F_EXCL,
+                related[index],
+                sock.port_id,
+                payload,
+            ) catch |err| return netlinkError(err);
         }
         related[7] = sock.nextSeq();
         const bytes = batch.commit(related[7], sock.port_id, nl.NFNL.SUBSYS_NFTABLES) catch |err| return netlinkError(err);
@@ -1497,7 +1580,11 @@ const Builder = struct {
         mem.sort(Entry, self.entries.items, {}, entryLess);
         for (self.entries.items, 0..) |e, index| {
             // Why: Walking a hash set during a kernel resize can yield an element twice, so a duplicate host is a read to repeat.
-            if (index > 0 and !entryLess({}, self.entries.items[index - 1], e)) return if (e.scope == null and self.entries.items[index - 1].scope == null) error.DumpInterrupted else error.UnknownState;
+            if (index > 0 and !entryLess(
+                {},
+                self.entries.items[index - 1],
+                e,
+            )) return if (e.scope == null and self.entries.items[index - 1].scope == null) error.DumpInterrupted else error.UnknownState;
             const scope_bytes = entryScope(e).encode() catch return error.UnknownState;
             self.topology.update(&scope_bytes);
             self.topology.update(&.{ @intFromBool(e.remaining_ms != null), @intFromBool(e.deadline_us != null), @intFromBool(e.effect_id != null), @intFromBool(e.partial) });
@@ -1507,7 +1594,15 @@ const Builder = struct {
         self.topology.update(&.{@intFromBool(self.present)});
         var fingerprint: [32]u8 = undefined;
         self.topology.final(&fingerprint);
-        return .{ .allocator = self.allocator, .installation = self.installation, .state = if (self.present) .owned else .absent, .entries = try self.entries.toOwnedSlice(), .fingerprint = fingerprint, .observed_start_ns = start, .observed_end_ns = end };
+        return .{
+            .allocator = self.allocator,
+            .installation = self.installation,
+            .state = if (self.present) .owned else .absent,
+            .entries = try self.entries.toOwnedSlice(),
+            .fingerprint = fingerprint,
+            .observed_start_ns = start,
+            .observed_end_ns = end,
+        };
     }
 };
 fn entryLess(_: void, a: Entry, b: Entry) bool {
@@ -2165,7 +2260,16 @@ fn readNft(self: *Inspector, builder: *Builder, timer: *std.time.Timer) Error!vo
             var matched = false;
             for (0..2) |index| {
                 var expected_buf: [512]u8 align(4) = undefined;
-                const expected = nft.buildDropRulePayload(&expected_buf, nl.NFPROTO.INET, name, "input", if (index == 0) "banned_ipv4" else "banned_ipv6", if (index == 0) nl.NFPROTO.IPV4 else nl.NFPROTO.IPV6, if (index == 0) 12 else 8, if (index == 0) 4 else 16) catch |err| return netlinkError(err);
+                const expected = nft.buildDropRulePayload(
+                    &expected_buf,
+                    nl.NFPROTO.INET,
+                    name,
+                    "input",
+                    if (index == 0) "banned_ipv4" else "banned_ipv6",
+                    if (index == 0) nl.NFPROTO.IPV4 else nl.NFPROTO.IPV6,
+                    if (index == 0) 12 else 8,
+                    if (index == 0) 4 else 16,
+                ) catch |err| return netlinkError(err);
                 const expected_attrs = try payloadAttrs(expected, &.{ 1, 2, 4 });
                 if (try equalExpressions(try a.get(4), try expected_attrs.get(4))) {
                     if (seen[index]) return error.UnknownState;

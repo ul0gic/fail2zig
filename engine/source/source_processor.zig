@@ -165,7 +165,12 @@ pub const Processor = struct {
         defer allocator.free(encoded);
         var parent: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(encoded, &parent, .{});
-        return .{ .options = options, .generation = try policy.binding(parent, if (options.timestamp == .undated) .undated else .timestamped, options.window_us), .scratch = scratch[0..options.max_decoded_bytes], .now = now };
+        return .{
+            .options = options,
+            .generation = try policy.binding(parent, if (options.timestamp == .undated) .undated else .timestamped, options.window_us),
+            .scratch = scratch[0..options.max_decoded_bytes],
+            .now = now,
+        };
     }
 
     pub fn bindFile(self: *const Processor, source: *files.FileSource) !void {
@@ -369,7 +374,13 @@ pub const Processor = struct {
                 now.us = try selected(record, now.us, consumer.context);
             };
             processing_us = now.us;
-            outcome = if (decoding_rejected) .{ .rejected = .{ .reason = .malformed, .receipt = receipt } } else try policy.evaluate(if (self.options.timestamp == .undated) .undated else .timestamped, input, receipt, now, self.options.window_us);
+            outcome = if (decoding_rejected) .{ .rejected = .{ .reason = .malformed, .receipt = receipt } } else try policy.evaluate(
+                if (self.options.timestamp == .undated) .undated else .timestamped,
+                input,
+                receipt,
+                now,
+                self.options.window_us,
+            );
             if (encoding_replaced) {
                 outcome = outcome.?.withEncodingReplacement();
                 replaced_count = std.math.add(u64, replaced_count, 1) catch return error.TimeCounterLimit;
@@ -395,7 +406,10 @@ pub const Processor = struct {
             }
             if (self.staged_detector) |consumer| {
                 const clock = self.monotonic_clock orelse return error.StagedClockRequired;
-                const prepared = try consumer.prepare(.{ .record = record, .decoded = decoded, .time = outcome.?, .processing_us = now.us, .monotonic_ms = clock.read(clock.context) }, consumer.context);
+                const prepared = try consumer.prepare(
+                    .{ .record = record, .decoded = decoded, .time = outcome.?, .processing_us = now.us, .monotonic_ms = clock.read(clock.context) },
+                    consumer.context,
+                );
                 self.consumer_stage = .{ .context = prepared.context, .publish = prepared.publish, .release = prepared.release };
                 if (prepared.outcomes.len == 0 or prepared.outcomes.len > 16) return error.InvalidDetection;
                 for (prepared.outcomes) |value| try value.validate(outcome.?);
@@ -429,7 +443,33 @@ pub const Processor = struct {
         if (detected) |value| self.stageDetection(value.kind, paused_veto);
         if (detections) |values| for (values) |value| self.stageDetection(value.kind, paused_veto);
         self.stage(counters, false, replaced_count);
-        return .{ .checkpoint = &self.staged_bytes, .disposition = if (outcome) |value| value.disposition() else "source-checkpoint", .native_time = outcome, .zone_provenance = zone_provenance, .effects_clock = if (self.retry_policy != null and self.retry_policy.?.enforce and !self.retry_enforcement_suppressed and processing_us != null) .{ .prepared_us = processing_us.?, .read = commitClock, .context = self } else null, .native_detection = detected, .native_detections = detections, .consumers = consumer_batch, .consumer_manifest = consumer_manifest, .native_retry = if (self.retry_policy) |value| .{ .generation = self.generation, .policy = value, .processing_us = processing_us, .suppress_enforcement = self.retry_enforcement_suppressed, .decay = self.retry_decay } else null, .retry_suspended = paused_veto, .retry_evidence = retry_evidence, .context = self, .publish = publish, .release = release };
+        return .{
+            .checkpoint = &self.staged_bytes,
+            .disposition = if (outcome) |value| value.disposition() else "source-checkpoint",
+            .native_time = outcome,
+            .zone_provenance = zone_provenance,
+            .effects_clock = if (self.retry_policy != null and self.retry_policy.?.enforce and !self.retry_enforcement_suppressed and processing_us != null) .{
+                .prepared_us = processing_us.?,
+                .read = commitClock,
+                .context = self,
+            } else null,
+            .native_detection = detected,
+            .native_detections = detections,
+            .consumers = consumer_batch,
+            .consumer_manifest = consumer_manifest,
+            .native_retry = if (self.retry_policy) |value| .{
+                .generation = self.generation,
+                .policy = value,
+                .processing_us = processing_us,
+                .suppress_enforcement = self.retry_enforcement_suppressed,
+                .decay = self.retry_decay,
+            } else null,
+            .retry_suspended = paused_veto,
+            .retry_evidence = retry_evidence,
+            .context = self,
+            .publish = publish,
+            .release = release,
+        };
     }
     fn commitClock(context: ?*anyopaque) i64 {
         const self: *Processor = @ptrCast(@alignCast(context.?));

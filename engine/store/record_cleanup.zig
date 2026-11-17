@@ -87,7 +87,14 @@ pub fn Methods(comptime Store: type) type {
             if (receipt != null) {
                 if (!std.mem.eql(u8, &try Store.effectBlob(row, 4, 32), &generation)) return error.InvalidMaintenanceState;
             } else if (row.store.api.column_type(row.ptr, 4) != 5) return error.InvalidMaintenanceState;
-            const id = ReceiptIdentity{ .jail = jail, .source = source, .generation = generation, .occurrence = try row.boundedBytes(0, 16384), .raw_hash = try Store.effectBlob(row, 1, 32), .cursor = try row.boundedBytes(2, Limits.cursor_bytes) };
+            const id = ReceiptIdentity{
+                .jail = jail,
+                .source = source,
+                .generation = generation,
+                .occurrence = try row.boundedBytes(0, 16384),
+                .raw_hash = try Store.effectBlob(row, 1, 32),
+                .cursor = try row.boundedBytes(2, Limits.cursor_bytes),
+            };
             try Store.validateReceiptIdentity(id);
             return id;
         }
@@ -302,7 +309,10 @@ pub fn Methods(comptime Store: type) type {
                     source = try copyColumn(&row, 2, &source_buffer);
                     occurrence = try copyColumn(&row, 3, &occurrence_buffer);
                     held = try internalHeld(retention, source, try row.boundedBytes(4, Limits.cursor_bytes));
-                    if (try row.optionalSigned(6)) |sequence| order = .{ .generation = try Store.effectBlob(&row, 5, 32), .sequence = std.math.cast(u64, sequence) orelse return error.InvalidMaintenanceState };
+                    if (try row.optionalSigned(6)) |sequence| order = .{
+                        .generation = try Store.effectBlob(&row, 5, 32),
+                        .sequence = std.math.cast(u64, sequence) orelse return error.InvalidMaintenanceState,
+                    };
                 }
                 if (order) |sequenced| {
                     const state = try self.sourceMaintenance(jail, source, sequenced.generation) orelse return error.InvalidMaintenanceState;

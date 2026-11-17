@@ -7,10 +7,105 @@ const tracy = @import("tracy.zig");
 
 pub const banner = "DIAGNOSTIC BUILD — not for production";
 
-pub const Section = enum { journal, file, dump, compare, expiry, commit, wal, publish, fsync, readback, dispatch, reload, select, owners, history, maintenance, events, spent_prune, obsolete_reclaim, capacity_count, tally_check };
-pub const Counter = enum { wakes, spawns, dump_messages, dump_elements, readbacks, journal_records, file_records, ingest_full_bursts, write_commits, commit_rows, consistency_checks, consistency_skipped, events_received, events_applied, events_dropped, acknowledged_batches, statement_prepares, statement_cache_bypasses, prune_yields, reclaim_pages, reclaim_passes, expiries_prepared, expiries_settled, expiry_prepare_selected, expiry_remove_selected, expiry_settle_selected, expiry_readback_selected, history_pages, history_groups, history_yields, retry_projection_pages, retry_projection_pending, retry_live_reads, owner_full_pages, owner_scope_reads, record_cleanup_groups, coupled_cleanup_groups, history_cleanup_groups, retired_zero_rows };
-pub const Gauge = enum { readback_late_ms, wal_bytes, rss_bytes, startup_ready_ms, ingest_backlog_bytes, commit_rows_last, prune_batch, expiry_due, expiry_removal_pending, expiry_settle_ready, expiry_readback_blocked, live_pending, withdraw_wait_reason, retry_projection_pending_state };
-pub const Limit = enum { live_bans, banned_subjects, retry_rows, effect_owners, effects, owner_revisions, intents, observations, action_targets, confirmed_events, event_details, pending_receipts, state_pages, sqlite_heap, kernel_elements, memory_plan, fds };
+pub const Section = enum {
+    journal,
+    file,
+    dump,
+    compare,
+    expiry,
+    commit,
+    wal,
+    publish,
+    fsync,
+    readback,
+    dispatch,
+    reload,
+    select,
+    owners,
+    history,
+    maintenance,
+    events,
+    spent_prune,
+    obsolete_reclaim,
+    capacity_count,
+    tally_check,
+};
+pub const Counter = enum {
+    wakes,
+    spawns,
+    dump_messages,
+    dump_elements,
+    readbacks,
+    journal_records,
+    file_records,
+    ingest_full_bursts,
+    write_commits,
+    commit_rows,
+    consistency_checks,
+    consistency_skipped,
+    events_received,
+    events_applied,
+    events_dropped,
+    acknowledged_batches,
+    statement_prepares,
+    statement_cache_bypasses,
+    prune_yields,
+    reclaim_pages,
+    reclaim_passes,
+    expiries_prepared,
+    expiries_settled,
+    expiry_prepare_selected,
+    expiry_remove_selected,
+    expiry_settle_selected,
+    expiry_readback_selected,
+    history_pages,
+    history_groups,
+    history_yields,
+    retry_projection_pages,
+    retry_projection_pending,
+    retry_live_reads,
+    owner_full_pages,
+    owner_scope_reads,
+    record_cleanup_groups,
+    coupled_cleanup_groups,
+    history_cleanup_groups,
+    retired_zero_rows,
+};
+pub const Gauge = enum {
+    readback_late_ms,
+    wal_bytes,
+    rss_bytes,
+    startup_ready_ms,
+    ingest_backlog_bytes,
+    commit_rows_last,
+    prune_batch,
+    expiry_due,
+    expiry_removal_pending,
+    expiry_settle_ready,
+    expiry_readback_blocked,
+    live_pending,
+    withdraw_wait_reason,
+    retry_projection_pending_state,
+};
+pub const Limit = enum {
+    live_bans,
+    banned_subjects,
+    retry_rows,
+    effect_owners,
+    effects,
+    owner_revisions,
+    intents,
+    observations,
+    action_targets,
+    confirmed_events,
+    event_details,
+    pending_receipts,
+    state_pages,
+    sqlite_heap,
+    kernel_elements,
+    memory_plan,
+    fds,
+};
 pub const Event = enum { commit_refused, source_paused, readback_stale, readback_deferred, storage_failed, continuity_loss, slow_startup, headroom_low, consistency_mismatch, events_overflowed };
 pub const EventDetail = struct {
     subject: []const u8 = "",
@@ -504,11 +599,17 @@ pub fn writeMetrics(w: anytype) !void {
             try w.print("f2z_diag_section_seconds_bucket{{section=\"{s}\",le=\"{s}\"}} {d}\n", .{ name, label, cumulative });
         }
         cumulative += totals.buckets[bucket_labels.len];
-        try w.print("f2z_diag_section_seconds_bucket{{section=\"{s}\",le=\"+Inf\"}} {d}\nf2z_diag_section_seconds_sum{{section=\"{s}\"}} {d}\nf2z_diag_section_seconds_count{{section=\"{s}\"}} {d}\n", .{ name, cumulative, name, seconds(totals.sum_ns), name, cumulative });
+        try w.print(
+            "f2z_diag_section_seconds_bucket{{section=\"{s}\",le=\"+Inf\"}} {d}\nf2z_diag_section_seconds_sum{{section=\"{s}\"}} {d}\nf2z_diag_section_seconds_count{{section=\"{s}\"}} {d}\n",
+            .{ name, cumulative, name, seconds(totals.sum_ns), name, cumulative },
+        );
     }
     for (snapshot.sections, snapshot.max_ns, 0..) |totals, max_ns, i| {
         const name = @tagName(@as(Section, @enumFromInt(i)));
-        try w.print("f2z_diag_section_entries_total{{section=\"{s}\"}} {d}\nf2z_diag_section_self_wall_seconds_total{{section=\"{s}\"}} {d}\nf2z_diag_section_self_cpu_seconds_total{{section=\"{s}\"}} {d}\nf2z_diag_section_max_seconds{{section=\"{s}\"}} {d}\n", .{ name, totals.entries, name, seconds(totals.wall_ns), name, seconds(totals.cpu_ns), name, seconds(max_ns) });
+        try w.print(
+            "f2z_diag_section_entries_total{{section=\"{s}\"}} {d}\nf2z_diag_section_self_wall_seconds_total{{section=\"{s}\"}} {d}\nf2z_diag_section_self_cpu_seconds_total{{section=\"{s}\"}} {d}\nf2z_diag_section_max_seconds{{section=\"{s}\"}} {d}\n",
+            .{ name, totals.entries, name, seconds(totals.wall_ns), name, seconds(totals.cpu_ns), name, seconds(max_ns) },
+        );
     }
     for (snapshot.counters, 0..) |value, i| try w.print("f2z_diag_{s}_total {d}\n", .{ @tagName(@as(Counter, @enumFromInt(i))), value });
     for (snapshot.gauges, 0..) |value, i| try w.print("f2z_diag_{s} {d}\n", .{ @tagName(@as(Gauge, @enumFromInt(i))), value });
@@ -518,7 +619,10 @@ pub fn writeMetrics(w: anytype) !void {
         try w.print("f2z_diag_limit_used{{limit=\"{s}\"}} {d}\nf2z_diag_limit_max{{limit=\"{s}\"}} {d}\nf2z_diag_limit_peak{{limit=\"{s}\"}} {d}\n", .{ name, used, name, max, name, peak });
     }
     for (snapshot.events, 0..) |value, i| try w.print("f2z_diag_events_total{{kind=\"{s}\"}} {d}\n", .{ @tagName(@as(Event, @enumFromInt(i))), value });
-    try w.print("f2z_diag_events_suppressed_total {d}\nf2z_diag_clock_failures_total {d}\nf2z_diag_journal_write_failures_total {d}\nf2z_diag_process_cpu_seconds_total {d}\nf2z_diag_worker_cpu_seconds_total {d}\n", .{ snapshot.events_suppressed, snapshot.clock_failures, snapshot.write_failures, seconds(snapshot.process_cpu_ns), seconds(snapshot.worker_cpu_ns) });
+    try w.print(
+        "f2z_diag_events_suppressed_total {d}\nf2z_diag_clock_failures_total {d}\nf2z_diag_journal_write_failures_total {d}\nf2z_diag_process_cpu_seconds_total {d}\nf2z_diag_worker_cpu_seconds_total {d}\n",
+        .{ snapshot.events_suppressed, snapshot.clock_failures, snapshot.write_failures, seconds(snapshot.process_cpu_ns), seconds(snapshot.worker_cpu_ns) },
+    );
 }
 
 fn seconds(ns: u64) f64 {

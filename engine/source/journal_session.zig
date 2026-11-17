@@ -155,7 +155,13 @@ pub const Session = struct {
         defer a.free(specification);
         var bound = options.processing;
         std.crypto.hash.sha2.Sha256.hash(specification, &bound.parent_generation, .{});
-        var processor = if (options.staged_detection) |consumer| try native.Processor.initWithStaged(a, bound, scratch, now, consumer) else try native.Processor.initWithJournalDetection(a, bound, scratch, now, options.detection);
+        var processor = if (options.staged_detection) |consumer| try native.Processor.initWithStaged(a, bound, scratch, now, consumer) else try native.Processor.initWithJournalDetection(
+            a,
+            bound,
+            scratch,
+            now,
+            options.detection,
+        );
         if (options.retry) |policy| try processor.bindRetry(policy, options.suppress_retry_enforcement, options.retry_hash);
         return processor;
     }
@@ -256,7 +262,21 @@ pub const Session = struct {
         errdefer a.free(source);
         const pending = if (self.pending_proof) |saved| try @import("file_session.zig").clonePending(a, saved) else null;
         const expected_durable = self.baseline_committed or self.expected_durable;
-        out.* = .{ .allocator = a, .generation = self.processor.generation, .jail = jail, .source = source, .pending_proof = pending, .source_repair = self.source_repair, .source_health = self.source_health, .last_error = self.last_error, .failure_diagnostic = self.failure_diagnostic, .notices = self.notices, .expected_durable = expected_durable, .initial_proposal = self.recoveryProposal(), .initial_tail_attempted = self.initial_tail_attempted };
+        out.* = .{
+            .allocator = a,
+            .generation = self.processor.generation,
+            .jail = jail,
+            .source = source,
+            .pending_proof = pending,
+            .source_repair = self.source_repair,
+            .source_health = self.source_health,
+            .last_error = self.last_error,
+            .failure_diagnostic = self.failure_diagnostic,
+            .notices = self.notices,
+            .expected_durable = expected_durable,
+            .initial_proposal = self.recoveryProposal(),
+            .initial_tail_attempted = self.initial_tail_attempted,
+        };
         return out;
     }
     fn recoveryProposal(self: *const Session) ?Position {
@@ -265,7 +285,11 @@ pub const Session = struct {
     }
     pub fn importRecovery(self: *Session, snapshot: *const RecoverySnapshot) !void {
         if (self.processor.in_flight or self.admission_phase != .positions or self.baseline_committed or self.restore_after != null or self.pending_proof != null) return error.RecoveryOutOfOrder;
-        if (!std.mem.eql(u8, &self.processor.generation, &snapshot.generation) or !std.mem.eql(u8, self.options.processing.jail, snapshot.jail) or !std.mem.eql(u8, self.options.source_id, snapshot.source)) return error.SourceGenerationMismatch;
+        if (!std.mem.eql(
+            u8,
+            &self.processor.generation,
+            &snapshot.generation,
+        ) or !std.mem.eql(u8, self.options.processing.jail, snapshot.jail) or !std.mem.eql(u8, self.options.source_id, snapshot.source)) return error.SourceGenerationMismatch;
         const pending = if (snapshot.pending_proof) |saved| try @import("file_session.zig").clonePending(self.allocator, saved) else null;
         self.pending_proof = pending;
         self.source_repair = snapshot.source_repair;
@@ -321,7 +345,10 @@ pub const Session = struct {
     fn storageFailure(self: *Session, cause: anyerror) anyerror {
         self.last_failure_domain = .storage;
         self.pipe.ready = false;
-        if (self.pipe.gate) |gate| gate.failed(cause, .{ .sqlite_code = self.pipe.store.last_error_code, .rollback_code = self.pipe.store.rollback_error_code, .reopen_required = self.pipe.store.reopen_required });
+        if (self.pipe.gate) |gate| gate.failed(
+            cause,
+            .{ .sqlite_code = self.pipe.store.last_error_code, .rollback_code = self.pipe.store.rollback_error_code, .reopen_required = self.pipe.store.reopen_required },
+        );
         return cause;
     }
     fn sourceFailure(self: *Session, cause: anyerror) anyerror {
@@ -406,7 +433,14 @@ pub const Session = struct {
         return error.RestoreRequired;
     }
     fn checkCandidate(candidate: records.Record, identity: durable.ReceiptIdentity) !void {
-        if (candidate.kind != .data or !identity.sameRecord(.{ .jail = identity.jail, .source = candidate.source, .occurrence = candidate.occurrence, .cursor = candidate.cursor, .raw_hash = candidate.raw_hash, .generation = identity.generation })) return error.PendingRecordMismatch;
+        if (candidate.kind != .data or !identity.sameRecord(.{
+            .jail = identity.jail,
+            .source = candidate.source,
+            .occurrence = candidate.occurrence,
+            .cursor = candidate.cursor,
+            .raw_hash = candidate.raw_hash,
+            .generation = identity.generation,
+        })) return error.PendingRecordMismatch;
     }
     fn verifyTurn(self: *Session) !void {
         try self.sourceIoAdmission();
@@ -597,7 +631,16 @@ pub const Session = struct {
         cursor.* = proposed.encode();
         @memcpy(occurrence[0..6], "entry:");
         @memcpy(occurrence[6..][0..entry.cursor.len], entry.cursor);
-        return .{ .source = self.options.source_id, .occurrence = occurrence[0 .. 6 + entry.cursor.len], .cursor = cursor, .message = entry.message, .raw_hash = entry.raw_hash, .timestamp_us = entry.realtime_us, .journal_monotonic_us = entry.monotonic_us, .journal_fields = entry.fields };
+        return .{
+            .source = self.options.source_id,
+            .occurrence = occurrence[0 .. 6 + entry.cursor.len],
+            .cursor = cursor,
+            .message = entry.message,
+            .raw_hash = entry.raw_hash,
+            .timestamp_us = entry.realtime_us,
+            .journal_monotonic_us = entry.monotonic_us,
+            .journal_fields = entry.fields,
+        };
     }
     fn restorePending(identity: durable.ReceiptIdentity, _: time.Timestamp, context: ?*anyopaque) !void {
         const self: *Session = @ptrCast(@alignCast(context.?));
@@ -644,7 +687,10 @@ pub const Session = struct {
         return self.nowMs();
     }
     fn reportNotices(self: *Session) void {
-        if (self.processor.timeNotice(self.nowMs())) |notice| std.log.scoped(.source_time).warn("jail {s}: rejected journal timestamps: missing={d}, malformed={d}, future={d}", .{ self.pipe.jail, notice.missing_since_notice, notice.malformed_since_notice, notice.future_since_notice });
+        if (self.processor.timeNotice(self.nowMs())) |notice| std.log.scoped(.source_time).warn(
+            "jail {s}: rejected journal timestamps: missing={d}, malformed={d}, future={d}",
+            .{ self.pipe.jail, notice.missing_since_notice, notice.malformed_since_notice, notice.future_since_notice },
+        );
     }
     fn pollAdmitted(self: *Session, budget: usize, committing: *bool) !usize {
         if (budget == 0 or budget > self.options.journal.batch_records) return error.InvalidPollBudget;

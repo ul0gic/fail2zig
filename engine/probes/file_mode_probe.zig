@@ -57,7 +57,11 @@ pub fn main() !void {
         capture.events.clearRetainingCapacity();
         const before = source.in_operation;
         while (try source.poll(Capture.ack, &capture)) {}
-        try std.json.stringify(.{ .stage = if (step == 0) "first" else "append", .before = before, .after = source.in_operation, .position = source.committed.?.offset, .events = capture.events.items }, .{}, out);
+        try std.json.stringify(
+            .{ .stage = if (step == 0) "first" else "append", .before = before, .after = source.in_operation, .position = source.committed.?.offset, .events = capture.events.items },
+            .{},
+            out,
+        );
     }
     try out.writeByte(']');
 }

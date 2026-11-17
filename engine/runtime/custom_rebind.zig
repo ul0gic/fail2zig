@@ -294,10 +294,22 @@ pub const Source = struct {
             if (value.revision == 0 or value.format_version != rule.version) return error.CustomLegacyIdentityMismatch;
             const payload = value.payload.?;
             try rule.Consumer.rebindCheckpoint(program, jail, key.source, target.old_parent, target.new_parent, resolver != null, payload, &self.payloads[i]);
-            self.changes[i] = .{ .old_key = self.old_requirements[i].key, .new_key = self.new_requirements[i].key, .old_format = rule.version, .new_format = rule.version, .revision = value.revision, .old_payload_sha256 = digest(payload), .new_payload = &self.payloads[i], .valid_until_us = value.valid_until_us };
+            self.changes[i] = .{
+                .old_key = self.old_requirements[i].key,
+                .new_key = self.new_requirements[i].key,
+                .old_format = rule.version,
+                .new_format = rule.version,
+                .revision = value.revision,
+                .old_payload_sha256 = digest(payload),
+                .new_payload = &self.payloads[i],
+                .valid_until_us = value.valid_until_us,
+            };
         }
         const policy = saved.states[n];
-        if (policy.format_version != 1 or policy.revision != target.old_ignore_revision or policy.valid_until_us != null or !equal(digest(policy.payload.?), target.old_ignore_sha256)) return error.CustomLegacyIdentityMismatch;
+        if (policy.format_version != 1 or policy.revision != target.old_ignore_revision or policy.valid_until_us != null or !equal(
+            digest(policy.payload.?),
+            target.old_ignore_sha256,
+        )) return error.CustomLegacyIdentityMismatch;
         var options = assets.ignore_options;
         options.parent_generation = target.old_parent;
         // Why: Restoring the stored ignore payload refuses one that no longer decodes before this source is rebound.
@@ -305,7 +317,11 @@ pub const Source = struct {
         restored.destroy();
         if (resolver) |generation| {
             const authority = saved.states[n + 1];
-            if (authority.format_version != 1 or authority.revision != 1 or authority.valid_until_us != null or !std.mem.eql(u8, authority.payload.?, &generation)) return error.CustomLegacyIdentityMismatch;
+            if (authority.format_version != 1 or authority.revision != 1 or authority.valid_until_us != null or !std.mem.eql(
+                u8,
+                authority.payload.?,
+                &generation,
+            )) return error.CustomLegacyIdentityMismatch;
         }
         self.update = .{ .old_manifest = old_manifest, .new_manifest = next_manifest, .status = saved.status, .expected_consumer_revision = saved.revision, .checkpoints = self.changes[0..n] };
         return self;

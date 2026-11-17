@@ -140,7 +140,14 @@ pub fn Methods(comptime Coordinator: type) type {
             count: usize,
         };
         fn captureFence(self: *const Coordinator) !CaptureFence {
-            var result = CaptureFence{ .generation = self.published_generation, .epoch = self.owner_read_epoch, .mark = self.published_owners_mark, .health_generation = self.published_health.generation, .pending = self.owner_publication_pending, .count = self.jails.len };
+            var result = CaptureFence{
+                .generation = self.published_generation,
+                .epoch = self.owner_read_epoch,
+                .mark = self.published_owners_mark,
+                .health_generation = self.published_health.generation,
+                .pending = self.owner_publication_pending,
+                .count = self.jails.len,
+            };
             for (self.jails, 0..) |jail, i| {
                 result.names[i] = try detection.Name.init(jail.name);
                 result.retry_revisions[i] = if (self.jailEnforces(&jail)) null else jail.retry_revision;
@@ -149,7 +156,11 @@ pub fn Methods(comptime Coordinator: type) type {
             return result;
         }
         fn fenceMatches(self: *const Coordinator, fence: *const CaptureFence) bool {
-            if (!std.mem.eql(u8, &fence.generation, &self.published_generation) or fence.epoch != self.owner_read_epoch or !std.meta.eql(fence.mark, self.published_owners_mark) or fence.health_generation != self.published_health.generation or fence.pending != self.owner_publication_pending or fence.count != self.jails.len) return false;
+            if (!std.mem.eql(
+                u8,
+                &fence.generation,
+                &self.published_generation,
+            ) or fence.epoch != self.owner_read_epoch or !std.meta.eql(fence.mark, self.published_owners_mark) or fence.health_generation != self.published_health.generation or fence.pending != self.owner_publication_pending or fence.count != self.jails.len) return false;
             for (self.jails, fence.names[0..fence.count], 0..) |jail, name, i| {
                 if (!std.mem.eql(u8, jail.name, name.slice())) return false;
                 if (!self.jailEnforces(&jail) and (jail.retry_revision != fence.retry_revisions[i] or jail.active.len != fence.active_counts[i])) return false;
@@ -167,7 +178,14 @@ pub fn Methods(comptime Coordinator: type) type {
         const observationSound = Coordinator.observationSound;
         const redacted_text = "<redacted>";
         pub fn lossJson(event: files.LossEvent) LossJson {
-            return .{ .sequence = event.sequence, .wall_us = event.wall_us, .reason = @tagName(event.reason), .inode = event.inode, .committed_offset = event.committed_offset, .observed_size = event.observed_size };
+            return .{
+                .sequence = event.sequence,
+                .wall_us = event.wall_us,
+                .reason = @tagName(event.reason),
+                .inode = event.inode,
+                .committed_offset = event.committed_offset,
+                .observed_size = event.observed_size,
+            };
         }
         fn captureSources(self: *const Coordinator, memory: *CaptureMemory, redact: bool) ![]SourceJson {
             var count: usize = 0;
@@ -276,7 +294,60 @@ pub fn Methods(comptime Coordinator: type) type {
                 generation_hex = std.fmt.bytesToHex(self.published_generation, .lower);
                 const effect_diagnostic = if (self.published_effects) |effects| effects.diagnostic else null;
                 const none_cause: []const u8 = if (paused_sources != 0 and unpaused_unhealthy == 0) "SourcePaused" else blocked_source orelse source_cause orelse "none";
-                break :blk .{ .payload = .{ .version = version, .runtime = "native", .generation = &generation_hex, .mutation_revision = self.published_revision, .state = protection, .protection = protection, .protection_cause = if (self.backend_failure) |failure| @as(?[]const u8, @errorName(failure)) else null, .active_bans = active_bans, .total_bans = self.published_confirmations, .knowledge = if (known) |k| @as(?[]const u8, @tagName(k)) else null, .confirmed_at_us = if (known != null and known.? != .none) self.published_view.readback_wall_us else null, .knowledge_age_ms = if (known != null and known.? != .none) self.knowledgeAgeMs(effect_ms) else null, .pending_bans = if (known != null) @as(?u64, self.published_view.pending) else null, .oldest_pending_ms = if (known != null) ageMs(now, self.published_view.oldest_pending_us) else null, .overdue_removals = if (known != null) @as(?u64, self.published_view.overdue_blocking) else null, .oldest_overdue_ms = if (known != null) ageMs(now, self.published_view.oldest_overdue_blocking_us) else null, .overdue_bookkeeping = if (known != null) @as(?u64, self.published_view.overdue -| self.published_view.overdue_blocking) else null, .dump_interrupted = if (known != null) @as(?u64, self.published_view.dump_interrupted) else null, .storage = @tagName(gate.phase), .cause = if (gate.phase == .intervention and gate.last_failure != null) @errorName(gate.last_failure.?.cause) else if (observation.clock_uncertain) "ClockUncertain" else if (observation.stalled) "WorkerStalled" else if (withdrawn) "FirewallWithdrawn" else if (known != null and known.? == .none and knowledge_cause != null) knowledge_cause.? else if (self.overBlocking()) "EffectRemovalOverdue" else if (knowledge_cause) |cause| cause else if (gate.last_failure) |failure| @errorName(failure.cause) else if (self.published_effects) |effects| if (effects.cause) |cause| @errorName(cause) else none_cause else if (self.backend_failure) |failure| @errorName(failure) else none_cause, .sqlite_code = if (gate.last_failure) |failure| failure.diagnostics.sqlite_code else null, .next_retry_ms = gate.next_retry_ms, .committed_records = gate.committed_records, .decisions_total = decisions, .jails_active = self.jails.len, .unhealthy_sources = unhealthy_sources, .missing_sources = if (missing_known) @as(?u32, missing_sources) else null, .backend = self.published_backend, .effect_backend = if (effect_diagnostic) |detail| @as(?[]const u8, @tagName(detail.backend)) else null, .effect_stage = if (effect_diagnostic) |detail| @as(?[]const u8, @tagName(detail.stage)) else null, .effect_cause = if (effect_diagnostic) |detail| @as(?[]const u8, @errorName(detail.cause)) else null, .effect_mutation = if (effect_diagnostic) |detail| @as(?[]const u8, @tagName(detail.mutation)) else null, .effects_uncertain = observation.expiry_uncertain or (if (self.published_effects) |effects| effects.uncertain else false), .overdue_effects = if (self.published_effects) |effects| effects.overdue else 0, .worker_busy = observation.busy, .worker_stalled = observation.stalled, .worker_busy_age_ms = observation.busy_age_ms, .worker_heartbeat_age_ms = observation.heartbeat_age_ms, .clock_uncertain = observation.clock_uncertain, .expiry_overdue = observation.expiry_overdue, .expiry_uncertain = observation.expiry_uncertain, .next_committed_expiry_us = observation.next_committed_expiry_us, .memory_admission_bytes = self.resources.snapshot().used_bytes, .uptime_seconds = if (observation.clock_uncertain) @as(?u64, null) else @as(u64, @intCast(@max(0, @divTrunc(now -| self.start_us, 1_000_000)))) }, .paused = paused_sources, .waiting_sources = waiting_sources, .intake_waiting = self.published_intake_waiting, .footprint = self.published_footprint, .pool = self.published_pool, .sources = try self.captureSources(&memory, redact) };
+                break :blk .{
+                    .payload = .{
+                        .version = version,
+                        .runtime = "native",
+                        .generation = &generation_hex,
+                        .mutation_revision = self.published_revision,
+                        .state = protection,
+                        .protection = protection,
+                        .protection_cause = if (self.backend_failure) |failure| @as(?[]const u8, @errorName(failure)) else null,
+                        .active_bans = active_bans,
+                        .total_bans = self.published_confirmations,
+                        .knowledge = if (known) |k| @as(?[]const u8, @tagName(k)) else null,
+                        .confirmed_at_us = if (known != null and known.? != .none) self.published_view.readback_wall_us else null,
+                        .knowledge_age_ms = if (known != null and known.? != .none) self.knowledgeAgeMs(effect_ms) else null,
+                        .pending_bans = if (known != null) @as(?u64, self.published_view.pending) else null,
+                        .oldest_pending_ms = if (known != null) ageMs(now, self.published_view.oldest_pending_us) else null,
+                        .overdue_removals = if (known != null) @as(?u64, self.published_view.overdue_blocking) else null,
+                        .oldest_overdue_ms = if (known != null) ageMs(now, self.published_view.oldest_overdue_blocking_us) else null,
+                        .overdue_bookkeeping = if (known != null) @as(?u64, self.published_view.overdue -| self.published_view.overdue_blocking) else null,
+                        .dump_interrupted = if (known != null) @as(?u64, self.published_view.dump_interrupted) else null,
+                        .storage = @tagName(gate.phase),
+                        .cause = if (gate.phase == .intervention and gate.last_failure != null) @errorName(gate.last_failure.?.cause) else if (observation.clock_uncertain) "ClockUncertain" else if (observation.stalled) "WorkerStalled" else if (withdrawn) "FirewallWithdrawn" else if (known != null and known.? == .none and knowledge_cause != null) knowledge_cause.? else if (self.overBlocking()) "EffectRemovalOverdue" else if (knowledge_cause) |cause| cause else if (gate.last_failure) |failure| @errorName(failure.cause) else if (self.published_effects) |effects| if (effects.cause) |cause| @errorName(cause) else none_cause else if (self.backend_failure) |failure| @errorName(failure) else none_cause,
+                        .sqlite_code = if (gate.last_failure) |failure| failure.diagnostics.sqlite_code else null,
+                        .next_retry_ms = gate.next_retry_ms,
+                        .committed_records = gate.committed_records,
+                        .decisions_total = decisions,
+                        .jails_active = self.jails.len,
+                        .unhealthy_sources = unhealthy_sources,
+                        .missing_sources = if (missing_known) @as(?u32, missing_sources) else null,
+                        .backend = self.published_backend,
+                        .effect_backend = if (effect_diagnostic) |detail| @as(?[]const u8, @tagName(detail.backend)) else null,
+                        .effect_stage = if (effect_diagnostic) |detail| @as(?[]const u8, @tagName(detail.stage)) else null,
+                        .effect_cause = if (effect_diagnostic) |detail| @as(?[]const u8, @errorName(detail.cause)) else null,
+                        .effect_mutation = if (effect_diagnostic) |detail| @as(?[]const u8, @tagName(detail.mutation)) else null,
+                        .effects_uncertain = observation.expiry_uncertain or (if (self.published_effects) |effects| effects.uncertain else false),
+                        .overdue_effects = if (self.published_effects) |effects| effects.overdue else 0,
+                        .worker_busy = observation.busy,
+                        .worker_stalled = observation.stalled,
+                        .worker_busy_age_ms = observation.busy_age_ms,
+                        .worker_heartbeat_age_ms = observation.heartbeat_age_ms,
+                        .clock_uncertain = observation.clock_uncertain,
+                        .expiry_overdue = observation.expiry_overdue,
+                        .expiry_uncertain = observation.expiry_uncertain,
+                        .next_committed_expiry_us = observation.next_committed_expiry_us,
+                        .memory_admission_bytes = self.resources.snapshot().used_bytes,
+                        .uptime_seconds = if (observation.clock_uncertain) @as(?u64, null) else @as(u64, @intCast(@max(0, @divTrunc(now -| self.start_us, 1_000_000)))),
+                    },
+                    .paused = paused_sources,
+                    .waiting_sources = waiting_sources,
+                    .intake_waiting = self.published_intake_waiting,
+                    .footprint = self.published_footprint,
+                    .pool = self.published_pool,
+                    .sources = try self.captureSources(&memory, redact),
+                };
             };
             var sink = query_v1.ByteSink{ .out = out, .allocator = a, .limit = limit };
             const writer = sink.writer();
@@ -286,7 +357,10 @@ pub fn Methods(comptime Coordinator: type) type {
             out.items.len -= 1;
             try writer.print(",\"paused_sources\":{d}", .{captured.paused});
             if (captured.footprint) |footprint| {
-                try writer.print(",\"state_file_bytes\":{d},\"state_file_pages\":{d},\"state_file_max_pages\":{d},\"state_file_used_pages\":{d},\"state_file_capacity_pages\":{d},\"state_file_owed_pages\":", .{ footprint.bytes, footprint.pages, footprint.max_pages, footprint.used_pages, footprint.capacity_pages });
+                try writer.print(
+                    ",\"state_file_bytes\":{d},\"state_file_pages\":{d},\"state_file_max_pages\":{d},\"state_file_used_pages\":{d},\"state_file_capacity_pages\":{d},\"state_file_owed_pages\":",
+                    .{ footprint.bytes, footprint.pages, footprint.max_pages, footprint.used_pages, footprint.capacity_pages },
+                );
                 try std.json.stringify(footprint.owed_pages, .{}, writer);
             }
             try writer.print(",\"intake\":\"{s}\",\"intake_cause\":", .{if (captured.intake_waiting) "waiting" else "open"});
@@ -379,7 +453,20 @@ pub fn Methods(comptime Coordinator: type) type {
                         const range = jail.owner_range;
                         for (self.owner_active[range.start..][0..range.len], self.owner_confirmed[range.start..][0..range.len]) |owner, confirmed| {
                             if (!observation.clock_uncertain and sampled_wall != null and !owner.lease.live(now)) continue;
-                            try appendLegacy(items, &count, .{ .scope = owner.scope.canonical, .jail_slot = @intCast(slot), .origin = owner.origin, .expiry_us = if (owner.lease == .finite) owner.lease.finite else null, .permanent = owner.lease == .permanent, .ordinal = owner.ordinal, .confirmed = confirmed and known, .expired = false });
+                            try appendLegacy(
+                                items,
+                                &count,
+                                .{
+                                    .scope = owner.scope.canonical,
+                                    .jail_slot = @intCast(slot),
+                                    .origin = owner.origin,
+                                    .expiry_us = if (owner.lease == .finite) owner.lease.finite else null,
+                                    .permanent = owner.lease == .permanent,
+                                    .ordinal = owner.ordinal,
+                                    .confirmed = confirmed and known,
+                                    .expired = false,
+                                },
+                            );
                         }
                     } else for (jail.active) |decision| {
                         if (!observation.clock_uncertain and sampled_wall != null and !decision.lease.live(now)) continue;
@@ -387,7 +474,20 @@ pub fn Methods(comptime Coordinator: type) type {
                             .v4 => |value| .{ .ipv4 = std.mem.readInt(u32, &value, .big) },
                             .v6 => |value| .{ .ipv6 = std.mem.readInt(u128, &value, .big) },
                         };
-                        try appendLegacy(items, &count, .{ .scope = .{ .subject = inspection.canonical_scope.Subject.host(address) }, .jail_slot = @intCast(slot), .origin = .detection, .expiry_us = if (decision.lease == .finite) decision.lease.finite else null, .permanent = decision.lease == .permanent, .ordinal = decision.ordinal, .confirmed = false, .expired = false });
+                        try appendLegacy(
+                            items,
+                            &count,
+                            .{
+                                .scope = .{ .subject = inspection.canonical_scope.Subject.host(address) },
+                                .jail_slot = @intCast(slot),
+                                .origin = .detection,
+                                .expiry_us = if (decision.lease == .finite) decision.lease.finite else null,
+                                .permanent = decision.lease == .permanent,
+                                .ordinal = decision.ordinal,
+                                .confirmed = false,
+                                .expired = false,
+                            },
+                        );
                     }
                 }
             }
@@ -403,8 +503,24 @@ pub fn Methods(comptime Coordinator: type) type {
                     for (expired[0..found]) |entry| {
                         const address = entry.entry.network();
                         const bits: u8 = if (entry.entry.family == .v4) 32 else 128;
-                        const subject = if (entry.entry.prefix == bits) inspection.canonical_scope.Subject.host(address) else try inspection.canonical_scope.Subject.network(address, entry.entry.prefix);
-                        try appendLegacy(items, &count, .{ .scope = .{ .subject = subject }, .jail_slot = @intCast(slot), .origin = .config, .expiry_us = entry.expires_us, .permanent = false, .ordinal = 0, .confirmed = false, .expired = true });
+                        const subject = if (entry.entry.prefix == bits) inspection.canonical_scope.Subject.host(address) else try inspection.canonical_scope.Subject.network(
+                            address,
+                            entry.entry.prefix,
+                        );
+                        try appendLegacy(
+                            items,
+                            &count,
+                            .{
+                                .scope = .{ .subject = subject },
+                                .jail_slot = @intCast(slot),
+                                .origin = .config,
+                                .expiry_us = entry.expires_us,
+                                .permanent = false,
+                                .ordinal = 0,
+                                .confirmed = false,
+                                .expired = true,
+                            },
+                        );
                     }
                 }
                 try reader.commitTransaction();
@@ -447,7 +563,17 @@ pub fn Methods(comptime Coordinator: type) type {
             const address = expired.entry.network();
             const full: u8 = if (expired.entry.family == .v4) 32 else 128;
             const subject = if (expired.entry.prefix == full) inspection.canonical_scope.Subject.host(address) else try inspection.canonical_scope.Subject.network(address, expired.entry.prefix);
-            return .{ .scope = try query_v1.projectScope(.{ .subject = subject }), .lease = .finite, .deadline_us = expired.expires_us, .decision_id = expired.decision_id, .confirmed = false, .ban_count = 0, .key = expiredKey(index), .origin = .config, .expired = true };
+            return .{
+                .scope = try query_v1.projectScope(.{ .subject = subject }),
+                .lease = .finite,
+                .deadline_us = expired.expires_us,
+                .decision_id = expired.decision_id,
+                .confirmed = false,
+                .ban_count = 0,
+                .key = expiredKey(index),
+                .origin = .config,
+                .expired = true,
+            };
         }
         pub fn metrics(ctx: ?*anyopaque, out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator) !void {
             const self: *Coordinator = @ptrCast(@alignCast(ctx.?));
@@ -456,7 +582,17 @@ pub fn Methods(comptime Coordinator: type) type {
                 defer self.mutex.unlock();
                 const observation = self.observedWorker();
                 var snapshot = self.metrics_state.snapshot();
-                snapshot.native = .{ .storage_healthy = self.published_health.phase == .healthy and observationSound(observation), .committed_records = self.published_health.committed_records, .worker_stalled = observation.stalled, .worker_busy = observation.busy, .worker_heartbeat_age_ms = observation.heartbeat_age_ms, .worker_busy_age_ms = observation.busy_age_ms, .clock_uncertain = observation.clock_uncertain, .expiry_overdue = observation.expiry_overdue, .expiry_uncertain = observation.expiry_uncertain };
+                snapshot.native = .{
+                    .storage_healthy = self.published_health.phase == .healthy and observationSound(observation),
+                    .committed_records = self.published_health.committed_records,
+                    .worker_stalled = observation.stalled,
+                    .worker_busy = observation.busy,
+                    .worker_heartbeat_age_ms = observation.heartbeat_age_ms,
+                    .worker_busy_age_ms = observation.busy_age_ms,
+                    .clock_uncertain = observation.clock_uncertain,
+                    .expiry_overdue = observation.expiry_overdue,
+                    .expiry_uncertain = observation.expiry_uncertain,
+                };
                 snapshot.pool_sample_available = self.published_pool.sample != null;
                 snapshot.pool_sample_pending = self.published_pool.pending;
                 snapshot.pool_sample_as_of_us = if (self.published_pool.sample) |sample| sample.as_of_us else null;
@@ -742,7 +878,17 @@ pub fn Methods(comptime Coordinator: type) type {
                 if (literals.len > custom_ignore.max_entries) return error.IgnoreLimit;
                 for (literals) |literal| if (literal.len > 254) return error.InvalidIgnoreEntry;
             }
-            return .{ .name = try memory.text(name), .enabled = if (runtime) |jail| jail.admin_enabled else false, .ignore_file = if (cfg) |value| (if (value.ignore_file) |path| try memory.text(path) else null) else null, .items = items, .hostnames = hostnames, .custom = custom, .literals = if (items == null) try memory.texts(literals) else &.{}, .ignoretime_s = if (resolved) |value| value.ignoretime_s else null, .ignoreself = resolved != null and resolved.?.ignoreself };
+            return .{
+                .name = try memory.text(name),
+                .enabled = if (runtime) |jail| jail.admin_enabled else false,
+                .ignore_file = if (cfg) |value| (if (value.ignore_file) |path| try memory.text(path) else null) else null,
+                .items = items,
+                .hostnames = hostnames,
+                .custom = custom,
+                .literals = if (items == null) try memory.texts(literals) else &.{},
+                .ignoretime_s = if (resolved) |value| value.ignoretime_s else null,
+                .ignoreself = resolved != null and resolved.?.ignoreself,
+            };
         }
         pub fn ignoreRender(ctx: ?*anyopaque, arena: std.mem.Allocator, jail_filter: ?[]const u8, redact: bool, out: *query_v1.JsonStream) anyerror!void {
             const self: *Coordinator = @ptrCast(@alignCast(ctx.?));
@@ -809,7 +955,18 @@ pub fn Methods(comptime Coordinator: type) type {
                     continue;
                 }
                 var hostnames: []const []const u8 = &.{};
-                const items: []const ignore_set.Item = if (jail.items) |values| values else try configuredIgnoreItems(memory.fixed.allocator(), reader, jail.name, jail.literals, if (fallback) filtered[0..filtered_count] else &.{}, if (fallback) &.{} else own, jail.ignoretime_s, jail.ignoreself, now, &hostnames);
+                const items: []const ignore_set.Item = if (jail.items) |values| values else try configuredIgnoreItems(
+                    memory.fixed.allocator(),
+                    reader,
+                    jail.name,
+                    jail.literals,
+                    if (fallback) filtered[0..filtered_count] else &.{},
+                    if (fallback) &.{} else own,
+                    jail.ignoretime_s,
+                    jail.ignoreself,
+                    now,
+                    &hostnames,
+                );
                 view.* = .{ .items = items, .hostnames = hostnames };
             }
             try reader.commitTransaction();
@@ -818,7 +975,17 @@ pub fn Methods(comptime Coordinator: type) type {
             try out.write(ignore_set.distinct_bound);
             try out.objectField("jails");
             try out.beginArray();
-            for (captures[0..count], built) |jail, view| try writeIgnoreJail(out, jail.name, jail.enabled, jail.ignore_file, view.items, view.hostnames, if (jail.custom) custom_ignore.max_entries else null, redact, now);
+            for (captures[0..count], built) |jail, view| try writeIgnoreJail(
+                out,
+                jail.name,
+                jail.enabled,
+                jail.ignore_file,
+                view.items,
+                view.hostnames,
+                if (jail.custom) custom_ignore.max_entries else null,
+                redact,
+                now,
+            );
             try out.endArray();
             try out.objectField("unconfigured");
             try out.beginArray();
@@ -886,7 +1053,17 @@ pub fn Methods(comptime Coordinator: type) type {
             var lines: [history.max_page]?[]u8 = undefined;
             try reader.retainedMatchesForEventsTx(memory.fixed.allocator(), installation, events, lines[0..events.len]);
             for (events, lines[0..events.len]) |event, line| {
-                try out.append(.{ .sequence = event.sequence, .event_id = event.event_id, .jail = try memory.text(event.jail.slice()), .decision_id = event.decision_id, .confirmed_us = event.confirmed_us, .scope = try query_v1.projectScope(event.scope.canonical), .native_retry = event.native_retry, .origin = event.origin, .match = line });
+                try out.append(.{
+                    .sequence = event.sequence,
+                    .event_id = event.event_id,
+                    .jail = try memory.text(event.jail.slice()),
+                    .decision_id = event.decision_id,
+                    .confirmed_us = event.confirmed_us,
+                    .scope = try query_v1.projectScope(event.scope.canonical),
+                    .native_retry = event.native_retry,
+                    .origin = event.origin,
+                    .match = line,
+                });
             }
         }
         // Why: A jail filter can skip every event, so one page scans at most 16 store pages and returns where to resume.
@@ -906,7 +1083,16 @@ pub fn Methods(comptime Coordinator: type) type {
                     if (appended == limit) return .{ .more = true, .resume_after = after };
                     after = event.sequence;
                     if (jail) |wanted| if (!std.mem.eql(u8, wanted, event.jail.slice())) continue;
-                    try out.append(.{ .sequence = event.sequence, .event_id = event.event_id, .jail = try out.allocator.dupe(u8, event.jail.slice()), .decision_id = event.decision_id, .confirmed_us = event.confirmed_us, .scope = try query_v1.projectScope(event.scope.canonical), .native_retry = event.native_retry, .origin = event.origin });
+                    try out.append(.{
+                        .sequence = event.sequence,
+                        .event_id = event.event_id,
+                        .jail = try out.allocator.dupe(u8, event.jail.slice()),
+                        .decision_id = event.decision_id,
+                        .confirmed_us = event.confirmed_us,
+                        .scope = try query_v1.projectScope(event.scope.canonical),
+                        .native_retry = event.native_retry,
+                        .origin = event.origin,
+                    });
                     appended += 1;
                 }
                 if (!page.more) return .{ .more = false, .resume_after = after };
@@ -956,9 +1142,40 @@ pub fn Methods(comptime Coordinator: type) type {
                 for (paths, owned_paths) |value, *owned| owned.* = if (redact) redacted_text else try memory.text(value);
                 const owned_ignores = try memory.fixed.allocator().alloc([]const u8, ignores.len);
                 for (ignores, owned_ignores) |value, *owned| owned.* = if (redact) redacted_text else try memory.text(value);
-                row.* = .{ .name = try memory.text(jail.name), .enabled = jail.admin_enabled, .filter = try memory.text(if (source) |value| value.filter else ""), .source = @tagName(jail.plan), .logpath = owned_paths, .maxretry = jail.policy.maxretry, .findtime = @intCast(@divTrunc(jail.policy.window_us, 1_000_000)), .bantime = if (jail.policy.duration == .finite_us) @intCast(@divTrunc(jail.policy.duration.finite_us, 1_000_000)) else 0, .bantime_permanent = jail.policy.duration == .permanent, .banaction = if (self.jailEnforces(&jail)) self.published_backend else "log-only", .ignoreip = owned_ignores, .history_max_matches = @min(cfg.global.history_max_matches, if (source) |value| value.history_max_matches orelse cfg.global.history_max_matches else cfg.global.history_max_matches), .history_max_matches_inherited = if (source) |value| value.history_max_matches == null else true };
+                row.* = .{
+                    .name = try memory.text(jail.name),
+                    .enabled = jail.admin_enabled,
+                    .filter = try memory.text(if (source) |value| value.filter else ""),
+                    .source = @tagName(jail.plan),
+                    .logpath = owned_paths,
+                    .maxretry = jail.policy.maxretry,
+                    .findtime = @intCast(@divTrunc(jail.policy.window_us, 1_000_000)),
+                    .bantime = if (jail.policy.duration == .finite_us) @intCast(@divTrunc(jail.policy.duration.finite_us, 1_000_000)) else 0,
+                    .bantime_permanent = jail.policy.duration == .permanent,
+                    .banaction = if (self.jailEnforces(&jail)) self.published_backend else "log-only",
+                    .ignoreip = owned_ignores,
+                    .history_max_matches = @min(
+                        cfg.global.history_max_matches,
+                        if (source) |value| value.history_max_matches orelse cfg.global.history_max_matches else cfg.global.history_max_matches,
+                    ),
+                    .history_max_matches_inherited = if (source) |value| value.history_max_matches == null else true,
+                };
             }
-            return .{ .jails = jails, .global = .{ .log_level = @tagName(cfg.global.log_level), .firewall = @tagName(cfg.global.firewall), .metrics_enabled = cfg.global.metrics_enabled, .metrics_bind = try memory.text(cfg.global.metrics_bind), .metrics_port = cfg.global.metrics_port, .socket_path = if (redact) redacted_text else try memory.text(cfg.global.socket_path), .state_file = if (redact) redacted_text else try memory.text(cfg.global.state_file), .dns_server = if (redact) redacted_text else if (cfg.global.dns_server) |value| try memory.text(value) else null, .timezone_root = if (redact) redacted_text else try memory.text(cfg.global.timezone_root), .history_max_matches = cfg.global.history_max_matches } };
+            return .{
+                .jails = jails,
+                .global = .{
+                    .log_level = @tagName(cfg.global.log_level),
+                    .firewall = @tagName(cfg.global.firewall),
+                    .metrics_enabled = cfg.global.metrics_enabled,
+                    .metrics_bind = try memory.text(cfg.global.metrics_bind),
+                    .metrics_port = cfg.global.metrics_port,
+                    .socket_path = if (redact) redacted_text else try memory.text(cfg.global.socket_path),
+                    .state_file = if (redact) redacted_text else try memory.text(cfg.global.state_file),
+                    .dns_server = if (redact) redacted_text else if (cfg.global.dns_server) |value| try memory.text(value) else null,
+                    .timezone_root = if (redact) redacted_text else try memory.text(cfg.global.timezone_root),
+                    .history_max_matches = cfg.global.history_max_matches,
+                },
+            };
         }
         // Holds: Every return to the mutex checks the fence first, so a page never joins rows from two publications.
         fn copyScopes(self: *Coordinator, memory: *CaptureMemory, body: []const u8, parse_arena: std.mem.Allocator, fence: *const CaptureFence) !query_v1.ScopesView {
@@ -1038,14 +1255,32 @@ pub fn Methods(comptime Coordinator: type) type {
                         for (items[0..live_take], 0..) |*item, offset| {
                             const index = range.start + start + offset;
                             const owner = self.owner_active[index];
-                            item.* = .{ .scope = try query_v1.projectScope(owner.scope.canonical), .lease = if (owner.lease == .permanent) .permanent else .finite, .deadline_us = if (owner.lease == .finite) owner.lease.finite else null, .decision_id = owner.decision_id, .confirmed = self.owner_confirmed[index] and known and owner.lease.live(now), .ban_count = owner.ordinal, .key = query_v1.ItemKey.init(&owner.key), .origin = owner.origin };
+                            item.* = .{
+                                .scope = try query_v1.projectScope(owner.scope.canonical),
+                                .lease = if (owner.lease == .permanent) .permanent else .finite,
+                                .deadline_us = if (owner.lease == .finite) owner.lease.finite else null,
+                                .decision_id = owner.decision_id,
+                                .confirmed = self.owner_confirmed[index] and known and owner.lease.live(now),
+                                .ban_count = owner.ordinal,
+                                .key = query_v1.ItemKey.init(&owner.key),
+                                .origin = owner.origin,
+                            };
                         }
                     } else for (items[0..live_take], jail.active[@min(start, live)..][0..live_take]) |*item, decision| {
                         const address: shared.IpAddress = switch (decision.subject) {
                             .v4 => |value| .{ .ipv4 = std.mem.readInt(u32, &value, .big) },
                             .v6 => |value| .{ .ipv6 = std.mem.readInt(u128, &value, .big) },
                         };
-                        item.* = .{ .scope = try query_v1.projectScope(.{ .subject = inspection.canonical_scope.Subject.host(address) }), .lease = if (decision.lease == .permanent) .permanent else .finite, .deadline_us = if (decision.lease == .finite) decision.lease.finite else null, .decision_id = null, .confirmed = false, .ban_count = decision.ordinal, .key = decisionKey(decision.subject), .origin = .detection };
+                        item.* = .{
+                            .scope = try query_v1.projectScope(.{ .subject = inspection.canonical_scope.Subject.host(address) }),
+                            .lease = if (decision.lease == .permanent) .permanent else .finite,
+                            .deadline_us = if (decision.lease == .finite) decision.lease.finite else null,
+                            .decision_id = null,
+                            .confirmed = false,
+                            .ban_count = decision.ordinal,
+                            .key = decisionKey(decision.subject),
+                            .origin = .detection,
+                        };
                     }
                     k = live_take;
                 }
@@ -1140,7 +1375,10 @@ pub fn Methods(comptime Coordinator: type) type {
             const requested_details = (requested_kind == .history or requested_kind == .scopes) and query_v1.requestedDetails(arena, body);
             const history_details = requested_kind == .history and requested_details;
             const capture_needed = requested_kind == .config or requested_kind == .scopes or history_details;
-            var memory: ?CaptureMemory = if (capture_needed) try CaptureMemory.init(a, if (requested_kind == .config) config_capture_bytes else if (history_details) history_capture_bytes else if (requested_details) scopes_detail_capture_bytes else scopes_capture_bytes) else null;
+            var memory: ?CaptureMemory = if (capture_needed) try CaptureMemory.init(
+                a,
+                if (requested_kind == .config) config_capture_bytes else if (history_details) history_capture_bytes else if (requested_details) scopes_detail_capture_bytes else scopes_capture_bytes,
+            ) else null;
             defer if (memory) |*value| value.deinit(a);
             var generation: [32]u8 = undefined;
             var config_view: ?query_v1.ConfigView = null;
@@ -1153,13 +1391,33 @@ pub fn Methods(comptime Coordinator: type) type {
                 generation = self.published_generation;
                 if (firewall_request or requested_kind == .scopes) fence = try self.captureFence();
                 if (firewall_request) {
-                    firewall_source = if (self.firewall_observation_cache) |cache| .{ .cache = .{ .ctx = cache, .read = firewallRead, .origin_ctx = self, .origin = firewallOrigin } } else .{ .unavailable = self.firewall_observation_unavailable };
+                    firewall_source = if (self.firewall_observation_cache) |cache| .{ .cache = .{
+                        .ctx = cache,
+                        .read = firewallRead,
+                        .origin_ctx = self,
+                        .origin = firewallOrigin,
+                    } } else .{ .unavailable = self.firewall_observation_unavailable };
                 } else if (requested_kind == .config) config_view = try self.copyConfig(&memory.?, peer_class == .monitor);
             }
             if (requested_kind == .scopes) scopes_view = try self.copyScopes(&memory.?, body, arena, &fence.?);
             var status_query = StatusQuery{ .coordinator = self, .redact = peer_class == .monitor };
             var history_query = HistoryQuery{ .coordinator = self, .generation = generation, .details = history_details, .memory = if (history_details) &memory.? else null };
-            const result = try query_v1.handle(a, body, peer_class, generation, .{ .status = .{ .ctx = &status_query, .stamped = true, .func = statusCallback }, .health = .{ .ctx = self, .func = healthCallback }, .config = config_view, .scopes = scopes_view, .history = .{ .ctx = &history_query, .read = historyRead }, .firewall = firewall_source, .ignore = .{ .ctx = self, .render = ignoreRender }, .continuity = .{ .ctx = self, .render = continuityRender } });
+            const result = try query_v1.handle(
+                a,
+                body,
+                peer_class,
+                generation,
+                .{
+                    .status = .{ .ctx = &status_query, .stamped = true, .func = statusCallback },
+                    .health = .{ .ctx = self, .func = healthCallback },
+                    .config = config_view,
+                    .scopes = scopes_view,
+                    .history = .{ .ctx = &history_query, .read = historyRead },
+                    .firewall = firewall_source,
+                    .ignore = .{ .ctx = self, .render = ignoreRender },
+                    .continuity = .{ .ctx = self, .render = continuityRender },
+                },
+            );
             if ((requested_kind == .ignore or requested_kind == .health or history_details) and !self.unchanged(generation)) {
                 result.deinit(a);
                 return error.InvalidatedCursor;

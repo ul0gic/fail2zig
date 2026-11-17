@@ -14,7 +14,21 @@ pub const max_owner_revisions = 1048576;
 pub const max_confirmed_events = 262144;
 pub const max_observations = 4194304;
 pub const max_page = 64;
-pub const Error = error{ InvalidEffect, EffectScopeNotRealized, EffectStorageRequired, InstallationRequired, InstallationMismatch, NamespaceAdmissionRequired, EffectCapacity, StaleEffect, EffectGenerationMismatch, EffectReconciliationRequired, EffectExpired, EffectClockReversed, IncompleteEffectObservation };
+pub const Error = error{
+    InvalidEffect,
+    EffectScopeNotRealized,
+    EffectStorageRequired,
+    InstallationRequired,
+    InstallationMismatch,
+    NamespaceAdmissionRequired,
+    EffectCapacity,
+    StaleEffect,
+    EffectGenerationMismatch,
+    EffectReconciliationRequired,
+    EffectExpired,
+    EffectClockReversed,
+    IncompleteEffectObservation,
+};
 pub const Backend = enum(u8) { nftables = 1, iptables = 2, ipset = 3 };
 pub const Installation = struct {
     id: [16]u8,

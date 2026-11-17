@@ -76,10 +76,20 @@ pub const Plan = struct {
             cell.*.deinit(a);
             a.destroy(cell);
         };
-        self.base = if (settings.custom) null else try builtin.Detector.init(a, .{ .filter = jail.filter, .body = .whole, .ignore = literals, .ignores = self.ignore_cell, .ignore_capacity = settings.ignore_capacity, .max_decoded_bytes = settings.max_decoded_bytes });
+        self.base = if (settings.custom) null else try builtin.Detector.init(
+            a,
+            .{ .filter = jail.filter, .body = .whole, .ignore = literals, .ignores = self.ignore_cell, .ignore_capacity = settings.ignore_capacity, .max_decoded_bytes = settings.max_decoded_bytes },
+        );
         errdefer if (self.base) |*value| value.deinit(a);
         self.qualified = if (self.base) |*value| try journal.Detector.init(value, profile) else null;
-        self.processing = .{ .jail = jail.name, .parent_generation = parent, .timestamp = .journal, .window_us = window, .max_record_bytes = settings.max_record_bytes, .max_decoded_bytes = settings.max_decoded_bytes };
+        self.processing = .{
+            .jail = jail.name,
+            .parent_generation = parent,
+            .timestamp = .journal,
+            .window_us = window,
+            .max_record_bytes = settings.max_record_bytes,
+            .max_decoded_bytes = settings.max_decoded_bytes,
+        };
         self.journal = settings.journal;
         self.source_id = settings.source_id;
         return self;

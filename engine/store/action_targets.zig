@@ -30,7 +30,19 @@ pub fn Methods(comptime Store: type) type {
                 const kind = std.meta.intToEnum(action_outcome.Kind, kind_value) catch return error.InvalidActionTarget;
                 const status = std.meta.intToEnum(action_outcome.Status, status_value) catch return error.InvalidActionTarget;
                 const jail = detection.Name.init(try row.boundedBytes(1, 64)) catch return error.InvalidActionTarget;
-                var target = action_outcome.Target{ .action_id = action_id, .scope_key = try Store.effectBlob(&row, 0, 32), .jail = jail, .kind = kind, .required = required == 1, .restored = restored == 1, .status = status, .intent_us = intent_us, .dispatch_us = dispatch_us, .settled_us = settled_us, .metadata_len = 0 };
+                var target = action_outcome.Target{
+                    .action_id = action_id,
+                    .scope_key = try Store.effectBlob(&row, 0, 32),
+                    .jail = jail,
+                    .kind = kind,
+                    .required = required == 1,
+                    .restored = restored == 1,
+                    .status = status,
+                    .intent_us = intent_us,
+                    .dispatch_us = dispatch_us,
+                    .settled_us = settled_us,
+                    .metadata_len = 0,
+                };
                 if (self.api.column_type(row.ptr, 9) != 5) {
                     const metadata = try row.boundedBytes(9, action_outcome.max_metadata_bytes);
                     if (metadata.len == 0 or !std.unicode.utf8ValidateSlice(metadata)) return error.InvalidActionTarget;

@@ -179,7 +179,14 @@ pub const Zone = struct {
             const fold = early != latest.?;
             if (fold and self.ambiguity == .reject) return error.AmbiguousLocalTime;
             const later = fold and self.ambiguity == .later;
-            return .{ .utc_seconds = if (later) latest.? else early, .offset_seconds = if (later) offset_late else offset_early, .zone_digest = self.data_digest, .generation = self.generation, .ambiguity = self.ambiguity, .fold_selected = fold };
+            return .{
+                .utc_seconds = if (later) latest.? else early,
+                .offset_seconds = if (later) offset_late else offset_early,
+                .zone_digest = self.data_digest,
+                .generation = self.generation,
+                .ambiguity = self.ambiguity,
+                .fold_selected = fold,
+            };
         }
         if (specified_offset and !in_range_candidate) return error.TimeOutOfRange;
         if (self.transitions.len >= 3) for (1..self.transitions.len - 1) |i| {

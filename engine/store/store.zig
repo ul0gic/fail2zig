@@ -54,12 +54,101 @@ const Api = struct {
 const embedded_api: Api = blk: {
     var api: Api = undefined;
     for (std.meta.fields(Api)) |field| {
-        const symbol = if (std.mem.eql(u8, field.name, "open")) "sqlite3_open_v2" else if (std.mem.eql(u8, field.name, "close")) "sqlite3_close_v2" else if (std.mem.eql(u8, field.name, "prepare")) "sqlite3_prepare_v2" else "sqlite3_" ++ field.name;
+        const symbol = if (std.mem.eql(u8, field.name, "open")) "sqlite3_open_v2" else if (std.mem.eql(u8, field.name, "close")) "sqlite3_close_v2" else if (std.mem.eql(
+            u8,
+            field.name,
+            "prepare",
+        )) "sqlite3_prepare_v2" else "sqlite3_" ++ field.name;
         @field(api, field.name) = @extern(field.type, .{ .name = symbol });
     }
     break :blk api;
 };
-pub const Error = application_history.Error || action_outcome.Error || retry.Error || consumers.Error || effects.Error || effect_history.Error || action_context.Error || error{ MaintenancePinned, StaleMaintenance, InvalidMaintenanceState, MaintenanceStorageRequired, ConsumerManifestRequired, ConsumerManifestMismatch, ConsumerManifestMissing, ConsumerManifestExists, ConsumerMigrationRequired, MissingRequiredConsumer, AmbiguousNativeDetection, AmbiguousRetryDecision, ConsumerStorageRequired, StaleConsumerCheckpoint, OpenFailed, UnsafePermissions, ForeignDatabase, UnsupportedSchema, DatabaseFailure, Busy, StorageFull, ReadOnly, StorageIo, CorruptDatabase, StorageLimit, Interrupted, AccessDenied, ReopenRequired, InvalidRecord, OccurrenceConflict, StaleCheckpoint, StaleSharedCheckpoint, InjectedFailure, OutOfMemory, ReceiptStorageRequired, InferenceStorageRequired, DetectionStorageRequired, ReceiptConflict, ReceiptRequired, ReceiptAlreadyCommitted, ReceiptLimit, RetryStorageRequired, RetryAdmissionRequired, RetryGenerationMismatch, RetryMigrationRequired, RetryCapacity, RetryEligibilityPending, ReceiptClockReversed, HistoryResetStorageRequired, InvalidHistoryReset, StaleHistoryReset, AdminStorageRequired, MigrationStorageRequired, StaleAdminRevision, InvalidAdminRequest, AdminRequestCapacity, RetryPolicyInFlight, StalePolicyTransition, ConfigGenerationExists, ConfigGenerationMissing, MigrationRunExists, MigrationRunMissing, MigrationStepMissing, MigrationStepOpen, MigrationStepOrder, InvalidMigrationRow, InvalidMigrationState, MigrationJailUnknown, LoadRepairMigrationIncomplete, LoadRepairWritersPending, LoadRepairBackupExists, LoadRepairBackupInvalid, LoadRepairDiskSpace, LoadRepairVerificationFailed, LoadRepairInvalidState, SchemaBackupExists, IgnoreCapacity, InvalidIgnoreEntry, ReserveBackpressure, MaintenanceWorkExhausted, LiveOwnerCounterInvalid, CustomLegacyProofRequired, CustomLegacyIdentityMismatch, StorageCapacity };
+pub const Error = application_history.Error || action_outcome.Error || retry.Error || consumers.Error || effects.Error || effect_history.Error || action_context.Error || error{
+    MaintenancePinned,
+    StaleMaintenance,
+    InvalidMaintenanceState,
+    MaintenanceStorageRequired,
+    ConsumerManifestRequired,
+    ConsumerManifestMismatch,
+    ConsumerManifestMissing,
+    ConsumerManifestExists,
+    ConsumerMigrationRequired,
+    MissingRequiredConsumer,
+    AmbiguousNativeDetection,
+    AmbiguousRetryDecision,
+    ConsumerStorageRequired,
+    StaleConsumerCheckpoint,
+    OpenFailed,
+    UnsafePermissions,
+    ForeignDatabase,
+    UnsupportedSchema,
+    DatabaseFailure,
+    Busy,
+    StorageFull,
+    ReadOnly,
+    StorageIo,
+    CorruptDatabase,
+    StorageLimit,
+    Interrupted,
+    AccessDenied,
+    ReopenRequired,
+    InvalidRecord,
+    OccurrenceConflict,
+    StaleCheckpoint,
+    StaleSharedCheckpoint,
+    InjectedFailure,
+    OutOfMemory,
+    ReceiptStorageRequired,
+    InferenceStorageRequired,
+    DetectionStorageRequired,
+    ReceiptConflict,
+    ReceiptRequired,
+    ReceiptAlreadyCommitted,
+    ReceiptLimit,
+    RetryStorageRequired,
+    RetryAdmissionRequired,
+    RetryGenerationMismatch,
+    RetryMigrationRequired,
+    RetryCapacity,
+    RetryEligibilityPending,
+    ReceiptClockReversed,
+    HistoryResetStorageRequired,
+    InvalidHistoryReset,
+    StaleHistoryReset,
+    AdminStorageRequired,
+    MigrationStorageRequired,
+    StaleAdminRevision,
+    InvalidAdminRequest,
+    AdminRequestCapacity,
+    RetryPolicyInFlight,
+    StalePolicyTransition,
+    ConfigGenerationExists,
+    ConfigGenerationMissing,
+    MigrationRunExists,
+    MigrationRunMissing,
+    MigrationStepMissing,
+    MigrationStepOpen,
+    MigrationStepOrder,
+    InvalidMigrationRow,
+    InvalidMigrationState,
+    MigrationJailUnknown,
+    LoadRepairMigrationIncomplete,
+    LoadRepairWritersPending,
+    LoadRepairBackupExists,
+    LoadRepairBackupInvalid,
+    LoadRepairDiskSpace,
+    LoadRepairVerificationFailed,
+    LoadRepairInvalidState,
+    SchemaBackupExists,
+    IgnoreCapacity,
+    InvalidIgnoreEntry,
+    ReserveBackpressure,
+    MaintenanceWorkExhausted,
+    LiveOwnerCounterInvalid,
+    CustomLegacyProofRequired,
+    CustomLegacyIdentityMismatch,
+    StorageCapacity,
+};
 
 pub const OpenStage = enum {
     path_validation,
@@ -156,7 +245,71 @@ pub fn sqliteError(rc: c_int) Error {
         else => error.DatabaseFailure,
     };
 }
-pub const CommitStage = enum { during_load_repair_events_swap, after_retry_detail_prune, before_admin_schema_commit, before_migration_schema_commit, after_admin_request, after_migration_step_intent, after_migration_step_outcome, before_migration_activation_commit, before_policy_transition_commit, before_config_generation_commit, before_config_generation_publish, before_action_target_schema_commit, after_action_target_intent, before_action_target_dispatch_commit, before_action_target_settlement_commit, before_history_reset_schema_commit, after_history_reset, before_canonical_effect_schema_commit, after_history_detail_delete, after_history_event_delete, before_history_retention_commit, before_escalation_schema_commit, before_application_history_schema_commit, before_cleanup_schema_commit, before_retry_lease_schema_commit, after_cleanup_mark, before_cleanup_escalation_delete, after_cleanup_escalation_delete, before_cleanup_retry_delete, after_cleanup_retry_delete, after_cleanup_delete, before_cleanup_commit, after_retry_retire, before_maintenance_schema_commit, after_source_sequence, after_record, after_checkpoint, after_shared_checkpoint, before_commit, before_receipt_commit, after_receipt_commit, after_receipt_delete, before_receipt_schema_commit, before_native_time_schema_commit, before_inference_schema_commit, before_detection_schema_commit, after_detection, before_clock_schema_commit, before_journal_detection_schema_commit, before_retry_schema_commit, after_retry_state, after_retry_decision, before_consumer_schema_commit, after_consumer_delta, before_effect_schema_commit, after_effect_owner, after_effect_intent, before_effect_dispatch_commit, before_effect_receipt_commit, before_manifest_schema_commit, before_manifest_commit, after_manifest_ready, before_consumer_input_commit };
+pub const CommitStage = enum {
+    during_load_repair_events_swap,
+    after_retry_detail_prune,
+    before_admin_schema_commit,
+    before_migration_schema_commit,
+    after_admin_request,
+    after_migration_step_intent,
+    after_migration_step_outcome,
+    before_migration_activation_commit,
+    before_policy_transition_commit,
+    before_config_generation_commit,
+    before_config_generation_publish,
+    before_action_target_schema_commit,
+    after_action_target_intent,
+    before_action_target_dispatch_commit,
+    before_action_target_settlement_commit,
+    before_history_reset_schema_commit,
+    after_history_reset,
+    before_canonical_effect_schema_commit,
+    after_history_detail_delete,
+    after_history_event_delete,
+    before_history_retention_commit,
+    before_escalation_schema_commit,
+    before_application_history_schema_commit,
+    before_cleanup_schema_commit,
+    before_retry_lease_schema_commit,
+    after_cleanup_mark,
+    before_cleanup_escalation_delete,
+    after_cleanup_escalation_delete,
+    before_cleanup_retry_delete,
+    after_cleanup_retry_delete,
+    after_cleanup_delete,
+    before_cleanup_commit,
+    after_retry_retire,
+    before_maintenance_schema_commit,
+    after_source_sequence,
+    after_record,
+    after_checkpoint,
+    after_shared_checkpoint,
+    before_commit,
+    before_receipt_commit,
+    after_receipt_commit,
+    after_receipt_delete,
+    before_receipt_schema_commit,
+    before_native_time_schema_commit,
+    before_inference_schema_commit,
+    before_detection_schema_commit,
+    after_detection,
+    before_clock_schema_commit,
+    before_journal_detection_schema_commit,
+    before_retry_schema_commit,
+    after_retry_state,
+    after_retry_decision,
+    before_consumer_schema_commit,
+    after_consumer_delta,
+    before_effect_schema_commit,
+    after_effect_owner,
+    after_effect_intent,
+    before_effect_dispatch_commit,
+    before_effect_receipt_commit,
+    before_manifest_schema_commit,
+    before_manifest_commit,
+    after_manifest_ready,
+    before_consumer_input_commit,
+};
 pub const Limits = struct {
     pub const pending_receipts = 4096;
     pub const checkpoint_bytes = 16 * 1024 * 1024;
@@ -1018,7 +1171,12 @@ pub const Store = struct {
         const ambiguity = std.meta.intToEnum(@FieldType(native_record.Provenance, "ambiguity"), try row.signed(2)) catch return error.InvalidRecord;
         const fold = try row.signed(3);
         if (fold < 0 or fold > 1) return error.InvalidRecord;
-        const result = native_record.Provenance{ .zone_digest = try Store.effectBlob(&row, 0, 32), .offset_seconds = std.math.cast(i32, try row.signed(1)) orelse return error.InvalidRecord, .ambiguity = ambiguity, .fold_selected = fold == 1 };
+        const result = native_record.Provenance{
+            .zone_digest = try Store.effectBlob(&row, 0, 32),
+            .offset_seconds = std.math.cast(i32, try row.signed(1)) orelse return error.InvalidRecord,
+            .ambiguity = ambiguity,
+            .fold_selected = fold == 1,
+        };
         result.validate() catch return error.InvalidRecord;
         return result;
     }
@@ -1033,7 +1191,14 @@ pub const Store = struct {
         if (!try row.row()) return null;
         const generation = try hashColumn(&row, 0) orelse return error.ReceiptConflict;
         const raw_hash = try hashColumn(&row, 2) orelse return error.ReceiptConflict;
-        const saved = ReceiptIdentity{ .jail = identity.jail, .source = identity.source, .occurrence = try row.boundedBytes(1, 16384), .cursor = try row.boundedBytes(3, Limits.cursor_bytes), .raw_hash = raw_hash, .generation = generation };
+        const saved = ReceiptIdentity{
+            .jail = identity.jail,
+            .source = identity.source,
+            .occurrence = try row.boundedBytes(1, 16384),
+            .cursor = try row.boundedBytes(3, Limits.cursor_bytes),
+            .raw_hash = raw_hash,
+            .generation = generation,
+        };
         if (!identity.sameRecord(saved)) return error.ReceiptConflict;
         return .{ .us = try row.signed(4) };
     }
@@ -1054,7 +1219,14 @@ pub const Store = struct {
         if (!try row.row()) return null;
         const raw_hash = try hashColumn(&row, 0) orelse return error.ReceiptConflict;
         const generation = try hashColumn(&row, 2) orelse return error.ReceiptConflict;
-        const saved = ReceiptIdentity{ .jail = identity.jail, .source = identity.source, .occurrence = identity.occurrence, .cursor = try row.boundedBytes(1, Limits.cursor_bytes), .raw_hash = raw_hash, .generation = generation };
+        const saved = ReceiptIdentity{
+            .jail = identity.jail,
+            .source = identity.source,
+            .occurrence = identity.occurrence,
+            .cursor = try row.boundedBytes(1, Limits.cursor_bytes),
+            .raw_hash = raw_hash,
+            .generation = generation,
+        };
         if (!identity.sameRecord(saved)) return error.ReceiptConflict;
         return .{ .us = try row.signed(3) };
     }
@@ -1368,11 +1540,25 @@ pub const Store = struct {
         }
         if (self.schema_version >= 3) {
             if (record.receipt) |receipt| {
-                const saved = try self.pendingReceipt(.{ .jail = record.jail, .source = record.source, .occurrence = record.occurrence, .cursor = record.cursor, .raw_hash = record.raw_hash, .generation = receipt.generation });
+                const saved = try self.pendingReceipt(.{
+                    .jail = record.jail,
+                    .source = record.source,
+                    .occurrence = record.occurrence,
+                    .cursor = record.cursor,
+                    .raw_hash = record.raw_hash,
+                    .generation = receipt.generation,
+                });
                 if (saved) |value| {
                     if (value.us != receipt.time.us) return error.ReceiptConflict;
                 } else {
-                    const committed = (try self.committedReceipt(.{ .jail = record.jail, .source = record.source, .occurrence = record.occurrence, .cursor = record.cursor, .raw_hash = record.raw_hash, .generation = receipt.generation })) orelse return error.ReceiptRequired;
+                    const committed = (try self.committedReceipt(.{
+                        .jail = record.jail,
+                        .source = record.source,
+                        .occurrence = record.occurrence,
+                        .cursor = record.cursor,
+                        .raw_hash = record.raw_hash,
+                        .generation = receipt.generation,
+                    })) orelse return error.ReceiptRequired;
                     if (committed.us != receipt.time.us) return error.ReceiptConflict;
                 }
             } else {

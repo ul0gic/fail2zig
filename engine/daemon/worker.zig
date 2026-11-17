@@ -83,7 +83,14 @@ pub fn Methods(comptime Coordinator: type) type {
                     }
                     if (comptime build_options.diag) diag_mod.event(.storage_failed, .{ .cause = @errorName(failure) });
                     if (!self.store_open or self.store.reopen_required) self.clearRetryPublication();
-                    if (self.gate.snapshot().phase == .healthy) self.gate.failed(failure, .{ .sqlite_code = if (self.store_open) self.store.last_error_code else null, .reopen_required = !self.store_open or self.store.reopen_required, .operation = if (self.store_open) self.store.maintenance_operation else null });
+                    if (self.gate.snapshot().phase == .healthy) self.gate.failed(
+                        failure,
+                        .{
+                            .sqlite_code = if (self.store_open) self.store.last_error_code else null,
+                            .reopen_required = !self.store_open or self.store.reopen_required,
+                            .operation = if (self.store_open) self.store.maintenance_operation else null,
+                        },
+                    );
                 };
                 self.publishHealth();
                 if (comptime build_options.diag) diag_mod.emitIfDue();
@@ -224,7 +231,10 @@ pub fn Methods(comptime Coordinator: type) type {
                     self.mutex.unlock();
                     if (changed) {
                         if (comptime build_options.diag) diag_mod.event(.source_paused, .{ .subject = jail.name, .cause = @errorName(failure) });
-                        if (jail.session.? == .journal) logJournalFailure(jail, failure, diagnostic) else std.log.err("native jail {s}: {s}; source stuck, retried on every poll; see fail2zig status", .{ jail.name, @errorName(failure) });
+                        if (jail.session.? == .journal) logJournalFailure(jail, failure, diagnostic) else std.log.err(
+                            "native jail {s}: {s}; source stuck, retried on every poll; see fail2zig status",
+                            .{ jail.name, @errorName(failure) },
+                        );
                         try self.refreshSourceStatus(jail);
                     }
                     continue;
@@ -281,7 +291,10 @@ pub fn Methods(comptime Coordinator: type) type {
                 jail.banlist_retry_ms = monotonic(self);
                 jail.config_bans +|= change.added;
                 if (change.added != 0 or change.lifted != 0 or change.expired != 0 or change.pending != jail.banlist_waiting)
-                    std.log.info("native: jail={} banip applied: {d} added, {d} lifted, {d} unchanged, {d} expired, {d} waiting for state-file capacity", .{ std.zig.fmtEscapes(jail.name), change.added, change.lifted, change.unchanged, change.expired, change.pending });
+                    std.log.info(
+                        "native: jail={} banip applied: {d} added, {d} lifted, {d} unchanged, {d} expired, {d} waiting for state-file capacity",
+                        .{ std.zig.fmtEscapes(jail.name), change.added, change.lifted, change.unchanged, change.expired, change.pending },
+                    );
                 jail.banlist_waiting = change.pending;
             }
         }
@@ -290,7 +303,10 @@ pub fn Methods(comptime Coordinator: type) type {
             if (self.last_gate_report_ms) |last| if (now_ms -| last < 10_000) return;
             const g = self.gates;
             if (std.meta.eql(g, MaintenanceGates{})) return;
-            std.log.debug("native: maintenance gates: slow={d} due={d} turns={d} unhealthy_gate={d} step={d}/{d}/{d} record_passes={d} record_deletes={d} records_parked={d}", .{ g.slow, g.due, g.turns, g.unhealthy_gate, g.step_progress, g.step_returned, g.step_wait, g.record_passes, g.record_deletes, g.records_parked });
+            std.log.debug(
+                "native: maintenance gates: slow={d} due={d} turns={d} unhealthy_gate={d} step={d}/{d}/{d} record_passes={d} record_deletes={d} records_parked={d}",
+                .{ g.slow, g.due, g.turns, g.unhealthy_gate, g.step_progress, g.step_returned, g.step_wait, g.record_passes, g.record_deletes, g.records_parked },
+            );
             self.last_gate_report_ms = now_ms;
             self.gates = .{};
         }
@@ -300,7 +316,30 @@ pub fn Methods(comptime Coordinator: type) type {
             if (self.last_view_report_ms) |last| if (now_ms -| last < 10_000) return;
             const c = manager.counters;
             if (std.meta.eql(c, self.last_view_counters)) return;
-            std.log.debug("native: effect view: rebuilds={d} restarted={d} incremental={d} readbacks={d} interrupted={d} entries={d} installed={d} ready={} pending={d} overdue={d} blocking={d} expiry_batches={d}/{d} retired={d}/{d} examined={d} pinned={d}/{d} refused={d}", .{ c.rebuilds_completed, c.rebuild_restarts, c.incremental_updates, c.full_readbacks, c.dump_interrupted, manager.count, manager.installed_live, manager.status.ready, c.pending, c.overdue, c.overdue_blocking, c.expiries_prepared, c.expiry_batches, self.retired_total, self.retire_batches, self.retire_examined, self.retire_pinned_state, self.retire_pinned_effect, self.retire_refused });
+            std.log.debug(
+                "native: effect view: rebuilds={d} restarted={d} incremental={d} readbacks={d} interrupted={d} entries={d} installed={d} ready={} pending={d} overdue={d} blocking={d} expiry_batches={d}/{d} retired={d}/{d} examined={d} pinned={d}/{d} refused={d}",
+                .{
+                    c.rebuilds_completed,
+                    c.rebuild_restarts,
+                    c.incremental_updates,
+                    c.full_readbacks,
+                    c.dump_interrupted,
+                    manager.count,
+                    manager.installed_live,
+                    manager.status.ready,
+                    c.pending,
+                    c.overdue,
+                    c.overdue_blocking,
+                    c.expiries_prepared,
+                    c.expiry_batches,
+                    self.retired_total,
+                    self.retire_batches,
+                    self.retire_examined,
+                    self.retire_pinned_state,
+                    self.retire_pinned_effect,
+                    self.retire_refused,
+                },
+            );
             self.last_view_report_ms = now_ms;
             self.last_view_counters = c;
         }
@@ -375,7 +414,19 @@ pub fn Methods(comptime Coordinator: type) type {
             const shed = self.shed;
             const logged = self.shed_logged;
             self.shed_logged = shed;
-            std.log.warn("native: state file under capacity pressure; shed {d} spent bookkeeping pages, {d} detail rows, {d} consumed events, {d} memory rows ({d}, {d}, {d}, {d} since start)", .{ shed.spent_pages - logged.spent_pages, shed.detail_rows - logged.detail_rows, shed.consumed_events - logged.consumed_events, shed.memory_rows - logged.memory_rows, shed.spent_pages, shed.detail_rows, shed.consumed_events, shed.memory_rows });
+            std.log.warn(
+                "native: state file under capacity pressure; shed {d} spent bookkeeping pages, {d} detail rows, {d} consumed events, {d} memory rows ({d}, {d}, {d}, {d} since start)",
+                .{
+                    shed.spent_pages - logged.spent_pages,
+                    shed.detail_rows - logged.detail_rows,
+                    shed.consumed_events - logged.consumed_events,
+                    shed.memory_rows - logged.memory_rows,
+                    shed.spent_pages,
+                    shed.detail_rows,
+                    shed.consumed_events,
+                    shed.memory_rows,
+                },
+            );
         }
 
         fn maintenanceTurn(self: *Coordinator) !void {
@@ -388,7 +439,11 @@ pub fn Methods(comptime Coordinator: type) type {
             }
             self.maintenance_progress = false;
             try self.retirementStep();
-            const age_us = std.math.mul(i64, std.math.cast(i64, self.cfg.global.history_retention) orelse return error.InvalidApplicationHistoryQuery, 1_000_000) catch return error.InvalidApplicationHistoryQuery;
+            const age_us = std.math.mul(
+                i64,
+                std.math.cast(i64, self.cfg.global.history_retention) orelse return error.InvalidApplicationHistoryQuery,
+                1_000_000,
+            ) catch return error.InvalidApplicationHistoryQuery;
             if (self.history_page == null and self.history_caught_up and self.history_wait == null) _ = try self.consumeHistory();
             try self.cleanupRecords();
             const caught_up = if (self.history_page) |page| page.after_sequence == page.head_sequence and page.last_sequence == page.head_sequence else self.history_consumer == null;

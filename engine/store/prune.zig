@@ -14,12 +14,22 @@ pub fn Methods(comptime Store: type) type {
         const reclaim_window: i64 = 1024;
         const obsolete_intent = "i.intent_id IS NOT n.intent_id AND i.status NOT IN(1,2) AND NOT EXISTS(SELECT 1 FROM action_targets a WHERE a.action_id=i.decision_id AND a.scope_key=i.scope_key AND a.status IN(1,2,5))";
         const reclaim_phases = [_]struct { max_sql: [:0]const u8, seek_sql: [:0]const u8, tables: []const store.TalliedTable, statements: []const [:0]const u8 }{
-            .{ .max_sql = "SELECT coalesce(max(rowid),0) FROM action_targets;", .seek_sql = "SELECT rowid FROM action_targets WHERE rowid>?1 ORDER BY rowid LIMIT 1 OFFSET ?2;", .tables = &.{.action_targets}, .statements = &.{"DELETE FROM action_targets WHERE rowid IN (SELECT a.rowid FROM action_targets a WHERE a.rowid>?1 AND a.rowid<=?2 AND a.status NOT IN(1,2,5) AND NOT EXISTS(SELECT 1 FROM effect_owners o INDEXED BY effect_owners_decision WHERE o.jail=a.jail AND o.decision_id=a.action_id));"} },
+            .{
+                .max_sql = "SELECT coalesce(max(rowid),0) FROM action_targets;",
+                .seek_sql = "SELECT rowid FROM action_targets WHERE rowid>?1 ORDER BY rowid LIMIT 1 OFFSET ?2;",
+                .tables = &.{.action_targets},
+                .statements = &.{"DELETE FROM action_targets WHERE rowid IN (SELECT a.rowid FROM action_targets a WHERE a.rowid>?1 AND a.rowid<=?2 AND a.status NOT IN(1,2,5) AND NOT EXISTS(SELECT 1 FROM effect_owners o INDEXED BY effect_owners_decision WHERE o.jail=a.jail AND o.decision_id=a.action_id));"},
+            },
             .{ .max_sql = "SELECT coalesce(max(rowid),0) FROM effect_intents;", .seek_sql = "SELECT rowid FROM effect_intents WHERE rowid>?1 ORDER BY rowid LIMIT 1 OFFSET ?2;", .tables = &.{ .effect_observations, .effect_intents }, .statements = &.{
                 "DELETE FROM effect_observations WHERE intent_id IN (SELECT i.intent_id FROM effect_intents i JOIN native_effects n ON n.scope_key=i.scope_key WHERE i.rowid>?1 AND i.rowid<=?2 AND " ++ obsolete_intent ++ ");",
                 "DELETE FROM effect_intents WHERE rowid IN (SELECT i.rowid FROM effect_intents i JOIN native_effects n ON n.scope_key=i.scope_key WHERE i.rowid>?1 AND i.rowid<=?2 AND " ++ obsolete_intent ++ ");",
             } },
-            .{ .max_sql = "SELECT coalesce(max(rowid),0) FROM effect_owner_revisions;", .seek_sql = "SELECT rowid FROM effect_owner_revisions WHERE rowid>?1 ORDER BY rowid LIMIT 1 OFFSET ?2;", .tables = &.{.effect_owner_revisions}, .statements = &.{"DELETE FROM effect_owner_revisions WHERE rowid IN (SELECT h.rowid FROM effect_owner_revisions h WHERE h.rowid>?1 AND h.rowid<=?2 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=h.scope_key AND o.jail=h.jail AND o.revision=h.revision) AND NOT EXISTS(SELECT 1 FROM action_targets a WHERE a.action_id=h.decision_id AND a.scope_key=h.scope_key AND a.status IN(1,2,5)));"} },
+            .{
+                .max_sql = "SELECT coalesce(max(rowid),0) FROM effect_owner_revisions;",
+                .seek_sql = "SELECT rowid FROM effect_owner_revisions WHERE rowid>?1 ORDER BY rowid LIMIT 1 OFFSET ?2;",
+                .tables = &.{.effect_owner_revisions},
+                .statements = &.{"DELETE FROM effect_owner_revisions WHERE rowid IN (SELECT h.rowid FROM effect_owner_revisions h WHERE h.rowid>?1 AND h.rowid<=?2 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=h.scope_key AND o.jail=h.jail AND o.revision=h.revision) AND NOT EXISTS(SELECT 1 FROM action_targets a WHERE a.action_id=h.decision_id AND a.scope_key=h.scope_key AND a.status IN(1,2,5)));"},
+            },
         };
 
         pub const ReclaimOutcome = enum { deleted, scanned, idle };

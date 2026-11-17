@@ -216,7 +216,10 @@ pub fn classifyWithRuntime(current: *const config.Config, proposed: *const confi
                 const configured = distinctConfigured(after_literals);
                 const runtime = runtimeOnly(runtime_counts, jail.name);
                 if (configured + runtime > ignore_set.distinct_bound) {
-                    out.reject("jails.{s}.ignoreip: {d} configured and {d} runtime-only entries exceed the {d}-entry limit; remove runtime entries with fail2zig ignore remove or shorten ignoreip", .{ jail.name, configured, runtime, ignore_set.distinct_bound });
+                    out.reject(
+                        "jails.{s}.ignoreip: {d} configured and {d} runtime-only entries exceed the {d}-entry limit; remove runtime entries with fail2zig ignore remove or shorten ignoreip",
+                        .{ jail.name, configured, runtime, ignore_set.distinct_bound },
+                    );
                 } else {
                     out.listJail(&out.ignore_jails, &out.ignore_count, jail.name, "ignoreip");
                 }
@@ -232,7 +235,10 @@ pub fn classifyWithRuntime(current: *const config.Config, proposed: *const confi
             out.listJail(&out.decay_jails, &out.decay_count, jail.name, "bantime_increment_decay");
         if (before.banaction != after.banaction) out.restart("jails.{s}.banaction", .{jail.name});
         if (before.findtime != after.findtime) out.restart("jails.{s}.findtime: bound to the source plan window", .{jail.name});
-        const policy_changed = before.maxretry != after.maxretry or before.bantime != after.bantime or before.bantime_kind != after.bantime_kind or !std.meta.eql(before.bantime_increment, after.bantime_increment);
+        const policy_changed = before.maxretry != after.maxretry or before.bantime != after.bantime or before.bantime_kind != after.bantime_kind or !std.meta.eql(
+            before.bantime_increment,
+            after.bantime_increment,
+        );
         if (!policy_changed) continue;
         if (!jail.enabled) {
             out.restart("jails.{s}: policy edit on a disabled jail applies at restart", .{jail.name});

@@ -672,7 +672,11 @@ pub fn Methods(comptime Store: type) type {
                 try self.checkConsumerRevision(dependency.key, dependency.expected_revision, .{ .value = dependency.valid_until_us });
             for (batch.deltas) |delta| {
                 if (delta.key.kind == .history and !allow_history) return error.InvalidHistoryTransition;
-                if (dnsAuthority(delta.key) and (delta.expected_revision != 0 or delta.format_version != 1 or delta.valid_until_us != null or !std.mem.eql(u8, delta.payload, &delta.key.generation))) return error.InvalidConsumer;
+                if (dnsAuthority(delta.key) and (delta.expected_revision != 0 or delta.format_version != 1 or delta.valid_until_us != null or !std.mem.eql(
+                    u8,
+                    delta.payload,
+                    &delta.key.generation,
+                ))) return error.InvalidConsumer;
                 try self.checkConsumerRevision(delta.key, delta.expected_revision, null);
             }
             _ = try self.checkConsumerTime(batch);
@@ -1092,12 +1096,21 @@ pub fn Methods(comptime Store: type) type {
             .{ .sql = "UPDATE pending_receipts SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .pending },
             .{ .sql = "UPDATE records SET source_generation=?3 WHERE jail=?1 AND source_generation=?2;", .counted = .none },
             .{ .sql = "UPDATE records SET receipt_generation=?3 WHERE jail=?1 AND receipt_generation=?2;", .counted = .none },
-            .{ .sql = "UPDATE checkpoints SET payload=CAST(substr(CAST(payload AS BLOB),1,8)||?3||substr(CAST(payload AS BLOB),41) AS BLOB) WHERE jail=?1 AND substr(CAST(payload AS BLOB),1,4)=CAST('F2NT' AS BLOB) AND substr(CAST(payload AS BLOB),9,32)=?2;", .counted = .none },
-            .{ .sql = "UPDATE checkpoints SET payload=CAST(substr(CAST(payload AS BLOB),1,6)||?3||substr(CAST(payload AS BLOB),39) AS BLOB) WHERE jail=?1 AND substr(CAST(payload AS BLOB),1,4)=CAST('F2JC' AS BLOB) AND substr(CAST(payload AS BLOB),7,32)=?2;", .counted = .none },
+            .{
+                .sql = "UPDATE checkpoints SET payload=CAST(substr(CAST(payload AS BLOB),1,8)||?3||substr(CAST(payload AS BLOB),41) AS BLOB) WHERE jail=?1 AND substr(CAST(payload AS BLOB),1,4)=CAST('F2NT' AS BLOB) AND substr(CAST(payload AS BLOB),9,32)=?2;",
+                .counted = .none,
+            },
+            .{
+                .sql = "UPDATE checkpoints SET payload=CAST(substr(CAST(payload AS BLOB),1,6)||?3||substr(CAST(payload AS BLOB),39) AS BLOB) WHERE jail=?1 AND substr(CAST(payload AS BLOB),1,4)=CAST('F2JC' AS BLOB) AND substr(CAST(payload AS BLOB),7,32)=?2;",
+                .counted = .none,
+            },
             .{ .sql = "UPDATE source_maintenance SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .none },
             .{ .sql = "UPDATE consumer_checkpoints SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .none },
             .{ .sql = "UPDATE consumer_requirements SET generation=?3 WHERE jail=?1 AND generation=?2;", .counted = .none },
-            .{ .sql = "UPDATE source_cursors SET cursor=CAST(substr(CAST(cursor AS BLOB),1,6)||?3||substr(CAST(cursor AS BLOB),39) AS BLOB) WHERE jail=?1 AND substr(CAST(cursor AS BLOB),1,4)=CAST('F2JC' AS BLOB) AND substr(CAST(cursor AS BLOB),7,32)=?2;", .counted = .cursors },
+            .{
+                .sql = "UPDATE source_cursors SET cursor=CAST(substr(CAST(cursor AS BLOB),1,6)||?3||substr(CAST(cursor AS BLOB),39) AS BLOB) WHERE jail=?1 AND substr(CAST(cursor AS BLOB),1,4)=CAST('F2JC' AS BLOB) AND substr(CAST(cursor AS BLOB),7,32)=?2;",
+                .counted = .cursors,
+            },
         };
 
         pub fn rekeyGenerationTablesTx(self: *Store, jail: []const u8, old: [32]u8, new: [32]u8, report: *RekeyReport) Error!void {
@@ -1175,7 +1188,15 @@ pub fn Methods(comptime Store: type) type {
                     const owner_revision = try owners.signed(1);
                     if (owner_revision <= 0 or owner_revision >= std.math.maxInt(i64) or try owners.signed(5) != 1) return error.InvalidEffect;
                     const lease = try Store.effectLease(&owners, 3, 4);
-                    try held.append(self.allocator, .{ .key = try Store.effectBlob(&owners, 0, 32), .revision = @intCast(owner_revision), .scope = try Store.effectBlob(&owners, 2, canonical_scope.encoded_bytes), .absent = lease == .absent });
+                    try held.append(
+                        self.allocator,
+                        .{
+                            .key = try Store.effectBlob(&owners, 0, 32),
+                            .revision = @intCast(owner_revision),
+                            .scope = try Store.effectBlob(&owners, 2, canonical_scope.encoded_bytes),
+                            .absent = lease == .absent,
+                        },
+                    );
                 }
             }
             if (held.items.len == 0 and now_us == null) return false;
@@ -1202,7 +1223,12 @@ pub fn Methods(comptime Store: type) type {
             if (!try row.row()) return null;
             const revision = try row.signed(1);
             if (revision <= 0 or revision >= std.math.maxInt(i64) or try row.signed(5) != 1) return error.InvalidEffect;
-            return .{ .key = try Store.effectBlob(&row, 0, 32), .revision = @intCast(revision), .scope = try Store.effectBlob(&row, 2, canonical_scope.encoded_bytes), .absent = try Store.effectLease(&row, 3, 4) == .absent };
+            return .{
+                .key = try Store.effectBlob(&row, 0, 32),
+                .revision = @intCast(revision),
+                .scope = try Store.effectBlob(&row, 2, canonical_scope.encoded_bytes),
+                .absent = try Store.effectLease(&row, 3, 4) == .absent,
+            };
         }
         pub fn rekeyOwnerHeldTx(self: *Store, owner: OwnerHeld, jail: []const u8, legacy: [32]u8, planned: [32]u8, now: i64, stale_failure: error{ StaleEffect, StalePolicyTransition }) Error!void {
             const scope = canonical_scope.Scope.decode(&owner.scope) catch return error.InvalidEffect;
@@ -1225,7 +1251,20 @@ pub fn Methods(comptime Store: type) type {
                 return;
             }
             const transition_id = effects.hashParts("fail2zig-generation-rekey-v1", &.{ &planned, &owner.key });
-            _ = try self.transitionOwnerReservedTx(.{ .scope = scope, .jail = jail, .current_generation = legacy, .next_generation = planned, .expected_owner_revision = owner.revision, .transition_id = transition_id, .mode = .retain, .occurred_us = now }, now, false);
+            _ = try self.transitionOwnerReservedTx(
+                .{
+                    .scope = scope,
+                    .jail = jail,
+                    .current_generation = legacy,
+                    .next_generation = planned,
+                    .expected_owner_revision = owner.revision,
+                    .transition_id = transition_id,
+                    .mode = .retain,
+                    .occurred_us = now,
+                },
+                now,
+                false,
+            );
         }
 
         pub fn validateRetry(self: *Store, jail: []const u8, generation: [32]u8, policy: retry.Policy) Error!void {
@@ -1587,7 +1626,19 @@ pub fn Methods(comptime Store: type) type {
                     effect_identity = identity;
                     if (!kept_existing) {
                         const targets: i64 = if (self.schema_version >= 21) @intCast(action_outcome.max_targets_per_action) else 0;
-                        _ = try self.setOwnerReservedTx(.{ .scope = scope, .jail = record.jail, .generation = admission.generation, .decision_id = identity, .expected_revision = effect_revision, .lease = decision.lease, .decided_us = decision.decided_us }, effect_now, targets);
+                        _ = try self.setOwnerReservedTx(
+                            .{
+                                .scope = scope,
+                                .jail = record.jail,
+                                .generation = admission.generation,
+                                .decision_id = identity,
+                                .expected_revision = effect_revision,
+                                .lease = decision.lease,
+                                .decided_us = decision.decided_us,
+                            },
+                            effect_now,
+                            targets,
+                        );
                         if (self.schema_version >= 21) try self.prepareActionTargetsTx(.{ .action_id = identity, .scope_key = key, .jail = record.jail }, effect_now);
                     }
                 }

@@ -125,7 +125,10 @@ pub fn Methods(comptime Coordinator: type) type {
                 rekeyed_jails += 1;
                 rekeyed_rows +|= @intCast(@min(rows, std.math.maxInt(u32)));
             }
-            if (rekeyed_jails != 0) std.log.info("native storage: saved detection generations rekeyed without the ignore list or the subject share: jails={d} rows={d}; no ban, deadline, checkpoint or retry subject changed", .{ rekeyed_jails, rekeyed_rows });
+            if (rekeyed_jails != 0) std.log.info(
+                "native storage: saved detection generations rekeyed without the ignore list or the subject share: jails={d} rows={d}; no ban, deadline, checkpoint or retry subject changed",
+                .{ rekeyed_jails, rekeyed_rows },
+            );
         }
 
         fn completeGenerationRekeys(self: *Coordinator) !void {
@@ -138,11 +141,18 @@ pub fn Methods(comptime Coordinator: type) type {
                     const current = try custom_ignore.Snapshot.restore(self.allocator, assets.ignore_options, state.value.payload.?);
                     current.destroy();
                     const policy = try self.store.readRetryPolicy(jail.name) orelse return error.RetryAdmissionRequired;
-                    if (!std.mem.eql(u8, &policy.generation, &try self.plannedGeneration(jail, .planned)) or !try durable.Store.retryPoliciesEqual(policy.policy, jail.policy)) return error.RetryGenerationMismatch;
+                    if (!std.mem.eql(
+                        u8,
+                        &policy.generation,
+                        &try self.plannedGeneration(jail, .planned),
+                    ) or !try durable.Store.retryPoliciesEqual(policy.policy, jail.policy)) return error.RetryGenerationMismatch;
                 }
                 const repair = try self.store.completeGenerationRekey(jail.name);
                 if (repair.receipts == 0 and repair.cursors == 0) continue;
-                std.log.info("native storage: generation rekey completed: jail={} receipts={d} cursors={d}; left by an earlier policy reload; no ban, deadline, checkpoint position or record changed", .{ std.zig.fmtEscapes(jail.name), repair.receipts, repair.cursors });
+                std.log.info(
+                    "native storage: generation rekey completed: jail={} receipts={d} cursors={d}; left by an earlier policy reload; no ban, deadline, checkpoint position or record changed",
+                    .{ std.zig.fmtEscapes(jail.name), repair.receipts, repair.cursors },
+                );
             }
         }
 
@@ -173,8 +183,16 @@ pub fn Methods(comptime Coordinator: type) type {
             const now = self.clock.wallUs();
             const generation = reload_mod.generationId(digest, now);
             var jails: [max_jails]durable.Store.ConfigGenerationJail = undefined;
-            for (self.jails, 0..) |*jail, i| jails[i] = .{ .jail = jail.name, .digest = try reload_mod.jailDigest(jail.name, jail.policy, try self.plannedGeneration(jail, .planned)), .allowlist_snapshot = if (jail.custom_plan) |assets| assets.initial_ignore.payload else "" };
-            try self.store.recordConfigGeneration(.{ .generation = generation, .config_digest = digest, .config_path = self.config_path, .committed_us = now, .published = true, .mutation_revision = try self.store.adminRevision() }, jails[0..self.jails.len], retention);
+            for (self.jails, 0..) |*jail, i| jails[i] = .{
+                .jail = jail.name,
+                .digest = try reload_mod.jailDigest(jail.name, jail.policy, try self.plannedGeneration(jail, .planned)),
+                .allowlist_snapshot = if (jail.custom_plan) |assets| assets.initial_ignore.payload else "",
+            };
+            try self.store.recordConfigGeneration(
+                .{ .generation = generation, .config_digest = digest, .config_path = self.config_path, .committed_us = now, .published = true, .mutation_revision = try self.store.adminRevision() },
+                jails[0..self.jails.len],
+                retention,
+            );
             return .{ .generation = generation, .digest = digest };
         }
 
@@ -191,7 +209,10 @@ pub fn Methods(comptime Coordinator: type) type {
                 .custom = jail.custom_plan != null,
             };
             self.store.validateRuntimeAdmissions(admissions[0..self.jails.len], if (self.custom_jails != 0 and self.dns_server != null) self.dns_generation else null) catch |err| {
-                if (err == error.RetryGenerationMismatch) std.log.err("native: source/profile or policy differs from saved state; restore the previous source configuration and SSH executable layout before restarting; retain the database", .{});
+                if (err == error.RetryGenerationMismatch) std.log.err(
+                    "native: source/profile or policy differs from saved state; restore the previous source configuration and SSH executable layout before restarting; retain the database",
+                    .{},
+                );
                 return err;
             };
             if (self.startup_installation) |selected| if (try self.store.readInstallation()) |saved| {

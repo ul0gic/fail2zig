@@ -20,7 +20,11 @@ pub fn parse(text: []const u8) error{InvalidValue}!u64 {
         const unit_start = pos;
         while (pos < text.len and std.ascii.isAlphabetic(text[pos])) : (pos += 1) {}
         const unit = text[unit_start..pos];
-        const scale: u64 = if (std.mem.eql(u8, unit, "s")) 1 else if (std.mem.eql(u8, unit, "m") or std.mem.eql(u8, unit, "mm") or std.mem.eql(u8, unit, "min")) 60 else if (std.mem.eql(u8, unit, "h")) 3600 else if (std.mem.eql(u8, unit, "d")) 86_400 else if (std.mem.eql(u8, unit, "w")) 604_800 else if (std.mem.eql(u8, unit, "mo")) 2_629_800 else if (std.mem.eql(u8, unit, "y")) 31_557_600 else return error.InvalidValue;
+        const scale: u64 = if (std.mem.eql(u8, unit, "s")) 1 else if (std.mem.eql(u8, unit, "m") or std.mem.eql(u8, unit, "mm") or std.mem.eql(
+            u8,
+            unit,
+            "min",
+        )) 60 else if (std.mem.eql(u8, unit, "h")) 3600 else if (std.mem.eql(u8, unit, "d")) 86_400 else if (std.mem.eql(u8, unit, "w")) 604_800 else if (std.mem.eql(u8, unit, "mo")) 2_629_800 else if (std.mem.eql(u8, unit, "y")) 31_557_600 else return error.InvalidValue;
         const seconds = std.math.mul(u64, number, scale) catch return error.InvalidValue;
         total = std.math.add(u64, total, seconds) catch return error.InvalidValue;
         has_term = true;

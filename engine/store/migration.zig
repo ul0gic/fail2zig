@@ -69,7 +69,18 @@ pub fn Methods(comptime Store: type) type {
             const recovery = try allocator.dupe(u8, try row.boundedBytes(4, 4096));
             errdefer allocator.free(recovery);
             const state = std.meta.intToEnum(MigrationState, try row.signed(6)) catch return error.InvalidMigrationRow;
-            const run = MigrationRun{ .run_id = run_id, .host_id = try effectBlob(&row, 0, 32), .source_db_fp = try effectBlob(&row, 1, 32), .source_cfg_fp = try effectBlob(&row, 2, 32), .plan_fp = try effectBlob(&row, 3, 32), .recovery_point = recovery, .generation = try effectBlob(&row, 5, 32), .state = state, .created_us = try row.signed(7), .updated_us = try row.signed(8) };
+            const run = MigrationRun{
+                .run_id = run_id,
+                .host_id = try effectBlob(&row, 0, 32),
+                .source_db_fp = try effectBlob(&row, 1, 32),
+                .source_cfg_fp = try effectBlob(&row, 2, 32),
+                .plan_fp = try effectBlob(&row, 3, 32),
+                .recovery_point = recovery,
+                .generation = try effectBlob(&row, 5, 32),
+                .state = state,
+                .created_us = try row.signed(7),
+                .updated_us = try row.signed(8),
+            };
             try self.commitTransaction();
             return run;
         }
@@ -150,7 +161,13 @@ pub fn Methods(comptime Store: type) type {
             try row.int(2, @intCast(output.len));
             var count: usize = 0;
             while (try row.row()) {
-                output[count] = .{ .seq = std.math.cast(u64, try row.signed(0)) orelse return error.InvalidMigrationRow, .step = std.meta.intToEnum(MigrationStep, try row.signed(1)) catch return error.InvalidMigrationRow, .outcome = std.meta.intToEnum(MigrationOutcome, try row.signed(2)) catch return error.InvalidMigrationRow, .started_us = try row.signed(3), .finished_us = try row.optionalSigned(4) };
+                output[count] = .{
+                    .seq = std.math.cast(u64, try row.signed(0)) orelse return error.InvalidMigrationRow,
+                    .step = std.meta.intToEnum(MigrationStep, try row.signed(1)) catch return error.InvalidMigrationRow,
+                    .outcome = std.meta.intToEnum(MigrationOutcome, try row.signed(2)) catch return error.InvalidMigrationRow,
+                    .started_us = try row.signed(3),
+                    .finished_us = try row.optionalSigned(4),
+                };
                 count += 1;
             }
             try self.commitTransaction();
@@ -254,7 +271,15 @@ pub fn Methods(comptime Store: type) type {
                 try rows.blob(1, &run_id);
                 while (try rows.row()) {
                     if (held.items.len == effects.max_effects) return error.EffectCapacity;
-                    var item = Staged{ .seq = std.math.cast(u64, try rows.signed(0)) orelse return error.InvalidMigrationRow, .jail = undefined, .jail_len = 0, .scope = try effectBlob(&rows, 2, canonical_scope_bytes), .lease_kind = std.math.cast(u8, try rows.signed(3)) orelse return error.InvalidMigrationRow, .deadline_us = try rows.optionalSigned(4), .decided_us = try rows.signed(5) };
+                    var item = Staged{
+                        .seq = std.math.cast(u64, try rows.signed(0)) orelse return error.InvalidMigrationRow,
+                        .jail = undefined,
+                        .jail_len = 0,
+                        .scope = try effectBlob(&rows, 2, canonical_scope_bytes),
+                        .lease_kind = std.math.cast(u8, try rows.signed(3)) orelse return error.InvalidMigrationRow,
+                        .deadline_us = try rows.optionalSigned(4),
+                        .decided_us = try rows.signed(5),
+                    };
                     const jail = try rows.boundedBytes(1, 64);
                     @memcpy(item.jail[0..jail.len], jail);
                     item.jail_len = @intCast(jail.len);
@@ -310,13 +335,35 @@ pub fn Methods(comptime Store: type) type {
                         try self.recordMigrationConflictTx(run_id, item.seq, &item.scope, jail, item.lease_kind, item.deadline_us, now);
                         const extend = !owner.permanent and lease == .finite and (owner.deadline_us orelse 0) < lease.finite;
                         if (extend) {
-                            _ = try self.setOwnerTx(try (effects.CanonicalOwnerChange{ .scope = scope, .jail = jail, .generation = generation, .decision_id = effects.hashParts("fail2zig-migration-extend-v1", &.{ &run_id, &counter }), .expected_revision = existing_revision, .lease = lease, .decided_us = @min(owner.decided_us, now) }).exact(), now);
+                            _ = try self.setOwnerTx(
+                                try (effects.CanonicalOwnerChange{
+                                    .scope = scope,
+                                    .jail = jail,
+                                    .generation = generation,
+                                    .decision_id = effects.hashParts("fail2zig-migration-extend-v1", &.{ &run_id, &counter }),
+                                    .expected_revision = existing_revision,
+                                    .lease = lease,
+                                    .decided_us = @min(owner.decided_us, now),
+                                }).exact(),
+                                now,
+                            );
                             effect_changed = true;
                         }
                         continue;
                     }
                 }
-                _ = try self.setOwnerTx(try (effects.CanonicalOwnerChange{ .scope = scope, .jail = jail, .generation = generation, .decision_id = decision_id, .expected_revision = existing_revision, .lease = lease, .decided_us = @min(item.decided_us, now) }).exact(), now);
+                _ = try self.setOwnerTx(
+                    try (effects.CanonicalOwnerChange{
+                        .scope = scope,
+                        .jail = jail,
+                        .generation = generation,
+                        .decision_id = decision_id,
+                        .expected_revision = existing_revision,
+                        .lease = lease,
+                        .decided_us = @min(item.decided_us, now),
+                    }).exact(),
+                    now,
+                );
                 effect_changed = true;
                 activated += 1;
             }
@@ -419,7 +466,16 @@ pub fn Methods(comptime Store: type) type {
                 if (live and !native_decision) continue;
                 if (count == output.len) return error.EffectCapacity;
                 if (live) {
-                    var delta = MigrationDelta{ .kind = .ban, .jail = undefined, .jail_len = @intCast(jail.len), .scope = scope_bytes, .lease_kind = live_kind, .deadline_us = live_deadline, .decided_us = live_decided, .carry_back = if (scope.protocols.isAll() and scope.ports.isAll()) .mapped else .unsupported };
+                    var delta = MigrationDelta{
+                        .kind = .ban,
+                        .jail = undefined,
+                        .jail_len = @intCast(jail.len),
+                        .scope = scope_bytes,
+                        .lease_kind = live_kind,
+                        .deadline_us = live_deadline,
+                        .decided_us = live_decided,
+                        .carry_back = if (scope.protocols.isAll() and scope.ports.isAll()) .mapped else .unsupported,
+                    };
                     @memcpy(delta.jail[0..jail.len], jail);
                     output[count] = delta;
                     count += 1;
@@ -428,7 +484,16 @@ pub fn Methods(comptime Store: type) type {
                 const staged_kind = std.math.cast(u8, try staged.signed(2)) orelse return error.InvalidMigrationRow;
                 const staged_deadline = try staged.optionalSigned(3);
                 const expired = staged_kind == 1 and (staged_deadline orelse 0) <= now_us;
-                var delta = MigrationDelta{ .kind = .unban, .jail = undefined, .jail_len = @intCast(jail.len), .scope = scope_bytes, .lease_kind = 0, .deadline_us = null, .decided_us = now_us, .carry_back = if (expired) .expired else .mapped };
+                var delta = MigrationDelta{
+                    .kind = .unban,
+                    .jail = undefined,
+                    .jail_len = @intCast(jail.len),
+                    .scope = scope_bytes,
+                    .lease_kind = 0,
+                    .deadline_us = null,
+                    .decided_us = now_us,
+                    .carry_back = if (expired) .expired else .mapped,
+                };
                 @memcpy(delta.jail[0..jail.len], jail);
                 output[count] = delta;
                 count += 1;
@@ -444,7 +509,16 @@ pub fn Methods(comptime Store: type) type {
                     const scope_bytes = try effectBlob(&owners, 0, canonical_scope_bytes);
                     const scope = canonical_scope.Scope.decode(&scope_bytes) catch return error.InvalidMigrationRow;
                     const mapped = scope.protocols.isAll() and scope.ports.isAll();
-                    var delta = MigrationDelta{ .kind = .ban, .jail = undefined, .jail_len = @intCast(jail.len), .scope = scope_bytes, .lease_kind = std.math.cast(u8, try owners.signed(1)) orelse return error.InvalidMigrationRow, .deadline_us = try owners.optionalSigned(2), .decided_us = try owners.signed(3), .carry_back = if (mapped) .mapped else .unsupported };
+                    var delta = MigrationDelta{
+                        .kind = .ban,
+                        .jail = undefined,
+                        .jail_len = @intCast(jail.len),
+                        .scope = scope_bytes,
+                        .lease_kind = std.math.cast(u8, try owners.signed(1)) orelse return error.InvalidMigrationRow,
+                        .deadline_us = try owners.optionalSigned(2),
+                        .decided_us = try owners.signed(3),
+                        .carry_back = if (mapped) .mapped else .unsupported,
+                    };
                     @memcpy(delta.jail[0..jail.len], jail);
                     output[count] = delta;
                     count += 1;
@@ -498,7 +572,12 @@ pub fn Methods(comptime Store: type) type {
             while (try staged.row()) {
                 if (pending.items.len == effects.max_effects) return error.EffectCapacity;
                 const jail = try staged.boundedBytes(1, 64);
-                var item: @TypeOf(pending.items[0]) = .{ .seq = std.math.cast(u64, try staged.signed(0)) orelse return error.InvalidMigrationRow, .jail = undefined, .jail_len = @intCast(jail.len), .scope = try effectBlob(&staged, 2, canonical_scope_bytes) };
+                var item: @TypeOf(pending.items[0]) = .{
+                    .seq = std.math.cast(u64, try staged.signed(0)) orelse return error.InvalidMigrationRow,
+                    .jail = undefined,
+                    .jail_len = @intCast(jail.len),
+                    .scope = try effectBlob(&staged, 2, canonical_scope_bytes),
+                };
                 @memcpy(item.jail[0..jail.len], jail);
                 try pending.append(self.allocator, item);
             }
@@ -511,7 +590,19 @@ pub fn Methods(comptime Store: type) type {
                 if (!migrationOwnsDecision(run_id, item.seq, owner.decision_id)) continue;
                 var counter: [8]u8 = undefined;
                 std.mem.writeInt(u64, &counter, item.seq, .little);
-                _ = try self.transitionOwner(.{ .scope = scope, .jail = jail, .current_generation = owner.generation, .next_generation = owner.generation, .expected_owner_revision = owner.revision, .transition_id = effects.hashParts("fail2zig-migration-release-v1", &.{ &run_id, &counter }), .mode = .release, .occurred_us = clock.prepared_us }, clock);
+                _ = try self.transitionOwner(
+                    .{
+                        .scope = scope,
+                        .jail = jail,
+                        .current_generation = owner.generation,
+                        .next_generation = owner.generation,
+                        .expected_owner_revision = owner.revision,
+                        .transition_id = effects.hashParts("fail2zig-migration-release-v1", &.{ &run_id, &counter }),
+                        .mode = .release,
+                        .occurred_us = clock.prepared_us,
+                    },
+                    clock,
+                );
                 released += 1;
             }
             return released;

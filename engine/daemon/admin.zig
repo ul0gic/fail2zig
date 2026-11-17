@@ -62,10 +62,20 @@ pub fn Methods(comptime Coordinator: type) type {
         pub fn expireAdminWaitLocked(self: *Coordinator, request: *AdminRequest, wait_ms: u64) Staged {
             if (request.phase == .staged) {
                 self.admin_request = null;
-                return .{ .view = (AdminOutcomeView{ .outcome = .rejected, .kind = request.kind }).withReason("worker did not accept the request within {d} ms; no state was changed", .{wait_ms}), .owned = true };
+                return .{
+                    .view = (AdminOutcomeView{ .outcome = .rejected, .kind = request.kind }).withReason("worker did not accept the request within {d} ms; no state was changed", .{wait_ms}),
+                    .owned = true,
+                };
             }
             request.abandoned = true;
-            return .{ .view = (AdminOutcomeView{ .outcome = .uncertain, .kind = request.kind, .generation = self.published_generation }).withReason("worker is still executing the request; inspect status and the recorded outcome", .{}), .owned = false };
+            return .{
+                .view = (AdminOutcomeView{
+                    .outcome = .uncertain,
+                    .kind = request.kind,
+                    .generation = self.published_generation,
+                }).withReason("worker is still executing the request; inspect status and the recorded outcome", .{}),
+                .owned = false,
+            };
         }
         pub fn adminWorkLocked(self: *Coordinator) ?struct { request: *AdminRequest, phase: AdminPhase } {
             const request = self.admin_request orelse return null;
@@ -139,8 +149,15 @@ pub fn Methods(comptime Coordinator: type) type {
                 if (request.mutation_committed) {
                     if (request.kind == .group_disable) break :blk disableAcceptedView(self, request, err);
                     const failed = switch (request.kind) {
-                        .migration_activate => (AdminOutcomeView{ .outcome = .partial, .kind = request.kind, .generation = self.published_generation }).withReason("migration owner activation committed before {s}; inspect state before retrying", .{@errorName(err)}),
-                        else => (AdminOutcomeView{ .outcome = .partial, .kind = request.kind, .generation = self.published_generation }).withReason("mutation committed before {s}; inspect state before retrying", .{@errorName(err)}),
+                        .migration_activate => (AdminOutcomeView{ .outcome = .partial, .kind = request.kind, .generation = self.published_generation }).withReason(
+                            "migration owner activation committed before {s}; inspect state before retrying",
+                            .{@errorName(err)},
+                        ),
+                        else => (AdminOutcomeView{
+                            .outcome = .partial,
+                            .kind = request.kind,
+                            .generation = self.published_generation,
+                        }).withReason("mutation committed before {s}; inspect state before retrying", .{@errorName(err)}),
                     };
                     if (request.pending_state) |state| if (self.findJail(state.jail)) |jail| {
                         setJailPaused(jail, !state.enabled or state.paused);
@@ -151,7 +168,10 @@ pub fn Methods(comptime Coordinator: type) type {
                     };
                     break :blk self.adminDetail(request, failed, request.pending_state);
                 }
-                if (err == error.StorageCapacity) break :blk (AdminOutcomeView{ .outcome = .rejected, .kind = request.kind, .generation = self.published_generation }).withReason("state file at capacity (StorageCapacity); nothing was recorded; retry when fail2zig status shows intake open", .{});
+                if (err == error.StorageCapacity) break :blk (AdminOutcomeView{ .outcome = .rejected, .kind = request.kind, .generation = self.published_generation }).withReason(
+                    "state file at capacity (StorageCapacity); nothing was recorded; retry when fail2zig status shows intake open",
+                    .{},
+                );
                 break :blk (AdminOutcomeView{ .outcome = .rejected, .kind = request.kind, .generation = self.published_generation }).withReason("{s}", .{@errorName(err)});
             };
             if (request.phase == .awaiting) return;
@@ -163,7 +183,10 @@ pub fn Methods(comptime Coordinator: type) type {
             if (kind == .firewall_withdraw) return self.withdrawFirewall(request);
             // Why: A replayed disable is answered from its record ahead of the storage gate, so it reads back while mutations are refused.
             if (kind == .group_disable) {
-                if (!self.store_open or self.store.reopen_required) return base.withOutcome(.uncertain).withReason("storage is unavailable; recorded disable outcome cannot be read; inspect status before retrying", .{});
+                if (!self.store_open or self.store.reopen_required) return base.withOutcome(.uncertain).withReason(
+                    "storage is unavailable; recorded disable outcome cannot be read; inspect status before retrying",
+                    .{},
+                );
                 const admitted = self.store.admitAdminRequest(request.request_id, request.expected_revision) catch |failure| switch (failure) {
                     error.StaleAdminRevision, error.InvalidAdminRequest => return failure,
                     else => return base.withOutcome(.uncertain).withReason("disable outcome could not be read: {s}; inspect status before retrying", .{@errorName(failure)}),
@@ -188,17 +211,40 @@ pub fn Methods(comptime Coordinator: type) type {
                 .replayed => |prior| return .{ .outcome = prior.outcome, .kind = prior.kind, .generation = self.published_generation, .mutation_revision = prior.mutation_revision },
                 .fresh => {},
             }
-            if (!std.mem.eql(u8, &request.expected_generation, &self.published_generation)) return self.adminDetail(request, base.withOutcome(.rejected).withReason("stale generation; reload happened", .{}), null);
+            if (!std.mem.eql(u8, &request.expected_generation, &self.published_generation)) return self.adminDetail(
+                request,
+                base.withOutcome(.rejected).withReason("stale generation; reload happened", .{}),
+                null,
+            );
             const now = self.clock.wallUs();
             switch (kind) {
-                .setting_batch => return self.adminDetail(request, (AdminOutcomeView{ .outcome = .rejected, .kind = kind }).withReason("runtime-only settings are not supported; edit the configuration and reload", .{}), null),
+                .setting_batch => return self.adminDetail(
+                    request,
+                    (AdminOutcomeView{ .outcome = .rejected, .kind = kind }).withReason("runtime-only settings are not supported; edit the configuration and reload", .{}),
+                    null,
+                ),
                 .repair_source => return self.executeRepairSource(request, base, now),
                 .ignore_add => return self.executeIgnoreAdd(request),
                 .ignore_remove => return self.executeIgnoreRemove(request),
                 .group_enable, .group_disable, .group_pause, .group_resume => {
-                    const jail = self.findJail(request.jailName()) orelse return self.adminDetail(request, (AdminOutcomeView{ .outcome = .absent, .kind = kind }).withReason("unknown jail", .{}), null);
-                    if (jail.retiring and (kind == .group_enable or kind == .group_resume)) return self.adminDetail(request, base.withOutcome(.rejected).withReason("jail retirement in progress; retry after completion", .{}), null);
-                    var state = durable.Store.JailAdminState{ .jail = jail.name, .enabled = true, .paused = false, .generation = self.published_generation, .changed_us = @max(0, now), .request_id = request.request_id };
+                    const jail = self.findJail(request.jailName()) orelse return self.adminDetail(
+                        request,
+                        (AdminOutcomeView{ .outcome = .absent, .kind = kind }).withReason("unknown jail", .{}),
+                        null,
+                    );
+                    if (jail.retiring and (kind == .group_enable or kind == .group_resume)) return self.adminDetail(
+                        request,
+                        base.withOutcome(.rejected).withReason("jail retirement in progress; retry after completion", .{}),
+                        null,
+                    );
+                    var state = durable.Store.JailAdminState{
+                        .jail = jail.name,
+                        .enabled = true,
+                        .paused = false,
+                        .generation = self.published_generation,
+                        .changed_us = @max(0, now),
+                        .request_id = request.request_id,
+                    };
                     var existing: durable.Store.JailAdminState = undefined;
                     if (try self.store.jailAdminState(jail.name, &existing)) {
                         state.enabled = existing.enabled;
@@ -215,7 +261,10 @@ pub fn Methods(comptime Coordinator: type) type {
                         .group_disable => {
                             state.enabled = false;
                             state.paused = true;
-                            const partial = base.withOutcome(.partial).withReason("jail disabled; owner releases continue automatically, including after restart; enabling cancels remaining releases", .{});
+                            const partial = base.withOutcome(.partial).withReason(
+                                "jail disabled; owner releases continue automatically, including after restart; enabling cancels remaining releases",
+                                .{},
+                            );
                             const revision = self.store.finishAdminRequest(.{ .request_id = request.request_id, .kind = kind, .subject = jail.name, .outcome = .partial, .generation = self.published_generation, .committed_us = @max(0, now), .detail = partial.reason.slice(), .admission_revision = request.expected_revision }, state) catch |failure| {
                                 self.recoverAdminStorageIfNeeded(failure);
                                 return base.withOutcome(.uncertain).withReason("disable acceptance not confirmed: {s}; inspect status and replay the same request", .{@errorName(failure)});
@@ -249,10 +298,18 @@ pub fn Methods(comptime Coordinator: type) type {
                     return view;
                 },
                 .ban, .unban => {
-                    const jail = self.findJail(request.jailName()) orelse return self.adminDetail(request, (AdminOutcomeView{ .outcome = .absent, .kind = kind }).withReason("unknown jail", .{}), null);
+                    const jail = self.findJail(request.jailName()) orelse return self.adminDetail(
+                        request,
+                        (AdminOutcomeView{ .outcome = .absent, .kind = kind }).withReason("unknown jail", .{}),
+                        null,
+                    );
                     if (kind == .ban and jail.retiring) return self.adminDetail(request, base.withOutcome(.rejected).withReason("jail retirement in progress; retry after completion", .{}), null);
                     if (kind == .ban and !jail.admin_enabled) return self.adminDetail(request, base.withOutcome(.rejected).withReason("jail is disabled; enable it before adding a ban", .{}), null);
-                    const manager = self.effects orelse return self.adminDetail(request, (AdminOutcomeView{ .outcome = .rejected, .kind = kind }).withReason("jail is log-only; manual bans require an enforcing backend", .{}), null);
+                    const manager = self.effects orelse return self.adminDetail(
+                        request,
+                        (AdminOutcomeView{ .outcome = .rejected, .kind = kind }).withReason("jail is log-only; manual bans require an enforcing backend", .{}),
+                        null,
+                    );
                     const canonical = try self.adminScope(request);
                     const scope = try effect.Scope.exact(canonical);
                     const key = try scope.key(manager.installation);
@@ -268,14 +325,46 @@ pub fn Methods(comptime Coordinator: type) type {
                         const duration: @import("../effect/lease.zig").Duration = if (request.duration_s) |seconds| try @import("../effect/lease.zig").Duration.finiteSeconds(seconds) else jail.policy.duration;
                         const lease = try duration.lease(now);
                         noteIgnoredTarget(request, jail);
-                        _ = try self.store.setOwnerFromCanonical(.{ .scope = canonical, .jail = jail.name, .generation = generation, .decision_id = durable.Store.adminDecisionId(request.request_id, request.expected_revision), .expected_revision = if (current) |owner| owner.revision else 0, .lease = lease, .decided_us = now, .origin = .manual }, clock);
+                        _ = try self.store.setOwnerFromCanonical(
+                            .{
+                                .scope = canonical,
+                                .jail = jail.name,
+                                .generation = generation,
+                                .decision_id = durable.Store.adminDecisionId(request.request_id, request.expected_revision),
+                                .expected_revision = if (current) |owner| owner.revision else 0,
+                                .lease = lease,
+                                .decided_us = now,
+                                .origin = .manual,
+                            },
+                            clock,
+                        );
                         jail.manual_bans +|= 1;
                         request.expect_absent = false;
                     } else {
-                        if (origin) |held| if (held.origin == .config) return self.adminDetail(request, (AdminOutcomeView{ .outcome = .rejected, .kind = kind }).withReason("{s}", .{ban_origin.refused_config_text}), null);
-                        const owner = current orelse return self.adminDetail(request, (AdminOutcomeView{ .outcome = .absent, .kind = kind }).withReason("no owner for this scope in the jail", .{}), null);
+                        if (origin) |held| if (held.origin == .config) return self.adminDetail(
+                            request,
+                            (AdminOutcomeView{ .outcome = .rejected, .kind = kind }).withReason("{s}", .{ban_origin.refused_config_text}),
+                            null,
+                        );
+                        const owner = current orelse return self.adminDetail(
+                            request,
+                            (AdminOutcomeView{ .outcome = .absent, .kind = kind }).withReason("no owner for this scope in the jail", .{}),
+                            null,
+                        );
                         if (owner.lease == .absent) return self.adminDetail(request, (AdminOutcomeView{ .outcome = .absent, .kind = kind }).withReason("owner already released", .{}), null);
-                        _ = try self.store.transitionOwner(.{ .scope = canonical, .jail = jail.name, .current_generation = owner.generation, .next_generation = owner.generation, .expected_owner_revision = owner.revision, .transition_id = request.request_id, .mode = .release, .occurred_us = now }, clock);
+                        _ = try self.store.transitionOwner(
+                            .{
+                                .scope = canonical,
+                                .jail = jail.name,
+                                .current_generation = owner.generation,
+                                .next_generation = owner.generation,
+                                .expected_owner_revision = owner.revision,
+                                .transition_id = request.request_id,
+                                .mode = .release,
+                                .occurred_us = now,
+                            },
+                            clock,
+                        );
                         request.mutation_committed = true;
                         if (request.prefix == null) _ = try self.store.releaseRetryDecision(jail.name, hostSubject(request.address.?), now);
                         request.expect_absent = true;
@@ -292,9 +381,16 @@ pub fn Methods(comptime Coordinator: type) type {
                     const address = request.address orelse return error.AdminAddressRequired;
                     const subject = hostSubject(address);
                     const scope: durable.HistoryResetScope = if (request.all) .overall else .{ .jail = request.jailName() };
-                    if (!request.all and self.findJail(request.jailName()) == null) return self.adminDetail(request, (AdminOutcomeView{ .outcome = .absent, .kind = kind }).withReason("unknown jail", .{}), null);
+                    if (!request.all and self.findJail(request.jailName()) == null) return self.adminDetail(
+                        request,
+                        (AdminOutcomeView{ .outcome = .absent, .kind = kind }).withReason("unknown jail", .{}),
+                        null,
+                    );
                     const expected = try self.store.historyResetRevision(scope, subject);
-                    _ = try self.store.resetHistory(.{ .scope = scope, .subject = subject, .expected_revision = expected, .intent_id = request.request_id }, .{ .prepared_us = now, .context = self, .read = wallClockEffect });
+                    _ = try self.store.resetHistory(
+                        .{ .scope = scope, .subject = subject, .expected_revision = expected, .intent_id = request.request_id },
+                        .{ .prepared_us = now, .context = self, .read = wallClockEffect },
+                    );
                     return self.adminDetail(request, base, null);
                 },
             }
@@ -315,7 +411,10 @@ pub fn Methods(comptime Coordinator: type) type {
             if (!outcome.replayed) {
                 request.mutation_committed = true;
                 jail.rekeyed = true;
-                self.gate.requestRebuild() catch |failure| std.log.warn("native: jail={} source repaired; reading resumes with the next recovery: {s}", .{ std.zig.fmtEscapes(name), @errorName(failure) });
+                self.gate.requestRebuild() catch |failure| std.log.warn(
+                    "native: jail={} source repaired; reading resumes with the next recovery: {s}",
+                    .{ std.zig.fmtEscapes(name), @errorName(failure) },
+                );
             }
             return self.adminDetail(request, base.withReason("{s}", .{source_repair.headline(outcome)}), null);
         }
@@ -329,7 +428,11 @@ pub fn Methods(comptime Coordinator: type) type {
             const cell = ignoreCell(jail) orelse return;
             const item = cell.*.check(request.address.?) orelse return;
             var text: [64]u8 = undefined;
-            const written = std.fmt.bufPrint(&request.warning.bytes, "{s} is on the ignore list ({s})", .{ formatAdminTarget(request, &text), ignoreSourceText(item.source).? }) catch request.warning.bytes[0..0];
+            const written = std.fmt.bufPrint(
+                &request.warning.bytes,
+                "{s} is on the ignore list ({s})",
+                .{ formatAdminTarget(request, &text), ignoreSourceText(item.source).? },
+            ) catch request.warning.bytes[0..0];
             request.warning.len = @intCast(written.len);
         }
         pub fn formatAdminTarget(request: *const AdminRequest, buffer: *[64]u8) []const u8 {
@@ -338,14 +441,30 @@ pub fn Methods(comptime Coordinator: type) type {
         }
         pub fn activateMigration(self: *Coordinator, request: *AdminRequest, base: AdminOutcomeView, now: i64) !AdminOutcomeView {
             const run_id = request.run_id orelse return error.AdminRunIdRequired;
-            if (self.effects == null) return self.adminDetail(request, (AdminOutcomeView{ .outcome = .rejected, .kind = request.kind }).withReason("destination is log-only; migrated owners need an enforcing backend", .{}), null);
-            const migration_run = (try self.store.migrationRun(self.allocator, run_id)) orelse return self.adminDetail(request, (AdminOutcomeView{ .outcome = .absent, .kind = request.kind }).withReason("unknown migration run", .{}), null);
+            if (self.effects == null) return self.adminDetail(
+                request,
+                (AdminOutcomeView{ .outcome = .rejected, .kind = request.kind }).withReason("destination is log-only; migrated owners need an enforcing backend", .{}),
+                null,
+            );
+            const migration_run = (try self.store.migrationRun(self.allocator, run_id)) orelse return self.adminDetail(
+                request,
+                (AdminOutcomeView{ .outcome = .absent, .kind = request.kind }).withReason("unknown migration run", .{}),
+                null,
+            );
             self.allocator.free(migration_run.recovery_point);
             if (migration_run.state == .complete) return self.adminDetail(request, base.withReason("migration run already complete", .{}), null);
-            if (migration_run.state != .staged and migration_run.state != .activating) return self.adminDetail(request, (AdminOutcomeView{ .outcome = .rejected, .kind = request.kind }).withReason("migration run is {s}, not staged", .{@tagName(migration_run.state)}), null);
+            if (migration_run.state != .staged and migration_run.state != .activating) return self.adminDetail(
+                request,
+                (AdminOutcomeView{ .outcome = .rejected, .kind = request.kind }).withReason("migration run is {s}, not staged", .{@tagName(migration_run.state)}),
+                null,
+            );
             try self.closeInterruptedMigrationStep(run_id, now);
             inline for (.{ durable.Store.MigrationStep.validate_plan, .check_drift, .capture_recovery_point, .quiesce_source, .stage_destination }) |required| {
-                if (!try self.store.migrationStepSucceeded(run_id, required)) return self.adminDetail(request, (AdminOutcomeView{ .outcome = .rejected, .kind = request.kind }).withReason("validation_failed: step {s} has no recorded success", .{@tagName(required)}), null);
+                if (!try self.store.migrationStepSucceeded(run_id, required)) return self.adminDetail(
+                    request,
+                    (AdminOutcomeView{ .outcome = .rejected, .kind = request.kind }).withReason("validation_failed: step {s} has no recorded success", .{@tagName(required)}),
+                    null,
+                );
             }
             var generations: [64]durable.Store.JailGeneration = undefined;
             var count: usize = 0;
@@ -359,7 +478,11 @@ pub fn Methods(comptime Coordinator: type) type {
             const clock = effect.Clock{ .prepared_us = now, .context = self, .read = wallClockEffect };
             const activated = self.store.activateStagedOwners(run_id, generations[0..count], clock) catch |err| {
                 try self.store.finishMigrationStep(run_id, seq, .operational_failure, @errorName(err), null, self.clock.wallUs());
-                if (err == error.MigrationJailUnknown) return self.adminDetail(request, base.withOutcome(.rejected).withReason("destination jail is disabled or unconfigured; enable/configure it before activation", .{}), null);
+                if (err == error.MigrationJailUnknown) return self.adminDetail(
+                    request,
+                    base.withOutcome(.rejected).withReason("destination jail is disabled or unconfigured; enable/configure it before activation", .{}),
+                    null,
+                );
                 return self.adminDetail(request, (AdminOutcomeView{ .outcome = .rejected, .kind = request.kind }).withReason("activation failed: {s}", .{@errorName(err)}), null);
             };
             request.mutation_committed = true;
@@ -373,12 +496,28 @@ pub fn Methods(comptime Coordinator: type) type {
         }
         pub fn rollbackMigration(self: *Coordinator, request: *AdminRequest, base: AdminOutcomeView, now: i64) !AdminOutcomeView {
             const run_id = request.run_id orelse return error.AdminRunIdRequired;
-            if (self.effects == null) return self.adminDetail(request, (AdminOutcomeView{ .outcome = .rejected, .kind = request.kind }).withReason("destination is log-only; nothing is realized to release", .{}), null);
-            const migration_run = (try self.store.migrationRun(self.allocator, run_id)) orelse return self.adminDetail(request, (AdminOutcomeView{ .outcome = .absent, .kind = request.kind }).withReason("unknown migration run", .{}), null);
+            if (self.effects == null) return self.adminDetail(
+                request,
+                (AdminOutcomeView{ .outcome = .rejected, .kind = request.kind }).withReason("destination is log-only; nothing is realized to release", .{}),
+                null,
+            );
+            const migration_run = (try self.store.migrationRun(self.allocator, run_id)) orelse return self.adminDetail(
+                request,
+                (AdminOutcomeView{ .outcome = .absent, .kind = request.kind }).withReason("unknown migration run", .{}),
+                null,
+            );
             self.allocator.free(migration_run.recovery_point);
-            if (migration_run.state != .complete and migration_run.state != .activating and migration_run.state != .rolled_back) return self.adminDetail(request, (AdminOutcomeView{ .outcome = .rejected, .kind = request.kind }).withReason("migration run is {s}; only an activated run can be rolled back", .{@tagName(migration_run.state)}), null);
+            if (migration_run.state != .complete and migration_run.state != .activating and migration_run.state != .rolled_back) return self.adminDetail(
+                request,
+                (AdminOutcomeView{ .outcome = .rejected, .kind = request.kind }).withReason("migration run is {s}; only an activated run can be rolled back", .{@tagName(migration_run.state)}),
+                null,
+            );
             const open = try self.store.pendingMigrationStep(run_id);
-            if (open == null or open.?.step != .rollback) return self.adminDetail(request, (AdminOutcomeView{ .outcome = .rejected, .kind = request.kind }).withReason("no rollback in progress for this run; restore the source with `migrate rollback` first", .{}), null);
+            if (open == null or open.?.step != .rollback) return self.adminDetail(
+                request,
+                (AdminOutcomeView{ .outcome = .rejected, .kind = request.kind }).withReason("no rollback in progress for this run; restore the source with `migrate rollback` first", .{}),
+                null,
+            );
             const clock = effect.Clock{ .prepared_us = now, .context = self, .read = wallClockEffect };
             _ = self.store.releaseMigrationOwners(run_id, clock) catch |err| {
                 return self.adminDetail(request, (AdminOutcomeView{ .outcome = .rejected, .kind = request.kind }).withReason("release failed: {s}", .{@errorName(err)}), null);
@@ -498,7 +637,10 @@ pub fn Methods(comptime Coordinator: type) type {
             if (!manager.withdrawn) return base.withOutcome(.rejected).withReason("{s}; no rules removed", .{@errorName(failure)});
             const after = manager.residualInstalled();
             const remaining = after.installed orelse {
-                std.log.warn("native: firewall withdraw stopped by {s}; remaining rules unreadable: {s}; enforcement withdrawn until the next start", .{ @errorName(failure), @errorName(after.cause.?) });
+                std.log.warn(
+                    "native: firewall withdraw stopped by {s}; remaining rules unreadable: {s}; enforcement withdrawn until the next start",
+                    .{ @errorName(failure), @errorName(after.cause.?) },
+                );
                 return base.withOutcome(.uncertain).withReason("{s}; remaining rules unreadable: {s}", .{ @errorName(failure), @errorName(after.cause.?) });
             };
             const outcome: durable.Store.AdminOutcome = if (failure == error.WithdrawalBoundReached or failure == error.StopRequested or effect_runtime.transientCause(failure)) .partial else .uncertain;
@@ -507,12 +649,18 @@ pub fn Methods(comptime Coordinator: type) type {
         }
         fn disableReplayView(self: *Coordinator, prior: durable.Store.AdminReplay) AdminOutcomeView {
             const view = AdminOutcomeView{ .outcome = prior.outcome, .kind = prior.kind, .generation = self.published_generation, .mutation_revision = prior.mutation_revision };
-            if (prior.kind == .group_disable and (prior.outcome == .partial or prior.outcome == .uncertain)) return view.withReason("jail disable continues automatically while disabled, including after restart; inspect jail/status; enabling cancels remaining releases", .{});
+            if (prior.kind == .group_disable and (prior.outcome == .partial or prior.outcome == .uncertain)) return view.withReason(
+                "jail disable continues automatically while disabled, including after restart; inspect jail/status; enabling cancels remaining releases",
+                .{},
+            );
             return view;
         }
         fn disableAcceptedView(self: *Coordinator, request: *AdminRequest, cause: ?anyerror) AdminOutcomeView {
             const view = AdminOutcomeView{ .outcome = .partial, .kind = .group_disable, .generation = self.published_generation, .mutation_revision = request.disable_revision };
-            if (cause) |failure| return view.withReason("disable accepted; cleanup is waiting on {s} and resumes automatically after recovery; enabling cancels remaining releases", .{@errorName(failure)});
+            if (cause) |failure| return view.withReason(
+                "disable accepted; cleanup is waiting on {s} and resumes automatically after recovery; enabling cancels remaining releases",
+                .{@errorName(failure)},
+            );
             return view.withReason("jail disabled; owner releases continue automatically, including after restart; inspect jail/status; enabling cancels remaining releases", .{});
         }
         fn syncDisableOutcome(self: *Coordinator, jail: *Jail, next: durable.Store.AdminOutcome, detail: []const u8) !void {
@@ -585,7 +733,10 @@ pub fn Methods(comptime Coordinator: type) type {
                 return;
             }
             const admitted = self.store.admitAdminRequest(request.request_id, request.expected_revision) catch |failure| {
-                self.completeAdmin(request, (view.withOutcome(.uncertain)).withReason("disable accepted; recorded outcome temporarily unreadable: {s}; inspect status before retrying", .{@errorName(failure)}));
+                self.completeAdmin(
+                    request,
+                    (view.withOutcome(.uncertain)).withReason("disable accepted; recorded outcome temporarily unreadable: {s}; inspect status before retrying", .{@errorName(failure)}),
+                );
                 return;
             };
             switch (admitted) {
@@ -604,7 +755,10 @@ pub fn Methods(comptime Coordinator: type) type {
                 return;
             }
             if (self.effects) |manager| if (manager.status.uncertain) {
-                view = (view.withOutcome(.uncertain)).withReason("effect outcome uncertain: {s}; disabled cleanup continues after recovery", .{if (manager.status.cause) |failure| @errorName(failure) else "unknown"});
+                view = (view.withOutcome(.uncertain)).withReason(
+                    "effect outcome uncertain: {s}; disabled cleanup continues after recovery",
+                    .{if (manager.status.cause) |failure| @errorName(failure) else "unknown"},
+                );
                 syncDisableOutcome(self, jail.?, .uncertain, view.reason.slice()) catch |failure| {
                     self.completeAdmin(request, view.withReason("effect outcome uncertain; uncertainty could not be recorded: {s}; inspect status", .{@errorName(failure)}));
                     return;
@@ -621,7 +775,11 @@ pub fn Methods(comptime Coordinator: type) type {
             if (request.kind == .group_disable and request.mutation_committed) return settleJailDisable(self, request);
             if (request.ignore) |ignore_state| if (ignore_state.lifting) return self.settleIgnoreLifts(request, ignore_state);
             const manager = self.effects orelse {
-                const view = if (request.run_id != null) (AdminOutcomeView{ .outcome = .uncertain, .kind = request.kind, .destination = "uncertain" }).withReason("no enforcement backend to verify activation", .{}) else AdminOutcomeView{ .outcome = .applied, .kind = request.kind };
+                const view = if (request.run_id != null) (AdminOutcomeView{
+                    .outcome = .uncertain,
+                    .kind = request.kind,
+                    .destination = "uncertain",
+                }).withReason("no enforcement backend to verify activation", .{}) else AdminOutcomeView{ .outcome = .applied, .kind = request.kind };
                 if (request.run_id != null) self.finishMigrationVerify(request, view);
                 self.completeAdmin(request, self.adminDetail(request, view, request.pending_state));
                 return;
@@ -765,7 +923,10 @@ pub fn Methods(comptime Coordinator: type) type {
                 else => true,
             };
             if (needs_jail and request.jail_len == 0) return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "jail is required") } };
-            if ((kind == .ban or kind == .unban or kind == .history_reset or kind == .ignore_add or kind == .ignore_remove) and request.address == null) return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "address is required") } };
+            if ((kind == .ban or kind == .unban or kind == .history_reset or kind == .ignore_add or kind == .ignore_remove) and request.address == null) return .{ .err = .{
+                .code = 400,
+                .message = try a.dupe(u8, "address is required"),
+            } };
             if (request.prefix) |prefix| {
                 const address = request.address orelse return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "address is required") } };
                 const max: u8 = if (address == .ipv4) 32 else 128;
@@ -778,7 +939,10 @@ pub fn Methods(comptime Coordinator: type) type {
                     std.fmt.bufPrint(&text, "{}/{d}", .{ request.address.?, prefix })
                 else
                     std.fmt.bufPrint(&text, "{}", .{request.address.?})) catch return .{ .err = .{ .code = 400, .message = try a.dupe(u8, "invalid address") } };
-                request.ignore_entry = shared.types.IgnoreEntry.parse(printed) catch |failure| return .{ .err = .{ .code = 400, .message = try a.dupe(u8, if (failure == error.InvalidPrefix) "invalid prefix" else "invalid address") } };
+                request.ignore_entry = shared.types.IgnoreEntry.parse(printed) catch |failure| return .{ .err = .{
+                    .code = 400,
+                    .message = try a.dupe(u8, if (failure == error.InvalidPrefix) "invalid prefix" else "invalid address"),
+                } };
             }
             const wait_ms: u64 = if (kind == .migration_activate or kind == .migration_rollback or kind == .firewall_withdraw) 10_000 else if (request.unban) ignore_unban_wait_ms else 3000;
             const response_entry = request.ignore_entry;
@@ -787,7 +951,10 @@ pub fn Methods(comptime Coordinator: type) type {
             const view = staged.view;
             auditAdmin(kind, body, view.outcome, peer_uid);
             const w = out.writer(a);
-            try w.print("{{\"schema_version\":1,\"kind\":\"{s}\",\"outcome\":\"{s}\",\"generation\":\"{s}\",\"mutation_revision\":{d},\"enforced\":{},\"reasons\":[", .{ @tagName(view.kind), @tagName(view.outcome), &std.fmt.bytesToHex(view.generation, .lower), view.mutation_revision, view.enforced });
+            try w.print(
+                "{{\"schema_version\":1,\"kind\":\"{s}\",\"outcome\":\"{s}\",\"generation\":\"{s}\",\"mutation_revision\":{d},\"enforced\":{},\"reasons\":[",
+                .{ @tagName(view.kind), @tagName(view.outcome), &std.fmt.bytesToHex(view.generation, .lower), view.mutation_revision, view.enforced },
+            );
             const ignore_state: ?*const IgnoreWork = if (staged.owned) request.ignore else null;
             var wrote_reason = false;
             if (view.reason.len != 0) {
@@ -812,7 +979,10 @@ pub fn Methods(comptime Coordinator: type) type {
                 if (view.outcome == .applied) if (request.resumed_offset) |offset| try w.print(",\"resumed_offset\":{d}", .{offset});
             }
             if (kind == .ignore_add or kind == .ignore_remove) try writeIgnoreFields(w, kind, body, response_entry.?, ignore_state);
-            if (kind == .migration_activate or kind == .migration_rollback) try w.print(",\"observed_protection\":{{\"destination\":\"{s}\",\"source\":\"unknown\"}}", .{view.destination orelse "unknown"});
+            if (kind == .migration_activate or kind == .migration_rollback) try w.print(
+                ",\"observed_protection\":{{\"destination\":\"{s}\",\"source\":\"unknown\"}}",
+                .{view.destination orelse "unknown"},
+            );
             try w.writeAll("}");
             return switch (view.outcome) {
                 .applied => .{ .ok = .{ .payload = try out.toOwnedSlice(a) } },
@@ -855,7 +1025,10 @@ pub fn Methods(comptime Coordinator: type) type {
                 try std.json.encodeJsonString(try formatListSubject(ban.canonical.subject, &scope_buffer), .{}, w);
                 try w.writeAll(",\"deadline_us\":");
                 if (ban.deadline_us) |deadline| try w.print("{d}", .{deadline}) else try w.writeAll("null");
-                try w.print(",\"permanent\":{},\"confirmed\":{},\"relation\":\"{s}\",\"lift\":\"{s}\",\"lift_reason\":", .{ ban.deadline_us == null, ban.confirmed, @tagName(ban.relation), @tagName(ban.lift) });
+                try w.print(
+                    ",\"permanent\":{},\"confirmed\":{},\"relation\":\"{s}\",\"lift\":\"{s}\",\"lift_reason\":",
+                    .{ ban.deadline_us == null, ban.confirmed, @tagName(ban.relation), @tagName(ban.lift) },
+                );
                 if (ban.reason) |text| try std.json.encodeJsonString(text, .{}, w) else try w.writeAll("null");
                 try w.writeAll("}");
             };
@@ -943,7 +1116,13 @@ pub fn Methods(comptime Coordinator: type) type {
             for (found[0..ignore_state.ban_count], ignore_state.bans[0..ignore_state.ban_count]) |item, *slot| {
                 if (enforces) {
                     const owner = self.owner_active[item.index];
-                    slot.* = .{ .canonical = owner.scope.canonical, .key = owner.key, .deadline_us = leaseDeadline(owner.lease), .confirmed = self.owner_confirmed[item.index] and self.confirmationKnown(monotonic(self)), .relation = item.relation };
+                    slot.* = .{
+                        .canonical = owner.scope.canonical,
+                        .key = owner.key,
+                        .deadline_us = leaseDeadline(owner.lease),
+                        .confirmed = self.owner_confirmed[item.index] and self.confirmationKnown(monotonic(self)),
+                        .relation = item.relation,
+                    };
                 } else {
                     const decision = jail.active[item.index];
                     slot.* = .{ .canonical = decisionScope(decision.subject), .key = [_]u8{0} ** 32, .deadline_us = leaseDeadline(decision.lease), .confirmed = false, .relation = item.relation };
@@ -1102,7 +1281,12 @@ pub fn Methods(comptime Coordinator: type) type {
             ignore_state.expires_us = expires_us;
             const recorded = existing != null and existing.? != .config;
             if (!recorded and before.entries.len + @intFromBool(existing == null) > ignore_set.distinct_bound)
-                return self.ignoreRefusal(request, .rejected, "jail {s} already has {d} ignore entries (configuration and runtime combined), the limit. Remove one with fail2zig ignore remove first.", .{ name, before.entries.len });
+                return self.ignoreRefusal(
+                    request,
+                    .rejected,
+                    "jail {s} already has {d} ignore entries (configuration and runtime combined), the limit. Remove one with fail2zig ignore remove first.",
+                    .{ name, before.entries.len },
+                );
             runtime[runtime_count] = .{ .entry = entry, .expires_us = expires_us };
             if (recorded) for (runtime[0..runtime_count]) |*item| if (item.entry.order(entry) == .eq) {
                 if (item.expires_us) |held| if (expires_us == null or expires_us.? > held) {
@@ -1110,20 +1294,40 @@ pub fn Methods(comptime Coordinator: type) type {
                 };
             };
             const after = ignore_set.EffectiveIgnore.build(self.allocator, literals, deadlines, runtime[0 .. runtime_count + @intFromBool(!recorded)], own, now) catch |failure| switch (failure) {
-                error.IgnoreCapacityExceeded => return self.ignoreRefusal(request, .rejected, "jail {s} already has {d} ignore entries (configuration and runtime combined), the limit. Remove one with fail2zig ignore remove first.", .{ name, before.entries.len }),
+                error.IgnoreCapacityExceeded => return self.ignoreRefusal(
+                    request,
+                    .rejected,
+                    "jail {s} already has {d} ignore entries (configuration and runtime combined), the limit. Remove one with fail2zig ignore remove first.",
+                    .{ name, before.entries.len },
+                ),
                 else => return failure,
             };
             var installed = false;
             defer if (!installed) after.deinit(self.allocator);
             if (jail) |value| try self.collectRelatedBans(request, value);
             if (request.unban and ignore_state.inside_total > max_lifted_bans)
-                return self.ignoreRefusal(request, .rejected, "{s} covers {d} bans in {s}; --unban lifts at most {d} per command. Nothing changed. Add the entry without --unban, then lift bans with fail2zig unban.", .{ canonical, ignore_state.inside_total, name, max_lifted_bans });
+                return self.ignoreRefusal(
+                    request,
+                    .rejected,
+                    "{s} covers {d} bans in {s}; --unban lifts at most {d} per command. Nothing changed. Add the entry without --unban, then lift bans with fail2zig unban.",
+                    .{ canonical, ignore_state.inside_total, name, max_lifted_bans },
+                );
             ignore_state.entry_state = .present;
             const result = self.store.addIgnoreEntry(name, entry, now, expires_us) catch |failure| {
                 if (failure == error.IgnoreCapacity)
-                    return self.ignoreRefusal(request, .rejected, "jail {s} already has {d} ignore entries (configuration and runtime combined), the limit. Remove one with fail2zig ignore remove first.", .{ name, before.entries.len });
+                    return self.ignoreRefusal(
+                        request,
+                        .rejected,
+                        "jail {s} already has {d} ignore entries (configuration and runtime combined), the limit. Remove one with fail2zig ignore remove first.",
+                        .{ name, before.entries.len },
+                    );
                 if (failure == error.StorageCapacity)
-                    return self.ignoreRefusal(request, .rejected, "state file at capacity (StorageCapacity); the entry for jail {s} was not added. Retry when fail2zig status shows intake open.", .{name});
+                    return self.ignoreRefusal(
+                        request,
+                        .rejected,
+                        "state file at capacity (StorageCapacity); the entry for jail {s} was not added. Retry when fail2zig status shows intake open.",
+                        .{name},
+                    );
                 std.log.err("native admin: ignore entry commit failed: {s}", .{@errorName(failure)});
                 return self.ignoreUncertain(request);
             };
@@ -1140,7 +1344,10 @@ pub fn Methods(comptime Coordinator: type) type {
             if (ignore_state.entry_state == .added) {
                 const lifting = if (request.unban) ignore_state.inside_total else 0;
                 if (lifting != 0)
-                    std.log.info("native: jail={} ignore entry added: {} (runtime); unban requested for {d} {s}", .{ std.zig.fmtEscapes(name), std.zig.fmtEscapes(canonical), lifting, if (lifting == 1) "ban" else "bans" })
+                    std.log.info(
+                        "native: jail={} ignore entry added: {} (runtime); unban requested for {d} {s}",
+                        .{ std.zig.fmtEscapes(name), std.zig.fmtEscapes(canonical), lifting, if (lifting == 1) "ban" else "bans" },
+                    )
                 else
                     std.log.info("native: jail={} ignore entry added: {} (runtime); existing bans unchanged", .{ std.zig.fmtEscapes(name), std.zig.fmtEscapes(canonical) });
             }
@@ -1190,8 +1397,18 @@ pub fn Methods(comptime Coordinator: type) type {
                 ignore_state.entry_state = .config_only;
                 recordConfiguredCover(ignore_state, before, entry, true);
                 if (self.config_path.len != 0 and self.config_path.len <= 96)
-                    return self.ignoreRefusal(request, .rejected, "{s} is set in the configuration file for jail {s} and cannot be removed at runtime. Edit ignoreip in {s} and run fail2zig reload.", .{ canonical, name, self.config_path });
-                return self.ignoreRefusal(request, .rejected, "{s} is set in the configuration file for jail {s} and cannot be removed at runtime. Edit ignoreip in the configuration file and run fail2zig reload.", .{ canonical, name });
+                    return self.ignoreRefusal(
+                        request,
+                        .rejected,
+                        "{s} is set in the configuration file for jail {s} and cannot be removed at runtime. Edit ignoreip in {s} and run fail2zig reload.",
+                        .{ canonical, name, self.config_path },
+                    );
+                return self.ignoreRefusal(
+                    request,
+                    .rejected,
+                    "{s} is set in the configuration file for jail {s} and cannot be removed at runtime. Edit ignoreip in the configuration file and run fail2zig reload.",
+                    .{ canonical, name },
+                );
             }
             if (existing == null) {
                 ignore_state.entry_state = .absent;
@@ -1224,7 +1441,10 @@ pub fn Methods(comptime Coordinator: type) type {
                 self.replaceIgnoreList(value, after);
                 installed = true;
             };
-            std.log.info("native: jail={} ignore entry removed: {} (runtime); configuration still covers it: {s}", .{ std.zig.fmtEscapes(name), std.zig.fmtEscapes(canonical), if (ignore_state.configured_count != 0) "yes" else "no" });
+            std.log.info(
+                "native: jail={} ignore entry removed: {} (runtime); configuration still covers it: {s}",
+                .{ std.zig.fmtEscapes(name), std.zig.fmtEscapes(canonical), if (ignore_state.configured_count != 0) "yes" else "no" },
+            );
             return self.adminDetail(request, .{ .outcome = .applied, .kind = request.kind, .enforced = true }, null);
         }
     };

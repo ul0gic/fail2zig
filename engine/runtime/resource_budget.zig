@@ -160,7 +160,14 @@ pub const Plan = struct {
         if (charged > limits.zig_bytes) return error.NativeMemoryAdmission;
         const available = try fd.available(limits.descriptors);
         if (total.fds > available) return error.NativeFdAdmission;
-        return .{ .cost = total, .zig_bytes = charged, .allocator_allowance_bytes = charged - total.bytes, .descriptor_capacity = available, .sqlite_bytes = sqlite_heap_bytes, .helper_os_allowance_bytes = self.helper_os_allowance_bytes };
+        return .{
+            .cost = total,
+            .zig_bytes = charged,
+            .allocator_allowance_bytes = charged - total.bytes,
+            .descriptor_capacity = available,
+            .sqlite_bytes = sqlite_heap_bytes,
+            .helper_os_allowance_bytes = self.helper_os_allowance_bytes,
+        };
     }
 };
 pub const Requirements = struct { cost: Cost, zig_bytes: usize, allocator_allowance_bytes: usize, descriptor_capacity: usize, sqlite_bytes: usize, helper_os_allowance_bytes: usize };
@@ -196,11 +203,21 @@ pub fn fileCost(options: FileOptions) !Component {
     const Retained = std.meta.Child(@TypeOf(@as(file_session.Session, undefined).retained.items));
     const Spec = std.meta.Child(@TypeOf(@as(file.FileSet, undefined).specs.items));
     const pending_bytes = 64 + store.Limits.source_bytes * 2 + store.Limits.cursor_bytes;
-    const arrays = try add(try mul(try capacity(options.source_capacity), @sizeOf(file.FileSource) + @sizeOf(Retained)), try mul(options.source_capacity, @sizeOf(repair.Repair) + @sizeOf(?store.Store.PendingSource)));
+    const arrays = try add(
+        try mul(try capacity(options.source_capacity), @sizeOf(file.FileSource) + @sizeOf(Retained)),
+        try mul(options.source_capacity, @sizeOf(repair.Repair) + @sizeOf(?store.Store.PendingSource)),
+    );
     const per_source = 4 * store.Limits.source_bytes + pending_bytes;
     const specs = try add(try mul(try capacity(options.spec_count), @sizeOf(Spec)), try mul(options.spec_count, store.Limits.source_bytes));
-    const discovery = try add(file.discovery_max_depth * store.Limits.source_bytes, try add(try mul(options.source_capacity, store.Limits.source_bytes), try mul(try capacity(options.source_capacity), @sizeOf([]u8))));
-    const live = Cost{ .bytes = try add(try add(@sizeOf(file_session.Session) + 64, options.max_decoded_bytes), try add(try add(arrays, specs), try add(discovery, try mul(options.source_capacity, per_source)))), .allocations = try add(32, try mul(options.source_capacity, 16)), .fds = try add(try mul(options.source_capacity, 2), file.discovery_max_depth) };
+    const discovery = try add(
+        file.discovery_max_depth * store.Limits.source_bytes,
+        try add(try mul(options.source_capacity, store.Limits.source_bytes), try mul(try capacity(options.source_capacity), @sizeOf([]u8))),
+    );
+    const live = Cost{
+        .bytes = try add(try add(@sizeOf(file_session.Session) + 64, options.max_decoded_bytes), try add(try add(arrays, specs), try add(discovery, try mul(options.source_capacity, per_source)))),
+        .allocations = try add(32, try mul(options.source_capacity, 16)),
+        .fds = try add(try mul(options.source_capacity, 2), file.discovery_max_depth),
+    };
     const overlap = try live.plus(.{ .fds = try add(options.source_capacity, 1) });
     const workspace = Cost{ .bytes = try add(try mul(options.max_record_bytes, 4), pending_bytes + store.Limits.cursor_bytes * 2), .allocations = 32 };
     const snapshot = try file_session.RecoverySnapshot.reservation(options.source_capacity);
@@ -237,7 +254,11 @@ pub fn timezoneCost(count: usize) Error!Component {
     return .{ .live = live, .restore_overlap = live, .workspace = if (count == 0) .{} else .{ .bytes = timezone.max_file_bytes, .allocations = 1, .fds = 2 }, .workspace_kind = .configuration };
 }
 pub fn storeWorkspace() Component {
-    return .{ .live = .{ .fds = 4 }, .workspace = .{ .bytes = store.Limits.checkpoint_bytes + store.Limits.shared_bytes + consumer.max_prepared_bytes + store.Limits.sqlite_row_bytes, .allocations = 128 }, .workspace_kind = .storage };
+    return .{
+        .live = .{ .fds = 4 },
+        .workspace = .{ .bytes = store.Limits.checkpoint_bytes + store.Limits.shared_bytes + consumer.max_prepared_bytes + store.Limits.sqlite_row_bytes, .allocations = 128 },
+        .workspace_kind = .storage,
+    };
 }
 pub fn effectCost(environment: Environment) Error!Component {
     const limits = inspection.Limits{};
@@ -257,7 +278,11 @@ pub fn controlCost(metrics: bool, response_capacity: usize) Error!Component {
     const Map = @TypeOf(@as(EventLoop, undefined).registrations);
     const registrations = ipc.max_clients + (if (metrics) http.max_clients else @as(usize, 0)) + 8;
     const loop_bytes = @sizeOf(EventLoop) + (4 * registrations + 16) * (@sizeOf(Map.KV) + 2);
-    var live = Cost{ .bytes = loop_bytes + @sizeOf(ipc.IpcServer) + ipc.max_clients * (ipc.client_buffer_size + ipc.max_response_bytes), .allocations = 2 + 2 * ipc.max_clients, .fds = ipc.max_clients + 2 + 8 };
+    var live = Cost{
+        .bytes = loop_bytes + @sizeOf(ipc.IpcServer) + ipc.max_clients * (ipc.client_buffer_size + ipc.max_response_bytes),
+        .allocations = 2 + 2 * ipc.max_clients,
+        .fds = ipc.max_clients + 2 + 8,
+    };
     if (metrics) {
         const Client = @typeInfo(@typeInfo(@TypeOf(@as(http.HttpServer, undefined).clients[0])).optional.child).pointer.child;
         live = try live.plus(.{ .bytes = @sizeOf(http.HttpServer) + http.max_clients * @sizeOf(Client), .allocations = http.max_clients + 1, .fds = http.max_clients + 1 });

@@ -406,7 +406,17 @@ fn observeRemoved(store: *Store, allocator: std.mem.Allocator, request: Request,
         const source = try allocator.dupe(u8, try rows.boundedBytes(0, store_mod.Limits.source_bytes));
         errdefer allocator.free(source);
         const prior_cursor = try allocator.dupe(u8, cursor);
-        selected = .{ .source = source, .prior_cursor = prior_cursor, .prior = prior, .current_device = device, .current_inode = inode, .current_offset = null, .current_incarnation = null, .generation = undefined, .revision = undefined };
+        selected = .{
+            .source = source,
+            .prior_cursor = prior_cursor,
+            .prior = prior,
+            .current_device = device,
+            .current_inode = inode,
+            .current_offset = null,
+            .current_incarnation = null,
+            .generation = undefined,
+            .revision = undefined,
+        };
     }
     var plan = selected orelse {
         try store.commitTransaction();
@@ -471,7 +481,16 @@ fn observeReplaced(store: *Store, allocator: std.mem.Allocator, request: Request
         errdefer allocator.free(source);
         const prior_cursor = try allocator.dupe(u8, cursor);
         errdefer allocator.free(prior_cursor);
-        selected = .{ .source = source, .prior_cursor = prior_cursor, .prior = prior, .next = files.restartedIncarnation(file, prior) catch return error.SourceUnreadable, .generation = undefined, .revision = undefined, .size = size, .replaced = true };
+        selected = .{
+            .source = source,
+            .prior_cursor = prior_cursor,
+            .prior = prior,
+            .next = files.restartedIncarnation(file, prior) catch return error.SourceUnreadable,
+            .generation = undefined,
+            .revision = undefined,
+            .size = size,
+            .replaced = true,
+        };
     }
     var plan = selected orelse {
         try store.commitTransaction();
@@ -580,7 +599,13 @@ fn commitRemoved(store: *Store, allocator: std.mem.Allocator, request: Request, 
         .new_incarnation = plan.current_incarnation orelse [_]u8{0} ** 16,
         .file = .{ .device = plan.prior.device, .inode = plan.prior.inode, .size = repair_size, .prefix_sha256 = plan.prior.prefix_hash },
         .committed_us = committed_us,
-        .removed = .{ .inode = plan.prior.inode, .last_size = plan.prior.observed_size, .committed_offset = plan.prior.offset, .current_inode = plan.current_inode, .current_offset = plan.current_offset },
+        .removed = .{
+            .inode = plan.prior.inode,
+            .last_size = plan.prior.observed_size,
+            .committed_offset = plan.prior.offset,
+            .current_inode = plan.current_inode,
+            .current_offset = plan.current_offset,
+        },
     };
 }
 

@@ -76,7 +76,15 @@ pub const FirewallStructure = struct {
     rules: ?[]const FirewallRule = null,
 };
 pub const FirewallTable = struct { family: ?[]const u8 = null, name: ?[]const u8 = null };
-pub const FirewallChain = struct { family: ?[]const u8 = null, table: ?[]const u8 = null, name: ?[]const u8 = null, type: ?[]const u8 = null, hook: ?[]const u8 = null, priority: ?i32 = null, policy: ?[]const u8 = null };
+pub const FirewallChain = struct {
+    family: ?[]const u8 = null,
+    table: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    type: ?[]const u8 = null,
+    hook: ?[]const u8 = null,
+    priority: ?i32 = null,
+    policy: ?[]const u8 = null,
+};
 pub const FirewallSet = struct { family: ?[]const u8 = null, table: ?[]const u8 = null, name: ?[]const u8 = null, key_type: ?[]const u8 = null };
 pub const FirewallRule = struct { family: ?[]const u8 = null, table: ?[]const u8 = null, chain: ?[]const u8 = null, match: ?[]const u8 = null, verdict: ?[]const u8 = null, position: ?u8 = null };
 
@@ -293,7 +301,19 @@ fn writeFirewallStructureChains(writer: anytype, items: []const FirewallChain, c
         var priority: [16]u8 = undefined;
         const value = if (row.priority) |number| try std.fmt.bufPrint(&priority, "{d}", .{number}) else "-";
         if (sumWidths(&widths) > columns) {
-            try writeStructureFields(writer, &.{ .{ .label = "CHAIN", .value = row.name }, .{ .label = "FAMILY", .value = row.family }, .{ .label = "TABLE", .value = row.table }, .{ .label = "TYPE", .value = row.type }, .{ .label = "HOOK", .value = row.hook }, .{ .label = "PRIORITY", .value = value }, .{ .label = "POLICY", .value = row.policy } }, columns);
+            try writeStructureFields(
+                writer,
+                &.{
+                    .{ .label = "CHAIN", .value = row.name },
+                    .{ .label = "FAMILY", .value = row.family },
+                    .{ .label = "TABLE", .value = row.table },
+                    .{ .label = "TYPE", .value = row.type },
+                    .{ .label = "HOOK", .value = row.hook },
+                    .{ .label = "PRIORITY", .value = value },
+                    .{ .label = "POLICY", .value = row.policy },
+                },
+                columns,
+            );
         } else {
             if (index == 0 or !sameStructureContext(items[index - 1], row)) {
                 try writeStructureContext(writer, row.family, row.table, columns);
@@ -313,7 +333,11 @@ fn writeFirewallStructureSets(writer: anytype, items: []const FirewallSet, color
     }
     for (items, 0..) |row, index| {
         if (sumWidths(&widths) > columns) {
-            try writeStructureFields(writer, &.{ .{ .label = "SET", .value = row.name }, .{ .label = "FAMILY", .value = row.family }, .{ .label = "TABLE", .value = row.table }, .{ .label = "KEY TYPE", .value = row.key_type } }, columns);
+            try writeStructureFields(
+                writer,
+                &.{ .{ .label = "SET", .value = row.name }, .{ .label = "FAMILY", .value = row.family }, .{ .label = "TABLE", .value = row.table }, .{ .label = "KEY TYPE", .value = row.key_type } },
+                columns,
+            );
         } else {
             if (index == 0 or !sameStructureContext(items[index - 1], row)) {
                 try writeStructureContext(writer, row.family, row.table, columns);
@@ -336,7 +360,18 @@ fn writeFirewallStructureRules(writer: anytype, items: []const FirewallRule, col
         var position: [4]u8 = undefined;
         const value = if (row.position) |number| try std.fmt.bufPrint(&position, "{d}", .{number}) else "-";
         if (sumWidths(&widths) > columns) {
-            try writeStructureFields(writer, &.{ .{ .label = "CHAIN", .value = row.chain }, .{ .label = "FAMILY", .value = row.family }, .{ .label = "TABLE", .value = row.table }, .{ .label = "MATCH", .value = row.match }, .{ .label = "VERDICT", .value = row.verdict }, .{ .label = "POSITION", .value = value } }, columns);
+            try writeStructureFields(
+                writer,
+                &.{
+                    .{ .label = "CHAIN", .value = row.chain },
+                    .{ .label = "FAMILY", .value = row.family },
+                    .{ .label = "TABLE", .value = row.table },
+                    .{ .label = "MATCH", .value = row.match },
+                    .{ .label = "VERDICT", .value = row.verdict },
+                    .{ .label = "POSITION", .value = value },
+                },
+                columns,
+            );
         } else {
             if (index == 0 or !sameStructureContext(items[index - 1], row)) {
                 try writeStructureContext(writer, row.family, row.table, columns);

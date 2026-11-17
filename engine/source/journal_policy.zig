@@ -87,7 +87,13 @@ pub const Prepared = struct {
         const flags: i64 = if (self.flags) |text| std.fmt.parseInt(i64, text, 10) catch return error.InvalidFlags else (if (self.path == null and self.files == null) local_only else 0);
         if (flags < 0 or flags > std.math.maxInt(c_int)) return error.InvalidFlags;
         if (self.path == null) if (self.files) |paths| if (paths.len == 0) return error.EmptyJournalFiles;
-        const result = Selection{ .flags = @intCast(flags), .directory = self.path, .files = self.files, .namespace = if (self.path != null or self.files != null) null else self.namespace, .matches = matches };
+        const result = Selection{
+            .flags = @intCast(flags),
+            .directory = self.path,
+            .files = self.files,
+            .namespace = if (self.path != null or self.files != null) null else self.namespace,
+            .matches = matches,
+        };
         try result.validate();
         return result;
     }
@@ -144,7 +150,13 @@ pub fn prepare(allocator: Allocator, options: Options, environment: Environment)
     try validateString(environment.runtime_logs);
     try validateString(options.rotated);
     for ([_]?[]const u8{ options.path, options.namespace }) |value| if (value) |text| try validateString(text);
-    var result = Prepared{ .path_present = options.path != null, .path = options.path, .files_present = options.files != null, .namespace_present = options.namespace != null, .namespace = options.namespace };
+    var result = Prepared{
+        .path_present = options.path != null,
+        .path = options.path,
+        .files_present = options.files != null,
+        .namespace_present = options.namespace != null,
+        .namespace = options.namespace,
+    };
     if (options.files) |patterns| {
         if (patterns.len > environment.max_files) return error.JournalSelectionLimit;
         var files = std.ArrayList([]const u8).init(allocator);

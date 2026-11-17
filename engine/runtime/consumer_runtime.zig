@@ -79,7 +79,13 @@ pub const DnsRuntime = struct {
     pub fn allocationPlan(options: DnsOptions) !AllocationPlan {
         if (options.max_sources == 0 or options.max_sources > bridge.max_sources or options.capacity == 0 or options.capacity > 1024) return error.InvalidConsumerRuntimeLimits;
         if (options.server != null and std.mem.allEqual(u8, &options.generation, 0)) return error.DnsGenerationMismatch;
-        return .{ .fixed_live_bytes = @sizeOf(DnsRuntime), .per_source_live_bytes = @sizeOf(Slot), .source_capacity = options.max_sources, .capacity_live_bytes = try mul(options.capacity, @sizeOf(?[dns.cache_entry_bytes]u8)), .workspace_bytes = state.max_prepared_bytes };
+        return .{
+            .fixed_live_bytes = @sizeOf(DnsRuntime),
+            .per_source_live_bytes = @sizeOf(Slot),
+            .source_capacity = options.max_sources,
+            .capacity_live_bytes = try mul(options.capacity, @sizeOf(?[dns.cache_entry_bytes]u8)),
+            .workspace_bytes = state.max_prepared_bytes,
+        };
     }
     pub fn requiredBytes(options: DnsOptions) !usize {
         return (try allocationPlan(options)).requiredBytes();
@@ -94,7 +100,15 @@ pub const DnsRuntime = struct {
         errdefer cache.deinit();
         const slots = try allocator.alloc(Slot, options.max_sources);
         errdefer allocator.free(slots);
-        self.* = .{ .allocator = allocator, .store = store, .options = options, .cache = cache, .slots = slots, .client = if (options.server) |server| try dns.Client.init(server, options.generation) else null, .reserved_bytes = reserved };
+        self.* = .{
+            .allocator = allocator,
+            .store = store,
+            .options = options,
+            .cache = cache,
+            .slots = slots,
+            .client = if (options.server) |server| try dns.Client.init(server, options.generation) else null,
+            .reserved_bytes = reserved,
+        };
         return self;
     }
     pub fn destroy(self: *DnsRuntime) void {
@@ -247,7 +261,11 @@ pub const DnsRuntime = struct {
     fn validateAuthority(self: *DnsRuntime, snapshot: *const durable.Store.ManifestSnapshot) !void {
         if (snapshot.status != .ready or snapshot.count != 1) return error.DnsAuthorityRequired;
         const row = snapshot.states[0];
-        if (row.revision != 1 or row.format_version != 1 or row.valid_until_us != null or row.payload == null or !std.mem.eql(u8, row.payload.?, &self.options.generation)) return error.DnsAuthorityRequired;
+        if (row.revision != 1 or row.format_version != 1 or row.valid_until_us != null or row.payload == null or !std.mem.eql(
+            u8,
+            row.payload.?,
+            &self.options.generation,
+        )) return error.DnsAuthorityRequired;
     }
     fn admitAuthority(self: *DnsRuntime) !void {
         var requirements: [1]state.Requirement = undefined;
@@ -485,7 +503,13 @@ pub const JailRuntime = struct {
         if (source_capacity == 0 or source_capacity > bridge.max_sources or rule_count == 0 or rule_count > bridge.max_rules) return error.InvalidConsumerRuntimeLimits;
         const source_bytes = try add(@sizeOf(Source), try add(16384, try mul(rule_count, @sizeOf(rule.Consumer))));
         const ignore_bytes = try add(@sizeOf(ignore.Snapshot), try add(try mul(ignore.max_entries, @sizeOf(ignore.Entry)), ignore.max_checkpoint_bytes));
-        return .{ .fixed_live_bytes = try add(@sizeOf(JailRuntime), ignore_bytes), .per_source_live_bytes = try add(source_bytes, @sizeOf(*Source)), .source_capacity = source_capacity, .capacity_live_bytes = 0, .workspace_bytes = try add(state.max_prepared_bytes + 16 * 16384, ignore_bytes) };
+        return .{
+            .fixed_live_bytes = try add(@sizeOf(JailRuntime), ignore_bytes),
+            .per_source_live_bytes = try add(source_bytes, @sizeOf(*Source)),
+            .source_capacity = source_capacity,
+            .capacity_live_bytes = 0,
+            .workspace_bytes = try add(state.max_prepared_bytes + 16 * 16384, ignore_bytes),
+        };
     }
     pub fn requiredBytes(options: JailOptions) !usize {
         return (try allocationPlan(options)).requiredBytes();
@@ -518,7 +542,17 @@ pub const JailRuntime = struct {
         errdefer allocator.destroy(self);
         const sources = try allocator.alloc(*Source, options.max_sources);
         errdefer allocator.free(sources);
-        self.* = .{ .allocator = allocator, .store = store, .dns_runtime = resolver, .options = options, .settings = settings, .ignores = .{ .live = live, .revision = saved.revision }, .registry = bridge.Registry.init(semantic), .sources = sources, .reserved_bytes = reserved };
+        self.* = .{
+            .allocator = allocator,
+            .store = store,
+            .dns_runtime = resolver,
+            .options = options,
+            .settings = settings,
+            .ignores = .{ .live = live, .revision = saved.revision },
+            .registry = bridge.Registry.init(semantic),
+            .sources = sources,
+            .reserved_bytes = reserved,
+        };
         return self;
     }
     pub fn destroy(self: *JailRuntime) void {
@@ -610,7 +644,14 @@ pub const JailRuntime = struct {
             owner.* = try rule.Consumer.init(program, self.settings.jail, held, self.settings.parent_generation, self.dns_runtime.client != null);
             source.pointers[i] = owner;
         }
-        source.coordinator = try bridge.Coordinator.initWithInitial(self.settings, held, source.pointers[0..owners.len], &self.ignores, self.options.initial_ignore, self.dns_runtime.cacheForConsumers());
+        source.coordinator = try bridge.Coordinator.initWithInitial(
+            self.settings,
+            held,
+            source.pointers[0..owners.len],
+            &self.ignores,
+            self.options.initial_ignore,
+            self.dns_runtime.cacheForConsumers(),
+        );
         const manifest = try source.coordinator.manifest(generation);
         var snapshot: ?durable.Store.ManifestSnapshot = self.store.consumerManifestSnapshot(self.allocator, manifest) catch |failure| blk: {
             if (failure != error.ConsumerManifestMissing) return failure;
@@ -620,7 +661,13 @@ pub const JailRuntime = struct {
         if (snapshot) |*saved| {
             if (saved.status != .ready) return error.MissingRequiredConsumer;
             var rows: [state.max_dependencies]bridge.Saved = undefined;
-            for (manifest.required, saved.states[0..saved.count], 0..) |requirement, value, i| rows[i] = .{ .key = requirement.key, .format_version = value.format_version, .revision = value.revision, .valid_until_us = value.valid_until_us, .payload = value.payload orelse return error.MissingRequiredConsumer };
+            for (manifest.required, saved.states[0..saved.count], 0..) |requirement, value, i| rows[i] = .{
+                .key = requirement.key,
+                .format_version = value.format_version,
+                .revision = value.revision,
+                .valid_until_us = value.valid_until_us,
+                .payload = value.payload orelse return error.MissingRequiredConsumer,
+            };
             const stage = try source.coordinator.prepareRestore(generation, rows[0..saved.count], try self.dns_runtime.now());
             defer stage.state.release(stage.state.context);
             try self.store.validateConsumerManifestSnapshot(manifest, saved);

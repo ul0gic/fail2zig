@@ -89,7 +89,15 @@ pub const Prepared = struct {
         if (hostname_count != 0 and std.mem.allEqual(u8, &resolver_generation, 0)) return error.HostnameResolutionRequired;
         if (hostname_count > consumer.max_dependencies - 2) return error.ConsumerCapacity;
         self.initial_ignore = snapshot;
-        self.settings = .{ .jail = self.jail_name, .logical_source = self.logical_source, .filter = filter, .parent_generation = self.parent_generation, .ignore_generation = snapshot.generation, .family = .both, .journal = source == .journald };
+        self.settings = .{
+            .jail = self.jail_name,
+            .logical_source = self.logical_source,
+            .filter = filter,
+            .parent_generation = self.parent_generation,
+            .ignore_generation = snapshot.generation,
+            .family = .both,
+            .journal = source == .journald,
+        };
         self.reserved_bytes = @sizeOf(Prepared) + self.jail_name.len + self.count * @sizeOf(rules.Program) + @sizeOf(ignore.Snapshot) + snapshot.entries.len * @sizeOf(ignore.Entry) + snapshot.payload.len;
         self.preparation_bytes = try reservationBytes(self.count);
         return self;
@@ -161,7 +169,10 @@ fn readProtected(a: std.mem.Allocator, path: []const u8, cap: usize, hook: ?Read
     if (try file.read(&extra) != 0) return error.ConsumerFileChanged;
     if (hook) |observer| try observer.call(observer.context);
     const after = try std.posix.fstat(fd);
-    if (before.dev != after.dev or before.ino != after.ino or before.mode != after.mode or before.uid != after.uid or before.gid != after.gid or before.size != after.size or !std.meta.eql(before.mtim, after.mtim) or !std.meta.eql(before.ctim, after.ctim)) return error.ConsumerFileChanged;
+    if (before.dev != after.dev or before.ino != after.ino or before.mode != after.mode or before.uid != after.uid or before.gid != after.gid or before.size != after.size or !std.meta.eql(
+        before.mtim,
+        after.mtim,
+    ) or !std.meta.eql(before.ctim, after.ctim)) return error.ConsumerFileChanged;
     return bytes;
 }
 const Hash = struct {

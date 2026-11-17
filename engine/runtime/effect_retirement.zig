@@ -134,7 +134,19 @@ pub fn Methods(comptime Manager: type) type {
                         const held = self.inventory.?;
                         const pre = self.store.effect_publication_epoch;
                         errdefer self.writeFailed(pre);
-                        _ = try self.store.settleOutcome(entry.token(), held.start_us, .{ .installation = entry.installation.id, .scope_key = entry.scope_key, .fingerprint = held.snapshot.fingerprint, .observed_us = held.end_us, .qualification = .complete_owned, .state = null }, try self.clock());
+                        _ = try self.store.settleOutcome(
+                            entry.token(),
+                            held.start_us,
+                            .{
+                                .installation = entry.installation.id,
+                                .scope_key = entry.scope_key,
+                                .fingerprint = held.snapshot.fingerprint,
+                                .observed_us = held.end_us,
+                                .qualification = .complete_owned,
+                                .state = null,
+                            },
+                            try self.clock(),
+                        );
                         if (std.meta.eql(entry.token(), self.live[scope.index].token())) self.markers[scope.index] = null;
                         return .progress;
                     }
@@ -203,7 +215,16 @@ pub fn Methods(comptime Manager: type) type {
             if (revision < 0) return error.InvalidEffect;
             try self.store.commitTransaction();
             const held = self.inventory.?;
-            return .{ .verified = .{ .intent = intent, .verification = .{ .observed = .{ .installation = self.installation.id, .effect_revision = @intCast(revision), .publication_epoch = epoch, .fingerprint = held.snapshot.fingerprint, .observed_us = held.end_us } } } };
+            return .{ .verified = .{
+                .intent = intent,
+                .verification = .{ .observed = .{
+                    .installation = self.installation.id,
+                    .effect_revision = @intCast(revision),
+                    .publication_epoch = epoch,
+                    .fingerprint = held.snapshot.fingerprint,
+                    .observed_us = held.end_us,
+                } },
+            } };
         }
     };
 }

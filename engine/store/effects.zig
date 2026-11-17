@@ -180,16 +180,45 @@ pub fn Methods(comptime Store: type) type {
         const max_mismatch_streak = 1_000_000;
         // Why: Reconciliation compares sqlite_schema text to these strings exactly, so they must stay byte-identical to the creating DDL.
         const live_owner_triggers = [_]struct { name: []const u8, sql: []const u8 }{
-            .{ .name = "effect_owner_live_insert", .sql = "CREATE TRIGGER effect_owner_live_insert AFTER INSERT ON effect_owners WHEN NEW.lease_kind<>0 BEGIN UPDATE effect_owner_live SET live=live+1 WHERE id=1; END" },
-            .{ .name = "effect_owner_live_update", .sql = "CREATE TRIGGER effect_owner_live_update AFTER UPDATE OF lease_kind ON effect_owners WHEN (OLD.lease_kind<>0)<>(NEW.lease_kind<>0) BEGIN UPDATE effect_owner_live SET live=live+CASE WHEN NEW.lease_kind<>0 THEN 1 ELSE -1 END WHERE id=1; END" },
-            .{ .name = "effect_owner_live_delete", .sql = "CREATE TRIGGER effect_owner_live_delete AFTER DELETE ON effect_owners WHEN OLD.lease_kind<>0 BEGIN UPDATE effect_owner_live SET live=live-1 WHERE id=1; END" },
+            .{
+                .name = "effect_owner_live_insert",
+                .sql = "CREATE TRIGGER effect_owner_live_insert AFTER INSERT ON effect_owners WHEN NEW.lease_kind<>0 BEGIN UPDATE effect_owner_live SET live=live+1 WHERE id=1; END",
+            },
+            .{
+                .name = "effect_owner_live_update",
+                .sql = "CREATE TRIGGER effect_owner_live_update AFTER UPDATE OF lease_kind ON effect_owners WHEN (OLD.lease_kind<>0)<>(NEW.lease_kind<>0) BEGIN UPDATE effect_owner_live SET live=live+CASE WHEN NEW.lease_kind<>0 THEN 1 ELSE -1 END WHERE id=1; END",
+            },
+            .{
+                .name = "effect_owner_live_delete",
+                .sql = "CREATE TRIGGER effect_owner_live_delete AFTER DELETE ON effect_owners WHEN OLD.lease_kind<>0 BEGIN UPDATE effect_owner_live SET live=live-1 WHERE id=1; END",
+            },
         };
         const owed_work_triggers = [_]struct { name: []const u8, table: []const u8, sql: []const u8 }{
-            .{ .name = "effect_owed_marker_insert", .table = "confirmation_markers", .sql = "CREATE TRIGGER effect_owed_marker_insert AFTER INSERT ON confirmation_markers BEGIN UPDATE effect_owed_work SET markers=markers+1 WHERE id=1; END" },
-            .{ .name = "effect_owed_marker_delete", .table = "confirmation_markers", .sql = "CREATE TRIGGER effect_owed_marker_delete AFTER DELETE ON confirmation_markers BEGIN UPDATE effect_owed_work SET markers=markers-1 WHERE id=1; END" },
-            .{ .name = "effect_owed_intent_insert", .table = "effect_intents", .sql = "CREATE TRIGGER effect_owed_intent_insert AFTER INSERT ON effect_intents WHEN NEW.status IN(1,2) BEGIN UPDATE effect_owed_work SET unsettled_intents=unsettled_intents+1 WHERE id=1; END" },
-            .{ .name = "effect_owed_intent_update", .table = "effect_intents", .sql = "CREATE TRIGGER effect_owed_intent_update AFTER UPDATE OF status ON effect_intents WHEN (OLD.status IN(1,2))<>(NEW.status IN(1,2)) BEGIN UPDATE effect_owed_work SET unsettled_intents=unsettled_intents+CASE WHEN NEW.status IN(1,2) THEN 1 ELSE -1 END WHERE id=1; END" },
-            .{ .name = "effect_owed_intent_delete", .table = "effect_intents", .sql = "CREATE TRIGGER effect_owed_intent_delete AFTER DELETE ON effect_intents WHEN OLD.status IN(1,2) BEGIN UPDATE effect_owed_work SET unsettled_intents=unsettled_intents-1 WHERE id=1; END" },
+            .{
+                .name = "effect_owed_marker_insert",
+                .table = "confirmation_markers",
+                .sql = "CREATE TRIGGER effect_owed_marker_insert AFTER INSERT ON confirmation_markers BEGIN UPDATE effect_owed_work SET markers=markers+1 WHERE id=1; END",
+            },
+            .{
+                .name = "effect_owed_marker_delete",
+                .table = "confirmation_markers",
+                .sql = "CREATE TRIGGER effect_owed_marker_delete AFTER DELETE ON confirmation_markers BEGIN UPDATE effect_owed_work SET markers=markers-1 WHERE id=1; END",
+            },
+            .{
+                .name = "effect_owed_intent_insert",
+                .table = "effect_intents",
+                .sql = "CREATE TRIGGER effect_owed_intent_insert AFTER INSERT ON effect_intents WHEN NEW.status IN(1,2) BEGIN UPDATE effect_owed_work SET unsettled_intents=unsettled_intents+1 WHERE id=1; END",
+            },
+            .{
+                .name = "effect_owed_intent_update",
+                .table = "effect_intents",
+                .sql = "CREATE TRIGGER effect_owed_intent_update AFTER UPDATE OF status ON effect_intents WHEN (OLD.status IN(1,2))<>(NEW.status IN(1,2)) BEGIN UPDATE effect_owed_work SET unsettled_intents=unsettled_intents+CASE WHEN NEW.status IN(1,2) THEN 1 ELSE -1 END WHERE id=1; END",
+            },
+            .{
+                .name = "effect_owed_intent_delete",
+                .table = "effect_intents",
+                .sql = "CREATE TRIGGER effect_owed_intent_delete AFTER DELETE ON effect_intents WHEN OLD.status IN(1,2) BEGIN UPDATE effect_owed_work SET unsettled_intents=unsettled_intents-1 WHERE id=1; END",
+            },
         };
         fn reconcileOwedWork(self: *Store) Error!void {
             for (owed_work_triggers) |trigger| {
@@ -286,7 +315,11 @@ pub fn Methods(comptime Store: type) type {
             const intent_id = try effectBlob(row, 5, 32);
             const status = std.meta.intToEnum(effects.Status, try row.signed(6)) catch return error.InvalidEffect;
             const decision_id = try effectBlob(row, 7, 32);
-            if (!effects.Lease.eql(desired, try effectLease(row, 9, 10)) or !std.mem.eql(u8, &intent_id, &effects.intentId(installation.id, scope_key, decision_id, @intCast(effect_revision), desired))) return error.InvalidEffect;
+            if (!effects.Lease.eql(desired, try effectLease(row, 9, 10)) or !std.mem.eql(
+                u8,
+                &intent_id,
+                &effects.intentId(installation.id, scope_key, decision_id, @intCast(effect_revision), desired),
+            )) return error.InvalidEffect;
             const created = try row.signed(11);
             const dispatched = try row.optionalSigned(12);
             const observed = try row.optionalSigned(13);
@@ -321,7 +354,16 @@ pub fn Methods(comptime Store: type) type {
                 }
             }
             if (!effects.Lease.eql(aggregate, desired)) return error.InvalidEffect;
-            return .{ .installation = installation, .scope = scope, .scope_key = scope_key, .revision = @intCast(effect_revision), .desired = desired, .intent_id = intent_id, .status = status, .intent_us = created };
+            return .{
+                .installation = installation,
+                .scope = scope,
+                .scope_key = scope_key,
+                .revision = @intCast(effect_revision),
+                .desired = desired,
+                .intent_id = intent_id,
+                .status = status,
+                .intent_us = created,
+            };
         }
         pub fn readEffect(self: *Store, key: effects.Hash, installation: effects.Installation) Error!?effects.Entry {
             var row = try self.statement(if (self.schema_version >= 19)
@@ -369,7 +411,11 @@ pub fn Methods(comptime Store: type) type {
             return .{ .revision = @intCast(effect_revision), .count = count, .more = more };
         }
         pub fn readOwners(self: *Store, key: effects.Hash, output: []effects.Owner) Error!usize {
-            var row = try self.statement(self.originSql("SELECT o.jail,o.generation,o.decision_id,o.revision,o.lease_kind,o.deadline_us,o.decided_us,EXISTS(SELECT 1 FROM effect_owner_revisions h WHERE h.scope_key=o.scope_key AND h.jail=o.jail AND h.revision=o.revision AND h.generation=o.generation AND h.decision_id=o.decision_id AND h.lease_kind=o.lease_kind AND h.deadline_us IS o.deadline_us AND h.decided_us=o.decided_us),", "o.origin", " FROM effect_owners o WHERE o.scope_key=?1 ORDER BY o.jail LIMIT 65;"));
+            var row = try self.statement(self.originSql(
+                "SELECT o.jail,o.generation,o.decision_id,o.revision,o.lease_kind,o.deadline_us,o.decided_us,EXISTS(SELECT 1 FROM effect_owner_revisions h WHERE h.scope_key=o.scope_key AND h.jail=o.jail AND h.revision=o.revision AND h.generation=o.generation AND h.decision_id=o.decision_id AND h.lease_kind=o.lease_kind AND h.deadline_us IS o.deadline_us AND h.decided_us=o.decided_us),",
+                "o.origin",
+                " FROM effect_owners o WHERE o.scope_key=?1 ORDER BY o.jail LIMIT 65;",
+            ));
             defer row.deinit();
             try row.blob(1, &key);
             var count: usize = 0;
@@ -381,7 +427,15 @@ pub fn Methods(comptime Store: type) type {
                 const lease = try effectLease(&row, 4, 5);
                 const decided = try row.signed(6);
                 if (lease == .finite and lease.finite <= decided) return error.InvalidEffect;
-                output[count] = .{ .jail = detection.Name.init(try row.boundedBytes(0, 64)) catch return error.InvalidEffect, .generation = try effectBlob(&row, 1, 32), .decision_id = try effectBlob(&row, 2, 32), .revision = @intCast(effect_revision), .lease = lease, .decided_us = decided, .origin = try storedOrigin(&row, 8) };
+                output[count] = .{
+                    .jail = detection.Name.init(try row.boundedBytes(0, 64)) catch return error.InvalidEffect,
+                    .generation = try effectBlob(&row, 1, 32),
+                    .decision_id = try effectBlob(&row, 2, 32),
+                    .revision = @intCast(effect_revision),
+                    .lease = lease,
+                    .decided_us = decided,
+                    .origin = try storedOrigin(&row, 8),
+                };
                 count += 1;
             }
             return count;
@@ -691,7 +745,11 @@ pub fn Methods(comptime Store: type) type {
         pub fn transitionOwnerReservedTx(self: *Store, change: effects.OwnerTransition, now: i64, reserve: bool) Error!OwnerTransitionTx {
             change.scope.validate() catch return error.InvalidEffect;
             _ = detection.Name.init(change.jail) catch return error.InvalidEffect;
-            if (change.expected_owner_revision == 0 or change.expected_owner_revision >= std.math.maxInt(i64) or change.occurred_us > now or std.mem.allEqual(u8, &change.transition_id, 0)) return error.InvalidEffect;
+            if (change.expected_owner_revision == 0 or change.expected_owner_revision >= std.math.maxInt(i64) or change.occurred_us > now or std.mem.allEqual(
+                u8,
+                &change.transition_id,
+                0,
+            )) return error.InvalidEffect;
             if (change.mode == .retain and std.mem.eql(u8, &change.current_generation, &change.next_generation)) return error.InvalidEffect;
             const installation = try self.readInstallation() orelse return error.InstallationRequired;
             const scope = try effects.Scope.exact(change.scope);
@@ -779,7 +837,12 @@ pub fn Methods(comptime Store: type) type {
                 while (try rows.row()) {
                     const revision = try rows.signed(2);
                     if (revision <= 0) return error.InvalidEffect;
-                    held[count] = .{ .key = try effectBlob(&rows, 0, 32), .generation = try effectBlob(&rows, 1, 32), .revision = @intCast(revision), .absent = (try Store.effectLease(&rows, 3, 4)) == .absent };
+                    held[count] = .{
+                        .key = try effectBlob(&rows, 0, 32),
+                        .generation = try effectBlob(&rows, 1, 32),
+                        .revision = @intCast(revision),
+                        .absent = (try Store.effectLease(&rows, 3, 4)) == .absent,
+                    };
                     count += 1;
                 }
             }
@@ -793,7 +856,19 @@ pub fn Methods(comptime Store: type) type {
                     if (!try row.row()) return error.InvalidEffect;
                     break :blk try effects.Scope.decodeCanonical(&try effectBlob(&row, 0, effects.Scope.canonical_encoded_bytes));
                 };
-                const result = try self.transitionOwnerTx(.{ .scope = scope.canonical, .jail = jail, .current_generation = owner.generation, .next_generation = owner.generation, .expected_owner_revision = owner.revision, .transition_id = request_id, .mode = .release, .occurred_us = now }, now);
+                const result = try self.transitionOwnerTx(
+                    .{
+                        .scope = scope.canonical,
+                        .jail = jail,
+                        .current_generation = owner.generation,
+                        .next_generation = owner.generation,
+                        .expected_owner_revision = owner.revision,
+                        .transition_id = request_id,
+                        .mode = .release,
+                        .occurred_us = now,
+                    },
+                    now,
+                );
                 if (!result.changed) return error.StaleEffect;
                 released += 1;
             }
@@ -1013,7 +1088,11 @@ pub fn Methods(comptime Store: type) type {
         }
         pub fn settleJailRetirementReconciliation(self: *Store, request: Store.JailRetirementReconciliation, dispatch_us: i64, observation: effects.Observation, clock: effects.Clock) Error!?effects.Settlement {
             const token = request.token;
-            if (observation.qualification != .complete_owned or !std.mem.eql(u8, &observation.installation, &token.installation) or !std.mem.eql(u8, &observation.scope_key, &token.scope_key)) return error.IncompleteEffectObservation;
+            if (observation.qualification != .complete_owned or !std.mem.eql(
+                u8,
+                &observation.installation,
+                &token.installation,
+            ) or !std.mem.eql(u8, &observation.scope_key, &token.scope_key)) return error.IncompleteEffectObservation;
             try self.beginWrite();
             errdefer self.rollback();
             if (!try self.jailRetirementFenceTx(request)) {
@@ -1029,7 +1108,11 @@ pub fn Methods(comptime Store: type) type {
             return settled.settlement;
         }
         pub fn settleOutcome(self: *Store, token: effects.Token, dispatch_us: i64, observation: effects.Observation, clock: effects.Clock) Error!effects.Settlement {
-            if (observation.qualification != .complete_owned or !std.mem.eql(u8, &observation.installation, &token.installation) or !std.mem.eql(u8, &observation.scope_key, &token.scope_key)) return error.IncompleteEffectObservation;
+            if (observation.qualification != .complete_owned or !std.mem.eql(
+                u8,
+                &observation.installation,
+                &token.installation,
+            ) or !std.mem.eql(u8, &observation.scope_key, &token.scope_key)) return error.IncompleteEffectObservation;
             try self.beginWrite();
             errdefer self.rollback();
             const settled = try self.settleTx(token, dispatch_us, observation, clock);
@@ -1045,7 +1128,14 @@ pub fn Methods(comptime Store: type) type {
             try self.beginWrite();
             errdefer self.rollback();
             for (tokens) |token| {
-                const observation = effects.Observation{ .installation = token.installation, .scope_key = token.scope_key, .fingerprint = fingerprint, .observed_us = observed_us, .qualification = .complete_owned, .state = .absent };
+                const observation = effects.Observation{
+                    .installation = token.installation,
+                    .scope_key = token.scope_key,
+                    .fingerprint = fingerprint,
+                    .observed_us = observed_us,
+                    .qualification = .complete_owned,
+                    .state = .absent,
+                };
                 const settled = try self.settleTx(token, observed_us, observation, clock);
                 if (settled.entry.desired != .absent or settled.settlement != .verified) return error.InvalidEffect;
             }
@@ -1062,7 +1152,14 @@ pub fn Methods(comptime Store: type) type {
             try self.beginWrite();
             errdefer self.rollback();
             for (items) |item| {
-                const observation = effects.Observation{ .installation = item.token.installation, .scope_key = item.token.scope_key, .fingerprint = fingerprint, .observed_us = observed_us, .qualification = .complete_owned, .state = item.state };
+                const observation = effects.Observation{
+                    .installation = item.token.installation,
+                    .scope_key = item.token.scope_key,
+                    .fingerprint = fingerprint,
+                    .observed_us = observed_us,
+                    .qualification = .complete_owned,
+                    .state = item.state,
+                };
                 _ = try self.settleTx(item.token, dispatch_us, observation, clock);
             }
             try self.advanceEffectSnapshot();

@@ -35,7 +35,11 @@ pub fn Methods(comptime Coordinator: type) type {
             const runtime = jail.consumer orelse return null;
             const assets = jail.custom_plan orelse return error.ConsumerRuntimeNotReady;
             const configured = findConfigJail(cfg, jail.name) orelse return error.UnknownJail;
-            const cost = resource.Cost{ .bytes = @sizeOf(custom_ignore.Snapshot) + custom_ignore.max_entries * @sizeOf(custom_ignore.Entry) + 2 * custom_ignore.max_checkpoint_bytes + custom_ignore.max_file_bytes, .allocations = 4, .fds = @intFromBool(!initial and configured.ignore_file != null) };
+            const cost = resource.Cost{
+                .bytes = @sizeOf(custom_ignore.Snapshot) + custom_ignore.max_entries * @sizeOf(custom_ignore.Entry) + 2 * custom_ignore.max_checkpoint_bytes + custom_ignore.max_file_bytes,
+                .allocations = 4,
+                .fds = @intFromBool(!initial and configured.ignore_file != null),
+            };
             const token = try self.resources.reserve(.configuration, cost);
             var held = false;
             defer if (!held) self.resources.release(token) catch |failure| std.log.err("native: custom policy reservation release failed: {s}", .{@errorName(failure)});
@@ -150,7 +154,10 @@ pub fn Methods(comptime Coordinator: type) type {
                     continue;
                 }
                 const next = try self.effectiveIgnore(self.live_cfg, jail.name, self.selfAddressList(), .apply, now);
-                if (next.over_bound) std.log.warn("native: jail={} has {d} ignore entries ({d} configured, {d} runtime-only), above the {d}-entry limit; all apply; fail2zig ignore add is refused until the count is {d} or less", .{ std.zig.fmtEscapes(jail.name), next.entries.len, next.configured_count, next.entries.len - next.configured_count, ignore_set.distinct_bound, ignore_set.distinct_bound });
+                if (next.over_bound) std.log.warn(
+                    "native: jail={} has {d} ignore entries ({d} configured, {d} runtime-only), above the {d}-entry limit; all apply; fail2zig ignore add is refused until the count is {d} or less",
+                    .{ std.zig.fmtEscapes(jail.name), next.entries.len, next.configured_count, next.entries.len - next.configured_count, ignore_set.distinct_bound, ignore_set.distinct_bound },
+                );
                 self.replaceIgnoreList(jail, next);
             }
             var stored: [256]durable.Store.IgnoreJailCount = undefined;

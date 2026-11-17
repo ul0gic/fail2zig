@@ -87,7 +87,14 @@ pub fn Methods(comptime Store: type) type {
             defer row.deinit();
             if (!try row.row()) return error.InvalidApplicationHistoryRow;
             const state = try row.signed(2);
-            const result = RetentionPolicy{ .generation = try row.signed(0), .max_matches = try row.signed(1), .published = state == 2, .sweep_cursor = try row.signed(3), .retry_cursor = try row.optionalSigned(4), .subject_cursor = try row.optionalSigned(5) };
+            const result = RetentionPolicy{
+                .generation = try row.signed(0),
+                .max_matches = try row.signed(1),
+                .published = state == 2,
+                .sweep_cursor = try row.signed(3),
+                .retry_cursor = try row.optionalSigned(4),
+                .subject_cursor = try row.optionalSigned(5),
+            };
             if (result.generation <= 0 or result.max_matches < 0 or result.max_matches > 1024 or result.sweep_cursor < 0 or (state != 1 and state != 2) or (result.retry_cursor orelse 0) < 0 or (result.subject_cursor orelse 0) < 0) return error.InvalidApplicationHistoryRow;
             return result;
         }
@@ -526,7 +533,10 @@ pub fn Methods(comptime Store: type) type {
             if (self.history_overload_notice_us) |last| if (now_us -| last < overload_notice_us) return pruned;
             self.history_overload_notice_us = now_us;
             const horizon = try self.integer("SELECT coalesce(min(e.confirmed_us),0) FROM confirmed_history_stream h JOIN confirmed_history_sequence s ON s.sequence=h.retained_from JOIN confirmed_effect_events e ON e.event_id=s.event_id WHERE h.id=1;");
-            std.log.warn("native history: {d} confirmed events at the overload threshold; consumed history is pruned before its retention age, oldest retained confirmation at {d} us", .{ events, horizon });
+            std.log.warn(
+                "native history: {d} confirmed events at the overload threshold; consumed history is pruned before its retention age, oldest retained confirmation at {d} us",
+                .{ events, horizon },
+            );
             return pruned;
         }
 
@@ -546,7 +556,13 @@ pub fn Methods(comptime Store: type) type {
                     const bytes = try row.signed(4);
                     if (total <= 0 or bytes < 0) return error.InvalidApplicationHistoryRow;
                     const stored = try row.boundedBytes(2, 16);
-                    summaries[count] = .{ .rowid = try row.signed(0), .family = try row.signed(1), .subject = undefined, .len = stored.len, .cost = if (total <= policy.max_matches and bytes <= 16384) @intCast(total) else 0 };
+                    summaries[count] = .{
+                        .rowid = try row.signed(0),
+                        .family = try row.signed(1),
+                        .subject = undefined,
+                        .len = stored.len,
+                        .cost = if (total <= policy.max_matches and bytes <= 16384) @intCast(total) else 0,
+                    };
                     @memcpy(summaries[count].subject[0..stored.len], stored);
                     count += 1;
                 }
@@ -676,7 +692,10 @@ pub fn Methods(comptime Store: type) type {
                 if (self.api.column_type(row.ptr, 9) != 5) {
                     if (self.api.column_type(row.ptr, 9) != 3) return error.InvalidApplicationHistoryRow;
                     const stored_evidence = try row.boundedBytes(9, retry.max_evidence_text_bytes);
-                    if (stored_evidence.len == 0 or !std.unicode.utf8ValidateSlice(stored_evidence) or detail.bytes != @as(i64, @intCast(stored_evidence.len))) return error.InvalidApplicationHistoryRow;
+                    if (stored_evidence.len == 0 or !std.unicode.utf8ValidateSlice(stored_evidence) or detail.bytes != @as(
+                        i64,
+                        @intCast(stored_evidence.len),
+                    )) return error.InvalidApplicationHistoryRow;
                     evidence = self.allocator.dupe(u8, stored_evidence) catch return error.OutOfMemory;
                 } else if (detail.bytes != null) return error.InvalidApplicationHistoryRow;
             }

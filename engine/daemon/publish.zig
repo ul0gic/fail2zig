@@ -367,7 +367,10 @@ pub fn Methods(comptime Coordinator: type) type {
             if (source == .file) for (0..2 * source.file.sources.max_sources) |_| {
                 const report = source.file.nextUnreportedContinuityFailure() orelse break;
                 if (comptime build_options.diag) diag_mod.event(.source_paused, .{ .subject = jail.name, .cause = @tagName(report.failure.kind) });
-                std.log.err("file source for jail '{'}' path '{'}' cannot resume its checkpoint: {}; unknown extent of unread data lost; source paused pending repair", .{ std.zig.fmtEscapes(jail.name), std.zig.fmtEscapes(report.path), report.failure });
+                std.log.err(
+                    "file source for jail '{'}' path '{'}' cannot resume its checkpoint: {}; unknown extent of unread data lost; source paused pending repair",
+                    .{ std.zig.fmtEscapes(jail.name), std.zig.fmtEscapes(report.path), report.failure },
+                );
             };
             if (source == .journal and changed) {
                 if (cause) |failure| {
@@ -407,18 +410,35 @@ pub fn Methods(comptime Coordinator: type) type {
                     const cause = @errorName(state.snapshot().last_cause orelse error.SourceInterventionRequired);
                     var detail_buffer: [192]u8 = undefined;
                     const detail = switch (facts.cause) {
-                        .resume_lost => try std.fmt.bufPrint(&detail_buffer, " (inode={d} committed_offset={d} size={})", .{ facts.inode, facts.committed_offset, OptionalNumber{ .value = facts.observed_size } }),
-                        .rotated_incarnation_lost => try std.fmt.bufPrint(&detail_buffer, " (removed inode={d} committed_offset={d} last_size={}; current inode={})", .{ facts.inode, facts.committed_offset, OptionalNumber{ .value = facts.observed_size }, OptionalNumber{ .value = facts.current_inode } }),
+                        .resume_lost => try std.fmt.bufPrint(
+                            &detail_buffer,
+                            " (inode={d} committed_offset={d} size={})",
+                            .{ facts.inode, facts.committed_offset, OptionalNumber{ .value = facts.observed_size } },
+                        ),
+                        .rotated_incarnation_lost => try std.fmt.bufPrint(
+                            &detail_buffer,
+                            " (removed inode={d} committed_offset={d} last_size={}; current inode={})",
+                            .{ facts.inode, facts.committed_offset, OptionalNumber{ .value = facts.observed_size }, OptionalNumber{ .value = facts.current_inode } },
+                        ),
                         .other => "",
                     };
                     const repair_line = if (facts.repair_token) |token| try repairCommand(self.allocator, jail.name, facts.path, token[0..facts.repair_token_len]) else null;
                     defer if (repair_line) |text| self.allocator.free(text);
                     if (repair_line != null and facts.path_absent)
-                        std.log.warn("native: jail={} source=file path={} paused at startup: {s}{s}; the file is absent; other jails enforce; once a file exists at the path, stop fail2zig and run: {}", .{ std.zig.fmtEscapes(jail.name), std.zig.fmtEscapes(facts.path), cause, detail, ControlEscaped{ .text = repair_line.? } })
+                        std.log.warn(
+                            "native: jail={} source=file path={} paused at startup: {s}{s}; the file is absent; other jails enforce; once a file exists at the path, stop fail2zig and run: {}",
+                            .{ std.zig.fmtEscapes(jail.name), std.zig.fmtEscapes(facts.path), cause, detail, ControlEscaped{ .text = repair_line.? } },
+                        )
                     else if (repair_line) |text|
-                        std.log.warn("native: jail={} source=file path={} paused at startup: {s}{s}; other jails enforce; to repair, stop fail2zig and run: {}", .{ std.zig.fmtEscapes(jail.name), std.zig.fmtEscapes(facts.path), cause, detail, ControlEscaped{ .text = text } })
+                        std.log.warn(
+                            "native: jail={} source=file path={} paused at startup: {s}{s}; other jails enforce; to repair, stop fail2zig and run: {}",
+                            .{ std.zig.fmtEscapes(jail.name), std.zig.fmtEscapes(facts.path), cause, detail, ControlEscaped{ .text = text } },
+                        )
                     else
-                        std.log.warn("native: jail={} source=file path={} paused at startup: {s}{s}" ++ tail_unrepairable, .{ std.zig.fmtEscapes(jail.name), std.zig.fmtEscapes(facts.path), cause, detail });
+                        std.log.warn(
+                            "native: jail={} source=file path={} paused at startup: {s}{s}" ++ tail_unrepairable,
+                            .{ std.zig.fmtEscapes(jail.name), std.zig.fmtEscapes(facts.path), cause, detail },
+                        );
                 }
             }
             if (logged) return;
@@ -427,7 +447,10 @@ pub fn Methods(comptime Coordinator: type) type {
                 .journal => |session| session.repairSnapshot(),
                 .internal => return,
             };
-            std.log.warn("native: jail={} source={s} paused at startup: {s}" ++ tail_unrepairable, .{ std.zig.fmtEscapes(jail.name), @tagName(jail.plan), @errorName(snapshot.last_cause orelse error.SourceInterventionRequired) });
+            std.log.warn(
+                "native: jail={} source={s} paused at startup: {s}" ++ tail_unrepairable,
+                .{ std.zig.fmtEscapes(jail.name), @tagName(jail.plan), @errorName(snapshot.last_cause orelse error.SourceInterventionRequired) },
+            );
         }
 
         fn sourceSignature(source: Source) SourceSignature {
@@ -459,7 +482,11 @@ pub fn Methods(comptime Coordinator: type) type {
         }
 
         fn sameSignature(a: SourceSignature, b: SourceSignature) bool {
-            return a.built == b.built and a.sources == b.sources and a.configured == b.configured and a.presence_revision == b.presence_revision and a.presence_known == b.presence_known and a.loss_sequence == b.loss_sequence and a.stuck == b.stuck and std.mem.eql(?anyerror, &a.causes, &b.causes);
+            return a.built == b.built and a.sources == b.sources and a.configured == b.configured and a.presence_revision == b.presence_revision and a.presence_known == b.presence_known and a.loss_sequence == b.loss_sequence and a.stuck == b.stuck and std.mem.eql(
+                ?anyerror,
+                &a.causes,
+                &b.causes,
+            );
         }
 
         pub fn refreshSourceStatus(self: *Coordinator, jail: *Jail) !void {
@@ -516,7 +543,20 @@ pub fn Methods(comptime Coordinator: type) type {
                         const events = try self.store.continuitySummary(jail.name, source.path, &newest);
                         if (facts == null and events == 0) continue;
                         const path = try arena.dupe(u8, source.path);
-                        var entry = SourceStatus{ .jail = jail.name, .kind = .file, .path = path, .on_truncation = jail.on_truncation, .state = .reading, .cause = null, .inode = null, .committed_offset = null, .observed_size = null, .repair = null, .loss_events = events, .last_loss = null };
+                        var entry = SourceStatus{
+                            .jail = jail.name,
+                            .kind = .file,
+                            .path = path,
+                            .on_truncation = jail.on_truncation,
+                            .state = .reading,
+                            .cause = null,
+                            .inode = null,
+                            .committed_offset = null,
+                            .observed_size = null,
+                            .repair = null,
+                            .loss_events = events,
+                            .last_loss = null,
+                        };
                         if (events != 0) {
                             newest.jail = jail.name;
                             newest.path = path;
@@ -551,7 +591,23 @@ pub fn Methods(comptime Coordinator: type) type {
                             break;
                         };
                         if (paused) continue;
-                        try list.append(arena, .{ .jail = jail.name, .kind = .file, .path = try arena.dupe(u8, configured.pattern), .on_truncation = jail.on_truncation, .state = .missing, .cause = null, .inode = null, .committed_offset = null, .observed_size = null, .repair = null, .loss_events = 0, .last_loss = null });
+                        try list.append(
+                            arena,
+                            .{
+                                .jail = jail.name,
+                                .kind = .file,
+                                .path = try arena.dupe(u8, configured.pattern),
+                                .on_truncation = jail.on_truncation,
+                                .state = .missing,
+                                .cause = null,
+                                .inode = null,
+                                .committed_offset = null,
+                                .observed_size = null,
+                                .repair = null,
+                                .loss_events = 0,
+                                .last_loss = null,
+                            },
+                        );
                     }
                 },
                 .journal => |session| {
@@ -568,12 +624,38 @@ pub fn Methods(comptime Coordinator: type) type {
         }
 
         fn pausedWithoutPath(jail: *const Jail, kind: @FieldType(SourceStatus, "kind"), cause: ?anyerror) SourceStatus {
-            return .{ .jail = jail.name, .kind = kind, .path = null, .on_truncation = if (kind == .file) jail.on_truncation else null, .state = .paused, .cause = @errorName(cause orelse error.SourceInterventionRequired), .inode = null, .committed_offset = null, .observed_size = null, .repair = null, .loss_events = 0, .last_loss = null };
+            return .{
+                .jail = jail.name,
+                .kind = kind,
+                .path = null,
+                .on_truncation = if (kind == .file) jail.on_truncation else null,
+                .state = .paused,
+                .cause = @errorName(cause orelse error.SourceInterventionRequired),
+                .inode = null,
+                .committed_offset = null,
+                .observed_size = null,
+                .repair = null,
+                .loss_events = 0,
+                .last_loss = null,
+            };
         }
 
         fn stuckWithoutPath(jail: *const Jail, cause: anyerror) SourceStatus {
             const kind: @FieldType(SourceStatus, "kind") = if (jail.plan == .journal) .journal else .file;
-            return .{ .jail = jail.name, .kind = kind, .path = null, .on_truncation = if (kind == .file) jail.on_truncation else null, .state = if (pipeline.Pipeline.commitBlocked(cause)) .waiting else .broken, .cause = @errorName(cause), .inode = null, .committed_offset = null, .observed_size = null, .repair = null, .loss_events = 0, .last_loss = null };
+            return .{
+                .jail = jail.name,
+                .kind = kind,
+                .path = null,
+                .on_truncation = if (kind == .file) jail.on_truncation else null,
+                .state = if (pipeline.Pipeline.commitBlocked(cause)) .waiting else .broken,
+                .cause = @errorName(cause),
+                .inode = null,
+                .committed_offset = null,
+                .observed_size = null,
+                .repair = null,
+                .loss_events = 0,
+                .last_loss = null,
+            };
         }
 
         fn sourceStatusLess(_: void, a: SourceStatus, b: SourceStatus) bool {
@@ -740,7 +822,10 @@ pub fn Methods(comptime Coordinator: type) type {
             }
             if (snapshot.notice_sequence != self.last_notice) {
                 self.last_notice = snapshot.notice_sequence;
-                std.log.info("native ingestion: {s}; cause={s}; committed={d}", .{ @tagName(snapshot.phase), if (snapshot.last_failure) |failure| @errorName(failure.cause) else "none", snapshot.committed_records });
+                std.log.info(
+                    "native ingestion: {s}; cause={s}; committed={d}",
+                    .{ @tagName(snapshot.phase), if (snapshot.last_failure) |failure| @errorName(failure.cause) else "none", snapshot.committed_records },
+                );
             }
             // Holds: READY is sent once, and only after readinessReport reports every component verified.
             if (!self.notified_ready) {

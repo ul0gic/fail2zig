@@ -209,7 +209,10 @@ const SizeText = struct {
 fn reportRecorded(stdout: anytype, options: Options, recorded: repair.RecordedLoss) !void {
     var time_buffer: [32]u8 = undefined;
     try stdout.print("repair-source: {s}\n  jail={} source=file\n  path={}\n", .{ repair.Headline.loss_recorded, std.zig.fmtEscapes(options.jail), std.zig.fmtEscapes(options.source) });
-    try stdout.print("  loss event: {s} UTC truncated inode={d} committed_offset={d} size={}\n", .{ formatUtc(&time_buffer, recorded.wall_us), recorded.inode, recorded.committed_offset, SizeText{ .size = recorded.observed_size } });
+    try stdout.print(
+        "  loss event: {s} UTC truncated inode={d} committed_offset={d} size={}\n",
+        .{ formatUtc(&time_buffer, recorded.wall_us), recorded.inode, recorded.committed_offset, SizeText{ .size = recorded.observed_size } },
+    );
     try stdout.print("  reading resumed at offset 0 of inode {d}; no repair was performed and the token was not used\n", .{recorded.inode});
 }
 
@@ -221,9 +224,15 @@ fn reportRemoved(stdout: anytype, options: Options, outcome: repair.Outcome, rem
     if (removed.last_size) |size| try stdout.print(" last_size={d}\n", .{size}) else if (outcome.replayed) try stdout.writeAll("\n") else try stdout.writeAll(" last_size=unknown\n");
     if (removed.current_inode) |inode| {
         try stdout.print("  current inode={d}", .{inode});
-        if (removed.current_offset) |offset| try stdout.print(" resumes at offset {d}\n", .{offset}) else try stdout.writeAll(" has no checkpoint; the next start reads it from its configured start\n");
+        if (removed.current_offset) |offset| try stdout.print(
+            " resumes at offset {d}\n",
+            .{offset},
+        ) else try stdout.writeAll(" has no checkpoint; the next start reads it from its configured start\n");
     }
-    if (removed.committed_offset) |offset| try stdout.print("Records in the removed incarnation after offset {d} were never read and cannot be recovered.\n", .{offset}) else try stdout.writeAll(removed_loss_text);
+    if (removed.committed_offset) |offset| try stdout.print(
+        "Records in the removed incarnation after offset {d} were never read and cannot be recovered.\n",
+        .{offset},
+    ) else try stdout.writeAll(removed_loss_text);
     try stdout.writeAll(
         \\While the daemon is stopped, protection for every jail may be absent: the stop can
         \\remove installed firewall rules. The next start reinstalls them from durable state
@@ -237,9 +246,15 @@ fn report(stdout: anytype, options: Options, outcome: repair.Outcome) !void {
     const hex = std.fmt.fmtSliceHexLower;
     try stdout.print("repair-source: {s}\n", .{repair.headline(outcome)});
     try stdout.print("  jail={s} source={s}\n  path={s}\n", .{ options.jail, outcome.source, options.source });
-    try stdout.print("  generation={s}\n  checkpoint_revision={d} -> {d}\n  prior_cursor_sha256={s}\n", .{ hex(&outcome.generation), outcome.prior_checkpoint_revision, outcome.prior_checkpoint_revision + 1, hex(&outcome.prior_cursor_sha256) });
+    try stdout.print(
+        "  generation={s}\n  checkpoint_revision={d} -> {d}\n  prior_cursor_sha256={s}\n",
+        .{ hex(&outcome.generation), outcome.prior_checkpoint_revision, outcome.prior_checkpoint_revision + 1, hex(&outcome.prior_cursor_sha256) },
+    );
     if (outcome.prior_incarnation) |incarnation| try stdout.print("  prior_incarnation={s} prior_offset={d}\n", .{ hex(&incarnation), outcome.prior_offset.? });
-    try stdout.print("  new_incarnation={s} new_offset=0\n  file device={d} inode={d} size={d} prefix_sha256={s}\n", .{ hex(&outcome.new_incarnation), outcome.file.device, outcome.file.inode, outcome.file.size, hex(&outcome.file.prefix_sha256) });
+    try stdout.print(
+        "  new_incarnation={s} new_offset=0\n  file device={d} inode={d} size={d} prefix_sha256={s}\n",
+        .{ hex(&outcome.new_incarnation), outcome.file.device, outcome.file.inode, outcome.file.size, hex(&outcome.file.prefix_sha256) },
+    );
     try stdout.writeAll(if (outcome.replaced_file) replaced_loss_text else truncated_loss_text);
     try stdout.writeAll(
         \\While the daemon is stopped, protection for every jail may be absent: the stop can

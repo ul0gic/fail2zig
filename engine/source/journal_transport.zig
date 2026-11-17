@@ -257,5 +257,12 @@ pub fn decode(scratch: []u8, line: []const u8, message_limit: usize) !Entry {
     };
     var digest: [32]u8 = undefined;
     hash.final(&digest);
-    return .{ .cursor = c.string, .message = message, .realtime_us = try unsigned(value.object.get("__REALTIME_TIMESTAMP")), .monotonic_us = try unsigned(value.object.get("__MONOTONIC_TIMESTAMP")), .fields = fields, .raw_hash = digest };
+    return .{
+        .cursor = c.string,
+        .message = message,
+        .realtime_us = try unsigned(value.object.get("__REALTIME_TIMESTAMP")),
+        .monotonic_us = try unsigned(value.object.get("__MONOTONIC_TIMESTAMP")),
+        .fields = fields,
+        .raw_hash = digest,
+    };
 }

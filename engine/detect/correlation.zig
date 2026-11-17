@@ -93,7 +93,14 @@ pub const Session = struct {
                         if (outcome.kind == .awaiting_context) valid_until_us = next.entries[index].?.deadline_us;
                     } else {
                         const index = expired_same orelse empty orelse return error.ContextCapacity;
-                        next.entries[index] = .{ .key = input.key, .subject = subject, .occurrence = timing.occurrence, .event_us = timing.event_us, .receipt_us = timing.receipt_us, .deadline_us = deadline };
+                        next.entries[index] = .{
+                            .key = input.key,
+                            .subject = subject,
+                            .occurrence = timing.occurrence,
+                            .event_us = timing.event_us,
+                            .receipt_us = timing.receipt_us,
+                            .deadline_us = deadline,
+                        };
                         valid_until_us = deadline;
                     }
                 }
@@ -108,7 +115,10 @@ pub const Session = struct {
                 if (found) |index| {
                     const entry = next.entries[index].?;
                     const event_end = @as(i128, entry.event_us) + self.ttl_us;
-                    const reason: ?rules.Reason = if (timing.processing_us >= entry.deadline_us) .context_expired else if (timing.event_us < entry.event_us or @as(i128, timing.event_us) > event_end) .event_order else if (outcome.subject != null and !outcome.subject.?.eql(entry.subject)) .context_conflict else null;
+                    const reason: ?rules.Reason = if (timing.processing_us >= entry.deadline_us) .context_expired else if (timing.event_us < entry.event_us or @as(
+                        i128,
+                        timing.event_us,
+                    ) > event_end) .event_order else if (outcome.subject != null and !outcome.subject.?.eql(entry.subject)) .context_conflict else null;
                     if (reason) |why| {
                         outcome.kind = .rejected;
                         outcome.reason = why;
@@ -240,7 +250,14 @@ pub const Session = struct {
             };
             var key = rules.Key{ .len = input[0] };
             @memcpy(&key.bytes, input[1..65]);
-            slot.* = .{ .key = key, .subject = subject, .occurrence = input[321..353].*, .event_us = std.mem.readInt(i64, input[353..361], .little), .receipt_us = std.mem.readInt(i64, input[361..369], .little), .deadline_us = std.mem.readInt(i64, input[369..377], .little) };
+            slot.* = .{
+                .key = key,
+                .subject = subject,
+                .occurrence = input[321..353].*,
+                .event_us = std.mem.readInt(i64, input[353..361], .little),
+                .receipt_us = std.mem.readInt(i64, input[361..369], .little),
+                .deadline_us = std.mem.readInt(i64, input[369..377], .little),
+            };
         }
         try self.validateState(state);
         return state;

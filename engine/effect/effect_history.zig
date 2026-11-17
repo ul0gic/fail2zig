@@ -8,7 +8,20 @@ const Origin = @import("shared").types.Origin;
 pub const version: u16 = 1;
 pub const max_page: usize = 64;
 pub const checkpoint_bytes: usize = 112;
-pub const Error = error{ InvalidHistoryEvent, InvalidHistoryPage, InvalidHistoryCheckpoint, HistoryGenerationMismatch, HistoryGap, StaleHistoryPage, InvalidHistoryTransition, HistoryCapacity, HistoryBusy, HistoryNotReady, HistoryAlreadyReady, HistoryCaughtUp };
+pub const Error = error{
+    InvalidHistoryEvent,
+    InvalidHistoryPage,
+    InvalidHistoryCheckpoint,
+    HistoryGenerationMismatch,
+    HistoryGap,
+    StaleHistoryPage,
+    InvalidHistoryTransition,
+    HistoryCapacity,
+    HistoryBusy,
+    HistoryNotReady,
+    HistoryAlreadyReady,
+    HistoryCaughtUp,
+};
 const max_number = std.math.maxInt(i64);
 
 pub const Event = struct {
@@ -99,7 +112,14 @@ pub const Checkpoint = struct {
     }
     pub fn decode(bytes: []const u8) Error!Checkpoint {
         if (bytes.len != checkpoint_bytes or !std.mem.eql(u8, bytes[0..8], "F2ZHIST1")) return error.InvalidHistoryCheckpoint;
-        const result = Checkpoint{ .generation = bytes[8..40].*, .installation = bytes[40..56].*, .last_sequence = std.mem.readInt(u64, bytes[56..64], .little), .total_confirmed = std.mem.readInt(u64, bytes[64..72], .little), .confirmed_watermark_us = std.mem.readInt(i64, bytes[72..80], .little), .rolling_digest = bytes[80..112].* };
+        const result = Checkpoint{
+            .generation = bytes[8..40].*,
+            .installation = bytes[40..56].*,
+            .last_sequence = std.mem.readInt(u64, bytes[56..64], .little),
+            .total_confirmed = std.mem.readInt(u64, bytes[64..72], .little),
+            .confirmed_watermark_us = std.mem.readInt(i64, bytes[72..80], .little),
+            .rolling_digest = bytes[80..112].*,
+        };
         try result.validate();
         return result;
     }

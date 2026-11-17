@@ -387,7 +387,10 @@ pub fn Methods(comptime Store: type) type {
                 .live_counter => self.loadRepairPage(progress, "INSERT INTO effect_owner_live(id,live) SELECT 1,count(*) FROM effect_owners WHERE lease_kind<>0;" ++
                     "INSERT INTO migration_activations SELECT s.run_id,s.seq,r.updated_us FROM migration_staged_owners s JOIN migration_runs r ON r.run_id=s.run_id WHERE r.state IN(6,7);"),
                 .detail_columns => self.loadRepairPage(progress, detail_columns_ddl),
-                .detail_sequence_index, .detail_age_index, .detail_subject_index, .detail_evidence_index => self.loadRepairPage(progress, detail_index_ddl[@intFromEnum(progress.phase) - @intFromEnum(Phase.detail_sequence_index)]),
+                .detail_sequence_index, .detail_age_index, .detail_subject_index, .detail_evidence_index => self.loadRepairPage(
+                    progress,
+                    detail_index_ddl[@intFromEnum(progress.phase) - @intFromEnum(Phase.detail_sequence_index)],
+                ),
                 .targets_swap => self.loadRepairPage(progress, "DROP TABLE action_targets; ALTER TABLE action_targets_v24 RENAME TO action_targets;"),
                 .observations_swap => self.loadRepairPage(progress, "DROP TABLE effect_observations; ALTER TABLE effect_observations_v24 RENAME TO effect_observations;"),
                 .spent_index => self.loadRepairPage(progress, "CREATE INDEX native_effects_spent ON native_effects(scope_key) WHERE lease_kind=0;"),
@@ -443,7 +446,10 @@ pub fn Methods(comptime Store: type) type {
             const partial_path = std.fmt.bufPrintZ(partial_buffer, "{s}{s}.partial", .{ options.state_path, kind.suffix() }) catch return error.StorageLimit;
             // Why: A backup file this run did not record may predate later writes, so its presence refuses the migration.
             if (std.fs.cwd().access(final_path, .{})) |_| {
-                std.log.warn("native storage: schema {d} migration refused: backup {s} already exists; keep it if it is the only copy of earlier state, otherwise move it aside and restart", .{ kind.target(), final_path });
+                std.log.warn(
+                    "native storage: schema {d} migration refused: backup {s} already exists; keep it if it is the only copy of earlier state, otherwise move it aside and restart",
+                    .{ kind.target(), final_path },
+                );
                 return switch (kind) {
                     .pre24 => error.LoadRepairBackupExists,
                     .pre25, .pre26, .pre27, .pre28, .pre29 => error.SchemaBackupExists,

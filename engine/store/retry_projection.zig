@@ -379,7 +379,10 @@ pub fn Methods(comptime Store: type) type {
             } else complete = true;
             const final = try self.projectionMeta();
             try self.commitTransaction();
-            if (comptime build_options.diag) if (!meta.ready or meta.target_us != null or (self.retry_admission_target_hint != null and self.retry_admission_target_hint.? > meta.as_of_us)) diag.count(.retry_projection_pages, 1);
+            if (comptime build_options.diag) if (!meta.ready or meta.target_us != null or (self.retry_admission_target_hint != null and self.retry_admission_target_hint.? > meta.as_of_us)) diag.count(
+                .retry_projection_pages,
+                1,
+            );
             if (self.retry_admission_target_hint) |hint| if (final.ready and hint <= final.as_of_us) {
                 self.retry_admission_target_hint = null;
             };
@@ -442,7 +445,10 @@ pub fn Methods(comptime Store: type) type {
                 self.projectionHint(now_us);
                 return null;
             }
-            return .{ .occupancy = .{ .tracked = @intCast(meta.total - meta.live), .banned = @intCast(meta.live), .tracking_limit = retry.max_pool_subjects, .ban_limit = retry.max_pool_subjects }, .as_of_us = now_us };
+            return .{
+                .occupancy = .{ .tracked = @intCast(meta.total - meta.live), .banned = @intCast(meta.live), .tracking_limit = retry.max_pool_subjects, .ban_limit = retry.max_pool_subjects },
+                .as_of_us = now_us,
+            };
         }
         fn subjectLess(a: detection.Subject, b: detection.Subject) bool {
             if (a == .v4 and b == .v6) return true;

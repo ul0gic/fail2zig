@@ -157,7 +157,15 @@ pub fn parseReply(packet: []const u8, name: Name, question: Question, id: u16) !
     for (records[0..total], 0..) |*record, index| {
         const owner = try readName(packet, &position, &budget);
         if (position > packet.len or packet.len - position < 10) return error.InvalidDnsPacket;
-        record.* = .{ .name = owner, .kind = try u16be(packet, position), .class = try u16be(packet, position + 2), .ttl = try u32be(packet, position + 4), .offset = position + 10, .length = try u16be(packet, position + 8), .section = if (index < answers) .answer else if (index < @as(usize, answers) + authority) .authority else .additional };
+        record.* = .{
+            .name = owner,
+            .kind = try u16be(packet, position),
+            .class = try u16be(packet, position + 2),
+            .ttl = try u32be(packet, position + 4),
+            .offset = position + 10,
+            .length = try u16be(packet, position + 8),
+            .section = if (index < answers) .answer else if (index < @as(usize, answers) + authority) .authority else .additional,
+        };
         position += 10;
         if (record.length > packet.len - position) return error.InvalidDnsPacket;
         position += record.length;
@@ -629,7 +637,13 @@ pub fn decodeCheckpoint(bytes: []const u8) !CacheEntry {
     answer.count = bytes[295];
     const revision = std.mem.readInt(u64, bytes[584..592], .little);
     if (revision == 0 or revision > std.math.maxInt(i64)) return error.InvalidDnsCheckpoint;
-    const result = Result{ .request = .{ .name = name, .family = family, .generation = bytes[8..40].* }, .answer = answer, .completed_us = std.mem.readInt(i64, bytes[568..576], .little), .valid_until_us = std.mem.readInt(i64, bytes[576..584], .little), .deadline_ms = 0 };
+    const result = Result{
+        .request = .{ .name = name, .family = family, .generation = bytes[8..40].* },
+        .answer = answer,
+        .completed_us = std.mem.readInt(i64, bytes[568..576], .little),
+        .valid_until_us = std.mem.readInt(i64, bytes[576..584], .little),
+        .deadline_ms = 0,
+    };
     try validateResult(result);
     return .{ .result = result, .revision = revision };
 }

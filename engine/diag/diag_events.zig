@@ -305,7 +305,10 @@ fn writeHeaders(w: anytype, id: *const [32]u8, ts_ms: u64, level: []const u8) !v
     try w.print("{{\"event_id\":\"{s}\",\"dsn\":", .{id});
     try std.json.encodeJsonString(endpoint.dsn(), .{}, w);
     try w.writeAll("}\n{\"type\":\"event\"}\n");
-    try w.print("{{\"event_id\":\"{s}\",\"timestamp\":{d}.{d:0>3},\"platform\":\"other\",\"level\":\"{s}\",\"logger\":\"fail2zig.diag\",\"release\":\"fail2zig@" ++ build_options.version ++ "\",\"environment\":\"diag\"", .{ id, ts_ms / std.time.ms_per_s, ts_ms % std.time.ms_per_s, level });
+    try w.print(
+        "{{\"event_id\":\"{s}\",\"timestamp\":{d}.{d:0>3},\"platform\":\"other\",\"level\":\"{s}\",\"logger\":\"fail2zig.diag\",\"release\":\"fail2zig@" ++ build_options.version ++ "\",\"environment\":\"diag\"",
+        .{ id, ts_ms / std.time.ms_per_s, ts_ms % std.time.ms_per_s, level },
+    );
 }
 
 fn writeBuildTags(w: anytype) !void {

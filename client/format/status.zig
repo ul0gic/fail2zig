@@ -442,7 +442,11 @@ fn formatTrackingPool(buffer: []u8, s: StatusPayload) ?[]const u8 {
     const banned = s.pool_banned orelse return null;
     const tracking_limit = s.pool_tracking_limit orelse return null;
     const ban_limit = s.pool_ban_limit orelse return null;
-    return std.fmt.bufPrint(buffer, "{d} of {d} tracked, {d} of {d} banned{s}", .{ tracked, tracking_limit, banned, ban_limit, if (s.pool_sample_pending == true) " (sample pending)" else "" }) catch null;
+    return std.fmt.bufPrint(
+        buffer,
+        "{d} of {d} tracked, {d} of {d} banned{s}",
+        .{ tracked, tracking_limit, banned, ban_limit, if (s.pool_sample_pending == true) " (sample pending)" else "" },
+    ) catch null;
 }
 
 fn formatProtection(buffer: []u8, s: StatusPayload) []const u8 {
@@ -466,7 +470,11 @@ fn formatPending(buffer: []u8, s: StatusPayload) []const u8 {
     const pending = s.pending_bans orelse return "unknown";
     const overdue = s.overdue_removals orelse return "unknown";
     if (pending == 0 and overdue == 0) return "none";
-    if (pending != 0 and overdue != 0) return std.fmt.bufPrint(buffer, "{d} bans (oldest {d} ms); {d} overdue (oldest {d} ms)", .{ pending, s.oldest_pending_ms orelse 0, overdue, s.oldest_overdue_ms orelse 0 }) catch "-";
+    if (pending != 0 and overdue != 0) return std.fmt.bufPrint(
+        buffer,
+        "{d} bans (oldest {d} ms); {d} overdue (oldest {d} ms)",
+        .{ pending, s.oldest_pending_ms orelse 0, overdue, s.oldest_overdue_ms orelse 0 },
+    ) catch "-";
     if (pending != 0) return std.fmt.bufPrint(buffer, "{d} bans (oldest {d} ms)", .{ pending, s.oldest_pending_ms orelse 0 }) catch "-";
     return std.fmt.bufPrint(buffer, "{d} overdue (oldest {d} ms)", .{ overdue, s.oldest_overdue_ms orelse 0 }) catch "-";
 }
@@ -495,7 +503,11 @@ fn formatWorker(buffer: []u8, s: StatusPayload) ?[]const u8 {
     if (!busy and !stalled) return null;
     const busy_age = s.worker_busy_age_ms;
     const heartbeat_age = s.worker_heartbeat_age_ms;
-    if (stalled and busy and busy_age != null and heartbeat_age != null) return std.fmt.bufPrint(buffer, "stalled; busy {d} ms; heartbeat {d} ms ago", .{ busy_age.?, heartbeat_age.? }) catch "stalled; busy";
+    if (stalled and busy and busy_age != null and heartbeat_age != null) return std.fmt.bufPrint(
+        buffer,
+        "stalled; busy {d} ms; heartbeat {d} ms ago",
+        .{ busy_age.?, heartbeat_age.? },
+    ) catch "stalled; busy";
     if (stalled and heartbeat_age != null) return std.fmt.bufPrint(buffer, "stalled; heartbeat {d} ms ago", .{heartbeat_age.?}) catch "stalled";
     if (stalled) return "stalled";
     if (busy_age) |age| return std.fmt.bufPrint(buffer, "busy for {d} ms", .{age}) catch "busy";

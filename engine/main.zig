@@ -241,7 +241,14 @@ pub fn main() !void {
         },
         .migrate => {
             var arena = std.heap.ArenaAllocator.init(heap);
-            std.process.exit(@import("cli/migrate.zig").run(heap, rest[1..], version, configuredSocket(arena.allocator(), rest, std.io.getStdErr().writer()), std.io.getStdOut().writer(), std.io.getStdErr().writer()).code());
+            std.process.exit(@import("cli/migrate.zig").run(
+                heap,
+                rest[1..],
+                version,
+                configuredSocket(arena.allocator(), rest, std.io.getStdErr().writer()),
+                std.io.getStdOut().writer(),
+                std.io.getStdErr().writer(),
+            ).code());
         },
         .rule_test => std.process.exit(@import("cli/rule_test.zig").run(heap, rest[1..], std.io.getStdOut().writer(), std.io.getStdErr().writer()).code()),
         .repair_source => std.process.exit(@import("cli/repair_source.zig").run(heap, rest[1..], std.io.getStdOut().writer(), std.io.getStdErr().writer()).code()),

@@ -1151,7 +1151,13 @@ fn putElement(self: *NftablesBackend, ip: shared.IpAddress, duration: shared.Dur
         var del_buf: [512]u8 = undefined;
         const del_payload = buildSetElemDelPayload(&del_buf, netlink.NFPROTO.INET, self.tableName(), if (ip == .ipv4) "banned_ipv4" else "banned_ipv6", key_bytes) catch |e| return mapNetlinkErr(e);
         const del_seq = sock_ptr.nextSeq();
-        batch.add(netlink.nfnlMsgType(netlink.NFNL.SUBSYS_NFTABLES, NFT_MSG.DELSETELEM), linux.NLM_F_REQUEST | linux.NLM_F_ACK, del_seq, sock_ptr.port_id, del_payload) catch |e| return mapNetlinkErr(e);
+        batch.add(
+            netlink.nfnlMsgType(netlink.NFNL.SUBSYS_NFTABLES, NFT_MSG.DELSETELEM),
+            linux.NLM_F_REQUEST | linux.NLM_F_ACK,
+            del_seq,
+            sock_ptr.port_id,
+            del_payload,
+        ) catch |e| return mapNetlinkErr(e);
         sequences[sequence_count] = del_seq;
         sequence_count += 1;
     }

@@ -31,7 +31,15 @@ const ignore_set = @import("../detect/ignore_set.zig");
 
 // Why: The match list is hashed into the journal source generation, so editing either list fails admission of existing state.
 const legacy_ssh_matches: []const []const u8 = &.{ "SYSLOG_IDENTIFIER=sshd", "SYSLOG_IDENTIFIER=sshd-session", "+", "_COMM=sshd", "_COMM=sshd-session" };
-const auth_ssh_matches: []const []const u8 = &.{ "SYSLOG_IDENTIFIER=sshd", "SYSLOG_IDENTIFIER=sshd-session", "SYSLOG_IDENTIFIER=sshd-auth", "+", "_COMM=sshd", "_COMM=sshd-session", "_COMM=sshd-auth" };
+const auth_ssh_matches: []const []const u8 = &.{
+    "SYSLOG_IDENTIFIER=sshd",
+    "SYSLOG_IDENTIFIER=sshd-session",
+    "SYSLOG_IDENTIFIER=sshd-auth",
+    "+",
+    "_COMM=sshd",
+    "_COMM=sshd-session",
+    "_COMM=sshd-auth",
+};
 const journal_sessions = @import("../source/journal_session.zig");
 const health = @import("../platform/storage_health.zig");
 const recovery = @import("../source/recovery.zig");
@@ -258,7 +266,10 @@ pub const WritablePath = enum { state, socket };
 pub fn logSandboxHint(err: anyerror, path: []const u8, kind: WritablePath) void {
     if (err != error.ReadOnlyFileSystem and err != error.AccessDenied) return;
     const dir = std.fs.path.dirname(path) orelse "/";
-    std.log.err("native: the service cannot write the {s} directory '{'}'; the shipped systemd unit allows writes only to directories it grants (ProtectSystem=strict); add the unit override from the installation guide, \"Custom state directory under systemd\" (the installer prints it for your configuration)", .{ @tagName(kind), std.zig.fmtEscapes(dir[0..@min(dir.len, 256)]) });
+    std.log.err(
+        "native: the service cannot write the {s} directory '{'}'; the shipped systemd unit allows writes only to directories it grants (ProtectSystem=strict); add the unit override from the installation guide, \"Custom state directory under systemd\" (the installer prints it for your configuration)",
+        .{ @tagName(kind), std.zig.fmtEscapes(dir[0..@min(dir.len, 256)]) },
+    );
 }
 pub fn destroyZone(a: std.mem.Allocator, zone: ?*timezone.Zone) void {
     if (zone) |value| {
@@ -855,7 +866,11 @@ pub const Coordinator = struct {
             .file => try plan.include(try resource.fileCost(.{ .source_capacity = capacity, .spec_count = jail.logpath.len, .max_record_bytes = 2048, .max_decoded_bytes = 2048 })),
             .journald => {
                 try plan.include(try resource.journalCost(.{ .max_record_bytes = 2048, .max_decoded_bytes = 2048, .batch_records = 1, .environment = environment }));
-                try plan.include(.{ .live = .{ .bytes = 8 * (std.fs.max_path_bytes + @sizeOf([]const u8)), .allocations = 9 }, .workspace = .{ .bytes = 98304, .allocations = 16, .fds = 4 }, .workspace_kind = .configuration });
+                try plan.include(.{
+                    .live = .{ .bytes = 8 * (std.fs.max_path_bytes + @sizeOf([]const u8)), .allocations = 9 },
+                    .workspace = .{ .bytes = 98304, .allocations = 16, .fds = 4 },
+                    .workspace_kind = .configuration,
+                });
             },
             .internal => try plan.include(.{ .workspace = .{ .bytes = 16 * 1024, .allocations = 4 }, .workspace_kind = .source }),
             .auto => return error.NativeInternalEventsRequired,
@@ -865,7 +880,11 @@ pub const Coordinator = struct {
         if (source == .file) for (jail.logpath) |path| {
             input_bytes += path.len;
         };
-        try plan.include(.{ .live = .{ .bytes = projection_bytes + input_bytes, .allocations = 5 + if (source == .file) jail.logpath.len else @as(usize, 0) }, .workspace = .{ .bytes = 65536, .allocations = 16, .fds = 2 }, .workspace_kind = .configuration });
+        try plan.include(.{
+            .live = .{ .bytes = projection_bytes + input_bytes, .allocations = 5 + if (source == .file) jail.logpath.len else @as(usize, 0) },
+            .workspace = .{ .bytes = 65536, .allocations = 16, .fds = 2 },
+            .workspace_kind = .configuration,
+        });
         if (jail.timezone != null) try plan.include(try resource.timezoneCost(1));
         if (jail.rule_files.len != 0) {
             const prepared = try consumer_plan.reservationBytes(jail.rule_files.len);
@@ -903,7 +922,10 @@ pub const Coordinator = struct {
         errdefer if (namespace_lock) |file| file.close();
         if (requested_enforcing) namespace_lock = try lockFirewallNamespace(cfg);
         var authority_lock = path_guard.lockStateIfPresent(cfg.global.state_file) catch |err| {
-            std.log.err("native: state authority admission failed: {s}; path='{'}'{s}", .{ @errorName(err), std.zig.fmtEscapes(cfg.global.state_file[0..@min(cfg.global.state_file.len, 256)]), if (cfg.global.state_file.len > 256) " [path truncated]" else "" });
+            std.log.err(
+                "native: state authority admission failed: {s}; path='{'}'{s}",
+                .{ @errorName(err), std.zig.fmtEscapes(cfg.global.state_file[0..@min(cfg.global.state_file.len, 256)]), if (cfg.global.state_file.len > 256) " [path truncated]" else "" },
+            );
             logSandboxHint(err, cfg.global.state_file, .state);
             return err;
         };
@@ -1011,7 +1033,10 @@ pub const Coordinator = struct {
             prepared += 1;
         }
         if (self.authority_lock == null) self.authority_lock = path_guard.lockAbsentState(cfg.global.state_file) catch |err| {
-            std.log.err("native: state authority admission failed: {s}; path='{'}'{s}", .{ @errorName(err), std.zig.fmtEscapes(cfg.global.state_file[0..@min(cfg.global.state_file.len, 256)]), if (cfg.global.state_file.len > 256) " [path truncated]" else "" });
+            std.log.err(
+                "native: state authority admission failed: {s}; path='{'}'{s}",
+                .{ @errorName(err), std.zig.fmtEscapes(cfg.global.state_file[0..@min(cfg.global.state_file.len, 256)]), if (cfg.global.state_file.len > 256) " [path truncated]" else "" },
+            );
             logSandboxHint(err, cfg.global.state_file, .state);
             return err;
         };
@@ -1050,7 +1075,10 @@ pub const Coordinator = struct {
             if (recount.prior_streak == 0)
                 std.log.warn("native storage: live-owner counter {d} did not match {d} live owners; recounted", .{ recount.stored, recount.counted })
             else
-                std.log.err("native storage: live-owner counter {d} did not match {d} live owners again ({d} consecutive startups); recounted, but a writer is bypassing the counter triggers", .{ recount.stored, recount.counted, recount.prior_streak + 1 });
+                std.log.err(
+                    "native storage: live-owner counter {d} did not match {d} live owners again ({d} consecutive startups); recounted, but a writer is bypassing the counter triggers",
+                    .{ recount.stored, recount.counted, recount.prior_streak + 1 },
+                );
         }
         errdefer self.destroyRuntime();
         try self.store.beginStartupAdmission();
@@ -1122,11 +1150,24 @@ pub const Coordinator = struct {
                 if (selected.journal_executables.len != 0) return error.UnusedJournalProfile;
                 const timestamp = selected.timestamp orelse return error.NativeTimestampRequired;
                 if (timestamp != .syslog and selected.timezone_offset_minutes != null) return error.UnusedTimezoneOffset;
-                var settings = projection.Settings{ .timestamp = undefined, .body = if (assets == null and !filter_registry.requiresWholeRecord(selected.filter) and (timestamp == .iso8601 or timestamp == .syslog)) .syslog else .whole, .start = if (timestamp == .undated) .tail else .head, .max_sources = max_sources_per_jail, .ignore_capacity = 128, .custom = assets != null };
+                var settings = projection.Settings{
+                    .timestamp = undefined,
+                    .body = if (assets == null and !filter_registry.requiresWholeRecord(selected.filter) and (timestamp == .iso8601 or timestamp == .syslog)) .syslog else .whole,
+                    .start = if (timestamp == .undated) .tail else .head,
+                    .max_sources = max_sources_per_jail,
+                    .ignore_capacity = 128,
+                    .custom = assets != null,
+                };
                 settings.timestamp = switch (timestamp) {
                     .undated => .undated,
                     .iso8601 => .{ .field = .{ .format = .iso8601, .boundary = .{ .delimiter = ' ' } } },
-                    .syslog => .{ .field = .{ .format = .syslog, .boundary = .{ .length = 15 }, .infer_year = true, .zone = zone, .context = .{ .offset_seconds = if (zone != null) null else @as(i32, selected.timezone_offset_minutes orelse return error.NativeTimezoneRequired) * 60 } } },
+                    .syslog => .{ .field = .{
+                        .format = .syslog,
+                        .boundary = .{ .length = 15 },
+                        .infer_year = true,
+                        .zone = zone,
+                        .context = .{ .offset_seconds = if (zone != null) null else @as(i32, selected.timezone_offset_minutes orelse return error.NativeTimezoneRequired) * 60 },
+                    } },
                     .epoch_seconds => .{ .field = .{ .format = .epoch_seconds, .boundary = .{ .delimiter = ' ' } } },
                     .common_log => .{ .field = .{ .format = .common_log, .start = 1, .boundary = .{ .length = 26 } } },
                 };
@@ -1142,7 +1183,10 @@ pub const Coordinator = struct {
                         return error.InvalidJournalExecutables;
                     }
                     discovered = journal_profile.discover(a) catch |err| {
-                        std.log.err("native: jail '{s}': cannot resolve trusted SSH journal executables: {s}; configure journal_executables explicitly for a nonstandard installation", .{ selected.name, @errorName(err) });
+                        std.log.err(
+                            "native: jail '{s}': cannot resolve trusted SSH journal executables: {s}; configure journal_executables explicitly for a nonstandard installation",
+                            .{ selected.name, @errorName(err) },
+                        );
                         return err;
                     };
                 } else {
@@ -1158,7 +1202,19 @@ pub const Coordinator = struct {
                 const matches: []const []const u8 = if (discovered != null and discovered.?.has_auth_helper) auth_ssh_matches else legacy_ssh_matches;
                 const machine = try std.fs.cwd().readFileAlloc(a, "/etc/machine-id", 33);
                 defer a.free(machine);
-                break :blk .{ .journal = try journal_projection.Plan.create(a, &selected_cfg, 0, parent_generation, .{ .machine_id = std.mem.trim(u8, machine, "\n"), .executables = executables, .ignore_capacity = 128, .custom = assets != null, .journal = .{ .batch_records = 1, .matches = matches } }) };
+                break :blk .{ .journal = try journal_projection.Plan.create(
+                    a,
+                    &selected_cfg,
+                    0,
+                    parent_generation,
+                    .{
+                        .machine_id = std.mem.trim(u8, machine, "\n"),
+                        .executables = executables,
+                        .ignore_capacity = 128,
+                        .custom = assets != null,
+                        .journal = .{ .batch_records = 1, .matches = matches },
+                    },
+                ) };
             },
             .auto => unreachable,
             .internal => .{ .internal = try internalGeneration(selected.name, policy, .identity) },
@@ -1403,6 +1459,9 @@ pub fn run(a: std.mem.Allocator, cfg: *const config.Config, config_path: []const
     try coordinator.start();
     defer coordinator.stop();
     const backend_name = if (coordinator.startup_backend) |selected| @tagName(selected) else "none";
-    std.log.info("fail2zig {s} running; backend={s}; native SQLite ingestion; protection admission pending; ipc={s}; http={s}", .{ version, backend_name, cfg.global.socket_path, if (cfg.global.metrics_enabled) cfg.global.metrics_bind else "off" });
+    std.log.info(
+        "fail2zig {s} running; backend={s}; native SQLite ingestion; protection admission pending; ipc={s}; http={s}",
+        .{ version, backend_name, cfg.global.socket_path, if (cfg.global.metrics_enabled) cfg.global.metrics_bind else "off" },
+    );
     try loop.run();
 }

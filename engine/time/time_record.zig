@@ -78,7 +78,13 @@ pub const Stored = struct {
                         if (effective != receipt.us or ahead <= 0 or ahead > policy.future_tolerance_us) return error.InvalidNativeTime;
                     },
                 }
-                const evidence = policy.Evidence{ .timestamp = .{ .us = effective }, .origin = origin, .original = if (self.original_us) |v| .{ .us = v } else null, .receipt = receipt, .inferred_year = self.inferred_year };
+                const evidence = policy.Evidence{
+                    .timestamp = .{ .us = effective },
+                    .origin = origin,
+                    .original = if (self.original_us) |v| .{ .us = v } else null,
+                    .receipt = receipt,
+                    .inferred_year = self.inferred_year,
+                };
                 return if (@intFromEnum(self.kind) <= @intFromEnum(Kind.eligible_adjusted)) .{ .eligible = evidence } else .{ .obsolete = evidence };
             },
             else => {

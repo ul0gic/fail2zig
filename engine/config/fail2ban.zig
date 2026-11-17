@@ -466,7 +466,18 @@ fn loadOccurrence(arena: std.mem.Allocator, result: *ParsedIni, root: []const u8
             try mergeInto(arena, result, parsed);
             var digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-            try result.sources.append(arena, .{ .edge = source_edge, .original_path = path, .resolved_target = target, .parent_path = if (stack.items.len > 1) stack.items[stack.items.len - 2] else null, .path = full, .bytes = bytes, .sha256 = digest });
+            try result.sources.append(
+                arena,
+                .{
+                    .edge = source_edge,
+                    .original_path = path,
+                    .resolved_target = target,
+                    .parent_path = if (stack.items.len > 1) stack.items[stack.items.len - 2] else null,
+                    .path = full,
+                    .bytes = bytes,
+                    .sha256 = digest,
+                },
+            );
         }
         if (try resolve(arena, &parsed, "INCLUDES", edge)) |value| {
             var lines = std.mem.splitScalar(u8, value, '\n');
@@ -806,7 +817,15 @@ pub fn readTypedOption(arena: std.mem.Allocator, ini: *const ParsedIni, section_
     const inherited = if (def) |sec| sec.origins.get(key) else null;
     const origin = own orelse inherited;
     const value = try resolve(arena, ini, section_name, key);
-    var result = ResolvedOption{ .presence = if (own != null) .explicit else if (inherited != null) .derived else .absent, .resolution = .resolved, .value_type = value_type, .raw = if (origin) |o| o.raw else null, .value = fallback, .origin = origin, .default_identity = default_identity };
+    var result = ResolvedOption{
+        .presence = if (own != null) .explicit else if (inherited != null) .derived else .absent,
+        .resolution = .resolved,
+        .value_type = value_type,
+        .raw = if (origin) |o| o.raw else null,
+        .value = fallback,
+        .origin = origin,
+        .default_identity = default_identity,
+    };
     const raw = value orelse return result;
     switch (value_type) {
         .string => result.value = .{ .string = raw },
@@ -874,7 +893,76 @@ pub fn prepareConfigDocument(arena: std.mem.Allocator, root: []const u8, stem: [
 
 fn normalizeInteger(arena: std.mem.Allocator, raw: []const u8) Error!?[]const u8 {
     // Why: Each entry is the zero of a run of ten Unicode decimal digits (category Nd), so any such digit maps to its ASCII value.
-    const zeroes = [_]u21{ 0x30, 0x660, 0x6f0, 0x7c0, 0x966, 0x9e6, 0xa66, 0xae6, 0xb66, 0xbe6, 0xc66, 0xce6, 0xd66, 0xde6, 0xe50, 0xed0, 0xf20, 0x1040, 0x1090, 0x17e0, 0x1810, 0x1946, 0x19d0, 0x1a80, 0x1a90, 0x1b50, 0x1bb0, 0x1c40, 0x1c50, 0xa620, 0xa8d0, 0xa900, 0xa9d0, 0xa9f0, 0xaa50, 0xabf0, 0xff10, 0x104a0, 0x10d30, 0x11066, 0x110f0, 0x11136, 0x111d0, 0x112f0, 0x11450, 0x114d0, 0x11650, 0x116c0, 0x11730, 0x118e0, 0x11950, 0x11c50, 0x11d50, 0x11da0, 0x11f50, 0x16a60, 0x16ac0, 0x16b50, 0x1d7ce, 0x1d7d8, 0x1d7e2, 0x1d7ec, 0x1d7f6, 0x1e140, 0x1e2f0, 0x1e4f0, 0x1e950, 0x1fbf0 };
+    const zeroes = [_]u21{
+        0x30,
+        0x660,
+        0x6f0,
+        0x7c0,
+        0x966,
+        0x9e6,
+        0xa66,
+        0xae6,
+        0xb66,
+        0xbe6,
+        0xc66,
+        0xce6,
+        0xd66,
+        0xde6,
+        0xe50,
+        0xed0,
+        0xf20,
+        0x1040,
+        0x1090,
+        0x17e0,
+        0x1810,
+        0x1946,
+        0x19d0,
+        0x1a80,
+        0x1a90,
+        0x1b50,
+        0x1bb0,
+        0x1c40,
+        0x1c50,
+        0xa620,
+        0xa8d0,
+        0xa900,
+        0xa9d0,
+        0xa9f0,
+        0xaa50,
+        0xabf0,
+        0xff10,
+        0x104a0,
+        0x10d30,
+        0x11066,
+        0x110f0,
+        0x11136,
+        0x111d0,
+        0x112f0,
+        0x11450,
+        0x114d0,
+        0x11650,
+        0x116c0,
+        0x11730,
+        0x118e0,
+        0x11950,
+        0x11c50,
+        0x11d50,
+        0x11da0,
+        0x11f50,
+        0x16a60,
+        0x16ac0,
+        0x16b50,
+        0x1d7ce,
+        0x1d7d8,
+        0x1d7e2,
+        0x1d7ec,
+        0x1d7f6,
+        0x1e140,
+        0x1e2f0,
+        0x1e4f0,
+        0x1e950,
+        0x1fbf0,
+    };
     const view = std.unicode.Utf8View.init(raw) catch return null;
     var iter = view.iterator();
     var out = std.ArrayListUnmanaged(u8){};

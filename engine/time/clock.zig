@@ -115,7 +115,14 @@ pub const VirtualClock = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const virtual = self.sampleLocked();
-        return .{ .mode = modeFor(self.rate_value), .rate = self.rate_value, .wall_us = self.wallLocked(virtual), .monotonic_ns = virtual, .real_wall_us = std.time.microTimestamp(), .regressions = self.regression_count };
+        return .{
+            .mode = modeFor(self.rate_value),
+            .rate = self.rate_value,
+            .wall_us = self.wallLocked(virtual),
+            .monotonic_ns = virtual,
+            .real_wall_us = std.time.microTimestamp(),
+            .regressions = self.regression_count,
+        };
     }
 
     fn modeFor(value: u32) Mode {

@@ -49,7 +49,11 @@ pub const Consumer = struct {
         }
         var binding: [32]u8 = undefined;
         hash.final(&binding);
-        return .{ .program = program, .binding = binding, .contexts = if (program.metadata().correlation) |c| try correlation.Session.init(binding, c.ttl_seconds, program.metadata().subject_kind == .hostname) else null };
+        return .{
+            .program = program,
+            .binding = binding,
+            .contexts = if (program.metadata().correlation) |c| try correlation.Session.init(binding, c.ttl_seconds, program.metadata().subject_kind == .hostname) else null,
+        };
     }
     pub fn prepare(self: *Consumer, input: rules.Input, timing: correlation.Timing) !Prepared {
         if (self.in_flight) return error.ConsumerBusy;
@@ -73,7 +77,13 @@ pub const Consumer = struct {
         self.encode(next);
         self.staged = next;
         self.in_flight = true;
-        return .{ .owner = self, .checkpoint = &self.bytes, .outcome = outcome, .prepared_us = timing.processing_us, .valid_until_us = if (self.correlation_stage) |stage| stage.valid_until_us else null };
+        return .{
+            .owner = self,
+            .checkpoint = &self.bytes,
+            .outcome = outcome,
+            .prepared_us = timing.processing_us,
+            .valid_until_us = if (self.correlation_stage) |stage| stage.valid_until_us else null,
+        };
     }
     pub fn prepareRestore(self: *Consumer, saved: []const u8) !Prepared {
         if (self.in_flight) return error.ConsumerBusy;
@@ -109,7 +119,14 @@ pub const Consumer = struct {
         var next = try Consumer.init(program, jail, source, new_parent, hostname_enabled);
         next.encode(previous.staged);
         if (program.metadata().correlation) |settings| {
-            try correlation.Session.rebindCheckpoint(previous.binding, next.binding, settings.ttl_seconds, program.metadata().subject_kind == .hostname, saved[header_bytes..], next.bytes[header_bytes..][0..correlation.checkpoint_bytes]);
+            try correlation.Session.rebindCheckpoint(
+                previous.binding,
+                next.binding,
+                settings.ttl_seconds,
+                program.metadata().subject_kind == .hostname,
+                saved[header_bytes..],
+                next.bytes[header_bytes..][0..correlation.checkpoint_bytes],
+            );
         }
         out.* = next.bytes;
     }

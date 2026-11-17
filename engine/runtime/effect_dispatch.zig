@@ -156,7 +156,20 @@ pub fn Methods(comptime Manager: type) type {
             if (entry.status != .pending) {
                 if (try self.settlementReadback(entry, sampled)) |outcome| return outcome;
                 const held = &(self.inventory orelse return self.readback(sampled));
-                try self.settle(bindings, index, entry, held.start_us, .{ .installation = entry.installation.id, .scope_key = entry.scope_key, .fingerprint = held.snapshot.fingerprint, .observed_us = held.end_us, .qualification = .complete_owned, .state = null });
+                try self.settle(
+                    bindings,
+                    index,
+                    entry,
+                    held.start_us,
+                    .{
+                        .installation = entry.installation.id,
+                        .scope_key = entry.scope_key,
+                        .fingerprint = held.snapshot.fingerprint,
+                        .observed_us = held.end_us,
+                        .qualification = .complete_owned,
+                        .state = null,
+                    },
+                );
                 if (self.cached_epoch == null) return .progress;
                 entry = self.live[index];
                 if (entry.status != .pending) return .progress;
@@ -231,7 +244,20 @@ pub fn Methods(comptime Manager: type) type {
                             if (!try self.evaluateInventory()) return self.deferReadback();
                         } else snapshot.deinit();
                         const held = &self.inventory.?;
-                        try self.settle(bindings, index, entry, held.start_us, .{ .installation = entry.installation.id, .scope_key = entry.scope_key, .fingerprint = held.snapshot.fingerprint, .observed_us = held.end_us, .qualification = .complete_owned, .state = entry.desired });
+                        try self.settle(
+                            bindings,
+                            index,
+                            entry,
+                            held.start_us,
+                            .{
+                                .installation = entry.installation.id,
+                                .scope_key = entry.scope_key,
+                                .fingerprint = held.snapshot.fingerprint,
+                                .observed_us = held.end_us,
+                                .qualification = .complete_owned,
+                                .state = entry.desired,
+                            },
+                        );
                         return .progress;
                     }
                     {
@@ -239,7 +265,20 @@ pub fn Methods(comptime Manager: type) type {
                         try self.validateAndCaptureObservation(&snapshot, .effect, verified.observed_wall_us, .effect_verify);
                     }
                     self.keepInventory(snapshot, verified.observed_start_wall_us, verified.observed_wall_us, after_ns);
-                    try self.settle(bindings, index, entry, dispatch_clock.prepared_us, .{ .installation = entry.installation.id, .scope_key = entry.scope_key, .fingerprint = self.inventory.?.snapshot.fingerprint, .observed_us = verified.observed_wall_us, .qualification = .complete_owned, .state = entry.desired });
+                    try self.settle(
+                        bindings,
+                        index,
+                        entry,
+                        dispatch_clock.prepared_us,
+                        .{
+                            .installation = entry.installation.id,
+                            .scope_key = entry.scope_key,
+                            .fingerprint = self.inventory.?.snapshot.fingerprint,
+                            .observed_us = verified.observed_wall_us,
+                            .qualification = .complete_owned,
+                            .state = entry.desired,
+                        },
+                    );
                     if (!try self.evaluateInventory()) return self.deferReadback();
                     return .progress;
                 },

@@ -413,7 +413,10 @@ pub fn renderToml(cfg: *const native.Config, w: anytype) !void {
     try w.print("memory_ceiling_mb = {d}\n", .{cfg.global.memory_ceiling_mb});
     try writeQuoted(w, "metrics_bind", cfg.global.metrics_bind);
     try w.print("metrics_port = {d}\n", .{cfg.global.metrics_port});
-    try w.print("metrics_enabled = {s}\non_no_backend = \"{s}\"\nfirewall = \"{s}\"\n", .{ if (cfg.global.metrics_enabled) "true" else "false", @tagName(cfg.global.on_no_backend), @tagName(cfg.global.firewall) });
+    try w.print(
+        "metrics_enabled = {s}\non_no_backend = \"{s}\"\nfirewall = \"{s}\"\n",
+        .{ if (cfg.global.metrics_enabled) "true" else "false", @tagName(cfg.global.on_no_backend), @tagName(cfg.global.firewall) },
+    );
     try w.writeAll("\n");
 
     try w.writeAll("[defaults]\n");
@@ -596,7 +599,10 @@ fn prepareManifest(ctx: *Context, document: *const fail2ban.ConfigDocument, glob
                 },
             };
             const origin = effective.origins.get(kv.key_ptr.*);
-            try options.append(a, .{ .section = section.key_ptr.*, .name = kv.key_ptr.*, .raw = if (origin) |o| o.raw else kv.value_ptr.*, .effective = value, .resolution_error = resolution_error, .origin = origin });
+            try options.append(
+                a,
+                .{ .section = section.key_ptr.*, .name = kv.key_ptr.*, .raw = if (origin) |o| o.raw else kv.value_ptr.*, .effective = value, .resolution_error = resolution_error, .origin = origin },
+            );
         }
         if (std.mem.eql(u8, section.key_ptr.*, "DEFAULT") or std.mem.eql(u8, section.key_ptr.*, "INCLUDES")) continue;
         var source_defaults = source_plan.FilterDefaults{ .config_root = ctx.source_dir };
@@ -622,7 +628,19 @@ fn prepareManifest(ctx: *Context, document: *const fail2ban.ConfigDocument, glob
                             error.OutOfMemory => return error.OutOfMemory,
                             else => {
                                 source_defaults.error_name = @errorName(err);
-                                try assets.append(a, .{ .jail = section.key_ptr.*, .kind = kind, .selector = selector, .admission = @errorName(err), .sources = prepared.config.sources.items, .parameters = try entries(a, &prepared.selector.parameters), .combined = &.{}, .consumer_phase = "filter-context-error" });
+                                try assets.append(
+                                    a,
+                                    .{
+                                        .jail = section.key_ptr.*,
+                                        .kind = kind,
+                                        .selector = selector,
+                                        .admission = @errorName(err),
+                                        .sources = prepared.config.sources.items,
+                                        .parameters = try entries(a, &prepared.selector.parameters),
+                                        .combined = &.{},
+                                        .consumer_phase = "filter-context-error",
+                                    },
+                                );
                                 continue;
                             },
                         };
@@ -636,7 +654,18 @@ fn prepareManifest(ctx: *Context, document: *const fail2ban.ConfigDocument, glob
                     break :combined fail2ban.combineAsset(a, &prepared, "") catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         else => {
-                            try assets.append(a, .{ .jail = section.key_ptr.*, .kind = kind, .selector = selector, .admission = @errorName(err), .sources = prepared.config.sources.items, .parameters = try entries(a, &prepared.selector.parameters), .combined = &.{} });
+                            try assets.append(
+                                a,
+                                .{
+                                    .jail = section.key_ptr.*,
+                                    .kind = kind,
+                                    .selector = selector,
+                                    .admission = @errorName(err),
+                                    .sources = prepared.config.sources.items,
+                                    .parameters = try entries(a, &prepared.selector.parameters),
+                                    .combined = &.{},
+                                },
+                            );
                             continue;
                         },
                     };
@@ -646,8 +675,27 @@ fn prepareManifest(ctx: *Context, document: *const fail2ban.ConfigDocument, glob
                     retained.* = combined;
                     source_defaults = .{ .values = retained, .asset_index = assets.items.len, .config_root = ctx.source_dir };
                 }
-                const admission = if (prepared.config.sources.items.len > 0) "prepared" else if (std.mem.eql(u8, kind, "filter") and registry.matcherForFilter(prepared.selector.name) != null) "native-projection" else "missing";
-                try assets.append(a, .{ .jail = section.key_ptr.*, .kind = kind, .selector = selector, .admission = admission, .sources = prepared.config.sources.items, .parameters = try entries(a, &prepared.selector.parameters), .combined = try entries(a, &combined), .diagnostics = prepared.config.warnings.items, .known_combined = known_values, .auto_logtype = auto_logtype, .consumer_phase = consumer_phase });
+                const admission = if (prepared.config.sources.items.len > 0) "prepared" else if (std.mem.eql(
+                    u8,
+                    kind,
+                    "filter",
+                ) and registry.matcherForFilter(prepared.selector.name) != null) "native-projection" else "missing";
+                try assets.append(
+                    a,
+                    .{
+                        .jail = section.key_ptr.*,
+                        .kind = kind,
+                        .selector = selector,
+                        .admission = admission,
+                        .sources = prepared.config.sources.items,
+                        .parameters = try entries(a, &prepared.selector.parameters),
+                        .combined = try entries(a, &combined),
+                        .diagnostics = prepared.config.warnings.items,
+                        .known_combined = known_values,
+                        .auto_logtype = auto_logtype,
+                        .consumer_phase = consumer_phase,
+                    },
+                );
             }
         }
         for (options.items) |*option| {
@@ -685,7 +733,23 @@ fn prepareManifest(ctx: *Context, document: *const fail2ban.ConfigDocument, glob
     var digest: [32]u8 = undefined;
     identity.final(&digest);
     const generation = std.fmt.bytesToHex(digest, .lower);
-    std.json.stringify(.{ .schema_version = @as(u32, 1), .reference_profile = document.reference_profile, .config_generation = @as([]const u8, &generation), .admission = "prepared", .native_projection_profile = "legacy-builtin", .sources = document.source.sources.items, .assignments = document.source.assignments.items, .options = options.items, .assets = assets.items, .global = try prepareGlobalManifest(ctx, global_document), .source_plans = source_plans.items }, .{}, bytes.writer(a)) catch return error.OutOfMemory;
+    std.json.stringify(
+        .{
+            .schema_version = @as(u32, 1),
+            .reference_profile = document.reference_profile,
+            .config_generation = @as([]const u8, &generation),
+            .admission = "prepared",
+            .native_projection_profile = "legacy-builtin",
+            .sources = document.source.sources.items,
+            .assignments = document.source.assignments.items,
+            .options = options.items,
+            .assets = assets.items,
+            .global = try prepareGlobalManifest(ctx, global_document),
+            .source_plans = source_plans.items,
+        },
+        .{},
+        bytes.writer(a),
+    ) catch return error.OutOfMemory;
     return try bytes.toOwnedSlice(a);
 }
 
@@ -730,7 +794,10 @@ fn prepareGlobalManifest(ctx: *Context, document: *const fail2ban.ConfigDocument
                 },
             };
             const origin = effective.origins.get(kv.key_ptr.*);
-            try options.append(a, .{ .section = section.key_ptr.*, .name = kv.key_ptr.*, .raw = if (origin) |o| o.raw else kv.value_ptr.*, .effective = value, .resolution_error = resolution_error, .origin = origin });
+            try options.append(
+                a,
+                .{ .section = section.key_ptr.*, .name = kv.key_ptr.*, .raw = if (origin) |o| o.raw else kv.value_ptr.*, .effective = value, .resolution_error = resolution_error, .origin = origin },
+            );
         }
     }
     const Rule = struct { phase: []const u8, section: []const u8 = "Definition", name: []const u8, kind: fail2ban.CanonicalType = .string, fallback: fail2ban.CanonicalValue };
@@ -767,5 +834,14 @@ fn prepareGlobalManifest(ctx: *Context, document: *const fail2ban.ConfigDocument
             .invalid;
         try observations.append(a, .{ .reader_entry = reader_entry, .phase = rule.phase, .section = rule.section, .option = rule.name, .value = value, .resolution_error = resolution_error });
     }
-    return .{ .admission = if (document.source.sources.items.len > 0) "pending" else "absent-native-projection", .source_present = document.source.sources.items.len > 0, .thread_section_present = document.source.section("Thread") != null, .sources = document.source.sources.items, .assignments = document.source.assignments.items, .options = options.items, .reader_observations = observations.items, .diagnostics = document.source.warnings.items };
+    return .{
+        .admission = if (document.source.sources.items.len > 0) "pending" else "absent-native-projection",
+        .source_present = document.source.sources.items.len > 0,
+        .thread_section_present = document.source.section("Thread") != null,
+        .sources = document.source.sources.items,
+        .assignments = document.source.assignments.items,
+        .options = options.items,
+        .reader_observations = observations.items,
+        .diagnostics = document.source.warnings.items,
+    };
 }

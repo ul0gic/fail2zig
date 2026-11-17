@@ -164,7 +164,10 @@ pub fn Methods(comptime Store: type) type {
                 var row = try self.statement("SELECT superseded_targets,backup_path FROM load_repair_migration WHERE id=1;");
                 defer row.deinit();
                 if (!try row.row()) return error.LoadRepairInvalidState;
-                std.log.info("native storage: schema 24 migration complete after {d} transactions; {d} unsettled action outcomes of replaced decisions marked superseded; pre-upgrade backup {s}", .{ pages, try row.signed(0), try row.bytes(1) });
+                std.log.info(
+                    "native storage: schema 24 migration complete after {d} transactions; {d} unsettled action outcomes of replaced decisions marked superseded; pre-upgrade backup {s}",
+                    .{ pages, try row.signed(0), try row.bytes(1) },
+                );
             }
         }
 

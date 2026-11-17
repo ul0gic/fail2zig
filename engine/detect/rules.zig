@@ -106,7 +106,23 @@ const Budget = struct {
     }
 };
 pub const Kind = enum { candidate, no_match, excluded, awaiting_context, rejected };
-pub const Reason = enum { matched, source_mismatch, template_mismatch, condition_failed, exclusion_matched, missing_field, wrong_type, invalid_record, invalid_subject, incomplete_record, context_stored, context_missing, context_expired, context_conflict, event_order };
+pub const Reason = enum {
+    matched,
+    source_mismatch,
+    template_mismatch,
+    condition_failed,
+    exclusion_matched,
+    missing_field,
+    wrong_type,
+    invalid_record,
+    invalid_subject,
+    incomplete_record,
+    context_stored,
+    context_missing,
+    context_expired,
+    context_conflict,
+    event_order,
+};
 pub const Outcome = struct {
     kind: Kind,
     reason: Reason,
@@ -231,7 +247,11 @@ pub const Program = struct {
             };
         };
         for (self.segments[0..self.segment_count]) |seg| switch (seg) {
-            .capture => |c| if (std.mem.eql(u8, c.name, self.parsed.value.subject) and c.kind != (if (self.parsed.value.subject_kind == .ip) Capture.ip else Capture.hostname)) return error.InvalidRule,
+            .capture => |c| if (std.mem.eql(
+                u8,
+                c.name,
+                self.parsed.value.subject,
+            ) and c.kind != (if (self.parsed.value.subject_kind == .ip) Capture.ip else Capture.hostname)) return error.InvalidRule,
             else => {},
         };
     }

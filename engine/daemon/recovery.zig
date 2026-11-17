@@ -43,7 +43,12 @@ pub fn Methods(comptime Coordinator: type) type {
         const audit_interval_ns = Coordinator.audit_interval_ns;
 
         pub fn driver(self: *Coordinator) recovery.Driver {
-            return .{ .store = &self.store, .gate = &self.gate, .clock = .{ .generation = [_]u8{0} ** 32, .clock_context = &self.clock, .clock = clock_mod.wallTimestamp }, .hooks = .{ .context = self, .storage = recoverStorage, .state = recoverState, .ownership = recoverOwnership, .sources = recoverSources, .turn = recoverTurn } };
+            return .{
+                .store = &self.store,
+                .gate = &self.gate,
+                .clock = .{ .generation = [_]u8{0} ** 32, .clock_context = &self.clock, .clock = clock_mod.wallTimestamp },
+                .hooks = .{ .context = self, .storage = recoverStorage, .state = recoverState, .ownership = recoverOwnership, .sources = recoverSources, .turn = recoverTurn },
+            };
         }
 
         fn recoverTurn(stage: health.RecoveryStep, ctx: ?*anyopaque) !bool {
@@ -421,7 +426,13 @@ pub fn Methods(comptime Coordinator: type) type {
                 .consumers => {
                     const jail = &self.jails[self.restore_jail];
                     var keys: [1]durable.Store.ManifestKey = undefined;
-                    const page = try self.store.consumerManifestKeysPage(self.allocator, jail.name, if (self.consumer_cursor_len == 0) null else self.consumer_cursor[0..self.consumer_cursor_len], self.consumer_scan_revision, &keys);
+                    const page = try self.store.consumerManifestKeysPage(
+                        self.allocator,
+                        jail.name,
+                        if (self.consumer_cursor_len == 0) null else self.consumer_cursor[0..self.consumer_cursor_len],
+                        self.consumer_scan_revision,
+                        &keys,
+                    );
                     defer for (keys[0..page.count]) |key| key.deinit(self.allocator);
                     self.consumer_scan_revision = page.revision;
                     for (keys[0..page.count]) |key| {
@@ -570,7 +581,10 @@ pub fn Methods(comptime Coordinator: type) type {
                 count += 1;
                 if (wait != null or !page.more) break;
             }
-            if (wait) |cause| if (self.history_wait == null) std.log.warn("native: recidive history consumption waits: {s}; processed events keep their checkpoint and the rest resume when room returns", .{@errorName(cause)});
+            if (wait) |cause| if (self.history_wait == null) std.log.warn(
+                "native: recidive history consumption waits: {s}; processed events keep their checkpoint and the rest resume when room returns",
+                .{@errorName(cause)},
+            );
             self.history_wait = wait;
             if (count == 0) {
                 self.history_page = null;
@@ -689,7 +703,11 @@ pub fn Methods(comptime Coordinator: type) type {
                         var snapshot = try self.store.consumerManifestSnapshot(self.allocator, owner.manifest());
                         defer snapshot.deinit(self.allocator);
                         const expected = try owner.live.encode();
-                        if (snapshot.revision != consumer_revision or snapshot.count != 1 or snapshot.states[0].revision != owner.revision or !std.mem.eql(u8, snapshot.states[0].payload orelse return error.MissingRequiredConsumer, &expected)) return error.StaleConsumerCheckpoint;
+                        if (snapshot.revision != consumer_revision or snapshot.count != 1 or snapshot.states[0].revision != owner.revision or !std.mem.eql(
+                            u8,
+                            snapshot.states[0].payload orelse return error.MissingRequiredConsumer,
+                            &expected,
+                        )) return error.StaleConsumerCheckpoint;
                         try self.store.validateConsumerManifestSnapshot(owner.manifest(), &snapshot);
                         if (self.history_page) |page| try self.store.validateConfirmedEffectPage(page);
                     }
