@@ -1087,6 +1087,10 @@ pub const Store = struct {
 
     pub usingnamespace @import("effects.zig").Methods(@This());
 
+    pub usingnamespace @import("effect_owners.zig").Methods(@This());
+
+    pub usingnamespace @import("effect_settlement.zig").Methods(@This());
+
     pub usingnamespace @import("consumer_retry.zig").Methods(@This());
 
     pub usingnamespace @import("consumer_manifests.zig").Methods(@This());
