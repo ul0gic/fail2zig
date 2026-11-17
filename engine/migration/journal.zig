@@ -140,10 +140,6 @@ pub const Journal = struct {
         self.* = undefined;
     }
 
-    pub fn runId(self: *const Journal) [32]u8 {
-        return self.run.run_id;
-    }
-
     pub fn state(self: *const Journal) State {
         return self.run.state;
     }

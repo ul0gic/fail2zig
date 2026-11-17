@@ -18,7 +18,6 @@ pub const ExitClass = shared.ExitClass;
 pub const Output = enum { json, table };
 
 pub const run_deadline_ns: u64 = 30 * std.time.ns_per_min;
-pub const step_deadline_ns: u64 = 5 * std.time.ns_per_min;
 pub const quiesce_window_ns: u64 = 2 * std.time.ns_per_s;
 
 pub const Options = struct {

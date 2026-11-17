@@ -215,19 +215,6 @@ pub fn Methods(comptime Store: type) type {
             self.schema_version = @max(schema, 4);
         }
 
-        pub fn enableYearInference(self: *Store) Error!void {
-            if (self.receipt_limit == null) return error.ReceiptStorageRequired;
-            try self.beginWrite();
-            errdefer self.rollback();
-            const schema = try self.chainSchema();
-            if (schema == 4) {
-                try self.exec("ALTER TABLE records ADD COLUMN inferred_year INTEGER CHECK(inferred_year IS NULL OR (typeof(inferred_year)='integer' AND inferred_year BETWEEN 1 AND 9999 AND original_us IS NOT NULL AND native_time_kind IN (1,3,4,6,11))); PRAGMA user_version=5;");
-            } else if (schema < 5 or schema > latest_schema) return error.UnsupportedSchema;
-            try self.fault(.before_inference_schema_commit);
-            try self.commitTransaction();
-            self.schema_version = @max(schema, 5);
-        }
-
         pub fn enableDetection(self: *Store) Error!void {
             if (self.receipt_limit == null) return error.ReceiptStorageRequired;
             try self.beginWrite();

@@ -1145,16 +1145,6 @@ pub fn Methods(comptime Store: type) type {
             try self.fault(.after_action_target_intent);
         }
 
-        pub fn prepareActionTargets(self: *Store, intent: action_outcome.Intent, clock: effects.Clock) Error!void {
-            try self.beginWrite();
-            errdefer self.rollback();
-            if (self.schema_version < 21) return error.ActionTargetStorageRequired;
-            const now = try self.effectClock(clock);
-            try self.prepareActionTargetsTx(intent, now);
-            _ = try self.commitEffectClock(clock);
-            try self.commitTransaction();
-        }
-
         pub fn actionTargets(self: *Store, action_id: [32]u8, output: *[action_outcome.max_targets_per_action]action_outcome.Target) Error!usize {
             if (std.mem.allEqual(u8, &action_id, 0) or self.schema_version < 21) return error.InvalidActionTarget;
             try self.beginRead();
@@ -1260,120 +1250,6 @@ pub fn Methods(comptime Store: type) type {
             try self.commitTransaction();
         }
 
-        pub fn applicationHistoryPage(self: *Store, allocator: std.mem.Allocator, installation: effects.Installation, query: application_history.EventQuery, output: []application_history.Event) Error!application_history.EventPage {
-            try query.validate();
-            if (output.len == 0 or output.len > application_history.max_page or self.schema_version < 17) return error.InvalidApplicationHistoryQuery;
-            try self.beginRead();
-            errdefer self.rollback();
-            const head = try self.historyHead(installation, query.after_sequence);
-            if (query.expected_stream_revision) |expected| if (expected != head.stream_revision) return error.StaleHistoryPage;
-            var row = try self.statement(if (self.schema_version >= store.load_repair_schema)
-                "SELECT s.sequence,e.event_id,e.scope_key,e.canonical_scope,e.jail,e.decision_id,e.confirmed_us,d.source,d.occurrence,d.decided_us,d.ordinal,d.evidence FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id LEFT JOIN confirmed_event_details d ON d.event_id=e.event_id WHERE s.sequence>?1 AND s.sequence<=?2 AND (?3 IS NULL OR e.jail=?3) AND (?4 IS NULL OR e.confirmed_us>=?4) AND (?5 IS NULL OR e.confirmed_us<?5) ORDER BY s.sequence LIMIT ?6;"
-            else if (self.schema_version >= 19)
-                "SELECT s.sequence,e.event_id,e.scope_key,n.canonical_scope,e.jail,e.decision_id,e.confirmed_us,d.source,d.occurrence,d.decided_us,d.ordinal,d.evidence FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key LEFT JOIN confirmed_event_details d ON d.event_id=e.event_id WHERE s.sequence>?1 AND s.sequence<=?2 AND (?3 IS NULL OR e.jail=?3) AND (?4 IS NULL OR e.confirmed_us>=?4) AND (?5 IS NULL OR e.confirmed_us<?5) ORDER BY s.sequence LIMIT ?6;"
-            else
-                "SELECT s.sequence,e.event_id,e.scope_key,n.scope,e.jail,e.decision_id,e.confirmed_us,d.source,d.occurrence,d.decided_us,d.ordinal,d.evidence FROM confirmed_history_sequence s JOIN confirmed_effect_events e ON e.event_id=s.event_id JOIN native_effects n ON n.scope_key=e.scope_key LEFT JOIN confirmed_event_details d ON d.event_id=e.event_id WHERE s.sequence>?1 AND s.sequence<=?2 AND (?3 IS NULL OR e.jail=?3) AND (?4 IS NULL OR e.confirmed_us>=?4) AND (?5 IS NULL OR e.confirmed_us<?5) ORDER BY s.sequence LIMIT ?6;");
-            defer row.deinit();
-            try row.int(1, @intCast(query.after_sequence));
-            try row.int(2, @intCast(head.head_sequence));
-            if (query.jail) |jail| try row.text(3, jail) else try self.check(self.api.bind_null(row.ptr, 3));
-            if (query.range.from_us) |stamp| try row.int(4, stamp) else try self.check(self.api.bind_null(row.ptr, 4));
-            if (query.range.to_us) |stamp| try row.int(5, stamp) else try self.check(self.api.bind_null(row.ptr, 5));
-            try row.int(6, @intCast(output.len + 1));
-            var count: usize = 0;
-            var more = false;
-            var last = query.after_sequence;
-            errdefer for (output[0..count]) |*event| event.deinit(allocator);
-            while (try row.row()) {
-                if (count == output.len) {
-                    more = true;
-                    break;
-                }
-                const sequence = try row.signed(0);
-                if (sequence <= 0 or sequence <= last or sequence > head.head_sequence) return error.InvalidApplicationHistoryRow;
-                const confirmed = effect_history.Event{ .sequence = @intCast(sequence), .event_id = try Store.effectBlob(&row, 1, 32), .installation = installation, .scope_key = try Store.effectBlob(&row, 2, 32), .scope = try self.decodeStoredScope(&row, 3), .jail = detection.Name.init(try row.boundedBytes(4, 64)) catch return error.InvalidApplicationHistoryRow, .decision_id = try Store.effectBlob(&row, 5, 32), .confirmed_us = try row.signed(6) };
-                confirmed.validate() catch return error.InvalidApplicationHistoryRow;
-                output[count] = .{ .confirmed = confirmed };
-                if (self.api.column_type(row.ptr, 7) == 5) {
-                    for (8..12) |column| if (self.api.column_type(row.ptr, @intCast(column)) != 5) return error.InvalidApplicationHistoryRow;
-                } else {
-                    if (self.api.column_type(row.ptr, 7) != 3 or self.api.column_type(row.ptr, 8) != 3) return error.InvalidApplicationHistoryRow;
-                    const source = try row.boundedBytes(7, Limits.source_bytes);
-                    const occurrence = try row.boundedBytes(8, Limits.source_bytes);
-                    const decided = try row.signed(9);
-                    const ordinal = try row.signed(10);
-                    if (source.len == 0 or occurrence.len == 0 or decided > confirmed.confirmed_us or ordinal <= 0) return error.InvalidApplicationHistoryRow;
-                    if (self.schema_version >= 27 and try self.effectiveHistoryLimitTx(confirmed.jail.slice()) == 0) {
-                        if (self.api.column_type(row.ptr, 11) != 5) {
-                            if (self.api.column_type(row.ptr, 11) != 3) return error.InvalidApplicationHistoryRow;
-                            const evidence = try row.boundedBytes(11, retry.max_evidence_text_bytes);
-                            if (evidence.len == 0 or !std.unicode.utf8ValidateSlice(evidence)) return error.InvalidApplicationHistoryRow;
-                        }
-                        count += 1;
-                        last = @intCast(sequence);
-                        continue;
-                    }
-                    const source_copy = allocator.dupe(u8, source) catch return error.OutOfMemory;
-                    errdefer allocator.free(source_copy);
-                    const occurrence_copy = allocator.dupe(u8, occurrence) catch return error.OutOfMemory;
-                    errdefer allocator.free(occurrence_copy);
-                    var evidence_copy: ?[]u8 = null;
-                    if (self.api.column_type(row.ptr, 11) != 5) {
-                        if (self.api.column_type(row.ptr, 11) != 3) return error.InvalidApplicationHistoryRow;
-                        const evidence = try row.boundedBytes(11, retry.max_evidence_text_bytes);
-                        if (evidence.len == 0 or !std.unicode.utf8ValidateSlice(evidence)) return error.InvalidApplicationHistoryRow;
-                        evidence_copy = allocator.dupe(u8, evidence) catch return error.OutOfMemory;
-                    }
-                    output[count].detail = .{ .source = source_copy, .occurrence = occurrence_copy, .decided_us = decided, .ordinal = @intCast(ordinal), .evidence = evidence_copy };
-                }
-                count += 1;
-                last = @intCast(sequence);
-            }
-            try self.commitTransaction();
-            return .{ .stream_revision = head.stream_revision, .head_sequence = head.head_sequence, .last_sequence = last, .count = count, .more = more };
-        }
-
-        pub fn applicationHistoryAggregates(self: *Store, installation: effects.Installation, query: application_history.AggregateQuery, output: []application_history.Aggregate) Error!application_history.AggregatePage {
-            try query.validate();
-            if (output.len == 0 or output.len > application_history.max_page + 1 or self.schema_version < 17) return error.InvalidApplicationHistoryQuery;
-            try self.beginRead();
-            errdefer self.rollback();
-            const head = try self.historyHead(installation, 0);
-            if (query.expected_stream_revision) |expected| if (expected != head.stream_revision) return error.StaleHistoryPage;
-            const predicate = " FROM confirmed_effect_events WHERE (?1 IS NULL OR jail=?1) AND (?2 IS NULL OR confirmed_us>=?2) AND (?3 IS NULL OR confirmed_us<?3)";
-            var overall = try self.statement("SELECT count(*),min(confirmed_us),max(confirmed_us)" ++ predicate ++ ";");
-            defer overall.deinit();
-            if (query.jail) |jail| try overall.text(1, jail) else try self.check(self.api.bind_null(overall.ptr, 1));
-            if (query.range.from_us) |stamp| try overall.int(2, stamp) else try self.check(self.api.bind_null(overall.ptr, 2));
-            if (query.range.to_us) |stamp| try overall.int(3, stamp) else try self.check(self.api.bind_null(overall.ptr, 3));
-            if (!try overall.row()) return error.InvalidApplicationHistoryRow;
-            const total = try overall.signed(0);
-            if (total < 0) return error.InvalidApplicationHistoryRow;
-            output[0] = .{ .jail = null, .confirmed = @intCast(total), .first_confirmed_us = try overall.optionalSigned(1), .latest_confirmed_us = try overall.optionalSigned(2) };
-            if ((total == 0) != (output[0].first_confirmed_us == null and output[0].latest_confirmed_us == null)) return error.InvalidApplicationHistoryRow;
-
-            var groups = try self.statement("SELECT jail,count(*),min(confirmed_us),max(confirmed_us)" ++ predicate ++ " GROUP BY jail ORDER BY jail LIMIT ?4;");
-            defer groups.deinit();
-            if (query.jail) |jail| try groups.text(1, jail) else try self.check(self.api.bind_null(groups.ptr, 1));
-            if (query.range.from_us) |stamp| try groups.int(2, stamp) else try self.check(self.api.bind_null(groups.ptr, 2));
-            if (query.range.to_us) |stamp| try groups.int(3, stamp) else try self.check(self.api.bind_null(groups.ptr, 3));
-            try groups.int(4, @intCast(output.len));
-            var count: usize = 1;
-            var more = false;
-            while (try groups.row()) {
-                if (count == output.len) {
-                    more = true;
-                    break;
-                }
-                const group_count = try groups.signed(1);
-                if (self.api.column_type(groups.ptr, 0) != 3 or group_count <= 0) return error.InvalidApplicationHistoryRow;
-                output[count] = .{ .jail = detection.Name.init(try groups.boundedBytes(0, 64)) catch return error.InvalidApplicationHistoryRow, .confirmed = @intCast(group_count), .first_confirmed_us = try groups.optionalSigned(2), .latest_confirmed_us = try groups.optionalSigned(3) };
-                if (output[count].first_confirmed_us == null or output[count].latest_confirmed_us == null) return error.InvalidApplicationHistoryRow;
-                count += 1;
-            }
-            try self.commitTransaction();
-            return .{ .stream_revision = head.stream_revision, .head_sequence = head.head_sequence, .count = count, .more = more };
-        }
         fn validateConfirmedEffectPageTx(self: *Store, token: effect_history.PageToken) Error!void {
             try token.validate();
             const installation = try self.readInstallation() orelse return error.InstallationRequired;
@@ -1565,9 +1441,6 @@ pub fn Methods(comptime Store: type) type {
             return true;
         }
 
-        pub fn retainDetailTx(self: *Store, family: i64, subject: []const u8, bytes: ?i64, sequence: i64) Error!void {
-            try self.accountRetainedDetailTx(family, subject, bytes, sequence, true);
-        }
         pub fn retainDetailDeferredTx(self: *Store, family: i64, subject: []const u8, bytes: ?i64, sequence: i64) Error!void {
             try self.accountRetainedDetailTx(family, subject, bytes, sequence, false);
         }
@@ -2174,9 +2047,6 @@ pub fn Methods(comptime Store: type) type {
             self.retention_page /= 2;
             return .yielded;
         }
-        pub fn cleanupConfirmedHistoryOne(self: *Store, policy: HistoryRetention, now_us: i64) Error!bool {
-            return try self.historyRetentionStep(policy, now_us) != .idle;
-        }
 
         const reclaim_window: i64 = 1024;
         const obsolete_intent = "i.intent_id IS NOT n.intent_id AND i.status NOT IN(1,2) AND NOT EXISTS(SELECT 1 FROM action_targets a WHERE a.action_id=i.decision_id AND a.scope_key=i.scope_key AND a.status IN(1,2,5))";
@@ -2406,9 +2276,6 @@ pub fn Methods(comptime Store: type) type {
             return try Store.effectBlob(&row, 0, 32);
         }
         pub const PruneResult = enum { idle, pruned, scanned, yielded };
-        pub fn pruneSpentEffectOne(self: *Store) Error!PruneResult {
-            return self.pruneSpentEffects(1);
-        }
         pub const max_prune_batch = Store.attribution_batch;
         pub fn pruneSpentEffects(self: *Store, max_scopes: usize) Error!PruneResult {
             const diag_span = if (comptime build_options.diag) diag_mod.enter(.spent_prune) else {};

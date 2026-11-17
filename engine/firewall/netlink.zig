@@ -504,7 +504,6 @@ pub fn parseNlmsgerr(payload: []const u8) Error!i32 {
 // Why: Subsystem ids, the nf_tables group, struct nfgenmsg and the batch types are from include/uapi/linux/netfilter/nfnetlink.h.
 pub const NFNL = struct {
     pub const SUBSYS_NFTABLES: u16 = 10;
-    pub const SUBSYS_IPSET: u16 = 6;
     pub const GRP_NFTABLES: u32 = 7;
 };
 

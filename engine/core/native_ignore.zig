@@ -95,39 +95,6 @@ pub const Snapshot = struct {
         allocator.free(self.payload);
         allocator.destroy(self);
     }
-    pub fn fromText(allocator: std.mem.Allocator, options: Options, text: []const u8) !*Snapshot {
-        if (text.len > max_file_bytes or std.mem.indexOfScalar(u8, text, 0) != null) return error.IgnoreLimit;
-        var values: [max_entries][]const u8 = undefined;
-        var count: usize = 0;
-        var lines = std.mem.splitScalar(u8, text, '\n');
-        while (lines.next()) |line| {
-            if (line.len > 1024) return error.IgnoreLimit;
-            const uncommented = line[0 .. std.mem.indexOfScalar(u8, line, '#') orelse line.len];
-            const value = std.mem.trim(u8, uncommented, " \r\t");
-            if (value.len == 0) continue;
-            if (count == max_entries) return error.IgnoreLimit;
-            values[count] = value;
-            count += 1;
-        }
-        return create(allocator, options, values[0..count]);
-    }
-    pub fn fromFile(allocator: std.mem.Allocator, options: Options, path: []const u8) !*Snapshot {
-        if (!std.fs.path.isAbsolute(path) or path.len > 4096 or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidIgnorePath;
-        const fd = try std.posix.open(path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true, .NOFOLLOW = true }, 0);
-        const file = std.fs.File{ .handle = fd };
-        defer file.close();
-        const before = try std.posix.fstat(fd);
-        if (!std.posix.S.ISREG(before.mode) or before.mode & 0o022 != 0 or (before.uid != 0 and before.uid != std.os.linux.geteuid())) return error.UntrustedIgnoreFile;
-        if (before.size < 0 or before.size > max_file_bytes) return error.IgnoreLimit;
-        const bytes = try allocator.alloc(u8, @intCast(before.size));
-        defer allocator.free(bytes);
-        if (try file.readAll(bytes) != bytes.len) return error.IgnoreFileChanged;
-        var extra: [1]u8 = undefined;
-        if (try file.read(&extra) != 0) return error.IgnoreFileChanged;
-        const after = try std.posix.fstat(fd);
-        if (before.size != after.size or !std.meta.eql(before.mtim, after.mtim) or !std.meta.eql(before.ctim, after.ctim)) return error.IgnoreFileChanged;
-        return fromText(allocator, options, bytes);
-    }
     pub fn restore(allocator: std.mem.Allocator, expected: Options, bytes: []const u8) !*Snapshot {
         return restoreVersion(allocator, expected, bytes, version);
     }

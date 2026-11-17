@@ -560,10 +560,6 @@ pub const Store = struct {
         return openImpl(allocator, path, .existing, &ignored);
     }
 
-    pub fn openDetailed(allocator: std.mem.Allocator, path: []const u8, diagnostic: *OpenDiagnostic) Error!Store {
-        return openImpl(allocator, path, .plain, diagnostic);
-    }
-
     pub fn openRuntime(allocator: std.mem.Allocator, path: []const u8) Error!Store {
         var ignored = OpenDiagnostic{};
         return openImpl(allocator, path, .runtime, &ignored);
@@ -583,11 +579,6 @@ pub const Store = struct {
         schema_version: i64,
         installation: ?effects.Installation,
     };
-
-    pub fn installationSnapshot(allocator: std.mem.Allocator, path: []const u8) Error!InstallationSnapshot {
-        var ignored = OpenDiagnostic{};
-        return installationSnapshotDetailed(allocator, path, &ignored);
-    }
 
     pub fn installationSnapshotDetailed(allocator: std.mem.Allocator, path: []const u8, diagnostic: *OpenDiagnostic) Error!InstallationSnapshot {
         var store = try openImpl(allocator, path, .preflight, diagnostic);
@@ -1000,104 +991,6 @@ pub const Store = struct {
         return if (floor) |value| .{ .us = value } else null;
     }
 
-    pub fn nativeDetection(self: *Store, jail: []const u8, source: []const u8, occurrence: ?[]const u8) Error!?detection.Outcome {
-        var output: [max_native_detections]detection.Outcome = undefined;
-        const count = try self.nativeDetections(jail, source, occurrence, &output);
-        if (count > 1) return error.AmbiguousNativeDetection;
-        return if (count == 0) null else output[0];
-    }
-    pub fn nativeDetections(self: *Store, jail: []const u8, source: []const u8, occurrence: ?[]const u8, output: []detection.Outcome) Error!usize {
-        if (output.len == 0 or output.len > max_native_detections) return error.ConsumerCapacity;
-        try self.beginRead();
-        errdefer self.rollback();
-        const schema = try self.integer("PRAGMA user_version;");
-        if (schema > latest_schema) return error.UnsupportedSchema;
-        if (schema < 6) return error.DetectionStorageRequired;
-        self.schema_version = schema;
-        const value = try self.readDetections(jail, source, occurrence, output);
-        try self.commitTransaction();
-        return value;
-    }
-    fn readDetections(self: *Store, jail: []const u8, source: []const u8, occurrence: ?[]const u8, output: []detection.Outcome) Error!usize {
-        var row = try self.statement(if (self.schema_version >= 12)
-            "SELECT version,kind,generation,filter,pattern,pattern_index,family,subject,ordinal FROM record_detections WHERE jail=?1 AND source=?2 AND occurrence=COALESCE(?3,(SELECT occurrence FROM source_cursors WHERE jail=?1 AND source=?2)) ORDER BY ordinal;"
-        else
-            "SELECT version,kind,generation,filter,pattern,pattern_index,family,subject,0 FROM record_detections WHERE jail=?1 AND source=?2 AND occurrence=COALESCE(?3,(SELECT occurrence FROM source_cursors WHERE jail=?1 AND source=?2));");
-        defer row.deinit();
-        try row.text(1, jail);
-        try row.text(2, source);
-        if (occurrence) |value| try row.text(3, value) else try self.check(self.api.bind_null(row.ptr, 3));
-        var count: usize = 0;
-        while (try row.row()) {
-            if (count >= output.len) return error.ConsumerCapacity;
-            if (try row.signed(0) != detection.version or self.api.column_type(row.ptr, 2) != 4 or self.api.column_type(row.ptr, 3) != 3) return error.DatabaseFailure;
-            const generation = try row.boundedBytes(2, 32);
-            if (generation.len != 32) return error.DatabaseFailure;
-            var result = detection.Outcome{
-                .kind = std.meta.intToEnum(detection.Kind, try row.signed(1)) catch return error.DatabaseFailure,
-                .generation = generation[0..32].*,
-                .filter = detection.Name.init(try row.boundedBytes(3, 64)) catch return error.DatabaseFailure,
-            };
-            if (self.schema_version < 8 and @intFromEnum(result.kind) >= 7) return error.DatabaseFailure;
-            if (self.api.column_type(row.ptr, 4) != 5) {
-                if (self.api.column_type(row.ptr, 4) != 3) return error.DatabaseFailure;
-                result.pattern = detection.Name.init(try row.boundedBytes(4, 64)) catch return error.DatabaseFailure;
-            }
-            if (try row.optionalSigned(5)) |index| result.pattern_index = std.math.cast(u16, index) orelse return error.DatabaseFailure;
-            if (try row.optionalSigned(6)) |family| {
-                if (self.api.column_type(row.ptr, 7) != 4) return error.DatabaseFailure;
-                const address = try row.boundedBytes(7, 16);
-                result.subject = switch (family) {
-                    4 => if (address.len == 4) .{ .v4 = address[0..4].* } else return error.DatabaseFailure,
-                    6 => if (address.len == 16) .{ .v6 = address[0..16].* } else return error.DatabaseFailure,
-                    else => return error.DatabaseFailure,
-                };
-            } else if (self.api.column_type(row.ptr, 7) != 5) return error.DatabaseFailure;
-            const time = (try self.readNativeTime(jail, source, occurrence)) orelse return error.DatabaseFailure;
-            result.validate(time) catch return error.DatabaseFailure;
-            if (try row.signed(8) != count) return error.InvalidRecord;
-            if (result.subject) |subject| for (output[0..count]) |prior| {
-                if (prior.subject) |previous| if (std.meta.eql(subject, previous)) return error.InvalidRecord;
-            };
-            output[count] = result;
-            count += 1;
-        }
-        return count;
-    }
-
-    pub fn nativeTime(self: *Store, jail: []const u8, source: []const u8, occurrence: ?[]const u8) Error!?time_policy.Result {
-        try self.beginRead();
-        errdefer self.rollback();
-        const schema = try self.integer("PRAGMA user_version;");
-        if (schema < 4 or schema > latest_schema) return error.UnsupportedSchema;
-        self.schema_version = schema;
-        const outcome = try self.readNativeTime(jail, source, occurrence);
-        try self.commitTransaction();
-        return outcome;
-    }
-
-    fn readNativeTime(self: *Store, jail: []const u8, source: []const u8, occurrence: ?[]const u8) Error!?time_policy.Result {
-        var row = try self.statement(if (self.schema_version >= 5)
-            "SELECT native_time_kind,original_us,effective_us,receipt_us,disposition,inferred_year FROM records WHERE jail=?1 AND source=?2 AND occurrence=COALESCE(?3,(SELECT occurrence FROM source_cursors WHERE jail=?1 AND source=?2));"
-        else
-            "SELECT native_time_kind,original_us,effective_us,receipt_us,disposition,NULL FROM records WHERE jail=?1 AND source=?2 AND occurrence=COALESCE(?3,(SELECT occurrence FROM source_cursors WHERE jail=?1 AND source=?2));");
-        defer row.deinit();
-        try row.text(1, jail);
-        try row.text(2, source);
-        if (occurrence) |value| try row.text(3, value) else try self.check(self.api.bind_null(row.ptr, 3));
-        if (!try row.row()) return null;
-        if (self.api.column_type(row.ptr, 0) == 5) {
-            if (self.api.column_type(row.ptr, 1) != 5 or self.api.column_type(row.ptr, 2) != 5 or self.api.column_type(row.ptr, 5) != 5) return error.DatabaseFailure;
-            if (self.schema_version >= 11) _ = try self.readTimeProvenance(jail, source, occurrence);
-            return null;
-        }
-        const kind = std.meta.intToEnum(native_record.Kind, try row.signed(0)) catch return error.DatabaseFailure;
-        const inferred_year = if (try row.optionalSigned(5)) |year| std.math.cast(u16, year) orelse return error.DatabaseFailure else null;
-        const stored = native_record.Stored{ .kind = kind, .original_us = try row.optionalSigned(1), .effective_us = try row.optionalSigned(2), .inferred_year = inferred_year, .zone = if (self.schema_version >= 11) try self.readTimeProvenance(jail, source, occurrence) else null };
-        const outcome = stored.outcomeWithDisposition(.{ .us = try row.signed(3) }, try row.boundedBytes(4, 64)) catch return error.DatabaseFailure;
-        return outcome;
-    }
-
     fn readTimeProvenance(self: *Store, jail: []const u8, source: []const u8, occurrence: ?[]const u8) Error!?native_record.Provenance {
         var row = try self.statement("SELECT zone_digest,zone_offset_seconds,zone_ambiguity,zone_fold,native_time_kind,original_us FROM records WHERE jail=?1 AND source=?2 AND occurrence=COALESCE(?3,(SELECT occurrence FROM source_cursors WHERE jail=?1 AND source=?2));");
         defer row.deinit();
@@ -1116,15 +1009,6 @@ pub const Store = struct {
         const result = native_record.Provenance{ .zone_digest = try Store.effectBlob(&row, 0, 32), .offset_seconds = std.math.cast(i32, try row.signed(1)) orelse return error.InvalidRecord, .ambiguity = ambiguity, .fold_selected = fold == 1 };
         result.validate() catch return error.InvalidRecord;
         return result;
-    }
-    pub fn nativeTimeProvenance(self: *Store, jail: []const u8, source: []const u8, occurrence: ?[]const u8) Error!?native_record.Provenance {
-        try self.beginRead();
-        errdefer self.rollback();
-        try self.effectSchema();
-        _ = try self.readNativeTime(jail, source, occurrence);
-        const value = try self.readTimeProvenance(jail, source, occurrence);
-        try self.commitTransaction();
-        return value;
     }
 
     pub fn pendingReceipt(self: *Store, identity: ReceiptIdentity) Error!?native_time.Timestamp {
@@ -1765,9 +1649,6 @@ pub const Store = struct {
         try stmt.text(1, jail);
         if (!try stmt.row()) return null;
         return allocator.dupe(u8, try stmt.boundedBytes(0, Limits.checkpoint_bytes)) catch error.OutOfMemory;
-    }
-    pub fn pendingIntents(self: *Store) Error!i64 {
-        return self.integer("SELECT count(*) FROM action_intents WHERE status='pending';");
     }
 
     pub fn visitSources(self: *Store, jail: []const u8, callback: *const fn ([]const u8, []const u8, []const u8, ?*anyopaque) anyerror!void, context: ?*anyopaque) !void {

@@ -187,14 +187,6 @@ pub const Entry = struct {
     raw_hash: [32]u8,
 };
 
-pub fn verifyAnchor(scratch: []u8, line: []const u8, expected_cursor: []const u8, message_limit: usize) !Entry {
-    try bounded(expected_cursor, max_cursor_bytes);
-    if (line.len == 0) return error.ResumeLost;
-    const entry = try decode(scratch, line, message_limit);
-    if (!std.mem.eql(u8, entry.cursor, expected_cursor)) return error.ResumeLost;
-    return entry;
-}
-
 pub fn verifyPending(entry: Entry, expected_cursor: []const u8, expected_hash: [32]u8) !void {
     try bounded(expected_cursor, max_cursor_bytes);
     if (!std.mem.eql(u8, entry.cursor, expected_cursor) or !std.mem.eql(u8, &entry.raw_hash, &expected_hash)) return error.PendingRecordMismatch;

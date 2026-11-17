@@ -237,20 +237,6 @@ pub const FileSource = struct {
         self.max_record_bytes = max_bytes;
     }
 
-    pub fn setFramer(self: *FileSource, callback: records.FrameCallback, context: ?*anyopaque, configuration_hash: [32]u8, max_bytes: usize) !void {
-        if (max_bytes == 0 or max_bytes > 1024 * 1024) return error.InvalidFramingLimit;
-        if (self.file != null) return error.SourceAlreadyOpened;
-        if (self.native_encoding != null) return error.FramerAlreadyBound;
-        if (self.committed) |saved_resume| {
-            const old = saved_resume.codec_configuration_hash orelse return error.FramingProfileMismatch;
-            if (!std.mem.eql(u8, &old, &configuration_hash)) return error.FramingProfileMismatch;
-        }
-        self.frame_callback = callback;
-        self.frame_context = context;
-        self.codec_configuration_hash = configuration_hash;
-        self.max_record_bytes = max_bytes;
-    }
-
     pub fn init(allocator: Allocator, path: []const u8, source_id: []const u8, start: Start, checkpoint: ?Resume) !FileSource {
         if (path.len == 0 or path.len > 16 * 1024 or source_id.len == 0 or source_id.len > 16 * 1024 or
             std.mem.indexOfScalar(u8, path, 0) != null or std.mem.indexOfScalar(u8, source_id, 0) != null) return error.InvalidSource;
@@ -708,12 +694,6 @@ pub const FileSource = struct {
         }
     };
 
-    pub fn pollBatch(self: *FileSource, callback: BatchAckCallback, userdata: ?*anyopaque) !usize {
-        while (true) return self.pollBatchTurn(callback, userdata, false) catch |err| {
-            if (err == error.SourceRepairPending) continue;
-            return err;
-        };
-    }
     pub fn pollBatchTurn(self: *FileSource, callback: BatchAckCallback, userdata: ?*anyopaque, preserve_checkpoint: bool) !usize {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();

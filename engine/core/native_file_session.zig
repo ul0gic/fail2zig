@@ -420,10 +420,6 @@ pub const Session = struct {
             } else self.repair_states[self.repair_count] = try repair.Repair.init(try repair.Binding.init(self.processor.generation, source.source_id), self.nowMs());
         }
     }
-    pub fn sourceRepairSnapshot(self: *const Session, index: usize) !repair.Snapshot {
-        if (index >= self.repair_count) return error.InvalidSource;
-        return self.repair_states[index].snapshot();
-    }
     pub fn awaitingPath(self: *const Session) bool {
         if (self.awaiting_discovery) return true;
         for (0..self.sources.configuredCount()) |i| if (self.sources.configuredStatus(i).?.presence == .missing) return true;
@@ -456,26 +452,6 @@ pub const Session = struct {
         path: []const u8,
         failure: files.ContinuityFailure,
     };
-
-    pub fn continuityFailure(self: *const Session) ?ContinuityReport {
-        for (self.sources.sources.items[0..self.repair_count], self.repair_states[0..self.repair_count]) |source, state| {
-            if (state.state.phase != .intervention) continue;
-            const failure = source.continuity_failure orelse continue;
-            return .{ .jail = self.pipe.jail, .source = source.source_id, .path = source.path, .failure = failure };
-        }
-        for (self.retained.items) |value| {
-            if (value.state.state.phase != .intervention) continue;
-            const failure = value.continuity orelse continue;
-            var adopted = false;
-            for (self.sources.sources.items) |source| if (std.mem.eql(u8, source.source_id, value.source)) {
-                adopted = true;
-                break;
-            };
-            if (adopted) continue;
-            return .{ .jail = self.pipe.jail, .source = value.source, .path = value.path, .failure = failure };
-        }
-        return null;
-    }
 
     pub fn nextUnreportedContinuityFailure(self: *Session) ?ContinuityReport {
         for (self.sources.sources.items[0..self.repair_count], self.repair_states[0..self.repair_count]) |*source, state| {
@@ -697,9 +673,6 @@ pub const Session = struct {
         std.mem.copyForwards(?durable.Store.PendingSource, self.pending_proofs[index .. self.repair_count - 1], self.pending_proofs[index + 1 .. self.repair_count]);
         self.pending_proofs[self.repair_count - 1] = null;
         self.repair_count -= 1;
-    }
-    pub fn policyLossEvent(self: *const Session) ?files.LossEvent {
-        return self.recorded_loss;
     }
     pub fn pausedSource(self: *const Session, index: usize) ?PausedSource {
         if (index >= self.repair_count) return null;

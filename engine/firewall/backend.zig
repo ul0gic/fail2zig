@@ -107,14 +107,6 @@ pub const Backend = union(BackendTag) {
         return self.vtable().unbanFn(self.context(), ip, jail);
     }
 
-    pub fn listBans(
-        self: *Backend,
-        jail: shared.JailId,
-        allocator: std.mem.Allocator,
-    ) BackendError![]shared.IpAddress {
-        return self.vtable().listBansFn(self.context(), jail, allocator);
-    }
-
     pub fn flush(self: *Backend, jail: shared.JailId) BackendError!void {
         return self.vtable().flushFn(self.context(), jail);
     }

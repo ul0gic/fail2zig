@@ -198,11 +198,6 @@ pub const Repair = struct {
         self.state.phase = .polling;
     }
 
-    pub fn attemptFailed(self: *Repair, token: Token, cause: anyerror, now_ms: u64) !Domain {
-        if (!std.meta.eql(token, self.currentToken()) or (self.state.phase != .verifying and self.state.phase != .polling)) return error.StaleRepair;
-        return self.failed(cause, now_ms);
-    }
-
     pub fn pollSucceeded(self: *Repair, token: Token) !void {
         try self.check(token, .polling);
         self.state = .{};

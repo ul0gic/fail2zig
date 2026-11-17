@@ -57,21 +57,6 @@ pub const Event = struct {
     }
 };
 
-pub const EventPage = struct {
-    format_version: u16 = version,
-    stream_revision: u64,
-    head_sequence: u64,
-    last_sequence: u64,
-    count: usize,
-    more: bool,
-};
-
-pub const Aggregate = struct {
-    jail: ?detection.Name,
-    confirmed: u64,
-    first_confirmed_us: ?i64,
-    latest_confirmed_us: ?i64,
-};
 pub const AggregateQuery = struct {
     expected_stream_revision: ?u64 = null,
     jail: ?[]const u8 = null,
@@ -83,7 +68,6 @@ pub const AggregateQuery = struct {
         if (self.jail) |jail| _ = detection.Name.init(jail) catch return error.InvalidApplicationHistoryQuery;
     }
 };
-pub const AggregatePage = struct { format_version: u16 = version, stream_revision: u64, head_sequence: u64, count: usize, more: bool };
 
 pub const PolicyCursor = struct { jail: detection.Name, subject: detection.Subject };
 pub const PolicyQuery = struct {
@@ -103,13 +87,3 @@ pub const PolicyQuery = struct {
         }
     }
 };
-pub const PolicySummary = struct {
-    jail: detection.Name,
-    subject: detection.Subject,
-    generation: [32]u8,
-    last_processed_us: i64,
-    lease: retry.Lease,
-    decisions: u64,
-    retired: bool,
-};
-pub const PolicyPage = struct { format_version: u16 = version, revision: u64, count: usize, more: bool };

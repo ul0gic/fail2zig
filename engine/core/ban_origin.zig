@@ -18,17 +18,8 @@ pub const BanListEntry = struct {
     }
 };
 
-pub const DetectionOutcome = enum { ban, receipt_only };
 pub const ManualOutcome = enum { set_manual, extend_as_manual, refuse_config };
 pub const refused_config_text = "banned by config: edit banip";
-
-pub fn detectionOutcome(current: ?OwnerOrigin) DetectionOutcome {
-    const owner = current orelse return .ban;
-    return switch (owner.origin) {
-        .detection => .ban,
-        .manual, .config => .receipt_only,
-    };
-}
 
 pub fn manualOutcome(current: ?OwnerOrigin) ManualOutcome {
     const owner = current orelse return .set_manual;

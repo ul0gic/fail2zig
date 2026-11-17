@@ -213,15 +213,6 @@ pub const ResolvedJailConfig = struct {
     ignoretime_s: ?u64,
 };
 
-pub fn resolveJail(cfg: *const Config, jail_name: []const u8) ?ResolvedJailConfig {
-    for (cfg.jails) |*j| {
-        if (std.mem.eql(u8, j.name, jail_name)) {
-            return resolveJailFromConfig(j, cfg.defaults);
-        }
-    }
-    return null;
-}
-
 pub fn resolveJailFromConfig(j: *const JailConfig, defaults: JailDefaults) ResolvedJailConfig {
     var increment = defaults.bantime_increment;
     if (j.bantime_increment_explicit and j.bantime_increment_fields == 0) {

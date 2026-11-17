@@ -72,7 +72,6 @@ pub fn Methods(comptime Store: type) type {
         pub const EvictionReport = struct { evicted: ?detection.Subject, last_processed_us: i64 };
         pub const PoolOccupancy = struct { tracked: u32, banned: u32, tracking_limit: u32, ban_limit: u32 };
         const PoolPressure = enum { none, tracking, banned };
-        pub const ManifestMode = enum { first_use, @"resume" };
         pub const ManifestStatus = enum { first_use, ready };
         pub const ManifestSnapshot = struct {
             status: ManifestStatus,
@@ -503,22 +502,6 @@ pub fn Methods(comptime Store: type) type {
                 try item.done();
             }
         }
-        pub fn admitConsumerManifest(self: *Store, manifest: consumers.Manifest, mode: ManifestMode) Error!void {
-            _ = try manifest.digest();
-            try self.beginWrite();
-            errdefer self.rollback();
-            try self.requireManifestSchema();
-            switch (mode) {
-                .first_use => try self.admitManifestTx(manifest),
-                .@"resume" => {
-                    const status = try self.checkManifest(manifest);
-                    for (manifest.required) |requirement| try self.checkRequiredState(requirement, status == .first_use);
-                },
-            }
-            if (mode == .first_use) try self.bumpConsumerRevision();
-            try self.fault(.before_manifest_commit);
-            try self.commitTransaction();
-        }
         pub fn consumerManifestSnapshot(self: *Store, allocator: std.mem.Allocator, manifest: consumers.Manifest) Error!ManifestSnapshot {
             try self.beginRead();
             errdefer self.rollback();
@@ -935,27 +918,6 @@ pub fn Methods(comptime Store: type) type {
             return result;
         }
 
-        pub fn retryStateAt(self: *Store, jail: []const u8, subject: detection.Subject, now_us: i64) Error!?retry.State {
-            try self.beginRead();
-            errdefer self.rollback();
-            const schema = try self.integer("PRAGMA user_version;");
-            if (schema < 9 or schema > latest_schema) return error.RetryStorageRequired;
-            const admission = (try self.readRetryPolicy(jail)) orelse return error.RetryAdmissionRequired;
-            if (try self.readRetryClock()) |floor| if (now_us < floor) return error.ReceiptClockReversed;
-            const working = try self.readWorkingRetryState(jail, subject, admission.policy);
-            const retired = try self.readRetired(jail, subject);
-            if (working != null and retired != null) return error.InvalidRetryState;
-            const result = if (working) |state| (try retry.prune(admission.policy, state, now_us)).state else retired;
-            try self.commitTransaction();
-            return result;
-        }
-
-        pub fn validateRuntimeOwners(self: *Store, names: []const []const u8) !void {
-            return self.validateOwners(names, null);
-        }
-        pub fn validateRuntimeOwnersWithManifests(self: *Store, names: []const []const u8, manifests: []const consumers.Manifest) !void {
-            return self.validateOwners(names, manifests);
-        }
         fn validateOwners(self: *Store, names: []const []const u8, manifests: ?[]const consumers.Manifest) !void {
             if (names.len == 0 or names.len > 64) return error.InvalidRecord;
             try self.beginRead();
@@ -1293,59 +1255,6 @@ pub fn Methods(comptime Store: type) type {
             _ = try self.transitionOwnerReservedTx(.{ .scope = scope, .jail = jail, .current_generation = legacy, .next_generation = planned, .expected_owner_revision = owner.revision, .transition_id = transition_id, .mode = .retain, .occurred_us = now }, now, false);
         }
 
-        pub fn retryPolicySummaryPage(self: *Store, query: application_history.PolicyQuery, output: []application_history.PolicySummary) Error!application_history.PolicyPage {
-            try query.validate();
-            if (output.len == 0 or output.len > application_history.max_page or self.schema_version < 17) return error.InvalidPolicySummary;
-            try self.beginRead();
-            errdefer self.rollback();
-            const revision_value = try self.integer("SELECT revision FROM policy_summary_clock WHERE id=1;");
-            if (revision_value <= 0) return error.InvalidPolicySummary;
-            const current_revision: u64 = @intCast(revision_value);
-            if (query.expected_revision) |expected| if (expected != current_revision) return error.StalePolicySummary;
-            var row = try self.statement("WITH summaries(jail,family,subject,generation,last_processed_us,lease_kind,deadline_us,decisions,retired) AS (SELECT s.jail,s.family,s.subject,p.generation,s.last_processed_us,s.lease_kind,s.deadline_us,s.decisions,0 FROM retry_states s JOIN retry_policies p ON p.jail=s.jail UNION ALL SELECT r.jail,r.family,r.subject,r.generation,r.last_processed_us,0,NULL,r.decisions,1 FROM retry_retired r) SELECT jail,family,subject,generation,last_processed_us,lease_kind,deadline_us,decisions,retired FROM summaries WHERE (?1 IS NULL OR jail=?1) AND (?2 IS NULL OR jail>?2 OR (jail=?2 AND (family>?3 OR (family=?3 AND subject>?4)))) ORDER BY jail,family,subject LIMIT ?5;");
-            defer row.deinit();
-            if (query.jail) |jail| try row.text(1, jail) else try self.check(self.api.bind_null(row.ptr, 1));
-            if (query.after) |after| {
-                try row.text(2, after.jail.slice());
-                switch (after.subject) {
-                    .v4 => |address| {
-                        try row.int(3, 4);
-                        try row.blob(4, &address);
-                    },
-                    .v6 => |address| {
-                        try row.int(3, 6);
-                        try row.blob(4, &address);
-                    },
-                }
-            } else {
-                try self.check(self.api.bind_null(row.ptr, 2));
-                try self.check(self.api.bind_null(row.ptr, 3));
-                try self.check(self.api.bind_null(row.ptr, 4));
-            }
-            try row.int(5, @intCast(output.len + 1));
-            var count: usize = 0;
-            var more = false;
-            while (try row.row()) {
-                if (count == output.len) {
-                    more = true;
-                    break;
-                }
-                if (self.api.column_type(row.ptr, 0) != 3) return error.InvalidPolicySummary;
-                const jail = detection.Name.init(try row.boundedBytes(0, 64)) catch return error.InvalidPolicySummary;
-                const subject = try self.decodeRetrySubject(&row, 1, 2);
-                const generation = try Store.effectBlob(&row, 3, 32);
-                const decisions = try row.signed(7);
-                const retired = try row.signed(8);
-                const lease = try retryLease(&row, 5, 6);
-                if (decisions < 0 or retired < 0 or retired > 1 or (retired == 1 and lease != .absent)) return error.InvalidPolicySummary;
-                if (count > 0 and std.mem.eql(u8, output[count - 1].jail.slice(), jail.slice()) and std.meta.eql(output[count - 1].subject, subject)) return error.InvalidPolicySummary;
-                output[count] = .{ .jail = jail, .subject = subject, .generation = generation, .last_processed_us = try row.signed(4), .lease = lease, .decisions = @intCast(decisions), .retired = retired == 1 };
-                count += 1;
-            }
-            try self.commitTransaction();
-            return .{ .revision = current_revision, .count = count, .more = more };
-        }
-
         pub fn validateRetry(self: *Store, jail: []const u8, generation: [32]u8, policy: retry.Policy) Error!void {
             try self.beginRead();
             errdefer self.rollback();
@@ -1388,12 +1297,6 @@ pub fn Methods(comptime Store: type) type {
             return subject;
         }
 
-        pub fn retryDecision(self: *Store, jail: []const u8, source: []const u8, occurrence: ?[]const u8) Error!?retry.Decision {
-            var output: [max_native_detections]retry.Decision = undefined;
-            const count = try self.retryDecisions(jail, source, occurrence, &output);
-            if (count > 1) return error.AmbiguousRetryDecision;
-            return if (count == 0) null else output[0];
-        }
         pub fn retryDecisions(self: *Store, jail: []const u8, source: []const u8, occurrence: ?[]const u8, output: []retry.Decision) Error!usize {
             if (output.len == 0 or output.len > max_native_detections) return error.ConsumerCapacity;
             var row = try self.statement(if (self.schema_version >= 16)
@@ -1421,135 +1324,6 @@ pub fn Methods(comptime Store: type) type {
                 count += 1;
             }
             return count;
-        }
-
-        pub fn retryEscalationDecision(self: *Store, jail: []const u8, source: []const u8, occurrence: []const u8, subject: detection.Subject) Error!?EscalationSelection {
-            if (self.schema_version < 18) return error.RetryStorageRequired;
-            var row = try self.statement("SELECT scope,prior_confirmed,latest_confirmed_us,chosen_duration_us,jitter_us FROM retry_decision_escalations WHERE jail=?1 AND family=?2 AND subject=?3 AND source=?4 AND occurrence=?5;");
-            defer row.deinit();
-            try row.text(1, jail);
-            try bindSubject(&row, &subject);
-            try row.text(4, source);
-            try row.text(5, occurrence);
-            if (!try row.row()) return null;
-            const scope_value = try row.signed(0);
-            const prior = try row.signed(1);
-            const latest = try row.optionalSigned(2);
-            const chosen = try row.signed(3);
-            const jitter = try row.signed(4);
-            if (prior < 0 or (prior == 0) != (latest == null) or chosen <= 0 or @mod(chosen, 1_000_000) != 0 or jitter < 0 or @mod(jitter, 1_000_000) != 0 or try row.row()) return error.InvalidRetryState;
-            return .{
-                .scope = std.meta.intToEnum(retry.EscalationScope, scope_value) catch return error.InvalidRetryState,
-                .prior_confirmed = @intCast(prior),
-                .latest_confirmed_us = latest,
-                .chosen_duration_us = chosen,
-                .jitter_us = jitter,
-            };
-        }
-
-        pub const RetryProlongation = struct {
-            jail: []const u8,
-            generation: [32]u8,
-            subject: detection.Subject,
-            ordinal: u64,
-            expected_owner_revision: u64,
-            requested: retry.Lease,
-        };
-        pub const RetryProlongationResult = struct { changed: bool, lease: retry.Lease, effect: effects.Entry };
-
-        pub fn prolongRetryDecision(self: *Store, change: RetryProlongation, clock: effects.Clock) Error!RetryProlongationResult {
-            if (change.ordinal == 0 or change.ordinal > std.math.maxInt(i64) or change.requested == .absent) return error.InvalidRetryState;
-            try self.beginWrite();
-            errdefer self.rollback();
-            try self.requireRetryProjectionMutationTx();
-            try self.effectSchema();
-            if (self.schema_version < 16) return error.RetryStorageRequired;
-            const now = try self.effectClock(clock);
-            if (!change.requested.live(now)) return error.LeaseExpired;
-            const admission = (try self.readRetryPolicy(change.jail)) orelse return error.RetryAdmissionRequired;
-            if (!std.mem.eql(u8, &admission.generation, &change.generation)) return error.RetryGenerationMismatch;
-
-            var decision_row = try self.statement("SELECT d.source,d.occurrence,d.decided_us,d.lease_kind,d.deadline_us,d.enforce,s.lease_kind,s.deadline_us,s.decisions FROM retry_decisions d JOIN retry_states s ON s.jail=d.jail AND s.family=d.family AND s.subject=d.subject WHERE d.jail=?1 AND d.family=?2 AND d.subject=?3 AND d.ordinal=?4;");
-            defer decision_row.deinit();
-            try decision_row.text(1, change.jail);
-            try bindSubject(&decision_row, &change.subject);
-            try decision_row.int(4, @intCast(change.ordinal));
-            if (!try decision_row.row() or self.api.column_type(decision_row.ptr, 0) != 3 or self.api.column_type(decision_row.ptr, 1) != 3) return error.InvalidRetryState;
-            const source = try decision_row.boundedBytes(0, Limits.source_bytes);
-            const occurrence = try decision_row.boundedBytes(1, Limits.source_bytes);
-            const decided_us = try decision_row.signed(2);
-            const current = try retryLease(&decision_row, 3, 4);
-            const enforce = try decision_row.signed(5);
-            const state_lease = try retryLease(&decision_row, 6, 7);
-            const decisions = try decision_row.signed(8);
-            if (enforce != 1 or decisions != change.ordinal or !retry.Lease.eql(current, state_lease)) return error.InvalidRetryState;
-            const prolonged = try current.prolonged(change.requested, now);
-
-            const installation = try self.readInstallation() orelse return error.InstallationRequired;
-            const scope = try effects.Scope.host(change.subject);
-            const key = try scope.key(installation);
-            const entry = try self.readEffect(key, installation) orelse return error.StaleEffect;
-            if (entry.status == .dispatched) return error.EffectReconciliationRequired;
-            const decision_id = effects.hashParts("fail2zig-native-effect-decision-v2", &.{ change.jail, source, occurrence, &change.generation, &key });
-            var owners: [effects.max_page]effects.Owner = undefined;
-            const owner_count = try self.readOwners(key, &owners);
-            var owner: ?effects.Owner = null;
-            for (owners[0..owner_count]) |candidate| if (std.mem.eql(u8, candidate.jail.slice(), change.jail)) {
-                if (owner != null) return error.InvalidEffect;
-                owner = candidate;
-            };
-            const existing = owner orelse return error.StaleEffect;
-            if (existing.revision != change.expected_owner_revision) return error.StaleEffect;
-            if (!std.mem.eql(u8, &existing.generation, &change.generation) or !std.mem.eql(u8, &existing.decision_id, &decision_id)) return error.EffectGenerationMismatch;
-            if (existing.decided_us != decided_us or !effects.Lease.eql(existing.lease, current)) return error.InvalidEffect;
-            if (!prolonged.changed) {
-                try self.commitTransaction();
-                return .{ .changed = false, .lease = current, .effect = entry };
-            }
-
-            {
-                var state = try self.statement("UPDATE retry_states SET lease_kind=?4,deadline_us=?5 WHERE jail=?1 AND family=?2 AND subject=?3;");
-                defer state.deinit();
-                try state.text(1, change.jail);
-                try bindSubject(&state, &change.subject);
-                try bindRetryLease(&state, 4, prolonged.lease);
-                try state.done();
-                if (self.api.changes(self.db) != 1) return error.InvalidRetryState;
-            }
-            try self.syncRetryProjectionRowTx(change.jail, &change.subject);
-            try self.changeRetryJailSummaryTx(change.jail, 0, 0);
-            try self.fault(.after_retry_state);
-            {
-                var decision = try self.statement("UPDATE retry_decisions SET lease_kind=?5,deadline_us=?6 WHERE jail=?1 AND family=?2 AND subject=?3 AND ordinal=?4;");
-                defer decision.deinit();
-                try decision.text(1, change.jail);
-                try bindSubject(&decision, &change.subject);
-                try decision.int(4, @intCast(change.ordinal));
-                try bindRetryLease(&decision, 5, prolonged.lease);
-                try decision.done();
-                if (self.api.changes(self.db) != 1) return error.InvalidRetryState;
-            }
-            try self.fault(.after_retry_decision);
-            try self.reserveEffectRows(.{ .revisions = 1, .intents = 1, .observations = store.load_repair.observations_per_intent });
-            if (existing.revision >= std.math.maxInt(i64) or entry.revision >= std.math.maxInt(i64) or try self.tableRows(.effect_owner_revisions) >= effects.max_owner_revisions) return error.EffectCapacity;
-            {
-                var update = try self.statement("UPDATE effect_owners SET revision=?4,lease_kind=?5,deadline_us=?6 WHERE scope_key=?1 AND jail=?2 AND revision=?3;");
-                defer update.deinit();
-                try update.blob(1, &key);
-                try update.text(2, change.jail);
-                try update.int(3, @intCast(existing.revision));
-                try update.int(4, @intCast(existing.revision + 1));
-                try Store.bindEffectLease(&update, 5, prolonged.lease);
-                try update.done();
-                if (self.api.changes(self.db) != 1) return error.StaleEffect;
-                self.insertedRows(.effect_owner_revisions, 1);
-            }
-            try self.fault(.after_effect_owner);
-            const next = try self.replaceEffectIntent(installation, scope, key, entry.revision + 1, decision_id, now);
-            const final = try self.commitEffectClock(clock);
-            if (!prolonged.lease.live(final) or (next.desired == .finite and !next.desired.live(final))) return error.EffectExpired;
-            try self.commitEffectTransaction(true);
-            return .{ .changed = true, .lease = prolonged.lease, .effect = next };
         }
 
         fn readEscalationHistory(self: *Store, jail: []const u8, subject: detection.Subject, scope: retry.EscalationScope, decay: retry.EscalationDecay, now_us: i64, policy: retry.Policy) Error!retry.EscalationHistoryInput {

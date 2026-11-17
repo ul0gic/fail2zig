@@ -14,11 +14,6 @@ pub const ConfigList = enum(u8) {
     banip = 2,
 };
 
-pub const ConfigDeadline = struct {
-    first_applied_us: i64,
-    expires_us: i64,
-};
-
 const max_jail_bytes = 64;
 const stale_batch = 32;
 

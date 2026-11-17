@@ -363,7 +363,6 @@ pub const Ban = struct {
         self.* = undefined;
     }
 };
-pub const Bip = Ban;
 
 fn freeOptional(allocator: std.mem.Allocator, value: Optional([]u8)) void {
     switch (value) {

@@ -10,7 +10,6 @@ pub const attempt_bytes = 40;
 pub const policy_bytes = 32;
 pub const escalation_bytes = escalation_policy.encoded_bytes;
 pub const max_evidence_text_bytes = 2 * 1024;
-pub const max_subject_evidence_bytes = 16 * 1024;
 pub const Error = lease_policy.Error || escalation_policy.Error || error{ InvalidRetryPolicy, InvalidRetryState, InvalidRetryEvidence, RetryClockReversed, RetryTimeOverflow };
 pub const Duration = lease_policy.Duration;
 pub const Lease = lease_policy.Lease;
@@ -121,10 +120,6 @@ pub const State = struct {
     decisions: u64 = 0,
     attempts: [max_attempts]Attempt = undefined,
     count: u16 = 0,
-
-    pub fn latestEventUs(self: *const State) ?i64 {
-        return if (self.count == 0) null else self.attempts[self.count - 1].at_us;
-    }
 
     pub fn validate(self: *const State, policy: Policy) Error!void {
         try policy.validate();

@@ -14,9 +14,6 @@ pub const Line = struct {
     truncated: bool,
 };
 
-pub const default_capacity: usize = 64 * 1024;
-pub const default_max_line_len: usize = 4096;
-
 pub const LineBuffer = struct {
     allocator: Allocator,
     buf: []u8,
@@ -42,10 +39,6 @@ pub const LineBuffer = struct {
             .skipping_overlong = false,
             .pending_truncation = false,
         };
-    }
-
-    pub fn initDefault(allocator: Allocator) Error!LineBuffer {
-        return init(allocator, default_capacity, default_max_line_len);
     }
 
     pub fn deinit(self: *LineBuffer) void {

@@ -208,19 +208,6 @@ pub const IpcServer = struct {
         }
     }
 
-    // Does:  Builds a server with no listening socket, for tests that inject peers through admitTestPeer.
-    pub fn initDetached(allocator: std.mem.Allocator, loop: *EventLoop) Error!IpcServer {
-        const pool = try allocator.alloc(u8, max_clients * client_buffer_size);
-        return .{
-            .allocator = allocator,
-            .loop = loop,
-            .socket_path = "",
-            .detached = true,
-            .self_uid = linux.geteuid(),
-            .pool = pool,
-        };
-    }
-
     pub fn deinit(self: *IpcServer) void {
         for (&self.clients) |*slot| {
             if (slot.*) |cli| {
@@ -251,26 +238,8 @@ pub const IpcServer = struct {
         self.handler = h;
     }
 
-    pub fn setDeadlines(self: *IpcServer, frame_ms: u64, drain_ms: u64) void {
-        self.frame_deadline_ms = frame_ms;
-        self.drain_deadline_ms = drain_ms;
-    }
-
-    pub fn admitTestPeerAs(self: *IpcServer, fd: posix.fd_t, cred: auth.PeerCred) !void {
-        std.debug.assert(self.detached);
-        return self.admitClient(fd, cred);
-    }
-
     pub fn isServing(self: *const IpcServer) bool {
         return self.serving.load(.acquire);
-    }
-
-    pub fn activeClients(self: *const IpcServer) usize {
-        var n: usize = 0;
-        for (self.clients) |slot| {
-            if (slot != null) n += 1;
-        }
-        return n;
     }
 
     pub fn start(self: *IpcServer) Error!void {

@@ -10,10 +10,6 @@ const journal = @import("../core/journal_policy.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Parameter = struct { name: []const u8, value: []const u8 };
-pub const FileSpec = struct {
-    pattern: []const u8,
-    start: @import("../core/durable_file_source.zig").Start,
-};
 pub const Path = struct {
     raw: []const u8,
     pattern: []const u8,
@@ -90,17 +86,6 @@ pub const Plan = struct {
     diagnostics: []const []const u8,
     runtime_defaults: struct { logencoding: []const u8 = "auto", maxlines: usize = 1 } = .{},
 
-    pub fn fileSpecs(self: Plan, allocator: Allocator) ![]FileSpec {
-        var specs = std.ArrayList(FileSpec).init(allocator);
-        errdefer specs.deinit();
-        for (self.paths) |path| {
-            const start = path.start orelse return error.InvalidStartMode;
-            if (path.pattern.len == 0) continue;
-            try specs.append(.{ .pattern = path.pattern, .start = start });
-        }
-        return specs.toOwnedSlice();
-    }
-
     pub const Availability = enum { available, dependency_unavailable, initialization_failed };
     pub const Environment = struct {
         matched_files: usize,
@@ -144,34 +129,6 @@ pub const Plan = struct {
         var observed = environment.backend_availability;
         result.selected = try policy.select(selector.name, &observed, Factory.observed);
         return result;
-    }
-
-    pub fn journalOptions(_: Plan, allocator: Allocator, binding: Binding) !journal.Options {
-        if (binding.selected == null or binding.selected.?.source_kind != .journal) return error.NotJournalSelection;
-        var options = journal.Options{};
-        for (binding.parameters) |parameter| {
-            if (std.mem.eql(u8, parameter.name, "journalpath")) options.path = parameter.value else if (std.mem.eql(u8, parameter.name, "journalfiles")) options.files = try journal.splitFiles(allocator, parameter.value) else if (std.mem.eql(u8, parameter.name, "journalflags")) options.flags = parameter.value else if (std.mem.eql(u8, parameter.name, "rotated")) options.rotated = parameter.value else if (std.mem.eql(u8, parameter.name, "namespace")) options.namespace = parameter.value;
-        }
-        return options;
-    }
-
-    pub fn prepareJournal(self: Plan, allocator: Allocator, binding: Binding, environment: journal.Environment) !journal.Prepared {
-        return journal.prepare(allocator, try self.journalOptions(allocator, binding), environment);
-    }
-
-    pub fn journalMatches(self: Plan, allocator: Allocator) ![]const []const u8 {
-        const raw = string(self.journalmatch) orelse return &.{};
-        var result = std.ArrayList([]const u8).init(allocator);
-        var lines = std.mem.splitScalar(u8, raw, '\n');
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
-            const words = try shellWords(allocator, line);
-            if (words.len == 0) return error.EmptyJournalMatchGroup;
-            // Why: A "+" word between match groups combines them as a logical OR (journalctl(1)).
-            if (result.items.len != 0) try result.append("+");
-            try result.appendSlice(words);
-        }
-        return result.toOwnedSlice();
     }
 };
 
@@ -334,48 +291,6 @@ pub fn prepare(allocator: Allocator, source_ini: *const config.ParsedIni, jail_n
     result.paths = try paths.toOwnedSlice();
     result.diagnostics = try diagnostics.toOwnedSlice();
     return result;
-}
-
-fn shellWords(allocator: Allocator, input: []const u8) ![]const []const u8 {
-    var result = std.ArrayList([]const u8).init(allocator);
-    var token = std.ArrayList(u8).init(allocator);
-    defer token.deinit();
-    var quote: u8 = 0;
-    var active = false;
-    var i: usize = 0;
-    while (i < input.len) : (i += 1) {
-        const c = input[i];
-        if (quote != 0) {
-            if (c == quote) {
-                quote = 0;
-            } else if (c == '\\' and quote == '"') {
-                i += 1;
-                if (i == input.len) return error.UnterminatedJournalQuote;
-                if (input[i] != '\\' and input[i] != '"') try token.append('\\');
-                try token.append(input[i]);
-            } else try token.append(c);
-            continue;
-        }
-        if (c == '\'' or c == '"') {
-            active = true;
-            quote = c;
-        } else if (c == '\\') {
-            active = true;
-            i += 1;
-            if (i == input.len) return error.UnterminatedJournalQuote;
-            try token.append(input[i]);
-        } else if (std.mem.indexOfScalar(u8, " \t\r\n", c) != null) {
-            if (active) try result.append(try allocator.dupe(u8, token.items));
-            token.clearRetainingCapacity();
-            active = false;
-        } else {
-            active = true;
-            try token.append(c);
-        }
-    }
-    if (quote != 0) return error.UnterminatedJournalQuote;
-    if (active) try result.append(try allocator.dupe(u8, token.items));
-    return result.toOwnedSlice();
 }
 
 fn trimPythonWhitespace(input: []const u8) ![]const u8 {

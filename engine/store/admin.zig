@@ -21,15 +21,6 @@ pub fn Methods(comptime Store: type) type {
         const effectLease = Store.effectLease;
         const retryPoliciesEqual = Store.retryPoliciesEqual;
         const bindSubjectAt = Store.bindSubjectAt;
-        pub fn transitionRetryPolicy(self: *Store, jail: []const u8, generation: [32]u8, expected: retry.Policy, next: retry.Policy) Error!void {
-            try self.beginWrite();
-            errdefer self.rollback();
-            if (self.schema_version < 22) return error.AdminStorageRequired;
-            try self.transitionJailGenerationTx(.{ .jail = jail, .generation = generation, .next_generation = generation, .expected = expected, .next = next }, std.time.microTimestamp());
-            try self.bumpAdminRevisionTx();
-            try self.fault(.before_policy_transition_commit);
-            try self.commitTransaction();
-        }
         fn transitionJailGenerationTx(self: *Store, change: PolicyTransition, now_us: i64) Error!void {
             const jail = change.jail;
             if (jail.len == 0 or jail.len > 64 or std.mem.indexOfScalar(u8, jail, 0) != null) return error.InvalidRecord;
@@ -209,31 +200,6 @@ pub fn Methods(comptime Store: type) type {
             }
             // Why: The newest 8 unpublished, unreferenced generations are kept, and at most 32 older ones are deleted per write.
             try self.exec(std.fmt.comptimePrint("DELETE FROM config_generations WHERE generation IN (SELECT generation FROM config_generations g WHERE g.published=0 AND NOT EXISTS(SELECT 1 FROM jail_admin_states s WHERE s.generation=g.generation) ORDER BY g.committed_us DESC,g.generation DESC LIMIT {d} OFFSET {d});", .{ config_generation_prune_page, unreferenced_config_generations_kept }));
-        }
-
-        pub fn publishConfigGeneration(self: *Store, generation: [32]u8) Error!void {
-            try self.beginWrite();
-            errdefer self.rollback();
-            if (self.schema_version < 22) return error.AdminStorageRequired;
-            try self.exec("UPDATE config_generations SET published=0 WHERE published=1;");
-            var update = try self.statement("UPDATE config_generations SET published=1 WHERE generation=?1;");
-            defer update.deinit();
-            try update.blob(1, &generation);
-            try update.done();
-            if (self.api.changes(self.db) != 1) return error.ConfigGenerationMissing;
-            try self.fault(.before_config_generation_publish);
-            try self.commitTransaction();
-        }
-
-        pub fn discardUnpublishedConfigGeneration(self: *Store, generation: [32]u8) Error!void {
-            try self.beginClassWrite(.reclamation);
-            errdefer self.rollback();
-            if (self.schema_version < 22) return error.AdminStorageRequired;
-            var delete = try self.statement("DELETE FROM config_generations WHERE generation=?1 AND published=0;");
-            defer delete.deinit();
-            try delete.blob(1, &generation);
-            try delete.done();
-            try self.commitTransaction();
         }
 
         pub const ConfigGenerationHead = struct { generation: [32]u8, config_digest: [32]u8, published: bool, committed_us: i64 };

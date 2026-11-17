@@ -23,9 +23,6 @@ const http = @import("../net/http.zig");
 const shared = @import("shared");
 pub const mib = 1024 * 1024;
 pub const sqlite_heap_bytes = 64 * mib;
-pub const sqlite_page_bytes = 1024 * mib;
-pub const sqlite_advisory_cache_bytes = 32 * mib;
-pub const wal_trigger_bytes = 16 * mib;
 pub const allocation_allowance = 64;
 pub const max_reservations = 512;
 pub const firewall_observation_object_bytes = 50 * 1024;
@@ -234,24 +231,11 @@ pub fn dnsCost(options: runtime.DnsOptions) !Component {
     result.restore_overlap.fds = result.live.fds;
     return result;
 }
-pub fn jailConsumerCost(options: runtime.JailOptions) !Component {
-    return consumerCost(try runtime.JailRuntime.allocationPlan(options), try add(64, try mul(options.max_sources, try add(8, try mul(options.programs.len, 2)))));
-}
-pub fn programCost(count: usize) Error!Component {
-    if (count > 128 * 8) return error.InvalidResourceLimit;
-    const live = Cost{ .bytes = try mul(count, @sizeOf(rules.Program)), .allocations = count };
-    return .{ .live = live, .restore_overlap = live };
-}
 pub fn timezoneCost(count: usize) Error!Component {
     if (count > 128) return error.InvalidResourceLimit;
     const bytes = @sizeOf(timezone.Zone) + 255 + timezone.max_transitions * @sizeOf(timezone.Transition) + timezone.max_types * @sizeOf(timezone.TimeType);
     const live = try (Cost{ .bytes = bytes, .allocations = 4 }).times(count);
     return .{ .live = live, .restore_overlap = live, .workspace = if (count == 0) .{} else .{ .bytes = timezone.max_file_bytes, .allocations = 1, .fds = 2 }, .workspace_kind = .configuration };
-}
-pub fn configurationCost(retained_capacity: usize, prepared_arena: usize, projection_arena: usize) Error!Component {
-    if (prepared_arena > 32 * mib or projection_arena > 4 * mib) return error.InvalidResourceLimit;
-    const live = Cost{ .bytes = try add(retained_capacity, try add(prepared_arena, projection_arena)), .allocations = 8 };
-    return .{ .live = live, .restore_overlap = live };
 }
 pub fn storeWorkspace() Component {
     return .{ .live = .{ .fds = 4 }, .workspace = .{ .bytes = store.Limits.checkpoint_bytes + store.Limits.shared_bytes + consumer.max_prepared_bytes + store.Limits.sqlite_row_bytes, .allocations = 128 }, .workspace_kind = .storage };

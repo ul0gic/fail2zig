@@ -61,10 +61,6 @@ pub fn seededBans(now: i64) [6]BanRow {
     };
 }
 
-pub const seeded_jail_count: u64 = 2;
-pub const seeded_log_count: u64 = 2;
-pub const seeded_ban_count: u64 = 6;
-
 pub fn build(path: []const u8, options: Options) Error!void {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path_z = std.fmt.bufPrintZ(&path_buffer, "{s}", .{path}) catch return error.PathTooLong;

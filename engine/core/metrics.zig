@@ -169,26 +169,6 @@ pub const Metrics = struct {
         return .{};
     }
 
-    pub fn incrementParsed(self: *Metrics) void {
-        self.lines_parsed.inc();
-    }
-
-    pub fn incrementMatched(self: *Metrics) void {
-        self.lines_matched.inc();
-    }
-
-    pub fn incrementParseErrors(self: *Metrics) void {
-        self.parse_errors.inc();
-    }
-
-    pub fn setMemoryBytes(self: *Metrics, bytes: u64) void {
-        self.memory_bytes_used.store(bytes);
-    }
-
-    pub fn setBansTotal(self: *Metrics, count: u64) void {
-        self.bans_total.store(count);
-    }
-
     pub fn setStateFile(self: *Metrics, bytes: u64, pages: u64, used_pages: u64) void {
         self.state_file_bytes.store(bytes);
         self.state_file_pages.store(pages);
@@ -244,27 +224,9 @@ pub const Metrics = struct {
         return null;
     }
 
-    pub fn jailIncrementParsed(self: *Metrics, jail: []const u8) void {
-        if (self.jailIndex(jail)) |i| {
-            self.jails[i].lines_parsed.inc();
-        }
-    }
-
-    pub fn jailIncrementMatched(self: *Metrics, jail: []const u8) void {
-        if (self.jailIndex(jail)) |i| {
-            self.jails[i].lines_matched.inc();
-        }
-    }
-
     pub fn jailSetBansTotal(self: *Metrics, jail: []const u8, count: u64) void {
         if (self.jailIndex(jail)) |i| {
             self.jails[i].bans_total.store(count);
-        }
-    }
-
-    pub fn jailIncrementParseErrors(self: *Metrics, jail: []const u8) void {
-        if (self.jailIndex(jail)) |i| {
-            self.jails[i].parse_errors.inc();
         }
     }
 
@@ -283,12 +245,6 @@ pub const Metrics = struct {
     pub fn jailSetPoolEvictions(self: *Metrics, jail: []const u8, count: u64) void {
         if (self.jailIndex(jail)) |i| {
             self.jails[i].pool_evictions.store(count);
-        }
-    }
-
-    pub fn jailSetSourceState(self: *Metrics, jail: []const u8, state: u8) void {
-        if (self.jailIndex(jail)) |i| {
-            self.jails[i].source_state.store(state, counter_order);
         }
     }
 

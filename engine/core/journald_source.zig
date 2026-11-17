@@ -47,26 +47,6 @@ pub const default_baseline_timeout_ms: u64 = 5_000;
 
 const max_reads_per_callback: usize = 4;
 
-pub const ResolvedSource = enum { file, journald, internal, fail };
-
-pub fn resolveSource(
-    source: config_mod.LogSource,
-    logpath_exists: bool,
-    journalctl_present: bool,
-    filter_journald_supported: bool,
-) ResolvedSource {
-    return switch (source) {
-        .file => .file,
-        .internal => .internal,
-        .journald => if (journalctl_present) .journald else .fail,
-        .auto => blk: {
-            if (logpath_exists) break :blk .file;
-            if (filter_journald_supported and journalctl_present) break :blk .journald;
-            break :blk .file;
-        },
-    };
-}
-
 pub const sshd_selectors = [_][]const u8{
     "SYSLOG_IDENTIFIER=sshd",
     "SYSLOG_IDENTIFIER=sshd-session",
@@ -219,15 +199,7 @@ fn normalizeMessage(val: std.json.Value, out: []u8) DecodeError![]const u8 {
     }
 }
 
-pub const cursor_magic: [4]u8 = .{ 'F', '2', 'Z', 'J' };
-pub const cursor_version: u16 = 1;
 const cursor_file_basename = "journald-cursors.bin";
-const max_sidecar_bytes: usize = 1024 * 1024;
-
-pub const CursorEntry = struct {
-    name: []const u8,
-    cursor: []const u8,
-};
 
 pub const SidecarError = error{
     OutOfMemory,
@@ -248,163 +220,6 @@ pub fn cursorPath(state_file: []const u8, buf: []u8) SidecarError![]const u8 {
     buf[dir.len] = '/';
     @memcpy(buf[dir.len + 1 ..][0..cursor_file_basename.len], cursor_file_basename);
     return buf[0..need];
-}
-
-pub const CursorSaveError = SidecarError || std.fs.File.OpenError;
-
-pub fn saveCursors(entries: []const CursorEntry, path: []const u8) CursorSaveError!void {
-    const max_path: usize = 4096;
-    if (path.len == 0 or path.len + 4 > max_path) return error.PathTooLong;
-    var tmp_buf: [max_path]u8 = undefined;
-    @memcpy(tmp_buf[0..path.len], path);
-    const tmp_suffix = ".tmp";
-    @memcpy(tmp_buf[path.len .. path.len + tmp_suffix.len], tmp_suffix);
-    const tmp_path = tmp_buf[0 .. path.len + tmp_suffix.len];
-
-    var file = try std.fs.cwd().createFile(tmp_path, .{
-        .mode = 0o600,
-        .truncate = true,
-    });
-    var close_handled = false;
-    defer if (!close_handled) file.close();
-
-    var crc = std.hash.Crc32.init();
-    const writer = file.writer();
-
-    var hdr: [10]u8 = undefined;
-    @memcpy(hdr[0..4], &cursor_magic);
-    std.mem.writeInt(u16, hdr[4..6], cursor_version, .little);
-    std.mem.writeInt(u32, hdr[6..10], @intCast(entries.len), .little);
-    writer.writeAll(&hdr) catch return error.WriteFailed;
-    crc.update(&hdr);
-
-    var len_buf: [2]u8 = undefined;
-    for (entries) |e| {
-        if (e.name.len > std.math.maxInt(u16) or e.cursor.len > std.math.maxInt(u16)) {
-            return error.WriteFailed;
-        }
-        std.mem.writeInt(u16, &len_buf, @intCast(e.name.len), .little);
-        writer.writeAll(&len_buf) catch return error.WriteFailed;
-        crc.update(&len_buf);
-        writer.writeAll(e.name) catch return error.WriteFailed;
-        crc.update(e.name);
-
-        std.mem.writeInt(u16, &len_buf, @intCast(e.cursor.len), .little);
-        writer.writeAll(&len_buf) catch return error.WriteFailed;
-        crc.update(&len_buf);
-        writer.writeAll(e.cursor) catch return error.WriteFailed;
-        crc.update(e.cursor);
-    }
-
-    var crc_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &crc_buf, crc.final(), .little);
-    writer.writeAll(&crc_buf) catch return error.WriteFailed;
-
-    posix.fsync(file.handle) catch return error.FsyncFailed;
-    posix.fchmod(file.handle, 0o600) catch return error.ChmodFailed;
-
-    file.close();
-    close_handled = true;
-
-    std.fs.cwd().rename(tmp_path, path) catch return error.RenameFailed;
-}
-
-pub fn loadCursors(allocator: Allocator, path: []const u8) SidecarError![]CursorEntry {
-    var file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return allocator.alloc(CursorEntry, 0) catch
-            return error.OutOfMemory,
-        else => return error.OpenFailed,
-    };
-    defer file.close();
-
-    const bytes = file.readToEndAlloc(allocator, max_sidecar_bytes) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.ReadFailed,
-    };
-    defer allocator.free(bytes);
-
-    const empty = struct {
-        fn make(a: Allocator) SidecarError![]CursorEntry {
-            return a.alloc(CursorEntry, 0) catch error.OutOfMemory;
-        }
-    }.make;
-
-    if (bytes.len < 10 + 4) {
-        std.log.warn("journald: cursor sidecar too short ({d} bytes); re-seeding", .{bytes.len});
-        return empty(allocator);
-    }
-    if (!std.mem.eql(u8, bytes[0..4], &cursor_magic)) {
-        std.log.warn("journald: cursor sidecar bad magic; re-seeding", .{});
-        return empty(allocator);
-    }
-    const ver = std.mem.readInt(u16, bytes[4..6], .little);
-    if (ver != cursor_version) {
-        std.log.warn("journald: cursor sidecar version {d} unsupported; re-seeding", .{ver});
-        return empty(allocator);
-    }
-    const count = std.mem.readInt(u32, bytes[6..10], .little);
-
-    const body = bytes[0 .. bytes.len - 4];
-    const stored_crc = std.mem.readInt(u32, bytes[bytes.len - 4 ..][0..4], .little);
-    if (std.hash.Crc32.hash(body) != stored_crc) {
-        std.log.warn("journald: cursor sidecar checksum mismatch; re-seeding", .{});
-        return empty(allocator);
-    }
-
-    var out = std.ArrayList(CursorEntry).init(allocator);
-    errdefer {
-        for (out.items) |e| {
-            allocator.free(e.name);
-            allocator.free(e.cursor);
-        }
-        out.deinit();
-    }
-
-    var off: usize = 10;
-    var i: u32 = 0;
-    while (i < count) : (i += 1) {
-        if (off + 2 > body.len) return failCorrupt(allocator, &out);
-        const name_len = std.mem.readInt(u16, body[off..][0..2], .little);
-        off += 2;
-        if (off + name_len > body.len) return failCorrupt(allocator, &out);
-        const name = allocator.dupe(u8, body[off..][0..name_len]) catch return error.OutOfMemory;
-        off += name_len;
-
-        if (off + 2 > body.len) {
-            allocator.free(name);
-            return failCorrupt(allocator, &out);
-        }
-        const cur_len = std.mem.readInt(u16, body[off..][0..2], .little);
-        off += 2;
-        if (off + cur_len > body.len) {
-            allocator.free(name);
-            return failCorrupt(allocator, &out);
-        }
-        const cur = allocator.dupe(u8, body[off..][0..cur_len]) catch {
-            allocator.free(name);
-            return error.OutOfMemory;
-        };
-        off += cur_len;
-
-        out.append(.{ .name = name, .cursor = cur }) catch {
-            allocator.free(name);
-            allocator.free(cur);
-            return error.OutOfMemory;
-        };
-    }
-
-    return out.toOwnedSlice() catch error.OutOfMemory;
-}
-
-fn failCorrupt(allocator: Allocator, out: *std.ArrayList(CursorEntry)) SidecarError![]CursorEntry {
-    std.log.warn("journald: cursor sidecar truncated/corrupt; re-seeding", .{});
-    for (out.items) |e| {
-        allocator.free(e.name);
-        allocator.free(e.cursor);
-    }
-    out.deinit();
-    out.* = std.ArrayList(CursorEntry).init(allocator);
-    return allocator.alloc(CursorEntry, 0) catch error.OutOfMemory;
 }
 
 const InFlight = struct {
@@ -508,10 +323,6 @@ pub const JournaldSource = struct {
         self.* = undefined;
     }
 
-    pub fn hasJails(self: *const JournaldSource) bool {
-        return self.jails.items.len > 0;
-    }
-
     pub fn addJail(
         self: *JournaldSource,
         jail: JailId,
@@ -532,24 +343,6 @@ pub const JournaldSource = struct {
             .userdata = userdata,
             .pending = pending,
         }) catch return error.OutOfMemory;
-    }
-
-    pub fn setFlushHook(
-        self: *JournaldSource,
-        fn_ptr: *const fn (?*anyopaque) bool,
-        userdata: ?*anyopaque,
-    ) void {
-        self.flush_fn = fn_ptr;
-        self.flush_userdata = userdata;
-    }
-
-    pub fn seedCursor(self: *JournaldSource, jail_name: []const u8, cursor: []const u8) void {
-        for (self.jails.items) |*jj| {
-            if (std.mem.eql(u8, jj.jail.slice(), jail_name)) {
-                jj.setCursor(cursor);
-                return;
-            }
-        }
     }
 
     pub fn attach(self: *JournaldSource) Error!void {
@@ -593,21 +386,6 @@ pub const JournaldSource = struct {
             );
             self.finishChild(jj, .kill);
         }
-    }
-
-    pub fn collectCursors(self: *const JournaldSource, buf: []CursorEntry) []CursorEntry {
-        var n: usize = 0;
-        for (self.jails.items) |*jj| {
-            if (n >= buf.len) break;
-            if (jj.cursor_len == 0) continue;
-            buf[n] = .{ .name = jj.jail.slice(), .cursor = jj.cursorSlice() };
-            n += 1;
-        }
-        return buf[0..n];
-    }
-
-    pub fn jailCount(self: *const JournaldSource) usize {
-        return self.jails.items.len;
     }
 
     pub fn healthForJail(self: *const JournaldSource, name: []const u8) ?JailHealth {

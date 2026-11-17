@@ -357,60 +357,6 @@ pub fn extractTimestampWithYear(
     return null;
 }
 
-pub const ExactTimestampMatch = struct { seconds: f64, len: u16 };
-pub const DateContext = struct {
-    year: i64,
-    now: f64,
-    default_offset_seconds: i32 = 0,
-};
-pub fn extractTimestampExact(text: []const u8, context: DateContext) ?ExactTimestampMatch {
-    if (text.len > std.math.maxInt(u16)) return null;
-    if (!std.math.isFinite(context.now) or context.year < 1 or context.year > 9999 or
-        context.default_offset_seconds <= -86400 or context.default_offset_seconds >= 86400) return null;
-    const legacy = extractTimestampWithYear(text, context.year) orelse return null;
-    var seconds: f64 = @floatFromInt(legacy.ts);
-    var consumed: usize = legacy.len;
-    const iso = text.len >= 19 and text[4] == '-' and text[7] == '-';
-    const bsd = text.len >= 15 and text[3] == ' ';
-    if (iso or bsd) {
-        const year = if (iso) parseU(i64, text[0..4]) orelse return null else context.year;
-        const month = if (iso) parseU(u8, text[5..7]) orelse return null else monthFromBsdName(text[0..3]) orelse return null;
-        const day = if (iso) parseU(u8, text[8..10]) orelse return null else parseU(u8, std.mem.trim(u8, text[4..6], " ")) orelse return null;
-        if (!validCivil(year, month, day)) return null;
-        const sec_start: usize = if (iso) 17 else 13;
-        if ((parseU(u8, text[sec_start .. sec_start + 2]) orelse return null) > 59) return null;
-        var end: usize = if (iso) 19 else 15;
-        if (iso and end < text.len and text[end] == '.') {
-            const start = end;
-            end += 1;
-            while (end < text.len and std.ascii.isDigit(text[end])) : (end += 1) {}
-            if (end == start + 1) return null;
-            seconds += std.fmt.parseFloat(f64, text[start..end]) catch return null;
-        }
-        const explicit_zone = iso and end < text.len and (text[end] == 'Z' or text[end] == '+' or text[end] == '-');
-        if (explicit_zone and text[end] != 'Z' and consumed == end) return null;
-        if (!explicit_zone) seconds -= @as(f64, @floatFromInt(context.default_offset_seconds));
-        if (bsd and seconds > context.now + 86400) {
-            if (!validCivil(year - 1, month, day)) return null;
-            seconds -= @as(f64, @floatFromInt((daysFromCivil(year, month, day) - daysFromCivil(year - 1, month, day)) * SECS_PER_DAY));
-        }
-    } else if (consumed < text.len and text[consumed] == '.') {
-        const start = consumed;
-        consumed += 1;
-        while (consumed < text.len and std.ascii.isDigit(text[consumed])) : (consumed += 1) {}
-        if (consumed == start + 1) return null;
-        seconds += std.fmt.parseFloat(f64, text[start..consumed]) catch return null;
-    }
-    if (!std.math.isFinite(seconds) or consumed > std.math.maxInt(u16)) return null;
-    return .{ .seconds = seconds, .len = @intCast(consumed) };
-}
-fn validCivil(year: i64, month: u8, day: u8) bool {
-    if (year < 1 or year > 9999 or month < 1 or month > 12 or day < 1) return false;
-    const lengths = [_]u8{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-    const leap = @mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0);
-    const limit: u8 = lengths[month - 1] + @as(u8, if (month == 2 and leap) 1 else 0);
-    return day <= limit;
-}
 pub fn stripSyslogPrefix(line: []const u8) []const u8 {
     const timestamp = extractTimestamp(line) orelse return line;
     var pos: usize = timestamp.len;
@@ -676,13 +622,5 @@ pub const Parser = struct {
     pub fn init(allocator: std.mem.Allocator) Parser {
         const default_match = comptime compile("<*><IP>");
         return .{ .allocator = allocator, .match_fn = default_match };
-    }
-
-    pub fn withMatcher(allocator: std.mem.Allocator, match_fn: MatchFn) Parser {
-        return .{ .allocator = allocator, .match_fn = match_fn };
-    }
-
-    pub fn parseLine(self: *const Parser, line: []const u8) Error!ParseResult {
-        return self.match_fn(line) orelse error.NoMatch;
     }
 };

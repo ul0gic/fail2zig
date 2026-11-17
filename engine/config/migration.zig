@@ -311,56 +311,6 @@ fn resolveFilter(ctx: *Context, name: []const u8) ?FilterResolution {
     return null;
 }
 
-pub fn parseDuration(raw: []const u8) ?u64 {
-    const trimmed = std.mem.trim(u8, raw, " \t");
-    if (trimmed.len == 0) return null;
-
-    var split: usize = 0;
-    while (split < trimmed.len) : (split += 1) {
-        const c = trimmed[split];
-        if (c < '0' or c > '9') break;
-    }
-    if (split == 0) return null;
-    const n = std.fmt.parseInt(u64, trimmed[0..split], 10) catch return null;
-
-    const rest = std.mem.trim(u8, trimmed[split..], " \t");
-    if (rest.len == 0) return n;
-
-    const Unit = struct { suf: []const u8, mul: u64 };
-    const units = [_]Unit{
-        .{ .suf = "seconds", .mul = 1 },
-        .{ .suf = "second", .mul = 1 },
-        .{ .suf = "sec", .mul = 1 },
-        .{ .suf = "s", .mul = 1 },
-        .{ .suf = "minutes", .mul = 60 },
-        .{ .suf = "minute", .mul = 60 },
-        .{ .suf = "min", .mul = 60 },
-        .{ .suf = "m", .mul = 60 },
-        .{ .suf = "hours", .mul = 3600 },
-        .{ .suf = "hour", .mul = 3600 },
-        .{ .suf = "hr", .mul = 3600 },
-        .{ .suf = "h", .mul = 3600 },
-        .{ .suf = "days", .mul = 86_400 },
-        .{ .suf = "day", .mul = 86_400 },
-        .{ .suf = "d", .mul = 86_400 },
-        .{ .suf = "weeks", .mul = 604_800 },
-        .{ .suf = "week", .mul = 604_800 },
-        .{ .suf = "w", .mul = 604_800 },
-        .{ .suf = "months", .mul = 30 * 86_400 },
-        .{ .suf = "month", .mul = 30 * 86_400 },
-        .{ .suf = "mo", .mul = 30 * 86_400 },
-        .{ .suf = "years", .mul = 365 * 86_400 },
-        .{ .suf = "year", .mul = 365 * 86_400 },
-        .{ .suf = "y", .mul = 365 * 86_400 },
-    };
-    for (units) |u| {
-        if (std.ascii.eqlIgnoreCase(rest, u.suf)) {
-            return std.math.mul(u64, n, u.mul) catch null;
-        }
-    }
-    return null;
-}
-
 fn parseBool(raw: []const u8) bool {
     const s = std.mem.trim(u8, raw, " \t");
     return std.ascii.eqlIgnoreCase(s, "true") or

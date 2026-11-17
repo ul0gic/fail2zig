@@ -20,13 +20,11 @@ pub const NFT_MSG = struct {
     pub const DELTABLE: u16 = 2;
     pub const NEWCHAIN: u16 = 3;
     pub const GETCHAIN: u16 = 4;
-    pub const DELCHAIN: u16 = 5;
     pub const NEWRULE: u16 = 6;
     pub const GETRULE: u16 = 7;
     pub const DELRULE: u16 = 8;
     pub const NEWSET: u16 = 9;
     pub const GETSET: u16 = 10;
-    pub const DELSET: u16 = 11;
     pub const NEWSETELEM: u16 = 12;
     pub const GETSETELEM: u16 = 13;
     pub const DELSETELEM: u16 = 14;
@@ -74,12 +72,10 @@ pub const NFTA_SET_ELEM = struct {
     pub const KEY: u16 = 1;
     pub const FLAGS: u16 = 3;
     pub const TIMEOUT: u16 = 4;
-    pub const EXPIRATION: u16 = 5;
 };
 
 pub const NFTA_GEN = struct {
     pub const ID: u16 = 1;
-    pub const PROC_PID: u16 = 2;
 };
 
 pub const NFTA_DATA_VALUE: u16 = 1;
@@ -96,11 +92,8 @@ pub const NFT_TYPE = struct {
 
 // Why: Hook numbers from include/uapi/linux/netfilter.h.
 pub const NF_INET_HOOK = struct {
-    pub const PREROUTING: u32 = 0;
     pub const LOCAL_IN: u32 = 1;
     pub const FORWARD: u32 = 2;
-    pub const LOCAL_OUT: u32 = 3;
-    pub const POSTROUTING: u32 = 4;
 };
 
 pub const NFTA_RULE = struct {
@@ -173,7 +166,6 @@ pub const NFTA_BITWISE = struct {
 };
 
 pub const NFT_PAYLOAD = struct {
-    pub const LL_HEADER: u32 = 0;
     pub const NETWORK_HEADER: u32 = 1;
     pub const TRANSPORT_HEADER: u32 = 2;
 };

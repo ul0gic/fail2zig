@@ -65,10 +65,6 @@ pub const Scope = struct {
         value.validate() catch return error.InvalidEffect;
         return .{ .canonical = value };
     }
-    pub fn toCanonical(self: Scope) Error!canonical_scope.Scope {
-        try self.validate();
-        return self.canonical;
-    }
     pub fn validate(self: Scope) Error!void {
         self.canonical.validate() catch return error.InvalidEffect;
         if (self.canonical.subject.kind == .host) {

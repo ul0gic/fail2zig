@@ -14,10 +14,6 @@ pub const Prepared = struct {
     outcome: ?rules.Outcome,
     prepared_us: ?i64 = null,
     valid_until_us: ?i64 = null,
-    pub fn validateCommit(self: Prepared, now_us: i64) !void {
-        if (self.prepared_us) |floor| if (now_us < floor) return error.ConsumerClockReversed;
-        if (self.valid_until_us) |expiry| if (now_us >= expiry) return error.ConsumerExpired;
-    }
     pub fn publish(self: Prepared) void {
         self.owner.counters = self.owner.staged;
         if (self.owner.correlation_stage) |stage| stage.publish();

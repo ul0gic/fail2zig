@@ -83,13 +83,6 @@ pub const Staging = struct {
 pub const StagedOwnerRow = @import("../core/record_store.zig").Store.StagedOwnerRow;
 pub const StagedHistoryRow = @import("../core/record_store.zig").Store.StagedHistoryRow;
 
-pub const staging_sql = struct {
-    pub const delete_owners: [:0]const u8 = "DELETE FROM migration_staged_owners WHERE run_id=?1;";
-    pub const delete_history: [:0]const u8 = "DELETE FROM migration_staged_history WHERE run_id=?1;";
-    pub const insert_owner: [:0]const u8 = "INSERT INTO migration_staged_owners(run_id,seq,jail,scope,lease_kind,deadline_us,source_event_us,source_row) VALUES(?1,?2,?3,?4,?5,?6,?7,?8);";
-    pub const insert_history: [:0]const u8 = "INSERT INTO migration_staged_history(run_id,seq,jail,scope,event_kind,event_us,bancount,source_row) VALUES(?1,?2,?3,?4,?5,?6,?7,?8);";
-};
-
 pub fn ownerRows(allocator: std.mem.Allocator, staging: *const Staging) error{OutOfMemory}![]StagedOwnerRow {
     const rows = try allocator.alloc(StagedOwnerRow, staging.owners.len);
     for (staging.owners, 0..) |owner, i| rows[i] = .{

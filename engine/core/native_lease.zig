@@ -77,23 +77,6 @@ pub const Lease = union(enum(u8)) {
     pub fn eql(a: Lease, b: Lease) bool {
         return std.meta.eql(a, b);
     }
-
-    pub fn prolonged(self: Lease, requested: Lease, now_us: i64) Error!struct { lease: Lease, changed: bool } {
-        if (self == .absent or requested == .absent) return error.InvalidDuration;
-        if (!self.live(now_us)) return error.LeaseExpired;
-        return switch (self) {
-            .absent => unreachable,
-            .permanent => .{ .lease = .permanent, .changed = false },
-            .finite => |current| switch (requested) {
-                .absent => unreachable,
-                .permanent => .{ .lease = .permanent, .changed = true },
-                .finite => |candidate| if (candidate > current)
-                    .{ .lease = .{ .finite = candidate }, .changed = true }
-                else
-                    .{ .lease = self, .changed = false },
-            },
-        };
-    }
 };
 
 pub const ClockSample = struct {
@@ -104,19 +87,6 @@ pub const ClockSample = struct {
 pub const Schedule = union(enum) {
     none,
     due_at_us: u64,
-
-    pub fn fromLease(lease: Lease, sample: ClockSample) Error!Schedule {
-        return switch (lease) {
-            .absent => error.InvalidDuration,
-            .permanent => .none,
-            .finite => |deadline| if (deadline <= sample.wall_us)
-                .{ .due_at_us = sample.monotonic_us }
-            else blk: {
-                const remaining: u64 = @intCast(@as(i128, deadline) - sample.wall_us);
-                break :blk .{ .due_at_us = std.math.add(u64, sample.monotonic_us, remaining) catch return error.TimeOverflow };
-            },
-        };
-    }
 
     pub fn due(self: Schedule, monotonic_us: u64) bool {
         return switch (self) {

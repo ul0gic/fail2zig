@@ -349,10 +349,6 @@ const expected_objects = blk: {
     };
 };
 
-pub fn backupPath(buffer: []u8, state_path: []const u8) Error![:0]u8 {
-    return std.fmt.bufPrintZ(buffer, "{s}{s}", .{ state_path, BackupKind.pre24.suffix() }) catch error.StorageLimit;
-}
-
 pub fn Methods(comptime Store: type) type {
     return struct {
         pub fn loadRepairStatus(self: *Store) Error!Status {
@@ -375,23 +371,6 @@ pub fn Methods(comptime Store: type) type {
             const cursor = try row.signed(1);
             if (cursor < 0 or (try row.signed(2) == 1) != (phase == .complete)) return error.LoadRepairInvalidState;
             return .{ .phase = phase, .cursor = cursor };
-        }
-
-        pub fn requireLoadRepairAdmission(self: *Store) Error!void {
-            switch (try self.loadRepairStatus()) {
-                .earlier_schema, .ready => {},
-                .incomplete => return error.LoadRepairMigrationIncomplete,
-                .complete => if (latest_schema < target_schema) return error.LoadRepairWritersPending,
-            }
-        }
-
-        pub fn completeLoadRepairMigration(self: *Store, options: Options) Error!void {
-            while (true) {
-                switch (try self.loadRepairStatus()) {
-                    .earlier_schema, .complete => return,
-                    .ready, .incomplete => _ = try self.stepLoadRepairMigration(options),
-                }
-            }
         }
 
         pub fn stepLoadRepairMigration(self: *Store, options: Options) Error!Step {

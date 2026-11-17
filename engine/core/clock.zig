@@ -148,9 +148,6 @@ pub fn wallRead(context: ?*anyopaque) i64 {
 pub fn wallTimestamp(context: ?*anyopaque) anyerror!native_time.Timestamp {
     return .{ .us = fromContext(context).wallUs() };
 }
-pub fn monotonicMsRead(context: ?*anyopaque) u64 {
-    return fromContext(context).monotonicMs();
-}
 pub fn monotonicNsRead(context: ?*anyopaque) ?u64 {
     return fromContext(context).monotonicNs();
 }

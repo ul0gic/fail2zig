@@ -260,31 +260,6 @@ pub const Manager = struct {
         self.stop_retries = 0;
         self.stopping = false;
     }
-    pub fn beginRepair(self: *Manager, expected_epoch: u64) !u64 {
-        if (expected_epoch == 0 or expected_epoch != self.repair_epoch or self.repair_epoch == std.math.maxInt(u64)) return error.StaleRepairEpoch;
-        self.repair_epoch += 1;
-        self.forgetKernel();
-        self.cached_epoch = null;
-        self.staged_revision = null;
-        self.staged_count = 0;
-        self.cursor = 0;
-        self.readback_failures = 0;
-        self.readback_wait = 0;
-        self.status.ready = false;
-        self.status.uncertain = false;
-        self.status.cause = null;
-        return self.repair_epoch;
-    }
-    pub fn repairEpoch(self: *const Manager) u64 {
-        return self.repair_epoch;
-    }
-    pub fn confirmedSubject(self: *const Manager, subject: @import("../core/native_detection_record.zig").Subject, now_us: i64) bool {
-        if (self.status.uncertain and !(self.status.cause != null and transientCause(self.status.cause.?))) return false;
-        const scope = effect.Scope.host(subject) catch return false;
-        const key = scope.key(self.installation) catch return false;
-        const index = self.findLive(key) orelse return false;
-        return self.live[index].status == .applied and self.live[index].desired.live(now_us) and (self.confirmed[index] or self.status.ready);
-    }
     pub fn confirmedKey(self: *const Manager, key: [32]u8, now_us: i64) bool {
         const index = self.findLive(key) orelse return false;
         return self.live[index].status == .applied and self.live[index].desired.live(now_us) and (self.confirmed[index] or self.status.ready);
@@ -363,16 +338,6 @@ pub const Manager = struct {
         if (now < self.last_wall_us) return error.EffectClockReversed;
         self.last_wall_us = now;
         return .{ .prepared_us = now, .context = self.wall_context, .read = self.wall };
-    }
-    pub fn prolongRetry(self: *Manager, change: durable.Store.RetryProlongation) !durable.Store.RetryProlongationResult {
-        errdefer |failure| {
-            self.status.ready = false;
-            self.status.uncertain = true;
-            self.status.cause = failure;
-        }
-        const result = try self.store.prolongRetryDecision(change, try self.clock());
-        if (result.changed) self.status.ready = false;
-        return result;
     }
     pub fn admit(self: *Manager) !void {
         errdefer |failure| {
@@ -1686,11 +1651,6 @@ pub const Manager = struct {
             std.log.warn("native: settlement of view index {d} changed no row at epoch {d}", .{ index, pre });
             return error.InvalidEffect;
         }
-    }
-    pub const StorageGate = enum { healthy, unhealthy };
-    pub fn stopStep(self: *Manager, expected_repair_epoch: u64, gate: StorageGate) Step {
-        if (gate != .healthy) return .{ .fatal = error.StorageUnhealthy };
-        return self.stopStepInner(expected_repair_epoch, true) catch |failure| .{ .fatal = failure };
     }
     pub fn withdrawStep(self: *Manager, expected_repair_epoch: u64) Step {
         const result = self.stopStepInner(expected_repair_epoch, false) catch |failure| Step{ .fatal = failure };

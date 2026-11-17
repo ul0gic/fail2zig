@@ -63,10 +63,6 @@ pub const FilterMatcher = struct {
         }
         return null;
     }
-
-    pub fn patternCount(self: FilterMatcher) usize {
-        return self.patterns.len;
-    }
 };
 
 pub fn matcherForFilter(name: []const u8) ?FilterMatcher {
@@ -84,11 +80,3 @@ fn namesEqual(canonical: []const u8, query: []const u8) bool {
     }
     return true;
 }
-
-pub fn listFilters(writer: anytype) !void {
-    for (entries) |e| {
-        try writer.print("{s}\n", .{e.name});
-    }
-}
-
-pub const registered_count: usize = entries.len;

@@ -172,15 +172,8 @@ pub const Processor = struct {
         if (self.options.timestamp == .journal) return error.InvalidFileTimestampSource;
         try source.setNativeFraming(self.options.encoding, self.generation, self.options.max_record_bytes);
     }
-    pub fn setClock(self: *Processor, now: time.Timestamp) !void {
-        if (self.in_flight) return error.ProcessorBusy;
-        self.now = now;
-    }
     pub fn adapter(self: *Processor) pipeline.Processor {
         return .{ .context = self, .prepare = prepare, .prepare_restore = restore };
-    }
-    pub fn timeHealth(self: *const Processor) policy.Counters {
-        return self.health.snapshot();
     }
     pub fn timeNotice(self: *Processor, monotonic_ms: u64) ?policy.Notice {
         return self.health.nextNotice(monotonic_ms);

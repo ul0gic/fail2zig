@@ -150,13 +150,6 @@ pub const HttpServer = struct {
         self.* = undefined;
     }
 
-    pub fn getBoundPort(self: *const HttpServer) !u16 {
-        var addr: linux.sockaddr.in = undefined;
-        var len: posix.socklen_t = @sizeOf(linux.sockaddr.in);
-        try posix.getsockname(self.listen_fd, @ptrCast(&addr), &len);
-        return std.mem.bigToNative(u16, addr.port);
-    }
-
     pub fn setMetricsSource(self: *HttpServer, s: MetricsSource) void {
         self.metrics_source = s;
     }

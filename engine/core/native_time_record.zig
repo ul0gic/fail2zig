@@ -52,14 +52,6 @@ pub const Stored = struct {
         _ = try stored.outcome(receipt);
         return stored;
     }
-    // The disposition refines existing time rows without changing their kind or provenance.
-    pub fn outcomeWithDisposition(self: Stored, receipt: time.Timestamp, disposition: []const u8) !policy.Result {
-        const result = try self.outcome(receipt);
-        if (std.mem.eql(u8, result.disposition(), disposition)) return result;
-        const replaced = result.withEncodingReplacement();
-        if (!std.mem.eql(u8, replaced.disposition(), disposition)) return error.InvalidNativeTime;
-        return replaced;
-    }
 
     pub fn outcome(self: Stored, receipt: time.Timestamp) !policy.Result {
         if (self.zone) |zone| {

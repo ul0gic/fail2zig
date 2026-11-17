@@ -408,24 +408,6 @@ pub fn Methods(comptime Store: type) type {
             origin: effects.Origin,
         };
         pub const owner_page_rows: usize = 4096;
-        pub fn operatorOwners(self: *Store, now_us: i64, output: []OperatorOwner) Error!usize {
-            if (output.len == 0 or output.len > effects.max_owners) return error.EffectCapacity;
-            var count: usize = 0;
-            var after: ?OperatorOwner = null;
-            while (true) {
-                const remaining = output.len - count;
-                if (remaining == 0) {
-                    var probe: [1]OperatorOwner = undefined;
-                    if (try self.operatorOwnerPage(now_us, &probe, after) != 0) return error.EffectCapacity;
-                    return count;
-                }
-                const want = @min(owner_page_rows, remaining);
-                const got = try self.operatorOwnerPage(now_us, output[count..][0..want], after);
-                count += got;
-                if (got < want) return count;
-                after = output[count - 1];
-            }
-        }
         pub fn operatorOwnerPage(self: *Store, now_us: i64, output: []OperatorOwner, after: ?OperatorOwner) Error!usize {
             if (comptime build_options.diag) diag.count(.owner_full_pages, 1);
             if (output.len == 0 or output.len > owner_page_rows) return error.EffectCapacity;
@@ -1242,19 +1224,6 @@ pub fn Methods(comptime Store: type) type {
         pub fn confirmedEffectEvents(self: *Store) Error!u64 {
             const count = try self.integer("SELECT count(*) FROM confirmed_effect_events;");
             return std.math.cast(u64, count) orelse error.InvalidEffect;
-        }
-        pub fn ownerRevision(self: *Store, key: effects.Hash, jail: []const u8, owner_revision: u64) Error!?effects.Owner {
-            if (owner_revision == 0 or owner_revision > std.math.maxInt(i64)) return error.InvalidEffect;
-            var row = try self.statement(self.originSql("SELECT generation,decision_id,lease_kind,deadline_us,decided_us,", "origin", " FROM effect_owner_revisions WHERE scope_key=?1 AND jail=?2 AND revision=?3;"));
-            defer row.deinit();
-            try row.blob(1, &key);
-            try row.text(2, jail);
-            try row.int(3, @intCast(owner_revision));
-            if (!try row.row()) return null;
-            const lease = try effectLease(&row, 2, 3);
-            const decided = try row.signed(4);
-            if (lease == .finite and lease.finite <= decided) return error.InvalidEffect;
-            return .{ .jail = detection.Name.init(jail) catch return error.InvalidEffect, .generation = try effectBlob(&row, 0, 32), .decision_id = try effectBlob(&row, 1, 32), .revision = owner_revision, .lease = lease, .decided_us = decided, .origin = try storedOrigin(&row, 5) };
         }
     };
 }
