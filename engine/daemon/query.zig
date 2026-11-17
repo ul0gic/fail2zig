@@ -1007,7 +1007,7 @@ pub fn Methods(comptime Coordinator: type) type {
             try out.endArray();
         }
         const HistoryQuery = struct { coordinator: *Coordinator, generation: [32]u8, details: bool, memory: ?*CaptureMemory };
-        pub fn historyRead(ctx: ?*anyopaque, jail: ?[]const u8, after_sequence: u64, limit: u16, out: *std.ArrayList(query_v1.HistoryEvent)) anyerror!query_v1.HistoryRead {
+        pub fn historyRead(ctx: ?*anyopaque, jail: ?[]const u8, after_sequence: ?u64, limit: u16, out: *std.ArrayList(query_v1.HistoryEvent)) anyerror!query_v1.HistoryRead {
             const query: *HistoryQuery = @ptrCast(@alignCast(ctx.?));
             const self = query.coordinator;
             if (!query.details) return historyReadPlain(self, jail, after_sequence, limit, out);
@@ -1016,7 +1016,8 @@ pub fn Methods(comptime Coordinator: type) type {
             try beginConfigRead(reader, query.generation);
             errdefer reader.rollback();
             const installation = try reader.readInstallation();
-            var after = after_sequence;
+            const start = try historyStart(try reader.confirmedHistoryStartTx(), after_sequence);
+            var after = start;
             var more = false;
             if (installation) |installed| {
                 var events: [history.max_page]history.Event = undefined;
@@ -1047,7 +1048,14 @@ pub fn Methods(comptime Coordinator: type) type {
             }
             try reader.commitTransaction();
             if (!self.unchanged(query.generation)) return error.InvalidatedCursor;
-            return .{ .more = more, .resume_after = after };
+            return .{ .more = more, .started_after = start, .resume_after = after };
+        }
+        // Does:  Picks where a history read starts: after the cursor, or after the retained floor when there is no cursor.
+        // Holds: A cursor below the retained floor is InvalidatedCursor, never a read that would report a gap.
+        fn historyStart(floor_after: u64, requested: ?u64) error{InvalidatedCursor}!u64 {
+            const after = requested orelse return floor_after;
+            if (after < floor_after) return error.InvalidatedCursor;
+            return after;
         }
         fn appendHistoryMatches(memory: *CaptureMemory, reader: *durable.Store, installation: effect.Installation, events: []const history.Event, out: *std.ArrayList(query_v1.HistoryEvent)) !void {
             var lines: [history.max_page]?[]u8 = undefined;
@@ -1068,19 +1076,27 @@ pub fn Methods(comptime Coordinator: type) type {
         }
         // Why: A jail filter can skip every event, so one page scans at most 16 store pages and returns where to resume.
         const history_scan_pages = 16;
-        fn historyReadPlain(ctx: ?*anyopaque, jail: ?[]const u8, after_sequence: u64, limit: u16, out: *std.ArrayList(query_v1.HistoryEvent)) anyerror!query_v1.HistoryRead {
+        fn historyReadPlain(ctx: ?*anyopaque, jail: ?[]const u8, after_sequence: ?u64, limit: u16, out: *std.ArrayList(query_v1.HistoryEvent)) anyerror!query_v1.HistoryRead {
             const self: *Coordinator = @ptrCast(@alignCast(ctx.?));
             const reader = if (self.history_reader) |*value| value else return error.HistoryUnavailable;
-            const installation = try reader.readInstallation() orelse return .{ .more = false, .resume_after = after_sequence };
+            const installation = try reader.readInstallation() orelse {
+                const none = after_sequence orelse 0;
+                return .{ .more = false, .started_after = none, .resume_after = none };
+            };
             var events: [history.max_page]history.Event = undefined;
-            var after = after_sequence;
+            const start = try historyStart(try reader.confirmedHistoryStart(), after_sequence);
+            var after = start;
             var appended: usize = 0;
             var pages: usize = 0;
             while (appended < limit and pages < history_scan_pages) : (pages += 1) {
-                const page = try reader.confirmedEffectPage(installation, after, null, &events);
-                if (page.count == 0) return .{ .more = false, .resume_after = after };
+                const page = reader.confirmedEffectPage(installation, after, null, &events) catch |failure| {
+                    // Why: Each page is its own read, so retention can prune past this position between two of them.
+                    if (failure == error.HistoryGap and after < try reader.confirmedHistoryStart()) return error.InvalidatedCursor;
+                    return failure;
+                };
+                if (page.count == 0) return .{ .more = false, .started_after = start, .resume_after = after };
                 for (events[0..page.count]) |event| {
-                    if (appended == limit) return .{ .more = true, .resume_after = after };
+                    if (appended == limit) return .{ .more = true, .started_after = start, .resume_after = after };
                     after = event.sequence;
                     if (jail) |wanted| if (!std.mem.eql(u8, wanted, event.jail.slice())) continue;
                     try out.append(.{
@@ -1095,9 +1111,9 @@ pub fn Methods(comptime Coordinator: type) type {
                     });
                     appended += 1;
                 }
-                if (!page.more) return .{ .more = false, .resume_after = after };
+                if (!page.more) return .{ .more = false, .started_after = start, .resume_after = after };
             }
-            return .{ .more = true, .resume_after = after };
+            return .{ .more = true, .started_after = start, .resume_after = after };
         }
         pub fn firewallOrigin(ctx: ?*anyopaque, scope: inspection.CanonicalScope) ?shared.types.Origin {
             const self: *Coordinator = @ptrCast(@alignCast(ctx.?));

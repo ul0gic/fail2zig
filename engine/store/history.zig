@@ -100,6 +100,25 @@ pub fn Methods(comptime Store: type) type {
             try page.validate();
             return page;
         }
+        // Does:  Returns the sequence a read with no cursor starts after: one below the oldest retained record.
+        pub fn confirmedHistoryStartTx(self: *Store) Error!u64 {
+            if (self.schema_version < 13) return 0;
+            var row = try self.statement("SELECT retained_from FROM confirmed_history_stream WHERE id=1;");
+            defer row.deinit();
+            if (!try row.row()) return 0;
+            const floor = try row.signed(0);
+            if (floor <= 0) return error.InvalidHistoryPage;
+            return @intCast(floor - 1);
+        }
+
+        pub fn confirmedHistoryStart(self: *Store) Error!u64 {
+            try self.beginRead();
+            errdefer self.rollback();
+            const start = try self.confirmedHistoryStartTx();
+            try self.commitTransaction();
+            return start;
+        }
+
         pub fn confirmedEffectPage(self: *Store, installation: effects.Installation, after_sequence: u64, expected_revision: ?u64, output: []effect_history.Event) Error!effect_history.Page {
             try self.beginRead();
             errdefer self.rollback();

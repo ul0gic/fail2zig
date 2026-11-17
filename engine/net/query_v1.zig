@@ -265,11 +265,12 @@ pub const HistoryEvent = struct {
     match: ?[]const u8 = null,
 };
 
-pub const HistoryRead = struct { more: bool, resume_after: u64 };
+pub const HistoryRead = struct { more: bool, started_after: u64, resume_after: u64 };
 
 pub const HistorySource = struct {
     ctx: ?*anyopaque,
-    read: *const fn (ctx: ?*anyopaque, jail: ?[]const u8, after_sequence: u64, limit: u16, out: *std.ArrayList(HistoryEvent)) anyerror!HistoryRead,
+    // Does:  A null after_sequence means no cursor: the source starts at its oldest retained record.
+    read: *const fn (ctx: ?*anyopaque, jail: ?[]const u8, after_sequence: ?u64, limit: u16, out: *std.ArrayList(HistoryEvent)) anyerror!HistoryRead,
 };
 
 pub const FirewallUnavailableReason = enum { no_manager, memory_budget, allocation_failed, not_observed, clock_unavailable };
@@ -1084,7 +1085,7 @@ fn writeFirewallItem(out: anytype, entry: inspection.Entry, metadata: firewall_o
 
 fn renderHistory(arena: std.mem.Allocator, writer: anytype, source: ?HistorySource, jail_filter: ?[]const u8, cursor_text: ?[]const u8, limit: u16, details: bool, generation_hex: []const u8) RenderError!void {
     const history = source orelse return error.SourceUnavailable;
-    var after_sequence: u64 = 0;
+    var after_sequence: ?u64 = null;
     if (cursor_text) |text| {
         const cursor = try Cursor.decode(text);
         if (cursor != .history) return error.BadCursor;
@@ -1099,7 +1100,7 @@ fn renderHistory(arena: std.mem.Allocator, writer: anytype, source: ?HistorySour
         else => error.SourceFailed,
     };
     // Why: A source that reports more without advancing would hand out a cursor that returns the same page forever.
-    if (scanned.more and scanned.resume_after <= after_sequence) return error.SourceFailed;
+    if (scanned.more and scanned.resume_after <= scanned.started_after) return error.SourceFailed;
     const items = events.items[0..@min(events.items.len, limit)];
 
     var out = std.json.writeStream(writer, .{});
