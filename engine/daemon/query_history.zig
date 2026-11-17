@@ -128,15 +128,22 @@ pub fn Methods(comptime Coordinator: type) type {
                 return .{ .more = false, .started_after = none, .resume_after = none };
             };
             var events: [history.max_page]history.Event = undefined;
-            const start = try historyStart(try reader.confirmedHistoryStart(), after_sequence);
+            var start = try historyStart(try reader.confirmedHistoryStart(), after_sequence);
             var after = start;
             var appended: usize = 0;
             var pages: usize = 0;
             while (appended < limit and pages < history_scan_pages) : (pages += 1) {
                 const page = reader.confirmedEffectPage(installation, after, null, &events) catch |failure| {
+                    if (failure != error.HistoryGap) return failure;
                     // Why: Each page is its own read, so retention can prune past this position between two of them.
-                    if (failure == error.HistoryGap and after < try reader.confirmedHistoryStart()) return error.InvalidatedCursor;
-                    return failure;
+                    const floor = try reader.confirmedHistoryStart();
+                    if (after >= floor) return failure;
+                    if (after_sequence != null) return error.InvalidatedCursor;
+                    // Why: A read with no cursor has nothing to expire: it resumes at the new floor, or ends the page with what it has.
+                    if (appended != 0) return .{ .more = true, .started_after = start, .resume_after = after };
+                    start = floor;
+                    after = floor;
+                    continue;
                 };
                 if (page.count == 0) return .{ .more = false, .started_after = start, .resume_after = after };
                 for (events[0..page.count]) |event| {

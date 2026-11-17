@@ -193,7 +193,8 @@ to 64. A response with more rows carries `next_cursor`; pass it back with
 - A `firewall show` cursor lives 60 seconds, must be used with the same
   `--limit`, and is void once the retained observation changes.
 - A `history` cursor has no timer. It is void once the configuration generation
-  or the set of owners changes.
+  or the set of owners changes, or once `history_retention` has removed the
+  record it points at.
 - A void cursor returns code 409, `cursor expired or observation changed; restart
   pagination without a cursor`. Start again without `--cursor`.
 
