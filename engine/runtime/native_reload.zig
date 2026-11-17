@@ -6,8 +6,8 @@
 const std = @import("std");
 const config = @import("../config/native.zig");
 const retry_config = @import("../config/native_retry_policy.zig");
-const retry = @import("../core/native_retry.zig");
-const ignore_set = @import("../core/native_ignore_set.zig");
+const retry = @import("../detect/retry.zig");
+const ignore_set = @import("../detect/ignore_set.zig");
 const banip = @import("../config/native_banip.zig");
 const shared = @import("shared");
 

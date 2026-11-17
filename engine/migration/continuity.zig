@@ -6,7 +6,7 @@
 const std = @import("std");
 const plan_mod = @import("plan.zig");
 const db = @import("fail2ban_db.zig");
-const file_source = @import("../core/durable_file_source.zig");
+const file_source = @import("../source/durable_file_source.zig");
 
 pub const first_line_max_bytes: usize = 64 * 1024;
 pub const prefix_max_bytes: u8 = 64;

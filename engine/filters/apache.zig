@@ -4,7 +4,7 @@
 // Holds: Every error-log pattern reads the address right after `[client ` and needs a `:` after it; the path patterns match only 404s.
 
 const types = @import("types.zig");
-const parser = @import("../core/parser.zig");
+const parser = @import("../detect/parser.zig");
 const access = @import("access.zig");
 
 pub const PatternDef = types.PatternDef;

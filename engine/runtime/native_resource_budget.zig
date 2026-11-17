@@ -4,19 +4,19 @@
 // Holds: The ledger's byte limit is the charged total admission approved; reserve refuses a charge past it before changing any counter.
 
 const std = @import("std");
-const store = @import("../core/record_store.zig");
-const file = @import("../core/durable_file_source.zig");
-const file_session = @import("../core/native_file_session.zig");
-const journal = @import("../core/native_journal_transport.zig");
-const journal_session = @import("../core/native_journal_session.zig");
-const repair = @import("../core/source_repair.zig");
-const consumer = @import("../core/native_consumer.zig");
+const store = @import("../source/record_store.zig");
+const file = @import("../source/durable_file_source.zig");
+const file_session = @import("../source/file_session.zig");
+const journal = @import("../source/journal_transport.zig");
+const journal_session = @import("../source/journal_session.zig");
+const repair = @import("../source/source_repair.zig");
+const consumer = @import("../detect/consumer.zig");
 const runtime = @import("native_consumer_runtime.zig");
-const effect = @import("../core/native_effect.zig");
-const retry = @import("../core/native_retry.zig");
+const effect = @import("../effect/effect.zig");
+const retry = @import("../detect/retry.zig");
 const effect_runtime = @import("native_effect_runtime.zig");
 const inspection = @import("../firewall/inspection.zig");
-const timezone = @import("../core/native_timezone.zig");
+const timezone = @import("../time/timezone.zig");
 const ipc = @import("../net/ipc.zig");
 const http = @import("../net/http.zig");
 const shared = @import("shared");
@@ -192,7 +192,7 @@ pub fn finishWithOptional(base: Plan, optional: Cost, limits: Limits, fd: FdCont
 
 pub const FileOptions = struct { source_capacity: usize, spec_count: usize, max_record_bytes: usize, max_decoded_bytes: usize };
 pub fn fileCost(options: FileOptions) !Component {
-    if (options.source_capacity == 0 or options.source_capacity > store.Limits.pending_receipts or options.spec_count == 0 or options.spec_count > options.source_capacity or options.max_record_bytes == 0 or options.max_record_bytes > @import("../core/source_text.zig").max_record_bytes or options.max_decoded_bytes == 0 or options.max_decoded_bytes > @import("../core/source_text.zig").max_record_bytes) return error.InvalidResourceLimit;
+    if (options.source_capacity == 0 or options.source_capacity > store.Limits.pending_receipts or options.spec_count == 0 or options.spec_count > options.source_capacity or options.max_record_bytes == 0 or options.max_record_bytes > @import("../source/source_text.zig").max_record_bytes or options.max_decoded_bytes == 0 or options.max_decoded_bytes > @import("../source/source_text.zig").max_record_bytes) return error.InvalidResourceLimit;
     const Retained = std.meta.Child(@TypeOf(@as(file_session.Session, undefined).retained.items));
     const Spec = std.meta.Child(@TypeOf(@as(file.FileSet, undefined).specs.items));
     const pending_bytes = 64 + store.Limits.source_bytes * 2 + store.Limits.cursor_bytes;
@@ -253,7 +253,7 @@ pub fn publicationCost(subjects: usize, coordinator_capacity: usize) Error!Cost 
 }
 pub fn controlCost(metrics: bool, response_capacity: usize) Error!Component {
     if (response_capacity == 0 or response_capacity > 2 * shared.protocol.max_payload_size) return error.InvalidResourceLimit;
-    const EventLoop = @import("../core/event_loop.zig").EventLoop;
+    const EventLoop = @import("../platform/event_loop.zig").EventLoop;
     const Map = @TypeOf(@as(EventLoop, undefined).registrations);
     const registrations = ipc.max_clients + (if (metrics) http.max_clients else @as(usize, 0)) + 8;
     const loop_bytes = @sizeOf(EventLoop) + (4 * registrations + 16) * (@sizeOf(Map.KV) + 2);

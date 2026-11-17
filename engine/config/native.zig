@@ -9,7 +9,7 @@ const native_duration = @import("native_duration.zig");
 const filter_registry = @import("../filters/registry.zig");
 const native_banip = @import("native_banip.zig");
 pub const max_config_bytes: usize = 16 * 1024 * 1024;
-pub const max_supported_retry = @import("../core/state.zig").max_attempts_per_ip;
+pub const max_supported_retry = @import("../detect/state.zig").max_attempts_per_ip;
 pub const max_ban_duration: u64 = std.math.maxInt(u64) / 1000;
 
 pub const Error = error{
@@ -148,7 +148,7 @@ pub const JailConfig = struct {
     timestamp: ?enum { iso8601, syslog, epoch_seconds, common_log, undated } = null,
     timezone_offset_minutes: ?i16 = null,
     timezone: ?[]const u8 = null,
-    timezone_ambiguity: ?@import("../core/native_timezone.zig").Ambiguity = null,
+    timezone_ambiguity: ?@import("../time/timezone.zig").Ambiguity = null,
     journal_executables: []const []const u8 = &.{},
     journal_executables_explicit: bool = false,
     rule_files: []const []const u8 = &.{},
@@ -749,7 +749,7 @@ pub fn validateDiag(cfg: *const Config, out: *ValidationDiagnostic) ValidationEr
             return validationFailure(out, .jail, .compatibility_manifest, .admitted_compatibility, j.name, error.CompatibilityNotAdmitted);
         if (j.enabled and cfg.global.compatibility_pending)
             return validationFailure(out, .global, .compatibility_manifest, .admitted_compatibility, null, error.CompatibilityNotAdmitted);
-        if (j.enabled and j.rule_files.len != 0) _ = @import("../core/native_detection_record.zig").Name.init(j.filter) catch
+        if (j.enabled and j.rule_files.len != 0) _ = @import("../detect/detection_record.zig").Name.init(j.filter) catch
             return validationFailure(out, .jail, .filter, .valid_rule_filter, j.name, error.InvalidNativeRules);
         if (j.enabled and j.rule_files.len == 0 and filter_registry.matcherForFilter(j.filter) == null) {
             return validationFailure(out, .jail, .filter, .builtin_filter, j.name, error.UnknownFilter);
@@ -1494,10 +1494,10 @@ const Parser = struct {
             j.timezone_offset_minutes = @intCast(n);
         } else if (std.mem.eql(u8, key, "timezone")) {
             const identifier = try asString(v);
-            @import("../core/native_timezone.zig").validateIdentifier(identifier) catch return error.InvalidValue;
+            @import("../time/timezone.zig").validateIdentifier(identifier) catch return error.InvalidValue;
             j.timezone = identifier;
         } else if (std.mem.eql(u8, key, "timezone_ambiguity")) {
-            j.timezone_ambiguity = std.meta.stringToEnum(@import("../core/native_timezone.zig").Ambiguity, try asString(v)) orelse return error.InvalidValue;
+            j.timezone_ambiguity = std.meta.stringToEnum(@import("../time/timezone.zig").Ambiguity, try asString(v)) orelse return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "journal_executables")) {
             j.journal_executables = try asStringArray(v);
             j.journal_executables_explicit = true;

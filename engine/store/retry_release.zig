@@ -4,7 +4,7 @@
 // Holds: A release resets exactly one retry_states row inside its own write transaction and refuses below schema version 16.
 
 const canonical_scope = @import("../firewall/scope.zig");
-const detection = @import("../core/native_detection_record.zig");
+const detection = @import("../detect/detection_record.zig");
 const store = @import("store.zig");
 const Error = store.Error;
 

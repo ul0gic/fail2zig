@@ -4,15 +4,15 @@
 // Holds: Consumer state reaches memory only after the store accepts it: each stage is committed or validated first, published second.
 
 const std = @import("std");
-const durable = @import("../core/record_store.zig");
-const state = @import("../core/native_consumer.zig");
-const bridge = @import("../core/native_consumer_coordinator.zig");
-const rule = @import("../core/native_rule_consumer.zig");
-const rules = @import("../core/native_rules.zig");
-const dns = @import("../core/native_dns.zig");
-const ignore = @import("../core/native_ignore.zig");
-const detection = @import("../core/native_detection_record.zig");
-const files = @import("../core/native_file_session.zig");
+const durable = @import("../source/record_store.zig");
+const state = @import("../detect/consumer.zig");
+const bridge = @import("../detect/consumer_coordinator.zig");
+const rule = @import("../detect/rule_consumer.zig");
+const rules = @import("../detect/rules.zig");
+const dns = @import("../detect/dns.zig");
+const ignore = @import("../detect/ignore.zig");
+const detection = @import("../detect/detection_record.zig");
+const files = @import("../source/file_session.zig");
 pub const Clock = struct {
     context: ?*anyopaque,
     read_us: *const fn (?*anyopaque) anyerror!i64,

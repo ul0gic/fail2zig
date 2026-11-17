@@ -5,10 +5,10 @@
 
 const shared = @import("shared");
 const store = @import("store.zig");
-const effects = @import("../core/native_effect.zig");
-const consumer = @import("../core/native_consumer.zig");
-const retry = @import("../core/native_retry.zig");
-const ignore = @import("../core/native_ignore.zig");
+const effects = @import("../effect/effect.zig");
+const consumer = @import("../detect/consumer.zig");
+const retry = @import("../detect/retry.zig");
+const ignore = @import("../detect/ignore.zig");
 const Error = store.Error;
 
 pub const Class = enum { intake, obligation, reclamation };

@@ -4,18 +4,18 @@
 // Holds: Nothing is rebound until a stored ignore payload regenerates the saved retry generation; without one it fails as unproven.
 
 const std = @import("std");
-const durable = @import("../core/record_store.zig");
+const durable = @import("../source/record_store.zig");
 const plan = @import("../config/native_consumer_plan.zig");
-const consumers = @import("../core/native_consumer.zig");
-const bridge = @import("../core/native_consumer_coordinator.zig");
-const rule = @import("../core/native_rule_consumer.zig");
-const ignore = @import("../core/native_ignore.zig");
-const retry = @import("../core/native_retry.zig");
-const files = @import("../core/durable_file_source.zig");
-const file_session = @import("../core/native_file_session.zig");
-const journal_session = @import("../core/native_journal_session.zig");
+const consumers = @import("../detect/consumer.zig");
+const bridge = @import("../detect/consumer_coordinator.zig");
+const rule = @import("../detect/rule_consumer.zig");
+const ignore = @import("../detect/ignore.zig");
+const retry = @import("../detect/retry.zig");
+const files = @import("../source/durable_file_source.zig");
+const file_session = @import("../source/file_session.zig");
+const journal_session = @import("../source/journal_session.zig");
 const reload = @import("native_reload.zig");
-const detection = @import("../core/native_detection_record.zig");
+const detection = @import("../detect/detection_record.zig");
 const Hash = std.crypto.hash.sha2.Sha256;
 
 pub fn digest(bytes: []const u8) [32]u8 {

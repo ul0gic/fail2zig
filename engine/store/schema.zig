@@ -9,10 +9,10 @@ const Error = store.Error;
 const Limits = store.Limits;
 const ReceiptIdentity = store.ReceiptIdentity;
 const latest_schema = store.latest_schema;
-const retry = @import("../core/native_retry.zig");
-const effects = @import("../core/native_effect.zig");
-const action_outcome = @import("../core/native_action_outcome.zig");
-const sd_notify = @import("../core/sd_notify.zig");
+const retry = @import("../detect/retry.zig");
+const effects = @import("../effect/effect.zig");
+const action_outcome = @import("../effect/action_outcome.zig");
+const sd_notify = @import("../platform/sd_notify.zig");
 const current_schema = @import("current_schema.zig");
 
 pub fn Methods(comptime Store: type) type {

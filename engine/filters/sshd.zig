@@ -6,7 +6,7 @@
 const std = @import("std");
 const shared = @import("shared");
 const types = @import("types.zig");
-const parser = @import("../core/parser.zig");
+const parser = @import("../detect/parser.zig");
 
 pub const PatternDef = types.PatternDef;
 

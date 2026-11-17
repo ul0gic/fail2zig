@@ -5,8 +5,8 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const diag_mod = @import("../core/diag.zig");
-const files = @import("../core/durable_file_source.zig");
+const diag_mod = @import("../diag/diag.zig");
+const files = @import("../source/durable_file_source.zig");
 const store = @import("store.zig");
 const Error = store.Error;
 const Stmt = store.Stmt;

@@ -5,8 +5,8 @@
 
 const std = @import("std");
 const shared = @import("shared");
-const native_time = @import("../core/native_time.zig");
-const parser = @import("../core/parser.zig");
+const native_time = @import("../time/time.zig");
+const parser = @import("../detect/parser.zig");
 const types = @import("types.zig");
 
 pub const PatternDef = types.PatternDef;

@@ -5,13 +5,13 @@
 
 const std = @import("std");
 const config = @import("native.zig");
-const builtin = @import("../core/native_builtin_detector.zig");
-const journal = @import("../core/native_journal_detector.zig");
-const origin = @import("../core/native_journal_origin.zig");
-const session = @import("../core/native_journal_session.zig");
-const processing = @import("../core/native_source_processor.zig");
-const transport = @import("../core/native_journal_transport.zig");
-const ignore_set = @import("../core/native_ignore_set.zig");
+const builtin = @import("../detect/builtin_detector.zig");
+const journal = @import("../detect/journal_detector.zig");
+const origin = @import("../source/journal_origin.zig");
+const session = @import("../source/journal_session.zig");
+const processing = @import("../source/source_processor.zig");
+const transport = @import("../source/journal_transport.zig");
+const ignore_set = @import("../detect/ignore_set.zig");
 pub const Settings = struct {
     machine_id: []const u8,
     executables: []const []const u8,

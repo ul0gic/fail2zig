@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const store = @import("store.zig");
-const effects = @import("../core/native_effect.zig");
+const effects = @import("../effect/effect.zig");
 const Error = store.Error;
 const observation_limit: usize = @intCast(store.load_repair.observations_per_intent);
 

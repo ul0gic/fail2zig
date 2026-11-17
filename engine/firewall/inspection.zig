@@ -6,7 +6,7 @@
 const std = @import("std");
 const shared = @import("shared");
 const build_options = @import("build_options");
-const diag_mod = @import("../core/diag.zig");
+const diag_mod = @import("../diag/diag.zig");
 const nl = @import("netlink.zig");
 pub const nft = @import("nftables.zig");
 const command = @import("command.zig");

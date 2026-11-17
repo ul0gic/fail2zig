@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const config = @import("fail2ban.zig");
-const policy = @import("../core/source_policy.zig");
+const policy = @import("../source/source_policy.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Parameter = struct { name: []const u8, value: []const u8 };
@@ -14,7 +14,7 @@ pub const Path = struct {
     pattern: []const u8,
     start_spelling: []const u8,
     explicit_start: bool,
-    start: ?@import("../core/durable_file_source.zig").Start,
+    start: ?@import("../source/durable_file_source.zig").Start,
 };
 pub const FilterDefaults = struct {
     values: ?*const std.StringArrayHashMapUnmanaged([]const u8) = null,
@@ -252,7 +252,7 @@ pub fn prepare(allocator: Allocator, source_ini: *const config.ParsedIni, jail_n
             const split = std.mem.lastIndexOfScalar(u8, line, ' ');
             const pattern = if (split) |index| line[0..index] else line;
             const spelling = if (split) |index| line[index + 1 ..] else "head";
-            const start: ?@import("../core/durable_file_source.zig").Start = if (std.ascii.eqlIgnoreCase(spelling, "head")) .head else if (std.ascii.eqlIgnoreCase(spelling, "tail")) .tail else null;
+            const start: ?@import("../source/durable_file_source.zig").Start = if (std.ascii.eqlIgnoreCase(spelling, "head")) .head else if (std.ascii.eqlIgnoreCase(spelling, "tail")) .tail else null;
             try paths.append(.{ .raw = line, .pattern = pattern, .start_spelling = spelling, .explicit_start = split != null, .start = start });
         }
     }

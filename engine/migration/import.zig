@@ -7,7 +7,7 @@ const std = @import("std");
 const db = @import("fail2ban_db.zig");
 const plan = @import("plan.zig");
 const scope = @import("../firewall/scope.zig");
-const lease = @import("../core/native_lease.zig");
+const lease = @import("../effect/lease.zig");
 
 pub const Error = db.Error || error{ PlanInvalid, TimeOverflow };
 
@@ -80,8 +80,8 @@ pub const Staging = struct {
     }
 };
 
-pub const StagedOwnerRow = @import("../core/record_store.zig").Store.StagedOwnerRow;
-pub const StagedHistoryRow = @import("../core/record_store.zig").Store.StagedHistoryRow;
+pub const StagedOwnerRow = @import("../source/record_store.zig").Store.StagedOwnerRow;
+pub const StagedHistoryRow = @import("../source/record_store.zig").Store.StagedHistoryRow;
 
 pub fn ownerRows(allocator: std.mem.Allocator, staging: *const Staging) error{OutOfMemory}![]StagedOwnerRow {
     const rows = try allocator.alloc(StagedOwnerRow, staging.owners.len);

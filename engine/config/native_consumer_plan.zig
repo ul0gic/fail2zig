@@ -5,11 +5,11 @@
 
 const std = @import("std");
 const native = @import("native.zig");
-const rules = @import("../core/native_rules.zig");
-const ignore = @import("../core/native_ignore.zig");
-const bridge = @import("../core/native_consumer_coordinator.zig");
-const detection = @import("../core/native_detection_record.zig");
-const consumer = @import("../core/native_consumer.zig");
+const rules = @import("../detect/rules.zig");
+const ignore = @import("../detect/ignore.zig");
+const bridge = @import("../detect/consumer_coordinator.zig");
+const detection = @import("../detect/detection_record.zig");
+const consumer = @import("../detect/consumer.zig");
 
 pub const version: u16 = 3;
 pub const max_rule_bytes = 4096;

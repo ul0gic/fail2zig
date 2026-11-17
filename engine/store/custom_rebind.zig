@@ -5,13 +5,13 @@
 
 const std = @import("std");
 const store = @import("store.zig");
-const consumers = @import("../core/native_consumer.zig");
-const detection = @import("../core/native_detection_record.zig");
-const effects = @import("../core/native_effect.zig");
-const retry = @import("../core/native_retry.zig");
-const files = @import("../core/durable_file_source.zig");
-const journal = @import("../core/native_journal_session.zig");
-const processor = @import("../core/native_source_processor.zig");
+const consumers = @import("../detect/consumer.zig");
+const detection = @import("../detect/detection_record.zig");
+const effects = @import("../effect/effect.zig");
+const retry = @import("../detect/retry.zig");
+const files = @import("../source/durable_file_source.zig");
+const journal = @import("../source/journal_session.zig");
+const processor = @import("../source/source_processor.zig");
 const Error = store.Error;
 
 fn hash(bytes: []const u8) [32]u8 {

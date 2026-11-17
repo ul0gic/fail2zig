@@ -6,9 +6,9 @@
 const std = @import("std");
 const shared = @import("shared");
 const build_options = @import("build_options");
-const diag_mod = @import("../core/diag.zig");
-const durable = @import("../core/record_store.zig");
-const effect = @import("../core/native_effect.zig");
+const diag_mod = @import("../diag/diag.zig");
+const durable = @import("../source/record_store.zig");
+const effect = @import("../effect/effect.zig");
 const firewall = @import("../firewall/inspection.zig");
 pub const observation = @import("native_firewall_observation.zig");
 

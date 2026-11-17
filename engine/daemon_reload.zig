@@ -6,16 +6,16 @@
 const std = @import("std");
 const shared = @import("shared");
 const config = @import("config/native.zig");
-const retry = @import("core/native_retry.zig");
+const retry = @import("detect/retry.zig");
 const resource = @import("runtime/native_resource_budget.zig");
-const durable = @import("core/record_store.zig");
-const ignore_set = @import("core/native_ignore_set.zig");
+const durable = @import("source/record_store.zig");
+const ignore_set = @import("detect/ignore_set.zig");
 const native_banip = @import("config/native_banip.zig");
 const build_options = @import("build_options");
-const diag_mod = @import("core/diag.zig");
+const diag_mod = @import("diag/diag.zig");
 const reload_mod = @import("runtime/native_reload.zig");
-const log_level = @import("core/log_level.zig");
-const audit = @import("core/audit.zig");
+const log_level = @import("platform/log_level.zig");
+const audit = @import("platform/audit.zig");
 const daemon = @import("native_daemon.zig");
 const max_jails = daemon.max_jails;
 
@@ -193,7 +193,7 @@ pub fn Methods(comptime Coordinator: type) type {
                 const rebinding: ?durable.Store.CursorRebinding = switch (jail.plan) {
                     .file => |*plan| blk: {
                         const processing = plan.sessionOptions().processing;
-                        break :blk .{ .old = @import("core/durable_file_source.zig").FileSource.framingBinding(processing.encoding, current_generation, processing.max_record_bytes), .new = @import("core/durable_file_source.zig").FileSource.framingBinding(processing.encoding, next_generation, processing.max_record_bytes) };
+                        break :blk .{ .old = @import("source/durable_file_source.zig").FileSource.framingBinding(processing.encoding, current_generation, processing.max_record_bytes), .new = @import("source/durable_file_source.zig").FileSource.framingBinding(processing.encoding, next_generation, processing.max_record_bytes) };
                     },
                     else => null,
                 };

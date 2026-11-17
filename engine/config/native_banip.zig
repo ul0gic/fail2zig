@@ -5,7 +5,7 @@
 
 const shared = @import("shared");
 const native = @import("native.zig");
-const ban_origin = @import("../core/ban_origin.zig");
+const ban_origin = @import("../effect/ban_origin.zig");
 
 const IgnoreEntry = shared.types.IgnoreEntry;
 const TimedEntry = shared.types.TimedEntry;

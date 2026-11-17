@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const config = @import("native.zig");
-const retry = @import("../core/native_retry.zig");
+const retry = @import("../detect/retry.zig");
 
 pub fn fromJail(jail: *const config.JailConfig, defaults: config.JailDefaults, max_subjects: u32) !retry.Policy {
     const effective = config.resolveJailFromConfig(jail, defaults);

@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const shared = @import("shared");
-const clock_mod = @import("../core/clock.zig");
+const clock_mod = @import("../time/clock.zig");
 
 const Request = struct {
     op: enum { show, rate, advance },

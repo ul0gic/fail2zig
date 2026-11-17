@@ -5,12 +5,12 @@
 
 const std = @import("std");
 const config = @import("native.zig");
-const processing = @import("../core/native_source_processor.zig");
-const detector = @import("../core/native_builtin_detector.zig");
-const session = @import("../core/native_file_session.zig");
-const files = @import("../core/durable_file_source.zig");
-const durable = @import("../core/record_store.zig");
-const ignore_set = @import("../core/native_ignore_set.zig");
+const processing = @import("../source/source_processor.zig");
+const detector = @import("../detect/builtin_detector.zig");
+const session = @import("../source/file_session.zig");
+const files = @import("../source/durable_file_source.zig");
+const durable = @import("../source/record_store.zig");
+const ignore_set = @import("../detect/ignore_set.zig");
 
 pub const Settings = struct {
     timestamp: processing.TimestampSource,
@@ -20,8 +20,8 @@ pub const Settings = struct {
 
     ignore_capacity: usize,
     custom: bool = false,
-    encoding: @import("../core/source_text.zig").Encoding = .utf8,
-    bom: @import("../core/source_text.zig").Bom = .preserve,
+    encoding: @import("../source/source_text.zig").Encoding = .utf8,
+    bom: @import("../source/source_text.zig").Bom = .preserve,
     max_record_bytes: u32 = 2048,
     max_decoded_bytes: u32 = 2048,
 };

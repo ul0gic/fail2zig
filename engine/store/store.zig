@@ -5,18 +5,18 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const diag_mod = @import("../core/diag.zig");
-const native_time = @import("../core/native_time.zig");
-const time_policy = @import("../core/source_time_policy.zig");
-const native_record = @import("../core/native_time_record.zig");
-const detection = @import("../core/native_detection_record.zig");
-const retry = @import("../core/native_retry.zig");
-const action_context = @import("../core/native_action_context.zig");
-const consumers = @import("../core/native_consumer.zig");
-const effects = @import("../core/native_effect.zig");
-const effect_history = @import("../core/native_effect_history.zig");
-const application_history = @import("../core/native_application_history.zig");
-const action_outcome = @import("../core/native_action_outcome.zig");
+const diag_mod = @import("../diag/diag.zig");
+const native_time = @import("../time/time.zig");
+const time_policy = @import("../source/source_time_policy.zig");
+const native_record = @import("../time/time_record.zig");
+const detection = @import("../detect/detection_record.zig");
+const retry = @import("../detect/retry.zig");
+const action_context = @import("../effect/action_context.zig");
+const consumers = @import("../detect/consumer.zig");
+const effects = @import("../effect/effect.zig");
+const effect_history = @import("../effect/effect_history.zig");
+const application_history = @import("../effect/application_history.zig");
+const action_outcome = @import("../effect/action_outcome.zig");
 const budget = @import("budget.zig");
 pub const latest_schema: i64 = 29;
 pub const load_repair_schema: i64 = 24;
@@ -24,7 +24,7 @@ pub const load_repair = @import("load_repair_migration.zig");
 pub const SchemaReadyOptions = struct {
     maximum_pending: usize,
     migration: load_repair.Options,
-    progress: ?@import("../core/sd_notify.zig").Hook = null,
+    progress: ?@import("../platform/sd_notify.zig").Hook = null,
 };
 pub const max_native_detections = 16;
 const Db = opaque {};
@@ -293,7 +293,7 @@ pub const Store = struct {
     prune_batch: u8 = attribution_batch,
     prune_after: ?effects.Hash = null,
     retry_detail_rest: u8 = 0,
-    maintenance_operation: ?@import("../core/storage_health.zig").MaintenanceOperation = null,
+    maintenance_operation: ?@import("../platform/storage_health.zig").MaintenanceOperation = null,
     history_overload_notice_us: ?i64 = null,
     escalation_jitter_context: ?*anyopaque = null,
     escalation_jitter: *const fn (?*anyopaque, u64) u64 = systemEscalationJitter,

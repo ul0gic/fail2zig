@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const shared = @import("shared");
-const parser = @import("../core/parser.zig");
+const parser = @import("../detect/parser.zig");
 
 const Quoted = struct { text: []const u8, end: usize };
 

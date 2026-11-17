@@ -10,21 +10,21 @@ const shared = @import("shared");
 const build_options = @import("build_options");
 const cli = @import("cli");
 
-const log_level = @import("core/log_level.zig");
+const log_level = @import("platform/log_level.zig");
 pub const std_options: std.Options = .{ .log_level = .debug, .logFn = configuredLog };
-pub const panic = if (build_options.diag) std.debug.FullPanic(@import("core/diag_events.zig").panic) else std.debug.FullPanic(std.debug.defaultPanic);
+pub const panic = if (build_options.diag) std.debug.FullPanic(@import("diag/diag_events.zig").panic) else std.debug.FullPanic(std.debug.defaultPanic);
 
 fn configuredLog(comptime level: std.log.Level, comptime scope: @Type(.enum_literal), comptime format: []const u8, args: anytype) void {
     if (!log_level.enabled(level)) return;
-    @import("core/log_target.zig").logFn(level, scope, format, args);
+    @import("platform/log_target.zig").logFn(level, scope, format, args);
 }
 
-pub const event_loop_mod = @import("core/event_loop.zig");
-pub const journald_source_mod = @import("core/journald_source.zig");
-pub const native_store_mod = @import("core/record_store.zig");
+pub const event_loop_mod = @import("platform/event_loop.zig");
+pub const journald_source_mod = @import("source/journald_source.zig");
+pub const native_store_mod = @import("source/record_store.zig");
 pub const firewall_scope_mod = @import("firewall/scope.zig");
-pub const native_action_outcome_mod = @import("core/native_action_outcome.zig");
-pub const native_effect_mod = @import("core/native_effect.zig");
+pub const native_action_outcome_mod = @import("effect/action_outcome.zig");
+pub const native_effect_mod = @import("effect/effect.zig");
 pub const firewall = @import("firewall/backend.zig");
 pub const config_mod = @import("config/native.zig");
 pub const migration_mod = @import("config/migration.zig");
@@ -389,7 +389,7 @@ fn failClosed(err: anytype, comptime fmt: []const u8, args: anytype) @TypeOf(err
 fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config, config_path: []const u8) !void {
     const level = std.meta.stringToEnum(std.log.Level, @tagName(cfg.global.log_level)) orelse .info;
     log_level.set(level);
-    const log_target = @import("core/log_target.zig");
+    const log_target = @import("platform/log_target.zig");
     var sink: ?log_target.Sink = null;
     defer if (sink) |*value| {
         log_target.install(null);

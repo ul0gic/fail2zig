@@ -8,7 +8,7 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const linux = std.os.linux;
 
-const event_loop_mod = @import("../core/event_loop.zig");
+const event_loop_mod = @import("../platform/event_loop.zig");
 const EventLoop = event_loop_mod.EventLoop;
 
 pub const max_clients: usize = 16;

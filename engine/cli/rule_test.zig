@@ -9,15 +9,15 @@ const cli = @import("cli");
 const posix = std.posix;
 
 const registry = @import("../filters/registry.zig");
-const builtin_detector = @import("../core/native_builtin_detector.zig");
-const rules = @import("../core/native_rules.zig");
-const text = @import("../core/source_text.zig");
-const time = @import("../core/native_time.zig");
-const policy = @import("../core/source_time_policy.zig");
-const inference = @import("../core/year_inference.zig");
-const timezone = @import("../core/native_timezone.zig");
-const journal = @import("../core/native_journal_transport.zig");
-const dns = @import("../core/native_dns.zig");
+const builtin_detector = @import("../detect/builtin_detector.zig");
+const rules = @import("../detect/rules.zig");
+const text = @import("../source/source_text.zig");
+const time = @import("../time/time.zig");
+const policy = @import("../source/source_time_policy.zig");
+const inference = @import("../time/year_inference.zig");
+const timezone = @import("../time/timezone.zig");
+const journal = @import("../source/journal_transport.zig");
+const dns = @import("../detect/dns.zig");
 const config_mod = @import("../config/native.zig");
 
 pub const ExitClass = shared.ExitClass;

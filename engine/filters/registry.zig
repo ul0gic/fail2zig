@@ -3,7 +3,7 @@
 // Does:  Maps built-in filter names to their pattern lists and to whether their matcher needs the whole record.
 // Holds: Every name is unique, lowercase and free of `_`, so a lookup that reads `_` as `-` resolves to at most one entry.
 
-const parser = @import("../core/parser.zig");
+const parser = @import("../detect/parser.zig");
 const types = @import("types.zig");
 const sshd = @import("sshd.zig");
 const nginx = @import("nginx.zig");

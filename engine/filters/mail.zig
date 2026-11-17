@@ -4,7 +4,7 @@
 // Holds: In every pattern the address must start right after a fixed literal such as `[`, `rip=` or `relay=`; it is never searched for.
 
 const types = @import("types.zig");
-const parser = @import("../core/parser.zig");
+const parser = @import("../detect/parser.zig");
 
 pub const PatternDef = types.PatternDef;
 

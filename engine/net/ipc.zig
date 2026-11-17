@@ -10,7 +10,7 @@ const linux = std.os.linux;
 
 const shared = @import("shared");
 const protocol = shared.protocol;
-const event_loop_mod = @import("../core/event_loop.zig");
+const event_loop_mod = @import("../platform/event_loop.zig");
 pub const auth = @import("ipc_auth.zig");
 
 const EventLoop = event_loop_mod.EventLoop;

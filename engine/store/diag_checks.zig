@@ -4,11 +4,11 @@
 // Holds: A check runs only with no transaction open and on the current schema; a query that fails counts as skipped, never a mismatch.
 
 const std = @import("std");
-const diag_mod = @import("../core/diag.zig");
-const effects = @import("../core/native_effect.zig");
-const retry = @import("../core/native_retry.zig");
-const action_outcome = @import("../core/native_action_outcome.zig");
-const application_history = @import("../core/native_application_history.zig");
+const diag_mod = @import("../diag/diag.zig");
+const effects = @import("../effect/effect.zig");
+const retry = @import("../detect/retry.zig");
+const action_outcome = @import("../effect/action_outcome.zig");
+const application_history = @import("../effect/application_history.zig");
 const store = @import("store.zig");
 
 const StatementPtr = @FieldType(store.Stmt, "ptr");

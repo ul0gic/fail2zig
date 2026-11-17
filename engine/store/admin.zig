@@ -4,9 +4,9 @@
 // Holds: Each non-rejected admin request, reload or policy transition raises the mutation revision by one in the transaction recording it.
 
 const std = @import("std");
-const effects = @import("../core/native_effect.zig");
-const consumers = @import("../core/native_consumer.zig");
-const detection = @import("../core/native_detection_record.zig");
+const effects = @import("../effect/effect.zig");
+const consumers = @import("../detect/consumer.zig");
+const detection = @import("../detect/detection_record.zig");
 const Error = @import("store.zig").Error;
 const budget = @import("budget.zig");
 const unreferenced_config_generations_kept = 8;

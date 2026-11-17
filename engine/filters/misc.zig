@@ -4,7 +4,7 @@
 // Holds: In every pattern but query-denied the address must start right after a fixed literal; only query-denied searches for it.
 
 const types = @import("types.zig");
-const parser = @import("../core/parser.zig");
+const parser = @import("../detect/parser.zig");
 
 pub const PatternDef = types.PatternDef;
 

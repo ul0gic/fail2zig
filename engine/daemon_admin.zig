@@ -6,15 +6,15 @@
 const std = @import("std");
 const shared = @import("shared");
 const config = @import("config/native.zig");
-const detection = @import("core/native_detection_record.zig");
-const effect = @import("core/native_effect.zig");
+const detection = @import("detect/detection_record.zig");
+const effect = @import("effect/effect.zig");
 const effect_runtime = @import("runtime/native_effect_runtime.zig");
 const inspection = @import("firewall/inspection.zig");
-const durable = @import("core/record_store.zig");
-const ignore_set = @import("core/native_ignore_set.zig");
+const durable = @import("source/record_store.zig");
+const ignore_set = @import("detect/ignore_set.zig");
 const RuntimeIgnoreEntry = @import("store/ignore_entries.zig").RuntimeIgnoreEntry;
-const audit = @import("core/audit.zig");
-const ban_origin = @import("core/ban_origin.zig");
+const audit = @import("platform/audit.zig");
+const ban_origin = @import("effect/ban_origin.zig");
 const source_repair = @import("store/source_repair.zig");
 const daemon = @import("native_daemon.zig");
 const max_jails = daemon.max_jails;
@@ -265,7 +265,7 @@ pub fn Methods(comptime Coordinator: type) type {
                             .refuse_config => return self.adminDetail(request, (AdminOutcomeView{ .outcome = .rejected, .kind = kind }).withReason("{s}", .{ban_origin.refused_config_text}), null),
                             .set_manual, .extend_as_manual => {},
                         }
-                        const duration: @import("core/native_lease.zig").Duration = if (request.duration_s) |seconds| try @import("core/native_lease.zig").Duration.finiteSeconds(seconds) else jail.policy.duration;
+                        const duration: @import("effect/lease.zig").Duration = if (request.duration_s) |seconds| try @import("effect/lease.zig").Duration.finiteSeconds(seconds) else jail.policy.duration;
                         const lease = try duration.lease(now);
                         noteIgnoredTarget(request, jail);
                         _ = try self.store.setOwnerFromCanonical(.{ .scope = canonical, .jail = jail.name, .generation = generation, .decision_id = durable.Store.adminDecisionId(request.request_id, request.expected_revision), .expected_revision = if (current) |owner| owner.revision else 0, .lease = lease, .decided_us = now, .origin = .manual }, clock);

@@ -4,7 +4,7 @@
 // Holds: Release touches only owners whose current decision id derives from this run and the staged row's sequence number.
 
 const std = @import("std");
-const effects = @import("../core/native_effect.zig");
+const effects = @import("../effect/effect.zig");
 const Error = @import("store.zig").Error;
 const budget = @import("budget.zig");
 

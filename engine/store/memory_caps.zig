@@ -4,8 +4,8 @@
 // Holds: A row whose subject still has a retry decision or a non-absent effect is moved to the highest rowid, never deleted.
 
 const std = @import("std");
-const effects = @import("../core/native_effect.zig");
-const detection = @import("../core/native_detection_record.zig");
+const effects = @import("../effect/effect.zig");
+const detection = @import("../detect/detection_record.zig");
 const store = @import("store.zig");
 const Error = store.Error;
 

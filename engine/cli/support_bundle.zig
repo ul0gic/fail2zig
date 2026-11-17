@@ -8,8 +8,8 @@ const builtin = @import("builtin");
 const shared = @import("shared");
 const client = @import("cli");
 const config_mod = @import("../config/native.zig");
-const durable = @import("../core/record_store.zig");
-const files = @import("../core/durable_file_source.zig");
+const durable = @import("../source/record_store.zig");
+const files = @import("../source/durable_file_source.zig");
 const reload = @import("../runtime/native_reload.zig");
 const ipc_auth = @import("../net/ipc_auth.zig");
 

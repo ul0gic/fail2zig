@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const store_mod = @import("store.zig");
-const files = @import("../core/durable_file_source.zig");
+const files = @import("../source/durable_file_source.zig");
 const continuity = @import("continuity.zig");
 const Store = store_mod.Store;
 const Sha256 = std.crypto.hash.sha2.Sha256;

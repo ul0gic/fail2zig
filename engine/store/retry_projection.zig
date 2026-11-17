@@ -5,9 +5,9 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const diag = @import("../core/diag.zig");
-const detection = @import("../core/native_detection_record.zig");
-const retry = @import("../core/native_retry.zig");
+const diag = @import("../diag/diag.zig");
+const detection = @import("../detect/detection_record.zig");
+const retry = @import("../detect/retry.zig");
 const store = @import("store.zig");
 const Error = store.Error;
 const Stmt = store.Stmt;

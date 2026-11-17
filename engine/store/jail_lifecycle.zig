@@ -4,8 +4,8 @@
 // Holds: A page touches at most 64 rows, and parent rows are deleted only after every child table is checked empty for the jail.
 
 const std = @import("std");
-const effects = @import("../core/native_effect.zig");
-const detection = @import("../core/native_detection_record.zig");
+const effects = @import("../effect/effect.zig");
+const detection = @import("../detect/detection_record.zig");
 const store = @import("store.zig");
 const Error = store.Error;
 

@@ -5,11 +5,11 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const diag = @import("../core/diag.zig");
-const effects = @import("../core/native_effect.zig");
-const detection = @import("../core/native_detection_record.zig");
-const action_outcome = @import("../core/native_action_outcome.zig");
-const application_history = @import("../core/native_application_history.zig");
+const diag = @import("../diag/diag.zig");
+const effects = @import("../effect/effect.zig");
+const detection = @import("../detect/detection_record.zig");
+const action_outcome = @import("../effect/action_outcome.zig");
+const application_history = @import("../effect/application_history.zig");
 const store = @import("store.zig");
 const budget = @import("budget.zig");
 const Error = store.Error;
