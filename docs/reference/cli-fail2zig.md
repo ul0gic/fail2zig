@@ -102,6 +102,8 @@ Choose exactly one input and exactly one rule:
 | `--limit <n>`                            | Samples to print, 0 to 10,000. Default 20.                                           |
 | `--print-lines`                          | Include the raw lines in the samples.                                                |
 | `--now <epoch-seconds>`, `--window <seconds>` | Fix the clock and the admission window, for repeatable results.                 |
+| `--journal-since <epoch-seconds>`        | With `--journal`: where the journal read starts. Default one hour before now.        |
+| `--journal-executable <path>`            | With `--journal`: the `journalctl` binary to run. Default `/usr/bin/journalctl`.     |
 | `--output json\|table`                   | Default `json`.                                                                      |
 
 With `--service`, the timestamp contract defaults to `syslog` for every filter
