@@ -4,7 +4,7 @@
 // Holds: The ledger's byte limit is the charged total admission approved; reserve refuses a charge past it before changing any counter.
 
 const std = @import("std");
-const store = @import("../source/record_store.zig");
+const store = @import("../store/store.zig");
 const file = @import("../source/durable_file_source.zig");
 const file_session = @import("../source/file_session.zig");
 const journal = @import("../source/journal_transport.zig");

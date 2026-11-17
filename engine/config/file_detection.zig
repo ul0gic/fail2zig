@@ -9,7 +9,7 @@ const processing = @import("../source/source_processor.zig");
 const detector = @import("../detect/builtin_detector.zig");
 const session = @import("../source/file_session.zig");
 const files = @import("../source/durable_file_source.zig");
-const durable = @import("../source/record_store.zig");
+const durable = @import("../store/store.zig");
 const ignore_set = @import("../detect/ignore_set.zig");
 
 pub const Settings = struct {

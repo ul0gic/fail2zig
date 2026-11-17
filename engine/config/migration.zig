@@ -690,7 +690,7 @@ fn prepareManifest(ctx: *Context, document: *const fail2ban.ConfigDocument, glob
 }
 
 fn parseImportedDuration(raw: []const u8) ?u64 {
-    const value = @import("duration.zig").parse(raw, false) catch return null;
+    const value = @import("shared").duration.parse(raw, false) catch return null;
     return value.nativeSeconds() catch null;
 }
 

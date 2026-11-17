@@ -6,7 +6,7 @@ const detection = @import("detection_record.zig");
 const effects = @import("../effect/effect.zig");
 const history = @import("../effect/effect_history.zig");
 const retry = @import("retry.zig");
-const durable = @import("../source/record_store.zig");
+const durable = @import("../store/store.zig");
 
 pub const source_id = "confirmed-effects";
 pub const pattern_id = "confirmed-native-ban";

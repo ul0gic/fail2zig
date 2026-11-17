@@ -4,7 +4,7 @@
 // Holds: Consumer state reaches memory only after the store accepts it: each stage is committed or validated first, published second.
 
 const std = @import("std");
-const durable = @import("../source/record_store.zig");
+const durable = @import("../store/store.zig");
 const state = @import("../detect/consumer.zig");
 const bridge = @import("../detect/consumer_coordinator.zig");
 const rule = @import("../detect/rule_consumer.zig");

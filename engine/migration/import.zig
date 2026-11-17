@@ -80,8 +80,8 @@ pub const Staging = struct {
     }
 };
 
-pub const StagedOwnerRow = @import("../source/record_store.zig").Store.StagedOwnerRow;
-pub const StagedHistoryRow = @import("../source/record_store.zig").Store.StagedHistoryRow;
+pub const StagedOwnerRow = @import("../store/store.zig").Store.StagedOwnerRow;
+pub const StagedHistoryRow = @import("../store/store.zig").Store.StagedHistoryRow;
 
 pub fn ownerRows(allocator: std.mem.Allocator, staging: *const Staging) error{OutOfMemory}![]StagedOwnerRow {
     const rows = try allocator.alloc(StagedOwnerRow, staging.owners.len);

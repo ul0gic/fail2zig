@@ -8,7 +8,7 @@ const shared = @import("shared");
 const cli = @import("cli");
 const config = @import("../config/config.zig");
 const paths = @import("../config/paths.zig");
-const durable = @import("../source/record_store.zig");
+const durable = @import("../store/store.zig");
 const effects = @import("../effect/effect.zig");
 
 const Options = struct { config_path: []const u8 = "/etc/fail2zig/config.toml", apply: bool = false };

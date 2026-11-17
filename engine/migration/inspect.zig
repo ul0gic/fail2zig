@@ -7,7 +7,7 @@ const std = @import("std");
 const fail2ban = @import("../config/fail2ban.zig");
 const filter_context = @import("../config/filter_context.zig");
 const registry = @import("../filters/registry.zig");
-const duration = @import("../config/duration.zig");
+const duration = @import("shared").duration;
 const IpAddress = @import("shared").IpAddress;
 
 pub const schema_version: u32 = 1;

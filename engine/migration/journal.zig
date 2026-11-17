@@ -4,7 +4,7 @@
 // Holds: A run reopens only with the host, source database, source configuration, plan and generation it was created with.
 
 const std = @import("std");
-const durable = @import("../source/record_store.zig");
+const durable = @import("../store/store.zig");
 
 pub const Store = durable.Store;
 pub const State = Store.MigrationState;

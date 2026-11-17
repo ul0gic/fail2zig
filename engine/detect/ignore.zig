@@ -3,7 +3,7 @@
 const std = @import("std");
 const dns = @import("dns.zig");
 const Ip = @import("shared").IpAddress;
-const Cidr = @import("state.zig").Cidr;
+const Cidr = @import("cidr.zig").Cidr;
 pub const version: u16 = 2;
 pub const max_entries = 1024;
 pub const max_hostnames = 16;

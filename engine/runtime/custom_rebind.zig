@@ -4,7 +4,7 @@
 // Holds: Nothing is rebound until a stored ignore payload regenerates the saved retry generation; without one it fails as unproven.
 
 const std = @import("std");
-const durable = @import("../source/record_store.zig");
+const durable = @import("../store/store.zig");
 const plan = @import("../config/consumer_plan.zig");
 const consumers = @import("../detect/consumer.zig");
 const bridge = @import("../detect/consumer_coordinator.zig");

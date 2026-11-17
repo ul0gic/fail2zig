@@ -8,7 +8,7 @@ const shared = @import("shared");
 const cli = @import("cli");
 const config_mod = @import("../config/config.zig");
 const native_paths = @import("../config/paths.zig");
-const durable = @import("../source/record_store.zig");
+const durable = @import("../store/store.zig");
 const repair = @import("../store/source_repair.zig");
 const files = @import("../source/durable_file_source.zig");
 

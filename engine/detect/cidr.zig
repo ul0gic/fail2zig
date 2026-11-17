@@ -8,8 +8,6 @@ const shared = @import("shared");
 
 const IpAddress = shared.IpAddress;
 
-pub const max_attempts_per_ip: usize = 128;
-
 pub const Cidr = union(enum) {
     v4: struct { net: u32, mask: u32 },
     v6: struct { net: u128, mask: u128 },

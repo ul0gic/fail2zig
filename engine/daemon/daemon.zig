@@ -23,7 +23,7 @@ const recurrence = @import("../detect/recurrence.zig");
 const firewall_backend = @import("../firewall/backend.zig");
 const inspection = @import("../firewall/inspection.zig");
 const path_guard = @import("../config/paths.zig");
-const durable = @import("../source/record_store.zig");
+const durable = @import("../store/store.zig");
 const sessions = @import("../source/file_session.zig");
 const pipeline = @import("../source/record_pipeline.zig");
 const journal_projection = @import("../config/journal_detection.zig");
@@ -869,7 +869,7 @@ pub const Coordinator = struct {
             .internal => try plan.include(.{ .workspace = .{ .bytes = 16 * 1024, .allocations = 4 }, .workspace_kind = .source }),
             .auto => return error.NativeInternalEventsRequired,
         }
-        const projection_bytes = @sizeOf(Plan) + @sizeOf(journal_projection.Plan) + jail.logpath.len * @sizeOf(sessions.Spec) + 128 * @sizeOf(@import("../detect/state.zig").Cidr);
+        const projection_bytes = @sizeOf(Plan) + @sizeOf(journal_projection.Plan) + jail.logpath.len * @sizeOf(sessions.Spec) + 128 * @sizeOf(@import("../detect/cidr.zig").Cidr);
         var input_bytes = jail.name.len;
         if (source == .file) for (jail.logpath) |path| {
             input_bytes += path.len;

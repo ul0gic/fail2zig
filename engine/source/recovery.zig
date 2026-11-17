@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-const durable = @import("record_store.zig");
+const durable = @import("../store/store.zig");
 const health = @import("../platform/storage_health.zig");
 const pipeline = @import("record_pipeline.zig");
 
