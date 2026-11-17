@@ -52,7 +52,11 @@ pub fn build(b: *std.Build) void {
     });
     sqlite.root_module.addCSourceFile(.{
         .file = b.path("vendor/sqlite/sqlite3.c"),
-        .flags = if (diag) &.{ "-DSQLITE_OMIT_LOAD_EXTENSION=1", "-DSQLITE_ENABLE_DBSTAT_VTAB=1", "-Dfsync=f2z_diag_fsync" } else &.{ "-DSQLITE_OMIT_LOAD_EXTENSION=1", "-DSQLITE_ENABLE_DBSTAT_VTAB=1" },
+        .flags = if (diag) &.{
+            "-DSQLITE_OMIT_LOAD_EXTENSION=1",
+            "-DSQLITE_ENABLE_DBSTAT_VTAB=1",
+            "-Dfsync=f2z_diag_fsync",
+        } else &.{ "-DSQLITE_OMIT_LOAD_EXTENSION=1", "-DSQLITE_ENABLE_DBSTAT_VTAB=1" },
     });
 
     const build_options = b.addOptions();
@@ -166,7 +170,10 @@ pub fn build(b: *std.Build) void {
         if (b.args) |args| run.addArgs(args);
         b.step(b.fmt("probe-{s}", .{probe.name}), "Run a manual diagnostic probe").dependOn(&run.step);
     }
-    const unreferenced = b.addExecutable(.{ .name = "f2z-unreferenced", .root_module = b.createModule(.{ .root_source_file = b.path("scripts/unreferenced.zig"), .target = b.graph.host, .optimize = .Debug }) });
+    const unreferenced = b.addExecutable(.{
+        .name = "f2z-unreferenced",
+        .root_module = b.createModule(.{ .root_source_file = b.path("scripts/unreferenced.zig"), .target = b.graph.host, .optimize = .Debug }),
+    });
     const run_unreferenced = b.addRunArtifact(unreferenced);
     run_unreferenced.setCwd(b.path("."));
     run_unreferenced.addArgs(&.{ "build.zig", "engine", "client", "shared", "tests" });
