@@ -5,7 +5,7 @@
 
 const std = @import("std");
 
-const fail2zig_version = "0.4.10";
+const fail2zig_version = "0.4.11";
 
 fn releaseSignal(b: *std.Build, strip: bool) ?[]const u8 {
     if (strip) return "-Dstrip=true";

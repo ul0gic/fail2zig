@@ -1,3 +1,88 @@
+# fail2zig v0.4.11
+
+Version 0.4.11 is a fix release. `history` works again after retention has
+removed the first record, an endpoint and a configuration key that never did
+anything are retired, and the documentation gains a troubleshooting guide, an FAQ
+and uninstall steps. The state format is unchanged from 0.4.10. How bans are
+detected and enforced is unchanged.
+
+## Changes
+
+- Start `history` at the oldest retained record. With no `--cursor`, `history`
+  failed with `500 query source failed` once `history_retention` had removed the
+  first record, about a day after a host's first ban on the default
+  configuration. The stored history was intact; the query started from the wrong
+  position. ([#131](https://github.com/ul0gic/fail2zig/issues/131))
+- Answer 409 to an expired cursor. A cursor that points before the oldest
+  retained record gets `cursor expired or observation changed; restart pagination
+  without a cursor` instead of the 500. Run the command again without `--cursor`.
+- Remove `/events`. The endpoint only ever answered `400 websocket not enabled`.
+  It now answers 404.
+- Deprecate `websocket_max_clients`. The key had no effect; it is accepted and
+  ignored with a warning, and the fail2ban importer no longer writes it.
+- Ship 13 release assets. `COPYING.date-profile` is no longer part of a release,
+  and the installer removes a copy left by an earlier one.
+- Add a [troubleshooting guide](docs/guides/troubleshooting.md), an
+  [FAQ](docs/guides/faq.md), and installation sections on
+  [uninstalling](docs/operations/installation.md#uninstalling),
+  [rotating the daemon's log file](docs/operations/installation.md#daemon-log-file-and-rotation)
+  and [SELinux and AppArmor](docs/operations/installation.md#selinux-and-apparmor).
+- Complete the configuration manual with the twelve keys it lacked, including
+  `timestamp` and the time zone keys, and document the `rule-test` flags
+  `--journal-since` and `--journal-executable`.
+- Correct the migration reference: `compatibility_pending` is what refuses an
+  enabled jail; `compatibility_manifest` blocks nothing by itself.
+
+The source tree was reorganised into one folder per subject and unused code was
+removed. Neither changes behaviour.
+
+## Upgrade and compatibility
+
+A v0.4.10 state is already at schema 29 and is opened as it is: no upgrade step,
+no backup, no extra time at the first start. Older states take the same steps as
+for 0.4.10, described in the [upgrade guide](docs/guides/upgrading.md). v0.4.7
+remains the minimum supported upgrade source.
+
+Returning to v0.4.10 needs no backup, because both releases use schema 29:
+reinstall the v0.4.10 executable and start it.
+
+Remove `websocket_max_clients` from your configuration when convenient; until
+then the daemon starts and logs a warning. Anything that probed `/events` for a
+400 now gets a 404. A client that keeps a `history` cursor across long pauses
+should treat 409 as "start again without a cursor".
+
+## Known limitations
+
+- A `history` cursor that points beyond the newest record still answers 500.
+- In the plain `history` read each page is its own read. A read with no cursor
+  recovers by itself when retention prunes between two pages; that recovery path
+  is covered by code review and not by a test that forces the timing.
+- A file `log_target` under `/var/log` does not work with the shipped unit until
+  the unit is given `LogsDirectory=fail2zig`, as the installation guide now says.
+- The limitations listed for v0.4.10 still apply.
+
+## Verification scope
+
+The full local suite passed. On the Debian 13 lab host, in disposable network
+namespaces beside the installed service:
+
+- The administrative suite passed, including the new case that prunes history
+  through retention and then reads it with no cursor, pages through it and
+  presents an expired cursor.
+- The enforcing daemon cases passed, and the firewall suite passed on nftables,
+  ipset and iptables.
+- The release lifecycle passed with this version's executable on all three
+  backends: a detected ban blocked TCP and its expiry restored it, and on nftables
+  also manual ban and unban, overlapping ownership across a restart, an IPv6 ban
+  and a daemon with metrics disabled.
+
+Not run: cutting the installed service over to this release under the shipped
+unit, and an upgrade of a populated state. The state format and the upgrade steps
+are those of 0.4.10. The suites above ran on a build that preceded the last
+change to the plain `history` reader; that change has the local suite and the
+pruned-history case in a local namespace behind it. A prune forced between two
+pages of one `history` read was not exercised.
+
 # fail2zig v0.4.10
 
 Version 0.4.10 is a storage release. A log source resumes by itself after a wait

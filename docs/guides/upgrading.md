@@ -8,17 +8,18 @@ last_verified: 2026-11-16
 ---
 
 This page covers what changes for an existing installation when you move to
-0.4.10. The [installation guide](../operations/installation.md) has the install
+0.4.11. The [installation guide](../operations/installation.md) has the install
 steps, and the [release notes](../../RELEASE_NOTES.md) list every change.
 
 ## Which releases can upgrade
 
-| State last written by | Path to 0.4.10                                                                  |
+| State last written by | Path to 0.4.11                                                                  |
 | --------------------- | ------------------------------------------------------------------------------- |
-| v0.4.9 (schema 28)    | Install 0.4.10 and start it. One step, to schema 29.                            |
-| v0.4.8 (schema 26)    | Install 0.4.10 and start it. Two steps in the same start: schema 28, then 29.   |
-| v0.4.7 (schema 25)    | Install 0.4.10 and start it. Three steps in the same start: 26, 28, then 29.    |
-| v0.4.6 (schema 24)    | Install v0.4.7 first and start it once, then upgrade to 0.4.10.                 |
+| v0.4.10 (schema 29)   | Install 0.4.11 and start it. No state change.                                   |
+| v0.4.9 (schema 28)    | Install 0.4.11 and start it. One step, to schema 29.                            |
+| v0.4.8 (schema 26)    | Install 0.4.11 and start it. Two steps in the same start: schema 28, then 29.   |
+| v0.4.7 (schema 25)    | Install 0.4.11 and start it. Three steps in the same start: 26, 28, then 29.    |
+| v0.4.6 (schema 24)    | Install v0.4.7 first and start it once, then upgrade to 0.4.11.                 |
 | v0.4.5 or earlier     | No supported path. Start from a fresh state and plan the protection gap.        |
 | v0.3.0 binary state   | No converter. The installer refuses to reinterpret it; start from fresh state.  |
 
@@ -47,8 +48,9 @@ start it once. That start upgrades schema 24 to 25 after writing
 
 ## What the first start does
 
-The first start of 0.4.10 upgrades the state in place and logs the result and the
-backup path.
+The first start of 0.4.11 on a state older than v0.4.10 upgrades it in place and
+logs the result and the backup path. A v0.4.10 state is already at schema 29 and
+is opened as it is, with no backup and no upgrade step.
 
 | Step            | Backup written first        | What it changes                                                         |
 | --------------- | --------------------------- | ----------------------------------------------------------------------- |
@@ -198,7 +200,7 @@ sudo fail2zig list --details
 sudo fail2zig firewall show
 ```
 
-`version` reports the running daemon, which must read 0.4.10. `status` shows the
+`version` reports the running daemon, which must read 0.4.11. `status` shows the
 state file's allocated pages and, on the `Used pages:` line, the pages in use;
 the tracking pool against its limits; each paused, waiting, broken or missing
 source; and retained loss events. `jails` shows source health per jail and agrees
@@ -213,6 +215,9 @@ controlled external check. See the
 An older binary refuses a newer state with `UnsupportedSchema`, so rollback
 restores the backup; swapping the executable alone does not work. After the
 schema 29 step, the `.pre29-backup` is the only way back to 0.4.9.
+
+Returning from 0.4.11 to 0.4.10 is the exception: both use schema 29, so stop the
+daemon, reinstall the 0.4.10 executable and start it. No backup is involved.
 
 1. Stop the daemon.
 2. Restore the backup over the state file: `.pre29-backup` to return to v0.4.9,
