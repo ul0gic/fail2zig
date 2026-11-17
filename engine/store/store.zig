@@ -1089,6 +1089,10 @@ pub const Store = struct {
 
     pub usingnamespace @import("consumer_retry.zig").Methods(@This());
 
+    pub usingnamespace @import("consumer_manifests.zig").Methods(@This());
+
+    pub usingnamespace @import("shared_dns.zig").Methods(@This());
+
     pub usingnamespace @import("retry_projection.zig").Methods(@This());
 
     pub usingnamespace @import("custom_rebind.zig").Methods(@This());

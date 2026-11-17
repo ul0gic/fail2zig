@@ -664,6 +664,8 @@ pub const Coordinator = struct {
         }
     };
     pub usingnamespace @import("admin.zig").Methods(@This());
+    pub usingnamespace @import("admin_ignore.zig").Methods(@This());
+    pub usingnamespace @import("admin_migration.zig").Methods(@This());
     pub const max_lifted_bans = 256;
     const max_wider_bans = 128;
     pub const IgnoreEntryState = enum { added, present, removed, config_only, absent, not_recorded, not_removed };
@@ -1326,6 +1328,9 @@ pub const Coordinator = struct {
         return false;
     }
     pub usingnamespace @import("query.zig").Methods(@This());
+    pub usingnamespace @import("query_status.zig").Methods(@This());
+    pub usingnamespace @import("query_bans.zig").Methods(@This());
+    pub usingnamespace @import("query_history.zig").Methods(@This());
     pub const quiet_interval_ms: u64 = 1000;
     pub const maintenance_idle_ms: u64 = 30 * quiet_interval_ms;
     pub const verify_interval_ns: u64 = 5 * std.time.ns_per_s;
