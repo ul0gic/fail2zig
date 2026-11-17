@@ -1,5 +1,9 @@
 #!/usr/bin/env -S python3 -I
-# Usage: grafana-save.py ENV_FILE FROM_MS TO_MS OUT_DIR  — PNG of the overview dashboard, or its panel data as JSON without a renderer.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Saves the lab overview dashboard for a time window as a PNG, or as per-panel query results with a summary when no renderer exists.
+# Holds: Grafana credentials come only from the named env file and are sent only in the request header, never written to the output folder.
+
 import base64
 import json
 import os

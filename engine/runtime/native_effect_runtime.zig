@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Reconciles stored firewall effects with the kernel set: dispatches, withdraws, expires and settles them from readback.
+// Holds: Health turns ready only in select, from a current inventory where every live effect is confirmed and none is pending or due.
+
 const std = @import("std");
 const shared = @import("shared");
 const build_options = @import("build_options");
@@ -35,7 +38,7 @@ pub fn transientCause(cause: anyerror) bool {
     return transientReadback(cause);
 }
 const max_readback_wait_turns: u16 = 255;
-// An audit starts this long before the knowledge window closes, so a dump at the ceiling finishes while knowledge is still fresh.
+// Why: With events subscribed, an audit starts this long before the verify interval ends, so a dump at the ceiling finishes inside it.
 const audit_lead_ns: u64 = 5 * std.time.ns_per_s;
 fn systemWall(_: ?*anyopaque) i64 {
     return std.time.microTimestamp();
@@ -458,6 +461,7 @@ pub const Manager = struct {
     fn catchUp(self: *Manager, bindings: []const Binding) !?Step {
         const cached = self.cached_epoch orelse return null;
         const current = self.store.effect_publication_epoch;
+        // Why: The store keeps attributions only for its last attribution_ring epochs; a gap it cannot replay falls back to a rebuild.
         if (current == std.math.maxInt(u64) or current <= cached or current - cached > durable.Store.attribution_ring) return null;
         var epoch = cached + 1;
         while (epoch <= current) : (epoch += 1) if (self.store.attributedChange(epoch) == null) return null;
@@ -557,7 +561,7 @@ pub const Manager = struct {
             .none => return error.EffectReconciliationRequired,
         }
     }
-    // Synchronous pre-admission cleanup cannot wait for an ordinary runtime slice.
+    // Does:  Discards a runtime view and clears ready at once, for startup retirement that cannot wait for a runtime slice.
     pub fn beginJailRetirementObservation(self: *Manager) void {
         if (self.view_authority == .runtime or self.staged_authority == .runtime) self.discardViewAuthority();
         self.status.ready = false;
@@ -639,6 +643,7 @@ pub const Manager = struct {
             .permanent => .{ .ensure_present = .permanent },
         } };
     }
+    // Holds: Refuses the inventory if any kernel element is not claimed by a live effect with the same scope and effect id.
     fn validateInventory(self: *Manager, snapshot: *const firewall.Snapshot) !void {
         if (snapshot.state != .owned) return error.InstallationMismatch;
         const installed = snapshot.entries;
@@ -673,6 +678,7 @@ pub const Manager = struct {
         };
         return true;
     }
+    // Does:  Reports whether the held inventory still stands: read after the last mutation was sent or, with events subscribed, healthy.
     fn inventoryCurrent(self: *const Manager) bool {
         const held = self.inventory orelse return false;
         if (self.events_subscribed) return self.events_healthy;
@@ -701,7 +707,7 @@ pub const Manager = struct {
             self.recordObservationFailure(.readback, failure);
             return propagateFirewall(void, failure);
         };
-        // Losing an already verified absence invalidates retirement walk provenance.
+        // Why: An absence that stops matching voids a retirement walk in progress, which restarts when inventory_discontinuity moves.
         if (entry.desired == .absent and self.matched[index] and !matched) self.inventory_discontinuity +|= 1;
         self.matched[index] = matched;
         if (self.confirmed[index] != matched) self.view_revision +%= 1;
@@ -746,7 +752,7 @@ pub const Manager = struct {
         const base = self.monotonic(self.monotonic_context) orelse 0;
         return base +| self.wake_interval_ns *| self.readback_wait;
     }
-    // This entry point can observe an issued operation, never dispatch a new one.
+    // Holds: Settles an already issued operation from readback; it never dispatches or withdraws an effect.
     pub fn reconcileJailRetirement(self: *Manager, request: durable.Store.JailRetirementReconciliation) Step {
         return self.reconcileJailRetirementInner(request) catch |failure| {
             self.dropInventory();
@@ -838,7 +844,7 @@ pub const Manager = struct {
             const after = systemMonotonic(null);
             slice.steps += 1;
             if (before != null and after != null) slice.longest_step_ns = @max(slice.longest_step_ns, after.? -| before.?);
-            // Without a monotonic reading the time budget cannot be enforced, so the slice ends after this step.
+            // Why: Without a monotonic reading the time budget cannot be enforced, so the slice ends after this step.
             if (start == null or after == null) break;
             slice.elapsed_ns = after.? -| start.?;
             if (slice.outcome != .progress or slice.elapsed_ns >= limits.max_ns) break;
@@ -1030,7 +1036,7 @@ pub const Manager = struct {
                     oldest_overdue_us = if (oldest_overdue_us) |prior| @min(prior, entry.intent_us) else entry.intent_us;
                     bookkeeping += 1;
                     all_confirmed = false;
-                    // An inventory read before the removal was prepared cannot settle it: the store refuses an outcome dated before its intent.
+                    // Why: The store refuses an outcome dated before its intent, so an inventory read before the removal cannot settle it.
                     if (held.start_us < entry.intent_us) {
                         settle_blocked += 1;
                         continue;
@@ -1042,7 +1048,7 @@ pub const Manager = struct {
                     settle_ready += 1;
                     continue;
                 }
-                // A kernel-expiring element read before its removal was prepared may still be timing out; only a later readback can call it drift.
+                // Why: A kernel-expiring element read before its removal was prepared may be timing out; only a later readback shows drift.
                 const class = expiryClass(transport, entry.scope);
                 if (class == .kernel_expiring and held.start_us < entry.intent_us) {
                     settle_blocked += 1;
@@ -1125,7 +1131,6 @@ pub const Manager = struct {
                 if (comptime build_options.diag) diag_mod.count(.expiry_readback_selected, 1);
                 return self.readback(sampled);
             }
-            // Preparation and its absence readback share one expiry turn with the settlement that completes the batch.
             if (comptime build_options.diag) diag_mod.count(.expiry_prepare_selected, 1);
             self.cursor = due_pick.?;
             return .progress;
@@ -1178,6 +1183,7 @@ pub const Manager = struct {
         const prior_mutation_ns = self.last_mutation_ns;
         const prior_mutation_wall_us = self.last_mutation_wall_us;
         for (indices[0..n]) |index| self.markers[index] = .{ .sent_ns = sent_ns, .sent_wall_us = dispatch_clock.prepared_us };
+        // Why: The mutation time is recorded before sending, so no inventory read that began earlier counts as current afterwards.
         self.last_mutation_ns = sent_ns;
         self.last_mutation_wall_us = dispatch_clock.prepared_us;
         const outcome = self.inspector.installBatch(tokens[0..n], .{ .wall_us = dispatch_clock.prepared_us }, &self.inventory.?.snapshot) catch |failure| {
@@ -1487,10 +1493,12 @@ pub const Manager = struct {
         if (comptime build_options.diag) diag_mod.count(.events_received, 1);
         switch (event) {
             .generation => |generation| {
+                // Why: nf_tables_commit raises the generation id by one per commit (net/netfilter/nf_tables_api.c); a gap is lost events.
                 if (self.last_generation) |last| if (generation.id != last +% 1) self.loseEvents();
                 self.last_generation = generation.id;
             },
             .elements => |elements| {
+                // Why: Acknowledged batches are already applied to the snapshot, so events from this process's netlink ports are skipped.
                 if (self.ownPort(elements.pid)) return;
                 const held = &(self.inventory orelse return);
                 const offset_ms = @divTrunc(self.wall(self.wall_context) - held.end_us, 1000);
@@ -1568,7 +1576,7 @@ pub const Manager = struct {
                 if (!verified.changed) {
                     self.last_mutation_ns = prior_mutation_ns;
                     self.last_mutation_wall_us = prior_mutation_wall_us;
-                    // Tool transports made a fresh pre-read in applyExact that may show an element expired since the held inventory; settle from it.
+                    // Why: An unchanged result from a baseline read before the intent cannot settle it, so the baseline is re-read.
                     if (self.inspector.installation.transport == .nftables) {
                         if (self.inventory) |held| if (held.start_us < entry.intent_us) {
                             snapshot.deinit();
@@ -1576,6 +1584,7 @@ pub const Manager = struct {
                             return .progress;
                         };
                     }
+                    // Why: applyExact read a fresh baseline that may show an element expired since the held inventory, so it is kept.
                     if (self.inventory == null or self.inspector.installation.transport != .nftables) {
                         {
                             errdefer snapshot.deinit();
@@ -1791,6 +1800,7 @@ pub const Manager = struct {
         const current = try self.store.jailRetirement(intent.jail.slice()) orelse return error.StaleEffect;
         if (current.keep_ignore_deadlines != intent.keep_ignore_deadlines) return error.StaleEffect;
         if (try self.retirementObservationTurn(true)) |outcome| return .{ .step = outcome };
+        // Why: inventory_discontinuity saturates, so at its maximum a later loss could no longer reset the walk.
         if (self.inventory_discontinuity == std.math.maxInt(u64)) return error.EffectCapacity;
         const epoch = self.store.effect_publication_epoch;
         if (epoch == std.math.maxInt(u64)) return error.EffectCapacity;

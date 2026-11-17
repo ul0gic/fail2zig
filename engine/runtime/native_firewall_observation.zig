@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Caches the latest firewall readback and serves it as cursor-paged pages of at most 256 entries.
+// Holds: A cursor is honoured only for the same process nonce, capture sequence and limit within 60 s of issue; a new capture voids it.
 
 const std = @import("std");
 const inspection = @import("../firewall/inspection.zig");
@@ -80,6 +82,7 @@ pub const Cache = struct {
             });
             return;
         }
+        // Why: The sequence never wraps, so a cursor issued for an old capture can never match a later one.
         if (self.metadata.sequence == std.math.maxInt(u64)) {
             self.recordFailureLocked(.{
                 .monotonic_ms = stamp.monotonic_ms,
@@ -200,6 +203,7 @@ pub const Page = struct {
     }
 };
 
+// Does:  Cursor layout: version byte 1, 16-byte nonce, then big-endian u64 sequence, u16 offset, u16 limit and u64 issue time.
 const cursor_wire_bytes: usize = 37;
 const Cursor = struct {
     nonce: [16]u8,

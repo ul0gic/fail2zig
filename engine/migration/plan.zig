@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Builds a migration plan from an inspected source and its snapshot, stores and reloads it, and checks it for staleness and drift.
+// Holds: A plan file loads only with no unknown fields, schema version 1 and a digest that matches its content; anything else is refused.
+
 const std = @import("std");
 const inspect = @import("inspect.zig");
 const fail2ban = @import("../config/fail2ban.zig");
@@ -9,6 +12,7 @@ const db = @import("fail2ban_db.zig");
 pub const schema_version: u32 = 1;
 pub const validity_us: i64 = 24 * 60 * 60 * 1_000_000;
 pub const max_plan_bytes: usize = 16 * 1024 * 1024;
+// Why: fail2ban's default socket path.
 pub const default_runtime_socket = "/var/run/fail2ban/fail2ban.sock";
 
 pub const Error = inspect.Error || snapshot.Error || error{
@@ -285,6 +289,7 @@ const Builder = struct {
     }
 };
 
+// Holds: A name too long to lowercase counts as secret, so an unchecked name is withheld.
 fn isSecretParameter(name: []const u8) bool {
     var lower_buf: [128]u8 = undefined;
     if (name.len > lower_buf.len) return true;
@@ -294,6 +299,7 @@ fn isSecretParameter(name: []const u8) bool {
     return false;
 }
 
+// Does:  Reports absent only when the socket path does not exist; an existing path or any other error is unknown.
 fn runtimeState(socket_path: []const u8) []const u8 {
     std.fs.cwd().access(socket_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return "absent",
@@ -310,6 +316,7 @@ fn manifestValue(a: std.mem.Allocator, manifest: *const inspect.Manifest) Error!
 
 fn computeDigest(a: std.mem.Allocator, doc: *const Document) Error![]const u8 {
     var copy = doc.*;
+    // Why: The digest field is blanked so the digest covers every other field and never itself.
     copy.digest = "";
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var buf = std.ArrayListUnmanaged(u8){};
@@ -376,6 +383,7 @@ pub fn writePlanFile(p: *const Plan, path: []const u8) Error!void {
     var dir = std.fs.cwd().openDir(dir_path, .{}) catch return error.PlanWriteFailed;
     defer dir.close();
     var tmp_name_buf: [std.fs.max_name_bytes]u8 = undefined;
+    // Why: Writing a synced temporary file and renaming it (rename(2)) means the plan path never holds a partial plan.
     const tmp_name = std.fmt.bufPrint(&tmp_name_buf, ".{s}.tmp", .{base}) catch return error.PlanWriteFailed;
     const file = dir.createFile(tmp_name, .{ .exclusive = true, .mode = 0o600 }) catch return error.PlanWriteFailed;
     var committed = false;
@@ -400,6 +408,7 @@ pub fn readPlanFile(allocator: std.mem.Allocator, path: []const u8) Error!Plan {
     };
     var fp: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &fp, .{});
+    // Why: The digest covers only fields Document declares, so an added field would otherwise pass the tamper check.
     const doc = std.json.parseFromSliceLeaky(Document, a, bytes, .{ .ignore_unknown_fields = false }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.PlanInvalid,

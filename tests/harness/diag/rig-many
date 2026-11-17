@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Usage: rig-many N CHECK --binary PATH --sha256 HEX [--minutes M] [--scenario empty|DIR]  — N rootless rigs at once.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Starts N rootless diag-run rigs at once on one check and fails when any rig fails or reports no result.
+# Holds: Every rig is waited for and a non-zero exit, a fail result or a missing result each adds to the failure count that sets the status.
+
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)

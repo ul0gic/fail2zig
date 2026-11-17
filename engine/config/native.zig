@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Parses the native configuration file into typed global, default and jail settings and validates them.
+// Holds: An unknown section or key, a repeated key, or a value of the wrong type fails the parse with its line; none is ignored.
 
 const std = @import("std");
 const shared = @import("shared");
@@ -172,6 +174,7 @@ pub const JailConfig = struct {
     ignoretime: ?shared.Duration = null,
     bantime_increment: BanTimeIncrement = .{},
     bantime_increment_explicit: bool = false,
+    // Does:  Marks the increment keys this jail set: 1 enabled, 2 multiplier, 4 factor, 8 formula, 16 max_bantime, 32 scope, 64 jitter.
     bantime_increment_fields: u8 = 0,
     on_truncation: ?TruncationPolicy = null,
 
@@ -660,6 +663,7 @@ pub fn validateDiag(cfg: *const Config, out: *ValidationDiagnostic) ValidationEr
         if (path.len == 0 or path.len >= std.fs.max_path_bytes or std.mem.indexOfScalar(u8, path, 0) != null)
             return validationFailure(out, .global, key, .valid_path, null, error.InvalidNativePath);
     }
+    // Why: sockaddr_un.sun_path holds 108 bytes including the terminating NUL (unix(7)).
     if (cfg.global.socket_path.len >= 108) return validationFailure(out, .global, .socket_path, .unix_socket_path_limit, null, error.InvalidNativePath);
     if (cfg.global.dns_server) |server| {
         if (!cfg.global.native_ingestion) return validationFailure(out, .global, .native_ingestion, .must_be_enabled, null, error.NativeIngestionRequired);
@@ -746,8 +750,7 @@ pub fn validateDiag(cfg: *const Config, out: *ValidationDiagnostic) ValidationEr
         var k: usize = i + 1;
         while (k < cfg.jails.len) : (k += 1) {
             if (std.mem.eql(u8, j.name, cfg.jails[k].name)) {
-                // The caller renders bounded, escaped context for this failure.
-                // Do not write the untrusted jail identifier separately.
+                // Why: A quoted jail name may hold control bytes, so this failure carries it only in the diagnostic, which escapes it.
                 return validationFailure(out, .jail, .name, .unique_jail_name, j.name, error.DuplicateJailName);
             }
         }
@@ -1037,6 +1040,7 @@ const Parser = struct {
             try self.expectEndOfLine();
         }
 
+        // Why: [defaults] may follow a jail section, so source inheritance and the truncation check wait until the whole file is read.
         for (self.jails.items, self.jail_source_origin.items) |*j, origin| {
             if (origin == .unset) j.source = self.defaults.source;
         }
@@ -1393,6 +1397,7 @@ const Parser = struct {
             self.global.websocket_max_clients = @intCast(n);
         } else if (std.mem.eql(u8, key, "history_retention")) {
             const n = try asInt(v);
+            // Why: History pruning multiplies retention into i64 microseconds, so a larger value would overflow there.
             if (n < 0 or n > @divTrunc(std.math.maxInt(i64), 1_000_000)) return error.InvalidValue;
             self.global.history_retention = @intCast(n);
         } else if (std.mem.eql(u8, key, "history_max_matches")) {

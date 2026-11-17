@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Stores runtime ignore entries per jail with an optional expiry, lists them and deletes those that have expired.
+// Holds: An entry is written and read back only as a network with no host bits set, and a jail holds at most 128 entries.
+
 const std = @import("std");
 const types = @import("shared").types;
 const store = @import("store.zig");

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Runs a built-in service filter or a rule file over a log file, one record or journal entries and reports each line's outcome.
+// Holds: Every line read lands in exactly one outcome count, so the four counts sum to lines_read; samples past --limit are only counted.
 
 const std = @import("std");
 const shared = @import("shared");
@@ -468,6 +470,7 @@ fn openSession(allocator: std.mem.Allocator, options: Options, report: *Report) 
         .epoch_seconds => time_source = .{ .field = .{ .format = .epoch_seconds, .boundary = .{ .delimiter = ' ' } } },
         .common_log => time_source = .{ .field = .{ .format = .common_log, .start = 1, .boundary = .{ .length = 26 } } },
         .syslog => {
+            // Why: A syslog TIMESTAMP is the 15 characters Mmm dd hh:mm:ss (RFC 3164 section 4.1.2).
             var field = TimeField{ .format = .syslog, .boundary = .{ .length = 15 }, .infer_year = options.year == null };
             if (resolved.time_zone) |id| {
                 const z = try allocator.create(timezone.Zone);
@@ -552,6 +555,7 @@ fn resolveFromConfig(arena: std.mem.Allocator, path: []const u8, options: Option
         return error.JailNotFound;
     };
     if (out.timestamp == null) if (jail.timestamp) |ts| {
+        // Why: TimestampKind repeats the config timestamp tags name for name, so this unwrap holds only while both lists match.
         out.timestamp = std.meta.stringToEnum(TimestampKind, @tagName(ts)).?;
     };
     if (out.tz_offset_minutes == null and out.time_zone == null) {
@@ -651,6 +655,7 @@ fn processJournalImpl(self: *Session, matches: []const []const u8) Error!void {
         const produced = journal.execute(arena.allocator(), argv, output, &diagnostic, options.timeout_ms, null) catch return error.JournalFailed;
         var lines = std.mem.splitScalar(u8, produced, '\n');
         var batch: usize = 0;
+        // Why: journalctl --cursor starts at the entry the cursor names (journalctl(1)), which the previous batch already counted.
         var first = query == .cursor;
         while (lines.next()) |line| {
             if (line.len == 0) continue;
@@ -687,6 +692,7 @@ fn fieldInput(field: TimeField, decoded: []const u8, receipt: time.Timestamp) !P
             const parsed = inference.inferZoned(value, receipt, zone) catch |err| return mapTimeError(err);
             return .{ .input = .{ .parsed = parsed.timestamp }, .inferred_year = parsed.year };
         }
+        // Why: The text is read as local wall time and the zone maps it to UTC, so no fixed offset is applied here.
         const local = time.parse(.syslog, value, .{ .year = field.context.year, .offset_seconds = 0 }) catch |err| return mapTimeError(err);
         const selected = zone.resolveLocalMicros(local.us) catch |err| return mapTimeError(err);
         return .{ .input = .{ .parsed = .{ .us = selected.utc_us } } };
@@ -866,6 +872,7 @@ const Resolver = struct {
                 return .{ .failed = if (r.answer.reason == .none) .incomplete else r.answer.reason };
             }
             if (now_ms - start_ms >= dns_timeout_ms) {
+                // Why: begin refuses while a query is in flight, so the client is reset to idle before the next hostname.
                 self.client.deinit();
                 return .{ .failed = .timeout };
             }

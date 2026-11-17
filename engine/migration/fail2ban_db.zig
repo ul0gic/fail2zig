@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Binds the SQLite C API and reads the jails, logs, bans and bips rows of a fail2ban database.
+// Holds: Reader refuses a database whose five tables or version differ, and any column value of the wrong type or over its byte cap.
+
 const std = @import("std");
 
 pub const Db = opaque {};
@@ -56,8 +59,6 @@ pub const open_flags = struct {
     pub const uri: c_int = 0x40;
     pub const exrescode: c_int = 0x02000000;
 };
-// Column expectations restated from GPL-2.0 upstream fail2ban-1.1.1/fail2ban/server/database.py:114-160;
-// never copied into product output.
 const column_type = struct {
     const integer: c_int = 1;
     const text: c_int = 3;
@@ -84,6 +85,7 @@ pub const Error = error{
 };
 
 pub fn sqliteError(code: c_int) Error {
+    // Why: An extended result code keeps its primary code in the low 8 bits (sqlite.org/rescode.html), and open sets exrescode.
     return switch (code & 0xff) {
         3, 23 => error.AccessDenied,
         5, 6 => error.Busy,
@@ -111,6 +113,7 @@ pub const Connection = struct {
     pub fn open(path_z: [*:0]const u8, flags: c_int) Error!Connection {
         var handle: ?*Db = null;
         const code = api.open_v2(path_z, &handle, flags | open_flags.exrescode, null);
+        // Why: sqlite3_open_v2 returns a handle even on error unless it could not allocate one (sqlite3.h), so it is closed below.
         const db = handle orelse return error.OutOfMemory;
         if (code != rc.ok) {
             _ = api.close_v2(db);
@@ -201,8 +204,7 @@ pub const Stmt = struct {
 
     pub fn bindText(self: Stmt, index: c_int, text: []const u8) Error!void {
         const len = std.math.cast(c_int, text.len) orelse return error.InvalidRow;
-        // SQLite copies the bytes before returning; this sentinel is never called.
-        // SQLITE_TRANSIENT is the all-ones pointer; SQLite accepts it unaligned, like a callback.
+        // Why: SQLITE_TRANSIENT is the all-ones pointer (sqlite3.h); SQLite copies the bytes before returning and never calls it.
         const transient: Destructor = @ptrFromInt(std.math.maxInt(usize));
         const code = api.bind_text(self.stmt, index, text.ptr, len, transient);
         if (code != rc.ok) return sqliteError(code);
@@ -240,6 +242,7 @@ pub const Stmt = struct {
 
 const Column = struct { name: []const u8, decl: []const u8 };
 const Table = struct { name: [:0]const u8, columns: []const Column, pragma: [*:0]const u8 };
+// Why: Tables, column order and declared types are those of a fail2ban schema version 4 database.
 pub const required_tables = [_]Table{
     .{ .name = "fail2banDb", .pragma = "PRAGMA table_info(fail2banDb)", .columns = &.{
         .{ .name = "version", .decl = "INTEGER" },

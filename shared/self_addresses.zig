@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Lists this host's own IPv4 and IPv6 addresses through one rtnetlink RTM_GETADDR dump.
+// Holds: Only kernel replies are parsed, every netlink length is checked against the bytes received, and at most 256 addresses are kept.
+
 const std = @import("std");
 const types = @import("types.zig");
 
@@ -11,7 +14,7 @@ const IpAddress = types.IpAddress;
 
 pub const max_self_addresses: u16 = 256;
 
-// The kernel caps one netlink dump skb at 32 KiB (net/netlink/af_netlink.c netlink_dump).
+// Why: The kernel caps one netlink dump skb at 32 KiB (net/netlink/af_netlink.c netlink_dump), so one receive holds it whole.
 const receive_buffer_bytes: usize = 32 * 1024;
 const request_sequence: u32 = 1;
 
@@ -110,6 +113,7 @@ fn receive(fd: i32, buffer: []u8) Error![]const u8 {
     while (true) {
         var sender = linux.sockaddr.nl{ .pid = 0, .groups = 0 };
         var sender_len: linux.socklen_t = @sizeOf(linux.sockaddr.nl);
+        // Why: MSG_TRUNC makes the call return the full datagram length (recv(2)), so a datagram larger than the buffer is refused.
         const rc = linux.recvfrom(fd, buffer.ptr, buffer.len, linux.MSG.TRUNC, @ptrCast(&sender), &sender_len);
         switch (linux.E.init(rc)) {
             .SUCCESS => {},
@@ -117,6 +121,7 @@ fn receive(fd: i32, buffer: []u8) Error![]const u8 {
             else => return error.KernelUnavailable,
         }
         if (rc == 0 or rc > buffer.len) return error.KernelUnavailable;
+        // Why: Only the kernel sends from port id 0 (netlink(7)), so a datagram from another process is refused.
         if (sender_len != @sizeOf(linux.sockaddr.nl) or sender.pid != 0) return error.KernelUnavailable;
         return buffer[0..rc];
     }
@@ -140,7 +145,7 @@ fn hostAddress(payload: []const u8) Error!?IpAddress {
         if (kind == @intFromEnum(linux.IFA.LOCAL)) local = value;
         if (kind == @intFromEnum(linux.IFA.ADDRESS)) peer = value;
     }
-    // On a point-to-point link IFA_ADDRESS is the remote end; IFA_LOCAL is this host's own address.
+    // Why: On a point-to-point link IFA_ADDRESS is the peer and IFA_LOCAL this host (include/uapi/linux/if_addr.h).
     const bytes = local orelse peer orelse return null;
     if (family == linux.AF.INET and bytes.len == 4) return .{ .ipv4 = mem.readInt(u32, bytes[0..4], .big) };
     if (family == linux.AF.INET6 and bytes.len == 16)

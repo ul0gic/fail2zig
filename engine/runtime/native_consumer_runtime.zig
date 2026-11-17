@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Restores, validates and runs the DNS and per-jail detection consumers against their stored manifests and checkpoints.
+// Holds: Consumer state reaches memory only after the store accepts it: each stage is committed or validated first, published second.
+
 const std = @import("std");
 const durable = @import("../core/record_store.zig");
 const state = @import("../core/native_consumer.zig");
@@ -129,6 +132,7 @@ pub const DnsRuntime = struct {
     }
     fn idleForRestore(self: *const DnsRuntime) !void {
         if (self.failed) return error.ConsumerRuntimeFailed;
+        // Why: Restore and validation may run inside the startup admission transaction, the one open transaction allowed here.
         if (self.store.api.get_autocommit(self.store.db) == 0 and !self.store.startupAdmissionActive()) return error.ConsumerTransactionActive;
         if (self.cache.in_flight) return error.ConsumerBusy;
         for (self.slots[0..self.count]) |slot| if (slot.owner.busy) return error.ConsumerBusy;
@@ -173,7 +177,7 @@ pub const DnsRuntime = struct {
         }, .{ .prepared_us = now_us, .clock_context = self, .clock = commitClock });
         return switch (outcome) {
             .retired => |retired| blk: {
-                // A released startup savepoint belongs only to this unpublished restore.
+                // Why: A retirement staged in the startup transaction is valid only before restore publishes and before any source binds.
                 if (retired.commit == .startup_staged and
                     (self.restored or self.count != 0 or !self.store.startupAdmissionActive())) return error.ConsumerTransactionActive;
                 break :blk retired;
@@ -228,7 +232,7 @@ pub const DnsRuntime = struct {
             return progress;
         }
         if (self.retire_examined == self.cache.entries.len) {
-            // Entries seen live early in a long scan may have expired by its end.
+            // Why: An entry seen live early in a pass may expire before it ends, so the cycle completes only if none did.
             const expired_during_scan = if (self.retire_next_expiry) |expiry| expiry <= now_us else false;
             self.retire_examined = 0;
             self.retire_next_expiry = null;
@@ -411,6 +415,7 @@ pub const DnsRuntime = struct {
             return failure;
         };
         if (result.answer.kind != .positive and result.answer.kind != .negative) return self.unknown(slot, now_ms);
+        // Why: A zero TTL answer may serve only the transaction in progress and should not be cached (RFC 1035 section 3.2.1).
         if (result.answer.ttl_seconds == 0) {
             if (result.answer.kind != .positive or pending.purpose != .subject) return self.unknown(slot, now_ms);
             try slot.owner.provideImmediate(result, now_ms, now_us);
@@ -551,7 +556,7 @@ pub const JailRuntime = struct {
             if (self.stage) |stage| stage.state.release(stage.state.context) else if (!self.published) self.next.destroy();
         }
     };
-    // Consumes next on success, unchanged, and failure; publication follows the caller's commit.
+    // Holds: Takes ownership of next on every path, including no change and failure; the caller publishes only after its commit.
     pub fn preparePolicy(self: *JailRuntime, next: *ignore.Snapshot, now_us: i64) !?PreparedPolicy {
         if (std.mem.eql(u8, next.payload, self.ignores.live.payload)) {
             next.destroy();

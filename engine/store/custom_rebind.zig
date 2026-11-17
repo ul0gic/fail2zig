@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Moves a jail's custom consumer inputs, cursors, checkpoints and owners from an old configuration generation to a new one.
+// Holds: Each rebind step runs only under startup admission and refuses unless the consumer revision equals the one its caller observed.
+
 const std = @import("std");
 const store = @import("store.zig");
 const consumers = @import("../core/native_consumer.zig");
@@ -301,7 +304,7 @@ pub fn Methods(comptime Store: type) type {
             errdefer self.rollback();
             if (try self.consumerRevision() != target.expected_consumer_revision) return error.StaleConsumerCheckpoint;
             try self.customEvidenceFenceTx(target);
-            // Each refusal uses an existing jail-leading primary key or explicit index prefix.
+            // Why: Every probe below searches a jail-leading primary key or the named index prefix, so none scans its table.
             for ([_][:0]const u8{
                 "SELECT 1 FROM checkpoints WHERE jail=?1 LIMIT 1;",
                 "SELECT 1 FROM records WHERE jail=?1 LIMIT 1;",

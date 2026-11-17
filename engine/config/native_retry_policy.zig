@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Builds a jail's retry policy from its effective configuration.
+// Holds: A maxretry of 0 or above retry.max_attempts, or a duration past i64 microseconds, is refused, never clamped.
+
 const std = @import("std");
 const config = @import("native.zig");
 const retry = @import("../core/native_retry.zig");

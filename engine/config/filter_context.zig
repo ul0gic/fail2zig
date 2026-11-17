@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
+// Does:  Prepares a filter asset for one jail, filling its parameters from the selector, the jail and an automatic logtype.
+// Holds: A selector parameter always wins: a jail option is copied in only when the selector did not set that key.
+
 const std = @import("std");
 const config = @import("fail2ban.zig");
 const A = std.mem.Allocator;

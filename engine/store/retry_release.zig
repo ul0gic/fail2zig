@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Releases a subject's retry lease and attempts, and closes open retry decisions when a whole-host scope is unbanned.
+// Holds: A release resets exactly one retry_states row inside its own write transaction and refuses below schema version 16.
+
 const canonical_scope = @import("../firewall/scope.zig");
 const detection = @import("../core/native_detection_record.zig");
 const store = @import("store.zig");

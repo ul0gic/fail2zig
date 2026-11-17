@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Bounds the state-file pages each kind of write can add and admits or refuses intake against the capacity line.
+// Holds: Intake that would take used plus owed pages past 262,144 is refused, and after a refusal reopens only 1,024 pages lower.
+
 const std = @import("std");
 const shared = @import("shared");
 const store = @import("store.zig");
@@ -17,23 +20,23 @@ pub const reclamation_pages: u64 = 2_048;
 pub const hysteresis_pages: u64 = 1_024;
 pub const owed_work_schema: i64 = 29;
 
-// SQLITE_DEFAULT_PAGE_SIZE (vendor/sqlite/sqlite3.c:14904); the store never sets page_size.
+// Why: SQLITE_DEFAULT_PAGE_SIZE is 4096 (vendor/sqlite/sqlite3.c:14904) and the store never sets page_size.
 const page_bytes: u64 = 4096;
-// Largest payload kept on a table leaf before spilling to overflow pages (sqlite3.c:76668).
+// Why: A table leaf keeps at most the usable size less 35 bytes of payload before spilling to overflow pages (sqlite3.c:76668).
 const max_local_bytes: u64 = page_bytes - 35;
-// Each overflow page carries the usable size less its next-page pointer (sqlite3.c:74664).
+// Why: Each overflow page carries the usable size less its 4-byte next-page pointer (sqlite3.c:74664).
 const overflow_bytes: u64 = page_bytes - 4;
-// balance() leaves a page alone while it is at least a third full (sqlite3.c:82368).
+// Why: balance() leaves a page alone while at least a third of it is in use (sqlite3.c:82368).
 const fill_divisor: u64 = 3;
-// Cell size is limited so at least four cells fit on a page (sqlite3.c:72278).
+// Why: SQLite limits cell size so at least four cells fit on a page (sqlite3.c:72278).
 const min_fanout: u64 = 4;
-// balance_nonroot turns at most three siblings into five (sqlite3.c:81492); balance_deeper adds the root's page.
+// Why: balance_nonroot turns at most three siblings into five (sqlite3.c:81492); balance_deeper adds the root's page.
 const pages_per_level: u64 = 2;
-// Schema 29 holds 119 b-trees: sqlite_schema rows with a root page.
+// Why: Schema version 29 creates 119 b-trees, the sqlite_schema rows with a root page.
 const schema_trees: u64 = 119;
-// Payload-size and rowid varints, header-size varint and the 2-byte cell pointer.
+// Why: Covers the payload-size, rowid and header-size varints and the 2-byte cell pointer.
 const cell_overhead: u64 = 20;
-// Serial types up to 2 x 16 MiB + 13 fit a 4-byte varint.
+// Why: Serial types up to 2 x 16 MiB + 13 fit a 4-byte varint.
 const column_header: u64 = 4;
 
 const max_depth: u64 = blk: {
@@ -154,6 +157,7 @@ pub fn Methods(comptime Store: type) type {
             const markers = try row.signed(1);
             const unsettled = try row.signed(2);
             if (live < 0) return error.LiveOwnerCounterInvalid;
+            // Why: Counters not marked reconciled are untrusted, so every live owner counts as unconfirmed and intents as the maximum.
             const trusted = try row.signed(3) == 1 and markers >= 0 and unsettled >= 0;
             const unconfirmed: u64 = @intCast(if (trusted) @max(0, live - markers) else live);
             const pending: u64 = if (trusted) @intCast(unsettled) else effects.max_intents;

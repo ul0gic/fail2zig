@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Records migration runs and their steps, stages imported owners and history, and activates or releases the staged owners.
+// Holds: Release touches only owners whose current decision id derives from this run and the staged row's sequence number.
+
 const std = @import("std");
 const effects = @import("../core/native_effect.zig");
 const Error = @import("store.zig").Error;
@@ -270,7 +273,7 @@ pub fn Methods(comptime Store: type) type {
                 var counter: [8]u8 = undefined;
                 std.mem.writeInt(u64, &counter, item.seq, .little);
                 const decision_id = effects.hashParts("fail2zig-migration-owner-v1", &.{ &run_id, &counter });
-                // Re-running activation after the owner was released or replaced must not reinstate the retired decision.
+                // Why: With the activation ledger a rerun skips rows already activated, so it cannot reinstate an owner since released.
                 if (ledger and !try self.recordMigrationActivationTx(run_id, item.seq, now)) {
                     if (try self.migrationOwnerCurrentTx(try (try effects.Scope.exact(scope)).key(installation), item.jail[0..item.jail_len], decision_id)) activated += 1;
                     continue;

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Runs one external tool from an argv vector, with optional stdin, a timeout and caps on stdout and stderr.
+// Holds: A child not yet reaped is killed and reaped on every return, and output past a cap fails the run instead of being cut short.
 
 const std = @import("std");
 const backend = @import("backend.zig");
@@ -75,6 +77,7 @@ fn runChild(allocator: std.mem.Allocator, argv: []const []const u8, input: ?[]co
         if (child.stdin) |stdin| {
             const written = std.posix.write(stdin.handle, pending) catch |err| switch (err) {
                 error.WouldBlock => 0,
+                // Why: A child that exits without reading its input closes the pipe; its exit status decides the run.
                 error.BrokenPipe => pending.len,
                 else => return error.SystemError,
             };
@@ -125,6 +128,7 @@ fn runChild(allocator: std.mem.Allocator, argv: []const []const u8, input: ?[]co
     return .{ .code = code, .stdout = stdout, .stderr = stderr };
 }
 
+// Why: std.process.Child writes a failed exec's error as a little-endian u64 on err_pipe; EOF means exec succeeded.
 fn checkSpawnPipe(fd: std.posix.fd_t) BoundedError!void {
     const flags = std.posix.fcntl(fd, std.posix.F.GETFL, 0) catch return error.SystemError;
     _ = std.posix.fcntl(fd, std.posix.F.SETFL, flags | @as(u32, @bitCast(std.posix.O{ .NONBLOCK = true }))) catch return error.SystemError;

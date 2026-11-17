@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Proves native ingestion, restart, source isolation, retry deadlines and enforcement readback by running the built daemon.
+// Holds: A daemon that enforces is started only after unsharing a network namespace distinct from the parent's; others run log-only.
+
 const std = @import("std");
 const t = std.testing;
 const engine = @import("engine");
@@ -647,8 +650,7 @@ fn expectMalformedDispositions(path: []const u8, decisions: i64) !void {
         if (index == 0) try t.expectEqual(@as(i64, 2), retained) else try t.expect(retained <= 2);
         const decision_query = try std.fmt.allocPrintZ(t.allocator, "SELECT count(*) FROM records r JOIN retry_decisions d USING(jail,source,occurrence) WHERE r.raw_hash=x'{s}';", .{std.fmt.fmtSliceHexLower(&hash)});
         defer t.allocator.free(decision_query);
-        // Only the damaged username retains a valid failure and address. Damage
-        // alone and a damaged address must never manufacture a decision.
+        // Why: Only the damaged username keeps a valid failure and address; damage alone or a damaged address yields no decision.
         try t.expectEqual(@as(i64, if (index == 0) 2 else 0), try store.inspectInteger(decision_query));
         const cursor_query = try std.fmt.allocPrintZ(t.allocator, "SELECT cursor FROM records WHERE raw_hash=x'{s}';", .{std.fmt.fmtSliceHexLower(&hash)});
         defer t.allocator.free(cursor_query);
@@ -831,7 +833,6 @@ test "native daemon: oversized source isolates its jail while independent file d
     }
     var cause_buffer: [160]u8 = undefined;
     const cause_text = try std.fmt.bufPrint(&cause_buffer, "paused ({s}", .{source_cause.?});
-    // Exercise the delivered formatter against the same actual daemon fault.
     const checks = [_]struct { format: []const u8, command: []const u8, needle: []const u8 }{
         .{ .format = "plain", .command = "status", .needle = "unhealthy_sources\t1" },
         .{ .format = "plain", .command = "status", .needle = "storage\thealthy" },

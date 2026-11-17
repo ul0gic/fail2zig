@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Builds the journald detection plan for one jail: origin profile, ignore set, built-in detector and processing options.
+// Holds: A disabled, unadmitted or non-journald jail, or a record or decoded limit over 64 KiB, is refused before any allocation.
+
 const std = @import("std");
 const config = @import("native.zig");
 const builtin = @import("../core/native_builtin_detector.zig");
@@ -44,8 +47,7 @@ pub const Plan = struct {
         const seconds = jail.effectiveFindtime(cfg.defaults);
         if (seconds == 0) return error.InvalidFindtime;
         const window = std.math.mul(i64, std.math.cast(i64, seconds) orelse return error.InvalidFindtime, 1_000_000) catch return error.InvalidFindtime;
-        // Validate before allocating; profile bytes must outlive a temporary
-        // discovered profile as well as callers' configuration storage.
+        // Why: The profile is checked before allocating, then rebuilt over owned copies so it outlives the caller's executable paths.
         _ = try origin.Profile.init(settings.machine_id, settings.executables);
         const executables = try a.alloc([]const u8, settings.executables.len);
         errdefer a.free(executables);

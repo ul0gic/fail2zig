@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Commits up to 64 intake records in one write transaction, each record under its own savepoint.
+// Holds: A dropped record rolls back to its savepoint and restores the noted counters; a batch whose savepoint failed never commits.
+
 const store = @import("store.zig");
 const budget = @import("budget.zig");
 const Error = store.Error;

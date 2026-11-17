@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Load reproduction rig: drives distinct PortSentry-style bans through a real nftables netlink backend in a rootless network namespace.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Starts a daemon with a portsentry jail on nftables, feeds distinct scan lines at a fixed rate and samples its status every second.
+# Holds: The script exits 1 when storage leaves healthy, the daemon exits, the generator fails or fewer bans than expected were recorded.
+
 set -uo pipefail
 umask 077
 BIN="$1"; WORK="$2"; TARGET="$3"; RATE="$4"; BANTIME="${5:-600}"
@@ -48,7 +52,6 @@ timestamp = "iso8601"
 logpath = ["$LOG"]
 maxretry = 1
 EOF
-# attach needs a daemon-written checkpoint per jail, so each extra jail ingests one line before the run.
 for j in $(seq 2 "${JAILS:-1}"); do
   : > "$WORK/portsentry-$j.log"
   cat >> "$WORK/config.toml" <<EOF
@@ -102,7 +105,6 @@ sample() {
 }
 python3 "$(dirname "$0")/feed.py" "$LOG" "$TARGET" "$RATE" >> "$WORK/rig.log" 2>&1 &
 GPID=$!
-# sampler: 1 Hz until storage leaves healthy or generator done + settle window
 last_cpu=$(cpu_ticks); last_t=$(date +%s.%N)
 settle=0
 result=0

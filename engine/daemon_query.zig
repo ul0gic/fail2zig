@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Builds the status, ban list, metrics, health and version 1 query pages from published daemon state and the read-only store.
+// Holds: Published state is copied while the coordinator mutex is held; rendering and store reads run only after it is released.
+
 const std = @import("std");
 const shared = @import("shared");
 const config = @import("config/native.zig");
@@ -63,11 +66,10 @@ const LegacyBanItem = struct {
     expired: bool,
 };
 const BanCapture = struct { name: []const u8, entries: []const shared.types.TimedEntry };
-// Captures use exact fixed backing allocations; outputs reserve their admitted byte cap.
 const capture_padding = (max_jails * 12 + 4) * (@alignOf(u128) - 1);
 const status_capture_bytes = query_v1.max_response_bytes + max_jails * daemon.max_source_status_per_jail * @sizeOf(SourceJson) + capture_padding;
 const legacy_capture_bytes = max_jails * 64 + (legacy_item_bound + 1) * @sizeOf(LegacyBanItem) + max_jails * native_banip.max_banip_entries * @sizeOf(shared.types.TimedEntry) + capture_padding;
-// Even an empty JSON string needs two quote bytes: no fitting config can exceed this slot bound.
+// Why: Every JSON string costs at least two quote bytes, so a config view that fits the response bound has at most half as many strings.
 const config_capture_bytes = query_v1.max_response_bytes + (query_v1.max_response_bytes / 2) * @sizeOf([]const u8) + max_jails * @sizeOf(query_v1.JailConfig) + capture_padding;
 const match_capture_bytes = query_v1.max_items_per_page * retry.max_evidence_text_bytes;
 const history_capture_bytes = match_capture_bytes + query_v1.max_items_per_page * 64 + capture_padding;
@@ -82,7 +84,7 @@ const ignore_capture_bytes = ignore_string_bytes + max_jails * @as(usize, @max(i
 const capture_bytes = @max(@max(status_capture_bytes, legacy_capture_bytes), @max(config_capture_bytes, @max(history_capture_bytes, @max(scopes_detail_capture_bytes, ignore_capture_bytes))));
 
 pub fn queryCaptureCost() resource.Cost {
-    // A bounded response can overlap its final owned copy; captures use one exact backing allocation.
+    // Why: A rendered response and its final owned copy are live at once, so two response bounds are charged.
     const expiry_scratch = native_banip.max_banip_entries * (@sizeOf(ExpiredBan) + @sizeOf(?i64));
     const match_scratch = history.max_page * (@sizeOf(durable.Store.OperatorOwner) + 2 * @sizeOf(history.Event) + @sizeOf(?[]u8) + @sizeOf(*query_v1.ScopeItem)) + query_v1.max_items_per_page * @sizeOf(query_v1.HistoryEvent);
     const capture_stack = @sizeOf(custom_ignore.Entry) + @sizeOf(dns.Name) + match_scratch + expiry_scratch + config.max_configured_jails * @sizeOf(detection.Name) + max_jails * @sizeOf(BanCapture) + (max_jails + 1) * @sizeOf(IgnoreJail) + @sizeOf(metrics_mod.Snapshot);
@@ -340,6 +342,7 @@ pub fn Methods(comptime Coordinator: type) type {
             }
             return count;
         }
+        // Holds: The read transaction stays open only when the store's latest config generation is published and equals the captured one.
         fn beginConfigRead(reader: *durable.Store, generation: [32]u8) !void {
             try reader.beginRead();
             errdefer reader.rollback();
@@ -416,6 +419,7 @@ pub fn Methods(comptime Coordinator: type) type {
                     }
                 }
                 try reader.commitTransaction();
+                // Why: The store read ran outside the mutex, so a generation published meanwhile refuses the page instead of mixing two.
                 if (!self.unchanged(generation)) return error.SnapshotLimit;
             }
             var sink = query_v1.ByteSink{ .out = out, .allocator = a, .limit = legacy_allowance };
@@ -658,7 +662,7 @@ pub fn Methods(comptime Coordinator: type) type {
                 .ipv6 => |value| .{ .v6 = .{ .net = value, .mask = std.math.maxInt(u128) } },
             });
         }
-        // buildIgnore stores the configured prefix before file values and tagged self entries.
+        // Why: buildIgnore puts configured entries before ignore_file values, so the first configured_count entries are configuration.
         fn copyCustomIgnore(memory: *CaptureMemory, snapshot: *const custom_ignore.Snapshot, configured_count: usize) !IgnoreProjection {
             if (snapshot.entries.len > custom_ignore.max_entries or configured_count > snapshot.entries.len) return error.IgnoreLimit;
             const allocator = memory.fixed.allocator();
@@ -896,6 +900,7 @@ pub fn Methods(comptime Coordinator: type) type {
                 try out.append(.{ .sequence = event.sequence, .event_id = event.event_id, .jail = try memory.text(event.jail.slice()), .decision_id = event.decision_id, .confirmed_us = event.confirmed_us, .scope = try query_v1.projectScope(event.scope.canonical), .native_retry = event.native_retry, .origin = event.origin, .match = line });
             }
         }
+        // Why: A jail filter can skip every event, so one page scans at most 16 store pages and returns where to resume.
         const history_scan_pages = 16;
         fn historyReadPlain(ctx: ?*anyopaque, jail: ?[]const u8, after_sequence: u64, limit: u16, out: *std.ArrayList(query_v1.HistoryEvent)) anyerror!query_v1.HistoryRead {
             const self: *Coordinator = @ptrCast(@alignCast(ctx.?));
@@ -966,6 +971,7 @@ pub fn Methods(comptime Coordinator: type) type {
             }
             return .{ .jails = jails, .global = .{ .log_level = @tagName(cfg.global.log_level), .firewall = @tagName(cfg.global.firewall), .metrics_enabled = cfg.global.metrics_enabled, .metrics_bind = try memory.text(cfg.global.metrics_bind), .metrics_port = cfg.global.metrics_port, .socket_path = if (redact) redacted_text else try memory.text(cfg.global.socket_path), .state_file = if (redact) redacted_text else try memory.text(cfg.global.state_file), .dns_server = if (redact) redacted_text else if (cfg.global.dns_server) |value| try memory.text(value) else null, .timezone_root = if (redact) redacted_text else try memory.text(cfg.global.timezone_root), .history_max_matches = cfg.global.history_max_matches } };
         }
+        // Holds: Every return to the mutex checks the fence first, so a page never joins rows from two publications.
         fn copyScopes(self: *Coordinator, memory: *CaptureMemory, body: []const u8, parse_arena: std.mem.Allocator, fence: *const CaptureFence) !query_v1.ScopesView {
             const allocator = memory.fixed.allocator();
             const jails = try allocator.alloc(query_v1.JailScopes, fence.count);
@@ -1017,7 +1023,7 @@ pub fn Methods(comptime Coordinator: type) type {
                     if (!self.jailEnforces(jail) and jail.retry_revision == null) return error.HistoryUnavailable;
                     live = if (self.jailEnforces(jail)) jail.owner_range.len else jail.active.len;
                     start = if (i == first and window.cursor_jail != null) self.keysetStart(jail, window.cursor_key.slice(), live) else 0;
-                    // A following live row proves that another page exists without reading its payload.
+                    // Why: With the page full, one more live row proves another page exists, so its payload is not read.
                     if (filled == storage.len and live > start) {
                         jails[i].count = live;
                         break;

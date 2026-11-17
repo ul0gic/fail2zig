@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Encodes nf_tables netlink messages and runs the nftables backend's scaffold install and element bans over netlink.
+// Holds: The table, both sets, the input chain and both drop rules go to the kernel in one batch, so it commits all of them or none.
 
 const std = @import("std");
 const native_endian = @import("builtin").cpu.arch.endian();
@@ -11,6 +13,7 @@ const backend = @import("backend.zig");
 const netlink = @import("netlink.zig");
 const canonical = @import("scope.zig");
 
+// Why: Unless marked otherwise, the numbers below are from include/uapi/linux/netfilter/nf_tables.h.
 pub const NFT_MSG = struct {
     pub const NEWTABLE: u16 = 0;
     pub const GETTABLE: u16 = 1;
@@ -85,11 +88,13 @@ pub const NLA_F_NESTED: u16 = 1 << 15;
 
 pub const NFT_SET_TIMEOUT: u32 = 16;
 
+// Why: Key types are nft userspace datatype ids (TYPE_IPADDR, TYPE_IP6ADDR in nftables' include/datatype.h), not kernel values.
 pub const NFT_TYPE = struct {
     pub const IPV4_ADDR: u32 = 7;
     pub const IPV6_ADDR: u32 = 8;
 };
 
+// Why: Hook numbers from include/uapi/linux/netfilter.h.
 pub const NF_INET_HOOK = struct {
     pub const PREROUTING: u32 = 0;
     pub const LOCAL_IN: u32 = 1;
@@ -178,16 +183,19 @@ pub const NFT_REG = struct {
     pub const REG_1: u32 = 1;
 };
 
+// Why: NF_DROP and NF_ACCEPT from include/uapi/linux/netfilter.h.
 pub const NF_VERDICT = struct {
     pub const DROP: u32 = 0;
     pub const ACCEPT: u32 = 1;
 };
 
+// Why: Source address offsets in the IPv4 header (RFC 791 section 3.1) and the IPv6 header (RFC 8200 section 3).
 pub const IPV4_SADDR_OFFSET: u32 = 12;
 pub const IPV4_SADDR_LEN: u32 = 4;
 pub const IPV6_SADDR_OFFSET: u32 = 8;
 pub const IPV6_SADDR_LEN: u32 = 16;
 
+// Why: Attribute alignment and header length from include/uapi/linux/netlink.h.
 const NLA_ALIGNTO: usize = 4;
 const NLA_HDRLEN: usize = 4;
 
@@ -305,6 +313,7 @@ pub fn buildSetQueryPayload(buf: []u8, table_name: []const u8, set_name: []const
 
 pub fn buildOwnedTablePayload(buf: []u8, table_name: []const u8, marker: []const u8) netlink.Error![]const u8 {
     const base = try buildTablePayload(buf, netlink.NFPROTO.INET, table_name);
+    // Why: Attribute 6 is NFTA_TABLE_USERDATA; the readback refuses a table under this name without the same marker there.
     const end = try appendAttr(buf, base.len, 6, marker);
     return buf[0..end];
 }
@@ -596,6 +605,7 @@ pub fn buildScopedDropRulePayload(
     userdata: []const u8,
 ) ScopeBuildError![]const u8 {
     const part = try scopeRulePart(scope, part_index);
+    // Why: NFT_USERDATA_MAXLEN is 256.
     if (userdata.len == 0 or userdata.len > 256) return error.InvalidRulePart;
     if (buf.len < @sizeOf(netlink.nfgenmsg)) return error.BufferTooSmall;
     const ng: *netlink.nfgenmsg = @alignCast(@ptrCast(&buf[0]));
@@ -619,6 +629,7 @@ pub fn buildScopedDropRulePayload(
     offset = try appendCompare(buf, offset, NFT_CMP.EQ, scope.subject.address[0..address_len]);
     if (part.protocol) |protocol| {
         offset = try appendMetaLoad(buf, offset, NFT_META.L4PROTO);
+        // Why: IP protocol numbers from the IANA registry (protocols(5)).
         const number: u8 = switch (protocol) {
             .tcp => 6,
             .udp => 17,
@@ -629,6 +640,7 @@ pub fn buildScopedDropRulePayload(
         offset = try appendCompare(buf, offset, NFT_CMP.EQ, &.{number});
     }
     if (part.port) |port| {
+        // Why: The destination port is bytes 2..4 of both the TCP header (RFC 9293 section 3.1) and the UDP header (RFC 768).
         offset = try appendPayloadLoad(buf, offset, NFT_PAYLOAD.TRANSPORT_HEADER, 2, 2);
         var first: [2]u8 = undefined;
         mem.writeInt(u16, &first, port.first, .big);
@@ -857,6 +869,7 @@ fn sendScaffold(self: *NftablesBackend) backend.BackendError!void {
     var sock_ptr = &(self.sock orelse return error.NotAvailable);
     const table_name = self.tableName();
 
+    // Why: The table is deleted first so the install starts from nothing; NotFound means no table was there.
     {
         var del_buf: [256]u8 = undefined;
         const del_payload = buildDeleteTablePayload(
@@ -1103,8 +1116,10 @@ fn banImpl(
 ) backend.BackendError!void {
     _ = jail;
     const self = castSelf(ctx);
+    // Why: NLM_F_EXCL refuses an element already present, so a repeat ban deletes and re-adds it in one batch to set the new timeout.
     putElement(self, ip, duration, false) catch |err| switch (err) {
         error.AlreadyBanned => putElement(self, ip, duration, true) catch |replace_err| switch (replace_err) {
+            // Why: An element that expired or was removed after the first attempt fails the delete, so the plain add runs again.
             error.NotBanned => try putElement(self, ip, duration, false),
             else => return replace_err,
         },
@@ -1290,7 +1305,6 @@ fn mapNetlinkErr(err: netlink.Error) backend.BackendError {
     };
 }
 
-// Expose only internals exercised by the out-of-module component tests.
 pub const TestAccess = if (@import("builtin").is_test) struct {
     pub const backendModule = backend;
     pub const alignAttribute = nlaAlign;

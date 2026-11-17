@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Proves how the daemon behaves with no usable firewall backend: fail-closed exit, DEGRADED log-only, forced backends, no listener.
+// Holds: No case changes the host firewall: each runs unprivileged, with an empty or stub PATH, or inside `unshare -Urn`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -78,6 +80,7 @@ fn runToExit(a: std.mem.Allocator, argv: []const []const u8, env: ?*const std.pr
     };
 }
 
+// Does:  Finds an error return trace by its header text or by a stack frame of the form 0x<hex> in <symbol>.
 fn hasErrorReturnTrace(text: []const u8) bool {
     if (std.mem.indexOf(u8, text, "error return trace") != null) return true;
     var i: usize = 0;
@@ -294,6 +297,7 @@ const Scenario = struct {
 
     fn init(a: std.mem.Allocator) !Scenario {
         if (builtin.os.tag != .linux) return error.SkipZigTest;
+        // Why: These cases need an unprivileged process, so uid 0 skips them.
         if (linux.geteuid() == 0) return error.SkipZigTest;
         return initAnyUid(a);
     }
@@ -315,6 +319,7 @@ const Scenario = struct {
         errdefer a.free(log_path);
         const socket_path = try std.fmt.allocPrint(a, "{s}/sock/fail2zig.sock", .{root});
         errdefer a.free(socket_path);
+        // Why: sockaddr_un.sun_path holds 108 bytes including the terminating NUL (unix(7)), so a longer socket path cannot bind.
         if (socket_path.len >= 108) return error.SkipZigTest;
 
         var f = try std.fs.cwd().createFile(log_path, .{});
@@ -826,6 +831,7 @@ test "integration: forced backend (e) firewall = \"ipset\" off PATH + on_no_back
     try testing.expect(!hasErrorReturnTrace(text));
 }
 
+// Why: The script rewrites firewall_namespace to its own /proc/$$/ns/net so the daemon targets the namespace unshare created.
 const userns_status_script =
     \\sed -i "s#^firewall_namespace = .*#firewall_namespace = \"/proc/$$/ns/net\"#" "$4"
     \\"$1" --foreground --config "$4" & p=$!
@@ -866,6 +872,7 @@ test "integration: forced backend (f) firewall = \"nftables\" in an owned netns 
     var r = try runToExit(a, &argv, null);
     defer r.deinit(a);
 
+    // Why: A kernel without nf_tables, or one that denies netlink to an unprivileged namespace, skips the case and prints the cause.
     if (lineContaining(r.stderr, "no usable backend (forced by config)")) |line| {
         if (std.mem.indexOf(u8, line, "nf_tables not in kernel") != null or std.mem.indexOf(u8, line, "netlink denied") != null) {
             std.debug.print("skipping: nf_tables not reachable from an unprivileged user namespace here: {s}\n", .{line});

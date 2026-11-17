@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Proves --validate-config names the key, line, column and jail of a bad config, and that durations reach the daemon as seconds.
+// Holds: Each case runs the built zig-out/bin/fail2zig on a config in a private temp directory and judges only exit code and output.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -49,6 +51,7 @@ fn validateConfig(a: std.mem.Allocator, config_path: []const u8) !Run {
     };
 }
 
+// Does:  Finds an error return trace by its header text or by a stack frame of the form 0x<hex> in <symbol>.
 fn hasErrorReturnTrace(text: []const u8) bool {
     if (std.mem.indexOf(u8, text, "error return trace") != null) return true;
     var i: usize = 0;
@@ -135,6 +138,7 @@ const Fixture = struct {
             \\
             \\
         , .{ self.root, self.root });
+        // Why: Padding lines 14 to 30 are numbered by line, which puts line37 on line 37 of a 40-line file.
         var n: usize = 14;
         while (n <= 30) : (n += 1) try w.print("# padding line {d}\n", .{n});
         try w.print(

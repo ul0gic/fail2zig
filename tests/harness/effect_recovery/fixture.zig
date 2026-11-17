@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Verifies effect recovery on an existing state file and the kernel firewall: owner refusals, stale evidence, drift and rollback.
+// Holds: It refuses to run unless F2Z_NATIVE_PARENT_NETNS names a namespace other than the current network namespace.
+
 const std = @import("std");
 const engine = @import("engine_test");
 const effects = engine.core.native_effect;
@@ -37,6 +40,7 @@ pub fn main() !void {
     if (admitted != .installed or admitted.installed.snapshot.state != .owned or admitted.installed.snapshot.entries.len != 0) return error.ExpectedEmptyOwnedFirewall;
     const observed = std.time.microTimestamp();
     const fingerprint = admitted.installed.snapshot.fingerprint;
+    // Why: The release intents must be created at a later microsecond than the observation, so the observation is stale when settled.
     std.Thread.sleep(std.time.ns_per_ms);
     var owners: [effects.max_page]effects.Owner = undefined;
     const count = try store.effectOwners(entry.scope_key, entry.revision, &owners);

@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Records admin requests, config generations, jail admin states and retry-policy transitions for the admin and reload paths.
+// Holds: Each non-rejected admin request, reload or policy transition raises the mutation revision by one in the transaction recording it.
+
 const std = @import("std");
 const retry = @import("../core/native_retry.zig");
 const effects = @import("../core/native_effect.zig");
@@ -204,6 +207,7 @@ pub fn Methods(comptime Store: type) type {
                 try insert.blob(4, jail.allowlist_snapshot);
                 try insert.done();
             }
+            // Why: The newest 8 unpublished, unreferenced generations are kept, and at most 32 older ones are deleted per write.
             try self.exec(std.fmt.comptimePrint("DELETE FROM config_generations WHERE generation IN (SELECT generation FROM config_generations g WHERE g.published=0 AND NOT EXISTS(SELECT 1 FROM jail_admin_states s WHERE s.generation=g.generation) ORDER BY g.committed_us DESC,g.generation DESC LIMIT {d} OFFSET {d});", .{ config_generation_prune_page, unreferenced_config_generations_kept }));
         }
 
@@ -262,6 +266,7 @@ pub fn Methods(comptime Store: type) type {
         }
         pub const AdminReplay = struct { kind: AdminKind, outcome: AdminOutcome, mutation_revision: u64 };
         pub const AdminAdmission = union(enum) { fresh, replayed: AdminReplay };
+        // Holds: Retention never prunes a partial or uncertain disable request that still pins a disabled jail in the bound generation.
         const unpinned_admin_request = "NOT (kind=2 AND outcome IN(4,5) AND EXISTS(SELECT 1 FROM jail_admin_states s WHERE s.jail=CAST(admin_requests.subject AS TEXT) AND s.enabled=0 AND s.request_id=admin_requests.request_id AND EXISTS(SELECT 1 FROM config_generation_jails c WHERE c.generation=?2 AND c.jail=s.jail)))";
         pub const JailAdminState = struct {
             jail: []const u8,

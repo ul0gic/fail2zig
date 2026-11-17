@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Checks a sustained-load run's kernel samples, status samples and database against the ban lifecycle limits and writes summary.json.
+# Holds: A full acceptance run is never reported as pass: plateau and hot renewal stay unverified, so its best result is incomplete.
+
 """Evaluate existing B5 evidence; no daemon control and no product imports."""
 import datetime
 import hashlib
@@ -243,8 +248,7 @@ def evaluate(work):
                    and row['storage'] == 'healthy' for row in tail))
         result['settled_idle_cpu_percent'] = ((tail[-1]['cpu'] - tail[0]['cpu']) * 100 /
                    meta['clk_tck'] / (tail[-1]['t'] - tail[0]['t'])) if settled else None
-        # Original driver does not independently prove stable load plateau or
-        # each hot-subject renewal. Never convert their absence into acceptance.
+        # Why: Plateau and hot renewal are not measured here, so both stay false and a full run can never be marked acceptance complete.
         result['plateau_verified'] = False
         result['hot_renewal_verified'] = False
         if full:

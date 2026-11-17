@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Evicts rows past the 65,536-row cap from retry_retired and confirmed_policy_summaries and warns at most once a minute.
+// Holds: A row whose subject still has a retry decision or a non-absent effect is moved to the highest rowid, never deleted.
+
 const std = @import("std");
 const effects = @import("../core/native_effect.zig");
 const detection = @import("../core/native_detection_record.zig");

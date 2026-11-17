@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Runs journal source preparation and selection for each request in a JSON fixture and prints the results as a JSON list.
+// Holds: File readability comes from each request's unreadable list, never from access(2) on the host running the probe.
+
 const std = @import("std");
 const policy = @import("engine_probe").core.journal_policy;
 const Request = struct {

@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Plans one jail's log source from fail2ban-format options: backend selector, log paths, journal matches, ignore and processing.
+// Holds: An option that fails to resolve is kept as a diagnostic, never dropped, and bind refuses a plan with any plan-level diagnostic.
+
 const std = @import("std");
 const config = @import("fail2ban.zig");
 const policy = @import("../core/source_policy.zig");
@@ -164,6 +167,7 @@ pub const Plan = struct {
             if (line.len == 0) continue;
             const words = try shellWords(allocator, line);
             if (words.len == 0) return error.EmptyJournalMatchGroup;
+            // Why: A "+" word between match groups combines them as a logical OR (journalctl(1)).
             if (result.items.len != 0) try result.append("+");
             try result.appendSlice(words);
         }
@@ -196,6 +200,7 @@ fn read(allocator: Allocator, ini: *const config.ParsedIni, section: []const u8,
     if (option.reader.?.presence == .absent) {
         if (defaults.values) |values| if (values.get(key)) |value| {
             var parsed = try config.parseIniSource(allocator, "prepared-filter-default", "[Definition]\n");
+            // Why: Doubling '%' makes the reader take the filter default literally instead of interpolating it again.
             const literal = try std.mem.replaceOwned(u8, allocator, value, "%", "%%");
             try parsed.sections.getPtr("Definition").?.keys.put(allocator, key, literal);
             const converted = config.readTypedOption(allocator, &parsed, "Definition", key, kind, fallback, default_id) catch |err| switch (err) {
@@ -287,6 +292,7 @@ pub fn prepare(allocator: Allocator, source_ini: *const config.ParsedIni, jail_n
     if (string(logpath)) |raw| {
         var lines = std.mem.splitScalar(u8, raw, '\n');
         while (lines.next()) |line| {
+            // Why: The word after a logpath line's last space is its start mode, head or tail; a line without one starts at head.
             const split = std.mem.lastIndexOfScalar(u8, line, ' ');
             const pattern = if (split) |index| line[0..index] else line;
             const spelling = if (split) |index| line[index + 1 ..] else "head";

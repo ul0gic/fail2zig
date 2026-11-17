@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Renders daemon responses as table, plain or JSON output, fitting tables to the terminal width.
+// Holds: Text passed through renderDiagnostic or writeEscaped carries no C0, DEL, C1 or bidirectional control codepoint to the terminal.
 
 const std = @import("std");
 const shared = @import("shared");
@@ -91,7 +93,6 @@ pub const StatusPayload = struct {
     expiry_uncertain: ?bool = null,
     next_committed_expiry_us: ?i64 = null,
     paused_sources: ?u32 = null,
-    // Absent on older daemon responses; null means the count is unknown.
     missing_sources: ?u32 = null,
     state_file_bytes: ?u64 = null,
     state_file_pages: ?u64 = null,
@@ -312,6 +313,7 @@ fn formatStatusReport(
     }
 }
 
+// Does:  Adds loss_events to the daemon's status object by writing it before the closing brace; the daemon's bytes are not re-encoded.
 fn writeStatusJsonWithLoss(writer: anytype, payload_json: []const u8, report: LossReport) !void {
     const object = std.mem.trim(u8, payload_json, " \t\r\n");
     if (object.len < 2 or object[0] != '{' or object[object.len - 1] != '}') return error.InvalidStatusPayload;
@@ -1148,6 +1150,7 @@ fn diagnosticUnit(input: []const u8) DiagnosticUnit {
     return .{ .input_len = sequence_len, .output_len = sequence_len, .kind = .raw };
 }
 
+// Why: C1 controls and the bidirectional marks, embeddings and isolates (Unicode UAX #9) can reorder or hide what the terminal shows.
 fn isUnsafeUnicodeControl(codepoint: u21) bool {
     return (codepoint >= 0x80 and codepoint <= 0x9f) or
         codepoint == 0x061c or
@@ -1198,6 +1201,7 @@ fn writeEscaped(writer: anytype, input: []const u8) !void {
     }
 }
 
+// Holds: The result fits both the buffer and 96 bytes, never splits an escape, and marks a cut input with trailing dots.
 fn renderDiagnostic(buffer: []u8, input: []const u8) []const u8 {
     const capacity = @min(buffer.len, diagnostic_max_bytes);
     if (capacity == 0) return buffer[0..0];
@@ -1285,6 +1289,7 @@ fn padTo(writer: anytype, used: usize, target: usize) !void {
     if (used < target) try writeSpaces(writer, target - used);
 }
 
+// Holds: A result the formatters below return from scratch is overwritten by the next such call, so each is used before the next.
 threadlocal var scratch: [64]u8 = undefined;
 
 fn formatUptime(opt: ?u64) []const u8 {
@@ -1556,6 +1561,7 @@ fn writeListTable(writer: anytype, entries: []const BanEntry, color: Color, now:
     const confirmation_col = colWidth("CONFIRMATION", confirmation_w);
     const full_width = ip_col + jail_col + origin_col + time_col + confirmation_col + if (details) count_col else 0;
     if (full_width <= columns) return writeListColumns(writer, entries, color, now, ip_col, jail_col, origin_col, time_col, confirmation_col, count_col, details, columns, details);
+    // Why: 76 is the sum of the fixed widths passed below (25 + 16 + 10 + 12 + 13).
     if (columns >= 76) return writeListColumns(writer, entries, color, now, 25, 16, 10, 12, 13, 0, false, columns, details);
     try writeListStacked(writer, entries, color, now, columns, details);
 }
@@ -1659,7 +1665,7 @@ fn writeMatchedLine(writer: anytype, matches: ?[]const []const u8, columns: usiz
             const unit = diagnosticUnit(line[index..]);
             emitUnit(unit_buffer[0..unit.output_len], line[index..][0..unit.input_len], unit);
             if (unit.kind == .hex and unit.input_len > 1) {
-                // Keep each byte escape intact even when the escaped codepoint wraps.
+                // Why: Each \xNN goes out as its own chunk, so a wrap may fall between byte escapes but never inside one.
                 var offset: usize = 0;
                 while (offset < unit.output_len) : (offset += 4) {
                     try writeMatchedChunk(out, unit_buffer[offset..][0..4], width, continuation, &column);
@@ -1813,7 +1819,7 @@ fn writeJailsTable(writer: anytype, jails: []const JailEntry, color: Color, colu
     const source_col = colWidth("SOURCE", longestJailText(jails, "log_source"));
     const health_col = @max("HEALTH".len, @min(w.health, diagnostic_max_bytes)) + 1;
     const full_width = name_col + state_col + active_col + max_col + find_col + ban_col + action_col + mode_col + protection_col + source_col + health_col;
-    // Requested detail fields must survive the narrow layout.
+    // Why: Too narrow for every column, the detail view stacks rows so max retry, find time and ban time are still shown.
     if (full_width > columns) return writeJailsStacked(writer, jails, color, columns, true);
 
     try color.on(writer, Color.bold);
@@ -2050,6 +2056,7 @@ fn writeCell(writer: anytype, s: []const u8, width: usize) !void {
     const value_max = width - 1;
     if (s.len <= value_max) return padRightPrint(writer, s, width);
     var cut = value_max - 3;
+    // Why: Bytes of the form 10xxxxxx continue a UTF-8 character (RFC 3629 section 3), so the cut moves back to a character start.
     while (cut > 0 and (s[cut] & 0xC0) == 0x80) cut -= 1;
     try writer.writeAll(s[0..cut]);
     try writer.writeAll("...");
@@ -2385,6 +2392,7 @@ fn writeShellArg(writer: anytype, text: []const u8) !void {
     try writer.writeByte('\'');
     var start: usize = 0;
     for (text, 0..) |byte, index| {
+        // Why: writeEscaped would double a backslash, which single quotes keep literally, so a backslash is written as itself.
         if (byte != '\'' and byte != '\\') continue;
         try writeEscaped(writer, text[start..index]);
         try writer.writeAll(if (byte == '\'') "'\\''" else "\\");
@@ -3885,6 +3893,7 @@ fn formatUtc(buffer: *[32]u8, confirmed_us: ?i64) []const u8 {
     const us = confirmed_us orelse return "-";
     if (us < 0) return "out-of-range";
     const secs: u64 = @intCast(@divTrunc(us, std.time.us_per_s));
+    // Why: 253402300799 is 9999-12-31 23:59:59 UTC, the last second whose year prints in four digits.
     const max_supported_utc_seconds: u64 = 253_402_300_799;
     if (secs > max_supported_utc_seconds) return "out-of-range";
     const day = std.time.epoch.EpochSeconds{ .secs = secs };

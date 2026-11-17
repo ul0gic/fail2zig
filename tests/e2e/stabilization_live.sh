@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Proves on an installed unit that config validation flags a deprecated and an unknown key and the daemon refuses a 0666 config.
+# Holds: Teardown on every exit restores the live config bytes, owner and mode and the unit's earlier active state.
 
 set -euo pipefail
 

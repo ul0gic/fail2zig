@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Builds, sends and receives netfilter netlink messages and checks kernel replies, acknowledgments and dumps.
+// Holds: A dump completes only on NLMSG_DONE for its own sequence; NLM_F_DUMP_INTR or a changed generation fails it as interrupted.
 
 const std = @import("std");
 const native_endian = @import("builtin").cpu.arch.endian();
@@ -8,6 +10,7 @@ const posix = std.posix;
 const linux = std.os.linux;
 const mem = std.mem;
 
+// Why: Alignment, header layout, message types and flags in this file are those of include/uapi/linux/netlink.h.
 pub const NLMSG_ALIGNTO: usize = 4;
 
 pub fn nlmsgAlign(len: usize) usize {
@@ -68,6 +71,7 @@ pub const Attributes = struct {
         const aligned = (len + 3) & ~@as(usize, 3);
         if (aligned > tail.len) return error.TruncatedMessage;
         self.offset += aligned;
+        // Why: The top two type bits are NLA_F_NESTED and NLA_F_NET_BYTEORDER, not part of the attribute kind.
         return .{ .kind = kind & 0x3fff, .flags = kind & 0xc000, .value = tail[4..len] };
     }
 };
@@ -113,6 +117,7 @@ pub fn recvEvents(sock: *NetlinkSocket, scratch: []u8) Error!?[]const u8 {
         .NOBUFS => return error.EventsOverflowed,
         else => return error.RecvFailed,
     }
+    // Why: The kernel reports multicast group n as bit n-1 of nl_groups, so a message from any other group is refused.
     const expected_groups = @as(u32, 1) << @intCast(sock.group - 1);
     if (msg.namelen != @sizeOf(linux.sockaddr.nl) or sender.family != posix.AF.NETLINK or sender.pid != 0 or sender.groups != expected_groups) return error.RecvFailed;
     if ((msg.flags & (linux.MSG.TRUNC | linux.MSG.CTRUNC)) != 0 or rc == 0 or rc > scratch.len) return error.TruncatedMessage;
@@ -152,9 +157,9 @@ pub const Dump = struct {
         self.count += 1;
         if (item.hdr.seq != self.sequence) return null;
         if (self.complete or (item.hdr.pid != 0 and item.hdr.pid != self.port_id)) return error.NetlinkError;
-        // NLM_F_DUMP_INTR: the kernel's generation moved during this dump, so the
-        // reply is not one consistent picture and the whole dump must be re-read.
+        // Why: 0x10 is NLM_F_DUMP_INTR: the ruleset changed during the dump, so the reply is not one consistent picture.
         if ((item.hdr.flags & 0x10) != 0) return error.DumpInterrupted;
+        // Why: Types 2 and 3 are NLMSG_ERROR and NLMSG_DONE, and flag 2 below is NLM_F_MULTI.
         const kind = @intFromEnum(item.hdr.type);
         if (kind == 2) {
             if (item.payload.len < 4 + NLMSG_HDRLEN) return error.TruncatedMessage;
@@ -174,7 +179,7 @@ pub const Dump = struct {
         }
         if (kind != self.message_type or (item.hdr.flags & 2) == 0) return error.NetlinkError;
         if (item.payload.len < @sizeOf(nfgenmsg)) return error.TruncatedMessage;
-        // nfgenmsg.res_id, big-endian at payload bytes 2..4, is the base sequence; Linux 6.12 never sets NLM_F_DUMP_INTR on set-element dumps.
+        // Why: Linux 6.12 never sets NLM_F_DUMP_INTR on set-element dumps, so a changed res_id, the base sequence, marks the interruption.
         const generation = mem.readInt(u16, item.payload[2..4], .big);
         if (self.generation) |first| {
             if (first != generation) return error.DumpInterrupted;
@@ -185,6 +190,7 @@ pub const Dump = struct {
     }
 };
 
+// Why: errnoToError negates its argument, and negating minInt(i32) overflows.
 fn safeErrno(code: i32) Error {
     if (code == std.math.minInt(i32)) return error.NetlinkError;
     return errnoToError(code);
@@ -240,6 +246,7 @@ pub fn receiveAcknowledgments(sock: *NetlinkSocket, required: []const u32, relat
     }
 }
 
+// Why: The numbers are Linux errno values from include/uapi/asm-generic/errno-base.h.
 pub fn errnoToError(errno: i32) Error {
     const v: i32 = if (errno < 0) -errno else errno;
     return switch (v) {
@@ -252,9 +259,9 @@ pub fn errnoToError(errno: i32) Error {
     };
 }
 
-// linux/netlink.h: SOL_NETLINK option joining one multicast group by number.
+// Why: Option 1 at SOL_NETLINK joins one multicast group by its number (include/uapi/linux/netlink.h, netlink(7)).
 const NETLINK_ADD_MEMBERSHIP: u32 = 1;
-// 4 MiB holds about forty 1,024-element install batches of events between the worker's 100 ms drains.
+// Why: Events queue here between the worker's 100 ms wakes, and the kernel drops them with ENOBUFS once the buffer is full.
 pub const event_receive_bytes: u32 = 4 << 20;
 
 pub const NetlinkSocket = struct {
@@ -298,6 +305,7 @@ pub const NetlinkSocket = struct {
             else => error.SocketFailed,
         };
         const bytes: u32 = event_receive_bytes;
+        // Why: SO_RCVBUFFORCE passes rmem_max only with CAP_NET_ADMIN (socket(7)); without it the capped SO_RCVBUF is used.
         posix.setsockopt(sock.fd, posix.SOL.SOCKET, linux.SO.RCVBUFFORCE, mem.asBytes(&bytes)) catch {
             posix.setsockopt(sock.fd, posix.SOL.SOCKET, posix.SO.RCVBUF, mem.asBytes(&bytes)) catch return error.SocketFailed;
         };
@@ -457,6 +465,7 @@ pub const MessageBuilder = struct {
     }
 };
 
+// Does:  Walks messages leniently: a short or overrunning length ends the walk with null instead of an error.
 pub const MessageIterator = struct {
     buf: []const u8,
     offset: usize = 0,
@@ -492,6 +501,7 @@ pub fn parseNlmsgerr(payload: []const u8) Error!i32 {
     return mem.readInt(i32, payload[0..@sizeOf(i32)], native_endian);
 }
 
+// Why: Subsystem ids, the nf_tables group, struct nfgenmsg and the batch types are from include/uapi/linux/netfilter/nfnetlink.h.
 pub const NFNL = struct {
     pub const SUBSYS_NFTABLES: u16 = 10;
     pub const SUBSYS_IPSET: u16 = 6;
@@ -508,6 +518,7 @@ pub const nfgenmsg = extern struct {
     res_id: u16 = 0,
 };
 
+// Why: Values from include/uapi/linux/netfilter.h.
 pub const NFPROTO = struct {
     pub const UNSPEC: u8 = 0;
     pub const INET: u8 = 1;
@@ -529,6 +540,7 @@ pub const Batch = struct {
 
     pub fn begin(self: *Batch, seq: u32, pid: u32, subsys: u16) Error!void {
         if (self.opened) return error.InvalidBatchState;
+        // Why: In batch BEGIN and END messages, res_id names the target subsystem, big-endian.
         const ng: nfgenmsg = .{
             .nfgen_family = NFPROTO.UNSPEC,
             .version = 0,
@@ -566,7 +578,7 @@ pub const Batch = struct {
             .res_id = mem.nativeToBig(u16, subsys),
         };
         const payload = mem.asBytes(&ng);
-        // The kernel queues the END ack only after the commit succeeded (Linux 6.12 nfnetlink.c); it is the proof the batch committed.
+        // Why: The kernel queues the END ack only after the commit succeeded (Linux 6.12 nfnetlink.c), so it proves the batch committed.
         try self.builder.append(
             NFNL_MSG_BATCH_END,
             linux.NLM_F_REQUEST | linux.NLM_F_ACK,

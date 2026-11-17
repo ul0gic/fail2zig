@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Computes the memory and descriptor cost of each runtime component and admits or reserves it against configured limits.
+// Holds: The ledger's byte limit is the charged total admission approved; reserve refuses a charge past it before changing any counter.
+
 const std = @import("std");
 const store = @import("../core/record_store.zig");
 const file = @import("../core/durable_file_source.zig");
@@ -89,11 +92,13 @@ pub const FdContext = struct {
         var count: usize = 0;
         while (try iterator.next()) |entry| {
             const fd = std.fmt.parseInt(std.posix.fd_t, entry.name, 10) catch return error.NativeFdAdmission;
+            // Why: Iterating /proc/self/fd lists the descriptor opened to read it, which is not part of the count.
             if (fd == directory.fd) continue;
             count = try add(count, 1);
             if (count >= configured or count >= 65536) return error.NativeFdAdmission;
         }
         const result = FdContext{ .soft_limit = soft, .already_open = count, .headroom = headroom };
+        // Why: Observation fails early when the descriptors already open leave no room under the configured limit.
         _ = try result.available(configured);
         return result;
     }
@@ -300,6 +305,7 @@ pub const Ledger = struct {
         const next_fds = try add(self.used_fds, cost.fds);
         if (next_bytes > self.limit_bytes) return error.NativeMemoryAdmission;
         if (next_fds > self.limit_fds) return error.NativeFdAdmission;
+        // Why: A slot whose serial reached its maximum is retired, so a wrapped serial can never match an old token.
         for (&self.slots, 0..) |*slot, index| if (!slot.active and slot.serial != std.math.maxInt(u64)) {
             const serial = slot.serial + 1;
             slot.* = .{ .serial = serial, .active = true, .category = category, .cost = cost };

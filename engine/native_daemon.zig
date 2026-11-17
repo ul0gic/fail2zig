@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Admits configuration, state and firewall at startup, then runs ingestion, enforcement and recovery on one worker thread.
+// Holds: Only the worker writes the store, jails and firewall; IPC and HTTP handlers stage requests and read state under the mutex.
+
 const std = @import("std");
 const shared = @import("shared");
 const config = @import("config/native.zig");
@@ -32,7 +35,7 @@ const custom_ignore = @import("core/native_ignore.zig");
 const native_banip = @import("config/native_banip.zig");
 const RuntimeIgnoreEntry = @import("store/ignore_entries.zig").RuntimeIgnoreEntry;
 
-// The released query is part of persistent source identity; changing an existing profile requires admission.
+// Why: The match list is hashed into the journal source generation, so editing either list fails admission of existing state.
 const legacy_ssh_matches: []const []const u8 = &.{ "SYSLOG_IDENTIFIER=sshd", "SYSLOG_IDENTIFIER=sshd-session", "+", "_COMM=sshd", "_COMM=sshd-session" };
 const auth_ssh_matches: []const []const u8 = &.{ "SYSLOG_IDENTIFIER=sshd", "SYSLOG_IDENTIFIER=sshd-session", "SYSLOG_IDENTIFIER=sshd-auth", "+", "_COMM=sshd", "_COMM=sshd-session", "_COMM=sshd-auth" };
 const journal_sessions = @import("core/native_journal_session.zig");
@@ -366,9 +369,11 @@ fn lockFirewallNamespace(cfg: *const config.Config) !std.fs.File {
     const selected = try std.posix.fstat(file.handle);
     const active = try std.posix.fstat(current.handle);
     if (selected.dev != active.dev or selected.ino != active.ino) return error.FirewallNamespaceMismatch;
+    // Why: The exclusive lock on the namespace file refuses a second daemon enforcing in the same network namespace.
     if (!try file.tryLock(.exclusive)) return error.NativeNamespaceAlreadyRunning;
     return file;
 }
+// Holds: Only reads the kernel; a saved installation whose selector or backend differs from the configuration is refused as a mismatch.
 fn preflightBackend(a: std.mem.Allocator, cfg: *const config.Config, enforcing: bool, persisted: ?effect.Installation) BackendAdmission {
     if (!enforcing) {
         std.log.info("firewall: every enabled jail is log-only; backend detection skipped", .{});
@@ -396,7 +401,7 @@ fn preflightBackend(a: std.mem.Allocator, cfg: *const config.Config, enforcing: 
     };
     observed.deinit();
     if (persisted == null) {
-        // An interrupted kernel dump is a concurrent change, not an unavailable backend.
+        // Why: DumpInterrupted means the tables changed during the read, not that the backend is unusable, so it gets up to three attempts.
         var attempt: u8 = 1;
         while (true) : (attempt += 1) {
             probe.inspectReservedNamespace() catch |cause| {
@@ -805,7 +810,7 @@ pub const Coordinator = struct {
         const self: *Coordinator = @ptrCast(@alignCast(ctx.?));
         self.mutex.lock();
         defer self.mutex.unlock();
-        // Fence readers before COMMIT; retain the prior deadline until readback verifies the new epoch.
+        // Why: The store calls this before an effect COMMIT; authority is withdrawn and the prior expiry kept until a current publication.
         self.worker_observation.publication(observationMs(), self.observationWall(), null, false);
     }
     fn resolverGeneration(server: ?std.net.Address) ![32]u8 {
@@ -896,6 +901,7 @@ pub const Coordinator = struct {
         self.resource_reservation = null;
     }
 
+    // Holds: Locks and the read-only backend probe precede the store open; startup admission commits only once recovery reaches ownership.
     pub fn create(a: std.mem.Allocator, cfg: *const config.Config, config_path: []const u8, progress: ?*sd_notify.Progress) !*Coordinator {
         try config.validate(cfg);
         path_guard.validate(a, cfg) catch |err| {
@@ -1044,6 +1050,7 @@ pub const Coordinator = struct {
             };
             std.log.info("diag clock: mode={s} rate={d} origin={d}", .{ @tagName(self.clock.mode()), self.clock.rate(), self.start_us });
         }
+        // Why: Checked again after the open, so a state file swapped in while it opened is refused.
         try self.verifyStateIdentity();
         try self.validatePreflightInstallation();
         self.self_addresses = self.readSelfAddresses();
@@ -1058,7 +1065,7 @@ pub const Coordinator = struct {
         }
         try self.store.finishMaintenanceValidation(&self.maintenance_validation);
         self.maintenance_validated = true;
-        // Committed before startup admission so a failed start keeps the mismatch streak.
+        // Why: The recount commits before startup admission begins, so a start that fails later still keeps the mismatch streak.
         if (try self.store.reconcileLiveOwners()) |recount| {
             if (recount.prior_streak == 0)
                 std.log.warn("native storage: live-owner counter {d} did not match {d} live owners; recounted", .{ recount.stored, recount.counted })
@@ -1209,7 +1216,7 @@ pub const Coordinator = struct {
             self.readiness_progress_started_ns = now;
             self.readiness_progress_done = done;
         }
-        // History pages count only up to the head seen when readiness began, so ingestion cannot extend the start; the ceiling bounds any stall.
+        // Why: After 300 s without progress no report is sent, so a stalled start stops extending the systemd start timeout.
         if (now - self.readiness_progress_started_ns.? > readiness_progress_ceiling_ns) return;
         self.reportStartup(.readiness, if (pending) |component| component.name() else "readiness", done, 0);
     }
@@ -1226,7 +1233,7 @@ pub const Coordinator = struct {
         try self.rekeySavedGenerations();
         try self.completeGenerationRekeys();
         try self.rebuildIgnoreLists();
-        // Apply the new source capacity after retiring the old jail population.
+        // Why: The new receipt limit is applied only after the retirements above have removed the old jail population's rows.
         const maximum_pending = self.jails.len * max_sources_per_jail;
         if (try self.store.pendingReceiptCount() > maximum_pending) return error.ReceiptLimit;
         self.store.receipt_limit = maximum_pending;
@@ -1635,6 +1642,7 @@ pub const Coordinator = struct {
     fn loadRepairOptions(self: *Coordinator) durable.load_repair.Options {
         return .{ .state_path = self.cfg.global.state_file, .now_us = self.clock.wallUs(), .history_max_matches = self.cfg.global.history_max_matches };
     }
+    // Holds: A schema version, or from schema 11 an installation, that differs from the snapshot taken before the backend probe refuses.
     fn validatePreflightInstallation(self: *Coordinator) !void {
         const expected = if (self.preflight_schema_version == 0) 0 else @max(self.preflight_schema_version, 2);
         if (self.store.schema_version != expected) return error.NativeStateChanged;
@@ -1840,6 +1848,7 @@ pub const Coordinator = struct {
         const held = try std.posix.fstat((self.namespace_lock orelse return error.NativeNamespaceLockRequired).handle);
         if (a.dev != held.dev or a.ino != held.ino) return error.FirewallNamespaceMismatch;
     }
+    // Holds: The state path must still name, without following a symlink, the regular file whose lock is held; anything else refuses.
     fn verifyStateIdentity(self: *Coordinator) !void {
         errdefer |failure| {
             if (!std.meta.eql(self.last_identity_failure, @as(?anyerror, failure))) {
@@ -1852,6 +1861,7 @@ pub const Coordinator = struct {
         if (held.dev != selected.dev or held.ino != selected.ino or !std.posix.S.ISREG(selected.mode)) return error.NativeStateReplaced;
         self.last_identity_failure = null;
     }
+    // Holds: A saved installation must equal the startup one; a new one is recorded only when none was persisted before the probe.
     fn ensureEffects(self: *Coordinator) !void {
         if (self.effects != null) {
             try self.verifyNamespace();
@@ -2279,7 +2289,7 @@ pub const Coordinator = struct {
                 }
             }
             commits[count] = .{ .batch = try stage.batch(.{ .prepared_us = now, .context = self, .read = processingClock }), .token = page.token };
-            // Only the local copy advances; the published owner waits for the whole group's COMMIT.
+            // Why: Only the prepared copy advances here; owner.live takes it after commitConfirmedHistoryGroup succeeds.
             stage.publish();
             count += 1;
             if (wait != null or !page.more) break;
@@ -2631,6 +2641,7 @@ pub const Coordinator = struct {
             jail.owner_range = .{ .start = first, .len = cursor - first };
         }
     }
+    // Holds: Owners are published only if the manager's cached epoch still equals the store's after the read; otherwise StaleEffect.
     pub fn publishOwners(self: *Coordinator) !void {
         const diag_span = if (comptime build_options.diag) diag_mod.enter(.owners) else {};
         defer if (comptime build_options.diag) diag_mod.leave(diag_span);
@@ -3107,6 +3118,7 @@ pub const Coordinator = struct {
             self.last_notice = snapshot.notice_sequence;
             std.log.info("native ingestion: {s}; cause={s}; committed={d}", .{ @tagName(snapshot.phase), if (snapshot.last_failure) |failure| @errorName(failure.cause) else "none", snapshot.committed_records });
         }
+        // Holds: READY is sent once, and only after readinessReport reports every component verified.
         if (!self.notified_ready) {
             const report = self.readinessReport();
             if (report.ready) {
@@ -3171,7 +3183,7 @@ pub const Coordinator = struct {
                         std.log.err("native: jail={s} source={s} continuity failure: {s}", .{ jail.name, @tagName(jail.plan), @errorName(cause) });
                     };
                     std.log.err("native: startup recovery failed: {s}; refusing to start", .{@errorName(failure)});
-                    // Exit skips the main loop's periodic drain; a file log target would lose the refusal cause.
+                    // Why: process.exit skips the event loop's periodic drain, so a file log target would lose the refusal cause.
                     if (log_sink) |sink| sink.drain();
                     std.process.exit(1);
                 }
@@ -3383,7 +3395,6 @@ pub const Coordinator = struct {
             jail.removal_cursor = page.next;
             jail.removal_bans_lifted = std.math.add(u32, jail.removal_bans_lifted, page.bans_lifted) catch return error.EffectCapacity;
             jail.removal_owners_released = std.math.add(u32, jail.removal_owners_released, page.owners_released) catch return error.EffectCapacity;
-            // A blocked live token settles through the ordinary Manager slice before this turn.
             return false;
         }
         return false;
@@ -3506,7 +3517,7 @@ pub const Coordinator = struct {
                 else => return failure,
             };
             if (batch.yielded) {
-                // A clean rollback retains every pass mark and cursor; only the next attempt shrinks.
+                // Why: A yielded batch rolled back cleanly, so jail.retirement keeps its marks and cursor and only the batch size halves.
                 jail.retirement.max = @max(1, pass.max / 2);
                 self.maintenance_progress = true;
                 return;
@@ -3519,7 +3530,7 @@ pub const Coordinator = struct {
             var restarted = false;
             if (batch.exhausted) {
                 if (pass.dirty or (if (pass.next_us) |next| now_us >= next else false)) {
-                    // Revisit keys behind the cursor once outside changes or elapsed time require it.
+                    // Why: Restarting from the first subject revisits those behind the cursor after outside changes or a due recheck.
                     pass = .{ .retry_revision = batch.retry_revision, .effect_revision = batch.effect_revision, .generation = generation, .max = pass.max };
                     restarted = true;
                 } else {
@@ -3630,7 +3641,7 @@ pub const Coordinator = struct {
         const now_ms = monotonic(self);
         const step_idle = !self.store.intake_closed and std.meta.eql(self.maintenance_idle, try self.maintenanceMark()) and now_ms -| self.maintenance_idle_since_ms < maintenance_idle_ms;
         var record_idle = false;
-        // The turn's own cleanup writes advance the mark; take it after them so only outside changes resume the step.
+        // Why: The mark is taken after this turn's own writes, so only changes made elsewhere end the idle period.
         defer if (record_idle or step_idle) {
             self.maintenance_idle = self.maintenanceMark() catch null;
             if (record_idle) self.maintenance_idle_since_ms = now_ms;

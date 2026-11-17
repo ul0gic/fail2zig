@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Maps built-in filter names to their pattern lists and to whether their matcher needs the whole record.
+// Holds: Every name is unique, lowercase and free of `_`, so a lookup that reads `_` as `-` resolves to at most one entry.
 
 const parser = @import("../core/parser.zig");
 const types = @import("types.zig");
@@ -15,6 +17,7 @@ pub const PatternDef = types.PatternDef;
 pub const Entry = struct {
     name: []const u8,
     patterns: []const PatternDef,
+    // Does:  True when the matcher must get the full line with its timestamp, not the syslog message body alone.
     whole_record: bool = false,
 };
 
@@ -71,6 +74,7 @@ pub fn matcherForFilter(name: []const u8) ?FilterMatcher {
     return .{ .patterns = patterns };
 }
 
+// Does:  Compares names with `_` read as `-`, so nginx_http_auth selects nginx-http-auth.
 fn namesEqual(canonical: []const u8, query: []const u8) bool {
     if (canonical.len != query.len) return false;
     for (canonical, query) |a, b| {

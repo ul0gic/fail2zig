@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Migrates a jail's legacy custom ignore state and source checkpoints to the planned consumer generation at startup.
+// Holds: Nothing is rebound until a stored ignore payload regenerates the saved retry generation; without one it fails as unproven.
+
 const std = @import("std");
 const durable = @import("../core/record_store.zig");
 const plan = @import("../config/native_consumer_plan.zig");
@@ -95,7 +98,7 @@ fn proves(allocator: std.mem.Allocator, jail: anytype, parent: [32]u8, payload: 
     return equal(try oldGeneration(allocator, jail, parent, initial, saved, resolver, .stored, progress), saved.generation);
 }
 
-// Called with the startup writer held, before generation-sensitive admission.
+// Holds: Runs inside startup admission; every store write it makes refuses outside it.
 pub fn migrate(allocator: std.mem.Allocator, store: *durable.Store, jail: anytype, resolver: ?[32]u8, planned: [32]u8, reclaim_completed: *bool, progress: Progress) !bool {
     const assets = jail.custom_plan orelse return false;
     const saved = try store.readRetryPolicy(jail.name);
@@ -117,6 +120,7 @@ pub fn migrate(allocator: std.mem.Allocator, store: *durable.Store, jail: anytyp
     if (existing) |value| {
         var options = assets.ignore_options;
         options.parent_generation = value.parent;
+        // Why: Restoring the current payload refuses one that no longer decodes before any evidence is searched.
         const live = try ignore.Snapshot.restoreLegacy(allocator, options, value.value.payload.?);
         live.destroy();
         found = try proves(allocator, jail, old_parent, value.value.payload.?, prior, resolver, progress);
@@ -130,7 +134,7 @@ pub fn migrate(allocator: std.mem.Allocator, store: *durable.Store, jail: anytyp
         examined += 1;
         progress.report(progress.context, examined);
         if (!std.mem.eql(u8, item.cursor.jail.slice(), jail.name)) continue;
-        // The header only routes a candidate; typed restoration and the complete binding prove it.
+        // Why: The header check only filters candidates; proves restores the payload and recomputes the generation before trusting it.
         if (item.payload.len < 80 or !std.mem.eql(u8, item.payload[0..4], "F2NI") or std.mem.readInt(u16, item.payload[4..6], .little) != 1) continue;
         const candidate_parent = item.payload[8..40].*;
         if (existing != null and !equal(candidate_parent, old_parent)) continue;
@@ -241,7 +245,7 @@ fn sources(allocator: std.mem.Allocator, store: *durable.Store, assets: *const p
     return count;
 }
 
-// One source owns its payloads; manifest/key strings borrow the caller's live target and source.
+// Holds: Owns its payloads and manifest snapshot; its keys borrow the target's jail name and the key's source, which must outlive it.
 pub const Source = struct {
     allocator: std.mem.Allocator,
     saved: ?durable.Store.ManifestSnapshot = null,
@@ -278,7 +282,7 @@ pub const Source = struct {
         self.saved = try store.consumerManifestSnapshot(allocator, old_manifest);
         const saved = &self.saved.?;
         if (saved.status != .ready or saved.count != required) return error.CustomLegacyIdentityMismatch;
-        // Include decoder workspace and one retained historical payload, not just copied output bytes.
+        // Why: The bound counts the two rule consumers and the restored ignore snapshot alive here, not only the copied payloads.
         var bytes: usize = @sizeOf(Source) + 2 * @sizeOf(rule.Consumer) + @sizeOf(ignore.Snapshot) + ignore.max_entries * @sizeOf(ignore.Entry) + ignore.max_checkpoint_bytes + key.source.len;
         for (saved.states[0..saved.count]) |state| {
             const payload = state.payload orelse return error.MissingRequiredConsumer;
@@ -296,6 +300,7 @@ pub const Source = struct {
         if (policy.format_version != 1 or policy.revision != target.old_ignore_revision or policy.valid_until_us != null or !equal(digest(policy.payload.?), target.old_ignore_sha256)) return error.CustomLegacyIdentityMismatch;
         var options = assets.ignore_options;
         options.parent_generation = target.old_parent;
+        // Why: Restoring the stored ignore payload refuses one that no longer decodes before this source is rebound.
         const restored = try ignore.Snapshot.restoreLegacy(allocator, options, policy.payload.?);
         restored.destroy();
         if (resolver) |generation| {

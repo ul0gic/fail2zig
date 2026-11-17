@@ -54,11 +54,11 @@ BASE="https://github.com/ul0gic/fail2zig/releases/download/${VERSION}"
 for file in \
   "fail2zig-${VERSION}-${ARCH}" fail2zig.service fail2zig.toml.example \
   install.sh fail2zig.1 fail2zig.toml.5 LICENSE SQLITE-NOTICE.md \
-  COPYING.date-profile SHA256SUMS; do
+  SHA256SUMS; do
   curl -fsSLO "${BASE}/${file}"
 done
 for file in "fail2zig-${VERSION}-${ARCH}" fail2zig.service fail2zig.toml.example \
-  install.sh fail2zig.1 fail2zig.toml.5 LICENSE SQLITE-NOTICE.md COPYING.date-profile; do
+  install.sh fail2zig.1 fail2zig.toml.5 LICENSE SQLITE-NOTICE.md; do
   awk -v name="$file" '$2 == name { print; found++ } END { if (found != 1) exit 1 }' \
     SHA256SUMS | sha256sum --check --strict || exit 1
 done

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Bans addresses through two ipset hash:ip sets matched by an INPUT rule, driving the ipset and iptables tools.
+// Holds: Only the two prefix-named sets and their match rule are touched, and the match rule is inserted only after -C reports it missing.
 
 const std = @import("std");
 const mem = std.mem;
@@ -204,6 +206,7 @@ fn initImpl(
     for ([_][]const u8{ "ipv4", "ipv6" }, [_][]const u8{ "inet", "inet6" }, [_][]const u8{ "iptables", "ip6tables" }) |suffix, family, binary| {
         var buf: [128]u8 = undefined;
         const name = setName(&buf, config.chain_prefix, suffix) catch return error.SystemError;
+        // Why: IPSET_MAXNAMELEN is 32 including the NUL (include/uapi/linux/netfilter/ipset/ip_set.h).
         if (name.len > 31) return error.SystemError;
         if (try iptables.runCommand(allocator, &.{ "ipset", "create", name, "hash:ip", "family", family, "timeout", "0", "maxelem", "1048576", "-exist" }) != .ok) return error.SystemError;
         const check = try iptables.runCommand(allocator, &.{ binary, "-C", "INPUT", "-m", "set", "--match-set", name, "src", "-j", "DROP" });
@@ -244,6 +247,7 @@ fn banImpl(
         return error.SystemError;
     };
     var argv_storage: [7][]const u8 = undefined;
+    // Why: Timeout 0 adds the entry permanently (ipset(8)), so the ban duration is not applied here.
     const argv = builder.addEntry(&argv_storage, ip_str, "0");
 
     const exit_class = try iptables.runCommand(allocator, argv);

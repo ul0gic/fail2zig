@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# B5 sustained lifecycle (run inside unshare --user --map-root-user --net), adapted from rig.sh:
-# a permanent oldest owner, RATE new distinct scopes/s for LOAD_S seconds, one hot subject
-# re-appearing every HOT_S seconds, then DRAIN_S seconds of drain and idle. Samples kernel,
-# daemon CPU/RSS, DB+WAL size and row counts.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Runs a sustained ban lifecycle with one permanent owner, a stream of new scopes and a recurring hot subject, sampling the daemon.
+# Holds: It exits 65 unless its network namespace differs from the parent one the runner recorded.
+
 set -euo pipefail
 umask 077
 [ "$#" -eq 3 ] || { echo "usage: load.sh BIN WORK ORACLE" >&2; exit 64; }
@@ -12,7 +13,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 [ -x "$BIN" ] && [ -x "$ORACLE" ] && [ -d "$W" ] || exit 65
 [ -z "$(find "$W" -mindepth 1 -maxdepth 1 -print -quit)" ] || { echo "work directory must be empty" >&2; exit 65; }
 for tool in python3 ip timeout getconf sha256sum; do command -v "$tool" >/dev/null || exit 65; done
-# Parent must establish isolation and independently verify expected candidate hash.
+# Why: Isolation is the parent's job, so the script refuses to run in the network namespace the runner recorded as its parent.
 [ -n "${F2Z_NATIVE_PARENT_NETNS:-}" ] && [ "$(readlink /proc/self/ns/net)" != "$F2Z_NATIVE_PARENT_NETNS" ] || { echo "distinct network namespace required" >&2; exit 65; }
 DPID=; GPID=; HPID=; SOCKDIR=; EVALUATED=0
 stop_child() {
@@ -43,7 +44,7 @@ cleanup() {
   if [ "$cleanup_failed" -ne 0 ]; then rc=1; fi
   if [ "$rc" -ne 0 ]; then
     echo "driver failed rc=$rc cleanup_failed=$cleanup_failed" >> "$W/driver-failure.txt"
-    # Preserve an evaluator's incomplete verdict; only a cleanup failure overrides it.
+    # Why: An evaluator verdict already written is kept unless cleanup itself failed.
     if [ "$EVALUATED" -eq 0 ] || [ "$cleanup_failed" -ne 0 ]; then
       python3 "$HERE/evaluate.py" failed "$W" "$rc" || true
     fi

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Proves native firewall admission, exact effects and readback in an isolated network namespace, plus snapshot and metadata checks.
+// Holds: Kernel cases skip unless a transport is selected and fail unless already outside the parent namespace, then unshare a fresh one.
 
 const std = @import("std");
 const shared = @import("shared");
@@ -71,6 +73,7 @@ fn isolatedTransport() !inspection.Transport {
     const current = try std.fs.readLinkAbsolute("/proc/self/ns/net", &current_buf);
     const initial = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse try std.fs.readLinkAbsolute("/proc/1/ns/net", &init_buf);
     try std.testing.expect(!std.mem.eql(u8, current, initial));
+    // Why: Each case enters its own fresh network namespace, so fixture rules never accumulate in the one the runner started in.
     if (linux.E.init(linux.unshare(linux.CLONE.NEWNET)) != .SUCCESS) return error.IsolationFailed;
     return std.meta.stringToEnum(inspection.Transport, selected) orelse error.InvalidFixture;
 }
@@ -343,8 +346,10 @@ test "kernel: native firewall: isolated denied admission leaves kernel unchanged
     defer reader.close();
     const before = try captureScaffold(&reader);
     defer std.testing.allocator.free(before);
+    // Why: The capability is dropped in a forked child so the parent keeps CAP_NET_ADMIN for the before and after readbacks.
     const child = try std.posix.fork();
     if (child == 0) {
+        // Why: 0x20080522 is _LINUX_CAPABILITY_VERSION_3 in linux/capability.h and prctl option 24 is PR_CAPBSET_DROP in linux/prctl.h.
         var header = std.mem.zeroes(linux.cap_user_header_t);
         header.version = 0x20080522;
         var data: [2]linux.cap_user_data_t = undefined;
@@ -651,6 +656,7 @@ test "kernel: native firewall: isolated fresh authority inspects selected transp
     try std.testing.expectError(error.ToolUnavailable, sets.inspectReservedNamespace());
 }
 
+// Why: The peer is a forked child in its own network namespace, so packets cross a veth pair between two namespaces.
 const PacketPeer = struct {
     pid: std.posix.pid_t,
     control: std.posix.fd_t,
@@ -967,6 +973,7 @@ test "kernel: native firewall: isolated fixed argv realizes the frozen scoped pa
     try peer.exchangeUdp(false, 35271, 60, false);
     const host_wait = host_deadline + (if (transport == .ipset) @as(i64, 1_100_000) else 100_000) - std.time.microTimestamp();
     if (host_wait > 0) std.Thread.sleep(@as(u64, @intCast(host_wait)) * std.time.ns_per_us);
+    // Why: The iptables rule has no kernel expiry, so only ipset is expected to deliver the packet after the deadline.
     try peer.exchangeUdp(false, 35271, 61, transport == .ipset);
     var host_removed = try applyVerified(&reader, try effectToken(&reader, false, .ensure_absent));
     host_removed.deinit();
@@ -1199,6 +1206,7 @@ test "native firewall: scoped snapshot requires exact scope effect identity and 
     try std.testing.expect(!try reader.matchesSnapshot(&snapshot, token, 100, 102));
 }
 
+// Holds: Expected lookup results come from this linear scan, never from findEntry.
 fn linearFind(entries: []const inspection.Entry, scope: inspection.CanonicalScope, effect_id: [32]u8) inspection.Error!?inspection.Entry {
     for (entries) |entry| {
         if (!std.meta.eql(inspection.TestAccess.entryScope(entry), scope)) continue;

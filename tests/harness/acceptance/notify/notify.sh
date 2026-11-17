@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# B4: independent populated restart and stalled Type=notify startup.
-# Run outside any test network namespace, as the lab user with sudo -n.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Proves a populated 400-subject restart reaches READY under a Type=notify unit and a stalled startup ends in timeout without READY.
+# Holds: Every unit and network namespace it creates is stopped or deleted in the exit trap, and a failed cleanup sets exit status 1.
+
 set -euo pipefail
 umask 077
 [[ $# == 3 ]] || { echo 'usage: notify.sh BIN WORK ORACLE' >&2; exit 64; }
@@ -26,7 +29,7 @@ cleanup() {
     local rc=$? cleanup_failed=0 unit ns
     trap - EXIT INT TERM
     for unit in "${UNITS[@]}"; do
-        # A stopped startup must be continued before normal termination can run.
+        # Why: A startup stopped with SIGSTOP is continued first so the stop request that follows can terminate it normally.
         timeout 5 sudo -n systemctl kill --kill-who=main --signal=CONT "$unit" 2>/dev/null || :
         if ! timeout 20 sudo -n systemctl stop "$unit" 2>/dev/null; then
             if [[ $(property "$unit" LoadState 2>/dev/null || :) != not-found ]]; then
@@ -53,8 +56,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# Rootless user+network namespace keeps generated files owned by the lab user.
-# No source files move after population: inode continuity is preserved.
+# Why: The population run uses a rootless user and network namespace, so the files it generates stay owned by the lab user.
 TARGET=400 READY_SECONDS=120 timeout --signal=TERM --kill-after=15 480 \
     unshare --user --map-root-user --net -- bash "$RECOVERY_DIR/recovery.sh" restart-populate "$BIN" "$W" "$ORACLE"
 [[ $(cat "$W/target-count") == 400 ]] || fail 'population did not retain 400 subjects'
@@ -67,7 +69,6 @@ make_run() {
     LOG="$W/notify-$RUN.log"
     [[ $(property "$UNIT" LoadState 2>/dev/null || :) == not-found ]] || fail "unit already exists: $UNIT"
     [[ ! -e /run/netns/$NS ]] || fail "namespace already exists: $NS"
-    # ip netns add and transient unit creation both refuse existing names.
     NAMESPACES+=("$NS")
     timeout 15 sudo -n ip netns add "$NS"
     timeout 15 sudo -n ip netns exec "$NS" ip link set lo up
@@ -110,7 +111,7 @@ printf 'notify: progressing READY=%ss kernel=400\n' "$ELAPSED" | tee "$W/notify-
 timeout 20 sudo -n systemctl stop "$UNIT"
 [[ $(property "$UNIT" ActiveState) == inactive ]] || fail 'progressing unit did not stop cleanly'
 grep -q 'native: ready' "$LOG" || fail 'active service lacks READY log'
-# A fast startup cannot qualify timeout extension; still exercise stalled startup.
+# Why: TimeoutStartSec is 20, so a startup that finishes inside it does not exercise timeout extension; the stalled case still runs.
 FAST=0
 (( ELAPSED > 20 )) || FAST=1
 

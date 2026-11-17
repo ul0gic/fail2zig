@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Proves the single fail2zig executable's command line from outside: help, exit classes, daemon start, queries, migrate, rule-test.
+// Holds: Behaviour is observed only by running the built zig-out/bin/fail2zig as a child process, against exit codes fixed here.
 
 const std = @import("std");
 const harness = @import("harness.zig");
@@ -681,6 +683,7 @@ test "cli entry: BUG-027 versioned queries, readiness and a file log target with
 
     const sock_dir = std.fs.path.dirname(h.socket_path).?;
     const before = (try std.fs.cwd().statFile(sock_dir)).mode & 0o7777;
+    // Why: A 0777 socket directory must make the daemon refuse connections, and this defer restores the mode on any exit.
     defer std.posix.fchmodat(std.posix.AT.FDCWD, sock_dir, before, 0) catch {};
     try std.posix.fchmodat(std.posix.AT.FDCWD, sock_dir, 0o777, 0);
     const refused = try run(a, &.{ exe, "--socket", h.socket_path, "--timeout", "2000", "--output", "json", "status" });

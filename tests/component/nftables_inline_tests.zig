@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Proves the nftables netlink payload builders and probe mappings against kernel header values and literal byte layouts.
+// Holds: Constants and layouts are literals fixed here, and each CAP_NET_ADMIN probe test skips unless its capability condition holds.
 
 const std = @import("std");
 const native_endian = @import("builtin").cpu.arch.endian();

@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Turns a jail's banip literals into ban-list entries and finds a banip entry that overlaps the same jail's ignoreip.
+// Holds: A banip list longer than max_banip_entries or the output buffer is refused whole, never truncated.
+
 const shared = @import("shared");
 const native = @import("native.zig");
 const ban_origin = @import("../core/ban_origin.zig");

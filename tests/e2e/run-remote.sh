@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Builds the candidate and lifecycle helper locally, ships them to a remote host over ssh and runs the release gate there.
+# Holds: Every ssh offers only the one named key with public-key authentication, so no other key in the agent is ever tried.
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

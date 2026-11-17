@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Builds the file-source detection plan for one jail: processing options, built-in detector, ignore set and log path specs.
+// Holds: A jail is refused unless it is enabled, admitted and file-sourced with between 1 and max_sources (at most 4096) log paths.
+
 const std = @import("std");
 const config = @import("native.zig");
 const processing = @import("../core/native_source_processor.zig");
@@ -111,6 +114,7 @@ pub const Plan = struct {
         };
         const scratch = try allocator.alloc(u8, settings.max_decoded_bytes);
         defer allocator.free(scratch);
+        // Why: A throwaway Processor is built so options it refuses fail plan creation instead of the first session.
         _ = try processing.Processor.init(allocator, options, scratch, .{ .us = 0 });
         const specs = try allocator.alloc(session.Spec, jail.logpath.len);
         errdefer allocator.free(specs);

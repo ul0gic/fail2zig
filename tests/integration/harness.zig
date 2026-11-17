@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Starts the built fail2zig daemon on a generated config and queries it over its control socket for the integration tests.
+// Holds: Each harness owns a private temporary directory for config, state, socket and log, and deinit kills the daemon and removes it.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -92,6 +94,7 @@ pub const Harness = struct {
         }
 
         var port = options.metrics_port;
+        // Why: The metrics port is hashed from the private directory path, so separate harnesses get different ports without coordination.
         if (port == 0) {
             const h = std.hash.Wyhash.hash(0, tmp_abs);
             port = @as(u16, @intCast(49152 + (h % 16384)));
@@ -135,6 +138,7 @@ pub const Harness = struct {
             return error.ConfigWriteFailed;
         };
         defer f.close();
+        // Why: open(2) applies the umask to the create mode, so chmod sets 0640 exactly.
         f.chmod(0o640) catch return error.ConfigWriteFailed;
         const w = f.writer();
 

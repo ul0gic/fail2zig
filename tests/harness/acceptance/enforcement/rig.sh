@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Load reproduction rig: drives distinct PortSentry-style bans through a real nftables netlink backend in a rootless network namespace.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Starts a daemon with a portsentry jail on nftables, feeds distinct scan lines at a fixed rate and samples its status every second.
+# Holds: A child process is signalled only when this script is its parent, and a child that outlives SIGTERM fails the run.
+
 set -euo pipefail
 umask 077
 BIN="$1"; WORK="$2"; TARGET="$3"; RATE="$4"; BANTIME="${5:-600}"
@@ -80,7 +84,6 @@ sample() {
   echo "$now $cpu $st" >> "$WORK/samples.log"
   echo "$st"
 }
-# generator in background: distinct IPs 198.18.A.B
 (
   n=0
   interval=$(awk -v r="$RATE" 'BEGIN{printf "%.4f", 1/r}')
@@ -94,7 +97,6 @@ sample() {
   echo "rig: generator done ($n lines)" >> "$WORK/rig.log"
 ) &
 GPID=$!
-# sampler: 1 Hz until storage leaves healthy or generator done + settle window
 last_cpu=$(cpu_ticks); last_t=$(date +%s.%N)
 settle=0
 while true; do

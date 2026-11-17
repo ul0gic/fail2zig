@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Check: daemon CPU, readback cadence and kernel element churn over the window, with no traffic driven.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Samples daemon CPU, status readback cadence and nft element churn over the window with no traffic driven.
+# Holds: The verdict is only fail or info, never pass, and fail only when the daemon died or storage was not healthy.
+
 set -u
 OUT="$F2Z_OUT"; K="$F2Z_HARNESS/kernel"
 read -r -a NS <<< "${F2Z_NS_EXEC:-}"

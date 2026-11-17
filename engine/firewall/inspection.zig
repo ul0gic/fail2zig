@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Reads back, creates and changes this installation's kernel firewall state through nftables netlink or iptables and ipset.
+// Holds: State under this installation's name reads as owned only when it carries the installation marker and the exact structure built.
 
 const std = @import("std");
 const shared = @import("shared");
@@ -83,6 +85,7 @@ pub const Installation = struct {
     pub fn validate(self: Installation) Error!void {
         if (mem.allEqual(u8, &self.id, 0)) return error.InvalidInstallation;
     }
+    // Why: The name is also an iptables chain, which iptables limits to 28 characters, and with a two-character suffix an ipset name.
     pub fn name(self: Installation, buf: *[28]u8) []const u8 {
         const hex = std.fmt.bytesToHex(self.id, .lower);
         @memcpy(buf[0..4], "f2z_");
@@ -518,6 +521,7 @@ pub const Inspector = struct {
                 var records = try dump(self, &sock, kind[0], kind[1], &.{ 0, 0, 0, 0 }, &timer, 0);
                 defer records.deinit();
                 for (records.values.items) |payload| {
+                    // Why: 1, 2, 3, 5, 7 and 10 are the NFPROTO families nf_tables tables use (include/uapi/linux/netfilter.h).
                     if (payload.len < 4 or payload[1] != 0 or mem.indexOfScalar(u8, &.{ 1, 2, 3, 5, 7, 10 }, payload[0]) == null) return error.UnknownState;
                     const attributes = try AttrMap.parse(payload[4..], &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 });
                     if (reservedName(try attributes.text(kind[2]))) return error.ForeignState;
@@ -539,6 +543,7 @@ pub const Inspector = struct {
                 if (sets.stdout.len != 0 and sets.stdout[sets.stdout.len - 1] != '\n') return error.Incomplete;
                 var names = mem.tokenizeScalar(u8, sets.stdout, '\n');
                 while (names.next()) |name| {
+                    // Why: IPSET_MAXNAMELEN is 32 including the NUL (include/uapi/linux/netfilter/ipset/ip_set.h).
                     if (name.len == 0 or name.len > 31 or mem.indexOfAny(u8, name, " \t\r") != null) return error.UnknownState;
                     if (reservedName(name)) return error.ForeignState;
                 }
@@ -783,7 +788,7 @@ pub const Inspector = struct {
         transferred = true;
         return .{ .result = .{ .verified = .{ .snapshot = after, .changed = true, .observed_start_wall_us = observation_start, .observed_wall_us = observation_end } }, .consumed = consumed };
     }
-    // Every element carries a timeout, so a present element is always replaced: delete then add, as the single path does.
+    // Why: NLM_F_EXCL refuses an element already present, so one found in the baseline is deleted first in the same batch.
     fn installNft(self: *Inspector, tokens: []const DispatchToken, clock: ClockSample, baseline: *const Snapshot, elapsed: *std.time.Timer, timer: *std.time.Timer, progress: *MutationProgress) Error!usize {
         var name_buf: [28]u8 = undefined;
         const name = self.installation.name(&name_buf);
@@ -837,7 +842,7 @@ pub const Inspector = struct {
         return consumed;
     }
     const restore_line_bytes: usize = 128;
-    // iptables-nft sends one netlink batch per COMMIT; on 1.8.11 a 768-rule COMMIT failed with "Message too long" and 512 passed.
+    // Why: iptables-nft sends one netlink batch per COMMIT; on 1.8.11 a 768-rule COMMIT failed with "Message too long" and 512 passed.
     const iptables_rules_per_commit: usize = 256;
     fn installIpset(self: *Inspector, tokens: []const DispatchToken, clock: ClockSample, elapsed: *std.time.Timer, timer: *std.time.Timer, progress: *MutationProgress) Error!usize {
         var name_buf: [28]u8 = undefined;
@@ -875,6 +880,7 @@ pub const Inspector = struct {
             }
             if (rules == 0) continue;
             writer.writeAll("COMMIT\n") catch return error.LimitExceeded;
+            // Why: Without --noflush, iptables-restore deletes every existing rule in the filter table first (iptables-restore(8)).
             try self.restore(&.{ if (v6) self.ip6tables_restore_path else self.iptables_restore_path, "--wait=1", "--noflush" }, stream.getWritten(), timer, progress);
         }
         return tokens.len;
@@ -1056,6 +1062,7 @@ pub const Inspector = struct {
                 const userdata = try metadata.encode();
                 const payload = nft.buildScopedDropRulePayload(&payloads[handle_count + part], name, "input", token.scope, part, &userdata) catch |err| return scopeBuildError(err);
                 related[count] = sock.nextSeq();
+                // Why: 0x800 is NLM_F_APPEND (include/uapi/linux/netlink.h), which adds each rule at the end of the chain.
                 batch.add(nl.nfnlMsgType(nl.NFNL.SUBSYS_NFTABLES, nft.NFT_MSG.NEWRULE), linux.NLM_F_REQUEST | linux.NLM_F_ACK | linux.NLM_F_CREATE | linux.NLM_F_EXCL | 0x800, related[count], sock.port_id, payload) catch |err| return netlinkError(err);
                 count += 1;
             }
@@ -1094,16 +1101,19 @@ pub const Inspector = struct {
         var mutations: usize = 0;
         for ([_][]const u8{ self.iptables_path, self.ip6tables_path }, 0..) |binary, index| {
             try self.mutateCommand(&.{ binary, "-w", "1", "-N", name }, timer, &mutations, progress);
+            // Why: parseIptables reads the chain as owned only when it holds this marked RETURN rule.
             try self.mutateCommand(&.{ binary, "-w", "1", "-A", name, "-m", "comment", "--comment", marker, "-j", "RETURN" }, timer, &mutations, progress);
             if (self.installation.transport == .ipset) {
                 var set_buf: [31]u8 = undefined;
                 const set = try setName(name, index == 1, &set_buf);
+                // Why: maxelem equals max_inventory_entries, the most entries a readback accepts.
                 try self.mutateCommand(&.{ self.ipset_path, "create", set, "hash:ip", "family", if (index == 0) "inet" else "inet6", "timeout", "0", "maxelem", "131072" }, timer, &mutations, progress);
                 try self.mutateCommand(&.{ binary, "-w", "1", "-I", name, "1", "-m", "set", "--match-set", set, "src", "-j", "DROP" }, timer, &mutations, progress);
             }
             try self.mutateCommand(&.{ binary, "-w", "1", "-I", "INPUT", "1", "-m", "comment", "--comment", marker, "-j", name }, timer, &mutations, progress);
         }
     }
+    // Holds: readNft accepts only these values (hook 1 NF_INET_LOCAL_IN, priority -1, policy 1 NF_ACCEPT), so the two change together.
     fn createNft(self: *Inspector, name: []const u8, marker: []const u8, timer: *std.time.Timer, progress: *MutationProgress) Error!void {
         var sock = nl.NetlinkSocket.init(linux.NETLINK.NETFILTER) catch |err| return netlinkError(err);
         defer sock.close();
@@ -1149,7 +1159,7 @@ pub const Inspector = struct {
         };
         return effectMatches(operation, transport, entry, start_us, end_us);
     }
-    // Kernel timeouts count real time: a virtual span from `anchor_us` becomes the real span that ends at the same instant.
+    // Why: Kernel timeouts run in real time, so under a diagnostic clock rate the span to the deadline is divided by that rate.
     fn kernelOperation(self: *const Inspector, operation: EffectOperation, anchor_us: i64) EffectOperation {
         if (comptime !build_options.diag) return operation;
         if (operation != .ensure_present or operation.ensure_present == .permanent) return operation;
@@ -1173,6 +1183,7 @@ pub const Inspector = struct {
         const held = self.retained_bytes;
         defer self.retained_bytes = held;
         var timer = std.time.Timer.start() catch return error.SystemError;
+        // Why: A netlink dump detects a moved generation itself; tool output has none, so it is read twice and compared.
         if (self.installation.transport == .nftables) return self.readCoherent(&timer);
         self.work_messages = 0;
         var first = try self.readOnce(&timer);
@@ -1189,7 +1200,7 @@ pub const Inspector = struct {
         second.snapshot.observed_start_ns = first.snapshot.observed_start_ns;
         return second.snapshot;
     }
-    // The kernel flags a dump whose generation moved; an interrupted dump is re-read at once and each retry restarts the work count.
+    // Holds: Only DumpInterrupted is retried, at most max_dump_attempts reads in all, each with a fresh work count.
     fn readCoherent(self: *Inspector, timer: *std.time.Timer) Error!Snapshot {
         var attempt: usize = 1;
         while (true) : (attempt += 1) {
@@ -1304,10 +1315,12 @@ fn deadlineUnits(operation: EffectOperation, transport: Transport, now_us: i64) 
     if (deadline <= now_us) return error.ExpiredIntent;
     const delta: u64 = @intCast(deadline - now_us);
     const quantum: u64 = if (transport == .ipset) 1_000_000 else 1000;
+    // Why: Rounding up keeps the kernel timeout from ending before the deadline.
     const units = delta / quantum + @intFromBool(delta % quantum != 0);
     if (transport == .ipset and units > 2_147_483) return error.UnsupportedDeadline;
     return units;
 }
+// Why: Under ipset, a scope other than a plain host is an iptables rule, so it is timed as iptables.
 fn timingTransport(transport: Transport, scope: CanonicalScope) Transport {
     if (transport == .ipset) {
         _ = legacyAddress(scope) catch return .iptables;
@@ -1317,8 +1330,7 @@ fn timingTransport(transport: Transport, scope: CanonicalScope) Transport {
 fn entryScope(entry: Entry) CanonicalScope {
     return entry.scope orelse .{ .subject = canonical_scope.Subject.host(entry.address) };
 }
-// Orders scopes exactly as `canonical_scope.Scope.encode` bytes compare, without validating or encoding;
-// bytes 0..32 of that encoding are this header and the port ranges follow it.
+// Holds: Equals bytes 0..32 of Scope.encode in scope.zig, so scopeOrder sorts scopes exactly as their encoded bytes compare.
 fn scopeHeader(scope: CanonicalScope) [32]u8 {
     var bytes = [_]u8{0} ** 32;
     bytes[0] = canonical_scope.encoded_version;
@@ -1385,7 +1397,7 @@ fn findEntry(entries: []const Entry, scope: CanonicalScope, effect_id: [32]u8) E
     if (entry.scope != null and (entry.effect_id == null or !mem.eql(u8, &entry.effect_id.?, &effect_id))) return error.ForeignState;
     return entry;
 }
-// Kernel set-element timeouts equal the ban deadline, so an element whose remaining timeout fits in `window_ns` may expire between readbacks.
+// Why: An element whose remaining timeout fits in window_ns can expire between the two reads, so its absence is not a change.
 fn sameEntries(before: []const Entry, after: []const Entry, except: ?CanonicalScope, window_ns: u64, transport: Transport) bool {
     var i: usize = 0;
     var j: usize = 0;
@@ -1421,8 +1433,7 @@ fn expiredWithin(entry: Entry, window_ns: u64, transport: Transport) bool {
     const remaining_us = std.math.mul(u64, remaining, 1000) catch return false;
     return remaining_us <= window_ns / std.time.ns_per_us +| 1 +| timeoutToleranceUs(transport);
 }
-// ipset reports whole seconds and nftables reports milliseconds at jiffy granularity.
-// Kernel timeouts are set from the daemon's clock a few ms before the kernel stamps them and are rounded to jiffies (up to 20 ms at HZ=100); a second covers both without admitting a foreign deadline.
+// Why: ipset reports whole seconds, and nftables timeouts start after the send and round to jiffies; one second covers both.
 fn timeoutToleranceUs(transport: Transport) u64 {
     _ = transport;
     return 1_000_000;
@@ -1485,7 +1496,7 @@ const Builder = struct {
     fn finish(self: *Builder, start: u64, end: u64) Error!Snapshot {
         mem.sort(Entry, self.entries.items, {}, entryLess);
         for (self.entries.items, 0..) |e, index| {
-            // nftables walks a hash set while the kernel may still be resizing it after a burst of inserts, and such a walk can yield a set element twice; that is an unstable read to repeat, not a foreign state.
+            // Why: Walking a hash set during a kernel resize can yield an element twice, so a duplicate host is a read to repeat.
             if (index > 0 and !entryLess({}, self.entries.items[index - 1], e)) return if (e.scope == null and self.entries.items[index - 1].scope == null) error.DumpInterrupted else error.UnknownState;
             const scope_bytes = entryScope(e).encode() catch return error.UnknownState;
             self.topology.update(&scope_bytes);
@@ -1638,6 +1649,7 @@ fn fixedScopedMetadata(tokens: Tokens, chain: []const u8, v6: bool) Error!?Scope
     var subject_buf: [64]u8 = undefined;
     var port_buf: [16]u8 = undefined;
     var comment_buf: [scoped_comment_bytes]u8 = undefined;
+    // Why: Only the arguments after the chain are compared, so this binary path never reaches the comparison.
     const expected = try buildFixedScopedArgv(&argv, &subject_buf, &port_buf, &comment_buf, if (v6) "/usr/sbin/ip6tables" else "/usr/sbin/iptables", chain, metadata, .delete);
     if (tokens.count != expected.len - 3 or !mem.eql(u8, tokens.values[0], "-A") or !mem.eql(u8, tokens.values[1], chain)) return error.ForeignState;
     for (tokens.values[2..tokens.count], expected[5..]) |actual, wanted| if (!mem.eql(u8, actual, wanted)) return error.ForeignState;
@@ -1783,10 +1795,12 @@ fn parseIptables(builder: *Builder, output: []const u8, v6: bool) Error!bool {
             if (references) {
                 if (!t.is(&.{ "-A", "INPUT", "-m", "comment", "--comment", marker, "-j", name })) return error.ForeignState;
                 jump_count += 1;
+                // Why: A rule ahead of the jump could accept a banned source first, so the jump must be the first INPUT rule.
                 if (input_rules != 1) return error.ForeignState;
             }
         }
     }
+    // Why: iptables -S prints the three built-in filter policies, so output missing one is cut short.
     if (!policy_seen[0] or !policy_seen[1] or !policy_seen[2]) return error.Incomplete;
     if (!chain) {
         if (mark or jump_count != 0) return error.ForeignState;
@@ -1878,6 +1892,7 @@ fn readTools(self: *Inspector, builder: *Builder, timer: *std.time.Timer) Error!
     builder.present = presence[0];
 }
 
+// Why: Bare attribute kinds in this file are enum values from include/uapi/linux/netfilter/nf_tables.h.
 const AttrMap = struct {
     values: [32]?[]const u8 = @splat(null),
     flags: [32]u16 = @splat(0),
@@ -1887,6 +1902,7 @@ const AttrMap = struct {
         while (it.next() catch return error.Incomplete) |a| {
             if (a.kind >= map.values.len or mem.indexOfScalar(u16, allowed, a.kind) == null) return error.UnknownState;
             if (map.values[a.kind] != null) return error.UnknownState;
+            // Why: Flag 0x8000 is NLA_F_NESTED and 0x4000 is NLA_F_NET_BYTEORDER (include/uapi/linux/netlink.h).
             if ((a.flags & 0x8000) != 0) try validateNested(a.value, 0);
             map.values[a.kind] = a.value;
             map.flags[a.kind] = a.flags;
@@ -1936,7 +1952,7 @@ fn netlinkError(err: nl.Error) Error {
         else => error.UnknownState,
     };
 }
-// The kernel applies a batch whole or rejects it whole, so a misjudged baseline is a non-mutation.
+// Why: The kernel commits a batch whole or not at all, so EEXIST or ENOENT from a stale baseline means nothing changed.
 fn rejectedBatch(err: nl.Error, progress: *MutationProgress) Error {
     switch (err) {
         error.AlreadyExists, error.NotFound => {
@@ -1963,6 +1979,7 @@ fn dump(self: *Inspector, sock: *nl.NetlinkSocket, request_type: u16, response_t
     var outgoing: [1024]u8 align(4) = undefined;
     var message = nl.MessageBuilder.init(&outgoing);
     const sequence = sock.nextSeq();
+    // Why: 0x300 is NLM_F_DUMP, NLM_F_ROOT | NLM_F_MATCH (include/uapi/linux/netlink.h).
     message.append(nl.nfnlMsgType(nl.NFNL.SUBSYS_NFTABLES, request_type), linux.NLM_F_REQUEST | 0x300, sequence, sock.port_id, request) catch |err| return netlinkError(err);
     nl.sendKernel(sock, message.bytes(), @min(try self.remainingMs(timer), 2000)) catch |err| return netlinkError(err);
     var state = nl.Dump{ .sequence = sequence, .message_type = nl.nfnlMsgType(nl.NFNL.SUBSYS_NFTABLES, response_type), .port_id = sock.port_id, .max_messages = self.limits.max_messages };
@@ -2053,6 +2070,7 @@ fn equalExpressions(a: []const u8, b: []const u8) Error!bool {
         const oa = try AttrMap.parse(observed.value, &.{ 1, 2 });
         const name = try ea.text(1);
         if (!mem.eql(u8, name, try oa.text(1))) return false;
+        // Why: The kernel dumps NFTA_LOOKUP_FLAGS (5) and NFTA_BITWISE_OP (6) as zero although the built rule omits them.
         const optional_zero_attr: ?u16 = if (mem.eql(u8, name, "lookup")) 5 else if (mem.eql(u8, name, "bitwise")) 6 else null;
         if (!try equalAttributes(try oa.get(2), try ea.get(2), 0, optional_zero_attr)) return false;
     }

@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Stores firewall effect ownership: each jail's owner of a ban scope, the scope's desired intent and the observed outcomes.
+// Holds: A stored effect is used only once its key, intent id and owner aggregate recompute equal and no timestamp passes the effect clock.
+
 const std = @import("std");
 const build_options = @import("build_options");
 const diag = @import("../core/diag.zig");
@@ -56,6 +59,7 @@ pub fn Methods(comptime Store: type) type {
         pub fn enableTimeProvenance(self: *Store) Error!void {
             return self.enableEffects();
         }
+        // Why: Column type codes are SQLITE_TEXT 3, SQLITE_BLOB 4 and SQLITE_NULL 5 (sqlite3.h).
         pub fn effectBlob(row: *Stmt, column: c_int, comptime length: usize) Error![length]u8 {
             if (row.store.api.column_type(row.ptr, column) != 4) return error.InvalidEffect;
             const bytes = try row.boundedBytes(column, length);
@@ -110,6 +114,7 @@ pub fn Methods(comptime Store: type) type {
                 if (!std.meta.eql(saved, installation)) return error.InstallationMismatch;
             } else {
                 if (admission.disposition != .verified_absent) return error.NamespaceAdmissionRequired;
+                // Why: Scope keys derive from the installation, so effects stored before one exists could never verify against it.
                 if (try self.integer("SELECT count(*) FROM native_effects;") != 0) return error.InvalidEffect;
                 var row = try self.statement("INSERT INTO effect_installation VALUES(1,?1,?2,?3);");
                 defer row.deinit();
@@ -174,6 +179,7 @@ pub fn Methods(comptime Store: type) type {
 
         pub const LiveOwnerRecount = struct { stored: i64, counted: i64, prior_streak: i64 = 0 };
         const max_mismatch_streak = 1_000_000;
+        // Why: Reconciliation compares sqlite_schema text to these strings exactly, so they must stay byte-identical to the creating DDL.
         const live_owner_triggers = [_]struct { name: []const u8, sql: []const u8 }{
             .{ .name = "effect_owner_live_insert", .sql = "CREATE TRIGGER effect_owner_live_insert AFTER INSERT ON effect_owners WHEN NEW.lease_kind<>0 BEGIN UPDATE effect_owner_live SET live=live+1 WHERE id=1; END" },
             .{ .name = "effect_owner_live_update", .sql = "CREATE TRIGGER effect_owner_live_update AFTER UPDATE OF lease_kind ON effect_owners WHEN (OLD.lease_kind<>0)<>(NEW.lease_kind<>0) BEGIN UPDATE effect_owner_live SET live=live+CASE WHEN NEW.lease_kind<>0 THEN 1 ELSE -1 END WHERE id=1; END" },
@@ -199,7 +205,7 @@ pub fn Methods(comptime Store: type) type {
             if (self.api.changes(self.db) != 1) return error.LiveOwnerCounterInvalid;
         }
 
-        // Windows of owners, one operation each, keep the per-row revision lookup inside the work budget at any ban count.
+        // Why: Each rowid window is its own read transaction with a fresh work budget, so the scan finishes at any ban count.
         const owner_scan_rows: i64 = 8192;
         fn ownersWithoutRevisions(self: *Store) Error!i64 {
             const last = try self.integer("SELECT coalesce(max(rowid),0) FROM effect_owners;");
@@ -402,7 +408,6 @@ pub fn Methods(comptime Store: type) type {
             ordinal: u64,
             origin: effects.Origin,
         };
-        // One page per read transaction keeps every page inside the work budget; the storage worker is the only writer, so the pages see one state.
         pub const owner_page_rows: usize = 4096;
         pub fn operatorOwners(self: *Store, now_us: i64, output: []OperatorOwner) Error!usize {
             if (output.len == 0 or output.len > effects.max_owners) return error.EffectCapacity;
@@ -440,8 +445,7 @@ pub fn Methods(comptime Store: type) type {
             }
             var count: usize = 0;
             while (count < output.len) {
-                // The limit applies before the live-lease test. Even a long absent or
-                // expired tail consumes at most 64 physical owner rows per transaction.
+                // Why: LIMIT applies before the live-lease test, so an absent or expired tail costs at most 64 owner rows per transaction.
                 const raw_limit: usize = 64;
                 var scanned: usize = 0;
                 var last_raw: RawCursor = undefined;
@@ -476,8 +480,7 @@ pub fn Methods(comptime Store: type) type {
                             if (!(try effectLease(&row, 4, 5)).live(now_us)) continue;
                             output[count] = try self.decodeOperatorOwner(&row, installation, if (floor) |value| value.us else null, now_us);
                             count += 1;
-                            // The caller resumes after this live row; leave later raw
-                            // rows for its next call instead of dropping live owners.
+                            // Why: Later rows are left for the next call, which resumes after this live row.
                             if (count == output.len) break;
                         }
                     }
@@ -675,7 +678,7 @@ pub fn Methods(comptime Store: type) type {
                 } else if (change.origin != .detection) return error.EffectStorageRequired;
                 try owner.done();
                 if (replaced == null) self.insertedRows(.effect_owners, 1);
-                // The effect_owner_insert and effect_owner_update triggers each add one revision row.
+                // Why: The effect_owner_insert and effect_owner_update triggers each add one revision row, on insert and on update alike.
                 self.insertedRows(.effect_owner_revisions, 1);
             }
             try self.fault(.after_effect_owner);
@@ -784,7 +787,7 @@ pub fn Methods(comptime Store: type) type {
             var held: [jail_disable_page_rows]Held = undefined;
             var count: usize = 0;
             {
-                // Include absent owners and every generation so the limit bounds examined rows.
+                // Why: Absent owners and every generation are selected so LIMIT 64 bounds the rows examined, not only the rows released.
                 var rows = try self.statement(if (after != null)
                     "SELECT scope_key,generation,revision,lease_kind,deadline_us FROM effect_owners INDEXED BY effect_owners_jail WHERE jail=?1 AND scope_key>?2 ORDER BY scope_key LIMIT 64;"
                 else
@@ -1090,6 +1093,7 @@ pub fn Methods(comptime Store: type) type {
         fn confirmOwnerTx(self: *Store, token: effects.Token, owner: effects.Owner, observed_us: i64) Error!?detection.Subject {
             var retained_subject: ?detection.Subject = null;
             const jail = owner.jail.slice();
+            // Why: Stored event ids are recomputed from this domain string and compared, so changing it fails every existing confirmation.
             const event_id = effects.hashParts("fail2zig-native-confirmed-owner-v1", &.{ &token.installation, &token.scope_key, jail, &owner.decision_id });
             {
                 var marker = try self.statement("SELECT decision_id,event_id FROM confirmation_markers WHERE scope_key=?1 AND jail=?2;");
@@ -1129,6 +1133,7 @@ pub fn Methods(comptime Store: type) type {
                 }
                 var sequence: i64 = undefined;
                 {
+                    // Why: The confirmed_history_append trigger gives the insert the head sequence, so any other event at head is a gap.
                     var head = try self.statement("SELECT h.head,s.event_id FROM confirmed_history_stream h JOIN confirmed_history_sequence s ON s.sequence=h.head WHERE h.id=1;");
                     defer head.deinit();
                     if (!try head.row() or !std.mem.eql(u8, &try effectBlob(&head, 1, 32), &event_id)) return error.HistoryGap;

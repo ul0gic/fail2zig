@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Proves the daemon refuses to start, with exit class, cause and no trace, on bad sockets, ports, configs, state and journals.
+// Holds: Each refusal case asserts a literal exit class and cause text, and the cases that retain state compare its bytes before and after.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -49,8 +51,7 @@ const RunFault = enum {
 fn terminateAndReap(child: *std.process.Child) void {
     posix.kill(child.id, posix.SIG.KILL) catch {};
     _ = child.wait() catch {
-        // Zig 0.14.1 caches a post-fork exec error in child.term without
-        // calling waitpid. Reap that known child and close its pipe handles.
+        // Why: Child.wait returns a cached exec error without calling waitpid, so the child and its pipes are reaped here.
         _ = posix.waitpid(child.id, 0);
         child.id = undefined;
         if (child.stdout) |*file| file.close();
@@ -122,8 +123,7 @@ fn runDaemonWithFault(
     errdefer err_out.deinit(a);
     try collectChildOutput(&child, a, &out, &err_out, fault);
 
-    // Observe exit without reaping. The watchdog remains active through this
-    // wait, while WNOWAIT reserves the PID until the guard has joined.
+    // Why: WNOWAIT observes the exit without reaping, so the PID stays reserved until the watchdog thread has joined.
     try waitForExitWithoutReaping(child.id);
     done.store(true, .release);
     guard.join();
@@ -225,6 +225,7 @@ test "startup harness reaps a post-spawn exec failure" {
     try expectReaped(pid);
 }
 
+// Does:  Finds an error return trace by its header text or by a stack frame of the form 0x<hex> in <symbol>.
 fn hasErrorReturnTrace(text: []const u8) bool {
     if (std.mem.indexOf(u8, text, "error return trace") != null) return true;
     var i: usize = 0;
@@ -545,6 +546,7 @@ test "integration: legacy state format refuses before SQLite and preserves saved
 }
 
 test "integration: unwritable persistence refuses startup then advances after repair" {
+    // Why: uid 0 bypasses directory permission bits, so this case would not see the refusal and skips.
     if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
     const a = testing.allocator;
     var s = try Scenario.init(a);
@@ -581,6 +583,7 @@ test "integration: unwritable persistence refuses startup then advances after re
 
 test "integration: state admission identifies foreign and unsupported databases without changing bytes" {
     const a = testing.allocator;
+    // Why: SQLite header offset 68 is the application id and offset 60 the user version (sqlite.org/fileformat2.html).
     const cases = .{
         .{ @as(u64, 68), @as(u32, 0x12345678), "ForeignDatabase" },
         .{ @as(u64, 60), @as(u32, 0x7fffffff), "UnsupportedSchema" },
@@ -806,8 +809,7 @@ test "integration: journal profile changed ordering refuses while retaining data
     defer a.free(after);
     try testing.expect(before.len >= 100);
     try testing.expectEqual(before.len, after.len);
-    // Header change counters (offsets 24/92, vendor/sqlite/sqlite3.c pager_write_changecounter) may advance;
-    // compare every other byte and require each counter pair to agree.
+    // Why: SQLite may advance the change counter at offset 24 and its copy at offset 92, so they are compared as a pair, not byte for byte.
     try testing.expectEqualSlices(u8, before[24..28], before[92..96]);
     try testing.expectEqualSlices(u8, after[24..28], after[92..96]);
     try testing.expectEqualSlices(u8, before[0..24], after[0..24]);

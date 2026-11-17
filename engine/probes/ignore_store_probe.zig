@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
+// Does:  Restores one jail from a SQLite store, optionally acknowledges a fixture occurrence, and prints the stored state as JSON.
+// Holds: An occurrence is acknowledged only when the restored jail revision equals jail_revision, and its failure is printed as outcome.
+
 const std = @import("std");
 const durable = @import("engine_probe").core.record_store;
 const pipeline = @import("engine_probe").core.record_pipeline;
@@ -17,6 +21,7 @@ const Proposal = struct {
     request: Request,
     published: bool = false,
     fn restore(_: ?[]const u8, context: ?*anyopaque) !pipeline.Restored {
+        // Why: Restore publishes through the no-op release, so published turns true only after a committed acknowledgement.
         return .{ .context = context, .publish = release, .release = release };
     }
     fn publish(context: ?*anyopaque) void {

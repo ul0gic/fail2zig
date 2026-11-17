@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Defines the canonical ban scope (subject, protocols, ports, topology) with its fixed-size versioned encoding and SHA-256 identity.
+// Holds: decode accepts only bytes that re-encode to exactly themselves, so each valid scope has one encoding and one identity.
+
 const std = @import("std");
 const shared = @import("shared");
 
+// Why: Kernel rule metadata embeds the encoding and decode refuses any other version, so a layout change needs a new version.
 pub const encoded_version: u8 = 2;
 pub const max_port_endpoint_units: usize = 15;
 pub const max_port_ranges: usize = max_port_endpoint_units;

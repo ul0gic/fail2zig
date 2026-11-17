@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Runs bounded storage maintenance: record cleanup, retry retirement, history retention and pruning of spent effect rows.
+// Holds: History is pruned only at or below the consumer's committed sequence, and the prefix advances from retained_from without gaps.
+
 const std = @import("std");
 const build_options = @import("build_options");
 const diag_mod = @import("../core/diag.zig");
@@ -45,7 +48,7 @@ pub fn Methods(comptime Store: type) type {
         pub const InternalSource = struct { jail: []const u8, generation: [32]u8 };
         pub const RecordCleanup = enum { idle, deleted, scanned };
         pub const max_cleanup_groups = 256;
-        // An interrupted write rolls back the whole transaction (vendor/sqlite/sqlite3.c:91249), so a group starts only while this many callbacks remain.
+        // Why: An interrupted write rolls back the whole transaction (sqlite3.h), so a group starts only while this many callbacks remain.
         const cleanup_work_reserve: u32 = 500;
         const max_group_rows = 1 + 3 * max_native_detections;
         pub fn maintenanceRevision(self: *Store) Error!u64 {
@@ -75,6 +78,7 @@ pub fn Methods(comptime Store: type) type {
             const now = try self.cleanupClock(clock);
             if (now < initial) return error.ReceiptClockReversed;
             _ = try self.maintenanceRevision();
+            // Why: The bound keeps revision+1 below maxInt(i64), which maintenanceRevision rejects as invalid.
             var row = try self.statement("UPDATE maintenance_clock SET floor_us=?1,revision=revision+1 WHERE id=1 AND revision<9223372036854775806;");
             defer row.deinit();
             try row.int(1, now);
@@ -200,7 +204,9 @@ pub fn Methods(comptime Store: type) type {
                     occurrence = try copyColumn(&row, 1, &occurrence_buffer);
                     held = try internalHeld(retention, source, try row.boundedBytes(2, Limits.cursor_bytes));
                 }
+                // Why: The record source_cursors still names is never deleted, and this watermark sweep cannot skip it, so it stops there.
                 if (held or try self.recordIsCursorAnchor(jail, source, occurrence)) break;
+                // Why: A pinned record keeps its row but drops its sequence, so the watermark can advance past it.
                 if (try self.recordCleanupPinned(retention, jail, source, occurrence)) {
                     try self.detachRecord(jail, source, occurrence);
                 } else {
@@ -365,6 +371,7 @@ pub fn Methods(comptime Store: type) type {
                 }
                 if (order) |sequenced| {
                     const state = try self.sourceMaintenance(jail, source, sequenced.generation) orelse return error.InvalidMaintenanceState;
+                    // Why: advanceSourceSequence requires the newest retained sequence to equal head, so the head record is kept.
                     if (sequenced.sequence == state.head_sequence) continue;
                 }
                 if (held or try self.recordIsCursorAnchor(jail, source, occurrence) or try self.recordCleanupPinned(retention, jail, source, occurrence)) continue;
@@ -552,7 +559,7 @@ pub fn Methods(comptime Store: type) type {
         pub fn retryRetirementCandidate(self: *Store, jail: []const u8, after: ?detection.Subject) Error!?RetryRetirementCandidate {
             _ = try self.maintenanceRevision();
             try Store.maintenanceKey(jail, "@retired");
-            // Eligibility stays outside WHERE so every returned raw PK successor spends an examination.
+            // Why: Eligibility is tested by the caller, not in WHERE, so each returned row costs one examination and the scan is bounded.
             var row = try self.statement(if (self.schema_version >= 16)
                 (if (after == null)
                     "SELECT family,subject,last_processed_us,decisions,lease_kind,deadline_us FROM retry_states WHERE jail=?1 ORDER BY family,subject LIMIT 1;"
@@ -656,7 +663,7 @@ pub fn Methods(comptime Store: type) type {
             const prior_rollback = self.rollback_error_code;
             self.rollback_error_code = null;
             const batch = self.retireRetrySubjectsTx(fence, after, now_us, window_us, max) catch |failure| {
-                // The transaction helper has already rolled back before an interruption can yield.
+                // Why: The errdefer in retireRetrySubjectsTx has already rolled back, so only a clean rollback lets an interruption yield.
                 const clean = !self.reopen_required and self.rollback_error_code == null and self.api.get_autocommit(self.db) != 0;
                 if (self.rollback_error_code == null) self.rollback_error_code = prior_rollback;
                 if (failure != error.Interrupted or !clean) return failure;
@@ -668,7 +675,7 @@ pub fn Methods(comptime Store: type) type {
         }
         fn retirementNextCheck(candidate: RetryRetirementCandidate, window_us: i64) ?i64 {
             if (candidate.lease == .permanent) return null;
-            // Strict age eligibility needs the first microsecond after the complete retained window.
+            // Why: Eligibility needs an age strictly past the window, so the first eligible instant is one microsecond after it ends.
             var next = @as(i128, candidate.last_processed_us) + @as(i128, window_us) + 1;
             if (candidate.lease == .finite) next = @max(next, @as(i128, candidate.lease.finite));
             return std.math.cast(i64, next);
@@ -896,7 +903,7 @@ pub fn Methods(comptime Store: type) type {
             return page;
         }
 
-        // The caller owns the read transaction and all returned line allocations.
+        // Holds: Refuses to run outside an open transaction; on success the caller owns and frees every returned line.
         pub fn retainedMatchesForEventsTx(self: *Store, allocator: std.mem.Allocator, installation: effects.Installation, events: []const effect_history.Event, output: []?[]u8) Error!void {
             if (output.len > effect_history.max_page) return error.InvalidApplicationHistoryQuery;
             @memset(output, null);
@@ -1394,7 +1401,7 @@ pub fn Methods(comptime Store: type) type {
         };
 
         pub fn pruneRetryDecisionDetailsTx(self: *Store) Error!usize {
-            // Proving that no row of a fully retained 65,536-row table is eligible exceeds the ordinary statement budget.
+            // Why: This scan may cover the whole retained table before finding no eligible row, so it runs with 5000 callbacks, not 1000.
             const prior_work = self.work_remaining;
             if (self.runtime_limits) self.work_remaining = 5000;
             defer {
@@ -1594,7 +1601,7 @@ pub fn Methods(comptime Store: type) type {
             if (self.api.changes(self.db) != 1) return error.InvalidApplicationHistoryRow;
         }
 
-        // A local quota is evaluated only after the aggregate window fits the global cap.
+        // Holds: Runs only when the subject's retained count fits the global cap; a larger total is refused as an invalid row.
         fn localVictimsTx(self: *Store, family: i64, subject: []const u8, policy: RetentionPolicy, total: i64, output: []i64) Error!usize {
             if (self.schema_version < 27) return 0;
             if (total <= 0 or total > policy.max_matches) return error.InvalidApplicationHistoryRow;
@@ -2121,7 +2128,7 @@ pub fn Methods(comptime Store: type) type {
             errdefer self.rollback();
             const outcome = self.historyRetentionTx(policy, now_us) catch |failure| {
                 if (failure != error.Interrupted) return failure;
-                // All mutations are owned by this transaction; publish nothing after a work-limit rollback.
+                // Why: An interrupted step leaves nothing to commit, so the transaction is rolled back and the next page halved instead.
                 return self.yieldRetention();
             };
             try self.fault(.before_history_retention_commit);
@@ -2247,8 +2254,7 @@ pub fn Methods(comptime Store: type) type {
             return page;
         }
 
-        // Borrows the startup admission through one operation savepoint per page.
-        // The caller owns the transient intent/revision cursor; normal maintenance state is untouched.
+        // Holds: Each page is one savepoint of the open startup admission and moves only the caller's cursor and window, not self.reclaim.
         pub fn reclaimCustomCompatibilityPage(self: *Store, cursor: *store.ReclaimCursor, window: *u16) Error!void {
             if (!self.startupAdmissionActive()) return error.DatabaseFailure;
             if (cursor.phase < 1 or cursor.phase > 2 or window.* == 0 or window.* > reclaim_window) return error.InvalidMaintenanceState;
@@ -2448,7 +2454,7 @@ pub fn Methods(comptime Store: type) type {
         }
         const PruneOutcome = enum { none, skipped, removed, budget };
         fn pruneSpentScopeTx(self: *Store, deleted: *i64, after: *?effects.Hash) Error!PruneOutcome {
-            // Eligibility stays outside WHERE so LIMIT bounds the search even when every spent scope is still pending.
+            // Why: Eligibility is a column, not a WHERE filter, so LIMIT 1 bounds the search even when every spent scope is still pending.
             var candidate = try self.statement(if (self.schema_version >= store.load_repair_schema)
                 "SELECT n.scope_key,n.intent_id,i.status=4 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=n.scope_key AND o.lease_kind<>0) AND NOT EXISTS(SELECT 1 FROM action_targets a INDEXED BY action_targets_unsettled WHERE a.scope_key=n.scope_key AND a.status IN(1,2,5)) AND NOT EXISTS(SELECT 1 FROM effect_intents p INDEXED BY effect_intents_pending WHERE p.scope_key=n.scope_key AND p.status IN(1,2)) AND NOT EXISTS(SELECT 1 FROM confirmation_markers m WHERE m.scope_key=n.scope_key) FROM native_effects n INDEXED BY native_effects_spent JOIN effect_intents i ON i.intent_id=n.intent_id WHERE n.lease_kind=0 AND n.scope_key>?1 ORDER BY n.scope_key LIMIT 1;"
             else if (self.schema_version >= 21)
@@ -2456,6 +2462,7 @@ pub fn Methods(comptime Store: type) type {
             else
                 "SELECT n.scope_key,n.intent_id,i.status=4 AND NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=n.scope_key AND o.lease_kind<>0) AND NOT EXISTS(SELECT 1 FROM confirmed_effect_events e WHERE e.scope_key=n.scope_key) AND NOT EXISTS(SELECT 1 FROM effect_intents p WHERE p.scope_key=n.scope_key AND p.status IN(1,2)) FROM native_effects n JOIN effect_intents i ON i.intent_id=n.intent_id WHERE n.lease_kind=0 AND n.scope_key>?1 ORDER BY n.scope_key LIMIT 1;");
             defer candidate.deinit();
+            // Why: An empty blob compares lower than every 32-byte key, so a pass with no cursor starts at the lowest scope.
             try candidate.blob(1, if (after.*) |*key| key else &.{});
             if (!try candidate.row()) {
                 after.* = null;
@@ -2504,6 +2511,7 @@ pub fn Methods(comptime Store: type) type {
                 try final.blob(1, &scope_key);
                 try final.done();
             }
+            // Why: changes() reports only the last statement, the native_effects delete, which must remove the scope's one row.
             if (self.api.changes(self.db) != 1) return error.InvalidEffect;
             deleted.* += 1;
             try self.advanceEffectSnapshot();

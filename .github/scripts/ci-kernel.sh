@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 fail2zig contributors
+# Does:  Runs the admin, daemon and firewall kernel test binaries as root on an unprivileged GitHub-hosted runner.
+# Holds: Each suite runs in its own new network namespace with a cleared environment and passes only with its exact SKIP count.
+
 set -euo pipefail
 [[ ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted && $EUID != 0 ]] || {
     echo 'kernel CI requires an unprivileged GitHub-hosted runner' >&2

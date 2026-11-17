@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Decides per log file and journal where reading resumes after cutover, from fail2ban's recorded offsets and first-line digests.
+// Holds: A file resumes at its recorded offset only if its first-line digest matches and the offset is in range; lossless blocks all else.
+
 const std = @import("std");
 const plan_mod = @import("plan.zig");
 const db = @import("fail2ban_db.zig");
@@ -212,6 +215,7 @@ fn fileBoundary(group: []const u8, path: []const u8, logs: []const LogRow, reque
     result.observed.first_line_md5_matches = matches;
     if (!matches) return fallback(result, requested, replay, "first-line-md5-mismatch");
 
+    // Why: A NULL lastfilepos reads as 0, the column's default in a fail2ban database.
     const raw_offset = source_row.lastfilepos orelse 0;
     if (raw_offset < 0) return fallback(result, requested, replay, "offset-negative");
     const offset: u64 = @intCast(raw_offset);
@@ -237,9 +241,12 @@ fn fallback(base: FileBoundary, requested: plan_mod.Continuity, replay: ?Replay,
 fn firstLineDigest(file: std.fs.File, recorded_len: usize) !?[40]u8 {
     var buffer: [first_line_max_bytes]u8 = undefined;
     const got = try file.preadAll(&buffer, 0);
+    // Why: fail2ban hashes the first line, newline included, only once it ends in one.
     const end = std.mem.indexOfScalar(u8, buffer[0..got], '\n') orelse return null;
     const line = buffer[0 .. end + 1];
+    // Why: A digest prints as at most 40 hex digits, so neither bufPrint below can fail.
     var out: [40]u8 = undefined;
+    // Why: fail2ban uses MD5, or SHA-1 where MD5 is unavailable.
     switch (recorded_len) {
         32 => {
             var digest: [16]u8 = undefined;

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 fail2zig contributors
+# Does:  Downloads pinned actionlint and zizmor releases and lints the workflow and action files with them.
+# Holds: Each tool archive must match its pinned SHA-256 before it is unpacked or run.
+
 set -euo pipefail
 mode=${1:-all}
 [[ $mode == all || $mode == security ]] || exit 2

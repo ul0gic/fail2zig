@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Asserts one recovery property per call from the SQLite state, kernel dumps and daemon logs of a recovery scenario.
+# Holds: The database is opened read-only; only the drift mode opens it writable.
+
 """Assertions extracted from the B2/B3/B8 evidence checks; harness-only SQLite."""
 import json
 import os

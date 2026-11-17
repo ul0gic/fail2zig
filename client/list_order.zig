@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Sorts a list payload's rows by address, prefix and jail for display.
+// Holds: Every row is kept with all its fields and only reordered, and the sorted payload never exceeds the 1 MiB protocol limit.
 
 const std = @import("std");
 const shared = @import("shared");
@@ -56,8 +58,7 @@ pub fn sortPayload(allocator: std.mem.Allocator, payload_json: []const u8) ![]u8
 
     std.sort.pdq(Entry, entries, {}, lessThan);
 
-    // The IPC response has a 1 MiB limit. A fixed writer also bounds any
-    // expansion while serializing preserved, otherwise unrecognized fields.
+    // Why: Rows are re-serialized with fields this client does not know, so a fixed buffer at the 1 MiB limit bounds the output.
     const buffer = try allocator.alloc(u8, max_payload);
     defer allocator.free(buffer);
     var stream = std.io.fixedBufferStream(buffer);
@@ -83,8 +84,7 @@ fn parseScope(ip: []const u8) !Scope {
     var address = try shared.IpAddress.parse(address_text);
     const ipv6_text = std.mem.indexOfScalar(u8, address_text, ':') != null;
 
-    // The shared parser normalizes IPv4-mapped IPv6 to IPv4 for enforcement.
-    // Preserve its original family only in this display sort key.
+    // Why: IpAddress.parse folds IPv4-mapped IPv6 to IPv4; the sort key restores IPv6 so the row sorts with the family it was written in.
     if (ipv6_text) switch (address) {
         .ipv4 => |value| address = .{ .ipv6 = @as(u128, 0x0000_0000_0000_0000_0000_ffff_0000_0000) | value },
         .ipv6 => {},
@@ -121,5 +121,6 @@ fn lessThan(_: void, left: Entry, right: Entry) bool {
     if (left.explicit_prefix != right.explicit_prefix) return !left.explicit_prefix;
     const jail_order = std.mem.order(u8, left.jail, right.jail);
     if (jail_order != .eq) return jail_order == .lt;
+    // Why: std.sort.pdq is not stable, so the original index breaks ties and equal rows keep the daemon's order.
     return left.original_index < right.original_index;
 }

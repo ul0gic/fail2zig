@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Prepares a fail2ban-format configuration tree and projects its enabled jails onto native settings through consumer bindings.
+// Holds: A global or jail option outside the typed allow-lists, or an enabled jail without a matching binding, is refused, never dropped.
+
 const std = @import("std");
 const ini = @import("fail2ban.zig");
 const context = @import("filter_context.zig");
@@ -112,6 +115,7 @@ pub const Prepared = struct {
                 if (selected.items.len == self.limits.occurrences) return error.ConfigOccurrenceLimit;
                 try selected.append(try std.fmt.allocPrint(a, "{s}.d/{s}", .{ stem, entry.name }));
             }
+            // Why: Entries are sorted by name so layer order, and the generation, never depend on readdir order.
             std.mem.sort([]const u8, selected.items, {}, less);
             try files.appendSlice(selected.items);
         }
@@ -140,6 +144,7 @@ pub const Prepared = struct {
         try stack.append(full);
         defer _ = stack.pop();
         var parsed = try ini.parseIniSource(a, full, file.bytes);
+        // Why: Before-includes merge ahead of this file and after-includes behind it, so each later layer overrides the earlier ones.
         for ([_][]const u8{ "before", "after" }) |role| {
             if (std.mem.eql(u8, role, "after")) {
                 try merge(a, graph, parsed);
@@ -185,6 +190,7 @@ pub const Prepared = struct {
         if (try file.read(&extra) != 0) return error.ConfigChanged;
         const after = try std.posix.fstat(fd);
         if (before.size != after.size or !std.meta.eql(before.mtim, after.mtim) or !std.meta.eql(before.ctim, after.ctim)) return error.ConfigChanged;
+        // Why: The resolved target is stat'ed again so the recorded target is proven to be the file whose bytes were read.
         const target = try std.fs.realpathAlloc(self.alloc(), path);
         const selected = try std.posix.fstatat(std.posix.AT.FDCWD, target, 0);
         if (selected.dev != before.dev or selected.ino != before.ino) return error.ConfigChanged;
@@ -310,6 +316,7 @@ pub const Prepared = struct {
 fn less(_: void, left: []const u8, right: []const u8) bool {
     return std.mem.lessThan(u8, left, right);
 }
+// Why: Each text is prefixed with its 64-bit length, so adjacent fields cannot shift bytes between them without changing the digest.
 fn hashText(hash: *std.crypto.hash.sha2.Sha256, text: []const u8) void {
     var length: [8]u8 = undefined;
     std.mem.writeInt(u64, &length, @intCast(text.len), .little);
@@ -463,6 +470,7 @@ pub const Projection = struct {
         try self.projectGlobals(prepared, global_binding, diagnostic);
         self.config.jails = try a.alloc(native.JailConfig, prepared.jails.len);
         var consumers = std.ArrayList(ConsumerSettings).init(a);
+        // Why: Limits caps jails at 128 and bindings past limits.jails are refused above, so 128 slots cover every binding.
         var consumed = [_]bool{false} ** 128;
         var identity = std.crypto.hash.sha2.Sha256.init(.{});
         identity.update("fail2zig-native-projection-v1\x00");
@@ -538,6 +546,7 @@ pub const Projection = struct {
                 .encoding = binding.encoding,
                 .window_us = window_us,
             } });
+            // Why: A throwaway Processor is built so processing options it refuses fail the projection, not the first session.
             var scratch: [2048]u8 = undefined;
             _ = try processing.Processor.init(a, consumers.items[consumers.items.len - 1].processing, &scratch, .{ .us = 0 });
             try std.json.stringify(binding, .{}, HashWriter{ .context = &identity });
@@ -736,6 +745,7 @@ fn seconds(raw: []const u8) !u64 {
         }
         total = std.math.add(u64, total, std.math.mul(u64, number, multiplier) catch return error.InvalidEffectiveDuration) catch return error.InvalidEffectiveDuration;
     }
+    // Why: The bound keeps the seconds convertible to i64 microseconds, the unit the projected processing window uses.
     if (total == 0 or total > @as(u64, std.math.maxInt(i64)) / 1_000_000) return error.InvalidEffectiveDuration;
     return total;
 }

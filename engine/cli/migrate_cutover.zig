@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Runs, reports and rolls back a fail2ban migration cutover as steps journalled in the fail2zig state file.
+// Holds: Rollback replaces the source database only while it and the recovery point hash to the plan's snapshot, rechecked before the swap.
 
 const std = @import("std");
 const shared = @import("shared");
@@ -251,6 +253,7 @@ fn try_pending_rollback(log: *journal.Journal) bool {
 fn faultAfterIntent(step: journal.Step) void {
     faultNamed(@tagName(step));
 }
+// Does:  Exits with status 137 (128 + SIGKILL) when F2Z_MIGRATE_FAULT names this point, to rehearse resuming an interrupted run.
 fn faultNamed(name: []const u8) void {
     const wanted = std.posix.getenv("F2Z_MIGRATE_FAULT") orelse return;
     if (std.mem.eql(u8, wanted, name)) std.process.exit(137);
@@ -500,6 +503,7 @@ const RestorePaths = struct {
         const base = std.fs.path.basename(source);
         var name_buffer: [64]u8 = undefined;
         const recovery = recoveryPointName(&name_buffer, ctx.run_id);
+        // Why: Bytes 15 to 31 are the 16 hex characters that follow the recovery-point- prefix.
         const tag = recovery[15..31];
         return .{
             .source = source,
@@ -530,6 +534,7 @@ fn rollbackPhases(ctx: *Context, log: *journal.Journal, stderr: anytype) !ExitCl
             stderr.print("migrate rollback: step {s} is still open; resume `migrate cutover --run-id` first\n", .{@tagName(open.step)}) catch {};
             return .rejected;
         }
+        // Why: The marker is written only after the swap completes, so its presence means the source is already restored.
         if (RestorePaths.exists(paths.marker)) return releaseDestination(ctx, log, open, stderr);
         return resumeRestore(ctx, log, open, expected, &paths, stderr);
     }
@@ -625,6 +630,7 @@ fn restoreSource(ctx: *Context, log: *journal.Journal, step: journal.Pending, ex
     };
     const original_stat = try std.posix.fstat(original.handle);
     original.close();
+    // Why: The copy stays owner-only until it takes the source's owner and mode once the deltas are written.
     std.fs.copyFileAbsolute(recovery_path, paths.derived, .{ .override_mode = 0o600 }) catch |err| {
         try log.finish(step, .operational_failure, "derived database not written", null, std.time.microTimestamp());
         stderr.print("migrate rollback: cannot write {s}: {s}; free space or fix access and rerun\n", .{ paths.derived, @errorName(err) }) catch {};
@@ -655,6 +661,7 @@ fn restoreSource(ctx: *Context, log: *journal.Journal, step: journal.Pending, ex
     {
         const derived_file = try std.fs.openFileAbsolute(paths.derived, .{});
         defer derived_file.close();
+        // Why: The derived database reaches disk before the rename below makes it the source.
         try derived_file.sync();
         try derived_file.chown(original_stat.uid, original_stat.gid);
         try derived_file.chmod(@intCast(original_stat.mode & 0o7777));
@@ -686,6 +693,7 @@ fn restoreSource(ctx: *Context, log: *journal.Journal, step: journal.Pending, ex
 fn finishSwap(ctx: *Context, paths: *RestorePaths) !void {
     _ = ctx;
     try std.fs.renameAbsolute(paths.derived, paths.source);
+    // Why: A rename is durable only once its directory is fsynced (fsync(2)).
     const dir_path = std.fs.path.dirname(paths.source) orelse ".";
     const fd = try std.posix.open(dir_path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
     defer std.posix.close(fd);
@@ -695,6 +703,7 @@ fn finishSwap(ctx: *Context, paths: *RestorePaths) !void {
 
 fn moveDatabase(allocator: std.mem.Allocator, from: []const u8, to: []const u8) !void {
     try std.fs.renameAbsolute(from, to);
+    // Why: In WAL mode SQLite keeps uncheckpointed transactions in -wal and its index in -shm beside the database (sqlite.org/wal.html).
     inline for (.{ "-wal", "-shm" }) |suffix| {
         const from_side = try std.fmt.allocPrint(allocator, "{s}{s}", .{ from, suffix });
         defer allocator.free(from_side);
@@ -791,7 +800,9 @@ fn carryBack(conn: fail2ban_db.Connection, delta: durable.Store.MigrationDelta, 
         },
         .ban => {
             const timeofban = @divFloor(delta.decided_us, std.time.us_per_s);
+            // Why: Lease kind 2 is permanent, and bantime -1 is the value the import reads back as a permanent ban.
             const bantime: i64 = if (delta.lease_kind == 2) -1 else @max(1, @divFloor((delta.deadline_us orelse now_us) - delta.decided_us, std.time.us_per_s));
+            // Why: bans keeps one row per ban while bips keeps one per address and jail (its primary key), hence INSERT OR REPLACE.
             inline for (.{ "INSERT INTO bans(jail, ip, timeofban, bantime, bancount, data) VALUES(?1, ?2, ?3, ?4, 1, NULL)", "INSERT OR REPLACE INTO bips(jail, ip, timeofban, bantime, bancount, data) VALUES(?1, ?2, ?3, ?4, 1, NULL)" }) |sql| {
                 var stmt = try conn.prepare(sql);
                 defer stmt.finalize();
@@ -815,6 +826,7 @@ fn subjectText(buffer: []u8, subject: anytype) ![]const u8 {
             var stream = std.io.fixedBufferStream(&address_buffer);
             try stream.writer().print("{}", .{v6});
             const written = stream.getWritten();
+            // Why: std.net.Ip6Address formats as [address]:port, so the address is taken from between the brackets.
             const close = std.mem.lastIndexOfScalar(u8, written, ']') orelse return error.InvalidSubject;
             break :blk written[1..close];
         },

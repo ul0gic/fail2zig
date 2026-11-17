@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Evaluates duration expressions, numbers with unit words joined by arithmetic operators, to seconds.
+// Holds: Input over 4096 bytes or 32 levels deep is refused, and every intermediate result is checked, so none is NaN or infinite.
+
 const std = @import("std");
 pub const Error = error{ InvalidDuration, NonFiniteDuration, TooComplex, NegativeDuration, PrecisionLoss, Overflow };
 pub const Duration = union(enum) {
@@ -14,10 +17,12 @@ pub const Duration = union(enum) {
         if (!std.math.isFinite(value)) return error.NonFiniteDuration;
         if (value < 0) return error.NegativeDuration;
         if (@trunc(value) != value) return error.PrecisionLoss;
+        // Why: 2^64 is the first value a u64 cannot hold, and @intFromFloat on an out-of-range value is illegal behaviour.
         if (value >= 18446744073709551616.0) return error.Overflow;
         return @intFromFloat(value);
     }
 };
+// Does:  Reads -1 as permanent, -2 as legacy_unknown only when history allows it, and refuses every other negative value.
 pub fn parse(text: []const u8, allow_history_unknown: bool) Error!Duration {
     const value = try expression(text);
     if (value == -1) return .permanent;
@@ -27,6 +32,7 @@ pub fn parse(text: []const u8, allow_history_unknown: bool) Error!Duration {
 }
 pub fn expression(text: []const u8) Error!f64 {
     if (text.len > 4096) return error.TooComplex;
+    // Why: A unit word becomes at most "*31557600 " and needs a digit or space before it, so 4096 input bytes stay under 32768.
     var normalized: [32768]u8 = undefined;
     var stream = std.io.fixedBufferStream(&normalized);
     var i: usize = 0;
@@ -130,6 +136,7 @@ const Parser = struct {
         const numeric = self.text[start..self.pos];
         if (std.mem.indexOfScalar(u8, numeric, '.') == null) {
             const integer = std.fmt.parseInt(u64, numeric, 10) catch return error.Overflow;
+            // Why: 2^53 is the largest integer an f64 holds exactly (IEEE 754 binary64), so a larger literal would round silently.
             if (integer > 9007199254740992) return error.PrecisionLoss;
         }
         var value = std.fmt.parseFloat(f64, numeric) catch return error.InvalidDuration;
@@ -139,6 +146,7 @@ const Parser = struct {
 };
 fn unit(value: []const u8) ?f64 {
     const Group = struct { aliases: []const []const u8, multiplier: f64 };
+    // Why: A year is 365.25 days and a month one twelfth of it, so neither depends on a calendar date.
     const groups = [_]Group{
         .{ .aliases = &.{ "d", "dd", "da", "day", "days" }, .multiplier = 86400 },
         .{ .aliases = &.{ "w", "ww", "we", "wee", "week", "weeks" }, .multiplier = 604800 },

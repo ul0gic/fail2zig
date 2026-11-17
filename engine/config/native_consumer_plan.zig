@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Prepares one jail's native consumer: loads its rule programs and ignore entries and derives the plan generation from them.
+// Holds: A rule or ignore file is read only if regular, root- or euid-owned, not group or world writable, and unchanged across the read.
+
 const std = @import("std");
 const native = @import("native.zig");
 const rules = @import("../core/native_rules.zig");
@@ -143,6 +146,7 @@ fn validatePath(path: []const u8) !void {
 const ReadHook = struct { context: ?*anyopaque, call: *const fn (?*anyopaque) anyerror!void };
 fn readProtected(a: std.mem.Allocator, path: []const u8, cap: usize, hook: ?ReadHook) ![]u8 {
     try validatePath(path);
+    // Why: A read-only nonblocking open of a FIFO returns at once (fifo(7)), so the fstat below can refuse it instead of hanging.
     const fd = try std.posix.open(path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true, .NOFOLLOW = true }, 0);
     const file = std.fs.File{ .handle = fd };
     defer file.close();
@@ -152,6 +156,7 @@ fn readProtected(a: std.mem.Allocator, path: []const u8, cap: usize, hook: ?Read
     const bytes = try a.alloc(u8, @intCast(before.size));
     errdefer a.free(bytes);
     if (try file.readAll(bytes) != bytes.len) return error.ConsumerFileChanged;
+    // Why: One more byte past the fstat size means the file grew during the read.
     var extra: [1]u8 = undefined;
     if (try file.read(&extra) != 0) return error.ConsumerFileChanged;
     if (hook) |observer| try observer.call(observer.context);
@@ -174,6 +179,7 @@ const Hash = struct {
     fn writer(self: *Hash) std.io.Writer(*Hash, error{ConsumerConfigLimit}, write) {
         return .{ .context = self };
     }
+    // Why: Each part is prefixed with its 64-bit length, so splitting the same bytes differently yields a different generation.
     fn part(self: *Hash, bytes: []const u8) !void {
         var size: [8]u8 = undefined;
         std.mem.writeInt(u64, &size, bytes.len, .little);

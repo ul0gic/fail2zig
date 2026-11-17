@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Proves the installed daemon reports the journal source for a journald jail and keeps its lifetime ban total across a restart.
+# Holds: The shipped unit must be byte-identical to the installed one and an already active unit is never clobbered without --force.
+
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"

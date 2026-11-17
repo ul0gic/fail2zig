@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Runs one client command: checks its arguments, sends the daemon the requests it needs and maps the outcome to an exit code.
+// Holds: Without --force, a ban covering loopback, a host address netlink reports or the SSH peer is refused before the daemon is asked.
 
 const std = @import("std");
 const shared = @import("shared");
@@ -13,7 +15,7 @@ const guard = @import("guard.zig");
 const list_order = @import("list_order.zig");
 
 pub const client_version = build_options.version;
-// Above the daemon's 10 s wait for a withdrawal outcome, so the answer arrives before the socket times out.
+// Why: The daemon waits up to 10 s for a withdrawal outcome, so 15 s lets its answer arrive before the socket times out.
 const firewall_withdraw_timeout_ms: u64 = 15_000;
 
 pub const ExitCode = enum(u8) {
@@ -203,6 +205,7 @@ fn refuseProtectedBan(allocator: std.mem.Allocator, target_text: []const u8, std
         stderr.print("error: invalid ban target '{s}'\n", .{target_text}) catch {};
         return .client_error;
     };
+    // Why: Without a netlink answer the host-address check is skipped; the loopback and SSH peer checks still run.
     var self = shared.self_addresses.read(allocator) catch |err| switch (err) {
         error.KernelUnavailable => shared.self_addresses.SelfAddresses{ .addresses = &.{}, .count = 0, .truncated = false },
         error.OutOfMemory => {
@@ -359,6 +362,7 @@ fn doList(allocator: std.mem.Allocator, globals: args.Globals, jail: ?[]const u8
     var first_entry = true;
     const now_us = std.time.microTimestamp();
     const page_limit = if (details) @as(u32, 64) else list_page_limit;
+    // Why: Detail pages hold fewer rows, so the page bound grows in proportion and the row ceiling stays the same.
     const page_bound = max_list_pages * (list_page_limit / page_limit);
     var pages: usize = 0;
     while (pages < page_bound) : (pages += 1) {
@@ -519,6 +523,7 @@ pub fn doAdmin(allocator: std.mem.Allocator, globals: args.Globals, stdout: anyt
         return .connection_failed;
     };
     defer client.close();
+    // Why: The daemon refuses an admin request whose expected mutation revision is stale, so the current one is read first.
     const status_resp = client.sendCommand(.{ .status = {} }) catch {
         stderr.print("error: {s}\n", .{client.errorMessage()}) catch {};
         return .connection_failed;

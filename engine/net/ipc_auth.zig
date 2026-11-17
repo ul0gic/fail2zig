@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Classifies IPC peers and command tags and checks that the socket path and its parent directory can be trusted.
+// Holds: Only uid 0 or the daemon's own uid is admin; no group membership and nothing a peer sends grants mutation.
 
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
 
+// Why: Field order and widths match struct ucred, which SO_PEERCRED fills (unix(7)).
 pub const PeerCred = extern struct {
     pid: i32,
     uid: u32,
@@ -22,6 +25,7 @@ pub const CommandClass = enum { read_only, mutation, unknown };
 
 pub const request_id_len: usize = 32;
 
+// Holds: Every shared.protocol.CommandId value is listed in exactly one class; an unlisted tag is refused as unknown.
 pub fn classifyTag(tag: u8) CommandClass {
     return switch (tag) {
         0, 3, 4, 6, 7 => .read_only,
@@ -30,6 +34,7 @@ pub fn classifyTag(tag: u8) CommandClass {
     };
 }
 
+// Does:  Returns the 32-byte request id that follows the tag in admin_v1 and reload_v1 frames; null for every other command.
 pub fn extractRequestId(body: []const u8) error{FrameTooShort}!?[request_id_len]u8 {
     if (body.len == 0) return error.FrameTooShort;
     switch (body[0]) {
@@ -71,9 +76,11 @@ pub const SocketPathError = error{
     SocketWrongMode,
 };
 
+// Why: Write access to the parent lets a user unlink and replace the socket, so group write and all access by others are refused.
 pub const forbidden_parent_bits: u32 = 0o027;
 pub const required_socket_mode: u32 = 0o660;
 
+// Why: sockaddr_un.sun_path holds 108 bytes including the terminating NUL (unix(7)).
 const max_path: usize = 108;
 
 fn lstatPath(path: []const u8) error{ PathTooLong, StatFailed }!linux.Stat {
@@ -126,6 +133,7 @@ pub const BindPathError = error{
     ProbeFailed,
 };
 
+// Does:  Classifies what sits at the bind path by connecting to it: refused means a stale file, connected means a live server.
 pub fn inspectBindPath(path: []const u8) BindPathError!BindPathState {
     if (path.len >= max_path) return error.PathTooLong;
     var z: [max_path]u8 = undefined;

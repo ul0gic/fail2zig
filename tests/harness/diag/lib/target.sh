@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Target side of diag-run, run as root on f2z-target: lock RUN_ID | prepare MODE STAGE SCENARIO SECONDS NLMON (DSN on stdin) | collect STAGE
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Runs the target-side steps of a diag run as root: take the run lock, prepare a candidate or upgraded daemon, and collect evidence.
+# Holds: The run lock is a directory made with mkdir, so only one run can hold it at a time.
+
 set -euo pipefail
 export PATH="$PATH:/usr/sbin:/sbin"
 LOCK=/run/f2z-diag-run.lock
@@ -43,7 +47,7 @@ dsn_env() {
   chmod 0600 "$ETC/diag.env"
   [ -n "$dsn" ] || return 0
   if [ "$netns" = 1 ]; then
-    # The candidate namespace has only loopback: bridge 127.0.0.1:18000 inside it to GlitchTip through a Unix socket.
+    # Why: The candidate namespace has only loopback, so the DSN host becomes 127.0.0.1:18000, bridged by a Unix socket to the upstream.
     local upstream; upstream=$(echo "$dsn" | sed -E 's#^https?://[^@/]+@([^/]+)/.*#\1#')
     install -d -m 0700 "$FWD"
     forward f2z-diag-dsn-host socat "UNIX-LISTEN:$FWD/dsn.sock,fork,mode=600" "TCP:$upstream"
@@ -60,7 +64,7 @@ prepare_candidate() {
   ip -n "$NS" link set lo up
   install -d -o fail2zig -g fail2zig -m 0750 /var/lib/f2z-diag
   local state; state=$(toml state_file "$INSTALLED_CONFIG")
-  # Freeze the baseline so the database, WAL and shared-memory files are copied as one consistent set.
+  # Why: The baseline unit is frozen during the copy so the database, WAL and shared-memory files form one consistent set.
   systemctl freeze fail2zig
   for f in "$state" "$state-wal" "$state-shm"; do [ -e "$f" ] && cp -p "$f" /var/lib/f2z-diag/; done
   systemctl thaw fail2zig

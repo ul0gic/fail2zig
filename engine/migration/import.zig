@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Converts a fail2ban snapshot's bans and bips rows into staged ban owners and history for the plan's selected groups.
+// Holds: Staging is refused while any blocker exists; a row with a bad address, unknown bantime or overflowing time blocks, never vanishes.
+
 const std = @import("std");
 const db = @import("fail2ban_db.zig");
 const plan = @import("plan.zig");
@@ -192,6 +195,7 @@ const Converter = struct {
     }
 
     fn subjectFor(self: *Converter, jail: []const u8, ip: []const u8, source_row: u64) Error!?scope.Subject {
+        // Why: Both callers reach here only after importable found this jail's group.
         const g = self.group(jail).?;
         if (!std.mem.eql(u8, g.scope_mapping, "host") and !std.mem.eql(u8, g.scope_mapping, "net") and !std.mem.eql(u8, g.scope_mapping, "port")) {
             try self.addBlocker(jail, "import", "scope-mapping-unknown:{s}", .{g.scope_mapping});
@@ -292,12 +296,14 @@ const Converter = struct {
         }
     }
 
+    // Holds: A permanent ban outranks any finite one, between finite bans the later wins, and the larger bancount is always kept.
     fn mergeOwner(self: *Converter, candidate: StagedOwner) Error!void {
         const key = OwnerKey{ .jail = candidate.jail, .encoded = candidate.encoded };
         const slot = self.index.getOrPut(self.a, key) catch return error.OutOfMemory;
         if (!slot.found_existing) {
             slot.value_ptr.* = self.owners.items.len;
             self.owners.append(self.a, candidate) catch {
+                // Why: The index entry would otherwise point one past the end of owners.
                 self.index.removeByPtr(slot.key_ptr);
                 return error.OutOfMemory;
             };
@@ -331,6 +337,7 @@ const Converter = struct {
                 try self.addBlocker(jail, "import", "bancount-negative:row:{d}", .{source_row});
                 continue;
             }
+            // Why: A bips row whose jail and scope already have an owner from bans would otherwise be restored twice.
             if (self.hasOwner(jail, resolved.encoded)) {
                 self.report.double_count_avoided += 1;
                 continue;

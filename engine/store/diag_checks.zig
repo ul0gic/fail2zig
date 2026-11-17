@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Samples table use against its caps and cross-checks stored counters and the kernel's element count, reporting mismatches.
+// Holds: A check runs only with no transaction open and on the current schema; a query that fails counts as skipped, never a mismatch.
+
 const std = @import("std");
 const build_options = @import("build_options");
 const diag_mod = @import("../core/diag.zig");
@@ -12,7 +15,7 @@ const store = @import("store.zig");
 const StatementPtr = @FieldType(store.Stmt, "ptr");
 const sample_interval_ns = 10 * std.time.ns_per_s;
 const check_interval_ns = 60 * std.time.ns_per_s;
-// The kernel times an element out on its own clock, so one whose deadline is this close to the readback may be present or gone.
+// Why: The kernel times an element out on its own clock, so one this close to its deadline at readback may be present or gone.
 const kernel_deadline_slack_us = std.time.us_per_s;
 const recent_records = 4096;
 
@@ -75,6 +78,7 @@ pub fn Methods(comptime Store: type) type {
             const statement = ptr orelse return null;
             defer _ = self.api.finalize(statement);
             for (binds, 1..) |value, index| if (self.api.bind_int64(statement, @intCast(index), value) != 0) return null;
+            // Why: Each check gets a full progress budget, and the caller's remaining budget is restored afterwards.
             const saved = self.work_remaining;
             self.work_remaining = 1000;
             defer self.work_remaining = saved;

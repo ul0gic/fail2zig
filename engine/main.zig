@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Routes the one executable's arguments to the daemon, the administrative client or an offline tool, and starts the daemon.
+// Holds: The daemon runs only after its configuration loads and validates and the socket directory exists; earlier failures exit nonzero.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -92,6 +94,7 @@ pub fn classifyEntry(args: []const []const u8) EntryMode {
     return .daemon;
 }
 
+// Does:  Reads the socket path from the default configuration file; null when --socket is given or that file cannot be loaded.
 fn configuredSocket(arena: std.mem.Allocator, args: []const []const u8, stderr: anytype) ?[]const u8 {
     for (args) |a| if (std.mem.eql(u8, a, "--socket")) return null;
     const path = (CliOptions{}).config_path;
@@ -422,6 +425,7 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config, config_path
         failClosed(err, "native: startup failed: {s}; refusing to start", .{@errorName(err)});
 }
 
+// Why: TMPFS_MAGIC from linux/magic.h, the f_type statfs(2) reports for tmpfs.
 const tmpfs_magic: i64 = 0x01021994;
 
 fn stateDirIsVolatile(state_file: []const u8, fs_magic: ?i64) bool {
@@ -437,6 +441,7 @@ fn fsMagicOfDir(dir: []const u8) ?i64 {
     var statfs_buf: [256]u8 align(8) = undefined;
     const rc = linux.syscall2(.statfs, @intFromPtr(&path_buf), @intFromPtr(&statfs_buf));
     if (linux.E.init(rc) != .SUCCESS) return null;
+    // Why: f_type is the first field of struct statfs and is a kernel long (asm-generic/statfs.h).
     return @as(i64, std.mem.bytesToValue(c_long, statfs_buf[0..@sizeOf(c_long)]));
 }
 

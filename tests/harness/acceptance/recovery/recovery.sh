@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Adapted from BUG-075 b2/b3/b8 and load_repro rig/restart; namespace owned by parent.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Runs one recovery scenario (restart, source repair or counters) against a real daemon and the kernel set it programs.
+# Holds: It exits 65 unless its network namespace differs from the parent one the runner recorded.
+
 set -euo pipefail
 umask 077
 [[ $# == 4 ]] || { echo 'usage: recovery.sh MODE BIN WORK ORACLE' >&2; exit 64; }
@@ -7,13 +11,13 @@ MODE=$1 BIN=$2 W=$3 ORACLE=$4
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 CHECK="$HERE/recovery_check.py"
 [[ $BIN == /* && $W == /* && $ORACLE == /* && -x $BIN && -x $ORACLE && -d $W ]] || exit 64
-# Paths are embedded in TOML. Reject rather than incorrectly escape a supplied path.
+# Why: The work path is written into TOML strings unescaped, so a path holding a quote, backslash or newline is refused.
 case "$W" in *'"'*|*'\'*|*$'\n'*|*$'\r'*) exit 64;; esac
 case "$MODE" in restart-populate|restart-check|source-repair|counters) ;; *) exit 64;; esac
 TARGET=${TARGET:-400}; HOLD_SECONDS=${HOLD_SECONDS:-600}; READY_SECONDS=${READY_SECONDS:-60}
 [[ $TARGET =~ ^[0-9]+$ && $HOLD_SECONDS =~ ^[0-9]+$ && $READY_SECONDS =~ ^[0-9]+$ ]] || exit 64
 (( TARGET > 0 && TARGET <= 64000 && HOLD_SECONDS <= 3600 && READY_SECONDS > 0 && READY_SECONDS <= 600 )) || exit 64
-# Only the runner may invoke this driver, inside its disposable network namespace.
+# Why: The script programs the firewall, so it refuses to run in the network namespace the runner recorded as its parent.
 [[ -n ${F2Z_NATIVE_PARENT_NETNS:-} && $(readlink /proc/self/ns/net) != "$F2Z_NATIVE_PARENT_NETNS" ]] || {
     echo 'distinct runner-owned network namespace required' >&2
     exit 65
@@ -32,7 +36,6 @@ cleanup() {
         if alive; then kill -KILL "$D" 2>/dev/null || :; fi
     fi
     if [[ -n $D ]]; then wait "$D" 2>/dev/null || :; fi
-    # Only the socket directory created by this process is removed.
     rm -rf -- "$S"
     exit "$rc"
 }
@@ -115,7 +118,7 @@ line() {
 }
 seed_three() {
     start; ready
-    # Populate the unaffected source too, so continuity comparison isn't vacuous.
+    # Why: The unaffected sshd source also gets a line, so the repair check finds its cursor offset above zero.
     printf 'Failed password for root from 198.19.0.1 port 22 ssh2\n' >> "$OTHER"
     line 198.18.0.1; line 198.18.0.2; line 198.18.0.3
     elems 3; status; stop

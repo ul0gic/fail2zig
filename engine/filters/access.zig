@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Parses web access log lines and builds matchers on a requested path fragment or a user-agent substring.
+// Holds: The address comes only from the first field; a line whose request is not exactly method, path and HTTP/ version matches nothing.
 
 const std = @import("std");
 const shared = @import("shared");
@@ -11,6 +13,7 @@ fn quoted(line: []const u8, start: usize) ?Quoted {
     const open = std.mem.indexOfScalarPos(u8, line, start, '"') orelse return null;
     var pos = open + 1;
     while (pos < line.len) : (pos += 1) {
+        // Why: Apache logs a quote inside a field as \" (mod_log_config), so an escaped quote does not end the field.
         if (line[pos] == '\\') {
             pos += 1;
             continue;
@@ -48,6 +51,7 @@ pub fn pathMatcher(comptime fragment: []const u8, comptime allow_forbidden: bool
             if (entry.status != 404 and !(allow_forbidden and entry.status == 403)) return null;
             const index = std.mem.indexOf(u8, entry.path, fragment) orelse return null;
             const end = index + fragment.len;
+            // Why: A path boundary must follow the fragment, so a request for /.envoy does not match the /.env fragment.
             if (end < entry.path.len and std.mem.indexOfScalar(u8, "/.?", entry.path[end]) == null) return null;
             return .{ .ip = entry.ip };
         }

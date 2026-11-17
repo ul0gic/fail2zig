@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Proves reload outcomes (noop, rejected, restart_required, applied) and SIGHUP reload against the running built daemon.
+// Holds: A rejected or restart-required reload leaves the generation unchanged, and a rejected one leaves the ban list unchanged.
 
 const std = @import("std");
 const harness = @import("harness.zig");

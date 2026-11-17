@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Parses the client command line into global flags and one command, and holds the help text for every command.
+// Holds: Parsing reads only argv and touches no socket, file or environment; every error it returns has its reason in ParseDiag.
 
 const std = @import("std");
 const shared = @import("shared");
@@ -736,6 +738,7 @@ fn parseList(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Erro
     return Parsed{ .globals = globals.*, .command = .{ .list = args } };
 }
 
+// Why: Both match the daemon's 256-item page limit, so a larger value is refused here before any request is sent.
 pub const max_history_limit: u32 = 256;
 pub const max_firewall_limit: u32 = 256;
 
@@ -778,6 +781,7 @@ fn parseHistory(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) E
                 diag.set("flag --cursor requires a value (from a previous page)", .{});
                 return error.MissingValue;
             }
+            // Why: 128 bytes is the longest cursor the daemon issues or accepts.
             if (rest[k].len == 0 or rest[k].len > 128) {
                 diag.set("invalid --cursor value (expected 1..128 characters)", .{});
                 return error.InvalidValue;
@@ -926,6 +930,7 @@ fn takeTrailingGlobal(
     return false;
 }
 
+// Why: migrate and the other offline tools never reach this parser; they are listed so a misspelling of one is still suggested.
 pub const known_commands = [_][]const u8{
     "status",
     "ban",

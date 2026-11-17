@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Acknowledges a truncated, replaced or removed log source so its jail resumes reading, through the daemon or offline.
+// Holds: Nothing runs without --acknowledge-truncation and a configured logpath of the named jail; a missing state file is never created.
+
 const std = @import("std");
 const shared = @import("shared");
 const cli = @import("cli");
@@ -70,7 +73,7 @@ fn usage(stderr: anytype) ExitClass {
     return .usage;
 }
 
-// The daemon reads exactly the paths its logpath patterns expand to.
+// Holds: A path is accepted only when it equals a logpath pattern or one of the at most 4096 paths that pattern expands to.
 fn configuredLogpath(allocator: std.mem.Allocator, jail: config_mod.JailConfig, path: []const u8) !bool {
     for (jail.logpath) |pattern| {
         if (std.mem.eql(u8, pattern, path)) return true;
@@ -105,9 +108,10 @@ pub fn execute(allocator: std.mem.Allocator, options: Options, now_us: i64, stdo
         stderr.print("repair-source: {s} is not a configured logpath of jail '{s}'\n", .{ options.source, options.jail }) catch {};
         return .rejected;
     }
+    // Why: A reachable daemon takes the repair itself; the offline lock is tried only when no daemon answers on the socket.
     if (online(allocator, cfg.global.socket_path, options, stdout, stderr)) |class| return class;
     const state_path = cfg.global.state_file;
-    // Never create state: an absent file has nothing to repair.
+    // Why: Unlike lockState, this lock never creates the file; an absent state has nothing to repair.
     const authority = native_paths.lockStateIfPresent(state_path) catch |err| {
         switch (err) {
             error.NativeAuthorityAlreadyRunning => stderr.print("repair-source: {s} is held by a running daemon or another administrator; stop fail2zig first\n", .{state_path}) catch {},
@@ -118,8 +122,9 @@ pub fn execute(allocator: std.mem.Allocator, options: Options, now_us: i64, stdo
         stderr.print("repair-source: state {s} does not exist; nothing to repair and no state was created\n", .{state_path}) catch {};
         return .rejected;
     };
-    // Released only after the store closes below.
+    // Why: Defers run in reverse order, so the lock is released only after the store opened below has closed.
     defer authority.close();
+    // Why: The lock is held on a descriptor, so each open by path is checked to still name the locked device and inode.
     if (!native_paths.stateMatchesAuthority(authority, state_path)) {
         stderr.print("repair-source: state {s} was replaced while locked; nothing was changed\n", .{state_path}) catch {};
         return .rejected;

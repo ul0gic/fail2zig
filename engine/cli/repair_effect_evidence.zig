@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Checks the state for repairable effect absence evidence and, with --apply, returns the eligible intents to pending.
+// Holds: Nothing is written without --apply, and no evidence is repaired before a state backup is taken and its SHA-256 printed.
+
 const std = @import("std");
 const shared = @import("shared");
 const cli = @import("cli");
@@ -70,6 +73,7 @@ fn execute(allocator: std.mem.Allocator, options: Options, stdout: anytype) !voi
     const state_path = cfg.global.state_file;
     const authority = try paths.lockStateIfPresent(state_path) orelse return error.FileNotFound;
     defer authority.close();
+    // Why: The lock is held on a descriptor, so each open by path is checked to still name the locked device and inode.
     if (!paths.stateMatchesAuthority(authority, state_path)) return error.OpenFailed;
     const checked = blk: {
         var store = try durable.Store.openReadOnly(allocator, state_path);

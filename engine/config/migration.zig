@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Imports a fail2ban configuration tree into a native configuration file that carries a prepared compatibility manifest.
+// Holds: The output is replaced only after the generated configuration validates, by renaming a fully written and synced temporary file.
 
 const std = @import("std");
 const fail2ban = @import("fail2ban.zig");
@@ -488,6 +490,7 @@ pub fn renderToml(cfg: *const native.Config, w: anytype) !void {
         if (j.bantime) |v| try w.print("bantime = {d}\n", .{v});
         if (j.banaction) |v| try w.print("banaction = \"{s}\"\n", .{@tagName(v)});
         if (j.ignoreip) |list| try writeStringArray(w, "ignoreip", list);
+        // Why: With no field bits set, mask 31 writes enabled, multiplier, factor, formula and max_bantime, but not scope or jitter.
         if (j.bantime_increment_explicit) try writeIncrementMask(w, j.bantime_increment, if (j.bantime_increment_fields == 0) 31 else j.bantime_increment_fields);
         try w.writeAll("\n");
     }
@@ -565,6 +568,7 @@ fn effectiveSection(arena: std.mem.Allocator, ini: *const fail2ban.ParsedIni, na
 fn requiresCompatibility(sec: *const fail2ban.Section) bool {
     if (sec.get("logpath")) |raw| {
         var lines = std.mem.splitScalar(u8, raw, '\n');
+        // Why: A space in a logpath line marks a head or tail start word, which a native logpath entry cannot express.
         while (lines.next()) |line| if (std.mem.lastIndexOfScalar(u8, line, ' ') != null) return true;
     }
     const supported = [_][]const u8{ "enabled", "filter", "logpath", "backend", "maxretry", "findtime", "bantime", "ignoreip", "bantime.increment", "bantime.factor", "bantime.maxtime" };

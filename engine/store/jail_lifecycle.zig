@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Retires a removed jail in pages: releases its owners, deletes its rows table by table, then deletes its parent rows.
+// Holds: A page touches at most 64 rows, and parent rows are deleted only after every child table is checked empty for the jail.
+
 const std = @import("std");
 const effects = @import("../core/native_effect.zig");
 const detection = @import("../core/native_detection_record.zig");
@@ -85,7 +88,7 @@ pub fn Methods(comptime Store: type) type {
             if (self.api.get_autocommit(self.db) != 0) return error.DatabaseFailure;
             _ = detection.Name.init(jail) catch return error.InvalidRecord;
             if (try self.jailRetirement(jail) != null) return;
-            // Bound the obligation set independently of the configured-name population.
+            // Why: At most 64 retirements are open at once, however many jail names the configuration has held.
             var intents: [64]JailRetirementIntent = undefined;
             if (try self.jailRetirements(&intents) == intents.len) return error.StorageLimit;
             var row = try self.statement("INSERT INTO jail_retirements VALUES(?1,?2);");
@@ -222,7 +225,7 @@ pub fn Methods(comptime Store: type) type {
                 },
                 .source_cursors, .pending_receipts => {
                     const phase = page.next.phase;
-                    // Copy only bounded keys; bindings outlive each SQLITE_STATIC statement.
+                    // Why: Text binds are SQLITE_STATIC and column bytes die at the next step, so each key is copied before it is bound.
                     var arena = std.heap.ArenaAllocator.init(self.allocator);
                     defer arena.deinit();
                     var sources: [64][]const u8 = undefined;
@@ -433,7 +436,7 @@ pub fn Methods(comptime Store: type) type {
                 var last: effects.Hash = undefined;
                 var live = false;
                 {
-                    // A separate read transaction for each page resets the SQLite work guard.
+                    // Why: Each page runs in its own read transaction, and beginning one restores the full SQLite progress budget.
                     try self.beginRead();
                     errdefer self.rollback();
                     {
@@ -462,7 +465,6 @@ pub fn Methods(comptime Store: type) type {
         }
 
         pub fn unconfiguredJails(self: *Store, configured: []const []const u8, out: [][64]u8) Error!usize {
-            // Startup holds the state lock and has not started workers, so these read pages share stable ownership.
             var count: usize = 0;
             var after: ?DiscoveryJail = null;
             while (true) {

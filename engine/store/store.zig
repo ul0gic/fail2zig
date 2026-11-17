@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Opens the native SQLite state file and owns its connection, transactions, statement cache and record commits.
+// Holds: A failed ROLLBACK or an uncertain COMMIT sets reopen_required, after which every exec, statement and step fails ReopenRequired.
+
 const std = @import("std");
 const build_options = @import("build_options");
 const diag_mod = @import("../core/diag.zig");
@@ -138,6 +141,7 @@ fn openFailure(diagnostic: *OpenDiagnostic, stage: OpenStage, failure: Error, po
 }
 
 pub fn sqliteError(rc: c_int) Error {
+    // Why: The low byte of an extended result code is its primary code, whose values sqlite3.h fixes.
     return switch (rc & 0xff) {
         3, 23 => error.AccessDenied,
         5, 6 => error.Busy,
@@ -331,6 +335,7 @@ pub const Store = struct {
     }
     fn workProgress(ctx: ?*anyopaque) callconv(.c) c_int {
         const self: *Store = @ptrCast(@alignCast(ctx.?));
+        // Why: A nonzero return from the progress handler interrupts the running statement with SQLITE_INTERRUPT (sqlite3.h).
         if (self.work_remaining == 0) return 1;
         self.work_remaining -= 1;
         return 0;
@@ -355,6 +360,7 @@ pub const Store = struct {
         var row = try self.statement("PRAGMA wal_checkpoint(TRUNCATE);");
         defer row.deinit();
         if (!try row.row()) return error.DatabaseFailure;
+        // Why: wal_checkpoint returns 1 in its first column when the checkpoint was blocked; 5 is SQLITE_BUSY (sqlite3.h).
         if (try row.signed(0) != 0) {
             self.last_error_code = 5;
             return error.Busy;
@@ -373,8 +379,10 @@ pub const Store = struct {
     }
     pub fn beginClassWrite(self: *Store, class: budget.Class) Error!void {
         try self.usable();
+        // Why: A startup admission already holds the write transaction; its operations nest as savepoints through beginAdmissionWrite.
         if (self.startup_admission) return error.DatabaseFailure;
         if (self.runtime_path) |path| try self.maintainWal(path);
+        // Why: IMMEDIATE takes the write lock at BEGIN, so a busy database fails here rather than at the first write.
         try self.exec("BEGIN IMMEDIATE;");
         self.admission = class;
         self.retry_admission_work_left = 256;
@@ -452,8 +460,7 @@ pub const Store = struct {
         self.startup_operation = false;
     }
 
-    // Invalidate before durable publication; a failed COMMIT stays conservatively
-    // uncertain until the caller republishes a verified view. Never restore here.
+    // Holds: Effect views are invalidated before COMMIT and never restored here, so a failed COMMIT leaves them invalid.
     pub fn commitEffectTransaction(self: *Store, changed: bool) Error!void {
         if (comptime build_options.diag) self.diagRecountTallies();
         if (changed) if (self.effect_invalidation) |hook| hook.invalidate(hook.context);
@@ -485,7 +492,7 @@ pub const Store = struct {
             } else |_| diag_mod.count(.consistency_skipped, 1);
         };
     }
-    // Capacity guards count a table once per transaction; inserts and trims adjust it in memory, any other delete forgets it.
+    // Holds: A table is counted once per transaction; insertedRows and removedRows adjust the tally and deletedRows discards it.
     pub fn tableRows(self: *Store, table: TalliedTable) Error!i64 {
         switch (table) {
             inline else => |known| {
@@ -597,6 +604,7 @@ pub const Store = struct {
     }
 
     const OpenMode = enum { plain, runtime, readonly, preflight, existing };
+    // Holds: Opens only a regular file owned by the caller's euid, mode 0600 or tighter, in a parent no group or other user can write.
     fn openImpl(allocator: std.mem.Allocator, path: []const u8, open_mode: OpenMode, diagnostic: *OpenDiagnostic) Error!Store {
         diagnostic.* = .{};
         const runtime = open_mode == .runtime;
@@ -630,6 +638,7 @@ pub const Store = struct {
         defer allocator.free(filename);
         var db: ?*Db = null;
         const access_flags: c_int = if (open_mode == .readonly or open_mode == .preflight) 1 else 2;
+        // Why: Flags are SQLITE_OPEN_READONLY 1 or READWRITE 2, with FULLMUTEX 0x10000 and NOFOLLOW 0x01000000 (sqlite3.h).
         const opened = api.open(filename, &db, access_flags | 0x10000 | 0x01000000, null);
         if (opened != 0 or db == null) {
             if (db) |handle| _ = api.close(handle);
@@ -649,18 +658,22 @@ pub const Store = struct {
         }
         const db_config = @extern(*const fn (*Db, c_int, ...) callconv(.c) c_int, .{ .name = "sqlite3_db_config" });
         self.last_error_code = null;
+        // Why: 1006 is SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE (sqlite3.h); closing a refused handle never checkpoints into the file.
         self.check(db_config(self.db, 1006, @as(c_int, 1), @as(?*c_int, null))) catch |failure|
             return openFailure(diagnostic, .connection_setup, failure, null, self.last_error_code);
         const selected = std.posix.fstatat(std.posix.AT.FDCWD, path, std.posix.AT.SYMLINK_NOFOLLOW) catch |failure|
             return openFailure(diagnostic, .file_identity_recheck, error.OpenFailed, openPosixCause(failure), null);
+        // Why: The path is stat'd again after sqlite3_open_v2, so a file swapped in after the checks above is refused.
         if (selected.dev != stat.dev or selected.ino != stat.ino or selected.uid != stat.uid or selected.mode != stat.mode)
             return openFailure(diagnostic, .file_identity_changed, error.OpenFailed, null, null);
         const file_control = @extern(*const fn (*Db, ?[*:0]const u8, c_int, ?*anyopaque) callconv(.c) c_int, .{ .name = "sqlite3_file_control" });
         var moved: c_int = 1;
+        // Why: 20 is SQLITE_FCNTL_HAS_MOVED (sqlite3.h); a file renamed, moved or deleted since SQLite opened it is refused.
         self.last_error_code = null;
         self.check(file_control(self.db, "main", 20, &moved)) catch |failure|
             return openFailure(diagnostic, .sqlite_file_identity, failure, null, self.last_error_code);
         if (moved != 0) return openFailure(diagnostic, .sqlite_file_identity, error.OpenFailed, null, null);
+        // Why: Limit 0 is SQLITE_LIMIT_LENGTH (sqlite3.h), the largest string, blob or row; this caps it at one checkpoint plus 128 KiB.
         _ = api.limit(self.db, 0, Limits.sqlite_row_bytes);
         if (api.limit(self.db, 0, -1) != Limits.sqlite_row_bytes)
             return openFailure(diagnostic, .sqlite_limits, error.StorageLimit, null, null);
@@ -682,6 +695,7 @@ pub const Store = struct {
             return openFailure(diagnostic, .schema_inspection, failure, null, self.last_error_code);
         const schema = self.integer("PRAGMA user_version;") catch |failure|
             return openFailure(diagnostic, .schema_inspection, failure, null, self.last_error_code);
+        // Why: 0x46325a31 is ASCII "F2Z1", the application_id this program writes (1177705009 in decimal).
         if (application == 0) {
             if (schema != 0)
                 return openFailure(diagnostic, .schema_validation, error.ForeignDatabase, null, null);
@@ -728,6 +742,7 @@ pub const Store = struct {
                 return openFailure(diagnostic, .schema_setup, failure, null, self.last_error_code);
             if (!std.mem.eql(u8, mode_name, "wal"))
                 return openFailure(diagnostic, .schema_setup, error.DatabaseFailure, null, null);
+            // Why: PRAGMA synchronous reads back 2 for FULL; the open fails unless both WAL and FULL took effect.
             const synchronous = self.integer("PRAGMA synchronous;") catch |failure|
                 return openFailure(diagnostic, .schema_setup, failure, null, self.last_error_code);
             if (synchronous != 2) return openFailure(diagnostic, .schema_setup, error.DatabaseFailure, null, null);
@@ -1159,6 +1174,7 @@ pub const Store = struct {
 
     pub fn visitPendingReceipts(self: *Store, callback: *const fn (ReceiptIdentity, native_time.Timestamp, ?*anyopaque) anyerror!void, context: ?*anyopaque) !void {
         const maximum = self.receipt_limit orelse return error.ReceiptStorageRequired;
+        // Why: PRAGMA data_version changes when another connection commits, so a change during the walk means the rows read are stale.
         const initial_version = try self.integer("PRAGMA data_version;");
         if (try self.pendingReceiptCount() == 0) {
             if (try self.integer("PRAGMA data_version;") != initial_version) return error.StaleCheckpoint;
@@ -1329,7 +1345,7 @@ pub const Store = struct {
         const free = for (0..statement_cache_slots) |_| {
             const slot = &cache[index];
             const cached = slot.stmt orelse break index;
-            // Compared by text: runtime-formatted SQL can reuse one buffer address for different statements.
+            // Why: Slots are keyed by a 64-bit hash, so the prepared text is compared to stop a collision returning the wrong statement.
             if (slot.hash == hash and preparedTextEql(cached, sql)) {
                 if (slot.in_use) {
                     if (comptime build_options.diag) diag_mod.count(.statement_cache_bypasses, 1);
@@ -1545,6 +1561,7 @@ pub const Store = struct {
             try stmt.blob(5, record.cursor);
             var time_bits: [8]u8 = undefined;
             if (record.event_time) |time| {
+                // Why: event_time is stored as the 8 big-endian bytes of the f64 bit pattern.
                 std.mem.writeInt(u64, &time_bits, @bitCast(time), .big);
                 try stmt.blob(6, &time_bits);
             } else try self.check(self.api.bind_null(stmt.ptr, 6));
@@ -1864,7 +1881,7 @@ pub const Stmt = struct {
         _ = clearBindings(self.ptr);
         slot.in_use = false;
     }
-    // SQLITE_STATIC (null destructor): bound bytes must outlive every step; never bind a returning helper's by-value parameters.
+    // Why: A null destructor is SQLITE_STATIC (sqlite3.h): SQLite keeps the pointer, so bound bytes must outlive every step.
     pub fn text(self: *Stmt, index: c_int, value: []const u8) Error!void {
         if (value.len > std.math.maxInt(c_int)) return error.InvalidRecord;
         try self.store.check(self.store.api.bind_text(self.ptr, index, value.ptr, @intCast(value.len), null));
@@ -1876,6 +1893,7 @@ pub const Stmt = struct {
     pub fn int(self: *Stmt, index: c_int, value: i64) Error!void {
         try self.store.check(self.store.api.bind_int64(self.ptr, index, value));
     }
+    // Why: Column type codes are SQLITE_INTEGER 1, SQLITE_TEXT 3, SQLITE_BLOB 4 and SQLITE_NULL 5 (sqlite3.h).
     pub fn signed(self: *Stmt, column: c_int) Error!i64 {
         if (self.store.api.column_type(self.ptr, column) != 1) return error.DatabaseFailure;
         return self.store.api.column_int64(self.ptr, column);
@@ -1887,6 +1905,7 @@ pub const Stmt = struct {
     pub fn row(self: *Stmt) Error!bool {
         try self.store.usable();
         const rc = self.store.api.step(self.ptr);
+        // Why: 100 is SQLITE_ROW, 101 SQLITE_DONE and 9 SQLITE_INTERRUPT, which the work-budget progress handler raises (sqlite3.h).
         return switch (rc) {
             100 => true,
             101 => false,
@@ -1920,6 +1939,7 @@ pub const Stmt = struct {
     pub fn bytes(self: *Stmt, column: c_int) Error![]const u8 {
         const data = self.store.api.column_blob(self.ptr, column);
         if (data == null) {
+            // Why: A null pointer is an empty or NULL value or an allocation failure; only the error code tells them apart (sqlite3.h).
             if (self.store.api.extended_errcode(self.store.db) == 7) try self.store.check(7);
             return "";
         }

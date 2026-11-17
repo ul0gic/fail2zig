@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Holds upgraded WebSocket clients, broadcasts daemon events to them as text frames and answers their control frames.
+// Holds: An unmasked client frame (RFC 6455 section 5.1) or a payload over 64 KiB closes the connection.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -18,8 +20,10 @@ pub const max_inbound_payload: usize = 64 * 1024;
 pub const ping_interval_ms: u64 = 30_000;
 pub const pong_timeout_ms: u64 = 10_000;
 
+// Why: The fixed GUID a server appends to the client's key before hashing (RFC 6455 section 4.2.2).
 pub const ws_magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
+// Why: Opcode values are fixed by RFC 6455 section 5.2.
 pub const Opcode = enum(u4) {
     continuation = 0x0,
     text = 0x1,
@@ -86,6 +90,7 @@ pub const WsServer = struct {
         self.* = undefined;
     }
 
+    // Holds: Owns fd from the call on: every failure path closes it.
     pub fn admitUpgraded(
         self: *WsServer,
         fd: posix.fd_t,
@@ -103,6 +108,7 @@ pub const WsServer = struct {
             return error.TooManyClients;
         }
 
+        // Why: A client frame header is at most 14 bytes (2 base, 8 length, 4 mask), so the buffer holds one maximum frame whole.
         const buf_size = @max(max_handshake_bytes, max_inbound_payload + 16);
         if (pre_read_tail.len > buf_size) {
             posix.close(fd);
@@ -125,6 +131,7 @@ pub const WsServer = struct {
             .fd = fd,
             .upgraded = true,
             .buf = buf,
+            // Why: Starting the pong clock at admission gives a new client a full interval before the heartbeat can close it.
             .last_pong_ms = std.time.milliTimestamp(),
         };
         if (pre_read_tail.len > 0) {
@@ -199,18 +206,22 @@ pub const WsServer = struct {
         _ = self;
         switch (frame.opcode) {
             .close => {
+                // Why: 0x88 0x00 is a final close frame with no payload; it completes the closing handshake (RFC 6455 section 5.5.1).
                 const close_frame = [_]u8{ 0x88, 0x00 };
                 _ = posix.write(cli.fd, &close_frame) catch {};
                 return error.ClientClosing;
             },
             .ping => {
+                // Why: A pong carries the ping's payload back unchanged (RFC 6455 section 5.5.3).
                 try writePongFrame(cli.fd, frame.payload);
             },
             .pong => {
                 cli.last_pong_ms = std.time.milliTimestamp();
             },
+            // Why: The stream is server to client only; inbound text is read and dropped.
             .text => {},
             .binary => {
+                // Why: Close status 1003 (0x03EB) reports a data type this endpoint cannot accept (RFC 6455 section 7.4.1).
                 const close_frame = [_]u8{ 0x88, 0x02, 0x03, 0xEB };
                 _ = posix.write(cli.fd, &close_frame) catch {};
                 return error.UnsupportedOpcode;
@@ -374,6 +385,7 @@ pub fn formatIso8601Utc(buf: []u8, ms_since_epoch: i64) ![]const u8 {
     );
 }
 
+// Why: RFC 6455 section 4.2.2 fixes SHA-1 for the accept value; it proves the handshake was read and protects nothing.
 pub fn computeAccept(key: []const u8, out: []u8) ![]const u8 {
     var sha = std.crypto.hash.Sha1.init(.{});
     sha.update(key);
@@ -393,6 +405,7 @@ pub fn findHeader(req: []const u8, name: []const u8) ?[]const u8 {
         if (line.len == 0) break;
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
         const hname = line[0..colon];
+        // Why: Field names are case-insensitive (RFC 9110 section 5.1).
         if (!asciiEqlIgnoreCase(hname, name)) continue;
         var value = line[colon + 1 ..];
         while (value.len > 0 and (value[0] == ' ' or value[0] == '\t')) {
@@ -420,8 +433,10 @@ pub const ParsedFrame = struct {
 
 pub const ParseError = error{ Incomplete, BadMask, UnsupportedLength };
 
+// Does:  Parses one client frame and unmasks its payload in place; Incomplete means more bytes are needed.
 pub fn parseFrame(buf: []u8) ParseError!ParsedFrame {
     if (buf.len < 2) return error.Incomplete;
+    // Why: Layout is RFC 6455 section 5.2: FIN and opcode, mask bit and 7-bit length, then a 16-bit or 64-bit extended length.
     const b0 = buf[0];
     const b1 = buf[1];
     const fin = (b0 & 0x80) != 0;
@@ -446,6 +461,7 @@ pub fn parseFrame(buf: []u8) ParseError!ParsedFrame {
     }
     if (payload_len > max_inbound_payload) return error.UnsupportedLength;
 
+    // Why: A client must mask every frame and a server must close on one that is not (RFC 6455 section 5.1).
     if (!masked) return error.BadMask;
     if (buf.len < offset + 4) return error.Incomplete;
     const mask_key = buf[offset..][0..4].*;
@@ -480,6 +496,7 @@ fn writePongFrame(fd: posix.fd_t, payload: []const u8) !void {
 fn writeFrame(fd: posix.fd_t, op: Opcode, payload: []const u8) !void {
     var hdr: [10]u8 = undefined;
     var hdr_len: usize = 2;
+    // Why: 0x80 sets FIN so each message is one frame, and a server never masks what it sends (RFC 6455 section 5.1).
     hdr[0] = 0x80 | @as(u8, @intFromEnum(op));
     if (payload.len < 126) {
         hdr[1] = @intCast(payload.len);

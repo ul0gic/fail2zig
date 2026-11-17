@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Usage (root, in the daemon's network namespace): nft-watch SECONDS  — element add/delete events, prefixed by epoch seconds.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Streams nftables element events for a fixed number of seconds, each line prefixed with the epoch time it was read.
+# Holds: It only monitors and stops itself through timeout, so it never changes the ruleset and never runs past the given seconds.
+
 set -uo pipefail
 export PATH="$PATH:/usr/sbin:/sbin"
 timeout "$1" nft monitor elements | while IFS= read -r line; do

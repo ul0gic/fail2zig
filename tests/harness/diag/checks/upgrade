@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Check: after an in-place upgrade on v047-wall-2040, the daemon is up with 2,040 bans intact and bans 50 new sources past the old wall.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Proves that after an in-place upgrade the daemon keeps its 2,040 bans and bans 50 more sources past that count.
+# Holds: A pass line needs 2,040 active bans and kernel elements before the new sources, 50 more after them, and healthy storage.
+
 set -u
 OUT="$F2Z_OUT"; K="$F2Z_HARNESS/kernel"; WALL=2040; MORE=50
 read -r -a NS <<< "${F2Z_NS_EXEC:-}"

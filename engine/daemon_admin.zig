@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Parses admin_v1 requests, hands each to the worker, executes it there and reports the outcome after store and kernel readback.
+// Holds: One request is in flight; one the worker never took times out rejected with nothing changed, one it took is left to the worker.
+
 const std = @import("std");
 const shared = @import("shared");
 const config = @import("config/native.zig");
@@ -101,6 +104,7 @@ pub fn Methods(comptime Coordinator: type) type {
             if (abandoned) self.freeAdminRequest(request);
             std.log.info("native admin: kind={s} outcome={s}", .{ @tagName(outcome.kind), @tagName(outcome.outcome) });
         }
+        // Holds: When the outcome row cannot be recorded the reply is uncertain, never the outcome that failed to record.
         pub fn adminDetail(self: *Coordinator, request: *AdminRequest, view: AdminOutcomeView, state: ?durable.Store.JailAdminState) AdminOutcomeView {
             var out = view;
             out.generation = self.published_generation;
@@ -157,6 +161,7 @@ pub fn Methods(comptime Coordinator: type) type {
             const kind = request.kind;
             const base = AdminOutcomeView{ .outcome = .applied, .kind = kind, .generation = self.published_generation };
             if (kind == .firewall_withdraw) return self.withdrawFirewall(request);
+            // Why: A replayed disable is answered from its record ahead of the storage gate, so it reads back while mutations are refused.
             if (kind == .group_disable) {
                 if (!self.store_open or self.store.reopen_required) return base.withOutcome(.uncertain).withReason("storage is unavailable; recorded disable outcome cannot be read; inspect status before retrying", .{});
                 const admitted = self.store.admitAdminRequest(request.request_id, request.expected_revision) catch |failure| switch (failure) {
@@ -515,7 +520,7 @@ pub fn Methods(comptime Coordinator: type) type {
             switch (try self.store.admitAdminRequest(progress.request_id, self.published_revision)) {
                 .fresh => return,
                 .replayed => |prior| {
-                    // Legacy applied rows remain historical; current cleanup is a separate published fact.
+                    // Why: A disable outcome already recorded as applied is final; only partial or uncertain outcomes advance.
                     if (prior.kind != .group_disable or (prior.outcome != .partial and prior.outcome != .uncertain)) return;
                     if (try self.store.updateJailDisableOutcome(jail.name, progress.request_id, prior.outcome, next, detail, self.store.effect_publication_epoch, @max(0, self.clock.wallUs()))) |revision| {
                         self.mutex.lock();
@@ -611,6 +616,7 @@ pub fn Methods(comptime Coordinator: type) type {
             if (view.outcome != .uncertain and (cause == null or cause.? == error.EffectReconciliationRequired) and monotonic(self) < request.deadline_ms) return;
             self.completeAdmin(request, view);
         }
+        // Holds: A ban or unban reports applied only after a coherent kernel readback; when the deadline passes first it reports partial.
         pub fn settleAdmin(self: *Coordinator, request: *AdminRequest) void {
             if (request.kind == .group_disable and request.mutation_committed) return settleJailDisable(self, request);
             if (request.ignore) |ignore_state| if (ignore_state.lifting) return self.settleIgnoreLifts(request, ignore_state);
@@ -992,6 +998,7 @@ pub fn Methods(comptime Coordinator: type) type {
                     ban.reason = "owner already released";
                     continue;
                 }
+                // Why: The transition id derives from the request id and ban index, so replaying the request reuses the same ids.
                 var counter: [4]u8 = undefined;
                 std.mem.writeInt(u32, &counter, @intCast(index), .little);
                 const transition = effect.hashParts("fail2zig-ignore-unban-v1", &.{ &request.request_id, &counter });

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Serves the metrics, status and health endpoints over HTTP/1.1 and hands /events upgrades to the WebSocket server.
+// Holds: A connection gets one response to one request of at most 8 KiB, then is closed or handed off; ban details are never served.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -192,6 +194,7 @@ pub const HttpServer = struct {
     }
 
     fn acceptPending(self: *HttpServer, listen_fd: posix.fd_t) void {
+        // Why: No timer runs here; stalled clients are swept when the next connection arrives.
         self.sweepDeadlines();
 
         while (true) {
@@ -298,6 +301,7 @@ pub const HttpServer = struct {
             }
             cli.len += n;
 
+            // Why: The header section ends at the first empty line (RFC 9112 section 2.1); no request body is ever read.
             if (std.mem.indexOf(u8, cli.buf[0..cli.len], "\r\n\r\n")) |hdr_end| {
                 const outcome = self.respond(cli, hdr_end) catch Outcome.close;
                 switch (outcome) {
@@ -311,6 +315,7 @@ pub const HttpServer = struct {
         self.closeClient(cli);
     }
 
+    // Does:  Says who owns the fd after a response: close leaves it here to be closed, handoff means the WebSocket server took it.
     const Outcome = enum { close, handoff };
 
     fn respond(self: *HttpServer, cli: *ClientReg, hdr_end_idx: usize) !Outcome {
@@ -354,6 +359,7 @@ pub const HttpServer = struct {
         }
     }
 
+    // Does:  Checks the Upgrade, Connection and Sec-WebSocket-Key fields (RFC 6455 section 4.2.1), replies 101 and hands the socket over.
     fn tryWsUpgrade(self: *HttpServer, cli: *ClientReg, hdr_end_idx: usize) !Outcome {
         const ws = self.ws_server orelse {
             try writeSimpleResponse(cli.fd, 400, "Bad Request", "text/plain", "websocket not enabled\n");
@@ -373,6 +379,7 @@ pub const HttpServer = struct {
             try writeSimpleResponse(cli.fd, 400, "Bad Request", "text/plain", "connection: upgrade required\n");
             return .close;
         };
+        // Why: Connection is a comma-separated list, so "upgrade" may sit beside other options (RFC 9110 section 7.6.1).
         if (!asciiContainsIgnoreCase(conn_hdr, "upgrade")) {
             try writeSimpleResponse(cli.fd, 400, "Bad Request", "text/plain", "connection header missing upgrade\n");
             return .close;
@@ -387,6 +394,7 @@ pub const HttpServer = struct {
             try writeSimpleResponse(cli.fd, 500, "Internal Server Error", "text/plain", "handshake failed\n");
             return .close;
         };
+        // Why: The reply is 101 fixed bytes plus the 28-character accept value, so the 256-byte buffer cannot overflow.
         var hs_buf: [256]u8 = undefined;
         const hs = std.fmt.bufPrint(
             &hs_buf,
@@ -398,10 +406,12 @@ pub const HttpServer = struct {
         ) catch unreachable;
         writeAll(cli.fd, hs) catch return .close;
 
+        // Why: Bytes read past the header section are the client's first frames and go to the WebSocket server.
         const tail_start = hdr_end_idx + 4;
         const tail = if (tail_start <= cli.len) cli.buf[tail_start..cli.len] else cli.buf[0..0];
 
         self.loop.removeFd(cli.fd) catch {};
+        // Why: admitUpgraded closes the fd on every failure, so the slot is released without a second close.
         ws.admitUpgraded(cli.fd, tail) catch |err| {
             std.log.warn("http: ws handoff failed (fd={d}): {s}", .{ cli.fd, @errorName(err) });
             return .handoff;
@@ -423,6 +433,7 @@ pub const HttpServer = struct {
             try writeSimpleResponse(fd, 500, "Internal Server Error", "text/plain", "metrics body too large\n");
             return;
         }
+        // Why: version=0.0.4 names the Prometheus text exposition format (prometheus.io/docs/instrumenting/exposition_formats).
         try writeResponse(fd, 200, "OK", "text/plain; version=0.0.4", body.items);
     }
 
@@ -457,6 +468,7 @@ pub const HttpServer = struct {
             try writeSimpleResponse(fd, 500, "Internal Server Error", "text/plain", "health body too large\n");
             return;
         }
+        // Why: The status code is read off the body: only the exact text "ready":true answers 200, so that spelling is load-bearing.
         if (std.mem.indexOf(u8, body.items, "\"ready\":true") != null) {
             try writeResponse(fd, 200, "OK", "application/json", body.items);
         } else {
@@ -500,6 +512,7 @@ fn parseRequestLine(line: []const u8) ?RequestLine {
     const sp1 = std.mem.indexOfScalar(u8, line, ' ') orelse return null;
     const rest = line[sp1 + 1 ..];
     const sp2 = std.mem.indexOfScalar(u8, rest, ' ') orelse return null;
+    // Why: Only origin-form request targets are served (RFC 9112 section 3.2.1).
     if (rest.len == 0 or rest[0] != '/') return null;
     return .{ .method = line[0..sp1], .path = rest[0..sp2] };
 }

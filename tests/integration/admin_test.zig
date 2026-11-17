@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Proves admin commands, jail pause and disable, owner release and migration cutover and rollback against a running daemon.
+// Holds: Cases that touch firewall rules require a network namespace other than F2Z_NATIVE_PARENT_NETNS, then unshare a fresh one.
 
 const std = @import("std");
 const harness = @import("harness.zig");
@@ -840,7 +842,7 @@ test "kernel: admin: a failure after one committed release page is partial and r
     defer _ = h.stopDaemon() catch {};
     try waitReady(&h, 10_000);
 
-    // The final key fails after 64 committed releases and one attempted update in the next page.
+    // Why: Release pages hold 64 owners ordered by scope_key and the trigger fails the 66th, so page one commits and page two rolls back.
     for (1..67) |host| {
         var address_buffer: [32]u8 = undefined;
         const address = try std.fmt.bufPrint(&address_buffer, "192.0.2.{d}", .{host});
@@ -1129,7 +1131,7 @@ test "kernel: admin: post-removal settlement failure stays uncertain and reconci
     try t.expect(std.mem.indexOf(u8, uncertain.body, "\"outcome\":\"uncertain\"") != null);
     try t.expect(std.mem.indexOf(u8, uncertain.body, "effect outcome uncertain") != null);
     try t.expect(!try kernelHas(a, "192.0.2.36"));
-    // The inspector removed and read back the rule; only its SQLite settlement rolled back.
+    // Why: The rule is already gone from the kernel; only the SQLite settlement update failed, so the intent stays pending.
     try t.expectEqual(@as(i64, 1), try probe.inspectInteger(pending_query));
     try t.expectEqual(@as(i64, 0), try probe.inspectInteger("SELECT count(*) FROM effect_owners WHERE jail='sshd' AND lease_kind!=0;"));
     try t.expectEqual(@as(i64, 1), try probe.inspectInteger("SELECT count(*) FROM jail_admin_states WHERE jail='sshd' AND enabled=0 AND paused=1 AND request_id=x'2323232323232323232323232323232323232323232323232323232323232323';"));
@@ -1246,8 +1248,7 @@ test "kernel: admin: enforcing manual ban, unban and disable settle only by kern
     defer reload.deinit(a);
     try t.expectEqual(@as(u8, 0), reload.code);
     try t.expect(std.mem.indexOf(u8, reload.stdout, "\"outcome\":\"applied\"") != null);
-    // Reload commits before recovery republishes health. Require a new readback
-    // so the pre-reload active snapshot cannot admit the next admin operation.
+    // Why: Reload commits before health is republished, so wait for a kernel readback newer than the reload in confirmed_at_us.
     const reloaded_us = std.time.microTimestamp();
     var reload_timer = try std.time.Timer.start();
     while (true) {
@@ -1346,7 +1347,7 @@ test "kernel: admin: enforcing manual ban, unban and disable settle only by kern
     defer a.free(plan_path);
     const source_socket = try std.fs.path.join(a, &.{ root, "f2b.sock" });
     defer a.free(source_socket);
-    const planned = try run(a, &.{ exe, "migrate", "plan", "--source-dir", "tests/fixtures/fail2ban/config/stock-1.1.1", "--source-db", db_path, "--staging-dir", staging, "--out", plan_path, "--replay-window", "600", "--runtime-socket", source_socket });
+    const planned = try run(a, &.{ exe, "migrate", "plan", "--source-dir", "tests/fixtures/fail2ban/config/cutover", "--source-db", db_path, "--staging-dir", staging, "--out", plan_path, "--replay-window", "600", "--runtime-socket", source_socket });
     defer planned.deinit(a);
     try t.expectEqual(@as(u8, 0), planned.code);
     const staged = try run(a, &.{ exe, "migrate", "cutover", "--plan", plan_path, "--state-file", h.state_path, "--staging-dir", staging, "--backend", "iptables", "--socket", h.socket_path });
@@ -1445,7 +1446,7 @@ test "kernel: admin: enforcing manual ban, unban and disable settle only by kern
     defer native.deinit(a);
     try t.expect(native.code == 0 or native.code == 4);
     try waitKernel(a, "203.0.113.99", true, 10000);
-    // A later native decision on a migrated scope must survive rollback too.
+    // Why: A native ban replaces the cutover owner of 192.0.2.10, and that new owner is compared again after the rollback below.
     const replacement = try admin(a, &h, &.{ "ban", "192.0.2.10", "--jail", "sshd", "--duration", "900" });
     defer replacement.deinit(a);
     try t.expectEqual(@as(u8, 0), replacement.code);
@@ -1493,6 +1494,7 @@ test "kernel: admin: enforcing manual ban, unban and disable settle only by kern
     try t.expect(std.mem.indexOf(u8, socket_only.stderr, "fail2ban-server") != null);
     const stand_in = try std.fs.path.join(a, &.{ root, "fail2ban-server" });
     defer a.free(stand_in);
+    // Why: Rollback with --source-verified requires a running process named fail2ban-server, so a copy of sleep stands in under that name.
     try std.fs.copyFileAbsolute("/bin/sleep", stand_in, .{ .override_mode = 0o755 });
     var service = std.process.Child.init(&.{ stand_in, "300" }, a);
     try service.spawn();

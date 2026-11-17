@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Finds and qualifies the SSH daemon executables a journal origin profile trusts.
+// Holds: A path qualifies only if every directory and the file are owned by the expected uid and not group or world writable.
+
 const std = @import("std");
 const posix = std.posix;
 
 pub const max_executables = 8;
-// Ordering preserves the existing Debian listener/session profile when both exist.
+// Why: The origin profile generation hashes executables in this order, so reordering it changes an existing profile's generation.
 pub const catalog = [_][]const u8{
     "/usr/sbin/sshd",
     "/usr/bin/sshd",
@@ -65,7 +68,7 @@ fn discoverAt(allocator: std.mem.Allocator, root: posix.fd_t, uid: posix.uid_t, 
     return result;
 }
 
-// O_PATH inspects special files without opening a device or waiting for a FIFO writer.
+// Why: With O_PATH the file itself is not opened (open(2)), so a device or FIFO is inspected by fstat without blocking.
 pub fn qualifyExplicit(path: []const u8) !void {
     try validatePath(path);
     const fd = try posix.open(path, .{ .PATH = true, .CLOEXEC = true }, 0);
@@ -85,8 +88,7 @@ fn qualifyLeaf(stat: posix.Stat, uid: posix.uid_t) !void {
     if (!posix.S.ISREG(stat.mode) or stat.uid != uid or stat.mode & 0o022 != 0 or stat.mode & 0o111 == 0) return error.UnqualifiedJournalExecutable;
 }
 
-// Each component is opened relative to a verified directory with NOFOLLOW; symlink contents are
-// read from that exact O_PATH fd, so neither lookup nor readlink can bypass a verified directory.
+// Holds: Each component is opened NOFOLLOW under a verified directory fd, and a link is read from its own fd, never by path.
 fn walk(root: posix.fd_t, path: []const u8, output: []u8, uid: posix.uid_t) ![]const u8 {
     try validatePath(path);
     try qualifyDirectory(try posix.fstat(root), uid);
@@ -108,8 +110,7 @@ fn walk(root: posix.fd_t, path: []const u8, output: []u8, uid: posix.uid_t) ![]c
             if (steps > 1024) return error.UnqualifiedJournalExecutable;
             if (std.mem.eql(u8, component, ".")) continue;
             if (std.mem.eql(u8, component, "..")) {
-                // Restart at the verified root using the canonical parent;
-                // never let '..' escape a test root or bypass component checks.
+                // Why: '..' restarts the walk from root on the canonical parent, so it cannot climb above root or skip a check.
                 canonical_len = if (std.mem.lastIndexOfScalar(u8, output[0..canonical_len], '/')) |index| index else 0;
                 var next: [std.fs.max_path_bytes]u8 = undefined;
                 const expanded = try std.fmt.bufPrint(&next, "{s}/{s}", .{ output[0..canonical_len], iterator.rest() });
@@ -126,10 +127,10 @@ fn walk(root: posix.fd_t, path: []const u8, output: []u8, uid: posix.uid_t) ![]c
             const stat = try posix.fstat(fd);
             if (posix.S.ISLNK(stat.mode)) {
                 if (stat.uid != uid or links == 40) return error.UnqualifiedJournalExecutable;
-                // Symlink mode bits have no access-control meaning on Linux.
-                // Ownership plus its verified, non-writable parent establish trust.
+                // Why: Linux never uses a symlink's permissions (symlink(7)), so its owner and verified parent are the whole check.
                 links += 1;
                 var target: [std.fs.max_path_bytes]u8 = undefined;
+                // Why: An empty path makes readlinkat read the link dirfd itself refers to (readlinkat(2)), not a name looked up again.
                 const value = try posix.readlinkat(fd, "", &target);
                 if (value.len == 0 or value.len == target.len) return error.UnqualifiedJournalExecutable;
                 var next: [std.fs.max_path_bytes]u8 = undefined;

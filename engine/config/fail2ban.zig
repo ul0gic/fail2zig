@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Reads fail2ban-format INI configuration: layered .conf and .local files, includes, interpolation, selectors and assets.
+// Holds: A source over 1 MiB or not UTF-8 is refused before parsing, and a repeated option or non-DEFAULT section fails its file.
 
 const std = @import("std");
 
@@ -320,6 +322,7 @@ pub fn interpolate(arena: std.mem.Allocator, ini: *ParsedIni) Error!void {
 }
 
 fn expandValue(arena: std.mem.Allocator, ini: *const ParsedIni, section_name: []const u8, src: []const u8, depth: usize, self_key: []const u8) Error![]const u8 {
+    // Why: A reference chain deeper than max_interp_depth is reported as a cycle, which keeps this recursion bounded.
     if (depth >= max_interp_depth) return error.InterpolationCycle;
     var out = std.ArrayListUnmanaged(u8){};
     _ = self_key;
@@ -341,6 +344,7 @@ fn expandValue(arena: std.mem.Allocator, ini: *const ParsedIni, section_name: []
                 const prefix = name[0..slash];
                 const option = name[slash + 1 ..];
                 if (std.mem.eql(u8, prefix, "known")) {
+                    // Why: known/<option> takes an explicit known/ key, else the value this section held before a later layer overrode it.
                     raw = rawGet(local, name) orelse local.previous.get(option);
                 } else if (!std.mem.eql(u8, prefix, "default")) {
                     const other = ini.section(prefix) orelse return error.InterpolationMissingOption;
@@ -383,6 +387,7 @@ fn mergeInto(
     var sec_it = override.sections.iterator();
     while (sec_it.next()) |entry| {
         const original_name = entry.key_ptr.*;
+        // Why: A conditional header [name?cond] merges into [name] with "?cond" appended to each of its keys.
         const condition = std.mem.indexOfScalar(u8, original_name, '?');
         const name = if (condition) |q| original_name[0..q] else original_name;
         const src_sec = entry.value_ptr;
@@ -1020,6 +1025,7 @@ pub fn parseSelector(arena: std.mem.Allocator, input: []const u8) Error!Selector
             const key_start = i;
             while (i < text.len and text[i] != '=' and text[i] != ',' and text[i] != ']') : (i += 1) {}
             if (i == text.len or text[i] != '=') return error.InvalidParameter;
+            // Why: A conditional key such as port?family=inet6 holds its own '=', so the value starts after the next one.
             if (std.mem.indexOfScalar(u8, text[key_start..i], '?') != null) {
                 i += 1;
                 while (i < text.len and text[i] != '=' and text[i] != ',' and text[i] != ']') : (i += 1) {}
@@ -1159,6 +1165,7 @@ pub fn combineAsset(arena: std.mem.Allocator, asset: *const ParameterizedAsset, 
     var it = combined.iterator();
     var index: usize = 0;
     while (it.next()) |kv| {
+        // Why: Section-qualified keys were added only as expansion sources, so output stops at the keys present before them.
         if (index == output_count) break;
         index += 1;
         const value = try expandTags(arena, &combined, kv.value_ptr.*, condition, 0);
@@ -1179,6 +1186,7 @@ fn expandTags(arena: std.mem.Allocator, values: *const std.StringArrayHashMapUnm
                 if (condition.len > 0) {
                     replacement = values.get(try std.fmt.allocPrint(arena, "{s}?{s}", .{ name, condition }));
                 } else {
+                    // Why: Without a condition, a tag that has name?cond variants is left in place for a conditional expansion.
                     var keys = values.iterator();
                     var deferred = false;
                     while (keys.next()) |kv| {
@@ -1297,6 +1305,7 @@ pub fn prepareConfigDocument(arena: std.mem.Allocator, root: []const u8, stem: [
 }
 
 fn normalizeInteger(arena: std.mem.Allocator, raw: []const u8) Error!?[]const u8 {
+    // Why: Each entry is the zero of a run of ten Unicode decimal digits (category Nd), so any such digit maps to its ASCII value.
     const zeroes = [_]u21{ 0x30, 0x660, 0x6f0, 0x7c0, 0x966, 0x9e6, 0xa66, 0xae6, 0xb66, 0xbe6, 0xc66, 0xce6, 0xd66, 0xde6, 0xe50, 0xed0, 0xf20, 0x1040, 0x1090, 0x17e0, 0x1810, 0x1946, 0x19d0, 0x1a80, 0x1a90, 0x1b50, 0x1bb0, 0x1c40, 0x1c50, 0xa620, 0xa8d0, 0xa900, 0xa9d0, 0xa9f0, 0xaa50, 0xabf0, 0xff10, 0x104a0, 0x10d30, 0x11066, 0x110f0, 0x11136, 0x111d0, 0x112f0, 0x11450, 0x114d0, 0x11650, 0x116c0, 0x11730, 0x118e0, 0x11950, 0x11c50, 0x11d50, 0x11da0, 0x11f50, 0x16a60, 0x16ac0, 0x16b50, 0x1d7ce, 0x1d7d8, 0x1d7e2, 0x1d7ec, 0x1d7f6, 0x1e140, 0x1e2f0, 0x1e4f0, 0x1e950, 0x1fbf0 };
     const view = std.unicode.Utf8View.init(raw) catch return null;
     var iter = view.iterator();

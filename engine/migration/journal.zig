@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Records a migration run's steps durably and decides whether an interrupted run resumes, repeats, rolls back or is refused.
+// Holds: A run reopens only with the host, source database, source configuration, plan and generation it was created with.
+
 const std = @import("std");
 const durable = @import("../core/record_store.zig");
 
@@ -44,6 +47,7 @@ pub const Identity = struct {
 pub fn hostId(machine_id: []const u8, hostname: []const u8) [32]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update("fail2zig-migration-host-v1");
+    // Why: /etc/machine-id ends in a newline (machine-id(5)), so whitespace is trimmed before hashing.
     hasher.update(std.mem.trim(u8, machine_id, " \r\n\t"));
     hasher.update(&[_]u8{0});
     hasher.update(std.mem.trim(u8, hostname, " \r\n\t"));
@@ -177,6 +181,7 @@ pub const Journal = struct {
     pub fn pendingStep(self: *Journal) Error!?Pending {
         var rows: [max_steps]StepRow = undefined;
         const listed = try self.steps(&rows);
+        // Why: migrationSteps stops at the buffer size, so a full buffer may hide later steps, an open one among them.
         if (listed.len == max_steps) return error.TooManySteps;
         for (listed) |row| if (row.outcome == .pending) return .{ .seq = row.seq, .step = row.step, .started_us = row.started_us };
         return null;
@@ -222,6 +227,7 @@ pub const Journal = struct {
             },
             .stage_destination => {
                 const staged = try self.store.stagedMigrationCounts(self.run.run_id);
+                // Why: stageMigrationRows writes every row in one transaction, so any staged row means the step committed.
                 if (staged.owners != 0 or staged.history != 0) {
                     try self.finish(pending_step, .success, "staged-rows-present-after-interruption", .staged, now_us);
                     return .{ .continue_from = .activate_owners };
@@ -239,6 +245,7 @@ pub const Journal = struct {
         }
     }
 
+    // Holds: Activation, completion and rollback succeed only when observed present; uncertain or unknown is logged uncertain and refused.
     fn settleObserved(self: *Journal, pending_step: Pending, observed: Observation, now_us: i64) Error!Resume {
         const step = pending_step.step;
         const relevant: Protection = switch (step) {

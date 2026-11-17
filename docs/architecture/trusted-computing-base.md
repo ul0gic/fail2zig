@@ -25,8 +25,7 @@ the entire trust boundary.
 
 SQLite C is pinned and statically embedded. Zig's ReleaseSafe checks do not
 prove memory safety of the complete process or remove the need to review C,
-subprocesses and kernel interactions. The release includes `SQLITE-NOTICE.md`
-and derived-data attribution in `COPYING.date-profile`.
+subprocesses and kernel interactions. The release includes `SQLITE-NOTICE.md`.
 
 ## Service identity and capabilities
 

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Attempts a number of ssh logins as invalid users against one target address to produce authentication failures.
+# Holds: Every attempt runs with BatchMode on, so none can stop to prompt for a password.
 
 set -euo pipefail
 

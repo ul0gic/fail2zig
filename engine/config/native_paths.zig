@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Checks that the socket, state file and log paths do not alias, and opens and exclusively locks the state file.
+// Holds: The state file is opened NOFOLLOW and must be a regular euid-owned file with no group or other bits, locked before it is read.
+
 const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("native.zig");
@@ -43,6 +46,7 @@ pub fn validate(a: std.mem.Allocator, cfg: *const config.Config) !void {
     const parent_stat = try std.posix.fstat(parent.fd);
     if (parent_stat.uid != std.os.linux.geteuid() or parent_stat.mode & 0o022 != 0) return error.UnsafeNativeSocket;
     if (try same(a, socket, cfg.global.state_file)) return error.NativePathAlias;
+    // Why: SQLite keeps -wal, -shm and -journal files beside the database, so the socket must not alias any of them either.
     for ([_][]const u8{ "-wal", "-shm", "-journal" }) |suffix| {
         const sidecar = try std.fmt.allocPrint(a, "{s}{s}", .{ cfg.global.state_file, suffix });
         defer a.free(sidecar);
@@ -113,6 +117,7 @@ fn validateAndLockState(file: std.fs.File) !std.fs.File {
     var header: [16]u8 = undefined;
     const length = try file.preadAll(&header, 0);
     if (std.mem.startsWith(u8, header[0..length], "F2ZS")) return error.NativeStateMigrationRequired;
+    // Why: Every SQLite database file begins with the 16-byte string "SQLite format 3\0" (sqlite.org database file format).
     if (length != 0 and !std.mem.eql(u8, header[0..length], "SQLite format 3\x00")) return error.CorruptDatabase;
     return file;
 }
@@ -143,6 +148,7 @@ pub fn lockAbsentState(path: []const u8) !std.fs.File {
 pub fn lockState(path: []const u8) !std.fs.File {
     if (try lockStateIfPresent(path)) |file| return file;
     return lockAbsentState(path) catch |err| switch (err) {
+        // Why: Losing the exclusive create to another opener means the file now exists, so it is opened once more as existing.
         error.NativeStateChanged => (try lockStateIfPresent(path)) orelse return error.NativeStateChanged,
         else => return err,
     };

@@ -1,16 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Lists the selected nftables tables' chains, sets, sorted elements with deadlines and address rules over raw NETLINK_NETFILTER.
+// Holds: A listing is accepted only when the ruleset generation is unchanged across it, otherwise the run exits 4.
 
-// Independent nftables inventory over raw NETLINK_NETFILTER, written from the kernel uapi
-// headers only (no product code, no libnftnl). Prints the selected tables' chains and sets,
-// their elements sorted by address, and rules in kernel chain order with decoded address
-// matches. Anonymous sets are not counted. Element deadlines are dump start plus remaining
-// expiration; each set line prints its dump latency, the bound on that bias. A listing is
-// accepted only when the ruleset generation is unchanged across it.
-// Build: gcc -O2 -Wall -Wextra -o kernel_oracle tests/harness/load_repro/kernel_oracle.c
-// Usage: kernel_oracle [--prefix NAME_PREFIX | --table NAME]   (default prefix "f2z_")
-// Exit: 0 listing complete (possibly no table), 1 netlink/system error, 2 truncated,
-//       malformed or unexpected message, 3 usage, 4 ruleset generation changed during dump.
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
@@ -52,7 +44,7 @@ static void die(int code, const char *what) {
 
 typedef struct { const struct nlattr *a[64]; } Attrs;
 
-// Rejects attributes that overrun their container; the kernel never emits them.
+// Holds: An attribute whose length overruns its container ends the run as malformed.
 static void parse_attrs(Attrs *out, const void *data, size_t len) {
     memset(out, 0, sizeof(*out));
     const unsigned char *p = data;
@@ -95,7 +87,7 @@ static void attr_str(const struct nlattr *a, char *out, size_t cap) {
     memcpy(out, s, n);
 }
 
-// nft_data VALUE inside a nested attribute; returns its length.
+// Does:  Copies the NFTA_DATA_VALUE bytes out of a nested data attribute and returns their length.
 static size_t nested_value(const struct nlattr *a, unsigned char *out, size_t cap) {
     if (!a) die(EXIT_MALFORMED, "missing data attribute");
     Attrs d;
@@ -158,8 +150,6 @@ static void request(uint16_t msg, uint16_t flags, uint8_t family, const void *at
             }
             if (h->nlmsg_type == NLMSG_DONE) {
                 if (!dump) die(EXIT_MALFORMED, "DONE for a non-dump request");
-                // A dump that failed part-way ends with a negative errno in DONE instead of
-                // NLMSG_ERROR; accepting it would print a silently partial listing.
                 if (h->nlmsg_len < NLMSG_HDRLEN + sizeof(int)) die(EXIT_MALFORMED, "truncated DONE message");
                 int status;
                 memcpy(&status, NLMSG_DATA(h), sizeof(status));
@@ -192,7 +182,6 @@ static size_t put_str_attr(unsigned char *buf, size_t off, uint16_t type, const 
     return off + NLA_ALIGN(a->nla_len);
 }
 
-// ---- generation ----
 static void on_gen(const struct nlmsghdr *h, const void *p, size_t n, void *ctx) {
     (void)h;
     Attrs a;
@@ -206,7 +195,6 @@ static uint32_t generation(void) {
     return id;
 }
 
-// ---- tables ----
 typedef struct { char name[NAME_LEN]; uint8_t family; char marker[NAME_LEN]; } Table;
 typedef struct { const char *prefix; const char *exact; Table t[MAX_TABLES]; int n; int others; } TableScan;
 
@@ -233,7 +221,6 @@ static void on_table(const struct nlmsghdr *h, const void *p, size_t n, void *ct
     }
 }
 
-// ---- chains ----
 typedef struct { const Table *t; } ChainCtx;
 
 static void on_chain(const struct nlmsghdr *h, const void *p, size_t n, void *ctx) {
@@ -256,7 +243,6 @@ static void on_chain(const struct nlmsghdr *h, const void *p, size_t n, void *ct
     printf("\n");
 }
 
-// ---- sets ----
 typedef struct { char name[NAME_LEN]; uint32_t flags, key_len; } Set;
 typedef struct { const Table *t; Set s[MAX_SETS]; int n; } SetScan;
 
@@ -275,7 +261,6 @@ static void on_set(const struct nlmsghdr *h, const void *p, size_t n, void *ctx)
     e->key_len = attr_u32(a.a[NFTA_SET_KEY_LEN]);
 }
 
-// ---- set elements ----
 typedef struct { int set_index; long long base_ms; uint8_t key_len; unsigned char key[16]; uint64_t timeout_ms, expires_ms; int has_timeout, has_expiry; } Elem;
 typedef struct { const char *table; const char *set; int set_index; uint32_t key_len; long long base_ms; Elem *e; size_t n; } ElemScan;
 
@@ -330,9 +315,6 @@ static void format_addr(const unsigned char *key, size_t len, char *out, size_t 
     if (!inet_ntop(len == 4 ? AF_INET : AF_INET6, key, out, (socklen_t)cap)) die(EXIT_MALFORMED, "address format");
 }
 
-// ---- rules ----
-// Decodes only the matches needed to identify an address ban: set lookup, source address
-// (with optional prefix mask), layer-4 protocol, destination port range and verdict.
 typedef struct { const Table *t; int scoped; int lookups; int rules; } RuleCtx;
 
 static int popcount_bytes(const unsigned char *m, size_t n) {
@@ -341,6 +323,7 @@ static int popcount_bytes(const unsigned char *m, size_t n) {
     return bits;
 }
 
+// Does:  Decodes only the matches that identify an address ban: set lookup, source address and mask, protocol, port range and verdict.
 static void on_rule(const struct nlmsghdr *h, const void *p, size_t n, void *ctx) {
     (void)h;
     RuleCtx *c = ctx;
@@ -481,12 +464,12 @@ int main(int argc, char **argv) {
 
         size_t first = total_elems;
         for (int si = 0; si < sets.n; si++) {
-            // Anonymous sets belong to rule expressions, not to the ban inventory.
+            // Why: Anonymous sets belong to rule expressions, not to the ban inventory, so they are listed as skipped and not counted.
             if (sets.s[si].flags & NFT_SET_ANONYMOUS) {
                 printf("set %s %s flags=0x%x key_len=%u anonymous=skipped\n", t->name, sets.s[si].name, sets.s[si].flags, sets.s[si].key_len);
                 continue;
             }
-            // Deadlines are computed from the dump start; latency bounds their bias.
+            // Why: Element deadlines are the dump start plus the remaining expiry, and the printed dump latency bounds that bias.
             long long start_ms = wall_ms();
             ElemScan es = { t->name, sets.s[si].name, si, sets.s[si].key_len, start_ms, elems + total_elems, 0 };
             alen = put_str_attr(attrs, 0, NFTA_SET_ELEM_LIST_TABLE, t->name);

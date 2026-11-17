@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Parses a native duration of number-and-unit terms, such as "1h 30m", into whole seconds.
+// Holds: An empty text, a term without digits, an unknown unit or a total past u64 is refused, never clamped.
 
 const std = @import("std");
 
-// Fixed seconds, matching the compatibility importer; months and years are not calendar intervals.
+// Why: "mo" and "y" are fixed second counts of 30.4375 and 365.25 days, the same as shared.duration, not calendar intervals.
 pub fn parse(text: []const u8) error{InvalidValue}!u64 {
     var pos: usize = 0;
     var total: u64 = 0;

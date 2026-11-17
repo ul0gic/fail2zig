@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Keeps an in-memory projection of retry states that answers pool counts, jail summaries, live decisions and eviction victims.
+// Holds: Counts, live decisions and victims are answered only after every retry_states row is copied and the projection clock is current.
+
 const std = @import("std");
 const build_options = @import("build_options");
 const diag = @import("../core/diag.zig");
@@ -250,7 +253,7 @@ pub fn Methods(comptime Store: type) type {
                 if (failure == error.RetryAdmissionRequired) return;
                 return failure;
             };
-            // Member rows were removed by committed retirement pages.
+            // Why: Retirement pages delete member rows first, so a row left here means the projection and retry_states disagree.
             var members = try self.statement("SELECT 1 FROM temp.retry_admission_rows WHERE jail_id=?1 LIMIT 1;");
             defer members.deinit();
             try members.int(1, id);
@@ -493,7 +496,7 @@ pub fn Methods(comptime Store: type) type {
             if (comptime build_options.diag) diag.count(.retry_live_reads, 1);
             var count: usize = 0;
             var after: ?LiveCursor = null;
-            // Synchronous worker-only pages cannot interleave another Store mutation.
+            // Why: Pages are separate read transactions run back to back on this Store, so no mutation through it falls between them.
             while (true) {
                 if (count == output.len) {
                     var probe: [1]Store.ActiveDecision = undefined;

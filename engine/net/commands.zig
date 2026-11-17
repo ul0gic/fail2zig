@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Answers the unversioned status, ban, unban, list and version commands from the tracker map and the configuration.
+// Holds: With no ready firewall every jail reports log-only, and a manual ban is refused unless its jail is enabled and enforcing.
 
 const std = @import("std");
 const shared = @import("shared");
@@ -188,6 +190,7 @@ pub const Context = struct {
         return self.firewall_state.effectiveAction(resolved.banaction) != .@"log-only";
     }
 
+    // Does:  Reduces firewall state, ban application and source health to one word: degraded, mixed, log-only or active.
     pub fn computeOverallState(self: *const Context) []const u8 {
         if (self.firewall_state == .unavailable) return "degraded";
         if (self.enabledJailCount() == 0) return "log-only";
@@ -197,6 +200,7 @@ pub const Context = struct {
                 var states = entry.value_ptr.*.iterator();
                 while (states.next()) |kv| {
                     const st = kv.value_ptr;
+                    // Why: A ban marked enforced that is not applied, or is past its expiry, means the kernel and the tracker disagree.
                     if (st.ban_state == .banned and st.enforced and (!st.applied or (st.ban_expiry orelse 0) <= std.time.timestamp())) return "degraded";
                 }
             }

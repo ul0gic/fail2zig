@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Applies an operator's source repair for a truncated, replaced or removed log file by rewriting its cursor under a token.
+// Holds: A token acts once, and a repair commits only if checkpoint revision, generation, cursor and the held file still match.
+
 const std = @import("std");
 const store_mod = @import("store.zig");
 const files = @import("../core/durable_file_source.zig");
@@ -179,6 +182,7 @@ fn readRow(store: *Store, allocator: std.mem.Allocator, request: Request, key: [
     var buffer: [store_mod.Limits.source_bytes + 128]u8 = undefined;
     const expected = try sourceId(&buffer, request.jail, request.path, device, inode);
     const stored = try row.boundedBytes(1, store_mod.Limits.source_bytes);
+    // Why: A replaced-file repair stores the old file's source id, so only its jail and path prefix can match the current file.
     const same_path = request.jail.len + 1 + request.path.len + 1;
     const named = if (outcome == outcome_replaced_file_acknowledged) stored.len > same_path and std.mem.eql(u8, stored[0..same_path], expected[0..same_path]) else std.mem.eql(u8, stored, expected);
     if (!std.mem.eql(u8, try row.boundedBytes(0, 64), request.jail) or !named) return error.RepairTokenMismatch;
@@ -283,7 +287,7 @@ fn observe(store: *Store, allocator: std.mem.Allocator, request: Request, file: 
 
 const Checkpoint = struct { generation: [32]u8, revision: u64 };
 
-// Bytes 8..40 of the native processor's `F2NT` jail checkpoint hold the configuration generation every source receipt is bound to.
+// Why: An F2NT jail checkpoint is 96 or 104 bytes and holds the configuration generation in bytes 8..40.
 fn readCheckpoint(store: *Store, jail: []const u8) Error!Checkpoint {
     var row = try store.statement("SELECT payload,revision FROM checkpoints WHERE jail=?1;");
     defer row.deinit();

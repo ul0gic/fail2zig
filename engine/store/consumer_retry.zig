@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Stores consumer manifests and checkpoints and the retry policies, states and decisions that turn matched records into bans.
+// Holds: A new ban past the banned-subject cap is refused, and a full tracking pool evicts only subjects whose effect is wholly absent.
+
 const std = @import("std");
 const build_options = @import("build_options");
 const diag_mod = @import("../core/diag.zig");
@@ -300,7 +303,7 @@ pub fn Methods(comptime Store: type) type {
             if (dnsAuthority(requirement.key) and (requirement.format_version != 1 or try row.signed(1) != 1 or expiry != null or
                 !std.mem.eql(u8, try row.boundedBytes(5, 32), &requirement.key.generation))) return error.InvalidConsumer;
         }
-        // Retire one complete manifest dependency group; never copy checkpoint payloads.
+        // Does:  Retires the jail's first manifest with its requirements and every checkpoint no other manifest still requires.
         pub fn retireJailManifestTx(self: *Store, jail: []const u8) Error!u16 {
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
@@ -803,6 +806,7 @@ pub fn Methods(comptime Store: type) type {
             var count: usize = 0;
             while (try manifests.row()) {
                 count += 1;
+                // Why: Besides one generation per admitted jail, only @shared and @history may hold manifests.
                 if (count > admissions.len + 2) return error.ConsumerGenerationMismatch;
                 const jail = try manifests.boundedBytes(0, 64);
                 const saved = try Store.effectBlob(&manifests, 1, 32);
@@ -1056,7 +1060,7 @@ pub fn Methods(comptime Store: type) type {
         pub const RekeyReport = struct { retry_rows: u32, pending_receipts: u32, manifests: u32, cursors: u32 };
         pub const CursorRekey = union(enum) { none, file: struct { legacy: [32]u8, planned: [32]u8 }, journal };
 
-        // One-time startup rewrite of v0.4.6 rows; a single statement over a large records table needs more than the ordinary statement budget.
+        // Why: A rekey rewrites a jail's records in single statements, which can exceed the default 1,000-callback progress budget.
         const rekey_work_callbacks: u32 = 100_000;
         pub const OwnerHeld = struct { key: [32]u8, revision: u64, scope: [canonical_scope.encoded_bytes]u8, absent: bool };
 
@@ -1222,7 +1226,7 @@ pub fn Methods(comptime Store: type) type {
             return std.math.cast(u32, self.api.changes(self.db)) orelse error.StorageLimit;
         }
 
-        // A supplied time is reload's caller sample; null keeps startup's nonempty-only clock sample and commit.
+        // Does:  Moves the jail's owners to the planned generation; with now_us null it commits the effect clock only if one moved.
         pub fn rekeyOwnersTx(self: *Store, jail: []const u8, legacy: [32]u8, planned: [32]u8, now_us: ?i64, stale_failure: error{ StaleEffect, StalePolicyTransition }) Error!bool {
             var held = std.ArrayListUnmanaged(OwnerHeld){};
             defer held.deinit(self.allocator);

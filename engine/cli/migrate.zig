@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Parses the migrate command line, runs inspect, snapshot, plan and validate, and dispatches cutover, status and rollback.
+// Holds: Plan exits success only when the plan has no blockers and validate only when the outcome is valid; anything else exits nonzero.
 
 const std = @import("std");
 const shared = @import("shared");

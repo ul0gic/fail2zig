@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Cuts the installed baseline over to a candidate build, runs the lifecycle and deployment checks, and restores the baseline on exit.
+# Holds: The exit trap deletes its backup only after every restored artifact and the nftables ruleset match the baseline.
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -170,6 +175,7 @@ restore() {
     exit "$result"
 }
 trap restore EXIT
+# Why: The lifecycle helper programs the firewall, so each run uses a private network namespace that keeps its changes off the host ruleset.
 if [ "$PROFILE" = full ]; then
     printf 'release-gate: backend=nftables profile=deep\n'
     unshare --net timeout --kill-after=5 90 \
@@ -191,8 +197,7 @@ if [ "$HAD_CLIENT" -eq 1 ]; then BASELINE_CLIENT=/usr/local/bin/fail2zig-client;
     exit 1
 }
 systemctl stop fail2zig
-# The legacy state must remain untouched while the candidate uses fresh native
-# state. Reject foreground writers before copying or moving the baseline tree.
+# Why: A running fail2zig or an open baseline state file could write the tree during the copy, so the cutover refuses while one exists.
 for proc in /proc/[0-9]*; do
     [ "$(cat "$proc/comm" 2>/dev/null || :)" != fail2zig ] || {
         echo "release-gate: foreground fail2zig still running: ${proc##*/}" >&2

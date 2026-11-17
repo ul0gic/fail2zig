@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Applies a jail's configured banip list as config-owned bans and lists live owners by origin.
+// Holds: A config owner whose decision is missing from the applied list is released; an entry over storage capacity is counted pending.
+
 const std = @import("std");
 const shared = @import("shared");
 const store = @import("store.zig");
@@ -95,6 +98,7 @@ pub fn Methods(comptime Store: type) type {
                 const first = std.sort.binarySearch(IndexedId, ids, decision_id, idOrder) orelse return error.InvalidBanListEntry;
                 var lowest = first;
                 while (lowest > 0 and std.mem.eql(u8, &ids[lowest - 1].id, &decision_id)) lowest -= 1;
+                // Why: Only the first entry carrying a decision id is applied; later entries with the same id are skipped.
                 if (ids[lowest].index != index) continue;
                 const scope = try entryScope(item.entry);
                 const key = try scope.key(installation);

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Drives the built daemon and client through ban, expiry, restart and unban on loopback, checking real TCP connects per backend.
+// Holds: A wait helper succeeds only by passing the same strict check a direct call makes, and falling through on timeout fails it.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -363,6 +365,7 @@ fn tcpConnects(source_ip: ?[]const u8, target_ip: []const u8, port: u16) !bool {
         else => if (expectedBlockedError(err)) return false else return err,
     };
     var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+    // Why: A dropped SYN gets no reply, so a connect still pending after tcp_probe_timeout_ms counts as blocked.
     if (try posix.poll(&fds, tcp_probe_timeout_ms) == 0) return false;
     posix.getsockoptError(fd) catch |err| {
         if (expectedBlockedError(err)) return false;
@@ -445,11 +448,13 @@ fn appendFailures(path: []const u8) !void {
     defer file.close();
     try file.seekFromEnd(0);
     const writer = file.writer();
+    // Why: Three failures from one address reach the maxretry = 3 written by writeConfig.
     for ([_]u16{ 40001, 40002, 40003 }) |port| {
         try writer.print("Failed password for fixture-user from 192.0.2.42 port {d} ssh2\n", .{port});
     }
 }
 
+// Why: firewall_namespace names this process's network namespace, where the fixture addresses and listeners live.
 fn writeConfig(path: []const u8, work: []const u8, auth_log: []const u8, daemon_log: []const u8, backend: []const u8) !void {
     var file = try std.fs.cwd().createFile(path, .{ .truncate = true, .mode = 0o600 });
     defer file.close();
@@ -504,6 +509,7 @@ fn runOverlapLifecycle(client: Client, daemon: *Daemon) !void {
     try client.discard(&.{ "ban", "192.0.2.42", "--jail", "other", "--duration", "40", "--force" });
     try client.waitListCount(&.{"list"}, 2);
     try client.waitInteger(&.{"status"}, "active_bans", 1);
+    // Why: The 20 s sshd ban expires while the 40 s other-jail ban is still active, so the address must stay blocked.
     std.Thread.sleep(21 * std.time.ns_per_s);
     try require(!(try tcpConnects("192.0.2.42", "127.0.0.1", test_port)), "short expiry preserves longer overlapping ownership");
     try client.waitListCount(&.{"list"}, 1);
@@ -535,6 +541,7 @@ fn runLifecycle(a: std.mem.Allocator, executable: []const u8, backend: []const u
     const daemon_log = try std.fs.path.join(a, &.{ work, "daemon.log" });
     defer a.free(daemon_log);
 
+    // Why: tcpConnects binds these source addresses, so they must exist on lo.
     try runExpected(a, &.{ "ip", "link", "set", "lo", "up" });
     try runExpected(a, &.{ "ip", "address", "add", "192.0.2.42/32", "dev", "lo" });
     try runExpected(a, &.{ "ip", "-6", "address", "add", "2001:db8::42/128", "dev", "lo", "nodad" });
@@ -610,6 +617,7 @@ fn runLifecycle(a: std.mem.Allocator, executable: []const u8, backend: []const u
             else => return error.ExpectedJsonArray,
         };
         if (items.len != 1 or items[0] != .object) return error.UnexpectedListCount;
+        // Why: The sshd jail's bantime is 5 s, so a ban without a duration expires 4 to 7 s after the request.
         const expiry = items[0].object.get("expiry_us") orelse return error.MissingJsonField;
         if (expiry != .integer or
             expiry.integer < default_ban_started_us + 4 * std.time.us_per_s or

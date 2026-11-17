@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 fail2zig maintainers
+# Does:  Appends paced portsentry scan lines for consecutive addresses starting at 198.18.0.0 to a log file.
+# Holds: The count is limited to the 131072 addresses of 198.18.0.0/15, so every generated address stays in that range.
+
 import argparse
 from datetime import datetime, timezone
 from ipaddress import IPv4Address

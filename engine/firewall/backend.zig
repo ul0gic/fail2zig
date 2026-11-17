@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Selects the firewall backend, forced by configuration or probed as nftables, then ipset, then iptables, and forwards calls to it.
+// Holds: A forced backend that fails its probe is refused with no fallback, and auto-detection stops at a netlink permission denial.
 
 const std = @import("std");
 const shared = @import("shared");

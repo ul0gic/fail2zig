@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Classifies a proposed configuration against the running one as no-op, live, restart-required or rejected.
+// Holds: Rejected outranks restart-required, which outranks live; both return with the policy, ignore, jail, banip and decay lists empty.
 
 const std = @import("std");
 const config = @import("../config/native.zig");
@@ -111,6 +113,7 @@ pub const Classification = struct {
 
 fn globalsEqual(a: *const config.GlobalConfig, b: *const config.GlobalConfig, out: *Classification) void {
     inline for (std.meta.fields(config.GlobalConfig)) |field| {
+        // Why: These two are applied live below; any other global field change needs a restart.
         if (comptime std.mem.eql(u8, field.name, "log_level") or std.mem.eql(u8, field.name, "history_max_matches")) continue;
         const left = @field(a, field.name);
         const right = @field(b, field.name);
@@ -158,6 +161,7 @@ fn distinctConfigured(literals: []const []const u8) usize {
             if (prior.order(entry) == .eq) duplicate = true;
         }
         if (duplicate) continue;
+        // Why: Past the scratch capacity the raw literal count is an upper bound, so the limit check stays conservative.
         if (count == seen.len) return literals.len;
         seen[count] = entry;
         count += 1;

@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Copies a live fail2ban database into a private staging file with the SQLite online backup API and records its identity.
+// Holds: The source is opened only read-only, and a copy is kept only if the source path names the same device and inode after the copy.
+
 const std = @import("std");
 const db = @import("fail2ban_db.zig");
 
@@ -114,6 +117,7 @@ pub fn capture(allocator: std.mem.Allocator, source_path: []const u8, staging_di
     defer source.close();
     if (options.identity_hook) |hook| hook.func(hook.context, .after_open);
     try source.busyTimeoutMs(Limits.busy_timeout_ms);
+    // Why: The path is checked again after open and after the copy, so a file swapped in at either point is refused.
     const reopened = try statSource(source_path);
     if (reopened.dev != identity.dev or reopened.ino != identity.ino) return error.NotRegularFile;
     if (try sourceHasMoved(source)) return error.NotRegularFile;
@@ -173,6 +177,7 @@ pub fn capture(allocator: std.mem.Allocator, source_path: []const u8, staging_di
 fn sourceHasMoved(source: db.Connection) Error!bool {
     const file_control = @extern(*const fn (*db.Db, ?[*:0]const u8, c_int, ?*anyopaque) callconv(.c) c_int, .{ .name = "sqlite3_file_control" });
     var moved: c_int = 1;
+    // Why: Opcode 20 is SQLITE_FCNTL_HAS_MOVED (sqlite3.h): whether the open file was renamed, moved or deleted since it was opened.
     const code = file_control(source.db, "main", 20, &moved);
     if (code != db.rc.ok) return db.sqliteError(code);
     return moved != 0;
@@ -226,6 +231,7 @@ fn buildUri(allocator: std.mem.Allocator, absolute: []const u8) Error![:0]u8 {
     out.appendSlice("file:") catch return error.OutOfMemory;
     for (absolute) |byte| {
         switch (byte) {
+            // Why: ? and # end a URI path (RFC 3986 section 3) and SQLite decodes %HH in it (sqlite3.h), so these bytes are escaped.
             '%', '?', '#' => {
                 const hex = "0123456789ABCDEF";
                 out.appendSlice(&.{ '%', hex[byte >> 4], hex[byte & 0xf] }) catch return error.OutOfMemory;
@@ -281,6 +287,7 @@ fn runBackup(source: db.Connection, destination_z: [*:0]const u8, pages_per_step
         const pagecount: u64 = @intCast(@max(db.api.backup_pagecount(backup), 0));
         const before = last_remaining orelse pagecount;
         const expected = before -| @as(u64, @intCast(pages_per_step));
+        // Why: A write to the source by another connection restarts the backup at the next step (sqlite3_backup_step in sqlite3.h).
         if (remaining > expected) {
             progress.restarts += 1;
             if (progress.restarts > Limits.max_restarts) return error.ConcurrentWriter;

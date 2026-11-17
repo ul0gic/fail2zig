@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Proves the shipped systemd unit starts the daemon with the expected run directory, socket ownership and group-only access.
+# Holds: Expected owners and modes are fixed in the script, and an already active unit is never clobbered without --force.
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)"

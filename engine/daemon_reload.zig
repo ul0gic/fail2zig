@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Stages a configuration reload from a request or signal and applies it on the worker as one durable generation commit.
+// Holds: Live state changes only after commitReloadGeneration succeeds; a failure before it leaves the published generation in place.
+
 const std = @import("std");
 const shared = @import("shared");
 const config = @import("config/native.zig");
@@ -69,6 +72,7 @@ pub fn Methods(comptime Coordinator: type) type {
                 .restart_required => .restart_required,
                 .rejected => .rejected,
             }, .generation = current_generation, .reasons = classification.reasons, .reason_count = classification.reason_count };
+            // Why: The worker re-reads each custom jail's ignore_file, so an unchanged configuration with one is still applied there.
             if (classification.kind != .live and !(classification.kind == .noop and self.hasAllowlistFiles())) return out;
             const request = self.allocator.create(ReloadRequest) catch return ReloadOutcome.single(.rejected, "out of memory", .{});
             request.* = .{ .config_digest = digest, .proposed = proposed, .arena = arena };
@@ -87,6 +91,7 @@ pub fn Methods(comptime Coordinator: type) type {
                 self.reload_wake.timedWait(&self.mutex, (wait_ms - elapsed_ms) * std.time.ns_per_ms) catch {};
             }
             if (!request.done) {
+                // Why: A request the worker never took is withdrawn unchanged; once taken, the worker finishes it and frees it.
                 if (self.reload_request == request) {
                     self.reload_request = null;
                     self.mutex.unlock();
@@ -137,6 +142,7 @@ pub fn Methods(comptime Coordinator: type) type {
             const now = self.clock.wallUs();
             const generation = reload_mod.generationId(request.config_digest, now);
             const proposed = request.proposed;
+            // Why: Another reload can publish between staging and this turn, so the proposal is classified again against current state.
             const classified = self.inspectPublicationLocked(ReloadClassificationInput{ .proposed = proposed }, classifyReloadLocked);
             const classification = &classified.classification;
             if (classification.kind != .live and !(classification.kind == .noop and self.hasAllowlistFiles())) return .{
@@ -150,7 +156,7 @@ pub fn Methods(comptime Coordinator: type) type {
                 .reasons = classification.reasons,
                 .reason_count = classification.reason_count,
             };
-            // Refuse reuse before constructing any proposed runtime or changing durable state.
+            // Holds: A jail name still retiring is refused before any jail is built or durable state changes.
             for (proposed.jails) |jail_cfg| if (jail_cfg.enabled) {
                 const runtime_retiring = if (self.findJail(jail_cfg.name)) |jail| jail.retiring else false;
                 var withdrawing = false;
@@ -314,7 +320,7 @@ pub fn Methods(comptime Coordinator: type) type {
             if (count != 0) self.owner_read_epoch = null;
             if (classification.log_level) |level| log_level.set(std.meta.stringToEnum(std.log.Level, @tagName(level)) orelse .info);
             const old_arena = self.replaceLiveConfigLocked(request.arena, proposed);
-            // Classification still borrows old configuration names until this turn returns.
+            // Why: The classification borrows names from the old configuration, so its arena is freed only when this function returns.
             defer if (old_arena) |arena| {
                 arena.deinit();
                 self.allocator.destroy(arena);

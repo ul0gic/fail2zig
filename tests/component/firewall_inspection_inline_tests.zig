@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Proves the firewall inspection parsers and scoped argv builders refuse widened, foreign, malformed or incomplete state.
+// Holds: Every input is an in-memory literal and every expected value a literal fixed here; no firewall command runs and no file is read.
+
 const std = @import("std");
 const mem = std.mem;
 const shared = @import("shared");
