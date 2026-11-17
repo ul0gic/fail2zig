@@ -8,7 +8,6 @@ const build_options = @import("build_options");
 const diag = @import("../core/diag.zig");
 const effects = @import("../core/native_effect.zig");
 const detection = @import("../core/native_detection_record.zig");
-const retry = @import("../core/native_retry.zig");
 const action_outcome = @import("../core/native_action_outcome.zig");
 const application_history = @import("../core/native_application_history.zig");
 const store = @import("store.zig");

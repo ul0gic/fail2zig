@@ -177,29 +177,12 @@ pub const Metrics = struct {
         self.lines_matched.inc();
     }
 
-    pub fn incrementBans(self: *Metrics) void {
-        self.bans_total.inc();
-        _ = self.active_bans.fetchAdd(1, counter_order);
-    }
-
-    pub fn incrementUnbans(self: *Metrics) void {
-        self.unbans_total.inc();
-        const prev = self.active_bans.load(counter_order);
-        if (prev > 0) {
-            _ = self.active_bans.fetchSub(1, counter_order);
-        }
-    }
-
     pub fn incrementParseErrors(self: *Metrics) void {
         self.parse_errors.inc();
     }
 
     pub fn setMemoryBytes(self: *Metrics, bytes: u64) void {
         self.memory_bytes_used.store(bytes);
-    }
-
-    pub fn setActiveBans(self: *Metrics, count: u32) void {
-        self.active_bans.store(count, counter_order);
     }
 
     pub fn setBansTotal(self: *Metrics, count: u64) void {
@@ -273,32 +256,9 @@ pub const Metrics = struct {
         }
     }
 
-    pub fn jailIncrementBans(self: *Metrics, jail: []const u8) void {
-        if (self.jailIndex(jail)) |i| {
-            self.jails[i].bans_total.inc();
-            _ = self.jails[i].active_bans.fetchAdd(1, counter_order);
-        }
-    }
-
-    pub fn jailSetActiveBans(self: *Metrics, jail: []const u8, count: u32) void {
-        if (self.jailIndex(jail)) |i| {
-            self.jails[i].active_bans.store(count, counter_order);
-        }
-    }
-
     pub fn jailSetBansTotal(self: *Metrics, jail: []const u8, count: u64) void {
         if (self.jailIndex(jail)) |i| {
             self.jails[i].bans_total.store(count);
-        }
-    }
-
-    pub fn jailIncrementUnbans(self: *Metrics, jail: []const u8) void {
-        if (self.jailIndex(jail)) |i| {
-            self.jails[i].unbans_total.inc();
-            const prev = self.jails[i].active_bans.load(counter_order);
-            if (prev > 0) {
-                _ = self.jails[i].active_bans.fetchSub(1, counter_order);
-            }
         }
     }
 

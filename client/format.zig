@@ -14,18 +14,10 @@ pub const Color = struct {
 
     const reset = "\x1b[0m";
     const bold = "\x1b[1m";
-    const dim = "\x1b[2m";
     const red = "\x1b[31m";
     const green = "\x1b[32m";
     const yellow = "\x1b[33m";
     const cyan = "\x1b[36m";
-    const gray = "\x1b[90m";
-
-    pub fn wrap(self: Color, writer: anytype, code: []const u8, text: []const u8) !void {
-        if (self.enabled) try writer.writeAll(code);
-        try writer.writeAll(text);
-        if (self.enabled) try writer.writeAll(reset);
-    }
 
     pub fn on(self: Color, writer: anytype, code: []const u8) !void {
         if (self.enabled) try writer.writeAll(code);
@@ -219,25 +211,6 @@ pub const VersionPayload = struct {
     build_date: ?[]const u8 = null,
 };
 
-pub const BanActionPayload = struct {
-    ip: ?[]const u8 = null,
-    jail: ?[]const u8 = null,
-    duration_seconds: ?u64 = null,
-    result: ?[]const u8 = null,
-};
-
-pub const UnbanActionPayload = struct {
-    ip: ?[]const u8 = null,
-    jail: ?[]const u8 = null,
-    result: ?[]const u8 = null,
-};
-
-pub const ReloadPayload = struct {
-    result: ?[]const u8 = null,
-    jails_loaded: ?u32 = null,
-    warnings: ?[]const []const u8 = null,
-};
-
 pub fn formatStatus(
     allocator: std.mem.Allocator,
     writer: anytype,
@@ -248,28 +221,12 @@ pub fn formatStatus(
     try formatStatusWithDetails(allocator, writer, payload_json, fmt, color, false, null);
 }
 
-pub fn formatStatusDetailed(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color) !void {
-    try formatStatusWithDetails(allocator, writer, payload_json, fmt, color, true, null);
-}
-
 pub fn formatStatusWithLoss(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color, loss: LossReport) !void {
     try formatStatusWithDetails(allocator, writer, payload_json, fmt, color, true, loss);
 }
 
 fn formatStatusWithDetails(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color, details: bool, loss: ?LossReport) !void {
     try formatStatusReport(allocator, writer, payload_json, fmt, color, terminalColumns(), details, loss);
-}
-
-fn formatStatusForWidthDetailed(
-    allocator: std.mem.Allocator,
-    writer: anytype,
-    payload_json: []const u8,
-    fmt: OutputFormat,
-    color: Color,
-    columns: usize,
-    details: bool,
-) !void {
-    return formatStatusReport(allocator, writer, payload_json, fmt, color, columns, details, null);
 }
 
 fn formatStatusReport(
@@ -2151,151 +2108,6 @@ pub fn formatVersion(
     }
 }
 
-pub fn formatBan(
-    allocator: std.mem.Allocator,
-    writer: anytype,
-    payload_json: []const u8,
-    fmt: OutputFormat,
-    color: Color,
-) !void {
-    try formatSimpleAction(
-        BanActionPayload,
-        allocator,
-        writer,
-        payload_json,
-        fmt,
-        color,
-        "Banned",
-    );
-}
-
-pub fn formatUnban(
-    allocator: std.mem.Allocator,
-    writer: anytype,
-    payload_json: []const u8,
-    fmt: OutputFormat,
-    color: Color,
-) !void {
-    try formatSimpleAction(
-        UnbanActionPayload,
-        allocator,
-        writer,
-        payload_json,
-        fmt,
-        color,
-        "Unbanned",
-    );
-}
-
-fn formatSimpleAction(
-    comptime T: type,
-    allocator: std.mem.Allocator,
-    writer: anytype,
-    payload_json: []const u8,
-    fmt: OutputFormat,
-    color: Color,
-    verb: []const u8,
-) !void {
-    switch (fmt) {
-        .json => {
-            try writer.writeAll(payload_json);
-            if (payload_json.len == 0 or payload_json[payload_json.len - 1] != '\n') {
-                try writer.writeAll("\n");
-            }
-        },
-        .plain => {
-            const parsed = std.json.parseFromSlice(
-                T,
-                allocator,
-                payload_json,
-                .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
-            ) catch return;
-            defer parsed.deinit();
-            if (parsed.value.ip) |ip| try writer.print("ip\t{s}\n", .{ip});
-            if (parsed.value.jail) |j| try writer.print("jail\t{s}\n", .{j});
-            if (parsed.value.result) |r| try writer.print("result\t{s}\n", .{r});
-        },
-        .table => {
-            const parsed = std.json.parseFromSlice(
-                T,
-                allocator,
-                payload_json,
-                .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
-            ) catch {
-                try writer.print("{s} request accepted.\n", .{verb});
-                return;
-            };
-            defer parsed.deinit();
-            try color.on(writer, Color.green);
-            try writer.writeAll(verb);
-            try color.off(writer);
-            if (parsed.value.ip) |ip| try writer.print(" {s}", .{ip});
-            if (parsed.value.jail) |j| try writer.print(" (jail: {s})", .{j});
-            if (parsed.value.result) |r| {
-                if (!std.mem.eql(u8, r, "banned") and !std.mem.eql(u8, r, "unbanned")) {
-                    try writer.print(" [{s}]", .{r});
-                }
-            }
-            try writer.writeAll("\n");
-        },
-    }
-}
-
-pub fn formatReload(
-    allocator: std.mem.Allocator,
-    writer: anytype,
-    payload_json: []const u8,
-    fmt: OutputFormat,
-    color: Color,
-) !void {
-    switch (fmt) {
-        .json => {
-            try writer.writeAll(payload_json);
-            if (payload_json.len == 0 or payload_json[payload_json.len - 1] != '\n') {
-                try writer.writeAll("\n");
-            }
-        },
-        .plain => {
-            const parsed = std.json.parseFromSlice(
-                ReloadPayload,
-                allocator,
-                payload_json,
-                .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
-            ) catch return;
-            defer parsed.deinit();
-            if (parsed.value.result) |r| try writer.print("result\t{s}\n", .{r});
-            if (parsed.value.jails_loaded) |j| try writer.print("jails_loaded\t{d}\n", .{j});
-        },
-        .table => {
-            const parsed = std.json.parseFromSlice(
-                ReloadPayload,
-                allocator,
-                payload_json,
-                .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
-            ) catch {
-                try writer.writeAll("Reload requested.\n");
-                return;
-            };
-            defer parsed.deinit();
-            try color.on(writer, Color.green);
-            try writer.writeAll("Reloaded");
-            try color.off(writer);
-            if (parsed.value.jails_loaded) |j| {
-                try writer.print(" ({d} jails loaded)", .{j});
-            }
-            try writer.writeAll(".\n");
-            if (parsed.value.warnings) |ws| {
-                for (ws) |w| {
-                    try color.on(writer, Color.yellow);
-                    try writer.writeAll("warning: ");
-                    try color.off(writer);
-                    try writer.print("{s}\n", .{w});
-                }
-            }
-        },
-    }
-}
-
 const IgnoreBan = struct {
     scope: []const u8 = "",
     deadline_us: ?i64 = null,
@@ -2877,21 +2689,6 @@ pub const ConfigPayload = struct {
     global: ?ConfigGlobal = null,
 };
 
-pub const ScopeEntry = struct {
-    jail: ?[]const u8 = null,
-    scope: ?ScopeView = null,
-    lease: ?[]const u8 = null,
-    deadline_us: ?i64 = null,
-    decision_id_hex: ?[]const u8 = null,
-    confirmed: ?bool = null,
-};
-
-pub const ScopesPayload = struct {
-    generation: ?[]const u8 = null,
-    items: ?[]const ScopeEntry = null,
-    next_cursor: ?[]const u8 = null,
-};
-
 pub const HistoryEntry = struct {
     sequence: ?u64 = null,
     event_id_hex: ?[]const u8 = null,
@@ -2984,10 +2781,6 @@ pub const FirewallPayload = struct {
 
 pub fn formatConfig(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color) !void {
     return formatQuery(ConfigPayload, "config", writeConfigPlain, writeConfigTable, allocator, writer, payload_json, fmt, color);
-}
-
-pub fn formatScopes(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color) !void {
-    return formatQuery(ScopesPayload, "scopes", writeScopesPlain, writeScopesTable, allocator, writer, payload_json, fmt, color);
 }
 
 pub fn formatHistory(allocator: std.mem.Allocator, writer: anytype, payload_json: []const u8, fmt: OutputFormat, color: Color) !void {
@@ -3226,79 +3019,8 @@ fn scopeMatch(buffer: []u8, scope: ?ScopeView) []const u8 {
     return renderDiagnostic(buffer, s.protocol.?);
 }
 
-fn writeScopesPlain(writer: anytype, p: ScopesPayload) !void {
-    try plainOpt(writer, "generation", p.generation);
-    for (p.items orelse &.{}, 0..) |it, i| {
-        var key: [64]u8 = undefined;
-        var addr: [64]u8 = undefined;
-        var match: [scope_match_max_bytes]u8 = undefined;
-        try plainOpt(writer, try itemKey(&key, i, "jail"), it.jail);
-        try plainOpt(writer, try itemKey(&key, i, "scope"), scopeAddress(&addr, it.scope));
-        try plainOpt(writer, try itemKey(&key, i, "match"), scopeMatch(&match, it.scope));
-        try plainOpt(writer, try itemKey(&key, i, "lease"), it.lease);
-        try plainInt(writer, try itemKey(&key, i, "deadline_us"), it.deadline_us);
-        try plainBool(writer, try itemKey(&key, i, "confirmed"), it.confirmed);
-        try plainOpt(writer, try itemKey(&key, i, "decision_id"), it.decision_id_hex);
-    }
-    try plainOpt(writer, "next_cursor", p.next_cursor);
-}
-
 fn itemKey(buffer: *[64]u8, index: usize, field_name: []const u8) ![]const u8 {
     return std.fmt.bufPrint(buffer, "items.{d}.{s}", .{ index, field_name }) catch error.NameTooLong;
-}
-
-fn writeScopesTable(writer: anytype, p: ScopesPayload, color: Color) !void {
-    const items = p.items orelse &.{};
-    if (items.len == 0) {
-        try writer.writeAll("No active scopes.\n");
-    } else {
-        const now = std.time.timestamp();
-        var widest_addr: usize = 0;
-        var widest_match: usize = 0;
-        for (items) |it| {
-            var addr: [64]u8 = undefined;
-            var match: [scope_match_max_bytes]u8 = undefined;
-            widest_addr = @max(widest_addr, scopeAddress(&addr, it.scope).len);
-            widest_match = @max(widest_match, scopeMatch(&match, it.scope).len);
-        }
-        const jail_col = colWidth("JAIL", longestLen(ScopeEntry, items, "jail"));
-        const addr_col = colWidth("SCOPE", widest_addr);
-        const match_col = colWidth("MATCH", widest_match);
-        try color.on(writer, Color.bold);
-        try padRightPrint(writer, "JAIL", jail_col);
-        try padRightPrint(writer, "SCOPE", addr_col);
-        try padRightPrint(writer, "MATCH", match_col);
-        try padRightPrint(writer, "LEASE", 11);
-        try padRightPrint(writer, "REMAINING", 12);
-        try padRightPrint(writer, "CONFIRMED", 11);
-        try padRightPrint(writer, "DECISION", 13);
-        try color.off(writer);
-        try writer.writeAll("\n");
-        try repeatChar(writer, '-', jail_col + addr_col + match_col + 47);
-        try writer.writeAll("\n");
-        for (items) |it| {
-            var addr: [64]u8 = undefined;
-            var match: [scope_match_max_bytes]u8 = undefined;
-            try writeCell(writer, it.jail orelse "-", jail_col);
-            try writeCell(writer, scopeAddress(&addr, it.scope), addr_col);
-            try writeCell(writer, scopeMatch(&match, it.scope), match_col);
-            try padRightPrint(writer, it.lease orelse "-", 11);
-            const remaining: []const u8 = if (std.mem.eql(u8, it.lease orelse "", "permanent")) "never" else formatRemaining(remainingFromDeadlineUs(it.deadline_us, now));
-            try padRightPrint(writer, remaining, 12);
-            try color.on(writer, if (it.confirmed orelse false) Color.green else Color.yellow);
-            try padRightPrint(writer, if (it.confirmed orelse false) "yes" else "no", 11);
-            try color.off(writer);
-            try padRightPrint(writer, shortHex(it.decision_id_hex), 13);
-            try writer.writeAll("\n");
-        }
-        try writer.print("Total: {d} scopes\n", .{items.len});
-    }
-    try writePageFooter(writer, p.generation, p.next_cursor);
-}
-
-fn remainingFromDeadlineUs(deadline_us: ?i64, now: i64) ?i64 {
-    const deadline = deadline_us orelse return null;
-    return @divTrunc(deadline, std.time.us_per_s) - now;
 }
 
 fn shortHex(opt: ?[]const u8) []const u8 {

@@ -794,28 +794,6 @@ fn generationId(payload: []const u8) netlink.Error!u32 {
     return error.NetlinkError;
 }
 
-pub fn queryGeneration(sock: *netlink.NetlinkSocket, timeout_ms: u64) netlink.Error!u32 {
-    var msg_buf: [64]u8 = undefined;
-    var builder = netlink.MessageBuilder.init(&msg_buf);
-    const seq = sock.nextSeq();
-    const ng: netlink.nfgenmsg = .{ .nfgen_family = netlink.NFPROTO.UNSPEC };
-    try builder.append(netlink.nfnlMsgType(netlink.NFNL.SUBSYS_NFTABLES, NFT_MSG.GETGEN), linux.NLM_F_REQUEST, seq, sock.port_id, std.mem.asBytes(&ng));
-    try netlink.sendKernel(sock, builder.bytes(), timeout_ms);
-    try sock.setRecvTimeout(timeout_ms);
-    var bytes: [1024]u8 = undefined;
-    var messages = netlink.StrictMessages{ .bytes = try netlink.recvKernel(sock, &bytes) };
-    while (try messages.next()) |item| {
-        if (item.hdr.seq != seq) continue;
-        if (@intFromEnum(item.hdr.type) == 2) {
-            const code = try netlink.parseNlmsgerr(item.payload);
-            return if (code == 0) error.NetlinkError else netlink.errnoToError(code);
-        }
-        if (@intFromEnum(item.hdr.type) != netlink.nfnlMsgType(netlink.NFNL.SUBSYS_NFTABLES, NFT_MSG.NEWGEN)) return error.NetlinkError;
-        return generationId(item.payload);
-    }
-    return error.NetlinkError;
-}
-
 pub fn probeReason() ProbeResult {
     var sock = netlink.NetlinkSocket.init(linux.NETLINK.NETFILTER) catch |err| {
         return probeReasonFromInitError(err);

@@ -256,11 +256,6 @@ pub const IpcServer = struct {
         self.drain_deadline_ms = drain_ms;
     }
 
-    pub fn admitTestPeer(self: *IpcServer, fd: posix.fd_t) !void {
-        std.debug.assert(self.detached);
-        return self.admitClient(fd, .{ .pid = 0, .uid = 0, .gid = 0 });
-    }
-
     pub fn admitTestPeerAs(self: *IpcServer, fd: posix.fd_t, cred: auth.PeerCred) !void {
         std.debug.assert(self.detached);
         return self.admitClient(fd, cred);

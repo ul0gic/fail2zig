@@ -144,12 +144,3 @@ pub fn lockAbsentState(path: []const u8) !std.fs.File {
         else => return err,
     } });
 }
-
-pub fn lockState(path: []const u8) !std.fs.File {
-    if (try lockStateIfPresent(path)) |file| return file;
-    return lockAbsentState(path) catch |err| switch (err) {
-        // Why: Losing the exclusive create to another opener means the file now exists, so it is opened once more as existing.
-        error.NativeStateChanged => (try lockStateIfPresent(path)) orelse return error.NativeStateChanged,
-        else => return err,
-    };
-}

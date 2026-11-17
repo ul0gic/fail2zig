@@ -861,36 +861,6 @@ fn formatFirewallDetailsCmd(allocator: std.mem.Allocator, writer: anytype, paylo
     return format.formatFirewallDetailed(allocator, writer, payload, fmt, color);
 }
 
-fn formatReloadCmd(
-    allocator: std.mem.Allocator,
-    writer: anytype,
-    payload: []const u8,
-    fmt: format.OutputFormat,
-    color: format.Color,
-) !void {
-    return format.formatReload(allocator, writer, payload, fmt, color);
-}
-
-fn formatBanCmd(
-    allocator: std.mem.Allocator,
-    writer: anytype,
-    payload: []const u8,
-    fmt: format.OutputFormat,
-    color: format.Color,
-) !void {
-    return format.formatBan(allocator, writer, payload, fmt, color);
-}
-
-fn formatUnbanCmd(
-    allocator: std.mem.Allocator,
-    writer: anytype,
-    payload: []const u8,
-    fmt: format.OutputFormat,
-    color: format.Color,
-) !void {
-    return format.formatUnban(allocator, writer, payload, fmt, color);
-}
-
 fn doDiagClock(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype, color: format.Color, request: args.Command.DiagClockArgs) ExitCode {
     var body_bytes: [128]u8 = undefined;
     var stream = std.io.fixedBufferStream(&body_bytes);

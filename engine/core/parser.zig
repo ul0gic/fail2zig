@@ -223,10 +223,6 @@ fn extractIp(text: []const u8) ?IpMatch {
 
 const SECS_PER_DAY: i64 = 86_400;
 
-fn isLeapYear(y: i64) bool {
-    return (@mod(y, 4) == 0 and @mod(y, 100) != 0) or @mod(y, 400) == 0;
-}
-
 fn daysFromCivil(y: i64, m: u8, d: u8) i64 {
     const y_adj: i64 = if (m <= 2) y - 1 else y;
     const era: i64 = @divFloor(y_adj, 400);

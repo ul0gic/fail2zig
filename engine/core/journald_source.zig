@@ -923,27 +923,6 @@ pub const JournaldSource = struct {
         }
         self.maybeFlush();
     }
-
-    fn seedBaseline(self: *JournaldSource, jj: *JournalJail, stdout: []const u8) void {
-        jj.resetStream();
-        var it = std.mem.splitScalar(u8, stdout, '\n');
-        while (it.next()) |raw_line| {
-            const line = std.mem.trim(u8, raw_line, " \t\r");
-            if (line.len == 0) continue;
-            self.seedBaselineLine(jj, line);
-            return;
-        }
-    }
-
-    fn processBatch(self: *JournaldSource, jj: *JournalJail, stdout: []const u8) void {
-        jj.resetStream();
-        var it = std.mem.splitScalar(u8, stdout, '\n');
-        while (it.next()) |raw_line| {
-            const line = std.mem.trim(u8, raw_line, " \t\r");
-            if (line.len == 0) continue;
-            if (!self.processEntry(jj, line)) break;
-        }
-    }
 };
 
 fn reapNoHang(pid: posix.pid_t) ?u32 {

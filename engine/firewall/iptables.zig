@@ -27,25 +27,9 @@ pub const CommandBuilder = struct {
         return argv[0..3];
     }
 
-    pub fn deleteChain(self: CommandBuilder, argv: *[4][]const u8) [][]const u8 {
-        argv[0] = self.binary;
-        argv[1] = "-X";
-        argv[2] = self.chain;
-        return argv[0..3];
-    }
-
     pub fn installJump(self: CommandBuilder, argv: *[6][]const u8) [][]const u8 {
         argv[0] = self.binary;
         argv[1] = "-I";
-        argv[2] = "INPUT";
-        argv[3] = "-j";
-        argv[4] = self.chain;
-        return argv[0..5];
-    }
-
-    pub fn removeJump(self: CommandBuilder, argv: *[6][]const u8) [][]const u8 {
-        argv[0] = self.binary;
-        argv[1] = "-D";
         argv[2] = "INPUT";
         argv[3] = "-j";
         argv[4] = self.chain;

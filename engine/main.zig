@@ -21,31 +21,16 @@ fn configuredLog(comptime level: std.log.Level, comptime scope: @Type(.enum_lite
 
 pub const event_loop_mod = @import("core/event_loop.zig");
 pub const journald_source_mod = @import("core/journald_source.zig");
-pub const parser_mod = @import("core/parser.zig");
-pub const state_mod = @import("core/state.zig");
 pub const native_store_mod = @import("core/record_store.zig");
 pub const firewall_scope_mod = @import("firewall/scope.zig");
 pub const native_action_outcome_mod = @import("core/native_action_outcome.zig");
 pub const native_effect_mod = @import("core/native_effect.zig");
 pub const firewall = @import("firewall/backend.zig");
 pub const config_mod = @import("config/native.zig");
-pub const fail2ban_mod = @import("config/fail2ban.zig");
 pub const migration_mod = @import("config/migration.zig");
-pub const migration_inspect_mod = @import("migration/inspect.zig");
 pub const migration_snapshot_mod = @import("migration/sqlite_snapshot.zig");
 pub const migration_fixture_mod = @import("migration/fail2ban_fixture.zig");
-pub const migrate_cli_mod = @import("cli/migrate.zig");
-pub const rule_test_cli_mod = @import("cli/rule_test.zig");
 pub const cli_mod = cli;
-pub const filter_types_mod = @import("filters/types.zig");
-pub const filter_sshd_mod = @import("filters/sshd.zig");
-pub const filter_nginx_mod = @import("filters/nginx.zig");
-pub const filter_apache_mod = @import("filters/apache.zig");
-pub const filter_mail_mod = @import("filters/mail.zig");
-pub const filter_misc_mod = @import("filters/misc.zig");
-pub const filter_portsentry_mod = @import("filters/portsentry.zig");
-pub const filter_registry_mod = @import("filters/registry.zig");
-pub const ipc_mod = @import("net/ipc.zig");
 
 pub const version = build_options.version;
 

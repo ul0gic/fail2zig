@@ -12,31 +12,6 @@ const iptables = @import("iptables.zig");
 pub const CommandBuilder = struct {
     set_name: []const u8,
 
-    pub fn createSet(
-        self: CommandBuilder,
-        argv: *[9][]const u8,
-        timeout_str: []const u8,
-        maxelem_str: []const u8,
-    ) [][]const u8 {
-        argv[0] = "ipset";
-        argv[1] = "create";
-        argv[2] = self.set_name;
-        argv[3] = "hash:ip";
-        argv[4] = "timeout";
-        argv[5] = timeout_str;
-        argv[6] = "maxelem";
-        argv[7] = maxelem_str;
-        argv[8] = "-exist";
-        return argv[0..9];
-    }
-
-    pub fn destroySet(self: CommandBuilder, argv: *[3][]const u8) [][]const u8 {
-        argv[0] = "ipset";
-        argv[1] = "destroy";
-        argv[2] = self.set_name;
-        return argv[0..3];
-    }
-
     pub fn addEntry(
         self: CommandBuilder,
         argv: *[7][]const u8,
@@ -70,20 +45,6 @@ pub const CommandBuilder = struct {
         return argv[0..5];
     }
 
-    pub fn flushSet(self: CommandBuilder, argv: *[3][]const u8) [][]const u8 {
-        argv[0] = "ipset";
-        argv[1] = "flush";
-        argv[2] = self.set_name;
-        return argv[0..3];
-    }
-
-    pub fn listSet(self: CommandBuilder, argv: *[3][]const u8) [][]const u8 {
-        argv[0] = "ipset";
-        argv[1] = "list";
-        argv[2] = self.set_name;
-        return argv[0..3];
-    }
-
     pub fn installMatchRule(
         self: CommandBuilder,
         argv: *[10][]const u8,
@@ -91,24 +52,6 @@ pub const CommandBuilder = struct {
     ) [][]const u8 {
         argv[0] = binary;
         argv[1] = "-I";
-        argv[2] = "INPUT";
-        argv[3] = "-m";
-        argv[4] = "set";
-        argv[5] = "--match-set";
-        argv[6] = self.set_name;
-        argv[7] = "src";
-        argv[8] = "-j";
-        argv[9] = "DROP";
-        return argv[0..10];
-    }
-
-    pub fn removeMatchRule(
-        self: CommandBuilder,
-        argv: *[10][]const u8,
-        binary: []const u8,
-    ) [][]const u8 {
-        argv[0] = binary;
-        argv[1] = "-D";
         argv[2] = "INPUT";
         argv[3] = "-m";
         argv[4] = "set";

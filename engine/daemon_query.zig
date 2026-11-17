@@ -170,13 +170,6 @@ pub fn Methods(comptime Coordinator: type) type {
         const quiet_interval_ms = Coordinator.quiet_interval_ms;
         const sessionProcessor = Coordinator.sessionProcessor;
         const redacted_text = "<redacted>";
-        pub fn sourceStatusOrder(_: void, a: *const SourceStatus, b: *const SourceStatus) bool {
-            return switch (std.mem.order(u8, a.jail, b.jail)) {
-                .lt => true,
-                .gt => false,
-                .eq => std.mem.lessThan(u8, a.path orelse "", b.path orelse ""),
-            };
-        }
         pub fn lossJson(event: files.LossEvent) LossJson {
             return .{ .sequence = event.sequence, .wall_us = event.wall_us, .reason = @tagName(event.reason), .inode = event.inode, .committed_offset = event.committed_offset, .observed_size = event.observed_size };
         }

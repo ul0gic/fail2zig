@@ -113,10 +113,6 @@ pub const Protocol = enum(u8) {
     udp = 2,
     icmp_v4 = 3,
     icmp_v6 = 4,
-
-    pub fn familyIcmp(family: Family) Protocol {
-        return if (family == .v4) .icmp_v4 else .icmp_v6;
-    }
 };
 
 pub const Protocols = struct {

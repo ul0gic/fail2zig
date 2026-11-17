@@ -24,7 +24,6 @@ extern fn ___tracy_profiler_started() i32;
 extern fn ___tracy_emit_zone_begin(srcloc: *const SourceLocation, active: i32) Zone;
 extern fn ___tracy_emit_zone_end(ctx: Zone) void;
 extern fn ___tracy_emit_frame_mark(name: ?[*:0]const u8) void;
-extern fn ___tracy_emit_plot(name: [*:0]const u8, val: f64) void;
 extern fn ___tracy_emit_logString(severity: i8, color: i32, callstack_depth: i32, size: usize, txt: [*]const u8) void;
 extern fn ___tracy_emit_memory_alloc(ptr: *const anyopaque, size: usize) void;
 extern fn ___tracy_emit_memory_free(ptr: *const anyopaque) void;
@@ -45,11 +44,6 @@ pub fn zoneEnd(zone: Zone) void {
 
 pub fn frameMark() void {
     ___tracy_emit_frame_mark(null);
-}
-
-// Tracy identifies a plot by the name pointer, so pass a string literal.
-pub fn plot(name: [*:0]const u8, value: f64) void {
-    ___tracy_emit_plot(name, value);
 }
 
 pub fn message(text: []const u8) void {
