@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Defines the log levels and the typed key-value fields a structured log line carries.
+// Holds: A field borrows its key and string value without copying, so it is valid only while the caller's storage is.
 
 pub const Level = enum(u2) {
     debug = 0,

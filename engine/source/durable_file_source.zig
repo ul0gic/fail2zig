@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Discovers log files by glob, reads them by framed record from a durable checkpoint, and detects replacement and truncation.
+// Holds: A checkpoint advances only after the callback acknowledges its record; a file resumes only if device, inode and prefix hash match.
+
 const std = @import("std");
+// Why: F_DUPFD_CLOEXEC is F_LINUX_SPECIFIC_BASE + 6 = 1030 in include/uapi/linux/fcntl.h.
 const linux_dupfd_cloexec = 1030;
 const records = @import("source_record.zig");
 const native_text = @import("source_text.zig");
@@ -30,7 +34,7 @@ pub const Start = enum { head, tail };
 pub const discovery_entries_per_turn: usize = 256;
 pub const discovery_entries_per_episode: usize = 65_536;
 pub const discovery_max_depth: usize = 16;
-// Filebeat's inactive-close default: .project/references/beats/filebeat/input/filestream/config.go:180
+// Holds: An unlinked file with nothing at its path is released only after five minutes at its committed end with no growth.
 const unlinked_retire_ms: u64 = 5 * std.time.ms_per_min;
 pub const DiscoveryStatus = enum { pending, complete };
 pub const Presence = enum { unknown, present, missing, failed };
@@ -146,6 +150,7 @@ pub fn restartedIncarnation(file: std.fs.File, committed: Resume) !Resume {
 }
 
 fn openRegularAt(directory: std.fs.Dir, path: []const u8) !std.fs.File {
+    // Why: O_NONBLOCK lets the open of a FIFO at the path return at once (fifo(7)), so the regular-file check can refuse it.
     const fd = try std.posix.openat(directory.fd, path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true }, 0);
     errdefer std.posix.close(fd);
     const stat = try std.posix.fstat(fd);
@@ -723,9 +728,10 @@ pub const FileSource = struct {
     pub fn pollBatchTurn(self: *FileSource, callback: BatchAckCallback, userdata: ?*anyopaque, preserve_checkpoint: bool) !usize {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        // Fits the admitted source workspace (native_resource_budget.zig:196) beside one pollTurn's own line and cursor.
+        // Why: With one pollTurn's own line and cursor, this fits the file workspace set in engine/runtime/resource_budget.zig.
         var collector = BatchCollector{ .source = self, .allocator = arena.allocator(), .budget = 3 * self.max_record_bytes + cursor_bytes };
         const start = self.mark();
+        // Why: One pollTurn can deliver a baseline checkpoint and a data record, so two free slots are kept.
         const read_failure: ?anyerror = while (collector.count + 2 <= collector.items.len) {
             const delivered = self.pollTurn(BatchCollector.collect, &collector, preserve_checkpoint) catch |err| {
                 if (err != error.BatchFull or collector.count == 0) break err;
@@ -877,6 +883,7 @@ pub const FileSource = struct {
             self.health = .resume_lost;
             return error.SourceChanged;
         }
+        // Why: Record bytes inside the first 64 are compared with a second read, so a file rewritten during the read is refused.
         if (r.offset < captured) {
             const first: usize = @intCast(r.offset);
             const end: usize = @intCast(@min(offset, captured));
@@ -921,11 +928,13 @@ pub const FileSource = struct {
     }
 };
 
+// Why: A leading dot in a name must be matched explicitly by the pattern (glob(7)).
 pub fn matchComponent(pattern: []const u8, name: []const u8) bool {
     if (name.len > 0 and name[0] == '.' and (pattern.len == 0 or pattern[0] != '.')) return false;
     return matchRest(pattern, name);
 }
 
+// Why: An undecodable byte maps to U+DC00 plus its value, a surrogate no valid UTF-8 decodes to, so it matches only itself.
 fn glyph(bytes: []const u8, index: usize) struct { value: u32, size: usize } {
     const first = bytes[index];
     const length = std.unicode.utf8ByteSequenceLength(first) catch return .{ .value = 0xdc00 + @as(u32, first), .size = 1 };
@@ -1192,7 +1201,7 @@ pub const FileSet = struct {
     pub fn configuredCount(self: *const FileSet) usize {
         return self.specs.items.len;
     }
-    // Pattern bytes belong to this FileSet and remain valid until its deinit.
+    // Holds: The returned pattern is owned by this FileSet and stays valid until its deinit.
     pub fn configuredStatus(self: *const FileSet, index: usize) ?struct { pattern: []const u8, presence: Presence } {
         if (index >= self.specs.items.len) return null;
         const spec = self.specs.items[index];

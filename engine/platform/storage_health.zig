@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Tracks the storage gate through failure, retry and ordered recovery, and observes the storage worker's clocks and heartbeat.
+// Holds: The gate turns healthy only after storage, state, ownership and sources recover in order in one generation; intervention is final.
+
 const std = @import("std");
 
 pub const diagnostic_stall_ms: u64 = 5000;
@@ -63,6 +66,7 @@ pub const WorkerObservation = struct {
             .busy = self.busy,
             .stalled = heartbeat_age >= diagnostic_stall_ms or busy_age >= diagnostic_stall_ms,
             .clock_uncertain = self.clock_uncertain,
+            // Why: observe above either sets wall_floor_us or marks the clock uncertain, so this unwrap runs only with a floor.
             .expiry_overdue = !self.clock_uncertain and if (self.next_committed_expiry_us) |deadline| self.wall_floor_us.? >= deadline else false,
             .expiry_uncertain = !self.expiry_authority_current or self.clock_uncertain,
             .busy_age_ms = busy_age,
@@ -71,6 +75,7 @@ pub const WorkerObservation = struct {
         };
     }
 
+    // Holds: A missing or backward reading marks the clock uncertain, and only publication with current authority clears it.
     fn observe(self: *WorkerObservation, monotonic_ms: ?u64, wall_us: ?i64) bool {
         var valid = true;
         if (monotonic_ms) |now| {
@@ -297,7 +302,7 @@ pub fn retryable(cause: anyerror) bool {
         error.EffectBackendUncertain,
         error.StaleEffect,
         error.EffectReconciliationRequired,
-        // Source-scoped backpressure remains retryable; never latches intervention.
+        // Why: Backpressure and capacity causes must stay listed, or failAt would latch them into intervention instead of a retry.
         error.ReserveBackpressure,
         error.RetryCapacity,
         error.RetryEligibilityPending,

@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Wraps the sshd built-in detector for journal records, checking each eligible record's journal origin first.
+// Holds: An eligible record whose origin the profile rejects is never matched, and every outcome carries this detector's generation.
+
 const std = @import("std");
 const builtin = @import("builtin_detector.zig");
 const origin = @import("../source/journal_origin.zig");

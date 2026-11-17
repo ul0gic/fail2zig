@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Decides how a manual ban treats a scope's current owner and derives the decision id of a configured ban list entry.
+// Holds: A manual ban never takes a config-owned scope; detection and manual owners are extended as manual.
+
 const shared = @import("shared");
 const effect = @import("effect.zig");
 const ban_origins = @import("../store/ban_origins.zig");

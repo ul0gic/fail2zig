@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Runs a source's native rules over each record and stages rule, allowlist and DNS state as one consumer batch.
+// Holds: Rule, allowlist and DNS state reach live state only in publish, and begin refuses a second batch while one is staged.
+
 const std = @import("std");
 const rules = @import("rules.zig");
 const rule = @import("rule_consumer.zig");
@@ -87,6 +90,7 @@ fn policyGeneration(settings: Settings, programs: []const *const rules.Program, 
     for (initial.entries) |entry| if (entry == .hostname) {
         hostname_ignores += 1;
     };
+    // Why: Each hostname can add one DNS read to a batch that also reads the allowlist and, when present, the resolver authority.
     if (hostname_rules + hostname_ignores > state.max_dependencies - 1 - @as(usize, @intFromBool(resolver_generation != null))) return error.ConsumerCapacity;
     if (hostname_rules + hostname_ignores != 0 and resolver_generation == null) return error.HostnameResolutionRequired;
     if (hostname_rules + hostname_ignores != 0 and settings.monotonic_ms == null) return error.DnsMonotonicClockRequired;
@@ -340,6 +344,7 @@ pub const Coordinator = struct {
         if (!self.ready) return error.ConsumerStateNotReady;
         if (input.record.kind != .data or input.decoded.len > 2048) return error.InvalidConsumer;
         const occurrence = try self.identity(input.record);
+        // Why: A record held for a DNS answer blocks every other record of this source until it is published or the hold is voided.
         if (self.waiting_occurrence) |held| if (!std.mem.eql(u8, &held, &occurrence)) return error.ConsumerPending;
         if (input.processing_us < input.record.receipt_time.?.us) return error.ConsumerClockReversed;
         if (input.time == .eligible and input.time.eligible.receipt.us != input.record.receipt_time.?.us) return error.ConsumerReceiptMismatch;
@@ -421,6 +426,7 @@ pub const Coordinator = struct {
             if (decision.kind == .ignored) kind = .ignored;
         }
         for (self.outcomes[0..self.outcome_count]) |*prior| if (std.meta.eql(prior.subject.?, subject)) {
+            // Why: An exclusion is per rule, so a candidate from any rule replaces another rule's excluded outcome for the same subject.
             if (kind == .candidate and prior.kind != .candidate) prior.* = self.addressOutcome(subject, kind, index);
             return;
         };

@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Merges configured, runtime and self ignore entries into one sorted set and checks addresses against it.
+// Holds: An expired item never matches, and duplicates merge only when their deadlines are equal, so deduplication never drops an expiry.
+
 const std = @import("std");
 const shared = @import("shared");
 const types = shared.types;
@@ -158,6 +161,7 @@ pub const EffectiveIgnore = struct {
         if (prior.source == item.source and sameDeadline(prior.expires_us, item.expires_us)) return true;
         if (prior.source == .self or item.source == .self) return false;
         if (prior.expires_us != null or item.expires_us != null) return false;
+        // Why: config and runtime are bit flags 1 and 2, so or-ing them gives both (3).
         prior.source = @enumFromInt(@intFromEnum(prior.source) | @intFromEnum(item.source));
         return true;
     }

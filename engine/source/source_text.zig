@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Frames records by newline and decodes them from seven text encodings into UTF-8.
+// Holds: Input over 1 MiB is refused before framing or decoding, and decodeFile turns NUL, CR and damaged bytes into U+FFFD.
+
 const std = @import("std");
 
 pub const max_record_bytes = 1024 * 1024;
@@ -133,8 +136,7 @@ pub fn decode(encoding: Encoding, input: []const u8, scratch: []u8, absolute_off
 
 pub const Decoded = struct { text: []const u8, replaced: bool, exceeded: bool = false };
 
-// File records are byte-framed before decoding. Replace maximal invalid subsequences
-// without consuming a following valid character or joining text across damaged bytes.
+// Does:  Replaces each maximal invalid subsequence with one U+FFFD without consuming the valid character after it.
 pub fn decodeFile(encoding: Encoding, input: []const u8, scratch: []u8, absolute_offset: u64, bom: Bom) Error!Decoded {
     if (input.len > max_record_bytes) return error.RecordTooLarge;
     if (absolute_offset % encoding.width() != 0) return error.MisalignedOffset;
@@ -210,7 +212,7 @@ pub fn decodeFile(encoding: Encoding, input: []const u8, scratch: []u8, absolute
                 }
             },
         }
-        // These embedded framing controls cannot be admitted to the detector as text.
+        // Why: NUL and CR are framing controls, so an embedded one is replaced and never reaches the detector as text.
         if (damaged or point == 0 or point == '\r') {
             point = 0xfffd;
             replaced = true;

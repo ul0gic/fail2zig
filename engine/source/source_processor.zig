@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Decodes each source record, classifies its time, runs the bound detector and stages the next counter checkpoint.
+// Holds: One record is staged at a time: prepare and restore refuse with ProcessorBusy until the staged checkpoint is released.
+
 const std = @import("std");
 const text = @import("source_text.zig");
 const time = @import("../time/time.zig");
@@ -46,6 +49,7 @@ pub const Options = struct {
     max_decoded_bytes: u32 = 2048,
 };
 pub const checkpoint_version: u16 = 1;
+// Why: A 96-byte checkpoint predates the replacement count and is read with that count as zero.
 const legacy_checkpoint_bytes = 96;
 pub const checkpoint_bytes = 104;
 const counter_fields = .{ "eligible", "obsolete", "missing", "malformed", "receipt", "adjusted", "future" };
@@ -203,6 +207,7 @@ pub const Processor = struct {
     fn decode(self: *const Processor, bytes: []const u8) !policy.Counters {
         return decodeCounters(self.generation, bytes);
     }
+    // Why: Layout is "F2NT", u16 version, two zero bytes, 32-byte generation, seven u64 counters, then the u64 replacement count.
     fn encodeCounters(generation: [32]u8, counters: policy.Counters, replaced: u64, out: *[checkpoint_bytes]u8) void {
         @memcpy(out[0..4], "F2NT");
         std.mem.writeInt(u16, out[4..6], checkpoint_version, .little);
@@ -252,6 +257,7 @@ pub const Processor = struct {
         self.failures_counted +|= self.staged_failures;
         self.ignored_detections +|= self.staged_ignored;
         if (self.restoring) self.reported_encoding_replaced = self.encoding_replaced;
+        // Why: Staged counters were validated when decoded or advanced, so Health.init cannot fail here.
         if (self.restoring) self.health = policy.Health.init(self.staged_counters) catch unreachable else self.health.publish(self.staged_counters);
     }
     fn release(context: ?*anyopaque) void {
@@ -350,7 +356,7 @@ pub const Processor = struct {
                 break :blk value;
             } else blk: {
                 const value = try text.decodeFile(self.options.encoding, record.message, self.scratch, offset, self.options.bom);
-                // Overflow produces no matchable prefix; the complete raw record still receives a disposition.
+                // Why: An overflowed decode has no matchable prefix, so the record is rejected as malformed but still gets a disposition.
                 decoding_rejected = value.exceeded;
                 encoding_replaced = value.replaced;
                 break :blk value.text;

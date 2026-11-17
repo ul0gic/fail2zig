@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Sends diagnostic anomalies and the first panic to a Sentry-envelope collector named by FAIL2ZIG_DIAG_DSN, from one sender thread.
+// Holds: report never blocks its caller: an anomaly is dropped and counted when the queue lock is held or all 64 slots are full.
+
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -109,6 +112,7 @@ pub fn report(kind: []const u8, subject: []const u8, cause: []const u8, detail: 
 pub fn panic(msg: []const u8, first_trace_addr: ?usize) noreturn {
     @branchHint(.cold);
     const trace_start = first_trace_addr orelse @returnAddress();
+    // Why: reportCrash waits for the sender thread, so a panic on that thread itself is never reported, and only the first panic is.
     if (!is_sender and !panicking.swap(true, .acq_rel)) reportCrash(msg, trace_start);
     std.debug.defaultPanic(msg, trace_start);
 }
@@ -237,6 +241,7 @@ fn post(client: *std.http.Client, body: []const u8) !void {
     });
     defer request.deinit();
     const connection = request.connection orelse return error.NoConnection;
+    // Why: SO_RCVTIMEO and SO_SNDTIMEO fail a stalled read or write after 3 s instead of holding the sender (socket(7)).
     const timeout = posix.timeval{ .sec = io_timeout_s, .usec = 0 };
     try posix.setsockopt(connection.stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
     try posix.setsockopt(connection.stream.handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout));

@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Loads and parses TZif zone files and resolves local times to UTC under a fold policy.
+// Holds: A zone file loads only via non-symlink paths owned by root or the euid, not group- or world-writable, and unchanged while read.
+
 const std = @import("std");
 pub const version: u16 = 1;
 pub const max_file_bytes = 1024 * 1024;
@@ -37,6 +40,7 @@ const Header = struct {
     type_count: usize,
     char_count: usize,
     fn read(cursor: *Cursor) !Header {
+        // Why: The header is 44 bytes; its six counts are isutcnt, isstdcnt, leapcnt, timecnt, typecnt and charcnt (tzfile(5)).
         const bytes = try cursor.take(44);
         if (!std.mem.eql(u8, bytes[0..4], "TZif") or !std.mem.allEqual(u8, bytes[5..20], 0)) return error.InvalidTimezoneHeader;
         if (bytes[4] != '2' and bytes[4] != '3') return error.UnsupportedTimezoneVersion;
@@ -77,10 +81,12 @@ const Block = struct {
         for (types, 0..) |*kind, i| {
             const raw = raw_types[i * 6 ..][0..6];
             const offset = std.mem.readInt(i32, raw[0..4], .big);
+            // Why: tt_utoff is never -2**31, so 32-bit readers can negate it without overflow (tzfile(5)).
             if (offset == std.math.minInt(i32) or raw[4] > 1 or raw[5] >= abbreviations.len) return error.InvalidTimezoneType;
             const name = std.mem.sliceTo(abbreviations[raw[5]..], 0);
             if (standard.len > 0 and standard[i] > 1) return error.InvalidTimezoneType;
             if (universal.len > 0 and (universal[i] > 1 or (universal[i] == 1 and (standard.len == 0 or standard[i] != 1)))) return error.InvalidTimezoneType;
+            // Why: A type designated "-00" is a placeholder for unspecified local time (tzfile(5)).
             kind.* = .{ .offset_seconds = offset, .is_dst = raw[4] == 1, .unspecified = std.mem.eql(u8, name, "-00") };
         }
         return .{ .transitions = transitions, .types = types };
@@ -104,6 +110,7 @@ pub const Zone = struct {
         var cursor = Cursor{ .bytes = bytes };
         const first = try Header.read(&cursor);
         const first_version = bytes[4];
+        // Why: Version 2 and later repeat the data with 8-byte times after the 4-byte block, which is read only to skip it (tzfile(5)).
         {
             const legacy = try Block.read(allocator, &cursor, first, false);
             defer legacy.deinit(allocator);
@@ -113,7 +120,9 @@ pub const Zone = struct {
         if (bytes[second_position + 4] != first_version) return error.InvalidTimezoneHeader;
         const block = try Block.read(allocator, &cursor, second, true);
         errdefer block.deinit(allocator);
+        // Why: typeAt covers only the span from the first to the last transition, so a single transition covers no time.
         if (block.transitions.len == 1 or (block.transitions.len == 0 and (block.types.len != 1 or block.types[0].is_dst))) return error.InsufficientTimezoneCoverage;
+        // Why: The file ends with a POSIX TZ string enclosed in newlines, which may be empty (tzfile(5)).
         const footer = bytes[cursor.position..];
         if (footer.len < 2 or footer.len > max_tail_bytes + 2 or footer[0] != '\n' or footer[footer.len - 1] != '\n') return error.InvalidTimezoneTail;
         const tail = footer[1 .. footer.len - 1];
@@ -152,6 +161,7 @@ pub const Zone = struct {
         self.* = undefined;
     }
 
+    // Holds: A local time two offsets both reach fails under reject, and a local time no offset reaches is refused, never shifted.
     pub fn resolveLocalSeconds(self: *const Zone, local_seconds: i64) !Selection {
         var earliest: ?i64 = null;
         var latest: ?i64 = null;
@@ -212,6 +222,7 @@ pub const Zone = struct {
         return kind.offset_seconds;
     }
 
+    // Does:  Returns the time type in force at utc_seconds; null outside the first-to-last transition span unless the zone is fixed.
     fn typeAt(self: *const Zone, utc_seconds: i64) ?TimeType {
         if (self.fixed) return self.types[0];
         if (self.transitions.len < 2 or utc_seconds < self.transitions[0].utc_seconds or utc_seconds >= self.transitions[self.transitions.len - 1].utc_seconds) return null;
@@ -292,6 +303,7 @@ fn trustedStat(stat: std.posix.Stat, directory: bool) !void {
         stat.mode & 0o022 != 0 or (stat.uid != 0 and stat.uid != std.os.linux.geteuid())) return error.UntrustedTimezoneFile;
 }
 
+// Does:  Returns the UTC offset of a TZ string with no daylight saving rule; null for any other string.
 fn fixedTailOffset(tail: []const u8) ?i32 {
     var at: usize = 0;
     if (tail.len > 0 and tail[0] == '<') {
@@ -302,6 +314,7 @@ fn fixedTailOffset(tail: []const u8) ?i32 {
         while (at < tail.len and std.ascii.isAlphabetic(tail[at])) : (at += 1) {}
         if (at < 3) return null;
     }
+    // Why: A TZ offset is positive west of the Prime Meridian, the inverse of a UTC offset (tzset(3)).
     var sign: i32 = -1;
     if (at < tail.len and (tail[at] == '+' or tail[at] == '-')) {
         if (tail[at] == '-') sign = 1;

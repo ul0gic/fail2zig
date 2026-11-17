@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Builds, validates and encodes the context of one ban decision: jail, filter, pattern, source, occurrence, subject and counts.
+// Holds: decode accepts only the 1108-byte F2AC version 1 form whose bytes equal the re-encoding of the context they decode to.
+
 const std = @import("std");
 const shared = @import("shared");
 const detection = @import("../detect/detection_record.zig");
@@ -148,6 +151,7 @@ pub const Context = struct {
             out[8] = subject.prefix;
             @memcpy(out[16..32], &subject.address);
         }
+        // Why: A name slot is a length byte and 64 bytes, a value slot a 2-byte length and 256 bytes, so offsets step by 65 and 258.
         putName(&out, 32, &self.jail);
         putName(&out, 97, &self.filter);
         if (self.pattern) |*value| putName(&out, 162, value);
@@ -212,6 +216,7 @@ pub fn fromRetry(
     outcome.validate(.{ .eligible = .{ .timestamp = .{ .us = event_us }, .original = .{ .us = event_us }, .receipt = .{ .us = event_us }, .origin = .event } }) catch return error.InvalidActionContext;
     if (outcome.kind != .candidate or !std.meta.eql(outcome.subject.?, decision.subject)) return error.InvalidActionContext;
     const enforcement = subjectFromDetection(decision.subject);
+    // Why: A SHA-256 digest is 64 hex characters, and the occurrence form adds the 7-byte "sha256:" prefix.
     var source_buffer: [64]u8 = undefined;
     var occurrence_buffer: [71]u8 = undefined;
     const bounded_source = try boundedIdentity(source, max_name_bytes, false, &source_buffer);
@@ -235,6 +240,7 @@ pub fn fromRetry(
 
 const BoundedIdentity = struct { value: []const u8, digest: bool };
 
+// Does:  Keeps a value that fits maximum; a longer one is replaced by the hex SHA-256 of its bytes, with digest set.
 fn boundedIdentity(value: []const u8, maximum: usize, prefixed: bool, buffer: []u8) Error!BoundedIdentity {
     if (value.len == 0 or std.mem.indexOfScalar(u8, value, 0) != null or !std.unicode.utf8ValidateSlice(value))
         return error.InvalidActionContext;

@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Defines ban durations and leases: a finite deadline in microseconds, a permanent lease, or none.
+// Holds: A finite lease deadline is the decision time plus a positive duration, and a sum past maxInt(i64) fails as TimeOverflow.
+
 const std = @import("std");
 
 pub const micros_per_second: i64 = 1_000_000;

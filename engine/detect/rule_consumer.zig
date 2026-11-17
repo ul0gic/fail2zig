@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Runs one native rule for a jail source and encodes its outcome counters and correlation contexts as a checkpoint.
+// Holds: Counters and contexts change only when a prepared stage is published; a checkpoint restores only under the binding that wrote it.
+
 const std = @import("std");
 const rules = @import("rules.zig");
 const correlation = @import("correlation.zig");
@@ -41,6 +44,7 @@ pub const Consumer = struct {
         if (program.metadata().subject_kind == .hostname and !hostname_enabled) return error.HostnameResolutionRequired;
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("fail2zig-native-rule-consumer-v1\x00");
+        // Why: Each part is length-prefixed, so two different part lists never hash the same bytes.
         for ([_][]const u8{ &program.generation, &parent_generation, jail, incarnation }) |part| {
             var length: [8]u8 = undefined;
             std.mem.writeInt(u64, &length, part.len, .little);

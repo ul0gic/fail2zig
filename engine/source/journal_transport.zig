@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Builds the journalctl argument list, runs it with capped output and a deadline, and decodes its JSON entries.
+// Holds: Output past the caller's buffer, stderr past 4 KiB or a run past timeout_ms fails it; an unreaped child is killed and reaped.
+
 const std = @import("std");
 const records = @import("source_record.zig");
 const build_options = @import("build_options");
@@ -78,6 +81,7 @@ pub fn argv(a: std.mem.Allocator, options: Options, query: Query, count: usize) 
     try validate(options);
     if (count == 0 or count > @as(usize, options.batch_records) + 1) return error.InvalidPollBudget;
     var args = std.ArrayList([]const u8).init(a);
+    // Why: Without --all, json output encodes a field over 4096 bytes as null (journalctl(1)).
     try args.appendSlice(&.{ options.executable, "--output=json", "--all", "--no-pager", "--quiet" });
     switch (options.target) {
         .system => try args.append("--system"),
@@ -98,6 +102,7 @@ pub fn argv(a: std.mem.Allocator, options: Options, query: Query, count: usize) 
             try args.append(try std.fmt.allocPrint(a, "--lines=+{d}", .{count}));
         },
     }
+    // Why: The matches follow --, so journalctl can never read one of them as an option.
     try args.append("--");
     try args.appendSlice(options.matches);
     return args.toOwnedSlice();
@@ -233,6 +238,7 @@ pub fn decode(scratch: []u8, line: []const u8, message_limit: usize) !Entry {
     while (iterator.next()) |field| {
         if (!fieldName(field.key_ptr.*)) return error.MalformedJournalRecord;
         const v = field.value_ptr.*;
+        // Why: journalctl prints a repeated field as an array of its values and a non-UTF-8 one as an array of bytes (journalctl(1)).
         if (v == .array and v.array.items.len > 0 and v.array.items[0] == .string) {
             for (v.array.items) |item| {
                 if (item != .string or count == max_fields) return error.UnsupportedJournalField;
@@ -246,6 +252,7 @@ pub fn decode(scratch: []u8, line: []const u8, message_limit: usize) !Entry {
         }
     }
     const fields = all[0..count];
+    // Why: Fields are sorted before hashing, so the raw hash does not depend on the order journalctl prints them in.
     std.mem.sort(records.JournalField, fields, {}, less);
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("fail2zig-native-journal-record-v1\x00");

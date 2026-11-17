@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Runs a jail's log files through admission, continuity checks, loss settlement and round-robin polling into the pipeline.
+// Holds: Read loss from truncation, replacement or removal with unread bytes is recorded in the store before reading resumes.
+
 const std = @import("std");
+// Why: F_DUPFD_CLOEXEC is F_LINUX_SPECIFIC_BASE + 6 = 1030 in include/uapi/linux/fcntl.h.
 const linux_dupfd_cloexec = 1030;
 const processing = @import("source_processor.zig");
 const files = @import("durable_file_source.zig");
@@ -131,6 +135,7 @@ fn cloneRetained(a: std.mem.Allocator, original: Retained) !Retained {
     errdefer a.free(result.path);
     result.pending = if (original.pending) |pending| try clonePending(a, pending) else null;
     errdefer if (result.pending) |pending| pending.deinit(a);
+    // Why: The duplicate takes the lowest free descriptor from 3 up (fcntl(2)), so it never lands on stdin, stdout or stderr.
     result.descriptor = if (original.descriptor) |file| .{ .handle = @intCast(try std.posix.fcntl(file.handle, linux_dupfd_cloexec, 3)) } else null;
     return result;
 }
@@ -966,7 +971,7 @@ pub const Session = struct {
             if (pending) |saved| {
                 if (!std.mem.eql(u8, &saved.identity.generation, &self.processor.generation)) return self.parked();
             } else {
-                // Failed batch records retain their receipt key after their savepoint rolls back.
+                // Why: A failed batch record leaves no pending row once its savepoint rolls back, but its receipt key stays held.
                 const held_source = self.candidate_source orelse return self.parked();
                 if (!std.mem.eql(u8, held_source, source_id) or self.pipe.candidate_receipt == null) return self.parked();
             }
@@ -1044,6 +1049,7 @@ pub const Session = struct {
         fn verify(record: records.Record, context: ?*anyopaque) !void {
             const self: *PendingProbe = @ptrCast(@alignCast(context.?));
             const saved = self.identity;
+            // Why: Success is returned as PendingRecordVerified, so the poll stops at the first record without acknowledging it.
             if (record.kind != .data or !saved.sameRecord(.{
                 .jail = saved.jail,
                 .source = record.source,

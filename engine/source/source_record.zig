@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Declares the record, journal field, framing callback and health types that sources hand to the record pipeline.
+// Holds: A Record only borrows its slices; nothing here owns or frees memory, so a caller that keeps a record copies it first.
 
 pub const Predecoded = struct {
     text: []const u8,

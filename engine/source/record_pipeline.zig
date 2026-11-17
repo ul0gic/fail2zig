@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Commits each source record with its receipt, processed outcome and checkpoint to the store, singly or in a batch frame.
+// Holds: Records are refused until restore loads the committed checkpoint, and a failed frame or a revision mismatch forces it again.
+
 const std = @import("std");
 const records = @import("source_record.zig");
 const durable = @import("../store/store.zig");
@@ -57,6 +60,7 @@ pub const Pipeline = struct {
     gate: ?*health.Gate = null,
     recovery_generation: u64 = 0,
     receipts: ?ReceiptAdmission = null,
+    // Does:  The receipt key and time chosen for the record being admitted, kept so a retry of that record reuses the same time.
     candidate_receipt: ?CandidateReceipt = null,
 
     pub fn admit(self: *Pipeline) !void {
@@ -145,7 +149,7 @@ pub const Pipeline = struct {
             return;
         };
         self.failed(cause);
-        // A processor receipt conflict has no source-repair owner; Store conflicts keep their existing policy.
+        // Why: A receipt conflict from the processor has no source-repair owner, so it fails the gate instead of only parking.
         if (cause == error.ReceiptConflict) if (self.gate) |gate| gate.failed(cause, .{});
     }
 

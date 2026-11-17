@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Defines a firewall effect: its installation, scope, lease, status and owner records, and the hashes that identify them.
+// Holds: A whole-host all-port scope keys under the v1 domain over its 24-byte form; any other scope keys under v2 over its canonical form.
+
 const std = @import("std");
 const detection = @import("../detect/detection_record.zig");
 const canonical_scope = @import("../firewall/scope.zig");
@@ -122,6 +125,7 @@ pub const Scope = struct {
         const value = canonical_scope.Scope.decode(bytes) catch return error.InvalidEffect;
         return exact(value);
     }
+    // Holds: The domain strings and encodings hashed here are stored in scope keys; changing either stops stored keys recomputing equal.
     pub fn key(self: Scope, installation: Installation) Error!Hash {
         try installation.validate();
         if (self.canonical.subject.kind == .host and self.canonical.protocols.isAll() and self.canonical.ports.isAll()) {
@@ -230,12 +234,14 @@ pub const Clock = struct {
     fn system(_: ?*anyopaque) i64 {
         return std.time.microTimestamp();
     }
+    // Does:  Reads the clock and refuses a time earlier than prepared_us or the given floor as EffectClockReversed.
     pub fn checked(self: Clock, floor_us: ?i64) Error!i64 {
         const now = self.read(self.context);
         if (now < self.prepared_us or (floor_us != null and now < floor_us.?)) return error.EffectClockReversed;
         return now;
     }
 };
+// Holds: The domain ends at a zero byte and each part follows its 8-byte length, so two different part lists never hash the same bytes.
 pub fn hashParts(domain: []const u8, parts: []const []const u8) Hash {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update(domain);

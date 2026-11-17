@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Defines the stored detection outcome and the consumer interfaces that produce it, and validates each outcome.
+// Holds: A pattern and subject are present exactly for unenforceable, ignored and candidate kinds, and no IPv4 subject is stored as IPv6.
+
 const std = @import("std");
 pub const StagedInput = struct {
     record: @import("../source/source_record.zig").Record,
@@ -32,6 +35,7 @@ pub const StagedConsumer = struct {
 };
 const policy = @import("../source/source_time_policy.zig");
 pub const version: u16 = 1;
+// Why: The store compares these values with its schema version, so existing numbers never change.
 pub const Kind = enum(u8) {
     time_excluded = 1,
     malformed_body,
@@ -77,6 +81,7 @@ pub const Subject = union(enum) {
     pub fn validate(self: Subject) error{InvalidDetection}!void {
         if (self == .v6) {
             const value = std.mem.readInt(u128, &self.v6, .big);
+            // Why: IPv4-mapped and IPv4-compatible forms (RFC 4291 section 2.5.5) are refused, so an IPv4 subject has one encoding.
             if ((value >> 32) == 0xffff or (value > 1 and value >> 32 == 0)) return error.InvalidDetection;
         }
     }

@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Defines action targets: the enforcement and notification outcomes recorded for each ban decision.
+// Holds: Intent metadata, when present, is 1 to 512 bytes of UTF-8 with no NUL byte; anything else is InvalidActionTarget.
+
 const std = @import("std");
 const detection = @import("../detect/detection_record.zig");
 
@@ -9,7 +12,7 @@ pub const max_rows: usize = 262_144;
 pub const Error = error{ InvalidActionTarget, ActionTargetStorageRequired, ActionTargetCapacity, StaleActionTarget, ActionTargetProofRequired };
 
 pub const Kind = enum(u8) { enforcement = 1, notification = 2 };
-// `superseded`: the decision was replaced or retired before its outcome settled; terminal.
+// Does:  superseded marks a target whose decision was released or replaced before it settled; no status follows it.
 pub const Status = enum(u8) { pending = 1, dispatched, confirmed, failed, uncertain, suppressed_restored, superseded };
 pub const Settlement = enum { confirmed, failed, uncertain };
 

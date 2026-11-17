@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Resolves a jail's journal options into a journal selection: flags, directory, namespace, matches and globbed journal files.
+// Holds: A glob or discovery that would pass max_files fails with JournalSelectionLimit instead of returning a truncated list.
+
 const std = @import("std");
 const config = @import("../config/fail2ban.zig");
 const matching = @import("durable_file_source.zig");
@@ -106,6 +109,7 @@ fn parseFlags(allocator: Allocator, value: []const u8) ![]const u8 {
     try validateString(value);
     return (try config.canonicalInteger(allocator, value)) orelse error.InvalidFlags;
 }
+// Why: Only the low four flag bits are used, so the decimal text is reduced mod 16, which gives two's-complement bits for a negative.
 fn flagBits(value: []const u8) u8 {
     var modulo: u8 = 0;
     for (value) |digit| {
@@ -134,6 +138,7 @@ pub fn splitFiles(allocator: Allocator, text: []const u8) ![]const []const u8 {
     while (it.nextCodepoint()) |cp| {
         const length = std.unicode.utf8CodepointSequenceLength(cp) catch unreachable;
         const before = it.i - length;
+        // Why: The separators are the comma plus exactly the characters Python's str.split() treats as whitespace.
         const separator = cp == ',' or cp == ' ' or (cp >= 9 and cp <= 13) or (cp >= 0x1c and cp <= 0x20) or cp == 0x85 or cp == 0xa0 or cp == 0x1680 or (cp >= 0x2000 and cp <= 0x200a) or cp == 0x2028 or cp == 0x2029 or cp == 0x202f or cp == 0x205f or cp == 0x3000;
         if (separator) {
             if (start) |first| try result.append(try allocator.dupe(u8, text[first..before]));

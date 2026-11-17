@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Validates, encodes and evaluates the policy that lengthens ban time for sources with prior confirmed bans.
+// Holds: With prior confirmed bans the duration never exceeds max_duration_us; overflow and non-finite results clamp to it.
+
 const std = @import("std");
 const lease = @import("lease.zig");
 
@@ -83,6 +86,7 @@ pub const Policy = struct {
         if (!std.math.isFinite(evaluated) or evaluated >= cap_seconds) {
             formula_us = self.max_duration_us;
         } else {
+            // Why: A zero factor can evaluate to 0 seconds, and a finite duration must be positive.
             const floored = @max(@as(f64, 1.0), @floor(evaluated));
             const seconds = std.math.lossyCast(i64, floored);
             formula_us = std.math.mul(i64, seconds, lease.micros_per_second) catch self.max_duration_us;

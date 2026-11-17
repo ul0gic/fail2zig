@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Builds, encodes and restores the native allowlist of networks, self addresses and hostnames, and checks addresses against it.
+// Holds: Only a literal, self or cached hostname match ignores an address; an uncached hostname yields pending, never not_ignored.
+
 const std = @import("std");
 const dns = @import("dns.zig");
 const Ip = @import("shared").IpAddress;
@@ -212,6 +215,7 @@ pub const Owner = struct {
         self.live.destroy();
     }
 };
+// Does:  Refuses an IPv6 value that fromIpv6Bits would rewrite or refuse, so each IPv4 host has one form.
 fn validateIp(ip: Ip) !void {
     if (ip == .ipv6) {
         const canonical = Ip.fromIpv6Bits(ip.ipv6) catch return error.InvalidIgnoreEntry;
@@ -268,6 +272,7 @@ fn decodeValue(tag: u8, bytes: []const u8) !Entry {
             if (bytes.len != 5 or bytes[0] > 32) return error.InvalidIgnoreCheckpoint;
             const mask: u32 = if (bytes[0] == 0) 0 else @as(u32, std.math.maxInt(u32)) << @as(u5, @intCast(32 - @as(u16, bytes[0])));
             const net = std.mem.readInt(u32, bytes[1..5], .big);
+            // Why: Host bits must be clear, so each network has one encoding.
             if (net & mask != net) return error.InvalidIgnoreCheckpoint;
             break :blk .{ .network = .{ .v4 = .{ .net = net, .mask = mask } } };
         },

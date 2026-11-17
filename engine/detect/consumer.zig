@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Describes the consumer state deltas and dependencies one commit carries, and checks a batch's limits and deadlines.
+// Holds: A batch over 16 deltas, 16 dependencies or 1 MiB is refused, as is one that repeats a key or expects two revisions for one key.
+
 const std = @import("std");
 
 pub const max_deltas = 16;
@@ -78,6 +81,7 @@ pub const Manifest = struct {
                 return std.mem.order(u8, &a, &b) == .lt;
             }
         };
+        // Why: Requirement hashes are sorted, so the digest does not depend on the order requirements are listed in.
         std.mem.sort([32]u8, hashes[0..self.required.len], {}, Order.less);
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("fail2zig-consumer-manifest-v1\x00");

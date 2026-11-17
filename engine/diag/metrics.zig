@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Holds the daemon's live counters and gauges, snapshots them, and renders the snapshot in the Prometheus text format.
+// Holds: Metric names and help strings are a published interface, and output is bounded to 64 jails with names of at most 64 bytes.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -176,6 +178,7 @@ pub const Metrics = struct {
         self.pool_banned.store(banned, counter_order);
     }
 
+    // Holds: A slot's name is written before jails_len is released, so a reader that acquires jails_len never sees a partial name.
     pub fn registerJail(self: *Metrics, name: []const u8) ?usize {
         if (name.len == 0 or name.len > max_jail_name_len) return null;
         const live = self.jails_len.load(.acquire);
@@ -276,6 +279,7 @@ fn sample(writer: anytype, name: []const u8, kind: Kind, help: []const u8, value
     try writer.print("{s} {d}\n", .{ name, value });
 }
 
+// Why: The text format requires \, " and line feed escaped in label values (prometheus.io/docs/instrumenting/exposition_formats).
 fn writeLabelValue(writer: anytype, value: []const u8) !void {
     for (value) |c| switch (c) {
         '\\' => try writer.writeAll("\\\\"),

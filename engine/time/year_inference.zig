@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Infers the missing year of a syslog timestamp by trying the receipt's year and the years either side of it.
+// Holds: The candidate nearest the receipt wins; a tie fails as AmbiguousYear and a zone error at least as near is returned.
+
 const std = @import("std");
 const time = @import("time.zig");
 const timezone = @import("timezone.zig");
@@ -12,6 +15,7 @@ pub fn inferZoned(field: []const u8, receipt: time.Timestamp, zone: *const timez
     const receipt_offset = try zone.utcOffsetAt(@divFloor(receipt.us, 1_000_000));
     const local_receipt = std.math.cast(i64, @as(i128, receipt.us) + @as(i128, receipt_offset) * 1_000_000) orelse return error.TimeOutOfRange;
     const reference = try receiptYear(.{ .us = local_receipt }, 0);
+    // Why: 2000 is a leap year, so only a malformed field fails here; a Feb 29 invalid in a candidate year is skipped below.
     _ = try time.parse(.syslog, field, .{ .year = 2000, .offset_seconds = 0 });
     var minimum: i32 = std.math.maxInt(i32);
     var maximum: i32 = std.math.minInt(i32);
@@ -62,6 +66,7 @@ pub fn inferZoned(field: []const u8, receipt: time.Timestamp, zone: *const timez
 pub fn receiptYear(receipt: time.Timestamp, offset_seconds: i32) !u16 {
     if (offset_seconds < -86340 or offset_seconds > 86340 or @mod(offset_seconds, 60) != 0) return error.InvalidTimeContext;
     const local = @as(i128, receipt.us) + @as(i128, offset_seconds) * 1_000_000;
+    // Why: The bounds are 0001-01-01T00:00:00 and 9999-12-31T23:59:59.999999 in microseconds, the years parse accepts.
     if (local < -62135596800000000 or local > 253402300799999999) return error.TimeOutOfRange;
     var low: u16 = 1;
     var high: u16 = 9999;

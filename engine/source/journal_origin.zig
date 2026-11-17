@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Checks that a journal entry came from a listed executable running as uid 0 over the syslog transport on this machine.
+// Holds: _MACHINE_ID, _UID, _EXE and _TRANSPORT must each appear exactly once and match; a missing or repeated one is refused.
+
 const std = @import("std");
 const records = @import("source_record.zig");
 const detection = @import("../detect/detection_record.zig");

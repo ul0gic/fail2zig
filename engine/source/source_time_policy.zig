@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Classifies a record's time as eligible, obsolete or rejected against its receipt time and the window, and counts outcomes.
+// Holds: An event time over 60 s past receipt is rejected as future; one less far ahead is replaced by the receipt time.
+
 const std = @import("std");
 const time = @import("../time/time.zig");
 
@@ -119,6 +122,7 @@ pub fn evaluate(policy: Policy, input: Input, receipt: ?time.Timestamp, now: tim
         },
         .undated => .{ .timestamp = observed, .origin = .receipt, .original = null, .receipt = observed },
     };
+    // Why: The timestamp is never after the receipt time, which is never after now, so age cannot answer future.
     return switch (try time.age(evidence.timestamp, now, window_us)) {
         .eligible => .{ .eligible = evidence },
         .obsolete => .{ .obsolete = evidence },
@@ -206,6 +210,7 @@ pub const Health = struct {
         return self.committed;
     }
 
+    // Does:  Returns the rejections counted since the last notice, at most once every 60 s; null when there are none or it is too soon.
     pub fn nextNotice(self: *Health, now_ms: u64) ?Notice {
         const missing = self.committed.missing -| self.reported_missing;
         const malformed = self.committed.malformed -| self.reported_malformed;

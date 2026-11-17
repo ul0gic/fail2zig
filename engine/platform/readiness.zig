@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Derives each component's health and the daemon's readiness from published config, storage, source, enforcement and admin inputs.
+// Holds: ready is true only when all six components are ok, and cause names the first one that is not, in declaration order.
 
 const std = @import("std");
 const storage_health = @import("storage_health.zig");
@@ -74,6 +76,7 @@ pub fn derive(inputs: Inputs) Report {
     const enforcement = deriveEnforcement(inputs.jails, inputs.effects);
     const admin = deriveAdmin(inputs.admin_generation_admitted, inputs.admin_serving);
 
+    // Why: components is indexed by Component ordinal, so this list must follow the enum's declaration order.
     const verdicts = [Component.count]Verdict{ config, storage, sources, clock, enforcement, admin };
     for (verdicts, 0..) |v, i| {
         components[i] = v.state;
@@ -141,6 +144,7 @@ fn deriveAdmin(generation_admitted: bool, serving: bool) Verdict {
 pub const schema_version: u32 = 1;
 
 pub fn writeJson(report: Report, writer: anytype) @TypeOf(writer).Error!void {
+    // Why: The health endpoint answers 200 only on the exact text "ready":true, so this spelling is load-bearing.
     try writer.print("{{\"schema_version\":{d},\"ready\":{s},\"components\":{{", .{ schema_version, if (report.ready) "true" else "false" });
     inline for (std.meta.fields(Component), 0..) |field, i| {
         if (i != 0) try writer.writeByte(',');

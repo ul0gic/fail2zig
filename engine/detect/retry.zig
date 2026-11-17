@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Counts a subject's attempts over a sliding window and decides a lease when they reach maxretry.
+// Holds: A decision needs maxretry distinct occurrences inside the window; a repeat never counts twice and a decision clears the count.
+
 const std = @import("std");
 const detection = @import("detection_record.zig");
 const lease_policy = @import("../effect/lease.zig");
@@ -55,6 +58,7 @@ pub const Policy = struct {
         };
         return bytes;
     }
+    // Does:  Encodes the policy with max_subjects zeroed, so a change to the pool cap alone leaves this form unchanged.
     pub fn identity(self: Policy) Error![policy_bytes]u8 {
         var bytes = try self.encode();
         @memset(bytes[24..28], 0);
@@ -70,6 +74,7 @@ pub const Policy = struct {
         if (bytes.len != policy_bytes or !std.mem.eql(u8, bytes[0..4], "F2RP") or
             (bytes[4] != 1 and bytes[4] != 2) or bytes[5] > 1) return error.InvalidRetryPolicy;
         const raw_duration = std.mem.readInt(i64, bytes[16..24], .little);
+        // Why: A version 1 encoding has no duration kind byte, so it decodes only as a finite duration.
         const duration: Duration = if (bytes[4] == 1) blk: {
             if (!std.mem.allEqual(u8, bytes[28..], 0)) return error.InvalidRetryPolicy;
             break :blk .{ .finite_us = raw_duration };
@@ -214,6 +219,7 @@ pub fn advance(policy: Policy, previous: ?State, subject: detection.Subject, att
         }
     }
     var next = if (previous) |prior| (try prune(policy, prior, now_us)).state else State{ .last_processed_us = now_us };
+    // Why: Attempts during a live lease are not counted, so no second decision is made while a ban holds.
     if (next.lease != .absent) {
         if (!next.lease.live(now_us)) return error.InvalidRetryState;
         return .{ .state = next, .disposition = .active };

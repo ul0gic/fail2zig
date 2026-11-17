@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Converts a source time outcome to its stored record and rebuilds the outcome from a stored record.
+// Holds: A record becomes an outcome only when every field agrees with its kind; fromOutcome runs that same check before returning.
+
 const time = @import("time.zig");
 const policy = @import("../source/source_time_policy.zig");
 const std = @import("std");

@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Classifies source failures and runs a source's repair cycle: backoff, continuity verification, then one poll.
+// Holds: A source turns healthy only by verifying then polling under the current token; a mismatch at verification forces intervention.
+
 const std = @import("std");
 
 pub const Phase = enum { healthy, waiting, verifying, polling, intervention };
@@ -60,6 +63,7 @@ pub const Binding = struct {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("fail2zig-source-repair-v1\x00");
         for (parts) |part| {
+            // Why: Each part is length-prefixed, so splitting the same bytes differently gives a different digest.
             var length: [8]u8 = undefined;
             std.mem.writeInt(u64, &length, part.len, .little);
             hash.update(&length);

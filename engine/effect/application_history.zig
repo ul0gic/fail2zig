@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Defines a confirmed history event paired with the detection detail that led to it.
+// Holds: A Detail owns its source, occurrence and evidence buffers; deinit frees all three and leaves the value undefined.
+
 const std = @import("std");
 const effect_history = @import("effect_history.zig");
 

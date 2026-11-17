@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Turns confirmed native bans from other jails into candidate detections for a jail that counts repeat offenders.
+// Holds: The consuming jail's own events are never counted, and each event commits at most one receipt, keyed by its event id.
+
 const std = @import("std");
 const config = @import("../config/config.zig");
 const detection = @import("detection_record.zig");
@@ -19,6 +22,7 @@ pub const Binding = struct {
     decay: retry.EscalationDecay = .{},
 };
 
+// Does:  Returns false for an event this jail does not count, and true once its receipt is committed, now or earlier.
 pub fn consume(store: *durable.Store, binding: Binding, event: history.Event, now: i64, clock: effects.Clock) !bool {
     try event.validate();
     if (event.confirmed_us > now) return error.InvalidHistoryEvent;

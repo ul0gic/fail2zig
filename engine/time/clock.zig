@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Provides wall and monotonic time: the system clock, or in diag builds a virtual clock that can be re-rated or stepped.
+// Holds: Virtual monotonic time never goes backwards; a real reading below the last one is counted as a regression and ignored.
+
 const std = @import("std");
 const build_options = @import("build_options");
 const native_time = @import("time.zig");
@@ -20,6 +23,7 @@ pub const SystemClock = struct {
         return std.time.timestamp();
     }
     pub inline fn monotonicNs(self: *SystemClock) u64 {
+        // Why: std.time.Timer.read writes the timer's previous sample, so concurrent reads would race on it.
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.timer.read();
@@ -95,6 +99,7 @@ pub const VirtualClock = struct {
         if (current <= 1) return real_wait_ns;
         return @max(real_wait_ns / current, std.time.ns_per_ms);
     }
+    // Holds: Virtual time continues from its current value at the new rate; a rate change never moves it.
     pub fn setRate(self: *VirtualClock, next: u32) error{OutOfRange}!void {
         if (next > max_rate) return error.OutOfRange;
         self.mutex.lock();

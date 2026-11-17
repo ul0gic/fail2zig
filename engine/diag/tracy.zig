@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Declares the Tracy profiler client's C entry points used by diagnostic builds and wraps the zone, frame and message calls.
+// Holds: Zone matches the C zone context by value, so zoneBegin's result passes back to zoneEnd unchanged.
 
 pub const SourceLocation = extern struct {
     name: ?[*:0]const u8,
@@ -9,7 +11,7 @@ pub const SourceLocation = extern struct {
     color: u32 = 0,
 };
 
-// Layout of ___tracy_c_zone_context without TRACY_ON_DEMAND, which build.zig never defines.
+// Why: Matches ___tracy_c_zone_context in TracyC.h, whose extra field exists only under TRACY_ON_DEMAND; build.zig never sets it.
 pub const Zone = extern struct {
     id: u32 = 0,
     active: i32 = 0,
@@ -26,8 +28,7 @@ extern fn ___tracy_emit_logString(severity: i8, color: i32, callstack_depth: i32
 extern fn ___tracy_emit_memory_alloc(ptr: *const anyopaque, size: usize) void;
 extern fn ___tracy_emit_memory_free(ptr: *const anyopaque) void;
 
-// The client is built with TRACY_MANUAL_LIFETIME so that only the daemon, not every CLI run, starts a profiler
-// (an unconnected profiler blocks process exit); every other call here is invalid before this one.
+// Why: build.zig sets TRACY_MANUAL_LIFETIME, so no profiler exists before this call and every other call here is an error until it.
 pub fn startup() void {
     ___tracy_startup_profiler();
 }

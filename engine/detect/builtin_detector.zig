@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Runs a built-in filter's patterns over one decoded record and classifies the first match.
+// Holds: An unenforceable or ignored address is never a candidate, and a syslog body without a complete prefix is malformed, never matched.
+
 const std = @import("std");
 const shared = @import("shared");
 const registry = @import("../filters/registry.zig");
@@ -51,6 +54,7 @@ pub const Detector = struct {
         const entry = for (registry.entries) |entry| {
             if (entry.patterns.ptr == patterns.ptr) break entry;
         } else unreachable;
+        // Why: recidive counts the daemon's own confirmed bans (recurrence.zig), never log lines.
         if (std.mem.eql(u8, entry.name, "recidive")) return error.InternalEventsRequired;
         if (options.ignore.len > options.ignore_capacity) return error.IgnoreCapacityExceeded;
         const cidrs = try allocator.alloc(Cidr, options.ignore.len);
@@ -76,6 +80,7 @@ pub const Detector = struct {
             .owned_cell = owned_cell,
             .max_decoded_bytes = options.max_decoded_bytes,
             .generation = digest(entry.name, options, version, null),
+            // Why: The version 2 generation also hashed the static ignore CIDRs; version 3 leaves them out.
             .legacy_generation = digest(entry.name, options, legacy_version, encoded),
         };
     }
@@ -154,6 +159,7 @@ pub const Detector = struct {
             .whole => decoded,
             .syslog => blk: {
                 const extracted = parser.stripSyslogPrefix(decoded);
+                // Why: stripSyslogPrefix returns its input when the prefix is incomplete, so an unchanged pointer means a malformed body.
                 if (extracted.ptr == decoded.ptr) return .malformed_body;
                 break :blk extracted;
             },

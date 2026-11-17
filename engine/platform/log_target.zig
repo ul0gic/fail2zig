@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Queues formatted log lines in a fixed ring and writes them to stderr or an append-only log file.
+// Holds: push never waits on the destination: a line over 4096 bytes is cut with a marker, and a full 256-line ring drops it.
 
 const std = @import("std");
 const posix = std.posix;
@@ -39,7 +41,7 @@ pub const Sink = struct {
     format: LogFormat,
     fd: posix.fd_t,
     owns_fd: bool,
-    // Lock descriptor writes before queue/stat updates; producers take only mutex.
+    // Holds: Lock order is write_mutex then mutex; push and take take only mutex, so a stalled write never blocks a producer.
     write_mutex: std.Thread.Mutex = .{},
     mutex: std.Thread.Mutex = .{},
     ring: []u8,
@@ -76,6 +78,7 @@ pub const Sink = struct {
         self.* = undefined;
     }
 
+    // Holds: The new file is opened before the swap under write_mutex, so a failed open keeps the old descriptor and no line is split.
     pub fn reopen(self: *Sink) OpenError!void {
         const path = switch (self.target) {
             .stderr => return,
@@ -154,7 +157,7 @@ pub const Sink = struct {
         }
     }
 
-    // Called with write_mutex held, including the descriptor check and fallback write.
+    // Holds: Runs with write_mutex held, so the descriptor check and the stderr notice cannot interleave with reopen.
     fn noteFailure(self: *Sink, err: anyerror) void {
         const notice_due = blk: {
             self.mutex.lock();
@@ -224,6 +227,7 @@ const JsonLine = struct {
     len: usize = 0,
     truncated: bool = false,
 
+    // Why: json_close.len bytes are held back for the closing quote, truncated flag and brace that reserved writes unchecked.
     const limit = max_line_bytes - json_close.len;
 
     fn room(self: *const JsonLine) usize {
@@ -245,6 +249,7 @@ const JsonLine = struct {
         self.len += bytes.len;
     }
 
+    // Holds: Control bytes and DEL are escaped and invalid UTF-8 becomes �, so a value cannot end the JSON string or the line.
     fn stringBody(self: *JsonLine, s: []const u8) void {
         var i: usize = 0;
         while (i < s.len) {
@@ -370,6 +375,7 @@ pub fn openLogFile(path: []const u8) OpenError!posix.fd_t {
         .CREAT = true,
         .NOFOLLOW = true,
         .CLOEXEC = true,
+        // Why: A FIFO with no reader then fails ENXIO instead of blocking open (open(2)); that maps to NotRegularFile below.
         .NONBLOCK = true,
     };
     const fd = posix.openat(posix.AT.FDCWD, path, flags, 0o640) catch |err| return switch (err) {

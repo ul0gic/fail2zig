@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Decides whether a jail with missing log files is admitted, skipped or switched to the journal, and which backend starts.
+// Holds: Backend selection moves to the next backend only on DependencyUnavailable; any other initialization error ends it.
+
 const std = @import("std");
 
 pub const LogSelection = struct {

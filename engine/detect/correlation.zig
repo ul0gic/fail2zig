@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Pairs the start and finish records of a correlated rule by key and carries the start's subject to the finish.
+// Holds: At most 8 contexts are held, each expiring ttl after its receipt; a finish takes a subject only from a live context with its key.
+
 const std = @import("std");
 const rules = @import("rules.zig");
 pub const capacity = 8;
@@ -92,6 +95,7 @@ pub const Session = struct {
                         }
                         if (outcome.kind == .awaiting_context) valid_until_us = next.entries[index].?.deadline_us;
                     } else {
+                        // Why: An expired context with the same key is reused first, so a key never holds two slots.
                         const index = expired_same orelse empty orelse return error.ContextCapacity;
                         next.entries[index] = .{
                             .key = input.key,
@@ -171,6 +175,7 @@ pub const Session = struct {
             .hostname => |name| try name.validate(),
             .address => |ip| {
                 if (ip.isUnenforceable()) return error.InvalidCorrelationCheckpoint;
+                // Why: IPv4-mapped and IPv4-compatible forms (RFC 4291 section 2.5.5) are refused, so an IPv4 subject has one encoding.
                 if (ip == .ipv6 and ((ip.ipv6 >> 32) == 0xffff or (ip.ipv6 > 1 and ip.ipv6 >> 32 == 0))) return error.InvalidCorrelationCheckpoint;
             },
         }
@@ -223,6 +228,7 @@ pub const Session = struct {
             std.mem.writeInt(i64, out[369..377], entry.deadline_us, .little);
         };
     }
+    // Holds: Refuses any byte the encoder would not write, so each state has exactly one checkpoint encoding.
     fn decode(self: *const Session, saved: []const u8) !State {
         if (saved.len != checkpoint_bytes or !std.mem.eql(u8, saved[0..4], "F2NC")) return error.InvalidCorrelationCheckpoint;
         if (std.mem.readInt(u16, saved[4..6], .little) != version or saved[6] > 1 or saved[7] != 0) return error.UnsupportedCorrelationCheckpoint;

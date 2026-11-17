@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Defines confirmed effect history events, their page tokens, and the checkpoint that folds consumed events into a rolling digest.
+// Holds: A checkpoint advances only over a page starting at its last sequence whose events run contiguously, each folded in once.
+
 const std = @import("std");
 const effects = @import("effect.zig");
 const detection = @import("../detect/detection_record.zig");
@@ -56,10 +59,12 @@ pub const PageToken = struct {
     after_sequence: u64,
     last_sequence: u64,
 
+    // Holds: A page starting below retained_from_sequence fails as HistoryGap; one ending past the head or over max_page long is invalid.
     pub fn validate(self: PageToken) Error!void {
         if (std.mem.allEqual(u8, &self.installation, 0) or self.stream_revision == 0 or self.stream_revision > max_number or self.head_sequence > max_number or
             self.retained_from_sequence == 0 or self.retained_from_sequence > self.head_sequence + 1 or self.after_sequence > self.head_sequence or
             self.last_sequence < self.after_sequence or self.last_sequence > self.head_sequence or self.last_sequence - self.after_sequence > max_page) return error.InvalidHistoryPage;
+        // Why: The check above refuses retained_from_sequence 0, so this subtraction cannot underflow.
         if (self.after_sequence < self.retained_from_sequence - 1) return error.HistoryGap;
     }
 };

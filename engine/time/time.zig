@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Parses log timestamps (epoch seconds, ISO 8601, syslog, common log) into UTC microseconds and classifies their age.
+// Holds: A missing year or offset comes only from the caller's context, never a default, and the unknown offset -00:00 is refused.
+
 const std = @import("std");
 
 pub const Error = error{ InvalidTimestamp, TimeOutOfRange, MissingYear, MissingTimezone, UnsupportedPrecision };
@@ -90,6 +93,7 @@ fn zone(text: []const u8, colon: bool) Error!i32 {
     const hours = try number(text[1..3]);
     const minutes = try number(text[if (colon) @as(usize, 4) else 3..]);
     if (hours > 23 or minutes > 59) return error.InvalidTimestamp;
+    // Why: An offset of -00:00 means the local offset is unknown (RFC 3339 section 4.3), so it is not read as UTC.
     if (text[0] == '-' and hours == 0 and minutes == 0) return error.MissingTimezone;
     const value: i32 = @intCast(hours * 3600 + minutes * 60);
     return if (text[0] == '-') -value else value;
@@ -109,6 +113,7 @@ fn calendar(year: i64, mon: i64, day: i64, clock: []const u8, microseconds: i64,
     const max_day = lengths[index] + @as(i64, if (mon == 2 and leap) 1 else 0);
     if (day < 1 or day > max_day) return error.InvalidTimestamp;
     const prior_year = year - 1;
+    // Why: 719162 is the day count from 0001-01-01 to 1970-01-01 in the proleptic Gregorian calendar.
     var days = prior_year * 365 + @divFloor(prior_year, 4) - @divFloor(prior_year, 100) + @divFloor(prior_year, 400) - 719162;
     for (lengths[0..index]) |n| days += n;
     if (mon > 2 and leap) days += 1;
@@ -129,7 +134,7 @@ fn iso(text: []const u8, context: Context) Error!Timestamp {
         microseconds = try fraction(text[start..end]);
     }
     const suffix = text[end..];
-    // ISO numeric zones accept both basic (+HHMM) and extended (+HH:MM) forms.
+    // Why: ISO 8601 writes a numeric offset in basic (+HHMM) or extended (+HH:MM) form, so both are accepted.
     const offset = if (suffix.len == 0)
         context.offset_seconds orelse return error.MissingTimezone
     else if (std.mem.eql(u8, suffix, "Z"))

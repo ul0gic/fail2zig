@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Extracts addresses and timestamps from log text and compiles token patterns into line matchers at compile time.
+// Holds: A compiled matcher never backtracks: each wildcard binds to the first match of the next token, and a later miss returns null.
 
 const std = @import("std");
 const shared = @import("shared");
@@ -33,6 +35,7 @@ pub fn extractIpv4(text: []const u8) ?Ipv4Match {
     var consumed: u8 = 0;
 
     for (text, 0..) |c, i| {
+        // Why: A dotted-quad IPv4 address is at most 15 characters.
         if (i >= 15) break;
 
         switch (c) {
@@ -221,6 +224,7 @@ fn extractIp(text: []const u8) ?IpMatch {
 
 const SECS_PER_DAY: i64 = 86_400;
 
+// Does:  Counts days from 1970-01-01 to a proleptic Gregorian date; negative before the epoch.
 fn daysFromCivil(y: i64, m: u8, d: u8) i64 {
     const y_adj: i64 = if (m <= 2) y - 1 else y;
     const era: i64 = @divFloor(y_adj, 400);
@@ -278,6 +282,7 @@ pub fn extractTimestampWithYear(
         const hh = parseU(u8, text[11..13]) orelse return null;
         const mm = parseU(u8, text[14..16]) orelse return null;
         const ss = parseU(u8, text[17..19]) orelse return null;
+        // Why: A second of 60 is a leap second, which RFC 3339 section 5.6 time-second allows.
         if (mo == 0 or mo > 12 or d == 0 or d > 31 or hh > 23 or mm > 59 or ss > 60) {
             @branchHint(.unlikely);
             return null;
@@ -315,6 +320,7 @@ pub fn extractTimestampWithYear(
             @branchHint(.unlikely);
             return null;
         };
+        // Why: RFC 3164 section 4.1.2 writes a day below 10 as a space and one digit.
         const day_slice = std.mem.trim(u8, text[4..6], " ");
         const d = parseU(u8, day_slice) orelse {
             @branchHint(.unlikely);
@@ -332,6 +338,7 @@ pub fn extractTimestampWithYear(
             return null;
         }
 
+        // Why: RFC 3164 section 4.1.2 timestamps carry no year, so a caller that passes none gets a date in 1970.
         const y = year orelse 1970;
         const days = daysFromCivil(y, mo, d);
         const ts = days * SECS_PER_DAY + @as(i64, hh) * 3600 +
@@ -355,6 +362,7 @@ pub fn extractTimestampWithYear(
     return null;
 }
 
+// Does:  Returns the text after `timestamp host tag: `, or line itself, same pointer, when any part is missing.
 pub fn stripSyslogPrefix(line: []const u8) []const u8 {
     const timestamp = extractTimestamp(line) orelse return line;
     var pos: usize = timestamp.len;
@@ -375,6 +383,7 @@ pub fn stripSyslogPrefix(line: []const u8) []const u8 {
 }
 
 fn extractHost(text: []const u8) ?u16 {
+    // Why: A domain name is at most 255 octets on the wire (RFC 1035 section 2.3.4), so at most 253 characters as dotted text.
     const cap = @min(text.len, 253);
     var i: usize = 0;
     while (i < cap) : (i += 1) {
@@ -555,8 +564,7 @@ fn damagedAddressTokenEnd(line: []const u8, start: usize, end: usize) ?usize {
     while (first > 0 and !addressTokenBoundary(line[first - 1])) : (first -= 1) {}
     var last = end;
     while (last < line.len and !addressTokenBoundary(line[last])) : (last += 1) {}
-    // Replacement must never turn a damaged address into a valid prefix or suffix.
-    // Keep the entire token in view, including bytes before a wildcard's candidate.
+    // Why: A token holding U+FFFD is refused whole, so a replaced byte never leaves a valid address as its prefix or suffix.
     return if (std.mem.indexOf(u8, line[first..last], "\xef\xbf\xbd") != null) last else null;
 }
 

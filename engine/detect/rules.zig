@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Compiles a native JSON rule into a bounded program and evaluates one record against it to a match outcome.
+// Holds: Evaluating a record spends from a work budget of at most 16384 units and allocates only from a 32 KiB scratch, else ResourceLimit.
+
 const std = @import("std");
 pub const Ip = @import("shared").IpAddress;
 pub const version: u16 = 1;
@@ -37,9 +40,11 @@ pub const Hostname = struct {
         if (input.len == 0 or input.len > 253) return error.InvalidSubject;
         var labels = std.mem.splitScalar(u8, input, '.');
         while (labels.next()) |label| {
+            // Why: Labels follow RFC 1035 section 2.3.1 as relaxed by RFC 1123 section 2.1: 1 to 63 bytes, alphanumeric at both ends.
             if (label.len == 0 or label.len > 63 or !std.ascii.isAlphanumeric(label[0]) or !std.ascii.isAlphanumeric(label[label.len - 1])) return error.InvalidSubject;
             for (label) |c| if (!std.ascii.isAlphanumeric(c) and c != '-') return error.InvalidSubject;
         }
+        // Why: Text that parses as an IP address is refused, so an address never enters as a hostname subject.
         if (Ip.parse(input)) |_| return error.InvalidSubject else |_| {}
         var result = Hostname{ .text = try Text(253).init(input) };
         for (result.text.bytes[0..result.text.len]) |*c| c.* = std.ascii.toLower(c.*);
@@ -48,6 +53,7 @@ pub const Hostname = struct {
     pub fn slice(self: *const Hostname) []const u8 {
         return self.text.slice();
     }
+    // Holds: Refuses stored bytes unless init would produce exactly them, zero padding included.
     pub fn validate(self: *const Hostname) !void {
         if (!self.text.valid()) return error.InvalidSubject;
         const expected = try init(self.slice());
@@ -144,6 +150,7 @@ pub const Program = struct {
     fixed: std.heap.FixedBufferAllocator,
     parsed: std.json.Parsed(Spec),
     limits: Limits,
+    // Does:  SHA-256 of the JSON encoding of version, spec and limits, so equal rules under equal limits share it.
     generation: [32]u8 = undefined,
     segments: [segment_cap]Segment = undefined,
     segment_count: usize = 0,
@@ -226,9 +233,11 @@ pub const Program = struct {
             if (close + 1 < template.len and !space(template[close + 1])) {
                 const next = template[close + 1];
                 if (std.mem.indexOfScalar(u8, "[](),;:=|\"'", next) == null) return error.InvalidRule;
+                // Why: IPv6 text contains ':', so ':' cannot end an ip capture.
                 if (kind == .ip and next == ':') return error.InvalidRule;
                 delimiter = next;
             }
+            // Why: A quoted capture reads its own opening and closing quote, so a template quote beside it could never match.
             if (kind == .quoted and ((pos > 0 and template[pos - 1] == '"') or delimiter == '"')) return error.InvalidRule;
             try self.append(.{ .capture = .{ .name = name, .kind = kind, .delimiter = delimiter } });
             pos = close + 1;
@@ -458,6 +467,7 @@ fn textValue(value: ?Value) ?[]const u8 {
     } else null;
 }
 fn compare(value: Value, p: Predicate, budget: *Budget) !?bool {
+    // Why: Each predicate is charged the worst-case field lookup, field_cap names of name_cap bytes, whatever the record holds.
     try budget.spend(field_cap * name_cap);
     if (p.number) |n| return switch (value) {
         .number => |v| v == n,
@@ -476,6 +486,7 @@ fn compare(value: Value, p: Predicate, budget: *Budget) !?bool {
 }
 
 fn parseAddress(text: []const u8) !Ip {
+    // Why: 45 is INET6_ADDRSTRLEN (46 in <netinet/in.h>) less its terminating NUL.
     if (text.len == 0 or text.len > 45) return error.InvalidSubject;
     const ip = Ip.parse(text) catch return error.InvalidSubject;
     if (ip.isUnenforceable()) return error.InvalidSubject;

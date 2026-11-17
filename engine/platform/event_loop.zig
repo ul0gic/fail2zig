@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Runs the daemon's epoll loop and dispatches ready descriptors, signalfd signals and timerfd expirations to their callbacks.
+// Holds: Each event's callback is looked up at dispatch, so none runs after its fd or timer is removed, even later in the same batch.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -152,6 +154,7 @@ pub const EventLoop = struct {
     ) Error!void {
         var mask = linux.empty_sigset;
         sigaddset(&mask, @as(u32, signo));
+        // Why: An unblocked signal is handled by its default disposition instead of being read from the signalfd (signalfd(2)).
         posix.sigprocmask(linux.SIG.BLOCK, &mask, null);
 
         const sflags: u32 = linux.SFD.CLOEXEC | linux.SFD.NONBLOCK;
@@ -257,6 +260,7 @@ pub const EventLoop = struct {
 
     pub fn stop(self: *EventLoop) void {
         self.running.store(false, .release);
+        // Why: epoll_wait in run has no timeout, so this eventfd write is what wakes it to see running cleared.
         const one: u64 = 1;
         const bytes = std.mem.asBytes(&one);
         _ = posix.write(self.wakeup_fd, bytes) catch {};

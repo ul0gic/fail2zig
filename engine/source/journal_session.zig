@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Polls the journal through journalctl from a durable cursor and commits each new entry together with its next cursor.
+// Holds: A fetch from a saved cursor fails with ResumeLost unless its first line is that same entry; the cursor moves only after commit.
+
 const std = @import("std");
 const transport = @import("journal_transport.zig");
 const native = @import("source_processor.zig");
@@ -10,7 +13,7 @@ const time = @import("../time/time.zig");
 const health = @import("../platform/storage_health.zig");
 const repair = @import("source_repair.zig");
 pub const checkpoint_bytes = 560;
-// Same one-second quiet interval as journald_source.poll_interval_ms and native_daemon quiet_interval_ms.
+// Why: A poll that found nothing holds off the next journalctl run for one second instead of spawning it on every turn.
 const empty_poll_floor_ms: u64 = 1000;
 const Position = struct {
     generation: [32]u8,
@@ -28,6 +31,7 @@ const Position = struct {
         next.length = @intCast(value.len);
         return next;
     }
+    // Why: Layout is "F2JC", u16 version 1, 32-byte generation, i64 start, u16 cursor length, then the cursor zero-padded to 512 bytes.
     fn encode(self: *const Position) [checkpoint_bytes]u8 {
         var result: [checkpoint_bytes]u8 = undefined;
         @memcpy(result[0..4], "F2JC");
@@ -600,8 +604,7 @@ pub const Session = struct {
         }
     };
     fn query(self: *Session, q: transport.Query, count: usize) !Lines {
-        // Reset both the raw buffer and its attempt provenance before argv can
-        // allocate or fail. Only an executor error below may repopulate it.
+        // Why: Both are cleared before argv can fail, so query_failure only ever describes an executor error from this run.
         self.diagnostic = .{};
         self.query_failure = null;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -613,12 +616,14 @@ pub const Session = struct {
         };
         if (result.len > self.output.len) return error.JournalOutputLimit;
         if (result.len > 0 and result[result.len - 1] != '\n') return error.IncompleteJournalRecord;
+        // Why: Every line is framed once before any is used, so a bad or surplus line fails the query before anything commits.
         var framed = Lines{ .bytes = result, .remaining = count };
         while (try framed.next()) |_| {}
         return .{ .bytes = result, .remaining = count };
     }
     fn fetch(self: *Session, budget: usize) !Lines {
         const anchored = self.position.length > 0;
+        // Why: --cursor output starts at the saved entry itself (journalctl(1)), so one extra line is read and checked as the anchor.
         var lines = try self.query(if (anchored) .{ .cursor = self.position.cursor() } else .{ .since_us = self.position.start_us }, budget + @as(usize, if (anchored) 1 else 0));
         if (anchored) {
             const line = (try lines.next()) orelse return error.ResumeLost;
@@ -696,6 +701,7 @@ pub const Session = struct {
         if (budget == 0 or budget > self.options.journal.batch_records) return error.InvalidPollBudget;
         try self.pipe.admit();
         try self.checkStartClock();
+        // Why: The first poll only commits the starting position as a baseline, so entries before it are never read.
         if (!self.baseline_committed) {
             if (self.pending_expected != null) return error.MissingJournalCheckpoint;
             const cursor = self.position.encode();

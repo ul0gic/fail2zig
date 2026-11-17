@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Sends sd_notify(3) state messages to the service manager and paces startup timeout extensions.
+// Holds: No message exceeds 512 bytes and no STATUS value carries a newline, so caller text cannot add another assignment.
 
 const std = @import("std");
 const posix = std.posix;
@@ -37,6 +39,7 @@ pub const Notifier = struct {
         if (path.len == 0 or path.len >= sun_path_len) return error.PathTooLong;
         var self: Notifier = .{};
         @memcpy(self.addr.path[0..path.len], path);
+        // Why: A leading '@' names an abstract socket: sun_path starts with NUL and no trailing NUL is counted (sd_notify(3), unix(7)).
         if (path[0] == '@') self.addr.path[0] = 0;
         self.addr_len = @intCast(@offsetOf(linux.sockaddr.un, "path") + path.len + @as(usize, if (path[0] == '@') 0 else 1));
         const stype: u32 = posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
@@ -74,6 +77,7 @@ pub const Notifier = struct {
         return self.reloadingAt(monotonicUsec());
     }
 
+    // Why: systemd.service(5) expects RELOADING=1 together with MONOTONIC_USEC set to the current CLOCK_MONOTONIC time in microseconds.
     pub fn reloadingAt(self: *const Notifier, monotonic_usec: u64) Error!Result {
         var buf: [64]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "RELOADING=1\nMONOTONIC_USEC={d}\n", .{monotonic_usec}) catch return error.MessageTooLong;
@@ -125,6 +129,7 @@ pub const Progress = struct {
     finished: bool = false,
     send_failed: bool = false,
 
+    // Holds: Startup is extended only after progress advances, and never past extension_usec from the moment that advance was seen.
     pub fn report(self: *Progress, phase: Phase, label: []const u8, done: u64, total: u64) void {
         self.mutex.lock();
         defer self.mutex.unlock();

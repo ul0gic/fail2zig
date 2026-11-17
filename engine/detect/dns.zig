@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Resolves hostnames with A and AAAA queries over UDP and TCP, parses replies, and keeps checked answers in a checkpointed cache.
+// Holds: A reply counts only if its id, question name and type match the query; answers are cached at most 300 s, or 30 s if negative.
+
 const std = @import("std");
 pub const Name = @import("rules.zig").Hostname;
 const Text = @import("rules.zig").Text;
@@ -76,6 +79,7 @@ fn readName(packet: []const u8, position: *usize, budget: *Budget) !Text(253) {
         if (length & 0xc0 == 0xc0) {
             if (at + 1 >= packet.len or pointers == seen.len) return error.InvalidDnsPacket;
             const target = ((@as(usize, length) & 0x3f) << 8) | packet[at + 1];
+            // Why: RFC 1035 section 4.1.4 points only to a prior occurrence; backward targets past the header cannot loop.
             if (target < 12 or target >= at) return error.InvalidDnsPacket;
             for (seen[0..pointers]) |prior| if (prior == target) return error.InvalidDnsPacket;
             seen[pointers] = target;
@@ -112,6 +116,7 @@ pub fn encodeQuery(name: Name, question: Question, id: u16, output: []u8) ![]con
     if (output.len < 12 + name.slice().len + 2 + 4) return error.DnsBufferSmall;
     @memset(output[0..12], 0);
     std.mem.writeInt(u16, output[0..2], id, .big);
+    // Why: The low bit of byte 2 is RD and bytes 4-5 are QDCOUNT (RFC 1035 section 4.1.1).
     output[2] = 1;
     output[5] = 1;
     var position: usize = 12;
@@ -139,6 +144,7 @@ pub fn parseReply(packet: []const u8, name: Name, question: Question, id: u16) !
     if (packet.len < 12 or packet.len > max_packet) return error.InvalidDnsPacket;
     if (try u16be(packet, 0) != id) return error.DnsRequestMismatch;
     const flags = try u16be(packet, 2);
+    // Why: Per RFC 1035 section 4.1.1 a reply has QR set, opcode 0, the high Z bit clear and one question.
     if (flags & 0x8000 == 0 or flags & 0x7800 != 0 or flags & 0x0040 != 0 or try u16be(packet, 4) != 1) return error.InvalidDnsPacket;
     var budget: Budget = .{};
     var position: usize = 12;
@@ -147,6 +153,7 @@ pub fn parseReply(packet: []const u8, name: Name, question: Question, id: u16) !
     position += 4;
     if (flags & 0x0200 != 0) return .{ .kind = .unknown, .reason = .truncated, .canonical = name };
     const rcode = flags & 0xf;
+    // Why: Only RCODE 0 (no error) and 3 (name error) can carry an answer or a denial (RFC 1035 section 4.1.1).
     if (rcode != 0 and rcode != 3) return .{ .kind = .unknown, .reason = .server, .canonical = name };
     const answers = try u16be(packet, 6);
     const authority = try u16be(packet, 8);
@@ -179,6 +186,7 @@ pub fn parseReply(packet: []const u8, name: Name, question: Question, id: u16) !
         var alias_ttl: u32 = 300;
         for (records[0..total]) |record| {
             try budget.spend(1 + record.name.len + result.canonical.text.len);
+            // Why: Type 5 is CNAME, type 6 SOA and class 1 IN (RFC 1035 sections 3.2.2 and 3.2.4).
             if (record.section != .answer or record.class != 1 or !std.mem.eql(u8, record.name.slice(), result.canonical.slice())) continue;
             if (record.kind == 5) {
                 if (alias != null) return error.InvalidDnsPacket;
@@ -222,10 +230,12 @@ pub fn parseReply(packet: []const u8, name: Name, question: Question, id: u16) !
             _ = try readName(packet, &offset, &budget);
             _ = try readName(packet, &offset, &budget);
             if (offset > record.offset + record.length or record.offset + record.length - offset != 20) return error.InvalidDnsPacket;
+            // Why: A denial lives for the lesser of the SOA TTL and its MINIMUM field (RFC 2308 section 5), here at most 30 s.
             const ttl = @min(@min(record.ttl, try u32be(packet, offset + 16)), 30);
             negative_ttl = @min(negative_ttl orelse ttl, ttl);
         }
         if (negative_ttl) |ttl| {
+            // Why: Without RD and RA both set the server did not recurse, so an absence is reported incomplete, never negative.
             if (flags & 0x0180 != 0x0180) return .{ .kind = .unknown, .reason = .incomplete, .canonical = name };
             result.kind = .negative;
             result.reason = .none;
@@ -303,7 +313,9 @@ pub const Client = struct {
         if (self.query_count >= 20) return error.DnsQueryLimit;
         self.query_count += 1;
         self.query_name = name;
+        // Why: A random query id means an off-path sender must guess 16 bits to forge a reply.
         self.query_id = std.crypto.random.int(u16);
+        // Why: The first two bytes of tx stay free for the TCP length prefix (RFC 1035 section 4.2.2).
         const query = try encodeQuery(name, self.question, self.query_id, self.tx[2..]);
         self.tx_len = query.len;
         self.tx_sent = 0;
@@ -364,10 +376,12 @@ pub const Client = struct {
             .udp_receive => {
                 var sender: std.net.Address = undefined;
                 var length: std.posix.socklen_t = @sizeOf(std.net.Address);
+                // Why: With MSG_TRUNC recvfrom returns the datagram's real length (recv(2)), so an oversized reply is refused.
                 const count = try std.posix.recvfrom(fd, self.rx[0..max_udp], std.posix.MSG.TRUNC, &sender.any, &length);
                 if (length != self.server.getOsSockLen() or sender.any.family != self.server.any.family or !sender.eql(self.server)) return error.DnsRequestMismatch;
                 if (count > max_udp) return error.InvalidDnsPacket;
                 const answer = try parseReply(self.rx[0..count], self.query_name, self.question, self.query_id);
+                // Why: TC marks a truncated reply (RFC 1035 section 4.1.1), so the same query is repeated over TCP.
                 if (answer.kind == .unknown and answer.reason == .truncated) {
                     self.closeSocket();
                     self.socket = try std.posix.socket(self.server.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC, 0);
@@ -603,6 +617,7 @@ fn encodeEntry(entry: CacheEntry, bytes: *[cache_entry_bytes]u8) !void {
     std.mem.writeInt(u64, bytes[584..592], entry.revision, .little);
     std.mem.writeInt(u32, bytes[592..596], entry.result.answer.ttl_seconds, .little);
 }
+// Holds: Refuses any byte the encoder would not write, so each cache entry has exactly one encoding.
 pub fn decodeCheckpoint(bytes: []const u8) !CacheEntry {
     if (bytes.len != cache_entry_bytes or !std.mem.eql(u8, bytes[0..4], "F2ND")) return error.InvalidDnsCheckpoint;
     if (std.mem.readInt(u16, bytes[4..6], .little) != version) return error.UnsupportedDnsCheckpoint;

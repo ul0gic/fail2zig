@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Drives storage recovery through its storage, state, ownership and sources steps under the storage health gate.
+// Holds: Steps complete in the order storage, state, ownership, sources, and a clock below the durable receipt floor fails the attempt.
+
 const durable = @import("../store/store.zig");
 const health = @import("../platform/storage_health.zig");
 const pipeline = @import("record_pipeline.zig");

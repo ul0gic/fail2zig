@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Formats an administrative command's audit record as a key=value text line or as structured log fields.
+// Holds: A value holding a space, quote, backslash or control byte is quoted and escaped, so it cannot forge another pair or line.
+
 const std = @import("std");
 const logger = @import("logger.zig");
 

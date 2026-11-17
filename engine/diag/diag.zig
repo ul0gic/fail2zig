@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Records section timings, counters, gauges, limits and events in diagnostic builds, as a JSON journal and metrics.
+// Holds: Nothing is recorded on a thread that has not called attach; every recording entry point returns early while attached is false.
+
 const std = @import("std");
 const build_options = @import("build_options");
 const posix = std.posix;
@@ -123,7 +126,6 @@ const summary_interval_ns = 10 * std.time.ns_per_s;
 const publish_interval_ns = std.time.ns_per_s;
 const headroom_alert_percent = 95;
 const headroom_rearm_percent = 80;
-// The restart target: full protection within 60 s while holding 65,536 bans.
 const slow_startup_ms = 60 * std.time.ms_per_s;
 const event_lines_per_window = 8;
 const max_subject_bytes = 128;
@@ -136,6 +138,7 @@ const bucket_bounds_ns = [_]u64{
     250 * std.time.ns_per_ms, 500 * std.time.ns_per_ms, std.time.ns_per_s,         2500 * std.time.ns_per_ms,
     5 * std.time.ns_per_s,    10 * std.time.ns_per_s,
 };
+// Why: Each label is its bound in seconds and writeMetrics pairs them by index, so both arrays keep one length and order.
 const bucket_labels = [_][]const u8{ "0.00001", "0.00005", "0.0001", "0.00025", "0.0005", "0.001", "0.0025", "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10" };
 const bucket_count = bucket_bounds_ns.len + 1;
 
@@ -212,6 +215,7 @@ comptime {
 fn timedFsync(fd: c_int) callconv(.c) c_int {
     const span = enter(.fsync);
     const rc = std.c.fsync(fd);
+    // Why: leave makes library calls that may overwrite errno, so fsync's errno is restored for the C caller.
     const saved_errno = std.c._errno().*;
     leave(span);
     std.c._errno().* = saved_errno;
@@ -309,9 +313,10 @@ pub fn startupReady() void {
 fn processAgeMs() ?u64 {
     var buffer: [1024]u8 = undefined;
     const stat = readProc("/proc/self/stat", &buffer) orelse return null;
+    // Why: The command name may itself contain ')' and spaces, so fields are counted from the last ')'.
     const close = std.mem.lastIndexOfScalar(u8, stat, ')') orelse return null;
     var fields = std.mem.tokenizeScalar(u8, stat[close + 1 ..], ' ');
-    // starttime is field 22 of proc_pid_stat(5); the fields after the command start at field 3.
+    // Why: starttime is field 22 of proc_pid_stat(5), and the first token after the last ')' is field 3.
     var field: usize = 3;
     while (field < 22) : (field += 1) _ = fields.next() orelse return null;
     const start_ticks = std.fmt.parseInt(u64, fields.next() orelse return null, 10) catch return null;
@@ -368,7 +373,7 @@ fn open(section: Section, counted: bool) Span {
     return span;
 }
 
-// Saturating subtraction: a failed clock read returns 0 and must not trap in ReleaseSafe.
+// Why: clockNs returns 0 on a failed read, so subtractions here saturate instead of trapping in ReleaseSafe.
 pub fn leave(span: Span) void {
     if (!span.active) return;
     const wall_ns = state.timer.read() -| span.wall_start_ns;
@@ -486,6 +491,7 @@ fn sampleDescriptors() void {
     var entries = directory.iterate();
     while (entries.next() catch return) |entry| {
         const fd = std.fmt.parseInt(posix.fd_t, entry.name, 10) catch continue;
+        // Why: The handle opened to list /proc/self/fd appears in its own listing and is not counted.
         if (fd != directory.fd) descriptors += 1;
     }
     limit(.fds, descriptors, soft);
