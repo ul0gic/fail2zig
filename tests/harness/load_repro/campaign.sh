@@ -1,21 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 fail2zig contributors
-#
-# Runs one daemon case in a rootless user + network namespace with an independent kernel
-# oracle (kernel_oracle) and a TCP oracle, reusing rig.sh / restart.sh for the workload.
-#
-#   campaign.sh load    <bin> <work> <targets> <rate> <bantime>   fresh work dir, rig.sh workload
-#   campaign.sh restart <bin> <work> [max_seconds]                preserved work dir, restart.sh
-#
-# Required env: EXPECT_SHA256 (binary hash), ORACLE (built kernel_oracle path).
-# Optional env: POST_SECONDS (90) sampling after rig.sh stops sampling, SAMPLE_INTERVAL (2),
-# CONNECT_TIMEOUT (1), RUN_LIMIT (1200) wall bound, SETTLE_SECONDS / HOLD_SECONDS passed to
-# rig.sh / restart.sh, PROBE_BANNED (space-separated generator addresses to probe).
-#
-# TCP path: the listener and every probe source are local addresses on lo, so each probe SYN
-# traverses the inet input hook the daemon's chain uses. A probe from 198.19.0.1 is never
-# generated and is the unbanned control on the same path.
+# Does:  Runs one load or restart case in a rootless user and network namespace, sampling the kernel set and TCP reachability alongside it.
+# Holds: The binary's SHA-256 must equal EXPECT_SHA256 before any namespace or daemon is started.
+
 set -u
 umask 077
 
@@ -30,8 +18,7 @@ usage() { echo "usage: campaign.sh load <bin> <work> <targets> <rate> <bantime> 
 case "$MODE" in load) [ $# -eq 6 ] || usage ;; restart) [ $# -ge 3 ] && [ $# -le 4 ] || usage ;; *) usage ;; esac
 
 if [ "${CAMPAIGN_IN_NS:-0}" != "1" ]; then
-  # Environment prerequisites are checked before the run so they are never reported as
-  # product failures.
+  # Why: Prerequisite failures exit 65 before any daemon runs, so they are never reported as a product failure.
   fail_env() { echo "campaign: environment prerequisite failed: $*" >&2; exit 65; }
   [ -n "${EXPECT_SHA256:-}" ] || fail_env "EXPECT_SHA256 unset"
   [ -x "${ORACLE:-}" ] || fail_env "ORACLE is not an executable kernel_oracle"
@@ -64,7 +51,7 @@ now() { date +%s.%N; }
 PIDS=()
 DPID=""
 FAIL=0
-# stop_daemon <pid>: a daemon still alive 30 s after TERM is killed and fails the case.
+# Does:  Sends TERM, waits 30 seconds, then sends KILL and marks the whole case failed.
 stop_daemon() {
   kill -TERM "$1" 2>/dev/null
   for _ in $(seq 1 300); do kill -0 "$1" 2>/dev/null || return 0; sleep 0.1; done
@@ -85,7 +72,8 @@ ip addr add 198.18.255.254/16 dev lo
 ip addr add "$CONTROL_ADDR/32" dev lo
 ip addr add "$LISTEN_ADDR/32" dev lo
 
-probe() { # probe <source> -> prints "rc latency_ms"
+# Does:  Prints the socat exit code and the connect latency in milliseconds for one connect from the given source address.
+probe() {
   local t0 t1 rc
   t0=$(now)
   socat -u OPEN:/dev/null "TCP:$LISTEN_ADDR:$LISTEN_PORT,bind=$1,connect-timeout=$CTO" 2>/dev/null
@@ -101,11 +89,10 @@ for _ in $(seq 1 50); do ss -Hltn "sport = :$LISTEN_PORT" | grep -q . && break; 
 PROBE_BANNED="${PROBE_BANNED:-198.18.0.1}"
 SOURCES="$PROBE_BANNED $CONTROL_ADDR"
 
-# Pre-daemon positive control: every probe source reaches the listener with no ruleset.
 for src in $SOURCES; do note "pre-daemon probe $src -> $(probe "$src")"; done
 "$ORACLE" > "$OUT/kernel/pre-daemon.txt"; note "pre-daemon kernel rc=$? $(tail -n 1 "$OUT/kernel/pre-daemon.txt")"
 
-# The socket path is whatever rig.sh / restart.sh wrote into the config they started.
+# Why: The socket path is read back from the config rig.sh or restart.sh wrote, not chosen here.
 if [ "$MODE" = "load" ]; then CONF="$WORK/config.toml"; else CONF="$WORK/config-restart.toml"; rm -f "$CONF"; fi
 sock() { sed -n 's/^socket_path = "\(.*\)"$/\1/p' "$CONF" 2>/dev/null; }
 
@@ -142,7 +129,7 @@ T0=$(now)
 if [ "$MODE" = "load" ]; then
   KEEP_RUNNING=1 bash "$HERE/rig.sh" "$BIN" "$WORK" "$4" "$5" "$6" > "$OUT/rig.stdout" 2>&1 &
   RPID=$!; PIDS+=("$RPID")
-  # rig.sh stops its own sampling when storage leaves healthy or its settle window ends.
+  # Why: The wait ends when rig.sh logs that it is leaving the daemon running, which it does after its own sampling stops.
   while kill -0 "$RPID" 2>/dev/null && ! grep -q "leaving daemon running" "$WORK/rig.log" 2>/dev/null; do sleep 1; done
   if ! kill -0 "$RPID" 2>/dev/null; then note "rig.sh exited before the post window (daemon not running)"; fi
   note "rig sampling ended at t=$(awk -v a="$T0" -v b="$(now)" 'BEGIN{printf "%.0f", b-a}')s; post window ${POST_SECONDS:-90}s"
@@ -169,7 +156,7 @@ else
   done
   [ -n "$DPID" ] || note "restart daemon pid not found"
   wait "$RPID"
-  # restart.sh waits 15 s after TERM and does not escalate.
+  # Why: restart.sh waits 15 seconds after TERM and never sends KILL, so a daemon still alive afterwards is stopped here.
   if [ -n "$DPID" ] && kill -0 "$DPID" 2>/dev/null; then stop_daemon "$DPID"; fi
   touch "$OUT/stop"
 fi

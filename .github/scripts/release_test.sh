@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 fail2zig contributors
+# Does:  Proves release.sh accepts valid release inputs and refuses tampered ones, and ci-select.sh routes only document-only changes short.
+# Holds: Expected outcomes are fixed here, gh is a stub answering from fixtures, and every file lives in one temp directory removed on exit.
+
 set -euo pipefail
 root=$(cd "$(dirname "$0")" && pwd)
 helper="$root/release.sh"
@@ -215,7 +218,7 @@ refuse env GITHUB_REF=refs/heads/topic PUBLICATION_ENABLED=true bash "$helper" p
 refuse env GITHUB_REF=refs/heads/main PUBLICATION_ENABLED=false bash "$helper" publication-guard
 
 mkdir "$scratch/approved" "$scratch/downloaded"
-for name in COPYING.date-profile LICENSE SQLITE-NOTICE.md fail2zig.1 fail2zig.service \
+for name in LICENSE SQLITE-NOTICE.md fail2zig.1 fail2zig.service \
     fail2zig.toml.5 fail2zig.toml.example install.sh; do printf 'fixture %s\n' "$name" > "$scratch/approved/$name"; done
 for target in x86_64-linux-musl aarch64-linux-musl arm-linux-musleabihf mips-linux-musleabi mipsel-linux-musleabi; do
     printf 'fixture %s\n' "$target" > "$scratch/approved/fail2zig-$RELEASE_TAG-$target"
@@ -257,6 +260,7 @@ selector="$scratch/selector"
 git init -q "$selector"
 git -C "$selector" config user.name 'CI acceptance'
 git -C "$selector" config user.email 'ci-acceptance@example.invalid'
+# Why: Commits in the scratch repository must not depend on the host's signing setup or run its hooks.
 git -C "$selector" config commit.gpgSign false
 git -C "$selector" config core.hooksPath /dev/null
 mkdir -p "$selector/docs" "$selector/engine"

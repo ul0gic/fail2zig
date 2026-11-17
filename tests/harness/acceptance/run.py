@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Runs one acceptance module under a private network namespace with a hash-pinned candidate and oracle and records result.json.
+# Holds: A run is reported passed only when the child exited 0 and left no live process in its process group.
+
 """Run one existing acceptance module; no builds, implicit binaries or lab connections."""
 import argparse
 import hashlib
@@ -66,7 +71,7 @@ def preflight(args):
     require(not work.exists() and not work.is_symlink(), 'work must be a new directory')
     require(work.parent.is_dir(), 'work parent must already exist')
     work = work.parent.resolve() / work.name
-    # Drivers embed paths in TOML; notify also uses systemd specifiers.
+    # Why: Drivers embed these paths in TOML, so only the characters a-z, A-Z, 0-9, underscore, dot, slash and hyphen are accepted.
     for path in (binary, oracle, work):
         require(re.fullmatch(r'/[a-zA-Z0-9_./-]+', str(path)), f'unsafe driver path characters: {path}')
     require(args.module in {'isolated-firewall', 'backend'} or args.backend == 'nftables', 'module supports nftables only')
@@ -116,13 +121,14 @@ def preflight(args):
 
 def kill_group(child, sig):
     try:
-        os.killpg(child.pid, sig)  # start_new_session below establishes our exclusive process group.
+        # Why: invoke starts the child with start_new_session, so its pid is the id of a process group this runner owns alone.
+        os.killpg(child.pid, sig)
     except ProcessLookupError:
         pass
 
 
 def group_alive(child):
-    # Ignore unreaped zombies: they cannot retain a listener, namespace or mutation authority.
+    # Why: An unreaped zombie holds no listener or namespace, so a Z or X state does not count as a live group member.
     for entry in Path('/proc').iterdir():
         if not entry.name.isdigit():
             continue
@@ -133,7 +139,7 @@ def group_alive(child):
         except (FileNotFoundError, ProcessLookupError):
             continue
         except PermissionError:
-            # In restricted procfs, conservatively treat an existing group as live.
+            # Why: When a /proc entry is unreadable, signal 0 to the group decides whether the group still exists.
             try:
                 os.killpg(child.pid, 0)
                 return True
@@ -153,8 +159,7 @@ def invoke(command, env, cwd, log, seconds, cleanup_seconds):
         except KeyboardInterrupt:
             code = 130
         if code == 0:
-            # An exited shell may still have a child finishing its exit after
-            # its cleanup trap's wait. Give that transition a bounded grace.
+            # Why: A child may still be finishing its exit after the shell returns, so the group gets 2 seconds of grace.
             until = time.monotonic() + 2
             while group_alive(child) and time.monotonic() < until:
                 time.sleep(0.05)
@@ -171,7 +176,7 @@ def invoke(command, env, cwd, log, seconds, cleanup_seconds):
                                 diagnostic.write(f'pid={entry.name} '.encode() + argv + b'\n')
                         except (FileNotFoundError, ProcessLookupError, PermissionError):
                             continue
-        # A successful parent exit is not success if it left live children behind.
+        # Why: A zero exit that left a live process group behind becomes code 125 and the group is killed.
         if child.poll() is None or group_alive(child):
             if code == 0:
                 code = 125
@@ -220,7 +225,8 @@ def suite_result(module, backend, log):
 
 def run(args, record, work, driver):
     os.umask(0o077)
-    work.mkdir(mode=0o700)  # Exclusive: never reuse or recursively remove user work.
+    # Why: mkdir without exist_ok fails on an existing path, so a user's work directory is never reused or removed.
+    work.mkdir(mode=0o700)
     scenario = work / 'scenario'
     scenario.mkdir(mode=0o700)
     log = work / 'run.log'
@@ -232,8 +238,7 @@ def run(args, record, work, driver):
         env['F2Z_NATIVE_FIREWALL_TRANSPORT'] = args.backend
     if args.plumbing:
         env.update(LOAD_S='12', DRAIN_S='20', BANTIME='5', HOT_S='2')
-    # Tool backends need host-root privilege for their command subprocesses on
-    # the target; both forms still create a private network namespace.
+    # Why: The iptables and ipset backends run their command subprocesses under sudo, still inside a private network namespace.
     if args.backend in {'iptables', 'ipset'}:
         forwarded = ('PATH', 'F2Z_NATIVE_PARENT_NETNS', 'F2Z_NATIVE_FIREWALL_TRANSPORT')
         ns = ['sudo', '-n', 'env'] + [f'{key}={env[key]}' for key in forwarded if key in env] + [
@@ -245,7 +250,7 @@ def run(args, record, work, driver):
     record.update(started_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), exit_code=1, status='failed')
     code = 1
     try:
-        # Recheck binaries immediately before executing; suites are separate artifacts, not candidate builds.
+        # Why: Candidate and oracle hashes are rechecked just before execution, so a binary swapped after preflight is refused.
         executable(record['candidate'], record['sha256'])
         executable(record['oracle'], record['oracle_sha256'])
         if args.module in SUITES:

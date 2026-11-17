@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Matches PortSentry 2.0.7 history records of a triggered scan that PortSentry itself did not block.
+// Holds: A line matches only if every field parses and nothing follows `blocked: [false]`; the address comes from the brackets alone.
 
 const std = @import("std");
 const shared = @import("shared");
-const native_time = @import("../core/native_time.zig");
-const parser = @import("../core/parser.zig");
+const native_time = @import("../time/time.zig");
+const parser = @import("../detect/parser.zig");
 const types = @import("types.zig");
 
 pub const PatternDef = types.PatternDef;
 
-// PortSentry v2.0.7 writes history records into a 1024-byte C buffer including newline and NUL;
-// this limit bounds every delimiter scan.
+// Why: PortSentry 2.0.7 builds each history record in a 1024-byte buffer that also holds the newline and NUL.
 const max_history_bytes: usize = 1024 - 2;
+// Why: PortSentry stamps records as %Y-%m-%dT%H:%M:%S., three millisecond digits, then %z: 28 bytes.
 const timestamp_bytes: usize = 28;
 
 pub const patterns = [_]PatternDef{
@@ -24,13 +26,13 @@ fn matchTriggeredScan(line: []const u8) ?parser.ParseResult {
 
     var cursor: usize = timestamp_bytes;
     if (!takeLiteral(line, &cursor, " Scan from: [")) return null;
+    // Why: 45 bytes is the longest textual IPv6 address, INET6_ADDRSTRLEN less its NUL (inet_ntop(3)).
     const address_text = takeUntil(line, &cursor, ']', 45) orelse return null;
     const address = shared.IpAddress.parse(address_text) catch return null;
 
     if (!takeLiteral(line, &cursor, " (")) return null;
     const displayed_host = takeUntil(line, &cursor, ')', 45) orelse return null;
-    // The supported RESOLVE_HOST=0 recipe repeats the numeric source here.
-    // This field is corroboration only and can never replace the bracketed IP.
+    // Why: With RESOLVE_HOST=0 PortSentry writes the bracketed address here again, so a record whose two fields differ is refused.
     if (!std.mem.eql(u8, displayed_host, address_text)) return null;
 
     if (!takeLiteral(line, &cursor, " protocol: [")) return null;

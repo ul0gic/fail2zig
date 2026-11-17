@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Encodes and decodes the length-framed command and response messages exchanged over the daemon's Unix socket.
+// Holds: Every length read from the wire is checked against its limit before the bytes it counts are read or allocated.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -12,6 +14,7 @@ pub const max_payload_size: u32 = 1 << 20;
 pub const max_request_body: u32 = 16 * 1024;
 pub const request_id_bytes = 32;
 
+// Why: Each value is the tag byte on the wire and ipc_auth.classifyTag authorizes by that number, so a value is never renumbered.
 pub const CommandId = enum(u8) {
     status = 0,
     ban = 1,
@@ -272,6 +275,7 @@ fn optDurationSize(d: ?Duration) u32 {
     return if (d != null) 1 + 8 else 1;
 }
 
+// Why: Addresses travel big-endian (network byte order) while every length and integer field is little-endian.
 fn writeIp(ip: IpAddress, writer: anytype) @TypeOf(writer).Error!void {
     switch (ip) {
         .ipv4 => |v| {

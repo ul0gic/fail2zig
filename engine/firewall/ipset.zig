@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Bans addresses through two ipset hash:ip sets matched by an INPUT rule, driving the ipset and iptables tools.
+// Holds: Only the two prefix-named sets and their match rule are touched, and the match rule is inserted only after -C reports it missing.
 
 const std = @import("std");
 const mem = std.mem;
@@ -9,31 +11,6 @@ const iptables = @import("iptables.zig");
 
 pub const CommandBuilder = struct {
     set_name: []const u8,
-
-    pub fn createSet(
-        self: CommandBuilder,
-        argv: *[9][]const u8,
-        timeout_str: []const u8,
-        maxelem_str: []const u8,
-    ) [][]const u8 {
-        argv[0] = "ipset";
-        argv[1] = "create";
-        argv[2] = self.set_name;
-        argv[3] = "hash:ip";
-        argv[4] = "timeout";
-        argv[5] = timeout_str;
-        argv[6] = "maxelem";
-        argv[7] = maxelem_str;
-        argv[8] = "-exist";
-        return argv[0..9];
-    }
-
-    pub fn destroySet(self: CommandBuilder, argv: *[3][]const u8) [][]const u8 {
-        argv[0] = "ipset";
-        argv[1] = "destroy";
-        argv[2] = self.set_name;
-        return argv[0..3];
-    }
 
     pub fn addEntry(
         self: CommandBuilder,
@@ -68,20 +45,6 @@ pub const CommandBuilder = struct {
         return argv[0..5];
     }
 
-    pub fn flushSet(self: CommandBuilder, argv: *[3][]const u8) [][]const u8 {
-        argv[0] = "ipset";
-        argv[1] = "flush";
-        argv[2] = self.set_name;
-        return argv[0..3];
-    }
-
-    pub fn listSet(self: CommandBuilder, argv: *[3][]const u8) [][]const u8 {
-        argv[0] = "ipset";
-        argv[1] = "list";
-        argv[2] = self.set_name;
-        return argv[0..3];
-    }
-
     pub fn installMatchRule(
         self: CommandBuilder,
         argv: *[10][]const u8,
@@ -89,24 +52,6 @@ pub const CommandBuilder = struct {
     ) [][]const u8 {
         argv[0] = binary;
         argv[1] = "-I";
-        argv[2] = "INPUT";
-        argv[3] = "-m";
-        argv[4] = "set";
-        argv[5] = "--match-set";
-        argv[6] = self.set_name;
-        argv[7] = "src";
-        argv[8] = "-j";
-        argv[9] = "DROP";
-        return argv[0..10];
-    }
-
-    pub fn removeMatchRule(
-        self: CommandBuilder,
-        argv: *[10][]const u8,
-        binary: []const u8,
-    ) [][]const u8 {
-        argv[0] = binary;
-        argv[1] = "-D";
         argv[2] = "INPUT";
         argv[3] = "-m";
         argv[4] = "set";
@@ -204,6 +149,7 @@ fn initImpl(
     for ([_][]const u8{ "ipv4", "ipv6" }, [_][]const u8{ "inet", "inet6" }, [_][]const u8{ "iptables", "ip6tables" }) |suffix, family, binary| {
         var buf: [128]u8 = undefined;
         const name = setName(&buf, config.chain_prefix, suffix) catch return error.SystemError;
+        // Why: IPSET_MAXNAMELEN is 32 including the NUL (include/uapi/linux/netfilter/ipset/ip_set.h).
         if (name.len > 31) return error.SystemError;
         if (try iptables.runCommand(allocator, &.{ "ipset", "create", name, "hash:ip", "family", family, "timeout", "0", "maxelem", "1048576", "-exist" }) != .ok) return error.SystemError;
         const check = try iptables.runCommand(allocator, &.{ binary, "-C", "INPUT", "-m", "set", "--match-set", name, "src", "-j", "DROP" });
@@ -244,6 +190,7 @@ fn banImpl(
         return error.SystemError;
     };
     var argv_storage: [7][]const u8 = undefined;
+    // Why: Timeout 0 adds the entry permanently (ipset(8)), so the ban duration is not applied here.
     const argv = builder.addEntry(&argv_storage, ip_str, "0");
 
     const exit_class = try iptables.runCommand(allocator, argv);

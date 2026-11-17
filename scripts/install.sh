@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Installs a verified fail2zig release or a local build as a systemd service, without starting it.
+# Holds: No account, directory or file outside staging is touched until every download matches SHA256SUMS and no process holds the state.
 
 set -euo pipefail
 
@@ -109,6 +113,7 @@ detect_target() {
     armv7l|armv8l) echo "arm-linux-musleabihf" ;;
     mips|mipsel)
       require_cmd od
+      # Why: ELF header byte 5 is EI_DATA: 1 is little-endian, 2 big-endian (/usr/include/elf.h).
       endian="$(od -An -tu1 -j5 -N1 /proc/self/exe)"
       case "${endian//[[:space:]]/}" in
         1) echo "mipsel-linux-musleabi" ;;
@@ -171,8 +176,7 @@ stage_from_release() {
     fail2zig.1 \
     fail2zig.toml.5 \
     LICENSE \
-    SQLITE-NOTICE.md \
-    COPYING.date-profile
+    SQLITE-NOTICE.md
   do
     log "downloading ${asset}"
     curl -fsSL --retry 3 -o "${WORKDIR}/${asset}" "${base}/${asset}"
@@ -212,8 +216,7 @@ stage_from_local() {
     docs/man/fail2zig.1 \
     docs/man/fail2zig.toml.5 \
     LICENSE \
-    SQLITE-NOTICE.md \
-    engine/compat/COPYING.date-profile
+    SQLITE-NOTICE.md
   do
     [ -f "${REPO_ROOT}/${source_path}" ] || die "missing ${source_path} in repo tree"
     staged_name="${source_path##*/}"
@@ -232,8 +235,6 @@ fi
 DAEMON_STAGED="${WORKDIR}/$(cat "${WORKDIR}/.daemon_name")"
 
 
-# Only these native SQLite paths are an automatic ownership transition. Stop all
-# writers for the whole install; the installer never stops or starts a service.
 [[ "$SYSTEM_GROUP" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "invalid system group name"
 for path in "$PREFIX" "$CONFIG_DIR" "$SYSTEMD_DIR" "$MAN_DIR" "$DOC_DIR"; do
   [[ "$path" =~ ^/[a-zA-Z0-9_./-]+$ ]] || die "install paths must be absolute and contain only letters, digits, /, _, . or -"
@@ -289,6 +290,7 @@ check_state() {
     [ "$owner" = 0 ] || [ "$owner" = "$SERVICE_UID" ] || die "unexpected state file owner: $path"
   done
   if [ -f "$STATE_FILE" ]; then
+    # Why: Every SQLite database begins with the 16 bytes "SQLite format 3" and a NUL (sqlite.org/fileformat.html).
     [ "$(od -An -tx1 -N16 "$STATE_FILE" | tr -d ' \n')" = 53514c69746520666f726d6174203300 ] ||
       die "state.bin is not native SQLite; legacy v0.3.0 state cannot be converted by this installer. Preserve it and select a new native database explicitly."
   elif [ -e "$STATE_FILE-wal" ] || [ -e "$STATE_FILE-shm" ]; then
@@ -315,8 +317,7 @@ if [ -f "$CONFIG_DIR/config.toml" ]; then
 fi
 if [ "$DRY_RUN" -ne 1 ]; then check_stopped; fi
 check_state
-# File.tryLock(.exclusive) uses flock on Linux. Hold the same lock until exit,
-# including across bind-mount aliases, while changing owner and installing files.
+# Why: The daemon locks its state file with flock (Zig's File.tryLock), so holding fd 9 refuses a running daemon until exit.
 if [ "$DRY_RUN" -ne 1 ] && [ -f "$STATE_FILE" ]; then
   require_cmd flock
   exec 9<> "$STATE_FILE"
@@ -341,6 +342,7 @@ else
   run useradd --system --gid "$SYSTEM_GROUP" --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin "$SYSTEM_USER"
 fi
 
+# Why: The account may only now exist, so its uid is read and both checks rerun before any ownership change.
 if [ "$DRY_RUN" -ne 1 ]; then
   SERVICE_UID="$(id -u "$SYSTEM_USER")"
   check_stopped
@@ -392,7 +394,10 @@ log "installing license and dependency notices under ${DOC_DIR}"
 run install -d -o root -g root -m 0755 "${DOC_DIR}"
 run install -o root -g root -m 0644 "${WORKDIR}/LICENSE" "${DOC_DIR}/LICENSE"
 run install -o root -g root -m 0644 "${WORKDIR}/SQLITE-NOTICE.md" "${DOC_DIR}/SQLITE-NOTICE.md"
-run install -o root -g root -m 0644 "${WORKDIR}/COPYING.date-profile" "${DOC_DIR}/COPYING.date-profile"
+if [ -e "${DOC_DIR}/COPYING.date-profile" ]; then
+  log "removing the retired ${DOC_DIR}/COPYING.date-profile (the data it covered is no longer shipped)"
+  run rm -f "${DOC_DIR}/COPYING.date-profile"
+fi
 
 
 log "installing ${SYSTEMD_DIR}/fail2zig.service"
@@ -424,6 +429,7 @@ if command -v systemctl >/dev/null 2>&1 && { [ "$STATE_DIR" != /var/lib/fail2zig
         [ "$covered" = 1 ] || needs_grant=1 ;;
       *)
         for entry in $writable; do
+          # Why: systemd.exec(5) allows a "-" or "+" prefix on ReadWritePaths= entries.
           entry="${entry#-}"; entry="${entry#+}"
           case "$dir/" in "${entry%/}/"*) covered=1 ;; esac
         done

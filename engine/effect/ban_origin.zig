@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
+// Does:  Decides how a manual ban treats a scope's current owner and derives the decision id of a configured ban list entry.
+// Holds: A manual ban never takes a config-owned scope; detection and manual owners are extended as manual.
+
+const shared = @import("shared");
+const effect = @import("effect.zig");
+const ban_origins = @import("../store/ban_origins.zig");
+
+pub const Origin = shared.types.Origin;
+pub const OwnerOrigin = ban_origins.OwnerOrigin;
+
+pub const BanListEntry = struct {
+    entry: shared.types.IgnoreEntry,
+    jail: []const u8,
+    duration_s: ?u64,
+
+    pub fn decisionId(self: BanListEntry) effect.Hash {
+        var buffer: [shared.types.IgnoreEntry.max_text_bytes]u8 = undefined;
+        return effect.hashParts("fail2zig-banip-v1", &.{ self.jail, self.entry.canonical(&buffer) });
+    }
+};
+
+pub const ManualOutcome = enum { set_manual, extend_as_manual, refuse_config };
+pub const refused_config_text = "banned by config: edit banip";
+
+pub fn manualOutcome(current: ?OwnerOrigin) ManualOutcome {
+    const owner = current orelse return .set_manual;
+    return switch (owner.origin) {
+        .detection, .manual => .extend_as_manual,
+        .config => .refuse_config,
+    };
+}

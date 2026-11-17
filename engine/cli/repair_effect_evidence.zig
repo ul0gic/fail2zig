@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Checks the state for repairable effect absence evidence and, with --apply, returns the eligible intents to pending.
+// Holds: Nothing is written without --apply, and no evidence is repaired before a state backup is taken and its SHA-256 printed.
+
 const std = @import("std");
 const shared = @import("shared");
 const cli = @import("cli");
-const config = @import("../config/native.zig");
-const paths = @import("../config/native_paths.zig");
-const durable = @import("../core/record_store.zig");
-const effects = @import("../core/native_effect.zig");
+const config = @import("../config/config.zig");
+const paths = @import("../config/paths.zig");
+const durable = @import("../store/store.zig");
+const effects = @import("../effect/effect.zig");
 
 const Options = struct { config_path: []const u8 = "/etc/fail2zig/config.toml", apply: bool = false };
 const Summary = struct { examined: usize = 0, eligible: usize = 0, repaired: usize = 0 };
@@ -21,7 +24,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8, stdout: anyty
         return .usage;
     };
     execute(allocator, options, stdout) catch |failure| {
-        stderr.print("repair-effect-evidence: refused: {s}; stop the daemon and preserve the state and any repair backup; only recognized absence evidence can be repaired\n", .{@errorName(failure)}) catch {};
+        stderr.print(
+            "repair-effect-evidence: refused: {s}; stop the daemon and preserve the state and any repair backup; only recognized absence evidence can be repaired\n",
+            .{@errorName(failure)},
+        ) catch {};
         return .rejected;
     };
     return .success;
@@ -70,6 +76,7 @@ fn execute(allocator: std.mem.Allocator, options: Options, stdout: anytype) !voi
     const state_path = cfg.global.state_file;
     const authority = try paths.lockStateIfPresent(state_path) orelse return error.FileNotFound;
     defer authority.close();
+    // Why: The lock is held on a descriptor, so each open by path is checked to still name the locked device and inode.
     if (!paths.stateMatchesAuthority(authority, state_path)) return error.OpenFailed;
     const checked = blk: {
         var store = try durable.Store.openReadOnly(allocator, state_path);

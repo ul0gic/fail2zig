@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Lists the built-in patterns for Apache authentication failures, bad bots and oversized or invalid requests.
+// Holds: Every error-log pattern reads the address right after `[client ` and needs a `:` after it; the path patterns match only 404s.
 
 const types = @import("types.zig");
-const parser = @import("../core/parser.zig");
+const parser = @import("../detect/parser.zig");
 const access = @import("access.zig");
 
 pub const PatternDef = types.PatternDef;

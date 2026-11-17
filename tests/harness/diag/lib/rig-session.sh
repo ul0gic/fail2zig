@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Rig side of diag-run, inside `unshare --user --map-root-user --net`: rig-session.sh BIN WORK SOCKDIR SCENARIO CHECK SECONDS NLMON RUN_DIR
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Starts the daemon under a generated config in the rig namespace, runs one check against it and collects status evidence.
+# Holds: The diagnostic DSN is unset in this shell before the check runs, so the check and its children never inherit it.
+
 set -u
 umask 077
 BIN="$1"; WORK="$2"; SOCKDIR="$3"; SCENARIO="$4"; CHECK="$5"; SECS="$6"; NLMON="$7"; RUN="$8"
@@ -47,7 +51,7 @@ FWD=""
 if [ "$diag" = 1 ]; then
   export FAIL2ZIG_DIAG_DIR="$WORK/diag"
   if [ -n "${F2Z_DSN:-}" ]; then
-    # Only loopback exists here: 127.0.0.1:18000 reaches GlitchTip through the Unix socket diag-run bridges outside.
+    # Why: Only loopback exists here, so the DSN host becomes 127.0.0.1:18000, a forwarder to the Unix socket bridged outside the namespace.
     socat TCP-LISTEN:18000,bind=127.0.0.1,reuseaddr,fork "UNIX-CONNECT:$SOCKDIR/dsn.sock" &
     FWD=$!
     export FAIL2ZIG_DIAG_DSN; FAIL2ZIG_DIAG_DSN=$(echo "$F2Z_DSN" | sed -E 's#^(https?://[^@/]+@)[^/]+#\1127.0.0.1:18000#')

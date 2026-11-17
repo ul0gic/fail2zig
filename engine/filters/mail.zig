@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Lists the built-in patterns for Postfix, Dovecot and Courier mail server failures.
+// Holds: In every pattern the address must start right after a fixed literal such as `[`, `rip=` or `relay=`; it is never searched for.
 
 const types = @import("types.zig");
-const parser = @import("../core/parser.zig");
+const parser = @import("../detect/parser.zig");
 
 pub const PatternDef = types.PatternDef;
 

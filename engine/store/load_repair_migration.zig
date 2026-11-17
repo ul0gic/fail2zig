@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Migrates a schema 23 state file to schema 24 in recorded, resumable phases behind a verified backup, and writes schema backups.
+// Holds: Each page commits its work with a compare-and-set of the recorded phase and cursor, so a resumed run never repeats or skips one.
+
 const std = @import("std");
 const store_mod = @import("store.zig");
 const Error = store_mod.Error;
@@ -8,8 +11,7 @@ pub const target_schema = store_mod.load_repair_schema;
 pub const runtime_schema: i64 = 25;
 const source_schema: i64 = 23;
 
-// Callback allowance for the final transaction's unpageable foreign_key_check and quick_check.
-// Measured worst 1.42 callbacks per page x the 65,536-page state cap x 1.25.
+// Why: Callback budget for the final foreign_key_check and quick_check, which cannot be paged: 1.42 x 65,536 pages x 1.25.
 pub const migration_verify: u32 = 116_400;
 pub const observations_per_intent: i64 = 4;
 const disk_reserve_bytes: u64 = 32 * 1024 * 1024;
@@ -118,7 +120,7 @@ const Statvfs = extern struct {
 };
 extern fn fstatvfs(fd: c_int, buffer: *Statvfs) c_int;
 
-// ADD COLUMN ... CHECK rescans every existing row, so triggers enforce the same rules instead.
+// Why: ADD COLUMN with a CHECK tests every existing row (sqlite.org lang_altertable.html), so triggers enforce new column rules.
 const fence_ddl =
     \\CREATE TABLE load_repair_migration(id INTEGER PRIMARY KEY CHECK(id=1),phase INTEGER NOT NULL CHECK(phase BETWEEN 1 AND 99),cursor INTEGER NOT NULL CHECK(typeof(cursor)='integer' AND cursor>=0),started_us INTEGER NOT NULL CHECK(typeof(started_us)='integer'),completed_us INTEGER CHECK(completed_us IS NULL OR typeof(completed_us)='integer'),backup_path TEXT NOT NULL CHECK(typeof(backup_path)='text' AND length(backup_path) BETWEEN 1 AND 4096),backup_sha256 BLOB NOT NULL CHECK(typeof(backup_sha256)='blob' AND length(backup_sha256)=32),backup_pages INTEGER NOT NULL CHECK(typeof(backup_pages)='integer' AND backup_pages>0),backup_user_version INTEGER NOT NULL CHECK(backup_user_version=23),backup_quick_check TEXT NOT NULL CHECK(backup_quick_check='ok'),superseded_targets INTEGER NOT NULL CHECK(typeof(superseded_targets)='integer' AND superseded_targets>=0),CHECK((phase=99)=(completed_us IS NOT NULL)));
     \\CREATE TABLE retention_policy(id INTEGER PRIMARY KEY CHECK(id=1),generation INTEGER NOT NULL CHECK(typeof(generation)='integer' AND generation>0),max_matches INTEGER NOT NULL CHECK(typeof(max_matches)='integer' AND max_matches BETWEEN 0 AND 1024),state INTEGER NOT NULL CHECK(state IN(1,2)),sweep_cursor INTEGER NOT NULL CHECK(typeof(sweep_cursor)='integer' AND sweep_cursor>=0));
@@ -347,10 +349,6 @@ const expected_objects = blk: {
     };
 };
 
-pub fn backupPath(buffer: []u8, state_path: []const u8) Error![:0]u8 {
-    return std.fmt.bufPrintZ(buffer, "{s}{s}", .{ state_path, BackupKind.pre24.suffix() }) catch error.StorageLimit;
-}
-
 pub fn Methods(comptime Store: type) type {
     return struct {
         pub fn loadRepairStatus(self: *Store) Error!Status {
@@ -375,23 +373,6 @@ pub fn Methods(comptime Store: type) type {
             return .{ .phase = phase, .cursor = cursor };
         }
 
-        pub fn requireLoadRepairAdmission(self: *Store) Error!void {
-            switch (try self.loadRepairStatus()) {
-                .earlier_schema, .ready => {},
-                .incomplete => return error.LoadRepairMigrationIncomplete,
-                .complete => if (latest_schema < target_schema) return error.LoadRepairWritersPending,
-            }
-        }
-
-        pub fn completeLoadRepairMigration(self: *Store, options: Options) Error!void {
-            while (true) {
-                switch (try self.loadRepairStatus()) {
-                    .earlier_schema, .complete => return,
-                    .ready, .incomplete => _ = try self.stepLoadRepairMigration(options),
-                }
-            }
-        }
-
         pub fn stepLoadRepairMigration(self: *Store, options: Options) Error!Step {
             if (options.state_path.len == 0 or options.history_max_matches > 1024) return error.InvalidRecord;
             switch (try self.loadRepairStatus()) {
@@ -406,7 +387,10 @@ pub fn Methods(comptime Store: type) type {
                 .live_counter => self.loadRepairPage(progress, "INSERT INTO effect_owner_live(id,live) SELECT 1,count(*) FROM effect_owners WHERE lease_kind<>0;" ++
                     "INSERT INTO migration_activations SELECT s.run_id,s.seq,r.updated_us FROM migration_staged_owners s JOIN migration_runs r ON r.run_id=s.run_id WHERE r.state IN(6,7);"),
                 .detail_columns => self.loadRepairPage(progress, detail_columns_ddl),
-                .detail_sequence_index, .detail_age_index, .detail_subject_index, .detail_evidence_index => self.loadRepairPage(progress, detail_index_ddl[@intFromEnum(progress.phase) - @intFromEnum(Phase.detail_sequence_index)]),
+                .detail_sequence_index, .detail_age_index, .detail_subject_index, .detail_evidence_index => self.loadRepairPage(
+                    progress,
+                    detail_index_ddl[@intFromEnum(progress.phase) - @intFromEnum(Phase.detail_sequence_index)],
+                ),
                 .targets_swap => self.loadRepairPage(progress, "DROP TABLE action_targets; ALTER TABLE action_targets_v24 RENAME TO action_targets;"),
                 .observations_swap => self.loadRepairPage(progress, "DROP TABLE effect_observations; ALTER TABLE effect_observations_v24 RENAME TO effect_observations;"),
                 .spent_index => self.loadRepairPage(progress, "CREATE INDEX native_effects_spent ON native_effects(scope_key) WHERE lease_kind=0;"),
@@ -421,7 +405,7 @@ pub fn Methods(comptime Store: type) type {
         fn startLoadRepair(self: *Store, options: Options) Error!Step {
             var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
             const backup = try self.takeSchemaBackup(options, .pre24, &path_buffer);
-            // Remove the backup only when the fence certainly did not commit.
+            // Why: The backup is deleted only when the fence certainly did not commit; an unknown commit outcome sets reopen_required.
             errdefer if (!self.reopen_required) std.fs.cwd().deleteFileZ(backup.path) catch {};
 
             try self.beginWrite();
@@ -460,9 +444,12 @@ pub fn Methods(comptime Store: type) type {
         pub fn prepareSchemaBackup(self: *Store, options: Options, kind: BackupKind, path_buffer: []u8, partial_buffer: []u8) Error!PreparedBackup {
             const final_path = std.fmt.bufPrintZ(path_buffer, "{s}{s}", .{ options.state_path, kind.suffix() }) catch return error.StorageLimit;
             const partial_path = std.fmt.bufPrintZ(partial_buffer, "{s}{s}.partial", .{ options.state_path, kind.suffix() }) catch return error.StorageLimit;
-            // An unrecorded backup may predate writes by another binary; never adopt it.
+            // Why: A backup file this run did not record may predate later writes, so its presence refuses the migration.
             if (std.fs.cwd().access(final_path, .{})) |_| {
-                std.log.warn("native storage: schema {d} migration refused: backup {s} already exists; keep it if it is the only copy of earlier state, otherwise move it aside and restart", .{ kind.target(), final_path });
+                std.log.warn(
+                    "native storage: schema {d} migration refused: backup {s} already exists; keep it if it is the only copy of earlier state, otherwise move it aside and restart",
+                    .{ kind.target(), final_path },
+                );
                 return switch (kind) {
                     .pre24 => error.LoadRepairBackupExists,
                     .pre25, .pre26, .pre27, .pre28, .pre29 => error.SchemaBackupExists,
@@ -507,6 +494,7 @@ pub fn Methods(comptime Store: type) type {
             errdefer std.fs.cwd().deleteFileZ(partial_path) catch {};
             {
                 var handle: ?*anyopaque = null;
+                // Why: SQLITE_OPEN_READWRITE, FULLMUTEX and NOFOLLOW (sqlite3.h); the empty file already exists, so CREATE is left out.
                 const opened = sqlite3_open_v2(partial_path, &handle, 0x02 | 0x10000 | 0x01000000, null);
                 const destination = handle orelse return error.OpenFailed;
                 defer _ = sqlite3_close_v2(destination);
@@ -517,8 +505,7 @@ pub fn Methods(comptime Store: type) type {
                 const finished = sqlite3_backup_finish(backup);
                 if (rc != 101) return store_mod.sqliteError(rc);
                 if (finished != 0) return store_mod.sqliteError(finished);
-                // The copied header carries the WAL flag; a rollback-journal backup can be
-                // verified read-only without creating sidecar files.
+                // Why: The copy inherits WAL mode from its header; in DELETE mode it can be verified read-only without -wal or -shm files.
                 const journal = sqlite3_exec(destination, "PRAGMA journal_mode=DELETE;", null, null, null);
                 if (journal != 0) return store_mod.sqliteError(journal);
             }
@@ -602,8 +589,7 @@ pub fn Methods(comptime Store: type) type {
                     try self.windowCopy(sql_details_count, sql_details, low, high);
                     try self.windowExec(sql_summaries, low, high, null);
                 },
-                // The limit fixed by the fence, not the current config: a config edit between
-                // resumed pages would otherwise mix limits and fail validation on every start.
+                // Why: Pages read the limit fixed at the fence, so a config edit between resumed pages cannot mix limits and fail checks.
                 .candidates => try self.windowExec(sql_candidates, low, high, .{ try self.integer("SELECT max_matches FROM retention_policy WHERE id=1;"), 1 }),
                 .validate => {
                     const fenced_max_matches = try self.integer("SELECT max_matches FROM retention_policy WHERE id=1;");
@@ -650,8 +636,7 @@ pub fn Methods(comptime Store: type) type {
             if (self.api.changes(self.db) != expected) return error.LoadRepairVerificationFailed;
         }
 
-        // The events table is a foreign-key parent: enforcement off outside the transaction, a checked swap,
-        // then enforcement restored and read back, per SQLite's documented rebuild procedure.
+        // Why: foreign_keys cannot change inside a transaction (sqlite.org foreignkeys.html), so it is turned off first and read back.
         fn swapLoadRepairEvents(self: *Store, progress: Progress) Error!Step {
             try self.exec("PRAGMA foreign_keys=OFF;");
             if (try self.integer("PRAGMA foreign_keys;") != 0) {
@@ -821,6 +806,7 @@ fn backupInteger(db: *anyopaque, sql: [:0]const u8) Error!i64 {
 
 fn verifyBackupFile(path: [:0]const u8, pages: i64, schema: i64) Error!void {
     var handle: ?*anyopaque = null;
+    // Why: SQLITE_OPEN_READONLY, FULLMUTEX and NOFOLLOW (sqlite3.h).
     const opened = sqlite3_open_v2(path, &handle, 0x01 | 0x10000 | 0x01000000, null);
     const db = handle orelse return error.LoadRepairBackupInvalid;
     defer _ = sqlite3_close_v2(db);

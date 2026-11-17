@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Proves a rotated file source is reopened and failures written to the replacement file are banned and confirmed.
+# Holds: A run that shares the init network namespace re-executes itself inside a fresh one, so it never programs the host firewall.
+
 set -euo pipefail
 ORIGINAL_ARGS=("$@")
 
@@ -29,6 +34,7 @@ done
 
 [ "$(id -u)" -eq 0 ] || { echo "e2e: must run as root (enforcing jail needs CAP_NET_ADMIN)" >&2; exit 2; }
 
+# Why: The enforcing jail programs nftables, so the run moves into a private network namespace before the daemon starts.
 if [ "$(readlink /proc/self/ns/net)" = "$(readlink /proc/1/ns/net)" ]; then
   exec unshare --net bash -c 'ip link set lo up; exec bash "$@"' _ "$0" "${ORIGINAL_ARGS[@]}"
 fi

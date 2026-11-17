@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Routes the one executable's arguments to the daemon, the administrative client or an offline tool, and starts the daemon.
+// Holds: The daemon runs only after its configuration loads and validates and the socket directory exists; earlier failures exit nonzero.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -8,42 +10,26 @@ const shared = @import("shared");
 const build_options = @import("build_options");
 const cli = @import("cli");
 
-const log_level = @import("core/log_level.zig");
+const log_level = @import("platform/log_level.zig");
 pub const std_options: std.Options = .{ .log_level = .debug, .logFn = configuredLog };
-pub const panic = if (build_options.diag) std.debug.FullPanic(@import("core/diag_events.zig").panic) else std.debug.FullPanic(std.debug.defaultPanic);
+pub const panic = if (build_options.diag) std.debug.FullPanic(@import("diag/diag_events.zig").panic) else std.debug.FullPanic(std.debug.defaultPanic);
 
 fn configuredLog(comptime level: std.log.Level, comptime scope: @Type(.enum_literal), comptime format: []const u8, args: anytype) void {
     if (!log_level.enabled(level)) return;
-    @import("core/log_target.zig").logFn(level, scope, format, args);
+    @import("platform/log_target.zig").logFn(level, scope, format, args);
 }
 
-pub const event_loop_mod = @import("core/event_loop.zig");
-pub const journald_source_mod = @import("core/journald_source.zig");
-pub const parser_mod = @import("core/parser.zig");
-pub const state_mod = @import("core/state.zig");
-pub const native_store_mod = @import("core/record_store.zig");
+pub const event_loop_mod = @import("platform/event_loop.zig");
+pub const native_store_mod = @import("store/store.zig");
 pub const firewall_scope_mod = @import("firewall/scope.zig");
-pub const native_action_outcome_mod = @import("core/native_action_outcome.zig");
-pub const native_effect_mod = @import("core/native_effect.zig");
+pub const native_action_outcome_mod = @import("effect/action_outcome.zig");
+pub const native_effect_mod = @import("effect/effect.zig");
 pub const firewall = @import("firewall/backend.zig");
-pub const config_mod = @import("config/native.zig");
-pub const fail2ban_mod = @import("config/fail2ban.zig");
+pub const config_mod = @import("config/config.zig");
 pub const migration_mod = @import("config/migration.zig");
-pub const migration_inspect_mod = @import("migration/inspect.zig");
 pub const migration_snapshot_mod = @import("migration/sqlite_snapshot.zig");
 pub const migration_fixture_mod = @import("migration/fail2ban_fixture.zig");
-pub const migrate_cli_mod = @import("cli/migrate.zig");
-pub const rule_test_cli_mod = @import("cli/rule_test.zig");
 pub const cli_mod = cli;
-pub const filter_types_mod = @import("filters/types.zig");
-pub const filter_sshd_mod = @import("filters/sshd.zig");
-pub const filter_nginx_mod = @import("filters/nginx.zig");
-pub const filter_apache_mod = @import("filters/apache.zig");
-pub const filter_mail_mod = @import("filters/mail.zig");
-pub const filter_misc_mod = @import("filters/misc.zig");
-pub const filter_portsentry_mod = @import("filters/portsentry.zig");
-pub const filter_registry_mod = @import("filters/registry.zig");
-pub const ipc_mod = @import("net/ipc.zig");
 
 pub const version = build_options.version;
 
@@ -92,6 +78,7 @@ pub fn classifyEntry(args: []const []const u8) EntryMode {
     return .daemon;
 }
 
+// Does:  Reads the socket path from the default configuration file; null when --socket is given or that file cannot be loaded.
 fn configuredSocket(arena: std.mem.Allocator, args: []const []const u8, stderr: anytype) ?[]const u8 {
     for (args) |a| if (std.mem.eql(u8, a, "--socket")) return null;
     const path = (CliOptions{}).config_path;
@@ -253,7 +240,14 @@ pub fn main() !void {
         },
         .migrate => {
             var arena = std.heap.ArenaAllocator.init(heap);
-            std.process.exit(@import("cli/migrate.zig").run(heap, rest[1..], version, configuredSocket(arena.allocator(), rest, std.io.getStdErr().writer()), std.io.getStdOut().writer(), std.io.getStdErr().writer()).code());
+            std.process.exit(@import("cli/migrate.zig").run(
+                heap,
+                rest[1..],
+                version,
+                configuredSocket(arena.allocator(), rest, std.io.getStdErr().writer()),
+                std.io.getStdOut().writer(),
+                std.io.getStdErr().writer(),
+            ).code());
         },
         .rule_test => std.process.exit(@import("cli/rule_test.zig").run(heap, rest[1..], std.io.getStdOut().writer(), std.io.getStdErr().writer()).code()),
         .repair_source => std.process.exit(@import("cli/repair_source.zig").run(heap, rest[1..], std.io.getStdOut().writer(), std.io.getStdErr().writer()).code()),
@@ -314,7 +308,7 @@ pub fn main() !void {
         ensureSocketDir(cfg.global.socket_path) catch |err| {
             const stderr = std.io.getStdErr().writer();
             try stderr.print("config: cannot prepare socket directory: {s}\n", .{@errorName(err)});
-            @import("native_daemon.zig").logSandboxHint(err, cfg.global.socket_path, .socket);
+            @import("daemon/daemon.zig").logSandboxHint(err, cfg.global.socket_path, .socket);
             std.process.exit(shared.ExitClass.rejected.code());
         };
     }
@@ -392,7 +386,7 @@ fn failClosed(err: anytype, comptime fmt: []const u8, args: anytype) @TypeOf(err
     switch (any) {
         error.OutOfMemory => return err,
         else => {
-            if (@import("native_daemon.zig").log_sink) |sink| sink.drain();
+            if (@import("daemon/daemon.zig").log_sink) |sink| sink.drain();
             std.process.exit(shared.ExitClass.rejected.code());
         },
     }
@@ -401,7 +395,7 @@ fn failClosed(err: anytype, comptime fmt: []const u8, args: anytype) @TypeOf(err
 fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config, config_path: []const u8) !void {
     const level = std.meta.stringToEnum(std.log.Level, @tagName(cfg.global.log_level)) orelse .info;
     log_level.set(level);
-    const log_target = @import("core/log_target.zig");
+    const log_target = @import("platform/log_target.zig");
     var sink: ?log_target.Sink = null;
     defer if (sink) |*value| {
         log_target.install(null);
@@ -415,13 +409,14 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config, config_path
             std.log.err("log target '{s}' unusable: {s}; refusing to start", .{ cfg.global.log_target, @errorName(err) });
             std.process.exit(shared.ExitClass.rejected.code());
         };
-        @import("native_daemon.zig").log_sink = &sink.?;
+        @import("daemon/daemon.zig").log_sink = &sink.?;
         log_target.install(&sink.?);
     }
-    return @import("native_daemon.zig").run(heap, cfg, config_path) catch |err|
+    return @import("daemon/daemon.zig").run(heap, cfg, config_path) catch |err|
         failClosed(err, "native: startup failed: {s}; refusing to start", .{@errorName(err)});
 }
 
+// Why: TMPFS_MAGIC from linux/magic.h, the f_type statfs(2) reports for tmpfs.
 const tmpfs_magic: i64 = 0x01021994;
 
 fn stateDirIsVolatile(state_file: []const u8, fs_magic: ?i64) bool {
@@ -437,6 +432,7 @@ fn fsMagicOfDir(dir: []const u8) ?i64 {
     var statfs_buf: [256]u8 align(8) = undefined;
     const rc = linux.syscall2(.statfs, @intFromPtr(&path_buf), @intFromPtr(&statfs_buf));
     if (linux.E.init(rc) != .SUCCESS) return null;
+    // Why: f_type is the first field of struct statfs and is a kernel long (asm-generic/statfs.h).
     return @as(i64, std.mem.bytesToValue(c_long, statfs_buf[0..@sizeOf(c_long)]));
 }
 

@@ -6,7 +6,7 @@ omission. `run.py --list` lists selections; `--preflight` checks inputs without
 starting a process or creating the work directory.
 
 Python 3.11+ is harness tooling only. The product remains Zig with embedded SQLite.
-These adapters preserve the BUG-075/R3 scenarios formerly kept in lab scratch
+These adapters preserve the load incident scenarios formerly kept in lab scratch
 scripts: enforcement=B1, restart=B2, notify=B4, source-repair=B3, counters=B8,
 backend=B6, load=B5. The raw nftables oracle remains in `../load_repro/`.
 
@@ -86,7 +86,7 @@ preset is 3 new subjects/s, a hot subject every 2s, 600s bans, 1800s load and 90
 drain. `--plumbing` selects a short mechanics-only exercise, clearly labelled;
 it cannot satisfy the full performance requirement.
 
-BUG-079 remains open: the R3 workload retained all subjects but failed the 5s p95
+One failure remains open: the load workload retained all subjects but failed the 5s p95
 latency requirement. An expected failure still returns nonzero. The evaluator
 bounds latency from the preceding absence to completion of first presence;
 ambiguous samples are incomplete. Resource ceilings remain 150MiB RSS and 272MiB

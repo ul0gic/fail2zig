@@ -70,6 +70,16 @@ A change is restart-only:
 reports
 .BR restart_required .
 .TP
+.B log_target
+String.
+.B stderr
+or an absolute path to a log file. With a file target the daemon reopens the
+file on
+.BR SIGUSR1 ,
+so a log rotation tool can move the old file away and signal the daemon. A
+change is restart-only. Default:
+.IR stderr .
+.TP
 .B pid_file
 String (absolute path). Deprecated compatibility key; an explicit setting logs
 a warning and no PID file is created. This setting can be omitted; no replacement
@@ -93,8 +103,7 @@ Mode 0660; group
 if that group exists.
 .TP
 .B websocket_max_clients
-Integer (1–1024). Accepted and range-checked, with no effect: this release
-serves no WebSocket stream. Default: 16.
+Integer. Deprecated: accepted and ignored with a warning. Remove it from the file.
 .TP
 .B state_file
 String (absolute path). Durable SQLite database containing source positions,
@@ -208,9 +217,7 @@ The server exposes
 and
 .IR /api/health .
 .I /api/bans
-returns 403 and
-.I /events
-returns 400, because this release serves no WebSocket stream.
+returns 403.
 0 is rejected; it does not disable the endpoint. Use
 .BR "metrics_enabled = false" .
 .TP
@@ -271,6 +278,44 @@ shows
 .IR "Protection: DEGRADED (cause)" .
 Default:
 .IR fail-closed .
+.TP
+.B dns_server
+String (IP address literal). Optional. The resolver used by native rules that
+resolve a host name. Resolution is bounded and is never an arbitrary command.
+Unset by default.
+.TP
+.B dns_port
+Integer (1\(en65535). Port of
+.BR dns_server .
+It must stay 53 unless
+.B dns_server
+is set. Default: 53.
+.TP
+.B timezone_root
+String (absolute path). Directory holding the time zone database read for a
+jail's named
+.BR timezone .
+Default:
+.IR /usr/share/zoneinfo .
+.TP
+.B native_ingestion
+Boolean. Must be true;
+.B false
+fails validation with
+.BR NativeIngestionRequired .
+Default: true.
+.TP
+.B compatibility_manifest
+String, written by the migration tools, not by hand. It blocks nothing by
+itself; see
+.BR compatibility_pending .
+.TP
+.B compatibility_pending
+Boolean, written by the migration tools, not by hand. While it is true, every
+enabled jail fails validation with
+.BR CompatibilityNotAdmitted .
+Resolve the import through the migration workflow; do not set it to false by
+hand to force an unsupported imported jail into service. Default: false.
 .
 .SH DEFAULTS SECTION
 All keys in this section apply to every jail unless overridden in the
@@ -535,6 +580,15 @@ or
 Default:
 .IR linear .
 .TP
+.B bantime_increment_scope
+String.
+.B per-jail
+counts a source's earlier confirmed bans in this jail only;
+.B overall
+counts them across every jail, so a source banned by one jail escalates faster
+in the others. Default:
+.IR per-jail .
+.TP
 .B bantime_increment_max_bantime
 Integer seconds or a quoted duration. Cap on escalated ban durations.
 Minimum: 1. Default: 604800 (7 days).
@@ -676,6 +730,51 @@ warned about but are not fatal — they may appear after the daemon starts.
 .B source
 Overrides defaults.source. Journald and internal jails do not need logpath.
 .TP
+.B timestamp
+String. How each line of a file source carries its time:
+.BR iso8601 ,
+.BR syslog ,
+.BR epoch_seconds ,
+.B common_log
+or
+.BR undated .
+A jail that reads files must set it; choose it for the actual log format, since
+a line whose time does not parse under the chosen value is rejected and never
+counted. Journal sources take their time from the journal and do not use it.
+.TP
+.B timezone_offset_minutes
+Integer (\-1439 to 1439). Fixed offset from UTC applied to timestamps that carry
+no zone of their own (for example
+.BR syslog ).
+Cannot be combined with
+.BR timezone .
+.TP
+.B timezone
+String. A named time zone such as
+.IR Europe/Berlin ,
+read from
+.B timezone_root
+in the global section, applied to timestamps that carry no zone of their own.
+Cannot be combined with
+.BR timezone_offset_minutes .
+.TP
+.B timezone_ambiguity
+String.
+.BR reject ,
+.B earlier
+or
+.BR later :
+what to do with a local time that occurs twice when clocks go back. Requires
+.BR timezone .
+Default:
+.IR reject .
+.TP
+.B compatibility_pending
+Boolean, written by the migration tools, not by hand. While it is true and the
+jail is enabled, validation fails with
+.BR CompatibilityNotAdmitted .
+The same key in the global section applies to every enabled jail. Default: false.
+.TP
 .B maxretry
 Optional integer (1–128). Overrides
 .B defaults.maxretry
@@ -782,7 +881,7 @@ prints
 .BI on_truncation= value
 on the summary line of each file jail.
 .TP
-.B bantime_increment_enabled , bantime_increment_multiplier , bantime_increment_factor , bantime_increment_formula , bantime_increment_max_bantime , bantime_increment_jitter , bantime_increment_decay
+.B bantime_increment_enabled , bantime_increment_multiplier , bantime_increment_factor , bantime_increment_formula , bantime_increment_scope , bantime_increment_max_bantime , bantime_increment_jitter , bantime_increment_decay
 Per-jail values take precedence over
 .B [defaults]
 values; jails without an explicit setting inherit from defaults.

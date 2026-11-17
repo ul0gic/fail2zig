@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Proves the daemon's sd_notify sequence, signal handling, log reopen and startup refusals by running the built executable.
+// Holds: Lifecycle claims come from datagrams on a private NOTIFY_SOCKET, and a notification that must not be sent fails expectSilence.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const posix = std.posix;
 const linux = std.os.linux;
 const harness = @import("harness.zig");
@@ -26,6 +27,7 @@ const Paths = struct {
         errdefer a.free(log_target);
         const notify = try std.fmt.allocPrint(a, "{s}/notify", .{h.tmp_abs});
         errdefer a.free(notify);
+        // Why: sockaddr_un.sun_path holds 108 bytes including the terminating NUL (unix(7)), so a longer notify path cannot bind.
         if (notify.len >= 108) return error.SkipZigTest;
         try std.fs.cwd().makePath(state_dir);
         return .{ .state_dir = state_dir, .state_file = state_file, .log_target = log_target, .notify = notify };
@@ -130,6 +132,7 @@ const NotifyReceiver = struct {
                 else => return err,
             };
             const message = buf[0..n];
+            // Why: EXTEND_TIMEOUT_USEC and STATUS messages are skipped so they cannot break the expected READY, RELOADING, STOPPING order.
             if (std.mem.startsWith(u8, message, "EXTEND_TIMEOUT_USEC=") or std.mem.startsWith(u8, message, "STATUS=")) continue;
             return message;
         }
@@ -224,6 +227,7 @@ fn waitStorageHealthy(h: *harness.Harness, timeout_ns: u64) !void {
     return error.TimedOut;
 }
 
+// Holds: READY=1 fails the case with ReadyBeforeAdmission unless storage was seen healthy first or is healthy when READY arrives.
 fn waitReadyAfterAdmission(h: *harness.Harness, rx: NotifyReceiver) !void {
     var buf: [256]u8 = undefined;
     var timer = try std.time.Timer.start();
@@ -455,7 +459,7 @@ fn expectRefusal(a: std.mem.Allocator, fx: *Fixture, stderr_needle: []const u8) 
     try expectNoSocket(&fx.h);
 }
 
-test "lifecycle: BUG-026 startup refusal reaches the file log before exit" {
+test "lifecycle: startup refusal reaches the file log before exit" {
     const a = t.allocator;
     var fx = try Fixture.init(a);
     defer fx.deinit(a);

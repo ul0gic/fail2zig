@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Handles the diagnostic clock command: shows, re-rates or steps the daemon's virtual clock.
+// Holds: The rate never changes while kernel elements are installed, and step mode is refused under a live enforcement backend.
+
 const std = @import("std");
 const shared = @import("shared");
-const clock_mod = @import("../core/clock.zig");
+const clock_mod = @import("../time/clock.zig");
 
 const Request = struct {
     op: enum { show, rate, advance },
@@ -22,6 +25,7 @@ pub fn handle(clock: *clock_mod.VirtualClock, effects_live: bool, installed_live
         .rate => {
             const next = request.rate orelse return refuse(a, 400, "rate requires an integer 0..{d}", .{clock_mod.VirtualClock.max_rate});
             if (next > clock_mod.VirtualClock.max_rate) return refuse(a, 400, "rate {d} out of range 0..{d}", .{ next, clock_mod.VirtualClock.max_rate });
+            // Why: Re-sending the current rate changes nothing and must succeed even while elements are installed.
             if (next != clock.rate()) {
                 if (next == 0 and effects_live) return refuse(a, 409, "step mode refused: a kernel enforcement backend is active; step mode needs log-only jails", .{});
                 if (installed_live != 0) return refuse(a, 409, "rate change refused: {d} kernel elements installed; retry after they expire", .{installed_live});

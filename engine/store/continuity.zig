@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Records source continuity-loss events, keeping the newest 256 per path, and resets or retires source checkpoints.
+// Holds: A checkpoint is reset or retired only while its source has no pending receipt, unless that one receipt is discarded with it.
+
 const std = @import("std");
 const build_options = @import("build_options");
-const diag_mod = @import("../core/diag.zig");
-const files = @import("../core/durable_file_source.zig");
+const diag_mod = @import("../diag/diag.zig");
+const files = @import("../source/durable_file_source.zig");
 const store = @import("store.zig");
 const Error = store.Error;
 const Stmt = store.Stmt;

@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Stores runtime ignore entries per jail with an optional expiry, lists them and deletes those that have expired.
+// Holds: An entry is written and read back only as a network with no host bits set, and a jail holds at most 128 entries.
+
 const std = @import("std");
 const types = @import("shared").types;
 const store = @import("store.zig");
@@ -161,7 +164,11 @@ pub fn Methods(comptime Store: type) type {
                     if (count == out.len) return error.StorageLimit;
                     const jail = try rows.boundedBytes(0, max_jail_bytes);
                     if (jail.len == 0) return error.DatabaseFailure;
-                    var item = IgnoreJailCount{ .jail = [_]u8{0} ** max_jail_bytes, .jail_len = @intCast(jail.len), .count = std.math.cast(u16, try rows.signed(1)) orelse return error.DatabaseFailure };
+                    var item = IgnoreJailCount{
+                        .jail = [_]u8{0} ** max_jail_bytes,
+                        .jail_len = @intCast(jail.len),
+                        .count = std.math.cast(u16, try rows.signed(1)) orelse return error.DatabaseFailure,
+                    };
                     @memcpy(item.jail[0..jail.len], jail);
                     out[count] = item;
                     count += 1;
@@ -196,7 +203,11 @@ pub fn Methods(comptime Store: type) type {
                     if (count == out.len) return error.StorageLimit;
                     const jail = try rows.boundedBytes(0, max_jail_bytes);
                     if (jail.len == 0) return error.DatabaseFailure;
-                    var item = IgnoreJailCount{ .jail = [_]u8{0} ** max_jail_bytes, .jail_len = @intCast(jail.len), .count = std.math.cast(u16, try rows.signed(1)) orelse return error.DatabaseFailure };
+                    var item = IgnoreJailCount{
+                        .jail = [_]u8{0} ** max_jail_bytes,
+                        .jail_len = @intCast(jail.len),
+                        .count = std.math.cast(u16, try rows.signed(1)) orelse return error.DatabaseFailure,
+                    };
                     @memcpy(item.jail[0..jail.len], jail);
                     out[count] = item;
                     count += 1;

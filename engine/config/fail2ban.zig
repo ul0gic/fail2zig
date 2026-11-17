@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Reads fail2ban-format INI configuration: layered .conf and .local files, includes, interpolation, selectors and assets.
+// Holds: A source over 1 MiB or not UTF-8 is refused before parsing, and a repeated option or non-DEFAULT section fails its file.
 
 const std = @import("std");
 
@@ -320,6 +322,7 @@ pub fn interpolate(arena: std.mem.Allocator, ini: *ParsedIni) Error!void {
 }
 
 fn expandValue(arena: std.mem.Allocator, ini: *const ParsedIni, section_name: []const u8, src: []const u8, depth: usize, self_key: []const u8) Error![]const u8 {
+    // Why: A reference chain deeper than max_interp_depth is reported as a cycle, which keeps this recursion bounded.
     if (depth >= max_interp_depth) return error.InterpolationCycle;
     var out = std.ArrayListUnmanaged(u8){};
     _ = self_key;
@@ -341,6 +344,7 @@ fn expandValue(arena: std.mem.Allocator, ini: *const ParsedIni, section_name: []
                 const prefix = name[0..slash];
                 const option = name[slash + 1 ..];
                 if (std.mem.eql(u8, prefix, "known")) {
+                    // Why: known/<option> takes an explicit known/ key, else the value this section held before a later layer overrode it.
                     raw = rawGet(local, name) orelse local.previous.get(option);
                 } else if (!std.mem.eql(u8, prefix, "default")) {
                     const other = ini.section(prefix) orelse return error.InterpolationMissingOption;
@@ -383,6 +387,7 @@ fn mergeInto(
     var sec_it = override.sections.iterator();
     while (sec_it.next()) |entry| {
         const original_name = entry.key_ptr.*;
+        // Why: A conditional header [name?cond] merges into [name] with "?cond" appended to each of its keys.
         const condition = std.mem.indexOfScalar(u8, original_name, '?');
         const name = if (condition) |q| original_name[0..q] else original_name;
         const src_sec = entry.value_ptr;
@@ -461,7 +466,18 @@ fn loadOccurrence(arena: std.mem.Allocator, result: *ParsedIni, root: []const u8
             try mergeInto(arena, result, parsed);
             var digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-            try result.sources.append(arena, .{ .edge = source_edge, .original_path = path, .resolved_target = target, .parent_path = if (stack.items.len > 1) stack.items[stack.items.len - 2] else null, .path = full, .bytes = bytes, .sha256 = digest });
+            try result.sources.append(
+                arena,
+                .{
+                    .edge = source_edge,
+                    .original_path = path,
+                    .resolved_target = target,
+                    .parent_path = if (stack.items.len > 1) stack.items[stack.items.len - 2] else null,
+                    .path = full,
+                    .bytes = bytes,
+                    .sha256 = digest,
+                },
+            );
         }
         if (try resolve(arena, &parsed, "INCLUDES", edge)) |value| {
             var lines = std.mem.splitScalar(u8, value, '\n');
@@ -544,444 +560,12 @@ fn stringLessThan(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.order(u8, a, b) == .lt;
 }
 
-pub const TranslatedPattern = struct {
-    original: []const u8,
-    pattern: []const u8,
-};
-
-pub const ParsedFilter = struct {
-    failregex: []const TranslatedPattern = &.{},
-    ignoreregex: []const TranslatedPattern = &.{},
-    warnings: []const Warning = &.{},
-};
-
-pub fn parseFilterSource(
-    arena: std.mem.Allocator,
-    source_label: []const u8,
-    src: []const u8,
-) Error!ParsedFilter {
-    var ini = try parseIniSource(arena, source_label, src);
-    try interpolate(arena, &ini);
-
-    var warnings = std.ArrayListUnmanaged(Warning){};
-    errdefer warnings.deinit(arena);
-
-    const def_sec = findSectionCaseInsensitive(&ini, "Definition");
-
-    var failregex_list = std.ArrayListUnmanaged(TranslatedPattern){};
-    errdefer failregex_list.deinit(arena);
-    var ignoreregex_list = std.ArrayListUnmanaged(TranslatedPattern){};
-    errdefer ignoreregex_list.deinit(arena);
-
-    if (def_sec) |sec| {
-        if (sec.get("failregex")) |raw| {
-            try translatePatternList(arena, source_label, raw, &failregex_list, &warnings);
-        }
-        if (sec.get("ignoreregex")) |raw| {
-            try translatePatternList(arena, source_label, raw, &ignoreregex_list, &warnings);
-        }
-    } else {
-        try appendWarningList(arena, &warnings, source_label, 0, "filter has no [Definition] section");
-    }
-
-    for (ini.warnings.items) |w| try warnings.append(arena, w);
-
-    return .{
-        .failregex = try failregex_list.toOwnedSlice(arena),
-        .ignoreregex = try ignoreregex_list.toOwnedSlice(arena),
-        .warnings = try warnings.toOwnedSlice(arena),
-    };
-}
-
-pub fn parseFilterFile(
-    arena: std.mem.Allocator,
-    path: []const u8,
-) Error!ParsedFilter {
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return error.FileNotFound,
-        error.AccessDenied => return error.AccessDenied,
-        else => return error.ReadFailed,
-    };
-    defer file.close();
-    const bytes = file.readToEndAlloc(arena, max_file_bytes) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.FileTooBig => return error.FileTooLarge,
-        else => return error.ReadFailed,
-    };
-    return parseFilterSource(arena, path, bytes);
-}
-
-fn appendWarningList(
-    arena: std.mem.Allocator,
-    list: *std.ArrayListUnmanaged(Warning),
-    source_label: []const u8,
-    line_no: u32,
-    message: []const u8,
-) Error!void {
-    try list.append(arena, .{
-        .source = try arena.dupe(u8, source_label),
-        .line = line_no,
-        .message = try arena.dupe(u8, message),
-    });
-}
-
-fn findSectionCaseInsensitive(ini: *const ParsedIni, name: []const u8) ?*const Section {
-    var it = ini.sections.iterator();
-    while (it.next()) |e| {
-        if (asciiEqlIgnoreCase(e.key_ptr.*, name)) return e.value_ptr;
-    }
-    return null;
-}
-
-fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        const la = std.ascii.toLower(ca);
-        const lb = std.ascii.toLower(cb);
-        if (la != lb) return false;
-    }
-    return true;
-}
-
-fn translatePatternList(
-    arena: std.mem.Allocator,
-    source_label: []const u8,
-    raw: []const u8,
-    out: *std.ArrayListUnmanaged(TranslatedPattern),
-    warn: *std.ArrayListUnmanaged(Warning),
-) Error!void {
-    var it = std.mem.splitScalar(u8, raw, '\n');
-    while (it.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t");
-        if (trimmed.len == 0) continue;
-
-        const translated = translatePythonRegex(arena, trimmed) catch |err| switch (err) {
-            error.UnsupportedRegex => {
-                try appendWarningList(arena, warn, source_label, 0, "unsupported regex feature; pattern skipped");
-                continue;
-            },
-            else => return err,
-        };
-
-        if (!std.mem.containsAtLeast(u8, translated, 1, "<IP>")) {
-            try appendWarningList(arena, warn, source_label, 0, "translated pattern has no <IP> token; skipped");
-            continue;
-        }
-
-        try out.append(arena, .{
-            .original = try arena.dupe(u8, trimmed),
-            .pattern = translated,
-        });
-    }
-}
-
-pub fn translatePythonRegex(
-    arena: std.mem.Allocator,
-    regex: []const u8,
-) Error![]const u8 {
-    var out = std.ArrayListUnmanaged(u8){};
-    errdefer out.deinit(arena);
-    try out.ensureTotalCapacity(arena, regex.len);
-
-    var i: usize = 0;
-    while (i < regex.len) {
-        const c = regex[i];
-
-        if (c == '^' or c == '$') {
-            i += 1;
-            continue;
-        }
-
-        if (c == '\\') {
-            if (i + 1 >= regex.len) return error.UnsupportedRegex;
-            const nxt = regex[i + 1];
-            switch (nxt) {
-                's', 'S' => {
-                    try appendWildcard(&out, arena);
-                    i += 2;
-                    continue;
-                },
-                'w', 'W' => {
-                    try appendWildcard(&out, arena);
-                    i += 2;
-                    continue;
-                },
-                'd' => {
-                    if (tryConsumeIpv4Literal(regex, i)) |consumed| {
-                        try out.appendSlice(arena, "<IP>");
-                        i = consumed;
-                        continue;
-                    }
-                    try appendWildcard(&out, arena);
-                    i += 2;
-                    if (i < regex.len and isQuantifier(regex[i])) i += 1;
-                    continue;
-                },
-                'D' => {
-                    try appendWildcard(&out, arena);
-                    i += 2;
-                    continue;
-                },
-                '.', '+', '*', '?', '(', ')', '[', ']', '{', '}', '|', '^', '$', '\\', '/', ' ', '\t', '-', '#', '"', '\'' => {
-                    try out.append(arena, nxt);
-                    i += 2;
-                    continue;
-                },
-                'n' => {
-                    try out.append(arena, '\n');
-                    i += 2;
-                    continue;
-                },
-                't' => {
-                    try out.append(arena, '\t');
-                    i += 2;
-                    continue;
-                },
-                '1'...'9' => return error.UnsupportedRegex,
-                else => {
-                    try out.append(arena, nxt);
-                    i += 2;
-                    continue;
-                },
-            }
-        }
-
-        if (c == '(') {
-            if (i + 2 < regex.len and regex[i + 1] == '?') {
-                const p = regex[i + 2];
-                if (p == '=' or p == '!' or p == '(') return error.UnsupportedRegex;
-                if (p == '<' and i + 3 < regex.len) {
-                    const q = regex[i + 3];
-                    if (q == '=' or q == '!') return error.UnsupportedRegex;
-                }
-            }
-
-            if (findHostInGroup(regex[i..])) |host_end| {
-                try out.appendSlice(arena, "<IP>");
-                i += host_end;
-                continue;
-            }
-
-            const end = findMatchingParen(regex, i) orelse return error.UnsupportedRegex;
-            const inner_start = innerGroupStart(regex, i);
-            const inner = regex[inner_start..end];
-            const inner_translated = try translatePythonRegex(arena, inner);
-            if (std.mem.indexOfScalar(u8, inner, '|') != null) {
-                try appendWildcard(&out, arena);
-            } else {
-                try out.appendSlice(arena, inner_translated);
-            }
-            i = end + 1;
-            if (i < regex.len and isQuantifier(regex[i])) {
-                try appendWildcard(&out, arena);
-                i += 1;
-            }
-            continue;
-        }
-
-        if (c == '[') {
-            const end = std.mem.indexOfScalarPos(u8, regex, i + 1, ']') orelse return error.UnsupportedRegex;
-            i = end + 1;
-            try appendWildcard(&out, arena);
-            if (i < regex.len and isQuantifier(regex[i])) i += 1;
-            continue;
-        }
-
-        if (c == '.') {
-            try appendWildcard(&out, arena);
-            i += 1;
-            if (i < regex.len and isQuantifier(regex[i])) i += 1;
-            continue;
-        }
-
-        if (c == '<') {
-            const close = std.mem.indexOfScalarPos(u8, regex, i + 1, '>') orelse return error.UnsupportedRegex;
-            const name = regex[i + 1 .. close];
-            if (asciiEqlIgnoreCase(name, "HOST")) {
-                try out.appendSlice(arena, "<IP>");
-            } else if (asciiEqlIgnoreCase(name, "IP")) {
-                try out.appendSlice(arena, "<IP>");
-            } else if (asciiEqlIgnoreCase(name, "TIMESTAMP")) {
-                try out.appendSlice(arena, "<TIMESTAMP>");
-            } else {
-                try appendWildcard(&out, arena);
-            }
-            i = close + 1;
-            continue;
-        }
-
-        if (c == '*' or c == '+' or c == '?') {
-            i += 1;
-            continue;
-        }
-
-        try out.append(arena, c);
-        i += 1;
-    }
-
-    return try out.toOwnedSlice(arena);
-}
-
-fn isQuantifier(c: u8) bool {
-    return c == '*' or c == '+' or c == '?';
-}
-
-fn appendWildcard(out: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) Error!void {
-    const items = out.items;
-    if (items.len >= 3 and std.mem.eql(u8, items[items.len - 3 ..], "<*>")) return;
-    try out.appendSlice(arena, "<*>");
-}
-
-fn tryConsumeIpv4Literal(regex: []const u8, start: usize) ?usize {
-    const canonical = "\\d+\\.\\d+\\.\\d+\\.\\d+";
-    if (start + canonical.len > regex.len) return null;
-    if (!std.mem.eql(u8, regex[start .. start + canonical.len], canonical)) return null;
-    return start + canonical.len;
-}
-
-fn findHostInGroup(slice: []const u8) ?usize {
-    var i: usize = 1;
-    if (i < slice.len and slice[i] == '?') {
-        i += 1;
-        if (i < slice.len and slice[i] == 'P') {
-            i += 1;
-            if (i >= slice.len or slice[i] != '<') return null;
-            i += 1;
-            while (i < slice.len and slice[i] != '>') : (i += 1) {}
-            if (i >= slice.len) return null;
-            i += 1;
-        } else if (i < slice.len and slice[i] == ':') {
-            i += 1;
-        } else return null;
-    }
-    const host_tok = "<HOST>";
-    if (i + host_tok.len > slice.len) return null;
-    if (!std.mem.eql(u8, slice[i .. i + host_tok.len], host_tok)) return null;
-    i += host_tok.len;
-    if (i >= slice.len or slice[i] != ')') return null;
-    return i + 1;
-}
-
-fn findMatchingParen(regex: []const u8, open_idx: usize) ?usize {
-    var depth: usize = 0;
-    var i: usize = open_idx;
-    while (i < regex.len) : (i += 1) {
-        const c = regex[i];
-        if (c == '\\' and i + 1 < regex.len) {
-            i += 1;
-            continue;
-        }
-        if (c == '(') depth += 1;
-        if (c == ')') {
-            depth -= 1;
-            if (depth == 0) return i;
-        }
-    }
-    return null;
-}
-
-fn innerGroupStart(regex: []const u8, open_idx: usize) usize {
-    var i = open_idx + 1;
-    if (i < regex.len and regex[i] == '?') {
-        i += 1;
-        if (i < regex.len and regex[i] == ':') {
-            i += 1;
-        } else if (i < regex.len and regex[i] == 'P') {
-            i += 1;
-            if (i < regex.len and regex[i] == '<') {
-                i += 1;
-                while (i < regex.len and regex[i] != '>') : (i += 1) {}
-                if (i < regex.len) i += 1;
-            }
-        }
-    }
-    return i;
-}
-
 pub const ActionBackend = enum {
     nftables,
     iptables,
     ipset,
     log_only,
 };
-
-pub const ParsedAction = struct {
-    name: []const u8,
-    backend: ActionBackend,
-    actionstart: []const u8 = "",
-    actionstop: []const u8 = "",
-    actionban: []const u8 = "",
-    actionunban: []const u8 = "",
-    actioncheck: []const u8 = "",
-    warnings: []const Warning = &.{},
-};
-
-pub fn parseActionSource(
-    arena: std.mem.Allocator,
-    action_name: []const u8,
-    src: []const u8,
-) Error!ParsedAction {
-    var ini = try parseIniSource(arena, action_name, src);
-    try interpolate(arena, &ini);
-
-    var warnings = std.ArrayListUnmanaged(Warning){};
-    errdefer warnings.deinit(arena);
-
-    const backend = mapActionNameToBackend(action_name);
-    if (backend == .log_only) {
-        try appendWarningList(
-            arena,
-            &warnings,
-            action_name,
-            0,
-            "action name not recognized; mapped to log-only backend",
-        );
-    }
-
-    const def_sec = findSectionCaseInsensitive(&ini, "Definition");
-    var result = ParsedAction{
-        .name = try arena.dupe(u8, action_name),
-        .backend = backend,
-    };
-
-    if (def_sec) |sec| {
-        if (sec.get("actionstart")) |v| result.actionstart = v;
-        if (sec.get("actionstop")) |v| result.actionstop = v;
-        if (sec.get("actionban")) |v| result.actionban = v;
-        if (sec.get("actionunban")) |v| result.actionunban = v;
-        if (sec.get("actioncheck")) |v| result.actioncheck = v;
-    } else {
-        try appendWarningList(arena, &warnings, action_name, 0, "action has no [Definition] section");
-    }
-
-    for (ini.warnings.items) |w| try warnings.append(arena, w);
-    result.warnings = try warnings.toOwnedSlice(arena);
-    return result;
-}
-
-pub fn parseActionFile(
-    arena: std.mem.Allocator,
-    path: []const u8,
-) Error!ParsedAction {
-    const basename = std.fs.path.basename(path);
-    const stem = if (std.mem.endsWith(u8, basename, ".conf"))
-        basename[0 .. basename.len - ".conf".len]
-    else
-        basename;
-
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return error.FileNotFound,
-        error.AccessDenied => return error.AccessDenied,
-        else => return error.ReadFailed,
-    };
-    defer file.close();
-    const bytes = file.readToEndAlloc(arena, max_file_bytes) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.FileTooBig => return error.FileTooLarge,
-        else => return error.ReadFailed,
-    };
-    return parseActionSource(arena, stem, bytes);
-}
 
 pub fn mapActionNameToBackend(name: []const u8) ActionBackend {
     if (std.mem.startsWith(u8, name, "nftables")) return .nftables;
@@ -1020,6 +604,7 @@ pub fn parseSelector(arena: std.mem.Allocator, input: []const u8) Error!Selector
             const key_start = i;
             while (i < text.len and text[i] != '=' and text[i] != ',' and text[i] != ']') : (i += 1) {}
             if (i == text.len or text[i] != '=') return error.InvalidParameter;
+            // Why: A conditional key such as port?family=inet6 holds its own '=', so the value starts after the next one.
             if (std.mem.indexOfScalar(u8, text[key_start..i], '?') != null) {
                 i += 1;
                 while (i < text.len and text[i] != '=' and text[i] != ',' and text[i] != ']') : (i += 1) {}
@@ -1159,6 +744,7 @@ pub fn combineAsset(arena: std.mem.Allocator, asset: *const ParameterizedAsset, 
     var it = combined.iterator();
     var index: usize = 0;
     while (it.next()) |kv| {
+        // Why: Section-qualified keys were added only as expansion sources, so output stops at the keys present before them.
         if (index == output_count) break;
         index += 1;
         const value = try expandTags(arena, &combined, kv.value_ptr.*, condition, 0);
@@ -1179,6 +765,7 @@ fn expandTags(arena: std.mem.Allocator, values: *const std.StringArrayHashMapUnm
                 if (condition.len > 0) {
                     replacement = values.get(try std.fmt.allocPrint(arena, "{s}?{s}", .{ name, condition }));
                 } else {
+                    // Why: Without a condition, a tag that has name?cond variants is left in place for a conditional expansion.
                     var keys = values.iterator();
                     var deferred = false;
                     while (keys.next()) |kv| {
@@ -1230,7 +817,15 @@ pub fn readTypedOption(arena: std.mem.Allocator, ini: *const ParsedIni, section_
     const inherited = if (def) |sec| sec.origins.get(key) else null;
     const origin = own orelse inherited;
     const value = try resolve(arena, ini, section_name, key);
-    var result = ResolvedOption{ .presence = if (own != null) .explicit else if (inherited != null) .derived else .absent, .resolution = .resolved, .value_type = value_type, .raw = if (origin) |o| o.raw else null, .value = fallback, .origin = origin, .default_identity = default_identity };
+    var result = ResolvedOption{
+        .presence = if (own != null) .explicit else if (inherited != null) .derived else .absent,
+        .resolution = .resolved,
+        .value_type = value_type,
+        .raw = if (origin) |o| o.raw else null,
+        .value = fallback,
+        .origin = origin,
+        .default_identity = default_identity,
+    };
     const raw = value orelse return result;
     switch (value_type) {
         .string => result.value = .{ .string = raw },
@@ -1297,7 +892,77 @@ pub fn prepareConfigDocument(arena: std.mem.Allocator, root: []const u8, stem: [
 }
 
 fn normalizeInteger(arena: std.mem.Allocator, raw: []const u8) Error!?[]const u8 {
-    const zeroes = [_]u21{ 0x30, 0x660, 0x6f0, 0x7c0, 0x966, 0x9e6, 0xa66, 0xae6, 0xb66, 0xbe6, 0xc66, 0xce6, 0xd66, 0xde6, 0xe50, 0xed0, 0xf20, 0x1040, 0x1090, 0x17e0, 0x1810, 0x1946, 0x19d0, 0x1a80, 0x1a90, 0x1b50, 0x1bb0, 0x1c40, 0x1c50, 0xa620, 0xa8d0, 0xa900, 0xa9d0, 0xa9f0, 0xaa50, 0xabf0, 0xff10, 0x104a0, 0x10d30, 0x11066, 0x110f0, 0x11136, 0x111d0, 0x112f0, 0x11450, 0x114d0, 0x11650, 0x116c0, 0x11730, 0x118e0, 0x11950, 0x11c50, 0x11d50, 0x11da0, 0x11f50, 0x16a60, 0x16ac0, 0x16b50, 0x1d7ce, 0x1d7d8, 0x1d7e2, 0x1d7ec, 0x1d7f6, 0x1e140, 0x1e2f0, 0x1e4f0, 0x1e950, 0x1fbf0 };
+    // Why: Each entry is the zero of a run of ten Unicode decimal digits (category Nd), so any such digit maps to its ASCII value.
+    const zeroes = [_]u21{
+        0x30,
+        0x660,
+        0x6f0,
+        0x7c0,
+        0x966,
+        0x9e6,
+        0xa66,
+        0xae6,
+        0xb66,
+        0xbe6,
+        0xc66,
+        0xce6,
+        0xd66,
+        0xde6,
+        0xe50,
+        0xed0,
+        0xf20,
+        0x1040,
+        0x1090,
+        0x17e0,
+        0x1810,
+        0x1946,
+        0x19d0,
+        0x1a80,
+        0x1a90,
+        0x1b50,
+        0x1bb0,
+        0x1c40,
+        0x1c50,
+        0xa620,
+        0xa8d0,
+        0xa900,
+        0xa9d0,
+        0xa9f0,
+        0xaa50,
+        0xabf0,
+        0xff10,
+        0x104a0,
+        0x10d30,
+        0x11066,
+        0x110f0,
+        0x11136,
+        0x111d0,
+        0x112f0,
+        0x11450,
+        0x114d0,
+        0x11650,
+        0x116c0,
+        0x11730,
+        0x118e0,
+        0x11950,
+        0x11c50,
+        0x11d50,
+        0x11da0,
+        0x11f50,
+        0x16a60,
+        0x16ac0,
+        0x16b50,
+        0x1d7ce,
+        0x1d7d8,
+        0x1d7e2,
+        0x1d7ec,
+        0x1d7f6,
+        0x1e140,
+        0x1e2f0,
+        0x1e4f0,
+        0x1e950,
+        0x1fbf0,
+    };
     const view = std.unicode.Utf8View.init(raw) catch return null;
     var iter = view.iterator();
     var out = std.ArrayListUnmanaged(u8){};

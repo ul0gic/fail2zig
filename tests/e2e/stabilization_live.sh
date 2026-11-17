@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Proves on an installed unit that config validation flags a deprecated and an unknown key and the daemon refuses a 0666 config.
+# Holds: Teardown on every exit restores the live config bytes, owner and mode and the unit's earlier active state.
 
 set -euo pipefail
 
@@ -132,10 +136,10 @@ systemctl stop "$UNIT" >/dev/null 2>&1 || true
 systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
 [ "$exited" -eq 1 ] || fail "(3) daemon did not exit 2 with a world-writable config (ExecMainStatus=$(systemctl show -p ExecMainStatus --value "$UNIT"))"
 journal_of "$INV_BAD" > "${WORK}/3.journal"
-grep -q "world-writable (mode 0666)" "${WORK}/3.journal" || { sed 's/^/e2e:   /' "${WORK}/3.journal" >&2; fail "(3) journal lacks the SEC-012 cause"; }
+grep -q "world-writable (mode 0666)" "${WORK}/3.journal" || { sed 's/^/e2e:   /' "${WORK}/3.journal" >&2; fail "(3) journal lacks the cause"; }
 grep -q "chmod 0640" "${WORK}/3.journal" || fail "(3) journal lacks the chmod 0640 fix hint"
 assert_no_trace "(3 failed start)" "${WORK}/3.journal"
-pass "(3a) 0666 config → daemon exit 2, SEC-012 cause in journal"
+pass "(3a) 0666 config → daemon exit 2, cause in journal"
 
 systemctl start "$UNIT"
 INV_GOOD="$(current_invocation)"
@@ -150,10 +154,10 @@ sed -E 's#^([[:space:]]*state_file[[:space:]]*=[[:space:]]*).*#\1"/run/fail2zig-
 grep -q '/run/fail2zig-e2e-scratch/state.bin' "$CONF4" || fail "(4) live config has no state_file key to rewrite"
 chmod 0640 "$CONF4"
 validate "$CONF4" "${WORK}/4.out" "${WORK}/4.err" || { cat "${WORK}/4.err" >&2; fail "(4) --validate-config exited non-zero"; }
-grep -q "will not survive" "${WORK}/4.err" || { cat "${WORK}/4.err" >&2; fail "(4) SYS-021 tmpfs/run warning missing"; }
+grep -q "will not survive" "${WORK}/4.err" || { cat "${WORK}/4.err" >&2; fail "(4) tmpfs/run warning missing"; }
 grep -q "/run/fail2zig-e2e-scratch/state.bin" "${WORK}/4.err" || fail "(4) warning does not name the state_file path"
 assert_no_trace "(4)" "${WORK}/4.err"
-pass "(4) state_file under /run → SYS-021 warning names path + consequence"
+pass "(4) state_file under /run → warning names path + consequence"
 
 journal_of "$INV_GOOD" > "${WORK}/5.journal"
 assert_no_trace "(5 healthy start)" "${WORK}/5.journal"

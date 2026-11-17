@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Runs, reports and rolls back a fail2ban migration cutover as steps journalled in the fail2zig state file.
+// Holds: Rollback replaces the source database only while it and the recovery point hash to the plan's snapshot, rechecked before the swap.
 
 const std = @import("std");
 const shared = @import("shared");
 const cli = @import("cli");
-const durable = @import("../core/record_store.zig");
+const durable = @import("../store/store.zig");
 const plan_mod = @import("../migration/plan.zig");
 const journal = @import("../migration/journal.zig");
 const import_mod = @import("../migration/import.zig");
@@ -16,7 +18,6 @@ pub const ExitClass = shared.ExitClass;
 pub const Output = enum { json, table };
 
 pub const run_deadline_ns: u64 = 30 * std.time.ns_per_min;
-pub const step_deadline_ns: u64 = 5 * std.time.ns_per_min;
 pub const quiesce_window_ns: u64 = 2 * std.time.ns_per_s;
 
 pub const Options = struct {
@@ -105,7 +106,15 @@ pub fn runCutover(allocator: std.mem.Allocator, options: Options, stdout: anytyp
             return .rejected;
         };
     defer log.deinit();
-    var ctx = Context{ .allocator = allocator, .store = &store, .loaded = &loaded, .options = &options, .run_id = run_id, .started = std.time.Timer.start() catch return .usage, .stderr_buffer = std.ArrayList(u8).init(allocator) };
+    var ctx = Context{
+        .allocator = allocator,
+        .store = &store,
+        .loaded = &loaded,
+        .options = &options,
+        .run_id = run_id,
+        .started = std.time.Timer.start() catch return .usage,
+        .stderr_buffer = std.ArrayList(u8).init(allocator),
+    };
     defer ctx.stderr_buffer.deinit();
     stderr.print("migrate cutover: run {s}\n", .{&std.fmt.bytesToHex(run_id, .lower)}) catch {};
 
@@ -212,7 +221,10 @@ fn writeReport(report: *const journal.Report, output: Output, stdout: anytype) !
             try stdout.writeAll("\n");
         },
         .table => {
-            try stdout.print("run\t{s}\nstate\t{s}\noutcome\t{s}\ndestination\t{s}\nsource\t{s}\n", .{ &report.run_id_hex, @tagName(report.state), @tagName(report.outcome), @tagName(report.observed_protection.destination), @tagName(report.observed_protection.source) });
+            try stdout.print(
+                "run\t{s}\nstate\t{s}\noutcome\t{s}\ndestination\t{s}\nsource\t{s}\n",
+                .{ &report.run_id_hex, @tagName(report.state), @tagName(report.outcome), @tagName(report.observed_protection.destination), @tagName(report.observed_protection.source) },
+            );
             for (report.steps) |step| try stdout.print("step\t{d}\t{s}\t{s}\n", .{ step.seq, @tagName(step.step), @tagName(step.outcome) });
         },
     }
@@ -238,7 +250,14 @@ fn identityFor(loaded: *const plan_mod.Plan, staging_dir: []const u8) !journal.I
     }
     var source_cfg_fp: [32]u8 = undefined;
     hash.final(&source_cfg_fp);
-    return .{ .host_id = journal.localHostId(), .source_db_fp = source_db_fp, .source_cfg_fp = source_cfg_fp, .plan_fp = loaded.plan_fp orelse return error.PlanFingerprintMissing, .recovery_point = staging_dir, .generation = [_]u8{0} ** 32 };
+    return .{
+        .host_id = journal.localHostId(),
+        .source_db_fp = source_db_fp,
+        .source_cfg_fp = source_cfg_fp,
+        .plan_fp = loaded.plan_fp orelse return error.PlanFingerprintMissing,
+        .recovery_point = staging_dir,
+        .generation = [_]u8{0} ** 32,
+    };
 }
 
 const Control = union(enum) { next, stop: ExitClass };
@@ -251,6 +270,7 @@ fn try_pending_rollback(log: *journal.Journal) bool {
 fn faultAfterIntent(step: journal.Step) void {
     faultNamed(@tagName(step));
 }
+// Does:  Exits with status 137 (128 + SIGKILL) when F2Z_MIGRATE_FAULT names this point, to rehearse resuming an interrupted run.
 fn faultNamed(name: []const u8) void {
     const wanted = std.posix.getenv("F2Z_MIGRATE_FAULT") orelse return;
     if (std.mem.eql(u8, wanted, name)) std.process.exit(137);
@@ -340,7 +360,11 @@ fn executeStep(ctx: *Context, log: *journal.Journal, step: journal.Step, stderr:
                 return err;
             };
             var detail: [128]u8 = undefined;
-            const text = std.fmt.bufPrint(&detail, "owners={d} history={d} expired={d} deduplicated={d}", .{ staging.report.imported_owners, staging.report.imported_history, staging.report.skipped_expired, staging.report.double_count_avoided }) catch "staged";
+            const text = std.fmt.bufPrint(
+                &detail,
+                "owners={d} history={d} expired={d} deduplicated={d}",
+                .{ staging.report.imported_owners, staging.report.imported_history, staging.report.skipped_expired, staging.report.double_count_avoided },
+            ) catch "staged";
             try log.finish(pending, .success, text, .staged, std.time.microTimestamp());
             return .next;
         },
@@ -357,10 +381,19 @@ fn activateThroughDaemon(ctx: *Context, stderr: anytype) !Control {
     defer out.deinit();
     ctx.stderr_buffer.clearRetainingCapacity();
     const hex = std.fmt.bytesToHex(ctx.run_id, .lower);
-    const code = cli.doAdmin(ctx.allocator, .{ .socket_path = ctx.options.socket_path, .timeout_ms = 30_000, .output = .json, .color = false }, out.writer(), ctx.stderr_buffer.writer(), .{ .kind = "migration_activate", .run_id = &hex });
+    const code = cli.doAdmin(
+        ctx.allocator,
+        .{ .socket_path = ctx.options.socket_path, .timeout_ms = 30_000, .output = .json, .color = false },
+        out.writer(),
+        ctx.stderr_buffer.writer(),
+        .{ .kind = "migration_activate", .run_id = &hex },
+    );
     switch (code) {
         .connection_failed => {
-            stderr.print("migrate cutover: staged; the daemon at {s} is not reachable. Start fail2zig, then rerun: fail2zig migrate cutover --run-id {s} ...\n", .{ ctx.options.socket_path, &hex }) catch {};
+            stderr.print(
+                "migrate cutover: staged; the daemon at {s} is not reachable. Start fail2zig, then rerun: fail2zig migrate cutover --run-id {s} ...\n",
+                .{ ctx.options.socket_path, &hex },
+            ) catch {};
             return .{ .stop = .unavailable };
         },
         .client_error => {
@@ -475,7 +508,15 @@ pub fn runRollback(allocator: std.mem.Allocator, options: Options, stdout: anyty
         return .rejected;
     };
     defer log.deinit();
-    var ctx = Context{ .allocator = allocator, .store = &store, .loaded = &loaded, .options = &options, .run_id = run_id, .started = std.time.Timer.start() catch return .usage, .stderr_buffer = std.ArrayList(u8).init(allocator) };
+    var ctx = Context{
+        .allocator = allocator,
+        .store = &store,
+        .loaded = &loaded,
+        .options = &options,
+        .run_id = run_id,
+        .started = std.time.Timer.start() catch return .usage,
+        .stderr_buffer = std.ArrayList(u8).init(allocator),
+    };
     defer ctx.stderr_buffer.deinit();
     const exit = rollbackPhases(&ctx, &log, stderr) catch |err| {
         stderr.print("migrate rollback: {s}; the journal step stays open, inspect and rerun\n", .{@errorName(err)}) catch {};
@@ -500,6 +541,7 @@ const RestorePaths = struct {
         const base = std.fs.path.basename(source);
         var name_buffer: [64]u8 = undefined;
         const recovery = recoveryPointName(&name_buffer, ctx.run_id);
+        // Why: Bytes 15 to 31 are the 16 hex characters that follow the recovery-point- prefix.
         const tag = recovery[15..31];
         return .{
             .source = source,
@@ -530,6 +572,7 @@ fn rollbackPhases(ctx: *Context, log: *journal.Journal, stderr: anytype) !ExitCl
             stderr.print("migrate rollback: step {s} is still open; resume `migrate cutover --run-id` first\n", .{@tagName(open.step)}) catch {};
             return .rejected;
         }
+        // Why: The marker is written only after the swap completes, so its presence means the source is already restored.
         if (RestorePaths.exists(paths.marker)) return releaseDestination(ctx, log, open, stderr);
         return resumeRestore(ctx, log, open, expected, &paths, stderr);
     }
@@ -556,7 +599,10 @@ fn resumeRestore(ctx: *Context, log: *journal.Journal, step: journal.Pending, ex
             try finishSwap(ctx, paths);
             try writeMarker(paths.marker, derived_sha);
             try ctx.store.markMigrationDeltasApplied(ctx.run_id);
-            stderr.print("migrate rollback: completed the interrupted swap; source restored at {s}. Start the source service, verify it protects, then rerun with --source-verified\n", .{paths.source}) catch {};
+            stderr.print(
+                "migrate rollback: completed the interrupted swap; source restored at {s}. Start the source service, verify it protects, then rerun with --source-verified\n",
+                .{paths.source},
+            ) catch {};
             return .unavailable;
         }
         if (RestorePaths.exists(paths.kept)) {
@@ -564,7 +610,10 @@ fn resumeRestore(ctx: *Context, log: *journal.Journal, step: journal.Pending, ex
             return restoreSource(ctx, log, step, expected, paths, stderr);
         }
         try log.finish(step, .rollback_failed, "source missing with no derived or kept file", .failed, std.time.microTimestamp());
-        stderr.print("migrate rollback: {s} is missing and neither the derived nor the kept copy exists; restore the recovery point by hand and release the destination manually\n", .{paths.source}) catch {};
+        stderr.print(
+            "migrate rollback: {s} is missing and neither the derived nor the kept copy exists; restore the recovery point by hand and release the destination manually\n",
+            .{paths.source},
+        ) catch {};
         return .partial;
     }
     const current = sourceFingerprint(ctx) catch |err| {
@@ -600,7 +649,10 @@ fn restoreSource(ctx: *Context, log: *journal.Journal, step: journal.Pending, ex
     };
     if (!std.mem.eql(u8, &source_sha, &expected)) {
         try log.finish(step, .rollback_failed, "source changed since quiescence", .failed, std.time.microTimestamp());
-        stderr.print("migrate rollback: {s} changed since the cutover quiesced it; nothing was written. Inspect it, then restore {s} by hand if that is what you want\n", .{ paths.source, recovery_path }) catch {};
+        stderr.print(
+            "migrate rollback: {s} changed since the cutover quiesced it; nothing was written. Inspect it, then restore {s} by hand if that is what you want\n",
+            .{ paths.source, recovery_path },
+        ) catch {};
         return .partial;
     }
     if (ctx.loaded.doc.selection.len > 64) {
@@ -625,6 +677,7 @@ fn restoreSource(ctx: *Context, log: *journal.Journal, step: journal.Pending, ex
     };
     const original_stat = try std.posix.fstat(original.handle);
     original.close();
+    // Why: The copy stays owner-only until it takes the source's owner and mode once the deltas are written.
     std.fs.copyFileAbsolute(recovery_path, paths.derived, .{ .override_mode = 0o600 }) catch |err| {
         try log.finish(step, .operational_failure, "derived database not written", null, std.time.microTimestamp());
         stderr.print("migrate rollback: cannot write {s}: {s}; free space or fix access and rerun\n", .{ paths.derived, @errorName(err) }) catch {};
@@ -643,7 +696,10 @@ fn restoreSource(ctx: *Context, log: *journal.Journal, step: journal.Pending, ex
                     unsupported += 1;
                     var text: [64]u8 = undefined;
                     const scope = try @import("../firewall/scope.zig").Scope.decode(&delta.scope);
-                    stderr.print("migrate rollback: unsupported delta not carried back: jail {s} scope {s} (protocol/port restricted); re-create it on the source by hand\n", .{ delta.jailName(), try subjectText(&text, scope.subject) }) catch {};
+                    stderr.print(
+                        "migrate rollback: unsupported delta not carried back: jail {s} scope {s} (protocol/port restricted); re-create it on the source by hand\n",
+                        .{ delta.jailName(), try subjectText(&text, scope.subject) },
+                    ) catch {};
                 },
                 .expired, .mapped => {
                     try carryBack(conn, delta, now);
@@ -655,6 +711,7 @@ fn restoreSource(ctx: *Context, log: *journal.Journal, step: journal.Pending, ex
     {
         const derived_file = try std.fs.openFileAbsolute(paths.derived, .{});
         defer derived_file.close();
+        // Why: The derived database reaches disk before the rename below makes it the source.
         try derived_file.sync();
         try derived_file.chown(original_stat.uid, original_stat.gid);
         try derived_file.chmod(@intCast(original_stat.mode & 0o7777));
@@ -678,7 +735,10 @@ fn restoreSource(ctx: *Context, log: *journal.Journal, step: journal.Pending, ex
     };
     try writeMarker(paths.marker, derived_sha);
     try ctx.store.markMigrationDeltasApplied(ctx.run_id);
-    stderr.print("migrate rollback: source database restored at {s} (previous kept at {s}); {d} deltas carried back, {d} unsupported. Start the source service, verify it protects, then run: fail2zig migrate rollback --run-id {s} --source-verified ...\n", .{ paths.source, paths.kept, applied, unsupported, &std.fmt.bytesToHex(ctx.run_id, .lower) }) catch {};
+    stderr.print(
+        "migrate rollback: source database restored at {s} (previous kept at {s}); {d} deltas carried back, {d} unsupported. Start the source service, verify it protects, then run: fail2zig migrate rollback --run-id {s} --source-verified ...\n",
+        .{ paths.source, paths.kept, applied, unsupported, &std.fmt.bytesToHex(ctx.run_id, .lower) },
+    ) catch {};
     if (ctx.options.source_verified) stderr.writeAll("migrate rollback: --source-verified applies to the release invocation only; the source service was just restored and cannot be attested yet\n") catch {};
     return .unavailable;
 }
@@ -686,6 +746,7 @@ fn restoreSource(ctx: *Context, log: *journal.Journal, step: journal.Pending, ex
 fn finishSwap(ctx: *Context, paths: *RestorePaths) !void {
     _ = ctx;
     try std.fs.renameAbsolute(paths.derived, paths.source);
+    // Why: A rename is durable only once its directory is fsynced (fsync(2)).
     const dir_path = std.fs.path.dirname(paths.source) orelse ".";
     const fd = try std.posix.open(dir_path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
     defer std.posix.close(fd);
@@ -695,6 +756,7 @@ fn finishSwap(ctx: *Context, paths: *RestorePaths) !void {
 
 fn moveDatabase(allocator: std.mem.Allocator, from: []const u8, to: []const u8) !void {
     try std.fs.renameAbsolute(from, to);
+    // Why: In WAL mode SQLite keeps uncheckpointed transactions in -wal and its index in -shm beside the database (sqlite.org/wal.html).
     inline for (.{ "-wal", "-shm" }) |suffix| {
         const from_side = try std.fmt.allocPrint(allocator, "{s}{s}", .{ from, suffix });
         defer allocator.free(from_side);
@@ -730,7 +792,13 @@ fn releaseDestination(ctx: *Context, log: *journal.Journal, step: journal.Pendin
     var out = std.ArrayList(u8).init(ctx.allocator);
     defer out.deinit();
     const hex = std.fmt.bytesToHex(ctx.run_id, .lower);
-    const code = cli.doAdmin(ctx.allocator, .{ .socket_path = ctx.options.socket_path, .timeout_ms = 30_000, .output = .json, .color = false }, out.writer(), ctx.stderr_buffer.writer(), .{ .kind = "migration_rollback", .run_id = &hex });
+    const code = cli.doAdmin(
+        ctx.allocator,
+        .{ .socket_path = ctx.options.socket_path, .timeout_ms = 30_000, .output = .json, .color = false },
+        out.writer(),
+        ctx.stderr_buffer.writer(),
+        .{ .kind = "migration_rollback", .run_id = &hex },
+    );
     switch (code) {
         .connection_failed => {
             stderr.print("migrate rollback: the daemon at {s} is not reachable; start it and rerun with --run-id {s} --source-verified\n", .{ ctx.options.socket_path, &hex }) catch {};
@@ -791,7 +859,9 @@ fn carryBack(conn: fail2ban_db.Connection, delta: durable.Store.MigrationDelta, 
         },
         .ban => {
             const timeofban = @divFloor(delta.decided_us, std.time.us_per_s);
+            // Why: Lease kind 2 is permanent, and bantime -1 is the value the import reads back as a permanent ban.
             const bantime: i64 = if (delta.lease_kind == 2) -1 else @max(1, @divFloor((delta.deadline_us orelse now_us) - delta.decided_us, std.time.us_per_s));
+            // Why: bans keeps one row per ban while bips keeps one per address and jail (its primary key), hence INSERT OR REPLACE.
             inline for (.{ "INSERT INTO bans(jail, ip, timeofban, bantime, bancount, data) VALUES(?1, ?2, ?3, ?4, 1, NULL)", "INSERT OR REPLACE INTO bips(jail, ip, timeofban, bantime, bancount, data) VALUES(?1, ?2, ?3, ?4, 1, NULL)" }) |sql| {
                 var stmt = try conn.prepare(sql);
                 defer stmt.finalize();
@@ -815,6 +885,7 @@ fn subjectText(buffer: []u8, subject: anytype) ![]const u8 {
             var stream = std.io.fixedBufferStream(&address_buffer);
             try stream.writer().print("{}", .{v6});
             const written = stream.getWritten();
+            // Why: std.net.Ip6Address formats as [address]:port, so the address is taken from between the brackets.
             const close = std.mem.lastIndexOfScalar(u8, written, ']') orelse return error.InvalidSubject;
             break :blk written[1..close];
         },

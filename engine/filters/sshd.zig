@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Matches OpenSSH sshd authentication failure messages and takes the peer address from them.
+// Holds: Each pattern is anchored at the message start, and a line holding two complete peer candidates matches nothing.
 
 const std = @import("std");
 const shared = @import("shared");
 const types = @import("types.zig");
-const parser = @import("../core/parser.zig");
+const parser = @import("../detect/parser.zig");
 
 pub const PatternDef = types.PatternDef;
 
@@ -88,7 +90,7 @@ fn completeSuffix(text: []const u8, comptime suffix: Suffix) bool {
         const via = peerAt(text, 5, false) orelse return false;
         cursor = via.end;
     }
-    // Authenticating-user events write a peer port; a trailing bare IP is not a peer field.
+    // Why: sshd writes a port after the peer in authenticating-user events, so an address without one is not taken as the peer.
     if (suffix == .authenticating and !std.mem.startsWith(u8, text[cursor..], " port ")) return false;
     if (std.mem.startsWith(u8, text[cursor..], " port ")) {
         cursor = decimalEnd(text, cursor + 6) orelse return false;
@@ -96,8 +98,7 @@ fn completeSuffix(text: []const u8, comptime suffix: Suffix) bool {
     if (suffix == .password or suffix == .maximum) {
         if (std.mem.startsWith(u8, text[cursor..], " ssh1") or std.mem.startsWith(u8, text[cursor..], " ssh2")) cursor += 5;
     }
-    // Auth-info is opaque: it may contain addresses, separators and a fake header.
-    // The outer scan still checks for another complete candidate before accepting.
+    // Why: Text after `: ` is sshd auth info that may hold addresses; the outer scan still refuses a line with two candidates.
     if (suffix == .password and std.mem.startsWith(u8, text[cursor..], ": ")) return true;
     if (std.mem.startsWith(u8, text[cursor..], " [preauth]")) cursor += 10;
     return cursor == text.len;
@@ -109,6 +110,7 @@ fn fieldMatcher(comptime prefix: []const u8, comptime separator: []const u8, com
             const line = if (suffix == .maximum and std.mem.startsWith(u8, input, "error: ")) input[7..] else input;
             if (!std.mem.startsWith(u8, line, prefix)) return null;
             const fields = line[prefix.len..];
+            // Why: Invalid-user lines belong to failed-password-invalid-user, so this pattern never claims one that pattern refused.
             if (comptime std.mem.eql(u8, prefix, "Failed password for ")) {
                 if (std.mem.startsWith(u8, fields, "invalid user ")) return null;
             }
@@ -119,7 +121,7 @@ fn fieldMatcher(comptime prefix: []const u8, comptime separator: []const u8, com
                 cursor = start;
                 const peer = peerAt(fields, start, suffix == .password) orelse continue;
                 if (!completeSuffix(fields[peer.end..], suffix)) continue;
-                // A valid-looking header inside user input cannot win by position.
+                // Why: A username can carry a forged separator and address, so the first candidate does not win by position.
                 if (candidate != null) return null;
                 candidate = peer.ip;
             }
@@ -142,7 +144,7 @@ fn receivedDisconnect(input: []const u8) ?parser.ParseResult {
         if (cursor >= fields.len or fields[cursor] != ':') return null;
         cursor += 1;
     } else {
-        // Old messages delimit the bare peer with colon-space, also for IPv6.
+        // Why: Older sshd messages write the peer with no port and end it with `: `, IPv6 addresses included.
         if (space == 0 or fields[space - 1] != ':') return null;
         ip = exactIp(fields[0 .. space - 1]) orelse return null;
         cursor = space + 1;

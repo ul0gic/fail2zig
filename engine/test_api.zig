@@ -1,18 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
-pub const native_effect_runtime = @import("runtime/native_effect_runtime.zig");
+// Does:  Gathers selected engine runtime, core and firewall modules under one import root for builds outside the daemon.
+// Holds: Nothing reachable from here imports main.zig, daemon/daemon.zig or the cli module, so builds on it link no daemon or client.
+
+pub const native_effect_runtime = @import("runtime/effect_runtime.zig");
 pub const core = struct {
-    pub const durable_file_source = @import("core/durable_file_source.zig");
-    pub const journal_policy = @import("core/journal_policy.zig");
-    pub const native_action_outcome = @import("core/native_action_outcome.zig");
-    pub const native_detection_record = @import("core/native_detection_record.zig");
-    pub const native_effect = @import("core/native_effect.zig");
-    pub const native_effect_history = @import("core/native_effect_history.zig");
-    pub const native_retry = @import("core/native_retry.zig");
-    pub const record_pipeline = @import("core/record_pipeline.zig");
-    pub const record_store = @import("core/record_store.zig");
-    pub const source_record = @import("core/source_record.zig");
-    pub const source_time_policy = @import("core/source_time_policy.zig");
+    pub const durable_file_source = @import("source/durable_file_source.zig");
+    pub const journal_policy = @import("source/journal_policy.zig");
+    pub const native_action_outcome = @import("effect/action_outcome.zig");
+    pub const native_detection_record = @import("detect/detection_record.zig");
+    pub const native_effect = @import("effect/effect.zig");
+    pub const native_effect_history = @import("effect/effect_history.zig");
+    pub const native_retry = @import("detect/retry.zig");
+    pub const record_pipeline = @import("source/record_pipeline.zig");
+    pub const record_store = @import("store/store.zig");
+    pub const source_record = @import("source/source_record.zig");
+    pub const source_time_policy = @import("source/source_time_policy.zig");
 };
 pub const firewall = struct {
     pub const command = @import("firewall/command.zig");

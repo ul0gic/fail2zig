@@ -1,0 +1,54 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
+// Does:  Wraps the sshd built-in detector for journal records, checking each eligible record's journal origin first.
+// Holds: An eligible record whose origin the profile rejects is never matched, and every outcome carries this detector's generation.
+
+const std = @import("std");
+const builtin = @import("builtin_detector.zig");
+const origin = @import("../source/journal_origin.zig");
+const stored = @import("detection_record.zig");
+const time = @import("../source/source_time_policy.zig");
+const records = @import("../source/source_record.zig");
+pub const Detector = struct {
+    base: *const builtin.Detector,
+    profile: origin.Profile,
+    generation: [32]u8,
+    legacy_generation: [32]u8,
+
+    pub fn init(base: *const builtin.Detector, profile: origin.Profile) !Detector {
+        if (!std.mem.eql(u8, base.entry.name, "sshd") or base.body != .whole) return error.UnsupportedJournalDetector;
+        return .{
+            .base = base,
+            .profile = profile,
+            .generation = qualify(base.generation, profile),
+            .legacy_generation = qualify(base.legacy_generation, profile),
+        };
+    }
+    fn qualify(base_generation: [32]u8, profile: origin.Profile) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("fail2zig-native-journal-detection-v1\x00");
+        hash.update(&base_generation);
+        hash.update(&profile.generation);
+        var generation: [32]u8 = undefined;
+        hash.final(&generation);
+        return generation;
+    }
+    pub fn consumer(self: *const Detector) stored.JournalConsumer {
+        return .{ .generation = self.generation, .context = self, .evaluate = consume };
+    }
+    pub fn legacyConsumer(self: *const Detector) stored.JournalConsumer {
+        return .{ .generation = self.legacy_generation, .context = self, .evaluate = consume };
+    }
+    fn consume(decoded: []const u8, fields: ?[]const records.JournalField, admitted: time.Result, context: ?*const anyopaque) !stored.Outcome {
+        const self: *const Detector = @ptrCast(@alignCast(context.?));
+        if (admitted == .eligible) if (self.profile.rejection(fields)) |kind| {
+            const result = stored.Outcome{ .kind = kind, .generation = self.generation, .filter = try stored.Name.init("sshd") };
+            try result.validate(admitted);
+            return result;
+        };
+        const adapter = self.base.consumer();
+        var result = try adapter.evaluate(decoded, admitted, adapter.context);
+        result.generation = self.generation;
+        return result;
+    }
+};

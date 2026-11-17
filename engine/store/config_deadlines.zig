@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Keeps the first-applied time and expiry of each timed ignoreip and banip entry across reloads, and drops unlisted ones.
+// Holds: An entry already stored keeps its original expiry; applying the same entry again never moves its deadline.
+
 const std = @import("std");
 const types = @import("shared").types;
 const store = @import("store.zig");
@@ -9,11 +12,6 @@ const Stmt = store.Stmt;
 pub const ConfigList = enum(u8) {
     ignoreip = 1,
     banip = 2,
-};
-
-pub const ConfigDeadline = struct {
-    first_applied_us: i64,
-    expires_us: i64,
 };
 
 const max_jail_bytes = 64;
@@ -62,6 +60,7 @@ pub fn Methods(comptime Store: type) type {
     return struct {
         pub fn applyConfigDeadlines(self: *Store, list: ConfigList, jail: []const u8, entries: []const types.TimedEntry, now_us: i64, out: []?i64) Error!void {
             if (!validRequest(jail, entries, out.len) or now_us <= 0) return error.InvalidRecord;
+            // Why: Ban list and reload apply deadlines inside their own write transaction, so one is begun only when none is open.
             const own = self.api.get_autocommit(self.db) != 0;
             if (own) try self.beginWrite();
             errdefer if (own) self.rollback();

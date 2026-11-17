@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Proves --validate-config names the key, line, column and jail of a bad config, and that durations reach the daemon as seconds.
+// Holds: Each case runs the built zig-out/bin/fail2zig on a config in a private temp directory and judges only exit code and output.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -49,6 +51,7 @@ fn validateConfig(a: std.mem.Allocator, config_path: []const u8) !Run {
     };
 }
 
+// Does:  Finds an error return trace by its header text or by a stack frame of the form 0x<hex> in <symbol>.
 fn hasErrorReturnTrace(text: []const u8) bool {
     if (std.mem.indexOf(u8, text, "error return trace") != null) return true;
     var i: usize = 0;
@@ -135,6 +138,7 @@ const Fixture = struct {
             \\
             \\
         , .{ self.root, self.root });
+        // Why: Padding lines 14 to 30 are numbered by line, which puts line37 on line 37 of a 40-line file.
         var n: usize = 14;
         while (n <= 30) : (n += 1) try w.print("# padding line {d}\n", .{n});
         try w.print(
@@ -312,7 +316,7 @@ test "integration: --validate-config rejects backend + source in the same jail a
     try expectContains(r.stderr, "InvalidValue (key 'backend' in [jails.sshd])");
 }
 
-test "integration: SYS-021 --validate-config warns when state_file lives under /run" {
+test "integration: --validate-config warns when state_file lives under /run" {
     const a = testing.allocator;
     var fx = try Fixture.init(a);
     defer fx.deinit();
@@ -337,7 +341,7 @@ test "integration: SYS-021 --validate-config warns when state_file lives under /
     try expectContains(r.stderr, "/var/lib/fail2zig");
 }
 
-test "integration: SYS-021 --validate-config stays quiet for a state_file under a persistent dir" {
+test "integration: --validate-config stays quiet for a state_file under a persistent dir" {
     const a = testing.allocator;
     var fx = try Fixture.init(a);
     defer fx.deinit();
@@ -353,7 +357,7 @@ test "integration: SYS-021 --validate-config stays quiet for a state_file under 
     try expectNotContains(r.stderr, "will not survive");
 }
 
-test "integration: ENH-008 --validate-config rejects metrics_port = 0 at line:col with the metrics_enabled hint" {
+test "integration: --validate-config rejects metrics_port = 0 at line:col with the metrics_enabled hint" {
     const a = testing.allocator;
     var fx = try Fixture.init(a);
     defer fx.deinit();
@@ -380,7 +384,7 @@ test "integration: ENH-008 --validate-config rejects metrics_port = 0 at line:co
     try testing.expect(!hasErrorReturnTrace(r.stderr));
 }
 
-test "integration: ENH-007 --validate-config rejects firewall = \"bogus\" in [global] as InvalidValue at line:col, no hint" {
+test "integration: --validate-config rejects firewall = \"bogus\" in [global] as InvalidValue at line:col, no hint" {
     const a = testing.allocator;
     var fx = try Fixture.init(a);
     defer fx.deinit();
@@ -404,7 +408,7 @@ test "integration: ENH-007 --validate-config rejects firewall = \"bogus\" in [gl
     try testing.expect(!hasErrorReturnTrace(r.stderr));
 }
 
-test "integration: ENH-007/008 --validate-config accepts firewall = \"ipset\" + metrics_enabled = false and echoes the forced backend" {
+test "integration: --validate-config accepts firewall = \"ipset\" + metrics_enabled = false and echoes the forced backend" {
     const a = testing.allocator;
     var fx = try Fixture.init(a);
     defer fx.deinit();

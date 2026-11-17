@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Proves the shipped systemd unit starts the daemon with the expected run directory, socket ownership and group-only access.
+# Holds: Expected owners and modes are fixed in the script, and an already active unit is never clobbered without --force.
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)"
@@ -142,7 +147,7 @@ done
 
 [ "$(systemctl is-active "$UNIT")" = "active" ] || fail "service not active"
 NR="$(systemctl show -p NRestarts --value "$UNIT")"
-[ "$NR" = "0" ] || fail "NRestarts=$NR (expected 0 — crash-loop signature of SYS-019)"
+[ "$NR" = "0" ] || fail "NRestarts=$NR (expected 0; a higher count is a crash loop)"
 [ "$ready" -eq 1 ] || fail "service active but IPC never became ready"
 pass "service active (running), NRestarts=0"
 

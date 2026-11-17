@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Lists the built-in patterns for nginx basic-auth failures, request and connection limiting, and bot path probes.
+// Holds: Every error-log pattern reads the address right after `client: `, and the path patterns match only 404 or 403 responses.
 
 const types = @import("types.zig");
-const parser = @import("../core/parser.zig");
+const parser = @import("../detect/parser.zig");
 const access = @import("access.zig");
 
 pub const PatternDef = types.PatternDef;

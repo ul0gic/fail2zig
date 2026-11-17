@@ -1,0 +1,116 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
+// Does:  Builds the journald detection plan for one jail: origin profile, ignore set, built-in detector and processing options.
+// Holds: A disabled, unadmitted or non-journald jail, or a record or decoded limit over 64 KiB, is refused before any allocation.
+
+const std = @import("std");
+const config = @import("config.zig");
+const builtin = @import("../detect/builtin_detector.zig");
+const journal = @import("../detect/journal_detector.zig");
+const origin = @import("../source/journal_origin.zig");
+const session = @import("../source/journal_session.zig");
+const processing = @import("../source/source_processor.zig");
+const transport = @import("../source/journal_transport.zig");
+const ignore_set = @import("../detect/ignore_set.zig");
+pub const Settings = struct {
+    machine_id: []const u8,
+    executables: []const []const u8,
+    journal: transport.Options = .{},
+    source_id: []const u8 = "system-journal",
+    ignore_capacity: usize,
+    custom: bool = false,
+    max_record_bytes: u32 = 2048,
+    max_decoded_bytes: u32 = 2048,
+};
+pub const Plan = struct {
+    allocator: std.mem.Allocator,
+    base: ?builtin.Detector,
+    ignore_cell: ?**ignore_set.EffectiveIgnore,
+    qualified: ?journal.Detector,
+    profile: origin.Profile,
+    owned_executables: [][]const u8,
+    processing: processing.Options,
+    journal: transport.Options,
+    source_id: []const u8,
+
+    pub fn create(a: std.mem.Allocator, cfg: *const config.Config, jail_index: usize, parent: [32]u8, settings: Settings) !*Plan {
+        if (jail_index >= cfg.jails.len) return error.UnknownJail;
+        const jail = &cfg.jails[jail_index];
+        if (!jail.enabled) return error.DisabledJail;
+        if (jail.name.len == 0 or jail.name.len > 64 or std.mem.indexOfScalar(u8, jail.name, 0) != null) return error.InvalidJail;
+        if (cfg.global.compatibility_pending or jail.compatibility_pending) return error.CompatibilityNotAdmitted;
+        const source = if (jail.source == .auto) cfg.defaults.source else jail.source;
+        if (source == .auto) return error.SourceSelectionRequired;
+        if (source != .journald) return error.InvalidJournalSource;
+        if (settings.source_id.len == 0 or settings.source_id.len > 512 or std.mem.indexOfScalar(u8, settings.source_id, 0) != null) return error.InvalidJournalSource;
+        if (settings.max_record_bytes == 0 or settings.max_record_bytes > 64 * 1024 or settings.max_decoded_bytes == 0 or settings.max_decoded_bytes > 64 * 1024) return error.InvalidJournalProcessing;
+        const seconds = jail.effectiveFindtime(cfg.defaults);
+        if (seconds == 0) return error.InvalidFindtime;
+        const window = std.math.mul(i64, std.math.cast(i64, seconds) orelse return error.InvalidFindtime, 1_000_000) catch return error.InvalidFindtime;
+        // Why: The profile is checked before allocating, then rebuilt over owned copies so it outlives the caller's executable paths.
+        _ = try origin.Profile.init(settings.machine_id, settings.executables);
+        const executables = try a.alloc([]const u8, settings.executables.len);
+        errdefer a.free(executables);
+        var copied: usize = 0;
+        errdefer for (executables[0..copied]) |path| a.free(path);
+        for (settings.executables, 0..) |path, index| {
+            executables[index] = try a.dupe(u8, path);
+            copied += 1;
+        }
+        const profile = try origin.Profile.init(settings.machine_id, executables);
+        try transport.validate(settings.journal);
+        const self = try a.create(Plan);
+        errdefer a.destroy(self);
+        self.allocator = a;
+        self.profile = profile;
+        self.owned_executables = executables;
+        const literals = jail.ignoreip orelse cfg.defaults.ignoreip;
+        self.ignore_cell = null;
+        if (!settings.custom) {
+            const cell = try a.create(*ignore_set.EffectiveIgnore);
+            errdefer a.destroy(cell);
+            cell.* = try ignore_set.EffectiveIgnore.build(a, literals, &.{}, &.{}, &.{}, 0);
+            self.ignore_cell = cell;
+        }
+        errdefer if (self.ignore_cell) |cell| {
+            cell.*.deinit(a);
+            a.destroy(cell);
+        };
+        self.base = if (settings.custom) null else try builtin.Detector.init(
+            a,
+            .{ .filter = jail.filter, .body = .whole, .ignore = literals, .ignores = self.ignore_cell, .ignore_capacity = settings.ignore_capacity, .max_decoded_bytes = settings.max_decoded_bytes },
+        );
+        errdefer if (self.base) |*value| value.deinit(a);
+        self.qualified = if (self.base) |*value| try journal.Detector.init(value, profile) else null;
+        self.processing = .{
+            .jail = jail.name,
+            .parent_generation = parent,
+            .timestamp = .journal,
+            .window_us = window,
+            .max_record_bytes = settings.max_record_bytes,
+            .max_decoded_bytes = settings.max_decoded_bytes,
+        };
+        self.journal = settings.journal;
+        self.source_id = settings.source_id;
+        return self;
+    }
+    pub fn sessionOptions(self: *const Plan) session.Options {
+        return .{ .processing = self.processing, .detection = if (self.qualified) |*value| value.consumer() else null, .journal = self.journal, .source_id = self.source_id };
+    }
+    pub fn legacySessionOptions(self: *const Plan) session.Options {
+        var options = self.sessionOptions();
+        if (self.qualified) |*value| options.detection = value.legacyConsumer();
+        return options;
+    }
+    pub fn destroy(self: *Plan) void {
+        const a = self.allocator;
+        if (self.base) |*value| value.deinit(a);
+        if (self.ignore_cell) |cell| {
+            cell.*.deinit(a);
+            a.destroy(cell);
+        }
+        for (self.owned_executables) |path| a.free(path);
+        a.free(self.owned_executables);
+        a.destroy(self);
+    }
+};

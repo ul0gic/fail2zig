@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
+// Does:  Polls every file matching the given patterns from its first byte and prints the delivered lines and final offsets as JSON.
+// Holds: No store is opened and offsets live only in memory, so nothing is written anywhere except the JSON on stdout.
+
 const std = @import("std");
 const files = @import("engine_probe").core.durable_file_source;
 const Capture = struct {

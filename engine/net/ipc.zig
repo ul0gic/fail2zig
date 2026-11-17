@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Serves the framed command protocol on the daemon's Unix socket: admits peers, reads a frame, dispatches it, writes one response.
+// Holds: A mutation reaches a handler only for a peer classed admin from its SO_PEERCRED credentials, never from frame content.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -8,13 +10,14 @@ const linux = std.os.linux;
 
 const shared = @import("shared");
 const protocol = shared.protocol;
-const event_loop_mod = @import("../core/event_loop.zig");
+const event_loop_mod = @import("../platform/event_loop.zig");
 pub const auth = @import("ipc_auth.zig");
 
 const EventLoop = event_loop_mod.EventLoop;
 
 pub const max_clients: usize = 8;
 
+// Why: A frame is a 4-byte little-endian length followed by at most max_payload_size bytes.
 pub const client_buffer_size: usize = protocol.max_payload_size + 4;
 
 pub const max_response_bytes: usize = protocol.max_payload_size + 4;
@@ -92,6 +95,7 @@ extern "c" fn umask(mask: u32) callconv(.C) u32;
 
 pub const ClockFn = *const fn () u64;
 
+// Why: A failed clock read returns the far future, so every deadline check closes the client instead of keeping it.
 fn monotonicMs() u64 {
     const ts = posix.clock_gettime(.MONOTONIC) catch return std.math.maxInt(u64);
     const sec: u64 = @intCast(ts.sec);
@@ -127,6 +131,7 @@ pub const IpcServer = struct {
         socket_path: []const u8,
     ) Error!IpcServer {
         if (builtin.os.tag != .linux) return error.NotLinux;
+        // Why: sockaddr_un.sun_path holds 108 bytes including the terminating NUL (unix(7)).
         if (socket_path.len >= 108) return error.PathTooLong;
         const self_uid = linux.geteuid();
 
@@ -147,6 +152,7 @@ pub const IpcServer = struct {
         const addr_len: posix.socklen_t =
             @intCast(sun_path_offset + socket_path.len + 1);
 
+        // Why: bind(2) creates the socket file as 0777 & ~umask (unix(7)), so 0117 makes it 0660 from its first moment.
         const prev_umask: u32 = umask(0o117);
         const bind_result = posix.bind(fd, @ptrCast(&addr), addr_len);
         _ = umask(prev_umask);
@@ -158,6 +164,7 @@ pub const IpcServer = struct {
             return error.ChmodFailed;
         };
 
+        // Why: The path is verified again after bind, so a file swapped in during setup is refused before listen.
         auth.verifySocketPath(socket_path, self_uid) catch |err| {
             std.log.warn("ipc: refusing to serve '{s}': {s}", .{ socket_path, @errorName(err) });
             return error.SocketPathInsecure;
@@ -201,18 +208,6 @@ pub const IpcServer = struct {
         }
     }
 
-    pub fn initDetached(allocator: std.mem.Allocator, loop: *EventLoop) Error!IpcServer {
-        const pool = try allocator.alloc(u8, max_clients * client_buffer_size);
-        return .{
-            .allocator = allocator,
-            .loop = loop,
-            .socket_path = "",
-            .detached = true,
-            .self_uid = linux.geteuid(),
-            .pool = pool,
-        };
-    }
-
     pub fn deinit(self: *IpcServer) void {
         for (&self.clients) |*slot| {
             if (slot.*) |cli| {
@@ -243,31 +238,8 @@ pub const IpcServer = struct {
         self.handler = h;
     }
 
-    pub fn setDeadlines(self: *IpcServer, frame_ms: u64, drain_ms: u64) void {
-        self.frame_deadline_ms = frame_ms;
-        self.drain_deadline_ms = drain_ms;
-    }
-
-    pub fn admitTestPeer(self: *IpcServer, fd: posix.fd_t) !void {
-        std.debug.assert(self.detached);
-        return self.admitClient(fd, .{ .pid = 0, .uid = 0, .gid = 0 });
-    }
-
-    pub fn admitTestPeerAs(self: *IpcServer, fd: posix.fd_t, cred: auth.PeerCred) !void {
-        std.debug.assert(self.detached);
-        return self.admitClient(fd, cred);
-    }
-
     pub fn isServing(self: *const IpcServer) bool {
         return self.serving.load(.acquire);
-    }
-
-    pub fn activeClients(self: *const IpcServer) usize {
-        var n: usize = 0;
-        for (self.clients) |slot| {
-            if (slot != null) n += 1;
-        }
-        return n;
     }
 
     pub fn start(self: *IpcServer) Error!void {
@@ -351,6 +323,7 @@ pub const IpcServer = struct {
         }
     }
 
+    // Does:  Rechecks the socket path on each accept and refuses new peers while it fails; admission resumes once it verifies again.
     fn verifyServing(self: *IpcServer) bool {
         auth.verifySocketPath(self.socket_path, self.self_uid) catch |err| {
             if (self.isServing()) std.log.warn("ipc: socket path '{s}' no longer trustworthy ({s}); refusing new connections", .{ self.socket_path, @errorName(err) });
@@ -365,6 +338,7 @@ pub const IpcServer = struct {
     }
 
     fn admitClient(self: *IpcServer, fd: posix.fd_t, cred: auth.PeerCred) !void {
+        // Why: Expired clients are closed first, so stalled peers holding every slot cannot refuse a new one.
         self.checkDeadlines(self.clock());
         var idx: ?usize = null;
         for (self.clients, 0..) |slot, i| {
@@ -405,6 +379,7 @@ pub const IpcServer = struct {
     }
 
     fn handleClientEvent(self: *IpcServer, cli: *ClientReg, events: u32) void {
+        // Why: A client has one response in flight; input that arrives before it drains is answered by closing the client.
         if (cli.pending != null) {
             if (events & linux.EPOLL.OUT != 0) {
                 self.flushPending(cli) catch |err| {
@@ -441,6 +416,7 @@ pub const IpcServer = struct {
         self.closeClient(cli);
     }
 
+    // Does:  Reads until one whole frame is buffered, dispatches it, and repeats while data remains and no response is pending.
     fn handleClientReadable(self: *IpcServer, cli: *ClientReg) void {
         while (true) {
             const target = if (cli.need == 0) 4 else cli.need;
@@ -512,6 +488,7 @@ pub const IpcServer = struct {
             return self.queueErr(cli, 400, "bad command");
         }
         const tag = body[0];
+        // Why: The tag byte alone decides authorization, so a refused peer's payload is never deserialized.
         const decision = auth.decide(.{ .class = cli.class, .command = auth.classifyTag(tag) });
         switch (decision) {
             .bad_command => {
@@ -543,6 +520,7 @@ pub const IpcServer = struct {
             .pid = cli.cred.pid,
             .request_id = request_id,
         };
+        // Why: The plain dispatch path carries no peer identity, so a mutation without dispatch_auth installed is refused.
         const result = if (self.handler.dispatch_auth) |f|
             f(self.handler.ctx, cmd, peer, self.allocator)
         else if (auth.classifyTag(tag) == .mutation)
@@ -567,6 +545,7 @@ pub const IpcServer = struct {
 
     const QueueError = std.mem.Allocator.Error || posix.WriteError || error{ NoSpaceLeft, ShortWrite, EventLoopError };
 
+    // Holds: Equals the byte count protocol.serializeResponse writes; queueResponse asserts the two agree.
     fn responseSize(resp: shared.Response) usize {
         return switch (resp) {
             .ok => |o| 4 + 1 + 4 + o.payload.len,
@@ -625,6 +604,7 @@ pub const IpcServer = struct {
         cli.sent = 0;
     }
 
+    // Why: EventLoop has no call to change interest, so the existing epoll registration is modified in place.
     fn setInterest(self: *IpcServer, cli: *ClientReg, events: u32) error{EventLoopError}!void {
         var ev: linux.epoll_event = .{ .events = events, .data = .{ .fd = cli.fd } };
         posix.epoll_ctl(self.loop.epoll_fd, linux.EPOLL.CTL_MOD, cli.fd, &ev) catch return error.EventLoopError;

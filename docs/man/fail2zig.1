@@ -1071,7 +1071,18 @@ with a bounded timeout; the default never touches the network),
 .BI \-\-output " json|table" ,
 .BR \-\-print\-lines ,
 .BI \-\-now " epoch-seconds" ,
-.BI \-\-window " seconds" .
+.BI \-\-window " seconds" ,
+.BI \-\-journal\-since " epoch-seconds"
+(with
+.BR \-\-journal :
+where the journal read starts; default one hour before now),
+.BI \-\-journal\-executable " path"
+(with
+.BR \-\-journal :
+the
+.BR journalctl (1)
+binary to run; default
+.IR /usr/bin/journalctl ).
 .PP
 Samples report the outcome
 .RB ( match ", " miss ", " ignore ", " reject ),

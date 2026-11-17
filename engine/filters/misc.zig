@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Lists the built-in patterns for BIND query refusals, ban records, vsftpd, ProFTPD and MySQL login failures.
+// Holds: In every pattern but query-denied the address must start right after a fixed literal; only query-denied searches for it.
 
 const types = @import("types.zig");
-const parser = @import("../core/parser.zig");
+const parser = @import("../detect/parser.zig");
 
 pub const PatternDef = types.PatternDef;
 

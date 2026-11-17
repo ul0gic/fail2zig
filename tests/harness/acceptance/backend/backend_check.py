@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Asserts one backend scenario property per call from kernel dumps, TCP reachability and the SQLite owner table.
+# Holds: The database is opened read-only and the expected subjects are fixed in the file, never read from the product.
+
 """Independent kernel/text/TCP and SQLite assertions for retained B6 scenario."""
 import ipaddress
 import json

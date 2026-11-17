@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Collects daemon, configuration, state, firewall, memory, log and host diagnostics into one redacted JSON support bundle.
+// Holds: Every string value passes the redactor before any byte is written; an absolute path outside the log paths always becomes <path>.
+
 const std = @import("std");
 const builtin = @import("builtin");
 const shared = @import("shared");
 const client = @import("cli");
-const config_mod = @import("../config/native.zig");
-const durable = @import("../core/record_store.zig");
-const files = @import("../core/durable_file_source.zig");
-const reload = @import("../runtime/native_reload.zig");
+const config_mod = @import("../config/config.zig");
+const durable = @import("../store/store.zig");
+const files = @import("../source/durable_file_source.zig");
+const reload = @import("../runtime/reload.zig");
 const ipc_auth = @import("../net/ipc_auth.zig");
 
 pub const ExitClass = shared.ExitClass;
@@ -142,6 +145,7 @@ fn collectAndWrite(arena: std.mem.Allocator, options: Options, version: []const 
     try root.put("host", try hostSection(&bundle));
 
     var redactor = Redactor{ .include_addresses = options.include_addresses, .log_paths = try logPaths(arena, loaded, effective) };
+    // Why: A fresh key per bundle keeps an address's label from matching its label in any other bundle.
     std.crypto.random.bytes(&redactor.key);
     var tree: Value = .{ .object = root };
     try redactor.value(arena, &tree);
@@ -153,6 +157,7 @@ fn collectAndWrite(arena: std.mem.Allocator, options: Options, version: []const 
         try buffered.writer().writeByte('\n');
         try buffered.flush();
     } else {
+        // Why: The bundle carries host and daemon detail, so it is created owner-only and never over an existing file.
         const file = std.fs.cwd().createFile(out_path, .{ .exclusive = true, .mode = 0o600 }) catch |err| {
             stderr.print("support-bundle: cannot create {s}: {s}\n", .{ out_path, @errorName(err) }) catch {};
             return .rejected;
@@ -471,6 +476,7 @@ fn logSection(bundle: *Bundle, loaded: ?config_mod.Config, limit: u16) !Value {
     file.seekTo(start) catch |err| return bundle.failed("log", @errorName(err));
     const buffer = try arena.alloc(u8, @intCast(size - start));
     const read = file.readAll(buffer) catch |err| return bundle.failed("log", @errorName(err));
+    // Why: A tail read that starts past offset 0 begins mid-line, so its first partial line is dropped.
     try object.put("lines", try keepLast(arena, buffer[0..read], limit, true, start != 0));
     return .{ .object = object };
 }
@@ -594,6 +600,7 @@ const Redactor = struct {
         if (shared.IpAddress.parse(core)) |_| return core.len else |_| {}
         const split = std.mem.lastIndexOfScalar(u8, core, '/') orelse blk: {
             const colon = std.mem.indexOfScalar(u8, core, ':') orelse return null;
+            // Why: An IPv6 address holds several colons, so only a lone colon can separate an address from a port.
             if (std.mem.lastIndexOfScalar(u8, core, ':') != colon) return null;
             break :blk colon;
         };

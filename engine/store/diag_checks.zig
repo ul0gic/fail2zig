@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Samples table use against its caps and cross-checks stored counters and the kernel's element count, reporting mismatches.
+// Holds: A check runs only with no transaction open and on the current schema; a query that fails counts as skipped, never a mismatch.
+
 const std = @import("std");
-const build_options = @import("build_options");
-const diag_mod = @import("../core/diag.zig");
-const effects = @import("../core/native_effect.zig");
-const retry = @import("../core/native_retry.zig");
-const action_outcome = @import("../core/native_action_outcome.zig");
-const application_history = @import("../core/native_application_history.zig");
+const diag_mod = @import("../diag/diag.zig");
+const effects = @import("../effect/effect.zig");
+const retry = @import("../detect/retry.zig");
+const action_outcome = @import("../effect/action_outcome.zig");
+const application_history = @import("../effect/application_history.zig");
 const store = @import("store.zig");
 
 const StatementPtr = @FieldType(store.Stmt, "ptr");
 const sample_interval_ns = 10 * std.time.ns_per_s;
 const check_interval_ns = 60 * std.time.ns_per_s;
-// The kernel times an element out on its own clock, so one whose deadline is this close to the readback may be present or gone.
+// Why: The kernel times an element out on its own clock, so one this close to its deadline at readback may be present or gone.
 const kernel_deadline_slack_us = std.time.us_per_s;
 const recent_records = 4096;
 
@@ -34,10 +36,22 @@ const table_limits = [_]TableLimit{
 
 const consistency = [_]struct { check: Check, sql: [:0]const u8 }{
     .{ .check = .live_owner_counter, .sql = "SELECT (SELECT live FROM effect_owner_live WHERE id=1)-(SELECT count(*) FROM effect_owners WHERE lease_kind<>0);" },
-    .{ .check = .retired_totals, .sql = "SELECT (SELECT count(*) FROM retry_retired_totals t WHERE t.total<(SELECT IFNULL(SUM(r.decisions),0) FROM retry_retired r WHERE r.jail=t.jail))+(SELECT count(DISTINCT jail) FROM retry_retired WHERE jail NOT IN (SELECT jail FROM retry_retired_totals));" },
+    .{
+        .check = .retired_totals,
+        .sql = "SELECT (SELECT count(*) FROM retry_retired_totals t WHERE t.total<(SELECT IFNULL(SUM(r.decisions),0) FROM retry_retired r WHERE r.jail=t.jail))+(SELECT count(DISTINCT jail) FROM retry_retired WHERE jail NOT IN (SELECT jail FROM retry_retired_totals));",
+    },
     .{ .check = .retired_overlap, .sql = "SELECT count(*) FROM retry_retired r JOIN retry_states s ON s.jail=r.jail AND s.family=r.family AND s.subject=r.subject;" },
-    .{ .check = .receipt_floor, .sql = "SELECT IFNULL(MAX(0,MAX(v)-(SELECT floor_us FROM receipt_clock WHERE id=1)),0) FROM (SELECT MAX(receipt_us) AS v FROM pending_receipts UNION ALL SELECT MAX(receipt_us) FROM (SELECT receipt_us FROM records ORDER BY rowid DESC LIMIT " ++ std.fmt.comptimePrint("{d}", .{recent_records}) ++ "));" },
-    .{ .check = .source_sequence_head, .sql = "SELECT count(*) FROM source_maintenance m WHERE m.head_sequence<>(SELECT MAX(r.source_sequence) FROM records r WHERE r.jail=m.jail AND r.source=m.source AND r.source_generation=m.generation);" },
+    .{
+        .check = .receipt_floor,
+        .sql = "SELECT IFNULL(MAX(0,MAX(v)-(SELECT floor_us FROM receipt_clock WHERE id=1)),0) FROM (SELECT MAX(receipt_us) AS v FROM pending_receipts UNION ALL SELECT MAX(receipt_us) FROM (SELECT receipt_us FROM records ORDER BY rowid DESC LIMIT " ++ std.fmt.comptimePrint(
+            "{d}",
+            .{recent_records},
+        ) ++ "));",
+    },
+    .{
+        .check = .source_sequence_head,
+        .sql = "SELECT count(*) FROM source_maintenance m WHERE m.head_sequence<>(SELECT MAX(r.source_sequence) FROM records r WHERE r.jail=m.jail AND r.source=m.source AND r.source_generation=m.generation);",
+    },
 };
 
 var last_sample: ?std.time.Instant = null;
@@ -75,6 +89,7 @@ pub fn Methods(comptime Store: type) type {
             const statement = ptr orelse return null;
             defer _ = self.api.finalize(statement);
             for (binds, 1..) |value, index| if (self.api.bind_int64(statement, @intCast(index), value) != 0) return null;
+            // Why: Each check gets a full progress budget, and the caller's remaining budget is restored afterwards.
             const saved = self.work_remaining;
             self.work_remaining = 1000;
             defer self.work_remaining = saved;
@@ -109,7 +124,10 @@ pub fn Methods(comptime Store: type) type {
 
         fn diagSampleLimits(self: *Store, now_us: i64) void {
             for (table_limits) |table| if (self.diagCount(table.sql, &.{})) |used| diag_mod.limit(table.which, used, table.cap);
-            if (self.diagCount("SELECT count(*) FROM retry_states WHERE lease_kind=2 OR (lease_kind=1 AND deadline_us>?1);", &.{now_us})) |banned| diag_mod.limit(.banned_subjects, banned, retry.max_pool_subjects);
+            if (self.diagCount(
+                "SELECT count(*) FROM retry_states WHERE lease_kind=2 OR (lease_kind=1 AND deadline_us>?1);",
+                &.{now_us},
+            )) |banned| diag_mod.limit(.banned_subjects, banned, retry.max_pool_subjects);
             if (self.receipt_limit) |maximum| if (self.diagCount("SELECT count(*) FROM pending_receipts;", &.{})) |pending| diag_mod.limit(.pending_receipts, pending, maximum);
             if (self.runtime_limits) if (self.diagCount("PRAGMA page_count;", &.{})) |pages| if (self.diagCount("PRAGMA max_page_count;", &.{})) |maximum| diag_mod.limit(.state_pages, pages, maximum);
             const memory_used = @extern(*const fn () callconv(.c) i64, .{ .name = "sqlite3_memory_used" });

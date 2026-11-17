@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Runs one client command: checks its arguments, sends the daemon the requests it needs and maps the outcome to an exit code.
+// Holds: Without --force, a ban covering loopback, a host address netlink reports or the SSH peer is refused before the daemon is asked.
 
 const std = @import("std");
 const shared = @import("shared");
@@ -13,7 +15,7 @@ const guard = @import("guard.zig");
 const list_order = @import("list_order.zig");
 
 pub const client_version = build_options.version;
-// Above the daemon's 10 s wait for a withdrawal outcome, so the answer arrives before the socket times out.
+// Why: The daemon waits up to 10 s for a withdrawal outcome, so 15 s lets its answer arrive before the socket times out.
 const firewall_withdraw_timeout_ms: u64 = 15_000;
 
 pub const ExitCode = enum(u8) {
@@ -203,6 +205,7 @@ fn refuseProtectedBan(allocator: std.mem.Allocator, target_text: []const u8, std
         stderr.print("error: invalid ban target '{s}'\n", .{target_text}) catch {};
         return .client_error;
     };
+    // Why: Without a netlink answer the host-address check is skipped; the loopback and SSH peer checks still run.
     var self = shared.self_addresses.read(allocator) catch |err| switch (err) {
         error.KernelUnavailable => shared.self_addresses.SelfAddresses{ .addresses = &.{}, .count = 0, .truncated = false },
         error.OutOfMemory => {
@@ -228,9 +231,22 @@ fn refuseProtectedBan(allocator: std.mem.Allocator, target_text: []const u8, std
 fn doQuery(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype, color: format.Color, kind: []const u8, jail: ?[]const u8, limit: ?u32, cursor: ?[]const u8, details: bool, comptime formatter: anytype) ExitCode {
     var body_bytes: [shared.protocol.max_request_body]u8 = undefined;
     var stream = std.io.fixedBufferStream(&body_bytes);
-    std.json.stringify(.{ .schema_version = @as(u32, 1), .kind = kind, .jail = jail, .limit = limit, .cursor = cursor, .details = @as(?bool, if (details) true else null) }, .{ .emit_null_optional_fields = false }, stream.writer()) catch return .client_error;
+    std.json.stringify(
+        .{ .schema_version = @as(u32, 1), .kind = kind, .jail = jail, .limit = limit, .cursor = cursor, .details = @as(?bool, if (details) true else null) },
+        .{ .emit_null_optional_fields = false },
+        stream.writer(),
+    ) catch return .client_error;
     const body = shared.Command.Body.init(stream.getWritten()) catch return .client_error;
-    return doRequestWithHint(allocator, globals, .{ .query_v1 = body }, stdout, stderr, color, formatter, if (std.mem.eql(u8, kind, "stats")) "daemon does not support stats; upgrade and restart the fail2zig daemon" else null);
+    return doRequestWithHint(
+        allocator,
+        globals,
+        .{ .query_v1 = body },
+        stdout,
+        stderr,
+        color,
+        formatter,
+        if (std.mem.eql(u8, kind, "stats")) "daemon does not support stats; upgrade and restart the fail2zig daemon" else null,
+    );
 }
 
 const max_continuity_pages: usize = 512;
@@ -359,6 +375,7 @@ fn doList(allocator: std.mem.Allocator, globals: args.Globals, jail: ?[]const u8
     var first_entry = true;
     const now_us = std.time.microTimestamp();
     const page_limit = if (details) @as(u32, 64) else list_page_limit;
+    // Why: Detail pages hold fewer rows, so the page bound grows in proportion and the row ceiling stays the same.
     const page_bound = max_list_pages * (list_page_limit / page_limit);
     var pages: usize = 0;
     while (pages < page_bound) : (pages += 1) {
@@ -366,7 +383,11 @@ fn doList(allocator: std.mem.Allocator, globals: args.Globals, jail: ?[]const u8
         const arena = page_arena.allocator();
         var body_bytes: [shared.protocol.max_request_body]u8 = undefined;
         var stream = std.io.fixedBufferStream(&body_bytes);
-        std.json.stringify(.{ .schema_version = @as(u32, 1), .kind = "scopes", .jail = jail, .limit = page_limit, .cursor = cursor, .details = @as(?bool, if (details) true else null) }, .{ .emit_null_optional_fields = false }, stream.writer()) catch return .client_error;
+        std.json.stringify(
+            .{ .schema_version = @as(u32, 1), .kind = "scopes", .jail = jail, .limit = page_limit, .cursor = cursor, .details = @as(?bool, if (details) true else null) },
+            .{ .emit_null_optional_fields = false },
+            stream.writer(),
+        ) catch return .client_error;
         const body = shared.Command.Body.init(stream.getWritten()) catch return .client_error;
 
         var diag: socket.DiagBuf = .{};
@@ -387,7 +408,10 @@ fn doList(allocator: std.mem.Allocator, globals: args.Globals, jail: ?[]const u8
                 if (pages == 0) {
                     format.formatError(stderr, e.code, e.message, globals.output, color) catch {};
                 } else {
-                    stderr.print("error: list stopped at page {d}: {s} (code {d}){s}\n", .{ pages + 1, e.message, e.code, if (e.code == 409) "; the ban set changed during the walk, rerun the command" else "" }) catch {};
+                    stderr.print(
+                        "error: list stopped at page {d}: {s} (code {d}){s}\n",
+                        .{ pages + 1, e.message, e.code, if (e.code == 409) "; the ban set changed during the walk, rerun the command" else "" },
+                    ) catch {};
                 }
                 return .daemon_error;
             },
@@ -428,7 +452,18 @@ fn doList(allocator: std.mem.Allocator, globals: args.Globals, jail: ?[]const u8
             const expiry_us: ?i64 = if (permanent) null else item.deadline_us;
             if (!first_entry) writer.writeByte(',') catch return walkOutOfMemory(stderr);
             first_entry = false;
-            const entry = .{ .ip = subject, .jail = item.jail, .origin = item.origin, .expired = expired, .expiry_us = expiry_us, .ban_expiry = if (expiry_us) |value| @divFloor(value, 1_000_000) else null, .permanent = permanent, .ban_count = item.ban_count, .enforced = item.confirmed, .confirmed = item.confirmed };
+            const entry = .{
+                .ip = subject,
+                .jail = item.jail,
+                .origin = item.origin,
+                .expired = expired,
+                .expiry_us = expiry_us,
+                .ban_expiry = if (expiry_us) |value| @divFloor(value, 1_000_000) else null,
+                .permanent = permanent,
+                .ban_count = item.ban_count,
+                .enforced = item.confirmed,
+                .confirmed = item.confirmed,
+            };
             if (details) {
                 var json = std.json.writeStream(writer, .{});
                 json.beginObject() catch return walkOutOfMemory(stderr);
@@ -473,7 +508,11 @@ fn walkOutOfMemory(stderr: anytype) ExitCode {
 fn doFirewallQuery(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype, color: format.Color, query: args.Command.FirewallArgs) ExitCode {
     var body_bytes: [shared.protocol.max_request_body]u8 = undefined;
     var stream = std.io.fixedBufferStream(&body_bytes);
-    std.json.stringify(.{ .schema_version = @as(u32, 1), .kind = "firewall", .limit = query.limit, .cursor = query.cursor }, .{ .emit_null_optional_fields = false }, stream.writer()) catch return .client_error;
+    std.json.stringify(
+        .{ .schema_version = @as(u32, 1), .kind = "firewall", .limit = query.limit, .cursor = query.cursor },
+        .{ .emit_null_optional_fields = false },
+        stream.writer(),
+    ) catch return .client_error;
     const body = shared.Command.Body.init(stream.getWritten()) catch return .client_error;
 
     var diag: socket.DiagBuf = .{};
@@ -519,6 +558,7 @@ pub fn doAdmin(allocator: std.mem.Allocator, globals: args.Globals, stdout: anyt
         return .connection_failed;
     };
     defer client.close();
+    // Why: The daemon refuses an admin request whose expected mutation revision is stale, so the current one is read first.
     const status_resp = client.sendCommand(.{ .status = {} }) catch {
         stderr.print("error: {s}\n", .{client.errorMessage()}) catch {};
         return .connection_failed;
@@ -543,7 +583,23 @@ pub fn doAdmin(allocator: std.mem.Allocator, globals: args.Globals, stdout: anyt
     };
     var body_bytes: [shared.protocol.max_request_body]u8 = undefined;
     var stream = std.io.fixedBufferStream(&body_bytes);
-    std.json.stringify(.{ .schema_version = @as(u32, 1), .kind = spec.kind, .jail = spec.jail, .address = spec.address, .prefix = spec.prefix, .duration_s = spec.duration_s, .all = spec.all, .unban = @as(?bool, if (spec.unban) true else null), .run_id = spec.run_id, .expected_generation = head.value.generation, .expected_mutation_revision = head.value.mutation_revision }, .{ .emit_null_optional_fields = false }, stream.writer()) catch return .client_error;
+    std.json.stringify(
+        .{
+            .schema_version = @as(u32, 1),
+            .kind = spec.kind,
+            .jail = spec.jail,
+            .address = spec.address,
+            .prefix = spec.prefix,
+            .duration_s = spec.duration_s,
+            .all = spec.all,
+            .unban = @as(?bool, if (spec.unban) true else null),
+            .run_id = spec.run_id,
+            .expected_generation = head.value.generation,
+            .expected_mutation_revision = head.value.mutation_revision,
+        },
+        .{ .emit_null_optional_fields = false },
+        stream.writer(),
+    ) catch return .client_error;
     const body = shared.Command.Body.init(stream.getWritten()) catch return .client_error;
     var request_id: [shared.protocol.request_id_bytes]u8 = undefined;
     std.crypto.random.bytes(&request_id);
@@ -664,7 +720,16 @@ fn doIgnoreList(allocator: std.mem.Allocator, globals: args.Globals, stdout: any
     return .success;
 }
 
-const AdminOutcome = struct { schema_version: u32 = 0, kind: []const u8 = "", outcome: []const u8 = "", generation: []const u8 = "", mutation_revision: u64 = 0, enforced: bool = false, reasons: []const []const u8 = &.{}, warning: ?[]const u8 = null };
+const AdminOutcome = struct {
+    schema_version: u32 = 0,
+    kind: []const u8 = "",
+    outcome: []const u8 = "",
+    generation: []const u8 = "",
+    mutation_revision: u64 = 0,
+    enforced: bool = false,
+    reasons: []const []const u8 = &.{},
+    warning: ?[]const u8 = null,
+};
 
 fn writeAdminOutcome(allocator: std.mem.Allocator, writer: anytype, payload: []const u8, fmt: format.OutputFormat) !void {
     if (fmt == .json) {
@@ -677,7 +742,10 @@ fn writeAdminOutcome(allocator: std.mem.Allocator, writer: anytype, payload: []c
         return;
     };
     defer parsed.deinit();
-    try writer.print("kind\t{s}\noutcome\t{s}\nenforced\t{}\ngeneration\t{s}\nmutation_revision\t{d}\n", .{ parsed.value.kind, parsed.value.outcome, parsed.value.enforced, parsed.value.generation, parsed.value.mutation_revision });
+    try writer.print(
+        "kind\t{s}\noutcome\t{s}\nenforced\t{}\ngeneration\t{s}\nmutation_revision\t{d}\n",
+        .{ parsed.value.kind, parsed.value.outcome, parsed.value.enforced, parsed.value.generation, parsed.value.mutation_revision },
+    );
     for (parsed.value.reasons) |reason| try writer.print("reason\t{s}\n", .{reason});
     if (parsed.value.warning) |warning| {
         if (fmt == .plain) try writer.print("warning\t{s}\n", .{warning}) else try writer.print("warning: {s}\n", .{warning});
@@ -856,36 +924,6 @@ fn formatFirewallDetailsCmd(allocator: std.mem.Allocator, writer: anytype, paylo
     return format.formatFirewallDetailed(allocator, writer, payload, fmt, color);
 }
 
-fn formatReloadCmd(
-    allocator: std.mem.Allocator,
-    writer: anytype,
-    payload: []const u8,
-    fmt: format.OutputFormat,
-    color: format.Color,
-) !void {
-    return format.formatReload(allocator, writer, payload, fmt, color);
-}
-
-fn formatBanCmd(
-    allocator: std.mem.Allocator,
-    writer: anytype,
-    payload: []const u8,
-    fmt: format.OutputFormat,
-    color: format.Color,
-) !void {
-    return format.formatBan(allocator, writer, payload, fmt, color);
-}
-
-fn formatUnbanCmd(
-    allocator: std.mem.Allocator,
-    writer: anytype,
-    payload: []const u8,
-    fmt: format.OutputFormat,
-    color: format.Color,
-) !void {
-    return format.formatUnban(allocator, writer, payload, fmt, color);
-}
-
 fn doDiagClock(allocator: std.mem.Allocator, globals: args.Globals, stdout: anytype, stderr: anytype, color: format.Color, request: args.Command.DiagClockArgs) ExitCode {
     var body_bytes: [128]u8 = undefined;
     var stream = std.io.fixedBufferStream(&body_bytes);
@@ -920,8 +958,14 @@ fn formatDiagClockCmd(
     const clock = parsed.value;
     switch (fmt) {
         .json => try std.json.stringify(clock, .{}, writer),
-        .plain => try writer.print("mode\t{s}\nrate\t{d}\nwall_us\t{d}\nreal_wall_us\t{d}\nmonotonic_ns\t{d}\nregressions\t{d}", .{ @tagName(clock.mode), clock.rate, clock.wall_us, clock.real_wall_us, clock.monotonic_ns, clock.regressions }),
-        .table => try writer.print("Mode:          {s}\nRate:          {d}\nVirtual wall:  {d} us\nReal wall:     {d} us\nMonotonic:     {d} ns\nRegressions:   {d}", .{ @tagName(clock.mode), clock.rate, clock.wall_us, clock.real_wall_us, clock.monotonic_ns, clock.regressions }),
+        .plain => try writer.print(
+            "mode\t{s}\nrate\t{d}\nwall_us\t{d}\nreal_wall_us\t{d}\nmonotonic_ns\t{d}\nregressions\t{d}",
+            .{ @tagName(clock.mode), clock.rate, clock.wall_us, clock.real_wall_us, clock.monotonic_ns, clock.regressions },
+        ),
+        .table => try writer.print(
+            "Mode:          {s}\nRate:          {d}\nVirtual wall:  {d} us\nReal wall:     {d} us\nMonotonic:     {d} ns\nRegressions:   {d}",
+            .{ @tagName(clock.mode), clock.rate, clock.wall_us, clock.real_wall_us, clock.monotonic_ns, clock.regressions },
+        ),
     }
     try writer.writeByte('\n');
 }

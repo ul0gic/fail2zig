@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Reports the state file's page usage and each table's row count and byte size.
+// Holds: A table name read from sqlite_schema is quoted into SQL only after it passes plainIdentifier (letters, digits, underscore).
+
 const std = @import("std");
 const store = @import("store.zig");
 const budget = @import("budget.zig");

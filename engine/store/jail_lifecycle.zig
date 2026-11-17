@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Retires a removed jail in pages: releases its owners, deletes its rows table by table, then deletes its parent rows.
+// Holds: A page touches at most 64 rows, and parent rows are deleted only after every child table is checked empty for the jail.
+
 const std = @import("std");
-const effects = @import("../core/native_effect.zig");
-const detection = @import("../core/native_detection_record.zig");
+const effects = @import("../effect/effect.zig");
+const detection = @import("../detect/detection_record.zig");
 const store = @import("store.zig");
 const Error = store.Error;
 
 pub fn Methods(comptime Store: type) type {
     return struct {
         pub const JailRetirementIntent = struct { jail: detection.Name, keep_ignore_deadlines: bool };
-        pub const JailRetirementPhase = enum { owners, retry_states, retry_retired, policy_summaries, source_cursors, pending_receipts, manifests, timed_entries, record_groups, maintenance_headers, finish, done };
+        pub const JailRetirementPhase = enum {
+            owners,
+            retry_states,
+            retry_retired,
+            policy_summaries,
+            source_cursors,
+            pending_receipts,
+            manifests,
+            timed_entries,
+            record_groups,
+            maintenance_headers,
+            finish,
+            done,
+        };
         pub const JailRetirementCursor = struct { phase: JailRetirementPhase = .owners, owner_after: ?effects.Hash = null, timed_list: u8 = 1 };
         pub const JailRetirementFinishProof = struct {
             intent: JailRetirementIntent,
@@ -19,7 +35,17 @@ pub fn Methods(comptime Store: type) type {
             },
         };
         pub const JailRetirementReconciliation = struct { jail: detection.Name, keep_ignore_deadlines: bool, owner_generation: effects.Hash, owner_revision: u64, token: effects.Token };
-        pub const JailRetirementPage = struct { next: JailRetirementCursor, examined: u16 = 0, owners_released: u16 = 0, bans_lifted: u16 = 0, deleted_rows: u16 = 0, done: bool = false, yielded: bool = false, withdrawal_required: bool = false, reconcile: ?JailRetirementReconciliation = null };
+        pub const JailRetirementPage = struct {
+            next: JailRetirementCursor,
+            examined: u16 = 0,
+            owners_released: u16 = 0,
+            bans_lifted: u16 = 0,
+            deleted_rows: u16 = 0,
+            done: bool = false,
+            yielded: bool = false,
+            withdrawal_required: bool = false,
+            reconcile: ?JailRetirementReconciliation = null,
+        };
 
         fn retirementIntent(row: *store.Stmt) Error!JailRetirementIntent {
             if (row.store.api.column_type(row.ptr, 0) != 3 or row.store.api.column_type(row.ptr, 1) != 1) return error.InvalidRecord;
@@ -85,7 +111,7 @@ pub fn Methods(comptime Store: type) type {
             if (self.api.get_autocommit(self.db) != 0) return error.DatabaseFailure;
             _ = detection.Name.init(jail) catch return error.InvalidRecord;
             if (try self.jailRetirement(jail) != null) return;
-            // Bound the obligation set independently of the configured-name population.
+            // Why: At most 64 retirements are open at once, however many jail names the configuration has held.
             var intents: [64]JailRetirementIntent = undefined;
             if (try self.jailRetirements(&intents) == intents.len) return error.StorageLimit;
             var row = try self.statement("INSERT INTO jail_retirements VALUES(?1,?2);");
@@ -141,7 +167,12 @@ pub fn Methods(comptime Store: type) type {
                         while (try rows.row()) {
                             const revision = try rows.signed(2);
                             if (revision <= 0) return error.InvalidEffect;
-                            held[count] = .{ .key = try Store.effectBlob(&rows, 0, 32), .generation = try Store.effectBlob(&rows, 1, 32), .revision = @intCast(revision), .absent = (try Store.effectLease(&rows, 3, 4)) == .absent };
+                            held[count] = .{
+                                .key = try Store.effectBlob(&rows, 0, 32),
+                                .generation = try Store.effectBlob(&rows, 1, 32),
+                                .revision = @intCast(revision),
+                                .absent = (try Store.effectLease(&rows, 3, 4)) == .absent,
+                            };
                             count += 1;
                         }
                     }
@@ -154,14 +185,32 @@ pub fn Methods(comptime Store: type) type {
                         const installation = try self.readInstallation() orelse return error.InstallationRequired;
                         const prior = try self.readEffect(owner.key, installation) orelse return error.InvalidEffect;
                         if (prior.status == .dispatched) {
-                            page.reconcile = .{ .jail = intent.jail, .keep_ignore_deadlines = intent.keep_ignore_deadlines, .owner_generation = owner.generation, .owner_revision = owner.revision, .token = prior.token() };
+                            page.reconcile = .{
+                                .jail = intent.jail,
+                                .keep_ignore_deadlines = intent.keep_ignore_deadlines,
+                                .owner_generation = owner.generation,
+                                .owner_revision = owner.revision,
+                                .token = prior.token(),
+                            };
                             blocked = true;
                             break;
                         }
                         var revision_bytes: [8]u8 = undefined;
                         std.mem.writeInt(u64, &revision_bytes, owner.revision, .little);
                         const id = effects.hashParts("fail2zig-jail-retire-v1", &.{ jail, &owner.key, &revision_bytes });
-                        const result = try self.transitionOwnerTx(.{ .scope = prior.scope.canonical, .jail = jail, .current_generation = owner.generation, .next_generation = owner.generation, .expected_owner_revision = owner.revision, .transition_id = id, .mode = .release, .occurred_us = now_us }, now);
+                        const result = try self.transitionOwnerTx(
+                            .{
+                                .scope = prior.scope.canonical,
+                                .jail = jail,
+                                .current_generation = owner.generation,
+                                .next_generation = owner.generation,
+                                .expected_owner_revision = owner.revision,
+                                .transition_id = id,
+                                .mode = .release,
+                                .occurred_us = now_us,
+                            },
+                            now,
+                        );
                         if (!result.changed) return error.InvalidEffect;
                         page.owners_released += 1;
                         page.bans_lifted += @intFromBool(result.entry.desired == .absent);
@@ -222,7 +271,7 @@ pub fn Methods(comptime Store: type) type {
                 },
                 .source_cursors, .pending_receipts => {
                     const phase = page.next.phase;
-                    // Copy only bounded keys; bindings outlive each SQLITE_STATIC statement.
+                    // Why: Text binds are SQLITE_STATIC and column bytes die at the next step, so each key is copied before it is bound.
                     var arena = std.heap.ArenaAllocator.init(self.allocator);
                     defer arena.deinit();
                     var sources: [64][]const u8 = undefined;
@@ -433,7 +482,7 @@ pub fn Methods(comptime Store: type) type {
                 var last: effects.Hash = undefined;
                 var live = false;
                 {
-                    // A separate read transaction for each page resets the SQLite work guard.
+                    // Why: Each page runs in its own read transaction, and beginning one restores the full SQLite progress budget.
                     try self.beginRead();
                     errdefer self.rollback();
                     {
@@ -462,7 +511,6 @@ pub fn Methods(comptime Store: type) type {
         }
 
         pub fn unconfiguredJails(self: *Store, configured: []const []const u8, out: [][64]u8) Error!usize {
-            // Startup holds the state lock and has not started workers, so these read pages share stable ownership.
             var count: usize = 0;
             var after: ?DiscoveryJail = null;
             while (true) {

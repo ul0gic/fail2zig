@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Records admin requests, config generations, jail admin states and retry-policy transitions for the admin and reload paths.
+// Holds: Each non-rejected admin request, reload or policy transition raises the mutation revision by one in the transaction recording it.
+
 const std = @import("std");
-const retry = @import("../core/native_retry.zig");
-const effects = @import("../core/native_effect.zig");
-const consumers = @import("../core/native_consumer.zig");
-const detection = @import("../core/native_detection_record.zig");
+const effects = @import("../effect/effect.zig");
+const consumers = @import("../detect/consumer.zig");
+const detection = @import("../detect/detection_record.zig");
 const Error = @import("store.zig").Error;
 const budget = @import("budget.zig");
 const unreferenced_config_generations_kept = 8;
@@ -18,15 +20,6 @@ pub fn Methods(comptime Store: type) type {
         const effectLease = Store.effectLease;
         const retryPoliciesEqual = Store.retryPoliciesEqual;
         const bindSubjectAt = Store.bindSubjectAt;
-        pub fn transitionRetryPolicy(self: *Store, jail: []const u8, generation: [32]u8, expected: retry.Policy, next: retry.Policy) Error!void {
-            try self.beginWrite();
-            errdefer self.rollback();
-            if (self.schema_version < 22) return error.AdminStorageRequired;
-            try self.transitionJailGenerationTx(.{ .jail = jail, .generation = generation, .next_generation = generation, .expected = expected, .next = next }, std.time.microTimestamp());
-            try self.bumpAdminRevisionTx();
-            try self.fault(.before_policy_transition_commit);
-            try self.commitTransaction();
-        }
         fn transitionJailGenerationTx(self: *Store, change: PolicyTransition, now_us: i64) Error!void {
             const jail = change.jail;
             if (jail.len == 0 or jail.len > 64 or std.mem.indexOfScalar(u8, jail, 0) != null) return error.InvalidRecord;
@@ -104,7 +97,11 @@ pub fn Methods(comptime Store: type) type {
             for (custom, 0..) |update, i| {
                 if (update.batch.deltas.len != 1) return error.InvalidAdminRequest;
                 const delta = update.batch.deltas[0];
-                if (delta.key.kind != .ignore or !std.mem.eql(u8, delta.key.jail, update.manifest.jail) or !std.mem.eql(u8, delta.key.source, "@shared") or !std.mem.eql(u8, delta.key.rule, "allowlist") or delta.expected_revision == 0) return error.InvalidAdminRequest;
+                if (delta.key.kind != .ignore or !std.mem.eql(
+                    u8,
+                    delta.key.jail,
+                    update.manifest.jail,
+                ) or !std.mem.eql(u8, delta.key.source, "@shared") or !std.mem.eql(u8, delta.key.rule, "allowlist") or delta.expected_revision == 0) return error.InvalidAdminRequest;
                 for (custom[0..i]) |previous| if (std.mem.eql(u8, previous.manifest.jail, update.manifest.jail)) return error.InvalidAdminRequest;
             }
             try self.beginIntakeWrite(budget.reload_pages);
@@ -204,32 +201,11 @@ pub fn Methods(comptime Store: type) type {
                 try insert.blob(4, jail.allowlist_snapshot);
                 try insert.done();
             }
-            try self.exec(std.fmt.comptimePrint("DELETE FROM config_generations WHERE generation IN (SELECT generation FROM config_generations g WHERE g.published=0 AND NOT EXISTS(SELECT 1 FROM jail_admin_states s WHERE s.generation=g.generation) ORDER BY g.committed_us DESC,g.generation DESC LIMIT {d} OFFSET {d});", .{ config_generation_prune_page, unreferenced_config_generations_kept }));
-        }
-
-        pub fn publishConfigGeneration(self: *Store, generation: [32]u8) Error!void {
-            try self.beginWrite();
-            errdefer self.rollback();
-            if (self.schema_version < 22) return error.AdminStorageRequired;
-            try self.exec("UPDATE config_generations SET published=0 WHERE published=1;");
-            var update = try self.statement("UPDATE config_generations SET published=1 WHERE generation=?1;");
-            defer update.deinit();
-            try update.blob(1, &generation);
-            try update.done();
-            if (self.api.changes(self.db) != 1) return error.ConfigGenerationMissing;
-            try self.fault(.before_config_generation_publish);
-            try self.commitTransaction();
-        }
-
-        pub fn discardUnpublishedConfigGeneration(self: *Store, generation: [32]u8) Error!void {
-            try self.beginClassWrite(.reclamation);
-            errdefer self.rollback();
-            if (self.schema_version < 22) return error.AdminStorageRequired;
-            var delete = try self.statement("DELETE FROM config_generations WHERE generation=?1 AND published=0;");
-            defer delete.deinit();
-            try delete.blob(1, &generation);
-            try delete.done();
-            try self.commitTransaction();
+            // Why: The newest 8 unpublished, unreferenced generations are kept, and at most 32 older ones are deleted per write.
+            try self.exec(std.fmt.comptimePrint(
+                "DELETE FROM config_generations WHERE generation IN (SELECT generation FROM config_generations g WHERE g.published=0 AND NOT EXISTS(SELECT 1 FROM jail_admin_states s WHERE s.generation=g.generation) ORDER BY g.committed_us DESC,g.generation DESC LIMIT {d} OFFSET {d});",
+                .{ config_generation_prune_page, unreferenced_config_generations_kept },
+            ));
         }
 
         pub const ConfigGenerationHead = struct { generation: [32]u8, config_digest: [32]u8, published: bool, committed_us: i64 };
@@ -241,7 +217,22 @@ pub fn Methods(comptime Store: type) type {
             return .{ .generation = try effectBlob(&row, 0, 32), .config_digest = try effectBlob(&row, 1, 32), .published = (try row.signed(2)) == 1, .committed_us = try row.signed(3) };
         }
 
-        pub const AdminKind = enum(u8) { group_enable = 1, group_disable, group_pause, group_resume, setting_batch, ban, unban, history_reset, migration_activate, migration_rollback, ignore_add, ignore_remove, repair_source, firewall_withdraw };
+        pub const AdminKind = enum(u8) {
+            group_enable = 1,
+            group_disable,
+            group_pause,
+            group_resume,
+            setting_batch,
+            ban,
+            unban,
+            history_reset,
+            migration_activate,
+            migration_rollback,
+            ignore_add,
+            ignore_remove,
+            repair_source,
+            firewall_withdraw,
+        };
         pub const AdminOutcome = enum(u8) { applied = 1, rejected, absent, partial, uncertain };
         pub const admin_request_retention = 4096;
         pub const admin_request_max_age_us: i64 = 30 * 24 * 60 * 60 * 1_000_000;
@@ -262,6 +253,7 @@ pub fn Methods(comptime Store: type) type {
         }
         pub const AdminReplay = struct { kind: AdminKind, outcome: AdminOutcome, mutation_revision: u64 };
         pub const AdminAdmission = union(enum) { fresh, replayed: AdminReplay };
+        // Holds: Retention never prunes a partial or uncertain disable request that still pins a disabled jail in the bound generation.
         const unpinned_admin_request = "NOT (kind=2 AND outcome IN(4,5) AND EXISTS(SELECT 1 FROM jail_admin_states s WHERE s.jail=CAST(admin_requests.subject AS TEXT) AND s.enabled=0 AND s.request_id=admin_requests.request_id AND EXISTS(SELECT 1 FROM config_generation_jails c WHERE c.generation=?2 AND c.jail=s.jail)))";
         pub const JailAdminState = struct {
             jail: []const u8,
@@ -395,7 +387,14 @@ pub fn Methods(comptime Store: type) type {
             defer row.deinit();
             try row.text(1, jail);
             if (!try row.row()) return false;
-            output.* = .{ .jail = jail, .enabled = (try row.signed(0)) == 1, .paused = (try row.signed(1)) == 1, .generation = try effectBlob(&row, 2, 32), .changed_us = try row.signed(3), .request_id = try effectBlob(&row, 4, 32) };
+            output.* = .{
+                .jail = jail,
+                .enabled = (try row.signed(0)) == 1,
+                .paused = (try row.signed(1)) == 1,
+                .generation = try effectBlob(&row, 2, 32),
+                .changed_us = try row.signed(3),
+                .request_id = try effectBlob(&row, 4, 32),
+            };
             return true;
         }
 
@@ -412,7 +411,15 @@ pub fn Methods(comptime Store: type) type {
             }
             const effect_revision = try row.signed(2);
             if (effect_revision <= 0) return error.InvalidEffect;
-            const owner = effects.Owner{ .jail = detection.Name.init(jail) catch return error.InvalidEffect, .generation = try effectBlob(&row, 0, 32), .decision_id = try effectBlob(&row, 1, 32), .revision = @intCast(effect_revision), .lease = try effectLease(&row, 3, 4), .decided_us = try row.signed(5), .origin = try Store.storedOrigin(&row, 6) };
+            const owner = effects.Owner{
+                .jail = detection.Name.init(jail) catch return error.InvalidEffect,
+                .generation = try effectBlob(&row, 0, 32),
+                .decision_id = try effectBlob(&row, 1, 32),
+                .revision = @intCast(effect_revision),
+                .lease = try effectLease(&row, 3, 4),
+                .decided_us = try row.signed(5),
+                .origin = try Store.storedOrigin(&row, 6),
+            };
             try self.commitTransaction();
             return owner;
         }

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Parses the client command line into global flags and one command, and holds the help text for every command.
+// Holds: Parsing reads only argv and touches no socket, file or environment; every error it returns has its reason in ParseDiag.
 
 const std = @import("std");
 const shared = @import("shared");
@@ -575,7 +577,10 @@ fn parseIgnore(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Er
     }
     _ = shared.types.IgnoreEntry.parse(address) catch |err| {
         switch (err) {
-            error.InvalidAddress => diag.set("invalid address '{s}' for 'ignore {s}': expected an IPv4 or IPv6 address or CIDR such as 192.0.2.10 or 2001:db8::/32", .{ format.escapeArgument(&echo, address), name }),
+            error.InvalidAddress => diag.set(
+                "invalid address '{s}' for 'ignore {s}': expected an IPv4 or IPv6 address or CIDR such as 192.0.2.10 or 2001:db8::/32",
+                .{ format.escapeArgument(&echo, address), name },
+            ),
             error.InvalidPrefix => diag.set("invalid prefix in '{s}': IPv4 prefixes are 0-32, IPv6 prefixes are 0-128", .{format.escapeArgument(&echo, address)}),
         }
         return error.InvalidValue;
@@ -624,7 +629,10 @@ fn parseJailAdmin(rest: []const []const u8, globals: *Globals, diag: *ParseDiag)
         }
         if (action == null) {
             action = std.meta.stringToEnum(Command.JailAction, a) orelse {
-                diag.set("invalid jail action '{s}' (expected: enable, disable, pause, resume); use 'list --jail <name>', 'ban <ip> --jail <name>', or 'unban <ip> --jail <name>' to manage bans", .{a});
+                diag.set(
+                    "invalid jail action '{s}' (expected: enable, disable, pause, resume); use 'list --jail <name>', 'ban <ip> --jail <name>', or 'unban <ip> --jail <name>' to manage bans",
+                    .{a},
+                );
                 return error.InvalidValue;
             };
             continue;
@@ -736,6 +744,7 @@ fn parseList(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) Erro
     return Parsed{ .globals = globals.*, .command = .{ .list = args } };
 }
 
+// Why: Both match the daemon's 256-item page limit, so a larger value is refused here before any request is sent.
 pub const max_history_limit: u32 = 256;
 pub const max_firewall_limit: u32 = 256;
 
@@ -778,6 +787,7 @@ fn parseHistory(rest: []const []const u8, globals: *Globals, diag: *ParseDiag) E
                 diag.set("flag --cursor requires a value (from a previous page)", .{});
                 return error.MissingValue;
             }
+            // Why: 128 bytes is the longest cursor the daemon issues or accepts.
             if (rest[k].len == 0 or rest[k].len > 128) {
                 diag.set("invalid --cursor value (expected 1..128 characters)", .{});
                 return error.InvalidValue;
@@ -926,6 +936,7 @@ fn takeTrailingGlobal(
     return false;
 }
 
+// Why: migrate and the other offline tools never reach this parser; they are listed so a misspelling of one is still suggested.
 pub const known_commands = [_][]const u8{
     "status",
     "ban",

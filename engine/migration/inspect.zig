@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Reads a fail2ban configuration tree and classifies each jail and its filter and action files as supported, changed or blocked.
+// Holds: A later operator change never lowers a blocker reason's kind, and every key outside known_keys is reported with its provenance.
+
 const std = @import("std");
 const fail2ban = @import("../config/fail2ban.zig");
 const filter_context = @import("../config/filter_context.zig");
 const registry = @import("../filters/registry.zig");
-const duration = @import("../config/duration.zig");
+const duration = @import("shared").duration;
 const IpAddress = @import("shared").IpAddress;
 
 pub const schema_version: u32 = 1;
@@ -126,6 +129,7 @@ const consumed_keys = [_][]const u8{
     "bantime.overalljails",
 };
 
+// Why: warn is fail2ban's default usedns.
 const stock_usedns = "warn";
 const known_chain_tag = "<known/chain>";
 
@@ -348,7 +352,7 @@ const Builder = struct {
             break :blk sel.name;
         };
         const builtin: ?[]const u8 = if (registry.get(filter_name) != null) filter_name else null;
-        // A same-named Fail2ban filter does not establish the 2.x history contract.
+        // Why: A fail2ban filter named portsentry does not show the log holds the PortSentry 2.0.7 history the built-in filter parses.
         if (std.mem.eql(u8, filter_name, "portsentry"))
             try self.addReason(&reasons, &kind, .blocker, "portsentry-history-format-unverified");
         if (builtin == null) try self.addReason(&reasons, &kind, .blocker, try std.fmt.allocPrint(a, "custom-filter:{s}", .{filter_name}));
@@ -493,6 +497,7 @@ const Builder = struct {
                 }
                 return try std.fmt.allocPrint(self.a, "{d}s", .{seconds});
             },
+            // Why: parse returns legacy_unknown only when its second argument is true, and it is false above.
             .legacy_unknown => unreachable,
         }
     }
@@ -587,6 +592,7 @@ fn isConsumedKey(key: []const u8) bool {
     return false;
 }
 
+// Why: A .local file overrides the settings of its .conf (jail.conf(5)), so an asset carrying one never counts as stock.
 fn isOverlay(occ: fail2ban.SourceOccurrence, name: []const u8) bool {
     if (occ.edge == .local or std.mem.endsWith(u8, occ.path, ".local")) return true;
     var buf: [128]u8 = undefined;

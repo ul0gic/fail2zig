@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Builds the fail2zig executable with SQLite compiled in, and defines the test, probe, fixture and diagnostic-marker check steps.
+// Holds: -Ddiag=true is refused when -Dstrip, RELEASE_TAG or a tag ref marks a release build, and -Dtracy is refused without -Ddiag.
+
 const std = @import("std");
 
-const fail2zig_version = "0.4.10";
+const fail2zig_version = "0.4.11";
 
 fn releaseSignal(b: *std.Build, strip: bool) ?[]const u8 {
     if (strip) return "-Dstrip=true";
@@ -49,7 +52,11 @@ pub fn build(b: *std.Build) void {
     });
     sqlite.root_module.addCSourceFile(.{
         .file = b.path("vendor/sqlite/sqlite3.c"),
-        .flags = if (diag) &.{ "-DSQLITE_OMIT_LOAD_EXTENSION=1", "-DSQLITE_ENABLE_DBSTAT_VTAB=1", "-Dfsync=f2z_diag_fsync" } else &.{ "-DSQLITE_OMIT_LOAD_EXTENSION=1", "-DSQLITE_ENABLE_DBSTAT_VTAB=1" },
+        .flags = if (diag) &.{
+            "-DSQLITE_OMIT_LOAD_EXTENSION=1",
+            "-DSQLITE_ENABLE_DBSTAT_VTAB=1",
+            "-Dfsync=f2z_diag_fsync",
+        } else &.{ "-DSQLITE_OMIT_LOAD_EXTENSION=1", "-DSQLITE_ENABLE_DBSTAT_VTAB=1" },
     });
 
     const build_options = b.addOptions();
@@ -90,7 +97,7 @@ pub fn build(b: *std.Build) void {
         });
         tracy_client.root_module.addCSourceFile(.{
             .file = tracy_dep.path("public/TracyClient.cpp"),
-            // Zig's C UBSan trap fires (ud1) in Tracy's queue dequeue switch, TracyProfiler.cpp:2569, and freezes the daemon.
+            // Why: Zig's C UBSan trap (ud1) fires in Tracy's queue dequeue switch and freezes the daemon.
             .flags = &.{ "-fno-sanitize=undefined", "-DTRACY_ENABLE", "-DTRACY_TIMER_FALLBACK", "-DTRACY_NO_BROADCAST", "-DTRACY_ONLY_LOCALHOST", "-DTRACY_DELAYED_INIT", "-DTRACY_MANUAL_LIFETIME" },
         });
         engine_mod.link_libcpp = true;
@@ -163,7 +170,16 @@ pub fn build(b: *std.Build) void {
         if (b.args) |args| run.addArgs(args);
         b.step(b.fmt("probe-{s}", .{probe.name}), "Run a manual diagnostic probe").dependOn(&run.step);
     }
-    // Manual load-reproduction state generator; not a test or CI member.
+    const unreferenced = b.addExecutable(.{
+        .name = "f2z-unreferenced",
+        .root_module = b.createModule(.{ .root_source_file = b.path("scripts/unreferenced.zig"), .target = b.graph.host, .optimize = .Debug }),
+    });
+    const run_unreferenced = b.addRunArtifact(unreferenced);
+    run_unreferenced.setCwd(b.path("."));
+    run_unreferenced.addArgs(&.{ "build.zig", "engine", "client", "shared", "tests" });
+    if (b.args) |args| run_unreferenced.addArgs(args);
+    b.step("unreferenced", "List files nothing imports and declarations nothing refers to").dependOn(&run_unreferenced.step);
+
     const load_fixture_mod = b.createModule(.{
         .root_source_file = b.path("tests/harness/load_repro/fixture.zig"),
         .target = target,
@@ -207,7 +223,6 @@ pub fn build(b: *std.Build) void {
         const run_tests = b.addRunArtifact(tests);
         b.step(entry.name, "Test isolated native component delivery").dependOn(&run_tests.step);
         firewall_step.dependOn(&run_tests.step);
-        // Compile-only entry point for isolated target execution; never run on the build host.
         if (std.mem.eql(u8, entry.name, "test-native-firewall")) {
             const installed = b.addInstallArtifact(tests, .{ .dest_sub_path = "native-firewall-tests" });
             b.step("build-native-firewall-tests", "Build an isolated target test binary without executing it").dependOn(&installed.step);

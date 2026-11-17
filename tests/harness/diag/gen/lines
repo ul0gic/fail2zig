@@ -1,11 +1,15 @@
 #!/usr/bin/env -S python3 -I
-# Usage: lines portsentry|sshd COUNT RATE [--start N] [--per-address K]  (writes paced lines to stdout)
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Writes paced portsentry or sshd failure lines for distinct addresses in 198.18.0.0/15 to stdout.
+# Holds: Every generated address lies in 198.18.0.0/15, and a request past its 128,000 addresses is refused before any line is written.
+
 import argparse
 import os
 import sys
 import time
 
-# 198.18.0.0/15 is the RFC 2544 benchmarking range: generated bans never block real traffic.
+# Why: 198.18.0.0/15 is the RFC 2544 benchmarking range, so generated addresses are never real clients.
 ADDRESSES = 2 * 256 * 250
 
 

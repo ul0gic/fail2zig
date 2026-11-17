@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Keeps an in-memory projection of retry states that answers pool counts, jail summaries, live decisions and eviction victims.
+// Holds: Counts, live decisions and victims are answered only after every retry_states row is copied and the projection clock is current.
+
 const std = @import("std");
 const build_options = @import("build_options");
-const diag = @import("../core/diag.zig");
-const detection = @import("../core/native_detection_record.zig");
-const retry = @import("../core/native_retry.zig");
+const diag = @import("../diag/diag.zig");
+const detection = @import("../detect/detection_record.zig");
+const retry = @import("../detect/retry.zig");
 const store = @import("store.zig");
 const Error = store.Error;
 const Stmt = store.Stmt;
@@ -250,7 +253,7 @@ pub fn Methods(comptime Store: type) type {
                 if (failure == error.RetryAdmissionRequired) return;
                 return failure;
             };
-            // Member rows were removed by committed retirement pages.
+            // Why: Retirement pages delete member rows first, so a row left here means the projection and retry_states disagree.
             var members = try self.statement("SELECT 1 FROM temp.retry_admission_rows WHERE jail_id=?1 LIMIT 1;");
             defer members.deinit();
             try members.int(1, id);
@@ -376,7 +379,10 @@ pub fn Methods(comptime Store: type) type {
             } else complete = true;
             const final = try self.projectionMeta();
             try self.commitTransaction();
-            if (comptime build_options.diag) if (!meta.ready or meta.target_us != null or (self.retry_admission_target_hint != null and self.retry_admission_target_hint.? > meta.as_of_us)) diag.count(.retry_projection_pages, 1);
+            if (comptime build_options.diag) if (!meta.ready or meta.target_us != null or (self.retry_admission_target_hint != null and self.retry_admission_target_hint.? > meta.as_of_us)) diag.count(
+                .retry_projection_pages,
+                1,
+            );
             if (self.retry_admission_target_hint) |hint| if (final.ready and hint <= final.as_of_us) {
                 self.retry_admission_target_hint = null;
             };
@@ -439,7 +445,10 @@ pub fn Methods(comptime Store: type) type {
                 self.projectionHint(now_us);
                 return null;
             }
-            return .{ .occupancy = .{ .tracked = @intCast(meta.total - meta.live), .banned = @intCast(meta.live), .tracking_limit = retry.max_pool_subjects, .ban_limit = retry.max_pool_subjects }, .as_of_us = now_us };
+            return .{
+                .occupancy = .{ .tracked = @intCast(meta.total - meta.live), .banned = @intCast(meta.live), .tracking_limit = retry.max_pool_subjects, .ban_limit = retry.max_pool_subjects },
+                .as_of_us = now_us,
+            };
         }
         fn subjectLess(a: detection.Subject, b: detection.Subject) bool {
             if (a == .v4 and b == .v6) return true;
@@ -493,7 +502,7 @@ pub fn Methods(comptime Store: type) type {
             if (comptime build_options.diag) diag.count(.retry_live_reads, 1);
             var count: usize = 0;
             var after: ?LiveCursor = null;
-            // Synchronous worker-only pages cannot interleave another Store mutation.
+            // Why: Pages are separate read transactions run back to back on this Store, so no mutation through it falls between them.
             while (true) {
                 if (count == output.len) {
                     var probe: [1]Store.ActiveDecision = undefined;

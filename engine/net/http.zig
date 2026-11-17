@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Serves the metrics, status and health endpoints over HTTP/1.1.
+// Holds: A connection gets one response to one request of at most 8 KiB and is then closed; ban details are never served.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const linux = std.os.linux;
 
-const event_loop_mod = @import("../core/event_loop.zig");
+const event_loop_mod = @import("../platform/event_loop.zig");
 const EventLoop = event_loop_mod.EventLoop;
-const ws_mod = @import("ws.zig");
 
 pub const max_clients: usize = 16;
 pub const max_request_bytes: usize = 8 * 1024;
@@ -85,7 +86,6 @@ pub const HttpServer = struct {
     metrics_source: MetricsSource = .{},
     status_source: StatusSource = .{},
     health_source: StatusSource = .{},
-    ws_server: ?*ws_mod.WsServer = null,
     clients: [max_clients]?*ClientReg = [_]?*ClientReg{null} ** max_clients,
     accept_bucket_epoch_s: i64 = 0,
     accept_bucket_count: u32 = 0,
@@ -148,13 +148,6 @@ pub const HttpServer = struct {
         self.* = undefined;
     }
 
-    pub fn getBoundPort(self: *const HttpServer) !u16 {
-        var addr: linux.sockaddr.in = undefined;
-        var len: posix.socklen_t = @sizeOf(linux.sockaddr.in);
-        try posix.getsockname(self.listen_fd, @ptrCast(&addr), &len);
-        return std.mem.bigToNative(u16, addr.port);
-    }
-
     pub fn setMetricsSource(self: *HttpServer, s: MetricsSource) void {
         self.metrics_source = s;
     }
@@ -164,10 +157,6 @@ pub const HttpServer = struct {
     }
     pub fn setStatusSource(self: *HttpServer, s: StatusSource) void {
         self.status_source = s;
-    }
-
-    pub fn setWsServer(self: *HttpServer, server: ?*ws_mod.WsServer) void {
-        self.ws_server = server;
     }
 
     pub fn start(self: *HttpServer) Error!void {
@@ -192,6 +181,7 @@ pub const HttpServer = struct {
     }
 
     fn acceptPending(self: *HttpServer, listen_fd: posix.fd_t) void {
+        // Why: No timer runs here; stalled clients are swept when the next connection arrives.
         self.sweepDeadlines();
 
         while (true) {
@@ -298,12 +288,10 @@ pub const HttpServer = struct {
             }
             cli.len += n;
 
-            if (std.mem.indexOf(u8, cli.buf[0..cli.len], "\r\n\r\n")) |hdr_end| {
-                const outcome = self.respond(cli, hdr_end) catch Outcome.close;
-                switch (outcome) {
-                    .close => self.closeClient(cli),
-                    .handoff => self.releaseClient(cli),
-                }
+            // Why: The header section ends at the first empty line (RFC 9112 section 2.1); no request body is ever read.
+            if (std.mem.indexOf(u8, cli.buf[0..cli.len], "\r\n\r\n") != null) {
+                self.respond(cli) catch {};
+                self.closeClient(cli);
                 return;
             }
         }
@@ -311,22 +299,20 @@ pub const HttpServer = struct {
         self.closeClient(cli);
     }
 
-    const Outcome = enum { close, handoff };
-
-    fn respond(self: *HttpServer, cli: *ClientReg, hdr_end_idx: usize) !Outcome {
+    fn respond(self: *HttpServer, cli: *ClientReg) !void {
         const req_end = std.mem.indexOf(u8, cli.buf[0..cli.len], "\r\n") orelse {
             try writeSimpleResponse(cli.fd, 400, "Bad Request", "text/plain", "bad request\n");
-            return .close;
+            return;
         };
         const request_line = cli.buf[0..req_end];
         const parsed = parseRequestLine(request_line) orelse {
             try writeSimpleResponse(cli.fd, 400, "Bad Request", "text/plain", "bad request line\n");
-            return .close;
+            return;
         };
 
         if (!std.mem.eql(u8, parsed.method, "GET")) {
             try writeSimpleResponse(cli.fd, 405, "Method Not Allowed", "text/plain", "only GET\n");
-            return .close;
+            return;
         }
 
         const path = blk: {
@@ -336,77 +322,20 @@ pub const HttpServer = struct {
 
         if (std.mem.eql(u8, path, "/metrics")) {
             try self.respondMetrics(cli.fd);
-            return .close;
+            return;
         } else if (std.mem.eql(u8, path, "/api/status")) {
             try self.respondStatus(cli.fd);
-            return .close;
+            return;
         } else if (std.mem.eql(u8, path, "/api/health")) {
             try self.respondHealth(cli.fd);
-            return .close;
+            return;
         } else if (std.mem.eql(u8, path, "/api/bans")) {
             try writeSimpleResponse(cli.fd, 403, "Forbidden", "text/plain", "ban details require administrator access through the local socket\n");
-            return .close;
-        } else if (std.mem.eql(u8, path, "/events")) {
-            return self.tryWsUpgrade(cli, hdr_end_idx);
+            return;
         } else {
             try writeSimpleResponse(cli.fd, 404, "Not Found", "text/plain", "not found\n");
-            return .close;
+            return;
         }
-    }
-
-    fn tryWsUpgrade(self: *HttpServer, cli: *ClientReg, hdr_end_idx: usize) !Outcome {
-        const ws = self.ws_server orelse {
-            try writeSimpleResponse(cli.fd, 400, "Bad Request", "text/plain", "websocket not enabled\n");
-            return .close;
-        };
-
-        const req_bytes = cli.buf[0..cli.len];
-        const upgrade_hdr = ws_mod.findHeader(req_bytes, "Upgrade") orelse {
-            try writeSimpleResponse(cli.fd, 400, "Bad Request", "text/plain", "upgrade required\n");
-            return .close;
-        };
-        if (!asciiEqlIgnoreCase(upgrade_hdr, "websocket")) {
-            try writeSimpleResponse(cli.fd, 400, "Bad Request", "text/plain", "bad upgrade\n");
-            return .close;
-        }
-        const conn_hdr = ws_mod.findHeader(req_bytes, "Connection") orelse {
-            try writeSimpleResponse(cli.fd, 400, "Bad Request", "text/plain", "connection: upgrade required\n");
-            return .close;
-        };
-        if (!asciiContainsIgnoreCase(conn_hdr, "upgrade")) {
-            try writeSimpleResponse(cli.fd, 400, "Bad Request", "text/plain", "connection header missing upgrade\n");
-            return .close;
-        }
-        const key = ws_mod.findHeader(req_bytes, "Sec-WebSocket-Key") orelse {
-            try writeSimpleResponse(cli.fd, 400, "Bad Request", "text/plain", "Sec-WebSocket-Key required\n");
-            return .close;
-        };
-
-        var accept_buf: [64]u8 = undefined;
-        const accept = ws_mod.computeAccept(key, &accept_buf) catch {
-            try writeSimpleResponse(cli.fd, 500, "Internal Server Error", "text/plain", "handshake failed\n");
-            return .close;
-        };
-        var hs_buf: [256]u8 = undefined;
-        const hs = std.fmt.bufPrint(
-            &hs_buf,
-            "HTTP/1.1 101 Switching Protocols\r\n" ++
-                "Upgrade: websocket\r\n" ++
-                "Connection: Upgrade\r\n" ++
-                "Sec-WebSocket-Accept: {s}\r\n\r\n",
-            .{accept},
-        ) catch unreachable;
-        writeAll(cli.fd, hs) catch return .close;
-
-        const tail_start = hdr_end_idx + 4;
-        const tail = if (tail_start <= cli.len) cli.buf[tail_start..cli.len] else cli.buf[0..0];
-
-        self.loop.removeFd(cli.fd) catch {};
-        ws.admitUpgraded(cli.fd, tail) catch |err| {
-            std.log.warn("http: ws handoff failed (fd={d}): {s}", .{ cli.fd, @errorName(err) });
-            return .handoff;
-        };
-        return .handoff;
     }
 
     fn respondMetrics(self: *HttpServer, fd: posix.fd_t) !void {
@@ -423,6 +352,7 @@ pub const HttpServer = struct {
             try writeSimpleResponse(fd, 500, "Internal Server Error", "text/plain", "metrics body too large\n");
             return;
         }
+        // Why: version=0.0.4 names the Prometheus text exposition format (prometheus.io/docs/instrumenting/exposition_formats).
         try writeResponse(fd, 200, "OK", "text/plain; version=0.0.4", body.items);
     }
 
@@ -457,6 +387,7 @@ pub const HttpServer = struct {
             try writeSimpleResponse(fd, 500, "Internal Server Error", "text/plain", "health body too large\n");
             return;
         }
+        // Why: The status code is read off the body: only the exact text "ready":true answers 200, so that spelling is load-bearing.
         if (std.mem.indexOf(u8, body.items, "\"ready\":true") != null) {
             try writeResponse(fd, 200, "OK", "application/json", body.items);
         } else {
@@ -477,18 +408,6 @@ pub const HttpServer = struct {
         posix.close(cli.fd);
         self.allocator.destroy(cli);
     }
-
-    fn releaseClient(self: *HttpServer, cli: *ClientReg) void {
-        for (&self.clients) |*slot| {
-            if (slot.*) |existing| {
-                if (existing == cli) {
-                    slot.* = null;
-                    break;
-                }
-            }
-        }
-        self.allocator.destroy(cli);
-    }
 };
 
 const RequestLine = struct {
@@ -500,6 +419,7 @@ fn parseRequestLine(line: []const u8) ?RequestLine {
     const sp1 = std.mem.indexOfScalar(u8, line, ' ') orelse return null;
     const rest = line[sp1 + 1 ..];
     const sp2 = std.mem.indexOfScalar(u8, rest, ' ') orelse return null;
+    // Why: Only origin-form request targets are served (RFC 9112 section 3.2.1).
     if (rest.len == 0 or rest[0] != '/') return null;
     return .{ .method = line[0..sp1], .path = rest[0..sp2] };
 }
@@ -549,24 +469,6 @@ fn writeAll(fd: posix.fd_t, bytes: []const u8) !void {
     }
 }
 
-fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| {
-        if (std.ascii.toLower(x) != std.ascii.toLower(y)) return false;
-    }
-    return true;
-}
-
-fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (haystack.len < needle.len) return false;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (asciiEqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
-    }
-    return false;
-}
-
 fn parseIpv4(s: []const u8) ?u32 {
     var parts = std.mem.splitScalar(u8, s, '.');
     var out: u32 = 0;
@@ -579,58 +481,4 @@ fn parseIpv4(s: []const u8) ?u32 {
     }
     if (count != 4) return null;
     return out;
-}
-
-fn drive(loop: *EventLoop, ms: u64) !void {
-    const Wd = struct {
-        fn run(l: *EventLoop, m: u64) void {
-            std.time.sleep(m * std.time.ns_per_ms);
-            l.stop();
-        }
-    };
-    const th = try std.Thread.spawn(.{}, Wd.run, .{ loop, ms });
-    try loop.run();
-    th.join();
-}
-
-fn connectLocalhost(port: u16) !posix.fd_t {
-    const stype: u32 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
-    const fd = try posix.socket(posix.AF.INET, stype, 0);
-    errdefer posix.close(fd);
-    var addr: linux.sockaddr.in = .{
-        .family = linux.AF.INET,
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = std.mem.nativeToBig(u32, 0x7F000001),
-        .zero = [_]u8{0} ** 8,
-    };
-    try posix.connect(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in));
-    return fd;
-}
-
-fn readAll(fd: posix.fd_t, buf: []u8) !usize {
-    var total: usize = 0;
-    while (total < buf.len) {
-        const n = posix.read(fd, buf[total..]) catch break;
-        if (n == 0) break;
-        total += n;
-    }
-    return total;
-}
-
-const ClientResult = struct {
-    buf: [4096]u8 = undefined,
-    len: usize = 0,
-
-    fn bytes(self: *const ClientResult) []const u8 {
-        return self.buf[0..self.len];
-    }
-};
-
-fn httpRoundTrip(port: u16, req: []const u8) !ClientResult {
-    const fd = try connectLocalhost(port);
-    defer posix.close(fd);
-    try writeAll(fd, req);
-    var res: ClientResult = .{};
-    res.len = try readAll(fd, &res.buf);
-    return res;
 }

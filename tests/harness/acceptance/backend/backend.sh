@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# B6 host-ban/restart/expiry, plus existing campaign TCP controls. Parent owns netns.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Proves on one firewall backend that host bans persist across a daemon restart and expire at their original deadlines.
+# Holds: It exits 65 unless its network namespace differs from the runner's recorded parent one, and removes its daemon and scratch on exit.
+
 set -euo pipefail
 umask 077
 [[ $# == 4 ]] || { echo 'usage: backend.sh BIN WORK ORACLE BACKEND' >&2; exit 64; }
@@ -12,7 +16,7 @@ case "$W" in *'"'*|*'\'*|*$'\n'*|*$'\r'*) exit 64;; esac
 [[ -z $(find "$W" -mindepth 1 -maxdepth 1 -print -quit) ]] || exit 64
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 HELPER="$HERE/backend_check.py"
-# Only the runner may invoke this driver, inside its disposable network namespace.
+# Why: The script programs the firewall, so it refuses to run in the network namespace the runner recorded as its parent.
 [[ -n ${F2Z_NATIVE_PARENT_NETNS:-} && $(readlink /proc/self/ns/net) != "$F2Z_NATIVE_PARENT_NETNS" ]] || {
     echo 'distinct runner-owned network namespace required' >&2
     exit 65
@@ -131,7 +135,7 @@ stop; assert_members absent; tcp open
 start; wait_members present; status; tcp blocked
 check deadlines "$W/state/fail2zig.sqlite" "$W/owners.json"
 cp "$W/kernel-current.txt" "$W/kernel-restart.txt"
-# Original deadlines control expiry; a restart must not grant another ban interval.
+# Why: Expiry is awaited against the deadlines saved before the restart, which a restart must not extend.
 expiry_end=$(check expiry_end "$W/owners.json")
 while (( $(date +%s) < expiry_end )); do alive || fail 'daemon exited before expiry'; sleep .2; done
 wait_members absent; status; tcp open

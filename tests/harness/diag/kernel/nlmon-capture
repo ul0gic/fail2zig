@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Usage (root, in the daemon's network namespace): nlmon-capture SECONDS OUT.pcap  — netlink traffic of that namespace.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Captures the netlink traffic of the current network namespace to a pcap file for a fixed number of seconds.
+# Holds: The nlmon interface it creates is deleted on exit, and a capture that wrote nothing exits 1.
+
 set -uo pipefail
 export PATH="$PATH:/usr/sbin:/sbin"
 SECS="$1"; OUT="$2"; IF="f2znl$$"
@@ -10,7 +14,7 @@ if ! ip link add "$IF" type nlmon 2>"$OUT.err"; then
 fi
 trap 'ip link del "$IF" 2>/dev/null' EXIT
 ip link set "$IF" up
-# Snap length 256 keeps the netlink headers and bounds the file; -Z root because tcpdump drops to its own user.
+# Why: -s 256 bounds each captured packet, and -Z root stops tcpdump changing user before it opens the output file (tcpdump(1)).
 timeout --signal INT "$SECS" tcpdump -i "$IF" -s 256 -U -Z root -w "$OUT" 2>>"$OUT.err"
 if [ ! -s "$OUT" ]; then
   echo "nlmon-capture: tcpdump wrote nothing: $(tail -c 200 "$OUT.err")" >&2

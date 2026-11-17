@@ -36,9 +36,8 @@ it still held unread bytes is a continuity loss with reason
 Same inode, size below the committed offset: reason `truncated`. Under `refuse`,
 the default, the source pauses, the daemon keeps running and every other jail
 keeps enforcing. `status` shows a `Paused:` block with the jail, path and cause,
-then the exact `repair-source` command. The `Repair:` line reads `stop fail2zig,
-then run:`, but stopping is not required: the command also works while the daemon
-is running. Under
+then the exact `repair-source` command. It applies through the running daemon;
+no stop or restart is needed. Under
 `restart` the source resumes at offset 0 of the file and records the event.
 
 ## Replacement

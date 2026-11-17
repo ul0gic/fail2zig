@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Existing B1: 210 distinct subjects at 4/s, 600s bans, independent kernel/TCP controls.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Drives 210 distinct bans at 4 per second through the rig, sampling kernel set and TCP reachability until the daemon stops.
+# Holds: It exits 65 unless its network namespace differs from the parent one the runner recorded.
+
 set -euo pipefail
 umask 077
 [ "$#" -eq 3 ] || exit 64
@@ -38,9 +42,9 @@ mkdir "$W/kernel"
 sha256sum "$BIN" > "$W/candidate.sha256"
 SOCKET_DIR=$(mktemp -d /tmp/f2z-enforce.XXXXXXXX)
 ip link set lo up
-# Explicit bindable addresses; a route through lo is not sufficient.
+# Why: The probes bind to these source addresses, so each is assigned to lo; a route alone does not make an address bindable (ip(7)).
 for addr in 10.99.0.1 198.19.0.1 198.18.0.1; do ip addr add "$addr/32" dev lo; done
-# One owned listener process, no forked children to escape cleanup.
+# Why: The listener is one child process whose pid is kept in L, so cleanup can terminate all of it.
 python3 -u -c 'import socket
 s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
 s.bind(("10.99.0.1",18080)); s.listen(128)
@@ -73,7 +77,7 @@ while [ $((SECONDS-start)) -lt 360 ]; do
     kill -0 "$L" || exit 1
     echo "$i blocked" >> "$W/tcp.log"
   fi
-  # Original R3 campaign: 60s settle plus 120s post window.
+  # Why: Sampling continues 120 seconds after the rig logs that it left the daemon running, which follows its 60 second settle.
   if [ "$post_until" -lt 0 ] && grep -q 'leaving daemon running' "$W/rig.log"; then post_until=$((SECONDS+120)); fi
   if [ "$post_until" -ge 0 ] && [ "$SECONDS" -ge "$post_until" ]; then break; fi
   sleep 1

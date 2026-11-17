@@ -172,12 +172,11 @@ state or source positions.
 | <span id="metrics_enabled"></span>`metrics_enabled`             | Boolean, `true`           | `false` removes the HTTP listener; the socket and protection remain available. |
 | <span id="metrics_bind"></span>`metrics_bind`                   | IPv4 string, `"127.0.0.1"` | Listen address, IPv4 only. Loopback is not authentication.                     |
 | <span id="metrics_port"></span>`metrics_port`                   | Integer `1–65535`, `9100` | Port remains validated even when disabled. Zero does not disable HTTP.         |
-| <span id="websocket_max_clients"></span>`websocket_max_clients` | Integer `1–1024`, `16`    | Accepted and range-checked, with no effect: this release serves no WebSocket.  |
+| <span id="websocket_max_clients"></span>`websocket_max_clients` | Integer                   | Deprecated: accepted and ignored with a warning. Remove it from the file.      |
 
 Endpoints are `/metrics`, `/api/status` and `/api/health`. Health reports
 readiness with HTTP 200/503. `/api/bans` returns 403: ban details are served only
-to administrators through the local socket. `/events` returns 400; the WebSocket
-event stream is not available in this release. The
+to administrators through the local socket. The
 [monitoring API reference](api.md) lists every endpoint, field and metric. HTTP shares the privileged daemon
 process. Keep external access controlled or disable it if unused.
 
@@ -392,10 +391,13 @@ Using both `source` and `backend` in one section is an error. It never chooses
 the firewall backend.
 
 `native_ingestion` defaults to true; `false` fails validation with
-`NativeIngestionRequired`. `compatibility_manifest` (`[global]`) and
-`compatibility_pending` (`[global]` and jails) are migration-managed admission
-metadata; an enabled jail with either set fails with `CompatibilityNotAdmitted`. Do not clear blockers by hand to force an
-unsupported imported jail into service.
+`NativeIngestionRequired`. `compatibility_manifest` (`[global]`, a string) and
+`compatibility_pending` (`[global]` and jails, a boolean) are written by the
+migration tools. The manifest blocks nothing by itself. While
+`compatibility_pending` is true in a jail, that jail fails with
+`CompatibilityNotAdmitted` if enabled; while it is true in `[global]`, every
+enabled jail does. Do not clear it by hand to force an unsupported imported jail
+into service.
 
 <span id="validation"></span>
 
@@ -444,7 +446,7 @@ entries plus the runtime entries of a jail exceed 128. See
 | `MemoryCeilingTooLow`                                       | `memory_ceiling_mb` is below its minimum.                          | Neither successful
 syntax validation nor a reload request establishes installed firewall protection.
 
-The [parser](../../engine/config/native.zig),
+The [parser](../../engine/config/config.zig),
 [shipped example](../../deploy/fail2zig.toml.example)
 and [fail2zig.toml(5)](../man/fail2zig.toml.5)
 define the accepted configuration.

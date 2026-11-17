@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Builds a fail2ban database in a chosen journal mode, optionally missing a table or seeded with jails, logs and bans.
+// Holds: Every seeded address lies in the RFC 5737 or RFC 3849 documentation ranges.
+
 const std = @import("std");
 const db = @import("fail2ban_db.zig");
 
@@ -21,8 +24,7 @@ pub const Options = struct {
     omit_sentinel: bool = false,
 };
 
-// DDL restated from GPL-2.0 upstream fail2ban-1.1.1/fail2ban/server/database.py:114-160; addresses
-// in this fixture use only the RFC 5737 and RFC 3849 documentation ranges.
+// Why: Each statement builds the layout of a fail2ban schema version 4 database.
 pub const ddl = [_]struct { table: []const u8, sql: [*:0]const u8 }{
     .{ .table = "fail2banDb", .sql = "CREATE TABLE IF NOT EXISTS fail2banDb(version INTEGER);" },
     .{ .table = "jails", .sql = "CREATE TABLE IF NOT EXISTS jails(name TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1);" ++
@@ -59,10 +61,6 @@ pub fn seededBans(now: i64) [6]BanRow {
     };
 }
 
-pub const seeded_jail_count: u64 = 2;
-pub const seeded_log_count: u64 = 2;
-pub const seeded_ban_count: u64 = 6;
-
 pub fn build(path: []const u8, options: Options) Error!void {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path_z = std.fmt.bufPrintZ(&path_buffer, "{s}", .{path}) catch return error.PathTooLong;
@@ -72,6 +70,7 @@ pub fn build(path: []const u8, options: Options) Error!void {
         .wal => try conn.exec("PRAGMA journal_mode=WAL"),
         .wal_pending => {
             try conn.exec("PRAGMA journal_mode=WAL");
+            // Why: With both automatic and on-close checkpoints off, committed rows stay in the -wal file after close.
             try conn.exec("PRAGMA wal_autocheckpoint=0");
             try conn.disableCheckpointOnClose();
         },

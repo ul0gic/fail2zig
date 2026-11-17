@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 fail2zig contributors
-# Fixed release contract. No user-supplied commands, paths, or target lists.
+# Does:  Checks release inputs, CI qualification evidence and packages, and publishes the GitHub release through fixed operations.
+# Holds: A release leaves draft only after its downloaded assets match the checked package bytes and the tag resolves to the source commit.
+
 set -euo pipefail
 
 fail() { echo "release: $*" >&2; exit 1; }
 targets=(x86_64-linux-musl aarch64-linux-musl arm-linux-musleabihf mips-linux-musleabi mipsel-linux-musleabi)
-payloads=(COPYING.date-profile LICENSE SQLITE-NOTICE.md fail2zig.1 fail2zig.service fail2zig.toml.5 fail2zig.toml.example install.sh)
+payloads=(LICENSE SQLITE-NOTICE.md fail2zig.1 fail2zig.service fail2zig.toml.5 fail2zig.toml.example install.sh)
 
 inputs() {
     [[ ${RELEASE_TAG:-} =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 'expected a vMAJOR.MINOR.PATCH tag'
@@ -211,7 +213,6 @@ package_check() {
 
 assemble() {
     local source=$1 dir=$2 target
-    cp "$source/engine/compat/COPYING.date-profile" "$dir/COPYING.date-profile"
     cp "$source/LICENSE" "$source/SQLITE-NOTICE.md" "$dir/"
     cp "$source/docs/man/fail2zig.1" "$source/docs/man/fail2zig.toml.5" "$dir/"
     cp "$source/deploy/fail2zig.service" "$source/deploy/fail2zig.toml.example" "$dir/"
@@ -245,7 +246,7 @@ elf_check() {
         esac
         description=$(file "$artifact")
         [[ $description =~ $expected && $description == *', stripped'* ]] || fail "wrong ELF/strip for $target"
-        # Capture readelf first: a tool failure must not look like absent linkage.
+        # Why: Assigning first lets set -e stop on a readelf failure, which inside [[ ]] would read as absent linkage.
         description=$(readelf -l "$artifact")
         [[ $description != *INTERP* ]] || fail "interpreter in $target"
         description=$(readelf -d "$artifact")

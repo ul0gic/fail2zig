@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Pages through native effects to find, and optionally repair, intents marked absent by evidence dispatched before them.
+// Holds: A repair commits only if each update and delete touches exactly one row and the effect then reads back equal to its entry.
+
 const std = @import("std");
 const store = @import("store.zig");
-const effects = @import("../core/native_effect.zig");
+const effects = @import("../effect/effect.zig");
 const Error = store.Error;
 const observation_limit: usize = @intCast(store.load_repair.observations_per_intent);
 

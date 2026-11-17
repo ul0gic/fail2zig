@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
+// Does:  Polls one file before and after appending a line and prints each stage's events, position and operation state as JSON.
+// Holds: Its only writes append whole lines at the end of the probed file; existing bytes are never truncated or rewritten.
+
 const std = @import("std");
 const files = @import("engine_probe").core.durable_file_source;
 const records = @import("engine_probe").core.source_record;
@@ -28,11 +32,13 @@ pub fn main() !void {
     if (args.len != 4 and args.len != 5) return error.InvalidArguments;
     const tail = std.mem.eql(u8, args[2], "1");
     const restored = !std.mem.eql(u8, args[3], "none");
+    // Why: A restored run starts at the tail, so its first poll delivers no existing line before the saved offset is applied.
     var source = try files.FileSource.init(a, args[1], "original-mode", if (tail or restored) .tail else .head, null);
     defer source.deinit();
     var capture = Capture{ .allocator = a, .source = &source, .events = std.ArrayList(Event).init(a), .append_during_ack = if (args.len == 5) args[1] else null };
     if (restored) {
         _ = try source.poll(Capture.ack, &capture);
+        // Why: The first poll builds a checkpoint with the file's real device, inode and prefix, so only its offset is replaced.
         var checkpoint = source.committed.?;
         checkpoint.offset = try std.fmt.parseInt(u64, args[3], 10);
         source.deinit();
@@ -51,7 +57,11 @@ pub fn main() !void {
         capture.events.clearRetainingCapacity();
         const before = source.in_operation;
         while (try source.poll(Capture.ack, &capture)) {}
-        try std.json.stringify(.{ .stage = if (step == 0) "first" else "append", .before = before, .after = source.in_operation, .position = source.committed.?.offset, .events = capture.events.items }, .{}, out);
+        try std.json.stringify(
+            .{ .stage = if (step == 0) "first" else "append", .before = before, .after = source.in_operation, .position = source.committed.?.offset, .events = capture.events.items },
+            .{},
+            out,
+        );
     }
     try out.writeByte(']');
 }

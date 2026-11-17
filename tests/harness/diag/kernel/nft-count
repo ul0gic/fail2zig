@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Usage (root, in the daemon's network namespace): nft-count  — prints "table set elements" per fail2zig set.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Prints the table, set name and element count of each fail2zig nftables set.
+# Holds: Only sets in tables named f2z_* are listed, so no other ruleset content is counted.
+
 set -euo pipefail
 export PATH="$PATH:/usr/sbin:/sbin"
 nft -j list ruleset | python3 -I -c '

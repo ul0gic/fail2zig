@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Validates a version 1 read-only query and renders one bounded JSON page of the requested kind.
+// Holds: A monitor peer gets no scopes, history or firewall items and only redacted configuration; no response exceeds 1 MiB.
+
 const std = @import("std");
 const shared = @import("shared");
 const canonical_scope = @import("../firewall/scope.zig");
 const inspection = @import("../firewall/inspection.zig");
-const firewall_observation = @import("../runtime/native_firewall_observation.zig");
+const firewall_observation = @import("../runtime/firewall_observation.zig");
 
 pub const schema_version: u32 = 1;
 pub const max_response_bytes: usize = 1 << 20;
@@ -124,6 +127,8 @@ pub const ScopeFields = struct {
 
 pub const ScopeProjectionError = error{InvalidScope};
 
+// Does:  Projects a canonical scope to wire fields; protocol and port are set only for a single protocol and a single port.
+// Holds: legacy_exact is true only when protocol and port alone describe the scope completely.
 pub fn projectScope(scope: canonical_scope.Scope) ScopeProjectionError!ScopeFields {
     scope.validate() catch return error.InvalidScope;
     var protocols = ProtocolSet{ .len = 0 };
@@ -135,6 +140,7 @@ pub fn projectScope(scope: canonical_scope.Scope) ScopeProjectionError!ScopeFiel
         canonical_scope.Protocol.icmp_v6,
     }) |protocol| {
         if (scope.protocols.contains(protocol)) {
+            // Why: Protocol repeats canonical_scope.Protocol value for value, so this cast holds only while both keep the same order.
             protocols.values[protocols.len] = @enumFromInt(@intFromEnum(protocol));
             protocols.len += 1;
         }
@@ -202,6 +208,7 @@ pub const ScopeItem = struct {
     match: ?[]const u8 = null,
 };
 
+// Does:  One jail's items as a window: items is the slice that starts at offset, count is the jail's total.
 pub const JailScopes = struct {
     name: []const u8,
     items: []const ScopeItem,
@@ -218,6 +225,7 @@ pub const JailScopes = struct {
 
 pub const ScopesWindow = struct { jail: ?[]const u8, cursor_jail: ?u32, cursor_key: ItemKey = .{}, limit: u32, details: bool = false };
 
+// Does:  Reads the paging window of a scopes request ahead of handle, so the source loads only that window; null means malformed.
 pub fn scopesWindow(arena: std.mem.Allocator, body: []const u8) ?ScopesWindow {
     if (body.len > shared.protocol.max_request_body) return null;
     const parsed = std.json.parseFromSliceLeaky(Request, arena, body, .{ .ignore_unknown_fields = false }) catch return null;
@@ -228,6 +236,7 @@ pub fn scopesWindow(arena: std.mem.Allocator, body: []const u8) ?ScopesWindow {
     }
     var window = ScopesWindow{ .jail = parsed.jail, .cursor_jail = null, .limit = limit, .details = parsed.details orelse false };
     if (parsed.cursor) |text| {
+        // Why: An undecodable cursor is left for handle to refuse; until then the window starts at the first item.
         const cursor = Cursor.decode(text) catch return window;
         switch (cursor) {
             .keyset => |keyset| {
@@ -256,11 +265,12 @@ pub const HistoryEvent = struct {
     match: ?[]const u8 = null,
 };
 
-pub const HistoryRead = struct { more: bool, resume_after: u64 };
+pub const HistoryRead = struct { more: bool, started_after: u64, resume_after: u64 };
 
 pub const HistorySource = struct {
     ctx: ?*anyopaque,
-    read: *const fn (ctx: ?*anyopaque, jail: ?[]const u8, after_sequence: u64, limit: u16, out: *std.ArrayList(HistoryEvent)) anyerror!HistoryRead,
+    // Does:  A null after_sequence means no cursor: the source starts at its oldest retained record.
+    read: *const fn (ctx: ?*anyopaque, jail: ?[]const u8, after_sequence: ?u64, limit: u16, out: *std.ArrayList(HistoryEvent)) anyerror!HistoryRead,
 };
 
 pub const FirewallUnavailableReason = enum { no_manager, memory_budget, allocation_failed, not_observed, clock_unavailable };
@@ -336,6 +346,8 @@ pub const Sources = struct {
 
 pub const Error = error{OutOfMemory};
 
+// Does:  Answers one query: validates the request, enforces the peer class, then renders the page or returns a coded failure.
+// Holds: A monitor request for an admin kind fails with 403 before anything is rendered.
 pub fn handle(allocator: std.mem.Allocator, body: []const u8, peer_class: PeerClass, generation: [32]u8, sources: Sources) Error!Result {
     if (body.len > shared.protocol.max_request_body) return fail(400, "request body exceeds 16 KiB");
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -424,11 +436,13 @@ pub fn handle(allocator: std.mem.Allocator, body: []const u8, peer_class: PeerCl
     return .{ .payload = try out.toOwnedSlice() };
 }
 
+// Does:  Opaque page position: base64url of `k:<jail index>:<key hex>` for scopes or `h:<sequence>` for history.
 pub const Cursor = union(enum) {
     keyset: struct { jail: u32, key: ItemKey },
     history: struct { after_sequence: u64 },
 
     pub fn encode(self: Cursor, buffer: *[max_cursor_bytes]u8) []const u8 {
+        // Why: 96 raw bytes encode to exactly max_cursor_bytes of unpadded base64url.
         var raw: [96]u8 = undefined;
         const text = switch (self) {
             .keyset => |k| std.fmt.bufPrint(&raw, "k:{d}:{s}", .{ k.jail, std.fmt.fmtSliceHexLower(k.key.slice()) }) catch return "",
@@ -471,6 +485,7 @@ pub fn requestedDetails(arena: std.mem.Allocator, body: []const u8) bool {
     return parsed.details orelse false;
 }
 
+// Does:  Peeks at a request's kind before handle runs; null when the body does not parse or names another schema version.
 pub fn requestedKind(arena: std.mem.Allocator, body: []const u8) ?Kind {
     if (body.len > shared.protocol.max_request_body) return null;
     const parsed = std.json.parseFromSliceLeaky(Request, arena, body, .{ .ignore_unknown_fields = false }) catch return null;
@@ -485,12 +500,14 @@ fn fail(code: u16, message: []const u8) Result {
 
 const RenderError = error{ OutOfMemory, ResponseTooLarge, SourceUnavailable, UnknownJail, BadCursor, InvalidatedCursor, SourceFailed };
 
+// Does:  Writer that refuses any byte past max_response_bytes.
 pub const BoundedSink = struct {
     list: *std.ArrayList(u8),
     const WriteError = error{ OutOfMemory, ResponseTooLarge };
     const Writer = std.io.GenericWriter(*BoundedSink, WriteError, write);
     fn write(self: *BoundedSink, bytes: []const u8) WriteError!usize {
         if (self.list.items.len + bytes.len > max_response_bytes) return error.ResponseTooLarge;
+        // Why: Reserving the cap once keeps the list's capacity from doubling past max_response_bytes.
         if (self.list.capacity < max_response_bytes) try self.list.ensureTotalCapacityPrecise(max_response_bytes);
         self.list.appendSliceAssumeCapacity(bytes);
         return bytes.len;
@@ -500,6 +517,7 @@ pub const BoundedSink = struct {
     }
 };
 
+// Does:  Runs a source callback and parses its JSON; the result must be an object so the envelope can be stamped onto it.
 fn runCallback(arena: std.mem.Allocator, allocator: std.mem.Allocator, callback: Callback) RenderError!std.json.Value {
     var raw = std.ArrayList(u8).init(allocator);
     defer raw.deinit();
@@ -525,6 +543,7 @@ fn renderStats(writer: anytype, source: ?Stats, generation_hex: []const u8) Rend
 
 fn renderPassthrough(arena: std.mem.Allocator, allocator: std.mem.Allocator, writer: anytype, callback: ?Callback, generation_hex: []const u8) RenderError!void {
     const source = callback orelse return error.SourceUnavailable;
+    // Why: A stamped source already carries schema_version and generation, so its bytes pass through without a parse.
     if (source.stamped) {
         var raw = std.ArrayList(u8).init(allocator);
         defer raw.deinit();
@@ -672,6 +691,7 @@ fn stringList(out: anytype, name: []const u8, values: []const []const u8, redact
     try out.endArray();
 }
 
+// Does:  Renders one page of ban scopes; the view arrives already positioned at the cursor through each jail's offset.
 fn renderScopes(writer: anytype, view: ?ScopesView, jail_filter: ?[]const u8, cursor_text: ?[]const u8, limit: u32, details: bool, generation_hex: []const u8) RenderError!void {
     const scopes = view orelse return error.SourceUnavailable;
     var first_jail: u32 = 0;
@@ -709,6 +729,7 @@ fn renderScopes(writer: anytype, view: ?ScopesView, jail_filter: ?[]const u8, cu
         while (item_index < jail.total() and emitted < limit) : (item_index += 1) {
             const item = jail.at(item_index);
             writeScopeItem(&out, jail.name, item, details) catch |err| return mapWrite(err);
+            // Why: The next cursor is built from the last item's key, so an item without one cannot be paged past.
             if (item.key.len == 0) return error.SourceFailed;
             last_key = item.key;
             emitted += 1;
@@ -726,6 +747,7 @@ fn renderScopes(writer: anytype, view: ?ScopesView, jail_filter: ?[]const u8, cu
     out.objectField("next_cursor") catch |err| return mapWrite(err);
     if (jail_index < last_jail) {
         var buffer: [max_cursor_bytes]u8 = undefined;
+        // Why: An empty key means the start of that jail; otherwise the cursor resumes after the last item written.
         const key = if (item_index == 0) ItemKey{} else last_key orelse return error.SourceFailed;
         const next = (Cursor{ .keyset = .{ .jail = jail_index, .key = key } }).encode(&buffer);
         out.write(next) catch |err| return mapWrite(err);
@@ -804,6 +826,7 @@ fn renderFirewall(allocator: std.mem.Allocator, writer: anytype, source: ?Firewa
     const selected = source orelse return error.SourceUnavailable;
     switch (selected) {
         .unavailable => |reason| {
+            // Why: A cursor names an observation; with none available it can only belong to one that is gone.
             if (cursor != null) return error.InvalidatedCursor;
             return writeUnavailableFirewall(writer, generation_hex, reason);
         },
@@ -921,6 +944,8 @@ fn hasFirewallStructure(metadata: firewall_observation.Metadata) bool {
     return metadata.state == .owned and metadata.structure_proof == .exact_v1;
 }
 
+// Does:  Describes the tables, chains, sets and rules this installation owns, derived from its name and backend, not read back.
+// Holds: Emitted only under the exact_v1 structure proof; every literal here must match what the backend installs.
 fn writeFirewallStructure(out: anytype, metadata: firewall_observation.Metadata) !void {
     try out.objectField("structure");
     if (!hasFirewallStructure(metadata)) return out.write(null);
@@ -1060,7 +1085,7 @@ fn writeFirewallItem(out: anytype, entry: inspection.Entry, metadata: firewall_o
 
 fn renderHistory(arena: std.mem.Allocator, writer: anytype, source: ?HistorySource, jail_filter: ?[]const u8, cursor_text: ?[]const u8, limit: u16, details: bool, generation_hex: []const u8) RenderError!void {
     const history = source orelse return error.SourceUnavailable;
-    var after_sequence: u64 = 0;
+    var after_sequence: ?u64 = null;
     if (cursor_text) |text| {
         const cursor = try Cursor.decode(text);
         if (cursor != .history) return error.BadCursor;
@@ -1074,7 +1099,8 @@ fn renderHistory(arena: std.mem.Allocator, writer: anytype, source: ?HistorySour
         error.HistoryUnavailable => error.SourceUnavailable,
         else => error.SourceFailed,
     };
-    if (scanned.more and scanned.resume_after <= after_sequence) return error.SourceFailed;
+    // Why: A source that reports more without advancing would hand out a cursor that returns the same page forever.
+    if (scanned.more and scanned.resume_after <= scanned.started_after) return error.SourceFailed;
     const items = events.items[0..@min(events.items.len, limit)];
 
     var out = std.json.writeStream(writer, .{});
@@ -1083,6 +1109,7 @@ fn renderHistory(arena: std.mem.Allocator, writer: anytype, source: ?HistorySour
     out.objectField("items") catch |err| return mapWrite(err);
     out.beginArray() catch |err| return mapWrite(err);
     for (items) |event| {
+        // Why: An item past the resume point would be returned again by the next page.
         if (event.sequence > scanned.resume_after) return error.SourceFailed;
         writeHistoryEvent(&out, event, details) catch |err| return mapWrite(err);
     }
@@ -1122,6 +1149,7 @@ fn writeMatches(out: anytype, match: ?[]const u8) !void {
     try out.endArray();
 }
 
+// Does:  Bounded writer over an unmanaged list, for sources that set their own byte limit.
 pub const ByteSink = struct {
     out: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,

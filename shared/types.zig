@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Defines the address, jail name and ignore-entry types with their text parsers and formatters, plus ban state and origin tags.
+// Holds: Parsing folds IPv4-mapped IPv6 to IPv4 and clears ignore-entry bits past the prefix, so one network has one value.
+
 const std = @import("std");
 const duration = @import("duration.zig");
 
@@ -27,10 +30,12 @@ pub const IpAddress = union(enum) {
     pub fn fromIpv6Bits(v: u128) Error!IpAddress {
         const mapped_prefix: u128 = 0x0000_0000_0000_0000_0000_ffff_0000_0000;
         const mapped_mask: u128 = 0xffff_ffff_ffff_ffff_ffff_ffff_0000_0000;
+        // Why: An IPv4-mapped address (RFC 4291 section 2.5.5.2) names an IPv4 host, so it is stored as that IPv4 address.
         if ((v & mapped_mask) == mapped_prefix) {
             return .{ .ipv4 = @truncate(v) };
         }
         const compat_mask: u128 = 0xffff_ffff_ffff_ffff_ffff_ffff_0000_0000;
+        // Why: The deprecated IPv4-compatible form (RFC 4291 section 2.5.5.1) is refused; only :: and ::1 share its prefix.
         if ((v & compat_mask) == 0) {
             const low32: u32 = @truncate(v);
             if (low32 != 0 and low32 != 1) {
@@ -115,6 +120,7 @@ pub const IpAddress = union(enum) {
             groups[i] = @truncate(v >> shift);
         }
 
+        // Why: Only the first longest run of two or more zero groups becomes "::" (RFC 5952 section 4.2).
         var best_start: isize = -1;
         var best_len: usize = 0;
         var i: usize = 0;
@@ -202,7 +208,7 @@ pub const IgnoreEntry = struct {
             std.fmt.bufPrint(buf, "{}", .{self.network()})
         else
             std.fmt.bufPrint(buf, "{}/{d}", .{ self.network(), self.prefix });
-        // Longest form is 39 address bytes plus "/128", inside the 64-byte buffer.
+        // Why: The longest text is a 39-byte IPv6 address plus "/128", so the 64-byte buffer cannot overflow.
         return printed catch unreachable;
     }
 
@@ -227,6 +233,7 @@ pub const IgnoreEntry = struct {
     }
 };
 
+// Why: The numeric values are stored in the state database's effect owner rows, so they are never renumbered.
 pub const Origin = enum(u8) {
     detection = 1,
     manual = 2,

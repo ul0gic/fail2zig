@@ -5,7 +5,7 @@ firewall, migration, restart and load qualification. Select one module with an
 explicit candidate hash and a new work directory. These tests run in owned
 namespaces and do not modify the installed service.
 
-`load_repro/` contains the retained BUG-075 incident generator and raw kernel
+`load_repro/` contains the retained load incident generator and raw kernel
 oracle. It is investigative material; the acceptance runner is the entry point
 for new checks.
 

@@ -32,9 +32,9 @@ every file you intend to install. A matching checksum establishes integrity
 relative to the checksum file. Attestation adds build provenance, not a guarantee
 that the source or toolchain is defect-free.
 
-The packet has 14 assets: five executables, the unit, example config, installer,
-two man pages, LICENSE, SQLITE-NOTICE.md, COPYING.date-profile and SHA256SUMS.
-There are 13 content entries in the checksum file. No separate client asset ships.
+The packet has 13 assets: five executables, the unit, example config, installer,
+two man pages, LICENSE, SQLITE-NOTICE.md and SHA256SUMS.
+There are 12 content entries in the checksum file. No separate client asset ships.
 
 ## Inspect static linkage
 

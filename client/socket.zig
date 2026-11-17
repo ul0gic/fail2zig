@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Connects to the daemon's Unix socket and exchanges one framed command for one response.
+// Holds: Timeouts are set before connect, so connect, each send and each receive wait at most timeout_ms; zero means no limit (socket(7)).
 
 const std = @import("std");
 const posix = std.posix;
@@ -138,6 +140,7 @@ pub fn connect(
     };
     errdefer posix.close(fd);
 
+    // Why: A Unix stream connect waits on a full listen backlog for up to SO_SNDTIMEO (net/unix/af_unix.c), so it is set first.
     const tv = timeoutToTimeval(timeout_ms);
     setTimeout(fd, posix.SO.SNDTIMEO, tv) catch |e| {
         diag.set("failed to set send timeout: {s}", .{@errorName(e)});

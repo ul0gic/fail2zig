@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Decides whether a manual ban target would cover a loopback address, an address of this host or the SSH client's address.
+// Holds: A target inside 127.0.0.0/8 or ::1, or containing a loopback, host or SSH peer address, is protected; nothing else is.
+
 const std = @import("std");
 const shared = @import("shared");
 
@@ -39,6 +42,7 @@ fn protect(matched: IpAddress, reason: GuardReason) GuardVerdict {
     return .{ .protected = .{ .matched = matched, .reason = reason } };
 }
 
+// Why: SSH_CONNECTION holds client address, client port, server address and server port, space-separated (ssh(1)).
 fn sshPeer(ssh_connection: ?[]const u8) ?IpAddress {
     const value = ssh_connection orelse return null;
     var fields = std.mem.tokenizeScalar(u8, value, ' ');

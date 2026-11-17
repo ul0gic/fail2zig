@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Parses the migrate command line, runs inspect, snapshot, plan and validate, and dispatches cutover, status and rollback.
+// Holds: Plan exits success only when the plan has no blockers and validate only when the outcome is valid; anything else exits nonzero.
 
 const std = @import("std");
 const shared = @import("shared");
@@ -198,7 +200,10 @@ fn runSnapshot(allocator: std.mem.Allocator, parsed: Parsed, stdout: anytype, st
             .pages_copied = captured.pages_copied,
             .restarts = captured.restarts,
         }, .{}, stdout) catch return .usage,
-        .table => stdout.print("source\t{s}\nversion\t{d}\njails\t{d}\nlogs\t{d}\nbans\t{d}\nbips\t{d}\ndestination\t{s}\nsha256\t{s}\n", .{ captured.source_path, captured.version, captured.row_counts.jails, captured.row_counts.logs, captured.row_counts.bans, captured.row_counts.bips, captured.destination_path, &digest }) catch return .usage,
+        .table => stdout.print(
+            "source\t{s}\nversion\t{d}\njails\t{d}\nlogs\t{d}\nbans\t{d}\nbips\t{d}\ndestination\t{s}\nsha256\t{s}\n",
+            .{ captured.source_path, captured.version, captured.row_counts.jails, captured.row_counts.logs, captured.row_counts.bans, captured.row_counts.bips, captured.destination_path, &digest },
+        ) catch return .usage,
     }
     stdout.writeAll("\n") catch {};
     return .success;
@@ -221,7 +226,16 @@ fn cutoverOptions(parsed: Parsed, configured_socket: ?[]const u8, stderr: anytyp
         stderr.writeAll("error: --backend nftables|ipset|iptables is required\n") catch {};
         return null;
     };
-    return .{ .plan_path = plan_path, .state_file = state_file, .staging_dir = staging_dir, .backend = backend, .socket_path = parsed.socket_path orelse configured_socket orelse cli.socket.default_socket_path, .run_id = parsed.run_id, .output = if (parsed.output == .json) .json else .table, .source_verified = parsed.source_verified };
+    return .{
+        .plan_path = plan_path,
+        .state_file = state_file,
+        .staging_dir = staging_dir,
+        .backend = backend,
+        .socket_path = parsed.socket_path orelse configured_socket orelse cli.socket.default_socket_path,
+        .run_id = parsed.run_id,
+        .output = if (parsed.output == .json) .json else .table,
+        .source_verified = parsed.source_verified,
+    };
 }
 
 fn runPlan(allocator: std.mem.Allocator, parsed: Parsed, tool_version: []const u8, stdout: anytype, stderr: anytype) ExitClass {

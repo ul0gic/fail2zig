@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Proves admin commands, jail pause and disable, owner release, migration cutover and rollback and history after pruning.
+// Holds: Cases that touch firewall rules require a network namespace other than F2Z_NATIVE_PARENT_NETNS, then unshare a fresh one.
 
 const std = @import("std");
 const harness = @import("harness.zig");
@@ -122,7 +124,7 @@ fn parseValue(a: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(std.json
     return std.json.parseFromSlice(std.json.Value, a, bytes, .{});
 }
 
-test "admin: BUG-032 prefix without address returns 400 and keeps serving" {
+test "admin: prefix without address returns 400 and keeps serving" {
     const a = t.allocator;
     const shared = @import("shared");
     var h = try harness.Harness.init(a, .{ .spawn_daemon = false });
@@ -161,7 +163,7 @@ test "admin: BUG-032 prefix without address returns 400 and keeps serving" {
     try t.expectEqual(@as(u8, 0), pause.code);
 }
 
-test "admin: BUG-025 unrecorded outcome is uncertain and the request remains fresh" {
+test "admin: unrecorded outcome is uncertain and the request remains fresh" {
     const a = t.allocator;
     var h = try harness.Harness.init(a, .{ .spawn_daemon = false });
     defer h.deinit();
@@ -181,8 +183,8 @@ test "admin: BUG-025 unrecorded outcome is uncertain and the request remains fre
     var probe = try engine.native_store_mod.Store.open(a, h.state_path);
     defer probe.close();
     try probe.inspectExec(
-        "CREATE TRIGGER bug025_admin_outcome BEFORE INSERT ON admin_requests " ++
-            "BEGIN SELECT RAISE(FAIL,'BUG-025 injected outcome failure'); END;",
+        "CREATE TRIGGER fail_admin_outcome BEFORE INSERT ON admin_requests " ++
+            "BEGIN SELECT RAISE(FAIL,'injected outcome failure'); END;",
     );
     const uncertain = try sendAdminFrame(a, &h, request_id, body);
     defer uncertain.deinit(a);
@@ -193,7 +195,7 @@ test "admin: BUG-025 unrecorded outcome is uncertain and the request remains fre
     try t.expectEqual(@as(i64, 0), try probe.inspectInteger("SELECT count(*) FROM jail_admin_states;"));
     try t.expectEqual(@as(i64, 0), try probe.inspectInteger("SELECT mutation_revision FROM admin_revision WHERE id=1;"));
 
-    try probe.inspectExec("DROP TRIGGER bug025_admin_outcome;");
+    try probe.inspectExec("DROP TRIGGER fail_admin_outcome;");
     const applied = try sendAdminFrame(a, &h, request_id, body);
     defer applied.deinit(a);
     try t.expectEqual(@as(u16, 200), applied.code);
@@ -548,7 +550,7 @@ fn ownerExpiry(items: []const std.json.Value, jail: []const u8) !i64 {
     return error.MissingOwner;
 }
 
-test "kernel: admin: BUG-040 nftables network ban list and unban preserve CIDR" {
+test "kernel: admin: nftables network ban list and unban preserve CIDR" {
     if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") == null) return error.SkipZigTest;
     const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
     var namespace_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -840,7 +842,7 @@ test "kernel: admin: a failure after one committed release page is partial and r
     defer _ = h.stopDaemon() catch {};
     try waitReady(&h, 10_000);
 
-    // The final key fails after 64 committed releases and one attempted update in the next page.
+    // Why: Release pages hold 64 owners ordered by scope_key and the trigger fails the 66th, so page one commits and page two rolls back.
     for (1..67) |host| {
         var address_buffer: [32]u8 = undefined;
         const address = try std.fmt.bufPrint(&address_buffer, "192.0.2.{d}", .{host});
@@ -879,14 +881,14 @@ test "kernel: admin: a failure after one committed release page is partial and r
     var trigger_buffer: [512]u8 = undefined;
     const trigger = try std.fmt.bufPrintZ(
         &trigger_buffer,
-        "CREATE TRIGGER bug033_second_page BEFORE UPDATE OF lease_kind ON effect_owners " ++
+        "CREATE TRIGGER fail_second_page BEFORE UPDATE OF lease_kind ON effect_owners " ++
             "WHEN OLD.jail='sshd' AND OLD.lease_kind!=0 AND NEW.lease_kind=0 AND OLD.scope_key=x'{s}' " ++
             "BEGIN SELECT RAISE(FAIL,'injected final-key failure after 65 attempted releases'); END;",
         .{maximum_key},
     );
     try probe.inspectExec(trigger);
     var trigger_installed = true;
-    defer if (trigger_installed) probe.inspectExec("DROP TRIGGER bug033_second_page;") catch {};
+    defer if (trigger_installed) probe.inspectExec("DROP TRIGGER fail_second_page;") catch {};
     const partial = try sendAdminFrame(a, &h, request_id, body);
     defer partial.deinit(a);
     try t.expectEqual(@as(u16, 507), partial.code);
@@ -911,7 +913,7 @@ test "kernel: admin: a failure after one committed release page is partial and r
     try t.expectEqual(@as(u16, 507), restarted.code);
     try t.expect(std.mem.indexOf(u8, restarted.body, "\"mutation_revision\":67") != null);
     try expectRemainingDisableOwners(&probe, remaining_keys, remaining_first, remaining_second);
-    try probe.inspectExec("DROP TRIGGER bug033_second_page;");
+    try probe.inspectExec("DROP TRIGGER fail_second_page;");
     trigger_installed = false;
 
     var timer = try std.time.Timer.start();
@@ -1116,12 +1118,12 @@ test "kernel: admin: post-removal settlement failure stays uncertain and reconci
         .{scope_hex},
     );
     try probe.inspectExec(
-        "CREATE TRIGGER bug035_settlement_failure BEFORE UPDATE OF status ON effect_intents " ++
+        "CREATE TRIGGER fail_settlement BEFORE UPDATE OF status ON effect_intents " ++
             "WHEN OLD.status=1 AND NEW.status=2 AND NEW.lease_kind=0 " ++
             "BEGIN SELECT RAISE(FAIL,'injected post-removal settlement failure'); END;",
     );
     var trigger_installed = true;
-    defer if (trigger_installed) probe.inspectExec("DROP TRIGGER bug035_settlement_failure;") catch {};
+    defer if (trigger_installed) probe.inspectExec("DROP TRIGGER fail_settlement;") catch {};
     const request_id = [_]u8{35} ** 32;
     const uncertain = try sendAdminFrame(a, &h, request_id, body);
     defer uncertain.deinit(a);
@@ -1129,7 +1131,7 @@ test "kernel: admin: post-removal settlement failure stays uncertain and reconci
     try t.expect(std.mem.indexOf(u8, uncertain.body, "\"outcome\":\"uncertain\"") != null);
     try t.expect(std.mem.indexOf(u8, uncertain.body, "effect outcome uncertain") != null);
     try t.expect(!try kernelHas(a, "192.0.2.36"));
-    // The inspector removed and read back the rule; only its SQLite settlement rolled back.
+    // Why: The rule is already gone from the kernel; only the SQLite settlement update failed, so the intent stays pending.
     try t.expectEqual(@as(i64, 1), try probe.inspectInteger(pending_query));
     try t.expectEqual(@as(i64, 0), try probe.inspectInteger("SELECT count(*) FROM effect_owners WHERE jail='sshd' AND lease_kind!=0;"));
     try t.expectEqual(@as(i64, 1), try probe.inspectInteger("SELECT count(*) FROM jail_admin_states WHERE jail='sshd' AND enabled=0 AND paused=1 AND request_id=x'2323232323232323232323232323232323232323232323232323232323232323';"));
@@ -1158,7 +1160,7 @@ test "kernel: admin: post-removal settlement failure stays uncertain and reconci
     try t.expectEqual(std.process.Child.Term{ .Exited = 0 }, try h.stopDaemon());
     try t.expectEqual(@as(i64, 1), try probe.inspectInteger(pending_query));
     try t.expectEqual(@as(i64, 1), try probe.inspectInteger(uncertain_query));
-    try probe.inspectExec("DROP TRIGGER bug035_settlement_failure;");
+    try probe.inspectExec("DROP TRIGGER fail_settlement;");
     trigger_installed = false;
     try h.startDaemon();
     try waitReady(&h, 15_000);
@@ -1246,8 +1248,7 @@ test "kernel: admin: enforcing manual ban, unban and disable settle only by kern
     defer reload.deinit(a);
     try t.expectEqual(@as(u8, 0), reload.code);
     try t.expect(std.mem.indexOf(u8, reload.stdout, "\"outcome\":\"applied\"") != null);
-    // Reload commits before recovery republishes health. Require a new readback
-    // so the pre-reload active snapshot cannot admit the next admin operation.
+    // Why: Reload commits before health is republished, so wait for a kernel readback newer than the reload in confirmed_at_us.
     const reloaded_us = std.time.microTimestamp();
     var reload_timer = try std.time.Timer.start();
     while (true) {
@@ -1346,7 +1347,7 @@ test "kernel: admin: enforcing manual ban, unban and disable settle only by kern
     defer a.free(plan_path);
     const source_socket = try std.fs.path.join(a, &.{ root, "f2b.sock" });
     defer a.free(source_socket);
-    const planned = try run(a, &.{ exe, "migrate", "plan", "--source-dir", "tests/fixtures/fail2ban/config/stock-1.1.1", "--source-db", db_path, "--staging-dir", staging, "--out", plan_path, "--replay-window", "600", "--runtime-socket", source_socket });
+    const planned = try run(a, &.{ exe, "migrate", "plan", "--source-dir", "tests/fixtures/fail2ban/config/cutover", "--source-db", db_path, "--staging-dir", staging, "--out", plan_path, "--replay-window", "600", "--runtime-socket", source_socket });
     defer planned.deinit(a);
     try t.expectEqual(@as(u8, 0), planned.code);
     const staged = try run(a, &.{ exe, "migrate", "cutover", "--plan", plan_path, "--state-file", h.state_path, "--staging-dir", staging, "--backend", "iptables", "--socket", h.socket_path });
@@ -1445,7 +1446,7 @@ test "kernel: admin: enforcing manual ban, unban and disable settle only by kern
     defer native.deinit(a);
     try t.expect(native.code == 0 or native.code == 4);
     try waitKernel(a, "203.0.113.99", true, 10000);
-    // A later native decision on a migrated scope must survive rollback too.
+    // Why: A native ban replaces the cutover owner of 192.0.2.10, and that new owner is compared again after the rollback below.
     const replacement = try admin(a, &h, &.{ "ban", "192.0.2.10", "--jail", "sshd", "--duration", "900" });
     defer replacement.deinit(a);
     try t.expectEqual(@as(u8, 0), replacement.code);
@@ -1493,6 +1494,7 @@ test "kernel: admin: enforcing manual ban, unban and disable settle only by kern
     try t.expect(std.mem.indexOf(u8, socket_only.stderr, "fail2ban-server") != null);
     const stand_in = try std.fs.path.join(a, &.{ root, "fail2ban-server" });
     defer a.free(stand_in);
+    // Why: Rollback with --source-verified requires a running process named fail2ban-server, so a copy of sleep stands in under that name.
     try std.fs.copyFileAbsolute("/bin/sleep", stand_in, .{ .override_mode = 0o755 });
     var service = std.process.Child.init(&.{ stand_in, "300" }, a);
     try service.spawn();
@@ -1611,4 +1613,156 @@ test "admin: staged migration owners stay outside authority and a log-only desti
     try t.expectEqual(@as(i64, 5), try store.inspectInteger("SELECT state FROM migration_runs WHERE run_id=x'a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5';"));
     try t.expectEqual(@as(i64, 0), try store.inspectInteger("SELECT count(*) FROM effect_owners;"));
     try t.expectEqual(@as(i64, 0), try store.inspectInteger("SELECT count(*) FROM migration_steps WHERE outcome=0;"));
+}
+
+const history_retention_s = 6;
+
+fn writeRetentionConfig(h: *harness.Harness) !void {
+    var file = try std.fs.cwd().createFile(h.config_path, .{ .mode = 0o600 });
+    defer file.close();
+    try file.writer().print(
+        \\[global]
+        \\native_ingestion = true
+        \\state_file = "{s}"
+        \\socket_path = "{s}"
+        \\metrics_enabled = false
+        \\firewall = "nftables"
+        \\firewall_namespace = "/proc/{d}/ns/net"
+        \\history_retention = {d}
+        \\[defaults]
+        \\enforce = true
+        \\maxretry = 2
+        \\findtime = 600
+        \\bantime = 600
+        \\[jails.sshd]
+        \\filter = "sshd"
+        \\source = "file"
+        \\timestamp = "undated"
+        \\logpath = ["{s}"]
+        \\
+    , .{ h.state_path, h.socket_path, linux.getpid(), history_retention_s, h.log_path });
+}
+
+const HistoryPage = struct {
+    sequences: std.ArrayList(u64),
+    next: ?[]u8,
+    fn deinit(self: *HistoryPage, a: std.mem.Allocator) void {
+        self.sequences.deinit();
+        if (self.next) |cursor| a.free(cursor);
+    }
+};
+
+fn readHistory(a: std.mem.Allocator, h: *harness.Harness, limit: []const u8, cursor: ?[]const u8) !HistoryPage {
+    var args = std.ArrayList([]const u8).init(a);
+    defer args.deinit();
+    try args.appendSlice(&.{ "history", "--limit", limit });
+    if (cursor) |value| try args.appendSlice(&.{ "--cursor", value });
+    const result = try admin(a, h, args.items);
+    defer result.deinit(a);
+    if (result.code != 0) {
+        std.debug.print("history exited {d}: {s}{s}\n", .{ result.code, result.stdout, result.stderr });
+        return error.HistoryFailed;
+    }
+    const doc = try parseValue(a, result.stdout);
+    defer doc.deinit();
+    var page = HistoryPage{ .sequences = std.ArrayList(u64).init(a), .next = null };
+    errdefer page.deinit(a);
+    for (doc.value.object.get("items").?.array.items) |item| try page.sequences.append(@intCast(item.object.get("sequence").?.integer));
+    const next = doc.value.object.get("next_cursor").?;
+    if (next == .string) page.next = try a.dupe(u8, next.string);
+    return page;
+}
+
+fn expectContiguousFrom(first: u64, sequences: []const u64) !void {
+    for (sequences, 0..) |sequence, index| try t.expectEqual(first + index, sequence);
+}
+
+fn banHost(a: std.mem.Allocator, h: *harness.Harness, address: []const u8) !void {
+    const ban = try admin(a, h, &.{ "ban", address, "--jail", "sshd", "--duration", "300" });
+    defer ban.deinit(a);
+    try t.expectEqual(@as(u8, 0), ban.code);
+    try t.expect(std.mem.indexOf(u8, ban.stdout, "\"enforced\":true") != null);
+}
+
+test "kernel: admin: history without a cursor starts at the oldest retained record after retention pruned the first records" {
+    if (std.posix.getenv("F2Z_NATIVE_DAEMON_ENFORCEMENT") == null) return error.SkipZigTest;
+    const prior = std.posix.getenv("F2Z_NATIVE_PARENT_NETNS") orelse return error.MissingIsolationCookie;
+    var namespace_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const current = try std.fs.readLinkAbsolute("/proc/self/ns/net", &namespace_buffer);
+    try t.expect(!std.mem.eql(u8, prior, current));
+    if (linux.E.init(linux.unshare(linux.CLONE.NEWNET)) != .SUCCESS) return error.IsolationFailed;
+
+    const a = t.allocator;
+    std.fs.cwd().access(exe, .{}) catch return error.SkipZigTest;
+    var h = try harness.Harness.init(a, .{ .spawn_daemon = false });
+    defer h.deinit();
+    try writeRetentionConfig(&h);
+    try h.startDaemon();
+    defer _ = h.stopDaemon() catch {};
+    try waitReady(&h, 10_000);
+
+    try banHost(a, &h, "192.0.2.11");
+    try banHost(a, &h, "192.0.2.12");
+
+    var early: HistoryPage = undefined;
+    var timer = try std.time.Timer.start();
+    while (true) {
+        early = try readHistory(a, &h, "50", null);
+        if (early.sequences.items.len >= 2) break;
+        early.deinit(a);
+        if (timer.read() > 5 * std.time.ns_per_s) return error.TimedOut;
+        std.time.sleep(50 * std.time.ns_per_ms);
+    }
+    defer early.deinit(a);
+    try expectContiguousFrom(1, early.sequences.items);
+    const pruned_through: u64 = early.sequences.items.len;
+    var first_page = try readHistory(a, &h, "1", null);
+    defer first_page.deinit(a);
+    try t.expectEqualSlices(u64, &.{1}, first_page.sequences.items);
+    const stale_cursor = first_page.next orelse return error.MissingNextCursor;
+
+    // Why: Retention removes only records at least history_retention old, so the first two must age before two newer bans arrive.
+    std.time.sleep((history_retention_s * 1000 + 500) * std.time.ns_per_ms);
+    try banHost(a, &h, "192.0.2.13");
+    try banHost(a, &h, "192.0.2.14");
+
+    var retained: HistoryPage = undefined;
+    timer.reset();
+    while (true) {
+        retained = try readHistory(a, &h, "50", null);
+        if (retained.sequences.items.len == 0) return error.RetentionPrunedEveryRecord;
+        if (retained.sequences.items[0] >= pruned_through + 1) break;
+        retained.deinit(a);
+        if (timer.read() > 20 * std.time.ns_per_s) return error.TimedOut;
+        std.time.sleep(100 * std.time.ns_per_ms);
+    }
+    defer retained.deinit(a);
+    try t.expectEqual(pruned_through + 1, retained.sequences.items[0]);
+    try expectContiguousFrom(pruned_through + 1, retained.sequences.items);
+    try t.expect(retained.sequences.items.len >= 2);
+
+    var paged = std.ArrayList(u64).init(a);
+    defer paged.deinit();
+    var cursor: ?[]u8 = null;
+    defer if (cursor) |value| a.free(value);
+    var pages: usize = 0;
+    while (pages < 32) : (pages += 1) {
+        var page = try readHistory(a, &h, "1", cursor);
+        defer page.deinit(a);
+        if (cursor) |value| a.free(value);
+        cursor = page.next;
+        page.next = null;
+        try paged.appendSlice(page.sequences.items);
+        if (cursor == null) break;
+    }
+    try t.expect(cursor == null);
+    try t.expectEqualSlices(u64, retained.sequences.items, paged.items);
+
+    const stale = try admin(a, &h, &.{ "history", "--limit", "50", "--cursor", stale_cursor });
+    defer stale.deinit(a);
+    try t.expect(stale.code != 0);
+    const answer = try std.mem.concat(a, u8, &.{ stale.stdout, stale.stderr });
+    defer a.free(answer);
+    try t.expect(std.mem.indexOf(u8, answer, "409") != null);
+    try t.expect(std.mem.indexOf(u8, answer, "cursor expired or observation changed; restart pagination without a cursor") != null);
 }

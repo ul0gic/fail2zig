@@ -30,7 +30,6 @@ The endpoints are read-only and carry no ban list.
 | `/api/status` | 200, `application/json`. The daemon status with paths and addresses redacted.              |
 | `/api/health` | 200 when ready, 503 when not, `application/json`.                                          |
 | `/api/bans`   | 403, `text/plain`. Ban details are served only through the socket to an administrator.     |
-| `/events`     | 400 `websocket not enabled`. The WebSocket event stream is not available in this release.  |
 | anything else | 404 `not found`.                                                                           |
 
 ```bash
@@ -194,7 +193,8 @@ to 64. A response with more rows carries `next_cursor`; pass it back with
 - A `firewall show` cursor lives 60 seconds, must be used with the same
   `--limit`, and is void once the retained observation changes.
 - A `history` cursor has no timer. It is void once the configuration generation
-  or the set of owners changes.
+  or the set of owners changes, or once `history_retention` has removed the
+  record it points at.
 - A void cursor returns code 409, `cursor expired or observation changed; restart
   pagination without a cursor`. Start again without `--cursor`.
 

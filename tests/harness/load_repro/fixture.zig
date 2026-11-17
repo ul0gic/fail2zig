@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Builds daemon state files and records Store observations through the production Store, for the load rig and its verifiers.
+// Holds: Generated states and result files are never overwritten: an existing one is refused, and new ones are created owner-only.
+
 const std = @import("std");
 const engine = @import("engine_test");
 const durable = engine.core.record_store;
@@ -21,19 +24,19 @@ const usage =
     \\
 ;
 const second_us: i64 = 1_000_000;
-// 2026-01-01T00:00:00Z; every state starts here so identical arguments give identical rows.
+// Why: States built from nothing start their clock at 2026-01-01T00:00:00Z, not at wall time.
 const epoch_us: i64 = 1_767_225_600 * second_us;
 const source_name = "fixture";
 const max_maintenance_steps = 100_000;
 const max_attach_jails = 16;
-// 198.19.0.0/16; the rig's first 65,536 generated addresses occupy 198.18.0.0/16.
+// Why: Attached addresses fill 198.19.0.0/16, above the rig's first 65,536 generated addresses in 198.18.0.0/16.
 const attach_addresses = 1 << 16;
-// Receipt, effect and maintenance floors reject only a smaller value, so 1 µs keeps receipts distinct and monotonic.
+// Why: Each attached record advances the clock by 1 µs, so receipt times strictly increase.
 const attach_step_us: i64 = 1;
 const attach_sample_bans = 1024;
 const batch_records = durable.Store.attribution_batch;
 const Timestamp = @FieldType(durable.Receipt, "time");
-// The daemon binds its history consumer to this constant policy generation.
+// Why: The daemon binds its history consumer to the policy generation hashed from this same label.
 fn historyPolicyGeneration() [32]u8 {
     return effects.hashParts("fail2zig-native-confirmed-history-v1", &.{});
 }
@@ -44,7 +47,7 @@ const RetentionMode = enum { shipped, skip };
 const SyncMode = enum { full, off };
 const AuditMode = enum { full, skip };
 
-// SQLITE_TRACE_PROFILE: the callback receives the finished statement and a pointer to its elapsed nanoseconds.
+// Why: SQLITE_TRACE_PROFILE is 0x02 in sqlite3.h; its callback gets the finished statement and a pointer to elapsed nanoseconds.
 const sqlite_trace_profile: c_uint = 0x02;
 const sqlite3_trace_v2 = @extern(*const fn (*anyopaque, c_uint, ?*const fn (c_uint, ?*anyopaque, ?*anyopaque, ?*anyopaque) callconv(.c) c_int, ?*anyopaque) callconv(.c) c_int, .{ .name = "sqlite3_trace_v2" });
 const sqlite3_sql = @extern(*const fn (?*anyopaque) callconv(.c) ?[*:0]const u8, .{ .name = "sqlite3_sql" });
@@ -132,7 +135,7 @@ const Profile = struct {
     }
 };
 
-// Times the Store's statement lifecycle; the trace profile sees only execution, never preparation.
+// Does:  Wraps the Store's prepare, step, finalize and exec entry points to time them, which the trace profile cannot do for preparation.
 const SqliteApi = struct {
     const Api = @FieldType(durable.Store, "api");
     const Stat = struct { calls: u64 = 0, ns: u64 = 0 };
@@ -307,7 +310,7 @@ const Stats = struct {
     ban_loop_ms: u64 = 0,
 };
 
-// Heap-owned: the store's progress handler and the effect clock keep pointers into it.
+// Why: Gen is heap-allocated because the store's progress handler and the effect clock keep pointers into it.
 const Gen = struct {
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -363,8 +366,7 @@ const Gen = struct {
         self.allocator.free(self.path);
         self.allocator.destroy(self);
     }
-    // Records which production Store operation returned an error, so only its own
-    // refusals are reported as results; every other error is a harness failure.
+    // Holds: Only an error recorded here from a Store operation counts as a refusal; runCase treats any other error as a harness failure.
     fn stored(self: *Gen, operation: []const u8, result: anytype) @TypeOf(result) {
         return result catch |failure| {
             self.store_failure = .{ .operation = operation, .failure = failure };
@@ -377,8 +379,7 @@ const Gen = struct {
         self.store_open = false;
     }
 
-    // Mirrors the daemon's runtime open and schema ladder, including the
-    // per-transaction work guard, so construction hits the same refusals.
+    // Does:  Opens the Store as the daemon does, with runtime limits and the current schema step, so construction meets the same refusals.
     fn openStore(self: *Gen) !void {
         self.store = try self.stored("Store.openRuntime", durable.Store.openRuntime(self.allocator, self.path));
         self.store_open = true;
@@ -388,7 +389,7 @@ const Gen = struct {
         }
         self.store.runtime_path = self.path;
         try self.stored("Store.configureRuntimeLimits", self.store.configureRuntimeLimits());
-        // Durability of intermediate commits only; row contents and VM work are unchanged.
+        // Why: synchronous=OFF changes commit durability only; row contents and VM work are unchanged.
         if (self.options.sync == .off) try self.stored("Store.exec", self.store.exec("PRAGMA synchronous=OFF;"));
         if (self.options.cache_kib != 0) {
             var pragma_buffer: [64]u8 = undefined;
@@ -416,7 +417,7 @@ const Gen = struct {
                 count += 1;
             }
         }
-        // Fresh shapes admit their first jail before runtime owner validation.
+        // Why: A fresh state has no jails to validate; addJail prepares the view after admitting the first one.
         if (count == 0) return;
         try self.stored("Store.validateRuntimeOwnerNames", self.store.validateRuntimeOwnerNames(names[0..count]));
         var validation = durable.Store.MaintenanceValidation{};
@@ -464,8 +465,6 @@ const Gen = struct {
         return .{ .installation = entry.installation.id, .scope_key = entry.scope_key, .fingerprint = effects.hashParts("fail2zig-load-fixture-observation-v1", &.{&entry.intent_id}), .observed_us = self.clock.now, .qualification = .complete_owned, .state = entry.desired };
     }
 
-    // One detection through receipt and record commit, then the effect runtime's
-    // dispatch, verified settlement and action-target reconciliation.
     fn ban(self: *Gen, jail_index: usize, subject: detection.Subject, evidence_bytes: usize) !void {
         try self.prepareRetryTime(self.clock.now);
         const jail = self.jails.items[jail_index];
@@ -521,7 +520,6 @@ const Gen = struct {
             .checkpoint = jail.checkpoint orelse "load-fixture",
         };
     }
-    // One record of a group-commit frame, in the pipeline's stageInFrame order.
     fn stageBan(self: *Gen, frame: anytype, jail_index: usize, subject: detection.Subject) !effects.Hash {
         const key = try (try effects.Scope.host(subject)).key(self.installation);
         const jail = &self.jails.items[jail_index];
@@ -544,7 +542,7 @@ const Gen = struct {
         self.stats.bans += 1;
         return key;
     }
-    // A refusal inside a frame keeps the records staged before it, as the pipeline does.
+    // Holds: A refusal inside a frame still commits the records staged before it and then returns the refusal.
     fn appendChunk(self: *Gen, size: usize) !void {
         try self.prepareRetryTime(self.clock.now);
         var frame = try self.stored("Store.beginBatch", self.store.beginBatch());
@@ -587,7 +585,7 @@ const Gen = struct {
             self.store_failure = null;
         } else if (refusal) |cause| return cause;
     }
-    // One readback per chunk: a single fingerprint and observation time, as the daemon's batched settlement.
+    // Does:  Settles a whole frame with one fingerprint and one observation time.
     fn settleChunk(self: *Gen, keys: []const effects.Hash, jail_indices: []const usize) !void {
         var items: [batch_records]durable.Store.InstallItem = undefined;
         var count: usize = 0;
@@ -700,7 +698,7 @@ const Gen = struct {
         try self.consume(null);
         if (self.maintenance) try self.maintain();
     }
-    // The daemon's restoreHistory sequence; a base without a saved consumer is not a daemon state.
+    // Holds: A state without a saved, ready, current-version history consumer is refused, never repaired.
     fn restoreHistory(self: *Gen) !void {
         const manifest = self.consumer.manifest();
         var saved = try self.stored("Store.consumerManifestSnapshot", self.store.consumerManifestSnapshot(self.allocator, manifest));
@@ -741,10 +739,10 @@ const Gen = struct {
             if (!try existing.row()) return error.FixtureMissingInstallation;
             jail.records = @intCast(try existing.signed(0));
         }
-        // The jail's pipeline restores from the latest record's checkpoint, so every appended record carries the one the daemon wrote.
+        // Why: Appended records carry the checkpoint the daemon last stored for the jail, not the fixture's placeholder.
         jail.checkpoint = try self.stored("Store.checkpoint", self.store.checkpoint(self.allocator, name)) orelse return error.FixtureMissingCheckpoint;
     }
-    // Starts at or above every persisted floor and never lowers one; a floor past wall time is reported, not repaired.
+    // Holds: The clock starts at or above every persisted floor and never lowers one; a floor past wall time is reported, not repaired.
     fn scheduleClock(self: *Gen) !void {
         const schedule = &self.report.schedule;
         const wall = std.time.microTimestamp();
@@ -799,7 +797,7 @@ const Gen = struct {
         item.head = try self.store.integer("SELECT head FROM confirmed_history_stream WHERE id=1;");
         try self.phases.append(item);
     }
-    // A closed store leaves no WAL, so the main file is a complete copy.
+    // Why: The copy is the main file alone, so a WAL left behind by the close is refused.
     fn snapshot(self: *Gen, dir: []const u8, name: []const u8) ![]u8 {
         self.closeStore();
         var wal_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -931,8 +929,6 @@ fn runReuse(gen: *Gen) !void {
     try gen.phase("final");
 }
 
-// Oracle states are built without retention maintenance: it is the operation
-// under test, and the daemon skips it while the history consumer lags.
 const OracleCase = struct {
     name: []const u8,
     build: *const fn (*Gen, []const u8, *std.ArrayList(Snapshot)) anyerror!void,
@@ -1024,8 +1020,6 @@ const oracle_cases = [_]OracleCase{
     .{ .name = "or9-after-insert", .build = buildLiveInsert },
 };
 
-// Inspection uses a separate read-only connection without the runtime guard,
-// so whole-database checks are not limited by the per-transaction allowance.
 const Inspection = struct {
     fn tables(store: *durable.Store, allocator: std.mem.Allocator) !std.ArrayList([]u8) {
         var names = std.ArrayList([]u8).init(allocator);
@@ -1068,6 +1062,7 @@ fn writeHex(ws: anytype, bytes: []const u8) !void {
 }
 
 fn writeState(ws: anytype, gen: *Gen, label: []const u8, path: []const u8) !void {
+    // Why: A read-only open skips the runtime limits, so whole-database checks are not capped by the per-transaction allowance.
     var store = try durable.Store.openReadOnly(gen.allocator, path);
     if (gen.options.profile) Profile.install(@ptrCast(store.db), gen.allocator);
     defer store.close();
@@ -1166,7 +1161,7 @@ fn writeState(ws: anytype, gen: *Gen, label: []const u8, path: []const u8) !void
     try writeQuery(ws, &store, "spent_scopes", "SELECT count(*) FROM native_effects WHERE lease_kind=0;");
     try writeQuery(ws, &store, "spent_scopes_referenced_by_history", "SELECT count(*) FROM native_effects n WHERE n.lease_kind=0 AND EXISTS(SELECT 1 FROM confirmed_effect_events e WHERE e.scope_key=n.scope_key);");
     try writeQuery(ws, &store, "obsolete_owner_revisions", "SELECT count(*) FROM effect_owner_revisions h WHERE NOT EXISTS(SELECT 1 FROM effect_owners o WHERE o.scope_key=h.scope_key AND o.jail=h.jail AND o.revision=h.revision);");
-    // native_effects has no index on intent_id; NOT IN materializes the referenced ids once instead of scanning per row.
+    // Why: native_effects has no index on intent_id, so NOT IN materializes the referenced ids once instead of scanning per row.
     try writeQuery(ws, &store, "obsolete_intents", "SELECT count(*) FROM effect_intents WHERE intent_id NOT IN (SELECT intent_id FROM native_effects WHERE intent_id IS NOT NULL);");
     try writeQuery(ws, &store, "obsolete_observations", "SELECT count(*) FROM effect_observations WHERE intent_id NOT IN (SELECT intent_id FROM native_effects WHERE intent_id IS NOT NULL);");
     try writeQuery(ws, &store, "action_targets_without_retained_event", "SELECT count(*) FROM action_targets a WHERE NOT EXISTS(SELECT 1 FROM confirmed_effect_events e WHERE e.scope_key=a.scope_key AND e.jail=a.jail AND e.decision_id=a.action_id);");
@@ -1297,7 +1292,7 @@ fn checkPublication(gen: *Gen, harness_failure: ?[]const u8) !Publication {
     const count: i64 = @intCast(gen.options.count);
     if (try store.integer("SELECT head FROM confirmed_history_stream WHERE id=1;") != gen.consumer.live.last_sequence) try result.failures.append("history_head_not_at_checkpoint");
     if (try store.integer("SELECT count(*) FROM pending_receipts;") != 0) try result.failures.append("pending_receipts");
-    // Spent-scope pruning removes only scopes and owners whose lease is spent, and attach runs no expiry, so live rows change only by the appended bans.
+    // Why: lease_kind<>0 leaves out spent rows, which maintenance prunes, and attach runs no expiry, so live rows grow only by count.
     if (try store.integer("SELECT count(*) FROM native_effects WHERE lease_kind<>0;") - gen.report.base_live_native_effects != count) try result.failures.append("live_native_effects_delta");
     if (try store.integer("SELECT count(*) FROM effect_owners WHERE lease_kind<>0;") - gen.report.base_live_effect_owners != count) try result.failures.append("live_effect_owners_delta");
     if (try store.integer("SELECT count(*) FROM action_targets WHERE status<>3;") != 0) try result.failures.append("unconfirmed_action_targets");
@@ -1381,7 +1376,7 @@ fn writeAddress(ws: anytype, index: u64) !void {
     try ws.write(try std.fmt.bufPrint(&buffer, "{d}.{d}.{d}.{d}", .{ subject.v4[0], subject.v4[1], subject.v4[2], subject.v4[3] }));
 }
 
-// Standalone Store observations; the verifier, not this producer, decides acceptance.
+// Holds: Pool and history runs only record observations; their complete event states acceptance_claimed = false.
 const PoolLog = struct {
     file: std.fs.File,
     timer: std.time.Timer,
@@ -1575,7 +1570,7 @@ fn poolProbeHeader(writer: anytype, value: anytype) !void {
     const bytes = stream.getWritten();
     try writer.writeAll(bytes[0 .. bytes.len - 1]);
 }
-// Preserve SELECT * column order and SQLite type tags used by poolHashRow.
+// Why: Columns keep SELECT * order and the SQLite type tags that poolHashRow hashes.
 fn poolTypedRow(writer: anytype, row: *durable.Stmt) !void {
     if (!try row.row()) return writer.writeAll("null");
     try poolTypedColumns(writer, row);
@@ -2512,6 +2507,7 @@ pub fn main() !u8 {
         try ws.objectField("states");
         try ws.beginArray();
         for (oracle_cases) |case| {
+            // Why: Maintenance is off, so no retention step has run in the oracle states this case writes.
             const gen = try Gen.create(allocator, dir, case.name, options, false);
             defer gen.destroy();
             var snapshots = std.ArrayList(Snapshot).init(allocator);
@@ -2525,7 +2521,7 @@ pub fn main() !u8 {
                     try c.build(g, d, s);
                 }
             }.body, .{ gen, dir, &snapshots, case });
-            // Oracle states are small by design; any refusal means the state is wrong.
+            // Why: An oracle state must build without a refusal, so any refusal fails the run.
             if (gen.refusal != null or outcome.harness_failure != null) failed = true;
             try ws.beginObject();
             try ws.objectField("case");

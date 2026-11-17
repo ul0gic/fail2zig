@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Supplies the bash, zsh and fish completion scripts for the fail2zig command.
+// Holds: Each script is a constant compiled into the binary; producing one reads no file, environment variable or socket.
 
 pub fn generateBash() []const u8 {
     return bash_script;

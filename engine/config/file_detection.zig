@@ -1,0 +1,150 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
+// Does:  Builds the file-source detection plan for one jail: processing options, built-in detector, ignore set and log path specs.
+// Holds: A jail is refused unless it is enabled, admitted and file-sourced with between 1 and max_sources (at most 4096) log paths.
+
+const std = @import("std");
+const config = @import("config.zig");
+const processing = @import("../source/source_processor.zig");
+const detector = @import("../detect/builtin_detector.zig");
+const session = @import("../source/file_session.zig");
+const files = @import("../source/durable_file_source.zig");
+const durable = @import("../store/store.zig");
+const ignore_set = @import("../detect/ignore_set.zig");
+
+pub const Settings = struct {
+    timestamp: processing.TimestampSource,
+    body: detector.Body,
+    start: files.Start,
+    max_sources: usize,
+
+    ignore_capacity: usize,
+    custom: bool = false,
+    encoding: @import("../source/source_text.zig").Encoding = .utf8,
+    bom: @import("../source/source_text.zig").Bom = .preserve,
+    max_record_bytes: u32 = 2048,
+    max_decoded_bytes: u32 = 2048,
+};
+
+pub const Plan = struct {
+    processing: processing.Options,
+    detection: ?detector.Detector,
+    ignore_cell: ?**ignore_set.EffectiveIgnore,
+    legacy_generation: [32]u8,
+    specs: []session.Spec,
+    max_sources: usize,
+
+    pub fn sessionOptions(self: *const Plan) session.Options {
+        return .{ .processing = self.processing, .detection = if (self.detection) |*value| value.consumer() else null, .max_sources = self.max_sources };
+    }
+
+    pub fn legacySessionOptions(self: *const Plan) session.Options {
+        var options = self.sessionOptions();
+        options.processing.parent_generation = self.legacy_generation;
+        if (self.detection) |*value| options.detection = value.legacyConsumer();
+        return options;
+    }
+    pub fn customSessionOptions(self: *const Plan, parent: [32]u8) !session.Options {
+        if (self.detection != null) return error.InvalidConsumer;
+        var options = self.sessionOptions();
+        options.processing.parent_generation = fileGeneration(parent, null);
+        return options;
+    }
+
+    pub fn init(allocator: std.mem.Allocator, cfg: *const config.Config, jail_index: usize, parent_generation: [32]u8, settings: Settings) !Plan {
+        if (jail_index >= cfg.jails.len) return error.UnknownJail;
+        const jail = &cfg.jails[jail_index];
+        if (!jail.enabled) return error.DisabledJail;
+        if (cfg.global.compatibility_pending or jail.compatibility_pending) return error.CompatibilityNotAdmitted;
+        const source = if (jail.source == .auto) cfg.defaults.source else jail.source;
+        switch (source) {
+            .auto => return error.SourceSelectionRequired,
+            .journald => return error.JournalOriginPolicyRequired,
+            .internal => return error.InternalEventsRequired,
+            .file => {},
+        }
+        if (settings.timestamp == .journal) return error.InvalidFileTimestampSource;
+        if (settings.max_sources == 0 or settings.max_sources > 4096 or jail.logpath.len == 0 or jail.logpath.len > settings.max_sources) return error.InvalidSourceLimit;
+        for (jail.logpath) |path| if (path.len == 0 or path.len > durable.Limits.source_bytes or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidSourceSpecification;
+        const seconds = jail.effectiveFindtime(cfg.defaults);
+        if (seconds == 0) return error.InvalidFindtime;
+        const window_us = std.math.mul(i64, std.math.cast(i64, seconds) orelse return error.InvalidFindtime, 1_000_000) catch return error.InvalidFindtime;
+        if (settings.body == .syslog) {
+            if (settings.timestamp != .field) return error.SyslogTimestampRequired;
+            const field = settings.timestamp.field;
+            if (field.start != 0) return error.SyslogTimestampRequired;
+            switch (field.format) {
+                .syslog => if (field.boundary != .length or field.boundary.length != 15) return error.SyslogTimestampRequired,
+                .iso8601 => if (field.boundary != .delimiter or field.boundary.delimiter != ' ') return error.SyslogTimestampRequired,
+                else => return error.SyslogTimestampRequired,
+            }
+        }
+        const literals = jail.ignoreip orelse cfg.defaults.ignoreip;
+        var ignore_cell: ?**ignore_set.EffectiveIgnore = null;
+        if (!settings.custom) {
+            const cell = try allocator.create(*ignore_set.EffectiveIgnore);
+            errdefer allocator.destroy(cell);
+            cell.* = try ignore_set.EffectiveIgnore.build(allocator, literals, &.{}, &.{}, &.{}, 0);
+            ignore_cell = cell;
+        }
+        errdefer if (ignore_cell) |cell| {
+            cell.*.deinit(allocator);
+            allocator.destroy(cell);
+        };
+        var detection: ?detector.Detector = if (settings.custom) null else try detector.Detector.init(allocator, .{
+            .filter = jail.filter,
+            .body = settings.body,
+            .ignore = literals,
+            .ignores = ignore_cell,
+            .ignore_capacity = settings.ignore_capacity,
+            .max_decoded_bytes = settings.max_decoded_bytes,
+        });
+        errdefer if (detection) |*value| value.deinit(allocator);
+        const generation = fileGeneration(parent_generation, if (detection) |value| value.generation else null);
+        const legacy_generation = fileGeneration(parent_generation, if (detection) |value| value.legacy_generation else null);
+        const options = processing.Options{
+            .jail = jail.name,
+            .parent_generation = generation,
+            .timestamp = settings.timestamp,
+            .encoding = settings.encoding,
+            .bom = settings.bom,
+            .window_us = window_us,
+            .max_record_bytes = settings.max_record_bytes,
+            .max_decoded_bytes = settings.max_decoded_bytes,
+        };
+        const scratch = try allocator.alloc(u8, settings.max_decoded_bytes);
+        defer allocator.free(scratch);
+        // Why: A throwaway Processor is built so options it refuses fail plan creation instead of the first session.
+        _ = try processing.Processor.init(allocator, options, scratch, .{ .us = 0 });
+        const specs = try allocator.alloc(session.Spec, jail.logpath.len);
+        errdefer allocator.free(specs);
+        var copied: usize = 0;
+        errdefer for (specs[0..copied]) |spec| allocator.free(spec.pattern);
+        for (specs, jail.logpath) |*spec, path| {
+            spec.* = .{ .pattern = try allocator.dupe(u8, path), .start = settings.start };
+            copied += 1;
+        }
+        return .{ .processing = options, .detection = detection, .ignore_cell = ignore_cell, .legacy_generation = legacy_generation, .specs = specs, .max_sources = settings.max_sources };
+    }
+
+    fn fileGeneration(parent_generation: [32]u8, detection_generation: ?[32]u8) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("fail2zig-native-file-detection-v1\x00");
+        hash.update(&parent_generation);
+        if (detection_generation) |value| hash.update(&value) else hash.update("required-staged-consumer");
+        var generation: [32]u8 = undefined;
+        hash.final(&generation);
+        return generation;
+    }
+
+    pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
+        if (self.detection) |*value| value.deinit(allocator);
+        if (self.ignore_cell) |cell| {
+            cell.*.deinit(allocator);
+            allocator.destroy(cell);
+        }
+        for (self.specs) |spec| allocator.free(spec.pattern);
+        allocator.free(self.specs);
+        self.* = undefined;
+    }
+};

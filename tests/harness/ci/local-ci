@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Local trusted-trigger CI: format, plain/diag/Debug builds with the no-diag scan, a Debug rig startup and the firewall suites in parallel, then the assembled daemon lane alone.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Runs the format, whitespace, plain, diag and Debug build checks and the firewall suite in parallel, then the assembled suite.
+# Holds: Every job's exit code is recorded in results.txt and the script exits non-zero when any job did not exit 0.
+
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)

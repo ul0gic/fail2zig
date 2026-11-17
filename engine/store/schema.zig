@@ -1,23 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Brings the state file to the current schema, creating it on an empty database or upgrading it one version per step.
+// Holds: Each step re-reads user_version inside its own write transaction and sets the next version in that same transaction.
+
 const std = @import("std");
 const store = @import("store.zig");
 const Error = store.Error;
-const Stmt = store.Stmt;
 const Limits = store.Limits;
-const Record = store.Record;
 const ReceiptIdentity = store.ReceiptIdentity;
 const latest_schema = store.latest_schema;
-const native_time = @import("../core/native_time.zig");
-const native_record = @import("../core/native_time_record.zig");
-const detection = @import("../core/native_detection_record.zig");
-const retry = @import("../core/native_retry.zig");
-const consumers = @import("../core/native_consumer.zig");
-const effects = @import("../core/native_effect.zig");
-const effect_history = @import("../core/native_effect_history.zig");
-const application_history = @import("../core/native_application_history.zig");
-const action_outcome = @import("../core/native_action_outcome.zig");
-const sd_notify = @import("../core/sd_notify.zig");
+const retry = @import("../detect/retry.zig");
+const effects = @import("../effect/effect.zig");
+const action_outcome = @import("../effect/action_outcome.zig");
+const sd_notify = @import("../platform/sd_notify.zig");
 const current_schema = @import("current_schema.zig");
 
 pub fn Methods(comptime Store: type) type {
@@ -98,6 +93,7 @@ pub fn Methods(comptime Store: type) type {
                 try seed.int(1, history_max_matches);
                 try seed.done();
             }
+            // Why: 1177705009 is 0x46325A31, the application_id openImpl requires of every existing state file.
             try self.exec("PRAGMA application_id=1177705009; PRAGMA user_version=29;");
             try self.fault(.before_migration_schema_commit);
             try self.commitTransaction();
@@ -109,6 +105,7 @@ pub fn Methods(comptime Store: type) type {
             if (entry_schema != 26 and entry_schema != 27) return error.UnsupportedSchema;
             var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
             const backup = try self.takeSchemaBackup(options, if (entry_schema == 26) .pre27 else .pre28, &path_buffer);
+            // Why: reopen_required means a COMMIT or ROLLBACK failed, so the upgrade may have committed and its backup is kept.
             errdefer if (!self.reopen_required) std.fs.cwd().deleteFileZ(backup.path) catch {};
             try self.beginWrite();
             errdefer self.rollback();
@@ -136,6 +133,7 @@ pub fn Methods(comptime Store: type) type {
             if (try self.integer("PRAGMA user_version;") != 28) return error.UnsupportedSchema;
             try self.exec(current_schema.owed_work_upgrade_ddl);
             try self.fault(.before_migration_schema_commit);
+            // Why: The backup is renamed into place and synced before COMMIT, so a committed schema 29 always has its schema-28 backup.
             try store.load_repair.publishSchemaBackup(backup);
             try self.commitTransaction();
             self.schema_version = latest_schema;
@@ -166,7 +164,10 @@ pub fn Methods(comptime Store: type) type {
                 var row = try self.statement("SELECT superseded_targets,backup_path FROM load_repair_migration WHERE id=1;");
                 defer row.deinit();
                 if (!try row.row()) return error.LoadRepairInvalidState;
-                std.log.info("native storage: schema 24 migration complete after {d} transactions; {d} unsettled action outcomes of replaced decisions marked superseded; pre-upgrade backup {s}", .{ pages, try row.signed(0), try row.bytes(1) });
+                std.log.info(
+                    "native storage: schema 24 migration complete after {d} transactions; {d} unsettled action outcomes of replaced decisions marked superseded; pre-upgrade backup {s}",
+                    .{ pages, try row.signed(0), try row.bytes(1) },
+                );
             }
         }
 
@@ -212,19 +213,6 @@ pub fn Methods(comptime Store: type) type {
             try self.fault(.before_native_time_schema_commit);
             try self.commitTransaction();
             self.schema_version = @max(schema, 4);
-        }
-
-        pub fn enableYearInference(self: *Store) Error!void {
-            if (self.receipt_limit == null) return error.ReceiptStorageRequired;
-            try self.beginWrite();
-            errdefer self.rollback();
-            const schema = try self.chainSchema();
-            if (schema == 4) {
-                try self.exec("ALTER TABLE records ADD COLUMN inferred_year INTEGER CHECK(inferred_year IS NULL OR (typeof(inferred_year)='integer' AND inferred_year BETWEEN 1 AND 9999 AND original_us IS NOT NULL AND native_time_kind IN (1,3,4,6,11))); PRAGMA user_version=5;");
-            } else if (schema < 5 or schema > latest_schema) return error.UnsupportedSchema;
-            try self.fault(.before_inference_schema_commit);
-            try self.commitTransaction();
-            self.schema_version = @max(schema, 5);
         }
 
         pub fn enableDetection(self: *Store) Error!void {
@@ -456,6 +444,7 @@ pub fn Methods(comptime Store: type) type {
                     var rows = try self.statement("SELECT jail,policy FROM retry_policies ORDER BY jail;");
                     defer rows.deinit();
                     while (try rows.row()) {
+                        // Why: Column type 3 is SQLITE_TEXT (sqlite3.h).
                         if (count == names.len or self.api.column_type(rows.ptr, 0) != 3) return error.InvalidRetryState;
                         const jail = try rows.boundedBytes(0, 64);
                         if (jail.len == 0) return error.InvalidRetryState;
@@ -536,6 +525,7 @@ pub fn Methods(comptime Store: type) type {
                 );
                 const detailed = try self.integer("SELECT count(*) FROM confirmed_event_details;");
                 const joinable = try self.integer("SELECT count(*) FROM confirmed_event_details d JOIN confirmed_effect_events e USING(event_id) JOIN retry_decision_details r ON r.jail=e.jail AND r.effect_decision_id=e.decision_id;");
+                // Why: Summaries are built from this join, so a detail that does not join would be missing from them without an error.
                 if (detailed != joinable) return error.RetryMigrationRequired;
                 try self.exec("INSERT INTO confirmed_policy_summaries SELECT r.jail,r.family,r.subject,count(*),max(e.confirmed_us) FROM confirmed_event_details d JOIN confirmed_effect_events e USING(event_id) JOIN retry_decision_details r ON r.jail=e.jail AND r.effect_decision_id=e.decision_id GROUP BY r.jail,r.family,r.subject;");
                 var names: [64][64]u8 = undefined;
@@ -598,6 +588,7 @@ pub fn Methods(comptime Store: type) type {
                     \\CREATE TRIGGER native_effect_scope_v2_update BEFORE UPDATE OF canonical_scope ON native_effects WHEN NEW.canonical_scope IS NULL OR NEW.canonical_scope IS NOT OLD.canonical_scope BEGIN SELECT RAISE(ABORT,'canonical effect scope immutable'); END;
                     \\PRAGMA user_version=19;
                 );
+                // Why: Every scope converted in SQL above is decoded before commit, so a malformed conversion rolls the upgrade back.
                 var verified: usize = 0;
                 {
                     var canonical_rows = try self.statement("SELECT canonical_scope FROM native_effects ORDER BY scope_key;");
@@ -697,6 +688,7 @@ pub fn Methods(comptime Store: type) type {
         fn enableRuntimeTables(self: *Store, options: store.load_repair.Options, backup: bool, path_buffer: []u8) Error![]const u8 {
             const taken: ?store.load_repair.SchemaBackup = if (backup) try self.takeSchemaBackup(options, .pre25, path_buffer) else null;
             errdefer if (taken) |made| if (!self.reopen_required) std.fs.cwd().deleteFileZ(made.path) catch {};
+            // Why: A load repair that ran in this start already took a pre-upgrade backup, so its recorded path is reused.
             const backup_path: []const u8 = if (taken) |made| made.path else blk: {
                 var row = try self.statement("SELECT backup_path FROM load_repair_migration WHERE id=1;");
                 defer row.deinit();

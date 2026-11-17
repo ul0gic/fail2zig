@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Judges an enforcement run from its kernel samples, health log and workload log and writes summary.json.
+# Holds: Missing, malformed or inconsistent evidence never yields a pass: only the result pass exits 0.
+
 """Existing B1 kernel/latency/health observations turned into a failure exit."""
 import datetime
 import json
@@ -108,6 +113,7 @@ def evaluate(work):
             raise ValueError('invalid first-install latency')
         upper_max, lower_max = max(first.values()), max(lower.values())
         result.update(subjects_seen=len(first), latency_max_lower_s=lower_max, latency_max_upper_s=upper_max)
+        # Why: Only the lower latency bound fails the run; an upper bound past 10 seconds leaves the result incomplete.
         if lower_max > 10:
             failures.append('maximum append-to-kernel latency exceeds 10 seconds')
         elif upper_max > 10:

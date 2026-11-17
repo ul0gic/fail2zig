@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Restart timing phase: starts the daemon on a PRESERVED state directory inside a fresh
-# network namespace (no nftables scaffold, like a host reboot) and records how long the
-# worker needs to re-dispatch every stored effect before readiness.
-# Run INSIDE: unshare --user --map-root-user --net bash restart.sh <bin> <work> [max_seconds]
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Starts the daemon on a preserved state directory in a fresh network namespace and records how long it takes to become ready.
+# Holds: Readiness is recorded only after the daemon logs native: ready, never from a timer or the socket alone.
+
 set -u
 umask 077
 BIN="$1"; WORK="$2"; MAX="${3:-300}"
@@ -31,7 +32,6 @@ for i in $(seq 1 "$MAX"); do
   if ! kill -0 "$DPID" 2>/dev/null; then echo "restart: daemon exited" | tee -a "$WORK/rig.log"; break; fi
   sleep 1
 done
-# Optional hold: keep sampling after readiness until storage leaves healthy or HOLD_SECONDS pass.
 hold=0
 while [ "${HOLD_SECONDS:-0}" -gt 0 ] && [ $hold -lt "${HOLD_SECONDS:-0}" ]; do
   st=$("$BIN" --socket "$SOCK" --timeout 3000 --output json status 2>/dev/null | tr -d '\n')

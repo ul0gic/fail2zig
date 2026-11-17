@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# One isolated check on a named scenario, with its evidence kept under .project/diag-runs/. See README.md.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Runs one named check on a scenario in a rootless rig on this host or on the lab target, keeping its evidence in a run folder.
+# Holds: The exit trap rolls the lab target back to its baseline snapshot and records whether that restore succeeded.
+
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
@@ -135,7 +139,7 @@ offset_ms() {
   a=$(date +%s%3N); t=$(remote 'date +%s%3N'); b=$(date +%s%3N)
   echo $(( t - (a + b) / 2 ))
 }
-# A memory snapshot resumes with the wall clock it was saved with; step it (systemd-timesyncd on the target) before anything starts.
+# Why: A rollback restores a memory snapshot, so the target clock must be within 1000 ms of this host before anything starts.
 sync_clock() {
   local before after
   before=$(offset_ms)

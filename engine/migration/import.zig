@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Converts a fail2ban snapshot's bans and bips rows into staged ban owners and history for the plan's selected groups.
+// Holds: Staging is refused while any blocker exists; a row with a bad address, unknown bantime or overflowing time blocks, never vanishes.
+
 const std = @import("std");
 const db = @import("fail2ban_db.zig");
 const plan = @import("plan.zig");
 const scope = @import("../firewall/scope.zig");
-const lease = @import("../core/native_lease.zig");
+const lease = @import("../effect/lease.zig");
 
 pub const Error = db.Error || error{ PlanInvalid, TimeOverflow };
 
@@ -77,15 +80,8 @@ pub const Staging = struct {
     }
 };
 
-pub const StagedOwnerRow = @import("../core/record_store.zig").Store.StagedOwnerRow;
-pub const StagedHistoryRow = @import("../core/record_store.zig").Store.StagedHistoryRow;
-
-pub const staging_sql = struct {
-    pub const delete_owners: [:0]const u8 = "DELETE FROM migration_staged_owners WHERE run_id=?1;";
-    pub const delete_history: [:0]const u8 = "DELETE FROM migration_staged_history WHERE run_id=?1;";
-    pub const insert_owner: [:0]const u8 = "INSERT INTO migration_staged_owners(run_id,seq,jail,scope,lease_kind,deadline_us,source_event_us,source_row) VALUES(?1,?2,?3,?4,?5,?6,?7,?8);";
-    pub const insert_history: [:0]const u8 = "INSERT INTO migration_staged_history(run_id,seq,jail,scope,event_kind,event_us,bancount,source_row) VALUES(?1,?2,?3,?4,?5,?6,?7,?8);";
-};
+pub const StagedOwnerRow = @import("../store/store.zig").Store.StagedOwnerRow;
+pub const StagedHistoryRow = @import("../store/store.zig").Store.StagedHistoryRow;
 
 pub fn ownerRows(allocator: std.mem.Allocator, staging: *const Staging) error{OutOfMemory}![]StagedOwnerRow {
     const rows = try allocator.alloc(StagedOwnerRow, staging.owners.len);
@@ -192,6 +188,7 @@ const Converter = struct {
     }
 
     fn subjectFor(self: *Converter, jail: []const u8, ip: []const u8, source_row: u64) Error!?scope.Subject {
+        // Why: Both callers reach here only after importable found this jail's group.
         const g = self.group(jail).?;
         if (!std.mem.eql(u8, g.scope_mapping, "host") and !std.mem.eql(u8, g.scope_mapping, "net") and !std.mem.eql(u8, g.scope_mapping, "port")) {
             try self.addBlocker(jail, "import", "scope-mapping-unknown:{s}", .{g.scope_mapping});
@@ -292,12 +289,14 @@ const Converter = struct {
         }
     }
 
+    // Holds: A permanent ban outranks any finite one, between finite bans the later wins, and the larger bancount is always kept.
     fn mergeOwner(self: *Converter, candidate: StagedOwner) Error!void {
         const key = OwnerKey{ .jail = candidate.jail, .encoded = candidate.encoded };
         const slot = self.index.getOrPut(self.a, key) catch return error.OutOfMemory;
         if (!slot.found_existing) {
             slot.value_ptr.* = self.owners.items.len;
             self.owners.append(self.a, candidate) catch {
+                // Why: The index entry would otherwise point one past the end of owners.
                 self.index.removeByPtr(slot.key_ptr);
                 return error.OutOfMemory;
             };
@@ -331,6 +330,7 @@ const Converter = struct {
                 try self.addBlocker(jail, "import", "bancount-negative:row:{d}", .{source_row});
                 continue;
             }
+            // Why: A bips row whose jail and scope already have an owner from bans would otherwise be restored twice.
             if (self.hasOwner(jail, resolved.encoded)) {
                 self.report.double_count_avoided += 1;
                 continue;

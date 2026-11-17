@@ -1,0 +1,932 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 fail2zig maintainers
+// Does:  Reads a log file by framed record from a durable checkpoint and detects its replacement and truncation.
+// Holds: A checkpoint advances only after the callback acknowledges its record; a file resumes only if device, inode and prefix hash match.
+
+const std = @import("std");
+// Why: F_DUPFD_CLOEXEC is F_LINUX_SPECIFIC_BASE + 6 = 1030 in include/uapi/linux/fcntl.h.
+const linux_dupfd_cloexec = 1030;
+const records = @import("source_record.zig");
+const native_text = @import("source_text.zig");
+const config = @import("../config/config.zig");
+const group_commit = @import("../store/group_commit.zig");
+const cursor_bytes = @import("../store/store.zig").Limits.cursor_bytes;
+const ReceiptIdentity = @import("../store/store.zig").ReceiptIdentity;
+const Allocator = std.mem.Allocator;
+pub const matchComponent = @import("file_discovery.zig").matchComponent;
+pub const expandGlob = @import("file_discovery.zig").expandGlob;
+pub const FileSet = @import("file_set.zig").FileSet;
+
+pub const BatchAckCallback = *const fn ([]const records.Record, *usize, ?*anyopaque) anyerror!void;
+
+pub const WallClock = struct {
+    context: ?*anyopaque = null,
+    read: *const fn (?*anyopaque) i64 = systemWallUs,
+
+    pub fn us(self: WallClock) i64 {
+        return self.read(self.context);
+    }
+    fn seconds(self: WallClock) i64 {
+        return @divFloor(self.us(), std.time.us_per_s);
+    }
+};
+fn systemWallUs(_: ?*anyopaque) i64 {
+    return std.time.microTimestamp();
+}
+pub const Start = enum { head, tail };
+pub const discovery_entries_per_turn: usize = 256;
+pub const discovery_entries_per_episode: usize = 65_536;
+pub const discovery_max_depth: usize = 16;
+// Holds: An unlinked file with nothing at its path is released only after five minutes at its committed end with no growth.
+const unlinked_retire_ms: u64 = 5 * std.time.ms_per_min;
+pub const DiscoveryStatus = enum { pending, complete };
+pub const Presence = enum { unknown, present, missing, failed };
+pub const Framing = enum {
+    bytes,
+    utf16le,
+    utf16be,
+    utf32le,
+    utf32be,
+    fn width(self: Framing) usize {
+        return switch (self) {
+            .bytes => 1,
+            .utf16le, .utf16be => 2,
+            .utf32le, .utf32be => 4,
+        };
+    }
+    fn isCharacter(self: Framing, bytes: []const u8, c: u8) bool {
+        return switch (self) {
+            .bytes => bytes[0] == c,
+            .utf16le => std.mem.readInt(u16, bytes[0..2], .little) == c,
+            .utf16be => std.mem.readInt(u16, bytes[0..2], .big) == c,
+            .utf32le => std.mem.readInt(u32, bytes[0..4], .little) == c,
+            .utf32be => std.mem.readInt(u32, bytes[0..4], .big) == c,
+        };
+    }
+};
+
+fn recordEnd(framing: Framing, bytes: []const u8, start: u64) ?usize {
+    const width = framing.width();
+    var i: usize = @intCast((width - start % width) % width);
+    while (i + width <= bytes.len) : (i += width) {
+        if (framing.isCharacter(bytes[i..], '\n')) return i + width;
+    }
+    return null;
+}
+
+fn stripTerminator(framing: Framing, bytes: []const u8) []const u8 {
+    const width = framing.width();
+    var end = bytes.len - width;
+    while (end >= width and framing.isCharacter(bytes[end - width ..], '\r')) end -= width;
+    return bytes[0..end];
+}
+pub const Resume = struct {
+    version: u8 = 2,
+    start: Start = .head,
+    codec_configuration_hash: ?[32]u8 = null,
+    framing: Framing = .bytes,
+    incarnation: [16]u8,
+    device: u64,
+    inode: u64,
+    offset: u64,
+    prefix_len: u8,
+    prefix_hash: [32]u8,
+    observed_size: ?u64 = null,
+};
+
+pub const LossReason = enum(u8) { truncated = 1, rotated_unread_removed = 2, replaced = 3 };
+
+pub const LossEvent = struct {
+    sequence: u64,
+    jail: []const u8,
+    path: []const u8,
+    source_id: []const u8,
+    wall_us: i64,
+    reason: LossReason,
+    inode: u64,
+    committed_offset: u64,
+    observed_size: ?u64,
+};
+
+pub const RemovedVerdict = enum { drained, unread, unknown };
+const NamedPath = enum { present, absent, absent_reported };
+
+pub const PendingLoss = struct { event: LossEvent, checkpoint_durable: bool };
+
+pub const Discontinuity = enum {
+    truncated,
+    prefix_changed,
+    missing,
+    replaced,
+};
+
+pub const ContinuityFailure = struct {
+    kind: Discontinuity,
+    incarnation: [16]u8,
+    committed_offset: u64,
+    committed_device: u64,
+    committed_inode: u64,
+    observed_size: ?u64 = null,
+    observed_device: ?u64 = null,
+    observed_inode: ?u64 = null,
+
+    pub fn format(self: ContinuityFailure, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+        try writer.print("kind={s} incarnation={s} committed_offset={d} committed_device={d} committed_inode={d} observed_size={?d} observed_device={?d} observed_inode={?d}", .{
+            @tagName(self.kind),  std.fmt.fmtSliceHexLower(&self.incarnation), self.committed_offset, self.committed_device,
+            self.committed_inode, self.observed_size,                          self.observed_device,  self.observed_inode,
+        });
+    }
+};
+
+pub fn truncatedInPlace(committed: Resume, device: u64, inode: u64, size: u64) bool {
+    return device == committed.device and inode == committed.inode and (size < committed.offset or size < committed.prefix_len);
+}
+
+pub fn prefixDigest(file: std.fs.File, length: u8) ![32]u8 {
+    return FileSource.prefix(file, length);
+}
+
+pub fn restartedIncarnation(file: std.fs.File, committed: Resume) !Resume {
+    var next = try FileSource.newResume(file, 0, committed.framing, committed.start);
+    next.codec_configuration_hash = committed.codec_configuration_hash;
+    return next;
+}
+
+pub fn openRegularAt(directory: std.fs.Dir, path: []const u8) !std.fs.File {
+    // Why: O_NONBLOCK lets the open of a FIFO at the path return at once (fifo(7)), so the regular-file check can refuse it.
+    const fd = try std.posix.openat(directory.fd, path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true }, 0);
+    errdefer std.posix.close(fd);
+    const stat = try std.posix.fstat(fd);
+    if (!std.posix.S.ISREG(stat.mode)) return error.NotRegularFile;
+    return .{ .handle = fd };
+}
+
+pub const FileSource = struct {
+    pub fn rebindCursor(allocator: Allocator, saved: []const u8, old_binding: [32]u8, new_binding: [32]u8) ![]u8 {
+        const parsed = try std.json.parseFromSlice(Resume, allocator, saved, .{});
+        defer parsed.deinit();
+        var position = parsed.value;
+        if (position.version != 2 or position.prefix_len > 64) return error.InvalidResume;
+        const binding = position.codec_configuration_hash orelse return error.FramingProfileMismatch;
+        if (!std.mem.eql(u8, &binding, &old_binding)) return error.FramingProfileMismatch;
+        if (position.offset % position.framing.width() != 0) return error.MisalignedOffset;
+        position.codec_configuration_hash = new_binding;
+        return std.json.stringifyAlloc(allocator, position, .{});
+    }
+    const ResumeSearch = struct {
+        directory: std.fs.Dir,
+        iterator: std.fs.Dir.Iterator,
+        visited: usize = 0,
+    };
+    allocator: Allocator,
+    path: []const u8,
+    source_id: []const u8,
+    file: ?std.fs.File = null,
+    start: Start,
+    committed: ?Resume = null,
+    health: records.Health = .waiting,
+    baseline_committed: bool = false,
+    in_operation: bool = false,
+    pending_eof_check: bool = false,
+    framing: Framing = .bytes,
+    max_record_bytes: usize = 1024 * 1024,
+    frame_callback: ?records.FrameCallback = null,
+    frame_context: ?*anyopaque = null,
+    codec_configuration_hash: ?[32]u8 = null,
+    native_encoding: ?native_text.Encoding = null,
+    resume_search: ?ResumeSearch = null,
+    continuity_failure: ?ContinuityFailure = null,
+    continuity_reported: bool = false,
+    policy: config.TruncationPolicy = .refuse,
+    jail: []const u8 = "",
+    siblings: ?*const std.ArrayList(FileSource) = null,
+    awaiting_path: bool = false,
+    awaiting_checked_s: i64 = 0,
+    named_path: NamedPath = .present,
+    named_checked_s: i64 = 0,
+    unlinked_idle: ?struct { size: u64, since_ms: u64 } = null,
+    pending_loss: ?PendingLoss = null,
+    detected_s: i64 = 0,
+    wall_clock: WallClock = .{},
+    read_prefix: *const fn (std.fs.File, u8) anyerror![32]u8 = prefix,
+
+    pub fn framingBinding(encoding: native_text.Encoding, configuration_hash: [32]u8, max_bytes: usize) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("fail2zig-native-framing-v1\x00");
+        hash.update(&configuration_hash);
+        hash.update(@tagName(encoding));
+        var limit: [4]u8 = undefined;
+        std.mem.writeInt(u32, &limit, @intCast(max_bytes), .little);
+        hash.update(&limit);
+        var binding: [32]u8 = undefined;
+        hash.final(&binding);
+        return binding;
+    }
+    pub fn setNativeFraming(self: *FileSource, encoding: native_text.Encoding, configuration_hash: [32]u8, max_bytes: usize) !void {
+        if (max_bytes < encoding.width() or max_bytes > native_text.max_record_bytes) return error.InvalidFramingLimit;
+        if (self.file != null) return error.SourceAlreadyOpened;
+        if (self.frame_callback != null) return error.FramerAlreadyBound;
+        const binding = framingBinding(encoding, configuration_hash, max_bytes);
+        const framing: Framing = switch (encoding) {
+            .utf8, .ascii, .latin1 => .bytes,
+            .utf16le => .utf16le,
+            .utf16be => .utf16be,
+            .utf32le => .utf32le,
+            .utf32be => .utf32be,
+        };
+        if (self.committed) |saved| {
+            const previous = saved.codec_configuration_hash orelse return error.FramingProfileMismatch;
+            if (!std.mem.eql(u8, &previous, &binding) or saved.framing != framing) return error.FramingProfileMismatch;
+            if (saved.offset % encoding.width() != 0) return error.MisalignedOffset;
+        }
+        self.native_encoding = encoding;
+        self.framing = framing;
+        self.codec_configuration_hash = binding;
+        self.max_record_bytes = max_bytes;
+    }
+
+    pub fn init(allocator: Allocator, path: []const u8, source_id: []const u8, start: Start, checkpoint: ?Resume) !FileSource {
+        if (path.len == 0 or path.len > 16 * 1024 or source_id.len == 0 or source_id.len > 16 * 1024 or
+            std.mem.indexOfScalar(u8, path, 0) != null or std.mem.indexOfScalar(u8, source_id, 0) != null) return error.InvalidSource;
+        if (checkpoint) |r| if (r.version != 2 or r.prefix_len > 64) return error.InvalidResume;
+        const owned_path = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned_path);
+        return .{
+            .allocator = allocator,
+            .path = owned_path,
+            .source_id = try allocator.dupe(u8, source_id),
+            .start = if (checkpoint) |r| r.start else start,
+            .in_operation = checkpoint == null and start == .tail,
+            .committed = checkpoint,
+            .baseline_committed = checkpoint != null,
+            .framing = if (checkpoint) |r| r.framing else .bytes,
+        };
+    }
+
+    pub fn acknowledgedCheckpoint(self: *const FileSource) ?Resume {
+        return if (self.baseline_committed) self.committed else null;
+    }
+
+    pub fn deinit(self: *FileSource) void {
+        self.clearResumeSearch();
+        if (self.file) |f| f.close();
+        self.allocator.free(self.path);
+        self.allocator.free(self.source_id);
+        self.* = undefined;
+    }
+
+    fn prefix(f: std.fs.File, n: u8) ![32]u8 {
+        var bytes: [64]u8 = undefined;
+        const got = try f.preadAll(bytes[0..n], 0);
+        if (got != n) return error.ResumeLost;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes[0..n], &digest, .{});
+        return digest;
+    }
+
+    fn newResume(f: std.fs.File, offset: u64, framing: Framing, start: Start) !Resume {
+        const stat = try std.posix.fstat(f.handle);
+        var incarnation: [16]u8 = undefined;
+        std.crypto.random.bytes(&incarnation);
+        const n: u8 = @intCast(@min(@as(u64, @intCast(stat.size)), 64));
+        return .{
+            .start = start,
+            .framing = framing,
+            .incarnation = incarnation,
+            .device = @intCast(stat.dev),
+            .inode = @intCast(stat.ino),
+            .offset = offset,
+            .prefix_len = n,
+            .prefix_hash = try prefix(f, n),
+            .observed_size = std.math.cast(u64, stat.size),
+        };
+    }
+
+    const Observed = struct { size: ?u64, device: u64, inode: u64 };
+
+    fn observe(stat: std.posix.Stat) Observed {
+        return .{ .size = std.math.cast(u64, stat.size), .device = @intCast(stat.dev), .inode = @intCast(stat.ino) };
+    }
+
+    fn classify(committed: Resume, observed: Observed) Discontinuity {
+        if (observed.device != committed.device or observed.inode != committed.inode) return .replaced;
+        if (observed.size) |size| if (truncatedInPlace(committed, observed.device, observed.inode, size)) return .truncated;
+        return .prefix_changed;
+    }
+
+    fn continuityLost(self: *FileSource, kind: Discontinuity, observed: ?Observed) error{ResumeLost} {
+        const r = self.committed.?;
+        self.continuity_failure = .{
+            .kind = kind,
+            .incarnation = r.incarnation,
+            .committed_offset = r.offset,
+            .committed_device = r.device,
+            .committed_inode = r.inode,
+            .observed_size = if (observed) |value| value.size else null,
+            .observed_device = if (observed) |value| value.device else null,
+            .observed_inode = if (observed) |value| value.inode else null,
+        };
+        self.continuity_reported = false;
+        self.detected_s = self.wall_clock.seconds();
+        self.health = .resume_lost;
+        return error.ResumeLost;
+    }
+
+    fn restartOn(self: *FileSource, file: std.fs.File, observed: Observed, reason: LossReason) !void {
+        const r = self.committed.?;
+        const next = restartedIncarnation(file, r) catch |err| {
+            if (err == error.ResumeLost) return self.continuityLost(if (reason == .replaced) .replaced else .truncated, observed);
+            return err;
+        };
+        if (self.pending_loss == null) {
+            const now_us = self.wall_clock.us();
+            self.detected_s = @divFloor(now_us, std.time.us_per_s);
+            self.pending_loss = .{
+                .event = .{
+                    .sequence = 0,
+                    .jail = self.jail,
+                    .path = self.path,
+                    .source_id = self.source_id,
+                    .wall_us = now_us,
+                    .reason = reason,
+                    .inode = r.inode,
+                    .committed_offset = r.offset,
+                    .observed_size = observed.size,
+                },
+                .checkpoint_durable = self.baseline_committed,
+            };
+        }
+        self.committed = next;
+        self.baseline_committed = false;
+    }
+
+    fn lostOrRestarted(self: *FileSource, file: std.fs.File, r: Resume, observed: Observed) !void {
+        const kind = classify(r, observed);
+        if (self.policy == .restart and kind == .truncated) return self.restartOn(file, observed, .truncated);
+        return self.continuityLost(kind, observed);
+    }
+
+    fn absent(self: *FileSource) error{ResumeLost}!?std.fs.File {
+        if (self.policy != .restart) return self.continuityLost(.missing, null);
+        self.awaiting_path = true;
+        self.awaiting_checked_s = self.wall_clock.seconds();
+        return null;
+    }
+
+    fn claimedBySibling(self: *const FileSource, observed: Observed) bool {
+        const siblings = self.siblings orelse return false;
+        for (siblings.items) |*other| {
+            if (other == self) continue;
+            const saved = other.committed orelse continue;
+            if (saved.device == observed.device and saved.inode == observed.inode) return true;
+        }
+        return false;
+    }
+
+    fn restartOnReplacement(self: *FileSource) !std.fs.File {
+        const f = try openRegularAt(std.fs.cwd(), self.path);
+        errdefer f.close();
+        const stat = try std.posix.fstat(f.handle);
+        const committed = self.committed.?;
+        if (stat.dev == committed.device and stat.ino == committed.inode) return f;
+        const observed = observe(stat);
+        if (self.claimedBySibling(observed)) return self.continuityLost(.replaced, observed);
+        try self.restartOn(f, observed, .replaced);
+        return f;
+    }
+
+    pub fn takePendingLoss(self: *FileSource) ?PendingLoss {
+        const loss = self.pending_loss;
+        self.pending_loss = null;
+        return loss;
+    }
+
+    fn openIncarnation(self: *FileSource) !?std.fs.File {
+        const direct: ?std.fs.File = openRegularAt(std.fs.cwd(), self.path) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        const expected = self.committed orelse return direct;
+        if (direct == null and self.awaiting_path and self.resume_search == null and self.wall_clock.seconds() == self.awaiting_checked_s) return null;
+        var replacement: ?Observed = null;
+        if (direct) |f| {
+            const stat = std.posix.fstat(f.handle) catch |err| {
+                f.close();
+                return err;
+            };
+            if (stat.dev == expected.device and stat.ino == expected.inode) {
+                self.clearResumeSearch();
+                return f;
+            }
+            replacement = observe(stat);
+            f.close();
+        }
+        if (self.resume_search == null) {
+            var parent = std.fs.cwd().openDir(std.fs.path.dirname(self.path) orelse ".", .{ .iterate = true }) catch |err| {
+                if (err == error.FileNotFound) return self.absent();
+                return err;
+            };
+            self.resume_search = .{ .directory = parent, .iterator = parent.iterate() };
+        }
+        var yielded = false;
+        defer if (!yielded) self.clearResumeSearch();
+        const search = &self.resume_search.?;
+        for (0..discovery_entries_per_turn) |_| {
+            const entry = (try search.iterator.next()) orelse {
+                self.clearResumeSearch();
+                const seen = replacement orelse return self.absent();
+                if (self.policy == .restart) return try self.restartOnReplacement();
+                return self.continuityLost(.replaced, seen);
+            };
+            if (search.visited >= discovery_entries_per_episode) return error.DiscoveryEntryLimit;
+            search.visited += 1;
+            const observed = std.posix.fstatat(search.directory.fd, entry.name, 0) catch |err| {
+                if (err == error.FileNotFound) continue;
+                return err;
+            };
+            if (!std.posix.S.ISREG(observed.mode) or observed.dev != expected.device or observed.ino != expected.inode) continue;
+            const f = openRegularAt(search.directory, entry.name) catch |err| {
+                if (err == error.FileNotFound or err == error.NotRegularFile) continue;
+                return err;
+            };
+            const stat = std.posix.fstat(f.handle) catch |err| {
+                f.close();
+                return err;
+            };
+            if (std.posix.S.ISREG(stat.mode) and stat.dev == expected.device and stat.ino == expected.inode) {
+                self.clearResumeSearch();
+                return f;
+            }
+            f.close();
+        }
+        yielded = true;
+        return error.SourceRepairPending;
+    }
+
+    fn clearResumeSearch(self: *FileSource) void {
+        if (self.resume_search) |*search| search.directory.close();
+        self.resume_search = null;
+    }
+
+    fn attachTurn(self: *FileSource) !bool {
+        if (self.file != null) return true;
+        const f = (self.openIncarnation() catch |err| {
+            self.health = switch (err) {
+                error.FileNotFound => .missing,
+                error.AccessDenied => .permission_denied,
+                error.ResumeLost => .resume_lost,
+                error.SourceRepairPending => .waiting,
+                else => .read_failed,
+            };
+            return err;
+        }) orelse {
+            self.health = .missing;
+            return false;
+        };
+        try self.acceptDescriptor(f);
+        return true;
+    }
+
+    pub fn acceptDescriptor(self: *FileSource, f: std.fs.File) !void {
+        errdefer f.close();
+        const stat = try std.posix.fstat(f.handle);
+        if (!std.posix.S.ISREG(stat.mode)) return error.NotRegularFile;
+        if (self.committed) |r| {
+            const observed = observe(stat);
+            const fingerprint: ?[32]u8 = self.read_prefix(f, r.prefix_len) catch |err| blk: {
+                if (err != error.ResumeLost) {
+                    self.health = .read_failed;
+                    return err;
+                }
+                break :blk null;
+            };
+            if (fingerprint == null or r.device != stat.dev or r.inode != stat.ino or stat.size < 0 or @as(u64, @intCast(stat.size)) < r.offset or !std.mem.eql(u8, &fingerprint.?, &r.prefix_hash))
+                try self.lostOrRestarted(f, r, observed);
+        } else {
+            const offset: u64 = if (self.start == .tail) @intCast(stat.size) else 0;
+            if (self.native_encoding) |encoding| if (offset % encoding.width() != 0) {
+                self.health = .malformed_record;
+                return error.MisalignedOffset;
+            };
+            self.committed = try newResume(f, offset, self.framing, self.start);
+            self.committed.?.codec_configuration_hash = self.codec_configuration_hash;
+        }
+        self.file = f;
+        self.awaiting_path = false;
+        self.named_checked_s = 0;
+        self.health = .healthy;
+        self.continuity_failure = null;
+        self.continuity_reported = false;
+    }
+
+    pub fn attachRetained(self: *FileSource, retained: std.fs.File) !void {
+        if (self.file != null) return;
+        if (self.committed == null) return error.MissingFileCheckpoint;
+        const fd = try std.posix.fcntl(retained.handle, linux_dupfd_cloexec, 3);
+        try self.acceptDescriptor(.{ .handle = @intCast(fd) });
+    }
+
+    pub fn verifyContinuity(self: *FileSource) !bool {
+        while (true) {
+            return self.verifyContinuityTurn() catch |err| {
+                if (err == error.SourceRepairPending) continue;
+                return err;
+            };
+        }
+    }
+
+    pub fn verifyContinuityTurn(self: *FileSource) !bool {
+        if (self.committed) |r| if (r.codec_configuration_hash != null and self.frame_callback == null and self.native_encoding == null)
+            return error.FramingProfileMismatch;
+        self.continuity_failure = null;
+        self.continuity_reported = false;
+        if (!try self.attachTurn()) return false;
+        const file = self.file.?;
+        const r = self.committed.?;
+        const stat = std.posix.fstat(file.handle) catch |err| {
+            self.health = .read_failed;
+            return err;
+        };
+        const observed = observe(stat);
+        const fingerprint: ?[32]u8 = self.read_prefix(file, r.prefix_len) catch |err| blk: {
+            if (err != error.ResumeLost) {
+                self.health = .read_failed;
+                return err;
+            }
+            break :blk null;
+        };
+        if (!std.posix.S.ISREG(stat.mode)) return self.continuityLost(classify(r, observed), observed);
+        if (fingerprint == null or stat.dev != r.device or stat.ino != r.inode or
+            stat.size < 0 or @as(u64, @intCast(stat.size)) < r.offset or
+            !std.mem.eql(u8, &fingerprint.?, &r.prefix_hash))
+            try self.lostOrRestarted(file, r, observed);
+        self.health = .healthy;
+        return true;
+    }
+
+    fn checkNamedPath(self: *FileSource) void {
+        const now = self.wall_clock.seconds();
+        if (self.named_checked_s == now) return;
+        self.named_checked_s = now;
+        _ = std.posix.fstatat(std.posix.AT.FDCWD, self.path, 0) catch |err| {
+            if ((err == error.FileNotFound or err == error.NotDir) and self.named_path == .present) self.named_path = .absent;
+            return;
+        };
+        self.named_path = .present;
+    }
+
+    pub fn verifyExistingContinuity(self: *FileSource) !void {
+        if (self.acknowledgedCheckpoint() == null) return error.MissingFileCheckpoint;
+        if (!try self.verifyContinuityTurn()) return error.ResumeLost;
+    }
+
+    pub fn verifyPending(self: *FileSource, expected: ReceiptIdentity) !void {
+        try self.verifyExistingContinuity();
+        const saved = self.committed;
+        const baseline = self.baseline_committed;
+        const operational = self.in_operation;
+        const eof_check = self.pending_eof_check;
+        defer {
+            self.committed = saved;
+            self.baseline_committed = baseline;
+            self.in_operation = operational;
+            self.pending_eof_check = eof_check;
+        }
+        const Probe = struct {
+            fn verify(record: records.Record, context: ?*anyopaque) !void {
+                const identity: *const ReceiptIdentity = @ptrCast(@alignCast(context.?));
+                if (record.kind != .data or !identity.sameRecord(.{
+                    .jail = identity.jail,
+                    .source = record.source,
+                    .occurrence = record.occurrence,
+                    .cursor = record.cursor,
+                    .raw_hash = record.raw_hash,
+                    .generation = identity.generation,
+                })) return error.PendingRecordMismatch;
+                return error.PendingRecordVerified;
+            }
+        };
+        var identity = expected;
+        _ = self.pollTurn(Probe.verify, &identity, true) catch |err| {
+            if (err != error.PendingRecordVerified) return err;
+            self.health = .healthy;
+            return;
+        };
+        return error.PendingRecordUnavailable;
+    }
+
+    pub fn replaced(self: *FileSource) !bool {
+        if (self.file == null) return false;
+        const current = openRegularAt(std.fs.cwd(), self.path) catch |err| {
+            if (err == error.FileNotFound) return true;
+            return err;
+        };
+        defer current.close();
+        const stat = try std.posix.fstat(current.handle);
+        const r = self.committed.?;
+        return stat.dev != r.device or stat.ino != r.inode;
+    }
+
+    pub fn markUnlinkedAndDrained(self: *FileSource, now_ms: u64) !bool {
+        const f = self.file orelse return false;
+        const r = self.committed orelse return false;
+        if (!self.baseline_committed or self.pending_loss != null) return false;
+        const held = try std.posix.fstat(f.handle);
+        if (held.nlink != 0 or @as(u64, @intCast(held.size)) != r.offset) {
+            self.unlinked_idle = null;
+            return false;
+        }
+        const named = std.posix.fstatat(std.posix.AT.FDCWD, self.path, 0) catch |err| switch (err) {
+            error.FileNotFound => {
+                const idle = self.unlinked_idle orelse return self.startUnlinkedIdle(r.offset, now_ms);
+                if (idle.size != r.offset) return self.startUnlinkedIdle(r.offset, now_ms);
+                if (now_ms -| idle.since_ms < unlinked_retire_ms) return false;
+                self.continuity_failure = .{
+                    .kind = .missing,
+                    .incarnation = r.incarnation,
+                    .committed_offset = r.offset,
+                    .committed_device = r.device,
+                    .committed_inode = r.inode,
+                };
+                return true;
+            },
+            else => return err,
+        };
+        self.unlinked_idle = null;
+        const observed = observe(named);
+        self.continuity_failure = .{
+            .kind = .replaced,
+            .incarnation = r.incarnation,
+            .committed_offset = r.offset,
+            .committed_device = r.device,
+            .committed_inode = r.inode,
+            .observed_size = observed.size,
+            .observed_device = observed.device,
+            .observed_inode = observed.inode,
+        };
+        return true;
+    }
+
+    fn startUnlinkedIdle(self: *FileSource, size: u64, now_ms: u64) bool {
+        self.unlinked_idle = .{ .size = size, .since_ms = now_ms };
+        return false;
+    }
+
+    pub fn poll(self: *FileSource, callback: records.AckCallback, userdata: ?*anyopaque) !bool {
+        while (true) return self.pollTurn(callback, userdata, false) catch |err| {
+            if (err == error.SourceRepairPending) continue;
+            return err;
+        };
+    }
+
+    const Mark = struct { committed: ?Resume, baseline_committed: bool, in_operation: bool, pending_eof_check: bool };
+    fn mark(self: *const FileSource) Mark {
+        return .{ .committed = self.committed, .baseline_committed = self.baseline_committed, .in_operation = self.in_operation, .pending_eof_check = self.pending_eof_check };
+    }
+    fn rewind(self: *FileSource, to: Mark) void {
+        self.committed = to.committed;
+        self.baseline_committed = to.baseline_committed;
+        self.in_operation = to.in_operation;
+        self.pending_eof_check = to.pending_eof_check;
+    }
+    const BatchCollector = struct {
+        source: *FileSource,
+        allocator: Allocator,
+        items: [group_commit.max_batch_records]records.Record = undefined,
+        marks: [group_commit.max_batch_records]Mark = undefined,
+        count: usize = 0,
+        bytes: usize = 0,
+        budget: usize,
+
+        fn collect(record: records.Record, context: ?*anyopaque) !void {
+            const self: *BatchCollector = @ptrCast(@alignCast(context.?));
+            var needed = record.occurrence.len + record.cursor.len + record.message.len;
+            if (record.predecoded) |decoded| needed += decoded.text.len + decoded.codec.len + decoded.disposition.len + (if (decoded.diagnostic) |value| value.len else 0) + decoded.codec_context_json.len + decoded.profile_hash.len + decoded.config_generation.len;
+            if (self.bytes + needed > self.budget) return error.BatchFull;
+            self.bytes += needed;
+            var owned = record;
+            owned.occurrence = try self.allocator.dupe(u8, record.occurrence);
+            owned.cursor = try self.allocator.dupe(u8, record.cursor);
+            owned.message = try self.allocator.dupe(u8, record.message);
+            if (record.predecoded) |decoded| {
+                var copy = decoded;
+                copy.text = try self.allocator.dupe(u8, decoded.text);
+                copy.codec = try self.allocator.dupe(u8, decoded.codec);
+                copy.disposition = try self.allocator.dupe(u8, decoded.disposition);
+                copy.diagnostic = if (decoded.diagnostic) |value| try self.allocator.dupe(u8, value) else null;
+                copy.codec_context_json = try self.allocator.dupe(u8, decoded.codec_context_json);
+                copy.profile_hash = try self.allocator.dupe(u8, decoded.profile_hash);
+                copy.config_generation = try self.allocator.dupe(u8, decoded.config_generation);
+                owned.predecoded = copy;
+            }
+            self.items[self.count] = owned;
+            if (record.kind == .checkpoint) {
+                self.marks[self.count] = self.source.mark();
+                self.marks[self.count].baseline_committed = true;
+            }
+            self.count += 1;
+        }
+    };
+
+    pub fn pollBatchTurn(self: *FileSource, callback: BatchAckCallback, userdata: ?*anyopaque, preserve_checkpoint: bool) !usize {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        // Why: With one pollTurn's own line and cursor, this fits the file workspace set in engine/runtime/resource_budget.zig.
+        var collector = BatchCollector{ .source = self, .allocator = arena.allocator(), .budget = 3 * self.max_record_bytes + cursor_bytes };
+        const start = self.mark();
+        // Why: One pollTurn can deliver a baseline checkpoint and a data record, so two free slots are kept.
+        const read_failure: ?anyerror = while (collector.count + 2 <= collector.items.len) {
+            const delivered = self.pollTurn(BatchCollector.collect, &collector, preserve_checkpoint) catch |err| {
+                if (err != error.BatchFull or collector.count == 0) break err;
+                self.health = .healthy;
+                break null;
+            };
+            if (!delivered) break null;
+            collector.marks[collector.count - 1] = self.mark();
+        } else null;
+        if (collector.count == 0) return read_failure orelse 0;
+        var acknowledged: usize = 0;
+        const delivery = callback(collector.items[0..collector.count], &acknowledged, userdata);
+        if (acknowledged < collector.count) self.rewind(if (acknowledged == 0) start else collector.marks[acknowledged - 1]);
+        delivery catch |err| {
+            self.health = .commit_failed;
+            return err;
+        };
+        if (acknowledged >= collector.count) if (read_failure) |err| return err;
+        var data: usize = 0;
+        for (collector.items[0..@min(acknowledged, collector.count)]) |record| data += @intFromBool(record.kind == .data);
+        return data;
+    }
+    pub fn pollTurn(self: *FileSource, callback: records.AckCallback, userdata: ?*anyopaque, preserve_checkpoint: bool) !bool {
+        if (self.committed) |saved_resume| if (saved_resume.codec_configuration_hash != null and self.frame_callback == null and self.native_encoding == null) return error.FramingProfileMismatch;
+        if (self.pending_loss != null) return error.LossNotRecorded;
+        self.continuity_failure = null;
+        self.continuity_reported = false;
+        if (!try self.attachTurn()) return false;
+        self.checkNamedPath();
+        if (self.pending_loss != null) return false;
+        try self.finishEofCheck();
+        const f = self.file.?;
+        var r = self.committed.?;
+        const stat = try f.stat();
+        const observed = Observed{ .size = stat.size, .device = r.device, .inode = r.inode };
+        const shrunk = stat.size < r.offset or stat.size < r.prefix_len;
+        const fingerprint = if (shrunk) r.prefix_hash else self.read_prefix(f, r.prefix_len) catch |err| {
+            if (err == error.ResumeLost) return self.continuityLost(classify(r, observed), observed);
+            self.health = .read_failed;
+            return err;
+        };
+        if (shrunk or !std.mem.eql(u8, &fingerprint, &r.prefix_hash)) {
+            if (self.policy == .restart and classify(r, observed) == .truncated) {
+                try self.restartOn(f, observed, .truncated);
+                self.health = .healthy;
+                return false;
+            }
+            if (preserve_checkpoint) return self.continuityLost(classify(r, observed), observed);
+            r = try newResume(f, 0, self.framing, self.start);
+            r.codec_configuration_hash = self.codec_configuration_hash;
+            self.committed = r;
+            self.baseline_committed = false;
+        }
+        if (!self.baseline_committed) {
+            const cursor = try std.json.stringifyAlloc(self.allocator, r, .{});
+            defer self.allocator.free(cursor);
+            var id_buf: [128]u8 = undefined;
+            const id = try std.fmt.bufPrint(&id_buf, "file:baseline:{s}:{d}", .{ std.fmt.fmtSliceHexLower(&r.incarnation), r.offset });
+            callback(.{ .kind = .checkpoint, .source = self.source_id, .source_path = self.path, .occurrence = id, .cursor = cursor, .message = "", .raw_hash = [_]u8{0} ** 32 }, userdata) catch |err| {
+                self.health = .commit_failed;
+                return err;
+            };
+            self.baseline_committed = true;
+        }
+        var line = std.ArrayList(u8).init(self.allocator);
+        defer line.deinit();
+        var offset = r.offset;
+        var chunk: [4096]u8 = undefined;
+        var frame_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer frame_arena.deinit();
+        var predecoded: ?records.Predecoded = null;
+        var native_payload_len: ?usize = null;
+        while (true) {
+            const remaining = self.max_record_bytes -| line.items.len;
+            const count = f.pread(chunk[0..@min(chunk.len, remaining)], offset) catch |err| {
+                self.health = .read_failed;
+                return err;
+            };
+            try line.appendSlice(chunk[0..count]);
+            if (line.items.len == 0) {
+                self.health = .healthy;
+                return false;
+            }
+            if (self.frame_callback) |frame| {
+                const eof = count == 0 or offset + count >= (try f.stat()).size;
+                const framed = frame(self.path, line.items, eof, frame_arena.allocator(), self.frame_context) catch |err| {
+                    self.health = switch (err) {
+                        error.RecordTooLarge => .record_too_long,
+                        error.UnsupportedFramingBoundary, error.InvalidFramingResult => .malformed_record,
+                        else => .child_failed,
+                    };
+                    return err;
+                };
+                if (framed) |result| {
+                    if (result.consumed == 0 or result.consumed > line.items.len) return error.InvalidFramingResult;
+                    line.shrinkRetainingCapacity(result.consumed);
+                    offset = r.offset + result.consumed;
+                    predecoded = result.decoded;
+                    break;
+                }
+                if (eof and line.items.len < self.max_record_bytes) {
+                    self.in_operation = true;
+                    self.health = .healthy;
+                    return false;
+                }
+            } else if (self.native_encoding) |encoding| {
+                const framed = native_text.frame(encoding, line.items, r.offset) catch |err| {
+                    self.health = .malformed_record;
+                    return err;
+                };
+                if (framed) |result| {
+                    native_payload_len = result.payload.len;
+                    line.shrinkRetainingCapacity(result.consumed);
+                    offset = r.offset + result.consumed;
+                    break;
+                }
+            } else if (recordEnd(self.framing, line.items, r.offset)) |end| {
+                line.shrinkRetainingCapacity(end);
+                offset = r.offset + end;
+                break;
+            }
+            if (line.items.len >= self.max_record_bytes) {
+                self.health = .record_too_long;
+                return error.RecordTooLong;
+            }
+            if (count == 0) {
+                self.in_operation = true;
+                self.health = .healthy;
+                return false;
+            }
+            offset += count;
+            _ = frame_arena.reset(.retain_capacity);
+        }
+
+        const after_read = try f.stat();
+        var next = r;
+        next.offset = offset;
+        next.observed_size = after_read.size;
+        next.prefix_len = @max(r.prefix_len, @as(u8, @intCast(@min(offset, 64))));
+        var captured_prefix: [64]u8 = undefined;
+        const captured = try f.preadAll(captured_prefix[0..next.prefix_len], 0);
+        var prior_hash: [32]u8 = undefined;
+        if (captured != next.prefix_len) {
+            self.health = .resume_lost;
+            return error.SourceChanged;
+        }
+        std.crypto.hash.sha2.Sha256.hash(captured_prefix[0..r.prefix_len], &prior_hash, .{});
+        if (after_read.size < offset or !std.mem.eql(u8, &prior_hash, &r.prefix_hash)) {
+            self.health = .resume_lost;
+            return error.SourceChanged;
+        }
+        // Why: Record bytes inside the first 64 are compared with a second read, so a file rewritten during the read is refused.
+        if (r.offset < captured) {
+            const first: usize = @intCast(r.offset);
+            const end: usize = @intCast(@min(offset, captured));
+            if (!std.mem.eql(u8, captured_prefix[first..end], line.items[0 .. end - first])) {
+                self.health = .resume_lost;
+                return error.SourceChanged;
+            }
+        }
+        std.crypto.hash.sha2.Sha256.hash(captured_prefix[0..next.prefix_len], &next.prefix_hash, .{});
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(line.items, &hash, .{});
+        var identity_buf: [256]u8 = undefined;
+        const identity = try std.fmt.bufPrint(&identity_buf, "file:v1:{s}:{d}:{d}:{s}", .{ std.fmt.fmtSliceHexLower(&r.incarnation), r.offset, offset, std.fmt.fmtSliceHexLower(&hash) });
+        const cursor = try std.json.stringifyAlloc(self.allocator, next, .{});
+        defer self.allocator.free(cursor);
+        if (predecoded) |decoded| if (!std.mem.eql(u8, &decoded.raw_hash, &hash)) return error.InvalidFramingResult;
+        const message = if (native_payload_len) |length| line.items[0..length] else if (predecoded != null) line.items else stripTerminator(self.framing, line.items);
+        callback(.{ .source = self.source_id, .source_path = self.path, .occurrence = identity, .cursor = cursor, .message = message, .raw_hash = hash, .predecoded = predecoded, .byte_start = r.offset, .byte_end = offset }, userdata) catch |err| {
+            self.health = .commit_failed;
+            return err;
+        };
+        self.committed = next;
+        if (!self.in_operation) {
+            self.pending_eof_check = true;
+            self.finishEofCheck() catch {
+                return true;
+            };
+        }
+        self.health = .healthy;
+        return true;
+    }
+
+    fn finishEofCheck(self: *FileSource) !void {
+        if (!self.pending_eof_check) return;
+        var byte: [1]u8 = undefined;
+        const count = self.file.?.pread(&byte, self.committed.?.offset) catch |err| {
+            self.health = .read_failed;
+            return err;
+        };
+        self.pending_eof_check = false;
+        if (count == 0) self.in_operation = true;
+    }
+};

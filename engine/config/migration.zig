@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Imports a fail2ban configuration tree into a native configuration file that carries a prepared compatibility manifest.
+// Holds: The output is replaced only after the generated configuration validates, by renaming a fully written and synced temporary file.
 
 const std = @import("std");
 const fail2ban = @import("fail2ban.zig");
-const native = @import("native.zig");
+const native = @import("config.zig");
 pub const source_plan = @import("source_plan.zig");
 const filter_context = @import("filter_context.zig");
 const registry = @import("../filters/registry.zig");
@@ -309,56 +311,6 @@ fn resolveFilter(ctx: *Context, name: []const u8) ?FilterResolution {
     return null;
 }
 
-pub fn parseDuration(raw: []const u8) ?u64 {
-    const trimmed = std.mem.trim(u8, raw, " \t");
-    if (trimmed.len == 0) return null;
-
-    var split: usize = 0;
-    while (split < trimmed.len) : (split += 1) {
-        const c = trimmed[split];
-        if (c < '0' or c > '9') break;
-    }
-    if (split == 0) return null;
-    const n = std.fmt.parseInt(u64, trimmed[0..split], 10) catch return null;
-
-    const rest = std.mem.trim(u8, trimmed[split..], " \t");
-    if (rest.len == 0) return n;
-
-    const Unit = struct { suf: []const u8, mul: u64 };
-    const units = [_]Unit{
-        .{ .suf = "seconds", .mul = 1 },
-        .{ .suf = "second", .mul = 1 },
-        .{ .suf = "sec", .mul = 1 },
-        .{ .suf = "s", .mul = 1 },
-        .{ .suf = "minutes", .mul = 60 },
-        .{ .suf = "minute", .mul = 60 },
-        .{ .suf = "min", .mul = 60 },
-        .{ .suf = "m", .mul = 60 },
-        .{ .suf = "hours", .mul = 3600 },
-        .{ .suf = "hour", .mul = 3600 },
-        .{ .suf = "hr", .mul = 3600 },
-        .{ .suf = "h", .mul = 3600 },
-        .{ .suf = "days", .mul = 86_400 },
-        .{ .suf = "day", .mul = 86_400 },
-        .{ .suf = "d", .mul = 86_400 },
-        .{ .suf = "weeks", .mul = 604_800 },
-        .{ .suf = "week", .mul = 604_800 },
-        .{ .suf = "w", .mul = 604_800 },
-        .{ .suf = "months", .mul = 30 * 86_400 },
-        .{ .suf = "month", .mul = 30 * 86_400 },
-        .{ .suf = "mo", .mul = 30 * 86_400 },
-        .{ .suf = "years", .mul = 365 * 86_400 },
-        .{ .suf = "year", .mul = 365 * 86_400 },
-        .{ .suf = "y", .mul = 365 * 86_400 },
-    };
-    for (units) |u| {
-        if (std.ascii.eqlIgnoreCase(rest, u.suf)) {
-            return std.math.mul(u64, n, u.mul) catch null;
-        }
-    }
-    return null;
-}
-
 fn parseBool(raw: []const u8) bool {
     const s = std.mem.trim(u8, raw, " \t");
     return std.ascii.eqlIgnoreCase(s, "true") or
@@ -461,7 +413,10 @@ pub fn renderToml(cfg: *const native.Config, w: anytype) !void {
     try w.print("memory_ceiling_mb = {d}\n", .{cfg.global.memory_ceiling_mb});
     try writeQuoted(w, "metrics_bind", cfg.global.metrics_bind);
     try w.print("metrics_port = {d}\n", .{cfg.global.metrics_port});
-    try w.print("metrics_enabled = {s}\nwebsocket_max_clients = {d}\non_no_backend = \"{s}\"\nfirewall = \"{s}\"\n", .{ if (cfg.global.metrics_enabled) "true" else "false", cfg.global.websocket_max_clients, @tagName(cfg.global.on_no_backend), @tagName(cfg.global.firewall) });
+    try w.print(
+        "metrics_enabled = {s}\non_no_backend = \"{s}\"\nfirewall = \"{s}\"\n",
+        .{ if (cfg.global.metrics_enabled) "true" else "false", @tagName(cfg.global.on_no_backend), @tagName(cfg.global.firewall) },
+    );
     try w.writeAll("\n");
 
     try w.writeAll("[defaults]\n");
@@ -488,6 +443,7 @@ pub fn renderToml(cfg: *const native.Config, w: anytype) !void {
         if (j.bantime) |v| try w.print("bantime = {d}\n", .{v});
         if (j.banaction) |v| try w.print("banaction = \"{s}\"\n", .{@tagName(v)});
         if (j.ignoreip) |list| try writeStringArray(w, "ignoreip", list);
+        // Why: With no field bits set, mask 31 writes enabled, multiplier, factor, formula and max_bantime, but not scope or jitter.
         if (j.bantime_increment_explicit) try writeIncrementMask(w, j.bantime_increment, if (j.bantime_increment_fields == 0) 31 else j.bantime_increment_fields);
         try w.writeAll("\n");
     }
@@ -565,6 +521,7 @@ fn effectiveSection(arena: std.mem.Allocator, ini: *const fail2ban.ParsedIni, na
 fn requiresCompatibility(sec: *const fail2ban.Section) bool {
     if (sec.get("logpath")) |raw| {
         var lines = std.mem.splitScalar(u8, raw, '\n');
+        // Why: A space in a logpath line marks a head or tail start word, which a native logpath entry cannot express.
         while (lines.next()) |line| if (std.mem.lastIndexOfScalar(u8, line, ' ') != null) return true;
     }
     const supported = [_][]const u8{ "enabled", "filter", "logpath", "backend", "maxretry", "findtime", "bantime", "ignoreip", "bantime.increment", "bantime.factor", "bantime.maxtime" };
@@ -642,7 +599,10 @@ fn prepareManifest(ctx: *Context, document: *const fail2ban.ConfigDocument, glob
                 },
             };
             const origin = effective.origins.get(kv.key_ptr.*);
-            try options.append(a, .{ .section = section.key_ptr.*, .name = kv.key_ptr.*, .raw = if (origin) |o| o.raw else kv.value_ptr.*, .effective = value, .resolution_error = resolution_error, .origin = origin });
+            try options.append(
+                a,
+                .{ .section = section.key_ptr.*, .name = kv.key_ptr.*, .raw = if (origin) |o| o.raw else kv.value_ptr.*, .effective = value, .resolution_error = resolution_error, .origin = origin },
+            );
         }
         if (std.mem.eql(u8, section.key_ptr.*, "DEFAULT") or std.mem.eql(u8, section.key_ptr.*, "INCLUDES")) continue;
         var source_defaults = source_plan.FilterDefaults{ .config_root = ctx.source_dir };
@@ -668,7 +628,19 @@ fn prepareManifest(ctx: *Context, document: *const fail2ban.ConfigDocument, glob
                             error.OutOfMemory => return error.OutOfMemory,
                             else => {
                                 source_defaults.error_name = @errorName(err);
-                                try assets.append(a, .{ .jail = section.key_ptr.*, .kind = kind, .selector = selector, .admission = @errorName(err), .sources = prepared.config.sources.items, .parameters = try entries(a, &prepared.selector.parameters), .combined = &.{}, .consumer_phase = "filter-context-error" });
+                                try assets.append(
+                                    a,
+                                    .{
+                                        .jail = section.key_ptr.*,
+                                        .kind = kind,
+                                        .selector = selector,
+                                        .admission = @errorName(err),
+                                        .sources = prepared.config.sources.items,
+                                        .parameters = try entries(a, &prepared.selector.parameters),
+                                        .combined = &.{},
+                                        .consumer_phase = "filter-context-error",
+                                    },
+                                );
                                 continue;
                             },
                         };
@@ -682,7 +654,18 @@ fn prepareManifest(ctx: *Context, document: *const fail2ban.ConfigDocument, glob
                     break :combined fail2ban.combineAsset(a, &prepared, "") catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         else => {
-                            try assets.append(a, .{ .jail = section.key_ptr.*, .kind = kind, .selector = selector, .admission = @errorName(err), .sources = prepared.config.sources.items, .parameters = try entries(a, &prepared.selector.parameters), .combined = &.{} });
+                            try assets.append(
+                                a,
+                                .{
+                                    .jail = section.key_ptr.*,
+                                    .kind = kind,
+                                    .selector = selector,
+                                    .admission = @errorName(err),
+                                    .sources = prepared.config.sources.items,
+                                    .parameters = try entries(a, &prepared.selector.parameters),
+                                    .combined = &.{},
+                                },
+                            );
                             continue;
                         },
                     };
@@ -692,8 +675,27 @@ fn prepareManifest(ctx: *Context, document: *const fail2ban.ConfigDocument, glob
                     retained.* = combined;
                     source_defaults = .{ .values = retained, .asset_index = assets.items.len, .config_root = ctx.source_dir };
                 }
-                const admission = if (prepared.config.sources.items.len > 0) "prepared" else if (std.mem.eql(u8, kind, "filter") and registry.matcherForFilter(prepared.selector.name) != null) "native-projection" else "missing";
-                try assets.append(a, .{ .jail = section.key_ptr.*, .kind = kind, .selector = selector, .admission = admission, .sources = prepared.config.sources.items, .parameters = try entries(a, &prepared.selector.parameters), .combined = try entries(a, &combined), .diagnostics = prepared.config.warnings.items, .known_combined = known_values, .auto_logtype = auto_logtype, .consumer_phase = consumer_phase });
+                const admission = if (prepared.config.sources.items.len > 0) "prepared" else if (std.mem.eql(
+                    u8,
+                    kind,
+                    "filter",
+                ) and registry.matcherForFilter(prepared.selector.name) != null) "native-projection" else "missing";
+                try assets.append(
+                    a,
+                    .{
+                        .jail = section.key_ptr.*,
+                        .kind = kind,
+                        .selector = selector,
+                        .admission = admission,
+                        .sources = prepared.config.sources.items,
+                        .parameters = try entries(a, &prepared.selector.parameters),
+                        .combined = try entries(a, &combined),
+                        .diagnostics = prepared.config.warnings.items,
+                        .known_combined = known_values,
+                        .auto_logtype = auto_logtype,
+                        .consumer_phase = consumer_phase,
+                    },
+                );
             }
         }
         for (options.items) |*option| {
@@ -731,12 +733,28 @@ fn prepareManifest(ctx: *Context, document: *const fail2ban.ConfigDocument, glob
     var digest: [32]u8 = undefined;
     identity.final(&digest);
     const generation = std.fmt.bytesToHex(digest, .lower);
-    std.json.stringify(.{ .schema_version = @as(u32, 1), .reference_profile = document.reference_profile, .config_generation = @as([]const u8, &generation), .admission = "prepared", .native_projection_profile = "legacy-builtin", .sources = document.source.sources.items, .assignments = document.source.assignments.items, .options = options.items, .assets = assets.items, .global = try prepareGlobalManifest(ctx, global_document), .source_plans = source_plans.items }, .{}, bytes.writer(a)) catch return error.OutOfMemory;
+    std.json.stringify(
+        .{
+            .schema_version = @as(u32, 1),
+            .reference_profile = document.reference_profile,
+            .config_generation = @as([]const u8, &generation),
+            .admission = "prepared",
+            .native_projection_profile = "legacy-builtin",
+            .sources = document.source.sources.items,
+            .assignments = document.source.assignments.items,
+            .options = options.items,
+            .assets = assets.items,
+            .global = try prepareGlobalManifest(ctx, global_document),
+            .source_plans = source_plans.items,
+        },
+        .{},
+        bytes.writer(a),
+    ) catch return error.OutOfMemory;
     return try bytes.toOwnedSlice(a);
 }
 
 fn parseImportedDuration(raw: []const u8) ?u64 {
-    const value = @import("duration.zig").parse(raw, false) catch return null;
+    const value = @import("shared").duration.parse(raw, false) catch return null;
     return value.nativeSeconds() catch null;
 }
 
@@ -776,7 +794,10 @@ fn prepareGlobalManifest(ctx: *Context, document: *const fail2ban.ConfigDocument
                 },
             };
             const origin = effective.origins.get(kv.key_ptr.*);
-            try options.append(a, .{ .section = section.key_ptr.*, .name = kv.key_ptr.*, .raw = if (origin) |o| o.raw else kv.value_ptr.*, .effective = value, .resolution_error = resolution_error, .origin = origin });
+            try options.append(
+                a,
+                .{ .section = section.key_ptr.*, .name = kv.key_ptr.*, .raw = if (origin) |o| o.raw else kv.value_ptr.*, .effective = value, .resolution_error = resolution_error, .origin = origin },
+            );
         }
     }
     const Rule = struct { phase: []const u8, section: []const u8 = "Definition", name: []const u8, kind: fail2ban.CanonicalType = .string, fallback: fail2ban.CanonicalValue };
@@ -813,5 +834,14 @@ fn prepareGlobalManifest(ctx: *Context, document: *const fail2ban.ConfigDocument
             .invalid;
         try observations.append(a, .{ .reader_entry = reader_entry, .phase = rule.phase, .section = rule.section, .option = rule.name, .value = value, .resolution_error = resolution_error });
     }
-    return .{ .admission = if (document.source.sources.items.len > 0) "pending" else "absent-native-projection", .source_present = document.source.sources.items.len > 0, .thread_section_present = document.source.section("Thread") != null, .sources = document.source.sources.items, .assignments = document.source.assignments.items, .options = options.items, .reader_observations = observations.items, .diagnostics = document.source.warnings.items };
+    return .{
+        .admission = if (document.source.sources.items.len > 0) "pending" else "absent-native-projection",
+        .source_present = document.source.sources.items.len > 0,
+        .thread_section_present = document.source.section("Thread") != null,
+        .sources = document.source.sources.items,
+        .assignments = document.source.assignments.items,
+        .options = options.items,
+        .reader_observations = observations.items,
+        .diagnostics = document.source.warnings.items,
+    };
 }

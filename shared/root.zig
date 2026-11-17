@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Re-exports the shared types, wire protocol, exit classes, duration parser and self-address reader as one module.
+// Holds: Every name here is an alias of a declaration in its own file; nothing is defined or copied here.
+
 pub const types = @import("types.zig");
 pub const protocol = @import("protocol.zig");
 pub const exit = @import("exit.zig");

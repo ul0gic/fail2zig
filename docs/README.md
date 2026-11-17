@@ -24,7 +24,12 @@ matches what you are doing.
 | Detect failures in a log no built-in filter covers | [Custom rule files](reference/custom-rules.md) |
 | Handle log rotation, truncation or a missing log | [Log file lifecycle](guides/log-lifecycle.md) |
 | Detect port scans | [PortSentry scan detection](guides/portsentry.md) |
+| Find out why the daemon will not start, a jail is paused or protection is degraded | [Troubleshooting](guides/troubleshooting.md) |
+| Rotate the daemon's own log file | [Daemon log file and rotation](operations/installation.md#daemon-log-file-and-rotation) |
+| Run on a host with SELinux or AppArmor | [SELinux and AppArmor](operations/installation.md#selinux-and-apparmor) |
+| Get a short answer to a common question | [Frequently asked questions](guides/faq.md) |
 | Report a problem | [Support bundle](operations/support-bundle.md) |
+| Remove fail2zig | [Uninstalling](operations/installation.md#uninstalling) |
 
 The installed manuals, `man fail2zig` and `man 5 fail2zig.toml`, are the exact
 reference for every command and key. Their sources are

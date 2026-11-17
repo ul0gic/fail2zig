@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Reads one file with a chosen framing and start and prints each data record's bytes and offsets as one JSON line.
+// Holds: Any invocation other than --file with path, framing and start fails before a file is opened; checkpoints are never printed.
+
 const std = @import("std");
 const files = @import("engine_probe").core.durable_file_source;
 const source_record = @import("engine_probe").core.source_record;
@@ -24,5 +27,6 @@ pub fn main() !void {
 fn onFile(record: source_record.Record, _: ?*anyopaque) !void {
     if (record.kind == .checkpoint) return;
     const writer = std.io.getStdOut().writer();
+    // Why: Record bytes may hold quotes, control bytes or invalid UTF-8, so they are hex-encoded instead of placed in a JSON string.
     try writer.print("{{\"message_hex\":\"{s}\",\"byte_start\":{d},\"byte_end\":{d}}}\n", .{ std.fmt.fmtSliceHexLower(record.message), record.byte_start.?, record.byte_end.? });
 }

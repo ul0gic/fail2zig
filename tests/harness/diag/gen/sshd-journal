@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# Usage (root): sshd-journal COUNT RATE [START] [PER_ADDRESS]  — sends sshd failures to the journal via the lab emitter.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 fail2zig maintainers
+# Does:  Sends paced sshd failure lines for distinct addresses to the journal through a root-owned copy of logger.
+# Holds: The emitter is a root-owned mode 0755 copy of logger at a fixed path, created only when it is missing.
+
 set -euo pipefail
 COUNT="$1"; RATE="$2"; START="${3:-0}"; PER="${4:-3}"
 EMITTER=${F2Z_SSHD_EMITTER:-/usr/local/libexec/f2z-diag/sshd-emitter}
 HERE=$(cd "$(dirname "$0")" && pwd)
-# The sshd jail accepts only _TRANSPORT=syslog, _UID=0 and an _EXE in journal_executables, so the
-# sender is a root copy of logger at a listed path; `logger --journald` and systemd-cat fail that check.
+# Why: The sshd jail takes only _TRANSPORT=syslog entries from _UID=0 with a listed _EXE, so the sender is a root copy of logger.
 if [ ! -x "$EMITTER" ]; then
   install -d -m 0755 "$(dirname "$EMITTER")"
   install -o root -g root -m 0755 "$(command -v logger)" "$EMITTER"
 fi
-# journald reads _EXE from the sender's /proc entry on arrival; keep the sender alive 5 s past the last line.
 { "$HERE/lines" sshd "$COUNT" "$RATE" --start "$START" --per-address "$PER"; sleep 5; } \
   | "$EMITTER" --tag sshd --priority auth.info --socket-errors=on

@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Acknowledges a truncated, replaced or removed log source so its jail resumes reading, through the daemon or offline.
+// Holds: Nothing runs without --acknowledge-truncation and a configured logpath of the named jail; a missing state file is never created.
+
 const std = @import("std");
 const shared = @import("shared");
 const cli = @import("cli");
-const config_mod = @import("../config/native.zig");
-const native_paths = @import("../config/native_paths.zig");
-const durable = @import("../core/record_store.zig");
+const config_mod = @import("../config/config.zig");
+const native_paths = @import("../config/paths.zig");
+const durable = @import("../store/store.zig");
 const repair = @import("../store/source_repair.zig");
-const files = @import("../core/durable_file_source.zig");
+const files = @import("../source/durable_file_source.zig");
 
 pub const ExitClass = shared.ExitClass;
 pub const default_config = "/etc/fail2zig/config.toml";
@@ -70,7 +73,7 @@ fn usage(stderr: anytype) ExitClass {
     return .usage;
 }
 
-// The daemon reads exactly the paths its logpath patterns expand to.
+// Holds: A path is accepted only when it equals a logpath pattern or one of the at most 4096 paths that pattern expands to.
 fn configuredLogpath(allocator: std.mem.Allocator, jail: config_mod.JailConfig, path: []const u8) !bool {
     for (jail.logpath) |pattern| {
         if (std.mem.eql(u8, pattern, path)) return true;
@@ -105,9 +108,10 @@ pub fn execute(allocator: std.mem.Allocator, options: Options, now_us: i64, stdo
         stderr.print("repair-source: {s} is not a configured logpath of jail '{s}'\n", .{ options.source, options.jail }) catch {};
         return .rejected;
     }
+    // Why: A reachable daemon takes the repair itself; the offline lock is tried only when no daemon answers on the socket.
     if (online(allocator, cfg.global.socket_path, options, stdout, stderr)) |class| return class;
     const state_path = cfg.global.state_file;
-    // Never create state: an absent file has nothing to repair.
+    // Why: Unlike lockState, this lock never creates the file; an absent state has nothing to repair.
     const authority = native_paths.lockStateIfPresent(state_path) catch |err| {
         switch (err) {
             error.NativeAuthorityAlreadyRunning => stderr.print("repair-source: {s} is held by a running daemon or another administrator; stop fail2zig first\n", .{state_path}) catch {},
@@ -118,8 +122,9 @@ pub fn execute(allocator: std.mem.Allocator, options: Options, now_us: i64, stdo
         stderr.print("repair-source: state {s} does not exist; nothing to repair and no state was created\n", .{state_path}) catch {};
         return .rejected;
     };
-    // Released only after the store closes below.
+    // Why: Defers run in reverse order, so the lock is released only after the store opened below has closed.
     defer authority.close();
+    // Why: The lock is held on a descriptor, so each open by path is checked to still name the locked device and inode.
     if (!native_paths.stateMatchesAuthority(authority, state_path)) {
         stderr.print("repair-source: state {s} was replaced while locked; nothing was changed\n", .{state_path}) catch {};
         return .rejected;
@@ -204,7 +209,10 @@ const SizeText = struct {
 fn reportRecorded(stdout: anytype, options: Options, recorded: repair.RecordedLoss) !void {
     var time_buffer: [32]u8 = undefined;
     try stdout.print("repair-source: {s}\n  jail={} source=file\n  path={}\n", .{ repair.Headline.loss_recorded, std.zig.fmtEscapes(options.jail), std.zig.fmtEscapes(options.source) });
-    try stdout.print("  loss event: {s} UTC truncated inode={d} committed_offset={d} size={}\n", .{ formatUtc(&time_buffer, recorded.wall_us), recorded.inode, recorded.committed_offset, SizeText{ .size = recorded.observed_size } });
+    try stdout.print(
+        "  loss event: {s} UTC truncated inode={d} committed_offset={d} size={}\n",
+        .{ formatUtc(&time_buffer, recorded.wall_us), recorded.inode, recorded.committed_offset, SizeText{ .size = recorded.observed_size } },
+    );
     try stdout.print("  reading resumed at offset 0 of inode {d}; no repair was performed and the token was not used\n", .{recorded.inode});
 }
 
@@ -216,9 +224,15 @@ fn reportRemoved(stdout: anytype, options: Options, outcome: repair.Outcome, rem
     if (removed.last_size) |size| try stdout.print(" last_size={d}\n", .{size}) else if (outcome.replayed) try stdout.writeAll("\n") else try stdout.writeAll(" last_size=unknown\n");
     if (removed.current_inode) |inode| {
         try stdout.print("  current inode={d}", .{inode});
-        if (removed.current_offset) |offset| try stdout.print(" resumes at offset {d}\n", .{offset}) else try stdout.writeAll(" has no checkpoint; the next start reads it from its configured start\n");
+        if (removed.current_offset) |offset| try stdout.print(
+            " resumes at offset {d}\n",
+            .{offset},
+        ) else try stdout.writeAll(" has no checkpoint; the next start reads it from its configured start\n");
     }
-    if (removed.committed_offset) |offset| try stdout.print("Records in the removed incarnation after offset {d} were never read and cannot be recovered.\n", .{offset}) else try stdout.writeAll(removed_loss_text);
+    if (removed.committed_offset) |offset| try stdout.print(
+        "Records in the removed incarnation after offset {d} were never read and cannot be recovered.\n",
+        .{offset},
+    ) else try stdout.writeAll(removed_loss_text);
     try stdout.writeAll(
         \\While the daemon is stopped, protection for every jail may be absent: the stop can
         \\remove installed firewall rules. The next start reinstalls them from durable state
@@ -232,9 +246,15 @@ fn report(stdout: anytype, options: Options, outcome: repair.Outcome) !void {
     const hex = std.fmt.fmtSliceHexLower;
     try stdout.print("repair-source: {s}\n", .{repair.headline(outcome)});
     try stdout.print("  jail={s} source={s}\n  path={s}\n", .{ options.jail, outcome.source, options.source });
-    try stdout.print("  generation={s}\n  checkpoint_revision={d} -> {d}\n  prior_cursor_sha256={s}\n", .{ hex(&outcome.generation), outcome.prior_checkpoint_revision, outcome.prior_checkpoint_revision + 1, hex(&outcome.prior_cursor_sha256) });
+    try stdout.print(
+        "  generation={s}\n  checkpoint_revision={d} -> {d}\n  prior_cursor_sha256={s}\n",
+        .{ hex(&outcome.generation), outcome.prior_checkpoint_revision, outcome.prior_checkpoint_revision + 1, hex(&outcome.prior_cursor_sha256) },
+    );
     if (outcome.prior_incarnation) |incarnation| try stdout.print("  prior_incarnation={s} prior_offset={d}\n", .{ hex(&incarnation), outcome.prior_offset.? });
-    try stdout.print("  new_incarnation={s} new_offset=0\n  file device={d} inode={d} size={d} prefix_sha256={s}\n", .{ hex(&outcome.new_incarnation), outcome.file.device, outcome.file.inode, outcome.file.size, hex(&outcome.file.prefix_sha256) });
+    try stdout.print(
+        "  new_incarnation={s} new_offset=0\n  file device={d} inode={d} size={d} prefix_sha256={s}\n",
+        .{ hex(&outcome.new_incarnation), outcome.file.device, outcome.file.inode, outcome.file.size, hex(&outcome.file.prefix_sha256) },
+    );
     try stdout.writeAll(if (outcome.replaced_file) replaced_loss_text else truncated_loss_text);
     try stdout.writeAll(
         \\While the daemon is stopped, protection for every jail may be absent: the stop can

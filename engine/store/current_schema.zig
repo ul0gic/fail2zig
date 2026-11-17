@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Declares the current schema's DDL and seed rows, and the statements that upgrade schema 26 and 28 databases toward it.
+// Holds: Every confirmed_effect_events insert takes the next head sequence through confirmed_history_append, so sequences have no gaps.
 
-// Final current objects; historical conversions remain in schema.zig.
 pub const jail_limits_ddl =
     \\CREATE TABLE history_jail_limits(jail TEXT PRIMARY KEY NOT NULL,max_matches INTEGER) WITHOUT ROWID;
 ;
@@ -143,12 +144,12 @@ pub const upgrade_ddl = jail_limits_ddl ++
     "ALTER TABLE retention_policy ADD COLUMN history_subject_sweep_cursor INTEGER DEFAULT 0;" ++
     "PRAGMA user_version=27;";
 
-// The obligation survives a crash independently of caller-local page cursors.
+// Why: A retirement row keeps the obligation across a crash, independent of the caller's in-memory page cursor.
 pub const jail_retirements_ddl =
     \\CREATE TABLE jail_retirements(jail TEXT NOT NULL PRIMARY KEY CHECK(typeof(jail)='text' AND length(CAST(jail AS BLOB)) BETWEEN 1 AND 64 AND instr(jail,char(0))=0),keep_ignore_deadlines INTEGER NOT NULL CHECK(typeof(keep_ignore_deadlines)='integer' AND keep_ignore_deadlines IN(0,1))) WITHOUT ROWID;
 ;
 
-// Counts may be negative until reconciled: the upgrade starts them at zero over populated tables.
+// Why: Counts have no lower bound: the upgrade seeds them at zero over populated tables, so a delete can go negative until reconciled.
 pub const owed_work_ddl =
     \\CREATE TABLE effect_owed_work(id INTEGER PRIMARY KEY CHECK(id=1),markers INTEGER NOT NULL CHECK(typeof(markers)='integer'),unsettled_intents INTEGER NOT NULL CHECK(typeof(unsettled_intents)='integer'),reconciled INTEGER NOT NULL CHECK(reconciled IN(0,1)));
     \\CREATE TRIGGER effect_owed_marker_insert AFTER INSERT ON confirmation_markers BEGIN UPDATE effect_owed_work SET markers=markers+1 WHERE id=1; END;

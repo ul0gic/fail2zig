@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
+// Does:  Bans addresses as DROP rules in one prefix-named chain jumped to from INPUT, driving the iptables and ip6tables tools.
+// Holds: Only that chain and its one INPUT jump are changed, and the jump and each ban rule are added only after -C reports them missing.
 
 const std = @import("std");
 const mem = std.mem;
@@ -25,25 +27,9 @@ pub const CommandBuilder = struct {
         return argv[0..3];
     }
 
-    pub fn deleteChain(self: CommandBuilder, argv: *[4][]const u8) [][]const u8 {
-        argv[0] = self.binary;
-        argv[1] = "-X";
-        argv[2] = self.chain;
-        return argv[0..3];
-    }
-
     pub fn installJump(self: CommandBuilder, argv: *[6][]const u8) [][]const u8 {
         argv[0] = self.binary;
         argv[1] = "-I";
-        argv[2] = "INPUT";
-        argv[3] = "-j";
-        argv[4] = self.chain;
-        return argv[0..5];
-    }
-
-    pub fn removeJump(self: CommandBuilder, argv: *[6][]const u8) [][]const u8 {
-        argv[0] = self.binary;
-        argv[1] = "-D";
         argv[2] = "INPUT";
         argv[3] = "-j";
         argv[4] = self.chain;
@@ -212,6 +198,7 @@ fn initImpl(
     self.config = config;
     var name_buf: [128]u8 = undefined;
     const name = chainName(&name_buf, config.chain_prefix, "input") catch return error.SystemError;
+    // Why: iptables refuses chain names of XT_EXTENSION_MAXNAMELEN (29, include/uapi/linux/netfilter/x_tables.h) characters or more.
     if (name.len > 28) return error.SystemError;
     for ([_][]const u8{ "iptables", "ip6tables" }) |binary| {
         const builder = CommandBuilder{ .binary = binary, .chain = name };

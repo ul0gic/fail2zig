@@ -13,6 +13,54 @@ rolling back to them is unsupported. To move between releases, follow the
 Each group heading ends with its type in braces: `{feat}`, `{perf}`, `{fix}` or
 `{sec}`. The website uses it to colour the group.
 
+## 0.4.11 — 2026-11-17
+
+**`history` keeps working after retention, and the documentation an operator needs**
+
+A fix release. `history` no longer fails once retention has removed the first
+record, a WebSocket endpoint that never served events is gone, and the
+documentation gains a troubleshooting guide, an FAQ and uninstall steps. The state
+format is unchanged from 0.4.10, and how bans are detected and enforced is unchanged.
+
+### Fixed {fix}
+
+- `history` **`history` works after retention has pruned.** With no `--cursor`,
+  `history` failed with `500 query source failed` once `history_retention` had
+  removed the first record, which on the default configuration is about a day
+  after a host's first ban. It now starts at the oldest retained record. No stored
+  data was lost. ([#131](https://github.com/ul0gic/fail2zig/issues/131))
+- `history` **An expired cursor says so.** A cursor that points before the oldest
+  retained record answers 409, `cursor expired or observation changed; restart
+  pagination without a cursor`, instead of the same 500.
+
+### Removed {fix}
+
+- `http` **`/events` is gone.** The endpoint only ever answered `400 websocket not
+  enabled`; no release served an event stream. It now answers 404 like any unknown
+  path.
+- `config` **`websocket_max_clients` is deprecated.** The key had no effect. It is
+  still accepted, so an existing configuration starts, and it logs a warning that
+  asks you to remove it. The fail2ban importer no longer writes it.
+- `release` **One notice file fewer.** A release now has 13 assets:
+  `COPYING.date-profile` is no longer shipped, and the installer removes a copy
+  left by an earlier release.
+
+### Documentation {feat}
+
+- `docs` **Troubleshooting.** A new guide maps each startup refusal, degraded
+  cause, paused source and refused command to its cause and the command that
+  resolves it.
+- `docs` **FAQ, uninstall, log rotation and security modules.** New pages and
+  sections answer the common questions, remove an installation completely, rotate
+  the daemon's own log file under the shipped unit, and state the SELinux and
+  AppArmor position.
+- `docs` **Complete key and flag reference.** The configuration manual gains the
+  twelve keys it lacked, including `timestamp` and the time zone keys, and
+  `rule-test` documents `--journal-since` and `--journal-executable`.
+- `docs` **Migration flag corrected.** An enabled jail is refused while
+  `compatibility_pending` is true; `compatibility_manifest` blocks nothing by
+  itself. The reference said either did.
+
 ## 0.4.10 — 2026-11-16
 
 **A state file that stays bounded and a source that resumes by itself**
