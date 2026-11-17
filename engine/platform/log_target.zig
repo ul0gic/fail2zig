@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const posix = std.posix;
-const LogFormat = @import("../config/native.zig").LogFormat;
+const LogFormat = @import("../config/config.zig").LogFormat;
 const logger = @import("logger.zig");
 
 pub const max_line_bytes: usize = 4096;

@@ -18,7 +18,7 @@ const inference = @import("../time/year_inference.zig");
 const timezone = @import("../time/timezone.zig");
 const journal = @import("../source/journal_transport.zig");
 const dns = @import("../detect/dns.zig");
-const config_mod = @import("../config/native.zig");
+const config_mod = @import("../config/config.zig");
 
 pub const ExitClass = shared.ExitClass;
 pub const Output = enum { json, table };

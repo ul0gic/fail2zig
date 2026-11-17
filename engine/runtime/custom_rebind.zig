@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const durable = @import("../source/record_store.zig");
-const plan = @import("../config/native_consumer_plan.zig");
+const plan = @import("../config/consumer_plan.zig");
 const consumers = @import("../detect/consumer.zig");
 const bridge = @import("../detect/consumer_coordinator.zig");
 const rule = @import("../detect/rule_consumer.zig");
@@ -14,7 +14,7 @@ const retry = @import("../detect/retry.zig");
 const files = @import("../source/durable_file_source.zig");
 const file_session = @import("../source/file_session.zig");
 const journal_session = @import("../source/journal_session.zig");
-const reload = @import("native_reload.zig");
+const reload = @import("reload.zig");
 const detection = @import("../detect/detection_record.zig");
 const Hash = std.crypto.hash.sha2.Sha256;
 

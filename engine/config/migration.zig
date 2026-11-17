@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const fail2ban = @import("fail2ban.zig");
-const native = @import("native.zig");
+const native = @import("config.zig");
 pub const source_plan = @import("source_plan.zig");
 const filter_context = @import("filter_context.zig");
 const registry = @import("../filters/registry.zig");

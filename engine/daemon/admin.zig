@@ -5,18 +5,18 @@
 
 const std = @import("std");
 const shared = @import("shared");
-const config = @import("config/native.zig");
-const detection = @import("detect/detection_record.zig");
-const effect = @import("effect/effect.zig");
-const effect_runtime = @import("runtime/native_effect_runtime.zig");
-const inspection = @import("firewall/inspection.zig");
-const durable = @import("source/record_store.zig");
-const ignore_set = @import("detect/ignore_set.zig");
-const RuntimeIgnoreEntry = @import("store/ignore_entries.zig").RuntimeIgnoreEntry;
-const audit = @import("platform/audit.zig");
-const ban_origin = @import("effect/ban_origin.zig");
-const source_repair = @import("store/source_repair.zig");
-const daemon = @import("native_daemon.zig");
+const config = @import("../config/config.zig");
+const detection = @import("../detect/detection_record.zig");
+const effect = @import("../effect/effect.zig");
+const effect_runtime = @import("../runtime/effect_runtime.zig");
+const inspection = @import("../firewall/inspection.zig");
+const durable = @import("../source/record_store.zig");
+const ignore_set = @import("../detect/ignore_set.zig");
+const RuntimeIgnoreEntry = @import("../store/ignore_entries.zig").RuntimeIgnoreEntry;
+const audit = @import("../platform/audit.zig");
+const ban_origin = @import("../effect/ban_origin.zig");
+const source_repair = @import("../store/source_repair.zig");
+const daemon = @import("daemon.zig");
 const max_jails = daemon.max_jails;
 const Jail = daemon.Jail;
 const AdminReadback = enum { pending, uncertain, coherent };
@@ -124,9 +124,9 @@ pub fn Methods(comptime Coordinator: type) type {
             if (!self.store.reopen_required and self.store.rollback_error_code == null and self.store.api.get_autocommit(self.store.db) != 0) return;
             self.gate.failed(failure, .{ .sqlite_code = self.store.last_error_code, .rollback_code = self.store.rollback_error_code, .reopen_required = true });
         }
-        pub fn adminScope(self: *Coordinator, request: *AdminRequest) !@import("firewall/scope.zig").Scope {
+        pub fn adminScope(self: *Coordinator, request: *AdminRequest) !@import("../firewall/scope.zig").Scope {
             const address = request.address orelse return error.AdminAddressRequired;
-            const canonical = @import("firewall/scope.zig");
+            const canonical = @import("../firewall/scope.zig");
             const subject = if (request.prefix) |prefix| blk: {
                 const manager = self.effects orelse return error.AdminEnforcementRequired;
                 if (manager.installation.backend == .iptables) return error.AdminNetworkScopeUnsupported;
@@ -265,7 +265,7 @@ pub fn Methods(comptime Coordinator: type) type {
                             .refuse_config => return self.adminDetail(request, (AdminOutcomeView{ .outcome = .rejected, .kind = kind }).withReason("{s}", .{ban_origin.refused_config_text}), null),
                             .set_manual, .extend_as_manual => {},
                         }
-                        const duration: @import("effect/lease.zig").Duration = if (request.duration_s) |seconds| try @import("effect/lease.zig").Duration.finiteSeconds(seconds) else jail.policy.duration;
+                        const duration: @import("../effect/lease.zig").Duration = if (request.duration_s) |seconds| try @import("../effect/lease.zig").Duration.finiteSeconds(seconds) else jail.policy.duration;
                         const lease = try duration.lease(now);
                         noteIgnoredTarget(request, jail);
                         _ = try self.store.setOwnerFromCanonical(.{ .scope = canonical, .jail = jail.name, .generation = generation, .decision_id = durable.Store.adminDecisionId(request.request_id, request.expected_revision), .expected_revision = if (current) |owner| owner.revision else 0, .lease = lease, .decided_us = now, .origin = .manual }, clock);

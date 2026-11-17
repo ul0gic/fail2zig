@@ -4,7 +4,7 @@
 // Holds: A maxretry of 0 or above retry.max_attempts, or a duration past i64 microseconds, is refused, never clamped.
 
 const std = @import("std");
-const config = @import("native.zig");
+const config = @import("config.zig");
 const retry = @import("../detect/retry.zig");
 
 pub fn fromJail(jail: *const config.JailConfig, defaults: config.JailDefaults, max_subjects: u32) !retry.Policy {

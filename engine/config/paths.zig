@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const config = @import("native.zig");
+const config = @import("config.zig");
 
 fn canonical(a: std.mem.Allocator, path: []const u8) ![]u8 {
     return std.fs.realpathAlloc(a, path) catch |err| switch (err) {

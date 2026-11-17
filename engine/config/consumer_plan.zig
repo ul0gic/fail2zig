@@ -4,7 +4,7 @@
 // Holds: A rule or ignore file is read only if regular, root- or euid-owned, not group or world writable, and unchanged across the read.
 
 const std = @import("std");
-const native = @import("native.zig");
+const native = @import("config.zig");
 const rules = @import("../detect/rules.zig");
 const ignore = @import("../detect/ignore.zig");
 const bridge = @import("../detect/consumer_coordinator.zig");

@@ -6,8 +6,8 @@
 const std = @import("std");
 const shared = @import("shared");
 const cli = @import("cli");
-const config = @import("../config/native.zig");
-const paths = @import("../config/native_paths.zig");
+const config = @import("../config/config.zig");
+const paths = @import("../config/paths.zig");
 const durable = @import("../source/record_store.zig");
 const effects = @import("../effect/effect.zig");
 

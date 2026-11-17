@@ -3,7 +3,7 @@
 // Does:  Gathers selected engine runtime, core and firewall modules under one import root for builds outside the daemon.
 // Holds: Nothing reachable from here imports main.zig, native_daemon.zig or the cli module, so builds on it link no daemon or client.
 
-pub const native_effect_runtime = @import("runtime/native_effect_runtime.zig");
+pub const native_effect_runtime = @import("runtime/effect_runtime.zig");
 pub const core = struct {
     pub const durable_file_source = @import("source/durable_file_source.zig");
     pub const journal_policy = @import("source/journal_policy.zig");

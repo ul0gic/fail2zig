@@ -3,7 +3,7 @@
 
 const std = @import("std");
 
-const config_mod = @import("../config/native.zig");
+const config_mod = @import("../config/config.zig");
 
 pub const Error = error{
     NotLinux,

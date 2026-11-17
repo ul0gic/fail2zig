@@ -5,59 +5,59 @@
 
 const std = @import("std");
 const shared = @import("shared");
-const config = @import("config/native.zig");
-const projection = @import("config/native_file_detection.zig");
-const retry_config = @import("config/native_retry_policy.zig");
-const retry = @import("detect/retry.zig");
-const detection = @import("detect/detection_record.zig");
-const timezone = @import("time/timezone.zig");
-const effect = @import("effect/effect.zig");
-const effect_runtime = @import("runtime/native_effect_runtime.zig");
+const config = @import("../config/config.zig");
+const projection = @import("../config/file_detection.zig");
+const retry_config = @import("../config/retry_policy.zig");
+const retry = @import("../detect/retry.zig");
+const detection = @import("../detect/detection_record.zig");
+const timezone = @import("../time/timezone.zig");
+const effect = @import("../effect/effect.zig");
+const effect_runtime = @import("../runtime/effect_runtime.zig");
 const firewall_observation = effect_runtime.observation;
-const consumer_runtime = @import("runtime/native_consumer_runtime.zig");
-const consumer_plan = @import("config/native_consumer_plan.zig");
-const consumer_bridge = @import("detect/consumer_coordinator.zig");
-const resource = @import("runtime/native_resource_budget.zig");
-const history = @import("effect/effect_history.zig");
-const recurrence = @import("detect/recurrence.zig");
-const firewall_backend = @import("firewall/backend.zig");
-const inspection = @import("firewall/inspection.zig");
-const path_guard = @import("config/native_paths.zig");
-const durable = @import("source/record_store.zig");
-const sessions = @import("source/file_session.zig");
-const pipeline = @import("source/record_pipeline.zig");
-const journal_projection = @import("config/native_journal_detection.zig");
-const journal_profile = @import("config/native_journal_profile.zig");
-const filter_registry = @import("filters/registry.zig");
-const files = @import("source/durable_file_source.zig");
-const ignore_set = @import("detect/ignore_set.zig");
-const custom_ignore = @import("detect/ignore.zig");
-const native_banip = @import("config/native_banip.zig");
-const RuntimeIgnoreEntry = @import("store/ignore_entries.zig").RuntimeIgnoreEntry;
+const consumer_runtime = @import("../runtime/consumer_runtime.zig");
+const consumer_plan = @import("../config/consumer_plan.zig");
+const consumer_bridge = @import("../detect/consumer_coordinator.zig");
+const resource = @import("../runtime/resource_budget.zig");
+const history = @import("../effect/effect_history.zig");
+const recurrence = @import("../detect/recurrence.zig");
+const firewall_backend = @import("../firewall/backend.zig");
+const inspection = @import("../firewall/inspection.zig");
+const path_guard = @import("../config/paths.zig");
+const durable = @import("../source/record_store.zig");
+const sessions = @import("../source/file_session.zig");
+const pipeline = @import("../source/record_pipeline.zig");
+const journal_projection = @import("../config/journal_detection.zig");
+const journal_profile = @import("../config/journal_profile.zig");
+const filter_registry = @import("../filters/registry.zig");
+const files = @import("../source/durable_file_source.zig");
+const ignore_set = @import("../detect/ignore_set.zig");
+const custom_ignore = @import("../detect/ignore.zig");
+const native_banip = @import("../config/banip.zig");
+const RuntimeIgnoreEntry = @import("../store/ignore_entries.zig").RuntimeIgnoreEntry;
 
 // Why: The match list is hashed into the journal source generation, so editing either list fails admission of existing state.
 const legacy_ssh_matches: []const []const u8 = &.{ "SYSLOG_IDENTIFIER=sshd", "SYSLOG_IDENTIFIER=sshd-session", "+", "_COMM=sshd", "_COMM=sshd-session" };
 const auth_ssh_matches: []const []const u8 = &.{ "SYSLOG_IDENTIFIER=sshd", "SYSLOG_IDENTIFIER=sshd-session", "SYSLOG_IDENTIFIER=sshd-auth", "+", "_COMM=sshd", "_COMM=sshd-session", "_COMM=sshd-auth" };
-const journal_sessions = @import("source/journal_session.zig");
-const health = @import("platform/storage_health.zig");
-const recovery = @import("source/recovery.zig");
-const loop_mod = @import("platform/event_loop.zig");
-const ipc = @import("net/ipc.zig");
-const http = @import("net/http.zig");
+const journal_sessions = @import("../source/journal_session.zig");
+const health = @import("../platform/storage_health.zig");
+const recovery = @import("../source/recovery.zig");
+const loop_mod = @import("../platform/event_loop.zig");
+const ipc = @import("../net/ipc.zig");
+const http = @import("../net/http.zig");
 const build_options = @import("build_options");
 const version = build_options.version;
-const diag_mod = @import("diag/diag.zig");
-const clock_mod = @import("time/clock.zig");
-const diag_command = @import("net/diag_command.zig");
-const reload_mod = @import("runtime/native_reload.zig");
-const custom_rebind = @import("runtime/native_custom_rebind.zig");
-const query_v1 = @import("net/query_v1.zig");
-const readiness = @import("platform/readiness.zig");
-const sd_notify = @import("platform/sd_notify.zig");
-const log_target = @import("platform/log_target.zig");
-const metrics_mod = @import("diag/metrics.zig");
-const ban_origin = @import("effect/ban_origin.zig");
-const source_repair = @import("store/source_repair.zig");
+const diag_mod = @import("../diag/diag.zig");
+const clock_mod = @import("../time/clock.zig");
+const diag_command = @import("../net/diag_command.zig");
+const reload_mod = @import("../runtime/reload.zig");
+const custom_rebind = @import("../runtime/custom_rebind.zig");
+const query_v1 = @import("../net/query_v1.zig");
+const readiness = @import("../platform/readiness.zig");
+const sd_notify = @import("../platform/sd_notify.zig");
+const log_target = @import("../platform/log_target.zig");
+const metrics_mod = @import("../diag/metrics.zig");
+const ban_origin = @import("../effect/ban_origin.zig");
+const source_repair = @import("../store/source_repair.zig");
 pub const max_jails = 64;
 pub const max_sources_per_jail = 8;
 pub const max_source_status_per_jail = 2 * max_sources_per_jail + 1;
@@ -565,7 +565,7 @@ pub const Coordinator = struct {
     self_addresses: ?shared.self_addresses.SelfAddresses = null,
     metrics_state: metrics_mod.Metrics = .{},
     published_pool: PublishedRetryPool = .{},
-    published_footprint: ?@import("store/footprint.zig").StateFileFootprint = null,
+    published_footprint: ?@import("../store/footprint.zig").StateFileFootprint = null,
     published_intake_waiting: bool = false,
     last_pool_ms: ?u64 = null,
     last_ignore_expiry_ms: ?u64 = null,
@@ -661,7 +661,7 @@ pub const Coordinator = struct {
             return self.jail[0..self.jail_len];
         }
     };
-    pub usingnamespace @import("daemon_admin.zig").Methods(@This());
+    pub usingnamespace @import("admin.zig").Methods(@This());
     pub const max_lifted_bans = 256;
     const max_wider_bans = 128;
     pub const IgnoreEntryState = enum { added, present, removed, config_only, absent, not_recorded, not_removed };
@@ -820,7 +820,7 @@ pub const Coordinator = struct {
         var plan: resource.Plan = .{};
         try plan.include(resource.storeWorkspace());
         try plan.include(try resource.controlCost(cfg.global.metrics_enabled, 2 * shared.protocol.max_payload_size));
-        try plan.include(.{ .live = try @import("daemon_query.zig").queryCaptureCost().plus(.{ .bytes = max_jails * @sizeOf(JailListRow) }) });
+        try plan.include(.{ .live = try @import("query.zig").queryCaptureCost().plus(.{ .bytes = max_jails * @sizeOf(JailListRow) }) });
         try plan.include(.{ .live = .{ .bytes = try std.math.add(usize, cfg.retained_capacity, 16 * resource.mib), .allocations = 2, .fds = 2 } });
         var custom: usize = 0;
         var internal_count: usize = 0;
@@ -869,7 +869,7 @@ pub const Coordinator = struct {
             .internal => try plan.include(.{ .workspace = .{ .bytes = 16 * 1024, .allocations = 4 }, .workspace_kind = .source }),
             .auto => return error.NativeInternalEventsRequired,
         }
-        const projection_bytes = @sizeOf(Plan) + @sizeOf(journal_projection.Plan) + jail.logpath.len * @sizeOf(sessions.Spec) + 128 * @sizeOf(@import("detect/state.zig").Cidr);
+        const projection_bytes = @sizeOf(Plan) + @sizeOf(journal_projection.Plan) + jail.logpath.len * @sizeOf(sessions.Spec) + 128 * @sizeOf(@import("../detect/state.zig").Cidr);
         var input_bytes = jail.name.len;
         if (source == .file) for (jail.logpath) |path| {
             input_bytes += path.len;
@@ -882,7 +882,7 @@ pub const Coordinator = struct {
             try plan.include(try resource.consumerCost(try consumer_runtime.JailRuntime.capacityPlan(jail.rule_files.len, capacity), 64 + capacity * (8 + jail.rule_files.len * 2)));
         }
     }
-    pub usingnamespace @import("daemon_reload.zig").Methods(@This());
+    pub usingnamespace @import("reload.zig").Methods(@This());
     fn releaseResources(self: *Coordinator) void {
         if (self.resource_reservation) |reservation| self.resources.release(reservation) catch |failure| {
             std.log.err("native resource reservation release failed: {s}", .{@errorName(failure)});
@@ -1935,7 +1935,7 @@ pub const Coordinator = struct {
             try self.admitStore();
         }
     }
-    pub fn sessionProcessor(jail: *const Jail) ?*const @import("source/source_processor.zig").Processor {
+    pub fn sessionProcessor(jail: *const Jail) ?*const @import("../source/source_processor.zig").Processor {
         const source = jail.session orelse return null;
         return switch (source) {
             .file => |value| &value.processor,
@@ -3414,7 +3414,7 @@ pub const Coordinator = struct {
             if (due) try self.rebuildIgnoreList(jail, now);
         }
     }
-    pub usingnamespace @import("daemon_query.zig").Methods(@This());
+    pub usingnamespace @import("query.zig").Methods(@This());
     fn reportMaintenanceGates(self: *Coordinator, now_ms: u64) void {
         if (self.last_gate_report_ms) |last| if (now_ms -| last < 10_000) return;
         const g = self.gates;

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 fail2zig maintainers
 const std = @import("std");
-const config = @import("../config/native.zig");
+const config = @import("../config/config.zig");
 const detection = @import("detection_record.zig");
 const effects = @import("../effect/effect.zig");
 const history = @import("../effect/effect_history.zig");

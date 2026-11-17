@@ -4,7 +4,7 @@
 // Holds: A jail is refused unless it is enabled, admitted and file-sourced with between 1 and max_sources (at most 4096) log paths.
 
 const std = @import("std");
-const config = @import("native.zig");
+const config = @import("config.zig");
 const processing = @import("../source/source_processor.zig");
 const detector = @import("../detect/builtin_detector.zig");
 const session = @import("../source/file_session.zig");

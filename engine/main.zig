@@ -26,7 +26,7 @@ pub const firewall_scope_mod = @import("firewall/scope.zig");
 pub const native_action_outcome_mod = @import("effect/action_outcome.zig");
 pub const native_effect_mod = @import("effect/effect.zig");
 pub const firewall = @import("firewall/backend.zig");
-pub const config_mod = @import("config/native.zig");
+pub const config_mod = @import("config/config.zig");
 pub const migration_mod = @import("config/migration.zig");
 pub const migration_snapshot_mod = @import("migration/sqlite_snapshot.zig");
 pub const migration_fixture_mod = @import("migration/fail2ban_fixture.zig");
@@ -302,7 +302,7 @@ pub fn main() !void {
         ensureSocketDir(cfg.global.socket_path) catch |err| {
             const stderr = std.io.getStdErr().writer();
             try stderr.print("config: cannot prepare socket directory: {s}\n", .{@errorName(err)});
-            @import("native_daemon.zig").logSandboxHint(err, cfg.global.socket_path, .socket);
+            @import("daemon/daemon.zig").logSandboxHint(err, cfg.global.socket_path, .socket);
             std.process.exit(shared.ExitClass.rejected.code());
         };
     }
@@ -380,7 +380,7 @@ fn failClosed(err: anytype, comptime fmt: []const u8, args: anytype) @TypeOf(err
     switch (any) {
         error.OutOfMemory => return err,
         else => {
-            if (@import("native_daemon.zig").log_sink) |sink| sink.drain();
+            if (@import("daemon/daemon.zig").log_sink) |sink| sink.drain();
             std.process.exit(shared.ExitClass.rejected.code());
         },
     }
@@ -403,10 +403,10 @@ fn runDaemon(heap: std.mem.Allocator, cfg: *const config_mod.Config, config_path
             std.log.err("log target '{s}' unusable: {s}; refusing to start", .{ cfg.global.log_target, @errorName(err) });
             std.process.exit(shared.ExitClass.rejected.code());
         };
-        @import("native_daemon.zig").log_sink = &sink.?;
+        @import("daemon/daemon.zig").log_sink = &sink.?;
         log_target.install(&sink.?);
     }
-    return @import("native_daemon.zig").run(heap, cfg, config_path) catch |err|
+    return @import("daemon/daemon.zig").run(heap, cfg, config_path) catch |err|
         failClosed(err, "native: startup failed: {s}; refusing to start", .{@errorName(err)});
 }
 

@@ -4,7 +4,7 @@
 // Holds: A disabled, unadmitted or non-journald jail, or a record or decoded limit over 64 KiB, is refused before any allocation.
 
 const std = @import("std");
-const config = @import("native.zig");
+const config = @import("config.zig");
 const builtin = @import("../detect/builtin_detector.zig");
 const journal = @import("../detect/journal_detector.zig");
 const origin = @import("../source/journal_origin.zig");

@@ -4,11 +4,11 @@
 // Holds: Rejected outranks restart-required, which outranks live; both return with the policy, ignore, jail, banip and decay lists empty.
 
 const std = @import("std");
-const config = @import("../config/native.zig");
-const retry_config = @import("../config/native_retry_policy.zig");
+const config = @import("../config/config.zig");
+const retry_config = @import("../config/retry_policy.zig");
 const retry = @import("../detect/retry.zig");
 const ignore_set = @import("../detect/ignore_set.zig");
-const banip = @import("../config/native_banip.zig");
+const banip = @import("../config/banip.zig");
 const shared = @import("shared");
 
 pub const max_reasons = 32;

@@ -10,7 +10,7 @@ const records = @import("source_record.zig");
 const time = @import("../time/time.zig");
 const storage_health = @import("../platform/storage_health.zig");
 const repair = @import("source_repair.zig");
-const config = @import("../config/native.zig");
+const config = @import("../config/config.zig");
 
 pub const Spec = struct { pattern: []const u8, start: files.Start = .head };
 pub const ConsumerSources = struct {

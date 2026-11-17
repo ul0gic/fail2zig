@@ -443,7 +443,7 @@ entries plus the runtime entries of a jail exceed 128. See
 | `MemoryCeilingTooLow`                                       | `memory_ceiling_mb` is below its minimum.                          | Neither successful
 syntax validation nor a reload request establishes installed firewall protection.
 
-The [parser](../../engine/config/native.zig),
+The [parser](../../engine/config/config.zig),
 [shipped example](../../deploy/fail2zig.toml.example)
 and [fail2zig.toml(5)](../man/fail2zig.toml.5)
 define the accepted configuration.

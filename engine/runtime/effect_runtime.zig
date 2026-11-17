@@ -10,7 +10,7 @@ const diag_mod = @import("../diag/diag.zig");
 const durable = @import("../source/record_store.zig");
 const effect = @import("../effect/effect.zig");
 const firewall = @import("../firewall/inspection.zig");
-pub const observation = @import("native_firewall_observation.zig");
+pub const observation = @import("firewall_observation.zig");
 
 pub const Binding = struct { jail: []const u8, generation: [32]u8 };
 pub const EffectDiagnostic = struct {
